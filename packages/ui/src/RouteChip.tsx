@@ -4,12 +4,13 @@ export type RouteChipVariant = 'plain' | 'gap';
 
 export interface RouteChipProps {
   variant?: RouteChipVariant;
+  gap?: boolean;
   children: ReactNode;
   style?: CSSProperties;
 }
 
-export function RouteChip({ variant = 'plain', children, style }: RouteChipProps) {
-  const gap = variant === 'gap';
+export function RouteChip({ variant = 'plain', gap = false, children, style }: RouteChipProps) {
+  const isGap = gap || variant === 'gap';
   return (
     <span
       style={{
@@ -18,8 +19,8 @@ export function RouteChip({ variant = 'plain', children, style }: RouteChipProps
         fontFamily: 'var(--mono)',
         fontSize: '0.6rem',
         letterSpacing: '0.02em',
-        color: gap ? 'var(--amber)' : 'var(--faint)',
-        border: gap
+        color: isGap ? 'var(--amber)' : 'var(--faint)',
+        border: isGap
           ? '1px dashed color-mix(in srgb, var(--amber) 40%, transparent)'
           : '1px solid var(--line-soft)',
         borderRadius: '999px',

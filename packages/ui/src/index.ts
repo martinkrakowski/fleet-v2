@@ -1,4 +1,4 @@
-export { Badge, type BadgeKind, type BadgeProps } from './Badge';
+export { Badge, type BadgeKind, type BadgeVariant, type BadgeProps } from './Badge';
 export { Fact, type FactState, type FactProps } from './Fact';
 export { Card, type CardProps } from './Card';
 export { IconButton, type IconButtonProps } from './IconButton';

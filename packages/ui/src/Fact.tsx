@@ -17,13 +17,16 @@ const DOT_STYLE: Record<FactState, CSSProperties> = {
 };
 
 export interface FactProps {
-  state: FactState;
+  state?: FactState;
+  value?: FactState;
+  stale?: boolean;
   children?: ReactNode;
   style?: CSSProperties;
 }
 
-export function Fact({ state, children, style }: FactProps) {
-  const color = STATE_COLOR[state];
+export function Fact({ state, value, stale = false, children, style }: FactProps) {
+  const shown = state ?? value ?? 'unknown';
+  const color = STATE_COLOR[shown];
   return (
     <span
       style={{
@@ -34,7 +37,7 @@ export function Fact({ state, children, style }: FactProps) {
         fontFamily: 'var(--mono)',
         fontSize: '0.7rem',
         whiteSpace: 'nowrap',
-        ...(state === 'stale' ? { opacity: 0.6 } : {}),
+        ...(shown === 'stale' || stale ? { opacity: 0.6 } : {}),
         ...style,
       }}
     >
@@ -44,10 +47,10 @@ export function Fact({ state, children, style }: FactProps) {
           height: '0.55rem',
           borderRadius: '50%',
           flex: 'none',
-          ...DOT_STYLE[state],
+          ...DOT_STYLE[shown],
         }}
       />
-      {children != null ? <span>{children}</span> : <span>{state}</span>}
+      {children != null ? <span>{children}</span> : <span>{shown}</span>}
     </span>
   );
 }

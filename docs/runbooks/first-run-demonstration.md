@@ -13,11 +13,11 @@ A local demonstration of the assembly line with no provider credential and no re
 - One scoped operator decision. Silence is left as "no answer" (an owner decision, not settled).
 - One notes file captured only after the simulated runner reports the attempt ended.
 - One keeper accepted by the orchestrator and proposed for the next brief. One candidate rejected. This line is the migration step-6 pilot slice only; it is not knowledge promotion ahead of checked scope and provenance.
+- Stop the controller between reserving capacity and dispatch. Start it again. Reconciliation does not dispatch a second time.
 
 ## Prerequisites
 
 The demo assumes the journal and persisted intent from migration steps 2-3, plus the readiness receipt. Without those, this runbook does not apply.
-- Stop the controller between reserving capacity and dispatch. Start it again. Reconciliation does not dispatch a second time.
 
 ## Proof
 

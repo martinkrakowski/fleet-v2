@@ -11,6 +11,7 @@ Checklist recorded once for a prepared workspace, before `DispatchAttempt`. From
 | Runner reachable | The port for this attempt answers |
 | Repository | The worktree is the named checkout |
 | Base commit | HEAD is the commit in the brief manifest |
+| Worktree inspection | No uncommitted changes, untracked files, or residue from an earlier attempt |
 | Toolchain | The manifest's toolchain is on PATH |
 | Dependencies | Install completed, or the manifest says none are required |
 | Brief | The frozen package is in the ignored worktree path and its digest matches |

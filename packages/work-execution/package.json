@@ -9,6 +9,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./use-cases": {
+      "types": "./dist/application/use-cases/index.d.ts",
+      "default": "./dist/application/use-cases/index.js"
     }
   },
   "scripts": {

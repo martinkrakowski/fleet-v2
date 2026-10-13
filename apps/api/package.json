@@ -9,7 +9,8 @@
     "preview": "node .output/server/index.mjs",
     "prepare": "nitro prepare",
     "lint": "eslint server --ext .ts",
-    "typecheck": "nitro prepare && tsc --noEmit"
+    "typecheck": "nitro prepare && tsc --noEmit",
+    "test": "vitest run --passWithNoTests --exclude '**/dist/**'"
   },
   "dependencies": {
     "@fleet/brief-knowledge": "workspace:*",
@@ -23,6 +24,7 @@
     "@types/node": "^22.0.0",
     "eslint": "^9.0.0",
     "typescript": "^5.5.4",
-    "typescript-eslint": "^8.0.0"
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^4.1.9"
   }
 }

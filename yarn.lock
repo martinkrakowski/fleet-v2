@@ -396,6 +396,19 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@fleet/ui@workspace:packages/ui":
+  version: 0.0.0-use.local
+  resolution: "@fleet/ui@workspace:packages/ui"
+  dependencies:
+    "@types/react": "npm:^19.0.0"
+    "@types/react-dom": "npm:^19.0.0"
+    typescript: "npm:^5.5.4"
+  peerDependencies:
+    react: ^19.0.0
+    react-dom: ^19.0.0
+  languageName: unknown
+  linkType: soft
+
 "@fleet/web@workspace:apps/web":
   version: 0.0.0-use.local
   resolution: "@fleet/web@workspace:apps/web"

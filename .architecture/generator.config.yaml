@@ -1,0 +1,159 @@
+generator:
+  version: "1.0"
+  description: "Global invariants and safety rules"
+  workspaceTemplate: "modular-monolith"
+
+  invariants:
+    - name: composite-safety
+      description: "Every tsconfig.json must contain paths: {} to override inherited source mappings."
+      priority: critical
+      failure: abort-and-cleanup
+
+    - name: barrel-ownership-boundary
+      description: "Barrels may only re-export types owned by the current bounded context."
+      priority: critical
+      failure: abort-and-cleanup
+
+    - name: port-single-ownership
+      description: "Each port interface belongs to exactly one bounded context."
+      priority: critical
+      failure: abort-and-cleanup
+
+    - name: dependency-consistency
+      description: "Every @fleet/* import must have a matching entry in package.json."
+      priority: high
+      failure: abort
+
+    - name: self-import-prevention
+      description: "No package imports itself by name."
+      priority: high
+      failure: abort
+
+    - name: signature-synchronization
+      description: "Generated consumers must derive exact signatures from the canonical port."
+      priority: high
+      failure: abort
+
+    - name: no-empty-stubs
+      description: "No empty barrels (export {}) in src/."
+      priority: medium
+      failure: warn-and-continue
+
+    - name: exports-field-mandatory
+      description: "Every package.json must include a complete exports map."
+      priority: medium
+      failure: warn-and-continue
+
+    - name: test-double-parity
+      description: "Test doubles must implement the same interface as the canonical port."
+      priority: medium
+      failure: warn-and-continue
+
+  bootstrap-sequence:
+    - load-ownership-map
+    - validate-port-ownership-map
+    - generate-package-skeleton
+    - enforce-tsconfig-paths-override
+    - generate-exports-field
+    - synchronize-signatures
+    - validate-barrel-chain
+    - enforce-dependency-consistency
+    - final-composite-reference-check
+
+  failure-behavior:
+    critical: abort-and-cleanup
+    high: abort
+    medium: warn-and-continue
+
+  ownership-registry:
+    ports:
+      RegisterWorkOrderPort: work-execution
+      PrepareBriefPackagePort: work-execution
+      ReserveExecutionCapacityPort: work-execution
+      DispatchAttemptPort: work-execution
+      ReconcileAttemptPort: work-execution
+      CollectAttemptArtifactsPort: work-execution
+      RequestAttemptAcceptancePort: work-execution
+      PrepareFixAttemptPort: work-execution
+      ExecuteAuthorizedForgeActionPort: work-execution
+      StopAttemptPort: work-execution
+      InspectWorkOrderPort: work-execution
+      WorkOrderRepositoryPort: work-execution
+      AttemptRepositoryPort: work-execution
+      ExecutionJournalPort: work-execution
+      BriefAuthoringPort: work-execution
+      ExecutionRunnerPort: work-execution
+      WorkspacePort: work-execution
+      AttemptArtifactPort: work-execution
+      ForgeActionPort: work-execution
+      AcceptanceAssessmentPort: work-execution
+      BriefKnowledgePort: work-execution
+      ActionAuthorizationPort: work-execution
+      ExecutionObservationPort: work-execution
+      WorkOrderRepositoryAdapter: work-execution
+      AttemptRepositoryAdapter: work-execution
+      ExecutionJournalAdapter: work-execution
+      BriefAuthoringAdapter: work-execution
+      ExecutionRunnerAdapter: work-execution
+      WorkspaceAdapter: work-execution
+      AttemptArtifactAdapter: work-execution
+      ForgeActionAdapter: work-execution
+      AcceptanceAssessmentAdapter: work-execution
+      BriefKnowledgeAdapter: work-execution
+      ActionAuthorizationAdapter: work-execution
+      ExecutionObservationAdapter: work-execution
+      RequestVerificationPort: evidence-and-acceptance
+      RequestIndependentReviewPort: evidence-and-acceptance
+      RecordVerificationReceiptPort: evidence-and-acceptance
+      RecordReviewReceiptPort: evidence-and-acceptance
+      RecordFindingDispositionPort: evidence-and-acceptance
+      AssessHeadAcceptancePort: evidence-and-acceptance
+      InspectAcceptanceEvidencePort: evidence-and-acceptance
+      EvidenceAssessmentRepositoryPort: evidence-and-acceptance
+      EvidenceArchivePort: evidence-and-acceptance
+      VerificationExecutorPort: evidence-and-acceptance
+      ForgeEvidencePort: evidence-and-acceptance
+      IndependentReviewPort: evidence-and-acceptance
+      EvidenceAssessmentRepositoryAdapter: evidence-and-acceptance
+      EvidenceArchiveAdapter: evidence-and-acceptance
+      VerificationExecutorAdapter: evidence-and-acceptance
+      ForgeEvidenceAdapter: evidence-and-acceptance
+      IndependentReviewAdapter: evidence-and-acceptance
+      CaptureCompletedAttemptNotesPort: brief-knowledge
+      CheckKnowledgeClaimPort: brief-knowledge
+      DecideKnowledgeDispositionPort: brief-knowledge
+      PublishAcceptedKeeperPort: brief-knowledge
+      ProposeBriefContextPort: brief-knowledge
+      RecordContextSelectionPort: brief-knowledge
+      RecordKnowledgeReusePort: brief-knowledge
+      SupersedeKnowledgeEntryPort: brief-knowledge
+      KnowledgeEntryRepositoryPort: brief-knowledge
+      KnowledgeRetrievalPort: brief-knowledge
+      ClaimVerificationPort: brief-knowledge
+      KeeperPublicationPort: brief-knowledge
+      KnowledgeEntryRepositoryAdapter: brief-knowledge
+      KnowledgeRetrievalAdapter: brief-knowledge
+      ClaimVerificationAdapter: brief-knowledge
+      KeeperPublicationAdapter: brief-knowledge
+      RegisterProjectProfilePort: operator-coordination
+      InspectConfiguredCapabilitiesPort: operator-coordination
+      RequestScopedDecisionPort: operator-coordination
+      ResolveActionAuthorizationPort: operator-coordination
+      RecordAuthorizationConsumptionPort: operator-coordination
+      PublishProjectObservationPort: operator-coordination
+      ReadProjectAttentionPort: operator-coordination
+      SendFleetRelayPort: operator-coordination
+      RecordRelayAcknowledgementPort: operator-coordination
+      InspectOutstandingCoordinationPort: operator-coordination
+      ProjectProfileRepositoryPort: operator-coordination
+      CoordinationRequestRepositoryPort: operator-coordination
+      DecisionTransportPort: operator-coordination
+      ObservationPublicationPort: operator-coordination
+      AttentionReadPort: operator-coordination
+      RelayTransportPort: operator-coordination
+      ProjectProfileRepositoryAdapter: operator-coordination
+      CoordinationRequestRepositoryAdapter: operator-coordination
+      DecisionTransportAdapter: operator-coordination
+      ObservationPublicationAdapter: operator-coordination
+      AttentionReadAdapter: operator-coordination
+      RelayTransportAdapter: operator-coordination

@@ -1,0 +1,636 @@
+# Fleet v2 — explicit, monolithic Hexagen generation manifest.
+# Architecture proposal and scaffold, 2026-10-13. No live execution is enabled.
+# Layers are the generator's symbol registry; contracts, domain_specification and
+# adapter_bindings retain the behavioural intent the AI assembly previously lost.
+schemaVersion: 1
+version: "0.1.0"
+system: fleet
+scope: fleet
+architecture: modular-monolith
+workspaceTemplate: modular-monolith
+description: >-
+  A barebones, recoverable assembly line for agentic work. Approved work becomes
+  a frozen brief, a disposable lane, a commit, verification, independent review,
+  fixes and an authorised merge. The process persists; workers are disposable.
+workspace:
+  name: fleet
+  description: >-
+    CLI-first coordination of disposable workers, explicit briefs, checked
+    evidence and curated lessons. Existing Fleet scripts migrate behind ports;
+    the existing Waves service supplies observation and decisions.
+planes:
+  core: [work-execution, evidence-and-acceptance]
+  supporting: [brief-knowledge, operator-coordination]
+
+monorepo:
+  packageManager: yarn@4.12.0
+  linker: node-modules
+  buildTool: turbo
+  workspaces: [apps/*, packages/*]
+  turboConfig:
+    pipeline:
+      build:
+        dependsOn: ["^build"]
+        outputs: [dist/**, .next/**, "!.next/cache/**", .output/**, .nitro/**]
+  workspaceDefaults:
+    tsConfig:
+      extends: ../../tsconfig.base.json
+      compilerOptions:
+        rootDir: src
+        outDir: dist
+        composite: true
+        declaration: true
+        emitDeclarationOnly: true
+        declarationMap: true
+        tsBuildInfoFile: ./dist/.tsbuildinfo
+        paths: {}
+      include: [src]
+      exclude: [node_modules, dist]
+    packageJson:
+      scripts:
+        build: tsc
+        lint: eslint src --ext .ts,.tsx
+        typecheck: tsc --noEmit
+        test: vitest run --passWithNoTests --exclude '**/dist/**'
+      devDependencies:
+        typescript: ^5.5.4
+        eslint: ^9.0.0
+        '@eslint/js': ^9.0.0
+        typescript-eslint: ^8.0.0
+        vitest: ^4.1.9
+    eslint:
+      template: |
+        import eslint from '@eslint/js';
+        import tseslint from 'typescript-eslint';
+
+        export default tseslint.config(
+          { ignores: ['dist/**', 'node_modules/**'] },
+          eslint.configs.recommended,
+          ...tseslint.configs.recommended,
+          {
+            rules: {
+              'no-console': 'error',
+              '@typescript-eslint/no-explicit-any': 'error',
+              '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
+            },
+          },
+          {
+            files: ['**/*.in-port.ts', '**/*.out-port.ts'],
+            rules: {
+              '@typescript-eslint/no-empty-object-type': ['error', { allowInterfaces: 'always' }],
+            },
+          },
+        );
+  rootFiles:
+    gitignore:
+      template: |
+        # Dependencies (Yarn 4, node-modules linker, workspaces)
+        node_modules/
+        .pnp.*
+        .yarn/*
+        !.yarn/patches
+        !.yarn/plugins
+        !.yarn/releases
+        !.yarn/sdks
+        !.yarn/versions
+
+        # TypeScript
+        dist/
+        *.tsbuildinfo
+        next-env.d.ts
+
+        # Turbo
+        .turbo/
+
+        # Next.js
+        .next/
+        out/
+
+        # Nitro
+        .nitro/
+        .output/
+
+        # Test and lint caches
+        coverage/
+        .eslintcache
+
+        # Logs
+        *.log
+        npm-debug.log*
+        yarn-debug.log*
+        yarn-error.log*
+
+        # OS
+        .DS_Store
+
+        # Secrets and local env (examples stay tracked)
+        .env
+        .env.*
+        !.env.example
+        !.env.*.example
+        *.pem
+
+        # Fleet installation and disposable lane runtime
+        /.fleet/
+        /.lane/
+        /installation/
+        SYNC-MIGRATION-REPORT.md
+    packageJson:
+      template: |
+        {
+          "name": "{system}",
+          "private": true,
+          "type": "module",
+          "packageManager": "{packageManager}",
+          "workspaces": {workspaces},
+          "scripts": {
+            "build": "turbo build",
+            "dev": "turbo dev",
+            "lint": "turbo lint",
+            "typecheck": "turbo typecheck",
+            "test": "turbo test",
+            "clean": "turbo clean",
+            "sync": "hexagen sync",
+            "sync:dry": "hexagen sync --dry-run",
+            "sync:check": "hexagen sync --check --allow-dirty",
+            "lint:arch": "hexagen arch validate",
+            "format": "prettier --write \"**/*.{ts,tsx,json,yaml,md}\""
+          },
+          "devDependencies": {
+            "turbo": "^2.11.5",
+            "typescript": "^5.5.4",
+            "eslint": "^9.0.0",
+            "prettier": "^3.0.0",
+            "@hexagen-monaco/sync": "0.14.0",
+            "@hexagen-monaco/arch-linter": "0.14.0"
+          }
+        }
+    tsConfig:
+      template: |
+        {
+          "compilerOptions": {
+            "target": "ES2022",
+            "module": "ESNext",
+            "moduleResolution": "bundler",
+            "strict": true,
+            "skipLibCheck": true,
+            "composite": true,
+            "declaration": true,
+            "emitDeclarationOnly": true
+          }
+        }
+
+generator:
+  version: "0.14.0"
+  sync:
+    idempotent: true
+    createOnlyIfMissing: true
+    nonDestructive: true
+    layers:
+      domain:
+        folder: src/domain
+        subfolders: [entities, value-objects]
+      application:
+        folder: src/application
+        subfolders: [ports/in, ports/out, use-cases]
+      infrastructure:
+        folder: src/infrastructure
+        subfolders: [adapters]
+    stubs:
+      enabled: true
+      # Registry entries already include Port/Adapter/UseCase suffixes. Emit
+      # their exact symbols rather than suffixing them a second time.
+      templates:
+        inPort: |
+          // @generated inbound contract scaffold — refine before implementation.
+          /** See this context's contracts registry in manifest.yaml. */
+          export interface {name} {}
+        outPort: |
+          // @generated outbound contract scaffold — refine before implementation.
+          /** See this context's contracts registry in manifest.yaml. */
+          export interface {name} {}
+        useCase: |
+          // @generated use-case scaffold — no operation is implemented.
+          export class {name} {
+            async execute(_input: unknown): Promise<never> {
+              throw new Error('Not implemented: {name}');
+            }
+          }
+        adapter: |
+          // @generated adapter scaffold — no external operation is implemented.
+          /** See adapter_bindings in manifest.yaml for the intended integration. */
+          export class {name} {}
+    apps:
+      enabled: true
+      frameworks:
+        next.js:
+          tsConfig:
+            extends: ../../tsconfig.base.json
+            compilerOptions:
+              rootDir: .
+              composite: false
+              declaration: false
+              emitDeclarationOnly: false
+              noEmit: true
+              strict: true
+              jsx: preserve
+              plugins:
+                - name: next
+              lib: [dom, dom.iterable, esnext]
+              allowJs: true
+              incremental: true
+              esModuleInterop: true
+              resolveJsonModule: true
+              isolatedModules: true
+            include: [next-env.d.ts, src/**/*.ts, src/**/*.tsx, .next/types/**/*.ts]
+            exclude: [node_modules, dist]
+        plain-ts:
+          packageJson:
+            template: |
+              {
+                "name": "@{scope}/{appName}",
+                "version": "0.1.0",
+                "private": true,
+                "type": "module",
+                "scripts": {
+                  "build": "tsc",
+                  "lint": "eslint src --ext .ts",
+                  "typecheck": "tsc --noEmit"
+                },
+                "dependencies": {
+                  "@{scope}/work-execution": "workspace:*",
+                  "@{scope}/evidence-and-acceptance": "workspace:*",
+                  "@{scope}/brief-knowledge": "workspace:*",
+                  "@{scope}/operator-coordination": "workspace:*"
+                },
+                "devDependencies": {
+                  "typescript": "^5.5.4",
+                  "eslint": "^9.0.0",
+                  "@eslint/js": "^9.0.0",
+                  "typescript-eslint": "^8.0.0"
+                }
+              }
+        nitro:
+          packageJson:
+            template: |
+              {
+                "name": "@{scope}/{appName}",
+                "version": "0.1.0",
+                "private": true,
+                "type": "module",
+                "scripts": {
+                  "build": "nitro build",
+                  "dev": "nitro dev --port 3001",
+                  "preview": "node .output/server/index.mjs",
+                  "prepare": "nitro prepare",
+                  "lint": "eslint server --ext .ts",
+                  "typecheck": "nitro prepare && tsc --noEmit"
+                },
+                "dependencies": {
+                  "nitropack": "^2.13.0",
+                  "@{scope}/work-execution": "workspace:*",
+                  "@{scope}/evidence-and-acceptance": "workspace:*",
+                  "@{scope}/brief-knowledge": "workspace:*",
+                  "@{scope}/operator-coordination": "workspace:*"
+                },
+                "devDependencies": {
+                  "@types/node": "^22.0.0",
+                  "typescript": "^5.5.4",
+                  "eslint": "^9.0.0",
+                  "@eslint/js": "^9.0.0",
+                  "typescript-eslint": "^8.0.0"
+                }
+              }
+
+apps:
+  - name: cli
+    framework: plain-ts
+    role: operator-driver-and-composition-root
+    description: >-
+      Compose the four contexts and adapters in a local CLI. No inference proxy,
+      automatic host administration or live dispatch is implemented.
+    depends_on: [work-execution, evidence-and-acceptance, brief-knowledge, operator-coordination]
+  - name: web
+    framework: next.js
+    role: browser-operator-surface
+    description: >-
+      Next.js App Router frontend scaffold. Future operator views call the API
+      boundary rather than importing infrastructure or execution adapters.
+    depends_on: []
+  - name: api
+    framework: nitro
+    role: http-driver-and-composition-root
+    description: >-
+      Nitro HTTP API scaffold and future composition root for the four contexts.
+      Routes delegate to application ports; execution and credentials stay behind
+      the existing infrastructure boundaries.
+    depends_on: [work-execution, evidence-and-acceptance, brief-knowledge, operator-coordination]
+
+bounded_contexts:
+  - name: work-execution
+    type: core
+    plane: core
+    status: active
+    description: >-
+      Own work orders, immutable brief packages, disposable attempt identity,
+      capacity reservations and the action journal. Dispatch and reconcile through
+      scoped runners; collect only after authoritative completion. Coordinate
+      acceptance, selected knowledge and applicable decisions through local ports.
+    depends_on: [evidence-and-acceptance, brief-knowledge, operator-coordination]
+    layers:
+      domain:
+        entities: [WorkOrder, Attempt, ActionJournalEntry, CapacityReservation]
+        value_objects: [WorkOrderState, AttemptState, AttemptOutcome, ModelAssignment, BriefPackage, RunnerObservation, ExecutionLimits]
+      application:
+        use_cases:
+          - RegisterWorkOrderUseCase
+          - PrepareBriefPackageUseCase
+          - ReserveExecutionCapacityUseCase
+          - DispatchAttemptUseCase
+          - ReconcileAttemptUseCase
+          - CollectAttemptArtifactsUseCase
+          - RequestAttemptAcceptanceUseCase
+          - PrepareFixAttemptUseCase
+          - ExecuteAuthorizedForgeActionUseCase
+          - StopAttemptUseCase
+          - InspectWorkOrderUseCase
+        ports:
+          in:
+            - RegisterWorkOrderPort
+            - PrepareBriefPackagePort
+            - ReserveExecutionCapacityPort
+            - DispatchAttemptPort
+            - ReconcileAttemptPort
+            - CollectAttemptArtifactsPort
+            - RequestAttemptAcceptancePort
+            - PrepareFixAttemptPort
+            - ExecuteAuthorizedForgeActionPort
+            - StopAttemptPort
+            - InspectWorkOrderPort
+          out:
+            - WorkOrderRepositoryPort
+            - AttemptRepositoryPort
+            - ExecutionJournalPort
+            - BriefAuthoringPort
+            - ExecutionRunnerPort
+            - WorkspacePort
+            - AttemptArtifactPort
+            - ForgeActionPort
+            - AcceptanceAssessmentPort
+            - BriefKnowledgePort
+            - ActionAuthorizationPort
+            - ExecutionObservationPort
+      infrastructure:
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter]
+    contracts:
+      RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
+      PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
+      ReserveExecutionCapacityPort: "Reserve configured slots and test workers atomically with attempt intent under the host's shared budget."
+      DispatchAttemptPort: "Start one prepared authorised attempt after capacity and runner capabilities are verified; retain ambiguous dispatch outcomes for reconciliation."
+      ReconcileAttemptPort: "Compare durable action intent with the matching server/session state before retry, collection or reservation release."
+      CollectAttemptArtifactsPort: "After matching runner completion, inspect the commit delta and collect identity-bound artifacts; explicitly record missing notes."
+      RequestAttemptAcceptancePort: "Request verification and independent review of the exact candidate head and retain a scoped acceptance receipt."
+      PrepareFixAttemptPort: "Create a fresh attempt with a small handover and numbered fixes after the prior attempt has ended."
+      ExecuteAuthorizedForgeActionPort: "Apply a scoped PR or merge action only when authorization and current-head evidence match; reconcile ambiguous forge responses."
+      StopAttemptPort: "Request cancellation of the identified runner session and establish its actual end before releasing capacity."
+      InspectWorkOrderPort: "Return the work order, attempt identities and separately reported/observed status with source and revision references."
+      WorkOrderRepositoryPort: "Persist work-order revisions with optimistic concurrency and retrieve orders by project and dependency identity."
+      AttemptRepositoryPort: "Persist immutable dispatch identity and guarded lifecycle updates; return known absence separately from unreadable state."
+      ExecutionJournalPort: "Atomically record intent, capacity and action receipts; a host has one designated dispatcher until shared arbitration is implemented."
+      BriefAuthoringPort: "Obtain a project orchestrator's brief or a hand-written file without introducing provider inference into the control plane."
+      ExecutionRunnerPort: "Start, inspect and stop a matching attempt/session with explicit capabilities and strict per-lane directory isolation."
+      WorkspacePort: "Prepare scoped Git worktrees and inspect base/head commits and commit deltas without resetting user work."
+      AttemptArtifactPort: "Place frozen briefs and templates under verified ignored paths and collect bounded immutable artifacts after lane completion."
+      ForgeActionPort: "Perform permitted credential-bearing PR and merge operations through stable action IDs and explicit expected-head checks."
+      AcceptanceAssessmentPort: "Consume the evidence context's exact-head assessment without importing its repositories or mutating its aggregates."
+      BriefKnowledgePort: "Request bounded context proposals, record selected versions and forward only completed-attempt notes to the knowledge context."
+      ActionAuthorizationPort: "Obtain and durably consume an applicable scope-bound grant from operator coordination; pending or unknown results block the action."
+      ExecutionObservationPort: "Publish recorded lifecycle observations through coordination; preserve a delivery gap without failing the lane."
+    adapter_bindings:
+      - { adapter: WorkOrderRepositoryAdapter, implements: WorkOrderRepositoryPort, integration: local-transactional-store }
+      - { adapter: AttemptRepositoryAdapter, implements: AttemptRepositoryPort, integration: local-transactional-store }
+      - { adapter: ExecutionJournalAdapter, implements: ExecutionJournalPort, integration: local-transactional-journal-and-capacity-arbitration }
+      - { adapter: BriefAuthoringAdapter, implements: BriefAuthoringPort, integration: reviewed-harness-or-hand-written-file }
+      - { adapter: ExecutionRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-ocm-run-subprocess }
+      - { adapter: WorkspaceAdapter, implements: WorkspacePort, integration: reviewed-git-worktree-subprocess }
+      - { adapter: AttemptArtifactAdapter, implements: AttemptArtifactPort, integration: bounded-filesystem-and-approved-remote-artifact-access }
+      - { adapter: ForgeActionAdapter, implements: ForgeActionPort, integration: reviewed-github-cli-subprocess }
+      - adapter: AcceptanceAssessmentAdapter
+        implements: AcceptanceAssessmentPort
+        integration: in-process
+        delegates_to: [evidence-and-acceptance/AssessHeadAcceptancePort, evidence-and-acceptance/RequestVerificationPort, evidence-and-acceptance/RequestIndependentReviewPort]
+      - adapter: BriefKnowledgeAdapter
+        implements: BriefKnowledgePort
+        integration: in-process
+        delegates_to: [brief-knowledge/ProposeBriefContextPort, brief-knowledge/RecordContextSelectionPort, brief-knowledge/CaptureCompletedAttemptNotesPort]
+      - adapter: ActionAuthorizationAdapter
+        implements: ActionAuthorizationPort
+        integration: in-process
+        delegates_to: [operator-coordination/ResolveActionAuthorizationPort, operator-coordination/RecordAuthorizationConsumptionPort]
+      - adapter: ExecutionObservationAdapter
+        implements: ExecutionObservationPort
+        integration: in-process
+        delegates_to: [operator-coordination/PublishProjectObservationPort]
+    domain_specification:
+      aggregate_roots: [WorkOrder, Attempt]
+      child_ownership: { ActionJournalEntry: Attempt, CapacityReservation: Attempt }
+      enum_values:
+        WorkOrderState: [approved, prepared, implementing, verifying, reviewing, fixing, ready-to-merge, merged, stopped]
+        AttemptState: [intent-recorded, dispatching, running, reconciling, ended, collected, blocked, cancelled]
+        AttemptOutcome: [done, partial, stopped, no-commit]
+      invariants:
+        - "Every fresh dispatch and fix round has a new attempt identity, independent of branch, role and model identity."
+        - "A brief binds attempt, base commit, approved policy revision, owned paths, model and variant, fallback, independent reviewer, positive limits and selected knowledge versions."
+        - "Record pre-dispatch commit tip and action intent before starting a worker. Local watcher exit and model final messages never establish authoritative completion."
+        - "Unknown runner state retains the reservation and blocks duplicate dispatch; reconcile against the correct server/session."
+        - "Collect lane notes only after lane end. Keep brief, notes and template paths ignored and check their exclusion from the index and commit range."
+        - "Domain rules receive time, IDs and digest values as inputs; infrastructure supplies clocks, randomness and hashing."
+        - "Lanes have no forge, shelf or Waves access. Provider keys remain in the existing host-side key proxy; memory enters through frozen briefs."
+      lifecycle_requirements:
+        - "Dispatch intent is durable before start; ambiguous results enter reconciliation rather than blind retries."
+        - "Only a matching ended observation permits artifact collection and capacity release."
+        - "Stopped sessions may have partial useful work; no-commit is not success."
+        - "Merge requires current-head acceptance and applicable authorization; a changed head invalidates old readiness."
+
+  - name: evidence-and-acceptance
+    type: core
+    plane: core
+    status: active
+    description: >-
+      Own exact-head verification, independent review, finding dispositions and
+      immutable acceptance receipts. Unknown, stale or incomplete evidence does
+      not pass. Return a verdict to execution without performing a merge.
+    depends_on: []
+    layers:
+      domain:
+        entities: [EvidenceAssessment, VerificationReceipt, ReviewReceipt, FindingDisposition]
+        value_objects: [AssessmentState, EvidenceResult, FindingState, AcceptanceReceipt, EvidenceScope]
+      application:
+        use_cases: [RequestVerificationUseCase, RequestIndependentReviewUseCase, RecordVerificationReceiptUseCase, RecordReviewReceiptUseCase, RecordFindingDispositionUseCase, AssessHeadAcceptanceUseCase, InspectAcceptanceEvidenceUseCase]
+        ports:
+          in: [RequestVerificationPort, RequestIndependentReviewPort, RecordVerificationReceiptPort, RecordReviewReceiptPort, RecordFindingDispositionPort, AssessHeadAcceptancePort, InspectAcceptanceEvidencePort]
+          out: [EvidenceAssessmentRepositoryPort, EvidenceArchivePort, VerificationExecutorPort, ForgeEvidencePort, IndependentReviewPort]
+      infrastructure:
+        adapters: [EvidenceAssessmentRepositoryAdapter, EvidenceArchiveAdapter, VerificationExecutorAdapter, ForgeEvidenceAdapter, IndependentReviewAdapter]
+    contracts:
+      RequestVerificationPort: "Request the required completed checks on configured verification hosts for a precise head and acceptance-policy revision."
+      RequestIndependentReviewPort: "Request a read-only review using an underlying model distinct from the implementer's and bind its result to the reviewed head."
+      RecordVerificationReceiptPort: "Validate and retain a completed check's head, host, procedure, exit result and evidence reference without treating launch as completion."
+      RecordReviewReceiptPort: "Retain exact-head reviewer identity, read-only capability, findings and source evidence; reject a purported independent review by the same model."
+      RecordFindingDispositionPort: "Record a fix or evidence-backed refutation of a specific finding while preserving unresolved findings."
+      AssessHeadAcceptancePort: "Evaluate every required check and finding against the current head and policy; issue a scoped acceptance receipt or explicit blockers."
+      InspectAcceptanceEvidencePort: "Return assessment revisions and receipt provenance, including stale, missing and unknown evidence."
+      EvidenceAssessmentRepositoryPort: "Persist assessments and child receipts with revision-aware updates."
+      EvidenceArchivePort: "Retain immutable verification and review artifacts addressed by identity and digest."
+      VerificationExecutorPort: "Run allow-listed checks on the configured verification host and return completed command receipts."
+      ForgeEvidencePort: "Read current CI/check/thread status through the forge without opening, merging or mutating PRs."
+      IndependentReviewPort: "Obtain an attributable read-only review from the configured independent seat; transport and provider selection belong to the adapter."
+    adapter_bindings:
+      - { adapter: EvidenceAssessmentRepositoryAdapter, implements: EvidenceAssessmentRepositoryPort, integration: local-transactional-store }
+      - { adapter: EvidenceArchiveAdapter, implements: EvidenceArchivePort, integration: immutable-artifact-files }
+      - { adapter: VerificationExecutorAdapter, implements: VerificationExecutorPort, integration: reviewed-verification-script-and-ssh }
+      - { adapter: ForgeEvidenceAdapter, implements: ForgeEvidencePort, integration: read-only-github-cli-subprocess }
+      - { adapter: IndependentReviewAdapter, implements: IndependentReviewPort, integration: configured-read-only-review-harness }
+    domain_specification:
+      aggregate_roots: [EvidenceAssessment]
+      child_ownership: { VerificationReceipt: EvidenceAssessment, ReviewReceipt: EvidenceAssessment, FindingDisposition: EvidenceAssessment }
+      enum_values:
+        AssessmentState: [pending, blocked, accepted, rejected, stale]
+        EvidenceResult: [pending, pass, fail, unknown, not-applicable]
+        FindingState: [unresolved, fixed, refuted]
+      invariants:
+        - "Receipts bind project, attempt, exact head, source, completion time and acceptance-policy revision."
+        - "The reviewer's underlying model differs from the implementer's; a provider change alone is insufficient."
+        - "Project CI and configured verification-host policy decide acceptance. Explicit host exclusions do not waive unrelated failures."
+        - "Mutation proof requires the predicted assertion failure, not a parse, bind or setup error."
+        - "Changed heads make old evidence stale. Pending, unknown and unresolved blockers never become an implicit pass."
+
+  - name: brief-knowledge
+    type: supporting
+    plane: supporting
+    status: active
+    description: >-
+      Own completed-attempt candidate lessons, orchestrator review, bounded keeper
+      retrieval, selection provenance and reuse outcomes. Capture proposes facts;
+      only deliberate checks and disposition promote them into reusable context.
+    depends_on: []
+    layers:
+      domain:
+        entities: [KnowledgeEntry, KnowledgeCheck, KnowledgeReuse]
+        value_objects: [KnowledgeDisposition, KnowledgeVerification, KnowledgeReuseOutcome, KnowledgeScope, ContextSelection, RetrievalBudget]
+      application:
+        use_cases: [CaptureCompletedAttemptNotesUseCase, CheckKnowledgeClaimUseCase, DecideKnowledgeDispositionUseCase, PublishAcceptedKeeperUseCase, ProposeBriefContextUseCase, RecordContextSelectionUseCase, RecordKnowledgeReuseUseCase, SupersedeKnowledgeEntryUseCase]
+        ports:
+          in: [CaptureCompletedAttemptNotesPort, CheckKnowledgeClaimPort, DecideKnowledgeDispositionPort, PublishAcceptedKeeperPort, ProposeBriefContextPort, RecordContextSelectionPort, RecordKnowledgeReusePort, SupersedeKnowledgeEntryPort]
+          out: [KnowledgeEntryRepositoryPort, KnowledgeRetrievalPort, ClaimVerificationPort, KeeperPublicationPort]
+      infrastructure:
+        adapters: [KnowledgeEntryRepositoryAdapter, KnowledgeRetrievalAdapter, ClaimVerificationAdapter, KeeperPublicationAdapter]
+    contracts:
+      CaptureCompletedAttemptNotesPort: "Accept bounded notes with completed-attempt identity and record missing/incomplete reports; every bullet becomes a candidate claim."
+      CheckKnowledgeClaimPort: "Record orchestrator-chosen evidence for a scoped claim without executing instructions supplied by the note."
+      DecideKnowledgeDispositionPort: "Accept, defer, reject or flag a policy proposal with checker identity and reasons."
+      PublishAcceptedKeeperPort: "Publish one accepted fact with source and checker attribution; preserve failed delivery for reconciliation."
+      ProposeBriefContextPort: "Return eligible ranked keepers for a project's task, paths, environment and target revision within explicit retrieval bounds."
+      RecordContextSelectionPort: "Record the orchestrator's selected entry versions, applicability checks and target brief identity before freezing context."
+      RecordKnowledgeReusePort: "Record inclusion, demonstrated benefit, wrong turns or unknown usefulness with attributable evidence."
+      SupersedeKnowledgeEntryPort: "Link a checked correction to the older entry it replaces and exclude superseded content from normal retrieval."
+      KnowledgeEntryRepositoryPort: "Persist candidate/keeper versions, checks, supersession and reuse history."
+      KnowledgeRetrievalPort: "Filter by authorized scope and rank lexical matches without returning rejected, superseded or inapplicable facts."
+      ClaimVerificationPort: "Perform a bounded allow-listed check selected by the orchestrator and return evidence, not model confidence."
+      KeeperPublicationPort: "Write attributed keeper entries to an optional external shelf without revealing its key to agents."
+    adapter_bindings:
+      - { adapter: KnowledgeEntryRepositoryAdapter, implements: KnowledgeEntryRepositoryPort, integration: local-transactional-store }
+      - { adapter: KnowledgeRetrievalAdapter, implements: KnowledgeRetrievalPort, integration: local-scoped-lexical-index }
+      - { adapter: ClaimVerificationAdapter, implements: ClaimVerificationPort, integration: allow-listed-command-or-source-inspection }
+      - { adapter: KeeperPublicationAdapter, implements: KeeperPublicationPort, integration: optional-stash-subprocess-or-local-export }
+    domain_specification:
+      aggregate_roots: [KnowledgeEntry]
+      child_ownership: { KnowledgeCheck: KnowledgeEntry, KnowledgeReuse: KnowledgeEntry }
+      enum_values:
+        KnowledgeDisposition: [candidate, accepted, deferred, rejected, superseded, policy-proposal]
+        KnowledgeVerification: [unverified, supported, contradicted, stale]
+        KnowledgeReuseOutcome: [included, helped, wrong-turn, unused, unknown]
+      invariants:
+        - "Accept only notes collected after authoritative lane end; this context never reads live worker files."
+        - "Each keeper carries source attempt, commit, author/date, scoped evidence, checker and version."
+        - "Notes and retrieval results are observations, never instructions or authority. The project orchestrator decides what enters a brief."
+        - "Rules, seats, host settings and permissions cannot change through keeper promotion; return a policy proposal for coordination."
+        - "Use explicit positive retrieval bounds and reviewed shared scope for cross-project lessons. No transcripts, secrets or client content are ingested."
+        - "Shelf failure or missing notes does not fail otherwise acceptable work. Context inclusion alone does not prove saved work."
+
+  - name: operator-coordination
+    type: supporting
+    plane: supporting
+    status: active
+    description: >-
+      Own project profiles, approved-policy references, scoped decisions,
+      authorization consumption, fleet relays and external observation delivery.
+      Translate Waves contracts in adapters; do not regenerate Waves or grant its
+      server execution credentials.
+    depends_on: []
+    layers:
+      domain:
+        entities: [ProjectProfile, CoordinationRequest, AuthorizationConsumption, RelayAcknowledgement]
+        value_objects: [CoordinationKind, CoordinationState, ActionAuthorization, PolicyReference, ObservationEnvelope]
+      application:
+        use_cases: [RegisterProjectProfileUseCase, InspectConfiguredCapabilitiesUseCase, RequestScopedDecisionUseCase, ResolveActionAuthorizationUseCase, RecordAuthorizationConsumptionUseCase, PublishProjectObservationUseCase, ReadProjectAttentionUseCase, SendFleetRelayUseCase, RecordRelayAcknowledgementUseCase, InspectOutstandingCoordinationUseCase]
+        ports:
+          in: [RegisterProjectProfilePort, InspectConfiguredCapabilitiesPort, RequestScopedDecisionPort, ResolveActionAuthorizationPort, RecordAuthorizationConsumptionPort, PublishProjectObservationPort, ReadProjectAttentionPort, SendFleetRelayPort, RecordRelayAcknowledgementPort, InspectOutstandingCoordinationPort]
+          out: [ProjectProfileRepositoryPort, CoordinationRequestRepositoryPort, DecisionTransportPort, ObservationPublicationPort, AttentionReadPort, RelayTransportPort]
+      infrastructure:
+        adapters: [ProjectProfileRepositoryAdapter, CoordinationRequestRepositoryAdapter, DecisionTransportAdapter, ObservationPublicationAdapter, AttentionReadAdapter, RelayTransportAdapter]
+    contracts:
+      RegisterProjectProfilePort: "Validate installation references, designated dispatcher, runner capabilities and approved policy without persisting credential values."
+      InspectConfiguredCapabilitiesPort: "Report the configured runner and integration capabilities, missing requirements and explicit unknowns."
+      RequestScopedDecisionPort: "Record the exact proposal, expected revision and action scope before asking its authorized decider."
+      ResolveActionAuthorizationPort: "Return an applicable grant from approved policy or a verified scoped decision; pending or ambiguous authority remains blocked."
+      RecordAuthorizationConsumptionPort: "Durably bind a grant to an action ID and retain reconciliation receipts without authorizing a second unrelated action."
+      PublishProjectObservationPort: "Publish the owning project's explicit events and derived facts while preserving disagreements and delivery failures."
+      ReadProjectAttentionPort: "Read bounded attention/staleness summaries without rewriting another project's observations."
+      SendFleetRelayPort: "Send an attributed authorized notice and distinguish delivery from recipient acknowledgement."
+      RecordRelayAcknowledgementPort: "Record an actual recipient response and its provenance; silence is not acknowledgement."
+      InspectOutstandingCoordinationPort: "List undecided proposals, unknown actions, undelivered observations and unacknowledged notices."
+      ProjectProfileRepositoryPort: "Persist private installation references and policy revisions with version-aware updates."
+      CoordinationRequestRepositoryPort: "Persist scoped proposals, revisions, acknowledgements and authorization-consumption receipts."
+      DecisionTransportPort: "Read and verify the existing Waves signed-answer protocol or an explicit owner-recorded local decision."
+      ObservationPublicationPort: "Publish a versioned Waves snapshot through its client without exposing tokens to agents."
+      AttentionReadPort: "Read the existing Waves attention and project-staleness endpoints with bounded requests."
+      RelayTransportPort: "Deliver notices or write a local outbox and return transport receipts without inferring acceptance."
+    adapter_bindings:
+      - { adapter: ProjectProfileRepositoryAdapter, implements: ProjectProfileRepositoryPort, integration: private-installation-config-and-local-store }
+      - { adapter: CoordinationRequestRepositoryAdapter, implements: CoordinationRequestRepositoryPort, integration: local-transactional-store }
+      - { adapter: DecisionTransportAdapter, implements: DecisionTransportPort, integration: existing-waves-decision-client-or-owner-recorded-file }
+      - { adapter: ObservationPublicationAdapter, implements: ObservationPublicationPort, integration: existing-waves-client }
+      - { adapter: AttentionReadAdapter, implements: AttentionReadPort, integration: existing-waves-read-endpoints }
+      - { adapter: RelayTransportAdapter, implements: RelayTransportPort, integration: harness-notice-channel-or-local-outbox }
+    domain_specification:
+      aggregate_roots: [ProjectProfile, CoordinationRequest]
+      child_ownership: { AuthorizationConsumption: CoordinationRequest, RelayAcknowledgement: CoordinationRequest }
+      enum_values:
+        CoordinationKind: [action-decision, policy-proposal, relay, registry-alert]
+        CoordinationState: [proposed, awaiting-decision, approved, declined, executing, completed, unknown, expired, cancelled]
+      invariants:
+        - "Authorization binds proposal digest, project, exact action, expected commit, policy and decision revisions."
+        - "Existing approved policy may authorize routine bounded work. A signed answer does not grant unrelated or privileged host actions."
+        - "Policy prose never silently becomes new machine authority; policy changes remain owner-approved versioned edits."
+        - "A status delivery failure is visible but does not block ordinary work. Missing required authorization blocks the affected action."
+        - "Use Waves contracts through an anti-corruption boundary. Do not fabricate lane/PR fields for host alerts or relays."
+        - "Fleet masters receive summaries and fleet-relevant proposals; project controllers own their status and raw notes."
+
+context_mappings:
+  - { upstream: evidence-and-acceptance, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "AcceptanceAssessmentAdapter delegates to supplier-owned application ports; dependency is declared on work-execution." }
+  - { upstream: brief-knowledge, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "BriefKnowledgeAdapter delegates to supplier-owned context-selection and completed-note ingestion ports." }
+  - { upstream: operator-coordination, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "ActionAuthorizationAdapter and ExecutionObservationAdapter delegate to supplier-owned authorization and publication ports." }
+
+agent_instructions:
+  product_identity: "The process persists; workers are disposable. Memory travels in the brief, not the model call."
+  implementation_status: scaffold-only
+  read_order: [.architecture/manifest.yaml, docs/architecture.md, AGENTS.md]
+  constraints:
+    - "Keep domain and application free of Node, filesystem, subprocess, network and vendor imports."
+    - "No empty interface or generic generated stub establishes an implemented security or lifecycle guarantee. Refine typed contracts before migrating a station."
+    - "Keep exactly four business contexts. CLI and Nitro API are composition roots; Next.js is a presentation boundary."
+    - "Use explicit allow-listed argument arrays for script adapters; do not execute commands copied from lane notes."
+    - "Preserve existing lane fences and host-side credential placement. No automatic host restart or sudo."
+    - "No service, credential, live host, production database or deployment is contacted by the generated application."
+    - "Migrate one workflow at a time and prove recovery before adding unattended coordination."

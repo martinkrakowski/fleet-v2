@@ -1,0 +1,19 @@
+# HexaGen — Architectural Invariants
+# Template: modular-monolith (flexible mode)
+
+shared_kernel:
+  package: "@fleet/shared"
+  allowed_in_all_layers: true
+
+layers:
+  domain:
+    access_rule: "internal-only"
+    allowed_imports: ["@fleet/shared"]
+
+  application:
+    access_rule: "ports-only"
+    allowed_imports: ["domain", "@fleet/shared"]
+
+  infrastructure:
+    access_rule: "adapters"
+    allowed_imports: ["domain", "application", "@fleet/shared"]

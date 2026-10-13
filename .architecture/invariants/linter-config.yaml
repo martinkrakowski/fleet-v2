@@ -1,0 +1,18 @@
+# Rules for @hexagen-monaco/arch-linter
+# Template: modular-monolith (flexible mode)
+
+global_whitelist:
+  - "@fleet/shared"
+  - "@fleet/shared/**"
+
+# Domain layers may not import npm packages (ADR-0054). Nothing is exempt by
+# default — list an exception here only when the library IS the domain artifact,
+# and say why:
+#
+# domain_package_allowlist:
+#   - package: <bounded-context>
+#     allowed_packages:
+#       - some-library
+
+test_double_rules:
+  allowed_cross_package_imports: true

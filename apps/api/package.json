@@ -1,0 +1,28 @@
+{
+  "name": "@fleet/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "nitro build",
+    "dev": "nitro dev --port 3001",
+    "preview": "node .output/server/index.mjs",
+    "prepare": "nitro prepare",
+    "lint": "eslint server --ext .ts",
+    "typecheck": "nitro prepare && tsc --noEmit"
+  },
+  "dependencies": {
+    "@fleet/brief-knowledge": "workspace:*",
+    "@fleet/evidence-and-acceptance": "workspace:*",
+    "@fleet/operator-coordination": "workspace:*",
+    "@fleet/work-execution": "workspace:*",
+    "nitropack": "^2.13.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
+    "typescript": "^5.5.4",
+    "typescript-eslint": "^8.0.0"
+  }
+}

@@ -17,6 +17,7 @@
     "@fleet/evidence-and-acceptance": "workspace:*",
     "@fleet/operator-coordination": "workspace:*",
     "@fleet/work-execution": "workspace:*",
+    "h3": "^1.15.11",
     "nitropack": "^2.13.0"
   },
   "devDependencies": {

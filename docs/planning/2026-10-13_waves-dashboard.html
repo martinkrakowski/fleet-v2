@@ -1,0 +1,1715 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleet · line controller</title>
+<style>
+/* ============================================================ tokens
+   Same names Waves draws from, so the two surfaces read as one family.
+   Dark by default; an explicit light twin under [data-theme="light"].
+   System fonts only: nothing is fetched. */
+:root, :root[data-theme="dark"]{
+  color-scheme: dark;
+  --bg:#05070d; --bg-glass:rgba(5,7,13,.82); --bg-raise:#101623; --bg-sink:#04060b;
+  --card:#0a0e18;
+  --card-sheen:linear-gradient(180deg,rgba(255,255,255,.028),rgba(255,255,255,.008) 42%,rgba(255,255,255,0));
+  --line:rgba(148,163,184,.13); --line-soft:rgba(148,163,184,.08); --line-strong:rgba(148,163,184,.28);
+  --text:#e9eef7; --muted:#93a0bb; --faint:#78849f;
+  --cyan:#22d3ee; --emerald:#34d399; --amber:#fbbf24; --rose:#fb7185; --violet:#c084fc; --slate:#7d8aa5;
+  --glow-cyan:rgba(34,211,238,.13); --glow-violet:rgba(192,132,252,.11);
+  --shadow:0 10px 30px rgba(0,0,0,.35);
+  --radius-card:14px; --radius:8px;
+  --sans:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --display:"Space Grotesk",var(--sans);
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+:root[data-theme="light"]{
+  color-scheme: light;
+  --bg:#f5f7fb; --bg-glass:rgba(245,247,251,.88); --bg-raise:#ffffff; --bg-sink:#eaeef5; --card:#ffffff;
+  --card-sheen:linear-gradient(180deg,rgba(255,255,255,.65),rgba(255,255,255,.25) 42%,rgba(255,255,255,0));
+  --line:rgba(15,23,42,.14); --line-soft:rgba(15,23,42,.09); --line-strong:rgba(15,23,42,.3);
+  --text:#0b1020; --muted:#4c5568; --faint:#61687a;
+  --cyan:#0e7490; --emerald:#047857; --amber:#a16207; --rose:#be123c; --violet:#7e22ce; --slate:#566076;
+  --glow-cyan:rgba(14,116,144,.08); --glow-violet:rgba(126,34,206,.05);
+  --shadow:0 10px 30px rgba(15,23,42,.12);
+}
+@media (prefers-reduced-motion: reduce){ *,*::before,*::after{ transition:none!important; animation:none!important; } }
+
+/* ============================================================ frame */
+*{ box-sizing:border-box }
+html,body{ height:100% }
+body{
+  margin:0;
+  background:
+    radial-gradient(60rem 40rem at 12% -12%,var(--glow-cyan),transparent 70%),
+    radial-gradient(52rem 36rem at 88% -10%,var(--glow-violet),transparent 72%),
+    var(--bg);
+  color:var(--text); font-family:var(--sans); font-size:13px; line-height:1.45;
+  -webkit-font-smoothing:antialiased;
+}
+body::before{
+  content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background-image:
+    linear-gradient(to right, rgb(148 163 184 / 4.5%) 1px, transparent 1px),
+    linear-gradient(to bottom, rgb(148 163 184 / 4.5%) 1px, transparent 1px);
+  background-size:56px 56px;
+  mask-image:linear-gradient(to bottom, rgb(0 0 0 / 90%), rgb(0 0 0 / 0%) 78%);
+}
+::selection{ background:var(--cyan); color:var(--bg) }
+a{ color:var(--cyan); text-decoration:none }
+code,.mono{ font-family:var(--mono); font-size:.92em }
+button{ font:inherit; color:inherit }
+:focus-visible{ outline:2px solid var(--cyan); outline-offset:2px }
+.ic{ width:1em; height:1em; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; flex:none; vertical-align:-.12em }
+.page,.pane>.body{ scrollbar-width:thin; scrollbar-color:var(--line-strong) transparent }
+.page::-webkit-scrollbar,.pane>.body::-webkit-scrollbar{ width:8px; height:8px }
+.page::-webkit-scrollbar-thumb,.pane>.body::-webkit-scrollbar-thumb{ background:var(--line-strong); border-radius:99px }
+
+.app{ display:grid; grid-template-rows:auto auto minmax(0,1fr) auto; height:100vh }
+
+.topbar{
+  position:sticky; top:0; z-index:3;
+  display:flex; align-items:center; gap:.9rem; flex-wrap:wrap;
+  min-height:52px; padding:.45rem 1.1rem;
+  background:var(--bg-glass); backdrop-filter:blur(14px);
+  border-bottom:1px solid var(--line-soft);
+}
+.mark{ display:inline-flex; align-items:center; gap:.5rem }
+.mark svg{ width:1.15rem; height:1.15rem; fill:none; stroke-width:1.8; stroke-linecap:round }
+.mark svg path:nth-child(1){ stroke:var(--cyan) }
+.mark svg path:nth-child(2){ stroke:color-mix(in srgb,var(--cyan) 50%,var(--emerald)) }
+.mark svg path:nth-child(3){ stroke:var(--emerald) }
+.mark b{ font-family:var(--display); font-size:16px; font-weight:700; letter-spacing:-.01em }
+.tag{ border:1px solid var(--line); border-radius:var(--radius); color:var(--faint); font-family:var(--mono); font-size:.6rem; letter-spacing:.16em; padding:.1rem .45rem; text-transform:uppercase }
+nav.views{ display:flex; gap:.15rem; margin-left:.4rem; flex-wrap:wrap }
+nav.views button{ background:none; border:1px solid transparent; border-radius:999px; color:var(--muted); cursor:pointer; padding:.22rem .75rem }
+nav.views button:hover{ color:var(--text) }
+nav.views button[aria-current="page"]{ background:var(--bg-sink); border-color:var(--line); color:var(--text) }
+nav.views button small{ color:var(--faint); font-family:var(--mono); font-size:.65rem; margin-left:.3rem }
+.topctl{ margin-left:auto; display:inline-flex; align-items:center; gap:.55rem; flex-wrap:wrap }
+.iconbtn{ display:inline-flex; align-items:center; justify-content:center; width:1.7rem; height:1.7rem; border:1px solid var(--line); border-radius:var(--radius); background:var(--bg-sink); color:var(--muted); cursor:pointer; font-size:1rem }
+.iconbtn:hover{ color:var(--text); border-color:var(--line-strong) }
+.cadence{ color:var(--faint); font-size:.68rem; min-width:6.8rem; text-align:right }
+.source{ display:inline-flex; align-items:center; gap:.45rem; border:1px solid var(--line); border-radius:999px; padding:.18rem .65rem; color:var(--muted); font-family:var(--mono); font-size:11px; white-space:nowrap }
+.source i{ width:.4rem; height:.4rem; border-radius:50%; background:var(--slate) }
+
+.projects{ display:flex; align-items:center; gap:.35rem; flex-wrap:wrap; padding:.35rem 1.1rem; border-bottom:1px solid var(--line-soft); background:color-mix(in srgb,var(--bg-raise) 72%,transparent) }
+.projects .lbl{ color:var(--faint); font-family:var(--mono); font-size:.62rem; letter-spacing:.12em; text-transform:uppercase; margin-right:.25rem }
+.projects button{ display:inline-flex; align-items:center; gap:.45rem; background:none; border:1px solid transparent; border-radius:999px; color:var(--muted); cursor:pointer; padding:.18rem .65rem }
+.projects button:hover{ color:var(--text); border-color:var(--line-soft) }
+.projects button[aria-current="true"]{ background:var(--bg-sink); border-color:var(--line-strong); color:var(--text) }
+.projects .stat{ display:inline-flex; gap:.28rem; align-items:center }
+.projects .stat i{ width:.42rem; height:.42rem; border-radius:50%; font-style:normal }
+.projects .stat i.u{ border:1.5px dashed var(--amber) }
+.projects .stat i.b{ background:var(--violet) }
+.projects .stat i.a{ background:var(--cyan) }
+.projects .stat b{ font-family:var(--mono); font-weight:500; font-size:.68rem; color:var(--text) }
+
+.page{ min-width:0; min-height:0; overflow:auto; padding:1rem 1.1rem 1.4rem; scrollbar-gutter:stable }
+.page.deskpage{ overflow:hidden; display:grid; grid-template-rows:minmax(0,1fr); padding:.7rem .8rem .8rem }
+.page.deskpage .view{ height:100%; min-height:0; display:grid; grid-template-rows:minmax(0,1fr) }
+.view{ animation:rise .18s ease }
+@keyframes rise{ from{ opacity:0; transform:translateY(4px) } }
+
+.footbar{ display:flex; align-items:flex-start; gap:.25rem 1.25rem; flex-wrap:wrap; padding:.35rem 1.1rem; border-top:1px solid var(--line-soft); background:var(--bg-glass); backdrop-filter:blur(14px); color:var(--muted); font-size:.72rem }
+.footbar .legend{ display:flex; gap:.25rem .8rem; margin-left:auto; flex-wrap:wrap; align-items:center; padding-top:.15rem }
+.footbar .legend span{ display:inline-flex; align-items:center; gap:.3rem; color:var(--faint); font-family:var(--mono); font-size:.62rem; letter-spacing:.06em; text-transform:uppercase }
+.footbar details{ font-size:.75rem }
+.footbar summary{ cursor:pointer; color:var(--muted) }
+.footbar .about{ max-width:78ch; color:var(--muted); margin:.4rem 0 .2rem; padding-left:1.2rem }
+.footbar .about li{ margin:.15rem 0 }
+
+/* ============================================================ parts */
+.card{ background:var(--card-sheen),var(--card); border:1px solid var(--line); border-radius:var(--radius-card) }
+.card.pad{ padding:.75rem .9rem }
+h1{ font-family:var(--display); font-size:1.35rem; letter-spacing:-.01em; margin:0; line-height:1.2 }
+h2{ font-size:.72rem; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); margin:0 0 .5rem; font-weight:600; display:flex; align-items:baseline; gap:.5rem; flex-wrap:wrap }
+h2 .meta{ color:var(--faint); font-family:var(--mono); font-size:.64rem; letter-spacing:0; text-transform:none; margin-left:auto; display:inline-flex; gap:.4rem; align-items:center; flex-wrap:wrap; font-weight:400 }
+.lede{ color:var(--muted); margin:.2rem 0 .9rem; max-width:80ch }
+.lede code{ color:var(--text) }
+.vh-top{ display:flex; align-items:center; gap:.8rem; flex-wrap:wrap; margin:0 0 .15rem }
+.vh-top h1{ flex:none }
+
+.route{ display:inline-flex; align-items:center; font-family:var(--mono); font-size:.6rem; letter-spacing:.02em; color:var(--faint); border:1px solid var(--line-soft); border-radius:999px; padding:.06rem .5rem; white-space:nowrap }
+.route.gap{ color:var(--amber); border:1px dashed color-mix(in srgb,var(--amber) 40%,transparent) }
+
+.counts{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.6rem; margin:0 0 .9rem }
+.count{ padding:.6rem .8rem }
+.count .n{ font-family:var(--mono); font-size:1.6rem; line-height:1.1 }
+.count .n small{ font-size:.9rem; color:var(--faint) }
+.count .l{ font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin-top:.1rem }
+.count .h{ font-size:.72rem; color:var(--faint); margin-top:.2rem }
+.count.unknown .n{ color:var(--amber) }
+.count.blocked .n{ color:var(--violet) }
+
+.linetools{ display:flex; gap:.9rem; align-items:center; flex-wrap:wrap; margin:0 0 .6rem; color:var(--muted); font-size:.8rem }
+.tally{ color:var(--faint); font-size:.68rem }
+.selfilter select{ background:var(--bg-sink); color:var(--text); border:1px solid var(--line); border-radius:var(--radius); padding:.2rem .4rem; font:inherit; font-size:.78rem }
+
+.switch{ display:inline-flex; align-items:center; gap:.45rem; cursor:pointer; user-select:none }
+.switch input{ position:absolute; opacity:0; width:0; height:0 }
+.switch .track{ width:1.9rem; height:1.05rem; border-radius:999px; border:1px solid var(--line-strong); background:var(--bg-sink); position:relative; transition:.15s; flex:none }
+.switch .track::after{ content:""; position:absolute; top:1px; left:1px; width:.78rem; height:.78rem; border-radius:50%; background:var(--muted); transition:.15s }
+.switch input:checked + .track{ background:color-mix(in srgb,var(--cyan) 20%,var(--bg-sink)); border-color:var(--cyan) }
+.switch input:checked + .track::after{ left:calc(100% - .9rem); background:var(--cyan) }
+.switch input:focus-visible + .track{ outline:2px solid var(--cyan); outline-offset:2px }
+
+.linegrid{ display:grid; grid-template-columns:minmax(0,1fr) 26rem; gap:.8rem; align-items:start }
+.rail{ display:flex; flex-direction:column; gap:.8rem; min-width:0 }
+.tablewrap{ overflow:auto }
+.tablewrap.inner{ border:1px solid var(--line-soft); border-radius:var(--radius); margin-top:.3rem }
+
+table.grid{ width:100%; border-collapse:collapse }
+table.grid th{ text-align:left; color:var(--faint); font-family:var(--mono); font-size:.6rem; letter-spacing:.12em; text-transform:uppercase; font-weight:500; padding:.5rem .6rem; border-bottom:1px solid var(--line); white-space:nowrap; position:sticky; top:0; background:var(--card); z-index:1 }
+table.grid td{ padding:.5rem .6rem; border-bottom:1px solid var(--line-soft); vertical-align:top }
+table.grid tr:last-child td{ border-bottom:none }
+table.grid tbody tr.row{ cursor:pointer }
+table.grid tbody tr.row:hover td{ background:color-mix(in srgb,var(--cyan) 5%,transparent) }
+table.grid tbody tr.row:focus-visible{ outline:2px solid var(--cyan); outline-offset:-2px }
+table.grid tbody tr[aria-selected="true"] td{ background:color-mix(in srgb,var(--cyan) 9%,transparent) }
+tr.group td{ background:var(--bg-sink); color:var(--muted); font-family:var(--mono); font-size:.72rem; letter-spacing:.04em; padding-top:.55rem; padding-bottom:.35rem; border-bottom:1px solid var(--line-soft) }
+th.fact,td.fact{ text-align:center; width:4.6rem }
+th.fact{ border-left:1px solid var(--line-soft) }
+th.fact.first{ border-left:1px solid var(--line) }
+th.fact.last,td.fact.last{ border-right:1px solid var(--line) }
+td .sub{ color:var(--muted); font-size:.74rem; display:block; margin-top:.12rem }
+td .sub.warn{ color:var(--amber) }
+.c-att{ width:12rem } .c-state{ width:8.5rem } .c-obs{ width:10.5rem } .c-go{ width:2.2rem; text-align:right; color:var(--faint) }
+.c-go .ic{ width:.9rem; height:.9rem }
+.c-att .badge{ margin-left:.35rem }
+.task{ display:block; max-width:30ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.c-obs .t{ font-weight:500; font-size:.74rem }
+.c-obs .src{ display:block; max-width:11.5rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.factwrap{ display:inline-flex; justify-content:center; width:100% }
+.idbtn{ background:none; border:none; color:var(--text); font-family:var(--mono); font-size:.78rem; cursor:pointer; padding:0 }
+.idbtn:hover{ color:var(--cyan) }
+
+.fact{ display:inline-flex; align-items:center; gap:.35rem; font-family:var(--mono); font-size:.7rem; white-space:nowrap }
+.fact i{ width:.55rem; height:.55rem; border-radius:50%; flex:none }
+.fact.yes{ color:var(--emerald) } .fact.yes i{ background:var(--emerald) }
+.fact.no{ color:var(--slate) } .fact.no i{ border:1.5px solid var(--slate) }
+.fact.unknown{ color:var(--amber) } .fact.unknown i{ border:1.5px dashed var(--amber) }
+.fact.stale{ opacity:.6 }
+
+.badge{ display:inline-flex; align-items:center; gap:.25rem; border:1px solid currentColor; border-radius:999px; background:color-mix(in srgb, currentColor 9%, transparent); font-family:var(--mono); font-size:.6rem; letter-spacing:.05em; padding:.03rem .45rem; text-transform:uppercase; white-space:nowrap; font-weight:500 }
+.badge.active{ color:var(--cyan) } .badge.ended{ color:var(--slate) } .badge.unknown{ color:var(--amber) }
+.badge.blocked{ color:var(--violet) } .badge.queued{ color:var(--muted) } .badge.accepted{ color:var(--emerald) }
+.badge.failed{ color:var(--rose) } .badge.fix{ color:var(--violet) } .badge.keeper{ color:var(--emerald) }
+.badge.candidate{ color:var(--amber) } .badge.l3{ color:var(--violet) }
+.dotword{ font-family:var(--mono); font-size:.7rem }
+.dotword.active{ color:var(--cyan) } .dotword.unknown{ color:var(--amber) } .dotword.blocked{ color:var(--violet) }
+.dotword.accepted{ color:var(--emerald) } .dotword.failed{ color:var(--rose) } .dotword.queued{ color:var(--muted) } .dotword.ended{ color:var(--slate) }
+
+.btn{ background:var(--bg-sink); border:1px solid var(--line-strong); border-radius:var(--radius); cursor:pointer; padding:.35rem .7rem; display:inline-flex; align-items:center; gap:.4rem; color:var(--text) }
+.btn:hover{ border-color:var(--text) }
+.btn[disabled]{ opacity:.5; cursor:default }
+.btn.primary{ border-color:color-mix(in srgb,var(--cyan) 55%,transparent); color:var(--cyan) }
+.btn.danger{ border-color:var(--rose); color:var(--rose) }
+.btn.merge{ border-color:var(--emerald); color:var(--emerald) }
+.btn.violet{ border-color:var(--violet); color:var(--violet) }
+.btn.small{ padding:.18rem .55rem; font-size:.78rem }
+.btn .head{ font-family:var(--mono); font-size:.72rem; color:var(--text); border-left:1px solid var(--line); padding-left:.4rem }
+
+.op{ display:flex; flex-direction:column; gap:.15rem; width:100%; text-align:left; background:var(--bg-sink); border:1px solid var(--line-strong); border-radius:var(--radius); padding:.5rem .65rem; cursor:pointer; margin-bottom:.45rem }
+.op:hover:not([disabled]){ border-color:var(--text) }
+.op[disabled]{ opacity:.55; cursor:default }
+.op.primary{ border-color:color-mix(in srgb,var(--cyan) 55%,transparent) } .op.primary .op-l b{ color:var(--cyan) }
+.op.danger{ border-color:color-mix(in srgb,var(--rose) 55%,transparent) } .op.danger .op-l b{ color:var(--rose) }
+.op.merge{ border-color:color-mix(in srgb,var(--emerald) 55%,transparent) } .op.merge .op-l b{ color:var(--emerald) }
+.op.violet{ border-color:color-mix(in srgb,var(--violet) 55%,transparent) } .op.violet .op-l b{ color:var(--violet) }
+.op-l{ display:flex; align-items:center; gap:.45rem; font-size:.85rem; flex-wrap:wrap }
+.op-l b{ font-weight:600 }
+.op-l .head{ font-family:var(--mono); font-size:.72rem; color:var(--muted); border-left:1px solid var(--line); padding-left:.4rem }
+.op-d{ color:var(--muted); font-size:.73rem; line-height:1.35 }
+.inflight{ display:inline-flex; align-items:center; gap:.35rem; color:var(--amber); font-size:.68rem; margin-left:auto }
+.spin{ width:.72rem; height:.72rem; border-radius:50%; border:2px solid color-mix(in srgb,currentColor 30%,transparent); border-top-color:currentColor; animation:rot .8s linear infinite; display:inline-block; flex:none }
+@keyframes rot{ to{ transform:rotate(1turn) } }
+
+.notoff-wrap{ margin-top:.7rem }
+.notoff-wrap h3{ font-size:.62rem; letter-spacing:.1em; text-transform:uppercase; color:var(--faint); font-weight:600; margin:0 0 .3rem }
+.notoff{ display:flex; gap:.45rem; align-items:baseline; color:var(--faint); font-size:.76rem; padding:.14rem 0; border-top:1px dashed var(--line-soft) }
+.notoff b{ color:var(--muted); font-weight:500; white-space:nowrap }
+
+.note{ border:1px solid var(--amber); border-radius:var(--radius); color:var(--amber); padding:.4rem .6rem; font-size:.78rem; background:var(--bg-raise); margin:.45rem 0 }
+.note.ok{ border-color:var(--emerald); color:var(--emerald) }
+.note.info{ border-color:var(--line-strong); color:var(--muted) }
+.note b{ color:var(--text); font-weight:500 }
+.empty{ padding:1rem; color:var(--muted); font-size:.8rem }
+.none{ color:var(--faint) }
+.warnline{ color:var(--amber) }
+.art{ margin-right:.6rem; font-size:.74rem }
+.art.ok{ color:var(--emerald) } .art.miss{ color:var(--faint) }
+.chip{ display:inline-block; border:1px solid var(--line); border-radius:999px; padding:.02rem .45rem; font-family:var(--mono); font-size:.6rem; color:var(--muted); white-space:nowrap; margin:.06rem .18rem .06rem 0 }
+
+/* ============================================================ desk */
+.desk{ display:grid; grid-template-columns:17.5rem minmax(0,1fr) 26rem; gap:.7rem; height:100%; min-height:0 }
+.pane{ display:flex; flex-direction:column; min-height:0; background:var(--card-sheen),var(--card); border:1px solid var(--line); border-radius:var(--radius-card) }
+.pane>header{ flex:none; padding:.6rem .8rem; border-bottom:1px solid var(--line-soft); display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; min-height:2.3rem }
+.pane>header h2{ margin:0; flex:none }
+.pane>header .meta{ margin-left:auto }
+.pane>.body{ flex:1; min-height:0; overflow:auto; padding:.65rem .8rem }
+
+.attempt-head{ display:flex; flex-direction:column; gap:.3rem; margin:0 0 .7rem }
+.attempt-head h1{ font-family:var(--mono); font-size:1.05rem }
+.attempt-head .badges{ display:flex; gap:.4rem; flex-wrap:wrap; align-items:center }
+.attempt-head .ids{ color:var(--muted); font-family:var(--mono); font-size:.74rem; display:flex; gap:.9rem; flex-wrap:wrap }
+.attempt-head .ids b{ color:var(--text); font-weight:500 }
+
+.facts5{ display:grid; grid-template-columns:repeat(5,1fr); gap:.3rem; margin:.2rem 0 .6rem }
+.facts5 .f{ border:1px solid var(--line-soft); border-radius:var(--radius); padding:.4rem .3rem; text-align:center; background:var(--bg-sink); min-width:0 }
+.facts5 .f .w{ font-size:.56rem; letter-spacing:.06em; text-transform:uppercase; color:var(--faint); display:block; margin-bottom:.25rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.facts5 .f .t{ display:block; font-family:var(--mono); font-size:.58rem; color:var(--faint); margin-top:.25rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+
+.steps{ display:flex; margin:.4rem 0 .9rem; overflow-x:auto; padding-bottom:.2rem }
+.step{ flex:1; min-width:3.8rem; position:relative; text-align:center }
+.step::before{ content:""; position:absolute; top:.42rem; left:-50%; width:100%; height:2px; background:var(--line) }
+.step:first-child::before{ display:none }
+.step .dot{ position:relative; display:block; width:.85rem; height:.85rem; border-radius:50%; margin:0 auto .3rem; background:var(--bg-sink); border:2px solid var(--line-strong) }
+.step.done .dot{ background:var(--emerald); border-color:var(--emerald) }
+.step.done::before{ background:color-mix(in srgb,var(--emerald) 45%,transparent) }
+.step.now .dot{ border-color:var(--cyan); box-shadow:0 0 0 4px color-mix(in srgb,var(--cyan) 16%,transparent); animation:breathe 2.2s ease-in-out infinite }
+@keyframes breathe{ 50%{ box-shadow:0 0 0 7px color-mix(in srgb,var(--cyan) 22%,transparent) } }
+.step.unknown .dot{ border:2px dashed var(--amber) }
+.step.fail .dot{ background:var(--rose); border-color:var(--rose) }
+.step.fail::before{ background:color-mix(in srgb,var(--rose) 45%,transparent) }
+.step.door .dot{ border-color:var(--violet); background:color-mix(in srgb,var(--violet) 40%,transparent) }
+.step .w{ display:block; font-size:.56rem; letter-spacing:.08em; text-transform:uppercase; color:var(--faint) }
+.step .t{ display:block; font-family:var(--mono); font-size:.58rem; color:var(--muted) }
+.step.faint{ opacity:.55 }
+
+dl.kv{ display:grid; grid-template-columns:max-content minmax(0,1fr); gap:.2rem .8rem; margin:0; font-size:.8rem }
+dl.kv dt{ color:var(--muted) }
+dl.kv dd{ margin:0; overflow-wrap:anywhere }
+dl.kv dd.mono{ font-size:.76rem }
+.sect{ margin:0 0 .95rem }
+.sect h2 .meta{ margin-left:auto }
+
+.receipt{ border:1px solid var(--line); border-left:3px solid var(--slate); border-radius:var(--radius); padding:.4rem .6rem; margin:0 0 .4rem; background:var(--bg-sink); font-size:.78rem }
+.receipt.pass{ border-left-color:var(--emerald) }
+.receipt.fail{ border-left-color:var(--rose) }
+.receipt.pending{ border-left-color:var(--line-strong); border-style:dashed; color:var(--faint) }
+.receipt .t{ font-family:var(--mono); font-size:.68rem; color:var(--faint); display:flex; justify-content:space-between; gap:.5rem; flex-wrap:wrap }
+.receipt .t b{ color:var(--text); font-weight:500 }
+.receipt p{ margin:.2rem 0 0 }
+
+ul.plain{ margin:.2rem 0 0; padding-left:1.1rem }
+ul.plain li{ margin:.1rem 0 }
+ul.check{ list-style:none; margin:0; padding:0; font-size:.78rem }
+ul.check li{ display:flex; gap:.5rem; padding:.14rem 0; align-items:baseline }
+ul.check li i{ font-family:var(--mono); color:var(--emerald); width:2.6rem; flex:none; font-style:normal; font-size:.64rem }
+ul.check li.fail i{ color:var(--rose) }
+ul.check li b{ font-weight:500 }
+details.inline summary{ cursor:pointer; color:var(--cyan); font-size:.74rem }
+
+.alist{ list-style:none; margin:.3rem 0 0; padding:0 }
+.alist li{ border:1px solid var(--line-soft); border-radius:var(--radius); padding:.45rem .55rem; margin:0 0 .4rem; cursor:pointer; background:var(--bg-sink); display:flex; flex-direction:column; gap:.12rem }
+.alist li:hover{ border-color:var(--line-strong) }
+.alist li[aria-current="true"]{ border-color:var(--cyan); box-shadow:0 0 0 3px color-mix(in srgb,var(--cyan) 14%,transparent) }
+.alist .id{ font-family:var(--mono); font-size:.76rem; display:flex; gap:.4rem; align-items:center; justify-content:space-between }
+.alist .id b{ font-weight:500; color:var(--text) }
+.alist .k{ color:var(--muted); font-size:.72rem }
+.alist .k.mono{ font-size:.68rem }
+
+.doorcard{ border:1px solid color-mix(in srgb,var(--violet) 45%,transparent); border-left:3px solid var(--violet); border-radius:var(--radius); padding:.55rem .65rem; margin:.8rem 0; background:color-mix(in srgb,var(--violet) 6%,var(--bg-sink)) }
+.doorcard .dc-h{ display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; color:var(--text); font-size:.8rem }
+.doorcard .q{ margin:.35rem 0; color:var(--text); font-size:.84rem }
+.doorcard .btn{ margin-top:.4rem }
+.doorcard .src{ color:var(--faint); font-size:.68rem; margin:.4rem 0 0 }
+
+.jentry{ border:1px solid var(--line-soft); border-left:3px solid var(--slate); border-radius:var(--radius); background:var(--bg-sink); padding:.35rem .55rem; margin-bottom:.4rem; font-size:.74rem }
+.jentry.ok{ border-left-color:var(--emerald) } .jentry.unknown{ border-left-color:var(--amber) }
+.jentry.ni{ border-left-color:var(--slate) } .jentry.err{ border-left-color:var(--rose) }
+.jentry .h{ display:flex; gap:.5rem; align-items:baseline; justify-content:space-between; flex-wrap:wrap }
+.jentry .h b{ font-weight:500 }
+.jentry .h .mono{ color:var(--faint); font-size:.64rem }
+.jentry p{ margin:.15rem 0 0; color:var(--muted) }
+.jentry .f{ color:var(--faint); font-size:.62rem; margin-top:.1rem }
+
+/* markdown, read-only: nothing inside is a control */
+.md{ max-width:72ch }
+.md h1{ font-size:1.12rem; margin:0 0 .6rem; font-family:var(--display) }
+.md h2{ font-size:.95rem; letter-spacing:0; text-transform:none; color:var(--text); margin:1rem 0 .35rem; font-weight:600 }
+.md h3{ font-size:.88rem; margin:.8rem 0 .3rem }
+.md p{ margin:0 0 .6rem; color:var(--text) }
+.md ul,.md ol{ margin:0 0 .6rem; padding-left:1.3rem }
+.md li{ margin:.18rem 0 }
+.md code{ background:color-mix(in srgb,var(--cyan) 10%,transparent); border-radius:4px; padding:.05rem .3rem; color:var(--cyan) }
+.md pre{ background:var(--bg-sink); border:1px solid var(--line); border-radius:var(--radius); padding:.6rem .8rem; overflow:auto }
+.md pre code{ background:none; color:var(--text); padding:0 }
+.md table{ border-collapse:collapse; margin:.4rem 0 .8rem; font-size:.8rem }
+.md th,.md td{ border:1px solid var(--line); padding:.25rem .5rem; text-align:left }
+
+.brief-stamp{ display:flex; gap:.8rem; flex-wrap:wrap; align-items:center; color:var(--faint); font-family:var(--mono); font-size:.68rem; margin:0 0 .7rem; padding-bottom:.5rem; border-bottom:1px dashed var(--line) }
+.brief-stamp b{ color:var(--muted); font-weight:500 }
+details.brief{ border:1px solid var(--line-soft); border-radius:var(--radius); padding:.5rem .65rem; background:var(--bg-sink) }
+details.brief summary{ display:flex; gap:.6rem; align-items:baseline; cursor:pointer; color:var(--muted); font-size:.8rem; flex-wrap:wrap; list-style:none }
+details.brief summary::-webkit-details-marker{ display:none }
+details.brief summary .dg{ font-family:var(--mono); font-size:.7rem; color:var(--faint) }
+details.brief summary .ic{ margin-left:auto; color:var(--faint) }
+details.brief[open] summary .ic{ transform:rotate(90deg) }
+details.brief .brief-stamp{ margin-top:.6rem }
+.digest{ font-family:var(--mono); font-size:.78rem; overflow-wrap:anywhere }
+
+.brief-grid{ display:grid; grid-template-columns:23rem minmax(0,1fr); gap:.8rem; align-items:start }
+.woitem{ display:flex; flex-direction:column; gap:.15rem; width:100%; text-align:left; background:var(--bg-sink); border:1px solid var(--line-soft); border-radius:var(--radius); padding:.45rem .6rem; margin-bottom:.4rem; cursor:pointer; color:var(--muted) }
+.woitem:hover{ border-color:var(--line-strong) }
+.woitem[aria-current="true"]{ border-color:var(--cyan); box-shadow:0 0 0 3px color-mix(in srgb,var(--cyan) 14%,transparent) }
+.woitem .t{ color:var(--text); font-size:.8rem }
+.woitem .m{ font-family:var(--mono); font-size:.64rem; color:var(--faint) }
+.woitem.needs .m{ color:var(--amber) }
+.listhead{ margin:.9rem 0 .35rem; font-size:.6rem; letter-spacing:.1em; text-transform:uppercase; color:var(--faint); font-weight:600 }
+table.rows td.claim{ max-width:36ch } table.rows td.mono{ white-space:nowrap; font-size:.74rem }
+table.rows td.why{ max-width:30ch } table.rows td.src{ white-space:nowrap; font-size:.72rem }
+table.rows tr.excluded td.claim,table.rows tr.excluded td.why{ color:var(--faint) }
+table.rows tr.excluded td.claim .c{ text-decoration:line-through; text-decoration-color:var(--line-strong) }
+table.rows td.inc{ width:3.4rem; text-align:center }
+.freeze-bar{ display:flex; gap:.8rem; align-items:center; flex-wrap:wrap; margin-top:.8rem; padding-top:.7rem; border-top:1px solid var(--line) }
+.freeze-bar .sum{ color:var(--muted); font-size:.76rem }
+.lockstamp{ display:inline-flex; gap:.3rem; align-items:center; font-family:var(--mono); font-size:.62rem; color:var(--muted); white-space:nowrap }
+.lockstamp.in{ color:var(--emerald) } .lockstamp.out{ color:var(--faint) }
+
+.cands{ display:grid; grid-template-columns:repeat(auto-fill,minmax(26rem,1fr)); gap:.7rem }
+.cand{ border:1px solid var(--line-soft); border-radius:var(--radius); background:var(--bg-sink); padding:.6rem .7rem }
+.cand .ch{ display:flex; gap:.5rem; align-items:center; flex-wrap:wrap }
+.cand .ch b{ font-weight:500 }
+.cand .claim{ margin:.35rem 0; color:var(--text); font-size:.84rem }
+.cand .prov{ font-size:.74rem }
+.cand .prov b{ color:var(--text); font-weight:500 }
+.acceptline{ font-size:.74rem; margin:.45rem 0 .2rem; padding:.25rem .5rem; border-radius:var(--radius); border:1px solid color-mix(in srgb,var(--emerald) 40%,transparent); color:var(--emerald) }
+.decided{ font-size:.7rem; font-family:var(--mono) }
+.decided.accept{ color:var(--emerald) } .decided.reject{ color:var(--rose) }
+.decided.unresolved{ color:var(--muted) } .decided.policy{ color:var(--violet) }
+.cand .disp{ display:flex; gap:.4rem; flex-wrap:wrap; margin-top:.5rem }
+
+.seats{ display:grid; grid-template-columns:repeat(3,1fr); gap:.35rem; margin:.5rem 0 }
+.seat{ border:1px dashed var(--line-strong); border-radius:var(--radius); padding:.3rem .35rem; text-align:center; font-family:var(--mono); font-size:.6rem; color:var(--faint); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.seat b{ display:block; font-weight:500; color:var(--faint); font-size:.56rem; letter-spacing:.08em; text-transform:uppercase }
+.seat.held{ border-style:solid; border-color:color-mix(in srgb,var(--cyan) 45%,transparent); background:color-mix(in srgb,var(--cyan) 9%,transparent) }
+.seat.held .who{ color:var(--text) }
+.q .lbl{ color:var(--faint); font-family:var(--mono); font-size:.6rem; letter-spacing:.1em; text-transform:uppercase }
+.qitem{ display:flex; gap:.55rem; align-items:baseline; border:1px solid var(--line-soft); border-radius:var(--radius); padding:.3rem .5rem; margin-top:.35rem; background:var(--bg-sink); font-size:.72rem; cursor:pointer }
+.qitem:hover{ border-color:var(--line-strong) }
+.qitem b{ font-weight:500 }
+.qitem .mono{ color:var(--faint); margin-left:auto }
+.q.none{ color:var(--faint); font-size:.72rem; margin-top:.4rem }
+.capnote{ color:var(--faint); font-size:.68rem; margin:.45rem 0 0 }
+.kvline{ color:var(--muted); font-family:var(--mono); font-size:.7rem }
+
+.attn{ border:1px solid var(--line-soft); border-left:3px solid var(--slate); border-radius:var(--radius); padding:.45rem .6rem; margin-bottom:.45rem; background:var(--bg-sink) }
+.attn .tt{ font-size:.8rem; color:var(--text) }
+.attn .tt b{ font-weight:500; font-family:var(--mono); font-size:.72rem }
+.attn .ss{ color:var(--muted); font-size:.72rem; margin:.12rem 0 .28rem }
+.attn .rr{ display:flex; gap:.4rem; flex-wrap:wrap }
+.attn.unknown{ border-left-color:var(--amber) } .attn.blocked{ border-left-color:var(--violet) }
+.attn.failed{ border-left-color:var(--rose) } .attn.mergeable{ border-left-color:var(--emerald) }
+.attn.queued{ border-left-color:var(--slate) } .attn.collect{ border-left-color:var(--cyan) }
+
+.toasts{ position:fixed; right:1rem; bottom:3.4rem; display:flex; flex-direction:column; gap:.5rem; z-index:50; width:min(26rem,calc(100vw - 2rem)) }
+.toast{ background:var(--bg-glass); backdrop-filter:blur(12px); border:1px solid var(--line-strong); border-left:3px solid var(--cyan); border-radius:10px; padding:.55rem .7rem; box-shadow:var(--shadow); animation:rise .2s ease }
+.toast.ok{ border-left-color:var(--emerald) } .toast.unknown{ border-left-color:var(--amber) }
+.toast.ni{ border-left-color:var(--slate) } .toast.err{ border-left-color:var(--rose) }
+.toast .t{ display:flex; gap:.6rem; align-items:baseline; justify-content:space-between }
+.toast .t b{ font-weight:600; font-size:.8rem }
+.toast .t .mono{ color:var(--faint); font-size:.64rem }
+.toast p{ margin:.2rem 0 0; color:var(--muted); font-size:.76rem }
+.toast .f{ color:var(--faint); font-size:.62rem; margin-top:.25rem }
+.tclose{ background:none; border:none; color:var(--faint); cursor:pointer; font-size:1rem; padding:0 .1rem; line-height:1 }
+.tclose:hover{ color:var(--text) }
+
+@media (max-width:72rem){
+  .linegrid{ grid-template-columns:1fr }
+  .desk{ grid-template-columns:1fr; height:auto }
+  .page.deskpage{ overflow:auto; display:block }
+  .page.deskpage .view{ height:auto; display:block }
+  .pane>.body{ overflow:visible; max-height:none }
+  .brief-grid{ grid-template-columns:1fr }
+  .counts{ grid-template-columns:repeat(2,1fr) }
+}
+@media (max-width:48rem){
+  .topbar,.footbar{ position:static }
+  .counts{ grid-template-columns:1fr }
+  th.fact,td.fact{ width:auto }
+  .factwrap .fact span{ display:none }
+  .c-obs .src,.task{ max-width:14rem }
+  .c-att{ width:auto }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <span class="mark" aria-label="Fleet">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18"/><path d="M3 12h13"/><path d="M3 17h8"/></svg>
+      <b>fleet</b>
+    </span>
+    <span class="tag">line controller</span>
+    <nav class="views" aria-label="Views" id="nav"></nav>
+    <div class="topctl">
+      <button class="iconbtn" data-action="refresh" title="Read the station again" aria-label="Read the station again">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.9-6.2"/><path d="M20 3v5h-5"/></svg>
+      </button>
+      <span class="cadence mono" id="countdown">next read 15 s</span>
+      <button class="iconbtn" data-action="theme" id="themeBtn" title="Switch to the light twin" aria-label="Switch theme"></button>
+      <span class="source" id="stamp" title="Every value on this page comes from a fixture file. Nothing reaches a runner."><i></i>fixture · no live host</span>
+    </div>
+  </header>
+  <nav class="projects" aria-label="Projects" id="projects"></nav>
+  <main class="page" id="page"></main>
+  <footer class="footbar">
+    <details>
+      <summary>What this draft leaves out on purpose</summary>
+      <ul class="about">
+        <li>No “system online” pill, no approval rate, no average handling time. The header counts work, not health.</li>
+        <li>No one-key approve or reject, and no hotkey that answers a question. A signed answer is a scoped decision and it is given in Waves.</li>
+        <li>No generic task queue. The home page is attempts, each with five runner facts kept apart. Unknown is its own state.</li>
+        <li>No button appears unless the API said that operation is legal for this attempt. What is not offered is said in words.</li>
+        <li>Nothing on the Brief or Knowledge page writes a policy. A policy proposal leaves the product.</li>
+        <li>501 renders as “not implemented on this station”; 409 on an unknown outcome renders as the amber unknown. A capped or offline station is a note, never an empty table that looks like “nothing running”.</li>
+        <li>Arrow keys move the selection; Enter opens the record under focus. No key performs an operation.</li>
+        <li>No live host, no provider key, no remote port that answers. Every value is read from a fixture shaped like the brief package, the five-fact observation and the worktree inspection. The refresh cadence advances a virtual clock; the silent runner stays unknown — this page never upgrades a fact by itself.</li>
+      </ul>
+    </details>
+    <div class="legend">
+      <span class="fact yes"><i></i><span>yes</span></span>
+      <span class="fact no"><i></i><span>no</span></span>
+      <span class="fact unknown"><i></i><span>unknown</span></span>
+      <span class="dotword blocked">● blocked on a decision</span>
+      <span class="route gap">gap · a route the plan does not name</span>
+    </div>
+  </footer>
+</div>
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<script>
+/* ============================================================ fixture
+   Shaped like the records the API will return once its routes leave 501:
+   the five-fact observation (ReconcileAttempt), the worktree inspection
+   (runner port), the brief package (PrepareBriefPackage) and receipts.
+   Hosts, paths and seats here are sample values, not an installation. */
+const FIXTURE = {
+  loadedAt: "2026-10-13T14:02:10Z",
+  capacity: { host: "execution host A", port: 4166, slots: 3 },
+  install: { wavesInboxUrl: "#waves-inbox" }, /* the inbox URL comes from installation values, never from the client */
+  projects: ["fleet-v2", "waves", "hexagen"],
+  workOrders: {
+    "wo-0142": { project: "fleet-v2", task: "Wire the Nitro API route surface (step A)", lane: "api-routes-a", base: "0da21c4", policy: "pol-2026-10-11.3" },
+    "wo-0139": { project: "fleet-v2", task: "Worktree inspection as a typed contract", lane: "runner-inspect", base: "0da21c4", policy: "pol-2026-10-11.3" },
+    "wo-0137": { project: "fleet-v2", task: "Reconcile runbook fixture and journal replay", lane: "journal-replay", base: "c69dcaa", policy: "pol-2026-10-11.3" },
+    "wo-0131": { project: "waves", task: "Relay and host-alert contract beside waves/v1 (W1)", lane: "contract-w1", base: "4e1a9b0", policy: "pol-2026-10-11.3" },
+    "wo-0128": { project: "hexagen", task: "Emit adapter bindings from the manifest", lane: "bindings-emit", base: "b77c3d1", policy: "pol-2026-10-11.3" },
+    "wo-0133": { project: "waves", task: "Enrol-key rotation runbook fixture", lane: "enrol-rotate", base: "4e1a9b0", policy: "pol-2026-10-11.3" },
+    "wo-0146": { project: "fleet-v2", task: "Five-fact observation as a typed port (step C)", lane: "facts-port", base: "0da21c4", policy: "pol-2026-10-11.3" },
+    "wo-0144": { project: "fleet-v2", task: "Replace empty route bodies with port types (step B)", lane: "api-routes-b", base: "0da21c4", policy: "pol-2026-10-11.3", unfrozen: true,
+      manifest: { "dispatch id": "assigned on dispatch", repository: "fleet-v2", "base commit": "0da21c4", "policy revision": "pol-2026-10-11.3",
+        "owned paths": "apps/api/server/routes/**", permissions: "read, write inside owned paths; no push, no gh, no ssh, no curl, no sudo",
+        "knowledge versions": "from the included rows at freeze", bounds: "100 steps · 45 min · 2 cpu · 4 GiB",
+        "expected artifacts": ".lane/notes.md, .lane/receipt.json", "decision references": "none" } }
+  },
+  attempts: [
+    {
+      id: "att_01J9ZM8R2C", wo: "wo-0142", kind: "fix", number: 2, fixOf: "att_01J9ZK3Q7V",
+      session: "ses_9c04d", port: 4166, slot: 2, capacity: "held",
+      startedAt: "13:41:08Z", observedAt: "14:02:04Z", observedFrom: "runner port 4166 · session ses_9c04d",
+      facts: { reachable: "yes", prepared: "yes", active: "yes", ended: "no", collected: "no" },
+      model: { implementer: "glm-5.3 · low", fallback: "laguna-s-2.1", reviewer: "gpt-6-luna" },
+      readiness: [
+        ["Runner reachable", true, "port 4166 answered in 40 ms"], ["Repository", true, "fleet-v2 worktree api-routes-a"],
+        ["Base commit", true, "HEAD 7b2d0aa, two commits on base 0da21c4 as the manifest says"], ["Toolchain", true, "node 22, yarn 4.12"],
+        ["Dependencies", true, "install completed 13:40:51Z"], ["Brief", true, "digest matches sha256:4c1e…9a2f"],
+        ["Isolation", true, "worktree scope, no egress, 2 cpu, 4 GiB, process-tree stop"], ["Completion", true, "runner reports command end"],
+        ["Credentials", true, "no key, token or .pgpass readable by the worker"], ["Capacity", true, "slot 2 reserved by this attempt; no other session in the worktree"]
+      ],
+      worktree: {
+        inspectedAt: "14:02:04Z", commit: "9f3e1c2", base: "0da21c4", commitsSinceDispatch: 1,
+        uncommitted: ["apps/api/server/envelope.ts", "apps/api/server/routes/v1/attempts.get.ts", "apps/api/server/composition.ts"],
+        untracked: ["apps/api/server/routes/v1/attempts.get.test.ts"],
+        residue: [], artifacts: [[".lane/notes.md", false], [".lane/receipt.json", false]]
+      },
+      receipts: { completion: null, verification: null, review: null, acceptance: null, decision: null },
+      legal: ["reconcile", "stop"],
+      notOffered: [["collect", "the command has not ended"], ["fix", "this attempt is still running"], ["merge", "no acceptance receipt at the current head"]],
+      cost: { steps: 41, minutes: 21, usd: 0.07 },
+      brief: {
+        digest: "sha256:4c1e5b0d…9a2f", frozenAt: "13:40:12Z", original: "sha256:b81a…07d3 (att_01J9ZK3Q7V)",
+        manifest: {
+          "dispatch id": "dsp_01J9ZM8Q", repository: "fleet-v2", "base commit": "0da21c4 (branch head 7b2d0aa)", "policy revision": "pol-2026-10-11.3",
+          "owned paths": "apps/api/**", permissions: "read, write inside owned paths; no push, no gh, no ssh, no curl, no sudo",
+          "knowledge versions": "k-017 v2, k-023 v1, k-009 v3", bounds: "100 steps · 45 min · 2 cpu · 4 GiB",
+          "expected artifacts": ".lane/notes.md, .lane/receipt.json", "decision references": "none"
+        },
+        markdown: `# Fix attempt 2 · wo-0142 · api-routes-a
+
+Fresh session. The original package is \`sha256:b81a…07d3\`. Do not resume \`ses_7f21a\`; its conversation is not yours.
+
+## On the branch
+- \`lane/api-routes-a\` is at 7b2d0aa, two commits on base 0da21c4.
+- \`apps/api/server/composition.ts\`, \`apps/api/server/envelope.ts\`, \`apps/api/server/routes/v1/*.ts\` were added by attempt 1.
+- Verification at 7b2d0aa failed: \`yarn typecheck\` in \`apps/api\` (receipt vrf-0217).
+
+## Fixes
+1. \`apps/api/server/routes/v1/attempts.get.ts:14\` returns 200 when the outcome is unknown. Return 409 with code \`attempt.unknown\`.
+2. \`apps/api/server/envelope.ts:9\` types \`result\` as \`unknown\`. The envelope is \`{ operationId, code, result: object | null }\`.
+3. \`InspectWorkOrder\` is imported from the package root. Import it from \`@fleet/work-execution/application\`.
+
+## Proof
+- \`yarn typecheck\` in \`apps/api\` passes. Run nothing else in the root.
+- A GET on \`/v1/attempts/att_x\` whose outcome is unknown returns 409.
+- \`GET /\` still returns \`{ status: "ok", app: "api" }\`.
+
+## Bounds
+100 steps, 45 minutes. Owned paths \`apps/api/**\`. Nothing under \`server/\` imports \`node:child_process\`.
+
+## Context selected for this brief
+| Entry | Claim |
+|---|---|
+| k-017 v2 | Nitro routes live under \`server/routes\`; \`srcDir\` is set in \`nitro.config.ts\`. |
+| k-023 v1 | Hexagen regenerates \`*.in-port.ts\`; hand edits are overwritten on sync. |
+| k-009 v3 | Routes must not import \`node:child_process\`; review greps \`server/\`. |
+
+Write \`.lane/notes.md\` before you stop: one claim per line, with the path it is about.`
+      }
+    },
+    {
+      id: "att_01J9ZN4H8Y", wo: "wo-0128", kind: "first", number: 1,
+      session: "ses_2e71b", port: 4166, slot: 3, capacity: "held",
+      startedAt: "13:52:30Z", observedAt: "14:02:05Z", observedFrom: "runner port 4166 · session ses_2e71b",
+      facts: { reachable: "yes", prepared: "yes", active: "yes", ended: "no", collected: "no" },
+      model: { implementer: "glm-5.3-flash · low", fallback: "laguna-s-2.1", reviewer: "longcat-2.5-preview" },
+      readiness: null,
+      worktree: { inspectedAt: "14:02:05Z", commit: "b77c3d1", base: "b77c3d1", commitsSinceDispatch: 0, uncommitted: ["packages/emit/src/bindings.ts"], untracked: [], residue: [], artifacts: [[".lane/notes.md", false], [".lane/receipt.json", false]] },
+      receipts: { completion: null, verification: null, review: null, acceptance: null, decision: null },
+      legal: ["reconcile", "stop"],
+      notOffered: [["collect", "the command has not ended"], ["merge", "no acceptance receipt at the current head"]],
+      cost: { steps: 18, minutes: 9, usd: 0.03 },
+      brief: { digest: "sha256:77d0…c41b", frozenAt: "13:52:01Z", manifest: { "owned paths": "packages/emit/**", bounds: "100 steps · 45 min" }, markdown: "# wo-0128 · bindings-emit\n\nEmit `adapter_bindings` from the manifest into the composition root stubs.\n\n## Proof\n- `yarn sync:check` reports no drift." }
+    },
+    {
+      id: "att_01J9ZH1M4T", wo: "wo-0139", kind: "first", number: 1,
+      session: "ses_3a8e0", port: 4166, slot: 1, capacity: "held",
+      startedAt: "13:22:44Z", observedAt: "14:01:58Z", observedFrom: "runner port 4166 did not answer (10 s timeout). Last answer 13:48:10Z.",
+      facts: { reachable: "unknown", prepared: "unknown", active: "unknown", ended: "unknown", collected: "no" },
+      lastKnown: { at: "13:48:10Z", facts: { reachable: "yes", prepared: "yes", active: "yes", ended: "no", collected: "no" } },
+      model: { implementer: "glm-5.3 · low", fallback: "laguna-s-2.1", reviewer: "gpt-6-luna" },
+      readiness: null,
+      worktree: { inspectedAt: "13:48:10Z", stale: true, commit: "c41d8e7", base: "0da21c4", commitsSinceDispatch: 1, uncommitted: ["packages/work-execution/src/ports/worktree-inspection.out-port.ts"], untracked: [], residue: [], artifacts: [[".lane/notes.md", false], [".lane/receipt.json", false]] },
+      receipts: { completion: null, verification: null, review: null, acceptance: null, decision: null },
+      legal: ["reconcile"],
+      notOffered: [["stop", "the runner cannot be read; a stop needs the runner to confirm termination"], ["collect", "the outcome is unknown; unknown is not ended"], ["merge", "unknown never frees capacity"]],
+      cost: { steps: 63, minutes: 26, usd: 0.12, note: "to last finished tool call" },
+      brief: { digest: "sha256:0a9e…d2f7", frozenAt: "13:22:10Z", manifest: { "owned paths": "packages/work-execution/**", bounds: "100 steps · 45 min" }, markdown: "# wo-0139 · runner-inspect\n\nType the worktree inspection on the runner port: checked-out commit, uncommitted and untracked changes, residue from earlier attempts, artifact presence. A record, not prose.\n\n## Proof\n- `yarn typecheck` in `packages/work-execution` passes.\n- One unit test builds the record from a fixture directory." }
+    },
+    {
+      id: "att_01J9ZQ6T1A", wo: "wo-0133", kind: "first", number: 1,
+      session: null, port: 4166, slot: null, capacity: "pending",
+      startedAt: null, queuedAt: "14:00:12Z", queueBound: "30 min", observedAt: "14:02:06Z", observedFrom: "journal · intent recorded, no session id",
+      facts: { reachable: "yes", prepared: "yes", active: "no", ended: "no", collected: "no" },
+      model: { implementer: "glm-5.3-flash · low", fallback: "laguna-s-2.1", reviewer: "longcat-2.5-preview" },
+      readiness: null,
+      worktree: { inspectedAt: "14:00:10Z", commit: "4e1a9b0", base: "4e1a9b0", commitsSinceDispatch: 0, uncommitted: [], untracked: [], residue: [], artifacts: [[".lane/brief/package.md", true], [".lane/notes.md", false]] },
+      receipts: { completion: null, verification: null, review: null, acceptance: null, decision: null },
+      legal: ["stop"],
+      notOffered: [["reconcile", "no session exists yet; the intent record is the truth"], ["dispatch again", "the journal already holds this intent; a second record would be a duplicate"]],
+      cost: null,
+      brief: { digest: "sha256:e3b0…1f44", frozenAt: "13:59:50Z", manifest: { "owned paths": "docs/runbooks/**", bounds: "60 steps · 30 min" }, markdown: "# wo-0133 · enrol-rotate\n\nWrite the fixture for the enrol-key rotation runbook. No token in the fixture." }
+    },
+    {
+      id: "att_01J9ZT4C6H", wo: "wo-0146", kind: "first", number: 1,
+      session: "ses_6f2d9", port: 4166, slot: null, capacity: "released",
+      startedAt: "13:54:02Z", observedAt: "13:58:44Z", observedFrom: "completion receipt cmp-0312 · runner port 4166",
+      facts: { reachable: "yes", prepared: "yes", active: "no", ended: "yes", collected: "no" },
+      model: { implementer: "glm-5.3-flash · low", fallback: "laguna-s-2.1", reviewer: "longcat-2.5-preview" },
+      readiness: null,
+      worktree: { inspectedAt: "13:58:44Z", commit: "d41c8f3", base: "0da21c4", commitsSinceDispatch: 1, uncommitted: [], untracked: [], residue: [], artifacts: [[".lane/notes.md", false], [".lane/receipt.json", true]] },
+      receipts: {
+        completion: { id: "cmp-0312", at: "13:58:40Z", exit: 0, pass: true, text: "command ended; process group gone; slot 1 released 13:58:44Z" },
+        verification: null, review: null, acceptance: null, decision: null
+      },
+      legal: ["collect"],
+      notOffered: [["reconcile", "a completion receipt exists (cmp-0312); the slot is already released"], ["fix", "verification has not run"], ["merge", "no acceptance receipt at the current head"]],
+      cost: { steps: 34, minutes: 5, usd: 0.02 },
+      brief: { digest: "sha256:9d10…aa07", frozenAt: "13:53:30Z", manifest: { "owned paths": "apps/api/**", bounds: "60 steps · 30 min" }, markdown: "# wo-0146 · facts-port\n\nType the five-fact observation as a port: reachable, prepared, active, ended, collected — each yes, no or unknown, with the time observed and the source that reported it.\n\n## Proof\n- `yarn typecheck` in `apps/api` passes." }
+    },
+    {
+      id: "att_01J9ZF2N6P", wo: "wo-0131", kind: "first", number: 1,
+      session: "ses_5d33c", port: 4166, slot: null, capacity: "released",
+      startedAt: "12:48:02Z", observedAt: "13:27:40Z", observedFrom: "completion receipt cmp-0309 · runner port 4166",
+      facts: { reachable: "yes", prepared: "yes", active: "no", ended: "yes", collected: "yes" },
+      model: { implementer: "glm-5.3 · low", fallback: "laguna-s-2.1", reviewer: "gpt-6-luna" },
+      readiness: null,
+      worktree: { inspectedAt: "13:27:40Z", commit: "a81f4e2", base: "4e1a9b0", commitsSinceDispatch: 3, uncommitted: [], untracked: [], residue: [], artifacts: [[".lane/notes.md", true], [".lane/receipt.json", true]] },
+      receipts: {
+        completion: { id: "cmp-0309", at: "13:26:51Z", exit: 0, pass: true, text: "command ended; process group gone; slot 1 released 13:26:55Z" },
+        verification: { id: "vrf-0220", at: "13:33:12Z", head: "a81f4e2", pass: true, text: "verification host L · 118 tests pass · contract fixtures match" },
+        review: { id: "rev-0118", at: "13:29:30Z", head: "a81f4e2", pass: true, text: "gpt-6-luna · 0 blockers · 1 note: name the new resource type in the changelog" },
+        acceptance: null,
+        decision: { id: "d-0311", pending: true, askedAt: "13:30:05Z", door: "one-way", question: "Add relay and host-alert resource types beside waves/v1 (pending decision W1)?", scope: "wo-0131 · head a81f4e2 · policy pol-2026-10-11.3", answer: null }
+      },
+      legal: [],
+      notOffered: [["merge", "awaiting decision d-0311 in Waves; silence is not approval"], ["fix", "nothing to fix: verification and review passed at a81f4e2"], ["reconcile", "the attempt ended and was collected"]],
+      cost: { steps: 88, minutes: 38, usd: 0.19 },
+      brief: { digest: "sha256:91ac…55e0", frozenAt: "12:47:30Z", manifest: { "owned paths": "packages/contract/**", bounds: "100 steps · 45 min", "decision references": "W1 (pending)" }, markdown: "# wo-0131 · contract-w1\n\nAdd the relay and host-alert resource types beside `waves/v1`. Keep `waves/v1` intact.\n\n## Proof\n- Existing `waves/v1` fixtures unchanged.\n- One fixture per new type.\n\n## Door\nThis is a new contract type (W1). The merge needs a signed decision; do not assume it." }
+    },
+    {
+      id: "att_01J9ZD5W9K", wo: "wo-0137", kind: "first", number: 1,
+      session: "ses_1b7f2", port: 4166, slot: null, capacity: "released",
+      startedAt: "12:30:15Z", observedAt: "13:55:20Z", observedFrom: "acceptance receipt acc-0071 · head e5a7c90",
+      facts: { reachable: "yes", prepared: "yes", active: "no", ended: "yes", collected: "yes" },
+      model: { implementer: "glm-5.3 · low", fallback: "laguna-s-2.1", reviewer: "gpt-6-luna" },
+      readiness: null,
+      worktree: { inspectedAt: "13:12:02Z", commit: "e5a7c90", base: "c69dcaa", commitsSinceDispatch: 2, uncommitted: [], untracked: [], residue: [], artifacts: [[".lane/notes.md", true], [".lane/receipt.json", true]] },
+      receipts: {
+        completion: { id: "cmp-0304", at: "13:11:40Z", exit: 0, pass: true, text: "command ended; process group gone; slot 2 released 13:11:44Z" },
+        verification: { id: "vrf-0219", at: "13:21:08Z", head: "e5a7c90", pass: true, text: "verification host L · 42 tests pass · journal replay: one intent, no second session" },
+        review: { id: "rev-0117", at: "13:18:55Z", head: "e5a7c90", pass: true, text: "gpt-6-luna · 0 blockers · 2 notes" },
+        acceptance: { id: "acc-0071", at: "13:55:20Z", head: "e5a7c90", pass: true, text: "accepted by the orchestrator · authorization auth-0088 · scope: merge wo-0137 at e5a7c90 · pull request #7 found, not reopened" },
+        decision: null
+      },
+      legal: ["merge"],
+      mergeHead: "e5a7c90", pullRequest: "#7",
+      notOffered: [["reconcile", "the attempt ended and was collected"], ["fix", "nothing to fix at e5a7c90"]],
+      cost: { steps: 71, minutes: 31, usd: 0.14 },
+      brief: { digest: "sha256:5f2c…8ab1", frozenAt: "12:29:40Z", manifest: { "owned paths": "packages/work-execution/**, docs/runbooks/reconcile-an-attempt.md", bounds: "100 steps · 45 min" }, markdown: "# wo-0137 · journal-replay\n\nA fixture that kills the controller between reserve and dispatch, restarts it, and proves reconciliation does not dispatch twice.\n\n## Proof\n- The journal holds one intent record.\n- A second reconcile prints the same session id." }
+    },
+    {
+      id: "att_01J9ZK3Q7V", wo: "wo-0142", kind: "first", number: 1,
+      session: "ses_7f21a", port: 4166, slot: null, capacity: "released",
+      startedAt: "12:34:10Z", observedAt: "13:19:30Z", observedFrom: "verification receipt vrf-0217 · head 7b2d0aa",
+      facts: { reachable: "yes", prepared: "yes", active: "no", ended: "yes", collected: "yes" },
+      model: { implementer: "glm-5.3 · low", fallback: "laguna-s-2.1", reviewer: "gpt-6-luna" },
+      readiness: null,
+      worktree: { inspectedAt: "13:12:40Z", commit: "7b2d0aa", base: "0da21c4", commitsSinceDispatch: 2, uncommitted: [], untracked: [], residue: [], artifacts: [[".lane/notes.md", true], [".lane/receipt.json", true]] },
+      receipts: {
+        completion: { id: "cmp-0305", at: "13:12:36Z", exit: 0, pass: true, text: "command ended; process group gone; slot 2 released 13:12:40Z" },
+        verification: { id: "vrf-0217", at: "13:19:30Z", head: "7b2d0aa", pass: false, text: "verification host L · yarn typecheck in apps/api failed: 3 errors (envelope.ts:9, attempts.get.ts:14, composition.ts:3)" },
+        review: null, acceptance: null, decision: null
+      },
+      legal: [],
+      notOffered: [["fix", "a fix attempt is already open: att_01J9ZM8R2C"], ["merge", "verification failed at 7b2d0aa"], ["reconcile", "the attempt ended and was collected"]],
+      cost: { steps: 94, minutes: 38, usd: 0.21 },
+      brief: { digest: "sha256:b81a…07d3", frozenAt: "12:33:40Z", manifest: { "owned paths": "apps/api/**", bounds: "100 steps · 45 min", "knowledge versions": "k-017 v2, k-023 v1, k-009 v3" }, markdown: "# wo-0142 · api-routes-a\n\nAdd the composition root, the error envelope and one route file per row of the route table. Each handler calls its use case and maps `Not implemented` to 501.\n\n## Proof\n- `yarn typecheck` in `apps/api`.\n- A request to each new path returns 501. `GET /` still returns ok." }
+    }
+  ],
+  proposals: [
+    { id: "k-017", v: "v2", kind: "keeper", claim: "Nitro routes live under server/routes; srcDir is set in nitro.config.ts, so src/routes never registers.", scope: "fleet-v2 · apps/api/**", source: "att_01J9ZB2… @ 3c9f0d1", why: [["paths", "apps/api/**"], ["task", "route, body"]], include: true },
+    { id: "k-009", v: "v3", kind: "keeper", claim: "Nothing under server/ imports node:child_process; the pre-merge review greps for it.", scope: "fleet-v2 · apps/api/server/**", source: "att_01J9Z9… @ eccc98b", why: [["paths", "apps/api/server/**"]], include: true },
+    { id: "k-023", v: "v1", kind: "keeper", claim: "Hexagen regenerates *.in-port.ts and *.out-port.ts; hand edits are overwritten by yarn sync.", scope: "shared · packages/*/src/**/ports/**", source: "att_01J9Z7… @ eccc98b", why: [["symbol", "InspectWorkOrder, RegisterWorkOrder"], ["task", "port types"]], include: true },
+    { id: "c-042", v: "—", kind: "candidate", claim: "Turbo runs typecheck without ^build; the context packages need dist/ first or apps/api fails to resolve them.", scope: "fleet-v2 · turbo.json", source: "att_01J9ZK3Q7V @ 7b2d0aa", why: [["environment", "turbo pipeline"], ["unchecked", "candidate, not a keeper"]], include: false },
+    { id: "k-031", v: "v1", kind: "keeper", claim: "yarn lint:arch fails when a supplier context imports an execution aggregate.", scope: "fleet-v2 · packages/**", source: "att_01J9Z8… @ eccc98b", why: [["task", "port types (weak)"]], include: false },
+    { id: "p-003", v: "—", kind: "l3", claim: "Lanes cannot push or use gh, ssh, curl or sudo; the orchestrator fetches and opens the pull request.", scope: "operating profile · link, not policy text", source: "pol-2026-10-11.3", why: [["profile", "lane permissions"]], include: true }
+  ],
+  candidates: [
+    { id: "c-041", claim: "Nitro's srcDir: 'server' ignores src/; a route under src/routes never registers.", project: "fleet-v2", paths: "apps/api/nitro.config.ts", source: "att_01J9ZK3Q7V @ 7b2d0aa", evidence: ".lane/notes.md · vrf-0217 (failed)", checked: null, supersedes: "k-017 v2 (would become v3)", acceptable: false, acceptWhy: "the source head 7b2d0aa has no acceptance receipt" },
+    { id: "c-042", claim: "Turbo runs typecheck without ^build; the context packages need dist/ first.", project: "fleet-v2", paths: "turbo.json, apps/api/package.json", source: "att_01J9ZK3Q7V @ 7b2d0aa", evidence: ".lane/notes.md", checked: null, supersedes: "—", acceptable: false, acceptWhy: "the source head 7b2d0aa has no acceptance receipt" },
+    { id: "c-043", claim: "The reviewer seat for wave 3 should move to a cheaper model; Luna is slow on contract diffs.", project: "waves", paths: "—", source: "att_01J9ZF2N6P @ a81f4e2", evidence: ".lane/notes.md", checked: null, supersedes: "—", acceptable: false, acceptWhy: "this is a seat change: a policy proposal, never a keeper" },
+    { id: "c-044", claim: "Killing the controller between reserve and dispatch leaves one intent record; replay finds the session and does not dispatch again.", project: "fleet-v2", paths: "packages/work-execution/src/journal/**, docs/runbooks/reconcile-an-attempt.md", source: "att_01J9ZD5W9K @ e5a7c90", evidence: "vrf-0219 (pass) · rev-0117 · acc-0071", checked: "vrf-0219 at e5a7c90", supersedes: "—", acceptable: true, acceptWhy: "acceptance receipt acc-0071 binds e5a7c90" }
+  ],
+  keepers: [
+    { id: "k-017", v: "v2", claim: "Nitro routes live under server/routes; srcDir is set in nitro.config.ts.", project: "fleet-v2", paths: "apps/api/**", source: "att_01J9ZB2… @ 3c9f0d1", checked: "orchestrator · vrf-0198 · 2026-10-12", supersedes: "k-017 v1", used: 3, wrongTurns: 0 },
+    { id: "k-023", v: "v1", claim: "Hexagen regenerates *.in-port.ts and *.out-port.ts; hand edits are overwritten by yarn sync.", project: "fleet-v2, hexagen", paths: "packages/*/src/**/ports/**", source: "att_01J9Z7… @ eccc98b", checked: "orchestrator · vrf-0190 · 2026-10-12", supersedes: "—", used: 5, wrongTurns: 0 },
+    { id: "k-009", v: "v3", claim: "Nothing under server/ imports node:child_process; the pre-merge review greps for it.", project: "fleet-v2", paths: "apps/api/server/**", source: "att_01J9Z9… @ eccc98b", checked: "orchestrator · rev-0102 · 2026-10-12", supersedes: "k-009 v2", used: 2, wrongTurns: 0 },
+    { id: "k-031", v: "v1", claim: "yarn lint:arch fails when a supplier context imports an execution aggregate.", project: "fleet-v2", paths: "packages/**", source: "att_01J9Z8… @ eccc98b", checked: "orchestrator · vrf-0191 · 2026-10-12", supersedes: "—", used: 1, wrongTurns: 1 }
+  ]
+};
+
+/* ============================================================ virtual clock
+   The fixture is frozen at 14:02:10Z; a virtual clock advances 1:1 with real
+   time so the refresh cadence is honest without a live host. */
+const V0 = Date.parse("2026-10-13T14:02:10Z"), R0 = Date.now();
+const vnow = () => new Date(V0 + (Date.now() - R0));
+const p2 = n => String(n).padStart(2, "0");
+const fmtT = d => `${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}Z`;
+const fmtDate = d => `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())}`;
+const fmtFull = d => `${fmtDate(d)} ${fmtT(d)}`;
+const parseT = s => s ? Date.parse(s.length <= 9 ? `2026-10-13T${s}` : s) : NaN;
+
+/* ============================================================ state */
+const state = {
+  view: "line", attempt: "att_01J9ZM8R2C", project: "all", showEnded: true, sumFilter: "",
+  include: Object.fromEntries(FIXTURE.proposals.map(p => [p.id, p.include])),
+  frozen: null, dispositions: {}, inFlight: {}, journal: [], lastRead: "", briefWo: "wo-0144", theme: "dark"
+};
+
+/* ============================================================ helpers */
+const $nav = document.getElementById("nav"), $projects = document.getElementById("projects"),
+      $page = document.getElementById("page"), $stamp = document.getElementById("stamp"),
+      $countdown = document.getElementById("countdown"), $themeBtn = document.getElementById("themeBtn"),
+      $toasts = document.getElementById("toasts");
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const att = id => FIXTURE.attempts.find(a => a.id === id);
+const woOf = a => FIXTURE.workOrders[a.wo];
+const attemptsOf = w => FIXTURE.attempts.filter(a => a.wo === w);
+const hasPackage = w => FIXTURE.attempts.some(a => a.wo === w && a.brief);
+const pkgOf = w => { const a = FIXTURE.attempts.find(x => x.wo === w && x.brief); return a ? a.brief : null; };
+const inProject = a => state.project === "all" || woOf(a).project === state.project;
+const ageMin = s => { const t = parseT(s); return t ? Math.max(0, Math.round((vnow() - t) / 60000)) : 0; };
+const shortId = s => "…" + s.slice(-5);
+const rnd = n => Math.random().toString(36).slice(2, 2 + n).toUpperCase();
+const FORDER = ["reachable", "prepared", "active", "ended", "collected"];
+const FACTS = { reachable: "Runner reachable", prepared: "Workspace prepared", active: "Worker command active", ended: "Worker command ended", collected: "Artifacts collected" };
+
+const ICONS = {
+  refresh: '<path d="M20 12a8 8 0 1 1-2.9-6.2"/><path d="M20 3v5h-5"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/>',
+  moon: '<path d="M20 14.5A8.5 8.5 0 1 1 9.5 4 7 7 0 0 0 20 14.5z"/>',
+  chev: '<path d="M9 6l6 6-6 6"/>',
+  ext: '<path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M19 13v6H5V5h6"/>',
+  stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
+  eye: '<path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.6"/>',
+  box: '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M4 7.5l8 4.5 8-4.5"/><path d="M12 12v9"/>',
+  plus: '<circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/>',
+  branch: '<circle cx="6" cy="5" r="2.4"/><circle cx="6" cy="19" r="2.4"/><circle cx="18" cy="12" r="2.4"/><path d="M6 7.4v9.2"/><path d="M8.4 5h4.6a5 5 0 0 1 5 5v2.6"/>',
+  snow: '<path d="M12 3v18M5.5 7.5l13 9M18.5 7.5l-13 9"/>',
+  send: '<path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>',
+  check: '<path d="M4 12l5 5L20 7"/>',
+  x: '<path d="M6 6l12 12M18 6L6 18"/>',
+  door: '<rect x="5" y="3" width="14" height="18" rx="2"/><circle cx="15.5" cy="12" r="1"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  lock: '<rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8 10.5V7a4 4 0 0 1 8 0v3.5"/>'
+};
+const icon = n => `<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n] || ""}</svg>`;
+
+const OPINFO = {
+  reconcile: { label: "Reconcile", icon: "eye", cls: "", desc: "Re-read the runner. Write a completion receipt if the command ended; the slot frees only then." },
+  stop: { label: "Stop", icon: "stop", cls: "danger", desc: "Stop the command — or withdraw the queued intent before a session exists." },
+  collect: { label: "Collect artifacts", icon: "box", cls: "", desc: "Legal only after a completion receipt. This station answers 501 behind the route." },
+  fix: { label: "Start fix", icon: "plus", cls: "", desc: "A fresh attempt on the same work order, numbered, frozen from this package." },
+  merge: { label: "Merge", icon: "branch", cls: "merge", desc: "The pull request is looked up before any forge call. The door opens only for an accepted head." },
+  freeze: { label: "Freeze the brief", icon: "snow", cls: "primary", desc: "Compute the digest from the included rows. The rows lock; the digest becomes the truth." },
+  dispatch: { label: "Dispatch the intent", icon: "send", cls: "primary", desc: "A separate step from the freeze. The Line holds the intent until a slot frees." },
+  accept: { label: "Accept", icon: "check", cls: "merge", desc: "Publish a keeper — only when an acceptance receipt binds the source head." },
+  reject: { label: "Reject", icon: "x", cls: "danger", desc: "Record the rejection with the source. The candidate stays on the record." },
+  unresolved: { label: "Leave unresolved", icon: "clock", cls: "", desc: "It stays a candidate; nothing is published." },
+  policy: { label: "Propose a policy change", icon: "door", cls: "violet", desc: "Recorded as having left the product. A policy proposal is never a keeper." }
+};
+
+const routeChip = (txt, gap) => `<span class="route${gap ? " gap" : ""}" title="${esc(gap ? "a route the plan does not name yet" : "the route the plan names for this read")}">${esc(txt)}</span>`;
+const factHTML = (v, stale) => `<span class="fact ${v}${stale ? " stale" : ""}"><i></i><span>${v}</span></span>`;
+const badge = (word) => `<span class="badge ${word}">${word}</span>`;
+
+/* Derived, and labelled as derived: the one-word summary is read off the five
+   facts and the receipts, never stored, never used to free a slot. */
+function summary(a){
+  const R = a.receipts;
+  if (a.withdrawn) return ["ended", "withdrawn before a session existed", "ended"];
+  if (R.decision && R.decision.pending) return ["blocked", "waiting on decision " + R.decision.id, "blocked"];
+  if (a.facts.reachable === "unknown" || a.facts.ended === "unknown") return ["unknown", a.lastKnown ? "runner silent since " + a.lastKnown.at : "runner silent", "unknown"];
+  if (a.capacity === "pending") return ["queued", "intent recorded · waiting for a slot", "queued"];
+  if (a.merged) return ["accepted", "merged at " + a.mergeHead, "accepted"];
+  if (R.acceptance) return ["accepted", "accepted at " + R.acceptance.head, "accepted"];
+  if (R.verification && !R.verification.pass) return ["failed", "check failed at " + R.verification.head, "failed"];
+  if (a.facts.active === "yes") return ["active", "running · " + (a.cost ? a.cost.minutes + " lane min" : ""), "active"];
+  if (a.facts.ended === "yes") return ["ended", a.facts.collected === "yes" ? "ended · collected" : "ended · artifacts not collected", "ended"];
+  return ["ended", "ended", "ended"];
+}
+
+/* A small read-only Markdown reader for the brief. Nothing in it is a control. */
+function md(src){
+  const inline = t => esc(t).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+  const lines = src.split("\n"); let out = [], i = 0;
+  while (i < lines.length){
+    const l = lines[i];
+    if (/^```/.test(l)){ let b = []; i++; while (i < lines.length && !/^```/.test(lines[i])) b.push(lines[i++]); i++; out.push(`<pre><code>${esc(b.join("\n"))}</code></pre>`); continue; }
+    const h = /^(#{1,3})\s+(.*)/.exec(l);
+    if (h){ out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); i++; continue; }
+    if (/^\|/.test(l)){
+      let rows = []; while (i < lines.length && /^\|/.test(lines[i])) rows.push(lines[i++]);
+      rows = rows.filter(r => !/^\|\s*-+/.test(r));
+      const cells = r => r.split("|").slice(1, -1).map(c => c.trim());
+      out.push(`<table><thead><tr>${cells(rows[0]).map(c => `<th>${inline(c)}</th>`).join("")}</tr></thead><tbody>${rows.slice(1).map(r => `<tr>${cells(r).map(c => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`); continue;
+    }
+    if (/^[-*]\s/.test(l)){ let b = []; while (i < lines.length && /^[-*]\s/.test(lines[i])) b.push(lines[i++].slice(2)); out.push(`<ul>${b.map(x => `<li>${inline(x)}</li>`).join("")}</ul>`); continue; }
+    if (/^\d+\.\s/.test(l)){ let b = []; while (i < lines.length && /^\d+\.\s/.test(lines[i])) b.push(lines[i++].replace(/^\d+\.\s/, "")); out.push(`<ol>${b.map(x => `<li>${inline(x)}</li>`).join("")}</ol>`); continue; }
+    if (l.trim() === ""){ i++; continue; }
+    let p = []; while (i < lines.length && lines[i].trim() !== "" && !/^(#|```|\||[-*]\s|\d+\.\s)/.test(lines[i])) p.push(lines[i++]);
+    out.push(`<p>${inline(p.join(" "))}</p>`);
+  }
+  return out.join("");
+}
+
+/* ============================================================ the line */
+function lineRows(){
+  const order = { unknown: 0, blocked: 1, active: 2, queued: 3, accepted: 4, failed: 5, ended: 6 };
+  return FIXTURE.attempts.filter(inProject)
+    .filter(a => state.showEnded || a.capacity !== "released")
+    .filter(a => !state.sumFilter || summary(a)[0] === state.sumFilter)
+    .sort((x, y) => {
+      const p = state.project === "all" ? woOf(x).project.localeCompare(woOf(y).project) : 0;
+      if (p) return p;
+      const s = order[summary(x)[0]] - order[summary(y)[0]];
+      if (s) return s;
+      return (parseT(y.startedAt || y.queuedAt) || 0) - (parseT(x.startedAt || x.queuedAt) || 0);
+    });
+}
+function queuePos(a){
+  const q = FIXTURE.attempts.filter(x => x.capacity === "pending").sort((x, y) => parseT(x.queuedAt) - parseT(y.queuedAt));
+  return q.indexOf(a) + 1 || "—";
+}
+function factTD(a, k){
+  const v = a.facts[k];
+  let tip = `${FACTS[k]}: ${v} · observed ${a.observedAt} · ${a.observedFrom}`;
+  if (v === "unknown" && a.lastKnown) tip += ` · last known ${a.lastKnown.at}: ${a.lastKnown.facts[k]}`;
+  return `<td class="fact"><span class="factwrap" title="${esc(tip)}">${factHTML(v, a.worktree && a.worktree.stale)}</span></td>`;
+}
+function rowHTML(a){
+  const [w, note] = summary(a);
+  const W = woOf(a);
+  const idsub = a.capacity === "pending"
+    ? `queued #${queuePos(a)} · ${ageMin(a.queuedAt)} min of ${esc(a.queueBound || "")} bound · no session`
+    : a.session ? `${esc(a.session)} · port ${a.port}${a.slot ? " · slot " + a.slot : ""}`
+    : a.withdrawn ? "withdrawn · no session ever existed"
+    : "ended · slot released";
+  const silent = a.facts.reachable === "unknown" && a.lastKnown ? ` · silent since ${esc(a.lastKnown.at)}` : "";
+  return `<tr class="row" data-action="open" data-att="${esc(a.id)}" tabindex="0" aria-selected="${state.attempt === a.id}">
+    <td class="c-att">
+      <button class="idbtn" data-action="copy" data-copy="${esc(a.id)}" title="copy ${esc(a.id)}">${esc(a.id)}</button>
+      <span class="badge ${a.kind === "fix" ? "fix" : ""}">${a.kind === "fix" ? "fix " + a.number : "first"}</span>
+      <span class="sub">${idsub}${silent}</span>
+    </td>
+    <td><span class="task" title="${esc(W.task)}">${esc(W.task)}</span><span class="sub mono">${esc(a.wo)} · ${esc(W.lane)}</span></td>
+    ${FORDER.map(k => factTD(a, k)).join("")}
+    <td class="c-state">${badge(w)}<span class="sub">${esc(note)}</span></td>
+    <td class="c-obs"><b class="mono t">${esc(a.observedAt)}</b><span class="sub src" title="${esc(a.observedFrom)}">${esc(a.observedFrom)}</span></td>
+    <td class="c-go">${icon("chev")}</td>
+  </tr>`;
+}
+function capacityHTML(){
+  const cap = FIXTURE.capacity;
+  const held = FIXTURE.attempts.filter(a => a.capacity === "held").sort((x, y) => (x.slot || 0) - (y.slot || 0));
+  const q = FIXTURE.attempts.filter(a => a.capacity === "pending").sort((x, y) => parseT(x.queuedAt) - parseT(y.queuedAt));
+  let seats = "";
+  for (let i = 1; i <= cap.slots; i++){
+    const h = held.find(a => a.slot === i);
+    seats += `<div class="seat ${h ? "held" : ""}" title="${h ? esc(h.id + " · " + summary(h)[1]) : "free"}"><b>slot ${i}</b><span class="who">${h ? esc(shortId(h.id)) : "free"}</span></div>`;
+  }
+  return `<section class="card pad">
+    <h2>Capacity <span class="meta">${routeChip("gap · no capacity route", true)}</span></h2>
+    <div class="kvline">${esc(cap.host)} · port ${cap.port} · ${held.length} of ${cap.slots} slots held</div>
+    <div class="seats">${seats}</div>
+    ${q.length ? `<div class="q"><span class="lbl">queued behind them</span>${q.map(a => `
+      <div class="qitem" data-action="open" data-att="${esc(a.id)}" tabindex="0" title="open the record">
+        <b class="mono">${esc(a.id)}</b><span>${esc(a.wo)}</span><span class="mono">${ageMin(a.queuedAt)} min of ${esc(a.queueBound || "")} bound</span>
+      </div>`).join("")}</div>` : `<div class="q none">no queued intents</div>`}
+    <p class="capnote">Unknown holds its slot. A slot frees only when a completion receipt is written.</p>
+  </section>`;
+}
+function attentionHTML(){
+  const busy = Object.keys(state.inFlight).length > 0;
+  const items = [];
+  FIXTURE.attempts.filter(inProject).forEach(a => {
+    const [w, note] = summary(a);
+    const legal = o => (a.legal || []).includes(o);
+    const op = (o, label) => legal(o) ? `<button class="btn small" data-action="op" data-op="${o}" data-att="${esc(a.id)}" ${busy ? "disabled" : ""}>${label || esc(OPINFO[o].label)}</button>` : "";
+    if (w === "unknown") items.push(`<div class="attn unknown"><div class="tt"><b>${esc(a.id)}</b> runner did not answer</div><div class="ss">${esc(note)} · slot ${a.slot} stays held · reconcile returns 409, not a guess</div><div class="rr">${op("reconcile")}</div></div>`);
+    if (w === "blocked" && a.receipts.decision) items.push(`<div class="attn blocked"><div class="tt"><b>${esc(a.wo)}</b> waits on decision ${esc(a.receipts.decision.id)}</div><div class="ss">${esc(note)} · a ${esc(a.receipts.decision.door)} door · silence is not approval</div><div class="rr"><a class="btn small" href="${esc(FIXTURE.install.wavesInboxUrl)}" target="_blank" rel="noopener">answer in Waves ${icon("ext")}</a></div></div>`);
+    if (w === "ended" && !a.withdrawn && a.receipts.completion && a.facts.collected !== "yes") items.push(`<div class="attn collect"><div class="tt"><b>${esc(a.id)}</b> ended · artifacts not collected</div><div class="ss">completion ${esc(a.receipts.completion.id)} · collect is legal now</div><div class="rr">${op("collect")}</div></div>`);
+    if (w === "failed"){
+      const openFix = attemptsOf(a.wo).find(x => x !== a && (x.capacity === "held" || x.capacity === "pending"));
+      items.push(`<div class="attn failed"><div class="tt"><b>${esc(a.id)}</b> verification failed</div><div class="ss">${esc(note)}${openFix ? " · a fix is already open: " + esc(openFix.id) : ""}</div>${openFix ? "" : `<div class="rr">${op("fix", "Start fix " + (attemptsOf(a.wo).length + 1))}</div>`}</div>`);
+    }
+    if (w === "queued") items.push(`<div class="attn queued"><div class="tt"><b>${esc(a.id)}</b> queued for a slot</div><div class="ss">${esc(note)} · ${ageMin(a.queuedAt)} min of ${esc(a.queueBound || "")} bound · no session yet, so withdraw is the only word</div><div class="rr">${op("stop", "Withdraw intent")}</div></div>`);
+    if (w === "accepted" && !a.merged && legal("merge")) items.push(`<div class="attn mergeable"><div class="tt"><b>${esc(a.wo)}</b> accepted at <span class="mono">${esc(a.mergeHead)}</span></div><div class="ss">pull request ${esc(a.pullRequest)} · merge is legal</div><div class="rr">${op("merge")}</div></div>`);
+  });
+  return `<section class="card pad">
+    <h2>Needs attention <span class="meta">${items.length}</span></h2>
+    ${items.length ? items.join("") : `<div class="empty">Nothing needs the operator right now. The counts above are work, not health.</div>`}
+  </section>`;
+}
+function viewLine(){
+  const scoped = FIXTURE.attempts.filter(inProject);
+  const rows = lineRows();
+  const queued = scoped.filter(a => a.capacity === "pending").length;
+  const unknown = scoped.filter(a => summary(a)[0] === "unknown").length;
+  const blocked = scoped.filter(a => summary(a)[0] === "blocked").length;
+  const held = FIXTURE.attempts.filter(a => a.capacity === "held").length;
+  const qAll = FIXTURE.attempts.filter(a => a.capacity === "pending").length;
+  const scopeName = state.project === "all" ? "every project" : state.project;
+  let body = "", lastP = null;
+  rows.forEach(a => {
+    if (state.project === "all"){
+      const p = woOf(a).project;
+      if (p !== lastP){
+        lastP = p;
+        const n = rows.filter(r => woOf(r).project === p).length;
+        body += `<tr class="group"><td colspan="10">${esc(p)} · ${n} attempt${n === 1 ? "" : "s"}</td></tr>`;
+      }
+    }
+    body += rowHTML(a);
+  });
+  const sums = ["", "unknown", "blocked", "active", "queued", "accepted", "failed", "ended"];
+  return `
+  <div class="vh-top"><h1>Line</h1>${routeChip("gap · no list route: GET /v1/attempts is missing", true)}</div>
+  <p class="lede">Attempts for <b>${esc(scopeName)}</b>, five runner facts kept apart. Pick a project above to narrow the line, the brief and knowledge together. A branch is not an attempt; a fix is a fresh attempt on the same work order. <b>Unknown</b> holds its slot until the runner answers — it is never read as idle, never as a pass. The state word is derived, and labelled as derived.</p>
+  <div class="counts">
+    <div class="card count"><div class="n">${queued}</div><div class="l">queued</div><div class="h">intents recorded · no session yet · waiting for a slot</div></div>
+    <div class="card count unknown"><div class="n">${unknown}</div><div class="l">unknown</div><div class="h">runner could not be read · not idle, not a pass · holds its slot</div></div>
+    <div class="card count blocked"><div class="n">${blocked}</div><div class="l">blocked</div><div class="h">waiting on a signed decision in Waves · silence is not approval</div></div>
+    <div class="card count slots"><div class="n">${held}<small>/${FIXTURE.capacity.slots}</small></div><div class="l">slots held</div><div class="h">${esc(FIXTURE.capacity.host)} · port ${FIXTURE.capacity.port} · ${qAll} queued intent${qAll === 1 ? "" : "s"} behind them</div></div>
+  </div>
+  <div class="linetools">
+    <label class="switch"><input type="checkbox" data-change="showended" ${state.showEnded ? "checked" : ""}><span class="track"></span><span>show ended</span></label>
+    <label class="selfilter">state
+      <select data-change="sumfilter">${sums.map(o => `<option value="${o}" ${state.sumFilter === o ? "selected" : ""}>${o || "every state"}</option>`).join("")}</select>
+    </label>
+    <span class="tally mono">${rows.length} of ${scoped.length} shown${state.sumFilter ? " · filtered" : ""}</span>
+  </div>
+  <div class="linegrid">
+    <section class="card tablewrap">
+      ${rows.length ? `<table class="grid">
+        <thead><tr>
+          <th class="c-att">attempt</th><th>work order</th>
+          ${FORDER.map((k, i) => `<th class="fact${i === 0 ? " first" : ""}${i === FORDER.length - 1 ? " last" : ""}">${k}</th>`).join("")}
+          <th class="c-state">state</th><th class="c-obs">observed</th><th class="c-go"></th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>` : `<div class="empty">Nothing matches this filter — that is not “nothing running”. ${scoped.length} attempt${scoped.length === 1 ? "" : "s"} in scope; the project, the state filter or the show-ended toggle hides the rest. A capped or offline station is a note like this one, never an empty table.</div>`}
+    </section>
+    <aside class="rail">
+      ${capacityHTML()}
+      ${attentionHTML()}
+    </aside>
+  </div>`;
+}
+
+/* ============================================================ the attempt */
+function woPane(a){
+  const W = woOf(a);
+  const sibs = attemptsOf(a.wo).sort((x, y) => x.number - y.number);
+  return `<aside class="pane" aria-label="Work order">
+    <header><h2>Work order</h2><span class="meta">${routeChip("read · attempt record")}</span></header>
+    <div class="body">
+      <dl class="kv">
+        <dt>project</dt><dd>${esc(W.project)}</dd>
+        <dt>task</dt><dd>${esc(W.task)}</dd>
+        <dt>lane</dt><dd class="mono">${esc(W.lane)}</dd>
+        <dt>base commit</dt><dd class="mono">${esc(W.base)}</dd>
+        <dt>policy revision</dt><dd class="mono">${esc(W.policy)}</dd>
+      </dl>
+      <div class="sect">
+        <h2>Attempts on this order <span class="meta">${sibs.length} · in order</span></h2>
+        <ul class="alist">${sibs.map(s => {
+          const [w, note] = summary(s);
+          return `<li data-action="open" data-att="${esc(s.id)}" tabindex="0" aria-current="${s.id === a.id}">
+            <span class="id"><b>${esc(s.id)}</b><span class="badge ${s.kind === "fix" ? "fix" : ""}">${s.kind === "fix" ? "fix " + s.number : "first"}</span></span>
+            <span class="k"><span class="dotword ${w}">${w}</span> · ${esc(note)}</span>
+            ${s.fixOf ? `<span class="k mono">fix of ${esc(s.fixOf)}</span>` : ""}
+            ${s.cost ? `<span class="k mono">${s.cost.steps} steps · ${s.cost.minutes} min · $${s.cost.usd}</span>` : `<span class="k">not started · no cost yet</span>`}
+          </li>`;
+        }).join("")}</ul>
+      </div>
+    </div>
+  </aside>`;
+}
+function facts5HTML(a){
+  const stale = a.worktree && a.worktree.stale;
+  return `<div class="facts5">${FORDER.map(k => {
+    const v = a.facts[k];
+    const lk = v === "unknown" && a.lastKnown ? a.lastKnown.facts[k] : null;
+    return `<div class="f" title="${esc(`${FACTS[k]}: ${v} · observed ${a.observedAt} · ${a.observedFrom}`)}">
+      <span class="w">${k}</span>${factHTML(v, stale)}<span class="t">${lk ? `last ${lk} · ${esc(a.lastKnown.at)}` : esc(a.observedAt)}</span>
+    </div>`;
+  }).join("")}</div>`;
+}
+function stepsHTML(a){
+  const R = a.receipts, f = a.facts;
+  const nodes = [
+    { w: "intent", t: a.queuedAt || "—", st: "done" },
+    { w: "dispatch", t: a.startedAt || "", st: a.startedAt ? "done" : (a.capacity === "pending" ? "now" : "faint") },
+    { w: "ended", t: R.completion ? R.completion.at : "", st: R.completion ? "done" : f.ended === "unknown" ? "unknown" : (f.active === "yes" ? "now" : "faint") },
+    { w: "collected", t: f.collected === "yes" ? "✓" : "", st: f.collected === "yes" ? "done" : (R.completion && !a.withdrawn ? "now" : "faint") },
+    { w: "verified", t: R.verification ? R.verification.at : "", st: R.verification ? (R.verification.pass ? "done" : "fail") : (f.collected === "yes" ? "now" : "faint") },
+    { w: "reviewed", t: R.review ? R.review.at : "", st: R.review ? (R.review.pass ? "done" : "fail") : (R.verification && R.verification.pass ? "now" : "faint") },
+    { w: "accepted", t: R.acceptance ? R.acceptance.at : "", st: R.acceptance ? "done" : (R.review && R.review.pass && R.verification && R.verification.pass ? (R.decision && R.decision.pending ? "door" : "now") : "faint") }
+  ];
+  if (a.merged) nodes.push({ w: "merged", t: R.merge ? R.merge.at : "", st: "done" });
+  return `<div class="steps" role="img" aria-label="attempt lifecycle">${nodes.map(n => `
+    <div class="step ${n.st}"><span class="dot"></span><span class="w">${n.w}</span><span class="t">${esc(n.t || "·")}</span></div>`).join("")}</div>`;
+}
+function unknownNote(a){
+  const lk = a.lastKnown;
+  const words = FORDER.map(k => `${k} ${lk.facts[k]}`).join(" · ");
+  return `<div class="note">The runner did not answer at ${esc(a.observedAt)}. Unknown is its own state — not “no”, not a pass. Nothing on this page was upgraded. Last known at <b>${esc(lk.at)}</b>: ${esc(words)}.</div>`;
+}
+function worktreeHTML(a){
+  const w = a.worktree;
+  const list = arr => arr && arr.length
+    ? `<details class="inline"><summary>${arr.length} path${arr.length === 1 ? "" : "s"}</summary><ul class="plain mono">${arr.map(p => `<li>${esc(p)}</li>`).join("")}</ul></details>`
+    : `<span class="none">none</span>`;
+  return `<div class="sect"><h2>Worktree inspection <span class="meta">${routeChip("read · runner port")}</span><span class="meta mono">inspected ${esc(w.inspectedAt)}${w.stale ? ' · <span class="badge unknown">stale</span>' : ""}</span></h2>
+    <dl class="kv">
+      <dt>checked out</dt><dd class="mono">${esc(w.commit)} · ${w.commitsSinceDispatch} commit${w.commitsSinceDispatch === 1 ? "" : "s"} since dispatch · base ${esc(w.base)}</dd>
+      <dt>uncommitted</dt><dd>${list(w.uncommitted)}</dd>
+      <dt>untracked</dt><dd>${list(w.untracked)}</dd>
+      <dt>residue</dt><dd>${w.residue && w.residue.length ? `<span class="warnline">${esc(w.residue.join(", "))}</span>` : `<span class="none">none</span>`}</dd>
+      <dt>expected artifacts</dt><dd>${(w.artifacts || []).map(([n, ok]) => `<span class="mono art ${ok ? "ok" : "miss"}">${ok ? "✓" : "–"} ${esc(n)}</span>`).join("")}</dd>
+    </dl>
+    ${w.stale ? `<div class="note">This inspection is stale — read at ${esc(w.inspectedAt)}. The page keeps it as it was; it never upgrades a stale fact by itself.</div>` : ""}
+  </div>`;
+}
+function readinessHTML(a){
+  return `<div class="sect"><h2>Readiness receipt <span class="meta mono">ten lines</span></h2>
+    <ul class="check">${a.readiness.map(([name, pass, note]) => `<li class="${pass ? "" : "fail"}"><i>${pass ? "pass" : "FAIL"}</i><span><b>${esc(name)}</b> — ${esc(note)}</span></li>`).join("")}</ul>
+  </div>`;
+}
+function receiptsHTML(a){
+  const R = a.receipts;
+  const slots = [["completion", R.completion], ["verification", R.verification], ["review", R.review], ["acceptance", R.acceptance]];
+  if (R.merge) slots.push(["merge", R.merge]);
+  const awaited = {
+    completion: "no completion receipt yet", verification: "the verification host has not spoken",
+    review: "the reviewer seat has not spoken", acceptance: "no acceptance binds this head yet", merge: "not merged"
+  };
+  return `<div class="sect"><h2>Receipts <span class="meta">${routeChip("GET /v1/heads/:sha/evidence")} <span class="meta">the completion receipt has no route today</span></span></h2>
+    ${slots.map(([name, r]) => r ? `
+      <div class="receipt ${r.pass ? "pass" : "fail"}">
+        <div class="t"><b>${name} · ${esc(r.id)}</b><span>${esc(r.at)}${r.head ? " · head " + esc(r.head) : ""}</span></div>
+        <p>${esc(r.text)}</p>
+      </div>` : `
+      <div class="receipt pending">
+        <div class="t"><b>${name}</b><span>awaited</span></div>
+        <p>${awaited[name]}</p>
+      </div>`).join("")}
+  </div>`;
+}
+function briefHTML(a){
+  const b = a.brief;
+  if (!b) return "";
+  return `<details class="brief">
+    <summary><b>Frozen brief</b><span class="dg">${esc(b.digest)}</span><span class="dg">frozen ${esc(b.frozenAt)}</span>${icon("chev")}</summary>
+    <div class="brief-stamp">
+      <span>digest <b>${esc(b.digest)}</b></span><span>frozen <b>${esc(b.frozenAt)}</b></span>
+      ${b.original ? `<span>original <b>${esc(b.original)}</b></span>` : ""}
+      <span>model <b>${esc(a.model.implementer)}</b></span>
+      ${routeChip("gap · no package read", true)}
+    </div>
+    <dl class="kv" style="margin-bottom:.6rem">${Object.entries(b.manifest).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
+    <div class="md">${md(b.markdown)}</div>
+  </details>`;
+}
+function recordPane(a){
+  const [word, note] = summary(a);
+  const sib = attemptsOf(a.wo);
+  return `<section class="pane" aria-label="Attempt record">
+    <header><h2>Record</h2><span class="meta">${routeChip("GET /v1/attempts/:id")}</span><span class="meta mono">observed ${esc(a.observedAt)}</span></header>
+    <div class="body">
+      <div class="attempt-head">
+        <h1><button class="idbtn" data-action="copy" data-copy="${esc(a.id)}" title="copy the attempt id" style="font-size:inherit">${esc(a.id)}</button></h1>
+        <div class="badges">
+          <span class="badge ${a.kind === "fix" ? "fix" : ""}">${a.kind === "fix" ? `fix ${a.number} of ${sib.length}` : "first attempt"}</span>
+          ${badge(word)}
+          <span class="dotword" style="color:var(--muted)">${esc(note)}</span>
+        </div>
+        <div class="ids">
+          <span>work order <b>${esc(a.wo)}</b></span>
+          <span>session <b>${a.session ? esc(a.session) : "none yet"}</b></span>
+          <span>port <b>${a.port}</b></span>
+          <span>${a.slot ? `slot <b>${a.slot}</b>` : a.capacity === "pending" ? `queue <b>#${queuePos(a)}</b>` : "<b>slot released</b>"}</span>
+          ${a.fixOf ? `<span>fix of <b>${esc(a.fixOf)}</b></span>` : ""}
+        </div>
+      </div>
+      ${facts5HTML(a)}
+      ${stepsHTML(a)}
+      ${a.lastKnown ? unknownNote(a) : ""}
+      <div class="sect"><h2>Model &amp; cost <span class="meta">reach: ${esc(a.cost && a.cost.note ? a.cost.note : "to the last observation")}</span></h2>
+        <dl class="kv">
+          <dt>implementer</dt><dd class="mono">${esc(a.model.implementer)}</dd>
+          <dt>fallback</dt><dd class="mono">${esc(a.model.fallback)}</dd>
+          <dt>reviewer seat</dt><dd class="mono">${esc(a.model.reviewer)}</dd>
+          ${a.cost ? `<dt>cost</dt><dd class="mono">${a.cost.steps} steps · ${a.cost.minutes} lane min · $${a.cost.usd}</dd>` : `<dt>cost</dt><dd><span class="none">nothing measured yet; the attempt has not started</span></dd>`}
+        </dl>
+      </div>
+      ${worktreeHTML(a)}
+      ${a.readiness ? readinessHTML(a) : ""}
+      ${receiptsHTML(a)}
+      ${briefHTML(a)}
+    </div>
+  </section>`;
+}
+function opButton(a, op){
+  const o = OPINFO[op];
+  const busy = Object.keys(state.inFlight).length > 0;
+  const fl = state.inFlight[op + ":" + a.id];
+  const label = op === "fix" ? `Start fix ${attemptsOf(a.wo).length + 1}` : o.label;
+  const extra = op === "merge" ? `<span class="head">${esc(a.mergeHead)}</span>` : op === "fix" ? `<span class="head">on ${esc(a.wo)}</span>` : "";
+  return `<button class="op ${o.cls}" data-action="op" data-op="${op}" data-att="${esc(a.id)}" ${busy ? "disabled" : ""}>
+    <span class="op-l">${icon(o.icon)}<b>${label}</b>${extra}${fl ? `<span class="inflight"><span class="spin"></span>${esc(fl.operationId)}</span>` : ""}</span>
+    <span class="op-d">${o.desc}</span>
+  </button>`;
+}
+function notOfferedHTML(a){
+  const list = a.notOffered || [];
+  if (!list.length) return "";
+  return `<div class="notoff-wrap"><h3>Not offered, and why</h3>${list.map(([op, why]) => {
+    const o = OPINFO[op] || { label: op };
+    return `<div class="notoff"><b>${esc(o.label)}</b><span>${esc(why)}</span></div>`;
+  }).join("")}</div>`;
+}
+function decisionHTML(a){
+  const d = a.receipts.decision;
+  if (!d || !d.pending) return "";
+  return `<div class="doorcard">
+    <div class="dc-h"><b>Open decision · ${esc(d.id)}</b><span class="badge blocked">${esc(d.door)} door</span></div>
+    <p class="q">${esc(d.question)}</p>
+    <dl class="kv">
+      <dt>scope</dt><dd class="mono">${esc(d.scope)}</dd>
+      <dt>asked</dt><dd class="mono">${esc(d.askedAt)}</dd>
+      <dt>answer</dt><dd>none — silence is not approval</dd>
+    </dl>
+    <a class="btn small" href="${esc(FIXTURE.install.wavesInboxUrl)}" target="_blank" rel="noopener">${icon("ext")} Answer in Waves</a>
+    <p class="src">The inbox URL comes from installation values, never from the client. Answering a decision is not in this product.</p>
+  </div>`;
+}
+function journalHTML(a){
+  const entries = state.journal.filter(j => j.att === a.id).slice(0, 5);
+  if (!entries.length) return "";
+  return `<div class="sect"><h2>Operations this session <span class="meta">receipts land here</span></h2>
+    ${entries.map(j => {
+      const cls = j.res.status === 200 ? "ok" : j.res.status === 409 ? "unknown" : j.res.status === 501 ? "ni" : "err";
+      const word = j.res.status === 200 ? "ok" : j.res.status === 409 ? "409 · unknown" : j.res.status === 501 ? "501" : j.res.status;
+      return `<div class="jentry ${cls}"><div class="h"><b>${esc(OPINFO[j.op] ? OPINFO[j.op].label : j.op)}</b><span class="mono">${esc(word)} · ${esc(j.at)}</span></div><p>${esc(j.res.text)}</p><div class="f">operation ${esc(j.operationId)}</div></div>`;
+    }).join("")}
+  </div>`;
+}
+function opsPane(a){
+  const flight = Object.entries(state.inFlight).find(([, v]) => v.att === a.id);
+  const legal = a.legal || [];
+  return `<section class="pane" aria-label="Operations">
+    <header><h2>Operations</h2><span class="meta">${routeChip("gap · no legal-operations field", true)}</span></header>
+    <div class="body">
+      ${flight ? `<div class="note info">Operation <b class="mono">${esc(flight[1].operationId)}</b> is in flight. Every button is closed until its receipt lands — a double click cannot send two operations.</div>` : ""}
+      ${legal.includes("reconcile") ? opButton(a, "reconcile") : ""}
+      ${legal.includes("stop") ? opButton(a, "stop") : ""}
+      ${legal.includes("collect") ? opButton(a, "collect") : ""}
+      ${legal.includes("fix") ? opButton(a, "fix") : ""}
+      ${legal.includes("merge") ? opButton(a, "merge") : ""}
+      ${notOfferedHTML(a)}
+      ${decisionHTML(a)}
+      ${journalHTML(a)}
+    </div>
+  </section>`;
+}
+function viewAttempt(){
+  const a = att(state.attempt) || FIXTURE.attempts[0];
+  state.attempt = a.id;
+  return `<div class="desk">${woPane(a)}${recordPane(a)}${opsPane(a)}</div>`;
+}
+
+/* ============================================================ the brief */
+function woChip(w, frozen){
+  const W = FIXTURE.workOrders[w];
+  const pkg = pkgOf(w);
+  const meta = frozen ? (pkg ? pkg.digest : (state.frozen && state.frozen.digest) || "frozen") : "needs a brief";
+  return `<button class="woitem ${frozen ? "" : "needs"}" data-action="briefwo" data-wo="${esc(w)}" aria-current="${state.briefWo === w}">
+    <span class="t">${esc(W.task)}</span>
+    <span class="m">${esc(w)} · ${esc(W.lane)} · ${esc(meta)}</span>
+  </button>`;
+}
+function proposalRow(p, locked){
+  const inc = state.include[p.id];
+  const kindCls = p.kind === "keeper" ? "keeper" : p.kind === "candidate" ? "candidate" : "l3";
+  const toggle = locked
+    ? `<span class="lockstamp ${inc ? "in" : "out"}">${icon("lock")} ${inc ? "included" : "excluded"}</span>`
+    : `<label class="switch"><input type="checkbox" data-change="include" data-id="${esc(p.id)}" ${inc ? "checked" : ""}><span class="track"></span></label>`;
+  return `<tr class="${inc ? "" : "excluded"}">
+    <td class="inc">${toggle}</td>
+    <td class="mono">${esc(p.id)} ${esc(p.v)}</td>
+    <td><span class="badge ${kindCls}">${esc(p.kind)}</span></td>
+    <td class="claim"><span class="c">${esc(p.claim)}</span></td>
+    <td class="src">${esc(p.scope)}</td>
+    <td class="mono src">${esc(p.source)}</td>
+    <td class="why">${p.why.map(([k, v]) => `<span class="chip">${esc(k)} · ${esc(v)}</span>`).join("")}</td>
+  </tr>`;
+}
+function composeMarkdown(f){
+  const w = FIXTURE.workOrders[f.wo];
+  const rows = FIXTURE.proposals.filter(p => state.include[p.id]);
+  return `# ${f.wo} · ${w.lane}\n\n${w.task}. One handler per row of the route table; map \`Not implemented\` to 501.\n\n## Bounds\n${w.manifest.bounds}. Owned paths ${w.manifest["owned paths"]}.\n\n## Context selected for this brief\n| Entry | Claim |\n|---|---|\n${rows.map(p => `| ${p.id} ${p.v} | ${p.claim} |`).join("\n")}\n\nWrite \`.lane/notes.md\` before you stop: one claim per line, with the path it is about.`;
+}
+function viewBrief(){
+  const woIds = Object.keys(FIXTURE.workOrders).filter(w => state.project === "all" || FIXTURE.workOrders[w].project === state.project);
+  const frozenIds = woIds.filter(w => hasPackage(w) || (state.frozen && state.frozen.wo === w));
+  const unfrozenIds = woIds.filter(w => !frozenIds.includes(w));
+  const sel = (state.briefWo && woIds.includes(state.briefWo)) ? state.briefWo : (unfrozenIds[0] || frozenIds[0] || woIds[0]);
+  state.briefWo = sel;
+  const W = FIXTURE.workOrders[sel];
+  const isFrozen = frozenIds.includes(sel);
+  const busy = Object.keys(state.inFlight).length > 0;
+  const inc = FIXTURE.proposals.filter(p => state.include[p.id]);
+
+  let main;
+  if (!isFrozen){
+    main = `
+    <div class="card pad">
+      <h2>Manifest <span class="meta">${routeChip("gap · no package read", true)}</span></h2>
+      <dl class="kv">${Object.entries(W.manifest).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
+    </div>
+    <div class="card pad" style="margin-top:.8rem">
+      <h2>Rows the retrieval proposed <span class="meta">${routeChip("POST /v1/knowledge/proposals")}<span class="meta">${inc.length} of ${FIXTURE.proposals.length} included</span></span></h2>
+      <div class="tablewrap inner">
+        <table class="grid rows">
+          <thead><tr><th>include</th><th>entry</th><th>kind</th><th>claim</th><th>scope</th><th>source</th><th>matched because</th></tr></thead>
+          <tbody>${FIXTURE.proposals.map(p => proposalRow(p, false)).join("")}</tbody>
+        </table>
+      </div>
+      <div class="freeze-bar">
+        <span class="sum">${inc.length} of ${FIXTURE.proposals.length} rows included · freeze computes the digest · nothing changes after</span>
+        <button class="btn primary" data-action="op" data-op="freeze" data-wo="${esc(sel)}" ${busy || !inc.length ? "disabled" : ""}>${icon("snow")} Freeze the brief</button>
+        ${routeChip("gap · folded into POST /v1/attempts", true)}
+      </div>
+      <p class="note info">Freeze is its own step. Dispatch follows separately — the Line holds the intent until a slot frees. The pending include and exclude choices above are client state until the freeze writes the digest.</p>
+    </div>`;
+  } else {
+    const a = FIXTURE.attempts.find(x => x.wo === sel && x.brief);
+    const fresh = state.frozen && state.frozen.wo === sel && !a;
+    const b = a ? a.brief : { digest: state.frozen.digest, frozenAt: state.frozen.frozenAt, manifest: W.manifest, markdown: composeMarkdown(state.frozen), original: null };
+    main = `
+    ${fresh ? `<div class="card pad">
+      <h2>Rows as frozen <span class="meta">locked · ${esc(state.frozen.digest)}</span></h2>
+      <div class="tablewrap inner">
+        <table class="grid rows">
+          <thead><tr><th>row</th><th>entry</th><th>kind</th><th>claim</th><th>scope</th><th>source</th><th>matched because</th></tr></thead>
+          <tbody>${FIXTURE.proposals.map(p => proposalRow(p, true)).join("")}</tbody>
+        </table>
+      </div>
+    </div>` : ""}
+    <div class="card pad" style="margin-top:${fresh ? ".8rem" : "0"}">
+      <div class="brief-stamp">
+        <span>digest <b>${esc(b.digest)}</b></span><span>frozen <b>${esc(b.frozenAt)}</b></span>
+        ${b.original ? `<span>original <b>${esc(b.original)}</b></span>` : ""}
+        ${routeChip("gap · no package read", true)}
+      </div>
+      <dl class="kv" style="margin-bottom:.6rem">${Object.entries(b.manifest).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
+      <div class="md">${md(b.markdown)}</div>
+      ${fresh ? `<div class="freeze-bar frozen">
+        <span class="sum">the package is frozen; the intent is not recorded yet</span>
+        <button class="btn primary" data-action="op" data-op="dispatch" data-wo="${esc(sel)}" ${busy ? "disabled" : ""}>${icon("send")} Dispatch the intent</button>
+        ${routeChip("POST /v1/attempts")}
+        <span class="sum">a separate step — the Line holds the intent until a slot frees</span>
+      </div>` : `<p class="note ok">Frozen and dispatched. The digest is the truth the runner was held to.</p>`}
+    </div>`;
+  }
+  return `
+  <div class="vh-top"><h1>Brief</h1>${routeChip("gap · freeze is folded into POST /v1/attempts", true)}</div>
+  <p class="lede">One work order has no frozen package. Include or exclude the rows the retrieval proposed; the freeze computes the digest and locks the rows; dispatch is a separate step taken on the Line. The rendered brief is read-only — nothing inside it is a control.</p>
+  <div class="brief-grid">
+    <aside class="pane">
+      <header><h2>Work orders</h2><span class="meta">${unfrozenIds.length} need a brief</span></header>
+      <div class="body">
+        ${unfrozenIds.map(w => woChip(w, false)).join("")}
+        ${frozenIds.length ? `<div class="listhead">frozen packages</div>` : ""}
+        ${frozenIds.map(w => woChip(w, true)).join("")}
+      </div>
+    </aside>
+    <div>${main}</div>
+  </div>`;
+}
+
+/* ============================================================ knowledge */
+function decidedText(d){
+  const map = {
+    accept: `accepted · keeper published · receipt ${d.receipt}`,
+    reject: `rejected · receipt ${d.receipt}`,
+    unresolved: `left unresolved · receipt ${d.receipt}`,
+    policy: `policy proposal ${d.receipt} recorded · it left the product, it is not a keeper`
+  };
+  return map[d.kind] + " · " + d.at;
+}
+function candCard(c, busy){
+  const d = state.dispositions[c.id];
+  const decided = !!d;
+  const dispBtn = op => `<button class="btn small ${OPINFO[op].cls}" data-action="op" data-op="${op}" data-cand="${esc(c.id)}" ${busy || decided ? "disabled" : ""}>${icon(OPINFO[op].icon)} ${OPINFO[op].label}</button>`;
+  return `<article class="cand">
+    <div class="ch"><b class="mono">${esc(c.id)}</b><span class="badge candidate">candidate</span>${d ? `<span class="decided ${d.kind}">${esc(decidedText(d))}</span>` : ""}</div>
+    <p class="claim">${esc(c.claim)}</p>
+    <dl class="kv prov">
+      <dt>project</dt><dd>${esc(c.project)}</dd>
+      <dt>paths</dt><dd class="mono">${esc(c.paths)}</dd>
+      <dt>source</dt><dd class="mono">${esc(c.source)}</dd>
+      <dt>evidence</dt><dd>${esc(c.evidence)}</dd>
+      <dt>checked</dt><dd>${c.checked ? esc(c.checked) : `<span class="none">not checked yet</span>`}</dd>
+      <dt>supersedes</dt><dd>${esc(c.supersedes)}</dd>
+    </dl>
+    ${c.acceptable
+      ? `<div class="acceptline">accept is legal · ${esc(c.acceptWhy)}</div>`
+      : `<div class="notoff"><b>Accept</b><span>${esc(c.acceptWhy)}</span></div>`}
+    <div class="disp">
+      ${c.acceptable ? dispBtn("accept") : ""}
+      ${dispBtn("reject")}${dispBtn("unresolved")}${dispBtn("policy")}
+    </div>
+  </article>`;
+}
+function viewKnowledge(){
+  const cands = FIXTURE.candidates.filter(c => state.project === "all" || c.project === state.project);
+  const keeps = FIXTURE.keepers.filter(k => state.project === "all" || k.project.split(",").map(s => s.trim()).includes(state.project));
+  const busy = Object.keys(state.inFlight).length > 0;
+  return `
+  <div class="vh-top"><h1>Knowledge</h1>${routeChip("gap · no list routes", true)}</div>
+  <p class="lede">Two lists. A keeper is published only from a head that carries an acceptance receipt; anything else stays a candidate, is rejected, or leaves the product as a policy proposal. Nothing on this page writes a policy.</p>
+  <section class="card pad">
+    <h2>Candidates <span class="meta">${cands.filter(c => !state.dispositions[c.id]).length} open · ${cands.length} in scope</span></h2>
+    <div class="cands">${cands.length ? cands.map(c => candCard(c, busy)).join("") : `<div class="empty">No candidates in this project scope. That is a scope note, not “nothing running”.</div>`}</div>
+  </section>
+  <section class="card pad" style="margin-top:.8rem">
+    <h2>Keepers <span class="meta">${keeps.length} in scope</span></h2>
+    <div class="tablewrap inner">
+      <table class="grid keeps">
+        <thead><tr><th>entry</th><th>claim</th><th>scope</th><th>source</th><th>checked</th><th>supersedes</th><th>reuse</th><th>wrong turns</th></tr></thead>
+        <tbody>${keeps.map(k => `
+          <tr>
+            <td class="mono">${esc(k.id)} ${esc(k.v)}</td>
+            <td class="claim">${esc(k.claim)}${k.from ? ` <span class="chip">published from ${esc(k.from)} just now</span>` : ""}</td>
+            <td class="src">${esc(k.project)} · ${esc(k.paths)}</td>
+            <td class="mono src">${esc(k.source)}</td>
+            <td>${esc(k.checked)}</td>
+            <td class="mono">${esc(k.supersedes)}</td>
+            <td class="mono">${k.used}×</td>
+            <td>${k.wrongTurns ? `<span class="badge failed" title="wrong turns reported against this keeper">${k.wrongTurns}</span>` : `<span class="none">0</span>`}</td>
+          </tr>`).join("")}</tbody>
+      </table>
+    </div>
+  </section>`;
+}
+
+/* ============================================================ the fake station
+   Every operation is a POST with an idempotency key, returns an operation id,
+   and ends in a receipt the page shows. 409 stays amber-unknown, 501 stays
+   "not implemented on this station", and no fact is ever upgraded by the page. */
+function recomputeLegal(a){
+  if (a.withdrawn){
+    a.legal = [];
+    a.notOffered = [
+      ["reconcile", "the intent was withdrawn; no session ever existed"],
+      ["collect", "nothing ran, so there are no artifacts"],
+      ["fix", "nothing to fix"],
+      ["merge", "no head, no acceptance"]
+    ];
+    return;
+  }
+  const legal = [], not = [];
+  const ended = a.facts.ended === "yes";
+  const collected = a.facts.collected === "yes";
+  if (!a.session) not.push(["reconcile", "no session exists yet; the intent record is the truth"]);
+  else if (a.receipts.completion) not.push(["reconcile", `a completion receipt exists (${a.receipts.completion.id})`]);
+  else legal.push("reconcile");
+  if (a.capacity === "pending" || (a.session && !ended)) legal.push("stop");
+  else not.push(["stop", ended ? "the command has ended" : "no session to stop"]);
+  if (a.receipts.completion && !collected) legal.push("collect");
+  else if (!a.receipts.completion) not.push(["collect", "legal only after a completion receipt"]);
+  else not.push(["collect", "the artifacts are already collected"]);
+  const sibs = attemptsOf(a.wo);
+  const latest = sibs.reduce((m, x) => x.number > m.number ? x : m, sibs[0]);
+  const unfinished = sibs.filter(x => x !== a && (x.capacity === "held" || x.capacity === "pending" || (x.receipts.completion && !x.receipts.verification)));
+  if (a.receipts.verification && !a.receipts.verification.pass && a === latest && unfinished.length === 0) legal.push("fix");
+  else {
+    let why;
+    if (unfinished.length) why = `another attempt on this order is unfinished (${unfinished[0].id})`;
+    else if (a !== latest) why = "a newer attempt exists on this work order";
+    else if (!a.receipts.verification) why = "verification has not run";
+    else if (a.receipts.verification.pass) why = "nothing to fix: verification passed";
+    else why = "a fix cannot open";
+    not.push(["fix", why]);
+  }
+  if (a.receipts.acceptance && !a.merged) legal.push("merge");
+  else if (a.merged) not.push(["merge", `already merged at ${a.mergeHead}`]);
+  else if (a.receipts.verification && !a.receipts.verification.pass) not.push(["merge", `verification failed at ${a.worktree.commit}`]);
+  else not.push(["merge", "no acceptance receipt at the current head"]);
+  a.legal = legal; a.notOffered = not;
+}
+function drift(a){
+  if (!a.cost) return;
+  a.cost.steps += Math.floor(Math.random() * 3);
+  if (a.startedAt) a.cost.minutes = Math.max(1, Math.round((vnow() - parseT(a.startedAt)) / 60000));
+  a.cost.usd = +(a.cost.steps * 0.0017).toFixed(2);
+  a.observedAt = fmtT(vnow());
+}
+function fakeDigest(s){
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+  const a2 = h.toString(16).padStart(8, "0");
+  const b = Math.imul(h ^ 0x9e3779b9, 2246822519) >>> 0;
+  return `sha256:${a2.slice(0, 4)}…${b.toString(16).padStart(8, "0").slice(0, 4)}`;
+}
+function newAttempt(woId, kind, number, brief, fixOf){
+  const W = FIXTURE.workOrders[woId];
+  const id = "att_01JA" + rnd(6);
+  const a = {
+    id, wo: woId, kind, number, fixOf: fixOf || null,
+    session: null, port: FIXTURE.capacity.port, slot: null, capacity: "pending",
+    queuedAt: fmtT(vnow()), queueBound: "30 min", startedAt: null,
+    observedAt: fmtT(vnow()), observedFrom: "journal · intent recorded, no session id",
+    facts: { reachable: "yes", prepared: "yes", active: "no", ended: "no", collected: "no" },
+    model: { implementer: "glm-5.3 · low", fallback: "laguna-s-2.1", reviewer: "gpt-6-luna" },
+    readiness: null,
+    worktree: { inspectedAt: fmtT(vnow()), commit: W.base, base: W.base, commitsSinceDispatch: 0, uncommitted: [], untracked: [], residue: [], artifacts: [[".lane/notes.md", false], [".lane/receipt.json", false]] },
+    receipts: { completion: null, verification: null, review: null, acceptance: null, decision: null },
+    legal: ["stop"],
+    notOffered: [
+      ["reconcile", "no session exists yet; the intent record is the truth"],
+      ["dispatch again", "the journal already holds this intent; a second record would be a duplicate"]
+    ],
+    cost: null, brief
+  };
+  FIXTURE.attempts.push(a);
+  return a;
+}
+function simulate(op, ctx){
+  const now = fmtT(vnow());
+  const rid = p => p + "-" + String(Math.floor(Math.random() * 9000 + 1000));
+  if (op === "reconcile"){
+    const a = att(ctx.att);
+    if (a.facts.reachable === "unknown" || a.facts.ended === "unknown"){
+      a.observedAt = now;
+      a.observedFrom = `reconcile · runner did not answer (10 s timeout) · ${now}`;
+      return { status: 409, code: "attempt.unknown", text: "The runner did not answer, so the outcome is unknown. No fact was upgraded; the slot stays held until the runner speaks." };
+    }
+    if (a.facts.active === "yes"){
+      drift(a);
+      return { status: 200, code: "observation.recorded", text: `Runner answered · command active · slot ${a.slot} held. Observation receipt written at ${now}.` };
+    }
+    return { status: 200, code: "observation.recorded", text: "Runner answered; nothing new to record." };
+  }
+  if (op === "stop"){
+    const a = att(ctx.att);
+    if (a.capacity === "pending"){
+      a.withdrawn = true; a.capacity = "released"; a.slot = null;
+      a.receipts.completion = { id: rid("wd"), at: now, exit: null, pass: true, text: "intent withdrawn before a session existed; the queue place closed" };
+      a.observedAt = now; a.observedFrom = `journal · intent withdrawn · ${now}`;
+      recomputeLegal(a);
+      return { status: 200, code: "intent.withdrawn", text: `The queued intent for ${a.wo} was withdrawn. No session ever existed; no slot was ever held.` };
+    }
+    const slot = a.slot;
+    a.receipts.completion = { id: rid("cmp"), at: now, exit: 130, pass: true, text: `command stopped by the operator; process group gone; slot ${slot} released` };
+    a.receipts.verification = { id: rid("vrf"), at: now, head: a.worktree.commit, pass: false, text: "verification not run: the command was stopped before it finished. A stopped attempt is not a pass." };
+    a.facts.active = "no"; a.facts.ended = "yes"; a.facts.collected = "no";
+    a.capacity = "released"; a.slot = null;
+    a.observedAt = now; a.observedFrom = `completion receipt ${a.receipts.completion.id} · runner port ${a.port}`;
+    attemptsOf(a.wo).forEach(recomputeLegal);
+    return { status: 200, code: "attempt.stopped", text: `Command stopped; completion receipt ${a.receipts.completion.id} written; slot ${slot} released only after the receipt.` };
+  }
+  if (op === "collect"){
+    /* the route is in the plan; this station has no body behind it */
+    return { status: 501, code: "station.not-implemented", text: "POST /v1/attempts/:id/artifacts has no body on this station. The route is in the plan; this station answers 501." };
+  }
+  if (op === "fix"){
+    const src = att(ctx.att);
+    const n = attemptsOf(src.wo).length + 1;
+    const a = newAttempt(src.wo, "fix", n, { digest: src.brief.digest, frozenAt: now, original: `${src.brief.digest} (${src.id})`, manifest: src.brief.manifest, markdown: src.brief.markdown }, src.id);
+    state.attempt = a.id; state.view = "attempt";
+    attemptsOf(src.wo).forEach(recomputeLegal);
+    return { status: 200, code: "attempt.queued", text: `Fix ${n} on ${src.wo} recorded as a queued intent, frozen from ${src.brief.digest}. The Line holds it until a slot frees.` };
+  }
+  if (op === "merge"){
+    const a = att(ctx.att);
+    a.merged = true;
+    a.receipts.merge = { id: rid("mrg"), at: now, head: a.mergeHead, pass: true, text: `pull request ${a.pullRequest} found before any forge call · merged at ${a.mergeHead}` };
+    recomputeLegal(a);
+    return { status: 200, code: "merge.executed", text: `Pull request ${a.pullRequest} was looked up first; the merge at ${a.mergeHead} is done. Receipt ${a.receipts.merge.id}.` };
+  }
+  if (op === "freeze"){
+    const inc = FIXTURE.proposals.filter(p => state.include[p.id]);
+    const digest = fakeDigest(inc.map(p => p.id + p.v).join(","));
+    state.frozen = { wo: ctx.wo, digest, frozenAt: now, ids: inc.map(p => p.id) };
+    return { status: 200, code: "brief.frozen", text: `Brief frozen · ${inc.length} of ${FIXTURE.proposals.length} rows included · digest ${digest}. The rows lock; dispatch is a separate step.` };
+  }
+  if (op === "dispatch"){
+    const f = state.frozen, w = FIXTURE.workOrders[f.wo];
+    const a = newAttempt(f.wo, "first", 1, { digest: f.digest, frozenAt: f.frozenAt, manifest: w.manifest, markdown: composeMarkdown(f) }, null);
+    state.view = "line"; state.attempt = a.id;
+    return { status: 200, code: "intent.recorded", text: `Intent recorded for ${f.wo} · brief ${f.digest}. It sits in the queue; the runner takes it when a slot frees.` };
+  }
+  const c = FIXTURE.candidates.find(x => x.id === ctx.cand);
+  if (c && op === "accept"){
+    FIXTURE.keepers.push({ id: "k-045", v: "v1", claim: c.claim, project: c.project, paths: c.paths, source: c.source, checked: `operator · ${fmtDate(vnow())}`, supersedes: "—", used: 0, wrongTurns: 0, from: c.id });
+    state.dispositions[c.id] = { kind: "accept", at: now, receipt: rid("acc-k") };
+    return { status: 200, code: "keeper.published", text: `Keeper k-045 v1 published from ${c.id} · acceptance receipt acc-0071 binds e5a7c90. Supersedes nothing yet.` };
+  }
+  if (c && op === "reject"){ const r = rid("rej"); state.dispositions[c.id] = { kind: "reject", at: now, receipt: r }; return { status: 200, code: "candidate.rejected", text: `${c.id} rejected with receipt ${r}. It stays on the record, not on the line.` }; }
+  if (c && op === "unresolved"){ const r = rid("unr"); state.dispositions[c.id] = { kind: "unresolved", at: now, receipt: r }; return { status: 200, code: "candidate.left", text: `${c.id} left unresolved with receipt ${r}. It stays a candidate.` }; }
+  if (c && op === "policy"){ const r = rid("pol-prop"); state.dispositions[c.id] = { kind: "policy", at: now, receipt: r }; return { status: 200, code: "policy.proposed", text: `Policy proposal ${r} recorded from ${c.id} · it left the product; it is not a keeper.` }; }
+  return { status: 400, code: "bad.request", text: "No such operation on this station." };
+}
+function invoke(op, ctx){
+  if (Object.keys(state.inFlight).length) return;
+  const key = op + ":" + (ctx.att || ctx.wo || ctx.cand || "");
+  const operationId = "op_" + rnd(6);
+  state.inFlight[key] = { op, operationId, att: ctx.att || null };
+  render();
+  setTimeout(() => {
+    const res = simulate(op, ctx);
+    delete state.inFlight[key];
+    state.journal.unshift({ op, operationId, at: fmtT(vnow()), att: ctx.att || null, res });
+    if (state.journal.length > 40) state.journal.pop();
+    toast(res, op, operationId);
+    render();
+  }, 800 + Math.random() * 700);
+}
+function toast(res, op, operationId){
+  const kind = res.status === 200 ? "ok" : res.status === 409 ? "unknown" : res.status === 501 ? "ni" : "err";
+  const word = res.status === 200 ? "ok" : res.status === 409 ? "409 · unknown" : res.status === 501 ? "501 · not implemented on this station" : String(res.status);
+  const el = document.createElement("div");
+  el.className = "toast " + kind;
+  el.innerHTML = `<div class="t"><b>${esc(OPINFO[op] ? OPINFO[op].label : op)}</b><span class="mono">${esc(word)}</span><button class="tclose" aria-label="Dismiss">×</button></div>
+    <p>${esc(res.text)}</p>
+    <div class="f">operation ${esc(operationId)}${res.code ? " · " + esc(res.code) : ""}</div>`;
+  $toasts.appendChild(el);
+  const kill = () => el.remove();
+  el.querySelector(".tclose").addEventListener("click", kill);
+  setTimeout(kill, 7000);
+  while ($toasts.children.length > 4) $toasts.firstChild.remove();
+}
+function miniToast(t){
+  const el = document.createElement("div");
+  el.className = "toast ni";
+  el.innerHTML = `<div class="t"><b>clipboard</b><button class="tclose" aria-label="Dismiss">×</button></div><p>${esc(t)}</p>`;
+  $toasts.appendChild(el);
+  el.querySelector(".tclose").addEventListener("click", () => el.remove());
+  setTimeout(() => el.remove(), 3500);
+}
+function copyText(s){
+  const ok = () => miniToast("copied · " + s);
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(s).then(ok).catch(() => fallbackCopy(s, ok));
+  } else fallbackCopy(s, ok);
+}
+function fallbackCopy(s, ok){
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = s; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    document.execCommand("copy"); ta.remove(); ok();
+  } catch (e){ miniToast("copy failed"); }
+}
+
+/* ============================================================ render */
+function renderNav(){
+  const scoped = FIXTURE.attempts.filter(inProject);
+  const openCands = FIXTURE.candidates.filter(c => !state.dispositions[c.id]).length;
+  const unfrozen = Object.keys(FIXTURE.workOrders).filter(w => state.project === "all" || FIXTURE.workOrders[w].project === state.project)
+    .filter(w => !hasPackage(w) && !(state.frozen && state.frozen.wo === w)).length;
+  const items = [
+    ["line", "Line", scoped.length],
+    ["attempt", "Attempt", null],
+    ["brief", "Brief", unfrozen || null],
+    ["knowledge", "Knowledge", openCands || null]
+  ];
+  $nav.innerHTML = items.map(([v, l, n]) =>
+    `<button data-action="view" data-view="${v}"${state.view === v ? ' aria-current="page"' : ""}>${l}${n != null ? ` <small>${n}</small>` : ""}</button>`
+  ).join("");
+}
+function renderProjects(){
+  const names = ["all", ...FIXTURE.projects];
+  $projects.innerHTML = '<span class="lbl">Projects</span>' + names.map(name => {
+    const as = FIXTURE.attempts.filter(a => name === "all" || woOf(a).project === name);
+    const c = { unknown: 0, blocked: 0, active: 0 };
+    as.forEach(a => { const w = summary(a)[0]; if (c[w] != null) c[w]++; });
+    const dots = [["u", "unknown", c.unknown], ["b", "blocked", c.blocked], ["a", "active", c.active]]
+      .filter(x => x[2]).map(([k, t, n]) => `<i class="${k}" title="${t}"></i><b>${n}</b>`).join("");
+    return `<button data-action="project" data-project="${esc(name)}" aria-current="${state.project === name}">${esc(name === "all" ? "All projects" : name)}<span class="stat">${dots}</span></button>`;
+  }).join("");
+}
+function renderStamp(){
+  $stamp.innerHTML = `<i></i>fixture · observed ${esc(state.lastRead)} · no live host`;
+}
+function renderPage(){
+  $page.className = "page" + (state.view === "attempt" ? " deskpage" : "");
+  const html = state.view === "line" ? viewLine() : state.view === "attempt" ? viewAttempt() : state.view === "brief" ? viewBrief() : viewKnowledge();
+  $page.innerHTML = `<div class="view">${html}</div>`;
+}
+function render(){
+  const ae = document.activeElement;
+  const sel = ae && ae.dataset && Object.keys(ae.dataset).length
+    ? Object.entries(ae.dataset).map(([k, v]) => `[data-${k}="${CSS.escape(String(v))}"]`).join("") : null;
+  const sc = [...document.querySelectorAll(".page, .pane > .body")].map(el => el.scrollTop);
+  renderNav(); renderProjects(); renderStamp(); renderPage();
+  [...document.querySelectorAll(".page, .pane > .body")].forEach((el, i) => { if (sc[i] != null) el.scrollTop = sc[i]; });
+  if (sel){
+    const n = document.querySelector(sel);
+    if (n && n.focus){ try { n.focus({ preventScroll: true }); } catch (e){} }
+  }
+}
+
+/* ============================================================ cadence
+   A refresh cadence on the virtual clock. It re-reads the station: observed
+   times move, running counters drift. It never upgrades a fact — the silent
+   runner stays unknown, exactly as the record says. */
+let nextRead = Date.now() + 15000;
+function observe(){
+  nextRead = Date.now() + 15000;
+  FIXTURE.attempts.forEach(a => {
+    if (a.capacity === "held" && a.facts.active === "yes") drift(a);
+    if (a.capacity === "pending") a.observedAt = fmtT(vnow());
+  });
+  state.lastRead = fmtFull(vnow());
+  render();
+}
+function setTheme(t){
+  state.theme = t;
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem("fleet-theme", t); } catch (e){}
+  $themeBtn.innerHTML = icon(t === "dark" ? "sun" : "moon");
+  $themeBtn.title = t === "dark" ? "Switch to the light twin" : "Switch to dark";
+}
+
+/* ============================================================ events */
+document.addEventListener("click", e => {
+  const t = e.target.closest("[data-action]");
+  if (!t) return;
+  const d = t.dataset;
+  switch (d.action){
+    case "view": state.view = d.view; break;
+    case "project": state.project = d.project; break;
+    case "open": state.attempt = d.att; state.view = "attempt"; break;
+    case "copy": copyText(d.copy); return;
+    case "theme": setTheme(state.theme === "dark" ? "light" : "dark"); return;
+    case "refresh": observe(); return;
+    case "op": invoke(d.op, { att: d.att, wo: d.wo, cand: d.cand }); return;
+    case "include": state.include[d.id] = !state.include[d.id]; break;
+    case "briefwo": state.briefWo = d.wo; break;
+  }
+  render();
+});
+document.addEventListener("change", e => {
+  const t = e.target.closest("[data-change]");
+  if (!t) return;
+  const d = t.dataset;
+  if (d.change === "showended") state.showEnded = t.checked;
+  if (d.change === "sumfilter") state.sumFilter = t.value;
+  if (d.change === "include") state.include[d.id] = t.checked;
+  render();
+});
+/* Navigation keys only: arrows move the selection, Enter opens the record
+   under focus. No key performs an operation. */
+document.addEventListener("keydown", e => {
+  if (e.target.matches("input, select, textarea")) return;
+  if (e.key === "Enter" || e.key === " "){
+    const r = e.target.closest && e.target.closest('[data-action="open"]');
+    if (r){ e.preventDefault(); state.attempt = r.dataset.att; state.view = "attempt"; render(); }
+    return;
+  }
+  if (e.key === "ArrowDown" || e.key === "ArrowUp"){
+    const list = lineRows().map(a => a.id);
+    if (!list.length) return;
+    const cur = list.indexOf(state.attempt);
+    const next = e.key === "ArrowDown" ? Math.min(list.length - 1, cur < 0 ? 0 : cur + 1) : Math.max(0, cur < 0 ? 0 : cur - 1);
+    if (next !== cur){ state.attempt = list[next]; e.preventDefault(); render(); }
+  }
+});
+
+/* ============================================================ boot */
+(function boot(){
+  let t = "dark";
+  try { t = localStorage.getItem("fleet-theme") || "dark"; } catch (e){}
+  setTheme(t);
+  state.lastRead = fmtFull(vnow());
+  render();
+  setInterval(() => { if (!document.hidden) observe(); }, 15000);
+  setInterval(() => {
+    if (document.hidden){ $countdown.textContent = "paused · tab hidden"; return; }
+    const s = Math.max(0, Math.ceil((nextRead - Date.now()) / 1000));
+    $countdown.textContent = s > 0 ? `next read ${s} s` : "reading…";
+  }, 500);
+})();
+</script>
+</body>
+</html>

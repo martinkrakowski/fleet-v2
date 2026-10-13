@@ -2,7 +2,19 @@
 
 *Date: 2026-10-13 · Status: draft, not adopted · Owner decision: pending*
 
-Source: the single-file draft `waves-dashboard.html` (title "Fleet · line controller"), read 2026-10-13. It is a static page with an in-memory fixture. The stamp says nothing reaches a runner. This plan is how that page becomes `apps/web` talking only to the Nitro API. It does not start a lane.
+Source file, in this repository: `docs/planning/2026-10-13_waves-dashboard.html` (124078 bytes, title "Fleet · line controller", copied 2026-10-13 from the desktop draft). An implementer reads that file. This plan does not restate its markup, its CSS, or its fixture records. Guessing the page from the tables below is a failed reading.
+
+The file is one static page with an in-memory `FIXTURE` and a `simulate` function. The stamp says nothing reaches a runner. This plan is how that page becomes `apps/web` talking only to the Nitro API. It does not start a lane.
+
+What to take from the file, and what to leave:
+
+| In the HTML | Use it as |
+|---|---|
+| The layout, the four views (`viewLine`, `viewAttempt`, `viewBrief`, `viewKnowledge`), and the project strip | The `apps/web` markup. Do not redesign it. |
+| `FIXTURE` | The shape of the read model, and the only data behind `?fixture=1` |
+| `recomputeLegal` | The rules the API must apply. The browser does not keep this function. |
+| `simulate` | Not product code. It is the fixture's stand-in for routes that return 501. |
+| Sample project names, the sample port, and the random cost drift | Fixture only. The live page reads projects, slots, and cost from the API. |
 
 ## What the draft is
 
@@ -71,7 +83,7 @@ Writes send `Idempotency-Key`. A 409 leaves the facts as the body says. A 501 le
 |---|---|---|---|
 | D1 | Add the list, capacity, and knowledge-list routes, and the `legal` / `notOffered` fields on the attempt record. Handlers call use cases and return 501 until the use case exists. | one fleet-v2 lane, `apps/api` only | `yarn typecheck` in `apps/api`. Each new path returns 501. `GET /` still returns ok. |
 | D2 | Split freeze from dispatch: `POST /v1/work-orders/:id/brief` then `POST /v1/attempts` with that digest. | one lane after D1 | A dispatch whose digest does not match the frozen brief is 409. Freeze does not create a session. |
-| D3 | Map the four views onto those routes in `apps/web`. Fixture mode stays behind `?fixture=1`. | one lane, `apps/web` only, after D1's paths exist | The line, the record, the brief, and knowledge render from a fixture. No request leaves the browser in fixture mode. |
+| D3 | Build the four views in `apps/web` by following `docs/planning/2026-10-13_waves-dashboard.html`. Wire them to the D1 routes. Fixture mode loads that file's `FIXTURE` and stays behind `?fixture=1`. | one lane, `apps/web` only, after D1's paths exist | The line, the record, the brief, and knowledge match the draft's sections. No request leaves the browser in fixture mode. |
 | D4 | Point the default mode at the API. Unknown renders as stale. 501 does not change a fact. | one lane after D3 | A 409 response leaves the previous yes/no facts marked stale. A stopped attempt does not show as a pass. |
 
 D1 and D3 can be sequenced. They must not edit the same files. D2 waits on D1. D4 waits on D3. None of these lanes enables forge, adds a Waves contract, or reads a token.

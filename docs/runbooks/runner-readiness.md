@@ -25,4 +25,4 @@ Write one readiness receipt: attempt id, environment digest, each line pass or f
 
 ## Not this runbook
 
-A goal-driven container bootstrap, a Gemini key in the guest, or treating "runner process is up" as "the lane finished".
+A goal-driven container bootstrap, a vendor key in the guest, or treating "runner process is up" as "the lane finished".

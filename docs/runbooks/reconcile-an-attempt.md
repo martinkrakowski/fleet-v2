@@ -18,6 +18,8 @@ The local client died, the API caller disconnected, or the controller restarted 
 6. Release capacity only after the receipt says the command ended and the process group is gone.
 7. A quota or permission refusal is a terminal refusal, not a return to the queue.
 
+Steps 6 and 7, and silence-as-"no answer" in the first-run demonstration, are open owner decisions, not settled rules. They remain pending owner decision before any runbook moves from draft to tool.
+
 ## Proof
 
 Killing the local watcher of a `--detach` dispatch leaves the server session running. A second reconcile prints the same session id and does not create a new one.

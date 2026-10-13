@@ -104,7 +104,7 @@ monorepo:
 
         # Next.js
         .next/
-        out/
+        apps/*/out/
 
         # Nitro
         .nitro/

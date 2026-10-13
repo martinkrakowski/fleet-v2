@@ -16,9 +16,9 @@ next-env.d.ts
 # Turbo
 .turbo/
 
-# Next.js
+# Next.js (static export output only; packages/*/src/application/ports/out stays tracked)
 .next/
-out/
+apps/*/out/
 
 # Nitro
 .nitro/
@@ -49,3 +49,6 @@ yarn-error.log*
 /.lane/
 /installation/
 SYNC-MIGRATION-REPORT.md
+
+# Agent briefs and lane scaffolding
+.agents/

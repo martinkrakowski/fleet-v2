@@ -7,7 +7,7 @@ import {
   RecordContextSelectionUseCase,
   RecordKnowledgeReuseUseCase,
   SupersedeKnowledgeEntryUseCase,
-} from "../../../../../packages/brief-knowledge/src/application/use-cases/index.js";
+} from "@fleet/brief-knowledge/use-cases";
 
 export interface KnowledgeComposition {
   captureCompletedAttemptNotes: CaptureCompletedAttemptNotesUseCase;

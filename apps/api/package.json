@@ -9,13 +9,15 @@
     "preview": "node .output/server/index.mjs",
     "prepare": "nitro prepare",
     "lint": "eslint server --ext .ts",
-    "typecheck": "nitro prepare && tsc --noEmit"
+    "typecheck": "nitro prepare && tsc --noEmit",
+    "test": "vitest run --passWithNoTests --exclude '**/dist/**'"
   },
   "dependencies": {
     "@fleet/brief-knowledge": "workspace:*",
     "@fleet/evidence-and-acceptance": "workspace:*",
     "@fleet/operator-coordination": "workspace:*",
     "@fleet/work-execution": "workspace:*",
+    "h3": "^1.15.11",
     "nitropack": "^2.13.0"
   },
   "devDependencies": {
@@ -23,6 +25,7 @@
     "@types/node": "^22.0.0",
     "eslint": "^9.0.0",
     "typescript": "^5.5.4",
-    "typescript-eslint": "^8.0.0"
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^4.1.9"
   }
 }

@@ -8,7 +8,7 @@ import {
   RecordVerificationReceiptUseCase,
   RequestIndependentReviewUseCase,
   RequestVerificationUseCase,
-} from "../../../../../packages/evidence-and-acceptance/src/application/use-cases/index.js";
+} from "@fleet/evidence-and-acceptance/use-cases";
 
 export interface EvidenceUseCases {
   requestVerification: RequestVerificationUseCase;

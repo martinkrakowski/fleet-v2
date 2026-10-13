@@ -26,3 +26,15 @@ export function isNotImplementedError(error: unknown): boolean {
     error instanceof Error && error.message.startsWith("Not implemented")
   );
 }
+
+export interface ApiErrorMapping {
+  status: number;
+  code: string;
+}
+
+export function mapWorkError(error: unknown): ApiErrorMapping | null {
+  if (!isNotImplementedError(error)) {
+    return null;
+  }
+  return { status: NOT_IMPLEMENTED_STATUS, code: NOT_IMPLEMENTED_CODE };
+}

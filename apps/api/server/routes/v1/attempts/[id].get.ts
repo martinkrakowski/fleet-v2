@@ -1,9 +1,7 @@
 import { workComposition } from "../../../wiring/work/composition";
 import {
-  NOT_IMPLEMENTED_CODE,
-  NOT_IMPLEMENTED_STATUS,
   envelope,
-  isNotImplementedError,
+  mapWorkError,
   newOperationId,
 } from "../../../wiring/work/errors";
 
@@ -14,9 +12,10 @@ export default defineEventHandler(async (event) => {
     const result = await workComposition().reconcileAttempt.execute({ id });
     return envelope(operationId, "OK", result);
   } catch (error) {
-    if (isNotImplementedError(error)) {
-      setResponseStatus(event, NOT_IMPLEMENTED_STATUS);
-      return envelope(operationId, NOT_IMPLEMENTED_CODE);
+    const mapping = mapWorkError(error);
+    if (mapping) {
+      setResponseStatus(event, mapping.status);
+      return envelope(operationId, mapping.code);
     }
     throw error;
   }

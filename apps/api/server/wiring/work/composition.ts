@@ -10,7 +10,7 @@ import {
   RequestAttemptAcceptanceUseCase,
   ReserveExecutionCapacityUseCase,
   StopAttemptUseCase,
-} from "../../../../../packages/work-execution/src/application/use-cases/index";
+} from "@fleet/work-execution/use-cases";
 
 export interface WorkComposition {
   registerWorkOrder: RegisterWorkOrderUseCase;

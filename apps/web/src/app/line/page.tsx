@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Badge, Card, Fact } from "@fleet/ui";
 import {
   attempts,
@@ -58,6 +58,7 @@ function summary(a: AttemptSummary): [word: string, note: string] {
 const woOf = (a: AttemptSummary) => workOrders[a.wo];
 const attemptsOf = (wo: string) => attempts.filter((a) => a.wo === wo);
 const attemptHref = (a: AttemptSummary) => `/attempt?id=${a.id}`;
+const isLive = (a: AttemptSummary) => a.facts.active === "yes" && a.facts.ended === "no";
 
 function queuePos(a: AttemptSummary): number {
   const q = attempts
@@ -80,6 +81,18 @@ function FactCell({ attempt, name }: { attempt: AttemptSummary; name: FactName }
   );
 }
 
+function LiveClock({ startMinutes }: { startMinutes: number }) {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setElapsed((n) => n + 1), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const total = startMinutes * 60 + elapsed;
+  const mm = String(Math.floor(total / 60)).padStart(2, "0");
+  const ss = String(total % 60).padStart(2, "0");
+  return <span className={`${styles.mono} ${styles.clock}`}>{mm}:{ss}</span>;
+}
+
 function AttemptRow({ attempt }: { attempt: AttemptSummary }) {
   const router = useRouter();
   const [word, note] = summary(attempt);
@@ -93,6 +106,7 @@ function AttemptRow({ attempt }: { attempt: AttemptSummary }) {
   const silent = attempt.facts.reachable === "unknown" && attempt.lastKnown
     ? ` · silent since ${attempt.lastKnown.at}`
     : "";
+  const live = isLive(attempt);
   return (
     <tr className={styles.row} onClick={() => router.push(href)}>
       <td className={styles.cAtt}>
@@ -115,7 +129,11 @@ function AttemptRow({ attempt }: { attempt: AttemptSummary }) {
         <FactCell key={name} attempt={attempt} name={name} />
       ))}
       <td className={styles.cState}>
-        <Badge tone={word}>{word}</Badge>
+        <span className={styles.stateword}>
+          {live ? <i className={styles.pulseDot} aria-hidden="true" /> : null}
+          <Badge tone={word}>{word}</Badge>
+          {live ? <LiveClock startMinutes={attempt.cost?.minutes ?? 0} /> : null}
+        </span>
         <span className={styles.sub}>{note}</span>
       </td>
       <td className={styles.cObs}>

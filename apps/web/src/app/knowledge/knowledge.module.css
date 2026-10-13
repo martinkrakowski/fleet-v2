@@ -17,8 +17,8 @@
   --violet: #c084fc;
   --glow-cyan: rgba(34, 211, 238, 0.13);
   --glow-violet: rgba(192, 132, 252, 0.11);
-  --radius-card: 14px;
-  --radius: 8px;
+  --radius-card: 3px;
+  --radius: 3px;
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 
@@ -129,7 +129,7 @@
   border: 1px solid var(--line-soft);
   border-radius: var(--radius);
   background: var(--bg-sink);
-  padding: 0.6rem 0.7rem;
+  padding: 0.75rem 0.8rem;
 }
 
 .ch {
@@ -173,7 +173,7 @@
 .acceptline {
   font-size: 0.74rem;
   margin: 0.45rem 0 0.2rem;
-  padding: 0.25rem 0.5rem;
+  padding: 0.75rem 0.8rem;
   border-radius: var(--radius);
   border: 1px solid color-mix(in srgb, var(--emerald) 40%, transparent);
   color: var(--emerald);
@@ -185,7 +185,7 @@
   align-items: baseline;
   color: var(--faint);
   font-size: 0.76rem;
-  padding: 0.14rem 0;
+  padding: 0.75rem 0;
   border-top: 1px dashed var(--line-soft);
 }
 
@@ -287,6 +287,7 @@
   border: 1px solid var(--line-soft);
   border-radius: var(--radius);
   margin-top: 0.3rem;
+  padding: 0.75rem;
 }
 
 .grid {
@@ -302,7 +303,7 @@
   letter-spacing: 0.12em;
   text-transform: uppercase;
   font-weight: 500;
-  padding: 0.5rem 0.6rem;
+  padding: 0.75rem;
   border-bottom: 1px solid var(--line);
   white-space: nowrap;
   position: sticky;
@@ -312,7 +313,7 @@
 }
 
 .grid td {
-  padding: 0.5rem 0.6rem;
+  padding: 0.75rem;
   border-bottom: 1px solid var(--line-soft);
   vertical-align: top;
 }

@@ -89,7 +89,7 @@ function WorkOrderPane({
       style={{ flex: "0 0 280px", minWidth: 0, display: "flex", flexDirection: "column", gap: ".8rem" }}
       aria-label="Work order"
     >
-      <Card title="Work order">
+      <Card title="Work order" padded>
         <dl
           style={{
             display: "grid",
@@ -147,8 +147,8 @@ function WorkOrderPane({
                   data-att={s.id}
                   style={{
                     border: "1px solid rgba(148,163,184,.08)",
-                    borderRadius: "8px",
-                    padding: ".45rem .55rem",
+                    borderRadius: "3px",
+                    padding: ".75rem",
                     margin: "0 0 .4rem",
                     cursor: "pointer",
                     background: "rgba(148,163,184,.03)",
@@ -257,8 +257,8 @@ function FactsSection({ attempt }: { attempt: Attempt }) {
               title={tip}
               style={{
                 border: "1px solid rgba(148,163,184,.08)",
-                borderRadius: "8px",
-                padding: ".4rem .3rem",
+                borderRadius: "3px",
+                padding: ".75rem",
                 textAlign: "center",
                 background: "rgba(148,163,184,.03)",
                 minWidth: 0,
@@ -302,8 +302,8 @@ function FactsSection({ attempt }: { attempt: Attempt }) {
         <div
           style={{
             border: "1px solid rgba(255,165,24, .3)",
-            borderRadius: "8px",
-            padding: ".4rem .6rem",
+            borderRadius: "3px",
+            padding: ".75rem .8rem",
             margin: ".45rem 0",
             background: "rgba(74, 222, 128, .05)",
             fontSize: ".78rem",
@@ -573,8 +573,8 @@ function WorktreeSection({ attempt }: { attempt: Attempt }) {
         <div
           style={{
             border: "1px solid rgba(255,165,24, .3)",
-            borderRadius: "8px",
-            padding: ".4rem .6rem",
+            borderRadius: "3px",
+            padding: ".75rem .8rem",
             margin: ".45rem 0",
             background: "rgba(74, 222, 128, .05)",
             fontSize: ".78rem",
@@ -622,7 +622,7 @@ function ReadinessSection({ attempt }: { attempt: Attempt }) {
             style={{
               display: "flex",
               gap: ".5rem",
-              padding: ".14rem 0",
+              padding: ".75rem 0",
               alignItems: "baseline",
               borderBottom: "1px solid rgba(148,163,184,.08)",
             }}
@@ -704,8 +704,8 @@ function ReceiptsSection({ attempt }: { attempt: Attempt }) {
             style={{
               border: "1px solid rgba(148,163,184,.13)",
               borderLeft: `3px solid ${r.pass ? "#34d399" : "#fb7185"}`,
-              borderRadius: "8px",
-              padding: ".4rem .6rem",
+              borderRadius: "3px",
+              padding: ".75rem .8rem",
               margin: "0 0 .4rem",
               background: "rgba(148,163,184,.03)",
               fontSize: ".78rem",
@@ -733,8 +733,8 @@ function ReceiptsSection({ attempt }: { attempt: Attempt }) {
             style={{
               border: "1px dashed rgba(148,163,184,.13)",
               borderLeft: "3px solid rgba(148,163,184,.2)",
-              borderRadius: "8px",
-              padding: ".4rem .6rem",
+              borderRadius: "3px",
+              padding: ".75rem .8rem",
               margin: "0 0 .4rem",
               background: "rgba(148,163,184,.03)",
               fontSize: ".78rem",
@@ -769,8 +769,8 @@ function BriefSection({ attempt }: { attempt: Attempt }) {
       className="brief"
       style={{
         border: "1px solid rgba(148,163,184,.08)",
-        borderRadius: "8px",
-        padding: ".5rem .65rem",
+              borderRadius: "3px",
+                  padding: ".75rem .8rem",
         background: "rgba(148,163,184,.03)",
       }}
     >
@@ -800,7 +800,7 @@ function BriefSection({ attempt }: { attempt: Attempt }) {
           fontFamily: "var(--mono, ui-monospace, monospace)",
           fontSize: ".68rem",
           margin: ".4rem 0 .5rem",
-          paddingBottom: ".3rem",
+          paddingBottom: ".75rem",
           borderBottom: "1px dashed rgba(148,163,184,.08)",
         }}
       >
@@ -827,8 +827,8 @@ function BriefSection({ attempt }: { attempt: Attempt }) {
         style={{
           background: "rgba(148,163,184,.05)",
           border: "1px solid rgba(148,163,184,.13)",
-          borderRadius: "8px",
-          padding: ".6rem .8rem",
+                borderRadius: "3px",
+          padding: ".75rem .8rem",
           overflow: "auto",
           fontFamily: "var(--mono, ui-monospace, monospace)",
           fontSize: ".74rem",
@@ -949,8 +949,8 @@ function RecordPane({
         <div
           style={{
             border: "1px solid rgba(255,165,24, .3)",
-            borderRadius: "8px",
-            padding: ".4rem .6rem",
+            borderRadius: "3px",
+            padding: ".75rem .8rem",
             margin: ".45rem 0",
             background: "rgba(74, 222, 128, .05)",
             fontSize: ".78rem",
@@ -1066,7 +1066,7 @@ function OperationsPane({ attempt, word }: { attempt: Attempt; word: string }) {
       style={{ flex: "0 0 260px", minWidth: 0, display: "flex", flexDirection: "column" }}
       aria-label="Operations"
     >
-      <Card title="Operations">
+      <Card title="Operations" padded>
         <div style={{ display: "flex", flexDirection: "column", gap: ".45rem" }}>
           {legalOps.map((op) => {
             const isLegal = attempt.legal.includes(op);
@@ -1087,7 +1087,7 @@ function OperationsPane({ attempt, word }: { attempt: Attempt; word: string }) {
                     alignItems: "baseline",
                     color: "#78849f",
                     fontSize: ".76rem",
-                    padding: ".14rem 0",
+                    padding: ".75rem 0",
                   }}
                 >
                   <b style={{ color: "#93a0bb", fontWeight: 500 }}>{esc(OP_LABELS[op] || op)}</b>
@@ -1107,7 +1107,7 @@ function OperationsPane({ attempt, word }: { attempt: Attempt; word: string }) {
                     alignItems: "baseline",
                     color: "#78849f",
                     fontSize: ".76rem",
-                    padding: ".14rem 0",
+                    padding: ".75rem 0",
                   }}
                 >
                   <b style={{ color: "#93a0bb", fontWeight: 500 }}>{esc(OP_LABELS[op] || op)}</b>
@@ -1135,8 +1135,8 @@ function OperationsPane({ attempt, word }: { attempt: Attempt; word: string }) {
                   border: `1px solid ${
                     op === "merge" ? "rgba(52,200,159,.4)" : op === "stop" ? "rgba(251,113,133,.4)" : "rgba(148,163,184,.2)"
                   }`,
-                  borderRadius: "8px",
-                  padding: ".5rem .65rem",
+                  borderRadius: "3px",
+        padding: ".75rem .8rem",
                   cursor: "pointer",
                   marginBottom: ".45rem",
                   fontSize: ".85rem",
@@ -1218,7 +1218,7 @@ function OperationsPane({ attempt, word }: { attempt: Attempt; word: string }) {
                   alignItems: "baseline",
                   color: "#78849f",
                   fontSize: ".76rem",
-                  padding: ".14rem 0",
+                  padding: ".75rem 0",
                 }}
               >
                 <b style={{ color: "#93a0bb", fontWeight: 500 }}>{esc(OP_LABELS[op] || op)}</b>
@@ -1233,8 +1233,8 @@ function OperationsPane({ attempt, word }: { attempt: Attempt; word: string }) {
             style={{
               border: "1px solid rgba(192,132,252,.4)",
               borderLeft: "3px solid #c084fc",
-              borderRadius: "8px",
-              padding: ".55rem .65rem",
+              borderRadius: "3px",
+              padding: ".75rem .8rem",
               margin: ".8rem 0",
               background: "color-mix(in srgb, #c084fc 6%, rgba(148,163,184,.05))",
             }}

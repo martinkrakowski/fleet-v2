@@ -6,8 +6,14 @@
  * Replace TODO implementations with actual logic.
  */
 
-import type { WorkspacePort } from '../../application/ports/out/WorkspacePort.out-port.js';
+import type {
+  WorktreeInspection,
+  WorktreeInspectionRequest,
+  WorkspacePort,
+} from '../../application/ports/out/WorkspacePort.out-port.js';
 
 export class WorkspaceAdapter implements WorkspacePort {
-
+  inspectWorktree(_request: WorktreeInspectionRequest): Promise<WorktreeInspection> {
+    return Promise.reject(new Error('Not implemented: WorkspaceAdapter.inspectWorktree'));
+  }
 }

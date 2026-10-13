@@ -15,8 +15,6 @@ import type {
   StartRunnerSessionResult,
   StopRunnerSessionRequest,
   StopRunnerSessionResult,
-  WorktreeInspection,
-  WorktreeInspectionRequest,
 } from '../../application/ports/out/ExecutionRunnerPort.out-port.js';
 
 export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
@@ -30,10 +28,6 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
 
   inspectSession(_session: RunnerSessionRef): Promise<RunnerSessionStatus> {
     return Promise.reject(new Error('Not implemented: ExecutionRunnerAdapter.inspectSession'));
-  }
-
-  inspectWorktree(_request: WorktreeInspectionRequest): Promise<WorktreeInspection> {
-    return Promise.reject(new Error('Not implemented: ExecutionRunnerAdapter.inspectWorktree'));
   }
 
   stopSession(_request: StopRunnerSessionRequest): Promise<StopRunnerSessionResult> {

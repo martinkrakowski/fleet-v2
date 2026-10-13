@@ -49,3 +49,6 @@ yarn-error.log*
 /.lane/
 /installation/
 SYNC-MIGRATION-REPORT.md
+
+# Agent briefs and lane scaffolding
+.agents/

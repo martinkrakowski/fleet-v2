@@ -7,8 +7,8 @@
 
 import type {
   CollectedAttemptArtifacts,
-} from '../out/AttemptArtifactPort.out-port.js';
-import type { CommandCompletionReceipt } from '../out/ExecutionRunnerPort.out-port.js';
+  CommandCompletionReceipt,
+} from '../../../domain/execution-records.js';
 
 export interface CollectAttemptArtifactsRequest {
   readonly attemptId: string;

@@ -6,6 +6,8 @@
  * implemented in this step.
  */
 
+import type { CommandCompletionReceipt } from '../../../domain/execution-records.js';
+
 /**
  * Isolation capabilities a runner must declare before an attempt may be
  * dispatched to it. The attempt's requirements must fit this profile;
@@ -29,20 +31,6 @@ export type WorkspacePreparationState =
   | 'failed';
 
 export type WorkerCommandPhase = 'not-started' | 'active' | 'ended';
-
-/**
- * Completion receipt bound to the attempt and the runner session. A runner
- * `Running` task is not evidence a lane is working or succeeded; a watcher
- * exit or a model's final message never establishes authoritative completion.
- */
-export interface CommandCompletionReceipt {
-  readonly attemptId: string;
-  readonly sessionId: string;
-  readonly endedAtIso: string;
-  readonly authoritative: boolean;
-  readonly exitStatus: number | null;
-  readonly stoppedByRequest: boolean;
-}
 
 /**
  * Runner states reported separately. They must not collapse into one
@@ -81,26 +69,6 @@ export interface RunnerSessionRef {
   readonly sessionId: string;
 }
 
-export interface WorktreeInspectionRequest {
-  readonly worktreePath: string;
-  readonly baseCommit: string;
-  readonly expectedArtifactPaths: readonly string[];
-}
-
-/**
- * Worktree inspection reported as a typed record, never as prose logs. Readiness
- * is not complete without this inspection (see docs/runbooks/runner-readiness.md).
- */
-export interface WorktreeInspection {
-  readonly worktreePath: string;
-  readonly checkedOutCommit: string;
-  readonly matchesBaseCommit: boolean;
-  readonly uncommittedPaths: readonly string[];
-  readonly untrackedPaths: readonly string[];
-  readonly residueFromEarlierAttempts: readonly string[];
-  readonly missingExpectedArtifacts: readonly string[];
-}
-
 export interface StopRunnerSessionRequest {
   readonly attemptId: string;
   readonly sessionId: string;
@@ -126,9 +94,6 @@ export interface ExecutionRunnerPort {
 
   /** Report the separately tracked runner states for a session. */
   inspectSession(session: RunnerSessionRef): Promise<RunnerSessionStatus>;
-
-  /** Inspect the worktree as a typed record; part of readiness, once per prepared environment. */
-  inspectWorktree(request: WorktreeInspectionRequest): Promise<WorktreeInspection>;
 
   /** Request cancellation and establish the session's actual end. */
   stopSession(request: StopRunnerSessionRequest): Promise<StopRunnerSessionResult>;

@@ -4,7 +4,10 @@
  * ignored paths and collect bounded immutable artifacts after lane completion.
  */
 
-import type { CommandCompletionReceipt } from './ExecutionRunnerPort.out-port.js';
+import type {
+  CollectedAttemptArtifacts,
+  CommandCompletionReceipt,
+} from '../../../domain/execution-records.js';
 
 export interface PlaceFrozenBriefRequest {
   readonly attemptId: string;
@@ -37,14 +40,6 @@ export interface CollectCompletedAttemptArtifactsRequest {
   readonly baseCommit: string;
   readonly expectedArtifactPaths: readonly string[];
   readonly completionReceipt: CommandCompletionReceipt;
-}
-
-export interface CollectedAttemptArtifacts {
-  readonly headCommit: string;
-  readonly commitsSinceBase: readonly string[];
-  readonly collectedArtifactPaths: readonly string[];
-  /** Missing notes are recorded explicitly; absence is a fact, not an error. */
-  readonly notes: 'present' | 'missing';
 }
 
 export type CollectCompletedAttemptArtifactsResult =

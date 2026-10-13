@@ -10,7 +10,9 @@ Waves is an independently usable observation and decision service. Projects publ
 
 The console does not receive SSH keys, GitHub credentials, or provider keys. It records decisions. The execution adapter performs authorised actions and writes the receipt back.
 
-Keep `waves/v1` intact. Add a contract when a new resource type appears. Do not disguise a host alert or a relay as a lane with a fake pull request.
+Keep `waves/v1` intact. Do not disguise a host alert or a relay as a lane with a fake pull request.
+
+W1 is a one-way door: adding contract types beside `waves/v1` expands a public contract surface that projects publish against, and removal breaks consumers. No new Waves contract type exists until the owner decides. Maintenance procedures stay bounded as operational observations; they are never stored as policy history in the product.
 
 Fleet relays, registry alerts (disk, gate budget, a project that stopped pushing), and maintenance procedures are observations. They are not lanes.
 
@@ -30,9 +32,13 @@ Reported facts and derived facts stay distinct. The console does not "correct" a
 
 The web app in fleet-v2 (`apps/web`) is a presentation boundary. It calls `apps/api`. It does not own domain rules and it is not the store for Waves.
 
+W2 is unresolved: whether the five views are Waves features or fleet-v2 web features fed by the API is a pending owner decision. No view is built before W2 is resolved, since placement is expensive to reverse.
+
 ## First slice
 
-Read-only: publish one observation for an attempt and read one signed decision. No deploy of the live Waves service. No enrol-key. No token in git. The owner registers a project and holds the token.
+Placement in the migration sequence (`docs/architecture.md`): the read-only slice sits after step 5 (integrate existing Waves decisions). It publishes one observation for an attempt and reads one signed decision. No deploy of the live Waves service. No enrol-key. No token in git. The owner registers a project and holds the token.
+
+The Decisions view's execution receipt appears only after step 7 (authorised forge actions with stale-head rejection) is authorised and proven; it presumes steps 1–4 (typed contracts, dispatch/collect, journal and recovery, exact-head verification). The Run detail view likewise presumes steps 1–4.
 
 ## Pending
 

@@ -16,9 +16,9 @@ next-env.d.ts
 # Turbo
 .turbo/
 
-# Next.js
+# Next.js (static export output only; packages/*/src/application/ports/out stays tracked)
 .next/
-out/
+apps/*/out/
 
 # Nitro
 .nitro/

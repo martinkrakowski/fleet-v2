@@ -1,13 +1,42 @@
-// @generated adapter stub — edit freely
+// @generated adapter stub — placeholders refuse; no external operation is implemented.
 /**
  * ExecutionRunnerAdapter implements ExecutionRunnerPort
  *
- * This adapter was generated from the port interface.
- * Replace TODO implementations with actual logic.
+ * Intended integration (manifest adapter_bindings): reviewed `ocm-run`
+ * subprocess on the attempt's port. Not implemented in migration step 1.
  */
 
-import type { ExecutionRunnerPort } from '../../application/ports/out/ExecutionRunnerPort.out-port.js';
+import type {
+  ExecutionRunnerPort,
+  RunnerIsolationCapabilities,
+  RunnerSessionRef,
+  RunnerSessionStatus,
+  StartRunnerSessionRequest,
+  StartRunnerSessionResult,
+  StopRunnerSessionRequest,
+  StopRunnerSessionResult,
+  WorktreeInspection,
+  WorktreeInspectionRequest,
+} from '../../application/ports/out/ExecutionRunnerPort.out-port.js';
 
 export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
+  describeCapabilities(): RunnerIsolationCapabilities {
+    throw new Error('Not implemented: ExecutionRunnerAdapter.describeCapabilities');
+  }
 
+  startSession(_request: StartRunnerSessionRequest): Promise<StartRunnerSessionResult> {
+    return Promise.reject(new Error('Not implemented: ExecutionRunnerAdapter.startSession'));
+  }
+
+  inspectSession(_session: RunnerSessionRef): Promise<RunnerSessionStatus> {
+    return Promise.reject(new Error('Not implemented: ExecutionRunnerAdapter.inspectSession'));
+  }
+
+  inspectWorktree(_request: WorktreeInspectionRequest): Promise<WorktreeInspection> {
+    return Promise.reject(new Error('Not implemented: ExecutionRunnerAdapter.inspectWorktree'));
+  }
+
+  stopSession(_request: StopRunnerSessionRequest): Promise<StopRunnerSessionResult> {
+    return Promise.reject(new Error('Not implemented: ExecutionRunnerAdapter.stopSession'));
+  }
 }

@@ -9,7 +9,7 @@ import {
   RequestScopedDecisionUseCase,
   ResolveActionAuthorizationUseCase,
   SendFleetRelayUseCase,
-} from "../../../../../packages/operator-coordination/src/application/use-cases/index.js";
+} from "@fleet/operator-coordination/use-cases";
 
 export interface OperatorComposition {
   inspectConfiguredCapabilities: InspectConfiguredCapabilitiesUseCase;

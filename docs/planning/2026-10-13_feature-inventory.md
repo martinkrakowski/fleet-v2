@@ -2,7 +2,7 @@
 
 *Date: 2026-10-13 · Status: draft, not adopted · Owner decision: pending*
 
-Index of behaviour to carry from `/Users/martin/Projects/fleet` into fleet-v2. The migration order is `2026-10-13_migrate-fleet.md`. Detail lives in the follow-up plans named in the last column. A row marked "installation" or "history" is not product code (decision M2, still pending, so those rows are provisional until the owner settles M2). The migration plan lives in this tree at `docs/planning/2026-10-13_migrate-fleet.md`; step references below point there and no second copy is made. Knowledge stations wait until the lane-notes draft (`2026-10-13_lane-notes-file.md`) is adopted by the owner.
+Index of behaviour to carry from the working Fleet workshop into fleet-v2. The migration order is `2026-10-13_migrate-fleet.md`. Detail lives in the follow-up plans named in the last column. A row marked "installation" or "history" is not product code (decision M2, still pending, so those rows are provisional until the owner settles M2). The migration plan lives in this tree at `docs/planning/2026-10-13_migrate-fleet.md`; step references below point there and no second copy is made. Knowledge stations wait until the lane-notes draft (`2026-10-13_lane-notes-file.md`) is adopted by the owner.
 
 ## Product identity
 
@@ -35,7 +35,7 @@ Index of behaviour to carry from `/Users/martin/Projects/fleet` into fleet-v2. T
 | Lane caps per server | `STATE.md`, item 6 | installation numbers; product only reserves | migrate M6 |
 | Gate slots × workers ≤ 24 threads | `/etc/environment`, project env | installation; `InspectConfiguredCapabilities` | product-identity |
 | Worktrees per project | `scripts/worktrees-per-project.sh`, `fleet worktrees list` | `Workspace` port | execution-kernel |
-| Project onboard and decommission | `fleet project onboard` (owner-tty); verify and decommission are stubs | host scripts stay; product records the profile | migrate M3 |
+| Project onboard and decommission | `fleet project onboard` (owner-tty); verify and decommission are stubs | host scripts stay; product records the profile | host scripts stay; no product onboard in the first stations |
 | Read-only host view | `fleet status`, `fleet project plan` | `InspectConfiguredCapabilities` | migrate |
 | `fleet` start and verify checklists | `scripts/fleet-verify.sh` | later `fleet doctor`; not a cutover | first-run runbook |
 
@@ -84,7 +84,7 @@ Index of behaviour to carry from `/Users/martin/Projects/fleet` into fleet-v2. T
 
 | Feature | Where it lives today | Lands in | Plan |
 |---|---|---|---|
-| Host-side key proxy; container holds no key | `scripts/key-proxy*` | `CredentialBroker` port; values never enter the product | execution-kernel |
+| Host-side key proxy; container holds no key | `scripts/key-proxy*` | host-side key proxy, called through an outbound port that does not exist yet; values never enter the product | execution-kernel |
 | Egress allow-list and boot verify | `scripts/egress-*` | runner capability profile | execution-kernel |
 | LXD lane containers | `scripts/lxd-lanes-*` | optional runner backend | execution-kernel |
 | Shared test Postgres | `scripts/test-db-service.sh` | installation; fleet-v2's own role is `none` | installation |
@@ -105,4 +105,4 @@ Index of behaviour to carry from `/Users/martin/Projects/fleet` into fleet-v2. T
 | TencentDB as the product centre, proxy injection, or a general memory hub | Identity reference parts 2 and 3. Optional backend later. |
 | Wiki generation and CodeGraph as first stations | After the execution kernel and lexical keepers. |
 | Rewriting `onboard-a-project.md` | Not step 1 of the migration. |
-| Deleting `/Users/martin/Projects/fleet` | M8. Shell stays live per workflow. |
+| Deleting the working Fleet workshop | M8. Shell stays live per workflow. |

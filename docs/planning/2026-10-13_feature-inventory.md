@@ -2,7 +2,7 @@
 
 *Date: 2026-10-13 · Status: draft, not adopted · Owner decision: pending*
 
-Index of behaviour to carry from `/Users/martin/Projects/fleet` into fleet-v2. The migration order is `2026-10-13_migrate-fleet.md`. Detail lives in the follow-up plans named in the last column. A row marked "installation" or "history" is not product code (decision M2, still pending).
+Index of behaviour to carry from the working Fleet workshop into fleet-v2. The migration order is `2026-10-13_migrate-fleet.md`. Detail lives in the follow-up plans named in the last column. A row marked "installation" or "history" is not product code (decision M2, still pending, so those rows are provisional until the owner settles M2). The migration plan lives in this tree at `docs/planning/2026-10-13_migrate-fleet.md`; step references below point there and no second copy is made. Knowledge stations wait until the lane-notes draft (`2026-10-13_lane-notes-file.md`) is adopted by the owner.
 
 ## Product identity
 
@@ -35,7 +35,7 @@ Index of behaviour to carry from `/Users/martin/Projects/fleet` into fleet-v2. T
 | Lane caps per server | `STATE.md`, item 6 | installation numbers; product only reserves | migrate M6 |
 | Gate slots × workers ≤ 24 threads | `/etc/environment`, project env | installation; `InspectConfiguredCapabilities` | product-identity |
 | Worktrees per project | `scripts/worktrees-per-project.sh`, `fleet worktrees list` | `Workspace` port | execution-kernel |
-| Project onboard and decommission | `fleet project onboard` (owner-tty); verify and decommission are stubs | host scripts stay; product records the profile | migrate M3 |
+| Project onboard and decommission | `fleet project onboard` (owner-tty); verify and decommission are stubs | host scripts stay; product records the profile | host scripts stay; no product onboard in the first stations |
 | Read-only host view | `fleet status`, `fleet project plan` | `InspectConfiguredCapabilities` | migrate |
 | `fleet` start and verify checklists | `scripts/fleet-verify.sh` | later `fleet doctor`; not a cutover | first-run runbook |
 
@@ -44,11 +44,11 @@ Index of behaviour to carry from `/Users/martin/Projects/fleet` into fleet-v2. T
 | Feature | Where it lives today | Lands in | Plan |
 |---|---|---|---|
 | Targeted tests on the lane; full gate is GitHub CI | rulebook | `RequestVerification` | migrate step 4 |
-| twilight (macOS) and sunrise (Linux AVX2), one verification at a time | `scripts/verify-run.sh` (not installed on those hosts as of 2026-10-13) | verification port; hosts in installation | migrate step 4 |
-| Sunrise may stand in for the Mini only after ten recorded CI matches | `registry/sunrise.md` | installation history | migrate M2 |
-| campaign-foundry golden-bytes filtered on sunrise | rulebook | project profile, not product default | installation |
+| The macOS host and the Linux AVX2 host, one verification at a time | `scripts/verify-run.sh` (not installed on those hosts as of 2026-10-13) | verification port; hosts in installation | migrate step 4 |
+| The Linux AVX2 host may stand in for the higher-trust macOS verification host only after ten recorded CI matches | installation registry | installation history | migrate M2 |
+| One project's golden-bytes profile filtered on the Linux AVX2 host | rulebook | project profile, not product default | installation |
 | Independent review; reviewer model is never the implementer | rulebook | `RequestIndependentReview` | migrate step 4 |
-| Fable once per high-risk lane; other passes on Opus; stand-ins only when those seats are absent | rulebook | seat table in installation | product-identity |
+| A dedicated high-risk reviewer seat once per high-risk lane; other passes on the second reviewer seat; stand-ins only when those seats are absent | rulebook | seat table in installation | product-identity |
 | PR sections: Hard to undo, Assumptions, Challenge this | `templates/pr-description.md` | acceptance check before forge | execution-kernel |
 | One-way door stops for the owner | `AGENTS.md` | `AssessHeadAcceptance` refuses | migrate step 7 |
 | Exact head: stale head is not accepted | architecture.md | `AssessHeadAcceptance` | migrate step 4 and 7 |
@@ -84,12 +84,12 @@ Index of behaviour to carry from `/Users/martin/Projects/fleet` into fleet-v2. T
 
 | Feature | Where it lives today | Lands in | Plan |
 |---|---|---|---|
-| Host-side key proxy; container holds no key | `scripts/key-proxy*` | `CredentialBroker` port; values never enter the product | execution-kernel |
+| Host-side key proxy; container holds no key | `scripts/key-proxy*` | host-side key proxy, called through an outbound port that does not exist yet; values never enter the product | execution-kernel |
 | Egress allow-list and boot verify | `scripts/egress-*` | runner capability profile | execution-kernel |
 | LXD lane containers | `scripts/lxd-lanes-*` | optional runner backend | execution-kernel |
 | Shared test Postgres | `scripts/test-db-service.sh` | installation; fleet-v2's own role is `none` | installation |
 | Disk report; prune only `tmp-cf` after an approved command | `AGENTS.md` | not a product feature | stays workshop |
-| Gemini only through `agy`; Grok only through the `grok` CLI; no plan model through OpenRouter | rulebook | installation seat rules | product-identity |
+| Each seat's model reachable only through its own designated CLI; no plan model through OpenRouter | rulebook | installation seat rules | product-identity |
 | OpenCode is the first runner; AX or Substrate is an optional later adapter | AX/Substrate reference | `ExecutionRunnerPort` | execution-kernel |
 
 ## Explicitly deferred
@@ -99,10 +99,10 @@ Index of behaviour to carry from `/Users/martin/Projects/fleet` into fleet-v2. T
 | Process checkpoint and automatic resurrection | A fresh attempt with a handover is the rule. Suspension must not ingest notes or accept work. |
 | Kubernetes, Redis, object storage, Substrate as required infrastructure | The line runs on the current workshop. |
 | A worker granting itself more lanes | Authority change. A worker may propose work. |
-| AX's default goal-driven bootstrap and passing a Gemini key into a container | Breaks the credential boundary. |
+| AX's default goal-driven bootstrap and passing a model-provider key into a container | Breaks the credential boundary. |
 | MicroVMs or gVisor as a requirement | The runner declares the isolation it can enforce. |
 | Folding the Waves repository into fleet-v2 | M4. Contracts and an adapter. |
 | TencentDB as the product centre, proxy injection, or a general memory hub | Identity reference parts 2 and 3. Optional backend later. |
 | Wiki generation and CodeGraph as first stations | After the execution kernel and lexical keepers. |
 | Rewriting `onboard-a-project.md` | Not step 1 of the migration. |
-| Deleting `/Users/martin/Projects/fleet` | M8. Shell stays live per workflow. |
+| Deleting the working Fleet workshop | M8. Shell stays live per workflow. |

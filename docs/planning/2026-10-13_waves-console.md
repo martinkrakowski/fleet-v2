@@ -8,7 +8,7 @@ Source: identity reference part 1 §2 and §6; fleet-v2 `docs/architecture.md` (
 
 Waves is an independently usable observation and decision service. Projects publish versioned observations. Signed decisions bind a proposal and a revision. Fleet consumes those contracts through an adapter in `operator-coordination`. A Waves outage must not corrupt an attempt. Silence is not approval.
 
-The console does not receive SSH keys, GitHub credentials, or provider keys. It records decisions. The execution adapter performs authorised actions and writes the receipt back.
+The console does not receive SSH keys, GitHub credentials, or provider keys. It records decisions. The execution adapter performs authorised actions and writes the receipt back, but no authorised action runs until the owner grants forge at migration step 7.
 
 Keep `waves/v1` intact. Do not disguise a host alert or a relay as a lane with a fake pull request.
 
@@ -32,7 +32,7 @@ Reported facts and derived facts stay distinct. The console does not "correct" a
 
 The web app in fleet-v2 (`apps/web`) is a presentation boundary. It calls `apps/api`. It does not own domain rules and it is not the store for Waves.
 
-W2 is unresolved: whether the five views are Waves features or fleet-v2 web features fed by the API is a pending owner decision. No view is built before W2 is resolved, since placement is expensive to reverse.
+W2 is unresolved: whether the five views are Waves features or fleet-v2 web features fed by the API is a pending owner decision. Resolving who owns the views was deliberately deferred; no view is built until the owner decides, since placement is expensive to reverse.
 
 ## First slice
 

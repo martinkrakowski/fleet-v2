@@ -5,12 +5,13 @@
  */
 
 const AMP = String.fromCharCode(38);
+const HASH = String.fromCharCode(35);
 const ENTITIES: Record<string, string> = {
   [AMP]: AMP + "amp;",
   "<": AMP + "lt;",
   ">": AMP + "gt;",
   '"': AMP + "quot;",
-  "'": AMP + "#39;"
+  "'": AMP + HASH + "39;"
 };
 
 const esc = (s: string): string =>

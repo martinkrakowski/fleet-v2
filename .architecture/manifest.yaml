@@ -40,7 +40,7 @@ monorepo:
         outDir: dist
         composite: true
         declaration: true
-        emitDeclarationOnly: true
+        emitDeclarationOnly: false
         declarationMap: true
         tsBuildInfoFile: ./dist/.tsbuildinfo
         paths: {}
@@ -176,7 +176,7 @@ monorepo:
             "skipLibCheck": true,
             "composite": true,
             "declaration": true,
-            "emitDeclarationOnly": true
+            "emitDeclarationOnly": false
           }
         }
 

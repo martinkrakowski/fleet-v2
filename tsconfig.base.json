@@ -7,6 +7,6 @@
     "skipLibCheck": true,
     "composite": true,
     "declaration": true,
-    "emitDeclarationOnly": true
+    "emitDeclarationOnly": false
   }
 }

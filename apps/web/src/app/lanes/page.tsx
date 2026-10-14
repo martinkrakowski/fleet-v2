@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
 import { Badge, Card } from "@fleet/ui";
 import {
@@ -10,7 +11,7 @@ import {
   workOrders,
   type AttemptSummary
 } from "./fixture";
-import styles from "./line.module.css";
+import styles from "./lanes.module.css";
 
 const STATE_ORDER: Record<string, number> = {
   unknown: 0,
@@ -197,19 +198,11 @@ function attentionItems(): AttentionItem[] {
   return items;
 }
 
-export default function LinePage() {
+export default function LanesPage() {
   const [showEnded, setShowEnded] = useState(true);
   const [stateFilter, setStateFilter] = useState("");
-  const [project, setProject] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
-
-  const projects = Array.from(
-    attempts.reduce((map, a) => {
-      const name = woOf(a).project;
-      map.set(name, (map.get(name) ?? 0) + 1);
-      return map;
-    }, new Map<string, number>())
-  ).sort(([a], [b]) => a.localeCompare(b));
+  const project = useSearchParams().get("project") ?? "";
 
   const rows = attempts
     .filter((a) => !project || woOf(a).project === project)
@@ -235,7 +228,7 @@ export default function LinePage() {
   const attention = attentionItems();
 
   return (
-    <main className={styles.page}>
+    <div className={styles.page}>
       <div className={styles.vhTop}>
         <h1 className={styles.title}>Lanes</h1>
         <span className={`${styles.route} ${styles.routeGap}`} title="a route the plan does not name yet">
@@ -301,35 +294,6 @@ export default function LinePage() {
       </div>
       <div className={styles.board}>
       <div className={styles.inbox}>
-        <Card className={styles.projpanel} padded>
-          <h2 className={styles.h2}>
-            Projects
-            <span className={styles.meta}>{projects.length}</span>
-          </h2>
-          <div className={styles.projList} role="list">
-            <button
-              type="button"
-              className={`${styles.projBtn}${project === "" ? ` ${styles.projOn}` : ""}`}
-              onClick={() => setProject("")}
-              aria-current={project === "" ? "true" : undefined}
-            >
-              <span className={styles.projName}>All</span>
-              <span className={styles.projCount}>{attempts.length}</span>
-            </button>
-            {projects.map(([name, count]) => (
-              <button
-                key={name}
-                type="button"
-                className={`${styles.projBtn}${project === name ? ` ${styles.projOn}` : ""}`}
-                onClick={() => setProject(name)}
-                aria-current={project === name ? "true" : undefined}
-              >
-                <span className={styles.projName}>{name}</span>
-                <span className={styles.projCount}>{count}</span>
-              </button>
-            ))}
-          </div>
-        </Card>
         <Card className={styles.lanewrap}>
           <div className={styles.laneHead}>
             <h2 className={styles.h2}>
@@ -420,12 +384,7 @@ export default function LinePage() {
           </Card>
         </aside>
       </div>
-      <footer className={styles.foot}>
-        <span>fixture</span>
-        <span>clocks run in the browser</span>
-        <span>GET /v1/attempts is not on this station</span>
-      </footer>
       </div>
-    </main>
+    </div>
   );
 }

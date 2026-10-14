@@ -57,6 +57,8 @@ export function ViewNav() {
             key={view.href}
             href={view.href}
             className="sidebar-link"
+            data-tooltip={view.label}
+            aria-label={view.label}
             aria-current={
               pathname?.startsWith(view.href) ? ("page" as const) : undefined
             }

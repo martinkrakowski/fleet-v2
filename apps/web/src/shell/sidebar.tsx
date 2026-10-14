@@ -22,7 +22,7 @@ export function Sidebar() {
   return (
     <>
       <aside className="sidebar">
-        <div className="sidebar-brand">
+        <div className="sidebar-brand" data-tooltip="fleet">
           <svg className="ic" viewBox="0 0 24 24" aria-hidden="true">
             <path d="M3 7h18" />
             <path d="M3 12h13" />

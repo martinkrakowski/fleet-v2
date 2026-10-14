@@ -45,16 +45,18 @@ work without component changes. Temporary legacy aliases (`--bg`, `--card`,
 
 ## Sidebar surface
 
-The sidebar is a dedicated dark slate rail, constant across themes:
+The sidebar is a themed rail whose tokens adapt between Light mode and Dark
+mode (the width tokens are constant):
 
-| Token | Value | Role |
-|---|---|---|
-| `--sidebar-bg` | `#1a2332` | rail background |
-| `--sidebar-w` | `252px` | expanded width |
-| `--sidebar-rail-w` | `64px` | collapsed icon-rail width (`body.sidebar-rail`) |
-| `--sidebar-active` | `rgba(26, 187, 156, 0.08)` | active link wash |
-| `--sidebar-text` | `#7b8fa3` | idle link text |
-| `--sidebar-text-active` | `#ffffff` | active/hover link text |
+| Token | Light mode | Dark mode | Role |
+|---|---|---|---|
+| `--sidebar-bg` | `#ffffff` | `#1a2332` | rail background |
+| `--sidebar-w` | `252px` | `252px` | expanded width |
+| `--sidebar-rail-w` | `64px` | `64px` | collapsed icon-rail width (`body.sidebar-rail`) |
+| `--sidebar-active` | `rgba(26, 187, 156, 0.1)` | `rgba(26, 187, 156, 0.14)` | active link wash |
+| `--sidebar-text` | `#5a6577` | `#93a0bb` | idle link text |
+| `--sidebar-text-active` | `#1e2633` | `#e9eef7` | active/hover link text |
+| `--sidebar-border` | `#e6e7eb` | `rgba(255, 255, 255, 0.08)` | rail border |
 
 ## Primary accent & semantic tones
 

@@ -1,38 +1,34 @@
-import { useState, type CSSProperties, type MouseEventHandler, type ReactNode } from 'react';
+import type { CSSProperties, MouseEventHandler, ReactNode } from 'react';
+import classes from './IconButton.module.css';
 
 export interface IconButtonProps {
   label: string;
+  title?: string;
   onClick?: MouseEventHandler<HTMLButtonElement>;
-  children: ReactNode;
+  disabled?: boolean;
+  className?: string;
   style?: CSSProperties;
+  children: ReactNode;
 }
 
-export function IconButton({ label, onClick, children, style }: IconButtonProps) {
-  const [hovered, setHovered] = useState(false);
+export function IconButton({
+  label,
+  title,
+  onClick,
+  disabled = false,
+  className,
+  style,
+  children,
+}: IconButtonProps) {
   return (
     <button
       type="button"
-      title={label}
+      title={title ?? label}
       aria-label={label}
       onClick={onClick}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      onFocus={() => setHovered(true)}
-      onBlur={() => setHovered(false)}
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        width: '1.7rem',
-        height: '1.7rem',
-        border: `1px solid ${hovered ? 'var(--line-strong)' : 'var(--line)'}`,
-        borderRadius: 'var(--radius)',
-        background: 'var(--bg-sink)',
-        color: hovered ? 'var(--text)' : 'var(--muted)',
-        cursor: 'pointer',
-        fontSize: '1rem',
-        ...style,
-      }}
+      disabled={disabled}
+      className={[classes.button, className].filter(Boolean).join(' ') || undefined}
+      style={style}
     >
       {children}
     </button>

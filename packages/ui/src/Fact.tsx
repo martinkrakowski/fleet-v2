@@ -1,19 +1,13 @@
 import type { CSSProperties, ReactNode } from 'react';
+import classes from './Fact.module.css';
 
 export type FactState = 'yes' | 'no' | 'unknown' | 'stale';
 
-const STATE_COLOR: Record<FactState, string> = {
-  yes: 'var(--emerald)',
-  no: 'var(--slate)',
-  unknown: 'var(--amber)',
-  stale: 'var(--muted)',
-};
-
-const DOT_STYLE: Record<FactState, CSSProperties> = {
-  yes: { background: 'var(--emerald)' },
-  no: { border: '1.5px solid var(--slate)' },
-  unknown: { border: '1.5px dashed var(--amber)' },
-  stale: { border: '1.5px dashed var(--muted)' },
+const STATE_CLASS: Record<FactState, string> = {
+  yes: classes.yes,
+  no: classes.no,
+  unknown: classes.unknown,
+  stale: classes.stale,
 };
 
 export interface FactProps {
@@ -21,35 +15,27 @@ export interface FactProps {
   value?: FactState;
   stale?: boolean;
   children?: ReactNode;
+  className?: string;
   style?: CSSProperties;
 }
 
-export function Fact({ state, value, stale = false, children, style }: FactProps) {
+export function Fact({
+  state,
+  value,
+  stale = false,
+  children,
+  className,
+  style,
+}: FactProps) {
   const shown = state ?? value ?? 'unknown';
-  const color = STATE_COLOR[shown];
   return (
     <span
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: '0.35rem',
-        color,
-        fontFamily: 'var(--mono)',
-        fontSize: '0.7rem',
-        whiteSpace: 'nowrap',
-        ...(shown === 'stale' || stale ? { opacity: 0.6 } : {}),
-        ...style,
-      }}
+      className={[classes.fact, STATE_CLASS[shown], shown === 'stale' || stale ? classes.dim : '', className]
+        .filter(Boolean)
+        .join(' ') || undefined}
+      style={style}
     >
-      <i
-        style={{
-          width: '0.55rem',
-          height: '0.55rem',
-          borderRadius: '50%',
-          flex: 'none',
-          ...DOT_STYLE[shown],
-        }}
-      />
+      <i className={classes.dot} />
       {children != null ? <span>{children}</span> : <span>{shown}</span>}
     </span>
   );

@@ -1,81 +1,155 @@
 # Fleet design system
 
-The line-controller draft HTML (`docs/planning/2026-10-13_waves-dashboard.html`)
-is the visual source of truth. This package, `@fleet/ui`, is its implementation
-as React components. Where the two disagree, the draft wins and the package
-changes.
+`docs/DESIGN.md` and `@fleet/ui` (`packages/ui`) are the **sole authoritative
+visual specification** for Fleet v2. The earlier draft
+`docs/planning/2026-10-13_waves-dashboard.html` is retired as the visual source
+of truth: where it disagrees with this document or the package, this document
+and `@fleet/ui` win.
 
-## Tokens
+## Licence attribution
 
-The draft defines its tokens as CSS custom properties on `:root`. The components
-in this package never hard-code a colour: every colour, border, radius and font
-reference goes through these variables, so the dark default and the
-`[data-theme="light"]` twin both work without component changes.
+Token values and component CSS rules in `@fleet/ui` and in
+`apps/web/src/app/globals.css` are adapted from MIT-licensed admin design system
+styles. The MIT copyright and permission notice is preserved with this
+distribution:
 
-Surfaces and lines:
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions: the above copyright
+> notice and this permission notice shall be included in all copies or
+> substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
-| Token | Role |
+## First paint & theme tokens
+
+Tokens are CSS custom properties defined on `:root` in
+`apps/web/src/app/globals.css`:
+
+- **Light mode** — `:root` and `:root[data-theme="light"]` define the default
+  palette: `--body-bg: #f5f7fb`, `--bg-surface: #ffffff`,
+  `--bg-surface-secondary: #f9fafb`.
+- **Dark mode** — `:root[data-theme="dark"]` overrides the palette:
+  `--body-bg: #0f1623`, `--bg-surface: #1a2332`,
+  `--bg-surface-secondary: #141d2b`.
+
+Components in `@fleet/ui` never hard-code a colour: every colour, border,
+radius, shadow and font reference goes through these variables, so both themes
+work without component changes. Temporary legacy aliases (`--bg`, `--card`,
+`--line`, `--muted`, `--sans`, …) remain on `:root` until Phase 7 retires them.
+
+## Sidebar surface
+
+The sidebar is a dedicated dark slate rail, constant across themes:
+
+| Token | Value | Role |
+|---|---|---|
+| `--sidebar-bg` | `#1a2332` | rail background |
+| `--sidebar-w` | `252px` | expanded width |
+| `--sidebar-rail-w` | `64px` | collapsed icon-rail width (`body.sidebar-rail`) |
+| `--sidebar-active` | `rgba(26, 187, 156, 0.08)` | active link wash |
+| `--sidebar-text` | `#7b8fa3` | idle link text |
+| `--sidebar-text-active` | `#ffffff` | active/hover link text |
+
+## Primary accent & semantic tones
+
+The primary accent is teal `#1abb9c` (`--primary`, `--primary-dk: #169f85`,
+`--primary-lt` as a translucent wash). Semantic tones pair a solid accent with
+a translucent `-lt` wash:
+
+| Tone | Solid | Wash |
+|---|---|---|
+| `neutral` | `--text-muted` / `--border-color` | — |
+| `accent` | `--primary` | `--primary-lt` |
+| `ok` | `--green` | `--green-lt` |
+| `warn` | `--yellow` | `--yellow-lt` |
+| `danger` | `--red` | `--red-lt` |
+| `decision` | `--purple` | `--purple-lt` |
+
+Supporting hues follow the same solid/wash pairing: `--blue`/`--blue-lt`,
+`--azure`/`--azure-lt`, `--cyan`/`--cyan-lt`, `--orange`/`--orange-lt`.
+
+## Typography & spacing
+
+The system is **pure**: zero CDN font requests, no `Inter` in the font stack —
+only operating-system faces.
+
+| Token | Value |
 |---|---|
-| `--bg` | page background |
-| `--card` | card / pane surface |
-| `--line`, `--line-soft`, `--line-strong` | hairlines at three weights |
+| `--font-sans` | `-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif` |
+| `--font-mono` | `ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace` |
 
-Text:
+Body copy is `14px` (`0.875rem`) at a line-height of `1.4286`, weights
+`400/500/600`.
 
-| Token | Role |
+Radii: `--radius-sm: 4px`, `--radius: 6px`, `--radius-lg: 8px` (cards use
+`--radius-card: 6px`).
+
+Spacing scale:
+
+| Token | Value |
 |---|---|
-| `--text` | primary text |
-| `--muted` | secondary text |
-| `--faint` | tertiary text |
+| `--space-1` | `4px` |
+| `--space-2` | `8px` |
+| `--space-3` | `12px` |
+| `--space-4` | `16px` |
+| `--space-5` | `24px` |
+| `--space-6` | `32px` |
+| `--space-7` | `48px` |
+| `--space-8` | `64px` |
 
-Accents:
+## CSS ownership boundary
 
-| Token | Meaning |
-|---|---|
-| `--cyan` | active / attention |
-| `--emerald` | accepted, success, "yes" |
-| `--amber` | unknown, gaps, warnings |
-| `--rose` | failed |
-| `--violet` | blocked, decisions |
+- `apps/web/src/app/globals.css` holds **only**: CSS custom properties, base
+  document resets, the Admin Shell layout classes (`.app-shell`, `.sidebar`,
+  `.topbar`, `.main`, `.page-wrapper`, `.footer` and their sub-parts), and the
+  `apps/web`-only page grid classes (`.row`, `.col-1`, `.col-2`, `.col-3`,
+  `.col-4`, `.col-8-4`, `.col-4-8`).
+- `packages/ui` (`@fleet/ui`) owns **all** primitive component styles and
+  **never** depends on `.row` or `.col-*`.
+- Component styles are plain CSS drawn from these variables. No Tailwind, no
+  runtime stylesheet, no dependency on any `@fleet/*` domain package.
 
-Supporting tokens used by the components: `--bg-sink` (sunken controls),
-`--card-sheen` (gradient layered over `--card`), `--radius` and `--radius-card`,
-`--slate` (the neutral accent for "ended" and "no").
+## Component catalogue (`@fleet/ui`)
 
-## Type roles
+**Surfaces**
 
-| Token | Role |
-|---|---|
-| `--sans` | body copy, controls |
-| `--display` | headings and the wordmark |
-| `--mono` | ids, facts, badges, chips, labels |
+- `Card` — the base surface (`--bg-surface`, `--border-color`,
+  `--radius-card`, `--shadow-card`), with `CardHeader`, `CardBody` and
+  `CardFooter` sections.
+- `PageHeader` — page title, optional subtitle and trailing actions.
+- `EmptyState` — centred icon, heading and body for empty collections.
+- `Banner` — full-width notice in a semantic tone (`ok` / `warn` / `danger` /
+  `accent`).
 
-System stacks only; nothing is fetched.
+**Controls**
 
-## Components
+- `Button` — primary (teal), secondary, subtle and danger variants, sizes,
+  loading state.
+- `IconButton` — square single-glyph button; `label` is required and becomes
+  both `title` and `aria-label`.
+- `Switch` — labelled toggle.
+- `Select` — native select styled to the token palette.
+- `Accordion` — collapsible section with header and body slots.
 
-All are exported from `src/index.ts` and take an optional `style` prop that
-merges after (and so overrides) the component styles.
+**Data display**
 
-- **`Badge kind`** — mono, uppercase pill with a 1px `currentColor` border and
-  a 9% `color-mix` wash. Kinds: `active` (cyan), `ended` (slate), `unknown`
-  (amber), `blocked` (violet), `queued` (muted), `accepted` (emerald),
-  `failed` (rose), `fix` (violet), `keeper` (emerald), `candidate` (amber).
-- **`Fact state`** — a dot plus a mono word, one of the five runner facts.
-  States: `yes` (filled emerald dot), `no` (outlined slate dot), `unknown`
-  (dashed amber dot), `stale` (dashed muted dot, dimmed to 60% — an
-  observation that no longer speaks for the present).
-- **`Card`** — the sheen-over-card surface with a `--line` border and
-  `--radius-card`; `padded` adds the draft's `0.75rem 0.9rem` inset.
-- **`IconButton label`** — 1.7rem square sunken button for a single glyph;
-  hover and focus bring `--line-strong` and `--text`. The `label` is required
-  and becomes both `title` and `aria-label`.
-- **`RouteChip variant`** — mono pill naming a route the plan does or does not
-  name. `plain` is faint on a soft hairline; `gap` is amber on a dashed amber
-  border.
+- `StatCard` — metric with label, value, optional delta and tone.
+- `Table` — token-styled table with header, rows and footer slots.
+- `KeyValueList` — two-column label/value list.
+- `Stepper` — numbered step indicator with a current marker.
+- `Chip` — compact mono pill for ids, routes and small facts.
+- `Badge` — uppercase status pill; kinds include `active`, `ended`,
+  `unknown`, `blocked`, `queued`, `accepted`, `failed`.
+- `Fact` — dot plus a mono word; states `yes`, `no`, `unknown`, `stale`.
+- `RouteChip` — mono pill naming a route; `plain` is faint on a soft hairline,
+  `gap` is warn-toned on a dashed border.
 
-## Non-goals
-
-No Tailwind, no runtime stylesheet, no dependency on any `@fleet/*` domain
-package. The package renders with inline styles drawn from the variables
-above; the page that mounts these components owns the `:root` token block.
+All components accept an optional `style` prop that merges after (and so
+overrides) the component styles, and take no colours from anywhere but the
+tokens above.

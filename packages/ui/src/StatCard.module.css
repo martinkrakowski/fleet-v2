@@ -1,0 +1,100 @@
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+}
+
+.topRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.label {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.value {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 1.5rem;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--text);
+}
+
+.subtext {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  font-size: 0.875rem;
+  flex: none;
+}
+
+.progressTrack {
+  position: relative;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--border-color-light);
+  overflow: hidden;
+}
+
+.progressFill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--primary);
+}
+
+/* Semantic icon tints */
+
+.toneNeutral {
+  color: var(--text-muted);
+  background: var(--bg-surface-secondary);
+}
+
+.toneAccent {
+  color: var(--primary);
+  background: var(--primary-lt, rgba(26, 187, 156, 0.1));
+}
+
+.toneOk {
+  color: var(--green);
+  background: var(--green-lt, rgba(47, 179, 68, 0.1));
+}
+
+.toneWarn {
+  color: var(--yellow);
+  background: var(--yellow-lt, rgba(245, 159, 0, 0.1));
+}
+
+.toneDanger {
+  color: var(--red);
+  background: var(--red-lt, rgba(214, 57, 57, 0.1));
+}
+
+.toneDecision {
+  color: var(--purple);
+  background: var(--purple-lt, rgba(174, 62, 201, 0.1));
+}

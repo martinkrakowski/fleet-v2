@@ -1,0 +1,17 @@
+.chip {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.02em;
+  color: var(--text-faint);
+  border: 1px solid var(--border-color-light);
+  border-radius: 999px;
+  padding: 0.06rem 0.5rem;
+  white-space: nowrap;
+}
+
+.gap {
+  color: var(--yellow);
+  border: 1px dashed color-mix(in srgb, var(--yellow) 40%, transparent);
+}

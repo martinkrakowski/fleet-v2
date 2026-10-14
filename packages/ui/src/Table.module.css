@@ -1,0 +1,70 @@
+.container {
+  display: block;
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  -webkit-overflow-scrolling: touch;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-sans);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.thead {
+  background: var(--bg-surface-secondary);
+}
+
+.stickyHeader .thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.headCell {
+  padding: 10px 16px;
+  text-align: left;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-color);
+  white-space: nowrap;
+}
+
+.cell {
+  padding: 10px 16px;
+  color: var(--text);
+  border-bottom: 1px solid var(--border-color-light);
+}
+
+.tbody .row:last-child .cell {
+  border-bottom: none;
+}
+
+.tbody .row:hover .cell {
+  background: var(--bg-surface-secondary);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+
+.strong {
+  font-weight: 600;
+}
+
+.alignRight {
+  text-align: right;
+}
+
+.alignCenter {
+  text-align: center;
+}

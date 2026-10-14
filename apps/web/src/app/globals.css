@@ -122,8 +122,76 @@ button {
 
 .app {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
   height: 100vh;
+}
+.frame {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 12.5rem minmax(0, 1fr);
+  gap: 0.45rem;
+  padding: 0.45rem 0.5rem 0;
+}
+.sidenav {
+  min-height: 0;
+  overflow: auto;
+  background: var(--card-sheen), var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  padding: 0.7rem 0.75rem;
+}
+.sideh {
+  display: flex;
+  justify-content: space-between;
+  margin: 0 0 0.45rem;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.sidelist {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.sidebtn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: 44px;
+  text-align: left;
+  background: var(--bg-sink);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  padding: 0.4rem 0.55rem;
+  cursor: pointer;
+  color: var(--muted);
+  font: inherit;
+}
+.sidebtn.on {
+  border-color: var(--cyan);
+  color: var(--text);
+  background: var(--glow-cyan);
+}
+.sidecount {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  color: var(--faint);
+}
+.foot {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  margin: 0.45rem 0.5rem 0.45rem;
+  padding: 0.45rem 0.75rem;
+  background: var(--card-sheen), var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 0.68rem;
 }
 .topbar {
   position: sticky;
@@ -259,6 +327,24 @@ nav.views a[aria-current="page"] {
   min-width: 0;
   min-height: 0;
   overflow: auto;
-  padding: 1rem 1.1rem 1.4rem;
+  padding: 0;
   scrollbar-gutter: stable;
+}
+@media (max-width: 56.25rem) {
+  .frame {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .sidenav {
+    max-height: 8.5rem;
+  }
+  .sidelist {
+    flex-direction: row;
+    overflow-x: auto;
+  }
+  .sidebtn {
+    flex: none;
+    width: auto;
+    white-space: nowrap;
+  }
 }

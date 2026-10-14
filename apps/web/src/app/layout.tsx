@@ -1,6 +1,6 @@
-import type { ReactNode } from "react";
+import { Suspense, type ReactNode } from "react";
 import { Countdown } from "../shell/countdown";
-import { ProjectStrip } from "../shell/project-strip";
+import { ProjectNav } from "../shell/project-nav";
 import { ThemeToggle } from "../shell/theme-toggle";
 import { ViewNav } from "../shell/view-nav";
 import "./globals.css";
@@ -30,8 +30,19 @@ export default function RootLayout({ children }: { children: ReactNode }) {
               <ThemeToggle />
             </div>
           </header>
-          <ProjectStrip />
-          <main className="page">{children}</main>
+          <div className="frame">
+            <Suspense fallback={null}>
+              <ProjectNav />
+            </Suspense>
+            <main className="page">
+              <Suspense fallback={null}>{children}</Suspense>
+            </main>
+          </div>
+          <footer className="foot">
+            <span>fixture</span>
+            <span>clocks run in the browser</span>
+            <span>GET /v1/attempts is not on this station</span>
+          </footer>
         </div>
       </body>
     </html>

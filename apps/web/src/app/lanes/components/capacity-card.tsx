@@ -29,27 +29,16 @@ export function CapacityCard({
           {Array.from({ length: capacity.slots }, (_, i) => {
             const holder = heldAttempts.find((a) => a.slot === i + 1);
             return (
-              <RouteChip
+              <div
                 key={i}
-                className={styles.seat}
-                style={{
-                  borderStyle: holder ? "solid" : "dashed",
-                  borderColor: holder
-                    ? "color-mix(in srgb, var(--primary) 45%, transparent)"
-                    : "var(--border-translucent)"
-                }}
+                className={`${styles.seat}${holder ? ` ${styles.seatHeld}` : ""}`}
+                title={holder ? `${holder.id} · ${summary(holder)[1]}` : "free"}
               >
-                <span
-                  title={
-                    holder ? `${holder.id} · ${summary(holder)[1]}` : "free"
-                  }
-                >
-                  <b>slot {i + 1}</b>{" "}
-                  <span className={styles.who}>
-                    {holder ? `…${holder.id.slice(-5)}` : "free"}
-                  </span>
+                <b>slot {i + 1}</b>
+                <span className={styles.who}>
+                  {holder ? `…${holder.id.slice(-5)}` : "free"}
                 </span>
-              </RouteChip>
+              </div>
             );
           })}
         </div>
@@ -63,11 +52,11 @@ export function CapacityCard({
                 title={a.id}
                 className={styles.qitem}
               >
-                <RouteChip className={styles.qchip}>
+                <span className={styles.qchip}>
                   <b className={styles.mono}>{a.id}</b>
                   <span>{a.wo}</span>
                   <span className={styles.mono}>{a.queueBound} bound</span>
-                </RouteChip>
+                </span>
               </Link>
             ))}
           </div>

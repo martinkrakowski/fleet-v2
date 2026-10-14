@@ -228,12 +228,27 @@
 }
 
 .seat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   justify-content: center;
   text-align: center;
   white-space: normal;
+  font-family: var(--font-mono);
   font-size: 0.6rem;
   color: var(--text-faint);
   padding: 0.75rem 0.35rem;
+  border: 1px dashed var(--border-translucent);
+  border-radius: var(--radius);
+  background: var(--bg-surface-secondary);
+  min-width: 0;
+}
+
+.seatHeld {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--primary) 45%, transparent);
+  background: var(--primary-lt);
+  color: var(--text);
 }
 
 .seat b {
@@ -273,9 +288,13 @@
   flex-direction: row;
   gap: 0.55rem;
   align-items: baseline;
+  font-family: var(--font-mono);
   font-size: 0.72rem;
   color: var(--text-muted);
   padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border-color-light);
+  border-radius: var(--radius);
+  background: var(--bg-surface-secondary);
 }
 
 .qchip b {

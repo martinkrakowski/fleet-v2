@@ -28,8 +28,8 @@
   --glow-cyan: rgba(34, 211, 238, 0.13);
   --glow-violet: rgba(192, 132, 252, 0.11);
   --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
-  --radius-card: 3px;
-  --radius: 3px;
+  --radius-card: 6px;
+  --radius: 6px;
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --display: "Space Grotesk", var(--sans);
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;

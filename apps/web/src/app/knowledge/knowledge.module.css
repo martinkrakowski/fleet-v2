@@ -17,8 +17,8 @@
   --violet: #c084fc;
   --glow-cyan: rgba(34, 211, 238, 0.13);
   --glow-violet: rgba(192, 132, 252, 0.11);
-  --radius-card: 3px;
-  --radius: 3px;
+  --radius-card: 6px;
+  --radius: 6px;
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 

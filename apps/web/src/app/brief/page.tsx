@@ -211,7 +211,7 @@ export default function BriefPage() {
           --text:#e9eef7; --muted:#93a0bb; --faint:#78849f;
           --cyan:#22d3ee; --emerald:#34d399; --amber:#fbbf24; --violet:#c084fc; --slate:#7d8aa5;
           --glow-cyan:rgba(34,211,238,.13); --glow-violet:rgba(192,132,252,.11);
-          --radius-card:3px; --radius:3px;
+          --radius-card:6px; --radius:6px;
           --sans:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
           --display:"Space Grotesk",var(--sans);
           --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;

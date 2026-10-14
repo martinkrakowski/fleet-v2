@@ -58,6 +58,16 @@ mode (the width tokens are constant):
 | `--sidebar-text-active` | `#1e2633` | `#e9eef7` | active/hover link text |
 | `--sidebar-border` | `#e6e7eb` | `rgba(255, 255, 255, 0.08)` | rail border |
 
+Toggling `body.sidebar-rail` animates the rail width (`252px` ↔ `64px`) with
+a `0.22s` `cubic-bezier(0.22, 1, 0.36, 1)` transition on `.app-shell`'s grid
+track and `.sidebar`'s width; labels, badges, the project filter and the
+footer fade/collapse by `opacity`/`max-width`/`max-height` instead of
+`display: none`, so the toggle animates cleanly in both directions. Collapsed
+rail items carry `data-tooltip` (view links use their label; the brand uses
+`fleet`) and reveal hover/`focus-visible` tooltips rendered from
+`attr(data-tooltip)` through `::after`. All shell motion is disabled under
+`prefers-reduced-motion: reduce`.
+
 ## Primary accent & semantic tones
 
 The primary accent is teal `#1abb9c` (`--primary`, `--primary-dk: #169f85`,

@@ -212,6 +212,7 @@ button {
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
   height: 100vh;
+  transition: grid-template-columns 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .sidebar {
@@ -225,6 +226,9 @@ button {
   border-right: 1px solid var(--sidebar-border);
   color: var(--sidebar-text);
   overflow-y: auto;
+  overflow-x: hidden;
+  transition: width 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 0.15s ease, border-color 0.15s ease;
 }
 .sidebar-brand {
   display: flex;
@@ -234,6 +238,19 @@ button {
   color: var(--sidebar-text-active);
   font-weight: 600;
   border-bottom: 1px solid var(--sidebar-border);
+  white-space: nowrap;
+  overflow: hidden;
+  transition: padding 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+    gap 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.sidebar-brand-label,
+.sidebar-link-label {
+  white-space: nowrap;
+  overflow: hidden;
+  opacity: 1;
+  max-width: 180px;
+  transition: opacity 0.16s ease,
+    max-width 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .sidebar-section {
   padding: var(--space-3) var(--space-3) var(--space-4);
@@ -245,6 +262,12 @@ button {
   text-transform: uppercase;
   color: var(--sidebar-text);
   opacity: 0.7;
+  white-space: nowrap;
+  overflow: hidden;
+  max-height: 2rem;
+  transition: opacity 0.16s ease,
+    max-height 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+    margin 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .sidebar-nav {
   display: flex;
@@ -252,6 +275,7 @@ button {
   gap: 2px;
 }
 .sidebar-link {
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -265,7 +289,9 @@ button {
   text-align: left;
   text-decoration: none;
   cursor: pointer;
-  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  transition: padding 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+    gap 0.22s cubic-bezier(0.22, 1, 0.36, 1), background-color 0.15s ease,
+    color 0.15s ease, border-color 0.15s ease;
 }
 .sidebar-link:hover {
   color: var(--sidebar-text-active);
@@ -287,6 +313,20 @@ button {
   font-family: var(--font-mono);
   font-size: 0.68rem;
   color: var(--sidebar-text);
+  white-space: nowrap;
+  overflow: hidden;
+  opacity: 1;
+  max-width: 64px;
+  transition: opacity 0.15s ease,
+    max-width 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.sidebar-projects {
+  overflow: hidden;
+  opacity: 1;
+  max-height: 600px;
+  transition: opacity 0.16s ease,
+    max-height 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+    padding 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .sidebar-footer {
   margin-top: auto;
@@ -294,9 +334,16 @@ button {
   border-top: 1px solid var(--sidebar-border);
   color: var(--sidebar-text);
   font-size: 0.72rem;
+  white-space: nowrap;
+  overflow: hidden;
+  opacity: 1;
+  max-height: 4rem;
+  transition: opacity 0.16s ease,
+    max-height 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+    padding 0.22s cubic-bezier(0.22, 1, 0.36, 1), border-color 0.16s ease;
 }
 
-/* Collapsed rail variant */
+/* Collapsed rail variant — smooth collapse, no display:none snap */
 @media (min-width: 992px) {
   body.sidebar-rail .app-shell {
     grid-template-columns: var(--sidebar-rail-w) minmax(0, 1fr);
@@ -304,25 +351,87 @@ button {
   body.sidebar-rail .main {
     grid-column: 2;
   }
+  body.sidebar-rail .sidebar {
+    overflow: visible;
+    z-index: 20;
+  }
 }
 body.sidebar-rail .sidebar {
   width: var(--sidebar-rail-w);
 }
 body.sidebar-rail .sidebar .sidebar-brand {
   justify-content: center;
+  gap: 0;
   padding: var(--space-4) var(--space-2);
 }
 body.sidebar-rail .sidebar .sidebar-brand-label,
 body.sidebar-rail .sidebar .sidebar-link-label,
-body.sidebar-rail .sidebar .sidebar-label,
-body.sidebar-rail .sidebar .sidebar-badge,
-body.sidebar-rail .sidebar .sidebar-projects,
+body.sidebar-rail .sidebar .sidebar-badge {
+  opacity: 0;
+  max-width: 0;
+  pointer-events: none;
+}
+body.sidebar-rail .sidebar .sidebar-label {
+  opacity: 0;
+  max-height: 0;
+  margin-top: 0;
+  margin-bottom: 0;
+  pointer-events: none;
+}
+body.sidebar-rail .sidebar .sidebar-projects {
+  opacity: 0;
+  max-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  pointer-events: none;
+}
 body.sidebar-rail .sidebar .sidebar-footer {
-  display: none;
+  opacity: 0;
+  max-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  border-top-color: transparent;
+  pointer-events: none;
 }
 body.sidebar-rail .sidebar .sidebar-link {
   justify-content: center;
+  gap: 0;
   padding: var(--space-2);
+}
+
+/* Collapsed rail hover/focus tooltips */
+@media (min-width: 992px) {
+  body.sidebar-rail .sidebar [data-tooltip] {
+    position: relative;
+    overflow: visible;
+  }
+  body.sidebar-rail .sidebar [data-tooltip]::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    left: calc(100% + var(--space-2));
+    top: 50%;
+    transform: translateY(-50%) translateX(-4px);
+    padding: var(--space-1) var(--space-2);
+    background: var(--bg-surface);
+    color: var(--text);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.14);
+    font-family: var(--font-sans);
+    font-size: 0.75rem;
+    font-weight: 500;
+    line-height: 1.2;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    z-index: 50;
+    transition: opacity 0.14s ease, transform 0.14s ease;
+  }
+  body.sidebar-rail .sidebar [data-tooltip]:hover::after,
+  body.sidebar-rail .sidebar [data-tooltip]:focus-visible::after {
+    opacity: 1;
+    transform: translateY(-50%) translateX(0);
+  }
 }
 
 /* Mobile off-canvas */
@@ -435,25 +544,50 @@ body.sidebar-rail .sidebar .sidebar-link {
     inset: 0 auto 0 0;
     z-index: 40;
     transform: translateX(-100%);
-    transition: transform 0.2s ease;
+    transition: transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
   }
   body.sidebar-open .sidebar {
     transform: translateX(0);
   }
   .sidebar-backdrop {
     display: block;
-  }
-  body.sidebar-open .sidebar-backdrop {
     position: fixed;
     inset: 0;
     z-index: 30;
     background: rgba(15, 23, 42, 0.5);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+  }
+  body.sidebar-open .sidebar-backdrop {
+    opacity: 1;
+    pointer-events: auto;
   }
   .app-shell {
     grid-template-columns: minmax(0, 1fr);
   }
   .main {
     height: 100vh;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Shell reduced motion                                                 */
+/* ------------------------------------------------------------------ */
+@media (prefers-reduced-motion: reduce) {
+  .app-shell,
+  .sidebar,
+  .sidebar-brand,
+  .sidebar-brand-label,
+  .sidebar-link,
+  .sidebar-link-label,
+  .sidebar-label,
+  .sidebar-badge,
+  .sidebar-projects,
+  .sidebar-footer,
+  .sidebar-backdrop,
+  body.sidebar-rail .sidebar [data-tooltip]::after {
+    transition: none;
   }
 }
 

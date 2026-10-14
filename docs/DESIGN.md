@@ -53,6 +53,7 @@ mode (the width tokens are constant):
 | `--sidebar-bg` | `#ffffff` | `#1a2332` | rail background |
 | `--sidebar-w` | `252px` | `252px` | expanded width |
 | `--sidebar-rail-w` | `64px` | `64px` | collapsed icon-rail width (`body.sidebar-rail`) |
+| `--footer-h` | `44px` | `44px` | shared height of `.sidebar-footer` and `.footer` |
 | `--sidebar-active` | `rgba(26, 187, 156, 0.1)` | `rgba(26, 187, 156, 0.14)` | active link wash |
 | `--sidebar-text` | `#5a6577` | `#93a0bb` | idle link text |
 | `--sidebar-text-active` | `#1e2633` | `#e9eef7` | active/hover link text |

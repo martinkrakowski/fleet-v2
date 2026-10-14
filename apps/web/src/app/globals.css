@@ -29,6 +29,7 @@
   --sidebar-bg: #ffffff;
   --sidebar-w: 252px;
   --sidebar-rail-w: 64px;
+  --footer-h: 44px;
   --sidebar-active: rgba(26, 187, 156, 0.1);
   --sidebar-text: #5a6577;
   --sidebar-text-active: #1e2633;
@@ -107,6 +108,7 @@
   --sidebar-bg: #1a2332;
   --sidebar-w: 252px;
   --sidebar-rail-w: 64px;
+  --footer-h: 44px;
   --sidebar-active: rgba(26, 187, 156, 0.14);
   --sidebar-text: #93a0bb;
   --sidebar-text-active: #e9eef7;
@@ -330,17 +332,20 @@ button {
 }
 .sidebar-footer {
   margin-top: auto;
-  padding: var(--space-4) var(--space-5);
+  display: flex;
+  align-items: center;
+  height: var(--footer-h);
+  min-height: var(--footer-h);
+  padding: 0 var(--space-5);
   border-top: 1px solid var(--sidebar-border);
   color: var(--sidebar-text);
-  font-size: 0.72rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  line-height: 1;
   white-space: nowrap;
   overflow: hidden;
-  opacity: 1;
-  max-height: 4rem;
-  transition: opacity 0.16s ease,
-    max-height 0.22s cubic-bezier(0.22, 1, 0.36, 1),
-    padding 0.22s cubic-bezier(0.22, 1, 0.36, 1), border-color 0.16s ease;
+  transition: color 0.16s ease, padding 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 0.15s ease;
 }
 
 /* Collapsed rail variant — smooth collapse, no display:none snap */
@@ -386,12 +391,10 @@ body.sidebar-rail .sidebar .sidebar-projects {
   pointer-events: none;
 }
 body.sidebar-rail .sidebar .sidebar-footer {
-  opacity: 0;
-  max-height: 0;
-  padding-top: 0;
-  padding-bottom: 0;
-  border-top-color: transparent;
+  padding: 0;
+  color: transparent;
   pointer-events: none;
+  user-select: none;
 }
 body.sidebar-rail .sidebar .sidebar-link {
   justify-content: center;
@@ -497,11 +500,14 @@ body.sidebar-rail .sidebar .sidebar-link {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  padding: var(--space-3) var(--space-5);
+  height: var(--footer-h);
+  min-height: var(--footer-h);
+  padding: 0 var(--space-5);
   border-top: 1px solid var(--border-color-light);
   color: var(--text-faint);
   font-family: var(--font-mono);
   font-size: 0.68rem;
+  line-height: 1;
 }
 
 /* ------------------------------------------------------------------ */

@@ -299,6 +299,7 @@ export default function LinePage() {
           {rows.length} of {scopedCount} shown{stateFilter ? " · filtered" : ""}
         </span>
       </div>
+      <div className={styles.board}>
       <div className={styles.inbox}>
         <Card className={styles.projpanel} padded>
           <h2 className={styles.h2}>
@@ -418,6 +419,12 @@ export default function LinePage() {
             )}
           </Card>
         </aside>
+      </div>
+      <footer className={styles.foot}>
+        <span>fixture</span>
+        <span>clocks run in the browser</span>
+        <span>GET /v1/attempts is not on this station</span>
+      </footer>
       </div>
     </main>
   );

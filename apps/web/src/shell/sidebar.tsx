@@ -9,10 +9,14 @@ function closeDrawer() {
 }
 
 /**
- * The fixed dark-slate application rail: brand, view links, the project
- * filter, and the station footer line. Collapses to a `64px` icon rail on
- * desktop via `body.sidebar-rail` and becomes an off-canvas drawer on
- * mobile via `body.sidebar-open`.
+ * The application rail: brand, view links, the project filter, and the
+ * station footer line. Styled by the `--sidebar-*` tokens in
+ * apps/web/src/app/globals.css, which adapt between Light mode
+ * (`#ffffff` surface, `#5a6577` / `#1e2633` text, `#e6e7eb` border) and
+ * Dark mode (`#1a2332` surface, `#93a0bb` / `#e9eef7` text,
+ * `rgba(255, 255, 255, 0.08)` border). Collapses to a `64px` icon rail
+ * on desktop via `body.sidebar-rail` and becomes an off-canvas drawer
+ * on mobile via `body.sidebar-open`.
  */
 export function Sidebar() {
   return (

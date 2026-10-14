@@ -25,14 +25,14 @@
   --bg-surface-secondary: #f9fafb;
   --bg-glass: rgba(245, 247, 251, 0.88);
 
-  /* Sidebar rail */
-  --sidebar-bg: #1a2332;
+  /* Sidebar rail — Light mode */
+  --sidebar-bg: #ffffff;
   --sidebar-w: 252px;
   --sidebar-rail-w: 64px;
-  --sidebar-active: rgba(26, 187, 156, 0.08);
-  --sidebar-text: #7b8fa3;
-  --sidebar-text-active: #ffffff;
-  --sidebar-border: rgba(255, 255, 255, 0.08);
+  --sidebar-active: rgba(26, 187, 156, 0.1);
+  --sidebar-text: #5a6577;
+  --sidebar-text-active: #1e2633;
+  --sidebar-border: #e6e7eb;
 
   /* Primary accent — teal */
   --primary: #1abb9c;
@@ -107,9 +107,9 @@
   --sidebar-bg: #1a2332;
   --sidebar-w: 252px;
   --sidebar-rail-w: 64px;
-  --sidebar-active: rgba(26, 187, 156, 0.08);
-  --sidebar-text: #7b8fa3;
-  --sidebar-text-active: #ffffff;
+  --sidebar-active: rgba(26, 187, 156, 0.14);
+  --sidebar-text: #93a0bb;
+  --sidebar-text-active: #e9eef7;
   --sidebar-border: rgba(255, 255, 255, 0.08);
 
   --primary: #1abb9c;
@@ -255,18 +255,31 @@ button {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  width: 100%;
   padding: var(--space-2) var(--space-3);
+  border: 1px solid transparent;
   border-radius: var(--radius);
+  background: transparent;
   color: var(--sidebar-text);
+  font: inherit;
+  text-align: left;
   text-decoration: none;
   cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
 .sidebar-link:hover {
   color: var(--sidebar-text-active);
   background: var(--sidebar-active);
 }
-.sidebar-link[aria-current="page"] {
+.sidebar-link[aria-current="page"],
+.sidebar-link[aria-current="true"] {
   background: var(--sidebar-active);
+  color: var(--sidebar-text-active);
+  border-color: color-mix(in srgb, var(--primary) 28%, transparent);
+  font-weight: 500;
+}
+.sidebar-link[aria-current="page"] .sidebar-badge,
+.sidebar-link[aria-current="true"] .sidebar-badge {
   color: var(--sidebar-text-active);
 }
 .sidebar-badge {
@@ -284,20 +297,32 @@ button {
 }
 
 /* Collapsed rail variant */
+@media (min-width: 992px) {
+  body.sidebar-rail .app-shell {
+    grid-template-columns: var(--sidebar-rail-w) minmax(0, 1fr);
+  }
+  body.sidebar-rail .main {
+    grid-column: 2;
+  }
+}
 body.sidebar-rail .sidebar {
   width: var(--sidebar-rail-w);
 }
+body.sidebar-rail .sidebar .sidebar-brand {
+  justify-content: center;
+  padding: var(--space-4) var(--space-2);
+}
+body.sidebar-rail .sidebar .sidebar-brand-label,
+body.sidebar-rail .sidebar .sidebar-link-label,
 body.sidebar-rail .sidebar .sidebar-label,
 body.sidebar-rail .sidebar .sidebar-badge,
+body.sidebar-rail .sidebar .sidebar-projects,
 body.sidebar-rail .sidebar .sidebar-footer {
   display: none;
 }
 body.sidebar-rail .sidebar .sidebar-link {
   justify-content: center;
   padding: var(--space-2);
-}
-body.sidebar-rail .main {
-  grid-column: 1 / -1;
 }
 
 /* Mobile off-canvas */

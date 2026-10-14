@@ -2,7 +2,6 @@ import { Suspense, type ReactNode } from "react";
 import { Footer } from "../shell/footer";
 import { Sidebar } from "../shell/sidebar";
 import { Topbar } from "../shell/topbar";
-import "../shell/shell.css";
 import "./globals.css";
 
 /**

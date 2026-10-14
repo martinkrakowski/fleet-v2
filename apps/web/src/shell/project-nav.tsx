@@ -1,52 +1,55 @@
 "use client";
 
-import { useRouter, useSearchParams } from "next/navigation";
-import { attempts, workOrders } from "../app/lanes/fixture";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import {
+  getProjectAttemptCounts,
+  totalAttemptsCount,
+} from "../fixtures/station-fixture";
 
 export function ProjectNav() {
   const router = useRouter();
-  const project = useSearchParams().get("project") ?? "";
-  const projects = Array.from(
-    attempts.reduce((map, attempt) => {
-      const name = workOrders[attempt.wo].project;
-      map.set(name, (map.get(name) ?? 0) + 1);
-      return map;
-    }, new Map<string, number>())
-  ).sort(([a], [b]) => a.localeCompare(b));
+  const pathname = usePathname() ?? "/lanes";
+  const searchParams = useSearchParams();
+  const project = searchParams.get("project") ?? "";
+  const projects = getProjectAttemptCounts();
 
   function choose(name: string) {
-    const query = name ? `?project=${encodeURIComponent(name)}` : "";
-    router.push(`/lanes${query}`);
+    const params = new URLSearchParams(searchParams.toString());
+    if (name) {
+      params.set("project", name);
+    } else {
+      params.delete("project");
+    }
+    const query = params.toString();
+    router.push(query ? `${pathname}?${query}` : pathname);
   }
 
   return (
-    <nav className="sidenav" aria-label="Projects">
-      <h2 className="sideh">
-        Projects <span>{projects.length}</span>
-      </h2>
-      <div className="sidelist">
+    <div className="sidebar-section sidebar-projects">
+      <div className="sidebar-label">Projects · {projects.length}</div>
+      <nav className="sidebar-nav" aria-label="Projects">
         <button
           type="button"
-          className={project === "" ? "sidebtn on" : "sidebtn"}
+          className="sidebar-link"
           aria-current={project === "" ? "true" : undefined}
           onClick={() => choose("")}
         >
-          <span>All</span>
-          <span className="sidecount">{attempts.length}</span>
+          <span className="sidebar-link-label">All</span>
+          <span className="sidebar-badge">{totalAttemptsCount}</span>
         </button>
         {projects.map(([name, count]) => (
           <button
             key={name}
             type="button"
-            className={project === name ? "sidebtn on" : "sidebtn"}
+            className="sidebar-link"
             aria-current={project === name ? "true" : undefined}
             onClick={() => choose(name)}
           >
-            <span>{name}</span>
-            <span className="sidecount">{count}</span>
+            <span className="sidebar-link-label">{name}</span>
+            <span className="sidebar-badge">{count}</span>
           </button>
         ))}
-      </div>
-    </nav>
+      </nav>
+    </div>
   );
 }

@@ -1,0 +1,33 @@
+/*
+ * Fleet v2 — shell component rules that supplement the Admin Shell layout
+ * classes owned by apps/web/src/app/globals.css (see docs/DESIGN.md).
+ *
+ * Everything here goes through the design tokens; no hard-coded colours.
+ */
+
+/* Collapsed desktop icon rail (`body.sidebar-rail`): keep the glyph, drop
+ * the text and the counts, and shrink the grid track to the rail width. */
+@media (min-width: 992px) {
+  body.sidebar-rail .app-shell {
+    grid-template-columns: var(--sidebar-rail-w) minmax(0, 1fr);
+  }
+  body.sidebar-rail .main {
+    grid-column: 2;
+  }
+}
+
+body.sidebar-rail .sidebar .sidebar-link-label,
+body.sidebar-rail .sidebar .sidebar-brand-label {
+  display: none;
+}
+
+body.sidebar-rail .sidebar .sidebar-brand {
+  justify-content: center;
+  padding: var(--space-4) var(--space-2);
+}
+
+/* The projects list is text-only; it stays in the expanded sidebar and in
+ * the mobile drawer instead of the icon rail. */
+body.sidebar-rail .sidebar .sidebar-projects {
+  display: none;
+}

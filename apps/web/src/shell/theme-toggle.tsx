@@ -1,8 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { IconButton } from "@fleet/ui";
+import { useEffect, useState } from "react";
 
-function ThemeIcon({ theme }: { theme: "dark" | "light" }) {
+type Theme = "dark" | "light";
+
+function ThemeIcon({ theme }: { theme: Theme }) {
   return theme === "dark" ? (
     <svg className="ic" viewBox="0 0 24 24" aria-hidden="true">
       <circle cx="12" cy="12" r="4" />
@@ -15,21 +18,33 @@ function ThemeIcon({ theme }: { theme: "dark" | "light" }) {
   );
 }
 
+/**
+ * The theme toggle. The chosen theme is persisted under `localStorage`
+ * key `theme` and applied to `document.documentElement.dataset.theme`.
+ */
 export function ThemeToggle() {
-  const [theme, setTheme] = useState<"dark" | "light">("dark");
-  const next = theme === "dark" ? "light" : "dark";
+  const [theme, setTheme] = useState<Theme>("dark");
+
+  useEffect(() => {
+    const current = document.documentElement.dataset.theme;
+    if (current === "light" || current === "dark") {
+      setTheme(current);
+    }
+  }, []);
+
+  const next: Theme = theme === "dark" ? "light" : "dark";
+
   return (
-    <button
-      type="button"
-      className="iconbtn"
+    <IconButton
+      label="Switch theme"
       title={theme === "dark" ? "Switch to the light twin" : "Switch to dark"}
-      aria-label="Switch theme"
       onClick={() => {
-        document.documentElement.setAttribute("data-theme", next);
+        document.documentElement.dataset.theme = next;
+        localStorage.setItem("theme", next);
         setTheme(next);
       }}
     >
       <ThemeIcon theme={theme} />
-    </button>
+    </IconButton>
   );
 }

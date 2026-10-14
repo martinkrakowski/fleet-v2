@@ -1,28 +1,17 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useMemo, useState, type ReactNode } from "react";
-import { Badge, Card, Fact } from "@fleet/ui";
+import { useEffect, useState, type ReactNode } from "react";
+import { Badge, Card } from "@fleet/ui";
 import {
   attempts,
   capacity,
   install,
   workOrders,
-  type AttemptSummary,
-  type FactName,
-  type FactState
+  type AttemptSummary
 } from "./fixture";
 import styles from "./line.module.css";
 
-const FACT_ORDER: FactName[] = ["reachable", "prepared", "active", "ended", "collected"];
-const FACT_WORDS: Record<FactName, string> = {
-  reachable: "Runner reachable",
-  prepared: "Workspace prepared",
-  active: "Worker command active",
-  ended: "Worker command ended",
-  collected: "Artifacts collected"
-};
 const STATE_ORDER: Record<string, number> = {
   unknown: 0,
   blocked: 1,
@@ -58,6 +47,7 @@ function summary(a: AttemptSummary): [word: string, note: string] {
 const woOf = (a: AttemptSummary) => workOrders[a.wo];
 const attemptsOf = (wo: string) => attempts.filter((a) => a.wo === wo);
 const attemptHref = (a: AttemptSummary) => `/attempt?id=${a.id}`;
+const isLive = (a: AttemptSummary) => a.facts.active === "yes" && a.facts.ended === "no";
 
 function queuePos(a: AttemptSummary): number {
   const q = attempts
@@ -66,64 +56,78 @@ function queuePos(a: AttemptSummary): number {
   return q.findIndex((x) => x.id === a.id) + 1;
 }
 
-function FactCell({ attempt, name }: { attempt: AttemptSummary; name: FactName }) {
-  const value = attempt.facts[name];
-  const state: FactState = attempt.stale ? "stale" : value;
-  let tip = `${FACT_WORDS[name]}: ${value} · observed ${attempt.observedAt} · ${attempt.observedFrom}`;
-  if (value === "unknown" && attempt.lastKnown) {
-    tip += ` · last known ${attempt.lastKnown.at}: ${attempt.lastKnown.facts[name]}`;
-  }
-  return (
-    <td className={styles.fact} title={tip}>
-      <Fact state={state} />
-    </td>
-  );
+function LiveClock({ startMinutes }: { startMinutes: number }) {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setElapsed((n) => n + 1), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const total = startMinutes * 60 + elapsed;
+  const mm = String(Math.floor(total / 60)).padStart(2, "0");
+  const ss = String(total % 60).padStart(2, "0");
+  return <span className={`${styles.mono} ${styles.clock}`}>{mm}:{ss}</span>;
 }
 
-function AttemptRow({ attempt }: { attempt: AttemptSummary }) {
-  const router = useRouter();
+function laneIdLine(a: AttemptSummary): string {
+  const base = a.capacity === "pending"
+    ? `queued #${queuePos(a)} · ${a.queueBound} bound · no session`
+    : a.session
+      ? `${a.session} · port ${a.port}${a.slot ? ` · slot ${a.slot}` : ""}`
+      : "ended · slot released";
+  const silent = a.facts.reachable === "unknown" && a.lastKnown
+    ? ` · silent since ${a.lastKnown.at}`
+    : "";
+  return `${a.id} · ${base}${silent} · ${a.wo}`;
+}
+
+function LaneRow({
+  attempt,
+  selected,
+  onSelect
+}: {
+  attempt: AttemptSummary;
+  selected: boolean;
+  onSelect: () => void;
+}) {
   const [word, note] = summary(attempt);
   const wo = woOf(attempt);
   const href = attemptHref(attempt);
-  const idSub = attempt.capacity === "pending"
-    ? `queued #${queuePos(attempt)} · ${attempt.queueBound} bound · no session`
-    : attempt.session
-      ? `${attempt.session} · port ${attempt.port}${attempt.slot ? ` · slot ${attempt.slot}` : ""}`
-      : "ended · slot released";
-  const silent = attempt.facts.reachable === "unknown" && attempt.lastKnown
-    ? ` · silent since ${attempt.lastKnown.at}`
-    : "";
+  const live = isLive(attempt);
   return (
-    <tr className={styles.row} onClick={() => router.push(href)}>
-      <td className={styles.cAtt}>
-        <Link className={styles.idlink} href={href} onClick={(e) => e.stopPropagation()}>
-          {attempt.id}
-        </Link>{" "}
-        <Badge tone={attempt.kind === "fix" ? "fix" : "first"}>
-          {attempt.kind === "fix" ? `fix ${attempt.number}` : "first"}
-        </Badge>
-        <span className={styles.sub}>
-          {idSub}
-          {silent}
-        </span>
-      </td>
-      <td>
-        <span className={styles.task} title={wo.task}>{wo.task}</span>
-        <span className={`${styles.sub} ${styles.mono}`}>{attempt.wo} · {wo.lane}</span>
-      </td>
-      {FACT_ORDER.map((name) => (
-        <FactCell key={name} attempt={attempt} name={name} />
-      ))}
-      <td className={styles.cState}>
-        <Badge tone={word}>{word}</Badge>
-        <span className={styles.sub}>{note}</span>
-      </td>
-      <td className={styles.cObs}>
-        <b className={`${styles.mono} ${styles.t}`}>{attempt.observedAt}</b>
-        <span className={styles.sub} title={attempt.observedFrom}>{attempt.observedFrom}</span>
-      </td>
-      <td className={styles.cGo}>›</td>
-    </tr>
+    <li className={`${styles.lane}${selected ? ` ${styles.laneSel}` : ""}`}>
+      <div className={styles.laneRow}>
+        <button type="button" className={styles.laneMain} onClick={onSelect} aria-expanded={selected}>
+          <span className={styles.laneTop}>
+            <span className={styles.taskWrap}>
+              <span className={styles.task} title={wo.task}>{wo.task}</span>{" "}
+              <Badge tone={attempt.kind === "fix" ? "fix" : "first"}>
+                {attempt.kind === "fix" ? `fix ${attempt.number}` : "first"}
+              </Badge>
+            </span>
+            <span className={styles.laneState}>
+              {live ? <i className={styles.pulseDot} aria-hidden="true" /> : null}
+              <Badge tone={word}>{word}</Badge>
+              {live ? (
+                <LiveClock startMinutes={attempt.cost?.minutes ?? 0} />
+              ) : attempt.cost ? (
+                <span className={`${styles.mono} ${styles.staticMin}`}>{attempt.cost.minutes} min</span>
+              ) : null}
+            </span>
+          </span>
+          <span className={`${styles.sub} ${styles.mono} ${styles.idline}`}>
+            {laneIdLine(attempt)}
+          </span>
+        </button>
+        <Link className={styles.openLink} href={href}>
+          Open
+        </Link>
+      </div>
+      {selected ? (
+        <div className={`${styles.laneMore} ${styles.mono}`}>
+          observed {attempt.observedAt} · {attempt.observedFrom} · {note}
+        </div>
+      ) : null}
+    </li>
   );
 }
 
@@ -196,26 +200,31 @@ function attentionItems(): AttentionItem[] {
 export default function LinePage() {
   const [showEnded, setShowEnded] = useState(true);
   const [stateFilter, setStateFilter] = useState("");
+  const [project, setProject] = useState("");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  const scoped = attempts;
-  const rows = useMemo(
-    () =>
-      scoped
-        .filter((a) => showEnded || a.capacity !== "released")
-        .filter((a) => !stateFilter || summary(a)[0] === stateFilter)
-        .sort((x, y) => {
-          const p = woOf(x).project.localeCompare(woOf(y).project);
-          if (p) return p;
-          const s = STATE_ORDER[summary(x)[0]] - STATE_ORDER[summary(y)[0]];
-          if (s) return s;
-          return (y.startedAt ?? y.queuedAt ?? "").localeCompare(x.startedAt ?? x.queuedAt ?? "");
-        }),
-    [scoped, showEnded, stateFilter]
-  );
+  const projects = Array.from(
+    attempts.reduce((map, a) => {
+      const name = woOf(a).project;
+      map.set(name, (map.get(name) ?? 0) + 1);
+      return map;
+    }, new Map<string, number>())
+  ).sort(([a], [b]) => a.localeCompare(b));
 
-  const queued = scoped.filter((a) => a.capacity === "pending").length;
-  const unknown = scoped.filter((a) => summary(a)[0] === "unknown").length;
-  const blocked = scoped.filter((a) => summary(a)[0] === "blocked").length;
+  const rows = attempts
+    .filter((a) => !project || woOf(a).project === project)
+    .filter((a) => showEnded || a.capacity !== "released")
+    .filter((a) => !stateFilter || summary(a)[0] === stateFilter)
+    .sort((x, y) => {
+      const s = STATE_ORDER[summary(x)[0]] - STATE_ORDER[summary(y)[0]];
+      if (s) return s;
+      return (y.startedAt ?? y.queuedAt ?? "").localeCompare(x.startedAt ?? x.queuedAt ?? "");
+    });
+  const scopedCount = attempts.filter((a) => !project || woOf(a).project === project).length;
+
+  const queued = attempts.filter((a) => a.capacity === "pending").length;
+  const unknown = attempts.filter((a) => summary(a)[0] === "unknown").length;
+  const blocked = attempts.filter((a) => summary(a)[0] === "blocked").length;
   const heldAttempts = attempts
     .filter((a) => a.capacity === "held")
     .sort((x, y) => (x.slot ?? 0) - (y.slot ?? 0));
@@ -223,28 +232,12 @@ export default function LinePage() {
     .filter((a) => a.capacity === "pending")
     .sort((x, y) => (x.queuedAt ?? "").localeCompare(y.queuedAt ?? ""));
   const queuedAll = pendingAttempts.length;
-  const attention = useMemo(() => attentionItems(), []);
-
-  const body: ReactNode[] = [];
-  let lastProject: string | null = null;
-  rows.forEach((a) => {
-    const project = woOf(a).project;
-    if (project !== lastProject) {
-      lastProject = project;
-      const n = rows.filter((r) => woOf(r).project === project).length;
-      body.push(
-        <tr key={`group-${project}`} className={styles.group}>
-          <td colSpan={10}>{project} · {n} attempt{n === 1 ? "" : "s"}</td>
-        </tr>
-      );
-    }
-    body.push(<AttemptRow key={a.id} attempt={a} />);
-  });
+  const attention = attentionItems();
 
   return (
     <main className={styles.page}>
       <div className={styles.vhTop}>
-        <h1 className={styles.title}>Line</h1>
+        <h1 className={styles.title}>Lanes</h1>
         <span className={`${styles.route} ${styles.routeGap}`} title="a route the plan does not name yet">
           gap · no list route: GET /v1/attempts is missing
         </span>
@@ -303,38 +296,64 @@ export default function LinePage() {
           </select>
         </label>
         <span className={`${styles.tally} ${styles.mono}`}>
-          {rows.length} of {scoped.length} shown{stateFilter ? " · filtered" : ""}
+          {rows.length} of {scopedCount} shown{stateFilter ? " · filtered" : ""}
         </span>
       </div>
-      <div className={styles.linegrid}>
-        <Card className={styles.tablewrap}>
+      <div className={styles.board}>
+      <div className={styles.inbox}>
+        <Card className={styles.projpanel} padded>
+          <h2 className={styles.h2}>
+            Projects
+            <span className={styles.meta}>{projects.length}</span>
+          </h2>
+          <div className={styles.projList} role="list">
+            <button
+              type="button"
+              className={`${styles.projBtn}${project === "" ? ` ${styles.projOn}` : ""}`}
+              onClick={() => setProject("")}
+              aria-current={project === "" ? "true" : undefined}
+            >
+              <span className={styles.projName}>All</span>
+              <span className={styles.projCount}>{attempts.length}</span>
+            </button>
+            {projects.map(([name, count]) => (
+              <button
+                key={name}
+                type="button"
+                className={`${styles.projBtn}${project === name ? ` ${styles.projOn}` : ""}`}
+                onClick={() => setProject(name)}
+                aria-current={project === name ? "true" : undefined}
+              >
+                <span className={styles.projName}>{name}</span>
+                <span className={styles.projCount}>{count}</span>
+              </button>
+            ))}
+          </div>
+        </Card>
+        <Card className={styles.lanewrap}>
+          <div className={styles.laneHead}>
+            <h2 className={styles.h2}>
+              {project || "All projects"}
+              <span className={styles.meta}>{rows.length} lane{rows.length === 1 ? "" : "s"}</span>
+            </h2>
+          </div>
           {rows.length > 0 ? (
-            <table className={styles.grid}>
-              <thead>
-                <tr>
-                  <th className={styles.cAtt}>attempt</th>
-                  <th>work order</th>
-                  {FACT_ORDER.map((name, i) => (
-                    <th
-                      key={name}
-                      className={`${styles.fact}${i === 0 ? ` ${styles.factFirst}` : ""}${i === FACT_ORDER.length - 1 ? ` ${styles.factLast}` : ""}`}
-                    >
-                      {name}
-                    </th>
-                  ))}
-                  <th className={styles.cState}>state</th>
-                  <th className={styles.cObs}>observed</th>
-                  <th className={styles.cGo}></th>
-                </tr>
-              </thead>
-              <tbody>{body}</tbody>
-            </table>
+            <ul className={styles.lanes}>
+              {rows.map((a) => (
+                <LaneRow
+                  key={a.id}
+                  attempt={a}
+                  selected={selectedId === a.id}
+                  onSelect={() => setSelectedId((cur) => (cur === a.id ? null : a.id))}
+                />
+              ))}
+            </ul>
           ) : (
             <div className={styles.empty}>
-              Nothing matches this filter — that is not “nothing running”. {scoped.length}{" "}
-              attempt{scoped.length === 1 ? "" : "s"} in scope; the state filter or the
-              show-ended toggle hides the rest. A capped or offline station is a note like
-              this one, never an empty table.
+              Nothing matches this filter — that is not “nothing running”. {scopedCount}{" "}
+              lane{scopedCount === 1 ? "" : "s"} in scope for {project || "every project"}; the state
+              filter or the show-ended toggle hides the rest. A capped or offline station is a
+              note like this one, never an empty list.
             </div>
           )}
         </Card>
@@ -400,6 +419,12 @@ export default function LinePage() {
             )}
           </Card>
         </aside>
+      </div>
+      <footer className={styles.foot}>
+        <span>fixture</span>
+        <span>clocks run in the browser</span>
+        <span>GET /v1/attempts is not on this station</span>
+      </footer>
       </div>
     </main>
   );

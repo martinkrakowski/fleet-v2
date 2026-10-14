@@ -211,7 +211,7 @@ export default function BriefPage() {
           --text:#e9eef7; --muted:#93a0bb; --faint:#78849f;
           --cyan:#22d3ee; --emerald:#34d399; --amber:#fbbf24; --violet:#c084fc; --slate:#7d8aa5;
           --glow-cyan:rgba(34,211,238,.13); --glow-violet:rgba(192,132,252,.11);
-          --radius-card:14px; --radius:8px;
+          --radius-card:6px; --radius:6px;
           --sans:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
           --display:"Space Grotesk",var(--sans);
           --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
@@ -238,11 +238,11 @@ export default function BriefPage() {
         .fc .card.pad{ padding:.75rem .9rem }
         .fc .brief-grid{ display:grid; grid-template-columns:23rem minmax(0,1fr); gap:.8rem; align-items:start }
         .fc .pane{ display:flex; flex-direction:column; min-height:0; background:var(--card-sheen),var(--card); border:1px solid var(--line); border-radius:var(--radius-card) }
-        .fc .pane>header{ flex:none; padding:.6rem .8rem; border-bottom:1px solid var(--line-soft); display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; min-height:2.3rem }
+        .fc .pane>header{ flex:none; padding:.75rem .8rem; border-bottom:1px solid var(--line-soft); display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; min-height:2.3rem }
         .fc .pane>header h2{ margin:0; flex:none }
         .fc .pane>header .meta{ margin-left:auto; color:var(--faint); font-family:var(--mono); font-size:.64rem }
-        .fc .pane>.body{ flex:1; min-height:0; overflow:auto; padding:.65rem .8rem }
-        .fc .woitem{ display:flex; flex-direction:column; gap:.15rem; width:100%; text-align:left; background:var(--bg-sink); border:1px solid var(--line-soft); border-radius:var(--radius); padding:.45rem .6rem; margin-bottom:.4rem; cursor:pointer; color:var(--muted) }
+        .fc .pane>.body{ flex:1; min-height:0; overflow:auto; padding:.75rem .8rem }
+        .fc .woitem{ display:flex; flex-direction:column; gap:.15rem; width:100%; text-align:left; background:var(--bg-sink); border:1px solid var(--line-soft); border-radius:var(--radius); padding:.75rem .8rem; margin-bottom:.4rem; cursor:pointer; color:var(--muted) }
         .fc .woitem:hover{ border-color:var(--line-strong) }
         .fc .woitem[aria-current="true"]{ border-color:var(--cyan); box-shadow:0 0 0 3px color-mix(in srgb,var(--cyan) 14%,transparent) }
         .fc .woitem .t{ color:var(--text); font-size:.8rem }
@@ -252,11 +252,11 @@ export default function BriefPage() {
         .fc dl.kv{ display:grid; grid-template-columns:max-content minmax(0,1fr); gap:.2rem .8rem; margin:0; font-size:.8rem }
         .fc dl.kv dt{ color:var(--muted) }
         .fc dl.kv dd{ margin:0; overflow-wrap:anywhere }
-        .fc .tablewrap{ overflow:auto }
-        .fc .tablewrap.inner{ border:1px solid var(--line-soft); border-radius:var(--radius); margin-top:.3rem }
+        .fc .tablewrap{ overflow:auto; padding:.75rem }
+        .fc .tablewrap.inner{ border:1px solid var(--line-soft); border-radius:var(--radius); margin-top:.3rem; padding:.75rem }
         .fc table.grid{ width:100%; border-collapse:collapse }
-        .fc table.grid th{ text-align:left; color:var(--faint); font-family:var(--mono); font-size:.6rem; letter-spacing:.12em; text-transform:uppercase; font-weight:500; padding:.5rem .6rem; border-bottom:1px solid var(--line); white-space:nowrap; position:sticky; top:0; background:var(--card); z-index:1 }
-        .fc table.grid td{ padding:.5rem .6rem; border-bottom:1px solid var(--line-soft); vertical-align:top }
+        .fc table.grid th{ text-align:left; color:var(--faint); font-family:var(--mono); font-size:.6rem; letter-spacing:.12em; text-transform:uppercase; font-weight:500; padding:.75rem; border-bottom:1px solid var(--line); white-space:nowrap; position:sticky; top:0; background:var(--card); z-index:1 }
+        .fc table.grid td{ padding:.75rem; border-bottom:1px solid var(--line-soft); vertical-align:top }
         .fc table.grid tr:last-child td{ border-bottom:none }
         .fc table.rows td.claim{ max-width:36ch } .fc table.rows td.mono{ white-space:nowrap; font-size:.74rem }
         .fc table.rows td.why{ max-width:30ch } .fc table.rows td.src{ white-space:nowrap; font-size:.72rem }
@@ -270,7 +270,7 @@ export default function BriefPage() {
         .fc .switch input:checked + .track{ background:color-mix(in srgb,var(--cyan) 20%,var(--bg-sink)); border-color:var(--cyan) }
         .fc .switch input:checked + .track::after{ left:calc(100% - .9rem); background:var(--cyan) }
         .fc .switch input:focus-visible + .track{ outline:2px solid var(--cyan); outline-offset:2px }
-        .fc .freeze-bar{ display:flex; gap:.8rem; align-items:center; flex-wrap:wrap; margin-top:.8rem; padding-top:.7rem; border-top:1px solid var(--line) }
+        .fc .freeze-bar{ display:flex; gap:.8rem; align-items:center; flex-wrap:wrap; margin-top:.8rem; padding-top:.75rem; border-top:1px solid var(--line) }
         .fc .freeze-bar .sum{ color:var(--muted); font-size:.76rem }
         .fc .lockstamp{ display:inline-flex; gap:.3rem; align-items:center; font-family:var(--mono); font-size:.62rem; color:var(--muted); white-space:nowrap }
         .fc .lockstamp.in{ color:var(--emerald) } .fc .lockstamp.out{ color:var(--faint) }
@@ -281,11 +281,11 @@ export default function BriefPage() {
         .fc .btn:hover{ border-color:var(--text) }
         .fc .btn[disabled]{ opacity:.5; cursor:default }
         .fc .btn.primary{ border-color:color-mix(in srgb,var(--cyan) 55%,transparent); color:var(--cyan) }
-        .fc .note{ border:1px solid var(--amber); border-radius:var(--radius); color:var(--amber); padding:.4rem .6rem; font-size:.78rem; background:var(--bg-raise); margin:.45rem 0 }
+        .fc .note{ border:1px solid var(--amber); border-radius:var(--radius); color:var(--amber); padding:.75rem .8rem; font-size:.78rem; background:var(--bg-raise); margin:.45rem 0 }
         .fc .note b{ color:var(--text); font-weight:500 }
         .fc .note.ok{ border-color:var(--emerald); color:var(--emerald) }
         .fc .note.info{ border-color:var(--line-strong); color:var(--muted) }
-        .fc .brief-stamp{ display:flex; gap:.8rem; flex-wrap:wrap; align-items:center; color:var(--faint); font-family:var(--mono); font-size:.68rem; margin:0 0 .7rem; padding-bottom:.5rem; border-bottom:1px dashed var(--line) }
+        .fc .brief-stamp{ display:flex; gap:.8rem; flex-wrap:wrap; align-items:center; color:var(--faint); font-family:var(--mono); font-size:.68rem; margin:0 0 .7rem; padding-bottom:.75rem; border-bottom:1px dashed var(--line) }
         .fc .brief-stamp b{ color:var(--muted); font-weight:500 }
         .fc .manifest-dl{ margin-bottom:.6rem }
         .fc .rows-card{ margin-top:.8rem }
@@ -299,10 +299,10 @@ export default function BriefPage() {
         .fc .md ul,.fc .md ol{ margin:0 0 .6rem; padding-left:1.3rem }
         .fc .md li{ margin:.18rem 0 }
         .fc .md code{ background:color-mix(in srgb,var(--cyan) 10%,transparent); border-radius:4px; padding:.05rem .3rem; color:var(--cyan) }
-        .fc .md pre{ background:var(--bg-sink); border:1px solid var(--line); border-radius:var(--radius); padding:.6rem .8rem; overflow:auto }
+        .fc .md pre{ background:var(--bg-sink); border:1px solid var(--line); border-radius:var(--radius); padding:.75rem .8rem; overflow:auto }
         .fc .md pre code{ background:none; color:var(--text); padding:0 }
         .fc .md table{ border-collapse:collapse; margin:.4rem 0 .8rem; font-size:.8rem }
-        .fc .md th,.fc .md td{ border:1px solid var(--line); padding:.25rem .5rem; text-align:left }
+        .fc .md th,.fc .md td{ border:1px solid var(--line); padding:.75rem; text-align:left }
         @media (max-width:72rem){
           .fc .brief-grid{ grid-template-columns:1fr }
         }

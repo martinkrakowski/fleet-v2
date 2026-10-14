@@ -18,7 +18,8 @@
     "sync:dry": "hexagen sync --dry-run",
     "sync:check": "hexagen sync --check --allow-dirty",
     "lint:arch": "hexagen arch validate",
-    "format": "prettier --write \"**/*.{ts,tsx,json,yaml,md}\""
+    "format": "prettier --write \"**/*.{ts,tsx,json,yaml,md}\"",
+    "staging:deploy": "sh deploy/staging/deploy.sh"
   },
   "devDependencies": {
     "@hexagen-monaco/arch-linter": "0.14.0",

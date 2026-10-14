@@ -25,16 +25,35 @@ const KIND_COLOR: Record<BadgeKind, string> = {
   candidate: 'var(--amber)',
 };
 
+const TONE_ALIAS: Record<string, BadgeKind> = {
+  first: 'active',
+  l3: 'candidate',
+  merge: 'accepted',
+};
+
+export type BadgeVariant = BadgeKind | 'first' | 'l3' | 'merge';
+
 export interface BadgeProps {
-  kind: BadgeKind;
+  kind?: BadgeKind;
+  variant?: string;
+  tone?: string;
+  title?: string;
   children: ReactNode;
   style?: CSSProperties;
 }
 
-export function Badge({ kind, children, style }: BadgeProps) {
-  const color = KIND_COLOR[kind];
+function resolveKind(kind?: string, variant?: string, tone?: string): BadgeKind {
+  const raw = kind ?? variant ?? tone ?? 'ended';
+  if (raw in KIND_COLOR) return raw as BadgeKind;
+  return TONE_ALIAS[raw] ?? 'ended';
+}
+
+export function Badge({ kind, variant, tone, title, children, style }: BadgeProps) {
+  const resolved = resolveKind(kind, variant, tone);
+  const color = KIND_COLOR[resolved];
   return (
     <span
+      title={title}
       style={{
         display: 'inline-flex',
         alignItems: 'center',

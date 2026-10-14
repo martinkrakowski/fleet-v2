@@ -1,0 +1,40 @@
+.list {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+}
+
+.row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-color-light, var(--line-soft));
+}
+
+.row:last-child {
+  border-bottom: none;
+}
+
+.term {
+  flex: 0 1 auto;
+  margin: 0;
+  font-family: var(--font-sans, var(--sans));
+  font-size: 0.75rem;
+  color: var(--text-muted, var(--muted));
+}
+
+.value {
+  flex: 1 1 auto;
+  margin: 0;
+  text-align: right;
+  font-family: var(--font-sans, var(--sans));
+  font-size: 0.8125rem;
+  color: var(--text, var(--text));
+}
+
+.mono {
+  font-family: var(--font-mono, var(--mono));
+  font-size: 0.75rem;
+}

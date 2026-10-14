@@ -1,0 +1,161 @@
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius, var(--radius));
+  font-family: var(--font-sans, var(--sans));
+  font-size: 0.8125rem;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--primary, var(--cyan));
+  outline-offset: 2px;
+}
+
+.button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.sizeSm {
+  height: 28px;
+  padding: 0 10px;
+}
+
+.sizeMd {
+  height: 32px;
+  padding: 0 12px;
+}
+
+.sizeLg {
+  height: 38px;
+  padding: 0 16px;
+  font-size: 0.875rem;
+}
+
+/* Outline (default) */
+
+.toneNeutral {
+  color: var(--text, var(--text));
+  background: var(--bg-surface, var(--card));
+  border-color: var(--border-color, var(--line));
+}
+
+.toneNeutral:hover:not(:disabled) {
+  background: var(--bg-surface-secondary, var(--bg-sink));
+}
+
+.toneAccent {
+  color: var(--primary, var(--cyan));
+  background: var(--bg-surface, var(--card));
+  border-color: color-mix(in srgb, var(--primary, var(--cyan)) 35%, transparent);
+}
+
+.toneAccent:hover:not(:disabled) {
+  background: var(--primary-lt, rgba(26, 187, 156, 0.1));
+}
+
+.toneOk {
+  color: var(--green, var(--emerald));
+  background: var(--bg-surface, var(--card));
+  border-color: color-mix(in srgb, var(--green, var(--emerald)) 35%, transparent);
+}
+
+.toneOk:hover:not(:disabled) {
+  background: var(--green-lt, rgba(47, 179, 68, 0.1));
+}
+
+.toneWarn {
+  color: var(--yellow, var(--amber));
+  background: var(--bg-surface, var(--card));
+  border-color: color-mix(in srgb, var(--yellow, var(--amber)) 35%, transparent);
+}
+
+.toneWarn:hover:not(:disabled) {
+  background: var(--yellow-lt, rgba(245, 159, 0, 0.1));
+}
+
+.toneDanger {
+  color: var(--red, var(--rose));
+  background: var(--bg-surface, var(--card));
+  border-color: color-mix(in srgb, var(--red, var(--rose)) 35%, transparent);
+}
+
+.toneDanger:hover:not(:disabled) {
+  background: var(--red-lt, rgba(214, 57, 57, 0.1));
+}
+
+.toneDecision {
+  color: var(--purple, var(--violet));
+  background: var(--bg-surface, var(--card));
+  border-color: color-mix(in srgb, var(--purple, var(--violet)) 35%, transparent);
+}
+
+.toneDecision:hover:not(:disabled) {
+  background: var(--purple-lt, rgba(174, 62, 201, 0.1));
+}
+
+/* Solid */
+
+.solid.toneNeutral {
+  color: var(--bg-surface, #ffffff);
+  background: var(--text, var(--text));
+  border-color: transparent;
+}
+
+.solid.toneNeutral:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.solid.toneAccent {
+  color: #ffffff;
+  background: var(--primary, var(--cyan));
+  border-color: transparent;
+}
+
+.solid.toneOk {
+  color: #ffffff;
+  background: var(--green, var(--emerald));
+  border-color: transparent;
+}
+
+.solid.toneWarn {
+  color: #1c1917;
+  background: var(--yellow, var(--amber));
+  border-color: transparent;
+}
+
+.solid.toneDanger {
+  color: #ffffff;
+  background: var(--red, var(--rose));
+  border-color: transparent;
+}
+
+.solid.toneDecision {
+  color: #ffffff;
+  background: var(--purple, var(--violet));
+  border-color: transparent;
+}
+
+/* Ghost */
+
+.ghost,
+.ghost:hover {
+  background: transparent;
+  border-color: transparent;
+}
+
+.ghost.toneNeutral {
+  color: var(--text-muted, var(--muted));
+}
+
+.ghost:hover:not(:disabled) {
+  background: var(--bg-surface-secondary, var(--bg-sink));
+}

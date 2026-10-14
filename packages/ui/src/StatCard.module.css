@@ -1,0 +1,100 @@
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  border: 1px solid var(--border-color, var(--line));
+  border-radius: var(--radius, var(--radius));
+  background: var(--bg-surface, var(--card));
+}
+
+.topRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.label {
+  font-family: var(--font-mono, var(--mono));
+  font-size: 0.625rem;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted, var(--muted));
+}
+
+.value {
+  margin: 0;
+  font-family: var(--font-sans, var(--sans));
+  font-size: 1.5rem;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--text, var(--text));
+}
+
+.subtext {
+  margin: 0;
+  font-family: var(--font-sans, var(--sans));
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--text-muted, var(--muted));
+}
+
+.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm, var(--radius));
+  font-size: 0.875rem;
+  flex: none;
+}
+
+.progressTrack {
+  position: relative;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--border-color-light, var(--line-soft));
+  overflow: hidden;
+}
+
+.progressFill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--primary, var(--cyan));
+}
+
+/* Semantic icon tints */
+
+.toneNeutral {
+  color: var(--text-muted, var(--muted));
+  background: var(--bg-surface-secondary, var(--bg-sink));
+}
+
+.toneAccent {
+  color: var(--primary, var(--cyan));
+  background: var(--primary-lt, rgba(26, 187, 156, 0.1));
+}
+
+.toneOk {
+  color: var(--green, var(--emerald));
+  background: var(--green-lt, rgba(47, 179, 68, 0.1));
+}
+
+.toneWarn {
+  color: var(--yellow, var(--amber));
+  background: var(--yellow-lt, rgba(245, 159, 0, 0.1));
+}
+
+.toneDanger {
+  color: var(--red, var(--rose));
+  background: var(--red-lt, rgba(214, 57, 57, 0.1));
+}
+
+.toneDecision {
+  color: var(--purple, var(--violet));
+  background: var(--purple-lt, rgba(174, 62, 201, 0.1));
+}

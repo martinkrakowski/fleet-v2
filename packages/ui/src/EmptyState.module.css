@@ -14,28 +14,28 @@
   justify-content: center;
   width: 40px;
   height: 40px;
-  border-radius: var(--radius-lg, var(--radius));
-  border: 1px solid var(--border-color, var(--line));
-  background: var(--bg-surface-secondary, var(--bg-sink));
-  color: var(--text-muted, var(--muted));
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-color);
+  background: var(--bg-surface-secondary);
+  color: var(--text-muted);
   font-size: 1.125rem;
 }
 
 .title {
   margin: 0;
-  font-family: var(--font-sans, var(--sans));
+  font-family: var(--font-sans);
   font-size: 0.875rem;
   font-weight: 600;
-  color: var(--text, var(--text));
+  color: var(--text);
 }
 
 .description {
   margin: 0;
   max-width: 40ch;
-  font-family: var(--font-sans, var(--sans));
+  font-family: var(--font-sans);
   font-size: 0.8125rem;
   line-height: 1.5;
-  color: var(--text-muted, var(--muted));
+  color: var(--text-muted);
 }
 
 .actions {

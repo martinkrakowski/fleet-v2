@@ -1,0 +1,59 @@
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  border: 1px solid;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  padding: 0.03rem 0.45rem;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.active {
+  color: var(--primary);
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 9%, transparent);
+}
+
+.ended {
+  color: var(--text-faint);
+  border-color: var(--text-faint);
+  background: color-mix(in srgb, var(--text-faint) 9%, transparent);
+}
+
+.unknown,
+.candidate {
+  color: var(--yellow);
+  border-color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 9%, transparent);
+}
+
+.blocked,
+.fix {
+  color: var(--purple);
+  border-color: var(--purple);
+  background: color-mix(in srgb, var(--purple) 9%, transparent);
+}
+
+.queued {
+  color: var(--text-muted);
+  border-color: var(--text-muted);
+  background: color-mix(in srgb, var(--text-muted) 9%, transparent);
+}
+
+.accepted,
+.keeper {
+  color: var(--green);
+  border-color: var(--green);
+  background: color-mix(in srgb, var(--green) 9%, transparent);
+}
+
+.failed {
+  color: var(--red);
+  border-color: var(--red);
+  background: color-mix(in srgb, var(--red) 9%, transparent);
+}

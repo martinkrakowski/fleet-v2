@@ -1,0 +1,51 @@
+.fact {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  white-space: nowrap;
+}
+
+.dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  flex: none;
+}
+
+.yes {
+  color: var(--green);
+}
+
+.yes .dot {
+  background: var(--green);
+}
+
+.no {
+  color: var(--text-faint);
+}
+
+.no .dot {
+  border: 1.5px solid var(--text-faint);
+}
+
+.unknown {
+  color: var(--yellow);
+}
+
+.unknown .dot {
+  border: 1.5px dashed var(--yellow);
+}
+
+.stale {
+  color: var(--text-muted);
+}
+
+.stale .dot {
+  border: 1.5px dashed var(--text-muted);
+}
+
+.dim {
+  opacity: 0.6;
+}

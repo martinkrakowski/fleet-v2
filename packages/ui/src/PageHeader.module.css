@@ -15,29 +15,29 @@
 
 .pretitle {
   margin: 0;
-  font-family: var(--font-mono, var(--mono));
+  font-family: var(--font-mono);
   font-size: 0.625rem;
   font-weight: 500;
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: var(--text-muted, var(--muted));
+  color: var(--text-muted);
 }
 
 .title {
   margin: 0;
-  font-family: var(--font-sans, var(--sans));
+  font-family: var(--font-sans);
   font-size: 1.25rem;
   font-weight: 600;
   line-height: 1.3;
-  color: var(--text, var(--text));
+  color: var(--text);
 }
 
 .description {
   margin: 0;
-  font-family: var(--font-sans, var(--sans));
+  font-family: var(--font-sans);
   font-size: 0.8125rem;
   line-height: 1.5;
-  color: var(--text-muted, var(--muted));
+  color: var(--text-muted);
 }
 
 .actions {

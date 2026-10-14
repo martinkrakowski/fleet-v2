@@ -5,10 +5,10 @@
   height: 22px;
   padding: 0 8px;
   border-radius: 999px;
-  border: 1px solid var(--border-color, var(--line));
-  background: var(--bg-surface-secondary, var(--bg-sink));
-  color: var(--text-muted, var(--muted));
-  font-family: var(--font-sans, var(--sans));
+  border: 1px solid var(--border-color);
+  background: var(--bg-surface-secondary);
+  color: var(--text-muted);
+  font-family: var(--font-sans);
   font-size: 0.6875rem;
   font-weight: 500;
   line-height: 1;
@@ -16,43 +16,43 @@
 }
 
 .mono {
-  font-family: var(--font-mono, var(--mono));
+  font-family: var(--font-mono);
   font-size: 0.625rem;
   letter-spacing: 0.02em;
 }
 
 .toneNeutral {
-  color: var(--text-muted, var(--muted));
-  background: var(--bg-surface-secondary, var(--bg-sink));
-  border-color: var(--border-color, var(--line));
+  color: var(--text-muted);
+  background: var(--bg-surface-secondary);
+  border-color: var(--border-color);
 }
 
 .toneAccent {
-  color: var(--primary, var(--cyan));
+  color: var(--primary);
   background: var(--primary-lt, rgba(26, 187, 156, 0.1));
-  border-color: color-mix(in srgb, var(--primary, var(--cyan)) 35%, transparent);
+  border-color: color-mix(in srgb, var(--primary) 35%, transparent);
 }
 
 .toneOk {
-  color: var(--green, var(--emerald));
+  color: var(--green);
   background: var(--green-lt, rgba(47, 179, 68, 0.1));
-  border-color: color-mix(in srgb, var(--green, var(--emerald)) 35%, transparent);
+  border-color: color-mix(in srgb, var(--green) 35%, transparent);
 }
 
 .toneWarn {
-  color: var(--yellow, var(--amber));
+  color: var(--yellow);
   background: var(--yellow-lt, rgba(245, 159, 0, 0.1));
-  border-color: color-mix(in srgb, var(--yellow, var(--amber)) 35%, transparent);
+  border-color: color-mix(in srgb, var(--yellow) 35%, transparent);
 }
 
 .toneDanger {
-  color: var(--red, var(--rose));
+  color: var(--red);
   background: var(--red-lt, rgba(214, 57, 57, 0.1));
-  border-color: color-mix(in srgb, var(--red, var(--rose)) 35%, transparent);
+  border-color: color-mix(in srgb, var(--red) 35%, transparent);
 }
 
 .toneDecision {
-  color: var(--purple, var(--violet));
+  color: var(--purple);
   background: var(--purple-lt, rgba(174, 62, 201, 0.1));
-  border-color: color-mix(in srgb, var(--purple, var(--violet)) 35%, transparent);
+  border-color: color-mix(in srgb, var(--purple) 35%, transparent);
 }

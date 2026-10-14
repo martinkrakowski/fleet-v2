@@ -11,16 +11,16 @@
   width: 36px;
   height: 20px;
   padding: 2px;
-  border: 1px solid var(--border-color, var(--line));
+  border: 1px solid var(--border-color);
   border-radius: 999px;
-  background: var(--bg-surface-secondary, var(--bg-sink));
+  background: var(--bg-surface-secondary);
   cursor: pointer;
   transition: background 140ms ease, border-color 140ms ease;
   flex: none;
 }
 
 .track:focus-visible {
-  outline: 2px solid var(--primary, var(--cyan));
+  outline: 2px solid var(--primary);
   outline-offset: 2px;
 }
 
@@ -30,8 +30,8 @@
 }
 
 .trackOn {
-  background: var(--primary, var(--cyan));
-  border-color: color-mix(in srgb, var(--primary, var(--cyan)) 35%, transparent);
+  background: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 35%, transparent);
 }
 
 .thumb {
@@ -39,7 +39,7 @@
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  background: #ffffff;
+  background: var(--sidebar-text-active);
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.35);
   transform: translateX(0);
   transition: transform 140ms ease;
@@ -50,9 +50,9 @@
 }
 
 .label {
-  font-family: var(--font-sans, var(--sans));
+  font-family: var(--font-sans);
   font-size: 0.8125rem;
-  color: var(--text, var(--text));
+  color: var(--text);
   cursor: pointer;
   user-select: none;
 }

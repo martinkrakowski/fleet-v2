@@ -4,7 +4,7 @@
   gap: 6px;
   position: relative;
   padding: 12px 16px;
-  border-radius: var(--radius, var(--radius));
+  border-radius: var(--radius);
   overflow: hidden;
 }
 
@@ -17,14 +17,14 @@
 
 .title {
   margin: 0;
-  font-family: var(--font-sans, var(--sans));
+  font-family: var(--font-sans);
   font-size: 0.8125rem;
   font-weight: 600;
   line-height: 1.45;
 }
 
 .body {
-  font-family: var(--font-sans, var(--sans));
+  font-family: var(--font-sans);
   font-size: 0.8125rem;
   line-height: 1.55;
 }
@@ -38,7 +38,7 @@
 }
 
 .meta {
-  font-family: var(--font-mono, var(--mono));
+  font-family: var(--font-mono);
   font-size: 0.6875rem;
   letter-spacing: 0.02em;
   opacity: 0.85;
@@ -53,73 +53,73 @@
 /* Semantic tones */
 
 .toneNeutral {
-  color: var(--text-muted, var(--muted));
-  background: var(--bg-surface-secondary, var(--bg-sink));
-  border: 1px solid var(--border-color, var(--line));
+  color: var(--text-muted);
+  background: var(--bg-surface-secondary);
+  border: 1px solid var(--border-color);
 }
 
 .toneNeutral::before {
-  background: var(--border-color, var(--line));
+  background: var(--border-color);
 }
 
 .toneOk {
-  color: var(--green, var(--emerald));
+  color: var(--green);
 }
 
 .toneWarn {
-  color: var(--yellow, var(--amber));
+  color: var(--yellow);
 }
 
 .toneDanger {
-  color: var(--red, var(--rose));
+  color: var(--red);
 }
 
 .toneDecision {
-  color: var(--purple, var(--violet));
+  color: var(--purple);
 }
 
 .toneAccent {
-  color: var(--primary, var(--cyan));
+  color: var(--primary);
   background: var(--primary-lt, rgba(26, 187, 156, 0.1));
-  border: 1px solid color-mix(in srgb, var(--primary, var(--cyan)) 35%, transparent);
+  border: 1px solid color-mix(in srgb, var(--primary) 35%, transparent);
 }
 
 .toneAccent::before {
-  background: var(--primary, var(--cyan));
+  background: var(--primary);
 }
 
 .toneOk {
   background: var(--green-lt, rgba(47, 179, 68, 0.1));
-  border: 1px solid color-mix(in srgb, var(--green, var(--emerald)) 35%, transparent);
+  border: 1px solid color-mix(in srgb, var(--green) 35%, transparent);
 }
 
 .toneOk::before {
-  background: var(--green, var(--emerald));
+  background: var(--green);
 }
 
 .toneWarn {
   background: var(--yellow-lt, rgba(245, 159, 0, 0.1));
-  border: 1px solid color-mix(in srgb, var(--yellow, var(--amber)) 35%, transparent);
+  border: 1px solid color-mix(in srgb, var(--yellow) 35%, transparent);
 }
 
 .toneWarn::before {
-  background: var(--yellow, var(--amber));
+  background: var(--yellow);
 }
 
 .toneDanger {
   background: var(--red-lt, rgba(214, 57, 57, 0.1));
-  border: 1px solid color-mix(in srgb, var(--red, var(--rose)) 35%, transparent);
+  border: 1px solid color-mix(in srgb, var(--red) 35%, transparent);
 }
 
 .toneDanger::before {
-  background: var(--red, var(--rose));
+  background: var(--red);
 }
 
 .toneDecision {
   background: var(--purple-lt, rgba(174, 62, 201, 0.1));
-  border: 1px solid color-mix(in srgb, var(--purple, var(--violet)) 35%, transparent);
+  border: 1px solid color-mix(in srgb, var(--purple) 35%, transparent);
 }
 
 .toneDecision::before {
-  background: var(--purple, var(--violet));
+  background: var(--purple);
 }

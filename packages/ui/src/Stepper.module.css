@@ -26,10 +26,10 @@
   width: 20px;
   height: 20px;
   border-radius: 50%;
-  border: 1px solid var(--border-color, var(--line));
-  background: var(--bg-surface-secondary, var(--bg-sink));
-  color: var(--text-muted, var(--muted));
-  font-family: var(--font-mono, var(--mono));
+  border: 1px solid var(--border-color);
+  background: var(--bg-surface-secondary);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
   font-size: 0.625rem;
   flex: none;
 }
@@ -39,7 +39,7 @@
 }
 
 .done {
-  color: var(--text, var(--text));
+  color: var(--text);
 }
 
 .done .dot,
@@ -48,38 +48,38 @@
 }
 
 .done .dot {
-  background: var(--green, var(--emerald));
-  color: #ffffff;
+  background: var(--green);
+  color: var(--sidebar-text-active);
 }
 
 .active .dot {
   border-width: 2px;
   border-color: currentColor;
-  color: var(--primary, var(--cyan));
+  color: var(--primary);
 }
 
 .toneNeutral {
-  color: var(--text-muted, var(--muted));
+  color: var(--text-muted);
 }
 
 .toneAccent {
-  color: var(--primary, var(--cyan));
+  color: var(--primary);
 }
 
 .toneOk {
-  color: var(--green, var(--emerald));
+  color: var(--green);
 }
 
 .toneWarn {
-  color: var(--yellow, var(--amber));
+  color: var(--yellow);
 }
 
 .toneDanger {
-  color: var(--red, var(--rose));
+  color: var(--red);
 }
 
 .toneDecision {
-  color: var(--purple, var(--violet));
+  color: var(--purple);
 }
 
 .text {
@@ -90,24 +90,24 @@
 }
 
 .label {
-  font-family: var(--font-sans, var(--sans));
+  font-family: var(--font-sans);
   font-size: 0.8125rem;
   font-weight: 500;
-  color: var(--text, var(--text));
+  color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .pending .label {
-  color: var(--text-muted, var(--muted));
+  color: var(--text-muted);
   font-weight: 400;
 }
 
 .detail {
-  font-family: var(--font-mono, var(--mono));
+  font-family: var(--font-mono);
   font-size: 0.6875rem;
-  color: var(--text-faint, var(--slate));
+  color: var(--text-faint);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -119,9 +119,9 @@
   min-width: 16px;
   height: 1px;
   margin: 0 8px;
-  background: var(--border-color, var(--line));
+  background: var(--border-color);
 }
 
 .connectorOn {
-  background: var(--green, var(--emerald));
+  background: var(--green);
 }

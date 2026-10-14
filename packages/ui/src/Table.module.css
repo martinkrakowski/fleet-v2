@@ -2,22 +2,22 @@
   display: block;
   width: 100%;
   overflow-x: auto;
-  border: 1px solid var(--border-color, var(--line));
-  border-radius: var(--radius, var(--radius));
-  background: var(--bg-surface, var(--card));
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
   -webkit-overflow-scrolling: touch;
 }
 
 .table {
   width: 100%;
   border-collapse: collapse;
-  font-family: var(--font-sans, var(--sans));
+  font-family: var(--font-sans);
   font-size: 0.8125rem;
   line-height: 1.5;
 }
 
 .thead {
-  background: var(--bg-surface-secondary, var(--bg-sink));
+  background: var(--bg-surface-secondary);
 }
 
 .stickyHeader .thead th {
@@ -33,15 +33,15 @@
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: var(--text-muted, var(--muted));
-  border-bottom: 1px solid var(--border-color, var(--line));
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-color);
   white-space: nowrap;
 }
 
 .cell {
   padding: 10px 16px;
-  color: var(--text, var(--text));
-  border-bottom: 1px solid var(--border-color-light, var(--line-soft));
+  color: var(--text);
+  border-bottom: 1px solid var(--border-color-light);
 }
 
 .tbody .row:last-child .cell {
@@ -49,11 +49,11 @@
 }
 
 .tbody .row:hover .cell {
-  background: var(--bg-surface-secondary, var(--bg-sink));
+  background: var(--bg-surface-secondary);
 }
 
 .mono {
-  font-family: var(--font-mono, var(--mono));
+  font-family: var(--font-mono);
   font-size: 0.75rem;
 }
 

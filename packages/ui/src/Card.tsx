@@ -32,23 +32,18 @@ export interface CardFooterProps {
 }
 
 /**
- * Legacy inline-token card surface. Existing consumers (`lanes`, `knowledge`)
- * keep their current rendering until the views adopt the composed
- * `Card` + `CardHeader`/`CardBody`/`CardFooter` structure.
+ * Composable card surface on semantic tokens (`--bg-surface`,
+ * `--border-color`, `--radius-card`, `--shadow-card`).
  */
 export function Card({ children, padded = false, title, className, style }: CardProps) {
   return (
     <section
-      className={className}
-      style={{
-        background: 'var(--card-sheen), var(--card)',
-        border: '1px solid var(--line)',
-        borderRadius: 'var(--radius-card)',
-        ...(padded ? { padding: '0.75rem 0.9rem' } : {}),
-        ...style,
-      }}
+      className={[classes.card, padded && classes.padded, className]
+        .filter(Boolean)
+        .join(' ') || undefined}
+      style={style}
     >
-      {title ? <h2>{title}</h2> : null}
+      {title ? <h2 className={classes.title}>{title}</h2> : null}
       {children}
     </section>
   );

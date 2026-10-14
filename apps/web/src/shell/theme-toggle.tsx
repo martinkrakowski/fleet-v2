@@ -21,9 +21,12 @@ function ThemeIcon({ theme }: { theme: Theme }) {
 /**
  * The theme toggle. The chosen theme is persisted under `localStorage`
  * key `theme` and applied to `document.documentElement.dataset.theme`.
+ * The default state is `"light"`; the pre-paint script in the root layout
+ * resolves the actual attribute before hydration and the mount effect
+ * syncs to it.
  */
 export function ThemeToggle() {
-  const [theme, setTheme] = useState<Theme>("dark");
+  const [theme, setTheme] = useState<Theme>("light");
 
   useEffect(() => {
     const current = document.documentElement.dataset.theme;

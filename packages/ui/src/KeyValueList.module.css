@@ -10,7 +10,7 @@
   justify-content: space-between;
   gap: 12px;
   padding: 8px 0;
-  border-bottom: 1px solid var(--border-color-light, var(--line-soft));
+  border-bottom: 1px solid var(--border-color-light);
 }
 
 .row:last-child {
@@ -20,21 +20,21 @@
 .term {
   flex: 0 1 auto;
   margin: 0;
-  font-family: var(--font-sans, var(--sans));
+  font-family: var(--font-sans);
   font-size: 0.75rem;
-  color: var(--text-muted, var(--muted));
+  color: var(--text-muted);
 }
 
 .value {
   flex: 1 1 auto;
   margin: 0;
   text-align: right;
-  font-family: var(--font-sans, var(--sans));
+  font-family: var(--font-sans);
   font-size: 0.8125rem;
-  color: var(--text, var(--text));
+  color: var(--text);
 }
 
 .mono {
-  font-family: var(--font-mono, var(--mono));
+  font-family: var(--font-mono);
   font-size: 0.75rem;
 }

@@ -1,0 +1,46 @@
+.wrapper {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.label {
+  font-family: var(--font-sans, var(--sans));
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text-muted, var(--muted));
+}
+
+.select {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 32px;
+  padding: 0 28px 0 10px;
+  border: 1px solid var(--border-color, var(--line));
+  border-radius: var(--radius, var(--radius));
+  background:
+    var(--bg-surface, var(--card))
+    no-repeat right 8px center / 10px 6px
+    linear-gradient(45deg, transparent 50%, var(--text-muted, var(--muted)) 50%),
+    linear-gradient(135deg, var(--text-muted, var(--muted)) 50%, transparent 50%);
+  color: var(--text, var(--text));
+  font-family: var(--font-sans, var(--sans));
+  font-size: 0.8125rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.select:hover:not(:disabled) {
+  border-color: var(--border-color-strong, var(--line-strong));
+}
+
+.select:focus-visible {
+  outline: 2px solid var(--primary, var(--cyan));
+  outline-offset: 2px;
+}
+
+.select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}

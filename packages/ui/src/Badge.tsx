@@ -13,16 +13,16 @@ export type BadgeKind =
   | 'candidate';
 
 const KIND_COLOR: Record<BadgeKind, string> = {
-  active: 'var(--cyan)',
-  ended: 'var(--slate)',
-  unknown: 'var(--amber)',
-  blocked: 'var(--violet)',
-  queued: 'var(--muted)',
-  accepted: 'var(--emerald)',
-  failed: 'var(--rose)',
-  fix: 'var(--violet)',
-  keeper: 'var(--emerald)',
-  candidate: 'var(--amber)',
+  active: 'var(--primary, var(--cyan))',
+  ended: 'var(--text-faint, var(--slate))',
+  unknown: 'var(--yellow, var(--amber))',
+  blocked: 'var(--purple, var(--violet))',
+  queued: 'var(--text-muted, var(--muted))',
+  accepted: 'var(--green, var(--emerald))',
+  failed: 'var(--red, var(--rose))',
+  fix: 'var(--purple, var(--violet))',
+  keeper: 'var(--green, var(--emerald))',
+  candidate: 'var(--yellow, var(--amber))',
 };
 
 const TONE_ALIAS: Record<string, BadgeKind> = {
@@ -39,6 +39,7 @@ export interface BadgeProps {
   tone?: string;
   title?: string;
   children: ReactNode;
+  className?: string;
   style?: CSSProperties;
 }
 
@@ -48,12 +49,13 @@ function resolveKind(kind?: string, variant?: string, tone?: string): BadgeKind 
   return TONE_ALIAS[raw] ?? 'ended';
 }
 
-export function Badge({ kind, variant, tone, title, children, style }: BadgeProps) {
+export function Badge({ kind, variant, tone, title, children, className, style }: BadgeProps) {
   const resolved = resolveKind(kind, variant, tone);
   const color = KIND_COLOR[resolved];
   return (
     <span
       title={title}
+      className={className}
       style={{
         display: 'inline-flex',
         alignItems: 'center',

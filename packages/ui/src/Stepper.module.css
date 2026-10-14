@@ -1,0 +1,127 @@
+.stepper {
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.step:last-child {
+  flex: 0 0 auto;
+}
+
+.dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid var(--border-color, var(--line));
+  background: var(--bg-surface-secondary, var(--bg-sink));
+  color: var(--text-muted, var(--muted));
+  font-family: var(--font-mono, var(--mono));
+  font-size: 0.625rem;
+  flex: none;
+}
+
+.dotIndex {
+  line-height: 1;
+}
+
+.done {
+  color: var(--text, var(--text));
+}
+
+.done .dot,
+.done {
+  border-color: transparent;
+}
+
+.done .dot {
+  background: var(--green, var(--emerald));
+  color: #ffffff;
+}
+
+.active .dot {
+  border-width: 2px;
+  border-color: currentColor;
+  color: var(--primary, var(--cyan));
+}
+
+.toneNeutral {
+  color: var(--text-muted, var(--muted));
+}
+
+.toneAccent {
+  color: var(--primary, var(--cyan));
+}
+
+.toneOk {
+  color: var(--green, var(--emerald));
+}
+
+.toneWarn {
+  color: var(--yellow, var(--amber));
+}
+
+.toneDanger {
+  color: var(--red, var(--rose));
+}
+
+.toneDecision {
+  color: var(--purple, var(--violet));
+}
+
+.text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.label {
+  font-family: var(--font-sans, var(--sans));
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--text, var(--text));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pending .label {
+  color: var(--text-muted, var(--muted));
+  font-weight: 400;
+}
+
+.detail {
+  font-family: var(--font-mono, var(--mono));
+  font-size: 0.6875rem;
+  color: var(--text-faint, var(--slate));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.connector {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 16px;
+  height: 1px;
+  margin: 0 8px;
+  background: var(--border-color, var(--line));
+}
+
+.connectorOn {
+  background: var(--green, var(--emerald));
+}

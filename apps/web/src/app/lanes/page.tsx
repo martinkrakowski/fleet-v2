@@ -11,7 +11,7 @@ import {
   workOrders,
   type AttemptSummary
 } from "./fixture";
-import styles from "./line.module.css";
+import styles from "./lanes.module.css";
 
 const STATE_ORDER: Record<string, number> = {
   unknown: 0,
@@ -198,7 +198,7 @@ function attentionItems(): AttentionItem[] {
   return items;
 }
 
-export default function LinePage() {
+export default function LanesPage() {
   const [showEnded, setShowEnded] = useState(true);
   const [stateFilter, setStateFilter] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -228,7 +228,7 @@ export default function LinePage() {
   const attention = attentionItems();
 
   return (
-    <main className={styles.page}>
+    <div className={styles.page}>
       <div className={styles.vhTop}>
         <h1 className={styles.title}>Lanes</h1>
         <span className={`${styles.route} ${styles.routeGap}`} title="a route the plan does not name yet">
@@ -385,6 +385,6 @@ export default function LinePage() {
         </aside>
       </div>
       </div>
-    </main>
+    </div>
   );
 }

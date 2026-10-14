@@ -296,33 +296,6 @@ nav.views a[aria-current="page"] {
   text-align: right;
 }
 
-.projects {
-  display: flex;
-  align-items: center;
-  gap: 0.35rem;
-  flex-wrap: wrap;
-  padding: 0.35rem 1.1rem;
-  border-bottom: 1px solid var(--line-soft);
-  background: color-mix(in srgb, var(--bg-raise) 72%, transparent);
-}
-.projects .lbl {
-  color: var(--faint);
-  font-family: var(--mono);
-  font-size: 0.62rem;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  margin-right: 0.25rem;
-}
-.projects span.proj {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.45rem;
-  border: 1px solid transparent;
-  border-radius: 999px;
-  color: var(--muted);
-  padding: 0.18rem 0.65rem;
-}
-
 .page {
   min-width: 0;
   min-height: 0;

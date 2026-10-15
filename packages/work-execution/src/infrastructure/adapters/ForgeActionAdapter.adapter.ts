@@ -1,13 +1,18 @@
-// @generated adapter stub — edit freely
+// @generated adapter stub — refined for migration step 1 (no behaviour).
 /**
  * ForgeActionAdapter implements ForgeActionPort
- *
- * This adapter was generated from the port interface.
- * Replace TODO implementations with actual logic.
+ * (reviewed-github-cli-subprocess). Forge stays owner-gated until migration
+ * step 7; every method refuses until then.
  */
 
-import type { ForgeActionPort } from '../../application/ports/out/ForgeActionPort.out-port.js';
+import type {
+  ForgeActionPort,
+  ForgeActionRequest,
+  ForgeActionResult,
+} from '../../application/ports/out/ForgeActionPort.out-port.js';
 
 export class ForgeActionAdapter implements ForgeActionPort {
-
+  async performForgeAction(_request: ForgeActionRequest): Promise<ForgeActionResult> {
+    throw new Error('Not implemented: ForgeActionAdapter.performForgeAction');
+  }
 }

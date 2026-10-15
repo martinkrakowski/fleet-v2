@@ -1,58 +1,32 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for migration step 1.
 /**
- * AttemptOutcome is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = AttemptOutcome.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * AttemptOutcome is an immutable value object over the manifest's outcome
+ * enum. No-commit is not success; the outcome records what the attempt
+ * produced, not that it ran.
  */
+
+export const ATTEMPT_OUTCOMES = ['done', 'partial', 'stopped', 'no-commit'] as const;
+
+export type AttemptOutcomeValue = (typeof ATTEMPT_OUTCOMES)[number];
+
+const ATTEMPT_OUTCOME_VALUES: readonly string[] = ATTEMPT_OUTCOMES;
+
 export class AttemptOutcome {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use AttemptOutcome.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly value: AttemptOutcomeValue) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing AttemptOutcome or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<AttemptOutcome, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new AttemptOutcome(value) };
-   * }
-   */
   static create(value: unknown): { success: boolean; value?: AttemptOutcome; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new AttemptOutcome(value) };
+    if (typeof value !== 'string' || !ATTEMPT_OUTCOME_VALUES.includes(value)) {
+      return { success: false, error: new Error(`Invalid attempt outcome: ${String(value)}`) };
+    }
+    return { success: true, value: new AttemptOutcome(value as AttemptOutcomeValue) };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
+  getValue(): AttemptOutcomeValue {
     return this.value;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
   equals(other: AttemptOutcome): boolean {
     return this.value === other.value;
   }

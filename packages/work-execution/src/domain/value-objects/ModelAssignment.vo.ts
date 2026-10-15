@@ -1,59 +1,71 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for migration step 1.
 /**
- * ModelAssignment is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = ModelAssignment.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * ModelAssignment is an immutable value object: model, variant and fallback
+ * as bound in the brief manifest. Host seat names are installation and never
+ * enter this value object.
  */
+
+export interface ModelAssignmentProps {
+  readonly model: string;
+  readonly variant: string;
+  readonly fallbackModel: string;
+}
+
+function isNonEmptyTrimmedString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 export class ModelAssignment {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use ModelAssignment.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly props: ModelAssignmentProps) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing ModelAssignment or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<ModelAssignment, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new ModelAssignment(value) };
-   * }
-   */
-  static create(value: unknown): { success: boolean; value?: ModelAssignment; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new ModelAssignment(value) };
+  static create(props: ModelAssignmentProps): {
+    success: boolean;
+    value?: ModelAssignment;
+    error?: Error;
+  } {
+    if (
+      !isNonEmptyTrimmedString(props.model) ||
+      !isNonEmptyTrimmedString(props.variant) ||
+      !isNonEmptyTrimmedString(props.fallbackModel)
+    ) {
+      return {
+        success: false,
+        error: new Error('ModelAssignment requires non-empty model, variant and fallbackModel'),
+      };
+    }
+    return {
+      success: true,
+      value: new ModelAssignment({
+        model: props.model.trim(),
+        variant: props.variant.trim(),
+        fallbackModel: props.fallbackModel.trim(),
+      }),
+    };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
-    return this.value;
+  getModel(): string {
+    return this.props.model;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
+  getVariant(): string {
+    return this.props.variant;
+  }
+
+  getFallbackModel(): string {
+    return this.props.fallbackModel;
+  }
+
+  getProps(): ModelAssignmentProps {
+    return this.props;
+  }
+
   equals(other: ModelAssignment): boolean {
-    return this.value === other.value;
+    return (
+      this.props.model === other.props.model &&
+      this.props.variant === other.props.variant &&
+      this.props.fallbackModel === other.props.fallbackModel
+    );
   }
 }

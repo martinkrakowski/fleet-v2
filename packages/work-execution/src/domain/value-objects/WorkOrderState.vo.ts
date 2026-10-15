@@ -1,58 +1,47 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for migration step 1.
 /**
- * WorkOrderState is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = WorkOrderState.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * WorkOrderState is an immutable value object over the manifest's work order
+ * enum. A state outside WORK_ORDER_STATES never constructs; terminal states
+ * accept no further dispatch.
  */
+
+export const WORK_ORDER_STATES = [
+  'approved',
+  'prepared',
+  'implementing',
+  'verifying',
+  'reviewing',
+  'fixing',
+  'ready-to-merge',
+  'merged',
+  'stopped',
+] as const;
+
+export type WorkOrderStateValue = (typeof WORK_ORDER_STATES)[number];
+
+const WORK_ORDER_STATE_VALUES: readonly string[] = WORK_ORDER_STATES;
+
 export class WorkOrderState {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use WorkOrderState.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly value: WorkOrderStateValue) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing WorkOrderState or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<WorkOrderState, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new WorkOrderState(value) };
-   * }
-   */
   static create(value: unknown): { success: boolean; value?: WorkOrderState; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new WorkOrderState(value) };
+    if (typeof value !== 'string' || !WORK_ORDER_STATE_VALUES.includes(value)) {
+      return { success: false, error: new Error(`Invalid work order state: ${String(value)}`) };
+    }
+    return { success: true, value: new WorkOrderState(value as WorkOrderStateValue) };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
+  getValue(): WorkOrderStateValue {
     return this.value;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
+  /** Terminal states accept no further attempt dispatch on this work order. */
+  isTerminal(): boolean {
+    return this.value === 'merged' || this.value === 'stopped';
+  }
+
   equals(other: WorkOrderState): boolean {
     return this.value === other.value;
   }

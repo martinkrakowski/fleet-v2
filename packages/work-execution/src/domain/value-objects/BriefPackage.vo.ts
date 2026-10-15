@@ -1,59 +1,102 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for migration step 1.
 /**
- * BriefPackage is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = BriefPackage.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * BriefPackage is an immutable value object for one frozen brief package:
+ * identity-bound paths, digests and revision references. The digest is
+ * integrity, not truth; the package owns at least one path.
  */
+
+export interface BriefPackageProps {
+  readonly attemptId: string;
+  readonly briefDigest: string;
+  readonly prosePath: string;
+  readonly manifestPath: string;
+  readonly baseCommit: string;
+  readonly policyRevision: string;
+  readonly independentReviewer: string;
+  readonly ownedPaths: readonly string[];
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+const STRING_FIELDS: readonly (keyof BriefPackageProps)[] = [
+  'attemptId',
+  'briefDigest',
+  'prosePath',
+  'manifestPath',
+  'baseCommit',
+  'policyRevision',
+  'independentReviewer',
+];
+
 export class BriefPackage {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use BriefPackage.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly props: BriefPackageProps) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing BriefPackage or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<BriefPackage, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new BriefPackage(value) };
-   * }
-   */
-  static create(value: unknown): { success: boolean; value?: BriefPackage; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new BriefPackage(value) };
+  static create(props: BriefPackageProps): { success: boolean; value?: BriefPackage; error?: Error } {
+    for (const field of STRING_FIELDS) {
+      if (!isNonEmptyString(props[field])) {
+        return { success: false, error: new Error(`BriefPackage requires a non-empty ${String(field)}`) };
+      }
+    }
+    if (!Array.isArray(props.ownedPaths) || props.ownedPaths.length === 0) {
+      return { success: false, error: new Error('BriefPackage requires at least one owned path') };
+    }
+    if (props.ownedPaths.some((path) => !isNonEmptyString(path))) {
+      return { success: false, error: new Error('BriefPackage owned paths must be non-empty strings') };
+    }
+    return { success: true, value: new BriefPackage({ ...props, ownedPaths: [...props.ownedPaths] }) };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
-    return this.value;
+  getAttemptId(): string {
+    return this.props.attemptId;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
+  getBriefDigest(): string {
+    return this.props.briefDigest;
+  }
+
+  getProsePath(): string {
+    return this.props.prosePath;
+  }
+
+  getManifestPath(): string {
+    return this.props.manifestPath;
+  }
+
+  getBaseCommit(): string {
+    return this.props.baseCommit;
+  }
+
+  getPolicyRevision(): string {
+    return this.props.policyRevision;
+  }
+
+  getIndependentReviewer(): string {
+    return this.props.independentReviewer;
+  }
+
+  getOwnedPaths(): readonly string[] {
+    return this.props.ownedPaths;
+  }
+
+  getProps(): BriefPackageProps {
+    return this.props;
+  }
+
   equals(other: BriefPackage): boolean {
-    return this.value === other.value;
+    return (
+      this.props.attemptId === other.props.attemptId &&
+      this.props.briefDigest === other.props.briefDigest &&
+      this.props.prosePath === other.props.prosePath &&
+      this.props.manifestPath === other.props.manifestPath &&
+      this.props.baseCommit === other.props.baseCommit &&
+      this.props.policyRevision === other.props.policyRevision &&
+      this.props.independentReviewer === other.props.independentReviewer &&
+      this.props.ownedPaths.length === other.props.ownedPaths.length &&
+      this.props.ownedPaths.every((path, index) => path === other.props.ownedPaths[index])
+    );
   }
 }

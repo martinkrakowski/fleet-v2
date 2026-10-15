@@ -369,6 +369,8 @@ __metadata:
     eslint: "npm:^9.0.0"
     typescript: "npm:^5.5.4"
     typescript-eslint: "npm:^8.0.0"
+  bin:
+    fleet-v2: ./dist/bin.js
   languageName: unknown
   linkType: soft
 

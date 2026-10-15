@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   NOT_IMPLEMENTED_STATUS,
   createFleetWebApiClient,
@@ -44,6 +44,18 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe("createFleetWebApiClient", () => {
+  // The environment-backed baseUrl resolution must never leak ambient
+  // variables into the deterministic tests below.
+  beforeEach(() => {
+    delete process.env.FLEET_API_URL;
+    delete process.env.NEXT_PUBLIC_FLEET_API_URL;
+  });
+
+  afterEach(() => {
+    delete process.env.FLEET_API_URL;
+    delete process.env.NEXT_PUBLIC_FLEET_API_URL;
+  });
+
   describe("200 OK", () => {
     it("returns the live payload with source 'api'", async () => {
       const live = {
@@ -267,6 +279,106 @@ describe("createFleetWebApiClient", () => {
       await client.fetchAttentionView({});
 
       expect(requestedUrls).toEqual([`${BASE_URL}/v1/attention`]);
+    });
+  });
+
+  describe("environment baseUrl resolution", () => {
+    it("uses FLEET_API_URL when baseUrl is omitted", async () => {
+      requestedUrls = [];
+      process.env.FLEET_API_URL = "http://env-api-1";
+      const client = createFleetWebApiClient({
+        fetchImpl: stubFetch(() => Promise.resolve(jsonResponse(200, { ok: true }))),
+      });
+
+      const result = await client.fetchAttentionView(WORK_ORDER_FIXTURE);
+
+      expect(result.source).toBe("api");
+      expect(result.status).toBe(200);
+      expect(result.fallbackReason).toBeNull();
+      expect(requestedUrls).toEqual(["http://env-api-1/v1/attention"]);
+    });
+
+    it("prefers FLEET_API_URL over NEXT_PUBLIC_FLEET_API_URL", async () => {
+      requestedUrls = [];
+      process.env.FLEET_API_URL = "http://env-api-1";
+      process.env.NEXT_PUBLIC_FLEET_API_URL = "http://env-api-2";
+      const client = createFleetWebApiClient({
+        fetchImpl: stubFetch(() => Promise.resolve(jsonResponse(200, {}))),
+      });
+
+      await client.fetchCoordinationView({});
+
+      expect(requestedUrls).toEqual(["http://env-api-1/v1/coordination"]);
+    });
+
+    it("uses NEXT_PUBLIC_FLEET_API_URL when FLEET_API_URL is unset", async () => {
+      requestedUrls = [];
+      process.env.NEXT_PUBLIC_FLEET_API_URL = "http://env-api-2/";
+      const client = createFleetWebApiClient({
+        fetchImpl: stubFetch(() => Promise.resolve(jsonResponse(200, {}))),
+      });
+
+      await client.fetchHeadEvidenceView("7b2d0aa", {});
+
+      expect(requestedUrls).toEqual(["http://env-api-2/v1/heads/7b2d0aa/evidence"]);
+    });
+
+    it("trims whitespace-padded environment origins", async () => {
+      requestedUrls = [];
+      process.env.FLEET_API_URL = "  http://env-api-1  ";
+      const client = createFleetWebApiClient({
+        fetchImpl: stubFetch(() => Promise.resolve(jsonResponse(200, {}))),
+      });
+
+      await client.fetchWorkOrderView("wo-0142", {});
+
+      expect(requestedUrls).toEqual(["http://env-api-1/v1/work-orders/wo-0142"]);
+    });
+
+    it("still forces the fixture fallback for an explicit empty baseUrl", async () => {
+      requestedUrls = [];
+      process.env.FLEET_API_URL = "http://env-api-1";
+      const client = createFleetWebApiClient({
+        baseUrl: "",
+        fetchImpl: stubFetch(() => Promise.resolve(jsonResponse(200, {}))),
+      });
+
+      const result = await client.fetchAttemptView("att_01J9ZM8R2C", WORK_ORDER_FIXTURE);
+
+      expect(requestedUrls).toEqual([]);
+      expect(result).toEqual({
+        source: "fixture-fallback",
+        status: null,
+        data: WORK_ORDER_FIXTURE,
+        fallbackReason: "api boundary is not configured",
+      });
+    });
+
+    it("treats a blank environment origin as unconfigured", async () => {
+      requestedUrls = [];
+      process.env.FLEET_API_URL = "   ";
+      const client = createFleetWebApiClient({
+        fetchImpl: stubFetch(() => Promise.resolve(jsonResponse(200, {}))),
+      });
+
+      const result = await client.fetchCoordinationView(WORK_ORDER_FIXTURE);
+
+      expect(requestedUrls).toEqual([]);
+      expect(result.source).toBe("fixture-fallback");
+      expect(result.fallbackReason).toBe("api boundary is not configured");
+    });
+
+    it("falls back to unconfigured when neither variable is set", async () => {
+      requestedUrls = [];
+      const client = createFleetWebApiClient({
+        fetchImpl: stubFetch(() => Promise.resolve(jsonResponse(200, {}))),
+      });
+
+      const result = await client.fetchWorkOrderView("wo-0142", WORK_ORDER_FIXTURE);
+
+      expect(requestedUrls).toEqual([]);
+      expect(result.source).toBe("fixture-fallback");
+      expect(result.fallbackReason).toBe("api boundary is not configured");
     });
   });
 });

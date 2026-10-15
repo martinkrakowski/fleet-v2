@@ -48,7 +48,14 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
   }
 
   async execute(input: unknown): Promise<RecordAuthorizationConsumptionResult> {
-    if (!this.deps || typeof input !== 'object' || input === null) {
+    // Unconfigured is 501 and is checked before any request validation.
+    if (!this.deps) {
+      throw new Error('Not implemented: RecordAuthorizationConsumptionUseCase');
+    }
+    // A configured runtime still refuses a missing request object instead of
+    // inventing one; the HTTP boundary always supplies an object body, and an
+    // empty object body is refused by the field validation below.
+    if (typeof input !== 'object' || input === null) {
       throw new Error('Not implemented: RecordAuthorizationConsumptionUseCase');
     }
     const request = input as RecordAuthorizationConsumptionRequest;

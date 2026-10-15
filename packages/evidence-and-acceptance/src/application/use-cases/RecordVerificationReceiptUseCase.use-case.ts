@@ -41,7 +41,14 @@ export class RecordVerificationReceiptUseCase implements RecordVerificationRecei
   private async run(
     request?: RecordVerificationReceiptRequest,
   ): Promise<RecordVerificationReceiptResult> {
-    if (!this.deps || typeof request !== 'object' || request === null) {
+    // Unconfigured is 501 and is checked before any request validation.
+    if (!this.deps) {
+      throw new Error(NOT_IMPLEMENTED);
+    }
+    // A configured runtime still refuses a missing request object instead of
+    // inventing one; the HTTP boundary always supplies an object body, and an
+    // empty object body flows into the validation below as a rejection.
+    if (typeof request !== 'object' || request === null) {
       throw new Error(NOT_IMPLEMENTED);
     }
     const deps = this.deps;

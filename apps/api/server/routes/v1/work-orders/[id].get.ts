@@ -7,9 +7,10 @@ import {
 
 export default defineEventHandler(async (event) => {
   const operationId = newOperationId();
-  const id = getRouterParam(event, "id");
   try {
-    const result = await workComposition().inspectWorkOrder.execute({ id });
+    const result = await workComposition().inspectWorkOrder.execute({
+      workOrderId: getRouterParam(event, "id") ?? "",
+    });
     return envelope(operationId, "OK", result);
   } catch (error) {
     const mapping = mapWorkError(error);

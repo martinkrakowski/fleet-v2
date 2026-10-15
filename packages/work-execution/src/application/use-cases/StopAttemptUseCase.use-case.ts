@@ -126,7 +126,14 @@ export class StopAttemptUseCase implements StopAttemptPort {
   }
 
   async execute(input?: unknown): Promise<StopAttemptResult> {
-    if (!this.deps || !input || typeof input !== 'object') {
+    // Unconfigured is 501 and is checked before any request validation.
+    if (!this.deps) {
+      throw new Error('Not implemented: StopAttemptUseCase');
+    }
+    // A configured runtime still refuses a missing request object instead of
+    // inventing one; the HTTP boundary always supplies an object body, and an
+    // empty object body flows into the validation below as a refusal.
+    if (!input || typeof input !== 'object') {
       throw new Error('Not implemented: StopAttemptUseCase');
     }
     return this.stopAttempt(input as StopAttemptRequest);

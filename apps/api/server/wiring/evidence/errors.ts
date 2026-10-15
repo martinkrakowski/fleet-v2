@@ -32,9 +32,10 @@ export async function evidenceResponse(
   event: H3Event,
   useCase: EvidenceUseCase,
   operationId: string,
+  input?: unknown,
 ): Promise<ApiEnvelope> {
   try {
-    const result = await useCase.execute(undefined);
+    const result = await useCase.execute(input);
     return { operationId, code: "OK", result: (result as object) ?? null };
   } catch (error) {
     if (isNotImplemented(error)) {

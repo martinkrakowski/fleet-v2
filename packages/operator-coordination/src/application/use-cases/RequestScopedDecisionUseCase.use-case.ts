@@ -40,7 +40,14 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
   }
 
   async execute(input: unknown): Promise<RequestScopedDecisionResult> {
-    if (!this.deps || typeof input !== 'object' || input === null) {
+    // Unconfigured is 501 and is checked before any request validation.
+    if (!this.deps) {
+      throw new Error('Not implemented: RequestScopedDecisionUseCase');
+    }
+    // A configured runtime still refuses a missing request object instead of
+    // inventing one; the HTTP boundary always supplies an object body, and an
+    // empty object body is rejected by the field validation below.
+    if (typeof input !== 'object' || input === null) {
       throw new Error('Not implemented: RequestScopedDecisionUseCase');
     }
     const request = input as RequestScopedDecisionRequest;

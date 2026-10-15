@@ -4,11 +4,14 @@ import {
   mapWorkError,
   newOperationId,
 } from "../../../wiring/work/errors";
+import { readObjectBody } from "../../../wiring/http-input";
 
 export default defineEventHandler(async (event) => {
   const operationId = newOperationId();
   try {
-    const result = await workComposition().registerWorkOrder.execute(undefined);
+    const result = await workComposition().registerWorkOrder.execute(
+      await readObjectBody(event),
+    );
     return envelope(operationId, "OK", result);
   } catch (error) {
     const mapping = mapWorkError(error);

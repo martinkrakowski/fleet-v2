@@ -1,53 +1,72 @@
-// @generated entity stub — edit freely
+// @generated entity stub — refined for step 5.
 /**
- * AuthorizationConsumption is a domain entity with identity and lifecycle.
- *
- * Domain entities:
- * - Have unique identity (ID)
- * - Contain business logic and invariants
- * - Are mutable (unlike value objects)
- * - Enforce domain rules in their methods
- *
- * @example
- * const entity = new AuthorizationConsumption(id, props);
- * entity.performAction();
+ * AuthorizationConsumption is the child record binding one grant to one action
+ * id and attempt. It exists so reconciliation can prove which action a grant
+ * was spent on: a recorded consumption never authorizes a second, unrelated
+ * action.
  */
+
+import type { AuthorizationConsumptionRecord } from '../coordination-records.js';
+
 export class AuthorizationConsumption {
-  /**
-   * Constructor for AuthorizationConsumption entity.
-   *
-   * @param id - Unique identifier
-   * @param props - Entity properties
-   *
-   * TODO: Define your entity properties
-   * Example:
-   * constructor(
-   *   private readonly id: string,
-   *   private name: string,
-   *   private status: Status,
-   * ) {
-   *   // Validate invariants
-   * }
-   */
-  constructor(private readonly id: string) {
-    // TODO: Initialize entity state
-    // TODO: Validate invariants
+  private constructor(private readonly record: AuthorizationConsumptionRecord) {
+    // Invariants are validated in fromRecord.
   }
 
-  /**
-   * Get entity ID.
-   */
+  static fromRecord(record: AuthorizationConsumptionRecord): AuthorizationConsumption {
+    if (typeof record !== 'object' || record === null) {
+      throw new Error('AuthorizationConsumption requires a record');
+    }
+    for (const field of [
+      'consumptionId',
+      'grantId',
+      'requestId',
+      'actionId',
+      'attemptId',
+      'expectedHeadSha',
+      'consumedAtIso',
+    ] as const) {
+      const value = record[field];
+      if (typeof value !== 'string' || value.trim().length === 0) {
+        throw new Error(`AuthorizationConsumption requires a non-empty ${field}`);
+      }
+    }
+    return new AuthorizationConsumption({ ...record });
+  }
+
   getId(): string {
-    return this.id;
+    return this.record.consumptionId;
   }
 
-  /**
-   * TODO: Add domain methods here
-   * Example:
-   * performAction(): Result<void, Error> {
-   *   // Validate business rules
-   *   // Update state
-   *   // Return result
-   * }
-   */
+  toRecord(): AuthorizationConsumptionRecord {
+    return { ...this.record };
+  }
+
+  getGrantId(): string {
+    return this.record.grantId;
+  }
+
+  getActionId(): string {
+    return this.record.actionId;
+  }
+
+  getAttemptId(): string {
+    return this.record.attemptId;
+  }
+
+  isForGrant(grantId: string): boolean {
+    return this.record.grantId === grantId;
+  }
+
+  isForAction(actionId: string): boolean {
+    return this.record.actionId === actionId;
+  }
+
+  isForAttempt(attemptId: string): boolean {
+    return this.record.attemptId === attemptId;
+  }
+
+  equals(other: AuthorizationConsumption): boolean {
+    return this.record.consumptionId === other.record.consumptionId;
+  }
 }

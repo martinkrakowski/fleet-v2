@@ -1,59 +1,100 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for step 5.
 /**
- * ActionAuthorization is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = ActionAuthorization.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * ActionAuthorization is an immutable value object binding one grant to the
+ * proposal digest, project, exact action scope, expected commit, policy
+ * revision and decision revision. A signed answer authorizes only that exact
+ * action; it never becomes authority for an unrelated or privileged action.
  */
+
+export interface ActionAuthorizationProps {
+  readonly grantId: string;
+  readonly projectId: string;
+  readonly actionScope: string;
+  readonly expectedHeadSha: string;
+  readonly policyRevision: string;
+  readonly decisionRevision: string;
+  readonly consumed: boolean;
+}
+
+const REQUIRED_FIELDS = [
+  'grantId',
+  'projectId',
+  'actionScope',
+  'expectedHeadSha',
+  'policyRevision',
+  'decisionRevision',
+] as const;
+
 export class ActionAuthorization {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use ActionAuthorization.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly props: ActionAuthorizationProps) {
+    // Value is immutable after construction.
+  }
+
+  static create(
+    props: unknown,
+  ): { success: boolean; value?: ActionAuthorization; error?: Error } {
+    if (typeof props !== 'object' || props === null) {
+      return { success: false, error: new Error('ActionAuthorization requires props') };
+    }
+    const candidate = props as Partial<ActionAuthorizationProps>;
+    for (const field of REQUIRED_FIELDS) {
+      const value = candidate[field];
+      if (typeof value !== 'string' || value.trim().length === 0) {
+        return {
+          success: false,
+          error: new Error(`ActionAuthorization requires a non-empty ${field}`),
+        };
+      }
+    }
+    if (typeof candidate.consumed !== 'boolean') {
+      return { success: false, error: new Error('ActionAuthorization requires a boolean consumed') };
+    }
+    return {
+      success: true,
+      value: new ActionAuthorization({
+        grantId: candidate.grantId as string,
+        projectId: candidate.projectId as string,
+        actionScope: candidate.actionScope as string,
+        expectedHeadSha: candidate.expectedHeadSha as string,
+        policyRevision: candidate.policyRevision as string,
+        decisionRevision: candidate.decisionRevision as string,
+        consumed: candidate.consumed as boolean,
+      }),
+    };
+  }
+
+  getProps(): ActionAuthorizationProps {
+    return { ...this.props };
+  }
+
+  getGrantId(): string {
+    return this.props.grantId;
   }
 
   /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing ActionAuthorization or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<ActionAuthorization, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new ActionAuthorization(value) };
-   * }
+   * The grant applies only to the exact action scope and expected commit it
+   * recorded. A different scope or a moved head is a different action.
    */
-  static create(value: unknown): { success: boolean; value?: ActionAuthorization; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new ActionAuthorization(value) };
+  matchesAction(actionScope: string, expectedHeadSha: string): boolean {
+    return (
+      this.props.actionScope === actionScope && this.props.expectedHeadSha === expectedHeadSha
+    );
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
-    return this.value;
+  /** A consumed grant is durably bound to one action and never re-authorizes it. */
+  isConsumed(): boolean {
+    return this.props.consumed;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
   equals(other: ActionAuthorization): boolean {
-    return this.value === other.value;
+    return (
+      this.props.grantId === other.props.grantId &&
+      this.props.projectId === other.props.projectId &&
+      this.props.actionScope === other.props.actionScope &&
+      this.props.expectedHeadSha === other.props.expectedHeadSha &&
+      this.props.policyRevision === other.props.policyRevision &&
+      this.props.decisionRevision === other.props.decisionRevision &&
+      this.props.consumed === other.props.consumed
+    );
   }
 }

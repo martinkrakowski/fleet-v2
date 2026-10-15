@@ -16,6 +16,7 @@ export { type SemanticTone } from './tone';
 export { PageHeader, type PageHeaderProps } from './PageHeader';
 export { EmptyState, type EmptyStateProps } from './EmptyState';
 export { Banner, type BannerProps } from './Banner';
+export { AlertBox, type AlertBoxProps } from './AlertBox';
 export {
   Button,
   type ButtonProps,

@@ -1,4 +1,8 @@
+"use client";
+
+import { useState } from "react";
 import {
+  AlertBox,
   Banner,
   Button,
   Card,
@@ -36,6 +40,8 @@ function opTone(op: string): SemanticTone {
 export function OperationsSidebar({ attempt, word }: { attempt: Attempt; word: string }) {
   const legalOps = ["reconcile", "stop", "collect", "fix", "merge"];
   const isUnknown = word === "unknown";
+  const [pendingOp, setPendingOp] = useState<string | null>(null);
+  const [confirmedOp, setConfirmedOp] = useState<{ op: string; at: string } | null>(null);
 
   const enabledOps = legalOps.filter((op) => {
     if (!attempt.legal.includes(op)) return false;
@@ -74,6 +80,7 @@ export function OperationsSidebar({ attempt, word }: { attempt: Attempt; word: s
               data-action="op"
               data-op={op}
               data-att={attempt.id}
+              onClick={() => setPendingOp(op)}
             >
               <span className={styles.opTitle}>
                 <b>{OP_LABELS[op] || op}</b>
@@ -86,6 +93,16 @@ export function OperationsSidebar({ attempt, word }: { attempt: Attempt; word: s
             </Button>
           ))}
         </div>
+
+        {confirmedOp !== null ? (
+          <Banner
+            tone={opTone(confirmedOp.op)}
+            className={styles.bannerSpacing}
+            title={`${OP_LABELS[confirmedOp.op] || confirmedOp.op} confirmed · ${confirmedOp.at}`}
+          >
+            Confirmed in this browser for {attempt.id}. No live mutation left this station.
+          </Banner>
+        ) : null}
 
         {notOfferedRows.length > 0 && (
           <div className={styles.notOfferedWrap}>
@@ -122,6 +139,26 @@ export function OperationsSidebar({ attempt, word }: { attempt: Attempt; word: s
           </Banner>
         )}
       </CardBody>
+      <AlertBox
+        open={pendingOp !== null}
+        tone={pendingOp ? opTone(pendingOp) : "neutral"}
+        title={pendingOp ? `${OP_LABELS[pendingOp] || pendingOp} · ${attempt.id}` : ""}
+        meta={`work order ${attempt.wo}`}
+        confirmLabel={pendingOp ? OP_LABELS[pendingOp] || pendingOp : "Confirm"}
+        cancelLabel="Cancel"
+        onCancel={() => setPendingOp(null)}
+        onConfirm={() => {
+          if (pendingOp) {
+            const at = new Date().toISOString().slice(11, 19) + "Z";
+            setConfirmedOp({ op: pendingOp, at });
+          }
+          setPendingOp(null);
+        }}
+      >
+        {pendingOp ? OP_DESC[pendingOp] : ""}{" "}
+        Confirming records this operation intent in the browser only; live runner and forge routes
+        are not triggered from this station without explicit authority.
+      </AlertBox>
     </Card>
   );
 }

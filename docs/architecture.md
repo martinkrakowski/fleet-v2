@@ -17,7 +17,7 @@ service.
 ```text
 apps/cli → all four contexts
 apps/api → all four contexts
-apps/web → HTTP API boundary (future integration)
+apps/web → @fleet/ui (presentation primitives) + HTTP API boundary
 work-execution → evidence-and-acceptance
 work-execution → brief-knowledge
 work-execution → operator-coordination
@@ -72,11 +72,23 @@ Retrieval proposes context; the orchestrator decides what enters the frozen brie
 6. Pilot checked lessons and scoped lexical retrieval before adding richer indexes.
 7. Implement authorised forge actions and prove stale-head rejection before merge.
 
-The web app currently has no domain-package dependencies. Its future operator
-views call the API boundary; API routes delegate to application ports. Generating
-these applications does not connect live dispatch or migrate existing operations.
+Each station is implemented across the four bounded contexts and is reachable
+from both composition roots: `@fleet/cli` through `node apps/cli/dist/bin.js`, and
+`@fleet/api` through its Nitro `/v1/*` routes. `@fleet/ui` carries the shared
+presentation primitives; `@fleet/web` is the presentation boundary that renders
+operator views over `@fleet/api`.
 
-No script is replaced solely to change language. Keep private hosts, paths, project
+Two boundaries remain deliberately open. First, `@fleet/web` ships a typed HTTP
+client and its views render fixture state: no view fetches yet, and the read
+routes those views would need (`GET /v1/attempts`, `GET /v1/capacity`,
+`GET /v1/briefs/:workOrderId`, the knowledge list routes) are still undeclared
+gaps. Second, live external transports — the attention reader, the verification
+and review executors, and the staging Kubernetes runtime — stay unbound until a
+host supplies them, so they report `unavailable` rather than inventing a result.
+
+Every action control in `@fleet/web` confirms through `@fleet/ui`'s `AlertBox`
+before it runs, and states on screen whether a live route backs it. No script is
+replaced solely to change language. Keep private hosts, paths, project
 registries, seat choices and operational history outside reusable product code.
 
 ## Acceptance for the scaffold

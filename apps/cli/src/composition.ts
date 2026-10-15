@@ -99,6 +99,14 @@ import {
 export interface FleetCliRuntimeOptions {
   /** Directory for file-backed state; every store is in-memory when omitted. */
   readonly stateDir?: string;
+  /** Agent, model and variant handed to the live runner subprocess. */
+  readonly runnerAgent?: string;
+  readonly runnerModel?: string;
+  readonly runnerVariant?: string;
+  /** Port the runner subprocess reaches its remote session server on. */
+  readonly runnerRemotePort?: number;
+  /** SSH host alias holding the worktree when it is not on this host. */
+  readonly worktreeSshHost?: string;
 }
 
 /** Deterministic identity of the acceptance assessment bound to one attempt. */
@@ -148,6 +156,45 @@ export function forgeActionScope(kind: 'push-and-open-pr' | 'merge-pr'): string 
   return `forge:${kind}`;
 }
 
+/** Single-quote one argument for the remote POSIX shell. */
+function posixQuote(value: string): string {
+  return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
+/**
+ * Replace the argument following one flag when the operator supplied an
+ * override. A blank or absent override leaves the reviewed argument alone, so
+ * the default invocation is unchanged.
+ */
+function replaceArgumentAfter(
+  args: readonly string[],
+  flag: string,
+  override: string | undefined,
+): readonly string[] {
+  if (override === undefined || override === '') return args;
+  const index = args.indexOf(flag);
+  if (index === -1 || index + 1 >= args.length) return args;
+  const replaced = [...args];
+  replaced[index + 1] = override;
+  return replaced;
+}
+
+/**
+ * Operator overrides for the reviewed GitHub CLI argument array. The fleet
+ * still chooses which command runs; only the human-readable title, body and
+ * merge cleanup come from the operator's own environment, never from a lane.
+ */
+function applyGhEnvironmentOverrides(args: readonly string[]): readonly string[] {
+  if (args[0] === 'pr' && args[1] === 'create') {
+    const withTitle = replaceArgumentAfter(args, '--title', process.env.FLEET_PR_TITLE?.trim());
+    return replaceArgumentAfter(withTitle, '--body', process.env.FLEET_PR_BODY?.trim());
+  }
+  if (args[0] === 'pr' && args[1] === 'merge' && process.env.FLEET_PR_DELETE_BRANCH === '1') {
+    return [...args, '--delete-branch'];
+  }
+  return args;
+}
+
 /**
  * Run the reviewed GitHub CLI subprocess for the forge adapter. A completed
  * invocation resolves with its exit code and captured output; a spawn failure
@@ -156,7 +203,7 @@ export function forgeActionScope(kind: 'push-and-open-pr' | 'merge-pr'): string 
  */
 function runGhSubprocess(args: readonly string[]): Promise<GhInvocationResult> {
   return new Promise((resolve, reject) => {
-    execFile('gh', [...args], { encoding: 'utf8' }, (error, stdout, stderr) => {
+    execFile('gh', [...applyGhEnvironmentOverrides(args)], { encoding: 'utf8' }, (error, stdout, stderr) => {
       if (error === null) {
         resolve({ exitCode: 0, stdout: String(stdout), stderr: String(stderr) });
         return;
@@ -175,10 +222,35 @@ function runGhSubprocess(args: readonly string[]): Promise<GhInvocationResult> {
  * Read the live HEAD commit of a directory with `git rev-parse`. A spawn
  * failure (missing binary, unreadable worktree) rejects so the forge adapter
  * reports the outcome as ambiguous for reconciliation instead of guessing.
+ * When the worktree lives on another host, the same read-only rev-parse runs
+ * over the reviewed ssh alias instead.
  */
-function readGitHead(worktreePath: string): Promise<string> {
+function readGitHead(worktreePath: string, sshHost?: string): Promise<string> {
+  const invocation =
+    sshHost !== undefined && !existsSync(worktreePath)
+      ? {
+          command: 'ssh',
+          args: [
+            sshHost,
+            ['git', '-C', worktreePath, 'rev-parse', 'HEAD'].map(posixQuote).join(' '),
+          ],
+        }
+      : { command: 'git', args: ['-C', worktreePath, 'rev-parse', 'HEAD'] };
   return new Promise((resolve, reject) => {
-    execFile('git', ['-C', worktreePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }, (error, stdout) => {
+    execFile(invocation.command, invocation.args, { encoding: 'utf8' }, (error, stdout) => {
+      if (error === null) {
+        resolve(String(stdout).trim());
+        return;
+      }
+      reject(error);
+    });
+  });
+}
+
+/** Run one local git command, resolving with stdout or rejecting on failure. */
+function runGitCommand(args: readonly string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile('git', [...args], { encoding: 'utf8' }, (error, stdout) => {
       if (error === null) {
         resolve(String(stdout).trim());
         return;
@@ -269,6 +341,19 @@ export interface FleetCliRuntime {
 
 export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCliRuntime {
   const stateDir = options?.stateDir;
+
+  // --- live runner / worktree host configuration -----------------------------
+  // Explicit options win; the environment is the operator's installation
+  // configuration. A blank value is treated as absent rather than as "".
+  const worktreeSshHost =
+    options?.worktreeSshHost ?? (process.env.FLEET_WORKTREE_SSH_HOST?.trim() || undefined);
+  const runnerAgent = options?.runnerAgent ?? (process.env.FLEET_RUNNER_AGENT?.trim() || undefined);
+  const runnerModel = options?.runnerModel ?? (process.env.FLEET_RUNNER_MODEL?.trim() || undefined);
+  const runnerVariant =
+    options?.runnerVariant ?? (process.env.FLEET_RUNNER_VARIANT?.trim() || undefined);
+  const parsedPort = process.env.OCM_REMOTE_PORT ? Number(process.env.OCM_REMOTE_PORT) : Number.NaN;
+  const runnerRemotePort =
+    options?.runnerRemotePort ?? (Number.isFinite(parsedPort) ? parsedPort : undefined);
 
   // --- operator-coordination -------------------------------------------------
 
@@ -414,10 +499,19 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const workOrderRepository = new WorkOrderRepositoryAdapter({ stateDir });
   const attemptRepository = new AttemptRepositoryAdapter({ stateDir });
   const executionJournal = new ExecutionJournalAdapter({ stateDir });
-  const workspace = new WorkspaceAdapter();
-  // Wraps the reviewed `ocm-run` subprocess resolved from PATH.
-  const runner = new ExecutionRunnerAdapter();
-  const attemptArtifact = new AttemptArtifactAdapter();
+  const workspace = new WorkspaceAdapter({ sshHost: worktreeSshHost });
+  // Wraps the reviewed `ocm-run` subprocess resolved from PATH. The worktree
+  // locator is resolved from the recorded attempt so a later CLI process
+  // (reconcile, stop, collect) addresses the same directory the dispatch used.
+  const runner = new ExecutionRunnerAdapter({
+    agent: runnerAgent,
+    model: runnerModel,
+    variant: runnerVariant,
+    remotePort: runnerRemotePort,
+    resolveWorktreePath: async (attemptId) =>
+      (await attemptRepository.findAttemptById(attemptId))?.worktreePath ?? null,
+  });
+  const attemptArtifact = new AttemptArtifactAdapter({ sshHost: worktreeSshHost });
   // Hand-written brief files arrive per request; no default prose is assumed.
   const briefAuthoring = new BriefAuthoringAdapter();
   // The reviewed GitHub CLI subprocess behind a host-side delegate; every
@@ -425,12 +519,30 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // a moved branch head is never pushed or merged on stale readiness.
   const forgeAction = new ForgeActionAdapter({
     runGh: runGhSubprocess,
-    verifyCurrentHeadSha: async (_branchName, request) => {
+    verifyCurrentHeadSha: async (branchName, request) => {
       const attempt = await attemptRepository.findAttemptById(request.attemptId);
       if (attempt === null) {
         throw new Error(`No attempt is recorded for ${request.attemptId}`);
       }
-      return readGitHead(attempt.worktreePath);
+      const head = await readGitHead(attempt.worktreePath, worktreeSshHost);
+      // A worktree that lives on another host has its branch only on that
+      // host's repository; `gh pr create` needs the branch on origin, so the
+      // verified head is fetched across and pushed before the PR is opened.
+      const branchRef = `${head}:refs/heads/${branchName}`;
+      const shouldSeedOrigin =
+        request.kind === 'push-and-open-pr' &&
+        head === request.expectedHeadSha &&
+        (worktreeSshHost !== undefined || process.env.FLEET_FORGE_PUSH_ORIGIN === '1');
+      if (shouldSeedOrigin && worktreeSshHost !== undefined && !existsSync(attempt.worktreePath)) {
+        await runGitCommand([
+          'fetch',
+          `${worktreeSshHost}:${attempt.worktreePath}`,
+          branchRef,
+          '--force',
+        ]);
+        await runGitCommand(['push', '-f', 'origin', branchRef]);
+      }
+      return head;
     },
   });
 

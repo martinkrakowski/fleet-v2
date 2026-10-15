@@ -1,6 +1,7 @@
 import type { ReactElement } from 'react';
 import {
   Accordion,
+  AlertBox,
   Banner,
   Badge,
   Button,
@@ -150,6 +151,22 @@ const stepperElement: ReactElement = (
 );
 const chipElement: ReactElement = <Chip tone="warn" mono title="route gap">gap</Chip>;
 
+const alertBoxElement: ReactElement = (
+  <AlertBox
+    open
+    tone="accent"
+    title="Freeze the brief for wo-0144"
+    meta="3 of 5 rows included"
+    confirmLabel="Freeze the brief"
+    cancelLabel="Cancel"
+    confirmDisabled={false}
+    onConfirm={() => undefined}
+    onCancel={() => undefined}
+  >
+    this writes a digest
+  </AlertBox>
+);
+
 export {
   badgeKindsAreExact,
   factStatesAreExact,
@@ -179,4 +196,5 @@ export {
   keyValueListElement,
   stepperElement,
   chipElement,
+  alertBoxElement,
 };

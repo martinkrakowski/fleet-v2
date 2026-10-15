@@ -1,6 +1,8 @@
 "use client";
 
+import { useState } from "react";
 import {
+  AlertBox,
   Banner,
   Button,
   Card,
@@ -35,6 +37,8 @@ export function FrozenBriefCard({
   dispatched,
   onDispatch,
 }: FrozenBriefCardProps) {
+  const [confirmDispatchOpen, setConfirmDispatchOpen] = useState(false);
+
   return (
     <Card>
       <CardHeader
@@ -75,7 +79,11 @@ export function FrozenBriefCard({
           ) : (
             <div className={styles.freezeBar}>
               <span className={styles.sum}>the package is frozen; the intent is not recorded yet</span>
-              <Button variant="solid" tone="accent" onClick={onDispatch}>
+              <Button
+                variant="solid"
+                tone="accent"
+                onClick={() => setConfirmDispatchOpen(true)}
+              >
                 Dispatch the intent
               </Button>
               <RouteChip>POST /v1/attempts</RouteChip>
@@ -92,6 +100,23 @@ export function FrozenBriefCard({
           </Banner>
         </CardFooter>
       )}
+      <AlertBox
+        open={confirmDispatchOpen}
+        tone="accent"
+        title={`Dispatch the intent for ${digest}`}
+        meta="POST /v1/attempts"
+        confirmLabel="Dispatch the intent"
+        cancelLabel="Cancel"
+        onCancel={() => setConfirmDispatchOpen(false)}
+        onConfirm={() => {
+          setConfirmDispatchOpen(false);
+          onDispatch();
+        }}
+      >
+        The package is frozen; dispatching records the intent so the Line holds it until a slot
+        frees. Neither button fetches on this station: the live freeze and dispatch routes are not
+        on this station, so confirming updates client state only.
+      </AlertBox>
     </Card>
   );
 }

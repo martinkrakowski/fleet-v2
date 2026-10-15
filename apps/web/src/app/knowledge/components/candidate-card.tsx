@@ -1,7 +1,8 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { Badge, Banner, Button, KeyValueList, KeyValueRow } from "@fleet/ui";
+import { useState } from "react";
+import { AlertBox, Badge, Banner, Button, KeyValueList, KeyValueRow } from "@fleet/ui";
 import type { Candidate } from "../fixture";
 import styles from "../knowledge.module.css";
 
@@ -89,6 +90,7 @@ export function CandidateCard({
   onDisposition: (id: string, kind: DispositionKind) => void;
 }) {
   const decided = disposition !== undefined;
+  const [pendingKind, setPendingKind] = useState<DispositionKind | null>(null);
   return (
     <article className={styles.cand}>
       <div className={styles.ch}>
@@ -147,12 +149,31 @@ export function CandidateCard({
               tone={OPS[kind].tone}
               size="sm"
               disabled={decided}
-              onClick={() => onDisposition(cand.id, kind)}
+              onClick={() => setPendingKind(kind)}
             >
               {OPS[kind].icon} {OPS[kind].label}
             </Button>
           ))}
       </div>
+      <AlertBox
+        open={pendingKind !== null}
+        tone={pendingKind ? OPS[pendingKind].tone : "neutral"}
+        title={pendingKind ? `${OPS[pendingKind].label} · ${cand.id}` : ""}
+        meta={`source ${cand.source}`}
+        confirmLabel={pendingKind ? OPS[pendingKind].label : "Confirm"}
+        cancelLabel="Cancel"
+        onCancel={() => setPendingKind(null)}
+        onConfirm={() => {
+          if (pendingKind) {
+            onDisposition(cand.id, pendingKind);
+          }
+          setPendingKind(null);
+        }}
+      >
+        Claim: &ldquo;{cand.claim}&rdquo;. Confirming &ldquo;
+        {pendingKind ? OPS[pendingKind].label : ""}&rdquo; records this disposition in this browser
+        only; no keeper or policy file is written from this station.
+      </AlertBox>
     </article>
   );
 }

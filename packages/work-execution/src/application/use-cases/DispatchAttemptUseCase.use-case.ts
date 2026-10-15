@@ -116,10 +116,19 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         reason: `Worktree ${request.worktreePath} has untracked files: ${inspection.untrackedPaths.join(', ')}`,
       };
     }
-    if (inspection.residueFromEarlierAttempts.length > 0) {
+    const preparedBriefInWorktree =
+      request.briefPackagePath === '.lane/brief.md' ||
+      request.briefPackagePath === `${request.worktreePath.replace(/\/+$/, '')}/.lane/brief.md`;
+    const activeBriefFiles = preparedBriefInWorktree
+      ? new Set(['.lane/brief.md', '.lane/brief-manifest.json'])
+      : new Set<string>();
+    const unexpectedResidue = inspection.residueFromEarlierAttempts.filter(
+      (entry) => !activeBriefFiles.has(entry),
+    );
+    if (unexpectedResidue.length > 0) {
       return {
         outcome: 'refused',
-        reason: `Worktree ${request.worktreePath} contains residue from earlier attempts: ${inspection.residueFromEarlierAttempts.join(', ')}`,
+        reason: `Worktree ${request.worktreePath} contains residue from earlier attempts: ${unexpectedResidue.join(', ')}`,
       };
     }
 

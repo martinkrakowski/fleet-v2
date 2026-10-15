@@ -1,15 +1,13 @@
 "use client";
 
 import { useState } from "react";
-import { PageHeader, RouteChip } from "@fleet/ui";
+import { AlertBox, Button, PageHeader } from "@fleet/ui";
 import { FIXTURE } from "./fixture";
 import { WorkOrderListCard } from "./components/work-order-list-card";
 import { BriefManifestCard } from "./components/brief-manifest-card";
 import { ProposalTableCard } from "./components/proposal-table-card";
 import { FrozenBriefCard } from "./components/frozen-brief-card";
 import styles from "./brief.module.css";
-
-const FREEZE_ROUTE_NOTE = "gap · the live freeze route is not on this station";
 
 function clientDigest(text: string): string {
   let h = 0x811c9dc5;
@@ -44,6 +42,7 @@ export default function BriefPage() {
   );
   const [frozen, setFrozen] = useState<ClientFrozen | null>(null);
   const [dispatchedWo, setDispatchedWo] = useState<string | null>(null);
+  const [confirmFreezeOpen, setConfirmFreezeOpen] = useState(false);
 
   const woIds = Object.keys(FIXTURE.workOrders);
   const frozenIds = woIds.filter((w) => Boolean(FIXTURE.frozenPackages[w]) || frozen?.wo === w);
@@ -73,6 +72,8 @@ export default function BriefPage() {
       ? FIXTURE.frozenPackages[woId]?.digest ?? frozen?.digest ?? "frozen"
       : "needs a brief";
 
+  const includedCount = FIXTURE.proposals.filter((p) => Boolean(include[p.id])).length;
+
   return (
     <div className={styles.stack}>
       <PageHeader
@@ -85,7 +86,16 @@ export default function BriefPage() {
             read-only — nothing inside it is a control.
           </>
         }
-        actions={<RouteChip gap>{FREEZE_ROUTE_NOTE}</RouteChip>}
+        actions={
+          <Button
+            variant="solid"
+            tone="accent"
+            onClick={() => setConfirmFreezeOpen(true)}
+            disabled={isFrozen || includedCount === 0}
+          >
+            Freeze the brief
+          </Button>
+        }
       />
       <div className={styles.grid}>
         <WorkOrderListCard
@@ -107,7 +117,6 @@ export default function BriefPage() {
                 onToggle={(proposalId) =>
                   setInclude((s) => ({ ...s, [proposalId]: !s[proposalId] }))
                 }
-                onFreeze={freeze}
               />
             </>
           ) : (
@@ -119,7 +128,6 @@ export default function BriefPage() {
                   locked
                   headerNote={`locked · ${shown.digest}`}
                   onToggle={() => undefined}
-                  onFreeze={freeze}
                 />
               ) : null}
               <FrozenBriefCard
@@ -136,6 +144,24 @@ export default function BriefPage() {
           )}
         </div>
       </div>
+      <AlertBox
+        open={confirmFreezeOpen}
+        tone="accent"
+        title={`Freeze the brief for ${sel}`}
+        meta={`${includedCount} of ${FIXTURE.proposals.length} rows included`}
+        confirmLabel="Freeze the brief"
+        cancelLabel="Cancel"
+        confirmDisabled={includedCount === 0}
+        onCancel={() => setConfirmFreezeOpen(false)}
+        onConfirm={() => {
+          setConfirmFreezeOpen(false);
+          freeze();
+        }}
+      >
+        Freeze is its own step. Dispatch follows separately as a second button. Neither button
+        fetches on this station: the live freeze route is not here, and the pending include and
+        exclude choices above are client state until a freeze writes a digest.
+      </AlertBox>
     </div>
   );
 }

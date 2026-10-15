@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, CSSProperties, ReactNode } from 'react';
+import type { ButtonHTMLAttributes, CSSProperties, ReactNode, Ref } from 'react';
 import { toneClassKey, type SemanticTone } from './tone';
 import classes from './Button.module.css';
 
@@ -12,6 +12,7 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   children: ReactNode;
   className?: string;
   style?: CSSProperties;
+  ref?: Ref<HTMLButtonElement>;
 }
 
 const SIZE_CLASS: Record<ButtonSize, string> = {
@@ -27,6 +28,7 @@ export function Button({
   type = 'button',
   className,
   style,
+  ref,
   children,
   ...rest
 }: ButtonProps) {
@@ -43,7 +45,7 @@ export function Button({
       .filter(Boolean)
       .join(' ') || undefined;
   return (
-    <button type={type} className={composed} style={style} {...rest}>
+    <button type={type} ref={ref} className={composed} style={style} {...rest}>
       {children}
     </button>
   );

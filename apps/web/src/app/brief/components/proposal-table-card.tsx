@@ -2,8 +2,6 @@
 
 import {
   Badge,
-  Banner,
-  Button,
   Card,
   CardBody,
   CardFooter,
@@ -33,7 +31,6 @@ export interface ProposalTableCardProps {
   locked: boolean;
   headerNote?: string;
   onToggle: (proposalId: string) => void;
-  onFreeze: () => void;
 }
 
 export function ProposalTableCard({
@@ -42,7 +39,6 @@ export function ProposalTableCard({
   locked,
   headerNote,
   onToggle,
-  onFreeze,
 }: ProposalTableCardProps) {
   const includedCount = proposals.filter((p) => Boolean(include[p.id])).length;
 
@@ -130,21 +126,8 @@ export function ProposalTableCard({
               {includedCount} of {proposals.length} rows included · freeze computes the digest ·
               nothing changes after
             </span>
-            <Button
-              variant="solid"
-              tone="accent"
-              onClick={onFreeze}
-              disabled={includedCount === 0}
-            >
-              Freeze the brief
-            </Button>
             <RouteChip gap>{FREEZE_ROUTE_NOTE}</RouteChip>
           </div>
-          <Banner tone="neutral">
-            Freeze is its own step. Dispatch follows separately as a second button. Neither button
-            fetches on this station: the live freeze route is not here, and the pending include and
-            exclude choices above are client state until a freeze writes a digest.
-          </Banner>
         </CardFooter>
       )}
     </Card>

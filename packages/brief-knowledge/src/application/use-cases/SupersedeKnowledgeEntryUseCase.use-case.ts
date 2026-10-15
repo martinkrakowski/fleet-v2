@@ -1,6 +1,86 @@
-// @generated use-case scaffold — no operation is implemented.
-export class SupersedeKnowledgeEntryUseCase {
-  async execute(_input: unknown): Promise<never> {
-    throw new Error('Not implemented: SupersedeKnowledgeEntryUseCase');
+// Implemented for lane bk-usecases-adapters (migration step 6).
+/**
+ * SupersedeKnowledgeEntryUseCase: link a checked correction to the older entry
+ * it replaces and exclude superseded content from normal retrieval.
+ */
+
+import type { KnowledgeEntryRecord } from '../../domain/knowledge-records.js';
+import type {
+  SupersedeKnowledgeEntryPort,
+  SupersedeKnowledgeEntryRequest,
+  SupersedeKnowledgeEntryResult,
+} from '../ports/in/SupersedeKnowledgeEntryPort.in-port.js';
+import type { KnowledgeEntryRepositoryPort } from '../ports/out/KnowledgeEntryRepositoryPort.out-port.js';
+
+export interface SupersedeKnowledgeEntryDependencies {
+  readonly repo: KnowledgeEntryRepositoryPort;
+}
+
+export class SupersedeKnowledgeEntryUseCase implements SupersedeKnowledgeEntryPort {
+  constructor(private readonly deps?: SupersedeKnowledgeEntryDependencies) {}
+
+  async execute(request: SupersedeKnowledgeEntryRequest): Promise<SupersedeKnowledgeEntryResult> {
+    return this.supersedeKnowledgeEntry(request);
   }
+
+  async supersedeKnowledgeEntry(
+    request: SupersedeKnowledgeEntryRequest,
+  ): Promise<SupersedeKnowledgeEntryResult> {
+    if (!this.deps || !isValidRequest(request)) {
+      throw new Error('Not implemented: SupersedeKnowledgeEntryUseCase');
+    }
+    if (isBlank(request.olderEntryId)) {
+      return { outcome: 'rejected', reason: 'SupersedeKnowledgeEntry requires a non-empty olderEntryId' };
+    }
+    if (isBlank(request.newerEntryId)) {
+      return { outcome: 'rejected', reason: 'SupersedeKnowledgeEntry requires a non-empty newerEntryId' };
+    }
+    if (isBlank(request.checkerId)) {
+      return { outcome: 'rejected', reason: 'SupersedeKnowledgeEntry requires a non-empty checkerId' };
+    }
+    if (isBlank(request.reason)) {
+      return { outcome: 'rejected', reason: 'SupersedeKnowledgeEntry requires a non-empty reason' };
+    }
+    if (request.olderEntryId === request.newerEntryId) {
+      return {
+        outcome: 'rejected',
+        reason: 'SupersedeKnowledgeEntry requires distinct olderEntryId and newerEntryId',
+      };
+    }
+
+    const repo = this.deps.repo;
+    const olderEntry = await repo.findEntryById(request.olderEntryId);
+    if (!olderEntry) {
+      return { outcome: 'rejected', reason: `Knowledge entry not found: ${request.olderEntryId}` };
+    }
+    const newerEntry = await repo.findEntryById(request.newerEntryId);
+    if (!newerEntry) {
+      return { outcome: 'rejected', reason: `Knowledge entry not found: ${request.newerEntryId}` };
+    }
+    if (newerEntry.disposition !== 'accepted') {
+      return { outcome: 'rejected', reason: 'Only accepted entries may supersede an older entry' };
+    }
+
+    const nowIso = request.nowIso ?? new Date().toISOString();
+    const updatedOlder: KnowledgeEntryRecord = {
+      ...olderEntry,
+      disposition: 'superseded',
+      supersededById: newerEntry.id,
+      checkerId: request.checkerId,
+      dispositionReason: request.reason,
+      revision: olderEntry.revision + 1,
+      updatedAtIso: nowIso,
+    };
+    await repo.saveEntry(updatedOlder);
+
+    return { outcome: 'superseded', olderEntry: updatedOlder, newerEntry };
+  }
+}
+
+function isValidRequest(request: unknown): request is SupersedeKnowledgeEntryRequest {
+  return typeof request === 'object' && request !== null && !Array.isArray(request);
+}
+
+function isBlank(value: unknown): boolean {
+  return typeof value !== 'string' || value.trim().length === 0;
 }

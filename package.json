@@ -1,5 +1,6 @@
 {
   "name": "fleet",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "packageManager": "yarn@4.12.0",

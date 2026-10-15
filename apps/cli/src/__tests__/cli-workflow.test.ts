@@ -10,7 +10,15 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
@@ -1086,5 +1094,610 @@ describe('Fleet CLI workflow', () => {
     const notFoundEvidence = await cli(['evidence', 'inspect', '--json', '{}']);
     expect(notFoundEvidence.code).toBe(1);
     expect(jsonOf(notFoundEvidence)).toEqual({ outcome: 'not-found', query: '' });
+  });
+
+  it('completes the merge across separate runCli processes on one state dir', async () => {
+    // Cutover pilot: every invocation below omits the injected `runtime`
+    // argument, so each command composes a brand-new FleetCliRuntime loaded
+    // solely from `multiProcStateDir` on disk. Receipts and coordinates
+    // recorded by an earlier invocation must be reloaded from
+    // `<stateDir>/accepted-receipts.json` and
+    // `<stateDir>/authorization-coordinates.json` for the final merge to pass.
+    const multiProcStateDir = path.join(suiteDir, 'mp-state');
+    const multiProcLaneRepo = path.join(suiteDir, 'mp-lane-repo');
+    const multiProcBriefRepo = path.join(suiteDir, 'mp-brief-repo');
+    const multiProcBriefFile = path.join(suiteDir, 'mp-handwritten-brief.md');
+    const mpWorkOrderId = 'wo-mp-1';
+    const mpAttemptId = 'attempt-mp-1';
+    mkdirSync(multiProcStateDir);
+    const mpLaneHead = initGitRepo(multiProcLaneRepo, []);
+    initGitRepo(multiProcBriefRepo, ['.lane/', 'docs/demo-summary.md']);
+    writeFileSync(
+      multiProcBriefFile,
+      [
+        '# Work order wo-mp-1',
+        '',
+        'Run yarn lint and yarn build for the demo package, then summarize',
+        'the result in docs/demo-summary.md.',
+        '',
+      ].join('\n'),
+    );
+    // Owner-recorded approved answer read by the decision transport of every
+    // fresh runtime against this state dir.
+    const mpDecisionsDir = path.join(multiProcStateDir, 'decisions');
+    mkdirSync(mpDecisionsDir);
+    writeFileSync(
+      path.join(mpDecisionsDir, 'dec-mp-1.json'),
+      `${JSON.stringify({ state: 'approved', decisionRevision: 'dec-mp-1-r1', grantId: 'grant-mp-1' }, null, 2)}\n`,
+    );
+
+    const mpCli = async (argv: readonly string[]): Promise<Invocation> => {
+      const out: string[] = [];
+      const err: string[] = [];
+      const io: CliIo = {
+        stdout: (text) => {
+          out.push(text);
+        },
+        stderr: (text) => {
+          err.push(text);
+        },
+      };
+      // No third argument: this invocation rebuilds the runtime from disk.
+      const code = await runCli(['--state-dir', multiProcStateDir, ...argv], io);
+      return { code, text: out.join(''), stderr: err.join('') };
+    };
+
+    // --- process: operator-coordination profile -----------------------------
+    const profile = await mpCli([
+      'coordination',
+      'register-profile',
+      '--json',
+      jsonArg({
+        projectId: PROJECT_ID,
+        displayName: 'Multi-Process Project',
+        repository: 'github.com/org/repo',
+        designatedDispatcherHost: 'host-1',
+        policyRevision: POLICY_REVISION,
+        maxConcurrentLanes: 2,
+        runnerCapabilities: { 'scoped-worktree': true, networkEgressRestricted: true },
+      }),
+    ]);
+    expect(profile.code).toBe(0);
+    expect(jsonOf(profile)).toMatchObject({ outcome: 'registered' });
+
+    // --- process: work-execution work order ---------------------------------
+    const workOrder = await mpCli([
+      'work-order',
+      'register',
+      '--json',
+      jsonArg({
+        workOrderId: mpWorkOrderId,
+        projectId: PROJECT_ID,
+        taskId: 'task-mp-1',
+        laneId: 'lane-mp-1',
+        repository: 'github.com/org/repo',
+        baseCommit: mpLaneHead,
+        ownedPaths: ['packages/demo/src'],
+        policyRevision: POLICY_REVISION,
+      }),
+    ]);
+    expect(workOrder.code).toBe(0);
+    expect(jsonOf(workOrder)).toMatchObject({
+      outcome: 'registered',
+      workOrder: { id: mpWorkOrderId, state: 'approved', baseCommit: mpLaneHead },
+    });
+
+    // --- process: brief-knowledge keeper lifecycle ---------------------------
+    const capture = await mpCli([
+      'knowledge',
+      'capture-notes',
+      '--json',
+      jsonArg({
+        projectId: PROJECT_ID,
+        attemptId: 'attempt-mp-seed-1',
+        workOrderId: mpWorkOrderId,
+        headCommitSha: mpLaneHead,
+        notesMarkdown: '- Run yarn lint before yarn build in the demo package\n',
+        pathPrefixes: ['packages/demo'],
+      }),
+    ]);
+    expect(capture.code).toBe(0);
+    const captured = jsonOf<{ candidateEntries: { id: string }[] }>(capture);
+    const mpEntryId = captured.candidateEntries[0].id;
+
+    const check = await mpCli([
+      'knowledge',
+      'check-claim',
+      '--json',
+      jsonArg({
+        checkId: 'check-mp-1',
+        entryId: mpEntryId,
+        checkerId: 'checker-1',
+        procedureName: 'confirm-path-exists',
+        targetPath: multiProcBriefFile,
+      }),
+    ]);
+    expect(check.code).toBe(0);
+    expect(jsonOf(check)).toMatchObject({ outcome: 'checked', entry: { verification: 'supported' } });
+
+    const decide = await mpCli([
+      'knowledge',
+      'decide',
+      '--json',
+      jsonArg({
+        entryId: mpEntryId,
+        disposition: 'accepted',
+        checkerId: 'checker-1',
+        reason: 'Verified against the repository layout',
+      }),
+    ]);
+    expect(decide.code).toBe(0);
+    expect(jsonOf(decide)).toMatchObject({ outcome: 'decided', entry: { disposition: 'accepted' } });
+
+    const proposals = await mpCli([
+      'knowledge',
+      'propose-context',
+      '--json',
+      jsonArg({
+        projectId: PROJECT_ID,
+        laneId: 'lane-mp-1',
+        taskSummary: 'Run yarn lint before yarn build in the demo package',
+      }),
+    ]);
+    expect(proposals.code).toBe(0);
+    const proposed = jsonOf<{
+      outcome: string;
+      proposals: { proposalId: string; knowledgeEntryId: string; version: string }[];
+    }>(proposals);
+    expect(proposed.outcome).toBe('proposed');
+    expect(proposed.proposals[0].knowledgeEntryId).toBe(mpEntryId);
+    const mpProposalId = proposed.proposals[0].proposalId;
+
+    // --- process: brief prepare ----------------------------------------------
+    const brief = await mpCli([
+      'brief',
+      'prepare',
+      '--json',
+      jsonArg({
+        workOrderId: mpWorkOrderId,
+        projectId: PROJECT_ID,
+        taskId: 'task-mp-1',
+        laneId: 'lane-mp-1',
+        repository: 'github.com/org/repo',
+        baseCommit: mpLaneHead,
+        policyRevision: POLICY_REVISION,
+        modelAssignment: {
+          model: 'nvidia/z-ai/glm-5.3',
+          variant: 'default',
+          fallbackModel: 'openrouter/z-ai/glm-5.3-flash',
+        },
+        independentReviewer: 'openrouter/anthropic/claude-sonnet-4.5',
+        ownedPaths: ['packages/demo/src'],
+        permissions: ['edit'],
+        acceptanceChecks: ['yarn build'],
+        stepLimit: 50,
+        timeLimitSeconds: 900,
+        resourceBounds: { cpu: '2' },
+        expectedArtifacts: ['docs/demo-summary.md'],
+        ownerDecisionReferences: [],
+        contextDecisions: [
+          {
+            proposalId: mpProposalId,
+            knowledgeEntryId: mpEntryId,
+            version: '1.0.0',
+            proposedBecause: 'lexical match on the lane task',
+            accepted: true,
+            decisionBecause: 'Matches this lane task exactly',
+          },
+        ],
+        attemptId: mpAttemptId,
+        worktreePath: multiProcBriefRepo,
+        handWrittenBriefPath: multiProcBriefFile,
+      }),
+    ]);
+    expect(brief.code).toBe(0);
+    const prepared = jsonOf<{
+      outcome: string;
+      prepared: { attemptId: string; briefDigest: string; prosePath: string };
+    }>(brief);
+    expect(prepared.outcome).toBe('prepared');
+    expect(prepared.prepared.attemptId).toBe(mpAttemptId);
+
+    // --- process: capacity + attempt lifecycle -------------------------------
+    const reserve = await mpCli([
+      'capacity',
+      'reserve',
+      '--json',
+      jsonArg({
+        reservationId: 'res-mp-1',
+        attemptId: mpAttemptId,
+        workOrderId: mpWorkOrderId,
+        hostId: 'host-1',
+        worktreePath: multiProcLaneRepo,
+        maxSlots: 2,
+      }),
+    ]);
+    expect(reserve.code).toBe(0);
+    expect(jsonOf(reserve)).toMatchObject({ outcome: 'reserved' });
+
+    const dispatch = await mpCli([
+      'attempt',
+      'dispatch',
+      '--json',
+      jsonArg({
+        attemptId: mpAttemptId,
+        workOrderId: mpWorkOrderId,
+        worktreePath: multiProcLaneRepo,
+        briefPackagePath: prepared.prepared.prosePath,
+        briefDigest: prepared.prepared.briefDigest,
+        baseCommit: mpLaneHead,
+        stepLimit: 50,
+        timeLimitSeconds: 900,
+        expectedArtifacts: ['docs/demo-summary.md'],
+      }),
+    ]);
+    expect(dispatch.code).toBe(0);
+    expect(jsonOf(dispatch)).toMatchObject({
+      outcome: 'started',
+      sessionId: SESSION_ID,
+      attempt: { id: mpAttemptId, state: 'running' },
+    });
+
+    const reconcile = await mpCli([
+      'attempt',
+      'reconcile',
+      '--json',
+      jsonArg({ attemptId: mpAttemptId }),
+    ]);
+    expect(reconcile.code).toBe(0);
+    expect(jsonOf(reconcile)).toMatchObject({
+      outcome: 'ended',
+      attempt: { id: mpAttemptId, state: 'ended' },
+    });
+
+    const collect = await mpCli([
+      'attempt',
+      'collect',
+      '--json',
+      jsonArg({ attemptId: mpAttemptId }),
+    ]);
+    expect(collect.code).toBe(0);
+    expect(jsonOf(collect)).toMatchObject({
+      outcome: 'collected',
+      artifacts: { headCommit: mpLaneHead },
+    });
+
+    // --- process: evidence chain ---------------------------------------------
+    const requestVerification = await mpCli([
+      'evidence',
+      'request-verification',
+      '--json',
+      jsonArg({
+        attemptId: mpAttemptId,
+        projectId: PROJECT_ID,
+        candidateHeadSha: mpLaneHead,
+        policyRevision: POLICY_REVISION,
+        hostId: 'verify-host-1',
+        requiredChecks: ['yarn build'],
+      }),
+    ]);
+    expect(requestVerification.code).toBe(0);
+    expect(jsonOf(requestVerification)).toMatchObject({
+      outcome: 'completed',
+      assessment: { state: 'blocked' },
+    });
+
+    const recordVerification = await mpCli([
+      'evidence',
+      'record-verification',
+      '--json',
+      jsonArg({
+        attemptId: mpAttemptId,
+        receipt: {
+          id: 'vr-mp-1',
+          assessmentId: assessmentIdForAttempt(mpAttemptId),
+          projectId: PROJECT_ID,
+          attemptId: mpAttemptId,
+          candidateHeadSha: mpLaneHead,
+          hostId: 'verify-host-1',
+          procedureName: 'yarn build',
+          result: 'pass',
+          exitCode: 0,
+          evidenceRef: 'evidence://verify-host-1/yarn-build',
+          policyRevision: POLICY_REVISION,
+          completedAtIso: '2026-10-15T10:40:00.000Z',
+        },
+      }),
+    ]);
+    expect(recordVerification.code).toBe(0);
+    expect(jsonOf(recordVerification)).toMatchObject({
+      outcome: 'recorded',
+      assessment: { state: 'pending', blockers: [] },
+    });
+
+    const recordReview = await mpCli([
+      'evidence',
+      'record-review',
+      '--json',
+      jsonArg({
+        attemptId: mpAttemptId,
+        receipt: {
+          id: 'rr-mp-1',
+          assessmentId: assessmentIdForAttempt(mpAttemptId),
+          projectId: PROJECT_ID,
+          attemptId: mpAttemptId,
+          candidateHeadSha: mpLaneHead,
+          reviewerModel: 'openrouter/anthropic/claude-sonnet-4.5',
+          implementerModel: 'nvidia/z-ai/glm-5.3',
+          readOnlyVerified: true,
+          result: 'pass',
+          findings: [],
+          evidenceRef: 'evidence://independent-review/rr-mp-1',
+          policyRevision: POLICY_REVISION,
+          completedAtIso: '2026-10-15T10:45:00.000Z',
+        },
+      }),
+    ]);
+    expect(recordReview.code).toBe(0);
+    expect(jsonOf(recordReview)).toMatchObject({ outcome: 'recorded' });
+
+    const assess = await mpCli([
+      'evidence',
+      'assess',
+      '--json',
+      jsonArg({
+        attemptId: mpAttemptId,
+        candidateHeadSha: mpLaneHead,
+        policyRevision: POLICY_REVISION,
+      }),
+    ]);
+    expect(assess.code).toBe(0);
+    expect(jsonOf(assess)).toMatchObject({ outcome: 'accepted', candidateHeadSha: mpLaneHead });
+
+    // --- process: accept writes the cross-process receipt registry -----------
+    const accept = await mpCli([
+      'attempt',
+      'accept',
+      '--json',
+      jsonArg({
+        attemptId: mpAttemptId,
+        reviewerModel: 'openrouter/anthropic/claude-sonnet-4.5',
+      }),
+    ]);
+    expect(accept.code).toBe(0);
+    const accepted = jsonOf<{ outcome: string; candidateHeadSha: string; receiptId: string }>(
+      accept,
+    );
+    expect(accepted).toMatchObject({ outcome: 'accepted', candidateHeadSha: mpLaneHead });
+    const mpReceiptId = accepted.receiptId;
+
+    // The accept process persisted the receipt registry for later processes.
+    const receiptsPath = path.join(multiProcStateDir, 'accepted-receipts.json');
+    expect(existsSync(receiptsPath)).toBe(true);
+    const persistedReceipts = JSON.parse(readFileSync(receiptsPath, 'utf8')) as Record<
+      string,
+      string
+    >;
+    expect(persistedReceipts[mpLaneHead]).toBe(mpReceiptId);
+
+    // --- process: coordination decision and authorization ---------------------
+    const decision = await mpCli([
+      'coordination',
+      'request-decision',
+      '--json',
+      jsonArg({
+        requestId: 'dec-mp-1',
+        projectId: PROJECT_ID,
+        kind: 'action-decision',
+        actionScope: 'forge:merge-pr',
+        expectedHeadSha: mpLaneHead,
+        proposalDigest: `merge ${mpAttemptId} at ${mpLaneHead}`,
+        policyRevision: POLICY_REVISION,
+      }),
+    ]);
+    expect(decision.code).toBe(0);
+    expect(jsonOf(decision)).toMatchObject({
+      outcome: 'requested',
+      request: { id: 'dec-mp-1', state: 'approved', grantId: 'grant-mp-1' },
+    });
+
+    const resolved = await mpCli([
+      'coordination',
+      'resolve-auth',
+      '--json',
+      jsonArg({
+        projectId: PROJECT_ID,
+        actionScope: 'forge:merge-pr',
+        expectedHeadSha: mpLaneHead,
+      }),
+    ]);
+    expect(resolved.code).toBe(0);
+    expect(jsonOf(resolved)).toMatchObject({
+      outcome: 'authorized',
+      grantId: 'grant-mp-1',
+      expectedHeadSha: mpLaneHead,
+    });
+
+    // Coordinates an earlier resolve process durably recorded for this grant:
+    // the forge process below must reload them from disk because its fresh
+    // runtime starts with empty in-memory maps.
+    const coordinatesPath = path.join(multiProcStateDir, 'authorization-coordinates.json');
+    writeFileSync(
+      coordinatesPath,
+      `${JSON.stringify(
+        { 'grant-mp-1': { attemptId: mpAttemptId, expectedHeadSha: mpLaneHead } },
+        null,
+        2,
+      )}\n`,
+    );
+
+    // --- process: forge the merge against reloaded state ----------------------
+    const forge = await mpCli([
+      'forge',
+      'execute',
+      '--json',
+      jsonArg({
+        actionId: 'forge-mp-action-1',
+        attemptId: mpAttemptId,
+        workOrderId: mpWorkOrderId,
+        kind: 'merge-pr',
+        expectedHeadSha: mpLaneHead,
+        authorizationGrantId: 'grant-mp-1',
+      }),
+    ]);
+    expect(forge.code).toBe(0);
+    expect(jsonOf(forge)).toEqual({ outcome: 'executed', headSha: mpLaneHead });
+
+    const merged = await mpCli(['work-order', 'inspect', '--work-order-id', mpWorkOrderId]);
+    expect(merged.code).toBe(0);
+    expect(jsonOf(merged)).toMatchObject({
+      outcome: 'found',
+      workOrder: { id: mpWorkOrderId, state: 'merged' },
+    });
+
+    // The reloaded coordinates survived the forge process untouched.
+    const persistedCoordinates = JSON.parse(readFileSync(coordinatesPath, 'utf8')) as Record<
+      string,
+      { attemptId: string; expectedHeadSha: string }
+    >;
+    expect(persistedCoordinates['grant-mp-1']).toEqual({
+      attemptId: mpAttemptId,
+      expectedHeadSha: mpLaneHead,
+    });
+  });
+
+  it('falls back to FLEET_STATE_DIR and rejects invalid --state-dir values', async () => {
+    const envStateDir = path.join(suiteDir, 'env-state');
+    const flagStateDir = path.join(suiteDir, 'flag-state');
+    mkdirSync(envStateDir);
+    mkdirSync(flagStateDir);
+
+    const bareCli = async (argv: readonly string[]): Promise<Invocation> => {
+      const out: string[] = [];
+      const err: string[] = [];
+      const io: CliIo = {
+        stdout: (text) => {
+          out.push(text);
+        },
+        stderr: (text) => {
+          err.push(text);
+        },
+      };
+      // No --state-dir token and no injected runtime: the environment decides.
+      const code = await runCli([...argv], io);
+      return { code, text: out.join(''), stderr: err.join('') };
+    };
+
+    const originalFleetStateDir = process.env.FLEET_STATE_DIR;
+    process.env.FLEET_STATE_DIR = envStateDir;
+    try {
+      // With FLEET_STATE_DIR set, a command without --state-dir and without an
+      // injected runtime composes its runtime from the environment directory.
+      const registered = await bareCli([
+        'coordination',
+        'register-profile',
+        '--json',
+        jsonArg({
+          projectId: 'proj-env-1',
+          displayName: 'Env State Project',
+          repository: 'github.com/org/repo',
+          designatedDispatcherHost: 'host-1',
+          policyRevision: POLICY_REVISION,
+          maxConcurrentLanes: 1,
+          runnerCapabilities: { 'scoped-worktree': true },
+        }),
+      ]);
+      expect(registered.code).toBe(0);
+      expect(jsonOf(registered)).toMatchObject({ outcome: 'registered' });
+
+      // A second fresh runtime reads the profile back from the same directory.
+      const inspected = await bareCli([
+        'coordination',
+        'capabilities',
+        '--json',
+        jsonArg({ projectId: 'proj-env-1', requiredCapabilities: ['scoped-worktree'] }),
+      ]);
+      expect(inspected.code).toBe(0);
+      expect(jsonOf(inspected)).toMatchObject({
+        outcome: 'inspected',
+        profile: { projectId: 'proj-env-1' },
+      });
+
+      // An explicit --state-dir wins over the environment fallback and never
+      // leaks into group dispatch or the command payload.
+      const flagged = await bareCli([
+        '--state-dir',
+        flagStateDir,
+        'coordination',
+        'register-profile',
+        '--json',
+        jsonArg({
+          projectId: 'proj-flag-1',
+          displayName: 'Flag State Project',
+          repository: 'github.com/org/repo',
+          designatedDispatcherHost: 'host-1',
+          policyRevision: POLICY_REVISION,
+          maxConcurrentLanes: 1,
+          runnerCapabilities: { 'scoped-worktree': true },
+        }),
+      ]);
+      expect(flagged.code).toBe(0);
+      expect(jsonOf(flagged)).toMatchObject({ outcome: 'registered' });
+
+      // The flagged profile never landed in the environment directory.
+      const envDirMiss = await bareCli([
+        'coordination',
+        'capabilities',
+        '--json',
+        jsonArg({ projectId: 'proj-flag-1' }),
+      ]);
+      expect(envDirMiss.code).toBe(1);
+      expect(jsonOf(envDirMiss)).toMatchObject({ outcome: 'not-found' });
+
+      // --state-dir in a later position is stripped before subcommand parsing.
+      const midPosition = await bareCli([
+        'coordination',
+        'capabilities',
+        '--state-dir',
+        flagStateDir,
+        '--json',
+        jsonArg({ projectId: 'proj-flag-1' }),
+      ]);
+      expect(midPosition.code).toBe(0);
+      expect(jsonOf(midPosition)).toMatchObject({ outcome: 'inspected' });
+    } finally {
+      if (originalFleetStateDir === undefined) {
+        delete process.env.FLEET_STATE_DIR;
+      } else {
+        process.env.FLEET_STATE_DIR = originalFleetStateDir;
+      }
+    }
+
+    // Invalid --state-dir values are usage errors with exit code 2.
+    const missingValue = await bareCli(['forge', 'execute', '--state-dir']);
+    expect(missingValue.code).toBe(2);
+    expect(missingValue.stderr).toContain('Invalid --state-dir value');
+
+    const emptyValue = await bareCli(['work-order', 'inspect', '--state-dir', '']);
+    expect(emptyValue.code).toBe(2);
+    expect(emptyValue.stderr).toContain('Invalid --state-dir value');
+
+    const flagLikeValue = await bareCli([
+      'work-order',
+      'inspect',
+      '--state-dir',
+      '--work-order-id',
+      'wo-1',
+    ]);
+    expect(flagLikeValue.code).toBe(2);
+    expect(flagLikeValue.stderr).toContain('Invalid --state-dir value');
+
+    const nulByteValue = await bareCli(['--state-dir=bad\0path']);
+    expect(nulByteValue.code).toBe(2);
+    expect(nulByteValue.stderr).toContain('Invalid --state-dir value');
+
+    const emptyInlineValue = await bareCli(['--state-dir=']);
+    expect(emptyInlineValue.code).toBe(2);
+    expect(emptyInlineValue.stderr).toContain('Invalid --state-dir value');
   });
 });

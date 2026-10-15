@@ -9,7 +9,7 @@
  * `CliIo`, so package code never touches `console`.
  */
 
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import type {
   BriefContextDecision,
@@ -189,6 +189,54 @@ function parseFlags(tokens: readonly string[]): Payload {
     Object.assign(payload, jsonPayload);
   }
   return payload;
+}
+
+/**
+ * Strip the global `--state-dir <path>` / `--state-dir=<path>` option from any
+ * position so it never reaches group dispatch or `parseFlags`, falling back to
+ * the `FLEET_STATE_DIR` environment value when the flag is omitted. Valid
+ * paths are normalized with `path.resolve`; a missing, empty or malformed
+ * value is a usage error.
+ */
+export function extractStateDirOption(
+  argv: readonly string[],
+  envStateDir?: string,
+): { readonly stateDir?: string; readonly restArgv: readonly string[] } {
+  let stateDir: string | undefined;
+  const restArgv: string[] = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === '--state-dir') {
+      const value = argv[index + 1];
+      index += 1;
+      if (
+        value === undefined ||
+        value.trim() === '' ||
+        value.startsWith('--') ||
+        value.includes('\0')
+      ) {
+        throw new CliUsageError('Invalid --state-dir value');
+      }
+      stateDir = resolve(value);
+      continue;
+    }
+    if (token.startsWith('--state-dir=')) {
+      const value = token.slice('--state-dir='.length);
+      if (value.trim() === '' || value.startsWith('--') || value.includes('\0')) {
+        throw new CliUsageError('Invalid --state-dir value');
+      }
+      stateDir = resolve(value);
+      continue;
+    }
+    restArgv.push(token);
+  }
+  if (stateDir === undefined) {
+    const fromEnv = envStateDir?.trim();
+    if (fromEnv !== undefined && fromEnv !== '') {
+      stateDir = resolve(fromEnv);
+    }
+  }
+  return { stateDir, restArgv };
 }
 
 /** Strict isolation profile required of runners unless overridden per dispatch. */
@@ -595,9 +643,13 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
 // Help text
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `Fleet CLI — operator driver across the four bounded contexts.
+const HELP_TEXT = `fleet-v2 — Fleet CLI operator driver across the four bounded contexts.
 
-Usage: fleet <command> <subcommand> [--json '<payload>'] [--flag value ...]
+Usage: fleet-v2 [--state-dir <path>] <command> <subcommand> [--json '<payload>'] [--flag value ...]
+
+Global state option: --state-dir <path> (or the FLEET_STATE_DIR environment
+variable) selects the directory that backs durable CLI state; it may appear
+in any position, and every store is in-memory when neither is given.
 
 Pass the full typed request as one JSON object with --json, or supply fields
 as --kebab-case flags (arrays as comma-separated values). The typed result
@@ -618,7 +670,7 @@ Exit codes: 0 completed, 1 refused/rejected/blocked/unknown result, 2 usage erro
 
 function groupHelp(group: string): string {
   const subcommands = Object.keys(COMMANDS[group] ?? {}).sort();
-  return `Usage: fleet ${group} <subcommand> [--json '<payload>'] [--flag value ...]\nSubcommands: ${subcommands.join(', ')}\nSee: fleet --help`;
+  return `Usage: fleet-v2 ${group} <subcommand> [--json '<payload>'] [--flag value ...]\nSubcommands: ${subcommands.join(', ')}\nSee: fleet-v2 --help`;
 }
 
 // ---------------------------------------------------------------------------
@@ -628,30 +680,34 @@ function groupHelp(group: string): string {
 export async function runCli(
   argv: readonly string[],
   io: CliIo = processIo,
-  runtime: FleetCliRuntime = createFleetCliRuntime(),
+  runtime?: FleetCliRuntime,
 ): Promise<number> {
   try {
-    if (argv.length === 0) {
+    const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
+    if (restArgv.length === 0) {
       io.stderr(`${HELP_TEXT}\n`);
       return 2;
     }
-    const group = argv[0];
+    // An explicitly injected runtime stays authoritative; only a call without
+    // one composes a fresh runtime bound to the resolved state directory.
+    const activeRuntime = runtime ?? createFleetCliRuntime({ stateDir });
+    const group = restArgv[0];
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);
       return 0;
     }
     const subcommands = COMMANDS[group];
     if (subcommands === undefined) {
-      io.stderr(`Unknown command: ${group}\nRun 'fleet --help' for the available commands.\n`);
+      io.stderr(`Unknown command: ${group}\nRun 'fleet-v2 --help' for the available commands.\n`);
       return 2;
     }
     let subcommand: string | null = null;
     let rest: readonly string[] = [];
-    if (argv.length > 1 && !argv[1].startsWith('--')) {
-      subcommand = argv[1];
-      rest = argv.slice(2);
+    if (restArgv.length > 1 && !restArgv[1].startsWith('--')) {
+      subcommand = restArgv[1];
+      rest = restArgv.slice(2);
     } else {
-      rest = argv.slice(1);
+      rest = restArgv.slice(1);
     }
     if (subcommand === null) {
       io.stderr(`${groupHelp(group)}\n`);
@@ -663,7 +719,7 @@ export async function runCli(
       return 2;
     }
     const payload = parseFlags(rest);
-    const result = await handler(payload, runtime);
+    const result = await handler(payload, activeRuntime);
     io.stdout(`${JSON.stringify(result)}\n`);
     return exitCodeForResult(result);
   } catch (error) {

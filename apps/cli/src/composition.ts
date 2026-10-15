@@ -17,7 +17,8 @@
  */
 
 import { execFile } from 'node:child_process';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 import {
   AcceptanceAssessmentAdapter,
@@ -103,6 +104,43 @@ export interface FleetCliRuntimeOptions {
 /** Deterministic identity of the acceptance assessment bound to one attempt. */
 export function assessmentIdForAttempt(attemptId: string): string {
   return `assessment-${attemptId}`;
+}
+
+/**
+ * Read one flat JSON record file as a plain object. An absent, unreadable or
+ * malformed file degrades to an empty record; the consuming delegate then
+ * reports the missing receipt or coordinates honestly instead of crashing.
+ */
+function readJsonRecord<T>(filePath: string): Record<string, T> {
+  if (!existsSync(filePath)) {
+    return {};
+  }
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf8'));
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, T>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Write one flat JSON record file atomically: the payload lands in a
+ * process-unique temp file first and is renamed over the target, so a
+ * concurrent reader never observes a half-written document.
+ */
+function writeJsonRecordAtomic<T>(filePath: string, data: Record<string, T>): void {
+  mkdirSync(dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.tmp-${process.pid}`;
+  writeFileSync(tempPath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+  renameSync(tempPath, filePath);
+}
+
+/** Grant-to-attempt binding persisted for cross-process forge execution. */
+interface AuthorizationCoordinates {
+  readonly attemptId: string;
+  readonly expectedHeadSha: string;
 }
 
 /** Deterministic coordination action scope for one forge action kind. */
@@ -398,8 +436,26 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
 
   // Live registry of acceptance receipts per candidate head: the acceptance
   // delegate records entries and the merge gate consumes them, so a merge is
-  // only ever authorized for a head whose acceptance receipt exists.
+  // only ever authorized for a head whose acceptance receipt exists. With a
+  // stateDir the registry is backed by `<stateDir>/accepted-receipts.json`:
+  // every read reloads the file first, so a separate CLI process running
+  // `forge execute --kind merge-pr` sees receipts recorded by an earlier
+  // `attempt accept` / `evidence assess` process.
+  const acceptedReceiptsPath =
+    stateDir === undefined ? undefined : join(stateDir, 'accepted-receipts.json');
   const acceptedReceiptByHead: Record<string, string> = {};
+  const acceptedReceiptByHeadView: Record<string, string> =
+    acceptedReceiptsPath === undefined
+      ? acceptedReceiptByHead
+      : new Proxy(acceptedReceiptByHead, {
+          get(target, prop) {
+            if (typeof prop === 'string') {
+              Object.assign(target, readJsonRecord<string>(acceptedReceiptsPath));
+              return target[prop];
+            }
+            return undefined;
+          },
+        });
 
   const acceptanceAssessment = new AcceptanceAssessmentAdapter({
     assess: async (request) => {
@@ -410,6 +466,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       });
       if (result.outcome === 'accepted') {
         acceptedReceiptByHead[result.candidateHeadSha] = result.receiptId;
+        if (acceptedReceiptsPath !== undefined) {
+          writeJsonRecordAtomic(acceptedReceiptsPath, {
+            ...readJsonRecord<string>(acceptedReceiptsPath),
+            [result.candidateHeadSha]: result.receiptId,
+          });
+        }
         return {
           outcome: 'accepted',
           receiptId: result.receiptId,
@@ -477,6 +539,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     },
   });
 
+  // Grant-to-attempt coordinates recorded when the authorization delegate
+  // resolves a grant. With a stateDir they are mirrored to
+  // `<stateDir>/authorization-coordinates.json`, so a separate CLI process
+  // running `forge execute` after an earlier `coordination resolve-auth`
+  // process finds the grant's bound attempt and expected head.
+  const authorizationCoordinatesPath =
+    stateDir === undefined ? undefined : join(stateDir, 'authorization-coordinates.json');
+  const resolveCoordinates = new Map<string, AuthorizationCoordinates>();
+
   const actionAuthorization = new ActionAuthorizationAdapter({
     resolveGrant: async (request) => {
       const result = await coordination.resolveActionAuthorization.resolveActionAuthorization({
@@ -484,9 +555,23 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         actionScope: forgeActionScope(request.actionKind),
         expectedHeadSha: request.expectedHeadSha,
       });
-      return result.outcome === 'authorized'
-        ? { outcome: 'granted', authorizationGrantId: result.grantId }
-        : { outcome: 'blocked', reason: result.reason };
+      if (result.outcome === 'authorized') {
+        resolveCoordinates.set(result.grantId, {
+          attemptId: request.attemptId,
+          expectedHeadSha: request.expectedHeadSha,
+        });
+        if (authorizationCoordinatesPath !== undefined) {
+          writeJsonRecordAtomic(authorizationCoordinatesPath, {
+            ...readJsonRecord<AuthorizationCoordinates>(authorizationCoordinatesPath),
+            [result.grantId]: {
+              attemptId: request.attemptId,
+              expectedHeadSha: request.expectedHeadSha,
+            },
+          });
+        }
+        return { outcome: 'granted', authorizationGrantId: result.grantId };
+      }
+      return { outcome: 'blocked', reason: result.reason };
     },
     consumeGrant: async (request) => {
       // The consumer-side consumption request carries only grant and action
@@ -504,10 +589,38 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
           reason: `Authorization grant ${request.authorizationGrantId} records no expected head`,
         };
       }
-      const attempts = await attemptRepository.listAllAttempts();
-      const attempt = attempts.find(
-        (candidate) => candidate.artifacts?.headCommit === grant.expectedHeadSha,
-      );
+      // Coordinates recorded at resolve time bind the grant to its attempt;
+      // a fresh process reloads them from disk before falling back to the
+      // head-matching scan over all recorded attempts.
+      if (
+        !resolveCoordinates.has(request.authorizationGrantId) &&
+        authorizationCoordinatesPath !== undefined
+      ) {
+        for (const [grantId, coordinates] of Object.entries(
+          readJsonRecord<AuthorizationCoordinates>(authorizationCoordinatesPath),
+        )) {
+          if (
+            typeof coordinates.attemptId === 'string' &&
+            typeof coordinates.expectedHeadSha === 'string'
+          ) {
+            resolveCoordinates.set(grantId, {
+              attemptId: coordinates.attemptId,
+              expectedHeadSha: coordinates.expectedHeadSha,
+            });
+          }
+        }
+      }
+      const coordinates = resolveCoordinates.get(request.authorizationGrantId);
+      const boundAttempt =
+        coordinates === undefined
+          ? null
+          : await attemptRepository.findAttemptById(coordinates.attemptId);
+      const attempt =
+        boundAttempt !== null && boundAttempt.artifacts?.headCommit === grant.expectedHeadSha
+          ? boundAttempt
+          : (await attemptRepository.listAllAttempts()).find(
+              (candidate) => candidate.artifacts?.headCommit === grant.expectedHeadSha,
+            );
       if (attempt === undefined) {
         return {
           outcome: 'refused',
@@ -607,7 +720,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       journal: executionJournal,
       authorizationPort: actionAuthorization,
       forgePort: forgeAction,
-      acceptedReceiptByHead,
+      acceptedReceiptByHead: acceptedReceiptByHeadView,
     }),
   };
 

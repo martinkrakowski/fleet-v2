@@ -1,53 +1,55 @@
-// @generated entity stub — edit freely
+// @generated entity stub — refined for step 5.
 /**
- * RelayAcknowledgement is a domain entity with identity and lifecycle.
- *
- * Domain entities:
- * - Have unique identity (ID)
- * - Contain business logic and invariants
- * - Are mutable (unlike value objects)
- * - Enforce domain rules in their methods
- *
- * @example
- * const entity = new RelayAcknowledgement(id, props);
- * entity.performAction();
+ * RelayAcknowledgement is the child record of an actual recipient response.
+ * Transport delivery is not acknowledgement and silence is not a response, so
+ * an acknowledgement always carries the recipient it came from and the
+ * provenance of that response.
  */
+
+import type { RelayAcknowledgementRecord } from '../coordination-records.js';
+
 export class RelayAcknowledgement {
-  /**
-   * Constructor for RelayAcknowledgement entity.
-   *
-   * @param id - Unique identifier
-   * @param props - Entity properties
-   *
-   * TODO: Define your entity properties
-   * Example:
-   * constructor(
-   *   private readonly id: string,
-   *   private name: string,
-   *   private status: Status,
-   * ) {
-   *   // Validate invariants
-   * }
-   */
-  constructor(private readonly id: string) {
-    // TODO: Initialize entity state
-    // TODO: Validate invariants
+  private constructor(private readonly record: RelayAcknowledgementRecord) {
+    // Invariants are validated in fromRecord.
   }
 
-  /**
-   * Get entity ID.
-   */
+  static fromRecord(record: RelayAcknowledgementRecord): RelayAcknowledgement {
+    if (typeof record !== 'object' || record === null) {
+      throw new Error('RelayAcknowledgement requires a record');
+    }
+    for (const field of [
+      'acknowledgementId',
+      'requestId',
+      'recipientId',
+      'responseSummary',
+      'provenance',
+      'acknowledgedAtIso',
+    ] as const) {
+      const value = record[field];
+      if (typeof value !== 'string' || value.trim().length === 0) {
+        throw new Error(`RelayAcknowledgement requires a non-empty ${field}`);
+      }
+    }
+    return new RelayAcknowledgement({ ...record });
+  }
+
   getId(): string {
-    return this.id;
+    return this.record.acknowledgementId;
   }
 
-  /**
-   * TODO: Add domain methods here
-   * Example:
-   * performAction(): Result<void, Error> {
-   *   // Validate business rules
-   *   // Update state
-   *   // Return result
-   * }
-   */
+  toRecord(): RelayAcknowledgementRecord {
+    return { ...this.record };
+  }
+
+  getRecipientId(): string {
+    return this.record.recipientId;
+  }
+
+  isFromRecipient(recipientId: string): boolean {
+    return this.record.recipientId === recipientId;
+  }
+
+  equals(other: RelayAcknowledgement): boolean {
+    return this.record.acknowledgementId === other.record.acknowledgementId;
+  }
 }

@@ -62,6 +62,7 @@ describe('Fleet CLI workflow', () => {
   let briefDigest: string;
   let acceptanceReceiptId: string;
   let originalPath: string | undefined;
+  let originalOcmRunBin: string | undefined;
 
   const cli = async (argv: readonly string[]): Promise<Invocation> => {
     const out: string[] = [];
@@ -139,6 +140,8 @@ describe('Fleet CLI workflow', () => {
     chmodSync(path.join(binDir, 'ocm-run'), 0o755);
     chmodSync(path.join(binDir, 'gh'), 0o755);
     originalPath = process.env.PATH;
+    originalOcmRunBin = process.env.FLEET_OCM_RUN_BIN;
+    process.env.FLEET_OCM_RUN_BIN = path.join(binDir, 'ocm-run');
     process.env.PATH = `${binDir}:${originalPath ?? ''}`;
 
     // The lane worktree stays pristine: it must match the base commit with no
@@ -173,12 +176,20 @@ describe('Fleet CLI workflow', () => {
       `${JSON.stringify({ state: 'approved', decisionRevision: 'dec-2-r1', grantId: 'grant-2' }, null, 2)}\n`,
     );
 
-    runtime = createFleetCliRuntime({ stateDir });
+    runtime = createFleetCliRuntime({
+      stateDir,
+      ocmRunBin: path.join(binDir, 'ocm-run'),
+    });
   });
 
   afterAll(() => {
     if (originalPath !== undefined) {
       process.env.PATH = originalPath;
+    }
+    if (originalOcmRunBin !== undefined) {
+      process.env.FLEET_OCM_RUN_BIN = originalOcmRunBin;
+    } else {
+      delete process.env.FLEET_OCM_RUN_BIN;
     }
     rmSync(suiteDir, { recursive: true, force: true });
   });

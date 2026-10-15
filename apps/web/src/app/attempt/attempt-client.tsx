@@ -25,9 +25,14 @@ export default function AttemptPage() {
 
   return (
     <div className={styles.layout}>
-      <aside className={styles.sidebarCol} aria-label="Work order">
-        <WorkOrderSidebar attempt={attempt} workOrder={workOrder} siblings={siblings} />
-      </aside>
+      <div className={styles.sidebarCol}>
+        <aside aria-label="Work order">
+          <WorkOrderSidebar attempt={attempt} workOrder={workOrder} siblings={siblings} />
+        </aside>
+        <aside className={styles.opsCol} aria-label="Operations">
+          <OperationsSidebar attempt={attempt} word={word} />
+        </aside>
+      </div>
 
       <section className={styles.recordCol} aria-label="Attempt record">
         <AttemptHeader
@@ -45,10 +50,6 @@ export default function AttemptPage() {
         <ReceiptsCard attempt={attempt} />
         <FrozenBriefAccordion attempt={attempt} />
       </section>
-
-      <aside className={styles.opsCol} aria-label="Operations">
-        <OperationsSidebar attempt={attempt} word={word} />
-      </aside>
     </div>
   );
 }

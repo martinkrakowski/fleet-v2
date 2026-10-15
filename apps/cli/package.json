@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "fleet-v2": "./dist/bin.js"
+  },
   "scripts": {
     "build": "tsc",
     "lint": "eslint src --ext .ts",

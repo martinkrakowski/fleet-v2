@@ -44,10 +44,24 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
   }
 
   async execute(input: unknown): Promise<ResolveActionAuthorizationResult> {
-    if (!this.deps || typeof input !== 'object' || input === null) {
+    // Unconfigured is 501 and is checked before any request validation.
+    if (!this.deps) {
+      throw new Error('Not implemented: ResolveActionAuthorizationUseCase');
+    }
+    // A configured runtime still refuses a missing request object instead of
+    // inventing one; the HTTP boundary always supplies an object body.
+    if (typeof input !== 'object' || input === null) {
       throw new Error('Not implemented: ResolveActionAuthorizationUseCase');
     }
     const request = input as ResolveActionAuthorizationRequest;
+    if (Object.keys(request).length === 0) {
+      // The HTTP boundary's empty body object: the resolve is blocked with
+      // its missing coordinates named, never reported as an unimplemented
+      // station.
+      return blocked(
+        'an authorization resolve requires a non-empty projectId, actionScope and expectedHeadSha',
+      );
+    }
     for (const field of ['projectId', 'actionScope', 'expectedHeadSha'] as const) {
       if (!isFilled(request[field])) {
         throw new Error('Not implemented: ResolveActionAuthorizationUseCase');

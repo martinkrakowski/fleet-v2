@@ -100,7 +100,14 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
   }
 
   async execute(input?: unknown): Promise<CollectAttemptArtifactsResult> {
-    if (!this.deps || !input || typeof input !== 'object') {
+    // Unconfigured is 501 and is checked before any request validation.
+    if (!this.deps) {
+      throw new Error('Not implemented: CollectAttemptArtifactsUseCase');
+    }
+    // A configured runtime still refuses a missing request object instead of
+    // inventing one; the HTTP boundary always supplies an object body, and an
+    // empty object body flows into the validation below as a refusal.
+    if (!input || typeof input !== 'object') {
       throw new Error('Not implemented: CollectAttemptArtifactsUseCase');
     }
     return this.collectAttemptArtifacts(input as CollectAttemptArtifactsRequest);

@@ -76,7 +76,17 @@ function describeFailure(error: unknown): string {
 export function createFleetWebApiClient(
   options: FleetWebApiClientOptions = {},
 ): FleetWebApiClient {
-  const baseUrl = options.baseUrl?.trim() ?? "";
+  // An explicit baseUrl wins as written: "" keeps forcing the unconfigured
+  // fixture fallback in unit tests. Only an omitted baseUrl falls back to
+  // the API origin configured through the environment, so the deployed app
+  // binds to its API boundary without each view passing one.
+  const baseUrl =
+    options.baseUrl !== undefined
+      ? options.baseUrl.trim()
+      : (typeof process !== "undefined"
+          ? (process.env.FLEET_API_URL ?? process.env.NEXT_PUBLIC_FLEET_API_URL)
+          : undefined
+        )?.trim() ?? "";
   const fetchImpl = options.fetchImpl ?? fetch;
 
   /**

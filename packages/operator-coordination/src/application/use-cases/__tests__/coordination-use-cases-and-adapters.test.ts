@@ -1,0 +1,1622 @@
+/**
+ * Step 5 unit tests for the operator-coordination use cases and their
+ * infrastructure adapters.
+ *
+ * The suite covers each of the ten inbound use cases against explicit test
+ * doubles and against the real adapters, and it exercises the four refusals
+ * that carry the safety weight of this context: a profile that would persist a
+ * credential, a grant that would authorize a second unrelated action, an
+ * observation delivery gap that must stay visible and undelivered, and relay
+ * delivery that must never be recorded as a recipient response.
+ */
+
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { afterEach, describe, expect, it } from 'vitest';
+
+import type {
+  AuthorizationConsumptionRecord,
+  CoordinationRequestRecord,
+  ProjectAttentionSummaryRecord,
+  ProjectProfileRecord,
+  RelayAcknowledgementRecord,
+} from '../../../domain/coordination-records.js';
+import type { ObservationEnvelopeProps } from '../../../domain/value-objects/ObservationEnvelope.vo.js';
+import type {
+  InspectConfiguredCapabilitiesRequest,
+  RegisterProjectProfileRequest,
+} from '../../ports/in/index.js';
+import type { CoordinationRequestRepositoryPort } from '../../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import type { DecisionAnswer, DecisionTransportPort } from '../../ports/out/DecisionTransportPort.out-port.js';
+import type { ProjectProfileRepositoryPort } from '../../ports/out/ProjectProfileRepositoryPort.out-port.js';
+import type { RelayDeliveryOutcome, RelayNoticeRequest } from '../../ports/out/RelayTransportPort.out-port.js';
+import { AttentionReadAdapter } from '../../../infrastructure/adapters/AttentionReadAdapter.adapter.js';
+import { CoordinationRequestRepositoryAdapter } from '../../../infrastructure/adapters/CoordinationRequestRepositoryAdapter.adapter.js';
+import { DecisionTransportAdapter } from '../../../infrastructure/adapters/DecisionTransportAdapter.adapter.js';
+import { ObservationPublicationAdapter } from '../../../infrastructure/adapters/ObservationPublicationAdapter.adapter.js';
+import { ProjectProfileRepositoryAdapter } from '../../../infrastructure/adapters/ProjectProfileRepositoryAdapter.adapter.js';
+import { RelayTransportAdapter } from '../../../infrastructure/adapters/RelayTransportAdapter.adapter.js';
+import { InspectConfiguredCapabilitiesUseCase } from '../InspectConfiguredCapabilitiesUseCase.use-case.js';
+import { InspectOutstandingCoordinationUseCase } from '../InspectOutstandingCoordinationUseCase.use-case.js';
+import { PublishProjectObservationUseCase } from '../PublishProjectObservationUseCase.use-case.js';
+import { ReadProjectAttentionUseCase } from '../ReadProjectAttentionUseCase.use-case.js';
+import { RecordAuthorizationConsumptionUseCase } from '../RecordAuthorizationConsumptionUseCase.use-case.js';
+import { RecordRelayAcknowledgementUseCase } from '../RecordRelayAcknowledgementUseCase.use-case.js';
+import { RegisterProjectProfileUseCase } from '../RegisterProjectProfileUseCase.use-case.js';
+import { RequestScopedDecisionUseCase } from '../RequestScopedDecisionUseCase.use-case.js';
+import { ResolveActionAuthorizationUseCase } from '../ResolveActionAuthorizationUseCase.use-case.js';
+import { SendFleetRelayUseCase } from '../SendFleetRelayUseCase.use-case.js';
+
+const NOW_ISO = '2026-10-15T09:00:00.000Z';
+const LATER_ISO = '2026-10-15T10:00:00.000Z';
+
+/* ------------------------------------------------------------------ *
+ * Record factories
+ * ------------------------------------------------------------------ */
+
+function profileRecord(overrides: Partial<ProjectProfileRecord> = {}): ProjectProfileRecord {
+  return {
+    projectId: 'project-atlas',
+    displayName: 'Atlas',
+    repository: 'atlas/repo',
+    designatedDispatcherHost: 'dispatcher-01',
+    policyRevision: 'policy-7',
+    maxConcurrentLanes: 3,
+    runnerCapabilities: { 'openai/gpt-5': true, 'local/vllm': false, s3: 'configured-unknown' },
+    revision: 0,
+    updatedAtIso: NOW_ISO,
+    ...overrides,
+  };
+}
+
+function consumptionRecord(
+  overrides: Partial<AuthorizationConsumptionRecord> = {},
+): AuthorizationConsumptionRecord {
+  return {
+    consumptionId: 'consumption-1',
+    grantId: 'grant-9',
+    requestId: 'request-1',
+    actionId: 'action-1',
+    attemptId: 'attempt-1',
+    expectedHeadSha: 'abc123',
+    consumedAtIso: LATER_ISO,
+    ...overrides,
+  };
+}
+
+function acknowledgementRecord(
+  overrides: Partial<RelayAcknowledgementRecord> = {},
+): RelayAcknowledgementRecord {
+  return {
+    acknowledgementId: 'ack-1',
+    requestId: 'request-1',
+    recipientId: 'fleet-master',
+    responseSummary: 'received and triaged',
+    provenance: 'waves-inbox-reply',
+    acknowledgedAtIso: LATER_ISO,
+    ...overrides,
+  };
+}
+
+function requestRecord(overrides: Partial<CoordinationRequestRecord> = {}): CoordinationRequestRecord {
+  return {
+    id: 'request-1',
+    projectId: 'project-atlas',
+    kind: 'action-decision',
+    state: 'approved',
+    actionScope: 'forge:merge',
+    expectedHeadSha: 'abc123',
+    proposalDigest: 'digest-1',
+    policyRevision: 'policy-7',
+    decisionRevision: 'decision-3',
+    grantId: 'grant-9',
+    consumptions: [],
+    acknowledgements: [],
+    deliveryStatus: 'pending',
+    deliveryGapReason: null,
+    revision: 1,
+    createdAtIso: NOW_ISO,
+    updatedAtIso: NOW_ISO,
+    ...overrides,
+  };
+}
+
+function envelope(overrides: Partial<ObservationEnvelopeProps> = {}): ObservationEnvelopeProps {
+  return {
+    observationId: 'observation-1',
+    projectId: 'project-atlas',
+    eventKind: 'attempt.completed',
+    sourceAttemptId: 'attempt-1',
+    payloadSummary: 'attempt finished; head commit collected',
+    recordedAtIso: NOW_ISO,
+    ...overrides,
+  };
+}
+
+function attentionSummary(
+  overrides: Partial<ProjectAttentionSummaryRecord> = {},
+): ProjectAttentionSummaryRecord {
+  return {
+    projectId: 'project-atlas',
+    staleWorkOrderCount: 1,
+    awaitingDecisionCount: 2,
+    deliveryGapCount: 0,
+    summaryText: 'one stale work order; two proposals awaiting a decision',
+    observedAtIso: NOW_ISO,
+    ...overrides,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Test doubles
+ * ------------------------------------------------------------------ */
+
+class StubProfileRepository implements ProjectProfileRepositoryPort {
+  readonly saves: ProjectProfileRecord[] = [];
+
+  constructor(private readonly profiles: Readonly<Record<string, ProjectProfileRecord>> = {}) {}
+
+  async saveProfile(record: ProjectProfileRecord): Promise<void> {
+    this.saves.push(record);
+  }
+
+  async findProfileById(projectId: string): Promise<ProjectProfileRecord | null> {
+    return this.profiles[projectId] ?? null;
+  }
+}
+
+class StubRequestRepository implements CoordinationRequestRepositoryPort {
+  readonly saves: CoordinationRequestRecord[] = [];
+  readonly requests = new Map<string, CoordinationRequestRecord>();
+
+  constructor(seed: readonly CoordinationRequestRecord[] = []) {
+    for (const record of seed) {
+      this.requests.set(record.id, record);
+    }
+  }
+
+  async saveRequest(record: CoordinationRequestRecord): Promise<void> {
+    this.saves.push(record);
+    this.requests.set(record.id, record);
+  }
+
+  async findRequestById(requestId: string): Promise<CoordinationRequestRecord | null> {
+    return this.requests.get(requestId) ?? null;
+  }
+
+  async findRequestByGrantId(grantId: string): Promise<CoordinationRequestRecord | null> {
+    for (const record of this.requests.values()) {
+      if (record.grantId === grantId) {
+        return record;
+      }
+    }
+    return null;
+  }
+
+  async listRequests(projectId?: string): Promise<readonly CoordinationRequestRecord[]> {
+    return [...this.requests.values()].filter(
+      (record) => projectId === undefined || record.projectId === projectId,
+    );
+  }
+}
+
+class StubDecisionTransport implements DecisionTransportPort {
+  readonly reads: string[] = [];
+
+  constructor(private readonly answers: Readonly<Record<string, DecisionAnswer>> = {}) {}
+
+  async readDecisionAnswer(requestId: string): Promise<DecisionAnswer> {
+    this.reads.push(requestId);
+    return (
+      this.answers[requestId] ?? {
+        state: 'awaiting-decision' as const,
+        decisionRevision: null,
+        grantId: null,
+      }
+    );
+  }
+}
+
+class StubRelayTransport {
+  readonly notices: RelayNoticeRequest[] = [];
+
+  constructor(private readonly receipts: Readonly<Record<string, RelayDeliveryOutcome>> = {}) {}
+
+  async deliverRelayNotice(request: RelayNoticeRequest): Promise<RelayDeliveryOutcome> {
+    this.notices.push(request);
+    return this.receipts[request.requestId] ?? { outcome: 'delivered' };
+  }
+}
+
+async function withTempDir<T>(run: (directory: string) => Promise<T>): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), 'fleet-coordination-'));
+  try {
+    return await run(directory);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Use case 1: RegisterProjectProfileUseCase
+ * ------------------------------------------------------------------ */
+
+describe('RegisterProjectProfileUseCase', () => {
+  const validRequest: RegisterProjectProfileRequest = {
+    projectId: 'project-atlas',
+    displayName: 'Atlas',
+    repository: 'atlas/repo',
+    designatedDispatcherHost: 'dispatcher-01',
+    policyRevision: 'policy-7',
+    maxConcurrentLanes: 3,
+    runnerCapabilities: { 'openai/gpt-5': true, 'local/vllm': false },
+    nowIso: NOW_ISO,
+  };
+
+  it('records a valid installation profile without any credential value', async () => {
+    const repo = new StubProfileRepository();
+    const result = await new RegisterProjectProfileUseCase({ profileRepo: repo }).execute(
+      validRequest,
+    );
+    expect(result.outcome).toBe('registered');
+    if (result.outcome !== 'registered') {
+      throw new Error('expected a registered profile');
+    }
+    expect(result.profile.designatedDispatcherHost).toBe('dispatcher-01');
+    expect(result.profile.revision).toBe(0);
+    expect(result.profile.updatedAtIso).toBe(NOW_ISO);
+    expect(repo.saves).toHaveLength(1);
+    expect(Object.keys(result.profile.runnerCapabilities)).toEqual(['openai/gpt-5', 'local/vllm']);
+  });
+
+  it('moves the profile revision forward when it already exists', async () => {
+    const repo = new StubProfileRepository({
+      'project-atlas': profileRecord({ revision: 4, updatedAtIso: LATER_ISO }),
+    });
+    const result = await new RegisterProjectProfileUseCase({ profileRepo: repo }).execute(
+      validRequest,
+    );
+    expect(result.outcome === 'registered' && result.profile.revision).toBe(5);
+  });
+
+  it('refuses a runner capability or field that would persist a credential', async () => {
+    const repo = new StubProfileRepository();
+    const useCase = new RegisterProjectProfileUseCase({ profileRepo: repo });
+    const capability = await useCase.execute({
+      ...validRequest,
+      runnerCapabilities: { 'openai/gpt-5': true, providerApiKey: 'never-persisted' },
+    });
+    expect(capability.outcome).toBe('rejected');
+    expect(capability.outcome === 'rejected' && capability.reason).toContain('providerApiKey');
+
+    for (const credentialName of ['secretKey', 'dbPassword', 'wavesToken']) {
+      const rejected = await useCase.execute({
+        ...validRequest,
+        runnerCapabilities: { [credentialName]: 'never-persisted' },
+      });
+      expect(rejected.outcome).toBe('rejected');
+      expect(rejected.outcome === 'rejected' && rejected.reason).toContain(credentialName);
+    }
+
+    const field = await useCase.execute({
+      ...validRequest,
+      deploymentSecret: 'never-persisted',
+    } as unknown as RegisterProjectProfileRequest);
+    expect(field.outcome).toBe('rejected');
+    expect(field.outcome === 'rejected' && field.reason).toContain('deploymentSecret');
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('refuses a profile that cannot dispatch or bound lanes', async () => {
+    const repo = new StubProfileRepository();
+    const useCase = new RegisterProjectProfileUseCase({ profileRepo: repo });
+    const noHost = await useCase.execute({ ...validRequest, designatedDispatcherHost: '  ' });
+    expect(noHost.outcome === 'rejected' && noHost.reason).toContain('designatedDispatcherHost');
+    const noLanes = await useCase.execute({ ...validRequest, maxConcurrentLanes: 0 });
+    expect(noLanes.outcome === 'rejected' && noLanes.reason).toContain('maxConcurrentLanes');
+    const noPolicy = await useCase.execute({ ...validRequest, policyRevision: '' });
+    expect(noPolicy.outcome === 'rejected' && noPolicy.reason).toContain('policyRevision');
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('refuses to run without dependencies or a request', async () => {
+    await expect(
+      new RegisterProjectProfileUseCase().execute(validRequest),
+    ).rejects.toThrow('Not implemented: RegisterProjectProfileUseCase');
+    await expect(
+      new RegisterProjectProfileUseCase({ profileRepo: new StubProfileRepository() }).execute(
+        undefined,
+      ),
+    ).rejects.toThrow('Not implemented: RegisterProjectProfileUseCase');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 2: InspectConfiguredCapabilitiesUseCase
+ * ------------------------------------------------------------------ */
+
+describe('InspectConfiguredCapabilitiesUseCase', () => {
+  const request: InspectConfiguredCapabilitiesRequest = {
+    projectId: 'project-atlas',
+    requiredCapabilities: ['openai/gpt-5', 'local/vllm', 's3', 'never-configured'],
+  };
+
+  it('separates supported, missing and explicitly unknown capabilities', async () => {
+    const repo = new StubProfileRepository({ 'project-atlas': profileRecord() });
+    const result = await new InspectConfiguredCapabilitiesUseCase({ profileRepo: repo }).execute(
+      request,
+    );
+    expect(result.outcome).toBe('inspected');
+    if (result.outcome !== 'inspected') {
+      throw new Error('expected an inspected profile');
+    }
+    expect(result.missingRequirements).toEqual(['local/vllm', 's3', 'never-configured']);
+    expect(result.explicitUnknowns).toEqual(['s3', 'never-configured']);
+    expect(result.profile.runnerCapabilities['openai/gpt-5']).toBe(true);
+  });
+
+  it('reports an unrecorded project as not-found rather than as having nothing', async () => {
+    const result = await new InspectConfiguredCapabilitiesUseCase({
+      profileRepo: new StubProfileRepository(),
+    }).execute({ projectId: 'project-unknown' });
+    expect(result).toEqual({ outcome: 'not-found', projectId: 'project-unknown' });
+  });
+
+  it('bounds the report to the requested requirements', async () => {
+    const repo = new StubProfileRepository({ 'project-atlas': profileRecord() });
+    const result = await new InspectConfiguredCapabilitiesUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+    });
+    expect(result.outcome === 'inspected' && result.missingRequirements).toEqual([]);
+    expect(result.outcome === 'inspected' && result.explicitUnknowns).toEqual([]);
+  });
+
+  it('refuses to run without dependencies', async () => {
+    await expect(
+      new InspectConfiguredCapabilitiesUseCase().execute(request),
+    ).rejects.toThrow('Not implemented: InspectConfiguredCapabilitiesUseCase');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 3: RequestScopedDecisionUseCase
+ * ------------------------------------------------------------------ */
+
+describe('RequestScopedDecisionUseCase', () => {
+  const request = {
+    requestId: 'request-1',
+    projectId: 'project-atlas',
+    kind: 'action-decision' as const,
+    actionScope: 'forge:merge',
+    expectedHeadSha: 'abc123',
+    proposalDigest: 'digest-1',
+    policyRevision: 'policy-7',
+    nowIso: NOW_ISO,
+  };
+
+  it('records the proposal before any decider is asked', async () => {
+    const repo = new StubRequestRepository();
+    const result = await new RequestScopedDecisionUseCase({ requestRepo: repo }).execute(request);
+    expect(result.outcome).toBe('requested');
+    if (result.outcome !== 'requested') {
+      throw new Error('expected a recorded request');
+    }
+    expect(result.request.state).toBe('awaiting-decision');
+    expect(result.request.grantId).toBeNull();
+    expect(result.request.decisionRevision).toBeNull();
+    expect(result.request.revision).toBe(0);
+    expect(repo.saves[0]?.id).toBe('request-1');
+  });
+
+  it('leaves an unanswered proposal awaiting rather than approved', async () => {
+    const repo = new StubRequestRepository();
+    const transport = new StubDecisionTransport();
+    const result = await new RequestScopedDecisionUseCase({
+      requestRepo: repo,
+      decisionTransport: transport,
+    }).execute(request);
+    expect(result.outcome === 'requested' && result.request.state).toBe('awaiting-decision');
+    expect(transport.reads).toEqual(['request-1']);
+    expect(repo.saves).toHaveLength(1);
+  });
+
+  it('applies a verified answer that carries a grant', async () => {
+    const repo = new StubRequestRepository();
+    const transport = new StubDecisionTransport({
+      'request-1': { state: 'approved', decisionRevision: 'decision-3', grantId: 'grant-9' },
+    });
+    const result = await new RequestScopedDecisionUseCase({
+      requestRepo: repo,
+      decisionTransport: transport,
+    }).execute(request);
+    if (result.outcome !== 'requested') {
+      throw new Error('expected a recorded request');
+    }
+    expect(result.request.state).toBe('approved');
+    expect(result.request.grantId).toBe('grant-9');
+    expect(result.request.decisionRevision).toBe('decision-3');
+    expect(result.request.revision).toBe(1);
+    expect(repo.saves.map((save) => save.state)).toEqual(['awaiting-decision', 'approved']);
+  });
+
+  it('never records an approval that carries no grant', async () => {
+    const repo = new StubRequestRepository();
+    const transport = new StubDecisionTransport({
+      'request-1': { state: 'approved', decisionRevision: 'decision-3', grantId: null },
+    });
+    const result = await new RequestScopedDecisionUseCase({
+      requestRepo: repo,
+      decisionTransport: transport,
+    }).execute(request);
+    expect(result.outcome === 'requested' && result.request.state).toBe('awaiting-decision');
+  });
+
+  it('refuses an unrecorded scope, an unknown kind and an absent request', async () => {
+    const repo = new StubRequestRepository();
+    const useCase = new RequestScopedDecisionUseCase({ requestRepo: repo });
+    const noScope = await useCase.execute({ ...request, actionScope: '  ' });
+    expect(noScope.outcome).toBe('rejected');
+    expect(noScope.outcome === 'rejected' && noScope.reason).toContain('actionScope');
+    const badKind = await useCase.execute({
+      ...request,
+      kind: 'escalation',
+    } as unknown as typeof request);
+    expect(badKind.outcome === 'rejected' && badKind.reason).toContain('kind');
+    expect(repo.saves).toHaveLength(0);
+    await expect(useCase.execute(undefined)).rejects.toThrow(
+      'Not implemented: RequestScopedDecisionUseCase',
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 4: ResolveActionAuthorizationUseCase
+ * ------------------------------------------------------------------ */
+
+describe('ResolveActionAuthorizationUseCase', () => {
+  const request = {
+    projectId: 'project-atlas',
+    actionScope: 'forge:merge',
+    expectedHeadSha: 'abc123',
+    authorizationGrantId: 'grant-9',
+  };
+
+  it('returns the applicable grant of an approved, unconsumed request', async () => {
+    const repo = new StubRequestRepository([requestRecord()]);
+    const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute(
+      request,
+    );
+    expect(result).toEqual({
+      outcome: 'authorized',
+      grantId: 'grant-9',
+      requestId: 'request-1',
+      expectedHeadSha: 'abc123',
+      policyRevision: 'policy-7',
+    });
+  });
+
+  it('finds an approved request by project and action scope without a grant id', async () => {
+    const repo = new StubRequestRepository([requestRecord()]);
+    const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute({
+      projectId: 'project-atlas',
+      actionScope: 'forge:merge',
+      expectedHeadSha: 'abc123',
+    });
+    expect(result.outcome === 'authorized' && result.grantId).toBe('grant-9');
+  });
+
+  it('blocks every state other than an approved grant', async () => {
+    const cases: ReadonlyArray<[string, Partial<CoordinationRequestRecord>, RegExp]> = [
+      [
+        'awaiting-decision',
+        { state: 'awaiting-decision', decisionRevision: null },
+        /awaiting-decision/,
+      ],
+      ['declined', { state: 'declined' }, /declined/],
+      ['no decision revision', { decisionRevision: null }, /decision revision/],
+      ['moved head', { expectedHeadSha: 'def456' }, /not forge:merge at abc123/],
+      ['different scope', { actionScope: 'host:restart' }, /host:restart/],
+      ['already consumed', { consumptions: [consumptionRecord()] }, /already consumed/],
+      ['another project', { projectId: 'project-other' }, /belongs to project project-other/],
+    ];
+    for (const [name, overrides, expected] of cases) {
+      const repo = new StubRequestRepository([requestRecord(overrides)]);
+      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute(
+        request,
+      );
+      expect(result.outcome, name).toBe('blocked');
+      expect(result.outcome === 'blocked' && result.reason, name).toMatch(expected);
+    }
+  });
+
+  it('blocks a recorded request that carries no grant', async () => {
+    const repo = new StubRequestRepository([requestRecord({ grantId: null })]);
+    const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute({
+      projectId: 'project-atlas',
+      actionScope: 'forge:merge',
+      expectedHeadSha: 'abc123',
+    });
+    expect(result.outcome === 'blocked' && result.reason).toContain('carries no grant');
+  });
+
+  it('blocks when nothing is recorded at all', async () => {
+    const repo = new StubRequestRepository();
+    const missingGrant = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute(
+      request,
+    );
+    expect(missingGrant.outcome === 'blocked' && missingGrant.reason).toContain('grant-9');
+    const missingScope = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute({
+      projectId: 'project-atlas',
+      actionScope: 'forge:merge',
+      expectedHeadSha: 'abc123',
+    });
+    expect(missingScope.outcome === 'blocked' && missingScope.reason).toContain('forge:merge');
+  });
+
+  it('refreshes a pending request from a verified answer once', async () => {
+    const repo = new StubRequestRepository([
+      requestRecord({ state: 'awaiting-decision', decisionRevision: null }),
+    ]);
+    const transport = new StubDecisionTransport({
+      'request-1': { state: 'approved', decisionRevision: 'decision-3', grantId: 'grant-9' },
+    });
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repo,
+      decisionTransport: transport,
+    }).execute(request);
+    expect(result.outcome === 'authorized' && result.grantId).toBe('grant-9');
+    expect(transport.reads).toEqual(['request-1']);
+    expect(repo.saves).toHaveLength(1);
+    expect(repo.saves[0]?.state).toBe('approved');
+  });
+
+  it('stays blocked when the verified answer carries no grant or is still pending', async () => {
+    const grantless = new StubRequestRepository([
+      requestRecord({ state: 'awaiting-decision', decisionRevision: null }),
+    ]);
+    const grantlessResult = await new ResolveActionAuthorizationUseCase({
+      requestRepo: grantless,
+      decisionTransport: new StubDecisionTransport({
+        'request-1': { state: 'approved', decisionRevision: 'decision-3', grantId: null },
+      }),
+    }).execute(request);
+    expect(grantlessResult.outcome === 'blocked' && grantlessResult.reason).toContain(
+      'awaiting-decision',
+    );
+    expect(grantless.saves).toHaveLength(0);
+
+    const pending = new StubRequestRepository([
+      requestRecord({ state: 'awaiting-decision', decisionRevision: null }),
+    ]);
+    const pendingResult = await new ResolveActionAuthorizationUseCase({
+      requestRepo: pending,
+      decisionTransport: new StubDecisionTransport({
+        'request-1': { state: 'declined', decisionRevision: 'decision-4', grantId: null },
+      }),
+    }).execute(request);
+    expect(pendingResult.outcome).toBe('blocked');
+  });
+
+  it('refuses to run without dependencies or a usable request', async () => {
+    await expect(
+      new ResolveActionAuthorizationUseCase().execute(request),
+    ).rejects.toThrow('Not implemented: ResolveActionAuthorizationUseCase');
+    await expect(
+      new ResolveActionAuthorizationUseCase({
+        requestRepo: new StubRequestRepository(),
+      }).execute(undefined),
+    ).rejects.toThrow('Not implemented: ResolveActionAuthorizationUseCase');
+    await expect(
+      new ResolveActionAuthorizationUseCase({
+        requestRepo: new StubRequestRepository(),
+      }).execute({ ...request, expectedHeadSha: '' }),
+    ).rejects.toThrow('Not implemented: ResolveActionAuthorizationUseCase');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 5: RecordAuthorizationConsumptionUseCase
+ * ------------------------------------------------------------------ */
+
+describe('RecordAuthorizationConsumptionUseCase', () => {
+  const consumptionRequest = {
+    consumptionId: 'consumption-1',
+    grantId: 'grant-9',
+    actionId: 'action-1',
+    attemptId: 'attempt-1',
+    expectedHeadSha: 'abc123',
+    nowIso: LATER_ISO,
+  };
+
+  it('binds a grant to one action and attempt and completes the request', async () => {
+    const repo = new StubRequestRepository([requestRecord()]);
+    const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: repo }).execute(
+      consumptionRequest,
+    );
+    expect(result.outcome).toBe('consumed');
+    if (result.outcome !== 'consumed') {
+      throw new Error('expected a recorded consumption');
+    }
+    expect(result.consumption).toEqual({
+      consumptionId: 'consumption-1',
+      grantId: 'grant-9',
+      requestId: 'request-1',
+      actionId: 'action-1',
+      attemptId: 'attempt-1',
+      expectedHeadSha: 'abc123',
+      consumedAtIso: LATER_ISO,
+    });
+    const stored = repo.requests.get('request-1');
+    expect(stored?.state).toBe('completed');
+    expect(stored?.revision).toBe(2);
+    expect(stored?.consumptions).toHaveLength(1);
+  });
+
+  it('never lets one grant authorize a second, unrelated action', async () => {
+    const repo = new StubRequestRepository([requestRecord()]);
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+    await useCase.execute(consumptionRequest);
+    const second = await useCase.execute({
+      ...consumptionRequest,
+      consumptionId: 'consumption-2',
+      actionId: 'action-2',
+      attemptId: 'attempt-2',
+    });
+    expect(second.outcome).toBe('refused');
+    expect(second.outcome === 'refused' && second.reason).toContain('action-1');
+    expect(repo.requests.get('request-1')?.consumptions).toHaveLength(1);
+  });
+
+  it('refuses to record the same action twice', async () => {
+    const repo = new StubRequestRepository([
+      requestRecord({ consumptions: [consumptionRecord()] }),
+    ]);
+    const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: repo }).execute(
+      consumptionRequest,
+    );
+    expect(result.outcome).toBe('refused');
+    expect(result.outcome === 'refused' && result.reason).toContain('already authorized');
+  });
+
+  it('refuses an unrecorded grant, an unapproved state and a moved head', async () => {
+    const unknownGrant = new StubRequestRepository();
+    expect(
+      (
+        await new RecordAuthorizationConsumptionUseCase({ requestRepo: unknownGrant }).execute(
+          consumptionRequest,
+        )
+      ).outcome === 'refused',
+    ).toBe(true);
+
+    const declined = new StubRequestRepository([requestRecord({ state: 'declined' })]);
+    expect(
+      (
+        await new RecordAuthorizationConsumptionUseCase({ requestRepo: declined }).execute(
+          consumptionRequest,
+        )
+      ).outcome === 'refused',
+    ).toBe(true);
+
+    const moved = new StubRequestRepository([requestRecord({ expectedHeadSha: 'def456' })]);
+    const movedResult = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: moved,
+    }).execute(consumptionRequest);
+    expect(movedResult.outcome === 'refused' && movedResult.reason).toContain('def456');
+    expect(moved.saves).toHaveLength(0);
+  });
+
+  it('refuses an incomplete consumption and refuses to run without dependencies', async () => {
+    const repo = new StubRequestRepository([requestRecord()]);
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+    const incomplete = await useCase.execute({ ...consumptionRequest, actionId: ' ' });
+    expect(incomplete.outcome === 'refused' && incomplete.reason).toContain('actionId');
+    await expect(useCase.execute(undefined)).rejects.toThrow(
+      'Not implemented: RecordAuthorizationConsumptionUseCase',
+    );
+    await expect(
+      new RecordAuthorizationConsumptionUseCase().execute(consumptionRequest),
+    ).rejects.toThrow('Not implemented: RecordAuthorizationConsumptionUseCase');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 6: PublishProjectObservationUseCase
+ * ------------------------------------------------------------------ */
+
+describe('PublishProjectObservationUseCase', () => {
+  const observation = {
+    observationId: 'observation-1',
+    projectId: 'project-atlas',
+    eventKind: 'attempt.completed',
+    sourceAttemptId: 'attempt-1',
+    payloadSummary: 'attempt finished; head commit collected',
+    nowIso: NOW_ISO,
+  };
+
+  it('publishes an attributed observation snapshot', async () => {
+    const published: ObservationEnvelopeProps[] = [];
+    const adapter = new ObservationPublicationAdapter({
+      publish: (candidate) => {
+        published.push(candidate);
+      },
+    });
+    const result = await new PublishProjectObservationUseCase({
+      publicationPort: adapter,
+    }).execute(observation);
+    expect(result).toEqual({ outcome: 'published', observationId: 'observation-1' });
+    expect(published).toEqual([envelope()]);
+  });
+
+  it('keeps an unknown source attempt unknown rather than inferring one', async () => {
+    const published: ObservationEnvelopeProps[] = [];
+    const adapter = new ObservationPublicationAdapter({
+      publish: (candidate) => {
+        published.push(candidate);
+      },
+    });
+    await new PublishProjectObservationUseCase({ publicationPort: adapter }).execute({
+      ...observation,
+      sourceAttemptId: null,
+    });
+    expect(published[0]?.sourceAttemptId).toBeNull();
+  });
+
+  it('preserves a delivery gap without throwing and leaves the fact undelivered', async () => {
+    const adapter = new ObservationPublicationAdapter({
+      publish: () => {
+        throw new Error('waves client unreachable');
+      },
+    });
+    const result = await new PublishProjectObservationUseCase({
+      publicationPort: adapter,
+    }).execute(observation);
+    expect(result.outcome).toBe('delivery-gap');
+    expect(result.outcome === 'delivery-gap' && result.reason).toContain('waves client unreachable');
+    await expect(adapter.listUndeliveredObservations('project-atlas')).resolves.toEqual([
+      envelope(),
+    ]);
+  });
+
+  it('refuses an observation it cannot attribute', async () => {
+    const adapter = new ObservationPublicationAdapter({ publish: () => undefined });
+    const useCase = new PublishProjectObservationUseCase({ publicationPort: adapter });
+    await expect(
+      useCase.execute({ ...observation, payloadSummary: '  ' }),
+    ).rejects.toThrow('Not implemented: PublishProjectObservationUseCase');
+    await expect(useCase.execute(undefined)).rejects.toThrow(
+      'Not implemented: PublishProjectObservationUseCase',
+    );
+    await expect(
+      new PublishProjectObservationUseCase().execute(observation),
+    ).rejects.toThrow('Not implemented: PublishProjectObservationUseCase');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 7: ReadProjectAttentionUseCase
+ * ------------------------------------------------------------------ */
+
+describe('ReadProjectAttentionUseCase', () => {
+  it('reads a bounded summary for one project', async () => {
+    const requested: string[] = [];
+    const adapter = new AttentionReadAdapter({
+      read: (projectId) => {
+        requested.push(projectId);
+        return attentionSummary();
+      },
+    });
+    const result = await new ReadProjectAttentionUseCase({ attentionPort: adapter }).execute({
+      projectId: 'project-atlas',
+    });
+    expect(result).toEqual({ outcome: 'read', attention: attentionSummary() });
+    expect(requested).toEqual(['project-atlas']);
+  });
+
+  it('reports an unreadable summary as unavailable rather than healthy', async () => {
+    const absent = new ReadProjectAttentionUseCase({
+      attentionPort: new AttentionReadAdapter(),
+    });
+    const missing = await absent.execute({ projectId: 'project-atlas' });
+    expect(missing.outcome).toBe('unavailable');
+
+    const failing = new ReadProjectAttentionUseCase({
+      attentionPort: new AttentionReadAdapter({
+        read: () => {
+          throw new Error('attention endpoint timed out');
+        },
+      }),
+    });
+    const failed = await failing.execute({ projectId: 'project-atlas' });
+    expect(failed.outcome === 'unavailable' && failed.reason).toContain('timed out');
+
+    const crossed = new ReadProjectAttentionUseCase({
+      attentionPort: new AttentionReadAdapter({
+        summaries: { 'project-other': attentionSummary({ projectId: 'project-other' }) },
+      }),
+    });
+    const otherProject = await crossed.execute({ projectId: 'project-atlas' });
+    expect(otherProject.outcome).toBe('unavailable');
+  });
+
+  it('refuses to run without dependencies or a project', async () => {
+    await expect(
+      new ReadProjectAttentionUseCase().execute({ projectId: 'project-atlas' }),
+    ).rejects.toThrow('Not implemented: ReadProjectAttentionUseCase');
+    await expect(
+      new ReadProjectAttentionUseCase({ attentionPort: new AttentionReadAdapter() }).execute(
+        undefined,
+      ),
+    ).rejects.toThrow('Not implemented: ReadProjectAttentionUseCase');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 8: SendFleetRelayUseCase
+ * ------------------------------------------------------------------ */
+
+describe('SendFleetRelayUseCase', () => {
+  const relayRequest = {
+    requestId: 'relay-1',
+    projectId: 'project-atlas',
+    recipientId: 'fleet-master',
+    summary: 'attempt finished; head abc123 is ready for review',
+    policyRevision: 'policy-7',
+    nowIso: NOW_ISO,
+  };
+
+  it('records delivery without recording a recipient response', async () => {
+    const repo = new StubRequestRepository();
+    const transport = new StubRelayTransport();
+    const result = await new SendFleetRelayUseCase({
+      requestRepo: repo,
+      relayTransport: transport,
+    }).execute(relayRequest);
+    expect(result.outcome).toBe('delivered');
+    if (result.outcome !== 'delivered') {
+      throw new Error('expected a delivered relay');
+    }
+    expect(result.request.kind).toBe('relay');
+    expect(result.request.deliveryStatus).toBe('delivered');
+    expect(result.request.deliveryGapReason).toBeNull();
+    // Delivery proves transport only; it never records a response.
+    expect(result.request.acknowledgements).toEqual([]);
+    expect(result.request.state).toBe('executing');
+    expect(transport.notices).toEqual([
+      {
+        requestId: 'relay-1',
+        projectId: 'project-atlas',
+        recipientId: 'fleet-master',
+        summary: relayRequest.summary,
+      },
+    ]);
+  });
+
+  it('records an explicit delivery gap instead of a fabricated receipt', async () => {
+    const repo = new StubRequestRepository();
+    const transport = new StubRelayTransport({
+      'relay-1': { outcome: 'delivery-gap', reason: 'notice channel is offline' },
+    });
+    const result = await new SendFleetRelayUseCase({
+      requestRepo: repo,
+      relayTransport: transport,
+    }).execute(relayRequest);
+    expect(result.outcome).toBe('delivery-gap');
+    if (result.outcome !== 'delivery-gap') {
+      throw new Error('expected a delivery gap');
+    }
+    expect(result.reason).toContain('offline');
+    expect(result.request.deliveryStatus).toBe('delivery-gap');
+    expect(result.request.deliveryGapReason).toContain('offline');
+    expect(result.request.acknowledgements).toEqual([]);
+  });
+
+  it('lets an unanswered gapped relay be sent again and refuses an answered one', async () => {
+    const repo = new StubRequestRepository();
+    const transport = new StubRelayTransport({
+      'relay-1': { outcome: 'delivery-gap', reason: 'notice channel is offline' },
+    });
+    const useCase = new SendFleetRelayUseCase({ requestRepo: repo, relayTransport: transport });
+    await useCase.execute(relayRequest);
+    const resent = await new SendFleetRelayUseCase({
+      requestRepo: repo,
+      relayTransport: new StubRelayTransport(),
+    }).execute({ ...relayRequest, nowIso: LATER_ISO });
+    expect(resent.outcome === 'delivered' && resent.request.revision).toBe(1);
+    expect(resent.outcome === 'delivered' && resent.request.createdAtIso).toBe(NOW_ISO);
+
+    const answered = new StubRequestRepository([
+      requestRecord({
+        id: 'relay-1',
+        kind: 'relay',
+        state: 'completed',
+        grantId: null,
+        decisionRevision: null,
+        acknowledgements: [acknowledgementRecord({ requestId: 'relay-1' })],
+      }),
+    ]);
+    const refused = await new SendFleetRelayUseCase({
+      requestRepo: answered,
+      relayTransport: new StubRelayTransport(),
+    }).execute(relayRequest);
+    expect(refused.outcome === 'rejected' && refused.reason).toContain('already answered');
+  });
+
+  it('refuses an unusable notice and refuses to run without dependencies', async () => {
+    const repo = new StubRequestRepository();
+    const useCase = new SendFleetRelayUseCase({
+      requestRepo: repo,
+      relayTransport: new StubRelayTransport(),
+    });
+    const empty = await useCase.execute({ ...relayRequest, summary: '  ' });
+    expect(empty.outcome === 'rejected' && empty.reason).toContain('summary');
+
+    const notARelay = await new SendFleetRelayUseCase({
+      requestRepo: new StubRequestRepository([requestRecord({ id: 'relay-1' })]),
+      relayTransport: new StubRelayTransport(),
+    }).execute(relayRequest);
+    expect(notARelay.outcome === 'rejected' && notARelay.reason).toContain('not a relay');
+    await expect(useCase.execute(undefined)).rejects.toThrow('Not implemented: SendFleetRelayUseCase');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 9: RecordRelayAcknowledgementUseCase
+ * ------------------------------------------------------------------ */
+
+describe('RecordRelayAcknowledgementUseCase', () => {
+  const relayRecord = (overrides: Partial<CoordinationRequestRecord> = {}): CoordinationRequestRecord =>
+    requestRecord({
+      id: 'relay-1',
+      kind: 'relay',
+      state: 'executing',
+      actionScope: 'relay:fleet-master',
+      expectedHeadSha: null,
+      grantId: null,
+      decisionRevision: null,
+      deliveryStatus: 'delivered',
+      ...overrides,
+    });
+
+  const acknowledgementRequest = {
+    acknowledgementId: 'ack-1',
+    requestId: 'relay-1',
+    recipientId: 'fleet-master',
+    responseSummary: 'received and triaged',
+    provenance: 'waves-inbox-reply',
+    nowIso: LATER_ISO,
+  };
+
+  it('records an actual recipient response and completes the relay', async () => {
+    const repo = new StubRequestRepository([relayRecord()]);
+    const result = await new RecordRelayAcknowledgementUseCase({ requestRepo: repo }).execute(
+      acknowledgementRequest,
+    );
+    expect(result.outcome).toBe('acknowledged');
+    if (result.outcome !== 'acknowledged') {
+      throw new Error('expected a recorded response');
+    }
+    expect(result.acknowledgement).toEqual({
+      acknowledgementId: 'ack-1',
+      requestId: 'relay-1',
+      recipientId: 'fleet-master',
+      responseSummary: 'received and triaged',
+      provenance: 'waves-inbox-reply',
+      acknowledgedAtIso: LATER_ISO,
+    });
+    expect(result.request.state).toBe('completed');
+    expect(result.request.revision).toBe(2);
+    expect(result.request.deliveryStatus).toBe('delivered');
+  });
+
+  it('refuses silence, an unattributed response and a duplicate', async () => {
+    const repo = new StubRequestRepository([relayRecord()]);
+    const useCase = new RecordRelayAcknowledgementUseCase({ requestRepo: repo });
+    for (const field of ['recipientId', 'responseSummary', 'provenance'] as const) {
+      const refused = await useCase.execute({ ...acknowledgementRequest, [field]: '   ' });
+      expect(refused.outcome, field).toBe('rejected');
+      expect(refused.outcome === 'rejected' && refused.reason, field).toContain(field);
+    }
+    const missing = await useCase.execute({ ...acknowledgementRequest, requestId: 'relay-none' });
+    expect(missing.outcome === 'rejected' && missing.reason).toContain('relay-none');
+    const notARelay = await new RecordRelayAcknowledgementUseCase({
+      requestRepo: new StubRequestRepository([
+        requestRecord({ id: 'relay-1', kind: 'action-decision' }),
+      ]),
+    }).execute(acknowledgementRequest);
+    expect(notARelay.outcome === 'rejected' && notARelay.reason).toContain('not a relay');
+
+    await useCase.execute(acknowledgementRequest);
+    const duplicate = await useCase.execute(acknowledgementRequest);
+    expect(duplicate.outcome === 'rejected' && duplicate.reason).toContain('already recorded');
+    expect(repo.requests.get('relay-1')?.acknowledgements).toHaveLength(1);
+  });
+
+  it('keeps a recorded delivery gap visible when a response arrives anyway', async () => {
+    const repo = new StubRequestRepository([
+      relayRecord({
+        deliveryStatus: 'delivery-gap',
+        deliveryGapReason: 'notice channel is offline',
+      }),
+    ]);
+    const result = await new RecordRelayAcknowledgementUseCase({ requestRepo: repo }).execute(
+      acknowledgementRequest,
+    );
+    expect(result.outcome === 'acknowledged' && result.request.deliveryStatus).toBe('delivery-gap');
+    expect(
+      result.outcome === 'acknowledged' && result.request.deliveryGapReason,
+    ).toContain('offline');
+  });
+
+  it('refuses to run without dependencies or a request', async () => {
+    await expect(
+      new RecordRelayAcknowledgementUseCase().execute(acknowledgementRequest),
+    ).rejects.toThrow('Not implemented: RecordRelayAcknowledgementUseCase');
+    await expect(
+      new RecordRelayAcknowledgementUseCase({
+        requestRepo: new StubRequestRepository(),
+      }).execute(undefined),
+    ).rejects.toThrow('Not implemented: RecordRelayAcknowledgementUseCase');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 10: InspectOutstandingCoordinationUseCase
+ * ------------------------------------------------------------------ */
+
+describe('InspectOutstandingCoordinationUseCase', () => {
+  it('categorises undecided proposals, unknown actions and unanswered relays', async () => {
+    const repo = new StubRequestRepository([
+      requestRecord({ id: 'request-1', state: 'proposed', grantId: null, decisionRevision: null }),
+      requestRecord({
+        id: 'request-2',
+        state: 'awaiting-decision',
+        grantId: null,
+        decisionRevision: null,
+      }),
+      requestRecord({ id: 'request-3', state: 'unknown', grantId: null, decisionRevision: null }),
+      requestRecord({
+        id: 'relay-1',
+        kind: 'relay',
+        state: 'executing',
+        actionScope: 'relay:fleet-master',
+        expectedHeadSha: null,
+        grantId: null,
+        decisionRevision: null,
+        deliveryStatus: 'delivered',
+      }),
+      requestRecord({
+        id: 'relay-2',
+        kind: 'relay',
+        state: 'completed',
+        actionScope: 'relay:fleet-master',
+        expectedHeadSha: null,
+        grantId: null,
+        decisionRevision: null,
+        deliveryStatus: 'delivered',
+        acknowledgements: [acknowledgementRecord({ requestId: 'relay-2' })],
+      }),
+      requestRecord({ id: 'request-4', state: 'completed', projectId: 'project-other' }),
+    ]);
+    const publicationPort = new ObservationPublicationAdapter({
+      publish: () => {
+        throw new Error('waves client unreachable');
+      },
+    });
+    const useCase = new InspectOutstandingCoordinationUseCase({
+      requestRepo: repo,
+      publicationPort,
+    });
+    const projectScope = await useCase.execute({ projectId: 'project-atlas' });
+    expect(projectScope.undecidedProposals.map((record) => record.id)).toEqual([
+      'request-1',
+      'request-2',
+    ]);
+    expect(projectScope.unknownActions.map((record) => record.id)).toEqual(['request-3']);
+    expect(projectScope.unacknowledgedRelays.map((record) => record.id)).toEqual(['relay-1']);
+    expect(projectScope.undeliveredObservations).toEqual([]);
+
+    await new PublishProjectObservationUseCase({ publicationPort }).execute({
+      observationId: 'observation-1',
+      projectId: 'project-atlas',
+      eventKind: 'attempt.completed',
+      sourceAttemptId: null,
+      payloadSummary: 'attempt finished',
+      nowIso: NOW_ISO,
+    });
+    const withGap = await useCase.execute({ projectId: 'project-atlas' });
+    expect(withGap.undeliveredObservations).toHaveLength(1);
+    expect(await useCase.execute({ projectId: 'project-other' })).toMatchObject({
+      undeliveredObservations: [],
+      undecidedProposals: [],
+    });
+
+    const fleetWide = await useCase.execute({});
+    expect(fleetWide.undecidedProposals).toHaveLength(2);
+    expect(fleetWide.unacknowledgedRelays.map((record) => record.id)).toEqual(['relay-1']);
+  });
+
+  it('reports known absence as empty lists, never as invented items', async () => {
+    const result = await new InspectOutstandingCoordinationUseCase({
+      requestRepo: new StubRequestRepository(),
+      publicationPort: new ObservationPublicationAdapter({ publish: () => undefined }),
+    }).execute({ projectId: 'project-atlas' });
+    expect(result).toEqual({
+      undecidedProposals: [],
+      unknownActions: [],
+      undeliveredObservations: [],
+      unacknowledgedRelays: [],
+    });
+  });
+
+  it('refuses to run without dependencies', async () => {
+    await expect(
+      new InspectOutstandingCoordinationUseCase().execute({ projectId: 'project-atlas' }),
+    ).rejects.toThrow('Not implemented: InspectOutstandingCoordinationUseCase');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Shared composition-boundary contract
+ * ------------------------------------------------------------------ */
+
+describe('use case composition boundary', () => {
+  const cases: ReadonlyArray<[string, { execute: (input: unknown) => Promise<unknown> }]> = [
+    ['RegisterProjectProfileUseCase', new RegisterProjectProfileUseCase()],
+    ['InspectConfiguredCapabilitiesUseCase', new InspectConfiguredCapabilitiesUseCase()],
+    ['RequestScopedDecisionUseCase', new RequestScopedDecisionUseCase()],
+    ['ResolveActionAuthorizationUseCase', new ResolveActionAuthorizationUseCase()],
+    ['RecordAuthorizationConsumptionUseCase', new RecordAuthorizationConsumptionUseCase()],
+    ['PublishProjectObservationUseCase', new PublishProjectObservationUseCase()],
+    ['ReadProjectAttentionUseCase', new ReadProjectAttentionUseCase()],
+    ['SendFleetRelayUseCase', new SendFleetRelayUseCase()],
+    ['RecordRelayAcknowledgementUseCase', new RecordRelayAcknowledgementUseCase()],
+    ['InspectOutstandingCoordinationUseCase', new InspectOutstandingCoordinationUseCase()],
+  ];
+
+  it('refuses every unconfigured use case at the boundary', async () => {
+    for (const [name, useCase] of cases) {
+      await expect(useCase.execute(undefined), name).rejects.toThrow(`Not implemented: ${name}`);
+      // A bare id is not a request object, so it never becomes one here.
+      await expect(useCase.execute('request-1'), name).rejects.toThrow(`Not implemented: ${name}`);
+    }
+  });
+
+  it('reports an incomplete request rather than acting on it', async () => {
+    const result = await new RegisterProjectProfileUseCase({
+      profileRepo: new StubProfileRepository(),
+    }).execute({});
+    expect(result.outcome).toBe('rejected');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Adapters
+ * ------------------------------------------------------------------ */
+
+describe('ProjectProfileRepositoryAdapter', () => {
+  it('stores profiles in memory and reports known absence as null', async () => {
+    const adapter = new ProjectProfileRepositoryAdapter();
+    await expect(adapter.findProfileById('project-atlas')).resolves.toBeNull();
+    await adapter.saveProfile(profileRecord({ revision: 0 }));
+    const found = await adapter.findProfileById('project-atlas');
+    expect(found?.designatedDispatcherHost).toBe('dispatcher-01');
+    expect(found?.runnerCapabilities).toEqual(profileRecord().runnerCapabilities);
+    expect(found).not.toBe(await adapter.findProfileById('project-atlas'));
+  });
+
+  it('refuses a stale or conflicting revision instead of overwriting', async () => {
+    const adapter = new ProjectProfileRepositoryAdapter();
+    await adapter.saveProfile(profileRecord({ revision: 3 }));
+    await expect(
+      adapter.saveProfile(profileRecord({ revision: 2, displayName: 'Stale' })),
+    ).rejects.toThrow(/stale revision 2/);
+    await expect(
+      adapter.saveProfile(profileRecord({ revision: 3, displayName: 'Conflicting' })),
+    ).rejects.toThrow(/conflicting revision 3/);
+    await expect(
+      adapter.saveProfile(profileRecord({ revision: 4, displayName: 'Newer' })),
+    ).resolves.toBeUndefined();
+    expect((await adapter.findProfileById('project-atlas'))?.revision).toBe(4);
+  });
+
+  it('refuses to persist a credential-shaped field', async () => {
+    const adapter = new ProjectProfileRepositoryAdapter();
+    await expect(
+      adapter.saveProfile({
+        ...profileRecord(),
+        wavesApiToken: 'never-persisted',
+      } as unknown as ProjectProfileRecord),
+    ).rejects.toThrow(/credential field/);
+    await expect(adapter.findProfileById('project-atlas')).resolves.toBeNull();
+  });
+
+  it('persists to the configured state directory and reloads it', async () => {
+    await withTempDir(async (stateDir) => {
+      const adapter = new ProjectProfileRepositoryAdapter({ stateDir });
+      await adapter.saveProfile(profileRecord({ revision: 1 }));
+      await adapter.saveProfile(
+        profileRecord({ projectId: 'project-borealis', revision: 0, displayName: 'Borealis' }),
+      );
+      const persisted = JSON.parse(
+        await readFile(join(stateDir, 'project-profiles.json'), 'utf8'),
+      ) as ReadonlyArray<Record<string, unknown>>;
+      expect(persisted).toHaveLength(2);
+
+      const reloaded = new ProjectProfileRepositoryAdapter({ stateDir });
+      const found = await reloaded.findProfileById('project-borealis');
+      expect(found?.displayName).toBe('Borealis');
+      await expect(reloaded.saveProfile(profileRecord({ revision: 0 }))).rejects.toThrow(
+        /stale revision 0/,
+      );
+    });
+  });
+
+  it('refuses a state file name that would escape the state directory', async () => {
+    await withTempDir(async (stateDir) => {
+      const escaping = new ProjectProfileRepositoryAdapter({
+        stateDir,
+        fileName: '../escaped-profiles.json',
+      });
+      await expect(escaping.saveProfile(profileRecord())).rejects.toThrow(
+        /unsafe state file name/,
+      );
+      await expect(
+        new CoordinationRequestRepositoryAdapter({
+          stateDir,
+          fileName: '../escaped-requests.json',
+        }).saveRequest(requestRecord()),
+      ).rejects.toThrow(/unsafe state file name/);
+    });
+  });
+
+  it('treats unreadable persisted state as an error rather than as no profile', async () => {
+    await withTempDir(async (stateDir) => {
+      await writeFile(join(stateDir, 'project-profiles.json'), 'not json', 'utf8');
+      const adapter = new ProjectProfileRepositoryAdapter({ stateDir });
+      await expect(adapter.findProfileById('project-atlas')).rejects.toThrow(/could not parse/);
+    });
+  });
+});
+
+describe('CoordinationRequestRepositoryAdapter', () => {
+  it('finds requests by identity and by grant', async () => {
+    const adapter = new CoordinationRequestRepositoryAdapter();
+    await expect(adapter.findRequestById('request-1')).resolves.toBeNull();
+    await expect(adapter.findRequestByGrantId('grant-9')).resolves.toBeNull();
+    await adapter.saveRequest(requestRecord());
+    expect((await adapter.findRequestById('request-1'))?.grantId).toBe('grant-9');
+    expect((await adapter.findRequestByGrantId('grant-9'))?.id).toBe('request-1');
+    expect(await adapter.listRequests()).toHaveLength(1);
+    expect(await adapter.listRequests('project-other')).toHaveLength(0);
+  });
+
+  it('reindexes a grant when the record holding it changes or releases it', async () => {
+    const adapter = new CoordinationRequestRepositoryAdapter();
+    await adapter.saveRequest(requestRecord());
+    await adapter.saveRequest(
+      requestRecord({
+        id: 'request-2',
+        revision: 0,
+        createdAtIso: LATER_ISO,
+      }),
+    );
+    // The newest record for a grant is the one that resolves it.
+    expect((await adapter.findRequestByGrantId('grant-9'))?.id).toBe('request-2');
+
+    await adapter.saveRequest(
+      requestRecord({
+        id: 'request-2',
+        revision: 1,
+        grantId: null,
+        decisionRevision: null,
+        updatedAtIso: LATER_ISO,
+      }),
+    );
+    expect(await adapter.findRequestByGrantId('grant-9')).toBeNull();
+    expect((await adapter.findRequestById('request-1'))?.grantId).toBe('grant-9');
+  });
+
+  it('refuses a stale revision and an invalid record', async () => {
+    const adapter = new CoordinationRequestRepositoryAdapter();
+    await adapter.saveRequest(requestRecord({ revision: 5 }));
+    await expect(
+      adapter.saveRequest(requestRecord({ revision: 4, updatedAtIso: LATER_ISO })),
+    ).rejects.toThrow(/stale revision 4/);
+    await expect(
+      adapter.saveRequest(
+        requestRecord({ id: 'request-2', deliveryStatus: 'delivery-gap', deliveryGapReason: null }),
+      ),
+    ).rejects.toThrow(/delivery gap reason/);
+  });
+
+  it('persists requests and reloads them with their grant index', async () => {
+    await withTempDir(async (stateDir) => {
+      const adapter = new CoordinationRequestRepositoryAdapter({ stateDir });
+      await adapter.saveRequest(requestRecord());
+      await adapter.saveRequest(
+        requestRecord({
+          id: 'relay-1',
+          kind: 'relay',
+          state: 'executing',
+          actionScope: 'relay:fleet-master',
+          expectedHeadSha: null,
+          grantId: null,
+          decisionRevision: null,
+          deliveryStatus: 'delivery-gap',
+          deliveryGapReason: 'notice channel is offline',
+          revision: 0,
+          createdAtIso: LATER_ISO,
+        }),
+      );
+      const reloaded = new CoordinationRequestRepositoryAdapter({ stateDir });
+      expect(await reloaded.listRequests()).toHaveLength(2);
+      expect((await reloaded.findRequestByGrantId('grant-9'))?.id).toBe('request-1');
+      expect((await reloaded.findRequestById('relay-1'))?.deliveryGapReason).toContain('offline');
+    });
+  });
+});
+
+describe('DecisionTransportAdapter', () => {
+  it('reads a verified answer recorded in process', async () => {
+    const adapter = new DecisionTransportAdapter({
+      answers: {
+        'request-1': { state: 'approved', decisionRevision: 'decision-3', grantId: 'grant-9' },
+      },
+    });
+    await expect(adapter.readDecisionAnswer('request-1')).resolves.toEqual({
+      state: 'approved',
+      decisionRevision: 'decision-3',
+      grantId: 'grant-9',
+    });
+    await expect(adapter.readDecisionAnswer('request-2')).resolves.toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+    });
+  });
+
+  it('never upgrades a grantless, malformed or absent answer to approval', async () => {
+    const adapter = new DecisionTransportAdapter({
+      answers: {
+        'request-1': { state: 'approved', decisionRevision: 'decision-3', grantId: null },
+        'request-2': { state: 'maybe', decisionRevision: 'decision-3', grantId: 'grant-9' },
+      } as never,
+    });
+    await expect(adapter.readDecisionAnswer('request-1')).resolves.toMatchObject({
+      state: 'awaiting-decision',
+      grantId: null,
+    });
+    await expect(adapter.readDecisionAnswer('request-2')).resolves.toMatchObject({
+      state: 'awaiting-decision',
+      grantId: null,
+    });
+  });
+
+  it('reads owner-recorded decision files and treats absence as awaiting', async () => {
+    await withTempDir(async (decisionsDir) => {
+      await writeFile(
+        join(decisionsDir, 'request-1.json'),
+        JSON.stringify({ state: 'approved', decisionRevision: 'decision-3', grantId: 'grant-9' }),
+        'utf8',
+      );
+      await writeFile(join(decisionsDir, 'request-2.json'), 'not json', 'utf8');
+      const adapter = new DecisionTransportAdapter({ decisionsDir });
+      await expect(adapter.readDecisionAnswer('request-1')).resolves.toMatchObject({
+        state: 'approved',
+        grantId: 'grant-9',
+      });
+      await expect(adapter.readDecisionAnswer('request-2')).resolves.toMatchObject({
+        state: 'awaiting-decision',
+      });
+      await expect(adapter.readDecisionAnswer('request-3')).resolves.toMatchObject({
+        state: 'awaiting-decision',
+      });
+      await expect(adapter.readDecisionAnswer('../../etc/passwd')).resolves.toMatchObject({
+        state: 'awaiting-decision',
+      });
+    });
+  });
+
+  it('reports a declined answer without inventing a grant', async () => {
+    const adapter = new DecisionTransportAdapter({
+      answers: {
+        'request-1': { state: 'declined', decisionRevision: 'decision-4', grantId: 'grant-9' },
+      },
+    });
+    await expect(adapter.readDecisionAnswer('request-1')).resolves.toEqual({
+      state: 'declined',
+      decisionRevision: 'decision-4',
+      grantId: null,
+    });
+  });
+});
+
+describe('ObservationPublicationAdapter', () => {
+  const temporaryDirectories: string[] = [];
+
+  afterEach(async () => {
+    for (const directory of temporaryDirectories.splice(0)) {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('publishes through the injected boundary and releases a previous gap', async () => {
+    let failing = true;
+    const adapter = new ObservationPublicationAdapter({
+      publish: () => {
+        if (failing) {
+          throw new Error('waves client unreachable');
+        }
+        return { outcome: 'published' };
+      },
+    });
+    const first = await adapter.publishObservationSnapshot(envelope());
+    expect(first.outcome).toBe('delivery-gap');
+    await expect(adapter.listUndeliveredObservations()).resolves.toHaveLength(1);
+
+    failing = false;
+    await expect(adapter.publishObservationSnapshot(envelope())).resolves.toEqual({
+      outcome: 'published',
+    });
+    await expect(adapter.listUndeliveredObservations()).resolves.toEqual([]);
+  });
+
+  it('keeps a reported gap undelivered and narrows it to one project', async () => {
+    const adapter = new ObservationPublicationAdapter({
+      publish: () => ({ outcome: 'delivery-gap', reason: 'snapshot rejected by the client' }),
+    });
+    await adapter.publishObservationSnapshot(envelope());
+    await adapter.publishObservationSnapshot(
+      envelope({ observationId: 'observation-2', projectId: 'project-other' }),
+    );
+    await expect(adapter.listUndeliveredObservations('project-atlas')).resolves.toHaveLength(1);
+    await expect(adapter.listUndeliveredObservations()).resolves.toHaveLength(2);
+  });
+
+  it('writes to a local outbox when no publication boundary is configured', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'fleet-observation-'));
+    temporaryDirectories.push(directory);
+    const adapter = new ObservationPublicationAdapter({ outboxDir: directory });
+    await expect(adapter.publishObservationSnapshot(envelope())).resolves.toEqual({
+      outcome: 'published',
+    });
+    const written = JSON.parse(
+      await readFile(join(directory, 'observation-1.json'), 'utf8'),
+    ) as ObservationEnvelopeProps;
+    expect(written.payloadSummary).toContain('head commit collected');
+    await expect(adapter.listUndeliveredObservations()).resolves.toEqual([]);
+  });
+
+  it('reports a gap and refuses to publish an unattributable observation', async () => {
+    const unconfigured = new ObservationPublicationAdapter();
+    const gap = await unconfigured.publishObservationSnapshot(envelope());
+    expect(gap.outcome === 'delivery-gap' && gap.reason).toContain('no observation publication');
+    const invalid = await unconfigured.publishObservationSnapshot({
+      ...envelope(),
+      projectId: '',
+    });
+    expect(invalid.outcome).toBe('delivery-gap');
+  });
+
+  it('always records a reason for a gap the boundary reports without one', async () => {
+    const adapter = new ObservationPublicationAdapter({
+      publish: () => ({ outcome: 'delivery-gap' }) as never,
+    });
+    const gap = await adapter.publishObservationSnapshot(envelope());
+    expect(gap.outcome === 'delivery-gap' && gap.reason).toContain('delivery gap');
+    await expect(adapter.listUndeliveredObservations()).resolves.toHaveLength(1);
+  });
+});
+
+describe('AttentionReadAdapter', () => {
+  it('prefers the injected reader and returns known absence as null', async () => {
+    const adapter = new AttentionReadAdapter({
+      read: (projectId) => (projectId === 'project-atlas' ? attentionSummary() : null),
+      summaries: { 'project-other': attentionSummary({ projectId: 'project-other' }) },
+    });
+    const read = await adapter.fetchProjectAttention('project-atlas');
+    expect(read?.awaitingDecisionCount).toBe(2);
+    expect(read).not.toBe(await adapter.fetchProjectAttention('project-atlas'));
+    // The reader is the boundary, so its absence is authoritative.
+    expect(await adapter.fetchProjectAttention('project-other')).toBeNull();
+  });
+
+  it('falls back to the local summary store', async () => {
+    const adapter = new AttentionReadAdapter({
+      summaries: { 'project-atlas': attentionSummary() },
+    });
+    expect((await adapter.fetchProjectAttention('project-atlas'))?.staleWorkOrderCount).toBe(1);
+    expect(await adapter.fetchProjectAttention('project-other')).toBeNull();
+    expect(await new AttentionReadAdapter().fetchProjectAttention('project-atlas')).toBeNull();
+  });
+
+  it('propagates a failed read instead of returning an empty summary', async () => {
+    const adapter = new AttentionReadAdapter({
+      read: () => Promise.reject(new Error('attention endpoint timed out')),
+    });
+    await expect(adapter.fetchProjectAttention('project-atlas')).rejects.toThrow(
+      'attention endpoint timed out',
+    );
+  });
+});
+
+describe('RelayTransportAdapter', () => {
+  it('delivers through the injected channel and returns its receipt', async () => {
+    const notices: RelayNoticeRequest[] = [];
+    const adapter = new RelayTransportAdapter({
+      deliver: (request) => {
+        notices.push(request);
+      },
+    });
+    const notice: RelayNoticeRequest = {
+      requestId: 'relay-1',
+      projectId: 'project-atlas',
+      recipientId: 'fleet-master',
+      summary: 'attempt finished',
+    };
+    await expect(adapter.deliverRelayNotice(notice)).resolves.toEqual({ outcome: 'delivered' });
+    expect(notices).toEqual([notice]);
+  });
+
+  it('preserves a reported gap and a thrown channel failure', async () => {
+    const reported = new RelayTransportAdapter({
+      deliver: () => ({ outcome: 'delivery-gap', reason: 'notice channel is offline' }),
+    });
+    const gap = await reported.deliverRelayNotice({
+      requestId: 'relay-1',
+      projectId: 'project-atlas',
+      recipientId: 'fleet-master',
+      summary: 'attempt finished',
+    });
+    expect(gap).toEqual({ outcome: 'delivery-gap', reason: 'notice channel is offline' });
+
+    const throwing = new RelayTransportAdapter({
+      deliver: () => {
+        throw new Error('channel closed');
+      },
+    });
+    const failed = await throwing.deliverRelayNotice({
+      requestId: 'relay-1',
+      projectId: 'project-atlas',
+      recipientId: 'fleet-master',
+      summary: 'attempt finished',
+    });
+    expect(failed.outcome === 'delivery-gap' && failed.reason).toContain('channel closed');
+
+    const reasonless = new RelayTransportAdapter({
+      deliver: () => ({ outcome: 'delivery-gap' }) as never,
+    });
+    const unexplained = await reasonless.deliverRelayNotice({
+      requestId: 'relay-1',
+      projectId: 'project-atlas',
+      recipientId: 'fleet-master',
+      summary: 'attempt finished',
+    });
+    expect(unexplained.outcome === 'delivery-gap' && unexplained.reason).toContain('delivery gap');
+  });
+
+  it('writes a local outbox receipt and refuses to fabricate one', async () => {
+    await withTempDir(async (outboxDir) => {
+      const adapter = new RelayTransportAdapter({ outboxDir });
+      const notice: RelayNoticeRequest = {
+        requestId: 'relay-1',
+        projectId: 'project-atlas',
+        recipientId: 'fleet-master',
+        summary: 'attempt finished',
+      };
+      await expect(adapter.deliverRelayNotice(notice)).resolves.toEqual({ outcome: 'delivered' });
+      const written = JSON.parse(await readFile(join(outboxDir, 'relay-1.json'), 'utf8')) as {
+        recipientId: string;
+      };
+      expect(written.recipientId).toBe('fleet-master');
+
+      const unconfigured = new RelayTransportAdapter();
+      const gap = await unconfigured.deliverRelayNotice(notice);
+      expect(gap.outcome === 'delivery-gap' && gap.reason).toContain('no relay transport');
+      const invalid = await adapter.deliverRelayNotice({ ...notice, recipientId: '  ' });
+      expect(invalid.outcome === 'delivery-gap' && invalid.reason).toContain('recipientId');
+    });
+  });
+});

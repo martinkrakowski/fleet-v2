@@ -1,6 +1,75 @@
-// @generated use-case scaffold — no operation is implemented.
-export class RecordContextSelectionUseCase {
-  async execute(_input: unknown): Promise<never> {
-    throw new Error('Not implemented: RecordContextSelectionUseCase');
+// Implemented for lane bk-usecases-adapters (migration step 6).
+/**
+ * RecordContextSelectionUseCase: record the orchestrator's selected entry
+ * versions, applicability checks and target brief identity before freezing
+ * context. Selections are provenance with an accountable decision; context
+ * inclusion alone does not prove saved work.
+ */
+
+import { ContextSelection } from '../../domain/value-objects/ContextSelection.vo.js';
+import type { ContextSelectionProps } from '../../domain/value-objects/ContextSelection.vo.js';
+import type {
+  RecordBriefContextSelectionRequest,
+  RecordBriefContextSelectionResult,
+  RecordContextSelectionPort,
+} from '../ports/in/RecordContextSelectionPort.in-port.js';
+import type { KnowledgeEntryRepositoryPort } from '../ports/out/KnowledgeEntryRepositoryPort.out-port.js';
+
+/** Provenance default when the orchestrator supplies no explicit reason. */
+const DEFAULT_DECISION_BECAUSE = 'selected by orchestrator';
+
+export interface RecordContextSelectionDependencies {
+  readonly repo: KnowledgeEntryRepositoryPort;
+}
+
+export class RecordContextSelectionUseCase implements RecordContextSelectionPort {
+  constructor(private readonly deps?: RecordContextSelectionDependencies) {}
+
+  async execute(request: RecordBriefContextSelectionRequest): Promise<RecordBriefContextSelectionResult> {
+    return this.recordContextSelection(request);
   }
+
+  async recordContextSelection(
+    request: RecordBriefContextSelectionRequest,
+  ): Promise<RecordBriefContextSelectionResult> {
+    if (!this.deps || !isValidRequest(request)) {
+      throw new Error('Not implemented: RecordContextSelectionUseCase');
+    }
+    if (isBlank(request.attemptId)) {
+      return { outcome: 'rejected', reason: 'RecordContextSelection requires a non-empty attemptId' };
+    }
+    if (!Array.isArray(request.selections) || request.selections.length === 0) {
+      return { outcome: 'rejected', reason: 'RecordContextSelection requires at least one selection' };
+    }
+
+    const selections: ContextSelectionProps[] = [];
+    for (const item of request.selections) {
+      const created = ContextSelection.create({
+        attemptId: request.attemptId,
+        knowledgeEntryId: item?.knowledgeEntryId ?? '',
+        version: item?.version ?? '',
+        accepted: item?.accepted === true,
+        decisionBecause: item?.decisionBecause ?? DEFAULT_DECISION_BECAUSE,
+      });
+      if (!created.success || !created.value) {
+        return {
+          outcome: 'rejected',
+          reason: created.error?.message ?? 'RecordContextSelection received an invalid selection item',
+        };
+      }
+      selections.push(created.value.getProps());
+    }
+
+    await this.deps.repo.saveContextSelections(request.attemptId, selections);
+
+    return { outcome: 'recorded', recordedCount: selections.length };
+  }
+}
+
+function isValidRequest(request: unknown): request is RecordBriefContextSelectionRequest {
+  return typeof request === 'object' && request !== null && !Array.isArray(request);
+}
+
+function isBlank(value: unknown): boolean {
+  return typeof value !== 'string' || value.trim().length === 0;
 }

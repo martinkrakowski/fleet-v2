@@ -1,59 +1,82 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for migration step 2.
 /**
- * KnowledgeScope is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = KnowledgeScope.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * KnowledgeScope is an immutable value object bounding where a knowledge
+ * entry may be applied. Cross-project reuse requires reviewed shared scope;
+ * retrieval filters by authorized scope before ranking.
  */
+
+export interface KnowledgeScopeProps {
+  readonly projectId: string;
+  readonly pathPrefixes: readonly string[];
+  readonly sharedAcrossProjects: boolean;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isStringList(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
+}
+
 export class KnowledgeScope {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use KnowledgeScope.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly props: KnowledgeScopeProps) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing KnowledgeScope or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<KnowledgeScope, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new KnowledgeScope(value) };
-   * }
-   */
-  static create(value: unknown): { success: boolean; value?: KnowledgeScope; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new KnowledgeScope(value) };
+  static create(props: KnowledgeScopeProps): {
+    success: boolean;
+    value?: KnowledgeScope;
+    error?: Error;
+  } {
+    if (!isNonEmptyString(props.projectId)) {
+      return { success: false, error: new Error('KnowledgeScope requires a non-empty projectId') };
+    }
+    if (!isStringList(props.pathPrefixes)) {
+      return { success: false, error: new Error('KnowledgeScope requires string pathPrefixes') };
+    }
+    if (typeof props.sharedAcrossProjects !== 'boolean') {
+      return { success: false, error: new Error('KnowledgeScope requires a boolean sharedAcrossProjects') };
+    }
+    return {
+      success: true,
+      value: new KnowledgeScope({ ...props, pathPrefixes: [...props.pathPrefixes] }),
+    };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
-    return this.value;
+  getProjectId(): string {
+    return this.props.projectId;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
+  getPathPrefixes(): readonly string[] {
+    return [...this.props.pathPrefixes];
+  }
+
+  isSharedAcrossProjects(): boolean {
+    return this.props.sharedAcrossProjects;
+  }
+
+  getProps(): KnowledgeScopeProps {
+    return { ...this.props, pathPrefixes: [...this.props.pathPrefixes] };
+  }
+
+  /** An entry applies to a project when it owns the entry or shares it. */
+  appliesToProject(projectId: string): boolean {
+    return this.props.sharedAcrossProjects || this.props.projectId === projectId;
+  }
+
   equals(other: KnowledgeScope): boolean {
-    return this.value === other.value;
+    return (
+      this.props.projectId === other.props.projectId &&
+      this.props.sharedAcrossProjects === other.props.sharedAcrossProjects &&
+      shallowEqualLists(this.props.pathPrefixes, other.props.pathPrefixes)
+    );
   }
+}
+
+function shallowEqualLists(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  return left.every((value, index) => value === right[index]);
 }

@@ -1,59 +1,51 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for migration step 2.
 /**
- * RetrievalBudget is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = RetrievalBudget.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * RetrievalBudget is an immutable value object over the explicit positive
+ * retrieval bounds. Keeper proposals never exceed maxEntries or the
+ * maxTotalChars character budget.
  */
+
+export interface RetrievalBudgetProps {
+  readonly maxEntries: number;
+  readonly maxTotalChars: number;
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0;
+}
+
 export class RetrievalBudget {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use RetrievalBudget.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly props: RetrievalBudgetProps) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing RetrievalBudget or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<RetrievalBudget, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new RetrievalBudget(value) };
-   * }
-   */
-  static create(value: unknown): { success: boolean; value?: RetrievalBudget; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new RetrievalBudget(value) };
+  static create(props: RetrievalBudgetProps): {
+    success: boolean;
+    value?: RetrievalBudget;
+    error?: Error;
+  } {
+    if (!isPositiveInteger(props.maxEntries)) {
+      return { success: false, error: new Error('RetrievalBudget requires a positive integer maxEntries') };
+    }
+    if (!isPositiveInteger(props.maxTotalChars)) {
+      return { success: false, error: new Error('RetrievalBudget requires a positive integer maxTotalChars') };
+    }
+    return { success: true, value: new RetrievalBudget({ ...props }) };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
-    return this.value;
+  getMaxEntries(): number {
+    return this.props.maxEntries;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
+  getMaxTotalChars(): number {
+    return this.props.maxTotalChars;
+  }
+
+  getProps(): RetrievalBudgetProps {
+    return { ...this.props };
+  }
+
   equals(other: RetrievalBudget): boolean {
-    return this.value === other.value;
+    return this.props.maxEntries === other.props.maxEntries && this.props.maxTotalChars === other.props.maxTotalChars;
   }
 }

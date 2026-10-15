@@ -1,58 +1,46 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for migration step 2.
 /**
- * KnowledgeDisposition is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = KnowledgeDisposition.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * KnowledgeDisposition is an immutable value object over the manifest's
+ * disposition enum. Capture only proposes candidate claims; becoming a
+ * retrievable keeper requires a deliberate disposition, and
+ * `policy-proposal` flags coordination items that this context never
+ * promotes on its own.
  */
+
+export const KNOWLEDGE_DISPOSITIONS = [
+  'candidate',
+  'accepted',
+  'deferred',
+  'rejected',
+  'superseded',
+  'policy-proposal',
+] as const;
+
+export type KnowledgeDispositionValue = (typeof KNOWLEDGE_DISPOSITIONS)[number];
+
+const KNOWLEDGE_DISPOSITION_VALUES: readonly string[] = KNOWLEDGE_DISPOSITIONS;
+
 export class KnowledgeDisposition {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use KnowledgeDisposition.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly value: KnowledgeDispositionValue) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing KnowledgeDisposition or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<KnowledgeDisposition, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new KnowledgeDisposition(value) };
-   * }
-   */
   static create(value: unknown): { success: boolean; value?: KnowledgeDisposition; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new KnowledgeDisposition(value) };
+    if (typeof value !== 'string' || !KNOWLEDGE_DISPOSITION_VALUES.includes(value)) {
+      return { success: false, error: new Error(`Invalid knowledge disposition: ${String(value)}`) };
+    }
+    return { success: true, value: new KnowledgeDisposition(value as KnowledgeDispositionValue) };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
+  getValue(): KnowledgeDispositionValue {
     return this.value;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
+  /** Only deliberately accepted entries are retrievable keepers. */
+  isRetrievableKeeper(): boolean {
+    return this.value === 'accepted';
+  }
+
   equals(other: KnowledgeDisposition): boolean {
     return this.value === other.value;
   }

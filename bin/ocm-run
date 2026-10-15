@@ -1,0 +1,487 @@
+#!/bin/sh
+# ocm-run — headless `opencode run` against an opencode server, and the
+# three questions an orchestrator has about a lane: is one running, wait for it, stop it.
+#
+#   ocm-run --dir <path ON server> --agent lane [-m <model>] [--format json] "<prompt>"
+#   ocm-run --status --dir <path>   # exit 0: nothing runs there; 3: a session is running (ids printed)
+#   ocm-run --wait   --dir <path>   # 0: nothing runs there (read twice); 75: GAVE UP after OCM_WAIT_MAX,
+#                                   #    a session still runs; 1: the status could not be read
+#   ocm-run --abort  --dir <path>   # stops every session running there; 0 once nothing runs
+#   ocm-run --check                 # exit 0 iff the dispatch path works. Runs nothing.
+#   ocm-run --help | -h             # print usage and exit 0
+#
+# THE SESSION LIVES ON THE SERVER, NOT IN THIS PROCESS.
+#   1. A dispatch is REFUSED (exit 75) when a session is already running in --dir.
+#      OCM_ALLOW_BUSY=1 overrides it, for the rare case that is intended.
+#   2. When this process is told to stop (INT, TERM, HUP), it ABORTS the session it
+#      started before it exits. --detach switches that off: the lane then outlives
+#      this process on purpose, and --wait / --abort are how it is followed.
+#   3. "Has the lane ended" is --status or --wait, never the end of a local process.
+#      --wait says "nothing runs" only after TWO status reads in a row, OCM_WAIT_CONFIRM seconds
+#      apart, both answered by the server and both listing nothing; a read that fails ends it with 1.
+#
+# Env: OCM_REMOTE_PORT (default 4096), OCM_HOST (ssh host/alias when tunnel is not already listening).
+#      The local port is always remote + 1; an OCM_PORT that differs is refused.
+#      OCM_ALLOW_BUSY=1; OCM_WAIT_INTERVAL (seconds between looks, default 15);
+#      OCM_WAIT_MAX (seconds before --wait gives up with 75, default 1500);
+#      OCM_WAIT_CONFIRM (seconds before the second read that confirms "nothing runs", default 5).
+#      OPENCODE_SERVER_USERNAME (default opencode) and OPENCODE_SERVER_PASSWORD (or
+#      OPENCODE_AUTH_FILE, default ~/.config/opencode/server-auth.env) for v2 basic auth.
+# Server calls used:
+#   v2 (opencode 2.x): GET /api/info (probe), GET /api/session/active, GET /api/session/<id>,
+#                      POST /api/session/<id>/interrupt, POST /api/session (remote --dir).
+#   v1 (opencode 1.18): GET /session/status?directory=…, POST /session/<id>/abort?directory=….
+# Exit: the run's own status; 1 the tunnel, the server or its session status could not be used or
+# read, opencode is not on PATH, or a session still runs after --abort; 2 usage;
+# 3 (--status) a session is running; 75 refused, or --wait gave up while a session still runs;
+# 129/130/143 when stopped by HUP/INT/TERM.
+
+set -u
+
+for arg do
+  case "$arg" in
+    --help | -h)
+      cat <<'EOF'
+Usage: ocm-run [--status|--wait|--abort|--check|--detach] --dir <path> [--agent <agent>] [-m <model>] [--variant <variant>] [--format json] ["<prompt>"]
+EOF
+      exit 0
+      ;;
+  esac
+done
+
+if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ] && [ -r "${OPENCODE_AUTH_FILE:-$HOME/.config/opencode/server-auth.env}" ]; then
+  . "${OPENCODE_AUTH_FILE:-$HOME/.config/opencode/server-auth.env}"
+fi
+if [ -n "${OPENCODE_SERVER_PASSWORD:-}" ]; then
+  OPENCODE_SERVER_USERNAME="${OPENCODE_SERVER_USERNAME:-opencode}"
+  OPENCODE_PASSWORD="$OPENCODE_SERVER_PASSWORD"
+  export OPENCODE_SERVER_USERNAME OPENCODE_SERVER_PASSWORD OPENCODE_PASSWORD
+fi
+
+remote="${OCM_REMOTE_PORT:-4096}"
+port="${OCM_PORT:-$((remote + 1))}"
+host="${OCM_HOST:-}"
+if [ "$port" != "$((remote + 1))" ]; then
+  echo "ocm-run: OCM_PORT=$port does not match OCM_REMOTE_PORT=$remote (expected $((remote + 1))); unset OCM_PORT" >&2
+  exit 2
+fi
+url="http://127.0.0.1:$port"
+
+ocm_curl() {
+  if [ -n "${OPENCODE_SERVER_PASSWORD:-}" ]; then
+    curl -u "${OPENCODE_SERVER_USERNAME:-opencode}:$OPENCODE_SERVER_PASSWORD" "$@"
+  else
+    curl "$@"
+  fi
+}
+
+# Our own flags are taken out; for v2 servers --dir and --variant are rewritten before launch.
+mode=run
+detach=0
+dir=''
+variant=''
+has_variant=0
+model=''
+has_model=0
+has_session=0
+prev=''
+[ "${1:-}" = "--check" ] && mode=check
+for arg do
+  shift
+  case "$arg" in
+    --attach | --attach=* | --server | --server=*)
+      echo "ocm-run: do not pass ${arg%%=*}; ocm-run connects to $url itself" >&2
+      exit 2
+      ;;
+    --status | --wait | --abort)
+      [ "$mode" = run ] || { echo "ocm-run: one of --status, --wait, --abort, --check at a time" >&2; exit 2; }
+      mode=${arg#--}
+      prev=''
+      continue
+      ;;
+    --detach)
+      detach=1
+      prev=''
+      continue
+      ;;
+    --dir=*) dir=${arg#--dir=} ;;
+    --variant=*)
+      has_variant=1
+      variant=${arg#--variant=}
+      ;;
+    --variant)
+      has_variant=1
+      ;;
+    --model=*)
+      has_model=1
+      model=${arg#--model=}
+      ;;
+    -m | --model)
+      has_model=1
+      ;;
+    -s | --session | --session=* | -c | --continue)
+      has_session=1
+      ;;
+  esac
+  case "$prev" in
+    --dir) dir=$arg ;;
+    --variant) variant=$arg ;;
+    -m | --model) model=$arg ;;
+  esac
+  case "$prev" in
+    --dir | --variant | -m | --model) prev='' ;;
+    *) prev=$arg ;;
+  esac
+  set -- "$@" "$arg"
+done
+
+if [ "$has_variant" = 1 ]; then
+  [ -n "$variant" ] || { echo "ocm-run: --variant needs a value" >&2; exit 2; }
+  [ "$has_model" = 1 ] && [ -n "$model" ] || { echo "ocm-run: --variant requires -m <provider/model>" >&2; exit 2; }
+  case "$model" in
+    *'#'*)
+      echo "ocm-run: cannot combine --variant $variant with an already hashed model ($model)" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
+  if [ -z "$host" ]; then
+    echo "ocm-run: server not listening on 127.0.0.1:$port and OCM_HOST is not set" >&2
+    exit 2
+  fi
+  ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes \
+    -L "127.0.0.1:$port:127.0.0.1:$remote" "$host" || {
+    echo "ocm-run: could not open the tunnel to $host" >&2
+    exit 1
+  }
+fi
+
+probe=$(ocm_curl -s -m 5 -w '\n%{http_code}:%{content_type}' "$url/api/info") || {
+  echo "ocm-run: could not reach opencode server at $url (remote port $remote${host:+ on $host})" >&2
+  exit 1
+}
+meta=$(printf '%s\n' "$probe" | tail -n 1)
+code=${meta%%:*}
+ctype=$(printf '%s' "${meta#*:}" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+info_flat=$(printf '%s\n' "$probe" | sed '$d' | tr -d ' \n\r\t')
+
+api=''
+case "$code:$ctype:$info_flat" in
+  200:application/json*:'{'*'}')
+    api=v2
+    ;;
+  200:application/json*:*)
+    echo "ocm-run: opencode server at $url (remote port $remote${host:+ on $host}) answered /api/info with non-object JSON" >&2
+    exit 1
+    ;;
+  200:* | 404:*)
+    api=v1
+    ;;
+  *)
+    echo "ocm-run: opencode server at $url (remote port $remote${host:+ on $host}) answered HTTP $code on /api/info; is that opencode server running?" >&2
+    exit 1
+    ;;
+esac
+
+if [ "$mode" = check ]; then
+  if [ "$api" = v1 ]; then
+    v1_probe=$(ocm_curl -s -m 5 -G -w '\n%{http_code}:%{content_type}' "$url/session/status" --data-urlencode "directory=${dir:-/}") || v1_probe=''
+    v1_meta=$(printf '%s\n' "$v1_probe" | tail -n 1)
+    v1_code=${v1_meta%%:*}
+    v1_ctype=$(printf '%s' "${v1_meta#*:}" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+    v1_flat=$(printf '%s\n' "$v1_probe" | sed '$d' | tr -d ' \n\r\t')
+    case "$v1_code:$v1_ctype:$v1_flat" in
+      200:*text/html*:* )
+        echo "ocm-run: opencode server at $url (remote port $remote${host:+ on $host}) answered HTML 200 on /api/info and /session/status" >&2
+        exit 1
+        ;;
+      200:*:'{'*'}')
+        ;;
+      *)
+        echo "ocm-run: opencode server at $url (remote port $remote${host:+ on $host}) did not answer v2 /api/info or v1 /session/status (HTTP ${v1_code:-000})" >&2
+        exit 1
+        ;;
+    esac
+  fi
+  command -v opencode >/dev/null 2>&1 || {
+    echo "ocm-run: opencode is not on PATH" >&2
+    exit 1
+  }
+  echo "ocm-run: ok ($url${host:+ via $host}, remote port $remote)"
+  exit 0
+fi
+
+# Prints the ids of the sessions running in $dir, one a line; nothing when none.
+# Returns 1 when the server could not be asked: a caller must not read that as "none".
+ocm_running() {
+  if [ "$api" = v2 ]; then
+    ocm_resp=$(ocm_curl -s -m 8 -w '\n%{http_code}:%{content_type}' "$url/api/session/active") || return 1
+    ocm_meta=$(printf '%s\n' "$ocm_resp" | tail -n 1)
+    ocm_code=${ocm_meta%%:*}
+    ocm_ct=$(printf '%s' "${ocm_meta#*:}" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+    case "$ocm_code:$ocm_ct" in 200:application/json*) ;; *) return 1 ;; esac
+    ocm_flat=$(printf '%s\n' "$ocm_resp" | sed '$d' | tr -d ' \n\r\t')
+    case "$ocm_flat" in
+      '{"data":{}}' | '{"data":[]}' | '[]') return 0 ;;
+      '{"data":{'*'}}' | '{"data":['*']}' | '['*']') ;;
+      *) return 1 ;;
+    esac
+    ocm_all=$(printf '%s' "$ocm_flat" | grep -o '"ses_[^"]*"' | tr -d '"')
+    [ -n "$ocm_all" ] || return 1
+    ocm_want=$dir
+    while [ "$ocm_want" != "/" ] && [ "${ocm_want%/}" != "$ocm_want" ]; do ocm_want=${ocm_want%/}; done
+    ocm_nl='
+'
+    ocm_seen=''
+    for ocm_id in $ocm_all; do
+      case " $ocm_seen " in *" $ocm_id "*) continue ;; esac
+      ocm_seen="$ocm_seen $ocm_id"
+      ocm_chunk=$(printf '%s\n' "$ocm_flat" | sed "s/\"ses_/\\${ocm_nl}\"ses_/g" | grep "^\"$ocm_id\"")
+      ocm_sdir=$(printf '%s\n' "$ocm_chunk" | sed -n 's/.*"location":{"directory":"\([^"]*\)".*/\1/p')
+      if [ -z "$ocm_sdir" ]; then
+        case "$ocm_chunk" in "\"$ocm_id\":{"*) ;; *) return 1 ;; esac
+        ocm_sresp=$(ocm_curl -s -m 8 -w '\n%{http_code}:%{content_type}' "$url/api/session/$ocm_id") || return 1
+        ocm_smeta=$(printf '%s\n' "$ocm_sresp" | tail -n 1)
+        ocm_scode=${ocm_smeta%%:*}
+        ocm_sct=$(printf '%s' "${ocm_smeta#*:}" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+        case "$ocm_scode:$ocm_sct" in 200:application/json*) ;; *) return 1 ;; esac
+        ocm_sflat=$(printf '%s\n' "$ocm_sresp" | sed '$d' | tr -d ' \n\r\t')
+        ocm_sdir=$(printf '%s\n' "$ocm_sflat" | sed -n 's/.*"location":{"directory":"\([^"]*\)".*/\1/p')
+      fi
+      [ -n "$ocm_sdir" ] || return 1
+      while [ "$ocm_sdir" != "/" ] && [ "${ocm_sdir%/}" != "$ocm_sdir" ]; do ocm_sdir=${ocm_sdir%/}; done
+      [ "$ocm_sdir" = "$ocm_want" ] && echo "$ocm_id"
+    done
+    return 0
+  fi
+  # v1: -f so an HTTP error is a failure, whatever its body (the server's error bodies are JSON objects too)
+  ocm_body=$(ocm_curl -sf -m 8 -G "$url/session/status" --data-urlencode "directory=$dir") || return 1
+  case "$ocm_body" in '{'*) ;; *) return 1 ;; esac
+  # Every session listed counts as running unless it is exactly {"type":"idle"}: a state this
+  # script does not know (retry, with other keys before "type") must never read as "nothing".
+  ocm_flat=$(printf '%s' "$ocm_body" | tr -d ' \n\t')
+  ocm_all=$(printf '%s' "$ocm_flat" | grep -o '"ses_[^"]*":{' | sed 's/^"\([^"]*\)".*/\1/')
+  ocm_idle=$(printf '%s' "$ocm_flat" | grep -o '"ses_[^"]*":{"type":"idle"}' | sed 's/^"\([^"]*\)".*/\1/')
+  for ocm_id in $ocm_all; do
+    case "
+$ocm_idle
+" in *"
+$ocm_id
+"*) ;; *) echo "$ocm_id" ;; esac
+  done
+  return 0
+}
+
+ocm_abort() { # $1: a session id
+  if [ "$api" = v2 ]; then
+    ocm_curl -s -o /dev/null -m 8 -X POST "$url/api/session/$1/interrupt"
+  else
+    ocm_curl -s -o /dev/null -m 8 -X POST -G "$url/session/$1/abort" --data-urlencode "directory=$dir"
+  fi
+}
+
+if [ "$mode" != run ]; then
+  [ -n "$dir" ] || { echo "ocm-run: --$mode needs --dir <path on the server>" >&2; exit 2; }
+  ids=$(ocm_running) || { echo "ocm-run: could not read the session status from $url" >&2; exit 1; }
+  case "$mode" in
+    status)
+      [ -z "$ids" ] && { echo "ocm-run: nothing is running in $dir (server: remote port $remote)"; exit 0; }
+      echo "ocm-run: running in $dir:"
+      echo "$ids"
+      exit 3
+      ;;
+    wait)
+      waited=0
+      max=${OCM_WAIT_MAX:-1500}
+      every=${OCM_WAIT_INTERVAL:-15}
+      confirm=${OCM_WAIT_CONFIRM:-5}
+      for ocm_n in "$max" "$every" "$confirm"; do
+        case "$ocm_n" in '' | *[!0-9]* | 0?* | ??????*) echo "ocm-run: OCM_WAIT_MAX (0 to 99999), OCM_WAIT_INTERVAL and OCM_WAIT_CONFIRM (1 to 99999) must be whole seconds" >&2; exit 2 ;; esac
+      done
+      if [ "$every" -lt 1 ] || [ "$confirm" -lt 1 ]; then
+        echo "ocm-run: OCM_WAIT_INTERVAL and OCM_WAIT_CONFIRM must be at least 1 second" >&2
+        exit 2
+      fi
+      idle=0
+      while :; do
+        if [ -z "$ids" ]; then
+          idle=$((idle + 1))
+          if [ "$idle" -ge 2 ]; then
+            echo "ocm-run: nothing is running in $dir (server: remote port $remote; read twice; waited $waited s)"
+            exit 0
+          fi
+          pause=$confirm
+        else
+          idle=0
+          if [ "$waited" -ge "$max" ]; then
+            echo "ocm-run: WAIT GAVE UP (exit 75), the lane has NOT ended: still running in $dir after $waited s: $(echo "$ids" | tr '\n' ' ')" >&2
+            exit 75
+          fi
+          pause=$every
+        fi
+        sleep "$pause"
+        waited=$((waited + pause))
+        ids=$(ocm_running) || { echo "ocm-run: WAIT STOPPED (exit 1), the lane may still run: could not read the session status from $url" >&2; exit 1; }
+      done
+      ;;
+    abort)
+      [ -z "$ids" ] && { echo "ocm-run: nothing is running in $dir"; exit 0; }
+      for id in $ids; do
+        ocm_abort "$id"
+        echo "ocm-run: asked the server to abort $id" >&2
+      done
+      tries=0
+      while [ "$tries" -lt 10 ]; do
+        ids=$(ocm_running) || { echo "ocm-run: could not read the session status from $url" >&2; exit 1; }
+        [ -z "$ids" ] && { echo "ocm-run: nothing is running in $dir"; exit 0; }
+        sleep 1
+        tries=$((tries + 1))
+      done
+      echo "ocm-run: still running in $dir after the abort: $(echo "$ids" | tr '\n' ' ')" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# Without --dir neither rule can work, and the old fault would be back without a word.
+[ -n "$dir" ] || { echo "ocm-run: a run needs --dir <path on the server>; without it nothing can be refused or aborted" >&2; exit 2; }
+
+# Rule 1: never a second session in a directory where one is running.
+before=$(ocm_running) || { echo "ocm-run: could not read the session status from $url; not dispatching blind" >&2; exit 1; }
+if [ -n "$before" ] && [ "${OCM_ALLOW_BUSY:-0}" != 1 ]; then
+  echo "ocm-run: a session is already running in $dir: $(echo "$before" | tr '\n' ' ')" >&2
+  echo "ocm-run: not dispatching a second one. Wait for it (ocm-run --wait --dir …) or stop it (ocm-run --abort --dir …)." >&2
+  exit 75
+fi
+
+errf=$(mktemp "${TMPDIR:-/tmp}/ocm-run.XXXXXX") || exit 1
+child=''
+
+# Rule 2: told to stop, this process stops what it started on the server.
+ocm_stop() { # $1: exit status
+  trap '' INT TERM HUP
+  ocm_dog=''
+  if [ -n "$child" ]; then
+    kill "$child" 2>/dev/null
+    ( sleep 10; kill -9 "$child" 2>/dev/null ) > /dev/null 2>&1 &
+    ocm_dog=$!
+  fi
+  if [ "$detach" = 0 ] && [ -n "$dir" ]; then
+    now=$(ocm_running) || {
+      now=''
+      echo "ocm-run: stopped, but the session status could not be read: a session may still run in $dir (ocm-run --status --dir …)" >&2
+    }
+    for id in $now; do
+      case "
+$before
+" in *"
+$id
+"*) continue ;; esac
+      ocm_abort "$id"
+      echo "ocm-run: stopped; asked the server to abort $id" >&2
+    done
+  elif [ "$detach" = 1 ]; then
+    echo "ocm-run: stopped; --detach was given, the session runs on in $dir" >&2
+  fi
+  if [ -n "$child" ]; then
+    wait "$child" 2>/dev/null
+    kill "$ocm_dog" 2>/dev/null
+  fi
+  cat "$errf" >&2
+  rm -f "$errf"
+  exit "$1"
+}
+trap 'rm -f "$errf"' EXIT
+trap 'ocm_stop 130' INT
+trap 'ocm_stop 143' TERM
+trap 'ocm_stop 129' HUP
+
+if [ "$api" = v2 ]; then
+  skip=''
+  fold=''
+  for arg do
+    shift
+    if [ -n "$skip" ]; then
+      skip=''
+      continue
+    fi
+    if [ -n "$fold" ]; then
+      fold=''
+      set -- "$@" "$arg#$variant"
+      continue
+    fi
+    case "$arg" in
+      --dir | --variant)
+        skip=1
+        continue
+        ;;
+      --dir=* | --variant=*)
+        continue
+        ;;
+      -m | --model)
+        if [ "$has_variant" = 1 ]; then
+          fold=1
+        fi
+        set -- "$@" "$arg"
+        continue
+        ;;
+      --model=*)
+        if [ "$has_variant" = 1 ]; then
+          set -- "$@" "$arg#$variant"
+        else
+          set -- "$@" "$arg"
+        fi
+        continue
+        ;;
+    esac
+    set -- "$@" "$arg"
+  done
+fi
+
+# The run is a background child so that a signal reaches the traps at once; a shell
+# only runs a trap after its foreground command has ended.
+ocm_launch() {
+  if [ "$api" = v2 ]; then
+    if [ -d "$dir" ]; then
+      ( cd "$dir" && exec opencode run --server "$url" "$@" ) < /dev/null 2> "$errf" &
+    else
+      ocm_sid=''
+      if [ "$has_session" = 0 ]; then
+        case "$dir" in
+          *'"'* | *'\'*)
+            echo "ocm-run: refusing --dir with quote or backslash" >&2
+            rc=2
+            return
+            ;;
+        esac
+        ocm_sresp=$(ocm_curl -sf -m 8 -H 'Content-Type: application/json' -d "{\"location\":{\"directory\":\"$dir\"}}" "$url/api/session") || ocm_sresp=''
+        ocm_sid=$(printf '%s' "$ocm_sresp" | grep -o '"id":"ses_[^"]*"' | head -n 1 | sed 's/"id":"//;s/"//')
+      fi
+      if [ -n "$ocm_sid" ]; then
+        OCM_DIR="$dir" opencode run --server "$url" -s "$ocm_sid" "$@" < /dev/null 2> "$errf" &
+      else
+        OCM_DIR="$dir" opencode run --server "$url" "$@" < /dev/null 2> "$errf" &
+      fi
+    fi
+  else
+    opencode run --attach "$url" "$@" < /dev/null 2> "$errf" &
+  fi
+  child=$!
+  wait "$child"
+  rc=$?
+  child=''
+}
+
+start=$(date +%s)
+ocm_launch "$@"
+if [ "$rc" -ne 0 ] && [ $(( $(date +%s) - start )) -lt 10 ] && grep -q "database is locked" "$errf"; then
+  cat "$errf" >&2
+  echo "ocm-run: opencode database was locked at launch; retrying once in 20 s" >&2
+  sleep "${OCM_RETRY_SLEEP:-20}" &
+  wait "$!"
+  ocm_launch "$@"
+fi
+cat "$errf" >&2
+exit "$rc"

@@ -46,6 +46,13 @@ runner environment allowlist to smuggle a setting through.
 - `FLEET_RUNNER_AGENT`, `FLEET_RUNNER_MODEL`, `FLEET_RUNNER_VARIANT` — the
   runner seat selection; the model/variant pair is recorded in the frozen brief.
 - `OCM_REMOTE_PORT` — the single port passed to the runner subprocess.
+- `OCM_HOST` — SSH target used by the bundled `bin/ocm-run` to open the loopback
+  tunnel to the OpenCode server when `127.0.0.1:<OCM_REMOTE_PORT + 1>` is not
+  already listening. It is distinct from `FLEET_WORKTREE_SSH_HOST`: that variable
+  names the host holding git worktrees, never the runner tunnel target.
+- `FLEET_OCM_RUN_BIN` — override for the runner binary path. The repository
+  bundles `bin/ocm-run` and `ExecutionRunnerAdapter` resolves it automatically;
+  the override exists only for unusual installations.
 - `FLEET_API_URL` — the server-side base URL for `@fleet/api`. The web client
   prefers it, falls back to `NEXT_PUBLIC_FLEET_API_URL`, and falls back again to
   the fixture set when neither is configured.

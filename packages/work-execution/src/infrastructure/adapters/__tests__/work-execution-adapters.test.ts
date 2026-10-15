@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { afterAll, describe, expect, it } from 'vitest';
 
@@ -704,8 +705,12 @@ describe('ExecutionRunnerAdapter', () => {
         }
       }
     } finally {
-      process.env.PATH = allowlisted.PATH;
-      process.env.OCM_REMOTE_PORT = allowlisted.OCM_REMOTE_PORT;
+      // Deleting instead of assigning undefined avoids Node coercing the
+      // variable to the literal string "undefined" in later subprocess envs.
+      if (allowlisted.PATH === undefined) delete process.env.PATH;
+      else process.env.PATH = allowlisted.PATH;
+      if (allowlisted.OCM_REMOTE_PORT === undefined) delete process.env.OCM_REMOTE_PORT;
+      else process.env.OCM_REMOTE_PORT = allowlisted.OCM_REMOTE_PORT;
       for (const key of secretKeys) {
         const previous = secretSnapshot[key];
         if (previous === undefined) {
@@ -766,7 +771,7 @@ describe('ExecutionRunnerAdapter', () => {
     const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner });
     const result = await adapter.startSession(makeStartRequest());
     expect(result).toEqual({ outcome: 'started', sessionId: 'ses_abc' });
-    expect(calls[0]?.command).toBe('ocm-run');
+    expect(calls[0]?.command).toMatch(/\/bin\/ocm-run$/);
     expect(calls[0]?.args).toEqual([
       '--detach',
       '--dir',
@@ -1099,5 +1104,53 @@ describe('ExecutionRunnerAdapter', () => {
     await adapter.inspectSession({ attemptId: 'att-missing', sessionId: 'ses_orphan' });
     expect(calls[0]?.args).toEqual(['--status', '--dir', 'ses_orphan']);
     expect(calls[0]?.env).toBeUndefined();
+  });
+
+  it('forwards a configured remoteHost as OCM_HOST alongside the remote port', async () => {
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 0, stdout: '{"sessionID":"ses_hosted"}', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({
+      runSubprocess: runner,
+      remotePort: 4166,
+      remoteHost: 'midnight.lan',
+    });
+    const result = await adapter.startSession(makeStartRequest());
+    expect(result).toEqual({ outcome: 'started', sessionId: 'ses_hosted' });
+    expect(calls[0]?.env).toEqual({ OCM_REMOTE_PORT: '4166', OCM_HOST: 'midnight.lan' });
+  });
+
+  const repoRootBin = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '../../../../../../bin/ocm-run',
+  );
+
+  it('runs the bundled bin/ocm-run --help successfully', async () => {
+    const { stdout } = await execFileAsync(repoRootBin, ['--help']);
+    expect(stdout).toContain('Usage: ocm-run');
+  });
+
+  it('rejects --attach from the caller with exit 2', async () => {
+    await expect(
+      execFileAsync(repoRootBin, ['--attach=bad'], {
+        env: { ...process.env, OCM_PORT: '' },
+      }),
+    ).rejects.toMatchObject({ code: 2, stderr: expect.stringContaining('do not pass --attach') });
+  });
+
+  it('refuses --check on an unused port without OCM_HOST with exit 2', async () => {
+    await expect(
+      execFileAsync(repoRootBin, ['--check'], {
+        env: {
+          ...process.env,
+          OCM_REMOTE_PORT: '65431',
+          OCM_PORT: '',
+          OCM_HOST: '',
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: 2,
+      stderr: expect.stringContaining('OCM_HOST is not set'),
+    });
   });
 });

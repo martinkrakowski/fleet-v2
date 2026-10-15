@@ -1,59 +1,75 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for migration step 1.
 /**
- * ExecutionLimits is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = ExecutionLimits.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * ExecutionLimits is an immutable value object over the brief's step, time and
+ * resource bounds. Limits are positive; the kernel receives them as inputs
+ * and infrastructure enforces them.
  */
+
+export interface ExecutionLimitsProps {
+  readonly stepLimit: number;
+  readonly timeLimitSeconds: number;
+  readonly resourceBounds: Readonly<Record<string, string>>;
+}
+
+function isPositiveFinite(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
 export class ExecutionLimits {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use ExecutionLimits.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly props: ExecutionLimitsProps) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing ExecutionLimits or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<ExecutionLimits, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new ExecutionLimits(value) };
-   * }
-   */
-  static create(value: unknown): { success: boolean; value?: ExecutionLimits; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new ExecutionLimits(value) };
+  static create(props: ExecutionLimitsProps): {
+    success: boolean;
+    value?: ExecutionLimits;
+    error?: Error;
+  } {
+    if (!isPositiveFinite(props.stepLimit) || !isPositiveFinite(props.timeLimitSeconds)) {
+      return {
+        success: false,
+        error: new Error('ExecutionLimits requires stepLimit > 0 and timeLimitSeconds > 0'),
+      };
+    }
+    if (props.resourceBounds === null || typeof props.resourceBounds !== 'object') {
+      return { success: false, error: new Error('ExecutionLimits requires resourceBounds') };
+    }
+    return { success: true, value: new ExecutionLimits({ ...props, resourceBounds: { ...props.resourceBounds } }) };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
-    return this.value;
+  getStepLimit(): number {
+    return this.props.stepLimit;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
+  getTimeLimitSeconds(): number {
+    return this.props.timeLimitSeconds;
+  }
+
+  getResourceBounds(): Readonly<Record<string, string>> {
+    return this.props.resourceBounds;
+  }
+
+  getProps(): ExecutionLimitsProps {
+    return this.props;
+  }
+
   equals(other: ExecutionLimits): boolean {
-    return this.value === other.value;
+    return (
+      this.props.stepLimit === other.props.stepLimit &&
+      this.props.timeLimitSeconds === other.props.timeLimitSeconds &&
+      shallowEqualRecords(this.props.resourceBounds, other.props.resourceBounds)
+    );
   }
+}
+
+function shallowEqualRecords(
+  left: Readonly<Record<string, string>>,
+  right: Readonly<Record<string, string>>,
+): boolean {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+  return leftKeys.every((key) => left[key] === right[key]);
 }

@@ -17,6 +17,18 @@ export function successEnvelope(operationId: string, result: object | null): Ope
   return { operationId, code: "OK", result };
 }
 
+export interface ApiErrorMapping {
+  status: number;
+  code: string;
+}
+
+export function mapOperatorError(error: unknown): ApiErrorMapping | null {
+  if (!(error instanceof Error && error.message.startsWith("Not implemented:"))) {
+    return null;
+  }
+  return { status: 501, code: "NOT_IMPLEMENTED" };
+}
+
 export function errorEnvelope(operationId: string, error: unknown): OperatorErrorResponse {
   if (error instanceof Error && error.message.startsWith("Not implemented:")) {
     return { statusCode: 501, body: { operationId, code: "NOT_IMPLEMENTED", result: null } };

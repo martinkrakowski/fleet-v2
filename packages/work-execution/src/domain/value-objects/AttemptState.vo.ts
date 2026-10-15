@@ -1,58 +1,52 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for migration step 1.
 /**
- * AttemptState is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = AttemptState.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * AttemptState is an immutable value object over the manifest's attempt enum.
+ * Unknown runner state is never ended: only ended, collected or cancelled
+ * attempts may release capacity.
  */
+
+export const ATTEMPT_STATES = [
+  'intent-recorded',
+  'dispatching',
+  'running',
+  'reconciling',
+  'ended',
+  'collected',
+  'blocked',
+  'cancelled',
+] as const;
+
+export type AttemptStateValue = (typeof ATTEMPT_STATES)[number];
+
+const ATTEMPT_STATE_VALUES: readonly string[] = ATTEMPT_STATES;
+
+const CAPACITY_RELEASE_STATES: readonly AttemptStateValue[] = ['ended', 'collected', 'cancelled'];
+
 export class AttemptState {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use AttemptState.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly value: AttemptStateValue) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing AttemptState or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<AttemptState, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new AttemptState(value) };
-   * }
-   */
   static create(value: unknown): { success: boolean; value?: AttemptState; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new AttemptState(value) };
+    if (typeof value !== 'string' || !ATTEMPT_STATE_VALUES.includes(value)) {
+      return { success: false, error: new Error(`Invalid attempt state: ${String(value)}`) };
+    }
+    return { success: true, value: new AttemptState(value as AttemptStateValue) };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
+  getValue(): AttemptStateValue {
     return this.value;
   }
 
   /**
-   * Value objects are compared by value.
+   * Capacity is released only for attempts that ended authoritatively, were
+   * collected, or were cancelled. Running, reconciling, dispatching,
+   * intent-recorded and blocked attempts keep their reservation.
    */
+  canReleaseCapacity(): boolean {
+    return CAPACITY_RELEASE_STATES.includes(this.value);
+  }
+
   equals(other: AttemptState): boolean {
     return this.value === other.value;
   }

@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc",
     "lint": "eslint src --ext .ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "../../node_modules/.bin/vitest run --passWithNoTests --exclude '**/dist/**'"
   },
   "dependencies": {
     "@fleet/brief-knowledge": "workspace:*",

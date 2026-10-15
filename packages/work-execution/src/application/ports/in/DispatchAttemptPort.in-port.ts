@@ -1,3 +1,33 @@
-// @generated inbound contract scaffold — refine before implementation.
-/** See this context's contracts registry in manifest.yaml. */
-export interface DispatchAttemptPort {}
+// @generated inbound contract scaffold — refined for migration step 1.
+/**
+ * DispatchAttemptPort: start one prepared, capacity-reserved attempt after
+ * runner capabilities are verified. An unknown dispatch outcome retains the
+ * reservation and enters reconciliation; it is never retried blindly.
+ */
+
+import type { AttemptRecord } from '../../../domain/execution-records.js';
+import type { RunnerIsolationCapabilities } from '../out/ExecutionRunnerPort.out-port.js';
+
+export interface DispatchAttemptRequest {
+  readonly attemptId: string;
+  readonly workOrderId: string;
+  readonly worktreePath: string;
+  readonly briefPackagePath: string;
+  readonly briefDigest: string;
+  readonly baseCommit: string;
+  readonly stepLimit: number;
+  readonly timeLimitSeconds: number;
+  readonly expectedArtifacts?: readonly string[];
+  readonly requiredCapabilities: RunnerIsolationCapabilities;
+  readonly nowIso?: string;
+}
+
+export type DispatchAttemptResult =
+  | { readonly outcome: 'started'; readonly attempt: AttemptRecord; readonly sessionId: string }
+  | { readonly outcome: 'unknown'; readonly attempt: AttemptRecord; readonly reason: string }
+  | { readonly outcome: 'refused'; readonly reason: string };
+
+export interface DispatchAttemptPort {
+  /** Start one prepared attempt; `unknown` never releases capacity. */
+  dispatchAttempt(request: DispatchAttemptRequest): Promise<DispatchAttemptResult>;
+}

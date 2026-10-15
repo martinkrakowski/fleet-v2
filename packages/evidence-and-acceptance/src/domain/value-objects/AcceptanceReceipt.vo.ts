@@ -1,59 +1,105 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for step 4.
 /**
- * AcceptanceReceipt is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = AcceptanceReceipt.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * AcceptanceReceipt is an immutable value object: the scoped, immutable proof
+ * that a specific candidate head was accepted under a specific acceptance
+ * policy revision. It carries no verdict logic; issuing it is a decision.
  */
+
+export interface AcceptanceReceiptProps {
+  readonly receiptId: string;
+  readonly assessmentId: string;
+  readonly projectId: string;
+  readonly attemptId: string;
+  readonly candidateHeadSha: string;
+  readonly policyRevision: string;
+  readonly issuedAtIso: string;
+}
+
+function isNonEmptyTrimmedString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 export class AcceptanceReceipt {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use AcceptanceReceipt.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly props: AcceptanceReceiptProps) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing AcceptanceReceipt or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<AcceptanceReceipt, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new AcceptanceReceipt(value) };
-   * }
-   */
-  static create(value: unknown): { success: boolean; value?: AcceptanceReceipt; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new AcceptanceReceipt(value) };
+  static create(props: AcceptanceReceiptProps): {
+    success: boolean;
+    value?: AcceptanceReceipt;
+    error?: Error;
+  } {
+    if (
+      !isNonEmptyTrimmedString(props.receiptId) ||
+      !isNonEmptyTrimmedString(props.assessmentId) ||
+      !isNonEmptyTrimmedString(props.projectId) ||
+      !isNonEmptyTrimmedString(props.attemptId) ||
+      !isNonEmptyTrimmedString(props.candidateHeadSha) ||
+      !isNonEmptyTrimmedString(props.policyRevision) ||
+      !isNonEmptyTrimmedString(props.issuedAtIso)
+    ) {
+      return {
+        success: false,
+        error: new Error(
+          'AcceptanceReceipt requires non-empty receiptId, assessmentId, projectId, attemptId, candidateHeadSha, policyRevision and issuedAtIso',
+        ),
+      };
+    }
+    return {
+      success: true,
+      value: new AcceptanceReceipt({
+        receiptId: props.receiptId.trim(),
+        assessmentId: props.assessmentId.trim(),
+        projectId: props.projectId.trim(),
+        attemptId: props.attemptId.trim(),
+        candidateHeadSha: props.candidateHeadSha.trim(),
+        policyRevision: props.policyRevision.trim(),
+        issuedAtIso: props.issuedAtIso.trim(),
+      }),
+    };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
-    return this.value;
+  getReceiptId(): string {
+    return this.props.receiptId;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
+  getAssessmentId(): string {
+    return this.props.assessmentId;
+  }
+
+  getProjectId(): string {
+    return this.props.projectId;
+  }
+
+  getAttemptId(): string {
+    return this.props.attemptId;
+  }
+
+  getCandidateHeadSha(): string {
+    return this.props.candidateHeadSha;
+  }
+
+  getPolicyRevision(): string {
+    return this.props.policyRevision;
+  }
+
+  getIssuedAtIso(): string {
+    return this.props.issuedAtIso;
+  }
+
+  getProps(): AcceptanceReceiptProps {
+    return this.props;
+  }
+
   equals(other: AcceptanceReceipt): boolean {
-    return this.value === other.value;
+    return (
+      this.props.receiptId === other.props.receiptId &&
+      this.props.assessmentId === other.props.assessmentId &&
+      this.props.projectId === other.props.projectId &&
+      this.props.attemptId === other.props.attemptId &&
+      this.props.candidateHeadSha === other.props.candidateHeadSha &&
+      this.props.policyRevision === other.props.policyRevision &&
+      this.props.issuedAtIso === other.props.issuedAtIso
+    );
   }
 }

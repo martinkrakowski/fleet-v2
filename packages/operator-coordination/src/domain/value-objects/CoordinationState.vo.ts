@@ -1,58 +1,57 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for step 5.
 /**
- * CoordinationState is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = CoordinationState.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * CoordinationState is an immutable value object over the manifest's
+ * coordination enum. Only the approved state authorizes execution: a pending,
+ * unknown, expired or cancelled request never grants authority.
  */
+
+export const COORDINATION_STATES = [
+  'proposed',
+  'awaiting-decision',
+  'approved',
+  'declined',
+  'executing',
+  'completed',
+  'unknown',
+  'expired',
+  'cancelled',
+] as const;
+
+export type CoordinationStateValue = (typeof COORDINATION_STATES)[number];
+
+const COORDINATION_STATE_VALUES: readonly string[] = COORDINATION_STATES;
+
 export class CoordinationState {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use CoordinationState.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly value: CoordinationStateValue) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing CoordinationState or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<CoordinationState, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new CoordinationState(value) };
-   * }
-   */
   static create(value: unknown): { success: boolean; value?: CoordinationState; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new CoordinationState(value) };
+    if (typeof value !== 'string' || !COORDINATION_STATE_VALUES.includes(value)) {
+      return { success: false, error: new Error(`Invalid coordination state: ${String(value)}`) };
+    }
+    return { success: true, value: new CoordinationState(value as CoordinationStateValue) };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
+  getValue(): CoordinationStateValue {
     return this.value;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
+  /** An approved request is the only state that may authorize its exact action. */
+  canAuthorizeExecution(): boolean {
+    return this.value === 'approved';
+  }
+
+  /** Terminal states accept no further decision, delivery or acknowledgement. */
+  isTerminal(): boolean {
+    return (
+      this.value === 'completed' ||
+      this.value === 'declined' ||
+      this.value === 'expired' ||
+      this.value === 'cancelled'
+    );
+  }
+
   equals(other: CoordinationState): boolean {
     return this.value === other.value;
   }

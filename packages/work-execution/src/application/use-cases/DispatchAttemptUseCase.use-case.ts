@@ -1,6 +1,258 @@
-// @generated use-case scaffold — no operation is implemented.
-export class DispatchAttemptUseCase {
-  async execute(_input: unknown): Promise<never> {
-    throw new Error('Not implemented: DispatchAttemptUseCase');
+// Implemented for migration step 2 — durable dispatch intent before the runner.
+/**
+ * DispatchAttemptUseCase: start one prepared, capacity-reserved attempt after
+ * the work order, the reservation, the runner's isolation capabilities and
+ * the worktree state are verified. The dispatch intent is durable in the
+ * journal before the runner subprocess is started. An unknown start outcome
+ * keeps the reservation and enters reconciliation; it is never retried
+ * blindly and never releases capacity.
+ */
+
+import type { ActionJournalEntryRecord, AttemptRecord } from '../../domain/execution-records.js';
+import type { DispatchAttemptPort, DispatchAttemptRequest, DispatchAttemptResult } from '../ports/in/DispatchAttemptPort.in-port.js';
+import type { RunnerIsolationCapabilities } from '../ports/out/ExecutionRunnerPort.out-port.js';
+import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
+import type { ExecutionObservationPort } from '../ports/out/ExecutionObservationPort.out-port.js';
+import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
+import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
+import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
+
+export interface DispatchAttemptDependencies {
+  readonly workOrderRepo: WorkOrderRepositoryPort;
+  readonly attemptRepo: AttemptRepositoryPort;
+  readonly journal: ExecutionJournalPort;
+  readonly workspace: WorkspacePort;
+  readonly runner: ExecutionRunnerPort;
+  readonly observation?: ExecutionObservationPort;
+}
+
+/** Boolean capabilities a dispatch may require the runner to enforce. */
+const REQUIRED_BOOLEAN_CAPABILITIES: readonly (keyof RunnerIsolationCapabilities)[] = [
+  'networkEgressRestricted',
+  'cpuAndMemoryLimited',
+  'processTreeTermination',
+  'authoritativeCompletion',
+  'artifactPersistence',
+];
+
+type JournalEntryDraft = Omit<ActionJournalEntryRecord, 'id'>;
+
+/**
+ * Append one journal entry with a deterministic identity derived from the
+ * attempt's append-only history. Intent must be durable before the runner
+ * subprocess runs, so every lifecycle use case appends through here.
+ */
+async function appendJournalEntry(
+  journal: ExecutionJournalPort,
+  draft: JournalEntryDraft,
+): Promise<ActionJournalEntryRecord> {
+  const priorEntries = await journal.listJournalEntriesForAttempt(draft.attemptId);
+  const entry: ActionJournalEntryRecord = {
+    ...draft,
+    id: `${draft.attemptId}:${draft.action}:${priorEntries.length + 1}`,
+  };
+  await journal.appendJournalEntry(entry);
+  return entry;
+}
+
+export class DispatchAttemptUseCase implements DispatchAttemptPort {
+  constructor(private readonly deps?: DispatchAttemptDependencies) {}
+
+  async dispatchAttempt(request: DispatchAttemptRequest): Promise<DispatchAttemptResult> {
+    if (!this.deps) {
+      throw new Error('Not implemented: DispatchAttemptUseCase');
+    }
+
+    const workOrder = await this.deps.workOrderRepo.findWorkOrderById(request.workOrderId);
+    if (!workOrder) {
+      return { outcome: 'refused', reason: `Work order not found: ${request.workOrderId}` };
+    }
+    if (workOrder.state === 'merged' || workOrder.state === 'stopped') {
+      return {
+        outcome: 'refused',
+        reason: `Work order ${workOrder.id} is ${workOrder.state} and accepts no further dispatch`,
+      };
+    }
+
+    const activeReservations = await this.deps.journal.listActiveReservations();
+    if (!activeReservations.some((reservation) => reservation.attemptId === request.attemptId && reservation.held)) {
+      return { outcome: 'refused', reason: 'No active capacity reservation for attempt' };
+    }
+
+    const runnerCapabilities = this.deps.runner.describeCapabilities();
+    const requiredCapabilities = request.requiredCapabilities;
+    const capabilitiesMissing =
+      runnerCapabilities.filesystemScope !== 'scoped-worktree' ||
+      (requiredCapabilities
+        ? REQUIRED_BOOLEAN_CAPABILITIES.some(
+            (capability) => requiredCapabilities[capability] && !runnerCapabilities[capability],
+          )
+        : false);
+    if (capabilitiesMissing) {
+      return { outcome: 'refused', reason: 'Runner capabilities do not satisfy required isolation' };
+    }
+
+    const inspection = await this.deps.workspace.inspectWorktree({
+      worktreePath: request.worktreePath,
+      baseCommit: request.baseCommit,
+      expectedArtifactPaths: request.expectedArtifacts ?? [],
+    });
+    if (!inspection.matchesBaseCommit) {
+      return {
+        outcome: 'refused',
+        reason: `Worktree ${request.worktreePath} does not match the base commit (checked out ${inspection.checkedOutCommit})`,
+      };
+    }
+    if (inspection.uncommittedPaths.length > 0) {
+      return {
+        outcome: 'refused',
+        reason: `Worktree ${request.worktreePath} has uncommitted changes: ${inspection.uncommittedPaths.join(', ')}`,
+      };
+    }
+    if (inspection.untrackedPaths.length > 0) {
+      return {
+        outcome: 'refused',
+        reason: `Worktree ${request.worktreePath} has untracked files: ${inspection.untrackedPaths.join(', ')}`,
+      };
+    }
+    if (inspection.residueFromEarlierAttempts.length > 0) {
+      return {
+        outcome: 'refused',
+        reason: `Worktree ${request.worktreePath} contains residue from earlier attempts: ${inspection.residueFromEarlierAttempts.join(', ')}`,
+      };
+    }
+
+    const nowIso = request.nowIso ?? new Date().toISOString();
+
+    // Durable intent first: the journal records the dispatch before the
+    // runner subprocess is contacted.
+    await appendJournalEntry(this.deps.journal, {
+      attemptId: request.attemptId,
+      workOrderId: request.workOrderId,
+      action: 'dispatch',
+      baseCommit: request.baseCommit,
+      recordedAtIso: nowIso,
+      status: 'intent-recorded',
+      sessionId: null,
+      detail: 'Dispatch intent recorded before runner start',
+    });
+
+    const existingAttempt = await this.deps.attemptRepo.findAttemptById(request.attemptId);
+    const dispatchingAttempt: AttemptRecord = existingAttempt
+      ? {
+          ...existingAttempt,
+          worktreePath: request.worktreePath,
+          baseCommit: request.baseCommit,
+          state: 'dispatching',
+          briefDigest: request.briefDigest,
+          briefPackagePath: request.briefPackagePath,
+          sessionId: null,
+          updatedAtIso: nowIso,
+        }
+      : {
+          id: request.attemptId,
+          workOrderId: request.workOrderId,
+          kind: 'initial',
+          fixNumber: 0,
+          priorAttemptId: null,
+          worktreePath: request.worktreePath,
+          baseCommit: request.baseCommit,
+          state: 'dispatching',
+          outcome: null,
+          briefDigest: request.briefDigest,
+          briefPackagePath: request.briefPackagePath,
+          sessionId: null,
+          completionReceipt: null,
+          artifacts: null,
+          createdAtIso: nowIso,
+          updatedAtIso: nowIso,
+        };
+    await this.deps.attemptRepo.saveAttempt(dispatchingAttempt);
+
+    const startResult = await this.deps.runner.startSession({
+      attemptId: request.attemptId,
+      worktreePath: request.worktreePath,
+      briefPackagePath: request.briefPackagePath,
+      baseCommit: request.baseCommit,
+      stepLimit: request.stepLimit,
+      timeLimitSeconds: request.timeLimitSeconds,
+      requiredCapabilities: request.requiredCapabilities,
+    });
+
+    if (startResult.outcome === 'started') {
+      const runningAttempt: AttemptRecord = {
+        ...dispatchingAttempt,
+        state: 'running',
+        sessionId: startResult.sessionId,
+        updatedAtIso: nowIso,
+      };
+      await this.deps.attemptRepo.saveAttempt(runningAttempt);
+      const completedEntry = await appendJournalEntry(this.deps.journal, {
+        attemptId: request.attemptId,
+        workOrderId: request.workOrderId,
+        action: 'dispatch',
+        baseCommit: request.baseCommit,
+        recordedAtIso: nowIso,
+        status: 'completed',
+        sessionId: startResult.sessionId,
+        detail: `Session started: ${startResult.sessionId}`,
+      });
+      if (this.deps.observation) {
+        // A delivery gap is preserved and visible; it never fails the lane.
+        await this.deps.observation.publishExecutionObservation({
+          entry: completedEntry,
+          projectId: workOrder.projectId,
+        });
+      }
+      return { outcome: 'started', attempt: runningAttempt, sessionId: startResult.sessionId };
+    }
+
+    if (startResult.outcome === 'unknown') {
+      // Unknown keeps the reservation; reconciliation decides before retry.
+      const reconcilingAttempt: AttemptRecord = {
+        ...dispatchingAttempt,
+        state: 'reconciling',
+        updatedAtIso: nowIso,
+      };
+      await this.deps.attemptRepo.saveAttempt(reconcilingAttempt);
+      await appendJournalEntry(this.deps.journal, {
+        attemptId: request.attemptId,
+        workOrderId: request.workOrderId,
+        action: 'dispatch',
+        baseCommit: request.baseCommit,
+        recordedAtIso: nowIso,
+        status: 'ambiguous',
+        sessionId: null,
+        detail: startResult.reason,
+      });
+      return { outcome: 'unknown', attempt: reconcilingAttempt, reason: startResult.reason };
+    }
+
+    const cancelledAttempt: AttemptRecord = {
+      ...dispatchingAttempt,
+      state: 'cancelled',
+      updatedAtIso: nowIso,
+    };
+    await this.deps.attemptRepo.saveAttempt(cancelledAttempt);
+    await appendJournalEntry(this.deps.journal, {
+      attemptId: request.attemptId,
+      workOrderId: request.workOrderId,
+      action: 'dispatch',
+      baseCommit: request.baseCommit,
+      recordedAtIso: nowIso,
+      status: 'refused',
+      sessionId: null,
+      detail: startResult.reason,
+    });
+    await this.deps.journal.releaseCapacityReservation(request.attemptId, nowIso);
+    return { outcome: 'refused', reason: startResult.reason };
+  }
+
+  async execute(input?: unknown): Promise<DispatchAttemptResult> {
+    if (!this.deps || !input || typeof input !== 'object') {
+      throw new Error('Not implemented: DispatchAttemptUseCase');
+    }
+    return this.dispatchAttempt(input as DispatchAttemptRequest);
   }
 }

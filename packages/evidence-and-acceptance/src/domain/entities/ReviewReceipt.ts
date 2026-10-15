@@ -1,53 +1,177 @@
-// @generated entity stub — edit freely
+// @generated entity stub — refined for step 4.
 /**
- * ReviewReceipt is a domain entity with identity and lifecycle.
- *
- * Domain entities:
- * - Have unique identity (ID)
- * - Contain business logic and invariants
- * - Are mutable (unlike value objects)
- * - Enforce domain rules in their methods
- *
- * @example
- * const entity = new ReviewReceipt(id, props);
- * entity.performAction();
+ * ReviewReceipt is a child entity of the EvidenceAssessment aggregate. It
+ * retains the reviewer identity, read-only capability, findings and source
+ * evidence for an exact head. A purported independent review by the same
+ * underlying model as the implementer is rejected: changing the provider
+ * prefix alone is insufficient.
  */
+
+import type {
+  ReviewFindingRecord,
+  ReviewReceiptRecord,
+} from '../evidence-records.js';
+import type { EvidenceResultValue } from '../value-objects/EvidenceResult.vo.js';
+import { EVIDENCE_RESULTS } from '../value-objects/EvidenceResult.vo.js';
+import { FINDING_STATES } from '../value-objects/FindingState.vo.js';
+
+export interface ReviewReceiptProps {
+  readonly id: string;
+  readonly assessmentId: string;
+  readonly projectId: string;
+  readonly attemptId: string;
+  readonly candidateHeadSha: string;
+  readonly reviewerModel: string;
+  readonly implementerModel: string;
+  readonly readOnlyVerified: boolean;
+  readonly result: EvidenceResultValue;
+  readonly findings: readonly ReviewFindingRecord[];
+  readonly evidenceRef: string;
+  readonly policyRevision: string;
+  readonly completedAtIso: string;
+}
+
+function isNonEmptyTrimmedString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/**
+ * Strip the provider seat prefix (`openrouter/...`, `nvidia/...`, ...) and
+ * return the underlying model family. `openrouter/z-ai/glm-5.3` and
+ * `nvidia/z-ai/glm-5.3` therefore share one underlying model family.
+ */
+export function underlyingModelFamily(model: string): string {
+  const separatorIndex = model.indexOf('/');
+  return separatorIndex === -1 ? model : model.slice(separatorIndex + 1);
+}
+
+function isValidFinding(finding: ReviewFindingRecord): boolean {
+  return (
+    isNonEmptyTrimmedString(finding.findingId) &&
+    (finding.severity === 'blocker' ||
+      finding.severity === 'major' ||
+      finding.severity === 'minor' ||
+      finding.severity === 'nit') &&
+    isNonEmptyTrimmedString(finding.summary) &&
+    (finding.filePath === null || typeof finding.filePath === 'string') &&
+    (finding.line === null || Number.isInteger(finding.line)) &&
+    typeof finding.state === 'string' &&
+    FINDING_STATES.includes(finding.state) &&
+    (finding.dispositionReason === null || typeof finding.dispositionReason === 'string') &&
+    (finding.dispositionEvidenceRef === null ||
+      typeof finding.dispositionEvidenceRef === 'string')
+  );
+}
+
 export class ReviewReceipt {
-  /**
-   * Constructor for ReviewReceipt entity.
-   *
-   * @param id - Unique identifier
-   * @param props - Entity properties
-   *
-   * TODO: Define your entity properties
-   * Example:
-   * constructor(
-   *   private readonly id: string,
-   *   private name: string,
-   *   private status: Status,
-   * ) {
-   *   // Validate invariants
-   * }
-   */
-  constructor(private readonly id: string) {
-    // TODO: Initialize entity state
-    // TODO: Validate invariants
+  private constructor(private readonly props: ReviewReceiptProps) {
+    // Invariants are validated in create.
   }
 
-  /**
-   * Get entity ID.
-   */
+  static create(props: ReviewReceiptProps): {
+    success: boolean;
+    value?: ReviewReceipt;
+    error?: Error;
+  } {
+    if (
+      !isNonEmptyTrimmedString(props.id) ||
+      !isNonEmptyTrimmedString(props.assessmentId) ||
+      !isNonEmptyTrimmedString(props.projectId) ||
+      !isNonEmptyTrimmedString(props.attemptId) ||
+      !isNonEmptyTrimmedString(props.candidateHeadSha) ||
+      !isNonEmptyTrimmedString(props.reviewerModel) ||
+      !isNonEmptyTrimmedString(props.implementerModel) ||
+      !isNonEmptyTrimmedString(props.evidenceRef) ||
+      !isNonEmptyTrimmedString(props.policyRevision) ||
+      !isNonEmptyTrimmedString(props.completedAtIso)
+    ) {
+      return {
+        success: false,
+        error: new Error(
+          'ReviewReceipt requires non-empty id, assessmentId, projectId, attemptId, candidateHeadSha, reviewerModel, implementerModel, evidenceRef, policyRevision and completedAtIso',
+        ),
+      };
+    }
+    if (typeof props.result !== 'string' || !EVIDENCE_RESULTS.includes(props.result)) {
+      return {
+        success: false,
+        error: new Error(`ReviewReceipt has an invalid result: ${String(props.result)}`),
+      };
+    }
+    if (typeof props.readOnlyVerified !== 'boolean') {
+      return {
+        success: false,
+        error: new Error('ReviewReceipt requires a boolean readOnlyVerified'),
+      };
+    }
+    // The reviewer's underlying model differs from the implementer's; a
+    // provider change alone is insufficient.
+    if (underlyingModelFamily(props.reviewerModel) === underlyingModelFamily(props.implementerModel)) {
+      return {
+        success: false,
+        error: new Error(
+          `ReviewReceipt requires a reviewer distinct from the implementer: ${props.reviewerModel} and ${props.implementerModel} share the same underlying model`,
+        ),
+      };
+    }
+    if (!Array.isArray(props.findings) || !props.findings.every(isValidFinding)) {
+      return {
+        success: false,
+        error: new Error('ReviewReceipt contains an invalid finding'),
+      };
+    }
+    return {
+      success: true,
+      value: new ReviewReceipt({ ...props, findings: [...props.findings] }),
+    };
+  }
+
+  static fromRecord(record: ReviewReceiptRecord): ReviewReceipt {
+    const created = ReviewReceipt.create(record);
+    if (!created.success || created.value === undefined) {
+      throw new Error(created.error?.message ?? 'Invalid ReviewReceipt record');
+    }
+    return created.value;
+  }
+
   getId(): string {
-    return this.id;
+    return this.props.id;
   }
 
-  /**
-   * TODO: Add domain methods here
-   * Example:
-   * performAction(): Result<void, Error> {
-   *   // Validate business rules
-   *   // Update state
-   *   // Return result
-   * }
-   */
+  getAssessmentId(): string {
+    return this.props.assessmentId;
+  }
+
+  getCandidateHeadSha(): string {
+    return this.props.candidateHeadSha;
+  }
+
+  getReviewerModel(): string {
+    return this.props.reviewerModel;
+  }
+
+  getImplementerModel(): string {
+    return this.props.implementerModel;
+  }
+
+  getResult(): EvidenceResultValue {
+    return this.props.result;
+  }
+
+  getFindings(): readonly ReviewFindingRecord[] {
+    return this.props.findings;
+  }
+
+  /** A review only proves the head it was produced for. */
+  matchesHead(candidateHeadSha: string): boolean {
+    return this.props.candidateHeadSha === candidateHeadSha;
+  }
+
+  getProps(): ReviewReceiptProps {
+    return this.props;
+  }
+
+  toRecord(): ReviewReceiptRecord {
+    return { ...this.props, findings: [...this.props.findings] };
+  }
 }

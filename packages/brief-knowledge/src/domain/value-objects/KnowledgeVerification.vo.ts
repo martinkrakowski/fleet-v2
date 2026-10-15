@@ -1,58 +1,37 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for migration step 2.
 /**
- * KnowledgeVerification is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = KnowledgeVerification.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * KnowledgeVerification is an immutable value object over the manifest's
+ * verification enum. Verification records evidence gathered by a bounded,
+ * orchestrator-chosen check — never model confidence.
  */
+
+export const KNOWLEDGE_VERIFICATIONS = ['unverified', 'supported', 'contradicted', 'stale'] as const;
+
+export type KnowledgeVerificationValue = (typeof KNOWLEDGE_VERIFICATIONS)[number];
+
+const KNOWLEDGE_VERIFICATION_VALUES: readonly string[] = KNOWLEDGE_VERIFICATIONS;
+
 export class KnowledgeVerification {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use KnowledgeVerification.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly value: KnowledgeVerificationValue) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing KnowledgeVerification or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<KnowledgeVerification, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new KnowledgeVerification(value) };
-   * }
-   */
   static create(value: unknown): { success: boolean; value?: KnowledgeVerification; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new KnowledgeVerification(value) };
+    if (typeof value !== 'string' || !KNOWLEDGE_VERIFICATION_VALUES.includes(value)) {
+      return { success: false, error: new Error(`Invalid knowledge verification: ${String(value)}`) };
+    }
+    return { success: true, value: new KnowledgeVerification(value as KnowledgeVerificationValue) };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
+  getValue(): KnowledgeVerificationValue {
     return this.value;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
+  /** Acceptance requires a supported check; unverified claims stay candidates. */
+  isSupported(): boolean {
+    return this.value === 'supported';
+  }
+
   equals(other: KnowledgeVerification): boolean {
     return this.value === other.value;
   }

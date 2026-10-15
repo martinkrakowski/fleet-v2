@@ -1,3 +1,26 @@
-// @generated outbound contract scaffold — refine before implementation.
-/** See this context's contracts registry in manifest.yaml. */
-export interface ForgeActionPort {}
+// @generated outbound contract scaffold — refined for migration step 1.
+/**
+ * ForgeActionPort: perform permitted credential-bearing PR and merge
+ * operations through stable action IDs and explicit expected-head checks.
+ * Credentials stay in the adapter's environment; lanes never see them. An
+ * ambiguous response is reported for reconciliation, never guessed.
+ */
+
+export interface ForgeActionRequest {
+  readonly actionId: string;
+  readonly attemptId: string;
+  readonly workOrderId: string;
+  readonly kind: 'push-and-open-pr' | 'merge-pr';
+  readonly expectedHeadSha: string;
+  readonly branchName: string;
+}
+
+export type ForgeActionResult =
+  | { readonly outcome: 'executed'; readonly pullRequestNumber?: number; readonly headSha: string }
+  | { readonly outcome: 'ambiguous'; readonly reason: string }
+  | { readonly outcome: 'refused'; readonly reason: string };
+
+export interface ForgeActionPort {
+  /** Perform one forge action only against the expected head. */
+  performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult>;
+}

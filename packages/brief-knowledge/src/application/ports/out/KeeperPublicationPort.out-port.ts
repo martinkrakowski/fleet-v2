@@ -1,3 +1,22 @@
-// @generated outbound contract scaffold — refine before implementation.
-/** See this context's contracts registry in manifest.yaml. */
-export interface KeeperPublicationPort {}
+// @generated outbound contract scaffold — refined for migration step 5.
+/**
+ * KeeperPublicationPort: write attributed keeper entries to an optional
+ * external shelf without revealing its key to agents. Failed delivery is
+ * preserved for reconciliation; shelf failure does not fail otherwise
+ * acceptable work.
+ */
+
+import type { KnowledgeEntryRecord } from '../../../domain/knowledge-records.js';
+
+export interface PublishKeeperToShelfRequest {
+  readonly entry: KnowledgeEntryRecord;
+}
+
+export type PublishKeeperToShelfResult =
+  | { readonly outcome: 'published'; readonly externalRef: string }
+  | { readonly outcome: 'failed'; readonly reason: string };
+
+export interface KeeperPublicationPort {
+  /** Write one attributed keeper entry to the shelf; failures come back for reconciliation. */
+  publishKeeperToShelf(request: PublishKeeperToShelfRequest): Promise<PublishKeeperToShelfResult>;
+}

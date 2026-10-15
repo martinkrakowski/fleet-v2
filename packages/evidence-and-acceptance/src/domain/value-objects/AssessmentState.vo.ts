@@ -1,58 +1,49 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for step 4.
 /**
- * AssessmentState is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = AssessmentState.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * AssessmentState is an immutable value object over the manifest's assessment
+ * enum. Pending, unknown and unresolved evidence never becomes an implicit
+ * pass; only accepted, rejected and stale assessments are terminal.
  */
+
+export const ASSESSMENT_STATES = [
+  'pending',
+  'blocked',
+  'accepted',
+  'rejected',
+  'stale',
+] as const;
+
+export type AssessmentStateValue = (typeof ASSESSMENT_STATES)[number];
+
+const ASSESSMENT_STATE_VALUES: readonly string[] = ASSESSMENT_STATES;
+
+const TERMINAL_STATES: readonly AssessmentStateValue[] = ['accepted', 'rejected', 'stale'];
+
 export class AssessmentState {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use AssessmentState.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly value: AssessmentStateValue) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing AssessmentState or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<AssessmentState, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new AssessmentState(value) };
-   * }
-   */
   static create(value: unknown): { success: boolean; value?: AssessmentState; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new AssessmentState(value) };
+    if (typeof value !== 'string' || !ASSESSMENT_STATE_VALUES.includes(value)) {
+      return { success: false, error: new Error(`Invalid assessment state: ${String(value)}`) };
+    }
+    return { success: true, value: new AssessmentState(value as AssessmentStateValue) };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
+  getValue(): AssessmentStateValue {
     return this.value;
   }
 
   /**
-   * Value objects are compared by value.
+   * Accepted, rejected and stale assessments no longer accept new evidence.
+   * Pending and blocked assessments are still open for receipts and
+   * dispositions.
    */
+  isTerminal(): boolean {
+    return TERMINAL_STATES.includes(this.value);
+  }
+
   equals(other: AssessmentState): boolean {
     return this.value === other.value;
   }

@@ -1,0 +1,1090 @@
+/**
+ * End-to-end CLI workflow tests across all four bounded contexts.
+ *
+ * The suite drives `runCli` against a single composed runtime with a real
+ * stateDir, real git worktrees and the real subprocess adapters. The two
+ * reviewed subprocess boundaries (`ocm-run` and `gh`) are exercised through
+ * stub scripts placed on PATH, so dispatch, reconciliation, collection and the
+ * forge action run through the genuine adapter plumbing without touching live
+ * hosts or credentials.
+ */
+
+import { execFileSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as path from 'node:path';
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import {
+  assessmentIdForAttempt,
+  createFleetCliRuntime,
+  type FleetCliRuntime,
+} from '../composition.js';
+import { runCli, type CliIo } from '../index.js';
+
+const PROJECT_ID = 'proj-cli-1';
+const WORK_ORDER_ID = 'wo-1';
+const LANE_ID = 'lane-cli-1';
+const ATTEMPT_ID = 'attempt-1';
+const POLICY_REVISION = 'policy-1';
+const SESSION_ID = 'ses_cli_workflow_1';
+
+/** One CLI invocation: exit code, raw stdout text and captured stderr. */
+interface Invocation {
+  readonly code: number;
+  readonly text: string;
+  readonly stderr: string;
+}
+
+function jsonOf<T>(invocation: Invocation): T {
+  return JSON.parse(invocation.text) as T;
+}
+
+describe('Fleet CLI workflow', () => {
+  let runtime: FleetCliRuntime;
+  let suiteDir: string;
+  let binDir: string;
+  let stateDir: string;
+  let laneRepoDir: string;
+  let briefRepoDir: string;
+  let briefFilePath: string;
+  let laneHead: string;
+  let entryId: string;
+  let briefDigest: string;
+  let acceptanceReceiptId: string;
+  let originalPath: string | undefined;
+
+  const cli = async (argv: readonly string[]): Promise<Invocation> => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const io: CliIo = {
+      stdout: (text) => {
+        out.push(text);
+      },
+      stderr: (text) => {
+        err.push(text);
+      },
+    };
+    const code = await runCli([...argv], io, runtime);
+    return { code, text: out.join(''), stderr: err.join('') };
+  };
+
+  const jsonArg = (payload: unknown): string => JSON.stringify(payload);
+
+  function initGitRepo(dir: string, gitignore: readonly string[]): string {
+    mkdirSync(dir, { recursive: true });
+    execFileSync('git', ['-C', dir, 'init', '-q']);
+    execFileSync('git', ['-C', dir, 'config', 'user.email', 'fleet@example.invalid']);
+    execFileSync('git', ['-C', dir, 'config', 'user.name', 'Fleet CLI Test']);
+    execFileSync('git', ['-C', dir, 'config', 'commit.gpgsign', 'false']);
+    writeFileSync(path.join(dir, 'README.md'), '# demo package\n');
+    if (gitignore.length > 0) {
+      writeFileSync(path.join(dir, '.gitignore'), `${gitignore.join('\n')}\n`);
+    }
+    execFileSync('git', ['-C', dir, 'add', '.']);
+    execFileSync('git', ['-C', dir, 'commit', '-q', '-m', 'init']);
+    return execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  }
+
+  beforeAll(() => {
+    suiteDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-workflow-'));
+    binDir = path.join(suiteDir, 'bin');
+    stateDir = path.join(suiteDir, 'state');
+    laneRepoDir = path.join(suiteDir, 'lane-repo');
+    briefRepoDir = path.join(suiteDir, 'brief-repo');
+    briefFilePath = path.join(suiteDir, 'handwritten-brief.md');
+    mkdirSync(binDir);
+    mkdirSync(stateDir);
+
+    // Stub for the reviewed `ocm-run` runner subprocess: a detached start
+    // reports a session id, --status reports an authoritative ended receipt,
+    // and --abort confirms termination.
+    writeFileSync(
+      path.join(binDir, 'ocm-run'),
+      [
+        '#!/bin/sh',
+        'for arg in "$@"; do',
+        '  if [ "$arg" = "--status" ]; then',
+        `    printf '%s\\n' '{"active":false,"endedAtIso":"2026-10-15T08:30:00.000Z","exitStatus":0,"artifactsCollected":true}'`,
+        '    exit 0',
+        '  fi',
+        '  if [ "$arg" = "--abort" ]; then',
+        '    exit 0',
+        '  fi',
+        'done',
+        `printf '%s\\n' '{"sessionID":"${SESSION_ID}"}'`,
+        'exit 0',
+        '',
+      ].join('\n'),
+    );
+    // Stub for the reviewed `gh` subprocess behind the forge adapter.
+    writeFileSync(
+      path.join(binDir, 'gh'),
+      [
+        '#!/bin/sh',
+        `printf '%s\\n' 'https://github.com/org/repo/pull/123'`,
+        'exit 0',
+        '',
+      ].join('\n'),
+    );
+    chmodSync(path.join(binDir, 'ocm-run'), 0o755);
+    chmodSync(path.join(binDir, 'gh'), 0o755);
+    originalPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${originalPath ?? ''}`;
+
+    // The lane worktree stays pristine: it must match the base commit with no
+    // untracked files and no earlier-attempt residue when dispatch inspects it.
+    laneHead = initGitRepo(laneRepoDir, []);
+    // The brief worktree ignores the frozen-brief targets and the expected
+    // artifact path, which prepare-brief-package proves before placement.
+    initGitRepo(briefRepoDir, ['.lane/', 'docs/demo-summary.md']);
+
+    writeFileSync(
+      briefFilePath,
+      [
+        '# Work order wo-1',
+        '',
+        'Run yarn lint and yarn build for the demo package, then summarize',
+        'the result in docs/demo-summary.md.',
+        '',
+      ].join('\n'),
+    );
+
+    // Owner-recorded decision answers, read by the decision transport when a
+    // scoped decision is requested. Only an approved answer with a recorded
+    // grant authorizes anything.
+    const decisionsDir = path.join(stateDir, 'decisions');
+    mkdirSync(decisionsDir);
+    writeFileSync(
+      path.join(decisionsDir, 'dec-1.json'),
+      `${JSON.stringify({ state: 'approved', decisionRevision: 'dec-1-r1', grantId: 'grant-1' }, null, 2)}\n`,
+    );
+    writeFileSync(
+      path.join(decisionsDir, 'dec-2.json'),
+      `${JSON.stringify({ state: 'approved', decisionRevision: 'dec-2-r1', grantId: 'grant-2' }, null, 2)}\n`,
+    );
+
+    runtime = createFleetCliRuntime({ stateDir });
+  });
+
+  afterAll(() => {
+    if (originalPath !== undefined) {
+      process.env.PATH = originalPath;
+    }
+    rmSync(suiteDir, { recursive: true, force: true });
+  });
+
+  it('walks the full four-context workflow from profile to merge', async () => {
+    // --- operator-coordination: register the project profile ----------------
+    const profile = await cli([
+      'coordination',
+      'register-profile',
+      '--json',
+      jsonArg({
+        projectId: PROJECT_ID,
+        displayName: 'CLI Workflow Project',
+        repository: 'github.com/org/repo',
+        designatedDispatcherHost: 'host-1',
+        policyRevision: POLICY_REVISION,
+        maxConcurrentLanes: 2,
+        runnerCapabilities: { 'scoped-worktree': true, networkEgressRestricted: true },
+      }),
+    ]);
+    expect(profile.code).toBe(0);
+    expect(jsonOf(profile)).toMatchObject({
+      outcome: 'registered',
+      profile: { projectId: PROJECT_ID, policyRevision: POLICY_REVISION, revision: 0 },
+    });
+
+    // --- work-execution: register the work order (flags path) --------------
+    const workOrder = await cli([
+      'work-order',
+      'register',
+      '--work-order-id',
+      WORK_ORDER_ID,
+      '--project-id',
+      PROJECT_ID,
+      '--task-id',
+      'task-1',
+      '--lane-id',
+      LANE_ID,
+      '--repository',
+      'github.com/org/repo',
+      '--base-commit',
+      laneHead,
+      '--owned-paths',
+      'packages/demo/src',
+      '--policy-revision',
+      POLICY_REVISION,
+    ]);
+    expect(workOrder.code).toBe(0);
+    expect(jsonOf(workOrder)).toMatchObject({
+      outcome: 'registered',
+      workOrder: { id: WORK_ORDER_ID, state: 'approved', baseCommit: laneHead },
+    });
+
+    // --- brief-knowledge: capture, check and promote a keeper lesson --------
+    const capture = await cli([
+      'knowledge',
+      'capture-notes',
+      '--json',
+      jsonArg({
+        projectId: PROJECT_ID,
+        attemptId: 'attempt-seed-1',
+        workOrderId: WORK_ORDER_ID,
+        headCommitSha: laneHead,
+        notesMarkdown: [
+          '- Run yarn lint before yarn build in the demo package',
+          '- The demo package build must run with node 22',
+          '',
+        ].join('\n'),
+        pathPrefixes: ['packages/demo'],
+      }),
+    ]);
+    expect(capture.code).toBe(0);
+    const captured = jsonOf<{
+      outcome: string;
+      notesStatus: string;
+      candidateEntries: { id: string; claimText: string; disposition: string }[];
+    }>(capture);
+    expect(captured).toMatchObject({ outcome: 'captured', notesStatus: 'present' });
+    expect(captured.candidateEntries).toHaveLength(2);
+    entryId = captured.candidateEntries[0].id;
+    expect(captured.candidateEntries[0]).toMatchObject({
+      claimText: 'Run yarn lint before yarn build in the demo package',
+      disposition: 'candidate',
+    });
+
+    const check = await cli([
+      'knowledge',
+      'check-claim',
+      '--json',
+      jsonArg({
+        checkId: 'check-1',
+        entryId,
+        checkerId: 'checker-1',
+        procedureName: 'confirm-path-exists',
+        targetPath: briefFilePath,
+      }),
+    ]);
+    expect(check.code).toBe(0);
+    expect(jsonOf(check)).toMatchObject({
+      outcome: 'checked',
+      entry: { id: entryId, verification: 'supported' },
+      check: { verification: 'supported' },
+    });
+
+    const decide = await cli([
+      'knowledge',
+      'decide',
+      '--json',
+      jsonArg({
+        entryId,
+        disposition: 'accepted',
+        checkerId: 'checker-1',
+        reason: 'Verified against the repository layout',
+      }),
+    ]);
+    expect(decide.code).toBe(0);
+    expect(jsonOf(decide)).toMatchObject({
+      outcome: 'decided',
+      entry: { id: entryId, disposition: 'accepted' },
+    });
+
+    const proposals = await cli([
+      'knowledge',
+      'propose-context',
+      '--json',
+      jsonArg({
+        projectId: PROJECT_ID,
+        laneId: LANE_ID,
+        taskSummary: 'Run yarn lint before yarn build in the demo package',
+      }),
+    ]);
+    expect(proposals.code).toBe(0);
+    const proposed = jsonOf<{
+      outcome: string;
+      proposals: { proposalId: string; knowledgeEntryId: string; version: string }[];
+    }>(proposals);
+    expect(proposed.outcome).toBe('proposed');
+    expect(proposed.proposals.length).toBeGreaterThan(0);
+    expect(proposed.proposals[0].knowledgeEntryId).toBe(entryId);
+    const proposalId = proposed.proposals[0].proposalId;
+
+    // --- work-execution: freeze the brief package ---------------------------
+    const brief = await cli([
+      'brief',
+      'prepare',
+      '--json',
+      jsonArg({
+        workOrderId: WORK_ORDER_ID,
+        projectId: PROJECT_ID,
+        taskId: 'task-1',
+        laneId: LANE_ID,
+        repository: 'github.com/org/repo',
+        baseCommit: laneHead,
+        policyRevision: POLICY_REVISION,
+        modelAssignment: {
+          model: 'nvidia/z-ai/glm-5.3',
+          variant: 'default',
+          fallbackModel: 'openrouter/z-ai/glm-5.3-flash',
+        },
+        independentReviewer: 'openrouter/anthropic/claude-sonnet-4.5',
+        ownedPaths: ['packages/demo/src'],
+        permissions: ['edit'],
+        acceptanceChecks: ['yarn build'],
+        stepLimit: 50,
+        timeLimitSeconds: 900,
+        resourceBounds: { cpu: '2' },
+        expectedArtifacts: ['docs/demo-summary.md'],
+        ownerDecisionReferences: [],
+        contextDecisions: [
+          {
+            proposalId,
+            knowledgeEntryId: entryId,
+            version: '1.0.0',
+            proposedBecause: 'lexical match on the lane task',
+            accepted: true,
+            decisionBecause: 'Matches this lane task exactly',
+          },
+        ],
+        attemptId: ATTEMPT_ID,
+        worktreePath: briefRepoDir,
+        handWrittenBriefPath: briefFilePath,
+      }),
+    ]);
+    expect(brief.code).toBe(0);
+    const prepared = jsonOf<{
+      outcome: string;
+      prepared: {
+        attemptId: string;
+        briefDigest: string;
+        prosePath: string;
+        manifestPath: string;
+        selectedKnowledgeVersions: { knowledgeEntryId: string; version: string }[];
+      };
+    }>(brief);
+    expect(prepared.outcome).toBe('prepared');
+    expect(prepared.prepared.attemptId).toBe(ATTEMPT_ID);
+    expect(prepared.prepared.selectedKnowledgeVersions).toEqual([
+      { knowledgeEntryId: entryId, version: '1.0.0' },
+    ]);
+    briefDigest = prepared.prepared.briefDigest;
+    expect(prepared.prepared.prosePath).toBe(path.join(briefRepoDir, '.lane', 'brief.md'));
+
+    // --- work-execution: reserve capacity and dispatch ----------------------
+    const reserve = await cli([
+      'capacity',
+      'reserve',
+      '--json',
+      jsonArg({
+        reservationId: 'res-1',
+        attemptId: ATTEMPT_ID,
+        workOrderId: WORK_ORDER_ID,
+        hostId: 'host-1',
+        worktreePath: laneRepoDir,
+        maxSlots: 2,
+      }),
+    ]);
+    expect(reserve.code).toBe(0);
+    expect(jsonOf(reserve)).toMatchObject({
+      outcome: 'reserved',
+      reservation: { attemptId: ATTEMPT_ID, hostId: 'host-1', held: true },
+    });
+
+    const dispatch = await cli([
+      'attempt',
+      'dispatch',
+      '--json',
+      jsonArg({
+        attemptId: ATTEMPT_ID,
+        workOrderId: WORK_ORDER_ID,
+        worktreePath: laneRepoDir,
+        briefPackagePath: prepared.prepared.prosePath,
+        briefDigest,
+        baseCommit: laneHead,
+        stepLimit: 50,
+        timeLimitSeconds: 900,
+        expectedArtifacts: ['docs/demo-summary.md'],
+      }),
+    ]);
+    expect(dispatch.code).toBe(0);
+    expect(jsonOf(dispatch)).toMatchObject({
+      outcome: 'started',
+      sessionId: SESSION_ID,
+      attempt: { id: ATTEMPT_ID, state: 'running', briefDigest },
+    });
+
+    const reconcile = await cli([
+      'attempt',
+      'reconcile',
+      '--json',
+      jsonArg({ attemptId: ATTEMPT_ID }),
+    ]);
+    expect(reconcile.code).toBe(0);
+    expect(jsonOf(reconcile)).toMatchObject({
+      outcome: 'ended',
+      attempt: { id: ATTEMPT_ID, state: 'ended' },
+      receipt: { attemptId: ATTEMPT_ID, sessionId: SESSION_ID, exitStatus: 0 },
+    });
+
+    const collect = await cli([
+      'attempt',
+      'collect',
+      '--json',
+      jsonArg({ attemptId: ATTEMPT_ID }),
+    ]);
+    expect(collect.code).toBe(0);
+    expect(jsonOf(collect)).toMatchObject({
+      outcome: 'collected',
+      artifacts: { headCommit: laneHead, commitsSinceBase: [], notes: 'missing' },
+    });
+
+    // --- evidence-and-acceptance: verification, review, assessment ----------
+    const requestVerification = await cli([
+      'evidence',
+      'request-verification',
+      '--json',
+      jsonArg({
+        attemptId: ATTEMPT_ID,
+        projectId: PROJECT_ID,
+        candidateHeadSha: laneHead,
+        policyRevision: POLICY_REVISION,
+        hostId: 'verify-host-1',
+        requiredChecks: ['yarn build'],
+      }),
+    ]);
+    expect(requestVerification.code).toBe(0);
+    // No verification host is allow-listed, so the executed check honestly
+    // reports `unknown` and the assessment stays blocked until a receipt is
+    // recorded.
+    expect(jsonOf(requestVerification)).toMatchObject({
+      outcome: 'completed',
+      assessment: {
+        id: assessmentIdForAttempt(ATTEMPT_ID),
+        candidateHeadSha: laneHead,
+        requiredChecks: ['yarn build'],
+        state: 'blocked',
+      },
+      receipts: [{ procedureName: 'yarn build', result: 'unknown' }],
+    });
+
+    const recordVerification = await cli([
+      'evidence',
+      'record-verification',
+      '--json',
+      jsonArg({
+        attemptId: ATTEMPT_ID,
+        receipt: {
+          id: 'vr-1',
+          assessmentId: assessmentIdForAttempt(ATTEMPT_ID),
+          projectId: PROJECT_ID,
+          attemptId: ATTEMPT_ID,
+          candidateHeadSha: laneHead,
+          hostId: 'verify-host-1',
+          procedureName: 'yarn build',
+          result: 'pass',
+          exitCode: 0,
+          evidenceRef: 'evidence://verify-host-1/yarn-build',
+          policyRevision: POLICY_REVISION,
+          completedAtIso: '2026-10-15T08:40:00.000Z',
+        },
+      }),
+    ]);
+    expect(recordVerification.code).toBe(0);
+    expect(jsonOf(recordVerification)).toMatchObject({
+      outcome: 'recorded',
+      assessment: { id: assessmentIdForAttempt(ATTEMPT_ID), state: 'pending', blockers: [] },
+    });
+
+    const recordReview = await cli([
+      'evidence',
+      'record-review',
+      '--json',
+      jsonArg({
+        attemptId: ATTEMPT_ID,
+        receipt: {
+          id: 'rr-1',
+          assessmentId: assessmentIdForAttempt(ATTEMPT_ID),
+          projectId: PROJECT_ID,
+          attemptId: ATTEMPT_ID,
+          candidateHeadSha: laneHead,
+          reviewerModel: 'openrouter/anthropic/claude-sonnet-4.5',
+          implementerModel: 'nvidia/z-ai/glm-5.3',
+          readOnlyVerified: true,
+          result: 'pass',
+          findings: [],
+          evidenceRef: 'evidence://independent-review/rr-1',
+          policyRevision: POLICY_REVISION,
+          completedAtIso: '2026-10-15T08:45:00.000Z',
+        },
+      }),
+    ]);
+    expect(recordReview.code).toBe(0);
+    expect(jsonOf(recordReview)).toMatchObject({
+      outcome: 'recorded',
+      assessment: {
+        id: assessmentIdForAttempt(ATTEMPT_ID),
+        reviewReceipts: [{ id: 'rr-1', result: 'pass' }],
+      },
+    });
+
+    const assess = await cli([
+      'evidence',
+      'assess',
+      '--json',
+      jsonArg({
+        attemptId: ATTEMPT_ID,
+        candidateHeadSha: laneHead,
+        policyRevision: POLICY_REVISION,
+      }),
+    ]);
+    expect(assess.code).toBe(0);
+    const assessed = jsonOf<{ outcome: string; receiptId: string; candidateHeadSha: string }>(
+      assess,
+    );
+    expect(assessed).toMatchObject({ outcome: 'accepted', candidateHeadSha: laneHead });
+    acceptanceReceiptId = assessed.receiptId;
+
+    // --- work-execution: accept the collected head --------------------------
+    const accept = await cli([
+      'attempt',
+      'accept',
+      '--json',
+      jsonArg({
+        attemptId: ATTEMPT_ID,
+        reviewerModel: 'openrouter/anthropic/claude-sonnet-4.5',
+      }),
+    ]);
+    expect(accept.code).toBe(0);
+    expect(jsonOf(accept)).toEqual({
+      outcome: 'accepted',
+      candidateHeadSha: laneHead,
+      receiptId: acceptanceReceiptId,
+    });
+
+    const inspectedEvidence = await cli([
+      'evidence',
+      'inspect',
+      '--candidate-head-sha',
+      laneHead,
+    ]);
+    expect(inspectedEvidence.code).toBe(0);
+    expect(jsonOf(inspectedEvidence)).toMatchObject({
+      outcome: 'found',
+      assessment: { acceptanceReceiptId: acceptanceReceiptId, state: 'accepted' },
+    });
+
+    const inspected = await cli(['work-order', 'inspect', `--work-order-id=${WORK_ORDER_ID}`]);
+    expect(inspected.code).toBe(0);
+    expect(jsonOf(inspected)).toMatchObject({
+      outcome: 'found',
+      workOrder: { id: WORK_ORDER_ID, state: 'ready-to-merge' },
+      attempts: [expect.objectContaining({ id: ATTEMPT_ID, state: 'collected', outcome: 'no-commit' })],
+    });
+
+    // --- operator-coordination: authorize the merge, then execute it --------
+    const decision = await cli([
+      'coordination',
+      'request-decision',
+      '--json',
+      jsonArg({
+        requestId: 'dec-1',
+        projectId: PROJECT_ID,
+        kind: 'action-decision',
+        actionScope: 'forge:merge-pr',
+        expectedHeadSha: laneHead,
+        proposalDigest: `merge ${ATTEMPT_ID} at ${laneHead}`,
+        policyRevision: POLICY_REVISION,
+      }),
+    ]);
+    expect(decision.code).toBe(0);
+    // The owner-recorded approved answer carries the grant that authorizes
+    // exactly this action scope and expected head.
+    expect(jsonOf(decision)).toMatchObject({
+      outcome: 'requested',
+      request: { id: 'dec-1', state: 'approved', grantId: 'grant-1', expectedHeadSha: laneHead },
+    });
+
+    const forge = await cli([
+      'forge',
+      'execute',
+      '--json',
+      jsonArg({
+        actionId: 'forge-action-1',
+        attemptId: ATTEMPT_ID,
+        workOrderId: WORK_ORDER_ID,
+        kind: 'merge-pr',
+        expectedHeadSha: laneHead,
+        authorizationGrantId: 'grant-1',
+      }),
+    ]);
+    expect(forge.code).toBe(0);
+    expect(jsonOf(forge)).toEqual({ outcome: 'executed', headSha: laneHead });
+
+    const merged = await cli(['work-order', 'inspect', '--work-order-id', WORK_ORDER_ID]);
+    expect(merged.code).toBe(0);
+    expect(jsonOf(merged)).toMatchObject({
+      outcome: 'found',
+      workOrder: { id: WORK_ORDER_ID, state: 'merged' },
+    });
+  });
+
+  it('exposes the coordination surface', async () => {
+    const relay = await cli([
+      'coordination',
+      'send-relay',
+      '--json',
+      jsonArg({
+        requestId: 'relay-1',
+        projectId: PROJECT_ID,
+        recipientId: 'fleet-owner',
+        summary: 'lane update',
+        policyRevision: POLICY_REVISION,
+      }),
+    ]);
+    expect(relay.code).toBe(0);
+    expect(jsonOf(relay)).toMatchObject({
+      outcome: 'delivered',
+      request: { id: 'relay-1', kind: 'relay', deliveryStatus: 'delivered' },
+    });
+
+    const ack = await cli([
+      'coordination',
+      'ack-relay',
+      '--json',
+      jsonArg({
+        acknowledgementId: 'ack-1',
+        requestId: 'relay-1',
+        recipientId: 'fleet-owner',
+        responseSummary: 'seen',
+        provenance: 'operator-channel',
+      }),
+    ]);
+    expect(ack.code).toBe(0);
+    expect(jsonOf(ack)).toMatchObject({
+      outcome: 'acknowledged',
+      acknowledgement: { acknowledgementId: 'ack-1' },
+    });
+
+    const observation = await cli([
+      'coordination',
+      'publish-observation',
+      '--json',
+      jsonArg({
+        observationId: 'obs-1',
+        projectId: PROJECT_ID,
+        eventKind: 'note',
+        sourceAttemptId: ATTEMPT_ID,
+        payloadSummary: 'attempt collected',
+      }),
+    ]);
+    expect(observation.code).toBe(0);
+    expect(jsonOf(observation)).toEqual({ outcome: 'published', observationId: 'obs-1' });
+
+    // No attention reader is configured, so the read reports absence instead
+    // of inventing a healthy summary; that is a non-zero exit.
+    const attention = await cli(['coordination', 'attention', '--project-id', PROJECT_ID]);
+    expect(attention.code).toBe(1);
+    expect(jsonOf(attention)).toMatchObject({
+      outcome: 'unavailable',
+      reason: expect.stringContaining('no attention summary is readable'),
+    });
+
+    const capabilities = await cli([
+      'coordination',
+      'capabilities',
+      '--json',
+      jsonArg({
+        projectId: PROJECT_ID,
+        requiredCapabilities: ['scoped-worktree', 'networkEgressRestricted'],
+      }),
+    ]);
+    expect(capabilities.code).toBe(0);
+    expect(jsonOf(capabilities)).toMatchObject({
+      outcome: 'inspected',
+      profile: { projectId: PROJECT_ID },
+      missingRequirements: [],
+      explicitUnknowns: [],
+    });
+
+    const outstanding = await cli([
+      'coordination',
+      'outstanding',
+      '--json',
+      jsonArg({ projectId: PROJECT_ID }),
+    ]);
+    expect(outstanding.code).toBe(0);
+    expect(jsonOf(outstanding)).toEqual({
+      undecidedProposals: [],
+      unknownActions: [],
+      undeliveredObservations: [],
+      unacknowledgedRelays: [],
+    });
+  });
+
+  it('authorizes, consumes and blocks scoped action decisions', async () => {
+    const decision = await cli([
+      'coordination',
+      'request-decision',
+      '--json',
+      jsonArg({
+        requestId: 'dec-2',
+        projectId: PROJECT_ID,
+        kind: 'action-decision',
+        actionScope: 'forge:push-and-open-pr',
+        expectedHeadSha: laneHead,
+        proposalDigest: `open a pull request for ${ATTEMPT_ID}`,
+        policyRevision: POLICY_REVISION,
+      }),
+    ]);
+    expect(decision.code).toBe(0);
+    expect(jsonOf(decision)).toMatchObject({
+      outcome: 'requested',
+      request: { id: 'dec-2', grantId: 'grant-2' },
+    });
+
+    const resolved = await cli([
+      'coordination',
+      'resolve-auth',
+      '--json',
+      jsonArg({
+        projectId: PROJECT_ID,
+        actionScope: 'forge:push-and-open-pr',
+        expectedHeadSha: laneHead,
+      }),
+    ]);
+    expect(resolved.code).toBe(0);
+    expect(jsonOf(resolved)).toMatchObject({
+      outcome: 'authorized',
+      grantId: 'grant-2',
+      expectedHeadSha: laneHead,
+    });
+
+    const consumed = await cli([
+      'coordination',
+      'consume-auth',
+      '--json',
+      jsonArg({
+        consumptionId: 'consumption-direct-1',
+        grantId: 'grant-2',
+        actionId: 'action-direct-1',
+        attemptId: ATTEMPT_ID,
+        expectedHeadSha: laneHead,
+      }),
+    ]);
+    expect(consumed.code).toBe(0);
+    expect(jsonOf(consumed)).toMatchObject({
+      outcome: 'consumed',
+      consumption: { actionId: 'action-direct-1', attemptId: ATTEMPT_ID },
+    });
+
+    // A consumed grant never authorizes a second action.
+    const blocked = await cli([
+      'coordination',
+      'resolve-auth',
+      '--json',
+      jsonArg({
+        projectId: PROJECT_ID,
+        actionScope: 'forge:push-and-open-pr',
+        expectedHeadSha: laneHead,
+      }),
+    ]);
+    expect(blocked.code).toBe(1);
+    expect(jsonOf(blocked)).toMatchObject({
+      outcome: 'blocked',
+      reason: expect.stringContaining('no recorded decision authorizes'),
+    });
+  });
+
+  it('manages the knowledge lifecycle beyond the workflow', async () => {
+    const selection = await cli([
+      'knowledge',
+      'select-context',
+      '--json',
+      jsonArg({
+        attemptId: ATTEMPT_ID,
+        selections: [
+          {
+            proposalId: 'bkp-manual-1',
+            knowledgeEntryId: entryId,
+            version: '1.0.0',
+            accepted: true,
+            decisionBecause: 'reused for the fix round',
+          },
+        ],
+      }),
+    ]);
+    expect(selection.code).toBe(0);
+    expect(jsonOf(selection)).toEqual({ outcome: 'recorded', recordedCount: 1 });
+
+    const reuse = await cli([
+      'knowledge',
+      'record-reuse',
+      '--json',
+      jsonArg({
+        reuseId: 'reuse-1',
+        entryId,
+        attemptId: ATTEMPT_ID,
+        outcome: 'included',
+        evidenceRef: 'brief manifest',
+      }),
+    ]);
+    expect(reuse.code).toBe(0);
+    expect(jsonOf(reuse)).toMatchObject({
+      outcome: 'recorded',
+      reuse: { id: 'reuse-1', outcome: 'included' },
+      entry: { id: entryId },
+    });
+
+    const published = await cli(['knowledge', 'publish', '--entry-id', entryId]);
+    expect(published.code).toBe(0);
+    expect(jsonOf(published)).toMatchObject({
+      outcome: 'published',
+      entry: { id: entryId },
+      externalRef: expect.stringContaining('keepers-shelf.json'),
+    });
+
+    // A second captured lesson supersedes the first after its own check and
+    // deliberate acceptance.
+    const capture = await cli([
+      'knowledge',
+      'capture-notes',
+      '--json',
+      jsonArg({
+        projectId: PROJECT_ID,
+        attemptId: 'attempt-seed-2',
+        workOrderId: WORK_ORDER_ID,
+        headCommitSha: laneHead,
+        notesMarkdown: '- Run yarn lint and yarn build together with node 22 in the demo package\n',
+        pathPrefixes: ['packages/demo'],
+      }),
+    ]);
+    expect(capture.code).toBe(0);
+    const captured = jsonOf<{ candidateEntries: { id: string }[] }>(capture);
+    const newerEntryId = captured.candidateEntries[0].id;
+
+    const check = await cli([
+      'knowledge',
+      'check-claim',
+      '--json',
+      jsonArg({
+        checkId: 'check-2',
+        entryId: newerEntryId,
+        checkerId: 'checker-1',
+        procedureName: 'confirm-path-exists',
+        targetPath: briefFilePath,
+      }),
+    ]);
+    expect(check.code).toBe(0);
+    expect(jsonOf(check)).toMatchObject({ outcome: 'checked', entry: { verification: 'supported' } });
+
+    const decide = await cli([
+      'knowledge',
+      'decide',
+      '--json',
+      jsonArg({
+        entryId: newerEntryId,
+        disposition: 'accepted',
+        checkerId: 'checker-1',
+        reason: 'Corrected lesson verified against the build pipeline',
+      }),
+    ]);
+    expect(decide.code).toBe(0);
+    expect(jsonOf(decide)).toMatchObject({ outcome: 'decided', entry: { disposition: 'accepted' } });
+
+    const superseded = await cli([
+      'knowledge',
+      'supersede',
+      '--json',
+      jsonArg({
+        olderEntryId: entryId,
+        newerEntryId,
+        checkerId: 'checker-1',
+        reason: 'The newer lesson records the node version requirement',
+      }),
+    ]);
+    expect(superseded.code).toBe(0);
+    expect(jsonOf(superseded)).toMatchObject({
+      outcome: 'superseded',
+      olderEntry: { id: entryId, disposition: 'superseded', supersededById: newerEntryId },
+      newerEntry: { id: newerEntryId },
+    });
+  });
+
+  it('prepares fix rounds, refuses unavailable evidence and stops attempts', async () => {
+    const fix = await cli([
+      'attempt',
+      'fix',
+      '--json',
+      jsonArg({
+        fixAttemptId: `${ATTEMPT_ID}-fix-1`,
+        workOrderId: WORK_ORDER_ID,
+        priorAttemptId: ATTEMPT_ID,
+        worktreePath: laneRepoDir,
+        baseCommit: laneHead,
+        numberedFixes: ['1. Re-run yarn build'],
+      }),
+    ]);
+    expect(fix.code).toBe(0);
+    expect(jsonOf(fix)).toMatchObject({
+      outcome: 'prepared',
+      attempt: {
+        id: `${ATTEMPT_ID}-fix-1`,
+        kind: 'fix',
+        fixNumber: 1,
+        priorAttemptId: ATTEMPT_ID,
+        state: 'intent-recorded',
+      },
+    });
+
+    // No independent review transport is configured, so the request is
+    // rejected rather than fabricated as evidence.
+    const review = await cli([
+      'evidence',
+      'request-review',
+      '--json',
+      jsonArg({
+        attemptId: ATTEMPT_ID,
+        projectId: PROJECT_ID,
+        candidateHeadSha: laneHead,
+        policyRevision: POLICY_REVISION,
+        implementerModel: 'nvidia/z-ai/glm-5.3',
+        reviewerModel: 'openrouter/anthropic/claude-sonnet-4.5',
+      }),
+    ]);
+    expect(review.code).toBe(1);
+    expect(jsonOf(review)).toMatchObject({
+      outcome: 'rejected',
+      reason: expect.stringContaining('No independent review transport is configured'),
+    });
+
+    // No finding was raised for this assessment, so there is nothing to
+    // dispose; the command reports that instead of inventing a resolution.
+    const disposition = await cli([
+      'evidence',
+      'disposition',
+      '--json',
+      jsonArg({
+        attemptId: ATTEMPT_ID,
+        disposition: {
+          id: 'fd-1',
+          assessmentId: assessmentIdForAttempt(ATTEMPT_ID),
+          findingId: 'finding-1',
+          candidateHeadSha: laneHead,
+          state: 'fixed',
+          reason: 'addressed',
+          evidenceRef: 'evidence://fd-1',
+          recordedBy: 'checker-1',
+          recordedAtIso: '2026-10-15T09:00:00.000Z',
+        },
+      }),
+    ]);
+    expect(disposition.code).toBe(1);
+    expect(jsonOf(disposition)).toMatchObject({
+      outcome: 'rejected',
+      reason: expect.stringContaining("No finding 'finding-1' was raised"),
+    });
+
+    const stop = await cli(['attempt', 'stop', '--json', jsonArg({ attemptId: ATTEMPT_ID })]);
+    expect(stop.code).toBe(0);
+    expect(jsonOf(stop)).toMatchObject({
+      outcome: 'terminated',
+      attempt: { id: ATTEMPT_ID, state: 'cancelled', outcome: 'stopped' },
+      receipt: { attemptId: ATTEMPT_ID, sessionId: SESSION_ID, stoppedByRequest: true },
+      capacityReleased: false,
+    });
+  });
+
+  it('reports help, usage errors and refusal exit codes', async () => {
+    const help = await cli(['--help']);
+    expect(help.code).toBe(0);
+    expect(help.text).toContain('work-order register|inspect');
+    expect(help.text).toContain('coordination register-profile|capabilities|request-decision');
+
+    const helpWord = await cli(['help']);
+    expect(helpWord.code).toBe(0);
+    expect(helpWord.text).toBe(help.text);
+
+    const none = await cli([]);
+    expect(none.code).toBe(2);
+    expect(none.stderr).toContain('Usage');
+
+    const unknownCommand = await cli(['warp-drive']);
+    expect(unknownCommand.code).toBe(2);
+    expect(unknownCommand.stderr).toContain("Unknown command: warp-drive");
+
+    const missingSubcommand = await cli(['work-order']);
+    expect(missingSubcommand.code).toBe(2);
+    expect(missingSubcommand.stderr).toContain('Subcommands:');
+
+    const unknownSubcommand = await cli(['work-order', 'frobnicate']);
+    expect(unknownSubcommand.code).toBe(2);
+    expect(unknownSubcommand.stderr).toContain('Unknown work-order subcommand: frobnicate');
+
+    const badJson = await cli(['work-order', 'register', '--json', '{oops']);
+    expect(badJson.code).toBe(2);
+    expect(badJson.stderr).toContain('--json payload is not valid JSON');
+
+    const nonObjectJson = await cli(['work-order', 'register', '--json', '[1,2]']);
+    expect(nonObjectJson.code).toBe(2);
+    expect(nonObjectJson.stderr).toContain('--json payload must be a JSON object');
+
+    const badKind = await cli([
+      'forge',
+      'execute',
+      '--json',
+      jsonArg({ attemptId: ATTEMPT_ID, kind: 'delete-everything', authorizationGrantId: 'g' }),
+    ]);
+    expect(badKind.code).toBe(2);
+    expect(badKind.stderr).toContain("forge kind must be 'push-and-open-pr' or 'merge-pr'");
+
+    // A duplicate identity is refused by the work order use case and exits 1.
+    const duplicate = await cli([
+      'work-order',
+      'register',
+      '--json',
+      jsonArg({
+        workOrderId: WORK_ORDER_ID,
+        projectId: PROJECT_ID,
+        taskId: 'task-1',
+        laneId: LANE_ID,
+        repository: 'github.com/org/repo',
+        baseCommit: laneHead,
+        ownedPaths: ['packages/demo/src'],
+        policyRevision: POLICY_REVISION,
+      }),
+    ]);
+    expect(duplicate.code).toBe(1);
+    expect(jsonOf(duplicate)).toMatchObject({
+      outcome: 'rejected',
+      reason: expect.stringContaining('already registered'),
+    });
+
+    // An invalid capacity request is refused with its reason.
+    const refusedReserve = await cli([
+      'capacity',
+      'reserve',
+      '--json',
+      jsonArg({
+        reservationId: 'res-x',
+        attemptId: 'attempt-x',
+        workOrderId: WORK_ORDER_ID,
+        hostId: 'host-1',
+        worktreePath: laneRepoDir,
+        maxSlots: 0,
+      }),
+    ]);
+    expect(refusedReserve.code).toBe(1);
+    expect(jsonOf(refusedReserve)).toMatchObject({
+      outcome: 'refused',
+      reason: 'maxSlots must be a positive number',
+    });
+
+    // Missing evidence identity is reported as not-found, never as a pass.
+    const notFoundEvidence = await cli(['evidence', 'inspect', '--json', '{}']);
+    expect(notFoundEvidence.code).toBe(1);
+    expect(jsonOf(notFoundEvidence)).toEqual({ outcome: 'not-found', query: '' });
+  });
+});

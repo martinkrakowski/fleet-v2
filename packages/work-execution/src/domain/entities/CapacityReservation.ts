@@ -1,53 +1,77 @@
-// @generated entity stub — edit freely
+// @generated entity stub — refined for migration step 1.
 /**
- * CapacityReservation is a domain entity with identity and lifecycle.
- *
- * Domain entities:
- * - Have unique identity (ID)
- * - Contain business logic and invariants
- * - Are mutable (unlike value objects)
- * - Enforce domain rules in their methods
- *
- * @example
- * const entity = new CapacityReservation(id, props);
- * entity.performAction();
+ * CapacityReservation is a child entity of Attempt: one physical slot held
+ * for one attempt on one host until the attempt ends. Releasing is a
+ * one-way transition; a released slot is never re-held by the same record.
  */
+
+import type { CapacityReservationRecord } from '../execution-records.js';
+
 export class CapacityReservation {
-  /**
-   * Constructor for CapacityReservation entity.
-   *
-   * @param id - Unique identifier
-   * @param props - Entity properties
-   *
-   * TODO: Define your entity properties
-   * Example:
-   * constructor(
-   *   private readonly id: string,
-   *   private name: string,
-   *   private status: Status,
-   * ) {
-   *   // Validate invariants
-   * }
-   */
-  constructor(private readonly id: string) {
-    // TODO: Initialize entity state
-    // TODO: Validate invariants
+  private constructor(private record: CapacityReservationRecord) {
+    // Invariants are validated in fromRecord.
   }
 
-  /**
-   * Get entity ID.
-   */
+  static fromRecord(record: CapacityReservationRecord): CapacityReservation {
+    if (typeof record.id !== 'string' || record.id.trim().length === 0) {
+      throw new Error('CapacityReservation requires a non-empty id');
+    }
+    if (typeof record.attemptId !== 'string' || record.attemptId.trim().length === 0) {
+      throw new Error('CapacityReservation requires a non-empty attemptId');
+    }
+    if (typeof record.hostId !== 'string' || record.hostId.trim().length === 0) {
+      throw new Error('CapacityReservation requires a non-empty hostId');
+    }
+    if (Number.isInteger(record.slotIndex) === false || record.slotIndex < 0) {
+      throw new Error('CapacityReservation requires a non-negative integer slotIndex');
+    }
+    if (typeof record.reservedAtIso !== 'string' || record.reservedAtIso.trim().length === 0) {
+      throw new Error('CapacityReservation requires a non-empty reservedAtIso');
+    }
+    if (record.releasedAtIso !== null && record.held) {
+      throw new Error('A held reservation cannot carry a releasedAtIso');
+    }
+    return new CapacityReservation({ ...record });
+  }
+
   getId(): string {
-    return this.id;
+    return this.record.id;
+  }
+
+  toRecord(): CapacityReservationRecord {
+    return { ...this.record };
+  }
+
+  getAttemptId(): string {
+    return this.record.attemptId;
+  }
+
+  getHostId(): string {
+    return this.record.hostId;
+  }
+
+  isHeld(): boolean {
+    return this.record.held;
+  }
+
+  isReleased(): boolean {
+    return !this.record.held && this.record.releasedAtIso !== null;
   }
 
   /**
-   * TODO: Add domain methods here
-   * Example:
-   * performAction(): Result<void, Error> {
-   *   // Validate business rules
-   *   // Update state
-   *   // Return result
-   * }
+   * Release is one-way: a released reservation is never re-held, and only a
+   * held reservation may be released.
    */
+  release(releasedAtIso: string): CapacityReservationRecord {
+    if (this.record.held === false) {
+      throw new Error('Only a held reservation can be released');
+    }
+    const released: CapacityReservationRecord = {
+      ...this.record,
+      held: false,
+      releasedAtIso,
+    };
+    this.record = released;
+    return released;
+  }
 }

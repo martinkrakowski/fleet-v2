@@ -19,6 +19,18 @@ export function isNotImplementedError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith("Not implemented");
 }
 
+export interface ApiErrorMapping {
+  status: number;
+  code: string;
+}
+
+export function mapKnowledgeError(error: unknown): ApiErrorMapping | null {
+  if (!isNotImplementedError(error)) {
+    return null;
+  }
+  return { status: 501, code: "NOT_IMPLEMENTED" };
+}
+
 export function resolveOperationId(event: H3Event): string {
   const idempotencyKey = getRequestHeader(event, "Idempotency-Key");
   return idempotencyKey ? idempotencyKey : crypto.randomUUID();

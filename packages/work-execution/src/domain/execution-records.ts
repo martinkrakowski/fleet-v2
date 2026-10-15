@@ -93,3 +93,5 @@ export interface ActionJournalEntryRecord {
   readonly sessionId: string | null;
   readonly detail: string | null;
 }
+
+export const __redProof: number = "not a number";

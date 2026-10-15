@@ -16,6 +16,18 @@ export function isNotImplemented(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith("Not implemented:");
 }
 
+export interface ApiErrorMapping {
+  status: number;
+  code: string;
+}
+
+export function mapEvidenceError(error: unknown): ApiErrorMapping | null {
+  if (!isNotImplemented(error)) {
+    return null;
+  }
+  return { status: 501, code: "NOT_IMPLEMENTED" };
+}
+
 export async function evidenceResponse(
   event: H3Event,
   useCase: EvidenceUseCase,

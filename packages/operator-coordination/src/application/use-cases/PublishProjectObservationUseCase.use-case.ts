@@ -35,10 +35,26 @@ export class PublishProjectObservationUseCase implements PublishProjectObservati
   }
 
   async execute(input: unknown): Promise<PublishProjectObservationResult> {
-    if (typeof input !== 'object' || input === null || !this.deps) {
+    // Unconfigured is 501 and is checked before any request validation.
+    if (!this.deps) {
+      throw new Error('Not implemented: PublishProjectObservationUseCase');
+    }
+    // A configured runtime still refuses a missing request object instead of
+    // inventing one; the HTTP boundary always supplies an object body.
+    if (typeof input !== 'object' || input === null) {
       throw new Error('Not implemented: PublishProjectObservationUseCase');
     }
     const request = input as PublishProjectObservationRequest;
+    if (Object.keys(request).length === 0) {
+      // The HTTP boundary's empty body object: the gap is reported and stays
+      // visible, never reported as an unimplemented station.
+      return {
+        outcome: 'delivery-gap',
+        observationId: '',
+        reason:
+          'an observation requires observationId, projectId, eventKind and payloadSummary',
+      };
+    }
     if (
       !isFilled(request.observationId) ||
       !isFilled(request.projectId) ||

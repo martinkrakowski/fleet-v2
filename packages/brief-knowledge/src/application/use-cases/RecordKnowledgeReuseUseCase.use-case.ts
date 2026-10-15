@@ -29,7 +29,14 @@ export class RecordKnowledgeReuseUseCase implements RecordKnowledgeReusePort {
   }
 
   async recordKnowledgeReuse(request: RecordKnowledgeReuseRequest): Promise<RecordKnowledgeReuseResult> {
-    if (!this.deps || !isValidRequest(request)) {
+    // Unconfigured is 501 and is checked before any request validation.
+    if (!this.deps) {
+      throw new Error('Not implemented: RecordKnowledgeReuseUseCase');
+    }
+    // A configured runtime still refuses a missing request object instead of
+    // inventing one; the HTTP boundary always supplies an object body, and an
+    // empty object body flows into the validation below as a rejection.
+    if (!isValidRequest(request)) {
       throw new Error('Not implemented: RecordKnowledgeReuseUseCase');
     }
     if (isBlank(request.entryId)) {

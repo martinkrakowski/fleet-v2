@@ -2,6 +2,10 @@
 // in-process cross-context adapters. The composition root is the only place
 // where supplier-side use cases are bound to consumer-side ports; the use
 // cases themselves never import across contexts.
+import { randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+
 import type { InspectWorkOrderUseCase } from "@fleet/work-execution/use-cases";
 
 import { configureEvidenceUseCases, createConfiguredEvidenceUseCases } from "./evidence/composition";
@@ -24,6 +28,123 @@ export interface FleetApiRuntimeOptions {
   readonly stateDir?: string;
 }
 
+/**
+ * The attempt coordinates recorded when an authorization grant is resolved.
+ * The work-side consumption request does not carry them, so they must
+ * survive the resolving process to scope any later consumption.
+ */
+export interface FleetAuthorizationCoordinate {
+  readonly attemptId: string;
+  readonly expectedHeadSha: string;
+}
+
+/** Cross-process state file names inside the shared `stateDir`. */
+const ACCEPTED_RECEIPTS_FILE = "accepted-receipts.json";
+const AUTHORIZATION_COORDINATES_FILE = "authorization-coordinates.json";
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isRecordOfStrings(value: unknown): value is Record<string, string> {
+  return isPlainRecord(value) && Object.values(value).every((entry) => typeof entry === "string");
+}
+
+function isAuthorizationCoordinate(value: unknown): value is FleetAuthorizationCoordinate {
+  return (
+    isPlainRecord(value) &&
+    typeof value.attemptId === "string" &&
+    typeof value.expectedHeadSha === "string"
+  );
+}
+
+/** Atomic JSON persistence: temp file beside the target, then rename over it. */
+function writeJsonFileAtomically(filePath: string, value: unknown): void {
+  mkdirSync(dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.tmp-${randomUUID()}`;
+  writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  renameSync(tempPath, filePath);
+}
+
+/**
+ * Read the acceptance receipts persisted under `stateDir`. An absent,
+ * unreadable or malformed file contributes no receipts; it is never
+ * reinterpreted as acceptance.
+ */
+export function readAcceptedReceiptsFromState(stateDir: string): Record<string, string> {
+  try {
+    const parsed: unknown = JSON.parse(
+      readFileSync(join(stateDir, ACCEPTED_RECEIPTS_FILE), "utf8"),
+    );
+    return isRecordOfStrings(parsed) ? { ...parsed } : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Atomically persist `receipts` to `<stateDir>/accepted-receipts.json`,
+ * merging the receipts already on disk so records written by other processes
+ * (a CLI run, an earlier API process) are never dropped.
+ */
+export function persistAcceptedReceiptsToState(
+  stateDir: string,
+  receipts: Readonly<Record<string, string>>,
+): void {
+  writeJsonFileAtomically(join(stateDir, ACCEPTED_RECEIPTS_FILE), {
+    ...readAcceptedReceiptsFromState(stateDir),
+    ...receipts,
+  });
+}
+
+/**
+ * Read the authorization coordinates persisted under `stateDir`. An absent,
+ * unreadable or malformed file contributes no coordinates.
+ */
+export function readAuthorizationCoordinatesFromState(
+  stateDir: string,
+): Map<string, FleetAuthorizationCoordinate> {
+  const coordinates = new Map<string, FleetAuthorizationCoordinate>();
+  try {
+    const parsed: unknown = JSON.parse(
+      readFileSync(join(stateDir, AUTHORIZATION_COORDINATES_FILE), "utf8"),
+    );
+    if (!isPlainRecord(parsed)) {
+      return coordinates;
+    }
+    for (const [grantId, coordinate] of Object.entries(parsed)) {
+      if (isAuthorizationCoordinate(coordinate)) {
+        coordinates.set(grantId, {
+          attemptId: coordinate.attemptId,
+          expectedHeadSha: coordinate.expectedHeadSha,
+        });
+      }
+    }
+  } catch {
+    // No persisted coordinates yet; the live in-process map stays authoritative.
+  }
+  return coordinates;
+}
+
+/**
+ * Atomically persist `coordinates` to `<stateDir>/authorization-coordinates.json`,
+ * merging the coordinates already on disk so grants resolved by other
+ * processes keep their scopes.
+ */
+export function persistAuthorizationCoordinatesToState(
+  stateDir: string,
+  coordinates: ReadonlyMap<string, FleetAuthorizationCoordinate>,
+): void {
+  const merged = readAuthorizationCoordinatesFromState(stateDir);
+  for (const [grantId, coordinate] of coordinates) {
+    merged.set(grantId, coordinate);
+  }
+  writeJsonFileAtomically(
+    join(stateDir, AUTHORIZATION_COORDINATES_FILE),
+    Object.fromEntries(merged),
+  );
+}
+
 export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null): void {
   if (options === null) {
     configureWorkComposition(null);
@@ -39,8 +160,10 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   const evidence = createConfiguredEvidenceUseCases({ stateDir });
 
   // Authorization grants resolved in this process remember the attempt
-  // coordinates the work-side consumption request does not carry.
-  const resolveCoordinates = new Map<string, { attemptId: string; expectedHeadSha: string }>();
+  // coordinates the work-side consumption request does not carry. With a
+  // shared stateDir they are persisted atomically on resolve and reloaded
+  // on consumption, so a grant resolved by an earlier process stays scoped.
+  const resolveCoordinates = new Map<string, FleetAuthorizationCoordinate>();
 
   // The notes-forwarding delegate resolves the note's project through the
   // work context's own lookup, captured as soon as the composition exists.
@@ -48,8 +171,22 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
 
   // Live registry of acceptance receipts per candidate head: the acceptance
   // delegate records entries and the merge gate consumes them, so a merge is
-  // only ever authorized for a head whose acceptance receipt exists.
-  const acceptedReceiptByHead: Record<string, string> = {};
+  // only ever authorized for a head whose acceptance receipt exists. With a
+  // shared stateDir the registry is persisted atomically on every acceptance
+  // and re-read before each lookup, so receipts recorded by earlier processes
+  // (CLI runs, restarted API processes) survive this process boundary.
+  const liveAcceptedReceiptByHead: Record<string, string> = {};
+  const acceptedReceiptByHead: Record<string, string> =
+    stateDir === undefined
+      ? liveAcceptedReceiptByHead
+      : new Proxy(liveAcceptedReceiptByHead, {
+          get(target, property, receiver) {
+            if (typeof property === "string") {
+              return { ...readAcceptedReceiptsFromState(stateDir), ...target }[property];
+            }
+            return Reflect.get(target, property, receiver);
+          },
+        });
 
   const crossContext: WorkCrossContextDelegates = {
     acceptance: {
@@ -62,13 +199,17 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
           policyRevision: request.policyRevision,
         });
         switch (result.outcome) {
-          case "accepted":
+          case "accepted": {
             acceptedReceiptByHead[result.candidateHeadSha] = result.receiptId;
+            if (stateDir !== undefined) {
+              persistAcceptedReceiptsToState(stateDir, liveAcceptedReceiptByHead);
+            }
             return {
               outcome: "accepted",
               receiptId: result.receiptId,
               assessedHeadSha: result.candidateHeadSha,
             };
+          }
           case "blocked":
             return { outcome: "rejected", reason: result.blockers.join("; ") };
           default:
@@ -144,11 +285,23 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
           attemptId: request.attemptId,
           expectedHeadSha: request.expectedHeadSha,
         });
+        if (stateDir !== undefined) {
+          persistAuthorizationCoordinatesToState(stateDir, resolveCoordinates);
+        }
         return { outcome: "granted", authorizationGrantId: result.grantId };
       },
       // The work-side consume request carries only the grant and action ids;
       // the coordinates recorded at resolve time scope the consumption.
       consumeGrant: async (request) => {
+        if (stateDir !== undefined) {
+          // Reload the persisted coordinates so a restarted process honors
+          // grants resolved before it started.
+          for (const [grantId, coordinate] of readAuthorizationCoordinatesFromState(stateDir)) {
+            if (!resolveCoordinates.has(grantId)) {
+              resolveCoordinates.set(grantId, coordinate);
+            }
+          }
+        }
         const coordinates = resolveCoordinates.get(request.authorizationGrantId);
         if (!coordinates) {
           return {

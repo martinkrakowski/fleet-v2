@@ -29,12 +29,24 @@ export class ReadProjectAttentionUseCase implements ReadProjectAttentionPort {
   }
 
   async execute(input: unknown): Promise<ReadProjectAttentionResult> {
-    if (!this.deps || typeof input !== 'object' || input === null) {
+    // Unconfigured is 501 and is checked before any request validation.
+    if (!this.deps) {
+      throw new Error('Not implemented: ReadProjectAttentionUseCase');
+    }
+    // A configured runtime still refuses a missing request object instead of
+    // inventing one; the HTTP boundary always supplies an object body, and an
+    // empty object body reports unreadable attention below rather than a 501.
+    if (typeof input !== 'object' || input === null) {
       throw new Error('Not implemented: ReadProjectAttentionUseCase');
     }
     const request = input as ReadProjectAttentionRequest;
     if (typeof request.projectId !== 'string' || request.projectId.trim().length === 0) {
-      throw new Error('Not implemented: ReadProjectAttentionUseCase');
+      // Without a usable project identity no attention summary can be read;
+      // that is an unavailable read, never an unimplemented station.
+      return {
+        outcome: 'unavailable',
+        reason: 'Project attention requires a non-empty projectId',
+      };
     }
     const projectId = request.projectId.trim();
     let summary: ProjectAttentionSummaryRecord | null;

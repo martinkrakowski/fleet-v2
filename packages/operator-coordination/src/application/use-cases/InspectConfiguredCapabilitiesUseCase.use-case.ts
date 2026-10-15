@@ -33,13 +33,22 @@ export class InspectConfiguredCapabilitiesUseCase implements InspectConfiguredCa
   }
 
   async execute(input: unknown): Promise<InspectConfiguredCapabilitiesResult> {
-    if (!this.deps || typeof input !== 'object' || input === null) {
+    // Unconfigured is 501 and is checked before any request validation.
+    if (!this.deps) {
+      throw new Error('Not implemented: InspectConfiguredCapabilitiesUseCase');
+    }
+    // A configured runtime still refuses a missing request object instead of
+    // inventing one; the HTTP boundary always supplies an object body, and an
+    // empty object body reports known absence below rather than a 501.
+    if (typeof input !== 'object' || input === null) {
       throw new Error('Not implemented: InspectConfiguredCapabilitiesUseCase');
     }
     const request = input as InspectConfiguredCapabilitiesRequest;
-    const projectId = request.projectId;
-    if (typeof projectId !== 'string' || projectId.trim().length === 0) {
-      throw new Error('Not implemented: InspectConfiguredCapabilitiesUseCase');
+    const projectId = typeof request.projectId === 'string' ? request.projectId : '';
+    if (projectId.trim().length === 0) {
+      // An unusable project identity is known absence, never an unimplemented
+      // station, so a configured runtime still answers over HTTP 200.
+      return { outcome: 'not-found', projectId };
     }
     const record = await this.deps.profileRepo.findProfileById(projectId);
     if (record === null) {

@@ -1,6 +1,11 @@
 import { getKnowledgeComposition } from "../../../wiring/knowledge/composition";
 import { knowledgeResponse } from "../../../wiring/knowledge/errors";
+import { readObjectBody } from "../../../wiring/http-input";
 
-export default defineEventHandler((event) =>
-  knowledgeResponse(event, getKnowledgeComposition().recordContextSelection, undefined),
+export default defineEventHandler(async (event) =>
+  knowledgeResponse(
+    event,
+    getKnowledgeComposition().recordContextSelection,
+    await readObjectBody(event),
+  ),
 );

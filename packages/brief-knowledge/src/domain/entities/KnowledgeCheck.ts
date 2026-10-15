@@ -1,53 +1,72 @@
-// @generated entity stub — edit freely
+// @generated entity stub — refined for migration step 3.
 /**
- * KnowledgeCheck is a domain entity with identity and lifecycle.
- *
- * Domain entities:
- * - Have unique identity (ID)
- * - Contain business logic and invariants
- * - Are mutable (unlike value objects)
- * - Enforce domain rules in their methods
- *
- * @example
- * const entity = new KnowledgeCheck(id, props);
- * entity.performAction();
+ * KnowledgeCheck is a child entity of the KnowledgeEntry aggregate. It
+ * records one bounded, orchestrator-chosen verification of one claim
+ * version. Evidence is attributable — a check names the checker, the
+ * procedure that ran and where the evidence lives; model confidence is
+ * never evidence.
  */
+
+import type { KnowledgeCheckRecord } from '../knowledge-records.js';
+import type { KnowledgeVerificationValue } from '../value-objects/KnowledgeVerification.vo.js';
+import { KnowledgeVerification } from '../value-objects/KnowledgeVerification.vo.js';
+
 export class KnowledgeCheck {
-  /**
-   * Constructor for KnowledgeCheck entity.
-   *
-   * @param id - Unique identifier
-   * @param props - Entity properties
-   *
-   * TODO: Define your entity properties
-   * Example:
-   * constructor(
-   *   private readonly id: string,
-   *   private name: string,
-   *   private status: Status,
-   * ) {
-   *   // Validate invariants
-   * }
-   */
-  constructor(private readonly id: string) {
-    // TODO: Initialize entity state
-    // TODO: Validate invariants
+  private constructor(private record: KnowledgeCheckRecord) {
+    // Invariants are validated in fromRecord.
   }
 
-  /**
-   * Get entity ID.
-   */
+  static fromRecord(record: KnowledgeCheckRecord): KnowledgeCheck {
+    if (typeof record.id !== 'string' || record.id.trim().length === 0) {
+      throw new Error('KnowledgeCheck requires a non-empty id');
+    }
+    if (typeof record.entryId !== 'string' || record.entryId.trim().length === 0) {
+      throw new Error('KnowledgeCheck requires a non-empty entryId');
+    }
+    if (typeof record.checkerId !== 'string' || record.checkerId.trim().length === 0) {
+      throw new Error('KnowledgeCheck requires a non-empty checkerId');
+    }
+    if (typeof record.procedureName !== 'string' || record.procedureName.trim().length === 0) {
+      throw new Error('KnowledgeCheck requires a non-empty procedureName');
+    }
+    if (!KnowledgeVerification.create(record.verification).success) {
+      throw new Error(`KnowledgeCheck has an invalid verification: ${String(record.verification)}`);
+    }
+    if (typeof record.evidenceRef !== 'string' || record.evidenceRef.trim().length === 0) {
+      throw new Error('KnowledgeCheck requires a non-empty evidenceRef');
+    }
+    if (typeof record.checkedAtIso !== 'string' || record.checkedAtIso.trim().length === 0) {
+      throw new Error('KnowledgeCheck requires a non-empty checkedAtIso');
+    }
+    return new KnowledgeCheck({ ...record });
+  }
+
   getId(): string {
-    return this.id;
+    return this.record.id;
   }
 
-  /**
-   * TODO: Add domain methods here
-   * Example:
-   * performAction(): Result<void, Error> {
-   *   // Validate business rules
-   *   // Update state
-   *   // Return result
-   * }
-   */
+  getEntryId(): string {
+    return this.record.entryId;
+  }
+
+  getCheckerId(): string {
+    return this.record.checkerId;
+  }
+
+  getVerification(): KnowledgeVerificationValue {
+    return this.record.verification;
+  }
+
+  /** Every check carries an evidence reference; absence is not a check. */
+  hasEvidence(): boolean {
+    return this.record.evidenceRef.trim().length > 0;
+  }
+
+  contradictsClaim(): boolean {
+    return this.record.verification === 'contradicted';
+  }
+
+  toRecord(): KnowledgeCheckRecord {
+    return { ...this.record };
+  }
 }

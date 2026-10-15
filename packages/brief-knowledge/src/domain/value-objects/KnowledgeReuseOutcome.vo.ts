@@ -1,58 +1,37 @@
-// @generated value-object stub — edit freely
+// @generated value-object stub — refined for migration step 2.
 /**
- * KnowledgeReuseOutcome is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = KnowledgeReuseOutcome.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * KnowledgeReuseOutcome is an immutable value object over the manifest's
+ * reuse outcome enum. Context inclusion alone does not prove saved work;
+ * only demonstrated benefit counts as `helped`.
  */
+
+export const KNOWLEDGE_REUSE_OUTCOMES = ['included', 'helped', 'wrong-turn', 'unused', 'unknown'] as const;
+
+export type KnowledgeReuseOutcomeValue = (typeof KNOWLEDGE_REUSE_OUTCOMES)[number];
+
+const KNOWLEDGE_REUSE_OUTCOME_VALUES: readonly string[] = KNOWLEDGE_REUSE_OUTCOMES;
+
 export class KnowledgeReuseOutcome {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use KnowledgeReuseOutcome.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly value: KnowledgeReuseOutcomeValue) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing KnowledgeReuseOutcome or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<KnowledgeReuseOutcome, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new KnowledgeReuseOutcome(value) };
-   * }
-   */
   static create(value: unknown): { success: boolean; value?: KnowledgeReuseOutcome; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new KnowledgeReuseOutcome(value) };
+    if (typeof value !== 'string' || !KNOWLEDGE_REUSE_OUTCOME_VALUES.includes(value)) {
+      return { success: false, error: new Error(`Invalid knowledge reuse outcome: ${String(value)}`) };
+    }
+    return { success: true, value: new KnowledgeReuseOutcome(value as KnowledgeReuseOutcomeValue) };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
+  getValue(): KnowledgeReuseOutcomeValue {
     return this.value;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
+  /** Demonstrated benefit, attributable with evidence; inclusion is not benefit. */
+  demonstratesBenefit(): boolean {
+    return this.value === 'helped';
+  }
+
   equals(other: KnowledgeReuseOutcome): boolean {
     return this.value === other.value;
   }

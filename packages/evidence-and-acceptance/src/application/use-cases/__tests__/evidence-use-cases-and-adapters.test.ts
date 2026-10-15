@@ -1039,6 +1039,27 @@ describe('AssessHeadAcceptanceUseCase', () => {
     ]);
   });
 
+  it('blocks acceptance when the forge could not read review threads', async () => {
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo: fakeRepository([completeEvidence()]),
+      forgeEvidence: stubForge({
+        candidateHeadSha: HEAD,
+        ciState: 'pass',
+        unresolvedThreadCount: null,
+      }),
+    });
+
+    const result = await useCase.assessHeadAcceptance(assessRequest());
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome !== 'blocked') {
+      throw new Error('expected a blocked assessment');
+    }
+    expect(result.blockers).toEqual([
+      'forge could not read review threads for this candidate head',
+    ]);
+  });
+
   it('accepts a head with passing checks, a passing independent review and a clean forge', async () => {
     const repo = fakeRepository([completeEvidence()]);
     const useCase = new AssessHeadAcceptanceUseCase({
@@ -1294,12 +1315,14 @@ describe('ForgeEvidenceAdapter', () => {
     expect(await adapter.readForgeCheckStatus({ candidateHeadSha: HEAD })).toEqual({
       candidateHeadSha: HEAD,
       ciState: 'unknown',
-      unresolvedThreadCount: 0,
+      unresolvedThreadCount: null,
     });
   });
 
   it('maps gh pr checks buckets and counts unresolved review threads', async () => {
     const adapter = new ForgeEvidenceAdapter({
+      owner: 'acme',
+      repo: 'widgets',
       runGh: async (args) => {
         if (args[0] === 'pr') {
           return {
@@ -1307,17 +1330,26 @@ describe('ForgeEvidenceAdapter', () => {
             stdout: JSON.stringify([{ bucket: 'pass' }, { bucket: 'skipping' }]),
           };
         }
-        return {
-          exitCode: 0,
-          stdout: JSON.stringify({
-            data: {
-              repository: {
-                pullRequest: {
-                  reviewThreads: { nodes: [{ isResolved: true }, { isResolved: false }] },
+        if (args[1] === 'graphql') {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              data: {
+                repository: {
+                  pullRequest: {
+                    reviewThreads: {
+                      totalCount: 2,
+                      nodes: [{ isResolved: true }, { isResolved: false }],
+                    },
+                  },
                 },
               },
-            },
-          }),
+            }),
+          };
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([{ number: 7, state: 'open', head: { sha: HEAD } }]),
         };
       },
     });
@@ -1331,9 +1363,33 @@ describe('ForgeEvidenceAdapter', () => {
 
   it('never reports a failing or unreadable forge state as a pass', async () => {
     const failing = new ForgeEvidenceAdapter({
-      runGh: async () => ({ exitCode: 0, stdout: JSON.stringify([{ bucket: 'fail' }]) }),
+      owner: 'acme',
+      repo: 'widgets',
+      runGh: async (args) => {
+        if (args[0] === 'pr') {
+          return { exitCode: 0, stdout: JSON.stringify([{ bucket: 'fail' }]) };
+        }
+        if (args[1] === 'graphql') {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              data: {
+                repository: {
+                  pullRequest: { reviewThreads: { totalCount: 0, nodes: [] } },
+                },
+              },
+            }),
+          };
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([{ number: 7, state: 'open', head: { sha: HEAD } }]),
+        };
+      },
     });
     const unreadable = new ForgeEvidenceAdapter({
+      owner: 'acme',
+      repo: 'widgets',
       runGh: async () => ({ exitCode: 1, stdout: 'gh: not authenticated' }),
     });
 

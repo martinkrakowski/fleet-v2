@@ -1,7 +1,11 @@
-// @generated adapter stub — signature-matched for step 4 (no behaviour).
+// @generated adapter — implemented for step 4 (fail-closed forge evidence).
 /**
- * ForgeEvidenceAdapter implements ForgeEvidencePort.
- * Behaviour lands with the station implementation; every method refuses.
+ * ForgeEvidenceAdapter implements ForgeEvidencePort. It resolves the
+ * candidate head to exactly one open pull request of the configured
+ * owner/repo, then reads that pull request's CI buckets and unresolved
+ * review threads through `gh`. Anything it cannot read fails closed: the CI
+ * state is `unknown` and the thread count is `null`, never a pass and never
+ * a zero.
  */
 
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
@@ -18,18 +22,20 @@ export interface GhCommandResult {
 }
 
 export interface ForgeEvidenceOptions {
+  /** Repository owner that owns the candidate head's pull request. */
+  readonly owner?: string;
+  /** Repository name that owns the candidate head's pull request. */
+  readonly repo?: string;
   /** Test/seam transport for `gh pr checks` and `gh api`. */
   readonly runGh?: (args: readonly string[]) => Promise<GhCommandResult>;
   /** Static per-head status, used when no forge transport is configured. */
   readonly statuses?: Readonly<Record<string, ForgeCheckStatus>>;
 }
 
+const HEAD_SHA_PATTERN = /^[0-9a-f]{40}$/;
+const OWNER_OR_REPO_PATTERN = /^[A-Za-z0-9_.-]+$/;
 const UNRESOLVED_THREADS_QUERY =
-  'query($headSha:String!){repository(owner:"fleet",name:"fleet"){pullRequest(headRefName:$headSha){reviewThreads(first:100){nodes{isResolved}}}}}';
-
-function isNonEmptyTrimmedString(value: unknown): value is string {
-  return typeof value === 'string' && value.trim().length > 0;
-}
+  'query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){totalCount nodes{isResolved}}}}}';
 
 function parseJson(raw: string): unknown {
   try {
@@ -39,9 +45,12 @@ function parseJson(raw: string): unknown {
   }
 }
 
-/** `gh pr checks --json bucket` buckets to the evidence enum. */
+/**
+ * `gh pr checks --json bucket` buckets to the evidence enum; an empty check
+ * list is `unknown` because no checks is not a pass.
+ */
 function ciStateFromBuckets(parsed: unknown): EvidenceResultValue {
-  if (!Array.isArray(parsed)) {
+  if (!Array.isArray(parsed) || parsed.length === 0) {
     return 'unknown';
   }
   let pending = false;
@@ -60,15 +69,44 @@ function ciStateFromBuckets(parsed: unknown): EvidenceResultValue {
   return pending ? 'pending' : 'pass';
 }
 
+/**
+ * The single open pull request whose head is exactly this sha, as an integer
+ * PR number. Zero matches, several matches and anything unreadable are null.
+ */
+function openPullRequestNumberForHead(payload: unknown, sha: string): number | null {
+  if (!Array.isArray(payload)) {
+    return null;
+  }
+  const matching = payload.filter((entry) => {
+    if (typeof entry !== 'object' || entry === null) {
+      return false;
+    }
+    const record = entry as { state?: unknown; head?: { sha?: unknown } };
+    return record.state === 'open' && record.head?.sha === sha;
+  });
+  if (matching.length !== 1) {
+    return null;
+  }
+  const number = (matching[0] as { number?: unknown }).number;
+  return typeof number === 'number' && Number.isInteger(number) ? number : null;
+}
+
+/** Unresolved review threads from the GraphQL payload; unreadable is null. */
 function unresolvedThreadCountFrom(payload: unknown): number | null {
   if (typeof payload !== 'object' || payload === null) {
     return null;
   }
-  const repository = (payload as { data?: { repository?: unknown } }).data?.repository;
+  const data = (payload as { data?: { repository?: unknown } }).data;
+  const repository = data?.repository;
   const pullRequest = (repository as { pullRequest?: unknown } | undefined)?.pullRequest;
   const reviewThreads = (pullRequest as { reviewThreads?: unknown } | undefined)?.reviewThreads;
+  const totalCount = (reviewThreads as { totalCount?: unknown } | undefined)?.totalCount;
   const nodes = (reviewThreads as { nodes?: unknown } | undefined)?.nodes;
-  if (!Array.isArray(nodes)) {
+  if (typeof totalCount !== 'number' || !Array.isArray(nodes)) {
+    return null;
+  }
+  // More threads than one page holds was never completely read.
+  if (totalCount > 100) {
     return null;
   }
   return nodes.filter((node) => (node as { isResolved?: unknown }).isResolved !== true).length;
@@ -79,13 +117,19 @@ export class ForgeEvidenceAdapter implements ForgeEvidencePort {
 
   /**
    * Read-only forge inspection. The adapter never opens, merges or mutates a
-   * pull request, and an unreadable forge state is `unknown` rather than a
-   * pass.
+   * pull request, and an unreadable forge state is `unknown` with a `null`
+   * thread count rather than a pass.
    */
   async readForgeCheckStatus(request: ReadForgeCheckStatusRequest): Promise<ForgeCheckStatus> {
     const candidateHeadSha = request.candidateHeadSha;
-    if (!isNonEmptyTrimmedString(candidateHeadSha)) {
-      return { candidateHeadSha, ciState: 'unknown', unresolvedThreadCount: 0 };
+    const unreadable = (): ForgeCheckStatus => ({
+      candidateHeadSha,
+      ciState: 'unknown',
+      unresolvedThreadCount: null,
+    });
+
+    if (!HEAD_SHA_PATTERN.test(candidateHeadSha)) {
+      return unreadable();
     }
 
     const staticStatus = this.options.statuses?.[candidateHeadSha];
@@ -95,30 +139,71 @@ export class ForgeEvidenceAdapter implements ForgeEvidencePort {
 
     const runGh = this.options.runGh;
     if (runGh === undefined) {
-      return { candidateHeadSha, ciState: 'unknown', unresolvedThreadCount: 0 };
+      return unreadable();
     }
 
-    const checks = await runGh(['pr', 'checks', candidateHeadSha, '--json', 'bucket']);
-    const ciState =
-      checks.exitCode === 0 ? ciStateFromBuckets(parseJson(checks.stdout)) : 'unknown';
+    const { owner, repo } = this.options;
+    if (
+      owner === undefined ||
+      repo === undefined ||
+      !OWNER_OR_REPO_PATTERN.test(owner) ||
+      !OWNER_OR_REPO_PATTERN.test(repo)
+    ) {
+      return unreadable();
+    }
 
-    const threads = await runGh([
-      'api',
-      'graphql',
-      '-f',
-      `query=${UNRESOLVED_THREADS_QUERY}`,
-      '-F',
-      `headSha=${candidateHeadSha}`,
-    ]);
-    const parsedThreads =
-      threads.exitCode === 0 ? unresolvedThreadCountFrom(parseJson(threads.stdout)) : null;
+    try {
+      // Step A: the head must resolve to exactly one open pull request.
+      const pulls = await runGh([
+        'api',
+        `repos/${owner}/${repo}/commits/${candidateHeadSha}/pulls`,
+      ]);
+      if (pulls.exitCode !== 0) {
+        return unreadable();
+      }
+      const pullRequestNumber = openPullRequestNumberForHead(
+        parseJson(pulls.stdout),
+        candidateHeadSha,
+      );
+      if (pullRequestNumber === null) {
+        return unreadable();
+      }
 
-    return {
-      candidateHeadSha,
-      ciState,
-      // An unreadable thread count cannot be reported as "no threads"; the
-      // unknown CI state above already keeps acceptance blocked.
-      unresolvedThreadCount: parsedThreads ?? 0,
-    };
+      // Step B: CI buckets for that pull request; gh exits 8 while checks run.
+      const checks = await runGh([
+        'pr',
+        'checks',
+        String(pullRequestNumber),
+        '-R',
+        `${owner}/${repo}`,
+        '--json',
+        'bucket',
+      ]);
+      const ciState: EvidenceResultValue =
+        checks.exitCode === 0 || checks.exitCode === 8
+          ? ciStateFromBuckets(parseJson(checks.stdout))
+          : 'unknown';
+
+      // Step C: unresolved review threads on that pull request.
+      const threads = await runGh([
+        'api',
+        'graphql',
+        '-f',
+        `query=${UNRESOLVED_THREADS_QUERY}`,
+        '-F',
+        `owner=${owner}`,
+        '-F',
+        `repo=${repo}`,
+        '-F',
+        `number=${pullRequestNumber}`,
+      ]);
+      const unresolvedThreadCount =
+        threads.exitCode === 0 ? unresolvedThreadCountFrom(parseJson(threads.stdout)) : null;
+
+      return { candidateHeadSha, ciState, unresolvedThreadCount };
+    } catch {
+      // A rejecting transport is an unreadable forge, never a thrown error.
+      return unreadable();
+    }
   }
 }

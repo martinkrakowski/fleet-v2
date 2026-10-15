@@ -120,7 +120,7 @@ function buildAttentionItems(): AttentionItem[] {
 export function AttentionCard() {
   const items = buildAttentionItems();
   return (
-    <Card>
+    <Card className={styles.attnCard}>
       <CardHeader
         title="Needs attention"
         actions={<span className={styles.meta}>{items.length}</span>}

@@ -494,6 +494,8 @@ body.sidebar-rail .sidebar .sidebar-link {
   overflow: auto;
   padding: var(--space-5);
   scrollbar-gutter: stable;
+  display: flex;
+  flex-direction: column;
 }
 
 .footer {

@@ -5,12 +5,12 @@
  */
 
 /* ------------------------------------------------------------------ */
-/* 3-column layout                                                     */
+/* 2-column layout                                                     */
 /* ------------------------------------------------------------------ */
 
 .layout {
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr) 260px;
+  grid-template-columns: 280px minmax(0, 1fr);
   gap: var(--space-4);
   align-items: start;
 }

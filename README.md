@@ -24,10 +24,10 @@ What each boundary does today:
 | Waves observations, decisions, relays, attention | Observations and relays go to local outbox directories; decisions are read from local answer files; attention reads report absence. The HTTP adapter to a live Waves service is not wired. |
 | Knowledge shelf | Keepers append to a local shelf file under the state directory. Publication to an external shelf is not wired. |
 | Web app | Renders live data from the API when `FLEET_API_URL` is set, and says on screen when it fell back to fixtures. Every mutating action opens a confirmation first. |
-| Staging | A deployment script for a Kubernetes namespace is in `deploy/staging/` (`yarn staging:deploy --yes`). Registry, host names and namespace are the operator's installation choices. |
+| Staging | A deployment script for a Kubernetes namespace is in `deploy/staging/` (`yarn staging:deploy --yes`). It currently hard-codes the author's own registry (`registry.midnight.lan`) and namespace (`fleet-v2-staging`); edit `deploy/staging/` for another installation. |
 | Continuous integration | No GitHub Actions workflow yet. Run the gate below before opening a pull request. |
 
-Everything in the second half of that table refuses or reports its own absence rather than inventing an answer. That is by design: an unconfigured port is never an implicit pass.
+Every boundary above that is not yet wired refuses or reports its own absence rather than inventing an answer. That is by design: an unconfigured port is never an implicit pass.
 
 ## What belongs here
 
@@ -55,7 +55,8 @@ Run the CLI:
 
 ```sh
 node apps/cli/dist/bin.js --help
-node apps/cli/dist/bin.js --state-dir ./.fleet/state coordination register-profile --json '{...}'
+# template: replace <profile-json> with a profile matching the coordination schema
+node apps/cli/dist/bin.js --state-dir ./.fleet/state coordination register-profile --json '<profile-json>'
 ```
 
 Every command takes its typed request as one JSON object with `--json`, or as `--kebab-case` flags. The typed result prints to stdout as one JSON document. Exit codes are part of the contract: `0` completed, `1` refused, rejected, blocked or unknown, `2` usage error.

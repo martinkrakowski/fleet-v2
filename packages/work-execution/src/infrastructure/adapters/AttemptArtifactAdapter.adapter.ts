@@ -168,12 +168,11 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
         .then(() => true)
         .catch(() => false);
     }
-    try {
-      await execFileAsync('ssh', [sshHost, `test -e ${posixQuote(targetPath)}`]);
-      return true;
-    } catch {
-      return false;
-    }
+    const { stdout } = await execFileAsync('ssh', [
+      sshHost,
+      `if test -e ${posixQuote(targetPath)}; then printf 1; else printf 0; fi`,
+    ]);
+    return stdout.trim() === '1';
   }
 
   /** Exit 0 means ignored; exit 1 means not ignored; anything else is an error. */

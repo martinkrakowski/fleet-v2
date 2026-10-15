@@ -37,18 +37,42 @@ export function AlertBox({
 }: AlertBoxProps) {
   const titleId = useId();
   const bodyId = useId();
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const cancelButtonRef = useRef<HTMLButtonElement | null>(null);
+  const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onCancel();
+      if (event.key === 'Escape') {
+        onCancel();
+        return;
+      }
+      if (event.key === 'Tab') {
+        const focusable = [cancelButtonRef.current, confirmButtonRef.current].filter(
+          (el): el is HTMLButtonElement => el !== null && !el.disabled,
+        );
+        if (focusable.length === 0) {
+          event.preventDefault();
+          return;
+        }
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const active = document.activeElement as HTMLButtonElement | null;
+        if (event.shiftKey) {
+          if (active === first || !focusable.includes(active as HTMLButtonElement)) {
+            event.preventDefault();
+            last.focus();
+          }
+        } else if (active === last || !focusable.includes(active as HTMLButtonElement)) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [open, onCancel]);
-
-  const previousFocusRef = useRef<HTMLElement | null>(null);
-  const cancelButtonRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -94,6 +118,7 @@ export function AlertBox({
               {cancelLabel}
             </Button>
             <Button
+              ref={confirmButtonRef}
               variant="solid"
               tone={tone === 'neutral' ? 'accent' : tone}
               size="sm"

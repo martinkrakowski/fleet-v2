@@ -25,8 +25,15 @@ export interface GhInvocationResult {
 /** Host-side delegates; the composition root binds the reviewed subprocess. */
 export interface ForgeActionDelegate {
   readonly runGh?: (args: readonly string[]) => Promise<GhInvocationResult>;
-  /** Resolve the branch's current head; absent means unverifiable. */
-  readonly verifyCurrentHeadSha?: (branchName: string) => Promise<string>;
+  /**
+   * Resolve the branch's current live head for exactly this request; a
+   * delegate that cannot verify the head is required to refuse instead of
+   * running any gh command.
+   */
+  readonly verifyCurrentHeadSha?: (
+    branchName: string,
+    request: ForgeActionRequest,
+  ) => Promise<string>;
 }
 
 function errorMessage(error: unknown): string {
@@ -79,24 +86,30 @@ export class ForgeActionAdapter implements ForgeActionPort {
       };
     }
 
+    // The live head must be verified for every invocation: an unconfigured
+    // verification delegate refuses instead of trusting stale readiness.
     const verifyCurrentHeadSha = this.delegate?.verifyCurrentHeadSha;
-    if (verifyCurrentHeadSha) {
-      let currentHead: string;
-      try {
-        currentHead = await verifyCurrentHeadSha(request.branchName);
-      } catch (error) {
-        return {
-          outcome: 'ambiguous',
-          reason: `Could not verify the current head of ${request.branchName}: ${errorMessage(error)}`,
-        };
-      }
-      // A moved head is refused; the old readiness is stale.
-      if (currentHead !== request.expectedHeadSha) {
-        return {
-          outcome: 'refused',
-          reason: `Moved head: branch ${request.branchName} is at ${currentHead}, expected ${request.expectedHeadSha}`,
-        };
-      }
+    if (!verifyCurrentHeadSha) {
+      return {
+        outcome: 'refused',
+        reason: 'Cannot perform forge action without verifyCurrentHeadSha',
+      };
+    }
+    let currentHead: string;
+    try {
+      currentHead = await verifyCurrentHeadSha(request.branchName, request);
+    } catch (error) {
+      return {
+        outcome: 'ambiguous',
+        reason: `Could not verify the current head of ${request.branchName}: ${errorMessage(error)}`,
+      };
+    }
+    // A moved head is refused; the old readiness is stale.
+    if (currentHead !== request.expectedHeadSha) {
+      return {
+        outcome: 'refused',
+        reason: `Moved head: branch ${request.branchName} is at ${currentHead}, expected ${request.expectedHeadSha}`,
+      };
     }
 
     if (request.kind === 'push-and-open-pr') {

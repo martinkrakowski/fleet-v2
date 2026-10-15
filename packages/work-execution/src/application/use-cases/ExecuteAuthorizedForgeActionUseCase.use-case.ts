@@ -75,10 +75,11 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     }
 
     // Merge requires current-head acceptance; old readiness is not a receipt.
+    // A missing receipt registry refuses the merge unconditionally: an
+    // unconfigured acceptance delegate is never a pass.
     if (
       request.kind === 'merge-pr' &&
-      deps.acceptedReceiptByHead !== undefined &&
-      !deps.acceptedReceiptByHead[request.expectedHeadSha]
+      !deps.acceptedReceiptByHead?.[request.expectedHeadSha]
     ) {
       return {
         outcome: 'refused',

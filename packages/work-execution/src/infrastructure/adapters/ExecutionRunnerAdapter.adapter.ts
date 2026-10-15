@@ -68,6 +68,42 @@ const capabilityBooleans: readonly (keyof RunnerIsolationCapabilities)[] = [
   'artifactPersistence',
 ];
 
+/**
+ * The only host environment variables a runner subprocess may inherit. Every
+ * other variable (credentials, tokens, host configuration) is stripped so the
+ * reviewed runner never observes secrets it does not need.
+ */
+export const RUNNER_ENV_ALLOWLIST: readonly string[] = [
+  'PATH',
+  'HOME',
+  'USER',
+  'LOGNAME',
+  'SHELL',
+  'LANG',
+  'LC_ALL',
+  'TERM',
+  'TMPDIR',
+  'SSH_AUTH_SOCK',
+  'OCM_REMOTE_PORT',
+  'OCM_HOST',
+  'YARN_NM_MODE',
+  'SYSTEMROOT',
+];
+
+/** Build the sanitized subprocess environment from the allow-list plus overrides. */
+export function buildRunnerEnv(
+  overrides?: Readonly<Record<string, string>>,
+): NodeJS.ProcessEnv {
+  const sanitized: NodeJS.ProcessEnv = {};
+  for (const key of RUNNER_ENV_ALLOWLIST) {
+    const value = process.env[key];
+    if (value !== undefined) {
+      sanitized[key] = value;
+    }
+  }
+  return overrides === undefined ? sanitized : { ...sanitized, ...overrides };
+}
+
 /** Default subprocess runner: exit codes become values, spawn failures throw. */
 async function runViaExecFile(
   command: string,
@@ -76,7 +112,7 @@ async function runViaExecFile(
 ): Promise<SubprocessResult> {
   try {
     const { stdout, stderr } = await execFileAsync(command, [...args], {
-      env: env === undefined ? process.env : { ...process.env, ...env },
+      env: buildRunnerEnv(env),
     });
     return { exitCode: 0, stdout: String(stdout), stderr: String(stderr) };
   } catch (error) {

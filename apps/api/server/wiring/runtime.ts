@@ -46,6 +46,11 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   // work context's own lookup, captured as soon as the composition exists.
   const workLookup: { inspectWorkOrder?: InspectWorkOrderUseCase } = {};
 
+  // Live registry of acceptance receipts per candidate head: the acceptance
+  // delegate records entries and the merge gate consumes them, so a merge is
+  // only ever authorized for a head whose acceptance receipt exists.
+  const acceptedReceiptByHead: Record<string, string> = {};
+
   const crossContext: WorkCrossContextDelegates = {
     acceptance: {
       // One acceptance assessment per attempt candidate head; the work-side
@@ -58,6 +63,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
         });
         switch (result.outcome) {
           case "accepted":
+            acceptedReceiptByHead[result.candidateHeadSha] = result.receiptId;
             return {
               outcome: "accepted",
               receiptId: result.receiptId,
@@ -179,6 +185,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
         return { outcome: "delivery-gap", reason: result.reason };
       },
     },
+    acceptedReceiptByHead,
   };
 
   const work = createConfiguredWorkComposition({ stateDir }, crossContext);

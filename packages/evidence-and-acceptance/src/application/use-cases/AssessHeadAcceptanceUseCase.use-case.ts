@@ -100,8 +100,15 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
     }
     const deps = this.deps;
 
-    if (!isNonEmptyTrimmedString(request.assessmentId) || !isNonEmptyTrimmedString(request.candidateHeadSha)) {
-      return { outcome: 'rejected', reason: 'Acceptance requires an assessmentId and a candidateHeadSha' };
+    if (
+      !isNonEmptyTrimmedString(request.assessmentId) ||
+      !isNonEmptyTrimmedString(request.candidateHeadSha) ||
+      !isNonEmptyTrimmedString(request.policyRevision)
+    ) {
+      return {
+        outcome: 'rejected',
+        reason: 'Acceptance requires an assessmentId, a candidateHeadSha, and a policyRevision',
+      };
     }
 
     const assessment = await deps.repo.findAssessmentById(request.assessmentId);
@@ -113,9 +120,7 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
 
     // A changed head or policy revision invalidates the evidence collected so
     // far; it never carries over as acceptance.
-    const policyChanged =
-      isNonEmptyTrimmedString(request.policyRevision) &&
-      assessment.policyRevision !== request.policyRevision;
+    const policyChanged = assessment.policyRevision !== request.policyRevision;
     if (assessment.candidateHeadSha !== request.candidateHeadSha || policyChanged) {
       const aggregate = EvidenceAssessment.fromRecord(assessment);
       aggregate.markStale(nowIso);

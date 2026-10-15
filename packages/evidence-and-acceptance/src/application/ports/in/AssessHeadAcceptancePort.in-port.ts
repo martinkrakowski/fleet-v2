@@ -10,7 +10,7 @@ import type { EvidenceAssessmentRecord } from '../../../domain/evidence-records.
 export interface AssessHeadAcceptanceRequest {
   readonly assessmentId: string;
   readonly candidateHeadSha: string;
-  readonly policyRevision?: string;
+  readonly policyRevision: string;
   readonly nowIso?: string;
 }
 

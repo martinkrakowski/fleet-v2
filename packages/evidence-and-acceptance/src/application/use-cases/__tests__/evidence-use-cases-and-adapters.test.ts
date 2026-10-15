@@ -287,6 +287,7 @@ function assessRequest(overrides: Record<string, unknown> = {}): AssessHeadAccep
   return {
     assessmentId: 'ea-1',
     candidateHeadSha: HEAD,
+    policyRevision: 'policy-7',
     nowIso: NOW,
     ...overrides,
   } as AssessHeadAcceptanceRequest;
@@ -868,6 +869,19 @@ describe('AssessHeadAcceptanceUseCase', () => {
     const result = await useCase.assessHeadAcceptance(assessRequest());
 
     expect(result).toEqual({ outcome: 'rejected', reason: 'Assessment not found' });
+  });
+
+  it('rejects an acceptance request without a policy revision', async () => {
+    const repo = fakeRepository([completeEvidence()]);
+    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+
+    const result = await useCase.assessHeadAcceptance(assessRequest({ policyRevision: '' }));
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'Acceptance requires an assessmentId, a candidateHeadSha, and a policyRevision',
+    });
+    expect(repo.records.get('ea-1')?.state).toBe('pending');
   });
 
   it('marks the assessment stale when the candidate head moved', async () => {

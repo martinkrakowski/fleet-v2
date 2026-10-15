@@ -530,7 +530,10 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       journal,
       authorizationPort: authorization,
       forgePort,
-      acceptedReceiptByHead: overrides.acceptedReceiptByHead ?? { [HEAD_SHA]: 'receipt-1' },
+      acceptedReceiptByHead:
+        'acceptedReceiptByHead' in overrides
+          ? overrides.acceptedReceiptByHead
+          : { [HEAD_SHA]: 'receipt-1' },
       now: () => FIXED_NOW,
     });
     return { journal, authorization, forgePort, workOrderRepo, useCase };
@@ -577,6 +580,20 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       authorization,
       acceptedReceiptByHead: { [OTHER_SHA]: 'receipt-other' },
     });
+
+    const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Cannot merge without an acceptance receipt for expectedHeadSha',
+    });
+    expect(authorization.consumeRequests).toHaveLength(0);
+    expect(forgePort.requests).toHaveLength(0);
+  });
+
+  it('refuses a merge when no acceptance receipt registry is configured at all', async () => {
+    const authorization = new FakeActionAuthorization();
+    const { useCase, forgePort } = makeDeps({ authorization, acceptedReceiptByHead: undefined });
 
     const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
 
@@ -1156,7 +1173,10 @@ describe('ForgeActionAdapter', () => {
 
   it('reports an unparseable create response as ambiguous', async () => {
     const { runGh } = makeRunGh({ exitCode: 0, stdout: 'no url in this output', stderr: '' });
-    const adapter = new ForgeActionAdapter({ runGh });
+    const adapter = new ForgeActionAdapter({
+      runGh,
+      verifyCurrentHeadSha: async () => HEAD_SHA,
+    });
 
     const result = await adapter.performForgeAction(forgeActionRequest());
 
@@ -1172,7 +1192,10 @@ describe('ForgeActionAdapter', () => {
       stdout: '',
       stderr: 'GraphQL: branch protection (organization rules)\n',
     });
-    const adapter = new ForgeActionAdapter({ runGh });
+    const adapter = new ForgeActionAdapter({
+      runGh,
+      verifyCurrentHeadSha: async () => HEAD_SHA,
+    });
 
     const result = await adapter.performForgeAction(forgeActionRequest());
 
@@ -1185,6 +1208,7 @@ describe('ForgeActionAdapter', () => {
   it('treats a crashing create invocation as ambiguous for reconciliation', async () => {
     const adapter = new ForgeActionAdapter({
       runGh: () => Promise.reject(new Error('gh binary missing')),
+      verifyCurrentHeadSha: async () => HEAD_SHA,
     });
 
     const result = await adapter.performForgeAction(forgeActionRequest());
@@ -1217,7 +1241,10 @@ describe('ForgeActionAdapter', () => {
 
   it('refuses a failed merge with the command error', async () => {
     const { runGh } = makeRunGh({ exitCode: 1, stdout: '', stderr: 'pull request not mergeable\n' });
-    const adapter = new ForgeActionAdapter({ runGh });
+    const adapter = new ForgeActionAdapter({
+      runGh,
+      verifyCurrentHeadSha: async () => HEAD_SHA,
+    });
 
     const result = await adapter.performForgeAction(forgeActionRequest({ kind: 'merge-pr' }));
 
@@ -1225,6 +1252,26 @@ describe('ForgeActionAdapter', () => {
       outcome: 'refused',
       reason: 'gh pr merge failed (exit 1): pull request not mergeable',
     });
+  });
+
+  it('refuses every invocation when verifyCurrentHeadSha is omitted', async () => {
+    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
+    const adapter = new ForgeActionAdapter({ runGh });
+
+    const createResult = await adapter.performForgeAction(forgeActionRequest());
+    const mergeResult = await adapter.performForgeAction(
+      forgeActionRequest({ kind: 'merge-pr' }),
+    );
+
+    expect(createResult).toEqual({
+      outcome: 'refused',
+      reason: 'Cannot perform forge action without verifyCurrentHeadSha',
+    });
+    expect(mergeResult).toEqual({
+      outcome: 'refused',
+      reason: 'Cannot perform forge action without verifyCurrentHeadSha',
+    });
+    expect(calls).toHaveLength(0);
   });
 
   it('refuses an invalid expected head or branch without running gh', async () => {

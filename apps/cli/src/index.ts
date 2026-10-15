@@ -434,7 +434,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
       rt.evidence.assessHeadAcceptance.assessHeadAcceptance({
         assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),
         candidateHeadSha: str(p, 'candidateHeadSha'),
-        policyRevision: optStr(p, 'policyRevision'),
+        policyRevision: str(p, 'policyRevision'),
         nowIso: optStr(p, 'nowIso'),
       }),
     inspect: async (p, rt) =>

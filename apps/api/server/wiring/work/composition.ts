@@ -60,6 +60,8 @@ export interface WorkCrossContextDelegates {
   readonly authorization?: ActionAuthorizationDelegate;
   readonly observation?: ExecutionObservationDelegate;
   readonly forge?: ForgeActionDelegate;
+  /** Accepted-receipt id per head; a merge without a receipt is refused. */
+  readonly acceptedReceiptByHead?: Readonly<Record<string, string>>;
 }
 
 let current: WorkComposition | null = null;
@@ -165,6 +167,7 @@ export function createConfiguredWorkComposition(
       journal,
       authorizationPort,
       forgePort,
+      acceptedReceiptByHead: crossContext?.acceptedReceiptByHead,
     }),
   };
 }

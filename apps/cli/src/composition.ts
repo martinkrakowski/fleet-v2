@@ -134,6 +134,23 @@ function runGhSubprocess(args: readonly string[]): Promise<GhInvocationResult> {
 }
 
 /**
+ * Read the live HEAD commit of a directory with `git rev-parse`. A spawn
+ * failure (missing binary, unreadable worktree) rejects so the forge adapter
+ * reports the outcome as ambiguous for reconciliation instead of guessing.
+ */
+function readGitHead(worktreePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile('git', ['-C', worktreePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }, (error, stdout) => {
+      if (error === null) {
+        resolve(String(stdout).trim());
+        return;
+      }
+      reject(error);
+    });
+  });
+}
+
+/**
  * The wired runtime handed to the CLI driver. Use cases are grouped per
  * bounded context and named after their inbound port method; the stateful
  * adapters the driver derives input from are exposed alongside them.
@@ -365,8 +382,19 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const attemptArtifact = new AttemptArtifactAdapter();
   // Hand-written brief files arrive per request; no default prose is assumed.
   const briefAuthoring = new BriefAuthoringAdapter();
-  // The reviewed GitHub CLI subprocess behind a host-side delegate.
-  const forgeAction = new ForgeActionAdapter({ runGh: runGhSubprocess });
+  // The reviewed GitHub CLI subprocess behind a host-side delegate; every
+  // invocation first verifies the live HEAD of the attempt's own worktree so
+  // a moved branch head is never pushed or merged on stale readiness.
+  const forgeAction = new ForgeActionAdapter({
+    runGh: runGhSubprocess,
+    verifyCurrentHeadSha: async (_branchName, request) => {
+      const attempt = await attemptRepository.findAttemptById(request.attemptId);
+      if (attempt === null) {
+        throw new Error(`No attempt is recorded for ${request.attemptId}`);
+      }
+      return readGitHead(attempt.worktreePath);
+    },
+  });
 
   // Live registry of acceptance receipts per candidate head: the acceptance
   // delegate records entries and the merge gate consumes them, so a merge is

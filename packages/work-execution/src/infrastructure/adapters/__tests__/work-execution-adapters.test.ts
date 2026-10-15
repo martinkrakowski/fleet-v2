@@ -17,6 +17,10 @@ import type {
   StartRunnerSessionRequest,
 } from '../../../application/ports/out/ExecutionRunnerPort.out-port.js';
 import type { SubprocessResult, SubprocessRunner } from '../ExecutionRunnerAdapter.adapter.js';
+import {
+  RUNNER_ENV_ALLOWLIST,
+  buildRunnerEnv,
+} from '../ExecutionRunnerAdapter.adapter.js';
 import { AttemptArtifactAdapter } from '../AttemptArtifactAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../AttemptRepositoryAdapter.adapter.js';
 import { BriefAuthoringAdapter } from '../BriefAuthoringAdapter.adapter.js';
@@ -668,6 +672,49 @@ describe('ExecutionRunnerAdapter', () => {
   it('declares enforced default capabilities', () => {
     const adapter = new ExecutionRunnerAdapter();
     expect(adapter.describeCapabilities()).toEqual(fullCapabilities);
+  });
+
+  it('builds a runner environment that strips unapproved process.env keys', () => {
+    const allowlisted: Record<string, string | undefined> = {
+      PATH: process.env.PATH,
+      OCM_REMOTE_PORT: process.env.OCM_REMOTE_PORT,
+    };
+    const secretKeys = ['OPENROUTER_API_KEY', 'GITHUB_TOKEN', 'FLEET_TEST_SECRET'] as const;
+    const secretSnapshot: Record<string, string | undefined> = Object.fromEntries(
+      secretKeys.map((key) => [key, process.env[key]]),
+    );
+    try {
+      process.env.PATH = '/usr/bin:/bin';
+      process.env.OPENROUTER_API_KEY = 'sk-test-openrouter';
+      process.env.GITHUB_TOKEN = 'gho-test-token';
+      process.env.FLEET_TEST_SECRET = 'do-not-forward';
+
+      const env = buildRunnerEnv({ OCM_REMOTE_PORT: '7777' });
+
+      // Allow-listed keys survive; explicit overrides win.
+      expect(env.PATH).toBe('/usr/bin:/bin');
+      expect(env.OCM_REMOTE_PORT).toBe('7777');
+      // Unapproved host variables — including credentials — are stripped.
+      expect(env.OPENROUTER_API_KEY).toBeUndefined();
+      expect(env.GITHUB_TOKEN).toBeUndefined();
+      expect(env.FLEET_TEST_SECRET).toBeUndefined();
+      for (const key of RUNNER_ENV_ALLOWLIST) {
+        if (process.env[key] !== undefined) {
+          expect(env[key]).toBe(process.env[key]);
+        }
+      }
+    } finally {
+      process.env.PATH = allowlisted.PATH;
+      process.env.OCM_REMOTE_PORT = allowlisted.OCM_REMOTE_PORT;
+      for (const key of secretKeys) {
+        const previous = secretSnapshot[key];
+        if (previous === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = previous;
+        }
+      }
+    }
   });
 
   it('applies capability overrides on top of the defaults', () => {

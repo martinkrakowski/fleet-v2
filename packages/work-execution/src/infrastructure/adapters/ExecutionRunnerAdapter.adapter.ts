@@ -45,6 +45,8 @@ export interface ExecutionRunnerAdapterOptions {
   readonly agent?: string;
   readonly model?: string;
   readonly variant?: string;
+  /** Optional resolver for cross-process lookup of an attempt's worktree path when not cached in memory. */
+  readonly resolveWorktreePath?: (attemptId: string) => Promise<string | null> | string | null;
   /** Deterministic subprocess execution for unit tests. */
   readonly runSubprocess?: SubprocessRunner;
   /** Capability overrides on top of the enforced defaults. */
@@ -113,6 +115,9 @@ async function runViaExecFile(
   try {
     const { stdout, stderr } = await execFileAsync(command, [...args], {
       env: buildRunnerEnv(env),
+      // A live `ocm-run --format json` run streams NDJSON on stdout; the
+      // default 1 MiB node buffer truncates it and reports a runner failure.
+      maxBuffer: 64 * 1024 * 1024,
     });
     return { exitCode: 0, stdout: String(stdout), stderr: String(stderr) };
   } catch (error) {
@@ -128,28 +133,68 @@ async function runViaExecFile(
   }
 }
 
-/** Extract a session id from JSON output or the first `ses_...` token. */
+/** A JSON object usable as a session-id carrier. */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Read the first non-empty session id from one parsed record: the runner
+ * reports it on the event itself or, for streamed events, on `part`.
+ */
+function sessionIdFromRecord(record: Record<string, unknown>): string | null {
+  for (const key of ['sessionID', 'sessionId']) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim() !== '') return value.trim();
+  }
+  const part = record['part'];
+  if (isPlainRecord(part)) {
+    for (const key of ['sessionID', 'sessionId']) {
+      const value = part[key];
+      if (typeof value === 'string' && value.trim() !== '') return value.trim();
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract a session id from JSON output, from any line of a multi-line
+ * NDJSON stream, or from the first `ses_...` token.
+ */
 function parseSessionId(stdout: string): string | null {
   const trimmed = stdout.trim();
   if (trimmed !== '') {
     try {
       const parsed: unknown = JSON.parse(trimmed);
-      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-        const candidate = parsed as Record<string, unknown>;
-        for (const key of ['sessionID', 'sessionId']) {
-          const value = candidate[key];
-          if (typeof value === 'string' && value.trim() !== '') return value.trim();
-        }
+      if (isPlainRecord(parsed)) {
+        const sessionId = sessionIdFromRecord(parsed);
+        if (sessionId !== null) return sessionId;
       }
     } catch {
-      // Not JSON output; fall through to the token scan.
+      // Not JSON output; fall through to the NDJSON line scan.
+    }
+    // A live run streams one JSON event per line; the first event carrying a
+    // session id identifies the session regardless of event ordering.
+    for (const rawLine of stdout.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (line === '') continue;
+      try {
+        const parsedLine: unknown = JSON.parse(line);
+        if (isPlainRecord(parsedLine)) {
+          const sessionId = sessionIdFromRecord(parsedLine);
+          if (sessionId !== null) return sessionId;
+        }
+      } catch {
+        // Not a JSON event line; the token scan below still applies.
+      }
     }
   }
   for (const rawToken of stdout.split(/\s+/)) {
     const token = rawToken.replace(/^["'`[{(]+/, '').replace(/["'`\]},.)]+$/, '');
     if (token.startsWith('ses_')) return token;
   }
-  return null;
+  const match = /\b(ses_[A-Za-z0-9_-]+)\b/.exec(stdout);
+  return match?.[1] ?? null;
 }
 
 function asIsoString(value: unknown): string | null {
@@ -204,8 +249,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     if (variant !== undefined) args.push('--variant', variant);
     args.push('--format', 'json', `Read and execute ${request.briefPackagePath}`);
 
-    const remotePort = this.options?.remotePort;
-    const env = remotePort === undefined ? undefined : { OCM_REMOTE_PORT: String(remotePort) };
+    const env = this.remotePortEnv();
 
     let result: SubprocessResult;
     try {
@@ -234,10 +278,16 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   }
 
   async inspectSession(session: RunnerSessionRef): Promise<RunnerSessionStatus> {
-    const dir = this.worktreeByAttemptId.get(session.attemptId) ?? session.sessionId;
+    // A reconcile or stop runs in a later CLI process than the dispatch, so
+    // the locator is resolved from the recorded attempt rather than memory.
+    const resolved =
+      this.worktreeByAttemptId.get(session.attemptId) ??
+      (await this.options?.resolveWorktreePath?.(session.attemptId)) ??
+      null;
+    const dir = resolved ?? session.sessionId;
     let result: SubprocessResult;
     try {
-      result = await this.run(this.binPath(), ['--status', '--dir', dir]);
+      result = await this.run(this.binPath(), ['--status', '--dir', dir], this.remotePortEnv());
     } catch {
       return {
         runnerReachable: 'unreachable',
@@ -247,7 +297,9 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
         artifactsCollected: false,
       };
     }
-    if (result.exitCode !== 0) {
+    // `ocm-run --status` exits 3 when a session is running in the directory and
+    // 0 when nothing is; both carry a classified status line.
+    if (result.exitCode !== 0 && result.exitCode !== 3) {
       return {
         runnerReachable: 'unreachable',
         workspacePreparation: 'unprepared',
@@ -260,10 +312,14 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   }
 
   async stopSession(request: StopRunnerSessionRequest): Promise<StopRunnerSessionResult> {
-    const dir = this.worktreeByAttemptId.get(request.attemptId) ?? request.sessionId;
+    const resolved =
+      this.worktreeByAttemptId.get(request.attemptId) ??
+      (await this.options?.resolveWorktreePath?.(request.attemptId)) ??
+      null;
+    const dir = resolved ?? request.sessionId;
     let result: SubprocessResult;
     try {
-      result = await this.run(this.binPath(), ['--abort', '--dir', dir]);
+      result = await this.run(this.binPath(), ['--abort', '--dir', dir], this.remotePortEnv());
     } catch (error) {
       return { outcome: 'unknown', reason: `Abort command failed: ${String(error)}` };
     }
@@ -286,6 +342,13 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
 
   private binPath(): string {
     return this.options?.ocmRunBin ?? 'ocm-run';
+  }
+
+  /** Configured remote port as runner environment; absent when not configured. */
+  private remotePortEnv(): Readonly<Record<string, string>> | undefined {
+    return this.options?.remotePort === undefined
+      ? undefined
+      : { OCM_REMOTE_PORT: String(this.options.remotePort) };
   }
 
   private run(
@@ -348,7 +411,11 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       };
     }
 
-    const ended = activeFlag === false || lower.includes('idle') || lower.includes('nothing running');
+    const ended =
+      activeFlag === false ||
+      lower.includes('idle') ||
+      lower.includes('nothing running') ||
+      lower.includes('nothing is running');
     if (ended) {
       const receipt: CommandCompletionReceipt = {
         attemptId: session.attemptId,

@@ -995,4 +995,109 @@ describe('ExecutionRunnerAdapter', () => {
       expect(thrown.reason).toContain('abort failed');
     }
   });
+
+  it('parses a sessionID out of a multi-line NDJSON runner stream', async () => {
+    const { runner } = scriptedRunner([
+      {
+        exitCode: 0,
+        stdout: [
+          '{"type":"system","subtype":"init","sessionID":"ses_stream"}',
+          '{"type":"message","part":{"type":"text","text":"working"}}',
+          '{"type":"message","part":{"sessionId":"ses_stream","text":"working"}}',
+        ].join('\n'),
+        stderr: '',
+      },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner });
+    const result = await adapter.startSession(makeStartRequest());
+    expect(result).toEqual({ outcome: 'started', sessionId: 'ses_stream' });
+  });
+
+  it('parses a sessionID carried only by a streamed part object', async () => {
+    const { runner } = scriptedRunner([
+      {
+        exitCode: 0,
+        stdout: [
+          '{"type":"step-start"}',
+          '{"type":"message","part":{"sessionID":"ses_part_only","text":"hello"}}',
+        ].join('\r\n'),
+        stderr: '',
+      },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner });
+    const result = await adapter.startSession(makeStartRequest());
+    expect(result).toEqual({ outcome: 'started', sessionId: 'ses_part_only' });
+  });
+
+  it('reads exit code 3 as an active session from ocm-run --status', async () => {
+    const { runner } = scriptedRunner([
+      { exitCode: 3, stdout: 'ocm-run: running in /path:\nses_abc', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner });
+    const status = await adapter.inspectSession({ attemptId: 'att-1', sessionId: 'ses_a' });
+    expect(status).toEqual({
+      runnerReachable: 'reachable',
+      workspacePreparation: 'prepared',
+      workerCommand: 'active',
+      completionReceipt: null,
+      artifactsCollected: false,
+    });
+  });
+
+  it('reads an exit-0 "nothing is running" status line as ended', async () => {
+    const { runner } = scriptedRunner([
+      {
+        exitCode: 0,
+        stdout: 'ocm-run: nothing is running in /path (server: remote port 4166)',
+        stderr: '',
+      },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner });
+    const status = await adapter.inspectSession({ attemptId: 'att-1', sessionId: 'ses_a' });
+    expect(status.workerCommand).toBe('ended');
+    expect(status.runnerReachable).toBe('reachable');
+    expect(status.completionReceipt?.attemptId).toBe('att-1');
+  });
+
+  it('resolves the status and abort directory from the recorded attempt', async () => {
+    // A fresh adapter stands in for a later CLI process: nothing is cached in
+    // memory, so the locator must come from the persisted attempt record.
+    const recordedWorktree = '/mnt/pool/cloud-services/worktrees/att-1';
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 3, stdout: 'ocm-run: running in /mnt/pool:\nses_abc', stderr: '' },
+      { exitCode: 0, stdout: 'aborted', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({
+      runSubprocess: runner,
+      remotePort: 4166,
+      resolveWorktreePath: (attemptId) =>
+        attemptId === 'att-1' ? recordedWorktree : null,
+    });
+    const status = await adapter.inspectSession({ attemptId: 'att-1', sessionId: 'ses_a' });
+    expect(status.workerCommand).toBe('active');
+    expect(calls[0]?.args).toEqual(['--status', '--dir', recordedWorktree]);
+    expect(calls[0]?.env).toEqual({ OCM_REMOTE_PORT: '4166' });
+
+    const stopped = await adapter.stopSession({
+      attemptId: 'att-1',
+      sessionId: 'ses_a',
+      gracePeriodSeconds: 30,
+    });
+    expect(stopped.outcome).toBe('terminated');
+    expect(calls[1]?.args).toEqual(['--abort', '--dir', recordedWorktree]);
+    expect(calls[1]?.env).toEqual({ OCM_REMOTE_PORT: '4166' });
+  });
+
+  it('falls back to the session id when the attempt records no worktree', async () => {
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 3, stdout: 'ocm-run: running in /path:\nses_abc', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({
+      runSubprocess: runner,
+      resolveWorktreePath: async () => null,
+    });
+    await adapter.inspectSession({ attemptId: 'att-missing', sessionId: 'ses_orphan' });
+    expect(calls[0]?.args).toEqual(['--status', '--dir', 'ses_orphan']);
+    expect(calls[0]?.env).toBeUndefined();
+  });
 });

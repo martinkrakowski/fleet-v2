@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "runner": {
+    "agent": "example-agent",
+    "model": "example-provider/example-model",
+    "variant": "example-variant",
+    "remotePort": 46000,
+    "host": "lane-host.example",
+    "ocmRunBin": "/home/operator/.config/fleet/ocm-run",
+    "fallbackChain": [
+      {
+        "agent": "example-agent",
+        "model": "example-provider/example-fallback-model",
+        "variant": "example-variant"
+      }
+    ]
+  },
+  "worktree": {
+    "sshHost": "lane-host.example"
+  },
+  "verification": {
+    "sshHost": "verify-host.example",
+    "procedures": {
+      "example-gate": {
+        "command": "fleet-verify-example",
+        "args": ["--gate"]
+      },
+      "example-review": {
+        "command": "fleet-verify-example",
+        "args": ["--review"]
+      }
+    }
+  },
+  "forge": {
+    "owner": "example-owner",
+    "repo": "example-repo"
+  },
+  "reviewer": {
+    "agent": "example-agent",
+    "model": "example-provider/example-review-model",
+    "variant": "example-variant"
+  },
+  "waves": {
+    "baseUrl": "https://waves.example",
+    "tokenFile": "/home/operator/.config/fleet/waves-token",
+    "caFile": "/home/operator/.config/fleet/waves-ca.pem",
+    "ownerPublicKey": "CxIZICcuNTxDSlFYX2ZtdHuCiZCXnqWss7rByM/W3eQ="
+  },
+  "shelf": {
+    "baseUrl": "https://shelf.example",
+    "keyFile": "/home/operator/.config/fleet/shelf-key"
+  }
+}

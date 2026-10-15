@@ -148,7 +148,9 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       if (!PASSING_RESULTS.includes(status.ciState)) {
         blockers.push(`forge reports CI state '${status.ciState}' for this candidate head`);
       }
-      if (status.unresolvedThreadCount > 0) {
+      if (status.unresolvedThreadCount === null) {
+        blockers.push('forge could not read review threads for this candidate head');
+      } else if (status.unresolvedThreadCount > 0) {
         blockers.push(
           `forge reports ${status.unresolvedThreadCount} unresolved review thread(s) for this candidate head`,
         );

@@ -13,7 +13,8 @@ export interface ReadForgeCheckStatusRequest {
 export interface ForgeCheckStatus {
   readonly candidateHeadSha: string;
   readonly ciState: EvidenceResultValue;
-  readonly unresolvedThreadCount: number;
+  /** Unresolved review threads on the candidate head; null when they could not be read. */
+  readonly unresolvedThreadCount: number | null;
 }
 
 export interface ForgeEvidencePort {

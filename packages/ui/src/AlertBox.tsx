@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useId } from 'react';
+import { useEffect, useId, useRef } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { Button } from './Button';
 import { toneClassKey, type SemanticTone } from './tone';
@@ -47,6 +47,20 @@ export function AlertBox({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [open, onCancel]);
 
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const cancelButtonRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    previousFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    cancelButtonRef.current?.focus();
+    return () => {
+      previousFocusRef.current?.focus();
+      previousFocusRef.current = null;
+    };
+  }, [open]);
+
   if (!open) return null;
 
   const toneKey = toneClassKey(tone);
@@ -76,7 +90,7 @@ export function AlertBox({
         <div className={classes.footer}>
           {meta != null ? <span className={classes.meta}>{meta}</span> : null}
           <div className={classes.actions}>
-            <Button variant="outline" tone="neutral" size="sm" onClick={onCancel}>
+            <Button ref={cancelButtonRef} variant="outline" tone="neutral" size="sm" onClick={onCancel}>
               {cancelLabel}
             </Button>
             <Button

@@ -86,6 +86,13 @@ gaps. Second, live external transports — the attention reader, the verificatio
 and review executors, and the staging Kubernetes runtime — stay unbound until a
 host supplies them, so they report `unavailable` rather than inventing a result.
 
+`ExecutionRunnerAdapter` wraps the reviewed runner script, which the repository
+bundles as `bin/ocm-run`. The adapter resolves that bundled script by default
+(overridable via `FLEET_OCM_RUN_BIN`), so dispatch no longer depends on an
+external `PATH` install. The script opens its SSH tunnel only when the loopback
+port is not listening and `OCM_HOST` is set; seat and variant selection remain
+operator configuration, not script policy.
+
 Every action control in `@fleet/web` confirms through `@fleet/ui`'s `AlertBox`
 before it runs, and states on screen whether a live route backs it. No script is
 replaced solely to change language. Keep private hosts, paths, project

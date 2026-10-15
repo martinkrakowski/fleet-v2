@@ -105,6 +105,10 @@ export interface FleetCliRuntimeOptions {
   readonly runnerVariant?: string;
   /** Port the runner subprocess reaches its remote session server on. */
   readonly runnerRemotePort?: number;
+  /** Override of the bundled ocm-run binary path (FLEET_OCM_RUN_BIN). */
+  readonly ocmRunBin?: string;
+  /** SSH host passed as OCM_HOST when the runner needs a loopback tunnel. */
+  readonly runnerRemoteHost?: string;
   /** SSH host alias holding the worktree when it is not on this host. */
   readonly worktreeSshHost?: string;
 }
@@ -354,6 +358,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const parsedPort = process.env.OCM_REMOTE_PORT ? Number(process.env.OCM_REMOTE_PORT) : Number.NaN;
   const runnerRemotePort =
     options?.runnerRemotePort ?? (Number.isFinite(parsedPort) ? parsedPort : undefined);
+  const ocmRunBin = options?.ocmRunBin ?? (process.env.FLEET_OCM_RUN_BIN?.trim() || undefined);
+  const runnerRemoteHost =
+    options?.runnerRemoteHost ?? (process.env.OCM_HOST?.trim() || undefined);
 
   // --- operator-coordination -------------------------------------------------
 
@@ -500,14 +507,17 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const attemptRepository = new AttemptRepositoryAdapter({ stateDir });
   const executionJournal = new ExecutionJournalAdapter({ stateDir });
   const workspace = new WorkspaceAdapter({ sshHost: worktreeSshHost });
-  // Wraps the reviewed `ocm-run` subprocess resolved from PATH. The worktree
-  // locator is resolved from the recorded attempt so a later CLI process
-  // (reconcile, stop, collect) addresses the same directory the dispatch used.
+  // Wraps the reviewed `ocm-run` runner subprocess. The bundled repository
+  // script is the default; the worktree locator is resolved from the recorded
+  // attempt so a later CLI process (reconcile, stop, collect) addresses the
+  // same directory the dispatch used.
   const runner = new ExecutionRunnerAdapter({
+    ocmRunBin,
     agent: runnerAgent,
     model: runnerModel,
     variant: runnerVariant,
     remotePort: runnerRemotePort,
+    remoteHost: runnerRemoteHost,
     resolveWorktreePath: async (attemptId) =>
       (await attemptRepository.findAttemptById(attemptId))?.worktreePath ?? null,
   });

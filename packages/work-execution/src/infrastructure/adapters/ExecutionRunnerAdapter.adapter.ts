@@ -8,6 +8,9 @@
  */
 
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import type {
@@ -24,6 +27,21 @@ import type {
 import type { CommandCompletionReceipt } from '../../domain/execution-records.js';
 
 const execFileAsync = promisify(execFile);
+
+/** Bundled runner script at the repository's `bin/ocm-run`. */
+function resolveBundledOcmRunPath(): string {
+  // Works from both the compiled dist tree and vitest's src tree.
+  let current = path.dirname(fileURLToPath(import.meta.url));
+  const root = path.parse(current).root;
+  while (true) {
+    const candidate = path.join(current, 'bin', 'ocm-run');
+    if (existsSync(candidate)) return candidate;
+    if (current === root) return 'ocm-run';
+    current = path.dirname(current);
+  }
+}
+
+const DEFAULT_OCM_RUN_PATH = resolveBundledOcmRunPath();
 
 export interface SubprocessResult {
   readonly exitCode: number;
@@ -42,6 +60,8 @@ export interface ExecutionRunnerAdapterOptions {
   readonly ocmRunBin?: string;
   /** Port passed as OCM_REMOTE_PORT to the runner subprocess. */
   readonly remotePort?: number;
+  /** SSH host passed as OCM_HOST to the runner subprocess when configured. */
+  readonly remoteHost?: string;
   readonly agent?: string;
   readonly model?: string;
   readonly variant?: string;
@@ -341,14 +361,24 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   }
 
   private binPath(): string {
-    return this.options?.ocmRunBin ?? 'ocm-run';
+    return (
+      this.options?.ocmRunBin ??
+      (process.env.FLEET_OCM_RUN_BIN?.trim() || undefined) ??
+      DEFAULT_OCM_RUN_PATH
+    );
   }
 
-  /** Configured remote port as runner environment; absent when not configured. */
+  /** Configured remote port/host as runner environment; absent when neither is set. */
   private remotePortEnv(): Readonly<Record<string, string>> | undefined {
-    return this.options?.remotePort === undefined
-      ? undefined
-      : { OCM_REMOTE_PORT: String(this.options.remotePort) };
+    const overrides: Record<string, string> = {};
+    if (this.options?.remotePort !== undefined) {
+      overrides.OCM_REMOTE_PORT = String(this.options.remotePort);
+    }
+    const remoteHost = this.options?.remoteHost ?? (process.env.OCM_HOST?.trim() || undefined);
+    if (remoteHost !== undefined) {
+      overrides.OCM_HOST = remoteHost;
+    }
+    return Object.keys(overrides).length === 0 ? undefined : overrides;
   }
 
   private run(

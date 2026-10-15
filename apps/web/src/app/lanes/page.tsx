@@ -8,7 +8,8 @@ import {
   CardHeader,
   EmptyState,
   PageHeader,
-  RouteChip
+  RouteChip,
+  Switch
 } from "@fleet/ui";
 import { attempts, capacity } from "./fixture";
 import { STATE_ORDER, summary, woOf } from "./derive";
@@ -82,21 +83,26 @@ export default function LanesPage() {
         queuedAll={pendingAttempts.length}
       />
       <LanesToolbar
-        showEnded={showEnded}
-        onShowEndedChange={setShowEnded}
         stateFilter={stateFilter}
         onStateFilterChange={setStateFilter}
         shown={rows.length}
         scopedCount={scopedCount}
       />
-      <div className="row col-8-4">
+      <div className={`row col-8-4 ${styles.board}`}>
         <Card className={styles.lanewrap}>
           <CardHeader
             title={project || "All projects"}
             actions={
-              <span className={styles.meta}>
-                {rows.length} lane{rows.length === 1 ? "" : "s"}
-              </span>
+              <div className={styles.headerActions}>
+                <Switch
+                  checked={showEnded}
+                  onChange={setShowEnded}
+                  label="Show ended"
+                />
+                <span className={styles.meta}>
+                  {rows.length} lane{rows.length === 1 ? "" : "s"}
+                </span>
+              </div>
             }
           />
           <CardBody>

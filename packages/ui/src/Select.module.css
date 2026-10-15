@@ -12,6 +12,22 @@
   color: var(--text-muted);
 }
 
+.wrapperInline {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.wrapperInline .label {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
 .select {
   appearance: none;
   -webkit-appearance: none;

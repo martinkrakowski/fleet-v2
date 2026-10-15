@@ -3,11 +3,13 @@ import classes from './Select.module.css';
 
 export interface SelectProps extends SelectHTMLAttributes<HTMLSelectElement> {
   label?: ReactNode;
+  inline?: boolean;
   wrapperClassName?: string;
 }
 
 export function Select({
   label,
+  inline,
   wrapperClassName,
   id,
   className,
@@ -18,7 +20,13 @@ export function Select({
   const selectId = id;
   return (
     <span
-      className={[classes.wrapper, wrapperClassName].filter(Boolean).join(' ') || undefined}
+      className={[
+        classes.wrapper,
+        inline && classes.wrapperInline,
+        wrapperClassName,
+      ]
+        .filter(Boolean)
+        .join(' ') || undefined}
     >
       {label != null ? (
         <label htmlFor={selectId} className={classes.label}>

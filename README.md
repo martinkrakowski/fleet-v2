@@ -14,7 +14,7 @@ What each boundary does today:
 
 | Boundary | State |
 |---|---|
-| Lane dispatch, status, stop | Live. Wraps the reviewed `ocm-run` subprocess on PATH with an argument array and an environment allow-list. Status comes from the lane server, never from the local watcher. |
+| Lane dispatch, status, stop | Live. Wraps the bundled `bin/ocm-run` (override with `FLEET_OCM_RUN_BIN`; remote host from `OCM_HOST`) with an argument array and an environment allow-list. Status comes from the lane server, never from the local watcher. |
 | Worktree inspection, brief placement, artifact collection | Live, over SSH to the host that owns the worktrees. A brief is placed only under an ignored path. Commits are counted against the pre-dispatch tip. |
 | Verification checks | The adapter runs only allow-listed procedures mapped to executables, and never interpolates a command string. The shipped composition root configures no allow-list yet, so every check reports that it cannot run. |
 | Pull request create and merge | Live through `gh`, and only after acceptance of the exact candidate head. A moved head is refused. |
@@ -24,6 +24,7 @@ What each boundary does today:
 | Waves observations, decisions, relays, attention | Observations and relays go to local outbox directories; decisions are read from local answer files; attention reads report absence. The HTTP adapter to a live Waves service is not wired. |
 | Knowledge shelf | Keepers append to a local shelf file under the state directory. Publication to an external shelf is not wired. |
 | Web app | Renders live data from the API when `FLEET_API_URL` is set, and says on screen when it fell back to fixtures. Every mutating action opens a confirmation first. |
+| Staging | A deployment script for a Kubernetes namespace is in `deploy/staging/` (`yarn staging:deploy --yes`). Registry, host names and namespace are the operator's installation choices. |
 | Continuous integration | No GitHub Actions workflow yet. Run the gate below before opening a pull request. |
 
 Everything in the second half of that table refuses or reports its own absence rather than inventing an answer. That is by design: an unconfigured port is never an implicit pass.

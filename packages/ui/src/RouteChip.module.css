@@ -1,6 +1,7 @@
 .chip {
   display: inline-flex;
   align-items: center;
+  max-width: 100%;
   font-family: var(--font-mono);
   font-size: 0.6rem;
   letter-spacing: 0.02em;
@@ -9,6 +10,14 @@
   border-radius: 999px;
   padding: 0.06rem 0.5rem;
   white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .chip {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    border-radius: var(--radius);
+  }
 }
 
 .gap {

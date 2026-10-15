@@ -288,6 +288,9 @@
   flex-direction: row;
   gap: 0.55rem;
   align-items: baseline;
+  flex-wrap: wrap;
+  min-width: 0;
+  overflow-wrap: anywhere;
   font-family: var(--font-mono);
   font-size: 0.72rem;
   color: var(--text-muted);
@@ -326,5 +329,17 @@
 
   .task {
     max-width: 24ch;
+  }
+}
+
+@media (max-width: 40rem) {
+  .taskWrap {
+    flex-wrap: wrap;
+  }
+
+  .task {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 }

@@ -577,6 +577,21 @@ body.sidebar-rail .sidebar .sidebar-link {
   }
 }
 
+@media (max-width: 640px) {
+  .topbar {
+    padding: var(--space-2) var(--space-4);
+  }
+  .page-wrapper {
+    padding: var(--space-3) var(--space-4);
+  }
+  .footer {
+    height: auto;
+    padding: var(--space-2) var(--space-4);
+    flex-wrap: wrap;
+    line-height: 1.4;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Shell reduced motion                                                 */
 /* ------------------------------------------------------------------ */

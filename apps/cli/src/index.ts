@@ -9,6 +9,7 @@
  * `CliIo`, so package code never touches `console`.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import type {
@@ -554,13 +555,34 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         disposition: requiredNested<FindingDispositionRecord>(p, 'disposition', 'evidence disposition'),
         nowIso: optStr(p, 'nowIso'),
       }),
-    assess: async (p, rt) =>
-      rt.evidence.assessHeadAcceptance.assessHeadAcceptance({
-        assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),
+    assess: async (p, rt) => {
+      let ownerDecisionReferences =
+        p['ownerDecisionReferences'] !== undefined ? strArr(p, 'ownerDecisionReferences') : undefined;
+      const attemptId = optStr(p, 'attemptId');
+      if (ownerDecisionReferences === undefined && attemptId) {
+        const attempt = await rt.execution.attemptRepository.findAttemptById(attemptId);
+        if (attempt?.worktreePath) {
+          const manifestPath = join(attempt.worktreePath, '.lane', 'brief-manifest.json');
+          try {
+            if (existsSync(manifestPath)) {
+              const manifestContent = JSON.parse(readFileSync(manifestPath, 'utf8'));
+              if (Array.isArray(manifestContent.ownerDecisionReferences)) {
+                ownerDecisionReferences = manifestContent.ownerDecisionReferences;
+              }
+            }
+          } catch {
+            // ignore unreadable brief manifest
+          }
+        }
+      }
+      return rt.evidence.assessHeadAcceptance.assessHeadAcceptance({
+        assessmentId: str(p, 'assessmentId') || (attemptId ? assessmentIdForAttempt(attemptId) : ''),
         candidateHeadSha: str(p, 'candidateHeadSha'),
         policyRevision: str(p, 'policyRevision'),
+        ownerDecisionReferences,
         nowIso: optStr(p, 'nowIso'),
-      }),
+      });
+    },
     inspect: async (p, rt) =>
       rt.evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
         assessmentId: optStr(p, 'assessmentId'),

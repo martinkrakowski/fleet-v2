@@ -200,7 +200,33 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   const installation = options?.installation;
   const operator = createConfiguredOperatorComposition({ stateDir, ownerPublicKey });
   const knowledge = createConfiguredKnowledgeComposition({ stateDir });
-  const evidence = createConfiguredEvidenceUseCases({ stateDir });
+  const evidence = createConfiguredEvidenceUseCases(
+    { stateDir },
+    {
+      ownerDecision: {
+        resolveOwnerDecision: async (request) => {
+          let req = await operator.coordinationRequestRepository.findRequestById(request.decisionReference);
+          if (req === null) {
+            req = await operator.coordinationRequestRepository.findRequestByGrantId(request.decisionReference);
+          }
+          if (req === null) {
+            return {
+              outcome: "unresolvable",
+              reason: `No coordination request found for reference '${request.decisionReference}'`,
+            };
+          }
+          return {
+            outcome: "resolved",
+            decision: {
+              id: req.id,
+              state: req.state,
+              expectedHeadSha: req.expectedHeadSha,
+            },
+          };
+        },
+      },
+    },
+  );
 
   // Authorization grants resolved in this process remember the attempt
   // coordinates the work-side consumption request does not carry. With a
@@ -400,6 +426,40 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
           return { outcome: "consumed", actionId: request.actionId };
         }
         return { outcome: "refused", reason: result.reason };
+      },
+    },
+    acceptanceEvidence: {
+      readAcceptance: async (request) => {
+        let inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
+          assessmentId: `assessment-${request.attemptId}`,
+          candidateHeadSha: request.candidateHeadSha,
+        });
+        if (inspected.outcome === "not-found") {
+          inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
+            assessmentId: request.attemptId,
+            candidateHeadSha: request.candidateHeadSha,
+          });
+        }
+        if (inspected.outcome === "not-found") {
+          inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
+            candidateHeadSha: request.candidateHeadSha,
+          });
+        }
+        if (inspected.outcome === "found") {
+          return {
+            outcome: "found",
+            assessment: {
+              candidateHeadSha: inspected.assessment.candidateHeadSha,
+              policyRevision: inspected.assessment.policyRevision,
+              state: inspected.assessment.state,
+              acceptanceReceiptId: inspected.assessment.acceptanceReceiptId,
+            },
+          };
+        }
+        return {
+          outcome: "not-found",
+          reason: `No acceptance assessment found for head ${request.candidateHeadSha}`,
+        };
       },
     },
     observation: {

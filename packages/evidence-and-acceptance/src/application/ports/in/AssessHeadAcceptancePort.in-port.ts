@@ -11,6 +11,7 @@ export interface AssessHeadAcceptanceRequest {
   readonly assessmentId: string;
   readonly candidateHeadSha: string;
   readonly policyRevision: string;
+  readonly ownerDecisionReferences?: readonly string[];
   readonly nowIso?: string;
 }
 

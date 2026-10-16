@@ -4,4 +4,5 @@ export * from "./EvidenceArchivePort.out-port.js";
 export * from "./EvidenceAssessmentRepositoryPort.out-port.js";
 export * from "./ForgeEvidencePort.out-port.js";
 export * from "./IndependentReviewPort.out-port.js";
+export * from "./OwnerDecisionPort.out-port.js";
 export * from "./VerificationExecutorPort.out-port.js";

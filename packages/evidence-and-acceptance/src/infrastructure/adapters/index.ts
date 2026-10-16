@@ -6,4 +6,5 @@ export * from "./file-store.js";
 export * from "./ForgeEvidenceAdapter.adapter.js";
 export * from "./IndependentReviewAdapter.adapter.js";
 export * from "./OcmReviewTransport.adapter.js";
+export * from "./OwnerDecisionAdapter.adapter.js";
 export * from "./VerificationExecutorAdapter.adapter.js";

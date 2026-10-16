@@ -10,6 +10,7 @@ import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { ForgeEvidencePort } from '../ports/out/ForgeEvidencePort.out-port.js';
+import type { OwnerDecisionPort } from '../ports/out/OwnerDecisionPort.out-port.js';
 import type { AssessmentStateValue } from '../../domain/value-objects/AssessmentState.vo.js';
 import type {
   AssessHeadAcceptancePort,
@@ -20,6 +21,7 @@ import type {
 export interface AssessHeadAcceptanceDependencies {
   readonly repo: EvidenceAssessmentRepositoryPort;
   readonly forgeEvidence?: ForgeEvidencePort;
+  readonly ownerDecisionPort?: OwnerDecisionPort;
 }
 
 const NOT_IMPLEMENTED = 'Not implemented: AssessHeadAcceptanceUseCase';
@@ -181,6 +183,46 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
         blockers.push(
           `forge reports ${status.unresolvedThreadCount} unresolved review thread(s) for this candidate head`,
         );
+      }
+    }
+
+    if (
+      Array.isArray(request.ownerDecisionReferences) &&
+      request.ownerDecisionReferences.length > 0
+    ) {
+      for (const ref of request.ownerDecisionReferences) {
+        if (!deps.ownerDecisionPort) {
+          blockers.push(`owner decision '${ref}' could not be resolved`);
+          continue;
+        }
+        try {
+          const decisionResult = await deps.ownerDecisionPort.resolveOwnerDecision({
+            decisionReference: ref,
+            candidateHeadSha: assessment.candidateHeadSha,
+          });
+          if (decisionResult.outcome === 'unresolvable') {
+            blockers.push(`owner decision '${ref}' could not be resolved: ${decisionResult.reason}`);
+          } else if (decisionResult.outcome === 'unknown') {
+            blockers.push(`owner decision '${ref}' is unknown: ${decisionResult.reason}`);
+          } else if (decisionResult.outcome === 'resolved') {
+            const decision = decisionResult.decision;
+            if (decision.state !== 'approved') {
+              blockers.push(
+                `owner decision '${ref}' is in state '${decision.state}', not 'approved'`,
+              );
+            } else if (decision.expectedHeadSha !== assessment.candidateHeadSha) {
+              blockers.push(
+                `owner decision '${ref}' was approved for head '${decision.expectedHeadSha}', not candidate head '${assessment.candidateHeadSha}'`,
+              );
+            }
+          } else {
+            blockers.push(`owner decision '${ref}' could not be resolved`);
+          }
+        } catch (error: unknown) {
+          blockers.push(
+            `owner decision '${ref}' could not be resolved: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       }
     }
 

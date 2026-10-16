@@ -17,7 +17,20 @@ import type {
   ForgeActionResult,
 } from '../ports/out/ForgeActionPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
+import type {
+  AcceptanceEvidencePort,
+  ReadAcceptanceRequest,
+  ReadAcceptanceResult,
+} from '../ports/out/AcceptanceEvidencePort.out-port.js';
 import { ExecuteAuthorizedForgeActionUseCase } from './ExecuteAuthorizedForgeActionUseCase.use-case.js';
+
+class InMemoryAcceptanceEvidencePort implements AcceptanceEvidencePort {
+  constructor(private readonly result: ReadAcceptanceResult) {}
+
+  async readAcceptance(_request: ReadAcceptanceRequest): Promise<ReadAcceptanceResult> {
+    return this.result;
+  }
+}
 
 class InMemoryAttemptRepo implements AttemptRepositoryPort {
   constructor(private attempt: AttemptRecord | null) {}
@@ -156,6 +169,16 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       };
 
       // Instance 1 runs and is refused by authorization
+      const defaultAcceptancePort = new InMemoryAcceptanceEvidencePort({
+        outcome: 'found',
+        assessment: {
+          candidateHeadSha: '1111111111111111111111111111111111111111',
+          policyRevision: 'pol-1',
+          state: 'accepted',
+          acceptanceReceiptId: 'receipt-001',
+        },
+      });
+
       const instance1 = new ExecuteAuthorizedForgeActionUseCase({
         attemptRepo,
         workOrderRepo,
@@ -165,6 +188,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         acceptedReceiptByHead: {
           '1111111111111111111111111111111111111111': 'receipt-001',
         },
+        acceptanceEvidencePort: defaultAcceptancePort,
       });
       const result1 = await instance1.executeAuthorizedForgeAction(req);
       expect(result1.outcome).toBe('refused');
@@ -182,6 +206,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         acceptedReceiptByHead: {
           '1111111111111111111111111111111111111111': 'receipt-001',
         },
+        acceptanceEvidencePort: defaultAcceptancePort,
       });
       // This should NOT throw a duplicate key error!
       const result2 = await instance2.executeAuthorizedForgeAction(req);
@@ -227,6 +252,15 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         acceptedReceiptByHead: {
           '1111111111111111111111111111111111111111': 'receipt-001',
         },
+        acceptanceEvidencePort: new InMemoryAcceptanceEvidencePort({
+          outcome: 'found',
+          assessment: {
+            candidateHeadSha: '1111111111111111111111111111111111111111',
+            policyRevision: 'pol-1',
+            state: 'accepted',
+            acceptanceReceiptId: 'receipt-001',
+          },
+        }),
       });
 
       const result = await useCase.executeAuthorizedForgeAction({
@@ -241,6 +275,245 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       expect(result).toEqual({ outcome: 'refused', reason: 'unavailable' });
       expect(consumed).toBe(false);
       expect(journal.entries).toHaveLength(0);
+    });
+  });
+
+  describe('M12: acceptance evidence verification before merge-pr', () => {
+    const validAssessment = {
+      candidateHeadSha: '1111111111111111111111111111111111111111',
+      policyRevision: 'pol-1',
+      state: 'accepted' as const,
+      acceptanceReceiptId: 'receipt-001',
+    };
+
+    const mergeReq = {
+      actionId: 'forge-act-1',
+      attemptId: 'att-001',
+      workOrderId: 'wo-001',
+      kind: 'merge-pr' as const,
+      expectedHeadSha: '1111111111111111111111111111111111111111',
+      authorizationGrantId: 'grant-001',
+    };
+
+    const successfulAuthPort: ActionAuthorizationPort = {
+      async resolveActionAuthorization() {
+        return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+      },
+      async consumeActionAuthorization(req) {
+        return { outcome: 'consumed', actionId: req.actionId };
+      },
+    };
+
+    const successfulForgePort: ForgeActionPort = {
+      isConfigured: () => true,
+      async performForgeAction() {
+        return { outcome: 'executed', headSha: '1111111111111111111111111111111111111111' };
+      },
+    };
+
+    it('stale assessment with a receipt in the map -> merge refused', async () => {
+      const journal = new InMemoryJournal();
+      const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+      const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+
+      const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
+        outcome: 'found',
+        assessment: {
+          ...validAssessment,
+          state: 'stale',
+        },
+      });
+
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        attemptRepo,
+        workOrderRepo,
+        journal,
+        authorizationPort: successfulAuthPort,
+        forgePort: successfulForgePort,
+        acceptedReceiptByHead: {
+          '1111111111111111111111111111111111111111': 'receipt-001',
+        },
+        acceptanceEvidencePort,
+      });
+
+      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('stale');
+    });
+
+    it('policy moved -> merge refused', async () => {
+      const journal = new InMemoryJournal();
+      const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+      const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord()); // has policyRevision: 'pol-1'
+
+      const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
+        outcome: 'found',
+        assessment: {
+          ...validAssessment,
+          policyRevision: 'pol-old-0',
+        },
+      });
+
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        attemptRepo,
+        workOrderRepo,
+        journal,
+        authorizationPort: successfulAuthPort,
+        forgePort: successfulForgePort,
+        acceptedReceiptByHead: {
+          '1111111111111111111111111111111111111111': 'receipt-001',
+        },
+        acceptanceEvidencePort,
+      });
+
+      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('policy revision');
+    });
+
+    it('blocked assessment -> merge refused', async () => {
+      const journal = new InMemoryJournal();
+      const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+      const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+
+      const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
+        outcome: 'found',
+        assessment: {
+          ...validAssessment,
+          state: 'blocked',
+        },
+      });
+
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        attemptRepo,
+        workOrderRepo,
+        journal,
+        authorizationPort: successfulAuthPort,
+        forgePort: successfulForgePort,
+        acceptedReceiptByHead: {
+          '1111111111111111111111111111111111111111': 'receipt-001',
+        },
+        acceptanceEvidencePort,
+      });
+
+      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('blocked');
+    });
+
+    it('missing assessment in evidence context -> merge refused', async () => {
+      const journal = new InMemoryJournal();
+      const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+      const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+
+      const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
+        outcome: 'not-found',
+        reason: 'no acceptance assessment recorded for the attempt head',
+      });
+
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        attemptRepo,
+        workOrderRepo,
+        journal,
+        authorizationPort: successfulAuthPort,
+        forgePort: successfulForgePort,
+        acceptedReceiptByHead: {
+          '1111111111111111111111111111111111111111': 'receipt-001',
+        },
+        acceptanceEvidencePort,
+      });
+
+      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('not found');
+    });
+
+    it('assessment head mismatch -> merge refused', async () => {
+      const journal = new InMemoryJournal();
+      const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+      const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+
+      const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
+        outcome: 'found',
+        assessment: {
+          ...validAssessment,
+          candidateHeadSha: '2222222222222222222222222222222222222222',
+        },
+      });
+
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        attemptRepo,
+        workOrderRepo,
+        journal,
+        authorizationPort: successfulAuthPort,
+        forgePort: successfulForgePort,
+        acceptedReceiptByHead: {
+          '1111111111111111111111111111111111111111': 'receipt-001',
+        },
+        acceptanceEvidencePort,
+      });
+
+      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('does not match expectedHeadSha');
+    });
+
+    it('null acceptance receipt ID -> merge refused', async () => {
+      const journal = new InMemoryJournal();
+      const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+      const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+
+      const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
+        outcome: 'found',
+        assessment: {
+          ...validAssessment,
+          acceptanceReceiptId: null,
+        },
+      });
+
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        attemptRepo,
+        workOrderRepo,
+        journal,
+        authorizationPort: successfulAuthPort,
+        forgePort: successfulForgePort,
+        acceptedReceiptByHead: {
+          '1111111111111111111111111111111111111111': 'receipt-001',
+        },
+        acceptanceEvidencePort,
+      });
+
+      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('no receipt ID');
+    });
+
+    it('executes merge when assessment is accepted, head and policy match, and receipt ID exists', async () => {
+      const journal = new InMemoryJournal();
+      const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+      const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+
+      const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
+        outcome: 'found',
+        assessment: validAssessment,
+      });
+
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        attemptRepo,
+        workOrderRepo,
+        journal,
+        authorizationPort: successfulAuthPort,
+        forgePort: successfulForgePort,
+        acceptedReceiptByHead: {
+          '1111111111111111111111111111111111111111': 'receipt-001',
+        },
+        acceptanceEvidencePort,
+      });
+
+      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result.outcome).toBe('executed');
+      expect((result as { headSha: string }).headSha).toBe('1111111111111111111111111111111111111111');
+      expect(journal.entries).toHaveLength(2); // intent-recorded + completed
     });
   });
 });

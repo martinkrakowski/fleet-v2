@@ -24,6 +24,7 @@ import { withFileLock, writeJsonAtomically } from './file-store.js';
 
 import {
   AcceptanceAssessmentAdapter,
+  AcceptanceEvidenceAdapter,
   ActionAuthorizationAdapter,
   AttemptArtifactAdapter,
   AttemptRepositoryAdapter,
@@ -61,6 +62,7 @@ import {
   ForgeEvidenceAdapter,
   IndependentReviewAdapter,
   InspectAcceptanceEvidenceUseCase,
+  OwnerDecisionAdapter,
   RecordFindingDispositionUseCase,
   RecordReviewReceiptUseCase,
   RecordVerificationReceiptUseCase,
@@ -373,6 +375,7 @@ export interface FleetCliRuntime {
     readonly verificationExecutor: VerificationExecutorAdapter;
     readonly independentReview: IndependentReviewAdapter;
     readonly forgeEvidence: ForgeEvidenceAdapter;
+    readonly ownerDecision: OwnerDecisionAdapter;
     readonly requestVerification: RequestVerificationUseCase;
     readonly requestIndependentReview: RequestIndependentReviewUseCase;
     readonly recordVerificationReceipt: RecordVerificationReceiptUseCase;
@@ -390,6 +393,7 @@ export interface FleetCliRuntime {
     readonly attemptArtifact: AttemptArtifactAdapter;
     readonly briefAuthoring: BriefAuthoringAdapter;
     readonly acceptanceAssessment: AcceptanceAssessmentAdapter;
+    readonly acceptanceEvidence: AcceptanceEvidenceAdapter;
     readonly actionAuthorization: ActionAuthorizationAdapter;
     readonly briefKnowledge: BriefKnowledgeAdapter;
     readonly executionObservation: ExecutionObservationAdapter;
@@ -533,6 +537,28 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // bound to AssessHeadAcceptanceUseCase here. Recorded receipts stay the
   // acceptance evidence until that transport exists.
   const forgeEvidence = new ForgeEvidenceAdapter();
+  const ownerDecision = new OwnerDecisionAdapter({
+    resolveOwnerDecision: async (request) => {
+      let req = await coordinationRequestRepository.findRequestById(request.decisionReference);
+      if (req === null) {
+        req = await coordinationRequestRepository.findRequestByGrantId(request.decisionReference);
+      }
+      if (req === null) {
+        return {
+          outcome: 'unresolvable',
+          reason: `No coordination request found for reference '${request.decisionReference}'`,
+        };
+      }
+      return {
+        outcome: 'resolved',
+        decision: {
+          id: req.id,
+          state: req.state,
+          expectedHeadSha: req.expectedHeadSha,
+        },
+      };
+    },
+  });
 
   const evidence = {
     evidenceAssessmentRepository,
@@ -540,6 +566,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     verificationExecutor,
     independentReview,
     forgeEvidence,
+    ownerDecision,
     requestVerification: new RequestVerificationUseCase({
       repo: evidenceAssessmentRepository,
       executor: verificationExecutor,
@@ -557,7 +584,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     recordFindingDisposition: new RecordFindingDispositionUseCase({
       repo: evidenceAssessmentRepository,
     }),
-    assessHeadAcceptance: new AssessHeadAcceptanceUseCase({ repo: evidenceAssessmentRepository }),
+    assessHeadAcceptance: new AssessHeadAcceptanceUseCase({
+      repo: evidenceAssessmentRepository,
+      ownerDecisionPort: ownerDecision,
+    }),
     inspectAcceptanceEvidence: new InspectAcceptanceEvidenceUseCase({
       repo: evidenceAssessmentRepository,
     }),
@@ -675,10 +705,26 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
           assessedHeadSha: inspected.assessment.candidateHeadSha,
         };
       }
+      let ownerDecisionReferences: readonly string[] | undefined;
+      const attempt = await attemptRepository.findAttemptById(request.attemptId);
+      if (attempt?.worktreePath) {
+        const manifestPath = join(attempt.worktreePath, '.lane', 'brief-manifest.json');
+        try {
+          if (existsSync(manifestPath)) {
+            const manifestContent = JSON.parse(readFileSync(manifestPath, 'utf8'));
+            if (Array.isArray(manifestContent.ownerDecisionReferences)) {
+              ownerDecisionReferences = manifestContent.ownerDecisionReferences;
+            }
+          }
+        } catch {
+          // ignore unreadable brief manifest
+        }
+      }
       const result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
         assessmentId,
         candidateHeadSha: request.candidateHeadSha,
         policyRevision: request.policyRevision,
+        ownerDecisionReferences,
       });
       if (result.outcome === 'accepted') {
         acceptedReceiptByHead[result.candidateHeadSha] = result.receiptId;
@@ -700,6 +746,41 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       }
       // `rejected` and `stale` both leave the action without a pass.
       return { outcome: 'rejected', reason: result.reason };
+    },
+  });
+
+  const acceptanceEvidence = new AcceptanceEvidenceAdapter({
+    readAcceptance: async (request) => {
+      let inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
+        assessmentId: assessmentIdForAttempt(request.attemptId),
+        candidateHeadSha: request.candidateHeadSha,
+      });
+      if (inspected.outcome === 'not-found') {
+        inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
+          assessmentId: request.attemptId,
+          candidateHeadSha: request.candidateHeadSha,
+        });
+      }
+      if (inspected.outcome === 'not-found') {
+        inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
+          candidateHeadSha: request.candidateHeadSha,
+        });
+      }
+      if (inspected.outcome === 'found') {
+        return {
+          outcome: 'found',
+          assessment: {
+            candidateHeadSha: inspected.assessment.candidateHeadSha,
+            policyRevision: inspected.assessment.policyRevision,
+            state: inspected.assessment.state,
+            acceptanceReceiptId: inspected.assessment.acceptanceReceiptId,
+          },
+        };
+      }
+      return {
+        outcome: 'not-found',
+        reason: `No acceptance assessment found for head ${request.candidateHeadSha}`,
+      };
     },
   });
 
@@ -898,6 +979,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     attemptArtifact,
     briefAuthoring,
     acceptanceAssessment,
+    acceptanceEvidence,
     actionAuthorization,
     briefKnowledge,
     executionObservation,
@@ -955,6 +1037,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       authorizationPort: actionAuthorization,
       forgePort: forgeAction,
       acceptedReceiptByHead: acceptedReceiptByHeadView,
+      acceptanceEvidencePort: acceptanceEvidence,
     }),
   };
 

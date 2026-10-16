@@ -22,6 +22,7 @@ import {
 } from "@fleet/operator-coordination/use-cases";
 
 export interface OperatorComposition {
+  coordinationRequestRepository: CoordinationRequestRepositoryAdapter;
   inspectConfiguredCapabilities: InspectConfiguredCapabilitiesUseCase;
   publishProjectObservation: PublishProjectObservationUseCase;
   requestScopedDecision: RequestScopedDecisionUseCase;
@@ -44,6 +45,7 @@ let configured: OperatorComposition | undefined;
 
 function unconfiguredOperatorComposition(): OperatorComposition {
   return {
+    coordinationRequestRepository: new CoordinationRequestRepositoryAdapter(),
     inspectConfiguredCapabilities: new InspectConfiguredCapabilitiesUseCase(),
     publishProjectObservation: new PublishProjectObservationUseCase(),
     requestScopedDecision: new RequestScopedDecisionUseCase(),
@@ -87,6 +89,7 @@ export function createConfiguredOperatorComposition(
   );
 
   return {
+    coordinationRequestRepository: requestRepo,
     inspectConfiguredCapabilities: new InspectConfiguredCapabilitiesUseCase({ profileRepo }),
     publishProjectObservation: new PublishProjectObservationUseCase({ publicationPort }),
     requestScopedDecision: new RequestScopedDecisionUseCase({

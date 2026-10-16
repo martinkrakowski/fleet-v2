@@ -16,6 +16,7 @@ import type {
   ExecuteAuthorizedForgeActionRequest,
   ExecuteAuthorizedForgeActionResult,
 } from '../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
+import type { AcceptanceEvidencePort } from '../ports/out/AcceptanceEvidencePort.out-port.js';
 import type { ActionAuthorizationPort } from '../ports/out/ActionAuthorizationPort.out-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
@@ -37,7 +38,9 @@ export interface ExecuteAuthorizedForgeActionDependencies {
   readonly authorizationPort: ActionAuthorizationPort;
   /** Performs the credential-bearing forge operation behind a port. */
   readonly forgePort: ForgeActionPort;
-  /** Accepted-receipt id per head; a merge without a receipt is refused. */
+  /** Out-port for reading acceptance assessment evidence from the evidence context. */
+  readonly acceptanceEvidencePort?: AcceptanceEvidencePort;
+  /** Non-authoritative cache of accepted-receipt id per head. */
   readonly acceptedReceiptByHead?: Readonly<Record<string, string>>;
   /**
    * Composition-root clock for journal and revision timestamps; the
@@ -72,16 +75,64 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     }
 
     // Merge requires current-head acceptance; old readiness is not a receipt.
-    // A missing receipt registry refuses the merge unconditionally: an
-    // unconfigured acceptance delegate is never a pass.
-    if (
-      request.kind === 'merge-pr' &&
-      !deps.acceptedReceiptByHead?.[request.expectedHeadSha]
-    ) {
-      return {
-        outcome: 'refused',
-        reason: 'Cannot merge without an acceptance receipt for expectedHeadSha',
-      };
+    // An out-port reads the evidence context's assessment; the merge proceeds
+    // only when the assessment state is 'accepted', its head equals the request head,
+    // its policy revision equals the attempt's, and its receipt id is non-null.
+    // Stale or blocked -> refuse.
+    if (request.kind === 'merge-pr') {
+      if (!deps.acceptanceEvidencePort) {
+        return {
+          outcome: 'refused',
+          reason: 'Cannot merge without a configured acceptance evidence port',
+        };
+      }
+      const acceptance = await deps.acceptanceEvidencePort.readAcceptance({
+        attemptId: request.attemptId,
+        candidateHeadSha: request.expectedHeadSha,
+      });
+      if (acceptance.outcome !== 'found') {
+        return {
+          outcome: 'refused',
+          reason: `Cannot merge: acceptance assessment not found for attempt ${request.attemptId}`,
+        };
+      }
+      const assessment = acceptance.assessment;
+      if (assessment.state === 'stale') {
+        return {
+          outcome: 'refused',
+          reason: 'Cannot merge: acceptance assessment is stale',
+        };
+      }
+      if (assessment.state === 'blocked') {
+        return {
+          outcome: 'refused',
+          reason: 'Cannot merge: acceptance assessment is blocked',
+        };
+      }
+      if (assessment.state !== 'accepted') {
+        return {
+          outcome: 'refused',
+          reason: `Cannot merge: assessment state is '${assessment.state}', expected 'accepted'`,
+        };
+      }
+      if (assessment.candidateHeadSha !== request.expectedHeadSha) {
+        return {
+          outcome: 'refused',
+          reason: `Cannot merge: assessment head '${assessment.candidateHeadSha}' does not match expectedHeadSha '${request.expectedHeadSha}'`,
+        };
+      }
+      if (assessment.policyRevision !== workOrder.policyRevision) {
+        return {
+          outcome: 'refused',
+          reason: `Cannot merge: assessment policy revision '${assessment.policyRevision}' does not match attempt policy revision '${workOrder.policyRevision}'`,
+        };
+      }
+      if (!assessment.acceptanceReceiptId) {
+        return {
+          outcome: 'refused',
+          reason: 'Cannot merge: acceptance assessment has no receipt ID',
+        };
+      }
     }
 
     if (typeof deps.forgePort.isConfigured === 'function' && !deps.forgePort.isConfigured()) {

@@ -379,11 +379,12 @@ bounded_contexts:
             - AttemptArtifactPort
             - ForgeActionPort
             - AcceptanceAssessmentPort
+            - AcceptanceEvidencePort
             - BriefKnowledgePort
             - ActionAuthorizationPort
             - ExecutionObservationPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -406,6 +407,7 @@ bounded_contexts:
       AttemptArtifactPort: "Place frozen briefs and templates under verified ignored paths and collect bounded immutable artifacts after lane completion."
       ForgeActionPort: "Perform permitted credential-bearing PR and merge operations through stable action IDs and explicit expected-head checks."
       AcceptanceAssessmentPort: "Consume the evidence context's exact-head assessment without importing its repositories or mutating its aggregates."
+      AcceptanceEvidencePort: "Consume the evidence context's exact-head assessment to authorize merge actions."
       BriefKnowledgePort: "Request bounded context proposals, record selected versions and forward only completed-attempt notes to the knowledge context."
       ActionAuthorizationPort: "Obtain and durably consume an applicable scope-bound grant from operator coordination; pending or unknown results block the action."
       ExecutionObservationPort: "Publish recorded lifecycle observations through coordination; preserve a delivery gap without failing the lane."
@@ -422,6 +424,10 @@ bounded_contexts:
         implements: AcceptanceAssessmentPort
         integration: in-process
         delegates_to: [evidence-and-acceptance/AssessHeadAcceptancePort, evidence-and-acceptance/RequestVerificationPort, evidence-and-acceptance/RequestIndependentReviewPort]
+      - adapter: AcceptanceEvidenceAdapter
+        implements: AcceptanceEvidencePort
+        integration: in-process
+        delegates_to: [evidence-and-acceptance/InspectAcceptanceEvidencePort]
       - adapter: BriefKnowledgeAdapter
         implements: BriefKnowledgePort
         integration: in-process
@@ -472,9 +478,9 @@ bounded_contexts:
         use_cases: [RequestVerificationUseCase, RequestIndependentReviewUseCase, RecordVerificationReceiptUseCase, RecordReviewReceiptUseCase, RecordFindingDispositionUseCase, AssessHeadAcceptanceUseCase, InspectAcceptanceEvidenceUseCase]
         ports:
           in: [RequestVerificationPort, RequestIndependentReviewPort, RecordVerificationReceiptPort, RecordReviewReceiptPort, RecordFindingDispositionPort, AssessHeadAcceptancePort, InspectAcceptanceEvidencePort]
-          out: [EvidenceAssessmentRepositoryPort, EvidenceArchivePort, VerificationExecutorPort, ForgeEvidencePort, IndependentReviewPort]
+          out: [EvidenceAssessmentRepositoryPort, EvidenceArchivePort, VerificationExecutorPort, ForgeEvidencePort, IndependentReviewPort, OwnerDecisionPort]
       infrastructure:
-        adapters: [EvidenceAssessmentRepositoryAdapter, EvidenceArchiveAdapter, VerificationExecutorAdapter, ForgeEvidenceAdapter, IndependentReviewAdapter]
+        adapters: [EvidenceAssessmentRepositoryAdapter, EvidenceArchiveAdapter, VerificationExecutorAdapter, ForgeEvidenceAdapter, IndependentReviewAdapter, OwnerDecisionAdapter]
     contracts:
       RequestVerificationPort: "Request the required completed checks on configured verification hosts for a precise head and acceptance-policy revision."
       RequestIndependentReviewPort: "Request a read-only review using an underlying model distinct from the implementer's and bind its result to the reviewed head."
@@ -488,12 +494,17 @@ bounded_contexts:
       VerificationExecutorPort: "Run allow-listed checks on the configured verification host and return completed command receipts."
       ForgeEvidencePort: "Read current CI/check/thread status through the forge without opening, merging or mutating PRs."
       IndependentReviewPort: "Obtain an attributable read-only review from the configured independent seat; transport and provider selection belong to the adapter."
+      OwnerDecisionPort: "Resolve owner decision references through operator coordination before head acceptance."
     adapter_bindings:
       - { adapter: EvidenceAssessmentRepositoryAdapter, implements: EvidenceAssessmentRepositoryPort, integration: local-transactional-store }
       - { adapter: EvidenceArchiveAdapter, implements: EvidenceArchivePort, integration: immutable-artifact-files }
       - { adapter: VerificationExecutorAdapter, implements: VerificationExecutorPort, integration: reviewed-verification-script-and-ssh }
       - { adapter: ForgeEvidenceAdapter, implements: ForgeEvidencePort, integration: read-only-github-cli-subprocess }
       - { adapter: IndependentReviewAdapter, implements: IndependentReviewPort, integration: configured-read-only-review-harness }
+      - adapter: OwnerDecisionAdapter
+        implements: OwnerDecisionPort
+        integration: in-process
+        delegates_to: [operator-coordination/InspectOutstandingCoordinationPort, operator-coordination/CoordinationRequestRepositoryPort]
     domain_specification:
       aggregate_roots: [EvidenceAssessment]
       child_ownership: { VerificationReceipt: EvidenceAssessment, ReviewReceipt: EvidenceAssessment, FindingDisposition: EvidenceAssessment }
@@ -624,6 +635,7 @@ context_mappings:
   - { upstream: evidence-and-acceptance, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "AcceptanceAssessmentAdapter delegates to supplier-owned application ports; dependency is declared on work-execution." }
   - { upstream: brief-knowledge, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "BriefKnowledgeAdapter delegates to supplier-owned context-selection and completed-note ingestion ports." }
   - { upstream: operator-coordination, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "ActionAuthorizationAdapter and ExecutionObservationAdapter delegate to supplier-owned authorization and publication ports." }
+  - { upstream: operator-coordination, downstream: evidence-and-acceptance, pattern: OHS, mechanism: in-process-application-contract, notes: "OwnerDecisionAdapter delegates to supplier-owned coordination request inspection ports." }
 
 agent_instructions:
   product_identity: "The process persists; workers are disposable. Memory travels in the brief, not the model call."

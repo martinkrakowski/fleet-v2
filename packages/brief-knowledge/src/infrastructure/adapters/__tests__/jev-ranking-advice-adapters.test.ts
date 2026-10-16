@@ -1,7 +1,7 @@
 // Lane D2 tests: JevRankingAdviceAdapter, AnswerFileRankingAdviceAdapter and
 // readKeyFile. No real network: fetch is always a spy or a failing stub.
 import { beforeAll, describe, expect, it } from 'vitest';
-import { chmod, mkdtemp, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
 import { readFile as readFileCb } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -182,6 +182,26 @@ describe('JevRankingAdviceAdapter', () => {
     });
     const result = await adapter.adviseRanking(QUERY);
     expect(result).toEqual({ status: 'unknown', reason: 'low-confidence' });
+    // The call was paid: the receipt is set as soon as the body parses,
+    // before validation, so its cost is still exposed.
+    expect(adapter.lastReceipt).not.toBeNull();
+    expect(adapter.lastReceipt?.costUsd).toBeCloseTo(0.000018102, 12);
+  });
+
+  it('clears lastReceipt after an unknown call that follows an advised call', async () => {
+    let first = true;
+    const flipFetch = (async () => {
+      if (first) {
+        first = false;
+        return new Response(JSON.stringify(FIXTURE_RESPONSE), { status: 200 });
+      }
+      throw new Error('connection refused');
+    }) as typeof fetch;
+    const adapter = makeAdapter({ fetch: flipFetch });
+    await adapter.adviseRanking(QUERY);
+    expect(adapter.lastReceipt).not.toBeNull();
+    const second = await adapter.adviseRanking(QUERY);
+    expect(second.status).toBe('unknown');
     expect(adapter.lastReceipt).toBeNull();
   });
 
@@ -199,6 +219,127 @@ describe('JevRankingAdviceAdapter', () => {
     const result = await adapter.adviseRanking(QUERY);
     expect(result).toEqual({ status: 'unknown', reason: 'not-configured' });
     expect((fetchFn as unknown as { calls: unknown[] }).calls).toHaveLength(0);
+  });
+
+  it('sends a request body identical to the recorded request fixture', async () => {
+    const fetchFn = okFetch();
+    const adapter = makeAdapter({ fetch: fetchFn });
+    await adapter.adviseRanking(QUERY);
+    const calls = (fetchFn as unknown as { calls: Array<{ init: RequestInit }> }).calls;
+    const fixtureRequest = await readFileAsync(
+      fileURLToPath(new URL('../__fixtures__/jev/jev-score-request.json', import.meta.url)),
+      'utf8',
+    );
+    expect(calls[0].init.body).toBe(fixtureRequest.trim());
+    expect(calls[0].init.redirect).toBe('error');
+  });
+
+  it('refuses a secret-pattern claimText with zero fetch calls', async () => {
+    const fetchFn = okFetch();
+    const adapter = makeAdapter({ fetch: fetchFn });
+    const result = await adapter.adviseRanking({
+      ...QUERY,
+      candidates: [
+        { id: 'entry-a', claimText: 'rotate the api key sk-abcdefghijklmnopqrstuvwx now' },
+        QUERY.candidates[1],
+      ],
+    });
+    expect(result).toEqual({ status: 'unknown', reason: 'redaction-refused' });
+    expect((fetchFn as unknown as { calls: unknown[] }).calls).toHaveLength(0);
+  });
+
+  it('refuses a secret-pattern pathPrefix with zero fetch calls', async () => {
+    const fetchFn = okFetch();
+    const adapter = makeAdapter({ fetch: fetchFn });
+    const result = await adapter.adviseRanking({
+      ...QUERY,
+      pathPrefixes: ['src/utils', 'secrets/ghp_abcdefghijklmnopqrstuvwxyz012345'],
+    });
+    expect(result).toEqual({ status: 'unknown', reason: 'redaction-refused' });
+    expect((fetchFn as unknown as { calls: unknown[] }).calls).toHaveLength(0);
+  });
+
+  it('calls readKey once per adviseRanking across two calls', async () => {
+    let readKeyCalls = 0;
+    const adapter = new JevRankingAdviceAdapter({
+      model: 'typesafe/jev-1.14',
+      keyFile: '/keys/jev.key',
+      minConfidence: 0.5,
+      fetch: okFetch(),
+      readKey: async () => {
+        readKeyCalls += 1;
+        return KEY_TEXT;
+      },
+    });
+    await adapter.adviseRanking(QUERY);
+    await adapter.adviseRanking(QUERY);
+    expect(readKeyCalls).toBe(2);
+  });
+
+  it('answers timeout when a streamed body never closes and the signal aborts', async () => {
+    const hangingFetch = (async (_url: unknown, init?: RequestInit) => {
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const stream = new ReadableStream<Uint8Array>({
+        start(c) {
+          streamController = c;
+          // Enqueue nothing: the body never closes on its own.
+        },
+      });
+      init?.signal?.addEventListener('abort', () => {
+        // Error the pending read with the abort reason, as a real aborted
+        // body read surfaces.
+        streamController.error(init.signal?.reason ?? new Error('aborted'));
+      });
+      return new Response(stream, { status: 200 });
+    }) as typeof fetch;
+    const adapter = makeAdapter({ fetch: hangingFetch, timeoutMs: 100 });
+    const result = await adapter.adviseRanking(QUERY);
+    expect(result).toEqual({ status: 'unknown', reason: 'timeout' });
+  });
+
+  it('refuses a streamed 70000-byte body and a 100000 content-length without reading', async () => {
+    let bigStreamReads = 0;
+    const bigBodyFetch = (async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          bigStreamReads += 1;
+          controller.enqueue(new Uint8Array(70000));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }) as typeof fetch;
+    const bigAdapter = makeAdapter({ fetch: bigBodyFetch });
+    expect(await bigAdapter.adviseRanking(QUERY)).toEqual({
+      status: 'unknown',
+      reason: 'shape',
+    });
+
+    let smallStreamReads = 0;
+    const headerFetch = (async () => {
+      const stream = new ReadableStream<Uint8Array>(
+        {
+          pull() {
+            smallStreamReads += 1;
+            throw new Error('body must not be read when content-length is over the cap');
+          },
+        },
+        { highWaterMark: 0 },
+      );
+      const response = {
+        ok: true,
+        headers: new Headers({ 'content-length': '100000' }),
+        body: stream,
+      } as unknown as Response;
+      return response;
+    }) as typeof fetch;
+    const headerAdapter = makeAdapter({ fetch: headerFetch });
+    expect(await headerAdapter.adviseRanking(QUERY)).toEqual({
+      status: 'unknown',
+      reason: 'shape',
+    });
+    expect(smallStreamReads).toBe(0);
+    expect(bigStreamReads).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -244,6 +385,12 @@ describe('readKeyFile', () => {
     await writeFile(path, '   \n', { mode: 0o600 });
     await chmod(path, 0o600);
     await expect(readKeyFile(path)).rejects.toThrow(/empty/);
+  });
+
+  it('rejects a directory', async () => {
+    const path = join(dir, 'dir.key');
+    await mkdir(path);
+    await expect(readKeyFile(path)).rejects.toThrow(/must be a regular file/);
   });
 });
 

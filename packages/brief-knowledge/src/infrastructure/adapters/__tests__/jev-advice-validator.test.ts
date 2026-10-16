@@ -39,6 +39,68 @@ describe('validateScoreAnswers', () => {
     expect(result.model).toBe('typesafe/jev-1.14-20261014');
   });
 
+  it('accepts a probability sum of 1.019 and rejects 1.021', async () => {
+    const body = await loadFixture('jev-score-response.json');
+    const accepted = mutateFixture(body, (clone) => {
+      const answers = clone.answers as Record<
+        string,
+        { probabilities: Record<string, number> }
+      >;
+      // 0.02 + 0.01 + 0.04 + 0.949 = 1.019, within the 0.02 tolerance.
+      answers.k0.probabilities = { 0: 0.02, 1: 0.01, 2: 0.04, 3: 0.949 };
+    });
+    expect(validateScoreAnswers(accepted, ASKED_KEYS, 4, 0.5).ok).toBe(true);
+
+    const rejected = mutateFixture(body, (clone) => {
+      const answers = clone.answers as Record<
+        string,
+        { probabilities: Record<string, number> }
+      >;
+      // 0.03 + 0.01 + 0.04 + 0.941 = 1.021, outside the 0.02 tolerance.
+      answers.k0.probabilities = { 0: 0.03, 1: 0.01, 2: 0.04, 3: 0.941 };
+    });
+    expect(validateScoreAnswers(rejected, ASKED_KEYS, 4, 0.5)).toEqual({
+      ok: false,
+      reason: 'shape',
+    });
+  });
+
+  it('refuses a model or id with a space, over 128 chars, or bad characters', async () => {
+    const body = await loadFixture('jev-score-response.json');
+
+    const spacedModel = mutateFixture(body, (clone) => {
+      clone.model = 'typesafe jev';
+    });
+    expect(validateScoreAnswers(spacedModel, ASKED_KEYS, 4, 0.5)).toEqual({
+      ok: false,
+      reason: 'shape',
+    });
+
+    const longModel = mutateFixture(body, (clone) => {
+      clone.model = 'a'.repeat(200);
+    });
+    expect(validateScoreAnswers(longModel, ASKED_KEYS, 4, 0.5)).toEqual({
+      ok: false,
+      reason: 'shape',
+    });
+
+    const spacedId = mutateFixture(body, (clone) => {
+      clone.id = 'gen fixture';
+    });
+    expect(validateScoreAnswers(spacedId, ASKED_KEYS, 4, 0.5)).toEqual({
+      ok: false,
+      reason: 'shape',
+    });
+
+    const longId = mutateFixture(body, (clone) => {
+      clone.id = 'g'.repeat(200);
+    });
+    expect(validateScoreAnswers(longId, ASKED_KEYS, 4, 0.5)).toEqual({
+      ok: false,
+      reason: 'shape',
+    });
+  });
+
   it('ranks k0 above k1 from the fixture', async () => {
     const body = await loadFixture('jev-score-response.json');
     const result = validateScoreAnswers(body, ASKED_KEYS, 4, 0.5);

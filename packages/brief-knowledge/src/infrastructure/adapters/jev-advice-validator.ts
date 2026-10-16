@@ -27,6 +27,15 @@ export const JEV_CRITERIA_LEVELS: readonly string[] = [
 /** Maximum allowed drift of the probability sum from 1. */
 const PROBABILITY_SUM_TOLERANCE = 0.02;
 
+/** `model` and `id` must be short, opaque identifier strings. */
+const ID_OR_MODEL_PATTERN = /^[A-Za-z0-9._/:-]+$/;
+
+function isValidIdOrModel(value: unknown): value is string {
+  return (
+    typeof value === 'string' && value.length <= 128 && ID_OR_MODEL_PATTERN.test(value)
+  );
+}
+
 export interface ScoreAnswersValid {
   readonly ok: true;
   /** Expectation score in [0,1] per asked key. */
@@ -76,7 +85,10 @@ export function validateScoreAnswers(
   if (!isPlainObject(body)) {
     return { ok: false, reason: 'shape' };
   }
-  if (typeof body.model !== 'string' || body.model.length === 0) {
+  if (!isValidIdOrModel(body.model)) {
+    return { ok: false, reason: 'shape' };
+  }
+  if (body.id !== undefined && !isValidIdOrModel(body.id)) {
     return { ok: false, reason: 'shape' };
   }
   if (!isPlainObject(body.answers)) {

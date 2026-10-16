@@ -9,11 +9,12 @@
  * Transport hygiene: the key is read by the injected `readKey` (default
  * `readKeyFile`, which requires O_NOFOLLOW, a regular file and mode
  * `& 0o077 === 0`, mirroring WavesHttpClient — re-implemented here, never
- * imported across contexts). One attempt with an AbortController timeout
- * (default 3 s). Non-2xx → `transport`; abort → `timeout`; response text over
- * 64 KiB or unparsable JSON → `shape`; then the strict score validator.
- * Authorization, request bodies and response bodies never appear in thrown
- * errors or returned values.
+ * imported across contexts). One attempt with a single AbortController
+ * deadline covering both the fetch and the body read (default 3 s), no
+ * redirects. Non-2xx → `transport`; abort → `timeout`; response bodies over
+ * 64 KiB (by header or by accumulated bytes) or unparsable JSON → `shape`;
+ * then the strict score validator. Authorization, request bodies and response
+ * bodies never appear in thrown errors or returned values.
  *
  * Receipt: the port result type carries no request id or cost, so the per-call
  * receipt (`requestId`, `costUsd`, `servedModel`, `stateSha256`) is exposed on
@@ -41,7 +42,7 @@ import {
 const JEV_DECISIONS_URL = 'https://openrouter.ai/api/alpha/decisions';
 const DEFAULT_JEV_TIMEOUT_MS = 3000;
 /** Response bodies at or beyond this size are refused as a shape failure. */
-const MAX_RESPONSE_TEXT_CHARS = 64 * 1024;
+const MAX_RESPONSE_BODY_BYTES = 65536;
 
 export interface JevRankingAdviceAdapterDependencies {
   /** Jev model id sent with every request, e.g. `typesafe/jev-1.14`. */
@@ -168,6 +169,19 @@ export class JevRankingAdviceAdapter implements KnowledgeRankingAdvicePort {
   }
 
   async adviseRanking(req: AdviseRankingQuery): Promise<RankingAdvice> {
+    // Every call starts from a clean slate: an unknown call after an advised
+    // call must not leave a stale receipt behind.
+    this.lastReceiptValue = null;
+    try {
+      return await this.adviseRankingInner(req);
+    } catch {
+      // The port never throws: any unexpected error is an opaque transport
+      // failure. Errors never carry keys, bodies or response content.
+      return { status: 'unknown', reason: 'transport' };
+    }
+  }
+
+  private async adviseRankingInner(req: AdviseRankingQuery): Promise<RankingAdvice> {
     if (this.disabledProjects.includes(req.projectId)) {
       return { status: 'unknown', reason: 'not-configured' };
     }
@@ -192,69 +206,121 @@ export class JevRankingAdviceAdapter implements KnowledgeRankingAdvicePort {
       questions: buildScoreQuestions(state),
     });
 
+    // One deadline covers the fetch AND the body read; the timer is cleared
+    // only after the body is fully read (or the attempt has already failed).
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    let response: Response;
     try {
-      response = await this.fetchFn(JEV_DECISIONS_URL, {
+      const response = await this.fetchFn(JEV_DECISIONS_URL, {
         method: 'POST',
         headers: {
           authorization: `Bearer ${key}`,
           'content-type': 'application/json',
         },
         body,
+        redirect: 'error',
         signal: controller.signal,
       });
+
+      if (!(response as { ok?: boolean }).ok) {
+        // HTTP status only; never the body.
+        return { status: 'unknown', reason: 'transport' };
+      }
+
+      const contentLengthHeader = response.headers.get('content-length');
+      if (contentLengthHeader !== null) {
+        const contentLength = Number(contentLengthHeader);
+        if (Number.isFinite(contentLength) && contentLength > MAX_RESPONSE_BODY_BYTES) {
+          // Refuse before reading a single byte of an oversized body.
+          return { status: 'unknown', reason: 'shape' };
+        }
+      }
+
+      const read = await readBoundedBody(response);
+      if (!read.ok) {
+        return { status: 'unknown', reason: read.reason };
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(read.text) as unknown;
+      } catch {
+        return { status: 'unknown', reason: 'shape' };
+      }
+
+      // The receipt is set as soon as the body parses as JSON — before
+      // validation — so a paid call that fails validation still exposes its
+      // cost for the receipt journal.
+      this.lastReceiptValue = extractReceipt(parsed, state.stateSha256);
+
+      const validated = validateScoreAnswers(
+        parsed,
+        state.keys,
+        DEFAULT_DECISION_LEVELS,
+        this.minConfidence,
+      );
+      if (!validated.ok) {
+        return { status: 'unknown', reason: validated.reason };
+      }
+
+      const scores: Record<string, number> = {};
+      for (const key of state.keys) {
+        scores[state.idsByKey[key]] = validated.scores[key];
+      }
+
+      return {
+        status: 'advised',
+        scores,
+        model: validated.model,
+        confidence: validated.confidence,
+      };
     } catch (error) {
-      return { status: 'unknown', reason: isAbortError(error) ? 'timeout' : 'transport' };
+      if (isAbortError(error)) {
+        return { status: 'unknown', reason: 'timeout' };
+      }
+      throw error;
     } finally {
       clearTimeout(timer);
     }
-
-    if (!(response as { ok?: boolean }).ok) {
-      // HTTP status only; never the body.
-      return { status: 'unknown', reason: 'transport' };
-    }
-
-    let text: string;
-    try {
-      text = await response.text();
-    } catch {
-      return { status: 'unknown', reason: 'transport' };
-    }
-    if (text.length > MAX_RESPONSE_TEXT_CHARS) {
-      return { status: 'unknown', reason: 'shape' };
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text) as unknown;
-    } catch {
-      return { status: 'unknown', reason: 'shape' };
-    }
-
-    const validated = validateScoreAnswers(
-      parsed,
-      state.keys,
-      DEFAULT_DECISION_LEVELS,
-      this.minConfidence,
-    );
-    if (!validated.ok) {
-      return { status: 'unknown', reason: validated.reason };
-    }
-
-    const scores: Record<string, number> = {};
-    for (const key of state.keys) {
-      scores[state.idsByKey[key]] = validated.scores[key];
-    }
-
-    this.lastReceiptValue = extractReceipt(parsed, state.stateSha256);
-    return {
-      status: 'advised',
-      scores,
-      model: validated.model,
-      confidence: validated.confidence,
-    };
   }
+}
+
+/** Result of reading a response body under the byte cap. */
+type BoundedBodyRead =
+  | { ok: true; text: string }
+  | { ok: false; reason: 'shape' | 'timeout' | 'transport' };
+
+/**
+ * Read `response.body` with a reader, accumulating bytes. Refuses (`shape`)
+ * as soon as the accumulated bytes exceed the cap and cancels the reader; an
+ * abort during the read maps to `timeout`, any other read error to
+ * `transport`. Decoded with TextDecoder.
+ */
+async function readBoundedBody(response: Response): Promise<BoundedBodyRead> {
+  const stream = response.body;
+  if (!stream) {
+    return { ok: false, reason: 'transport' };
+  }
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let received = 0;
+  let text = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > MAX_RESPONSE_BODY_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        return { ok: false, reason: 'shape' };
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } catch (error) {
+    return { ok: false, reason: isAbortError(error) ? 'timeout' : 'transport' };
+  }
+  return { ok: true, text };
 }
 
 /** One `score` question per candidate key, matching the recorded request. */

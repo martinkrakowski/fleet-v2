@@ -4,4 +4,5 @@ export * from "./EvidenceArchiveAdapter.adapter.js";
 export * from "./EvidenceAssessmentRepositoryAdapter.adapter.js";
 export * from "./ForgeEvidenceAdapter.adapter.js";
 export * from "./IndependentReviewAdapter.adapter.js";
+export * from "./OcmReviewTransport.adapter.js";
 export * from "./VerificationExecutorAdapter.adapter.js";

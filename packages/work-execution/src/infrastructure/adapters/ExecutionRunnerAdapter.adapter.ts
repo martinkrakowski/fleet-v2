@@ -56,7 +56,7 @@ export type SubprocessRunner = (
 ) => Promise<SubprocessResult>;
 
 export interface ExecutionRunnerAdapterOptions {
-  /** Path of the ocm-run binary; `ocm-run` from PATH when omitted. */
+  /** Path of the ocm-run binary; the bundled `bin/ocm-run` when found, else `ocm-run` from PATH when omitted. */
   readonly ocmRunBin?: string;
   /** Port passed as OCM_REMOTE_PORT to the runner subprocess. */
   readonly remotePort?: number;

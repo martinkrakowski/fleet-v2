@@ -2,5 +2,6 @@
 
 export * from "./AuthorizationConsumption.js";
 export * from "./CoordinationRequest.js";
+export * from "./OwnerQuestion.js";
 export * from "./ProjectProfile.js";
 export * from "./RelayAcknowledgement.js";

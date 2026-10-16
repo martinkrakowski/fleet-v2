@@ -439,6 +439,7 @@ __metadata:
   resolution: "@fleet/operator-coordination@workspace:packages/operator-coordination"
   dependencies:
     "@eslint/js": "npm:^9.0.0"
+    "@fleet/shared": "workspace:*"
     eslint: "npm:^9.0.0"
     typescript: "npm:^5.5.4"
     typescript-eslint: "npm:^8.0.0"

@@ -562,7 +562,7 @@ bounded_contexts:
           in: [CaptureCompletedAttemptNotesPort, CheckKnowledgeClaimPort, DecideKnowledgeDispositionPort, PublishAcceptedKeeperPort, ProposeBriefContextPort, RecordContextSelectionPort, RecordKnowledgeReusePort, SupersedeKnowledgeEntryPort]
           out: [KnowledgeEntryRepositoryPort, KnowledgeRetrievalPort, ClaimVerificationPort, KeeperPublicationPort, KnowledgeRankingAdvicePort, DecisionReceiptJournalPort]
       infrastructure:
-        adapters: [KnowledgeEntryRepositoryAdapter, KnowledgeRetrievalAdapter, ClaimVerificationAdapter, KeeperPublicationAdapter, NullRankingAdviceAdapter, AdvisedKnowledgeRetrievalAdapter, JevRankingAdviceAdapter, AnswerFileRankingAdviceAdapter, FileDecisionReceiptJournalAdapter, NotConfiguredReceiptJournal]
+        adapters: [KnowledgeEntryRepositoryAdapter, KnowledgeRetrievalAdapter, ClaimVerificationAdapter, KeeperPublicationAdapter, NullRankingAdviceAdapter, AdvisedKnowledgeRetrievalAdapter, JevRankingAdviceAdapter, AnswerFileRankingAdviceAdapter, BudgetedRankingAdviceAdapter, FileDecisionReceiptJournalAdapter, NotConfiguredReceiptJournal]
     contracts:
       CaptureCompletedAttemptNotesPort: "Accept bounded notes with completed-attempt identity and record missing/incomplete reports; every bullet becomes a candidate claim."
       CheckKnowledgeClaimPort: "Record orchestrator-chosen evidence for a scoped claim without executing instructions supplied by the note."
@@ -586,6 +586,7 @@ bounded_contexts:
       - { adapter: NullRankingAdviceAdapter, implements: KnowledgeRankingAdvicePort, integration: not-configured-null }
       - { adapter: AdvisedKnowledgeRetrievalAdapter, implements: KnowledgeRetrievalPort, integration: inner-retrieval-decorator }
       - { adapter: JevRankingAdviceAdapter, implements: KnowledgeRankingAdvicePort, integration: openrouter-jev-decisions-endpoint }
+      - { adapter: BudgetedRankingAdviceAdapter, implements: KnowledgeRankingAdvicePort, integration: budgeted-receipted-decision-decorator }
       - { adapter: AnswerFileRankingAdviceAdapter, implements: KnowledgeRankingAdvicePort, integration: owner-recorded-answer-file }
       - { adapter: FileDecisionReceiptJournalAdapter, implements: DecisionReceiptJournalPort, integration: local-jsonl-receipt-journal }
       - { adapter: NotConfiguredReceiptJournal, implements: DecisionReceiptJournalPort, integration: not-configured-null }

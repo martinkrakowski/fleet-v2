@@ -401,6 +401,20 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@fleet/onboarding@workspace:packages/onboarding":
+  version: 0.0.0-use.local
+  resolution: "@fleet/onboarding@workspace:packages/onboarding"
+  dependencies:
+    "@eslint/js": "npm:^9.0.0"
+    "@fleet/installation": "workspace:*"
+    "@fleet/tooling": "workspace:*"
+    eslint: "npm:^9.0.0"
+    typescript: "npm:^5.5.4"
+    typescript-eslint: "npm:^8.0.0"
+    vitest: "npm:^4.1.9"
+  languageName: unknown
+  linkType: soft
+
 "@fleet/operator-coordination@workspace:*, @fleet/operator-coordination@workspace:packages/operator-coordination":
   version: 0.0.0-use.local
   resolution: "@fleet/operator-coordination@workspace:packages/operator-coordination"
@@ -413,7 +427,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@fleet/tooling@workspace:packages/tooling":
+"@fleet/tooling@workspace:*, @fleet/tooling@workspace:packages/tooling":
   version: 0.0.0-use.local
   resolution: "@fleet/tooling@workspace:packages/tooling"
   dependencies:

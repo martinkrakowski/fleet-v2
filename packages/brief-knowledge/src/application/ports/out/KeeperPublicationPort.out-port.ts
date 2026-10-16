@@ -1,9 +1,9 @@
 // @generated outbound contract scaffold — refined for migration step 5.
 /**
- * KeeperPublicationPort: write attributed keeper entries to an optional
- * external shelf without revealing its key to agents. Failed delivery is
- * preserved for reconciliation; shelf failure does not fail otherwise
- * acceptable work.
+ * KeeperPublicationPort: write attributed keeper entries to the configured
+ * shelf provider. Entries matching secret patterns are refused before any
+ * provider runs and written nowhere. Failed delivery is preserved for
+ * reconciliation; shelf failure does not fail otherwise acceptable work.
  */
 
 import type { KnowledgeEntryRecord } from '../../../domain/knowledge-records.js';

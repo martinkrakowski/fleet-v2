@@ -1,7 +1,7 @@
 /**
  * WavesHttpClient: small HTTPS client for communicating with Waves.
  * Validates https baseUrl (no redirects), reads token with strict file mode (0600)
- * and O_NOFOLLOW like ByteStash, sends Authorization: Bearer, and scrubs the token
+ * and O_NOFOLLOW (mode 600, no symlinks), sends Authorization: Bearer, and scrubs the token
  * from all reasons and response bodies. Supports optional caFile and timeoutMs,
  * with a pluggable request seam for testing.
  *

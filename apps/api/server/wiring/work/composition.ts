@@ -186,9 +186,6 @@ export function createConfiguredWorkComposition(
 
   const {
     worktreeSshHost,
-    runnerAgent,
-    runnerModel,
-    runnerVariant,
     runnerRemotePort,
     ocmRunBin,
     runnerRemoteHost,
@@ -204,13 +201,12 @@ export function createConfiguredWorkComposition(
   // arriving in a later process addresses the same directory as its dispatch.
   const runner = new ExecutionRunnerAdapter({
     ocmRunBin,
-    agent: runnerAgent,
-    model: runnerModel,
-    variant: runnerVariant,
     remotePort: runnerRemotePort,
     remoteHost: runnerRemoteHost,
     resolveWorktreePath: async (attemptId) =>
       (await attemptRepo.findAttemptById(attemptId))?.worktreePath ?? null,
+    resolveAttempt: async (attemptId) =>
+      await attemptRepo.findAttemptById(attemptId),
   });
   const acceptancePort = new AcceptanceAssessmentAdapter(crossContext?.acceptance);
   const briefKnowledge = new BriefKnowledgeAdapter(crossContext?.briefKnowledge);
@@ -235,6 +231,7 @@ export function createConfiguredWorkComposition(
       workspace,
       runner,
       observation,
+      artifactPort,
     }),
     reconcileAttempt: new ReconcileAttemptUseCase({ attemptRepo, journal, runner }),
     stopAttempt: new StopAttemptUseCase({ attemptRepo, journal, runner }),

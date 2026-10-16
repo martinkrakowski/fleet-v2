@@ -55,7 +55,6 @@ import reviewReceiptPost from "../../routes/v1/reviews/[id]/receipt.post";
 import findingDispositionPost from "../../routes/v1/findings/[id]/disposition.post";
 import headAssessmentPost from "../../routes/v1/heads/[sha]/assessment.post";
 import headEvidenceGet from "../../routes/v1/heads/[sha]/evidence.get";
-import attemptsIndexPost from "../../routes/v1/attempts/index.post";
 import knowledgeDispositionPost from "../../routes/v1/knowledge/[id]/disposition.post";
 import knowledgePublishPost from "../../routes/v1/knowledge/[id]/publish.post";
 import knowledgeReusePost from "../../routes/v1/knowledge/[id]/reuse.post";
@@ -102,7 +101,6 @@ beforeAll(async () => {
     ["/v1/attempts/:id", "get", attemptIdGet],
     ["/v1/heads/:sha/evidence", "get", headEvidenceGet],
     ["/v1/work-orders", "post", workOrdersIndexPost],
-    ["/v1/attempts", "post", attemptsIndexPost],
     ["/v1/verifications", "post", verificationsIndexPost],
     ["/v1/verifications/:id/receipt", "post", verificationReceiptPost],
     ["/v1/reviews", "post", reviewsIndexPost],
@@ -352,7 +350,6 @@ const ALL_ROUTES: ReadonlyArray<{ method: "get" | "post"; path: string }> = [
   { method: "get", path: "/v1/attention" },
   { method: "get", path: "/v1/coordination" },
   { method: "post", path: "/v1/work-orders" },
-  { method: "post", path: "/v1/attempts" },
   { method: "post", path: "/v1/attempts/attempt-matrix/artifacts" },
   { method: "post", path: "/v1/attempts/attempt-matrix/fix" },
   { method: "post", path: "/v1/attempts/attempt-matrix/stop" },
@@ -564,6 +561,11 @@ describe("501-vs-validation matrix", () => {
         "NOT_IMPLEMENTED",
       );
     }
+
+    // M11 removed POST /v1/attempts; with no handler mounted it reports 404
+    // while unconfigured instead of the 501 every remaining route reports.
+    const removed = await callRoute("post", "/v1/attempts", {});
+    expect(removed.status).toBe(404);
   });
 
   it("answers empty bodies with 200 domain outcomes while configured", async () => {

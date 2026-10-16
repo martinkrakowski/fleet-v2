@@ -73,6 +73,8 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
     const status = await this.deps.runner.inspectSession({
       attemptId: attempt.id,
       sessionId: attempt.sessionId,
+      worktreePath: attempt.worktreePath,
+      runner: attempt.runner,
     });
 
     if (status.runnerReachable !== 'reachable') {
@@ -99,6 +101,7 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
     const receiptMatches =
       status.workerCommand === 'ended' &&
       receipt !== null &&
+      receipt.authoritative === true &&
       receipt.attemptId === attempt.id &&
       receipt.sessionId === attempt.sessionId;
 

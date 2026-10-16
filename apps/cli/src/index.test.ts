@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { FleetInstallation } from '@fleet/installation';
+import type { SubprocessRunner } from '@fleet/work-execution';
 import { resolveRunnerSettings, runCli, type CliIo } from './index.js';
 import { createFleetCliRuntime } from './composition.js';
 
@@ -221,4 +222,80 @@ describe('CLI installation wiring', () => {
       expect(resolved.worktreeSshHost).toBe('ssh.nested.example');
     });
   });
+
+  describe('attempt dispatch and stop CLI commands', () => {
+    it('refuses attempt dispatch --model gpt-5 with usage error naming the field', async () => {
+      const dummyRuntime = createFleetCliRuntime({ stateDir: tempDir });
+      const { io, stderr } = createMockIo();
+      const exitCode = await runCli(
+        ['attempt', 'dispatch', '--attemptId', 'att-1', '--model', 'gpt-5'],
+        io,
+        dummyRuntime,
+      );
+
+      expect(exitCode).toBe(2);
+      const combinedStderr = stderr.join('');
+      expect(combinedStderr).toContain('model');
+      expect(combinedStderr).toContain('forbidden');
+    });
+
+    it('stops a running attempt with matching recorded port at CLI level', async () => {
+      const spawnedCalls: Array<{ args: readonly string[]; env?: Record<string, string> }> = [];
+      const mockRunner: SubprocessRunner = async (_cmd, args, env) => {
+        spawnedCalls.push({ args, env });
+        return { exitCode: 0, stdout: 'Session aborted', stderr: '' };
+      };
+
+      const runtime = createFleetCliRuntime({
+        stateDir: tempDir,
+        runnerRemotePort: 4166,
+        runSubprocess: mockRunner,
+      });
+
+      const attemptId = 'att-running-1';
+      await runtime.execution.attemptRepository.saveAttempt({
+        id: attemptId,
+        workOrderId: 'wo-1',
+        kind: 'initial',
+        fixNumber: 0,
+        priorAttemptId: null,
+        worktreePath: tempDir,
+        baseCommit: 'commit-base',
+        state: 'running',
+        outcome: null,
+        briefDigest: 'digest-1',
+        briefPackagePath: '.lane/brief.md',
+        sessionId: 'ses-123',
+        completionReceipt: null,
+        artifacts: null,
+        runner: {
+          remotePort: 4166,
+          host: null,
+          agent: null,
+          model: 'model-a',
+          variant: null,
+        },
+        createdAtIso: '2026-10-15T00:00:00.000Z',
+        updatedAtIso: '2026-10-15T00:00:00.000Z',
+      });
+
+      const { io, stdout, stderr } = createMockIo();
+      const exitCode = await runCli(['attempt', 'stop', '--attemptId', attemptId], io, runtime);
+
+      expect(exitCode).toBe(0);
+      expect(stderr).toEqual([]);
+      expect(spawnedCalls).toHaveLength(1);
+      expect(spawnedCalls[0].args).toEqual(['--abort', '--dir', tempDir]);
+      expect(spawnedCalls[0].env?.OCM_REMOTE_PORT).toBe('4166');
+
+      const saved = await runtime.execution.attemptRepository.findAttemptById(attemptId);
+      expect(saved?.state).toBe('cancelled');
+      expect(saved?.outcome).toBe('stopped');
+      expect(saved?.completionReceipt?.authoritative).toBe(true);
+
+      const parsedStdout = JSON.parse(stdout.join(''));
+      expect(parsedStdout.outcome).toBe('terminated');
+    });
+  });
 });
+

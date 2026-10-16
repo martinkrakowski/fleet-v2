@@ -48,6 +48,17 @@ export class StopAttemptUseCase implements StopAttemptPort {
       return { outcome: 'refused', reason: 'Attempt not found or has no sessionId' };
     }
 
+    if (
+      attempt.state === 'collected' ||
+      attempt.state === 'cancelled' ||
+      (attempt.state === 'ended' && attempt.completionReceipt?.authoritative === true)
+    ) {
+      return {
+        outcome: 'refused',
+        reason: `Attempt ${attempt.id} is in terminal state '${attempt.state}' and cannot be stopped`,
+      };
+    }
+
     const nowIso = request.nowIso ?? new Date().toISOString();
 
     await appendJournalEntry(this.deps.journal, {
@@ -64,10 +75,12 @@ export class StopAttemptUseCase implements StopAttemptPort {
     const stopResult = await this.deps.runner.stopSession({
       attemptId: attempt.id,
       sessionId: attempt.sessionId,
+      worktreePath: attempt.worktreePath,
+      runner: attempt.runner,
       gracePeriodSeconds: request.gracePeriodSeconds ?? 10,
     });
 
-    if (stopResult.outcome === 'terminated') {
+    if (stopResult.outcome === 'terminated' && stopResult.receipt.authoritative === true) {
       const cancelled: AttemptRecord = {
         ...attempt,
         state: 'cancelled',
@@ -95,6 +108,20 @@ export class StopAttemptUseCase implements StopAttemptPort {
       };
     }
 
+    if (stopResult.outcome === 'refused') {
+      await appendJournalEntry(this.deps.journal, {
+        attemptId: attempt.id,
+        workOrderId: attempt.workOrderId,
+        action: 'stop',
+        baseCommit: attempt.baseCommit,
+        recordedAtIso: nowIso,
+        status: 'refused',
+        sessionId: attempt.sessionId,
+        detail: stopResult.reason,
+      });
+      return { outcome: 'refused', reason: stopResult.reason };
+    }
+
     if (stopResult.outcome === 'still-running') {
       // Capacity stays held until the session's actual end is established.
       await appendJournalEntry(this.deps.journal, {
@@ -112,6 +139,8 @@ export class StopAttemptUseCase implements StopAttemptPort {
 
     const reconciling: AttemptRecord = { ...attempt, state: 'reconciling', updatedAtIso: nowIso };
     await this.deps.attemptRepo.saveAttempt(reconciling);
+    const failureReason =
+      (stopResult as { reason?: string }).reason ?? 'Termination receipt was not authoritative';
     await appendJournalEntry(this.deps.journal, {
       attemptId: attempt.id,
       workOrderId: attempt.workOrderId,
@@ -120,9 +149,9 @@ export class StopAttemptUseCase implements StopAttemptPort {
       recordedAtIso: nowIso,
       status: 'ambiguous',
       sessionId: attempt.sessionId,
-      detail: stopResult.reason,
+      detail: failureReason,
     });
-    return { outcome: 'unknown', attempt: reconciling, reason: stopResult.reason };
+    return { outcome: 'unknown', attempt: reconciling, reason: failureReason };
   }
 
   async execute(input?: unknown): Promise<StopAttemptResult> {

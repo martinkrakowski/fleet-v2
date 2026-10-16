@@ -9,10 +9,12 @@ import { describe, expect, it } from 'vitest';
 import type {
   ActionJournalEntryRecord,
   AttemptRecord,
+  AttemptRunnerRecord,
   CapacityReservationRecord,
   CommandCompletionReceipt,
   WorkOrderRecord,
 } from '../../../domain/execution-records.js';
+import type { DispatchAttemptRequest } from '../../ports/in/DispatchAttemptPort.in-port.js';
 import type { AttemptArtifactPort } from '../../ports/out/AttemptArtifactPort.out-port.js';
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import type { BriefAuthoringPort } from '../../ports/out/BriefAuthoringPort.out-port.js';
@@ -880,6 +882,7 @@ function makeRunner(
     startResult?: StartRunnerSessionResult;
     inspectStatus?: RunnerSessionStatus;
     stopResult?: StopRunnerSessionResult;
+    describeRunner?: () => AttemptRunnerRecord | undefined;
     onStart?: () => void;
   } = {},
 ) {
@@ -897,6 +900,16 @@ function makeRunner(
   const stopCalls: StopSessionCall[] = [];
   const port: ExecutionRunnerPort = {
     describeCapabilities: () => capabilities,
+    describeRunner:
+      options.describeRunner !== undefined
+        ? options.describeRunner
+        : () => ({
+            remotePort: 4166,
+            host: null,
+            agent: null,
+            model: 'nvidia/z-ai/glm-5.3',
+            variant: 'default',
+          }),
     async startSession(request) {
       startCalls.push(request);
       options.onStart?.();
@@ -922,7 +935,12 @@ function makeRunner(
   return { port, capabilities, startCalls, inspectCalls, stopCalls };
 }
 
-function makeWorkspace(options: { inspection?: Partial<WorktreeInspection> } = {}) {
+function makeWorkspace(
+  options: {
+    inspection?: Partial<WorktreeInspection>;
+    readWorktreeFile?: (worktreePath: string, relativePath: string) => Promise<string | null>;
+  } = {},
+) {
   const calls: InspectWorktreeCall[] = [];
   const port: WorkspacePort = {
     async inspectWorktree(request) {
@@ -938,6 +956,17 @@ function makeWorkspace(options: { inspection?: Partial<WorktreeInspection> } = {
         ...options.inspection,
       };
     },
+    readWorktreeFile:
+      options.readWorktreeFile ??
+      (async () =>
+        JSON.stringify({
+          modelAssignment: {
+            model: 'nvidia/z-ai/glm-5.3',
+            agent: 'lane-agent',
+            variant: 'default',
+          },
+          independentReviewer: 'reviewer-model',
+        })),
   };
   return { port, calls };
 }
@@ -983,6 +1012,7 @@ function makeDispatchSetup(
     withReservation?: boolean;
     runnerOptions?: Parameters<typeof makeRunner>[0];
     workspaceInspection?: Partial<WorktreeInspection>;
+    workspaceOptions?: Parameters<typeof makeWorkspace>[0];
   } = {},
 ) {
   const workOrderRepo = makeWorkOrderRepo();
@@ -996,7 +1026,7 @@ function makeDispatchSetup(
     journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
   }
   const runner = makeRunner(options.runnerOptions);
-  const workspace = makeWorkspace({ inspection: options.workspaceInspection });
+  const workspace = makeWorkspace({ inspection: options.workspaceInspection, ...options.workspaceOptions });
   const observation = makeObservation();
   const useCase = new DispatchAttemptUseCase({
     workOrderRepo,
@@ -1214,6 +1244,70 @@ describe('DispatchAttemptUseCase', () => {
     expect(result.attempt.fixNumber).toBe(1);
     expect(result.attempt.priorAttemptId).toBe('attempt-0');
     expect(result.attempt.state).toBe('running');
+  });
+
+  it('refuses dispatch when request carries model, agent, variant, modelAssignment, runnerPort, remotePort, runnerHost, or host', async () => {
+    const setup = makeDispatchSetup();
+
+    const withModel = await setup.useCase.dispatchAttempt(
+      validDispatchRequest({ model: 'gpt-5' }) as unknown as DispatchAttemptRequest,
+    );
+    expect(withModel).toEqual({
+      outcome: 'refused',
+      reason: "'model' must not be specified; the seat is determined by the frozen brief manifest",
+    });
+
+    const withAgent = await setup.useCase.dispatchAttempt(
+      validDispatchRequest({ agent: 'my-agent' }) as unknown as DispatchAttemptRequest,
+    );
+    expect(withAgent).toEqual({
+      outcome: 'refused',
+      reason: "'agent' must not be specified; the seat is determined by the frozen brief manifest",
+    });
+
+    const withModelAssignment = await setup.useCase.dispatchAttempt(
+      validDispatchRequest({ modelAssignment: { model: 'gpt-5' } }) as unknown as DispatchAttemptRequest,
+    );
+    expect(withModelAssignment).toEqual({
+      outcome: 'refused',
+      reason: "'modelAssignment' must not be specified; the seat is determined by the frozen brief manifest",
+    });
+
+    for (const field of ['runnerPort', 'remotePort', 'runnerHost', 'host'] as const) {
+      const result = await setup.useCase.dispatchAttempt(
+        validDispatchRequest({ [field]: 'forbidden-val' }) as unknown as DispatchAttemptRequest,
+      );
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: `'${field}' must not be specified; the seat is determined by the frozen brief manifest`,
+      });
+    }
+  });
+
+  it('refuses dispatch when no runner port can be described', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: { describeRunner: () => undefined },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as unknown as DispatchAttemptRequest,
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'No runner port can be described for dispatch',
+    });
+  });
+
+  it('refuses dispatch when frozen brief manifest cannot be read through port', async () => {
+    const setup = makeDispatchSetup({
+      workspaceOptions: { readWorktreeFile: async () => null },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as unknown as DispatchAttemptRequest,
+    );
+    expect(result.outcome).toBe('refused');
+    expect((result as { reason: string }).reason).toContain('Unable to read frozen brief manifest');
   });
 });
 
@@ -1467,6 +1561,8 @@ describe('StopAttemptUseCase', () => {
       attemptId: 'attempt-1',
       sessionId: 'session-1',
       gracePeriodSeconds: 30,
+      worktreePath: '/lanes/attempt-1',
+      runner: undefined,
     });
   });
 
@@ -1528,6 +1624,37 @@ describe('StopAttemptUseCase', () => {
     expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('reconciling');
     expect(setup.journal.entries).toHaveLength(2);
     expect(setup.journal.entries[1]).toMatchObject({ action: 'stop', status: 'ambiguous' });
+  });
+
+  it('refuses to stop when runner stopSession returns refused without releasing capacity', async () => {
+    const setup = makeStopSetup({
+      stopResult: { outcome: 'refused', reason: 'Attempt has no recorded runner port' },
+    });
+
+    const result = await setup.useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Attempt has no recorded runner port',
+    });
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries).toHaveLength(2);
+    expect(setup.journal.entries[1]).toMatchObject({ action: 'stop', status: 'refused' });
+  });
+
+  it('does not save cancelled or release capacity when termination receipt is not authoritative', async () => {
+    const receipt = completionReceipt({ stoppedByRequest: true, authoritative: false });
+    const setup = makeStopSetup({
+      stopResult: { outcome: 'terminated', receipt },
+    });
+
+    const result = await setup.useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toMatchObject({
+      outcome: 'unknown',
+    });
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('reconciling');
   });
 });
 

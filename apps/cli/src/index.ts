@@ -12,6 +12,7 @@
 import { join, resolve } from 'node:path';
 
 import type {
+  AttemptSeatOverrideRecord,
   BriefContextDecision,
   BriefModelAssignment,
   CommandCompletionReceipt,
@@ -360,6 +361,23 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   },
   attempt: {
     dispatch: async (p, rt) => {
+      for (const field of [
+        'model',
+        'agent',
+        'variant',
+        'modelAssignment',
+        'runnerPort',
+        'remotePort',
+        'runnerHost',
+        'host',
+      ]) {
+        if (p[field] !== undefined) {
+          throw new CliUsageError(
+            `'${field}' is forbidden and must not be specified; the seat is determined by the frozen brief manifest`,
+          );
+        }
+      }
+
       const attemptId = str(p, 'attemptId');
       const existing = await rt.execution.attemptRepository.findAttemptById(attemptId);
       const worktreePath = str(p, 'worktreePath');
@@ -367,13 +385,50 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         ...STRICT_RUNNER_CAPABILITIES,
         ...(nested<Partial<RunnerIsolationCapabilities>>(p, 'requiredCapabilities') ?? {}),
       };
+
+      // Seat override from --seat-override and --override-reason
+      let seatOverride = nested<AttemptSeatOverrideRecord>(p, 'seatOverride');
+      const seatOverrideStr = optStr(p, 'seatOverride');
+      if (!seatOverride && seatOverrideStr) {
+        const colonIndex = seatOverrideStr.lastIndexOf(':');
+        let model = seatOverrideStr;
+        let variant: string | undefined;
+        if (colonIndex !== -1 && colonIndex > seatOverrideStr.indexOf('/')) {
+          model = seatOverrideStr.slice(0, colonIndex);
+          variant = seatOverrideStr.slice(colonIndex + 1);
+        }
+        const reason = str(p, 'overrideReason');
+        const setBy = str(p, 'overrideSetBy') || process.env.USER || 'operator';
+        const expiresAtIso =
+          optStr(p, 'overrideExpiresAt') ?? optStr(p, 'overrideExpiresAtIso') ?? '';
+        const agent = optStr(p, 'overrideAgent');
+        seatOverride = {
+          model,
+          ...(variant ? { variant } : {}),
+          ...(agent ? { agent } : {}),
+          reason,
+          setBy,
+          expiresAtIso,
+        };
+      } else if (seatOverride && !seatOverride.reason && optStr(p, 'overrideReason')) {
+        seatOverride = { ...seatOverride, reason: str(p, 'overrideReason') };
+      }
+
+      const reviewerSeat =
+        optStr(p, 'reviewerSeat') ??
+        optStr(p, 'reviewerModel') ??
+        existing?.reviewerSeat ??
+        undefined;
+
+      const briefPackagePath =
+        str(p, 'briefPackagePath') ||
+        (worktreePath === '' ? '' : join(worktreePath, '.lane', 'brief.md'));
+
       return rt.execution.dispatchAttempt.dispatchAttempt({
         attemptId,
         workOrderId: str(p, 'workOrderId') || existing?.workOrderId || '',
         worktreePath,
-        briefPackagePath:
-          str(p, 'briefPackagePath') ||
-          (worktreePath === '' ? '' : join(worktreePath, '.lane', 'brief.md')),
+        briefPackagePath,
         briefDigest: str(p, 'briefDigest') || existing?.briefDigest || '',
         baseCommit: str(p, 'baseCommit') || existing?.baseCommit || '',
         stepLimit: num(p, 'stepLimit', 200),
@@ -381,6 +436,8 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         expectedArtifacts: strArr(p, 'expectedArtifacts'),
         requiredCapabilities,
         nowIso: optStr(p, 'nowIso'),
+        seatOverride,
+        reviewerSeat,
       });
     },
     reconcile: async (p, rt) =>

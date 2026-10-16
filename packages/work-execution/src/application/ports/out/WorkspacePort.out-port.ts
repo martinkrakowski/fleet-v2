@@ -28,4 +28,7 @@ export interface WorktreeInspection {
 export interface WorkspacePort {
   /** Inspect the worktree as a typed record; part of readiness, once per prepared environment. */
   inspectWorktree(request: WorktreeInspectionRequest): Promise<WorktreeInspection>;
+
+  /** Read a text file from the worktree, locally or remotely. Returns null if missing. */
+  readWorktreeFile?(worktreePath: string, relativePath: string): Promise<string | null>;
 }

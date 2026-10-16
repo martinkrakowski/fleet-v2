@@ -173,4 +173,33 @@ export class WorkspaceAdapter implements WorkspacePort {
     ]);
     return stdout.trim() === '1';
   }
+
+  async readWorktreeFile(worktreePath: string, relativePath: string): Promise<string | null> {
+    if (this.options?.sshHost && !existsSync(worktreePath) && !isSafeSshHost(this.options.sshHost)) {
+      throw new Error(
+        `Unable to read file in ${worktreePath}: unsafe SSH host '${this.options.sshHost}'`,
+      );
+    }
+    const targetPath = path.isAbsolute(relativePath)
+      ? relativePath
+      : path.join(worktreePath, relativePath);
+    const sshHost = this.useRemote(worktreePath);
+    if (sshHost === null) {
+      try {
+        return await fs.readFile(targetPath, 'utf8');
+      } catch {
+        return null;
+      }
+    }
+    try {
+      const { stdout } = await execFileAsync('ssh', [
+        sshHost,
+        '--',
+        `cat ${posixQuote(targetPath)}`,
+      ]);
+      return stdout;
+    } catch {
+      return null;
+    }
+  }
 }

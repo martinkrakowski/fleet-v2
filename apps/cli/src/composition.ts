@@ -51,6 +51,7 @@ import {
   isSafeSshHost,
   observationEventKind,
   type GhInvocationResult,
+  type SubprocessRunner,
 } from '@fleet/work-execution';
 
 import {
@@ -122,6 +123,8 @@ export interface FleetCliRuntimeOptions {
   readonly worktreeSshHost?: string;
   /** Owner Ed25519 public key in base64 format for verifying approved decisions. */
   readonly ownerPublicKey?: string;
+  /** Deterministic subprocess execution for runner tests. */
+  readonly runSubprocess?: SubprocessRunner;
 }
 
 export interface ResolvedRunnerSettings {
@@ -413,9 +416,6 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // A blank env value is treated as absent rather than as "".
   const {
     worktreeSshHost,
-    runnerAgent,
-    runnerModel,
-    runnerVariant,
     runnerRemotePort,
     ocmRunBin,
     runnerRemoteHost,
@@ -575,13 +575,13 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // same directory the dispatch used.
   const runner = new ExecutionRunnerAdapter({
     ocmRunBin,
-    agent: runnerAgent,
-    model: runnerModel,
-    variant: runnerVariant,
     remotePort: runnerRemotePort,
     remoteHost: runnerRemoteHost,
+    runSubprocess: options?.runSubprocess,
     resolveWorktreePath: async (attemptId) =>
       (await attemptRepository.findAttemptById(attemptId))?.worktreePath ?? null,
+    resolveAttempt: async (attemptId) =>
+      await attemptRepository.findAttemptById(attemptId),
   });
   const attemptArtifact = new AttemptArtifactAdapter({ sshHost: worktreeSshHost });
   // Hand-written brief files arrive per request; no default prose is assumed.
@@ -924,6 +924,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       workspace,
       runner,
       observation: executionObservation,
+      artifactPort: attemptArtifact,
     }),
     reconcileAttempt: new ReconcileAttemptUseCase({
       attemptRepo: attemptRepository,

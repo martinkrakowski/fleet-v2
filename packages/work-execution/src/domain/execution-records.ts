@@ -50,6 +50,36 @@ export interface WorkOrderRecord {
 /** Fix rounds are fresh attempts; they never resume the prior conversation. */
 export type AttemptKind = 'initial' | 'fix';
 
+/** Runner session details recorded at dispatch time for port and host fidelity. */
+export interface AttemptRunnerRecord {
+  readonly remotePort: number;
+  readonly host: string | null;
+  readonly agent: string | null;
+  readonly model: string | null;
+  readonly variant: string | null;
+}
+
+/** Scoped operator seat override accepted at dispatch. */
+export interface AttemptSeatOverrideRecord {
+  readonly model: string;
+  readonly agent?: string;
+  readonly variant?: string;
+  readonly reason: string;
+  readonly setBy: string;
+  readonly expiresAtIso: string;
+}
+
+/**
+ * Strip provider prefix and variant suffix, returning the underlying model name/family
+ * for independent review and override separation checks.
+ */
+export function underlyingModelFamily(model: string): string {
+  const withoutVariant = model.split(/[#:]/)[0].trim().toLowerCase();
+  const segments = withoutVariant.split('/').filter((s) => s.length > 0);
+  if (segments.length === 0) return withoutVariant;
+  return segments[segments.length - 1];
+}
+
 /** Serializable record of one dispatch or one fresh fix session. */
 export interface AttemptRecord {
   readonly id: string;
@@ -66,6 +96,9 @@ export interface AttemptRecord {
   readonly sessionId: string | null;
   readonly completionReceipt: CommandCompletionReceipt | null;
   readonly artifacts: CollectedAttemptArtifacts | null;
+  readonly runner?: AttemptRunnerRecord | null;
+  readonly seatOverride?: AttemptSeatOverrideRecord | null;
+  readonly reviewerSeat?: string | null;
   readonly createdAtIso: string;
   readonly updatedAtIso: string;
 }

@@ -366,6 +366,7 @@ __metadata:
     "@fleet/brief-knowledge": "workspace:*"
     "@fleet/evidence-and-acceptance": "workspace:*"
     "@fleet/installation": "workspace:*"
+    "@fleet/onboarding": "workspace:*"
     "@fleet/operator-coordination": "workspace:*"
     "@fleet/work-execution": "workspace:*"
     eslint: "npm:^9.0.0"
@@ -401,7 +402,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@fleet/onboarding@workspace:packages/onboarding":
+"@fleet/onboarding@workspace:*, @fleet/onboarding@workspace:packages/onboarding":
   version: 0.0.0-use.local
   resolution: "@fleet/onboarding@workspace:packages/onboarding"
   dependencies:

@@ -5,6 +5,7 @@
  * bounded allow-listed procedure; model confidence is never evidence.
  */
 
+import { KnowledgeEntry } from '../../domain/entities/KnowledgeEntry.js';
 import type {
   KnowledgeCheckRecord,
   KnowledgeEntryRecord,
@@ -79,13 +80,18 @@ export class CheckKnowledgeClaimUseCase implements CheckKnowledgeClaimPort {
       checkedAtIso,
     };
 
-    const updated: KnowledgeEntryRecord = {
-      ...entry,
-      verification: verification.verification,
-      checks: [...entry.checks, check],
-      revision: entry.revision + 1,
-      updatedAtIso: checkedAtIso,
-    };
+    let updated: KnowledgeEntryRecord;
+    try {
+      const aggregate = KnowledgeEntry.fromRecord(entry);
+      aggregate.applyCheck(check);
+      updated = aggregate.toRecord();
+    } catch (error) {
+      return {
+        outcome: 'rejected',
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+
     await repo.saveEntry(updated);
 
     return { outcome: 'checked', entry: updated, check };

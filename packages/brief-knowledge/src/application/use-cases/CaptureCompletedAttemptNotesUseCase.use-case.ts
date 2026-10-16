@@ -7,6 +7,7 @@
  * lane end — this context never reads live worker files.
  */
 
+import { KnowledgeEntry } from '../../domain/entities/KnowledgeEntry.js';
 import type { KnowledgeEntryRecord } from '../../domain/knowledge-records.js';
 import type {
   CaptureCompletedAttemptNotesPort,
@@ -17,9 +18,6 @@ import type { KnowledgeEntryRepositoryPort } from '../ports/out/KnowledgeEntryRe
 
 /** Upper bound on candidate claims captured from one attempt's notes. */
 const MAX_CANDIDATE_ENTRIES = 50;
-
-/** Process-local sequence so repeated captures for one attempt stay unique. */
-let captureRunSequence = 0;
 
 export interface CaptureCompletedAttemptNotesDependencies {
   readonly repo: KnowledgeEntryRepositoryPort;
@@ -58,35 +56,60 @@ export class CaptureCompletedAttemptNotesUseCase implements CaptureCompletedAtte
       return { outcome: 'rejected', reason: 'CaptureCompletedAttemptNotes requires a non-empty headCommitSha' };
     }
 
+    const repo = this.deps.repo;
+
+    // Recapture of the same attempt is refused cleanly (typed), not a mid-loop throw.
+    const projectEntries = await repo.listEntriesByProject(request.projectId);
+    const alreadyCaptured = projectEntries.some((entry) => entry.sourceAttemptId === request.attemptId);
+    if (alreadyCaptured) {
+      return {
+        outcome: 'rejected',
+        reason: `Notes for attempt ${request.attemptId} have already been captured`,
+      };
+    }
+
     if (request.notesMarkdown === null || request.notesMarkdown.trim().length === 0) {
       return { outcome: 'captured', notesStatus: 'missing', candidateEntries: [] };
     }
 
-    const repo = this.deps.repo;
     const nowIso = request.nowIso ?? new Date().toISOString();
-    const runSequence = (captureRunSequence += 1);
     const claims = parseBulletClaims(request.notesMarkdown);
 
-    const candidateEntries: KnowledgeEntryRecord[] = claims.map((claimText, index) => ({
-      id: `ke-${request.attemptId}-${runSequence}-${index + 1}`,
-      version: '1.0.0',
-      projectId: request.projectId,
-      sourceAttemptId: request.attemptId,
-      sourceCommitSha: request.headCommitSha,
-      claimText,
-      pathPrefixes: request.pathPrefixes ? [...request.pathPrefixes] : [],
-      sharedAcrossProjects: false,
-      disposition: 'candidate',
-      verification: 'unverified',
-      checkerId: null,
-      dispositionReason: null,
-      supersededById: null,
-      checks: [],
-      reuses: [],
-      revision: 1,
-      createdAtIso: nowIso,
-      updatedAtIso: nowIso,
-    }));
+    // Entry IDs are derived deterministically from attemptId + 1-based note index.
+    // They are stable across restarts and distinct across attempts without a process counter.
+    const candidateEntries: KnowledgeEntryRecord[] = [];
+    for (let index = 0; index < claims.length; index++) {
+      const entryId = `ke-${request.attemptId}-${index + 1}`;
+      const existing = await repo.findEntryById(entryId);
+      if (existing) {
+        return {
+          outcome: 'rejected',
+          reason: `Knowledge entry already exists: ${entryId}`,
+        };
+      }
+      const rawRecord: KnowledgeEntryRecord = {
+        id: entryId,
+        version: '1.0.0',
+        projectId: request.projectId,
+        sourceAttemptId: request.attemptId,
+        sourceCommitSha: request.headCommitSha,
+        claimText: claims[index],
+        pathPrefixes: request.pathPrefixes ? [...request.pathPrefixes] : [],
+        sharedAcrossProjects: false,
+        disposition: 'candidate',
+        verification: 'unverified',
+        checkerId: null,
+        dispositionReason: null,
+        supersededById: null,
+        checks: [],
+        reuses: [],
+        revision: 1,
+        createdAtIso: nowIso,
+        updatedAtIso: nowIso,
+      };
+      const validated = KnowledgeEntry.fromRecord(rawRecord);
+      candidateEntries.push(validated.toRecord());
+    }
 
     for (const entry of candidateEntries) {
       await repo.saveEntry(entry);

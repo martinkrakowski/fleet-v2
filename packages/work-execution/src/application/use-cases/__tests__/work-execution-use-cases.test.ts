@@ -817,8 +817,20 @@ describe('PrepareBriefPackageUseCase', () => {
     const expectedSelection = {
       attemptId: 'attempt-1',
       selections: [
-        { proposalId: 'p-1', knowledgeEntryId: 'ke-1', version: 'v1', accepted: true },
-        { proposalId: 'p-2', knowledgeEntryId: 'ke-2', version: 'v2', accepted: false },
+        {
+          proposalId: 'p-1',
+          knowledgeEntryId: 'ke-1',
+          version: 'v1',
+          accepted: true,
+          decisionBecause: 'applicable to this lane',
+        },
+        {
+          proposalId: 'p-2',
+          knowledgeEntryId: 'ke-2',
+          version: 'v2',
+          accepted: false,
+          decisionBecause: 'out of scope for this lane',
+        },
       ],
     };
     expect(knowledge.selectionCalls).toEqual([expectedSelection, expectedSelection]);

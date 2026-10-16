@@ -86,7 +86,7 @@ describe('GROK_TOOL', () => {
       needsAllowRules: false,
       headless: true,
     });
-    expect(GROK_TOOL.invocation.argvTemplate).toEqual([
+    expect(GROK_TOOL.invocation?.argvTemplate).toEqual([
       'grok',
       '-m',
       '{model}',

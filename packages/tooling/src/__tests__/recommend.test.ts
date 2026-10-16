@@ -22,12 +22,14 @@ function expectValidCatalogue(input: {
   models: ModelsByTool;
   policy?: PolicySection;
   allowedRoutes?: readonly AllowedRouteRule[];
+  allAgyHostsFull?: boolean;
 }) {
   const result = recommendSeats({
     tools: input.tools,
     models: input.models,
     policy: input.policy ?? NO_POLICY,
     ...(input.allowedRoutes === undefined ? {} : { allowedRoutes: input.allowedRoutes }),
+    ...(input.allAgyHostsFull === undefined ? {} : { allAgyHostsFull: input.allAgyHostsFull }),
   });
   expect(result.outcome).toBe('catalogue');
   if (result.outcome !== 'catalogue') {
@@ -381,6 +383,42 @@ describe('recommendSeats', () => {
       const seat = result.seats.find((entry) => entry.id === 'opencode-nvidia-z-ai-glm-5.3-none');
       expect(seat?.variant).toBe('none');
       expect(seat?.model).toBe('nvidia/z-ai/glm-5.3');
+    });
+  });
+
+  describe('table: an agy seat follows the runner mode (D7)', () => {
+    const tools = [tool('opencode'), tool('agy'), tool('grok')];
+    const models: ModelsByTool = {
+      opencode: [model('nvidia/z-ai/glm-5.3', 'free')],
+      agy: [model('future-model-9', 'free')],
+      grok: [model('gemini-3.1-pro')],
+    };
+
+    it('treats an agy seat as edit-only by default, and says so on its reason line', () => {
+      const result = expectValidCatalogue({ tools, models });
+      const agySeat = result.seats.find((seat) => seat.id === 'agy-future-model-9');
+      expect(agySeat?.roles).toEqual(['implementer']);
+      expect(result.reasons['agy-future-model-9']).toContain(
+        'agy seat treated edit-only (default): the orchestrator runs its checks and commits',
+      );
+    });
+
+    it('treats an agy seat as full only when told every agy host is full', () => {
+      const result = expectValidCatalogue({ tools, models, allAgyHostsFull: true });
+      expect(result.reasons['agy-future-model-9']).toContain(
+        'agy seat treated full: every agy lane-runner host is full',
+      );
+    });
+
+    it('an explicit allAgyHostsFull: false is the default treatment', () => {
+      const omitted = recommendSeats({ tools, models, policy: NO_POLICY });
+      const explicitFalse = recommendSeats({
+        tools,
+        models,
+        policy: NO_POLICY,
+        allAgyHostsFull: false,
+      });
+      expect(explicitFalse).toEqual(omitted);
     });
   });
 

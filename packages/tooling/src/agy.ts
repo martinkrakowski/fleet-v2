@@ -1,5 +1,12 @@
 import { interpretAccountSignIn } from './sign-in.js';
-import type { ModelListResult, ToolDescriptor, ToolModel } from './types.js';
+import type {
+  AgyMode,
+  ModelListResult,
+  ToolCapabilities,
+  ToolDescriptor,
+  ToolInvocationSpec,
+  ToolModel,
+} from './types.js';
 
 const TABLE_HEADER: readonly string[] = ['ID', 'PROVIDER', 'VARIANTS'];
 
@@ -64,9 +71,79 @@ function parseAgyModels(output: string): ModelListResult {
 }
 
 /**
- * agy is an orchestrator CLI that edits files but cannot run shell
- * commands: an edit-only seat whose checks and commits the orchestrator
- * performs. It drives providers of every cost class, so `mixed`.
+ * agy's two fixed invocations, one per runner mode (plan D7). The flag
+ * names are verified against `agy --help` (2026-10-16): `--print <prompt>`,
+ * `--model <id>`, `--output-format json`, `--mode accept-edits|auto` and,
+ * for `full` only, `--dangerously-skip-permissions`. There is no `agy run`
+ * subcommand and no `--variant` flag, and no other flag is ever passed:
+ * each template is the whole argv, placeholder substitution aside.
+ */
+const AGY_INVOCATION_BY_MODE: Readonly<Record<AgyMode, ToolInvocationSpec>> = {
+  'edit-only': {
+    argvTemplate: [
+      'agy',
+      '--print',
+      '{prompt}',
+      '--model',
+      '{model}',
+      '--output-format',
+      'json',
+      '--mode',
+      'accept-edits',
+    ],
+  },
+  full: {
+    argvTemplate: [
+      'agy',
+      '--print',
+      '{prompt}',
+      '--model',
+      '{model}',
+      '--output-format',
+      'json',
+      '--mode',
+      'auto',
+      '--dangerously-skip-permissions',
+    ],
+  },
+};
+
+/**
+ * agy's capabilities follow the mode (plan D7). An `edit-only` seat edits
+ * files but cannot run shell commands: the orchestrator runs the lane's
+ * checks and commits. A `full` seat runs commands, like an opencode lane.
+ * Both run headless, and both need allow rules: headless agy denies tools
+ * outside its allow-list until the seat's configuration grants them.
+ */
+const AGY_CAPABILITIES_BY_MODE: Readonly<Record<AgyMode, ToolCapabilities>> = {
+  'edit-only': {
+    canRunCommands: false,
+    readOnlyMode: false,
+    needsAllowRules: true,
+    headless: true,
+  },
+  full: {
+    canRunCommands: true,
+    readOnlyMode: false,
+    needsAllowRules: true,
+    headless: true,
+  },
+};
+
+/**
+ * The capabilities of a seat on agy under one runner mode (plan D7). Every
+ * consumer — the recommender, the seat checks, dispatch — resolves agy's
+ * capabilities through this helper, never through a modeless assumption.
+ */
+export function agyCapabilitiesFor(mode: AgyMode): ToolCapabilities {
+  return AGY_CAPABILITIES_BY_MODE[mode];
+}
+
+/**
+ * agy is an orchestrator CLI run headless in one of two modes (plan D7):
+ * `edit-only` (the default) edits files but cannot run shell commands,
+ * while `full` runs commands like an opencode lane. It drives providers of
+ * every cost class, so `mixed`.
  */
 export const AGY_TOOL: ToolDescriptor = {
   id: 'agy',
@@ -80,14 +157,9 @@ export const AGY_TOOL: ToolDescriptor = {
     argv: ['agy', 'models'],
     parse: parseAgyModels,
   },
-  capabilities: {
-    canRunCommands: false,
-    readOnlyMode: false,
-    needsAllowRules: false,
-    headless: true,
-  },
-  invocation: {
-    argvTemplate: ['agy', 'run', '-m', '{model}', '--variant', '{variant}', '{prompt}'],
-  },
+  // Conservative default: with no mode resolved, an agy seat is edit-only.
+  capabilities: AGY_CAPABILITIES_BY_MODE['edit-only'],
+  capabilitiesByMode: AGY_CAPABILITIES_BY_MODE,
+  invocationByMode: AGY_INVOCATION_BY_MODE,
   costSource: 'mixed',
 };

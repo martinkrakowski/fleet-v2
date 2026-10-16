@@ -124,7 +124,7 @@ describe('OPENCODE_TOOL', () => {
       needsAllowRules: false,
       headless: true,
     });
-    expect(OPENCODE_TOOL.invocation.argvTemplate).toEqual([
+    expect(OPENCODE_TOOL.invocation?.argvTemplate).toEqual([
       'opencode',
       'run',
       '-m',

@@ -104,6 +104,15 @@ function serializeHost(host: HostSection): Record<string, unknown> {
     if (host.runner.maxLanes !== undefined) {
       runner.maxLanes = host.runner.maxLanes;
     }
+    if (host.runner.kind === 'agy') {
+      runner.agyMode = host.runner.agyMode;
+      if (host.runner.agyAcknowledgement !== undefined) {
+        runner.agyAcknowledgement = {
+          textVersion: host.runner.agyAcknowledgement.textVersion,
+          acceptedAt: host.runner.agyAcknowledgement.acceptedAt,
+        };
+      }
+    }
     out.runner = runner;
   }
   return out;

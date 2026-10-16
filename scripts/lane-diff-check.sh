@@ -52,12 +52,30 @@ fi
 T=$(mktemp -d "${TMPDIR:-/tmp}/lane-diff-check.XXXXXX") || exit 2
 trap 'rm -rf "$T"' EXIT
 
-# The files under review: committed since base, changed in the working tree, and untracked (not ignored).
-{
-  if [ -n "$base" ]; then git diff --name-only "$base...HEAD" 2>/dev/null || git diff --name-only "$base" HEAD; fi
-  git diff --name-only HEAD
-  git ls-files --others --exclude-standard
-} | grep -v '^$' | sort -u > "$T/files"
+# The files under review: committed since base, changed in the working tree or index, and untracked (not
+# ignored). Renames are split into delete + add so a protected source path is seen; names are taken
+# NUL-delimited and unquoted so unusual names are scanned as the real file. Any collection failure fails
+# closed (exit 2).
+g() { git -c core.quotePath=false "$@"; }
+collect() {
+  if git rev-parse --verify -q HEAD >/dev/null; then
+    if [ -n "$base" ]; then
+      g diff --no-renames --name-only -z "$base...HEAD" 2>/dev/null || g diff --no-renames --name-only -z "$base" HEAD || return 1
+    fi
+    g diff --no-renames --name-only -z HEAD || return 1
+  else
+    # Unborn HEAD: everything staged is new.
+    g diff --cached --no-renames --name-only -z || return 1
+  fi
+  g ls-files --others --exclude-standard -z || return 1
+}
+collect > "$T/files0" || { echo "lane-diff-check: could not list changed files" >&2; exit 2; }
+# A file name containing a newline cannot be reviewed line by line: refuse.
+if [ "$(tr -cd '\n' < "$T/files0" | wc -c | tr -d ' ')" != 0 ]; then
+  echo "lane-diff-check: a changed file name contains a newline; refusing" >&2
+  exit 2
+fi
+tr '\0' '\n' < "$T/files0" | grep -v '^$' | sort -u > "$T/files"
 
 say() { [ "$quiet" = 1 ] || echo "$@"; }
 findings=0
@@ -107,7 +125,11 @@ while IFS= read -r f; do
 done < "$T/files"
 
 if [ -n "$brief" ]; then
-  grep -oE '(packages|apps|docs|bin|scripts|tests|deploy|installation)[A-Za-z0-9_./-]*' "$brief" | sed 's/[.,:;)]*$//' | sort -u > "$T/brief-paths"
+  {
+    grep -oE '(packages|apps|docs|bin|scripts|tests|deploy|installation)[A-Za-z0-9_./-]*' "$brief"
+    # Root-level files named in the brief, e.g. README.md or tsconfig.json.
+    grep -oE '(^|[^A-Za-z0-9_./-])[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(md|json|ts|tsx|js|mjs|cjs|yml|yaml|txt|sh|toml)([^A-Za-z0-9_./-]|$)' "$brief" | sed 's/^[^A-Za-z0-9_]*//; s/[^A-Za-z0-9]*$//'
+  } | sed 's/[.,:;)]*$//' | sort -u > "$T/brief-paths"
   while IFS= read -r f; do
     hit=0
     while IFS= read -r p; do

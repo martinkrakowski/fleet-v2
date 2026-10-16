@@ -85,6 +85,23 @@ check '--strict-brief makes it a finding (1)' '[ "$(rc)" = 1 ] && grep -q "^outs
 run "$R" --base base --brief .lane/brief.md --quiet
 check '--quiet prints nothing' '[ ! -s "$T/o" ]'
 
+rm -rf docs apps/cli
+
+echo '# review fixes'
+git mv .github/workflows/gate.yml packages/x/gate.yml
+run "$R" --base base; check 'a staged rename away from a protected path is a finding' '[ "$(rc)" = 1 ] && grep -q "^protected: .github/workflows/gate.yml" "$T/o"'
+git mv packages/x/gate.yml .github/workflows/gate.yml
+odd="packages/x/src/caf\303\251 file.ts"; odd=$(printf "$odd")
+printf 'const t = "%s";\n' "$tok" > "$odd"
+run "$R" --base base; check 'a non-ASCII file name is scanned as the real file' '[ "$(rc)" = 1 ] && grep -q "(github-token)" "$T/o"'
+rm -f "$odd"
+printf '# brief\n\nUpdate README.md only.\n' > .lane/brief2.md
+echo r > README.md
+run "$R" --base base --brief .lane/brief2.md --strict-brief; check 'a root-level file the brief names is in scope' '! grep -q "outside-brief.*README.md" "$T/o"'
+rm -f README.md
+U=$T/unborn; mkdir -p "$U/.github" && ( cd "$U" && git init -q . && echo x > .github/w.yml && git add .github/w.yml )
+run "$U"; check 'a staged protected file before the first commit is a finding' '[ "$(rc)" = 1 ] && grep -q "^protected: .github/w.yml" "$T/o"'
+
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"
 [ "$fails" = 0 ]

@@ -153,6 +153,8 @@ generator:
       RelayTransportPort: operator-coordination
       ProjectProfileRepositoryAdapter: operator-coordination
       CoordinationRequestRepositoryAdapter: operator-coordination
+      OwnerQuestionRepositoryPort: operator-coordination
+      OwnerQuestionRepositoryAdapter: operator-coordination
       DecisionTransportAdapter: operator-coordination
       ObservationPublicationAdapter: operator-coordination
       AttentionReadAdapter: operator-coordination

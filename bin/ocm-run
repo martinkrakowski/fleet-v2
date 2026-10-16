@@ -399,6 +399,9 @@ trap 'ocm_stop 143' TERM
 trap 'ocm_stop 129' HUP
 
 if [ "$api" = v2 ]; then
+  case "$model:$variant" in
+    nvidia/*:low) variant=none ;;
+  esac
   skip=''
   fold=''
   for arg do
@@ -424,14 +427,14 @@ if [ "$api" = v2 ]; then
         if [ "$has_variant" = 1 ]; then
           fold=1
         fi
-        set -- "$@" "$arg"
+        set -- "$@" "-m"
         continue
         ;;
       --model=*)
         if [ "$has_variant" = 1 ]; then
-          set -- "$@" "$arg#$variant"
+          set -- "$@" "-m" "${arg#--model=}#$variant"
         else
-          set -- "$@" "$arg"
+          set -- "$@" "-m" "${arg#--model=}"
         fi
         continue
         ;;

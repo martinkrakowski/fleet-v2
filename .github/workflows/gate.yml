@@ -41,3 +41,5 @@ jobs:
         run: yarn test
       - name: yarn sync:check
         run: yarn sync:check
+      - name: ocm-run tests
+        run: sh tests/ocm-run.test.sh

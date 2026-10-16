@@ -1,10 +1,12 @@
-// Implemented for lane bk-usecases-adapters (migration step 6).
+// Implemented for lane bk-usecases-adapters (migration step 6); updated for shelf transport fallback.
 /**
  * KeeperPublicationAdapter implements KeeperPublicationPort: attributed
  * keeper entries go to an injected publish callback or an optional local
- * shelf file (`keepers-shelf.json`) under stateDir. Failed delivery is
- * returned for reconciliation — a shelf failure never throws and never
- * rejects otherwise acceptable work.
+ * shelf file (`keepers-shelf.json`) under stateDir. When an injected publish
+ * callback fails or throws and fallbackToShelfFile is enabled, entries are
+ * also appended to stateDir/keepers-shelf.json for reconciliation. Failed
+ * delivery is returned for reconciliation — publication never throws and
+ * never rejects otherwise acceptable work.
  */
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -23,10 +25,12 @@ export type KeeperPublicationCallback = (
 ) => Promise<PublishKeeperToShelfResult> | PublishKeeperToShelfResult;
 
 export interface KeeperPublicationAdapterDependencies {
-  /** Injected publication procedure; when present it fully owns delivery. */
+  /** Injected publication procedure; when present it fully owns delivery unless fallbackToShelfFile is enabled. */
   readonly publish?: KeeperPublicationCallback;
-  /** When set (and no callback is injected), keepers append to stateDir/keepers-shelf.json. */
+  /** When set (and no callback is injected, or fallbackToShelfFile is enabled on failure), keepers append to stateDir/keepers-shelf.json. */
   readonly stateDir?: string;
+  /** When true and publish fails or throws, append the entry to stateDir/keepers-shelf.json for reconciliation. */
+  readonly fallbackToShelfFile?: boolean;
 }
 
 export class KeeperPublicationAdapter implements KeeperPublicationPort {
@@ -41,7 +45,35 @@ export class KeeperPublicationAdapter implements KeeperPublicationPort {
     }
 
     if (this.deps?.publish) {
-      return await this.deps.publish(request);
+      let result: PublishKeeperToShelfResult;
+      try {
+        result = await this.deps.publish(request);
+      } catch (error) {
+        result = {
+          outcome: 'failed',
+          reason: errorMessage(error),
+        };
+      }
+
+      if (
+        result.outcome === 'failed' &&
+        this.deps.fallbackToShelfFile &&
+        this.deps.stateDir
+      ) {
+        const shelfResult = await this.appendEntryToShelf(this.deps.stateDir, request.entry);
+        if (shelfResult.ok) {
+          return {
+            outcome: 'failed',
+            reason: `${result.reason}; kept in ${SHELF_FILE} for reconciliation`,
+          };
+        }
+        return {
+          outcome: 'failed',
+          reason: `${result.reason}; shelf fallback failed: ${shelfResult.reason}`,
+        };
+      }
+
+      return result;
     }
 
     const stateDir = this.deps?.stateDir;
@@ -52,19 +84,33 @@ export class KeeperPublicationAdapter implements KeeperPublicationPort {
       };
     }
 
+    const shelfResult = await this.appendEntryToShelf(stateDir, request.entry);
+    if (!shelfResult.ok) {
+      return {
+        outcome: 'failed',
+        reason: shelfResult.reason,
+      };
+    }
+    return { outcome: 'published', externalRef: `${SHELF_FILE}#${request.entry.id}` };
+  }
+
+  private async appendEntryToShelf(
+    stateDir: string,
+    entry: KnowledgeEntryRecord,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
     const shelfPath = join(stateDir, SHELF_FILE);
     try {
       const keepers = await readShelf(shelfPath);
       if (typeof keepers === 'string') {
-        return { outcome: 'failed', reason: keepers };
+        return { ok: false, reason: keepers };
       }
-      keepers.push(request.entry);
+      keepers.push(entry);
       await mkdir(stateDir, { recursive: true });
       await writeFile(shelfPath, `${JSON.stringify(keepers, null, 2)}\n`, 'utf8');
-      return { outcome: 'published', externalRef: `${SHELF_FILE}#${request.entry.id}` };
+      return { ok: true };
     } catch (error) {
       return {
-        outcome: 'failed',
+        ok: false,
         reason: `Keeper shelf write failed for ${shelfPath}: ${errorMessage(error)}`,
       };
     }

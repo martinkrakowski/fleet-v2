@@ -15,6 +15,7 @@
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { SECRET_PATTERNS } from '@fleet/shared';
 import type { KnowledgeEntryRecord } from '../../domain/knowledge-records.js';
 import type {
   KeeperPublicationPort,
@@ -24,14 +25,8 @@ import type {
 
 const SHELF_FILE = 'keepers-shelf.json';
 
-export const SECRET_PATTERNS: readonly RegExp[] = [
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
-  /\bsk-[A-Za-z0-9_-]{20,}\b/,
-  /\bAKIA[0-9A-Z]{16}\b/,
-  /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/,
-  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/,
-];
+// SECRET_PATTERNS moved to the shared kernel (lane Q0); re-exported for compatibility.
+export { SECRET_PATTERNS } from '@fleet/shared';
 
 export type KeeperPublicationCallback = (
   request: PublishKeeperToShelfRequest,

@@ -254,7 +254,14 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   const ownerPublicKey = options?.ownerPublicKey;
   const installation = options?.installation;
   const operator = createConfiguredOperatorComposition({ stateDir, ownerPublicKey });
-  const knowledge = createConfiguredKnowledgeComposition({ stateDir });
+  const knowledge = createConfiguredKnowledgeComposition({
+    stateDir,
+    // The installation's v2 decisions block only (D3); v1 files never carry
+    // one, so a v1 installation keeps today's deterministic retrieval.
+    ...(installation?.decisions !== undefined
+      ? { decisions: installation.decisions }
+      : {}),
+  });
   // The attempt lookup below is filled in once the work composition exists;
   // the evidence delegates only run at assessment time.
   const attemptLookup: { inspectAttempt?: InspectAttemptUseCase } = {};

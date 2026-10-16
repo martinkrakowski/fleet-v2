@@ -12,6 +12,13 @@
 /** Identifiers of the product-shipped tool descriptors. */
 export type ToolId = 'claude-code' | 'opencode' | 'grok' | 'agy';
 
+/**
+ * The two modes an agy lane-runner host can declare (plan D7):
+ * `edit-only`, where the orchestrator runs the lane's checks and commits,
+ * and `full`, where the lane runs them itself, like an opencode lane.
+ */
+export type AgyMode = 'edit-only' | 'full';
+
 /** Outcome of a sign-in probe. */
 export type SignInStatus = 'signed-in' | 'signed-out' | 'unknown';
 
@@ -113,6 +120,27 @@ export interface ToolDescriptor {
   readonly signIn: ToolSignInSpec;
   readonly models: ToolModelsSpec;
   readonly capabilities: ToolCapabilities;
+  /**
+   * Capability sets keyed by runner mode, for a tool whose capabilities
+   * follow the mode (agy, plan D7). When present, `capabilities` holds the
+   * conservative default (the `edit-only` set) and consumers resolve the
+   * set for the selected host's mode; they never fall back to a modeless
+   * assumption. Absent on tools with one fixed capability set.
+   */
+  readonly capabilitiesByMode?: Readonly<Record<AgyMode, ToolCapabilities>>;
+  /**
+   * How a seat on this tool is invoked by default. For a tool with
+   * mode-keyed invocations (`invocationByMode`) this is the most
+   * restrictive mode's template (agy: `edit-only`), so a caller that knows
+   * no mode can never reach a broader one.
+   */
   readonly invocation: ToolInvocationSpec;
+  /**
+   * Invocation templates keyed by runner mode, for a tool whose argv
+   * follows the mode (agy, plan D7). Each template is fixed data: the
+   * flags are pinned by a descriptor test and no other flag is ever
+   * passed.
+   */
+  readonly invocationByMode?: Readonly<Record<AgyMode, ToolInvocationSpec>>;
   readonly costSource: ToolCostSource;
 }

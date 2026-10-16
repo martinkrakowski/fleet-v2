@@ -68,6 +68,10 @@ export class ForgeActionAdapter implements ForgeActionPort {
     this.delegate = delegate;
   }
 
+  isConfigured(): boolean {
+    return this.delegate !== undefined && this.delegate.runGh !== undefined;
+  }
+
   async performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult> {
     const runGh = this.delegate?.runGh;
     if (!runGh) {

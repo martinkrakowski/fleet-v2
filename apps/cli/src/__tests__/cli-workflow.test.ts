@@ -866,6 +866,7 @@ describe('Fleet CLI workflow', () => {
         consumptionId: 'consumption-direct-1',
         grantId: 'grant-2',
         actionId: 'action-direct-1',
+        actionKind: 'push-and-open-pr',
         attemptId: ATTEMPT_ID,
         expectedHeadSha: laneHead,
       }),

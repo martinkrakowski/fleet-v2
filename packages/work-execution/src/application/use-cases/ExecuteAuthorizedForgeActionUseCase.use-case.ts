@@ -47,9 +47,6 @@ export interface ExecuteAuthorizedForgeActionDependencies {
 }
 
 export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedForgeActionPort {
-  /** Monotonic per-instance sequence keeping journal entry ids unique. */
-  private journalSequence = 0;
-
   constructor(private readonly deps?: ExecuteAuthorizedForgeActionDependencies) {}
 
   async executeAuthorizedForgeAction(
@@ -87,9 +84,19 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       };
     }
 
+    if (typeof deps.forgePort.isConfigured === 'function' && !deps.forgePort.isConfigured()) {
+      return {
+        outcome: 'refused',
+        reason: 'unavailable',
+      };
+    }
+
     const authorization = await deps.authorizationPort.consumeActionAuthorization({
       authorizationGrantId: request.authorizationGrantId,
       actionId: request.actionId,
+      actionKind: request.kind,
+      expectedHeadSha: request.expectedHeadSha,
+      attemptId: request.attemptId,
     });
     if (authorization.outcome !== 'consumed') {
       await this.appendJournal(deps, request, attempt, 'refused', authorization.reason);
@@ -181,8 +188,10 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     status: ActionJournalEntryRecord['status'],
     detail: string | null,
   ): Promise<void> {
+    const priorEntries = await deps.journal.listJournalEntriesForAttempt(request.attemptId);
+    const sequence = priorEntries.length + 1;
     const entry: ActionJournalEntryRecord = {
-      id: `forge:${request.actionId}:${status}:${++this.journalSequence}`,
+      id: `forge:${request.actionId}:${status}:${sequence}`,
       attemptId: request.attemptId,
       workOrderId: request.workOrderId,
       action: 'forge',

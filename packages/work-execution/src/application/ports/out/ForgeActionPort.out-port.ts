@@ -23,4 +23,7 @@ export type ForgeActionResult =
 export interface ForgeActionPort {
   /** Perform one forge action only against the expected head. */
   performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult>;
+
+  /** Report whether this forge port has an underlying execution delegate configured. */
+  isConfigured(): boolean;
 }

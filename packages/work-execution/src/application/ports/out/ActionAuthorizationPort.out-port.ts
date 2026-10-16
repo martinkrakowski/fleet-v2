@@ -24,6 +24,9 @@ export type ResolveActionAuthorizationResult =
 export interface ConsumeActionAuthorizationRequest {
   readonly authorizationGrantId: string;
   readonly actionId: string;
+  readonly actionKind: 'push-and-open-pr' | 'merge-pr';
+  readonly expectedHeadSha: string;
+  readonly attemptId: string;
 }
 
 export type ConsumeActionAuthorizationResult =

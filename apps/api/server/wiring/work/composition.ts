@@ -279,7 +279,6 @@ export function createConfiguredWorkComposition(
       workOrderRepo,
       acceptancePort,
       artifactPort,
-      workspace,
     }),
     executeAuthorizedForgeAction: new ExecuteAuthorizedForgeActionUseCase({
       attemptRepo,
@@ -302,7 +301,7 @@ export function createConfiguredWorkComposition(
       if (attempt === null) {
         return { outcome: "unknown", reason: `Attempt not found: '${attemptId}'` };
       }
-      return resolveImplementerSeat(attempt, { artifactPort, workspace });
+      return resolveImplementerSeat(attempt, { artifactPort });
     },
   };
 }

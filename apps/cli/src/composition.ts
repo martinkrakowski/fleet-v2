@@ -1022,7 +1022,6 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       workOrderRepo: workOrderRepository,
       acceptancePort: acceptanceAssessment,
       artifactPort: attemptArtifact,
-      workspace,
     }),
     executeAuthorizedForgeAction: new ExecuteAuthorizedForgeActionUseCase({
       attemptRepo: attemptRepository,

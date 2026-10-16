@@ -8,8 +8,10 @@
  * differ from the implementer's (a provider prefix alone is insufficient).
  * The implementer is the attempt's own recorded seat — the runner model
  * dispatch wrote, or failing that the frozen brief manifest's model
- * assignment. There is no default seat: an attempt whose seat is unknown is
- * refused, never compared against an assumed model.
+ * assignment read through the artifact port. There is no default seat and no
+ * worktree-file fallback: an attempt whose seat is unknown is refused, never
+ * compared against an assumed model, and a model is never read from a file
+ * inside the worker's worktree.
  * The evidence context's exact-head assessment is consumed through
  * AcceptanceAssessmentPort; a receipt for any other head is never propagated
  * as an acceptance of the requested one.
@@ -28,7 +30,6 @@ import type { AcceptanceAssessmentPort } from '../ports/out/AcceptanceAssessment
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
-import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
 import type { AttemptRecord, WorkOrderRecord } from '../../domain/execution-records.js';
 import { WorkOrder } from '../../domain/entities/WorkOrder.js';
 
@@ -45,10 +46,12 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-/** Ports that can read the frozen brief manifest; neither is assumed present. */
+/**
+ * Ports that can read the frozen brief manifest; the artifact port reads the
+ * product's frozen brief package, and is not assumed present.
+ */
 export interface ImplementerSeatPorts {
   readonly artifactPort?: Pick<AttemptArtifactPort, 'readBriefManifest'>;
-  readonly workspace?: Pick<WorkspacePort, 'readWorktreeFile'>;
 }
 
 /** The seat an attempt was implemented on, and the record that established it. */
@@ -63,9 +66,11 @@ export type ImplementerSeatResolution =
 /**
  * Read `modelAssignment.model` from the attempt's frozen brief manifest. The
  * candidate paths are derived from the dispatch-recorded brief package path
- * only: a worker-writable worktree file is never a seat authority, so a
- * legacy attempt without a recorded runner model stays `unknown`. An
- * unreadable or non-JSON candidate is absence, not an error.
+ * only, and the manifest is read only through the artifact port, which reads
+ * the product's frozen brief package: a worker-writable worktree file is
+ * never a seat authority, so an attempt without a recorded runner model and
+ * without a wired artifact port stays `unknown` and is refused. An unreadable
+ * or non-JSON candidate is absence, not an error.
  */
 async function readFrozenManifestModel(
   attempt: AttemptRecord,
@@ -84,9 +89,7 @@ async function readFrozenManifestModel(
     try {
       raw = ports.artifactPort?.readBriefManifest
         ? await ports.artifactPort.readBriefManifest(attempt.worktreePath, candidate)
-        : ports.workspace?.readWorktreeFile
-          ? await ports.workspace.readWorktreeFile(attempt.worktreePath, candidate)
-          : null;
+        : null;
     } catch {
       continue;
     }
@@ -113,9 +116,9 @@ async function readFrozenManifestModel(
 /**
  * Bind an attempt to the seat that implemented it: the runner model dispatch
  * recorded on the attempt, otherwise the frozen brief manifest's model
- * assignment read through the dispatch-recorded brief package path. Neither
- * known is `unknown`, never an assumed default seat, and a legacy attempt
- * with no recorded runner model is refused.
+ * assignment read through the artifact port. Neither known is `unknown`,
+ * never an assumed default seat, and an attempt with no recorded runner model
+ * and no wired artifact port is refused.
  */
 export async function resolveImplementerSeat(
   attempt: AttemptRecord,
@@ -148,8 +151,6 @@ export interface RequestAttemptAcceptanceDependencies {
   readonly acceptancePort: AcceptanceAssessmentPort;
   /** Reads the frozen brief manifest when the attempt records no runner seat. */
   readonly artifactPort?: Pick<AttemptArtifactPort, 'readBriefManifest'>;
-  /** Fallback reader for the frozen brief manifest. */
-  readonly workspace?: Pick<WorkspacePort, 'readWorktreeFile'>;
   /**
    * Composition-root clock for revision timestamps; the wall-clock default
    * is a scaffold convenience, not an authority source.
@@ -194,7 +195,6 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
     // rather than compared against an assumed default.
     const implementerSeat = await resolveImplementerSeat(attempt, {
       artifactPort: deps.artifactPort,
-      workspace: deps.workspace,
     });
     if (implementerSeat.outcome === 'unknown') {
       return { outcome: 'rejected', reason: implementerSeat.reason };

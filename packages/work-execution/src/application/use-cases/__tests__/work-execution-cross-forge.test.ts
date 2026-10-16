@@ -421,6 +421,37 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     expect(acceptancePort.requests).toHaveLength(0);
   });
 
+  it('refuses a seatless attempt with no artifact port and never reads a worktree file', async () => {
+    const acceptancePort = new FakeAcceptanceAssessment();
+    let worktreeReads = 0;
+    const useCase = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([
+        makeAttempt({
+          runner: null,
+          briefPackagePath: '/tmp/opencode/lanes/attempt-1/.lane/brief.md',
+        }),
+      ]),
+      acceptancePort,
+      // Even a handed-in workspace port must never be consulted: a model
+      // never comes from a file inside the worker's worktree.
+      workspace: {
+        readWorktreeFile: async () => {
+          worktreeReads += 1;
+          return JSON.stringify({ modelAssignment: { model: 'worktree-seat-model' } });
+        },
+      },
+    } as unknown as ConstructorParameters<typeof RequestAttemptAcceptanceUseCase>[0]);
+
+    const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(result.outcome).toBe('rejected');
+    expect(result.outcome === 'rejected' && result.reason).toBe(
+      "Attempt attempt-1 records no implementer seat: neither the dispatched runner model nor the frozen brief manifest's model assignment is known",
+    );
+    expect(worktreeReads).toBe(0);
+    expect(acceptancePort.requests).toHaveLength(0);
+  });
+
   it('falls back to the frozen manifest seat when the attempt records none', async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const workOrderRepo = new InMemoryWorkOrderRepository([makeWorkOrder()]);

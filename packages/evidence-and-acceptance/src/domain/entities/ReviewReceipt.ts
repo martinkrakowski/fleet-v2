@@ -36,13 +36,60 @@ function isNonEmptyTrimmedString(value: unknown): value is string {
 }
 
 /**
- * Strip the provider seat prefix (`openrouter/...`, `nvidia/...`, ...) and
- * return the underlying model family. `openrouter/z-ai/glm-5.3` and
- * `nvidia/z-ai/glm-5.3` therefore share one underlying model family.
+ * Size, speed and cost suffixes stripped from a model name, repeatedly, to
+ * reach the underlying model family. `flashx` precedes `flash` so the longer
+ * suffix is removed whole.
+ */
+const FAMILY_SUFFIXES: readonly string[] = [
+  'flashx',
+  'flash',
+  'prime',
+  'preview',
+  'mini',
+  'lite',
+  'free',
+  'paid',
+];
+
+/** Strip one trailing size/speed/cost suffix (`-flash`, `:free`, ...) if present. */
+function stripOneFamilySuffix(value: string): string {
+  for (const suffix of FAMILY_SUFFIXES) {
+    for (const separator of [':', '-']) {
+      const token = separator + suffix;
+      if (value.endsWith(token) && value.length > token.length) {
+        return value.slice(0, value.length - token.length);
+      }
+    }
+  }
+  return value;
+}
+
+/**
+ * Strip the provider seat prefix (`openrouter/...`, `nvidia/...`, ...), any
+ * `#variant`, any `:free`/`:paid` suffix and the size and speed suffixes, and
+ * return the underlying model family compared case-insensitively. This is
+ * stricter than a provider-prefix strip alone: `openrouter/z-ai/glm-5.3`,
+ * `nvidia/z-ai/glm-5.3-flash` and `z-ai/glm-5.3#none` share one family, so a
+ * flash reviewer of a GLM implementer is refused.
  */
 export function underlyingModelFamily(model: string): string {
-  const separatorIndex = model.indexOf('/');
-  return separatorIndex === -1 ? model : model.slice(separatorIndex + 1);
+  let value = model;
+  const hashIndex = value.indexOf('#');
+  if (hashIndex !== -1) {
+    value = value.slice(0, hashIndex);
+  }
+  const separatorIndex = value.lastIndexOf('/');
+  if (separatorIndex !== -1) {
+    value = value.slice(separatorIndex + 1);
+  }
+  value = value.toLowerCase();
+  for (;;) {
+    const stripped = stripOneFamilySuffix(value);
+    if (stripped === value) {
+      return value;
+    }
+    value = stripped;
+  }
 }
 
 function isValidFinding(finding: ReviewFindingRecord): boolean {

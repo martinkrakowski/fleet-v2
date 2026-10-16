@@ -4,15 +4,19 @@ import { join, resolve } from 'node:path';
 import type { FleetInstallation, FleetInstallationModel, RunnerSection } from './types.js';
 import { deriveInstallationModel } from './model.js';
 import { parseInstallation } from './parse.js';
+import { validateSeatPolicy, v1FamilyWarnings } from './policy.js';
 
 export interface LoadOptions {
   file?: string;
   env?: Record<string, string | undefined>;
   cwd?: string;
   /**
-   * Policy rule hook (lane O5). The loader calls it with the derived model
+   * Additional policy rule hook. The loader calls it with the derived model
    * after mapping; every returned string is a load error. Shape validation
-   * happens in the parser regardless.
+   * happens in the parser regardless. The seat and chain policy
+   * (`validateSeatPolicy`) is enforced by the loader itself for every v2
+   * file, so a hand-edited file cannot bypass it; this hook adds caller
+   * policy on top and never replaces the built-in rules.
    */
   validatePolicy?: (installation: FleetInstallationModel) => string[];
 }
@@ -207,6 +211,13 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
     installation = merged.installation;
   }
   const { model, warnings } = deriveInstallationModel(installation);
+  if (installation.schemaVersion === 2) {
+    errors.push(...validateSeatPolicy(model));
+  } else {
+    // v1 files get no new refusals: their single runner/reviewer pair is
+    // checked only for the family rule and reported as a warning.
+    warnings.push(...v1FamilyWarnings(model));
+  }
   if (options.validatePolicy !== undefined) {
     errors.push(...options.validatePolicy(model));
   }

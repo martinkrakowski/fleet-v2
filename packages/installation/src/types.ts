@@ -171,8 +171,8 @@ export interface ForbiddenRouteRule {
 }
 
 /**
- * The v2 `policy` section: shape only. The rules are lane O5 and reach the
- * loader through its `validatePolicy` hook.
+ * The v2 `policy` section: shape only. The rules are enforced by the loader
+ * itself through `validateSeatPolicy` (lane O5) on every v2 file.
  */
 export interface PolicySection {
   readonly forbiddenRoutes?: readonly ForbiddenRouteRule[];

@@ -281,10 +281,25 @@ describe('ReviewReceipt', () => {
     expect(receipt.toRecord().findings).toHaveLength(2);
   });
 
-  it('strips the provider prefix when comparing underlying model families', () => {
-    expect(underlyingModelFamily('openrouter/z-ai/glm-5.3')).toBe('z-ai/glm-5.3');
-    expect(underlyingModelFamily('nvidia/z-ai/glm-5.3')).toBe('z-ai/glm-5.3');
-    expect(underlyingModelFamily('bare-model')).toBe('bare-model');
+  it('strips prefixes, variants, cost and size suffixes when comparing model families', () => {
+    const sameFamily: readonly [string, string][] = [
+      ['nvidia/z-ai/glm-5.3-flash', 'openrouter/z-ai/glm-5.3'],
+      ['openrouter/z-ai/glm-5.3', 'z-ai/glm-5.3#none'],
+      ['opencode/longcat-2.5-preview-free', 'longcat-2.5'],
+      ['openrouter/z-ai/glm-5.3-flash', 'NVIDIA/z-ai/glm-5.3'],
+      ['bare-model', 'bare-model'],
+    ];
+    for (const [left, right] of sameFamily) {
+      expect(underlyingModelFamily(left)).toBe(underlyingModelFamily(right));
+    }
+    const distinctFamilies: readonly [string, string][] = [
+      ['claude-sonnet', 'claude-opus'],
+      ['glm-5.3', 'glm-5.4'],
+      ['gpt-6-luna', 'glm-5.3'],
+    ];
+    for (const [left, right] of distinctFamilies) {
+      expect(underlyingModelFamily(left)).not.toBe(underlyingModelFamily(right));
+    }
   });
 
   it('rejects openrouter/z-ai/glm-5.3 vs nvidia/z-ai/glm-5.3 as the same model', () => {

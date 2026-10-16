@@ -44,7 +44,10 @@ import {
   StopAttemptUseCase,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
+  consumptionId,
+  forgeActionScope,
   isSafeSshHost,
+  observationEventKind,
   type GhInvocationResult,
 } from '@fleet/work-execution';
 
@@ -158,10 +161,7 @@ interface AuthorizationCoordinates {
   readonly expectedHeadSha: string;
 }
 
-/** Deterministic coordination action scope for one forge action kind. */
-export function forgeActionScope(kind: 'push-and-open-pr' | 'merge-pr'): string {
-  return `forge:${kind}`;
-}
+export { consumptionId, forgeActionScope, observationEventKind };
 
 /** Single-quote one argument for the remote POSIX shell. */
 function posixQuote(value: string): string {
@@ -726,6 +726,18 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
           reason: `Authorization grant ${request.authorizationGrantId} records no expected head`,
         };
       }
+      if (grant.actionScope !== forgeActionScope(request.actionKind)) {
+        return {
+          outcome: 'refused',
+          reason: `Authorization grant ${request.authorizationGrantId} was recorded for scope ${grant.actionScope}, not ${forgeActionScope(request.actionKind)}`,
+        };
+      }
+      if (grant.expectedHeadSha !== request.expectedHeadSha) {
+        return {
+          outcome: 'refused',
+          reason: `Authorization grant ${request.authorizationGrantId} was recorded for head ${grant.expectedHeadSha}, not ${request.expectedHeadSha}`,
+        };
+      }
       // Coordinates recorded at resolve time bind the grant to its attempt;
       // a fresh process reloads them from disk before falling back to the
       // head-matching scan over all recorded attempts.
@@ -753,10 +765,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
           ? null
           : await attemptRepository.findAttemptById(coordinates.attemptId);
       const attempt =
-        boundAttempt !== null && boundAttempt.artifacts?.headCommit === grant.expectedHeadSha
+        boundAttempt !== null && boundAttempt.artifacts?.headCommit === request.expectedHeadSha
           ? boundAttempt
           : (await attemptRepository.listAllAttempts()).find(
-              (candidate) => candidate.artifacts?.headCommit === grant.expectedHeadSha,
+              (candidate) => candidate.artifacts?.headCommit === request.expectedHeadSha,
             );
       if (attempt === undefined) {
         return {
@@ -766,9 +778,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         };
       }
       const result = await coordination.recordAuthorizationConsumption.recordAuthorizationConsumption({
-        consumptionId: `consumption-${request.actionId}`,
+        consumptionId: consumptionId(request.actionId),
         grantId: request.authorizationGrantId,
         actionId: request.actionId,
+        actionKind: request.actionKind,
         attemptId: attempt.id,
         expectedHeadSha: grant.expectedHeadSha,
       });
@@ -783,7 +796,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       const result = await coordination.publishProjectObservation.publishProjectObservation({
         observationId: request.entry.id,
         projectId: request.projectId,
-        eventKind: `execution:${request.entry.action}:${request.entry.status}`,
+        eventKind: observationEventKind(request.entry.action, request.entry.status),
         sourceAttemptId: request.entry.attemptId,
         payloadSummary: JSON.stringify(request.entry),
       });

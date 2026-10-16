@@ -222,8 +222,13 @@ class FakeForge implements ForgeActionPort {
   readonly requests: ForgeActionRequest[] = [];
   journalAtCall: readonly ActionJournalEntryRecord[] = [];
   result: ForgeActionResult = { outcome: 'executed', headSha: HEAD_SHA };
+  configured = true;
 
   constructor(private readonly journal?: InMemoryJournal) {}
+
+  isConfigured(): boolean {
+    return this.configured;
+  }
 
   async performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult> {
     this.requests.push(request);
@@ -639,7 +644,13 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       reason: 'Authorization grant already consumed by action other-1',
     });
     expect(authorization.consumeRequests).toEqual([
-      { authorizationGrantId: 'grant-1', actionId: 'action-1' },
+      {
+        authorizationGrantId: 'grant-1',
+        actionId: 'action-1',
+        actionKind: 'merge-pr',
+        expectedHeadSha: HEAD_SHA,
+        attemptId: 'attempt-1',
+      },
     ]);
     expect(forgePort.requests).toHaveLength(0);
     expect(journal.entries.map((entry) => entry.status)).toEqual(['refused']);
@@ -803,6 +814,17 @@ describe('ActionAuthorizationAdapter', () => {
     };
   }
 
+  function consumeRequest(overrides: Partial<ConsumeActionAuthorizationRequest> = {}): ConsumeActionAuthorizationRequest {
+    return {
+      authorizationGrantId: 'grant-1',
+      actionId: 'action-1',
+      actionKind: 'merge-pr',
+      expectedHeadSha: HEAD_SHA,
+      attemptId: 'attempt-1',
+      ...overrides,
+    };
+  }
+
   it('rejects while unconfigured', async () => {
     const adapter = new ActionAuthorizationAdapter();
 
@@ -810,7 +832,7 @@ describe('ActionAuthorizationAdapter', () => {
       'Not implemented: ActionAuthorizationAdapter.resolveActionAuthorization',
     );
     await expect(
-      adapter.consumeActionAuthorization({ authorizationGrantId: 'grant-1', actionId: 'action-1' }),
+      adapter.consumeActionAuthorization(consumeRequest()),
     ).rejects.toThrow('Not implemented: ActionAuthorizationAdapter.consumeActionAuthorization');
   });
 
@@ -833,7 +855,7 @@ describe('ActionAuthorizationAdapter', () => {
   it('blocks resolution once the grant has been consumed', async () => {
     const grants = makeGrants();
     const adapter = new ActionAuthorizationAdapter({ grants });
-    await adapter.consumeActionAuthorization({ authorizationGrantId: 'grant-1', actionId: 'action-1' });
+    await adapter.consumeActionAuthorization(consumeRequest());
 
     const result = await adapter.resolveActionAuthorization(resolveRequest());
 
@@ -844,14 +866,8 @@ describe('ActionAuthorizationAdapter', () => {
     const grants = makeGrants();
     const adapter = new ActionAuthorizationAdapter({ grants });
 
-    const first = await adapter.consumeActionAuthorization({
-      authorizationGrantId: 'grant-1',
-      actionId: 'action-1',
-    });
-    const retry = await adapter.consumeActionAuthorization({
-      authorizationGrantId: 'grant-1',
-      actionId: 'action-1',
-    });
+    const first = await adapter.consumeActionAuthorization(consumeRequest());
+    const retry = await adapter.consumeActionAuthorization(consumeRequest());
 
     expect(first).toEqual({ outcome: 'consumed', actionId: 'action-1' });
     expect(retry).toEqual({ outcome: 'consumed', actionId: 'action-1' });
@@ -860,16 +876,14 @@ describe('ActionAuthorizationAdapter', () => {
 
   it('refuses a second unrelated action and an unknown grant', async () => {
     const adapter = new ActionAuthorizationAdapter({ grants: makeGrants() });
-    await adapter.consumeActionAuthorization({ authorizationGrantId: 'grant-1', actionId: 'action-1' });
+    await adapter.consumeActionAuthorization(consumeRequest());
 
-    const secondAction = await adapter.consumeActionAuthorization({
-      authorizationGrantId: 'grant-1',
-      actionId: 'action-2',
-    });
-    const unknown = await adapter.consumeActionAuthorization({
-      authorizationGrantId: 'grant-missing',
-      actionId: 'action-1',
-    });
+    const secondAction = await adapter.consumeActionAuthorization(
+      consumeRequest({ actionId: 'action-2' }),
+    );
+    const unknown = await adapter.consumeActionAuthorization(
+      consumeRequest({ authorizationGrantId: 'grant-missing' }),
+    );
 
     expect(secondAction).toEqual({
       outcome: 'refused',
@@ -892,14 +906,15 @@ describe('ActionAuthorizationAdapter', () => {
     });
 
     const resolved = await adapter.resolveActionAuthorization(resolveRequest());
-    const consumed = await adapter.consumeActionAuthorization({
+    const req = consumeRequest({
       authorizationGrantId: 'grant-2',
       actionId: 'action-9',
     });
+    const consumed = await adapter.consumeActionAuthorization(req);
 
     expect(resolved).toEqual({ outcome: 'granted', authorizationGrantId: 'grant-2' });
     expect(consumed).toEqual({ outcome: 'consumed', actionId: 'action-9' });
-    expect(consumeRequests).toEqual([{ authorizationGrantId: 'grant-2', actionId: 'action-9' }]);
+    expect(consumeRequests).toEqual([req]);
   });
 });
 

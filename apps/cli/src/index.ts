@@ -597,6 +597,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         consumptionId: str(p, 'consumptionId'),
         grantId: str(p, 'grantId'),
         actionId: str(p, 'actionId'),
+        actionKind: str(p, 'actionKind'),
         attemptId: str(p, 'attemptId'),
         expectedHeadSha: str(p, 'expectedHeadSha'),
         nowIso: optStr(p, 'nowIso'),

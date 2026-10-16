@@ -631,6 +631,7 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
     consumptionId: 'consumption-1',
     grantId: 'grant-9',
     actionId: 'action-1',
+    actionKind: 'merge',
     attemptId: 'attempt-1',
     expectedHeadSha: 'abc123',
     nowIso: LATER_ISO,

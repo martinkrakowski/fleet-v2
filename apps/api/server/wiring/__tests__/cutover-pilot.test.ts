@@ -805,9 +805,9 @@ describe("restarted API and web client loopback pilot", () => {
     // --- acceptedReceiptByHead survived the restart ---
     // The restarted runtime's in-memory receipt registry is empty, so this
     // merge request passes the acceptance-receipt gate only through the
-    // `<stateDir>/accepted-receipts.json` reload. The refusal below proves
-    // the receipt WAS found: the consume delegate is the step that refuses
-    // (an unknown grant has no persisted coordinates), not the merge gate.
+    // `<stateDir>/accepted-receipts.json` reload. Under M10, an unconfigured
+    // forge delegate refuses with 'unavailable' without consuming; reaching
+    // that readiness refusal proves the receipt was accepted for PILOT_HEAD.
     const receiptOnly = await callRoute("post", "/v1/forge", {
       actionId: "action-merge-control",
       attemptId: "attempt-pilot-1",
@@ -822,15 +822,11 @@ describe("restarted API and web client loopback pilot", () => {
       reason?: string;
     };
     expect(controlResult.outcome).toBe("refused");
-    expect(controlResult.reason).toContain(
-      "No in-process authorization resolve recorded grant grant-unknown",
-    );
+    expect(controlResult.reason).toBe("unavailable");
 
-    // --- resolveCoordinates survived the restart ---
-    // The persisted coordinates scope the consumption: the grant is durably
-    // consumed for exactly this action and attempt. The forge subprocess
-    // delegate itself is intentionally unbound in this runtime, so the final
-    // step reports 501 only after the consumption has been recorded.
+    // --- M10: unconfigured forge delegate leaves grant unconsumed ---
+    // The forge subprocess delegate is unbound in this runtime; under M10,
+    // execution refuses with unavailable WITHOUT consuming the grant.
     const merge = await callRoute("post", "/v1/forge", {
       actionId: "action-merge-pilot-1",
       attemptId: "attempt-pilot-1",
@@ -839,8 +835,13 @@ describe("restarted API and web client loopback pilot", () => {
       expectedHeadSha: PILOT_HEAD,
       authorizationGrantId: "grant-pilot-1",
     });
-    expect(merge.status).toBe(501);
-    expect(envelopeOf(merge.payload).code).toBe("NOT_IMPLEMENTED");
+    expect(merge.status).toBe(200);
+    const mergeResult = envelopeOf(merge.payload).result as {
+      outcome?: string;
+      reason?: string;
+    };
+    expect(mergeResult.outcome).toBe("refused");
+    expect(mergeResult.reason).toBe("unavailable");
 
     const storedRequests = JSON.parse(
       await readFile(join(pilotStateDir, "coordination-requests.json"), "utf8"),
@@ -854,12 +855,7 @@ describe("restarted API and web client loopback pilot", () => {
       }>;
     }>;
     const grantRequest = storedRequests.find((request) => request.id === "req-grant-pilot-1");
-    expect(grantRequest?.state).toBe("completed");
-    const consumption = grantRequest?.consumptions?.[0];
-    expect(consumption?.actionId).toBe("action-merge-pilot-1");
-    // These coordinates can only have come from the persisted
-    // authorization-coordinates.json reloaded by the restarted runtime.
-    expect(consumption?.attemptId).toBe("attempt-pilot-1");
-    expect(consumption?.expectedHeadSha).toBe(PILOT_HEAD);
+    expect(grantRequest?.state).toBe("approved");
+    expect(grantRequest?.consumptions).toHaveLength(0);
   });
 });

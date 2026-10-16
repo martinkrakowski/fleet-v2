@@ -6,6 +6,11 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+import {
+  consumptionId,
+  forgeActionScope,
+  observationEventKind,
+} from "@fleet/work-execution";
 import type { InspectWorkOrderUseCase } from "@fleet/work-execution/use-cases";
 
 import { configureEvidenceUseCases, createConfiguredEvidenceUseCases } from "./evidence/composition";
@@ -277,7 +282,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
       resolveGrant: async (request) => {
         const result = await operator.resolveActionAuthorization.resolveActionAuthorization({
           projectId: request.projectId,
-          actionScope: `${request.workOrderId}/${request.actionKind}`,
+          actionScope: forgeActionScope(request.actionKind),
           expectedHeadSha: request.expectedHeadSha,
         });
         if (result.outcome === "blocked") {
@@ -313,11 +318,12 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
         }
         const result =
           await operator.recordAuthorizationConsumption.recordAuthorizationConsumption({
-            consumptionId: `consumption-${request.authorizationGrantId}`,
+            consumptionId: consumptionId(request.actionId),
             grantId: request.authorizationGrantId,
             actionId: request.actionId,
-            attemptId: coordinates.attemptId,
-            expectedHeadSha: coordinates.expectedHeadSha,
+            actionKind: request.actionKind,
+            attemptId: request.attemptId ?? coordinates.attemptId,
+            expectedHeadSha: request.expectedHeadSha ?? coordinates.expectedHeadSha,
           });
         if (result.outcome === "consumed") {
           return { outcome: "consumed", actionId: request.actionId };
@@ -330,7 +336,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
         const result = await operator.publishProjectObservation.publishProjectObservation({
           observationId: request.entry.id,
           projectId: request.projectId,
-          eventKind: request.entry.action,
+          eventKind: observationEventKind(request.entry.action, request.entry.status),
           sourceAttemptId: request.entry.attemptId,
           payloadSummary: request.entry.status,
         });

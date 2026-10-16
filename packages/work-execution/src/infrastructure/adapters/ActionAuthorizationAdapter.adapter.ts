@@ -88,6 +88,18 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
           reason: `Authorization grant not found: ${request.authorizationGrantId}`,
         };
       }
+      if (grant.kind !== request.actionKind) {
+        return {
+          outcome: 'refused',
+          reason: `Authorization grant ${request.authorizationGrantId} kind ${grant.kind} does not match requested ${request.actionKind}`,
+        };
+      }
+      if (grant.expectedHeadSha !== request.expectedHeadSha) {
+        return {
+          outcome: 'refused',
+          reason: `Authorization grant ${request.authorizationGrantId} expected head ${grant.expectedHeadSha} does not match requested ${request.expectedHeadSha}`,
+        };
+      }
       if (grant.consumedByActionId === null) {
         grants.set(request.authorizationGrantId, {
           ...grant,

@@ -29,6 +29,8 @@ jobs:
         run: corepack enable
       - name: yarn install --immutable
         run: yarn install --immutable
+      - name: model-family fixture parity
+        run: sh scripts/check-model-family-fixtures.sh
       - name: yarn build
         run: yarn build
       - name: yarn typecheck

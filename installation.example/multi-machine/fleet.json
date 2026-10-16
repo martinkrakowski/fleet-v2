@@ -38,7 +38,7 @@
     {
       "id": "implementer",
       "tool": "opencode",
-      "model": "example-provider/example-implementer-model",
+      "model": "example-provider/glm-5.3",
       "agent": "example-agent",
       "roles": ["implementer"],
       "costClass": "plan-quota"
@@ -46,7 +46,7 @@
     {
       "id": "implementer-fallback",
       "tool": "opencode",
-      "model": "example-provider/example-fallback-model",
+      "model": "example-provider/glm-5.3-flash",
       "agent": "example-agent",
       "roles": ["implementer"],
       "costClass": "paid"
@@ -54,7 +54,7 @@
     {
       "id": "reviewer",
       "tool": "opencode",
-      "model": "example-provider/example-review-model",
+      "model": "example-provider/grok-4.7",
       "agent": "example-agent",
       "roles": ["reviewer"],
       "costClass": "paid"
@@ -62,7 +62,7 @@
     {
       "id": "high-risk-reviewer",
       "tool": "opencode",
-      "model": "example-provider/example-high-risk-model",
+      "model": "example-provider/gemini-3.8-pro",
       "agent": "example-agent",
       "roles": ["high-risk-reviewer"],
       "costClass": "paid"

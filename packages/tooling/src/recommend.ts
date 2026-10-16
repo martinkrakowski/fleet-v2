@@ -110,20 +110,57 @@ export interface NoValidCatalogueResult {
 export type SeatRecommendation = SeatCatalogueResult | NoValidCatalogueResult;
 
 /**
- * Ordered model families, strongest first. This table is data fleet
+ * Ordered model tiers, strongest first. This table is data fleet
  * maintains: it is a fixed ordering used to pick reviewers, not a claim
- * about model quality, and it is the only place strength is defined. A
- * family not listed ranks below every listed family, in first-seen order.
+ * about model quality, and it is the only place strength is defined. The
+ * keys are the tier names produced by the tooling-local `modelTier` (the
+ * old pre-digit prefix), never by `underlyingModelFamily`: since the
+ * owner decision of 2026-10-16 the family is the vendor line only (one
+ * family per vendor line, e.g. every Claude model is `claude`), which can
+ * no longer rank tiers. A tier not listed ranks below every listed tier,
+ * in first-seen order.
  */
 const STRENGTH_ORDER: readonly string[] = [
-  'claude-opus-4-5',
-  'glm-5.3',
-  'claude-sonnet-4-5',
-  'grok-4.7',
-  'claude-haiku-4-5',
-  'grok-4.7-fast',
-  'grok-code-fast-4.7',
+  'claude-opus',
+  'glm',
+  'claude-sonnet',
+  'grok',
+  'claude-haiku',
 ];
+
+/**
+ * The tooling-local strength tier of a model id: the same pre-processing as
+ * `underlyingModelFamily` (lowercase, trim, cut at `#`, drop the provider
+ * prefix, cut at `:` or `@`) and then the leading run of letters and hyphens
+ * before the first digit, with a trailing hyphen trimmed. An id with no
+ * digit keeps its whole remaining name, so `space-bunny-free` is a tier of
+ * its own. Used ONLY for strength ranking above; the reviewer/implementer
+ * disjointness check keeps using `underlyingModelFamily` (the vendor-line
+ * family), so a Sonnet implementer refuses an Opus reviewer.
+ */
+function modelTier(id: string): string {
+  let value = id.trim().toLowerCase();
+  const hashIndex = value.indexOf('#');
+  if (hashIndex !== -1) {
+    value = value.slice(0, hashIndex);
+  }
+  const separatorIndex = value.lastIndexOf('/');
+  if (separatorIndex !== -1) {
+    value = value.slice(separatorIndex + 1);
+  }
+  const specialIndex = value.search(/[:@]/);
+  if (specialIndex !== -1) {
+    value = value.slice(0, specialIndex);
+  }
+  const digitIndex = value.search(/[0-9]/);
+  if (digitIndex !== -1) {
+    value = value.slice(0, digitIndex);
+  }
+  if (value.endsWith('-')) {
+    value = value.slice(0, -1);
+  }
+  return value;
+}
 
 /** Cost-class ordering: free first, then plan-quota, then paid. */
 const COST_RANK: Readonly<Record<CostClass, number>> = {
@@ -140,7 +177,9 @@ interface Candidate {
   readonly variant?: string;
   readonly costClass: CostClass;
   readonly family: string;
-  /** Lower is stronger; unlisted families rank after the listed ones. */
+  /** Tooling-local strength tier (`modelTier`), never the family. */
+  readonly tier: string;
+  /** Lower is stronger; unlisted tiers rank after the listed ones. */
   readonly strength: number;
 }
 
@@ -189,7 +228,7 @@ function resolveModel(
   tool: ToolId,
   displayName: string,
   info: ModelInfo,
-  familySeenOrder: Map<string, number>,
+  tierSeenOrder: Map<string, number>,
 ): { candidate?: Candidate; skipReason?: string } {
   const id = info.id.trim();
   if (id === '') {
@@ -217,12 +256,13 @@ function resolveModel(
   if (family === '') {
     return { skipReason: `model ${id} on ${displayName} skipped: its model family is empty` };
   }
-  if (!familySeenOrder.has(family)) {
-    familySeenOrder.set(family, familySeenOrder.size);
+  const tier = modelTier(id);
+  if (!tierSeenOrder.has(tier)) {
+    tierSeenOrder.set(tier, tierSeenOrder.size);
   }
-  const strengthIndex = STRENGTH_ORDER.indexOf(family);
+  const strengthIndex = STRENGTH_ORDER.indexOf(tier);
   const strength =
-    strengthIndex === -1 ? STRENGTH_ORDER.length + (familySeenOrder.get(family) ?? 0) : strengthIndex;
+    strengthIndex === -1 ? STRENGTH_ORDER.length + (tierSeenOrder.get(tier) ?? 0) : strengthIndex;
   return {
     candidate: {
       tool,
@@ -231,6 +271,7 @@ function resolveModel(
       variant: info.variant,
       costClass,
       family,
+      tier,
       strength,
     },
   };
@@ -299,7 +340,7 @@ export function recommendSeats(input: {
   allowedRoutes?: readonly AllowedRouteRule[];
 }): SeatRecommendation {
   const skipped: string[] = [];
-  const familySeenOrder = new Map<string, number>();
+  const tierSeenOrder = new Map<string, number>();
 
   // Usable candidates, per tool, in input order. Tools whose sign-in could
   // not be confirmed and model lists reported `unknown` are skipped.
@@ -334,7 +375,7 @@ export function recommendSeats(input: {
       continue;
     }
     for (const info of models) {
-      const resolved = resolveModel(detected.id, descriptor.displayName, info, familySeenOrder);
+      const resolved = resolveModel(detected.id, descriptor.displayName, info, tierSeenOrder);
       if (resolved.skipReason !== undefined) {
         skipped.push(resolved.skipReason);
       } else if (resolved.candidate !== undefined) {

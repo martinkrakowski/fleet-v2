@@ -297,9 +297,12 @@ describe('ReviewReceipt', () => {
       expect(underlyingModelFamily(left)).toBe(underlyingModelFamily(right));
     }
     const distinctFamilies: readonly [string, string][] = [
-      ['claude-sonnet', 'claude-opus'],
-      ['glm-5.3', 'glm-5.4'],
+      // Every Claude model shares the `claude` vendor-line family (owner
+      // rule: one family per vendor line), so sonnet vs opus is no longer
+      // a distinct pair; gemini, gpt and glm stay distinct.
+      ['gemini-3.1-pro', 'glm-5.3'],
       ['gpt-6-luna', 'glm-5.3'],
+      ['claude-opus-5-5', 'glm-5.3'],
     ];
     for (const [left, right] of distinctFamilies) {
       expect(underlyingModelFamily(left)).not.toBe(underlyingModelFamily(right));

@@ -2,6 +2,7 @@
 
 export * from "./ClaimVerificationAdapter.adapter.js";
 export * from "./file-store.js";
+export * from "./GitShelfProvider.adapter.js";
 export * from "./KeeperPublicationAdapter.adapter.js";
 export * from "./KnowledgeEntryRepositoryAdapter.adapter.js";
 export * from "./KnowledgeRetrievalAdapter.adapter.js";

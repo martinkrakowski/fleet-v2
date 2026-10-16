@@ -13,6 +13,8 @@ import {
   type AttemptOwnerDecisionDelegate,
   type OwnerDecisionDelegate,
 } from "@fleet/evidence-and-acceptance";
+import { resolveRoleExecutors } from "@fleet/work-execution";
+import type { FleetInstallation } from "@fleet/installation";
 import {
   AssessHeadAcceptanceUseCase,
   InspectAcceptanceEvidenceUseCase,
@@ -41,6 +43,8 @@ export interface EvidenceCrossContextDelegates {
 
 export interface EvidenceUseCasesOptions {
   readonly stateDir?: string;
+  /** Parsed installation; the verifier role's host decides the executor. */
+  readonly installation?: FleetInstallation;
 }
 
 function createEvidenceUseCases(): EvidenceUseCases {
@@ -62,7 +66,13 @@ export function createConfiguredEvidenceUseCases(
   const stateDir = options?.stateDir;
 
   const repo = new EvidenceAssessmentRepositoryAdapter({ stateDir });
-  const executor = new VerificationExecutorAdapter();
+  // The verification executor runs only allow-listed procedures, locally or
+  // over the verifier role's ssh transport; with no installation (and so no
+  // allow-list) executed checks report `unknown` until a receipt is recorded.
+  const executor = new VerificationExecutorAdapter({
+    executor: resolveRoleExecutors(options?.installation).verifier,
+    allowListedCommands: options?.installation?.verification?.procedures,
+  });
   const archive = new EvidenceArchiveAdapter(
     stateDir === undefined ? {} : { archiveDir: join(stateDir, "evidence-archive") },
   );

@@ -29,6 +29,7 @@ import { ExecutionJournalAdapter } from '../ExecutionJournalAdapter.adapter.js';
 import { ExecutionRunnerAdapter } from '../ExecutionRunnerAdapter.adapter.js';
 import { WorkOrderRepositoryAdapter } from '../WorkOrderRepositoryAdapter.adapter.js';
 import { WorkspaceAdapter } from '../WorkspaceAdapter.adapter.js';
+import { LocalExecutor } from '../LocalExecutor.adapter.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -426,7 +427,7 @@ describe('WorkspaceAdapter', () => {
   it('inspects a clean worktree at its base commit', { timeout: 20000 }, async () => {
     const repoPath = await createGitRepo();
     const head = (await git(repoPath, ['rev-parse', 'HEAD'])).trim();
-    const inspection = await new WorkspaceAdapter().inspectWorktree({
+    const inspection = await new WorkspaceAdapter({ executor: new LocalExecutor() }).inspectWorktree({
       worktreePath: repoPath,
       baseCommit: head,
       expectedArtifactPaths: ['README.md'],
@@ -442,7 +443,7 @@ describe('WorkspaceAdapter', () => {
   it('reports missing expected artifacts', { timeout: 20000 }, async () => {
     const repoPath = await createGitRepo();
     const head = (await git(repoPath, ['rev-parse', 'HEAD'])).trim();
-    const inspection = await new WorkspaceAdapter().inspectWorktree({
+    const inspection = await new WorkspaceAdapter({ executor: new LocalExecutor() }).inspectWorktree({
       worktreePath: repoPath,
       baseCommit: head,
       expectedArtifactPaths: ['README.md', 'docs/report.md'],
@@ -459,7 +460,7 @@ describe('WorkspaceAdapter', () => {
     await fs.writeFile(path.join(repoPath, '.lane', 'brief.md'), 'brief\n', 'utf8');
     await fs.writeFile(path.join(repoPath, '.lane', 'notes.md'), 'notes\n', 'utf8');
 
-    const inspection = await new WorkspaceAdapter().inspectWorktree({
+    const inspection = await new WorkspaceAdapter({ executor: new LocalExecutor() }).inspectWorktree({
       worktreePath: repoPath,
       baseCommit: '0'.repeat(40),
       expectedArtifactPaths: ['.lane/brief.md'],
@@ -475,7 +476,7 @@ describe('WorkspaceAdapter', () => {
   it('reads a worktree file when present and returns null when absent', async () => {
     const repoPath = await createGitRepo();
     await fs.writeFile(path.join(repoPath, 'config.json'), '{"hello":"world"}', 'utf8');
-    const adapter = new WorkspaceAdapter();
+    const adapter = new WorkspaceAdapter({ executor: new LocalExecutor() });
     const content = await adapter.readWorktreeFile(repoPath, 'config.json');
     expect(content).toBe('{"hello":"world"}');
 
@@ -561,7 +562,7 @@ describe('BriefAuthoringAdapter', () => {
 describe('AttemptArtifactAdapter', () => {
   it('verifies which candidate paths are gitignored', { timeout: 20000 }, async () => {
     const repoPath = await createGitRepo();
-    const adapter = new AttemptArtifactAdapter();
+    const adapter = new AttemptArtifactAdapter({ executor: new LocalExecutor() });
     const ignored = await adapter.verifyIgnoredPaths({
       worktreePath: repoPath,
       candidatePaths: ['.lane/brief.md', '.lane/brief-manifest.json'],
@@ -579,7 +580,7 @@ describe('AttemptArtifactAdapter', () => {
 
   it('refuses to place a frozen brief when .lane is not gitignored', { timeout: 20000 }, async () => {
     const repoPath = await createGitRepo(false);
-    const result = await new AttemptArtifactAdapter().placeFrozenBrief({
+    const result = await new AttemptArtifactAdapter({ executor: new LocalExecutor() }).placeFrozenBrief({
       attemptId: 'att-1',
       worktreePath: repoPath,
       proseMarkdown: '# Brief',
@@ -594,7 +595,7 @@ describe('AttemptArtifactAdapter', () => {
 
   it('places the frozen brief package under ignored paths', { timeout: 20000 }, async () => {
     const repoPath = await createGitRepo();
-    const result = await new AttemptArtifactAdapter().placeFrozenBrief({
+    const result = await new AttemptArtifactAdapter({ executor: new LocalExecutor() }).placeFrozenBrief({
       attemptId: 'att-1',
       worktreePath: repoPath,
       proseMarkdown: '# Brief prose',
@@ -618,7 +619,7 @@ describe('AttemptArtifactAdapter', () => {
   it('refuses a completion receipt bound to another attempt', { timeout: 20000 }, async () => {
     const repoPath = await createGitRepo();
     const head = (await git(repoPath, ['rev-parse', 'HEAD'])).trim();
-    const result = await new AttemptArtifactAdapter().collectCompletedAttemptArtifacts({
+    const result = await new AttemptArtifactAdapter({ executor: new LocalExecutor() }).collectCompletedAttemptArtifacts({
       attemptId: 'att-1',
       worktreePath: repoPath,
       baseCommit: head,
@@ -631,7 +632,7 @@ describe('AttemptArtifactAdapter', () => {
   it('collects artifacts with zero commits since base and missing notes', { timeout: 20000 }, async () => {
     const repoPath = await createGitRepo();
     const head = (await git(repoPath, ['rev-parse', 'HEAD'])).trim();
-    const result = await new AttemptArtifactAdapter().collectCompletedAttemptArtifacts({
+    const result = await new AttemptArtifactAdapter({ executor: new LocalExecutor() }).collectCompletedAttemptArtifacts({
       attemptId: 'att-1',
       worktreePath: repoPath,
       baseCommit: head,
@@ -659,7 +660,7 @@ describe('AttemptArtifactAdapter', () => {
     await fs.mkdir(path.join(repoPath, '.lane'), { recursive: true });
     await fs.writeFile(path.join(repoPath, '.lane', 'notes.md'), 'notes\n', 'utf8');
 
-    const result = await new AttemptArtifactAdapter().collectCompletedAttemptArtifacts({
+    const result = await new AttemptArtifactAdapter({ executor: new LocalExecutor() }).collectCompletedAttemptArtifacts({
       attemptId: 'att-1',
       worktreePath: repoPath,
       baseCommit: base,
@@ -679,7 +680,7 @@ describe('AttemptArtifactAdapter', () => {
     const head = (await git(repoPath, ['rev-parse', 'HEAD'])).trim();
     await fs.mkdir(path.join(repoPath, '.lane'), { recursive: true });
     await fs.writeFile(path.join(repoPath, '.lane', 'notes.md'), 'notes\n', 'utf8');
-    const result = await new AttemptArtifactAdapter().collectCompletedAttemptArtifacts({
+    const result = await new AttemptArtifactAdapter({ executor: new LocalExecutor() }).collectCompletedAttemptArtifacts({
       attemptId: 'att-1',
       worktreePath: repoPath,
       baseCommit: head,
@@ -699,7 +700,7 @@ describe('AttemptArtifactAdapter', () => {
       '{"modelAssignment":{"model":"glm-5"}}',
       'utf8',
     );
-    const adapter = new AttemptArtifactAdapter();
+    const adapter = new AttemptArtifactAdapter({ executor: new LocalExecutor() });
     const content = await adapter.readBriefManifest(repoPath);
     expect(content).toBe('{"modelAssignment":{"model":"glm-5"}}');
 

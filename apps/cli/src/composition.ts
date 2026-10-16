@@ -52,6 +52,7 @@ import {
   forgeActionScope,
   isSafeSshHost,
   observationEventKind,
+  resolveRoleExecutors,
   type GhInvocationResult,
   type SubprocessRunner,
 } from '@fleet/work-execution';
@@ -430,6 +431,13 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     ocmRunBin,
     runnerRemoteHost,
   } = resolveRunnerSettings(options);
+  // One executor per role: the installation's hosts (v2) or the v1 mapping
+  // decides local versus ssh per host; the orchestrator runs where this root
+  // runs. runnerRemoteHost/ocmRunBin stay runner settings, separate from the
+  // worktree executor's host.
+  const roleExecutors = resolveRoleExecutors(options?.installation, {
+    worktreeSshHost,
+  });
   const ownerPublicKey =
     options?.ownerPublicKey ?? (process.env.FLEET_OWNER_PUBLIC_KEY?.trim() || undefined);
 
@@ -539,9 +547,14 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const evidenceArchive = new EvidenceArchiveAdapter({
     archiveDir: stateDir === undefined ? undefined : join(stateDir, 'evidence-archive'),
   });
-  // No verification host is allow-listed in the scaffold, so executed checks
-  // report `unknown` until a receipt is recorded by the operator.
-  const verificationExecutor = new VerificationExecutorAdapter();
+  // The verification executor runs only allow-listed procedures, locally or
+  // over the verifier role's ssh transport; with no installation (and so no
+  // allow-list) executed checks report `unknown` until a receipt is recorded
+  // by the operator.
+  const verificationExecutor = new VerificationExecutorAdapter({
+    executor: roleExecutors.verifier,
+    allowListedCommands: options?.installation?.verification?.procedures,
+  });
   // No independent review transport is configured; requests report that.
   const independentReview = new IndependentReviewAdapter();
   // Instantiated for the station that binds a live forge transport; an
@@ -633,7 +646,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const workOrderRepository = new WorkOrderRepositoryAdapter({ stateDir });
   const attemptRepository = new AttemptRepositoryAdapter({ stateDir });
   const executionJournal = new ExecutionJournalAdapter({ stateDir });
-  const workspace = new WorkspaceAdapter({ sshHost: worktreeSshHost });
+  const workspace = new WorkspaceAdapter({ executor: roleExecutors.worktree });
   // Wraps the reviewed `ocm-run` runner subprocess. The bundled repository
   // script is the default; the worktree locator is resolved from the recorded
   // attempt so a later CLI process (reconcile, stop, collect) addresses the
@@ -642,13 +655,14 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     ocmRunBin,
     remotePort: runnerRemotePort,
     remoteHost: runnerRemoteHost,
+    executor: roleExecutors.orchestrator,
     runSubprocess: options?.runSubprocess,
     resolveWorktreePath: async (attemptId) =>
       (await attemptRepository.findAttemptById(attemptId))?.worktreePath ?? null,
     resolveAttempt: async (attemptId) =>
       await attemptRepository.findAttemptById(attemptId),
   });
-  const attemptArtifact = new AttemptArtifactAdapter({ sshHost: worktreeSshHost });
+  const attemptArtifact = new AttemptArtifactAdapter({ executor: roleExecutors.worktree });
   // Hand-written brief files arrive per request; no default prose is assumed.
   const briefAuthoring = new BriefAuthoringAdapter();
   // The reviewed GitHub CLI subprocess behind a host-side delegate; every

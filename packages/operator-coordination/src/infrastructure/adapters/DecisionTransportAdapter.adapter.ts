@@ -22,6 +22,7 @@ import type {
   DecisionTransportPort,
 } from '../../application/ports/out/DecisionTransportPort.out-port.js';
 import { verifyDecisionSignature } from './DecisionSignature.adapter.js';
+import type { WavesHttpClient } from './WavesHttpClient.adapter.js';
 
 export interface DecisionTransportAdapterOptions {
   /** Directory of owner-recorded decision answers, one file per request. */
@@ -31,6 +32,8 @@ export interface DecisionTransportAdapterOptions {
   readonly fileExtension?: string;
   /** Owner Ed25519 public key in base64 format for verifying approved decisions. */
   readonly ownerPublicKey?: string;
+  /** Optional Waves HTTP client for fetching decision answers. */
+  readonly client?: WavesHttpClient;
 }
 
 const DEFAULT_FILE_EXTENSION = '.json';
@@ -52,6 +55,21 @@ export class DecisionTransportAdapter implements DecisionTransportPort {
     const injected = this.options.answers?.[requestId];
     if (injected !== undefined) {
       return normalizeAnswer(injected, query, this.options.ownerPublicKey);
+    }
+    if (this.options.client !== undefined) {
+      let candidate: unknown = null;
+      try {
+        const id = encodeURIComponent(requestId);
+        const res = await this.options.client.get(`/api/v1/decisions/${id}`);
+        if (res.status >= 200 && res.status < 300) {
+          candidate = JSON.parse(res.body);
+        }
+      } catch {
+        // network error, timeout, JSON parse error -> candidate remains null
+      }
+      if (candidate !== null) {
+        return normalizeAnswer(candidate, query, this.options.ownerPublicKey);
+      }
     }
     const path = this.decisionPath(requestId);
     if (path === null) {

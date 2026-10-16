@@ -57,4 +57,7 @@ export interface AttemptArtifactPort {
   collectCompletedAttemptArtifacts(
     request: CollectCompletedAttemptArtifactsRequest,
   ): Promise<CollectCompletedAttemptArtifactsResult>;
+
+  /** Read a brief manifest from the worktree, locally or remotely. Returns null if missing. */
+  readBriefManifest?(worktreePath: string, manifestPath?: string): Promise<string | null>;
 }

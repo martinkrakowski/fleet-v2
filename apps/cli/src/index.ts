@@ -9,7 +9,6 @@
  * `CliIo`, so package code never touches `console`.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import type {
@@ -362,6 +361,14 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   },
   attempt: {
     dispatch: async (p, rt) => {
+      for (const field of ['model', 'agent', 'variant', 'modelAssignment']) {
+        if (p[field] !== undefined) {
+          throw new CliUsageError(
+            `'${field}' is forbidden and must not be specified; the seat is determined by the frozen brief manifest`,
+          );
+        }
+      }
+
       const attemptId = str(p, 'attemptId');
       const existing = await rt.execution.attemptRepository.findAttemptById(attemptId);
       const worktreePath = str(p, 'worktreePath');
@@ -397,18 +404,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         seatOverride = { ...seatOverride, reason: str(p, 'overrideReason') };
       }
 
-      let modelAssignment =
-        nested<BriefModelAssignment & { agent?: string }>(p, 'modelAssignment') ??
-        (optStr(p, 'model')
-          ? {
-              model: str(p, 'model'),
-              variant: str(p, 'variant') || 'default',
-              fallbackModel: str(p, 'fallbackModel'),
-              agent: optStr(p, 'agent'),
-            }
-          : undefined);
-
-      let reviewerSeat =
+      const reviewerSeat =
         optStr(p, 'reviewerSeat') ??
         optStr(p, 'reviewerModel') ??
         existing?.reviewerSeat ??
@@ -417,38 +413,6 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
       const briefPackagePath =
         str(p, 'briefPackagePath') ||
         (worktreePath === '' ? '' : join(worktreePath, '.lane', 'brief.md'));
-
-      // If modelAssignment or reviewerSeat is not in input, read from the frozen brief package
-      if (!modelAssignment || !reviewerSeat) {
-        const candidatePaths = [
-          briefPackagePath ? briefPackagePath.replace(/\.md$/, '-manifest.json') : null,
-          briefPackagePath && worktreePath
-            ? join(worktreePath, briefPackagePath).replace(/\.md$/, '-manifest.json')
-            : null,
-          worktreePath ? join(worktreePath, '.lane', 'brief-manifest.json') : null,
-        ].filter((cp): cp is string => cp !== null && existsSync(cp));
-
-        for (const candidatePath of candidatePaths) {
-          try {
-            const raw = readFileSync(candidatePath, 'utf8');
-            const parsed = JSON.parse(raw) as Record<string, unknown>;
-            if (!modelAssignment && parsed && typeof parsed === 'object' && parsed.modelAssignment) {
-              modelAssignment = parsed.modelAssignment as BriefModelAssignment & { agent?: string };
-            }
-            if (
-              !reviewerSeat &&
-              parsed &&
-              typeof parsed === 'object' &&
-              typeof parsed.independentReviewer === 'string'
-            ) {
-              reviewerSeat = parsed.independentReviewer;
-            }
-            if (modelAssignment && reviewerSeat) break;
-          } catch {
-            // ignore
-          }
-        }
-      }
 
       return rt.execution.dispatchAttempt.dispatchAttempt({
         attemptId,
@@ -462,11 +426,8 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         expectedArtifacts: strArr(p, 'expectedArtifacts'),
         requiredCapabilities,
         nowIso: optStr(p, 'nowIso'),
-        modelAssignment,
         seatOverride,
         reviewerSeat,
-        runnerPort: optNum(p, 'runnerPort') ?? optNum(p, 'remotePort'),
-        runnerHost: optStr(p, 'runnerHost') ?? optStr(p, 'remoteHost'),
       });
     },
     reconcile: async (p, rt) =>

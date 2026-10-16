@@ -94,6 +94,7 @@ export interface StopRunnerSessionRequest {
   readonly sessionId: string;
   readonly gracePeriodSeconds: number;
   readonly worktreePath?: string;
+  readonly runner?: AttemptRunnerRecord | null;
 }
 
 /**
@@ -104,6 +105,7 @@ export interface StopRunnerSessionRequest {
 export type StopRunnerSessionResult =
   | { readonly outcome: 'terminated'; readonly receipt: CommandCompletionReceipt }
   | { readonly outcome: 'still-running'; readonly reason: string }
+  | { readonly outcome: 'refused'; readonly reason: string }
   | { readonly outcome: 'unknown'; readonly reason: string };
 
 export interface ExecutionRunnerPort {

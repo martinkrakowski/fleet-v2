@@ -459,6 +459,17 @@ describe('WorkspaceAdapter', () => {
     expect(inspection.residueFromEarlierAttempts).toEqual(['.lane/brief.md', '.lane/notes.md']);
     expect(inspection.missingExpectedArtifacts).toEqual([]);
   });
+
+  it('reads a worktree file when present and returns null when absent', async () => {
+    const repoPath = await createGitRepo();
+    await fs.writeFile(path.join(repoPath, 'config.json'), '{"hello":"world"}', 'utf8');
+    const adapter = new WorkspaceAdapter();
+    const content = await adapter.readWorktreeFile(repoPath, 'config.json');
+    expect(content).toBe('{"hello":"world"}');
+
+    const missing = await adapter.readWorktreeFile(repoPath, 'nonexistent.json');
+    expect(missing).toBeNull();
+  });
 });
 
 describe('BriefAuthoringAdapter', () => {
@@ -666,6 +677,22 @@ describe('AttemptArtifactAdapter', () => {
     expect(result.outcome).toBe('collected');
     if (result.outcome !== 'collected') return;
     expect(result.artifacts.collectedArtifactPaths).toEqual(['README.md', '.lane/notes.md']);
+  });
+
+  it('reads a brief manifest when present and returns null when absent', async () => {
+    const repoPath = await createGitRepo();
+    await fs.mkdir(path.join(repoPath, '.lane'), { recursive: true });
+    await fs.writeFile(
+      path.join(repoPath, '.lane', 'brief-manifest.json'),
+      '{"modelAssignment":{"model":"glm-5"}}',
+      'utf8',
+    );
+    const adapter = new AttemptArtifactAdapter();
+    const content = await adapter.readBriefManifest(repoPath);
+    expect(content).toBe('{"modelAssignment":{"model":"glm-5"}}');
+
+    const missing = await adapter.readBriefManifest(repoPath, path.join(repoPath, '.lane', 'missing-manifest.json'));
+    expect(missing).toBeNull();
   });
 });
 
@@ -1023,12 +1050,13 @@ describe('ExecutionRunnerAdapter', () => {
 
   it('terminates a session and returns an authoritative stop receipt', async () => {
     const { runner, calls } = scriptedRunner([{ exitCode: 0, stdout: 'aborted', stderr: '' }]);
-    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner });
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
     const result = await adapter.stopSession({
       attemptId: 'att-1',
       sessionId: 'ses_a',
       worktreePath: runnerWorktreePath,
       gracePeriodSeconds: 30,
+      runner: { remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
     });
     expect(result.outcome).toBe('terminated');
     if (result.outcome !== 'terminated') return;
@@ -1045,23 +1073,27 @@ describe('ExecutionRunnerAdapter', () => {
     const stillRunning = new ExecutionRunnerAdapter({
       runSubprocess: scriptedRunner([{ exitCode: 1, stdout: '', stderr: 'still running' }])
         .runner,
+      remotePort: 4166,
     });
     const still = await stillRunning.stopSession({
       attemptId: 'att-1',
       sessionId: 'ses_a',
       worktreePath: runnerWorktreePath,
       gracePeriodSeconds: 30,
+      runner: { remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
     });
     expect(still).toEqual({ outcome: 'still-running', reason: 'still running' });
 
     const throwing = new ExecutionRunnerAdapter({
       runSubprocess: scriptedRunner([new Error('abort failed')]).runner,
+      remotePort: 4166,
     });
     const thrown = await throwing.stopSession({
       attemptId: 'att-1',
       sessionId: 'ses_a',
       worktreePath: runnerWorktreePath,
       gracePeriodSeconds: 30,
+      runner: { remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
     });
     expect(thrown.outcome).toBe('unknown');
     if (thrown.outcome === 'unknown') {

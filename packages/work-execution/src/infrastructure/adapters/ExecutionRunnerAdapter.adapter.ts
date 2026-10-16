@@ -26,7 +26,6 @@ import type {
 import type {
   AttemptRecord,
   AttemptRunnerRecord,
-  AttemptSeatOverrideRecord,
   CommandCompletionReceipt,
 } from '../../domain/execution-records.js';
 
@@ -69,12 +68,6 @@ export interface ExecutionRunnerAdapterOptions {
   readonly agent?: string;
   readonly model?: string;
   readonly variant?: string;
-  /** Explicit seat override on adapter options. */
-  readonly seatOverride?: AttemptSeatOverrideRecord | {
-    readonly model: string;
-    readonly agent?: string;
-    readonly variant?: string;
-  };
   /** Optional resolver for cross-process lookup of an attempt's worktree path when not cached in memory. */
   readonly resolveWorktreePath?: (attemptId: string) => Promise<string | null> | string | null;
   /** Optional resolver for attempt record (used to verify recorded runner port/host). */
@@ -230,7 +223,7 @@ function parseSessionId(stdout: string): string | null {
 }
 
 /** An ssh destination that could inject options or split words never spawns. */
-export function isSafeSshHost(host: string): boolean {
+function isSafeSshHost(host: string): boolean {
   return host.length > 0 && !host.startsWith('-') && !/\s/.test(host);
 }
 
@@ -287,9 +280,9 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       return { outcome: 'refused', reason: `Unsafe OCM_HOST configured: ${remoteHost}` };
     }
 
-    // Determine seat: takes model, agent, variant from attempt manifest (modelAssignment) or request;
-    // adapter options may override ONLY when an explicit seatOverride option is set.
-    const seatOverride = this.options?.seatOverride ?? request.seatOverride;
+    // Determine seat: takes model, agent, variant from request seatOverride or model/assignment;
+    // adapter options no longer override seats.
+    const seatOverride = request.seatOverride;
     let model: string | undefined;
     let agent: string | undefined;
     let variant: string | undefined;
@@ -555,27 +548,66 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   }
 
   async stopSession(request: StopRunnerSessionRequest): Promise<StopRunnerSessionResult> {
+    // Resolve recorded runner
+    let recordedRunner = request.runner;
+    let attemptRecord: AttemptRecord | null = null;
+    if (!recordedRunner && this.options?.resolveAttempt) {
+      attemptRecord = await this.options.resolveAttempt(request.attemptId);
+      recordedRunner = attemptRecord?.runner ?? null;
+    }
+
+    // Refuse when attempt has no recorded port (legacy records without runner)
+    if (!recordedRunner || recordedRunner.remotePort === undefined || recordedRunner.remotePort === null) {
+      return { outcome: 'refused', reason: 'Attempt has no recorded runner port' };
+    }
+
+    const configuredPort = this.configuredRemotePort();
     const configuredHost = this.configuredRemoteHost();
+
     if (configuredHost !== null && !isSafeSshHost(configuredHost)) {
-      return { outcome: 'unknown', reason: `Unsafe OCM_HOST configured: ${configuredHost}` };
+      return { outcome: 'refused', reason: `Unsafe OCM_HOST configured: ${configuredHost}` };
+    }
+
+    if (
+      recordedRunner.host !== null &&
+      recordedRunner.host !== undefined &&
+      !isSafeSshHost(recordedRunner.host)
+    ) {
+      return { outcome: 'refused', reason: `Unsafe recorded runner host: ${recordedRunner.host}` };
+    }
+
+    // Refuse when configured port or host differs from recorded one
+    if (
+      configuredPort !== recordedRunner.remotePort ||
+      (configuredHost ?? null) !== (recordedRunner.host ?? null)
+    ) {
+      return {
+        outcome: 'refused',
+        reason: 'Configured runner port or host differs from recorded runner',
+      };
     }
 
     const resolved =
       request.worktreePath ??
       this.worktreeByAttemptId.get(request.attemptId) ??
       (await this.options?.resolveWorktreePath?.(request.attemptId)) ??
+      attemptRecord?.worktreePath ??
       (this.options?.resolveAttempt ? (await this.options.resolveAttempt(request.attemptId))?.worktreePath : null) ??
       null;
 
     // L1: never fall back to request.sessionId; refuse!
     if (!resolved || resolved.trim() === '') {
-      return { outcome: 'unknown', reason: 'Worktree directory not resolved for session abort' };
+      return { outcome: 'refused', reason: 'Worktree directory not resolved for session abort' };
     }
 
     const dir = resolved;
     let result: SubprocessResult;
     try {
-      result = await this.run(this.binPath(), ['--abort', '--dir', dir], this.remotePortEnv());
+      result = await this.run(
+        this.binPath(),
+        ['--abort', '--dir', dir],
+        this.remotePortEnv(recordedRunner.remotePort, recordedRunner.host ?? undefined),
+      );
     } catch (error) {
       return { outcome: 'unknown', reason: `Abort command failed: ${String(error)}` };
     }

@@ -222,4 +222,29 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
       );
     }
   }
+
+  async readBriefManifest(worktreePath: string, manifestPath?: string): Promise<string | null> {
+    if (this.options?.sshHost && !existsSync(worktreePath) && !isSafeSshHost(this.options.sshHost)) {
+      throw new Error(`Refusing to read manifest: unsafe SSH host '${this.options.sshHost}'`);
+    }
+    const targetPath = manifestPath ?? path.join(worktreePath, '.lane', 'brief-manifest.json');
+    const sshHost = this.useRemote(worktreePath);
+    if (sshHost === null) {
+      try {
+        return await fs.readFile(targetPath, 'utf8');
+      } catch {
+        return null;
+      }
+    }
+    try {
+      const { stdout } = await execFileAsync('ssh', [
+        sshHost,
+        '--',
+        `cat ${posixQuote(targetPath)}`,
+      ]);
+      return stdout;
+    } catch {
+      return null;
+    }
+  }
 }

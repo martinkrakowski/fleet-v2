@@ -18,7 +18,11 @@ import type { WorkOrderRepositoryPort } from './application/ports/out/WorkOrderR
 import type { AttemptRepositoryPort } from './application/ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from './application/ports/out/ExecutionJournalPort.out-port.js';
 import type { WorkspacePort } from './application/ports/out/WorkspacePort.out-port.js';
-import type { ExecutionRunnerPort } from './application/ports/out/ExecutionRunnerPort.out-port.js';
+import type {
+  ExecutionRunnerPort,
+  StartRunnerSessionRequest,
+} from './application/ports/out/ExecutionRunnerPort.out-port.js';
+import type { DispatchAttemptRequest } from './application/ports/in/DispatchAttemptPort.in-port.js';
 
 function createMockWorkOrder(overrides?: Partial<WorkOrderRecord>): WorkOrderRecord {
   return {
@@ -55,6 +59,13 @@ function createMockAttempt(overrides?: Partial<AttemptRecord>): AttemptRecord {
     sessionId: 'ses_test_123',
     completionReceipt: null,
     artifacts: null,
+    runner: {
+      remotePort: 4166,
+      host: null,
+      agent: null,
+      model: 'nvidia/z-ai/glm-5.3',
+      variant: null,
+    },
     createdAtIso: '2026-10-15T00:00:00.000Z',
     updatedAtIso: '2026-10-15T00:00:00.000Z',
     ...overrides,
@@ -177,7 +188,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
       expect(spawned).toBe(false);
     });
 
-    it('allows adapter options.seatOverride to override manifest seat when set', async () => {
+    it('uses request.seatOverride during startSession', async () => {
       const invocations: Array<{ args: readonly string[] }> = [];
       const runner: SubprocessRunner = async (_cmd, args) => {
         invocations.push({ args });
@@ -186,11 +197,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
 
       const adapter = new ExecutionRunnerAdapter({
         runSubprocess: runner,
-        seatOverride: {
-          model: 'anthropic/claude-3-5-sonnet',
-          variant: 'high',
-          agent: 'override-agent',
-        },
       });
 
       const result = await adapter.startSession({
@@ -201,10 +207,12 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         stepLimit: 100,
         timeLimitSeconds: 3600,
         requiredCapabilities: adapter.describeCapabilities(),
-        modelAssignment: {
-          model: 'nvidia/z-ai/glm-5.3',
-          variant: 'low',
-          fallbackModel: 'openai/gpt-4o',
+        seatOverride: {
+          model: 'anthropic/claude-3-5-sonnet',
+          variant: 'high',
+          agent: 'override-agent',
+          reason: 'Test override',
+          setBy: 'test',
         },
       });
 
@@ -215,7 +223,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
       expect(args[args.indexOf('--agent') + 1]).toBe('override-agent');
     });
 
-    it('does not let options.model override request model when options.seatOverride is not set', async () => {
+    it('does not let options.model override request model', async () => {
       const invocations: Array<{ args: readonly string[] }> = [];
       const runner: SubprocessRunner = async (_cmd, args) => {
         invocations.push({ args });
@@ -280,6 +288,14 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           residueFromEarlierAttempts: [],
           missingExpectedArtifacts: [],
         }),
+        readWorktreeFile: async () =>
+          JSON.stringify({
+            modelAssignment: {
+              model: 'nvidia/z-ai/glm-5.3',
+              variant: 'low',
+              agent: 'lane-agent',
+            },
+          }),
       };
 
       const runnerPort: ExecutionRunnerPort = {
@@ -335,12 +351,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         stepLimit: 100,
         timeLimitSeconds: 3600,
         requiredCapabilities: runnerPort.describeCapabilities(),
-        modelAssignment: {
-          model: 'nvidia/z-ai/glm-5.3',
-          variant: 'low',
-          fallbackModel: 'openai/gpt-4o',
-          agent: 'lane-agent',
-        },
       });
 
       expect(result.outcome).toBe('started');
@@ -706,9 +716,17 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         attemptId: 'att-unknown-dir',
         sessionId: 'ses_fallback_test',
         gracePeriodSeconds: 10,
+        runner: {
+          remotePort: 4166,
+          host: null,
+          agent: null,
+          model: 'model',
+          variant: null,
+        },
       });
 
-      expect(result.outcome).toBe('unknown');
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('Worktree directory not resolved');
       expect(executedArgs).toHaveLength(0);
     });
   });
@@ -723,6 +741,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
 
       const adapter = new ExecutionRunnerAdapter({
         runSubprocess: runner,
+        remotePort: 4166,
       });
 
       const result = await adapter.stopSession({
@@ -730,6 +749,13 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         sessionId: 'ses_abort_test',
         worktreePath: '/worktrees/lane-1',
         gracePeriodSeconds: 10,
+        runner: {
+          remotePort: 4166,
+          host: null,
+          agent: null,
+          model: 'model',
+          variant: null,
+        },
       });
 
       expect(result.outcome).toBe('terminated');
@@ -884,6 +910,15 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           residueFromEarlierAttempts: [],
           missingExpectedArtifacts: [],
         }),
+        readWorktreeFile: async () =>
+          JSON.stringify({
+            modelAssignment: {
+              model: 'nvidia/z-ai/glm-5.3',
+              variant: 'default',
+              fallbackModel: 'openai/gpt-4o',
+            },
+            independentReviewer: 'reviewer-seat-1',
+          }),
       };
 
       let startedModel: string | undefined;
@@ -956,15 +991,11 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           authoritativeCompletion: true,
           artifactPersistence: true,
         },
-        modelAssignment: {
-          model: 'nvidia/z-ai/glm-5.3',
-          variant: 'default',
-          fallbackModel: 'openai/gpt-4o',
-        },
         seatOverride: {
           model: 'anthropic/claude-3-5-sonnet',
           reason: '', // Empty reason!
           setBy: 'operator',
+          expiresAtIso: '2026-10-15T23:59:59.000Z',
         },
       });
 
@@ -993,11 +1024,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           artifactPersistence: true,
         },
         nowIso: '2026-10-15T12:00:00.000Z',
-        modelAssignment: {
-          model: 'nvidia/z-ai/glm-5.3',
-          variant: 'default',
-          fallbackModel: 'openai/gpt-4o',
-        },
         seatOverride: {
           model: 'anthropic/claude-3-5-sonnet',
           reason: 'Need higher reasoning',
@@ -1033,15 +1059,12 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           authoritativeCompletion: true,
           artifactPersistence: true,
         },
-        modelAssignment: {
-          model: 'anthropic/claude-3-5-sonnet',
-          variant: 'default',
-          fallbackModel: 'openai/gpt-4o',
-        },
+        nowIso: '2026-10-15T12:00:00.000Z',
         seatOverride: {
           model: 'nvidia/z-ai/glm-5.3#low', // Same underlying family as openrouter/z-ai/glm-5.3!
           reason: 'Trying glm',
           setBy: 'operator',
+          expiresAtIso: '2026-10-15T23:59:59.000Z',
         },
       });
 
@@ -1071,11 +1094,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           processTreeTermination: true,
           authoritativeCompletion: true,
           artifactPersistence: true,
-        },
-        modelAssignment: {
-          model: 'nvidia/z-ai/glm-5.3',
-          variant: 'default',
-          fallbackModel: 'openai/gpt-4o',
         },
         nowIso: '2026-10-15T12:00:00.000Z',
         seatOverride: {
@@ -1263,4 +1281,536 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
       expect(capturedEnv?.OCM_HOST).toBe('runner-node-01.internal');
     });
   });
+
+  describe('10. Recorded Runner Gate for stopSession and StopAttemptUseCase', () => {
+    it('stopSession refuses without spawn when port does not match recorded port', async () => {
+      let spawned = false;
+      const runner: SubprocessRunner = async () => {
+        spawned = true;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remotePort: 4166,
+      });
+
+      const result = await adapter.stopSession({
+        attemptId: 'att-1',
+        sessionId: 'ses_1',
+        gracePeriodSeconds: 0,
+        worktreePath: '/worktrees/lane-1',
+        runner: {
+          remotePort: 4167,
+          host: null,
+          agent: null,
+          model: 'model',
+          variant: null,
+        },
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('differs from recorded runner');
+      expect(spawned).toBe(false);
+    });
+
+    it('StopAttemptUseCase holds capacity and does not cancel when stop is refused due to wrong port', async () => {
+      let spawned = false;
+      const runnerSubprocess: SubprocessRunner = async () => {
+        spawned = true;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const runnerAdapter = new ExecutionRunnerAdapter({
+        runSubprocess: runnerSubprocess,
+        remotePort: 4166,
+      });
+
+      const attempt = createMockAttempt({
+        id: 'att-wrong-port',
+        state: 'running',
+        runner: {
+          remotePort: 4167,
+          host: null,
+          agent: null,
+          model: 'model',
+          variant: null,
+        },
+      });
+
+      const attempts = new Map<string, AttemptRecord>([[attempt.id, attempt]]);
+      const attemptRepo: AttemptRepositoryPort = {
+        findAttemptById: async (id) => attempts.get(id) ?? null,
+        saveAttempt: async (rec) => {
+          attempts.set(rec.id, rec);
+        },
+        listAttemptsByWorkOrder: async () => [...attempts.values()],
+        listAllAttempts: async () => [...attempts.values()],
+      };
+      const journal = createInMemoryJournal();
+
+      const useCase = new StopAttemptUseCase({
+        attemptRepo,
+        journal,
+        runner: runnerAdapter,
+      });
+
+      const result = await useCase.stopAttempt({ attemptId: attempt.id });
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('differs from recorded runner');
+      expect(spawned).toBe(false);
+
+      const saved = attempts.get(attempt.id)!;
+      expect(saved.state).toBe('running');
+      expect(saved.outcome).toBeNull();
+      expect(journal.reservations[0].held).toBe(true);
+    });
+
+    it('stopSession refuses without spawn when attempt has no runner record (legacy record)', async () => {
+      let spawned = false;
+      const runner: SubprocessRunner = async () => {
+        spawned = true;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remotePort: 4166,
+      });
+
+      const result = await adapter.stopSession({
+        attemptId: 'att-legacy',
+        sessionId: 'ses_1',
+        gracePeriodSeconds: 0,
+        worktreePath: '/worktrees/lane-1',
+        runner: null,
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('no recorded runner port');
+      expect(spawned).toBe(false);
+    });
+
+    it('stopSession refuses without spawn when recorded runner host is unsafe', async () => {
+      let spawned = false;
+      const runner: SubprocessRunner = async () => {
+        spawned = true;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remotePort: 4166,
+      });
+
+      const result = await adapter.stopSession({
+        attemptId: 'att-unsafe',
+        sessionId: 'ses_1',
+        gracePeriodSeconds: 0,
+        worktreePath: '/worktrees/lane-1',
+        runner: {
+          remotePort: 4166,
+          host: '-unsafe-flag',
+          agent: null,
+          model: 'model',
+          variant: null,
+        },
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('Unsafe recorded runner host');
+      expect(spawned).toBe(false);
+    });
+
+    it('stopSession spawns abort with recorded port when port matches', async () => {
+      let capturedArgs: readonly string[] = [];
+      let capturedEnv: Readonly<Record<string, string>> | undefined;
+      const runner: SubprocessRunner = async (_cmd, args, env) => {
+        capturedArgs = args;
+        capturedEnv = env;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remotePort: 4166,
+      });
+
+      const result = await adapter.stopSession({
+        attemptId: 'att-matching',
+        sessionId: 'ses_1',
+        gracePeriodSeconds: 0,
+        worktreePath: '/worktrees/lane-1',
+        runner: {
+          remotePort: 4166,
+          host: null,
+          agent: null,
+          model: 'model',
+          variant: null,
+        },
+      });
+
+      expect(result.outcome).toBe('terminated');
+      expect(capturedArgs).toEqual(['--abort', '--dir', '/worktrees/lane-1']);
+      expect(capturedEnv?.OCM_REMOTE_PORT).toBe('4166');
+    });
+  });
+
+  describe('11. Frozen Seat Fidelity and Dispatch Validation', () => {
+    function setupDispatchWithCustomWorkspace(
+      workspace: WorkspacePort,
+      runnerPortOverrides?: Partial<ExecutionRunnerPort>,
+    ) {
+      const workOrder = createMockWorkOrder();
+      const attempts = new Map<string, AttemptRecord>();
+      const journal = createInMemoryJournal();
+      for (const id of ['att-remote-1', 'att-unreadable', 'att-no-port', 'att-tz-1', 'att-tz-2']) {
+        journal.reservations.push({
+          id: `res-${id}`,
+          attemptId: id,
+          hostId: 'host-1',
+          slotIndex: 0,
+          held: true,
+          reservedAtIso: '2026-10-15T00:00:00.000Z',
+          releasedAtIso: null,
+        });
+      }
+
+      const workOrderRepo: WorkOrderRepositoryPort = {
+        findWorkOrderById: async (id) => (id === workOrder.id ? workOrder : null),
+        saveWorkOrder: async () => {},
+        listWorkOrdersByProject: async () => [workOrder],
+      };
+
+      const attemptRepo: AttemptRepositoryPort = {
+        findAttemptById: async (id) => attempts.get(id) ?? null,
+        saveAttempt: async (rec) => {
+          attempts.set(rec.id, rec);
+        },
+        listAttemptsByWorkOrder: async () => [...attempts.values()],
+        listAllAttempts: async () => [...attempts.values()],
+      };
+
+      let startedSessionReq: StartRunnerSessionRequest | undefined;
+      const defaultRunner: ExecutionRunnerPort = {
+        describeCapabilities: () => ({
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        }),
+        describeRunner: () => ({
+          remotePort: 4166,
+          host: null,
+          agent: null,
+          model: null,
+          variant: null,
+        }),
+        startSession: async (req) => {
+          startedSessionReq = req;
+          return {
+            outcome: 'started',
+            sessionId: 'ses_dispatch_test',
+            runner: {
+              remotePort: 4166,
+              host: null,
+              agent: req.agent ?? null,
+              model: req.model ?? null,
+              variant: req.variant ?? null,
+            },
+          };
+        },
+        inspectSession: async () => {
+          throw new Error('Not used');
+        },
+        stopSession: async () => {
+          throw new Error('Not used');
+        },
+      };
+
+      const runnerPort = { ...defaultRunner, ...runnerPortOverrides };
+
+      const useCase = new DispatchAttemptUseCase({
+        workOrderRepo,
+        attemptRepo,
+        journal,
+        workspace,
+        runner: runnerPort,
+      });
+
+      return { useCase, attempts, journal, getStartedSessionReq: () => startedSessionReq };
+    }
+
+    it('refuses dispatch if request carries forbidden model field', async () => {
+      const { useCase, getStartedSessionReq } = setupDispatchWithCustomWorkspace({
+        inspectWorktree: async (req) => ({
+          worktreePath: req.worktreePath,
+          matchesBaseCommit: true,
+          checkedOutCommit: 'commit-base-123',
+          uncommittedPaths: [],
+          untrackedPaths: [],
+          residueFromEarlierAttempts: [],
+          missingExpectedArtifacts: [],
+        }),
+        readWorktreeFile: async () => JSON.stringify({ modelAssignment: { model: 'seat-1' } }),
+      });
+
+      const result = await useCase.dispatchAttempt({
+        attemptId: 'att-1',
+        workOrderId: 'wo-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        briefDigest: 'digest-1',
+        baseCommit: 'commit-base-123',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: {
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        },
+        model: 'forbidden-model-override',
+      } as unknown as DispatchAttemptRequest);
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain("'model' must not be specified");
+      expect(getStartedSessionReq()).toBeUndefined();
+    });
+
+    it('resolves seat from frozen brief manifest on remote worktree read through port', async () => {
+      let readWorktreeArgs: { worktreePath: string; relativePath: string } | undefined;
+      const { useCase, getStartedSessionReq, attempts } = setupDispatchWithCustomWorkspace({
+        inspectWorktree: async (req) => ({
+          worktreePath: req.worktreePath,
+          matchesBaseCommit: true,
+          checkedOutCommit: 'commit-base-123',
+          uncommittedPaths: [],
+          untrackedPaths: [],
+          residueFromEarlierAttempts: [],
+          missingExpectedArtifacts: [],
+        }),
+        readWorktreeFile: async (worktreePath, relativePath) => {
+          readWorktreeArgs = { worktreePath, relativePath };
+          return JSON.stringify({
+            modelAssignment: {
+              model: 'remote-manifest-seat-model',
+              agent: 'remote-agent',
+              variant: 'fast',
+            },
+          });
+        },
+      });
+
+      const result = await useCase.dispatchAttempt({
+        attemptId: 'att-remote-1',
+        workOrderId: 'wo-1',
+        worktreePath: '/ssh-remote-worktree/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        briefDigest: 'digest-1',
+        baseCommit: 'commit-base-123',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: {
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        },
+      });
+
+      expect(result.outcome).toBe('started');
+      expect(readWorktreeArgs).toEqual({
+        worktreePath: '/ssh-remote-worktree/lane-1',
+        relativePath: '.lane/brief.md',
+      });
+      const started = getStartedSessionReq();
+      expect(started).toBeDefined();
+      if (!started) {
+        throw new Error('started session request must be defined');
+      }
+      expect(started.model).toBe('remote-manifest-seat-model');
+      expect(started.agent).toBe('remote-agent');
+      expect(started.variant).toBe('fast');
+
+      const saved = attempts.get('att-remote-1')!;
+      expect(saved.runner?.model).toBe('remote-manifest-seat-model');
+      expect(saved.runner?.remotePort).toBe(4166);
+    });
+
+    it('refuses dispatch and touches no runner when brief manifest cannot be read through port', async () => {
+      let runnerStarted = false;
+      const { useCase } = setupDispatchWithCustomWorkspace(
+        {
+          inspectWorktree: async (req) => ({
+            worktreePath: req.worktreePath,
+            matchesBaseCommit: true,
+            checkedOutCommit: 'commit-base-123',
+            uncommittedPaths: [],
+            untrackedPaths: [],
+            residueFromEarlierAttempts: [],
+            missingExpectedArtifacts: [],
+          }),
+          readWorktreeFile: async () => null,
+        },
+        {
+          startSession: async () => {
+            runnerStarted = true;
+            throw new Error('Should not be called');
+          },
+        },
+      );
+
+      const result = await useCase.dispatchAttempt({
+        attemptId: 'att-unreadable',
+        workOrderId: 'wo-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        briefDigest: 'digest-1',
+        baseCommit: 'commit-base-123',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: {
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        },
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('Unable to read frozen brief manifest');
+      expect(runnerStarted).toBe(false);
+    });
+
+    it('refuses dispatch and mutates no reservation when no runner port can be described', async () => {
+      let runnerStarted = false;
+      const { useCase, journal } = setupDispatchWithCustomWorkspace(
+        {
+          inspectWorktree: async (req) => ({
+            worktreePath: req.worktreePath,
+            matchesBaseCommit: true,
+            checkedOutCommit: 'commit-base-123',
+            uncommittedPaths: [],
+            untrackedPaths: [],
+            residueFromEarlierAttempts: [],
+            missingExpectedArtifacts: [],
+          }),
+          readWorktreeFile: async () => JSON.stringify({ modelAssignment: { model: 'model-1' } }),
+        },
+        {
+          describeRunner: () => undefined,
+          startSession: async () => {
+            runnerStarted = true;
+            throw new Error('Should not be called');
+          },
+        },
+      );
+
+      const result = await useCase.dispatchAttempt({
+        attemptId: 'att-no-port',
+        workOrderId: 'wo-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        briefDigest: 'digest-1',
+        baseCommit: 'commit-base-123',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: {
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        },
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('No runner port can be described for dispatch');
+      expect(runnerStarted).toBe(false);
+      expect(journal.entries.filter((e) => e.attemptId === 'att-no-port')).toHaveLength(0);
+    });
+
+    it('compares seat override expiry with Date.parse correctly across timezones', async () => {
+      const { useCase } = setupDispatchWithCustomWorkspace({
+        inspectWorktree: async (req) => ({
+          worktreePath: req.worktreePath,
+          matchesBaseCommit: true,
+          checkedOutCommit: 'commit-base-123',
+          uncommittedPaths: [],
+          untrackedPaths: [],
+          residueFromEarlierAttempts: [],
+          missingExpectedArtifacts: [],
+        }),
+        readWorktreeFile: async () => JSON.stringify({ modelAssignment: { model: 'seat-1' } }),
+      });
+
+      const resultExpired = await useCase.dispatchAttempt({
+        attemptId: 'att-tz-1',
+        workOrderId: 'wo-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        briefDigest: 'digest-1',
+        baseCommit: 'commit-base-123',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: {
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        },
+        nowIso: '2026-10-15T12:00:00.000Z',
+        seatOverride: {
+          model: 'anthropic/claude-3-5-sonnet',
+          reason: 'Timezone test expired',
+          setBy: 'operator',
+          expiresAtIso: '2026-10-15T13:00:00+02:00',
+        },
+      });
+
+      expect(resultExpired.outcome).toBe('refused');
+      expect((resultExpired as { reason: string }).reason).toContain('expired at');
+
+      const resultValid = await useCase.dispatchAttempt({
+        attemptId: 'att-tz-2',
+        workOrderId: 'wo-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        briefDigest: 'digest-1',
+        baseCommit: 'commit-base-123',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: {
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        },
+        nowIso: '2026-10-15T12:00:00.000Z',
+        seatOverride: {
+          model: 'anthropic/claude-3-5-sonnet',
+          reason: 'Timezone test valid',
+          setBy: 'operator',
+          expiresAtIso: '2026-10-15T11:00:00-02:00',
+        },
+      });
+
+      expect(resultValid.outcome).toBe('started');
+    });
+  });
 });
+

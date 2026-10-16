@@ -166,4 +166,70 @@ describe('AttemptArtifactAdapter SSH host validation and invocation', () => {
       expect(args[1]).toBe('--');
     }
   });
+
+  it('refuses readBriefManifest when sshHost is unsafe and spawns no subprocess', async () => {
+    const adapter = new AttemptArtifactAdapter({ sshHost: '-oProxyCommand=x' });
+
+    await expect(
+      adapter.readBriefManifest('/nonexistent/remote/worktree'),
+    ).rejects.toThrow(/unsafe SSH host/);
+
+    expect(execFileMock).not.toHaveBeenCalled();
+  });
+
+  it('inserts -- before the command on safe host during readBriefManifest', async () => {
+    execFileMock.mockImplementation(
+      (_file: string, _args: readonly string[], cb: ExecFileCallback | undefined) => {
+        if (cb) {
+          cb(null, { stdout: '{"safe":true}', stderr: '' });
+        }
+      },
+    );
+
+    const adapter = new AttemptArtifactAdapter({ sshHost: 'midnight' });
+    const content = await adapter.readBriefManifest('/nonexistent/remote/worktree');
+
+    expect(content).toBe('{"safe":true}');
+    expect(execFileMock).toHaveBeenCalled();
+    const [cmd, args] = execFileMock.mock.calls[0] as [string, readonly string[]];
+    expect(cmd).toBe('ssh');
+    expect(args[0]).toBe('midnight');
+    expect(args[1]).toBe('--');
+  });
+});
+
+describe('WorkspaceAdapter.readWorktreeFile SSH host validation and invocation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('refuses readWorktreeFile when sshHost is unsafe and spawns no subprocess', async () => {
+    const adapter = new WorkspaceAdapter({ sshHost: '-oProxyCommand=x' });
+
+    await expect(
+      adapter.readWorktreeFile('/nonexistent/remote/worktree', '.lane/brief-manifest.json'),
+    ).rejects.toThrow(/unsafe SSH host/);
+
+    expect(execFileMock).not.toHaveBeenCalled();
+  });
+
+  it('inserts -- before the command on safe host during readWorktreeFile', async () => {
+    execFileMock.mockImplementation(
+      (_file: string, _args: readonly string[], cb: ExecFileCallback | undefined) => {
+        if (cb) {
+          cb(null, { stdout: 'file-contents', stderr: '' });
+        }
+      },
+    );
+
+    const adapter = new WorkspaceAdapter({ sshHost: 'midnight' });
+    const content = await adapter.readWorktreeFile('/nonexistent/remote/worktree', '.lane/brief-manifest.json');
+
+    expect(content).toBe('file-contents');
+    expect(execFileMock).toHaveBeenCalled();
+    const [cmd, args] = execFileMock.mock.calls[0] as [string, readonly string[]];
+    expect(cmd).toBe('ssh');
+    expect(args[0]).toBe('midnight');
+    expect(args[1]).toBe('--');
+  });
 });

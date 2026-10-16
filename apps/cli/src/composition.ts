@@ -51,6 +51,7 @@ import {
   isSafeSshHost,
   observationEventKind,
   type GhInvocationResult,
+  type SubprocessRunner,
 } from '@fleet/work-execution';
 
 import {
@@ -122,6 +123,8 @@ export interface FleetCliRuntimeOptions {
   readonly worktreeSshHost?: string;
   /** Owner Ed25519 public key in base64 format for verifying approved decisions. */
   readonly ownerPublicKey?: string;
+  /** Deterministic subprocess execution for runner tests. */
+  readonly runSubprocess?: SubprocessRunner;
 }
 
 export interface ResolvedRunnerSettings {
@@ -580,6 +583,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     variant: runnerVariant,
     remotePort: runnerRemotePort,
     remoteHost: runnerRemoteHost,
+    runSubprocess: options?.runSubprocess,
     resolveWorktreePath: async (attemptId) =>
       (await attemptRepository.findAttemptById(attemptId))?.worktreePath ?? null,
     resolveAttempt: async (attemptId) =>
@@ -926,6 +930,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       workspace,
       runner,
       observation: executionObservation,
+      artifactPort: attemptArtifact,
     }),
     reconcileAttempt: new ReconcileAttemptUseCase({
       attemptRepo: attemptRepository,

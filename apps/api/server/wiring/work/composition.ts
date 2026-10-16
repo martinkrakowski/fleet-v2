@@ -237,6 +237,7 @@ export function createConfiguredWorkComposition(
       workspace,
       runner,
       observation,
+      artifactPort,
     }),
     reconcileAttempt: new ReconcileAttemptUseCase({ attemptRepo, journal, runner }),
     stopAttempt: new StopAttemptUseCase({ attemptRepo, journal, runner }),

@@ -91,6 +91,7 @@ function assessmentProps(overrides: Partial<EvidenceAssessmentProps> = {}): Evid
     attemptId: 'att-1',
     candidateHeadSha: 'sha-1',
     policyRevision: 'policy-7',
+    implementerModel: 'provider-b/model-implementer',
     requiredChecks: ['ci', 'unit-tests'],
     state: 'pending',
     verificationReceipts: [],

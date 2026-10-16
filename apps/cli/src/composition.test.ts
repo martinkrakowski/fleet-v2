@@ -152,6 +152,7 @@ describe('apps/cli composition', () => {
         attemptId,
         candidateHeadSha: headH,
         policyRevision: 'pol-1',
+        implementerModel: 'implementer-mod',
         requiredChecks: [],
         state: 'accepted',
         verificationReceipts: [],
@@ -216,6 +217,7 @@ describe('apps/cli composition', () => {
         attemptId,
         candidateHeadSha: headH,
         policyRevision: 'pol-1',
+        implementerModel: 'implementer-mod',
         requiredChecks: [],
         state: 'stale',
         verificationReceipts: [],
@@ -274,6 +276,7 @@ describe('apps/cli composition', () => {
         attemptId,
         candidateHeadSha: headH,
         policyRevision: 'pol-1',
+        implementerModel: 'implementer-mod',
         requiredChecks: [],
         state: 'accepted',
         verificationReceipts: [],
@@ -329,6 +332,7 @@ describe('apps/cli composition', () => {
         attemptId,
         candidateHeadSha: HEAD,
         policyRevision: 'pol-1',
+        implementerModel: 'implementer-mod',
         requiredChecks: [],
         state: options.state ?? 'pending',
         verificationReceipts: [],
@@ -505,6 +509,12 @@ describe('apps/cli composition', () => {
       doors: [doorRef],
       state: 'accepted',
       decision: makeOwnerDecisionRequest(doorRef, HEAD),
+    });
+    // The attempt was dispatched on a recorded seat, so the acceptance use
+    // case can bind the implementer and reach the door re-check.
+    await rt.execution.attemptRepository.saveAttempt({
+      ...makeAttempt('att-door-e2e', 'wo-att-door-e2e', HEAD, [doorRef]),
+      runner: { remotePort: 0, host: null, agent: null, model: 'seat/implementer', variant: null },
     });
     const grantId = 'grant-door-e2e';
     await rt.coordination.coordinationRequestRepository.saveRequest(

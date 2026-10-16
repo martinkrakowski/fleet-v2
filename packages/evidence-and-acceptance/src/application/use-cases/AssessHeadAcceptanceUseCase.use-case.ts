@@ -15,6 +15,7 @@
 
 import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
+import { underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { ForgeEvidencePort } from '../ports/out/ForgeEvidencePort.out-port.js';
 import type { OwnerDecisionPort } from '../ports/out/OwnerDecisionPort.out-port.js';
@@ -65,18 +66,43 @@ function collectCheckBlockers(assessment: EvidenceAssessmentRecord): readonly st
   return blockers;
 }
 
-/** At least one attributable read-only review that passed for this head. */
+/**
+ * At least one attributable read-only review that passed for this head, where
+ * every receipt counted is re-checked against the implementer seat the
+ * assessment recorded at creation: a reviewer sharing the implementer's
+ * underlying model family, or a receipt whose implementer field differs from
+ * the recorded seat, is not independent evidence and is named as a blocker.
+ */
 function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly string[] {
   const reviews: readonly ReviewReceiptRecord[] = assessment.reviewReceipts.filter(
     (receipt) => receipt.candidateHeadSha === assessment.candidateHeadSha,
   );
-  const passing = reviews.some(
-    (receipt) => receipt.readOnlyVerified && receipt.result === 'pass',
-  );
   if (reviews.length === 0) {
     return ['no independent review was recorded for this candidate head'];
   }
-  return passing ? [] : ['no read-only independent review passed for this candidate head'];
+  const blockers: string[] = [];
+  let passing = false;
+  for (const receipt of reviews) {
+    if (receipt.implementerModel !== assessment.implementerModel) {
+      blockers.push(
+        `review receipt '${receipt.id}' is not independent: it records implementer '${receipt.implementerModel}' instead of the assessment's seat '${assessment.implementerModel}'`,
+      );
+      continue;
+    }
+    if (underlyingModelFamily(receipt.reviewerModel) === underlyingModelFamily(assessment.implementerModel)) {
+      blockers.push(
+        `review receipt '${receipt.id}' is not independent: reviewer '${receipt.reviewerModel}' shares the implementer's model family '${underlyingModelFamily(assessment.implementerModel)}'`,
+      );
+      continue;
+    }
+    if (receipt.readOnlyVerified && receipt.result === 'pass') {
+      passing = true;
+    }
+  }
+  if (!passing && blockers.length === 0) {
+    return ['no read-only independent review passed for this candidate head'];
+  }
+  return blockers;
 }
 
 /** Unresolved findings block acceptance until they are fixed or refuted. */

@@ -71,6 +71,7 @@ function makePassingAssessmentRecord(
     attemptId: 'att-1',
     candidateHeadSha: '1111111111111111111111111111111111111111',
     policyRevision: 'pol-1',
+    implementerModel: 'implementer-model',
     requiredChecks: [],
     state: 'pending',
     verificationReceipts: [],

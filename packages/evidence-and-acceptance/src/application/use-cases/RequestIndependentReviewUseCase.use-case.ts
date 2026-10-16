@@ -111,6 +111,12 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
           'Assessment identity mismatch (projectId, attemptId, or policyRevision does not match existing assessment)',
       };
     }
+    if (existing.implementerModel !== request.implementerModel) {
+      return {
+        outcome: 'rejected',
+        reason: `Assessment '${existing.id}' was implemented on seat '${existing.implementerModel}', not '${request.implementerModel}'`,
+      };
+    }
 
     if (AssessmentState.create(existing.state).value?.isTerminal()) {
       return {

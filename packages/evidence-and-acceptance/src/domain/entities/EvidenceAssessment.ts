@@ -31,6 +31,8 @@ export interface EvidenceAssessmentProps {
   readonly attemptId: string;
   readonly candidateHeadSha: string;
   readonly policyRevision: string;
+  /** The implementer seat recorded at creation; absent means refused. */
+  readonly implementerModel: string;
   readonly requiredChecks: readonly string[];
   readonly state: AssessmentStateValue;
   readonly verificationReceipts: readonly VerificationReceiptRecord[];
@@ -64,12 +66,13 @@ export class EvidenceAssessment {
       !isNonEmptyTrimmedString(props.attemptId) ||
       !isNonEmptyTrimmedString(props.candidateHeadSha) ||
       !isNonEmptyTrimmedString(props.policyRevision) ||
+      !isNonEmptyTrimmedString(props.implementerModel) ||
       !isNonEmptyTrimmedString(props.updatedAtIso)
     ) {
       return {
         success: false,
         error: new Error(
-          'EvidenceAssessment requires non-empty id, projectId, attemptId, candidateHeadSha, policyRevision and updatedAtIso',
+          'EvidenceAssessment requires non-empty id, projectId, attemptId, candidateHeadSha, policyRevision, implementerModel and updatedAtIso',
         ),
       };
     }

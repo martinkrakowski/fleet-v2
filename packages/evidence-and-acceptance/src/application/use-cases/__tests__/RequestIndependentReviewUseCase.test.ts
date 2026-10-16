@@ -86,6 +86,7 @@ function sampleRecord(overrides: Partial<EvidenceAssessmentRecord> = {}): Eviden
     attemptId: 'att-1',
     candidateHeadSha: HEAD1,
     policyRevision: 'pol-1',
+    implementerModel: 'anthropic/claude-3-5-sonnet',
     requiredChecks: [],
     state: 'pending',
     verificationReceipts: [],

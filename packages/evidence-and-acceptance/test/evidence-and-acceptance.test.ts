@@ -36,6 +36,7 @@ function makeAssessmentRecord(overrides: Partial<EvidenceAssessmentRecord> = {})
     attemptId: 'att-1',
     candidateHeadSha: '0123456789abcdef0123456789abcdef01234567',
     policyRevision: 'pol-1',
+    implementerModel: 'provider-b/model-implementer',
     requiredChecks: ['unit-test'],
     state: 'pending',
     verificationReceipts: [],
@@ -169,6 +170,7 @@ describe('Use cases terminal assessment rejection (Fix 1)', () => {
         candidateHeadSha: initial.candidateHeadSha,
         policyRevision: initial.policyRevision,
         hostId: 'host-1',
+        implementerModel: 'provider-b/model-implementer',
         requiredChecks: ['unit-test'],
       });
 
@@ -200,7 +202,7 @@ describe('Use cases terminal assessment rejection (Fix 1)', () => {
         attemptId: initial.attemptId,
         candidateHeadSha: initial.candidateHeadSha,
         policyRevision: initial.policyRevision,
-        implementerModel: 'provider-a/impl-model',
+        implementerModel: 'provider-b/model-implementer',
         reviewerModel: 'provider-b/rev-model',
       });
 

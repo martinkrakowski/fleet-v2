@@ -14,6 +14,7 @@ function sampleProps(overrides: Partial<EvidenceAssessmentProps> = {}): Evidence
     attemptId: 'att-1',
     candidateHeadSha: HEAD,
     policyRevision: 'pol-1',
+    implementerModel: 'provider-b/model-implementer',
     requiredChecks: ['lint', 'test'],
     state: 'pending',
     verificationReceipts: [],

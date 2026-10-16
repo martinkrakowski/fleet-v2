@@ -50,6 +50,7 @@ function sampleRecord(overrides: Partial<EvidenceAssessmentRecord> = {}): Eviden
     attemptId: 'att-1',
     candidateHeadSha: HEAD,
     policyRevision: 'pol-1',
+    implementerModel: 'seat-b/implementer',
     requiredChecks: [],
     state: 'pending',
     verificationReceipts: [],
@@ -171,6 +172,79 @@ describe('AssessHeadAcceptanceUseCase', () => {
     if (result.outcome === 'accepted') {
       expect(result.receiptId).toContain('acc-asm-1');
       expect(result.assessment.state).toBe('accepted');
+    }
+  });
+
+  it('blocks acceptance when a seeded review receipt shares the implementer model family', async () => {
+    const violating = sampleRecord({
+      implementerModel: 'nvidia/abc/model-x',
+      reviewReceipts: [
+        {
+          id: 'rr-bad',
+          assessmentId: 'asm-1',
+          projectId: 'proj-1',
+          attemptId: 'att-1',
+          candidateHeadSha: HEAD,
+          reviewerModel: 'openrouter/abc/model-x',
+          implementerModel: 'seat-c/impostor',
+          readOnlyVerified: true,
+          result: 'pass',
+          findings: [],
+          evidenceRef: 'ref-1',
+          policyRevision: 'pol-1',
+          completedAtIso: '2026-10-15T12:00:00.000Z',
+        },
+      ],
+    });
+    const repo = new InMemoryAssessmentRepo([violating]);
+    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+
+    const result = await useCase.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockers.join('\n')).toContain('rr-bad');
+      expect(result.blockers.join('\n')).toContain('not independent');
+    }
+  });
+
+  it('blocks acceptance when a seeded review receipt records a different implementer seat', async () => {
+    const violating = sampleRecord({
+      reviewReceipts: [
+        {
+          id: 'rr-seat',
+          assessmentId: 'asm-1',
+          projectId: 'proj-1',
+          attemptId: 'att-1',
+          candidateHeadSha: HEAD,
+          reviewerModel: 'seat-a/reviewer',
+          implementerModel: 'seat-c/impostor',
+          readOnlyVerified: true,
+          result: 'pass',
+          findings: [],
+          evidenceRef: 'ref-1',
+          policyRevision: 'pol-1',
+          completedAtIso: '2026-10-15T12:00:00.000Z',
+        },
+      ],
+    });
+    const repo = new InMemoryAssessmentRepo([violating]);
+    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+
+    const result = await useCase.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockers.join('\n')).toContain('rr-seat');
+      expect(result.blockers.join('\n')).toContain('records implementer');
     }
   });
 });

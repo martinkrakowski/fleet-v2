@@ -79,6 +79,12 @@ export interface EvidenceAssessmentRecord {
   readonly attemptId: string;
   readonly candidateHeadSha: string;
   readonly policyRevision: string;
+  /**
+   * The implementer seat the assessment's attempt was dispatched on, recorded
+   * at assessment creation from the attempt itself. It is the independence
+   * reference every review receipt is checked against.
+   */
+  readonly implementerModel: string;
   readonly requiredChecks: readonly string[];
   readonly state: AssessmentStateValue;
   readonly verificationReceipts: readonly VerificationReceiptRecord[];

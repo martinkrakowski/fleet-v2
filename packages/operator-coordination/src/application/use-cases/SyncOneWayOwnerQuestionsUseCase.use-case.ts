@@ -23,7 +23,6 @@ import type {
 } from '../ports/in/SyncOneWayOwnerQuestionsPort.in-port.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import type { DecisionTransportPort } from '../ports/out/DecisionTransportPort.out-port.js';
-import { OwnerQuestionRevisionConflictError } from '../ports/out/OwnerQuestionRepositoryPort.out-port.js';
 import type { OwnerQuestionRepositoryPort } from '../ports/out/OwnerQuestionRepositoryPort.out-port.js';
 
 export interface SyncOneWayOwnerQuestionsDependencies {
@@ -60,7 +59,13 @@ export class SyncOneWayOwnerQuestionsUseCase implements SyncOneWayOwnerQuestions
         continue;
       }
       // The linked request is only ever read, never written.
-      const linked = await this.deps.requestRepo.findRequestById(linkedRequestId);
+      let linked: Awaited<ReturnType<typeof this.deps.requestRepo.findRequestById>>;
+      try {
+        linked = await this.deps.requestRepo.findRequestById(linkedRequestId);
+      } catch {
+        unchanged.push(record);
+        continue;
+      }
       if (linked === null) {
         unchanged.push(record);
         continue;
@@ -108,12 +113,10 @@ export class SyncOneWayOwnerQuestionsUseCase implements SyncOneWayOwnerQuestions
         } else {
           rejected.push(syncedRecord);
         }
-      } catch (error) {
-        // A lost revision race is another writer moving first; the question
-        // stays open for the next run instead of being forced.
-        if (!(error instanceof OwnerQuestionRevisionConflictError)) {
-          throw error;
-        }
+      } catch {
+        // A lost revision race (another writer moved first) or a record that
+        // no longer validates leaves this question open; the run continues
+        // with the others instead of failing for all of them.
         unchanged.push(record);
       }
     }

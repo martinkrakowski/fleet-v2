@@ -488,6 +488,14 @@ describe('ExpireOwnerQuestionsUseCase', () => {
     return { repo, useCase };
   }
 
+  it('refuses to run with an unreadable clock and expires nothing', async () => {
+    const repo = new FakeOwnerQuestionRepo();
+    repo.records.set('q-old', twoWayRecord({ questionId: 'q-old', expiresAt: '2026-10-16T11:59:59.000Z' }));
+    const useCase = new ExpireOwnerQuestionsUseCase({ ownerQuestionRepo: repo, clock: { nowIso: () => 'not-a-time' } });
+    await expect(useCase.expireOwnerQuestions()).rejects.toThrow(/valid clock time/);
+    expect(repo.records.get('q-old')?.state).toBe('open');
+  });
+
   it('expires an open question whose expiresAt has passed and it stays blocking', async () => {
     const { repo, useCase } = setup([
       twoWayRecord({ questionId: 'q-old', expiresAt: '2026-10-16T11:59:59.000Z' }),
@@ -792,6 +800,14 @@ describe('ListOwnerQuestionsUseCase and ReadOwnerQuestionUseCase', () => {
     const narrowed = await useCase.listOwnerQuestions({ state: 'open', since: '2026-10-17T00:00:00.000Z' });
     expect(narrowed.questions.map((question) => question.questionId)).toEqual(['q-2']);
     expect(repo.queries[1]).toEqual({ state: 'open', since: '2026-10-17T00:00:00.000Z' });
+  });
+
+  it('refuses a since without an explicit zone', async () => {
+    const repo = new FakeOwnerQuestionRepo();
+    repo.records.set('q-1', twoWayRecord());
+    const useCase = new ListOwnerQuestionsUseCase({ ownerQuestionRepo: repo });
+    const result = await useCase.listOwnerQuestions({ since: '2026-10-16T00:00:00' });
+    expect(result.questions).toEqual([]);
   });
 
   it('returns no invented questions for an unknown state or unreadable since', async () => {

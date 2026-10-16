@@ -37,6 +37,10 @@ export class ExpireOwnerQuestionsUseCase implements ExpireOwnerQuestionsPort {
       throw new Error('Not implemented: ExpireOwnerQuestionsUseCase');
     }
     const nowMs = new Date(this.deps.clock.nowIso()).getTime();
+    if (!Number.isFinite(nowMs)) {
+      // An unreadable clock must never expire everything: refuse the run.
+      throw new Error('ExpireOwnerQuestions requires a valid clock time');
+    }
     const open = await this.deps.ownerQuestionRepo.list({ state: 'open' });
     const expired: OwnerQuestionRecord[] = [];
     const unchanged: OwnerQuestionRecord[] = [];

@@ -71,8 +71,9 @@ export class AcknowledgeOwnerAnswerUseCase implements AcknowledgeOwnerAnswerPort
       });
       // The repository requires record.revision === expectedRevision + 1.
       acknowledged = { ...transitioned.toRecord(), revision: stored.revision + 1 };
-    } catch (error) {
-      return { outcome: 'refused', reason: error instanceof Error ? error.message : String(error) };
+    } catch {
+      // A fixed reason: internal validation text is never passed to the caller.
+      return { outcome: 'refused', reason: 'the acknowledgement does not fit this question' };
     }
 
     try {

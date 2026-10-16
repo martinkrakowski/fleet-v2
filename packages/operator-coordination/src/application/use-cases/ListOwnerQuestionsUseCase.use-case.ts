@@ -32,7 +32,13 @@ export class ListOwnerQuestionsUseCase implements ListOwnerQuestionsPort {
       return { questions: [] };
     }
     const since = request.since;
-    if (since !== undefined && (typeof since !== 'string' || Number.isNaN(Date.parse(since)))) {
+    // An ISO date-time with an explicit Z or offset, so the filter means the
+    // same instant on every host.
+    const ISO_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+    if (
+      since !== undefined &&
+      (typeof since !== 'string' || !ISO_WITH_ZONE.test(since) || Number.isNaN(Date.parse(since)))
+    ) {
       return { questions: [] };
     }
     const questions = await this.deps.ownerQuestionRepo.list({

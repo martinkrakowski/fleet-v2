@@ -617,15 +617,15 @@ bounded_contexts:
     depends_on: []
     layers:
       domain:
-        entities: [ProjectProfile, CoordinationRequest, AuthorizationConsumption, RelayAcknowledgement]
+        entities: [ProjectProfile, CoordinationRequest, AuthorizationConsumption, RelayAcknowledgement, OwnerQuestion]
         value_objects: [CoordinationKind, CoordinationState, ActionAuthorization, PolicyReference, ObservationEnvelope]
       application:
         use_cases: [RegisterProjectProfileUseCase, InspectConfiguredCapabilitiesUseCase, RequestScopedDecisionUseCase, ResolveActionAuthorizationUseCase, CheckOwnerDecisionUseCase, RecordAuthorizationConsumptionUseCase, PublishProjectObservationUseCase, ReadProjectAttentionUseCase, SendFleetRelayUseCase, RecordRelayAcknowledgementUseCase, InspectOutstandingCoordinationUseCase]
         ports:
           in: [RegisterProjectProfilePort, InspectConfiguredCapabilitiesPort, RequestScopedDecisionPort, ResolveActionAuthorizationPort, CheckOwnerDecisionPort, RecordAuthorizationConsumptionPort, PublishProjectObservationPort, ReadProjectAttentionPort, SendFleetRelayPort, RecordRelayAcknowledgementPort, InspectOutstandingCoordinationPort]
-          out: [ProjectProfileRepositoryPort, CoordinationRequestRepositoryPort, DecisionTransportPort, ObservationPublicationPort, AttentionReadPort, RelayTransportPort]
+          out: [ProjectProfileRepositoryPort, CoordinationRequestRepositoryPort, OwnerQuestionRepositoryPort, DecisionTransportPort, ObservationPublicationPort, AttentionReadPort, RelayTransportPort]
       infrastructure:
-        adapters: [ProjectProfileRepositoryAdapter, CoordinationRequestRepositoryAdapter, DecisionTransportAdapter, ObservationPublicationAdapter, AttentionReadAdapter, RelayTransportAdapter]
+        adapters: [ProjectProfileRepositoryAdapter, CoordinationRequestRepositoryAdapter, OwnerQuestionRepositoryAdapter, DecisionTransportAdapter, ObservationPublicationAdapter, AttentionReadAdapter, RelayTransportAdapter]
     contracts:
       RegisterProjectProfilePort: "Validate installation references, designated dispatcher, runner capabilities and approved policy without persisting credential values."
       InspectConfiguredCapabilitiesPort: "Report the configured runner and integration capabilities, missing requirements and explicit unknowns."
@@ -640,6 +640,7 @@ bounded_contexts:
       InspectOutstandingCoordinationPort: "List undecided proposals, unknown actions, undelivered observations and unacknowledged notices."
       ProjectProfileRepositoryPort: "Persist private installation references and policy revisions with version-aware updates."
       CoordinationRequestRepositoryPort: "Persist scoped proposals, revisions, acknowledgements and authorization-consumption receipts."
+      OwnerQuestionRepositoryPort: "Persist owner questions as a separate aggregate with revision-aware saves; never share the coordination requests store."
       DecisionTransportPort: "Read and verify the existing Waves signed-answer protocol or an explicit owner-recorded local decision."
       ObservationPublicationPort: "Publish a versioned Waves snapshot through its client without exposing tokens to agents."
       AttentionReadPort: "Read the existing Waves attention and project-staleness endpoints with bounded requests."
@@ -647,12 +648,13 @@ bounded_contexts:
     adapter_bindings:
       - { adapter: ProjectProfileRepositoryAdapter, implements: ProjectProfileRepositoryPort, integration: private-installation-config-and-local-store }
       - { adapter: CoordinationRequestRepositoryAdapter, implements: CoordinationRequestRepositoryPort, integration: local-transactional-store }
+      - { adapter: OwnerQuestionRepositoryAdapter, implements: OwnerQuestionRepositoryPort, integration: local-json-store }
       - { adapter: DecisionTransportAdapter, implements: DecisionTransportPort, integration: existing-waves-decision-client-or-owner-recorded-file }
       - { adapter: ObservationPublicationAdapter, implements: ObservationPublicationPort, integration: existing-waves-client }
       - { adapter: AttentionReadAdapter, implements: AttentionReadPort, integration: existing-waves-read-endpoints }
       - { adapter: RelayTransportAdapter, implements: RelayTransportPort, integration: harness-notice-channel-or-local-outbox }
     domain_specification:
-      aggregate_roots: [ProjectProfile, CoordinationRequest]
+      aggregate_roots: [ProjectProfile, CoordinationRequest, OwnerQuestion]
       child_ownership: { AuthorizationConsumption: CoordinationRequest, RelayAcknowledgement: CoordinationRequest }
       enum_values:
         CoordinationKind: [action-decision, policy-proposal, relay, registry-alert]

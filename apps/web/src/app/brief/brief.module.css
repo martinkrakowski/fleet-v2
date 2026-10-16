@@ -17,6 +17,59 @@
   gap: var(--space-4);
 }
 
+/* Desktop: header stays in place; the two columns scroll internally. */
+@media (min-width: 72rem) {
+  .view {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .grid {
+    flex: 1;
+    min-height: 0;
+    align-items: stretch;
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .woCard {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .woScroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .detail {
+    min-height: 0;
+    overflow-y: auto;
+  }
+}
+
+/*
+ * Between the shell breakpoint (992px) and the two-column breakpoint
+ * (72rem) the grid is a single column; the whole grid scrolls internally
+ * so the page header still stays in place.
+ */
+@media (min-width: 992px) and (max-width: 71.99rem) {
+  .view {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .grid {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+  }
+}
+
 .listHead {
   margin: var(--space-3) 0 var(--space-1);
   font-size: 0.6rem;

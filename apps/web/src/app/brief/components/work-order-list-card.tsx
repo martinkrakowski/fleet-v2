@@ -54,9 +54,9 @@ export function WorkOrderListCard({
   onSelect,
 }: WorkOrderListCardProps) {
   return (
-    <Card aria-label="Work orders">
+    <Card className={styles.woCard} aria-label="Work orders">
       <CardHeader title="Work orders" subtitle={`${unfrozenIds.length} need a brief`} />
-      <CardBody>
+      <CardBody className={styles.woScroll}>
         {unfrozenIds.map((woId) => (
           <WorkOrderItem
             key={woId}

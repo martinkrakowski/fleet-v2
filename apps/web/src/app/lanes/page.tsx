@@ -105,7 +105,7 @@ export default function LanesPage() {
               </div>
             }
           />
-          <CardBody>
+          <CardBody className={styles.laneScroll}>
             {rows.length > 0 ? (
               <ul className={styles.lanes}>
                 {rows.map((a) => (

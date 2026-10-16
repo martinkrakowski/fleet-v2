@@ -166,6 +166,201 @@ describe('parseInstallation v2 decisions', () => {
   });
 });
 
+describe('parseInstallation v2 decisions consumers (K3)', () => {
+  it('accepts the per-consumer map on a jev block', () => {
+    const decisions = {
+      ...jevDecisions,
+      consumers: {
+        'knowledge-ranking': { minConfidence: 0.9, monthlyBudgetUsd: 20 },
+        'claim-triage': {
+          minConfidence: 0.7,
+          monthlyBudgetUsd: 30,
+          acknowledgeCandidateClaimsLeaveHost: true,
+        },
+      },
+    };
+    const result = parseInstallation({ ...validV2, decisions });
+    expect(result).toEqual({ ok: true, installation: { ...validV2, decisions } });
+  });
+
+  it('accepts optional-only and boundary shapes', () => {
+    const onlyThreshold = {
+      ...jevDecisions,
+      consumers: { 'knowledge-ranking': { minConfidence: 0 } },
+    };
+    expect(parseInstallation({ ...validV2, decisions: onlyThreshold })).toEqual({
+      ok: true,
+      installation: { ...validV2, decisions: onlyThreshold },
+    });
+
+    // An entry may carry only the acknowledgement, and an empty map is valid.
+    const onlyAck = {
+      ...jevDecisions,
+      consumers: { 'claim-triage': { acknowledgeCandidateClaimsLeaveHost: true } },
+    };
+    expect(parseInstallation({ ...validV2, decisions: onlyAck })).toEqual({
+      ok: true,
+      installation: { ...validV2, decisions: onlyAck },
+    });
+
+    const empty = { ...jevDecisions, consumers: {} };
+    expect(parseInstallation({ ...validV2, decisions: empty })).toEqual({
+      ok: true,
+      installation: { ...validV2, decisions: empty },
+    });
+  });
+
+  it('accepts a consumer sub-budget equal to the block total', () => {
+    const decisions = {
+      ...jevDecisions,
+      monthlyBudgetUsd: 50,
+      consumers: {
+        'knowledge-ranking': { monthlyBudgetUsd: 50 },
+        'claim-triage': { monthlyBudgetUsd: 50, acknowledgeCandidateClaimsLeaveHost: true },
+      },
+    };
+    const result = parseInstallation({ ...validV2, decisions });
+    expect(result).toEqual({ ok: true, installation: { ...validV2, decisions } });
+  });
+
+  it('accepts the per-consumer map on an answer-file block without a block budget', () => {
+    const decisions = {
+      provider: 'answer-file',
+      answerFile: '/etc/fleet/answers.json',
+      consumers: {
+        'knowledge-ranking': { minConfidence: 0.6, monthlyBudgetUsd: 400 },
+        'claim-triage': {
+          monthlyBudgetUsd: 10000,
+          acknowledgeCandidateClaimsLeaveHost: true,
+        },
+      },
+    };
+    const result = parseInstallation({ ...validV2, decisions });
+    expect(result).toEqual({ ok: true, installation: { ...validV2, decisions } });
+  });
+
+  it('refuses a consumer sub-budget above the block total', () => {
+    const result = parseInstallation({
+      ...validV2,
+      decisions: {
+        ...jevDecisions,
+        monthlyBudgetUsd: 50,
+        consumers: {
+          'knowledge-ranking': { monthlyBudgetUsd: 50.01 },
+          'claim-triage': { monthlyBudgetUsd: 60, acknowledgeCandidateClaimsLeaveHost: true },
+        },
+      },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: [
+        'decisions.consumers.knowledge-ranking.monthlyBudgetUsd: must not exceed decisions.monthlyBudgetUsd',
+        'decisions.consumers.claim-triage.monthlyBudgetUsd: must not exceed decisions.monthlyBudgetUsd',
+      ],
+    });
+  });
+
+  it('collects every consumer error with value-free messages', () => {
+    const result = parseInstallation({
+      ...validV2,
+      decisions: {
+        ...jevDecisions,
+        consumers: {
+          'knowledge-ranking': { minConfidence: 1.5, monthlyBudgetUsd: 0, extra: true },
+          'claim-triage': {
+            minConfidence: 'high',
+            monthlyBudgetUsd: -1,
+            acknowledgeCandidateClaimsLeaveHost: 'yes',
+          },
+          'mystery-consumer': { minConfidence: 0.5 },
+        },
+      },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors).toEqual([
+        'decisions.consumers: unknown key',
+        'decisions.consumers.knowledge-ranking: unknown key',
+        'decisions.consumers.knowledge-ranking.minConfidence: must be a number between 0 and 1',
+        'decisions.consumers.knowledge-ranking.monthlyBudgetUsd: must be a number greater than 0',
+        'decisions.consumers.claim-triage.minConfidence: must be a number between 0 and 1',
+        'decisions.consumers.claim-triage.monthlyBudgetUsd: must be a number greater than 0',
+        'decisions.consumers.claim-triage.acknowledgeCandidateClaimsLeaveHost: must be true',
+      ]);
+      expect(result.errors.join(' ')).not.toContain('mystery-consumer');
+      expect(result.errors.join(' ')).not.toContain('high');
+    }
+  });
+
+  it('refuses non-object shapes for the map and its entries', () => {
+    const mapNotObject = parseInstallation({
+      ...validV2,
+      decisions: { ...jevDecisions, consumers: 'none' },
+    });
+    expect(mapNotObject).toEqual({ ok: false, errors: ['decisions.consumers: must be an object'] });
+
+    const entryNotObject = parseInstallation({
+      ...validV2,
+      decisions: { ...jevDecisions, consumers: { 'knowledge-ranking': true } },
+    });
+    expect(entryNotObject).toEqual({
+      ok: false,
+      errors: ['decisions.consumers.knowledge-ranking: must be an object'],
+    });
+
+    const triageNotObject = parseInstallation({
+      ...validV2,
+      decisions: { ...jevDecisions, consumers: { 'claim-triage': 3 } },
+    });
+    expect(triageNotObject).toEqual({
+      ok: false,
+      errors: ['decisions.consumers.claim-triage: must be an object'],
+    });
+  });
+
+  it('requires the claim-triage acknowledgement whenever the entry is present', () => {
+    const onJev = parseInstallation({
+      ...validV2,
+      decisions: {
+        ...jevDecisions,
+        consumers: { 'claim-triage': { minConfidence: 0.7 } },
+      },
+    });
+    expect(onJev).toEqual({
+      ok: false,
+      errors: ['decisions.consumers.claim-triage.acknowledgeCandidateClaimsLeaveHost: required'],
+    });
+
+    const onAnswerFile = parseInstallation({
+      ...validV2,
+      decisions: {
+        provider: 'answer-file',
+        answerFile: '/etc/fleet/answers.json',
+        consumers: { 'claim-triage': {} },
+      },
+    });
+    expect(onAnswerFile).toEqual({
+      ok: false,
+      errors: ['decisions.consumers.claim-triage.acknowledgeCandidateClaimsLeaveHost: required'],
+    });
+  });
+
+  it('skips the sub-budget comparison when the block budget itself is invalid', () => {
+    const result = parseInstallation({
+      ...validV2,
+      decisions: {
+        ...jevDecisions,
+        monthlyBudgetUsd: 0,
+        consumers: { 'knowledge-ranking': { monthlyBudgetUsd: 60 } },
+      },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['decisions.monthlyBudgetUsd: must be a number greater than 0'],
+    });
+  });
+});
+
 describe('parseInstallation v2', () => {
   it('accepts a valid v2 file and returns it unchanged', () => {
     const result = parseInstallation(validV2);

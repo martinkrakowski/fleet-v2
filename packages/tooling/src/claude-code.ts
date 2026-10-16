@@ -2,11 +2,13 @@ import { interpretAccountSignIn } from './sign-in.js';
 import type { ToolModel, ToolDescriptor } from './types.js';
 
 /**
- * Claude Code has no CLI model listing: a subscription serves a known set of
- * models, so the descriptor carries the product-shipped fixed list and its
- * `parse` ignores the (absent) probe output.
+ * Claude Code has no CLI model listing: fleet cannot ask the tool what it
+ * serves. This pinned list is clearly labelled fallback data, not a parse
+ * result and not a claim that a subscription always serves exactly these
+ * models; the descriptor's `parse` falls back to it only because the tool
+ * cannot list models at all.
  */
-const CLAUDE_CODE_MODELS: readonly ToolModel[] = [
+export const CLAUDE_CODE_FALLBACK_MODELS: readonly ToolModel[] = [
   { id: 'claude-opus-4-5' },
   { id: 'claude-sonnet-4-5' },
   { id: 'claude-haiku-4-5' },
@@ -26,7 +28,7 @@ export const CLAUDE_CODE_TOOL: ToolDescriptor = {
     interpret: interpretAccountSignIn,
   },
   models: {
-    parse: () => CLAUDE_CODE_MODELS,
+    parse: () => CLAUDE_CODE_FALLBACK_MODELS,
   },
   capabilities: {
     canRunCommands: true,

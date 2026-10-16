@@ -48,6 +48,24 @@ describe('OPENCODE_TOOL', () => {
       expect(OPENCODE_TOOL.signIn.interpret('opencode: unknown command', 1)).toBe('unknown');
       expect(OPENCODE_TOOL.signIn.interpret('', 0)).toBe('unknown');
     });
+
+    it('any line that does not parse makes the whole answer unknown', () => {
+      expect(
+        OPENCODE_TOOL.signIn.interpret(
+          ['Providers:', '  z-ai                    signed in', 'garbage line', ''].join('\n'),
+          0,
+        ),
+      ).toBe('unknown');
+      expect(
+        OPENCODE_TOOL.signIn.interpret(
+          ['Providers (2):', '  z-ai                    signed in', ''].join('\n'),
+          0,
+        ),
+      ).toBe('unknown');
+      expect(OPENCODE_TOOL.signIn.interpret('  z-ai                    signed in', 0)).toBe(
+        'signed-in',
+      );
+    });
   });
 
   describe('models.parse (GET /api/model JSON)', () => {

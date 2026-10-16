@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { CLAUDE_CODE_TOOL } from '../claude-code.js';
+import { CLAUDE_CODE_FALLBACK_MODELS, CLAUDE_CODE_TOOL } from '../claude-code.js';
 
 describe('CLAUDE_CODE_TOOL', () => {
   it('detects through `claude --version`', () => {
@@ -38,10 +38,13 @@ describe('CLAUDE_CODE_TOOL', () => {
   });
 
   describe('models', () => {
-    it('declares no probe and serves the product-shipped fixed list', () => {
+    it('declares no probe and falls back to the pinned, labelled model list', () => {
       expect(CLAUDE_CODE_TOOL.models.argv).toBeUndefined();
       expect(CLAUDE_CODE_TOOL.models.http).toBeUndefined();
-      expect(CLAUDE_CODE_TOOL.models.parse('')).toEqual([
+      // The list is pinned data (the tool cannot list models), not a parse
+      // result: `parse` returns the labelled fallback constant.
+      expect(CLAUDE_CODE_TOOL.models.parse('')).toBe(CLAUDE_CODE_FALLBACK_MODELS);
+      expect(CLAUDE_CODE_FALLBACK_MODELS).toEqual([
         { id: 'claude-opus-4-5' },
         { id: 'claude-sonnet-4-5' },
         { id: 'claude-haiku-4-5' },

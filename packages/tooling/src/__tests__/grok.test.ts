@@ -58,6 +58,19 @@ describe('GROK_TOOL', () => {
       expect(GROK_TOOL.models.parse('Available models:\n  (default)\n')).toBe('unknown');
     });
 
+    it('a row with trailing junk after the id is unknown: the regex anchors the whole line', () => {
+      expect(GROK_TOOL.models.parse('Available models:\n  grok-4.7 junk here\n')).toBe('unknown');
+      expect(GROK_TOOL.models.parse('Available models:\n  grok-4.7 (default) extra\n')).toBe(
+        'unknown',
+      );
+    });
+
+    it('a parenthesised annotation after the id is still accepted', () => {
+      expect(GROK_TOOL.models.parse('Available models:\n  grok-4.7 (default)\n')).toEqual([
+        { id: 'grok-4.7' },
+      ]);
+    });
+
     it('malformed output is unknown', () => {
       expect(GROK_TOOL.models.parse('')).toBe('unknown');
       expect(GROK_TOOL.models.parse('grok: no models\n')).toBe('unknown');

@@ -37,7 +37,18 @@ import {
   RequestAttemptAcceptanceUseCase,
   ReserveExecutionCapacityUseCase,
   StopAttemptUseCase,
+  resolveImplementerSeat,
+  type ImplementerSeatResolution,
 } from "@fleet/work-execution/use-cases";
+
+/**
+ * Reads the seat an attempt was actually implemented on. Absent on a
+ * composition that never bound one; a boundary that needs the seat then
+ * refuses rather than accepting a caller-supplied model.
+ */
+export type AttemptImplementerSeatResolver = (
+  attemptId: string,
+) => Promise<ImplementerSeatResolution>;
 
 export interface WorkComposition {
   registerWorkOrder: RegisterWorkOrderUseCase;
@@ -52,6 +63,8 @@ export interface WorkComposition {
   prepareFixAttempt: PrepareFixAttemptUseCase;
   requestAttemptAcceptance: RequestAttemptAcceptanceUseCase;
   executeAuthorizedForgeAction: ExecuteAuthorizedForgeActionUseCase;
+  /** The attempt's recorded implementer seat; never an operator value. */
+  readonly resolveAttemptImplementerSeat?: AttemptImplementerSeatResolver;
 }
 
 export interface WorkCompositionOptions {
@@ -156,6 +169,11 @@ function unconfiguredWorkComposition(): WorkComposition {
     prepareFixAttempt: new PrepareFixAttemptUseCase(),
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase(),
     executeAuthorizedForgeAction: new ExecuteAuthorizedForgeActionUseCase(),
+    // Unconfigured resolves no seat, and says so the same way the use cases
+    // do: the HTTP boundary reports 501 instead of inventing a model.
+    resolveAttemptImplementerSeat: async () => {
+      throw new Error("Not implemented: AttemptImplementerSeatResolver");
+    },
   };
 }
 
@@ -260,6 +278,8 @@ export function createConfiguredWorkComposition(
       attemptRepo,
       workOrderRepo,
       acceptancePort,
+      artifactPort,
+      workspace,
     }),
     executeAuthorizedForgeAction: new ExecuteAuthorizedForgeActionUseCase({
       attemptRepo,
@@ -274,5 +294,15 @@ export function createConfiguredWorkComposition(
       ownerDecisionPort,
       attemptOwnerDecisionPort,
     }),
+    // Independence is a fact about the lane, so any boundary that needs the
+    // implementer seat reads it from the recorded attempt, never from the
+    // request it is answering.
+    resolveAttemptImplementerSeat: async (attemptId: string) => {
+      const attempt = await attemptRepo.findAttemptById(attemptId);
+      if (attempt === null) {
+        return { outcome: "unknown", reason: `Attempt not found: '${attemptId}'` };
+      }
+      return resolveImplementerSeat(attempt, { artifactPort, workspace });
+    },
   };
 }

@@ -2,9 +2,10 @@
 // cross-context adapters and the forge adapter.
 /**
  * Covers RequestAttemptAcceptanceUseCase (exact-head check, moved head,
- * same-model reviewer rejection including across providers, accepted
- * receipt propagation), ExecuteAuthorizedForgeActionUseCase (stale head,
- * missing acceptance receipt on merge, single-consumption grants,
+ * independence against the attempt's own recorded seat — including across
+ * providers — the frozen-manifest fallback, refusal when no seat is recorded
+ * at all, accepted receipt propagation), ExecuteAuthorizedForgeActionUseCase
+ * (stale head, missing acceptance receipt on merge, single-consumption grants,
  * ambiguous forge responses) and all five cross-context/forge adapters.
  */
 
@@ -72,6 +73,8 @@ const OTHER_SHA = 'fedcba9876543210fedcba9876543210fedcba98';
 const BASE_COMMIT = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const FIXED_NOW = '2026-10-15T08:00:00.000Z';
 const LANE_ID = 'wk-p4-cross-forge';
+/** The seat the frozen manifest dispatched this attempt on. */
+const SEAT_MODEL = 'nvidia/z-ai/glm-5.3';
 
 function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
@@ -95,6 +98,7 @@ function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
       collectedArtifactPaths: [],
       notes: 'present',
     },
+    runner: { remotePort: 4166, host: null, agent: null, model: SEAT_MODEL, variant: null },
     createdAtIso: FIXED_NOW,
     updatedAtIso: FIXED_NOW,
     ...overrides,
@@ -364,35 +368,148 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([makeAttempt()]),
       acceptancePort,
-      implementerModelByAttempt: { 'attempt-1': 'nvidia/z-ai/glm-5.3' },
     });
 
     const result = await useCase.requestAttemptAcceptance(
-      acceptanceRequest({ reviewerModel: 'nvidia/z-ai/glm-5.3' }),
+      acceptanceRequest({ reviewerModel: SEAT_MODEL }),
     );
 
     expect(result.outcome).toBe('rejected');
     expect(result.outcome === 'rejected' && result.reason).toContain(
-      'matches implementer model nvidia/z-ai/glm-5.3',
+      `matches implementer model ${SEAT_MODEL}`,
     );
     expect(acceptancePort.requests).toHaveLength(0);
   });
 
-  it('rejects the same base model across different providers', async () => {
+  it('rejects a reviewer on the recorded seat through another provider', async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([makeAttempt()]),
       acceptancePort,
     });
 
-    // No per-attempt map: the default implementer seat is nvidia/z-ai/glm-5.3.
+    // The attempt ran on nvidia/z-ai/glm-5.3; a different provider prefix on
+    // the same underlying model is not independence.
     const result = await useCase.requestAttemptAcceptance(
       acceptanceRequest({ reviewerModel: 'openrouter/z-ai/glm-5.3' }),
     );
 
     expect(result.outcome).toBe('rejected');
-    expect(result.outcome === 'rejected' && result.reason).toContain('an independent reviewer is required');
+    expect(result.outcome === 'rejected' && result.reason).toContain(
+      'an independent reviewer is required',
+    );
     expect(acceptancePort.requests).toHaveLength(0);
+  });
+
+  it('rejects an attempt that records no implementer seat instead of assuming one', async () => {
+    const acceptancePort = new FakeAcceptanceAssessment();
+    const useCase = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([
+        makeAttempt({ runner: null, briefPackagePath: null }),
+      ]),
+      acceptancePort,
+      // No frozen manifest is readable through the ports either.
+      artifactPort: { readBriefManifest: async () => null },
+    });
+
+    const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(result.outcome).toBe('rejected');
+    expect(result.outcome === 'rejected' && result.reason).toBe(
+      "Attempt attempt-1 records no implementer seat: neither the dispatched runner model nor the frozen brief manifest's model assignment is known",
+    );
+    expect(acceptancePort.requests).toHaveLength(0);
+  });
+
+  it('falls back to the frozen manifest seat when the attempt records none', async () => {
+    const acceptancePort = new FakeAcceptanceAssessment();
+    const workOrderRepo = new InMemoryWorkOrderRepository([makeWorkOrder()]);
+    const manifestReads: string[] = [];
+    const readManifest = async (
+      _worktreePath: string,
+      manifestPath?: string,
+    ): Promise<string | null> => {
+      manifestReads.push(manifestPath ?? '');
+      // Only the manifest file carries a model assignment; the prose brief does not.
+      if (manifestPath === undefined || !manifestPath.endsWith('.json')) {
+        return null;
+      }
+      return JSON.stringify({ modelAssignment: { model: 'opencode/longcat-2.5-preview-free' } });
+    };
+    const seatlessAttempt = makeAttempt({
+      runner: null,
+      briefPackagePath: '/tmp/opencode/lanes/attempt-1/.lane/brief.md',
+    });
+    const useCase = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
+      workOrderRepo,
+      acceptancePort,
+      artifactPort: { readBriefManifest: readManifest },
+    });
+
+    const accepted = await useCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(accepted).toEqual({
+      outcome: 'accepted',
+      candidateHeadSha: HEAD_SHA,
+      receiptId: 'receipt-1',
+    });
+    expect(manifestReads).toContain('/tmp/opencode/lanes/attempt-1/.lane/brief-manifest.json');
+
+    // The same manifest seat refuses its own reviewer on another provider.
+    const sameFamily = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
+      workOrderRepo,
+      acceptancePort: new FakeAcceptanceAssessment(),
+      artifactPort: { readBriefManifest: readManifest },
+    });
+
+    const refused = await sameFamily.requestAttemptAcceptance(
+      acceptanceRequest({ reviewerModel: 'other/longcat-2.5-preview-free' }),
+    );
+
+    expect(refused.outcome).toBe('rejected');
+    expect(refused.outcome === 'rejected' && refused.reason).toContain(
+      'matches implementer model opencode/longcat-2.5-preview-free',
+    );
+  });
+
+  it('prefers the recorded runner seat over a differing frozen manifest', async () => {
+    const manifestReads: string[] = [];
+    // The manifest and the recorded seat disagree; the seat dispatch actually
+    // ran is the one independence is judged against.
+    const useCase = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([
+        makeAttempt({
+          runner: {
+            remotePort: 4166,
+            host: null,
+            agent: null,
+            model: 'opencode/longcat-2.5-preview-free',
+            variant: null,
+          },
+        }),
+      ]),
+      acceptancePort: new FakeAcceptanceAssessment(),
+      artifactPort: {
+        readBriefManifest: async (_worktreePath: string, manifestPath?: string) => {
+          manifestReads.push(manifestPath ?? '');
+          return JSON.stringify({ modelAssignment: { model: SEAT_MODEL } });
+        },
+      },
+    });
+
+    const result = await useCase.requestAttemptAcceptance(
+      acceptanceRequest({ reviewerModel: 'openrouter/z-ai/glm-5.3' }),
+    );
+
+    // Independent of the recorded seat, so the request reaches the
+    // policy-revision check rather than a false refusal against the manifest.
+    expect(result.outcome).toBe('rejected');
+    expect(result.outcome === 'rejected' && result.reason).toBe(
+      'Acceptance requires the work order policy revision; no work order is available',
+    );
+    expect(manifestReads).toEqual([]);
   });
 
   it('rejects when no work order is available to scope the assessment', async () => {

@@ -18,6 +18,7 @@ import type {
   CommandCompletionReceipt,
   RunnerIsolationCapabilities,
 } from '@fleet/work-execution';
+import { resolveImplementerSeat } from '@fleet/work-execution/use-cases';
 import type {
   FindingDispositionRecord,
   ReviewReceiptRecord,
@@ -280,6 +281,44 @@ function exitCodeForResult(result: unknown): number {
   return 0;
 }
 
+/**
+ * Bind an independent review request to the implementer seat the attempt
+ * actually ran on. Independence is a fact about the lane, so the operator
+ * never supplies it: the attempt's recorded seat is read back, and a supplied
+ * `implementerModel` is accepted only when it restates that seat. An attempt
+ * with no recorded seat is a typed rejection, not an assumed model.
+ */
+async function bindImplementerSeat(
+  runtime: FleetCliRuntime,
+  payload: Payload,
+): Promise<
+  | { readonly bound: true; readonly implementerModel: string }
+  | { readonly bound: false; readonly rejection: { outcome: 'rejected'; reason: string } }
+> {
+  const attemptId = str(payload, 'attemptId');
+  const attempt = await runtime.execution.attemptRepository.findAttemptById(attemptId);
+  if (attempt === null) {
+    return {
+      bound: false,
+      rejection: { outcome: 'rejected', reason: `Attempt not found: '${attemptId}'` },
+    };
+  }
+  const seat = await resolveImplementerSeat(attempt, {
+    artifactPort: runtime.execution.attemptArtifact,
+    workspace: runtime.execution.workspace,
+  });
+  if (seat.outcome === 'unknown') {
+    return { bound: false, rejection: { outcome: 'rejected', reason: seat.reason } };
+  }
+  const supplied = optStr(payload, 'implementerModel');
+  if (supplied !== undefined && supplied.trim() !== seat.model) {
+    throw new CliUsageError(
+      `evidence request-review refuses implementerModel '${supplied.trim()}': attempt '${attemptId}' was dispatched on seat '${seat.model}'`,
+    );
+  }
+  return { bound: true, implementerModel: seat.model };
+}
+
 // ---------------------------------------------------------------------------
 // Command table. Each handler builds one typed request from the payload; the
 // use case owns every behavioural decision.
@@ -531,18 +570,23 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         receipt: requiredNested<VerificationReceiptRecord>(p, 'receipt', 'evidence record-verification'),
         nowIso: optStr(p, 'nowIso'),
       }),
-    'request-review': async (p, rt) =>
-      rt.evidence.requestIndependentReview.requestIndependentReview({
+    'request-review': async (p, rt) => {
+      const seat = await bindImplementerSeat(rt, p);
+      if (!seat.bound) {
+        return seat.rejection;
+      }
+      return rt.evidence.requestIndependentReview.requestIndependentReview({
         assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),
         projectId: str(p, 'projectId'),
         attemptId: str(p, 'attemptId'),
         candidateHeadSha: str(p, 'candidateHeadSha'),
         policyRevision: str(p, 'policyRevision'),
-        implementerModel: str(p, 'implementerModel'),
+        implementerModel: seat.implementerModel,
         reviewerModel: str(p, 'reviewerModel'),
         diffSummary: optStr(p, 'diffSummary'),
         nowIso: optStr(p, 'nowIso'),
-      }),
+      });
+    },
     'record-review': async (p, rt) =>
       rt.evidence.recordReviewReceipt.recordReviewReceipt({
         assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),

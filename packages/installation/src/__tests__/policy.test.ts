@@ -40,11 +40,13 @@ describe('underlyingModelFamily (installation copy)', () => {
       expect(underlyingModelFamily(left)).toBe(underlyingModelFamily(right));
     }
     const distinct: readonly [string, string][] = [
-      ['claude-sonnet', 'claude-opus'],
-      // glm-5.3 and glm-5.4 now share the `glm` family (vendor-line rule);
-      // gemini and grok stay distinct.
+      // Every Claude model shares the `claude` vendor-line family, so
+      // sonnet vs opus is no longer a distinct pair (owner rule:
+      // one family per vendor line); gemini, grok, gpt and glm stay
+      // distinct.
       ['gemini-3.1-pro', 'grok-4.7'],
       ['gpt-6-luna', 'glm-5.3'],
+      ['claude-opus-5-5', 'glm-5.3'],
     ];
     for (const [left, right] of distinct) {
       expect(underlyingModelFamily(left)).not.toBe(underlyingModelFamily(right));
@@ -57,8 +59,8 @@ describe('validateSeatPolicy', () => {
     const errors = validateSeatPolicy(
       installation({
         seats: [
-          seat({ id: 'impl', model: 'provider-a/model-a', costClass: 'paid' }),
-          seat({ id: 'reviewer', model: 'provider-b/model-b', roles: ['reviewer'] }),
+          seat({ id: 'impl', model: 'provider-a/glm-5.3', costClass: 'paid' }),
+          seat({ id: 'reviewer', model: 'provider-b/grok-4.7', roles: ['reviewer'] }),
         ],
         chains: {
           implementer: [{ seatId: 'impl' }],
@@ -169,11 +171,11 @@ describe('validateSeatPolicy', () => {
     const errors = validateSeatPolicy(
       installation({
         seats: [
-          seat({ id: 'impl', model: 'a/m1' }),
-          seat({ id: 'impl-fallback', model: 'b/m2' }),
+          seat({ id: 'impl', model: 'a/glm-5.3' }),
+          seat({ id: 'impl-fallback', model: 'b/grok-4.7' }),
           seat({
             id: 'hr-reviewer',
-            model: 'c/m2#high',
+            model: 'c/grok-4.7-fast#high',
             roles: ['high-risk-reviewer'],
             costClass: 'paid',
           }),

@@ -25,20 +25,24 @@ const REVIEWER_ROLES: readonly Exclude<SeatRole, 'implementer'>[] = [
 const CHAIN_ROLES: readonly SeatRole[] = ['implementer', 'reviewer', 'high-risk-reviewer'];
 
 /**
- * The underlying model family of a model id: the id is lowercased and
- * trimmed, cut at the first `#` (any `#variant`), everything up to and
- * including the last `/` is dropped (every provider prefix), the remainder is
- * cut at the first `:` or `@` (`:nitro`, `:free`, `@20250929`, ...), and then
- * the leading run of letters and hyphens before the first digit is kept with
- * a trailing hyphen trimmed. An id with no digit keeps the whole remaining
- * name, so a name like `space-bunny-free` is a family of its own.
- * `nvidia/z-ai/glm-5.3-flash`, `openrouter/z-ai/glm-5.3#low` and `glm-5.2`
- * share the family `glm`; `claude-opus-5-5` is the family `claude-opus`.
+ * The underlying model family of a model id — one family per vendor line
+ * (owner decision 2026-10-16): the id is lowercased and trimmed, cut at the
+ * first `#` (any `#variant`), everything up to and including the last `/` is
+ * dropped (every provider prefix), the remainder is cut at the first `:` or
+ * `@` (`:nitro`, `:free`, `@20250929`, ...), and the family is then the
+ * leading run of ASCII letters only, stopping at the first character that is
+ * not `a`-`z`. Every model of a vendor line is one family, so tier words
+ * before the first digit never split a line: `claude-opus-5-5`,
+ * `claude-3-5-sonnet-20241022` and `claude-haiku-4-5` are all `claude`;
+ * `grok-4.7` and `grok-code-fast-4.7` are `grok`; `gemini-flash-latest` and
+ * `models/gemini-2.5-pro` are `gemini`; `gpt-5` and `gpt-oss-120b` are `gpt`;
+ * `glm-z1-32b` is `glm`; `laguna-s-2.1` is `laguna`;
+ * `space-bunny-free` is `space`.
  *
- * An empty family (from `''`, `'/'`, `'z-ai/'`, `'#low'`) is invalid; callers
- * comparing families must fail closed and treat an empty family as equal to
- * every other family. The installation parser refuses a seat whose model
- * yields an empty family.
+ * An empty family (from `''`, `'4o-mini'`, `'/'`, `'z-ai/'`, `'#low'`) is
+ * invalid; callers comparing families must fail closed and treat an empty
+ * family as equal to every other family. The installation parser refuses a
+ * seat whose model yields an empty family.
  */
 export function underlyingModelFamily(model: string): string {
   let value = model.trim().toLowerCase();
@@ -54,14 +58,8 @@ export function underlyingModelFamily(model: string): string {
   if (specialIndex !== -1) {
     value = value.slice(0, specialIndex);
   }
-  const digitIndex = value.search(/[0-9]/);
-  if (digitIndex !== -1) {
-    value = value.slice(0, digitIndex);
-  }
-  if (value.endsWith('-')) {
-    value = value.slice(0, -1);
-  }
-  return value;
+  const letters = /^[a-z]*/.exec(value);
+  return letters === null ? '' : letters[0];
 }
 
 /** Compile a glob (`*`, `?`) on a model id into a case-insensitive RegExp. */

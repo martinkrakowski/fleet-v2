@@ -1180,8 +1180,9 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
       expect(underlyingModelFamily('anthropic/claude-3-5-sonnet')).toBe('claude');
       expect(underlyingModelFamily('openai/gpt-4o')).toBe('gpt');
       expect(underlyingModelFamily('gpt-4o')).toBe('gpt');
-      // An id with no digit keeps the whole name: a vendor line of its own.
-      expect(underlyingModelFamily('opencode/space-bunny-free')).toBe('space-bunny-free');
+      // Letters-only vendor-line family (owner rule 2026-10-16): tier
+      // words never split a line, so every Claude model is `claude`.
+      expect(underlyingModelFamily('opencode/space-bunny-free')).toBe('space');
       // An empty family is invalid: flash and non-flash models of one family
       // compare equal under the strict rule.
       expect(underlyingModelFamily('z-ai/glm-5.3-flash')).toBe(underlyingModelFamily('z-ai/glm-5.3'));

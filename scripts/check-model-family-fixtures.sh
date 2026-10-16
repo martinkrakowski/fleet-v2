@@ -1,3 +1,4 @@
+#!/bin/sh
 # Exits 1 if the two byte-identical model-family fixture copies drift
 # apart, 0 otherwise. Run from the repository root or anywhere.
 set -eu

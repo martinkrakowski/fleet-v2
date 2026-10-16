@@ -36,20 +36,24 @@ function isNonEmptyTrimmedString(value: unknown): value is string {
 }
 
 /**
- * The underlying model family of a model id: the id is lowercased and
- * trimmed, cut at the first `#` (any `#variant`), everything up to and
- * including the last `/` is dropped (every provider prefix), the remainder is
- * cut at the first `:` or `@` (`:nitro`, `:thinking`, `:free`/`:paid`,
- * `@20250929`, ...), and then the leading run of letters and hyphens before
- * the first digit is kept with a trailing hyphen trimmed. An id with no digit
- * keeps the whole remaining name, so a name like `space-bunny-free` is a
- * family of its own. This is stricter than a provider-prefix strip alone:
- * `openrouter/z-ai/glm-5.3`, `nvidia/z-ai/glm-5.3-flash` and `glm-5.2` share
- * the family `glm`, so a flash reviewer of a GLM implementer is refused.
+ * The underlying model family of a model id — one family per vendor line
+ * (owner decision 2026-10-16): the id is lowercased and trimmed, cut at the
+ * first `#` (any `#variant`), everything up to and including the last `/` is
+ * dropped (every provider prefix), the remainder is cut at the first `:` or
+ * `@` (`:nitro`, `:thinking`, `:free`/`:paid`, `@20250929`, ...), and the
+ * family is then the leading run of ASCII letters only, stopping at the
+ * first character that is not `a`-`z`. Every model of a vendor line is one
+ * family, so tier words before the first digit never split a line:
+ * `openrouter/z-ai/glm-5.3`, `nvidia/z-ai/glm-5.3-flash`, `glm-5.2` and
+ * `glm-z1-32b` are all `glm`; `claude-sonnet-4-5` and
+ * `claude-3-5-sonnet-20241022` are `claude`; `grok-4.7` and
+ * `grok-code-fast-4.7` are `grok`; `gpt-5` and `gpt-oss-120b` are `gpt`;
+ * `space-bunny-free` is `space`. A flash reviewer of a GLM implementer is
+ * refused; so is any Claude reviewer of a Claude implementer.
  *
- * An empty family (from `''`, `'/'`, `'z-ai/'`, `'#low'`) is invalid; callers
- * comparing families must fail closed and treat an empty family as equal to
- * every other family.
+ * An empty family (from `''`, `'4o-mini'`, `'/'`, `'z-ai/'`, `'#low'`) is
+ * invalid; callers comparing families must fail closed and treat an empty
+ * family as equal to every other family.
  */
 export function underlyingModelFamily(model: string): string {
   let value = model.trim().toLowerCase();
@@ -65,14 +69,8 @@ export function underlyingModelFamily(model: string): string {
   if (specialIndex !== -1) {
     value = value.slice(0, specialIndex);
   }
-  const digitIndex = value.search(/[0-9]/);
-  if (digitIndex !== -1) {
-    value = value.slice(0, digitIndex);
-  }
-  if (value.endsWith('-')) {
-    value = value.slice(0, -1);
-  }
-  return value;
+  const letters = /^[a-z]*/.exec(value);
+  return letters === null ? '' : letters[0];
 }
 
 /**

@@ -316,7 +316,7 @@ describe('recommendSeats', () => {
         models: {
           'claude-code': [model('claude-sonnet-4-5')],
           opencode: [model('nvidia/z-ai/glm-5.3', 'plan-quota'), model('xai/grok-4.7', 'free')],
-          grok: [model('claude-opus-5-5')],
+          grok: [model('gemini-3.8-pro')],
         },
       });
       // The free seat comes first, then plan-quota seats strongest first.
@@ -325,10 +325,28 @@ describe('recommendSeats', () => {
         'opencode-nvidia-z-ai-glm-5.3',
         'claude-code-claude-sonnet-4-5',
       ]);
-      // The grok variants share the `grok` family with the xai implementer
-      // seat under the vendor-line rule, so the strongest disjoint reviewer
-      // is claude-opus-5-5 (the `claude-opus` family).
-      expect(result.chains.reviewer?.map((step) => step.seatId)).toEqual(['grok-claude-opus-5-5']);
+      // gemini-3.8-pro is the only candidate whose vendor-line family is
+      // absent from the implementer chain (grok, glm and claude are all
+      // taken), so it is the reviewer.
+      expect(result.chains.reviewer?.map((step) => step.seatId)).toEqual(['grok-gemini-3.8-pro']);
+    });
+
+    it('refuses a Sonnet implementer with an Opus reviewer: both are the claude family', () => {
+      // One family per vendor line (owner rule): claude-sonnet and
+      // claude-opus share the `claude` family, so the strongest disjoint
+      // reviewer no longer exists.
+      const result = recommendSeats({
+        tools: [tool('claude-code'), tool('grok')],
+        models: {
+          'claude-code': [model('claude-sonnet-4-5', 'plan-quota')],
+          grok: [model('claude-opus-5-5')],
+        },
+        policy: NO_POLICY,
+      });
+      expect(result.outcome).toBe('no-valid-catalogue');
+      if (result.outcome === 'no-valid-catalogue') {
+        expect(result.reasons.join(' ')).toContain('no reviewer');
+      }
     });
 
     it('ranks an unlisted family below every listed family, in first-seen order', () => {

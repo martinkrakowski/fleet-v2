@@ -41,6 +41,11 @@ const validV2: FleetInstallationV2 = {
   shelf: { provider: 'local' },
   forge: { mode: 'github', owner: 'example-owner', repo: 'example-repo' },
   verification: { procedures: { gate: { command: 'yarn', args: ['test'] } } },
+  waves: {
+    baseUrl: 'https://waves.example',
+    tokenFile: '/home/operator/.config/fleet/waves-token',
+  },
+  decisions: { provider: 'none' },
 };
 
 function parseV2Fixture(value: unknown): FleetInstallationV2 {
@@ -62,10 +67,36 @@ describe('writeInstallationV2', () => {
     });
   });
 
+  it('round-trips a jev decisions block', () => {
+    const installation = parseV2Fixture({
+      ...validV2,
+      decisions: {
+        provider: 'jev',
+        model: 'example-provider/example-model',
+        keyFile: '/etc/fleet/jev-key',
+        minConfidence: 0.8,
+        monthlyBudgetUsd: 50,
+        assumedCostPerCallUsd: 0.01,
+        acknowledgeProseLeavesHost: true,
+        disabledProjects: ['project-a'],
+      },
+    });
+    const written = writeInstallationV2(installation);
+    expect(parseInstallation(JSON.parse(written))).toEqual({
+      ok: true,
+      installation,
+    });
+  });
+
   it('writes a stable section and key order regardless of input order', () => {
     const installation = parseV2Fixture(validV2);
     const forward = writeInstallationV2(installation);
     const reordered: FleetInstallationV2 = {
+      decisions: { provider: 'none' },
+      waves: {
+        baseUrl: 'https://waves.example',
+        tokenFile: '/home/operator/.config/fleet/waves-token',
+      },
       verification: installation.verification,
       forge: installation.forge,
       shelf: installation.shelf,

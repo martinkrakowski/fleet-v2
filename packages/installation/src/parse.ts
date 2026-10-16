@@ -5,6 +5,7 @@ import type {
   ChainTrigger,
   ChainsSection,
   CostClass,
+  DecisionsSectionV2,
   FallbackSeat,
   FleetInstallation,
   FleetInstallationV2,
@@ -56,6 +57,7 @@ const V2_ROOT_KEYS: readonly string[] = [
   'forge',
   'verification',
   'waves',
+  'decisions',
 ];
 const RUNNER_KEYS: readonly string[] = [
   'agent',
@@ -89,6 +91,18 @@ const POLICY_KEYS: readonly string[] = ['forbiddenRoutes', 'perLaneCostCeiling']
 const FORBIDDEN_ROUTE_KEYS: readonly string[] = ['tool', 'modelPattern'];
 const GIT_SHELF_KEYS: readonly string[] = ['provider', 'repoDir', 'branch', 'pathPrefix'];
 const GITHUB_FORGE_KEYS: readonly string[] = ['mode', 'owner', 'repo'];
+const NO_DECISIONS_KEYS: readonly string[] = ['provider'];
+const JEV_DECISIONS_KEYS: readonly string[] = [
+  'provider',
+  'model',
+  'keyFile',
+  'minConfidence',
+  'monthlyBudgetUsd',
+  'assumedCostPerCallUsd',
+  'acknowledgeProseLeavesHost',
+  'disabledProjects',
+];
+const ANSWER_FILE_DECISIONS_KEYS: readonly string[] = ['provider', 'answerFile'];
 
 const HOST_ROLES: readonly HostRole[] = ['orchestrator', 'lane-runner', 'verifier'];
 const SEAT_ROLES: readonly SeatRole[] = ['implementer', 'reviewer', 'high-risk-reviewer'];
@@ -1149,6 +1163,160 @@ function parseV2Forge(value: JsonObject, errors: string[]): ForgeSectionV2 | und
   return undefined;
 }
 
+function readOptionalFraction(
+  record: JsonObject,
+  key: string,
+  fieldPath: string,
+  errors: string[],
+): number | undefined {
+  if (!Object.hasOwn(record, key)) {
+    return undefined;
+  }
+  const value = record[key];
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+    errors.push(`${fieldPath}: must be a number between 0 and 1`);
+    return undefined;
+  }
+  return value;
+}
+
+function readOptionalPositiveNumber(
+  record: JsonObject,
+  key: string,
+  fieldPath: string,
+  errors: string[],
+): number | undefined {
+  if (!Object.hasOwn(record, key)) {
+    return undefined;
+  }
+  const value = record[key];
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    errors.push(`${fieldPath}: must be a number greater than 0`);
+    return undefined;
+  }
+  return value;
+}
+
+function readRequiredFraction(
+  record: JsonObject,
+  key: string,
+  fieldPath: string,
+  errors: string[],
+): number | undefined {
+  if (!Object.hasOwn(record, key)) {
+    errors.push(`${fieldPath}: required`);
+    return undefined;
+  }
+  return readOptionalFraction(record, key, fieldPath, errors);
+}
+
+function readRequiredPositiveNumber(
+  record: JsonObject,
+  key: string,
+  fieldPath: string,
+  errors: string[],
+): number | undefined {
+  if (!Object.hasOwn(record, key)) {
+    errors.push(`${fieldPath}: required`);
+    return undefined;
+  }
+  return readOptionalPositiveNumber(record, key, fieldPath, errors);
+}
+
+function parseV2Decisions(value: JsonObject, errors: string[]): DecisionsSectionV2 | undefined {
+  if (!Object.hasOwn(value, 'decisions')) {
+    return undefined;
+  }
+  const section = value.decisions;
+  if (!isJsonObject(section)) {
+    errors.push('decisions: must be an object');
+    return undefined;
+  }
+  if (!Object.hasOwn(section, 'provider')) {
+    collectUnknownKeys(section, JEV_DECISIONS_KEYS, 'decisions', errors);
+    errors.push('decisions.provider: required');
+    return undefined;
+  }
+  const provider = section.provider;
+  if (provider === 'none') {
+    collectUnknownKeys(section, NO_DECISIONS_KEYS, 'decisions', errors);
+    return { provider: 'none' };
+  }
+  if (provider === 'jev') {
+    collectUnknownKeys(section, JEV_DECISIONS_KEYS, 'decisions', errors);
+    const model = readRequiredString(section, 'model', 'decisions.model', errors);
+    const keyFile = readRequiredAbsolutePath(section, 'keyFile', 'decisions.keyFile', errors);
+    const minConfidence = readRequiredFraction(
+      section,
+      'minConfidence',
+      'decisions.minConfidence',
+      errors,
+    );
+    const monthlyBudgetUsd = readRequiredPositiveNumber(
+      section,
+      'monthlyBudgetUsd',
+      'decisions.monthlyBudgetUsd',
+      errors,
+    );
+    const assumedCostPerCallUsd = readRequiredPositiveNumber(
+      section,
+      'assumedCostPerCallUsd',
+      'decisions.assumedCostPerCallUsd',
+      errors,
+    );
+    let acknowledgedProse = false;
+    if (!Object.hasOwn(section, 'acknowledgeProseLeavesHost')) {
+      errors.push('decisions.acknowledgeProseLeavesHost: required');
+    } else if (section.acknowledgeProseLeavesHost !== true) {
+      errors.push('decisions.acknowledgeProseLeavesHost: must be true');
+    } else {
+      acknowledgedProse = true;
+    }
+    const disabledProjects = readOptionalStringArray(
+      section,
+      'disabledProjects',
+      'decisions.disabledProjects',
+      errors,
+    );
+    if (
+      model === undefined ||
+      keyFile === undefined ||
+      minConfidence === undefined ||
+      monthlyBudgetUsd === undefined ||
+      assumedCostPerCallUsd === undefined ||
+      !acknowledgedProse
+    ) {
+      return undefined;
+    }
+    return {
+      provider: 'jev',
+      model,
+      keyFile,
+      minConfidence,
+      monthlyBudgetUsd,
+      assumedCostPerCallUsd,
+      acknowledgeProseLeavesHost: true,
+      ...(disabledProjects !== undefined ? { disabledProjects } : {}),
+    };
+  }
+  if (provider === 'answer-file') {
+    collectUnknownKeys(section, ANSWER_FILE_DECISIONS_KEYS, 'decisions', errors);
+    const answerFile = readRequiredAbsolutePath(
+      section,
+      'answerFile',
+      'decisions.answerFile',
+      errors,
+    );
+    if (answerFile === undefined) {
+      return undefined;
+    }
+    return { provider: 'answer-file', answerFile };
+  }
+  collectUnknownKeys(section, JEV_DECISIONS_KEYS, 'decisions', errors);
+  errors.push('decisions.provider: must be a known provider');
+  return undefined;
+}
+
 function parseV2Verification(
   value: JsonObject,
   errors: string[],
@@ -1257,6 +1425,7 @@ function parseInstallationV2(value: JsonObject): ParseResult {
   const forge = parseV2Forge(value, errors);
   const verification = parseV2Verification(value, errors);
   const waves = parseWavesSection(value, errors);
+  const decisions = parseV2Decisions(value, errors);
 
   if (errors.length > 0) {
     return { ok: false, errors };
@@ -1289,6 +1458,9 @@ function parseInstallationV2(value: JsonObject): ParseResult {
   }
   if (waves !== undefined) {
     installation.waves = waves;
+  }
+  if (decisions !== undefined) {
+    installation.decisions = decisions;
   }
   return { ok: true, installation };
 }

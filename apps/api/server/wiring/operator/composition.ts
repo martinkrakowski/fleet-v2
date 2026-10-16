@@ -4,15 +4,22 @@ import {
   CoordinationRequestRepositoryAdapter,
   DecisionTransportAdapter,
   ObservationPublicationAdapter,
+  OwnerQuestionRepositoryAdapter,
   ProjectProfileRepositoryAdapter,
   RelayTransportAdapter,
 } from "@fleet/operator-coordination";
 
 import { join } from "node:path";
 import {
+  AcknowledgeOwnerAnswerUseCase,
+  AnswerOwnerQuestionUseCase,
+  AskOwnerQuestionUseCase,
+  ExpireOwnerQuestionsUseCase,
   InspectConfiguredCapabilitiesUseCase,
   InspectOutstandingCoordinationUseCase,
+  ListOwnerQuestionsUseCase,
   PublishProjectObservationUseCase,
+  ReadOwnerQuestionUseCase,
   ReadProjectAttentionUseCase,
   RecordAuthorizationConsumptionUseCase,
   RecordRelayAcknowledgementUseCase,
@@ -20,7 +27,11 @@ import {
   RequestScopedDecisionUseCase,
   ResolveActionAuthorizationUseCase,
   SendFleetRelayUseCase,
+  SyncOneWayOwnerQuestionsUseCase,
 } from "@fleet/operator-coordination/use-cases";
+
+/** A real clock: the composition root alone supplies "now" to the use cases. */
+const systemClock = { nowIso: () => new Date().toISOString() };
 
 export interface OperatorComposition {
   coordinationRequestRepository: CoordinationRequestRepositoryAdapter;
@@ -35,6 +46,13 @@ export interface OperatorComposition {
   sendFleetRelay: SendFleetRelayUseCase;
   recordRelayAcknowledgement: RecordRelayAcknowledgementUseCase;
   registerProjectProfile: RegisterProjectProfileUseCase;
+  listOwnerQuestions: ListOwnerQuestionsUseCase;
+  readOwnerQuestion: ReadOwnerQuestionUseCase;
+  askOwnerQuestion: AskOwnerQuestionUseCase;
+  answerOwnerQuestion: AnswerOwnerQuestionUseCase;
+  acknowledgeOwnerAnswer: AcknowledgeOwnerAnswerUseCase;
+  syncOneWayOwnerQuestions: SyncOneWayOwnerQuestionsUseCase;
+  expireOwnerQuestions: ExpireOwnerQuestionsUseCase;
 }
 
 export interface OperatorCompositionOptions {
@@ -59,6 +77,13 @@ function unconfiguredOperatorComposition(): OperatorComposition {
     sendFleetRelay: new SendFleetRelayUseCase(),
     recordRelayAcknowledgement: new RecordRelayAcknowledgementUseCase(),
     registerProjectProfile: new RegisterProjectProfileUseCase(),
+    listOwnerQuestions: new ListOwnerQuestionsUseCase(),
+    readOwnerQuestion: new ReadOwnerQuestionUseCase(),
+    askOwnerQuestion: new AskOwnerQuestionUseCase(),
+    answerOwnerQuestion: new AnswerOwnerQuestionUseCase(),
+    acknowledgeOwnerAnswer: new AcknowledgeOwnerAnswerUseCase(),
+    syncOneWayOwnerQuestions: new SyncOneWayOwnerQuestionsUseCase(),
+    expireOwnerQuestions: new ExpireOwnerQuestionsUseCase(),
   };
 }
 
@@ -90,6 +115,7 @@ export function createConfiguredOperatorComposition(
   const relayTransport = new RelayTransportAdapter(
     stateDir === undefined ? {} : { outboxDir: join(stateDir, "relay-outbox") },
   );
+  const ownerQuestionRepo = new OwnerQuestionRepositoryAdapter({ stateDir });
 
   return {
     coordinationRequestRepository: requestRepo,
@@ -113,6 +139,31 @@ export function createConfiguredOperatorComposition(
     sendFleetRelay: new SendFleetRelayUseCase({ requestRepo, relayTransport }),
     recordRelayAcknowledgement: new RecordRelayAcknowledgementUseCase({ requestRepo }),
     registerProjectProfile: new RegisterProjectProfileUseCase({ profileRepo }),
+    listOwnerQuestions: new ListOwnerQuestionsUseCase({ ownerQuestionRepo }),
+    readOwnerQuestion: new ReadOwnerQuestionUseCase({ ownerQuestionRepo }),
+    askOwnerQuestion: new AskOwnerQuestionUseCase({
+      ownerQuestionRepo,
+      requestRepo,
+      clock: systemClock,
+    }),
+    answerOwnerQuestion: new AnswerOwnerQuestionUseCase({
+      ownerQuestionRepo,
+      clock: systemClock,
+    }),
+    acknowledgeOwnerAnswer: new AcknowledgeOwnerAnswerUseCase({
+      ownerQuestionRepo,
+      clock: systemClock,
+    }),
+    syncOneWayOwnerQuestions: new SyncOneWayOwnerQuestionsUseCase({
+      ownerQuestionRepo,
+      requestRepo,
+      decisionTransport,
+      clock: systemClock,
+    }),
+    expireOwnerQuestions: new ExpireOwnerQuestionsUseCase({
+      ownerQuestionRepo,
+      clock: systemClock,
+    }),
   };
 }
 

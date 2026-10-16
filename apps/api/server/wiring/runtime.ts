@@ -2,10 +2,11 @@
 // in-process cross-context adapters. The composition root is the only place
 // where supplier-side use cases are bound to consumer-side ports; the use
 // cases themselves never import across contexts.
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { join } from "node:path";
 
+import { GH_BINARY_CANDIDATES, resolveGhBinary } from "./gh-binary";
 import { withFileLock, writeJsonAtomically } from "./file-store";
 
 import {
@@ -48,19 +49,36 @@ export interface FleetApiRuntimeOptions {
   readonly installation?: FleetInstallation;
 }
 
+/** Whether `path` is an executable regular file (S4036: absolute gh only). */
+function isExecutableRegularFile(path: string): boolean {
+  try {
+    const stats = statSync(path);
+    return stats.isFile() && (stats.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Run the reviewed GitHub CLI subprocess as an argument array for forge
- * evidence reads (D6). A completed invocation resolves with its exit code and
- * captured output; a spawn failure (for example a missing binary) rejects so
- * the adapter reports an unreadable forge instead of guessing.
+ * evidence reads (D6). The binary is resolved from fixed absolute locations
+ * (S4036), never through PATH; when none is found the invocation rejects so
+ * the adapter reports an unreadable forge (fail closed, as a missing binary
+ * does today). A completed invocation resolves with its exit code and
+ * captured output; a spawn failure rejects so the adapter reports an
+ * unreadable forge instead of guessing.
  */
 function runGhSubprocess(args: readonly string[]): Promise<{
   exitCode: number | null;
   stdout: string;
   stderr?: string;
 }> {
+  const ghBinary = resolveGhBinary(GH_BINARY_CANDIDATES, isExecutableRegularFile);
+  if (ghBinary === undefined) {
+    return Promise.reject(new Error("gh not found in fixed locations"));
+  }
   return new Promise((resolve, reject) => {
-    execFile("gh", [...args], { encoding: "utf8" }, (error, stdout, stderr) => {
+    execFile(ghBinary, [...args], { encoding: "utf8" }, (error, stdout, stderr) => {
       if (error === null) {
         resolve({ exitCode: 0, stdout: String(stdout), stderr: String(stderr) });
         return;

@@ -261,11 +261,14 @@ describe('Fleet CLI workflow', () => {
       `${JSON.stringify({ state: 'approved', decisionRevision: 'dec-2-r1', grantId: 'grant-2', signature: dec2Signature }, null, 2)}\n`,
     );
 
+    // The gh stub resolves from its absolute path through the runtime option
+    // (S4036): the reviewed gh subprocess is never resolved through PATH.
     runtime = createFleetCliRuntime({
       stateDir,
       ocmRunBin: path.join(binDir, 'ocm-run'),
       ownerPublicKey: testOwnerPublicKey,
       runnerRemotePort: RUNNER_PORT,
+      ghBinaryCandidates: [path.join(binDir, 'gh')],
     });
   });
 
@@ -1233,10 +1236,9 @@ describe('Fleet CLI workflow', () => {
   });
 
   it('completes the merge across separate runCli processes on one state dir', async () => {
-    // Cutover pilot: every invocation below omits the injected `runtime`
-    // argument, so each command composes a brand-new FleetCliRuntime loaded
-    // solely from `multiProcStateDir` on disk. Receipts and coordinates
-    // recorded by an earlier invocation must be reloaded from
+    // Cutover pilot: every invocation below passes a brand-new FleetCliRuntime
+    // composed solely from `multiProcStateDir` on disk. Receipts and
+    // coordinates recorded by an earlier invocation must be reloaded from
     // `<stateDir>/accepted-receipts.json` and
     // `<stateDir>/authorization-coordinates.json` for the final merge to pass.
     const multiProcStateDir = path.join(suiteDir, 'mp-state');
@@ -1287,8 +1289,21 @@ describe('Fleet CLI workflow', () => {
           err.push(text);
         },
       };
-      // No third argument: this invocation rebuilds the runtime from disk.
-      const code = await runCli(['--state-dir', multiProcStateDir, ...argv], io);
+      // Every invocation passes a brand-new runtime composed solely from
+      // `multiProcStateDir` (plus the gh stub's fixed location, S4036), so
+      // the in-memory maps start empty exactly as in separate processes.
+      // Receipts and coordinates recorded by an earlier invocation must be
+      // reloaded from `<stateDir>/accepted-receipts.json` and
+      // `<stateDir>/authorization-coordinates.json` for the final merge to
+      // pass.
+      const code = await runCli(
+        ['--state-dir', multiProcStateDir, ...argv],
+        io,
+        createFleetCliRuntime({
+          stateDir: multiProcStateDir,
+          ghBinaryCandidates: [path.join(binDir, 'gh')],
+        }),
+      );
       return { code, text: out.join(''), stderr: err.join('') };
     };
 

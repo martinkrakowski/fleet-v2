@@ -59,13 +59,81 @@ function passingReview(assessmentId: string): ReviewReceiptRecord {
   };
 }
 
+/** A minimal v2 installation fixture declaring one forge mode. */
+function makeInstallation(mode: "none" | "github"): FleetInstallation {
+  return mode === "github"
+    ? ({
+        schemaVersion: 2,
+        forge: { mode: "github", owner: "example-owner", repo: "example-repo" },
+      } as FleetInstallation)
+    : ({ schemaVersion: 2, forge: { mode: "none" } } as FleetInstallation);
+}
+
+type GhResult = { exitCode: number; stdout: string; stderr?: string };
+
+/**
+ * A stub of the argument-array gh transport: `failing` returns a failing
+ * pull request lookup, `passing` answers every forge read for HEAD with
+ * passing checks and no unresolved threads.
+ */
+function makeGhRunner(outcome: "failing" | "passing") {
+  return async (args: readonly string[]): Promise<GhResult> => {
+    if (outcome === "failing") {
+      return { exitCode: 1, stdout: "", stderr: "gh: API error" };
+    }
+    if (args[0] === "api" && typeof args[1] === "string" && args[1].startsWith("repos/")) {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify([{ state: "open", head: { sha: GITHUB_HEAD }, number: 7 }]),
+      };
+    }
+    if (args[0] === "pr") {
+      return { exitCode: 0, stdout: JSON.stringify([{ bucket: "pass" }]) };
+    }
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        data: {
+          repository: { pullRequest: { reviewThreads: { totalCount: 0, nodes: [] } } },
+        },
+      }),
+    };
+  };
+}
+
+/** The evidence composition wired for one forge mode with a stub transport. */
+function makeEvidence(mode: "none" | "github", ghRunner?: ReturnType<typeof makeGhRunner>) {
+  return createConfiguredEvidenceUseCases({
+    installation: makeInstallation(mode),
+    ...(mode === "github" && ghRunner !== undefined ? { forgeGhRunner: ghRunner } : {}),
+  });
+}
+
+/** Request verification for one github-mode assessment, then assess its head. */
+async function assessGithubHead(
+  evidence: ReturnType<typeof makeEvidence>,
+  assessmentId: string,
+) {
+  expect(
+    (
+      await evidence.requestVerification.execute({
+        ...VERIFICATION_REQUEST,
+        assessmentId,
+        attemptId: assessmentId,
+        candidateHeadSha: GITHUB_HEAD,
+      })
+    ).outcome,
+  ).toBe("completed");
+  return evidence.assessHeadAcceptance.assessHeadAcceptance({
+    assessmentId,
+    candidateHeadSha: GITHUB_HEAD,
+    policyRevision: "policy-1",
+  });
+}
+
 describe("evidence composition forge mode (D6)", () => {
   it("mode none accepts receipt-only, never reads the forge, and records not-configured", async () => {
-    const installation = {
-      schemaVersion: 2,
-      forge: { mode: "none" },
-    } as FleetInstallation;
-    const evidence = createConfiguredEvidenceUseCases({ installation });
+    const evidence = makeEvidence("none");
 
     expect((await evidence.requestVerification.execute(VERIFICATION_REQUEST)).outcome).toBe(
       "completed",
@@ -108,11 +176,7 @@ describe("evidence composition forge mode (D6)", () => {
   });
 
   it("mode none blocks a brief that names a CI requirement", async () => {
-    const installation = {
-      schemaVersion: 2,
-      forge: { mode: "none" },
-    } as FleetInstallation;
-    const evidence = createConfiguredEvidenceUseCases({ installation });
+    const evidence = makeEvidence("none");
 
     expect(
       (
@@ -138,64 +202,10 @@ describe("evidence composition forge mode (D6)", () => {
     }
   });
 
-  type GhResult = { exitCode: number; stdout: string; stderr?: string };
-
-  /**
-   * A stub of the argument-array gh transport: `failing` returns a failing
-   * pull request lookup, `passing` answers every forge read for HEAD with
-   * passing checks and no unresolved threads.
-   */
-  function makeGhRunner(outcome: "failing" | "passing") {
-    return async (args: readonly string[]): Promise<GhResult> => {
-      if (outcome === "failing") {
-        return { exitCode: 1, stdout: "", stderr: "gh: API error" };
-      }
-      if (args[0] === "api" && typeof args[1] === "string" && args[1].startsWith("repos/")) {
-        return {
-          exitCode: 0,
-          stdout: JSON.stringify([{ state: "open", head: { sha: GITHUB_HEAD }, number: 7 }]),
-        };
-      }
-      if (args[0] === "pr") {
-        return { exitCode: 0, stdout: JSON.stringify([{ bucket: "pass" }]) };
-      }
-      return {
-        exitCode: 0,
-        stdout: JSON.stringify({
-          data: {
-            repository: { pullRequest: { reviewThreads: { totalCount: 0, nodes: [] } } },
-          },
-        }),
-      };
-    };
-  }
-
   it("mode github blocks when the gh runner returns failure", async () => {
-    const installation = {
-      schemaVersion: 2,
-      forge: { mode: "github", owner: "example-owner", repo: "example-repo" },
-    } as FleetInstallation;
-    const evidence = createConfiguredEvidenceUseCases({
-      installation,
-      forgeGhRunner: makeGhRunner("failing"),
-    });
+    const evidence = makeEvidence("github", makeGhRunner("failing"));
+    const assessed = await assessGithubHead(evidence, "att-forge-github");
 
-    expect(
-      (
-        await evidence.requestVerification.execute({
-          ...VERIFICATION_REQUEST,
-          assessmentId: "att-forge-github",
-          attemptId: "att-forge-github",
-          candidateHeadSha: GITHUB_HEAD,
-        })
-      ).outcome,
-    ).toBe("completed");
-
-    const assessed = await evidence.assessHeadAcceptance.assessHeadAcceptance({
-      assessmentId: "att-forge-github",
-      candidateHeadSha: GITHUB_HEAD,
-      policyRevision: "policy-1",
-    });
     expect(assessed.outcome).toBe("blocked");
     if (assessed.outcome === "blocked") {
       expect(assessed.blockers.join(" ")).toContain("forge reports CI state 'unknown'");
@@ -203,31 +213,9 @@ describe("evidence composition forge mode (D6)", () => {
   });
 
   it("mode github counts passing checks and no unresolved threads as a pass", async () => {
-    const installation = {
-      schemaVersion: 2,
-      forge: { mode: "github", owner: "example-owner", repo: "example-repo" },
-    } as FleetInstallation;
-    const evidence = createConfiguredEvidenceUseCases({
-      installation,
-      forgeGhRunner: makeGhRunner("passing"),
-    });
+    const evidence = makeEvidence("github", makeGhRunner("passing"));
+    const assessed = await assessGithubHead(evidence, "att-forge-github");
 
-    expect(
-      (
-        await evidence.requestVerification.execute({
-          ...VERIFICATION_REQUEST,
-          assessmentId: "att-forge-github",
-          attemptId: "att-forge-github",
-          candidateHeadSha: GITHUB_HEAD,
-        })
-      ).outcome,
-    ).toBe("completed");
-
-    const assessed = await evidence.assessHeadAcceptance.assessHeadAcceptance({
-      assessmentId: "att-forge-github",
-      candidateHeadSha: GITHUB_HEAD,
-      policyRevision: "policy-1",
-    });
     // Without cross-context delegates the attempt's one-way doors block, so
     // the forge pass is proven by the absence of any forge read blocker and
     // by no not-configured marker on the stored assessment.

@@ -177,15 +177,21 @@ describe('forge mode wired into CLI acceptance (D6)', () => {
     };
   }
 
-  it('mode github blocks when the gh runner returns failure', async () => {
-    const installation = makeInstallation({ mode: 'github', owner: 'example-owner', repo: 'example-repo' });
-    const runtime = createFleetCliRuntime({
-      installation,
-      forgeGhRunner: makeGhRunner('failing'),
+  /** The runtime wired for one forge mode with the optional stub transport. */
+  function makeRuntime(forge: ForgeSectionV2, ghRunner?: ReturnType<typeof makeGhRunner>) {
+    return createFleetCliRuntime({
+      installation: makeInstallation(forge),
+      ...(ghRunner !== undefined ? { forgeGhRunner: ghRunner } : {}),
     });
-    await runtime.execution.attemptRepository.saveAttempt(makeAttempt());
-    await runtime.evidence.evidenceAssessmentRepository.saveAssessment(makeAssessment([]));
+  }
 
+  /** Persist the attempt and its pending assessment, then assess via the CLI. */
+  async function runAssessment(
+    runtime: ReturnType<typeof createFleetCliRuntime>,
+    requiredChecks: readonly string[] = [],
+  ): Promise<{ code: number; out: string[] }> {
+    await runtime.execution.attemptRepository.saveAttempt(makeAttempt());
+    await runtime.evidence.evidenceAssessmentRepository.saveAssessment(makeAssessment(requiredChecks));
     const { out, io } = collectIo();
     const code = await runCli(
       ['evidence', 'assess', '--json', JSON.stringify({
@@ -196,6 +202,15 @@ describe('forge mode wired into CLI acceptance (D6)', () => {
       io,
       runtime,
     );
+    return { code, out };
+  }
+
+  it('mode github blocks when the gh runner returns failure', async () => {
+    const runtime = makeRuntime(
+      { mode: 'github', owner: 'example-owner', repo: 'example-repo' },
+      makeGhRunner('failing'),
+    );
+    const { code, out } = await runAssessment(runtime);
 
     expect(code).toBe(1);
     const result = JSON.parse(out.join('')) as { outcome: string; blockers: string[] };
@@ -204,24 +219,11 @@ describe('forge mode wired into CLI acceptance (D6)', () => {
   });
 
   it('mode github counts passing checks and no unresolved threads as a pass', async () => {
-    const installation = makeInstallation({ mode: 'github', owner: 'example-owner', repo: 'example-repo' });
-    const runtime = createFleetCliRuntime({
-      installation,
-      forgeGhRunner: makeGhRunner('passing'),
-    });
-    await runtime.execution.attemptRepository.saveAttempt(makeAttempt());
-    await runtime.evidence.evidenceAssessmentRepository.saveAssessment(makeAssessment([]));
-
-    const { out, io } = collectIo();
-    const code = await runCli(
-      ['evidence', 'assess', '--json', JSON.stringify({
-        attemptId: ATTEMPT_ID,
-        candidateHeadSha: HEAD,
-        policyRevision: 'pol-1',
-      })],
-      io,
-      runtime,
+    const runtime = makeRuntime(
+      { mode: 'github', owner: 'example-owner', repo: 'example-repo' },
+      makeGhRunner('passing'),
     );
+    const { code, out } = await runAssessment(runtime);
 
     expect(code).toBe(0);
     const result = JSON.parse(out.join('')) as { outcome: string };
@@ -235,21 +237,8 @@ describe('forge mode wired into CLI acceptance (D6)', () => {
   });
 
   it('mode none accepts receipt-only and records forgeEvidence not-configured', async () => {
-    const installation = makeInstallation({ mode: 'none' });
-    const runtime = createFleetCliRuntime({ installation });
-    await runtime.execution.attemptRepository.saveAttempt(makeAttempt());
-    await runtime.evidence.evidenceAssessmentRepository.saveAssessment(makeAssessment([]));
-
-    const { out, io } = collectIo();
-    const code = await runCli(
-      ['evidence', 'assess', '--json', JSON.stringify({
-        attemptId: ATTEMPT_ID,
-        candidateHeadSha: HEAD,
-        policyRevision: 'pol-1',
-      })],
-      io,
-      runtime,
-    );
+    const runtime = makeRuntime({ mode: 'none' });
+    const { code, out } = await runAssessment(runtime);
 
     expect(code).toBe(0);
     const result = JSON.parse(out.join('')) as { outcome: string };
@@ -261,21 +250,8 @@ describe('forge mode wired into CLI acceptance (D6)', () => {
   });
 
   it('mode none blocks an assessment whose brief names a CI requirement', async () => {
-    const installation = makeInstallation({ mode: 'none' });
-    const runtime = createFleetCliRuntime({ installation });
-    await runtime.execution.attemptRepository.saveAttempt(makeAttempt());
-    await runtime.evidence.evidenceAssessmentRepository.saveAssessment(makeAssessment(['ci']));
-
-    const { out, io } = collectIo();
-    const code = await runCli(
-      ['evidence', 'assess', '--json', JSON.stringify({
-        attemptId: ATTEMPT_ID,
-        candidateHeadSha: HEAD,
-        policyRevision: 'pol-1',
-      })],
-      io,
-      runtime,
-    );
+    const runtime = makeRuntime({ mode: 'none' });
+    const { code, out } = await runAssessment(runtime, ['ci']);
 
     expect(code).toBe(1);
     const result = JSON.parse(out.join('')) as { outcome: string; blockers: string[] };

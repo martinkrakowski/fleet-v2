@@ -17,9 +17,10 @@
  */
 
 import { execFile } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
 
 import {
@@ -139,6 +140,12 @@ export interface FleetCliRuntimeOptions {
    * inject a stub transport here.
    */
   readonly forgeGhRunner?: (args: readonly string[]) => Promise<GhInvocationResult>;
+  /**
+   * Absolute gh locations overriding the fixed defaults (tests only).
+   * Production always resolves the reviewed GitHub CLI from
+   * GH_BINARY_CANDIDATES and never falls back to PATH (S4036).
+   */
+  readonly ghBinaryCandidates?: readonly string[];
 }
 
 export interface ResolvedRunnerSettings {
@@ -272,15 +279,35 @@ function applyGhEnvironmentOverrides(args: readonly string[]): readonly string[]
   return args;
 }
 
+/** Whether `path` is an executable regular file (S4036: absolute gh only). */
+function isExecutableRegularFile(path: string): boolean {
+  try {
+    const stats = statSync(path);
+    return stats.isFile() && (stats.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Run the reviewed GitHub CLI subprocess for the forge adapter. A completed
+ * Run the reviewed GitHub CLI subprocess for the forge adapter. The binary is
+ * resolved from fixed absolute locations (S4036), never through PATH; when
+ * none is found the invocation rejects so the adapter reports the forge as
+ * unreadable (fail closed, as a missing binary does today). A completed
  * invocation resolves with its exit code and captured output; a spawn failure
- * (for example a missing binary) rejects so the adapter reports the outcome as
- * ambiguous for reconciliation instead of guessing.
+ * rejects so the adapter reports the outcome as ambiguous for reconciliation
+ * instead of guessing.
  */
-function runGhSubprocess(args: readonly string[]): Promise<GhInvocationResult> {
+function runGhSubprocess(
+  args: readonly string[],
+  candidates: readonly string[] = GH_BINARY_CANDIDATES,
+): Promise<GhInvocationResult> {
+  const ghBinary = resolveGhBinary(candidates, isExecutableRegularFile);
+  if (ghBinary === undefined) {
+    return Promise.reject(new Error('gh not found in fixed locations'));
+  }
   return new Promise((resolve, reject) => {
-    execFile('gh', [...applyGhEnvironmentOverrides(args)], { encoding: 'utf8' }, (error, stdout, stderr) => {
+    execFile(ghBinary, [...applyGhEnvironmentOverrides(args)], { encoding: 'utf8' }, (error, stdout, stderr) => {
       if (error === null) {
         resolve({ exitCode: 0, stdout: String(stdout), stderr: String(stderr) });
         return;
@@ -588,7 +615,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // The argument-array gh runner shared with the forge action adapter (D6):
   // mode `github` hands it to the forge-evidence adapter so reads can
   // succeed; tests inject a stub transport through the runtime options.
-  const forgeGhRunner = options?.forgeGhRunner ?? runGhSubprocess;
+  const ghBinaryCandidates = options?.ghBinaryCandidates ?? GH_BINARY_CANDIDATES;
+  const forgeGhRunner =
+    options?.forgeGhRunner ??
+    ((args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates));
   const forgeEvidence =
     forgeMode === 'github'
       ? new ForgeEvidenceAdapter({
@@ -713,7 +743,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // invocation first verifies the live HEAD of the attempt's own worktree so
   // a moved branch head is never pushed or merged on stale readiness.
   const forgeAction = new ForgeActionAdapter({
-    runGh: runGhSubprocess,
+    runGh: (args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates),
     verifyCurrentHeadSha: async (branchName, request) => {
       const attempt = await attemptRepository.findAttemptById(request.attemptId);
       if (attempt === null) {

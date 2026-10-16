@@ -329,6 +329,7 @@ describe('apps/api runtime wiring', () => {
           attemptId,
           candidateHeadSha: headH,
           policyRevision: 'pol-1',
+          implementerModel: 'seat/implementer',
           requiredChecks: [],
           state: 'pending',
           verificationReceipts: [],
@@ -437,7 +438,10 @@ describe('apps/api runtime wiring', () => {
         deps?: { attemptRepo: { saveAttempt: (a: AttemptRecord) => Promise<void> } };
       }).deps?.attemptRepo;
       if (attemptRepo) {
-        await attemptRepo.saveAttempt(makeAttempt(attemptId, workOrderId, headH, [doorRef]));
+        await attemptRepo.saveAttempt({
+          ...makeAttempt(attemptId, workOrderId, headH, [doorRef]),
+          runner: { remotePort: 0, host: null, model: 'seat/implementer', variant: null, agent: null },
+        });
       }
       const reqRepo = (operator.checkOwnerDecision as unknown as {
         deps?: { requestRepo: { saveRequest: (r: CoordinationRequestRecord) => Promise<void> } };
@@ -456,6 +460,7 @@ describe('apps/api runtime wiring', () => {
           attemptId,
           candidateHeadSha: headH,
           policyRevision: 'pol-1',
+          implementerModel: 'seat/implementer',
           requiredChecks: [],
           state: 'accepted',
           verificationReceipts: [],

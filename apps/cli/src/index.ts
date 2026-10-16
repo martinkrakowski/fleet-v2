@@ -305,7 +305,6 @@ async function bindImplementerSeat(
   }
   const seat = await resolveImplementerSeat(attempt, {
     artifactPort: runtime.execution.attemptArtifact,
-    workspace: runtime.execution.workspace,
   });
   if (seat.outcome === 'unknown') {
     return { bound: false, rejection: { outcome: 'rejected', reason: seat.reason } };

@@ -57,6 +57,13 @@ runner environment allowlist to smuggle a setting through.
   prefers it, falls back to `NEXT_PUBLIC_FLEET_API_URL`, and falls back again to
   the fixture set when neither is configured.
 
+- `AGY_BIN` — set in the lane host's own environment (never added to the runner
+  environment allow-list) to override the agy binary used by `bin/agy-run`, the agy
+  sibling of `bin/ocm-run`. agy lanes dispatch only through that script: the prompt is
+  fixed to the brief inside the worktree, `--model` is mandatory, and
+  `--dangerously-skip-permissions` is refused. `scripts/agy-run-hash.txt` pins the
+  script. `yarn test:bin` runs every shell test under `tests/`.
+
 ## Web UI action rules
 
 - Every action button in `@fleet/web` that would change something must open

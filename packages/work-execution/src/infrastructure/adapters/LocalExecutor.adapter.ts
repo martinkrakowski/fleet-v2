@@ -4,8 +4,11 @@
  * directly (no shell): every argument travels as one argv element, so shell
  * metacharacters in an argument keep their literal meaning. `input` is
  * written to the child's stdin and stdin is then closed; `timeoutMs` kills
- * the child's whole process tree; `maxBufferBytes` caps the captured output
- * and overrunning it is an error, never a silent truncation.
+ * the child's whole process tree (default 60 s when omitted); an omitted
+ * `env` gives the child only the allow-listed host variables (plus
+ * SSH_AUTH_SOCK for the ssh transport), never the full host environment;
+ * `maxBufferBytes` caps the captured output and overrunning it is an error,
+ * never a silent truncation.
  */
 
 import type {

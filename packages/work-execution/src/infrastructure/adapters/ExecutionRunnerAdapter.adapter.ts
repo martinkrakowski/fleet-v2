@@ -35,6 +35,9 @@ const execFileAsync = promisify(execFile);
 /** Reviewed runner output budget: NDJSON runs must not truncate. */
 const RUNNER_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
+/** Runner subprocess budget; the runner is started with --detach, so it returns well within this. */
+const RUNNER_START_TIMEOUT_MS = 120_000;
+
 /** Bundled runner script at the repository's `bin/ocm-run`. */
 function resolveBundledOcmRunPath(): string {
   // Works from both the compiled dist tree and vitest's src tree.
@@ -668,6 +671,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
         .run([command, ...args], {
           env: { ...runEnv } as Record<string, string>,
           maxBufferBytes: RUNNER_MAX_BUFFER_BYTES,
+          timeoutMs: RUNNER_START_TIMEOUT_MS,
         })
         .then((result) => {
           if (result.exitCode === null) {

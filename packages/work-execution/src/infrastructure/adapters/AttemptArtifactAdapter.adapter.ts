@@ -6,7 +6,10 @@
  * The collected record reports facts (missing notes included), never prose.
  *
  * Every command runs through the configured `CommandExecutorPort` (local or
- * ssh). The former direct `sshHost` seam is gone: transport selection is the
+ * ssh) with an explicit wall-clock budget: git commands, existence probes,
+ * reads and `mkdir` each get 60 s, and each `tee` stdin write gets 120 s; a
+ * run that exceeds its budget is killed and reported as a failure, never a
+ * success. The former direct `sshHost` seam is gone: transport selection is the
  * executor's job. The brief bytes travel on the executor's stdin (`tee`,
  * bounded by an explicit wall-clock timeout), so no remote shell ever sees
  * operator-authored prose.
@@ -34,8 +37,20 @@ export interface AttemptArtifactAdapterOptions {
   readonly executor?: CommandExecutorPort;
 }
 
-/** Wall-clock budget for one brief-placement command (`mkdir`, `tee`). */
+/** Wall-clock budget for one brief-placement command (`mkdir`). */
 const BRIEF_WRITE_TIMEOUT_MS = 60 * 1000;
+
+/** Wall-clock budget for one `tee` stdin write of brief bytes. */
+const TEE_TIMEOUT_MS = 120 * 1000;
+
+/** Wall-clock budget for one read-only git command in the worktree. */
+const GIT_TIMEOUT_MS = 60 * 1000;
+
+/** Wall-clock budget for one existence probe (`test -e`). */
+const PROBE_TIMEOUT_MS = 60 * 1000;
+
+/** Wall-clock budget for one file read (`cat`). */
+const CAT_TIMEOUT_MS = 60 * 1000;
 
 export class AttemptArtifactAdapter implements AttemptArtifactPort {
   constructor(private readonly options?: AttemptArtifactAdapterOptions) {}
@@ -87,7 +102,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     // frozen brief stays byte-identical without any shell redirection.
     const proseWrite = await executor.run(['tee', prosePath], {
       input: request.proseMarkdown,
-      timeoutMs: BRIEF_WRITE_TIMEOUT_MS,
+      timeoutMs: TEE_TIMEOUT_MS,
     });
     if (proseWrite.exitCode !== 0) {
       return {
@@ -97,7 +112,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     }
     const manifestWrite = await executor.run(['tee', manifestPath], {
       input: request.manifestJson,
-      timeoutMs: BRIEF_WRITE_TIMEOUT_MS,
+      timeoutMs: TEE_TIMEOUT_MS,
     });
     if (manifestWrite.exitCode !== 0) {
       return {
@@ -165,10 +180,12 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     };
   }
 
-  /** Read-only git in the worktree, through the executor. */
+  /** Read-only git in the worktree, through the executor, within its budget. */
   private async runGit(worktreePath: string, args: readonly string[]): Promise<string> {
     const executor = this.requireExecutor();
-    const result = await executor.run(['git', '-C', worktreePath, ...args]);
+    const result = await executor.run(['git', '-C', worktreePath, ...args], {
+      timeoutMs: GIT_TIMEOUT_MS,
+    });
     if (result.exitCode !== 0) {
       throw new Error(
         `git ${args.join(' ')} failed in ${worktreePath}: exit ${String(result.exitCode)}` +
@@ -181,7 +198,9 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
   /** Existence of one absolute path in the worktree's filesystem. */
   private async pathExists(worktreePath: string, targetPath: string): Promise<boolean> {
     const executor = this.requireExecutor();
-    const result = await executor.run(['test', '-e', targetPath]);
+    const result = await executor.run(['test', '-e', targetPath], {
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
     if (result.exitCode !== 0 && result.exitCode !== 1) {
       throw new Error(
         `Unable to probe ${targetPath}: exit ${String(result.exitCode)}` +
@@ -194,15 +213,18 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
   /** Exit 0 means ignored; exit 1 means not ignored; anything else is an error. */
   private async checkIgnored(worktreePath: string, candidatePath: string): Promise<boolean> {
     const executor = this.requireExecutor();
-    const result = await executor.run([
-      'git',
-      '-C',
-      worktreePath,
-      'check-ignore',
-      '-q',
-      '--',
-      candidatePath,
-    ]);
+    const result = await executor.run(
+      [
+        'git',
+        '-C',
+        worktreePath,
+        'check-ignore',
+        '-q',
+        '--',
+        candidatePath,
+      ],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
     if (result.exitCode === 0) return true;
     if (result.exitCode === 1) return false;
     throw new Error(
@@ -214,7 +236,14 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
   async readBriefManifest(worktreePath: string, manifestPath?: string): Promise<string | null> {
     const targetPath = manifestPath ?? path.join(worktreePath, '.lane', 'brief-manifest.json');
     const executor = this.requireExecutor();
-    const result = await executor.run(['cat', targetPath]);
+    const result = await executor.run(['cat', targetPath], { timeoutMs: CAT_TIMEOUT_MS });
+    // A null exit code (spawn failure, timeout) is a failed read, not an
+    // absent manifest; only exit 1 and friends mean "no such file".
+    if (result.exitCode === null) {
+      throw new Error(
+        `Unable to read ${targetPath}` + (result.error !== undefined ? `: ${result.error}` : ''),
+      );
+    }
     return result.exitCode === 0 ? result.stdout : null;
   }
 }

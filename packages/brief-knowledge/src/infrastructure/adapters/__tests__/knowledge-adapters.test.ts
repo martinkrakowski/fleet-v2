@@ -2,7 +2,7 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { VerifyClaimRequest } from '../../../application/ports/out/ClaimVerificationPort.out-port.js';
 import type { KnowledgeEntryRecord } from '../../../domain/knowledge-records.js';
 import type { ContextSelectionProps } from '../../../domain/value-objects/ContextSelection.vo.js';
@@ -427,5 +427,200 @@ describe('KeeperPublicationAdapter', () => {
     await expect(
       adapter.publishKeeperToShelf({ entry: makeEntry({ id: ' ' }) }),
     ).rejects.toThrow(/non-empty id/);
+  });
+
+  it('refuses before any provider when the claim text matches a secret pattern', async () => {
+    const stateDir = await makeTempStateDir();
+    const publish = vi.fn<() => Promise<{ outcome: 'published'; externalRef: string }>>();
+    const adapter = new KeeperPublicationAdapter({ publish, stateDir, fallbackToShelfFile: true });
+
+    const result = await adapter.publishKeeperToShelf({
+      entry: makeEntry({
+        id: 'secret-claim',
+        claimText: 'Private key:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----',
+      }),
+    });
+
+    expect(result).toEqual({
+      outcome: 'failed',
+      reason: 'keeper text matches a secret pattern; not published',
+      retryable: false,
+    });
+    expect(publish).not.toHaveBeenCalled();
+    await expect(readFile(join(stateDir, 'keepers-shelf.json'))).rejects.toThrow();
+  });
+
+  it('refuses before any provider when the disposition reason matches a secret pattern', async () => {
+    const stateDir = await makeTempStateDir();
+    const publish = vi.fn<() => Promise<{ outcome: 'published'; externalRef: string }>>();
+    const adapter = new KeeperPublicationAdapter({ publish, stateDir, fallbackToShelfFile: true });
+
+    const result = await adapter.publishKeeperToShelf({
+      entry: makeEntry({
+        id: 'secret-disposition',
+        dispositionReason: 'review note carried a GitHub token ghp_12345678901234567890',
+      }),
+    });
+
+    expect(result).toEqual({
+      outcome: 'failed',
+      reason: 'keeper text matches a secret pattern; not published',
+      retryable: false,
+    });
+    expect(publish).not.toHaveBeenCalled();
+    await expect(readFile(join(stateDir, 'keepers-shelf.json'))).rejects.toThrow();
+  });
+
+  it('refuses before any provider when a string inside a check record matches a secret pattern', async () => {
+    const stateDir = await makeTempStateDir();
+    const publish = vi.fn<() => Promise<{ outcome: 'published'; externalRef: string }>>();
+    const adapter = new KeeperPublicationAdapter({ publish, stateDir, fallbackToShelfFile: true });
+
+    const result = await adapter.publishKeeperToShelf({
+      entry: makeEntry({
+        id: 'secret-check',
+        checks: [
+          {
+            id: 'check-1',
+            entryId: 'secret-check',
+            checkerId: 'checker-1',
+            procedureName: 'inspect-source-path',
+            verification: 'supported',
+            evidenceRef: 'evidence log line 3: OpenAI key sk-12345678901234567890 was pasted',
+            checkedAtIso: '2026-10-15T00:00:00.000Z',
+          },
+        ],
+      }),
+    });
+
+    expect(result).toEqual({
+      outcome: 'failed',
+      reason: 'keeper text matches a secret pattern; not published',
+      retryable: false,
+    });
+    expect(publish).not.toHaveBeenCalled();
+    await expect(readFile(join(stateDir, 'keepers-shelf.json'))).rejects.toThrow();
+  });
+
+  it('refuses before any provider when a string inside a reuse record matches a secret pattern', async () => {
+    const stateDir = await makeTempStateDir();
+    const publish = vi.fn<() => Promise<{ outcome: 'published'; externalRef: string }>>();
+    const adapter = new KeeperPublicationAdapter({ publish, stateDir, fallbackToShelfFile: true });
+
+    const result = await adapter.publishKeeperToShelf({
+      entry: makeEntry({
+        id: 'secret-reuse',
+        reuses: [
+          {
+            id: 'reuse-1',
+            entryId: 'secret-reuse',
+            version: '1.0.0',
+            attemptId: 'attempt-1',
+            outcome: 'helped',
+            evidenceRef: 'channel log: slack token xoxb-ABCDEFGHIJKLMNO appears twice',
+            recordedAtIso: '2026-10-15T00:00:00.000Z',
+          },
+        ],
+      }),
+    });
+
+    expect(result).toEqual({
+      outcome: 'failed',
+      reason: 'keeper text matches a secret pattern; not published',
+      retryable: false,
+    });
+    expect(publish).not.toHaveBeenCalled();
+    await expect(readFile(join(stateDir, 'keepers-shelf.json'))).rejects.toThrow();
+  });
+
+  it('refuses and writes nowhere in the no-callback path when the entry carries a secret', async () => {
+    const stateDir = await makeTempStateDir();
+    const adapter = new KeeperPublicationAdapter({ stateDir });
+
+    const result = await adapter.publishKeeperToShelf({
+      entry: makeEntry({
+        id: 'secret-no-callback',
+        claimText: 'AWS access key AKIAIOSFODNN7EXAMPLE in the runbook',
+      }),
+    });
+
+    expect(result).toEqual({
+      outcome: 'failed',
+      reason: 'keeper text matches a secret pattern; not published',
+      retryable: false,
+    });
+    await expect(readFile(join(stateDir, 'keepers-shelf.json'))).rejects.toThrow();
+  });
+
+  it('appends the entry to the shelf file when the publish callback fails and fallback is on', async () => {
+    const stateDir = await makeTempStateDir();
+    const adapter = new KeeperPublicationAdapter({
+      publish: async () => ({ outcome: 'failed', reason: 'upstream shelf offline' }),
+      stateDir,
+      fallbackToShelfFile: true,
+    });
+
+    const entry = makeEntry({ id: 'fallback-entry-1' });
+    const result = await adapter.publishKeeperToShelf({ entry });
+
+    expect(result).toEqual({
+      outcome: 'failed',
+      reason: 'upstream shelf offline; kept in keepers-shelf.json for reconciliation',
+    });
+
+    const shelf = JSON.parse(await readFile(join(stateDir, 'keepers-shelf.json'), 'utf8')) as KnowledgeEntryRecord[];
+    expect(shelf).toEqual([entry]);
+  });
+
+  it('does not write to the shelf file when the publish callback fails and fallback is off', async () => {
+    const stateDir = await makeTempStateDir();
+    const adapter = new KeeperPublicationAdapter({
+      publish: async () => ({ outcome: 'failed', reason: 'upstream shelf offline' }),
+      stateDir,
+      fallbackToShelfFile: false,
+    });
+
+    const result = await adapter.publishKeeperToShelf({ entry: makeEntry({ id: 'no-fallback-entry' }) });
+
+    expect(result).toEqual({ outcome: 'failed', reason: 'upstream shelf offline' });
+    await expect(readFile(join(stateDir, 'keepers-shelf.json'))).rejects.toThrow();
+  });
+
+  it('appends to the shelf file when the publish callback throws and fallback is on', async () => {
+    const stateDir = await makeTempStateDir();
+    const adapter = new KeeperPublicationAdapter({
+      publish: async () => {
+        throw new Error('network crash');
+      },
+      stateDir,
+      fallbackToShelfFile: true,
+    });
+
+    const entry = makeEntry({ id: 'throw-entry-with-fallback' });
+    const result = await adapter.publishKeeperToShelf({ entry });
+
+    expect(result).toEqual({
+      outcome: 'failed',
+      reason: 'network crash; kept in keepers-shelf.json for reconciliation',
+    });
+
+    const shelf = JSON.parse(await readFile(join(stateDir, 'keepers-shelf.json'), 'utf8')) as KnowledgeEntryRecord[];
+    expect(shelf).toEqual([entry]);
+  });
+
+  it('does not write to the shelf file when the publish callback throws and fallback is off', async () => {
+    const stateDir = await makeTempStateDir();
+    const adapter = new KeeperPublicationAdapter({
+      publish: async () => {
+        throw new Error('network crash');
+      },
+      stateDir,
+      fallbackToShelfFile: false,
+    });
+
+    const result = await adapter.publishKeeperToShelf({ entry: makeEntry({ id: 'throw-entry-no-fallback' }) });
+
+    expect(result).toEqual({ outcome: 'failed', reason: 'network crash' });
+    await expect(readFile(join(stateDir, 'keepers-shelf.json'))).rejects.toThrow();
   });
 });

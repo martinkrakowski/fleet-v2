@@ -545,7 +545,7 @@ bounded_contexts:
       - { adapter: KnowledgeEntryRepositoryAdapter, implements: KnowledgeEntryRepositoryPort, integration: local-transactional-store }
       - { adapter: KnowledgeRetrievalAdapter, implements: KnowledgeRetrievalPort, integration: local-scoped-lexical-index }
       - { adapter: ClaimVerificationAdapter, implements: ClaimVerificationPort, integration: allow-listed-command-or-source-inspection }
-      - { adapter: KeeperPublicationAdapter, implements: KeeperPublicationPort, integration: optional-stash-subprocess-or-local-export }
+      - { adapter: KeeperPublicationAdapter, implements: KeeperPublicationPort, integration: local-file-or-git-provider }
     domain_specification:
       aggregate_roots: [KnowledgeEntry]
       child_ownership: { KnowledgeCheck: KnowledgeEntry, KnowledgeReuse: KnowledgeEntry }

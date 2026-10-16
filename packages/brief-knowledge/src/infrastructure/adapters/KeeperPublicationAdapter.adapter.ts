@@ -1,12 +1,16 @@
-// Implemented for lane bk-usecases-adapters (migration step 6); updated for shelf transport fallback.
+// Implemented for lane bk-usecases-adapters (migration step 6); refined for lane o1-shelf (plan D1):
+// the secret-pattern refusal moved here and scans every text field of an entry before any provider.
 /**
  * KeeperPublicationAdapter implements KeeperPublicationPort: attributed
  * keeper entries go to an injected publish callback or an optional local
- * shelf file (`keepers-shelf.json`) under stateDir. When an injected publish
- * callback fails or throws and fallbackToShelfFile is enabled, entries are
- * also appended to stateDir/keepers-shelf.json for reconciliation. Failed
- * delivery is returned for reconciliation — publication never throws and
- * never rejects otherwise acceptable work.
+ * shelf file (`keepers-shelf.json`) under stateDir. Before any provider
+ * runs, every text field of the entry (claimText, dispositionReason and
+ * every string inside checks and reuses) is scanned against SECRET_PATTERNS;
+ * a matching entry is refused with `retryable: false` and written nowhere.
+ * When an injected publish callback fails or throws and fallbackToShelfFile
+ * is enabled, entries are also appended to stateDir/keepers-shelf.json for
+ * reconciliation. Failed delivery is returned for reconciliation —
+ * publication never throws and never rejects otherwise acceptable work.
  */
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -17,9 +21,17 @@ import type {
   PublishKeeperToShelfRequest,
   PublishKeeperToShelfResult,
 } from '../../application/ports/out/KeeperPublicationPort.out-port.js';
-import { SECRET_PATTERNS } from './ByteStashShelfTransport.adapter.js';
 
 const SHELF_FILE = 'keepers-shelf.json';
+
+export const SECRET_PATTERNS: readonly RegExp[] = [
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
+  /\bsk-[A-Za-z0-9_-]{20,}\b/,
+  /\bAKIA[0-9A-Z]{16}\b/,
+  /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/,
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/,
+];
 
 export type KeeperPublicationCallback = (
   request: PublishKeeperToShelfRequest,
@@ -45,6 +57,15 @@ export class KeeperPublicationAdapter implements KeeperPublicationPort {
       throw new Error('KeeperPublicationAdapter requires an entry with a non-empty id');
     }
 
+    // Refusal runs before any provider: a refused keeper is written nowhere.
+    if (entryMatchesSecretPattern(request.entry)) {
+      return {
+        outcome: 'failed',
+        reason: 'keeper text matches a secret pattern; not published',
+        retryable: false,
+      };
+    }
+
     if (this.deps?.publish) {
       let result: PublishKeeperToShelfResult;
       try {
@@ -62,13 +83,6 @@ export class KeeperPublicationAdapter implements KeeperPublicationPort {
         this.deps.stateDir &&
         result.retryable !== false
       ) {
-        if (matchesSecretPattern(request.entry.claimText)) {
-          return {
-            outcome: 'failed',
-            reason: `${result.reason}; shelf fallback refused: keeper text matches a secret pattern; not published`,
-            retryable: false,
-          };
-        }
         const shelfResult = await this.appendEntryToShelf(this.deps.stateDir, request.entry);
         if (shelfResult.ok) {
           return {
@@ -93,14 +107,6 @@ export class KeeperPublicationAdapter implements KeeperPublicationPort {
       };
     }
 
-    if (matchesSecretPattern(request.entry.claimText)) {
-      return {
-        outcome: 'failed',
-        reason: 'keeper text matches a secret pattern; not published',
-        retryable: false,
-      };
-    }
-
     const shelfResult = await this.appendEntryToShelf(stateDir, request.entry);
     if (!shelfResult.ok) {
       return {
@@ -115,7 +121,9 @@ export class KeeperPublicationAdapter implements KeeperPublicationPort {
     stateDir: string,
     entry: KnowledgeEntryRecord,
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
-    if (matchesSecretPattern(entry.claimText)) {
+    // Defense in depth: a refused keeper is written nowhere, even if a future
+    // call path reaches the shelf append directly.
+    if (entryMatchesSecretPattern(entry)) {
       return {
         ok: false,
         reason: 'keeper text matches a secret pattern; not published',
@@ -140,9 +148,51 @@ export class KeeperPublicationAdapter implements KeeperPublicationPort {
   }
 }
 
-function matchesSecretPattern(text: unknown): boolean {
-  if (typeof text !== 'string') return false;
-  return SECRET_PATTERNS.some((pattern) => pattern.test(text));
+/** True when any text field of the entry matches a secret pattern. */
+function entryMatchesSecretPattern(entry: KnowledgeEntryRecord): boolean {
+  return collectEntryTextFields(entry).some((text) =>
+    SECRET_PATTERNS.some((pattern) => pattern.test(text)),
+  );
+}
+
+/**
+ * Collects every text field of an entry: claimText, dispositionReason and
+ * every string inside checks and reuses (walked recursively so nested
+ * records stay covered).
+ */
+function collectEntryTextFields(entry: KnowledgeEntryRecord): string[] {
+  const texts: string[] = [];
+  if (typeof entry.claimText === 'string') {
+    texts.push(entry.claimText);
+  }
+  if (typeof entry.dispositionReason === 'string') {
+    texts.push(entry.dispositionReason);
+  }
+  for (const group of [entry.checks, entry.reuses]) {
+    if (!Array.isArray(group)) continue;
+    for (const record of group) {
+      collectStrings(record, texts);
+    }
+  }
+  return texts;
+}
+
+function collectStrings(value: unknown, into: string[]): void {
+  if (typeof value === 'string') {
+    into.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectStrings(item, into);
+    }
+    return;
+  }
+  if (value !== null && typeof value === 'object') {
+    for (const item of Object.values(value)) {
+      collectStrings(item, into);
+    }
+  }
 }
 
 /** Returns the parsed shelf keepers, an empty array when absent, or a failure reason string. */

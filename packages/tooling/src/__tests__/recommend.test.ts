@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { validateSeatPolicy } from '@fleet/installation';
 
 import { RECOMMENDER_VERSION, recommendSeats } from '../recommend.js';
-import type { DetectedTool, ModelInfo, ModelsByTool } from '../recommend.js';
+import type { AllowedRouteRule, DetectedTool, ModelInfo, ModelsByTool } from '../recommend.js';
 import type { PolicySection } from '@fleet/installation';
 
 function tool(id: DetectedTool['id'], signIn: DetectedTool['signIn'] = 'signed-in'): DetectedTool {
@@ -21,11 +21,13 @@ function expectValidCatalogue(input: {
   tools: readonly DetectedTool[];
   models: ModelsByTool;
   policy?: PolicySection;
+  allowedRoutes?: readonly AllowedRouteRule[];
 }) {
   const result = recommendSeats({
     tools: input.tools,
     models: input.models,
     policy: input.policy ?? NO_POLICY,
+    ...(input.allowedRoutes === undefined ? {} : { allowedRoutes: input.allowedRoutes }),
   });
   expect(result.outcome).toBe('catalogue');
   if (result.outcome !== 'catalogue') {
@@ -246,6 +248,57 @@ describe('recommendSeats', () => {
       expect(result.outcome).toBe('no-valid-catalogue');
       if (result.outcome === 'no-valid-catalogue') {
         expect(result.reasons.join(' ')).toContain('no implementer seat');
+      }
+    });
+  });
+
+  describe('table: the policy allow-list gates the candidate pool', () => {
+    const tools = [tool('opencode'), tool('claude-code'), tool('grok')];
+    const models: ModelsByTool = {
+      opencode: [
+        model('nvidia/z-ai/glm-5.3', 'free'),
+        model('glm-5.3-flash', 'free'),
+        model('xai/grok-4.7', 'free'),
+      ],
+      'claude-code': [model('claude-sonnet-4-5')],
+      grok: [model('grok-4.7'), model('grok-4.7-fast')],
+    };
+    const allowedRoutes: AllowedRouteRule[] = [
+      { tool: 'opencode', modelPattern: 'nvidia/*' },
+      { tool: 'claude-code', modelPattern: 'claude-*' },
+      { tool: 'grok', modelPattern: 'grok-4.7' },
+    ];
+
+    it('never ranks a disallowed candidate, not even as a lower-ranked entry', () => {
+      const result = expectValidCatalogue({ tools, models, allowedRoutes });
+      // Without the allow-list, glm-5.3-flash would sit lower in the
+      // implementer chain and xai/grok-4.7 would be the strongest reviewer;
+      // both are gone, and so is the disallowed grok-4.7-fast.
+      expect(result.chains.implementer?.map((step) => step.seatId)).toEqual([
+        'opencode-nvidia-z-ai-glm-5.3',
+        'claude-code-claude-sonnet-4-5',
+      ]);
+      expect(result.chains.reviewer?.map((step) => step.seatId)).toEqual(['grok-grok-4.7']);
+      const ranked = JSON.stringify({
+        seats: result.seats,
+        chains: result.chains,
+        reasons: result.reasons,
+      });
+      expect(ranked).not.toContain('glm-5.3-flash');
+      expect(ranked).not.toContain('xai/grok-4.7');
+      expect(ranked).not.toContain('grok-4.7-fast');
+      // Every dropped candidate is recorded with a reason.
+      expect(result.skipped).toHaveLength(3);
+      expect(result.skipped.join(' ')).toContain('not on the policy allow-list');
+    });
+
+    it('admits nothing when the allow-list is present but empty', () => {
+      const result = recommendSeats({ tools, models, policy: NO_POLICY, allowedRoutes: [] });
+      expect(result.outcome).toBe('no-valid-catalogue');
+      if (result.outcome === 'no-valid-catalogue') {
+        expect(result.reasons.join(' ')).toContain('no implementer seat');
+        expect(result.skipped).toHaveLength(6);
+        expect(result.skipped.join(' ')).toContain('not on the policy allow-list');
       }
     });
   });

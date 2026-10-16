@@ -554,13 +554,23 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         disposition: requiredNested<FindingDispositionRecord>(p, 'disposition', 'evidence disposition'),
         nowIso: optStr(p, 'nowIso'),
       }),
-    assess: async (p, rt) =>
-      rt.evidence.assessHeadAcceptance.assessHeadAcceptance({
-        assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),
+    assess: async (p, rt) => {
+      // Owner decision references are frozen into the brief package and read
+      // from the attempt record; supplying them here would let a caller name
+      // the one-way doors it is judged against.
+      if (p['ownerDecisionReferences'] !== undefined) {
+        throw new CliUsageError(
+          "'--ownerDecisionReferences' is forbidden; owner decisions come from the attempt record",
+        );
+      }
+      const attemptId = optStr(p, 'attemptId');
+      return rt.evidence.assessHeadAcceptance.assessHeadAcceptance({
+        assessmentId: str(p, 'assessmentId') || (attemptId ? assessmentIdForAttempt(attemptId) : ''),
         candidateHeadSha: str(p, 'candidateHeadSha'),
         policyRevision: str(p, 'policyRevision'),
         nowIso: optStr(p, 'nowIso'),
-      }),
+      });
+    },
     inspect: async (p, rt) =>
       rt.evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
         assessmentId: optStr(p, 'assessmentId'),

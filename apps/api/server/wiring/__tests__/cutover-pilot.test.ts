@@ -237,6 +237,7 @@ const PILOT_OBSERVATION_REQUEST = {
 const PILOT_ATTEMPT = {
   id: "attempt-pilot-1",
   workOrderId: "wo-pilot-1",
+  ownerDecisionReferences: [],
   kind: "initial",
   fixNumber: 0,
   priorAttemptId: null,
@@ -260,7 +261,7 @@ const PILOT_ATTEMPT = {
 
 /** The assessment an earlier process carried all the way to acceptance. */
 const PILOT_ACCEPTED_ASSESSMENT = {
-  id: "assessment-pilot-1",
+  id: "assessment-attempt-pilot-1",
   projectId: "proj-pilot-1",
   attemptId: "attempt-pilot-1",
   candidateHeadSha: PILOT_HEAD,
@@ -270,7 +271,7 @@ const PILOT_ACCEPTED_ASSESSMENT = {
   verificationReceipts: [
     {
       id: "vr-pilot-1",
-      assessmentId: "assessment-pilot-1",
+      assessmentId: "assessment-attempt-pilot-1",
       projectId: "proj-pilot-1",
       attemptId: "attempt-pilot-1",
       candidateHeadSha: PILOT_HEAD,
@@ -286,7 +287,7 @@ const PILOT_ACCEPTED_ASSESSMENT = {
   reviewReceipts: [
     {
       id: "rr-pilot-1",
-      assessmentId: "assessment-pilot-1",
+      assessmentId: "assessment-attempt-pilot-1",
       projectId: "proj-pilot-1",
       attemptId: "attempt-pilot-1",
       candidateHeadSha: PILOT_HEAD,
@@ -789,7 +790,7 @@ describe("restarted API and web client loopback pilot", () => {
       };
     };
     expect(headResult.outcome).toBe("found");
-    expect(headResult.assessment?.id).toBe("assessment-pilot-1");
+    expect(headResult.assessment?.id).toBe("assessment-attempt-pilot-1");
     expect(headResult.assessment?.candidateHeadSha).toBe(PILOT_HEAD);
     expect(headResult.assessment?.state).toBe("accepted");
     expect(headResult.assessment?.acceptanceReceiptId).toBe("acc-pilot-1");

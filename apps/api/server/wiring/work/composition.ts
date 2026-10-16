@@ -1,5 +1,6 @@
 import {
   AcceptanceAssessmentAdapter,
+  AcceptanceEvidenceAdapter,
   ActionAuthorizationAdapter,
   AttemptArtifactAdapter,
   AttemptRepositoryAdapter,
@@ -9,13 +10,18 @@ import {
   ExecutionObservationAdapter,
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
+  OwnerDecisionAdapter,
+  AttemptOwnerDecisionAdapter,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
   type AcceptanceAssessmentDelegate,
+  type AcceptanceEvidenceDelegate,
   type ActionAuthorizationDelegate,
   type BriefKnowledgeDelegate,
   type ExecutionObservationDelegate,
   type ForgeActionDelegate,
+  type OwnerDecisionDelegate,
+  type AttemptOwnerDecisionDelegate,
 } from "@fleet/work-execution";
 import type { FleetInstallation } from "@fleet/installation";
 import {
@@ -122,6 +128,9 @@ export function resolveWorkRunnerSettings(
  */
 export interface WorkCrossContextDelegates {
   readonly acceptance?: AcceptanceAssessmentDelegate;
+  readonly acceptanceEvidence?: AcceptanceEvidenceDelegate;
+  readonly ownerDecision?: OwnerDecisionDelegate;
+  readonly attemptOwnerDecision?: AttemptOwnerDecisionDelegate;
   readonly briefKnowledge?: BriefKnowledgeDelegate;
   readonly authorization?: ActionAuthorizationDelegate;
   readonly observation?: ExecutionObservationDelegate;
@@ -209,10 +218,15 @@ export function createConfiguredWorkComposition(
       await attemptRepo.findAttemptById(attemptId),
   });
   const acceptancePort = new AcceptanceAssessmentAdapter(crossContext?.acceptance);
+  const acceptanceEvidencePort = new AcceptanceEvidenceAdapter(crossContext?.acceptanceEvidence);
   const briefKnowledge = new BriefKnowledgeAdapter(crossContext?.briefKnowledge);
   const authorizationPort = new ActionAuthorizationAdapter(crossContext?.authorization);
   const observation = new ExecutionObservationAdapter(crossContext?.observation);
   const forgePort = new ForgeActionAdapter(crossContext?.forge);
+  const ownerDecisionPort = new OwnerDecisionAdapter(crossContext?.ownerDecision);
+  const attemptOwnerDecisionPort = new AttemptOwnerDecisionAdapter(
+    crossContext?.attemptOwnerDecision,
+  );
 
   return {
     registerWorkOrder: new RegisterWorkOrderUseCase({ workOrderRepo }),
@@ -254,6 +268,11 @@ export function createConfiguredWorkComposition(
       authorizationPort,
       forgePort,
       acceptedReceiptByHead: crossContext?.acceptedReceiptByHead,
+      acceptanceEvidencePort,
+      // Forge actions re-check the attempt's one-way doors through the same
+      // owner-decision resolution acceptance uses.
+      ownerDecisionPort,
+      attemptOwnerDecisionPort,
     }),
   };
 }

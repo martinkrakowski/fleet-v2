@@ -99,6 +99,14 @@ export interface AttemptRecord {
   readonly runner?: AttemptRunnerRecord | null;
   readonly seatOverride?: AttemptSeatOverrideRecord | null;
   readonly reviewerSeat?: string | null;
+  /**
+   * Owner decision references the product froze into the brief package, read
+   * from that frozen package at dispatch and never from a worktree file at
+   * acceptance time. An absent field on records written before dispatch
+   * recorded it is read as unknown, which blocks acceptance; it is not an empty
+   * list and never a caller-supplied one.
+   */
+  readonly ownerDecisionReferences?: readonly string[];
   readonly createdAtIso: string;
   readonly updatedAtIso: string;
 }

@@ -3,11 +3,15 @@
 import { join } from "node:path";
 
 import {
+  AttemptOwnerDecisionAdapter,
   EvidenceArchiveAdapter,
   EvidenceAssessmentRepositoryAdapter,
   ForgeEvidenceAdapter,
   IndependentReviewAdapter,
+  OwnerDecisionAdapter,
   VerificationExecutorAdapter,
+  type AttemptOwnerDecisionDelegate,
+  type OwnerDecisionDelegate,
 } from "@fleet/evidence-and-acceptance";
 import {
   AssessHeadAcceptanceUseCase,
@@ -29,6 +33,12 @@ export interface EvidenceUseCases {
   recordFindingDisposition: RecordFindingDispositionUseCase;
 }
 
+export interface EvidenceCrossContextDelegates {
+  readonly ownerDecision?: OwnerDecisionDelegate;
+  /** Reads the attempt record that carries the frozen owner decision doors. */
+  readonly attemptOwnerDecision?: AttemptOwnerDecisionDelegate;
+}
+
 export interface EvidenceUseCasesOptions {
   readonly stateDir?: string;
 }
@@ -47,6 +57,7 @@ function createEvidenceUseCases(): EvidenceUseCases {
 
 export function createConfiguredEvidenceUseCases(
   options?: EvidenceUseCasesOptions,
+  crossContext?: EvidenceCrossContextDelegates,
 ): EvidenceUseCases {
   const stateDir = options?.stateDir;
 
@@ -57,6 +68,10 @@ export function createConfiguredEvidenceUseCases(
   );
   const forgeEvidence = new ForgeEvidenceAdapter();
   const reviewer = new IndependentReviewAdapter();
+  const ownerDecisionPort = new OwnerDecisionAdapter(crossContext?.ownerDecision);
+  const attemptOwnerDecisionPort = new AttemptOwnerDecisionAdapter(
+    crossContext?.attemptOwnerDecision,
+  );
 
   return {
     requestVerification: new RequestVerificationUseCase({ repo, executor, archive }),
@@ -67,7 +82,12 @@ export function createConfiguredEvidenceUseCases(
       archive,
     }),
     recordReviewReceipt: new RecordReviewReceiptUseCase({ repo }),
-    assessHeadAcceptance: new AssessHeadAcceptanceUseCase({ repo, forgeEvidence }),
+    assessHeadAcceptance: new AssessHeadAcceptanceUseCase({
+      repo,
+      forgeEvidence,
+      ownerDecisionPort,
+      attemptOwnerDecisionPort,
+    }),
     inspectAcceptanceEvidence: new InspectAcceptanceEvidenceUseCase({ repo }),
     recordFindingDisposition: new RecordFindingDispositionUseCase({ repo }),
   };
@@ -92,6 +112,7 @@ function isEvidenceUseCases(
 
 export function configureEvidenceUseCases(
   custom: EvidenceUseCases | { stateDir?: string } | null,
+  crossContext?: EvidenceCrossContextDelegates,
 ): void {
   if (custom === null) {
     configured = null;
@@ -100,6 +121,6 @@ export function configureEvidenceUseCases(
   }
   configured = isEvidenceUseCases(custom)
     ? custom
-    : createConfiguredEvidenceUseCases(custom);
+    : createConfiguredEvidenceUseCases(custom, crossContext);
   shared = null;
 }

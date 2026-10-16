@@ -46,6 +46,31 @@ const REQUIRED_BOOLEAN_CAPABILITIES: readonly (keyof RunnerIsolationCapabilities
 type JournalEntryDraft = Omit<ActionJournalEntryRecord, 'id'>;
 
 /**
+ * Owner decision references as frozen in the brief package. An absent field is
+ * an empty list; anything present that is not an array of non-empty strings is
+ * malformed and returns null so the dispatch refuses.
+ */
+function readOwnerDecisionReferences(
+  manifest: Record<string, unknown>,
+): readonly string[] | null {
+  const recorded = manifest.ownerDecisionReferences;
+  if (recorded === undefined || recorded === null) {
+    return [];
+  }
+  if (!Array.isArray(recorded)) {
+    return null;
+  }
+  const references: string[] = [];
+  for (const entry of recorded) {
+    if (typeof entry !== 'string' || entry.trim().length === 0) {
+      return null;
+    }
+    references.push(entry.trim());
+  }
+  return references;
+}
+
+/**
  * Append one journal entry with a deterministic identity derived from the
  * attempt's append-only history. Intent must be durable before the runner
  * subprocess runs, so every lifecycle use case appends through here.
@@ -224,6 +249,19 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       };
     }
 
+    // The one-way doors this attempt must clear come from the frozen brief
+    // package the product prepared. An absent field means there are none; a
+    // malformed one refuses dispatch rather than dispatching a lane whose
+    // doors cannot be read later.
+    const ownerDecisionReferences = readOwnerDecisionReferences(parsedManifest);
+    if (ownerDecisionReferences === null) {
+      return {
+        outcome: 'refused',
+        reason:
+          "Frozen brief manifest 'ownerDecisionReferences' must be an array of non-empty strings when present",
+      };
+    }
+
     const nowIso = request.nowIso ?? new Date().toISOString();
 
     const existingAttempt = await this.deps.attemptRepo.findAttemptById(request.attemptId);
@@ -328,6 +366,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           runner: initialRunner,
           seatOverride: request.seatOverride ?? existingAttempt.seatOverride ?? null,
           reviewerSeat: request.reviewerSeat ?? existingAttempt.reviewerSeat ?? fallbackReviewer,
+          ownerDecisionReferences,
           updatedAtIso: nowIso,
         }
       : {
@@ -348,6 +387,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           runner: initialRunner,
           seatOverride: request.seatOverride ?? null,
           reviewerSeat: request.reviewerSeat ?? fallbackReviewer,
+          ownerDecisionReferences,
           createdAtIso: nowIso,
           updatedAtIso: nowIso,
         };

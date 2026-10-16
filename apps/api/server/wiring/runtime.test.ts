@@ -4,12 +4,14 @@ import {
 } from './runtime.js';
 import { workComposition } from './work/composition.js';
 import { getOperatorComposition } from './operator/composition.js';
+import { getEvidenceUseCases } from './evidence/composition.js';
 import {
   forgeActionScope,
   consumptionId,
   observationEventKind,
 } from '@fleet/work-execution';
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
+import type { EvidenceAssessmentRecord } from '@fleet/evidence-and-acceptance';
 import type { AttemptRecord, WorkOrderRecord } from '@fleet/work-execution';
 
 function makeHeadH(): string {
@@ -34,8 +36,13 @@ function makeWorkOrder(id: string): WorkOrderRecord {
   };
 }
 
-function makeAttempt(id: string, workOrderId: string, head: string): AttemptRecord {
-  return {
+function makeAttempt(
+  id: string,
+  workOrderId: string,
+  head: string,
+  doors?: readonly string[],
+): AttemptRecord {
+  const record: AttemptRecord = {
     id,
     workOrderId,
     kind: 'initial',
@@ -58,6 +65,7 @@ function makeAttempt(id: string, workOrderId: string, head: string): AttemptReco
     createdAtIso: '2026-10-15T10:00:00Z',
     updatedAtIso: '2026-10-15T10:30:00Z',
   };
+  return doors === undefined ? record : { ...record, ownerDecisionReferences: doors };
 }
 
 function makeApprovedGrant(
@@ -122,7 +130,7 @@ describe('apps/api runtime wiring', () => {
         deps?: { attemptRepo: { saveAttempt: (a: AttemptRecord) => Promise<void> } };
       }).deps?.attemptRepo;
       if (attemptRepo) {
-        await attemptRepo.saveAttempt(makeAttempt(attemptId, workOrderId, headH));
+        await attemptRepo.saveAttempt(makeAttempt(attemptId, workOrderId, headH, []));
       }
 
       // Resolve authorization grant for push-and-open-pr at head H
@@ -160,6 +168,262 @@ describe('apps/api runtime wiring', () => {
         const grant = await findRepo.findRequestByGrantId(grantId);
         expect(grant?.consumptions).toHaveLength(0);
         expect(grant?.state).toBe('approved');
+      }
+    });
+  });
+
+  describe('M15: one-way doors resolve through the coordination application layer', () => {
+    const headH = makeHeadH();
+
+    function ownerDecision(
+      requestId: string,
+      overrides: Partial<CoordinationRequestRecord>,
+    ): CoordinationRequestRecord {
+      return {
+        id: requestId,
+        projectId: 'proj-api-test',
+        kind: 'action-decision',
+        state: 'approved',
+        actionScope: `owner-decision:${requestId}`,
+        expectedHeadSha: headH,
+        proposalDigest: `digest-${requestId}`,
+        policyRevision: 'pol-1',
+        decisionRevision: `dec-${requestId}`,
+        grantId: `grant-${requestId}`,
+        consumptions: [],
+        acknowledgements: [],
+        deliveryStatus: 'delivered',
+        deliveryGapReason: null,
+        revision: 1,
+        createdAtIso: '2026-10-15T10:00:00Z',
+        updatedAtIso: '2026-10-15T10:00:00Z',
+        ...overrides,
+      };
+    }
+
+    async function assessWithDoor(
+      attemptId: string,
+      doors: readonly string[] | null,
+      decision?: CoordinationRequestRecord,
+    ) {
+      configureFleetApiRuntime();
+      const work = workComposition();
+      const operator = getOperatorComposition();
+      const evidence = getEvidenceUseCases();
+      const assessmentId = `assessment-${attemptId}`;
+
+      const attemptRepo = (work.executeAuthorizedForgeAction as unknown as {
+        deps?: { attemptRepo: { saveAttempt: (a: AttemptRecord) => Promise<void> } };
+      }).deps?.attemptRepo;
+      if (attemptRepo) {
+        await attemptRepo.saveAttempt(
+          doors === null
+            ? makeAttempt(attemptId, `wo-${attemptId}`, headH)
+            : { ...makeAttempt(attemptId, `wo-${attemptId}`, headH), ownerDecisionReferences: doors },
+        );
+      }
+      const reqRepo = (operator.checkOwnerDecision as unknown as {
+        deps?: { requestRepo: { saveRequest: (r: CoordinationRequestRecord) => Promise<void> } };
+      }).deps?.requestRepo;
+      if (decision && reqRepo) {
+        await reqRepo.saveRequest(decision);
+      }
+      const assessmentRepo = (evidence.assessHeadAcceptance as unknown as {
+        deps?: {
+          repo: {
+            saveAssessment: (a: EvidenceAssessmentRecord) => Promise<void>;
+          };
+        };
+      }).deps?.repo;
+      const assessment: EvidenceAssessmentRecord = {
+          id: assessmentId,
+          projectId: 'proj-api-test',
+          attemptId,
+          candidateHeadSha: headH,
+          policyRevision: 'pol-1',
+          requiredChecks: [],
+          state: 'pending',
+          verificationReceipts: [],
+          reviewReceipts: [
+            {
+              id: `review-${attemptId}`,
+              assessmentId,
+              projectId: 'proj-api-test',
+              attemptId,
+              candidateHeadSha: headH,
+              reviewerModel: 'seat/reviewer',
+              implementerModel: 'seat/implementer',
+              readOnlyVerified: true,
+              result: 'pass',
+              findings: [],
+              evidenceRef: `ev-${attemptId}`,
+              policyRevision: 'pol-1',
+              completedAtIso: '2026-10-15T10:00:00Z',
+            },
+          ],
+          findingDispositions: [],
+          acceptanceReceiptId: null,
+          blockers: [],
+          revision: 1,
+          updatedAtIso: '2026-10-15T10:00:00Z',
+        };
+      if (assessmentRepo) {
+        await assessmentRepo.saveAssessment(assessment);
+      }
+
+      return evidence.assessHeadAcceptance.assessHeadAcceptance({
+        assessmentId,
+        candidateHeadSha: headH,
+        policyRevision: 'pol-1',
+      });
+    }
+
+    it('an approved door for the candidate head accepts through the runtime wiring', async () => {
+      const result = await assessWithDoor(
+        'att-api-door-approved',
+        ['req-door-approved'],
+        ownerDecision('req-door-approved', {}),
+      );
+
+      // The only blockers left are the unbound forge transport's honest unknowns:
+// the door itself cleared through the coordination application layer.
+      expect(result.outcome).toBe('blocked');
+      if (result.outcome === 'blocked') {
+        expect(result.blockers.some((blocker) => blocker.includes('owner decision'))).toBe(false);
+        expect(result.blockers).toEqual([
+          "forge reports CI state 'unknown' for this candidate head",
+          'forge could not read review threads for this candidate head',
+        ]);
+      }
+    });
+
+    it('a declined door blocks through the runtime wiring', async () => {
+      const result = await assessWithDoor(
+        'att-api-door-declined',
+        ['req-door-declined'],
+        ownerDecision('req-door-declined', { state: 'declined', decisionRevision: null, grantId: null }),
+      );
+
+      expect(result.outcome).toBe('blocked');
+      if (result.outcome === 'blocked') {
+        expect(
+          result.blockers.some((blocker) =>
+            blocker.includes("owner decision 'req-door-declined' is not approved"),
+          ),
+        ).toBe(true);
+      }
+    });
+
+    it('an attempt recorded before doors were frozen blocks through the runtime wiring', async () => {
+      const result = await assessWithDoor('att-api-door-legacy', null);
+
+      expect(result.outcome).toBe('blocked');
+      if (result.outcome === 'blocked') {
+        expect(
+          result.blockers.some((blocker) =>
+            blocker.includes('owner decision references for attempt'),
+          ),
+        ).toBe(true);
+      }
+    });
+
+    it('withdrawn door: attempt accept is blocked and merge-pr refuses without consuming the grant', async () => {
+      configureFleetApiRuntime();
+      const work = workComposition();
+      const operator = getOperatorComposition();
+      const evidence = getEvidenceUseCases();
+      const attemptId = 'att-api-door-e2e';
+      const workOrderId = 'wo-api-door-e2e';
+      const doorRef = 'req-api-door-e2e';
+      const grantId = 'grant-api-door-e2e';
+      // The API acceptance delegate addresses the assessment by the attempt id.
+      const assessmentId = attemptId;
+
+      const workOrderRepo = (work.registerWorkOrder as unknown as {
+        deps?: { workOrderRepo: { saveWorkOrder: (w: WorkOrderRecord) => Promise<void> } };
+      }).deps?.workOrderRepo;
+      if (workOrderRepo) {
+        await workOrderRepo.saveWorkOrder(makeWorkOrder(workOrderId));
+      }
+      const attemptRepo = (work.executeAuthorizedForgeAction as unknown as {
+        deps?: { attemptRepo: { saveAttempt: (a: AttemptRecord) => Promise<void> } };
+      }).deps?.attemptRepo;
+      if (attemptRepo) {
+        await attemptRepo.saveAttempt(makeAttempt(attemptId, workOrderId, headH, [doorRef]));
+      }
+      const reqRepo = (operator.checkOwnerDecision as unknown as {
+        deps?: { requestRepo: { saveRequest: (r: CoordinationRequestRecord) => Promise<void> } };
+      }).deps?.requestRepo;
+      if (reqRepo) {
+        await reqRepo.saveRequest(ownerDecision(doorRef, {}));
+        await reqRepo.saveRequest(makeApprovedGrant(grantId, forgeActionScope('merge-pr'), headH));
+      }
+      const assessmentRepo = (evidence.assessHeadAcceptance as unknown as {
+        deps?: { repo: { saveAssessment: (a: EvidenceAssessmentRecord) => Promise<void> } };
+      }).deps?.repo;
+      if (assessmentRepo) {
+        await assessmentRepo.saveAssessment({
+          id: assessmentId,
+          projectId: 'proj-api-test',
+          attemptId,
+          candidateHeadSha: headH,
+          policyRevision: 'pol-1',
+          requiredChecks: [],
+          state: 'accepted',
+          verificationReceipts: [],
+          reviewReceipts: [],
+          findingDispositions: [],
+          acceptanceReceiptId: `acc-${attemptId}`,
+          blockers: [],
+          revision: 1,
+          updatedAtIso: '2026-10-15T10:00:00Z',
+        });
+      }
+
+      // The owner decision is withdrawn while the attempt keeps its door.
+      if (reqRepo) {
+        await reqRepo.saveRequest(
+          ownerDecision(doorRef, {
+            state: 'awaiting-decision',
+            decisionRevision: null,
+            grantId: null,
+            revision: 2,
+          }),
+        );
+      }
+
+      // `attempt accept` must refuse even though a receipt-bearing accepted
+      // assessment is still stored for this exact head.
+      const accept = await work.requestAttemptAcceptance.requestAttemptAcceptance({
+        attemptId,
+        candidateHeadSha: headH,
+        reviewerModel: 'openrouter/anthropic/claude-sonnet-4.5',
+      });
+      expect(accept.outcome).toBe('rejected');
+      if (accept.outcome === 'rejected') {
+        // The API delegate surfaces the acceptance blockers directly.
+        expect(accept.reason).toContain(`'${doorRef}' is not approved`);
+      }
+
+      // `forge execute --kind merge-pr` refuses before consuming the grant.
+      const forge = await work.executeAuthorizedForgeAction.executeAuthorizedForgeAction({
+        actionId: 'action-api-door-e2e',
+        attemptId,
+        workOrderId,
+        kind: 'merge-pr',
+        expectedHeadSha: headH,
+        authorizationGrantId: grantId,
+      });
+      expect(forge.outcome).toBe('refused');
+      if (forge.outcome === 'refused') {
+        expect(forge.reason).toContain(`'${doorRef}' is not approved`);
+      }
+      if (reqRepo) {
+        const findRepo = reqRepo as unknown as {
+          findRequestByGrantId: (id: string) => Promise<CoordinationRequestRecord | null>;
+        };
+        const grant = await findRepo.findRequestByGrantId(grantId);
+        expect(grant?.consumptions ?? []).toHaveLength(0);
       }
     });
   });

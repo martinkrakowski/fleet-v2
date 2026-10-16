@@ -1142,6 +1142,78 @@ describe('DispatchAttemptUseCase', () => {
     expect(dirty.journal.entries).toHaveLength(0);
   });
 
+  it('records the frozen brief manifest owner decision references on the attempt', async () => {
+    const setup = makeDispatchSetup({
+      workspaceOptions: {
+        readWorktreeFile: async () =>
+          JSON.stringify({
+            modelAssignment: {
+              model: 'nvidia/z-ai/glm-5.3',
+              agent: 'lane-agent',
+              variant: 'default',
+            },
+            independentReviewer: 'reviewer-model',
+            ownerDecisionReferences: ['door-1', 'door-2'],
+          }),
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('started');
+    if (result.outcome !== 'started') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.ownerDecisionReferences).toEqual(['door-1', 'door-2']);
+    const stored = await setup.attemptRepo.findAttemptById('attempt-1');
+    expect(stored?.ownerDecisionReferences).toEqual(['door-1', 'door-2']);
+  });
+
+  it('records an empty door list when the frozen manifest names none', async () => {
+    const setup = makeDispatchSetup();
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('started');
+    if (result.outcome !== 'started') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.ownerDecisionReferences).toEqual([]);
+  });
+
+  it('refuses dispatch when the frozen manifest records malformed owner decision references', async () => {
+    const malformed: readonly unknown[] = ['not-an-array', [42], [''], [{}]];
+    for (const recorded of malformed) {
+      const setup = makeDispatchSetup({
+        workspaceOptions: {
+          readWorktreeFile: async () =>
+            JSON.stringify({
+              modelAssignment: { model: 'nvidia/z-ai/glm-5.3', agent: 'lane-agent', variant: 'default' },
+              independentReviewer: 'reviewer-model',
+              ownerDecisionReferences: recorded,
+            }),
+        },
+      });
+
+      const result = await setup.useCase.dispatchAttempt(
+        validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+      );
+
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason:
+          "Frozen brief manifest 'ownerDecisionReferences' must be an array of non-empty strings when present",
+      });
+      expect(setup.runner.startCalls).toHaveLength(0);
+      expect(setup.journal.entries).toHaveLength(0);
+      expect(await setup.attemptRepo.findAttemptById('attempt-1')).toBeNull();
+    }
+  });
+
   it('records durable intent before start and transitions to running on started', async () => {
     const journalEntryCountsAtStart: number[] = [];
     const setup = makeDispatchSetup({

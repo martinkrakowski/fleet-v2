@@ -3,6 +3,10 @@
  * Evaluate every required check and finding against the current head and
  * policy; issue a scoped acceptance receipt or explicit blockers. Never
  * performs a merge.
+ *
+ * The request carries coordinates only. Owner decision references are not a
+ * request field: acceptance reads them from the attempt record through a port,
+ * so a caller can never name the one-way doors it is being judged against.
  */
 
 import type { EvidenceAssessmentRecord } from '../../../domain/evidence-records.js';

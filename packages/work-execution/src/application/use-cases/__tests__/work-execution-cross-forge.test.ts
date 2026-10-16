@@ -38,6 +38,11 @@ import type {
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../../ports/out/ExecutionJournalPort.out-port.js';
 import type {
+  AcceptanceEvidencePort,
+  ReadAcceptanceRequest,
+  ReadAcceptanceResult,
+} from '../../ports/out/AcceptanceEvidencePort.out-port.js';
+import type {
   ForgeActionPort,
   ForgeActionRequest,
   ForgeActionResult,
@@ -68,6 +73,7 @@ const LANE_ID = 'wk-p4-cross-forge';
 function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
     id: 'attempt-1',
+    ownerDecisionReferences: [],
     workOrderId: 'wo-1',
     kind: 'initial',
     fixNumber: 0,
@@ -244,6 +250,24 @@ function acceptanceRequest(overrides: Partial<RequestAttemptAcceptanceRequest> =
     reviewerModel: 'openrouter/anthropic/claude-sonnet-4.5',
     ...overrides,
   };
+}
+
+class FakeAcceptanceEvidence implements AcceptanceEvidencePort {
+  constructor(
+    private readonly result: ReadAcceptanceResult = {
+      outcome: 'found',
+      assessment: {
+        state: 'accepted',
+        candidateHeadSha: HEAD_SHA,
+        policyRevision: 'policy-7',
+        acceptanceReceiptId: 'receipt-1',
+      },
+    },
+  ) {}
+
+  async readAcceptance(_request: ReadAcceptanceRequest): Promise<ReadAcceptanceResult> {
+    return this.result;
+  }
 }
 
 function forgeRequest(overrides: Partial<ExecuteAuthorizedForgeActionRequest> = {}): ExecuteAuthorizedForgeActionRequest {
@@ -517,7 +541,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       workOrder?: WorkOrderRecord | null;
       authorization?: FakeActionAuthorization | ActionAuthorizationPort;
       forgeResult?: ForgeActionResult;
-      acceptedReceiptByHead?: Readonly<Record<string, string>>;
+      acceptanceEvidence?: ReadAcceptanceResult | null;
     } = {},
   ) {
     const journal = new InMemoryJournal();
@@ -529,16 +553,37 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
     const workOrderRepo = new InMemoryWorkOrderRepository(
       overrides.workOrder === null ? [] : [overrides.workOrder ?? makeWorkOrder()],
     );
+    // Merges read acceptance through the port; `null` leaves it unwired to
+    // exercise the fail-closed unconfigured branch.
+    const acceptanceEvidencePort =
+      overrides.acceptanceEvidence === undefined
+        ? new FakeAcceptanceEvidence()
+        : overrides.acceptanceEvidence === null
+          ? undefined
+          : new FakeAcceptanceEvidence(overrides.acceptanceEvidence);
+    const attemptRepo = new InMemoryAttemptRepository([overrides.attempt ?? makeAttempt()]);
     const useCase = new ExecuteAuthorizedForgeActionUseCase({
-      attemptRepo: new InMemoryAttemptRepository([overrides.attempt ?? makeAttempt()]),
+      attemptRepo,
       workOrderRepo,
       journal,
       authorizationPort: authorization,
       forgePort,
-      acceptedReceiptByHead:
-        'acceptedReceiptByHead' in overrides
-          ? overrides.acceptedReceiptByHead
-          : { [HEAD_SHA]: 'receipt-1' },
+      acceptanceEvidencePort,
+      attemptOwnerDecisionPort: {
+        async readAttemptOwnerDecisionReferences({ attemptId }) {
+          const record = await attemptRepo.findAttemptById(attemptId);
+          if (record === null) {
+            return { outcome: 'unknown', reason: `No attempt is recorded for ${attemptId}` };
+          }
+          if (record.ownerDecisionReferences === undefined) {
+            return {
+              outcome: 'unknown',
+              reason: `attempt ${attemptId} was recorded before owner decision references were frozen`,
+            };
+          }
+          return { outcome: 'recorded', ownerDecisionReferences: record.ownerDecisionReferences };
+        },
+      },
       now: () => FIXED_NOW,
     });
     return { journal, authorization, forgePort, workOrderRepo, useCase };
@@ -579,32 +624,40 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
     expect(forgePort.requests).toHaveLength(0);
   });
 
-  it('refuses a merge without an acceptance receipt for the expected head', async () => {
+  it('refuses a merge when the acceptance assessment is for another head', async () => {
     const authorization = new FakeActionAuthorization();
     const { useCase, forgePort } = makeDeps({
       authorization,
-      acceptedReceiptByHead: { [OTHER_SHA]: 'receipt-other' },
+      acceptanceEvidence: {
+        outcome: 'found',
+        assessment: {
+          state: 'accepted',
+          candidateHeadSha: OTHER_SHA,
+          policyRevision: 'policy-7',
+          acceptanceReceiptId: 'receipt-other',
+        },
+      },
     });
 
     const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
 
     expect(result).toEqual({
       outcome: 'refused',
-      reason: 'Cannot merge without an acceptance receipt for expectedHeadSha',
+      reason: `Cannot merge: assessment head '${OTHER_SHA}' does not match expectedHeadSha '${HEAD_SHA}'`,
     });
     expect(authorization.consumeRequests).toHaveLength(0);
     expect(forgePort.requests).toHaveLength(0);
   });
 
-  it('refuses a merge when no acceptance receipt registry is configured at all', async () => {
+  it('refuses a merge when no acceptance evidence port is configured at all', async () => {
     const authorization = new FakeActionAuthorization();
-    const { useCase, forgePort } = makeDeps({ authorization, acceptedReceiptByHead: undefined });
+    const { useCase, forgePort } = makeDeps({ authorization, acceptanceEvidence: null });
 
     const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
 
     expect(result).toEqual({
       outcome: 'refused',
-      reason: 'Cannot merge without an acceptance receipt for expectedHeadSha',
+      reason: 'Cannot merge without a configured acceptance evidence port',
     });
     expect(authorization.consumeRequests).toHaveLength(0);
     expect(forgePort.requests).toHaveLength(0);
@@ -612,7 +665,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
 
   it('executes a push-and-open-pr without requiring an acceptance receipt', async () => {
     const { useCase, forgePort, workOrderRepo } = makeDeps({
-      acceptedReceiptByHead: {},
+      acceptanceEvidence: { outcome: 'not-found', reason: 'no assessment recorded' },
       forgeResult: { outcome: 'executed', pullRequestNumber: 42, headSha: HEAD_SHA },
     });
 

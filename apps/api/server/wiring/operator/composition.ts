@@ -1,5 +1,6 @@
 import {
   AttentionReadAdapter,
+  CheckOwnerDecisionUseCase,
   CoordinationRequestRepositoryAdapter,
   DecisionTransportAdapter,
   ObservationPublicationAdapter,
@@ -22,10 +23,12 @@ import {
 } from "@fleet/operator-coordination/use-cases";
 
 export interface OperatorComposition {
+  coordinationRequestRepository: CoordinationRequestRepositoryAdapter;
   inspectConfiguredCapabilities: InspectConfiguredCapabilitiesUseCase;
   publishProjectObservation: PublishProjectObservationUseCase;
   requestScopedDecision: RequestScopedDecisionUseCase;
   resolveActionAuthorization: ResolveActionAuthorizationUseCase;
+  checkOwnerDecision: CheckOwnerDecisionUseCase;
   recordAuthorizationConsumption: RecordAuthorizationConsumptionUseCase;
   readProjectAttention: ReadProjectAttentionUseCase;
   inspectOutstandingCoordination: InspectOutstandingCoordinationUseCase;
@@ -44,10 +47,12 @@ let configured: OperatorComposition | undefined;
 
 function unconfiguredOperatorComposition(): OperatorComposition {
   return {
+    coordinationRequestRepository: new CoordinationRequestRepositoryAdapter(),
     inspectConfiguredCapabilities: new InspectConfiguredCapabilitiesUseCase(),
     publishProjectObservation: new PublishProjectObservationUseCase(),
     requestScopedDecision: new RequestScopedDecisionUseCase(),
     resolveActionAuthorization: new ResolveActionAuthorizationUseCase(),
+    checkOwnerDecision: new CheckOwnerDecisionUseCase(),
     recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase(),
     readProjectAttention: new ReadProjectAttentionUseCase(),
     inspectOutstandingCoordination: new InspectOutstandingCoordinationUseCase(),
@@ -87,6 +92,7 @@ export function createConfiguredOperatorComposition(
   );
 
   return {
+    coordinationRequestRepository: requestRepo,
     inspectConfiguredCapabilities: new InspectConfiguredCapabilitiesUseCase({ profileRepo }),
     publishProjectObservation: new PublishProjectObservationUseCase({ publicationPort }),
     requestScopedDecision: new RequestScopedDecisionUseCase({
@@ -97,6 +103,7 @@ export function createConfiguredOperatorComposition(
       requestRepo,
       decisionTransport,
     }),
+    checkOwnerDecision: new CheckOwnerDecisionUseCase({ requestRepo }),
     recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase({ requestRepo }),
     readProjectAttention: new ReadProjectAttentionUseCase({ attentionPort }),
     inspectOutstandingCoordination: new InspectOutstandingCoordinationUseCase({

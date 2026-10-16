@@ -24,6 +24,7 @@ import { withFileLock, writeJsonAtomically } from './file-store.js';
 
 import {
   AcceptanceAssessmentAdapter,
+  AcceptanceEvidenceAdapter,
   ActionAuthorizationAdapter,
   AttemptArtifactAdapter,
   AttemptRepositoryAdapter,
@@ -36,6 +37,7 @@ import {
   ExecutionObservationAdapter,
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
+  InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
@@ -56,11 +58,13 @@ import {
 
 import {
   AssessHeadAcceptanceUseCase,
+  AttemptOwnerDecisionAdapter,
   EvidenceArchiveAdapter,
   EvidenceAssessmentRepositoryAdapter,
   ForgeEvidenceAdapter,
   IndependentReviewAdapter,
   InspectAcceptanceEvidenceUseCase,
+  OwnerDecisionAdapter,
   RecordFindingDispositionUseCase,
   RecordReviewReceiptUseCase,
   RecordVerificationReceiptUseCase,
@@ -86,6 +90,7 @@ import {
 
 import {
   AttentionReadAdapter,
+  CheckOwnerDecisionUseCase,
   CoordinationRequestRepositoryAdapter,
   DecisionTransportAdapter,
   InspectConfiguredCapabilitiesUseCase,
@@ -352,6 +357,7 @@ export interface FleetCliRuntime {
     readonly sendFleetRelay: SendFleetRelayUseCase;
     readonly recordRelayAcknowledgement: RecordRelayAcknowledgementUseCase;
     readonly inspectOutstandingCoordination: InspectOutstandingCoordinationUseCase;
+    readonly checkOwnerDecision: CheckOwnerDecisionUseCase;
   };
   readonly knowledge: {
     readonly knowledgeEntryRepository: KnowledgeEntryRepositoryAdapter;
@@ -373,6 +379,8 @@ export interface FleetCliRuntime {
     readonly verificationExecutor: VerificationExecutorAdapter;
     readonly independentReview: IndependentReviewAdapter;
     readonly forgeEvidence: ForgeEvidenceAdapter;
+    readonly ownerDecision: OwnerDecisionAdapter;
+    readonly attemptOwnerDecision: AttemptOwnerDecisionAdapter;
     readonly requestVerification: RequestVerificationUseCase;
     readonly requestIndependentReview: RequestIndependentReviewUseCase;
     readonly recordVerificationReceipt: RecordVerificationReceiptUseCase;
@@ -390,12 +398,14 @@ export interface FleetCliRuntime {
     readonly attemptArtifact: AttemptArtifactAdapter;
     readonly briefAuthoring: BriefAuthoringAdapter;
     readonly acceptanceAssessment: AcceptanceAssessmentAdapter;
+    readonly acceptanceEvidence: AcceptanceEvidenceAdapter;
     readonly actionAuthorization: ActionAuthorizationAdapter;
     readonly briefKnowledge: BriefKnowledgeAdapter;
     readonly executionObservation: ExecutionObservationAdapter;
     readonly forgeAction: ForgeActionAdapter;
     readonly registerWorkOrder: RegisterWorkOrderUseCase;
     readonly inspectWorkOrder: InspectWorkOrderUseCase;
+    readonly inspectAttempt: InspectAttemptUseCase;
     readonly prepareBriefPackage: PrepareBriefPackageUseCase;
     readonly reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
     readonly dispatchAttempt: DispatchAttemptUseCase;
@@ -460,6 +470,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     resolveActionAuthorization: new ResolveActionAuthorizationUseCase({
       requestRepo: coordinationRequestRepository,
       decisionTransport,
+    }),
+    // One-way doors are answered by the coordination request's own
+    // authorization rule, through the application layer: the evidence context
+    // never reads this repository directly.
+    checkOwnerDecision: new CheckOwnerDecisionUseCase({
+      requestRepo: coordinationRequestRepository,
     }),
     recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase({
       requestRepo: coordinationRequestRepository,
@@ -533,6 +549,49 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // bound to AssessHeadAcceptanceUseCase here. Recorded receipts stay the
   // acceptance evidence until that transport exists.
   const forgeEvidence = new ForgeEvidenceAdapter();
+  const ownerDecision = new OwnerDecisionAdapter({
+    checkOwnerDecision: async (request) => {
+      const result = await coordination.checkOwnerDecision.checkOwnerDecision({
+        requestId: request.requestId,
+        candidateHeadSha: request.candidateHeadSha,
+      });
+      return result.outcome === 'approved'
+        ? { outcome: 'approved', decisionId: result.requestId }
+        : result;
+    },
+  });
+  // The doors an attempt must clear are read from its own record, which
+  // dispatch wrote from the frozen brief package. The attempt lookup is
+  // captured here and filled in once the work composition exists below.
+  const attemptLookup: { inspectAttempt?: InspectAttemptUseCase } = {};
+  const attemptOwnerDecision = new AttemptOwnerDecisionAdapter({
+    readAttemptOwnerDecisionReferences: async (request) => {
+      const inspectAttempt = attemptLookup.inspectAttempt;
+      if (!inspectAttempt) {
+        return {
+          outcome: 'unknown',
+          reason: 'The work context is not wired for attempt inspection',
+        };
+      }
+      const inspection = await inspectAttempt.inspectAttempt({
+        attemptId: request.attemptId,
+      });
+      if (inspection.outcome !== 'found') {
+        return {
+          outcome: 'unknown',
+          reason: `No attempt is recorded for ${request.attemptId}`,
+        };
+      }
+      const recorded = inspection.attempt.ownerDecisionReferences;
+      if (recorded === undefined) {
+        return {
+          outcome: 'unknown',
+          reason: `attempt ${request.attemptId} was recorded before owner decision references were frozen`,
+        };
+      }
+      return { outcome: 'recorded', ownerDecisionReferences: recorded };
+    },
+  });
 
   const evidence = {
     evidenceAssessmentRepository,
@@ -540,6 +599,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     verificationExecutor,
     independentReview,
     forgeEvidence,
+    ownerDecision,
+    attemptOwnerDecision,
     requestVerification: new RequestVerificationUseCase({
       repo: evidenceAssessmentRepository,
       executor: verificationExecutor,
@@ -557,7 +618,11 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     recordFindingDisposition: new RecordFindingDispositionUseCase({
       repo: evidenceAssessmentRepository,
     }),
-    assessHeadAcceptance: new AssessHeadAcceptanceUseCase({ repo: evidenceAssessmentRepository }),
+    assessHeadAcceptance: new AssessHeadAcceptanceUseCase({
+      repo: evidenceAssessmentRepository,
+      ownerDecisionPort: ownerDecision,
+      attemptOwnerDecisionPort: attemptOwnerDecision,
+    }),
     inspectAcceptanceEvidence: new InspectAcceptanceEvidenceUseCase({
       repo: evidenceAssessmentRepository,
     }),
@@ -647,34 +712,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const acceptanceAssessment = new AcceptanceAssessmentAdapter({
     assess: async (request) => {
       const assessmentId = assessmentIdForAttempt(request.attemptId);
-      const inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
-        assessmentId,
-        candidateHeadSha: request.candidateHeadSha,
-      });
-      if (
-        inspected.outcome === 'found' &&
-        inspected.assessment.state === 'accepted' &&
-        inspected.assessment.candidateHeadSha === request.candidateHeadSha &&
-        inspected.assessment.policyRevision === request.policyRevision &&
-        inspected.assessment.acceptanceReceiptId !== null
-      ) {
-        acceptedReceiptByHead[inspected.assessment.candidateHeadSha] =
-          inspected.assessment.acceptanceReceiptId;
-        if (acceptedReceiptsPath !== undefined) {
-          const headSha = inspected.assessment.candidateHeadSha;
-          const receiptId = inspected.assessment.acceptanceReceiptId;
-          await withFileLock(`${acceptedReceiptsPath}.lock`, async () => {
-            const current = readJsonRecord<string>(acceptedReceiptsPath);
-            current[headSha] = receiptId;
-            await writeJsonAtomically(acceptedReceiptsPath, current);
-          });
-        }
-        return {
-          outcome: 'accepted',
-          receiptId: inspected.assessment.acceptanceReceiptId,
-          assessedHeadSha: inspected.assessment.candidateHeadSha,
-        };
-      }
+      // Always delegate to the use case: it re-checks the attempt's one-way
+      // doors before its idempotent accepted path, so a stored acceptance
+      // whose owner decision has been withdrawn still blocks here.
       const result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
         assessmentId,
         candidateHeadSha: request.candidateHeadSha,
@@ -700,6 +740,38 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       }
       // `rejected` and `stale` both leave the action without a pass.
       return { outcome: 'rejected', reason: result.reason };
+    },
+  });
+
+  const acceptanceEvidence = new AcceptanceEvidenceAdapter({
+    readAcceptance: async (request) => {
+      let inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
+        assessmentId: assessmentIdForAttempt(request.attemptId),
+        candidateHeadSha: request.candidateHeadSha,
+      });
+      if (inspected.outcome === 'not-found') {
+        inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
+          assessmentId: request.attemptId,
+          candidateHeadSha: request.candidateHeadSha,
+        });
+      }
+      // No head-only fallback: an assessment that is not bound to this attempt
+      // is another attempt's evidence, and this attempt has none.
+      if (inspected.outcome === 'found') {
+        return {
+          outcome: 'found',
+          assessment: {
+            candidateHeadSha: inspected.assessment.candidateHeadSha,
+            policyRevision: inspected.assessment.policyRevision,
+            state: inspected.assessment.state,
+            acceptanceReceiptId: inspected.assessment.acceptanceReceiptId,
+          },
+        };
+      }
+      return {
+        outcome: 'not-found',
+        reason: `No acceptance assessment found for head ${request.candidateHeadSha}`,
+      };
     },
   });
 
@@ -898,6 +970,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     attemptArtifact,
     briefAuthoring,
     acceptanceAssessment,
+    acceptanceEvidence,
     actionAuthorization,
     briefKnowledge,
     executionObservation,
@@ -908,6 +981,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       attemptRepo: attemptRepository,
       journal: executionJournal,
     }),
+    inspectAttempt: new InspectAttemptUseCase({ attemptRepo: attemptRepository }),
     prepareBriefPackage: new PrepareBriefPackageUseCase({
       briefAuthoring,
       artifactPort: attemptArtifact,
@@ -955,8 +1029,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       authorizationPort: actionAuthorization,
       forgePort: forgeAction,
       acceptedReceiptByHead: acceptedReceiptByHeadView,
+      acceptanceEvidencePort: acceptanceEvidence,
+      // Merge-time door re-check goes through the same resolution acceptance
+      // uses, so a withdrawn owner decision also refuses the forge action.
+      ownerDecisionPort: ownerDecision,
+      attemptOwnerDecisionPort: attemptOwnerDecision,
     }),
   };
+
+  attemptLookup.inspectAttempt = execution.inspectAttempt;
 
   return { coordination, knowledge, evidence, execution };
 }

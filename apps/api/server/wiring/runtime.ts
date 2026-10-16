@@ -11,8 +11,17 @@ import {
   consumptionId,
   forgeActionScope,
   observationEventKind,
+  type AttemptOwnerDecisionDelegate as WorkAttemptOwnerDecisionDelegate,
+  type OwnerDecisionDelegate as WorkOwnerDecisionDelegate,
 } from "@fleet/work-execution";
-import type { InspectWorkOrderUseCase } from "@fleet/work-execution/use-cases";
+import type {
+  AttemptOwnerDecisionDelegate as EvidenceAttemptOwnerDecisionDelegate,
+  OwnerDecisionDelegate as EvidenceOwnerDecisionDelegate,
+} from "@fleet/evidence-and-acceptance";
+import type {
+  InspectAttemptUseCase,
+  InspectWorkOrderUseCase,
+} from "@fleet/work-execution/use-cases";
 
 import type { FleetInstallation } from "@fleet/installation";
 
@@ -200,7 +209,59 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   const installation = options?.installation;
   const operator = createConfiguredOperatorComposition({ stateDir, ownerPublicKey });
   const knowledge = createConfiguredKnowledgeComposition({ stateDir });
-  const evidence = createConfiguredEvidenceUseCases({ stateDir });
+  // The attempt lookup below is filled in once the work composition exists;
+  // the evidence delegates only run at assessment time.
+  const attemptLookup: { inspectAttempt?: InspectAttemptUseCase } = {};
+  const ownerDecisionDelegate: EvidenceOwnerDecisionDelegate = {
+    // The coordination request's own authorization rule decides; this
+    // delegate calls the supplier's application port, never its repository.
+    checkOwnerDecision: async (request) => {
+      const result = await operator.checkOwnerDecision.checkOwnerDecision({
+        requestId: request.requestId,
+        candidateHeadSha: request.candidateHeadSha,
+      });
+      return result.outcome === "approved"
+        ? { outcome: "approved", decisionId: result.requestId }
+        : result;
+    },
+  };
+  const attemptOwnerDecisionDelegate: EvidenceAttemptOwnerDecisionDelegate & WorkAttemptOwnerDecisionDelegate = {
+    // The doors come from the attempt record dispatch wrote from the
+    // frozen brief package, never from a request body or worktree file.
+    readAttemptOwnerDecisionReferences: async (request) => {
+      const inspectAttempt = attemptLookup.inspectAttempt;
+      if (!inspectAttempt) {
+        return {
+          outcome: "unknown",
+          reason: "The work context is not wired for attempt inspection",
+        };
+      }
+      const inspection = await inspectAttempt.inspectAttempt({
+        attemptId: request.attemptId,
+      });
+      if (inspection.outcome !== "found") {
+        return {
+          outcome: "unknown",
+          reason: `No attempt is recorded for ${request.attemptId}`,
+        };
+      }
+      const recorded = inspection.attempt.ownerDecisionReferences;
+      if (recorded === undefined) {
+        return {
+          outcome: "unknown",
+          reason: `attempt ${request.attemptId} was recorded before owner decision references were frozen`,
+        };
+      }
+      return { outcome: "recorded", ownerDecisionReferences: recorded };
+    },
+  };
+  const evidence = createConfiguredEvidenceUseCases(
+    { stateDir },
+    {
+      ownerDecision: ownerDecisionDelegate,
+      attemptOwnerDecision: attemptOwnerDecisionDelegate,
+    },
+  );
 
   // Authorization grants resolved in this process remember the attempt
   // coordinates the work-side consumption request does not carry. With a
@@ -231,33 +292,31 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
           },
         });
 
+  // The work context re-checks forge-time doors through the same coordination
+  // resolution the evidence context uses; the shapes differ per context, the
+  // authority (the recorded request's own rule) does not.
+  const workOwnerDecisionDelegate: WorkOwnerDecisionDelegate = {
+    resolveOwnerDecision: async (request) => {
+      const result = await operator.checkOwnerDecision.checkOwnerDecision({
+        requestId: request.decisionReference,
+        candidateHeadSha: request.candidateHeadSha,
+      });
+      return result.outcome === "approved"
+        ? { outcome: "approved", decisionId: result.requestId }
+        : result;
+    },
+  };
+
   const crossContext: WorkCrossContextDelegates = {
+    ownerDecision: workOwnerDecisionDelegate,
+    attemptOwnerDecision: attemptOwnerDecisionDelegate,
     acceptance: {
       // One acceptance assessment per attempt candidate head; the work-side
       // request's coordinates map onto the evidence context's exact-head keys.
       assess: async (request) => {
-        const inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
-          assessmentId: request.attemptId,
-          candidateHeadSha: request.candidateHeadSha,
-        });
-        if (
-          inspected.outcome === "found" &&
-          inspected.assessment.state === "accepted" &&
-          inspected.assessment.candidateHeadSha === request.candidateHeadSha &&
-          inspected.assessment.policyRevision === request.policyRevision &&
-          inspected.assessment.acceptanceReceiptId !== null
-        ) {
-          acceptedReceiptByHead[inspected.assessment.candidateHeadSha] =
-            inspected.assessment.acceptanceReceiptId;
-          if (stateDir !== undefined) {
-            persistAcceptedReceiptsToState(stateDir, liveAcceptedReceiptByHead);
-          }
-          return {
-            outcome: "accepted",
-            receiptId: inspected.assessment.acceptanceReceiptId,
-            assessedHeadSha: inspected.assessment.candidateHeadSha,
-          };
-        }
+        // Always delegate to the use case: it re-checks the attempt's one-way
+        // doors before its idempotent accepted path, so a stored acceptance
+        // whose owner decision has been withdrawn still blocks here.
         const result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
           assessmentId: request.attemptId,
           candidateHeadSha: request.candidateHeadSha,
@@ -402,6 +461,37 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
         return { outcome: "refused", reason: result.reason };
       },
     },
+    acceptanceEvidence: {
+      readAcceptance: async (request) => {
+        let inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
+          assessmentId: `assessment-${request.attemptId}`,
+          candidateHeadSha: request.candidateHeadSha,
+        });
+        if (inspected.outcome === "not-found") {
+          inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
+            assessmentId: request.attemptId,
+            candidateHeadSha: request.candidateHeadSha,
+          });
+        }
+        // No head-only fallback: an assessment that is not bound to this
+        // attempt is another attempt's evidence, and this attempt has none.
+        if (inspected.outcome === "found") {
+          return {
+            outcome: "found",
+            assessment: {
+              candidateHeadSha: inspected.assessment.candidateHeadSha,
+              policyRevision: inspected.assessment.policyRevision,
+              state: inspected.assessment.state,
+              acceptanceReceiptId: inspected.assessment.acceptanceReceiptId,
+            },
+          };
+        }
+        return {
+          outcome: "not-found",
+          reason: `No acceptance assessment found for head ${request.candidateHeadSha}`,
+        };
+      },
+    },
     observation: {
       publish: async (request) => {
         const result = await operator.publishProjectObservation.publishProjectObservation({
@@ -422,6 +512,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
 
   const work = createConfiguredWorkComposition({ stateDir, installation }, crossContext);
   workLookup.inspectWorkOrder = work.inspectWorkOrder;
+  attemptLookup.inspectAttempt = work.inspectAttempt;
 
   configureOperatorComposition(operator);
   configureKnowledgeComposition(knowledge);

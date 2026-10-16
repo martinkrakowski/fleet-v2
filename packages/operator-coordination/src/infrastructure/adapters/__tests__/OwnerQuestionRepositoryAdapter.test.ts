@@ -102,7 +102,9 @@ describe('OwnerQuestionRepositoryAdapter', () => {
       expect(error).toBeInstanceOf(OwnerQuestionRevisionConflictError);
       const conflict = error as OwnerQuestionRevisionConflictError;
       expect(conflict.questionId).toBe('q-1');
-      expect(conflict.attemptedRevision).toBe(0);
+      // The attempted revision is the record's own revision, not the expected one.
+      expect(conflict.attemptedRevision).toBe(2);
+      expect(conflict.message).not.toContain('q-1');
     }
 
     // The accepted optimistic path: read, then write the next revision.
@@ -167,6 +169,56 @@ describe('OwnerQuestionRepositoryAdapter', () => {
     expect(await adapter.get('q-1')).not.toBeNull();
     await expect(adapter.save(questionRecord(), 0)).rejects.toBeInstanceOf(
       OwnerQuestionRevisionConflictError,
+    );
+  });
+
+  it('fails the second of two writers that both read revision 1 and both save revision 2', async () => {
+    const first = new OwnerQuestionRepositoryAdapter({ stateDir: tempDir });
+    const second = new OwnerQuestionRepositoryAdapter({ stateDir: tempDir });
+    await first.save(questionRecord(), 0);
+
+    // Both writers read the stored revision 1...
+    const readFirst = await first.get('q-1');
+    const readSecond = await second.get('q-1');
+    expect(readFirst?.revision).toBe(1);
+    expect(readSecond?.revision).toBe(1);
+
+    // ...and both attempt to write revision 2 on top of revision 1.
+    await first.save(questionRecord({ revision: 2 }), 1);
+    try {
+      await second.save(questionRecord({ revision: 2 }), 1);
+      throw new Error('expected a revision conflict');
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(OwnerQuestionRevisionConflictError);
+      const conflict = error as OwnerQuestionRevisionConflictError;
+      expect(conflict.attemptedRevision).toBe(2);
+    }
+    expect((await first.get('q-1'))?.revision).toBe(2);
+  });
+
+  it('requires a new question to arrive as revision 1 and the next revision to be expected + 1', async () => {
+    const adapter = new OwnerQuestionRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.save(questionRecord({ revision: 2 }), 0)).rejects.toThrow(
+      /revision must be 1/,
+    );
+    await adapter.save(questionRecord(), 0);
+    await expect(adapter.save(questionRecord({ revision: 3 }), 1)).rejects.toThrow(
+      /revision must be 2/,
+    );
+    await adapter.save(questionRecord({ revision: 2 }), 1);
+    expect((await adapter.get('q-1'))?.revision).toBe(2);
+  });
+
+  it('refuses a fileName that collides with the coordination requests store', async () => {
+    const adapter = new OwnerQuestionRepositoryAdapter({
+      stateDir: tempDir,
+      fileName: 'coordination-requests.json',
+    });
+    await expect(adapter.save(questionRecord(), 0)).rejects.toThrow(/coordination requests store/);
+    await expect(adapter.get('q-1')).rejects.toThrow(/coordination requests store/);
+    // The coordination requests file was never created or touched.
+    await expect(fs.readFile(path.join(tempDir, 'coordination-requests.json'), 'utf8')).rejects.toMatchObject(
+      { code: 'ENOENT' },
     );
   });
 });

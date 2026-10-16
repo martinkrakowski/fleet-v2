@@ -56,6 +56,22 @@ function answeredRecord(
   return questionRecord({ state: 'answered', answer, ...overrides });
 }
 
+function rejectedRecord(
+  overrides: Partial<OwnerQuestionRecordInput> = {},
+): OwnerQuestionRecordInput {
+  const answer: OwnerQuestionAnswerRecord = {
+    shape: 'reject',
+    optionId: null,
+    text: null,
+    reason: null,
+    questionRevision: 1,
+    answeredVia: 'cli',
+    answeredAt: '2026-10-16T11:00:00.000Z',
+    sessionId: null,
+  };
+  return questionRecord({ state: 'rejected', answer, ...overrides });
+}
+
 describe('OwnerQuestion validation', () => {
   it('accepts a well-formed record and keeps every field', () => {
     const entity = OwnerQuestion.fromRecord(questionRecord());
@@ -98,7 +114,7 @@ describe('OwnerQuestion validation', () => {
         { id: 'a', label: 'Second', consequence: 'Second path.' },
       ],
     });
-    expect(() => OwnerQuestion.fromRecord(duplicate)).toThrow(/repeats option id/);
+    expect(() => OwnerQuestion.fromRecord(duplicate)).toThrow(/repeats an option id/);
 
     const emptyId = questionRecord({
       options: [
@@ -128,7 +144,7 @@ describe('OwnerQuestion validation', () => {
     ).toThrow(/option label exceeds 1024/);
     expect(() =>
       OwnerQuestion.fromRecord(
-        answeredRecord({
+        rejectedRecord({
           answer: {
             shape: 'reject',
             optionId: null,
@@ -142,6 +158,20 @@ describe('OwnerQuestion validation', () => {
         }),
       ),
     ).toThrow(/answer text exceeds 4096/);
+    expect(() =>
+      OwnerQuestion.fromRecord(
+        questionRecord({
+          options: [
+            { id: 'a', label: 'First', consequence: 'First path.' },
+            { id: 'b'.padEnd(70, 'b'), label: 'Second', consequence: 'Second path.' },
+          ],
+        }),
+      ),
+    ).toThrow(/option id exceeds 64/);
+    // Bounds count UTF-8 bytes, not string length.
+    expect(() =>
+      OwnerQuestion.fromRecord(questionRecord({ title: 'é'.repeat(101) })),
+    ).toThrow(/title exceeds 200/);
   });
 
   it('refuses the whole record beyond 32768 JSON characters', () => {
@@ -176,7 +206,7 @@ describe('OwnerQuestion validation', () => {
         ],
       }),
       questionRecord({ recommendation: { optionId: 'a', because: `Because ${secret} says so` } }),
-      answeredRecord({
+      rejectedRecord({
         answer: {
           shape: 'reject',
           optionId: null,
@@ -188,7 +218,7 @@ describe('OwnerQuestion validation', () => {
           sessionId: null,
         },
       }),
-      answeredRecord({
+      rejectedRecord({
         answer: {
           shape: 'reject',
           optionId: null,
@@ -200,6 +230,12 @@ describe('OwnerQuestion validation', () => {
           sessionId: null,
         },
       }),
+      questionRecord({
+        options: [
+          { id: `id-${secret}`, label: 'First', consequence: 'First path.' },
+          { id: 'b', label: 'Second', consequence: 'Second path.' },
+        ],
+      }),
     ];
     const expectedFields = [
       'title',
@@ -209,6 +245,7 @@ describe('OwnerQuestion validation', () => {
       'recommendation because',
       'answer text',
       'answer reason',
+      'option id',
     ];
     cases.forEach((record, index) => {
       try {
@@ -299,4 +336,150 @@ describe('OwnerQuestion validation', () => {
     const record = entity.toRecord();
     expect(() => (record.options as OwnerQuestionOptionRecord[]).push()).toThrow();
   });
+
+  it('requires a revision of at least 1', () => {
+    expect(() => OwnerQuestion.fromRecord(questionRecord({ revision: 0 }))).toThrow(
+      /positive integer revision/,
+    );
+    expect(() => OwnerQuestion.fromRecord(questionRecord({ revision: 1.5 }))).toThrow(
+      /positive integer revision/,
+    );
+  });
+
+  it('treats expired questions as blocking, like open ones', () => {
+    expect(OwnerQuestion.fromRecord(questionRecord()).isBlocking()).toBe(true);
+    expect(OwnerQuestion.fromRecord(questionRecord({ state: 'expired' })).isBlocking()).toBe(true);
+    expect(OwnerQuestion.fromRecord(answeredRecord()).isBlocking()).toBe(false);
+    expect(OwnerQuestion.fromRecord(rejectedRecord()).isBlocking()).toBe(false);
+  });
+
+  it('keeps answer shape consistent with the state and normalises an accept to the recommended option', () => {
+    expect(() =>
+      OwnerQuestion.fromRecord(
+        rejectedRecord({
+          answer: {
+            shape: 'accept',
+            optionId: 'a',
+            text: null,
+            reason: null,
+            questionRevision: 1,
+            answeredVia: 'web',
+            answeredAt: '2026-10-16T11:00:00.000Z',
+            sessionId: null,
+          },
+        }),
+      ),
+    ).toThrow(/state rejected requires an answer of shape reject/);
+    expect(() =>
+      OwnerQuestion.fromRecord(
+        answeredRecord({
+          answer: {
+            shape: 'reject',
+            optionId: null,
+            text: null,
+            reason: 'Not this path.',
+            questionRevision: 1,
+            answeredVia: 'web',
+            answeredAt: '2026-10-16T11:00:00.000Z',
+            sessionId: null,
+          },
+        }),
+      ),
+    ).toThrow(/state answered requires an answer of shape accept or answer/);
+
+    // An accept always records the recommended option, whatever the caller named.
+    const normalised = OwnerQuestion.fromRecord(
+      answeredRecord({
+        answer: {
+          shape: 'accept',
+          optionId: null,
+          text: null,
+          reason: null,
+          questionRevision: 1,
+          answeredVia: 'signed-decision',
+          answeredAt: '2026-10-16T11:00:00.000Z',
+          sessionId: null,
+        },
+      }),
+    );
+    expect(normalised.toRecord().answer?.optionId).toBe('a');
+    const misnamed = OwnerQuestion.fromRecord(
+      answeredRecord({
+        recommendation: { optionId: 'b', because: 'Second path reads better.' },
+        answer: {
+          shape: 'accept',
+          optionId: 'a',
+          text: null,
+          reason: null,
+          questionRevision: 1,
+          answeredVia: 'web',
+          answeredAt: '2026-10-16T11:00:00.000Z',
+          sessionId: null,
+        },
+      }),
+    );
+    expect(misnamed.toRecord().answer?.optionId).toBe('b');
+  });
+
+  it('normalises timestamps to canonical ISO strings', () => {
+    const entity = OwnerQuestion.fromRecord(
+      questionRecord({
+        askedAt: '2026-10-16T12:00:00+02:00',
+        expiresAt: '2026-10-17T00:30:00+02:00',
+      }),
+    );
+    expect(entity.toRecord().askedAt).toBe('2026-10-16T10:00:00.000Z');
+    expect(entity.toRecord().expiresAt).toBe('2026-10-16T22:30:00.000Z');
+    const answered = OwnerQuestion.fromRecord(
+      answeredRecord({ answer: { ...answeredAnswer(), answeredAt: '2026-10-16T13:30:00+02:00' } }),
+    );
+    expect(answered.toRecord().answer?.answeredAt).toBe('2026-10-16T11:30:00.000Z');
+  });
+
+  it('never echoes a caller-supplied identifier in an error message', () => {
+    const marker = 'leak-me-id-zz';
+    const cases: readonly OwnerQuestionRecordInput[] = [
+      questionRecord({ recommendation: { optionId: marker, because: 'nope' } }),
+      questionRecord({
+        options: [
+          { id: 'a', label: 'First', consequence: 'First path.' },
+          { id: 'a', label: 'Second', consequence: 'Second path.' },
+        ],
+      }),
+      answeredRecord({
+        answer: {
+          shape: 'answer',
+          optionId: marker,
+          text: null,
+          reason: null,
+          questionRevision: 1,
+          answeredVia: 'web',
+          answeredAt: '2026-10-16T11:00:00.000Z',
+          sessionId: null,
+        },
+      }),
+    ];
+    for (const record of cases) {
+      try {
+        OwnerQuestion.fromRecord(record);
+        throw new Error('expected a refusal');
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        expect(message).not.toContain(marker);
+      }
+    }
+  });
 });
+
+function answeredAnswer(): OwnerQuestionAnswerRecord {
+  return {
+    shape: 'accept',
+    optionId: 'a',
+    text: null,
+    reason: null,
+    questionRevision: 1,
+    answeredVia: 'web',
+    answeredAt: '2026-10-16T11:00:00.000Z',
+    sessionId: null,
+  };
+}

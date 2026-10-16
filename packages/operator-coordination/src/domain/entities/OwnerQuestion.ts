@@ -29,6 +29,8 @@ const BLOCK_KINDS: readonly string[] = ['plan', 'pr', 'lane', 'work-order'];
 
 const TITLE_MAX_CHARS = 200;
 const BODY_MAX_CHARS = 8192;
+const ID_MAX_CHARS = 256;
+const OPTION_ID_MAX_CHARS = 64;
 const OPTION_TEXT_MAX_CHARS = 1024;
 const ANSWER_TEXT_MAX_CHARS = 4096;
 const RECORD_JSON_MAX_CHARS = 32768;
@@ -47,6 +49,33 @@ export function canTransitionOwnerQuestion(from: OwnerQuestionState, to: OwnerQu
   return ALLOWED_TRANSITIONS[from].includes(to);
 }
 
+/**
+ * Validate one string field: it must be a string, fit `maxChars` counted in
+ * UTF-8 bytes (not string length), and never carry a secret shape. Errors name
+ * the field and never echo the value, ids included.
+ */
+function readText(field: string, value: unknown, maxChars: number): string {
+  if (typeof value !== 'string') {
+    throw new Error(`OwnerQuestion ${field} must be a string`);
+  }
+  if (new TextEncoder().encode(value).byteLength > maxChars) {
+    throw new Error(`OwnerQuestion ${field} exceeds ${maxChars} bytes`);
+  }
+  if (containsSecretShape(value)) {
+    throw new Error(`OwnerQuestion ${field} contains a secret-shaped value and was refused`);
+  }
+  return value;
+}
+
+/** Normalise a validated timestamp to a canonical ISO string for stable ordering. */
+function normaliseTimestamp(field: string, value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(`OwnerQuestion ${field} must be a valid timestamp`);
+  }
+  return parsed.toISOString();
+}
+
 export class OwnerQuestion {
   private constructor(private readonly record: OwnerQuestionRecord) {
     // Invariants are validated in fromRecord.
@@ -62,24 +91,14 @@ export class OwnerQuestion {
         throw new Error(`OwnerQuestion requires a non-empty ${field}`);
       }
     }
-    if (input.title.length > TITLE_MAX_CHARS) {
-      throw new Error(`OwnerQuestion title exceeds ${TITLE_MAX_CHARS} characters`);
+    const questionId = readText('questionId', input.questionId, ID_MAX_CHARS);
+    const askedBy = readText('askedBy', input.askedBy, ID_MAX_CHARS);
+    const title = readText('title', input.title, TITLE_MAX_CHARS);
+    const body = readText('body', input.body, BODY_MAX_CHARS);
+    if (!Number.isInteger(input.revision) || input.revision < 1) {
+      throw new Error('OwnerQuestion requires a positive integer revision of at least 1');
     }
-    if (input.body.length > BODY_MAX_CHARS) {
-      throw new Error(`OwnerQuestion body exceeds ${BODY_MAX_CHARS} characters`);
-    }
-    if (containsSecretShape(input.title)) {
-      throw new Error('OwnerQuestion title contains a secret-shaped value and was refused');
-    }
-    if (containsSecretShape(input.body)) {
-      throw new Error('OwnerQuestion body contains a secret-shaped value and was refused');
-    }
-    if (!Number.isInteger(input.revision) || input.revision < 0) {
-      throw new Error('OwnerQuestion requires a non-negative integer revision');
-    }
-    if (typeof input.askedAt !== 'string' || Number.isNaN(Date.parse(input.askedAt))) {
-      throw new Error('OwnerQuestion requires a valid askedAt timestamp');
-    }
+    const askedAt = normaliseTimestamp('askedAt', input.askedAt);
     const expiresAt = readExpiresAt(input);
     const options = OwnerQuestion.readOptions(input.options);
     const recommendation = OwnerQuestion.readRecommendation(input.recommendation, options);
@@ -90,18 +109,18 @@ export class OwnerQuestion {
     const answer = OwnerQuestion.readAnswer(input.answer, state, recommendation, options, input.revision);
     const acknowledgement = OwnerQuestion.readAcknowledgement(input.acknowledgement, state, answer);
     const record: OwnerQuestionRecord = {
-      questionId: input.questionId,
+      questionId,
       revision: input.revision,
-      askedBy: input.askedBy,
-      title: input.title,
-      body: input.body,
+      askedBy,
+      title,
+      body,
       options,
       recommendation,
       doorKind,
       linkedRequestId,
       blocks,
       state,
-      askedAt: input.askedAt,
+      askedAt,
       expiresAt,
       answer,
       acknowledgement,
@@ -125,6 +144,7 @@ export class OwnerQuestion {
       throw new Error('OwnerQuestion requires at least 2 options');
     }
     const seenIds = new Set<string>();
+    const read: OwnerQuestionOptionRecord[] = [];
     for (const option of options) {
       if (typeof option !== 'object' || option === null) {
         throw new Error('OwnerQuestion options must be objects');
@@ -132,26 +152,24 @@ export class OwnerQuestion {
       if (typeof option.id !== 'string' || option.id.trim().length === 0) {
         throw new Error('OwnerQuestion option id must be a non-empty string');
       }
-      if (seenIds.has(option.id)) {
-        throw new Error(`OwnerQuestion repeats option id ${option.id}`);
+      const id = readText('option id', option.id, OPTION_ID_MAX_CHARS);
+      if (seenIds.has(id)) {
+        throw new Error('OwnerQuestion repeats an option id');
       }
-      seenIds.add(option.id);
-      for (const field of ['label', 'consequence'] as const) {
-        const value = option[field];
+      seenIds.add(id);
+      const fields: { field: 'option label' | 'option consequence'; value: unknown }[] = [
+        { field: 'option label', value: option.label },
+        { field: 'option consequence', value: option.consequence },
+      ];
+      for (const { field, value } of fields) {
         if (typeof value !== 'string' || value.trim().length === 0) {
-          throw new Error(`OwnerQuestion option ${field} must be a non-empty string`);
+          throw new Error(`OwnerQuestion ${field} must be a non-empty string`);
         }
-        if (value.length > OPTION_TEXT_MAX_CHARS) {
-          throw new Error(
-            `OwnerQuestion option ${field} exceeds ${OPTION_TEXT_MAX_CHARS} characters`,
-          );
-        }
-        if (containsSecretShape(value)) {
-          throw new Error(`OwnerQuestion option ${field} contains a secret-shaped value and was refused`);
-        }
+        readText(field, value, OPTION_TEXT_MAX_CHARS);
       }
+      read.push({ id, label: option.label, consequence: option.consequence });
     }
-    return Object.freeze(options.map((option) => ({ ...option })));
+    return Object.freeze(read);
   }
 
   private static readRecommendation(
@@ -161,23 +179,18 @@ export class OwnerQuestion {
     if (typeof recommendation !== 'object' || recommendation === null) {
       throw new Error('OwnerQuestion requires a recommendation');
     }
-    if (typeof recommendation.optionId !== 'string' || recommendation.optionId.length === 0) {
+    const optionId = readText('recommendation optionId', recommendation.optionId, OPTION_ID_MAX_CHARS);
+    if (optionId.trim().length === 0) {
       throw new Error('OwnerQuestion recommendation optionId must be a non-empty string');
     }
-    if (!options.some((option) => option.id === recommendation.optionId)) {
-      throw new Error(
-        `OwnerQuestion recommendation names option ${recommendation.optionId}, which is not one of the options`,
-      );
+    if (!options.some((option) => option.id === optionId)) {
+      throw new Error('OwnerQuestion recommendation names an option that is not one of the options');
     }
     if (typeof recommendation.because !== 'string' || recommendation.because.trim().length === 0) {
       throw new Error('OwnerQuestion recommendation because must be a non-empty string');
     }
-    if (containsSecretShape(recommendation.because)) {
-      throw new Error(
-        'OwnerQuestion recommendation because contains a secret-shaped value and was refused',
-      );
-    }
-    return { optionId: recommendation.optionId, because: recommendation.because };
+    const because = readText('recommendation because', recommendation.because, OPTION_TEXT_MAX_CHARS);
+    return { optionId, because };
   }
 
   private static readBlocks(
@@ -187,6 +200,7 @@ export class OwnerQuestion {
     if (!Array.isArray(list)) {
       throw new Error('OwnerQuestion blocks must be an array');
     }
+    const read: OwnerQuestionBlockRecord[] = [];
     for (const block of list) {
       if (typeof block !== 'object' || block === null) {
         throw new Error('OwnerQuestion blocks must be objects');
@@ -197,8 +211,9 @@ export class OwnerQuestion {
       if (typeof block.ref !== 'string' || block.ref.trim().length === 0) {
         throw new Error('OwnerQuestion block ref must be a non-empty string');
       }
+      read.push({ kind: block.kind, ref: readText('block ref', block.ref, ID_MAX_CHARS) });
     }
-    return Object.freeze(list.map((block) => ({ ...block })));
+    return Object.freeze(read);
   }
 
   private static readAnswer(
@@ -226,6 +241,12 @@ export class OwnerQuestion {
     if (!ANSWER_SHAPES.includes(answer.shape)) {
       throw new Error(`OwnerQuestion answer shape is not one of ${ANSWER_SHAPES.join(', ')}`);
     }
+    if (state === 'rejected' && answer.shape !== 'reject') {
+      throw new Error('OwnerQuestion in state rejected requires an answer of shape reject');
+    }
+    if (state === 'answered' && answer.shape !== 'accept' && answer.shape !== 'answer') {
+      throw new Error('OwnerQuestion in state answered requires an answer of shape accept or answer');
+    }
     if (!ANSWER_VIAS.includes(answer.answeredVia)) {
       throw new Error(`OwnerQuestion answer answeredVia is not one of ${ANSWER_VIAS.join(', ')}`);
     }
@@ -241,17 +262,14 @@ export class OwnerQuestion {
     if (typeof answer.answeredAt !== 'string' || Number.isNaN(Date.parse(answer.answeredAt))) {
       throw new Error('OwnerQuestion answer requires a valid answeredAt timestamp');
     }
-    const optionId = answer.optionId ?? null;
+    // An accept always lands on the recommended option, whatever the caller named.
+    const optionId =
+      answer.shape === 'accept' ? recommendation.optionId : (answer.optionId ?? null);
     const text = answer.text ?? null;
     const reason = answer.reason ?? null;
     const sessionId = answer.sessionId ?? null;
     if (optionId !== null && !options.some((option) => option.id === optionId)) {
-      throw new Error(`OwnerQuestion answer names option ${optionId}, which is not one of the options`);
-    }
-    if (answer.shape === 'accept' && optionId !== null && optionId !== recommendation.optionId) {
-      throw new Error(
-        `OwnerQuestion answer shape accept must name the recommended option ${recommendation.optionId}`,
-      );
+      throw new Error('OwnerQuestion answer names an option that is not one of the options');
     }
     if (answer.shape === 'reject' && optionId !== null) {
       throw new Error('OwnerQuestion answer shape reject must not name an option');
@@ -262,20 +280,13 @@ export class OwnerQuestion {
     if (answer.shape === 'accept' && (reason !== null || (text !== null && text.length > 0))) {
       throw new Error('OwnerQuestion answer shape accept carries no free text or reason');
     }
-    for (const field of ['text', 'reason'] as const) {
-      const value = answer[field];
-      if (value !== null && value !== undefined) {
-        if (typeof value !== 'string') {
-          throw new Error(`OwnerQuestion answer ${field} must be a string or null`);
-        }
-        if (value.length > ANSWER_TEXT_MAX_CHARS) {
-          throw new Error(`OwnerQuestion answer ${field} exceeds ${ANSWER_TEXT_MAX_CHARS} characters`);
-        }
-        if (containsSecretShape(value)) {
-          throw new Error(
-            `OwnerQuestion answer ${field} contains a secret-shaped value and was refused`,
-          );
-        }
+    const readTexts: { field: 'answer text' | 'answer reason'; value: string | null }[] = [
+      { field: 'answer text', value: text },
+      { field: 'answer reason', value: reason },
+    ];
+    for (const { field, value } of readTexts) {
+      if (value !== null) {
+        readText(field, value, ANSWER_TEXT_MAX_CHARS);
       }
     }
     return {
@@ -285,8 +296,8 @@ export class OwnerQuestion {
       reason,
       questionRevision: answer.questionRevision,
       answeredVia: answer.answeredVia as OwnerQuestionAnswerRecord['answeredVia'],
-      answeredAt: answer.answeredAt,
-      sessionId,
+      answeredAt: normaliseTimestamp('answer answeredAt', answer.answeredAt),
+      sessionId: sessionId === null ? null : readText('answer sessionId', sessionId, ID_MAX_CHARS),
     };
   }
 
@@ -316,7 +327,10 @@ export class OwnerQuestion {
     if (typeof acknowledgement.at !== 'string' || Number.isNaN(Date.parse(acknowledgement.at))) {
       throw new Error('OwnerQuestion acknowledgement requires a valid at timestamp');
     }
-    return { by: acknowledgement.by, at: acknowledgement.at };
+    return {
+      by: readText('acknowledgement by', acknowledgement.by, ID_MAX_CHARS),
+      at: normaliseTimestamp('acknowledgement at', acknowledgement.at),
+    };
   }
 
   getId(): string {
@@ -360,8 +374,9 @@ export class OwnerQuestion {
     return this.record.blocks.map((block) => ({ ...block }));
   }
 
+  /** Open and expired questions both block their work; expired ones are re-asked. */
   isBlocking(): boolean {
-    return this.record.state === 'open';
+    return this.record.state === 'open' || this.record.state === 'expired';
   }
 
   /** Move to `next` through an allowed transition, optionally recording the answer and/or acknowledgement. */
@@ -371,7 +386,7 @@ export class OwnerQuestion {
   ): OwnerQuestion {
     if (!canTransitionOwnerQuestion(this.record.state, next)) {
       throw new Error(
-        `OwnerQuestion ${this.record.questionId} may not move from ${this.record.state} to ${next}`,
+        `OwnerQuestion may not move from ${this.record.state} to ${next}`,
       );
     }
     const candidate = {
@@ -390,10 +405,10 @@ function readExpiresAt(input: OwnerQuestionRecordInput): string | null {
   if (value === undefined || value === null) {
     return null;
   }
-  if (typeof value !== 'string' || Number.isNaN(Date.parse(value))) {
+  if (typeof value !== 'string') {
     throw new Error('OwnerQuestion expiresAt must be a valid timestamp or null');
   }
-  return value;
+  return normaliseTimestamp('expiresAt', value);
 }
 
 function readDoorKind(input: OwnerQuestionRecordInput): OwnerQuestionRecord['doorKind'] {
@@ -413,7 +428,7 @@ function readLinkedRequestId(
     if (typeof value !== 'string' || value.trim().length === 0) {
       throw new Error('OwnerQuestion with doorKind one-way requires a linkedRequestId');
     }
-    return value;
+    return readText('linkedRequestId', value, ID_MAX_CHARS);
   }
   if (value !== undefined && value !== null) {
     throw new Error('OwnerQuestion with doorKind two-way must not carry a linkedRequestId');

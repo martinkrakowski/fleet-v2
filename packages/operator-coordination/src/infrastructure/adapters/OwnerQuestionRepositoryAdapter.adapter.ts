@@ -31,8 +31,37 @@ export interface OwnerQuestionRepositoryAdapterOptions {
 }
 
 const DEFAULT_FILE_NAME = 'owner-questions.json';
+/** The coordination requests aggregate owns its own file; never that one. */
+const COORDINATION_REQUESTS_FILE_NAME = 'coordination-requests.json';
 /** A configured file name may not escape the state directory it belongs to. */
 const SAFE_FILE_NAME = /^[A-Za-z0-9._-]{1,128}$/;
+
+/**
+ * Revision arithmetic: a new question (expected revision 0) must arrive as
+ * revision 1; any save on top of an existing revision must arrive as exactly
+ * expectedRevision + 1. Violations are malformed calls, not lost races.
+ */
+function assertRevisionArithmetic(recordRevision: number, expectedRevision: number): void {
+  const required = expectedRevision + 1;
+  if (recordRevision !== required) {
+    throw new Error(
+      `OwnerQuestionRepositoryAdapter refuses record revision ${recordRevision} with expected revision ${expectedRevision}; revision must be ${required}`,
+    );
+  }
+}
+
+function revisionConflict(
+  questionId: string,
+  expectedRevision: number,
+  storedRevision: number,
+  recordRevision: number,
+): OwnerQuestionRevisionConflictError {
+  return new OwnerQuestionRevisionConflictError(
+    questionId,
+    recordRevision,
+    `OwnerQuestionRepositoryAdapter refuses expected revision ${expectedRevision}; stored revision is ${storedRevision}`,
+  );
+}
 
 function copy(record: OwnerQuestionRecord): OwnerQuestionRecord {
   return {
@@ -58,12 +87,9 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
       const existing = this.inMemoryQuestions.get(validated.questionId);
       const storedRevision = existing === undefined ? 0 : existing.revision;
       if (storedRevision !== expectedRevision) {
-        throw new OwnerQuestionRevisionConflictError(
-          validated.questionId,
-          expectedRevision,
-          `OwnerQuestionRepositoryAdapter refuses expected revision ${expectedRevision} for ${validated.questionId}; stored revision is ${storedRevision}`,
-        );
+        throw revisionConflict(validated.questionId, expectedRevision, storedRevision, validated.revision);
       }
+      assertRevisionArithmetic(validated.revision, expectedRevision);
       this.inMemoryQuestions.set(validated.questionId, validated);
       return;
     }
@@ -73,12 +99,9 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
       const existing = records.get(validated.questionId);
       const storedRevision = existing === undefined ? 0 : existing.revision;
       if (storedRevision !== expectedRevision) {
-        throw new OwnerQuestionRevisionConflictError(
-          validated.questionId,
-          expectedRevision,
-          `OwnerQuestionRepositoryAdapter refuses expected revision ${expectedRevision} for ${validated.questionId}; stored revision is ${storedRevision}`,
-        );
+        throw revisionConflict(validated.questionId, expectedRevision, storedRevision, validated.revision);
       }
+      assertRevisionArithmetic(validated.revision, expectedRevision);
       records.set(validated.questionId, validated);
       const list = [...records.values()]
         .sort((left, right) => left.questionId.localeCompare(right.questionId))
@@ -121,8 +144,13 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
       return null;
     }
     const name = fileName ?? DEFAULT_FILE_NAME;
+    if (name === COORDINATION_REQUESTS_FILE_NAME) {
+      throw new Error(
+        'OwnerQuestionRepositoryAdapter refuses a fileName that collides with the coordination requests store',
+      );
+    }
     if (!SAFE_FILE_NAME.test(name)) {
-      throw new Error(`OwnerQuestionRepositoryAdapter refuses unsafe state file name: ${name}`);
+      throw new Error('OwnerQuestionRepositoryAdapter refuses unsafe state file name');
     }
     return join(stateDir, name);
   }

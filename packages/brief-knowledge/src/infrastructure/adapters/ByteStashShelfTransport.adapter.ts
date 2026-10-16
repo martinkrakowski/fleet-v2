@@ -6,8 +6,9 @@
  */
 
 import https from 'node:https';
-import { lstat, readFile } from 'node:fs/promises';
-import type { Stats } from 'node:fs';
+import { open, readFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
 import type {
   PublishKeeperToShelfRequest,
   PublishKeeperToShelfResult,
@@ -123,14 +124,14 @@ export function createByteStashShelfPublisher(
     } catch {
       return {
         outcome: 'failed',
-        reason: `Invalid ByteStash baseUrl: ${options.baseUrl}`,
+        reason: 'Invalid ByteStash baseUrl',
       };
     }
 
     if (parsedBase.protocol !== 'https:') {
       return {
         outcome: 'failed',
-        reason: `ByteStash baseUrl must use https: ${options.baseUrl}`,
+        reason: `ByteStash baseUrl must use https: ${parsedBase.origin}`,
       };
     }
 
@@ -140,43 +141,53 @@ export function createByteStashShelfPublisher(
           return {
             outcome: 'failed',
             reason: 'keeper text matches a secret pattern; not published',
+            retryable: false,
           };
         }
       }
     }
 
-    let stat: Stats;
+    let handle: FileHandle;
     try {
-      stat = await lstat(options.keyFile);
+      handle = await open(options.keyFile, constants.O_RDONLY | constants.O_NOFOLLOW);
     } catch (error) {
+      if (isEloop(error)) {
+        return {
+          outcome: 'failed',
+          reason: `ByteStash key file at ${options.keyFile} must be a regular file, not a symlink`,
+        };
+      }
       return {
         outcome: 'failed',
         reason: `ByteStash key file inaccessible at ${options.keyFile}: ${errorMessage(error)}`,
       };
     }
 
-    if (stat.isSymbolicLink() || !stat.isFile()) {
-      return {
-        outcome: 'failed',
-        reason: `ByteStash key file at ${options.keyFile} must be a regular file, not a symlink`,
-      };
-    }
-
-    if ((stat.mode & 0o077) !== 0) {
-      return {
-        outcome: 'failed',
-        reason: `ByteStash key file at ${options.keyFile} has invalid mode 0o${(stat.mode & 0o777).toString(8)}; group and other permissions must be 0`,
-      };
-    }
-
     let rawKey: string;
     try {
-      rawKey = await readFile(options.keyFile, 'utf8');
+      const stat = await handle.stat();
+      if (!stat.isFile()) {
+        return {
+          outcome: 'failed',
+          reason: `ByteStash key file at ${options.keyFile} must be a regular file, not a symlink`,
+        };
+      }
+
+      if ((stat.mode & 0o077) !== 0) {
+        return {
+          outcome: 'failed',
+          reason: `ByteStash key file at ${options.keyFile} has invalid mode 0o${(stat.mode & 0o777).toString(8)}; group and other permissions must be 0`,
+        };
+      }
+
+      rawKey = await handle.readFile('utf8');
     } catch (error) {
       return {
         outcome: 'failed',
         reason: `ByteStash key file unreadable at ${options.keyFile}: ${errorMessage(error)}`,
       };
+    } finally {
+      await handle.close();
     }
 
     const firstLine = rawKey.split(/\r?\n/)[0]?.trim() ?? '';
@@ -253,7 +264,9 @@ export function createByteStashShelfPublisher(
         error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string'
           ? (error as { code: string }).code
           : errorMessage(error);
-      const rawReason = `ByteStash publication failed: ${codeOrMessage}`;
+      const scrubbed = scrubKey(codeOrMessage, apiKey).trim();
+      const truncated = truncatePreservingRedacted(scrubbed, 200);
+      const rawReason = `ByteStash publication failed: ${truncated}`;
       return {
         outcome: 'failed',
         reason: scrubKey(rawReason, apiKey),
@@ -261,7 +274,7 @@ export function createByteStashShelfPublisher(
     }
 
     if (response.status < 200 || response.status >= 300) {
-      const bodySnippet = truncateAndFormatBody(response.body);
+      const bodySnippet = scrubAndTruncateBody(response.body, apiKey);
       const rawReason = `ByteStash publication failed: HTTP ${response.status}${bodySnippet}`;
       return {
         outcome: 'failed',
@@ -273,7 +286,7 @@ export function createByteStashShelfPublisher(
     try {
       parsed = JSON.parse(response.body);
     } catch {
-      const bodySnippet = truncateAndFormatBody(response.body);
+      const bodySnippet = scrubAndTruncateBody(response.body, apiKey);
       const rawReason = `ByteStash publication failed: HTTP ${response.status} (invalid JSON)${bodySnippet}`;
       return {
         outcome: 'failed',
@@ -282,7 +295,7 @@ export function createByteStashShelfPublisher(
     }
 
     if (!isValidSnippetResponse(parsed)) {
-      const bodySnippet = truncateAndFormatBody(response.body);
+      const bodySnippet = scrubAndTruncateBody(response.body, apiKey);
       const rawReason = `ByteStash publication failed: HTTP ${response.status} (missing id in response)${bodySnippet}`;
       return {
         outcome: 'failed',
@@ -297,17 +310,32 @@ export function createByteStashShelfPublisher(
   };
 }
 
-function truncateAndFormatBody(rawBody: string | undefined): string {
+const REDACTED_MARKER = '[REDACTED]';
+
+function truncatePreservingRedacted(text: string, limit = 200): string {
+  if (text.length <= limit) {
+    return text;
+  }
+  const start = Math.max(0, limit - REDACTED_MARKER.length + 1);
+  for (let i = start; i < limit; i++) {
+    if (text.startsWith(REDACTED_MARKER, i)) {
+      return text.slice(0, i + REDACTED_MARKER.length);
+    }
+  }
+  return text.slice(0, limit);
+}
+
+function scrubAndTruncateBody(rawBody: string | undefined, apiKey: string): string {
   if (!rawBody) return '';
-  const trimmed = rawBody.trim();
-  if (!trimmed) return '';
-  const slice = trimmed.slice(0, 200);
+  const scrubbed = scrubKey(rawBody, apiKey).trim();
+  if (!scrubbed) return '';
+  const slice = truncatePreservingRedacted(scrubbed, 200);
   return ` - ${slice}`;
 }
 
 function scrubKey(text: string, key?: string): string {
   if (!key) return text;
-  return text.split(key).join('[REDACTED]');
+  return text.split(key).join(REDACTED_MARKER);
 }
 
 function isValidSnippetResponse(value: unknown): value is { id: string | number } {
@@ -322,6 +350,15 @@ function isValidSnippetResponse(value: unknown): value is { id: string | number 
     return id.trim().length > 0;
   }
   return false;
+}
+
+function isEloop(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: unknown }).code === 'ELOOP'
+  );
 }
 
 function errorMessage(error: unknown): string {

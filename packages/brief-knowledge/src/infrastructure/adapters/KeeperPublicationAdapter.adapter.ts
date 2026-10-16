@@ -17,6 +17,7 @@ import type {
   PublishKeeperToShelfRequest,
   PublishKeeperToShelfResult,
 } from '../../application/ports/out/KeeperPublicationPort.out-port.js';
+import { SECRET_PATTERNS } from './ByteStashShelfTransport.adapter.js';
 
 const SHELF_FILE = 'keepers-shelf.json';
 
@@ -58,8 +59,16 @@ export class KeeperPublicationAdapter implements KeeperPublicationPort {
       if (
         result.outcome === 'failed' &&
         this.deps.fallbackToShelfFile &&
-        this.deps.stateDir
+        this.deps.stateDir &&
+        result.retryable !== false
       ) {
+        if (matchesSecretPattern(request.entry.claimText)) {
+          return {
+            outcome: 'failed',
+            reason: `${result.reason}; shelf fallback refused: keeper text matches a secret pattern; not published`,
+            retryable: false,
+          };
+        }
         const shelfResult = await this.appendEntryToShelf(this.deps.stateDir, request.entry);
         if (shelfResult.ok) {
           return {
@@ -84,6 +93,14 @@ export class KeeperPublicationAdapter implements KeeperPublicationPort {
       };
     }
 
+    if (matchesSecretPattern(request.entry.claimText)) {
+      return {
+        outcome: 'failed',
+        reason: 'keeper text matches a secret pattern; not published',
+        retryable: false,
+      };
+    }
+
     const shelfResult = await this.appendEntryToShelf(stateDir, request.entry);
     if (!shelfResult.ok) {
       return {
@@ -98,6 +115,12 @@ export class KeeperPublicationAdapter implements KeeperPublicationPort {
     stateDir: string,
     entry: KnowledgeEntryRecord,
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    if (matchesSecretPattern(entry.claimText)) {
+      return {
+        ok: false,
+        reason: 'keeper text matches a secret pattern; not published',
+      };
+    }
     const shelfPath = join(stateDir, SHELF_FILE);
     try {
       const keepers = await readShelf(shelfPath);
@@ -115,6 +138,11 @@ export class KeeperPublicationAdapter implements KeeperPublicationPort {
       };
     }
   }
+}
+
+function matchesSecretPattern(text: unknown): boolean {
+  if (typeof text !== 'string') return false;
+  return SECRET_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 /** Returns the parsed shelf keepers, an empty array when absent, or a failure reason string. */

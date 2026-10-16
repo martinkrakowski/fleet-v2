@@ -198,7 +198,35 @@ describe('ByteStashShelfTransport', () => {
       expect(result.outcome).toBe('failed');
       if (result.outcome === 'failed') {
         expect(result.reason).toContain(symlinkPath);
+        expect(result.reason).toContain('must be a regular file, not a symlink');
         expect(result.reason).not.toContain(validKey);
+      }
+      expect(mockRequest).not.toHaveBeenCalled();
+    });
+
+    it('refuses symlinked key file via O_NOFOLLOW without reading target secret', async () => {
+      const targetSecretPath = join(tempDir, 'target-secret.key');
+      const targetSecret = 'sensitive-target-key-never-read';
+      await writeFile(targetSecretPath, `${targetSecret}\n`, 'utf8');
+      await chmod(targetSecretPath, 0o600);
+
+      const symlinkPath = join(tempDir, 'symlink-to-target.key');
+      await symlink(targetSecretPath, symlinkPath);
+      const mockRequest = vi.fn<ByteStashRequestFn>();
+
+      const publisher = createByteStashShelfPublisher({
+        baseUrl: 'https://stash.example.com',
+        keyFile: symlinkPath,
+        author: 'alice',
+        request: mockRequest,
+      });
+
+      const result = await publisher({ entry: makeTestEntry() });
+      expect(result.outcome).toBe('failed');
+      if (result.outcome === 'failed') {
+        expect(result.reason).toContain(symlinkPath);
+        expect(result.reason).toContain('must be a regular file, not a symlink');
+        expect(result.reason).not.toContain(targetSecret);
       }
       expect(mockRequest).not.toHaveBeenCalled();
     });
@@ -321,6 +349,7 @@ describe('ByteStashShelfTransport', () => {
         expect(result).toEqual({
           outcome: 'failed',
           reason: 'keeper text matches a secret pattern; not published',
+          retryable: false,
         });
         expect(mockRequest).not.toHaveBeenCalled();
       });
@@ -338,7 +367,45 @@ describe('ByteStashShelfTransport', () => {
       const result = await publisher({ entry: makeTestEntry() });
       expect(result.outcome).toBe('failed');
       if (result.outcome === 'failed') {
-        expect(result.reason).toContain('must use https');
+        expect(result.reason).toContain('must use https: http://insecure-stash.local');
+      }
+      expect(mockRequest).not.toHaveBeenCalled();
+    });
+
+    it('never echoes userinfo from baseUrl in failure reason, using parsed origin instead', async () => {
+      const mockRequest = vi.fn<ByteStashRequestFn>();
+      const publisher = createByteStashShelfPublisher({
+        baseUrl: 'http://admin:secret-password@insecure-stash.example.com:8443/subpath',
+        keyFile: keyFilePath,
+        author: 'alice',
+        request: mockRequest,
+      });
+
+      const result = await publisher({ entry: makeTestEntry() });
+      expect(result.outcome).toBe('failed');
+      if (result.outcome === 'failed') {
+        expect(result.reason).toBe('ByteStash baseUrl must use https: http://insecure-stash.example.com:8443');
+        expect(result.reason).not.toContain('admin');
+        expect(result.reason).not.toContain('secret-password');
+        expect(result.reason).not.toContain('subpath');
+      }
+      expect(mockRequest).not.toHaveBeenCalled();
+    });
+
+    it('never echoes raw baseUrl when baseUrl is invalid URL with userinfo', async () => {
+      const mockRequest = vi.fn<ByteStashRequestFn>();
+      const publisher = createByteStashShelfPublisher({
+        baseUrl: 'http://[invalid-host-with-credentials:pass',
+        keyFile: keyFilePath,
+        author: 'alice',
+        request: mockRequest,
+      });
+
+      const result = await publisher({ entry: makeTestEntry() });
+      expect(result.outcome).toBe('failed');
+      if (result.outcome === 'failed') {
+        expect(result.reason).toBe('Invalid ByteStash baseUrl');
+        expect(result.reason).not.toContain('pass');
       }
       expect(mockRequest).not.toHaveBeenCalled();
     });
@@ -488,6 +555,34 @@ describe('ByteStashShelfTransport', () => {
         expect(result.reason).toContain('E'.repeat(200));
       }
     });
+
+    it('scrubs key before truncating when key straddles character 200 in server body, leaving no prefix of the key', async () => {
+      // Place validKey so it begins at character 192, straddling character 200.
+      // Characters 192..199 contain the first 8 characters of validKey ('stash-te').
+      const prefix = 'X'.repeat(192);
+      const straddlingBody = `${prefix}${validKey}-remainder-of-response-body`;
+
+      const mockRequest: ByteStashRequestFn = async () => ({
+        status: 500,
+        body: straddlingBody,
+      });
+
+      const publisher = createByteStashShelfPublisher({
+        baseUrl: 'https://stash.example.com',
+        keyFile: keyFilePath,
+        author: 'alice',
+        request: mockRequest,
+      });
+
+      const result = await publisher({ entry: makeTestEntry() });
+      expect(result.outcome).toBe('failed');
+      if (result.outcome === 'failed') {
+        const first8Chars = validKey.slice(0, 8);
+        expect(result.reason.includes(first8Chars)).toBe(false);
+        expect(result.reason.includes(validKey)).toBe(false);
+        expect(result.reason).toContain('[REDACTED]');
+      }
+    });
   });
 
   describe('KeeperPublicationAdapter fallbackToShelfFile', () => {
@@ -569,6 +664,82 @@ describe('ByteStashShelfTransport', () => {
       expect(result).toEqual({
         outcome: 'failed',
         reason: 'network crash',
+      });
+
+      const shelfPath = join(tempDir, 'keepers-shelf.json');
+      await expect(readFile(shelfPath)).rejects.toThrow();
+    });
+
+    it('does not write to shelf file when publisher refuses secret claim with retryable: false and fallback is on', async () => {
+      const publisher = createByteStashShelfPublisher({
+        baseUrl: 'https://stash.example.com',
+        keyFile: keyFilePath,
+        author: 'alice',
+      });
+
+      const adapter = new KeeperPublicationAdapter({
+        publish: publisher,
+        stateDir: tempDir,
+        fallbackToShelfFile: true,
+      });
+
+      const secretEntry = makeTestEntry({
+        id: 'secret-claim-fallback-entry',
+        claimText: 'Private key:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----',
+      });
+
+      const result = await adapter.publishKeeperToShelf({ entry: secretEntry });
+
+      expect(result).toEqual({
+        outcome: 'failed',
+        reason: 'keeper text matches a secret pattern; not published',
+        retryable: false,
+      });
+
+      const shelfPath = join(tempDir, 'keepers-shelf.json');
+      await expect(readFile(shelfPath)).rejects.toThrow();
+    });
+
+    it('does not write to shelf file when publisher fails on secret claim and fallback is on', async () => {
+      const adapter = new KeeperPublicationAdapter({
+        publish: async () => ({ outcome: 'failed', reason: 'network timeout' }),
+        stateDir: tempDir,
+        fallbackToShelfFile: true,
+      });
+
+      const secretEntry = makeTestEntry({
+        id: 'secret-claim-generic-fail',
+        claimText: 'Leaked GitHub token: ghp_12345678901234567890 in config',
+      });
+
+      const result = await adapter.publishKeeperToShelf({ entry: secretEntry });
+
+      expect(result.outcome).toBe('failed');
+      if (result.outcome === 'failed') {
+        expect(result.reason).toContain('shelf fallback refused: keeper text matches a secret pattern; not published');
+        expect(result.retryable).toBe(false);
+      }
+
+      const shelfPath = join(tempDir, 'keepers-shelf.json');
+      await expect(readFile(shelfPath)).rejects.toThrow();
+    });
+
+    it('refuses and does not write to shelf file in no-callback path when claim contains a secret', async () => {
+      const adapter = new KeeperPublicationAdapter({
+        stateDir: tempDir,
+      });
+
+      const secretEntry = makeTestEntry({
+        id: 'secret-claim-no-callback',
+        claimText: 'OpenAI key sk-12345678901234567890 leaked in log',
+      });
+
+      const result = await adapter.publishKeeperToShelf({ entry: secretEntry });
+
+      expect(result).toEqual({
+        outcome: 'failed',
+        reason: 'keeper text matches a secret pattern; not published',
+        retryable: false,
       });
 
       const shelfPath = join(tempDir, 'keepers-shelf.json');

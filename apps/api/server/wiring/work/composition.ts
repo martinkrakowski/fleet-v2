@@ -14,7 +14,9 @@ import {
   AttemptOwnerDecisionAdapter,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
+  resolveInstallationForgeMode,
   resolveRoleExecutors,
+  resolveRunnerCapabilityProfile,
   type AcceptanceAssessmentDelegate,
   type AcceptanceEvidenceDelegate,
   type ActionAuthorizationDelegate,
@@ -24,7 +26,7 @@ import {
   type OwnerDecisionDelegate,
   type AttemptOwnerDecisionDelegate,
 } from "@fleet/work-execution";
-import type { FleetInstallation } from "@fleet/installation";
+import { deriveInstallationModel, type FleetInstallation } from "@fleet/installation";
 import {
   CollectAttemptArtifactsUseCase,
   DispatchAttemptUseCase,
@@ -226,6 +228,13 @@ export function createConfiguredWorkComposition(
   const roleExecutors = resolveRoleExecutors(options?.installation, {
     worktreeSshHost,
   });
+  // The loader-derived model (D4) supplies the runner capability profile and
+  // the forge mode (D6); a v1 installation maps onto it unchanged.
+  const installationModel = options?.installation
+    ? deriveInstallationModel(options.installation).model
+    : undefined;
+  const runnerProfile = resolveRunnerCapabilityProfile(installationModel?.hosts);
+  const forgeMode = resolveInstallationForgeMode(options?.installation);
 
   const workOrderRepo = new WorkOrderRepositoryAdapter({ stateDir });
   const attemptRepo = new AttemptRepositoryAdapter({ stateDir });
@@ -240,6 +249,11 @@ export function createConfiguredWorkComposition(
     remotePort: runnerRemotePort,
     remoteHost: runnerRemoteHost,
     executor: roleExecutors.orchestrator,
+    // The capability report comes from the installation's lane-runner entry
+    // with the loader-derived source (D4); the transport trims the runner
+    // environment on a single machine (D5).
+    ...(runnerProfile !== undefined ? { capabilities: runnerProfile.capabilities } : {}),
+    ...(runnerProfile !== undefined ? { runnerTransport: runnerProfile.transport } : {}),
     resolveWorktreePath: async (attemptId) =>
       (await attemptRepo.findAttemptById(attemptId))?.worktreePath ?? null,
     resolveAttempt: async (attemptId) =>
@@ -302,6 +316,8 @@ export function createConfiguredWorkComposition(
       // owner-decision resolution acceptance uses.
       ownerDecisionPort,
       attemptOwnerDecisionPort,
+      // Forge mode `none` (D6) refuses every forge action.
+      ...(forgeMode === "none" ? { forgeMode: "none" as const } : {}),
     }),
     // Independence is a fact about the lane, so any boundary that needs the
     // implementer seat reads it from the recorded attempt, never from the

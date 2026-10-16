@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { EvidenceAssessmentRecord } from '../../domain/evidence-records.js';
+import type {
+  ForgeCheckStatus,
+  ForgeEvidencePort,
+} from '../ports/out/ForgeEvidencePort.out-port.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type {
   OwnerDecisionPort,
@@ -402,5 +406,136 @@ describe('AssessHeadAcceptanceUseCase (M15: Owner Decision / One-Way Door)', () 
         "'ownerDecisionReferences' must not be supplied; owner decisions are read from the attempt record",
     });
     expect(attemptDoors.requests).toHaveLength(0);
+  });
+});
+
+describe('AssessHeadAcceptanceUseCase forge mode (D6)', () => {
+  const request = {
+    assessmentId: 'assessment-att-1',
+    candidateHeadSha: CANDIDATE_HEAD,
+    policyRevision: 'pol-1',
+  };
+
+  function forgeProbePort(): ForgeEvidencePort & { readonly calls: number } {
+    let calls = 0;
+    return {
+      get calls() {
+        return calls;
+      },
+      async readForgeCheckStatus(): Promise<ForgeCheckStatus> {
+        calls += 1;
+        throw new Error('forge transport must not be read in mode none');
+      },
+    };
+  }
+
+  it('mode none without a CI requirement accepts receipt-only and records forgeEvidence not-configured', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
+    const forge = forgeProbePort();
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      forgeEvidence: forge,
+      forgeMode: 'none',
+      ownerDecisionPort: new InMemoryOwnerDecisionPort({ outcome: 'approved', decisionId: 'door-1' }),
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: [],
+      }),
+    });
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('accepted');
+    // The forge is never read in mode none, and the assessment records the
+    // distinct not-configured value, never unknown.
+    expect(forge.calls).toBe(0);
+    expect(repo.assessment?.forgeEvidence).toBe('not-configured');
+  });
+
+  it('mode none blocks a brief that names a CI requirement', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(
+      makePassingAssessmentRecord({ requiredChecks: ['ci', 'unit-tests'] }),
+    );
+    const forge = forgeProbePort();
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      forgeEvidence: forge,
+      forgeMode: 'none',
+      ownerDecisionPort: new InMemoryOwnerDecisionPort({ outcome: 'approved', decisionId: 'door-1' }),
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: [],
+      }),
+    });
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(
+        result.blockers.some((blocker) =>
+          blocker.includes("forge mode is 'none'") && blocker.includes('not-configured'),
+        ),
+      ).toBe(true);
+    }
+    expect(repo.assessment?.state).toBe('blocked');
+    expect(repo.assessment?.forgeEvidence).toBe('not-configured');
+  });
+
+  it('mode github keeps the forge read binding and records no forgeEvidence value', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      forgeEvidence: {
+        async readForgeCheckStatus() {
+          return { candidateHeadSha: CANDIDATE_HEAD, ciState: 'unknown', unresolvedThreadCount: null };
+        },
+      },
+      forgeMode: 'github',
+      ownerDecisionPort: new InMemoryOwnerDecisionPort({ outcome: 'approved', decisionId: 'door-1' }),
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: [],
+      }),
+    });
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    // A failing forge read still blocks exactly as before.
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockers.some((blocker) => blocker.includes("CI state 'unknown'"))).toBe(true);
+    }
+    expect(repo.assessment?.forgeEvidence).toBeUndefined();
+  });
+
+  it('mode github replaces a previously stored not-configured forgeEvidence with the real forge read', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(
+      makePassingAssessmentRecord({ forgeEvidence: 'not-configured' }),
+    );
+    let reads = 0;
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      forgeEvidence: {
+        async readForgeCheckStatus() {
+          reads += 1;
+          return { candidateHeadSha: CANDIDATE_HEAD, ciState: 'pass', unresolvedThreadCount: 0 };
+        },
+      },
+      forgeMode: 'github',
+      ownerDecisionPort: new InMemoryOwnerDecisionPort({ outcome: 'approved', decisionId: 'door-1' }),
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: [],
+      }),
+    });
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    // The real forge read decides: the stale not-configured marker is never
+    // carried over, and acceptance is no longer receipt-only.
+    expect(reads).toBe(1);
+    expect(result.outcome).toBe('accepted');
+    expect(repo.assessment?.forgeEvidence).toBeUndefined();
   });
 });

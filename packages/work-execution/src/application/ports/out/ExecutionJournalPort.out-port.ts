@@ -21,7 +21,23 @@ export interface ReserveCapacityAtomicallyRequest {
   readonly maxSlots: number;
   /** The reservation appended when the claim is granted; `slotIndex` is assigned under the lock. */
   readonly record: CapacityReservationClaim;
+  /**
+   * Busy-worktree arbitration, run under the reservations lock after the held
+   * reservations are re-read (Opus note on #58). It receives the freshly read
+   * held reservations and decides whether the claim's worktree is already
+   * busy; a busy verdict refuses the claim without writing. Keeping the check
+   * inside the lock means a conflicting reservation that lands while the
+   * claim is in flight is still seen.
+   */
+  readonly checkBusyWorktree?: (
+    held: readonly CapacityReservationRecord[],
+  ) => Promise<BusyWorktreeCheck>;
 }
+
+/** The busy-worktree verdict of a claim, decided under the lock. */
+export type BusyWorktreeCheck =
+  | { readonly outcome: 'ok' }
+  | { readonly outcome: 'busy-worktree'; readonly blockingAttemptId: string };
 
 export type ReserveCapacityAtomicallyResult =
   | { readonly outcome: 'reserved'; readonly reservation: CapacityReservationRecord }
@@ -29,6 +45,10 @@ export type ReserveCapacityAtomicallyResult =
       readonly outcome: 'duplicate-attempt';
       readonly attemptId: string;
       readonly existingReservationId: string;
+    }
+  | {
+      readonly outcome: 'busy-worktree';
+      readonly blockingAttemptId: string;
     }
   | {
       readonly outcome: 'no-free-slot';
@@ -59,9 +79,11 @@ export interface ExecutionJournalPort {
   /**
    * Reserve one slot for one attempt in a single locked read-modify-write.
    * The held reservations are re-read under the reservations lock; a claim by
-   * an attempt that already holds one and a claim over a full budget are
-   * refused without writing, and only a passing claim is appended with the
-   * lowest free slot index. A reservation is never superseded.
+   * an attempt that already holds one, a claim over a busy worktree (decided
+   * by the request's `checkBusyWorktree`, run under the same lock) and a claim
+   * over a full budget are refused without writing, and only a passing claim
+   * is appended with the lowest free slot index. A reservation is never
+   * superseded.
    */
   reserveCapacityAtomically(
     request: ReserveCapacityAtomicallyRequest,

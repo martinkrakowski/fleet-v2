@@ -295,11 +295,13 @@ describe('loader policy enforcement', () => {
   it('refuses a hand-edited v2 file that violates the policy without any hook', () => {
     const file = writeV2({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: {
         host: {
           transport: 'local',
           worktreeRoot: '/tmp/wt',
           roles: ['orchestrator', 'lane-runner', 'verifier'],
+          runner: { kind: 'opencode', port: 4166, maxLanes: 1 },
         },
       },
       seats: [

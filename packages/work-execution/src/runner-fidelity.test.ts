@@ -378,7 +378,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         baseCommit: attempt.baseCommit,
         stepLimit: 100,
         timeLimitSeconds: 3600,
-        requiredCapabilities: runnerPort.describeCapabilities(),
       });
 
       expect(result.outcome).toBe('started');
@@ -1012,14 +1011,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
-        requiredCapabilities: {
-          filesystemScope: 'scoped-worktree',
-          networkEgressRestricted: true,
-          cpuAndMemoryLimited: true,
-          processTreeTermination: true,
-          authoritativeCompletion: true,
-          artifactPersistence: true,
-        },
         seatOverride: {
           model: 'anthropic/claude-3-5-sonnet',
           reason: '', // Empty reason!
@@ -1044,14 +1035,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
-        requiredCapabilities: {
-          filesystemScope: 'scoped-worktree',
-          networkEgressRestricted: true,
-          cpuAndMemoryLimited: true,
-          processTreeTermination: true,
-          authoritativeCompletion: true,
-          artifactPersistence: true,
-        },
         seatOverride: {
           model: 'anthropic/claude-3-5-sonnet',
           reason: 'Valid reason',
@@ -1075,14 +1058,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
-        requiredCapabilities: {
-          filesystemScope: 'scoped-worktree',
-          networkEgressRestricted: true,
-          cpuAndMemoryLimited: true,
-          processTreeTermination: true,
-          authoritativeCompletion: true,
-          artifactPersistence: true,
-        },
         seatOverride: {
           model: 'anthropic/claude-3-5-sonnet',
           reason: 'Valid reason',
@@ -1107,14 +1082,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
-        requiredCapabilities: {
-          filesystemScope: 'scoped-worktree',
-          networkEgressRestricted: true,
-          cpuAndMemoryLimited: true,
-          processTreeTermination: true,
-          authoritativeCompletion: true,
-          artifactPersistence: true,
-        },
         nowIso: '2026-10-15T12:00:00.000Z',
         seatOverride: {
           model: 'anthropic/claude-3-5-sonnet',
@@ -1143,14 +1110,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
-        requiredCapabilities: {
-          filesystemScope: 'scoped-worktree',
-          networkEgressRestricted: true,
-          cpuAndMemoryLimited: true,
-          processTreeTermination: true,
-          authoritativeCompletion: true,
-          artifactPersistence: true,
-        },
         nowIso: '2026-10-15T12:00:00.000Z',
         seatOverride: {
           model: 'nvidia/z-ai/glm-5.3#low', // Same underlying family as openrouter/z-ai/glm-5.3!
@@ -1179,14 +1138,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
-        requiredCapabilities: {
-          filesystemScope: 'scoped-worktree',
-          networkEgressRestricted: true,
-          cpuAndMemoryLimited: true,
-          processTreeTermination: true,
-          authoritativeCompletion: true,
-          artifactPersistence: true,
-        },
         nowIso: '2026-10-15T12:00:00.000Z',
         seatOverride: {
           model: 'openai/gpt-4o',
@@ -1670,14 +1621,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
-        requiredCapabilities: {
-          filesystemScope: 'scoped-worktree',
-          networkEgressRestricted: true,
-          cpuAndMemoryLimited: true,
-          processTreeTermination: true,
-          authoritativeCompletion: true,
-          artifactPersistence: true,
-        },
         model: 'forbidden-model-override',
       } as unknown as DispatchAttemptRequest);
 
@@ -1719,14 +1662,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
-        requiredCapabilities: {
-          filesystemScope: 'scoped-worktree',
-          networkEgressRestricted: true,
-          cpuAndMemoryLimited: true,
-          processTreeTermination: true,
-          authoritativeCompletion: true,
-          artifactPersistence: true,
-        },
       });
 
       expect(result.outcome).toBe('started');
@@ -1780,14 +1715,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
-        requiredCapabilities: {
-          filesystemScope: 'scoped-worktree',
-          networkEgressRestricted: true,
-          cpuAndMemoryLimited: true,
-          processTreeTermination: true,
-          authoritativeCompletion: true,
-          artifactPersistence: true,
-        },
       });
 
       expect(result.outcome).toBe('refused');
@@ -1828,14 +1755,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
-        requiredCapabilities: {
-          filesystemScope: 'scoped-worktree',
-          networkEgressRestricted: true,
-          cpuAndMemoryLimited: true,
-          processTreeTermination: true,
-          authoritativeCompletion: true,
-          artifactPersistence: true,
-        },
       });
 
       expect(result.outcome).toBe('refused');
@@ -1867,14 +1786,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
-        requiredCapabilities: {
-          filesystemScope: 'scoped-worktree',
-          networkEgressRestricted: true,
-          cpuAndMemoryLimited: true,
-          processTreeTermination: true,
-          authoritativeCompletion: true,
-          artifactPersistence: true,
-        },
         nowIso: '2026-10-15T12:00:00.000Z',
         seatOverride: {
           model: 'anthropic/claude-3-5-sonnet',
@@ -1896,14 +1807,6 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
-        requiredCapabilities: {
-          filesystemScope: 'scoped-worktree',
-          networkEgressRestricted: true,
-          cpuAndMemoryLimited: true,
-          processTreeTermination: true,
-          authoritativeCompletion: true,
-          artifactPersistence: true,
-        },
         nowIso: '2026-10-15T12:00:00.000Z',
         seatOverride: {
           model: 'anthropic/claude-3-5-sonnet',

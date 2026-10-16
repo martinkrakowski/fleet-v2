@@ -14,7 +14,7 @@ import {
   type OwnerDecisionDelegate,
 } from "@fleet/evidence-and-acceptance";
 import { resolveRoleExecutors } from "@fleet/work-execution";
-import type { FleetInstallation } from "@fleet/installation";
+import { deriveInstallationModel, type FleetInstallation } from "@fleet/installation";
 import {
   AssessHeadAcceptanceUseCase,
   InspectAcceptanceEvidenceUseCase,
@@ -45,6 +45,18 @@ export interface EvidenceUseCasesOptions {
   readonly stateDir?: string;
   /** Parsed installation; the verifier role's host decides the executor. */
   readonly installation?: FleetInstallation;
+  /**
+   * Argument-array `gh` transport for forge evidence reads (D6). Mode
+   * `github` hands it to the ForgeEvidenceAdapter so reads can succeed; the
+   * runtime binds the reviewed subprocess runner, tests inject a stub.
+   */
+  readonly forgeGhRunner?: (
+    args: readonly string[],
+  ) => Promise<{
+    readonly exitCode: number | null;
+    readonly stdout: string;
+    readonly stderr?: string;
+  }>;
 }
 
 function createEvidenceUseCases(): EvidenceUseCases {
@@ -76,7 +88,33 @@ export function createConfiguredEvidenceUseCases(
   const archive = new EvidenceArchiveAdapter(
     stateDir === undefined ? {} : { archiveDir: join(stateDir, "evidence-archive") },
   );
-  const forgeEvidence = new ForgeEvidenceAdapter();
+  // The forge mode comes from the loader-derived model (D6): mode `github`
+  // binds the forge-evidence port, mode `none` keeps acceptance receipt-only
+  // and records `forgeEvidence: 'not-configured'`.
+  const installationModel = options?.installation
+    ? deriveInstallationModel(options.installation).model
+    : undefined;
+  const forgeMode = installationModel?.forge?.mode;
+  const forgeSection =
+    installationModel?.forge !== undefined && "mode" in installationModel.forge
+      ? installationModel.forge
+      : undefined;
+  const forgeGithubSection = forgeSection?.mode === "github" ? forgeSection : undefined;
+  const forgeEvidenceAdapter =
+    // Mode `none` never reads the forge; every other mode (github, or an
+    // installation without a forge section, which keeps today's fail-closed
+    // unknown reads) binds the port. Mode `github` binds the same
+    // argument-array gh transport the forge action adapter uses, so reads
+    // can succeed (D6).
+    forgeMode === "none"
+      ? undefined
+      : new ForgeEvidenceAdapter({
+          owner: forgeGithubSection?.owner,
+          repo: forgeGithubSection?.repo,
+          ...(options?.forgeGhRunner !== undefined
+            ? { runGh: options.forgeGhRunner }
+            : {}),
+        });
   const reviewer = new IndependentReviewAdapter();
   const ownerDecisionPort = new OwnerDecisionAdapter(crossContext?.ownerDecision);
   const attemptOwnerDecisionPort = new AttemptOwnerDecisionAdapter(
@@ -94,7 +132,11 @@ export function createConfiguredEvidenceUseCases(
     recordReviewReceipt: new RecordReviewReceiptUseCase({ repo }),
     assessHeadAcceptance: new AssessHeadAcceptanceUseCase({
       repo,
-      forgeEvidence,
+      // Mode `github` binds the forge-evidence port (with owner/repo); mode
+      // `none` never reads the forge and records the not-configured value on
+      // the assessment.
+      ...(forgeEvidenceAdapter !== undefined ? { forgeEvidence: forgeEvidenceAdapter } : {}),
+      ...(forgeMode === "none" ? { forgeMode: "none" as const } : {}),
       ownerDecisionPort,
       attemptOwnerDecisionPort,
     }),

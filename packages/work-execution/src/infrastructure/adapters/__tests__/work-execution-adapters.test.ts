@@ -149,6 +149,9 @@ function makeReceipt(overrides: Partial<CommandCompletionReceipt> = {}): Command
 }
 
 const fullCapabilities: RunnerIsolationCapabilities = {
+  // D4: the enforced default profile is the v1 / env-only behaviour, so its
+  // report carries the loader-derived `legacy-asserted` source.
+  source: 'legacy-asserted',
   filesystemScope: 'scoped-worktree',
   networkEgressRestricted: true,
   cpuAndMemoryLimited: true,

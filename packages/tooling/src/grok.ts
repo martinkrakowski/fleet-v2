@@ -1,0 +1,68 @@
+import { interpretAccountSignIn } from './sign-in.js';
+import type { ModelListResult, ToolDescriptor, ToolModel } from './types.js';
+
+const MODELS_HEADER = 'Available models:';
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._/-]*/;
+
+function nonEmptyLines(output: string): readonly string[] {
+  const lines = output.split(/\r?\n/);
+  while (lines.length > 0 && lines[0].trim() === '') {
+    lines.shift();
+  }
+  while (lines.length > 0 && lines[lines.length - 1].trim() === '') {
+    lines.pop();
+  }
+  return lines;
+}
+
+/**
+ * `grok models` prints an `Available models:` header followed by one model
+ * id a line, with optional annotations (such as `(default)`) after the id.
+ * A missing header, a row without a readable id, or a header with no model
+ * after it is `'unknown'`.
+ */
+function parseGrokModels(output: string): ModelListResult {
+  const lines = nonEmptyLines(output);
+  if (lines.length === 0 || lines[0].trim() !== MODELS_HEADER) {
+    return 'unknown';
+  }
+  const result: ToolModel[] = [];
+  for (const line of lines.slice(1)) {
+    const match = MODEL_ID.exec(line.trim());
+    if (match === null) {
+      return 'unknown';
+    }
+    result.push({ id: match[0] });
+  }
+  return result.length === 0 ? 'unknown' : result;
+}
+
+/**
+ * The Grok CLI as fleet invokes it: a reviewer in `--permission-mode plan`,
+ * which neither writes nor runs commands. The template pins plan mode, so a
+ * grok seat is read-only (`canRunCommands: false`, `readOnlyMode: true`)
+ * and needs no allow rules.
+ */
+export const GROK_TOOL: ToolDescriptor = {
+  id: 'grok',
+  displayName: 'Grok CLI',
+  detect: { argv: ['grok', '--version'] },
+  signIn: {
+    argv: ['grok', 'auth', 'status'],
+    interpret: interpretAccountSignIn,
+  },
+  models: {
+    argv: ['grok', 'models'],
+    parse: parseGrokModels,
+  },
+  capabilities: {
+    canRunCommands: false,
+    readOnlyMode: true,
+    needsAllowRules: false,
+    headless: true,
+  },
+  invocation: {
+    argvTemplate: ['grok', '-m', '{model}', '--permission-mode', 'plan', '{prompt}'],
+  },
+  costSource: 'pay-per-token',
+};

@@ -209,10 +209,10 @@ clear_all; : > "$T/locked-once"
 run -- --dir "$D" "p" > /dev/null 2> "$T/err"; rc=$?
 check "an early 'database is locked' is retried once" '[ "$rc" = 0 ] && [ "$(wc -l < "$T/args.log" | tr -d " ")" = 2 ] && grep -q "retrying once" "$T/err"'
 
-# --- 1b. OCM_HOST default and override
+# --- 1b. OCM_HOST: no default host, environment override
 clear_all
 out=$(run OCM_HOST= -- --check 2>&1); rc=$?
-check "OCM_HOST: defaults to m when unset in environment" '[ "$rc" = 0 ] && echo "$out" | grep -q " via m, remote port "'
+check "OCM_HOST: has no product default (no host name is a product constant)" '[ "$rc" = 0 ] && ! echo "$out" | grep -q " via "'
 out=$(run OCM_HOST=custom-host -- --check 2>&1); rc=$?
 check "OCM_HOST: uses environment override when set" '[ "$rc" = 0 ] && echo "$out" | grep -q " via custom-host, remote port "'
 

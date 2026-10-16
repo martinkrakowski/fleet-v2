@@ -494,11 +494,20 @@ body.sidebar-rail .sidebar .sidebar-link {
   padding: var(--space-5);
   display: flex;
   flex-direction: column;
+  /* Default: the page wrapper scrolls, so content stays reachable everywhere. */
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
-/* Desktop: the document and .main never scroll; views scroll internally. */
+/*
+ * Desktop: scroll containment is opt-in. Only when the view inside carries
+ * `data-contained-scroll` on its root element (the roots of /lanes, /attempt
+ * and /brief) does the shell stop scrolling and hand scrolling to the view's
+ * internal panels. Every other view (/, /knowledge) keeps the page-wrapper
+ * scrolling normally.
+ */
 @media (min-width: 992px) {
-  .page-wrapper {
+  .page-wrapper:has([data-contained-scroll]) {
     overflow: hidden;
   }
 }

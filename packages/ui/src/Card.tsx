@@ -23,6 +23,10 @@ export interface CardBodyProps {
   flush?: boolean;
   className?: string;
   style?: CSSProperties;
+  /** Optional keyboard-accessible scroll-region attributes. */
+  tabIndex?: number;
+  role?: string;
+  'aria-label'?: string;
 }
 
 export interface CardFooterProps {
@@ -74,13 +78,24 @@ export function CardHeader({
   );
 }
 
-export function CardBody({ children, flush = false, className, style }: CardBodyProps) {
+export function CardBody({
+  children,
+  flush = false,
+  className,
+  style,
+  tabIndex,
+  role,
+  'aria-label': ariaLabel,
+}: CardBodyProps) {
   return (
     <div
       className={[classes.body, flush && classes.bodyFlush, className]
         .filter(Boolean)
         .join(' ') || undefined}
       style={style}
+      tabIndex={tabIndex}
+      role={role}
+      aria-label={ariaLabel}
     >
       {children}
     </div>

@@ -1,10 +1,14 @@
 /**
- * Desktop scroll-containment contracts for the lanes, attempt and brief views.
+ * Scroll-containment contracts for the shell and the lanes, attempt and brief
+ * views.
  *
- * The orchestrator verifies the rendered layout in a browser; these tests pin
- * the containment classes and rules each view must keep: on desktop the shell
- * never scrolls and each named panel scrolls internally, while below each
- * view's breakpoint the page scrolls normally again.
+ * Containment is opt-in: `.page-wrapper` scrolls by default everywhere, and
+ * only a view whose root element carries `data-contained-scroll` pins the
+ * shell on desktop (`overflow: hidden` via `:has()`). The orchestrator
+ * verifies the rendered layout in a browser; these tests pin the opt-in
+ * attribute on each route's root, the `:has()` rule in globals.css, and the
+ * keyboard-accessible scroll regions each view must keep. @testing-library is
+ * not installed in apps/web, so the JSX assertions read the component sources.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -35,88 +39,117 @@ function hasRule(block: string, selector: string, body: string): boolean {
   return re.test(block);
 }
 
+/** First JSX opening tag matching `pattern` (or a failing empty string). */
+function openingTag(source: string, pattern: RegExp, what: string): string {
+  const tag = source.match(pattern)?.[0];
+  expect(tag, `expected the ${what} element in the component source`).toBeTruthy();
+  return tag ?? "";
+}
+
+/**
+ * Every scroll body must be a keyboard-reachable named region so keyboard
+ * users can reach and scroll each internally scrolling panel.
+ */
+function expectScrollRegion(tag: string, label: string): void {
+  expect(tag).toContain("tabIndex={0}");
+  expect(tag).toContain('role="region"');
+  expect(tag).toContain(`aria-label="${label}"`);
+}
+
 describe("shell containment", () => {
   const css = read("globals.css");
 
-  it("hides overflow on .page-wrapper on desktop and scrolls it below 992px", () => {
-    expect(hasRule(mediaBlock(css, "(min-width: 992px)"), ".page-wrapper", "overflow: hidden")).toBe(true);
+  it("keeps .page-wrapper scrolling by default on every viewport", () => {
+    expect(css).toMatch(
+      /\.page-wrapper\s*\{[^}]*overflow-y:\s*auto[^}]*scrollbar-gutter:\s*stable/,
+    );
     expect(hasRule(mediaBlock(css, "(max-width: 991.98px)"), ".page-wrapper", "overflow-y: auto")).toBe(true);
   });
 
-  it("keeps .main a full-height flex column with a non-scrolling page-wrapper", () => {
-    expect(css).toMatch(/\.main\s*\{[^}]*height:\s*100vh/);
-    expect(css).toMatch(/\.page-wrapper\s*\{[^}]*flex:\s*1[^}]*min-height:\s*0/);
+  it("contains overflow on desktop only for views that opt in", () => {
+    expect(css).toContain(".page-wrapper:has([data-contained-scroll])");
+    expect(
+      hasRule(
+        mediaBlock(css, "(min-width: 992px)"),
+        ".page-wrapper:has([data-contained-scroll])",
+        "overflow: hidden",
+      ),
+    ).toBe(true);
   });
 });
 
-describe("lanes containment", () => {
-  const css = read("lanes", "lanes.module.css");
-  const desktop = mediaBlock(css, "(min-width: 992px)");
-
-  it("scrolls the lane board body and the rail internally on desktop", () => {
-    expect(hasRule(desktop, ".laneScroll", "overflow-y: auto")).toBe(true);
-    expect(hasRule(desktop, ".laneScroll", "min-height: 0")).toBe(true);
-    expect(hasRule(desktop, ".rail", "overflow-y: auto")).toBe(true);
-    expect(hasRule(desktop, ".rail", "min-height: 0")).toBe(true);
-    expect(hasRule(desktop, ".board", "min-height: 0")).toBe(true);
+describe("opt-in containment roots of the five routes", () => {
+  it("/ renders no root element — it redirects to /lanes", () => {
+    const home = read("page.tsx");
+    expect(home).toMatch(/redirect\("\/lanes"\)/);
+    expect(home).not.toContain("data-contained-scroll");
   });
 
-  it("keeps the mobile layout free of inner scroll containers", () => {
-    const cssText = css;
-    expect(cssText).not.toMatch(/max-width:\s*991\.98px[\s\S]*overflow-y:\s*auto/);
+  it("/knowledge does not opt in — the page scrolls normally", () => {
+    const knowledge = read("knowledge", "page.tsx");
+    expect(knowledge).toContain("<div className={styles.page}>");
+    expect(knowledge).not.toContain("data-contained-scroll");
   });
 
-  it("wires the scroll class onto the lane board body", () => {
-    expect(read("lanes", "page.tsx")).toMatch(/CardBody className=\{styles\.laneScroll\}/);
-  });
-});
-
-describe("attempt containment", () => {
-  const css = read("attempt", "attempt.module.css");
-  const desktop = mediaBlock(css, "(min-width: 992px)");
-
-  it("scrolls the sidebar column and the record column internally on desktop", () => {
-    expect(hasRule(desktop, ".sidebarCol", "overflow-y: auto")).toBe(true);
-    expect(hasRule(desktop, ".recordCol", "overflow-y: auto")).toBe(true);
-    expect(hasRule(desktop, ".layout", "min-height: 0")).toBe(true);
-    expect(hasRule(desktop, ".layout", "grid-template-rows: minmax(0, 1fr)")).toBe(true);
+  it("/lanes opts in on its root element", () => {
+    const lanes = read("lanes", "page.tsx");
+    expect(lanes).toContain(
+      "<div className={styles.page} data-contained-scroll>",
+    );
   });
 
-  it("leaves the layout stacked without inner scrolling below 992px", () => {
-    const mobile = mediaBlock(css, "(max-width: 991.98px)");
-    expect(mobile).not.toMatch(/overflow/);
+  it("/attempt opts in on its root element", () => {
+    const attempt = read("attempt", "attempt-client.tsx");
+    expect(attempt).toContain(
+      "<div className={styles.layout} data-contained-scroll>",
+    );
+  });
+
+  it("/brief opts in on its root element", () => {
+    const brief = read("brief", "page.tsx");
+    expect(
+      brief.match(
+        /<div\s*\n\s*className=\{\[styles\.stack, styles\.view\][\s\S]*?data-contained-scroll\s*\n\s*>/,
+      ),
+    ).toBeTruthy();
   });
 });
 
-describe("brief containment", () => {
-  const css = read("brief", "brief.module.css");
-  const desktop = mediaBlock(css, "(min-width: 72rem)");
-
-  it("keeps the header fixed and scrolls both columns internally", () => {
-    expect(hasRule(desktop, ".view", "overflow: hidden")).toBe(true);
-    expect(hasRule(desktop, ".woScroll", "overflow-y: auto")).toBe(true);
-    expect(hasRule(desktop, ".detail", "overflow-y: auto")).toBe(true);
-    expect(hasRule(desktop, ".grid", "min-height: 0")).toBe(true);
+describe("keyboard-accessible scroll regions", () => {
+  it("names the lanes board scroll and the rail", () => {
+    const lanes = read("lanes", "page.tsx");
+    expectScrollRegion(
+      openingTag(lanes, /<CardBody[^>]*styles\.laneScroll[^>]*>/, "lanes board scroll body"),
+      "Lanes",
+    );
+    expectScrollRegion(
+      openingTag(lanes, /<div[^>]*styles\.rail[^>]*>/, "lanes rail"),
+      "Attention",
+    );
   });
 
-  it("scrolls the whole grid between the shell and view breakpoints", () => {
-    const band = mediaBlock(css, "(min-width: 992px) and (max-width: 71.99rem)");
-    expect(hasRule(band, ".view", "overflow: hidden")).toBe(true);
-    expect(hasRule(band, ".grid", "overflow-y: auto")).toBe(true);
+  it("names the attempt sidebar column and record column", () => {
+    const attempt = read("attempt", "attempt-client.tsx");
+    expectScrollRegion(
+      openingTag(attempt, /<div[^>]*styles\.sidebarCol[^>]*>/, "attempt sidebar column"),
+      "Work order and operations",
+    );
+    expectScrollRegion(
+      openingTag(attempt, /<section[^>]*styles\.recordCol[^>]*>/, "attempt record column"),
+      "Attempt record",
+    );
   });
 
-  it("leaves no desktop containment in the base (unscoped) rules", () => {
-    const base = css.replace(/@media[^{]+\{[\s\S]*?\n\}/g, "");
-    expect(base).not.toMatch(/overflow:\s*hidden/);
-    expect(base).not.toMatch(/overflow-y:\s*auto/);
-  });
-
-  it("wires the containment classes into the view", () => {
-    const page = read("brief", "page.tsx");
+  it("names the brief work-order list and detail column", () => {
     const card = read("brief", "components", "work-order-list-card.tsx");
-    expect(page).toMatch(/styles\.view/);
-    expect(page).toMatch(/styles\.detail/);
-    expect(card).toMatch(/className=\{styles\.woCard\}/);
-    expect(card).toMatch(/CardBody className=\{styles\.woScroll\}/);
+    expectScrollRegion(
+      openingTag(card, /<CardBody[^>]*styles\.woScroll[^>]*>/, "brief work-order scroll body"),
+      "Work orders",
+    );
+    const brief = read("brief", "page.tsx");
+    expectScrollRegion(
+      openingTag(brief, /<div[^>]*styles\.detail[^>]*>/, "brief detail column"),
+      "Brief detail",
+    );
   });
 });

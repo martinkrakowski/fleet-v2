@@ -52,7 +52,7 @@ export default function LanesPage() {
     .sort((x, y) => (x.queuedAt ?? "").localeCompare(y.queuedAt ?? ""));
 
   return (
-    <div className={styles.page}>
+    <div className={styles.page} data-contained-scroll>
       <PageHeader
         title="Lanes"
         description={
@@ -105,7 +105,12 @@ export default function LanesPage() {
               </div>
             }
           />
-          <CardBody className={styles.laneScroll}>
+          <CardBody
+            className={styles.laneScroll}
+            tabIndex={0}
+            role="region"
+            aria-label="Lanes"
+          >
             {rows.length > 0 ? (
               <ul className={styles.lanes}>
                 {rows.map((a) => (
@@ -134,7 +139,12 @@ export default function LanesPage() {
             )}
           </CardBody>
         </Card>
-        <div className={styles.rail}>
+        <div
+          className={styles.rail}
+          tabIndex={0}
+          role="region"
+          aria-label="Attention"
+        >
           <CapacityCard
             heldAttempts={heldAttempts}
             pendingAttempts={pendingAttempts}

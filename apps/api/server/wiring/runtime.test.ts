@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   configureFleetApiRuntime,
@@ -122,16 +125,14 @@ describe('apps/api runtime wiring', () => {
       const workOrderRepo = (work.registerWorkOrder as unknown as {
         deps?: { workOrderRepo: { saveWorkOrder: (w: WorkOrderRecord) => Promise<void> } };
       }).deps?.workOrderRepo;
-      if (workOrderRepo) {
-        await workOrderRepo.saveWorkOrder(makeWorkOrder(workOrderId));
-      }
+      expect(workOrderRepo).toBeDefined();
+      await workOrderRepo!.saveWorkOrder(makeWorkOrder(workOrderId));
 
       const attemptRepo = (work.executeAuthorizedForgeAction as unknown as {
         deps?: { attemptRepo: { saveAttempt: (a: AttemptRecord) => Promise<void> } };
       }).deps?.attemptRepo;
-      if (attemptRepo) {
-        await attemptRepo.saveAttempt(makeAttempt(attemptId, workOrderId, headH, []));
-      }
+      expect(attemptRepo).toBeDefined();
+      await attemptRepo!.saveAttempt(makeAttempt(attemptId, workOrderId, headH, []));
 
       // Resolve authorization grant for push-and-open-pr at head H
       const grantRecord = makeApprovedGrant(
@@ -141,11 +142,15 @@ describe('apps/api runtime wiring', () => {
       );
       // Save grant in operator context
       const reqRepo = (operator.recordAuthorizationConsumption as unknown as {
-        deps?: { requestRepo: { saveRequest: (r: CoordinationRequestRecord) => Promise<void> } };
+        deps?: {
+          requestRepo: {
+            saveRequest: (r: CoordinationRequestRecord) => Promise<void>;
+            findRequestByGrantId: (id: string) => Promise<CoordinationRequestRecord | null>;
+          };
+        };
       }).deps?.requestRepo;
-      if (reqRepo) {
-        await reqRepo.saveRequest(grantRecord);
-      }
+      expect(reqRepo).toBeDefined();
+      await reqRepo!.saveRequest(grantRecord);
 
       // Try to execute forge action through work composition
       const result = await work.executeAuthorizedForgeAction.executeAuthorizedForgeAction({
@@ -161,13 +166,94 @@ describe('apps/api runtime wiring', () => {
       expect(result).toEqual({ outcome: 'refused', reason: 'unavailable' });
 
       // Verify the grant is still UNCONSUMED
-      if (reqRepo) {
-        const findRepo = reqRepo as unknown as {
-          findRequestByGrantId: (id: string) => Promise<CoordinationRequestRecord | null>;
-        };
-        const grant = await findRepo.findRequestByGrantId(grantId);
-        expect(grant?.consumptions).toHaveLength(0);
-        expect(grant?.state).toBe('approved');
+      const grant = await reqRepo!.findRequestByGrantId(grantId);
+      expect(grant?.consumptions).toHaveLength(0);
+      expect(grant?.state).toBe('approved');
+    });
+  });
+
+  describe('restart-reload coverage', () => {
+    it('reloads authorization-coordinates.json on a fresh API runtime and consumes through authorization delegate', async () => {
+      const stateDir = mkdtempSync(join(tmpdir(), 'fleet-api-restart-test-'));
+      try {
+        const grantId = 'grant-api-restart-1';
+        const attemptId = 'att-api-restart-1';
+        const headH = makeHeadH();
+        const actionId = 'action-api-restart-1';
+
+        // Write authorization-coordinates.json directly to stateDir
+        const coordinatesPath = join(stateDir, 'authorization-coordinates.json');
+        writeFileSync(
+          coordinatesPath,
+          JSON.stringify({
+            [grantId]: {
+              attemptId,
+              expectedHeadSha: headH,
+            },
+          }),
+          'utf8',
+        );
+
+        // Build a fresh API runtime on the same stateDir
+        configureFleetApiRuntime({ stateDir });
+
+        const operator = getOperatorComposition();
+        const work = workComposition();
+
+        // Seed the approved grant in operator context
+        const grantRecord = makeApprovedGrant(
+          grantId,
+          forgeActionScope('push-and-open-pr'),
+          headH,
+        );
+        const reqRepo = (operator.recordAuthorizationConsumption as unknown as {
+          deps?: {
+            requestRepo: {
+              saveRequest: (r: CoordinationRequestRecord) => Promise<void>;
+              findRequestByGrantId: (id: string) => Promise<CoordinationRequestRecord | null>;
+            };
+          };
+        }).deps?.requestRepo;
+        expect(reqRepo).toBeDefined();
+        await reqRepo!.saveRequest(grantRecord);
+
+        // Access authorization delegate/port from work composition
+        const authPort = (work.executeAuthorizedForgeAction as unknown as {
+          deps?: {
+            authorizationPort: {
+              consumeActionAuthorization: (req: {
+                authorizationGrantId: string;
+                actionId: string;
+                actionKind: 'push-and-open-pr' | 'merge-pr';
+                expectedHeadSha: string;
+                attemptId: string;
+              }) => Promise<{ outcome: string; actionId?: string; reason?: string }>;
+            };
+          };
+        }).deps?.authorizationPort;
+        expect(authPort).toBeDefined();
+
+        // Consume through authorization delegate
+        const result = await authPort!.consumeActionAuthorization({
+          authorizationGrantId: grantId,
+          actionId,
+          actionKind: 'push-and-open-pr',
+          expectedHeadSha: headH,
+          attemptId,
+        });
+
+        expect(result).toEqual({ outcome: 'consumed', actionId });
+
+        // Verify the grant in operator repo is now consumed and state completed
+        const grant = await reqRepo!.findRequestByGrantId(grantId);
+        expect(grant?.state).toBe('completed');
+        expect(grant?.consumptions).toHaveLength(1);
+        expect(grant?.consumptions[0].actionId).toBe(actionId);
+        expect(grant?.consumptions[0].attemptId).toBe(attemptId);
+        expect(grant?.consumptions[0].expectedHeadSha).toBe(headH);
+      } finally {
+        rmSync(stateDir, { recursive: true, force: true });
+        configureFleetApiRuntime(null);
       }
     });
   });

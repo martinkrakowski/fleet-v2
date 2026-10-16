@@ -30,14 +30,10 @@ const REQUIRED_TEXT_FIELDS = [
   'consumptionId',
   'grantId',
   'actionId',
-  'actionKind',
+  'actionScope',
   'attemptId',
   'expectedHeadSha',
 ] as const;
-
-function forgeActionScope(kind: string): string {
-  return kind.startsWith('forge:') ? kind : `forge:${kind}`;
-}
 
 function refused(reason: string): RecordAuthorizationConsumptionResult {
   return { outcome: 'refused', reason };
@@ -87,10 +83,10 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     if (recorded.state !== 'approved') {
       return refused(`grant ${grantId} is ${recorded.state}, which authorizes no action`);
     }
-    const expectedScope = forgeActionScope(request.actionKind.trim());
-    if (recorded.actionScope !== expectedScope) {
+    const suppliedScope = request.actionScope.trim();
+    if (recorded.actionScope !== suppliedScope) {
       return refused(
-        `grant ${grantId} was recorded for scope ${recorded.actionScope}, not ${expectedScope}`,
+        `grant ${grantId} was recorded for scope ${recorded.actionScope}, not ${suppliedScope}`,
       );
     }
     if (recorded.expectedHeadSha !== request.expectedHeadSha.trim()) {

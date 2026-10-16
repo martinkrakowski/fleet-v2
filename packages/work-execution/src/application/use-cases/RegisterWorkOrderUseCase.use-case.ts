@@ -64,10 +64,12 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       return { outcome: 'rejected', reason: 'Work order owned paths must be non-empty strings' };
     }
 
-    const existing = await this.deps.workOrderRepo.listWorkOrdersByProject(request.projectId);
-    if (existing.some((order) => order.id === request.workOrderId)) {
+    const existingById = await this.deps.workOrderRepo.findWorkOrderById(request.workOrderId);
+    if (existingById !== null) {
       return { outcome: 'rejected', reason: `Work order already registered: ${request.workOrderId}` };
     }
+
+    const existing = await this.deps.workOrderRepo.listWorkOrdersByProject(request.projectId);
 
     for (const order of existing) {
       if (!isActiveWorkOrder(order.state)) {

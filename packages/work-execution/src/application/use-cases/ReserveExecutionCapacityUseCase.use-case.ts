@@ -47,8 +47,18 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
       throw new Error('Not implemented: ReserveExecutionCapacityUseCase');
     }
 
-    if (typeof request.maxSlots !== 'number' || !Number.isFinite(request.maxSlots) || request.maxSlots <= 0) {
+    // A non-positive (or non-finite) budget is refused with the original
+    // reason; a positive but fractional budget is refused as non-integer so
+    // both callers and journals see an exact, stable refusal message.
+    if (
+      typeof request.maxSlots !== 'number' ||
+      !Number.isFinite(request.maxSlots) ||
+      request.maxSlots <= 0
+    ) {
       return { outcome: 'refused', reason: 'maxSlots must be a positive number' };
+    }
+    if (!Number.isInteger(request.maxSlots)) {
+      return { outcome: 'refused', reason: 'maxSlots must be a positive integer' };
     }
     const requiredFields: readonly (keyof ReserveExecutionCapacityRequest)[] = [
       'reservationId',
@@ -62,10 +72,17 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
     }
 
     const heldReservations = await this.deps.journal.listActiveReservations(request.hostId);
+    const allActive = await this.deps.journal.listActiveReservations();
+    if (
+      allActive.some((reservation) => reservation.attemptId === request.attemptId) ||
+      heldReservations.some((reservation) => reservation.attemptId === request.attemptId)
+    ) {
+      return {
+        outcome: 'refused',
+        reason: `Attempt ${request.attemptId} already holds an active capacity reservation`,
+      };
+    }
     for (const reservation of heldReservations) {
-      if (reservation.attemptId === request.attemptId) {
-        continue;
-      }
       const holder = await this.deps.attemptRepo.findAttemptById(reservation.attemptId);
       if (holder && holder.worktreePath === request.worktreePath) {
         return { outcome: 'busy-worktree', blockingAttemptId: reservation.attemptId };

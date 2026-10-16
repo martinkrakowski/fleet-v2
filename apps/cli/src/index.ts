@@ -35,6 +35,7 @@ import { loadInstallation } from '@fleet/installation';
 import {
   assessmentIdForAttempt,
   createFleetCliRuntime,
+  forgeActionScope,
   resolveRunnerSettings,
   type FleetCliRuntime,
 } from './composition.js';
@@ -697,7 +698,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         consumptionId: str(p, 'consumptionId'),
         grantId: str(p, 'grantId'),
         actionId: str(p, 'actionId'),
-        actionKind: str(p, 'actionKind'),
+        actionScope: str(p, 'actionScope') || (str(p, 'actionKind') ? forgeActionScope(str(p, 'actionKind')) : ''),
         attemptId: str(p, 'attemptId'),
         expectedHeadSha: str(p, 'expectedHeadSha'),
         nowIso: optStr(p, 'nowIso'),

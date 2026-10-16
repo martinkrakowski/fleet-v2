@@ -631,7 +631,9 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
     consumptionId: 'consumption-1',
     grantId: 'grant-9',
     actionId: 'action-1',
-    actionKind: 'merge',
+    // The caller carries the scope over the port (work-execution's
+    // forgeActionScope for forge actions); the use case compares it exactly.
+    actionScope: 'forge:merge',
     attemptId: 'attempt-1',
     expectedHeadSha: 'abc123',
     nowIso: LATER_ISO,
@@ -719,6 +721,8 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
     const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
     const incomplete = await useCase.execute({ ...consumptionRequest, actionId: ' ' });
     expect(incomplete.outcome === 'refused' && incomplete.reason).toContain('actionId');
+    const missingScope = await useCase.execute({ ...consumptionRequest, actionScope: ' ' });
+    expect(missingScope.outcome === 'refused' && missingScope.reason).toContain('actionScope');
     await expect(useCase.execute(undefined)).rejects.toThrow(
       'Not implemented: RecordAuthorizationConsumptionUseCase',
     );

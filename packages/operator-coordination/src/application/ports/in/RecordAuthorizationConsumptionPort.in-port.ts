@@ -12,7 +12,8 @@ export interface RecordAuthorizationConsumptionRequest {
   readonly consumptionId: string;
   readonly grantId: string;
   readonly actionId: string;
-  readonly actionKind: string;
+  readonly actionScope: string;
+  readonly actionKind?: string;
   readonly attemptId: string;
   readonly expectedHeadSha: string;
   readonly nowIso?: string;

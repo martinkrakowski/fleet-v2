@@ -69,6 +69,13 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         reason: `a decision request requires a recorded kind: ${String(request.kind)}`,
       };
     }
+    const existing = await this.deps.requestRepo.findRequestById(request.requestId.trim());
+    if (existing !== null) {
+      return {
+        outcome: 'rejected',
+        reason: `a coordination request with id ${request.requestId.trim()} is already recorded`,
+      };
+    }
     // The composition root supplies the clock; no authority depends on it here.
     const nowIso = isFilled(request.nowIso) ? request.nowIso : new Date().toISOString();
     const recorded: CoordinationRequestRecord = CoordinationRequest.fromRecord({

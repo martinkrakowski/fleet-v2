@@ -156,7 +156,7 @@ const trackedV1ExampleMappedModel: FleetInstallationModel = {
     {
       id: 'implementer',
       tool: 'opencode',
-      model: 'example-provider/example-model',
+      model: 'example-provider/glm-5.3',
       variant: 'example-variant',
       agent: 'example-agent',
       roles: ['implementer'],
@@ -164,7 +164,7 @@ const trackedV1ExampleMappedModel: FleetInstallationModel = {
     {
       id: 'implementer-fallback-1',
       tool: 'opencode',
-      model: 'example-provider/example-fallback-model',
+      model: 'example-provider/glm-5.3-flash',
       variant: 'example-variant',
       agent: 'example-agent',
       roles: ['implementer'],
@@ -172,7 +172,7 @@ const trackedV1ExampleMappedModel: FleetInstallationModel = {
     {
       id: 'reviewer',
       tool: 'opencode',
-      model: 'example-provider/example-review-model',
+      model: 'example-provider/grok-4.7',
       variant: 'example-variant',
       agent: 'example-agent',
       roles: ['reviewer'],

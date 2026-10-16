@@ -40,14 +40,30 @@ const SAME_FAMILY_GROUPS: readonly string[][] = [
   ['bare-model', 'bare-model', 'Bare-Model#high'],
   ['openai/gpt-4o', 'gpt-4o', 'openai/gpt-4o@20250929'],
   ['gpt-6-luna-mini', 'gpt-6-luna', 'openrouter/openai/gpt-6-luna:free'],
+  [
+    'claude-sonnet-4-5',
+    'claude-3-5-sonnet-20241022',
+    'claude-opus-5-5',
+    'claude-haiku-4-5',
+    'openrouter/anthropic/claude-opus-5-5:beta',
+  ],
+  ['grok-4.7', 'grok-code-fast-4.7', 'grok-4.7-fast'],
+  ['gemini-2.5-pro', 'gemini-flash-latest'],
+  ['gpt-5', 'gpt-oss-120b'],
+  ['glm-5.3', 'glm-z1-32b'],
+  ['laguna-s-2.1', 'laguna-s-2.1'],
+  ['space-bunny-free', 'space-bunny-paid'],
 ];
 
 const DISTINCT_PAIRS: readonly [string, string][] = [
-  ['claude-sonnet', 'claude-opus'],
-  ['glm-5.3', 'glm-5.4'],
+  // One family per vendor line (owner rule 2026-10-16): sonnet vs opus is
+  // the same `claude` family; these pairs stay distinct.
+  ['gemini-3.1-pro', 'grok-4.7'],
   ['gpt-6-luna', 'glm-5.3'],
-  ['glm-5.3', 'glm-5.3-flashx-nonexistent-family-marker'],
-  ['model-a', 'model-b'],
+  ['claude-opus-5-5', 'glm-5.3'],
+  ['gpt-6-luna', 'gemini-3.8-pro'],
+  ['claude-sonnet-4-5', 'glm-5.3'],
+  ['model-a', 'other-b'],
 ];
 
 const ODD_INPUTS: readonly string[] = [

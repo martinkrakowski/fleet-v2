@@ -25,50 +25,27 @@ const REVIEWER_ROLES: readonly Exclude<SeatRole, 'implementer'>[] = [
 const CHAIN_ROLES: readonly SeatRole[] = ['implementer', 'reviewer', 'high-risk-reviewer'];
 
 /**
- * Size, speed and cost suffixes stripped from a model name, repeatedly, to
- * reach the underlying model family. `flashx` precedes `flash` so the longer
- * suffix is removed whole.
- */
-const FAMILY_SUFFIXES: readonly string[] = [
-  'flashx',
-  'flash',
-  'prime',
-  'preview',
-  'mini',
-  'lite',
-  'free',
-  'paid',
-];
-
-/** Strip one trailing size/speed/cost suffix (`-flash`, `:free`, ...) if present. */
-function stripOneFamilySuffix(value: string): string {
-  for (const suffix of FAMILY_SUFFIXES) {
-    for (const separator of [':', '-']) {
-      const token = separator + suffix;
-      if (value.endsWith(token) && value.length > token.length) {
-        return value.slice(0, value.length - token.length);
-      }
-    }
-  }
-  return value;
-}
-
-/**
- * The underlying model family of a model id: every provider prefix (all
- * leading path segments up to the model name), any `#variant`, anything from
- * the first `:` after the model name (`:nitro`, `:thinking`, `:free`/`:paid`,
- * ...), any `@...` suffix (`@20250929`, ...) and the size and speed suffixes
- * are stripped, and the remainder is compared case-insensitively.
- * `openrouter/z-ai/glm-5.3`, `nvidia/z-ai/glm-5.3-flash` and
- * `z-ai/glm-5.3#none` share one family.
+ * The underlying model family of a model id — one family per vendor line
+ * (owner decision 2026-10-16): the id is lowercased and trimmed, cut at the
+ * first `#` (any `#variant`), everything up to and including the last `/` is
+ * dropped (every provider prefix), the remainder is cut at the first `:` or
+ * `@` (`:nitro`, `:free`, `@20250929`, ...), and the family is then the
+ * leading run of ASCII letters only, stopping at the first character that is
+ * not `a`-`z`. Every model of a vendor line is one family, so tier words
+ * before the first digit never split a line: `claude-opus-5-5`,
+ * `claude-3-5-sonnet-20241022` and `claude-haiku-4-5` are all `claude`;
+ * `grok-4.7` and `grok-code-fast-4.7` are `grok`; `gemini-flash-latest` and
+ * `models/gemini-2.5-pro` are `gemini`; `gpt-5` and `gpt-oss-120b` are `gpt`;
+ * `glm-z1-32b` is `glm`; `laguna-s-2.1` is `laguna`;
+ * `space-bunny-free` is `space`.
  *
- * An empty family (from `''`, `'/'`, `'z-ai/'`, `'#low'`) is invalid; callers
- * comparing families must fail closed and treat an empty family as equal to
- * every other family. The installation parser refuses a seat whose model
- * yields an empty family.
+ * An empty family (from `''`, `'4o-mini'`, `'/'`, `'z-ai/'`, `'#low'`) is
+ * invalid; callers comparing families must fail closed and treat an empty
+ * family as equal to every other family. The installation parser refuses a
+ * seat whose model yields an empty family.
  */
 export function underlyingModelFamily(model: string): string {
-  let value = model.trim();
+  let value = model.trim().toLowerCase();
   const hashIndex = value.indexOf('#');
   if (hashIndex !== -1) {
     value = value.slice(0, hashIndex);
@@ -77,22 +54,12 @@ export function underlyingModelFamily(model: string): string {
   if (separatorIndex !== -1) {
     value = value.slice(separatorIndex + 1);
   }
-  const colonIndex = value.indexOf(':');
-  if (colonIndex !== -1) {
-    value = value.slice(0, colonIndex);
+  const specialIndex = value.search(/[:@]/);
+  if (specialIndex !== -1) {
+    value = value.slice(0, specialIndex);
   }
-  const atIndex = value.indexOf('@');
-  if (atIndex !== -1) {
-    value = value.slice(0, atIndex);
-  }
-  value = value.toLowerCase();
-  for (;;) {
-    const stripped = stripOneFamilySuffix(value);
-    if (stripped === value) {
-      return value;
-    }
-    value = stripped;
-  }
+  const letters = /^[a-z]*/.exec(value);
+  return letters === null ? '' : letters[0];
 }
 
 /** Compile a glob (`*`, `?`) on a model id into a case-insensitive RegExp. */

@@ -10,6 +10,7 @@ import type { DoctorProbes, SeatProbeResult } from '../probes.js';
 import type { DoctorLine } from '../types.js';
 import { doctorExitCode, runDoctor } from '../run-doctor.js';
 import type { DoctorableInstallation } from '../run-doctor.js';
+import { createNodeDoctorProbes } from '../probes-node.js';
 
 /** A v2 model: one local runner host, one ssh verifier, two tools, two seats. */
 function sampleModel(overrides?: {
@@ -198,7 +199,7 @@ describe('runDoctor', () => {
     expect(doctorExitCode(lines)).toBe(1);
   });
 
-  it('reports UNKNOWN for an unparsable tool version', async () => {
+  it('reports UNKNOWN for an unparsable tool version on every host', async () => {
     const model = sampleModel({ tools: ['opencode'] });
     const { probes } = fakeProbes({ toolVersion: async () => undefined });
     const lines = await collect(loadedResult(model), probes);
@@ -206,12 +207,70 @@ describe('runDoctor', () => {
     expect(lines).toContainEqual(
       expect.objectContaining({
         scope: 'tool',
-        subject: 'opencode',
+        subject: 'main/opencode',
         check: 'version',
         status: 'UNKNOWN',
         detail: 'version absent or unparsable',
       }),
     );
+    expect(lines).toContainEqual(
+      expect.objectContaining({
+        scope: 'tool',
+        subject: 'verifier-host/opencode',
+        status: 'UNKNOWN',
+      }),
+    );
+  });
+
+  it('probes tool versions on every host, the ssh host through the ssh wrapper argv', async () => {
+    const model = sampleModel({ tools: ['claude-code'] });
+    const sshArgvs: Array<readonly string[]> = [];
+    const probes = createNodeDoctorProbes({
+      localExecutor: {
+        async run() {
+          return { exitCode: 0, signal: null, stdout: 'claude 9.9.9\n', stderr: '' };
+        },
+      },
+      sshExecutor: {
+        async run(argv) {
+          sshArgvs.push(argv);
+          return { exitCode: 0, signal: null, stdout: 'claude 1.2.3\n', stderr: '' };
+        },
+      },
+    });
+    const lines = await collect(loadedResult(model), probes);
+
+    // One version line per host; each subject names the host and the tool.
+    expect(lines).toContainEqual(
+      expect.objectContaining({
+        scope: 'tool',
+        subject: 'main/claude-code',
+        check: 'version',
+        status: 'PASS',
+        detail: 'version claude 9.9.9',
+      }),
+    );
+    expect(lines).toContainEqual(
+      expect.objectContaining({
+        scope: 'tool',
+        subject: 'verifier-host/claude-code',
+        check: 'version',
+        status: 'PASS',
+        detail: 'version claude 1.2.3',
+      }),
+    );
+    // The ssh host's version probe travels through the BatchMode wrapper.
+    expect(sshArgvs).toContainEqual([
+      'ssh',
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'ConnectTimeout=10',
+      'verifier-host',
+      '--',
+      'claude',
+      '--version',
+    ]);
   });
 
   it('reports PASS for a declared runner and UNKNOWN for legacy-asserted and undeclared', async () => {

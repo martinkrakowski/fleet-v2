@@ -155,6 +155,20 @@ describe('createNodeDoctorProbes', () => {
     await expect(badProbes.fileMode('local', '/x')).resolves.toBeUndefined();
   });
 
+  it('falls back to the BSD `stat -f %Lp` form when GNU `stat -c %a` fails', async () => {
+    const local = fakeExecutor(({ argv }) =>
+      argv[1] === '-c'
+        ? { exitCode: 1, signal: null, stdout: '', stderr: 'usage: stat [-FLnqxs] file' }
+        : { exitCode: 0, signal: null, stdout: '600\n', stderr: '' },
+    );
+    const probes = createNodeDoctorProbes({ localExecutor: local.executor });
+    await expect(probes.fileMode('local', '/secrets/auth.json')).resolves.toBe(0o600);
+    expect(local.calls.map((call) => call.argv)).toEqual([
+      ['stat', '-c', '%a', '/secrets/auth.json'],
+      ['stat', '-f', '%Lp', '/secrets/auth.json'],
+    ]);
+  });
+
   it('tests worktree root writability with `test -w`', async () => {
     const local = fakeExecutor({});
     const probes = createNodeDoctorProbes({
@@ -186,6 +200,28 @@ describe('createNodeDoctorProbes', () => {
       sha256: hash,
     });
     expect(local.calls[0]?.argv).toEqual(['sha256sum', binaryPath]);
+  });
+
+  it('falls back to `shasum -a 256` when sha256sum is missing', async () => {
+    const repoRoot = mkdtempSync(join(tmpdir(), 'doctor-probes-'));
+    const binaryPath = join(repoRoot, 'bin', 'ocm-run');
+    mkdirSync(join(repoRoot, 'bin'), { recursive: true });
+    writeFileSync(binaryPath, '#!/bin/sh\n');
+    const hash = '6'.repeat(64);
+    const local = fakeExecutor(({ argv }) =>
+      argv[0] === 'sha256sum'
+        ? { exitCode: null, signal: null, stdout: '', stderr: '', error: 'spawn ENOENT' }
+        : { exitCode: 0, signal: null, stdout: `${hash}  ${binaryPath}\n`, stderr: '' },
+    );
+    const probes = createNodeDoctorProbes({ localExecutor: local.executor, repoRoot });
+    await expect(probes.ocmRunBinary()).resolves.toEqual({
+      path: binaryPath,
+      sha256: hash,
+    });
+    expect(local.calls.map((call) => call.argv)).toEqual([
+      ['sha256sum', binaryPath],
+      ['shasum', '-a', '256', binaryPath],
+    ]);
   });
 
   it('returns undefined when the bundled binary or a well-formed hash is missing', async () => {

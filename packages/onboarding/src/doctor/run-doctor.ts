@@ -215,27 +215,34 @@ async function hostLines(
   return lines;
 }
 
-/** Per configured tool: its version, or UNKNOWN when absent or unparsable. */
+/**
+ * Per configured tool on every host in the installation: its version, probed
+ * through the same host mapping the other host checks use, or UNKNOWN when
+ * absent or unparsable. Each line's subject names the host and the tool.
+ */
 async function toolLines(
   model: FleetInstallationModel,
   probes: DoctorProbes,
 ): Promise<DoctorLine[]> {
   const lines: DoctorLine[] = [];
-  for (const toolId of model.tools ?? []) {
-    const version = await safely(() =>
-      probes.toolVersion('local', toolId as ToolId),
-    );
-    lines.push(
-      line(
-        'tool',
-        toolId,
-        'version',
-        version === undefined ? 'UNKNOWN' : 'PASS',
-        version === undefined
-          ? 'version absent or unparsable'
-          : `version ${version}`,
-      ),
-    );
+  for (const [name, host] of Object.entries(model.hosts)) {
+    const probeHost = probeHostOf(name, host);
+    for (const toolId of model.tools ?? []) {
+      const version = await safely(() =>
+        probes.toolVersion(probeHost, toolId as ToolId),
+      );
+      lines.push(
+        line(
+          'tool',
+          `${name}/${toolId}`,
+          'version',
+          version === undefined ? 'UNKNOWN' : 'PASS',
+          version === undefined
+            ? 'version absent or unparsable'
+            : `version ${version}`,
+        ),
+      );
+    }
   }
   return lines;
 }

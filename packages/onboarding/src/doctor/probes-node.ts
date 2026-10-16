@@ -300,7 +300,12 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
     },
 
     async fileMode(host, path) {
-      const result = await runOnHost(executors, host, ['stat', '-c', '%a', path]);
+      // GNU stat answers `-c %a`; the BSD/macOS stat rejects `-c` and answers
+      // `%Lp`, so a failed GNU probe falls back to the BSD form.
+      let result = await runOnHost(executors, host, ['stat', '-c', '%a', path]);
+      if (!succeeded(result)) {
+        result = await runOnHost(executors, host, ['stat', '-f', '%Lp', path]);
+      }
       if (!succeeded(result)) {
         return undefined;
       }
@@ -324,9 +329,16 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
       if (!existsSync(path)) {
         return undefined;
       }
-      const result = await localExecutor.run(['sha256sum', path], {
+      // GNU coreutils `sha256sum` first; when it is missing (macOS/BSD ships
+      // `shasum` instead) the same file is hashed with `shasum -a 256`.
+      let result = await localExecutor.run(['sha256sum', path], {
         timeoutMs,
       });
+      if (!succeeded(result)) {
+        result = await localExecutor.run(['shasum', '-a', '256', path], {
+          timeoutMs,
+        });
+      }
       if (!succeeded(result)) {
         return undefined;
       }

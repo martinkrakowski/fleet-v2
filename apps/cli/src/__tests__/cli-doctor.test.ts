@@ -1,37 +1,42 @@
 /**
  * `fleet-v2 doctor` against a fake installation and fake probes: output
  * shape (one line per doctor check, JSON documents with --json) and the
- * doctor exit-code contract (0 all PASS, 1 any FAIL/UNKNOWN, 2 usage).
+ * doctor exit-code contract (0 all PASS, 1 any FAIL/UNKNOWN and also a
+ * missing or invalid installation, 2 usage).
  */
 
 import { describe, expect, it } from 'vitest';
 
+import type { FleetInstallationModel } from '@fleet/installation';
 import type { DoctorLine, DoctorProbes } from '@fleet/onboarding';
 
 import { runCli, type CliIo, type DoctorCliOptions } from '../index.js';
 
-const LOAD_RESULT = {
-  status: 'absent',
-  installation: { schemaVersion: 2 },
-  model: {
-    schemaVersion: 2,
-    hosts: {
-      local: {
-        transport: 'local',
-        worktreeRoot: '/worktrees',
-        roles: ['orchestrator', 'lane-runner'],
-      },
+const MODEL = {
+  schemaVersion: 2,
+  hosts: {
+    local: {
+      transport: 'local',
+      worktreeRoot: '/worktrees',
+      roles: ['orchestrator', 'lane-runner'],
     },
-    tools: ['claude-code'],
-    seats: [
-      {
-        id: 'seat-1',
-        tool: 'claude-code',
-        model: 'glm-5.3',
-        roles: ['implementer'],
-      },
-    ],
   },
+  tools: ['claude-code'],
+  seats: [
+    {
+      id: 'seat-1',
+      tool: 'claude-code',
+      model: 'glm-5.3',
+      roles: ['implementer'],
+    },
+  ],
+} as FleetInstallationModel;
+
+const LOAD_RESULT = {
+  status: 'loaded',
+  file: '/installation/fleet.json',
+  installation: { schemaVersion: 2 },
+  model: MODEL,
   warnings: [],
 } as NonNullable<DoctorCliOptions['loadResult']>;
 
@@ -69,6 +74,14 @@ function captureIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
 }
 
 const doctorOptions = (probes: DoctorProbes) => ({ loadResult: LOAD_RESULT, probes });
+
+/** A missing installation: the loader's `absent` status with its minimal model. */
+const ABSENT_LOAD_RESULT = {
+  status: 'absent',
+  installation: { schemaVersion: 1 },
+  model: MODEL,
+  warnings: [],
+} as NonNullable<DoctorCliOptions['loadResult']>;
 
 describe('fleet-v2 doctor', () => {
   it('exits 0 and prints one line per check when everything passes', async () => {
@@ -152,5 +165,34 @@ describe('fleet-v2 doctor', () => {
     );
     expect(code).toBe(2);
     expect(stderr.join('')).toContain('--wat');
+  });
+
+  it('refuses a missing installation with exit 1, not 2', async () => {
+    const { io, stderr } = captureIo();
+    const code = await runCli(['doctor'], io, undefined, {
+      loadResult: ABSENT_LOAD_RESULT,
+    });
+    expect(code).toBe(1);
+    expect(stderr.join('')).toContain('missing');
+  });
+
+  it('refuses an invalid installation with exit 1, not 2', async () => {
+    const { io, stderr } = captureIo();
+    const code = await runCli(['doctor'], io, undefined, {
+      loadResult: {
+        status: 'invalid',
+        file: '/installation/fleet.json',
+        errors: ['/installation/fleet.json: invalid JSON'],
+      },
+    });
+    expect(code).toBe(1);
+    expect(stderr.join('')).toContain('invalid');
+  });
+
+  it('documents that seat probes run from the operator machine', async () => {
+    const { io, stdout } = captureIo();
+    const code = await runCli(['doctor', '--help'], io);
+    expect(code).toBe(0);
+    expect(stdout.join('')).toContain("operator's machine");
   });
 });

@@ -213,4 +213,58 @@ describe('Fleet CLI composition root cross-process safe persistence', () => {
       expectedHeadSha: 'commit-b',
     });
   });
+
+  it('throws and leaves corrupt accepted-receipts.json unchanged on write attempt', async () => {
+    const runtime = createFleetCliRuntime({ stateDir: tempDir });
+    const receiptsPath = path.join(tempDir, 'accepted-receipts.json');
+    const corruptContent = 'CORRUPT_NOT_JSON_{{';
+    await fs.writeFile(receiptsPath, corruptContent, 'utf8');
+
+    const assessment: EvidenceAssessmentRecord = {
+      id: assessmentIdForAttempt('attempt-corrupt'),
+      projectId: 'project-1',
+      attemptId: 'attempt-corrupt',
+      candidateHeadSha: 'head-sha-corrupt',
+      policyRevision: 'policy-v1',
+      state: 'pending',
+      revision: 1,
+      requiredChecks: [],
+      verificationReceipts: [],
+      reviewReceipts: [
+        {
+          id: 'rev-corrupt',
+          assessmentId: assessmentIdForAttempt('attempt-corrupt'),
+          projectId: 'project-1',
+          attemptId: 'attempt-corrupt',
+          candidateHeadSha: 'head-sha-corrupt',
+          reviewerModel: 'openrouter/anthropic/claude-3.5-sonnet',
+          implementerModel: 'openrouter/openai/gpt-4o',
+          readOnlyVerified: true,
+          result: 'pass',
+          findings: [],
+          evidenceRef: 'evidence-ref-corrupt',
+          policyRevision: 'policy-v1',
+          completedAtIso: '2026-10-15T10:00:00.000Z',
+        },
+      ],
+      findingDispositions: [],
+      acceptanceReceiptId: null,
+      blockers: [],
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+
+    await runtime.evidence.evidenceAssessmentRepository.saveAssessment(assessment);
+
+    await expect(
+      runtime.execution.acceptanceAssessment.assessHeadAcceptance({
+        attemptId: 'attempt-corrupt',
+        workOrderId: 'wo-corrupt',
+        candidateHeadSha: 'head-sha-corrupt',
+        policyRevision: 'policy-v1',
+      }),
+    ).rejects.toThrow();
+
+    const contentAfter = await fs.readFile(receiptsPath, 'utf8');
+    expect(contentAfter).toBe(corruptContent);
+  });
 });

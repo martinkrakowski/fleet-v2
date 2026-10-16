@@ -163,19 +163,4 @@ describe('apps/api runtime wiring', () => {
       }
     });
   });
-
-  it("throws and leaves corrupt accepted-receipts.json unchanged on write attempt", async () => {
-    const receiptsPath = path.join(tempDir, "accepted-receipts.json");
-    const corruptContent = "CORRUPT_NOT_JSON_{{";
-    await fs.writeFile(receiptsPath, corruptContent, "utf8");
-
-    await expect(
-      persistAcceptedReceiptsToState(tempDir, {
-        "head-commit-new": "receipt-id-new",
-      }),
-    ).rejects.toThrow();
-
-    const contentAfter = await fs.readFile(receiptsPath, "utf8");
-    expect(contentAfter).toBe(corruptContent);
-  });
 });

@@ -198,6 +198,19 @@ describe('JevRankingAdviceAdapter', () => {
     expect(adapter.lastReceipt?.costUsd).toBeCloseTo(0.000018102, 12);
   });
 
+  it('records costUsd as undefined when the response carries no usage cost', async () => {
+    const noCost = JSON.parse(JSON.stringify(FIXTURE_RESPONSE)) as {
+      usage: Record<string, unknown>;
+    };
+    noCost.usage = {};
+    const adapter = makeAdapter({ fetch: (async () => responseFor(noCost)) as typeof fetch });
+    const result = await adapter.adviseRanking(QUERY);
+    expect(result.status).toBe('advised');
+    expect(adapter.lastReceipt).not.toBeNull();
+    // undefined, never 0: the journal must keep the reservation's assumed cost.
+    expect(adapter.lastReceipt?.costUsd).toBeUndefined();
+  });
+
   it('clears lastReceipt after an unknown call that follows an advised call', async () => {
     let first = true;
     const flipFetch = (async () => {

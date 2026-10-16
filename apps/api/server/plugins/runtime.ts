@@ -7,8 +7,9 @@ import { configureFleetApiRuntime } from "../wiring/runtime";
 
 export function bootstrapFleetApiFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
   const stateDir = env.FLEET_STATE_DIR?.trim();
+  const ownerPublicKey = env.FLEET_OWNER_PUBLIC_KEY?.trim() || undefined;
   if (stateDir) {
-    configureFleetApiRuntime({ stateDir });
+    configureFleetApiRuntime({ stateDir, ownerPublicKey });
     return true;
   }
   return false;

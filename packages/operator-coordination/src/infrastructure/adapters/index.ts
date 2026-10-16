@@ -6,3 +6,4 @@ export * from "./DecisionTransportAdapter.adapter.js";
 export * from "./ObservationPublicationAdapter.adapter.js";
 export * from "./ProjectProfileRepositoryAdapter.adapter.js";
 export * from "./RelayTransportAdapter.adapter.js";
+export * from "./decision-signature.js";

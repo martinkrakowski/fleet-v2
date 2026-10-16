@@ -26,6 +26,7 @@ import {
 export interface FleetApiRuntimeOptions {
   /** Shared persistence directory for every context's file-backed adapters. */
   readonly stateDir?: string;
+  readonly ownerPublicKey?: string;
 }
 
 /**
@@ -155,7 +156,8 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   }
 
   const stateDir = options?.stateDir;
-  const operator = createConfiguredOperatorComposition({ stateDir });
+  const ownerPublicKey = options?.ownerPublicKey;
+  const operator = createConfiguredOperatorComposition({ stateDir, ownerPublicKey });
   const knowledge = createConfiguredKnowledgeComposition({ stateDir });
   const evidence = createConfiguredEvidenceUseCases({ stateDir });
 

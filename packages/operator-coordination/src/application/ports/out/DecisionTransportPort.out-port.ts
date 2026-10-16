@@ -12,9 +12,17 @@ export interface DecisionAnswer {
   readonly state: DecisionState;
   readonly decisionRevision: string | null;
   readonly grantId: string | null;
+  readonly signature?: string | null;
+}
+
+export interface DecisionAnswerQuery {
+  readonly requestId: string;
+  readonly projectId: string;
+  readonly actionScope: string;
+  readonly expectedHeadSha: string | null;
 }
 
 export interface DecisionTransportPort {
   /** Verified answer only; absence and ambiguity are returned, not invented. */
-  readDecisionAnswer(requestId: string): Promise<DecisionAnswer>;
+  readDecisionAnswer(query: DecisionAnswerQuery): Promise<DecisionAnswer>;
 }

@@ -111,6 +111,8 @@ export interface FleetCliRuntimeOptions {
   readonly runnerRemoteHost?: string;
   /** SSH host alias holding the worktree when it is not on this host. */
   readonly worktreeSshHost?: string;
+  /** Owner Ed25519 public key in base64 format for verifying approved decisions. */
+  readonly ownerPublicKey?: string;
 }
 
 /** Deterministic identity of the acceptance assessment bound to one attempt. */
@@ -361,6 +363,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const ocmRunBin = options?.ocmRunBin ?? (process.env.FLEET_OCM_RUN_BIN?.trim() || undefined);
   const runnerRemoteHost =
     options?.runnerRemoteHost ?? (process.env.OCM_HOST?.trim() || undefined);
+  const ownerPublicKey =
+    options?.ownerPublicKey ?? (process.env.FLEET_OWNER_PUBLIC_KEY?.trim() || undefined);
 
   // --- operator-coordination -------------------------------------------------
 
@@ -370,6 +374,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // absent or grantless answer stays `awaiting-decision`; nothing is upgraded.
   const decisionTransport = new DecisionTransportAdapter({
     decisionsDir: stateDir === undefined ? undefined : join(stateDir, 'decisions'),
+    ownerPublicKey,
   });
   const observationPublication = new ObservationPublicationAdapter({
     outboxDir: stateDir === undefined ? undefined : join(stateDir, 'observation-outbox'),

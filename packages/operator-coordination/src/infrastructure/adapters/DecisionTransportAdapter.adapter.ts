@@ -4,10 +4,12 @@
  * decision file.
  *
  * An answer is read from an injected map or from `<decisionsDir>/<id>.json`.
- * Only a recognised state with a recorded grant is treated as an approval; an
+ * Only an approved answer carrying a valid Ed25519 signature from the configured
+ * owner public key is treated as an approval; an unsigned, invalidly signed,
  * absent, unreadable, malformed or grantless answer is reported as
- * `awaiting-decision` and is never upgraded to approval. No credential or token
- * is read or surfaced through this adapter.
+ * `awaiting-decision` and is never upgraded to approval. Declined and awaiting
+ * states require no signature. No credential or token is read or surfaced
+ * through this adapter.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -15,9 +17,11 @@ import { join } from 'node:path';
 
 import type {
   DecisionAnswer,
+  DecisionAnswerQuery,
   DecisionState,
   DecisionTransportPort,
 } from '../../application/ports/out/DecisionTransportPort.out-port.js';
+import { verifyDecisionSignature } from './decision-signature.js';
 
 export interface DecisionTransportAdapterOptions {
   /** Directory of owner-recorded decision answers, one file per request. */
@@ -25,6 +29,8 @@ export interface DecisionTransportAdapterOptions {
   /** Answers recorded in process, taking precedence over files. */
   readonly answers?: Readonly<Record<string, DecisionAnswer>>;
   readonly fileExtension?: string;
+  /** Owner Ed25519 public key in base64 format for verifying approved decisions. */
+  readonly ownerPublicKey?: string;
 }
 
 const DEFAULT_FILE_EXTENSION = '.json';
@@ -41,10 +47,11 @@ const AWAITING: DecisionAnswer = {
 export class DecisionTransportAdapter implements DecisionTransportPort {
   constructor(private readonly options: DecisionTransportAdapterOptions = {}) {}
 
-  async readDecisionAnswer(requestId: string): Promise<DecisionAnswer> {
+  async readDecisionAnswer(query: DecisionAnswerQuery): Promise<DecisionAnswer> {
+    const { requestId } = query;
     const injected = this.options.answers?.[requestId];
     if (injected !== undefined) {
-      return normalizeAnswer(injected);
+      return normalizeAnswer(injected, query, this.options.ownerPublicKey);
     }
     const path = this.decisionPath(requestId);
     if (path === null) {
@@ -63,7 +70,7 @@ export class DecisionTransportAdapter implements DecisionTransportPort {
     } catch {
       return { ...AWAITING };
     }
-    return normalizeAnswer(parsed);
+    return normalizeAnswer(parsed, query, this.options.ownerPublicKey);
   }
 
   private decisionPath(requestId: string): string | null {
@@ -79,11 +86,15 @@ export class DecisionTransportAdapter implements DecisionTransportPort {
 }
 
 /** Only a recognised state with a recorded grant is an answer; the rest awaits. */
-function normalizeAnswer(candidate: unknown): DecisionAnswer {
+function normalizeAnswer(
+  candidate: unknown,
+  query: DecisionAnswerQuery,
+  ownerPublicKey?: string,
+): DecisionAnswer {
   if (typeof candidate !== 'object' || candidate === null) {
     return { ...AWAITING };
   }
-  const answer = candidate as Partial<DecisionAnswer>;
+  const answer = candidate as Partial<DecisionAnswer> & { signature?: unknown };
   if (typeof answer.state !== 'string' || !DECISION_STATES.includes(answer.state)) {
     return { ...AWAITING };
   }
@@ -102,6 +113,32 @@ function normalizeAnswer(candidate: unknown): DecisionAnswer {
   }
   if (state === 'declined') {
     return { state, decisionRevision, grantId: null };
+  }
+  if (state === 'approved') {
+    if (
+      ownerPublicKey === undefined ||
+      ownerPublicKey.trim().length === 0 ||
+      typeof answer.signature !== 'string' ||
+      answer.signature.trim().length === 0
+    ) {
+      return { ...AWAITING };
+    }
+    const verified = verifyDecisionSignature(
+      {
+        requestId: query.requestId,
+        projectId: query.projectId,
+        actionScope: query.actionScope,
+        expectedHeadSha: query.expectedHeadSha,
+        decisionRevision,
+        grantId,
+        state,
+      },
+      answer.signature.trim(),
+      ownerPublicKey.trim(),
+    );
+    if (!verified) {
+      return { ...AWAITING };
+    }
   }
   return { state, decisionRevision, grantId };
 }

@@ -144,7 +144,12 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (decisionTransport === undefined || record.state !== 'awaiting-decision') {
       return record;
     }
-    const answer = await decisionTransport.readDecisionAnswer(record.id);
+    const answer = await decisionTransport.readDecisionAnswer({
+      requestId: record.id,
+      projectId: record.projectId,
+      actionScope: record.actionScope,
+      expectedHeadSha: record.expectedHeadSha,
+    });
     if (answer.state === 'awaiting-decision' || answer.state === 'declined') {
       return record;
     }

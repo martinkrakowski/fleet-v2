@@ -51,8 +51,7 @@ describe('ProjectProfileRepositoryAdapter cross-process safe persistence', () =>
       updatedAtIso: '2026-10-15T10:01:00.000Z',
     };
 
-    await adapterA.saveProfile(profile1);
-    await adapterB.saveProfile(profile2);
+    await Promise.all([adapterA.saveProfile(profile1), adapterB.saveProfile(profile2)]);
 
     const found1FromA = await adapterA.findProfileById('proj-1');
     const found2FromA = await adapterA.findProfileById('proj-2');
@@ -63,5 +62,32 @@ describe('ProjectProfileRepositoryAdapter cross-process safe persistence', () =>
     expect(found2FromA?.projectId).toBe('proj-2');
     expect(found1FromB?.projectId).toBe('proj-1');
     expect(found2FromB?.projectId).toBe('proj-2');
+  });
+
+  it('throws and preserves file content when saving to a corrupt file', async () => {
+    const filePath = path.join(tempDir, 'project-profiles.json');
+    const corruptContent = '{ not valid json';
+    await fs.writeFile(filePath, corruptContent, 'utf8');
+
+    const adapter = new ProjectProfileRepositoryAdapter({ stateDir: tempDir });
+    const profile: ProjectProfileRecord = {
+      projectId: 'proj-corrupt',
+      displayName: 'Project Corrupt',
+      repository: 'org/repo-corrupt',
+      designatedDispatcherHost: 'host-1',
+      policyRevision: 'pol-1',
+      maxConcurrentLanes: 2,
+      runnerCapabilities: {
+        filesystemScope: 'scoped-worktree',
+        networkEgressRestricted: true,
+      },
+      revision: 1,
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+
+    await expect(adapter.saveProfile(profile)).rejects.toThrow();
+
+    const contentAfter = await fs.readFile(filePath, 'utf8');
+    expect(contentAfter).toBe(corruptContent);
   });
 });

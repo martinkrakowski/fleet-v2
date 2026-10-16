@@ -134,14 +134,11 @@ export class EvidenceAssessmentRepositoryAdapter implements EvidenceAssessmentRe
       }
       throw error;
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return map;
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      throw new Error(`EvidenceAssessmentRepositoryAdapter expects a record list in ${stateFilePath}`);
     }
-    const records = Array.isArray(parsed) ? parsed : [];
-    for (const record of records) {
+    for (const record of parsed) {
       if (isAssessmentRecord(record)) {
         map.set(record.id, copyRecord(record));
       }

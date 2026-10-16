@@ -167,16 +167,12 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       }
       throw error;
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return entries;
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      throw new Error(`ExecutionJournalAdapter expects a record list in ${target}`);
     }
-    if (Array.isArray(parsed)) {
-      for (const item of parsed) {
-        if (isActionJournalEntryRecord(item)) entries.push(item);
-      }
+    for (const item of parsed) {
+      if (isActionJournalEntryRecord(item)) entries.push(item);
     }
     return entries;
   }
@@ -196,16 +192,12 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       }
       throw error;
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return map;
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      throw new Error(`ExecutionJournalAdapter expects a record list in ${target}`);
     }
-    if (Array.isArray(parsed)) {
-      for (const item of parsed) {
-        if (isCapacityReservationRecord(item)) map.set(item.id, item);
-      }
+    for (const item of parsed) {
+      if (isCapacityReservationRecord(item)) map.set(item.id, item);
     }
     return map;
   }

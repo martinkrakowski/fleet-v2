@@ -78,4 +78,96 @@ describe('withFileLock', () => {
     // Lock file must be unlinked in finally
     await expect(fs.access(lockPath)).rejects.toThrow();
   });
+
+  it('handles two contenders on a stale lock with Promise.all so exactly one is inside fn at a time', async () => {
+    const lockPath = path.join(tempDir, 'stale-contenders.lock');
+
+    // Create a stale lock file written 70 seconds ago
+    const staleToken = `99999-0123456789abcdef-${Date.now() - 70_000}`;
+    await fs.writeFile(lockPath, staleToken, 'utf8');
+    const past = (Date.now() - 70_000) / 1000;
+    await fs.utimes(lockPath, past, past);
+
+    let activeCount = 0;
+    let maxActiveCount = 0;
+
+    const contender = async () => {
+      return withFileLock(lockPath, async () => {
+        activeCount += 1;
+        maxActiveCount = Math.max(maxActiveCount, activeCount);
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        activeCount -= 1;
+        return true;
+      });
+    };
+
+    const results = await Promise.all([contender(), contender()]);
+    expect(results).toEqual([true, true]);
+    expect(maxActiveCount).toBe(1);
+    expect(activeCount).toBe(0);
+    await expect(fs.access(lockPath)).rejects.toThrow();
+  });
+
+  it('does not delete the new holder lock when an old holder whose lock was taken over releases', async () => {
+    const lockPath = path.join(tempDir, 'takeover-release.lock');
+
+    let releaseHolderA: () => void = () => {};
+    const pauseHolderA = new Promise<void>((resolve) => {
+      releaseHolderA = resolve;
+    });
+
+    let holderAStarted: () => void = () => {};
+    const waitForHolderA = new Promise<void>((resolve) => {
+      holderAStarted = resolve;
+    });
+
+    const promiseA = withFileLock(lockPath, async () => {
+      holderAStarted();
+      await pauseHolderA;
+    });
+
+    await waitForHolderA;
+    const tokenA = await fs.readFile(lockPath, 'utf8');
+
+    // Make the lock stale so holder B can take it over
+    const staleTokenA = `${tokenA.slice(0, tokenA.lastIndexOf('-'))}-${Date.now() - 70_000}`;
+    await fs.writeFile(lockPath, staleTokenA, 'utf8');
+    const past = (Date.now() - 70_000) / 1000;
+    await fs.utimes(lockPath, past, past);
+
+    let holderBStarted: () => void = () => {};
+    const waitForHolderB = new Promise<void>((resolve) => {
+      holderBStarted = resolve;
+    });
+
+    let releaseHolderB: () => void = () => {};
+    const pauseHolderB = new Promise<void>((resolve) => {
+      releaseHolderB = resolve;
+    });
+
+    const promiseB = withFileLock(lockPath, async () => {
+      holderBStarted();
+      await pauseHolderB;
+    });
+
+    await waitForHolderB;
+    const tokenB = await fs.readFile(lockPath, 'utf8');
+    expect(tokenB).not.toBe(tokenA);
+    expect(tokenB).not.toBe(staleTokenA);
+
+    // Holder A completes its fn and executes finally
+    releaseHolderA();
+    await promiseA;
+
+    // Holder A must NOT have deleted Holder B's lock!
+    const lockAfterARelease = await fs.readFile(lockPath, 'utf8');
+    expect(lockAfterARelease).toBe(tokenB);
+
+    // Holder B completes its fn and releases its lock
+    releaseHolderB();
+    await promiseB;
+
+    // Lock file is unlinked by Holder B
+    await expect(fs.access(lockPath)).rejects.toThrow();
+  });
 });

@@ -1,17 +1,40 @@
+import { randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 
 export interface FileLockOptions {
   /** Maximum wait time in milliseconds before timing out. Defaults to 10000ms. */
   readonly timeoutMs?: number;
+  /** Stale lock threshold in milliseconds. Defaults to 60000ms. */
+  readonly staleThresholdMs?: number;
 }
 
 let tempFileCounter = 0;
 
+function parseLockTime(raw: string): number | null {
+  try {
+    const data = JSON.parse(raw) as { time?: unknown };
+    if (typeof data?.time === "number") {
+      return data.time;
+    }
+  } catch {
+    // Not JSON
+  }
+  const parts = raw.trim().split(/[-:]/);
+  if (parts.length >= 3) {
+    const num = Number(parts[parts.length - 1]);
+    if (Number.isFinite(num) && num > 0) {
+      return num;
+    }
+  }
+  return null;
+}
+
 /**
  * Acquire an exclusive lock on `lockPath` using `fs.open(path, 'wx')` holding
- * pid and time. Stale locks (>60s) are removed and retried once. The lock is
- * released in `finally`.
+ * a unique acquisition token (pid + random 16 hex + time). Stale locks (>60s)
+ * are safely taken over via atomic rename. The lock is released in `finally`
+ * only if the lock file still contains this acquisition's token.
  */
 export async function withFileLock<T>(
   lockPath: string,
@@ -20,19 +43,17 @@ export async function withFileLock<T>(
 ): Promise<T> {
   const timeoutMs = options?.timeoutMs ?? 10_000;
   const pollIntervalMs = 25;
-  const staleThresholdMs = 60_000;
+  const staleThresholdMs = options?.staleThresholdMs ?? 60_000;
   const startTime = Date.now();
+  const token = `${process.pid}-${randomBytes(8).toString("hex")}-${Date.now()}`;
 
   await fs.mkdir(path.dirname(lockPath), { recursive: true });
-
-  let staleRetried = false;
 
   while (true) {
     let handle: fs.FileHandle | null = null;
     try {
       handle = await fs.open(lockPath, "wx");
-      const payload = JSON.stringify({ pid: process.pid, time: Date.now() });
-      await handle.writeFile(payload, "utf8");
+      await handle.writeFile(token, "utf8");
       await handle.close();
       handle = null;
       break;
@@ -60,33 +81,48 @@ export async function withFileLock<T>(
         throw error;
       }
 
-      if (!staleRetried) {
-        let isStale = false;
+      let isStale = false;
+      try {
+        const stat = await fs.stat(lockPath);
+        let lockTime = stat.mtimeMs;
         try {
-          const stat = await fs.stat(lockPath);
-          let lockTime = stat.mtimeMs;
-          try {
-            const raw = await fs.readFile(lockPath, "utf8");
-            const data = JSON.parse(raw) as { time?: unknown };
-            if (typeof data?.time === "number") {
-              lockTime = data.time;
-            }
-          } catch {
-            // fallback to stat.mtimeMs
-          }
-          if (Date.now() - lockTime > staleThresholdMs) {
-            isStale = true;
+          const raw = await fs.readFile(lockPath, "utf8");
+          const parsed = parseLockTime(raw);
+          if (parsed !== null) {
+            lockTime = parsed;
           }
         } catch {
-          // File might have been unlinked concurrently
+          // fallback to stat.mtimeMs
+        }
+        if (Date.now() - lockTime > staleThresholdMs) {
+          isStale = true;
+        }
+      } catch {
+        // File might have been unlinked concurrently
+      }
+
+      if (isStale) {
+        const staleFile = `${lockPath}.stale.${token}`;
+        let renamed = false;
+        try {
+          await fs.rename(lockPath, staleFile);
+          renamed = true;
+        } catch (renameError: unknown) {
+          const isEnoent =
+            typeof renameError === "object" &&
+            renameError !== null &&
+            (renameError as { code?: string }).code === "ENOENT";
+          if (!isEnoent) {
+            throw renameError;
+          }
+          // Failed rename (ENOENT) means someone else took over: go back to waiting.
         }
 
-        if (isStale) {
-          staleRetried = true;
+        if (renamed) {
           try {
-            await fs.unlink(lockPath);
+            await fs.unlink(staleFile);
           } catch {
-            // ignore if already deleted
+            // ignore
           }
           continue;
         }
@@ -106,7 +142,10 @@ export async function withFileLock<T>(
     return await fn();
   } finally {
     try {
-      await fs.unlink(lockPath);
+      const current = await fs.readFile(lockPath, "utf8");
+      if (current.trim() === token.trim()) {
+        await fs.unlink(lockPath);
+      }
     } catch {
       // ignore
     }

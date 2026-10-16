@@ -49,8 +49,7 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
     };
 
     // Both instances append different entries
-    await adapterA.appendJournalEntry(entry1);
-    await adapterB.appendJournalEntry(entry2);
+    await Promise.all([adapterA.appendJournalEntry(entry1), adapterB.appendJournalEntry(entry2)]);
 
     // Both entries must survive
     const entriesFromA = await adapterA.listJournalEntriesForAttempt('att-1');
@@ -89,8 +88,7 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
       releasedAtIso: null,
     };
 
-    await adapterA.saveCapacityReservation(res1);
-    await adapterB.saveCapacityReservation(res2);
+    await Promise.all([adapterA.saveCapacityReservation(res1), adapterB.saveCapacityReservation(res2)]);
 
     const activeA = await adapterA.listActiveReservations();
     const activeB = await adapterB.listActiveReservations();
@@ -104,5 +102,51 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
 
     const activeAfterRelease = await adapterB.listActiveReservations();
     expect(activeAfterRelease.map((r) => r.id)).toEqual(['res-2']);
+  });
+
+  it('throws and preserves file content when appending to a corrupt journal file', async () => {
+    const filePath = path.join(tempDir, 'journal.json');
+    const corruptContent = '{ corrupt journal';
+    await fs.writeFile(filePath, corruptContent, 'utf8');
+
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    const entry: ActionJournalEntryRecord = {
+      id: 'entry-corrupt',
+      attemptId: 'att-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'commit-1',
+      status: 'intent-recorded',
+      recordedAtIso: '2026-10-15T10:00:00.000Z',
+      sessionId: null,
+      detail: 'test entry',
+    };
+
+    await expect(adapter.appendJournalEntry(entry)).rejects.toThrow();
+
+    const contentAfter = await fs.readFile(filePath, 'utf8');
+    expect(contentAfter).toBe(corruptContent);
+  });
+
+  it('throws and preserves file content when saving to a corrupt reservations file', async () => {
+    const filePath = path.join(tempDir, 'reservations.json');
+    const corruptContent = '{ corrupt reservations';
+    await fs.writeFile(filePath, corruptContent, 'utf8');
+
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    const res: CapacityReservationRecord = {
+      id: 'res-corrupt',
+      attemptId: 'att-1',
+      hostId: 'host-1',
+      slotIndex: 0,
+      held: true,
+      reservedAtIso: '2026-10-15T10:00:00.000Z',
+      releasedAtIso: null,
+    };
+
+    await expect(adapter.saveCapacityReservation(res)).rejects.toThrow();
+
+    const contentAfter = await fs.readFile(filePath, 'utf8');
+    expect(contentAfter).toBe(corruptContent);
   });
 });

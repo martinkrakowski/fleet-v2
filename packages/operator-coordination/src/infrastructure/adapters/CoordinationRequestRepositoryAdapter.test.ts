@@ -61,8 +61,7 @@ describe('CoordinationRequestRepositoryAdapter cross-process safe persistence', 
       updatedAtIso: '2026-10-15T10:01:00.000Z',
     };
 
-    await adapterA.saveRequest(req1);
-    await adapterB.saveRequest(req2);
+    await Promise.all([adapterA.saveRequest(req1), adapterB.saveRequest(req2)]);
 
     const found1FromA = await adapterA.findRequestById('req-1');
     const found2FromA = await adapterA.findRequestById('req-2');
@@ -79,5 +78,37 @@ describe('CoordinationRequestRepositoryAdapter cross-process safe persistence', 
 
     const allRequests = await adapterA.listRequests('proj-1');
     expect(allRequests.map((r) => r.id).sort()).toEqual(['req-1', 'req-2']);
+  });
+
+  it('throws and preserves file content when saving to a corrupt file', async () => {
+    const filePath = path.join(tempDir, 'coordination-requests.json');
+    const corruptContent = '{ not valid json';
+    await fs.writeFile(filePath, corruptContent, 'utf8');
+
+    const adapter = new CoordinationRequestRepositoryAdapter({ stateDir: tempDir });
+    const req: CoordinationRequestRecord = {
+      id: 'req-corrupt',
+      projectId: 'proj-1',
+      kind: 'action-decision',
+      actionScope: 'forge:push-and-open-pr',
+      expectedHeadSha: 'commit-1',
+      proposalDigest: 'prop-1',
+      policyRevision: 'pol-1',
+      decisionRevision: null,
+      grantId: 'grant-corrupt',
+      state: 'proposed',
+      deliveryStatus: 'pending',
+      deliveryGapReason: null,
+      revision: 1,
+      consumptions: [],
+      acknowledgements: [],
+      createdAtIso: '2026-10-15T10:00:00.000Z',
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+
+    await expect(adapter.saveRequest(req)).rejects.toThrow();
+
+    const contentAfter = await fs.readFile(filePath, 'utf8');
+    expect(contentAfter).toBe(corruptContent);
   });
 });

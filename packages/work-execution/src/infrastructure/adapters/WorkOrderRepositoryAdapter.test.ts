@@ -53,8 +53,7 @@ describe('WorkOrderRepositoryAdapter cross-process safe persistence', () => {
       updatedAtIso: '2026-10-15T10:01:00.000Z',
     };
 
-    await adapterA.saveWorkOrder(wo1);
-    await adapterB.saveWorkOrder(wo2);
+    await Promise.all([adapterA.saveWorkOrder(wo1), adapterB.saveWorkOrder(wo2)]);
 
     const found1FromA = await adapterA.findWorkOrderById('wo-1');
     const found2FromA = await adapterA.findWorkOrderById('wo-2');
@@ -99,5 +98,33 @@ describe('WorkOrderRepositoryAdapter cross-process safe persistence', () => {
     await expect(adapterA.saveWorkOrder({ ...wo1, revision: 1 })).rejects.toThrow(
       'Stale work order revision for wo-1: expected > 2, got 1',
     );
+  });
+
+  it('throws and preserves file content when saving to a corrupt file', async () => {
+    const filePath = path.join(tempDir, 'work-orders.json');
+    const corruptContent = '{ not valid json';
+    await fs.writeFile(filePath, corruptContent, 'utf8');
+
+    const adapter = new WorkOrderRepositoryAdapter({ stateDir: tempDir });
+    const wo: WorkOrderRecord = {
+      id: 'wo-corrupt',
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      laneId: 'lane-1',
+      repository: 'repo-1',
+      baseCommit: 'commit-1',
+      ownedPaths: ['src/a'],
+      policyRevision: 'pol-1',
+      prerequisiteWorkOrderIds: [],
+      state: 'approved',
+      revision: 1,
+      createdAtIso: '2026-10-15T10:00:00.000Z',
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+
+    await expect(adapter.saveWorkOrder(wo)).rejects.toThrow();
+
+    const contentAfter = await fs.readFile(filePath, 'utf8');
+    expect(contentAfter).toBe(corruptContent);
   });
 });

@@ -55,8 +55,7 @@ describe('EvidenceAssessmentRepositoryAdapter cross-process safe persistence', (
       updatedAtIso: '2026-10-15T10:01:00.000Z',
     };
 
-    await adapterA.saveAssessment(assessment1);
-    await adapterB.saveAssessment(assessment2);
+    await Promise.all([adapterA.saveAssessment(assessment1), adapterB.saveAssessment(assessment2)]);
 
     const found1FromA = await adapterA.findAssessmentById('assessment-1');
     const found2FromA = await adapterA.findAssessmentById('assessment-2');
@@ -104,5 +103,34 @@ describe('EvidenceAssessmentRepositoryAdapter cross-process safe persistence', (
     await expect(adapterA.saveAssessment({ ...assessment1, revision: 1 })).rejects.toThrow(
       'Optimistic concurrency conflict for assessment assessment-1: revision 1 does not advance stored revision 2',
     );
+  });
+
+  it('throws and preserves file content when saving to a corrupt file', async () => {
+    const filePath = path.join(tempDir, 'assessments.json');
+    const corruptContent = '{ not valid json';
+    await fs.writeFile(filePath, corruptContent, 'utf8');
+
+    const adapter = new EvidenceAssessmentRepositoryAdapter({ stateDir: tempDir });
+    const assessment: EvidenceAssessmentRecord = {
+      id: 'assessment-corrupt',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: 'head-sha-1',
+      policyRevision: 'pol-1',
+      requiredChecks: ['test'],
+      state: 'pending',
+      verificationReceipts: [],
+      reviewReceipts: [],
+      findingDispositions: [],
+      acceptanceReceiptId: null,
+      blockers: [],
+      revision: 1,
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+
+    await expect(adapter.saveAssessment(assessment)).rejects.toThrow();
+
+    const contentAfter = await fs.readFile(filePath, 'utf8');
+    expect(contentAfter).toBe(corruptContent);
   });
 });

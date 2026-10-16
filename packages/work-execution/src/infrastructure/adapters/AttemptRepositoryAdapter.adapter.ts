@@ -132,13 +132,10 @@ export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
       }
       throw error;
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return map;
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      throw new Error(`AttemptRepositoryAdapter expects a record list in ${target}`);
     }
-    if (!Array.isArray(parsed)) return map;
     for (const item of parsed) {
       if (isAttemptRecord(item)) map.set(item.id, item);
     }

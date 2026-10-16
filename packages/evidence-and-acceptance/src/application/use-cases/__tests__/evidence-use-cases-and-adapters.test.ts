@@ -490,7 +490,7 @@ describe('RequestIndependentReviewUseCase', () => {
 
   it('rejects a review that could not prove it stayed read-only', async () => {
     const useCase = new RequestIndependentReviewUseCase({
-      repo: fakeRepository(),
+      repo: fakeRepository([assessmentRecord({ requiredChecks: [] })]),
       reviewer: stubReviewer({ ...completedReview, readOnlyVerified: false }),
       archive: recordingArchive(),
     });
@@ -505,7 +505,7 @@ describe('RequestIndependentReviewUseCase', () => {
 
   it('rejects an unavailable reviewer seat', async () => {
     const useCase = new RequestIndependentReviewUseCase({
-      repo: fakeRepository(),
+      repo: fakeRepository([assessmentRecord({ requiredChecks: [] })]),
       reviewer: stubReviewer({ outcome: 'unavailable', reason: 'seat is busy' }),
       archive: recordingArchive(),
     });
@@ -546,17 +546,42 @@ describe('RequestIndependentReviewUseCase', () => {
     expect(stored?.state).toBe('blocked');
   });
 
-  it('returns the receipt without saving when no assessment exists yet', async () => {
+  it('rejects when no assessment exists yet', async () => {
     const repo = fakeRepository();
+    const reviewer = stubReviewer(completedReview);
     const useCase = new RequestIndependentReviewUseCase({
       repo,
-      reviewer: stubReviewer(completedReview),
+      reviewer,
       archive: recordingArchive(),
     });
 
     const result = await useCase.requestIndependentReview(requestReview() as never);
 
-    expect(result.outcome).toBe('reviewed');
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: "No assessment exists for assessmentId 'ea-1'",
+    });
+    expect(reviewer.calls).toHaveLength(0);
+    expect(repo.saved).toBe(0);
+  });
+
+  it('rejects when the assessment exists for another candidate head', async () => {
+    const repo = fakeRepository([assessmentRecord({ candidateHeadSha: OTHER_HEAD })]);
+    const reviewer = stubReviewer(completedReview);
+    const useCase = new RequestIndependentReviewUseCase({
+      repo,
+      reviewer,
+      archive: recordingArchive(),
+    });
+
+    const result = await useCase.requestIndependentReview(requestReview() as never);
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome !== 'rejected') {
+      throw new Error('expected a rejection');
+    }
+    expect(result.reason).toContain('exists for candidate head');
+    expect(reviewer.calls).toHaveLength(0);
     expect(repo.saved).toBe(0);
   });
 });

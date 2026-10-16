@@ -125,6 +125,33 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
 
     const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
 
+    if (assessment.state === 'stale') {
+      return { outcome: 'stale', reason: 'Assessment is stale and cannot be accepted' };
+    }
+    if (assessment.state === 'accepted') {
+      if (
+        assessment.candidateHeadSha === request.candidateHeadSha &&
+        assessment.policyRevision === request.policyRevision
+      ) {
+        return {
+          outcome: 'accepted',
+          receiptId: assessment.acceptanceReceiptId ?? '',
+          candidateHeadSha: assessment.candidateHeadSha,
+          assessment,
+        };
+      }
+      return {
+        outcome: 'rejected',
+        reason: `Assessment is already in terminal state '${assessment.state}'`,
+      };
+    }
+    if (assessment.state === 'rejected') {
+      return {
+        outcome: 'rejected',
+        reason: `Assessment is already in terminal state '${assessment.state}'`,
+      };
+    }
+
     // A changed head or policy revision invalidates the evidence collected so
     // far; it never carries over as acceptance.
     const policyChanged = assessment.policyRevision !== request.policyRevision;

@@ -1054,7 +1054,7 @@ describe('Fleet CLI workflow', () => {
     expect(review.code).toBe(1);
     expect(jsonOf(review)).toMatchObject({
       outcome: 'rejected',
-      reason: expect.stringContaining('No independent review transport is configured'),
+      reason: expect.stringContaining("in terminal state 'accepted'"),
     });
 
     // No finding was raised for this assessment, so there is nothing to

@@ -11,6 +11,7 @@ import type {
   VerificationReceiptRecord,
 } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
+import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { EvidenceArchivePort } from '../ports/out/EvidenceArchivePort.out-port.js';
 import type { VerificationExecutorPort } from '../ports/out/VerificationExecutorPort.out-port.js';
@@ -93,6 +94,38 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
 
     const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
     const existing = await deps.repo.findAssessmentById(request.assessmentId);
+    if (existing !== null) {
+      if (AssessmentState.create(existing.state).value?.isTerminal()) {
+        return {
+          outcome: 'rejected',
+          reason: `Assessment '${existing.id}' is in terminal state '${existing.state}'`,
+        };
+      }
+      if (existing.candidateHeadSha !== request.candidateHeadSha) {
+        return {
+          outcome: 'rejected',
+          reason: `Assessment candidate head '${existing.candidateHeadSha}' does not match requested head '${request.candidateHeadSha}'`,
+        };
+      }
+      if (existing.policyRevision !== request.policyRevision) {
+        return {
+          outcome: 'rejected',
+          reason: `Assessment policy revision '${existing.policyRevision}' does not match requested policy revision '${request.policyRevision}'`,
+        };
+      }
+      if (existing.attemptId !== request.attemptId) {
+        return {
+          outcome: 'rejected',
+          reason: `Assessment attempt ID '${existing.attemptId}' does not match requested attempt ID '${request.attemptId}'`,
+        };
+      }
+      if (existing.projectId !== request.projectId) {
+        return {
+          outcome: 'rejected',
+          reason: `Assessment project ID '${existing.projectId}' does not match requested project ID '${request.projectId}'`,
+        };
+      }
+    }
     const base: EvidenceAssessmentRecord = existing ?? {
       id: request.assessmentId,
       projectId: request.projectId,

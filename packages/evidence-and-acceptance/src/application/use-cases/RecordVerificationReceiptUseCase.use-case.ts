@@ -7,6 +7,7 @@
 
 import type { EvidenceAssessmentRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
+import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type {
   RecordVerificationReceiptPort,
@@ -62,6 +63,12 @@ export class RecordVerificationReceiptUseCase implements RecordVerificationRecei
     if (assessment === null) {
       return { outcome: 'rejected', reason: 'Assessment not found' };
     }
+    if (AssessmentState.create(assessment.state).value?.isTerminal()) {
+      return {
+        outcome: 'rejected',
+        reason: `Assessment '${assessment.id}' is in terminal state '${assessment.state}'`,
+      };
+    }
     if (receipt.candidateHeadSha !== assessment.candidateHeadSha) {
       return {
         outcome: 'rejected',
@@ -74,16 +81,28 @@ export class RecordVerificationReceiptUseCase implements RecordVerificationRecei
         reason: `Verification receipt was produced under policy revision ${receipt.policyRevision}, not the assessed ${assessment.policyRevision}`,
       };
     }
-    if (receipt.result === 'pending') {
+    if (receipt.attemptId !== assessment.attemptId) {
       return {
         outcome: 'rejected',
-        reason: 'A launched check is not a completed one: a pending result is not evidence',
+        reason: `Verification receipt belongs to attempt ${receipt.attemptId}, not the assessed attempt ${assessment.attemptId}`,
+      };
+    }
+    if (receipt.projectId !== assessment.projectId) {
+      return {
+        outcome: 'rejected',
+        reason: `Verification receipt belongs to project ${receipt.projectId}, not the assessed project ${assessment.projectId}`,
       };
     }
     if (receipt.assessmentId !== assessment.id) {
       return {
         outcome: 'rejected',
         reason: `Verification receipt belongs to assessment ${receipt.assessmentId}, not ${assessment.id}`,
+      };
+    }
+    if (receipt.result === 'pending') {
+      return {
+        outcome: 'rejected',
+        reason: 'A launched check is not a completed one: a pending result is not evidence',
       };
     }
 

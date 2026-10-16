@@ -180,7 +180,9 @@ export class EvidenceAssessment {
   pendingRequiredChecks(): readonly string[] {
     return this.record.requiredChecks.filter((check) => {
       const receipt = this.record.verificationReceipts.find(
-        (candidate) => candidate.procedureName === check,
+        (candidate) =>
+          candidate.procedureName === check &&
+          candidate.candidateHeadSha === this.record.candidateHeadSha,
       );
       if (receipt === undefined) {
         return true;
@@ -222,6 +224,9 @@ export class EvidenceAssessment {
   }
 
   appendVerificationReceipt(receipt: VerificationReceiptRecord, updatedAtIso: string): void {
+    if (this.isTerminal()) {
+      throw new Error(`Cannot append verification receipt to an assessment in terminal state '${this.record.state}'`);
+    }
     const validated = VerificationReceipt.create(receipt);
     if (!validated.success || validated.value === undefined) {
       throw new Error(validated.error?.message ?? 'Invalid verification receipt');
@@ -241,6 +246,9 @@ export class EvidenceAssessment {
   }
 
   appendReviewReceipt(receipt: ReviewReceiptRecord, updatedAtIso: string): void {
+    if (this.isTerminal()) {
+      throw new Error(`Cannot append review receipt to an assessment in terminal state '${this.record.state}'`);
+    }
     const validated = ReviewReceipt.create(receipt);
     if (!validated.success || validated.value === undefined) {
       throw new Error(validated.error?.message ?? 'Invalid review receipt');
@@ -260,6 +268,9 @@ export class EvidenceAssessment {
   }
 
   appendFindingDisposition(disposition: FindingDispositionRecord, updatedAtIso: string): void {
+    if (this.isTerminal()) {
+      throw new Error(`Cannot append finding disposition to an assessment in terminal state '${this.record.state}'`);
+    }
     const validated = FindingDisposition.create(disposition);
     if (!validated.success || validated.value === undefined) {
       throw new Error(validated.error?.message ?? 'Invalid finding disposition');
@@ -283,6 +294,9 @@ export class EvidenceAssessment {
     if (!isNonEmptyTrimmedString(acceptanceReceiptId)) {
       throw new Error('Acceptance requires a non-empty receipt id');
     }
+    if (this.isTerminal()) {
+      throw new Error(`Cannot accept an assessment in terminal state '${this.record.state}'`);
+    }
     this.record = {
       ...this.record,
       state: 'accepted',
@@ -301,6 +315,7 @@ export class EvidenceAssessment {
     this.record = {
       ...this.record,
       state: 'blocked',
+      acceptanceReceiptId: null,
       blockers: [...blockers],
       revision: this.record.revision + 1,
       updatedAtIso,
@@ -312,6 +327,7 @@ export class EvidenceAssessment {
     this.record = {
       ...this.record,
       state: 'stale',
+      acceptanceReceiptId: null,
       revision: this.record.revision + 1,
       updatedAtIso,
     };
@@ -321,6 +337,7 @@ export class EvidenceAssessment {
     this.record = {
       ...this.record,
       state: 'rejected',
+      acceptanceReceiptId: null,
       revision: this.record.revision + 1,
       updatedAtIso,
     };

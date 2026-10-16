@@ -7,6 +7,7 @@
 
 import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
+import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import { ReviewReceipt, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { EvidenceArchivePort } from '../ports/out/EvidenceArchivePort.out-port.js';
@@ -86,6 +87,38 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       };
     }
 
+    const existing = await deps.repo.findAssessmentById(request.assessmentId);
+    if (existing === null) {
+      return {
+        outcome: 'rejected',
+        reason: `No assessment exists for assessmentId '${request.assessmentId}'`,
+      };
+    }
+    if (existing.candidateHeadSha !== request.candidateHeadSha) {
+      return {
+        outcome: 'rejected',
+        reason: `Assessment '${request.assessmentId}' exists for candidate head '${existing.candidateHeadSha}', not '${request.candidateHeadSha}'`,
+      };
+    }
+    if (
+      existing.projectId !== request.projectId ||
+      existing.attemptId !== request.attemptId ||
+      existing.policyRevision !== request.policyRevision
+    ) {
+      return {
+        outcome: 'rejected',
+        reason:
+          'Assessment identity mismatch (projectId, attemptId, or policyRevision does not match existing assessment)',
+      };
+    }
+
+    if (AssessmentState.create(existing.state).value?.isTerminal()) {
+      return {
+        outcome: 'rejected',
+        reason: `Assessment '${existing.id}' is in terminal state '${existing.state}'`,
+      };
+    }
+
     const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
     const run = await deps.reviewer.runIndependentReview({
       attemptId: request.attemptId,
@@ -134,19 +167,16 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
     }
     const receipt = validated.value.toRecord();
 
-    const existing = await deps.repo.findAssessmentById(request.assessmentId);
-    if (existing !== null) {
-      const assessment = EvidenceAssessment.fromRecord(existing);
-      assessment.appendReviewReceipt(receipt, nowIso);
-      const merged = assessment.toRecord();
-      const blockers = EvidenceAssessment.fromRecord(merged).collectBlockers();
-      const updated: EvidenceAssessmentRecord = {
-        ...merged,
-        state: blockers.length > 0 ? 'blocked' : 'pending',
-        blockers: [...blockers],
-      };
-      await deps.repo.saveAssessment(updated);
-    }
+    const assessment = EvidenceAssessment.fromRecord(existing);
+    assessment.appendReviewReceipt(receipt, nowIso);
+    const merged = assessment.toRecord();
+    const blockers = EvidenceAssessment.fromRecord(merged).collectBlockers();
+    const updated: EvidenceAssessmentRecord = {
+      ...merged,
+      state: blockers.length > 0 ? 'blocked' : 'pending',
+      blockers: [...blockers],
+    };
+    await deps.repo.saveAssessment(updated);
 
     return { outcome: 'reviewed', receipt };
   }

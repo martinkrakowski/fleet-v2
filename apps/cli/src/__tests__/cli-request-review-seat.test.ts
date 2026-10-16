@@ -86,7 +86,7 @@ describe('evidence request-review implementer seat binding', () => {
       collectedArtifactPaths: [],
       notes: 'missing',
     },
-    runner: { remotePort: 4166, host: null, agent: null, model: SEAT_MODEL, variant: null },
+    runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: SEAT_MODEL, variant: null },
     createdAtIso: '2026-10-16T08:00:00.000Z',
     updatedAtIso: '2026-10-16T08:30:00.000Z',
   });

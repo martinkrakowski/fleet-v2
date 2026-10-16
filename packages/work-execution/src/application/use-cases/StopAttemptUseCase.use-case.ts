@@ -48,6 +48,17 @@ export class StopAttemptUseCase implements StopAttemptPort {
       return { outcome: 'refused', reason: 'Attempt not found or has no sessionId' };
     }
 
+    if (
+      attempt.state === 'collected' ||
+      attempt.state === 'cancelled' ||
+      (attempt.state === 'ended' && attempt.completionReceipt?.authoritative === true)
+    ) {
+      return {
+        outcome: 'refused',
+        reason: `Attempt ${attempt.id} is in terminal state '${attempt.state}' and cannot be stopped`,
+      };
+    }
+
     const nowIso = request.nowIso ?? new Date().toISOString();
 
     await appendJournalEntry(this.deps.journal, {
@@ -64,6 +75,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
     const stopResult = await this.deps.runner.stopSession({
       attemptId: attempt.id,
       sessionId: attempt.sessionId,
+      worktreePath: attempt.worktreePath,
       gracePeriodSeconds: request.gracePeriodSeconds ?? 10,
     });
 

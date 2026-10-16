@@ -22,9 +22,13 @@ import type {
   StartRunnerSessionResult,
   StopRunnerSessionRequest,
   StopRunnerSessionResult,
-  WorkspacePreparationState,
 } from '../../application/ports/out/ExecutionRunnerPort.out-port.js';
-import type { CommandCompletionReceipt } from '../../domain/execution-records.js';
+import type {
+  AttemptRecord,
+  AttemptRunnerRecord,
+  AttemptSeatOverrideRecord,
+  CommandCompletionReceipt,
+} from '../../domain/execution-records.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -65,8 +69,16 @@ export interface ExecutionRunnerAdapterOptions {
   readonly agent?: string;
   readonly model?: string;
   readonly variant?: string;
+  /** Explicit seat override on adapter options. */
+  readonly seatOverride?: AttemptSeatOverrideRecord | {
+    readonly model: string;
+    readonly agent?: string;
+    readonly variant?: string;
+  };
   /** Optional resolver for cross-process lookup of an attempt's worktree path when not cached in memory. */
   readonly resolveWorktreePath?: (attemptId: string) => Promise<string | null> | string | null;
+  /** Optional resolver for attempt record (used to verify recorded runner port/host). */
+  readonly resolveAttempt?: (attemptId: string) => Promise<AttemptRecord | null> | AttemptRecord | null;
   /** Deterministic subprocess execution for unit tests. */
   readonly runSubprocess?: SubprocessRunner;
   /** Capability overrides on top of the enforced defaults. */
@@ -217,23 +229,9 @@ function parseSessionId(stdout: string): string | null {
   return match?.[1] ?? null;
 }
 
-function asIsoString(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() !== '' ? value : null;
-}
-
-function asExitStatus(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
-}
-
-const workspacePreparationStates: readonly WorkspacePreparationState[] = [
-  'unprepared',
-  'preparing',
-  'prepared',
-  'failed',
-];
-
-function isWorkspacePreparationState(value: string): value is WorkspacePreparationState {
-  return (workspacePreparationStates as readonly string[]).includes(value);
+/** An ssh destination that could inject options or split words never spawns. */
+export function isSafeSshHost(host: string): boolean {
+  return host.length > 0 && !host.startsWith('-') && !/\s/.test(host);
 }
 
 export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
@@ -244,6 +242,32 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
 
   describeCapabilities(): RunnerIsolationCapabilities {
     return { ...defaultCapabilities, ...this.options?.capabilities };
+  }
+
+  configuredRemotePort(): number | undefined {
+    if (this.options?.remotePort !== undefined) return this.options.remotePort;
+    const envPort = process.env.OCM_REMOTE_PORT;
+    if (envPort !== undefined && envPort.trim() !== '') {
+      const parsed = Number(envPort);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return undefined;
+  }
+
+  configuredRemoteHost(): string | null {
+    return this.options?.remoteHost ?? (process.env.OCM_HOST?.trim() || null);
+  }
+
+  describeRunner(): AttemptRunnerRecord | undefined {
+    const port = this.configuredRemotePort();
+    if (port === undefined) return undefined;
+    return {
+      remotePort: port,
+      host: this.configuredRemoteHost(),
+      agent: this.options?.agent ?? null,
+      model: this.options?.model ?? null,
+      variant: this.options?.variant ?? null,
+    };
   }
 
   async startSession(request: StartRunnerSessionRequest): Promise<StartRunnerSessionResult> {
@@ -258,15 +282,40 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       return { outcome: 'refused', reason: 'Runner does not satisfy required isolation capabilities' };
     }
 
+    const remoteHost = this.configuredRemoteHost();
+    if (remoteHost !== null && !isSafeSshHost(remoteHost)) {
+      return { outcome: 'refused', reason: `Unsafe OCM_HOST configured: ${remoteHost}` };
+    }
+
+    // Determine seat: takes model, agent, variant from attempt manifest (modelAssignment) or request;
+    // adapter options may override ONLY when an explicit seatOverride option is set.
+    const seatOverride = this.options?.seatOverride ?? request.seatOverride;
+    let model: string | undefined;
+    let agent: string | undefined;
+    let variant: string | undefined;
+
+    if (seatOverride) {
+      model = seatOverride.model;
+      agent = seatOverride.agent ?? request.agent ?? request.modelAssignment?.agent ?? this.options?.agent;
+      variant = seatOverride.variant ?? request.variant ?? request.modelAssignment?.variant ?? this.options?.variant;
+    } else {
+      model = request.model ?? request.modelAssignment?.model ?? this.options?.model;
+      agent = request.agent ?? request.modelAssignment?.agent ?? this.options?.agent;
+      variant = request.variant ?? request.modelAssignment?.variant ?? this.options?.variant;
+    }
+
+    // Refuse to start (outcome refused, no spawn) when no model is known
+    if (!model || model.trim() === '') {
+      return { outcome: 'refused', reason: 'No model specified for runner session' };
+    }
+
     this.worktreeByAttemptId.set(request.attemptId, request.worktreePath);
 
     const args: string[] = ['--detach', '--dir', request.worktreePath];
-    const agent = this.options?.agent;
-    const model = this.options?.model;
-    const variant = this.options?.variant;
-    if (agent !== undefined) args.push('--agent', agent);
-    if (model !== undefined) args.push('-m', model);
-    if (variant !== undefined) args.push('--variant', variant);
+    if (agent !== undefined && agent.trim() !== '') args.push('--agent', agent);
+    // -m is ALWAYS passed
+    args.push('-m', model);
+    if (variant !== undefined && variant.trim() !== '') args.push('--variant', variant);
     args.push('--format', 'json', `Read and execute ${request.briefPackagePath}`);
 
     const env = this.remotePortEnv();
@@ -284,7 +333,21 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     if (result.exitCode === 0) {
       const sessionId = parseSessionId(result.stdout);
       if (sessionId !== null) {
-        return { outcome: 'started', sessionId };
+        const port = this.configuredRemotePort();
+        return {
+          outcome: 'started',
+          sessionId,
+          runner:
+            port !== undefined
+              ? {
+                  remotePort: port,
+                  host: this.configuredRemoteHost(),
+                  agent: agent ?? null,
+                  model,
+                  variant: variant ?? null,
+                }
+              : undefined,
+        };
       }
       return {
         outcome: 'unknown',
@@ -298,45 +361,218 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   }
 
   async inspectSession(session: RunnerSessionRef): Promise<RunnerSessionStatus> {
-    // A reconcile or stop runs in a later CLI process than the dispatch, so
-    // the locator is resolved from the recorded attempt rather than memory.
+    // Resolve recorded runner
+    let recordedRunner = session.runner;
+    let attemptRecord: AttemptRecord | null = null;
+    if (!recordedRunner && this.options?.resolveAttempt) {
+      attemptRecord = await this.options.resolveAttempt(session.attemptId);
+      recordedRunner = attemptRecord?.runner ?? null;
+    }
+
+    // Refuse when attempt has no recorded port (old records without it read as unknown)
+    if (!recordedRunner || recordedRunner.remotePort === undefined || recordedRunner.remotePort === null) {
+      return {
+        runnerReachable: 'unknown',
+        workspacePreparation: 'unprepared',
+        workerCommand: 'not-started',
+        completionReceipt: null,
+        artifactsCollected: false,
+      };
+    }
+
+    const configuredPort = this.configuredRemotePort();
+    const configuredHost = this.configuredRemoteHost();
+
+    if (configuredHost !== null && !isSafeSshHost(configuredHost)) {
+      return {
+        runnerReachable: 'unknown',
+        workspacePreparation: 'unprepared',
+        workerCommand: 'not-started',
+        completionReceipt: null,
+        artifactsCollected: false,
+      };
+    }
+
+    if (
+      recordedRunner.host !== null &&
+      recordedRunner.host !== undefined &&
+      !isSafeSshHost(recordedRunner.host)
+    ) {
+      return {
+        runnerReachable: 'unknown',
+        workspacePreparation: 'unprepared',
+        workerCommand: 'not-started',
+        completionReceipt: null,
+        artifactsCollected: false,
+      };
+    }
+
+    // Refuse when configured port or host differs from recorded one
+    if (
+      configuredPort !== recordedRunner.remotePort ||
+      (configuredHost ?? null) !== (recordedRunner.host ?? null)
+    ) {
+      return {
+        runnerReachable: 'unknown',
+        workspacePreparation: 'unprepared',
+        workerCommand: 'not-started',
+        completionReceipt: null,
+        artifactsCollected: false,
+      };
+    }
+
+    // L1: Resolve worktree directory; never fall back to session.sessionId
     const resolved =
+      session.worktreePath ??
       this.worktreeByAttemptId.get(session.attemptId) ??
       (await this.options?.resolveWorktreePath?.(session.attemptId)) ??
+      attemptRecord?.worktreePath ??
+      (this.options?.resolveAttempt ? (await this.options.resolveAttempt(session.attemptId))?.worktreePath : null) ??
       null;
-    const dir = resolved ?? session.sessionId;
+
+    if (!resolved || resolved.trim() === '') {
+      return {
+        runnerReachable: 'unknown',
+        workspacePreparation: 'unprepared',
+        workerCommand: 'not-started',
+        completionReceipt: null,
+        artifactsCollected: false,
+      };
+    }
+
+    const dir = resolved;
     let result: SubprocessResult;
     try {
-      result = await this.run(this.binPath(), ['--status', '--dir', dir], this.remotePortEnv());
+      result = await this.run(
+        this.binPath(),
+        ['--status', '--dir', dir],
+        this.remotePortEnv(recordedRunner.remotePort, recordedRunner.host ?? undefined),
+      );
     } catch {
       return {
-        runnerReachable: 'unreachable',
+        runnerReachable: 'unknown',
         workspacePreparation: 'unprepared',
         workerCommand: 'not-started',
         completionReceipt: null,
         artifactsCollected: false,
       };
     }
-    // `ocm-run --status` exits 3 when a session is running in the directory and
-    // 0 when nothing is; both carry a classified status line.
-    if (result.exitCode !== 0 && result.exitCode !== 3) {
+
+    // M1: classify ocm-run --status by exit code only:
+    // 0 = nothing running, 3 = running (parse session ids only on 3), anything else unknown.
+    // No keyword scanning of the text.
+    if (result.exitCode === 3) {
+      const parsedId = parseSessionId(result.stdout);
+      if (parsedId !== null && session.sessionId && parsedId !== session.sessionId) {
+        return {
+          runnerReachable: 'unknown',
+          workspacePreparation: 'unprepared',
+          workerCommand: 'not-started',
+          completionReceipt: null,
+          artifactsCollected: false,
+        };
+      }
       return {
-        runnerReachable: 'unreachable',
-        workspacePreparation: 'unprepared',
-        workerCommand: 'not-started',
+        runnerReachable: 'reachable',
+        workspacePreparation: 'prepared',
+        workerCommand: 'active',
         completionReceipt: null,
         artifactsCollected: false,
       };
     }
-    return this.parseSessionStatus(session, `${result.stdout}\n${result.stderr}`);
+
+    if (result.exitCode === 0) {
+      // "Nothing running" is authoritative ONLY when attempt has recorded sessionId,
+      // port and host match, and status was asked for recorded worktree directory.
+      if (!session.sessionId || session.sessionId.trim() === '') {
+        return {
+          runnerReachable: 'unknown',
+          workspacePreparation: 'unprepared',
+          workerCommand: 'not-started',
+          completionReceipt: null,
+          artifactsCollected: false,
+        };
+      }
+
+      let parsedExitStatus: number | null = null;
+      let parsedEndedAtIso: string = new Date().toISOString();
+      let parsedArtifactsCollected = false;
+
+      const trimmed = result.stdout.trim();
+      let parsed: unknown = null;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        for (const line of trimmed.split(/\r?\n/)) {
+          const l = line.trim();
+          if (l.startsWith('{') && l.endsWith('}')) {
+            try {
+              parsed = JSON.parse(l);
+              break;
+            } catch {
+              // continue
+            }
+          }
+        }
+      }
+      if (isPlainRecord(parsed)) {
+        if (typeof parsed.exitStatus === 'number') {
+          parsedExitStatus = parsed.exitStatus;
+        }
+        if (typeof parsed.endedAtIso === 'string' && !Number.isNaN(Date.parse(parsed.endedAtIso))) {
+          parsedEndedAtIso = parsed.endedAtIso;
+        }
+        if (typeof parsed.artifactsCollected === 'boolean') {
+          parsedArtifactsCollected = parsed.artifactsCollected;
+        }
+      }
+
+      const receipt: CommandCompletionReceipt = {
+        attemptId: session.attemptId,
+        sessionId: session.sessionId,
+        endedAtIso: parsedEndedAtIso,
+        authoritative: true,
+        exitStatus: parsedExitStatus,
+        stoppedByRequest: false,
+      };
+      return {
+        runnerReachable: 'reachable',
+        workspacePreparation: 'prepared',
+        workerCommand: 'ended',
+        completionReceipt: receipt,
+        artifactsCollected: parsedArtifactsCollected,
+      };
+    }
+
+    // Anything else is unknown
+    return {
+      runnerReachable: 'unknown',
+      workspacePreparation: 'unprepared',
+      workerCommand: 'not-started',
+      completionReceipt: null,
+      artifactsCollected: false,
+    };
   }
 
   async stopSession(request: StopRunnerSessionRequest): Promise<StopRunnerSessionResult> {
+    const configuredHost = this.configuredRemoteHost();
+    if (configuredHost !== null && !isSafeSshHost(configuredHost)) {
+      return { outcome: 'unknown', reason: `Unsafe OCM_HOST configured: ${configuredHost}` };
+    }
+
     const resolved =
+      request.worktreePath ??
       this.worktreeByAttemptId.get(request.attemptId) ??
       (await this.options?.resolveWorktreePath?.(request.attemptId)) ??
+      (this.options?.resolveAttempt ? (await this.options.resolveAttempt(request.attemptId))?.worktreePath : null) ??
       null;
-    const dir = resolved ?? request.sessionId;
+
+    // L1: never fall back to request.sessionId; refuse!
+    if (!resolved || resolved.trim() === '') {
+      return { outcome: 'unknown', reason: 'Worktree directory not resolved for session abort' };
+    }
+
+    const dir = resolved;
     let result: SubprocessResult;
     try {
       result = await this.run(this.binPath(), ['--abort', '--dir', dir], this.remotePortEnv());
@@ -344,12 +580,13 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       return { outcome: 'unknown', reason: `Abort command failed: ${String(error)}` };
     }
     if (result.exitCode === 0) {
+      // L2: a successful abort records exitStatus: null and stoppedByRequest: true instead of 130
       const receipt: CommandCompletionReceipt = {
         attemptId: request.attemptId,
         sessionId: request.sessionId,
         endedAtIso: new Date().toISOString(),
         authoritative: true,
-        exitStatus: 130,
+        exitStatus: null,
         stoppedByRequest: true,
       };
       return { outcome: 'terminated', receipt };
@@ -369,14 +606,18 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   }
 
   /** Configured remote port/host as runner environment; absent when neither is set. */
-  private remotePortEnv(): Readonly<Record<string, string>> | undefined {
+  private remotePortEnv(
+    overridePort?: number,
+    overrideHost?: string,
+  ): Readonly<Record<string, string>> | undefined {
     const overrides: Record<string, string> = {};
-    if (this.options?.remotePort !== undefined) {
-      overrides.OCM_REMOTE_PORT = String(this.options.remotePort);
+    const port = overridePort ?? this.configuredRemotePort();
+    if (port !== undefined) {
+      overrides.OCM_REMOTE_PORT = String(port);
     }
-    const remoteHost = this.options?.remoteHost ?? (process.env.OCM_HOST?.trim() || undefined);
-    if (remoteHost !== undefined) {
-      overrides.OCM_HOST = remoteHost;
+    const host = overrideHost ?? this.configuredRemoteHost();
+    if (host !== null && host !== undefined) {
+      overrides.OCM_HOST = host;
     }
     return Object.keys(overrides).length === 0 ? undefined : overrides;
   }
@@ -389,98 +630,5 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     const injected = this.options?.runSubprocess;
     if (injected !== undefined) return injected(command, args, env);
     return runViaExecFile(command, args, env);
-  }
-
-  private parseSessionStatus(session: RunnerSessionRef, output: string): RunnerSessionStatus {
-    const lower = output.toLowerCase();
-
-    let activeFlag: boolean | undefined;
-    let endedAtIso: string | null = null;
-    let exitStatus: number | null = null;
-    let artifactsCollected = false;
-    let workspacePreparation: WorkspacePreparationState | undefined;
-    const trimmed = output.trim();
-    if (trimmed !== '') {
-      try {
-        const parsed: unknown = JSON.parse(trimmed);
-        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-          const candidate = parsed as Record<string, unknown>;
-          if (typeof candidate.active === 'boolean') activeFlag = candidate.active;
-          endedAtIso =
-            asIsoString(candidate.endedAtIso) ?? asIsoString(candidate.ended_at_iso);
-          exitStatus =
-            asExitStatus(candidate.exitStatus) ??
-            asExitStatus(candidate.exit_status) ??
-            asExitStatus(candidate.exitCode);
-          if (typeof candidate.artifactsCollected === 'boolean') {
-            artifactsCollected = candidate.artifactsCollected;
-          }
-          const preparation =
-            asIsoString(candidate.workspacePreparation) ?? asIsoString(candidate.workspace_preparation);
-          if (preparation !== null && isWorkspacePreparationState(preparation)) {
-            workspacePreparation = preparation;
-          }
-        }
-      } catch {
-        // Free-text status output; keyword classification below.
-      }
-    }
-
-    if (
-      lower.includes('unreachable') ||
-      lower.includes('not reachable') ||
-      lower.includes('connection refused') ||
-      lower.includes('error')
-    ) {
-      return {
-        runnerReachable: 'unreachable',
-        workspacePreparation: 'unprepared',
-        workerCommand: 'not-started',
-        completionReceipt: null,
-        artifactsCollected: false,
-      };
-    }
-
-    const ended =
-      activeFlag === false ||
-      lower.includes('idle') ||
-      lower.includes('nothing running') ||
-      lower.includes('nothing is running');
-    if (ended) {
-      const receipt: CommandCompletionReceipt = {
-        attemptId: session.attemptId,
-        sessionId: session.sessionId,
-        endedAtIso: endedAtIso ?? new Date().toISOString(),
-        authoritative: true,
-        exitStatus,
-        stoppedByRequest: false,
-      };
-      return {
-        runnerReachable: 'reachable',
-        workspacePreparation: workspacePreparation ?? 'prepared',
-        workerCommand: 'ended',
-        completionReceipt: receipt,
-        artifactsCollected,
-      };
-    }
-
-    const active = activeFlag === true || lower.includes('active') || lower.includes('running');
-    if (active) {
-      return {
-        runnerReachable: 'reachable',
-        workspacePreparation: workspacePreparation ?? 'prepared',
-        workerCommand: 'active',
-        completionReceipt: null,
-        artifactsCollected,
-      };
-    }
-
-    return {
-      runnerReachable: 'unreachable',
-      workspacePreparation: 'unprepared',
-      workerCommand: 'not-started',
-      completionReceipt: null,
-      artifactsCollected: false,
-    };
   }
 }

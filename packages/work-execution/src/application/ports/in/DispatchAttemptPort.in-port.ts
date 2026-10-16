@@ -5,7 +5,10 @@
  * reservation and enters reconciliation; it is never retried blindly.
  */
 
-import type { AttemptRecord } from '../../../domain/execution-records.js';
+import type {
+  AttemptRecord,
+  AttemptSeatOverrideRecord,
+} from '../../../domain/execution-records.js';
 import type { RunnerIsolationCapabilities } from '../out/ExecutionRunnerPort.out-port.js';
 
 export interface DispatchAttemptRequest {
@@ -20,6 +23,19 @@ export interface DispatchAttemptRequest {
   readonly expectedArtifacts?: readonly string[];
   readonly requiredCapabilities: RunnerIsolationCapabilities;
   readonly nowIso?: string;
+  readonly modelAssignment?: {
+    readonly model: string;
+    readonly variant?: string;
+    readonly fallbackModel?: string;
+    readonly agent?: string;
+  };
+  readonly seatOverride?: AttemptSeatOverrideRecord;
+  readonly reviewerSeat?: string;
+  readonly runnerPort?: number;
+  readonly runnerHost?: string;
+  readonly model?: string;
+  readonly agent?: string;
+  readonly variant?: string;
 }
 
 export type DispatchAttemptResult =

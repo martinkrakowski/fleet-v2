@@ -972,6 +972,10 @@ function validDispatchRequest(overrides: Record<string, unknown> = {}) {
       authoritativeCompletion: true,
       artifactPersistence: true,
     },
+    modelAssignment: {
+      model: 'nvidia/z-ai/glm-5.3',
+      variant: 'default',
+    },
     nowIso: '2026-10-15T08:00:00.000Z',
     ...overrides,
   };
@@ -1467,6 +1471,7 @@ describe('StopAttemptUseCase', () => {
       attemptId: 'attempt-1',
       sessionId: 'session-1',
       gracePeriodSeconds: 30,
+      worktreePath: '/lanes/wo-1',
     });
   });
 

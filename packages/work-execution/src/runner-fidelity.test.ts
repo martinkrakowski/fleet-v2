@@ -1,0 +1,1266 @@
+import { describe, expect, it } from 'vitest';
+import {
+  ExecutionRunnerAdapter,
+  type SubprocessRunner,
+} from './infrastructure/adapters/ExecutionRunnerAdapter.adapter.js';
+import { DispatchAttemptUseCase } from './application/use-cases/DispatchAttemptUseCase.use-case.js';
+import { ReconcileAttemptUseCase } from './application/use-cases/ReconcileAttemptUseCase.use-case.js';
+import { StopAttemptUseCase } from './application/use-cases/StopAttemptUseCase.use-case.js';
+import {
+  underlyingModelFamily,
+  type ActionJournalEntryRecord,
+  type AttemptRecord,
+  type CapacityReservationRecord,
+  type CommandCompletionReceipt,
+  type WorkOrderRecord,
+} from './domain/execution-records.js';
+import type { WorkOrderRepositoryPort } from './application/ports/out/WorkOrderRepositoryPort.out-port.js';
+import type { AttemptRepositoryPort } from './application/ports/out/AttemptRepositoryPort.out-port.js';
+import type { ExecutionJournalPort } from './application/ports/out/ExecutionJournalPort.out-port.js';
+import type { WorkspacePort } from './application/ports/out/WorkspacePort.out-port.js';
+import type { ExecutionRunnerPort } from './application/ports/out/ExecutionRunnerPort.out-port.js';
+
+function createMockWorkOrder(overrides?: Partial<WorkOrderRecord>): WorkOrderRecord {
+  return {
+    id: 'wo-1',
+    projectId: 'proj-1',
+    taskId: 'task-1',
+    laneId: 'lane-1',
+    repository: 'owner/repo',
+    baseCommit: 'commit-base-123',
+    ownedPaths: ['src/'],
+    policyRevision: 'pol-1',
+    prerequisiteWorkOrderIds: [],
+    state: 'approved',
+    revision: 1,
+    createdAtIso: '2026-10-15T00:00:00.000Z',
+    updatedAtIso: '2026-10-15T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+function createMockAttempt(overrides?: Partial<AttemptRecord>): AttemptRecord {
+  return {
+    id: 'att-1',
+    workOrderId: 'wo-1',
+    kind: 'initial',
+    fixNumber: 0,
+    priorAttemptId: null,
+    worktreePath: '/worktrees/lane-1',
+    baseCommit: 'commit-base-123',
+    state: 'running',
+    outcome: null,
+    briefDigest: 'digest-1',
+    briefPackagePath: '.lane/brief.md',
+    sessionId: 'ses_test_123',
+    completionReceipt: null,
+    artifacts: null,
+    createdAtIso: '2026-10-15T00:00:00.000Z',
+    updatedAtIso: '2026-10-15T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+function createInMemoryJournal(): ExecutionJournalPort & {
+  readonly entries: ActionJournalEntryRecord[];
+  readonly reservations: CapacityReservationRecord[];
+} {
+  const entries: ActionJournalEntryRecord[] = [];
+  const reservations: CapacityReservationRecord[] = [
+    {
+      id: 'res-1',
+      attemptId: 'att-1',
+      hostId: 'host-1',
+      slotIndex: 0,
+      held: true,
+      reservedAtIso: '2026-10-15T00:00:00.000Z',
+      releasedAtIso: null,
+    },
+  ];
+
+  return {
+    entries,
+    reservations,
+    appendJournalEntry: async (entry) => {
+      entries.push(entry);
+    },
+    listJournalEntriesForAttempt: async (attemptId) => {
+      return entries.filter((e) => e.attemptId === attemptId);
+    },
+    saveCapacityReservation: async (reservation) => {
+      const idx = reservations.findIndex((r) => r.id === reservation.id);
+      if (idx >= 0) {
+        reservations[idx] = reservation;
+      } else {
+        reservations.push(reservation);
+      }
+    },
+    listActiveReservations: async () => {
+      return reservations.filter((r) => r.held);
+    },
+    releaseCapacityReservation: async (attemptId, releasedAtIso) => {
+      const reservation = reservations.find((r) => r.attemptId === attemptId && r.held);
+      if (reservation) {
+        (reservation as { held: boolean }).held = false;
+        (reservation as { releasedAtIso: string | null }).releasedAtIso = releasedAtIso;
+        return true;
+      }
+      return false;
+    },
+  };
+}
+
+describe('Runner Adapter Seat, Port and Status Fidelity', () => {
+  describe('1. H5: Model Assignment, Seat Override, and -m Flag', () => {
+    it('dispatches the frozen seat from request modelAssignment and always passes -m', async () => {
+      const invocations: Array<{ command: string; args: readonly string[]; env?: Readonly<Record<string, string>> }> = [];
+      const runner: SubprocessRunner = async (command, args, env) => {
+        invocations.push({ command, args, env });
+        return { exitCode: 0, stdout: JSON.stringify({ sessionID: 'ses_123' }), stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remotePort: 4096,
+      });
+
+      const result = await adapter.startSession({
+        attemptId: 'att-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        baseCommit: 'base-sha',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: adapter.describeCapabilities(),
+        modelAssignment: {
+          model: 'nvidia/z-ai/glm-5.3',
+          variant: 'low',
+          fallbackModel: 'openai/gpt-4o',
+          agent: 'lane-glm',
+        },
+      });
+
+      expect(result.outcome).toBe('started');
+      expect(invocations).toHaveLength(1);
+      const args = invocations[0].args;
+      expect(args).toContain('-m');
+      expect(args[args.indexOf('-m') + 1]).toBe('nvidia/z-ai/glm-5.3');
+      expect(args).toContain('--variant');
+      expect(args[args.indexOf('--variant') + 1]).toBe('low');
+      expect(args).toContain('--agent');
+      expect(args[args.indexOf('--agent') + 1]).toBe('lane-glm');
+    });
+
+    it('refuses to start when no model is known without spawning a subprocess', async () => {
+      let spawned = false;
+      const runner: SubprocessRunner = async () => {
+        spawned = true;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+      });
+
+      const result = await adapter.startSession({
+        attemptId: 'att-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        baseCommit: 'base-sha',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: adapter.describeCapabilities(),
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('No model specified');
+      expect(spawned).toBe(false);
+    });
+
+    it('allows adapter options.seatOverride to override manifest seat when set', async () => {
+      const invocations: Array<{ args: readonly string[] }> = [];
+      const runner: SubprocessRunner = async (_cmd, args) => {
+        invocations.push({ args });
+        return { exitCode: 0, stdout: JSON.stringify({ sessionID: 'ses_override' }), stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        seatOverride: {
+          model: 'anthropic/claude-3-5-sonnet',
+          variant: 'high',
+          agent: 'override-agent',
+        },
+      });
+
+      const result = await adapter.startSession({
+        attemptId: 'att-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        baseCommit: 'base-sha',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: adapter.describeCapabilities(),
+        modelAssignment: {
+          model: 'nvidia/z-ai/glm-5.3',
+          variant: 'low',
+          fallbackModel: 'openai/gpt-4o',
+        },
+      });
+
+      expect(result.outcome).toBe('started');
+      const args = invocations[0].args;
+      expect(args[args.indexOf('-m') + 1]).toBe('anthropic/claude-3-5-sonnet');
+      expect(args[args.indexOf('--variant') + 1]).toBe('high');
+      expect(args[args.indexOf('--agent') + 1]).toBe('override-agent');
+    });
+
+    it('does not let options.model override request model when options.seatOverride is not set', async () => {
+      const invocations: Array<{ args: readonly string[] }> = [];
+      const runner: SubprocessRunner = async (_cmd, args) => {
+        invocations.push({ args });
+        return { exitCode: 0, stdout: JSON.stringify({ sessionID: 'ses_123' }), stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        model: 'env-model-should-not-override',
+      });
+
+      const result = await adapter.startSession({
+        attemptId: 'att-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        baseCommit: 'base-sha',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: adapter.describeCapabilities(),
+        modelAssignment: {
+          model: 'nvidia/z-ai/glm-5.3',
+          variant: 'low',
+          fallbackModel: 'openai/gpt-4o',
+        },
+      });
+
+      expect(result.outcome).toBe('started');
+      const args = invocations[0].args;
+      expect(args[args.indexOf('-m') + 1]).toBe('nvidia/z-ai/glm-5.3');
+    });
+  });
+
+  describe('2. H2: Record Runner Port & Host Fidelity in Reconcile', () => {
+    it('records runner details on the attempt at dispatch', async () => {
+      const workOrder = createMockWorkOrder();
+      const attempt = createMockAttempt({ state: 'dispatching' });
+      const attempts = new Map<string, AttemptRecord>([[attempt.id, attempt]]);
+      const journal = createInMemoryJournal();
+
+      const workOrderRepo: WorkOrderRepositoryPort = {
+        findWorkOrderById: async (id) => (id === workOrder.id ? workOrder : null),
+        saveWorkOrder: async () => {},
+        listWorkOrdersByProject: async () => [workOrder],
+      };
+
+      const attemptRepo: AttemptRepositoryPort = {
+        findAttemptById: async (id) => attempts.get(id) ?? null,
+        saveAttempt: async (rec) => {
+          attempts.set(rec.id, rec);
+        },
+        listAttemptsByWorkOrder: async () => [...attempts.values()],
+        listAllAttempts: async () => [...attempts.values()],
+      };
+
+      const workspace: WorkspacePort = {
+        inspectWorktree: async (req) => ({
+          worktreePath: req.worktreePath,
+          matchesBaseCommit: true,
+          checkedOutCommit: 'commit-base-123',
+          uncommittedPaths: [],
+          untrackedPaths: [],
+          residueFromEarlierAttempts: [],
+          missingExpectedArtifacts: [],
+        }),
+      };
+
+      const runnerPort: ExecutionRunnerPort = {
+        describeCapabilities: () => ({
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        }),
+        describeRunner: () => ({
+          remotePort: 4166,
+          host: 'runner-host.lan',
+          agent: 'lane-agent',
+          model: 'nvidia/z-ai/glm-5.3',
+          variant: 'low',
+        }),
+        startSession: async () => ({
+          outcome: 'started',
+          sessionId: 'ses_started_4166',
+          runner: {
+            remotePort: 4166,
+            host: 'runner-host.lan',
+            agent: 'lane-agent',
+            model: 'nvidia/z-ai/glm-5.3',
+            variant: 'low',
+          },
+        }),
+        inspectSession: async () => {
+          throw new Error('Not used');
+        },
+        stopSession: async () => {
+          throw new Error('Not used');
+        },
+      };
+
+      const useCase = new DispatchAttemptUseCase({
+        workOrderRepo,
+        attemptRepo,
+        journal,
+        workspace,
+        runner: runnerPort,
+      });
+
+      const result = await useCase.dispatchAttempt({
+        attemptId: attempt.id,
+        workOrderId: workOrder.id,
+        worktreePath: attempt.worktreePath,
+        briefPackagePath: attempt.briefPackagePath!,
+        briefDigest: attempt.briefDigest!,
+        baseCommit: attempt.baseCommit,
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: runnerPort.describeCapabilities(),
+        modelAssignment: {
+          model: 'nvidia/z-ai/glm-5.3',
+          variant: 'low',
+          fallbackModel: 'openai/gpt-4o',
+          agent: 'lane-agent',
+        },
+      });
+
+      expect(result.outcome).toBe('started');
+      const saved = attempts.get(attempt.id)!;
+      expect(saved.runner).toBeDefined();
+      expect(saved.runner?.remotePort).toBe(4166);
+      expect(saved.runner?.host).toBe('runner-host.lan');
+      expect(saved.runner?.model).toBe('nvidia/z-ai/glm-5.3');
+    });
+
+    it('inspectSession refuses (unknown, non-authoritative) when attempt has no recorded port', async () => {
+      const adapter = new ExecutionRunnerAdapter({
+        remotePort: 4096,
+      });
+
+      // Old record with no runner details
+      const status = await adapter.inspectSession({
+        attemptId: 'att-old',
+        sessionId: 'ses_old',
+        worktreePath: '/worktrees/lane-1',
+        runner: null,
+      });
+
+      expect(status.runnerReachable).toBe('unknown');
+      expect(status.completionReceipt).toBeNull();
+    });
+
+    it('inspectSession refuses when configured remotePort differs from recorded port', async () => {
+      const adapter = new ExecutionRunnerAdapter({
+        remotePort: 4096, // Differing port!
+      });
+
+      const status = await adapter.inspectSession({
+        attemptId: 'att-1',
+        sessionId: 'ses_1',
+        worktreePath: '/worktrees/lane-1',
+        runner: {
+          remotePort: 4166, // Recorded port was 4166
+          host: null,
+          agent: null,
+          model: 'nvidia/z-ai/glm-5.3',
+          variant: null,
+        },
+      });
+
+      expect(status.runnerReachable).toBe('unknown');
+      expect(status.completionReceipt).toBeNull();
+    });
+
+    it('inspectSession refuses when configured remoteHost differs from recorded host', async () => {
+      const adapter = new ExecutionRunnerAdapter({
+        remotePort: 4166,
+        remoteHost: 'wrong-host.lan',
+      });
+
+      const status = await adapter.inspectSession({
+        attemptId: 'att-1',
+        sessionId: 'ses_1',
+        worktreePath: '/worktrees/lane-1',
+        runner: {
+          remotePort: 4166,
+          host: 'expected-host.lan',
+          agent: null,
+          model: 'nvidia/z-ai/glm-5.3',
+          variant: null,
+        },
+      });
+
+      expect(status.runnerReachable).toBe('unknown');
+      expect(status.completionReceipt).toBeNull();
+    });
+  });
+
+  describe('3. M1: Classify ocm-run --status by Exit Code Only (No Keyword Scanning)', () => {
+    it('treats exit 3 as running even when stdout contains "idle"', async () => {
+      const runner: SubprocessRunner = async () => ({
+        exitCode: 3,
+        // Text contains idle and path contains idle! Keyword scanning would have marked it ended!
+        stdout: 'Session ses_idle_test is currently idle in /worktrees/idle-fix',
+        stderr: '',
+      });
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remotePort: 4166,
+      });
+
+      const status = await adapter.inspectSession({
+        attemptId: 'att-idle',
+        sessionId: 'ses_idle_test',
+        worktreePath: '/worktrees/idle-fix',
+        runner: {
+          remotePort: 4166,
+          host: null,
+          agent: null,
+          model: 'model',
+          variant: null,
+        },
+      });
+
+      expect(status.runnerReachable).toBe('reachable');
+      expect(status.workerCommand).toBe('active');
+      expect(status.completionReceipt).toBeNull();
+    });
+
+    it('treats exit 0 as ended even when stdout contains "error"', async () => {
+      const runner: SubprocessRunner = async () => ({
+        exitCode: 0,
+        // Text contains error! Keyword scanning would have marked it unreachable!
+        stdout: 'Previous error recovered; nothing running in /worktrees/error-retry',
+        stderr: '',
+      });
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remotePort: 4166,
+      });
+
+      const status = await adapter.inspectSession({
+        attemptId: 'att-error',
+        sessionId: 'ses_error_test',
+        worktreePath: '/worktrees/error-retry',
+        runner: {
+          remotePort: 4166,
+          host: null,
+          agent: null,
+          model: 'model',
+          variant: null,
+        },
+      });
+
+      expect(status.runnerReachable).toBe('reachable');
+      expect(status.workerCommand).toBe('ended');
+      expect(status.completionReceipt).not.toBeNull();
+      expect(status.completionReceipt?.authoritative).toBe(true);
+    });
+
+    it('treats exit codes other than 0 and 3 as unknown', async () => {
+      for (const exitCode of [1, 2, 4, 127]) {
+        const runner: SubprocessRunner = async () => ({
+          exitCode,
+          stdout: 'Active session running',
+          stderr: '',
+        });
+
+        const adapter = new ExecutionRunnerAdapter({
+          runSubprocess: runner,
+          remotePort: 4166,
+        });
+
+        const status = await adapter.inspectSession({
+          attemptId: 'att-1',
+          sessionId: 'ses_1',
+          worktreePath: '/worktrees/lane-1',
+          runner: {
+            remotePort: 4166,
+            host: null,
+            agent: null,
+            model: 'model',
+            variant: null,
+          },
+        });
+
+        expect(status.runnerReachable).toBe('unknown');
+        expect(status.workerCommand).toBe('not-started');
+        expect(status.completionReceipt).toBeNull();
+      }
+    });
+  });
+
+  describe('4. Authoritative Completion & Reconcile Capacity Release', () => {
+    it('"nothing running" is authoritative only when sessionId is recorded', async () => {
+      const runner: SubprocessRunner = async () => ({
+        exitCode: 0,
+        stdout: 'nothing is running',
+        stderr: '',
+      });
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remotePort: 4166,
+      });
+
+      // No recorded sessionId
+      const status = await adapter.inspectSession({
+        attemptId: 'att-no-session',
+        sessionId: '',
+        worktreePath: '/worktrees/lane-1',
+        runner: {
+          remotePort: 4166,
+          host: null,
+          agent: null,
+          model: 'model',
+          variant: null,
+        },
+      });
+
+      expect(status.runnerReachable).toBe('unknown');
+      expect(status.completionReceipt).toBeNull();
+    });
+
+    it('ReconcileAttemptUseCase releases capacity only on authoritative receipt', async () => {
+      const attempt = createMockAttempt({ state: 'running' });
+      const attempts = new Map<string, AttemptRecord>([[attempt.id, attempt]]);
+      const journal = createInMemoryJournal();
+
+      const attemptRepo: AttemptRepositoryPort = {
+        findAttemptById: async (id) => attempts.get(id) ?? null,
+        saveAttempt: async (rec) => {
+          attempts.set(rec.id, rec);
+        },
+        listAttemptsByWorkOrder: async () => [...attempts.values()],
+        listAllAttempts: async () => [...attempts.values()],
+      };
+
+      const authoritativeReceipt: CommandCompletionReceipt = {
+        attemptId: attempt.id,
+        sessionId: attempt.sessionId!,
+        endedAtIso: '2026-10-15T01:00:00.000Z',
+        authoritative: true,
+        exitStatus: null,
+        stoppedByRequest: false,
+      };
+
+      const runnerPort: ExecutionRunnerPort = {
+        describeCapabilities: () => ({
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        }),
+        startSession: async () => {
+          throw new Error('Not used');
+        },
+        inspectSession: async () => ({
+          runnerReachable: 'reachable',
+          workspacePreparation: 'prepared',
+          workerCommand: 'ended',
+          completionReceipt: authoritativeReceipt,
+          artifactsCollected: false,
+        }),
+        stopSession: async () => {
+          throw new Error('Not used');
+        },
+      };
+
+      const useCase = new ReconcileAttemptUseCase({
+        attemptRepo,
+        journal,
+        runner: runnerPort,
+      });
+
+      const result = await useCase.reconcileAttempt({ attemptId: attempt.id });
+      expect(result.outcome).toBe('ended');
+      expect(attempts.get(attempt.id)!.state).toBe('ended');
+      expect(journal.reservations[0].held).toBe(false); // Capacity released!
+    });
+
+    it('ReconcileAttemptUseCase does not release capacity when receipt is non-authoritative', async () => {
+      const attempt = createMockAttempt({ state: 'running' });
+      const attempts = new Map<string, AttemptRecord>([[attempt.id, attempt]]);
+      const journal = createInMemoryJournal();
+
+      const attemptRepo: AttemptRepositoryPort = {
+        findAttemptById: async (id) => attempts.get(id) ?? null,
+        saveAttempt: async (rec) => {
+          attempts.set(rec.id, rec);
+        },
+        listAttemptsByWorkOrder: async () => [...attempts.values()],
+        listAllAttempts: async () => [...attempts.values()],
+      };
+
+      const nonAuthoritativeReceipt: CommandCompletionReceipt = {
+        attemptId: attempt.id,
+        sessionId: attempt.sessionId!,
+        endedAtIso: '2026-10-15T01:00:00.000Z',
+        authoritative: false, // NON-AUTHORITATIVE!
+        exitStatus: null,
+        stoppedByRequest: false,
+      };
+
+      const runnerPort: ExecutionRunnerPort = {
+        describeCapabilities: () => ({
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        }),
+        startSession: async () => {
+          throw new Error('Not used');
+        },
+        inspectSession: async () => ({
+          runnerReachable: 'reachable',
+          workspacePreparation: 'prepared',
+          workerCommand: 'ended',
+          completionReceipt: nonAuthoritativeReceipt,
+          artifactsCollected: false,
+        }),
+        stopSession: async () => {
+          throw new Error('Not used');
+        },
+      };
+
+      const useCase = new ReconcileAttemptUseCase({
+        attemptRepo,
+        journal,
+        runner: runnerPort,
+      });
+
+      const result = await useCase.reconcileAttempt({ attemptId: attempt.id });
+      expect(result.outcome).toBe('unknown');
+      expect(attempts.get(attempt.id)!.state).toBe('reconciling');
+      expect(journal.reservations[0].held).toBe(true); // Capacity NOT released!
+    });
+  });
+
+  describe('5. L1: Never Fall Back to Session ID as Directory', () => {
+    it('inspectSession refuses when worktree directory cannot be resolved', async () => {
+      let executedArgs: readonly string[] = [];
+      const runner: SubprocessRunner = async (_cmd, args) => {
+        executedArgs = args;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remotePort: 4166,
+      });
+
+      const status = await adapter.inspectSession({
+        attemptId: 'att-unknown-dir',
+        sessionId: 'ses_fallback_test',
+        runner: {
+          remotePort: 4166,
+          host: null,
+          agent: null,
+          model: 'model',
+          variant: null,
+        },
+      });
+
+      expect(status.runnerReachable).toBe('unknown');
+      expect(executedArgs).toHaveLength(0); // Subprocess was not called with sessionId as dir!
+    });
+
+    it('stopSession refuses when worktree directory cannot be resolved', async () => {
+      let executedArgs: readonly string[] = [];
+      const runner: SubprocessRunner = async (_cmd, args) => {
+        executedArgs = args;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remotePort: 4166,
+      });
+
+      const result = await adapter.stopSession({
+        attemptId: 'att-unknown-dir',
+        sessionId: 'ses_fallback_test',
+        gracePeriodSeconds: 10,
+      });
+
+      expect(result.outcome).toBe('unknown');
+      expect(executedArgs).toHaveLength(0);
+    });
+  });
+
+  describe('6. L2: Abort Records exitStatus: null and stoppedByRequest: true', () => {
+    it('successful abort records exitStatus: null and stoppedByRequest: true instead of 130', async () => {
+      const runner: SubprocessRunner = async () => ({
+        exitCode: 0,
+        stdout: 'Session aborted',
+        stderr: '',
+      });
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+      });
+
+      const result = await adapter.stopSession({
+        attemptId: 'att-1',
+        sessionId: 'ses_abort_test',
+        worktreePath: '/worktrees/lane-1',
+        gracePeriodSeconds: 10,
+      });
+
+      expect(result.outcome).toBe('terminated');
+      const terminated = result as { outcome: 'terminated'; receipt: CommandCompletionReceipt };
+      expect(terminated.receipt.exitStatus).toBeNull();
+      expect(terminated.receipt.stoppedByRequest).toBe(true);
+      expect(terminated.receipt.authoritative).toBe(true);
+    });
+  });
+
+  describe('7. Appendix: StopAttemptUseCase Terminal States Guard', () => {
+    const journal = createInMemoryJournal();
+
+    function setupStopUseCase(attempt: AttemptRecord) {
+      const attempts = new Map<string, AttemptRecord>([[attempt.id, attempt]]);
+      const attemptRepo: AttemptRepositoryPort = {
+        findAttemptById: async (id) => attempts.get(id) ?? null,
+        saveAttempt: async (rec) => {
+          attempts.set(rec.id, rec);
+        },
+        listAttemptsByWorkOrder: async () => [...attempts.values()],
+        listAllAttempts: async () => [...attempts.values()],
+      };
+
+      let runnerStopCalled = false;
+      const runnerPort: ExecutionRunnerPort = {
+        describeCapabilities: () => ({
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        }),
+        startSession: async () => {
+          throw new Error('Not used');
+        },
+        inspectSession: async () => {
+          throw new Error('Not used');
+        },
+        stopSession: async () => {
+          runnerStopCalled = true;
+          return {
+            outcome: 'terminated',
+            receipt: {
+              attemptId: attempt.id,
+              sessionId: attempt.sessionId!,
+              endedAtIso: '2026-10-15T01:00:00.000Z',
+              authoritative: true,
+              exitStatus: null,
+              stoppedByRequest: true,
+            },
+          };
+        },
+      };
+
+      const useCase = new StopAttemptUseCase({
+        attemptRepo,
+        journal,
+        runner: runnerPort,
+      });
+
+      return { useCase, attempts, wasRunnerStopCalled: () => runnerStopCalled };
+    }
+
+    it('refuses stop on collected attempt instead of regressing it', async () => {
+      const attempt = createMockAttempt({ state: 'collected' });
+      const { useCase, attempts, wasRunnerStopCalled } = setupStopUseCase(attempt);
+
+      const result = await useCase.stopAttempt({ attemptId: attempt.id });
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain("terminal state 'collected'");
+      expect(attempts.get(attempt.id)!.state).toBe('collected');
+      expect(wasRunnerStopCalled()).toBe(false);
+    });
+
+    it('refuses stop on cancelled attempt', async () => {
+      const attempt = createMockAttempt({ state: 'cancelled' });
+      const { useCase, attempts, wasRunnerStopCalled } = setupStopUseCase(attempt);
+
+      const result = await useCase.stopAttempt({ attemptId: attempt.id });
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain("terminal state 'cancelled'");
+      expect(attempts.get(attempt.id)!.state).toBe('cancelled');
+      expect(wasRunnerStopCalled()).toBe(false);
+    });
+
+    it('refuses stop on ended attempt with authoritative receipt', async () => {
+      const attempt = createMockAttempt({
+        state: 'ended',
+        completionReceipt: {
+          attemptId: 'att-1',
+          sessionId: 'ses_test_123',
+          endedAtIso: '2026-10-15T01:00:00.000Z',
+          authoritative: true,
+          exitStatus: null,
+          stoppedByRequest: false,
+        },
+      });
+      const { useCase, attempts, wasRunnerStopCalled } = setupStopUseCase(attempt);
+
+      const result = await useCase.stopAttempt({ attemptId: attempt.id });
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain("terminal state 'ended'");
+      expect(attempts.get(attempt.id)!.state).toBe('ended');
+      expect(wasRunnerStopCalled()).toBe(false);
+    });
+
+    it('stops a running attempt', async () => {
+      const attempt = createMockAttempt({ state: 'running' });
+      const { useCase, attempts, wasRunnerStopCalled } = setupStopUseCase(attempt);
+
+      const result = await useCase.stopAttempt({ attemptId: attempt.id });
+      expect(result.outcome).toBe('terminated');
+      expect(attempts.get(attempt.id)!.state).toBe('cancelled');
+      expect(attempts.get(attempt.id)!.outcome).toBe('stopped');
+      expect(wasRunnerStopCalled()).toBe(true);
+    });
+  });
+
+  describe('8. ADDITION: Scoped Seat Override', () => {
+    function setupDispatchWithOverride(existingAttempt?: AttemptRecord) {
+      const workOrder = createMockWorkOrder();
+      const attempts = new Map<string, AttemptRecord>();
+      if (existingAttempt) {
+        attempts.set(existingAttempt.id, existingAttempt);
+      }
+      const journal = createInMemoryJournal();
+
+      const workOrderRepo: WorkOrderRepositoryPort = {
+        findWorkOrderById: async (id) => (id === workOrder.id ? workOrder : null),
+        saveWorkOrder: async () => {},
+        listWorkOrdersByProject: async () => [workOrder],
+      };
+
+      const attemptRepo: AttemptRepositoryPort = {
+        findAttemptById: async (id) => attempts.get(id) ?? null,
+        saveAttempt: async (rec) => {
+          attempts.set(rec.id, rec);
+        },
+        listAttemptsByWorkOrder: async () => [...attempts.values()],
+        listAllAttempts: async () => [...attempts.values()],
+      };
+
+      const workspace: WorkspacePort = {
+        inspectWorktree: async (req) => ({
+          worktreePath: req.worktreePath,
+          matchesBaseCommit: true,
+          checkedOutCommit: 'commit-base-123',
+          uncommittedPaths: [],
+          untrackedPaths: [],
+          residueFromEarlierAttempts: [],
+          missingExpectedArtifacts: [],
+        }),
+      };
+
+      let startedModel: string | undefined;
+      const runnerPort: ExecutionRunnerPort = {
+        describeCapabilities: () => ({
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        }),
+        describeRunner: () => ({
+          remotePort: 4096,
+          host: null,
+          agent: null,
+          model: null,
+          variant: null,
+        }),
+        startSession: async (req) => {
+          startedModel = req.model;
+          return {
+            outcome: 'started',
+            sessionId: 'ses_override_test',
+            runner: {
+              remotePort: 4096,
+              host: null,
+              agent: req.agent ?? null,
+              model: req.model ?? null,
+              variant: req.variant ?? null,
+            },
+          };
+        },
+        inspectSession: async () => {
+          throw new Error('Not used');
+        },
+        stopSession: async () => {
+          throw new Error('Not used');
+        },
+      };
+
+      const useCase = new DispatchAttemptUseCase({
+        workOrderRepo,
+        attemptRepo,
+        journal,
+        workspace,
+        runner: runnerPort,
+      });
+
+      return { useCase, attempts, journal, getStartedModel: () => startedModel };
+    }
+
+    it('refuses an override without a reason', async () => {
+      const { useCase } = setupDispatchWithOverride();
+
+      const result = await useCase.dispatchAttempt({
+        attemptId: 'att-1',
+        workOrderId: 'wo-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        briefDigest: 'digest-1',
+        baseCommit: 'commit-base-123',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: {
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        },
+        modelAssignment: {
+          model: 'nvidia/z-ai/glm-5.3',
+          variant: 'default',
+          fallbackModel: 'openai/gpt-4o',
+        },
+        seatOverride: {
+          model: 'anthropic/claude-3-5-sonnet',
+          reason: '', // Empty reason!
+          setBy: 'operator',
+        },
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('explicit reason');
+    });
+
+    it('refuses an expired override', async () => {
+      const { useCase } = setupDispatchWithOverride();
+
+      const result = await useCase.dispatchAttempt({
+        attemptId: 'att-1',
+        workOrderId: 'wo-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        briefDigest: 'digest-1',
+        baseCommit: 'commit-base-123',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: {
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        },
+        nowIso: '2026-10-15T12:00:00.000Z',
+        modelAssignment: {
+          model: 'nvidia/z-ai/glm-5.3',
+          variant: 'default',
+          fallbackModel: 'openai/gpt-4o',
+        },
+        seatOverride: {
+          model: 'anthropic/claude-3-5-sonnet',
+          reason: 'Need higher reasoning',
+          setBy: 'operator',
+          expiresAtIso: '2026-10-15T11:59:59.000Z', // Expired!
+        },
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('expired at');
+    });
+
+    it('refuses an override whose model shares underlying family with recorded reviewer seat', async () => {
+      const existing = createMockAttempt({
+        reviewerSeat: 'openrouter/z-ai/glm-5.3',
+      });
+      const { useCase } = setupDispatchWithOverride(existing);
+
+      const result = await useCase.dispatchAttempt({
+        attemptId: existing.id,
+        workOrderId: 'wo-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        briefDigest: 'digest-1',
+        baseCommit: 'commit-base-123',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: {
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        },
+        modelAssignment: {
+          model: 'anthropic/claude-3-5-sonnet',
+          variant: 'default',
+          fallbackModel: 'openai/gpt-4o',
+        },
+        seatOverride: {
+          model: 'nvidia/z-ai/glm-5.3#low', // Same underlying family as openrouter/z-ai/glm-5.3!
+          reason: 'Trying glm',
+          setBy: 'operator',
+        },
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('shares underlying model family');
+    });
+
+    it('accepts valid override, starts session with override model, and records in journal and attempt', async () => {
+      const existing = createMockAttempt({
+        reviewerSeat: 'anthropic/claude-3-5-sonnet',
+      });
+      const { useCase, attempts, journal, getStartedModel } = setupDispatchWithOverride(existing);
+
+      const result = await useCase.dispatchAttempt({
+        attemptId: existing.id,
+        workOrderId: 'wo-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        briefDigest: 'digest-1',
+        baseCommit: 'commit-base-123',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: {
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        },
+        modelAssignment: {
+          model: 'nvidia/z-ai/glm-5.3',
+          variant: 'default',
+          fallbackModel: 'openai/gpt-4o',
+        },
+        nowIso: '2026-10-15T12:00:00.000Z',
+        seatOverride: {
+          model: 'openai/gpt-4o',
+          variant: 'default',
+          reason: 'Authorized benchmark test',
+          setBy: 'martin',
+          expiresAtIso: '2026-10-15T23:59:59.000Z',
+        },
+      });
+
+      expect(result.outcome).toBe('started');
+      expect(getStartedModel()).toBe('openai/gpt-4o');
+
+      const saved = attempts.get(existing.id)!;
+      expect(saved.seatOverride).toBeDefined();
+      expect(saved.seatOverride?.model).toBe('openai/gpt-4o');
+      expect(saved.seatOverride?.reason).toBe('Authorized benchmark test');
+      expect(saved.seatOverride?.setBy).toBe('martin');
+
+      // Journal entry was appended
+      const overrideEntry = journal.entries.find((e) => e.detail?.includes('Seat override recorded'));
+      expect(overrideEntry).toBeDefined();
+      expect(overrideEntry?.detail).toContain('openai/gpt-4o');
+      expect(overrideEntry?.detail).toContain('Authorized benchmark test');
+      expect(overrideEntry?.detail).toContain('martin');
+    });
+
+    it('underlyingModelFamily handles prefixes, variants and segment stripping correctly', () => {
+      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3')).toBe('glm-5.3');
+      expect(underlyingModelFamily('openrouter/z-ai/glm-5.3')).toBe('glm-5.3');
+      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3#low')).toBe('glm-5.3');
+      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3-flash')).toBe('glm-5.3-flash');
+      expect(underlyingModelFamily('openrouter/z-ai/glm-5.3-flash')).toBe('glm-5.3-flash');
+      expect(underlyingModelFamily('openrouter/anthropic/claude-3-5-sonnet:beta')).toBe('claude-3-5-sonnet');
+      expect(underlyingModelFamily('anthropic/claude-3-5-sonnet')).toBe('claude-3-5-sonnet');
+      expect(underlyingModelFamily('openai/gpt-4o')).toBe('gpt-4o');
+      expect(underlyingModelFamily('gpt-4o')).toBe('gpt-4o');
+    });
+  });
+
+  describe('9. OCM_HOST: Validate with isSafeSshHost (Refuse Unsafe Without Spawning)', () => {
+    it('refuses startSession without spawning when remoteHost starts with a dash', async () => {
+      let spawned = false;
+      const runner: SubprocessRunner = async () => {
+        spawned = true;
+        return { exitCode: 0, stdout: JSON.stringify({ sessionID: 'ses_123' }), stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remoteHost: '-oProxyCommand=evil',
+        remotePort: 4166,
+      });
+
+      const result = await adapter.startSession({
+        attemptId: 'att-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        baseCommit: 'base-sha',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: adapter.describeCapabilities(),
+        modelAssignment: { model: 'glm-5' },
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('Unsafe OCM_HOST');
+      expect(spawned).toBe(false);
+    });
+
+    it('refuses startSession without spawning when remoteHost contains whitespace', async () => {
+      let spawned = false;
+      const runner: SubprocessRunner = async () => {
+        spawned = true;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remoteHost: 'host name with space',
+        remotePort: 4166,
+      });
+
+      const result = await adapter.startSession({
+        attemptId: 'att-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        baseCommit: 'base-sha',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: adapter.describeCapabilities(),
+        modelAssignment: { model: 'glm-5' },
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('Unsafe OCM_HOST');
+      expect(spawned).toBe(false);
+    });
+
+    it('refuses inspectSession without spawning when configured remoteHost is unsafe', async () => {
+      let spawned = false;
+      const runner: SubprocessRunner = async () => {
+        spawned = true;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remoteHost: '-unsafe-host',
+        remotePort: 4166,
+      });
+
+      const status = await adapter.inspectSession({
+        attemptId: 'att-1',
+        sessionId: 'ses_1',
+        worktreePath: '/worktrees/lane-1',
+        runner: {
+          remotePort: 4166,
+          host: '-unsafe-host',
+          agent: null,
+          model: 'glm-5',
+          variant: null,
+        },
+      });
+
+      expect(status.runnerReachable).toBe('unknown');
+      expect(spawned).toBe(false);
+    });
+
+    it('refuses inspectSession without spawning when recorded runner host is unsafe', async () => {
+      let spawned = false;
+      const runner: SubprocessRunner = async () => {
+        spawned = true;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remotePort: 4166,
+      });
+
+      const status = await adapter.inspectSession({
+        attemptId: 'att-1',
+        sessionId: 'ses_1',
+        worktreePath: '/worktrees/lane-1',
+        runner: {
+          remotePort: 4166,
+          host: '-injected-host',
+          agent: null,
+          model: 'glm-5',
+          variant: null,
+        },
+      });
+
+      expect(status.runnerReachable).toBe('unknown');
+      expect(spawned).toBe(false);
+    });
+
+    it('allows safe remoteHost and passes it to ocm-run subprocess as OCM_HOST', async () => {
+      let capturedEnv: Readonly<Record<string, string>> | undefined;
+      const runner: SubprocessRunner = async (_cmd, _args, env) => {
+        capturedEnv = env;
+        return { exitCode: 0, stdout: JSON.stringify({ sessionID: 'ses_safe' }), stderr: '' };
+      };
+
+      const adapter = new ExecutionRunnerAdapter({
+        runSubprocess: runner,
+        remoteHost: 'runner-node-01.internal',
+        remotePort: 4166,
+      });
+
+      const result = await adapter.startSession({
+        attemptId: 'att-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        baseCommit: 'base-sha',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: adapter.describeCapabilities(),
+        modelAssignment: { model: 'glm-5' },
+      });
+
+      expect(result.outcome).toBe('started');
+      expect(capturedEnv?.OCM_HOST).toBe('runner-node-01.internal');
+    });
+  });
+});

@@ -6,7 +6,11 @@
  * fix rounds never resume the prior conversation.
  */
 
-import type { AttemptRecord } from '../execution-records.js';
+import type {
+  AttemptRecord,
+  AttemptRunnerRecord,
+  AttemptSeatOverrideRecord,
+} from '../execution-records.js';
 import type { AttemptStateValue } from '../value-objects/AttemptState.vo.js';
 import { AttemptState } from '../value-objects/AttemptState.vo.js';
 
@@ -95,5 +99,17 @@ export class Attempt {
       this.record.completionReceipt.attemptId === attemptId &&
       this.record.completionReceipt.sessionId === sessionId
     );
+  }
+
+  getRunner(): AttemptRunnerRecord | null | undefined {
+    return this.record.runner;
+  }
+
+  getSeatOverride(): AttemptSeatOverrideRecord | null | undefined {
+    return this.record.seatOverride;
+  }
+
+  getReviewerSeat(): string | null | undefined {
+    return this.record.reviewerSeat;
   }
 }

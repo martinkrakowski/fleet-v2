@@ -63,6 +63,7 @@ const LANE_ID = 'lane-cli-1';
 const ATTEMPT_ID = 'attempt-1';
 const POLICY_REVISION = 'policy-1';
 const SESSION_ID = 'ses_cli_workflow_1';
+const RUNNER_PORT = 4166;
 
 /** One CLI invocation: exit code, raw stdout text and captured stderr. */
 interface Invocation {
@@ -92,6 +93,7 @@ describe('Fleet CLI workflow', () => {
   let testOwnerPublicKey: string;
   let testOwnerPrivateKey: KeyObject;
   let originalOwnerKey: string | undefined;
+  let originalOcmRemotePort: string | undefined;
 
   function signDecisionForWorkflow(fields: {
     requestId: string;
@@ -108,6 +110,8 @@ describe('Fleet CLI workflow', () => {
   beforeEach(() => {
     originalOwnerKey = process.env.FLEET_OWNER_PUBLIC_KEY;
     process.env.FLEET_OWNER_PUBLIC_KEY = testOwnerPublicKey;
+    originalOcmRemotePort = process.env.OCM_REMOTE_PORT;
+    process.env.OCM_REMOTE_PORT = String(RUNNER_PORT);
   });
 
   afterEach(() => {
@@ -115,6 +119,11 @@ describe('Fleet CLI workflow', () => {
       process.env.FLEET_OWNER_PUBLIC_KEY = originalOwnerKey;
     } else {
       delete process.env.FLEET_OWNER_PUBLIC_KEY;
+    }
+    if (originalOcmRemotePort !== undefined) {
+      process.env.OCM_REMOTE_PORT = originalOcmRemotePort;
+    } else {
+      delete process.env.OCM_REMOTE_PORT;
     }
   });
 
@@ -169,7 +178,7 @@ describe('Fleet CLI workflow', () => {
         '#!/bin/sh',
         'for arg in "$@"; do',
         '  if [ "$arg" = "--status" ]; then',
-        `    printf '%s\\n' '{"active":false,"endedAtIso":"2026-10-15T08:30:00.000Z","exitStatus":0,"artifactsCollected":true}'`,
+        `    printf '%s\\n' '{"active":false,"endedAtIso":"2026-10-15T08:30:00.000Z","exitStatus":0,"artifactsCollected":true,"port":${RUNNER_PORT}}'`,
         '    exit 0',
         '  fi',
         '  if [ "$arg" = "--abort" ]; then',
@@ -256,6 +265,7 @@ describe('Fleet CLI workflow', () => {
       stateDir,
       ocmRunBin: path.join(binDir, 'ocm-run'),
       ownerPublicKey: testOwnerPublicKey,
+      runnerRemotePort: RUNNER_PORT,
     });
   });
 
@@ -1084,13 +1094,13 @@ describe('Fleet CLI workflow', () => {
       reason: expect.stringContaining("No finding 'finding-1' was raised"),
     });
 
+    // Attempt attempt-1 is already in terminal state 'collected', so stopping
+    // it is refused rather than regressing its state to cancelled.
     const stop = await cli(['attempt', 'stop', '--json', jsonArg({ attemptId: ATTEMPT_ID })]);
-    expect(stop.code).toBe(0);
+    expect(stop.code).toBe(1);
     expect(jsonOf(stop)).toMatchObject({
-      outcome: 'terminated',
-      attempt: { id: ATTEMPT_ID, state: 'cancelled', outcome: 'stopped' },
-      receipt: { attemptId: ATTEMPT_ID, sessionId: SESSION_ID, stoppedByRequest: true },
-      capacityReleased: false,
+      outcome: 'refused',
+      reason: expect.stringContaining("terminal state 'collected' and cannot be stopped"),
     });
   });
 

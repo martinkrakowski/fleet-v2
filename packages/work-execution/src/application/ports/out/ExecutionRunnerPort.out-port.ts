@@ -6,7 +6,11 @@
  * implemented in this step.
  */
 
-import type { CommandCompletionReceipt } from '../../../domain/execution-records.js';
+import type {
+  AttemptRunnerRecord,
+  AttemptSeatOverrideRecord,
+  CommandCompletionReceipt,
+} from '../../../domain/execution-records.js';
 
 /**
  * Isolation capabilities a runner must declare before an attempt may be
@@ -52,6 +56,16 @@ export interface StartRunnerSessionRequest {
   readonly stepLimit: number;
   readonly timeLimitSeconds: number;
   readonly requiredCapabilities: RunnerIsolationCapabilities;
+  readonly agent?: string;
+  readonly model?: string;
+  readonly variant?: string;
+  readonly seatOverride?: AttemptSeatOverrideRecord;
+  readonly modelAssignment?: {
+    readonly model: string;
+    readonly variant?: string;
+    readonly fallbackModel?: string;
+    readonly agent?: string;
+  };
 }
 
 /**
@@ -60,19 +74,26 @@ export interface StartRunnerSessionRequest {
  * it is never retried blindly and never releases capacity.
  */
 export type StartRunnerSessionResult =
-  | { readonly outcome: 'started'; readonly sessionId: string }
+  | {
+      readonly outcome: 'started';
+      readonly sessionId: string;
+      readonly runner?: AttemptRunnerRecord;
+    }
   | { readonly outcome: 'refused'; readonly reason: string }
   | { readonly outcome: 'unknown'; readonly reason: string };
 
 export interface RunnerSessionRef {
   readonly attemptId: string;
   readonly sessionId: string;
+  readonly worktreePath?: string;
+  readonly runner?: AttemptRunnerRecord | null;
 }
 
 export interface StopRunnerSessionRequest {
   readonly attemptId: string;
   readonly sessionId: string;
   readonly gracePeriodSeconds: number;
+  readonly worktreePath?: string;
 }
 
 /**
@@ -88,6 +109,9 @@ export type StopRunnerSessionResult =
 export interface ExecutionRunnerPort {
   /** Capabilities this runner can actually enforce, declared before dispatch. */
   describeCapabilities(): RunnerIsolationCapabilities;
+
+  /** Optional runner configuration details for attempt recording and port fidelity. */
+  describeRunner?(): AttemptRunnerRecord | undefined;
 
   /** Start one prepared attempt's worker command in its scoped worktree. */
   startSession(request: StartRunnerSessionRequest): Promise<StartRunnerSessionResult>;

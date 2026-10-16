@@ -8,7 +8,12 @@
  * blindly and never releases capacity.
  */
 
-import type { ActionJournalEntryRecord, AttemptRecord } from '../../domain/execution-records.js';
+import type {
+  ActionJournalEntryRecord,
+  AttemptRecord,
+  AttemptRunnerRecord,
+} from '../../domain/execution-records.js';
+import { underlyingModelFamily } from '../../domain/execution-records.js';
 import type { DispatchAttemptPort, DispatchAttemptRequest, DispatchAttemptResult } from '../ports/in/DispatchAttemptPort.in-port.js';
 import type { RunnerIsolationCapabilities } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
@@ -134,6 +139,50 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
 
     const nowIso = request.nowIso ?? new Date().toISOString();
 
+    const existingAttempt = await this.deps.attemptRepo.findAttemptById(request.attemptId);
+
+    // Validate seat override if provided (ADDITION)
+    if (request.seatOverride) {
+      if (!request.seatOverride.reason || request.seatOverride.reason.trim() === '') {
+        return { outcome: 'refused', reason: 'Seat override requires an explicit reason' };
+      }
+      if (request.seatOverride.expiresAtIso && request.seatOverride.expiresAtIso <= nowIso) {
+        return {
+          outcome: 'refused',
+          reason: `Seat override expired at ${request.seatOverride.expiresAtIso}`,
+        };
+      }
+      const recordedReviewer = request.reviewerSeat ?? existingAttempt?.reviewerSeat;
+      if (
+        recordedReviewer &&
+        underlyingModelFamily(request.seatOverride.model) ===
+          underlyingModelFamily(recordedReviewer)
+      ) {
+        return {
+          outcome: 'refused',
+          reason: `Seat override model '${request.seatOverride.model}' shares underlying model family with recorded reviewer seat '${recordedReviewer}'`,
+        };
+      }
+    }
+
+    const effectiveModel =
+      request.seatOverride?.model ??
+      request.modelAssignment?.model ??
+      request.model;
+    const effectiveAgent =
+      request.seatOverride?.agent ??
+      request.modelAssignment?.agent ??
+      request.agent;
+    const effectiveVariant =
+      request.seatOverride?.variant ??
+      request.modelAssignment?.variant ??
+      request.variant;
+
+    // Refuse to start when no model is known
+    if (!effectiveModel || effectiveModel.trim() === '') {
+      return { outcome: 'refused', reason: 'No model specified for dispatch' };
+    }
+
     // Durable intent first: the journal records the dispatch before the
     // runner subprocess is contacted.
     await appendJournalEntry(this.deps.journal, {
@@ -147,7 +196,33 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       detail: 'Dispatch intent recorded before runner start',
     });
 
-    const existingAttempt = await this.deps.attemptRepo.findAttemptById(request.attemptId);
+    if (request.seatOverride) {
+      await appendJournalEntry(this.deps.journal, {
+        attemptId: request.attemptId,
+        workOrderId: request.workOrderId,
+        action: 'dispatch',
+        baseCommit: request.baseCommit,
+        recordedAtIso: nowIso,
+        status: 'intent-recorded',
+        sessionId: null,
+        detail: `Seat override recorded: ${request.seatOverride.model} (by ${request.seatOverride.setBy}, reason: ${request.seatOverride.reason}${request.seatOverride.expiresAtIso ? `, expires: ${request.seatOverride.expiresAtIso}` : ''})`,
+      });
+    }
+
+    const runnerInfo = this.deps.runner.describeRunner?.();
+    const runnerPort = runnerInfo?.remotePort ?? request.runnerPort;
+    const runnerHost = runnerInfo?.host ?? request.runnerHost ?? null;
+    const initialRunner: AttemptRunnerRecord | null =
+      runnerPort !== undefined
+        ? {
+            remotePort: runnerPort,
+            host: runnerHost,
+            agent: effectiveAgent ?? runnerInfo?.agent ?? null,
+            model: effectiveModel,
+            variant: effectiveVariant ?? runnerInfo?.variant ?? null,
+          }
+        : null;
+
     const dispatchingAttempt: AttemptRecord = existingAttempt
       ? {
           ...existingAttempt,
@@ -157,6 +232,9 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           briefDigest: request.briefDigest,
           briefPackagePath: request.briefPackagePath,
           sessionId: null,
+          runner: initialRunner ?? existingAttempt.runner ?? null,
+          seatOverride: request.seatOverride ?? existingAttempt.seatOverride ?? null,
+          reviewerSeat: request.reviewerSeat ?? existingAttempt.reviewerSeat ?? null,
           updatedAtIso: nowIso,
         }
       : {
@@ -174,6 +252,9 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           sessionId: null,
           completionReceipt: null,
           artifacts: null,
+          runner: initialRunner,
+          seatOverride: request.seatOverride ?? null,
+          reviewerSeat: request.reviewerSeat ?? null,
           createdAtIso: nowIso,
           updatedAtIso: nowIso,
         };
@@ -187,6 +268,11 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       stepLimit: request.stepLimit,
       timeLimitSeconds: request.timeLimitSeconds,
       requiredCapabilities: request.requiredCapabilities,
+      model: effectiveModel,
+      agent: effectiveAgent,
+      variant: effectiveVariant,
+      seatOverride: request.seatOverride,
+      modelAssignment: request.modelAssignment,
     });
 
     if (startResult.outcome === 'started') {
@@ -194,6 +280,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         ...dispatchingAttempt,
         state: 'running',
         sessionId: startResult.sessionId,
+        runner: startResult.runner ?? dispatchingAttempt.runner ?? null,
         updatedAtIso: nowIso,
       };
       await this.deps.attemptRepo.saveAttempt(runningAttempt);

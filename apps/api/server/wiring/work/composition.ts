@@ -211,6 +211,8 @@ export function createConfiguredWorkComposition(
     remoteHost: runnerRemoteHost,
     resolveWorktreePath: async (attemptId) =>
       (await attemptRepo.findAttemptById(attemptId))?.worktreePath ?? null,
+    resolveAttempt: async (attemptId) =>
+      await attemptRepo.findAttemptById(attemptId),
   });
   const acceptancePort = new AcceptanceAssessmentAdapter(crossContext?.acceptance);
   const briefKnowledge = new BriefKnowledgeAdapter(crossContext?.briefKnowledge);

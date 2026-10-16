@@ -582,6 +582,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     remoteHost: runnerRemoteHost,
     resolveWorktreePath: async (attemptId) =>
       (await attemptRepository.findAttemptById(attemptId))?.worktreePath ?? null,
+    resolveAttempt: async (attemptId) =>
+      await attemptRepository.findAttemptById(attemptId),
   });
   const attemptArtifact = new AttemptArtifactAdapter({ sshHost: worktreeSshHost });
   // Hand-written brief files arrive per request; no default prose is assumed.

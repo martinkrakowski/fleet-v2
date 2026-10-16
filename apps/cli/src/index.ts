@@ -9,9 +9,11 @@
  * `CliIo`, so package code never touches `console`.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import type {
+  AttemptSeatOverrideRecord,
   BriefContextDecision,
   BriefModelAssignment,
   CommandCompletionReceipt,
@@ -367,13 +369,92 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         ...STRICT_RUNNER_CAPABILITIES,
         ...(nested<Partial<RunnerIsolationCapabilities>>(p, 'requiredCapabilities') ?? {}),
       };
+
+      // Seat override from --seat-override and --override-reason
+      let seatOverride = nested<AttemptSeatOverrideRecord>(p, 'seatOverride');
+      const seatOverrideStr = optStr(p, 'seatOverride');
+      if (!seatOverride && seatOverrideStr) {
+        const colonIndex = seatOverrideStr.lastIndexOf(':');
+        let model = seatOverrideStr;
+        let variant: string | undefined;
+        if (colonIndex !== -1 && colonIndex > seatOverrideStr.indexOf('/')) {
+          model = seatOverrideStr.slice(0, colonIndex);
+          variant = seatOverrideStr.slice(colonIndex + 1);
+        }
+        const reason = str(p, 'overrideReason');
+        const setBy = str(p, 'overrideSetBy') || process.env.USER || 'operator';
+        const expiresAtIso = optStr(p, 'overrideExpiresAt') ?? optStr(p, 'overrideExpiresAtIso');
+        const agent = optStr(p, 'overrideAgent');
+        seatOverride = {
+          model,
+          ...(variant ? { variant } : {}),
+          ...(agent ? { agent } : {}),
+          reason,
+          setBy,
+          ...(expiresAtIso ? { expiresAtIso } : {}),
+        };
+      } else if (seatOverride && !seatOverride.reason && optStr(p, 'overrideReason')) {
+        seatOverride = { ...seatOverride, reason: str(p, 'overrideReason') };
+      }
+
+      let modelAssignment =
+        nested<BriefModelAssignment & { agent?: string }>(p, 'modelAssignment') ??
+        (optStr(p, 'model')
+          ? {
+              model: str(p, 'model'),
+              variant: str(p, 'variant') || 'default',
+              fallbackModel: str(p, 'fallbackModel'),
+              agent: optStr(p, 'agent'),
+            }
+          : undefined);
+
+      let reviewerSeat =
+        optStr(p, 'reviewerSeat') ??
+        optStr(p, 'reviewerModel') ??
+        existing?.reviewerSeat ??
+        undefined;
+
+      const briefPackagePath =
+        str(p, 'briefPackagePath') ||
+        (worktreePath === '' ? '' : join(worktreePath, '.lane', 'brief.md'));
+
+      // If modelAssignment or reviewerSeat is not in input, read from the frozen brief package
+      if (!modelAssignment || !reviewerSeat) {
+        const candidatePaths = [
+          briefPackagePath ? briefPackagePath.replace(/\.md$/, '-manifest.json') : null,
+          briefPackagePath && worktreePath
+            ? join(worktreePath, briefPackagePath).replace(/\.md$/, '-manifest.json')
+            : null,
+          worktreePath ? join(worktreePath, '.lane', 'brief-manifest.json') : null,
+        ].filter((cp): cp is string => cp !== null && existsSync(cp));
+
+        for (const candidatePath of candidatePaths) {
+          try {
+            const raw = readFileSync(candidatePath, 'utf8');
+            const parsed = JSON.parse(raw) as Record<string, unknown>;
+            if (!modelAssignment && parsed && typeof parsed === 'object' && parsed.modelAssignment) {
+              modelAssignment = parsed.modelAssignment as BriefModelAssignment & { agent?: string };
+            }
+            if (
+              !reviewerSeat &&
+              parsed &&
+              typeof parsed === 'object' &&
+              typeof parsed.independentReviewer === 'string'
+            ) {
+              reviewerSeat = parsed.independentReviewer;
+            }
+            if (modelAssignment && reviewerSeat) break;
+          } catch {
+            // ignore
+          }
+        }
+      }
+
       return rt.execution.dispatchAttempt.dispatchAttempt({
         attemptId,
         workOrderId: str(p, 'workOrderId') || existing?.workOrderId || '',
         worktreePath,
-        briefPackagePath:
-          str(p, 'briefPackagePath') ||
-          (worktreePath === '' ? '' : join(worktreePath, '.lane', 'brief.md')),
+        briefPackagePath,
         briefDigest: str(p, 'briefDigest') || existing?.briefDigest || '',
         baseCommit: str(p, 'baseCommit') || existing?.baseCommit || '',
         stepLimit: num(p, 'stepLimit', 200),
@@ -381,6 +462,11 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         expectedArtifacts: strArr(p, 'expectedArtifacts'),
         requiredCapabilities,
         nowIso: optStr(p, 'nowIso'),
+        modelAssignment,
+        seatOverride,
+        reviewerSeat,
+        runnerPort: optNum(p, 'runnerPort') ?? optNum(p, 'remotePort'),
+        runnerHost: optStr(p, 'runnerHost') ?? optStr(p, 'remoteHost'),
       });
     },
     reconcile: async (p, rt) =>

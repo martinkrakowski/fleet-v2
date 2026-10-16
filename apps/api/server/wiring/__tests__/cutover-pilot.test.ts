@@ -435,8 +435,8 @@ describe("cross-context state persistence helpers", () => {
 
     expect(readAcceptedReceiptsFromState(stateDir)).toEqual({});
 
-    persistAcceptedReceiptsToState(stateDir, { "head-a": "acc-a" });
-    persistAcceptedReceiptsToState(stateDir, { "head-b": "acc-b" });
+    await persistAcceptedReceiptsToState(stateDir, { "head-a": "acc-a" });
+    await persistAcceptedReceiptsToState(stateDir, { "head-b": "acc-b" });
 
     // The second write merges instead of dropping the first process's receipt.
     expect(readAcceptedReceiptsFromState(stateDir)).toEqual({
@@ -451,13 +451,13 @@ describe("cross-context state persistence helpers", () => {
 
     expect(readAuthorizationCoordinatesFromState(stateDir).size).toBe(0);
 
-    persistAuthorizationCoordinatesToState(
+    await persistAuthorizationCoordinatesToState(
       stateDir,
       new Map([
         ["grant-a", { attemptId: "attempt-a", expectedHeadSha: "head-a" }],
       ]),
     );
-    persistAuthorizationCoordinatesToState(
+    await persistAuthorizationCoordinatesToState(
       stateDir,
       new Map([
         ["grant-b", { attemptId: "attempt-b", expectedHeadSha: "head-b" }],

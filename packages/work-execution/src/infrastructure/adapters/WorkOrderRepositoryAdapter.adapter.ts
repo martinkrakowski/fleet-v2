@@ -3,8 +3,8 @@
  * WorkOrderRepositoryAdapter implements WorkOrderRepositoryPort
  * (local-transactional-store). Records live in an in-memory map by default;
  * when `stateDir` is configured each mutation is persisted as JSON via an
- * atomic temp-file-then-rename write. Optimistic concurrency refuses stale
- * revisions instead of silently overwriting newer state.
+ * atomic temp-file-then-rename write under an exclusive lock. Optimistic concurrency refuses stale
+ * revisions evaluated against the freshly read record.
  */
 
 import { promises as fs } from 'node:fs';
@@ -12,13 +12,12 @@ import * as path from 'node:path';
 
 import type { WorkOrderRecord } from '../../domain/execution-records.js';
 import type { WorkOrderRepositoryPort } from '../../application/ports/out/WorkOrderRepositoryPort.out-port.js';
+import { withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface WorkOrderRepositoryAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
   readonly stateDir?: string;
 }
-
-let workOrderTempCounter = 0;
 
 function isWorkOrderRecord(value: unknown): value is WorkOrderRecord {
   if (typeof value !== 'object' || value === null) return false;
@@ -27,76 +26,88 @@ function isWorkOrderRecord(value: unknown): value is WorkOrderRecord {
 }
 
 export class WorkOrderRepositoryAdapter implements WorkOrderRepositoryPort {
-  private readonly records = new Map<string, WorkOrderRecord>();
-  private loadPromise: Promise<void> | null = null;
-  private persistCounter = 0;
+  private readonly inMemoryRecords = new Map<string, WorkOrderRecord>();
 
   constructor(private readonly options?: WorkOrderRepositoryAdapterOptions) {}
 
   async saveWorkOrder(record: WorkOrderRecord): Promise<void> {
-    await this.ensureLoaded();
-    const existing = this.records.get(record.id);
-    if (existing !== undefined && existing.revision >= record.revision) {
-      throw new Error(
-        `Stale work order revision for ${record.id}: expected > ${existing.revision}, got ${record.revision}`,
-      );
+    const stateDir = this.options?.stateDir;
+    if (stateDir === undefined) {
+      const existing = this.inMemoryRecords.get(record.id);
+      if (existing !== undefined && existing.revision >= record.revision) {
+        throw new Error(
+          `Stale work order revision for ${record.id}: expected > ${existing.revision}, got ${record.revision}`,
+        );
+      }
+      this.inMemoryRecords.set(record.id, record);
+      return;
     }
-    this.records.set(record.id, record);
-    await this.persist();
+
+    const target = path.join(stateDir, 'work-orders.json');
+    const lockPath = path.join(stateDir, 'work-orders.json.lock');
+
+    await withFileLock(lockPath, async () => {
+      const records = await this.readRecordsFromDisk(target);
+      const existing = records.get(record.id);
+      if (existing !== undefined && existing.revision >= record.revision) {
+        throw new Error(
+          `Stale work order revision for ${record.id}: expected > ${existing.revision}, got ${record.revision}`,
+        );
+      }
+      records.set(record.id, record);
+      await writeJsonAtomically(target, [...records.values()]);
+    });
   }
 
   async findWorkOrderById(workOrderId: string): Promise<WorkOrderRecord | null> {
-    await this.ensureLoaded();
-    return this.records.get(workOrderId) ?? null;
+    const stateDir = this.options?.stateDir;
+    if (stateDir === undefined) {
+      return this.inMemoryRecords.get(workOrderId) ?? null;
+    }
+    const target = path.join(stateDir, 'work-orders.json');
+    const records = await this.readRecordsFromDisk(target);
+    return records.get(workOrderId) ?? null;
   }
 
   async listWorkOrdersByProject(projectId?: string): Promise<readonly WorkOrderRecord[]> {
-    await this.ensureLoaded();
-    const records = [...this.records.values()];
-    if (projectId === undefined) return records;
-    return records.filter((record) => record.projectId === projectId);
-  }
-
-  private ensureLoaded(): Promise<void> {
-    if (this.loadPromise === null) {
-      this.loadPromise = this.loadFromDisk().catch((error: unknown) => {
-        this.loadPromise = null;
-        throw error;
-      });
-    }
-    return this.loadPromise;
-  }
-
-  private async loadFromDisk(): Promise<void> {
     const stateDir = this.options?.stateDir;
-    if (stateDir === undefined) return;
+    if (stateDir === undefined) {
+      const records = [...this.inMemoryRecords.values()];
+      if (projectId === undefined) return records;
+      return records.filter((record) => record.projectId === projectId);
+    }
+    const target = path.join(stateDir, 'work-orders.json');
+    const records = await this.readRecordsFromDisk(target);
+    const list = [...records.values()];
+    if (projectId === undefined) return list;
+    return list.filter((record) => record.projectId === projectId);
+  }
+
+  private async readRecordsFromDisk(target: string): Promise<Map<string, WorkOrderRecord>> {
+    const map = new Map<string, WorkOrderRecord>();
     let raw: string;
     try {
-      raw = await fs.readFile(path.join(stateDir, 'work-orders.json'), 'utf8');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      raw = await fs.readFile(target, 'utf8');
+    } catch (error: unknown) {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        (error as { code?: string }).code === 'ENOENT'
+      ) {
+        return map;
+      }
       throw error;
     }
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return;
-    for (const item of parsed) {
-      if (isWorkOrderRecord(item)) this.records.set(item.id, item);
-    }
-  }
-
-  private async persist(): Promise<void> {
-    const stateDir = this.options?.stateDir;
-    if (stateDir === undefined) return;
-    const target = path.join(stateDir, 'work-orders.json');
-    const temp = `${target}.${process.pid}-${this.persistCounter++}-${workOrderTempCounter++}.tmp`;
-    const serialized = JSON.stringify([...this.records.values()], null, 2);
-    await fs.mkdir(stateDir, { recursive: true });
+    let parsed: unknown;
     try {
-      await fs.writeFile(temp, serialized, 'utf8');
-      await fs.rename(temp, target);
-    } catch (error) {
-      await fs.rm(temp, { force: true }).catch(() => undefined);
-      throw error;
+      parsed = JSON.parse(raw);
+    } catch {
+      return map;
     }
+    if (!Array.isArray(parsed)) return map;
+    for (const item of parsed) {
+      if (isWorkOrderRecord(item)) map.set(item.id, item);
+    }
+    return map;
   }
 }

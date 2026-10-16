@@ -2,21 +2,23 @@
  * CoordinationRequestRepositoryAdapter implements
  * CoordinationRequestRepositoryPort over a local transactional store: an
  * in-process map that optionally persists to
- * `<stateDir>/coordination-requests.json`.
+ * `<stateDir>/coordination-requests.json` under an exclusive lock.
  *
  * Every stored or loaded record is re-validated by the domain, so a request
  * that would duplicate a consumption, hide a delivery gap or invent a state
  * never becomes readable state. Writes are revision-aware: a stale or
- * conflicting revision is an error rather than a silent overwrite, and lookups
- * return known absence as null instead of synthesizing a request.
+ * conflicting revision evaluated against the freshly read record is an error
+ * rather than a silent overwrite, and lookups return known absence as null
+ * instead of synthesizing a request.
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import type { CoordinationRequestRepositoryPort } from '../../application/ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import { withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface CoordinationRequestRepositoryAdapterOptions {
   /** When set, requests are persisted here and reloaded on first use. */
@@ -37,57 +39,107 @@ function copy(record: CoordinationRequestRecord): CoordinationRequestRecord {
 }
 
 export class CoordinationRequestRepositoryAdapter implements CoordinationRequestRepositoryPort {
-  private readonly requests = new Map<string, CoordinationRequestRecord>();
-  private readonly grants = new Map<string, string>();
-  private loaded = false;
+  private readonly inMemoryRequests = new Map<string, CoordinationRequestRecord>();
+  private readonly inMemoryGrants = new Map<string, string>();
 
   constructor(private readonly options: CoordinationRequestRepositoryAdapterOptions = {}) {}
 
   async saveRequest(record: CoordinationRequestRecord): Promise<void> {
-    await this.ensureLoaded();
-    const validated = CoordinationRequest.fromRecord(record).toRecord();
-    const existing = this.requests.get(validated.id);
-    if (existing !== undefined) {
-      if (validated.revision < existing.revision) {
-        throw new Error(
-          `CoordinationRequestRepositoryAdapter refuses stale revision ${validated.revision} for ${validated.id}; stored revision is ${existing.revision}`,
-        );
+    const target = this.statePath;
+    if (target === null) {
+      const validated = CoordinationRequest.fromRecord(record).toRecord();
+      const existing = this.inMemoryRequests.get(validated.id);
+      if (existing !== undefined) {
+        if (validated.revision < existing.revision) {
+          throw new Error(
+            `CoordinationRequestRepositoryAdapter refuses stale revision ${validated.revision} for ${validated.id}; stored revision is ${existing.revision}`,
+          );
+        }
+        if (
+          validated.revision === existing.revision &&
+          JSON.stringify(copy(validated)) !== JSON.stringify(copy(existing))
+        ) {
+          throw new Error(
+            `CoordinationRequestRepositoryAdapter refuses conflicting revision ${validated.revision} for ${validated.id}`,
+          );
+        }
       }
-      if (
-        validated.revision === existing.revision &&
-        JSON.stringify(copy(validated)) !== JSON.stringify(copy(existing))
-      ) {
-        throw new Error(
-          `CoordinationRequestRepositoryAdapter refuses conflicting revision ${validated.revision} for ${validated.id}`,
-        );
-      }
+      this.inMemoryRequests.set(validated.id, validated);
+      this.reindexGrant(validated);
+      return;
     }
-    this.requests.set(validated.id, validated);
-    this.reindexGrant(validated);
-    await this.persist();
+
+    const lockPath = `${target}.lock`;
+    const validated = CoordinationRequest.fromRecord(record).toRecord();
+
+    await withFileLock(lockPath, async () => {
+      const records = await this.readRecordsFromDisk(target);
+      const existing = records.get(validated.id);
+      if (existing !== undefined) {
+        if (validated.revision < existing.revision) {
+          throw new Error(
+            `CoordinationRequestRepositoryAdapter refuses stale revision ${validated.revision} for ${validated.id}; stored revision is ${existing.revision}`,
+          );
+        }
+        if (
+          validated.revision === existing.revision &&
+          JSON.stringify(copy(validated)) !== JSON.stringify(copy(existing))
+        ) {
+          throw new Error(
+            `CoordinationRequestRepositoryAdapter refuses conflicting revision ${validated.revision} for ${validated.id}`,
+          );
+        }
+      }
+      records.set(validated.id, validated);
+      const list = [...records.values()]
+        .sort((left, right) => left.id.localeCompare(right.id))
+        .map(copy);
+      await writeJsonAtomically(target, list);
+    });
   }
 
   async findRequestById(requestId: string): Promise<CoordinationRequestRecord | null> {
-    await this.ensureLoaded();
-    const found = this.requests.get(requestId);
+    const target = this.statePath;
+    if (target === null) {
+      const found = this.inMemoryRequests.get(requestId);
+      return found === undefined ? null : copy(found);
+    }
+    const records = await this.readRecordsFromDisk(target);
+    const found = records.get(requestId);
     return found === undefined ? null : copy(found);
   }
 
   async findRequestByGrantId(grantId: string): Promise<CoordinationRequestRecord | null> {
-    await this.ensureLoaded();
-    const requestId = this.grants.get(grantId);
-    if (requestId === undefined) {
-      return null;
+    const target = this.statePath;
+    if (target === null) {
+      const requestId = this.inMemoryGrants.get(grantId);
+      if (requestId === undefined) {
+        return null;
+      }
+      const found = this.inMemoryRequests.get(requestId);
+      return found === undefined ? null : copy(found);
     }
-    const found = this.requests.get(requestId);
+    const records = await this.readRecordsFromDisk(target);
+    const found = [...records.values()].find((r) => r.grantId === grantId);
     return found === undefined ? null : copy(found);
   }
 
   async listRequests(projectId?: string): Promise<readonly CoordinationRequestRecord[]> {
-    await this.ensureLoaded();
+    const target = this.statePath;
     const wanted =
       typeof projectId === 'string' && projectId.trim().length > 0 ? projectId.trim() : undefined;
-    return [...this.requests.values()]
+    if (target === null) {
+      return [...this.inMemoryRequests.values()]
+        .filter((record) => wanted === undefined || record.projectId === wanted)
+        .sort((left, right) =>
+          left.createdAtIso === right.createdAtIso
+            ? left.id.localeCompare(right.id)
+            : left.createdAtIso.localeCompare(right.createdAtIso),
+        )
+        .map(copy);
+    }
+    const records = await this.readRecordsFromDisk(target);
+    return [...records.values()]
       .filter((record) => wanted === undefined || record.projectId === wanted)
       .sort((left, right) =>
         left.createdAtIso === right.createdAtIso
@@ -97,15 +149,14 @@ export class CoordinationRequestRepositoryAdapter implements CoordinationRequest
       .map(copy);
   }
 
-  /** A grant moves with its record; a released grant stops resolving. */
   private reindexGrant(record: CoordinationRequestRecord): void {
-    for (const [grantId, requestId] of [...this.grants.entries()]) {
+    for (const [grantId, requestId] of [...this.inMemoryGrants.entries()]) {
       if (requestId === record.id) {
-        this.grants.delete(grantId);
+        this.inMemoryGrants.delete(grantId);
       }
     }
     if (record.grantId !== null) {
-      this.grants.set(record.grantId, record.id);
+      this.inMemoryGrants.set(record.grantId, record.id);
     }
   }
 
@@ -121,21 +172,14 @@ export class CoordinationRequestRepositoryAdapter implements CoordinationRequest
     return join(stateDir, name);
   }
 
-  private async ensureLoaded(): Promise<void> {
-    if (this.loaded) {
-      return;
-    }
-    this.loaded = true;
-    const path = this.statePath;
-    if (path === null) {
-      return;
-    }
+  private async readRecordsFromDisk(path: string): Promise<Map<string, CoordinationRequestRecord>> {
+    const map = new Map<string, CoordinationRequestRecord>();
     let contents: string;
     try {
-      contents = await readFile(path, 'utf8');
-    } catch (error) {
+      contents = await fs.readFile(path, 'utf8');
+    } catch (error: unknown) {
       if (isNotFound(error)) {
-        return;
+        return map;
       }
       throw new Error(
         `CoordinationRequestRepositoryAdapter could not read ${path}: ${describe(error)}`,
@@ -144,7 +188,7 @@ export class CoordinationRequestRepositoryAdapter implements CoordinationRequest
     let parsed: unknown;
     try {
       parsed = JSON.parse(contents);
-    } catch (error) {
+    } catch (error: unknown) {
       throw new Error(
         `CoordinationRequestRepositoryAdapter could not parse ${path}: ${describe(error)}`,
       );
@@ -154,19 +198,9 @@ export class CoordinationRequestRepositoryAdapter implements CoordinationRequest
     }
     for (const entry of parsed) {
       const record = CoordinationRequest.fromRecord(entry as CoordinationRequestRecord).toRecord();
-      this.requests.set(record.id, record);
-      this.reindexGrant(record);
+      map.set(record.id, record);
     }
-  }
-
-  private async persist(): Promise<void> {
-    const path = this.statePath;
-    if (path === null) {
-      return;
-    }
-    const records = [...this.requests.values()].sort((left, right) => left.id.localeCompare(right.id)).map(copy);
-    await mkdir(this.options.stateDir as string, { recursive: true });
-    await writeFile(path, `${JSON.stringify(records, null, 2)}\n`, 'utf8');
+    return map;
   }
 }
 

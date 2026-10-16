@@ -1,21 +1,23 @@
 /**
  * ProjectProfileRepositoryAdapter implements ProjectProfileRepositoryPort over a
  * private installation store: an in-process map that optionally persists to
- * `<stateDir>/project-profiles.json`.
+ * `<stateDir>/project-profiles.json` under an exclusive lock.
  *
  * Only the fields this context owns are persisted, and every stored or loaded
  * profile is re-validated by the domain before it is handed back, so a
  * credential-shaped field can never accumulate in installation state. Writes
- * are version-aware: a stale or conflicting revision is an error, never a
- * silent overwrite, and known absence is null while unreadable state throws.
+ * are version-aware: a stale or conflicting revision evaluated against the
+ * freshly read record is an error, never a silent overwrite, and known absence
+ * is null while unreadable state throws.
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
 import type { ProjectProfileRecord } from '../../domain/coordination-records.js';
 import { ProjectProfile } from '../../domain/entities/ProjectProfile.js';
 import type { ProjectProfileRepositoryPort } from '../../application/ports/out/ProjectProfileRepositoryPort.out-port.js';
+import { withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface ProjectProfileRepositoryAdapterOptions {
   /** When set, profiles are persisted here and reloaded on first use. */
@@ -32,37 +34,71 @@ function copy(record: ProjectProfileRecord): ProjectProfileRecord {
 }
 
 export class ProjectProfileRepositoryAdapter implements ProjectProfileRepositoryPort {
-  private readonly profiles = new Map<string, ProjectProfileRecord>();
-  private loaded = false;
+  private readonly inMemoryProfiles = new Map<string, ProjectProfileRecord>();
 
   constructor(private readonly options: ProjectProfileRepositoryAdapterOptions = {}) {}
 
   async saveProfile(record: ProjectProfileRecord): Promise<void> {
-    await this.ensureLoaded();
-    const validated = ProjectProfile.fromRecord(record).toRecord();
-    const existing = this.profiles.get(validated.projectId);
-    if (existing !== undefined) {
-      if (validated.revision < existing.revision) {
-        throw new Error(
-          `ProjectProfileRepositoryAdapter refuses stale revision ${validated.revision} for ${validated.projectId}; stored revision is ${existing.revision}`,
-        );
+    const target = this.statePath;
+    if (target === null) {
+      const validated = ProjectProfile.fromRecord(record).toRecord();
+      const existing = this.inMemoryProfiles.get(validated.projectId);
+      if (existing !== undefined) {
+        if (validated.revision < existing.revision) {
+          throw new Error(
+            `ProjectProfileRepositoryAdapter refuses stale revision ${validated.revision} for ${validated.projectId}; stored revision is ${existing.revision}`,
+          );
+        }
+        if (
+          validated.revision === existing.revision &&
+          JSON.stringify(copy(validated)) !== JSON.stringify(copy(existing))
+        ) {
+          throw new Error(
+            `ProjectProfileRepositoryAdapter refuses conflicting revision ${validated.revision} for ${validated.projectId}`,
+          );
+        }
       }
-      if (
-        validated.revision === existing.revision &&
-        JSON.stringify(copy(validated)) !== JSON.stringify(copy(existing))
-      ) {
-        throw new Error(
-          `ProjectProfileRepositoryAdapter refuses conflicting revision ${validated.revision} for ${validated.projectId}`,
-        );
-      }
+      this.inMemoryProfiles.set(validated.projectId, validated);
+      return;
     }
-    this.profiles.set(validated.projectId, validated);
-    await this.persist();
+
+    const lockPath = `${target}.lock`;
+    const validated = ProjectProfile.fromRecord(record).toRecord();
+
+    await withFileLock(lockPath, async () => {
+      const profiles = await this.readProfilesFromDisk(target);
+      const existing = profiles.get(validated.projectId);
+      if (existing !== undefined) {
+        if (validated.revision < existing.revision) {
+          throw new Error(
+            `ProjectProfileRepositoryAdapter refuses stale revision ${validated.revision} for ${validated.projectId}; stored revision is ${existing.revision}`,
+          );
+        }
+        if (
+          validated.revision === existing.revision &&
+          JSON.stringify(copy(validated)) !== JSON.stringify(copy(existing))
+        ) {
+          throw new Error(
+            `ProjectProfileRepositoryAdapter refuses conflicting revision ${validated.revision} for ${validated.projectId}`,
+          );
+        }
+      }
+      profiles.set(validated.projectId, validated);
+      const list = [...profiles.values()]
+        .sort((left, right) => left.projectId.localeCompare(right.projectId))
+        .map(copy);
+      await writeJsonAtomically(target, list);
+    });
   }
 
   async findProfileById(projectId: string): Promise<ProjectProfileRecord | null> {
-    await this.ensureLoaded();
-    const found = this.profiles.get(projectId);
+    const target = this.statePath;
+    if (target === null) {
+      const found = this.inMemoryProfiles.get(projectId);
+      return found === undefined ? null : copy(found);
+    }
+    const profiles = await this.readProfilesFromDisk(target);
+    const found = profiles.get(projectId);
     return found === undefined ? null : copy(found);
   }
 
@@ -78,21 +114,14 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
     return join(stateDir, name);
   }
 
-  private async ensureLoaded(): Promise<void> {
-    if (this.loaded) {
-      return;
-    }
-    this.loaded = true;
-    const path = this.statePath;
-    if (path === null) {
-      return;
-    }
+  private async readProfilesFromDisk(path: string): Promise<Map<string, ProjectProfileRecord>> {
+    const map = new Map<string, ProjectProfileRecord>();
     let contents: string;
     try {
-      contents = await readFile(path, 'utf8');
-    } catch (error) {
+      contents = await fs.readFile(path, 'utf8');
+    } catch (error: unknown) {
       if (isNotFound(error)) {
-        return;
+        return map;
       }
       throw new Error(
         `ProjectProfileRepositoryAdapter could not read ${path}: ${describe(error)}`,
@@ -101,7 +130,7 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
     let parsed: unknown;
     try {
       parsed = JSON.parse(contents);
-    } catch (error) {
+    } catch (error: unknown) {
       throw new Error(
         `ProjectProfileRepositoryAdapter could not parse ${path}: ${describe(error)}`,
       );
@@ -111,20 +140,9 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
     }
     for (const entry of parsed) {
       const profile = ProjectProfile.fromRecord(entry as ProjectProfileRecord).toRecord();
-      this.profiles.set(profile.projectId, profile);
+      map.set(profile.projectId, profile);
     }
-  }
-
-  private async persist(): Promise<void> {
-    const path = this.statePath;
-    if (path === null) {
-      return;
-    }
-    const records = [...this.profiles.values()]
-      .sort((left, right) => left.projectId.localeCompare(right.projectId))
-      .map(copy);
-    await mkdir(this.options.stateDir as string, { recursive: true });
-    await writeFile(path, `${JSON.stringify(records, null, 2)}\n`, 'utf8');
+    return map;
   }
 }
 

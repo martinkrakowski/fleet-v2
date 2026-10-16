@@ -17,8 +17,10 @@
  */
 
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { withFileLock, writeJsonAtomically } from './file-store.js';
 
 import {
   AcceptanceAssessmentAdapter,
@@ -197,18 +199,6 @@ function readJsonRecord<T>(filePath: string): Record<string, T> {
   } catch {
     return {};
   }
-}
-
-/**
- * Write one flat JSON record file atomically: the payload lands in a
- * process-unique temp file first and is renamed over the target, so a
- * concurrent reader never observes a half-written document.
- */
-function writeJsonRecordAtomic<T>(filePath: string, data: Record<string, T>): void {
-  mkdirSync(dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp-${process.pid}`;
-  writeFileSync(tempPath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
-  renameSync(tempPath, filePath);
 }
 
 /** Grant-to-attempt binding persisted for cross-process forge execution. */
@@ -657,9 +647,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       if (result.outcome === 'accepted') {
         acceptedReceiptByHead[result.candidateHeadSha] = result.receiptId;
         if (acceptedReceiptsPath !== undefined) {
-          writeJsonRecordAtomic(acceptedReceiptsPath, {
-            ...readJsonRecord<string>(acceptedReceiptsPath),
-            [result.candidateHeadSha]: result.receiptId,
+          await withFileLock(`${acceptedReceiptsPath}.lock`, async () => {
+            const current = readJsonRecord<string>(acceptedReceiptsPath);
+            current[result.candidateHeadSha] = result.receiptId;
+            await writeJsonAtomically(acceptedReceiptsPath, current);
           });
         }
         return {
@@ -751,12 +742,14 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
           expectedHeadSha: request.expectedHeadSha,
         });
         if (authorizationCoordinatesPath !== undefined) {
-          writeJsonRecordAtomic(authorizationCoordinatesPath, {
-            ...readJsonRecord<AuthorizationCoordinates>(authorizationCoordinatesPath),
-            [result.grantId]: {
+          await withFileLock(`${authorizationCoordinatesPath}.lock`, async () => {
+            const current =
+              readJsonRecord<AuthorizationCoordinates>(authorizationCoordinatesPath);
+            current[result.grantId] = {
               attemptId: request.attemptId,
               expectedHeadSha: request.expectedHeadSha,
-            },
+            };
+            await writeJsonAtomically(authorizationCoordinatesPath, current);
           });
         }
         return { outcome: 'granted', authorizationGrantId: result.grantId };

@@ -2,16 +2,18 @@
 /**
  * KnowledgeEntryRepositoryAdapter implements KnowledgeEntryRepositoryPort
  * (local-transactional-store): an in-memory Map with optional stateDir JSON
- * persistence (`knowledge-entries.json`, `context-selections.json`) and
- * optimistic concurrency enforced on `revision`. Records are stored exactly
- * as the use case produced them; the repository adds no domain decisions.
+ * persistence (`knowledge-entries.json`, `context-selections.json`) under exclusive
+ * file locks and optimistic concurrency enforced on `revision` evaluated against
+ * the freshly read record. Records are stored exactly as the use case produced them;
+ * the repository adds no domain decisions.
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { promises as fs } from 'node:fs';
+import { join } from 'node:path';
 import type { KnowledgeEntryRecord } from '../../domain/knowledge-records.js';
 import type { ContextSelectionProps } from '../../domain/value-objects/ContextSelection.vo.js';
 import type { KnowledgeEntryRepositoryPort } from '../../application/ports/out/KnowledgeEntryRepositoryPort.out-port.js';
+import { withFileLock, writeJsonAtomically } from './file-store.js';
 
 const ENTRIES_FILE = 'knowledge-entries.json';
 const SELECTIONS_FILE = 'context-selections.json';
@@ -22,9 +24,8 @@ export interface KnowledgeEntryRepositoryAdapterDependencies {
 }
 
 export class KnowledgeEntryRepositoryAdapter implements KnowledgeEntryRepositoryPort {
-  private readonly entries = new Map<string, KnowledgeEntryRecord>();
-  private readonly selectionsByAttempt = new Map<string, ContextSelectionProps[]>();
-  private loaded = false;
+  private readonly inMemoryEntries = new Map<string, KnowledgeEntryRecord>();
+  private readonly inMemorySelectionsByAttempt = new Map<string, ContextSelectionProps[]>();
 
   constructor(private readonly deps?: KnowledgeEntryRepositoryAdapterDependencies) {}
 
@@ -40,30 +41,59 @@ export class KnowledgeEntryRepositoryAdapter implements KnowledgeEntryRepository
     if (typeof record.revision !== 'number' || !Number.isInteger(record.revision)) {
       throw new Error(`KnowledgeEntryRepositoryAdapter requires an integer revision for entry ${record.id}`);
     }
-    await this.ensureLoaded();
 
-    // Optimistic concurrency: a write must carry a revision newer than the
-    // stored one; same-revision or stale writes are conflicts.
-    const stored = this.entries.get(record.id);
-    if (stored && record.revision <= stored.revision) {
-      throw new Error(
-        `Optimistic concurrency conflict for knowledge entry ${record.id}: ` +
-          `stored revision ${stored.revision}, incoming revision ${record.revision}`,
-      );
+    const stateDir = this.deps?.stateDir;
+    if (!stateDir) {
+      const stored = this.inMemoryEntries.get(record.id);
+      if (stored && record.revision <= stored.revision) {
+        throw new Error(
+          `Optimistic concurrency conflict for knowledge entry ${record.id}: ` +
+            `stored revision ${stored.revision}, incoming revision ${record.revision}`,
+        );
+      }
+      this.inMemoryEntries.set(record.id, record);
+      return;
     }
 
-    this.entries.set(record.id, record);
-    await this.persistEntries();
+    const target = join(stateDir, ENTRIES_FILE);
+    const lockPath = `${target}.lock`;
+
+    await withFileLock(lockPath, async () => {
+      const entries = await this.readEntriesFromDisk(target);
+      const stored = entries.get(record.id);
+      if (stored && record.revision <= stored.revision) {
+        throw new Error(
+          `Optimistic concurrency conflict for knowledge entry ${record.id}: ` +
+            `stored revision ${stored.revision}, incoming revision ${record.revision}`,
+        );
+      }
+      entries.set(record.id, record);
+      await writeJsonAtomically(target, [...entries.values()]);
+    });
   }
 
   async findEntryById(entryId: string): Promise<KnowledgeEntryRecord | null> {
-    await this.ensureLoaded();
-    return this.entries.get(entryId) ?? null;
+    const stateDir = this.deps?.stateDir;
+    if (!stateDir) {
+      return this.inMemoryEntries.get(entryId) ?? null;
+    }
+    const target = join(stateDir, ENTRIES_FILE);
+    const entries = await this.readEntriesFromDisk(target);
+    return entries.get(entryId) ?? null;
   }
 
   async listEntriesByProject(projectId?: string): Promise<readonly KnowledgeEntryRecord[]> {
-    await this.ensureLoaded();
-    const all = [...this.entries.values()];
+    const stateDir = this.deps?.stateDir;
+    if (!stateDir) {
+      const all = [...this.inMemoryEntries.values()];
+      if (projectId === undefined) {
+        return all;
+      }
+      return all.filter((entry) => entry.projectId === projectId);
+    }
+    const target = join(stateDir, ENTRIES_FILE);
+    const entries = await this.readEntriesFromDisk(target);
+    const all = [...entries.values()];
     if (projectId === undefined) {
       return all;
     }
@@ -77,100 +107,79 @@ export class KnowledgeEntryRepositoryAdapter implements KnowledgeEntryRepository
     if (!Array.isArray(selections)) {
       throw new Error('KnowledgeEntryRepositoryAdapter requires a selections array');
     }
-    await this.ensureLoaded();
-    const existing = this.selectionsByAttempt.get(attemptId) ?? [];
-    this.selectionsByAttempt.set(attemptId, [...existing, ...selections]);
-    await this.persistSelections();
+
+    const stateDir = this.deps?.stateDir;
+    if (!stateDir) {
+      const existing = this.inMemorySelectionsByAttempt.get(attemptId) ?? [];
+      this.inMemorySelectionsByAttempt.set(attemptId, [...existing, ...selections]);
+      return;
+    }
+
+    const target = join(stateDir, SELECTIONS_FILE);
+    const lockPath = `${target}.lock`;
+
+    await withFileLock(lockPath, async () => {
+      const all = await this.readSelectionsFromDisk(target);
+      all.push(...selections);
+      await writeJsonAtomically(target, all);
+    });
   }
 
   async listContextSelections(attemptId: string): Promise<readonly ContextSelectionProps[]> {
-    await this.ensureLoaded();
-    return [...(this.selectionsByAttempt.get(attemptId) ?? [])];
-  }
-
-  /** Load persisted state once, lazily; absent files are empty state, unreadable state is an error. */
-  private async ensureLoaded(): Promise<void> {
-    if (this.loaded) {
-      return;
-    }
-    this.loaded = true;
     const stateDir = this.deps?.stateDir;
     if (!stateDir) {
-      return;
+      return [...(this.inMemorySelectionsByAttempt.get(attemptId) ?? [])];
     }
-
-    const entriesPath = join(stateDir, ENTRIES_FILE);
-    const storedEntries = await readJsonFile(entriesPath);
-    if (storedEntries !== null) {
-      if (!Array.isArray(storedEntries)) {
-        throw new Error(`Unreadable knowledge entries state at ${entriesPath}: expected a JSON array`);
-      }
-      for (const record of storedEntries) {
-        if (record && typeof record.id === 'string') {
-          this.entries.set(record.id, record as KnowledgeEntryRecord);
-        }
-      }
-    }
-
-    const selectionsPath = join(stateDir, SELECTIONS_FILE);
-    const storedSelections = await readJsonFile(selectionsPath);
-    if (storedSelections !== null) {
-      if (!Array.isArray(storedSelections)) {
-        throw new Error(`Unreadable context selections state at ${selectionsPath}: expected a JSON array`);
-      }
-      for (const props of storedSelections) {
-        if (props && typeof props.attemptId === 'string') {
-          const existing = this.selectionsByAttempt.get(props.attemptId) ?? [];
-          this.selectionsByAttempt.set(props.attemptId, [...existing, props as ContextSelectionProps]);
-        }
-      }
-    }
+    const target = join(stateDir, SELECTIONS_FILE);
+    const all = await this.readSelectionsFromDisk(target);
+    return all.filter((selection) => selection.attemptId === attemptId);
   }
 
-  private async persistEntries(): Promise<void> {
-    const stateDir = this.deps?.stateDir;
-    if (!stateDir) {
-      return;
+  private async readEntriesFromDisk(target: string): Promise<Map<string, KnowledgeEntryRecord>> {
+    const map = new Map<string, KnowledgeEntryRecord>();
+    const stored = await readJsonFile(target);
+    if (stored === null) return map;
+    if (!Array.isArray(stored)) {
+      throw new Error(`Unreadable knowledge entries state at ${target}: expected a JSON array`);
     }
-    await writeJsonFile(join(stateDir, ENTRIES_FILE), [...this.entries.values()]);
+    for (const record of stored) {
+      if (record && typeof (record as { id?: unknown }).id === 'string') {
+        map.set((record as KnowledgeEntryRecord).id, record as KnowledgeEntryRecord);
+      }
+    }
+    return map;
   }
 
-  private async persistSelections(): Promise<void> {
-    const stateDir = this.deps?.stateDir;
-    if (!stateDir) {
-      return;
+  private async readSelectionsFromDisk(target: string): Promise<ContextSelectionProps[]> {
+    const stored = await readJsonFile(target);
+    if (stored === null) return [];
+    if (!Array.isArray(stored)) {
+      throw new Error(`Unreadable context selections state at ${target}: expected a JSON array`);
     }
-    const all: ContextSelectionProps[] = [];
-    for (const selections of this.selectionsByAttempt.values()) {
-      all.push(...selections);
+    const valid: ContextSelectionProps[] = [];
+    for (const props of stored) {
+      if (props && typeof (props as { attemptId?: unknown }).attemptId === 'string') {
+        valid.push(props as ContextSelectionProps);
+      }
     }
-    await writeJsonFile(join(stateDir, SELECTIONS_FILE), all);
+    return valid;
   }
 }
 
-async function readJsonFile(path: string): Promise<unknown> {
+async function readJsonFile(filePath: string): Promise<unknown> {
   let raw: string;
   try {
-    raw = await readFile(path, 'utf8');
-  } catch (error) {
+    raw = await fs.readFile(filePath, 'utf8');
+  } catch (error: unknown) {
     if (isEnoent(error)) {
       return null;
     }
-    throw new Error(`Unreadable knowledge state file at ${path}: ${errorMessage(error)}`);
+    throw new Error(`Unreadable knowledge state file at ${filePath}: ${errorMessage(error)}`);
   }
   try {
     return JSON.parse(raw) as unknown;
-  } catch (error) {
-    throw new Error(`Unreadable knowledge state file at ${path}: ${errorMessage(error)}`);
-  }
-}
-
-async function writeJsonFile(path: string, value: unknown): Promise<void> {
-  try {
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  } catch (error) {
-    throw new Error(`Failed to persist knowledge state file ${path}: ${errorMessage(error)}`);
+  } catch (error: unknown) {
+    throw new Error(`Unreadable knowledge state file at ${filePath}: ${errorMessage(error)}`);
   }
 }
 

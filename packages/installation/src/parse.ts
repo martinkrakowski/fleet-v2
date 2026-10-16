@@ -1,5 +1,7 @@
 import { isAbsolute } from 'node:path';
 
+import { AGY_SECURITY_TEXT_VERSION } from './agy-security.js';
+
 import type {
   ChainStep,
   ChainTrigger,
@@ -78,6 +80,9 @@ const WAVES_KEYS: readonly string[] = ['baseUrl', 'tokenFile', 'caFile', 'ownerP
 const SHELF_KEYS: readonly string[] = ['baseUrl', 'keyFile'];
 const HOST_KEYS: readonly string[] = ['transport', 'sshAlias', 'worktreeRoot', 'tmpDir', 'roles', 'runner'];
 const HOST_RUNNER_KEYS: readonly string[] = ['kind', 'port', 'authFile', 'capabilities', 'maxLanes'];
+// An agy runner carries the mode and, for `full`, the security acknowledgement (D7).
+const AGY_HOST_RUNNER_KEYS: readonly string[] = [...HOST_RUNNER_KEYS, 'agyMode', 'agyAcknowledgement'];
+const AGY_ACKNOWLEDGEMENT_KEYS: readonly string[] = ['textVersion', 'acceptedAt'];
 const CAPABILITY_KEYS: readonly string[] = [
   'networkEgressRestricted',
   'cpuAndMemoryLimited',
@@ -696,34 +701,125 @@ function parseRunnerCapabilities(
   };
 }
 
+const ISO_TIMESTAMP_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+
+function isIsoTimestamp(value: string): boolean {
+  return ISO_TIMESTAMP_PATTERN.test(value) && !Number.isNaN(Date.parse(value));
+}
+
+function parseAgyAcknowledgement(
+  runner: JsonObject,
+  runnerPath: string,
+  errors: string[],
+): { textVersion: string; acceptedAt: string } | undefined {
+  if (!Object.hasOwn(runner, 'agyAcknowledgement')) {
+    return undefined;
+  }
+  const section = runner.agyAcknowledgement;
+  const fieldPath = `${runnerPath}.agyAcknowledgement`;
+  if (!isJsonObject(section)) {
+    errors.push(`${fieldPath}: must be an object`);
+    return undefined;
+  }
+  collectUnknownKeys(section, AGY_ACKNOWLEDGEMENT_KEYS, fieldPath, errors);
+  const textVersion = readRequiredString(section, 'textVersion', `${fieldPath}.textVersion`, errors);
+  const acceptedAt = readRequiredString(section, 'acceptedAt', `${fieldPath}.acceptedAt`, errors);
+  if (acceptedAt !== undefined && !isIsoTimestamp(acceptedAt)) {
+    errors.push(`${fieldPath}.acceptedAt: must be an ISO 8601 timestamp`);
+    return undefined;
+  }
+  if (textVersion === undefined || acceptedAt === undefined) {
+    return undefined;
+  }
+  if (textVersion !== AGY_SECURITY_TEXT_VERSION) {
+    errors.push(`${fieldPath}: agyAcknowledgement is stale; re-confirm with init or /settings`);
+    return undefined;
+  }
+  return { textVersion, acceptedAt };
+}
+
 function parseHostRunner(
   runner: JsonObject,
   runnerPath: string,
   errors: string[],
 ): HostRunnerSection | undefined {
-  collectUnknownKeys(runner, HOST_RUNNER_KEYS, runnerPath, errors);
+  collectUnknownKeys(runner, AGY_HOST_RUNNER_KEYS, runnerPath, errors);
   const kind = readRequiredEnum(
     runner,
     'kind',
     `${runnerPath}.kind`,
-    ['opencode'],
+    ['opencode', 'agy'],
     'must be a known runner kind',
     errors,
   );
+  // The agy-only fields are unknown keys on an opencode runner (D7).
+  if (kind === 'opencode') {
+    for (const agyOnlyKey of ['agyMode', 'agyAcknowledgement']) {
+      if (Object.hasOwn(runner, agyOnlyKey)) {
+        errors.push(`${runnerPath}: unknown key`);
+      }
+    }
+  }
   const port = readRequiredPort(runner, 'port', `${runnerPath}.port`, errors);
   const authFile = readOptionalAbsolutePath(runner, 'authFile', `${runnerPath}.authFile`, errors);
   const capabilities = parseRunnerCapabilities(runner, runnerPath, errors);
   const maxLanes = readOptionalPositiveInteger(runner, 'maxLanes', `${runnerPath}.maxLanes`, errors);
+  let agyMode: 'edit-only' | 'full' | undefined;
+  let agyAcknowledgement: { textVersion: string; acceptedAt: string } | undefined;
+  if (kind === 'agy') {
+    agyMode = readRequiredEnum(
+      runner,
+      'agyMode',
+      `${runnerPath}.agyMode`,
+      ['edit-only', 'full'],
+      'must be a known agy runner mode',
+      errors,
+    );
+    agyAcknowledgement = parseAgyAcknowledgement(runner, runnerPath, errors);
+    // Loader rule (D7): `full` requires a declared isolation floor and a
+    // current acknowledgement of the security text. The messages name the
+    // field and the rule, never the file's values.
+    if (agyMode === 'full') {
+      const floorOk =
+        capabilities !== undefined &&
+        capabilities.filesystemScope === 'scoped-worktree' &&
+        capabilities.networkEgressRestricted === true &&
+        capabilities.processTreeTermination === true;
+      if (!floorOk) {
+        errors.push(
+          `${runnerPath}.agyMode: full requires the declared isolation floor` +
+            ' (scoped-worktree filesystem, restricted network egress, process tree termination)',
+        );
+      }
+      if (!Object.hasOwn(runner, 'agyAcknowledgement')) {
+        errors.push(
+          `${runnerPath}.agyAcknowledgement: full requires an acknowledgement of the current security text`,
+        );
+      }
+    }
+  }
   if (kind === undefined || port === undefined) {
     return undefined;
   }
-  return {
-    kind,
+  const common = {
     port,
     ...(authFile !== undefined ? { authFile } : {}),
     ...(capabilities !== undefined ? { capabilities } : {}),
     ...(maxLanes !== undefined ? { maxLanes } : {}),
   };
+  if (kind === 'agy') {
+    if (agyMode === undefined) {
+      return undefined;
+    }
+    return {
+      kind,
+      ...common,
+      agyMode,
+      ...(agyAcknowledgement !== undefined ? { agyAcknowledgement } : {}),
+    };
+  }
+  return { kind: 'opencode', ...common };
 }
 
 function parseRoles<T extends string>(

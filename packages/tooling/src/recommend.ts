@@ -20,6 +20,10 @@
  *   in the input), when the caller names one, admits only matching
  *   candidates. A disallowed candidate is skipped with a reason and never
  *   appears in the output, not even as a lower-ranked chain entry.
+ * - An agy seat follows the runner mode (plan D7): it is treated
+ *   edit-only — the orchestrator runs its checks and commits — unless the
+ *   input says every agy lane-runner host in the installation is `full`.
+ *   The treatment is stated on every agy seat's reason line.
  * - The catalogue must pass `@fleet/installation`'s `validateSeatPolicy`.
  *   The recommender never returns an invalid catalogue: if no valid one can
  *   be built, the typed `no-valid-catalogue` result carries the reasons.
@@ -42,8 +46,9 @@ import {
   type SeatSection,
 } from '@fleet/installation';
 
+import { agyCapabilitiesFor } from './agy.js';
 import { BUILT_IN_TOOLS } from './descriptors.js';
-import type { SignInStatus, ToolId } from './types.js';
+import type { AgyMode, SignInStatus, ToolCapabilities, ToolDescriptor, ToolId } from './types.js';
 
 /** Version of the recommender's output shape. Starts at `1`. */
 export const RECOMMENDER_VERSION = '1' as const;
@@ -322,6 +327,38 @@ function pickReviewers(candidates: readonly Candidate[]): ReviewerPick | undefin
 }
 
 /**
+ * The mode an agy seat is treated as (plan D7): edit-only unless the
+ * caller says every agy lane-runner host in the installation is `full`.
+ * The default is the conservative one: an installation the caller says
+ * nothing about never gets a seat assumed to run commands.
+ */
+function agySeatMode(allAgyHostsFull: boolean): AgyMode {
+  return allAgyHostsFull ? 'full' : 'edit-only';
+}
+
+/**
+ * The capabilities a seat on this tool has under the resolved agy mode.
+ * Only agy has mode-keyed capabilities (plan D7); every other tool is
+ * fully described by its single capability set.
+ */
+function seatCapabilities(descriptor: ToolDescriptor, agyMode: AgyMode): ToolCapabilities {
+  return descriptor.id === 'agy' ? agyCapabilitiesFor(agyMode) : descriptor.capabilities;
+}
+
+/**
+ * One clause stating how an agy seat is treated (plan D7), appended to the
+ * seat's reason line; empty for every other tool.
+ */
+function modeClause(tool: ToolId, agyMode: AgyMode): string {
+  if (tool !== 'agy') {
+    return '';
+  }
+  return agyMode === 'full'
+    ? '; agy seat treated full: every agy lane-runner host is full'
+    : '; agy seat treated edit-only (default): the orchestrator runs its checks and commits';
+}
+
+/**
  * Recommend seats and chains for the detected tools. Pure: the same input
  * always yields the same output, and nothing outside `input` is read.
  */
@@ -329,6 +366,13 @@ export function recommendSeats(input: {
   tools: readonly DetectedTool[];
   models: ModelsByTool;
   policy: RecommendPolicy;
+  /**
+   * True only when every agy lane-runner host in the installation declares
+   * `agyMode: full` (plan D7). Default false: an agy seat is treated as
+   * edit-only — the orchestrator runs its checks and commits — unless the
+   * caller says otherwise.
+   */
+  allAgyHostsFull?: boolean;
   /**
    * Optional allow-list over the candidate pool. When present, only
    * candidates admitted by at least one rule are ranked at all — a
@@ -341,6 +385,7 @@ export function recommendSeats(input: {
 }): SeatRecommendation {
   const skipped: string[] = [];
   const tierSeenOrder = new Map<string, number>();
+  const agyMode = agySeatMode(input.allAgyHostsFull === true);
 
   // Usable candidates, per tool, in input order. Tools whose sign-in could
   // not be confirmed and model lists reported `unknown` are skipped.
@@ -421,13 +466,15 @@ export function recommendSeats(input: {
 
   // Implementer candidates: tools that can run commands, plus edit-only
   // tools whose checks and commits the orchestrator runs. A read-only tool
-  // can only review.
+  // can only review. An agy seat's capabilities follow its mode (D7):
+  // edit-only by default, `full` only when every agy lane-runner host is.
   const implementerCandidates = allowed.filter((candidate) => {
     const descriptor = BUILT_IN_TOOLS.find((entry) => entry.id === candidate.tool);
     if (descriptor === undefined) {
       return false;
     }
-    return descriptor.capabilities.canRunCommands || !descriptor.capabilities.readOnlyMode;
+    const capabilities = seatCapabilities(descriptor, agyMode);
+    return capabilities.canRunCommands || !capabilities.readOnlyMode;
   });
 
   // Paid seats are proposed only after a working free or plan-quota seat.
@@ -501,8 +548,8 @@ export function recommendSeats(input: {
     });
     reasons[id] =
       candidate.costClass === 'paid'
-        ? `implementer: paid seat on ${candidate.displayName} (${candidate.modelId}); paid only after the free or plan-quota seats`
-        : `implementer: ${candidate.costClass} seat on ${candidate.displayName} (${candidate.modelId}); free and plan-quota seats come first`;
+        ? `implementer: paid seat on ${candidate.displayName} (${candidate.modelId}); paid only after the free or plan-quota seats${modeClause(candidate.tool, agyMode)}`
+        : `implementer: ${candidate.costClass} seat on ${candidate.displayName} (${candidate.modelId}); free and plan-quota seats come first${modeClause(candidate.tool, agyMode)}`;
     implementerSteps.push({ seatId: id });
   }
 
@@ -518,7 +565,7 @@ export function recommendSeats(input: {
       roles: ['reviewer', 'high-risk-reviewer'],
       costClass: candidate.costClass,
     });
-    reasons[id] = reason;
+    reasons[id] = `${reason}${modeClause(candidate.tool, agyMode)}`;
     reviewerSteps.push({ seatId: id });
   };
   addReviewerSeat(

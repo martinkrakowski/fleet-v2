@@ -121,14 +121,36 @@ export interface RunnerCapabilityDeclaration {
   readonly filesystemScope: DeclaredFilesystemScope;
 }
 
-/** The `runner` block of a v2 host. */
-export interface HostRunnerSection {
-  readonly kind: 'opencode';
+/**
+ * The security-text acknowledgement a `full` agy runner must carry (D7).
+ * `acceptedAt` is an ISO 8601 timestamp.
+ */
+export interface AgyAcknowledgement {
+  readonly textVersion: string;
+  readonly acceptedAt: string;
+}
+
+/** The fields a host runner carries regardless of its kind. */
+interface HostRunnerCommon {
   readonly port: number;
   readonly authFile?: string;
   readonly capabilities?: RunnerCapabilityDeclaration;
   readonly maxLanes?: number;
 }
+
+/** The `runner` block of a v2 host (D7): the kind selects the extra fields. */
+export interface OpencodeHostRunnerSection extends HostRunnerCommon {
+  readonly kind: 'opencode';
+}
+
+/** An agy runner declares its mode (D7); `full` also needs the acknowledgement. */
+export interface AgyHostRunnerSection extends HostRunnerCommon {
+  readonly kind: 'agy';
+  readonly agyMode: 'edit-only' | 'full';
+  readonly agyAcknowledgement?: AgyAcknowledgement;
+}
+
+export type HostRunnerSection = OpencodeHostRunnerSection | AgyHostRunnerSection;
 
 /** One named v2 host (plan section 1). */
 export interface HostSection {
@@ -281,14 +303,28 @@ export interface DerivedRunnerCapabilities {
   readonly processTreeTermination: boolean | null;
 }
 
-/** The `runner` block of a model host; capabilities are always derived. */
-export interface HostRunnerModel {
+/** An opencode runner of the model; capabilities are always derived. */
+export interface OpencodeHostRunnerModel {
   readonly kind: 'opencode';
   readonly port?: number;
   readonly authFile?: string;
   readonly capabilities: DerivedRunnerCapabilities;
   readonly maxLanes?: number;
 }
+
+/** An agy runner of the model; the mode decides the agy argv (D7). */
+export interface AgyHostRunnerModel {
+  readonly kind: 'agy';
+  readonly port?: number;
+  readonly authFile?: string;
+  readonly capabilities: DerivedRunnerCapabilities;
+  readonly maxLanes?: number;
+  readonly agyMode: 'edit-only' | 'full';
+  readonly agyAcknowledgement?: AgyAcknowledgement;
+}
+
+/** The `runner` block of a model host; capabilities are always derived. */
+export type HostRunnerModel = OpencodeHostRunnerModel | AgyHostRunnerModel;
 
 /**
  * One host of the derived model. `worktreeRoot` is absent for hosts mapped

@@ -1,4 +1,5 @@
 export * from './types.js';
+export * from './agy-security.js';
 export * from './parse.js';
 export * from './model.js';
 export * from './write.js';

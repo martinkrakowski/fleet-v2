@@ -125,16 +125,27 @@ function copyDecisions(decisions: DecisionsSectionV2): DecisionsSectionV2 {
 }
 
 function deriveHostRunner(runner: NonNullable<HostSection['runner']>): HostRunnerModel {
-  return {
-    kind: runner.kind,
+  const capabilities: DerivedRunnerCapabilities =
+    runner.capabilities === undefined
+      ? UNDECLARED_CAPABILITIES
+      : { source: 'declared', ...runner.capabilities };
+  const common = {
     port: runner.port,
     ...(runner.authFile !== undefined ? { authFile: runner.authFile } : {}),
-    capabilities:
-      runner.capabilities === undefined
-        ? UNDECLARED_CAPABILITIES
-        : { source: 'declared', ...runner.capabilities },
+    capabilities,
     ...(runner.maxLanes !== undefined ? { maxLanes: runner.maxLanes } : {}),
   };
+  if (runner.kind === 'agy') {
+    return {
+      kind: 'agy',
+      ...common,
+      agyMode: runner.agyMode,
+      ...(runner.agyAcknowledgement !== undefined
+        ? { agyAcknowledgement: runner.agyAcknowledgement }
+        : {}),
+    };
+  }
+  return { kind: 'opencode', ...common };
 }
 
 function copySeat(seat: SeatSection): SeatModel {

@@ -32,6 +32,14 @@ export interface KnowledgeComposition {
 export interface KnowledgeCompositionOptions {
   readonly stateDir?: string;
   /**
+   * Repository override (tests only): without a stateDir the composition's
+   * store is a private in-memory repository, so a test cannot seed the keepers
+   * ProposeBriefContextUseCase reads. Injecting the repository is the API
+   * composition's equivalent of the CLI runtime's exposed
+   * `knowledge.knowledgeEntryRepository`.
+   */
+  readonly knowledgeEntryRepository?: KnowledgeEntryRepositoryAdapter;
+  /**
    * The installation's v2 `decisions` block; `undefined` for v1 or an absent
    * block, which keeps today's deterministic retrieval (decision port plan,
    * invariant 6: off by default).
@@ -72,7 +80,8 @@ export function createConfiguredKnowledgeComposition(
 ): KnowledgeComposition {
   const stateDir = options?.stateDir;
 
-  const repo = new KnowledgeEntryRepositoryAdapter({ stateDir });
+  const repo =
+    options?.knowledgeEntryRepository ?? new KnowledgeEntryRepositoryAdapter({ stateDir });
   const plainRetrieval = new KnowledgeRetrievalAdapter();
   // Advisory only: the decision port reorders the deterministic set and never
   // changes membership (decision port plan, invariant 1). With no decisions

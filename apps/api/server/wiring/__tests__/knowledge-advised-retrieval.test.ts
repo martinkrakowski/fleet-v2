@@ -7,14 +7,15 @@
 // candidate order; a different candidate order re-keys the same answers onto
 // the same claims). No real network and no key material anywhere.
 import { readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  buildRankingAdviceState,
   KnowledgeEntryRepositoryAdapter,
   type KnowledgeEntryRecord,
   type RankingAdviceDecisions,
@@ -22,8 +23,10 @@ import {
 
 import {
   createConfiguredKnowledgeComposition,
+  getKnowledgeComposition,
   type KnowledgeComposition,
 } from "../knowledge/composition";
+import { configureFleetApiRuntime } from "../runtime";
 
 const FIXTURE_DIR = new URL(
   "../../../../../packages/brief-knowledge/src/infrastructure/adapters/__fixtures__/jev/",
@@ -122,6 +125,13 @@ afterAll(async () => {
   );
 });
 
+afterEach(() => {
+  vi.unstubAllGlobals();
+  // The runtime tests configure the module-level compositions; reset them so
+  // no test inherits another's wiring.
+  configureFleetApiRuntime(null);
+});
+
 async function makeTempStateDir(): Promise<string> {
   const directory = await mkdtemp(path.join(tmpdir(), "fleet-api-d5b-"));
   createdDirs.add(directory);
@@ -129,8 +139,7 @@ async function makeTempStateDir(): Promise<string> {
 }
 
 /** Two eligible keepers: the README claim leads lexically, the date claim trails. */
-async function seedKeepers(stateDir: string | undefined): Promise<void> {
-  const repo = new KnowledgeEntryRepositoryAdapter({ stateDir });
+async function seedKeepers(repo: KnowledgeEntryRepositoryAdapter): Promise<void> {
   await repo.saveEntry(entry("entry-readme", RECORDED_LOW_CLAIM, PATH_PREFIXES));
   await repo.saveEntry(entry("entry-date", RECORDED_HIGH_CLAIM, PATH_PREFIXES));
 }
@@ -159,7 +168,7 @@ function monthReceiptPath(stateDir: string): string {
 describe("knowledge composition ranking advice wiring", () => {
   it("with no decisions block: same order as before and fetch is never called", async () => {
     const stateDir = await makeTempStateDir();
-    await seedKeepers(stateDir);
+    await seedKeepers(new KnowledgeEntryRepositoryAdapter({ stateDir }));
     const fetch = replayFetch();
     const composition = createConfiguredKnowledgeComposition({ stateDir, fetch });
     const result = await propose(composition);
@@ -171,7 +180,7 @@ describe("knowledge composition ranking advice wiring", () => {
 
   it("with provider 'none': same order as before and fetch is never called", async () => {
     const stateDir = await makeTempStateDir();
-    await seedKeepers(stateDir);
+    await seedKeepers(new KnowledgeEntryRepositoryAdapter({ stateDir }));
     const fetch = replayFetch();
     const composition = createConfiguredKnowledgeComposition({
       stateDir,
@@ -184,26 +193,46 @@ describe("knowledge composition ranking advice wiring", () => {
   });
 
   it("with a jev block but no stateDir: fetch is never called", async () => {
+    // The advice port only runs once two eligible keepers are ranked, so this
+    // case seeds the same in-memory repository the composition wired (without
+    // a stateDir there is no file-backed store to seed through).
+    const repo = new KnowledgeEntryRepositoryAdapter();
+    await seedKeepers(repo);
     const fetch = replayFetch();
+    const readKeys: string[] = [];
     const composition = createConfiguredKnowledgeComposition({
+      knowledgeEntryRepository: repo,
       decisions: JEV_DECISIONS,
       fetch,
-      readKey: async () => "stub-key-not-real",
+      readKey: async (keyPath) => {
+        readKeys.push(keyPath);
+        return "stub-key-not-real";
+      },
     });
     const result = await propose(composition);
     expect(result.outcome).toBe("proposed");
+    // No durable receipt journal (invariant 5): the advice answers
+    // unknown/not-configured and the deterministic lexical order stands.
+    expect(result.proposals.map((p) => p.knowledgeEntryId)).toEqual(["entry-readme", "entry-date"]);
+    expect(result.proposals.every((p) => !p.proposedBecause.includes("decision("))).toBe(true);
+    // The provider pipeline never got as far as reading the key or fetching.
+    expect(readKeys).toHaveLength(0);
     expect(fetch.calls).toHaveLength(0);
   });
 
   it("with a jev block, a stateDir and the recorded fixture: the keepers are reordered and receipted", async () => {
     const stateDir = await makeTempStateDir();
-    await seedKeepers(stateDir);
+    await seedKeepers(new KnowledgeEntryRepositoryAdapter({ stateDir }));
     const fetch = replayFetch();
+    const readKeys: string[] = [];
     const composition = createConfiguredKnowledgeComposition({
       stateDir,
       decisions: JEV_DECISIONS,
       fetch,
-      readKey: async () => "stub-key-not-real",
+      readKey: async (keyPath) => {
+        readKeys.push(keyPath);
+        return "stub-key-not-real";
+      },
     });
     const result = await propose(composition);
     expect(result.outcome).toBe("proposed");
@@ -213,6 +242,8 @@ describe("knowledge composition ranking advice wiring", () => {
     expect(result.proposals[0]?.proposedBecause).toContain(
       `decision(${FIXTURE_RESPONSE.model}, c=0.91)`,
     );
+    // The stub key reader saw exactly the configured keyFile path.
+    expect(readKeys).toEqual([JEV_DECISIONS.keyFile]);
     expect(fetch.calls).toHaveLength(1);
 
     const raw = await readFile(monthReceiptPath(stateDir), "utf8");
@@ -226,5 +257,80 @@ describe("knowledge composition ranking advice wiring", () => {
     expect(lines[1]?.provider).toBe("jev");
     expect(lines[1]?.lexicalOrder).toEqual(["entry-readme", "entry-date"]);
     expect(lines[1]?.decidedOrder).toEqual(["entry-date", "entry-readme"]);
+  });
+
+  it("with a v1 installation: lexical order through the configured runtime and fetch is never called", async () => {
+    const stateDir = await makeTempStateDir();
+    await seedKeepers(new KnowledgeEntryRepositoryAdapter({ stateDir }));
+    const fetch = replayFetch();
+    // The composition captures globalThis.fetch at configure time, so the
+    // stub must be in place before the runtime is wired.
+    vi.stubGlobal("fetch", fetch);
+    // v1 files never carry a decisions block; the composition must not invent
+    // one, so the advice port stays null and the lexical order stands.
+    configureFleetApiRuntime({ stateDir, installation: { schemaVersion: 1 } });
+    const result = await propose(getKnowledgeComposition());
+    expect(result.outcome).toBe("proposed");
+    expect(result.proposals.map((p) => p.knowledgeEntryId)).toEqual(["entry-readme", "entry-date"]);
+    expect(result.proposals.every((p) => !p.proposedBecause.includes("decision("))).toBe(true);
+    expect(fetch.calls).toHaveLength(0);
+  });
+
+  it("with a v2 installation answer-file decisions block: the keepers are reordered without network", async () => {
+    const stateDir = await makeTempStateDir();
+    await seedKeepers(new KnowledgeEntryRepositoryAdapter({ stateDir }));
+    // The advice state is declared from the fields the inner (lexical) result
+    // carries, in that order: the README claim is k0, the date claim k1. The
+    // owner-recorded answer is keyed by the state digest it answers.
+    const state = buildRankingAdviceState({
+      taskSummary: TASK_SUMMARY,
+      pathPrefixes: PATH_PREFIXES,
+      candidates: [
+        { id: "entry-readme", claimText: RECORDED_LOW_CLAIM },
+        { id: "entry-date", claimText: RECORDED_HIGH_CLAIM },
+      ],
+    });
+    if (!state.ok) {
+      throw new Error("the recorded claims must build a decision state");
+    }
+    const answerFile = path.join(stateDir, "recorded-decision-answers.json");
+    await writeFile(
+      answerFile,
+      JSON.stringify({
+        [state.stateSha256]: {
+          model: FIXTURE_RESPONSE.model,
+          id: "gen-recorded-answer-file",
+          answers: {
+            // The lexical leader gets the recorded irrelevant answer, the
+            // runner-up the recorded highly-relevant answer: exactly the
+            // judgement the live fixture case asserts.
+            k0: FIXTURE_RESPONSE.answers.k1,
+            k1: FIXTURE_RESPONSE.answers.k0,
+          },
+        },
+      }),
+      "utf8",
+    );
+    const fetch = replayFetch();
+    vi.stubGlobal("fetch", fetch);
+    configureFleetApiRuntime({
+      stateDir,
+      installation: {
+        schemaVersion: 2,
+        hosts: {},
+        forge: { mode: "none" },
+        decisions: { provider: "answer-file", answerFile },
+      },
+    });
+    const result = await propose(getKnowledgeComposition());
+    expect(result.outcome).toBe("proposed");
+    // The recorded judgement reorders the deterministic set, proving the
+    // installation's decisions block reached the knowledge factory.
+    expect(result.proposals.map((p) => p.knowledgeEntryId)).toEqual(["entry-date", "entry-readme"]);
+    expect(result.proposals[0]?.proposedBecause).toContain(
+      `decision(${FIXTURE_RESPONSE.model}, c=0.91)`,
+    );
+    // The answer-file provider reads only the recorded file: no network.
+    expect(fetch.calls).toHaveLength(0);
   });
 });

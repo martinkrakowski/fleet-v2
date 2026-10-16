@@ -113,11 +113,20 @@ function replayFetch(): typeof fetch & { calls: unknown[] } {
   return fn;
 }
 
-/** Minimal v2 installation carrying only the decisions block under test. */
+/**
+ * Minimal v2 installation, shaped as the parser would produce it: a v2 file
+ * always declares a forge mode (D6) and may name zero hosts. Only the
+ * decisions block under test is varied.
+ */
 function installationWithDecisions(
   decisions: RankingAdviceDecisions | undefined,
 ): FleetInstallation {
-  return { schemaVersion: 2, ...(decisions !== undefined ? { decisions } : {}) };
+  return {
+    schemaVersion: 2,
+    hosts: {},
+    forge: { mode: 'none' },
+    ...(decisions !== undefined ? { decisions } : {}),
+  };
 }
 
 async function seedKeepers(runtime: FleetCliRuntime): Promise<void> {
@@ -195,12 +204,13 @@ describe('CLI knowledge composition ranking advice wiring', () => {
     expect(fetch.calls).toHaveLength(0);
   });
 
-  it('with a jev block but no stateDir: fetch is never called', async () => {
+  it('with a v1 installation: lexical order and fetch is never called', async () => {
     const fetch = replayFetch();
+    // v1 files never carry a decisions block; the runtime must not invent one,
+    // so the advice port stays null and the deterministic order stands.
     const runtime = createFleetCliRuntime({
-      installation: installationWithDecisions(JEV_DECISIONS),
+      installation: { schemaVersion: 1 },
       adviceFetch: fetch,
-      adviceReadKey: async () => 'stub-key-not-real',
     });
     await seedKeepers(runtime);
     const result = await propose(runtime);
@@ -209,17 +219,48 @@ describe('CLI knowledge composition ranking advice wiring', () => {
       'entry-readme',
       'entry-date',
     ]);
+    expect(result.proposals.every((p) => !p.proposedBecause.includes('decision('))).toBe(true);
+    expect(fetch.calls).toHaveLength(0);
+  });
+
+  it('with a jev block but no stateDir: fetch is never called', async () => {
+    const fetch = replayFetch();
+    const readKeys: string[] = [];
+    const runtime = createFleetCliRuntime({
+      installation: installationWithDecisions(JEV_DECISIONS),
+      adviceFetch: fetch,
+      adviceReadKey: async (keyPath) => {
+        readKeys.push(keyPath);
+        return 'stub-key-not-real';
+      },
+    });
+    await seedKeepers(runtime);
+    const result = await propose(runtime);
+    expect(result.outcome).toBe('proposed');
+    // No durable receipt journal (invariant 5): the advice answers
+    // unknown/not-configured and the deterministic lexical order stands.
+    expect(result.proposals.map((p) => p.knowledgeEntryId)).toEqual([
+      'entry-readme',
+      'entry-date',
+    ]);
+    expect(result.proposals.every((p) => !p.proposedBecause.includes('decision('))).toBe(true);
+    // The provider pipeline never got as far as reading the key or fetching.
+    expect(readKeys).toHaveLength(0);
     expect(fetch.calls).toHaveLength(0);
   });
 
   it('with a jev block, a stateDir and the recorded fixture: the keepers are reordered and receipted', async () => {
     const stateDir = newTempStateDir();
     const fetch = replayFetch();
+    const readKeys: string[] = [];
     const runtime = createFleetCliRuntime({
       stateDir,
       installation: installationWithDecisions(JEV_DECISIONS),
       adviceFetch: fetch,
-      adviceReadKey: async () => 'stub-key-not-real',
+      adviceReadKey: async (keyPath) => {
+        readKeys.push(keyPath);
+        return 'stub-key-not-real';
+      },
     });
     await seedKeepers(runtime);
     const result = await propose(runtime);
@@ -233,6 +274,8 @@ describe('CLI knowledge composition ranking advice wiring', () => {
     expect(result.proposals[0]?.proposedBecause).toContain(
       `decision(${FIXTURE_RESPONSE.model}, c=0.91)`,
     );
+    // The stub key reader saw exactly the configured keyFile path.
+    expect(readKeys).toEqual([JEV_DECISIONS.keyFile]);
     expect(fetch.calls).toHaveLength(1);
 
     const raw = readFileSync(monthReceiptPath(stateDir), 'utf8');

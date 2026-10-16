@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -8,9 +8,15 @@ import { bootstrapFleetApiFromEnv } from "../../plugins/runtime";
 
 describe("API runtime installation bootstrap", () => {
   let tempDir: string;
+  let tokenFile: string;
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "fleet-api-test-"));
+    // A valid token is required since the API hardening; each case below then
+    // exercises only the installation condition it names.
+    tokenFile = join(tempDir, "api-token");
+    writeFileSync(tokenFile, `${"t".repeat(40)}\n`);
+    chmodSync(tokenFile, 0o600);
   });
 
   afterEach(() => {
@@ -30,6 +36,7 @@ describe("API runtime installation bootstrap", () => {
 
     const configured = bootstrapFleetApiFromEnv({
       FLEET_STATE_DIR: tempDir,
+      FLEET_API_TOKEN_FILE: tokenFile,
       FLEET_INSTALLATION_FILE: invalidFilePath,
     });
 
@@ -41,6 +48,7 @@ describe("API runtime installation bootstrap", () => {
 
     const configured = bootstrapFleetApiFromEnv({
       FLEET_STATE_DIR: tempDir,
+      FLEET_API_TOKEN_FILE: tokenFile,
       FLEET_INSTALLATION_FILE: absentFilePath,
     });
 
@@ -67,6 +75,7 @@ describe("API runtime installation bootstrap", () => {
 
     const configured = bootstrapFleetApiFromEnv({
       FLEET_STATE_DIR: tempDir,
+      FLEET_API_TOKEN_FILE: tokenFile,
       FLEET_INSTALLATION_FILE: validFilePath,
     });
 

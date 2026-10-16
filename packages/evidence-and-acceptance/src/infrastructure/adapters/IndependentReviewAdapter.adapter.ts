@@ -6,7 +6,7 @@
 
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type { ReviewFindingRecord } from '../../domain/evidence-records.js';
-import { underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
+import { isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
 import type {
   IndependentReviewPort,
   RunIndependentReviewRequest,
@@ -55,7 +55,10 @@ export class IndependentReviewAdapter implements IndependentReviewPort {
     }
     if (
       request.reviewerModel === request.implementerModel ||
-      underlyingModelFamily(request.reviewerModel) === underlyingModelFamily(request.implementerModel)
+      isSameModelFamily(
+        underlyingModelFamily(request.reviewerModel),
+        underlyingModelFamily(request.implementerModel),
+      )
     ) {
       return {
         outcome: 'unavailable',

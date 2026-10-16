@@ -79,6 +79,40 @@ describe('validateSeatPolicy', () => {
     );
   });
 
+  it('refuses a seat whose model yields an empty model family', () => {
+    for (const model of ['', '/', 'z-ai/', '#low']) {
+      const errors = validateSeatPolicy(
+        installation({
+          seats: [seat({ id: 'impl', model })],
+          chains: { implementer: [{ seatId: 'impl' }] },
+        }),
+      );
+      expect(errors).toContainEqual(
+        `seats.impl: model "${model}" yields an empty model family`,
+      );
+    }
+  });
+
+  it('applies the family rule to reviewer-role seats that are not chain members', () => {
+    const errors = validateSeatPolicy(
+      installation({
+        seats: [
+          seat({ id: 'impl', model: 'openrouter/z-ai/glm-5.3' }),
+          seat({
+            id: 'standalone-reviewer',
+            model: 'z-ai/glm-5.3-flash',
+            roles: ['reviewer'],
+            costClass: 'paid',
+          }),
+        ],
+        chains: { implementer: [{ seatId: 'impl' }] },
+      }),
+    );
+    expect(errors).toContainEqual(
+      'seats.standalone-reviewer: seat "standalone-reviewer" shares the implementer chain\'s model family (z-ai/glm-5.3-flash)',
+    );
+  });
+
   it('refuses a chain seat that does not hold the chain role', () => {
     const errors = validateSeatPolicy(
       installation({

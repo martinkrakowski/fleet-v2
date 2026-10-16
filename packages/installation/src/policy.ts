@@ -55,10 +55,17 @@ function stripOneFamilySuffix(value: string): string {
 
 /**
  * The underlying model family of a model id: every provider prefix (all
- * leading path segments up to the model name), any `#variant`, any
- * `:free`/`:paid` suffix and the size and speed suffixes are stripped, and
- * the remainder is compared case-insensitively. `openrouter/z-ai/glm-5.3`,
- * `nvidia/z-ai/glm-5.3-flash` and `z-ai/glm-5.3#none` share one family.
+ * leading path segments up to the model name), any `#variant`, anything from
+ * the first `:` after the model name (`:nitro`, `:thinking`, `:free`/`:paid`,
+ * ...), any `@...` suffix (`@20250929`, ...) and the size and speed suffixes
+ * are stripped, and the remainder is compared case-insensitively.
+ * `openrouter/z-ai/glm-5.3`, `nvidia/z-ai/glm-5.3-flash` and
+ * `z-ai/glm-5.3#none` share one family.
+ *
+ * An empty family (from `''`, `'/'`, `'z-ai/'`, `'#low'`) is invalid; callers
+ * comparing families must fail closed and treat an empty family as equal to
+ * every other family. The installation parser refuses a seat whose model
+ * yields an empty family.
  */
 export function underlyingModelFamily(model: string): string {
   let value = model;
@@ -69,6 +76,14 @@ export function underlyingModelFamily(model: string): string {
   const separatorIndex = value.lastIndexOf('/');
   if (separatorIndex !== -1) {
     value = value.slice(separatorIndex + 1);
+  }
+  const colonIndex = value.indexOf(':');
+  if (colonIndex !== -1) {
+    value = value.slice(0, colonIndex);
+  }
+  const atIndex = value.indexOf('@');
+  if (atIndex !== -1) {
+    value = value.slice(0, atIndex);
   }
   value = value.toLowerCase();
   for (;;) {
@@ -119,6 +134,14 @@ export function validateSeatPolicy(installation: FleetInstallationModel): string
     seatsById.set(seat.id, seat);
   }
 
+  // A seat whose model yields an empty model family is refused: an empty
+  // family can never prove reviewer independence.
+  for (const seat of seats) {
+    if (underlyingModelFamily(seat.model) === '') {
+      errors.push(`seats.${seat.id}: model "${seat.model}" yields an empty model family`);
+    }
+  }
+
   // A seat holding implementer and a reviewer role is refused.
   for (const seat of seats) {
     const holdsImplementer = seat.roles.includes('implementer');
@@ -162,7 +185,8 @@ export function validateSeatPolicy(installation: FleetInstallationModel): string
     }
   }
 
-  // No reviewer-family seat shares a family with any implementer seat.
+  // No seat holding a reviewer role shares a family with any implementer
+  // seat, whether or not the seat is a chain member.
   const implementerIds = chainSeatIds.get('implementer') ?? [];
   const implementerFamilies = new Set(
     implementerIds
@@ -171,17 +195,23 @@ export function validateSeatPolicy(installation: FleetInstallationModel): string
       .map((seat) => underlyingModelFamily(seat.model)),
   );
   if (implementerFamilies.size > 0) {
-    for (const role of REVIEWER_ROLES) {
-      for (const id of chainSeatIds.get(role) ?? []) {
-        const seat = seatsById.get(id);
-        if (seat === undefined) {
-          continue;
-        }
-        if (implementerFamilies.has(underlyingModelFamily(seat.model))) {
-          errors.push(
-            `chains.${role}: seat "${seat.id}" shares the implementer chain's model family (${seat.model})`,
-          );
-        }
+    const chainIdsByRole = new Map<SeatRole, Set<string>>(
+      REVIEWER_ROLES.map((role) => [role, new Set(chainSeatIds.get(role) ?? [])]),
+    );
+    for (const seat of seats) {
+      const reviewerRole = seat.roles.find((role) => role !== 'implementer');
+      if (reviewerRole === undefined) {
+        continue;
+      }
+      const seatFamily = underlyingModelFamily(seat.model);
+      const shares = [...implementerFamilies].some(
+        (family) => family === seatFamily || family === '' || seatFamily === '',
+      );
+      if (shares) {
+        const inChain = chainIdsByRole.get(reviewerRole)?.has(seat.id) ?? false;
+        errors.push(
+          `${inChain ? `chains.${reviewerRole}` : `seats.${seat.id}`}: seat "${seat.id}" shares the implementer chain's model family (${seat.model})`,
+        );
       }
     }
   }
@@ -230,10 +260,16 @@ export function v1FamilyWarnings(installation: FleetInstallationModel): string[]
   for (const role of REVIEWER_ROLES) {
     for (const step of seatSteps(chains, role)) {
       const seat = seats.find((candidate) => candidate.id === step.seatId);
-      if (seat !== undefined && implementerFamilies.has(underlyingModelFamily(seat.model))) {
-        warnings.push(
-          `${V1_FAMILY_WARNING_PREFIX} (${seat.model}); v1 files are warned, not refused`,
+      if (seat !== undefined) {
+        const seatFamily = underlyingModelFamily(seat.model);
+        const shares = [...implementerFamilies].some(
+          (family) => family === seatFamily || family === '' || seatFamily === '',
         );
+        if (shares) {
+          warnings.push(
+            `${V1_FAMILY_WARNING_PREFIX} (${seat.model}); v1 files are warned, not refused`,
+          );
+        }
       }
     }
   }

@@ -69,17 +69,6 @@ export interface AttemptSeatOverrideRecord {
   readonly expiresAtIso: string;
 }
 
-/**
- * Strip provider prefix and variant suffix, returning the underlying model name/family
- * for independent review and override separation checks.
- */
-export function underlyingModelFamily(model: string): string {
-  const withoutVariant = model.split(/[#:]/)[0].trim().toLowerCase();
-  const segments = withoutVariant.split('/').filter((s) => s.length > 0);
-  if (segments.length === 0) return withoutVariant;
-  return segments[segments.length - 1];
-}
-
 /** Serializable record of one dispatch or one fresh fix session. */
 export interface AttemptRecord {
   readonly id: string;

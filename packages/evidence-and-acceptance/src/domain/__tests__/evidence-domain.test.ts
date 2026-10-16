@@ -7,7 +7,7 @@ import type { ReviewFindingRecord } from '../evidence-records.js';
 import { EvidenceAssessment } from '../entities/EvidenceAssessment.js';
 import type { EvidenceAssessmentProps } from '../entities/EvidenceAssessment.js';
 import { FindingDisposition } from '../entities/FindingDisposition.js';
-import { ReviewReceipt, underlyingModelFamily } from '../entities/ReviewReceipt.js';
+import { ReviewReceipt, isSameModelFamily, underlyingModelFamily } from '../entities/ReviewReceipt.js';
 import type { ReviewReceiptProps } from '../entities/ReviewReceipt.js';
 import { VerificationReceipt } from '../entities/VerificationReceipt.js';
 import type { VerificationReceiptProps } from '../entities/VerificationReceipt.js';
@@ -287,6 +287,10 @@ describe('ReviewReceipt', () => {
       ['openrouter/z-ai/glm-5.3', 'z-ai/glm-5.3#none'],
       ['opencode/longcat-2.5-preview-free', 'longcat-2.5'],
       ['openrouter/z-ai/glm-5.3-flash', 'NVIDIA/z-ai/glm-5.3'],
+      ['openrouter/anthropic/claude-3-5-sonnet:beta', 'anthropic/claude-3-5-sonnet'],
+      ['anthropic/claude-3-5-sonnet:nitro', 'anthropic/claude-3-5-sonnet:thinking'],
+      ['anthropic/claude-3-5-sonnet@20250929', 'anthropic/claude-3-5-sonnet'],
+      ['anthropic/claude-3-5-sonnet@20250929:beta', 'anthropic/claude-3-5-sonnet'],
       ['bare-model', 'bare-model'],
     ];
     for (const [left, right] of sameFamily) {
@@ -299,6 +303,12 @@ describe('ReviewReceipt', () => {
     ];
     for (const [left, right] of distinctFamilies) {
       expect(underlyingModelFamily(left)).not.toBe(underlyingModelFamily(right));
+    }
+    // An empty family is invalid: the raw output is the empty string and a
+    // comparison against any other family fails closed as "same".
+    for (const model of ['', '/', 'z-ai/', '#low']) {
+      expect(underlyingModelFamily(model)).toBe('');
+      expect(isSameModelFamily(underlyingModelFamily(model), 'glm-5.3')).toBe(true);
     }
   });
 

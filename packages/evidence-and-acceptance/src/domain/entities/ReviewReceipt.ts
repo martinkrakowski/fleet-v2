@@ -66,11 +66,16 @@ function stripOneFamilySuffix(value: string): string {
 
 /**
  * Strip the provider seat prefix (`openrouter/...`, `nvidia/...`, ...), any
- * `#variant`, any `:free`/`:paid` suffix and the size and speed suffixes, and
- * return the underlying model family compared case-insensitively. This is
- * stricter than a provider-prefix strip alone: `openrouter/z-ai/glm-5.3`,
- * `nvidia/z-ai/glm-5.3-flash` and `z-ai/glm-5.3#none` share one family, so a
- * flash reviewer of a GLM implementer is refused.
+ * `#variant`, anything from the first `:` after the model name (`:nitro`,
+ * `:thinking`, `:free`/`:paid`, ...), any `@...` suffix (`@20250929`, ...) and
+ * the size and speed suffixes, and return the underlying model family compared
+ * case-insensitively. This is stricter than a provider-prefix strip alone:
+ * `openrouter/z-ai/glm-5.3`, `nvidia/z-ai/glm-5.3-flash` and `z-ai/glm-5.3#none`
+ * share one family, so a flash reviewer of a GLM implementer is refused.
+ *
+ * An empty family (from `''`, `'/'`, `'z-ai/'`, `'#low'`) is invalid; callers
+ * comparing families must fail closed and treat an empty family as equal to
+ * every other family.
  */
 export function underlyingModelFamily(model: string): string {
   let value = model;
@@ -82,6 +87,14 @@ export function underlyingModelFamily(model: string): string {
   if (separatorIndex !== -1) {
     value = value.slice(separatorIndex + 1);
   }
+  const colonIndex = value.indexOf(':');
+  if (colonIndex !== -1) {
+    value = value.slice(0, colonIndex);
+  }
+  const atIndex = value.indexOf('@');
+  if (atIndex !== -1) {
+    value = value.slice(0, atIndex);
+  }
   value = value.toLowerCase();
   for (;;) {
     const stripped = stripOneFamilySuffix(value);
@@ -90,6 +103,15 @@ export function underlyingModelFamily(model: string): string {
     }
     value = stripped;
   }
+}
+
+/**
+ * Fail-closed family comparison: two families are the same when they are
+ * equal, and also when either is empty (an empty family is invalid, so it can
+ * never prove independence).
+ */
+export function isSameModelFamily(left: string, right: string): boolean {
+  return left === right || left === '' || right === '';
 }
 
 function isValidFinding(finding: ReviewFindingRecord): boolean {
@@ -153,7 +175,10 @@ export class ReviewReceipt {
     }
     // The reviewer's underlying model differs from the implementer's; a
     // provider change alone is insufficient.
-    if (underlyingModelFamily(props.reviewerModel) === underlyingModelFamily(props.implementerModel)) {
+    if (isSameModelFamily(
+      underlyingModelFamily(props.reviewerModel),
+      underlyingModelFamily(props.implementerModel),
+    )) {
       return {
         success: false,
         error: new Error(

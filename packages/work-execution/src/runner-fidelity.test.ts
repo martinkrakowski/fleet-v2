@@ -6,8 +6,8 @@ import {
 import { DispatchAttemptUseCase } from './application/use-cases/DispatchAttemptUseCase.use-case.js';
 import { ReconcileAttemptUseCase } from './application/use-cases/ReconcileAttemptUseCase.use-case.js';
 import { StopAttemptUseCase } from './application/use-cases/StopAttemptUseCase.use-case.js';
+import { underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import {
-  underlyingModelFamily,
   type ActionJournalEntryRecord,
   type AttemptRecord,
   type AttemptSeatOverrideRecord,
@@ -1214,16 +1214,28 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
       expect(overrideEntry?.detail).toContain('martin');
     });
 
-    it('underlyingModelFamily handles prefixes, variants and segment stripping correctly', () => {
+    it('underlyingModelFamily (shared evidence rule) handles prefixes, variants and suffix stripping correctly', () => {
       expect(underlyingModelFamily('nvidia/z-ai/glm-5.3')).toBe('glm-5.3');
       expect(underlyingModelFamily('openrouter/z-ai/glm-5.3')).toBe('glm-5.3');
       expect(underlyingModelFamily('nvidia/z-ai/glm-5.3#low')).toBe('glm-5.3');
-      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3-flash')).toBe('glm-5.3-flash');
-      expect(underlyingModelFamily('openrouter/z-ai/glm-5.3-flash')).toBe('glm-5.3-flash');
+      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3-flash')).toBe('glm-5.3');
+      expect(underlyingModelFamily('openrouter/z-ai/glm-5.3-flash')).toBe('glm-5.3');
+      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3-flashx')).toBe('glm-5.3');
       expect(underlyingModelFamily('openrouter/anthropic/claude-3-5-sonnet:beta')).toBe('claude-3-5-sonnet');
+      expect(underlyingModelFamily('anthropic/claude-3-5-sonnet:nitro')).toBe('claude-3-5-sonnet');
+      expect(underlyingModelFamily('opencode/longcat-2.5-preview:free')).toBe('longcat-2.5');
+      expect(underlyingModelFamily('anthropic/claude-3-5-sonnet@20250929')).toBe('claude-3-5-sonnet');
+      expect(underlyingModelFamily('anthropic/claude-3-5-sonnet@20250929:beta')).toBe('claude-3-5-sonnet');
       expect(underlyingModelFamily('anthropic/claude-3-5-sonnet')).toBe('claude-3-5-sonnet');
       expect(underlyingModelFamily('openai/gpt-4o')).toBe('gpt-4o');
       expect(underlyingModelFamily('gpt-4o')).toBe('gpt-4o');
+      // An empty family is invalid: flash and non-flash models of one family
+      // compare equal under the strict rule.
+      expect(underlyingModelFamily('z-ai/glm-5.3-flash')).toBe(underlyingModelFamily('z-ai/glm-5.3'));
+      expect(underlyingModelFamily('')).toBe('');
+      expect(underlyingModelFamily('/')).toBe('');
+      expect(underlyingModelFamily('z-ai/')).toBe('');
+      expect(underlyingModelFamily('#low')).toBe('');
     });
   });
 

@@ -1,6 +1,6 @@
 # Settings UI: web onboarding and installation settings
 
-*Date: 2026-10-16 · Status: revision 2.3, ready after Grok and Fable (two rounds each) and an Opus check of the last changes (both "not ready" on revision 1; every blocker addressed below) · Builds on `2026-10-16_onboarding-and-init.md`*
+*Date: 2026-10-16 · Status: revision 2.4 (amendment: Settings always in the app menu; agy security step), previously 2.3, ready after Grok and Fable (two rounds each) and an Opus check of the last changes (both "not ready" on revision 1; every blocker addressed below) · Builds on `2026-10-16_onboarding-and-init.md`*
 
 ## Goal
 
@@ -130,6 +130,10 @@ browser (kept in `sessionStorage` so a setup restart can resume), not a record.
 3. **Isolation** (the single-machine risk in plain words, then `none`, `container` or `custom` per runner;
    a `Banner` when `none` says dispatch will refuse). Drafts never carry a capability `source`; the loader
    derives it.
+3a. **Security and agy mode** (only when a runner has `kind: agy`; onboarding plan Amendment O14): the
+   versioned security text, then `edit-only` or `full`; `full` is offered only when the host's declared
+   isolation meets the floor, and is confirmed by typing `full` in a text input, never a checkbox. The UI
+   never writes `agyAcknowledgement` without that input.
 4. **Seats** (recommendation with reasons, inline edits, policy violations on the seat that causes them,
    "recommend again" as a diff).
 5. **Forge** (`github` with the detected `gh auth status`, or `none`, with D6's meaning stated).
@@ -141,7 +145,11 @@ browser (kept in `sessionStorage` so a setup restart can resume), not a record.
 
 **`AlertBox` text** for every write states: what it does (writes `installation/fleet.json`, showing the
 diff), what it does not do (no lane, forge, publish or network action; no credential created), and that
-no live route runs as a result; never a bare "Are you sure?". Step changes and toggles stay immediate.
+no live route runs as a result; never a bare "Are you sure?". When the diff turns `full` on, or keeps an
+existing `full` whose acknowledgement is stale, the text says so and shows the security text version; the
+compare-and-swap write is refused while a `full` host's acknowledgement is stale, unless that same write
+carries a fresh acknowledgement (the developer typed `full` in step 3a, which sets the current `textVersion`
+and a new `acceptedAt`). Step changes and toggles stay immediate.
 
 ### Converting a v1 file
 
@@ -193,11 +201,11 @@ otherwise. File ownership as in the onboarding plan: within a wave, at most one 
 | U1 | API setup guard (`00.setup-guard.ts`), path normalisation, six routes, startup refusals, `FLEET_DEPLOYMENT` in staging | apps/api, deploy/staging | O10 (engine) | F |
 | U2 | `fleet-v2 setup --ui`: build check, token directory and file, children on loopback with reported ports, environment scrubbing, exit and cleanup | apps/cli | U1, O11 | F |
 | U3 | Web session exchange, same-origin enforcement, fixed six-route proxy, startup refusals in `instrumentation.ts` | apps/web | U1 | F |
-| U4 | The ten steps, first-run and edit modes, v1 conversion with forced isolation, `sessionStorage` draft, `AlertBox` text; the `@fleet/ui` text input | apps/web, packages/ui | U3 | O |
+| U4 | The eleven steps (including 3a), first-run and edit modes, v1 conversion with forced isolation, `sessionStorage` draft, `AlertBox` text; the `@fleet/ui` text input | apps/web, packages/ui | U3, O14b, O14e2 | O |
 | U5 | CI smoke for setup mode and the byte-for-byte comparison with `init` | scripts, `.github` | U2, U4 | O |
 | U6 | Runbook section (single, multi with ssh forwarding, recovery) and README link | docs | U4 | O |
 
-Waves: U1 → U2 and U3 together (different apps; U2 waits for O11) → U4 → U5 and U6 together.
+Waves: U1 → U2 and U3 together (different apps; U2 waits for O11) → U4 (also after O14b and O14e2) → U5 and U6 together. U7 after U1 and O14e2; U8 after U7 and U4.
 
 ## Risks
 
@@ -220,11 +228,41 @@ Waves: U1 → U2 and U3 together (different apps; U2 waits for O11) → U4 → U
 - A desktop browser on the orchestrator host, or reached with the ssh forwarding above.
 - macOS and Linux (WSL on Windows), production builds only.
 
+## Amendment (revision 2.4): Settings always in the app menu
+
+Owner, 2026-10-16: "The UI should have the onboarding settings always accessible via a settings menu within
+the application UI." Editing from the normal app would give the `/v1` API the power to rewrite the
+installation (including turning on agy `full`), which this plan deliberately keeps out of `/v1`. So:
+
+- **Menu:** a Settings entry is always present in the app's main navigation (desktop and mobile drawer). It
+  opens `/settings` in both modes.
+- **Normal mode (`/v1`, bearer token, read-only):** `/settings` shows every section of the installation as
+  it is on disk, with paths, modes and declared capabilities (the installation holds no secret values, only
+  credential file paths), the loader's validation result, each host's capability `source`, every `full`
+  agy host flagged, and the security text. Data comes from one new read-only route `GET /v1/settings`
+  (summary built by `@fleet/onboarding` from an explicit allow-list of fields, so a future field is left out
+  until added; no file contents, no doctor probes). Tests: non-GET methods are refused and a request without
+  the bearer token gets 401. The view shows credential file paths and ssh aliases to anyone holding the
+  `/v1` token; the runbook says so. Each section has an
+  **Edit** button that opens an `AlertBox` explaining that editing happens in local setup mode, showing the
+  exact command (`fleet-v2 setup --ui`) and that nothing changes from this page; it starts nothing.
+- **Setup mode:** unchanged; the same pages become editable.
+- A banner on the read-only view states it is a view of the file, refreshed on load.
+
+| # | Lane | Edits | Depends on | Review |
+|---|---|---|---|---|
+| U7 | `GET /v1/settings` (read-only, guarded like every `/v1` route) and its summary builder in `@fleet/onboarding` | apps/api, onboarding | U1, O14e2 | F |
+| U8 | Settings menu entry, read-only `/settings` view, Edit `AlertBox` | apps/web | U7, U4 | O |
+
+U4 additionally depends on O14b and O14e2 for step 3a. U5's byte-for-byte comparison injects the
+acknowledgement time (or excludes `acceptedAt`) so a `full` draft compares exactly.
+
 ## Decisions taken in this revision (owner may change)
 
 1. Setup mode stays open until Ctrl-C or 30 minutes idle (revision 1's open question 1).
-2. No read-only settings view inside the normal authenticated app for now; editing and viewing both go
-   through setup mode (revision 1's open question 2).
+2. *Superseded by revision 2.4 (owner, 2026-10-16: "The UI should have the onboarding settings always
+   accessible via a settings menu within the application UI").* Settings is always in the app menu; the
+   normal app shows a read-only view, and editing still happens only in setup mode (see the amendment).
 
 ## Review
 

@@ -24,7 +24,7 @@
     {
       "id": "implementer",
       "tool": "opencode",
-      "model": "example-provider/example-implementer-model",
+      "model": "example-provider/glm-5.3",
       "agent": "example-agent",
       "roles": ["implementer"],
       "costClass": "plan-quota"
@@ -32,7 +32,7 @@
     {
       "id": "reviewer",
       "tool": "opencode",
-      "model": "example-provider/example-review-model",
+      "model": "example-provider/grok-4.7",
       "agent": "example-agent",
       "roles": ["reviewer"],
       "costClass": "paid"

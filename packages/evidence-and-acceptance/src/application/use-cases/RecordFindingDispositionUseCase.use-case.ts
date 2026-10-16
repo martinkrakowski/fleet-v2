@@ -7,6 +7,7 @@
 
 import type { EvidenceAssessmentRecord, ReviewFindingRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
+import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type {
   RecordFindingDispositionPort,
@@ -118,6 +119,12 @@ export class RecordFindingDispositionUseCase implements RecordFindingDisposition
       return {
         outcome: 'rejected',
         reason: `No finding '${disposition.findingId}' was raised for assessment ${assessment.id}`,
+      };
+    }
+    if (AssessmentState.create(assessment.state).value?.isTerminal()) {
+      return {
+        outcome: 'rejected',
+        reason: `Assessment '${assessment.id}' is in terminal state '${assessment.state}'`,
       };
     }
 

@@ -7,6 +7,7 @@
 
 import type { EvidenceAssessmentRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
+import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import { ReviewReceipt, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type {
@@ -59,6 +60,42 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
     if (assessment === null) {
       return { outcome: 'rejected', reason: 'Assessment not found' };
     }
+    if (AssessmentState.create(assessment.state).value?.isTerminal()) {
+      return {
+        outcome: 'rejected',
+        reason: `Assessment '${assessment.id}' is in terminal state '${assessment.state}'`,
+      };
+    }
+    if (receipt.candidateHeadSha !== assessment.candidateHeadSha) {
+      return {
+        outcome: 'rejected',
+        reason: `Review receipt belongs to head ${receipt.candidateHeadSha}, not the assessed head ${assessment.candidateHeadSha}`,
+      };
+    }
+    if (receipt.policyRevision !== assessment.policyRevision) {
+      return {
+        outcome: 'rejected',
+        reason: `Review receipt was produced under policy revision ${receipt.policyRevision}, not the assessed ${assessment.policyRevision}`,
+      };
+    }
+    if (receipt.attemptId !== assessment.attemptId) {
+      return {
+        outcome: 'rejected',
+        reason: `Review receipt belongs to attempt ${receipt.attemptId}, not the assessed attempt ${assessment.attemptId}`,
+      };
+    }
+    if (receipt.projectId !== assessment.projectId) {
+      return {
+        outcome: 'rejected',
+        reason: `Review receipt belongs to project ${receipt.projectId}, not the assessed project ${assessment.projectId}`,
+      };
+    }
+    if (receipt.assessmentId !== assessment.id) {
+      return {
+        outcome: 'rejected',
+        reason: `Review receipt belongs to assessment ${receipt.assessmentId}, not ${assessment.id}`,
+      };
+    }
     if (!receipt.readOnlyVerified) {
       return {
         outcome: 'rejected',
@@ -80,18 +117,6 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
       return {
         outcome: 'rejected',
         reason: `Reviewer ${receipt.reviewerModel} and implementer ${receipt.implementerModel} share the same underlying model`,
-      };
-    }
-    if (receipt.candidateHeadSha !== assessment.candidateHeadSha) {
-      return {
-        outcome: 'rejected',
-        reason: `Review receipt belongs to head ${receipt.candidateHeadSha}, not the assessed head ${assessment.candidateHeadSha}`,
-      };
-    }
-    if (receipt.assessmentId !== assessment.id) {
-      return {
-        outcome: 'rejected',
-        reason: `Review receipt belongs to assessment ${receipt.assessmentId}, not ${assessment.id}`,
       };
     }
 

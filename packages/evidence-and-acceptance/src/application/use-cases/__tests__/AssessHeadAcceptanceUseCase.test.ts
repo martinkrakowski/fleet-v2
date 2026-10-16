@@ -89,7 +89,9 @@ describe('AssessHeadAcceptanceUseCase', () => {
     }
   });
 
-  it('re-assessing an accepted record returns rejected', async () => {
+  it('re-assessing an accepted record with the same head and policy returns the stored acceptance', async () => {
+    // Idempotent by design (Fable should-fix on #47): a retry must not turn an
+    // accepted head into a permanent failure.
     const acceptedRecord = sampleRecord({ state: 'accepted', acceptanceReceiptId: 'acc-1' });
     const repo = new InMemoryAssessmentRepo([acceptedRecord]);
     const useCase = new AssessHeadAcceptanceUseCase({ repo });
@@ -100,10 +102,8 @@ describe('AssessHeadAcceptanceUseCase', () => {
       policyRevision: 'pol-1',
     });
 
-    expect(result.outcome).toBe('rejected');
-    if (result.outcome === 'rejected') {
-      expect(result.reason).toContain('terminal state');
-    }
+    expect(result.outcome).toBe('accepted');
+    expect(JSON.stringify(result)).toContain('acc-1');
   });
 
   it('re-assessing a rejected record returns rejected', async () => {

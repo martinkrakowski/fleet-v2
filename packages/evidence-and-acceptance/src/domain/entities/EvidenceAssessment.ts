@@ -224,6 +224,9 @@ export class EvidenceAssessment {
   }
 
   appendVerificationReceipt(receipt: VerificationReceiptRecord, updatedAtIso: string): void {
+    if (this.isTerminal()) {
+      throw new Error(`Cannot append verification receipt to an assessment in terminal state '${this.record.state}'`);
+    }
     const validated = VerificationReceipt.create(receipt);
     if (!validated.success || validated.value === undefined) {
       throw new Error(validated.error?.message ?? 'Invalid verification receipt');
@@ -243,6 +246,9 @@ export class EvidenceAssessment {
   }
 
   appendReviewReceipt(receipt: ReviewReceiptRecord, updatedAtIso: string): void {
+    if (this.isTerminal()) {
+      throw new Error(`Cannot append review receipt to an assessment in terminal state '${this.record.state}'`);
+    }
     const validated = ReviewReceipt.create(receipt);
     if (!validated.success || validated.value === undefined) {
       throw new Error(validated.error?.message ?? 'Invalid review receipt');
@@ -262,6 +268,9 @@ export class EvidenceAssessment {
   }
 
   appendFindingDisposition(disposition: FindingDispositionRecord, updatedAtIso: string): void {
+    if (this.isTerminal()) {
+      throw new Error(`Cannot append finding disposition to an assessment in terminal state '${this.record.state}'`);
+    }
     const validated = FindingDisposition.create(disposition);
     if (!validated.success || validated.value === undefined) {
       throw new Error(validated.error?.message ?? 'Invalid finding disposition');

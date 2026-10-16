@@ -11,6 +11,7 @@ import type {
   VerificationReceiptRecord,
 } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
+import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { EvidenceArchivePort } from '../ports/out/EvidenceArchivePort.out-port.js';
 import type { VerificationExecutorPort } from '../ports/out/VerificationExecutorPort.out-port.js';
@@ -94,6 +95,12 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
     const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
     const existing = await deps.repo.findAssessmentById(request.assessmentId);
     if (existing !== null) {
+      if (AssessmentState.create(existing.state).value?.isTerminal()) {
+        return {
+          outcome: 'rejected',
+          reason: `Assessment '${existing.id}' is in terminal state '${existing.state}'`,
+        };
+      }
       if (existing.candidateHeadSha !== request.candidateHeadSha) {
         return {
           outcome: 'rejected',

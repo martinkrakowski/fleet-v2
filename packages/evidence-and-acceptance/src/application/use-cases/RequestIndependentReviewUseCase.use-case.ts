@@ -7,6 +7,7 @@
 
 import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
+import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import { ReviewReceipt, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { EvidenceArchivePort } from '../ports/out/EvidenceArchivePort.out-port.js';
@@ -108,6 +109,13 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
         outcome: 'rejected',
         reason:
           'Assessment identity mismatch (projectId, attemptId, or policyRevision does not match existing assessment)',
+      };
+    }
+
+    if (AssessmentState.create(existing.state).value?.isTerminal()) {
+      return {
+        outcome: 'rejected',
+        reason: `Assessment '${existing.id}' is in terminal state '${existing.state}'`,
       };
     }
 

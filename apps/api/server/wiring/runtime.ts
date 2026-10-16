@@ -227,6 +227,28 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
       // One acceptance assessment per attempt candidate head; the work-side
       // request's coordinates map onto the evidence context's exact-head keys.
       assess: async (request) => {
+        const inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
+          assessmentId: request.attemptId,
+          candidateHeadSha: request.candidateHeadSha,
+        });
+        if (
+          inspected.outcome === "found" &&
+          inspected.assessment.state === "accepted" &&
+          inspected.assessment.candidateHeadSha === request.candidateHeadSha &&
+          inspected.assessment.policyRevision === request.policyRevision &&
+          inspected.assessment.acceptanceReceiptId !== null
+        ) {
+          acceptedReceiptByHead[inspected.assessment.candidateHeadSha] =
+            inspected.assessment.acceptanceReceiptId;
+          if (stateDir !== undefined) {
+            persistAcceptedReceiptsToState(stateDir, liveAcceptedReceiptByHead);
+          }
+          return {
+            outcome: "accepted",
+            receiptId: inspected.assessment.acceptanceReceiptId,
+            assessedHeadSha: inspected.assessment.candidateHeadSha,
+          };
+        }
         const result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
           assessmentId: request.attemptId,
           candidateHeadSha: request.candidateHeadSha,

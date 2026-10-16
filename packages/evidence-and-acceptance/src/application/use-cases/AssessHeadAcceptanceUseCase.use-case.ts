@@ -128,7 +128,24 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
     if (assessment.state === 'stale') {
       return { outcome: 'stale', reason: 'Assessment is stale and cannot be accepted' };
     }
-    if (assessment.state === 'accepted' || assessment.state === 'rejected') {
+    if (assessment.state === 'accepted') {
+      if (
+        assessment.candidateHeadSha === request.candidateHeadSha &&
+        assessment.policyRevision === request.policyRevision
+      ) {
+        return {
+          outcome: 'accepted',
+          receiptId: assessment.acceptanceReceiptId ?? '',
+          candidateHeadSha: assessment.candidateHeadSha,
+          assessment,
+        };
+      }
+      return {
+        outcome: 'rejected',
+        reason: `Assessment is already in terminal state '${assessment.state}'`,
+      };
+    }
+    if (assessment.state === 'rejected') {
       return {
         outcome: 'rejected',
         reason: `Assessment is already in terminal state '${assessment.state}'`,

@@ -701,6 +701,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
           knowledgeEntryId: selection.knowledgeEntryId,
           version: selection.version,
           accepted: selection.accepted,
+          decisionBecause: selection.decisionBecause,
         })),
       });
       return result.outcome === 'recorded'

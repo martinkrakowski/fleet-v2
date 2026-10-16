@@ -68,7 +68,8 @@ export class RecordContextSelectionUseCase implements RecordContextSelectionPort
         };
       }
 
-      // Refuse selecting an entry that is not an accepted keeper.
+      // Refuse selecting an entry that is not an accepted keeper when accepted is true.
+      // A rejected item (accepted: false) may reference any existing entry.
       const entry = await this.deps.repo.findEntryById(item.knowledgeEntryId);
       if (!entry) {
         return {
@@ -76,15 +77,17 @@ export class RecordContextSelectionUseCase implements RecordContextSelectionPort
           reason: `Knowledge entry not found: ${item.knowledgeEntryId}`,
         };
       }
-      const isAcceptedKeeper =
-        entry.disposition === 'accepted' &&
-        entry.verification === 'supported' &&
-        entry.supersededById === null;
-      if (!isAcceptedKeeper) {
-        return {
-          outcome: 'rejected',
-          reason: `Only accepted keepers may be selected: entry ${entry.id} is not an accepted keeper (disposition: ${entry.disposition}, verification: ${entry.verification})`,
-        };
+      if (item.accepted) {
+        const isAcceptedKeeper =
+          entry.disposition === 'accepted' &&
+          entry.verification === 'supported' &&
+          entry.supersededById === null;
+        if (!isAcceptedKeeper) {
+          return {
+            outcome: 'rejected',
+            reason: `Only accepted keepers may be selected: entry ${entry.id} is not an accepted keeper (disposition: ${entry.disposition}, verification: ${entry.verification})`,
+          };
+        }
       }
 
       const created = ContextSelection.create({

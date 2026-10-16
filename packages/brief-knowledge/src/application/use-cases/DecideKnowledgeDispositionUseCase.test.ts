@@ -203,10 +203,35 @@ describe('DecideKnowledgeDispositionUseCase', () => {
     }
   });
 
+  it('never accepts policy proposals', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    const candidate = createEntryRecord({
+      id: 'ke-policy-1',
+      disposition: 'candidate',
+      verification: 'supported',
+      claimText: 'Change permissions for the deploy seat',
+    });
+    await repo.saveEntry(candidate);
+
+    const useCase = new DecideKnowledgeDispositionUseCase({ repo });
+    const result = await useCase.execute({
+      entryId: 'ke-policy-1',
+      disposition: 'accepted',
+      checkerId: 'checker-1',
+      reason: 'Attempting to accept policy proposal',
+    });
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'A policy proposal never becomes an accepted keeper; coordinate it as policy',
+    });
+  });
+
   it('applies entity guard: a policy proposal never becomes an accepted keeper', async () => {
     const repo = new InMemoryKnowledgeEntryRepository();
     const proposal = createEntryRecord({
       id: 'ke-proposal-1',
+      claimText: 'General compiler guidance',
       disposition: 'policy-proposal',
       verification: 'supported',
     });

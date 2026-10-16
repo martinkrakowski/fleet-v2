@@ -308,4 +308,65 @@ describe('RecordContextSelectionUseCase', () => {
       decisionBecause: realReason,
     });
   });
+
+  it('allows a rejected selection (accepted: false) to reference any existing entry', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    const candidateEntry = createEntryRecord({
+      id: 'ke-cand-unverified',
+      disposition: 'candidate',
+      verification: 'unverified',
+    });
+    const contradictedEntry = createEntryRecord({
+      id: 'ke-contra',
+      disposition: 'candidate',
+      verification: 'contradicted',
+    });
+    const supersededEntry = createEntryRecord({
+      id: 'ke-old',
+      disposition: 'superseded',
+      verification: 'supported',
+      supersededById: 'ke-newer',
+    });
+    await repo.saveEntry(candidateEntry);
+    await repo.saveEntry(contradictedEntry);
+    await repo.saveEntry(supersededEntry);
+
+    const useCase = new RecordContextSelectionUseCase({ repo });
+    const result = await useCase.execute({
+      attemptId: 'att-1',
+      selections: [
+        {
+          proposalId: 'prop-1',
+          knowledgeEntryId: 'ke-cand-unverified',
+          version: '1.0.0',
+          accepted: false,
+          decisionBecause: 'Candidate not verified for this attempt',
+        },
+        {
+          proposalId: 'prop-2',
+          knowledgeEntryId: 'ke-contra',
+          version: '1.0.0',
+          accepted: false,
+          decisionBecause: 'Contradicted claim rejected by orchestrator',
+        },
+        {
+          proposalId: 'prop-3',
+          knowledgeEntryId: 'ke-old',
+          version: '1.0.0',
+          accepted: false,
+          decisionBecause: 'Superseded claim excluded by orchestrator',
+        },
+      ],
+    });
+
+    expect(result).toEqual({ outcome: 'recorded', recordedCount: 3 });
+    const recorded = await repo.listContextSelections('att-1');
+    expect(recorded).toHaveLength(3);
+    expect(recorded[0].accepted).toBe(false);
+    expect(recorded[0].knowledgeEntryId).toBe('ke-cand-unverified');
+    expect(recorded[1].accepted).toBe(false);
+    expect(recorded[1].knowledgeEntryId).toBe('ke-contra');
+    expect(recorded[2].accepted).toBe(false);
+    expect(recorded[2].knowledgeEntryId).toBe('ke-old');
+  });
 });

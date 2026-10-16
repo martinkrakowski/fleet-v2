@@ -302,8 +302,21 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
       rt.execution.inspectWorkOrder.inspectWorkOrder({ workOrderId: str(p, 'workOrderId') }),
   },
   brief: {
-    prepare: async (p, rt) =>
-      rt.execution.prepareBriefPackage.prepareBriefPackage({
+    prepare: async (p, rt) => {
+      const contextDecisions = nestedArr<BriefContextDecision>(p, 'contextDecisions') ?? [];
+      for (const decision of contextDecisions) {
+        if (
+          !decision ||
+          typeof decision !== 'object' ||
+          typeof decision.decisionBecause !== 'string' ||
+          decision.decisionBecause.trim() === ''
+        ) {
+          throw new CliUsageError(
+            "brief prepare contextDecisions requires a non-empty 'decisionBecause' for each item",
+          );
+        }
+      }
+      return rt.execution.prepareBriefPackage.prepareBriefPackage({
         workOrderId: str(p, 'workOrderId'),
         projectId: str(p, 'projectId'),
         taskId: str(p, 'taskId'),
@@ -326,11 +339,12 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         resourceBounds: nested<Record<string, string>>(p, 'resourceBounds') ?? {},
         expectedArtifacts: strArr(p, 'expectedArtifacts'),
         ownerDecisionReferences: strArr(p, 'ownerDecisionReferences'),
-        contextDecisions: nestedArr<BriefContextDecision>(p, 'contextDecisions') ?? [],
+        contextDecisions,
         attemptId: optStr(p, 'attemptId'),
         worktreePath: optStr(p, 'worktreePath'),
         handWrittenBriefPath: strOrNull(p, 'handWrittenBriefPath'),
-      }),
+      });
+    },
   },
   capacity: {
     reserve: async (p, rt) =>
@@ -538,12 +552,26 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         maxEntries: optNum(p, 'maxEntries'),
         maxTotalChars: optNum(p, 'maxTotalChars'),
       }),
-    'select-context': async (p, rt) =>
-      rt.knowledge.recordContextSelection.recordContextSelection({
+    'select-context': async (p, rt) => {
+      const selections = nestedArr<RecordContextSelectionItem>(p, 'selections') ?? [];
+      for (const selection of selections) {
+        if (
+          !selection ||
+          typeof selection !== 'object' ||
+          typeof selection.decisionBecause !== 'string' ||
+          selection.decisionBecause.trim() === ''
+        ) {
+          throw new CliUsageError(
+            "knowledge select-context requires a non-empty 'decisionBecause' for each item",
+          );
+        }
+      }
+      return rt.knowledge.recordContextSelection.recordContextSelection({
         attemptId: str(p, 'attemptId'),
-        selections: nestedArr<RecordContextSelectionItem>(p, 'selections') ?? [],
+        selections,
         nowIso: optStr(p, 'nowIso'),
-      }),
+      });
+    },
     'record-reuse': async (p, rt) =>
       rt.knowledge.recordKnowledgeReuse.recordKnowledgeReuse({
         reuseId: str(p, 'reuseId'),

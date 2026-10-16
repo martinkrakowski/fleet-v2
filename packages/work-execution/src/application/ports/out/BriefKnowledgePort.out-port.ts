@@ -29,6 +29,7 @@ export interface RecordContextSelectionEntry {
   readonly knowledgeEntryId: string;
   readonly version: string;
   readonly accepted: boolean;
+  readonly decisionBecause?: string;
 }
 
 export interface RecordContextSelectionRequest {

@@ -181,6 +181,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
           knowledgeEntryId: decision.knowledgeEntryId,
           version: decision.version,
           accepted: decision.accepted,
+          decisionBecause: decision.decisionBecause,
         })),
       });
     }

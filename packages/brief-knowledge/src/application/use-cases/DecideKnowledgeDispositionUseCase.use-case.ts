@@ -20,6 +20,8 @@ export interface DecideKnowledgeDispositionDependencies {
   readonly repo: KnowledgeEntryRepositoryPort;
 }
 
+export const POLICY_PROPOSAL_PATTERN = /\b(rules?|seats?|hosts?|permissions?|policy|policies)\b/i;
+
 export class DecideKnowledgeDispositionUseCase implements DecideKnowledgeDispositionPort {
   constructor(private readonly deps?: DecideKnowledgeDispositionDependencies) {}
 
@@ -57,6 +59,13 @@ export class DecideKnowledgeDispositionUseCase implements DecideKnowledgeDisposi
     const entry = await repo.findEntryById(request.entryId);
     if (!entry) {
       return { outcome: 'rejected', reason: `Knowledge entry not found: ${request.entryId}` };
+    }
+
+    if (request.disposition === 'accepted' && POLICY_PROPOSAL_PATTERN.test(entry.claimText)) {
+      return {
+        outcome: 'rejected',
+        reason: 'A policy proposal never becomes an accepted keeper; coordinate it as policy',
+      };
     }
 
     const nowIso = request.nowIso ?? new Date().toISOString();

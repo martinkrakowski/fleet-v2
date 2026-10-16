@@ -728,6 +728,23 @@ describe("configured compositions execute real operations", () => {
     if (captured.outcome !== "captured") return;
     const entryId = captured.candidateEntries[0]?.id ?? "";
 
+    const checked = await getKnowledgeComposition().checkKnowledgeClaim.execute({
+      entryId,
+      checkId: "check-brief-1",
+      checkerId: "checker-1",
+      procedureName: "confirm-path-exists",
+      targetPath: process.cwd(),
+    });
+    expect(checked.outcome).toBe("checked");
+
+    const decided = await getKnowledgeComposition().decideKnowledgeDisposition.execute({
+      entryId,
+      disposition: "accepted",
+      checkerId: "checker-1",
+      reason: "verified against the working tree",
+    });
+    expect(decided.outcome).toBe("decided");
+
     const repoPath = await makeTempGitRepo();
     const briefPath = path.join(repoPath, "hand-written-brief.md");
     await writeFile(briefPath, "# Frozen brief for the wired runtime\n", "utf8");
@@ -774,11 +791,13 @@ describe("configured compositions execute real operations", () => {
     // The work-side delegation reached the knowledge context's store.
     const selections = JSON.parse(
       await readFile(path.join(stateDir, "context-selections.json"), "utf8"),
-    ) as Array<{ attemptId: string; knowledgeEntryId: string }>;
+    ) as Array<{ attemptId: string; knowledgeEntryId: string; decisionBecause?: string }>;
     expect(
       selections.some(
         (selection) =>
-          selection.attemptId === "att-brief-1" && selection.knowledgeEntryId === entryId,
+          selection.attemptId === "att-brief-1" &&
+          selection.knowledgeEntryId === entryId &&
+          selection.decisionBecause === "accepted by the orchestrator",
       ),
     ).toBe(true);
   });

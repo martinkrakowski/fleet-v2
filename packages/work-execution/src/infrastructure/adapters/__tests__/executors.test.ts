@@ -747,7 +747,20 @@ describe('a timed-out child never reports a real exit code (spawn-run close hand
     expect(result.error).toBeDefined();
     const grandchildPid = Number(result.stdout.trim().split('\n')[0]);
     expect(Number.isFinite(grandchildPid)).toBe(true);
-    expect(() => process.kill(grandchildPid, 0)).toThrow();
+    // The kill is asynchronous and the orphan is reaped by init, so poll briefly.
+    const isAlive = (): boolean => {
+      try {
+        process.kill(grandchildPid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const deadline = Date.now() + 3000;
+    while (isAlive() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(isAlive()).toBe(false);
   });
 });
 

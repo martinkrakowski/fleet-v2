@@ -14,7 +14,7 @@ export interface PublishKeeperToShelfRequest {
 
 export type PublishKeeperToShelfResult =
   | { readonly outcome: 'published'; readonly externalRef: string }
-  | { readonly outcome: 'failed'; readonly reason: string };
+  | { readonly outcome: 'failed'; readonly reason: string; readonly retryable?: boolean };
 
 export interface KeeperPublicationPort {
   /** Write one attributed keeper entry to the shelf; failures come back for reconciliation. */

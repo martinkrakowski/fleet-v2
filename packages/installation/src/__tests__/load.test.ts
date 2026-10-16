@@ -147,7 +147,8 @@ describe('loadInstallation', () => {
     const result = loadInstallation({ file, env: {} });
     expect(result.status).toBe('invalid');
     if (result.status === 'invalid') {
-      expect(result.errors).toEqual(['waves.token: unknown key']);
+      expect(result.errors).toEqual(['waves: unknown key']);
+      expect(result.errors.join(' ').includes('token')).toBe(false);
     }
   });
 

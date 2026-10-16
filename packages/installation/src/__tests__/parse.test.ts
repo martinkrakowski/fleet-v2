@@ -69,7 +69,10 @@ describe('parseInstallation', () => {
 
   it('rejects an unknown top-level key', () => {
     const result = parseInstallation({ schemaVersion: 1, oops: true });
-    expect(result).toEqual({ ok: false, errors: ['oops: unknown key'] });
+    expect(result).toEqual({ ok: false, errors: ['installation: unknown key'] });
+    if (!result.ok) {
+      expect(result.errors.join(' ').includes('oops')).toBe(false);
+    }
   });
 
   it('rejects an unknown nested key inside waves', () => {
@@ -81,7 +84,10 @@ describe('parseInstallation', () => {
         token: 'never-echo',
       },
     });
-    expect(result).toEqual({ ok: false, errors: ['waves.token: unknown key'] });
+    expect(result).toEqual({ ok: false, errors: ['waves: unknown key'] });
+    if (!result.ok) {
+      expect(result.errors.join(' ').includes('token')).toBe(false);
+    }
   });
 
   it('rejects a section that is not an object', () => {
@@ -165,10 +171,11 @@ describe('parseInstallation', () => {
     });
     expect(result).toEqual({
       ok: false,
-      errors: [
-        'verification.procedures.Bad_Name: procedure name must match ^[a-z0-9][a-z0-9-]*$',
-      ],
+      errors: ['verification.procedures: invalid procedure name'],
     });
+    if (!result.ok) {
+      expect(result.errors.join(' ').includes('Bad_Name')).toBe(false);
+    }
   });
 
   it('rejects procedure args that are not an array of non-empty strings', () => {

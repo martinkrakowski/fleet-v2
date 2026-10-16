@@ -6,7 +6,10 @@
  * error, never a silent guess.
  *
  * Every command runs through the configured `CommandExecutorPort` (local or
- * ssh). The former direct `sshHost` seam is gone: transport selection is the
+ * ssh) with an explicit wall-clock budget: git commands, existence probes
+ * and file reads each get 60 s; a run that exceeds its budget is killed and
+ * reported as a failure, never a success. The former direct `sshHost` seam
+ * is gone: transport selection is the
  * executor's job, made once from the installation configuration and not
  * re-decided here per call. In particular, once a worktree ssh host is
  * configured, git runs through that ssh transport even when the worktree
@@ -34,6 +37,15 @@ export interface WorkspaceAdapterOptions {
 
 /** Residue markers a previous attempt may have left in the worktree. */
 const laneResidueFiles = ['.lane/brief.md', '.lane/brief-manifest.json', '.lane/notes.md'];
+
+/** Wall-clock budget for one read-only git command in the worktree. */
+const GIT_TIMEOUT_MS = 60 * 1000;
+
+/** Wall-clock budget for one existence probe (`test -e`). */
+const PROBE_TIMEOUT_MS = 60 * 1000;
+
+/** Wall-clock budget for one file read (`cat`). */
+const CAT_TIMEOUT_MS = 60 * 1000;
 
 /**
  * Validate that an SSH host string is safe to pass to subprocess commands.
@@ -135,10 +147,12 @@ export class WorkspaceAdapter implements WorkspacePort {
     };
   }
 
-  /** Read-only git in the worktree, through the executor. */
+  /** Read-only git in the worktree, through the executor, within its budget. */
   private async runGit(worktreePath: string, args: readonly string[]): Promise<string> {
     const executor = this.requireExecutor();
-    const result = await executor.run(['git', '-C', worktreePath, ...args]);
+    const result = await executor.run(['git', '-C', worktreePath, ...args], {
+      timeoutMs: GIT_TIMEOUT_MS,
+    });
     if (result.exitCode !== 0) {
       throw new Error(
         `git ${args.join(' ')} failed in ${worktreePath}: exit ${String(result.exitCode)}` +
@@ -151,7 +165,9 @@ export class WorkspaceAdapter implements WorkspacePort {
   /** Existence of one absolute path in the worktree's filesystem. */
   private async pathExists(worktreePath: string, targetPath: string): Promise<boolean> {
     const executor = this.requireExecutor();
-    const result = await executor.run(['test', '-e', targetPath]);
+    const result = await executor.run(['test', '-e', targetPath], {
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
     if (result.exitCode !== 0 && result.exitCode !== 1) {
       throw new Error(
         `Unable to probe ${targetPath}: exit ${String(result.exitCode)}` +
@@ -166,7 +182,14 @@ export class WorkspaceAdapter implements WorkspacePort {
       ? relativePath
       : path.join(worktreePath, relativePath);
     const executor = this.requireExecutor();
-    const result = await executor.run(['cat', targetPath]);
+    const result = await executor.run(['cat', targetPath], { timeoutMs: CAT_TIMEOUT_MS });
+    // A null exit code (spawn failure, timeout) is a failed read, not an
+    // absent file; only exit 1 and friends mean "no such file".
+    if (result.exitCode === null) {
+      throw new Error(
+        `Unable to read ${targetPath}` + (result.error !== undefined ? `: ${result.error}` : ''),
+      );
+    }
     return result.exitCode === 0 ? result.stdout : null;
   }
 }

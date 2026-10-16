@@ -7,6 +7,7 @@
 
 import type {
   ChainsSection,
+  DecisionsSectionV2,
   FleetInstallation,
   FleetInstallationV2,
   ForgeSectionV2,
@@ -55,6 +56,9 @@ export function writeInstallationV2(installation: FleetInstallationV2): string {
   }
   if (installation.waves !== undefined) {
     document.waves = serializeWaves(installation.waves);
+  }
+  if (installation.decisions !== undefined) {
+    document.decisions = serializeDecisions(installation.decisions);
   }
   return `${JSON.stringify(document, null, 2)}\n`;
 }
@@ -187,6 +191,27 @@ function serializeVerification(
     procedures[name] = out;
   }
   return { procedures };
+}
+
+function serializeDecisions(decisions: DecisionsSectionV2): Record<string, unknown> {
+  if (decisions.provider === 'none') {
+    return { provider: 'none' };
+  }
+  if (decisions.provider === 'answer-file') {
+    return { provider: 'answer-file', answerFile: decisions.answerFile };
+  }
+  return {
+    provider: 'jev',
+    model: decisions.model,
+    keyFile: decisions.keyFile,
+    minConfidence: decisions.minConfidence,
+    monthlyBudgetUsd: decisions.monthlyBudgetUsd,
+    assumedCostPerCallUsd: decisions.assumedCostPerCallUsd,
+    acknowledgeProseLeavesHost: decisions.acknowledgeProseLeavesHost,
+    ...(decisions.disabledProjects !== undefined
+      ? { disabledProjects: [...decisions.disabledProjects] }
+      : {}),
+  };
 }
 
 function serializeWaves(waves: WavesSection): Record<string, unknown> {

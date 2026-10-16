@@ -215,6 +215,35 @@ export interface VerificationProceduresSection {
   readonly procedures: Readonly<Record<string, VerificationProcedure>>;
 }
 
+/** The v2 `decisions` block with the `none` provider (D3). */
+export interface NoDecisionsSection {
+  readonly provider: 'none';
+}
+
+/** The v2 `decisions` block with the Jev provider (D3). */
+export interface JevDecisionsSection {
+  readonly provider: 'jev';
+  readonly model: string;
+  readonly keyFile: string;
+  readonly minConfidence: number;
+  readonly monthlyBudgetUsd: number;
+  readonly assumedCostPerCallUsd: number;
+  readonly acknowledgeProseLeavesHost: true;
+  readonly disabledProjects?: readonly string[];
+}
+
+/** The v2 `decisions` block with the answer-file provider (D3). */
+export interface AnswerFileDecisionsSection {
+  readonly provider: 'answer-file';
+  readonly answerFile: string;
+}
+
+/** The v2 `decisions` block (D3). */
+export type DecisionsSectionV2 =
+  | NoDecisionsSection
+  | JevDecisionsSection
+  | AnswerFileDecisionsSection;
+
 /** The v2 file shape (plan section 1). */
 export interface FleetInstallationV2 {
   readonly schemaVersion: 2;
@@ -232,6 +261,7 @@ export interface FleetInstallationV2 {
   readonly forge: ForgeSectionV2;
   readonly verification?: VerificationProceduresSection;
   readonly waves?: WavesSection;
+  readonly decisions?: DecisionsSectionV2;
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +335,7 @@ export interface FleetInstallationModel {
   readonly forge?: ForgeSectionV2;
   readonly verification?: VerificationProceduresSection;
   readonly waves?: WavesSection;
+  readonly decisions?: DecisionsSectionV2;
 }
 
 // ---------------------------------------------------------------------------
@@ -346,4 +377,6 @@ export interface FleetInstallation {
   readonly chains?: ChainsSection;
   /** v2: policy shape; rules arrive through the loader's `validatePolicy` hook. Never set in v1. */
   readonly policy?: PolicySection;
+  /** v2: decision provider configuration (D3). Never set in v1. */
+  readonly decisions?: DecisionsSectionV2;
 }

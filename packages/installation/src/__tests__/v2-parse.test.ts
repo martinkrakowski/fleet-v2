@@ -41,6 +41,131 @@ const validV2 = {
   verification: { procedures: { gate: { command: 'yarn', args: ['test'] } } },
 };
 
+const jevDecisions = {
+  provider: 'jev',
+  model: 'example-provider/example-model',
+  keyFile: '/etc/fleet/jev-key',
+  minConfidence: 0.8,
+  monthlyBudgetUsd: 50,
+  assumedCostPerCallUsd: 0.01,
+  acknowledgeProseLeavesHost: true,
+  disabledProjects: ['project-a'],
+};
+
+describe('parseInstallation v2 decisions', () => {
+  it('accepts each provider and a file without the block', () => {
+    const none = parseInstallation({ ...validV2, decisions: { provider: 'none' } });
+    expect(none).toEqual({ ok: true, installation: { ...validV2, decisions: { provider: 'none' } } });
+
+    const jev = parseInstallation({ ...validV2, decisions: jevDecisions });
+    expect(jev).toEqual({ ok: true, installation: { ...validV2, decisions: jevDecisions } });
+
+    const answerFile = parseInstallation({
+      ...validV2,
+      decisions: { provider: 'answer-file', answerFile: '/etc/fleet/answers.json' },
+    });
+    expect(answerFile).toEqual({
+      ok: true,
+      installation: {
+        ...validV2,
+        decisions: { provider: 'answer-file', answerFile: '/etc/fleet/answers.json' },
+      },
+    });
+
+    const absent = parseInstallation(validV2);
+    expect(absent).toEqual({ ok: true, installation: validV2 });
+  });
+
+  it('rejects bad fields per provider with value-free messages', () => {
+    const badJev = parseInstallation({
+      ...validV2,
+      decisions: {
+        ...jevDecisions,
+        keyFile: 'relative/key',
+        minConfidence: 1.5,
+        monthlyBudgetUsd: 0,
+        assumedCostPerCallUsd: -1,
+        acknowledgeProseLeavesHost: false,
+        disabledProjects: [''],
+        extra: 'nope',
+      },
+    });
+    expect(badJev).toEqual({
+      ok: false,
+      errors: [
+        'decisions: unknown key',
+        'decisions.keyFile: must be an absolute path',
+        'decisions.minConfidence: must be a number between 0 and 1',
+        'decisions.monthlyBudgetUsd: must be a number greater than 0',
+        'decisions.assumedCostPerCallUsd: must be a number greater than 0',
+        'decisions.acknowledgeProseLeavesHost: must be true',
+        'decisions.disabledProjects[0]: must be a non-empty string',
+      ],
+    });
+
+    const missingJevFields = parseInstallation({
+      ...validV2,
+      decisions: { provider: 'jev', model: 'example-provider/example-model' },
+    });
+    expect(missingJevFields).toEqual({
+      ok: false,
+      errors: [
+        'decisions.keyFile: required',
+        'decisions.minConfidence: required',
+        'decisions.monthlyBudgetUsd: required',
+        'decisions.assumedCostPerCallUsd: required',
+        'decisions.acknowledgeProseLeavesHost: required',
+      ],
+    });
+
+    const noneWithExtra = parseInstallation({
+      ...validV2,
+      decisions: { provider: 'none', keyFile: '/etc/fleet/jev-key' },
+    });
+    expect(noneWithExtra).toEqual({ ok: false, errors: ['decisions: unknown key'] });
+
+    const answerFileMissing = parseInstallation({
+      ...validV2,
+      decisions: { provider: 'answer-file' },
+    });
+    expect(answerFileMissing).toEqual({ ok: false, errors: ['decisions.answerFile: required'] });
+
+    const badProvider = parseInstallation({ ...validV2, decisions: { provider: 'oracle' } });
+    expect(badProvider).toEqual({
+      ok: false,
+      errors: ['decisions.provider: must be a known provider'],
+    });
+
+    const notAnObject = parseInstallation({ ...validV2, decisions: 'none' });
+    expect(notAnObject).toEqual({ ok: false, errors: ['decisions: must be an object'] });
+
+    const noProvider = parseInstallation({ ...validV2, decisions: { model: 'm' } });
+    expect(noProvider).toEqual({
+      ok: false,
+      errors: ['decisions.provider: required'],
+    });
+  });
+
+  it('refuses a v1 file carrying decisions', () => {
+    const result = parseInstallation({
+      schemaVersion: 1,
+      decisions: { provider: 'none' },
+    });
+    expect(result).toEqual({ ok: false, errors: ['installation: unknown key'] });
+  });
+
+  it('does not echo the keyFile value in an error message', () => {
+    const result = parseInstallation({
+      ...validV2,
+      decisions: { ...jevDecisions, keyFile: 'secret/relative-path' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.join(' ')).not.toContain('secret/relative-path');
+    }
+  });
+});
+
 describe('parseInstallation v2', () => {
   it('accepts a valid v2 file and returns it unchanged', () => {
     const result = parseInstallation(validV2);

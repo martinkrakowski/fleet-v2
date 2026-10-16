@@ -560,9 +560,9 @@ bounded_contexts:
         use_cases: [CaptureCompletedAttemptNotesUseCase, CheckKnowledgeClaimUseCase, DecideKnowledgeDispositionUseCase, PublishAcceptedKeeperUseCase, ProposeBriefContextUseCase, RecordContextSelectionUseCase, RecordKnowledgeReuseUseCase, SupersedeKnowledgeEntryUseCase]
         ports:
           in: [CaptureCompletedAttemptNotesPort, CheckKnowledgeClaimPort, DecideKnowledgeDispositionPort, PublishAcceptedKeeperPort, ProposeBriefContextPort, RecordContextSelectionPort, RecordKnowledgeReusePort, SupersedeKnowledgeEntryPort]
-          out: [KnowledgeEntryRepositoryPort, KnowledgeRetrievalPort, ClaimVerificationPort, KeeperPublicationPort]
+          out: [KnowledgeEntryRepositoryPort, KnowledgeRetrievalPort, ClaimVerificationPort, KeeperPublicationPort, KnowledgeRankingAdvicePort, DecisionReceiptJournalPort]
       infrastructure:
-        adapters: [KnowledgeEntryRepositoryAdapter, KnowledgeRetrievalAdapter, ClaimVerificationAdapter, KeeperPublicationAdapter]
+        adapters: [KnowledgeEntryRepositoryAdapter, KnowledgeRetrievalAdapter, ClaimVerificationAdapter, KeeperPublicationAdapter, NullRankingAdviceAdapter, AdvisedKnowledgeRetrievalAdapter, JevRankingAdviceAdapter, AnswerFileRankingAdviceAdapter]
     contracts:
       CaptureCompletedAttemptNotesPort: "Accept bounded notes with completed-attempt identity and record missing/incomplete reports; every bullet becomes a candidate claim."
       CheckKnowledgeClaimPort: "Record orchestrator-chosen evidence for a scoped claim without executing instructions supplied by the note."
@@ -576,11 +576,17 @@ bounded_contexts:
       KnowledgeRetrievalPort: "Filter by authorized scope and rank lexical matches without returning rejected, superseded or inapplicable facts."
       ClaimVerificationPort: "Perform a bounded allow-listed check selected by the orchestrator and return evidence, not model confidence."
       KeeperPublicationPort: "Write attributed keeper entries to an optional external shelf without revealing its key to agents."
+      KnowledgeRankingAdvicePort: "Ask a bounded advisory ranking judgement for explicit candidates and return scores or an unknown reason that preserves today's deterministic behaviour."
+      DecisionReceiptJournalPort: "Append decision receipts and report month-to-date spend in UTC so a paid decision is never invisible to its budget."
     adapter_bindings:
       - { adapter: KnowledgeEntryRepositoryAdapter, implements: KnowledgeEntryRepositoryPort, integration: local-transactional-store }
       - { adapter: KnowledgeRetrievalAdapter, implements: KnowledgeRetrievalPort, integration: local-scoped-lexical-index }
       - { adapter: ClaimVerificationAdapter, implements: ClaimVerificationPort, integration: allow-listed-command-or-source-inspection }
       - { adapter: KeeperPublicationAdapter, implements: KeeperPublicationPort, integration: local-file-or-git-provider }
+      - { adapter: NullRankingAdviceAdapter, implements: KnowledgeRankingAdvicePort, integration: not-configured-null }
+      - { adapter: AdvisedKnowledgeRetrievalAdapter, implements: KnowledgeRetrievalPort, integration: inner-retrieval-decorator }
+      - { adapter: JevRankingAdviceAdapter, implements: KnowledgeRankingAdvicePort, integration: openrouter-jev-decisions-endpoint }
+      - { adapter: AnswerFileRankingAdviceAdapter, implements: KnowledgeRankingAdvicePort, integration: owner-recorded-answer-file }
     domain_specification:
       aggregate_roots: [KnowledgeEntry]
       child_ownership: { KnowledgeCheck: KnowledgeEntry, KnowledgeReuse: KnowledgeEntry }

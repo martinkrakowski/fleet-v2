@@ -6,6 +6,7 @@
 
 import type {
   ChainStep,
+  DecisionsSectionV2,
   DerivedRunnerCapabilities,
   FleetInstallation,
   FleetInstallationModel,
@@ -96,8 +97,30 @@ function deriveModelFromV2(installation: FleetInstallation): ModelOutcome {
         ? { verification: { procedures: installation.verification.procedures } }
         : {}),
       ...(installation.waves !== undefined ? { waves: installation.waves } : {}),
+      ...(installation.decisions !== undefined
+        ? { decisions: copyDecisions(installation.decisions) }
+        : {}),
     },
     warnings: [],
+  };
+}
+
+/** Field-by-field copy of the decisions block (D3): no extra key survives. */
+function copyDecisions(decisions: DecisionsSectionV2): DecisionsSectionV2 {
+  if (decisions.provider === 'none' || decisions.provider === 'answer-file') {
+    return { ...decisions };
+  }
+  return {
+    provider: 'jev',
+    model: decisions.model,
+    keyFile: decisions.keyFile,
+    minConfidence: decisions.minConfidence,
+    monthlyBudgetUsd: decisions.monthlyBudgetUsd,
+    assumedCostPerCallUsd: decisions.assumedCostPerCallUsd,
+    acknowledgeProseLeavesHost: decisions.acknowledgeProseLeavesHost,
+    ...(decisions.disabledProjects !== undefined
+      ? { disabledProjects: [...decisions.disabledProjects] }
+      : {}),
   };
 }
 

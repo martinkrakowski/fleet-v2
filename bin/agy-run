@@ -1,0 +1,331 @@
+#!/bin/sh
+# agy-run — a headless agy (Antigravity CLI) lane in a worktree, and the three questions an
+# orchestrator has about a lane: is one running, wait for it, stop it. Sibling of bin/ocm-run.
+#
+#   agy-run --dir <worktree> --model <model> [--effort low|medium|high|xhigh|max] [--agent <name>]
+#           [--mode accept-edits|auto|plan] [--sandbox] [--timeout <45m>] [--brief <.lane/brief.md>] [--detach]
+#   agy-run --status --dir <worktree>   # exit 0: nothing runs there; 3: a lane is running (pid printed)
+#   agy-run --wait   --dir <worktree>   # 0: nothing runs there; 75: GAVE UP after AGY_WAIT_MAX, a lane still runs
+#   agy-run --abort  --dir <worktree>   # stops the lane running there; 0 once nothing runs
+#   agy-run --check  [--dir <worktree>] # exit 0 iff agy is on PATH (and the dir qualifies). Runs nothing.
+#   agy-run --help | -h
+#
+# THE PROMPT IS FIXED. agy is told to read the brief file inside the worktree and carry out its WORK
+# ORDER. No free text reaches the model from the command line, so the dispatch command is the same for
+# every lane and one permission rule covers it. A fix round is a new brief, never a new prompt.
+#
+# WHAT IS NEVER PASSED: --dangerously-skip-permissions (refused, exit 2). agy's own permission rules
+# (its settings.json on the host that runs the lane) decide what a lane may touch; widening them is an
+# owner decision on that host, not a flag. --disable-slash-commands is not passed either: agy ignores
+# --mode while it is set, and the fixed prompt contains no slash command to expand.
+#
+# Rules, as for ocm-run:
+#   1. A dispatch is REFUSED (exit 75) when a lane is already running in --dir. AGY_ALLOW_BUSY=1 overrides.
+#   2. Told to stop (INT, TERM, HUP), this process stops the agy it started. --detach switches that off:
+#      the lane then outlives this process on purpose, and --wait / --abort are how it is followed.
+#   3. "Has the lane ended" is --status or --wait, never the end of a local process.
+#
+# Files under <dir>/.lane (which must be gitignored): agy-run.lock (pid, start, model, mode),
+# agy-run.out (agy's JSON result), agy-run.err (agy's stderr), agy-run.before (HEAD at dispatch),
+# agy-run.last (one line per ended run: exit, seconds, tokens, denied actions).
+# Env: AGY_BIN (default: agy), AGY_ALLOW_BUSY=1, AGY_SANDBOX=1 (same as --sandbox),
+#      AGY_DENIED_IS_FAILURE=1 (a run that ends with denied actions exits 5),
+#      AGY_WAIT_INTERVAL (seconds between looks, default 15), AGY_WAIT_MAX (default 1500),
+#      AGY_HOME (default ~/.gemini/antigravity-cli): agy's state dir, read after a run that ended with denied
+#      actions to name the denied targets (agy's JSON names only the tool). Paths only are printed.
+# Exit: 0 the lane ended with a non-empty response; 1 agy is missing, the dir does not qualify, the
+# run produced no response (an empty response is never a clean result), or agy failed; 2 usage;
+# 3 (--status) a lane is running; 4 agy reported a model or agent error (its exit 3, AGY_ERROR on
+# stderr); 5 denied actions with AGY_DENIED_IS_FAILURE=1; 75 refused, or --wait gave up while a lane
+# still runs; 129/130/143 when stopped by HUP/INT/TERM.
+
+set -u
+
+usage() {
+  cat <<'USAGE'
+Usage: agy-run [--status|--wait|--abort|--check|--detach] --dir <worktree> --model <model>
+               [--effort low|medium|high|xhigh|max] [--agent <name>] [--mode accept-edits|auto|plan]
+               [--sandbox] [--timeout <duration, default 45m>] [--brief <path inside --dir, default .lane/brief.md>]
+The prompt is fixed: agy reads the brief and carries out its WORK ORDER. No prompt text is accepted.
+USAGE
+}
+
+die_usage() { echo "agy-run: $1" >&2; usage >&2; exit 2; }
+
+AGY_BIN=${AGY_BIN:-agy}
+mode=run
+detach=0
+dir=''
+model=''
+effort=''
+agent=''
+agymode=accept-edits
+sandbox=${AGY_SANDBOX:-0}
+timeout=45m
+brief=.lane/brief.md
+
+need() { [ "$#" -ge 2 ] || die_usage "$1 needs a value"; }
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --help | -h) usage; exit 0 ;;
+    --status | --wait | --abort | --check)
+      [ "$mode" = run ] || die_usage "one of --status, --wait, --abort, --check at a time"
+      mode=${1#--} ;;
+    --detach) detach=1 ;;
+    --dir) need "$@"; dir=$2; shift ;;
+    --dir=*) dir=${1#--dir=} ;;
+    --model | -m) need "$@"; model=$2; shift ;;
+    --model=*) model=${1#--model=} ;;
+    --effort) need "$@"; effort=$2; shift ;;
+    --effort=*) effort=${1#--effort=} ;;
+    --agent) need "$@"; agent=$2; shift ;;
+    --agent=*) agent=${1#--agent=} ;;
+    --mode) need "$@"; agymode=$2; shift ;;
+    --mode=*) agymode=${1#--mode=} ;;
+    --sandbox) sandbox=1 ;;
+    --timeout) need "$@"; timeout=$2; shift ;;
+    --timeout=*) timeout=${1#--timeout=} ;;
+    --brief) need "$@"; brief=$2; shift ;;
+    --brief=*) brief=${1#--brief=} ;;
+    --dangerously-skip-permissions)
+      echo "agy-run: refusing --dangerously-skip-permissions. A lane's powers come from agy's permission rules on this host, never from a dispatch flag." >&2
+      exit 2 ;;
+    --print | -p | --prompt | --prompt-interactive | -i | --continue | -c | --conversation | --add-dir | --input-format | --json-schema | --remote-control | --output-format | --print-timeout | --disable-slash-commands)
+      die_usage "do not pass $1; agy-run sets agy's print, output and workspace options itself" ;;
+    -*) die_usage "unknown option $1" ;;
+    *) die_usage "agy-run takes no prompt; the brief inside the worktree is the prompt" ;;
+  esac
+  shift
+done
+
+case "$agymode" in accept-edits | auto | plan) ;; *) die_usage "--mode must be accept-edits, auto or plan" ;; esac
+case "$effort" in '' | low | medium | high | xhigh | max) ;; *) die_usage "--effort must be low, medium, high, xhigh or max" ;; esac
+case "$timeout" in
+  *[!0-9smh]* | '' | [smh]* | *[0-9]) die_usage "--timeout must be a whole number followed by s, m or h (for example 45m)" ;;
+esac
+case "$brief" in
+  /* | *../* | ../* | *'/..' | ..) die_usage "--brief must be a relative path inside --dir" ;;
+esac
+
+command -v "$AGY_BIN" >/dev/null 2>&1 || { echo "agy-run: $AGY_BIN is not on PATH" >&2; exit 1; }
+
+# A dir qualifies when it is the root of a git worktree and .lane is gitignored there.
+qualify_dir() {
+  [ -n "$dir" ] || { echo "agy-run: --$mode needs --dir <worktree>" >&2; exit 2; }
+  [ -d "$dir" ] || { echo "agy-run: $dir is not a directory" >&2; exit 1; }
+  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || { echo "agy-run: $dir is not inside a git worktree" >&2; exit 1; }
+  here=$(cd "$dir" && pwd -P)
+  [ "$top" = "$here" ] || { echo "agy-run: $dir is not the root of its worktree ($top is)" >&2; exit 1; }
+  dir=$here
+  git -C "$dir" check-ignore -q .lane/agy-run.lock 2>/dev/null || { echo "agy-run: .lane/ is not gitignored in $dir; a lane's lock and brief must never be committed" >&2; exit 1; }
+}
+
+lane=''
+lock=''
+set_paths() {
+  lane=$dir/.lane
+  lock=$lane/agy-run.lock
+}
+
+# Prints the pid of the lane running in $dir, nothing when none. A lock whose pid is gone is stale:
+# it is removed and the lane counts as ended.
+lane_running() {
+  [ -f "$lock" ] || return 0
+  lr_pid=$(head -n 1 "$lock" 2>/dev/null)
+  case "$lr_pid" in '' | *[!0-9]*) rm -f "$lock"; return 0 ;; esac
+  if kill -0 "$lr_pid" 2>/dev/null; then
+    echo "$lr_pid"
+    return 0
+  fi
+  echo "agy-run: the lane in $dir ended (pid $lr_pid is gone); its result is in .lane/agy-run.out" >&2
+  rm -f "$lock"
+  return 0
+}
+
+if [ "$mode" = check ]; then
+  if [ -n "$dir" ]; then
+    qualify_dir
+    set_paths
+    [ -f "$dir/$brief" ] || { echo "agy-run: no brief at $dir/$brief" >&2; exit 1; }
+    git -C "$dir" check-ignore -q "$brief" || { echo "agy-run: $brief is not gitignored in $dir" >&2; exit 1; }
+  fi
+  echo "agy-run: ok ($(command -v "$AGY_BIN")${dir:+, $dir qualifies})"
+  exit 0
+fi
+
+qualify_dir
+set_paths
+mkdir -p "$lane"
+
+if [ "$mode" != run ]; then
+  pid=$(lane_running)
+  case "$mode" in
+    status)
+      [ -z "$pid" ] && { echo "agy-run: nothing is running in $dir"; exit 0; }
+      echo "agy-run: running in $dir (pid $pid, since $(sed -n 2p "$lock"), model $(sed -n 3p "$lock"))"
+      exit 3
+      ;;
+    wait)
+      every=${AGY_WAIT_INTERVAL:-15}
+      max=${AGY_WAIT_MAX:-1500}
+      for n in "$every" "$max"; do
+        case "$n" in '' | *[!0-9]*) echo "agy-run: AGY_WAIT_INTERVAL and AGY_WAIT_MAX must be whole seconds" >&2; exit 2 ;; esac
+      done
+      [ "$every" -ge 1 ] || { echo "agy-run: AGY_WAIT_INTERVAL must be at least 1 second" >&2; exit 2; }
+      waited=0
+      while [ -n "$pid" ]; do
+        if [ "$waited" -ge "$max" ]; then
+          echo "agy-run: WAIT GAVE UP (exit 75), the lane has NOT ended: still running in $dir after $waited s (pid $pid)" >&2
+          exit 75
+        fi
+        sleep "$every"
+        waited=$((waited + every))
+        pid=$(lane_running)
+      done
+      echo "agy-run: nothing is running in $dir (waited $waited s)"
+      exit 0
+      ;;
+    abort)
+      [ -z "$pid" ] && { echo "agy-run: nothing is running in $dir"; exit 0; }
+      kill -TERM "$pid" 2>/dev/null
+      echo "agy-run: asked pid $pid to stop" >&2
+      tries=0
+      while [ "$tries" -lt 10 ]; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+        tries=$((tries + 1))
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null
+        echo "agy-run: pid $pid did not stop in 10 s; killed" >&2
+        sleep 1
+      fi
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "agy-run: still running in $dir after the abort (pid $pid)" >&2
+        exit 1
+      fi
+      rm -f "$lock"
+      echo "agy-run: nothing is running in $dir"
+      exit 0
+      ;;
+  esac
+fi
+
+# A run.
+[ -n "$model" ] || die_usage "a run needs --model <model>; never rely on agy's default model"
+[ -f "$dir/$brief" ] || { echo "agy-run: no brief at $dir/$brief" >&2; exit 1; }
+git -C "$dir" check-ignore -q "$brief" || { echo "agy-run: $brief is not gitignored in $dir; a brief is never committed" >&2; exit 1; }
+
+# Rule 1: never a second lane in a worktree where one is running.
+busy=$(lane_running)
+if [ -n "$busy" ] && [ "${AGY_ALLOW_BUSY:-0}" != 1 ]; then
+  echo "agy-run: a lane is already running in $dir (pid $busy)" >&2
+  echo "agy-run: not dispatching a second one. Wait for it (agy-run --wait --dir …) or stop it (agy-run --abort --dir …)." >&2
+  exit 75
+fi
+
+# The lock is taken with noclobber so two dispatches in the same second cannot both win.
+if ! ( set -C; printf '%s\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$model" "$agymode" > "$lock" ) 2>/dev/null; then
+  echo "agy-run: another dispatch took the lock in $dir at the same moment; not dispatching" >&2
+  exit 75
+fi
+
+before=$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo none)
+printf '%s\n' "$before" > "$lane/agy-run.before"
+out=$lane/agy-run.out
+err=$lane/agy-run.err
+: > "$out"
+: > "$err"
+
+prompt="Read the file $brief in the current directory and carry out its WORK ORDER exactly as written. Do not read, change or run anything outside the current directory. Do not read files under .git: this worktree's git metadata lives outside it and is off-limits; the brief states the branch and base commit. When you are done, reply with the list of files you changed."
+
+set -- --print "$prompt" --output-format json --print-timeout "$timeout" --mode "$agymode" --model "$model"
+[ -n "$effort" ] && set -- "$@" --effort "$effort"
+[ -n "$agent" ] && set -- "$@" --agent "$agent"
+[ "$sandbox" = 1 ] && set -- "$@" --sandbox
+
+child=''
+start=$(date +%s)
+
+finish_run() { # $1: exit status to report; writes agy-run.last, prints the summary, frees the lock
+  secs=$(( $(date +%s) - start ))
+  flat=$(tr -d ' \n\r\t' < "$out" 2>/dev/null)
+  tokens=$(printf '%s' "$flat" | sed -n 's/.*"total_tokens":\([0-9]*\).*/\1/p')
+  denied=$(printf '%s' "$flat" | sed -n 's/.*"denied_actions":\[\(.*\)\].*/\1/p' | grep -o '"action":"[^"]*"' | sed 's/"action":"//;s/"$//' | sort -u | tr '\n' ' ')
+  dcount=$(printf '%s' "$denied" | wc -w | tr -d ' ')
+  printf 'end=%s exit=%s secs=%s tokens=%s denied=%s model=%s mode=%s before=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$secs" "${tokens:-?}" "$dcount" "$model" "$agymode" "$before" >> "$lane/agy-run.last"
+  rm -f "$lock"
+}
+
+stop_run() { # $1: exit status
+  trap '' INT TERM HUP
+  if [ "$detach" = 1 ]; then
+    echo "agy-run: stopped; --detach was given, the lane runs on in $dir (pid ${child:-?}); follow it with --wait or --abort" >&2
+    exit "$1"
+  fi
+  if [ -n "$child" ]; then
+    kill -TERM "$child" 2>/dev/null
+    ( sleep 10; kill -KILL "$child" 2>/dev/null ) >/dev/null 2>&1 &
+    dog=$!
+    wait "$child" 2>/dev/null
+    kill "$dog" 2>/dev/null
+    echo "agy-run: stopped; the lane in $dir was stopped with it" >&2
+  fi
+  cat "$err" >&2
+  finish_run "$1"
+  exit "$1"
+}
+trap 'stop_run 130' INT
+trap 'stop_run 143' TERM
+trap 'stop_run 129' HUP
+
+# The lane is a background child so a signal reaches the traps at once. With --detach the child
+# ignores HUP, so it survives the end of the ssh session that started it.
+if [ "$detach" = 1 ]; then
+  ( trap '' HUP; cd "$dir" && exec "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
+else
+  ( cd "$dir" && exec "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
+fi
+child=$!
+printf '%s\n' "$child" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$model" "$agymode" > "$lock"
+wait "$child"
+rc=$?
+child=''
+
+cat "$err" >&2
+cat "$out"
+[ -s "$out" ] && [ "$(tail -c 1 "$out" | od -An -c | tr -d ' ')" != '\n' ] && echo
+
+flat=$(tr -d ' \n\r\t' < "$out")
+status=$rc
+case "$rc" in
+  0)
+    case "$flat" in
+      *'"response":""'* | *'"response":null'*) status=1; echo "agy-run: agy returned an EMPTY response; that is a failed run, never a clean result" >&2 ;;
+      *'"response":"'*) ;;
+      *) status=1; echo "agy-run: agy returned no JSON result" >&2 ;;
+    esac
+    ;;
+  3) status=4; echo "agy-run: agy reported a model or agent error (its exit 3); see AGY_ERROR above" >&2 ;;
+esac
+case "$flat" in
+  *'"denied_actions":[{'*)
+    names=$(printf '%s' "$flat" | sed -n 's/.*"denied_actions":\[\(.*\)\].*/\1/p' | grep -o '"action":"[^"]*"' | sed 's/"action":"//;s/"$//' | sort -u | tr '\n' ' ')
+    echo "agy-run: agy DENIED itself these actions (headless mode cannot ask): $names" >&2
+    echo "agy-run: an allow rule for them belongs in agy's settings on this host, scoped to the worktree root; that is an owner change" >&2
+    cid=$(printf '%s' "$flat" | sed -n 's/.*"conversation_id":"\([^"]*\)".*/\1/p')
+    agyhome=${AGY_HOME:-$HOME/.gemini/antigravity-cli}
+    if [ -n "$cid" ] && ls "$agyhome/conversations/$cid".db* >/dev/null 2>&1; then
+      targets=$(cat "$agyhome/conversations/$cid".db* 2>/dev/null | LC_ALL=C grep -ao 'denied permission for [a-z_]*([^)]*)' | sed 's/^denied permission for //' | sort -u)
+      if [ -n "$targets" ]; then
+        echo "agy-run: denied targets, from agy's record of conversation $cid:" >&2
+        printf '%s\n' "$targets" | sed 's/^/agy-run:   /' >&2
+      fi
+    fi
+    [ "$status" = 0 ] && [ "${AGY_DENIED_IS_FAILURE:-0}" = 1 ] && status=5
+    ;;
+esac
+finish_run "$status"
+echo "agy-run: ended after $(( $(date +%s) - start )) s with exit $status (model $model, mode $agymode, HEAD before: $before)" >&2
+exit "$status"

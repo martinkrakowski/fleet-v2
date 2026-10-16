@@ -38,12 +38,15 @@ describe('CLAUDE_CODE_TOOL', () => {
   });
 
   describe('models', () => {
-    it('declares no probe and falls back to the pinned, labelled model list', () => {
+    it('declares no probe and returns the pinned list marked as fallback, never a probe result', () => {
       expect(CLAUDE_CODE_TOOL.models.argv).toBeUndefined();
       expect(CLAUDE_CODE_TOOL.models.http).toBeUndefined();
-      // The list is pinned data (the tool cannot list models), not a parse
-      // result: `parse` returns the labelled fallback constant.
-      expect(CLAUDE_CODE_TOOL.models.parse('')).toBe(CLAUDE_CODE_FALLBACK_MODELS);
+      // The list is pinned data (the tool cannot list models), not a probe
+      // result: `parse` returns it behind the explicit `source: 'fallback'`
+      // marker, so no consumer can mistake it for what the tool reported.
+      const parsed = CLAUDE_CODE_TOOL.models.parse('');
+      expect(parsed).toEqual({ source: 'fallback', models: CLAUDE_CODE_FALLBACK_MODELS });
+      expect(parsed).not.toEqual(CLAUDE_CODE_FALLBACK_MODELS);
       expect(CLAUDE_CODE_FALLBACK_MODELS).toEqual([
         { id: 'claude-opus-4-5' },
         { id: 'claude-sonnet-4-5' },

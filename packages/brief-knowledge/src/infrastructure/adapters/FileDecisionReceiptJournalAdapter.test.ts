@@ -67,7 +67,7 @@ describe('FileDecisionReceiptJournalAdapter', () => {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   });
 
-  it('reserves below and exactly at budget and refuses above it', async () => {
+  it('reserves below budget and refuses at or above it', async () => {
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
       () => new Date('2026-01-15T10:00:00.000Z'),
@@ -85,17 +85,17 @@ describe('FileDecisionReceiptJournalAdapter', () => {
       monthlyBudgetUsd: 1,
       stateSha256: SHA_B,
     });
-    expect(at.ok).toBe(true);
+    expect(at).toEqual({ ok: false, reason: 'budget-exhausted' });
 
-    const over = await adapter.reserve({
-      assumedCostUsd: 0.25,
+    const justBelow = await adapter.reserve({
+      assumedCostUsd: 0.5,
       monthlyBudgetUsd: 1,
       stateSha256: SHA_C,
     });
-    expect(over).toEqual({ ok: false, reason: 'budget-exhausted' });
+    expect(justBelow.ok).toBe(true);
 
-    // Only the two accepted reservations were appended; spend is unchanged.
-    expect(await adapter.monthSpendUsd(new Date('2026-01-20T00:00:00.000Z'))).toBe(1);
+    // Only the two accepted reservations were appended.
+    expect(await adapter.monthSpendUsd(new Date('2026-01-20T00:00:00.000Z'))).toBe(0.75);
     const lines = await readJournalLines(tempDir, '2026-01');
     expect(lines).toHaveLength(2);
     expect(lines.every((line) => line.kind === 'reserved')).toBe(true);
@@ -122,12 +122,12 @@ describe('FileDecisionReceiptJournalAdapter', () => {
     });
     expect(await adapter.monthSpendUsd(new Date('2026-01-20T00:00:00.000Z'))).toBe(0.125);
 
-    // The settled cost freed budget: 0.125 + 0.875 = exactly 1 is allowed…
-    const at = await adapter.reserve({ assumedCostUsd: 0.875, monthlyBudgetUsd: 1, stateSha256: SHA_B });
-    expect(at.ok).toBe(true);
-    // …and anything more is refused.
-    const over = await adapter.reserve({ assumedCostUsd: 0.1, monthlyBudgetUsd: 1, stateSha256: SHA_B });
-    expect(over).toEqual({ ok: false, reason: 'budget-exhausted' });
+    // The settled cost freed budget: 0.125 + 0.75 stays below 1 and is allowed…
+    const below = await adapter.reserve({ assumedCostUsd: 0.75, monthlyBudgetUsd: 1, stateSha256: SHA_B });
+    expect(below.ok).toBe(true);
+    // …and reaching the cap exactly is refused.
+    const at = await adapter.reserve({ assumedCostUsd: 0.125, monthlyBudgetUsd: 1, stateSha256: SHA_B });
+    expect(at).toEqual({ ok: false, reason: 'budget-exhausted' });
   });
 
   it('keeps the assumed cost and marks estimated when the receipt has no cost', async () => {
@@ -265,7 +265,7 @@ describe('FileDecisionReceiptJournalAdapter', () => {
     const adapterB = new FileDecisionReceiptJournalAdapter(tempDir, clock);
     const query = {
       assumedCostUsd: 0.5,
-      monthlyBudgetUsd: 0.5,
+      monthlyBudgetUsd: 0.75,
       stateSha256: SHA_A,
     } as const;
 

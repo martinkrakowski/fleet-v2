@@ -15,6 +15,11 @@
  *   reviewer roles). Strength comes from the ordered table below.
  * - Tools whose sign-in could not be confirmed and model lists reported
  *   `unknown` are skipped, and the skip is recorded with a reason.
+ * - The policy gates the candidate pool before any ranking: forbidden
+ *   routes refuse matching candidates outright, and an allow-list (`allowedRoutes`
+ *   in the input), when the caller names one, admits only matching
+ *   candidates. A disallowed candidate is skipped with a reason and never
+ *   appears in the output, not even as a lower-ranked chain entry.
  * - The catalogue must pass `@fleet/installation`'s `validateSeatPolicy`.
  *   The recommender never returns an invalid catalogue: if no valid one can
  *   be built, the typed `no-valid-catalogue` result carries the reasons.
@@ -70,6 +75,17 @@ export type ModelsByTool = Readonly<Partial<Record<ToolId, ModelInfoList>>>;
 
 /** The policy shape the recommender respects and passes through. */
 export type RecommendPolicy = PolicySection;
+
+/**
+ * One allow-list rule of the recommender input: a built-in tool and a glob
+ * (`*`, `?`) over the model ids it may serve, matched like a forbidden
+ * route. A candidate is admitted only by a rule naming its tool whose
+ * pattern matches its model id.
+ */
+export interface AllowedRouteRule {
+  readonly tool: ToolId;
+  readonly modelPattern: string;
+}
 
 /** A catalogue the recommender could build and validate. */
 export interface SeatCatalogueResult {
@@ -272,6 +288,15 @@ export function recommendSeats(input: {
   tools: readonly DetectedTool[];
   models: ModelsByTool;
   policy: RecommendPolicy;
+  /**
+   * Optional allow-list over the candidate pool. When present, only
+   * candidates admitted by at least one rule are ranked at all — a
+   * candidate outside it is skipped with a reason and never appears in the
+   * output, not even as a lower-ranked entry or an extra reviewer seat. An
+   * empty list admits nothing; an omitted one leaves the pool to the
+   * policy's forbidden routes alone.
+   */
+  allowedRoutes?: readonly AllowedRouteRule[];
 }): SeatRecommendation {
   const skipped: string[] = [];
   const familySeenOrder = new Map<string, number>();
@@ -323,12 +348,35 @@ export function recommendSeats(input: {
     route,
     matcher: globToRegExp(route.modelPattern),
   }));
-  const allowed = candidates.filter(
+  const notForbidden = candidates.filter(
     (candidate) =>
       !forbidden.some(
         ({ route, matcher }) => route.tool === candidate.tool && matcher.test(candidate.modelId),
       ),
   );
+
+  // The allow-list, when the input names one, admits only matching
+  // candidates. The gate runs here, before any ranking or role selection:
+  // a disallowed candidate is skipped with a reason and can never re-enter
+  // the output as a lower-ranked entry, an extra reviewer seat or any other
+  // seat.
+  const allowList = input.allowedRoutes?.map((rule) => ({
+    tool: rule.tool,
+    matcher: globToRegExp(rule.modelPattern),
+  }));
+  const allowed: Candidate[] = [];
+  for (const candidate of notForbidden) {
+    if (
+      allowList !== undefined &&
+      !allowList.some(({ tool, matcher }) => tool === candidate.tool && matcher.test(candidate.modelId))
+    ) {
+      skipped.push(
+        `model ${candidate.modelId} on ${candidate.displayName} skipped: it is not on the policy allow-list`,
+      );
+      continue;
+    }
+    allowed.push(candidate);
+  }
 
   // Implementer candidates: tools that can run commands, plus edit-only
   // tools whose checks and commits the orchestrator runs. A read-only tool

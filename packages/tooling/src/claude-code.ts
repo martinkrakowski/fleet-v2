@@ -3,10 +3,10 @@ import type { ToolModel, ToolDescriptor } from './types.js';
 
 /**
  * Claude Code has no CLI model listing: fleet cannot ask the tool what it
- * serves. This pinned list is clearly labelled fallback data, not a parse
- * result and not a claim that a subscription always serves exactly these
- * models; the descriptor's `parse` falls back to it only because the tool
- * cannot list models at all.
+ * serves. This pinned list is fallback data: the descriptor's `parse`
+ * returns it marked `source: 'fallback'` — never as a bare list that could
+ * pass for a probe result, and never as a claim that a subscription always
+ * serves exactly these models.
  */
 export const CLAUDE_CODE_FALLBACK_MODELS: readonly ToolModel[] = [
   { id: 'claude-opus-4-5' },
@@ -28,7 +28,9 @@ export const CLAUDE_CODE_TOOL: ToolDescriptor = {
     interpret: interpretAccountSignIn,
   },
   models: {
-    parse: () => CLAUDE_CODE_FALLBACK_MODELS,
+    // No probe exists: the parse returns the pinned list marked as
+    // fallback, never a bare list that could pass for a probe result.
+    parse: () => ({ source: 'fallback', models: CLAUDE_CODE_FALLBACK_MODELS }),
   },
   capabilities: {
     canRunCommands: true,

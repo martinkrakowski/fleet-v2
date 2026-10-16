@@ -30,7 +30,16 @@ import {
 } from '@fleet/brief-knowledge';
 import { COORDINATION_KINDS } from '@fleet/operator-coordination';
 
-import { loadInstallation } from '@fleet/installation';
+import { loadInstallation, type LoadResult } from '@fleet/installation';
+import type {
+  DoctorLine,
+  DoctorProbes,
+} from '@fleet/onboarding';
+import {
+  createNodeDoctorProbes,
+  doctorExitCode,
+  runDoctor,
+} from '@fleet/onboarding';
 
 import {
   assessmentIdForAttempt,
@@ -812,6 +821,98 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
 };
 
 // ---------------------------------------------------------------------------
+// `doctor`: read-only installation checks with real probes
+// ---------------------------------------------------------------------------
+
+export interface DoctorCliOptions {
+  /**
+   * Pre-loaded installation; the existing loader composes one when omitted.
+   * A `missing` or `invalid` result is refused with exit 1, never checked.
+   */
+  readonly loadResult?: LoadResult;
+  /** Probe implementation; the node probes compose one when omitted. */
+  readonly probes?: DoctorProbes;
+}
+
+const DOCTOR_HELP = `Usage: fleet-v2 doctor [--probe-seats] [--json]
+
+Read-only checks over the loaded installation: hosts and roles, platform
+tools, configured tool versions, credential file modes (never contents), the
+bundled ocm-run hash and each configured seat.
+
+  --probe-seats  run each seat's one-step probe (a live model call). Seat
+                 probes run from the operator's machine — the host running
+                 fleet-v2 doctor — never on a remote host.
+  --json         print one JSON document per doctor line
+
+Exit codes: 0 all PASS, 1 any FAIL or UNKNOWN — and also a missing or invalid
+installation, which doctor refuses to check — 2 usage error. Without
+--probe-seats every seat is reported UNKNOWN, so doctor exits 1 whenever the
+installation defines seats.`;
+
+/** Parse doctor's own flags; `--json` here selects output shape, not a payload. */
+function parseDoctorFlags(tokens: readonly string[]): {
+  probeSeats: boolean;
+  json: boolean;
+} {
+  let probeSeats = false;
+  let json = false;
+  for (const token of tokens) {
+    if (token === '--probe-seats') {
+      probeSeats = true;
+      continue;
+    }
+    if (token === '--json') {
+      json = true;
+      continue;
+    }
+    throw new CliUsageError(`Unknown doctor option: ${token}\n${DOCTOR_HELP}`);
+  }
+  return { probeSeats, json };
+}
+
+function formatDoctorLine(doctorLine: DoctorLine): string {
+  return `${doctorLine.status} ${doctorLine.scope} ${doctorLine.subject} ${doctorLine.check} — ${doctorLine.detail}`;
+}
+
+/**
+ * Run the doctor engine over the installation and print one line per check.
+ * The exit code follows `doctorExitCode`: 0 only when every line passed. A
+ * missing or invalid installation is refused with exit 1, not a usage error.
+ */
+export async function doctorCommand(
+  argv: readonly string[],
+  io: CliIo,
+  options: DoctorCliOptions = {},
+): Promise<number> {
+  if (argv.includes('--help') || argv.includes('-h')) {
+    io.stdout(`${DOCTOR_HELP}\n`);
+    return 0;
+  }
+  const { probeSeats, json } = parseDoctorFlags(argv);
+  const loadResult = options.loadResult ?? loadInstallation();
+  if (loadResult.status === 'invalid') {
+    io.stderr(`installation invalid (${loadResult.file}):\n`);
+    for (const error of loadResult.errors) {
+      io.stderr(`${error}\n`);
+    }
+    io.stderr('doctor refuses to run checks against an invalid installation\n');
+    return 1;
+  }
+  if (loadResult.status === 'absent') {
+    io.stderr('installation missing: doctor has no installation to check\n');
+    return 1;
+  }
+  const probes = options.probes ?? createNodeDoctorProbes();
+  const lines: DoctorLine[] = [];
+  for await (const doctorLine of runDoctor(loadResult, probes, { probeSeats })) {
+    lines.push(doctorLine);
+    io.stdout(json ? `${JSON.stringify(doctorLine)}\n` : `${formatDoctorLine(doctorLine)}\n`);
+  }
+  return doctorExitCode(lines);
+}
+
+// ---------------------------------------------------------------------------
 // Help text
 // ---------------------------------------------------------------------------
 
@@ -827,8 +928,12 @@ Pass the full typed request as one JSON object with --json, or supply fields
 as --kebab-case flags (arrays as comma-separated values). The typed result
 prints to stdout as one JSON document.
 
+doctor prints one check per line (JSON documents with --json). Without
+--probe-seats every seat is UNKNOWN, so doctor exits 1 when seats exist.
+
 Commands:
   work-order register|inspect
+  doctor [--probe-seats] [--json]
   brief prepare
   capacity reserve
   attempt dispatch|reconcile|stop|collect|fix|accept
@@ -853,12 +958,19 @@ export async function runCli(
   argv: readonly string[],
   io: CliIo = processIo,
   runtime?: FleetCliRuntime,
+  doctorOptions?: DoctorCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
     if (restArgv.length === 0) {
       io.stderr(`${HELP_TEXT}\n`);
       return 2;
+    }
+    // The doctor reads the installation itself and refuses a missing or
+    // invalid one with exit 1; it never composes the state-backed runtime.
+    const group = restArgv[0];
+    if (group === 'doctor') {
+      return await doctorCommand(restArgv.slice(1), io, doctorOptions ?? {});
     }
     // An explicitly injected runtime stays authoritative; only a call without
     // one composes a fresh runtime bound to the resolved state directory.
@@ -879,7 +991,6 @@ export async function runCli(
         installation: loadResult.installation,
       });
     }
-    const group = restArgv[0];
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);
       return 0;

@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { VerificationExecutorAdapter } from '../VerificationExecutorAdapter.adapter.js';
+import { LocalExecutor } from '../LocalExecutor.adapter.js';
 import type {
   SpawnedVerificationOutcome,
   SpawnVerificationTransport,
@@ -370,8 +371,7 @@ describe('VerificationExecutorAdapter with a CommandExecutorPort', () => {
     expect(fake.calls[0].options?.timeoutMs).toBe(DEFAULT_TIMEOUT_MS);
   });
 
-  it('maps a failing exit code to fail and a signal or spawn error to unknown', async () => {
-    const failing = new VerificationExecutorAdapter({
+  it('maps a failing exit code to fail and a signal or spawn error to unknown', async () => {    const failing = new VerificationExecutorAdapter({
       executor: fakeExecutor({ exitCode: 2, stderr: 'boom\n' }),
       allowListedCommands: allowList,
     });
@@ -400,5 +400,47 @@ describe('VerificationExecutorAdapter with a CommandExecutorPort', () => {
     const result = await adapter.executeVerificationCheck(checkRequest());
     expect(result.result).toBe('unknown');
     expect(fake.calls).toHaveLength(0);
+  });
+
+  it('maps exit code 255 through an ssh executor to unknown, never fail', async () => {
+    const fake = fakeExecutor({ exitCode: 255, stderr: 'ssh: connection refused\n' });
+    const adapter = new VerificationExecutorAdapter({
+      executor: fake,
+      allowListedCommands: allowList,
+    });
+    const result = await adapter.executeVerificationCheck(checkRequest());
+    expect(result.result).toBe('unknown');
+    expect(result.exitCode).toBe(255);
+    expect(result.outputSummary).toContain('255');
+  });
+
+  it('maps a real timeout through the executor path to unknown', async () => {
+    const directory = temporaryDirectory();
+    const script = join(directory, 'verify-sleeps.sh');
+    writeFileSync(script, '#!/bin/sh\nsleep 30\n', { mode: 0o755 });
+    const adapter = new VerificationExecutorAdapter({
+      executor: new LocalExecutor(),
+      allowListedCommands: { ci: script },
+      timeoutMs: 400,
+    });
+    const result = await adapter.executeVerificationCheck(checkRequest());
+    expect(result.result).toBe('unknown');
+    expect(result.exitCode).toBeNull();
+    expect(result.outputSummary).toContain('timeout');
+  });
+
+  it('passes a real check through the executor path to pass', async () => {
+    const directory = temporaryDirectory();
+    const script = join(directory, 'verify-ok.sh');
+    writeFileSync(script, '#!/bin/sh\necho verified\n', { mode: 0o755 });
+    const adapter = new VerificationExecutorAdapter({
+      executor: new LocalExecutor(),
+      allowListedCommands: { ci: script },
+      timeoutMs: 10_000,
+    });
+    const result = await adapter.executeVerificationCheck(checkRequest());
+    expect(result.result).toBe('pass');
+    expect(result.exitCode).toBe(0);
+    expect(result.outputSummary).toContain('verified');
   });
 });

@@ -1,25 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-
-type ExecFileCallback = (
-  error: Error | null,
-  result?: { stdout: string; stderr: string } | string,
-) => void;
-
-const execFileMock = vi.fn();
-
-vi.mock('node:child_process', () => ({
-  execFile: (
-    file: string,
-    args: readonly string[],
-    optionsOrCallback?: unknown,
-    callback?: ExecFileCallback,
-  ) => {
-    const cb = typeof optionsOrCallback === 'function'
-      ? (optionsOrCallback as ExecFileCallback)
-      : callback;
-    return execFileMock(file, args, cb);
-  },
-}));
+import { describe, it, expect } from 'vitest';
 
 import { isSafeSshHost, WorkspaceAdapter } from '../WorkspaceAdapter.adapter.js';
 import { AttemptArtifactAdapter } from '../AttemptArtifactAdapter.adapter.js';
@@ -48,188 +27,52 @@ describe('isSafeSshHost', () => {
   });
 });
 
-describe('WorkspaceAdapter SSH host validation and invocation', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it('refuses to inspect a worktree when sshHost starts with -oProxyCommand=x and spawns no subprocess', async () => {
-    const adapter = new WorkspaceAdapter({ sshHost: '-oProxyCommand=x' });
-
+describe('WorkspaceAdapter and AttemptArtifactAdapter are executor-only', () => {
+  it('refuses to inspect a worktree without a configured executor', async () => {
     await expect(
-      adapter.inspectWorktree({
-        worktreePath: '/nonexistent/worktree/path/for/test',
+      new WorkspaceAdapter().inspectWorktree({
+        worktreePath: '/wt',
         baseCommit: 'commit000',
         expectedArtifactPaths: [],
       }),
-    ).rejects.toThrow(/unsafe SSH host/);
-
-    expect(execFileMock).not.toHaveBeenCalled();
+    ).rejects.toThrow(/requires a configured CommandExecutorPort executor/);
   });
 
-  it('inserts -- before the command when invoking ssh on a safe host', async () => {
-    execFileMock.mockImplementation(
-      (_file: string, _args: readonly string[], cb: ExecFileCallback | undefined) => {
-        if (cb) {
-          cb(null, { stdout: 'commit1234567\n', stderr: '' });
-        }
-      },
+  it('refuses to place a brief without a configured executor', async () => {
+    await expect(
+      new AttemptArtifactAdapter().placeFrozenBrief({
+        attemptId: 'att-1',
+        worktreePath: '/wt',
+        proseMarkdown: '# Brief',
+        manifestJson: '{}',
+      }),
+    ).rejects.toThrow(/requires a configured CommandExecutorPort executor/);
+  });
+
+  it('refuses to read a brief manifest without a configured executor', async () => {
+    await expect(new AttemptArtifactAdapter().readBriefManifest('/wt')).rejects.toThrow(
+      /requires a configured CommandExecutorPort executor/,
     );
+  });
 
-    const adapter = new WorkspaceAdapter({ sshHost: 'midnight' });
-
+  it('documents the transport change: git runs through the ssh executor even when the worktree path exists locally', async () => {
+    // The legacy adapters probed `existsSync(worktreePath)` and silently ran
+    // locally; the executor path never does. Once a worktree ssh host is
+    // configured the installation decides the transport, whatever the local
+    // filesystem shows.
+    const calls: Array<{ argv: readonly string[] }> = [];
+    const executor = {
+      run: async (argv: readonly string[]) => {
+        calls.push({ argv });
+        return { exitCode: 0, signal: null, stdout: 'commit1234567\n', stderr: '' };
+      },
+    };
+    const adapter = new WorkspaceAdapter({ executor });
     await adapter.inspectWorktree({
-      worktreePath: '/nonexistent/remote/worktree',
+      worktreePath: '/tmp', // exists locally, yet the executor is still used
       baseCommit: 'commit1234567',
       expectedArtifactPaths: [],
     });
-
-    expect(execFileMock).toHaveBeenCalled();
-    const calls = execFileMock.mock.calls;
-    for (const call of calls) {
-      const [cmd, args] = call as [string, readonly string[]];
-      expect(cmd).toBe('ssh');
-      expect(args[0]).toBe('midnight');
-      expect(args[1]).toBe('--');
-    }
-  });
-});
-
-describe('AttemptArtifactAdapter SSH host validation and invocation', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it('refuses placeFrozenBrief with typed refusal when sshHost is -oProxyCommand=x and spawns no subprocess', async () => {
-    const adapter = new AttemptArtifactAdapter({ sshHost: '-oProxyCommand=x' });
-
-    const result = await adapter.placeFrozenBrief({
-      attemptId: 'att-test-1',
-      worktreePath: '/nonexistent/worktree/path',
-      proseMarkdown: '# Test brief',
-      manifestJson: '{}',
-    });
-
-    expect(result.outcome).toBe('refused');
-    expect((result as { reason: string }).reason).toContain('unsafe SSH host');
-    expect(execFileMock).not.toHaveBeenCalled();
-  });
-
-  it('refuses collectCompletedAttemptArtifacts with typed refusal when sshHost is -oProxyCommand=x and spawns no subprocess', async () => {
-    const adapter = new AttemptArtifactAdapter({ sshHost: '-oProxyCommand=x' });
-
-    const result = await adapter.collectCompletedAttemptArtifacts({
-      attemptId: 'att-test-1',
-      worktreePath: '/nonexistent/worktree/path',
-      baseCommit: 'commit000',
-      expectedArtifactPaths: [],
-      completionReceipt: {
-        attemptId: 'att-test-1',
-        sessionId: 'sess-test-1',
-        endedAtIso: '2026-10-16T00:00:00.000Z',
-        authoritative: true,
-        exitStatus: 0,
-        stoppedByRequest: false,
-      },
-    });
-
-    expect(result.outcome).toBe('refused');
-    expect((result as { reason: string }).reason).toContain('unsafe SSH host');
-    expect(execFileMock).not.toHaveBeenCalled();
-  });
-
-  it('inserts -- before the command on safe host during placeFrozenBrief', async () => {
-    execFileMock.mockImplementation(
-      (_file: string, _args: readonly string[], cb: ExecFileCallback | undefined) => {
-        if (cb) {
-          cb(null, { stdout: '', stderr: '' });
-        }
-      },
-    );
-
-    const adapter = new AttemptArtifactAdapter({ sshHost: 'midnight' });
-
-    const result = await adapter.placeFrozenBrief({
-      attemptId: 'att-test-2',
-      worktreePath: '/nonexistent/remote/worktree',
-      proseMarkdown: '# Safe brief',
-      manifestJson: '{"safe":true}',
-    });
-
-    expect(result.outcome).toBe('placed');
-    expect(execFileMock).toHaveBeenCalled();
-    const calls = execFileMock.mock.calls;
-    for (const call of calls) {
-      const [cmd, args] = call as [string, readonly string[]];
-      expect(cmd).toBe('ssh');
-      expect(args[0]).toBe('midnight');
-      expect(args[1]).toBe('--');
-    }
-  });
-
-  it('refuses readBriefManifest when sshHost is unsafe and spawns no subprocess', async () => {
-    const adapter = new AttemptArtifactAdapter({ sshHost: '-oProxyCommand=x' });
-
-    await expect(
-      adapter.readBriefManifest('/nonexistent/remote/worktree'),
-    ).rejects.toThrow(/unsafe SSH host/);
-
-    expect(execFileMock).not.toHaveBeenCalled();
-  });
-
-  it('inserts -- before the command on safe host during readBriefManifest', async () => {
-    execFileMock.mockImplementation(
-      (_file: string, _args: readonly string[], cb: ExecFileCallback | undefined) => {
-        if (cb) {
-          cb(null, { stdout: '{"safe":true}', stderr: '' });
-        }
-      },
-    );
-
-    const adapter = new AttemptArtifactAdapter({ sshHost: 'midnight' });
-    const content = await adapter.readBriefManifest('/nonexistent/remote/worktree');
-
-    expect(content).toBe('{"safe":true}');
-    expect(execFileMock).toHaveBeenCalled();
-    const [cmd, args] = execFileMock.mock.calls[0] as [string, readonly string[]];
-    expect(cmd).toBe('ssh');
-    expect(args[0]).toBe('midnight');
-    expect(args[1]).toBe('--');
-  });
-});
-
-describe('WorkspaceAdapter.readWorktreeFile SSH host validation and invocation', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it('refuses readWorktreeFile when sshHost is unsafe and spawns no subprocess', async () => {
-    const adapter = new WorkspaceAdapter({ sshHost: '-oProxyCommand=x' });
-
-    await expect(
-      adapter.readWorktreeFile('/nonexistent/remote/worktree', '.lane/brief-manifest.json'),
-    ).rejects.toThrow(/unsafe SSH host/);
-
-    expect(execFileMock).not.toHaveBeenCalled();
-  });
-
-  it('inserts -- before the command on safe host during readWorktreeFile', async () => {
-    execFileMock.mockImplementation(
-      (_file: string, _args: readonly string[], cb: ExecFileCallback | undefined) => {
-        if (cb) {
-          cb(null, { stdout: 'file-contents', stderr: '' });
-        }
-      },
-    );
-
-    const adapter = new WorkspaceAdapter({ sshHost: 'midnight' });
-    const content = await adapter.readWorktreeFile('/nonexistent/remote/worktree', '.lane/brief-manifest.json');
-
-    expect(content).toBe('file-contents');
-    expect(execFileMock).toHaveBeenCalled();
-    const [cmd, args] = execFileMock.mock.calls[0] as [string, readonly string[]];
-    expect(cmd).toBe('ssh');
-    expect(args[0]).toBe('midnight');
-    expect(args[1]).toBe('--');
+    expect(calls[0].argv.slice(0, 3)).toEqual(['git', '-C', '/tmp']);
   });
 });

@@ -32,6 +32,9 @@ import type {
 
 const execFileAsync = promisify(execFile);
 
+/** Reviewed runner output budget: NDJSON runs must not truncate. */
+const RUNNER_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+
 /** Bundled runner script at the repository's `bin/ocm-run`. */
 function resolveBundledOcmRunPath(): string {
   // Works from both the compiled dist tree and vitest's src tree.
@@ -146,7 +149,7 @@ async function runViaExecFile(
       env: buildRunnerEnv(env),
       // A live `ocm-run --format json` run streams NDJSON on stdout; the
       // default 1 MiB node buffer truncates it and reports a runner failure.
-      maxBuffer: 64 * 1024 * 1024,
+      maxBuffer: RUNNER_MAX_BUFFER_BYTES,
     });
     return { exitCode: 0, stdout: String(stdout), stderr: String(stderr) };
   } catch (error) {
@@ -656,8 +659,16 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     if (injected !== undefined) return injected(command, args, env);
     const executor = this.options?.executor;
     if (executor !== undefined) {
+      // Exactly what the legacy path applied: the allow-listed host
+      // environment (from process.env) plus the OCM overrides — never the
+      // full process env and never only the two OCM variables — and the
+      // same 64 MiB output budget the legacy execFile path enforced.
+      const runEnv = buildRunnerEnv(env as Record<string, string> | undefined);
       return executor
-        .run([command, ...args], env === undefined ? undefined : { env })
+        .run([command, ...args], {
+          env: { ...runEnv } as Record<string, string>,
+          maxBufferBytes: RUNNER_MAX_BUFFER_BYTES,
+        })
         .then((result) => {
           if (result.exitCode === null) {
             throw new Error(result.error ?? 'Runner subprocess ended without an exit code');

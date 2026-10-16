@@ -44,7 +44,14 @@ export interface RoleExecutors {
 
 /** Build the executor one host spec selects: ssh alias → SshExecutor, else local. */
 export function executorForHost(spec?: ExecutorHostSpec): CommandExecutorPort {
-  if (spec !== undefined && spec.transport === 'ssh' && spec.sshAlias !== undefined) {
+  if (spec !== undefined && spec.transport === 'ssh') {
+    if (spec.sshAlias === undefined || spec.sshAlias.trim() === '') {
+      // Refuse loudly: a host that declares an ssh transport without an
+      // alias must never silently degrade to a local executor.
+      throw new Error(
+        `Host${spec.roles?.length ? ` (roles: ${spec.roles.join(', ')})` : ''} declares transport 'ssh' without an sshAlias; refusing to fall back to a local executor`,
+      );
+    }
     return new SshExecutor({ host: spec.sshAlias });
   }
   return new LocalExecutor();

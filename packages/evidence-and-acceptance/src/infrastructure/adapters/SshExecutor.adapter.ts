@@ -5,19 +5,18 @@
  *
  *   ssh -o BatchMode=yes <host> -- <argv quoted for the remote POSIX shell>
  *
+ * `input` is written to the ssh client's stdin (carrying it to the remote
+ * command's stdin) and stdin is then closed; `timeoutMs` kills the ssh
+ * client's whole process tree; `maxBufferBytes` caps the captured output.
  * An unsafe host is refused before any subprocess is spawned.
  */
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-
+import { runSpawnOutcome } from './spawn-run.js';
 import type {
   CommandExecutorPort,
   CommandRunOptions,
   CommandRunResult,
 } from '../../application/ports/out/CommandExecutorPort.out-port.js';
-
-const execFileAsync = promisify(execFile);
 
 export interface SshExecutorOptions {
   /** Safe ssh destination (`host` or `user@host`) owning the remote commands. */
@@ -71,43 +70,18 @@ export class SshExecutor implements CommandExecutorPort {
         error: 'SshExecutor refuses to run an empty argv',
       };
     }
-    try {
-      const { stdout, stderr } = await execFileAsync('ssh', sshArgvFor(host, argv), {
-        ...(options?.input !== undefined
-          ? { input: options.input, encoding: 'utf8' as const }
-          : { encoding: 'utf8' as const }),
-        ...(options?.env !== undefined ? { env: { ...options.env } } : {}),
-        ...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
-      });
-      return { exitCode: 0, signal: null, stdout: String(stdout), stderr: String(stderr) };
-    } catch (error) {
-      return sshFailureResult(error);
-    }
-  }
-}
-
-/** Map a completed-but-failed ssh call onto the port's result. */
-function sshFailureResult(error: unknown): CommandRunResult {
-  const failure = error as {
-    code?: number | string;
-    signal?: string | null;
-    stdout?: string;
-    stderr?: string;
-    message?: string;
-  };
-  if (typeof failure.code === 'number') {
+    const outcome = await runSpawnOutcome('ssh', sshArgvFor(host, argv), {
+      ...(options?.env !== undefined ? { env: options.env } : {}),
+      ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options?.input !== undefined ? { input: options.input } : {}),
+      ...(options?.maxBufferBytes !== undefined ? { maxBufferBytes: options.maxBufferBytes } : {}),
+    });
     return {
-      exitCode: failure.code,
-      signal: typeof failure.signal === 'string' ? failure.signal : null,
-      stdout: String(failure.stdout ?? ''),
-      stderr: String(failure.stderr ?? ''),
+      exitCode: outcome.exitCode,
+      signal: outcome.signal,
+      stdout: outcome.stdout,
+      stderr: outcome.stderr,
+      ...(outcome.error !== undefined ? { error: outcome.error } : {}),
     };
   }
-  return {
-    exitCode: null,
-    signal: typeof failure.signal === 'string' ? failure.signal : null,
-    stdout: String(failure.stdout ?? ''),
-    stderr: String(failure.stderr ?? ''),
-    error: failure.message ?? String(error),
-  };
 }

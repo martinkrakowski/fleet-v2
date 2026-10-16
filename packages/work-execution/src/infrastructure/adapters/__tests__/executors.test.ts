@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 
 import { LocalExecutor } from '../LocalExecutor.adapter.js';
 import { SshExecutor, posixQuote, sshArgvFor } from '../SshExecutor.adapter.js';
@@ -55,6 +56,33 @@ describe('LocalExecutor', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe('piped-bytes');
   });
+
+  it('kills a command that never exits when the timeout expires', async () => {
+    const startedAt = Date.now();
+    const result = await new LocalExecutor().run(['/bin/sleep', '30'], { timeoutMs: 400 });
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+    expect(result.exitCode).toBeNull();
+    expect(result.error).toContain('timeout');
+  });
+
+  it('succeeds with more than 1 MiB of stdout (runner-parity output budget)', async () => {
+    const result = await new LocalExecutor().run([
+      '/bin/sh',
+      '-c',
+      "head -c 1048577 /dev/zero | tr '\\0' 'x'",
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.length).toBe(1_048_577);
+  });
+
+  it('reports an error instead of truncating when stdout exceeds maxBufferBytes', async () => {
+    const result = await new LocalExecutor().run(
+      ['/bin/sh', '-c', "head -c 200000 /dev/zero | tr '\\0' 'x'"],
+      { maxBufferBytes: 1024 },
+    );
+    expect(result.error).toContain('maxBufferBytes');
+    expect(result.exitCode).toBeNull();
+  });
 });
 
 describe('SshExecutor argv construction', () => {
@@ -74,15 +102,86 @@ describe('SshExecutor argv construction', () => {
   });
 
   it('refuses an unsafe host without spawning any subprocess', async () => {
-    const execFileMock = vi.fn();
-    vi.doMock('node:child_process', () => ({ execFile: execFileMock }));
+    const spawnMock = vi.fn();
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
     try {
       const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
       const executor = new FreshSshExecutor({ host: '-oProxyCommand=x' });
       const result = await executor.run(['git', 'status']);
       expect(result.exitCode).toBeNull();
       expect(result.error).toContain('unsafe SSH host');
-      expect(execFileMock).not.toHaveBeenCalled();
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      vi.doUnmock('node:child_process');
+      vi.resetModules();
+    }
+  });
+
+  it('writes input to the ssh client stdin and closes it, and carries the env', async () => {
+    let written = '';
+    let ended = false;
+    const child = Object.assign(new EventEmitter(), {
+      pid: 42_424,
+      stdin: {
+        write: (chunk: string) => {
+          written += chunk;
+          return true;
+        },
+        end: () => {
+          ended = true;
+        },
+        on: () => child,
+      },
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      kill: vi.fn((signal?: NodeJS.Signals) => {
+        if (signal === 'SIGKILL') setImmediate(() => child.emit('close', null, 'SIGKILL'));
+      }),
+    });
+    const spawnMock = vi.fn((..._args: unknown[]) => child);
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+    try {
+      const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
+      const executor = new FreshSshExecutor({ host: 'midnight' });
+      const pending = executor.run(['cat'], { input: 'remote-stdin-bytes', env: { HOME: '/h' } });
+      setImmediate(() => {
+        child.emit('close', 0, null);
+      });
+      const result = await pending;
+      expect(result.exitCode).toBe(0);
+      expect(written).toBe('remote-stdin-bytes');
+      expect(ended).toBe(true);
+      expect(spawnMock.mock.calls[0][0]).toBe('ssh');
+      expect(
+        (spawnMock.mock.calls[0][2] as { env?: Record<string, string> } | undefined)?.env,
+      ).toEqual({ HOME: '/h' });
+    } finally {
+      vi.doUnmock('node:child_process');
+      vi.resetModules();
+    }
+  });
+
+  it('kills a hung remote command at the timeout instead of leaving stdin open', async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: 42_425,
+      exitCode: null,
+      signalCode: null,
+      stdin: { write: () => true, end: () => {}, on: () => child },
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      kill: vi.fn((signal?: NodeJS.Signals) => {
+        if (signal === 'SIGKILL') setImmediate(() => child.emit('close', null, 'SIGKILL'));
+      }),
+    });
+    const spawnMock = vi.fn((..._args: unknown[]) => child);
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+    try {
+      const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
+      const executor = new FreshSshExecutor({ host: 'midnight' });
+      const pending = executor.run(['sleep', '999'], { input: 'ignored', timeoutMs: 300 });
+      const result = await pending;
+      expect(result.exitCode).toBeNull();
+      expect(result.error).toContain('timeout');
     } finally {
       vi.doUnmock('node:child_process');
       vi.resetModules();
@@ -222,6 +321,44 @@ describe('AttemptArtifactAdapter with a fake executor', () => {
     expect(calls[0].options?.env?.OCM_REMOTE_PORT).toBe('4321');
   });
 
+  it('applies buildRunnerEnv on the executor path: allow-list plus OCM overrides, never secrets', async () => {
+    const previousToken = process.env.GH_TOKEN;
+    process.env.GH_TOKEN = 'gh-secret-token';
+    try {
+      const withPort = fakeExecutor(() => ({}));
+      const withPortAdapter = new ExecutionRunnerAdapter({
+        executor: withPort.executor,
+        remotePort: 4321,
+        ocmRunBin: '/bin/echo',
+      });
+      await withPortAdapter.startSession(sessionRequest);
+      const envWithPort = withPort.calls[0].options?.env;
+      // The OCM override travels alongside the allow-listed host variables.
+      expect(envWithPort?.OCM_REMOTE_PORT).toBe('4321');
+      expect(typeof envWithPort?.PATH).toBe('string');
+      expect(typeof envWithPort?.HOME).toBe('string');
+      // A planted credential is stripped.
+      expect(envWithPort?.GH_TOKEN).toBeUndefined();
+      // The runner output budget matches the reviewed 64 MiB.
+      expect(withPort.calls[0].options?.maxBufferBytes).toBe(64 * 1024 * 1024);
+
+      const withoutPort = fakeExecutor(() => ({}));
+      const withoutPortAdapter = new ExecutionRunnerAdapter({
+        executor: withoutPort.executor,
+        ocmRunBin: '/bin/echo',
+      });
+      await withoutPortAdapter.startSession(sessionRequest);
+      const envWithoutPort = withoutPort.calls[0].options?.env;
+      expect(envWithoutPort?.OCM_REMOTE_PORT).toBeUndefined();
+      expect(typeof envWithoutPort?.PATH).toBe('string');
+      expect(typeof envWithoutPort?.HOME).toBe('string');
+      expect(envWithoutPort?.GH_TOKEN).toBeUndefined();
+    } finally {
+      if (previousToken === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = previousToken;
+    }
+  });
+
   it('reports an executor spawn failure as an unknown outcome', async () => {
     const { executor } = fakeExecutor((_call, index) =>
       index === 0 ? { exitCode: null, error: 'spawn failed' } : {},
@@ -296,5 +433,14 @@ describe('resolveRoleExecutors', () => {
   it('selects a local executor for an undefined or local host spec', () => {
     expect(executorForHost(undefined)).toBeInstanceOf(LocalExecutor);
     expect(executorForHost({ transport: 'local' })).toBeInstanceOf(LocalExecutor);
+  });
+
+  it('refuses an ssh host spec without an sshAlias instead of silently going local', () => {
+    expect(() => executorForHost({ transport: 'ssh' })).toThrow(/sshAlias/);
+    expect(() =>
+      resolveRoleExecutors({
+        hosts: { broken: { transport: 'ssh', roles: ['lane-runner'] } },
+      }),
+    ).toThrow(/sshAlias/);
   });
 });

@@ -13,8 +13,14 @@ export interface CommandRunOptions {
   readonly input?: string;
   /** Complete subprocess environment when given; inherit otherwise. */
   readonly env?: Readonly<Record<string, string>>;
-  /** Wall-clock budget; an exceeded run is terminated and reported. */
+  /** Wall-clock budget; an exceeded run is terminated (with its process tree) and reported. */
   readonly timeoutMs?: number;
+  /**
+   * Cap on captured stdout+stderr in bytes. When the child exceeds it, the
+   * process tree is killed and the run is reported as an error, never
+   * truncated silently.
+   */
+  readonly maxBufferBytes?: number;
 }
 
 /** Completed outcome of one command run, as far as this port needs it. */

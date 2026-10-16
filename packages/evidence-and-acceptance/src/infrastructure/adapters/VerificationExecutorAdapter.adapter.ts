@@ -204,6 +204,16 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
           completedAtIso,
         );
       }
+      if (executed.exitCode === 255) {
+        // Through an ssh executor exit 255 means the transport itself
+        // failed before the check ran; the check's own outcome is unknown.
+        return receipt(
+          'unknown',
+          executed.exitCode,
+          'verification check exited 255; through an ssh executor this means the transport failed before the check completed',
+          completedAtIso,
+        );
+      }
       return receipt(executed.exitCode === 0 ? 'pass' : 'fail', executed.exitCode, summary, completedAtIso);
     }
 

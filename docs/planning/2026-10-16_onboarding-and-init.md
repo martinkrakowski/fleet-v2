@@ -1,6 +1,6 @@
 # Onboarding and `fleet-v2 init`: single or multi machine, tools, seats, shelf
 
-*Date: 2026-10-16 · Status: revision 2.2, after Fable and Grok (both "not ready" on revision 1; every blocker addressed below; re-check findings from both closed in 2.1 and 2.2) · Owner decisions: D1–D6*
+*Date: 2026-10-16 · Status: revision 2.4 (O14 amendment, D7), previously 2.2, after Fable and Grok (both "not ready" on revision 1; every blocker addressed below; re-check findings from both closed in 2.1 and 2.2) · Owner decisions: D1–D7*
 
 ## Goal
 
@@ -177,7 +177,7 @@ edit the same package. Root wiring for a package-only lane happens in a later wa
 | O7 | Git shelf provider (plumbing argv above) | brief-knowledge | O1 | F |
 | O6 | Recommender | tooling | O4, O5 | O |
 | O8 | Capability declarations with a loader-derived `source` (D4), `filesystemScope: "unknown"` for undeclared runners, removal of the CLI `requiredCapabilities` overrides, D5's local-runner environment, forge mode `none` (D6) in the forge and acceptance use cases, the forge-evidence port injected into acceptance in both roots for mode `github`; roots wiring for O7 | work-execution, evidence-and-acceptance, apps | O3, O7 | F |
-| O14 | Tool-neutral runner port; agy edit-only adapter | work-execution | O4, O8 | F |
+| O14 | Replaced by O14-0 … O14e2 in Amendment O14 below | — | — | — |
 | O9 | `fleet-v2 doctor` | apps | O3, O4, O5, O8 | O |
 | O10 | `fleet-v2 init` | apps | O6, O7, O8, O9 | F |
 | O11 | `fleet-v2 seats` | apps | O6, O9, O10 | O |
@@ -191,10 +191,146 @@ edit the same package. Root wiring for a package-only lane happens in a later wa
 - **Wave C:** O5 (evidence family function, installation policy module), O6 (tooling) once O5 lands, or in
   the same wave if O5 merges first.
 - **Wave D:** O8 (the wave's apps lane).
-- **Wave E:** O9 (apps), O14 (work-execution).
+- **Wave E:** O9 (apps; engine in `@fleet/onboarding` per U0), O14-0 (family function), S1.
 - **Wave F:** O10 (apps).
 - **Wave G:** O11 (apps), O12 (scripts, CI), O13 (docs). O11 and O12 do not share files; O12's script
   calls the CLI and does not edit it.
+- **O14 waves** (Amendment O14): S1 (scripts, `.github`) in Wave E; S2 (scripts) in Wave F; O14-0 in Wave E;
+  O14a (tooling) after O14-0, so never in O14-0's wave; O14b after O14-0; O14c1 after O14a and O14b; O14c2
+  after O14c1 and S1; O14d after O14c2 and S2; O14e1 (apps) in a new **Wave H**
+  after Wave G; O14e2 (`@fleet/onboarding`, apps) in **Wave I** after O14e1.
+
+## Amendment O14 (2026-10-16, revision 2.4): agy as a lane runner, `full` chosen at onboarding
+
+*Owner decision D7, 2026-10-16: "we should allow agy to run lanes in full capacity. This should be an option
+for new developers, when onboarding their project. Security recommendations and considerations should also
+be presented during the onboarding process." Design advised by Fable; revision 2.3 reviewed by Opus and Grok
+(both not ready); 2.4 answers every blocker.*
+
+### D7. agy runner modes
+
+A host whose `runner.kind` is `agy` declares `agyMode`:
+
+| Mode | agy argv (fixed in the descriptor) | Who runs checks and commits |
+|---|---|---|
+| `edit-only` (default) | `agy --print <prompt> --model <id> --output-format json --mode accept-edits` | the orchestrator (edit-only flow below) |
+| `full` | `agy --print <prompt> --model <id> --output-format json --mode auto --dangerously-skip-permissions` | the lane, like an opencode lane |
+
+No other flag is ever passed; there is no option to add one. Flag names are verified against `agy --help` in
+O14a and pinned by a descriptor test.
+
+**`full` requires a declared isolation floor (loader rule).** The loader refuses `agyMode: full` unless that
+host's capabilities are `declared` (O8 `source`) with `filesystemScope: scoped-worktree`,
+`networkEgressRestricted: true` and `processTreeTermination: true`. A developer whose machine cannot honestly
+declare this is offered `edit-only` and the container recipe in the runbook. This is still a declaration, not
+a detection (D4). On the owner's workshop the midnight host itself cannot make that declaration, so the rule
+also keeps `full` off it; the earlier rulebook ban becomes a mechanism.
+
+**Acknowledgement (loader rule).** The loader refuses `agyMode: full` unless the host carries
+`agyAcknowledgement: { textVersion, acceptedAt }` whose `textVersion` equals the security text shipped with
+this build. A newer text makes the record stale: the loader refuses and `doctor` FAILs until `init` or
+`/settings` re-confirms; re-confirming means the developer types `full` again and that same write stores a
+new `textVersion` and `acceptedAt`. A hand-written record cannot be told apart from a real one; that is stated in the
+security text. `doctor` reports every `full` host as UNKNOWN ("declared isolation, not verifiable"), the same
+treatment as `legacy-asserted` capabilities, so it is never silent.
+
+**Tool capabilities follow the mode.** The agy descriptor gains two capability sets keyed by mode
+(`edit-only`: `canRunCommands: false`; `full`: `canRunCommands: true`). At dispatch the selected host's mode
+decides. The recommender and seat checks treat an agy seat as edit-only unless every agy lane-runner host in
+the installation is `full`.
+
+### Security step in `init` and `/settings`
+
+Shown before the agy mode question, only when a runner has `kind: agy`; versioned (`textVersion`).
+
+1. **Recommendation:** use `full` only inside a container or VM with a scoped worktree mount and restricted
+   network egress. Otherwise use `edit-only`.
+2. **What `full` can do:** run any command as the runner's user, read anything that user can read, reach the
+   network where egress allows, and use credentials in its environment or home directory.
+3. **What fleet still enforces:** the runner environment allow-list (D5), the isolation floor above and
+   dispatch refusal (D4/O8), independent review by a different model family, verification, and acceptance
+   rules (CI evidence when forge mode is `github`; receipt-only when it is `none`, D6).
+4. **What fleet cannot enforce:** anything inside the runner user's reach; declarations are statements.
+5. **Confirmation:** the developer types `full` to choose it. A checkbox is never enough.
+
+### Environment
+
+agy's allow-list is `PATH`, `HOME` (agy's sign-in lives under it), `LANG`, `LC_ALL`, `TMPDIR` and `AGY_BIN`,
+set by the lane host. `SSH_AUTH_SOCK`, `GH_TOKEN`, `GITHUB_TOKEN`, every `GIT_*` and every `OPENROUTER*` /
+`*_API_KEY` variable stay dropped in both modes, tested per mode. `HOME` still exposes files under it to
+`full`; that is in the security text.
+
+### Edit-only flow (`CommitEditOnlyAttemptUseCase`, work-execution)
+
+After the runner ends with a receipt, on the worktree host's executor, in order; any failure stops the flow
+with no commit:
+
+1. **HEAD unchanged** since dispatch, else refuse.
+2. **Diff check** (`LaneDiffCheckPort`, TS; `scripts/lane-diff-check.sh` is the operator twin and the
+   reference): tracked and untracked changes, including anything under `.git/` (hooks, config); every path
+   must fall under the frozen brief's allowed path prefixes (the brief gains `allowedPathPrefixes`, required
+   for edit-only seats); protected paths (fixed list: `.git/`, `.github/`, `.lane/`, `installation/`,
+   lockfiles unless the brief allows them, plus policy additions); secret patterns on added lines.
+3. **Verification** through the allow-listed verification executor (never the orchestrator's environment).
+   Failure means no commit.
+4. **Commit** with plumbing argv (`write-tree`, `commit-tree`, then `update-ref <branch> <new> <head at
+   dispatch>`, a compare-and-swap so a moved branch is never replaced), hooks disabled, no signing, `GIT_*`
+   stripped, staging only the checked paths; trailers `Implemented-By: agy <model>` and `Fleet-Attempt: <attempt id>`.
+
+**Evidence:** `commitAuthority: 'lane' | 'orchestrator'` (unset when no commit); findings recorded as path and
+rule only, never the matched value; `.lane/agy-run.*` outputs archived only after the same secret refusal
+passes on them. **Outcome:** a refused flow marks the attempt `failed` with reason `edit-only-refused`. A
+secret or protected-path finding does not trigger the chain's `no-commit` fallback (it needs the owner); an
+empty diff or a verification failure does. Runner timeout or signal kill is a failed run (exit code null,
+#74), as is an empty response or exit 1 or 4.
+
+### Model families (prerequisite for any agy implementer seat)
+
+The family of a model id is its **vendor line**: lowercase, drop everything up to the last `/`, cut at the
+first `#`, `:` or `@`, then take the leading run of letters and hyphens before the first digit, trimming a
+trailing hyphen; an id with no digit keeps its whole name. So `gemini-3.1-pro-high`, `gemini-3.8-flash-high`
+and `google/gemini-3.8-pro:free` are all `gemini`; `nvidia/z-ai/glm-5.3-flash` is `glm`; `gpt-6-luna` is
+`gpt`; `laguna-s-2.1` is `laguna-s`; `space-bunny` is `space-bunny`. An empty result is invalid and fails
+closed. This is stricter than O5 (all versions of a vendor line are one family). The same function is used
+in all four places that compare families today: `packages/installation/src/policy.ts`,
+`packages/evidence-and-acceptance/src/domain/entities/ReviewReceipt.ts`, `packages/tooling/src/recommend.ts`
+and `packages/work-execution/src/application/use-cases/DispatchAttemptUseCase.use-case.ts`. Each copy is
+tested against one shared table of equal and distinct pairs, committed once and copied byte-for-byte; a test
+fails if the copies diverge.
+
+### Policy
+
+`forbiddenRoutes` already exists. `init` offers, as a recommendation the developer accepts or declines,
+the rules `{ tool: opencode, model: "*gemini*" }` and `{ tool: opencode, model: "openrouter/google/*" }`. The
+product default stays neutral (section 3).
+
+### Lanes
+
+| # | Lane | Edits | Depends on | Review |
+|---|---|---|---|---|
+| S1 | `bin/agy-run`, its shell test, the gate step and `scripts/agy-run-hash.txt`, rebased from the 2026-10-15 worktree | bin, tests, scripts, `.github` | — | F |
+| S2 | `scripts/lane-diff-check.sh` and its test | scripts, tests | — | O |
+| O14-0 | Vendor-line family function in all four places with the shared table | installation, evidence-and-acceptance, tooling, work-execution | O5 | F |
+| O14a | agy descriptor: two argv templates, mode-keyed capabilities, `needsAllowRules: true` | tooling | O4, O14-0 | F |
+| O14b | `runner.kind: 'opencode' \| 'agy'`, `agyMode`, `agyAcknowledgement`, the isolation-floor and acknowledgement loader rules | installation | O2, O14-0 | F |
+| O14c1 | Runner selector and `kind` on runner records; opencode behaviour unchanged | work-execution | O8, O14a, O14b | F |
+| O14c2 | agy adapter, both modes, on a fake `agy-run`; environment allow-list per mode | work-execution | O14c1, S1 | F |
+| O14d | `allowedPathPrefixes` on briefs, `LaneDiffCheckPort`, `CommitEditOnlyAttemptUseCase` | work-execution | O14c2, S2 | F |
+| O14e1 | Roots wiring for the selector, adapter and edit-only flow | apps | O14d, Wave G | F |
+| O14e2 | Security step and agy mode question in the onboarding engine and `init`; `doctor` lines for `full` | onboarding, apps | O14e1, O10 | F |
+
+O14-0 edits four packages; no other lane in its wave touches them (O14a waits for it). S1 and S2 never
+share a wave with O12, U5 or each other, since all of them edit `scripts`.
+
+### One-way doors (owner, 2026-10-16: "Proceed with your recommendations"; all six taken as proposed)
+
+1. The `full` isolation floor above (chosen over allowing `full` on undeclared hosts with a stronger
+   acknowledgement).
+2. Trailer format `Implemented-By` / `Fleet-Attempt` (lands in public history).
+3. Evidence fields `commitAuthority`, finding records, archived agy outputs.
+4. The `runner.kind` union and the `agyAcknowledgement` record shape (persisted in installation files).
+5. Typed confirmation of `full`.
+6. The stricter vendor-line family rule.
 
 ## Relationship to the cutover plan
 
@@ -224,6 +360,8 @@ edit the same package. Root wiring for a package-only lane happens in a later wa
   historical record and keeps its wording; it is not product documentation.
 
 ## Decisions taken in this revision (owner may change)
+
+- **Revision 2.4:** D7 and the six one-way doors at the end of Amendment O14 are owner decisions (2026-10-16).
 
 1. `init` detects a running `opencode serve` and prints how to start one; it does not start it.
 2. One shelf repository per installation, configurable; several projects can point at the same one.

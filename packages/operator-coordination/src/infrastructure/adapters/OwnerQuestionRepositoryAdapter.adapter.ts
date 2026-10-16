@@ -123,12 +123,21 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
 
   async list(query?: OwnerQuestionListQuery): Promise<readonly OwnerQuestionRecord[]> {
     const target = this.statePath;
+    // Compare parsed times: `since` may use any ISO form (offsets, no
+    // milliseconds), while stored askedAt values are canonical UTC strings.
+    let sinceMs: number | undefined;
+    if (query?.since !== undefined) {
+      sinceMs = Date.parse(query.since);
+      if (!Number.isFinite(sinceMs)) {
+        throw new Error('OwnerQuestion list since must be an ISO timestamp');
+      }
+    }
     const records = target === null ? this.inMemoryQuestions : await this.readRecordsFromDisk(target);
     return [...records.values()]
       .filter(
         (record) =>
           (query?.state === undefined || record.state === query.state) &&
-          (query?.since === undefined || record.askedAt >= query.since),
+          (sinceMs === undefined || Date.parse(record.askedAt) >= sinceMs),
       )
       .sort((left, right) =>
         left.askedAt === right.askedAt

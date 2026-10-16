@@ -221,4 +221,13 @@ describe('OwnerQuestionRepositoryAdapter', () => {
       { code: 'ENOENT' },
     );
   });
+
+  it('compares since as a time, accepting offset forms and refusing invalid input', async () => {
+    const adapter = new OwnerQuestionRepositoryAdapter();
+    await adapter.save(questionRecord({ questionId: 'q-early', askedAt: '2026-10-16T10:00:00.000Z' }), 0);
+    await adapter.save(questionRecord({ questionId: 'q-late', askedAt: '2026-10-16T12:00:00.000Z' }), 0);
+    const listed = await adapter.list({ since: '2026-10-16T13:00:00+02:00' });
+    expect(listed.map((record) => record.questionId)).toEqual(['q-late']);
+    await expect(adapter.list({ since: 'not-a-time' })).rejects.toThrow(/ISO timestamp/);
+  });
 });

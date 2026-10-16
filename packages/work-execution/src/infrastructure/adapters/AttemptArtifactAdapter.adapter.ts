@@ -25,6 +25,7 @@ import type {
   VerifyIgnoredPathsRequest,
   VerifyIgnoredPathsResult,
 } from '../../application/ports/out/AttemptArtifactPort.out-port.js';
+import { isSafeSshHost } from './WorkspaceAdapter.adapter.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -54,6 +55,10 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
   }
 
   async placeFrozenBrief(request: PlaceFrozenBriefRequest): Promise<PlaceFrozenBriefResult> {
+    if (this.options?.sshHost && !existsSync(request.worktreePath) && !isSafeSshHost(this.options.sshHost)) {
+      return { outcome: 'refused', reason: `Refusing to place brief: unsafe SSH host '${this.options.sshHost}'` };
+    }
+
     const briefTargets = ['.lane/brief.md', '.lane/brief-manifest.json'];
     const ignored = await this.verifyIgnoredPaths({
       worktreePath: request.worktreePath,
@@ -80,7 +85,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
         `mkdir -p ${posixQuote(laneDirectory)} && ` +
         `printf '%s' ${posixQuote(proseB64)} | base64 -d > ${posixQuote(prosePath)} && ` +
         `printf '%s' ${posixQuote(manifestB64)} | base64 -d > ${posixQuote(manifestPath)}`;
-      await execFileAsync('ssh', [sshHost, command]);
+      await execFileAsync('ssh', [sshHost, '--', command]);
     }
     return { outcome: 'placed', prosePath, manifestPath };
   }
@@ -88,6 +93,10 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
   async collectCompletedAttemptArtifacts(
     request: CollectCompletedAttemptArtifactsRequest,
   ): Promise<CollectCompletedAttemptArtifactsResult> {
+    if (this.options?.sshHost && !existsSync(request.worktreePath) && !isSafeSshHost(this.options.sshHost)) {
+      return { outcome: 'refused', reason: `Refusing to collect artifacts: unsafe SSH host '${this.options.sshHost}'` };
+    }
+
     if (request.completionReceipt.attemptId !== request.attemptId) {
       return { outcome: 'refused', reason: 'Completion receipt attemptId mismatch' };
     }
@@ -144,7 +153,13 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
 
   /** Remote host alias when the worktree lives off-host, otherwise null. */
   private useRemote(worktreePath: string): string | null {
-    return this.options?.sshHost && !existsSync(worktreePath) ? this.options.sshHost : null;
+    if (!this.options?.sshHost || existsSync(worktreePath)) {
+      return null;
+    }
+    if (!isSafeSshHost(this.options.sshHost)) {
+      throw new Error(`Refusing to execute on unsafe SSH host: ${this.options.sshHost}`);
+    }
+    return this.options.sshHost;
   }
 
   /** Read-only git in the worktree, locally or through the reviewed ssh host. */
@@ -155,7 +170,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
       return stdout;
     }
     const remoteCommand = ['git', '-C', worktreePath, ...args].map(posixQuote).join(' ');
-    const { stdout } = await execFileAsync('ssh', [sshHost, remoteCommand]);
+    const { stdout } = await execFileAsync('ssh', [sshHost, '--', remoteCommand]);
     return stdout;
   }
 
@@ -170,6 +185,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     }
     const { stdout } = await execFileAsync('ssh', [
       sshHost,
+      '--',
       `if test -e ${posixQuote(targetPath)}; then printf 1; else printf 0; fi`,
     ]);
     return stdout.trim() === '1';
@@ -195,7 +211,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
       .map(posixQuote)
       .join(' ');
     try {
-      await execFileAsync('ssh', [sshHost, remoteCommand]);
+      await execFileAsync('ssh', [sshHost, '--', remoteCommand]);
       return true;
     } catch (error) {
       const exitCode = (error as { code?: number | string }).code;

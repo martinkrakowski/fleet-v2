@@ -110,7 +110,7 @@ yarn sync:check
 
 Waves stays an independently usable product: projects publish versioned observations, and signed decisions bind a particular proposal and revision. Fleet consumes those contracts through an adapter and never merges Waves' source.
 
-This repository is the distribution of a process that first ran as shell scripts in a private workshop. Those scripts move behind typed ports one workflow at a time, after the port exists and the behaviour is proved against the current command. Until the operator declares a workflow moved, the script remains the live path for it.
+This repository is the distribution of a process that first ran as shell scripts in a private workshop. Those scripts move behind typed ports one workflow at a time, after the port exists and the behaviour is proved against the current command. Until the operator declares a workflow moved, the script remains the live path for it. The workshop copy of `ocm-run` is canonical and the bundled copy is mirrored by hash.
 
 ## Contributing
 

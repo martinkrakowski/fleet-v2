@@ -20,7 +20,7 @@
 #      --wait says "nothing runs" only after TWO status reads in a row, OCM_WAIT_CONFIRM seconds
 #      apart, both answered by the server and both listing nothing; a read that fails ends it with 1.
 #
-# Env: OCM_REMOTE_PORT (default 4096), OCM_HOST (ssh host/alias when tunnel is not already listening).
+# Env: OCM_REMOTE_PORT (default 4096), OCM_HOST (ssh alias, default m).
 #      The local port is always remote + 1; an OCM_PORT that differs is refused.
 #      OCM_ALLOW_BUSY=1; OCM_WAIT_INTERVAL (seconds between looks, default 15);
 #      OCM_WAIT_MAX (seconds before --wait gives up with 75, default 1500);
@@ -60,7 +60,7 @@ fi
 
 remote="${OCM_REMOTE_PORT:-4096}"
 port="${OCM_PORT:-$((remote + 1))}"
-host="${OCM_HOST:-}"
+host="${OCM_HOST:-m}"
 if [ "$port" != "$((remote + 1))" ]; then
   echo "ocm-run: OCM_PORT=$port does not match OCM_REMOTE_PORT=$remote (expected $((remote + 1))); unset OCM_PORT" >&2
   exit 2
@@ -147,10 +147,6 @@ if [ "$has_variant" = 1 ]; then
 fi
 
 if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
-  if [ -z "$host" ]; then
-    echo "ocm-run: server not listening on 127.0.0.1:$port and OCM_HOST is not set" >&2
-    exit 2
-  fi
   ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes \
     -L "127.0.0.1:$port:127.0.0.1:$remote" "$host" || {
     echo "ocm-run: could not open the tunnel to $host" >&2
@@ -159,7 +155,7 @@ if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
 fi
 
 probe=$(ocm_curl -s -m 5 -w '\n%{http_code}:%{content_type}' "$url/api/info") || {
-  echo "ocm-run: could not reach opencode server at $url (remote port $remote${host:+ on $host})" >&2
+  echo "ocm-run: could not reach opencode server at $url (remote port $remote on $host)" >&2
   exit 1
 }
 meta=$(printf '%s\n' "$probe" | tail -n 1)
@@ -173,14 +169,14 @@ case "$code:$ctype:$info_flat" in
     api=v2
     ;;
   200:application/json*:*)
-    echo "ocm-run: opencode server at $url (remote port $remote${host:+ on $host}) answered /api/info with non-object JSON" >&2
+    echo "ocm-run: opencode server at $url (remote port $remote on $host) answered /api/info with non-object JSON" >&2
     exit 1
     ;;
   200:* | 404:*)
     api=v1
     ;;
   *)
-    echo "ocm-run: opencode server at $url (remote port $remote${host:+ on $host}) answered HTTP $code on /api/info; is that opencode server running?" >&2
+    echo "ocm-run: opencode server at $url (remote port $remote on $host) answered HTTP $code on /api/info; is that opencode server running?" >&2
     exit 1
     ;;
 esac
@@ -194,13 +190,13 @@ if [ "$mode" = check ]; then
     v1_flat=$(printf '%s\n' "$v1_probe" | sed '$d' | tr -d ' \n\r\t')
     case "$v1_code:$v1_ctype:$v1_flat" in
       200:*text/html*:* )
-        echo "ocm-run: opencode server at $url (remote port $remote${host:+ on $host}) answered HTML 200 on /api/info and /session/status" >&2
+        echo "ocm-run: opencode server at $url (remote port $remote on $host) answered HTML 200 on /api/info and /session/status" >&2
         exit 1
         ;;
       200:*:'{'*'}')
         ;;
       *)
-        echo "ocm-run: opencode server at $url (remote port $remote${host:+ on $host}) did not answer v2 /api/info or v1 /session/status (HTTP ${v1_code:-000})" >&2
+        echo "ocm-run: opencode server at $url (remote port $remote on $host) did not answer v2 /api/info or v1 /session/status (HTTP ${v1_code:-000})" >&2
         exit 1
         ;;
     esac
@@ -209,7 +205,7 @@ if [ "$mode" = check ]; then
     echo "ocm-run: opencode is not on PATH" >&2
     exit 1
   }
-  echo "ocm-run: ok ($url${host:+ via $host}, remote port $remote)"
+  echo "ocm-run: ok ($url via $host, remote port $remote)"
   exit 0
 fi
 
@@ -399,6 +395,9 @@ trap 'ocm_stop 143' TERM
 trap 'ocm_stop 129' HUP
 
 if [ "$api" = v2 ]; then
+  case "$model:$variant" in
+    nvidia/*:low) variant=none ;;
+  esac
   skip=''
   fold=''
   for arg do
@@ -424,14 +423,14 @@ if [ "$api" = v2 ]; then
         if [ "$has_variant" = 1 ]; then
           fold=1
         fi
-        set -- "$@" "$arg"
+        set -- "$@" "-m"
         continue
         ;;
       --model=*)
         if [ "$has_variant" = 1 ]; then
-          set -- "$@" "$arg#$variant"
+          set -- "$@" "-m" "${arg#--model=}#$variant"
         else
-          set -- "$@" "$arg"
+          set -- "$@" "-m" "${arg#--model=}"
         fi
         continue
         ;;

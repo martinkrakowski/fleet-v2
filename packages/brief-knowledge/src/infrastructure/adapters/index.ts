@@ -2,6 +2,7 @@
 
 export * from "./AdvisedKnowledgeRetrievalAdapter.adapter.js";
 export * from "./AnswerFileRankingAdviceAdapter.adapter.js";
+export * from "./BudgetedRankingAdviceAdapter.adapter.js";
 export * from "./ClaimVerificationAdapter.adapter.js";
 export * from "./file-store.js";
 export * from "./FileDecisionReceiptJournalAdapter.adapter.js";
@@ -14,3 +15,4 @@ export * from "./KnowledgeEntryRepositoryAdapter.adapter.js";
 export * from "./KnowledgeRetrievalAdapter.adapter.js";
 export * from "./NotConfiguredReceiptJournal.adapter.js";
 export * from "./NullRankingAdviceAdapter.adapter.js";
+export * from "./ranking-advice-factory.js";

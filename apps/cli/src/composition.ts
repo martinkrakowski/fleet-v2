@@ -936,7 +936,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         consumptionId: consumptionId(request.actionId),
         grantId: request.authorizationGrantId,
         actionId: request.actionId,
-        actionKind: request.actionKind,
+        actionScope: forgeActionScope(request.actionKind),
         attemptId: attempt.id,
         expectedHeadSha: grant.expectedHeadSha,
       });

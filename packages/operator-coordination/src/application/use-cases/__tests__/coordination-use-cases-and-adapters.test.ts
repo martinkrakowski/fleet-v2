@@ -30,6 +30,7 @@ import type {
   RegisterProjectProfileRequest,
 } from '../../ports/in/index.js';
 import type { CoordinationRequestRepositoryPort } from '../../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import { CoordinationRequestRevisionConflictError } from '../../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import type {
   DecisionAnswer,
   DecisionAnswerQuery,
@@ -475,6 +476,101 @@ describe('RequestScopedDecisionUseCase', () => {
       'Not implemented: RequestScopedDecisionUseCase',
     );
   });
+
+  it('rejects a duplicate that races past the lookup instead of leaking the store error', async () => {
+    // The real revision-aware adapter does the refusing; only the lookup is
+    // stubbed, because a racer's read lands before the other writer commits.
+    const store = new CoordinationRequestRepositoryAdapter();
+    class RacingRequestRepository implements CoordinationRequestRepositoryPort {
+      async saveRequest(record: CoordinationRequestRecord): Promise<void> {
+        await store.saveRequest(record);
+      }
+      async findRequestById(): Promise<CoordinationRequestRecord | null> {
+        return null;
+      }
+      async findRequestByGrantId(): Promise<CoordinationRequestRecord | null> {
+        return null;
+      }
+      async listRequests(): Promise<readonly CoordinationRequestRecord[]> {
+        return [];
+      }
+    }
+
+    const winner = await new RequestScopedDecisionUseCase({ requestRepo: store }).execute(request);
+    expect(winner.outcome).toBe('requested');
+
+    // Same id at revision 0 with later timestamps: the store refuses it as a
+    // conflict, and the use case reports that as its own typed outcome.
+    const loser = await new RequestScopedDecisionUseCase({
+      requestRepo: new RacingRequestRepository(),
+    }).execute({ ...request, nowIso: LATER_ISO });
+
+    expect(loser.outcome).toBe('rejected');
+    expect(loser.outcome === 'rejected' && loser.reason).toContain(
+      'a coordination request with id request-1 lost a revision race',
+    );
+    // The winner's record survives untouched; the racer rewrote nothing.
+    const stored = await store.findRequestById('request-1');
+    expect(stored?.createdAtIso).toBe(NOW_ISO);
+    expect(stored?.revision).toBe(0);
+  });
+
+  it('rejects a duplicate whose store reports the conflict before any decider is asked', async () => {
+    // A store that refuses the racing save is never consulted again: the decider
+    // is not asked, because nothing of this proposal was ever recorded.
+    class ConflictingRequestRepository implements CoordinationRequestRepositoryPort {
+      async saveRequest(record: CoordinationRequestRecord): Promise<void> {
+        throw new CoordinationRequestRevisionConflictError(
+          record.id,
+          record.revision,
+          'CoordinationRequestRepositoryAdapter refuses conflicting revision 0 for request-1',
+        );
+      }
+      async findRequestById(): Promise<CoordinationRequestRecord | null> {
+        return null;
+      }
+      async findRequestByGrantId(): Promise<CoordinationRequestRecord | null> {
+        return null;
+      }
+      async listRequests(): Promise<readonly CoordinationRequestRecord[]> {
+        return [];
+      }
+    }
+
+    const transport = new StubDecisionTransport({
+      'request-1': { state: 'approved', decisionRevision: 'decision-3', grantId: 'grant-9' },
+    });
+    const result = await new RequestScopedDecisionUseCase({
+      requestRepo: new ConflictingRequestRepository(),
+      decisionTransport: transport,
+    }).execute(request);
+
+    expect(result.outcome).toBe('rejected');
+    expect(transport.reads).toEqual([]);
+  });
+
+  it('propagates a store failure that is not a revision conflict', async () => {
+    class FailingRequestRepository implements CoordinationRequestRepositoryPort {
+      async saveRequest(): Promise<void> {
+        throw new Error('CoordinationRequestRepositoryAdapter could not read the store');
+      }
+      async findRequestById(): Promise<CoordinationRequestRecord | null> {
+        return null;
+      }
+      async findRequestByGrantId(): Promise<CoordinationRequestRecord | null> {
+        return null;
+      }
+      async listRequests(): Promise<readonly CoordinationRequestRecord[]> {
+        return [];
+      }
+    }
+
+    await expect(
+      new RequestScopedDecisionUseCase({ requestRepo: new FailingRequestRepository() }).execute(
+        request,
+      ),
+    ).rejects.toThrow('CoordinationRequestRepositoryAdapter could not read the store');
+  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -631,7 +727,9 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
     consumptionId: 'consumption-1',
     grantId: 'grant-9',
     actionId: 'action-1',
-    actionKind: 'merge',
+    // The caller carries the scope over the port (work-execution's
+    // forgeActionScope for forge actions); the use case compares it exactly.
+    actionScope: 'forge:merge',
     attemptId: 'attempt-1',
     expectedHeadSha: 'abc123',
     nowIso: LATER_ISO,
@@ -719,6 +817,8 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
     const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
     const incomplete = await useCase.execute({ ...consumptionRequest, actionId: ' ' });
     expect(incomplete.outcome === 'refused' && incomplete.reason).toContain('actionId');
+    const missingScope = await useCase.execute({ ...consumptionRequest, actionScope: ' ' });
+    expect(missingScope.outcome === 'refused' && missingScope.reason).toContain('actionScope');
     await expect(useCase.execute(undefined)).rejects.toThrow(
       'Not implemented: RecordAuthorizationConsumptionUseCase',
     );

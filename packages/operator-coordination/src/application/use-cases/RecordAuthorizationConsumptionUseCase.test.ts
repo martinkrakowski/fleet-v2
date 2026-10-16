@@ -51,7 +51,7 @@ function makeApprovedGrantRecord(overrides?: Partial<CoordinationRequestRecord>)
 }
 
 describe('RecordAuthorizationConsumptionUseCase (H7)', () => {
-  it('refuses when recorded grant actionScope differs from forgeActionScope(actionKind)', async () => {
+  it('refuses when recorded grant actionScope differs from supplied actionScope', async () => {
     const repo = new InMemoryCoordinationRequestRepo();
     await repo.saveRequest(makeApprovedGrantRecord({
       grantId: 'grant-push',
@@ -65,7 +65,7 @@ describe('RecordAuthorizationConsumptionUseCase (H7)', () => {
       consumptionId: 'c-1',
       grantId: 'grant-push',
       actionId: 'action-merge',
-      actionKind: 'merge-pr',
+      actionScope: 'forge:merge-pr',
       attemptId: 'att-1',
       expectedHeadSha: 'head-H',
     });
@@ -90,7 +90,7 @@ describe('RecordAuthorizationConsumptionUseCase (H7)', () => {
       consumptionId: 'c-1',
       grantId: 'grant-push',
       actionId: 'action-push',
-      actionKind: 'push-and-open-pr',
+      actionScope: 'forge:push-and-open-pr',
       attemptId: 'att-1',
       expectedHeadSha: 'head-DIFFERENT',
     });
@@ -115,7 +115,7 @@ describe('RecordAuthorizationConsumptionUseCase (H7)', () => {
       consumptionId: 'c-1',
       grantId: 'grant-push',
       actionId: 'action-push',
-      actionKind: 'push-and-open-pr',
+      actionScope: 'forge:push-and-open-pr',
       attemptId: 'att-1',
       expectedHeadSha: 'head-H',
     });
@@ -124,6 +124,83 @@ describe('RecordAuthorizationConsumptionUseCase (H7)', () => {
     if (result.outcome === 'consumed') {
       expect(result.consumption.actionId).toBe('action-push');
       expect(result.consumption.grantId).toBe('grant-push');
+    }
+  });
+
+  it('successfully consumes non-forge scope host:restart when supplied scope matches exactly', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await repo.saveRequest(makeApprovedGrantRecord({
+      grantId: 'grant-restart',
+      actionScope: 'host:restart',
+      expectedHeadSha: 'head-H',
+    }));
+
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+
+    const result = await useCase.recordAuthorizationConsumption({
+      consumptionId: 'c-restart',
+      grantId: 'grant-restart',
+      actionId: 'action-restart',
+      actionScope: 'host:restart',
+      attemptId: 'att-1',
+      expectedHeadSha: 'head-H',
+    });
+
+    expect(result.outcome).toBe('consumed');
+    if (result.outcome === 'consumed') {
+      expect(result.consumption.actionId).toBe('action-restart');
+      expect(result.consumption.grantId).toBe('grant-restart');
+    }
+  });
+
+  it('successfully consumes non-forge scope relay:fleet-master when supplied scope matches exactly', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await repo.saveRequest(makeApprovedGrantRecord({
+      grantId: 'grant-relay',
+      actionScope: 'relay:fleet-master',
+      expectedHeadSha: 'head-H',
+    }));
+
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+
+    const result = await useCase.recordAuthorizationConsumption({
+      consumptionId: 'c-relay',
+      grantId: 'grant-relay',
+      actionId: 'action-relay',
+      actionScope: 'relay:fleet-master',
+      attemptId: 'att-1',
+      expectedHeadSha: 'head-H',
+    });
+
+    expect(result.outcome).toBe('consumed');
+    if (result.outcome === 'consumed') {
+      expect(result.consumption.actionId).toBe('action-relay');
+      expect(result.consumption.grantId).toBe('grant-relay');
+    }
+  });
+
+  it('refuses non-forge scope when supplied scope differs from recorded scope', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await repo.saveRequest(makeApprovedGrantRecord({
+      grantId: 'grant-restart',
+      actionScope: 'host:restart',
+      expectedHeadSha: 'head-H',
+    }));
+
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+
+    const result = await useCase.recordAuthorizationConsumption({
+      consumptionId: 'c-restart',
+      grantId: 'grant-restart',
+      actionId: 'action-restart',
+      actionScope: 'host:shutdown',
+      attemptId: 'att-1',
+      expectedHeadSha: 'head-H',
+    });
+
+    expect(result.outcome).toBe('refused');
+    if (result.outcome === 'refused') {
+      expect(result.reason).toContain('scope host:restart, not host:shutdown');
     }
   });
 });

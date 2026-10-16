@@ -451,7 +451,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
             consumptionId: consumptionId(request.actionId),
             grantId: request.authorizationGrantId,
             actionId: request.actionId,
-            actionKind: request.actionKind,
+            actionScope: forgeActionScope(request.actionKind),
             attemptId: request.attemptId ?? coordinates.attemptId,
             expectedHeadSha: request.expectedHeadSha ?? coordinates.expectedHeadSha,
           });

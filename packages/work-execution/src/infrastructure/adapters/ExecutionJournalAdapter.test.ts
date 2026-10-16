@@ -7,6 +7,10 @@ import type {
   ActionJournalEntryRecord,
   CapacityReservationRecord,
 } from '../../domain/execution-records.js';
+import type {
+  ReserveCapacityAtomicallyRequest,
+  ReserveCapacityAtomicallyResult,
+} from '../../application/ports/out/ExecutionJournalPort.out-port.js';
 import { ExecutionJournalAdapter } from './ExecutionJournalAdapter.adapter.js';
 
 describe('ExecutionJournalAdapter cross-process safe persistence', () => {
@@ -148,5 +152,164 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
 
     const contentAfter = await fs.readFile(filePath, 'utf8');
     expect(contentAfter).toBe(corruptContent);
+  });
+});
+
+describe('ExecutionJournalAdapter atomic capacity arbitration', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-journal-race-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  function makeClaim(
+    overrides: { id?: string; attemptId?: string; hostId?: string; maxSlots?: number } = {},
+  ): ReserveCapacityAtomicallyRequest {
+    const attemptId = overrides.attemptId ?? 'att-race';
+    return {
+      attemptId,
+      maxSlots: overrides.maxSlots ?? 2,
+      record: {
+        id: overrides.id ?? 'res-race',
+        attemptId,
+        hostId: overrides.hostId ?? 'host-1',
+        held: true,
+        reservedAtIso: '2026-10-15T11:00:00.000Z',
+        releasedAtIso: null,
+      },
+    };
+  }
+
+  /**
+   * Latch for reservation races, not sleeps: the reservations lock file is
+   * held by the test while both claims are issued, so both are in flight
+   * and already contending on the lock before either can read or write.
+   * Removing the gate opens the race; the lock itself arbitrates the rest.
+   */
+  async function raceUnderReservationsGate<T>(
+    issue: () => Promise<T>,
+  ): Promise<T> {
+    const lockPath = path.join(tempDir, 'reservations.json.lock');
+    await fs.writeFile(lockPath, 'race-gate-held-by-test', 'utf8');
+    const racing = issue();
+    await fs.rm(lockPath, { force: true });
+    return await racing;
+  }
+
+  async function readPersistedReservations(): Promise<CapacityReservationRecord[]> {
+    const raw = await fs.readFile(path.join(tempDir, 'reservations.json'), 'utf8');
+    return JSON.parse(raw) as CapacityReservationRecord[];
+  }
+
+  it('lets exactly one of two racing claims for the same attempt reserve', async () => {
+    const adapterA = new ExecutionJournalAdapter({ stateDir: tempDir });
+    const adapterB = new ExecutionJournalAdapter({ stateDir: tempDir });
+
+    const [fromA, fromB] = await raceUnderReservationsGate(() =>
+      Promise.all([
+        adapterA.reserveCapacityAtomically(makeClaim({ id: 'res-race-a' })),
+        adapterB.reserveCapacityAtomically(makeClaim({ id: 'res-race-b' })),
+      ]),
+    );
+
+    const results: ReserveCapacityAtomicallyResult[] = [fromA, fromB];
+    const reserved = results.filter((result) => result.outcome === 'reserved');
+    const refused = results.filter((result) => result.outcome === 'duplicate-attempt');
+    expect(reserved).toHaveLength(1);
+    expect(refused).toHaveLength(1);
+    if (reserved[0]?.outcome !== 'reserved' || refused[0]?.outcome !== 'duplicate-attempt') {
+      throw new Error('expected exactly one reserved and one duplicate-attempt result');
+    }
+
+    // The refusal names the claim that won, and exactly one reservation —
+    // the winner's, never both — is durable for the attempt.
+    const persisted = await readPersistedReservations();
+    expect(persisted.map((reservation) => reservation.attemptId)).toEqual(['att-race']);
+    expect(reserved[0].reservation.id).toBe(persisted[0]?.id);
+    expect(refused[0].existingReservationId).toBe(persisted[0]?.id);
+
+    // The losing claim wrote nothing: the file still holds one record only.
+    expect(await adapterB.listActiveReservations('host-1')).toHaveLength(1);
+  });
+
+  it('lets exactly one of two attempts racing for the last slot reserve', async () => {
+    const adapterA = new ExecutionJournalAdapter({ stateDir: tempDir });
+    const adapterB = new ExecutionJournalAdapter({ stateDir: tempDir });
+
+    // One slot of the host's budget of two is already held.
+    const seeded = await adapterA.reserveCapacityAtomically(
+      makeClaim({ id: 'res-held', attemptId: 'att-held' }),
+    );
+    expect(seeded.outcome).toBe('reserved');
+
+    const [fromA, fromB] = await raceUnderReservationsGate(() =>
+      Promise.all([
+        adapterA.reserveCapacityAtomically(
+          makeClaim({ id: 'res-last-a', attemptId: 'att-last-a' }),
+        ),
+        adapterB.reserveCapacityAtomically(
+          makeClaim({ id: 'res-last-b', attemptId: 'att-last-b' }),
+        ),
+      ]),
+    );
+
+    const results: ReserveCapacityAtomicallyResult[] = [fromA, fromB];
+    const reserved = results.filter((result) => result.outcome === 'reserved');
+    const refused = results.filter((result) => result.outcome === 'no-free-slot');
+    expect(reserved).toHaveLength(1);
+    expect(refused).toHaveLength(1);
+    if (reserved[0]?.outcome !== 'reserved' || refused[0]?.outcome !== 'no-free-slot') {
+      throw new Error('expected exactly one reserved and one no-free-slot result');
+    }
+    expect(refused[0].heldCount).toBe(2);
+    expect(refused[0].maxSlots).toBe(2);
+
+    // The budget is exactly full, the two held slots are distinct, and the
+    // losing attempt wrote nothing.
+    const persisted = await readPersistedReservations();
+    expect(persisted).toHaveLength(2);
+    expect(persisted.every((reservation) => reservation.held)).toBe(true);
+    expect(new Set(persisted.map((reservation) => reservation.slotIndex)).size).toBe(2);
+    expect(persisted.map((reservation) => reservation.attemptId).sort()).toEqual(
+      ['att-held', reserved[0].reservation.attemptId].sort(),
+    );
+  });
+
+  it('refuses sequentially to supersede a held reservation for the same attempt and preserves the file', async () => {
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    const first = await adapter.reserveCapacityAtomically(makeClaim({ id: 'res-first' }));
+    expect(first.outcome).toBe('reserved');
+
+    await expect(
+      adapter.saveCapacityReservation({
+        id: 'res-second',
+        attemptId: 'att-race',
+        hostId: 'host-1',
+        slotIndex: 1,
+        held: true,
+        reservedAtIso: '2026-10-15T11:01:00.000Z',
+        releasedAtIso: null,
+      }),
+    ).rejects.toThrow(
+      'ExecutionJournalAdapter refuses to supersede held reservation res-first of attempt att-race',
+    );
+
+    // A second claim through the atomic path is refused too — never superseded.
+    const duplicate = await adapter.reserveCapacityAtomically(
+      makeClaim({ id: 'res-second' }),
+    );
+    expect(duplicate).toEqual({
+      outcome: 'duplicate-attempt',
+      attemptId: 'att-race',
+      existingReservationId: 'res-first',
+    });
+
+    const persisted = await readPersistedReservations();
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]?.id).toBe('res-first');
   });
 });

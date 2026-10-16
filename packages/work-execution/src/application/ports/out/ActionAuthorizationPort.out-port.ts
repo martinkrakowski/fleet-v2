@@ -25,8 +25,17 @@ export interface ConsumeActionAuthorizationRequest {
   readonly authorizationGrantId: string;
   readonly actionId: string;
   readonly actionKind: 'push-and-open-pr' | 'merge-pr';
-  readonly expectedHeadSha: string;
-  readonly attemptId: string;
+  /**
+   * Head the grant was scoped to at resolve time. Optional because the
+   * resolving runtime retains the coordinates and scopes the consumption
+   * when the work-side request carries only grant and action identities.
+   */
+  readonly expectedHeadSha?: string;
+  /**
+   * Attempt the grant was bound to at resolve time. Optional for the same
+   * reason: the recorded coordinates scope the consumption.
+   */
+  readonly attemptId?: string;
 }
 
 export type ConsumeActionAuthorizationResult =

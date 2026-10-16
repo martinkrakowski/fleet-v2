@@ -31,6 +31,48 @@ export interface RunDoctorOptions {
 
 const PLATFORM_TOOLS = ['sh', 'nc', 'curl'] as const;
 
+/** Longest detail a probe may contribute to a doctor line. */
+const MAX_DETAIL_CHARS = 200;
+
+const REDACTED = '[redacted]';
+
+/**
+ * Secret shapes a probe output must never carry into a doctor line. Order
+ * matters: the vendor-prefixed and header shapes are named explicitly, then
+ * the generic token-like shape catches everything else of standing length.
+ * The generic shape does not eat the expected-vs-actual `sha256 <hex>` pair
+ * the runner-binary check reports, so it refuses a match directly behind
+ * either label.
+ */
+const SECRET_SHAPES: readonly (readonly [RegExp, string])[] = [
+  [/\bsk-[A-Za-z0-9_-]{8,}\b/g, REDACTED],
+  [/gh[pousr]_[A-Za-z0-9_]{8,}\b/g, REDACTED],
+  [/\bBearer\s+\S+/gi, REDACTED],
+  [/(?<!sha256 )(?<!expected )\b[A-Za-z0-9_-]{24,}\b/g, REDACTED],
+];
+
+/** Replace every secret-shaped substring with `[redacted]`. */
+export function redactSecretShapes(text: string): string {
+  let redacted = text;
+  for (const [pattern, replacement] of SECRET_SHAPES) {
+    redacted = redacted.replace(new RegExp(pattern.source, pattern.flags), replacement);
+  }
+  return redacted;
+}
+
+/**
+ * Bound a probe-produced detail before it reaches a doctor line: one line
+ * (newlines and tabs folded to single spaces), every secret-shaped string
+ * replaced by `[redacted]`, and at most 200 characters.
+ */
+export function boundDoctorDetail(detail: string): string {
+  let bounded = detail.replace(/\s*\r?\n\s*/g, ' ').replace(/[\t ]+/g, ' ').trim();
+  bounded = redactSecretShapes(bounded);
+  return bounded.length > MAX_DETAIL_CHARS
+    ? bounded.slice(0, MAX_DETAIL_CHARS)
+    : bounded;
+}
+
 /** Format a stat mode as the conventional octal literal, e.g. `0644`. */
 function formatMode(mode: number): string {
   return `0${(mode & 0o777).toString(8).padStart(3, '0')}`;
@@ -56,7 +98,9 @@ function line(
   status: DoctorStatus,
   detail: string,
 ): DoctorLine {
-  return { scope, subject, check, status, detail };
+  // Every detail of every probe implementation passes this boundary: one
+  // line, bounded length, no secret-shaped text.
+  return { scope, subject, check, status, detail: boundDoctorDetail(detail) };
 }
 
 /** The host string probes address: the ssh alias for ssh hosts, `local` otherwise. */

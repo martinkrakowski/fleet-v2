@@ -361,7 +361,16 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   },
   attempt: {
     dispatch: async (p, rt) => {
-      for (const field of ['model', 'agent', 'variant', 'modelAssignment']) {
+      for (const field of [
+        'model',
+        'agent',
+        'variant',
+        'modelAssignment',
+        'runnerPort',
+        'remotePort',
+        'runnerHost',
+        'host',
+      ]) {
         if (p[field] !== undefined) {
           throw new CliUsageError(
             `'${field}' is forbidden and must not be specified; the seat is determined by the frozen brief manifest`,
@@ -390,7 +399,8 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         }
         const reason = str(p, 'overrideReason');
         const setBy = str(p, 'overrideSetBy') || process.env.USER || 'operator';
-        const expiresAtIso = optStr(p, 'overrideExpiresAt') ?? optStr(p, 'overrideExpiresAtIso');
+        const expiresAtIso =
+          optStr(p, 'overrideExpiresAt') ?? optStr(p, 'overrideExpiresAtIso') ?? '';
         const agent = optStr(p, 'overrideAgent');
         seatOverride = {
           model,
@@ -398,7 +408,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
           ...(agent ? { agent } : {}),
           reason,
           setBy,
-          ...(expiresAtIso ? { expiresAtIso } : {}),
+          expiresAtIso,
         };
       } else if (seatOverride && !seatOverride.reason && optStr(p, 'overrideReason')) {
         seatOverride = { ...seatOverride, reason: str(p, 'overrideReason') };

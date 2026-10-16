@@ -65,9 +65,6 @@ export interface ExecutionRunnerAdapterOptions {
   readonly remotePort?: number;
   /** SSH host passed as OCM_HOST to the runner subprocess when configured. */
   readonly remoteHost?: string;
-  readonly agent?: string;
-  readonly model?: string;
-  readonly variant?: string;
   /** Optional resolver for cross-process lookup of an attempt's worktree path when not cached in memory. */
   readonly resolveWorktreePath?: (attemptId: string) => Promise<string | null> | string | null;
   /** Optional resolver for attempt record (used to verify recorded runner port/host). */
@@ -257,9 +254,9 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     return {
       remotePort: port,
       host: this.configuredRemoteHost(),
-      agent: this.options?.agent ?? null,
-      model: this.options?.model ?? null,
-      variant: this.options?.variant ?? null,
+      agent: null,
+      model: null,
+      variant: null,
     };
   }
 
@@ -280,22 +277,11 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       return { outcome: 'refused', reason: `Unsafe OCM_HOST configured: ${remoteHost}` };
     }
 
-    // Determine seat: takes model, agent, variant from request seatOverride or model/assignment;
-    // adapter options no longer override seats.
+    // Determine seat: takes model, agent, variant ONLY from the request built by the use case.
     const seatOverride = request.seatOverride;
-    let model: string | undefined;
-    let agent: string | undefined;
-    let variant: string | undefined;
-
-    if (seatOverride) {
-      model = seatOverride.model;
-      agent = seatOverride.agent ?? request.agent ?? request.modelAssignment?.agent ?? this.options?.agent;
-      variant = seatOverride.variant ?? request.variant ?? request.modelAssignment?.variant ?? this.options?.variant;
-    } else {
-      model = request.model ?? request.modelAssignment?.model ?? this.options?.model;
-      agent = request.agent ?? request.modelAssignment?.agent ?? this.options?.agent;
-      variant = request.variant ?? request.modelAssignment?.variant ?? this.options?.variant;
-    }
+    const model = seatOverride?.model ?? request.model ?? request.modelAssignment?.model;
+    const agent = seatOverride?.agent ?? request.agent ?? request.modelAssignment?.agent;
+    const variant = seatOverride?.variant ?? request.variant ?? request.modelAssignment?.variant;
 
     // Refuse to start (outcome refused, no spawn) when no model is known
     if (!model || model.trim() === '') {

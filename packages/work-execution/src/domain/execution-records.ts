@@ -66,7 +66,7 @@ export interface AttemptSeatOverrideRecord {
   readonly variant?: string;
   readonly reason: string;
   readonly setBy: string;
-  readonly expiresAtIso?: string;
+  readonly expiresAtIso: string;
 }
 
 /**

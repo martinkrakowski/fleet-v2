@@ -10,6 +10,7 @@ import {
   underlyingModelFamily,
   type ActionJournalEntryRecord,
   type AttemptRecord,
+  type AttemptSeatOverrideRecord,
   type CapacityReservationRecord,
   type CommandCompletionReceipt,
   type WorkOrderRecord,
@@ -213,6 +214,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           agent: 'override-agent',
           reason: 'Test override',
           setBy: 'test',
+          expiresAtIso: '2026-10-15T23:59:59.000Z',
         },
       });
 
@@ -223,7 +225,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
       expect(args[args.indexOf('--agent') + 1]).toBe('override-agent');
     });
 
-    it('does not let options.model override request model', async () => {
+    it('adapter constructed without seat options plus a manifest without a variant produces no --variant flag', async () => {
       const invocations: Array<{ args: readonly string[] }> = [];
       const runner: SubprocessRunner = async (_cmd, args) => {
         invocations.push({ args });
@@ -232,7 +234,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
 
       const adapter = new ExecutionRunnerAdapter({
         runSubprocess: runner,
-        model: 'env-model-should-not-override',
+        remotePort: 4096,
       });
 
       const result = await adapter.startSession({
@@ -243,16 +245,18 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         stepLimit: 100,
         timeLimitSeconds: 3600,
         requiredCapabilities: adapter.describeCapabilities(),
-        modelAssignment: {
-          model: 'nvidia/z-ai/glm-5.3',
-          variant: 'low',
-          fallbackModel: 'openai/gpt-4o',
-        },
+        model: 'nvidia/z-ai/glm-5.3',
+        agent: 'lane-glm',
+        // variant omitted
       });
 
       expect(result.outcome).toBe('started');
       const args = invocations[0].args;
+      expect(args).toContain('-m');
       expect(args[args.indexOf('-m') + 1]).toBe('nvidia/z-ai/glm-5.3');
+      expect(args).toContain('--agent');
+      expect(args[args.indexOf('--agent') + 1]).toBe('lane-glm');
+      expect(args).not.toContain('--variant');
     });
   });
 
@@ -914,6 +918,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           JSON.stringify({
             modelAssignment: {
               model: 'nvidia/z-ai/glm-5.3',
+              agent: 'lane-agent',
               variant: 'default',
               fallbackModel: 'openai/gpt-4o',
             },
@@ -1001,6 +1006,69 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
 
       expect(result.outcome).toBe('refused');
       expect((result as { reason: string }).reason).toContain('explicit reason');
+    });
+
+    it('refuses an override without expiresAtIso (required field)', async () => {
+      const { useCase } = setupDispatchWithOverride();
+
+      const result = await useCase.dispatchAttempt({
+        attemptId: 'att-1',
+        workOrderId: 'wo-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        briefDigest: 'digest-1',
+        baseCommit: 'commit-base-123',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: {
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        },
+        seatOverride: {
+          model: 'anthropic/claude-3-5-sonnet',
+          reason: 'Valid reason',
+          setBy: 'operator',
+        } as unknown as AttemptSeatOverrideRecord,
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('expiresAtIso');
+    });
+
+    it('refuses an override with empty expiresAtIso', async () => {
+      const { useCase } = setupDispatchWithOverride();
+
+      const result = await useCase.dispatchAttempt({
+        attemptId: 'att-1',
+        workOrderId: 'wo-1',
+        worktreePath: '/worktrees/lane-1',
+        briefPackagePath: '.lane/brief.md',
+        briefDigest: 'digest-1',
+        baseCommit: 'commit-base-123',
+        stepLimit: 100,
+        timeLimitSeconds: 3600,
+        requiredCapabilities: {
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          authoritativeCompletion: true,
+          artifactPersistence: true,
+        },
+        seatOverride: {
+          model: 'anthropic/claude-3-5-sonnet',
+          reason: 'Valid reason',
+          setBy: 'operator',
+          expiresAtIso: '',
+        },
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('expiresAtIso');
     });
 
     it('refuses an expired override', async () => {

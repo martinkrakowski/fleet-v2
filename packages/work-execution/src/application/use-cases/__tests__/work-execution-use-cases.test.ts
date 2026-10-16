@@ -962,6 +962,7 @@ function makeWorkspace(
         JSON.stringify({
           modelAssignment: {
             model: 'nvidia/z-ai/glm-5.3',
+            agent: 'lane-agent',
             variant: 'default',
           },
           independentReviewer: 'reviewer-model',
@@ -1245,7 +1246,7 @@ describe('DispatchAttemptUseCase', () => {
     expect(result.attempt.state).toBe('running');
   });
 
-  it('refuses dispatch when request carries model, agent, variant, or modelAssignment', async () => {
+  it('refuses dispatch when request carries model, agent, variant, modelAssignment, runnerPort, remotePort, runnerHost, or host', async () => {
     const setup = makeDispatchSetup();
 
     const withModel = await setup.useCase.dispatchAttempt(
@@ -1271,6 +1272,16 @@ describe('DispatchAttemptUseCase', () => {
       outcome: 'refused',
       reason: "'modelAssignment' must not be specified; the seat is determined by the frozen brief manifest",
     });
+
+    for (const field of ['runnerPort', 'remotePort', 'runnerHost', 'host'] as const) {
+      const result = await setup.useCase.dispatchAttempt(
+        validDispatchRequest({ [field]: 'forbidden-val' }) as unknown as DispatchAttemptRequest,
+      );
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: `'${field}' must not be specified; the seat is determined by the frozen brief manifest`,
+      });
+    }
   });
 
   it('refuses dispatch when no runner port can be described', async () => {

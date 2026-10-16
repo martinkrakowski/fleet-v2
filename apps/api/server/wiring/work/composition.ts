@@ -186,9 +186,6 @@ export function createConfiguredWorkComposition(
 
   const {
     worktreeSshHost,
-    runnerAgent,
-    runnerModel,
-    runnerVariant,
     runnerRemotePort,
     ocmRunBin,
     runnerRemoteHost,
@@ -204,9 +201,6 @@ export function createConfiguredWorkComposition(
   // arriving in a later process addresses the same directory as its dispatch.
   const runner = new ExecutionRunnerAdapter({
     ocmRunBin,
-    agent: runnerAgent,
-    model: runnerModel,
-    variant: runnerVariant,
     remotePort: runnerRemotePort,
     remoteHost: runnerRemoteHost,
     resolveWorktreePath: async (attemptId) =>

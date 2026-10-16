@@ -72,7 +72,16 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     }
 
     const rawReq = request as unknown as Record<string, unknown>;
-    for (const field of ['model', 'agent', 'variant', 'modelAssignment']) {
+    for (const field of [
+      'model',
+      'agent',
+      'variant',
+      'modelAssignment',
+      'runnerPort',
+      'remotePort',
+      'runnerHost',
+      'host',
+    ]) {
       if (rawReq[field] !== undefined) {
         return {
           outcome: 'refused',
@@ -235,15 +244,16 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       if (!request.seatOverride.setBy || request.seatOverride.setBy.trim() === '') {
         return { outcome: 'refused', reason: 'Seat override requires an explicit setBy operator' };
       }
-      if (request.seatOverride.expiresAtIso) {
-        const expiresMs = Date.parse(request.seatOverride.expiresAtIso);
-        const nowMs = Date.parse(nowIso);
-        if (Number.isNaN(expiresMs) || expiresMs <= nowMs) {
-          return {
-            outcome: 'refused',
-            reason: `Seat override expired at ${request.seatOverride.expiresAtIso}`,
-          };
-        }
+      if (!request.seatOverride.expiresAtIso || request.seatOverride.expiresAtIso.trim() === '') {
+        return { outcome: 'refused', reason: 'Seat override requires an explicit expiresAtIso timestamp' };
+      }
+      const expiresMs = Date.parse(request.seatOverride.expiresAtIso);
+      const nowMs = Date.parse(nowIso);
+      if (Number.isNaN(expiresMs) || expiresMs <= nowMs) {
+        return {
+          outcome: 'refused',
+          reason: `Seat override expired at ${request.seatOverride.expiresAtIso}`,
+        };
       }
       const candidateReviewers = [
         existingAttempt?.reviewerSeat,
@@ -294,16 +304,16 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         recordedAtIso: nowIso,
         status: 'intent-recorded',
         sessionId: null,
-        detail: `Seat override recorded: ${request.seatOverride.model} (by ${request.seatOverride.setBy}, reason: ${request.seatOverride.reason}${request.seatOverride.expiresAtIso ? `, expires: ${request.seatOverride.expiresAtIso}` : ''})`,
+        detail: `Seat override recorded: ${request.seatOverride.model} (by ${request.seatOverride.setBy}, reason: ${request.seatOverride.reason}, expires: ${request.seatOverride.expiresAtIso})`,
       });
     }
 
     const initialRunner: AttemptRunnerRecord = {
       remotePort: runnerPort,
       host: runnerHost,
-      agent: effectiveAgent ?? runnerInfo.agent ?? null,
+      agent: effectiveAgent ?? null,
       model: effectiveModel,
-      variant: effectiveVariant ?? runnerInfo.variant ?? null,
+      variant: effectiveVariant ?? null,
     };
 
     const dispatchingAttempt: AttemptRecord = existingAttempt

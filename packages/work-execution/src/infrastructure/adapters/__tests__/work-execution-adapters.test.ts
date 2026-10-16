@@ -819,12 +819,15 @@ describe('ExecutionRunnerAdapter', () => {
     const adapter = new ExecutionRunnerAdapter({
       ocmRunBin: '/usr/local/bin/ocm-run',
       remotePort: 7777,
-      agent: 'opencode',
-      model: 'glm-5',
-      variant: 'fast',
       runSubprocess: runner,
     });
-    const result = await adapter.startSession(makeStartRequest());
+    const result = await adapter.startSession(
+      makeStartRequest({
+        agent: 'opencode',
+        model: 'glm-5',
+        variant: 'fast',
+      }),
+    );
     expect(result).toEqual({
       outcome: 'started',
       sessionId: 'ses_lower',

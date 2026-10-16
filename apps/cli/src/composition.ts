@@ -416,9 +416,6 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // A blank env value is treated as absent rather than as "".
   const {
     worktreeSshHost,
-    runnerAgent,
-    runnerModel,
-    runnerVariant,
     runnerRemotePort,
     ocmRunBin,
     runnerRemoteHost,
@@ -578,9 +575,6 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // same directory the dispatch used.
   const runner = new ExecutionRunnerAdapter({
     ocmRunBin,
-    agent: runnerAgent,
-    model: runnerModel,
-    variant: runnerVariant,
     remotePort: runnerRemotePort,
     remoteHost: runnerRemoteHost,
     runSubprocess: options?.runSubprocess,

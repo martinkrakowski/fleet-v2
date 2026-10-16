@@ -1,0 +1,380 @@
+/**
+ * The doctor engine (plan section 6): read-only checks over a loaded
+ * installation, reported as an ordered stream of `DoctorLine`s. The engine
+ * performs no side effect itself — every observation enters through the
+ * injected `DoctorProbes` — and a probe that throws becomes an `UNKNOWN`
+ * line, never a crash. Details carry paths, modes, versions and reasons
+ * only; never file contents, keys or tokens.
+ */
+
+import type {
+  FleetInstallationModel,
+  HostModel,
+  LoadResult,
+  SeatModel,
+} from '@fleet/installation';
+import type { ToolId } from '@fleet/tooling';
+
+import type { DoctorLine, DoctorStatus } from './types.js';
+import type { DoctorProbes } from './probes.js';
+
+/** A load result doctor can check: absent or loaded, never invalid. */
+export type DoctorableInstallation = Exclude<LoadResult, { status: 'invalid' }>;
+
+export interface RunDoctorOptions {
+  /**
+   * Probe each seat with the one-step seat probe. `false` reports one
+   * `UNKNOWN` line per seat and calls `seatProbe` zero times.
+   */
+  readonly probeSeats: boolean;
+}
+
+const PLATFORM_TOOLS = ['sh', 'nc', 'curl'] as const;
+
+/** Format a stat mode as the conventional octal literal, e.g. `0644`. */
+function formatMode(mode: number): string {
+  return `0${(mode & 0o777).toString(8).padStart(3, '0')}`;
+}
+
+/**
+ * Run one probe; a throw (or rejection) becomes `undefined` and the caller
+ * reports `UNKNOWN` with the given reason. A probe result is never allowed
+ * to crash the sweep.
+ */
+async function safely<T>(probe: () => Promise<T>): Promise<T | undefined> {
+  try {
+    return await probe();
+  } catch {
+    return undefined;
+  }
+}
+
+function line(
+  scope: DoctorLine['scope'],
+  subject: string,
+  check: string,
+  status: DoctorStatus,
+  detail: string,
+): DoctorLine {
+  return { scope, subject, check, status, detail };
+}
+
+/** The host string probes address: the ssh alias for ssh hosts, `local` otherwise. */
+function probeHostOf(name: string, host: HostModel): string {
+  return host.transport === 'ssh' ? (host.sshAlias ?? name) : 'local';
+}
+
+/** Installation-level lines: schema version and any accepted-and-ignored v1 fields. */
+async function installationLines(
+  result: DoctorableInstallation,
+): Promise<DoctorLine[]> {
+  const lines: DoctorLine[] = [];
+  const mapped =
+    result.installation.schemaVersion === 1
+      ? `schema version 1, mapped onto v2`
+      : `schema version 2`;
+  lines.push(
+    line('installation', 'schema', 'schema-version', 'PASS', mapped),
+  );
+  for (const warning of result.warnings) {
+    // The loader's warnings name accepted-and-ignored v1 fields (D1); they
+    // are never failures because nothing consumes those fields today.
+    lines.push(
+      line('installation', 'shelf', 'v1-ignored-fields', 'PASS', warning),
+    );
+  }
+  return lines;
+}
+
+/** Per-host and role lines: reachability, platform tools, worktree root, runner capabilities. */
+async function hostLines(
+  model: FleetInstallationModel,
+  probes: DoctorProbes,
+): Promise<DoctorLine[]> {
+  const lines: DoctorLine[] = [];
+  for (const [name, host] of Object.entries(model.hosts)) {
+    const probeHost = probeHostOf(name, host);
+    const roles = host.roles.join(', ');
+
+    const reachable = await safely(() => probes.hostReachable(probeHost));
+    lines.push(
+      line(
+        'host',
+        name,
+        'reachable',
+        reachable === undefined ? 'UNKNOWN' : reachable ? 'PASS' : 'FAIL',
+        reachable === undefined
+          ? `reachability probe failed (${probeHost})`
+          : reachable
+            ? `reachable via ${probeHost} (roles: ${roles})`
+            : `not reachable via ${probeHost}`,
+      ),
+    );
+
+    const toolNames: string[] = [...PLATFORM_TOOLS];
+    if (host.transport === 'ssh') {
+      toolNames.push('ssh');
+    }
+    for (const toolName of toolNames) {
+      const available = await safely(() =>
+        probes.commandAvailable(probeHost, toolName),
+      );
+      lines.push(
+        line(
+          'host',
+          name,
+          `command-${toolName}`,
+          available === undefined ? 'UNKNOWN' : available ? 'PASS' : 'FAIL',
+          available === undefined
+            ? `availability probe for ${toolName} failed`
+            : available
+              ? `${toolName} available`
+              : `${toolName} not available`,
+        ),
+      );
+    }
+
+    if (host.worktreeRoot !== undefined) {
+      const writable = await safely(() =>
+        probes.worktreeRootWritable(probeHost),
+      );
+      lines.push(
+        line(
+          'host',
+          name,
+          'worktree-root-writable',
+          writable === undefined ? 'UNKNOWN' : writable ? 'PASS' : 'FAIL',
+          writable === undefined
+            ? `writability probe for ${host.worktreeRoot} failed`
+            : writable
+              ? `${host.worktreeRoot} writable`
+              : `${host.worktreeRoot} not writable`,
+        ),
+      );
+    }
+
+    if (host.runner !== undefined) {
+      const capabilities = host.runner.capabilities;
+      const status: DoctorStatus =
+        capabilities.source === 'declared' ? 'PASS' : 'UNKNOWN';
+      lines.push(
+        line(
+          'host',
+          name,
+          'runner-capabilities',
+          status,
+          `capability source ${capabilities.source}, filesystemScope ${capabilities.filesystemScope}`,
+        ),
+      );
+    }
+  }
+  return lines;
+}
+
+/** Per configured tool: its version, or UNKNOWN when absent or unparsable. */
+async function toolLines(
+  model: FleetInstallationModel,
+  probes: DoctorProbes,
+): Promise<DoctorLine[]> {
+  const lines: DoctorLine[] = [];
+  for (const toolId of model.tools ?? []) {
+    const version = await safely(() =>
+      probes.toolVersion('local', toolId as ToolId),
+    );
+    lines.push(
+      line(
+        'tool',
+        toolId,
+        'version',
+        version === undefined ? 'UNKNOWN' : 'PASS',
+        version === undefined
+          ? 'version absent or unparsable'
+          : `version ${version}`,
+      ),
+    );
+  }
+  return lines;
+}
+
+/** Credential files: mode only, never contents. Group/world-readable or missing is FAIL. */
+async function credentialLines(
+  model: FleetInstallationModel,
+  probes: DoctorProbes,
+): Promise<DoctorLine[]> {
+  const lines: DoctorLine[] = [];
+  const credentialPaths: Array<{ host: string; path: string }> = [];
+  for (const [name, host] of Object.entries(model.hosts)) {
+    const authFile = host.runner?.authFile;
+    if (authFile !== undefined) {
+      credentialPaths.push({ host: probeHostOf(name, host), path: authFile });
+    }
+  }
+  const decisions = model.decisions;
+  if (decisions !== undefined && decisions.provider === 'jev') {
+    credentialPaths.push({ host: 'local', path: decisions.keyFile });
+  }
+  for (const credential of credentialPaths) {
+    let mode: number | undefined;
+    let probeFailed = false;
+    try {
+      mode = await probes.fileMode(credential.host, credential.path);
+    } catch {
+      probeFailed = true;
+    }
+    if (probeFailed) {
+      lines.push(
+        line(
+          'credential',
+          credential.path,
+          'file-mode',
+          'UNKNOWN',
+          `${credential.path}: mode probe failed`,
+        ),
+      );
+      continue;
+    }
+    if (mode === undefined) {
+      lines.push(
+        line(
+          'credential',
+          credential.path,
+          'file-mode',
+          'FAIL',
+          `${credential.path}: missing`,
+        ),
+      );
+      continue;
+    }
+    const groupOrWorldReadable = (mode & 0o077) !== 0;
+    lines.push(
+      line(
+        'credential',
+        credential.path,
+        'file-mode',
+        groupOrWorldReadable ? 'FAIL' : 'PASS',
+        groupOrWorldReadable
+          ? `${credential.path}: mode ${formatMode(mode)} is group- or world-readable`
+          : `${credential.path}: mode ${formatMode(mode)}`,
+      ),
+    );
+  }
+  return lines;
+}
+
+/** The bundled runner binary: resolved path and sha256 against the expected hash. */
+async function runnerBinaryLines(probes: DoctorProbes): Promise<DoctorLine[]> {
+  const binary = await safely(() => probes.ocmRunBinary());
+  if (binary === undefined) {
+    return [
+      line(
+        'runner-binary',
+        'ocm-run',
+        'hash',
+        'UNKNOWN',
+        'bundled ocm-run unresolved or unreadable',
+      ),
+    ];
+  }
+  const expected = await safely(() => probes.expectedOcmRunHash());
+  if (expected === undefined) {
+    return [
+      line(
+        'runner-binary',
+        'ocm-run',
+        'hash',
+        'UNKNOWN',
+        `expected hash unavailable (${binary.path})`,
+      ),
+    ];
+  }
+  const matches = binary.sha256 === expected;
+  return [
+    line(
+      'runner-binary',
+      'ocm-run',
+      'hash',
+      matches ? 'PASS' : 'FAIL',
+      matches
+        ? `${binary.path} sha256 ${binary.sha256}`
+        : `${binary.path} sha256 ${binary.sha256} does not match expected ${expected}`,
+    ),
+  ];
+}
+
+/** Seat lines: probed, or explicitly not probed. */
+async function seatLines(
+  model: FleetInstallationModel,
+  probes: DoctorProbes,
+  options: RunDoctorOptions,
+): Promise<DoctorLine[]> {
+  const lines: DoctorLine[] = [];
+  for (const seat of model.seats ?? []) {
+    if (!options.probeSeats) {
+      lines.push(
+        line('seat', seat.id, 'probe', 'UNKNOWN', 'not probed (--probe-seats)'),
+      );
+      continue;
+    }
+    const outcome = await safely(() => probes.seatProbe(seat as SeatModel));
+    if (outcome === undefined) {
+      lines.push(
+        line('seat', seat.id, 'probe', 'UNKNOWN', 'seat probe failed'),
+      );
+      continue;
+    }
+    lines.push(
+      line(
+        'seat',
+        seat.id,
+        'probe',
+        outcome.outcome === 'pass'
+          ? 'PASS'
+          : outcome.outcome === 'fail'
+            ? 'FAIL'
+            : 'UNKNOWN',
+        outcome.reason,
+      ),
+    );
+  }
+  return lines;
+}
+
+/**
+ * Run every doctor check over a loaded installation, in the order:
+ * installation, hosts and their roles, configured tools, credential files,
+ * the bundled runner binary, then seats. Each yielded line is one check;
+ * the generator awaits probes sequentially so output order is stable.
+ */
+export async function* runDoctor(
+  result: DoctorableInstallation,
+  probes: DoctorProbes,
+  options: RunDoctorOptions,
+): AsyncGenerator<DoctorLine> {
+  for (const doctorLine of await installationLines(result)) {
+    yield doctorLine;
+  }
+  for (const doctorLine of await hostLines(result.model, probes)) {
+    yield doctorLine;
+  }
+  for (const doctorLine of await toolLines(result.model, probes)) {
+    yield doctorLine;
+  }
+  for (const doctorLine of await credentialLines(result.model, probes)) {
+    yield doctorLine;
+  }
+  for (const doctorLine of await runnerBinaryLines(probes)) {
+    yield doctorLine;
+  }
+  for (const doctorLine of await seatLines(result.model, probes, options)) {
+    yield doctorLine;
+  }
+}
+
+/**
+ * The doctor exit code: `0` when every line passed, `1` when any line
+ * failed or is unknown (the `AGENTS.md` contract; a usage error is `2` and
+ * belongs to the CLI, not the engine).
+ */
+export function doctorExitCode(lines: readonly DoctorLine[]): 0 | 1 {
+  return lines.every((doctorLine) => doctorLine.status === 'PASS') ? 0 : 1;
+}

@@ -256,7 +256,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
     },
   };
   const evidence = createConfiguredEvidenceUseCases(
-    { stateDir },
+    { stateDir, installation },
     {
       ownerDecision: ownerDecisionDelegate,
       attemptOwnerDecision: attemptOwnerDecisionDelegate,

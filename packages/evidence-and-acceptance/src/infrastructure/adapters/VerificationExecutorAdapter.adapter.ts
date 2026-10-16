@@ -15,6 +15,7 @@ import type {
   ExecuteVerificationCheckResult,
   VerificationExecutorPort,
 } from '../../application/ports/out/VerificationExecutorPort.out-port.js';
+import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 
 /** Allow-listed check: an executable plus optional fixed arguments. */
 export interface AllowListedVerificationCommand {
@@ -62,6 +63,12 @@ export interface VerificationExecutorOptions {
    * starts with `-` or contains whitespace is rejected without spawning.
    */
   readonly sshHost?: string;
+  /**
+   * Executor owning the verification host's commands (local or ssh). When
+   * set it is authoritative and the allow-listed command travels as one argv
+   * array through it, never through a shell.
+   */
+  readonly executor?: CommandExecutorPort;
   /** Wall-clock budget for one check; a check that exceeds it is `unknown`. */
   readonly timeoutMs?: number;
   /**
@@ -166,6 +173,40 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
       );
     }
 
+    const timeoutMs = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+
+    const executor = this.options.executor;
+    if (executor !== undefined) {
+      const executed = await executor.run([resolved.command, ...resolved.args, request.candidateHeadSha], {
+        timeoutMs,
+      });
+      const output = [executed.stdout, executed.stderr]
+        .filter((part) => part.trim().length > 0)
+        .join('\n');
+      const summary =
+        output.length > 0 ? output : `'${request.procedureName}' produced no output`;
+      if (executed.error !== undefined) {
+        return receipt('unknown', executed.exitCode, `spawn failed: ${executed.error}`, completedAtIso);
+      }
+      if (executed.signal !== null) {
+        return receipt(
+          'unknown',
+          executed.exitCode,
+          `verification check was terminated by signal ${executed.signal} before completing`,
+          completedAtIso,
+        );
+      }
+      if (executed.exitCode === null) {
+        return receipt(
+          'unknown',
+          null,
+          'verification check ended without reporting an exit code',
+          completedAtIso,
+        );
+      }
+      return receipt(executed.exitCode === 0 ? 'pass' : 'fail', executed.exitCode, summary, completedAtIso);
+    }
+
     const sshHost = this.options.sshHost;
     if (sshHost !== undefined && !isSpawnableSshHost(sshHost)) {
       return receipt(
@@ -176,7 +217,6 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
       );
     }
 
-    const timeoutMs = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const spawn = this.options.spawn ?? defaultSpawnTransport;
     let file: string;
     let argv: readonly string[];

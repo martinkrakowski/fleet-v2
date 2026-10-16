@@ -14,6 +14,7 @@ import {
   AttemptOwnerDecisionAdapter,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
+  resolveRoleExecutors,
   type AcceptanceAssessmentDelegate,
   type AcceptanceEvidenceDelegate,
   type ActionAuthorizationDelegate,
@@ -218,18 +219,27 @@ export function createConfiguredWorkComposition(
     runnerRemoteHost,
   } = resolveWorkRunnerSettings(options);
 
+  // One executor per role: the installation's hosts (v2) or the v1 mapping
+  // decides local versus ssh per host; the orchestrator runs where this root
+  // runs. runnerRemoteHost/ocmRunBin stay runner settings, separate from the
+  // worktree executor's host.
+  const roleExecutors = resolveRoleExecutors(options?.installation, {
+    worktreeSshHost,
+  });
+
   const workOrderRepo = new WorkOrderRepositoryAdapter({ stateDir });
   const attemptRepo = new AttemptRepositoryAdapter({ stateDir });
   const journal = new ExecutionJournalAdapter({ stateDir });
   const briefAuthoring = new BriefAuthoringAdapter();
-  const workspace = new WorkspaceAdapter({ sshHost: worktreeSshHost });
-  const artifactPort = new AttemptArtifactAdapter({ sshHost: worktreeSshHost });
+  const workspace = new WorkspaceAdapter({ executor: roleExecutors.worktree });
+  const artifactPort = new AttemptArtifactAdapter({ executor: roleExecutors.worktree });
   // The worktree locator is resolved from the recorded attempt so a request
   // arriving in a later process addresses the same directory as its dispatch.
   const runner = new ExecutionRunnerAdapter({
     ocmRunBin,
     remotePort: runnerRemotePort,
     remoteHost: runnerRemoteHost,
+    executor: roleExecutors.orchestrator,
     resolveWorktreePath: async (attemptId) =>
       (await attemptRepo.findAttemptById(attemptId))?.worktreePath ?? null,
     resolveAttempt: async (attemptId) =>

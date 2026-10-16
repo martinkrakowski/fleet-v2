@@ -320,3 +320,85 @@ describe('VerificationExecutorAdapter', () => {
     expect(result.completedAtIso).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
   });
 });
+
+describe('VerificationExecutorAdapter with a CommandExecutorPort', () => {
+  const allowList = { ci: { command: '/opt/verify-run.sh', args: ['--strict'] } };
+
+  interface RecordedRun {
+    argv: readonly string[];
+    options?: { timeoutMs?: number };
+  }
+
+  function fakeExecutor(outcome: Partial<{
+    exitCode: number | null;
+    signal: string | null;
+    stdout: string;
+    stderr: string;
+    error: string;
+  }>): {
+    run: (argv: readonly string[], options?: { timeoutMs?: number }) => Promise<{
+      exitCode: number | null;
+      signal: string | null;
+      stdout: string;
+      stderr: string;
+      error?: string;
+    }>;
+    calls: RecordedRun[];
+  } {
+    const calls: RecordedRun[] = [];
+    return {
+      calls,
+      run: async (argv, options) => {
+        calls.push({ argv, options });
+        return { exitCode: 0, signal: null, stdout: '', stderr: '', ...outcome };
+      },
+    };
+  }
+
+  it('runs the allow-listed command plus the candidate sha through the executor', async () => {
+    const fake = fakeExecutor({ stdout: 'ok\n' });
+    const adapter = new VerificationExecutorAdapter({
+      executor: fake,
+      allowListedCommands: allowList,
+    });
+    const result = await adapter.executeVerificationCheck(checkRequest());
+    expect(result.result).toBe('pass');
+    expect(result.exitCode).toBe(0);
+    expect(result.outputSummary).toBe('ok\n');
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0].argv).toEqual(['/opt/verify-run.sh', '--strict', HEAD]);
+    expect(fake.calls[0].options?.timeoutMs).toBe(DEFAULT_TIMEOUT_MS);
+  });
+
+  it('maps a failing exit code to fail and a signal or spawn error to unknown', async () => {
+    const failing = new VerificationExecutorAdapter({
+      executor: fakeExecutor({ exitCode: 2, stderr: 'boom\n' }),
+      allowListedCommands: allowList,
+    });
+    expect((await failing.executeVerificationCheck(checkRequest())).result).toBe('fail');
+
+    const signalled = new VerificationExecutorAdapter({
+      executor: fakeExecutor({ exitCode: null, signal: 'SIGTERM' }),
+      allowListedCommands: allowList,
+    });
+    const signalledResult = await signalled.executeVerificationCheck(checkRequest());
+    expect(signalledResult.result).toBe('unknown');
+    expect(signalledResult.outputSummary).toContain('SIGTERM');
+
+    const spawnFailed = new VerificationExecutorAdapter({
+      executor: fakeExecutor({ exitCode: null, error: 'spawn failed' }),
+      allowListedCommands: allowList,
+    });
+    const failedResult = await spawnFailed.executeVerificationCheck(checkRequest());
+    expect(failedResult.result).toBe('unknown');
+    expect(failedResult.outputSummary).toContain('spawn failed');
+  });
+
+  it('never runs the executor when the procedure is not allow-listed', async () => {
+    const fake = fakeExecutor({});
+    const adapter = new VerificationExecutorAdapter({ executor: fake });
+    const result = await adapter.executeVerificationCheck(checkRequest());
+    expect(result.result).toBe('unknown');
+    expect(fake.calls).toHaveLength(0);
+  });
+});

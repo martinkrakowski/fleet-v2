@@ -23,6 +23,7 @@ import type {
   StopRunnerSessionRequest,
   StopRunnerSessionResult,
 } from '../../application/ports/out/ExecutionRunnerPort.out-port.js';
+import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import type {
   AttemptRecord,
   AttemptRunnerRecord,
@@ -71,6 +72,12 @@ export interface ExecutionRunnerAdapterOptions {
   readonly resolveAttempt?: (attemptId: string) => Promise<AttemptRecord | null> | AttemptRecord | null;
   /** Deterministic subprocess execution for unit tests. */
   readonly runSubprocess?: SubprocessRunner;
+  /**
+   * Executor owning the orchestrator host's subprocesses (the ocm-run
+   * wrapper). Used when no `runSubprocess` seam is injected; the executor's
+   * `env` option carries the sanitized runner environment.
+   */
+  readonly executor?: CommandExecutorPort;
   /** Capability overrides on top of the enforced defaults. */
   readonly capabilities?: Partial<RunnerIsolationCapabilities>;
 }
@@ -647,6 +654,17 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   ): Promise<SubprocessResult> {
     const injected = this.options?.runSubprocess;
     if (injected !== undefined) return injected(command, args, env);
+    const executor = this.options?.executor;
+    if (executor !== undefined) {
+      return executor
+        .run([command, ...args], env === undefined ? undefined : { env })
+        .then((result) => {
+          if (result.exitCode === null) {
+            throw new Error(result.error ?? 'Runner subprocess ended without an exit code');
+          }
+          return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+        });
+    }
     return runViaExecFile(command, args, env);
   }
 }

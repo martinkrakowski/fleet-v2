@@ -21,11 +21,18 @@ import type {
   WorktreeInspectionRequest,
   WorkspacePort,
 } from '../../application/ports/out/WorkspacePort.out-port.js';
+import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 
 const execFileAsync = promisify(execFile);
 
 export interface WorkspaceAdapterOptions {
-  /** SSH host alias holding the worktree when it is not present locally. */
+  /**
+   * Executor owning the worktree's host commands. When set it is
+   * authoritative: every git command, existence probe and file read runs
+   * through it, locally or over the ssh transport the executor carries.
+   */
+  readonly executor?: CommandExecutorPort;
+  /** Legacy direct seam: SSH host alias holding the worktree when it is not present locally. */
   readonly sshHost?: string;
 }
 
@@ -145,8 +152,18 @@ export class WorkspaceAdapter implements WorkspacePort {
     return this.options.sshHost;
   }
 
-  /** Read-only git in the worktree, locally or through the reviewed ssh host. */
+  /** Read-only git in the worktree, through the executor, the legacy ssh host, or locally. */
   private async runGit(worktreePath: string, args: readonly string[]): Promise<string> {
+    if (this.options?.executor !== undefined) {
+      const result = await this.options.executor.run(['git', '-C', worktreePath, ...args]);
+      if (result.exitCode !== 0) {
+        throw new Error(
+          `git ${args.join(' ')} failed in ${worktreePath}: exit ${String(result.exitCode)}` +
+            (result.stderr.trim() !== '' ? `: ${result.stderr.trim()}` : ''),
+        );
+      }
+      return result.stdout;
+    }
     const sshHost = this.useRemote(worktreePath);
     if (sshHost === null) {
       const { stdout } = await execFileAsync('git', ['-C', worktreePath, ...args]);
@@ -159,6 +176,16 @@ export class WorkspaceAdapter implements WorkspacePort {
 
   /** Existence of one absolute path in the worktree's filesystem. */
   private async pathExists(worktreePath: string, targetPath: string): Promise<boolean> {
+    if (this.options?.executor !== undefined) {
+      const result = await this.options.executor.run(['test', '-e', targetPath]);
+      if (result.exitCode !== 0 && result.exitCode !== 1) {
+        throw new Error(
+          `Unable to probe ${targetPath}: exit ${String(result.exitCode)}` +
+            (result.error !== undefined ? `: ${result.error}` : ''),
+        );
+      }
+      return result.exitCode === 0;
+    }
     const sshHost = this.useRemote(worktreePath);
     if (sshHost === null) {
       return fs
@@ -175,14 +202,18 @@ export class WorkspaceAdapter implements WorkspacePort {
   }
 
   async readWorktreeFile(worktreePath: string, relativePath: string): Promise<string | null> {
+    const targetPath = path.isAbsolute(relativePath)
+      ? relativePath
+      : path.join(worktreePath, relativePath);
+    if (this.options?.executor !== undefined) {
+      const result = await this.options.executor.run(['cat', targetPath]);
+      return result.exitCode === 0 ? result.stdout : null;
+    }
     if (this.options?.sshHost && !existsSync(worktreePath) && !isSafeSshHost(this.options.sshHost)) {
       throw new Error(
         `Unable to read file in ${worktreePath}: unsafe SSH host '${this.options.sshHost}'`,
       );
     }
-    const targetPath = path.isAbsolute(relativePath)
-      ? relativePath
-      : path.join(worktreePath, relativePath);
     const sshHost = this.useRemote(worktreePath);
     if (sshHost === null) {
       try {

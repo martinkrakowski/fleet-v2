@@ -384,10 +384,9 @@ export class OwnerQuestion {
     next: OwnerQuestionState,
     patch?: { answer?: OwnerQuestionAnswerRecord | null; acknowledgement?: OwnerQuestionRecord['acknowledgement'] },
   ): OwnerQuestion {
-    if (!canTransitionOwnerQuestion(this.record.state, next)) {
-      throw new Error(
-        `OwnerQuestion may not move from ${this.record.state} to ${next}`,
-      );
+    if (!STATES.includes(next) || !canTransitionOwnerQuestion(this.record.state, next)) {
+      // The requested state is caller input: never echo it.
+      throw new Error(`OwnerQuestion may not move from ${this.record.state} to the requested state`);
     }
     const candidate = {
       ...this.toRecord(),

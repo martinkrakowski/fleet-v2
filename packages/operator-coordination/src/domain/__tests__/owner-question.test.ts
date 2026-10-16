@@ -188,6 +188,55 @@ describe('OwnerQuestion validation', () => {
     expect(() => OwnerQuestion.fromRecord(oversized)).toThrow(/32768 JSON characters/);
   });
 
+  it('refuses a secret shape in id and reference fields without echoing it', () => {
+    const secret = fakeSecretShape();
+    const cases: readonly OwnerQuestionRecordInput[] = [
+      questionRecord({ questionId: `q-${secret}` }),
+      questionRecord({ askedBy: `asker-${secret}` }),
+      questionRecord({ doorKind: 'one-way', linkedRequestId: `req-${secret}` }),
+      questionRecord({ blocks: [{ kind: 'lane', ref: `lane-${secret}` }] }),
+      rejectedRecord({
+        answer: {
+          shape: 'reject',
+          optionId: null,
+          text: null,
+          reason: null,
+          questionRevision: 1,
+          answeredVia: 'web',
+          answeredAt: '2026-10-16T11:00:00.000Z',
+          sessionId: `session-${secret}`,
+        },
+      }),
+      rejectedRecord({
+        state: 'acknowledged',
+        acknowledgement: { by: `by-${secret}`, at: '2026-10-16T12:00:00.000Z' },
+      }),
+    ];
+    for (const record of cases) {
+      let message = '';
+      try {
+        OwnerQuestion.fromRecord(record);
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).not.toBe('');
+      expect(message).not.toContain(secret);
+    }
+  });
+
+  it('never echoes a requested state that is not a known state', () => {
+    const question = OwnerQuestion.fromRecord(questionRecord());
+    const marker = 'zz-marker-state-zz';
+    let message = '';
+    try {
+      question.transitionTo(marker as never);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).not.toBe('');
+    expect(message).not.toContain(marker);
+  });
+
   it('refuses a secret shape in each scanned field and names the field without echoing the value', () => {
     const secret = fakeSecretShape();
     const cases: readonly OwnerQuestionRecordInput[] = [

@@ -2,8 +2,8 @@
 
 export * from "./AttentionReadAdapter.adapter.js";
 export * from "./CoordinationRequestRepositoryAdapter.adapter.js";
+export * from "./DecisionSignature.adapter.js";
 export * from "./DecisionTransportAdapter.adapter.js";
 export * from "./ObservationPublicationAdapter.adapter.js";
 export * from "./ProjectProfileRepositoryAdapter.adapter.js";
 export * from "./RelayTransportAdapter.adapter.js";
-export * from "./decision-signature.js";

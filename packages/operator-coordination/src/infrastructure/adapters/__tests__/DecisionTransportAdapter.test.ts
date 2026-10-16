@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { canonicalDecisionBytes } from '../decision-signature.js';
+import { canonicalDecisionBytes } from '../DecisionSignature.adapter.js';
 import { DecisionTransportAdapter } from '../DecisionTransportAdapter.adapter.js';
 import type { DecisionAnswerQuery } from '../../../application/ports/out/DecisionTransportPort.out-port.js';
 
@@ -513,5 +513,34 @@ describe('DecisionTransportAdapter signature verification', () => {
       decisionRevision: 'rev-1',
       grantId: 'grant-1',
     });
+  });
+});
+
+describe("verifyDecisionSignature canonical base64", () => {
+  it("refuses a valid signature written in a non-canonical base64 form", async () => {
+    const { generateKeyPairSync, sign } = await import("node:crypto");
+    const { canonicalDecisionBytes: bytesOf, verifyDecisionSignature } = await import(
+      "../DecisionSignature.adapter.js"
+    );
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const raw = publicKey.export({ format: "der", type: "spki" }).subarray(12).toString("base64");
+    const fields = {
+      requestId: "req-1",
+      projectId: "proj-1",
+      actionScope: "forge:merge-pr",
+      expectedHeadSha: "a".repeat(40),
+      decisionRevision: "r1",
+      grantId: "g1",
+      state: "approved",
+    };
+    const signature = sign(null, bytesOf(fields), privateKey).toString("base64");
+    expect(verifyDecisionSignature(fields, signature, raw)).toBe(true);
+    const urlAlphabet = signature.replace(/\+/g, "-").replace(/\//g, "_");
+    const withSpace = `${signature.slice(0, 10)} ${signature.slice(10)}`;
+    const unpadded = signature.replace(/=+$/, "");
+    for (const variant of [withSpace, unpadded, ...(urlAlphabet !== signature ? [urlAlphabet] : [])]) {
+      expect(verifyDecisionSignature(fields, variant, raw)).toBe(false);
+    }
+    expect(verifyDecisionSignature(fields, signature, ` ${raw}`)).toBe(false);
   });
 });

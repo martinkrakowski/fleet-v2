@@ -24,7 +24,6 @@ import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { canonicalDecisionBytes } from '@fleet/operator-coordination';
 
 import {
   assessmentIdForAttempt,
@@ -32,6 +31,31 @@ import {
   type FleetCliRuntime,
 } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
+
+/** Canonical decision bytes, written out here so the test pins the signed format independently. */
+function canonicalDecisionBytes(fields: {
+  requestId: string;
+  projectId: string;
+  actionScope: string;
+  expectedHeadSha: string | null;
+  decisionRevision: string | null;
+  grantId: string | null;
+  state: string;
+}): Buffer {
+  return Buffer.from(
+    JSON.stringify({
+      requestId: fields.requestId,
+      projectId: fields.projectId,
+      actionScope: fields.actionScope,
+      expectedHeadSha: fields.expectedHeadSha ?? null,
+      decisionRevision: fields.decisionRevision ?? null,
+      grantId: fields.grantId ?? null,
+      state: fields.state,
+    }),
+    'utf8',
+  );
+}
+
 
 const PROJECT_ID = 'proj-cli-1';
 const WORK_ORDER_ID = 'wo-1';

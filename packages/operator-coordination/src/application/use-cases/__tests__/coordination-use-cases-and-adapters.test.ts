@@ -35,7 +35,7 @@ import type {
   DecisionAnswerQuery,
   DecisionTransportPort,
 } from '../../ports/out/DecisionTransportPort.out-port.js';
-import { canonicalDecisionBytes } from '../../../infrastructure/adapters/decision-signature.js';
+import { canonicalDecisionBytes } from '../../../infrastructure/adapters/DecisionSignature.adapter.js';
 import type { ProjectProfileRepositoryPort } from '../../ports/out/ProjectProfileRepositoryPort.out-port.js';
 import type { RelayDeliveryOutcome, RelayNoticeRequest } from '../../ports/out/RelayTransportPort.out-port.js';
 import { AttentionReadAdapter } from '../../../infrastructure/adapters/AttentionReadAdapter.adapter.js';

@@ -10,6 +10,20 @@ export interface CanonicalDecisionFields {
   readonly state: string;
 }
 
+/** Canonical base64 only: no whitespace, no URL alphabet, correct padding. */
+const CANONICAL_BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
+
+function decodeCanonicalBase64(value: string, expectedLength: number): Buffer | null {
+  if (!CANONICAL_BASE64.test(value) || value.length % 4 !== 0) {
+    return null;
+  }
+  const decoded = Buffer.from(value, 'base64');
+  if (decoded.length !== expectedLength || decoded.toString('base64') !== value) {
+    return null;
+  }
+  return decoded;
+}
+
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 
 /**
@@ -44,12 +58,12 @@ export function verifyDecisionSignature(
     if (typeof signatureBase64 !== 'string' || typeof publicKeyBase64 !== 'string') {
       return false;
     }
-    const rawKey = Buffer.from(publicKeyBase64, 'base64');
-    if (rawKey.length !== 32) {
+    const rawKey = decodeCanonicalBase64(publicKeyBase64, 32);
+    if (rawKey === null) {
       return false;
     }
-    const sig = Buffer.from(signatureBase64, 'base64');
-    if (sig.length !== 64) {
+    const sig = decodeCanonicalBase64(signatureBase64, 64);
+    if (sig === null) {
       return false;
     }
     const key = createPublicKey({

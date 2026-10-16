@@ -21,7 +21,7 @@ import type {
   DecisionState,
   DecisionTransportPort,
 } from '../../application/ports/out/DecisionTransportPort.out-port.js';
-import { verifyDecisionSignature } from './decision-signature.js';
+import { verifyDecisionSignature } from './DecisionSignature.adapter.js';
 
 export interface DecisionTransportAdapterOptions {
   /** Directory of owner-recorded decision answers, one file per request. */

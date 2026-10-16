@@ -8,3 +8,4 @@ export * from "./file-store.js";
 export * from "./ObservationPublicationAdapter.adapter.js";
 export * from "./ProjectProfileRepositoryAdapter.adapter.js";
 export * from "./RelayTransportAdapter.adapter.js";
+export * from "./WavesHttpClient.adapter.js";

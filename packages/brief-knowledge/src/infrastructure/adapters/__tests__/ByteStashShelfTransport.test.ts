@@ -2,9 +2,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, writeFile, chmod, symlink, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import https from 'node:https';
+import { EventEmitter } from 'node:events';
 import type { KnowledgeEntryRecord } from '../../../domain/knowledge-records.js';
 import {
   createByteStashShelfPublisher,
+  defaultByteStashRequest,
   SECRET_PATTERNS,
   type ByteStashRequestFn,
 } from '../ByteStashShelfTransport.adapter.js';
@@ -582,6 +585,132 @@ describe('ByteStashShelfTransport', () => {
         expect(result.reason.includes(validKey)).toBe(false);
         expect(result.reason).toContain('[REDACTED]');
       }
+    });
+  });
+
+  describe('defaultByteStashRequest transport safety', () => {
+    const MIB = 1024 * 1024;
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      vi.useRealTimers();
+    });
+
+    function installFakeHttps(statusCode = 200): {
+      req: EventEmitter & {
+        write: ReturnType<typeof vi.fn>;
+        end: ReturnType<typeof vi.fn>;
+        destroy: ReturnType<typeof vi.fn>;
+      };
+      res: EventEmitter & { statusCode: number };
+    } {
+      const req = Object.assign(new EventEmitter(), {
+        write: vi.fn(),
+        end: vi.fn(),
+        destroy: vi.fn(),
+      });
+      const res = Object.assign(new EventEmitter(), { statusCode });
+      vi.spyOn(https, 'request').mockImplementation(
+        ((...args: unknown[]) => {
+          const callback = args[args.length - 1] as (response: unknown) => void;
+          callback(res);
+          return req;
+        }) as unknown as typeof https.request,
+      );
+      return { req, res };
+    }
+
+    function request(timeoutMs = 15000): Promise<{ status: number; body: string }> {
+      return defaultByteStashRequest(new URL('https://stash.example.com/api/snippets'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{"title":"keeper entry"}',
+        timeoutMs,
+      });
+    }
+
+    it('resolves a complete response from buffered chunks and writes the body', async () => {
+      const { req, res } = installFakeHttps(201);
+
+      const promise = request();
+      res.emit('data', Buffer.from('{"id":'));
+      res.emit('data', Buffer.from('4242}'));
+      res.emit('end');
+
+      await expect(promise).resolves.toEqual({ status: 201, body: '{"id":4242}' });
+      expect(req.write).toHaveBeenCalledWith('{"title":"keeper entry"}');
+      expect(req.destroy).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the response stream errors mid-body', async () => {
+      const { req, res } = installFakeHttps(200);
+
+      const promise = request();
+      res.emit('data', Buffer.from('{"partial":'));
+      res.emit('error', new Error('connection reset mid-body'));
+
+      await expect(promise).rejects.toThrow('connection reset mid-body');
+      expect(req.destroy).toHaveBeenCalled();
+    });
+
+    it('rejects when the response is aborted before completion', async () => {
+      const { req, res } = installFakeHttps(200);
+
+      const promise = request();
+      res.emit('data', Buffer.from('{"partial":'));
+      res.emit('aborted');
+
+      await expect(promise).rejects.toThrow('ByteStash response was aborted before completion');
+      expect(req.destroy).toHaveBeenCalled();
+    });
+
+    it('rejects a response body larger than 1 MiB', async () => {
+      const { req, res } = installFakeHttps(200);
+
+      const promise = request();
+      res.emit('data', Buffer.alloc(MIB));
+      res.emit('data', Buffer.alloc(1));
+
+      await expect(promise).rejects.toThrow('ByteStash response body exceeded 1048576 bytes');
+      expect(req.destroy).toHaveBeenCalled();
+    });
+
+    it('accepts a response body of exactly 1 MiB', async () => {
+      const { res } = installFakeHttps(200);
+
+      const promise = request();
+      res.emit('data', Buffer.alloc(MIB));
+      res.emit('end');
+
+      await expect(promise).resolves.toMatchObject({ status: 200 });
+    });
+
+    it('rejects when the request itself errors before a response', async () => {
+      const { req } = installFakeHttps(200);
+
+      const promise = request();
+      const error = Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' });
+      req.emit('error', error);
+
+      await expect(promise).rejects.toThrow('connect ETIMEDOUT');
+    });
+
+    it('cancels the request and rejects when the total deadline passes', async () => {
+      const { req } = installFakeHttps(200);
+
+      const promise = request(50);
+      await expect(promise).rejects.toThrow('Request timed out after 50ms');
+      expect(req.destroy).toHaveBeenCalled();
+    });
+
+    it('applies the 15000ms total deadline by default when timeoutMs is not positive', async () => {
+      vi.useFakeTimers();
+      installFakeHttps(200);
+
+      const promise = request(0);
+      const assertion = expect(promise).rejects.toThrow('Request timed out after 15000ms');
+      await vi.advanceTimersByTimeAsync(15000);
+      await assertion;
     });
   });
 

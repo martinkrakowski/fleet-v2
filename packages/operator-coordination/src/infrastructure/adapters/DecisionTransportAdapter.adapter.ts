@@ -22,6 +22,7 @@ import type {
   DecisionTransportPort,
 } from '../../application/ports/out/DecisionTransportPort.out-port.js';
 import { verifyDecisionSignature } from './DecisionSignature.adapter.js';
+import type { WavesHttpClient } from './WavesHttpClient.adapter.js';
 
 export interface DecisionTransportAdapterOptions {
   /** Directory of owner-recorded decision answers, one file per request. */
@@ -31,12 +32,23 @@ export interface DecisionTransportAdapterOptions {
   readonly fileExtension?: string;
   /** Owner Ed25519 public key in base64 format for verifying approved decisions. */
   readonly ownerPublicKey?: string;
+  /** Optional Waves HTTP client for fetching decision answers. */
+  readonly client?: WavesHttpClient;
 }
 
 const DEFAULT_FILE_EXTENSION = '.json';
 const DECISION_STATES: readonly string[] = ['approved', 'declined', 'awaiting-decision'];
-/** Request ids become file names, so they may not carry path structure. */
+/** Request ids become file names and HTTP path segments, so they may not carry path structure. */
 const SAFE_REQUEST_ID = /^[A-Za-z0-9._-]{1,128}$/;
+
+/**
+ * A dot is a legal id character, but an id made only of dots resolves as a
+ * relative path segment in a URL (`/api/v1/decisions/..` becomes `/api/v1/`),
+ * so dot-only ids are refused like any other path structure.
+ */
+function isSafeRequestId(requestId: string): boolean {
+  return SAFE_REQUEST_ID.test(requestId) && !/^[.]+$/.test(requestId);
+}
 
 const AWAITING: DecisionAnswer = {
   state: 'awaiting-decision',
@@ -49,9 +61,31 @@ export class DecisionTransportAdapter implements DecisionTransportPort {
 
   async readDecisionAnswer(query: DecisionAnswerQuery): Promise<DecisionAnswer> {
     const { requestId } = query;
+    // A request id that could carry path structure is refused before any
+    // transport is consulted: it can never name a decision answer source.
+    if (typeof requestId !== 'string' || !isSafeRequestId(requestId)) {
+      return { ...AWAITING };
+    }
     const injected = this.options.answers?.[requestId];
     if (injected !== undefined) {
       return normalizeAnswer(injected, query, this.options.ownerPublicKey);
+    }
+    if (this.options.client !== undefined) {
+      let candidate: unknown = null;
+      try {
+        // isSafeRequestId already refused ids with path structure (including
+        // dot-only ids such as `..`), so the id cannot redirect the URL.
+        const id = encodeURIComponent(requestId);
+        const res = await this.options.client.get(`/api/v1/decisions/${id}`);
+        if (res.status >= 200 && res.status < 300) {
+          candidate = JSON.parse(res.body);
+        }
+      } catch {
+        // network error, timeout, JSON parse error -> candidate remains null
+      }
+      if (candidate !== null) {
+        return normalizeAnswer(candidate, query, this.options.ownerPublicKey);
+      }
     }
     const path = this.decisionPath(requestId);
     if (path === null) {
@@ -78,7 +112,7 @@ export class DecisionTransportAdapter implements DecisionTransportPort {
     if (decisionsDir === undefined || decisionsDir.trim().length === 0) {
       return null;
     }
-    if (typeof requestId !== 'string' || !SAFE_REQUEST_ID.test(requestId)) {
+    if (typeof requestId !== 'string' || !isSafeRequestId(requestId)) {
       return null;
     }
     return join(decisionsDir, `${requestId}${this.options.fileExtension ?? DEFAULT_FILE_EXTENSION}`);

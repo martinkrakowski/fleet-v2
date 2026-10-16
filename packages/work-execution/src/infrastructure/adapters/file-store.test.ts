@@ -5,6 +5,15 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { FileLockTimeoutError, withFileLock, writeJsonAtomically } from './file-store.js';
 
+/** An explicit one-way latch: the test decides when the holder may proceed. */
+function createLatch(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 describe('withFileLock', () => {
   let tempDir: string;
 
@@ -19,25 +28,54 @@ describe('withFileLock', () => {
   it('handles lock contention between two concurrent saves', async () => {
     const lockPath = path.join(tempDir, 'test.lock');
     const filePath = path.join(tempDir, 'data.json');
-    const order: number[] = [];
 
-    // Start two concurrent saves attempting to acquire the same lock
+    let active = 0;
+    let maxActive = 0;
+    let firstReleased = false;
+    let secondEnteredBeforeRelease = false;
+
+    const firstEntered = createLatch();
+    const releaseFirst = createLatch();
+    const secondEntered = createLatch();
+
+    // The first save holds the lock until the test explicitly releases it.
     const save1 = withFileLock(lockPath, async () => {
-      order.push(1);
-      await new Promise((resolve) => setTimeout(resolve, 60));
-      order.push(2);
+      active += 1;
+      maxActive = Math.max(maxActive, active);
       await writeJsonAtomically(filePath, { value: 'first' });
+      firstEntered.resolve();
+      await releaseFirst.promise;
+      firstReleased = true;
+      active -= 1;
     });
+
+    // The lock is provably held before the second save is even started.
+    await firstEntered.promise;
 
     const save2 = withFileLock(lockPath, async () => {
-      order.push(3);
+      if (!firstReleased) {
+        secondEnteredBeforeRelease = true;
+      }
+      active += 1;
+      maxActive = Math.max(maxActive, active);
       await writeJsonAtomically(filePath, { value: 'second' });
+      secondEntered.resolve();
+      active -= 1;
     });
 
+    // Give the blocked second save several retry windows while the lock is
+    // still held; a broken lock would enter here and be caught below.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(secondEnteredBeforeRelease).toBe(false);
+
+    releaseFirst.resolve();
+    await secondEntered.promise;
     await Promise.all([save1, save2]);
 
-    // save1 must completely finish (1, 2) before save2 can enter (3)
-    expect(order).toEqual([1, 2, 3]);
+    // Mutual exclusion: at no point were both critical sections active.
+    expect(maxActive).toBe(1);
 
     const finalRaw = await fs.readFile(filePath, 'utf8');
     const parsed = JSON.parse(finalRaw) as { value: string };

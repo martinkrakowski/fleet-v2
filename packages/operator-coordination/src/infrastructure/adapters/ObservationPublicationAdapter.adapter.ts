@@ -1,13 +1,15 @@
 /**
  * ObservationPublicationAdapter implements ObservationPublicationPort against
- * the existing Waves client boundary: an injected publisher, a local outbox, or
- * neither.
+ * the existing Waves client boundary: a Waves HTTP client, an injected publisher,
+ * a local outbox, or neither.
  *
  * A publication that fails is retained as an undelivered observation with its
  * reason, so `listUndeliveredObservations` still returns the fact instead of it
  * disappearing. An observation that later publishes successfully is released
- * from that list. Nothing is retried as a different fact, and no token is
- * exposed to agents through this adapter.
+ * from that list. When publication over HTTP fails (non-2xx, timeout or throw),
+ * the outbox file is written as a retry queue and a delivery-gap outcome is returned.
+ * A 401 is reported as such and never retried with another token. Nothing is
+ * retried as a different fact, and no token is exposed to agents through this adapter.
  */
 
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -19,6 +21,8 @@ import type {
   ObservationPublicationOutcome,
   ObservationPublicationPort,
 } from '../../application/ports/out/ObservationPublicationPort.out-port.js';
+import type { WavesHttpClient } from './WavesHttpClient.adapter.js';
+import { scrubAndTruncate } from './WavesHttpClient.adapter.js';
 
 export type ObservationPublisher = (
   envelope: ObservationEnvelopeProps,
@@ -27,8 +31,10 @@ export type ObservationPublisher = (
 export interface ObservationPublicationAdapterOptions {
   /** Existing Waves client boundary; its successful return is the receipt. */
   readonly publish?: ObservationPublisher;
-  /** Local outbox used when no publisher is configured. */
+  /** Local outbox used when no publisher is configured, or as fallback on failure. */
   readonly outboxDir?: string;
+  /** Waves HTTP client boundary for live observation publication. */
+  readonly client?: WavesHttpClient;
 }
 
 const UNSAFE_ID = /[^A-Za-z0-9._-]/g;
@@ -78,7 +84,44 @@ export class ObservationPublicationAdapter implements ObservationPublicationPort
   private async publishThroughBoundary(
     envelope: ObservationEnvelopeProps,
   ): Promise<ObservationPublicationOutcome> {
-    const { publish, outboxDir } = this.options;
+    const { client, publish, outboxDir } = this.options;
+    if (client !== undefined) {
+      let failureReason: string | undefined;
+      try {
+        const id = encodeURIComponent(envelope.observationId);
+        const response = await client.put(`/api/v1/observations/${id}`, envelope);
+        if (response.status < 200 || response.status >= 300) {
+          if (response.status === 401) {
+            failureReason = `observation publication failed: HTTP 401 unauthorized`;
+          } else {
+            const snippet = scrubAndTruncate(client.scrub(response.body));
+            failureReason = `observation publication failed: HTTP ${response.status}${snippet ? ` - ${snippet}` : ''}`;
+          }
+        }
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        failureReason = `observation publication failed: ${client.scrub(msg)}`;
+      }
+
+      if (failureReason !== undefined) {
+        if (outboxDir !== undefined && outboxDir.trim().length > 0) {
+          try {
+            await this.writeOutboxFile(outboxDir, envelope);
+          } catch (writeError) {
+            failureReason = `${failureReason}; outbox write failed: ${
+              writeError instanceof Error ? writeError.message : String(writeError)
+            }`;
+          }
+        }
+        return {
+          outcome: 'delivery-gap',
+          reason: failureReason,
+        };
+      }
+
+      return { outcome: 'published' };
+    }
+
     if (publish !== undefined) {
       try {
         const receipt = await publish(envelope);
@@ -87,30 +130,41 @@ export class ObservationPublicationAdapter implements ObservationPublicationPort
           receipt !== null &&
           (receipt as ObservationPublicationOutcome).outcome === 'delivery-gap'
         ) {
+          const reason = readReason(receipt, 'publication boundary reported a delivery gap');
+          if (outboxDir !== undefined && outboxDir.trim().length > 0) {
+            try {
+              await this.writeOutboxFile(outboxDir, envelope);
+            } catch {
+              // outbox write failure preserved
+            }
+          }
           return {
             outcome: 'delivery-gap',
-            reason: readReason(receipt, 'publication boundary reported a delivery gap'),
+            reason,
           };
         }
         return { outcome: 'published' };
       } catch (error) {
+        const reason = `observation publication failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`;
+        if (outboxDir !== undefined && outboxDir.trim().length > 0) {
+          try {
+            await this.writeOutboxFile(outboxDir, envelope);
+          } catch {
+            // outbox write failure preserved
+          }
+        }
         return {
           outcome: 'delivery-gap',
-          reason: `observation publication failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
+          reason,
         };
       }
     }
+
     if (outboxDir !== undefined && outboxDir.trim().length > 0) {
       try {
-        await mkdir(outboxDir, { recursive: true });
-        const name = `${envelope.observationId.replace(UNSAFE_ID, '-')}.json`;
-        await writeFile(
-          join(outboxDir, name),
-          `${JSON.stringify(envelope, null, 2)}\n`,
-          'utf8',
-        );
+        await this.writeOutboxFile(outboxDir, envelope);
         return { outcome: 'published' };
       } catch (error) {
         return {
@@ -121,9 +175,23 @@ export class ObservationPublicationAdapter implements ObservationPublicationPort
         };
       }
     }
+
     return {
       outcome: 'delivery-gap',
       reason: `no observation publication boundary is configured for ${envelope.observationId}`,
     };
+  }
+
+  private async writeOutboxFile(
+    outboxDir: string,
+    envelope: ObservationEnvelopeProps,
+  ): Promise<void> {
+    await mkdir(outboxDir, { recursive: true });
+    const name = `${envelope.observationId.replace(UNSAFE_ID, '-')}.json`;
+    await writeFile(
+      join(outboxDir, name),
+      `${JSON.stringify(envelope, null, 2)}\n`,
+      'utf8',
+    );
   }
 }

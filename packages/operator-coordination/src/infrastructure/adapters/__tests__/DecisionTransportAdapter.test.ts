@@ -1,12 +1,13 @@
 import { generateKeyPairSync, sign, type KeyObject } from 'node:crypto';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { canonicalDecisionBytes } from '../DecisionSignature.adapter.js';
 import { DecisionTransportAdapter } from '../DecisionTransportAdapter.adapter.js';
+import { WavesHttpClient, type WavesRequestFn } from '../WavesHttpClient.adapter.js';
 import type { DecisionAnswerQuery } from '../../../application/ports/out/DecisionTransportPort.out-port.js';
 
 function createOwnerKeyPair(): { publicKeyBase64: string; privateKey: KeyObject } {
@@ -542,5 +543,334 @@ describe("verifyDecisionSignature canonical base64", () => {
       expect(verifyDecisionSignature(fields, variant, raw)).toBe(false);
     }
     expect(verifyDecisionSignature(fields, signature, ` ${raw}`)).toBe(false);
+  });
+});
+
+describe('DecisionTransportAdapter HTTP client transport', () => {
+  const tempDirs: string[] = [];
+  let tokenFilePath: string;
+  const validToken = 'waves-dec-secret-token_111';
+
+  async function makeTempDir(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), 'fleet-decisions-http-test-'));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  afterEach(async () => {
+    for (const dir of tempDirs.splice(0)) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  async function setupTokenFile(): Promise<string> {
+    const dir = await makeTempDir();
+    tokenFilePath = join(dir, 'valid.token');
+    await writeFile(tokenFilePath, `${validToken}\n`, 'utf8');
+    await chmod(tokenFilePath, 0o600);
+    return tokenFilePath;
+  }
+
+  function createClient(requestFn: WavesRequestFn, tokenFile: string): WavesHttpClient {
+    return new WavesHttpClient({
+      baseUrl: 'https://waves.internal:8443',
+      tokenFile,
+      request: requestFn,
+    });
+  }
+
+  const query: DecisionAnswerQuery = {
+    requestId: 'req-http-1',
+    projectId: 'proj-1',
+    actionScope: 'forge:merge-pr',
+    expectedHeadSha: 'sha-commit-1',
+  };
+
+  it('valid signed approval from HTTP -> approved', async () => {
+    const tokenFile = await setupTokenFile();
+    const { publicKeyBase64, privateKey } = createOwnerKeyPair();
+    const signature = signDecision(
+      {
+        ...query,
+        decisionRevision: 'rev-http-1',
+        grantId: 'grant-http-1',
+        state: 'approved',
+      },
+      privateKey,
+    );
+
+    let calledPath: string | undefined;
+    const mockRequest: WavesRequestFn = async (url) => {
+      calledPath = url.pathname;
+      return {
+        status: 200,
+        body: JSON.stringify({
+          state: 'approved',
+          decisionRevision: 'rev-http-1',
+          grantId: 'grant-http-1',
+          signature,
+        }),
+      };
+    };
+
+    const client = createClient(mockRequest, tokenFile);
+    const adapter = new DecisionTransportAdapter({
+      client,
+      ownerPublicKey: publicKeyBase64,
+    });
+
+    const result = await adapter.readDecisionAnswer(query);
+    expect(calledPath).toBe('/api/v1/decisions/req-http-1');
+    expect(result).toEqual({
+      state: 'approved',
+      decisionRevision: 'rev-http-1',
+      grantId: 'grant-http-1',
+    });
+  });
+
+  it('unsigned approved from HTTP -> awaiting-decision', async () => {
+    const tokenFile = await setupTokenFile();
+    const { publicKeyBase64 } = createOwnerKeyPair();
+
+    const mockRequest: WavesRequestFn = async () => ({
+      status: 200,
+      body: JSON.stringify({
+        state: 'approved',
+        decisionRevision: 'rev-http-1',
+        grantId: 'grant-http-1',
+      }),
+    });
+
+    const client = createClient(mockRequest, tokenFile);
+    const adapter = new DecisionTransportAdapter({
+      client,
+      ownerPublicKey: publicKeyBase64,
+    });
+
+    const result = await adapter.readDecisionAnswer(query);
+    expect(result).toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+    });
+  });
+
+  it('invalid signature from HTTP -> awaiting-decision', async () => {
+    const tokenFile = await setupTokenFile();
+    const { publicKeyBase64 } = createOwnerKeyPair();
+
+    const mockRequest: WavesRequestFn = async () => ({
+      status: 200,
+      body: JSON.stringify({
+        state: 'approved',
+        decisionRevision: 'rev-http-1',
+        grantId: 'grant-http-1',
+        signature: 'invalid-signature',
+      }),
+    });
+
+    const client = createClient(mockRequest, tokenFile);
+    const adapter = new DecisionTransportAdapter({
+      client,
+      ownerPublicKey: publicKeyBase64,
+    });
+
+    const result = await adapter.readDecisionAnswer(query);
+    expect(result).toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+    });
+  });
+
+  it('declined from HTTP needs no signature', async () => {
+    const tokenFile = await setupTokenFile();
+    const mockRequest: WavesRequestFn = async () => ({
+      status: 200,
+      body: JSON.stringify({
+        state: 'declined',
+        decisionRevision: 'rev-declined-1',
+        grantId: 'ignored',
+      }),
+    });
+
+    const client = createClient(mockRequest, tokenFile);
+    const adapter = new DecisionTransportAdapter({ client });
+
+    const result = await adapter.readDecisionAnswer(query);
+    expect(result).toEqual({
+      state: 'declined',
+      decisionRevision: 'rev-declined-1',
+      grantId: null,
+    });
+  });
+
+  it('HTTP 401 response -> awaiting-decision', async () => {
+    const tokenFile = await setupTokenFile();
+    const { publicKeyBase64 } = createOwnerKeyPair();
+
+    const mockRequest: WavesRequestFn = async () => ({
+      status: 401,
+      body: 'Unauthorized',
+    });
+
+    const client = createClient(mockRequest, tokenFile);
+    const adapter = new DecisionTransportAdapter({
+      client,
+      ownerPublicKey: publicKeyBase64,
+    });
+
+    const result = await adapter.readDecisionAnswer(query);
+    expect(result).toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+    });
+  });
+
+  it('HTTP timeout -> awaiting-decision', async () => {
+    const tokenFile = await setupTokenFile();
+    const { publicKeyBase64 } = createOwnerKeyPair();
+
+    const mockRequest: WavesRequestFn = async () => {
+      const err = Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' });
+      throw err;
+    };
+
+    const client = createClient(mockRequest, tokenFile);
+    const adapter = new DecisionTransportAdapter({
+      client,
+      ownerPublicKey: publicKeyBase64,
+    });
+
+    const result = await adapter.readDecisionAnswer(query);
+    expect(result).toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+    });
+  });
+
+  it('HTTP 404 falls back to decisionsDir if local file exists, else awaiting', async () => {
+    const tokenFile = await setupTokenFile();
+    const { publicKeyBase64, privateKey } = createOwnerKeyPair();
+    const signature = signDecision(
+      {
+        ...query,
+        decisionRevision: 'rev-file-1',
+        grantId: 'grant-file-1',
+        state: 'approved',
+      },
+      privateKey,
+    );
+
+    const decisionsDir = await makeTempDir();
+    await writeFile(
+      join(decisionsDir, 'req-http-1.json'),
+      JSON.stringify({
+        state: 'approved',
+        decisionRevision: 'rev-file-1',
+        grantId: 'grant-file-1',
+        signature,
+      }),
+      'utf8',
+    );
+
+    const mockRequest: WavesRequestFn = async () => ({
+      status: 404,
+      body: 'not found',
+    });
+
+    const client = createClient(mockRequest, tokenFile);
+    const adapter = new DecisionTransportAdapter({
+      client,
+      decisionsDir,
+      ownerPublicKey: publicKeyBase64,
+    });
+
+    const result = await adapter.readDecisionAnswer(query);
+    expect(result).toEqual({
+      state: 'approved',
+      decisionRevision: 'rev-file-1',
+      grantId: 'grant-file-1',
+    });
+  });
+
+  it('refuses a `..` request id before building the HTTP URL, never calling the client', async () => {
+    const tokenFile = await setupTokenFile();
+    const mockRequest = vi.fn<WavesRequestFn>(async () => ({
+      status: 200,
+      body: JSON.stringify({
+        state: 'approved',
+        decisionRevision: 'rev-http-1',
+        grantId: 'grant-http-1',
+        signature: 'would-be-approval',
+      }),
+    }));
+
+    const client = createClient(mockRequest, tokenFile);
+    const adapter = new DecisionTransportAdapter({ client });
+
+    const result = await adapter.readDecisionAnswer({ ...query, requestId: '..' });
+
+    expect(result).toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+    });
+    expect(mockRequest).not.toHaveBeenCalled();
+  });
+
+  it('refuses a request id carrying path structure before any transport is consulted', async () => {
+    const tokenFile = await setupTokenFile();
+    const mockRequest = vi.fn<WavesRequestFn>(async () => ({
+      status: 200,
+      body: JSON.stringify({ state: 'declined', decisionRevision: 'rev-declined', grantId: null }),
+    }));
+
+    const client = createClient(mockRequest, tokenFile);
+    const adapter = new DecisionTransportAdapter({ client });
+
+    const result = await adapter.readDecisionAnswer({ ...query, requestId: 'req/../../secret' });
+
+    expect(result).toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+    });
+    expect(mockRequest).not.toHaveBeenCalled();
+  });
+
+  it('refuses an unsafe request id even when a matching injected answer exists', async () => {
+    const { publicKeyBase64, privateKey } = createOwnerKeyPair();
+    const signature = signDecision(
+      {
+        ...query,
+        requestId: '..',
+        decisionRevision: 'rev-1',
+        grantId: 'grant-1',
+        state: 'approved',
+      },
+      privateKey,
+    );
+
+    const adapter = new DecisionTransportAdapter({
+      ownerPublicKey: publicKeyBase64,
+      answers: {
+        '..': {
+          state: 'approved',
+          decisionRevision: 'rev-1',
+          grantId: 'grant-1',
+          signature,
+        },
+      },
+    });
+
+    const result = await adapter.readDecisionAnswer({ ...query, requestId: '..' });
+    expect(result).toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+    });
   });
 });

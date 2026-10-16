@@ -300,6 +300,7 @@ describe('loader policy enforcement', () => {
           transport: 'local',
           worktreeRoot: '/tmp/wt',
           roles: ['orchestrator', 'lane-runner', 'verifier'],
+          runner: { kind: 'opencode', port: 4166, maxLanes: 1 },
         },
       },
       seats: [

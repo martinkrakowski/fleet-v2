@@ -86,10 +86,22 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
           reason: 'Cannot merge without a configured acceptance evidence port',
         };
       }
-      const acceptance = await deps.acceptanceEvidencePort.readAcceptance({
-        attemptId: request.attemptId,
-        candidateHeadSha: request.expectedHeadSha,
-      });
+      let acceptance: Awaited<ReturnType<AcceptanceEvidencePort['readAcceptance']>>;
+      try {
+        acceptance = await deps.acceptanceEvidencePort.readAcceptance({
+          attemptId: request.attemptId,
+          candidateHeadSha: request.expectedHeadSha,
+        });
+      } catch (error: unknown) {
+        // An evidence read that fails is not an absent assessment: it is an
+        // unreadable one, and an unreadable assessment never merges.
+        return {
+          outcome: 'refused',
+          reason: `Cannot merge: acceptance evidence could not be read: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        };
+      }
       if (acceptance.outcome !== 'found') {
         return {
           outcome: 'refused',

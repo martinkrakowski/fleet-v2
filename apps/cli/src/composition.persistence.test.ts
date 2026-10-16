@@ -5,7 +5,39 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { EvidenceAssessmentRecord } from '@fleet/evidence-and-acceptance';
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
+import type { AttemptRecord } from '@fleet/work-execution';
 import { assessmentIdForAttempt, createFleetCliRuntime } from './composition.js';
+
+/**
+ * A collected attempt whose frozen brief named no one-way doors, so acceptance
+ * reads an empty door list instead of blocking on an unknown one.
+ */
+function collectedAttempt(attemptId: string, headSha: string): AttemptRecord {
+  return {
+    id: attemptId,
+    workOrderId: `wo-${attemptId}`,
+    kind: 'initial',
+    fixNumber: 0,
+    priorAttemptId: null,
+    state: 'collected',
+    outcome: 'done',
+    baseCommit: 'base-sha',
+    worktreePath: '/tmp/worktree',
+    briefDigest: 'digest-1',
+    briefPackagePath: null,
+    sessionId: null,
+    completionReceipt: null,
+    artifacts: {
+      headCommit: headSha,
+      commitsSinceBase: [headSha],
+      collectedArtifactPaths: [],
+      notes: 'present',
+    },
+    ownerDecisionReferences: [],
+    createdAtIso: '2026-10-15T09:00:00.000Z',
+    updatedAtIso: '2026-10-15T10:00:00.000Z',
+  };
+}
 
 describe('Fleet CLI composition root cross-process safe persistence', () => {
   let tempDir: string;
@@ -90,6 +122,12 @@ describe('Fleet CLI composition root cross-process safe persistence', () => {
 
     await runtimeA.evidence.evidenceAssessmentRepository.saveAssessment(assessmentA);
     await runtimeB.evidence.evidenceAssessmentRepository.saveAssessment(assessmentB);
+    await runtimeA.execution.attemptRepository.saveAttempt(
+      collectedAttempt('attempt-a', 'head-sha-a'),
+    );
+    await runtimeB.execution.attemptRepository.saveAttempt(
+      collectedAttempt('attempt-b', 'head-sha-b'),
+    );
 
     // Concurrently assess both attempts across runtime instances
     const [resultA, resultB] = await Promise.all([
@@ -254,6 +292,9 @@ describe('Fleet CLI composition root cross-process safe persistence', () => {
     };
 
     await runtime.evidence.evidenceAssessmentRepository.saveAssessment(assessment);
+    await runtime.execution.attemptRepository.saveAttempt(
+      collectedAttempt('attempt-corrupt', 'head-sha-corrupt'),
+    );
 
     await expect(
       runtime.execution.acceptanceAssessment.assessHeadAcceptance({

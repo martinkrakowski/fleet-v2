@@ -51,6 +51,7 @@ describe("API Security and Hardening", () => {
   let attemptGetHandler: EventHandler;
   let reconcilePostHandler: EventHandler;
   let stopPostHandler: EventHandler;
+  let assessmentPostHandler: EventHandler;
 
   beforeAll(async () => {
     for (const [key, value] of Object.entries(h3)) {
@@ -74,6 +75,9 @@ describe("API Security and Hardening", () => {
     attemptGetHandler = (await import("../server/routes/v1/attempts/[id].get.js")).default;
     reconcilePostHandler = (await import("../server/routes/v1/attempts/[id]/reconcile.post.js")).default;
     stopPostHandler = (await import("../server/routes/v1/attempts/[id]/stop.post.js")).default;
+    assessmentPostHandler = (
+      await import("../server/routes/v1/heads/[sha]/assessment.post.js")
+    ).default;
   });
 
   beforeEach(async () => {
@@ -98,6 +102,7 @@ describe("API Security and Hardening", () => {
     );
     const router = createRouter();
     router.post("/v1/attempts/:id/reconcile", reconcilePostHandler);
+    router.post("/v1/heads/:sha/assessment", assessmentPostHandler);
     router.get("/v1/attempts/:id", attemptGetHandler);
     router.post(
       "/v1/attempts/:id/stop",
@@ -425,6 +430,53 @@ describe("API Security and Hardening", () => {
         body: "foo=bar",
       });
       expect(res.status).toBe(401);
+    });
+  });
+
+  describe("assessment request boundary", () => {
+    it("refuses a body carrying ownerDecisionReferences with 400 and never assesses", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+
+      const res = await fetch(`${baseUrl}/v1/heads/${"a".repeat(40)}/assessment`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${VALID_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          assessmentId: "assessment-1",
+          policyRevision: "policy-1",
+          ownerDecisionReferences: ["door-chosen-by-caller"],
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = await res.json();
+      expect(JSON.stringify(data)).toContain("ownerDecisionReferences");
+    });
+
+    it("routes a body without references to the assessment use case", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+
+      const res = await fetch(`${baseUrl}/v1/heads/${"a".repeat(40)}/assessment`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${VALID_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          assessmentId: "assessment-1",
+          policyRevision: "policy-1",
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.operationId).toBe("AssessHeadAcceptance");
+      // An unknown assessment is rejected, never silently accepted.
+      expect(data.result).toMatchObject({ outcome: "rejected", reason: "Assessment not found" });
     });
   });
 

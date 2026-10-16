@@ -478,9 +478,9 @@ bounded_contexts:
         use_cases: [RequestVerificationUseCase, RequestIndependentReviewUseCase, RecordVerificationReceiptUseCase, RecordReviewReceiptUseCase, RecordFindingDispositionUseCase, AssessHeadAcceptanceUseCase, InspectAcceptanceEvidenceUseCase]
         ports:
           in: [RequestVerificationPort, RequestIndependentReviewPort, RecordVerificationReceiptPort, RecordReviewReceiptPort, RecordFindingDispositionPort, AssessHeadAcceptancePort, InspectAcceptanceEvidencePort]
-          out: [EvidenceAssessmentRepositoryPort, EvidenceArchivePort, VerificationExecutorPort, ForgeEvidencePort, IndependentReviewPort, OwnerDecisionPort]
+          out: [EvidenceAssessmentRepositoryPort, EvidenceArchivePort, VerificationExecutorPort, ForgeEvidencePort, IndependentReviewPort, OwnerDecisionPort, AttemptOwnerDecisionPort]
       infrastructure:
-        adapters: [EvidenceAssessmentRepositoryAdapter, EvidenceArchiveAdapter, VerificationExecutorAdapter, ForgeEvidenceAdapter, IndependentReviewAdapter, OwnerDecisionAdapter]
+        adapters: [EvidenceAssessmentRepositoryAdapter, EvidenceArchiveAdapter, VerificationExecutorAdapter, ForgeEvidenceAdapter, IndependentReviewAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter]
     contracts:
       RequestVerificationPort: "Request the required completed checks on configured verification hosts for a precise head and acceptance-policy revision."
       RequestIndependentReviewPort: "Request a read-only review using an underlying model distinct from the implementer's and bind its result to the reviewed head."
@@ -494,7 +494,8 @@ bounded_contexts:
       VerificationExecutorPort: "Run allow-listed checks on the configured verification host and return completed command receipts."
       ForgeEvidencePort: "Read current CI/check/thread status through the forge without opening, merging or mutating PRs."
       IndependentReviewPort: "Obtain an attributable read-only review from the configured independent seat; transport and provider selection belong to the adapter."
-      OwnerDecisionPort: "Resolve owner decision references through operator coordination before head acceptance."
+      OwnerDecisionPort: "Resolve owner decision references through operator coordination's CheckOwnerDecisionPort before head acceptance; an undecided, declined or unreadable decision blocks."
+      AttemptOwnerDecisionPort: "Read the owner decision references the product froze into an attempt's brief package; an attempt recorded without them is unknown and blocks acceptance."
     adapter_bindings:
       - { adapter: EvidenceAssessmentRepositoryAdapter, implements: EvidenceAssessmentRepositoryPort, integration: local-transactional-store }
       - { adapter: EvidenceArchiveAdapter, implements: EvidenceArchivePort, integration: immutable-artifact-files }
@@ -504,7 +505,11 @@ bounded_contexts:
       - adapter: OwnerDecisionAdapter
         implements: OwnerDecisionPort
         integration: in-process
-        delegates_to: [operator-coordination/InspectOutstandingCoordinationPort, operator-coordination/CoordinationRequestRepositoryPort]
+        delegates_to: [operator-coordination/CheckOwnerDecisionPort]
+      - adapter: AttemptOwnerDecisionAdapter
+        implements: AttemptOwnerDecisionPort
+        integration: in-process
+        delegates_to: [work-execution/InspectAttemptPort]
     domain_specification:
       aggregate_roots: [EvidenceAssessment]
       child_ownership: { VerificationReceipt: EvidenceAssessment, ReviewReceipt: EvidenceAssessment, FindingDisposition: EvidenceAssessment }
@@ -587,9 +592,9 @@ bounded_contexts:
         entities: [ProjectProfile, CoordinationRequest, AuthorizationConsumption, RelayAcknowledgement]
         value_objects: [CoordinationKind, CoordinationState, ActionAuthorization, PolicyReference, ObservationEnvelope]
       application:
-        use_cases: [RegisterProjectProfileUseCase, InspectConfiguredCapabilitiesUseCase, RequestScopedDecisionUseCase, ResolveActionAuthorizationUseCase, RecordAuthorizationConsumptionUseCase, PublishProjectObservationUseCase, ReadProjectAttentionUseCase, SendFleetRelayUseCase, RecordRelayAcknowledgementUseCase, InspectOutstandingCoordinationUseCase]
+        use_cases: [RegisterProjectProfileUseCase, InspectConfiguredCapabilitiesUseCase, RequestScopedDecisionUseCase, ResolveActionAuthorizationUseCase, CheckOwnerDecisionUseCase, RecordAuthorizationConsumptionUseCase, PublishProjectObservationUseCase, ReadProjectAttentionUseCase, SendFleetRelayUseCase, RecordRelayAcknowledgementUseCase, InspectOutstandingCoordinationUseCase]
         ports:
-          in: [RegisterProjectProfilePort, InspectConfiguredCapabilitiesPort, RequestScopedDecisionPort, ResolveActionAuthorizationPort, RecordAuthorizationConsumptionPort, PublishProjectObservationPort, ReadProjectAttentionPort, SendFleetRelayPort, RecordRelayAcknowledgementPort, InspectOutstandingCoordinationPort]
+          in: [RegisterProjectProfilePort, InspectConfiguredCapabilitiesPort, RequestScopedDecisionPort, ResolveActionAuthorizationPort, CheckOwnerDecisionPort, RecordAuthorizationConsumptionPort, PublishProjectObservationPort, ReadProjectAttentionPort, SendFleetRelayPort, RecordRelayAcknowledgementPort, InspectOutstandingCoordinationPort]
           out: [ProjectProfileRepositoryPort, CoordinationRequestRepositoryPort, DecisionTransportPort, ObservationPublicationPort, AttentionReadPort, RelayTransportPort]
       infrastructure:
         adapters: [ProjectProfileRepositoryAdapter, CoordinationRequestRepositoryAdapter, DecisionTransportAdapter, ObservationPublicationAdapter, AttentionReadAdapter, RelayTransportAdapter]
@@ -598,6 +603,7 @@ bounded_contexts:
       InspectConfiguredCapabilitiesPort: "Report the configured runner and integration capabilities, missing requirements and explicit unknowns."
       RequestScopedDecisionPort: "Record the exact proposal, expected revision and action scope before asking its authorized decider."
       ResolveActionAuthorizationPort: "Return an applicable grant from approved policy or a verified scoped decision; pending or ambiguous authority remains blocked."
+      CheckOwnerDecisionPort: "Report whether one recorded coordination request authorizes its own owner decision at an exact candidate head; unreadable is unknown and neither unknown nor not-approved is an approval."
       RecordAuthorizationConsumptionPort: "Durably bind a grant to an action ID and retain reconciliation receipts without authorizing a second unrelated action."
       PublishProjectObservationPort: "Publish the owning project's explicit events and derived facts while preserving disagreements and delivery failures."
       ReadProjectAttentionPort: "Read bounded attention/staleness summaries without rewriting another project's observations."
@@ -633,9 +639,10 @@ bounded_contexts:
 
 context_mappings:
   - { upstream: evidence-and-acceptance, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "AcceptanceAssessmentAdapter delegates to supplier-owned application ports; dependency is declared on work-execution." }
+  - { upstream: work-execution, downstream: evidence-and-acceptance, pattern: OHS, mechanism: in-process-application-contract, notes: "AttemptOwnerDecisionAdapter delegates to supplier-owned InspectAttemptPort so acceptance reads the frozen one-way doors from the attempt record, never from a request body or worktree file; the dependency is declared on work-execution." }
   - { upstream: brief-knowledge, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "BriefKnowledgeAdapter delegates to supplier-owned context-selection and completed-note ingestion ports." }
   - { upstream: operator-coordination, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "ActionAuthorizationAdapter and ExecutionObservationAdapter delegate to supplier-owned authorization and publication ports." }
-  - { upstream: operator-coordination, downstream: evidence-and-acceptance, pattern: OHS, mechanism: in-process-application-contract, notes: "OwnerDecisionAdapter delegates to supplier-owned coordination request inspection ports." }
+  - { upstream: operator-coordination, downstream: evidence-and-acceptance, pattern: OHS, mechanism: in-process-application-contract, notes: "OwnerDecisionAdapter delegates to the supplier-owned CheckOwnerDecisionPort, never to its repository; the recorded request's own authorization rule decides." }
 
 agent_instructions:
   product_identity: "The process persists; workers are disposable. Memory travels in the brief, not the model call."

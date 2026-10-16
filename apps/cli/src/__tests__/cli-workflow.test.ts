@@ -1195,6 +1195,39 @@ describe('Fleet CLI workflow', () => {
     expect(jsonOf(notFoundEvidence)).toEqual({ outcome: 'not-found', query: '' });
   });
 
+  it('refuses an evidence assess that carries owner decision references', async () => {
+    // Owner decisions are read from the attempt record; a caller may not name
+    // the one-way doors it is being judged against.
+    const withReferences = await cli([
+      'evidence',
+      'assess',
+      '--json',
+      jsonArg({
+        assessmentId: 'assessment-1',
+        candidateHeadSha: laneHead,
+        policyRevision: POLICY_REVISION,
+        ownerDecisionReferences: ['door-chosen-by-caller'],
+      }),
+    ]);
+    expect(withReferences.code).toBe(2);
+    expect(withReferences.stderr).toContain("'--ownerDecisionReferences' is forbidden");
+
+    const withFlag = await cli([
+      'evidence',
+      'assess',
+      '--ownerDecisionReferences',
+      'door-chosen-by-caller',
+      '--json',
+      jsonArg({
+        assessmentId: 'assessment-1',
+        candidateHeadSha: laneHead,
+        policyRevision: POLICY_REVISION,
+      }),
+    ]);
+    expect(withFlag.code).toBe(2);
+    expect(withFlag.stderr).toContain("'--ownerDecisionReferences' is forbidden");
+  });
+
   it('completes the merge across separate runCli processes on one state dir', async () => {
     // Cutover pilot: every invocation below omits the injected `runtime`
     // argument, so each command composes a brand-new FleetCliRuntime loaded

@@ -12,7 +12,10 @@ import {
   forgeActionScope,
   observationEventKind,
 } from "@fleet/work-execution";
-import type { InspectWorkOrderUseCase } from "@fleet/work-execution/use-cases";
+import type {
+  InspectAttemptUseCase,
+  InspectWorkOrderUseCase,
+} from "@fleet/work-execution/use-cases";
 
 import type { FleetInstallation } from "@fleet/installation";
 
@@ -200,29 +203,53 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   const installation = options?.installation;
   const operator = createConfiguredOperatorComposition({ stateDir, ownerPublicKey });
   const knowledge = createConfiguredKnowledgeComposition({ stateDir });
+  // The attempt lookup below is filled in once the work composition exists;
+  // the evidence delegates only run at assessment time.
+  const attemptLookup: { inspectAttempt?: InspectAttemptUseCase } = {};
   const evidence = createConfiguredEvidenceUseCases(
     { stateDir },
     {
       ownerDecision: {
-        resolveOwnerDecision: async (request) => {
-          let req = await operator.coordinationRequestRepository.findRequestById(request.decisionReference);
-          if (req === null) {
-            req = await operator.coordinationRequestRepository.findRequestByGrantId(request.decisionReference);
-          }
-          if (req === null) {
+        // The coordination request's own authorization rule decides; this
+        // delegate calls the supplier's application port, never its repository.
+        checkOwnerDecision: async (request) => {
+          const result = await operator.checkOwnerDecision.checkOwnerDecision({
+            requestId: request.requestId,
+            candidateHeadSha: request.candidateHeadSha,
+          });
+          return result.outcome === "approved"
+            ? { outcome: "approved", decisionId: result.requestId }
+            : result;
+        },
+      },
+      attemptOwnerDecision: {
+        // The doors come from the attempt record dispatch wrote from the
+        // frozen brief package, never from a request body or worktree file.
+        readAttemptOwnerDecisionReferences: async (request) => {
+          const inspectAttempt = attemptLookup.inspectAttempt;
+          if (!inspectAttempt) {
             return {
-              outcome: "unresolvable",
-              reason: `No coordination request found for reference '${request.decisionReference}'`,
+              outcome: "unknown",
+              reason: "The work context is not wired for attempt inspection",
             };
           }
-          return {
-            outcome: "resolved",
-            decision: {
-              id: req.id,
-              state: req.state,
-              expectedHeadSha: req.expectedHeadSha,
-            },
-          };
+          const inspection = await inspectAttempt.inspectAttempt({
+            attemptId: request.attemptId,
+          });
+          if (inspection.outcome !== "found") {
+            return {
+              outcome: "unknown",
+              reason: `No attempt is recorded for ${request.attemptId}`,
+            };
+          }
+          const recorded = inspection.attempt.ownerDecisionReferences;
+          if (recorded === undefined) {
+            return {
+              outcome: "unknown",
+              reason: `attempt ${request.attemptId} was recorded before owner decision references were frozen`,
+            };
+          }
+          return { outcome: "recorded", ownerDecisionReferences: recorded };
         },
       },
     },
@@ -440,11 +467,8 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
             candidateHeadSha: request.candidateHeadSha,
           });
         }
-        if (inspected.outcome === "not-found") {
-          inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
-            candidateHeadSha: request.candidateHeadSha,
-          });
-        }
+        // No head-only fallback: an assessment that is not bound to this
+        // attempt is another attempt's evidence, and this attempt has none.
         if (inspected.outcome === "found") {
           return {
             outcome: "found",
@@ -482,6 +506,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
 
   const work = createConfiguredWorkComposition({ stateDir, installation }, crossContext);
   workLookup.inspectWorkOrder = work.inspectWorkOrder;
+  attemptLookup.inspectAttempt = work.inspectAttempt;
 
   configureOperatorComposition(operator);
   configureKnowledgeComposition(knowledge);

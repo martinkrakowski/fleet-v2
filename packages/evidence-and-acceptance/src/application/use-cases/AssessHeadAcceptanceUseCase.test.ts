@@ -6,6 +6,11 @@ import type {
   OwnerDecisionResult,
   ResolveOwnerDecisionRequest,
 } from '../ports/out/OwnerDecisionPort.out-port.js';
+import type {
+  AttemptOwnerDecisionPort,
+  AttemptOwnerDecisionResult,
+  ReadAttemptOwnerDecisionRequest,
+} from '../ports/out/AttemptOwnerDecisionPort.out-port.js';
 import { AssessHeadAcceptanceUseCase } from './AssessHeadAcceptanceUseCase.use-case.js';
 
 class InMemoryEvidenceAssessmentRepo implements EvidenceAssessmentRepositoryPort {
@@ -27,10 +32,33 @@ class InMemoryEvidenceAssessmentRepo implements EvidenceAssessmentRepositoryPort
 }
 
 class InMemoryOwnerDecisionPort implements OwnerDecisionPort {
+  readonly requests: ResolveOwnerDecisionRequest[] = [];
+
   constructor(private readonly result: OwnerDecisionResult) {}
 
-  async resolveOwnerDecision(_request: ResolveOwnerDecisionRequest): Promise<OwnerDecisionResult> {
+  async resolveOwnerDecision(request: ResolveOwnerDecisionRequest): Promise<OwnerDecisionResult> {
+    this.requests.push(request);
     return this.result;
+  }
+}
+
+/** The frozen doors recorded on the attempt at dispatch. */
+class InMemoryAttemptOwnerDecisionPort implements AttemptOwnerDecisionPort {
+  readonly requests: ReadAttemptOwnerDecisionRequest[] = [];
+
+  constructor(private readonly result: AttemptOwnerDecisionResult) {}
+
+  async readAttemptOwnerDecisionReferences(
+    request: ReadAttemptOwnerDecisionRequest,
+  ): Promise<AttemptOwnerDecisionResult> {
+    this.requests.push(request);
+    return this.result;
+  }
+}
+
+class ThrowingAttemptOwnerDecisionPort implements AttemptOwnerDecisionPort {
+  async readAttemptOwnerDecisionReferences(): Promise<AttemptOwnerDecisionResult> {
+    throw new Error('attempt store is unreadable');
   }
 }
 
@@ -72,177 +100,306 @@ function makePassingAssessmentRecord(
   };
 }
 
+const CANDIDATE_HEAD = '1111111111111111111111111111111111111111';
+
 describe('AssessHeadAcceptanceUseCase (M15: Owner Decision / One-Way Door)', () => {
-  const candidateHeadSha = '1111111111111111111111111111111111111111';
+  const request = {
+    assessmentId: 'assessment-att-1',
+    candidateHeadSha: CANDIDATE_HEAD,
+    policyRevision: 'pol-1',
+  };
 
-  it('undecided one-way door -> acceptance blocked', async () => {
+  it('records no owner decisions and accepts the exact head', async () => {
     const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
+    const attemptDoors = new InMemoryAttemptOwnerDecisionPort({
+      outcome: 'recorded',
+      ownerDecisionReferences: [],
+    });
     const ownerDecisionPort = new InMemoryOwnerDecisionPort({
-      outcome: 'resolved',
-      decision: {
-        id: 'req-door-1',
-        state: 'awaiting-decision',
-        expectedHeadSha: candidateHeadSha,
-      },
+      outcome: 'approved',
+      decisionId: 'door-1',
     });
 
-    const useCase = new AssessHeadAcceptanceUseCase({
-      repo,
-      ownerDecisionPort,
-    });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, ownerDecisionPort, attemptOwnerDecisionPort: attemptDoors });
+    const result = await useCase.assessHeadAcceptance(request);
 
-    const result = await useCase.assessHeadAcceptance({
-      assessmentId: 'assessment-att-1',
-      candidateHeadSha,
-      policyRevision: 'pol-1',
-      ownerDecisionReferences: ['door-1'],
-    });
-
-    expect(result.outcome).toBe('blocked');
-    if (result.outcome === 'blocked') {
-      expect(result.blockers.some((b) => b.includes("state 'awaiting-decision', not 'approved'"))).toBe(true);
+    expect(result.outcome).toBe('accepted');
+    if (result.outcome === 'accepted') {
+      expect(result.candidateHeadSha).toBe(CANDIDATE_HEAD);
+      expect(result.receiptId).toContain('acc-assessment-att-1-');
     }
-    expect(repo.assessment?.state).toBe('blocked');
+    expect(repo.assessment?.state).toBe('accepted');
+    expect(attemptDoors.requests).toEqual([{ attemptId: 'att-1' }]);
+    expect(ownerDecisionPort.requests).toHaveLength(0);
   });
 
-  it('unresolvable one-way door -> acceptance blocked', async () => {
+  it('decided one-way door for the candidate head -> acceptance passes', async () => {
     const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
     const ownerDecisionPort = new InMemoryOwnerDecisionPort({
-      outcome: 'unresolvable',
-      reason: 'No coordination request found for reference door-missing',
+      outcome: 'approved',
+      decisionId: 'door-1',
     });
 
     const useCase = new AssessHeadAcceptanceUseCase({
       repo,
       ownerDecisionPort,
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: ['door-1'],
+      }),
     });
 
-    const result = await useCase.assessHeadAcceptance({
-      assessmentId: 'assessment-att-1',
-      candidateHeadSha,
-      policyRevision: 'pol-1',
-      ownerDecisionReferences: ['door-missing'],
-    });
+    const result = await useCase.assessHeadAcceptance(request);
 
-    expect(result.outcome).toBe('blocked');
-    if (result.outcome === 'blocked') {
-      expect(result.blockers.some((b) => b.includes('could not be resolved'))).toBe(true);
-    }
-    expect(repo.assessment?.state).toBe('blocked');
+    expect(result.outcome).toBe('accepted');
+    expect(ownerDecisionPort.requests).toEqual([
+      { decisionReference: 'door-1', candidateHeadSha: CANDIDATE_HEAD },
+    ]);
+    expect(repo.assessment?.state).toBe('accepted');
   });
 
-  it('unknown one-way door -> acceptance blocked', async () => {
+  it('a declined one-way door -> acceptance blocked', async () => {
     const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
     const ownerDecisionPort = new InMemoryOwnerDecisionPort({
-      outcome: 'unknown',
-      reason: 'Transport unreachable',
+      outcome: 'not-approved',
+      reason: "coordination request door-1 is 'declined'",
     });
 
     const useCase = new AssessHeadAcceptanceUseCase({
       repo,
       ownerDecisionPort,
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: ['door-1'],
+      }),
     });
 
-    const result = await useCase.assessHeadAcceptance({
-      assessmentId: 'assessment-att-1',
-      candidateHeadSha,
-      policyRevision: 'pol-1',
-      ownerDecisionReferences: ['door-unknown'],
-    });
-
-    expect(result.outcome).toBe('blocked');
-    if (result.outcome === 'blocked') {
-      expect(result.blockers.some((b) => b.includes('is unknown: Transport unreachable'))).toBe(true);
-    }
-    expect(repo.assessment?.state).toBe('blocked');
-  });
-
-  it('one-way door approved for wrong head -> acceptance blocked', async () => {
-    const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
-    const ownerDecisionPort = new InMemoryOwnerDecisionPort({
-      outcome: 'resolved',
-      decision: {
-        id: 'req-door-1',
-        state: 'approved',
-        expectedHeadSha: '9999999999999999999999999999999999999999',
-      },
-    });
-
-    const useCase = new AssessHeadAcceptanceUseCase({
-      repo,
-      ownerDecisionPort,
-    });
-
-    const result = await useCase.assessHeadAcceptance({
-      assessmentId: 'assessment-att-1',
-      candidateHeadSha,
-      policyRevision: 'pol-1',
-      ownerDecisionReferences: ['door-1'],
-    });
+    const result = await useCase.assessHeadAcceptance(request);
 
     expect(result.outcome).toBe('blocked');
     if (result.outcome === 'blocked') {
       expect(
-        result.blockers.some((b) =>
-          b.includes("was approved for head '9999999999999999999999999999999999999999', not candidate head '1111111111111111111111111111111111111111'"),
+        result.blockers.some((blocker) =>
+          blocker.includes("owner decision 'door-1' is not approved: coordination request door-1 is 'declined'"),
         ),
       ).toBe(true);
     }
     expect(repo.assessment?.state).toBe('blocked');
   });
 
-  it('unconfigured ownerDecisionPort with door references -> acceptance blocked', async () => {
-    const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
-    const useCase = new AssessHeadAcceptanceUseCase({
-      repo,
-      // ownerDecisionPort omitted
-    });
-
-    const result = await useCase.assessHeadAcceptance({
-      assessmentId: 'assessment-att-1',
-      candidateHeadSha,
-      policyRevision: 'pol-1',
-      ownerDecisionReferences: ['door-1'],
-    });
-
-    expect(result.outcome).toBe('blocked');
-    if (result.outcome === 'blocked') {
-      expect(result.blockers.some((b) => b.includes("owner decision 'door-1' could not be resolved"))).toBe(
-        true,
-      );
-    }
-    expect(repo.assessment?.state).toBe('blocked');
-  });
-
-  it('decided one-way door (approved for candidate head) -> acceptance passes', async () => {
+  it('an undecided one-way door -> acceptance blocked', async () => {
     const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
     const ownerDecisionPort = new InMemoryOwnerDecisionPort({
-      outcome: 'resolved',
-      decision: {
-        id: 'req-door-1',
-        state: 'approved',
-        expectedHeadSha: candidateHeadSha,
-      },
+      outcome: 'not-approved',
+      reason: "coordination request door-1 is 'awaiting-decision'",
     });
 
     const useCase = new AssessHeadAcceptanceUseCase({
       repo,
       ownerDecisionPort,
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: ['door-1'],
+      }),
     });
 
-    const result = await useCase.assessHeadAcceptance({
-      assessmentId: 'assessment-att-1',
-      candidateHeadSha,
-      policyRevision: 'pol-1',
-      ownerDecisionReferences: ['door-1'],
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockers.some((blocker) => blocker.includes("'awaiting-decision'"))).toBe(true);
+    }
+    expect(repo.assessment?.state).toBe('blocked');
+  });
+
+  it('an approval recorded for another scope on the same head -> acceptance blocked', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
+    const ownerDecisionPort = new InMemoryOwnerDecisionPort({
+      outcome: 'not-approved',
+      reason:
+        "coordination request door-1 is 'approved' for scope 'forge:merge-pr' at " +
+        `${CANDIDATE_HEAD}; it does not authorize owner-decision:door-1 at ${CANDIDATE_HEAD}`,
     });
+
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      ownerDecisionPort,
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: ['door-1'],
+      }),
+    });
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    expect(ownerDecisionPort.requests).toHaveLength(1);
+    expect(repo.assessment?.state).toBe('blocked');
+  });
+
+  it('an unknown one-way door -> acceptance blocked', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
+    const ownerDecisionPort = new InMemoryOwnerDecisionPort({
+      outcome: 'unknown',
+      reason: 'No coordination request is recorded for owner decision door-unknown',
+    });
+
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      ownerDecisionPort,
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: ['door-unknown'],
+      }),
+    });
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(
+        result.blockers.some((blocker) =>
+          blocker.includes("owner decision 'door-unknown' is unknown: No coordination request is recorded"),
+        ),
+      ).toBe(true);
+    }
+    expect(repo.assessment?.state).toBe('blocked');
+  });
+
+  it('an old attempt recorded without owner decision references -> acceptance blocked', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      ownerDecisionPort: new InMemoryOwnerDecisionPort({ outcome: 'approved', decisionId: 'door-1' }),
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'unknown',
+        reason: 'attempt att-1 was recorded before owner decision references were frozen',
+      }),
+    });
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(
+        result.blockers.some((blocker) =>
+          blocker.includes("owner decision references for attempt 'att-1' are unknown"),
+        ),
+      ).toBe(true);
+    }
+    expect(repo.assessment?.state).toBe('blocked');
+  });
+
+  it('an unreadable attempt record -> acceptance blocked, never an empty door list', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      ownerDecisionPort: new InMemoryOwnerDecisionPort({ outcome: 'approved', decisionId: 'door-1' }),
+      attemptOwnerDecisionPort: new ThrowingAttemptOwnerDecisionPort(),
+    });
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(
+        result.blockers.some((blocker) =>
+          blocker.includes('could not be read: attempt store is unreadable'),
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it('an unconfigured attempt owner decision port -> acceptance blocked', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      ownerDecisionPort: new InMemoryOwnerDecisionPort({ outcome: 'approved', decisionId: 'door-1' }),
+    });
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(
+        result.blockers.some((blocker) =>
+          blocker.includes('no attempt owner decision port is configured'),
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it('an already accepted assessment with a newly undecided door -> blocked, not the stored acceptance', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(
+      makePassingAssessmentRecord({
+        state: 'accepted',
+        acceptanceReceiptId: 'acc-assessment-att-1-11111111',
+      }),
+    );
+    const ownerDecisionPort = new InMemoryOwnerDecisionPort({
+      outcome: 'not-approved',
+      reason: "coordination request door-1 is 'awaiting-decision'",
+    });
+
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      ownerDecisionPort,
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: ['door-1'],
+      }),
+    });
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    expect(repo.assessment?.state).toBe('blocked');
+    expect(repo.assessment?.acceptanceReceiptId).toBeNull();
+  });
+
+  it('an already accepted assessment with every door approved -> the stored acceptance', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(
+      makePassingAssessmentRecord({
+        state: 'accepted',
+        acceptanceReceiptId: 'acc-assessment-att-1-11111111',
+      }),
+    );
+
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      ownerDecisionPort: new InMemoryOwnerDecisionPort({ outcome: 'approved', decisionId: 'door-1' }),
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: ['door-1'],
+      }),
+    });
+
+    const result = await useCase.assessHeadAcceptance(request);
 
     expect(result.outcome).toBe('accepted');
     if (result.outcome === 'accepted') {
-      expect(result.candidateHeadSha).toBe(candidateHeadSha);
-      expect(result.receiptId).toContain('acc-assessment-att-1-');
+      expect(result.receiptId).toBe('acc-assessment-att-1-11111111');
     }
-    expect(repo.assessment?.state).toBe('accepted');
-    expect(repo.assessment?.acceptanceReceiptId).not.toBeNull();
+  });
+
+  it('a request carrying owner decision references is rejected', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord());
+    const attemptDoors = new InMemoryAttemptOwnerDecisionPort({
+      outcome: 'recorded',
+      ownerDecisionReferences: [],
+    });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: attemptDoors });
+
+    const result = await useCase.execute({
+      ...request,
+      ownerDecisionReferences: ['door-chosen-by-caller'],
+    });
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason:
+        "'ownerDecisionReferences' must not be supplied; owner decisions are read from the attempt record",
+    });
+    expect(attemptDoors.requests).toHaveLength(0);
   });
 });

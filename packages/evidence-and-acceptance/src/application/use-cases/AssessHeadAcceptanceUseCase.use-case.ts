@@ -1,9 +1,16 @@
 // @generated use-case scaffold — refined for step 4.
 /**
  * AssessHeadAcceptanceUseCase evaluates every required check, the independent
- * review and the forge state against one exact head, then issues a scoped
- * acceptance receipt or an explicit blocker list. It never merges: a changed
- * head or policy revision makes prior evidence stale instead of accepted.
+ * review, the forge state and the attempt's one-way doors against one exact
+ * head, then issues a scoped acceptance receipt or an explicit blocker list. It
+ * never merges: a changed head or policy revision makes prior evidence stale
+ * instead of accepted.
+ *
+ * Owner decision references are read from the attempt record through
+ * AttemptOwnerDecisionPort, never from the request, and every reference is
+ * resolved through OwnerDecisionPort. The door check runs before a stored
+ * acceptance is returned, so "already accepted" is never an early return past
+ * a door that is now undecided, unknown or unreadable.
  */
 
 import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain/evidence-records.js';
@@ -11,7 +18,7 @@ import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js'
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { ForgeEvidencePort } from '../ports/out/ForgeEvidencePort.out-port.js';
 import type { OwnerDecisionPort } from '../ports/out/OwnerDecisionPort.out-port.js';
-import type { AssessmentStateValue } from '../../domain/value-objects/AssessmentState.vo.js';
+import type { AttemptOwnerDecisionPort } from '../ports/out/AttemptOwnerDecisionPort.out-port.js';
 import type {
   AssessHeadAcceptancePort,
   AssessHeadAcceptanceRequest,
@@ -22,6 +29,8 @@ export interface AssessHeadAcceptanceDependencies {
   readonly repo: EvidenceAssessmentRepositoryPort;
   readonly forgeEvidence?: ForgeEvidencePort;
   readonly ownerDecisionPort?: OwnerDecisionPort;
+  /** Reads the one-way doors the frozen brief named for this attempt. */
+  readonly attemptOwnerDecisionPort?: AttemptOwnerDecisionPort;
 }
 
 const NOT_IMPLEMENTED = 'Not implemented: AssessHeadAcceptanceUseCase';
@@ -30,6 +39,10 @@ const PASSING_RESULTS: readonly string[] = ['pass', 'not-applicable'];
 
 function isNonEmptyTrimmedString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** Required checks without a completed, passing receipt for this exact head. */
@@ -109,6 +122,17 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
     }
     const deps = this.deps;
 
+    // Owner decision references are never a request field: a caller that
+    // supplies them is naming the doors it is judged against, which is refused
+    // rather than honoured.
+    if ('ownerDecisionReferences' in (request as unknown as Record<string, unknown>)) {
+      return {
+        outcome: 'rejected',
+        reason:
+          "'ownerDecisionReferences' must not be supplied; owner decisions are read from the attempt record",
+      };
+    }
+
     if (
       !isNonEmptyTrimmedString(request.assessmentId) ||
       !isNonEmptyTrimmedString(request.candidateHeadSha) ||
@@ -130,23 +154,6 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
     if (assessment.state === 'stale') {
       return { outcome: 'stale', reason: 'Assessment is stale and cannot be accepted' };
     }
-    if (assessment.state === 'accepted') {
-      if (
-        assessment.candidateHeadSha === request.candidateHeadSha &&
-        assessment.policyRevision === request.policyRevision
-      ) {
-        return {
-          outcome: 'accepted',
-          receiptId: assessment.acceptanceReceiptId ?? '',
-          candidateHeadSha: assessment.candidateHeadSha,
-          assessment,
-        };
-      }
-      return {
-        outcome: 'rejected',
-        reason: `Assessment is already in terminal state '${assessment.state}'`,
-      };
-    }
     if (assessment.state === 'rejected') {
       return {
         outcome: 'rejected',
@@ -158,13 +165,37 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
     // far; it never carries over as acceptance.
     const policyChanged = assessment.policyRevision !== request.policyRevision;
     if (assessment.candidateHeadSha !== request.candidateHeadSha || policyChanged) {
+      if (assessment.state === 'accepted') {
+        return {
+          outcome: 'rejected',
+          reason: `Assessment is already in terminal state '${assessment.state}'`,
+        };
+      }
       const aggregate = EvidenceAssessment.fromRecord(assessment);
       aggregate.markStale(nowIso);
       await deps.repo.saveAssessment(aggregate.toRecord());
       return { outcome: 'stale', reason: 'Candidate head or policy revision changed' };
     }
 
+    // One-way doors are checked before a stored acceptance is returned: an
+    // idempotent "already accepted" read is not a way past a door that is now
+    // undecided, unknown or unreadable.
+    const doorBlockers = await this.collectOwnerDecisionBlockers(assessment);
+
+    if (assessment.state === 'accepted') {
+      if (doorBlockers.length > 0) {
+        return await this.block(deps, assessment, doorBlockers, nowIso);
+      }
+      return {
+        outcome: 'accepted',
+        receiptId: assessment.acceptanceReceiptId ?? '',
+        candidateHeadSha: assessment.candidateHeadSha,
+        assessment,
+      };
+    }
+
     const blockers: string[] = [
+      ...doorBlockers,
       ...collectCheckBlockers(assessment),
       ...collectReviewBlockers(assessment),
       ...collectFindingBlockers(assessment),
@@ -186,59 +217,12 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       }
     }
 
-    if (
-      Array.isArray(request.ownerDecisionReferences) &&
-      request.ownerDecisionReferences.length > 0
-    ) {
-      for (const ref of request.ownerDecisionReferences) {
-        if (!deps.ownerDecisionPort) {
-          blockers.push(`owner decision '${ref}' could not be resolved`);
-          continue;
-        }
-        try {
-          const decisionResult = await deps.ownerDecisionPort.resolveOwnerDecision({
-            decisionReference: ref,
-            candidateHeadSha: assessment.candidateHeadSha,
-          });
-          if (decisionResult.outcome === 'unresolvable') {
-            blockers.push(`owner decision '${ref}' could not be resolved: ${decisionResult.reason}`);
-          } else if (decisionResult.outcome === 'unknown') {
-            blockers.push(`owner decision '${ref}' is unknown: ${decisionResult.reason}`);
-          } else if (decisionResult.outcome === 'resolved') {
-            const decision = decisionResult.decision;
-            if (decision.state !== 'approved') {
-              blockers.push(
-                `owner decision '${ref}' is in state '${decision.state}', not 'approved'`,
-              );
-            } else if (decision.expectedHeadSha !== assessment.candidateHeadSha) {
-              blockers.push(
-                `owner decision '${ref}' was approved for head '${decision.expectedHeadSha}', not candidate head '${assessment.candidateHeadSha}'`,
-              );
-            }
-          } else {
-            blockers.push(`owner decision '${ref}' could not be resolved`);
-          }
-        } catch (error: unknown) {
-          blockers.push(
-            `owner decision '${ref}' could not be resolved: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      }
-    }
-
-    const aggregate = EvidenceAssessment.fromRecord(assessment);
     if (blockers.length > 0) {
-      aggregate.block(blockers, nowIso);
-      const updated: EvidenceAssessmentRecord = {
-        ...aggregate.toRecord(),
-        acceptanceReceiptId: null,
-        state: 'blocked' as AssessmentStateValue,
-      };
-      await deps.repo.saveAssessment(updated);
-      return { outcome: 'blocked', blockers, assessment: updated };
+      return await this.block(deps, assessment, blockers, nowIso);
     }
 
     const receiptId = `acc-${assessment.id}-${assessment.candidateHeadSha.slice(0, 8)}`;
+    const aggregate = EvidenceAssessment.fromRecord(assessment);
     aggregate.accept(receiptId, nowIso);
     const accepted = aggregate.toRecord();
     await deps.repo.saveAssessment(accepted);
@@ -248,5 +232,83 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       candidateHeadSha: assessment.candidateHeadSha,
       assessment: accepted,
     };
+  }
+
+  /**
+   * The doors frozen in the attempt's brief package, resolved against this
+   * exact head. Anything unreadable, unrecorded or unresolved is a blocker:
+   * a door that cannot be seen open has not been shown open.
+   */
+  private async collectOwnerDecisionBlockers(
+    assessment: EvidenceAssessmentRecord,
+  ): Promise<readonly string[]> {
+    const deps = this.deps;
+    if (deps === undefined) {
+      return ['owner decision references could not be read: the station is unconfigured'];
+    }
+    if (deps.attemptOwnerDecisionPort === undefined) {
+      return [
+        `owner decision references for attempt '${assessment.attemptId}' could not be read: no attempt owner decision port is configured`,
+      ];
+    }
+    let recorded: Awaited<
+      ReturnType<AttemptOwnerDecisionPort['readAttemptOwnerDecisionReferences']>
+    >;
+    try {
+      recorded = await deps.attemptOwnerDecisionPort.readAttemptOwnerDecisionReferences({
+        attemptId: assessment.attemptId,
+      });
+    } catch (error: unknown) {
+      return [
+        `owner decision references for attempt '${assessment.attemptId}' could not be read: ${describeError(error)}`,
+      ];
+    }
+    if (recorded.outcome === 'unknown') {
+      return [
+        `owner decision references for attempt '${assessment.attemptId}' are unknown: ${recorded.reason}`,
+      ];
+    }
+
+    const blockers: string[] = [];
+    for (const reference of recorded.ownerDecisionReferences) {
+      if (!isNonEmptyTrimmedString(reference)) {
+        blockers.push(`attempt '${assessment.attemptId}' records an empty owner decision reference`);
+        continue;
+      }
+      if (deps.ownerDecisionPort === undefined) {
+        blockers.push(`owner decision '${reference}' could not be resolved: no owner decision port is configured`);
+        continue;
+      }
+      try {
+        const decision = await deps.ownerDecisionPort.resolveOwnerDecision({
+          decisionReference: reference,
+          candidateHeadSha: assessment.candidateHeadSha,
+        });
+        if (decision.outcome === 'not-approved') {
+          blockers.push(`owner decision '${reference}' is not approved: ${decision.reason}`);
+        } else if (decision.outcome === 'unknown') {
+          blockers.push(`owner decision '${reference}' is unknown: ${decision.reason}`);
+        }
+      } catch (error: unknown) {
+        blockers.push(
+          `owner decision '${reference}' could not be resolved: ${describeError(error)}`,
+        );
+      }
+    }
+    return blockers;
+  }
+
+  /** Record the explicit blocker list and hold the assessment open. */
+  private async block(
+    deps: AssessHeadAcceptanceDependencies,
+    assessment: EvidenceAssessmentRecord,
+    blockers: readonly string[],
+    nowIso: string,
+  ): Promise<AssessHeadAcceptanceResult> {
+    const aggregate = EvidenceAssessment.fromRecord(assessment);
+    aggregate.block(blockers, nowIso);
+    const updated = aggregate.toRecord();
+    await deps.repo.saveAssessment(updated);
+    return { outcome: 'blocked', blockers, assessment: updated };
   }
 }

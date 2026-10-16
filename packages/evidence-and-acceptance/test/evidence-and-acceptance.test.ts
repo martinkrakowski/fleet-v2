@@ -20,6 +20,14 @@ import {
   IndependentReviewAdapter,
   VerificationExecutorAdapter,
 } from '../src/infrastructure/adapters/index.js';
+import type { AttemptOwnerDecisionPort } from '../src/application/ports/out/AttemptOwnerDecisionPort.out-port.js';
+
+/** An attempt whose frozen brief named no owner decisions. */
+const noOwnerDecisions: AttemptOwnerDecisionPort = {
+  async readAttemptOwnerDecisionReferences() {
+    return { outcome: 'recorded', ownerDecisionReferences: [] };
+  },
+};
 
 function makeAssessmentRecord(overrides: Partial<EvidenceAssessmentRecord> = {}): EvidenceAssessmentRecord {
   return {
@@ -302,7 +310,7 @@ describe('Fix 1 required lifecycle scenario', () => {
     const policy = 'policy-v1';
 
     const repo = new EvidenceAssessmentRepositoryAdapter();
-    const assessUseCase = new AssessHeadAcceptanceUseCase({ repo });
+    const assessUseCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: noOwnerDecisions });
     const recordVerificationUseCase = new RecordVerificationReceiptUseCase({ repo });
 
     // Assessment pending at head H
@@ -405,7 +413,7 @@ describe('Fix 2: Re-assessing an already-accepted head with the same head and po
     const storedReceipt = 'acc-stored-receipt-999';
 
     const repo = new EvidenceAssessmentRepositoryAdapter();
-    const assessUseCase = new AssessHeadAcceptanceUseCase({ repo });
+    const assessUseCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: noOwnerDecisions });
 
     const acceptedRecord = makeAssessmentRecord({
       id: 'asmt-idempotent-accept',

@@ -1,5 +1,6 @@
 import {
   AttentionReadAdapter,
+  CheckOwnerDecisionUseCase,
   CoordinationRequestRepositoryAdapter,
   DecisionTransportAdapter,
   ObservationPublicationAdapter,
@@ -27,6 +28,7 @@ export interface OperatorComposition {
   publishProjectObservation: PublishProjectObservationUseCase;
   requestScopedDecision: RequestScopedDecisionUseCase;
   resolveActionAuthorization: ResolveActionAuthorizationUseCase;
+  checkOwnerDecision: CheckOwnerDecisionUseCase;
   recordAuthorizationConsumption: RecordAuthorizationConsumptionUseCase;
   readProjectAttention: ReadProjectAttentionUseCase;
   inspectOutstandingCoordination: InspectOutstandingCoordinationUseCase;
@@ -50,6 +52,7 @@ function unconfiguredOperatorComposition(): OperatorComposition {
     publishProjectObservation: new PublishProjectObservationUseCase(),
     requestScopedDecision: new RequestScopedDecisionUseCase(),
     resolveActionAuthorization: new ResolveActionAuthorizationUseCase(),
+    checkOwnerDecision: new CheckOwnerDecisionUseCase(),
     recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase(),
     readProjectAttention: new ReadProjectAttentionUseCase(),
     inspectOutstandingCoordination: new InspectOutstandingCoordinationUseCase(),
@@ -100,6 +103,7 @@ export function createConfiguredOperatorComposition(
       requestRepo,
       decisionTransport,
     }),
+    checkOwnerDecision: new CheckOwnerDecisionUseCase({ requestRepo }),
     recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase({ requestRepo }),
     readProjectAttention: new ReadProjectAttentionUseCase({ attentionPort }),
     inspectOutstandingCoordination: new InspectOutstandingCoordinationUseCase({

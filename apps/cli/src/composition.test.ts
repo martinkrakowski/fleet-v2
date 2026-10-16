@@ -31,7 +31,12 @@ function makeWorkOrder(id: string, _head: string): WorkOrderRecord {
   };
 }
 
-function makeAttempt(id: string, workOrderId: string, head: string): AttemptRecord {
+function makeAttempt(
+  id: string,
+  workOrderId: string,
+  head: string,
+  ownerDecisionReferences?: readonly string[],
+): AttemptRecord {
   return {
     id,
     workOrderId,
@@ -52,6 +57,7 @@ function makeAttempt(id: string, workOrderId: string, head: string): AttemptReco
       collectedArtifactPaths: ['/tmp/patch.diff'],
       notes: 'present',
     },
+    ...(ownerDecisionReferences === undefined ? {} : { ownerDecisionReferences }),
     createdAtIso: '2026-10-15T10:00:00Z',
     updatedAtIso: '2026-10-15T10:30:00Z',
   };
@@ -83,6 +89,34 @@ function makeApprovedGrant(
   };
 }
 
+/** A recorded owner decision, addressed by its own `owner-decision:` scope. */
+function makeOwnerDecisionRequest(
+  requestId: string,
+  head: string,
+  overrides: Partial<CoordinationRequestRecord> = {},
+): CoordinationRequestRecord {
+  return {
+    id: requestId,
+    projectId: 'proj-cli-test',
+    kind: 'action-decision',
+    state: 'approved',
+    actionScope: `owner-decision:${requestId}`,
+    expectedHeadSha: head,
+    proposalDigest: `digest-${requestId}`,
+    policyRevision: 'pol-1',
+    decisionRevision: `dec-${requestId}`,
+    grantId: `grant-${requestId}`,
+    consumptions: [],
+    acknowledgements: [],
+    deliveryStatus: 'delivered',
+    deliveryGapReason: null,
+    revision: 1,
+    createdAtIso: '2026-10-15T10:00:00Z',
+    updatedAtIso: '2026-10-15T10:00:00Z',
+    ...overrides,
+  };
+}
+
 describe('apps/cli composition', () => {
   describe('M6: shared coordination key formats', () => {
     it('produces the standard forgeActionScope, consumptionId, and observationEventKind', () => {
@@ -103,7 +137,9 @@ describe('apps/cli composition', () => {
 
       // Record work order and collected attempt at head H
       await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder(workOrderId, headH));
-      await rt.execution.attemptRepository.saveAttempt(makeAttempt(attemptId, workOrderId, headH));
+      await rt.execution.attemptRepository.saveAttempt(
+        makeAttempt(attemptId, workOrderId, headH, []),
+      );
 
       // Save an approved grant for push-and-open-pr at head H
       const pushGrant = makeApprovedGrant(grantId, forgeActionScope('push-and-open-pr'), headH);
@@ -166,7 +202,9 @@ describe('apps/cli composition', () => {
       const grantId = 'grant-m12-stale';
 
       await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder(workOrderId, headH));
-      await rt.execution.attemptRepository.saveAttempt(makeAttempt(attemptId, workOrderId, headH));
+      await rt.execution.attemptRepository.saveAttempt(
+        makeAttempt(attemptId, workOrderId, headH, []),
+      );
 
       const mergeGrant = makeApprovedGrant(grantId, forgeActionScope('merge-pr'), headH);
       await rt.coordination.coordinationRequestRepository.saveRequest(mergeGrant);
@@ -222,7 +260,9 @@ describe('apps/cli composition', () => {
       // Work order has policyRevision: 'pol-moved'
       const wo = { ...makeWorkOrder(workOrderId, headH), policyRevision: 'pol-moved' };
       await rt.execution.workOrderRepository.saveWorkOrder(wo);
-      await rt.execution.attemptRepository.saveAttempt(makeAttempt(attemptId, workOrderId, headH));
+      await rt.execution.attemptRepository.saveAttempt(
+        makeAttempt(attemptId, workOrderId, headH, []),
+      );
 
       const mergeGrant = makeApprovedGrant(grantId, forgeActionScope('merge-pr'), headH);
       await rt.coordination.coordinationRequestRepository.saveRequest(mergeGrant);
@@ -262,155 +302,200 @@ describe('apps/cli composition', () => {
   });
 
   describe('M15: owner decision / one-way door integration in composition root', () => {
-    it('undecided one-way door -> acceptance blocked', async () => {
+    const HEAD = makeHeadH();
+
+    async function seedDoor(
+      attemptId: string,
+      options: {
+        decision?: CoordinationRequestRecord;
+        /** `null` records the attempt as it was before the field existed. */
+        doors?: readonly string[] | null;
+        state?: 'pending' | 'accepted';
+      } = {},
+    ) {
       const rt = createFleetCliRuntime();
-      const headH = makeHeadH();
-      const attemptId = 'att-m15-door-undecided';
       const assessmentId = assessmentIdForAttempt(attemptId);
-      const doorRef = 'req-door-open-1';
-
-      // Save a coordination request awaiting decision
-      await rt.coordination.coordinationRequestRepository.saveRequest({
-        id: doorRef,
-        projectId: 'proj-cli-test',
-        kind: 'action-decision',
-        state: 'awaiting-decision',
-        actionScope: 'door:dangerous-op',
-        expectedHeadSha: headH,
-        proposalDigest: 'digest-door-1',
-        policyRevision: 'pol-1',
-        decisionRevision: null,
-        grantId: null,
-        consumptions: [],
-        acknowledgements: [],
-        deliveryStatus: 'delivered',
-        deliveryGapReason: null,
-        revision: 1,
-        createdAtIso: '2026-10-15T10:00:00Z',
-        updatedAtIso: '2026-10-15T10:00:00Z',
-      });
-
-      // Save an assessment with passing review
-      await rt.evidence.evidenceAssessmentRepository.saveAssessment({
-        id: assessmentId,
-        projectId: 'proj-cli-test',
-        attemptId,
-        candidateHeadSha: headH,
-        policyRevision: 'pol-1',
-        requiredChecks: [],
-        state: 'pending',
-        verificationReceipts: [],
-        reviewReceipts: [
-          {
-            id: 'rev-m15-1',
-            assessmentId,
-            projectId: 'proj-cli-test',
-            attemptId,
-            candidateHeadSha: headH,
-            reviewerModel: 'reviewer-mod',
-            implementerModel: 'implementer-mod',
-            readOnlyVerified: true,
-            result: 'pass',
-            findings: [],
-            evidenceRef: 'ev-1',
-            policyRevision: 'pol-1',
-            completedAtIso: '2026-10-15T10:00:00Z',
-          },
-        ],
-        findingDispositions: [],
-        acceptanceReceiptId: null,
-        blockers: [],
-        revision: 1,
-        updatedAtIso: '2026-10-15T10:00:00Z',
-      });
-
-      const result = await rt.evidence.assessHeadAcceptance.assessHeadAcceptance({
-        assessmentId,
-        candidateHeadSha: headH,
-        policyRevision: 'pol-1',
-        ownerDecisionReferences: [doorRef],
-      });
-
-      expect(result.outcome).toBe('blocked');
-      if (result.outcome === 'blocked') {
-        expect(result.blockers.some((b) => b.includes("state 'awaiting-decision', not 'approved'"))).toBe(true);
+      const workOrderId = `wo-${attemptId}`;
+      await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder(workOrderId, HEAD));
+      await rt.execution.attemptRepository.saveAttempt(
+        makeAttempt(attemptId, workOrderId, HEAD, options.doors === null ? undefined : (options.doors ?? [])),
+      );
+      if (options.decision !== undefined) {
+        await rt.coordination.coordinationRequestRepository.saveRequest(options.decision);
       }
-    });
-
-    it('decided one-way door -> acceptance passes', async () => {
-      const rt = createFleetCliRuntime();
-      const headH = makeHeadH();
-      const attemptId = 'att-m15-door-decided';
-      const assessmentId = assessmentIdForAttempt(attemptId);
-      const doorRef = 'req-door-approved-1';
-
-      // Save an approved coordination request for headH
-      await rt.coordination.coordinationRequestRepository.saveRequest({
-        id: doorRef,
-        projectId: 'proj-cli-test',
-        kind: 'action-decision',
-        state: 'approved',
-        actionScope: 'door:dangerous-op',
-        expectedHeadSha: headH,
-        proposalDigest: 'digest-door-1',
-        policyRevision: 'pol-1',
-        decisionRevision: 'dec-approved-1',
-        grantId: 'grant-door-1',
-        consumptions: [],
-        acknowledgements: [],
-        deliveryStatus: 'delivered',
-        deliveryGapReason: null,
-        revision: 2,
-        createdAtIso: '2026-10-15T10:00:00Z',
-        updatedAtIso: '2026-10-15T10:30:00Z',
-      });
-
-      // Save an assessment with passing review
       await rt.evidence.evidenceAssessmentRepository.saveAssessment({
         id: assessmentId,
         projectId: 'proj-cli-test',
         attemptId,
-        candidateHeadSha: headH,
+        candidateHeadSha: HEAD,
         policyRevision: 'pol-1',
         requiredChecks: [],
-        state: 'pending',
+        state: options.state ?? 'pending',
         verificationReceipts: [],
         reviewReceipts: [
           {
-            id: 'rev-m15-2',
+            id: `rev-${attemptId}`,
             assessmentId,
             projectId: 'proj-cli-test',
             attemptId,
-            candidateHeadSha: headH,
+            candidateHeadSha: HEAD,
             reviewerModel: 'reviewer-mod',
             implementerModel: 'implementer-mod',
             readOnlyVerified: true,
             result: 'pass',
             findings: [],
-            evidenceRef: 'ev-2',
+            evidenceRef: `ev-${attemptId}`,
             policyRevision: 'pol-1',
             completedAtIso: '2026-10-15T10:00:00Z',
           },
         ],
         findingDispositions: [],
-        acceptanceReceiptId: null,
+        acceptanceReceiptId: options.state === 'accepted' ? `acc-${attemptId}` : null,
         blockers: [],
         revision: 1,
         updatedAtIso: '2026-10-15T10:00:00Z',
       });
+      return { rt, assessmentId };
+    }
 
-      const result = await rt.evidence.assessHeadAcceptance.assessHeadAcceptance({
+    function assess(rt: ReturnType<typeof createFleetCliRuntime>, assessmentId: string) {
+      return rt.evidence.assessHeadAcceptance.assessHeadAcceptance({
         assessmentId,
-        candidateHeadSha: headH,
+        candidateHeadSha: HEAD,
         policyRevision: 'pol-1',
-        ownerDecisionReferences: [doorRef],
       });
+    }
+
+    it('an approved one-way door for the candidate head -> acceptance passes', async () => {
+      const doorRef = 'req-door-approved-1';
+      const { rt, assessmentId } = await seedDoor('att-m15-door-decided', {
+        doors: [doorRef],
+        decision: makeOwnerDecisionRequest(doorRef, HEAD),
+      });
+
+      const result = await assess(rt, assessmentId);
 
       expect(result.outcome).toBe('accepted');
       if (result.outcome === 'accepted') {
-        expect(result.candidateHeadSha).toBe(headH);
+        expect(result.candidateHeadSha).toBe(HEAD);
         expect(result.receiptId).toContain('acc-');
       }
+    });
+
+    it('an undecided one-way door -> acceptance blocked', async () => {
+      const doorRef = 'req-door-open-1';
+      const { rt, assessmentId } = await seedDoor('att-m15-door-undecided', {
+        doors: [doorRef],
+        decision: makeOwnerDecisionRequest(doorRef, HEAD, {
+          state: 'awaiting-decision',
+          decisionRevision: null,
+          grantId: null,
+        }),
+      });
+
+      const result = await assess(rt, assessmentId);
+
+      expect(result.outcome).toBe('blocked');
+      if (result.outcome === 'blocked') {
+        expect(result.blockers.some((b) => b.includes("owner decision 'req-door-open-1' is not approved"))).toBe(
+          true,
+        );
+        expect(result.blockers.some((b) => b.includes("'awaiting-decision'"))).toBe(true);
+      }
+    });
+
+    it('a declined one-way door -> acceptance blocked', async () => {
+      const doorRef = 'req-door-declined-1';
+      const { rt, assessmentId } = await seedDoor('att-m15-door-declined', {
+        doors: [doorRef],
+        decision: makeOwnerDecisionRequest(doorRef, HEAD, {
+          state: 'declined',
+          decisionRevision: null,
+          grantId: null,
+        }),
+      });
+
+      const result = await assess(rt, assessmentId);
+
+      expect(result.outcome).toBe('blocked');
+      if (result.outcome === 'blocked') {
+        expect(result.blockers.some((b) => b.includes("'declined'"))).toBe(true);
+      }
+    });
+
+    it('an approval recorded for another scope on the same head -> acceptance blocked', async () => {
+      const doorRef = 'req-door-other-scope';
+      const { rt, assessmentId } = await seedDoor('att-m15-door-other-scope', {
+        doors: [doorRef],
+        decision: makeOwnerDecisionRequest(doorRef, HEAD, {
+          actionScope: forgeActionScope('merge-pr'),
+        }),
+      });
+
+      const result = await assess(rt, assessmentId);
+
+      expect(result.outcome).toBe('blocked');
+      if (result.outcome === 'blocked') {
+        expect(
+          result.blockers.some((b) => b.includes(`does not authorize owner-decision:${doorRef}`)),
+        ).toBe(true);
+      }
+    });
+
+    it('an unrecorded one-way door -> acceptance blocked as unknown', async () => {
+      const { rt, assessmentId } = await seedDoor('att-m15-door-unrecorded', {
+        doors: ['req-door-never-recorded'],
+      });
+
+      const result = await assess(rt, assessmentId);
+
+      expect(result.outcome).toBe('blocked');
+      if (result.outcome === 'blocked') {
+        expect(result.blockers.some((b) => b.includes('is unknown'))).toBe(true);
+      }
+    });
+
+    it('an attempt recorded before doors were frozen -> acceptance blocked', async () => {
+      const { rt, assessmentId } = await seedDoor('att-m15-old-attempt', { doors: null });
+
+      const result = await assess(rt, assessmentId);
+
+      expect(result.outcome).toBe('blocked');
+      if (result.outcome === 'blocked') {
+        expect(
+          result.blockers.some((b) =>
+            b.includes('owner decision references for attempt'),
+          ),
+        ).toBe(true);
+      }
+    });
+
+    it('an already accepted assessment with a newly undecided door -> blocked, not the stored acceptance', async () => {
+      const doorRef = 'req-door-approved-then-open';
+      const { rt, assessmentId } = await seedDoor('att-m15-door-regressed', {
+        doors: [doorRef],
+        state: 'accepted',
+        decision: makeOwnerDecisionRequest(doorRef, HEAD),
+      });
+
+      const first = await assess(rt, assessmentId);
+      expect(first.outcome).toBe('accepted');
+
+      // The owner decision is withdrawn while the attempt keeps its door.
+      await rt.coordination.coordinationRequestRepository.saveRequest(
+        makeOwnerDecisionRequest(doorRef, HEAD, {
+          state: 'awaiting-decision',
+          decisionRevision: null,
+          grantId: null,
+          revision: 2,
+        }),
+      );
+
+      const second = await assess(rt, assessmentId);
+      expect(second.outcome).toBe('blocked');
+      const stored = await rt.evidence.evidenceAssessmentRepository.findAssessmentById(assessmentId);
+      expect(stored?.state).toBe('blocked');
+      expect(stored?.acceptanceReceiptId).toBeNull();
     });
   });
 });

@@ -18,6 +18,7 @@ import type {
 } from '../../../domain/evidence-records.js';
 import type { EvidenceResultValue } from '../../../domain/value-objects/EvidenceResult.vo.js';
 import type { EvidenceAssessmentRepositoryPort } from '../../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
+import type { AttemptOwnerDecisionPort } from '../../ports/out/AttemptOwnerDecisionPort.out-port.js';
 import type { EvidenceArchivePort } from '../../ports/out/EvidenceArchivePort.out-port.js';
 import type { ForgeCheckStatus, ForgeEvidencePort } from '../../ports/out/ForgeEvidencePort.out-port.js';
 import type {
@@ -878,6 +879,12 @@ describe('RecordFindingDispositionUseCase', () => {
 });
 
 describe('AssessHeadAcceptanceUseCase', () => {
+  /** An attempt whose frozen brief named no owner decisions. */
+  const noOwnerDecisions: AttemptOwnerDecisionPort = {
+    async readAttemptOwnerDecisionReferences() {
+      return { outcome: 'recorded', ownerDecisionReferences: [] };
+    },
+  };
   function completeEvidence(
     overrides: Partial<EvidenceAssessmentRecord> = {},
   ): EvidenceAssessmentRecord {
@@ -889,7 +896,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
   }
 
   it('rejects an assessment that does not exist', async () => {
-    const useCase = new AssessHeadAcceptanceUseCase({ repo: fakeRepository() });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo: fakeRepository(), attemptOwnerDecisionPort: noOwnerDecisions });
 
     const result = await useCase.assessHeadAcceptance(assessRequest());
 
@@ -898,7 +905,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
 
   it('rejects an acceptance request without a policy revision', async () => {
     const repo = fakeRepository([completeEvidence()]);
-    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: noOwnerDecisions });
 
     const result = await useCase.assessHeadAcceptance(assessRequest({ policyRevision: '' }));
 
@@ -911,7 +918,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
 
   it('marks the assessment stale when the candidate head moved', async () => {
     const repo = fakeRepository([completeEvidence()]);
-    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: noOwnerDecisions });
 
     const result: AssessHeadAcceptanceResult = await useCase.assessHeadAcceptance(
       assessRequest({ candidateHeadSha: OTHER_HEAD }),
@@ -927,7 +934,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
 
   it('marks the assessment stale when the acceptance policy revision changed', async () => {
     const repo = fakeRepository([completeEvidence()]);
-    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: noOwnerDecisions });
 
     const result = await useCase.assessHeadAcceptance(assessRequest({ policyRevision: 'policy-8' }));
 
@@ -940,7 +947,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
       const repo = fakeRepository([
         completeEvidence({ verificationReceipts: receipt === null ? [] : [receipt] }),
       ]);
-      const useCase = new AssessHeadAcceptanceUseCase({ repo });
+      const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: noOwnerDecisions });
 
       const result = await useCase.assessHeadAcceptance(assessRequest());
 
@@ -960,7 +967,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
         reviewReceipts: [reviewReceipt({ result: 'fail' })],
       }),
     ]);
-    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: noOwnerDecisions });
 
     const result = await useCase.assessHeadAcceptance(assessRequest());
 
@@ -979,7 +986,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
         reviewReceipts: [reviewReceipt({ result: 'pass', findings: [finding('f-1')] })],
       }),
     ]);
-    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: noOwnerDecisions });
 
     const blocked = await useCase.assessHeadAcceptance(assessRequest());
 
@@ -1017,7 +1024,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
         ],
       }),
     ]);
-    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: noOwnerDecisions });
 
     await new RecordFindingDispositionUseCase({ repo }).recordFindingDisposition({
       assessmentId: 'ea-1',
@@ -1035,6 +1042,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
   it('blocks while forge CI has not passed', async () => {
     const useCase = new AssessHeadAcceptanceUseCase({
       repo: fakeRepository([completeEvidence()]),
+      attemptOwnerDecisionPort: noOwnerDecisions,
       forgeEvidence: stubForge({ candidateHeadSha: HEAD, ciState: 'pending', unresolvedThreadCount: 0 }),
     });
 
@@ -1050,6 +1058,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
   it('blocks while the forge still carries unresolved review threads', async () => {
     const useCase = new AssessHeadAcceptanceUseCase({
       repo: fakeRepository([completeEvidence()]),
+      attemptOwnerDecisionPort: noOwnerDecisions,
       forgeEvidence: stubForge({ candidateHeadSha: HEAD, ciState: 'pass', unresolvedThreadCount: 2 }),
     });
 
@@ -1067,6 +1076,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
   it('blocks acceptance when the forge could not read review threads', async () => {
     const useCase = new AssessHeadAcceptanceUseCase({
       repo: fakeRepository([completeEvidence()]),
+      attemptOwnerDecisionPort: noOwnerDecisions,
       forgeEvidence: stubForge({
         candidateHeadSha: HEAD,
         ciState: 'pass',
@@ -1089,6 +1099,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
     const repo = fakeRepository([completeEvidence()]);
     const useCase = new AssessHeadAcceptanceUseCase({
       repo,
+      attemptOwnerDecisionPort: noOwnerDecisions,
       forgeEvidence: stubForge({ candidateHeadSha: HEAD, ciState: 'pass', unresolvedThreadCount: 0 }),
     });
 

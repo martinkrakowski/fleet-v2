@@ -9,7 +9,6 @@
  * `CliIo`, so package code never touches `console`.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import type {
@@ -556,30 +555,19 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         nowIso: optStr(p, 'nowIso'),
       }),
     assess: async (p, rt) => {
-      let ownerDecisionReferences =
-        p['ownerDecisionReferences'] !== undefined ? strArr(p, 'ownerDecisionReferences') : undefined;
-      const attemptId = optStr(p, 'attemptId');
-      if (ownerDecisionReferences === undefined && attemptId) {
-        const attempt = await rt.execution.attemptRepository.findAttemptById(attemptId);
-        if (attempt?.worktreePath) {
-          const manifestPath = join(attempt.worktreePath, '.lane', 'brief-manifest.json');
-          try {
-            if (existsSync(manifestPath)) {
-              const manifestContent = JSON.parse(readFileSync(manifestPath, 'utf8'));
-              if (Array.isArray(manifestContent.ownerDecisionReferences)) {
-                ownerDecisionReferences = manifestContent.ownerDecisionReferences;
-              }
-            }
-          } catch {
-            // ignore unreadable brief manifest
-          }
-        }
+      // Owner decision references are frozen into the brief package and read
+      // from the attempt record; supplying them here would let a caller name
+      // the one-way doors it is judged against.
+      if (p['ownerDecisionReferences'] !== undefined) {
+        throw new CliUsageError(
+          "'--ownerDecisionReferences' is forbidden; owner decisions come from the attempt record",
+        );
       }
+      const attemptId = optStr(p, 'attemptId');
       return rt.evidence.assessHeadAcceptance.assessHeadAcceptance({
         assessmentId: str(p, 'assessmentId') || (attemptId ? assessmentIdForAttempt(attemptId) : ''),
         candidateHeadSha: str(p, 'candidateHeadSha'),
         policyRevision: str(p, 'policyRevision'),
-        ownerDecisionReferences,
         nowIso: optStr(p, 'nowIso'),
       });
     },

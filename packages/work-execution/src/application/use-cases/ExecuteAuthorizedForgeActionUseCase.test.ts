@@ -488,6 +488,64 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       expect((result as { reason: string }).reason).toContain('no receipt ID');
     });
 
+    it('an acceptance evidence read that throws -> merge refused, never forged', async () => {
+      const journal = new InMemoryJournal();
+      const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+      const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+
+      let consumed = false;
+      const authorizationPort: ActionAuthorizationPort = {
+        async resolveActionAuthorization() {
+          return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+        },
+        async consumeActionAuthorization() {
+          consumed = true;
+          return { outcome: 'consumed', actionId: 'act-1' };
+        },
+      };
+
+      let forgeCalls = 0;
+      const forgePort: ForgeActionPort = {
+        isConfigured: () => true,
+        async performForgeAction() {
+          forgeCalls += 1;
+          return { outcome: 'executed', headSha: '1111111111111111111111111111111111111111' };
+        },
+      };
+
+      const acceptanceEvidencePort: AcceptanceEvidencePort = {
+        async readAcceptance(): Promise<ReadAcceptanceResult> {
+          throw new Error('evidence store is unreadable');
+        },
+      };
+
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        attemptRepo,
+        workOrderRepo,
+        journal,
+        authorizationPort,
+        forgePort,
+        acceptanceEvidencePort,
+      });
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'act-1',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'merge-pr',
+        expectedHeadSha: '1111111111111111111111111111111111111111',
+        authorizationGrantId: 'grant-001',
+      });
+
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain(
+        'acceptance evidence could not be read: evidence store is unreadable',
+      );
+      expect(consumed).toBe(false);
+      expect(forgeCalls).toBe(0);
+      expect(journal.entries).toHaveLength(0);
+    });
+
     it('executes merge when assessment is accepted, head and policy match, and receipt ID exists', async () => {
       const journal = new InMemoryJournal();
       const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());

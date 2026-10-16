@@ -2,10 +2,18 @@ import { describe, expect, it } from 'vitest';
 
 import type { EvidenceAssessmentRecord } from '../../../domain/evidence-records.js';
 import type { EvidenceAssessmentRepositoryPort } from '../../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
+import type { AttemptOwnerDecisionPort } from '../../ports/out/AttemptOwnerDecisionPort.out-port.js';
 import { AssessHeadAcceptanceUseCase } from '../AssessHeadAcceptanceUseCase.use-case.js';
 
 const HEAD = '1111111111111111111111111111111111111111';
 const OTHER_HEAD = '2222222222222222222222222222222222222222';
+
+/** An attempt whose frozen brief named no owner decisions. */
+const NO_OWNER_DECISIONS: AttemptOwnerDecisionPort = {
+  async readAttemptOwnerDecisionReferences() {
+    return { outcome: 'recorded', ownerDecisionReferences: [] };
+  },
+};
 
 class InMemoryAssessmentRepo implements EvidenceAssessmentRepositoryPort {
   private readonly records = new Map<string, EvidenceAssessmentRecord>();
@@ -75,7 +83,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
   it('re-assessing a stale record returns stale, not accepted', async () => {
     const staleRecord = sampleRecord({ state: 'stale' });
     const repo = new InMemoryAssessmentRepo([staleRecord]);
-    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
 
     const result = await useCase.assessHeadAcceptance({
       assessmentId: 'asm-1',
@@ -94,7 +102,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
     // accepted head into a permanent failure.
     const acceptedRecord = sampleRecord({ state: 'accepted', acceptanceReceiptId: 'acc-1' });
     const repo = new InMemoryAssessmentRepo([acceptedRecord]);
-    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
 
     const result = await useCase.assessHeadAcceptance({
       assessmentId: 'asm-1',
@@ -109,7 +117,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
   it('re-assessing a rejected record returns rejected', async () => {
     const rejectedRecord = sampleRecord({ state: 'rejected' });
     const repo = new InMemoryAssessmentRepo([rejectedRecord]);
-    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
 
     const result = await useCase.assessHeadAcceptance({
       assessmentId: 'asm-1',
@@ -126,7 +134,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
   it('marks assessment stale when head changes, and subsequent assessment returns stale', async () => {
     const pendingRecord = sampleRecord({ state: 'pending' });
     const repo = new InMemoryAssessmentRepo([pendingRecord]);
-    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
 
     // Request with different head sha
     const firstResult = await useCase.assessHeadAcceptance({
@@ -151,7 +159,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
   it('accepts a pending assessment with passing evidence', async () => {
     const pendingRecord = sampleRecord({ state: 'pending' });
     const repo = new InMemoryAssessmentRepo([pendingRecord]);
-    const useCase = new AssessHeadAcceptanceUseCase({ repo });
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
 
     const result = await useCase.assessHeadAcceptance({
       assessmentId: 'asm-1',

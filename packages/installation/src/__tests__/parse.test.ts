@@ -60,10 +60,10 @@ describe('parseInstallation', () => {
     expect(result).toEqual({ ok: false, errors: ['schemaVersion: required'] });
   });
 
-  it('requires schemaVersion to be 1', () => {
-    for (const version of [2, 0, 1.5, '1', null]) {
+  it('requires schemaVersion to be 1 or 2', () => {
+    for (const version of [0, 3, 1.5, '1', '2', null]) {
       const result = parseInstallation({ schemaVersion: version });
-      expect(result).toEqual({ ok: false, errors: ['schemaVersion: must be 1'] });
+      expect(result).toEqual({ ok: false, errors: ['schemaVersion: must be 1 or 2'] });
     }
   });
 
@@ -217,7 +217,7 @@ describe('parseInstallation', () => {
 
   it('collects every error across sections', () => {
     const result = parseInstallation({
-      schemaVersion: 2,
+      schemaVersion: 3,
       runner: { agent: '  ', model: 'm' },
       waves: { baseUrl: 'http://waves.example', tokenFile: 'relative/token' },
       shelf: { baseUrl: 'https://shelf.example' },
@@ -225,7 +225,7 @@ describe('parseInstallation', () => {
     expect(result).toEqual({
       ok: false,
       errors: [
-        'schemaVersion: must be 1',
+        'schemaVersion: must be 1 or 2',
         'runner.agent: must be a non-empty string',
         'waves.baseUrl: must be an https URL',
         'waves.tokenFile: must be an absolute path',

@@ -1,18 +1,36 @@
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
-import type { FleetInstallation, RunnerSection } from './types.js';
+import type { FleetInstallation, FleetInstallationModel, RunnerSection } from './types.js';
+import { deriveInstallationModel } from './model.js';
 import { parseInstallation } from './parse.js';
 
 export interface LoadOptions {
   file?: string;
   env?: Record<string, string | undefined>;
   cwd?: string;
+  /**
+   * Policy rule hook (lane O5). The loader calls it with the derived model
+   * after mapping; every returned string is a load error. Shape validation
+   * happens in the parser regardless.
+   */
+  validatePolicy?: (installation: FleetInstallationModel) => string[];
 }
 
 export type LoadResult =
-  | { status: 'absent'; installation: FleetInstallation }
-  | { status: 'loaded'; file: string; installation: FleetInstallation }
+  | {
+      status: 'absent';
+      installation: FleetInstallation;
+      model: FleetInstallationModel;
+      warnings: string[];
+    }
+  | {
+      status: 'loaded';
+      file: string;
+      installation: FleetInstallation;
+      model: FleetInstallationModel;
+      warnings: string[];
+    }
   | { status: 'invalid'; file: string; errors: string[] };
 
 type EnvRecord = Record<string, string | undefined>;
@@ -74,6 +92,8 @@ interface OverrideOutcome {
  * Apply environment overrides after parsing. Only variables that are non-empty
  * after trim override a file value. A `runner` or `worktree` section created by
  * an override may be partial: fields the environment does not name stay absent.
+ * The overrides configure the v1 sections, so they apply to v1 files and to an
+ * absent file; a v2 file configures its hosts in the file itself.
  */
 function applyEnvironmentOverrides(
   installation: FleetInstallation,
@@ -139,11 +159,16 @@ function applyEnvironmentOverrides(
 }
 
 /**
- * Load `installation/fleet.json`.
+ * Load `installation/fleet.json`, version 1 or 2.
  *
  * A missing file is `absent` with the minimal installation; an unreadable file
  * or invalid JSON is `invalid` with error text that never includes the file
- * content. Environment overrides apply after parsing, whatever the file status.
+ * content. Environment overrides apply after parsing a v1 file or an absent
+ * file, whatever its status. The result carries the parsed file as
+ * `installation` and the derived v2 model with its runner capability sources
+ * (D4) as `model`; `warnings` lists accepted-and-ignored v1 fields (D1). When
+ * a `validatePolicy` hook is provided the loader calls it with the model and
+ * treats every returned string as a load error.
  */
 export function loadInstallation(options: LoadOptions = {}): LoadResult {
   const cwd = options.cwd ?? process.cwd();
@@ -175,12 +200,21 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
     }
   }
 
-  const merged = applyEnvironmentOverrides(installation, env);
-  if (merged.errors.length > 0) {
-    return { status: 'invalid', file, errors: merged.errors };
+  const errors: string[] = [];
+  if (installation.schemaVersion === 1) {
+    const merged = applyEnvironmentOverrides(installation, env);
+    errors.push(...merged.errors);
+    installation = merged.installation;
+  }
+  const { model, warnings } = deriveInstallationModel(installation);
+  if (options.validatePolicy !== undefined) {
+    errors.push(...options.validatePolicy(model));
+  }
+  if (errors.length > 0) {
+    return { status: 'invalid', file, errors };
   }
   if (source === 'loaded') {
-    return { status: 'loaded', file, installation: merged.installation };
+    return { status: 'loaded', file, installation, model, warnings };
   }
-  return { status: 'absent', installation: merged.installation };
+  return { status: 'absent', installation, model, warnings };
 }

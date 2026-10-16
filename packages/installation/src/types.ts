@@ -1,12 +1,11 @@
 /**
- * Typed shape of `installation/fleet.json`.
+ * Typed shapes of `installation/fleet.json`, schema versions 1 and 2.
  *
  * The file holds host references and paths to credential files; it never holds
- * credential values. Every section is optional. In the merged result produced
- * by `loadInstallation` the `runner` fields are all optional because
- * environment overrides may create a partial runner section; `parseInstallation`
- * still requires `agent` and `model` whenever the file carries a `runner`
- * section.
+ * credential values. In the merged result produced by `loadInstallation` the
+ * v1 `runner` fields are all optional because environment overrides may
+ * create a partial runner section; `parseInstallation` still requires `agent`
+ * and `model` whenever a v1 file carries a `runner` section.
  */
 
 /** One seat in the runner fallback chain. */
@@ -71,8 +70,11 @@ export interface ShelfSection {
   readonly keyFile: string;
 }
 
-/** A parsed installation configuration. */
-export interface FleetInstallation {
+/**
+ * The v1 file shape, unchanged in meaning. `FleetInstallationV2` files map
+ * onto the same v2 model through `deriveInstallationModel`.
+ */
+export interface FleetInstallationV1 {
   readonly schemaVersion: 1;
   readonly runner?: RunnerSection;
   readonly worktree?: WorktreeSection;
@@ -81,4 +83,262 @@ export interface FleetInstallation {
   readonly reviewer?: ReviewerSection;
   readonly waves?: WavesSection;
   readonly shelf?: ShelfSection;
+}
+
+// ---------------------------------------------------------------------------
+// Schema v2 file shape
+// ---------------------------------------------------------------------------
+
+/** Roles one host may hold (plan section 1). */
+export type HostRole = 'orchestrator' | 'lane-runner' | 'verifier';
+
+/** How the installation reaches a host. */
+export type HostTransport = 'local' | 'ssh';
+
+/** Roles one seat may hold (plan section 3). */
+export type SeatRole = 'implementer' | 'reviewer' | 'high-risk-reviewer';
+
+/** Triggers that move a chain on to its next seat. */
+export type ChainTrigger = '429' | '402' | 'timeout' | 'quota' | 'no-commit';
+
+/** Cost class of a seat. */
+export type CostClass = 'free' | 'plan-quota' | 'paid';
+
+/** Filesystem scope a v2 file may declare. `unknown` is derived only. */
+export type DeclaredFilesystemScope = 'scoped-worktree' | 'inherited-directory';
+
+/** How a runner capability declaration reached the derived model. Never a file field. */
+export type RunnerCapabilitySource = 'declared' | 'undeclared' | 'legacy-asserted';
+
+/**
+ * A v2 runner capability declaration. There is no `source` field: a file
+ * carrying one is refused, and the loader derives the source instead (D4).
+ */
+export interface RunnerCapabilityDeclaration {
+  readonly networkEgressRestricted: boolean;
+  readonly cpuAndMemoryLimited: boolean;
+  readonly processTreeTermination: boolean;
+  readonly filesystemScope: DeclaredFilesystemScope;
+}
+
+/** The `runner` block of a v2 host. */
+export interface HostRunnerSection {
+  readonly kind: 'opencode';
+  readonly port: number;
+  readonly authFile?: string;
+  readonly capabilities?: RunnerCapabilityDeclaration;
+  readonly maxLanes?: number;
+}
+
+/** One named v2 host (plan section 1). */
+export interface HostSection {
+  readonly transport: HostTransport;
+  readonly sshAlias?: string;
+  readonly worktreeRoot: string;
+  readonly tmpDir?: string;
+  readonly roles: readonly HostRole[];
+  readonly runner?: HostRunnerSection;
+}
+
+/** One v2 seat (plan section 3). */
+export interface SeatSection {
+  readonly id: string;
+  readonly tool: string;
+  readonly model: string;
+  readonly variant?: string;
+  readonly agent?: string;
+  readonly roles: readonly SeatRole[];
+  readonly costClass: CostClass;
+}
+
+/** One ordered step of a role's chain. */
+export interface ChainStep {
+  readonly seatId: string;
+  readonly triggers?: readonly ChainTrigger[];
+}
+
+/** The v2 `chains` section: one ordered seat list per role. */
+export interface ChainsSection {
+  readonly implementer?: readonly ChainStep[];
+  readonly reviewer?: readonly ChainStep[];
+  readonly 'high-risk-reviewer'?: readonly ChainStep[];
+}
+
+/** One forbidden route rule of the policy shape. */
+export interface ForbiddenRouteRule {
+  readonly tool: string;
+  readonly modelPattern: string;
+}
+
+/**
+ * The v2 `policy` section: shape only. The rules are lane O5 and reach the
+ * loader through its `validatePolicy` hook.
+ */
+export interface PolicySection {
+  readonly forbiddenRoutes?: readonly ForbiddenRouteRule[];
+  readonly perLaneCostCeiling?: number;
+}
+
+/** The v2 `shelf` section with the local provider (D1, default). */
+export interface LocalShelfSection {
+  readonly provider: 'local';
+}
+
+/** The v2 `shelf` section with the git provider (D1). */
+export interface GitShelfSection {
+  readonly provider: 'git';
+  readonly repoDir: string;
+  readonly branch: string;
+  readonly pathPrefix: string;
+}
+
+/** The v2 `shelf` section (D1). */
+export type ShelfSectionV2 = LocalShelfSection | GitShelfSection;
+
+/** The v2 `forge` section with mode `github` (D6). */
+export interface GithubForgeSection {
+  readonly mode: 'github';
+  readonly owner: string;
+  readonly repo: string;
+}
+
+/** The v2 `forge` section with mode `none` (D6). */
+export interface NoForgeSection {
+  readonly mode: 'none';
+}
+
+/** The v2 `forge` section (D6). */
+export type ForgeSectionV2 = GithubForgeSection | NoForgeSection;
+
+/** The v2 `verification` section: procedures only; ssh hosts live in `hosts`. */
+export interface VerificationProceduresSection {
+  readonly procedures: Readonly<Record<string, VerificationProcedure>>;
+}
+
+/** The v2 file shape (plan section 1). */
+export interface FleetInstallationV2 {
+  readonly schemaVersion: 2;
+  readonly hosts: Readonly<Record<string, HostSection>>;
+  readonly tools?: readonly string[];
+  readonly seats?: readonly SeatSection[];
+  readonly chains?: ChainsSection;
+  readonly policy?: PolicySection;
+  readonly shelf?: ShelfSectionV2;
+  readonly forge?: ForgeSectionV2;
+  readonly verification?: VerificationProceduresSection;
+  readonly waves?: WavesSection;
+}
+
+// ---------------------------------------------------------------------------
+// Derived v2 model
+// ---------------------------------------------------------------------------
+
+/**
+ * Runner capabilities as the loader derives them. `null` booleans mean the
+ * declaration does not say; `filesystemScope: "unknown"` means the runner is
+ * undeclared and dispatch must refuse it (D4).
+ */
+export interface DerivedRunnerCapabilities {
+  readonly source: RunnerCapabilitySource;
+  readonly filesystemScope: DeclaredFilesystemScope | 'unknown';
+  readonly networkEgressRestricted: boolean | null;
+  readonly cpuAndMemoryLimited: boolean | null;
+  readonly processTreeTermination: boolean | null;
+}
+
+/** The `runner` block of a model host; capabilities are always derived. */
+export interface HostRunnerModel {
+  readonly kind: 'opencode';
+  readonly port?: number;
+  readonly authFile?: string;
+  readonly capabilities: DerivedRunnerCapabilities;
+  readonly maxLanes?: number;
+}
+
+/**
+ * One host of the derived model. `worktreeRoot` is absent for hosts mapped
+ * from v1, which carries no such path.
+ */
+export interface HostModel {
+  readonly transport: HostTransport;
+  readonly sshAlias?: string;
+  readonly worktreeRoot?: string;
+  readonly tmpDir?: string;
+  readonly roles: readonly HostRole[];
+  readonly runner?: HostRunnerModel;
+}
+
+/** A host model with writable properties, used while the mapping builds one. */
+export type MutableHostModel = { -readonly [K in keyof HostModel]: HostModel[K] };
+
+/**
+ * One seat of the derived model. `costClass` is absent for seats mapped from
+ * v1, which carries no cost information.
+ */
+export interface SeatModel {
+  readonly id: string;
+  readonly tool: string;
+  readonly model: string;
+  readonly variant?: string;
+  readonly agent?: string;
+  readonly roles: readonly SeatRole[];
+  readonly costClass?: CostClass;
+}
+
+/**
+ * The v2 model the loader derives from a file of either version: every v1
+ * section maps onto it, and every runner capability `source` is derived (D4).
+ */
+export interface FleetInstallationModel {
+  readonly schemaVersion: 2;
+  readonly hosts: Readonly<Record<string, HostModel>>;
+  readonly tools?: readonly string[];
+  readonly seats?: readonly SeatModel[];
+  readonly chains?: ChainsSection;
+  readonly policy?: PolicySection;
+  readonly shelf?: ShelfSectionV2;
+  readonly forge?: ForgeSectionV2;
+  readonly verification?: VerificationProceduresSection;
+  readonly waves?: WavesSection;
+}
+
+// ---------------------------------------------------------------------------
+// Union of both file versions
+// ---------------------------------------------------------------------------
+
+/**
+ * A parsed installation file, `schemaVersion` 1 or 2.
+ *
+ * The v1 sections appear only in a v1 file and the v2 sections only in a v2
+ * file; `parseInstallation` enforces the split and never returns a mix. The
+ * type stays one flat interface, not a discriminated union, because existing
+ * consumers read the v1 sections regardless of version; `verification`,
+ * `forge` and `shelf` differ per version and are unions here. The precise
+ * per-version shapes are `FleetInstallationV1` and `FleetInstallationV2`.
+ */
+export interface FleetInstallation {
+  readonly schemaVersion: 1 | 2;
+  /** v1: the lane runner seat and its fallback chain. Never set in v2. */
+  readonly runner?: RunnerSection;
+  /** v1: the host holding the git worktrees. Never set in v2. */
+  readonly worktree?: WorktreeSection;
+  /** v1: procedures and verification host. v2: procedures only. */
+  readonly verification?: VerificationSection | VerificationProceduresSection;
+  /** v1: GitHub owner and repository. v2: a forge mode (D6). */
+  readonly forge?: ForgeSection | ForgeSectionV2;
+  /** v1: the reviewer seat. Never set in v2. */
+  readonly reviewer?: ReviewerSection;
+  readonly waves?: WavesSection;
+  /** v1: removed snippet transport (D1), accepted and ignored. v2: local or git. */
+  readonly shelf?: ShelfSection | ShelfSectionV2;
+  /** v2: named hosts with transports, roles and runners. Never set in v1. */
+  readonly hosts?: Readonly<Record<string, HostSection>>;
+  /** v2: enabled tool ids. Never set in v1. */
+  readonly tools?: readonly string[];
+  /** v2: seats. Never set in v1. */
+  readonly seats?: readonly SeatSection[];
+  /** v2: per-role seat chains. Never set in v1. */
+  readonly chains?: ChainsSection;
+  /** v2: policy shape; rules arrive through the loader's `validatePolicy` hook. Never set in v1. */
+  readonly policy?: PolicySection;
 }

@@ -156,6 +156,31 @@ describe('loadInstallation hardening', () => {
         expect(result.installation.runner?.agent).toBe('file-agent');
         expect(result.installation.runner?.model).toBe('override-model');
         expect(result.installation.worktree?.sshHost).toBe('ssh.internal');
+        expect(result.model.hosts['ssh.internal']).toEqual({
+          transport: 'ssh',
+          sshAlias: 'ssh.internal',
+          roles: ['lane-runner'],
+          runner: {
+            kind: 'opencode',
+            capabilities: {
+              source: 'legacy-asserted',
+              filesystemScope: 'scoped-worktree',
+              networkEgressRestricted: true,
+              cpuAndMemoryLimited: true,
+              processTreeTermination: true,
+            },
+          },
+        });
+        expect(result.model.seats).toEqual([
+          {
+            id: 'implementer',
+            tool: 'opencode',
+            model: 'override-model',
+            agent: 'file-agent',
+            roles: ['implementer'],
+          },
+        ]);
+        expect(result.warnings).toEqual([]);
       }
     });
   });

@@ -1,0 +1,106 @@
+{
+  "schemaVersion": 2,
+  "hosts": {
+    "orchestrator-host": {
+      "transport": "ssh",
+      "sshAlias": "orchestrator-host.example",
+      "worktreeRoot": "/srv/fleet/worktrees",
+      "roles": ["orchestrator"]
+    },
+    "lane-host": {
+      "transport": "ssh",
+      "sshAlias": "lane-host.example",
+      "worktreeRoot": "/srv/fleet/worktrees",
+      "tmpDir": "/srv/fleet/tmp",
+      "roles": ["lane-runner"],
+      "runner": {
+        "kind": "opencode",
+        "port": 46000,
+        "authFile": "/home/operator/.config/fleet/opencode-auth.json",
+        "capabilities": {
+          "networkEgressRestricted": true,
+          "cpuAndMemoryLimited": true,
+          "processTreeTermination": true,
+          "filesystemScope": "scoped-worktree"
+        },
+        "maxLanes": 2
+      }
+    },
+    "verify-host": {
+      "transport": "ssh",
+      "sshAlias": "verify-host.example",
+      "worktreeRoot": "/srv/fleet/verify",
+      "roles": ["verifier"]
+    }
+  },
+  "tools": ["opencode"],
+  "seats": [
+    {
+      "id": "implementer",
+      "tool": "opencode",
+      "model": "example-provider/example-implementer-model",
+      "agent": "example-agent",
+      "roles": ["implementer"],
+      "costClass": "plan-quota"
+    },
+    {
+      "id": "implementer-fallback",
+      "tool": "opencode",
+      "model": "example-provider/example-fallback-model",
+      "agent": "example-agent",
+      "roles": ["implementer"],
+      "costClass": "paid"
+    },
+    {
+      "id": "reviewer",
+      "tool": "opencode",
+      "model": "example-provider/example-review-model",
+      "agent": "example-agent",
+      "roles": ["reviewer"],
+      "costClass": "paid"
+    },
+    {
+      "id": "high-risk-reviewer",
+      "tool": "opencode",
+      "model": "example-provider/example-high-risk-model",
+      "agent": "example-agent",
+      "roles": ["high-risk-reviewer"],
+      "costClass": "paid"
+    }
+  ],
+  "chains": {
+    "implementer": [
+      { "seatId": "implementer" },
+      {
+        "seatId": "implementer-fallback",
+        "triggers": ["429", "402", "timeout", "quota", "no-commit"]
+      }
+    ],
+    "reviewer": [{ "seatId": "reviewer" }],
+    "high-risk-reviewer": [{ "seatId": "high-risk-reviewer" }]
+  },
+  "policy": {
+    "forbiddenRoutes": [
+      { "tool": "example-tool", "modelPattern": "example-forbidden-model-*" }
+    ]
+  },
+  "shelf": {
+    "provider": "git",
+    "repoDir": "/home/developer/example-shelf-repo",
+    "branch": "example-shelf-branch",
+    "pathPrefix": "keepers"
+  },
+  "forge": { "mode": "github", "owner": "example-owner", "repo": "example-repo" },
+  "verification": {
+    "procedures": {
+      "example-gate": { "command": "fleet-verify-example", "args": ["--gate"] },
+      "example-review": { "command": "fleet-verify-example", "args": ["--review"] }
+    }
+  },
+  "waves": {
+    "baseUrl": "https://waves.example",
+    "tokenFile": "/home/operator/.config/fleet/waves-token",
+    "caFile": "/home/operator/.config/fleet/waves-ca.pem",
+    "ownerPublicKey": "CxIZICcuNTxDSlFYX2ZtdHuCiZCXnqWss7rByM/W3eQ="
+  }
+}

@@ -10,6 +10,7 @@
  * delivery that must never be recorded as a recipient response.
  */
 
+import { generateKeyPairSync, sign, type KeyObject } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -29,7 +30,12 @@ import type {
   RegisterProjectProfileRequest,
 } from '../../ports/in/index.js';
 import type { CoordinationRequestRepositoryPort } from '../../ports/out/CoordinationRequestRepositoryPort.out-port.js';
-import type { DecisionAnswer, DecisionTransportPort } from '../../ports/out/DecisionTransportPort.out-port.js';
+import type {
+  DecisionAnswer,
+  DecisionAnswerQuery,
+  DecisionTransportPort,
+} from '../../ports/out/DecisionTransportPort.out-port.js';
+import { canonicalDecisionBytes } from '../../../infrastructure/adapters/DecisionSignature.adapter.js';
 import type { ProjectProfileRepositoryPort } from '../../ports/out/ProjectProfileRepositoryPort.out-port.js';
 import type { RelayDeliveryOutcome, RelayNoticeRequest } from '../../ports/out/RelayTransportPort.out-port.js';
 import { AttentionReadAdapter } from '../../../infrastructure/adapters/AttentionReadAdapter.adapter.js';
@@ -207,10 +213,10 @@ class StubDecisionTransport implements DecisionTransportPort {
 
   constructor(private readonly answers: Readonly<Record<string, DecisionAnswer>> = {}) {}
 
-  async readDecisionAnswer(requestId: string): Promise<DecisionAnswer> {
-    this.reads.push(requestId);
+  async readDecisionAnswer(query: DecisionAnswerQuery): Promise<DecisionAnswer> {
+    this.reads.push(query.requestId);
     return (
-      this.answers[requestId] ?? {
+      this.answers[query.requestId] ?? {
         state: 'awaiting-decision' as const,
         decisionRevision: null,
         grantId: null,
@@ -1359,18 +1365,67 @@ describe('CoordinationRequestRepositoryAdapter', () => {
 });
 
 describe('DecisionTransportAdapter', () => {
+  function testKeyPair(): { publicKeyBase64: string; privateKey: KeyObject } {
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    const raw32 = publicKey.export({ format: 'der', type: 'spki' }).subarray(12);
+    return {
+      publicKeyBase64: raw32.toString('base64'),
+      privateKey,
+    };
+  }
+
+  function testSignature(
+    fields: {
+      requestId: string;
+      projectId: string;
+      actionScope: string;
+      expectedHeadSha: string | null;
+      decisionRevision: string | null;
+      grantId: string | null;
+      state: string;
+    },
+    privateKey: KeyObject,
+  ): string {
+    return sign(null, canonicalDecisionBytes(fields), privateKey).toString('base64');
+  }
+
+  const query: DecisionAnswerQuery = {
+    requestId: 'request-1',
+    projectId: 'project-atlas',
+    actionScope: 'forge:merge',
+    expectedHeadSha: 'abc123',
+  };
+
   it('reads a verified answer recorded in process', async () => {
+    const { publicKeyBase64, privateKey } = testKeyPair();
+    const signature = testSignature(
+      {
+        ...query,
+        decisionRevision: 'decision-3',
+        grantId: 'grant-9',
+        state: 'approved',
+      },
+      privateKey,
+    );
     const adapter = new DecisionTransportAdapter({
+      ownerPublicKey: publicKeyBase64,
       answers: {
-        'request-1': { state: 'approved', decisionRevision: 'decision-3', grantId: 'grant-9' },
+        'request-1': {
+          state: 'approved',
+          decisionRevision: 'decision-3',
+          grantId: 'grant-9',
+          signature,
+        },
       },
     });
-    await expect(adapter.readDecisionAnswer('request-1')).resolves.toEqual({
+    await expect(adapter.readDecisionAnswer(query)).resolves.toEqual({
       state: 'approved',
       decisionRevision: 'decision-3',
       grantId: 'grant-9',
     });
-    await expect(adapter.readDecisionAnswer('request-2')).resolves.toEqual({
+    await expect(
+      adapter.readDecisionAnswer({ ...query, requestId: 'request-2' }),
+    ).resolves.toEqual({
       state: 'awaiting-decision',
       decisionRevision: null,
       grantId: null,
@@ -1384,36 +1439,59 @@ describe('DecisionTransportAdapter', () => {
         'request-2': { state: 'maybe', decisionRevision: 'decision-3', grantId: 'grant-9' },
       } as never,
     });
-    await expect(adapter.readDecisionAnswer('request-1')).resolves.toMatchObject({
+    await expect(adapter.readDecisionAnswer(query)).resolves.toMatchObject({
       state: 'awaiting-decision',
       grantId: null,
     });
-    await expect(adapter.readDecisionAnswer('request-2')).resolves.toMatchObject({
+    await expect(
+      adapter.readDecisionAnswer({ ...query, requestId: 'request-2' }),
+    ).resolves.toMatchObject({
       state: 'awaiting-decision',
       grantId: null,
     });
   });
 
   it('reads owner-recorded decision files and treats absence as awaiting', async () => {
+    const { publicKeyBase64, privateKey } = testKeyPair();
+    const signature = testSignature(
+      {
+        ...query,
+        decisionRevision: 'decision-3',
+        grantId: 'grant-9',
+        state: 'approved',
+      },
+      privateKey,
+    );
     await withTempDir(async (decisionsDir) => {
       await writeFile(
         join(decisionsDir, 'request-1.json'),
-        JSON.stringify({ state: 'approved', decisionRevision: 'decision-3', grantId: 'grant-9' }),
+        JSON.stringify({
+          state: 'approved',
+          decisionRevision: 'decision-3',
+          grantId: 'grant-9',
+          signature,
+        }),
         'utf8',
       );
       await writeFile(join(decisionsDir, 'request-2.json'), 'not json', 'utf8');
-      const adapter = new DecisionTransportAdapter({ decisionsDir });
-      await expect(adapter.readDecisionAnswer('request-1')).resolves.toMatchObject({
+      const adapter = new DecisionTransportAdapter({ decisionsDir, ownerPublicKey: publicKeyBase64 });
+      await expect(adapter.readDecisionAnswer(query)).resolves.toMatchObject({
         state: 'approved',
         grantId: 'grant-9',
       });
-      await expect(adapter.readDecisionAnswer('request-2')).resolves.toMatchObject({
+      await expect(
+        adapter.readDecisionAnswer({ ...query, requestId: 'request-2' }),
+      ).resolves.toMatchObject({
         state: 'awaiting-decision',
       });
-      await expect(adapter.readDecisionAnswer('request-3')).resolves.toMatchObject({
+      await expect(
+        adapter.readDecisionAnswer({ ...query, requestId: 'request-3' }),
+      ).resolves.toMatchObject({
         state: 'awaiting-decision',
       });
-      await expect(adapter.readDecisionAnswer('../../etc/passwd')).resolves.toMatchObject({
+      await expect(
+        adapter.readDecisionAnswer({ ...query, requestId: '../../etc/passwd' }),
+      ).resolves.toMatchObject({
         state: 'awaiting-decision',
       });
     });
@@ -1425,7 +1503,7 @@ describe('DecisionTransportAdapter', () => {
         'request-1': { state: 'declined', decisionRevision: 'decision-4', grantId: 'grant-9' },
       },
     });
-    await expect(adapter.readDecisionAnswer('request-1')).resolves.toEqual({
+    await expect(adapter.readDecisionAnswer(query)).resolves.toEqual({
       state: 'declined',
       decisionRevision: 'decision-4',
       grantId: null,

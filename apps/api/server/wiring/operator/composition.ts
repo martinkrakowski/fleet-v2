@@ -36,6 +36,7 @@ export interface OperatorComposition {
 
 export interface OperatorCompositionOptions {
   readonly stateDir?: string;
+  readonly ownerPublicKey?: string;
 }
 
 let composition: OperatorComposition | undefined;
@@ -68,10 +69,15 @@ export function createConfiguredOperatorComposition(
   options?: OperatorCompositionOptions,
 ): OperatorComposition {
   const stateDir = options?.stateDir;
+  const ownerPublicKey =
+    options?.ownerPublicKey ?? (process.env.FLEET_OWNER_PUBLIC_KEY?.trim() || undefined);
 
   const profileRepo = new ProjectProfileRepositoryAdapter({ stateDir });
   const requestRepo = new CoordinationRequestRepositoryAdapter({ stateDir });
-  const decisionTransport = new DecisionTransportAdapter();
+  const decisionTransport = new DecisionTransportAdapter({
+    decisionsDir: stateDir === undefined ? undefined : join(stateDir, "decisions"),
+    ownerPublicKey,
+  });
   const publicationPort = new ObservationPublicationAdapter(
     stateDir === undefined ? {} : { outboxDir: join(stateDir, "observation-outbox") },
   );
@@ -104,13 +110,13 @@ export function createConfiguredOperatorComposition(
 }
 
 function isOperatorComposition(
-  value: OperatorComposition | { stateDir?: string },
+  value: OperatorComposition | OperatorCompositionOptions,
 ): value is OperatorComposition {
   return typeof value === "object" && "inspectConfiguredCapabilities" in value;
 }
 
 export function configureOperatorComposition(
-  custom: OperatorComposition | { stateDir?: string } | null,
+  custom: OperatorComposition | OperatorCompositionOptions | null,
 ): void {
   if (custom === null) {
     configured = undefined;

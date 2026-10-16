@@ -19,10 +19,11 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { generateKeyPairSync, sign, type KeyObject } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   assessmentIdForAttempt,
@@ -30,6 +31,31 @@ import {
   type FleetCliRuntime,
 } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
+
+/** Canonical decision bytes, written out here so the test pins the signed format independently. */
+function canonicalDecisionBytes(fields: {
+  requestId: string;
+  projectId: string;
+  actionScope: string;
+  expectedHeadSha: string | null;
+  decisionRevision: string | null;
+  grantId: string | null;
+  state: string;
+}): Buffer {
+  return Buffer.from(
+    JSON.stringify({
+      requestId: fields.requestId,
+      projectId: fields.projectId,
+      actionScope: fields.actionScope,
+      expectedHeadSha: fields.expectedHeadSha ?? null,
+      decisionRevision: fields.decisionRevision ?? null,
+      grantId: fields.grantId ?? null,
+      state: fields.state,
+    }),
+    'utf8',
+  );
+}
+
 
 const PROJECT_ID = 'proj-cli-1';
 const WORK_ORDER_ID = 'wo-1';
@@ -63,6 +89,34 @@ describe('Fleet CLI workflow', () => {
   let acceptanceReceiptId: string;
   let originalPath: string | undefined;
   let originalOcmRunBin: string | undefined;
+  let testOwnerPublicKey: string;
+  let testOwnerPrivateKey: KeyObject;
+  let originalOwnerKey: string | undefined;
+
+  function signDecisionForWorkflow(fields: {
+    requestId: string;
+    projectId: string;
+    actionScope: string;
+    expectedHeadSha: string | null;
+    decisionRevision: string | null;
+    grantId: string | null;
+    state: string;
+  }): string {
+    return sign(null, canonicalDecisionBytes(fields), testOwnerPrivateKey).toString('base64');
+  }
+
+  beforeEach(() => {
+    originalOwnerKey = process.env.FLEET_OWNER_PUBLIC_KEY;
+    process.env.FLEET_OWNER_PUBLIC_KEY = testOwnerPublicKey;
+  });
+
+  afterEach(() => {
+    if (originalOwnerKey !== undefined) {
+      process.env.FLEET_OWNER_PUBLIC_KEY = originalOwnerKey;
+    } else {
+      delete process.env.FLEET_OWNER_PUBLIC_KEY;
+    }
+  });
 
   const cli = async (argv: readonly string[]): Promise<Invocation> => {
     const out: string[] = [];
@@ -165,20 +219,43 @@ describe('Fleet CLI workflow', () => {
     // Owner-recorded decision answers, read by the decision transport when a
     // scoped decision is requested. Only an approved answer with a recorded
     // grant authorizes anything.
+    const { publicKey: pubKeyObj, privateKey: privKeyObj } = generateKeyPairSync('ed25519');
+    testOwnerPublicKey = pubKeyObj.export({ format: 'der', type: 'spki' }).subarray(12).toString('base64');
+    testOwnerPrivateKey = privKeyObj;
+
     const decisionsDir = path.join(stateDir, 'decisions');
     mkdirSync(decisionsDir);
+    const dec1Signature = signDecisionForWorkflow({
+      requestId: 'dec-1',
+      projectId: PROJECT_ID,
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: laneHead,
+      decisionRevision: 'dec-1-r1',
+      grantId: 'grant-1',
+      state: 'approved',
+    });
     writeFileSync(
       path.join(decisionsDir, 'dec-1.json'),
-      `${JSON.stringify({ state: 'approved', decisionRevision: 'dec-1-r1', grantId: 'grant-1' }, null, 2)}\n`,
+      `${JSON.stringify({ state: 'approved', decisionRevision: 'dec-1-r1', grantId: 'grant-1', signature: dec1Signature }, null, 2)}\n`,
     );
+    const dec2Signature = signDecisionForWorkflow({
+      requestId: 'dec-2',
+      projectId: PROJECT_ID,
+      actionScope: 'forge:push-and-open-pr',
+      expectedHeadSha: laneHead,
+      decisionRevision: 'dec-2-r1',
+      grantId: 'grant-2',
+      state: 'approved',
+    });
     writeFileSync(
       path.join(decisionsDir, 'dec-2.json'),
-      `${JSON.stringify({ state: 'approved', decisionRevision: 'dec-2-r1', grantId: 'grant-2' }, null, 2)}\n`,
+      `${JSON.stringify({ state: 'approved', decisionRevision: 'dec-2-r1', grantId: 'grant-2', signature: dec2Signature }, null, 2)}\n`,
     );
 
     runtime = createFleetCliRuntime({
       stateDir,
       ocmRunBin: path.join(binDir, 'ocm-run'),
+      ownerPublicKey: testOwnerPublicKey,
     });
   });
 
@@ -1137,9 +1214,18 @@ describe('Fleet CLI workflow', () => {
     // fresh runtime against this state dir.
     const mpDecisionsDir = path.join(multiProcStateDir, 'decisions');
     mkdirSync(mpDecisionsDir);
+    const decMp1Signature = signDecisionForWorkflow({
+      requestId: 'dec-mp-1',
+      projectId: PROJECT_ID,
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: mpLaneHead,
+      decisionRevision: 'dec-mp-1-r1',
+      grantId: 'grant-mp-1',
+      state: 'approved',
+    });
     writeFileSync(
       path.join(mpDecisionsDir, 'dec-mp-1.json'),
-      `${JSON.stringify({ state: 'approved', decisionRevision: 'dec-mp-1-r1', grantId: 'grant-mp-1' }, null, 2)}\n`,
+      `${JSON.stringify({ state: 'approved', decisionRevision: 'dec-mp-1-r1', grantId: 'grant-mp-1', signature: decMp1Signature }, null, 2)}\n`,
     );
 
     const mpCli = async (argv: readonly string[]): Promise<Invocation> => {

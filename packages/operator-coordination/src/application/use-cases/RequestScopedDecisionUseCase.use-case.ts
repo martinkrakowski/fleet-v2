@@ -92,7 +92,7 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     }).toRecord();
     // The proposal is durable before any decider is asked.
     await this.deps.requestRepo.saveRequest(recorded);
-    const answer = await this.readVerifiedAnswer(request.requestId);
+    const answer = await this.readVerifiedAnswer(recorded);
     if (answer === undefined || answer.state === 'awaiting-decision') {
       return { outcome: 'requested', request: recorded };
     }
@@ -113,11 +113,16 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
   }
 
   /** Absence and ambiguity stay awaiting; nothing is invented here. */
-  private async readVerifiedAnswer(requestId: string): Promise<DecisionAnswer | undefined> {
+  private async readVerifiedAnswer(record: CoordinationRequestRecord): Promise<DecisionAnswer | undefined> {
     if (this.deps?.decisionTransport === undefined) {
       return undefined;
     }
-    const answer = await this.deps.decisionTransport.readDecisionAnswer(requestId);
+    const answer = await this.deps.decisionTransport.readDecisionAnswer({
+      requestId: record.id,
+      projectId: record.projectId,
+      actionScope: record.actionScope,
+      expectedHeadSha: record.expectedHeadSha,
+    });
     if (
       answer.state !== 'approved' &&
       answer.state !== 'declined' &&

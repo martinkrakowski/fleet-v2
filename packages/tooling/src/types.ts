@@ -22,11 +22,24 @@ export interface ToolModel {
 }
 
 /**
- * A parsed model list: either a non-empty list or explicitly `'unknown'`.
- * An empty list is never a result; a tool that named nothing it can serve
- * answered `'unknown'`.
+ * A product-shipped fallback list, marked as fallback: the pinned models a
+ * descriptor ships when the tool cannot list what it serves. The `source`
+ * marker keeps it distinguishable from a probe result wherever a
+ * `ModelListResult` travels, so no consumer can mistake pinned data for
+ * what the tool itself reported.
  */
-export type ModelListResult = readonly ToolModel[] | 'unknown';
+export interface FallbackModelList {
+  readonly source: 'fallback';
+  readonly models: readonly ToolModel[];
+}
+
+/**
+ * A parsed model list: a non-empty list, explicitly `'unknown'`, or a
+ * fallback list explicitly marked `source: 'fallback'`. An empty list is
+ * never a result; a tool that named nothing it can serve answered
+ * `'unknown'`.
+ */
+export type ModelListResult = readonly ToolModel[] | 'unknown' | FallbackModelList;
 
 /** The `--version` probe that recognises the tool and shows its version. */
 export interface ToolDetectSpec {

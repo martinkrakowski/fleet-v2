@@ -97,11 +97,14 @@ describe('detectTools', () => {
       'signed-out',
     ]);
     expect(detections.map((detection) => detection.models)).toEqual([
-      [
-        { id: 'claude-opus-4-5' },
-        { id: 'claude-sonnet-4-5' },
-        { id: 'claude-haiku-4-5' },
-      ],
+      {
+        source: 'fallback',
+        models: [
+          { id: 'claude-opus-4-5' },
+          { id: 'claude-sonnet-4-5' },
+          { id: 'claude-haiku-4-5' },
+        ],
+      },
       [
         { id: 'nvidia/z-ai/glm-5.3', variants: ['none'] },
         { id: 'xai/grok-4.7' },
@@ -237,17 +240,22 @@ describe('detectTool', () => {
     expect(detection.models).toBe('unknown');
   });
 
-  it('still reports the fixed list of an installed tool with no probe at all', async () => {
+  it('still reports the pinned fallback list, marked as fallback, of an installed tool with no probe at all', async () => {
     const { run, calls } = fakeRunner({
       'claude --version': RECORDED_SWEEP['claude --version'],
       'claude auth status': RECORDED_SWEEP['claude auth status'],
     });
     const detection = await detectTool(CLAUDE_CODE_TOOL, run);
-    expect(detection.models).toEqual([
-      { id: 'claude-opus-4-5' },
-      { id: 'claude-sonnet-4-5' },
-      { id: 'claude-haiku-4-5' },
-    ]);
+    // The marker travels through the sweep: the fallback list is never
+    // presented as a probe result.
+    expect(detection.models).toEqual({
+      source: 'fallback',
+      models: [
+        { id: 'claude-opus-4-5' },
+        { id: 'claude-sonnet-4-5' },
+        { id: 'claude-haiku-4-5' },
+      ],
+    });
     expect(calls).not.toContain('claude models');
   });
 

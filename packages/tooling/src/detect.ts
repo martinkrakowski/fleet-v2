@@ -39,6 +39,10 @@ export interface ToolDetection {
   /** The recorded stdout of the detect probe, trimmed; '' when it failed. */
   readonly detectOutput: string;
   readonly signIn: SignInStatus;
+  /**
+   * The parsed model list. A product-shipped fallback arrives marked
+   * `source: 'fallback'`; it is never presented as a probe result.
+   */
   readonly models: ModelListResult;
 }
 
@@ -55,7 +59,11 @@ async function runProbe(
 
 /** An empty list is never truth: a parse that named nothing stays `'unknown'`. */
 function asModelList(list: ModelListResult): ModelListResult {
-  return Array.isArray(list) && list.length === 0 ? 'unknown' : list;
+  if (typeof list === 'string') {
+    return list;
+  }
+  const models = 'source' in list ? list.models : list;
+  return models.length === 0 ? 'unknown' : list;
 }
 
 async function detectModels(
@@ -85,8 +93,8 @@ async function detectModels(
     }
     return asModelList(spec.parse(probe.stdout));
   }
-  // Neither probe: the tool has a product-shipped fixed list; its parse
-  // ignores the (absent) output.
+  // Neither probe: the tool cannot list models; its parse returns the
+  // product-shipped list marked `source: 'fallback'`, never a probe result.
   return asModelList(spec.parse(''));
 }
 

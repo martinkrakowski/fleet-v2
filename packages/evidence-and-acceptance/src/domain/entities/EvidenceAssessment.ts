@@ -180,7 +180,9 @@ export class EvidenceAssessment {
   pendingRequiredChecks(): readonly string[] {
     return this.record.requiredChecks.filter((check) => {
       const receipt = this.record.verificationReceipts.find(
-        (candidate) => candidate.procedureName === check,
+        (candidate) =>
+          candidate.procedureName === check &&
+          candidate.candidateHeadSha === this.record.candidateHeadSha,
       );
       if (receipt === undefined) {
         return true;
@@ -283,6 +285,9 @@ export class EvidenceAssessment {
     if (!isNonEmptyTrimmedString(acceptanceReceiptId)) {
       throw new Error('Acceptance requires a non-empty receipt id');
     }
+    if (this.isTerminal()) {
+      throw new Error(`Cannot accept an assessment in terminal state '${this.record.state}'`);
+    }
     this.record = {
       ...this.record,
       state: 'accepted',
@@ -301,6 +306,7 @@ export class EvidenceAssessment {
     this.record = {
       ...this.record,
       state: 'blocked',
+      acceptanceReceiptId: null,
       blockers: [...blockers],
       revision: this.record.revision + 1,
       updatedAtIso,
@@ -312,6 +318,7 @@ export class EvidenceAssessment {
     this.record = {
       ...this.record,
       state: 'stale',
+      acceptanceReceiptId: null,
       revision: this.record.revision + 1,
       updatedAtIso,
     };
@@ -321,6 +328,7 @@ export class EvidenceAssessment {
     this.record = {
       ...this.record,
       state: 'rejected',
+      acceptanceReceiptId: null,
       revision: this.record.revision + 1,
       updatedAtIso,
     };

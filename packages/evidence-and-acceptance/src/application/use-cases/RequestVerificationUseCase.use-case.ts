@@ -93,6 +93,32 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
 
     const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
     const existing = await deps.repo.findAssessmentById(request.assessmentId);
+    if (existing !== null) {
+      if (existing.candidateHeadSha !== request.candidateHeadSha) {
+        return {
+          outcome: 'rejected',
+          reason: `Assessment candidate head '${existing.candidateHeadSha}' does not match requested head '${request.candidateHeadSha}'`,
+        };
+      }
+      if (existing.policyRevision !== request.policyRevision) {
+        return {
+          outcome: 'rejected',
+          reason: `Assessment policy revision '${existing.policyRevision}' does not match requested policy revision '${request.policyRevision}'`,
+        };
+      }
+      if (existing.attemptId !== request.attemptId) {
+        return {
+          outcome: 'rejected',
+          reason: `Assessment attempt ID '${existing.attemptId}' does not match requested attempt ID '${request.attemptId}'`,
+        };
+      }
+      if (existing.projectId !== request.projectId) {
+        return {
+          outcome: 'rejected',
+          reason: `Assessment project ID '${existing.projectId}' does not match requested project ID '${request.projectId}'`,
+        };
+      }
+    }
     const base: EvidenceAssessmentRecord = existing ?? {
       id: request.assessmentId,
       projectId: request.projectId,

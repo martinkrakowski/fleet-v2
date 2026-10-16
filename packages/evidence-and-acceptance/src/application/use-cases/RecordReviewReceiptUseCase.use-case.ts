@@ -7,7 +7,7 @@
 
 import type { EvidenceAssessmentRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
-import { underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
+import { ReviewReceipt, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type {
   RecordReviewReceiptPort,
@@ -66,8 +66,15 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
       };
     }
     if (
-      isNonEmptyTrimmedString(receipt.reviewerModel) &&
-      isNonEmptyTrimmedString(receipt.implementerModel) &&
+      !isNonEmptyTrimmedString(receipt.reviewerModel) ||
+      !isNonEmptyTrimmedString(receipt.implementerModel)
+    ) {
+      return {
+        outcome: 'rejected',
+        reason: 'Review receipt requires non-empty reviewerModel and implementerModel',
+      };
+    }
+    if (
       underlyingModelFamily(receipt.reviewerModel) === underlyingModelFamily(receipt.implementerModel)
     ) {
       return {
@@ -85,6 +92,14 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
       return {
         outcome: 'rejected',
         reason: `Review receipt belongs to assessment ${receipt.assessmentId}, not ${assessment.id}`,
+      };
+    }
+
+    const validatedReceipt = ReviewReceipt.create(receipt);
+    if (!validatedReceipt.success || validatedReceipt.value === undefined) {
+      return {
+        outcome: 'rejected',
+        reason: validatedReceipt.error?.message ?? 'Invalid review receipt',
       };
     }
 

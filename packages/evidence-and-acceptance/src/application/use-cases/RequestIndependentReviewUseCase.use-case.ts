@@ -86,6 +86,31 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       };
     }
 
+    const existing = await deps.repo.findAssessmentById(request.assessmentId);
+    if (existing === null) {
+      return {
+        outcome: 'rejected',
+        reason: `No assessment exists for assessmentId '${request.assessmentId}'`,
+      };
+    }
+    if (existing.candidateHeadSha !== request.candidateHeadSha) {
+      return {
+        outcome: 'rejected',
+        reason: `Assessment '${request.assessmentId}' exists for candidate head '${existing.candidateHeadSha}', not '${request.candidateHeadSha}'`,
+      };
+    }
+    if (
+      existing.projectId !== request.projectId ||
+      existing.attemptId !== request.attemptId ||
+      existing.policyRevision !== request.policyRevision
+    ) {
+      return {
+        outcome: 'rejected',
+        reason:
+          'Assessment identity mismatch (projectId, attemptId, or policyRevision does not match existing assessment)',
+      };
+    }
+
     const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
     const run = await deps.reviewer.runIndependentReview({
       attemptId: request.attemptId,
@@ -134,19 +159,16 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
     }
     const receipt = validated.value.toRecord();
 
-    const existing = await deps.repo.findAssessmentById(request.assessmentId);
-    if (existing !== null) {
-      const assessment = EvidenceAssessment.fromRecord(existing);
-      assessment.appendReviewReceipt(receipt, nowIso);
-      const merged = assessment.toRecord();
-      const blockers = EvidenceAssessment.fromRecord(merged).collectBlockers();
-      const updated: EvidenceAssessmentRecord = {
-        ...merged,
-        state: blockers.length > 0 ? 'blocked' : 'pending',
-        blockers: [...blockers],
-      };
-      await deps.repo.saveAssessment(updated);
-    }
+    const assessment = EvidenceAssessment.fromRecord(existing);
+    assessment.appendReviewReceipt(receipt, nowIso);
+    const merged = assessment.toRecord();
+    const blockers = EvidenceAssessment.fromRecord(merged).collectBlockers();
+    const updated: EvidenceAssessmentRecord = {
+      ...merged,
+      state: blockers.length > 0 ? 'blocked' : 'pending',
+      blockers: [...blockers],
+    };
+    await deps.repo.saveAssessment(updated);
 
     return { outcome: 'reviewed', receipt };
   }

@@ -124,6 +124,18 @@ describe('AdvisedKnowledgeRetrievalAdapter', () => {
     }
   });
 
+  it('returns the same reference when the advice port throws', async () => {
+    const innerResult = [match('a', 1), match('b', 0.5)];
+    const inner: KnowledgeRetrievalPort = { rankEligibleKeepers: async () => innerResult };
+    const throwing: KnowledgeRankingAdvicePort = {
+      adviseRanking: async () => {
+        throw new Error('boom');
+      },
+    };
+    const decorator = new AdvisedKnowledgeRetrievalAdapter(inner, throwing);
+    await expect(decorator.rankEligibleKeepers(query(innerResult))).resolves.toBe(innerResult);
+  });
+
   for (const reason of UNKNOWN_REASONS) {
     it(`returns the same reference on unknown/${reason}`, async () => {
       const innerResult = [match('a', 1), match('b', 0.5)];

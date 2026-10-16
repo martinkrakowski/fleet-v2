@@ -54,15 +54,21 @@ export class AdvisedKnowledgeRetrievalAdapter implements KnowledgeRetrievalPort 
       return innerResult;
     }
 
-    const advice: RankingAdvice = await this.advice.adviseRanking({
-      projectId: query.projectId,
-      taskSummary: query.taskSummary,
-      pathPrefixes: query.pathPrefixes,
-      candidates: innerResult.map((match) => ({
-        id: match.entry.id,
-        claimText: match.entry.claimText,
-      })),
-    });
+    let advice: RankingAdvice;
+    try {
+      advice = await this.advice.adviseRanking({
+        projectId: query.projectId,
+        taskSummary: query.taskSummary,
+        pathPrefixes: query.pathPrefixes,
+        candidates: innerResult.map((match) => ({
+          id: match.entry.id,
+          claimText: match.entry.claimText,
+        })),
+      });
+    } catch {
+      // A throwing advice port is unknown: the deterministic result stands.
+      return innerResult;
+    }
 
     if (advice.status !== 'advised') {
       // 5. On unknown, return the inner result object unchanged.

@@ -354,6 +354,7 @@ bounded_contexts:
           - ExecuteAuthorizedForgeActionUseCase
           - StopAttemptUseCase
           - InspectWorkOrderUseCase
+          - InspectAttemptUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -367,6 +368,7 @@ bounded_contexts:
             - ExecuteAuthorizedForgeActionPort
             - StopAttemptPort
             - InspectWorkOrderPort
+            - InspectAttemptPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -394,6 +396,7 @@ bounded_contexts:
       ExecuteAuthorizedForgeActionPort: "Apply a scoped PR or merge action only when authorization and current-head evidence match; reconcile ambiguous forge responses."
       StopAttemptPort: "Request cancellation of the identified runner session and establish its actual end before releasing capacity."
       InspectWorkOrderPort: "Return the work order, attempt identities and separately reported/observed status with source and revision references."
+      InspectAttemptPort: "Return the attempt record safely without invoking the runner or mutating server state."
       WorkOrderRepositoryPort: "Persist work-order revisions with optimistic concurrency and retrieve orders by project and dependency identity."
       AttemptRepositoryPort: "Persist immutable dispatch identity and guarded lifecycle updates; return known absence separately from unreadable state."
       ExecutionJournalPort: "Atomically record intent, capacity and action receipts; a host has one designated dispatcher until shared arbitration is implemented."

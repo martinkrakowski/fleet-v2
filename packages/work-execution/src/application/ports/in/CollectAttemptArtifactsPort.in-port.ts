@@ -13,8 +13,8 @@ import type {
 export interface CollectAttemptArtifactsRequest {
   readonly attemptId: string;
   readonly workOrderId: string;
-  readonly worktreePath: string;
-  readonly baseCommit: string;
+  readonly worktreePath?: string;
+  readonly baseCommit?: string;
   readonly expectedArtifacts: readonly string[];
   readonly completionReceipt: CommandCompletionReceipt;
 }

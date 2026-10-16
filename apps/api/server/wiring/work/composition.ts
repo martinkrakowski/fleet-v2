@@ -22,6 +22,7 @@ import {
   CollectAttemptArtifactsUseCase,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
+  InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
@@ -35,6 +36,7 @@ import {
 export interface WorkComposition {
   registerWorkOrder: RegisterWorkOrderUseCase;
   inspectWorkOrder: InspectWorkOrderUseCase;
+  inspectAttempt: InspectAttemptUseCase;
   prepareBriefPackage: PrepareBriefPackageUseCase;
   reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
   dispatchAttempt: DispatchAttemptUseCase;
@@ -135,6 +137,7 @@ function unconfiguredWorkComposition(): WorkComposition {
   return {
     registerWorkOrder: new RegisterWorkOrderUseCase(),
     inspectWorkOrder: new InspectWorkOrderUseCase(),
+    inspectAttempt: new InspectAttemptUseCase(),
     prepareBriefPackage: new PrepareBriefPackageUseCase(),
     reserveExecutionCapacity: new ReserveExecutionCapacityUseCase(),
     dispatchAttempt: new DispatchAttemptUseCase(),
@@ -218,6 +221,7 @@ export function createConfiguredWorkComposition(
   return {
     registerWorkOrder: new RegisterWorkOrderUseCase({ workOrderRepo }),
     inspectWorkOrder: new InspectWorkOrderUseCase({ workOrderRepo, attemptRepo, journal }),
+    inspectAttempt: new InspectAttemptUseCase({ attemptRepo }),
     prepareBriefPackage: new PrepareBriefPackageUseCase({
       briefAuthoring,
       artifactPort,

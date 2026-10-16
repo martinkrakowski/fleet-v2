@@ -177,14 +177,23 @@ export async function persistAuthorizationCoordinatesToState(
   });
 }
 
+let runtimeConfigured = false;
+
+export function isFleetApiRuntimeConfigured(): boolean {
+  return runtimeConfigured;
+}
+
 export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null): void {
   if (options === null) {
+    runtimeConfigured = false;
     configureWorkComposition(null);
     configureEvidenceUseCases(null);
     configureKnowledgeComposition(null);
     configureOperatorComposition(null);
     return;
   }
+
+  runtimeConfigured = true;
 
   const stateDir = options?.stateDir;
   const ownerPublicKey = options?.ownerPublicKey;

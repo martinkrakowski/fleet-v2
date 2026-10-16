@@ -10,6 +10,8 @@
  * view renders the fixture and reports why it did so instead of crashing.
  */
 
+import * as fs from "node:fs";
+
 /** Status the API boundary returns for a use case that is not implemented. */
 export const NOT_IMPLEMENTED_STATUS = 501;
 
@@ -18,6 +20,8 @@ export interface FleetWebApiClientOptions {
   readonly baseUrl?: string;
   /** Injectable `fetch`, for tests and for runtimes with their own transport. */
   readonly fetchImpl?: typeof fetch;
+  /** Explicit token file path override. */
+  readonly tokenFile?: string;
 }
 
 /** Where the payload in a `LiveEndpointResult` came from. */
@@ -73,6 +77,40 @@ function describeFailure(error: unknown): string {
   return error instanceof Error ? error.message : "unknown error";
 }
 
+export function readWebClientApiToken(tokenFile?: string): string | null {
+  if (typeof window !== "undefined") {
+    return null;
+  }
+  const filePath =
+    tokenFile !== undefined
+      ? tokenFile.trim()
+      : (typeof process !== "undefined"
+          ? process.env.FLEET_API_TOKEN_FILE
+          : undefined)?.trim() ?? "";
+
+  if (filePath.length === 0) {
+    return null;
+  }
+
+  try {
+    const stats = fs.lstatSync(filePath);
+    if (!stats.isFile() || stats.isSymbolicLink()) {
+      return null;
+    }
+    if ((stats.mode & 0o077) !== 0) {
+      return null;
+    }
+    const content = fs.readFileSync(filePath, "utf8");
+    const firstLine = content.split(/\r?\n/)[0]?.trim() ?? "";
+    if (firstLine.length < 32 || !/^[A-Za-z0-9_-]{32,}$/.test(firstLine)) {
+      return null;
+    }
+    return firstLine;
+  } catch {
+    return null;
+  }
+}
+
 export function createFleetWebApiClient(
   options: FleetWebApiClientOptions = {},
 ): FleetWebApiClient {
@@ -88,6 +126,7 @@ export function createFleetWebApiClient(
           : undefined
         )?.trim() ?? "";
   const fetchImpl = options.fetchImpl ?? fetch;
+  const token = readWebClientApiToken(options.tokenFile);
 
   /**
    * Reads one endpoint and degrades to `fallback` on every failure mode. The
@@ -108,10 +147,15 @@ export function createFleetWebApiClient(
 
     const url = endpointUrl(baseUrl, path);
 
+    const headers: Record<string, string> = { accept: "application/json" };
+    if (token) {
+      headers.authorization = `Bearer ${token}`;
+    }
+
     let response: Response;
     try {
       response = await fetchImpl(url, {
-        headers: { accept: "application/json" },
+        headers,
       });
     } catch (error) {
       return fixtureFallback(

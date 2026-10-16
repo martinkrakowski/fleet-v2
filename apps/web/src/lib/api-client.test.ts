@@ -1,3 +1,6 @@
+import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   NOT_IMPLEMENTED_STATUS,
@@ -49,11 +52,13 @@ describe("createFleetWebApiClient", () => {
   beforeEach(() => {
     delete process.env.FLEET_API_URL;
     delete process.env.NEXT_PUBLIC_FLEET_API_URL;
+    delete process.env.FLEET_API_TOKEN_FILE;
   });
 
   afterEach(() => {
     delete process.env.FLEET_API_URL;
     delete process.env.NEXT_PUBLIC_FLEET_API_URL;
+    delete process.env.FLEET_API_TOKEN_FILE;
   });
 
   describe("200 OK", () => {
@@ -379,6 +384,143 @@ describe("createFleetWebApiClient", () => {
       expect(requestedUrls).toEqual([]);
       expect(result.source).toBe("fixture-fallback");
       expect(result.fallbackReason).toBe("api boundary is not configured");
+    });
+  });
+
+  describe("bearer token authentication", () => {
+    let tempDir: string;
+
+    beforeEach(() => {
+      tempDir = mkdtempSync(join(tmpdir(), "fleet-web-test-"));
+    });
+
+    afterEach(() => {
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it("attaches Authorization header when FLEET_API_TOKEN_FILE is valid mode 0600", async () => {
+      const tokenPath = join(tempDir, "token");
+      const validToken = "A".repeat(32);
+      writeFileSync(tokenPath, validToken + "\n", { mode: 0o600 });
+      chmodSync(tokenPath, 0o600);
+      process.env.FLEET_API_TOKEN_FILE = tokenPath;
+
+      let capturedHeaders: HeadersInit | undefined;
+      const client = createFleetWebApiClient({
+        baseUrl: BASE_URL,
+        fetchImpl: async (_input, init) => {
+          capturedHeaders = init?.headers;
+          return jsonResponse(200, { ok: true });
+        },
+      });
+
+      await client.fetchAttentionView({});
+
+      expect((capturedHeaders as Record<string, string>)?.authorization).toBe(`Bearer ${validToken}`);
+    });
+
+    it("attaches Authorization header when tokenFile option is provided", async () => {
+      const tokenPath = join(tempDir, "token-opt");
+      const validToken = "B".repeat(40);
+      writeFileSync(tokenPath, validToken, { mode: 0o600 });
+      chmodSync(tokenPath, 0o600);
+
+      let capturedHeaders: HeadersInit | undefined;
+      const client = createFleetWebApiClient({
+        baseUrl: BASE_URL,
+        tokenFile: tokenPath,
+        fetchImpl: async (_input, init) => {
+          capturedHeaders = init?.headers;
+          return jsonResponse(200, { ok: true });
+        },
+      });
+
+      await client.fetchAttentionView({});
+
+      expect((capturedHeaders as Record<string, string>)?.authorization).toBe(`Bearer ${validToken}`);
+    });
+
+    it("omits Authorization header when token file has group/other permissions (mode 0644)", async () => {
+      const tokenPath = join(tempDir, "token-insecure");
+      writeFileSync(tokenPath, "C".repeat(32), { mode: 0o644 });
+      chmodSync(tokenPath, 0o644);
+      process.env.FLEET_API_TOKEN_FILE = tokenPath;
+
+      let capturedHeaders: HeadersInit | undefined;
+      const client = createFleetWebApiClient({
+        baseUrl: BASE_URL,
+        fetchImpl: async (_input, init) => {
+          capturedHeaders = init?.headers;
+          return jsonResponse(200, { ok: true });
+        },
+      });
+
+      await client.fetchAttentionView({});
+
+      expect((capturedHeaders as Record<string, string>)?.authorization).toBeUndefined();
+    });
+
+    it("omits Authorization header when token file is a symlink", async () => {
+      const realPath = join(tempDir, "token-real");
+      const linkPath = join(tempDir, "token-link");
+      writeFileSync(realPath, "D".repeat(32), { mode: 0o600 });
+      chmodSync(realPath, 0o600);
+      symlinkSync(realPath, linkPath);
+      process.env.FLEET_API_TOKEN_FILE = linkPath;
+
+      let capturedHeaders: HeadersInit | undefined;
+      const client = createFleetWebApiClient({
+        baseUrl: BASE_URL,
+        fetchImpl: async (_input, init) => {
+          capturedHeaders = init?.headers;
+          return jsonResponse(200, { ok: true });
+        },
+      });
+
+      await client.fetchAttentionView({});
+
+      expect((capturedHeaders as Record<string, string>)?.authorization).toBeUndefined();
+    });
+
+    it("omits Authorization header when token is shorter than 32 characters", async () => {
+      const tokenPath = join(tempDir, "token-short");
+      writeFileSync(tokenPath, "short-token", { mode: 0o600 });
+      chmodSync(tokenPath, 0o600);
+      process.env.FLEET_API_TOKEN_FILE = tokenPath;
+
+      let capturedHeaders: HeadersInit | undefined;
+      const client = createFleetWebApiClient({
+        baseUrl: BASE_URL,
+        fetchImpl: async (_input, init) => {
+          capturedHeaders = init?.headers;
+          return jsonResponse(200, { ok: true });
+        },
+      });
+
+      await client.fetchAttentionView({});
+
+      expect((capturedHeaders as Record<string, string>)?.authorization).toBeUndefined();
+    });
+
+    it("never reads NEXT_PUBLIC_* variables for token", async () => {
+      (process.env as Record<string, string>).NEXT_PUBLIC_FLEET_API_TOKEN = "E".repeat(32);
+      (process.env as Record<string, string>).NEXT_PUBLIC_TOKEN_FILE = join(tempDir, "token-public");
+
+      let capturedHeaders: HeadersInit | undefined;
+      const client = createFleetWebApiClient({
+        baseUrl: BASE_URL,
+        fetchImpl: async (_input, init) => {
+          capturedHeaders = init?.headers;
+          return jsonResponse(200, { ok: true });
+        },
+      });
+
+      await client.fetchAttentionView({});
+
+      expect((capturedHeaders as Record<string, string>)?.authorization).toBeUndefined();
+
+      delete (process.env as Record<string, string>).NEXT_PUBLIC_FLEET_API_TOKEN;
+      delete (process.env as Record<string, string>).NEXT_PUBLIC_TOKEN_FILE;
     });
   });
 });

@@ -19,12 +19,16 @@ export async function readObjectBody(event: H3Event): Promise<Record<string, unk
     return {};
   }
   if (isPlainObject(body)) {
-    return body;
+    const rest = { ...body };
+    delete rest.nowIso;
+    return rest;
   }
   throw createError({ statusCode: 400, statusMessage: "Invalid JSON object body" });
 }
 
-/** The parsed query as a plain record, forwarded without renaming. */
+/** The parsed query as a plain record with wire timestamps stripped. */
 export function readQueryRecord(event: H3Event): Record<string, unknown> {
-  return getQuery(event) as Record<string, unknown>;
+  const rest = { ...(getQuery(event) as Record<string, unknown>) };
+  delete rest.nowIso;
+  return rest;
 }

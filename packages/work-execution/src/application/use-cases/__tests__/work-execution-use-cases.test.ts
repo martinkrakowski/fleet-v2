@@ -107,7 +107,7 @@ function storedAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
     kind: 'initial',
     fixNumber: 0,
     priorAttemptId: null,
-    worktreePath: '/lanes/wo-1',
+    worktreePath: '/lanes/attempt-1',
     baseCommit: 'abc123',
     state: 'running',
     outcome: null,
@@ -1761,11 +1761,27 @@ describe('PrepareFixAttemptUseCase', () => {
     expect(noFixes).toEqual({ outcome: 'refused', reason: 'numberedFixes must record at least one fix' });
 
     const missingFields = await setup.useCase.prepareFixAttempt(
-      validFixRequest({ baseCommit: '' }) as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0],
+      validFixRequest({ workOrderId: '' }) as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0],
     );
     expect(missingFields).toEqual({
       outcome: 'refused',
-      reason: 'Missing required fix attempt fields: baseCommit',
+      reason: 'Missing required fix attempt fields: workOrderId',
+    });
+
+    const mismatchedWorktree = await setup.useCase.prepareFixAttempt(
+      validFixRequest({ worktreePath: '/lanes/other' }) as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0],
+    );
+    expect(mismatchedWorktree).toEqual({
+      outcome: 'refused',
+      reason: 'worktreePath does not match prior attempt: expected /lanes/attempt-1, got /lanes/other',
+    });
+
+    const mismatchedBaseCommit = await setup.useCase.prepareFixAttempt(
+      validFixRequest({ baseCommit: 'mismatched-commit' }) as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0],
+    );
+    expect(mismatchedBaseCommit).toEqual({
+      outcome: 'refused',
+      reason: 'baseCommit does not match prior attempt: expected abc123, got mismatched-commit',
     });
   });
 

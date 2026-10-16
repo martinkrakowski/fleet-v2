@@ -11,8 +11,8 @@ export interface PrepareFixAttemptRequest {
   readonly fixAttemptId: string;
   readonly workOrderId: string;
   readonly priorAttemptId: string;
-  readonly worktreePath: string;
-  readonly baseCommit: string;
+  readonly worktreePath?: string;
+  readonly baseCommit?: string;
   readonly numberedFixes: readonly string[];
   readonly nowIso?: string;
 }

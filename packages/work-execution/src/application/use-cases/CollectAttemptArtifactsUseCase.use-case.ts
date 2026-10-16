@@ -62,10 +62,17 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
       return { outcome: 'refused', reason: 'Attempt has not ended with a matching completion receipt' };
     }
 
+    if (request.worktreePath !== undefined && request.worktreePath !== attempt.worktreePath) {
+      return { outcome: 'refused', reason: 'worktreePath differs from recorded attempt' };
+    }
+    if (request.baseCommit !== undefined && request.baseCommit !== attempt.baseCommit) {
+      return { outcome: 'refused', reason: 'baseCommit differs from recorded attempt' };
+    }
+
     const collected = await this.deps.artifactPort.collectCompletedAttemptArtifacts({
       attemptId: request.attemptId,
-      worktreePath: request.worktreePath,
-      baseCommit: request.baseCommit,
+      worktreePath: attempt.worktreePath,
+      baseCommit: attempt.baseCommit,
       expectedArtifactPaths: request.expectedArtifacts,
       completionReceipt: request.completionReceipt,
     });

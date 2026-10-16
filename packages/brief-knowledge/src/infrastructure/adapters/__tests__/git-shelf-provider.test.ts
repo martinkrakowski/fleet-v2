@@ -9,7 +9,8 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { GitShelfProvider, NodeGitArgvRunner } from '../GitShelfProvider.adapter.js';
 import type { GitArgvRunner, GitShelfProviderDependencies } from '../GitShelfProvider.adapter.js';
-import { KeeperPublicationAdapter, SECRET_PATTERNS } from '../KeeperPublicationAdapter.adapter.js';
+import { KeeperPublicationAdapter } from '../KeeperPublicationAdapter.adapter.js';
+import { SECRET_PATTERNS } from '@fleet/shared';
 import type { KnowledgeEntryRecord } from '../../../domain/knowledge-records.js';
 
 const execFileAsync = promisify(execFile);

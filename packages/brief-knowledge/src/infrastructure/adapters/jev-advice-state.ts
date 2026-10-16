@@ -14,7 +14,7 @@
 
 import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
-import { SECRET_PATTERNS } from './KeeperPublicationAdapter.adapter.js';
+import { SECRET_PATTERNS } from '@fleet/shared';
 import { JEV_CRITERIA_LEVELS } from './jev-advice-validator.js';
 
 /** Maximum size of one declared field, in bytes. */

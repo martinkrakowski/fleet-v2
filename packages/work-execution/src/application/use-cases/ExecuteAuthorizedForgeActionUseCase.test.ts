@@ -22,6 +22,10 @@ import type {
   ReadAcceptanceRequest,
   ReadAcceptanceResult,
 } from '../ports/out/AcceptanceEvidencePort.out-port.js';
+import type { AttemptOwnerDecisionPort } from '../ports/out/AttemptOwnerDecisionPort.out-port.js';
+import type {
+  OwnerDecisionPort,
+} from '../ports/out/OwnerDecisionPort.out-port.js';
 import { ExecuteAuthorizedForgeActionUseCase } from './ExecuteAuthorizedForgeActionUseCase.use-case.js';
 
 class InMemoryAcceptanceEvidencePort implements AcceptanceEvidencePort {
@@ -93,6 +97,7 @@ class InMemoryJournal implements ExecutionJournalPort {
 function makeAttemptRecord(): AttemptRecord {
   return {
     id: 'att-001',
+    ownerDecisionReferences: [],
     workOrderId: 'wo-001',
     kind: 'initial',
     fixNumber: 0,
@@ -113,6 +118,25 @@ function makeAttemptRecord(): AttemptRecord {
     },
     createdAtIso: '2026-10-15T10:00:00Z',
     updatedAtIso: '2026-10-15T10:30:00Z',
+  };
+}
+
+/** An attempt-owner-decision port backed by one attempt repository. */
+function attemptDoorsFrom(repo: AttemptRepositoryPort): AttemptOwnerDecisionPort {
+  return {
+    async readAttemptOwnerDecisionReferences({ attemptId }) {
+      const record = await repo.findAttemptById(attemptId);
+      if (record === null) {
+        return { outcome: 'unknown', reason: `No attempt is recorded for ${attemptId}` };
+      }
+      if (record.ownerDecisionReferences === undefined) {
+        return {
+          outcome: 'unknown',
+          reason: `attempt ${attemptId} was recorded before owner decision references were frozen`,
+        };
+      }
+      return { outcome: 'recorded', ownerDecisionReferences: record.ownerDecisionReferences };
+    },
   };
 }
 
@@ -181,6 +205,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
 
       const instance1 = new ExecuteAuthorizedForgeActionUseCase({
         attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
         journal,
         authorizationPort,
@@ -199,6 +224,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       // Instance 2 simulates a second process running with a fresh use case instance on the same journal
       const instance2 = new ExecuteAuthorizedForgeActionUseCase({
         attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
         journal,
         authorizationPort,
@@ -245,6 +271,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
         journal,
         authorizationPort,
@@ -326,6 +353,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
         journal,
         authorizationPort: successfulAuthPort,
@@ -356,6 +384,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
         journal,
         authorizationPort: successfulAuthPort,
@@ -386,6 +415,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
         journal,
         authorizationPort: successfulAuthPort,
@@ -413,6 +443,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
         journal,
         authorizationPort: successfulAuthPort,
@@ -443,6 +474,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
         journal,
         authorizationPort: successfulAuthPort,
@@ -473,6 +505,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
         journal,
         authorizationPort: successfulAuthPort,
@@ -521,6 +554,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
         journal,
         authorizationPort,
@@ -558,6 +592,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
         journal,
         authorizationPort: successfulAuthPort,
@@ -572,6 +607,156 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       expect(result.outcome).toBe('executed');
       expect((result as { headSha: string }).headSha).toBe('1111111111111111111111111111111111111111');
       expect(journal.entries).toHaveLength(2); // intent-recorded + completed
+    });
+  });
+
+  describe('one-way door re-check at forge time', () => {
+    const HEAD = '1111111111111111111111111111111111111111';
+    const mergeReq = {
+      actionId: 'forge-att-001',
+      attemptId: 'att-001',
+      workOrderId: 'wo-001',
+      kind: 'merge-pr' as const,
+      expectedHeadSha: HEAD,
+      authorizationGrantId: 'grant-001',
+    };
+
+    function acceptancePortFound() {
+      return new InMemoryAcceptanceEvidencePort({
+        outcome: 'found',
+        assessment: {
+          candidateHeadSha: HEAD,
+          policyRevision: 'pol-1',
+          state: 'accepted',
+          acceptanceReceiptId: 'receipt-001',
+        },
+      });
+    }
+
+    function ownerPortWith(
+      result:
+        | { outcome: 'approved'; decisionId: string }
+        | { outcome: 'not-approved'; reason: string }
+        | { outcome: 'unknown'; reason: string },
+      calls: { resolve: number },
+    ): OwnerDecisionPort {
+      return {
+        async resolveOwnerDecision() {
+          calls.resolve++;
+          return result;
+        },
+      };
+    }
+
+    function baseDeps(attempt: AttemptRecord, ownerPort?: OwnerDecisionPort) {
+      const authPort: ActionAuthorizationPort = {
+        async resolveActionAuthorization() {
+          return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+        },
+        async consumeActionAuthorization(req) {
+          return { outcome: 'consumed', actionId: req.actionId };
+        },
+      };
+      const forgePort: ForgeActionPort = {
+        isConfigured: () => true,
+        async performForgeAction() {
+          return { outcome: 'executed', headSha: HEAD };
+        },
+      };
+      const attemptRepo = new InMemoryAttemptRepo(attempt);
+      return {
+        attemptRepo,
+        workOrderRepo: new InMemoryWorkOrderRepo(makeWorkOrderRecord()),
+        journal: new InMemoryJournal(),
+        authorizationPort: authPort,
+        forgePort,
+        acceptedReceiptByHead: { [HEAD]: 'receipt-001' },
+        acceptanceEvidencePort: acceptancePortFound(),
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
+        ...(ownerPort !== undefined ? { ownerDecisionPort: ownerPort } : {}),
+      };
+    }
+
+    function attemptWithDoors(
+      doors: readonly string[] | undefined,
+    ): AttemptRecord {
+      const record = makeAttemptRecord();
+      if (doors === undefined) {
+        // An attempt recorded before the field existed.
+        const { ownerDecisionReferences: _omitted, ...rest } = record;
+        void _omitted;
+        return rest as AttemptRecord;
+      }
+      return { ...record, ownerDecisionReferences: doors };
+    }
+
+    it('an approved door does not block the merge', async () => {
+      const calls = { resolve: 0 };
+      const useCase = new ExecuteAuthorizedForgeActionUseCase(
+        baseDeps(attemptWithDoors(['req-door-1']), ownerPortWith({ outcome: 'approved', decisionId: 'req-door-1' }, calls)),
+      );
+      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result.outcome).toBe('executed');
+      expect(calls.resolve).toBe(1);
+    });
+
+    it('an undecided or declined door refuses before the grant is consumed', async () => {
+      for (const decision of [
+        { outcome: 'not-approved' as const, reason: 'awaiting decision' },
+        { outcome: 'unknown' as const, reason: 'no recorded decision' },
+      ]) {
+        const calls = { resolve: 0 };
+        const consumed: { value: boolean } = { value: false };
+        const authPort: ActionAuthorizationPort = {
+          async resolveActionAuthorization() {
+            return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+          },
+          async consumeActionAuthorization(req) {
+            consumed.value = true;
+            return { outcome: 'consumed', actionId: req.actionId };
+          },
+        };
+        const deps = {
+          ...baseDeps(attemptWithDoors(['req-door-open']), ownerPortWith(decision, calls)),
+          authorizationPort: authPort,
+        };
+        const useCase = new ExecuteAuthorizedForgeActionUseCase(deps);
+        const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+        expect(result.outcome).toBe('refused');
+        expect((result as { reason: string }).reason).toContain(
+          `'req-door-open' is ${decision.outcome === 'not-approved' ? 'not approved' : 'unknown'}`,
+        );
+        expect(consumed.value).toBe(false);
+        expect(calls.resolve).toBe(1);
+      }
+    });
+
+    it('an attempt recorded before doors were frozen refuses without resolving anything', async () => {
+      const calls = { resolve: 0 };
+      const useCase = new ExecuteAuthorizedForgeActionUseCase(
+        baseDeps(attemptWithDoors(undefined), ownerPortWith({ outcome: 'approved', decisionId: 'x' }, calls)),
+      );
+      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('are unknown');
+      expect(calls.resolve).toBe(0);
+    });
+
+    it('recorded doors with no owner decision port refuse', async () => {
+      const useCase = new ExecuteAuthorizedForgeActionUseCase(
+        baseDeps(attemptWithDoors(['req-door-1'])),
+      );
+      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason: string }).reason).toContain('no owner decision port is configured');
+    });
+
+    it('an empty door list does not require the port and executes', async () => {
+      const useCase = new ExecuteAuthorizedForgeActionUseCase(
+        baseDeps(attemptWithDoors([])),
+      );
+      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result.outcome).toBe('executed');
     });
   });
 });

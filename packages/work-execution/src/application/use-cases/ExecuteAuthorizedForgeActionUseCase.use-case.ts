@@ -17,6 +17,8 @@ import type {
   ExecuteAuthorizedForgeActionResult,
 } from '../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
 import type { AcceptanceEvidencePort } from '../ports/out/AcceptanceEvidencePort.out-port.js';
+import type { OwnerDecisionPort } from '../ports/out/OwnerDecisionPort.out-port.js';
+import type { AttemptOwnerDecisionPort } from '../ports/out/AttemptOwnerDecisionPort.out-port.js';
 import type { ActionAuthorizationPort } from '../ports/out/ActionAuthorizationPort.out-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
@@ -40,6 +42,14 @@ export interface ExecuteAuthorizedForgeActionDependencies {
   readonly forgePort: ForgeActionPort;
   /** Out-port for reading acceptance assessment evidence from the evidence context. */
   readonly acceptanceEvidencePort?: AcceptanceEvidencePort;
+  /**
+   * Out-port for resolving the attempt's frozen one-way doors through owner
+   * coordination; the same resolution acceptance uses, so a door that is now
+   * undecided, declined or unknown also refuses the forge action.
+   */
+  readonly ownerDecisionPort?: OwnerDecisionPort;
+  /** Out-port for reading the one-way doors the frozen brief named for this attempt. */
+  readonly attemptOwnerDecisionPort?: AttemptOwnerDecisionPort;
   /** Non-authoritative cache of accepted-receipt id per head. */
   readonly acceptedReceiptByHead?: Readonly<Record<string, string>>;
   /**
@@ -72,6 +82,17 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         outcome: 'refused',
         reason: 'Moved head: attempt headCommit does not match expectedHeadSha',
       };
+    }
+
+    // One-way doors are re-checked at merge/push-and-open time through the
+    // same owner-decision ports acceptance used: an owner decision withdrawn
+    // after a stored acceptance still refuses the forge action, and the
+    // refusal happens before any authorization grant is consumed.
+    if (request.kind === 'merge-pr' || request.kind === 'push-and-open-pr') {
+      const doorBlockers = await this.collectForgeDoorBlockers(deps, request);
+      if (doorBlockers.length > 0) {
+        return { outcome: 'refused', reason: doorBlockers.join('; ') };
+      }
     }
 
     // Merge requires current-head acceptance; old readiness is not a receipt.
@@ -265,5 +286,76 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       detail,
     };
     await deps.journal.appendJournalEntry(entry);
+  }
+
+  /**
+   * Merge-time re-check of the attempt's one-way doors. The doors come from
+   * the attempt record through the attempt owner-decision port and every
+   * reference is resolved through the same owner-decision port acceptance
+   * used. An attempt recorded before doors were frozen, a reference that
+   * cannot be seen approved, or an unreadable port all refuse the action.
+   */
+  private async collectForgeDoorBlockers(
+    deps: ExecuteAuthorizedForgeActionDependencies,
+    request: ExecuteAuthorizedForgeActionRequest,
+  ): Promise<string[]> {
+    const blockers: string[] = [];
+    const attemptOwnerDecisionPort = deps.attemptOwnerDecisionPort;
+    if (attemptOwnerDecisionPort === undefined) {
+      return [
+        `owner decision references for attempt '${request.attemptId}' could not be read: no attempt owner decision port is configured`,
+      ];
+    }
+    let recorded: Awaited<
+      ReturnType<AttemptOwnerDecisionPort['readAttemptOwnerDecisionReferences']>
+    >;
+    try {
+      recorded = await attemptOwnerDecisionPort.readAttemptOwnerDecisionReferences({
+        attemptId: request.attemptId,
+      });
+    } catch (error: unknown) {
+      return [
+        `owner decision references for attempt '${request.attemptId}' could not be read: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      ];
+    }
+    if (recorded.outcome !== 'recorded') {
+      return [
+        `owner decision references for attempt '${request.attemptId}' are unknown: ${recorded.reason}`,
+      ];
+    }
+    for (const reference of recorded.ownerDecisionReferences) {
+      const ownerDecisionPort = deps.ownerDecisionPort;
+      if (ownerDecisionPort === undefined) {
+        blockers.push(
+          `owner decision '${reference}' could not be resolved: no owner decision port is configured`,
+        );
+        continue;
+      }
+      let decision;
+      try {
+        decision = await ownerDecisionPort.resolveOwnerDecision({
+          decisionReference: reference,
+          candidateHeadSha: request.expectedHeadSha,
+        });
+      } catch (error: unknown) {
+        blockers.push(
+          `owner decision '${reference}' could not be resolved: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        continue;
+      }
+      if (decision.outcome === 'approved') {
+        continue;
+      }
+      if (decision.outcome === 'not-approved') {
+        blockers.push(`owner decision '${reference}' is not approved: ${decision.reason}`);
+      } else {
+        blockers.push(`owner decision '${reference}' is unknown: ${decision.reason}`);
+      }
+    }
+    return blockers;
   }
 }

@@ -237,6 +237,7 @@ const PILOT_OBSERVATION_REQUEST = {
 const PILOT_ATTEMPT = {
   id: "attempt-pilot-1",
   workOrderId: "wo-pilot-1",
+  ownerDecisionReferences: [],
   kind: "initial",
   fixNumber: 0,
   priorAttemptId: null,

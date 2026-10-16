@@ -497,5 +497,58 @@ describe('apps/cli composition', () => {
       expect(stored?.state).toBe('blocked');
       expect(stored?.acceptanceReceiptId).toBeNull();
     });
+
+    it('withdrawn door: attempt accept is blocked and merge-pr refuses without consuming the grant', async () => {
+    const HEAD = makeHeadH();
+    const doorRef = 'req-door-e2e';
+    const { rt } = await seedDoor('att-door-e2e', {
+      doors: [doorRef],
+      state: 'accepted',
+      decision: makeOwnerDecisionRequest(doorRef, HEAD),
+    });
+    const grantId = 'grant-door-e2e';
+    await rt.coordination.coordinationRequestRepository.saveRequest(
+      makeApprovedGrant(grantId, forgeActionScope('merge-pr'), HEAD),
+    );
+
+    // The owner decision is withdrawn while the attempt keeps its door.
+    await rt.coordination.coordinationRequestRepository.saveRequest(
+      makeOwnerDecisionRequest(doorRef, HEAD, {
+        state: 'awaiting-decision',
+        decisionRevision: null,
+        grantId: null,
+        revision: 2,
+      }),
+    );
+
+    // `attempt accept` must refuse even though a receipt-bearing accepted
+    // assessment is still stored for this exact head.
+    const accept = await rt.execution.requestAttemptAcceptance.requestAttemptAcceptance({
+      attemptId: 'att-door-e2e',
+      candidateHeadSha: HEAD,
+      reviewerModel: 'openrouter/anthropic/claude-sonnet-4.5',
+    });
+    expect(accept.outcome).toBe('rejected');
+    if (accept.outcome === 'rejected') {
+      expect(accept.reason).toContain('Acceptance blocked');
+    }
+
+    // `forge execute --kind merge-pr` refuses before consuming the grant.
+    const forge = await rt.execution.executeAuthorizedForgeAction.executeAuthorizedForgeAction({
+      actionId: 'action-door-e2e',
+      attemptId: 'att-door-e2e',
+      workOrderId: 'wo-att-door-e2e',
+      kind: 'merge-pr',
+      expectedHeadSha: HEAD,
+      authorizationGrantId: grantId,
+    });
+    expect(forge.outcome).toBe('refused');
+    if (forge.outcome === 'refused') {
+      expect(forge.reason).toContain(`'${doorRef}' is not approved`);
+    }
+    const grant =
+      await rt.coordination.coordinationRequestRepository.findRequestByGrantId(grantId);
+    expect(grant?.consumptions).toHaveLength(0);
+    });
   });
 });

@@ -712,36 +712,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const acceptanceAssessment = new AcceptanceAssessmentAdapter({
     assess: async (request) => {
       const assessmentId = assessmentIdForAttempt(request.attemptId);
-      const inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
-        assessmentId,
-        candidateHeadSha: request.candidateHeadSha,
-      });
-      if (
-        inspected.outcome === 'found' &&
-        inspected.assessment.state === 'accepted' &&
-        inspected.assessment.candidateHeadSha === request.candidateHeadSha &&
-        inspected.assessment.policyRevision === request.policyRevision &&
-        inspected.assessment.acceptanceReceiptId !== null
-      ) {
-        acceptedReceiptByHead[inspected.assessment.candidateHeadSha] =
-          inspected.assessment.acceptanceReceiptId;
-        if (acceptedReceiptsPath !== undefined) {
-          const headSha = inspected.assessment.candidateHeadSha;
-          const receiptId = inspected.assessment.acceptanceReceiptId;
-          await withFileLock(`${acceptedReceiptsPath}.lock`, async () => {
-            const current = readJsonRecord<string>(acceptedReceiptsPath);
-            current[headSha] = receiptId;
-            await writeJsonAtomically(acceptedReceiptsPath, current);
-          });
-        }
-        return {
-          outcome: 'accepted',
-          receiptId: inspected.assessment.acceptanceReceiptId,
-          assessedHeadSha: inspected.assessment.candidateHeadSha,
-        };
-      }
-      // Owner decision references are never read here: acceptance resolves the
-      // attempt's own recorded doors through the ports above.
+      // Always delegate to the use case: it re-checks the attempt's one-way
+      // doors before its idempotent accepted path, so a stored acceptance
+      // whose owner decision has been withdrawn still blocks here.
       const result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
         assessmentId,
         candidateHeadSha: request.candidateHeadSha,
@@ -1057,6 +1030,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       forgePort: forgeAction,
       acceptedReceiptByHead: acceptedReceiptByHeadView,
       acceptanceEvidencePort: acceptanceEvidence,
+      // Merge-time door re-check goes through the same resolution acceptance
+      // uses, so a withdrawn owner decision also refuses the forge action.
+      ownerDecisionPort: ownerDecision,
+      attemptOwnerDecisionPort: attemptOwnerDecision,
     }),
   };
 

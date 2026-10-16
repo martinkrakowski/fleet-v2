@@ -73,6 +73,7 @@ const LANE_ID = 'wk-p4-cross-forge';
 function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
     id: 'attempt-1',
+    ownerDecisionReferences: [],
     workOrderId: 'wo-1',
     kind: 'initial',
     fixNumber: 0,
@@ -560,13 +561,29 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         : overrides.acceptanceEvidence === null
           ? undefined
           : new FakeAcceptanceEvidence(overrides.acceptanceEvidence);
+    const attemptRepo = new InMemoryAttemptRepository([overrides.attempt ?? makeAttempt()]);
     const useCase = new ExecuteAuthorizedForgeActionUseCase({
-      attemptRepo: new InMemoryAttemptRepository([overrides.attempt ?? makeAttempt()]),
+      attemptRepo,
       workOrderRepo,
       journal,
       authorizationPort: authorization,
       forgePort,
       acceptanceEvidencePort,
+      attemptOwnerDecisionPort: {
+        async readAttemptOwnerDecisionReferences({ attemptId }) {
+          const record = await attemptRepo.findAttemptById(attemptId);
+          if (record === null) {
+            return { outcome: 'unknown', reason: `No attempt is recorded for ${attemptId}` };
+          }
+          if (record.ownerDecisionReferences === undefined) {
+            return {
+              outcome: 'unknown',
+              reason: `attempt ${attemptId} was recorded before owner decision references were frozen`,
+            };
+          }
+          return { outcome: 'recorded', ownerDecisionReferences: record.ownerDecisionReferences };
+        },
+      },
       now: () => FIXED_NOW,
     });
     return { journal, authorization, forgePort, workOrderRepo, useCase };

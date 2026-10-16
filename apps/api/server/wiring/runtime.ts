@@ -11,7 +11,13 @@ import {
   consumptionId,
   forgeActionScope,
   observationEventKind,
+  type AttemptOwnerDecisionDelegate as WorkAttemptOwnerDecisionDelegate,
+  type OwnerDecisionDelegate as WorkOwnerDecisionDelegate,
 } from "@fleet/work-execution";
+import type {
+  AttemptOwnerDecisionDelegate as EvidenceAttemptOwnerDecisionDelegate,
+  OwnerDecisionDelegate as EvidenceOwnerDecisionDelegate,
+} from "@fleet/evidence-and-acceptance";
 import type {
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
@@ -206,52 +212,54 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   // The attempt lookup below is filled in once the work composition exists;
   // the evidence delegates only run at assessment time.
   const attemptLookup: { inspectAttempt?: InspectAttemptUseCase } = {};
+  const ownerDecisionDelegate: EvidenceOwnerDecisionDelegate = {
+    // The coordination request's own authorization rule decides; this
+    // delegate calls the supplier's application port, never its repository.
+    checkOwnerDecision: async (request) => {
+      const result = await operator.checkOwnerDecision.checkOwnerDecision({
+        requestId: request.requestId,
+        candidateHeadSha: request.candidateHeadSha,
+      });
+      return result.outcome === "approved"
+        ? { outcome: "approved", decisionId: result.requestId }
+        : result;
+    },
+  };
+  const attemptOwnerDecisionDelegate: EvidenceAttemptOwnerDecisionDelegate & WorkAttemptOwnerDecisionDelegate = {
+    // The doors come from the attempt record dispatch wrote from the
+    // frozen brief package, never from a request body or worktree file.
+    readAttemptOwnerDecisionReferences: async (request) => {
+      const inspectAttempt = attemptLookup.inspectAttempt;
+      if (!inspectAttempt) {
+        return {
+          outcome: "unknown",
+          reason: "The work context is not wired for attempt inspection",
+        };
+      }
+      const inspection = await inspectAttempt.inspectAttempt({
+        attemptId: request.attemptId,
+      });
+      if (inspection.outcome !== "found") {
+        return {
+          outcome: "unknown",
+          reason: `No attempt is recorded for ${request.attemptId}`,
+        };
+      }
+      const recorded = inspection.attempt.ownerDecisionReferences;
+      if (recorded === undefined) {
+        return {
+          outcome: "unknown",
+          reason: `attempt ${request.attemptId} was recorded before owner decision references were frozen`,
+        };
+      }
+      return { outcome: "recorded", ownerDecisionReferences: recorded };
+    },
+  };
   const evidence = createConfiguredEvidenceUseCases(
     { stateDir },
     {
-      ownerDecision: {
-        // The coordination request's own authorization rule decides; this
-        // delegate calls the supplier's application port, never its repository.
-        checkOwnerDecision: async (request) => {
-          const result = await operator.checkOwnerDecision.checkOwnerDecision({
-            requestId: request.requestId,
-            candidateHeadSha: request.candidateHeadSha,
-          });
-          return result.outcome === "approved"
-            ? { outcome: "approved", decisionId: result.requestId }
-            : result;
-        },
-      },
-      attemptOwnerDecision: {
-        // The doors come from the attempt record dispatch wrote from the
-        // frozen brief package, never from a request body or worktree file.
-        readAttemptOwnerDecisionReferences: async (request) => {
-          const inspectAttempt = attemptLookup.inspectAttempt;
-          if (!inspectAttempt) {
-            return {
-              outcome: "unknown",
-              reason: "The work context is not wired for attempt inspection",
-            };
-          }
-          const inspection = await inspectAttempt.inspectAttempt({
-            attemptId: request.attemptId,
-          });
-          if (inspection.outcome !== "found") {
-            return {
-              outcome: "unknown",
-              reason: `No attempt is recorded for ${request.attemptId}`,
-            };
-          }
-          const recorded = inspection.attempt.ownerDecisionReferences;
-          if (recorded === undefined) {
-            return {
-              outcome: "unknown",
-              reason: `attempt ${request.attemptId} was recorded before owner decision references were frozen`,
-            };
-          }
-          return { outcome: "recorded", ownerDecisionReferences: recorded };
-        },
-      },
+      ownerDecision: ownerDecisionDelegate,
+      attemptOwnerDecision: attemptOwnerDecisionDelegate,
     },
   );
 
@@ -284,33 +292,31 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
           },
         });
 
+  // The work context re-checks forge-time doors through the same coordination
+  // resolution the evidence context uses; the shapes differ per context, the
+  // authority (the recorded request's own rule) does not.
+  const workOwnerDecisionDelegate: WorkOwnerDecisionDelegate = {
+    resolveOwnerDecision: async (request) => {
+      const result = await operator.checkOwnerDecision.checkOwnerDecision({
+        requestId: request.decisionReference,
+        candidateHeadSha: request.candidateHeadSha,
+      });
+      return result.outcome === "approved"
+        ? { outcome: "approved", decisionId: result.requestId }
+        : result;
+    },
+  };
+
   const crossContext: WorkCrossContextDelegates = {
+    ownerDecision: workOwnerDecisionDelegate,
+    attemptOwnerDecision: attemptOwnerDecisionDelegate,
     acceptance: {
       // One acceptance assessment per attempt candidate head; the work-side
       // request's coordinates map onto the evidence context's exact-head keys.
       assess: async (request) => {
-        const inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
-          assessmentId: request.attemptId,
-          candidateHeadSha: request.candidateHeadSha,
-        });
-        if (
-          inspected.outcome === "found" &&
-          inspected.assessment.state === "accepted" &&
-          inspected.assessment.candidateHeadSha === request.candidateHeadSha &&
-          inspected.assessment.policyRevision === request.policyRevision &&
-          inspected.assessment.acceptanceReceiptId !== null
-        ) {
-          acceptedReceiptByHead[inspected.assessment.candidateHeadSha] =
-            inspected.assessment.acceptanceReceiptId;
-          if (stateDir !== undefined) {
-            persistAcceptedReceiptsToState(stateDir, liveAcceptedReceiptByHead);
-          }
-          return {
-            outcome: "accepted",
-            receiptId: inspected.assessment.acceptanceReceiptId,
-            assessedHeadSha: inspected.assessment.candidateHeadSha,
-          };
-        }
+        // Always delegate to the use case: it re-checks the attempt's one-way
+        // doors before its idempotent accepted path, so a stored acceptance
+        // whose owner decision has been withdrawn still blocks here.
         const result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
           assessmentId: request.attemptId,
           candidateHeadSha: request.candidateHeadSha,

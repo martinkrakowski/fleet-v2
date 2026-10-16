@@ -5,7 +5,7 @@
  * append-only evidence with duplicate ids refused; capacity reservations are
  * keyed by id and superseded per attempt so intent is durable before the
  * subprocess runs. In-memory by default, JSON-persisted via atomic
- * temp-file-then-rename writes when `stateDir` is configured.
+ * temp-file-then-rename writes under exclusive locks when `stateDir` is configured.
  */
 
 import { promises as fs } from 'node:fs';
@@ -16,13 +16,12 @@ import type {
   CapacityReservationRecord,
 } from '../../domain/execution-records.js';
 import type { ExecutionJournalPort } from '../../application/ports/out/ExecutionJournalPort.out-port.js';
+import { withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface ExecutionJournalAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
   readonly stateDir?: string;
 }
-
-let journalTempCounter = 0;
 
 function isActionJournalEntryRecord(value: unknown): value is ActionJournalEntryRecord {
   if (typeof value !== 'object' || value === null) return false;
@@ -37,48 +36,90 @@ function isCapacityReservationRecord(value: unknown): value is CapacityReservati
 }
 
 export class ExecutionJournalAdapter implements ExecutionJournalPort {
-  private readonly journalEntries: ActionJournalEntryRecord[] = [];
-  private readonly reservationsById = new Map<string, CapacityReservationRecord>();
-  private loadPromise: Promise<void> | null = null;
-  private journalPersistCounter = 0;
-  private reservationPersistCounter = 0;
+  private readonly inMemoryJournalEntries: ActionJournalEntryRecord[] = [];
+  private readonly inMemoryReservationsById = new Map<string, CapacityReservationRecord>();
 
   constructor(private readonly options?: ExecutionJournalAdapterOptions) {}
 
   async appendJournalEntry(entry: ActionJournalEntryRecord): Promise<void> {
-    await this.ensureLoaded();
-    const duplicate = this.journalEntries.some((existing) => existing.id === entry.id);
-    if (duplicate) {
-      throw new Error(`Duplicate journal entry id: ${entry.id}`);
+    const stateDir = this.options?.stateDir;
+    if (stateDir === undefined) {
+      const duplicate = this.inMemoryJournalEntries.some((existing) => existing.id === entry.id);
+      if (duplicate) {
+        throw new Error(`Duplicate journal entry id: ${entry.id}`);
+      }
+      this.inMemoryJournalEntries.push(entry);
+      return;
     }
-    this.journalEntries.push(entry);
-    await this.persistJournal();
+
+    const target = path.join(stateDir, 'journal.json');
+    const lockPath = path.join(stateDir, 'journal.json.lock');
+
+    await withFileLock(lockPath, async () => {
+      const entries = await this.readJournalFromDisk(target);
+      const duplicate = entries.some((existing) => existing.id === entry.id);
+      if (duplicate) {
+        throw new Error(`Duplicate journal entry id: ${entry.id}`);
+      }
+      entries.push(entry);
+      await writeJsonAtomically(target, entries);
+    });
   }
 
   async listJournalEntriesForAttempt(
     attemptId: string,
   ): Promise<readonly ActionJournalEntryRecord[]> {
-    await this.ensureLoaded();
-    return this.journalEntries.filter((entry) => entry.attemptId === attemptId);
+    const stateDir = this.options?.stateDir;
+    if (stateDir === undefined) {
+      return this.inMemoryJournalEntries.filter((entry) => entry.attemptId === attemptId);
+    }
+    const target = path.join(stateDir, 'journal.json');
+    const entries = await this.readJournalFromDisk(target);
+    return entries.filter((entry) => entry.attemptId === attemptId);
   }
 
   async saveCapacityReservation(reservation: CapacityReservationRecord): Promise<void> {
-    await this.ensureLoaded();
-    // A reservation supersedes any earlier reservation for the same attempt.
-    for (const [id, existing] of this.reservationsById) {
-      if (existing.attemptId === reservation.attemptId && id !== reservation.id) {
-        this.reservationsById.delete(id);
+    const stateDir = this.options?.stateDir;
+    if (stateDir === undefined) {
+      for (const [id, existing] of this.inMemoryReservationsById) {
+        if (existing.attemptId === reservation.attemptId && id !== reservation.id) {
+          this.inMemoryReservationsById.delete(id);
+        }
       }
+      this.inMemoryReservationsById.set(reservation.id, reservation);
+      return;
     }
-    this.reservationsById.set(reservation.id, reservation);
-    await this.persistReservations();
+
+    const target = path.join(stateDir, 'reservations.json');
+    const lockPath = path.join(stateDir, 'reservations.json.lock');
+
+    await withFileLock(lockPath, async () => {
+      const reservations = await this.readReservationsFromDisk(target);
+      // A reservation supersedes any earlier reservation for the same attempt.
+      for (const [id, existing] of reservations) {
+        if (existing.attemptId === reservation.attemptId && id !== reservation.id) {
+          reservations.delete(id);
+        }
+      }
+      reservations.set(reservation.id, reservation);
+      await writeJsonAtomically(target, [...reservations.values()]);
+    });
   }
 
   async listActiveReservations(
     hostId?: string,
   ): Promise<readonly CapacityReservationRecord[]> {
-    await this.ensureLoaded();
-    const held = [...this.reservationsById.values()].filter(
+    const stateDir = this.options?.stateDir;
+    if (stateDir === undefined) {
+      const held = [...this.inMemoryReservationsById.values()].filter(
+        (reservation) => reservation.held === true,
+      );
+      if (hostId === undefined) return held;
+      return held.filter((reservation) => reservation.hostId === hostId);
+    }
+    const target = path.join(stateDir, 'reservations.json');
+    const reservations = await this.readReservationsFromDisk(target);
+    const held = [...reservations.values()].filter(
       (reservation) => reservation.held === true,
     );
     if (hostId === undefined) return held;
@@ -86,84 +127,78 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
   }
 
   async releaseCapacityReservation(attemptId: string, releasedAtIso: string): Promise<boolean> {
-    await this.ensureLoaded();
-    const held = [...this.reservationsById.values()].find(
-      (reservation) => reservation.attemptId === attemptId && reservation.held === true,
-    );
-    if (held === undefined) return false;
-    this.reservationsById.set(held.id, { ...held, held: false, releasedAtIso });
-    await this.persistReservations();
-    return true;
-  }
-
-  private ensureLoaded(): Promise<void> {
-    if (this.loadPromise === null) {
-      this.loadPromise = this.loadFromDisk().catch((error: unknown) => {
-        this.loadPromise = null;
-        throw error;
-      });
-    }
-    return this.loadPromise;
-  }
-
-  private async loadFromDisk(): Promise<void> {
     const stateDir = this.options?.stateDir;
-    if (stateDir === undefined) return;
-    const journalFile = path.join(stateDir, 'journal.json');
-    try {
-      const raw = await fs.readFile(journalFile, 'utf8');
-      const parsed: unknown = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        for (const item of parsed) {
-          if (isActionJournalEntryRecord(item)) this.journalEntries.push(item);
-        }
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    if (stateDir === undefined) {
+      const held = [...this.inMemoryReservationsById.values()].find(
+        (reservation) => reservation.attemptId === attemptId && reservation.held === true,
+      );
+      if (held === undefined) return false;
+      this.inMemoryReservationsById.set(held.id, { ...held, held: false, releasedAtIso });
+      return true;
     }
-    const reservationsFile = path.join(stateDir, 'reservations.json');
-    try {
-      const raw = await fs.readFile(reservationsFile, 'utf8');
-      const parsed: unknown = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        for (const item of parsed) {
-          if (isCapacityReservationRecord(item)) this.reservationsById.set(item.id, item);
-        }
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-  }
 
-  private async persistJournal(): Promise<void> {
-    const stateDir = this.options?.stateDir;
-    if (stateDir === undefined) return;
-    const target = path.join(stateDir, 'journal.json');
-    const temp = `${target}.${process.pid}-${this.journalPersistCounter++}-${journalTempCounter++}.tmp`;
-    const serialized = JSON.stringify(this.journalEntries, null, 2);
-    await fs.mkdir(stateDir, { recursive: true });
-    try {
-      await fs.writeFile(temp, serialized, 'utf8');
-      await fs.rename(temp, target);
-    } catch (error) {
-      await fs.rm(temp, { force: true }).catch(() => undefined);
-      throw error;
-    }
-  }
-
-  private async persistReservations(): Promise<void> {
-    const stateDir = this.options?.stateDir;
-    if (stateDir === undefined) return;
     const target = path.join(stateDir, 'reservations.json');
-    const temp = `${target}.${process.pid}-${this.reservationPersistCounter++}-${journalTempCounter++}.tmp`;
-    const serialized = JSON.stringify([...this.reservationsById.values()], null, 2);
-    await fs.mkdir(stateDir, { recursive: true });
+    const lockPath = path.join(stateDir, 'reservations.json.lock');
+
+    return await withFileLock(lockPath, async () => {
+      const reservations = await this.readReservationsFromDisk(target);
+      const held = [...reservations.values()].find(
+        (reservation) => reservation.attemptId === attemptId && reservation.held === true,
+      );
+      if (held === undefined) return false;
+      reservations.set(held.id, { ...held, held: false, releasedAtIso });
+      await writeJsonAtomically(target, [...reservations.values()]);
+      return true;
+    });
+  }
+
+  private async readJournalFromDisk(target: string): Promise<ActionJournalEntryRecord[]> {
+    const entries: ActionJournalEntryRecord[] = [];
+    let raw: string;
     try {
-      await fs.writeFile(temp, serialized, 'utf8');
-      await fs.rename(temp, target);
-    } catch (error) {
-      await fs.rm(temp, { force: true }).catch(() => undefined);
+      raw = await fs.readFile(target, 'utf8');
+    } catch (error: unknown) {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        (error as { code?: string }).code === 'ENOENT'
+      ) {
+        return entries;
+      }
       throw error;
     }
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      throw new Error(`ExecutionJournalAdapter expects a record list in ${target}`);
+    }
+    for (const item of parsed) {
+      if (isActionJournalEntryRecord(item)) entries.push(item);
+    }
+    return entries;
+  }
+
+  private async readReservationsFromDisk(target: string): Promise<Map<string, CapacityReservationRecord>> {
+    const map = new Map<string, CapacityReservationRecord>();
+    let raw: string;
+    try {
+      raw = await fs.readFile(target, 'utf8');
+    } catch (error: unknown) {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        (error as { code?: string }).code === 'ENOENT'
+      ) {
+        return map;
+      }
+      throw error;
+    }
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      throw new Error(`ExecutionJournalAdapter expects a record list in ${target}`);
+    }
+    for (const item of parsed) {
+      if (isCapacityReservationRecord(item)) map.set(item.id, item);
+    }
+    return map;
   }
 }

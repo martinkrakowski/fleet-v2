@@ -435,8 +435,8 @@ describe("cross-context state persistence helpers", () => {
 
     expect(readAcceptedReceiptsFromState(stateDir)).toEqual({});
 
-    persistAcceptedReceiptsToState(stateDir, { "head-a": "acc-a" });
-    persistAcceptedReceiptsToState(stateDir, { "head-b": "acc-b" });
+    await persistAcceptedReceiptsToState(stateDir, { "head-a": "acc-a" });
+    await persistAcceptedReceiptsToState(stateDir, { "head-b": "acc-b" });
 
     // The second write merges instead of dropping the first process's receipt.
     expect(readAcceptedReceiptsFromState(stateDir)).toEqual({
@@ -451,13 +451,13 @@ describe("cross-context state persistence helpers", () => {
 
     expect(readAuthorizationCoordinatesFromState(stateDir).size).toBe(0);
 
-    persistAuthorizationCoordinatesToState(
+    await persistAuthorizationCoordinatesToState(
       stateDir,
       new Map([
         ["grant-a", { attemptId: "attempt-a", expectedHeadSha: "head-a" }],
       ]),
     );
-    persistAuthorizationCoordinatesToState(
+    await persistAuthorizationCoordinatesToState(
       stateDir,
       new Map([
         ["grant-b", { attemptId: "attempt-b", expectedHeadSha: "head-b" }],
@@ -476,16 +476,16 @@ describe("cross-context state persistence helpers", () => {
     expect(readdirSync(stateDir).filter((name) => name.includes(".tmp-"))).toEqual([]);
   });
 
-  it("treats malformed persisted state as empty rather than guessing", async () => {
+  it("refuses malformed persisted state instead of reading it as empty", async () => {
+    // A corrupt file must never be read as empty: the next locked write would
+    // replace the whole history with one record (Fable pass on #45).
     const stateDir = await makeTempDir();
 
     await writeFile(join(stateDir, "accepted-receipts.json"), "not json", "utf8");
-    await writeJsonFile(join(stateDir, "authorization-coordinates.json"), {
-      "grant-a": { attemptId: 7, expectedHeadSha: "head-a" },
-    });
+    await writeFile(join(stateDir, "authorization-coordinates.json"), "{not json", "utf8");
 
-    expect(readAcceptedReceiptsFromState(stateDir)).toEqual({});
-    expect(readAuthorizationCoordinatesFromState(stateDir).size).toBe(0);
+    expect(() => readAcceptedReceiptsFromState(stateDir)).toThrow();
+    expect(() => readAuthorizationCoordinatesFromState(stateDir)).toThrow();
   });
 });
 

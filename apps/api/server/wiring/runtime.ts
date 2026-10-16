@@ -2,9 +2,10 @@
 // in-process cross-context adapters. The composition root is the only place
 // where supplier-side use cases are bound to consumer-side ports; the use
 // cases themselves never import across contexts.
-import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { withFileLock, writeJsonAtomically } from "./file-store";
 
 import {
   consumptionId,
@@ -67,28 +68,32 @@ function isAuthorizationCoordinate(value: unknown): value is FleetAuthorizationC
   );
 }
 
-/** Atomic JSON persistence: temp file beside the target, then rename over it. */
-function writeJsonFileAtomically(filePath: string, value: unknown): void {
-  mkdirSync(dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp-${randomUUID()}`;
-  writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  renameSync(tempPath, filePath);
-}
-
 /**
- * Read the acceptance receipts persisted under `stateDir`. An absent,
- * unreadable or malformed file contributes no receipts; it is never
- * reinterpreted as acceptance.
+ * Read the acceptance receipts persisted under `stateDir`. ENOENT means {};
+ * unreadable or malformed persisted state throws. Any other filesystem error (e.g. EACCES) throws.
  */
 export function readAcceptedReceiptsFromState(stateDir: string): Record<string, string> {
+  const filePath = join(stateDir, ACCEPTED_RECEIPTS_FILE);
+  let content: string;
   try {
-    const parsed: unknown = JSON.parse(
-      readFileSync(join(stateDir, ACCEPTED_RECEIPTS_FILE), "utf8"),
-    );
-    return isRecordOfStrings(parsed) ? { ...parsed } : {};
-  } catch {
-    return {};
+    content = readFileSync(filePath, "utf8");
+  } catch (error: unknown) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      (error as { code?: string }).code === "ENOENT"
+    ) {
+      return {};
+    }
+    throw error;
   }
+  const parsed: unknown = JSON.parse(content);
+  if (!isRecordOfStrings(parsed)) {
+    throw new Error(
+      `Unreadable accepted receipts state at ${filePath}: expected a JSON object of string values`,
+    );
+  }
+  return { ...parsed };
 }
 
 /**
@@ -96,41 +101,56 @@ export function readAcceptedReceiptsFromState(stateDir: string): Record<string, 
  * merging the receipts already on disk so records written by other processes
  * (a CLI run, an earlier API process) are never dropped.
  */
-export function persistAcceptedReceiptsToState(
+export async function persistAcceptedReceiptsToState(
   stateDir: string,
   receipts: Readonly<Record<string, string>>,
-): void {
-  writeJsonFileAtomically(join(stateDir, ACCEPTED_RECEIPTS_FILE), {
-    ...readAcceptedReceiptsFromState(stateDir),
-    ...receipts,
+): Promise<void> {
+  const filePath = join(stateDir, ACCEPTED_RECEIPTS_FILE);
+  await withFileLock(`${filePath}.lock`, async () => {
+    const diskReceipts = readAcceptedReceiptsFromState(stateDir);
+    await writeJsonAtomically(filePath, {
+      ...diskReceipts,
+      ...receipts,
+    });
   });
 }
 
 /**
- * Read the authorization coordinates persisted under `stateDir`. An absent,
- * unreadable or malformed file contributes no coordinates.
+ * Read the authorization coordinates persisted under `stateDir`. ENOENT
+ * means an empty map; unreadable or malformed persisted state throws.
+ * Any other filesystem error (e.g. EACCES) throws.
  */
 export function readAuthorizationCoordinatesFromState(
   stateDir: string,
 ): Map<string, FleetAuthorizationCoordinate> {
+  const filePath = join(stateDir, AUTHORIZATION_COORDINATES_FILE);
   const coordinates = new Map<string, FleetAuthorizationCoordinate>();
+  let content: string;
   try {
-    const parsed: unknown = JSON.parse(
-      readFileSync(join(stateDir, AUTHORIZATION_COORDINATES_FILE), "utf8"),
-    );
-    if (!isPlainRecord(parsed)) {
+    content = readFileSync(filePath, "utf8");
+  } catch (error: unknown) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      (error as { code?: string }).code === "ENOENT"
+    ) {
       return coordinates;
     }
-    for (const [grantId, coordinate] of Object.entries(parsed)) {
-      if (isAuthorizationCoordinate(coordinate)) {
-        coordinates.set(grantId, {
-          attemptId: coordinate.attemptId,
-          expectedHeadSha: coordinate.expectedHeadSha,
-        });
-      }
+    throw error;
+  }
+  const parsed: unknown = JSON.parse(content);
+  if (!isPlainRecord(parsed)) {
+    throw new Error(
+      `Unreadable authorization coordinates state at ${filePath}: expected a JSON object`,
+    );
+  }
+  for (const [grantId, coordinate] of Object.entries(parsed)) {
+    if (isAuthorizationCoordinate(coordinate)) {
+      coordinates.set(grantId, {
+        attemptId: coordinate.attemptId,
+        expectedHeadSha: coordinate.expectedHeadSha,
+      });
     }
-  } catch {
-    // No persisted coordinates yet; the live in-process map stays authoritative.
   }
   return coordinates;
 }
@@ -140,18 +160,21 @@ export function readAuthorizationCoordinatesFromState(
  * merging the coordinates already on disk so grants resolved by other
  * processes keep their scopes.
  */
-export function persistAuthorizationCoordinatesToState(
+export async function persistAuthorizationCoordinatesToState(
   stateDir: string,
   coordinates: ReadonlyMap<string, FleetAuthorizationCoordinate>,
-): void {
-  const merged = readAuthorizationCoordinatesFromState(stateDir);
-  for (const [grantId, coordinate] of coordinates) {
-    merged.set(grantId, coordinate);
-  }
-  writeJsonFileAtomically(
-    join(stateDir, AUTHORIZATION_COORDINATES_FILE),
-    Object.fromEntries(merged),
-  );
+): Promise<void> {
+  const filePath = join(stateDir, AUTHORIZATION_COORDINATES_FILE);
+  await withFileLock(`${filePath}.lock`, async () => {
+    const merged = readAuthorizationCoordinatesFromState(stateDir);
+    for (const [grantId, coordinate] of coordinates) {
+      merged.set(grantId, coordinate);
+    }
+    await writeJsonAtomically(
+      filePath,
+      Object.fromEntries(merged),
+    );
+  });
 }
 
 export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null): void {
@@ -213,7 +236,9 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
           case "accepted": {
             acceptedReceiptByHead[result.candidateHeadSha] = result.receiptId;
             if (stateDir !== undefined) {
-              persistAcceptedReceiptsToState(stateDir, liveAcceptedReceiptByHead);
+              await persistAcceptedReceiptsToState(stateDir, {
+                [result.candidateHeadSha]: result.receiptId,
+              });
             }
             return {
               outcome: "accepted",
@@ -297,7 +322,18 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
           expectedHeadSha: request.expectedHeadSha,
         });
         if (stateDir !== undefined) {
-          persistAuthorizationCoordinatesToState(stateDir, resolveCoordinates);
+          await persistAuthorizationCoordinatesToState(
+            stateDir,
+            new Map([
+              [
+                result.grantId,
+                {
+                  attemptId: request.attemptId,
+                  expectedHeadSha: request.expectedHeadSha,
+                },
+              ],
+            ]),
+          );
         }
         return { outcome: "granted", authorizationGrantId: result.grantId };
       },

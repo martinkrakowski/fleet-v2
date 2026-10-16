@@ -9,6 +9,7 @@ export * from "./BriefKnowledgeAdapter.adapter.js";
 export * from "./ExecutionJournalAdapter.adapter.js";
 export * from "./ExecutionObservationAdapter.adapter.js";
 export * from "./ExecutionRunnerAdapter.adapter.js";
+export * from "./file-store.js";
 export * from "./ForgeActionAdapter.adapter.js";
 export * from "./WorkOrderRepositoryAdapter.adapter.js";
 export * from "./WorkspaceAdapter.adapter.js";

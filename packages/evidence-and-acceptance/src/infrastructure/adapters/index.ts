@@ -2,6 +2,7 @@
 
 export * from "./EvidenceArchiveAdapter.adapter.js";
 export * from "./EvidenceAssessmentRepositoryAdapter.adapter.js";
+export * from "./file-store.js";
 export * from "./ForgeEvidenceAdapter.adapter.js";
 export * from "./IndependentReviewAdapter.adapter.js";
 export * from "./OcmReviewTransport.adapter.js";

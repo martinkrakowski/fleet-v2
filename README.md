@@ -77,6 +77,7 @@ These values belong to the operator's installation, never to this repository.
 | Variable | Meaning |
 |---|---|
 | `FLEET_STATE_DIR` | Directory for repositories, journals, evidence archives, receipts and outboxes. The CLI's `--state-dir` flag overrides it. |
+| `FLEET_INSTALLATION_FILE` | Path to the installation configuration file (default `installation/fleet.json` under the working directory). |
 | `FLEET_WORKTREE_SSH_HOST` | Host that owns the lane worktrees. Worktree inspection and artifact collection run there over SSH. |
 | `FLEET_RUNNER_AGENT`, `FLEET_RUNNER_MODEL`, `FLEET_RUNNER_VARIANT` | The runner seat. The model and variant are recorded in the frozen brief manifest. |
 | `OCM_REMOTE_PORT` | The single port passed to the runner subprocess. |

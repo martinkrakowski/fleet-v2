@@ -16,6 +16,7 @@
   "dependencies": {
     "@fleet/brief-knowledge": "workspace:*",
     "@fleet/evidence-and-acceptance": "workspace:*",
+    "@fleet/installation": "workspace:*",
     "@fleet/operator-coordination": "workspace:*",
     "@fleet/work-execution": "workspace:*"
   },

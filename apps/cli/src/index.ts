@@ -29,11 +29,16 @@ import {
 } from '@fleet/brief-knowledge';
 import { COORDINATION_KINDS } from '@fleet/operator-coordination';
 
+import { loadInstallation } from '@fleet/installation';
+
 import {
   assessmentIdForAttempt,
   createFleetCliRuntime,
+  resolveRunnerSettings,
   type FleetCliRuntime,
 } from './composition.js';
+
+export { resolveRunnerSettings };
 
 export interface CliIo {
   readonly stdout: (text: string) => void;
@@ -690,7 +695,23 @@ export async function runCli(
     }
     // An explicitly injected runtime stays authoritative; only a call without
     // one composes a fresh runtime bound to the resolved state directory.
-    const activeRuntime = runtime ?? createFleetCliRuntime({ stateDir });
+    let activeRuntime: FleetCliRuntime;
+    if (runtime !== undefined) {
+      activeRuntime = runtime;
+    } else {
+      const loadResult = loadInstallation();
+      if (loadResult.status === 'invalid') {
+        io.stderr(`installation invalid (${loadResult.file}):\n`);
+        for (const error of loadResult.errors) {
+          io.stderr(`${error}\n`);
+        }
+        return 2;
+      }
+      activeRuntime = createFleetCliRuntime({
+        stateDir,
+        installation: loadResult.installation,
+      });
+    }
     const group = restArgv[0];
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);

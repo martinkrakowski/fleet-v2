@@ -661,9 +661,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         acceptedReceiptByHead[inspected.assessment.candidateHeadSha] =
           inspected.assessment.acceptanceReceiptId;
         if (acceptedReceiptsPath !== undefined) {
-          writeJsonRecordAtomic(acceptedReceiptsPath, {
-            ...readJsonRecord<string>(acceptedReceiptsPath),
-            [inspected.assessment.candidateHeadSha]: inspected.assessment.acceptanceReceiptId,
+          const headSha = inspected.assessment.candidateHeadSha;
+          const receiptId = inspected.assessment.acceptanceReceiptId;
+          await withFileLock(`${acceptedReceiptsPath}.lock`, async () => {
+            const current = readJsonRecord<string>(acceptedReceiptsPath);
+            current[headSha] = receiptId;
+            await writeJsonAtomically(acceptedReceiptsPath, current);
           });
         }
         return {

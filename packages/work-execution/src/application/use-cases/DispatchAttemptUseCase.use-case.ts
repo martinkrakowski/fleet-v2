@@ -45,9 +45,9 @@ const REQUIRED_BOOLEAN_CAPABILITIES: readonly (keyof RunnerIsolationCapabilities
 
 /**
  * The lane brief's runner requirements (D4): a scoped worktree with every
- * enforced isolation boolean. Requirements come from the brief only — an
- * operator override is a usage error at the boundaries — so this profile is
- * the default when a request does not carry its own brief-derived ones.
+ * enforced isolation boolean. Requirements come from the frozen brief's lane
+ * profile only — the request carries none, and an operator override is a
+ * usage error at the boundaries.
  */
 const BRIEF_RUNNER_REQUIREMENTS: RunnerIsolationCapabilities = {
   filesystemScope: 'scoped-worktree',
@@ -147,10 +147,9 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     }
 
     const runnerCapabilities = this.deps.runner.describeCapabilities();
-    // Requirements come from the brief's lane profile only; a request field
-    // is tolerated for callers that carry brief-derived requirements, never
-    // as an operator override.
-    const requiredCapabilities = request.requiredCapabilities ?? BRIEF_RUNNER_REQUIREMENTS;
+    // Requirements come from the frozen brief's lane profile only; the
+    // request carries no requirements field.
+    const requiredCapabilities = BRIEF_RUNNER_REQUIREMENTS;
     const capabilitiesMissing =
       runnerCapabilities.filesystemScope !== 'scoped-worktree' ||
       REQUIRED_BOOLEAN_CAPABILITIES.some(

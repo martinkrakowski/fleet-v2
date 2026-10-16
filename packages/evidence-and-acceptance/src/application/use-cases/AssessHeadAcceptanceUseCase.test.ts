@@ -508,4 +508,34 @@ describe('AssessHeadAcceptanceUseCase forge mode (D6)', () => {
     }
     expect(repo.assessment?.forgeEvidence).toBeUndefined();
   });
+
+  it('mode github replaces a previously stored not-configured forgeEvidence with the real forge read', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(
+      makePassingAssessmentRecord({ forgeEvidence: 'not-configured' }),
+    );
+    let reads = 0;
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      forgeEvidence: {
+        async readForgeCheckStatus() {
+          reads += 1;
+          return { candidateHeadSha: CANDIDATE_HEAD, ciState: 'pass', unresolvedThreadCount: 0 };
+        },
+      },
+      forgeMode: 'github',
+      ownerDecisionPort: new InMemoryOwnerDecisionPort({ outcome: 'approved', decisionId: 'door-1' }),
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: [],
+      }),
+    });
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    // The real forge read decides: the stale not-configured marker is never
+    // carried over, and acceptance is no longer receipt-only.
+    expect(reads).toBe(1);
+    expect(result.outcome).toBe('accepted');
+    expect(repo.assessment?.forgeEvidence).toBeUndefined();
+  });
 });

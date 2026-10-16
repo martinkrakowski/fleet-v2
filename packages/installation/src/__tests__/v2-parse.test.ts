@@ -58,6 +58,7 @@ describe('parseInstallation v2', () => {
   it('refuses v1 sections in a v2 file', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: validV2.hosts,
       runner: { agent: 'example-agent', model: 'example-model' },
       worktree: { sshHost: 'lane-host.example' },
@@ -80,17 +81,38 @@ describe('parseInstallation v2', () => {
 
   it('requires the hosts section', () => {
     const result = parseInstallation({ schemaVersion: 2 });
-    expect(result).toEqual({ ok: false, errors: ['hosts: required'] });
+    expect(result).toEqual({ ok: false, errors: ['hosts: required', 'forge: required'] });
   });
 
   it('rejects a hosts section that is not an object', () => {
     const result = parseInstallation({ schemaVersion: 2, hosts: 'nope' });
-    expect(result).toEqual({ ok: false, errors: ['hosts: must be an object'] });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['hosts: must be an object', 'forge: required'],
+    });
+  });
+
+  it('requires a forge section in a v2 file (D6)', () => {
+    const withForge = parseInstallation({
+      schemaVersion: 2,
+      hosts: validV2.hosts,
+      forge: validV2.forge,
+    });
+    expect(withForge.ok).toBe(true);
+    if (withForge.ok) {
+      expect(withForge.installation.forge).toEqual(validV2.forge);
+    }
+    const withoutForge = parseInstallation({
+      schemaVersion: 2,
+      hosts: validV2.hosts,
+    });
+    expect(withoutForge).toEqual({ ok: false, errors: ['forge: required'] });
   });
 
   it('rejects an invalid host name without echoing it', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: {
         'BAD HOST NAME!': {
           transport: 'local',
@@ -114,7 +136,7 @@ describe('parseInstallation v2', () => {
 
   it('rejects a host named __proto__ coming from JSON', () => {
     const parsed = JSON.parse(
-      '{"schemaVersion":2,"hosts":{"__proto__":{"transport":"local","worktreeRoot":"/srv","roles":["orchestrator","lane-runner"]}}}',
+      '{"schemaVersion":2,"forge":{"mode":"none"},"hosts":{"__proto__":{"transport":"local","worktreeRoot":"/srv","roles":["orchestrator","lane-runner"]}}}',
     ) as unknown;
     const result = parseInstallation(parsed);
     expect(result).toEqual({
@@ -130,6 +152,7 @@ describe('parseInstallation v2', () => {
   it('collects every host error with value-free messages', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: {
         a: {
           transport: 'ftp',
@@ -171,6 +194,7 @@ describe('parseInstallation v2', () => {
   it('requires sshAlias for ssh transport and refuses it for local transport', () => {
     const missingAlias = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: { lane: { transport: 'ssh', worktreeRoot: '/srv', roles: ['lane-runner'] } },
     });
     expect(missingAlias).toEqual({
@@ -184,6 +208,7 @@ describe('parseInstallation v2', () => {
 
     const localWithAlias = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: { local: { transport: 'local', sshAlias: 'lane-host.example', worktreeRoot: '/srv', roles: ['lane-runner'] } },
     });
     expect(localWithAlias).toEqual({
@@ -199,6 +224,7 @@ describe('parseInstallation v2', () => {
   it('refuses a capability source key in a file', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: {
         lane: {
           transport: 'local',
@@ -230,6 +256,7 @@ describe('parseInstallation v2', () => {
   it('refuses an unknown capability filesystem scope', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: {
         lane: {
           transport: 'local',
@@ -260,6 +287,7 @@ describe('parseInstallation v2', () => {
   it('enforces the host role invariants', () => {
     const noOrchestrator = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: { lane: { transport: 'local', worktreeRoot: '/srv', roles: ['lane-runner'] } },
     });
     expect(noOrchestrator).toEqual({
@@ -273,6 +301,7 @@ describe('parseInstallation v2', () => {
 
     const twoOrchestrators = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: {
         a: { transport: 'local', worktreeRoot: '/srv', roles: ['orchestrator'] },
         b: { transport: 'local', worktreeRoot: '/srv', roles: ['orchestrator'] },
@@ -290,6 +319,7 @@ describe('parseInstallation v2', () => {
   it('refuses a lane-runner host without a runner block (Fable should-fix on #64)', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: {
         lane: { transport: 'local', worktreeRoot: '/srv', roles: ['orchestrator', 'lane-runner'] },
       },
@@ -303,6 +333,7 @@ describe('parseInstallation v2', () => {
   it('rejects empty or repeated host roles', () => {
     const empty = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: { a: { transport: 'local', worktreeRoot: '/srv', roles: [] } },
     });
     expect(empty.ok).toBe(false);
@@ -312,6 +343,7 @@ describe('parseInstallation v2', () => {
 
     const repeated = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: { a: { transport: 'local', worktreeRoot: '/srv', roles: ['lane-runner', 'lane-runner'] } },
     });
     expect(repeated.ok).toBe(false);
@@ -323,6 +355,7 @@ describe('parseInstallation v2', () => {
   it('rejects duplicate or invalid tools entries', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: validV2.hosts,
       tools: ['opencode', 'opencode', '   '],
     });
@@ -335,6 +368,7 @@ describe('parseInstallation v2', () => {
   it('collects seat errors and refuses duplicate seat ids', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: validV2.hosts,
       seats: [
         {
@@ -364,6 +398,7 @@ describe('parseInstallation v2', () => {
   it('refuses chain steps that name an unknown seat', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: validV2.hosts,
       seats: [
         {
@@ -392,6 +427,7 @@ describe('parseInstallation v2', () => {
   it('refuses unknown chain role keys without echoing them', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: validV2.hosts,
       chains: { SENTINEL_CHAIN_ROLE: [{ seatId: 'implementer' }] },
     });
@@ -404,6 +440,7 @@ describe('parseInstallation v2', () => {
   it('validates the policy shape without applying rules', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: validV2.hosts,
       policy: {
         forbiddenRoutes: [{ tool: 'opencode' }],
@@ -422,6 +459,7 @@ describe('parseInstallation v2', () => {
   it('refuses v1 shelf fields in a v2 file', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: validV2.hosts,
       shelf: { baseUrl: 'https://shelf.example', keyFile: '/etc/shelf/key' },
     });
@@ -434,6 +472,7 @@ describe('parseInstallation v2', () => {
   it('validates the git shelf provider', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: validV2.hosts,
       shelf: { provider: 'git', repoDir: 'relative/shelf', branch: '  ' },
     });
@@ -450,6 +489,7 @@ describe('parseInstallation v2', () => {
   it('refuses extra keys on the local shelf provider and unknown providers', () => {
     const localWithExtra = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: validV2.hosts,
       shelf: { provider: 'local', branch: 'some-branch' },
     });
@@ -457,6 +497,7 @@ describe('parseInstallation v2', () => {
 
     const badProvider = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: validV2.hosts,
       shelf: { provider: 'snippet' },
     });
@@ -499,6 +540,7 @@ describe('parseInstallation v2', () => {
   it('refuses verification.sshHost in a v2 file', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: validV2.hosts,
       verification: {
         sshHost: 'verify-host.example',
@@ -511,6 +553,7 @@ describe('parseInstallation v2', () => {
   it('keeps the v1 procedure rules inside a v2 verification section', () => {
     const result = parseInstallation({
       schemaVersion: 2,
+      forge: { mode: 'none' },
       hosts: validV2.hosts,
       verification: { procedures: { BAD_NAME: { command: 'yarn' } } },
     });

@@ -48,9 +48,8 @@ export function writeInstallationV2(installation: FleetInstallationV2): string {
   if (installation.shelf !== undefined) {
     document.shelf = serializeShelf(installation.shelf);
   }
-  if (installation.forge !== undefined) {
-    document.forge = serializeForge(installation.forge);
-  }
+  // Forge is required in a v2 file (D6); the writer always emits the mode.
+  document.forge = serializeForge(installation.forge);
   if (installation.verification !== undefined) {
     document.verification = serializeVerification(installation.verification);
   }

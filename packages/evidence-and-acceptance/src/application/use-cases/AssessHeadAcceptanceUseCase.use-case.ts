@@ -235,6 +235,18 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
     if (deps.forgeMode === 'none' && assessment.forgeEvidence !== 'not-configured') {
       assessment = { ...assessment, forgeEvidence: 'not-configured' };
     }
+    // Under the forge-evidence port (mode `github`, D6) the real forge read
+    // decides: a previously stored `not-configured` value (for example
+    // recorded before the forge was configured) is never carried over — the
+    // port below reads the live forge state and every later save drops the
+    // stale marker.
+    if (
+      deps.forgeMode !== 'none' &&
+      deps.forgeEvidence !== undefined &&
+      assessment.forgeEvidence !== undefined
+    ) {
+      assessment = { ...assessment, forgeEvidence: undefined };
+    }
 
     // One-way doors are checked before a stored acceptance is returned: an
     // idempotent "already accepted" read is not a way past a door that is now

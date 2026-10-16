@@ -45,6 +45,18 @@ export interface EvidenceUseCasesOptions {
   readonly stateDir?: string;
   /** Parsed installation; the verifier role's host decides the executor. */
   readonly installation?: FleetInstallation;
+  /**
+   * Argument-array `gh` transport for forge evidence reads (D6). Mode
+   * `github` hands it to the ForgeEvidenceAdapter so reads can succeed; the
+   * runtime binds the reviewed subprocess runner, tests inject a stub.
+   */
+  readonly forgeGhRunner?: (
+    args: readonly string[],
+  ) => Promise<{
+    readonly exitCode: number | null;
+    readonly stdout: string;
+    readonly stderr?: string;
+  }>;
 }
 
 function createEvidenceUseCases(): EvidenceUseCases {
@@ -91,12 +103,17 @@ export function createConfiguredEvidenceUseCases(
   const forgeEvidenceAdapter =
     // Mode `none` never reads the forge; every other mode (github, or an
     // installation without a forge section, which keeps today's fail-closed
-    // unknown reads) binds the port.
+    // unknown reads) binds the port. Mode `github` binds the same
+    // argument-array gh transport the forge action adapter uses, so reads
+    // can succeed (D6).
     forgeMode === "none"
       ? undefined
       : new ForgeEvidenceAdapter({
           owner: forgeGithubSection?.owner,
           repo: forgeGithubSection?.repo,
+          ...(options?.forgeGhRunner !== undefined
+            ? { runGh: options.forgeGhRunner }
+            : {}),
         });
   const reviewer = new IndependentReviewAdapter();
   const ownerDecisionPort = new OwnerDecisionAdapter(crossContext?.ownerDecision);

@@ -3,6 +3,7 @@
 // where supplier-side use cases are bound to consumer-side ports; the use
 // cases themselves never import across contexts.
 import { readFileSync } from "node:fs";
+import { execFile } from "node:child_process";
 import { join } from "node:path";
 
 import { withFileLock, writeJsonAtomically } from "./file-store";
@@ -45,6 +46,33 @@ export interface FleetApiRuntimeOptions {
   readonly stateDir?: string;
   readonly ownerPublicKey?: string;
   readonly installation?: FleetInstallation;
+}
+
+/**
+ * Run the reviewed GitHub CLI subprocess as an argument array for forge
+ * evidence reads (D6). A completed invocation resolves with its exit code and
+ * captured output; a spawn failure (for example a missing binary) rejects so
+ * the adapter reports an unreadable forge instead of guessing.
+ */
+function runGhSubprocess(args: readonly string[]): Promise<{
+  exitCode: number | null;
+  stdout: string;
+  stderr?: string;
+}> {
+  return new Promise((resolve, reject) => {
+    execFile("gh", [...args], { encoding: "utf8" }, (error, stdout, stderr) => {
+      if (error === null) {
+        resolve({ exitCode: 0, stdout: String(stdout), stderr: String(stderr) });
+        return;
+      }
+      const code = (error as { code?: number | string }).code;
+      if (typeof code === "number") {
+        resolve({ exitCode: code, stdout: String(stdout), stderr: String(stderr) });
+        return;
+      }
+      reject(error);
+    });
+  });
 }
 
 /**
@@ -256,7 +284,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
     },
   };
   const evidence = createConfiguredEvidenceUseCases(
-    { stateDir, installation },
+    { stateDir, installation, forgeGhRunner: runGhSubprocess },
     {
       ownerDecision: ownerDecisionDelegate,
       attemptOwnerDecision: attemptOwnerDecisionDelegate,

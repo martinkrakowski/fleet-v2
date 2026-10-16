@@ -153,18 +153,35 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
 
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
-      const held = [...this.inMemoryReservationsById.values()].filter(
-        (reservation) => reservation.held === true,
-      );
-      const busy = await busyUnderLock(held);
-      if (busy !== null) {
-        return busy;
+      // In-memory branch: the busy-worktree verdict is re-run whenever the
+      // held set changed while the check was in flight, and the final
+      // check-and-append is synchronous (no await between re-reading the
+      // held reservations and appending), so two same-process claims can
+      // never both observe the same empty reservation set (as on main).
+      for (;;) {
+        const held = [...this.inMemoryReservationsById.values()].filter(
+          (reservation) => reservation.held === true,
+        );
+        const busy = await busyUnderLock(held);
+        if (busy !== null) {
+          return busy;
+        }
+        const fresh = [...this.inMemoryReservationsById.values()].filter(
+          (reservation) => reservation.held === true,
+        );
+        if (
+          request.checkBusyWorktree !== undefined &&
+          (fresh.length !== held.length ||
+            fresh.some((reservation) => !held.includes(reservation)))
+        ) {
+          continue;
+        }
+        const result = arbitrateReservation(request, fresh);
+        if (result.outcome === 'reserved') {
+          this.inMemoryReservationsById.set(result.reservation.id, result.reservation);
+        }
+        return result;
       }
-      const result = arbitrateReservation(request, held);
-      if (result.outcome === 'reserved') {
-        this.inMemoryReservationsById.set(result.reservation.id, result.reservation);
-      }
-      return result;
     }
 
     const target = path.join(stateDir, 'reservations.json');

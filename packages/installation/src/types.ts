@@ -219,12 +219,17 @@ export interface VerificationProceduresSection {
 export interface FleetInstallationV2 {
   readonly schemaVersion: 2;
   readonly hosts: Readonly<Record<string, HostSection>>;
+  /**
+   * Required (D6): a v2 file always declares a forge mode, `{ mode: 'github',
+   * owner, repo }` or `{ mode: 'none' }`. Only the v1 file and the env-only
+   * setup may run without a forge section.
+   */
   readonly tools?: readonly string[];
   readonly seats?: readonly SeatSection[];
   readonly chains?: ChainsSection;
   readonly policy?: PolicySection;
   readonly shelf?: ShelfSectionV2;
-  readonly forge?: ForgeSectionV2;
+  readonly forge: ForgeSectionV2;
   readonly verification?: VerificationProceduresSection;
   readonly waves?: WavesSection;
 }
@@ -324,7 +329,7 @@ export interface FleetInstallation {
   readonly worktree?: WorktreeSection;
   /** v1: procedures and verification host. v2: procedures only. */
   readonly verification?: VerificationSection | VerificationProceduresSection;
-  /** v1: GitHub owner and repository. v2: a forge mode (D6). */
+  /** v1: GitHub owner and repository. v2: a forge mode (D6), required in v2. */
   readonly forge?: ForgeSection | ForgeSectionV2;
   /** v1: the reviewer seat. Never set in v2. */
   readonly reviewer?: ReviewerSection;

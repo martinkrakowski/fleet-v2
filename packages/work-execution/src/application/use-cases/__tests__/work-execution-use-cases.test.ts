@@ -1116,14 +1116,6 @@ function validDispatchRequest(overrides: Record<string, unknown> = {}) {
     stepLimit: 40,
     timeLimitSeconds: 3600,
     expectedArtifacts: ['dist/report.json'],
-    requiredCapabilities: {
-      filesystemScope: 'scoped-worktree',
-      networkEgressRestricted: true,
-      cpuAndMemoryLimited: true,
-      processTreeTermination: true,
-      authoritativeCompletion: true,
-      artifactPersistence: true,
-    },
     nowIso: '2026-10-15T08:00:00.000Z',
     ...overrides,
   };
@@ -1253,7 +1245,6 @@ describe('DispatchAttemptUseCase', () => {
     });
 
     const request = validDispatchRequest();
-    delete (request as { requiredCapabilities?: unknown }).requiredCapabilities;
     const result = await setup.useCase.dispatchAttempt(
       request as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
     );
@@ -1281,7 +1272,6 @@ describe('DispatchAttemptUseCase', () => {
     });
 
     const request = validDispatchRequest();
-    delete (request as { requiredCapabilities?: unknown }).requiredCapabilities;
     const result = await setup.useCase.dispatchAttempt(
       request as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
     );
@@ -1308,7 +1298,6 @@ describe('DispatchAttemptUseCase', () => {
     });
 
     const request = validDispatchRequest();
-    delete (request as { requiredCapabilities?: unknown }).requiredCapabilities;
     const result = await setup.useCase.dispatchAttempt(
       request as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
     );

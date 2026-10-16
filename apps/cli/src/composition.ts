@@ -133,6 +133,12 @@ export interface FleetCliRuntimeOptions {
   readonly ownerPublicKey?: string;
   /** Deterministic subprocess execution for runner tests. */
   readonly runSubprocess?: SubprocessRunner;
+  /**
+   * Argument-array `gh` runner for forge evidence reads (D6). Defaults to the
+   * reviewed subprocess runner shared with the forge action adapter; tests
+   * inject a stub transport here.
+   */
+  readonly forgeGhRunner?: (args: readonly string[]) => Promise<GhInvocationResult>;
 }
 
 export interface ResolvedRunnerSettings {
@@ -579,11 +585,16 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       : undefined;
   const forgeGithubSection =
     forgeSection?.mode === 'github' ? forgeSection : undefined;
+  // The argument-array gh runner shared with the forge action adapter (D6):
+  // mode `github` hands it to the forge-evidence adapter so reads can
+  // succeed; tests inject a stub transport through the runtime options.
+  const forgeGhRunner = options?.forgeGhRunner ?? runGhSubprocess;
   const forgeEvidence =
     forgeMode === 'github'
       ? new ForgeEvidenceAdapter({
           owner: forgeGithubSection?.owner,
           repo: forgeGithubSection?.repo,
+          runGh: forgeGhRunner,
         })
       : new ForgeEvidenceAdapter();
   const ownerDecision = new OwnerDecisionAdapter({

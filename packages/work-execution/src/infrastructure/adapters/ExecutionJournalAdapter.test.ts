@@ -8,6 +8,7 @@ import type {
   CapacityReservationRecord,
 } from '../../domain/execution-records.js';
 import type {
+  BusyWorktreeCheck,
   ReserveCapacityAtomicallyRequest,
   ReserveCapacityAtomicallyResult,
 } from '../../application/ports/out/ExecutionJournalPort.out-port.js';
@@ -311,5 +312,54 @@ describe('ExecutionJournalAdapter atomic capacity arbitration', () => {
     const persisted = await readPersistedReservations();
     expect(persisted).toHaveLength(1);
     expect(persisted[0]?.id).toBe('res-first');
+  });
+});
+
+describe('ExecutionJournalAdapter in-memory atomic capacity arbitration', () => {
+  function makeClaim(
+    overrides: { id?: string; attemptId?: string } = {},
+  ): ReserveCapacityAtomicallyRequest {
+    const attemptId = overrides.attemptId ?? 'att-mem-race';
+    return {
+      attemptId,
+      maxSlots: 2,
+      record: {
+        id: overrides.id ?? 'res-mem-race',
+        attemptId,
+        hostId: 'host-1',
+        held: true,
+        reservedAtIso: '2026-10-15T11:00:00.000Z',
+        releasedAtIso: null,
+      },
+    };
+  }
+
+  /** A not-busy verdict that still yields, widening the race window. */
+  const notBusy = async (): Promise<BusyWorktreeCheck> => ({ outcome: 'ok' });
+
+  it('lets exactly one of two same-process racing claims reserve', async () => {
+    const adapter = new ExecutionJournalAdapter({});
+    const results = await Promise.all([
+      adapter.reserveCapacityAtomically(makeClaim({ id: 'res-mem-a' })),
+      adapter.reserveCapacityAtomically(makeClaim({ id: 'res-mem-b' })),
+    ]);
+    const reserved = results.filter((result) => result.outcome === 'reserved');
+    const refused = results.filter((result) => result.outcome === 'duplicate-attempt');
+    expect(reserved).toHaveLength(1);
+    expect(refused).toHaveLength(1);
+    expect(await adapter.listActiveReservations('host-1')).toHaveLength(1);
+  });
+
+  it('lets exactly one of two same-process racing claims reserve across the busy-check await', async () => {
+    const adapter = new ExecutionJournalAdapter({});
+    const results = await Promise.all([
+      adapter.reserveCapacityAtomically({ ...makeClaim({ id: 'res-mem-a' }), checkBusyWorktree: notBusy }),
+      adapter.reserveCapacityAtomically({ ...makeClaim({ id: 'res-mem-b' }), checkBusyWorktree: notBusy }),
+    ]);
+    const reserved = results.filter((result) => result.outcome === 'reserved');
+    const refused = results.filter((result) => result.outcome === 'duplicate-attempt');
+    expect(reserved).toHaveLength(1);
+    expect(refused).toHaveLength(1);
+    expect(await adapter.listActiveReservations('host-1')).toHaveLength(1);
   });
 });

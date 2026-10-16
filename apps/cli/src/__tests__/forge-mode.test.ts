@@ -9,13 +9,13 @@ import { assessmentIdForAttempt, createFleetCliRuntime } from '../composition.js
 import { runCli } from '../index.js';
 import type { AttemptRecord } from '@fleet/work-execution';
 import type { EvidenceAssessmentRecord } from '@fleet/evidence-and-acceptance';
-import type { FleetInstallation } from '@fleet/installation';
+import type { FleetInstallation, ForgeSectionV2 } from '@fleet/installation';
 
 const HEAD = '1111111111111111111111111111111111111111';
 const ATTEMPT_ID = 'att-forge-1';
 
 /** Minimal v2 installation: one local host with a declared container runner. */
-function makeInstallation(forge: FleetInstallation['forge']): FleetInstallation {
+function makeInstallation(forge: ForgeSectionV2): FleetInstallation {
   return {
     schemaVersion: 2,
     hosts: {
@@ -36,7 +36,7 @@ function makeInstallation(forge: FleetInstallation['forge']): FleetInstallation 
         },
       },
     },
-    ...(forge !== undefined ? { forge } : {}),
+    forge,
   };
 }
 
@@ -142,9 +142,47 @@ describe('attempt dispatch refuses the requiredCapabilities override (D4)', () =
 });
 
 describe('forge mode wired into CLI acceptance (D6)', () => {
-  it('a failing forge read blocks acceptance through the CLI in mode github', async () => {
+  /** Gh results as the argument-array runner resolves them. */
+  type GhResult = { exitCode: number; stdout: string; stderr: string };
+
+  /**
+   * A stub of the reviewed gh subprocess: `failing` returns a failing pull
+   * request lookup, `passing` answers every forge read for HEAD with passing
+   * checks and no unresolved threads.
+   */
+  function makeGhRunner(outcome: 'failing' | 'passing') {
+    return async (args: readonly string[]): Promise<GhResult> => {
+      if (outcome === 'failing') {
+        return { exitCode: 1, stdout: '', stderr: 'gh: API error' };
+      }
+      if (args[0] === 'api' && typeof args[1] === 'string' && args[1].startsWith('repos/')) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([{ state: 'open', head: { sha: HEAD }, number: 7 }]),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'pr') {
+        return { exitCode: 0, stdout: JSON.stringify([{ bucket: 'pass' }]), stderr: '' };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: {
+            repository: { pullRequest: { reviewThreads: { totalCount: 0, nodes: [] } } },
+          },
+        }),
+        stderr: '',
+      };
+    };
+  }
+
+  it('mode github blocks when the gh runner returns failure', async () => {
     const installation = makeInstallation({ mode: 'github', owner: 'example-owner', repo: 'example-repo' });
-    const runtime = createFleetCliRuntime({ installation });
+    const runtime = createFleetCliRuntime({
+      installation,
+      forgeGhRunner: makeGhRunner('failing'),
+    });
     await runtime.execution.attemptRepository.saveAttempt(makeAttempt());
     await runtime.evidence.evidenceAssessmentRepository.saveAssessment(makeAssessment([]));
 
@@ -163,6 +201,37 @@ describe('forge mode wired into CLI acceptance (D6)', () => {
     const result = JSON.parse(out.join('')) as { outcome: string; blockers: string[] };
     expect(result.outcome).toBe('blocked');
     expect(result.blockers.some((b) => b.includes("forge reports CI state 'unknown'"))).toBe(true);
+  });
+
+  it('mode github counts passing checks and no unresolved threads as a pass', async () => {
+    const installation = makeInstallation({ mode: 'github', owner: 'example-owner', repo: 'example-repo' });
+    const runtime = createFleetCliRuntime({
+      installation,
+      forgeGhRunner: makeGhRunner('passing'),
+    });
+    await runtime.execution.attemptRepository.saveAttempt(makeAttempt());
+    await runtime.evidence.evidenceAssessmentRepository.saveAssessment(makeAssessment([]));
+
+    const { out, io } = collectIo();
+    const code = await runCli(
+      ['evidence', 'assess', '--json', JSON.stringify({
+        attemptId: ATTEMPT_ID,
+        candidateHeadSha: HEAD,
+        policyRevision: 'pol-1',
+      })],
+      io,
+      runtime,
+    );
+
+    expect(code).toBe(0);
+    const result = JSON.parse(out.join('')) as { outcome: string };
+    expect(result.outcome).toBe('accepted');
+    // The forge read is real evidence in mode github: no not-configured
+    // marker is stored on the assessment.
+    const stored = await runtime.evidence.evidenceAssessmentRepository.findAssessmentById(
+      assessmentIdForAttempt(ATTEMPT_ID),
+    );
+    expect(stored?.forgeEvidence).toBeUndefined();
   });
 
   it('mode none accepts receipt-only and records forgeEvidence not-configured', async () => {

@@ -9,7 +9,6 @@ import type {
   AttemptRecord,
   AttemptSeatOverrideRecord,
 } from '../../../domain/execution-records.js';
-import type { RunnerIsolationCapabilities } from '../out/ExecutionRunnerPort.out-port.js';
 
 export interface DispatchAttemptRequest {
   readonly attemptId: string;
@@ -21,13 +20,6 @@ export interface DispatchAttemptRequest {
   readonly stepLimit: number;
   readonly timeLimitSeconds: number;
   readonly expectedArtifacts?: readonly string[];
-  /**
-   * Optional since D4: the requirements come from the brief's lane profile,
-   * never from the caller. When omitted, dispatch requires the strict lane
-   * profile below. A boundary that accepts an operator override is itself at
-   * fault; the CLI refuses one as a usage error.
-   */
-  readonly requiredCapabilities?: RunnerIsolationCapabilities;
   readonly nowIso?: string;
   readonly seatOverride?: AttemptSeatOverrideRecord;
   readonly reviewerSeat?: string;

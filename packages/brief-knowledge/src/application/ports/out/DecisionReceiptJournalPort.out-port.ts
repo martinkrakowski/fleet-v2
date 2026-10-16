@@ -19,7 +19,9 @@ export interface DecisionCallReceipt {
   readonly requestId?: string;
   /**
    * Reported cost in USD. When absent the journal records the reservation's
-   * assumed cost and marks the receipt `estimated`.
+   * assumed cost and marks the receipt `estimated`. Callers must pass
+   * `undefined` — never `0` — when the provider reported no cost: `0` would
+   * be recorded as a real, paid cost of zero.
    */
   readonly costUsd?: number;
   /** Candidate ids in the order the deterministic retrieval produced. */
@@ -52,8 +54,10 @@ export interface DecisionReceiptJournalPort {
   reserve(query: ReserveDecisionQuery): Promise<ReserveDecisionResult>;
   /**
    * Append the settled receipt for a reservation. Throws when the reservation
-   * is unknown or the append fails; the caller then treats the answer as
-   * unknown and keeps the deterministic behaviour.
+   * is unknown, when it was already settled (settling is once only), or when
+   * the append fails; the caller then treats the answer as unknown and keeps
+   * the deterministic behaviour. A settle whose `receipt.costUsd` is absent
+   * keeps the reservation's assumed cost and is marked `estimated: true`.
    */
   settle(reservationId: string, receipt: DecisionCallReceipt): Promise<void>;
   /** Sum of settled and reserved costs for the UTC month containing `monthUtc`. */

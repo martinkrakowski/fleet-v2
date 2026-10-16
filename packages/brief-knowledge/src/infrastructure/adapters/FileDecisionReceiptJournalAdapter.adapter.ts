@@ -6,6 +6,7 @@
  * owner-decision inbox `<stateDir>/decisions/`. Every append and every
  * read-then-append runs under the brief-knowledge `withFileLock`. A malformed
  * line throws (fail closed): spend is never understated or silently skipped.
+ * Settling is once only per reservation id, so spend is monotone there.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -21,6 +22,9 @@ import { withFileLock } from './file-store.js';
 
 /** Own receipts directory; distinct from the owner-decision inbox `decisions/`. */
 const RECEIPTS_DIRNAME = 'decision-receipts';
+
+/** A stateSha256 is always a lowercase hex SHA-256 digest. */
+const STATE_SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 /** Appended before a call: `{kind:'reserved', id, assumedCostUsd, stateSha256, at}`. */
 interface ReservedEntry {
@@ -105,6 +109,13 @@ function requireStringArray(context: ParseContext, value: unknown, field: string
   return [...value];
 }
 
+function requireStateSha256(context: ParseContext, value: unknown): string {
+  if (typeof value !== 'string' || !STATE_SHA256_PATTERN.test(value)) {
+    malformed(context, 'stateSha256 must match /^[0-9a-f]{64}$/');
+  }
+  return value;
+}
+
 function parseEntry(line: string, filePath: string, lineNumber: number): JournalEntry {
   const context: ParseContext = { filePath, lineNumber };
   if (line.trim().length === 0) {
@@ -125,7 +136,7 @@ function parseEntry(line: string, filePath: string, lineNumber: number): Journal
       kind: 'reserved',
       id: requireNonEmptyString(context, entry.id, 'id'),
       assumedCostUsd: requireNonNegativeNumber(context, entry.assumedCostUsd, 'assumedCostUsd'),
-      stateSha256: requireNonEmptyString(context, entry.stateSha256, 'stateSha256'),
+      stateSha256: requireStateSha256(context, entry.stateSha256),
       at: requireNonEmptyString(context, entry.at, 'at'),
     };
   }
@@ -203,8 +214,10 @@ function requireValidatedQuery(query: ReserveDecisionQuery): {
   ) {
     throw new Error('FileDecisionReceiptJournalAdapter requires a finite non-negative monthlyBudgetUsd');
   }
-  if (typeof stateSha256 !== 'string' || stateSha256.trim().length === 0) {
-    throw new Error('FileDecisionReceiptJournalAdapter requires a non-empty stateSha256');
+  if (typeof stateSha256 !== 'string' || !STATE_SHA256_PATTERN.test(stateSha256)) {
+    throw new Error(
+      'FileDecisionReceiptJournalAdapter requires stateSha256 to match /^[0-9a-f]{64}$/',
+    );
   }
   return { assumedCostUsd, monthlyBudgetUsd, stateSha256 };
 }
@@ -267,16 +280,35 @@ function requireValidatedReceipt(
 export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournalPort {
   private readonly stateDir: string;
   private readonly now: () => Date;
+  private readonly lockTimeoutMs: number | undefined;
 
-  constructor(stateDir: string, now: () => Date = () => new Date()) {
+  constructor(
+    stateDir: string,
+    now: () => Date = () => new Date(),
+    options: { readonly lockTimeoutMs?: number } = {},
+  ) {
     if (typeof stateDir !== 'string' || stateDir.trim().length === 0) {
       throw new Error('FileDecisionReceiptJournalAdapter requires a non-empty stateDir');
     }
     if (typeof now !== 'function') {
       throw new Error('FileDecisionReceiptJournalAdapter requires a now() clock');
     }
+    if (
+      options.lockTimeoutMs !== undefined &&
+      (typeof options.lockTimeoutMs !== 'number' ||
+        !Number.isFinite(options.lockTimeoutMs) ||
+        options.lockTimeoutMs <= 0)
+    ) {
+      throw new Error('FileDecisionReceiptJournalAdapter requires a positive finite lockTimeoutMs');
+    }
     this.stateDir = stateDir;
     this.now = now;
+    // undefined keeps withFileLock's own default timeout.
+    this.lockTimeoutMs = options.lockTimeoutMs;
+  }
+
+  private lockOptions(): { readonly timeoutMs: number } | undefined {
+    return this.lockTimeoutMs === undefined ? undefined : { timeoutMs: this.lockTimeoutMs };
   }
 
   async reserve(query: ReserveDecisionQuery): Promise<ReserveDecisionResult> {
@@ -284,50 +316,64 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
     const atDate = this.now();
     const monthKey = utcMonthKey(atDate);
     const reservationId = randomUUID();
-    return withFileLock(this.monthLockPath(monthKey), async () => {
-      const entries = await this.readMonthEntries(monthKey);
-      const monthSpend = monthSpendFromEntries(entries);
-      if (monthSpend + assumedCostUsd > monthlyBudgetUsd) {
-        return { ok: false as const, reason: 'budget-exhausted' as const };
-      }
-      const entry: ReservedEntry = {
-        kind: 'reserved',
-        id: reservationId,
-        assumedCostUsd,
-        stateSha256,
-        at: atDate.toISOString(),
-      };
-      await this.appendEntry(monthKey, entry);
-      return { ok: true as const, reservationId };
-    });
+    return withFileLock(
+      this.monthLockPath(monthKey),
+      async () => {
+        const entries = await this.readMonthEntries(monthKey);
+        const monthSpend = monthSpendFromEntries(entries);
+        if (monthSpend + assumedCostUsd > monthlyBudgetUsd) {
+          return { ok: false as const, reason: 'budget-exhausted' as const };
+        }
+        const entry: ReservedEntry = {
+          kind: 'reserved',
+          id: reservationId,
+          assumedCostUsd,
+          stateSha256,
+          at: atDate.toISOString(),
+        };
+        await this.appendEntry(monthKey, entry);
+        return { ok: true as const, reservationId };
+      },
+      this.lockOptions(),
+    );
   }
 
   async settle(reservationId: string, receipt: DecisionCallReceipt): Promise<void> {
     const validated = requireValidatedReceipt(reservationId, receipt);
     const atDate = this.now();
     const monthKey = utcMonthKey(atDate);
-    await withFileLock(this.monthLockPath(monthKey), async () => {
-      const entries = await this.readMonthEntries(monthKey);
-      let costUsd: number;
-      let estimated: boolean;
-      if (validated.costUsd !== undefined) {
-        costUsd = validated.costUsd;
-        estimated = false;
-      } else {
-        // No reported cost: record the reservation's assumed cost. The
-        // reservation may live in the previous month's file when the call
-        // crossed a UTC month boundary.
-        const reservation =
-          findReservedEntry(entries, reservationId) ??
-          findReservedEntry(await this.readMonthEntries(previousUtcMonthKey(atDate)), reservationId);
-        if (!reservation) {
-          throw new Error(
-            `FileDecisionReceiptJournalAdapter cannot settle unknown reservation ${reservationId}`,
-          );
-        }
-        costUsd = reservation.assumedCostUsd;
-        estimated = true;
+    await withFileLock(
+      this.monthLockPath(monthKey),
+      async () => {
+      // The reservation is always resolved, whether or not the receipt
+      // reports a cost: the current month's file first, then the previous
+      // month's (a call may cross a UTC month boundary between reserve and
+      // settle).
+      const monthEntries = await this.readMonthEntries(monthKey);
+      let previousEntries: JournalEntry[] = [];
+      let reservation: ReservedEntry | undefined = findReservedEntry(monthEntries, reservationId);
+      if (!reservation) {
+        previousEntries = await this.readMonthEntries(previousUtcMonthKey(atDate));
+        reservation = findReservedEntry(previousEntries, reservationId);
       }
+      if (!reservation) {
+        throw new Error(
+          `FileDecisionReceiptJournalAdapter cannot settle unknown reservation ${reservationId}`,
+        );
+      }
+      // Settling is once only: spend stays monotone per reservation.
+      if (
+        findSettledEntry(monthEntries, reservationId) !== undefined ||
+        findSettledEntry(previousEntries, reservationId) !== undefined
+      ) {
+        throw new Error(
+          `FileDecisionReceiptJournalAdapter reservation ${reservationId} is already settled`,
+        );
+      }
+      // No reported cost: record the reservation's assumed cost, marked
+      // estimated. The check-and-append above runs inside this month's lock.
+      const costUsd = validated.costUsd ?? reservation.assumedCostUsd;
+      const estimated = validated.costUsd === undefined;
       const entry: SettledEntry = {
         kind: 'settled',
         reservationId,
@@ -342,7 +388,9 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
         at: atDate.toISOString(),
       };
       await this.appendEntry(monthKey, entry);
-    });
+      },
+      this.lockOptions(),
+    );
   }
 
   async monthSpendUsd(monthUtc: Date): Promise<number> {
@@ -352,10 +400,14 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
     const monthKey = utcMonthKey(monthUtc);
     // Lock the pure read too: a concurrent append must never be observed as a
     // torn (malformed) line, and malformed lines fail closed.
-    return withFileLock(this.monthLockPath(monthKey), async () => {
-      const entries = await this.readMonthEntries(monthKey);
-      return monthSpendFromEntries(entries);
-    });
+    return withFileLock(
+      this.monthLockPath(monthKey),
+      async () => {
+        const entries = await this.readMonthEntries(monthKey);
+        return monthSpendFromEntries(entries);
+      },
+      this.lockOptions(),
+    );
   }
 
   /** `<stateDir>/decision-receipts/<YYYY-MM>.jsonl` — never the owner-decision inbox. */
@@ -404,6 +456,19 @@ function findReservedEntry(
   let found: ReservedEntry | undefined;
   for (const entry of entries) {
     if (entry.kind === 'reserved' && entry.id === reservationId) {
+      found = entry;
+    }
+  }
+  return found;
+}
+
+function findSettledEntry(
+  entries: readonly JournalEntry[],
+  reservationId: string,
+): SettledEntry | undefined {
+  let found: SettledEntry | undefined;
+  for (const entry of entries) {
+    if (entry.kind === 'settled' && entry.reservationId === reservationId) {
       found = entry;
     }
   }

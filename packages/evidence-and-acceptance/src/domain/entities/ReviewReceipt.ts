@@ -36,49 +36,23 @@ function isNonEmptyTrimmedString(value: unknown): value is string {
 }
 
 /**
- * Size, speed and cost suffixes stripped from a model name, repeatedly, to
- * reach the underlying model family. `flashx` precedes `flash` so the longer
- * suffix is removed whole.
- */
-const FAMILY_SUFFIXES: readonly string[] = [
-  'flashx',
-  'flash',
-  'prime',
-  'preview',
-  'mini',
-  'lite',
-  'free',
-  'paid',
-];
-
-/** Strip one trailing size/speed/cost suffix (`-flash`, `:free`, ...) if present. */
-function stripOneFamilySuffix(value: string): string {
-  for (const suffix of FAMILY_SUFFIXES) {
-    for (const separator of [':', '-']) {
-      const token = separator + suffix;
-      if (value.endsWith(token) && value.length > token.length) {
-        return value.slice(0, value.length - token.length);
-      }
-    }
-  }
-  return value;
-}
-
-/**
- * Strip the provider seat prefix (`openrouter/...`, `nvidia/...`, ...), any
- * `#variant`, anything from the first `:` after the model name (`:nitro`,
- * `:thinking`, `:free`/`:paid`, ...), any `@...` suffix (`@20250929`, ...) and
- * the size and speed suffixes, and return the underlying model family compared
- * case-insensitively. This is stricter than a provider-prefix strip alone:
- * `openrouter/z-ai/glm-5.3`, `nvidia/z-ai/glm-5.3-flash` and `z-ai/glm-5.3#none`
- * share one family, so a flash reviewer of a GLM implementer is refused.
+ * The underlying model family of a model id: the id is lowercased and
+ * trimmed, cut at the first `#` (any `#variant`), everything up to and
+ * including the last `/` is dropped (every provider prefix), the remainder is
+ * cut at the first `:` or `@` (`:nitro`, `:thinking`, `:free`/`:paid`,
+ * `@20250929`, ...), and then the leading run of letters and hyphens before
+ * the first digit is kept with a trailing hyphen trimmed. An id with no digit
+ * keeps the whole remaining name, so a name like `space-bunny-free` is a
+ * family of its own. This is stricter than a provider-prefix strip alone:
+ * `openrouter/z-ai/glm-5.3`, `nvidia/z-ai/glm-5.3-flash` and `glm-5.2` share
+ * the family `glm`, so a flash reviewer of a GLM implementer is refused.
  *
  * An empty family (from `''`, `'/'`, `'z-ai/'`, `'#low'`) is invalid; callers
  * comparing families must fail closed and treat an empty family as equal to
  * every other family.
  */
 export function underlyingModelFamily(model: string): string {
-  let value = model.trim();
+  let value = model.trim().toLowerCase();
   const hashIndex = value.indexOf('#');
   if (hashIndex !== -1) {
     value = value.slice(0, hashIndex);
@@ -87,22 +61,18 @@ export function underlyingModelFamily(model: string): string {
   if (separatorIndex !== -1) {
     value = value.slice(separatorIndex + 1);
   }
-  const colonIndex = value.indexOf(':');
-  if (colonIndex !== -1) {
-    value = value.slice(0, colonIndex);
+  const specialIndex = value.search(/[:@]/);
+  if (specialIndex !== -1) {
+    value = value.slice(0, specialIndex);
   }
-  const atIndex = value.indexOf('@');
-  if (atIndex !== -1) {
-    value = value.slice(0, atIndex);
+  const digitIndex = value.search(/[0-9]/);
+  if (digitIndex !== -1) {
+    value = value.slice(0, digitIndex);
   }
-  value = value.toLowerCase();
-  for (;;) {
-    const stripped = stripOneFamilySuffix(value);
-    if (stripped === value) {
-      return value;
-    }
-    value = stripped;
+  if (value.endsWith('-')) {
+    value = value.slice(0, -1);
   }
+  return value;
 }
 
 /**

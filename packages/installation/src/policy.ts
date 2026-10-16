@@ -25,42 +25,15 @@ const REVIEWER_ROLES: readonly Exclude<SeatRole, 'implementer'>[] = [
 const CHAIN_ROLES: readonly SeatRole[] = ['implementer', 'reviewer', 'high-risk-reviewer'];
 
 /**
- * Size, speed and cost suffixes stripped from a model name, repeatedly, to
- * reach the underlying model family. `flashx` precedes `flash` so the longer
- * suffix is removed whole.
- */
-const FAMILY_SUFFIXES: readonly string[] = [
-  'flashx',
-  'flash',
-  'prime',
-  'preview',
-  'mini',
-  'lite',
-  'free',
-  'paid',
-];
-
-/** Strip one trailing size/speed/cost suffix (`-flash`, `:free`, ...) if present. */
-function stripOneFamilySuffix(value: string): string {
-  for (const suffix of FAMILY_SUFFIXES) {
-    for (const separator of [':', '-']) {
-      const token = separator + suffix;
-      if (value.endsWith(token) && value.length > token.length) {
-        return value.slice(0, value.length - token.length);
-      }
-    }
-  }
-  return value;
-}
-
-/**
- * The underlying model family of a model id: every provider prefix (all
- * leading path segments up to the model name), any `#variant`, anything from
- * the first `:` after the model name (`:nitro`, `:thinking`, `:free`/`:paid`,
- * ...), any `@...` suffix (`@20250929`, ...) and the size and speed suffixes
- * are stripped, and the remainder is compared case-insensitively.
- * `openrouter/z-ai/glm-5.3`, `nvidia/z-ai/glm-5.3-flash` and
- * `z-ai/glm-5.3#none` share one family.
+ * The underlying model family of a model id: the id is lowercased and
+ * trimmed, cut at the first `#` (any `#variant`), everything up to and
+ * including the last `/` is dropped (every provider prefix), the remainder is
+ * cut at the first `:` or `@` (`:nitro`, `:free`, `@20250929`, ...), and then
+ * the leading run of letters and hyphens before the first digit is kept with
+ * a trailing hyphen trimmed. An id with no digit keeps the whole remaining
+ * name, so a name like `space-bunny-free` is a family of its own.
+ * `nvidia/z-ai/glm-5.3-flash`, `openrouter/z-ai/glm-5.3#low` and `glm-5.2`
+ * share the family `glm`; `claude-opus-5-5` is the family `claude-opus`.
  *
  * An empty family (from `''`, `'/'`, `'z-ai/'`, `'#low'`) is invalid; callers
  * comparing families must fail closed and treat an empty family as equal to
@@ -68,7 +41,7 @@ function stripOneFamilySuffix(value: string): string {
  * yields an empty family.
  */
 export function underlyingModelFamily(model: string): string {
-  let value = model.trim();
+  let value = model.trim().toLowerCase();
   const hashIndex = value.indexOf('#');
   if (hashIndex !== -1) {
     value = value.slice(0, hashIndex);
@@ -77,22 +50,18 @@ export function underlyingModelFamily(model: string): string {
   if (separatorIndex !== -1) {
     value = value.slice(separatorIndex + 1);
   }
-  const colonIndex = value.indexOf(':');
-  if (colonIndex !== -1) {
-    value = value.slice(0, colonIndex);
+  const specialIndex = value.search(/[:@]/);
+  if (specialIndex !== -1) {
+    value = value.slice(0, specialIndex);
   }
-  const atIndex = value.indexOf('@');
-  if (atIndex !== -1) {
-    value = value.slice(0, atIndex);
+  const digitIndex = value.search(/[0-9]/);
+  if (digitIndex !== -1) {
+    value = value.slice(0, digitIndex);
   }
-  value = value.toLowerCase();
-  for (;;) {
-    const stripped = stripOneFamilySuffix(value);
-    if (stripped === value) {
-      return value;
-    }
-    value = stripped;
+  if (value.endsWith('-')) {
+    value = value.slice(0, -1);
   }
+  return value;
 }
 
 /** Compile a glob (`*`, `?`) on a model id into a case-insensitive RegExp. */

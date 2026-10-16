@@ -41,7 +41,9 @@ describe('underlyingModelFamily (installation copy)', () => {
     }
     const distinct: readonly [string, string][] = [
       ['claude-sonnet', 'claude-opus'],
-      ['glm-5.3', 'glm-5.4'],
+      // glm-5.3 and glm-5.4 now share the `glm` family (vendor-line rule);
+      // gemini and grok stay distinct.
+      ['gemini-3.1-pro', 'grok-4.7'],
       ['gpt-6-luna', 'glm-5.3'],
     ];
     for (const [left, right] of distinct) {

@@ -44,9 +44,11 @@ const SAME_FAMILY_GROUPS: readonly string[][] = [
 
 const DISTINCT_PAIRS: readonly [string, string][] = [
   ['claude-sonnet', 'claude-opus'],
-  ['glm-5.3', 'glm-5.4'],
+  // glm-5.3, glm-5.4 and any glm-5.3 suffix variant now share the `glm`
+  // family (vendor-line rule); these pairs stay distinct.
+  ['gemini-3.1-pro', 'grok-4.7'],
   ['gpt-6-luna', 'glm-5.3'],
-  ['glm-5.3', 'glm-5.3-flashx-nonexistent-family-marker'],
+  ['claude-opus-5-5', 'glm-5.3'],
   ['model-a', 'model-b'],
 ];
 

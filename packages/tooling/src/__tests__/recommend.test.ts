@@ -132,15 +132,21 @@ describe('recommendSeats', () => {
       }
     });
 
-    it('accepts a single tool whose read-only sibling serves as reviewer', () => {
-      const result = expectValidCatalogue({
+    it('refuses a paid sibling that now shares the implementer model family', () => {
+      // The vendor-line rule folds grok-4.7-fast into the `grok` family of
+      // the xai/grok-4.7 implementer seat, so no disjoint reviewer remains.
+      const result = recommendSeats({
         tools: [tool('opencode'), tool('grok')],
         models: {
           opencode: [model('nvidia/z-ai/glm-5.3', 'free'), model('xai/grok-4.7', 'free')],
           grok: [model('grok-4.7-fast', 'paid')],
         },
+        policy: NO_POLICY,
       });
-      expect(result.chains.reviewer?.map((step) => step.seatId)).toEqual(['grok-grok-4.7-fast']);
+      expect(result.outcome).toBe('no-valid-catalogue');
+      if (result.outcome === 'no-valid-catalogue') {
+        expect(result.reasons.join(' ')).toContain('no reviewer');
+      }
     });
 
     it('refuses a single free implementer seat: a free seat is never the only seat of a role', () => {
@@ -310,7 +316,7 @@ describe('recommendSeats', () => {
         models: {
           'claude-code': [model('claude-sonnet-4-5')],
           opencode: [model('nvidia/z-ai/glm-5.3', 'plan-quota'), model('xai/grok-4.7', 'free')],
-          grok: [model('grok-4.7-fast')],
+          grok: [model('claude-opus-5-5')],
         },
       });
       // The free seat comes first, then plan-quota seats strongest first.
@@ -319,9 +325,10 @@ describe('recommendSeats', () => {
         'opencode-nvidia-z-ai-glm-5.3',
         'claude-code-claude-sonnet-4-5',
       ]);
-      // claude-opus is not offered; glm-5.3 outranks claude-sonnet but shares
-      // the implementer family, so the reviewer is grok-4.7-fast.
-      expect(result.chains.reviewer?.map((step) => step.seatId)).toEqual(['grok-grok-4.7-fast']);
+      // The grok variants share the `grok` family with the xai implementer
+      // seat under the vendor-line rule, so the strongest disjoint reviewer
+      // is claude-opus-5-5 (the `claude-opus` family).
+      expect(result.chains.reviewer?.map((step) => step.seatId)).toEqual(['grok-claude-opus-5-5']);
     });
 
     it('ranks an unlisted family below every listed family, in first-seen order', () => {
@@ -330,7 +337,7 @@ describe('recommendSeats', () => {
         models: {
           opencode: [model('nvidia/z-ai/glm-5.3', 'free'), model('xai/grok-4.7', 'free')],
           agy: [model('future-model-9', 'free')],
-          grok: [model('grok-4.7-fast'), model('grok-code-fast-4.7')],
+          grok: [model('gemini-3.1-pro')],
         },
       });
       expect(result.chains.implementer?.map((step) => step.seatId)).toEqual([
@@ -338,7 +345,9 @@ describe('recommendSeats', () => {
         'opencode-xai-grok-4.7',
         'agy-future-model-9',
       ]);
-      expect(result.chains.reviewer?.map((step) => step.seatId)).toEqual(['grok-grok-4.7-fast']);
+      // The gemini family is unlisted, so it ranks below every listed
+      // family; it is the only disjoint reviewer candidate here.
+      expect(result.chains.reviewer?.map((step) => step.seatId)).toEqual(['grok-gemini-3.1-pro']);
     });
   });
 
@@ -348,7 +357,7 @@ describe('recommendSeats', () => {
         tools: [tool('opencode'), tool('grok')],
         models: {
           opencode: [model('nvidia/z-ai/glm-5.3', 'free', 'none'), model('xai/grok-4.7', 'free')],
-          grok: [model('grok-4.7-fast')],
+          grok: [model('gemini-3.1-pro')],
         },
       });
       const seat = result.seats.find((entry) => entry.id === 'opencode-nvidia-z-ai-glm-5.3-none');
@@ -386,7 +395,7 @@ describe('recommendSeats', () => {
         tools: [tool('opencode'), tool('grok')],
         models: {
           opencode: [model('nvidia/z-ai/glm-5.3', 'free'), model('xai/grok-4.7', 'free')],
-          grok: [model('grok-4.7-fast', 'paid')],
+          grok: [model('gemini-3.1-pro', 'paid')],
         },
         policy: NO_POLICY,
       },
@@ -395,7 +404,7 @@ describe('recommendSeats', () => {
         models: {
           'claude-code': [model('claude-sonnet-4-5')],
           opencode: [model('nvidia/z-ai/glm-5.3', 'plan-quota'), model('xai/grok-4.7', 'free')],
-          grok: [model('grok-4.7-fast')],
+          grok: [model('gemini-3.1-pro')],
         },
         policy: NO_POLICY,
       },
@@ -404,7 +413,7 @@ describe('recommendSeats', () => {
         models: {
           opencode: [model('nvidia/z-ai/glm-5.3', 'free'), model('xai/grok-4.7', 'free')],
           agy: [model('future-model-9', 'free')],
-          grok: [model('grok-4.7-fast'), model('grok-code-fast-4.7')],
+          grok: [model('gemini-3.1-pro')],
         },
         policy: NO_POLICY,
       },
@@ -412,7 +421,7 @@ describe('recommendSeats', () => {
         tools: [tool('opencode'), tool('grok')],
         models: {
           opencode: [model('nvidia/z-ai/glm-5.3', 'free', 'none'), model('xai/grok-4.7', 'free')],
-          grok: [model('grok-4.7-fast')],
+          grok: [model('gemini-3.1-pro')],
         },
         policy: NO_POLICY,
       },

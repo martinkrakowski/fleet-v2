@@ -1,0 +1,21 @@
+[
+  { "model": "gemini-3.1-pro-high", "family": "gemini" },
+  { "model": "gemini-3.8-flash-high", "family": "gemini" },
+  { "model": "google/gemini-3.8-pro:free", "family": "gemini" },
+  { "model": "nvidia/z-ai/glm-5.3-flash", "family": "glm" },
+  { "model": "openrouter/z-ai/glm-5.3#low", "family": "glm" },
+  { "model": "openrouter/openai/gpt-6-luna", "family": "gpt" },
+  { "model": "openrouter/poolside/laguna-s-2.1", "family": "laguna-s" },
+  { "model": "opencode/space-bunny-free", "family": "space-bunny-free" },
+  { "model": "opencode/longcat-2.5-preview-free", "family": "longcat" },
+  { "model": "claude-opus-5-5", "family": "claude-opus" },
+  { "model": "grok-4.7", "family": "grok" },
+  { "same": ["gemini-3.1-pro-high", "gemini-3.8-flash-high"] },
+  { "same": ["glm-5.3", "glm-5.2"] },
+  { "different": ["gemini-3.8-pro", "glm-5.3"] },
+  { "different": ["gpt-6-luna", "glm-5.3"] },
+  { "different": ["laguna-s-2.1", "glm-5.3-flash"] },
+  { "model": "", "family": "" },
+  { "model": "/", "family": "" },
+  { "model": "#low", "family": "" }
+]

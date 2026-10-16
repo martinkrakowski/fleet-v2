@@ -112,17 +112,18 @@ export type SeatRecommendation = SeatCatalogueResult | NoValidCatalogueResult;
 /**
  * Ordered model families, strongest first. This table is data fleet
  * maintains: it is a fixed ordering used to pick reviewers, not a claim
- * about model quality, and it is the only place strength is defined. A
+ * about model quality, and it is the only place strength is defined. The
+ * keys are the family names produced by `underlyingModelFamily` (the
+ * leading letters-and-hyphens run of the model name), so `grok-4.7`,
+ * `grok-4.7-fast` and `grok-code-fast-4.7` all rank as one `grok` family. A
  * family not listed ranks below every listed family, in first-seen order.
  */
 const STRENGTH_ORDER: readonly string[] = [
-  'claude-opus-4-5',
-  'glm-5.3',
-  'claude-sonnet-4-5',
-  'grok-4.7',
-  'claude-haiku-4-5',
-  'grok-4.7-fast',
-  'grok-code-fast-4.7',
+  'claude-opus',
+  'glm',
+  'claude-sonnet',
+  'grok',
+  'claude-haiku',
 ];
 
 /** Cost-class ordering: free first, then plan-quota, then paid. */

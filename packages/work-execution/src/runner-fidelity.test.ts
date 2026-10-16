@@ -1165,21 +1165,23 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
       expect(overrideEntry?.detail).toContain('martin');
     });
 
-    it('underlyingModelFamily (shared evidence rule) handles prefixes, variants and suffix stripping correctly', () => {
-      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3')).toBe('glm-5.3');
-      expect(underlyingModelFamily('openrouter/z-ai/glm-5.3')).toBe('glm-5.3');
-      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3#low')).toBe('glm-5.3');
-      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3-flash')).toBe('glm-5.3');
-      expect(underlyingModelFamily('openrouter/z-ai/glm-5.3-flash')).toBe('glm-5.3');
-      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3-flashx')).toBe('glm-5.3');
-      expect(underlyingModelFamily('openrouter/anthropic/claude-3-5-sonnet:beta')).toBe('claude-3-5-sonnet');
-      expect(underlyingModelFamily('anthropic/claude-3-5-sonnet:nitro')).toBe('claude-3-5-sonnet');
-      expect(underlyingModelFamily('opencode/longcat-2.5-preview:free')).toBe('longcat-2.5');
-      expect(underlyingModelFamily('anthropic/claude-3-5-sonnet@20250929')).toBe('claude-3-5-sonnet');
-      expect(underlyingModelFamily('anthropic/claude-3-5-sonnet@20250929:beta')).toBe('claude-3-5-sonnet');
-      expect(underlyingModelFamily('anthropic/claude-3-5-sonnet')).toBe('claude-3-5-sonnet');
-      expect(underlyingModelFamily('openai/gpt-4o')).toBe('gpt-4o');
-      expect(underlyingModelFamily('gpt-4o')).toBe('gpt-4o');
+    it('underlyingModelFamily (shared evidence rule) handles prefixes, variants and vendor lines correctly', () => {
+      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3')).toBe('glm');
+      expect(underlyingModelFamily('openrouter/z-ai/glm-5.3')).toBe('glm');
+      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3#low')).toBe('glm');
+      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3-flash')).toBe('glm');
+      expect(underlyingModelFamily('openrouter/z-ai/glm-5.3-flash')).toBe('glm');
+      expect(underlyingModelFamily('nvidia/z-ai/glm-5.3-flashx')).toBe('glm');
+      expect(underlyingModelFamily('openrouter/anthropic/claude-3-5-sonnet:beta')).toBe('claude');
+      expect(underlyingModelFamily('anthropic/claude-3-5-sonnet:nitro')).toBe('claude');
+      expect(underlyingModelFamily('opencode/longcat-2.5-preview:free')).toBe('longcat');
+      expect(underlyingModelFamily('anthropic/claude-3-5-sonnet@20250929')).toBe('claude');
+      expect(underlyingModelFamily('anthropic/claude-3-5-sonnet@20250929:beta')).toBe('claude');
+      expect(underlyingModelFamily('anthropic/claude-3-5-sonnet')).toBe('claude');
+      expect(underlyingModelFamily('openai/gpt-4o')).toBe('gpt');
+      expect(underlyingModelFamily('gpt-4o')).toBe('gpt');
+      // An id with no digit keeps the whole name: a vendor line of its own.
+      expect(underlyingModelFamily('opencode/space-bunny-free')).toBe('space-bunny-free');
       // An empty family is invalid: flash and non-flash models of one family
       // compare equal under the strict rule.
       expect(underlyingModelFamily('z-ai/glm-5.3-flash')).toBe(underlyingModelFamily('z-ai/glm-5.3'));

@@ -50,7 +50,6 @@ describe("API Security and Hardening", () => {
   let stopHandlerInvoked: boolean;
   let attemptGetHandler: EventHandler;
   let reconcilePostHandler: EventHandler;
-  let attemptsPostHandler: EventHandler;
   let stopPostHandler: EventHandler;
 
   beforeAll(async () => {
@@ -74,7 +73,6 @@ describe("API Security and Hardening", () => {
 
     attemptGetHandler = (await import("../server/routes/v1/attempts/[id].get.js")).default;
     reconcilePostHandler = (await import("../server/routes/v1/attempts/[id]/reconcile.post.js")).default;
-    attemptsPostHandler = (await import("../server/routes/v1/attempts/index.post.js")).default;
     stopPostHandler = (await import("../server/routes/v1/attempts/[id]/stop.post.js")).default;
   });
 
@@ -101,7 +99,6 @@ describe("API Security and Hardening", () => {
     const router = createRouter();
     router.post("/v1/attempts/:id/reconcile", reconcilePostHandler);
     router.get("/v1/attempts/:id", attemptGetHandler);
-    router.post("/v1/attempts", attemptsPostHandler);
     router.post(
       "/v1/attempts/:id/stop",
       eventHandler(async (event) => {
@@ -454,16 +451,16 @@ describe("API Security and Hardening", () => {
   });
 
   describe("M9 and M11 routes", () => {
-    it("POST /v1/attempts returns 501 when unconfigured", async () => {
+    it("POST /v1/attempts is removed and returns 404 when unconfigured", async () => {
       const res = await fetch(`${baseUrl}/v1/attempts`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({}),
       });
-      expect(res.status).toBe(501);
+      expect(res.status).toBe(404);
     });
 
-    it("POST /v1/attempts returns 404 when configured", async () => {
+    it("POST /v1/attempts is removed and returns 404 when configured", async () => {
       setActiveApiToken(VALID_TOKEN);
       configureFleetApiRuntime({ stateDir: tempDir });
 

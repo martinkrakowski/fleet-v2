@@ -1561,7 +1561,7 @@ describe('StopAttemptUseCase', () => {
       attemptId: 'attempt-1',
       sessionId: 'session-1',
       gracePeriodSeconds: 30,
-      worktreePath: '/lanes/wo-1',
+      worktreePath: '/lanes/attempt-1',
       runner: undefined,
     });
   });

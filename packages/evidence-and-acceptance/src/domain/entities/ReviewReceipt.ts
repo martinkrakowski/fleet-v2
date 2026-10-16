@@ -36,49 +36,27 @@ function isNonEmptyTrimmedString(value: unknown): value is string {
 }
 
 /**
- * Size, speed and cost suffixes stripped from a model name, repeatedly, to
- * reach the underlying model family. `flashx` precedes `flash` so the longer
- * suffix is removed whole.
- */
-const FAMILY_SUFFIXES: readonly string[] = [
-  'flashx',
-  'flash',
-  'prime',
-  'preview',
-  'mini',
-  'lite',
-  'free',
-  'paid',
-];
-
-/** Strip one trailing size/speed/cost suffix (`-flash`, `:free`, ...) if present. */
-function stripOneFamilySuffix(value: string): string {
-  for (const suffix of FAMILY_SUFFIXES) {
-    for (const separator of [':', '-']) {
-      const token = separator + suffix;
-      if (value.endsWith(token) && value.length > token.length) {
-        return value.slice(0, value.length - token.length);
-      }
-    }
-  }
-  return value;
-}
-
-/**
- * Strip the provider seat prefix (`openrouter/...`, `nvidia/...`, ...), any
- * `#variant`, anything from the first `:` after the model name (`:nitro`,
- * `:thinking`, `:free`/`:paid`, ...), any `@...` suffix (`@20250929`, ...) and
- * the size and speed suffixes, and return the underlying model family compared
- * case-insensitively. This is stricter than a provider-prefix strip alone:
- * `openrouter/z-ai/glm-5.3`, `nvidia/z-ai/glm-5.3-flash` and `z-ai/glm-5.3#none`
- * share one family, so a flash reviewer of a GLM implementer is refused.
+ * The underlying model family of a model id — one family per vendor line
+ * (owner decision 2026-10-16): the id is lowercased and trimmed, cut at the
+ * first `#` (any `#variant`), everything up to and including the last `/` is
+ * dropped (every provider prefix), the remainder is cut at the first `:` or
+ * `@` (`:nitro`, `:thinking`, `:free`/`:paid`, `@20250929`, ...), and the
+ * family is then the leading run of ASCII letters only, stopping at the
+ * first character that is not `a`-`z`. Every model of a vendor line is one
+ * family, so tier words before the first digit never split a line:
+ * `openrouter/z-ai/glm-5.3`, `nvidia/z-ai/glm-5.3-flash`, `glm-5.2` and
+ * `glm-z1-32b` are all `glm`; `claude-sonnet-4-5` and
+ * `claude-3-5-sonnet-20241022` are `claude`; `grok-4.7` and
+ * `grok-code-fast-4.7` are `grok`; `gpt-5` and `gpt-oss-120b` are `gpt`;
+ * `space-bunny-free` is `space`. A flash reviewer of a GLM implementer is
+ * refused; so is any Claude reviewer of a Claude implementer.
  *
- * An empty family (from `''`, `'/'`, `'z-ai/'`, `'#low'`) is invalid; callers
- * comparing families must fail closed and treat an empty family as equal to
- * every other family.
+ * An empty family (from `''`, `'4o-mini'`, `'/'`, `'z-ai/'`, `'#low'`) is
+ * invalid; callers comparing families must fail closed and treat an empty
+ * family as equal to every other family.
  */
 export function underlyingModelFamily(model: string): string {
-  let value = model.trim();
+  let value = model.trim().toLowerCase();
   const hashIndex = value.indexOf('#');
   if (hashIndex !== -1) {
     value = value.slice(0, hashIndex);
@@ -87,22 +65,12 @@ export function underlyingModelFamily(model: string): string {
   if (separatorIndex !== -1) {
     value = value.slice(separatorIndex + 1);
   }
-  const colonIndex = value.indexOf(':');
-  if (colonIndex !== -1) {
-    value = value.slice(0, colonIndex);
+  const specialIndex = value.search(/[:@]/);
+  if (specialIndex !== -1) {
+    value = value.slice(0, specialIndex);
   }
-  const atIndex = value.indexOf('@');
-  if (atIndex !== -1) {
-    value = value.slice(0, atIndex);
-  }
-  value = value.toLowerCase();
-  for (;;) {
-    const stripped = stripOneFamilySuffix(value);
-    if (stripped === value) {
-      return value;
-    }
-    value = stripped;
-  }
+  const letters = /^[a-z]*/.exec(value);
+  return letters === null ? '' : letters[0];
 }
 
 /**

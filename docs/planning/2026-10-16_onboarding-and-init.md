@@ -286,17 +286,22 @@ empty diff or a verification failure does. Runner timeout or signal kill is a fa
 
 ### Model families (prerequisite for any agy implementer seat)
 
-The family of a model id is its **vendor line**: lowercase, drop everything up to the last `/`, cut at the
-first `#`, `:` or `@`, then take the leading run of letters and hyphens before the first digit, trimming a
-trailing hyphen; an id with no digit keeps its whole name. So `gemini-3.1-pro-high`, `gemini-3.8-flash-high`
-and `google/gemini-3.8-pro:free` are all `gemini`; `nvidia/z-ai/glm-5.3-flash` is `glm`; `gpt-6-luna` is
-`gpt`; `laguna-s-2.1` is `laguna-s`; `space-bunny` is `space-bunny`. An empty result is invalid and fails
-closed. This is stricter than O5 (all versions of a vendor line are one family). The same function is used
+The family of a model id is its **vendor line**, one family per vendor line: lowercase, drop everything up
+to the last `/`, cut at the first `#`, `:` or `@`, then take the leading run of ASCII letters only (stop at
+the first character that is not `a`-`z`). So `gemini-3.1-pro-high`, `gemini-3.8-flash-high`,
+`models/gemini-2.5-pro` and `gemini-flash-latest` are all `gemini`; `nvidia/z-ai/glm-5.3-flash` and
+`glm-z1-32b` are `glm`; `gpt-6-luna` and `gpt-oss-120b` are `gpt`; `laguna-s-2.1` is `laguna`;
+`space-bunny-free` is `space`; `claude-opus-5-5`, `claude-sonnet-4-5` and `claude-3-5-sonnet-20241022` are
+all `claude`. A digit-led id such as `4o-mini` yields an empty result, which is invalid and fails closed.
+The same function is used
 in all four places that compare families today: `packages/installation/src/policy.ts`,
 `packages/evidence-and-acceptance/src/domain/entities/ReviewReceipt.ts`, `packages/tooling/src/recommend.ts`
 and `packages/work-execution/src/application/use-cases/DispatchAttemptUseCase.use-case.ts`. Each copy is
 tested against one shared table of equal and distinct pairs, committed once and copied byte-for-byte; a test
-fails if the copies diverge.
+fails if the copies diverge. Strength ranking in `packages/tooling/src/recommend.ts` uses a separate
+tooling-local tier key (the old pre-digit prefix), since the vendor-line family can no longer rank tiers.
+Owner decision 2026-10-16: one family per vendor line, e.g. every Claude model is `claude`; strength ranking
+uses a separate tier key.
 
 ### Policy
 

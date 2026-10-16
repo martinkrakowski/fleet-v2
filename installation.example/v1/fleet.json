@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "runner": {
     "agent": "example-agent",
-    "model": "example-provider/example-model",
+    "model": "example-provider/glm-5.3",
     "variant": "example-variant",
     "remotePort": 46000,
     "host": "lane-host.example",
@@ -10,7 +10,7 @@
     "fallbackChain": [
       {
         "agent": "example-agent",
-        "model": "example-provider/example-fallback-model",
+        "model": "example-provider/glm-5.3-flash",
         "variant": "example-variant"
       }
     ]
@@ -37,7 +37,7 @@
   },
   "reviewer": {
     "agent": "example-agent",
-    "model": "example-provider/example-review-model",
+    "model": "example-provider/grok-4.7",
     "variant": "example-variant"
   },
   "waves": {

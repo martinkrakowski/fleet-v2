@@ -12,6 +12,11 @@
  * index commands). Before any command writes, `rev-parse --show-toplevel`
  * must equal `repoDir`.
  *
+ * Commits carry an explicit, fixed identity (`-c user.name=<authorName>
+ * -c user.email=<authorEmail>`, defaulting to `fleet-v2 shelf` /
+ * `shelf@fleet-v2.invalid`), never the operator's personal identity and
+ * never host defaults.
+ *
  * Sequence per keeper: `hash-object -w --stdin`; with a temporary index
  * (`GIT_INDEX_FILE=<tmp>`), `read-tree <parent>` (skipped for the first
  * commit), `update-index --add --cacheinfo 100644,<blob>,<path>`,
@@ -21,8 +26,10 @@
  * for the first commit, so a concurrent update is refused. Prior keepers
  * stay in the tree because the parent's tree is read first.
  *
- * The provider refuses (writing nothing) when `branch` is the shelf
- * repository's checked-out HEAD branch, when the entry id fails
+ * The provider refuses (writing nothing) when `branch` is checked out in
+ * ANY worktree of the shelf repository (`git worktree list --porcelain`),
+ * when `pathPrefix` is not a safe relative path (no leading `/`, no `..`
+ * segment, no `.git` segment), when the entry id fails
  * `^[A-Za-z0-9._-]{1,128}$` or contains `..`, or when `repoDir` is the
  * fleet-v2 checkout itself. Failures come back as failed publication
  * results for reconciliation; publication never throws.
@@ -42,8 +49,18 @@ import type { KeeperPublicationCallback } from './KeeperPublicationAdapter.adapt
 
 const ZERO_OID = '0'.repeat(40);
 const SAFE_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
-/** Applied to every command: no repository hooks, no commit signing. */
-const GIT_CONFIG_ARGS = ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false'] as const;
+/** Applied to every command: no fsmonitor, no repository hooks, no commit signing. */
+const GIT_CONFIG_ARGS = [
+  '-c',
+  'core.fsmonitor=false',
+  '-c',
+  'core.hooksPath=/dev/null',
+  '-c',
+  'commit.gpgsign=false',
+] as const;
+/** Fixed commit identity defaults; the operator's identity is never consulted. */
+export const DEFAULT_SHELF_AUTHOR_NAME = 'fleet-v2 shelf';
+export const DEFAULT_SHELF_AUTHOR_EMAIL = 'shelf@fleet-v2.invalid';
 
 /**
  * Runs one git argv (element 0 is the `git` executable) with an explicit
@@ -102,10 +119,14 @@ export class NodeGitArgvRunner implements GitArgvRunner {
 export interface GitShelfProviderDependencies {
   /** The shelf git repository's working tree root. Must not be the fleet-v2 checkout. */
   readonly repoDir: string;
-  /** Branch the keepers are written to. Must not be the repository's checked-out HEAD branch. */
+  /** Branch the keepers are written to. Must not be checked out in any worktree. */
   readonly branch: string;
   /** Path prefix inside the tree; keepers become `<pathPrefix>/<entryId>.md`. */
   readonly pathPrefix: string;
+  /** Commit author name; defaults to DEFAULT_SHELF_AUTHOR_NAME. */
+  readonly authorName?: string;
+  /** Commit author/committer email; defaults to DEFAULT_SHELF_AUTHOR_EMAIL. */
+  readonly authorEmail?: string;
   /** Injected argv runner; defaults to NodeGitArgvRunner. */
   readonly run?: GitArgvRunner;
 }
@@ -133,6 +154,10 @@ export class GitShelfProvider {
     if (!this.deps.repoDir || !this.deps.branch || typeof this.deps.pathPrefix !== 'string') {
       return refused('GitShelfProvider requires repoDir, branch and pathPrefix');
     }
+    const pathPrefixProblem = pathPrefixProblemIn(this.deps.pathPrefix);
+    if (pathPrefixProblem !== null) {
+      return refused(`pathPrefix ${JSON.stringify(this.deps.pathPrefix)} is not a safe shelf path prefix: ${pathPrefixProblem}`);
+    }
 
     const childEnv = sanitizedChildEnv();
     const shelfPath = shelfFilePath(this.deps.pathPrefix, entry.id);
@@ -150,6 +175,21 @@ export class GitShelfProvider {
     const head = await this.git(childEnv, 'symbolic-ref', '--short', 'HEAD');
     if (head.exitCode === 0 && head.stdout.trim() === this.deps.branch) {
       return refused(`branch ${this.deps.branch} is the repository's checked-out HEAD branch`);
+    }
+
+    // Fail closed before anything is written: the target branch must not be
+    // checked out in ANY worktree of the shelf repository.
+    const worktrees = await this.git(childEnv, 'worktree', 'list', '--porcelain');
+    if (worktrees.exitCode !== 0) {
+      return failed(`git worktree list failed: ${gitError(worktrees)}`);
+    }
+    const targetRef = `branch refs/heads/${this.deps.branch}`;
+    if (
+      worktrees.stdout
+        .split('\n')
+        .some((line) => line.trim() === targetRef)
+    ) {
+      return refused(`branch ${this.deps.branch} is checked out in a worktree of the shelf repository`);
     }
 
     const tip = await this.git(childEnv, 'rev-parse', '--verify', '--quiet', `refs/heads/${this.deps.branch}`);
@@ -196,6 +236,14 @@ export class GitShelfProvider {
         ...(parent !== null ? ['-p', parent] : []),
         '-m',
         commitMessage(entry),
+        {
+          config: [
+            '-c',
+            `user.name=${this.deps.authorName ?? DEFAULT_SHELF_AUTHOR_NAME}`,
+            '-c',
+            `user.email=${this.deps.authorEmail ?? DEFAULT_SHELF_AUTHOR_EMAIL}`,
+          ],
+        },
       );
       if (commit.exitCode !== 0) {
         return failed(`git commit-tree failed: ${gitError(commit)}`);
@@ -205,7 +253,11 @@ export class GitShelfProvider {
       // Compare-and-swap: a concurrent update of the branch is refused.
       const updateRef = await this.git(childEnv, 'update-ref', `refs/heads/${this.deps.branch}`, newOid, oldOid);
       if (updateRef.exitCode !== 0) {
-        return refused(`branch ${this.deps.branch} moved during publication; refused by compare-and-swap`, true);
+        const detail = gitError(updateRef);
+        return refused(
+          `branch ${this.deps.branch} moved during publication; refused by compare-and-swap${detail === `exit ${updateRef.exitCode}` ? '' : `: ${detail}`}`,
+          true,
+        );
       }
       return { outcome: 'published', externalRef: `git:${this.deps.branch}:${shelfPath}#${newOid}` };
     } finally {
@@ -216,18 +268,20 @@ export class GitShelfProvider {
   private git(
     env: Readonly<Record<string, string>>,
     subcommand: string,
-    ...rest: readonly (string | { stdin: string })[]
+    ...rest: readonly (string | { stdin?: string; config?: readonly string[] })[]
   ): Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }> {
     const args: string[] = [];
+    const config: string[] = [];
     let stdin: string | undefined;
     for (const part of rest) {
       if (typeof part === 'string') {
         args.push(part);
       } else {
-        stdin = part.stdin;
+        if (part.stdin !== undefined) stdin = part.stdin;
+        if (part.config !== undefined) config.push(...part.config);
       }
     }
-    return this.run.run(['git', ...GIT_CONFIG_ARGS, subcommand, ...args], {
+    return this.run.run(['git', ...GIT_CONFIG_ARGS, ...config, subcommand, ...args], {
       cwd: this.deps.repoDir,
       env,
       stdin,
@@ -257,6 +311,23 @@ export function isFleetV2Checkout(dir: string): boolean {
 /** `<pathPrefix>/<entryId>.md`, with an empty pathPrefix allowed by the plan's optional form. */
 export function shelfFilePath(pathPrefix: string, entryId: string): string {
   return pathPrefix ? `${pathPrefix}/${entryId}.md` : `${entryId}.md`;
+}
+
+/**
+ * Validates `pathPrefix` as a safe relative tree path: non-empty segments
+ * only, no leading `/`, no `..` segment and no `.git` segment. An empty
+ * prefix (keepers at the tree root) is allowed. Returns a problem
+ * description, or null when the prefix is safe.
+ */
+export function pathPrefixProblemIn(pathPrefix: string): string | null {
+  if (pathPrefix === '') return null;
+  if (pathPrefix.startsWith('/')) return 'must be relative (no leading /)';
+  for (const segment of pathPrefix.split('/')) {
+    if (segment === '..') return 'must not contain a ".." segment';
+    if (segment.toLowerCase() === '.git') return 'must not contain a ".git" segment';
+    if (segment === '') return 'must not contain an empty segment';
+  }
+  return null;
 }
 
 function keeperMarkdown(entry: KnowledgeEntryRecord): string {

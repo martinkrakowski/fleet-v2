@@ -119,10 +119,10 @@ describe('GitShelfProvider against a real git repository', () => {
     expect(listing.split('\n').sort()).toEqual(['keepers/entry-1.md', 'keepers/entry-2.md']);
   });
 
-  it('does not run repository hooks — a failing pre-commit and reference-transaction are ignored', async () => {
+  it('does not run repository hooks — a failing post-index-change and reference-transaction are ignored', async () => {
     const repoDir = await makeShelfRepo();
     const markerPath = join(await makeTempDir('git-shelf-hooks-'), 'hooks-ran');
-    await installFailingHook(repoDir, 'pre-commit', markerPath);
+    await installFailingHook(repoDir, 'post-index-change', markerPath);
     await installFailingHook(repoDir, 'reference-transaction', markerPath);
     const provider = makeProvider(repoDir);
 
@@ -182,6 +182,93 @@ describe('GitShelfProvider against a real git repository', () => {
     });
     const listing = await runGit(repoDir, 'ls-tree', '-r', '--name-only', 'refs/heads/main');
     expect(listing).toBe('README.md');
+  });
+
+  it('refuses when the branch is checked out in ANY worktree of the shelf repository', async () => {
+    const repoDir = await makeShelfRepo();
+    const provider = makeProvider(repoDir);
+    // The keepers branch must exist before a worktree can be added on it.
+    await provider.publish({ entry: makeEntry({ id: 'entry-1' }) });
+    const worktreeDir = await makeTempDir('git-shelf-worktree-');
+    await runGit(repoDir, 'worktree', 'add', worktreeDir, 'keepers');
+    const tipBefore = await runGit(repoDir, 'rev-parse', 'refs/heads/keepers');
+
+    const result = await provider.publish({ entry: makeEntry({ id: 'entry-2' }) });
+
+    expect(result).toEqual({
+      outcome: 'failed',
+      reason: expect.stringContaining('checked out in a worktree'),
+      retryable: false,
+    });
+    expect(await runGit(repoDir, 'rev-parse', 'refs/heads/keepers')).toBe(tipBefore);
+    const listing = await runGit(repoDir, 'ls-tree', '-r', '--name-only', 'refs/heads/keepers');
+    expect(listing).not.toContain('entry-2.md');
+    // Cleanup before the temp dirs are removed.
+    await runGit(repoDir, 'worktree', 'remove', '--force', worktreeDir);
+  });
+
+  it('commits with the fixed configured identity, not the host defaults or operator identity', async () => {
+    const repoDir = await makeShelfRepo();
+    // No user identity anywhere: HOME points at an empty temp dir, and the
+    // repository carries no user.name/user.email config (setup used -c only).
+    const emptyHome = await makeTempDir('git-shelf-empty-home-');
+    const previousHome = process.env.HOME;
+    process.env.HOME = emptyHome;
+
+    try {
+      const provider = makeProvider(repoDir, { authorName: 'shelf bot', authorEmail: 'bot@shelf.invalid' });
+      const result = await provider.publish({ entry: makeEntry() });
+      expect(result.outcome).toBe('published');
+
+      const identity = await runGit(repoDir, 'log', '-1', '--format=%an|%ae|%cn|%ce', 'refs/heads/keepers');
+      expect(identity).toBe('shelf bot|bot@shelf.invalid|shelf bot|bot@shelf.invalid');
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
+  it('defaults the commit identity to the fleet-v2 shelf identity', async () => {
+    const repoDir = await makeShelfRepo();
+    const emptyHome = await makeTempDir('git-shelf-empty-home-');
+    const previousHome = process.env.HOME;
+    process.env.HOME = emptyHome;
+
+    try {
+      const provider = makeProvider(repoDir);
+      const result = await provider.publish({ entry: makeEntry() });
+      expect(result.outcome).toBe('published');
+
+      const identity = await runGit(repoDir, 'log', '-1', '--format=%an|%ae|%cn|%ce', 'refs/heads/keepers');
+      expect(identity).toBe('fleet-v2 shelf|shelf@fleet-v2.invalid|fleet-v2 shelf|shelf@fleet-v2.invalid');
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
+  it('refuses an unsafe pathPrefix explicitly and writes nothing', async () => {
+    const repoDir = await makeShelfRepo();
+    for (const badPrefix of ['/absolute', 'a/../b', '.git/keepers', 'x/.git', 'x//y']) {
+      const provider = makeProvider(repoDir, { pathPrefix: badPrefix });
+
+      const result = await provider.publish({ entry: makeEntry() });
+
+      expect(result, badPrefix).toEqual({
+        outcome: 'failed',
+        reason: expect.stringContaining('not a safe shelf path prefix'),
+        retryable: false,
+      });
+      expect(await runGit(repoDir, 'for-each-ref', 'refs/heads/keepers')).toBe('');
+    }
+
+    // A safe prefix still publishes.
+    const provider = makeProvider(repoDir, { pathPrefix: 'shared/note' });
+    const result = await provider.publish({ entry: makeEntry() });
+    expect(result.outcome).toBe('published');
+    expect(await runGit(repoDir, 'ls-tree', '-r', '--name-only', 'refs/heads/keepers')).toBe(
+      'shared/note/entry-1.md',
+    );
   });
 
   it('refuses an entry id that fails the safe-id rule and writes nothing', async () => {
@@ -246,7 +333,14 @@ describe('GitShelfProvider against a real git repository', () => {
     expect(observed.length).toBeGreaterThanOrEqual(6);
     for (const call of observed) {
       expect(call.argv[0]).toBe('git');
-      expect(call.argv.slice(1, 5)).toEqual(['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false']);
+      expect(call.argv.slice(1, 7)).toEqual([
+        '-c',
+        'core.fsmonitor=false',
+        '-c',
+        'core.hooksPath=/dev/null',
+        '-c',
+        'commit.gpgsign=false',
+      ]);
       expect(call.envKeys.filter((key) => /^GIT_/i.test(key))).toEqual(
         call.argv.includes('read-tree') || call.argv.includes('update-index') || call.argv.includes('write-tree')
           ? ['GIT_INDEX_FILE']
@@ -256,7 +350,7 @@ describe('GitShelfProvider against a real git repository', () => {
     const hashObject = observed.find((call) => call.argv.includes('hash-object'));
     expect(hashObject?.stdin).toContain('Always run the typecheck before committing');
     const updateRef = observed.find((call) => call.argv.includes('update-ref'));
-    expect(updateRef?.argv.slice(5)).toEqual([
+    expect(updateRef?.argv.slice(7)).toEqual([
       'update-ref',
       'refs/heads/keepers',
       expect.any(String),

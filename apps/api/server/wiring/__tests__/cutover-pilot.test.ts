@@ -476,16 +476,16 @@ describe("cross-context state persistence helpers", () => {
     expect(readdirSync(stateDir).filter((name) => name.includes(".tmp-"))).toEqual([]);
   });
 
-  it("treats malformed persisted state as empty rather than guessing", async () => {
+  it("refuses malformed persisted state instead of reading it as empty", async () => {
+    // A corrupt file must never be read as empty: the next locked write would
+    // replace the whole history with one record (Fable pass on #45).
     const stateDir = await makeTempDir();
 
     await writeFile(join(stateDir, "accepted-receipts.json"), "not json", "utf8");
-    await writeJsonFile(join(stateDir, "authorization-coordinates.json"), {
-      "grant-a": { attemptId: 7, expectedHeadSha: "head-a" },
-    });
+    await writeFile(join(stateDir, "authorization-coordinates.json"), "{not json", "utf8");
 
-    expect(readAcceptedReceiptsFromState(stateDir)).toEqual({});
-    expect(readAuthorizationCoordinatesFromState(stateDir).size).toBe(0);
+    expect(() => readAcceptedReceiptsFromState(stateDir)).toThrow();
+    expect(() => readAuthorizationCoordinatesFromState(stateDir)).toThrow();
   });
 });
 

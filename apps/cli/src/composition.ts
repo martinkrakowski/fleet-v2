@@ -183,22 +183,29 @@ export function assessmentIdForAttempt(attemptId: string): string {
 }
 
 /**
- * Read one flat JSON record file as a plain object. An absent, unreadable or
- * malformed file degrades to an empty record; the consuming delegate then
- * reports the missing receipt or coordinates honestly instead of crashing.
+ * Read one flat JSON record file as a plain object. ENOENT means {};
+ * any other read error or a JSON parse failure THROWS, preventing
+ * destructive writes over corrupt state.
  */
-function readJsonRecord<T>(filePath: string): Record<string, T> {
-  if (!existsSync(filePath)) {
-    return {};
-  }
+export function readJsonRecord<T>(filePath: string): Record<string, T> {
+  let content: string;
   try {
-    const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf8'));
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-      ? (parsed as Record<string, T>)
-      : {};
-  } catch {
-    return {};
+    content = readFileSync(filePath, 'utf8');
+  } catch (error: unknown) {
+    if (
+      typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: string }).code === 'ENOENT'
+    ) {
+      return {};
+    }
+    throw error;
   }
+  const parsed: unknown = JSON.parse(content);
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`Invalid JSON record in ${filePath}: expected an object`);
+  }
+  return parsed as Record<string, T>;
 }
 
 /** Grant-to-attempt binding persisted for cross-process forge execution. */

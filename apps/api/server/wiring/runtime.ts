@@ -69,19 +69,31 @@ function isAuthorizationCoordinate(value: unknown): value is FleetAuthorizationC
 }
 
 /**
- * Read the acceptance receipts persisted under `stateDir`. An absent,
- * unreadable or malformed file contributes no receipts; it is never
- * reinterpreted as acceptance.
+ * Read the acceptance receipts persisted under `stateDir`. ENOENT means {};
+ * unreadable or malformed persisted state throws. Any other filesystem error (e.g. EACCES) throws.
  */
 export function readAcceptedReceiptsFromState(stateDir: string): Record<string, string> {
+  const filePath = join(stateDir, ACCEPTED_RECEIPTS_FILE);
+  let content: string;
   try {
-    const parsed: unknown = JSON.parse(
-      readFileSync(join(stateDir, ACCEPTED_RECEIPTS_FILE), "utf8"),
-    );
-    return isRecordOfStrings(parsed) ? { ...parsed } : {};
-  } catch {
-    return {};
+    content = readFileSync(filePath, "utf8");
+  } catch (error: unknown) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      (error as { code?: string }).code === "ENOENT"
+    ) {
+      return {};
+    }
+    throw error;
   }
+  const parsed: unknown = JSON.parse(content);
+  if (!isRecordOfStrings(parsed)) {
+    throw new Error(
+      `Unreadable accepted receipts state at ${filePath}: expected a JSON object of string values`,
+    );
+  }
+  return { ...parsed };
 }
 
 /**
@@ -104,30 +116,41 @@ export async function persistAcceptedReceiptsToState(
 }
 
 /**
- * Read the authorization coordinates persisted under `stateDir`. An absent,
- * unreadable or malformed file contributes no coordinates.
+ * Read the authorization coordinates persisted under `stateDir`. ENOENT
+ * means an empty map; unreadable or malformed persisted state throws.
+ * Any other filesystem error (e.g. EACCES) throws.
  */
 export function readAuthorizationCoordinatesFromState(
   stateDir: string,
 ): Map<string, FleetAuthorizationCoordinate> {
+  const filePath = join(stateDir, AUTHORIZATION_COORDINATES_FILE);
   const coordinates = new Map<string, FleetAuthorizationCoordinate>();
+  let content: string;
   try {
-    const parsed: unknown = JSON.parse(
-      readFileSync(join(stateDir, AUTHORIZATION_COORDINATES_FILE), "utf8"),
-    );
-    if (!isPlainRecord(parsed)) {
+    content = readFileSync(filePath, "utf8");
+  } catch (error: unknown) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      (error as { code?: string }).code === "ENOENT"
+    ) {
       return coordinates;
     }
-    for (const [grantId, coordinate] of Object.entries(parsed)) {
-      if (isAuthorizationCoordinate(coordinate)) {
-        coordinates.set(grantId, {
-          attemptId: coordinate.attemptId,
-          expectedHeadSha: coordinate.expectedHeadSha,
-        });
-      }
+    throw error;
+  }
+  const parsed: unknown = JSON.parse(content);
+  if (!isPlainRecord(parsed)) {
+    throw new Error(
+      `Unreadable authorization coordinates state at ${filePath}: expected a JSON object`,
+    );
+  }
+  for (const [grantId, coordinate] of Object.entries(parsed)) {
+    if (isAuthorizationCoordinate(coordinate)) {
+      coordinates.set(grantId, {
+        attemptId: coordinate.attemptId,
+        expectedHeadSha: coordinate.expectedHeadSha,
+      });
     }
-  } catch {
-    // No persisted coordinates yet; the live in-process map stays authoritative.
   }
   return coordinates;
 }

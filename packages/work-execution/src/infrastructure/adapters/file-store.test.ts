@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { FileLockTimeoutError, withFileLock, writeJsonAtomically } from './file-store.js';
 
 describe('withFileLock', () => {
   let tempDir: string;
@@ -44,26 +44,6 @@ describe('withFileLock', () => {
     expect(parsed.value).toBe('second');
   });
 
-  it('recovers from a stale lock older than 60 seconds', async () => {
-    const lockPath = path.join(tempDir, 'stale.lock');
-
-    // Create a stale lock file written 70 seconds ago
-    const stalePayload = JSON.stringify({ pid: 999999, time: Date.now() - 70_000 });
-    await fs.writeFile(lockPath, stalePayload, 'utf8');
-
-    let executed = false;
-    const result = await withFileLock(lockPath, async () => {
-      executed = true;
-      return 'acquired';
-    });
-
-    expect(executed).toBe(true);
-    expect(result).toBe('acquired');
-
-    // Lock must be released after completion
-    await expect(fs.access(lockPath)).rejects.toThrow();
-  });
-
   it('releases lock when the function throws', async () => {
     const lockPath = path.join(tempDir, 'throw.lock');
 
@@ -79,95 +59,47 @@ describe('withFileLock', () => {
     await expect(fs.access(lockPath)).rejects.toThrow();
   });
 
-  it('handles two contenders on a stale lock with Promise.all so exactly one is inside fn at a time', async () => {
-    const lockPath = path.join(tempDir, 'stale-contenders.lock');
+  it('makes the second caller time out with FileLockTimeoutError and leaves the lock file untouched when held by another token', async () => {
+    const lockPath = path.join(tempDir, 'held.lock');
+    const foreignToken = `12345-foreignhex-${Date.now() - 5000}`;
+    await fs.writeFile(lockPath, foreignToken, 'utf8');
 
-    // Create a stale lock file written 70 seconds ago
-    const staleToken = `99999-0123456789abcdef-${Date.now() - 70_000}`;
-    await fs.writeFile(lockPath, staleToken, 'utf8');
-    const past = (Date.now() - 70_000) / 1000;
-    await fs.utimes(lockPath, past, past);
+    let thrownError: unknown = null;
+    try {
+      await withFileLock(
+        lockPath,
+        async () => {
+          return 'should not enter';
+        },
+        { timeoutMs: 50 },
+      );
+    } catch (error) {
+      thrownError = error;
+    }
 
-    let activeCount = 0;
-    let maxActiveCount = 0;
+    expect(thrownError).toBeInstanceOf(FileLockTimeoutError);
+    const timeoutError = thrownError as FileLockTimeoutError;
+    expect(timeoutError.lockPath).toBe(lockPath);
+    expect(timeoutError.message).toContain(lockPath);
+    expect(timeoutError.message).toContain('12345');
+    expect(timeoutError.message).toContain('Remove the lock only after confirming that pid is gone');
 
-    const contender = async () => {
-      return withFileLock(lockPath, async () => {
-        activeCount += 1;
-        maxActiveCount = Math.max(maxActiveCount, activeCount);
-        await new Promise((resolve) => setTimeout(resolve, 60));
-        activeCount -= 1;
-        return true;
-      });
-    };
-
-    const results = await Promise.all([contender(), contender()]);
-    expect(results).toEqual([true, true]);
-    expect(maxActiveCount).toBe(1);
-    expect(activeCount).toBe(0);
-    await expect(fs.access(lockPath)).rejects.toThrow();
+    // The lock file must be left untouched
+    const content = await fs.readFile(lockPath, 'utf8');
+    expect(content).toBe(foreignToken);
   });
 
-  it('does not delete the new holder lock when an old holder whose lock was taken over releases', async () => {
-    const lockPath = path.join(tempDir, 'takeover-release.lock');
+  it('does not unlink the lock file on release when a foreign token is in the file', async () => {
+    const lockPath = path.join(tempDir, 'foreign-token.lock');
+    const foreignToken = `99999-foreignhex-${Date.now()}`;
 
-    let releaseHolderA: () => void = () => {};
-    const pauseHolderA = new Promise<void>((resolve) => {
-      releaseHolderA = resolve;
+    await withFileLock(lockPath, async () => {
+      // While lock is held, overwrite the lock file with a foreign token
+      await fs.writeFile(lockPath, foreignToken, 'utf8');
     });
 
-    let holderAStarted: () => void = () => {};
-    const waitForHolderA = new Promise<void>((resolve) => {
-      holderAStarted = resolve;
-    });
-
-    const promiseA = withFileLock(lockPath, async () => {
-      holderAStarted();
-      await pauseHolderA;
-    });
-
-    await waitForHolderA;
-    const tokenA = await fs.readFile(lockPath, 'utf8');
-
-    // Make the lock stale so holder B can take it over
-    const staleTokenA = `${tokenA.slice(0, tokenA.lastIndexOf('-'))}-${Date.now() - 70_000}`;
-    await fs.writeFile(lockPath, staleTokenA, 'utf8');
-    const past = (Date.now() - 70_000) / 1000;
-    await fs.utimes(lockPath, past, past);
-
-    let holderBStarted: () => void = () => {};
-    const waitForHolderB = new Promise<void>((resolve) => {
-      holderBStarted = resolve;
-    });
-
-    let releaseHolderB: () => void = () => {};
-    const pauseHolderB = new Promise<void>((resolve) => {
-      releaseHolderB = resolve;
-    });
-
-    const promiseB = withFileLock(lockPath, async () => {
-      holderBStarted();
-      await pauseHolderB;
-    });
-
-    await waitForHolderB;
-    const tokenB = await fs.readFile(lockPath, 'utf8');
-    expect(tokenB).not.toBe(tokenA);
-    expect(tokenB).not.toBe(staleTokenA);
-
-    // Holder A completes its fn and executes finally
-    releaseHolderA();
-    await promiseA;
-
-    // Holder A must NOT have deleted Holder B's lock!
-    const lockAfterARelease = await fs.readFile(lockPath, 'utf8');
-    expect(lockAfterARelease).toBe(tokenB);
-
-    // Holder B completes its fn and releases its lock
-    releaseHolderB();
-    await promiseB;
-
-    // Lock file is unlinked by Holder B
-    await expect(fs.access(lockPath)).rejects.toThrow();
+    // Release in finally must not unlink the file because the token does not match
+    const content = await fs.readFile(lockPath, 'utf8');
+    expect(content).toBe(foreignToken);
   });
 });

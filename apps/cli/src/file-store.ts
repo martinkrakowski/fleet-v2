@@ -5,36 +5,82 @@ import * as path from 'node:path';
 export interface FileLockOptions {
   /** Maximum wait time in milliseconds before timing out. Defaults to 10000ms. */
   readonly timeoutMs?: number;
-  /** Stale lock threshold in milliseconds. Defaults to 60000ms. */
+  /** Stale lock threshold in milliseconds (unused, retained for compatibility). */
   readonly staleThresholdMs?: number;
+}
+
+export class FileLockTimeoutError extends Error {
+  readonly lockPath: string;
+  readonly holderPid?: number | string;
+  readonly ageMs?: number;
+
+  constructor(lockPath: string, holderPid?: number | string, ageMs?: number) {
+    const pidStr = holderPid !== undefined ? `${holderPid}` : 'unknown';
+    const ageStr = ageMs !== undefined ? `${ageMs}ms` : 'unknown';
+    super(
+      `File lock timeout on ${lockPath}: held by pid ${pidStr} (age ${ageStr}). Remove the lock only after confirming that pid is gone.`,
+    );
+    this.name = 'FileLockTimeoutError';
+    this.lockPath = lockPath;
+    this.holderPid = holderPid;
+    this.ageMs = ageMs;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
 }
 
 let tempFileCounter = 0;
 
-function parseLockTime(raw: string): number | null {
+async function readLockHolderInfo(
+  lockPath: string,
+): Promise<{ holderPid?: number | string; ageMs?: number }> {
   try {
-    const data = JSON.parse(raw) as { time?: unknown };
-    if (typeof data?.time === 'number') {
-      return data.time;
+    const stat = await fs.stat(lockPath);
+    let holderPid: number | string | undefined;
+    let lockTime: number | null = null;
+    try {
+      const raw = await fs.readFile(lockPath, 'utf8');
+      try {
+        const data = JSON.parse(raw) as { pid?: unknown; time?: unknown };
+        if (typeof data?.pid === 'number' || typeof data?.pid === 'string') {
+          holderPid = data.pid;
+        }
+        if (typeof data?.time === 'number') {
+          lockTime = data.time;
+        }
+      } catch {
+        // Not JSON
+      }
+      if (holderPid === undefined) {
+        const parts = raw.trim().split(/[-:]/);
+        if (parts.length >= 1 && parts[0].length > 0) {
+          const num = Number(parts[0]);
+          holderPid = Number.isFinite(num) ? num : parts[0];
+        }
+        if (parts.length >= 3) {
+          const num = Number(parts[parts.length - 1]);
+          if (Number.isFinite(num) && num > 0) {
+            lockTime = num;
+          }
+        }
+      }
+    } catch {
+      // Reading file failed
     }
+    const effectiveTime = lockTime ?? stat.mtimeMs;
+    const ageMs = Math.max(0, Date.now() - effectiveTime);
+    return { holderPid, ageMs };
   } catch {
-    // Not JSON
+    return {};
   }
-  const parts = raw.trim().split(/[-:]/);
-  if (parts.length >= 3) {
-    const num = Number(parts[parts.length - 1]);
-    if (Number.isFinite(num) && num > 0) {
-      return num;
-    }
-  }
-  return null;
 }
 
 /**
  * Acquire an exclusive lock on `lockPath` using `fs.open(path, 'wx')` holding
- * a unique acquisition token (pid + random 16 hex + time). Stale locks (>60s)
- * are safely taken over via atomic rename. The lock is released in `finally`
- * only if the lock file still contains this acquisition's token.
+ * a unique acquisition token (pid + random 16 hex + time). Fails closed on
+ * contention: retries until timeoutMs, then throws FileLockTimeoutError.
+ * Never takes over or unlinks a lock held by another process.
+ * The lock is released in `finally` only if the lock file still contains
+ * this acquisition's token.
  */
 export async function withFileLock<T>(
   lockPath: string,
@@ -43,7 +89,6 @@ export async function withFileLock<T>(
 ): Promise<T> {
   const timeoutMs = options?.timeoutMs ?? 10_000;
   const pollIntervalMs = 25;
-  const staleThresholdMs = options?.staleThresholdMs ?? 60_000;
   const startTime = Date.now();
   const token = `${process.pid}-${randomBytes(8).toString('hex')}-${Date.now()}`;
 
@@ -81,55 +126,9 @@ export async function withFileLock<T>(
         throw error;
       }
 
-      let isStale = false;
-      try {
-        const stat = await fs.stat(lockPath);
-        let lockTime = stat.mtimeMs;
-        try {
-          const raw = await fs.readFile(lockPath, 'utf8');
-          const parsed = parseLockTime(raw);
-          if (parsed !== null) {
-            lockTime = parsed;
-          }
-        } catch {
-          // fallback to stat.mtimeMs
-        }
-        if (Date.now() - lockTime > staleThresholdMs) {
-          isStale = true;
-        }
-      } catch {
-        // File might have been unlinked concurrently
-      }
-
-      if (isStale) {
-        const staleFile = `${lockPath}.stale.${token}`;
-        let renamed = false;
-        try {
-          await fs.rename(lockPath, staleFile);
-          renamed = true;
-        } catch (renameError: unknown) {
-          const isEnoent =
-            typeof renameError === 'object' &&
-            renameError !== null &&
-            (renameError as { code?: string }).code === 'ENOENT';
-          if (!isEnoent) {
-            throw renameError;
-          }
-          // Failed rename (ENOENT) means someone else took over: go back to waiting.
-        }
-
-        if (renamed) {
-          try {
-            await fs.unlink(staleFile);
-          } catch {
-            // ignore
-          }
-          continue;
-        }
-      }
-
       if (Date.now() - startTime >= timeoutMs) {
-        throw new Error(`Timeout waiting for file lock: ${lockPath}`);
+        const { holderPid, ageMs } = await readLockHolderInfo(lockPath);
+        throw new FileLockTimeoutError(lockPath, holderPid, ageMs);
       }
 
       const elapsed = Date.now() - startTime;

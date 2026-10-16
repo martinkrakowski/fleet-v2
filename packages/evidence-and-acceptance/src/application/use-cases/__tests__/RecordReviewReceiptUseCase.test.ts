@@ -44,6 +44,7 @@ function sampleRecord(overrides: Partial<EvidenceAssessmentRecord> = {}): Eviden
     attemptId: 'att-1',
     candidateHeadSha: HEAD,
     policyRevision: 'pol-1',
+    implementerModel: 'anthropic/claude-3-5-sonnet',
     requiredChecks: [],
     state: 'pending',
     verificationReceipts: [],
@@ -150,8 +151,8 @@ describe('RecordReviewReceiptUseCase blank model handling', () => {
     const useCase = new RecordReviewReceiptUseCase({ repo });
 
     const receipt = sampleReceipt({
-      reviewerModel: 'openrouter/anthropic/claude-3-5-sonnet',
-      implementerModel: 'bedrock/anthropic/claude-3-5-sonnet',
+      reviewerModel: 'openrouter/claude-3-5-sonnet',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
     });
 
     const result = await useCase.recordReviewReceipt({
@@ -161,7 +162,7 @@ describe('RecordReviewReceiptUseCase blank model handling', () => {
 
     expect(result.outcome).toBe('rejected');
     if (result.outcome === 'rejected') {
-      expect(result.reason).toContain('share the same underlying model');
+      expect(result.reason).toContain('shares the same underlying model as the implementer');
     }
   });
 
@@ -182,5 +183,49 @@ describe('RecordReviewReceiptUseCase blank model handling', () => {
     }
     const stored = await repo.findAssessmentById('asm-1');
     expect(stored?.reviewReceipts).toHaveLength(1);
+  });
+
+  it('refuses a receipt claiming the implementer seat with a fake implementer field', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const useCase = new RecordReviewReceiptUseCase({ repo });
+
+    // The reviewer IS the implementer's own model, dressed up with a receipt
+    // implementer field that differs from the assessment's recorded seat.
+    const receipt = sampleReceipt({
+      reviewerModel: 'bedrock/anthropic/claude-3-5-sonnet',
+      implementerModel: 'openai/gpt-4o',
+    });
+
+    const result = await useCase.recordReviewReceipt({
+      assessmentId: 'asm-1',
+      receipt,
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.reason).toContain("claims implementer 'openai/gpt-4o'");
+      expect(result.reason).toContain('claude-3-5-sonnet');
+    }
+    const stored = await repo.findAssessmentById('asm-1');
+    expect(stored?.reviewReceipts).toHaveLength(0);
+  });
+
+  it('refuses a receipt whose implementer field differs from the recorded seat', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const useCase = new RecordReviewReceiptUseCase({ repo });
+
+    const receipt = sampleReceipt({ implementerModel: 'openai/gpt-4o' });
+
+    const result = await useCase.recordReviewReceipt({
+      assessmentId: 'asm-1',
+      receipt,
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.reason).toContain('was implemented on seat');
+    }
+    const stored = await repo.findAssessmentById('asm-1');
+    expect(stored?.reviewReceipts).toHaveLength(0);
   });
 });

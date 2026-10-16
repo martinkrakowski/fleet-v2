@@ -62,8 +62,10 @@ export type ImplementerSeatResolution =
 
 /**
  * Read `modelAssignment.model` from the attempt's frozen brief manifest. The
- * candidate paths are the ones dispatch itself reads, so both stations see one
- * manifest; an unreadable or non-JSON candidate is absence, not an error.
+ * candidate paths are derived from the dispatch-recorded brief package path
+ * only: a worker-writable worktree file is never a seat authority, so a
+ * legacy attempt without a recorded runner model stays `unknown`. An
+ * unreadable or non-JSON candidate is absence, not an error.
  */
 async function readFrozenManifestModel(
   attempt: AttemptRecord,
@@ -75,7 +77,6 @@ async function readFrozenManifestModel(
     isNonEmptyString(briefPackagePath)
       ? briefPackagePath.replace(/\.md$/, '-manifest.json')
       : null,
-    '.lane/brief-manifest.json',
   ].filter(isNonEmptyString);
 
   for (const candidate of candidates) {
@@ -112,8 +113,9 @@ async function readFrozenManifestModel(
 /**
  * Bind an attempt to the seat that implemented it: the runner model dispatch
  * recorded on the attempt, otherwise the frozen brief manifest's model
- * assignment read through the existing ports. Neither known is `unknown`,
- * never an assumed default seat.
+ * assignment read through the dispatch-recorded brief package path. Neither
+ * known is `unknown`, never an assumed default seat, and a legacy attempt
+ * with no recorded runner model is refused.
  */
 export async function resolveImplementerSeat(
   attempt: AttemptRecord,

@@ -13,6 +13,12 @@ export interface RequestVerificationRequest {
   readonly candidateHeadSha: string;
   readonly policyRevision: string;
   readonly hostId: string;
+  /**
+   * The implementer seat the attempt was dispatched on, resolved from the
+   * attempt's own recorded runner seat by the caller. The assessment records
+   * it at creation; an absent seat is a refusal, never an assumed model.
+   */
+  readonly implementerModel: string;
   readonly requiredChecks: readonly string[];
   readonly nowIso?: string;
 }

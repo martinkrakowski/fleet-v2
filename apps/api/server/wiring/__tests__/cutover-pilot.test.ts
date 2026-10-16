@@ -336,6 +336,7 @@ const MATRIX_VERIFICATION_REQUEST = {
   candidateHeadSha: MATRIX_HEAD,
   policyRevision: "policy-matrix-1",
   hostId: "host-matrix-1",
+  implementerModel: "seat-matrix/implementer-model",
   requiredChecks: ["typecheck"],
 };
 

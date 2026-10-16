@@ -519,7 +519,12 @@ describe('Fleet CLI workflow', () => {
     expect(jsonOf(dispatch)).toMatchObject({
       outcome: 'started',
       sessionId: SESSION_ID,
-      attempt: { id: ATTEMPT_ID, state: 'running', briefDigest },
+      attempt: {
+        id: ATTEMPT_ID,
+        state: 'running',
+        briefDigest,
+        runner: { model: 'nvidia/z-ai/glm-5.3' },
+      },
     });
 
     const reconcile = await cli([
@@ -617,7 +622,6 @@ describe('Fleet CLI workflow', () => {
           attemptId: ATTEMPT_ID,
           candidateHeadSha: laneHead,
           reviewerModel: 'openrouter/anthropic/claude-sonnet-4.5',
-          implementerModel: 'nvidia/z-ai/glm-5.3',
           readOnlyVerified: true,
           result: 'pass',
           findings: [],
@@ -1481,7 +1485,11 @@ describe('Fleet CLI workflow', () => {
     expect(jsonOf(dispatch)).toMatchObject({
       outcome: 'started',
       sessionId: SESSION_ID,
-      attempt: { id: mpAttemptId, state: 'running' },
+      attempt: {
+        id: mpAttemptId,
+        state: 'running',
+        runner: { model: 'nvidia/z-ai/glm-5.3' },
+      },
     });
 
     const reconcile = await mpCli([
@@ -1569,7 +1577,6 @@ describe('Fleet CLI workflow', () => {
           attemptId: mpAttemptId,
           candidateHeadSha: mpLaneHead,
           reviewerModel: 'openrouter/anthropic/claude-sonnet-4.5',
-          implementerModel: 'nvidia/z-ai/glm-5.3',
           readOnlyVerified: true,
           result: 'pass',
           findings: [],

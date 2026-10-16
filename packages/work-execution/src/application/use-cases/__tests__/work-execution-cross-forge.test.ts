@@ -474,6 +474,39 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     );
   });
 
+  it('rejects a legacy attempt whose only manifest is the worker-writable worktree path', async () => {
+    const acceptancePort = new FakeAcceptanceAssessment();
+    const manifestReads: string[] = [];
+    const useCase = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([
+        makeAttempt({
+          runner: null,
+          briefPackagePath: '/tmp/opencode/lanes/attempt-1/.lane/brief.md',
+        }),
+      ]),
+      acceptancePort,
+      artifactPort: {
+        readBriefManifest: async (_worktreePath: string, manifestPath?: string) => {
+          manifestReads.push(manifestPath ?? '');
+          // A worker-writable worktree manifest would happily "confirm" any seat.
+          if (manifestPath === '.lane/brief-manifest.json') {
+            return JSON.stringify({ modelAssignment: { model: 'opencode/longcat-2.5-preview-free' } });
+          }
+          return null;
+        },
+      },
+    });
+
+    const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(result.outcome).toBe('rejected');
+    expect(result.outcome === 'rejected' && result.reason).toBe(
+      "Attempt attempt-1 records no implementer seat: neither the dispatched runner model nor the frozen brief manifest's model assignment is known",
+    );
+    expect(manifestReads).not.toContain('.lane/brief-manifest.json');
+    expect(acceptancePort.requests).toHaveLength(0);
+  });
+
   it('prefers the recorded runner seat over a differing frozen manifest', async () => {
     const manifestReads: string[] = [];
     // The manifest and the recorded seat disagree; the seat dispatch actually

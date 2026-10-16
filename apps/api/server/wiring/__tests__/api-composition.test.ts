@@ -129,6 +129,7 @@ const VERIFICATION_REQUEST = {
   candidateHeadSha: "def5678",
   policyRevision: "policy-1",
   hostId: "host-1",
+  implementerModel: "seat/implementer",
   requiredChecks: ["typecheck"],
 };
 

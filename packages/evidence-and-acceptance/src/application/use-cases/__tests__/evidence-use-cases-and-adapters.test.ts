@@ -152,6 +152,7 @@ function assessmentRecord(
     attemptId: 'att-1',
     candidateHeadSha: HEAD,
     policyRevision: 'policy-7',
+    implementerModel: IMPLEMENTER_MODEL,
     requiredChecks: ['ci'],
     state: 'pending',
     verificationReceipts: [],
@@ -264,6 +265,7 @@ function requestVerification(overrides: Record<string, unknown> = {}): Record<st
     candidateHeadSha: HEAD,
     policyRevision: 'policy-7',
     hostId: 'host-1',
+    implementerModel: IMPLEMENTER_MODEL,
     requiredChecks: ['ci', 'unit-tests'],
     nowIso: NOW,
     ...overrides,
@@ -710,7 +712,7 @@ describe('RecordReviewReceiptUseCase', () => {
     if (result.outcome !== 'rejected') {
       throw new Error('expected a rejection');
     }
-    expect(result.reason).toContain('share the same underlying model');
+    expect(result.reason).toContain('shares the same underlying model as the implementer');
   });
 
   it('rejects a review bound to another head', async () => {

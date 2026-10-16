@@ -102,6 +102,9 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
         reason: 'Review was not verified read-only, so it is not evidence',
       };
     }
+    // The implementer identity on the receipt is a fact about the attempt's
+    // recorded seat, not a caller-supplied label: it must restate the seat the
+    // assessment recorded at creation.
     if (
       !isNonEmptyTrimmedString(receipt.reviewerModel) ||
       !isNonEmptyTrimmedString(receipt.implementerModel)
@@ -111,12 +114,16 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
         reason: 'Review receipt requires non-empty reviewerModel and implementerModel',
       };
     }
-    if (
-      underlyingModelFamily(receipt.reviewerModel) === underlyingModelFamily(receipt.implementerModel)
-    ) {
+    if (receipt.implementerModel !== assessment.implementerModel) {
       return {
         outcome: 'rejected',
-        reason: `Reviewer ${receipt.reviewerModel} and implementer ${receipt.implementerModel} share the same underlying model`,
+        reason: `Review receipt claims implementer '${receipt.implementerModel}', but assessment '${assessment.id}' was implemented on seat '${assessment.implementerModel}'`,
+      };
+    }
+    if (underlyingModelFamily(receipt.reviewerModel) === underlyingModelFamily(assessment.implementerModel)) {
+      return {
+        outcome: 'rejected',
+        reason: `Reviewer ${receipt.reviewerModel} shares the same underlying model as the implementer ${assessment.implementerModel}`,
       };
     }
 

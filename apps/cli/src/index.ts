@@ -553,17 +553,25 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
     },
   },
   evidence: {
-    'request-verification': async (p, rt) =>
-      rt.evidence.requestVerification.requestVerification({
+    'request-verification': async (p, rt) => {
+      // The assessment records the attempt's own implementer seat at creation;
+      // an unresolvable seat is a typed rejection, never an assumed model.
+      const seat = await bindImplementerSeat(rt, p);
+      if (!seat.bound) {
+        return seat.rejection;
+      }
+      return rt.evidence.requestVerification.requestVerification({
         assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),
         projectId: str(p, 'projectId'),
         attemptId: str(p, 'attemptId'),
         candidateHeadSha: str(p, 'candidateHeadSha'),
         policyRevision: str(p, 'policyRevision'),
         hostId: str(p, 'hostId'),
+        implementerModel: seat.implementerModel,
         requiredChecks: strArr(p, 'requiredChecks'),
         nowIso: optStr(p, 'nowIso'),
-      }),
+      });
+    },
     'record-verification': async (p, rt) =>
       rt.evidence.recordVerificationReceipt.recordVerificationReceipt({
         assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),
@@ -587,12 +595,26 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         nowIso: optStr(p, 'nowIso'),
       });
     },
-    'record-review': async (p, rt) =>
-      rt.evidence.recordReviewReceipt.recordReviewReceipt({
+    'record-review': async (p, rt) => {
+      const seat = await bindImplementerSeat(rt, p);
+      if (!seat.bound) {
+        return seat.rejection;
+      }
+      const receipt = requiredNested<ReviewReceiptRecord>(p, 'receipt', 'evidence record-review');
+      const supplied = receipt.implementerModel;
+      if (typeof supplied === 'string' && supplied.trim() !== '' && supplied.trim() !== seat.implementerModel) {
+        throw new CliUsageError(
+          `evidence record-review refuses implementerModel '${supplied.trim()}': attempt '${str(p, 'attemptId')}' was dispatched on seat '${seat.implementerModel}'`,
+        );
+      }
+      // The receipt's implementer field restates the recorded seat; it is
+      // bound, never caller-authored.
+      return rt.evidence.recordReviewReceipt.recordReviewReceipt({
         assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),
-        receipt: requiredNested<ReviewReceiptRecord>(p, 'receipt', 'evidence record-review'),
+        receipt: { ...receipt, implementerModel: seat.implementerModel },
         nowIso: optStr(p, 'nowIso'),
-      }),
+      });
+    },
     disposition: async (p, rt) =>
       rt.evidence.recordFindingDisposition.recordFindingDisposition({
         assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),

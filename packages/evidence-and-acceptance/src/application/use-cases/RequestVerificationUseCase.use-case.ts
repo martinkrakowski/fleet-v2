@@ -76,12 +76,13 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
       !isNonEmptyTrimmedString(request.attemptId) ||
       !isNonEmptyTrimmedString(request.candidateHeadSha) ||
       !isNonEmptyTrimmedString(request.policyRevision) ||
-      !isNonEmptyTrimmedString(request.hostId)
+      !isNonEmptyTrimmedString(request.hostId) ||
+      !isNonEmptyTrimmedString(request.implementerModel)
     ) {
       return {
         outcome: 'rejected',
         reason:
-          'Verification requires non-empty assessmentId, projectId, attemptId, candidateHeadSha, policyRevision and hostId',
+          'Verification requires non-empty assessmentId, projectId, attemptId, candidateHeadSha, policyRevision, hostId and implementerModel',
       };
     }
     if (
@@ -125,6 +126,12 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
           reason: `Assessment project ID '${existing.projectId}' does not match requested project ID '${request.projectId}'`,
         };
       }
+      if (existing.implementerModel !== request.implementerModel) {
+        return {
+          outcome: 'rejected',
+          reason: `Assessment records implementer seat '${existing.implementerModel}', which does not match the attempt's recorded seat '${request.implementerModel}'`,
+        };
+      }
     }
     const base: EvidenceAssessmentRecord = existing ?? {
       id: request.assessmentId,
@@ -132,6 +139,7 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
       attemptId: request.attemptId,
       candidateHeadSha: request.candidateHeadSha,
       policyRevision: request.policyRevision,
+      implementerModel: request.implementerModel,
       requiredChecks: [...request.requiredChecks],
       state: 'pending',
       verificationReceipts: [],

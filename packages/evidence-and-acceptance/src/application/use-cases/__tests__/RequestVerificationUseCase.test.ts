@@ -84,6 +84,7 @@ function sampleRecord(overrides: Partial<EvidenceAssessmentRecord> = {}): Eviden
     attemptId: 'att-1',
     candidateHeadSha: HEAD1,
     policyRevision: 'pol-1',
+    implementerModel: 'anthropic/claude-3-5-sonnet',
     requiredChecks: ['lint'],
     state: 'pending',
     verificationReceipts: [],
@@ -112,6 +113,7 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
       candidateHeadSha: HEAD2, // mismatched head!
       policyRevision: 'pol-1',
       hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
       requiredChecks: ['lint'],
     });
 
@@ -140,6 +142,7 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
       candidateHeadSha: HEAD1,
       policyRevision: 'pol-2', // mismatched policy revision!
       hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
       requiredChecks: ['lint'],
     });
 
@@ -165,6 +168,7 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
       candidateHeadSha: HEAD1,
       policyRevision: 'pol-1',
       hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
       requiredChecks: ['lint'],
     });
 
@@ -189,6 +193,7 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
       candidateHeadSha: HEAD1,
       policyRevision: 'pol-1',
       hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
       requiredChecks: ['lint'],
     });
 
@@ -218,6 +223,7 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
       candidateHeadSha: HEAD1,
       policyRevision: 'pol-1',
       hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
       requiredChecks: ['lint'],
     });
 
@@ -242,6 +248,7 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
       candidateHeadSha: HEAD1,
       policyRevision: 'pol-1',
       hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
       requiredChecks: ['lint'],
     });
 
@@ -249,5 +256,57 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
     const stored = await repo.findAssessmentById('asm-brand-new');
     expect(stored).not.toBeNull();
     expect(stored?.candidateHeadSha).toBe(HEAD1);
+    expect(stored?.implementerModel).toBe('anthropic/claude-3-5-sonnet');
+  });
+
+  it('refuses when the implementer seat is absent', async () => {
+    const repo = new InMemoryAssessmentRepo([]);
+    const executor = new StubExecutor();
+    const archive = new StubArchive();
+    const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+
+    const result = await useCase.requestVerification({
+      assessmentId: 'asm-no-seat',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      hostId: 'host-1',
+      implementerModel: '   ',
+      requiredChecks: ['lint'],
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.reason).toContain('implementerModel');
+    }
+    expect(executor.calls).toHaveLength(0);
+    const stored = await repo.findAssessmentById('asm-no-seat');
+    expect(stored).toBeNull();
+  });
+
+  it('refuses when the implementer seat differs from the recorded assessment seat', async () => {
+    const existing = sampleRecord({ implementerModel: 'anthropic/claude-3-5-sonnet' });
+    const repo = new InMemoryAssessmentRepo([existing]);
+    const executor = new StubExecutor();
+    const archive = new StubArchive();
+    const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+
+    const result = await useCase.requestVerification({
+      assessmentId: 'asm-1',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      hostId: 'host-1',
+      implementerModel: 'openai/gpt-4o',
+      requiredChecks: ['lint'],
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.reason).toContain('implementer seat');
+    }
+    expect(executor.calls).toHaveLength(0);
   });
 });

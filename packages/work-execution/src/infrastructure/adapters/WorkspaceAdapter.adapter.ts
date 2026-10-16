@@ -32,6 +32,23 @@ export interface WorkspaceAdapterOptions {
 /** Residue markers a previous attempt may have left in the worktree. */
 const laneResidueFiles = ['.lane/brief.md', '.lane/brief-manifest.json', '.lane/notes.md'];
 
+const SAFE_SSH_HOST_PATTERN = /^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$/;
+
+/**
+ * Validate that an SSH host string is safe to pass to subprocess commands.
+ * Matches `^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$` and does not start with `-`.
+ */
+export function isSafeSshHost(host: string): boolean {
+  if (typeof host !== 'string' || host.startsWith('-')) {
+    return false;
+  }
+  const atIndex = host.indexOf('@');
+  if (atIndex !== -1 && host.slice(atIndex + 1).startsWith('-')) {
+    return false;
+  }
+  return SAFE_SSH_HOST_PATTERN.test(host);
+}
+
 /** Single-quote one argument for the remote POSIX shell. */
 function posixQuote(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";
@@ -50,6 +67,12 @@ export class WorkspaceAdapter implements WorkspacePort {
 
   async inspectWorktree(request: WorktreeInspectionRequest): Promise<WorktreeInspection> {
     const { worktreePath, baseCommit } = request;
+
+    if (this.options?.sshHost && !existsSync(worktreePath) && !isSafeSshHost(this.options.sshHost)) {
+      throw new Error(
+        `Unable to inspect worktree in ${worktreePath}: unsafe SSH host '${this.options.sshHost}'`,
+      );
+    }
 
     let checkedOutCommit: string;
     try {
@@ -113,7 +136,13 @@ export class WorkspaceAdapter implements WorkspacePort {
 
   /** Remote host alias when the worktree lives off-host, otherwise null. */
   private useRemote(worktreePath: string): string | null {
-    return this.options?.sshHost && !existsSync(worktreePath) ? this.options.sshHost : null;
+    if (!this.options?.sshHost || existsSync(worktreePath)) {
+      return null;
+    }
+    if (!isSafeSshHost(this.options.sshHost)) {
+      throw new Error(`Refusing to execute on unsafe SSH host: ${this.options.sshHost}`);
+    }
+    return this.options.sshHost;
   }
 
   /** Read-only git in the worktree, locally or through the reviewed ssh host. */
@@ -124,7 +153,7 @@ export class WorkspaceAdapter implements WorkspacePort {
       return stdout;
     }
     const remoteCommand = ['git', '-C', worktreePath, ...args].map(posixQuote).join(' ');
-    const { stdout } = await execFileAsync('ssh', [sshHost, remoteCommand]);
+    const { stdout } = await execFileAsync('ssh', [sshHost, '--', remoteCommand]);
     return stdout;
   }
 
@@ -139,6 +168,7 @@ export class WorkspaceAdapter implements WorkspacePort {
     }
     const { stdout } = await execFileAsync('ssh', [
       sshHost,
+      '--',
       `if test -e ${posixQuote(targetPath)}; then printf 1; else printf 0; fi`,
     ]);
     return stdout.trim() === '1';

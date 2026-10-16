@@ -44,6 +44,7 @@ import {
   StopAttemptUseCase,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
+  isSafeSshHost,
   type GhInvocationResult,
 } from '@fleet/work-execution';
 
@@ -229,13 +230,19 @@ function runGhSubprocess(args: readonly string[]): Promise<GhInvocationResult> {
  * When the worktree lives on another host, the same read-only rev-parse runs
  * over the reviewed ssh alias instead.
  */
-function readGitHead(worktreePath: string, sshHost?: string): Promise<string> {
+export function readGitHead(worktreePath: string, sshHost?: string): Promise<string> {
+  if (sshHost !== undefined && !existsSync(worktreePath)) {
+    if (!isSafeSshHost(sshHost)) {
+      return Promise.reject(new Error(`Refusing to read HEAD over SSH: unsafe host '${sshHost}'`));
+    }
+  }
   const invocation =
     sshHost !== undefined && !existsSync(worktreePath)
       ? {
           command: 'ssh',
           args: [
             sshHost,
+            '--',
             ['git', '-C', worktreePath, 'rev-parse', 'HEAD'].map(posixQuote).join(' '),
           ],
         }
@@ -544,6 +551,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         head === request.expectedHeadSha &&
         (worktreeSshHost !== undefined || process.env.FLEET_FORGE_PUSH_ORIGIN === '1');
       if (shouldSeedOrigin && worktreeSshHost !== undefined && !existsSync(attempt.worktreePath)) {
+        if (!isSafeSshHost(worktreeSshHost)) {
+          throw new Error(`Refusing to fetch from unsafe SSH host: '${worktreeSshHost}'`);
+        }
         await runGitCommand([
           'fetch',
           `${worktreeSshHost}:${attempt.worktreePath}`,

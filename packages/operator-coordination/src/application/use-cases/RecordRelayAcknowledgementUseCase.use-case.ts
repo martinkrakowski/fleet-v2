@@ -77,6 +77,15 @@ export class RecordRelayAcknowledgementUseCase implements RecordRelayAcknowledge
     if (recorded.kind !== 'relay') {
       return rejected(`recorded request ${requestId} is not a relay notice`);
     }
+    const recipientId = request.recipientId.trim();
+    const expectedRecipient = recorded.actionScope.startsWith('relay:')
+      ? recorded.actionScope.slice('relay:'.length)
+      : recorded.actionScope;
+    if (recipientId !== expectedRecipient) {
+      return rejected(
+        `recipient ${recipientId} does not match relay recipient ${expectedRecipient}`,
+      );
+    }
     if (
       recorded.acknowledgements.some(
         (acknowledgement) => acknowledgement.acknowledgementId === acknowledgementId,

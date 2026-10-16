@@ -23,9 +23,9 @@ What each boundary does today:
 | Forge evidence (CI state, unresolved threads) | Port exists; no `gh pr checks` transport is bound yet, so evidence reads as `unknown`. |
 | Waves observations, decisions, relays, attention | Observations and relays go to local outbox directories; decisions are read from local answer files; attention reads report absence. The HTTP adapter to a live Waves service is not wired. |
 | Knowledge shelf | Keepers append to a local shelf file under the state directory. Publication to an external shelf is not wired. |
-| Web app | Renders live data from the API when `FLEET_API_URL` is set, and says on screen when it fell back to fixtures. Every mutating action opens a confirmation first. |
+| Web app | Views read fixtures; `api-client.ts` exists and is not yet used by pages. Every mutating action opens a confirmation first. |
 | Staging | A deployment script for a Kubernetes namespace is in `deploy/staging/` (`yarn staging:deploy --yes`). It currently hard-codes the author's own registry (`registry.midnight.lan`) and namespace (`fleet-v2-staging`); edit `deploy/staging/` for another installation. |
-| Continuous integration | No GitHub Actions workflow yet. Run the gate below before opening a pull request. |
+| Continuous integration | GitHub Actions workflow `.github/workflows/gate.yml` runs the gate checks on pull requests and main. |
 
 Every boundary above that is not yet wired refuses or reports its own absence rather than inventing an answer. That is by design: an unconfigured port is never an implicit pass.
 
@@ -81,7 +81,7 @@ These values belong to the operator's installation, never to this repository.
 | `FLEET_RUNNER_AGENT`, `FLEET_RUNNER_MODEL`, `FLEET_RUNNER_VARIANT` | The runner seat. The model and variant are recorded in the frozen brief manifest. |
 | `OCM_REMOTE_PORT` | The single port passed to the runner subprocess. |
 | `FLEET_FORGE_PUSH_ORIGIN`, `FLEET_PR_TITLE`, `FLEET_PR_BODY`, `FLEET_PR_DELETE_BRANCH` | Forge settings used by `gh` after acceptance. |
-| `FLEET_API_URL`, `NEXT_PUBLIC_FLEET_API_URL` | Base URL the web app uses for the API. With neither set the web app renders fixtures and says so. |
+| `FLEET_API_URL`, `NEXT_PUBLIC_FLEET_API_URL` | Base URL for the web app's HTTP API client (`api-client.ts`). Pages currently render fixtures. |
 
 Put installation data (hosts, paths, project registries, model seats, variants, fallbacks, capacities, service URLs) under the ignored `installation/` directory. Runtime artifacts belong under `.fleet/`. Lane briefs and notes stay in ignored paths inside the lane's own worktree.
 

@@ -28,7 +28,20 @@ import type {
 
 export interface AssessHeadAcceptanceDependencies {
   readonly repo: EvidenceAssessmentRepositoryPort;
+  /**
+   * The forge-evidence port (D6). It is bound only when the installation's
+   * forge mode is `github`; a failing or unreadable forge read then blocks
+   * acceptance exactly as before.
+   */
   readonly forgeEvidence?: ForgeEvidencePort;
+  /**
+   * The installation's forge mode (D6). With `none` the use case never reads
+   * the forge: it records `forgeEvidence: 'not-configured'` on the
+   * assessment — a distinct value, never `unknown` — and blocks when the
+   * brief names a CI-state requirement, which `not-configured` never
+   * satisfies. Verification receipts and the independent review still bind.
+   */
+  readonly forgeMode?: 'github' | 'none';
   readonly ownerDecisionPort?: OwnerDecisionPort;
   /** Reads the one-way doors the frozen brief named for this attempt. */
   readonly attemptOwnerDecisionPort?: AttemptOwnerDecisionPort;
@@ -44,6 +57,15 @@ function isNonEmptyTrimmedString(value: unknown): value is string {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Whether a brief names a CI-state requirement (D6). The canonical CI check
+ * name is `ci` (case-insensitive); such a check cannot be satisfied by a
+ * forge that is not configured.
+ */
+function namesCiRequirement(requiredChecks: readonly string[]): boolean {
+  return requiredChecks.some((check) => check.trim().toLowerCase() === 'ci');
 }
 
 /** Required checks without a completed, passing receipt for this exact head. */
@@ -175,11 +197,10 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       };
     }
 
-    const assessment = await deps.repo.findAssessmentById(request.assessmentId);
+    let assessment = await deps.repo.findAssessmentById(request.assessmentId);
     if (assessment === null) {
       return { outcome: 'rejected', reason: 'Assessment not found' };
     }
-
     const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
 
     if (assessment.state === 'stale') {
@@ -208,6 +229,13 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       return { outcome: 'stale', reason: 'Candidate head or policy revision changed' };
     }
 
+    // With forge mode `none` (D6) the assessment records the distinct
+    // `not-configured` forge-evidence value; acceptance is receipt-only and
+    // every later save carries the record.
+    if (deps.forgeMode === 'none' && assessment.forgeEvidence !== 'not-configured') {
+      assessment = { ...assessment, forgeEvidence: 'not-configured' };
+    }
+
     // One-way doors are checked before a stored acceptance is returned: an
     // idempotent "already accepted" read is not a way past a door that is now
     // undecided, unknown or unreadable.
@@ -232,7 +260,15 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       ...collectFindingBlockers(assessment),
     ];
 
-    if (deps.forgeEvidence !== undefined) {
+    if (deps.forgeMode === 'none') {
+      // D6: `not-configured` never satisfies a CI-state requirement; a brief
+      // that names one is blocked, never receipt-only accepted past it.
+      if (namesCiRequirement(assessment.requiredChecks)) {
+        blockers.push(
+          "forge mode is 'none': the brief requires CI state, and forge evidence is 'not-configured'",
+        );
+      }
+    } else if (deps.forgeEvidence !== undefined) {
       const status = await deps.forgeEvidence.readForgeCheckStatus({
         candidateHeadSha: assessment.candidateHeadSha,
       });

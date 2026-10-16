@@ -793,6 +793,11 @@ function parseHost(entry: JsonObject, hostPath: string, errors: string[]): HostS
   if (transport === undefined || worktreeRoot === undefined || roles === undefined) {
     return undefined;
   }
+  // A lane-runner host without a runner block is an undeclared runner (D4):
+  // the loader refuses it instead of deriving an undispatchable host.
+  if (roles.includes('lane-runner') && !Object.hasOwn(entry, 'runner')) {
+    errors.push(`${hostPath}.runner: required when the host holds the lane-runner role`);
+  }
   return {
     transport,
     ...(sshAlias !== undefined ? { sshAlias } : {}),

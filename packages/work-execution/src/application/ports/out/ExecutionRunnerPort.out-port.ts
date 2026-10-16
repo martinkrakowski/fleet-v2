@@ -16,14 +16,22 @@ import type {
  * Isolation capabilities a runner must declare before an attempt may be
  * dispatched to it. The attempt's requirements must fit this profile;
  * Kubernetes objects and other vendor types stay out of this contract.
+ *
+ * `filesystemScope: "unknown"` reports an undeclared runner (D4): dispatch
+ * refuses it and no flag can waive the refusal. `source` reports how the
+ * capability profile was established (D4): `declared` for a v2 declaration,
+ * `legacy-asserted` for the v1 and env-only mapping, `undeclared` when the
+ * runner carries no declaration. It is optional so records and tests that
+ * predate D4 keep their meaning.
  */
 export interface RunnerIsolationCapabilities {
-  readonly filesystemScope: 'scoped-worktree' | 'inherited-directory';
+  readonly filesystemScope: 'scoped-worktree' | 'inherited-directory' | 'unknown';
   readonly networkEgressRestricted: boolean;
   readonly cpuAndMemoryLimited: boolean;
   readonly processTreeTermination: boolean;
   readonly authoritativeCompletion: boolean;
   readonly artifactPersistence: boolean;
+  readonly source?: 'declared' | 'undeclared' | 'legacy-asserted';
 }
 
 export type RunnerReachability = 'reachable' | 'unreachable' | 'unknown';

@@ -53,6 +53,12 @@ export interface ExecuteAuthorizedForgeActionDependencies {
   /** Non-authoritative cache of accepted-receipt id per head. */
   readonly acceptedReceiptByHead?: Readonly<Record<string, string>>;
   /**
+   * The installation's forge mode (D6). Mode `none` refuses every forge
+   * action before any grant is consumed or subprocess runs; `github` and an
+   * unknown mode keep today's behaviour.
+   */
+  readonly forgeMode?: 'github' | 'none';
+  /**
    * Composition-root clock for journal and revision timestamps; the
    * wall-clock default is a scaffold convenience, not an authority source.
    */
@@ -68,6 +74,15 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     const deps = this.deps;
     if (!deps) {
       throw new Error('Not implemented: ExecuteAuthorizedForgeActionUseCase');
+    }
+
+    // Forge mode `none` (D6) is an explicit installation choice: every forge
+    // action refuses before anything is consumed, journalled or executed.
+    if (deps.forgeMode === 'none') {
+      return {
+        outcome: 'refused',
+        reason: "Forge mode is 'none': no forge transport is configured, so forge actions refuse",
+      };
     }
 
     const attempt = await deps.attemptRepo.findAttemptById(request.attemptId);

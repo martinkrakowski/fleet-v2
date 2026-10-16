@@ -138,11 +138,28 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
   async reserveCapacityAtomically(
     request: ReserveCapacityAtomicallyRequest,
   ): Promise<ReserveCapacityAtomicallyResult> {
+    /** Busy-worktree verdict, decided under the lock when a check is supplied. */
+    const busyUnderLock = async (
+      held: readonly CapacityReservationRecord[],
+    ): Promise<ReserveCapacityAtomicallyResult | null> => {
+      if (request.checkBusyWorktree === undefined) {
+        return null;
+      }
+      const verdict = await request.checkBusyWorktree(held);
+      return verdict.outcome === 'busy-worktree'
+        ? { outcome: 'busy-worktree', blockingAttemptId: verdict.blockingAttemptId }
+        : null;
+    };
+
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
       const held = [...this.inMemoryReservationsById.values()].filter(
         (reservation) => reservation.held === true,
       );
+      const busy = await busyUnderLock(held);
+      if (busy !== null) {
+        return busy;
+      }
       const result = arbitrateReservation(request, held);
       if (result.outcome === 'reserved') {
         this.inMemoryReservationsById.set(result.reservation.id, result.reservation);
@@ -158,6 +175,10 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       const held = [...reservations.values()].filter(
         (reservation) => reservation.held === true,
       );
+      const busy = await busyUnderLock(held);
+      if (busy !== null) {
+        return busy;
+      }
       const result = arbitrateReservation(request, held);
       if (result.outcome === 'reserved') {
         reservations.set(result.reservation.id, result.reservation);

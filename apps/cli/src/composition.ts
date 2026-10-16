@@ -52,7 +52,9 @@ import {
   forgeActionScope,
   isSafeSshHost,
   observationEventKind,
+  resolveInstallationForgeMode,
   resolveRoleExecutors,
+  resolveRunnerCapabilityProfile,
   type GhInvocationResult,
   type SubprocessRunner,
 } from '@fleet/work-execution';
@@ -108,7 +110,7 @@ import {
   ResolveActionAuthorizationUseCase,
   SendFleetRelayUseCase,
 } from '@fleet/operator-coordination';
-import type { FleetInstallation } from '@fleet/installation';
+import { deriveInstallationModel, type FleetInstallation } from '@fleet/installation';
 
 export interface FleetCliRuntimeOptions {
   /** Directory for file-backed state; every store is in-memory when omitted. */
@@ -396,6 +398,8 @@ export interface FleetCliRuntime {
     readonly executionJournal: ExecutionJournalAdapter;
     readonly workspace: WorkspaceAdapter;
     readonly runner: ExecutionRunnerAdapter;
+    /** The runner entry's declared lane budget; undefined without one. */
+    readonly runnerMaxLanes?: number;
     readonly attemptArtifact: AttemptArtifactAdapter;
     readonly briefAuthoring: BriefAuthoringAdapter;
     readonly acceptanceAssessment: AcceptanceAssessmentAdapter;
@@ -431,6 +435,13 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     ocmRunBin,
     runnerRemoteHost,
   } = resolveRunnerSettings(options);
+  // The loader-derived model (D4) supplies the runner capability profile and
+  // the forge mode (D6); a v1 installation maps onto it unchanged.
+  const installationModel = options?.installation
+    ? deriveInstallationModel(options.installation).model
+    : undefined;
+  const runnerProfile = resolveRunnerCapabilityProfile(installationModel?.hosts);
+  const forgeMode = resolveInstallationForgeMode(options?.installation);
   // One executor per role: the installation's hosts (v2) or the v1 mapping
   // decides local versus ssh per host; the orchestrator runs where this root
   // runs. runnerRemoteHost/ocmRunBin stay runner settings, separate from the
@@ -557,11 +568,24 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   });
   // No independent review transport is configured; requests report that.
   const independentReview = new IndependentReviewAdapter();
-  // Instantiated for the station that binds a live forge transport; an
-  // unconfigured adapter reads every CI state as `unknown`, so it is not
-  // bound to AssessHeadAcceptanceUseCase here. Recorded receipts stay the
-  // acceptance evidence until that transport exists.
-  const forgeEvidence = new ForgeEvidenceAdapter();
+  // Instantiated for the station that binds a live forge transport. With
+  // forge mode `github` (D6) it is bound to AssessHeadAcceptanceUseCase with
+  // the installation's owner/repo; with mode `none` acceptance is
+  // receipt-only and records `forgeEvidence: 'not-configured'`; with no forge
+  // section the CLI keeps today's receipt-only behaviour.
+  const forgeSection =
+    installationModel?.forge !== undefined && 'mode' in installationModel.forge
+      ? installationModel.forge
+      : undefined;
+  const forgeGithubSection =
+    forgeSection?.mode === 'github' ? forgeSection : undefined;
+  const forgeEvidence =
+    forgeMode === 'github'
+      ? new ForgeEvidenceAdapter({
+          owner: forgeGithubSection?.owner,
+          repo: forgeGithubSection?.repo,
+        })
+      : new ForgeEvidenceAdapter();
   const ownerDecision = new OwnerDecisionAdapter({
     checkOwnerDecision: async (request) => {
       const result = await coordination.checkOwnerDecision.checkOwnerDecision({
@@ -633,6 +657,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     }),
     assessHeadAcceptance: new AssessHeadAcceptanceUseCase({
       repo: evidenceAssessmentRepository,
+      // Forge mode `github` binds the forge-evidence port in this root too
+      // (D6); mode `none` records receipt-only acceptance as not-configured.
+      ...(forgeMode === 'github' ? { forgeEvidence } : {}),
+      ...(forgeMode === 'none' ? { forgeMode: 'none' as const } : {}),
       ownerDecisionPort: ownerDecision,
       attemptOwnerDecisionPort: attemptOwnerDecision,
     }),
@@ -657,6 +685,11 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     remoteHost: runnerRemoteHost,
     executor: roleExecutors.orchestrator,
     runSubprocess: options?.runSubprocess,
+    // The capability report comes from the installation's lane-runner entry
+    // with the loader-derived source (D4); the transport trims the runner
+    // environment on a single machine (D5).
+    ...(runnerProfile !== undefined ? { capabilities: runnerProfile.capabilities } : {}),
+    ...(runnerProfile !== undefined ? { runnerTransport: runnerProfile.transport } : {}),
     resolveWorktreePath: async (attemptId) =>
       (await attemptRepository.findAttemptById(attemptId))?.worktreePath ?? null,
     resolveAttempt: async (attemptId) =>
@@ -981,6 +1014,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     executionJournal,
     workspace,
     runner,
+    // The runner entry's lane budget (D4/D6 plan item 4); undefined without a
+    // declared lane-runner entry, in which case the request default applies.
+    runnerMaxLanes: runnerProfile?.maxLanes,
     attemptArtifact,
     briefAuthoring,
     acceptanceAssessment,
@@ -1045,10 +1081,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       forgePort: forgeAction,
       acceptedReceiptByHead: acceptedReceiptByHeadView,
       acceptanceEvidencePort: acceptanceEvidence,
-      // Merge-time door re-check goes through the same resolution acceptance
-      // uses, so a withdrawn owner decision also refuses the forge action.
+      // Forge actions re-check the attempt's one-way doors through the same
+      // owner-decision resolution acceptance uses.
       ownerDecisionPort: ownerDecision,
       attemptOwnerDecisionPort: attemptOwnerDecision,
+      // Forge mode `none` (D6) refuses every forge action.
+      ...(forgeMode === 'none' ? { forgeMode: 'none' as const } : {}),
     }),
   };
 

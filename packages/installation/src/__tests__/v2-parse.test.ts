@@ -177,6 +177,7 @@ describe('parseInstallation v2', () => {
       ok: false,
       errors: [
         'hosts.lane.sshAlias: required when transport is "ssh"',
+        'hosts.lane.runner: required when the host holds the lane-runner role',
         'hosts: exactly one host must hold the orchestrator role',
       ],
     });
@@ -189,6 +190,7 @@ describe('parseInstallation v2', () => {
       ok: false,
       errors: [
         'hosts.local.sshAlias: must be absent when transport is "local"',
+        'hosts.local.runner: required when the host holds the lane-runner role',
         'hosts: exactly one host must hold the orchestrator role',
       ],
     });
@@ -262,7 +264,11 @@ describe('parseInstallation v2', () => {
     });
     expect(noOrchestrator).toEqual({
       ok: false,
-      errors: ['hosts: exactly one host must hold the orchestrator role'],
+      errors: [
+        // A lane-runner host without a runner block is refused by the loader (D4).
+        'hosts.lane.runner: required when the host holds the lane-runner role',
+        'hosts: exactly one host must hold the orchestrator role',
+      ],
     });
 
     const twoOrchestrators = parseInstallation({
@@ -278,6 +284,19 @@ describe('parseInstallation v2', () => {
         'hosts: exactly one host must hold the orchestrator role',
         'hosts: at least one host must hold the lane-runner role',
       ],
+    });
+  });
+
+  it('refuses a lane-runner host without a runner block (Fable should-fix on #64)', () => {
+    const result = parseInstallation({
+      schemaVersion: 2,
+      hosts: {
+        lane: { transport: 'local', worktreeRoot: '/srv', roles: ['orchestrator', 'lane-runner'] },
+      },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['hosts.lane.runner: required when the host holds the lane-runner role'],
     });
   });
 

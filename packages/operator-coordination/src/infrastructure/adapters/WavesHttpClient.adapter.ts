@@ -4,6 +4,10 @@
  * and O_NOFOLLOW like ByteStash, sends Authorization: Bearer, and scrubs the token
  * from all reasons and response bodies. Supports optional caFile and timeoutMs,
  * with a pluggable request seam for testing.
+ *
+ * The default transport always settles: request errors, response stream errors
+ * and aborts reject, a total deadline (default 15000ms) cancels the request, and
+ * response bodies beyond 1 MiB are refused instead of buffered.
  */
 
 import https from 'node:https';
@@ -35,9 +39,37 @@ export interface WavesHttpResponse {
   readonly body: string;
 }
 
+/** Total time a request may take from dispatch to a settled response. */
+const WAVES_TOTAL_DEADLINE_MS = 15000;
+/** Response bodies at or beyond this size are refused, never buffered. */
+const MAX_RESPONSE_BODY_BYTES = 1024 * 1024;
+
 export const defaultWavesRequest: WavesRequestFn = (url, init) => {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const clearDeadline = (): void => {
+      if (deadlineTimer !== undefined) {
+        clearTimeout(deadlineTimer);
+        deadlineTimer = undefined;
+      }
+    };
+
+    const resolveOnce = (value: { status: number; body: string }): void => {
+      if (settled) return;
+      settled = true;
+      clearDeadline();
+      resolve(value);
+    };
+
+    const rejectOnce = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearDeadline();
+      reject(error);
+    };
+
     const req = https.request(
       url,
       {
@@ -46,43 +78,59 @@ export const defaultWavesRequest: WavesRequestFn = (url, init) => {
         ca: init.ca,
       },
       (res) => {
-        let body = '';
-        res.setEncoding('utf8');
-        res.on('data', (chunk) => {
-          body += chunk;
+        const chunks: Buffer[] = [];
+        let receivedBytes = 0;
+        res.on('data', (chunk: Buffer) => {
+          if (settled) return;
+          receivedBytes += chunk.length;
+          if (receivedBytes > MAX_RESPONSE_BODY_BYTES) {
+            const error = Object.assign(
+              new Error(`Waves response body exceeded ${MAX_RESPONSE_BODY_BYTES} bytes`),
+              { code: 'ERR_BODY_TOO_LARGE' },
+            );
+            rejectOnce(error);
+            req.destroy(error);
+            return;
+          }
+          chunks.push(chunk);
         });
         res.on('end', () => {
-          if (!settled) {
-            settled = true;
-            resolve({
-              status: res.statusCode ?? 0,
-              body,
-            });
-          }
+          resolveOnce({
+            status: res.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+        // A response stream that fails mid-body must reject, never hang.
+        res.on('error', (error: Error) => {
+          if (settled) return;
+          rejectOnce(error);
+          req.destroy(error);
+        });
+        // A response that is aborted before 'end' must reject, never hang.
+        res.on('aborted', () => {
+          if (settled) return;
+          rejectOnce(
+            Object.assign(new Error('Waves response was aborted before completion'), {
+              code: 'ECONNRESET',
+            }),
+          );
+          req.destroy();
         });
       },
     );
 
-    req.on('error', (err) => {
-      if (!settled) {
-        settled = true;
-        reject(err);
-      }
+    req.on('error', (error) => {
+      rejectOnce(error);
     });
 
-    if (init.timeoutMs > 0) {
-      req.setTimeout(init.timeoutMs, () => {
-        if (!settled) {
-          settled = true;
-          const timeoutErr = Object.assign(
-            new Error(`Request timed out after ${init.timeoutMs}ms`),
-            { code: 'ETIMEDOUT' },
-          );
-          req.destroy(timeoutErr);
-          reject(timeoutErr);
-        }
+    const deadlineMs = init.timeoutMs > 0 ? init.timeoutMs : WAVES_TOTAL_DEADLINE_MS;
+    deadlineTimer = setTimeout(() => {
+      const error = Object.assign(new Error(`Request timed out after ${deadlineMs}ms`), {
+        code: 'ETIMEDOUT',
       });
-    }
+      rejectOnce(error);
+      req.destroy(error);
+    }, deadlineMs);
 
     if (init.body !== undefined) {
       req.write(init.body);
@@ -147,8 +195,13 @@ export class WavesHttpClient {
     this.requestFn = options.request ?? defaultWavesRequest;
   }
 
-  getLoadedToken(): string | undefined {
-    return this.lastToken;
+  /**
+   * Scrubs the currently loaded token out of `text`. The loaded token itself is
+   * never readable through this client; this is the only token-related surface
+   * callers get, so no failure reason or body snippet can carry it.
+   */
+  scrub(text: string): string {
+    return scrubToken(text, this.lastToken);
   }
 
   async get(path: string): Promise<WavesHttpResponse> {

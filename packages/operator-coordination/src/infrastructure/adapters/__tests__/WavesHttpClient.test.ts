@@ -2,8 +2,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, writeFile, chmod, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import https from 'node:https';
+import { EventEmitter } from 'node:events';
 import {
   WavesHttpClient,
+  defaultWavesRequest,
   type WavesRequestFn,
 } from '../WavesHttpClient.adapter.js';
 
@@ -325,6 +328,167 @@ describe('WavesHttpClient', () => {
         expect(msg).not.toContain(validToken);
         expect(msg).toContain('[REDACTED]');
       }
+    });
+  });
+
+  describe('scrub replaces the token getter', () => {
+    it('scrubs the loaded token from text and exposes no way to read it back', async () => {
+      const client = new WavesHttpClient({
+        baseUrl: 'https://waves.internal',
+        tokenFile: tokenFilePath,
+        request: async () => ({ status: 200, body: '{}' }),
+      });
+
+      // Before any request no token is loaded, so scrub changes nothing.
+      const before = `failure mentioning ${validToken}`;
+      expect(client.scrub(before)).toBe(before);
+
+      await client.get('/api/v1/attention');
+
+      const scrubbed = client.scrub(`failure mentioning ${validToken}`);
+      expect(scrubbed).not.toContain(validToken);
+      expect(scrubbed).toContain('[REDACTED]');
+      expect(scrubbed).not.toContain(validToken.slice(0, 8));
+
+      // The token cannot be read back out of the client.
+      const clientAsRecord = client as unknown as Record<string, unknown>;
+      expect(clientAsRecord.getLoadedToken).toBeUndefined();
+      expect(typeof clientAsRecord.scrub).toBe('function');
+    });
+  });
+
+  describe('defaultWavesRequest transport safety', () => {
+    const MIB = 1024 * 1024;
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      vi.useRealTimers();
+    });
+
+    function installFakeHttps(statusCode = 200): {
+      req: EventEmitter & {
+        write: ReturnType<typeof vi.fn>;
+        end: ReturnType<typeof vi.fn>;
+        destroy: ReturnType<typeof vi.fn>;
+      };
+      res: EventEmitter & { statusCode: number };
+    } {
+      const req = Object.assign(new EventEmitter(), {
+        write: vi.fn(),
+        end: vi.fn(),
+        destroy: vi.fn(),
+      });
+      const res = Object.assign(new EventEmitter(), { statusCode });
+      vi.spyOn(https, 'request').mockImplementation(
+        ((...args: unknown[]) => {
+          const callback = args[args.length - 1] as (response: unknown) => void;
+          callback(res);
+          return req;
+        }) as unknown as typeof https.request,
+      );
+      return { req, res };
+    }
+
+    function request(timeoutMs = 15000): Promise<{ status: number; body: string }> {
+      return defaultWavesRequest(new URL('https://waves.internal/api/v1/attention'), {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+        timeoutMs,
+      });
+    }
+
+    it('resolves a complete response from buffered chunks', async () => {
+      const { req, res } = installFakeHttps(200);
+
+      const promise = request();
+      res.emit('data', Buffer.from('{"ok":'));
+      res.emit('data', Buffer.from('true}'));
+      res.emit('end');
+
+      await expect(promise).resolves.toEqual({ status: 200, body: '{"ok":true}' });
+      expect(req.destroy).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the response stream errors mid-body', async () => {
+      const { req, res } = installFakeHttps(200);
+
+      const promise = request();
+      res.emit('data', Buffer.from('{"partial":'));
+      res.emit('error', new Error('socket hang up mid-body'));
+
+      await expect(promise).rejects.toThrow('socket hang up mid-body');
+      expect(req.destroy).toHaveBeenCalled();
+    });
+
+    it('rejects when the response is aborted before completion', async () => {
+      const { req, res } = installFakeHttps(200);
+
+      const promise = request();
+      res.emit('data', Buffer.from('{"partial":'));
+      res.emit('aborted');
+
+      await expect(promise).rejects.toThrow('Waves response was aborted before completion');
+      expect(req.destroy).toHaveBeenCalled();
+    });
+
+    it('rejects a response body larger than 1 MiB', async () => {
+      const { req, res } = installFakeHttps(200);
+
+      const promise = request();
+      res.emit('data', Buffer.alloc(MIB));
+      res.emit('data', Buffer.alloc(1));
+
+      await expect(promise).rejects.toThrow('Waves response body exceeded 1048576 bytes');
+      expect(req.destroy).toHaveBeenCalled();
+    });
+
+    it('accepts a response body of exactly 1 MiB', async () => {
+      const { res } = installFakeHttps(200);
+
+      const promise = request();
+      res.emit('data', Buffer.alloc(MIB));
+      res.emit('end');
+
+      await expect(promise).resolves.toMatchObject({ status: 200 });
+    });
+
+    it('rejects when the request itself errors before a response', async () => {
+      const { req } = installFakeHttps(200);
+
+      const promise = request();
+      const error = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+      req.emit('error', error);
+
+      await expect(promise).rejects.toThrow('connect ECONNREFUSED');
+    });
+
+    it('settles once even if the stream errors after end', async () => {
+      const { res } = installFakeHttps(200);
+
+      const promise = request();
+      res.emit('data', Buffer.from('{"ok":true}'));
+      res.emit('end');
+      res.emit('error', new Error('late error after end'));
+
+      await expect(promise).resolves.toEqual({ status: 200, body: '{"ok":true}' });
+    });
+
+    it('cancels the request and rejects when the total deadline passes', async () => {
+      const { req } = installFakeHttps(200);
+
+      const promise = request(50);
+      await expect(promise).rejects.toThrow('Request timed out after 50ms');
+      expect(req.destroy).toHaveBeenCalled();
+    });
+
+    it('applies the 15000ms total deadline by default when timeoutMs is not positive', async () => {
+      vi.useFakeTimers();
+      installFakeHttps(200);
+
+      const promise = request(0);
+      const assertion = expect(promise).rejects.toThrow('Request timed out after 15000ms');
+      await vi.advanceTimersByTimeAsync(15000);
+      await assertion;
     });
   });
 });

@@ -97,7 +97,7 @@ describe('AttentionReadAdapter with WavesHttpClient', () => {
       expect(summary).toBeNull();
     });
 
-    it('returns 0-count summary when project is in projects list but has no attention items', async () => {
+    it('returns null (unknown attention) when the project has no attention item, never a zeroed summary', async () => {
       const mockRequest: WavesRequestFn = async (url) => {
         if (url.pathname === '/api/v1/attention') {
           return { status: 200, body: JSON.stringify([]) };
@@ -114,14 +114,8 @@ describe('AttentionReadAdapter with WavesHttpClient', () => {
       const adapter = new AttentionReadAdapter({ client: createClient(mockRequest) });
       const summary = await adapter.fetchProjectAttention('healthy-project');
 
-      expect(summary).toEqual({
-        projectId: 'healthy-project',
-        staleWorkOrderCount: 0,
-        awaitingDecisionCount: 0,
-        deliveryGapCount: 0,
-        summaryText: 'no attention items for healthy-project',
-        observedAtIso: '2026-10-15T11:00:00.000Z',
-      });
+      // Absent from the attention list means unknown, not 0/0/0 healthy.
+      expect(summary).toBeNull();
     });
   });
 
@@ -218,6 +212,238 @@ describe('AttentionReadAdapter with WavesHttpClient', () => {
       await expect(adapter.fetchProjectAttention('project-alpha')).rejects.toThrow(
         /invalid JSON/,
       );
+    });
+  });
+
+  describe('fail-closed on undocumented response shapes', () => {
+    const documentedAttentionItem = {
+      projectId: 'project-alpha',
+      staleWorkOrderCount: 3,
+      awaitingDecisionCount: 1,
+      deliveryGapCount: 2,
+      summaryText: '3 stale work orders, 1 awaiting decision',
+      observedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+
+    function attentionRequest(attentionBody: string): WavesRequestFn {
+      return async (url) => {
+        if (url.pathname === '/api/v1/attention') {
+          return { status: 200, body: attentionBody };
+        }
+        if (url.pathname === '/api/v1/projects') {
+          return {
+            status: 200,
+            body: JSON.stringify([{ id: 'project-alpha', lastPush: '2026-10-15T09:59:00.000Z' }]),
+          };
+        }
+        return { status: 404, body: 'not found' };
+      };
+    }
+
+    function projectsRequest(projectsBody: string): WavesRequestFn {
+      return async (url) => {
+        if (url.pathname === '/api/v1/attention') {
+          return {
+            status: 200,
+            body: JSON.stringify([documentedAttentionItem]),
+          };
+        }
+        if (url.pathname === '/api/v1/projects') {
+          return { status: 200, body: projectsBody };
+        }
+        return { status: 404, body: 'not found' };
+      };
+    }
+
+    it('throws when /api/v1/attention wraps items in a data envelope', async () => {
+      const mockRequest = attentionRequest(
+        JSON.stringify({ data: [documentedAttentionItem] }),
+      );
+      const adapter = new AttentionReadAdapter({ client: createClient(mockRequest) });
+
+      await expect(adapter.fetchProjectAttention('project-alpha')).rejects.toThrow(
+        'unexpected /api/v1/attention response shape: expected a top-level array of attention items',
+      );
+    });
+
+    it('throws when /api/v1/projects wraps items in a data envelope', async () => {
+      const mockRequest = projectsRequest(
+        JSON.stringify({ data: [{ id: 'project-alpha' }] }),
+      );
+      const adapter = new AttentionReadAdapter({ client: createClient(mockRequest) });
+
+      await expect(adapter.fetchProjectAttention('project-alpha')).rejects.toThrow(
+        'unexpected /api/v1/projects response shape: expected a top-level array of project items',
+      );
+    });
+
+    it('throws on snake_case attention keys instead of guessing zeros', async () => {
+      const snakeItem = {
+        project_id: 'project-alpha',
+        stale_work_order_count: 3,
+        awaiting_decision_count: 1,
+        delivery_gap_count: 2,
+        summary_text: '3 stale work orders, 1 awaiting decision',
+        observed_at_iso: '2026-10-15T10:00:00.000Z',
+      };
+      const mockRequest = attentionRequest(JSON.stringify([snakeItem]));
+      const adapter = new AttentionReadAdapter({ client: createClient(mockRequest) });
+
+      // The old adapter guessed 0/0/0 for this shape; it must now throw.
+      await expect(adapter.fetchProjectAttention('project-alpha')).rejects.toThrow(
+        /snake_case key "project_id".*camelCase keys/,
+      );
+    });
+
+    it('throws on snake_case keys even in an attention item for another project', async () => {
+      const snakeItem = {
+        projectId: 'other-project',
+        staleWorkOrderCount: 3,
+        awaitingDecisionCount: 1,
+        deliveryGapCount: 2,
+        summaryText: 'unrelated item with one snake key',
+        observedAtIso: '2026-10-15T10:00:00.000Z',
+        last_push: '2026-10-15T09:00:00.000Z',
+      };
+      const mockRequest = attentionRequest(JSON.stringify([snakeItem]));
+      const adapter = new AttentionReadAdapter({ client: createClient(mockRequest) });
+
+      await expect(adapter.fetchProjectAttention('project-alpha')).rejects.toThrow(
+        /snake_case key "last_push"/,
+      );
+    });
+
+    it('throws on a snake_case key in the projects list', async () => {
+      const mockRequest = projectsRequest(
+        JSON.stringify([{ id: 'project-alpha', last_push: '2026-10-15T09:59:00.000Z' }]),
+      );
+      const adapter = new AttentionReadAdapter({ client: createClient(mockRequest) });
+
+      await expect(adapter.fetchProjectAttention('project-alpha')).rejects.toThrow(
+        'unexpected /api/v1/projects response shape',
+      );
+    });
+
+    const malformedCounts = [
+      {
+        name: 'a missing staleWorkOrderCount',
+        item: {
+          projectId: 'project-alpha',
+          awaitingDecisionCount: 1,
+          deliveryGapCount: 2,
+          summaryText: 'partial item',
+          observedAtIso: '2026-10-15T10:00:00.000Z',
+        },
+      },
+      {
+        name: 'a string staleWorkOrderCount',
+        item: { ...documentedAttentionItem, staleWorkOrderCount: 'three' },
+      },
+      {
+        name: 'a fractional awaitingDecisionCount',
+        item: { ...documentedAttentionItem, awaitingDecisionCount: 1.5 },
+      },
+      {
+        name: 'a negative deliveryGapCount',
+        item: { ...documentedAttentionItem, deliveryGapCount: -1 },
+      },
+    ];
+
+    for (const { name, item } of malformedCounts) {
+      it(`throws when the attention item has ${name}, never 0`, async () => {
+        const mockRequest = attentionRequest(JSON.stringify([item]));
+        const adapter = new AttentionReadAdapter({ client: createClient(mockRequest) });
+
+        await expect(adapter.fetchProjectAttention('project-alpha')).rejects.toThrow(
+          'unexpected /api/v1/attention response shape',
+        );
+      });
+    }
+
+    it('throws when the attention item is not an object', async () => {
+      const mockRequest = attentionRequest(JSON.stringify(['project-alpha']));
+      const adapter = new AttentionReadAdapter({ client: createClient(mockRequest) });
+
+      await expect(adapter.fetchProjectAttention('project-alpha')).rejects.toThrow(
+        'unexpected /api/v1/attention response shape: item at index 0 must be an object',
+      );
+    });
+
+    it('throws when the attention item has no projectId', async () => {
+      const mockRequest = attentionRequest(
+        JSON.stringify([
+          {
+            staleWorkOrderCount: 3,
+            awaitingDecisionCount: 1,
+            deliveryGapCount: 2,
+            summaryText: 'anonymous item',
+            observedAtIso: '2026-10-15T10:00:00.000Z',
+          },
+        ]),
+      );
+      const adapter = new AttentionReadAdapter({ client: createClient(mockRequest) });
+
+      await expect(adapter.fetchProjectAttention('project-alpha')).rejects.toThrow(
+        'item at index 0 requires a non-empty string projectId',
+      );
+    });
+
+    it('throws when the attention item has no observedAtIso, inventing no timestamp', async () => {
+      const mockRequest = attentionRequest(
+        JSON.stringify([
+          {
+            projectId: 'project-alpha',
+            staleWorkOrderCount: 3,
+            awaitingDecisionCount: 1,
+            deliveryGapCount: 2,
+            summaryText: 'item without an observation time',
+          },
+        ]),
+      );
+      const adapter = new AttentionReadAdapter({ client: createClient(mockRequest) });
+
+      await expect(adapter.fetchProjectAttention('project-alpha')).rejects.toThrow(
+        'item at index 0 requires a string observedAtIso',
+      );
+    });
+
+    it('throws when the attention item has no summaryText', async () => {
+      const mockRequest = attentionRequest(
+        JSON.stringify([
+          {
+            projectId: 'project-alpha',
+            staleWorkOrderCount: 3,
+            awaitingDecisionCount: 1,
+            deliveryGapCount: 2,
+            observedAtIso: '2026-10-15T10:00:00.000Z',
+          },
+        ]),
+      );
+      const adapter = new AttentionReadAdapter({ client: createClient(mockRequest) });
+
+      await expect(adapter.fetchProjectAttention('project-alpha')).rejects.toThrow(
+        'item at index 0 requires a string summaryText',
+      );
+    });
+
+    it('accepts a documented response and returns the exact item counts', async () => {
+      const mockRequest = attentionRequest(
+        JSON.stringify([
+          { ...documentedAttentionItem, projectId: 'other-project', staleWorkOrderCount: 9 },
+          documentedAttentionItem,
+        ]),
+      );
+      const adapter = new AttentionReadAdapter({ client: createClient(mockRequest) });
+
+      const summary = await adapter.fetchProjectAttention('project-alpha');
+      expect(summary).toEqual({
+        projectId: 'project-alpha',
+        staleWorkOrderCount: 3,
+        awaitingDecisionCount: 1,
+        deliveryGapCount: 2,
+        summaryText: '3 stale work orders, 1 awaiting decision',
+        observedAtIso: '2026-10-15T10:00:00.000Z',
+      });
     });
   });
 

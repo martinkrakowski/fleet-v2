@@ -22,7 +22,7 @@ import type {
   ObservationPublicationPort,
 } from '../../application/ports/out/ObservationPublicationPort.out-port.js';
 import type { WavesHttpClient } from './WavesHttpClient.adapter.js';
-import { scrubAndTruncate, scrubToken } from './WavesHttpClient.adapter.js';
+import { scrubAndTruncate } from './WavesHttpClient.adapter.js';
 
 export type ObservationPublisher = (
   envelope: ObservationEnvelopeProps,
@@ -94,13 +94,13 @@ export class ObservationPublicationAdapter implements ObservationPublicationPort
           if (response.status === 401) {
             failureReason = `observation publication failed: HTTP 401 unauthorized`;
           } else {
-            const snippet = scrubAndTruncate(response.body, client.getLoadedToken());
+            const snippet = scrubAndTruncate(client.scrub(response.body));
             failureReason = `observation publication failed: HTTP ${response.status}${snippet ? ` - ${snippet}` : ''}`;
           }
         }
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        failureReason = `observation publication failed: ${scrubToken(msg, client.getLoadedToken())}`;
+        failureReason = `observation publication failed: ${client.scrub(msg)}`;
       }
 
       if (failureReason !== undefined) {

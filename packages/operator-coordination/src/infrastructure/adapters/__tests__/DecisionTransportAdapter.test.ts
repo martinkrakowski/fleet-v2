@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { canonicalDecisionBytes } from '../DecisionSignature.adapter.js';
 import { DecisionTransportAdapter } from '../DecisionTransportAdapter.adapter.js';
@@ -793,6 +793,84 @@ describe('DecisionTransportAdapter HTTP client transport', () => {
       state: 'approved',
       decisionRevision: 'rev-file-1',
       grantId: 'grant-file-1',
+    });
+  });
+
+  it('refuses a `..` request id before building the HTTP URL, never calling the client', async () => {
+    const tokenFile = await setupTokenFile();
+    const mockRequest = vi.fn<WavesRequestFn>(async () => ({
+      status: 200,
+      body: JSON.stringify({
+        state: 'approved',
+        decisionRevision: 'rev-http-1',
+        grantId: 'grant-http-1',
+        signature: 'would-be-approval',
+      }),
+    }));
+
+    const client = createClient(mockRequest, tokenFile);
+    const adapter = new DecisionTransportAdapter({ client });
+
+    const result = await adapter.readDecisionAnswer({ ...query, requestId: '..' });
+
+    expect(result).toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+    });
+    expect(mockRequest).not.toHaveBeenCalled();
+  });
+
+  it('refuses a request id carrying path structure before any transport is consulted', async () => {
+    const tokenFile = await setupTokenFile();
+    const mockRequest = vi.fn<WavesRequestFn>(async () => ({
+      status: 200,
+      body: JSON.stringify({ state: 'declined', decisionRevision: 'rev-declined', grantId: null }),
+    }));
+
+    const client = createClient(mockRequest, tokenFile);
+    const adapter = new DecisionTransportAdapter({ client });
+
+    const result = await adapter.readDecisionAnswer({ ...query, requestId: 'req/../../secret' });
+
+    expect(result).toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+    });
+    expect(mockRequest).not.toHaveBeenCalled();
+  });
+
+  it('refuses an unsafe request id even when a matching injected answer exists', async () => {
+    const { publicKeyBase64, privateKey } = createOwnerKeyPair();
+    const signature = signDecision(
+      {
+        ...query,
+        requestId: '..',
+        decisionRevision: 'rev-1',
+        grantId: 'grant-1',
+        state: 'approved',
+      },
+      privateKey,
+    );
+
+    const adapter = new DecisionTransportAdapter({
+      ownerPublicKey: publicKeyBase64,
+      answers: {
+        '..': {
+          state: 'approved',
+          decisionRevision: 'rev-1',
+          grantId: 'grant-1',
+          signature,
+        },
+      },
+    });
+
+    const result = await adapter.readDecisionAnswer({ ...query, requestId: '..' });
+    expect(result).toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
     });
   });
 });

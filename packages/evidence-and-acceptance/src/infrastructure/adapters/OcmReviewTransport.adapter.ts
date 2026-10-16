@@ -42,6 +42,18 @@ export const READ_ONLY_REVIEW_TOOLS: ReadonlySet<string> = new Set([
   'list',
 ]);
 
+/** Recognised event types for review runner stream. Any unrecognised event voids read-only. */
+export const RECOGNISED_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'step_start',
+  'step-start',
+  'step_finish',
+  'step-finish',
+  'text',
+  'tool',
+  'tool_use',
+  'tool_call',
+]);
+
 /** Process environment variables that a reviewer subprocess may inherit. */
 export const REVIEWER_ENV_ALLOWLIST: readonly string[] = [
   'PATH',
@@ -78,6 +90,33 @@ function extractTextPart(record: Record<string, unknown>): string | null {
   return null;
 }
 
+function isStepStart(record: Record<string, unknown>): boolean {
+  if (record.type === 'step_start' || record.type === 'step-start') {
+    return true;
+  }
+  const part = isPlainRecord(record.part) ? record.part : null;
+  if (part !== null && (part.type === 'step_start' || part.type === 'step-start')) {
+    return true;
+  }
+  return false;
+}
+
+function isToolEvent(record: Record<string, unknown>): boolean {
+  if (record.type === 'tool' || record.type === 'tool_use' || record.type === 'tool_call') {
+    return true;
+  }
+  const part = isPlainRecord(record.part) ? record.part : null;
+  if (part !== null) {
+    if (part.type === 'tool' || part.type === 'tool_use' || part.type === 'tool_call') {
+      return true;
+    }
+    if (part.tool !== undefined) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function extractToolName(record: Record<string, unknown>): string | null {
   const part = isPlainRecord(record.part) ? record.part : null;
 
@@ -88,29 +127,20 @@ function extractToolName(record: Record<string, unknown>): string | null {
     if (isPlainRecord(part.tool) && typeof part.tool.name === 'string' && part.tool.name.trim() !== '') {
       return part.tool.name.trim();
     }
-    return 'unknown';
   }
 
-  const isToolType =
-    record.type === 'tool' ||
-    record.type === 'tool_use' ||
-    record.type === 'tool_call' ||
-    (part !== null && (part.type === 'tool' || part.type === 'tool_use' || part.type === 'tool_call'));
+  if (part !== null && typeof part.name === 'string' && part.name.trim() !== '') {
+    return part.name.trim();
+  }
 
-  if (isToolType) {
-    if (part !== null && typeof part.name === 'string' && part.name.trim() !== '') {
-      return part.name.trim();
-    }
-    if (typeof record.tool === 'string' && record.tool.trim() !== '') {
-      return record.tool.trim();
-    }
-    if (isPlainRecord(record.tool) && typeof record.tool.name === 'string' && record.tool.name.trim() !== '') {
-      return record.tool.name.trim();
-    }
-    if (typeof record.name === 'string' && record.name.trim() !== '') {
-      return record.name.trim();
-    }
-    return 'unknown';
+  if (typeof record.tool === 'string' && record.tool.trim() !== '') {
+    return record.tool.trim();
+  }
+  if (isPlainRecord(record.tool) && typeof record.tool.name === 'string' && record.tool.name.trim() !== '') {
+    return record.tool.name.trim();
+  }
+  if (typeof record.name === 'string' && record.name.trim() !== '') {
+    return record.name.trim();
   }
 
   return null;
@@ -194,10 +224,27 @@ export function createOcmReviewTransport(
       );
     }
 
-    // 2. Resolve review directory and verify before head
+    // 2. Reject options starting with '-'
+    if (options.model.startsWith('-') || options.model.trim().startsWith('-')) {
+      throw new Error(`invalid model: "${options.model}" starts with "-"`);
+    }
+    if (options.agent.startsWith('-') || options.agent.trim().startsWith('-')) {
+      throw new Error(`invalid agent: "${options.agent}" starts with "-"`);
+    }
+    if (
+      options.variant !== undefined &&
+      (options.variant.startsWith('-') || options.variant.trim().startsWith('-'))
+    ) {
+      throw new Error(`invalid variant: "${options.variant}" starts with "-"`);
+    }
+
+    // 3. Resolve review directory and verify before head
     const dir = await options.resolveReviewDir(request);
     if (dir === null || typeof dir !== 'string' || dir.trim() === '') {
       throw new Error(`failed to resolve review directory for attempt ${request.attemptId}`);
+    }
+    if (dir.startsWith('-') || dir.trim().startsWith('-')) {
+      throw new Error(`invalid review directory: "${dir}" starts with "-"`);
     }
     const before = await options.readHead(dir);
     if (before !== request.candidateHeadSha) {
@@ -206,7 +253,7 @@ export function createOcmReviewTransport(
       );
     }
 
-    // 3. Build argv and sanitized environment
+    // 4. Build argv and sanitized environment
     const prompt = buildReviewPrompt(request);
     const argv: string[] = [
       '--dir',
@@ -222,7 +269,7 @@ export function createOcmReviewTransport(
     ];
     const env = buildReviewerEnv(options);
 
-    // 4. Spawn runner process; non-zero or null exit throws
+    // 5. Spawn runner process; non-zero or null exit throws
     const spawnFn = options.spawn ?? defaultSpawn;
     const spawnResult = await spawnFn(options.ocmRunBin, argv, env);
     if (spawnResult.exitCode !== 0) {
@@ -231,7 +278,9 @@ export function createOcmReviewTransport(
       );
     }
 
-    // 5. Parse stdout JSON lines for text and tool parts
+    // 6. Parse stdout JSON lines for text and tool parts
+    let readOnlyVoided = false;
+    let hasStepStart = false;
     const textParts: string[] = [];
     const toolNames: string[] = [];
     for (const rawLine of spawnResult.stdout.split(/\r?\n/)) {
@@ -241,40 +290,54 @@ export function createOcmReviewTransport(
       try {
         parsed = JSON.parse(line);
       } catch {
+        readOnlyVoided = true;
         continue;
       }
-      if (!isPlainRecord(parsed)) continue;
+      if (!isPlainRecord(parsed)) {
+        readOnlyVoided = true;
+        continue;
+      }
+
+      if (typeof parsed.type !== 'string' || !RECOGNISED_EVENT_TYPES.has(parsed.type)) {
+        readOnlyVoided = true;
+      }
+
+      if (isStepStart(parsed)) {
+        hasStepStart = true;
+      }
+
+      if (isToolEvent(parsed)) {
+        const toolName = extractToolName(parsed);
+        if (toolName === null) {
+          readOnlyVoided = true;
+        } else {
+          toolNames.push(toolName);
+          if (!READ_ONLY_REVIEW_TOOLS.has(toolName)) {
+            readOnlyVoided = true;
+          }
+        }
+      }
 
       const textPart = extractTextPart(parsed);
       if (textPart !== null) {
         textParts.push(textPart);
       }
-
-      const toolName = extractToolName(parsed);
-      if (toolName !== null) {
-        toolNames.push(toolName);
-      }
     }
 
-    const toolsReadOnly = toolNames.every((tool) => READ_ONLY_REVIEW_TOOLS.has(tool));
-
-    // 6. Verify head after review and compute readOnlyVerified
+    // 7. Verify head after review and compute readOnlyVerified
     const after = await options.readHead(dir);
     const readOnlyVerified =
-      toolsReadOnly && before === request.candidateHeadSha && after === request.candidateHeadSha;
+      !readOnlyVoided &&
+      hasStepStart &&
+      before === request.candidateHeadSha &&
+      after === request.candidateHeadSha;
 
-    // 7. Parse verdict, findings, and rawOutput
+    // 8. Parse verdict, findings, and rawOutput
     const finalText = textParts.join('');
     const findings: ReviewFindingRecord[] = [];
-    const verdictMatches: ('PASS' | 'FAIL')[] = [];
 
     for (const rawLine of finalText.split(/\r?\n/)) {
       const line = rawLine.trim();
-      const verdictMatch = VERDICT_PATTERN.exec(line);
-      if (verdictMatch !== null) {
-        verdictMatches.push(verdictMatch[1] as 'PASS' | 'FAIL');
-      }
-
       const findingMatch = FINDING_PATTERN.exec(line);
       if (findingMatch !== null) {
         findings.push({
@@ -290,15 +353,31 @@ export function createOcmReviewTransport(
       }
     }
 
-    let result: EvidenceResultValue = 'unknown';
-    if (verdictMatches.length === 1) {
-      const single = verdictMatches[0];
-      if (single === 'PASS') {
-        const hasBlocker = findings.some((f) => f.severity === 'blocker');
-        result = hasBlocker ? 'fail' : 'pass';
-      } else if (single === 'FAIL') {
-        result = 'fail';
+    let verdict: 'PASS' | 'FAIL' | null = null;
+    if (textParts.length > 0) {
+      const lastPart = textParts[textParts.length - 1];
+      const lines = lastPart.split(/\r?\n/);
+      let lastNonEmptyLine: string | null = null;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].trim() !== '') {
+          lastNonEmptyLine = lines[i];
+          break;
+        }
       }
+      if (lastNonEmptyLine !== null) {
+        const verdictMatch = VERDICT_PATTERN.exec(lastNonEmptyLine);
+        if (verdictMatch !== null) {
+          verdict = verdictMatch[1] as 'PASS' | 'FAIL';
+        }
+      }
+    }
+
+    let result: EvidenceResultValue = 'unknown';
+    if (verdict === 'PASS') {
+      const hasBlocker = findings.some((f) => f.severity === 'blocker');
+      result = hasBlocker ? 'fail' : 'pass';
+    } else if (verdict === 'FAIL') {
+      result = 'fail';
     }
 
     const rawOutput =

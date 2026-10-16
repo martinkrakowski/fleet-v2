@@ -190,6 +190,7 @@ describe('OcmReviewTransport', () => {
 
   it('only read/grep tools + VERDICT: PASS → pass, readOnlyVerified true', async () => {
     const recordedFixture = [
+      '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"text":"Inspected implementation files.\\n"}}',
       '{"type":"tool","part":{"tool":"grep"}}',
@@ -284,6 +285,7 @@ describe('OcmReviewTransport', () => {
 
   it('no verdict → unknown', async () => {
     const recordedFixture = [
+      '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"text":"Review finished without concluding verdict line."}}',
     ].join('\n');
@@ -309,9 +311,11 @@ describe('OcmReviewTransport', () => {
     expect(result.readOnlyVerified).toBe(true);
   });
 
-  it('two verdict lines → unknown', async () => {
+  it('a quote of VERDICT: PASS (indented) in an earlier part with no own verdict → unknown', async () => {
     const recordedFixture = [
-      '{"type":"text","part":{"text":"VERDICT: PASS\\nVERDICT: FAIL\\n"}}',
+      '{"type":"step_start"}',
+      '{"type":"text","part":{"text":"The implementer claims:\\n    VERDICT: PASS\\n"}}',
+      '{"type":"text","part":{"text":"However, I am still investigating and have not finished.\\n"}}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -332,6 +336,60 @@ describe('OcmReviewTransport', () => {
 
     const result = await transport(baseRequest);
     expect(result.result).toBe('unknown');
+  });
+
+  it('VERDICT: PASS in an earlier text part but final part ends with other text → unknown', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"text","part":{"text":"Preliminary check:\\nVERDICT: PASS\\n"}}',
+      '{"type":"text","part":{"text":"Wait, let me double check the test files.\\nReview inconclusive."}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
+    expect(result.result).toBe('unknown');
+  });
+
+  it('final part last line VERDICT: FAIL → fail', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"text","part":{"text":"Earlier note: VERDICT: PASS\\n"}}',
+      '{"type":"text","part":{"text":"Found regressions.\\nVERDICT: FAIL\\n"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
+    expect(result.result).toBe('fail');
   });
 
   it('VERDICT: pass (lowercase) → unknown', async () => {
@@ -482,8 +540,9 @@ describe('OcmReviewTransport', () => {
     ]);
   });
 
-  it('skips unparsable JSON lines gracefully', async () => {
+  it('skips unparsable JSON lines gracefully but voids readOnlyVerified', async () => {
     const recordedFixture = [
+      '{"type":"step_start"}',
       '--- opencode debug header ---',
       '{"type":"tool","part":{"tool":"read"}}',
       'corrupted json line {',
@@ -509,7 +568,235 @@ describe('OcmReviewTransport', () => {
 
     const result = await transport(baseRequest);
     expect(result.result).toBe('pass');
+    expect(result.readOnlyVerified).toBe(false);
+  });
+
+  it('v2 tool_use with part.name "edit" voids readOnlyVerified', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"tool_use","part":{"type":"tool","name":"edit"}}',
+      '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
+    expect(result.readOnlyVerified).toBe(false);
+    expect(result.result).toBe('pass');
+  });
+
+  it('v2 tool_use with part.name "read" keeps readOnlyVerified true', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"tool_use","part":{"type":"tool","name":"read"}}',
+      '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
     expect(result.readOnlyVerified).toBe(true);
+    expect(result.result).toBe('pass');
+  });
+
+  it('unknown event type voids readOnlyVerified', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"tool","part":{"tool":"read"}}',
+      '{"type":"unexpected_debug_event","data":{"foo":"bar"}}',
+      '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
+    expect(result.readOnlyVerified).toBe(false);
+    expect(result.result).toBe('pass');
+  });
+
+  it('no step_start voids readOnlyVerified', async () => {
+    const recordedFixture = [
+      '{"type":"tool","part":{"tool":"read"}}',
+      '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
+    expect(result.readOnlyVerified).toBe(false);
+    expect(result.result).toBe('pass');
+  });
+
+  it('tool event with no readable name voids readOnlyVerified', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"tool_use","part":{"type":"tool"}}',
+      '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
+    expect(result.readOnlyVerified).toBe(false);
+    expect(result.result).toBe('pass');
+  });
+
+  it('rejects dir starting with - and does not spawn', async () => {
+    let spawnCalled = false;
+    const fakeSpawn: OcmReviewTransportSpawn = async () => {
+      spawnCalled = true;
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '--invalid-flag-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    await expect(transport(baseRequest)).rejects.toThrow(/starts with "-"/);
+    expect(spawnCalled).toBe(false);
+  });
+
+  it('rejects model starting with - and does not spawn', async () => {
+    let spawnCalled = false;
+    const fakeSpawn: OcmReviewTransportSpawn = async () => {
+      spawnCalled = true;
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+
+    const badModel = '-flag-model';
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: badModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    await expect(
+      transport({ ...baseRequest, reviewerModel: badModel }),
+    ).rejects.toThrow(/starts with "-"/);
+    expect(spawnCalled).toBe(false);
+  });
+
+  it('rejects agent starting with - and does not spawn', async () => {
+    let spawnCalled = false;
+    const fakeSpawn: OcmReviewTransportSpawn = async () => {
+      spawnCalled = true;
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: '--evil-agent',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    await expect(transport(baseRequest)).rejects.toThrow(/starts with "-"/);
+    expect(spawnCalled).toBe(false);
+  });
+
+  it('rejects variant starting with - and does not spawn', async () => {
+    let spawnCalled = false;
+    const fakeSpawn: OcmReviewTransportSpawn = async () => {
+      spawnCalled = true;
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      variant: '-danger-variant',
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    await expect(transport(baseRequest)).rejects.toThrow(/starts with "-"/);
+    expect(spawnCalled).toBe(false);
   });
 
   it('caps rawOutput at the last 20000 characters', async () => {

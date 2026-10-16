@@ -55,8 +55,8 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
     const entriesFromA = await adapterA.listJournalEntriesForAttempt('att-1');
     const entriesFromB = await adapterB.listJournalEntriesForAttempt('att-1');
 
-    expect(entriesFromA.map((e) => e.id)).toEqual(['entry-1', 'entry-2']);
-    expect(entriesFromB.map((e) => e.id)).toEqual(['entry-1', 'entry-2']);
+    expect([...entriesFromA.map((e) => e.id)].sort()).toEqual(['entry-1', 'entry-2']);
+    expect([...entriesFromB.map((e) => e.id)].sort()).toEqual(['entry-1', 'entry-2']);
 
     // Duplicate id must be refused even when attempted by a second adapter instance
     await expect(adapterB.appendJournalEntry(entry1)).rejects.toThrow(

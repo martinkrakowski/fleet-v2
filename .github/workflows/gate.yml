@@ -45,3 +45,5 @@ jobs:
         run: sh tests/ocm-run.test.sh
       - name: agy-run tests
         run: sh tests/agy-run.test.sh
+      - name: lane-diff-check tests
+        run: sh tests/lane-diff-check.test.sh

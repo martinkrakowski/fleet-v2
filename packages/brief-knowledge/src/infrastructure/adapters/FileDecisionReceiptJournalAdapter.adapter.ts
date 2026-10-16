@@ -321,7 +321,8 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
       async () => {
         const entries = await this.readMonthEntries(monthKey);
         const monthSpend = monthSpendFromEntries(entries);
-        if (monthSpend + assumedCostUsd > monthlyBudgetUsd) {
+        // Refuse at or above the cap (owner, 2026-10-16): spend never reaches the budget exactly.
+        if (monthSpend + assumedCostUsd >= monthlyBudgetUsd) {
           return { ok: false as const, reason: 'budget-exhausted' as const };
         }
         const entry: ReservedEntry = {

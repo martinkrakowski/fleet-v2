@@ -78,9 +78,11 @@ import {
 } from '@fleet/evidence-and-acceptance';
 
 import {
+  AdvisedKnowledgeRetrievalAdapter,
   CaptureCompletedAttemptNotesUseCase,
   CheckKnowledgeClaimUseCase,
   ClaimVerificationAdapter,
+  createRankingAdvice,
   DecideKnowledgeDispositionUseCase,
   KeeperPublicationAdapter,
   KnowledgeEntryRepositoryAdapter,
@@ -146,6 +148,13 @@ export interface FleetCliRuntimeOptions {
    * GH_BINARY_CANDIDATES and never falls back to PATH (S4036).
    */
   readonly ghBinaryCandidates?: readonly string[];
+  /**
+   * Spy transport override for the ranking advice provider (tests only).
+   * Production uses globalThis.fetch; the key itself is never in argv or env.
+   */
+  readonly adviceFetch?: typeof fetch;
+  /** Stub key reader override for the ranking advice provider (tests only). */
+  readonly adviceReadKey?: (path: string) => Promise<string>;
 }
 
 export interface ResolvedRunnerSettings {
@@ -556,6 +565,23 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const claimVerification = new ClaimVerificationAdapter();
   const keeperPublication = new KeeperPublicationAdapter({ stateDir });
   const knowledgeRetrieval = new KnowledgeRetrievalAdapter();
+  // Advisory only (decision port plan): the installation's v2 decisions block
+  // (v1 files never carry one) drives an advice port that reorders the
+  // deterministic retrieval set; with no block the advice port is null and the
+  // inner result stands unchanged. Proposals flow through ProposeBriefContext
+  // only; the key never enters argv, env or logs.
+  const rankingAdvice = createRankingAdvice({
+    ...(options?.installation?.decisions !== undefined
+      ? { decisions: options.installation.decisions }
+      : {}),
+    ...(stateDir !== undefined ? { stateDir } : {}),
+    fetch: options?.adviceFetch ?? globalThis.fetch,
+    ...(options?.adviceReadKey !== undefined ? { readKey: options.adviceReadKey } : {}),
+  });
+  const advisedRetrieval = new AdvisedKnowledgeRetrievalAdapter(
+    knowledgeRetrieval,
+    rankingAdvice,
+  );
 
   const knowledge = {
     knowledgeEntryRepository,
@@ -578,7 +604,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     }),
     proposeBriefContext: new ProposeBriefContextUseCase({
       repo: knowledgeEntryRepository,
-      retrieval: knowledgeRetrieval,
+      retrieval: advisedRetrieval,
     }),
     recordContextSelection: new RecordContextSelectionUseCase({ repo: knowledgeEntryRepository }),
     recordKnowledgeReuse: new RecordKnowledgeReuseUseCase({ repo: knowledgeEntryRepository }),

@@ -1,8 +1,11 @@
 import {
+  AdvisedKnowledgeRetrievalAdapter,
   ClaimVerificationAdapter,
+  createRankingAdvice,
   KeeperPublicationAdapter,
   KnowledgeEntryRepositoryAdapter,
   KnowledgeRetrievalAdapter,
+  type RankingAdviceDecisions,
 } from "@fleet/brief-knowledge";
 import {
   CaptureCompletedAttemptNotesUseCase,
@@ -28,6 +31,16 @@ export interface KnowledgeComposition {
 
 export interface KnowledgeCompositionOptions {
   readonly stateDir?: string;
+  /**
+   * The installation's v2 `decisions` block; `undefined` for v1 or an absent
+   * block, which keeps today's deterministic retrieval (decision port plan,
+   * invariant 6: off by default).
+   */
+  readonly decisions?: RankingAdviceDecisions;
+  /** Spy transport override for the ranking advice provider (tests only). */
+  readonly fetch?: typeof fetch;
+  /** Stub key reader override for the ranking advice provider (tests only). */
+  readonly readKey?: (path: string) => Promise<string>;
 }
 
 let composition: KnowledgeComposition | undefined;
@@ -60,7 +73,17 @@ export function createConfiguredKnowledgeComposition(
   const stateDir = options?.stateDir;
 
   const repo = new KnowledgeEntryRepositoryAdapter({ stateDir });
-  const retrieval = new KnowledgeRetrievalAdapter();
+  const plainRetrieval = new KnowledgeRetrievalAdapter();
+  // Advisory only: the decision port reorders the deterministic set and never
+  // changes membership (decision port plan, invariant 1). With no decisions
+  // block the advice port is null and the inner result stands unchanged.
+  const advice = createRankingAdvice({
+    ...(options?.decisions !== undefined ? { decisions: options.decisions } : {}),
+    ...(stateDir !== undefined ? { stateDir } : {}),
+    fetch: options?.fetch ?? globalThis.fetch,
+    ...(options?.readKey !== undefined ? { readKey: options.readKey } : {}),
+  });
+  const retrieval = new AdvisedKnowledgeRetrievalAdapter(plainRetrieval, advice);
   const verifier = new ClaimVerificationAdapter();
   const publisher = new KeeperPublicationAdapter({ stateDir });
 

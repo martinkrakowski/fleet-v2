@@ -4,3 +4,4 @@ namespace: fleet-v2-staging
 resources:
   - namespace.yaml
   - app.yaml
+  - networkpolicy.yaml

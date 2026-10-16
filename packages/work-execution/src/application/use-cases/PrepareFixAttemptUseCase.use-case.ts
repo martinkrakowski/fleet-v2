@@ -37,8 +37,6 @@ export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
       'fixAttemptId',
       'workOrderId',
       'priorAttemptId',
-      'worktreePath',
-      'baseCommit',
     ];
     const missingFields = requiredFields.filter((field) => !isNonEmpty(request[field]));
     if (missingFields.length > 0) {
@@ -59,6 +57,19 @@ export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
       return { outcome: 'refused', reason: 'Cannot prepare fix attempt before prior attempt has ended' };
     }
 
+    if (request.worktreePath !== undefined && request.worktreePath !== prior.worktreePath) {
+      return {
+        outcome: 'refused',
+        reason: `worktreePath does not match prior attempt: expected ${prior.worktreePath}, got ${request.worktreePath}`,
+      };
+    }
+    if (request.baseCommit !== undefined && request.baseCommit !== prior.baseCommit) {
+      return {
+        outcome: 'refused',
+        reason: `baseCommit does not match prior attempt: expected ${prior.baseCommit}, got ${request.baseCommit}`,
+      };
+    }
+
     const existingFix = await this.deps.attemptRepo.findAttemptById(request.fixAttemptId);
     if (existingFix) {
       return { outcome: 'refused', reason: `Fix attempt id already exists: ${request.fixAttemptId}` };
@@ -73,8 +84,8 @@ export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
       kind: 'fix',
       fixNumber: prior.fixNumber + 1,
       priorAttemptId: prior.id,
-      worktreePath: request.worktreePath,
-      baseCommit: request.baseCommit,
+      worktreePath: prior.worktreePath,
+      baseCommit: prior.baseCommit,
       state: 'intent-recorded',
       outcome: null,
       briefDigest: null,

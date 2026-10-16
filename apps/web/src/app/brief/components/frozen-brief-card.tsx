@@ -86,7 +86,7 @@ export function FrozenBriefCard({
               >
                 Dispatch the intent
               </Button>
-              <RouteChip>POST /v1/attempts</RouteChip>
+              <RouteChip gap>no live route exists yet</RouteChip>
               <span className={styles.sum}>
                 a separate step — the Line holds the intent until a slot frees
               </span>
@@ -104,7 +104,7 @@ export function FrozenBriefCard({
         open={confirmDispatchOpen}
         tone="accent"
         title={`Dispatch the intent for ${digest}`}
-        meta="POST /v1/attempts"
+        meta="no live route exists yet"
         confirmLabel="Dispatch the intent"
         cancelLabel="Cancel"
         onCancel={() => setConfirmDispatchOpen(false)}

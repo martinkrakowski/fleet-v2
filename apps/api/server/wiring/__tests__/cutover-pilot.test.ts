@@ -9,7 +9,7 @@ import "./nitro-globals.js";
 
 import { readdirSync } from "node:fs";
 import { createServer, type Server } from "node:http";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -512,9 +512,20 @@ describe("bootstrapFleetApiFromEnv (Nitro startup plugin)", () => {
 
   it("configures the runtime when FLEET_STATE_DIR is set", async () => {
     const stateDir = await makeTempDir();
+    const tokenFile = join(stateDir, "api-token");
+    await writeFile(tokenFile, "a".repeat(32) + "\n", { mode: 0o600 });
+    await chmod(tokenFile, 0o600);
     configureFleetApiRuntime(null);
 
-    expect(bootstrapFleetApiFromEnv({ FLEET_STATE_DIR: `  ${stateDir}  ` })).toBe(true);
+    // Stays unconfigured without a valid token file.
+    expect(bootstrapFleetApiFromEnv({ FLEET_STATE_DIR: `  ${stateDir}  ` })).toBe(false);
+
+    expect(
+      bootstrapFleetApiFromEnv({
+        FLEET_STATE_DIR: `  ${stateDir}  `,
+        FLEET_API_TOKEN_FILE: tokenFile,
+      }),
+    ).toBe(true);
 
     const registered = await workComposition().registerWorkOrder.execute(
       PILOT_WORK_ORDER_REQUEST,
@@ -580,12 +591,9 @@ describe("501-vs-validation matrix", () => {
     expect(coordinationResult.undeliveredObservations).toEqual([]);
     expect(coordinationResult.unacknowledgedRelays).toEqual([]);
 
-    // Documented scaffold exception: POST /v1/attempts keeps its existing
-    // three-step pipeline (prepare -> reserve -> dispatch) with no request
-    // forwarding, so it still reports 501 while configured.
+    // M11 removed POST /v1/attempts; while configured it reports 404.
     const scaffold = await callRoute("post", "/v1/attempts", {});
-    expect(scaffold.status).toBe(501);
-    expect(envelopeOf(scaffold.payload).code).toBe("NOT_IMPLEMENTED");
+    expect(scaffold.status).toBe(404);
   });
 
   it("preserves body.assessmentId and merges :id on the evidence receipt routes", async () => {

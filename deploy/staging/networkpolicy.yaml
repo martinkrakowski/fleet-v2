@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fleet-v2-api
+  namespace: fleet-v2-staging
+spec:
+  podSelector:
+    matchLabels:
+      app: fleet-v2
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 3000
+    - ports:
+        - protocol: TCP
+          port: 3001
+      from:
+        - podSelector:
+            matchLabels:
+              app: fleet-v2

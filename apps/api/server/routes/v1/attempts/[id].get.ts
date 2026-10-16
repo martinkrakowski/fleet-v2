@@ -1,3 +1,4 @@
+import { defineEventHandler, getRouterParam, setResponseStatus } from "h3";
 import { workComposition } from "../../../wiring/work/composition";
 import {
   envelope,
@@ -9,7 +10,7 @@ import { readQueryRecord } from "../../../wiring/http-input";
 export default defineEventHandler(async (event) => {
   const operationId = newOperationId();
   try {
-    const result = await workComposition().reconcileAttempt.execute({
+    const result = await workComposition().inspectAttempt.execute({
       ...readQueryRecord(event),
       attemptId: getRouterParam(event, "id") ?? "",
     });

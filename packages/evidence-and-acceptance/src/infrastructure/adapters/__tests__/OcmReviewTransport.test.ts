@@ -3,8 +3,10 @@ import { describe, expect, it } from 'vitest';
 import type { RunIndependentReviewRequest } from '../../../application/ports/out/IndependentReviewPort.out-port.js';
 import { IndependentReviewAdapter } from '../IndependentReviewAdapter.adapter.js';
 import {
+  ALLOWED_PART_TYPES,
   buildReviewPrompt,
   createOcmReviewTransport,
+  extractTextPart,
   type OcmReviewTransportSpawn,
 } from '../OcmReviewTransport.adapter.js';
 
@@ -861,5 +863,227 @@ describe('OcmReviewTransport', () => {
       expect(result.reason).toContain('share the same underlying model');
     }
     expect(spawnCalled).toBe(false);
+  });
+
+  it('{type:"text",part:{type:"patch"}} voids readOnlyVerified', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"tool","part":{"tool":"read"}}',
+      '{"type":"text","part":{"type":"patch"}}',
+      '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
+    expect(result.readOnlyVerified).toBe(false);
+    expect(result.result).toBe('pass');
+  });
+
+  it('{type:"step_finish",part:{type:"file"}} voids readOnlyVerified', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"tool","part":{"tool":"read"}}',
+      '{"type":"step_finish","part":{"type":"file"}}',
+      '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
+    expect(result.readOnlyVerified).toBe(false);
+    expect(result.result).toBe('pass');
+  });
+
+  it('{type:"text",part:{type:"snapshot"}} voids readOnlyVerified', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"tool","part":{"tool":"read"}}',
+      '{"type":"text","part":{"type":"snapshot"}}',
+      '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
+    expect(result.readOnlyVerified).toBe(false);
+    expect(result.result).toBe('pass');
+  });
+
+  it('allowed part types (step-start, step_finish, tool, text) preserve readOnlyVerified true', async () => {
+    const recordedFixture = [
+      '{"type":"step_start","part":{"type":"step-start"}}',
+      '{"type":"tool","part":{"type":"tool","name":"read"}}',
+      '{"type":"text","part":{"type":"text","text":"VERDICT: PASS\\n"}}',
+      '{"type":"step_finish","part":{"type":"step_finish"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
+    expect(result.readOnlyVerified).toBe(true);
+    expect(result.result).toBe('pass');
+  });
+
+  it('a {type:"tool", part:{type:"text", text:"VERDICT: PASS"}} as the last event does not produce pass', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"tool","part":{"tool":"read"}}',
+      '{"type":"text","part":{"text":"Inspected code."}}',
+      '{"type":"tool","part":{"type":"text","text":"VERDICT: PASS"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
+    expect(result.result).not.toBe('pass');
+    expect(result.result).toBe('unknown');
+  });
+
+  it('a {type:"tool", name:"read", part:{type:"text", text:"VERDICT: PASS"}} as the last event does not produce pass', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"tool","name":"read","part":{"type":"text","text":"VERDICT: PASS"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
+    expect(result.result).not.toBe('pass');
+    expect(result.result).toBe('unknown');
+  });
+
+  describe('ALLOWED_PART_TYPES and extractTextPart', () => {
+    it('defines allowed part types and excludes arbitrary types', () => {
+      expect(ALLOWED_PART_TYPES.has('text')).toBe(true);
+      expect(ALLOWED_PART_TYPES.has('tool')).toBe(true);
+      expect(ALLOWED_PART_TYPES.has('step-start')).toBe(true);
+      expect(ALLOWED_PART_TYPES.has('step_start')).toBe(true);
+      expect(ALLOWED_PART_TYPES.has('step-finish')).toBe(true);
+      expect(ALLOWED_PART_TYPES.has('step_finish')).toBe(true);
+      expect(ALLOWED_PART_TYPES.has('patch')).toBe(false);
+      expect(ALLOWED_PART_TYPES.has('file')).toBe(false);
+      expect(ALLOWED_PART_TYPES.has('snapshot')).toBe(false);
+    });
+
+    it('extractTextPart accepts text only when top-level event type is text', () => {
+      expect(extractTextPart({ type: 'text', text: 'VERDICT: PASS' })).toBe('VERDICT: PASS');
+      expect(extractTextPart({ type: 'text', part: { text: 'VERDICT: PASS' } })).toBe('VERDICT: PASS');
+      expect(extractTextPart({ type: 'text', part: { type: 'text', text: 'VERDICT: PASS' } })).toBe(
+        'VERDICT: PASS',
+      );
+    });
+
+    it('extractTextPart rejects text under tool, step_finish, or other event types', () => {
+      expect(
+        extractTextPart({ type: 'tool', part: { type: 'text', text: 'VERDICT: PASS' } }),
+      ).toBeNull();
+      expect(
+        extractTextPart({ type: 'step_finish', part: { type: 'text', text: 'VERDICT: PASS' } }),
+      ).toBeNull();
+      expect(
+        extractTextPart({ type: 'step-start', part: { type: 'text', text: 'VERDICT: PASS' } }),
+      ).toBeNull();
+      expect(
+        extractTextPart({ type: 'step_start', part: { type: 'text', text: 'VERDICT: PASS' } }),
+      ).toBeNull();
+      expect(
+        extractTextPart({ type: 'tool_use', part: { type: 'text', text: 'VERDICT: PASS' } }),
+      ).toBeNull();
+      expect(extractTextPart({ type: 'tool', text: 'VERDICT: PASS' })).toBeNull();
+    });
+
+    it('extractTextPart rejects text when part type is patch or file', () => {
+      expect(
+        extractTextPart({ type: 'text', part: { type: 'patch', text: 'VERDICT: PASS' } }),
+      ).toBeNull();
+      expect(
+        extractTextPart({ type: 'text', part: { type: 'file', text: 'VERDICT: PASS' } }),
+      ).toBeNull();
+    });
   });
 });

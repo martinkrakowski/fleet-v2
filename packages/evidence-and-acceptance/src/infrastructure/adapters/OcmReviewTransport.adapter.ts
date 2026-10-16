@@ -54,6 +54,16 @@ export const RECOGNISED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'tool_call',
 ]);
 
+/** Allowed part types for review runner stream parts. Any other part.type voids read-only. */
+export const ALLOWED_PART_TYPES: ReadonlySet<string> = new Set([
+  'text',
+  'tool',
+  'step-start',
+  'step_start',
+  'step-finish',
+  'step_finish',
+]);
+
 /** Process environment variables that a reviewer subprocess may inherit. */
 export const REVIEWER_ENV_ALLOWLIST: readonly string[] = [
   'PATH',
@@ -74,18 +84,21 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function extractTextPart(record: Record<string, unknown>): string | null {
+export function extractTextPart(record: Record<string, unknown>): string | null {
+  if (record.type !== 'text') {
+    return null;
+  }
   const part = isPlainRecord(record.part) ? record.part : null;
-  if (record.type === 'text') {
-    if (part !== null && typeof part.text === 'string') {
+  if (part !== null) {
+    if (part.type !== undefined && part.type !== 'text') {
+      return null;
+    }
+    if (typeof part.text === 'string') {
       return part.text;
     }
-    if (typeof record.text === 'string') {
-      return record.text;
-    }
   }
-  if (part !== null && part.type === 'text' && typeof part.text === 'string') {
-    return part.text;
+  if (typeof record.text === 'string') {
+    return record.text;
   }
   return null;
 }
@@ -300,6 +313,17 @@ export function createOcmReviewTransport(
 
       if (typeof parsed.type !== 'string' || !RECOGNISED_EVENT_TYPES.has(parsed.type)) {
         readOnlyVoided = true;
+      }
+
+      if (parsed.part !== undefined) {
+        if (!isPlainRecord(parsed.part)) {
+          readOnlyVoided = true;
+        } else if (
+          parsed.part.type !== undefined &&
+          (typeof parsed.part.type !== 'string' || !ALLOWED_PART_TYPES.has(parsed.part.type))
+        ) {
+          readOnlyVoided = true;
+        }
       }
 
       if (isStepStart(parsed)) {

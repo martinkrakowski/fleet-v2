@@ -3,13 +3,11 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApp, createRouter, eventHandler, toNodeListener } from "h3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import * as h3 from "h3";
+import { createApp, createRouter, eventHandler, toNodeListener, type EventHandler } from "h3";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import securityMiddleware from "../server/middleware/security.js";
 import { bootstrapFleetApiFromEnv } from "../server/plugins/runtime.js";
-import attemptGetHandler from "../server/routes/v1/attempts/[id].get.js";
-import reconcilePostHandler from "../server/routes/v1/attempts/[id]/reconcile.post.js";
-import attemptsPostHandler from "../server/routes/v1/attempts/index.post.js";
 import { readObjectBody, readQueryRecord } from "../server/wiring/http-input.js";
 import {
   configureFleetApiRuntime,
@@ -22,6 +20,26 @@ import {
 } from "../server/wiring/token.js";
 import { configureWorkComposition } from "../server/wiring/work/composition.js";
 
+// Nitro auto-imports h3 utilities into the global scope at build time;
+// vitest does not, so stub them globally before loading route modules.
+for (const [key, value] of Object.entries(h3)) {
+  if (typeof value === "function") {
+    vi.stubGlobal(key, value);
+  }
+}
+vi.stubGlobal("defineEventHandler", h3.defineEventHandler);
+vi.stubGlobal("getRouterParam", h3.getRouterParam);
+vi.stubGlobal("setResponseStatus", h3.setResponseStatus);
+vi.stubGlobal("readBody", h3.readBody);
+vi.stubGlobal("createError", h3.createError);
+Object.assign(globalThis, {
+  defineEventHandler: h3.defineEventHandler,
+  getRouterParam: h3.getRouterParam,
+  setResponseStatus: h3.setResponseStatus,
+  readBody: h3.readBody,
+  createError: h3.createError,
+});
+
 const VALID_TOKEN = "a".repeat(32);
 const ANOTHER_VALID_TOKEN = "b".repeat(48);
 
@@ -29,9 +47,40 @@ describe("API Security and Hardening", () => {
   let tempDir: string;
   let server: Server;
   let baseUrl: string;
+  let stopHandlerInvoked: boolean;
+  let attemptGetHandler: EventHandler;
+  let reconcilePostHandler: EventHandler;
+  let attemptsPostHandler: EventHandler;
+  let stopPostHandler: EventHandler;
+
+  beforeAll(async () => {
+    for (const [key, value] of Object.entries(h3)) {
+      if (typeof value === "function") {
+        vi.stubGlobal(key, value);
+      }
+    }
+    vi.stubGlobal("defineEventHandler", h3.defineEventHandler);
+    vi.stubGlobal("getRouterParam", h3.getRouterParam);
+    vi.stubGlobal("setResponseStatus", h3.setResponseStatus);
+    vi.stubGlobal("readBody", h3.readBody);
+    vi.stubGlobal("createError", h3.createError);
+    Object.assign(globalThis, {
+      defineEventHandler: h3.defineEventHandler,
+      getRouterParam: h3.getRouterParam,
+      setResponseStatus: h3.setResponseStatus,
+      readBody: h3.readBody,
+      createError: h3.createError,
+    });
+
+    attemptGetHandler = (await import("../server/routes/v1/attempts/[id].get.js")).default;
+    reconcilePostHandler = (await import("../server/routes/v1/attempts/[id]/reconcile.post.js")).default;
+    attemptsPostHandler = (await import("../server/routes/v1/attempts/index.post.js")).default;
+    stopPostHandler = (await import("../server/routes/v1/attempts/[id]/stop.post.js")).default;
+  });
 
   beforeEach(async () => {
     tempDir = mkdtempSync(join(tmpdir(), "fleet-api-test-"));
+    stopHandlerInvoked = false;
     configureFleetApiRuntime(null);
     setActiveApiToken(null);
     configureWorkComposition(null);
@@ -53,6 +102,17 @@ describe("API Security and Hardening", () => {
     router.post("/v1/attempts/:id/reconcile", reconcilePostHandler);
     router.get("/v1/attempts/:id", attemptGetHandler);
     router.post("/v1/attempts", attemptsPostHandler);
+    router.post(
+      "/v1/attempts/:id/stop",
+      eventHandler(async (event) => {
+        stopHandlerInvoked = true;
+        return stopPostHandler(event);
+      }),
+    );
+    router.get(
+      "/",
+      eventHandler(() => ({ status: "ok", app: "api" })),
+    );
     app.use(router.handler);
     app.use(
       "/health",
@@ -152,10 +212,27 @@ describe("API Security and Hardening", () => {
   });
 
   describe("Security Middleware", () => {
-    it("allows non-/v1 routes without token", async () => {
+    it("allows allowlisted routes (/ and /health) without token", async () => {
       const res = await fetch(`${baseUrl}/health`);
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ status: "up" });
+
+      const rootRes = await fetch(`${baseUrl}/`);
+      expect(rootRes.status).toBe(200);
+      expect(await rootRes.json()).toEqual({ status: "ok", app: "api" });
+    });
+
+    it("allows allowlisted routes without token even when configured", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+
+      const res = await fetch(`${baseUrl}/health`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ status: "up" });
+
+      const rootRes = await fetch(`${baseUrl}/`);
+      expect(rootRes.status).toBe(200);
+      expect(await rootRes.json()).toEqual({ status: "ok", app: "api" });
     });
 
     it("passes through /v1 routes when runtime is unconfigured", async () => {
@@ -263,6 +340,94 @@ describe("API Security and Hardening", () => {
         body: JSON.stringify({ name: "hello" }),
       });
       expect(jsonRes.status).toBe(200);
+    });
+
+    it("refuses /v%31/attempts/a1/stop without a token with 401 and the handler never runs", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+
+      const res = await fetch(`${baseUrl}/v%31/attempts/a1/stop`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(401);
+      expect(stopHandlerInvoked).toBe(false);
+    });
+
+    it("refuses /%76%31/... without a token with 401 and the handler never runs", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+
+      const res = await fetch(`${baseUrl}/%76%31/attempts/a1/stop`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(401);
+      expect(stopHandlerInvoked).toBe(false);
+    });
+
+    it("refuses //v1/... without a token with 401", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+
+      const resStop = await fetch(`${baseUrl}//v1/attempts/a1/stop`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(resStop.status).toBe(401);
+      expect(stopHandlerInvoked).toBe(false);
+
+      const resTest = await fetch(`${baseUrl}//v1/test`);
+      expect(resTest.status).toBe(401);
+    });
+
+    it("allows a valid token with an encoded prefix to pass checks", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+
+      const resGet = await fetch(`${baseUrl}/v%31/test`, {
+        headers: {
+          authorization: `Bearer ${VALID_TOKEN}`,
+        },
+      });
+      expect(resGet.status).toBe(200);
+      expect((await resGet.json()).ok).toBe(true);
+
+      const resFullyEncoded = await fetch(`${baseUrl}/%76%31/test`, {
+        headers: {
+          authorization: `Bearer ${VALID_TOKEN}`,
+        },
+      });
+      expect(resFullyEncoded.status).toBe(200);
+      expect((await resFullyEncoded.json()).ok).toBe(true);
+
+      const resStop = await fetch(`${baseUrl}/v%31/attempts/a1/stop`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${VALID_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      expect(resStop.status).toBe(200);
+      expect(stopHandlerInvoked).toBe(true);
+    });
+
+    it("refuses unauthenticated form-encoded POST with 401 (not 415)", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+
+      const res = await fetch(`${baseUrl}/v1/test`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: "foo=bar",
+      });
+      expect(res.status).toBe(401);
     });
   });
 

@@ -19,3 +19,8 @@ yarn staging:deploy --yes
 
 The script refuses a dirty tree and refuses to run without a terminal unless
 `--yes` is passed. It checks that `midnight-ca` exists before it builds.
+
+## API Configuration and Activation
+
+Staging stays 501 until the owner creates a mode-600 token file, mounts it as a Secret, and sets `FLEET_STATE_DIR` and `FLEET_API_TOKEN_FILE`. Do not add or commit any secret value.
+

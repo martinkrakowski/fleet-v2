@@ -3,21 +3,25 @@ import {
   defineEventHandler,
   getMethod,
   getRequestHeader,
-  getRequestPath,
   setResponseHeader,
   setResponseStatus,
 } from "h3";
 import { isFleetApiRuntimeConfigured } from "../wiring/runtime";
 import { getActiveApiToken } from "../wiring/token";
 
+const ALLOWED_UNAUTHENTICATED_PATHS = new Set(["/", "/health"]);
+
 export default defineEventHandler((event) => {
-  const path = getRequestPath(event);
-  if (!path.startsWith("/v1/") && path !== "/v1") {
+  // When the runtime is unconfigured, keep today's 501 behaviour (middleware does not need the token then).
+  if (!isFleetApiRuntimeConfigured()) {
     return;
   }
 
-  // When the runtime is unconfigured, keep today's 501 behaviour (middleware does not need the token then).
-  if (!isFleetApiRuntimeConfigured()) {
+  const rawPath = event.path || "/";
+  const qIndex = rawPath.indexOf("?");
+  const decodedPath = qIndex === -1 ? rawPath : rawPath.slice(0, qIndex);
+
+  if (ALLOWED_UNAUTHENTICATED_PATHS.has(decodedPath)) {
     return;
   }
 
@@ -34,21 +38,6 @@ export default defineEventHandler((event) => {
       setResponseStatus(event, 403);
       setResponseHeader(event, "content-type", "application/json");
       return { error: "Forbidden origin" };
-    }
-  }
-
-  // Require Content-Type: application/json on every non-GET request
-  const method = getMethod(event).toUpperCase();
-  if (method !== "GET") {
-    const contentType = getRequestHeader(event, "content-type");
-    const isJson =
-      typeof contentType === "string" &&
-      (contentType.trim().toLowerCase() === "application/json" ||
-        contentType.trim().toLowerCase().startsWith("application/json;"));
-    if (!isJson) {
-      setResponseStatus(event, 415);
-      setResponseHeader(event, "content-type", "application/json");
-      return { error: "Unsupported Media Type: Content-Type must be application/json" };
     }
   }
 
@@ -84,5 +73,20 @@ export default defineEventHandler((event) => {
     setResponseStatus(event, 401);
     setResponseHeader(event, "content-type", "application/json");
     return { error: "Unauthorized: invalid bearer token" };
+  }
+
+  // Require Content-Type: application/json on every non-GET request
+  const method = getMethod(event).toUpperCase();
+  if (method !== "GET") {
+    const contentType = getRequestHeader(event, "content-type");
+    const isJson =
+      typeof contentType === "string" &&
+      (contentType.trim().toLowerCase() === "application/json" ||
+        contentType.trim().toLowerCase().startsWith("application/json;"));
+    if (!isJson) {
+      setResponseStatus(event, 415);
+      setResponseHeader(event, "content-type", "application/json");
+      return { error: "Unsupported Media Type: Content-Type must be application/json" };
+    }
   }
 });

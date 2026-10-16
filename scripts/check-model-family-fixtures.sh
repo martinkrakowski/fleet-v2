@@ -7,7 +7,15 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 installation_fixture="$root/packages/installation/src/__tests__/fixtures/model-family-cases.json"
 evidence_fixture="$root/packages/evidence-and-acceptance/src/domain/entities/__tests__/fixtures/model-family-cases.json"
 
-if ! cmp -s "$installation_fixture" "$evidence_fixture"; then
-  echo "model-family-cases.json fixtures differ between installation and evidence-and-acceptance" >&2
+# Fails the run with one line on stderr.
+fail() {
+  echo "check-model-family-fixtures: $1" >&2
   exit 1
-fi
+}
+
+for f in "$installation_fixture" "$evidence_fixture"; do
+  [ -f "$f" ] || fail "missing fixture $f"
+done
+
+cmp -s "$installation_fixture" "$evidence_fixture" ||
+  fail "model-family-cases.json fixtures differ between installation and evidence-and-acceptance"

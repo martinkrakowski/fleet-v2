@@ -17,6 +17,7 @@
     "@fleet/brief-knowledge": "workspace:*",
     "@fleet/evidence-and-acceptance": "workspace:*",
     "@fleet/installation": "workspace:*",
+    "@fleet/onboarding": "workspace:*",
     "@fleet/operator-coordination": "workspace:*",
     "@fleet/work-execution": "workspace:*"
   },

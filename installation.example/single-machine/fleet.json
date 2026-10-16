@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 2,
+  "hosts": {
+    "this-machine": {
+      "transport": "local",
+      "worktreeRoot": "/home/developer/fleet-worktrees",
+      "tmpDir": "/home/developer/fleet-worktrees/.tmp",
+      "roles": ["orchestrator", "lane-runner", "verifier"],
+      "runner": {
+        "kind": "opencode",
+        "port": 46000,
+        "capabilities": {
+          "networkEgressRestricted": false,
+          "cpuAndMemoryLimited": false,
+          "processTreeTermination": false,
+          "filesystemScope": "inherited-directory"
+        },
+        "maxLanes": 1
+      }
+    }
+  },
+  "tools": ["opencode"],
+  "seats": [
+    {
+      "id": "implementer",
+      "tool": "opencode",
+      "model": "example-provider/example-implementer-model",
+      "agent": "example-agent",
+      "roles": ["implementer"],
+      "costClass": "plan-quota"
+    },
+    {
+      "id": "reviewer",
+      "tool": "opencode",
+      "model": "example-provider/example-review-model",
+      "agent": "example-agent",
+      "roles": ["reviewer"],
+      "costClass": "paid"
+    }
+  ],
+  "chains": {
+    "implementer": [{ "seatId": "implementer" }],
+    "reviewer": [{ "seatId": "reviewer" }]
+  },
+  "policy": {
+    "forbiddenRoutes": [
+      { "tool": "example-tool", "modelPattern": "example-forbidden-model-*" }
+    ]
+  },
+  "shelf": { "provider": "local" },
+  "forge": { "mode": "none" },
+  "verification": {
+    "procedures": {
+      "example-gate": { "command": "fleet-verify-example", "args": ["--gate"] }
+    }
+  }
+}

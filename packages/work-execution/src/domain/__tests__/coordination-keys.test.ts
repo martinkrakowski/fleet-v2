@@ -4,7 +4,7 @@ import {
   forgeActionScope,
   observationEventKind,
   type ForgeActionKind,
-} from './coordination-keys.js';
+} from '../coordination-keys.js';
 
 describe('coordination-keys domain', () => {
   describe('forgeActionScope', () => {

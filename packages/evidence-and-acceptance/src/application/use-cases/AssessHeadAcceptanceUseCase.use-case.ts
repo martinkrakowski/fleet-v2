@@ -15,7 +15,7 @@
 
 import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
-import { underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
+import { isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { ForgeEvidencePort } from '../ports/out/ForgeEvidencePort.out-port.js';
 import type { OwnerDecisionPort } from '../ports/out/OwnerDecisionPort.out-port.js';
@@ -89,7 +89,12 @@ function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly s
       );
       continue;
     }
-    if (underlyingModelFamily(receipt.reviewerModel) === underlyingModelFamily(assessment.implementerModel)) {
+    if (
+      isSameModelFamily(
+        underlyingModelFamily(receipt.reviewerModel),
+        underlyingModelFamily(assessment.implementerModel),
+      )
+    ) {
       blockers.push(
         `review receipt '${receipt.id}' is not independent: reviewer '${receipt.reviewerModel}' shares the implementer's model family '${underlyingModelFamily(assessment.implementerModel)}'`,
       );

@@ -8,7 +8,7 @@
 import type { EvidenceAssessmentRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
-import { ReviewReceipt, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
+import { ReviewReceipt, isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type {
   RecordReviewReceiptPort,
@@ -120,7 +120,12 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
         reason: `Review receipt claims implementer '${receipt.implementerModel}', but assessment '${assessment.id}' was implemented on seat '${assessment.implementerModel}'`,
       };
     }
-    if (underlyingModelFamily(receipt.reviewerModel) === underlyingModelFamily(assessment.implementerModel)) {
+    if (
+      isSameModelFamily(
+        underlyingModelFamily(receipt.reviewerModel),
+        underlyingModelFamily(assessment.implementerModel),
+      )
+    ) {
       return {
         outcome: 'rejected',
         reason: `Reviewer ${receipt.reviewerModel} shares the same underlying model as the implementer ${assessment.implementerModel}`,

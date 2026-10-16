@@ -13,7 +13,7 @@ import type {
   AttemptRecord,
   AttemptRunnerRecord,
 } from '../../domain/execution-records.js';
-import { underlyingModelFamily } from '../../domain/execution-records.js';
+import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import type { DispatchAttemptPort, DispatchAttemptRequest, DispatchAttemptResult } from '../ports/in/DispatchAttemptPort.in-port.js';
 import type { RunnerIsolationCapabilities } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
@@ -301,8 +301,10 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
 
       for (const recordedReviewer of candidateReviewers) {
         if (
-          underlyingModelFamily(request.seatOverride.model) ===
-            underlyingModelFamily(recordedReviewer)
+          isSameModelFamily(
+            underlyingModelFamily(request.seatOverride.model),
+            underlyingModelFamily(recordedReviewer),
+          )
         ) {
           return {
             outcome: 'refused',

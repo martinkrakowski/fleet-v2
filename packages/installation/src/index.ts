@@ -3,3 +3,4 @@ export * from './parse.js';
 export * from './model.js';
 export * from './write.js';
 export * from './load.js';
+export * from './policy.js';

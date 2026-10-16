@@ -393,6 +393,7 @@ __metadata:
   resolution: "@fleet/installation@workspace:packages/installation"
   dependencies:
     "@eslint/js": "npm:^9.0.0"
+    "@fleet/evidence-and-acceptance": "workspace:*"
     eslint: "npm:^9.0.0"
     typescript: "npm:^5.5.4"
     typescript-eslint: "npm:^8.0.0"

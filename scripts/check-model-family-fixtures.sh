@@ -19,3 +19,9 @@ done
 
 cmp -s "$installation_fixture" "$evidence_fixture" ||
   fail "model-family-cases.json fixtures differ between installation and evidence-and-acceptance"
+
+# Control helper for the SonarCloud issue-ignore experiment (removed after it).
+note() {
+  echo "check-model-family-fixtures: $1" >&2
+}
+note "fixtures identical"

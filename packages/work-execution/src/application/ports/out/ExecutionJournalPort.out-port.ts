@@ -10,6 +10,32 @@ import type {
   CapacityReservationRecord,
 } from '../../../domain/execution-records.js';
 
+/** A capacity reservation before a physical slot index is assigned under the lock. */
+export type CapacityReservationClaim = Omit<CapacityReservationRecord, 'slotIndex'>;
+
+/** One attempt's claim on one slot under its host's shared budget. */
+export interface ReserveCapacityAtomicallyRequest {
+  /** The attempt claiming the slot; it must hold no active reservation. */
+  readonly attemptId: string;
+  /** The claiming host's shared slot budget. */
+  readonly maxSlots: number;
+  /** The reservation appended when the claim is granted; `slotIndex` is assigned under the lock. */
+  readonly record: CapacityReservationClaim;
+}
+
+export type ReserveCapacityAtomicallyResult =
+  | { readonly outcome: 'reserved'; readonly reservation: CapacityReservationRecord }
+  | {
+      readonly outcome: 'duplicate-attempt';
+      readonly attemptId: string;
+      readonly existingReservationId: string;
+    }
+  | {
+      readonly outcome: 'no-free-slot';
+      readonly heldCount: number;
+      readonly maxSlots: number;
+    };
+
 export interface ExecutionJournalPort {
   /** Append one journal entry; the journal is append-only evidence. */
   appendJournalEntry(entry: ActionJournalEntryRecord): Promise<void>;
@@ -17,7 +43,11 @@ export interface ExecutionJournalPort {
   /** List the journal entries for one attempt in recorded order. */
   listJournalEntriesForAttempt(attemptId: string): Promise<readonly ActionJournalEntryRecord[]>;
 
-  /** Persist one capacity reservation or its release. */
+  /**
+   * Persist one capacity reservation or its release. A held claim never
+   * supersedes another reservation for the same attempt; that refusal is an
+   * error, never a silent replacement.
+   */
   saveCapacityReservation(reservation: CapacityReservationRecord): Promise<void>;
 
   /** List held reservations, optionally narrowed to one host. */
@@ -25,4 +55,15 @@ export interface ExecutionJournalPort {
 
   /** Release the held reservation for one attempt; false when none was held. */
   releaseCapacityReservation(attemptId: string, releasedAtIso: string): Promise<boolean>;
+
+  /**
+   * Reserve one slot for one attempt in a single locked read-modify-write.
+   * The held reservations are re-read under the reservations lock; a claim by
+   * an attempt that already holds one and a claim over a full budget are
+   * refused without writing, and only a passing claim is appended with the
+   * lowest free slot index. A reservation is never superseded.
+   */
+  reserveCapacityAtomically(
+    request: ReserveCapacityAtomicallyRequest,
+  ): Promise<ReserveCapacityAtomicallyResult>;
 }

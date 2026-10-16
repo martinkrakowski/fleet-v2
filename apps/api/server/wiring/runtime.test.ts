@@ -225,26 +225,28 @@ describe('apps/api runtime wiring', () => {
                 authorizationGrantId: string;
                 actionId: string;
                 actionKind: 'push-and-open-pr' | 'merge-pr';
-                expectedHeadSha: string;
-                attemptId: string;
+                expectedHeadSha?: string;
+                attemptId?: string;
               }) => Promise<{ outcome: string; actionId?: string; reason?: string }>;
             };
           };
         }).deps?.authorizationPort;
         expect(authPort).toBeDefined();
 
-        // Consume through authorization delegate
+        // Consume through the authorization delegate carrying only the grant
+        // and action identities. The attempt and head coordinates were never
+        // in this request, so the only source that can scope the consumption
+        // is the coordinates file reloaded from `stateDir` above.
         const result = await authPort!.consumeActionAuthorization({
           authorizationGrantId: grantId,
           actionId,
           actionKind: 'push-and-open-pr',
-          expectedHeadSha: headH,
-          attemptId,
         });
 
         expect(result).toEqual({ outcome: 'consumed', actionId });
 
-        // Verify the grant in operator repo is now consumed and state completed
+        // Verify the grant in operator repo is now consumed and state completed,
+        // scoped by the reloaded coordinates rather than by the request.
         const grant = await reqRepo!.findRequestByGrantId(grantId);
         expect(grant?.state).toBe('completed');
         expect(grant?.consumptions).toHaveLength(1);

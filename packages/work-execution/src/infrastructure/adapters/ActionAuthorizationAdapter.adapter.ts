@@ -94,6 +94,14 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
           reason: `Authorization grant ${request.authorizationGrantId} kind ${grant.kind} does not match requested ${request.actionKind}`,
         };
       }
+      if (request.expectedHeadSha === undefined) {
+        // The local grant store keeps no resolve-time coordinates, so a
+        // consume request that omits the head cannot be verified here.
+        return {
+          outcome: 'refused',
+          reason: `Authorization grant ${request.authorizationGrantId} requires the expectedHeadSha this local grant store cannot infer`,
+        };
+      }
       if (grant.expectedHeadSha !== request.expectedHeadSha) {
         return {
           outcome: 'refused',

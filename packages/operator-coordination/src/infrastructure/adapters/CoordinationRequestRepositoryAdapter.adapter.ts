@@ -7,9 +7,10 @@
  * Every stored or loaded record is re-validated by the domain, so a request
  * that would duplicate a consumption, hide a delivery gap or invent a state
  * never becomes readable state. Writes are revision-aware: a stale or
- * conflicting revision evaluated against the freshly read record is an error
- * rather than a silent overwrite, and lookups return known absence as null
- * instead of synthesizing a request.
+ * conflicting revision evaluated against the freshly read record raises the
+ * typed CoordinationRequestRevisionConflictError rather than a silent
+ * overwrite, and lookups return known absence as null instead of synthesizing
+ * a request.
  */
 
 import { promises as fs } from 'node:fs';
@@ -17,6 +18,7 @@ import { join } from 'node:path';
 
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
+import { CoordinationRequestRevisionConflictError } from '../../application/ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import type { CoordinationRequestRepositoryPort } from '../../application/ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
 
@@ -38,6 +40,34 @@ function copy(record: CoordinationRequestRecord): CoordinationRequestRecord {
   };
 }
 
+/**
+ * Refuse a write that loses a race with a fresher record: a stale revision, or
+ * the same revision carrying different content. Both are a lost race, never a
+ * silent overwrite, and both surface as the typed conflict error.
+ */
+function refuseRevisionConflict(
+  validated: CoordinationRequestRecord,
+  existing: CoordinationRequestRecord,
+): void {
+  if (validated.revision < existing.revision) {
+    throw new CoordinationRequestRevisionConflictError(
+      validated.id,
+      validated.revision,
+      `CoordinationRequestRepositoryAdapter refuses stale revision ${validated.revision} for ${validated.id}; stored revision is ${existing.revision}`,
+    );
+  }
+  if (
+    validated.revision === existing.revision &&
+    JSON.stringify(copy(validated)) !== JSON.stringify(copy(existing))
+  ) {
+    throw new CoordinationRequestRevisionConflictError(
+      validated.id,
+      validated.revision,
+      `CoordinationRequestRepositoryAdapter refuses conflicting revision ${validated.revision} for ${validated.id}`,
+    );
+  }
+}
+
 export class CoordinationRequestRepositoryAdapter implements CoordinationRequestRepositoryPort {
   private readonly inMemoryRequests = new Map<string, CoordinationRequestRecord>();
   private readonly inMemoryGrants = new Map<string, string>();
@@ -50,19 +80,7 @@ export class CoordinationRequestRepositoryAdapter implements CoordinationRequest
       const validated = CoordinationRequest.fromRecord(record).toRecord();
       const existing = this.inMemoryRequests.get(validated.id);
       if (existing !== undefined) {
-        if (validated.revision < existing.revision) {
-          throw new Error(
-            `CoordinationRequestRepositoryAdapter refuses stale revision ${validated.revision} for ${validated.id}; stored revision is ${existing.revision}`,
-          );
-        }
-        if (
-          validated.revision === existing.revision &&
-          JSON.stringify(copy(validated)) !== JSON.stringify(copy(existing))
-        ) {
-          throw new Error(
-            `CoordinationRequestRepositoryAdapter refuses conflicting revision ${validated.revision} for ${validated.id}`,
-          );
-        }
+        refuseRevisionConflict(validated, existing);
       }
       this.inMemoryRequests.set(validated.id, validated);
       this.reindexGrant(validated);
@@ -76,19 +94,7 @@ export class CoordinationRequestRepositoryAdapter implements CoordinationRequest
       const records = await this.readRecordsFromDisk(target);
       const existing = records.get(validated.id);
       if (existing !== undefined) {
-        if (validated.revision < existing.revision) {
-          throw new Error(
-            `CoordinationRequestRepositoryAdapter refuses stale revision ${validated.revision} for ${validated.id}; stored revision is ${existing.revision}`,
-          );
-        }
-        if (
-          validated.revision === existing.revision &&
-          JSON.stringify(copy(validated)) !== JSON.stringify(copy(existing))
-        ) {
-          throw new Error(
-            `CoordinationRequestRepositoryAdapter refuses conflicting revision ${validated.revision} for ${validated.id}`,
-          );
-        }
+        refuseRevisionConflict(validated, existing);
       }
       records.set(validated.id, validated);
       const list = [...records.values()]

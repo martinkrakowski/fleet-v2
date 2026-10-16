@@ -5,7 +5,11 @@ import type {
   CapacityReservationRecord,
 } from '../src/domain/execution-records.js';
 import type { AttemptRepositoryPort } from '../src/application/ports/out/AttemptRepositoryPort.out-port.js';
-import type { ExecutionJournalPort } from '../src/application/ports/out/ExecutionJournalPort.out-port.js';
+import type {
+  ExecutionJournalPort,
+  ReserveCapacityAtomicallyRequest,
+  ReserveCapacityAtomicallyResult,
+} from '../src/application/ports/out/ExecutionJournalPort.out-port.js';
 import { ReserveExecutionCapacityUseCase } from '../src/application/use-cases/ReserveExecutionCapacityUseCase.use-case.js';
 
 class InMemoryJournal implements ExecutionJournalPort {
@@ -36,6 +40,33 @@ class InMemoryJournal implements ExecutionJournalPort {
       }
     }
     return false;
+  }
+
+  /** Mirrors the adapter's locked arbitration: duplicate, budget, then lowest free slot. */
+  async reserveCapacityAtomically(
+    request: ReserveCapacityAtomicallyRequest,
+  ): Promise<ReserveCapacityAtomicallyResult> {
+    const held = Array.from(this.reservations.values()).filter((r) => r.held);
+    const duplicate = held.find((r) => r.attemptId === request.attemptId);
+    if (duplicate !== undefined) {
+      return {
+        outcome: 'duplicate-attempt',
+        attemptId: request.attemptId,
+        existingReservationId: duplicate.id,
+      };
+    }
+    const heldOnHost = held.filter((r) => r.hostId === request.record.hostId);
+    if (heldOnHost.length >= request.maxSlots) {
+      return { outcome: 'no-free-slot', heldCount: heldOnHost.length, maxSlots: request.maxSlots };
+    }
+    const usedSlots = new Set(heldOnHost.map((r) => r.slotIndex));
+    let slotIndex = 0;
+    while (usedSlots.has(slotIndex)) {
+      slotIndex += 1;
+    }
+    const reservation: CapacityReservationRecord = { ...request.record, slotIndex };
+    this.reservations.set(reservation.id, reservation);
+    return { outcome: 'reserved', reservation };
   }
 }
 

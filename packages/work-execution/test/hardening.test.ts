@@ -4,9 +4,13 @@ import type {
   AttemptRecord,
   CollectedAttemptArtifacts,
   CommandCompletionReceipt,
+  CapacityReservationRecord,
 } from '../src/domain/execution-records.js';
 import type { AttemptRepositoryPort } from '../src/application/ports/out/AttemptRepositoryPort.out-port.js';
-import type { ExecutionJournalPort } from '../src/application/ports/out/ExecutionJournalPort.out-port.js';
+import type {
+  ExecutionJournalPort,
+  ReserveCapacityAtomicallyRequest,
+} from '../src/application/ports/out/ExecutionJournalPort.out-port.js';
 import type {
   AttemptArtifactPort,
   CollectCompletedAttemptArtifactsRequest,
@@ -83,6 +87,10 @@ class InMemoryJournal implements ExecutionJournalPort {
   }
   async releaseCapacityReservation(): Promise<boolean> {
     return true;
+  }
+  async reserveCapacityAtomically(request: ReserveCapacityAtomicallyRequest) {
+    const reservation: CapacityReservationRecord = { ...request.record, slotIndex: 0 };
+    return { outcome: 'reserved' as const, reservation };
   }
 }
 

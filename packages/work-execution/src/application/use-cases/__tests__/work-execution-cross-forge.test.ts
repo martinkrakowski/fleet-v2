@@ -36,7 +36,10 @@ import type {
   ResolveActionAuthorizationResult,
 } from '../../ports/out/ActionAuthorizationPort.out-port.js';
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
-import type { ExecutionJournalPort } from '../../ports/out/ExecutionJournalPort.out-port.js';
+import type {
+  ExecutionJournalPort,
+  ReserveCapacityAtomicallyRequest,
+} from '../../ports/out/ExecutionJournalPort.out-port.js';
 import type {
   AcceptanceEvidencePort,
   ReadAcceptanceRequest,
@@ -189,6 +192,11 @@ class InMemoryJournal implements ExecutionJournalPort {
 
   async releaseCapacityReservation(_attemptId: string, _releasedAtIso: string): Promise<boolean> {
     return false;
+  }
+
+  async reserveCapacityAtomically(request: ReserveCapacityAtomicallyRequest) {
+    const reservation: CapacityReservationRecord = { ...request.record, slotIndex: 0 };
+    return { outcome: 'reserved' as const, reservation };
   }
 }
 
@@ -946,6 +954,28 @@ describe('ActionAuthorizationAdapter', () => {
       outcome: 'refused',
       reason: 'Authorization grant not found: grant-missing',
     });
+  });
+
+  it('refuses a local-store consumption whose request omits the head it cannot infer', async () => {
+    const grants = makeGrants();
+    const adapter = new ActionAuthorizationAdapter({ grants });
+
+    const omittedHead = await adapter.consumeActionAuthorization(
+      consumeRequest({ expectedHeadSha: undefined }),
+    );
+    const omittedAttempt = await adapter.consumeActionAuthorization(
+      consumeRequest({ actionId: 'action-2', attemptId: undefined }),
+    );
+
+    expect(omittedHead).toEqual({
+      outcome: 'refused',
+      reason:
+        'Authorization grant grant-1 requires the expectedHeadSha this local grant store cannot infer',
+    });
+    // The head is refused rather than assumed; the attempt id is not what
+    // scopes this store, so omitting it still consumes exactly once.
+    expect(omittedAttempt).toEqual({ outcome: 'consumed', actionId: 'action-2' });
+    expect(grants.get('grant-1')?.consumedByActionId).toBe('action-2');
   });
 
   it('delegates to configured supplier functions when provided', async () => {

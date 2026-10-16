@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type {
   ActionJournalEntryRecord,
   AttemptRecord,
+  CapacityReservationRecord,
   WorkOrderRecord,
 } from '../../domain/execution-records.js';
 import type {
@@ -10,7 +11,10 @@ import type {
   ConsumeActionAuthorizationResult,
 } from '../ports/out/ActionAuthorizationPort.out-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
-import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
+import type {
+  ExecutionJournalPort,
+  ReserveCapacityAtomicallyRequest,
+} from '../ports/out/ExecutionJournalPort.out-port.js';
 import type {
   ForgeActionPort,
   ForgeActionRequest,
@@ -91,6 +95,10 @@ class InMemoryJournal implements ExecutionJournalPort {
   }
   async releaseCapacityReservation(): Promise<boolean> {
     return false;
+  }
+  async reserveCapacityAtomically(request: ReserveCapacityAtomicallyRequest) {
+    const reservation: CapacityReservationRecord = { ...request.record, slotIndex: 0 };
+    return { outcome: 'reserved' as const, reservation };
   }
 }
 

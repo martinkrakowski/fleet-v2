@@ -19,7 +19,11 @@ import type { AttemptArtifactPort } from '../../ports/out/AttemptArtifactPort.ou
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import type { BriefAuthoringPort } from '../../ports/out/BriefAuthoringPort.out-port.js';
 import type { BriefKnowledgePort } from '../../ports/out/BriefKnowledgePort.out-port.js';
-import type { ExecutionJournalPort } from '../../ports/out/ExecutionJournalPort.out-port.js';
+import type {
+  ExecutionJournalPort,
+  ReserveCapacityAtomicallyRequest,
+  ReserveCapacityAtomicallyResult,
+} from '../../ports/out/ExecutionJournalPort.out-port.js';
 import type { ExecutionObservationPort } from '../../ports/out/ExecutionObservationPort.out-port.js';
 import type {
   ExecutionRunnerPort,
@@ -98,6 +102,33 @@ function makeJournal(): ExecutionJournalPort & {
         }
       }
       return false;
+    },
+    // Mirrors the adapter's locked arbitration: duplicate, budget, then
+    // lowest free slot, in one read-modify-write.
+    async reserveCapacityAtomically(
+      request: ReserveCapacityAtomicallyRequest,
+    ): Promise<ReserveCapacityAtomicallyResult> {
+      const held = [...reservations.values()].filter((reservation) => reservation.held);
+      const duplicate = held.find((reservation) => reservation.attemptId === request.attemptId);
+      if (duplicate !== undefined) {
+        return {
+          outcome: 'duplicate-attempt',
+          attemptId: request.attemptId,
+          existingReservationId: duplicate.id,
+        };
+      }
+      const heldOnHost = held.filter((reservation) => reservation.hostId === request.record.hostId);
+      if (heldOnHost.length >= request.maxSlots) {
+        return { outcome: 'no-free-slot', heldCount: heldOnHost.length, maxSlots: request.maxSlots };
+      }
+      const usedSlots = new Set(heldOnHost.map((reservation) => reservation.slotIndex));
+      let slotIndex = 0;
+      while (usedSlots.has(slotIndex)) {
+        slotIndex += 1;
+      }
+      const reservation: CapacityReservationRecord = { ...request.record, slotIndex };
+      reservations.set(reservation.id, reservation);
+      return { outcome: 'reserved', reservation };
     },
   };
 }
@@ -466,6 +497,32 @@ describe('ReserveExecutionCapacityUseCase', () => {
     }
     expect(journal.heldFor('attempt-9')).toBe(true);
     expect(journal.heldFor('attempt-10')).toBe(true);
+  });
+
+  it('refuses a second reservation for the same attempt without superseding the first', async () => {
+    const journal = makeJournal();
+    const attemptRepo = makeAttemptRepo();
+    const useCase = new ReserveExecutionCapacityUseCase({ journal, attemptRepo });
+
+    const first = await useCase.reserveExecutionCapacity(
+      validReservationRequest() as Parameters<
+        ReserveExecutionCapacityUseCase['reserveExecutionCapacity']
+      >[0],
+    );
+    const duplicate = await useCase.reserveExecutionCapacity(
+      validReservationRequest({ reservationId: 'res-duplicate' }) as Parameters<
+        ReserveExecutionCapacityUseCase['reserveExecutionCapacity']
+      >[0],
+    );
+
+    expect(first.outcome).toBe('reserved');
+    expect(duplicate).toEqual({
+      outcome: 'refused',
+      reason: 'Attempt attempt-9 already holds an active capacity reservation',
+    });
+    // The first claim survives; nothing was superseded or rewritten.
+    expect([...journal.reservations.keys()]).toEqual(['res-9']);
+    expect(journal.heldFor('attempt-9')).toBe(true);
   });
 
   it('reports busy-worktree when another active attempt holds the same worktree', async () => {

@@ -377,16 +377,28 @@ describe('ExecutionJournalAdapter', () => {
     );
   });
 
-  it('supersedes an earlier reservation for the same attempt', async () => {
+  it('refuses to supersede an earlier held reservation for the same attempt', async () => {
     const adapter = new ExecutionJournalAdapter();
     await adapter.saveCapacityReservation(makeReservation({ id: 'res-1', attemptId: 'att-1' }));
-    await adapter.saveCapacityReservation(makeReservation({ id: 'res-2', attemptId: 'att-1' }));
+    await expect(
+      adapter.saveCapacityReservation(makeReservation({ id: 'res-2', attemptId: 'att-1' })),
+    ).rejects.toThrow(
+      'ExecutionJournalAdapter refuses to supersede held reservation res-1 of attempt att-1',
+    );
+    // The earlier claim survives untouched.
     expect((await adapter.listActiveReservations()).map((reservation) => reservation.id)).toEqual([
-      'res-2',
+      'res-1',
     ]);
     expect(await adapter.releaseCapacityReservation('att-1', '2026-10-15T12:00:00.000Z')).toBe(
       true,
     );
+    // Once released, a fresh reservation for the same attempt is appendable history.
+    await expect(
+      adapter.saveCapacityReservation(makeReservation({ id: 'res-2', attemptId: 'att-1', slotIndex: 1 })),
+    ).resolves.toBeUndefined();
+    expect((await adapter.listActiveReservations()).map((reservation) => reservation.id)).toEqual([
+      'res-2',
+    ]);
   });
 
   it('persists journal entries and reservations to stateDir', async () => {

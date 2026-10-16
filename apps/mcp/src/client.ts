@@ -14,8 +14,9 @@ const LOOPBACK_URL_PATTERN =
  * imported — apps/mcp is a client of `/v1`, not a second composition root).
  *
  * The file must be an absolute path to a regular file (not a symlink) with no
- * group/other permission bits; the token is the first line, trimmed and
- * non-empty. Returns null on any failure.
+ * group/other permission bits; the token is the first line, trimmed, at least
+ * 32 characters long and composed only of `A-Z a-z 0-9 _ -`. Returns null on
+ * any failure.
  */
 export function readApiTokenFromFile(filePath: string): string | null {
   if (
@@ -37,7 +38,7 @@ export function readApiTokenFromFile(filePath: string): string | null {
     }
     const content = readFileSync(filePath, "utf8");
     const firstLine = content.split(/\r?\n/)[0]?.trim() ?? "";
-    if (firstLine.length === 0) {
+    if (!/^[A-Za-z0-9_-]{32,}$/.test(firstLine)) {
       return null;
     }
     return firstLine;
@@ -84,6 +85,41 @@ function failure(
     : { ok: false, code, message, operationId };
 }
 
+/**
+ * Validate a `/v1` request path. It must be relative to the configured base
+ * URL: start with `/v1/`, contain no `//`, `..`, `@`, `\`, `#` or control
+ * characters, and resolve to the same origin with a `/v1/` pathname. Returns
+ * null when the path is refused.
+ */
+export function resolveApiPath(
+  path: string,
+  baseUrl: string,
+): string | null {
+  if (
+    typeof path !== "string" ||
+    !path.startsWith("/v1/") ||
+    path.includes("//") ||
+    path.includes("..") ||
+    path.includes("@") ||
+    path.includes("\\") ||
+    path.includes("#") ||
+    // eslint-disable-next-line no-control-regex
+    /[\u0000-\u001f\u007f]/.test(path)
+  ) {
+    return null;
+  }
+  let url: URL;
+  try {
+    url = new URL(path, baseUrl);
+  } catch {
+    return null;
+  }
+  if (url.origin !== new URL(baseUrl).origin || !url.pathname.startsWith("/v1/")) {
+    return null;
+  }
+  return path;
+}
+
 /** Validate a base URL; loopback with an explicit port only. */
 export function normalizeBaseUrl(baseUrl: string | undefined): string | null {
   if (typeof baseUrl !== "string") {
@@ -123,10 +159,17 @@ export function createFleetApiClient(config: {
         "FLEET_API_TOKEN_FILE is missing, unreadable or has unsafe permissions.",
       );
     }
+    const resolvedPath = resolveApiPath(path, baseUrl);
+    if (!resolvedPath) {
+      return failure(
+        "invalid-path",
+        "Path must be a /v1 route relative to the API base URL.",
+      );
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const response = await doFetch(`${baseUrl}${path}`, {
+      const response = await doFetch(new URL(resolvedPath, baseUrl).href, {
         method,
         headers: {
           Authorization: `Bearer ${token}`,
@@ -146,13 +189,41 @@ export function createFleetApiClient(config: {
           "API response exceeds the 1 MiB limit.",
         );
       }
-      const text = await response.text();
-      if (Buffer.byteLength(text, "utf8") > MAX_RESPONSE_BYTES) {
+      // Enforce the 1 MiB cap while reading: as soon as the accumulated body
+      // exceeds the cap, cancel the stream and abort the request.
+      const reader = response.body?.getReader();
+      let received: Uint8Array[] = [];
+      let totalBytes = 0;
+      let cancelled = false;
+      if (reader) {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+          totalBytes += value.byteLength;
+          if (totalBytes > MAX_RESPONSE_BYTES) {
+            cancelled = true;
+            void reader.cancel().catch(() => undefined);
+            controller.abort();
+            break;
+          }
+          received.push(value);
+        }
+      }
+      if (cancelled) {
         return failure(
           "response-too-large",
           "API response exceeds the 1 MiB limit.",
         );
       }
+      const decoder = new TextDecoder();
+      let text = received.reduce(
+        (acc, chunk) => acc + decoder.decode(chunk, { stream: true }),
+        "",
+      );
+      received = [];
+      text += decoder.decode();
       let parsed: unknown;
       try {
         parsed = JSON.parse(text);

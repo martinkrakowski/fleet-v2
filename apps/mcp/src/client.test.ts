@@ -1,4 +1,10 @@
-import { chmodSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -17,7 +23,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  // Temp token files stay inside /tmp; nothing to restore.
+  rmSync(dir, { recursive: true, force: true });
 });
 
 function writeTokenFile(mode: number): string {
@@ -91,6 +97,13 @@ describe("readApiTokenFromFile", () => {
   it("refuses a relative path and a missing file", () => {
     expect(readApiTokenFromFile("relative/token")).toBeNull();
     expect(readApiTokenFromFile(join(dir, "missing"))).toBeNull();
+  });
+
+  it("refuses a short token", () => {
+    const path = join(dir, "short-token");
+    writeFileSync(path, "abc\n");
+    chmodSync(path, 0o600);
+    expect(readApiTokenFromFile(path)).toBeNull();
   });
 });
 
@@ -208,5 +221,81 @@ describe("createFleetApiClient", () => {
     expect(result).toMatchObject({ ok: false, code: "transport-error" });
     expect(JSON.stringify(result)).not.toContain(TOKEN);
     expect(JSON.stringify(result)).not.toContain("127.0.0.1");
+  });
+
+  it("cancels an unbounded stream and reports response-too-large", async () => {
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      // Keeps producing 1 KiB chunks forever; the client must cancel the
+      // reader as soon as the accumulated total exceeds the cap.
+      pull(controller) {
+        controller.enqueue(new Uint8Array(1024).fill(120)); // "x"
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const fetchLike: FetchLike = async () =>
+      new Response(stream, { status: 200 });
+    const api = client({ tokenPath: writeTokenFile(0o600), fetch: fetchLike });
+    expect(await api.get("/v1/coordination")).toMatchObject({
+      ok: false,
+      code: "response-too-large",
+    });
+    expect(cancelled).toBe(true);
+  });
+
+  it("refuses invalid paths without fetching", async () => {
+    let calls = 0;
+    const fetchLike: FetchLike = async () => {
+      calls += 1;
+      return jsonResponse(200, OK_ENVELOPE);
+    };
+    const api = client({ tokenPath: writeTokenFile(0o600), fetch: fetchLike });
+    for (const path of [
+      "@evil.com/v1",
+      "//evil.com/v1/x",
+      "/v1/../x",
+      "/v1/x#y",
+      "v1/x",
+    ]) {
+      expect(await api.get(path)).toMatchObject({
+        ok: false,
+        code: "invalid-path",
+      });
+      expect(await api.post(path, { a: 1 })).toMatchObject({
+        ok: false,
+        code: "invalid-path",
+      });
+    }
+    expect(calls).toBe(0);
+  });
+
+  it("refuses base-URL bypass probes without fetching", async () => {
+    let calls = 0;
+    const fetchLike: FetchLike = async () => {
+      calls += 1;
+      return jsonResponse(200, OK_ENVELOPE);
+    };
+    for (const baseUrl of [
+      "http://user@127.0.0.1:3001",
+      "http://127.0.0.1:3001@evil.com",
+      "http://localhost.evil.com:3001",
+      "http://LOCALHOST:3001",
+      "http://localhost.:3001",
+      "http://[::ffff:127.0.0.1]:3001",
+      "http://127.0.0.1:3001?x",
+    ]) {
+      const api = client({
+        baseUrl,
+        tokenPath: writeTokenFile(0o600),
+        fetch: fetchLike,
+      });
+      expect(await api.get("/v1/coordination")).toMatchObject({
+        ok: false,
+        code: "not-configured",
+      });
+    }
+    expect(calls).toBe(0);
   });
 });

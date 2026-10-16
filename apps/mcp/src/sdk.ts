@@ -12,15 +12,25 @@ export interface McpServerLike {
   connect(transport: unknown): Promise<void>;
 }
 
+export type StdioTransportLike = object;
+
 export interface LoadedSdk {
   McpServer: new (info: { name: string; version: string }, options?: unknown) => McpServerLike;
+  StdioServerTransport: new () => StdioTransportLike;
 }
 
 let cached: Promise<LoadedSdk> | null = null;
 
 export function loadSdk(): Promise<LoadedSdk> {
-  cached ??= import("@modelcontextprotocol/sdk/server/mcp.js")
-    .then((mod) => ({ McpServer: mod.McpServer as LoadedSdk["McpServer"] }))
+  cached ??= Promise.all([
+    import("@modelcontextprotocol/sdk/server/mcp.js"),
+    import("@modelcontextprotocol/sdk/server/stdio.js"),
+  ])
+    .then(([mod, stdio]) => ({
+      McpServer: mod.McpServer as LoadedSdk["McpServer"],
+      StdioServerTransport:
+        stdio.StdioServerTransport as LoadedSdk["StdioServerTransport"],
+    }))
     .catch((cause: unknown) => {
       cached = null;
       throw new Error(

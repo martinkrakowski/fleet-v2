@@ -26,6 +26,7 @@ import type {
   DecisionTransportPort,
 } from '../../ports/out/DecisionTransportPort.out-port.js';
 import { OwnerQuestionRevisionConflictError } from '../../ports/out/OwnerQuestionRepositoryPort.out-port.js';
+import { OwnerQuestionRepositoryAdapter } from '../../../infrastructure/adapters/OwnerQuestionRepositoryAdapter.adapter.js';
 import type {
   OwnerQuestionListQuery,
   OwnerQuestionRepositoryPort,
@@ -81,6 +82,13 @@ class FakeOwnerQuestionRepo implements OwnerQuestionRepositoryPort {
       const failure = this.failNextSaveWith;
       this.failNextSaveWith = null;
       throw failure;
+    }
+    // Enforce the same revision arithmetic as the real adapter: the saved
+    // record must arrive as exactly expectedRevision + 1.
+    if (record.revision !== expectedRevision + 1) {
+      throw new Error(
+        `fake repo requires record revision ${expectedRevision + 1} with expected revision ${expectedRevision}, got ${record.revision}`,
+      );
     }
     this.records.set(record.questionId, record);
   }
@@ -306,7 +314,7 @@ describe('AskOwnerQuestionUseCase', () => {
     );
     expect(result).toEqual({
       outcome: 'refused',
-      reason: expect.stringContaining('must reference an existing coordination request'),
+      reason: 'the linked request was not found or is not an action-decision or policy-proposal',
     });
     expect(repo.saveCalls).toBe(0);
   });
@@ -383,6 +391,8 @@ describe('AnswerOwnerQuestionUseCase', () => {
     expect(result.question.answer?.optionId).toBe('b');
     expect(result.question.answer?.answeredAt).toBe(NOW_ISO);
     expect(result.question.answer?.questionRevision).toBe(1);
+    expect(result.question.revision).toBe(2);
+    expect(repo.records.get('q-two-way')?.revision).toBe(2);
     expect(repo.savedWithExpectedRevision).toEqual([1]);
   });
 
@@ -448,6 +458,13 @@ describe('AnswerOwnerQuestionUseCase', () => {
     expect(result.outcome).toBe('refused');
   });
 
+  it('refuses an answer on an expired question', async () => {
+    const { repo, useCase } = setup(twoWayRecord({ state: 'expired' }));
+    const result = await useCase.answerOwnerQuestion(answerRequest());
+    expect(result.outcome).toBe('refused');
+    expect(repo.saveCalls).toBe(0);
+  });
+
   it('refuses an answeredVia reserved for signed decisions', async () => {
     const { useCase } = setup(twoWayRecord());
     const result = await useCase.answerOwnerQuestion(
@@ -480,6 +497,7 @@ describe('ExpireOwnerQuestionsUseCase', () => {
     expect(result.unchanged).toHaveLength(0);
     const stored = repo.records.get('q-old');
     expect(stored?.state).toBe('expired');
+    expect(stored?.revision).toBe(2);
     expect(OwnerQuestion.fromRecord(stored!).isBlocking()).toBe(true);
     expect(repo.savedWithExpectedRevision).toEqual([1]);
   });
@@ -514,6 +532,18 @@ describe('ExpireOwnerQuestionsUseCase', () => {
     const result = await useCase.expireOwnerQuestions();
     expect(result.expired).toHaveLength(0);
     expect(result.unchanged).toHaveLength(1);
+  });
+
+  it('skips open one-way questions, leaving them for SyncOneWay', async () => {
+    const { repo, useCase } = setup([
+      oneWayRecord({ questionId: 'q-one-old', expiresAt: '2026-10-16T11:00:00.000Z' }),
+      twoWayRecord({ questionId: 'q-two-old', expiresAt: '2026-10-16T11:00:00.000Z' }),
+    ]);
+    const result = await useCase.expireOwnerQuestions();
+    expect(result.expired.map((question) => question.questionId)).toEqual(['q-two-old']);
+    expect(result.unchanged.map((question) => question.questionId)).toEqual(['q-one-old']);
+    expect(repo.records.get('q-one-old')?.state).toBe('open');
+    expect(repo.records.get('q-two-old')?.state).toBe('expired');
   });
 });
 
@@ -553,6 +583,8 @@ describe('AcknowledgeOwnerAnswerUseCase', () => {
     if (result.outcome !== 'acknowledged') return;
     expect(result.question.state).toBe('acknowledged');
     expect(result.acknowledgement).toEqual({ by: 'the-owner', at: NOW_ISO });
+    expect(result.question.revision).toBe(2);
+    expect(repo.records.get('q-two-way')?.revision).toBe(2);
     expect(repo.savedWithExpectedRevision).toEqual([1]);
   });
 
@@ -595,6 +627,31 @@ describe('AcknowledgeOwnerAnswerUseCase', () => {
     expect(result.outcome).toBe('refused');
     expect(repo.saveCalls).toBe(0);
   });
+
+  it('refuses with the conflict reason when the save loses a revision race', async () => {
+    const answered = OwnerQuestion.fromRecord(twoWayRecord())
+      .transitionTo('answered', {
+        answer: {
+          shape: 'accept',
+          optionId: 'a',
+          text: null,
+          reason: null,
+          questionRevision: 1,
+          answeredVia: 'web',
+          answeredAt: '2026-10-16T11:00:00.000Z',
+          sessionId: null,
+        },
+      })
+      .toRecord();
+    const { repo, useCase } = setup(answered);
+    repo.failNextSaveWith = new OwnerQuestionRevisionConflictError('q-two-way', 2, 'lost race');
+    const result = await useCase.acknowledgeOwnerAnswer(ackRequest());
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'another writer moved this question first; read it and acknowledge again',
+    });
+    expect(repo.records.get('q-two-way')?.state).toBe('answered');
+  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -627,6 +684,7 @@ describe('SyncOneWayOwnerQuestionsUseCase', () => {
     expect(result.rejected).toHaveLength(0);
     const stored = repo.records.get('q-one-way');
     expect(stored?.state).toBe('answered');
+    expect(stored?.revision).toBe(2);
     expect(stored?.answer).toMatchObject({
       shape: 'accept',
       optionId: 'a',
@@ -752,5 +810,145 @@ describe('ListOwnerQuestionsUseCase and ReadOwnerQuestionUseCase', () => {
     expect(found).toEqual({ outcome: 'found', question: twoWayRecord() });
     const missing = await useCase.readOwnerQuestion({ questionId: 'q-none' });
     expect(missing).toEqual({ outcome: 'not-found', questionId: 'q-none' });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The real in-memory OwnerQuestionRepositoryAdapter (no stateDir)
+ * ------------------------------------------------------------------ */
+
+describe('owner-question use cases through the real OwnerQuestionRepositoryAdapter', () => {
+  /** The real adapter with no stateDir: a pure in-process store that
+   * enforces stored === expected AND record.revision === expected + 1. */
+  function adapter(): OwnerQuestionRepositoryAdapter {
+    return new OwnerQuestionRepositoryAdapter();
+  }
+
+  it('Ask stores a revision-1 question, and List and Read see it', async () => {
+    const repo = adapter();
+    const ask = new AskOwnerQuestionUseCase({
+      ownerQuestionRepo: repo,
+      requestRepo: new NeverWritingRequestRepo(new Map()),
+      clock: clock(),
+    });
+    const asked = await ask.askOwnerQuestion(askRequest({ questionId: 'q-real' }));
+    expect(asked.outcome).toBe('asked');
+    const stored = await repo.get('q-real');
+    expect(stored?.revision).toBe(1);
+    const listed = await new ListOwnerQuestionsUseCase({ ownerQuestionRepo: repo }).listOwnerQuestions({ state: 'open' });
+    expect(listed.questions.map((question) => question.questionId)).toEqual(['q-real']);
+    const read = await new ReadOwnerQuestionUseCase({ ownerQuestionRepo: repo }).readOwnerQuestion({ questionId: 'q-real' });
+    expect(read.outcome).toBe('found');
+  });
+
+  it('Ask refuses a one-way question whose linked request is missing, without echoing the id', async () => {
+    const ask = new AskOwnerQuestionUseCase({
+      ownerQuestionRepo: adapter(),
+      requestRepo: new NeverWritingRequestRepo(new Map()),
+      clock: clock(),
+    });
+    const result = await ask.askOwnerQuestion(
+      askRequest({ doorKind: 'one-way', linkedRequestId: 'request-9' }),
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'the linked request was not found or is not an action-decision or policy-proposal',
+    });
+  });
+
+  it('Answer bumps the stored revision to 2 and keeps the answered revision on the answer', async () => {
+    const repo = adapter();
+    await repo.save(twoWayRecord(), 0);
+    const useCase = new AnswerOwnerQuestionUseCase({ ownerQuestionRepo: repo, clock: clock() });
+    const result = await useCase.answerOwnerQuestion(answerRequest({ shape: 'answer', optionId: 'b' }));
+    expect(result.outcome).toBe('answered');
+    if (result.outcome !== 'answered') return;
+    expect(result.replayed).toBe(false);
+    expect(result.question.revision).toBe(2);
+    expect(result.question.answer?.questionRevision).toBe(1);
+    const stored = await repo.get('q-two-way');
+    expect(stored?.revision).toBe(2);
+    expect(stored?.state).toBe('answered');
+  });
+
+  it('Answer refuses a stale revision with the server-value reason', async () => {
+    const repo = adapter();
+    await repo.save(twoWayRecord(), 0);
+    const useCase = new AnswerOwnerQuestionUseCase({ ownerQuestionRepo: repo, clock: clock() });
+    const result = await useCase.answerOwnerQuestion(answerRequest({ questionRevision: 2 }));
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'the answer names a stale revision; current revision is 1',
+    });
+  });
+
+  it('Answer refuses an expired question', async () => {
+    const repo = adapter();
+    await repo.save(twoWayRecord({ state: 'expired' }), 0);
+    const useCase = new AnswerOwnerQuestionUseCase({ ownerQuestionRepo: repo, clock: clock() });
+    const result = await useCase.answerOwnerQuestion(answerRequest());
+    expect(result.outcome).toBe('refused');
+    const stored = await repo.get('q-two-way');
+    expect(stored?.state).toBe('expired');
+    expect(stored?.answer).toBeNull();
+  });
+
+  it('Acknowledge bumps the stored revision to 3 after Answer bumped it to 2', async () => {
+    const repo = adapter();
+    await repo.save(twoWayRecord(), 0);
+    const answered = await new AnswerOwnerQuestionUseCase({ ownerQuestionRepo: repo, clock: clock() })
+      .answerOwnerQuestion(answerRequest());
+    expect(answered.outcome).toBe('answered');
+    const result = await new AcknowledgeOwnerAnswerUseCase({ ownerQuestionRepo: repo, clock: clock() })
+      .acknowledgeOwnerAnswer(ackRequest({ by: 'the-owner' }));
+    expect(result.outcome).toBe('acknowledged');
+    const stored = await repo.get('q-two-way');
+    expect(stored?.revision).toBe(3);
+    expect(stored?.state).toBe('acknowledged');
+    expect(stored?.acknowledgement).toEqual({ by: 'the-owner', at: NOW_ISO });
+  });
+
+  it('Expire expires an overdue two-way question and skips a one-way question', async () => {
+    const repo = adapter();
+    await repo.save(
+      twoWayRecord({ questionId: 'q-exp', expiresAt: '2026-10-16T11:00:00.000Z' }),
+      0,
+    );
+    await repo.save(
+      oneWayRecord({ questionId: 'q-stay', expiresAt: '2026-10-16T11:00:00.000Z' }),
+      0,
+    );
+    const result = await new ExpireOwnerQuestionsUseCase({ ownerQuestionRepo: repo, clock: clock() })
+      .expireOwnerQuestions();
+    expect(result.expired.map((question) => question.questionId)).toEqual(['q-exp']);
+    expect(result.unchanged.map((question) => question.questionId)).toEqual(['q-stay']);
+    expect((await repo.get('q-exp'))?.state).toBe('expired');
+    expect((await repo.get('q-exp'))?.revision).toBe(2);
+    expect((await repo.get('q-stay'))?.state).toBe('open');
+    expect((await repo.get('q-stay'))?.revision).toBe(1);
+  });
+
+  it('SyncOneWay moves an approved one-way question to answered at revision 2', async () => {
+    const repo = adapter();
+    await repo.save(oneWayRecord(), 0);
+    const useCase = new SyncOneWayOwnerQuestionsUseCase({
+      ownerQuestionRepo: repo,
+      requestRepo: new NeverWritingRequestRepo(new Map([
+        ['request-9', requestRecord('request-9')],
+      ])),
+      decisionTransport: new StubDecisionTransport({
+        state: 'approved',
+        decisionRevision: 'd-1',
+        grantId: null,
+        signature: null,
+      }),
+      clock: clock(),
+    });
+    const result = await useCase.syncOneWayOwnerQuestions();
+    expect(result.answered).toHaveLength(1);
+    const stored = await repo.get('q-one-way');
+    expect(stored?.revision).toBe(2);
+    expect(stored?.state).toBe('answered');
+    expect(stored?.answer).toMatchObject({ answeredVia: 'signed-decision', questionRevision: 1 });
   });
 });

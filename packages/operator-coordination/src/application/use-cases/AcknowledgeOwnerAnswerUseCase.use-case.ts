@@ -9,6 +9,7 @@
  */
 
 import { OwnerQuestion } from '../../domain/entities/OwnerQuestion.js';
+import type { OwnerQuestionRecord } from '../../domain/owner-question-records.js';
 import type { OwnerQuestionClock } from '../ports/in/AskOwnerQuestionPort.in-port.js';
 import type {
   AcknowledgeOwnerAnswerPort,
@@ -54,7 +55,7 @@ export class AcknowledgeOwnerAnswerUseCase implements AcknowledgeOwnerAnswerPort
 
     const stored = await this.deps.ownerQuestionRepo.get(questionId);
     if (stored === null) {
-      return { outcome: 'refused', reason: `no owner question is recorded for ${questionId}` };
+      return { outcome: 'refused', reason: 'no owner question is recorded for that id' };
     }
     if (stored.state !== 'answered' && stored.state !== 'rejected') {
       return {
@@ -63,18 +64,19 @@ export class AcknowledgeOwnerAnswerUseCase implements AcknowledgeOwnerAnswerPort
       };
     }
 
-    let acknowledged: OwnerQuestion;
+    let acknowledged: OwnerQuestionRecord;
     try {
-      const entity = OwnerQuestion.fromRecord(stored).transitionTo('acknowledged', {
+      const transitioned = OwnerQuestion.fromRecord(stored).transitionTo('acknowledged', {
         acknowledgement: { by, at: this.deps.clock.nowIso() },
       });
-      acknowledged = entity;
+      // The repository requires record.revision === expectedRevision + 1.
+      acknowledged = { ...transitioned.toRecord(), revision: stored.revision + 1 };
     } catch (error) {
       return { outcome: 'refused', reason: error instanceof Error ? error.message : String(error) };
     }
 
     try {
-      await this.deps.ownerQuestionRepo.save(acknowledged.toRecord(), stored.revision);
+      await this.deps.ownerQuestionRepo.save(acknowledged, stored.revision);
     } catch (error) {
       if (error instanceof OwnerQuestionRevisionConflictError) {
         return {
@@ -84,7 +86,7 @@ export class AcknowledgeOwnerAnswerUseCase implements AcknowledgeOwnerAnswerPort
       }
       throw error;
     }
-    const question = acknowledged.toRecord();
+    const question = acknowledged;
     const acknowledgement = question.acknowledgement;
     if (acknowledgement === null) {
       return { outcome: 'refused', reason: 'the acknowledgement could not be recorded' };

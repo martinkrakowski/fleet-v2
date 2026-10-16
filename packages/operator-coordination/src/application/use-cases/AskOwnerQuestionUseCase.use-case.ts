@@ -83,16 +83,11 @@ export class AskOwnerQuestionUseCase implements AskOwnerQuestionPort {
         return { outcome: 'refused', reason: 'a one-way question requires a linkedRequestId' };
       }
       const linked = await this.deps.requestRepo.findRequestById(linkedRequestId);
-      if (linked === null) {
+      if (linked === null || !LINKABLE_KINDS.includes(linked.kind)) {
+        // Never echo the caller-supplied id or kind in the reason.
         return {
           outcome: 'refused',
-          reason: `a one-way question must reference an existing coordination request, and none is recorded for ${linkedRequestId}`,
-        };
-      }
-      if (!LINKABLE_KINDS.includes(linked.kind)) {
-        return {
-          outcome: 'refused',
-          reason: 'a one-way question must reference an action-decision or policy-proposal request',
+          reason: 'the linked request was not found or is not an action-decision or policy-proposal',
         };
       }
     }

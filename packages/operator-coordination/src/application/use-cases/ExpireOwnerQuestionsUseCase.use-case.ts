@@ -1,7 +1,8 @@
 /**
  * ExpireOwnerQuestionsUseCase implements ExpireOwnerQuestionsPort. It moves
- * every open owner question whose expiry has passed to the expired state,
- * judged by the injected clock, never by a request body.
+ * every open two-way owner question whose expiry has passed to the expired
+ * state, judged by the injected clock, never by a request body. A one-way
+ * question stays open until SyncOneWay sees a signed owner decision.
  *
  * Expired questions stay blocking: their work remains held until the question
  * is re-asked. A question whose save loses a revision race is left for the
@@ -40,6 +41,12 @@ export class ExpireOwnerQuestionsUseCase implements ExpireOwnerQuestionsPort {
     const expired: OwnerQuestionRecord[] = [];
     const unchanged: OwnerQuestionRecord[] = [];
     for (const record of open) {
+      // A one-way question stays open until SyncOneWay sees a signed owner
+      // decision; only two-way questions expire.
+      if (record.doorKind !== 'two-way') {
+        unchanged.push(record);
+        continue;
+      }
       if (record.expiresAt === null) {
         unchanged.push(record);
         continue;
@@ -50,9 +57,11 @@ export class ExpireOwnerQuestionsUseCase implements ExpireOwnerQuestionsPort {
         continue;
       }
       try {
-        const entity = OwnerQuestion.fromRecord(record).transitionTo('expired');
-        await this.deps.ownerQuestionRepo.save(entity.toRecord(), record.revision);
-        expired.push(entity.toRecord());
+        const transitioned = OwnerQuestion.fromRecord(record).transitionTo('expired');
+        // The repository requires record.revision === expectedRevision + 1.
+        const expiredRecord = { ...transitioned.toRecord(), revision: record.revision + 1 };
+        await this.deps.ownerQuestionRepo.save(expiredRecord, record.revision);
+        expired.push(expiredRecord);
       } catch (error) {
         // A lost revision race is another writer moving first; the question
         // stays open for the next run instead of being forced.

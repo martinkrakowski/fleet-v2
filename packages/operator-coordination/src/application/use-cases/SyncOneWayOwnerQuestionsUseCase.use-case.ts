@@ -87,7 +87,7 @@ export class SyncOneWayOwnerQuestionsUseCase implements SyncOneWayOwnerQuestions
 
       try {
         const current = OwnerQuestion.fromRecord(record);
-        const synced = current.transitionTo(state === 'approved' ? 'answered' : 'rejected', {
+        const transitioned = current.transitionTo(state === 'approved' ? 'answered' : 'rejected', {
           answer: {
             shape: state === 'approved' ? 'accept' : 'reject',
             optionId:
@@ -100,11 +100,13 @@ export class SyncOneWayOwnerQuestionsUseCase implements SyncOneWayOwnerQuestions
             sessionId: null,
           },
         });
-        await this.deps.ownerQuestionRepo.save(synced.toRecord(), record.revision);
+        // The repository requires record.revision === expectedRevision + 1.
+        const syncedRecord = { ...transitioned.toRecord(), revision: record.revision + 1 };
+        await this.deps.ownerQuestionRepo.save(syncedRecord, record.revision);
         if (state === 'approved') {
-          answered.push(synced.toRecord());
+          answered.push(syncedRecord);
         } else {
-          rejected.push(synced.toRecord());
+          rejected.push(syncedRecord);
         }
       } catch (error) {
         // A lost revision race is another writer moving first; the question

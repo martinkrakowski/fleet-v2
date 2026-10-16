@@ -1,7 +1,8 @@
 /**
  * AnswerOwnerQuestionUseCase implements AnswerOwnerQuestionPort. It records the
  * owner's answer on a two-way question at its current revision and saves with
- * the expected revision the use case last read.
+ * the expected revision the use case last read, bumping the stored record to
+ * that revision + 1.
  *
  * A one-way question is refused: it is answered only by a signed owner
  * decision, never through this port. An answer whose revision is not the
@@ -11,7 +12,7 @@
  * request, and the answered-at moment comes from the injected clock.
  */
 
-import type { OwnerQuestionAnswerRecord } from '../../domain/owner-question-records.js';
+import type { OwnerQuestionAnswerRecord, OwnerQuestionRecord } from '../../domain/owner-question-records.js';
 import { OwnerQuestion } from '../../domain/entities/OwnerQuestion.js';
 import type { OwnerQuestionClock } from '../ports/in/AskOwnerQuestionPort.in-port.js';
 import type {
@@ -90,7 +91,7 @@ export class AnswerOwnerQuestionUseCase implements AnswerOwnerQuestionPort {
 
     const stored = await this.deps.ownerQuestionRepo.get(questionId);
     if (stored === null) {
-      return { outcome: 'refused', reason: `no owner question is recorded for ${questionId}` };
+      return { outcome: 'refused', reason: 'no owner question is recorded for that id' };
     }
 
     if (stored.doorKind === 'one-way') {
@@ -122,11 +123,11 @@ export class AnswerOwnerQuestionUseCase implements AnswerOwnerQuestionPort {
     if (request.questionRevision !== stored.revision) {
       return {
         outcome: 'refused',
-        reason: `the answer names revision ${request.questionRevision} but the question's current revision is ${stored.revision}`,
+        reason: `the answer names a stale revision; current revision is ${stored.revision}`,
       };
     }
 
-    let answered: OwnerQuestion;
+    let answered: OwnerQuestionRecord;
     try {
       const current = OwnerQuestion.fromRecord(stored);
       const answer: OwnerQuestionAnswerRecord = {
@@ -134,20 +135,25 @@ export class AnswerOwnerQuestionUseCase implements AnswerOwnerQuestionPort {
         optionId: request.optionId ?? null,
         text: request.text ?? null,
         reason: request.reason ?? null,
+        // The answer carries the revision the caller answered, never the
+        // bumped revision the save produces.
         questionRevision: request.questionRevision,
         answeredVia: request.answeredVia,
         answeredAt: this.deps.clock.nowIso(),
         sessionId: request.sessionId ?? null,
       };
-      answered = current.transitionTo(request.shape === 'reject' ? 'rejected' : 'answered', {
-        answer,
-      });
+      const transitioned = current.transitionTo(
+        request.shape === 'reject' ? 'rejected' : 'answered',
+        { answer },
+      );
+      // The repository requires record.revision === expectedRevision + 1.
+      answered = { ...transitioned.toRecord(), revision: stored.revision + 1 };
     } catch (error) {
       return { outcome: 'refused', reason: error instanceof Error ? error.message : String(error) };
     }
 
     try {
-      await this.deps.ownerQuestionRepo.save(answered.toRecord(), stored.revision);
+      await this.deps.ownerQuestionRepo.save(answered, stored.revision);
     } catch (error) {
       if (error instanceof OwnerQuestionRevisionConflictError) {
         return {
@@ -157,6 +163,6 @@ export class AnswerOwnerQuestionUseCase implements AnswerOwnerQuestionPort {
       }
       throw error;
     }
-    return { outcome: 'answered', question: answered.toRecord(), replayed: false };
+    return { outcome: 'answered', question: answered, replayed: false };
   }
 }

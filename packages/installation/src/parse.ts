@@ -48,7 +48,12 @@ const WAVES_KEYS: readonly string[] = ['baseUrl', 'tokenFile', 'caFile', 'ownerP
 const SHELF_KEYS: readonly string[] = ['baseUrl', 'keyFile'];
 
 const PROCEDURE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
-const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+const FORBIDDEN_PROCEDURE_NAMES: ReadonlySet<string> = new Set([
+  'constructor',
+  'prototype',
+  '__proto__',
+  'hasownproperty',
+]);
 
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -61,12 +66,13 @@ function isNonEmptyString(value: unknown): value is string {
 function collectUnknownKeys(
   record: JsonObject,
   allowedKeys: readonly string[],
-  prefix: string,
+  parentPath: string,
   errors: string[],
 ): void {
+  const path = parentPath === '' ? 'installation' : parentPath;
   for (const key of Object.keys(record)) {
     if (!allowedKeys.includes(key)) {
-      errors.push(prefix === '' ? `${key}: unknown key` : `${prefix}.${key}: unknown key`);
+      errors.push(`${path}: unknown key`);
     }
   }
 }
@@ -120,7 +126,8 @@ function readOptionalPort(
 
 function isHttpsUrl(value: string): boolean {
   try {
-    return new URL(value).protocol === 'https:';
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:' && parsed.username === '' && parsed.password === '';
   } catch {
     return false;
   }
@@ -186,11 +193,12 @@ function readOptionalAbsolutePath(
   return value.trim();
 }
 
-function isBase64Of32Bytes(value: string): boolean {
-  if (value.length === 0 || value.length % 4 !== 0 || !BASE64_PATTERN.test(value)) {
+function isCanonicalBase64Of32Bytes(value: string): boolean {
+  if (typeof value !== 'string' || value.length === 0) {
     return false;
   }
-  return Buffer.from(value, 'base64').length === 32;
+  const buffer = Buffer.from(value, 'base64');
+  return buffer.length === 32 && buffer.toString('base64') === value;
 }
 
 function readOptionalOwnerPublicKey(
@@ -203,11 +211,11 @@ function readOptionalOwnerPublicKey(
     return undefined;
   }
   const value = record[key];
-  if (typeof value !== 'string' || !isBase64Of32Bytes(value.trim())) {
+  if (typeof value !== 'string' || !isCanonicalBase64Of32Bytes(value)) {
     errors.push(`${fieldPath}: must be base64 of exactly 32 bytes`);
     return undefined;
   }
-  return value.trim();
+  return value;
 }
 
 function readOptionalStringArray(
@@ -340,13 +348,13 @@ function parseProcedures(
   record: JsonObject,
   errors: string[],
 ): Readonly<Record<string, VerificationProcedure>> {
-  const procedures: Record<string, VerificationProcedure> = {};
+  const procedures: Record<string, VerificationProcedure> = Object.create(null);
   for (const name of Object.keys(record)) {
-    const procedurePath = `verification.procedures.${name}`;
-    if (!PROCEDURE_NAME_PATTERN.test(name)) {
-      errors.push(`${procedurePath}: procedure name must match ^[a-z0-9][a-z0-9-]*$`);
+    if (!PROCEDURE_NAME_PATTERN.test(name) || FORBIDDEN_PROCEDURE_NAMES.has(name.toLowerCase())) {
+      errors.push('verification.procedures: invalid procedure name');
       continue;
     }
+    const procedurePath = `verification.procedures.${name}`;
     const entry = record[name];
     if (!isJsonObject(entry)) {
       errors.push(`${procedurePath}: must be an object`);
@@ -490,7 +498,7 @@ export function parseInstallation(value: unknown): ParseResult {
     return { ok: false, errors: ['installation: must be an object'] };
   }
   const errors: string[] = [];
-  collectUnknownKeys(value, ROOT_KEYS, '', errors);
+  collectUnknownKeys(value, ROOT_KEYS, 'installation', errors);
 
   if (!Object.hasOwn(value, 'schemaVersion')) {
     errors.push('schemaVersion: required');

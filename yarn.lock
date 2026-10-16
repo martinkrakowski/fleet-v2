@@ -333,6 +333,7 @@ __metadata:
     "@eslint/js": "npm:^9.0.0"
     "@fleet/brief-knowledge": "workspace:*"
     "@fleet/evidence-and-acceptance": "workspace:*"
+    "@fleet/installation": "workspace:*"
     "@fleet/operator-coordination": "workspace:*"
     "@fleet/work-execution": "workspace:*"
     "@types/node": "npm:^22.0.0"
@@ -364,6 +365,7 @@ __metadata:
     "@eslint/js": "npm:^9.0.0"
     "@fleet/brief-knowledge": "workspace:*"
     "@fleet/evidence-and-acceptance": "workspace:*"
+    "@fleet/installation": "workspace:*"
     "@fleet/operator-coordination": "workspace:*"
     "@fleet/work-execution": "workspace:*"
     eslint: "npm:^9.0.0"
@@ -386,7 +388,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@fleet/installation@workspace:packages/installation":
+"@fleet/installation@workspace:*, @fleet/installation@workspace:packages/installation":
   version: 0.0.0-use.local
   resolution: "@fleet/installation@workspace:packages/installation"
   dependencies:

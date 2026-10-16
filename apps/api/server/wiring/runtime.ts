@@ -8,6 +8,8 @@ import { dirname, join } from "node:path";
 
 import type { InspectWorkOrderUseCase } from "@fleet/work-execution/use-cases";
 
+import type { FleetInstallation } from "@fleet/installation";
+
 import { configureEvidenceUseCases, createConfiguredEvidenceUseCases } from "./evidence/composition";
 import {
   configureKnowledgeComposition,
@@ -27,6 +29,7 @@ export interface FleetApiRuntimeOptions {
   /** Shared persistence directory for every context's file-backed adapters. */
   readonly stateDir?: string;
   readonly ownerPublicKey?: string;
+  readonly installation?: FleetInstallation;
 }
 
 /**
@@ -157,6 +160,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
 
   const stateDir = options?.stateDir;
   const ownerPublicKey = options?.ownerPublicKey;
+  const installation = options?.installation;
   const operator = createConfiguredOperatorComposition({ stateDir, ownerPublicKey });
   const knowledge = createConfiguredKnowledgeComposition({ stateDir });
   const evidence = createConfiguredEvidenceUseCases({ stateDir });
@@ -343,7 +347,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
     acceptedReceiptByHead,
   };
 
-  const work = createConfiguredWorkComposition({ stateDir }, crossContext);
+  const work = createConfiguredWorkComposition({ stateDir, installation }, crossContext);
   workLookup.inspectWorkOrder = work.inspectWorkOrder;
 
   configureOperatorComposition(operator);

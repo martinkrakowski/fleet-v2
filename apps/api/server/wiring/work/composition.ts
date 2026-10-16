@@ -17,6 +17,7 @@ import {
   type ExecutionObservationDelegate,
   type ForgeActionDelegate,
 } from "@fleet/work-execution";
+import type { FleetInstallation } from "@fleet/installation";
 import {
   CollectAttemptArtifactsUseCase,
   DispatchAttemptUseCase,
@@ -47,13 +48,69 @@ export interface WorkComposition {
 
 export interface WorkCompositionOptions {
   readonly stateDir?: string;
+  readonly installation?: FleetInstallation;
   /** Live runner subprocess configuration; environment is the fallback. */
   readonly runnerAgent?: string;
   readonly runnerModel?: string;
   readonly runnerVariant?: string;
   readonly runnerRemotePort?: number;
+  readonly ocmRunBin?: string;
+  readonly runnerRemoteHost?: string;
   /** SSH host alias holding the worktree when it is not on this host. */
   readonly worktreeSshHost?: string;
+}
+
+export interface ResolvedWorkRunnerSettings {
+  readonly worktreeSshHost?: string;
+  readonly runnerAgent?: string;
+  readonly runnerModel?: string;
+  readonly runnerVariant?: string;
+  readonly runnerRemotePort?: number;
+  readonly ocmRunBin?: string;
+  readonly runnerRemoteHost?: string;
+}
+
+/**
+ * Resolves runner and worktree host configuration.
+ * Resolution precedence: options.<x> ?? installation.<x> ?? <env read>.
+ */
+export function resolveWorkRunnerSettings(
+  options?: WorkCompositionOptions,
+  installation?: FleetInstallation,
+  env: Record<string, string | undefined> = process.env,
+): ResolvedWorkRunnerSettings {
+  const inst = options?.installation ?? installation;
+  const parsedPort = env.OCM_REMOTE_PORT ? Number(env.OCM_REMOTE_PORT) : Number.NaN;
+  return {
+    worktreeSshHost:
+      options?.worktreeSshHost ??
+      inst?.worktree?.sshHost ??
+      (env.FLEET_WORKTREE_SSH_HOST?.trim() || undefined),
+    runnerAgent:
+      options?.runnerAgent ??
+      inst?.runner?.agent ??
+      (env.FLEET_RUNNER_AGENT?.trim() || undefined),
+    runnerModel:
+      options?.runnerModel ??
+      inst?.runner?.model ??
+      (env.FLEET_RUNNER_MODEL?.trim() || undefined),
+    runnerVariant:
+      options?.runnerVariant ??
+      inst?.runner?.variant ??
+      (env.FLEET_RUNNER_VARIANT?.trim() || undefined),
+    runnerRemotePort:
+      options?.runnerRemotePort ??
+      inst?.runner?.remotePort ??
+      (Number.isFinite(parsedPort) ? parsedPort : undefined),
+    ocmRunBin:
+      options?.ocmRunBin ??
+      inst?.runner?.ocmRunBin ??
+      (env.FLEET_OCM_RUN_BIN?.trim() || undefined),
+    runnerRemoteHost:
+      options?.runnerRemoteHost ??
+      inst?.runner?.host ??
+      (env.OCM_HOST?.trim() || undefined),
+  };
 }
 
 /**
@@ -99,13 +156,13 @@ export function workComposition(): WorkComposition {
 }
 
 function isWorkComposition(
-  value: WorkComposition | { stateDir?: string },
+  value: WorkComposition | WorkCompositionOptions,
 ): value is WorkComposition {
   return typeof value === "object" && "registerWorkOrder" in value;
 }
 
 export function configureWorkComposition(
-  custom: WorkComposition | { stateDir?: string } | null,
+  custom: WorkComposition | WorkCompositionOptions | null,
 ): void {
   if (custom === null) {
     configured = null;
@@ -124,17 +181,15 @@ export function createConfiguredWorkComposition(
 ): WorkComposition {
   const stateDir = options?.stateDir;
 
-  // Explicit options win; the environment is the operator's installation
-  // configuration, and a blank value is treated as absent.
-  const worktreeSshHost =
-    options?.worktreeSshHost ?? (process.env.FLEET_WORKTREE_SSH_HOST?.trim() || undefined);
-  const runnerAgent = options?.runnerAgent ?? (process.env.FLEET_RUNNER_AGENT?.trim() || undefined);
-  const runnerModel = options?.runnerModel ?? (process.env.FLEET_RUNNER_MODEL?.trim() || undefined);
-  const runnerVariant =
-    options?.runnerVariant ?? (process.env.FLEET_RUNNER_VARIANT?.trim() || undefined);
-  const parsedPort = process.env.OCM_REMOTE_PORT ? Number(process.env.OCM_REMOTE_PORT) : Number.NaN;
-  const runnerRemotePort =
-    options?.runnerRemotePort ?? (Number.isFinite(parsedPort) ? parsedPort : undefined);
+  const {
+    worktreeSshHost,
+    runnerAgent,
+    runnerModel,
+    runnerVariant,
+    runnerRemotePort,
+    ocmRunBin,
+    runnerRemoteHost,
+  } = resolveWorkRunnerSettings(options);
 
   const workOrderRepo = new WorkOrderRepositoryAdapter({ stateDir });
   const attemptRepo = new AttemptRepositoryAdapter({ stateDir });
@@ -145,10 +200,12 @@ export function createConfiguredWorkComposition(
   // The worktree locator is resolved from the recorded attempt so a request
   // arriving in a later process addresses the same directory as its dispatch.
   const runner = new ExecutionRunnerAdapter({
+    ocmRunBin,
     agent: runnerAgent,
     model: runnerModel,
     variant: runnerVariant,
     remotePort: runnerRemotePort,
+    remoteHost: runnerRemoteHost,
     resolveWorktreePath: async (attemptId) =>
       (await attemptRepo.findAttemptById(attemptId))?.worktreePath ?? null,
   });

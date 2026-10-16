@@ -52,7 +52,12 @@ function resolveInstallationFile(file: string | undefined, env: EnvRecord, cwd: 
   return join(cwd, 'installation', 'fleet.json');
 }
 
+const REMOTE_PORT_PATTERN = /^\d+$/;
+
 function parseRemotePort(value: string): number | undefined {
+  if (!REMOTE_PORT_PATTERN.test(value)) {
+    return undefined;
+  }
   const port = Number(value);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     return undefined;

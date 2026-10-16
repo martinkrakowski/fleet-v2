@@ -96,10 +96,13 @@ import {
   ResolveActionAuthorizationUseCase,
   SendFleetRelayUseCase,
 } from '@fleet/operator-coordination';
+import type { FleetInstallation } from '@fleet/installation';
 
 export interface FleetCliRuntimeOptions {
   /** Directory for file-backed state; every store is in-memory when omitted. */
   readonly stateDir?: string;
+  /** Parsed installation configuration. */
+  readonly installation?: FleetInstallation;
   /** Agent, model and variant handed to the live runner subprocess. */
   readonly runnerAgent?: string;
   readonly runnerModel?: string;
@@ -114,6 +117,59 @@ export interface FleetCliRuntimeOptions {
   readonly worktreeSshHost?: string;
   /** Owner Ed25519 public key in base64 format for verifying approved decisions. */
   readonly ownerPublicKey?: string;
+}
+
+export interface ResolvedRunnerSettings {
+  readonly worktreeSshHost?: string;
+  readonly runnerAgent?: string;
+  readonly runnerModel?: string;
+  readonly runnerVariant?: string;
+  readonly runnerRemotePort?: number;
+  readonly ocmRunBin?: string;
+  readonly runnerRemoteHost?: string;
+}
+
+/**
+ * Resolves runner and worktree host configuration.
+ * Resolution precedence: options.<x> ?? installation.<x> ?? <env read>.
+ */
+export function resolveRunnerSettings(
+  options?: FleetCliRuntimeOptions,
+  installation?: FleetInstallation,
+  env: Record<string, string | undefined> = process.env,
+): ResolvedRunnerSettings {
+  const inst = options?.installation ?? installation;
+  const parsedPort = env.OCM_REMOTE_PORT ? Number(env.OCM_REMOTE_PORT) : Number.NaN;
+  return {
+    worktreeSshHost:
+      options?.worktreeSshHost ??
+      inst?.worktree?.sshHost ??
+      (env.FLEET_WORKTREE_SSH_HOST?.trim() || undefined),
+    runnerAgent:
+      options?.runnerAgent ??
+      inst?.runner?.agent ??
+      (env.FLEET_RUNNER_AGENT?.trim() || undefined),
+    runnerModel:
+      options?.runnerModel ??
+      inst?.runner?.model ??
+      (env.FLEET_RUNNER_MODEL?.trim() || undefined),
+    runnerVariant:
+      options?.runnerVariant ??
+      inst?.runner?.variant ??
+      (env.FLEET_RUNNER_VARIANT?.trim() || undefined),
+    runnerRemotePort:
+      options?.runnerRemotePort ??
+      inst?.runner?.remotePort ??
+      (Number.isFinite(parsedPort) ? parsedPort : undefined),
+    ocmRunBin:
+      options?.ocmRunBin ??
+      inst?.runner?.ocmRunBin ??
+      (env.FLEET_OCM_RUN_BIN?.trim() || undefined),
+    runnerRemoteHost:
+      options?.runnerRemoteHost ??
+      inst?.runner?.host ??
+      (env.OCM_HOST?.trim() || undefined),
+  };
 }
 
 /** Deterministic identity of the acceptance assessment bound to one attempt. */
@@ -356,20 +412,17 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const stateDir = options?.stateDir;
 
   // --- live runner / worktree host configuration -----------------------------
-  // Explicit options win; the environment is the operator's installation
-  // configuration. A blank value is treated as absent rather than as "".
-  const worktreeSshHost =
-    options?.worktreeSshHost ?? (process.env.FLEET_WORKTREE_SSH_HOST?.trim() || undefined);
-  const runnerAgent = options?.runnerAgent ?? (process.env.FLEET_RUNNER_AGENT?.trim() || undefined);
-  const runnerModel = options?.runnerModel ?? (process.env.FLEET_RUNNER_MODEL?.trim() || undefined);
-  const runnerVariant =
-    options?.runnerVariant ?? (process.env.FLEET_RUNNER_VARIANT?.trim() || undefined);
-  const parsedPort = process.env.OCM_REMOTE_PORT ? Number(process.env.OCM_REMOTE_PORT) : Number.NaN;
-  const runnerRemotePort =
-    options?.runnerRemotePort ?? (Number.isFinite(parsedPort) ? parsedPort : undefined);
-  const ocmRunBin = options?.ocmRunBin ?? (process.env.FLEET_OCM_RUN_BIN?.trim() || undefined);
-  const runnerRemoteHost =
-    options?.runnerRemoteHost ?? (process.env.OCM_HOST?.trim() || undefined);
+  // Resolution precedence: options.<x> ?? installation.<x> ?? <env read>.
+  // A blank env value is treated as absent rather than as "".
+  const {
+    worktreeSshHost,
+    runnerAgent,
+    runnerModel,
+    runnerVariant,
+    runnerRemotePort,
+    ocmRunBin,
+    runnerRemoteHost,
+  } = resolveRunnerSettings(options);
   const ownerPublicKey =
     options?.ownerPublicKey ?? (process.env.FLEET_OWNER_PUBLIC_KEY?.trim() || undefined);
 

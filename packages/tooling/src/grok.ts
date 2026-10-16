@@ -2,7 +2,13 @@ import { interpretAccountSignIn } from './sign-in.js';
 import type { ModelListResult, ToolDescriptor, ToolModel } from './types.js';
 
 const MODELS_HEADER = 'Available models:';
-const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._/-]*/;
+/**
+ * One model row, anchored to the whole line: a readable id, optionally
+ * followed by whitespace and a parenthesised annotation such as `(default)`.
+ * Anything else after the id (bare prose, a second id, trailing junk) fails
+ * the match and the whole list is `'unknown'`.
+ */
+const MODEL_ROW = /^([A-Za-z0-9][A-Za-z0-9._/-]*)(?:[ \t]+\([^()]*\))?$/;
 
 function nonEmptyLines(output: string): readonly string[] {
   const lines = output.split(/\r?\n/);
@@ -28,11 +34,11 @@ function parseGrokModels(output: string): ModelListResult {
   }
   const result: ToolModel[] = [];
   for (const line of lines.slice(1)) {
-    const match = MODEL_ID.exec(line.trim());
+    const match = MODEL_ROW.exec(line.trim());
     if (match === null) {
       return 'unknown';
     }
-    result.push({ id: match[0] });
+    result.push({ id: match[1] });
   }
   return result.length === 0 ? 'unknown' : result;
 }

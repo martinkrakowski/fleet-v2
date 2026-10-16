@@ -9,8 +9,11 @@ const PROVIDER_ROW = /^[ \t]*(\S+)[ \t]{2,}(signed in|signed out)[ \t]*$/;
 /**
  * `opencode auth` prints a provider table; any provider row signed in is
  * enough for a seat, because the model list already shows what is usable.
- * The listing itself failing, or a table with no readable row, is
- * `'unknown'`: fleet never guesses a provider's state from prose.
+ * The whole recorded output is parsed, not scanned: blank lines and the
+ * `Providers:` header are tolerated, and any other line that does not parse
+ * as a provider row makes the whole answer `'unknown'`, as do a failing
+ * exit code and a table with no readable row. fleet never guesses a
+ * provider's state from prose.
  */
 function interpretOpenCodeSignIn(stdout: string, exitCode: number): SignInStatus {
   if (exitCode !== 0) {
@@ -19,9 +22,12 @@ function interpretOpenCodeSignIn(stdout: string, exitCode: number): SignInStatus
   let parsedRows = 0;
   let signedInRows = 0;
   for (const line of stdout.split(/\r?\n/)) {
+    if (line.trim() === '' || line.trim() === 'Providers:') {
+      continue;
+    }
     const match = PROVIDER_ROW.exec(line);
     if (match === null) {
-      continue;
+      return 'unknown';
     }
     parsedRows += 1;
     if (match[2] === 'signed in') {

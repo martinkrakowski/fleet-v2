@@ -6,3 +6,4 @@ export * from './grok.js';
 export * from './agy.js';
 export * from './descriptors.js';
 export * from './detect.js';
+export * from './recommend.js';

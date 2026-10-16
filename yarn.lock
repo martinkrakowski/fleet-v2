@@ -418,6 +418,7 @@ __metadata:
   resolution: "@fleet/tooling@workspace:packages/tooling"
   dependencies:
     "@eslint/js": "npm:^9.0.0"
+    "@fleet/installation": "workspace:*"
     eslint: "npm:^9.0.0"
     typescript: "npm:^5.5.4"
     typescript-eslint: "npm:^8.0.0"

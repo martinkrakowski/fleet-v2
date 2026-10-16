@@ -726,3 +726,63 @@ describe('a hung command through an adapter is killed at its budget', () => {
     }
   });
 });
+
+describe('a timed-out child never reports a real exit code (spawn-run close handler)', () => {
+  it('a child that traps SIGTERM and exits 0 still reports exitCode null with an error', async () => {
+    const result = await runSpawnOutcome('/bin/sh', ['-c', 'trap "exit 0" TERM; sleep 30'], {
+      timeoutMs: 300,
+    });
+    expect(result.exitCode).toBeNull();
+    expect(result.error).toBeDefined();
+    expect(result.error).not.toBe('');
+  });
+
+  it('kills the whole process tree: the grandchild is gone after the timeout', async () => {
+    const result = await runSpawnOutcome(
+      '/bin/sh',
+      ['-c', 'sleep 999 & echo $!; wait'],
+      { timeoutMs: 300 },
+    );
+    expect(result.exitCode).toBeNull();
+    expect(result.error).toBeDefined();
+    const grandchildPid = Number(result.stdout.trim().split('\n')[0]);
+    expect(Number.isFinite(grandchildPid)).toBe(true);
+    expect(() => process.kill(grandchildPid, 0)).toThrow();
+  });
+});
+
+describe('exit code null is failure/unknown, never an answer (adapters)', () => {
+  it('WorkspaceAdapter: a null-exit-code probe throws instead of reporting absence', async () => {
+    const { executor } = fakeExecutor(() => ({ exitCode: null, error: 'timeout' }));
+    const adapter = new WorkspaceAdapter({ executor: executor });
+    await expect(
+      adapter.inspectWorktree({
+        worktreePath: '/wt',
+        baseCommit: 'base0000',
+        expectedArtifactPaths: [],
+      }),
+    ).rejects.toThrow();
+  });
+
+  it('AttemptArtifactAdapter: a null-exit-code check-ignore throws instead of "not ignored"', async () => {
+    const { executor } = fakeExecutor(() => ({ exitCode: null, error: 'timeout' }));
+    const adapter = new AttemptArtifactAdapter({ executor: executor });
+    await expect(
+      adapter.verifyIgnoredPaths({ worktreePath: '/wt', candidatePaths: ['.lane/brief.md'] }),
+    ).rejects.toThrow(/check-ignore failed/);
+  });
+});
+
+describe('runner start budget (ExecutionRunnerAdapter)', () => {
+  it('passes the explicit 120s runner budget and a timed-out start (exitCode null) is unknown, never started', async () => {
+    const { executor, calls } = fakeExecutor(() => ({ exitCode: null, error: 'timeout' }));
+    const adapter = new ExecutionRunnerAdapter({
+      executor: executor,
+      remotePort: 4321,
+      ocmRunBin: '/bin/echo',
+    });
+    const result = await adapter.startSession(sessionRequest);
+    expect(result.outcome).toBe('unknown');
+    expect(calls[0].options?.timeoutMs).toBe(120_000);
+  });
+});

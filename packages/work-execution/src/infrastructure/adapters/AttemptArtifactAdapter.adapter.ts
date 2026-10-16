@@ -237,6 +237,13 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     const targetPath = manifestPath ?? path.join(worktreePath, '.lane', 'brief-manifest.json');
     const executor = this.requireExecutor();
     const result = await executor.run(['cat', targetPath], { timeoutMs: CAT_TIMEOUT_MS });
+    // A null exit code (spawn failure, timeout) is a failed read, not an
+    // absent manifest; only exit 1 and friends mean "no such file".
+    if (result.exitCode === null) {
+      throw new Error(
+        `Unable to read ${targetPath}` + (result.error !== undefined ? `: ${result.error}` : ''),
+      );
+    }
     return result.exitCode === 0 ? result.stdout : null;
   }
 }

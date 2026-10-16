@@ -207,8 +207,11 @@ export function runSpawnOutcome(
 
     child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
       const signalName = signal ?? killed;
+      // A timed-out or overran run was killed, so the child's exit code (0
+      // from a trap, 1 from a late failure) is not an answer: report null.
+      const forcedNull = killed !== null || overran;
       settle({
-        exitCode: code,
+        exitCode: forcedNull ? null : code,
         signal: typeof signalName === 'string' ? signalName : null,
         stdout,
         stderr,

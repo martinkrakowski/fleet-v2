@@ -76,8 +76,8 @@ describe('AGY_TOOL', () => {
     expect(AGY_TOOL.costSource).toBe('mixed');
   });
 
-  it('has no single invocation: the argv exists only per mode', () => {
-    expect(AGY_TOOL.invocation).toBeUndefined();
+  it('defaults its single invocation to the edit-only template', () => {
+    expect(AGY_TOOL.invocation).toBe(AGY_TOOL.invocationByMode?.['edit-only']);
     expect(AGY_TOOL.invocationByMode?.['edit-only']).toBeDefined();
     expect(AGY_TOOL.invocationByMode?.full).toBeDefined();
   });

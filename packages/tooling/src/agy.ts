@@ -160,6 +160,8 @@ export const AGY_TOOL: ToolDescriptor = {
   // Conservative default: with no mode resolved, an agy seat is edit-only.
   capabilities: AGY_CAPABILITIES_BY_MODE['edit-only'],
   capabilitiesByMode: AGY_CAPABILITIES_BY_MODE,
+  // Conservative default, identical to the edit-only template.
+  invocation: AGY_INVOCATION_BY_MODE['edit-only'],
   invocationByMode: AGY_INVOCATION_BY_MODE,
   costSource: 'mixed',
 };

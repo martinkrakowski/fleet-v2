@@ -64,7 +64,7 @@ describe('CLAUDE_CODE_TOOL', () => {
       needsAllowRules: true,
       headless: true,
     });
-    expect(CLAUDE_CODE_TOOL.invocation?.argvTemplate).toEqual([
+    expect(CLAUDE_CODE_TOOL.invocation.argvTemplate).toEqual([
       'claude',
       '-p',
       '--model',

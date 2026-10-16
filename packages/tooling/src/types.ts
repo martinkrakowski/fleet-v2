@@ -129,12 +129,12 @@ export interface ToolDescriptor {
    */
   readonly capabilitiesByMode?: Readonly<Record<AgyMode, ToolCapabilities>>;
   /**
-   * How a seat on this tool is invoked when the tool has one fixed argv.
-   * A descriptor with mode-keyed invocations (`invocationByMode`) carries
-   * no single template instead: there is no mode-independent argv, and no
-   * caller may invent one.
+   * How a seat on this tool is invoked by default. For a tool with
+   * mode-keyed invocations (`invocationByMode`) this is the most
+   * restrictive mode's template (agy: `edit-only`), so a caller that knows
+   * no mode can never reach a broader one.
    */
-  readonly invocation?: ToolInvocationSpec;
+  readonly invocation: ToolInvocationSpec;
   /**
    * Invocation templates keyed by runner mode, for a tool whose argv
    * follows the mode (agy, plan D7). Each template is fixed data: the

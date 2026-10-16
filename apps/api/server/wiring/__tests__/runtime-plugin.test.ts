@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { configureFleetApiRuntime } from "../wiring/runtime";
-import { bootstrapFleetApiFromEnv } from "./runtime";
+import { configureFleetApiRuntime } from "../runtime";
+import { bootstrapFleetApiFromEnv } from "../../plugins/runtime";
 
 describe("API runtime installation bootstrap", () => {
   let tempDir: string;

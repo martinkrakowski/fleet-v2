@@ -171,6 +171,16 @@ describe('JevRankingAdviceAdapter', () => {
     expect(await missingKey.adviseRanking(QUERY)).toEqual({ status: 'unknown', reason: 'shape' });
   });
 
+  it('never copies an invalid served model or id into the receipt', async () => {
+    const hostile = JSON.parse(JSON.stringify(FIXTURE_RESPONSE)) as { model: string; id: string };
+    hostile.model = 'x'.repeat(200);
+    hostile.id = 'has space';
+    const adapter = makeAdapter({ fetch: (async () => responseFor(hostile)) as typeof fetch });
+    expect(await adapter.adviseRanking(QUERY)).toEqual({ status: 'unknown', reason: 'shape' });
+    expect(adapter.lastReceipt?.servedModel).toBe('');
+    expect(adapter.lastReceipt?.requestId).toBe('');
+  });
+
   it('answers low-confidence when the served confidence is below minConfidence', async () => {
     const lowConfidence = JSON.parse(JSON.stringify(FIXTURE_RESPONSE)) as {
       answers: Record<string, { confidence: number }>;

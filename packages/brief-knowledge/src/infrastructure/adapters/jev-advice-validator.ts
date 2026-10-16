@@ -30,7 +30,7 @@ const PROBABILITY_SUM_TOLERANCE = 0.02;
 /** `model` and `id` must be short, opaque identifier strings. */
 const ID_OR_MODEL_PATTERN = /^[A-Za-z0-9._/:-]+$/;
 
-function isValidIdOrModel(value: unknown): value is string {
+export function isValidIdOrModel(value: unknown): value is string {
   return (
     typeof value === 'string' && value.length <= 128 && ID_OR_MODEL_PATTERN.test(value)
   );

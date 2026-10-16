@@ -32,6 +32,7 @@ import type {
 } from '../../application/ports/out/KnowledgeRankingAdvicePort.out-port.js';
 import {
   DEFAULT_DECISION_LEVELS,
+  isValidIdOrModel,
   validateScoreAnswers,
 } from './jev-advice-validator.js';
 import {
@@ -41,7 +42,7 @@ import {
 
 const JEV_DECISIONS_URL = 'https://openrouter.ai/api/alpha/decisions';
 const DEFAULT_JEV_TIMEOUT_MS = 3000;
-/** Response bodies at or beyond this size are refused as a shape failure. */
+/** Response bodies larger than this many bytes are refused as a shape failure. */
 const MAX_RESPONSE_BODY_BYTES = 65536;
 
 export interface JevRankingAdviceAdapterDependencies {
@@ -223,7 +224,8 @@ export class JevRankingAdviceAdapter implements KnowledgeRankingAdvicePort {
       });
 
       if (!(response as { ok?: boolean }).ok) {
-        // HTTP status only; never the body.
+        // HTTP status only; never the body. Release the connection.
+        await response.body?.cancel().catch(() => undefined);
         return { status: 'unknown', reason: 'transport' };
       }
 
@@ -232,6 +234,7 @@ export class JevRankingAdviceAdapter implements KnowledgeRankingAdvicePort {
         const contentLength = Number(contentLengthHeader);
         if (Number.isFinite(contentLength) && contentLength > MAX_RESPONSE_BODY_BYTES) {
           // Refuse before reading a single byte of an oversized body.
+          await response.body?.cancel().catch(() => undefined);
           return { status: 'unknown', reason: 'shape' };
         }
       }
@@ -344,10 +347,10 @@ function buildScoreQuestions(state: RankingAdviceStateBuilt): Record<
 
 /** Extract the receipt fields without trusting or re-serving the body. */
 function extractReceipt(parsed: unknown, stateSha256: string): JevDecisionReceipt {
-  const requestId = isPlainObject(parsed) && typeof parsed.id === 'string' ? parsed.id : '';
+  const requestId = isPlainObject(parsed) && isValidIdOrModel(parsed.id) ? parsed.id : '';
   const usage = isPlainObject(parsed) && isPlainObject(parsed.usage) ? parsed.usage : {};
   const costUsd = typeof usage.cost === 'number' && Number.isFinite(usage.cost) ? usage.cost : 0;
   const servedModel =
-    isPlainObject(parsed) && typeof parsed.model === 'string' ? parsed.model : '';
+    isPlainObject(parsed) && isValidIdOrModel(parsed.model) ? parsed.model : '';
   return { requestId, costUsd, servedModel, stateSha256 };
 }

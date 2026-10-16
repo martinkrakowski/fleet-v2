@@ -24,8 +24,13 @@ export default function AttemptPage() {
   const [word, note, variant] = summarize(attempt);
 
   return (
-    <div className={styles.layout}>
-      <div className={styles.sidebarCol}>
+    <div className={styles.layout} data-contained-scroll>
+      <div
+        className={styles.sidebarCol}
+        tabIndex={0}
+        role="region"
+        aria-label="Work order and operations"
+      >
         <aside aria-label="Work order">
           <WorkOrderSidebar attempt={attempt} workOrder={workOrder} siblings={siblings} />
         </aside>
@@ -34,7 +39,12 @@ export default function AttemptPage() {
         </aside>
       </div>
 
-      <section className={styles.recordCol} aria-label="Attempt record">
+      <section
+        className={styles.recordCol}
+        tabIndex={0}
+        role="region"
+        aria-label="Attempt record"
+      >
         <AttemptHeader
           attempt={attempt}
           word={word}

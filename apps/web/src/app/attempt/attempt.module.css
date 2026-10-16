@@ -30,6 +30,22 @@
   }
 }
 
+/* Desktop: the layout fills the page height; both columns scroll internally. */
+@media (min-width: 992px) {
+  .layout {
+    flex: 1;
+    min-height: 0;
+    align-items: stretch;
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .sidebarCol,
+  .recordCol {
+    min-height: 0;
+    overflow-y: auto;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Section headings (outside cards)                                    */
 /* ------------------------------------------------------------------ */

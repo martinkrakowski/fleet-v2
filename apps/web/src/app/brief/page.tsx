@@ -75,7 +75,10 @@ export default function BriefPage() {
   const includedCount = FIXTURE.proposals.filter((p) => Boolean(include[p.id])).length;
 
   return (
-    <div className={styles.stack}>
+    <div
+      className={[styles.stack, styles.view].filter(Boolean).join(" ")}
+      data-contained-scroll
+    >
       <PageHeader
         title="Brief"
         description={
@@ -106,7 +109,12 @@ export default function BriefPage() {
           metaFor={metaFor}
           onSelect={setBriefWo}
         />
-        <div className={styles.stack}>
+        <div
+          className={[styles.stack, styles.detail].filter(Boolean).join(" ")}
+          tabIndex={0}
+          role="region"
+          aria-label="Brief detail"
+        >
           {!isFrozen || !shown ? (
             <>
               <BriefManifestCard woId={sel} manifest={W.manifest} />

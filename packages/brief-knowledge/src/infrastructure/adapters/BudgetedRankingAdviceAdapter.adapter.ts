@@ -162,7 +162,10 @@ export class BudgetedRankingAdviceAdapter implements KnowledgeRankingAdvicePort 
       await this.journal.settle(reservationId, {
         provider: this.provider,
         model,
-        ...(requestId === undefined ? {} : { requestId }),
+        // An empty requestId is the Jev adapter's missing-id marker (''):
+        // treat it as absent — the journal refuses an empty requestId and
+        // settle would throw, losing the receipt of a paid call.
+        ...(requestId ? { requestId } : {}),
         costUsd,
         lexicalOrder,
         decidedOrder,

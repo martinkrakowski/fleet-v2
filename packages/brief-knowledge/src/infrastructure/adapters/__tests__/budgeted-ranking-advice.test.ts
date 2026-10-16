@@ -98,6 +98,17 @@ class FakeInner implements KnowledgeRankingAdvicePort {
   }
 }
 
+/** Fake inner port whose adviseRanking always throws. */
+class ThrowingInner implements KnowledgeRankingAdvicePort {
+  readonly calls: AdviseRankingQuery[] = [];
+  readonly lastReceipt: BudgetedInnerReceipt | null = null;
+
+  async adviseRanking(req: AdviseRankingQuery): Promise<RankingAdvice> {
+    this.calls.push(req);
+    throw new Error('inner transport failure');
+  }
+}
+
 interface MakeDepsOverrides {
   answer?: RankingAdvice;
   receipt?: BudgetedInnerReceipt | null;
@@ -277,6 +288,86 @@ describe('BudgetedRankingAdviceAdapter', () => {
       await rm(stateDir, { recursive: true, force: true });
     }
   });
+
+  it('empty requestId and servedModel in the receipt are absent: advised answer returned; settled line has no requestId, the receipt cost, estimated false', async () => {
+    const stateDir = await newTempStateDir();
+    try {
+      const { adapter } = makeBudgeted(stateDir, {
+        answer: {
+          status: 'advised',
+          scores: { 'entry-a': 1, 'entry-b': 0 },
+          model: 'jev-model-1',
+          confidence: 0.9,
+        },
+        // The Jev adapter reports '' when the response id or model is
+        // missing or invalid; an empty requestId must never reach the
+        // journal (it refuses one, so settle would throw).
+        receipt: { requestId: '', servedModel: '', costUsd: 0.00001 },
+      });
+      const result = await adapter.adviseRanking(QUERY);
+      expect(result.status).toBe('advised');
+
+      const lines = await readJournal(stateDir);
+      expect(lines).toHaveLength(2);
+      const settled = lines[1];
+      expect(settled.kind).toBe('settled');
+      expect(settled.requestId).toBeUndefined();
+      expect(settled.costUsd).toBe(0.00001);
+      expect(settled.estimated).toBe(false);
+      expect(settled.model).toBe('jev-model-1');
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a journal whose reserve throws: unknown/not-configured and zero inner calls', async () => {
+    const stateDir = await newTempStateDir();
+    try {
+      const journal: DecisionReceiptJournalPort = {
+        reserve: async () => {
+          throw new Error('journal unavailable');
+        },
+        settle: async () => {
+          throw new Error('journal unavailable');
+        },
+        monthSpendUsd: async () => 0,
+      };
+      const { adapter, inner } = makeBudgeted(stateDir, { journal });
+      const result = await adapter.adviseRanking(QUERY);
+      expect(result).toEqual({ status: 'unknown', reason: 'not-configured' });
+      expect(inner.calls).toHaveLength(0);
+      // Nothing was made, so nothing was recorded either.
+      expect(await readJournal(stateDir)).toEqual([]);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('inner throws: unknown/transport and a settled line exists with unknownReason transport', async () => {
+    const stateDir = await newTempStateDir();
+    try {
+      const adapter = new BudgetedRankingAdviceAdapter({
+        inner: new ThrowingInner(),
+        journal: new FileDecisionReceiptJournalAdapter(stateDir, () => new Date()),
+        provider: 'jev',
+        assumedCostUsd: 0.00002,
+        monthlyBudgetUsd: 0.01,
+      });
+      const result = await adapter.adviseRanking(QUERY);
+      expect(result).toEqual({ status: 'unknown', reason: 'transport' });
+
+      const lines = await readJournal(stateDir);
+      expect(lines).toHaveLength(2);
+      expect(lines[0].kind).toBe('reserved');
+      const settled = lines[1];
+      expect(settled.kind).toBe('settled');
+      expect(settled.unknownReason).toBe('transport');
+      expect(settled.lexicalOrder).toEqual(['entry-a', 'entry-b']);
+      expect(settled.decidedOrder).toEqual(['entry-a', 'entry-b']);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('createRankingAdvice', () => {
@@ -293,7 +384,7 @@ describe('createRankingAdvice', () => {
     return fn;
   }
 
-  const JEV_DECISIONS: RankingAdviceDecisions = {
+  const JEV_DECISIONS = {
     provider: 'jev',
     model: 'typesafe/jev-1.14',
     keyFile: '/keys/jev.key',
@@ -301,22 +392,32 @@ describe('createRankingAdvice', () => {
     monthlyBudgetUsd: 0.01,
     assumedCostPerCallUsd: 0.00002,
     acknowledgeProseLeavesHost: true as const,
-  };
+  } satisfies RankingAdviceDecisions;
 
   it("provider 'none' never calls fetch", async () => {
-    const fetch = spyFetch(FIXTURE_RESPONSE);
-    const port = createRankingAdvice({ decisions: { provider: 'none' }, stateDir: '/tmp', fetch });
-    const result = await port.adviseRanking(QUERY);
-    expect(result).toEqual({ status: 'unknown', reason: 'not-configured' });
-    expect(fetch.calls).toHaveLength(0);
+    const stateDir = await newTempStateDir();
+    try {
+      const fetch = spyFetch(FIXTURE_RESPONSE);
+      const port = createRankingAdvice({ decisions: { provider: 'none' }, stateDir, fetch });
+      const result = await port.adviseRanking(QUERY);
+      expect(result).toEqual({ status: 'unknown', reason: 'not-configured' });
+      expect(fetch.calls).toHaveLength(0);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
   });
 
   it('undefined decisions behave as none', async () => {
-    const fetch = spyFetch(FIXTURE_RESPONSE);
-    const port = createRankingAdvice({ stateDir: '/tmp', fetch });
-    const result = await port.adviseRanking(QUERY);
-    expect(result).toEqual({ status: 'unknown', reason: 'not-configured' });
-    expect(fetch.calls).toHaveLength(0);
+    const stateDir = await newTempStateDir();
+    try {
+      const fetch = spyFetch(FIXTURE_RESPONSE);
+      const port = createRankingAdvice({ stateDir, fetch });
+      const result = await port.adviseRanking(QUERY);
+      expect(result).toEqual({ status: 'unknown', reason: 'not-configured' });
+      expect(fetch.calls).toHaveLength(0);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
   });
 
   it('jev without a stateDir answers unknown/not-configured and fetch is never called', async () => {
@@ -350,6 +451,134 @@ describe('createRankingAdvice', () => {
       expect(lines[1].costUsd).toBe(0.000018102);
       expect(lines[1].estimated).toBe(false);
       expect(lines[1].decidedOrder).toEqual(['entry-a', 'entry-b']);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('the month file text contains neither the claimText, the taskSummary nor the key string', async () => {
+    const stateDir = await newTempStateDir();
+    try {
+      const key = 'sk-d5a-privacy-check-key-not-real';
+      const fetch = spyFetch(FIXTURE_RESPONSE);
+      const port = createRankingAdvice({
+        decisions: JEV_DECISIONS,
+        stateDir,
+        fetch,
+        readKey: async () => key,
+      });
+      const result = await port.adviseRanking(QUERY);
+      expect(result.status).toBe('advised');
+
+      const raw = await readFile(monthFilePath(stateDir), 'utf8');
+      expect(raw).not.toContain(QUERY.candidates[0].claimText);
+      expect(raw).not.toContain(QUERY.candidates[1].claimText);
+      expect(raw).not.toContain(QUERY.taskSummary);
+      expect(raw).not.toContain(key);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("answer-file without a stateDir answers unknown/not-configured and the injected reader is never called", async () => {
+    let readerCalls = 0;
+    const readAnswerFile = async (): Promise<string> => {
+      readerCalls += 1;
+      return '{}';
+    };
+    const port = createRankingAdvice({
+      decisions: { provider: 'answer-file', answerFile: '/answers/recorded.json' },
+      readAnswerFile,
+    });
+    const result = await port.adviseRanking(QUERY);
+    expect(result).toEqual({ status: 'unknown', reason: 'not-configured' });
+    expect(readerCalls).toBe(0);
+  });
+
+  it('answer-file with a stateDir and a fixture-shaped answer for the state hash is advised; settled line provider answer-file, costUsd 0, estimated true', async () => {
+    const stateDir = await newTempStateDir();
+    try {
+      const state = buildRankingAdviceState(QUERY);
+      expect(state.ok).toBe(true);
+      const stateSha256 = state.ok ? state.stateSha256 : '';
+      const readAnswerFile = async (): Promise<string> =>
+        JSON.stringify({ [stateSha256]: FIXTURE_RESPONSE });
+      const port = createRankingAdvice({
+        decisions: { provider: 'answer-file', answerFile: '/answers/recorded.json' },
+        stateDir,
+        readAnswerFile,
+      });
+      const result = await port.adviseRanking(QUERY);
+      expect(result.status).toBe('advised');
+
+      const lines = await readJournal(stateDir);
+      expect(lines).toHaveLength(2);
+      expect(lines[0].kind).toBe('reserved');
+      const settled = lines[1];
+      expect(settled.kind).toBe('settled');
+      expect(settled.provider).toBe('answer-file');
+      expect(settled.costUsd).toBe(0);
+      expect(settled.estimated).toBe(true);
+      expect(settled.decidedOrder).toEqual(['entry-a', 'entry-b']);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("jev with the query's project disabled: zero fetch calls", async () => {
+    const stateDir = await newTempStateDir();
+    try {
+      const fetch = spyFetch(FIXTURE_RESPONSE);
+      const decisions: RankingAdviceDecisions = {
+        ...JEV_DECISIONS,
+        disabledProjects: ['proj-1'],
+      };
+      const port = createRankingAdvice({
+        decisions,
+        stateDir,
+        fetch,
+        readKey: async () => 'sk-test-key-value-not-real',
+      });
+      const result = await port.adviseRanking(QUERY);
+      expect(result).toEqual({ status: 'unknown', reason: 'not-configured' });
+      expect(fetch.calls).toHaveLength(0);
+
+      // The reserve happened and the unknown inner answer was still settled.
+      const lines = await readJournal(stateDir);
+      expect(lines).toHaveLength(2);
+      expect(lines[1].kind).toBe('settled');
+      expect(lines[1].unknownReason).toBe('not-configured');
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('minConfidence 0.95 with the recorded fixture (confidence 0.91): unknown/low-confidence, settled line with the fixture cost; readKey receives the keyFile path', async () => {
+    const stateDir = await newTempStateDir();
+    try {
+      const fetch = spyFetch(FIXTURE_RESPONSE);
+      const readKeyPaths: string[] = [];
+      const decisions: RankingAdviceDecisions = { ...JEV_DECISIONS, minConfidence: 0.95 };
+      const port = createRankingAdvice({
+        decisions,
+        stateDir,
+        fetch,
+        readKey: async (path) => {
+          readKeyPaths.push(path);
+          return 'sk-test-key-value-not-real';
+        },
+      });
+      const result = await port.adviseRanking(QUERY);
+      expect(result).toEqual({ status: 'unknown', reason: 'low-confidence' });
+      expect(readKeyPaths).toEqual([JEV_DECISIONS.keyFile]);
+
+      const lines = await readJournal(stateDir);
+      expect(lines).toHaveLength(2);
+      const settled = lines[1];
+      expect(settled.kind).toBe('settled');
+      expect(settled.costUsd).toBe(0.000018102);
+      expect(settled.estimated).toBe(false);
+      expect(settled.unknownReason).toBe('low-confidence');
     } finally {
       await rm(stateDir, { recursive: true, force: true });
     }

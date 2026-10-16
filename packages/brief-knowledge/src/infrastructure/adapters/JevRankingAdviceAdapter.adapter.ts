@@ -64,7 +64,11 @@ export interface JevRankingAdviceAdapterDependencies {
 /** Per-call receipt for the D4/D5 decision receipt journal. */
 export interface JevDecisionReceipt {
   readonly requestId: string;
-  readonly costUsd: number;
+  /**
+   * Reported cost in USD; `undefined` when the response carried no usable
+   * usage cost (callers pass `undefined`, never `0`, to the journal).
+   */
+  readonly costUsd?: number;
   /** Served model id as reported; recorded, never trusted. */
   readonly servedModel: string;
   readonly stateSha256: string;
@@ -349,7 +353,9 @@ function buildScoreQuestions(state: RankingAdviceStateBuilt): Record<
 function extractReceipt(parsed: unknown, stateSha256: string): JevDecisionReceipt {
   const requestId = isPlainObject(parsed) && isValidIdOrModel(parsed.id) ? parsed.id : '';
   const usage = isPlainObject(parsed) && isPlainObject(parsed.usage) ? parsed.usage : {};
-  const costUsd = typeof usage.cost === 'number' && Number.isFinite(usage.cost) ? usage.cost : 0;
+  // Absent or non-finite cost stays undefined, never 0: the journal would
+  // otherwise record a real paid cost of zero.
+  const costUsd = typeof usage.cost === 'number' && Number.isFinite(usage.cost) ? usage.cost : undefined;
   const servedModel =
     isPlainObject(parsed) && isValidIdOrModel(parsed.model) ? parsed.model : '';
   return { requestId, costUsd, servedModel, stateSha256 };

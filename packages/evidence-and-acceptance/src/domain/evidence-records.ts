@@ -87,6 +87,12 @@ export interface EvidenceAssessmentRecord {
   readonly implementerModel: string;
   readonly requiredChecks: readonly string[];
   readonly state: AssessmentStateValue;
+  /**
+   * Forge evidence state recorded at acceptance time (D6). `not-configured`
+   * is a distinct value, legal only when the installation's forge mode is
+   * `none`; it is never `unknown` and never satisfies a CI-state requirement.
+   */
+  readonly forgeEvidence?: 'not-configured';
   readonly verificationReceipts: readonly VerificationReceiptRecord[];
   readonly reviewReceipts: readonly ReviewReceiptRecord[];
   readonly findingDispositions: readonly FindingDispositionRecord[];

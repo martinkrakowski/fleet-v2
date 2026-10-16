@@ -559,6 +559,7 @@ describe('loadInstallation', () => {
       directory,
       JSON.stringify({
         schemaVersion: 2,
+        forge: { mode: 'none' },
         hosts: {
           lane: {
             transport: 'local',
@@ -598,6 +599,7 @@ describe('loadInstallation', () => {
       directory,
       JSON.stringify({
         schemaVersion: 2,
+        forge: { mode: 'none' },
         hosts: {
           lane: {
             transport: 'local',

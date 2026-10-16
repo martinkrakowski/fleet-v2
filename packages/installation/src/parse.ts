@@ -807,6 +807,11 @@ function parseHost(entry: JsonObject, hostPath: string, errors: string[]): HostS
   if (transport === undefined || worktreeRoot === undefined || roles === undefined) {
     return undefined;
   }
+  // A lane-runner host without a runner block is an undeclared runner (D4):
+  // the loader refuses it instead of deriving an undispatchable host.
+  if (roles.includes('lane-runner') && !Object.hasOwn(entry, 'runner')) {
+    errors.push(`${hostPath}.runner: required when the host holds the lane-runner role`);
+  }
   return {
     transport,
     ...(sshAlias !== undefined ? { sshAlias } : {}),
@@ -1131,7 +1136,10 @@ function parseV2Shelf(value: JsonObject, errors: string[]): ShelfSectionV2 | und
 }
 
 function parseV2Forge(value: JsonObject, errors: string[]): ForgeSectionV2 | undefined {
+  // A v2 file always declares a forge mode (D6); only the v1 file and the
+  // env-only setup may run without one.
   if (!Object.hasOwn(value, 'forge')) {
+    errors.push('forge: required');
     return undefined;
   }
   const section = value.forge;
@@ -1347,8 +1355,9 @@ function parseV2Verification(
  *
  * Every problem is collected as `"<json path>: <problem>"`; a field's value is
  * never echoed in an error. Unknown keys anywhere are rejected. A v1 file
- * carries only v1 sections, a v2 file only v2 sections, and the v2 host rules
- * (exactly one orchestrator, at least one lane-runner) hold.
+ * carries only v1 sections, a v2 file only v2 sections, and the v2 rules
+ * (exactly one orchestrator, at least one lane-runner, and a required forge
+ * section, D6) hold.
  */
 export function parseInstallation(value: unknown): ParseResult {
   if (!isJsonObject(value)) {
@@ -1431,9 +1440,15 @@ function parseInstallationV2(value: JsonObject): ParseResult {
     return { ok: false, errors };
   }
 
+  if (forge === undefined) {
+    // Unreachable once errors is empty: parseV2Forge refuses a v2 file
+    // without a forge section. The guard keeps the required type honest.
+    return { ok: false, errors: [...errors, 'forge: required'] };
+  }
   const installation: Mutable<FleetInstallationV2> = {
     schemaVersion: 2,
     hosts: hosts ?? {},
+    forge,
   };
   if (tools !== undefined) {
     installation.tools = tools;
@@ -1449,9 +1464,6 @@ function parseInstallationV2(value: JsonObject): ParseResult {
   }
   if (shelf !== undefined) {
     installation.shelf = shelf;
-  }
-  if (forge !== undefined) {
-    installation.forge = forge;
   }
   if (verification !== undefined) {
     installation.verification = verification;

@@ -167,6 +167,58 @@ function makeWorkOrderRecord(): WorkOrderRecord {
 }
 
 describe('ExecuteAuthorizedForgeActionUseCase', () => {
+  describe('forge mode none (D6)', () => {
+    it('refuses every forge action before any grant is consumed, journalled or executed', async () => {
+      const journal = new InMemoryJournal();
+      const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+      const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+
+      let consumed = false;
+      const authorizationPort: ActionAuthorizationPort = {
+        async resolveActionAuthorization() {
+          return { outcome: 'granted', authorizationGrantId: 'g-1' };
+        },
+        async consumeActionAuthorization(
+          _req: ConsumeActionAuthorizationRequest,
+        ): Promise<ConsumeActionAuthorizationResult> {
+          consumed = true;
+          return { outcome: 'consumed', actionId: _req.actionId };
+        },
+      };
+      const forgePort: ForgeActionPort = {
+        isConfigured: () => true,
+        async performForgeAction(): Promise<ForgeActionResult> {
+          throw new Error('Should never be called');
+        },
+      };
+
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        attemptRepo,
+        workOrderRepo,
+        journal,
+        authorizationPort,
+        forgePort,
+        forgeMode: 'none',
+      });
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'forge-att-001',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'push-and-open-pr',
+        expectedHeadSha: '1111111111111111111111111111111111111111',
+        authorizationGrantId: 'grant-001',
+      });
+
+      expect(result.outcome).toBe('refused');
+      if (result.outcome === 'refused') {
+        expect(result.reason).toContain("Forge mode is 'none'");
+      }
+      expect(consumed).toBe(false);
+      expect(journal.entries).toHaveLength(0);
+    });
+  });
+
   describe('M7: journal sequence derivation across use case instances', () => {
     it('two use-case instances on the same journal, the second after a refusal, produce distinct ids and a typed result, no throw', async () => {
       const journal = new InMemoryJournal();

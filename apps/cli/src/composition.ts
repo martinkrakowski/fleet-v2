@@ -17,9 +17,10 @@
  */
 
 import { execFile } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
 
 import {
@@ -52,7 +53,9 @@ import {
   forgeActionScope,
   isSafeSshHost,
   observationEventKind,
+  resolveInstallationForgeMode,
   resolveRoleExecutors,
+  resolveRunnerCapabilityProfile,
   type GhInvocationResult,
   type SubprocessRunner,
 } from '@fleet/work-execution';
@@ -108,7 +111,7 @@ import {
   ResolveActionAuthorizationUseCase,
   SendFleetRelayUseCase,
 } from '@fleet/operator-coordination';
-import type { FleetInstallation } from '@fleet/installation';
+import { deriveInstallationModel, type FleetInstallation } from '@fleet/installation';
 
 export interface FleetCliRuntimeOptions {
   /** Directory for file-backed state; every store is in-memory when omitted. */
@@ -131,6 +134,18 @@ export interface FleetCliRuntimeOptions {
   readonly ownerPublicKey?: string;
   /** Deterministic subprocess execution for runner tests. */
   readonly runSubprocess?: SubprocessRunner;
+  /**
+   * Argument-array `gh` runner for forge evidence reads (D6). Defaults to the
+   * reviewed subprocess runner shared with the forge action adapter; tests
+   * inject a stub transport here.
+   */
+  readonly forgeGhRunner?: (args: readonly string[]) => Promise<GhInvocationResult>;
+  /**
+   * Absolute gh locations overriding the fixed defaults (tests only).
+   * Production always resolves the reviewed GitHub CLI from
+   * GH_BINARY_CANDIDATES and never falls back to PATH (S4036).
+   */
+  readonly ghBinaryCandidates?: readonly string[];
 }
 
 export interface ResolvedRunnerSettings {
@@ -264,15 +279,35 @@ function applyGhEnvironmentOverrides(args: readonly string[]): readonly string[]
   return args;
 }
 
+/** Whether `path` is an executable regular file (S4036: absolute gh only). */
+function isExecutableRegularFile(path: string): boolean {
+  try {
+    const stats = statSync(path);
+    return stats.isFile() && (stats.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Run the reviewed GitHub CLI subprocess for the forge adapter. A completed
+ * Run the reviewed GitHub CLI subprocess for the forge adapter. The binary is
+ * resolved from fixed absolute locations (S4036), never through PATH; when
+ * none is found the invocation rejects so the adapter reports the forge as
+ * unreadable (fail closed, as a missing binary does today). A completed
  * invocation resolves with its exit code and captured output; a spawn failure
- * (for example a missing binary) rejects so the adapter reports the outcome as
- * ambiguous for reconciliation instead of guessing.
+ * rejects so the adapter reports the outcome as ambiguous for reconciliation
+ * instead of guessing.
  */
-function runGhSubprocess(args: readonly string[]): Promise<GhInvocationResult> {
+function runGhSubprocess(
+  args: readonly string[],
+  candidates: readonly string[] = GH_BINARY_CANDIDATES,
+): Promise<GhInvocationResult> {
+  const ghBinary = resolveGhBinary(candidates, isExecutableRegularFile);
+  if (ghBinary === undefined) {
+    return Promise.reject(new Error('gh not found in fixed locations'));
+  }
   return new Promise((resolve, reject) => {
-    execFile('gh', [...applyGhEnvironmentOverrides(args)], { encoding: 'utf8' }, (error, stdout, stderr) => {
+    execFile(ghBinary, [...applyGhEnvironmentOverrides(args)], { encoding: 'utf8' }, (error, stdout, stderr) => {
       if (error === null) {
         resolve({ exitCode: 0, stdout: String(stdout), stderr: String(stderr) });
         return;
@@ -396,6 +431,8 @@ export interface FleetCliRuntime {
     readonly executionJournal: ExecutionJournalAdapter;
     readonly workspace: WorkspaceAdapter;
     readonly runner: ExecutionRunnerAdapter;
+    /** The runner entry's declared lane budget; undefined without one. */
+    readonly runnerMaxLanes?: number;
     readonly attemptArtifact: AttemptArtifactAdapter;
     readonly briefAuthoring: BriefAuthoringAdapter;
     readonly acceptanceAssessment: AcceptanceAssessmentAdapter;
@@ -431,6 +468,13 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     ocmRunBin,
     runnerRemoteHost,
   } = resolveRunnerSettings(options);
+  // The loader-derived model (D4) supplies the runner capability profile and
+  // the forge mode (D6); a v1 installation maps onto it unchanged.
+  const installationModel = options?.installation
+    ? deriveInstallationModel(options.installation).model
+    : undefined;
+  const runnerProfile = resolveRunnerCapabilityProfile(installationModel?.hosts);
+  const forgeMode = resolveInstallationForgeMode(options?.installation);
   // One executor per role: the installation's hosts (v2) or the v1 mapping
   // decides local versus ssh per host; the orchestrator runs where this root
   // runs. runnerRemoteHost/ocmRunBin stay runner settings, separate from the
@@ -557,11 +601,32 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   });
   // No independent review transport is configured; requests report that.
   const independentReview = new IndependentReviewAdapter();
-  // Instantiated for the station that binds a live forge transport; an
-  // unconfigured adapter reads every CI state as `unknown`, so it is not
-  // bound to AssessHeadAcceptanceUseCase here. Recorded receipts stay the
-  // acceptance evidence until that transport exists.
-  const forgeEvidence = new ForgeEvidenceAdapter();
+  // Instantiated for the station that binds a live forge transport. With
+  // forge mode `github` (D6) it is bound to AssessHeadAcceptanceUseCase with
+  // the installation's owner/repo; with mode `none` acceptance is
+  // receipt-only and records `forgeEvidence: 'not-configured'`; with no forge
+  // section the CLI keeps today's receipt-only behaviour.
+  const forgeSection =
+    installationModel?.forge !== undefined && 'mode' in installationModel.forge
+      ? installationModel.forge
+      : undefined;
+  const forgeGithubSection =
+    forgeSection?.mode === 'github' ? forgeSection : undefined;
+  // The argument-array gh runner shared with the forge action adapter (D6):
+  // mode `github` hands it to the forge-evidence adapter so reads can
+  // succeed; tests inject a stub transport through the runtime options.
+  const ghBinaryCandidates = options?.ghBinaryCandidates ?? GH_BINARY_CANDIDATES;
+  const forgeGhRunner =
+    options?.forgeGhRunner ??
+    ((args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates));
+  const forgeEvidence =
+    forgeMode === 'github'
+      ? new ForgeEvidenceAdapter({
+          owner: forgeGithubSection?.owner,
+          repo: forgeGithubSection?.repo,
+          runGh: forgeGhRunner,
+        })
+      : new ForgeEvidenceAdapter();
   const ownerDecision = new OwnerDecisionAdapter({
     checkOwnerDecision: async (request) => {
       const result = await coordination.checkOwnerDecision.checkOwnerDecision({
@@ -633,6 +698,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     }),
     assessHeadAcceptance: new AssessHeadAcceptanceUseCase({
       repo: evidenceAssessmentRepository,
+      // Forge mode `github` binds the forge-evidence port in this root too
+      // (D6); mode `none` records receipt-only acceptance as not-configured.
+      ...(forgeMode === 'github' ? { forgeEvidence } : {}),
+      ...(forgeMode === 'none' ? { forgeMode: 'none' as const } : {}),
       ownerDecisionPort: ownerDecision,
       attemptOwnerDecisionPort: attemptOwnerDecision,
     }),
@@ -657,6 +726,11 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     remoteHost: runnerRemoteHost,
     executor: roleExecutors.orchestrator,
     runSubprocess: options?.runSubprocess,
+    // The capability report comes from the installation's lane-runner entry
+    // with the loader-derived source (D4); the transport trims the runner
+    // environment on a single machine (D5).
+    ...(runnerProfile !== undefined ? { capabilities: runnerProfile.capabilities } : {}),
+    ...(runnerProfile !== undefined ? { runnerTransport: runnerProfile.transport } : {}),
     resolveWorktreePath: async (attemptId) =>
       (await attemptRepository.findAttemptById(attemptId))?.worktreePath ?? null,
     resolveAttempt: async (attemptId) =>
@@ -669,7 +743,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // invocation first verifies the live HEAD of the attempt's own worktree so
   // a moved branch head is never pushed or merged on stale readiness.
   const forgeAction = new ForgeActionAdapter({
-    runGh: runGhSubprocess,
+    runGh: (args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates),
     verifyCurrentHeadSha: async (branchName, request) => {
       const attempt = await attemptRepository.findAttemptById(request.attemptId);
       if (attempt === null) {
@@ -981,6 +1055,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     executionJournal,
     workspace,
     runner,
+    // The runner entry's lane budget (D4/D6 plan item 4); undefined without a
+    // declared lane-runner entry, in which case the request default applies.
+    runnerMaxLanes: runnerProfile?.maxLanes,
     attemptArtifact,
     briefAuthoring,
     acceptanceAssessment,
@@ -1045,10 +1122,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       forgePort: forgeAction,
       acceptedReceiptByHead: acceptedReceiptByHeadView,
       acceptanceEvidencePort: acceptanceEvidence,
-      // Merge-time door re-check goes through the same resolution acceptance
-      // uses, so a withdrawn owner decision also refuses the forge action.
+      // Forge actions re-check the attempt's one-way doors through the same
+      // owner-decision resolution acceptance uses.
       ownerDecisionPort: ownerDecision,
       attemptOwnerDecisionPort: attemptOwnerDecision,
+      // Forge mode `none` (D6) refuses every forge action.
+      ...(forgeMode === 'none' ? { forgeMode: 'none' as const } : {}),
     }),
   };
 

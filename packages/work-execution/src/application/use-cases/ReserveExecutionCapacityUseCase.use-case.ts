@@ -1,12 +1,13 @@
 // Implemented for migration step 2 — shared-host slot arbitration.
 /**
  * ReserveExecutionCapacityUseCase: reserve one slot for one attempt under the
- * host's shared budget. A busy worktree blocks the reservation before the
- * slot budget is consulted; a refusal is distinguished from "no free slot".
- * The duplicate-attempt and slot-budget checks run inside the journal's
- * locked read-modify-write, so a racing claim never superseds another
- * reservation and never exceeds the budget. Only a durable reservation in
- * the journal authorizes later dispatch.
+ * host's shared budget. The busy-worktree check runs inside the journal's
+ * locked read-modify-write (Opus note on #58), so a conflicting reservation
+ * that lands while the claim is in flight is still refused; a refusal is
+ * distinguished from "no free slot". The duplicate-attempt, busy-worktree and
+ * slot-budget checks all run under the lock, so a racing claim never
+ * supersedes another reservation and never exceeds the budget. Only a durable
+ * reservation in the journal authorizes later dispatch.
  */
 
 import type { AttemptStateValue } from '../../domain/value-objects/AttemptState.vo.js';
@@ -46,7 +47,8 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
   async reserveExecutionCapacity(
     request: ReserveExecutionCapacityRequest,
   ): Promise<ReserveExecutionCapacityResult> {
-    if (!this.deps) {
+    const deps = this.deps;
+    if (!deps) {
       throw new Error('Not implemented: ReserveExecutionCapacityUseCase');
     }
 
@@ -74,28 +76,10 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
       return { outcome: 'refused', reason: `Missing required reservation fields: ${missingFields.join(', ')}` };
     }
 
-    const heldReservations = await this.deps.journal.listActiveReservations(request.hostId);
-    for (const reservation of heldReservations) {
-      const holder = await this.deps.attemptRepo.findAttemptById(reservation.attemptId);
-      if (holder && holder.worktreePath === request.worktreePath) {
-        return { outcome: 'busy-worktree', blockingAttemptId: reservation.attemptId };
-      }
-    }
-
-    const allAttempts = await this.deps.attemptRepo.listAllAttempts();
-    const conflictingAttempt = allAttempts.find(
-      (attempt) =>
-        attempt.id !== request.attemptId &&
-        attempt.worktreePath === request.worktreePath &&
-        WORKTREE_CLAIMING_STATES.includes(attempt.state),
-    );
-    if (conflictingAttempt) {
-      return { outcome: 'busy-worktree', blockingAttemptId: conflictingAttempt.id };
-    }
-
-    // The duplicate-attempt and slot-budget checks run inside the journal's
-    // locked read-modify-write: a racing claim that slips between this
-    // read and the append is still refused by the re-read under the lock.
+    // The busy-worktree, duplicate-attempt and slot-budget checks all run
+    // inside the journal's locked read-modify-write (Opus note on #58): a
+    // conflicting reservation that lands between the request and the append
+    // is still refused by the re-read under the lock.
     const nowIso = request.nowIso ?? new Date().toISOString();
     const claim: CapacityReservationClaim = {
       id: request.reservationId,
@@ -105,11 +89,32 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
       reservedAtIso: nowIso,
       releasedAtIso: null,
     };
-    const arbitration = await this.deps.journal.reserveCapacityAtomically({
+    const arbitration = await deps.journal.reserveCapacityAtomically({
       attemptId: request.attemptId,
       maxSlots: request.maxSlots,
       record: claim,
+      checkBusyWorktree: async (held) => {
+        for (const reservation of held) {
+          const holder = await deps.attemptRepo.findAttemptById(reservation.attemptId);
+          if (holder && holder.worktreePath === request.worktreePath) {
+            return { outcome: 'busy-worktree', blockingAttemptId: reservation.attemptId };
+          }
+        }
+        const allAttempts = await deps.attemptRepo.listAllAttempts();
+        const conflictingAttempt = allAttempts.find(
+          (attempt) =>
+            attempt.id !== request.attemptId &&
+            attempt.worktreePath === request.worktreePath &&
+            WORKTREE_CLAIMING_STATES.includes(attempt.state),
+        );
+        return conflictingAttempt
+          ? { outcome: 'busy-worktree', blockingAttemptId: conflictingAttempt.id }
+          : { outcome: 'ok' };
+      },
     });
+    if (arbitration.outcome === 'busy-worktree') {
+      return { outcome: 'busy-worktree', blockingAttemptId: arbitration.blockingAttemptId };
+    }
     if (arbitration.outcome === 'duplicate-attempt') {
       return {
         outcome: 'refused',

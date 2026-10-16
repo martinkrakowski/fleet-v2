@@ -35,6 +35,12 @@ export interface EvidenceAssessmentProps {
   readonly implementerModel: string;
   readonly requiredChecks: readonly string[];
   readonly state: AssessmentStateValue;
+  /**
+   * Forge evidence state recorded at acceptance time (D6). `not-configured`
+   * is a distinct value, legal only when the installation's forge mode is
+   * `none`; it is never `unknown` and never satisfies a CI-state requirement.
+   */
+  readonly forgeEvidence?: 'not-configured';
   readonly verificationReceipts: readonly VerificationReceiptRecord[];
   readonly reviewReceipts: readonly ReviewReceiptRecord[];
   readonly findingDispositions: readonly FindingDispositionRecord[];
@@ -80,6 +86,12 @@ export class EvidenceAssessment {
       return {
         success: false,
         error: new Error('EvidenceAssessment requiredChecks must be non-empty strings'),
+      };
+    }
+    if (props.forgeEvidence !== undefined && props.forgeEvidence !== 'not-configured') {
+      return {
+        success: false,
+        error: new Error("EvidenceAssessment forgeEvidence must be 'not-configured' when present"),
       };
     }
     const state = AssessmentState.create(props.state);

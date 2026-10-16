@@ -16,7 +16,6 @@ import type {
   BriefContextDecision,
   BriefModelAssignment,
   CommandCompletionReceipt,
-  RunnerIsolationCapabilities,
 } from '@fleet/work-execution';
 import { resolveImplementerSeat } from '@fleet/work-execution/use-cases';
 import type {
@@ -247,16 +246,6 @@ export function extractStateDirOption(
   return { stateDir, restArgv };
 }
 
-/** Strict isolation profile required of runners unless overridden per dispatch. */
-const STRICT_RUNNER_CAPABILITIES: RunnerIsolationCapabilities = {
-  filesystemScope: 'scoped-worktree',
-  networkEgressRestricted: true,
-  cpuAndMemoryLimited: true,
-  processTreeTermination: true,
-  authoritativeCompletion: true,
-  artifactPersistence: true,
-};
-
 /** Result outcomes that report a refusal, gap or unknown and exit non-zero. */
 const NON_ZERO_OUTCOMES: ReadonlySet<string> = new Set([
   'rejected',
@@ -387,16 +376,29 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
     },
   },
   capacity: {
-    reserve: async (p, rt) =>
-      rt.execution.reserveExecutionCapacity.reserveExecutionCapacity({
+    reserve: async (p, rt) => {
+      // The runner's installation entry feeds capacity maxSlots (plan item 4):
+      // a declared maxLanes is the host budget, and a conflicting operator
+      // value is a usage error rather than a silent override.
+      const declaredMaxLanes = rt.execution.runnerMaxLanes;
+      if (declaredMaxLanes !== undefined && p['maxSlots'] !== undefined) {
+        const supplied = num(p, 'maxSlots', declaredMaxLanes);
+        if (supplied !== declaredMaxLanes) {
+          throw new CliUsageError(
+            `'--maxSlots ${supplied}' conflicts with the runner's declared maxLanes ${declaredMaxLanes}; the installation feeds capacity maxSlots`,
+          );
+        }
+      }
+      return rt.execution.reserveExecutionCapacity.reserveExecutionCapacity({
         reservationId: str(p, 'reservationId'),
         attemptId: str(p, 'attemptId'),
         workOrderId: str(p, 'workOrderId'),
         hostId: str(p, 'hostId'),
         worktreePath: str(p, 'worktreePath'),
-        maxSlots: num(p, 'maxSlots', 1),
+        maxSlots: declaredMaxLanes ?? num(p, 'maxSlots', 1),
         nowIso: optStr(p, 'nowIso'),
-      }),
+      });
+    },
   },
   attempt: {
     dispatch: async (p, rt) => {
@@ -416,14 +418,18 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
           );
         }
       }
+      // D4: the CLI no longer accepts runner capability overrides —
+      // requirements come from the brief only, so a supplied one is a usage
+      // error (exit 2), never a weaker or stronger dispatch profile.
+      if (p['requiredCapabilities'] !== undefined) {
+        throw new CliUsageError(
+          "'--requiredCapabilities' is forbidden; runner requirements come from the brief only",
+        );
+      }
 
       const attemptId = str(p, 'attemptId');
       const existing = await rt.execution.attemptRepository.findAttemptById(attemptId);
       const worktreePath = str(p, 'worktreePath');
-      const requiredCapabilities: RunnerIsolationCapabilities = {
-        ...STRICT_RUNNER_CAPABILITIES,
-        ...(nested<Partial<RunnerIsolationCapabilities>>(p, 'requiredCapabilities') ?? {}),
-      };
 
       // Seat override from --seat-override and --override-reason
       let seatOverride = nested<AttemptSeatOverrideRecord>(p, 'seatOverride');
@@ -473,7 +479,6 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         stepLimit: num(p, 'stepLimit', 200),
         timeLimitSeconds: num(p, 'timeLimitSeconds', 3600),
         expectedArtifacts: strArr(p, 'expectedArtifacts'),
-        requiredCapabilities,
         nowIso: optStr(p, 'nowIso'),
         seatOverride,
         reviewerSeat,

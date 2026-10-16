@@ -43,6 +43,21 @@ const REQUIRED_BOOLEAN_CAPABILITIES: readonly (keyof RunnerIsolationCapabilities
   'artifactPersistence',
 ];
 
+/**
+ * The lane brief's runner requirements (D4): a scoped worktree with every
+ * enforced isolation boolean. Requirements come from the frozen brief's lane
+ * profile only — the request carries none, and an operator override is a
+ * usage error at the boundaries.
+ */
+const BRIEF_RUNNER_REQUIREMENTS: RunnerIsolationCapabilities = {
+  filesystemScope: 'scoped-worktree',
+  networkEgressRestricted: true,
+  cpuAndMemoryLimited: true,
+  processTreeTermination: true,
+  authoritativeCompletion: true,
+  artifactPersistence: true,
+};
+
 type JournalEntryDraft = Omit<ActionJournalEntryRecord, 'id'>;
 
 /**
@@ -132,14 +147,14 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     }
 
     const runnerCapabilities = this.deps.runner.describeCapabilities();
-    const requiredCapabilities = request.requiredCapabilities;
+    // Requirements come from the frozen brief's lane profile only; the
+    // request carries no requirements field.
+    const requiredCapabilities = BRIEF_RUNNER_REQUIREMENTS;
     const capabilitiesMissing =
       runnerCapabilities.filesystemScope !== 'scoped-worktree' ||
-      (requiredCapabilities
-        ? REQUIRED_BOOLEAN_CAPABILITIES.some(
-            (capability) => requiredCapabilities[capability] && !runnerCapabilities[capability],
-          )
-        : false);
+      REQUIRED_BOOLEAN_CAPABILITIES.some(
+        (capability) => requiredCapabilities[capability] && !runnerCapabilities[capability],
+      );
     if (capabilitiesMissing) {
       return { outcome: 'refused', reason: 'Runner capabilities do not satisfy required isolation' };
     }
@@ -402,7 +417,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       baseCommit: request.baseCommit,
       stepLimit: request.stepLimit,
       timeLimitSeconds: request.timeLimitSeconds,
-      requiredCapabilities: request.requiredCapabilities,
+      requiredCapabilities,
       model: effectiveModel,
       agent: effectiveAgent,
       variant: effectiveVariant,

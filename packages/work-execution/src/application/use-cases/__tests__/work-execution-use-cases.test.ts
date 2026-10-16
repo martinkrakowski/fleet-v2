@@ -47,6 +47,7 @@ import { RegisterWorkOrderUseCase } from '../RegisterWorkOrderUseCase.use-case.j
 import { ReconcileAttemptUseCase } from '../ReconcileAttemptUseCase.use-case.js';
 import { ReserveExecutionCapacityUseCase } from '../ReserveExecutionCapacityUseCase.use-case.js';
 import { StopAttemptUseCase } from '../StopAttemptUseCase.use-case.js';
+import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 
 function makeAttemptRepo(): AttemptRepositoryPort & { attempts: Map<string, AttemptRecord> } {
   const attempts = new Map<string, AttemptRecord>();
@@ -103,12 +104,19 @@ function makeJournal(): ExecutionJournalPort & {
       }
       return false;
     },
-    // Mirrors the adapter's locked arbitration: duplicate, budget, then
-    // lowest free slot, in one read-modify-write.
+    // Mirrors the adapter's locked arbitration: the busy-worktree verdict
+    // (when the use case supplies one), duplicate, budget, then lowest free
+    // slot, in one read-modify-write.
     async reserveCapacityAtomically(
       request: ReserveCapacityAtomicallyRequest,
     ): Promise<ReserveCapacityAtomicallyResult> {
       const held = [...reservations.values()].filter((reservation) => reservation.held);
+      if (request.checkBusyWorktree !== undefined) {
+        const verdict = await request.checkBusyWorktree(held);
+        if (verdict.outcome === 'busy-worktree') {
+          return { outcome: 'busy-worktree', blockingAttemptId: verdict.blockingAttemptId };
+        }
+      }
       const duplicate = held.find((reservation) => reservation.attemptId === request.attemptId);
       if (duplicate !== undefined) {
         return {
@@ -560,6 +568,64 @@ describe('ReserveExecutionCapacityUseCase', () => {
     );
 
     expect(result).toEqual({ outcome: 'busy-worktree', blockingAttemptId: 'attempt-3' });
+  });
+
+  it('decides the busy-worktree check inside the journal lock, not before it (Opus note on #58)', async () => {
+    // A real journal adapter wrapped with a lock marker: the marker is true
+    // only while the adapter's locked read-modify-write is in flight.
+    const inner = new ExecutionJournalAdapter();
+    let lockActive = false;
+    const journal: ExecutionJournalPort = {
+      async appendJournalEntry(entry) {
+        await inner.appendJournalEntry(entry);
+      },
+      async listJournalEntriesForAttempt(attemptId) {
+        return inner.listJournalEntriesForAttempt(attemptId);
+      },
+      async saveCapacityReservation(reservation) {
+        await inner.saveCapacityReservation(reservation);
+      },
+      async listActiveReservations(hostId) {
+        return inner.listActiveReservations(hostId);
+      },
+      async releaseCapacityReservation(attemptId, releasedAtIso) {
+        return inner.releaseCapacityReservation(attemptId, releasedAtIso);
+      },
+      async reserveCapacityAtomically(request) {
+        lockActive = true;
+        try {
+          return await inner.reserveCapacityAtomically(request);
+        } finally {
+          lockActive = false;
+        }
+      },
+    };
+    // The conflicting claim registers only while the lock is held, as a
+    // concurrent registration between the request and the append would.
+    const conflicting = storedAttempt({
+      id: 'attempt-2',
+      workOrderId: 'wo-2',
+      state: 'intent-recorded',
+      worktreePath: '/lanes/attempt-9',
+    });
+    const baseRepo = makeAttemptRepo();
+    const attemptRepo = {
+      ...baseRepo,
+      async listAllAttempts() {
+        return lockActive ? [conflicting] : [];
+      },
+    } as AttemptRepositoryPort;
+    const useCase = new ReserveExecutionCapacityUseCase({ journal, attemptRepo });
+
+    const result = await useCase.reserveExecutionCapacity(
+      validReservationRequest() as Parameters<
+        ReserveExecutionCapacityUseCase['reserveExecutionCapacity']
+      >[0],
+    );
+
+    expect(result).toEqual({ outcome: 'busy-worktree', blockingAttemptId: 'attempt-2' });
+    // Nothing was written: the busy verdict refused the claim under the lock.
+    expect(await journal.listActiveReservations()).toHaveLength(0);
   });
 
   it('allows reusing a worktree whose attempt ended, and reports no-free-slot when the budget is exhausted', async () => {
@@ -1050,14 +1116,6 @@ function validDispatchRequest(overrides: Record<string, unknown> = {}) {
     stepLimit: 40,
     timeLimitSeconds: 3600,
     expectedArtifacts: ['dist/report.json'],
-    requiredCapabilities: {
-      filesystemScope: 'scoped-worktree',
-      networkEgressRestricted: true,
-      cpuAndMemoryLimited: true,
-      processTreeTermination: true,
-      authoritativeCompletion: true,
-      artifactPersistence: true,
-    },
     nowIso: '2026-10-15T08:00:00.000Z',
     ...overrides,
   };
@@ -1171,6 +1229,84 @@ describe('DispatchAttemptUseCase', () => {
       reason: 'Runner capabilities do not satisfy required isolation',
     });
     expect(noTermination.runner.startCalls).toHaveLength(0);
+  });
+
+  it('refuses dispatch for an undeclared runner whose filesystem scope is unknown (D4)', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        capabilities: {
+          source: 'undeclared',
+          filesystemScope: 'unknown',
+          networkEgressRestricted: false,
+          cpuAndMemoryLimited: false,
+          processTreeTermination: false,
+        },
+      },
+    });
+
+    const request = validDispatchRequest();
+    const result = await setup.useCase.dispatchAttempt(
+      request as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    // The unwaivable capability check refuses the unknown scope; no flag or
+    // request field can waive it.
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Runner capabilities do not satisfy required isolation',
+    });
+    expect(setup.runner.startCalls).toHaveLength(0);
+  });
+
+  it('dispatches a declared container profile and sends the brief requirements to the runner', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        capabilities: {
+          source: 'declared',
+          filesystemScope: 'scoped-worktree',
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+        },
+      },
+    });
+
+    const request = validDispatchRequest();
+    const result = await setup.useCase.dispatchAttempt(
+      request as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('started');
+    expect(setup.runner.startCalls).toHaveLength(1);
+    // The runner start still receives the brief's requirements, never an
+    // operator override.
+    expect(setup.runner.startCalls[0].requiredCapabilities).toEqual({
+      filesystemScope: 'scoped-worktree',
+      networkEgressRestricted: true,
+      cpuAndMemoryLimited: true,
+      processTreeTermination: true,
+      authoritativeCompletion: true,
+      artifactPersistence: true,
+    });
+  });
+
+  it('applies the brief requirements when the request carries none', async () => {
+    // A runner that reports today's booleans but a relaxed egress stance is
+    // refused by the brief profile, even with no request capabilities.
+    const setup = makeDispatchSetup({
+      runnerOptions: { capabilities: { networkEgressRestricted: false } },
+    });
+
+    const request = validDispatchRequest();
+    const result = await setup.useCase.dispatchAttempt(
+      request as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Runner capabilities do not satisfy required isolation',
+    });
+    expect(setup.runner.startCalls).toHaveLength(0);
   });
 
   it('refuses dispatch for a dirty or mismatched worktree', async () => {

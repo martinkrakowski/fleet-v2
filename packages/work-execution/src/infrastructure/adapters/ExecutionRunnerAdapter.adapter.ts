@@ -86,9 +86,18 @@ export interface ExecutionRunnerAdapterOptions {
   readonly executor?: CommandExecutorPort;
   /** Capability overrides on top of the enforced defaults. */
   readonly capabilities?: Partial<RunnerIsolationCapabilities>;
+  /**
+   * Transport of the host holding the lane-runner role (D5). A `local` host's
+   * runner environment drops `SSH_AUTH_SOCK`; an `ssh` host and an unset
+   * transport keep the full allow-list.
+   */
+  readonly runnerTransport?: 'local' | 'ssh';
 }
 
 const defaultCapabilities: RunnerIsolationCapabilities = {
+  // The enforced default is today's v1 / env-only behaviour, so its profile
+  // reports the loader-derived `legacy-asserted` source (D4).
+  source: 'legacy-asserted',
   filesystemScope: 'scoped-worktree',
   networkEgressRestricted: true,
   cpuAndMemoryLimited: true,
@@ -127,12 +136,27 @@ export const RUNNER_ENV_ALLOWLIST: readonly string[] = [
   'SYSTEMROOT',
 ];
 
+export interface RunnerEnvOptions {
+  /**
+   * Transport of the host holding the lane-runner role (D5). A `local` host's
+   * runner environment drops `SSH_AUTH_SOCK`; the trimmed environment applies
+   * only to the lane process, never to the orchestrator's own git and gh calls.
+   */
+  readonly transport?: 'local' | 'ssh';
+}
+
 /** Build the sanitized subprocess environment from the allow-list plus overrides. */
 export function buildRunnerEnv(
   overrides?: Readonly<Record<string, string>>,
+  options?: RunnerEnvOptions,
 ): NodeJS.ProcessEnv {
+  const localTransport = options?.transport === 'local';
   const sanitized: NodeJS.ProcessEnv = {};
   for (const key of RUNNER_ENV_ALLOWLIST) {
+    // A single-machine lane (D5) never inherits the operator's ssh agent.
+    if (localTransport && key === 'SSH_AUTH_SOCK') {
+      continue;
+    }
     const value = process.env[key];
     if (value !== undefined) {
       sanitized[key] = value;
@@ -146,10 +170,11 @@ async function runViaExecFile(
   command: string,
   args: readonly string[],
   env?: Readonly<Record<string, string>>,
+  envOptions?: RunnerEnvOptions,
 ): Promise<SubprocessResult> {
   try {
     const { stdout, stderr } = await execFileAsync(command, [...args], {
-      env: buildRunnerEnv(env),
+      env: buildRunnerEnv(env, envOptions),
       // A live `ocm-run --format json` run streams NDJSON on stdout; the
       // default 1 MiB node buffer truncates it and reports a runner failure.
       maxBuffer: RUNNER_MAX_BUFFER_BYTES,
@@ -658,6 +683,10 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     args: readonly string[],
     env?: Readonly<Record<string, string>>,
   ): Promise<SubprocessResult> {
+    // D5: the lane-runner host's transport decides whether the runner
+    // environment keeps `SSH_AUTH_SOCK`; every non-runner subprocess keeps
+    // the full allow-list regardless.
+    const envOptions: RunnerEnvOptions = { transport: this.options?.runnerTransport };
     const injected = this.options?.runSubprocess;
     if (injected !== undefined) return injected(command, args, env);
     const executor = this.options?.executor;
@@ -666,7 +695,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       // environment (from process.env) plus the OCM overrides — never the
       // full process env and never only the two OCM variables — and the
       // same 64 MiB output budget the legacy execFile path enforced.
-      const runEnv = buildRunnerEnv(env as Record<string, string> | undefined);
+      const runEnv = buildRunnerEnv(env as Record<string, string> | undefined, envOptions);
       return executor
         .run([command, ...args], {
           env: { ...runEnv } as Record<string, string>,
@@ -680,6 +709,6 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
           return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
         });
     }
-    return runViaExecFile(command, args, env);
+    return runViaExecFile(command, args, env, envOptions);
   }
 }

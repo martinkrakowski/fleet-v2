@@ -3,7 +3,9 @@
  * LocalExecutor implements the evidence context's CommandExecutorPort by
  * spawning the argv array directly (no shell): every argument travels as one
  * argv element. `input` is written to the child's stdin and stdin is then
- * closed; `timeoutMs` kills the child's whole process tree; `maxBufferBytes`
+ * closed; `timeoutMs` kills the child's whole process tree (default 60 s
+ * when omitted); an omitted `env` gives the child only the allow-listed
+ * host variables, never the full host environment; `maxBufferBytes`
  * caps the captured output and overrunning it is an error, never a silent
  * truncation.
  */

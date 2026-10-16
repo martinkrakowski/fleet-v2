@@ -8,9 +8,11 @@
  * Every remote word is POSIX-single-quoted, so no argument is ever split or
  * interpreted by the remote shell. `input` is written to the ssh client's
  * stdin (carrying it to the remote command's stdin) and stdin is then
- * closed; `timeoutMs` kills the ssh client's whole process tree;
- * `maxBufferBytes` caps the captured output. An unsafe host is refused
- * before any subprocess is spawned.
+ * closed; `timeoutMs` kills the ssh client's whole process tree (default
+ * 60 s when omitted); an omitted `env` gives the ssh client only the
+ * allow-listed host variables including SSH_AUTH_SOCK, never the full host
+ * environment; `maxBufferBytes` caps the captured output. An unsafe host is
+ * refused before any subprocess is spawned.
  */
 
 import { isSafeSshHost } from './WorkspaceAdapter.adapter.js';

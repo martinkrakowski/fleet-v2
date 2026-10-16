@@ -3,9 +3,15 @@
  * executors (local and ssh transports). No shell is ever involved: the argv
  * array travels as separate words. `input` is written to the child's stdin
  * and stdin is then closed, so a command that reads stdin always receives
- * the bytes. A `timeoutMs` budget kills the whole process tree; a
- * `maxBufferBytes` cap kills the process tree instead of truncating output
- * silently.
+ * the bytes. A `timeoutMs` budget kills the whole process tree; when the
+ * caller gives none, the default budget (60 s) applies. A `maxBufferBytes`
+ * cap kills the process tree instead of truncating output silently.
+ *
+ * When the caller passes no `env`, the child inherits only the allow-listed
+ * host variables (PATH, HOME, USER, LOGNAME, LANG, LC_ALL, TMPDIR, plus
+ * SSH_AUTH_SOCK for the ssh transport) — never the full `process.env`, so a
+ * credential planted in the host environment (GH_TOKEN, AWS_*, a proxy
+ * password) cannot leak into a child.
  */
 
 import { spawn } from 'node:child_process';
@@ -13,6 +19,43 @@ import type { ChildProcess } from 'node:child_process';
 
 /** Default captured-output cap, matching the runner's reviewed 64 MiB. */
 export const DEFAULT_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+
+/** Default wall-clock budget for one run when the caller gives no timeout. */
+export const DEFAULT_RUN_TIMEOUT_MS = 60 * 1000;
+
+/**
+ * Host variables a child may inherit when the caller passes no `env`, plus
+ * the ssh-only addition. Everything else — credentials, tokens, host
+ * configuration — is stripped, fail closed.
+ */
+const CHILD_ENV_ALLOWLIST: readonly string[] = [
+  'PATH',
+  'HOME',
+  'USER',
+  'LOGNAME',
+  'LANG',
+  'LC_ALL',
+  'TMPDIR',
+];
+
+const SSH_CHILD_ENV_ALLOWLIST: readonly string[] = [...CHILD_ENV_ALLOWLIST, 'SSH_AUTH_SOCK'];
+
+/**
+ * Build the allow-listed child environment from the host environment. The
+ * ssh transport keeps `SSH_AUTH_SOCK` (the host's agent); a local child
+ * never sees it.
+ */
+export function allowListedChildEnv(transport: 'local' | 'ssh'): Record<string, string> {
+  const allowlist = transport === 'ssh' ? SSH_CHILD_ENV_ALLOWLIST : CHILD_ENV_ALLOWLIST;
+  const env: Record<string, string> = {};
+  for (const key of allowlist) {
+    const value = process.env[key];
+    if (value !== undefined) {
+      env[key] = value;
+    }
+  }
+  return env;
+}
 
 /** Grace between the timeout's SIGTERM to the process tree and the SIGKILL. */
 const KILL_GRACE_MS = 500;
@@ -70,12 +113,18 @@ export function runSpawnOutcome(
     let killGrace: ReturnType<typeof setTimeout> | undefined;
 
     const maxBufferBytes = options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES;
+    const timeoutMs = options.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
     let buffered = 0;
     let overran = false;
 
     const child = spawn(file, [...args], {
       ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
-      ...(options.env !== undefined ? { env: { ...options.env } } : {}),
+      // An explicit `env` is the complete child environment. Without one the
+      // child gets the allow-listed host variables, never `process.env`.
+      env:
+        options.env !== undefined
+          ? { ...options.env }
+          : allowListedChildEnv(file === 'ssh' ? 'ssh' : 'local'),
       // A detached child becomes its own POSIX process-group leader, so the
       // timeout can kill the tree and not only the direct child.
       detached: process.platform !== 'win32',
@@ -98,32 +147,29 @@ export function runSpawnOutcome(
       // The process tree was SIGKILLed; a close event still follows.
     };
 
-    const timer =
-      options.timeoutMs !== undefined
-        ? setTimeout(() => {
-            if (killed === null) {
-              killed = 'SIGTERM';
-              error = `command exceeded its ${String(options.timeoutMs)}ms timeout and its process tree was killed`;
-              // SIGTERM first so a well-behaved tree can flush; SIGKILL follows.
-              if (child.pid !== undefined) {
-                try {
-                  process.kill(-child.pid, 'SIGTERM');
-                } catch {
-                  try {
-                    child.kill('SIGTERM');
-                  } catch {
-                    // already exited
-                  }
-                }
-              }
+    const timer = setTimeout(() => {
+      if (killed === null) {
+        killed = 'SIGTERM';
+        error = `command exceeded its ${String(timeoutMs)}ms timeout and its process tree was killed`;
+        // SIGTERM first so a well-behaved tree can flush; SIGKILL follows.
+        if (child.pid !== undefined) {
+          try {
+            process.kill(-child.pid, 'SIGTERM');
+          } catch {
+            try {
+              child.kill('SIGTERM');
+            } catch {
+              // already exited
             }
-            killGrace = setTimeout(() => {
-              if (child.exitCode === null && child.signalCode === null) {
-                killProcessTree(child);
-              }
-            }, KILL_GRACE_MS);
-          }, options.timeoutMs)
-        : undefined;
+          }
+        }
+      }
+      killGrace = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          killProcessTree(child);
+        }
+      }, KILL_GRACE_MS);
+    }, timeoutMs);
 
     const considerBuffer = (chunk: string): boolean => {
       buffered += Buffer.byteLength(chunk, 'utf8');

@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 
 import { LocalExecutor } from '../LocalExecutor.adapter.js';
 import { SshExecutor, posixQuote, sshArgvFor } from '../SshExecutor.adapter.js';
+import { runSpawnOutcome } from '../spawn-run.js';
 import { executorForHost, resolveRoleExecutors } from '../ExecutorSelector.adapter.js';
 import { WorkspaceAdapter } from '../WorkspaceAdapter.adapter.js';
 import { AttemptArtifactAdapter } from '../AttemptArtifactAdapter.adapter.js';
@@ -442,5 +443,286 @@ describe('resolveRoleExecutors', () => {
         hosts: { broken: { transport: 'ssh', roles: ['lane-runner'] } },
       }),
     ).toThrow(/sshAlias/);
+  });
+});
+
+/** A never-exiting child: only the process-tree kill can end it. */
+function hungChild(pid: number) {
+  const child = Object.assign(new EventEmitter(), {
+    pid,
+    exitCode: null,
+    signalCode: null,
+    stdin: { write: () => true, end: () => {}, on: () => child },
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    kill: vi.fn((signal?: NodeJS.Signals) => {
+      if (signal === 'SIGTERM' || signal === 'SIGKILL') {
+        queueMicrotask(() => child.emit('close', null, signal));
+      }
+      return true;
+    }),
+  });
+  return child;
+}
+
+/** A scripted child that exits 0 right after spawn (next microtask). */
+function quickChild(pid: number) {
+  const child = Object.assign(new EventEmitter(), {
+    pid,
+    stdin: { write: () => true, end: () => {}, on: () => child },
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    kill: vi.fn(),
+  });
+  queueMicrotask(() => child.emit('close', 0, null));
+  return child;
+}
+
+function setProcessEnv(key: string, value: string | undefined): () => void {
+  const previous = process.env[key];
+  process.env[key] = value;
+  return () => {
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
+  };
+}
+
+describe('default child environment (spawn-run allow-list)', () => {
+  it('keeps a planted GH_TOKEN out of a local child environment when no env is given', async () => {
+    const restore = setProcessEnv('GH_TOKEN', 'gh-secret-token');
+    try {
+      const result = await new LocalExecutor().run(['/bin/sh', '-c', 'printf %s "$GH_TOKEN"']);
+      expect(result.exitCode).toBe(0);
+      // The credential never reached the child.
+      expect(result.stdout).toBe('');
+    } finally {
+      restore();
+    }
+  });
+
+  it('keeps the allow-listed working set for a local child and drops SSH_AUTH_SOCK', async () => {
+    const restore = setProcessEnv('SSH_AUTH_SOCK', '/tmp/planted-agent.sock');
+    try {
+      const path_ = await new LocalExecutor().run(['/bin/sh', '-c', 'printf %s "$PATH"']);
+      expect(path_.exitCode).toBe(0);
+      expect(path_.stdout.length).toBeGreaterThan(0);
+      expect(path_.stdout).toBe(process.env.PATH);
+      const agent = await new LocalExecutor().run(['/bin/sh', '-c', 'printf %s "$SSH_AUTH_SOCK"']);
+      expect(agent.exitCode).toBe(0);
+      // SSH_AUTH_SOCK is an ssh-only allowance; a local child never sees it.
+      expect(agent.stdout).toBe('');
+    } finally {
+      restore();
+    }
+  });
+
+  it('treats an explicit env as the complete environment instead of merging the allow-list', async () => {
+    const restore = setProcessEnv('GH_TOKEN', 'gh-secret-token');
+    try {
+      const result = await new LocalExecutor().run(
+        ['/bin/sh', '-c', 'printf %s "$LANE_EXECUTOR_TEST_VAR|$GH_TOKEN"'],
+        { env: { LANE_EXECUTOR_TEST_VAR: 'explicit-wins' } },
+      );
+      expect(result.exitCode).toBe(0);
+      // The explicit variable travels; nothing else (the planted token) is
+      // merged in behind the caller's back.
+      expect(result.stdout).toBe('explicit-wins|');
+    } finally {
+      restore();
+    }
+  });
+
+  it('gives the ssh client an allow-listed environment: GH_TOKEN stripped, SSH_AUTH_SOCK kept', async () => {
+    const restoreToken = setProcessEnv('GH_TOKEN', 'gh-secret-token');
+    const restoreSock = setProcessEnv('SSH_AUTH_SOCK', '/tmp/planted-agent.sock');
+    const child = Object.assign(new EventEmitter(), {
+      pid: 42_426,
+      stdin: { write: () => true, end: () => {}, on: () => child },
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      kill: vi.fn(),
+    });
+    const spawnMock = vi.fn((..._args: unknown[]) => child);
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+    try {
+      const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
+      const executor = new FreshSshExecutor({ host: 'midnight' });
+      const pending = executor.run(['git', 'status']);
+      setImmediate(() => child.emit('close', 0, null));
+      const result = await pending;
+      expect(result.exitCode).toBe(0);
+      const env = (spawnMock.mock.calls[0][2] as { env?: Record<string, string> } | undefined)?.env;
+      expect(env).toBeDefined();
+      expect(env?.GH_TOKEN).toBeUndefined();
+      // The ssh transport keeps the host's agent socket.
+      expect(env?.SSH_AUTH_SOCK).toBe('/tmp/planted-agent.sock');
+      expect(typeof env?.PATH).toBe('string');
+      expect(typeof env?.HOME).toBe('string');
+    } finally {
+      restoreToken();
+      restoreSock();
+      vi.doUnmock('node:child_process');
+      vi.resetModules();
+    }
+  });
+});
+
+describe('default run timeout (spawn-run)', () => {
+  it('kills a hung command at the 60s default and reports the failure, never success', async () => {
+    const child = hungChild(42_427);
+    const spawnMock = vi.fn(() => child);
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+    vi.useFakeTimers();
+    try {
+      const { runSpawnOutcome: freshRunSpawnOutcome } = await import('../spawn-run.js');
+      const pending = freshRunSpawnOutcome('/bin/sleep', ['999']);
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(child.kill).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+      const outcome = await pending;
+      expect(outcome.exitCode).toBeNull();
+      expect(outcome.signal).toBe('SIGTERM');
+      expect(outcome.error).toContain('60000ms timeout');
+    } finally {
+      vi.useRealTimers();
+      vi.doUnmock('node:child_process');
+      vi.resetModules();
+    }
+  });
+
+  it('still completes a fast command normally under the default budget', async () => {
+    const outcome = await runSpawnOutcome('/bin/echo', ['fleet']);
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.stdout).toBe('fleet\n');
+    expect(outcome.error).toBeUndefined();
+  });
+});
+
+describe('explicit per-command budgets through the adapters', () => {
+  it('WorkspaceAdapter gives every git command and test probe a 60s budget', async () => {
+    const { executor, calls } = fakeExecutor((call, index) =>
+      index === 0 ? { stdout: 'base0000\n' } : index === 1 ? { stdout: '' } : { exitCode: 1 },
+    );
+    const adapter = new WorkspaceAdapter({ executor: executor });
+    await adapter.inspectWorktree({
+      worktreePath: '/wt',
+      baseCommit: 'base0000',
+      expectedArtifactPaths: [],
+    });
+    const gitCalls = calls.filter((call) => call.argv[0] === 'git');
+    const probeCalls = calls.filter((call) => call.argv[0] === 'test');
+    expect(gitCalls.length).toBeGreaterThanOrEqual(2);
+    expect(probeCalls.length).toBeGreaterThanOrEqual(1); // residue probes
+    for (const call of [...gitCalls, ...probeCalls]) {
+      expect(call.options?.timeoutMs).toBe(60_000);
+    }
+  });
+
+  it('WorkspaceAdapter gives cat reads a 60s budget', async () => {
+    const { executor, calls } = fakeExecutor(() => ({ stdout: 'file-bytes' }));
+    const adapter = new WorkspaceAdapter({ executor: executor });
+    await adapter.readWorktreeFile('/wt', '.lane/brief.md');
+    expect(calls).toHaveLength(1);
+    expect(calls[0].argv[0]).toBe('cat');
+    expect(calls[0].options?.timeoutMs).toBe(60_000);
+  });
+
+  it('AttemptArtifactAdapter gives tee 120s and every other command 60s', async () => {
+    const { executor, calls } = fakeExecutor((call) =>
+      call.argv[0] === 'tee' ? { exitCode: 0 } : {},
+    );
+    const adapter = new AttemptArtifactAdapter({ executor: executor });
+    const result = await adapter.placeFrozenBrief({
+      attemptId: 'att-1',
+      worktreePath: '/wt',
+      proseMarkdown: '# Brief',
+      manifestJson: '{}',
+    });
+    expect(result.outcome).toBe('placed');
+    const teeCalls = calls.filter((call) => call.argv[0] === 'tee');
+    expect(teeCalls).toHaveLength(2);
+    for (const call of teeCalls) {
+      expect(call.options?.timeoutMs).toBe(120_000);
+    }
+    const otherCalls = calls.filter((call) => call.argv[0] !== 'tee');
+    expect(otherCalls.length).toBeGreaterThanOrEqual(3); // 2x check-ignore + mkdir
+    for (const call of otherCalls) {
+      expect(call.options?.timeoutMs).toBe(60_000);
+    }
+  });
+
+  it('AttemptArtifactAdapter gives cat reads a 60s budget', async () => {
+    const { executor, calls } = fakeExecutor(() => ({ stdout: '{}' }));
+    const adapter = new AttemptArtifactAdapter({ executor: executor });
+    await adapter.readBriefManifest('/wt');
+    expect(calls).toHaveLength(1);
+    expect(calls[0].argv[0]).toBe('cat');
+    expect(calls[0].options?.timeoutMs).toBe(60_000);
+  });
+});
+
+describe('a hung command through an adapter is killed at its budget', () => {
+  it('WorkspaceAdapter: a hung git command dies at the 60s budget and the inspection fails, never succeeds', async () => {
+    const child = hungChild(42_428);
+    const spawnMock = vi.fn(() => child);
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+    vi.useFakeTimers();
+    try {
+      const { LocalExecutor: FreshLocalExecutor } = await import('../LocalExecutor.adapter.js');
+      const { WorkspaceAdapter: FreshWorkspaceAdapter } = await import(
+        '../WorkspaceAdapter.adapter.js'
+      );
+      const adapter = new FreshWorkspaceAdapter({ executor: new FreshLocalExecutor() });
+      const pending = adapter.inspectWorktree({
+        worktreePath: '/wt',
+        baseCommit: 'base0000',
+        expectedArtifactPaths: [],
+      });
+      // Attach the rejection expectation before the kill lands, so the
+      // rejection is never unhandled.
+      const expectation = expect(pending).rejects.toThrow(/rev-parse HEAD failed/);
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(child.kill).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+      await expectation;
+    } finally {
+      vi.useRealTimers();
+      vi.doUnmock('node:child_process');
+      vi.resetModules();
+    }
+  });
+
+  it('AttemptArtifactAdapter: a hung tee dies at the 120s budget and the brief is refused, never placed', async () => {
+    let nextPid = 43_000;
+    const hung = hungChild(42_429);
+    const spawnMock = vi.fn((file: string) => (file === 'tee' ? hung : quickChild(nextPid++)));
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+    vi.useFakeTimers();
+    try {
+      const { LocalExecutor: FreshLocalExecutor } = await import('../LocalExecutor.adapter.js');
+      const { AttemptArtifactAdapter: FreshAttemptArtifactAdapter } = await import(
+        '../AttemptArtifactAdapter.adapter.js'
+      );
+      const adapter = new FreshAttemptArtifactAdapter({ executor: new FreshLocalExecutor() });
+      const pending = adapter.placeFrozenBrief({
+        attemptId: 'att-1',
+        worktreePath: '/wt',
+        proseMarkdown: '# Brief',
+        manifestJson: '{}',
+      });
+      await vi.advanceTimersByTimeAsync(119_999);
+      expect(hung.kill).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(hung.kill).toHaveBeenCalledWith('SIGTERM');
+      const result = await pending;
+      expect(result.outcome).toBe('refused');
+      expect((result as { reason?: string }).reason).toContain('120000ms timeout');
+    } finally {
+      vi.useRealTimers();
+      vi.doUnmock('node:child_process');
+      vi.resetModules();
+    }
   });
 });

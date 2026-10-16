@@ -213,7 +213,7 @@ describe('CheckKnowledgeClaimUseCase', () => {
 
   it('records the check, updates verification and revision, and saves the entry', async () => {
     const repo = new InMemoryKnowledgeEntryRepository();
-    const entry = makeEntry({ verification: 'unverified' });
+    const entry = makeEntry({ disposition: 'candidate', verification: 'unverified' });
     await repo.saveEntry(entry);
     const verifier = new StubClaimVerifier({
       verification: 'supported',
@@ -259,7 +259,7 @@ describe('CheckKnowledgeClaimUseCase', () => {
 
   it('records contradicted verdicts from the verifier', async () => {
     const repo = new InMemoryKnowledgeEntryRepository();
-    await repo.saveEntry(makeEntry());
+    await repo.saveEntry(makeEntry({ disposition: 'candidate', verification: 'unverified' }));
     const verifier = new StubClaimVerifier({ verification: 'contradicted', evidenceRef: 'evidence-2' });
     const useCase = new CheckKnowledgeClaimUseCase({ repo, verifier });
 
@@ -315,7 +315,7 @@ describe('DecideKnowledgeDispositionUseCase', () => {
 
     expect(result).toEqual({
       outcome: 'rejected',
-      reason: 'Only supported (verified) claims may be accepted as keepers',
+      reason: 'An unverified claim cannot become accepted; run a supported check first',
     });
     expect(repo.entries.get('entry-1')?.disposition).toBe('candidate');
     expect(repo.entries.get('entry-1')?.revision).toBe(1);
@@ -324,7 +324,10 @@ describe('DecideKnowledgeDispositionUseCase', () => {
   it('never accepts policy proposals', async () => {
     const repo = new InMemoryKnowledgeEntryRepository();
     await repo.saveEntry(
-      makeEntry({ claimText: 'Add a new seat to the workspace plan and change permissions', verification: 'supported' }),
+      makeEntry({
+        disposition: 'policy-proposal',
+        verification: 'supported',
+      }),
     );
     const useCase = new DecideKnowledgeDispositionUseCase({ repo });
 
@@ -337,7 +340,7 @@ describe('DecideKnowledgeDispositionUseCase', () => {
 
     expect(result).toEqual({
       outcome: 'rejected',
-      reason: 'Policy proposals must receive policy-proposal disposition, never accepted',
+      reason: 'A policy proposal never becomes an accepted keeper; coordinate it as policy',
     });
   });
 
@@ -657,6 +660,8 @@ describe('RecordContextSelectionUseCase', () => {
 
   it('records selections for an attempt in order', async () => {
     const repo = new InMemoryKnowledgeEntryRepository();
+    await repo.saveEntry(makeEntry({ id: 'keeper-1', disposition: 'accepted', verification: 'supported' }));
+    await repo.saveEntry(makeEntry({ id: 'keeper-2', disposition: 'accepted', verification: 'supported' }));
     const useCase = new RecordContextSelectionUseCase({ repo });
 
     const request: RecordBriefContextSelectionRequest = {
@@ -669,7 +674,13 @@ describe('RecordContextSelectionUseCase', () => {
           accepted: true,
           decisionBecause: 'applies to src/api',
         },
-        { proposalId: 'bkp-2', knowledgeEntryId: 'keeper-2', version: '1.0.0', accepted: false },
+        {
+          proposalId: 'bkp-2',
+          knowledgeEntryId: 'keeper-2',
+          version: '1.0.0',
+          accepted: false,
+          decisionBecause: 'selected by orchestrator',
+        },
       ],
     };
     const result = await useCase.recordContextSelection(request);
@@ -684,7 +695,13 @@ describe('RecordContextSelectionUseCase', () => {
       accepted: true,
       decisionBecause: 'applies to src/api',
     });
-    expect(stored[1]?.decisionBecause).toBe('selected by orchestrator');
+    expect(stored[1]).toEqual({
+      attemptId: 'attempt-1',
+      knowledgeEntryId: 'keeper-2',
+      version: '1.0.0',
+      accepted: false,
+      decisionBecause: 'selected by orchestrator',
+    });
   });
 
   it('rejects a blank attemptId and an empty selection list', async () => {

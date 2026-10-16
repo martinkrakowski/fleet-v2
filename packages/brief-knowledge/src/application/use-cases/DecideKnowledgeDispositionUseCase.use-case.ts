@@ -6,6 +6,7 @@
  * proposal never becomes an accepted keeper.
  */
 
+import { KnowledgeEntry } from '../../domain/entities/KnowledgeEntry.js';
 import { KNOWLEDGE_DISPOSITIONS } from '../../domain/value-objects/KnowledgeDisposition.vo.js';
 import type { KnowledgeEntryRecord } from '../../domain/knowledge-records.js';
 import type {
@@ -14,9 +15,6 @@ import type {
   DecideKnowledgeDispositionResult,
 } from '../ports/in/DecideKnowledgeDispositionPort.in-port.js';
 import type { KnowledgeEntryRepositoryPort } from '../ports/out/KnowledgeEntryRepositoryPort.out-port.js';
-
-/** Claims mentioning rule/seat/permission/policy changes are policy proposals. */
-const POLICY_PROPOSAL_PATTERN = /\b(rules?|seats?|permissions?|polic(?:y|ies))\b/i;
 
 export interface DecideKnowledgeDispositionDependencies {
   readonly repo: KnowledgeEntryRepositoryPort;
@@ -61,37 +59,27 @@ export class DecideKnowledgeDispositionUseCase implements DecideKnowledgeDisposi
       return { outcome: 'rejected', reason: `Knowledge entry not found: ${request.entryId}` };
     }
 
-    if (request.disposition === 'accepted' && entry.verification !== 'supported') {
+    const nowIso = request.nowIso ?? new Date().toISOString();
+    let updated: KnowledgeEntryRecord;
+    try {
+      const aggregate = KnowledgeEntry.fromRecord(entry);
+      updated = aggregate.decideDisposition({
+        disposition: request.disposition,
+        checkerId: request.checkerId,
+        reason: request.reason,
+        nowIso,
+      });
+    } catch (error) {
       return {
         outcome: 'rejected',
-        reason: 'Only supported (verified) claims may be accepted as keepers',
-      };
-    }
-    if (request.disposition === 'accepted' && proposesPolicyChange(entry.claimText)) {
-      return {
-        outcome: 'rejected',
-        reason: 'Policy proposals must receive policy-proposal disposition, never accepted',
+        reason: error instanceof Error ? error.message : String(error),
       };
     }
 
-    const nowIso = request.nowIso ?? new Date().toISOString();
-    const updated: KnowledgeEntryRecord = {
-      ...entry,
-      disposition: request.disposition,
-      checkerId: request.checkerId,
-      dispositionReason: request.reason,
-      revision: entry.revision + 1,
-      updatedAtIso: nowIso,
-    };
     await repo.saveEntry(updated);
 
     return { outcome: 'decided', entry: updated };
   }
-}
-
-/** A claim that proposes changing rules, seats or permissions is a policy proposal. */
-function proposesPolicyChange(claimText: string): boolean {
-  return POLICY_PROPOSAL_PATTERN.test(claimText);
 }
 
 function isValidRequest(request: unknown): request is DecideKnowledgeDispositionRequest {

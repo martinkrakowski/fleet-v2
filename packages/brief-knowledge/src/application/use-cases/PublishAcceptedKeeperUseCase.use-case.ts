@@ -5,6 +5,7 @@
  * failure does not fail otherwise acceptable work.
  */
 
+import { KnowledgeEntry } from '../../domain/entities/KnowledgeEntry.js';
 import type {
   PublishAcceptedKeeperPort,
   PublishAcceptedKeeperRequest,
@@ -48,8 +49,20 @@ export class PublishAcceptedKeeperUseCase implements PublishAcceptedKeeperPort {
     if (entry.disposition !== 'accepted') {
       return { outcome: 'rejected', reason: 'Only accepted keepers may be published' };
     }
+    if (entry.verification !== 'supported') {
+      return { outcome: 'rejected', reason: 'Only supported keepers may be published' };
+    }
     if (entry.supersededById !== null) {
       return { outcome: 'rejected', reason: 'Superseded keepers may not be published' };
+    }
+
+    try {
+      KnowledgeEntry.fromRecord(entry);
+    } catch (error) {
+      return {
+        outcome: 'rejected',
+        reason: error instanceof Error ? error.message : String(error),
+      };
     }
 
     const publication = await publisher.publishKeeperToShelf({ entry });

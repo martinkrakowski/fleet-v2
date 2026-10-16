@@ -15,9 +15,6 @@ import type {
 } from '../ports/in/RecordContextSelectionPort.in-port.js';
 import type { KnowledgeEntryRepositoryPort } from '../ports/out/KnowledgeEntryRepositoryPort.out-port.js';
 
-/** Provenance default when the orchestrator supplies no explicit reason. */
-const DEFAULT_DECISION_BECAUSE = 'selected by orchestrator';
-
 export interface RecordContextSelectionDependencies {
   readonly repo: KnowledgeEntryRepositoryPort;
 }
@@ -51,12 +48,51 @@ export class RecordContextSelectionUseCase implements RecordContextSelectionPort
 
     const selections: ContextSelectionProps[] = [];
     for (const item of request.selections) {
+      if (!item || typeof item !== 'object') {
+        return { outcome: 'rejected', reason: 'RecordContextSelection received an invalid selection item' };
+      }
+      if (isBlank(item.knowledgeEntryId)) {
+        return { outcome: 'rejected', reason: 'ContextSelection requires a non-empty knowledgeEntryId' };
+      }
+      if (isBlank(item.version)) {
+        return { outcome: 'rejected', reason: 'ContextSelection requires a non-empty version' };
+      }
+      if (typeof item.accepted !== 'boolean') {
+        return { outcome: 'rejected', reason: 'RecordContextSelection requires a boolean accepted' };
+      }
+      // Mandatory provenance: no fabricated default reason; reject when absent.
+      if (isBlank(item.decisionBecause)) {
+        return {
+          outcome: 'rejected',
+          reason: 'RecordContextSelection requires a non-empty decisionBecause for each selection',
+        };
+      }
+
+      // Refuse selecting an entry that is not an accepted keeper.
+      const entry = await this.deps.repo.findEntryById(item.knowledgeEntryId);
+      if (!entry) {
+        return {
+          outcome: 'rejected',
+          reason: `Knowledge entry not found: ${item.knowledgeEntryId}`,
+        };
+      }
+      const isAcceptedKeeper =
+        entry.disposition === 'accepted' &&
+        entry.verification === 'supported' &&
+        entry.supersededById === null;
+      if (!isAcceptedKeeper) {
+        return {
+          outcome: 'rejected',
+          reason: `Only accepted keepers may be selected: entry ${entry.id} is not an accepted keeper (disposition: ${entry.disposition}, verification: ${entry.verification})`,
+        };
+      }
+
       const created = ContextSelection.create({
         attemptId: request.attemptId,
-        knowledgeEntryId: item?.knowledgeEntryId ?? '',
-        version: item?.version ?? '',
-        accepted: item?.accepted === true,
-        decisionBecause: item?.decisionBecause ?? DEFAULT_DECISION_BECAUSE,
+        knowledgeEntryId: item.knowledgeEntryId,
+        version: item.version,
+        accepted: item.accepted,
+        decisionBecause: item.decisionBecause,
       });
       if (!created.success || !created.value) {
         return {

@@ -4,6 +4,7 @@
  * it replaces and exclude superseded content from normal retrieval.
  */
 
+import { KnowledgeEntry } from '../../domain/entities/KnowledgeEntry.js';
 import type { KnowledgeEntryRecord } from '../../domain/knowledge-records.js';
 import type {
   SupersedeKnowledgeEntryPort,
@@ -69,15 +70,22 @@ export class SupersedeKnowledgeEntryUseCase implements SupersedeKnowledgeEntryPo
     }
 
     const nowIso = request.nowIso ?? new Date().toISOString();
-    const updatedOlder: KnowledgeEntryRecord = {
-      ...olderEntry,
-      disposition: 'superseded',
-      supersededById: newerEntry.id,
-      checkerId: request.checkerId,
-      dispositionReason: request.reason,
-      revision: olderEntry.revision + 1,
-      updatedAtIso: nowIso,
-    };
+    let updatedOlder: KnowledgeEntryRecord;
+    try {
+      const olderAggregate = KnowledgeEntry.fromRecord(olderEntry);
+      updatedOlder = olderAggregate.supersedeBy({
+        newerEntryId: newerEntry.id,
+        checkerId: request.checkerId,
+        reason: request.reason,
+        nowIso,
+      });
+    } catch (error) {
+      return {
+        outcome: 'rejected',
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+
     await repo.saveEntry(updatedOlder);
 
     return { outcome: 'superseded', olderEntry: updatedOlder, newerEntry };

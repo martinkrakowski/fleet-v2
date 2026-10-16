@@ -68,7 +68,7 @@ function stripOneFamilySuffix(value: string): string {
  * yields an empty family.
  */
 export function underlyingModelFamily(model: string): string {
-  let value = model;
+  let value = model.trim();
   const hashIndex = value.indexOf('#');
   if (hashIndex !== -1) {
     value = value.slice(0, hashIndex);

@@ -120,12 +120,10 @@ Waves: Q0 → Q1a → Q1b → Q2 and Q3 together (different apps) → Q4 → Q5 
 - The orchestrator declares `two-way` only for genuinely reversible choices; a wrong declaration still
   grants nothing (section 2).
 
-## Open questions for the owner
+## Owner decisions (2026-10-16: "proceed with recommended defaults")
 
-1. A signing command inside fleet-v2 (owner private key file, mode 600) to make one-way answers one step
-   shorter? Recommendation: not now; keep signing out of fleet-v2.
-2. Should expired two-way questions fall back to the recommendation? Recommendation: no; they stay blocking
-   and are re-asked.
+1. No signing command inside fleet-v2 for now; the owner keeps signing decision files outside it.
+2. Expired two-way questions never fall back to the recommendation; they stay blocking and are re-asked.
 
 ## Challenge this
 

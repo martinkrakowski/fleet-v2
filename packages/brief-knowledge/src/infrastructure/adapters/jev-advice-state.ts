@@ -227,7 +227,10 @@ function laneSegment(laneId: unknown): string {
  * within the journal's 256-character cap and never carries a raw lane id.
  */
 export function rankingContextRef(req: RankingContextRefRequest): string {
-  const candidateIds = req.candidates.map((candidate) => candidate.id).sort();
+  // Code-unit order, explicitly: the digest must not depend on the host's locale.
+  const candidateIds = req.candidates
+    .map((candidate) => candidate.id)
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
   const digest = sha256Hex(JSON.stringify({ candidateIds, taskSummary: req.taskSummary }));
   return `ranking:${laneSegment(req.laneId)}:${digest}`;
 }

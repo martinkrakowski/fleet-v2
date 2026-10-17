@@ -324,7 +324,7 @@ export class JevClaimTriageAdapter implements ClaimTriagePort {
           consumer: CLAIM_TRIAGE_CONSUMER,
           contextRef,
           provider: this.provider,
-          model: this.provider,
+          model: this.model,
           costUsd: undefined,
           questionKinds,
           latencyMs,

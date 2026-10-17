@@ -88,17 +88,28 @@ const BASE_REQUEST = {
   notesMarkdown: "- First lesson\n- Second instruction\n- Third status note",
 };
 
+/** A promise that resolves when the background triage of one capture settles. */
+function triageSettled(): { promise: Promise<void>; onTriageSettled: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, onTriageSettled: () => resolve() };
+}
+
 /** Capture once and return the use case, repo and captured entries. */
 async function captureWith(triage?: ClaimTriagePort): Promise<{
   repo: RecordingKnowledgeEntryRepository;
   entries: readonly KnowledgeEntryRecord[];
 }> {
   const repo = new RecordingKnowledgeEntryRepository();
+  const settled = triageSettled();
   const useCase = new CaptureCompletedAttemptNotesUseCase({
     repo,
-    ...(triage ? { triage } : {}),
+    ...(triage ? { triage, onTriageSettled: settled.onTriageSettled } : {}),
   });
   const result = await useCase.execute(BASE_REQUEST);
+  if (triage) await settled.promise;
   if (result.outcome !== "captured") {
     throw new Error(
       `expected captured outcome, got: ${JSON.stringify(result)}`,
@@ -176,8 +187,14 @@ describe("CaptureCompletedAttemptNotesUseCase post-capture triage hook", () => {
         scores: {},
       };
     });
-    const useCase = new CaptureCompletedAttemptNotesUseCase({ repo, triage });
+    const settled = triageSettled();
+    const useCase = new CaptureCompletedAttemptNotesUseCase({
+      repo,
+      triage,
+      onTriageSettled: settled.onTriageSettled,
+    });
     const result = await useCase.execute(BASE_REQUEST);
+    await settled.promise;
     expect(result.outcome).toBe("captured");
     // Only the still-undecided candidate got its flag.
     expect(repo.flagWrites).toEqual([
@@ -214,11 +231,31 @@ describe("CaptureCompletedAttemptNotesUseCase post-capture triage hook", () => {
       flags: { "ke-att-1-1": "policy-like" },
       scores: {},
     }));
-    const useCase = new CaptureCompletedAttemptNotesUseCase({ repo, triage });
+    const settled = triageSettled();
+    const useCase = new CaptureCompletedAttemptNotesUseCase({
+      repo,
+      triage,
+      onTriageSettled: settled.onTriageSettled,
+    });
     const result = await useCase.execute(BASE_REQUEST);
+    await settled.promise;
     expect(result.outcome).toBe("captured");
     const stored = await repo.findEntryById("ke-att-1-1");
     expect(stored?.disposition).toBe("candidate");
+  });
+
+  it("returns captured without waiting for a triage port that never answers", async () => {
+    const repo = new RecordingKnowledgeEntryRepository();
+    const triage = new FakeTriagePort(() => new Promise(() => undefined));
+    const useCase = new CaptureCompletedAttemptNotesUseCase({ repo, triage });
+    const result = await Promise.race([
+      useCase.execute(BASE_REQUEST),
+      new Promise<"timed-out">((resolve) => setTimeout(() => resolve("timed-out"), 500)),
+    ]);
+    expect(result).not.toBe("timed-out");
+    if (result === "timed-out") return;
+    expect(result.outcome).toBe("captured");
+    expect(repo.flagWrites).toEqual([]);
   });
 
   it("captures unchanged without a triage port (triage disabled)", async () => {

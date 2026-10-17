@@ -30,6 +30,12 @@ export interface CaptureCompletedAttemptNotesDependencies {
    * entry that already has a disposition.
    */
   readonly triage?: ClaimTriagePort;
+  /**
+   * Called once the background triage of one capture has settled (flags
+   * written or not). Capture never waits for it; tests and the composition
+   * root may use it to observe completion.
+   */
+  readonly onTriageSettled?: () => void;
 }
 
 export class CaptureCompletedAttemptNotesUseCase implements CaptureCompletedAttemptNotesPort {
@@ -152,13 +158,22 @@ export class CaptureCompletedAttemptNotesUseCase implements CaptureCompletedAtte
 
     // Post-capture triage hook (K5b): runs only after every candidate is
     // stored, writes advice-only flags and is never allowed to fail, delay
-    // or change the capture result.
+    // or change the capture result, so it is started and NOT awaited.
     if (this.deps.triage && candidateEntries.length > 0) {
-      await this.runPostCaptureTriage(
+      const onSettled = this.deps.onTriageSettled;
+      void this.runPostCaptureTriage(
         request.attemptId,
         request.pathPrefixes ?? [],
         candidateEntries,
-      );
+      )
+        .catch(() => undefined)
+        .finally(() => {
+          try {
+            onSettled?.();
+          } catch {
+            // An observer that throws never reaches the caller.
+          }
+        });
     }
 
     return { outcome: "captured", notesStatus: "present", candidateEntries };

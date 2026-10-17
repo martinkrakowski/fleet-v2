@@ -323,9 +323,7 @@ describe("pathUnderPrefix", () => {
 describe("checkLaneDiff (policy additions are never lifted, O14d1 S3)", () => {
   it("a policy-protected path applies even when the brief explicitly allows the fixed protected prefix", () => {
     const verdict = checkLaneDiff({
-      changedPaths: [
-        { path: ".github/workflows/ci.yml", status: "modified" },
-      ],
+      changedPaths: [{ path: ".github/workflows/ci.yml", status: "modified" }],
       allowedPathPrefixes: [".github"],
       policyProtectedPaths: [".github/workflows/"],
       secretPatterns: SCRIPT_PATTERNS,
@@ -357,7 +355,10 @@ describe("isFixedProtectedPath (script parity, O14d1)", () => {
     ).split("\n");
     const line = lines[83] ?? "";
     const match = /^PROTECTED='\^\((.*)\)'\r?$/.exec(line);
-    expect(match, "the script's PROTECTED line 84 was not found").not.toBeNull();
+    expect(
+      match,
+      "the script's PROTECTED line 84 was not found",
+    ).not.toBeNull();
     const alternatives = match![1]!.split("|");
     expect(alternatives.length).toBeGreaterThan(0);
     for (const alternative of alternatives) {
@@ -391,7 +392,11 @@ describe("isFixedProtectedPath (script parity, O14d1)", () => {
           ],
         },
       ],
-      { secretPatterns: [{ name: "github-token", regex: /gh[pousr]_[A-Za-z0-9]{20,}/g }] },
+      {
+        secretPatterns: [
+          { name: "github-token", regex: /gh[pousr]_[A-Za-z0-9]{20,}/g },
+        ],
+      },
     );
     expect(verdict.findings).toEqual([
       {

@@ -267,7 +267,11 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
           "probe a changed file's index blob",
         );
         if (!probe.ok)
-          return { outcome: "error", reason: "lane diff check: could not probe a changed file's index blob" };
+          return {
+            outcome: "error",
+            reason:
+              "lane diff check: could not probe a changed file's index blob",
+          };
         const index = await git(
           ["cat-file", "blob", `:${entry.path}`],
           "read a changed file's index blob",

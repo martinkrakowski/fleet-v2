@@ -2,8 +2,7 @@
   "schemaVersion": 2,
   "hosts": {
     "orchestrator-host": {
-      "transport": "ssh",
-      "sshAlias": "orchestrator-host.example",
+      "transport": "local",
       "worktreeRoot": "/srv/fleet/worktrees",
       "roles": ["orchestrator"]
     },

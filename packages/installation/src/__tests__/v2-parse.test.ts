@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
 import { describe, expect, it } from 'vitest';
 
 import { parseInstallation } from '../parse.js';
@@ -7,8 +10,7 @@ const validV2 = {
   schemaVersion: 2,
   hosts: {
     'lane-host': {
-      transport: 'ssh',
-      sshAlias: 'lane-host.example',
+      transport: 'local',
       worktreeRoot: '/srv/fleet/worktrees',
       roles: ['orchestrator', 'lane-runner'],
       runner: {
@@ -367,6 +369,19 @@ describe('parseInstallation v2', () => {
     expect(result).toEqual({ ok: true, installation: validV2 });
   });
 
+  it('parses both tracked installation examples', () => {
+    for (const example of ['single-machine/fleet.json', 'multi-machine/fleet.json']) {
+      const raw = readFileSync(
+        fileURLToPath(new URL(`../../../../installation.example/${example}`, import.meta.url)),
+        'utf8',
+      );
+      expect(parseInstallation(JSON.parse(raw))).toEqual({
+        ok: true,
+        installation: JSON.parse(raw),
+      });
+    }
+  });
+
   it('builds the hosts map with a null prototype', () => {
     const result = parseInstallation(validV2);
     expect(result.ok).toBe(true);
@@ -648,6 +663,108 @@ describe('parseInstallation v2', () => {
       ok: false,
       errors: ['hosts.lane.runner: required when the host holds the lane-runner role'],
     });
+  });
+
+  it('refuses a second lane-runner host: exactly one lane-runner host', () => {
+    const result = parseInstallation({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        first: {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/first',
+          roles: ['orchestrator', 'lane-runner'],
+          runner: { kind: 'opencode', port: 46000 },
+        },
+        second: {
+          transport: 'ssh',
+          sshAlias: 'second.example',
+          worktreeRoot: '/srv/fleet/second',
+          roles: ['lane-runner'],
+          runner: { kind: 'opencode', port: 46001 },
+        },
+      },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['hosts: at most one host may hold the lane-runner role'],
+    });
+  });
+
+  it('refuses an orchestrator host whose transport is not local', () => {
+    const result = parseInstallation({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        here: {
+          transport: 'ssh',
+          sshAlias: 'here.example',
+          worktreeRoot: '/srv/fleet/here',
+          roles: ['orchestrator'],
+        },
+        lane: {
+          transport: 'ssh',
+          sshAlias: 'lane.example',
+          worktreeRoot: '/srv/fleet/lane',
+          roles: ['lane-runner'],
+          runner: { kind: 'opencode', port: 46000 },
+        },
+      },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['hosts.here.transport: must be "local" when the host holds the orchestrator role'],
+    });
+  });
+
+  it('refuses equal derived dial ports: a local 46001 runner and an ssh 46000 runner', () => {
+    const result = parseInstallation({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        lane: {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['orchestrator', 'lane-runner'],
+          runner: { kind: 'opencode', port: 46001 },
+        },
+        verify: {
+          transport: 'ssh',
+          sshAlias: 'verify.example',
+          worktreeRoot: '/srv/fleet/verify',
+          roles: ['verifier'],
+          // An agy runner takes part in the dial-port rule with its port.
+          runner: { kind: 'agy', port: 46000, agyMode: 'edit-only' },
+        },
+      },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['hosts.verify.runner.port: derived dial port must be unique across hosts'],
+    });
+  });
+
+  it('accepts distinct derived dial ports: a local 46000 runner and an ssh 46001 runner', () => {
+    const result = parseInstallation({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        lane: {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['orchestrator', 'lane-runner'],
+          runner: { kind: 'opencode', port: 46000 },
+        },
+        verify: {
+          transport: 'ssh',
+          sshAlias: 'verify.example',
+          worktreeRoot: '/srv/fleet/verify',
+          roles: ['verifier'],
+          runner: { kind: 'agy', port: 46001, agyMode: 'edit-only' },
+        },
+      },
+    });
+    expect(result.ok).toBe(true);
   });
 
   it('rejects empty or repeated host roles', () => {

@@ -10,8 +10,7 @@ const validV2: FleetInstallationV2 = {
   schemaVersion: 2,
   hosts: {
     'lane-host': {
-      transport: 'ssh',
-      sshAlias: 'lane-host.example',
+      transport: 'local',
       worktreeRoot: '/srv/fleet/worktrees',
       roles: ['orchestrator', 'lane-runner'],
       runner: {
@@ -182,8 +181,7 @@ describe('writeInstallationV2', () => {
           },
           roles: ['orchestrator', 'lane-runner'],
           worktreeRoot: '/srv/fleet/worktrees',
-          sshAlias: 'lane-host.example',
-          transport: 'ssh',
+          transport: 'local',
         },
       },
       schemaVersion: 2,

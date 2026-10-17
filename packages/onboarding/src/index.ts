@@ -6,3 +6,4 @@ export * from './hosts/draft.js';
 export * from './hosts/validate.js';
 export * from './hosts/probe-plan.js';
 export * from './hosts/write.js';
+export * from './hosts/write-node.js';

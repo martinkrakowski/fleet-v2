@@ -5,13 +5,25 @@
  * explicit pair of line lists and on the candidate a draft would produce.
  */
 
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import { isFleetInstallationV2, parseInstallation, writeInstallationV2 } from '@fleet/installation';
+import {
+  isFleetInstallationV2,
+  parseInstallation,
+  writeInstallationV2,
+} from '@fleet/installation';
 
 import type { HostDraft, HostDraftCandidate } from '../draft.js';
 import { applyHostDraft } from '../draft.js';
@@ -19,12 +31,14 @@ import {
   diffInstallation,
   diffInstallationText,
   readHashOf,
-  readInstallationFile,
   renderInstallationDiff,
   serialiseInstallationCandidate,
+} from '../write.js';
+import {
+  readInstallationFile,
   sha256Of,
   writeInstallation,
-} from '../write.js';
+} from '../write-node.js';
 
 /** A valid v2 file: one local orchestrator that is also the lane runner. */
 const baseFile = {
@@ -52,9 +66,11 @@ const verifierDraft: HostDraft = {
 };
 
 function candidateFile(): HostDraftCandidate {
-  const applied = applyHostDraft(baseFile, verifierDraft);
+  const applied = applyHostDraft(baseFile, verifierDraft, 'add');
   if (!applied.ok) {
-    throw new Error(`the fixture draft itself must apply: ${applied.errors.join('; ')}`);
+    throw new Error(
+      `the fixture draft itself must apply: ${applied.errors.join('; ')}`,
+    );
   }
   return applied.candidate;
 }
@@ -129,7 +145,9 @@ describe('diff', () => {
       removed: [],
       added: ['b'],
     });
-    expect(renderInstallationDiff({ removed: ['b'], added: ['d'] })).toBe('- b\n+ d');
+    expect(renderInstallationDiff({ removed: ['b'], added: ['d'] })).toBe(
+      '- b\n+ d',
+    );
   });
 
   it('diffs the current installation value against the candidate write', () => {
@@ -164,14 +182,20 @@ describe('writeInstallation', () => {
     const file = join(dir, 'fleet.json');
     const candidate = candidateFile();
     try {
-      const result = await writeInstallation({ file, candidate, expectedHash: 'absent' });
+      const result = await writeInstallation({
+        file,
+        candidate,
+        expectedHash: 'absent',
+      });
       expect(result.status).toBe('written');
       if (result.status !== 'written') {
         return;
       }
       const bytes = await readFile(file);
       expect(result.hash).toBe(sha256Of(bytes));
-      expect(bytes.toString('utf8')).toBe(serialiseInstallationCandidate(candidate));
+      expect(bytes.toString('utf8')).toBe(
+        serialiseInstallationCandidate(candidate),
+      );
       expect((await stat(file)).mode & 0o777).toBe(0o600);
       expect(await readdir(dir)).toEqual(['fleet.json']);
     } finally {
@@ -190,7 +214,10 @@ describe('writeInstallation', () => {
       const expectedHash = readHashOf(read);
 
       const tampered = `${JSON.stringify(
-        { ...baseFile, hosts: { ...baseFile.hosts, extra: baseFile.hosts['here'] } },
+        {
+          ...baseFile,
+          hosts: { ...baseFile.hosts, extra: baseFile.hosts['here'] },
+        },
         null,
         2,
       )}\n`;
@@ -219,7 +246,11 @@ describe('writeInstallation', () => {
     const file = join(dir, 'fleet.json');
     try {
       const candidate: HostDraftCandidate = { schemaVersion: 2, hosts: {} };
-      const result = await writeInstallation({ file, candidate, expectedHash: 'absent' });
+      const result = await writeInstallation({
+        file,
+        candidate,
+        expectedHash: 'absent',
+      });
       expect(result.status).toBe('refused');
       if (result.status !== 'refused') {
         return;
@@ -230,7 +261,117 @@ describe('writeInstallation', () => {
       if (!parsed.ok) {
         expect(result.errors).toEqual(parsed.errors);
       }
-      expect(await readInstallationFile(file).then((read) => read.status)).toBe('absent');
+      expect(await readInstallationFile(file).then((read) => read.status)).toBe(
+        'absent',
+      );
+    } finally {
+      await remove(dir);
+    }
+  });
+
+  it('refuses a candidate an operator built directly with an unsafe alias, writing nothing', async () => {
+    const dir = await tempDir();
+    const file = join(dir, 'fleet.json');
+    try {
+      // Not produced by draftHost: the candidate carries the unsafe alias,
+      // so only the write's own loader call can catch it.
+      const unsafe: HostDraftCandidate = {
+        schemaVersion: 2,
+        hosts: {
+          here: {
+            transport: 'ssh',
+            sshAlias: '-oProxyCommand=x',
+            worktreeRoot: '/srv/fleet-v2/worktrees',
+            roles: ['verifier'],
+          },
+        },
+        forge: { mode: 'none' },
+      };
+      const result = await writeInstallation({
+        file,
+        candidate: unsafe,
+        expectedHash: 'absent',
+      });
+      expect(result.status).toBe('refused');
+      if (result.status !== 'refused') {
+        return;
+      }
+      expect(result.reason).toBe('invalid');
+      expect(result.errors.some((error) => error.includes('sshAlias'))).toBe(
+        true,
+      );
+      // Nothing was written: no file, no temp residue.
+      expect(await readdir(dir)).toEqual([]);
+    } finally {
+      await remove(dir);
+    }
+  });
+
+  it('refuses a second writer with reason "locked" while the lock is held, leaving the file unchanged', async () => {
+    const dir = await tempDir();
+    const file = join(dir, 'fleet.json');
+    const original = `${JSON.stringify(baseFile, null, 2)}\n`;
+    try {
+      await writeFile(file, original);
+      const read = await readInstallationFile(file);
+      expect(read.status).toBe('read');
+      const expectedHash = readHashOf(read);
+
+      // Simulate another writer holding the lock for the same file.
+      await writeFile(`${file}.lock`, '');
+
+      const result = await writeInstallation({
+        file,
+        candidate: candidateFile(),
+        expectedHash,
+      });
+      expect(result.status).toBe('refused');
+      if (result.status !== 'refused') {
+        return;
+      }
+      expect(result.reason).toBe('locked');
+      // The refused write read nothing and touched nothing.
+      expect(await readFile(file, 'utf8')).toBe(original);
+      expect(await readdir(dir)).toEqual(['fleet.json', 'fleet.json.lock']);
+    } finally {
+      await remove(dir);
+    }
+  });
+
+  it('releases the lock after a write, so the next writer with the same expected hash gets the stale refusal', async () => {
+    const dir = await tempDir();
+    const file = join(dir, 'fleet.json');
+    const original = `${JSON.stringify(baseFile, null, 2)}\n`;
+    try {
+      await writeFile(file, original);
+      const read = await readInstallationFile(file);
+      expect(read.status).toBe('read');
+      const expectedHash = readHashOf(read);
+
+      const first = await writeInstallation({
+        file,
+        candidate: candidateFile(),
+        expectedHash,
+      });
+      expect(first.status).toBe('written');
+      if (first.status !== 'written') {
+        return;
+      }
+      // The lock file is gone after the write finished.
+      expect(await readdir(dir)).toEqual(['fleet.json']);
+
+      // A second sequential writer still holds the caller's stale hash.
+      const second = await writeInstallation({
+        file,
+        candidate: candidateFile(),
+        expectedHash,
+      });
+      expect(second.status).toBe('refused');
+      if (second.status !== 'refused') {
+        return;
+      }
+      expect(second.reason).toBe('changed');
+      expect(second.currentHash).toBe(first.hash);
     } finally {
       await remove(dir);
     }

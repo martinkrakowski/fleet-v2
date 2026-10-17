@@ -26,7 +26,10 @@ interface RecordedCall {
 
 type Outcome = (call: RecordedCall) => Partial<DoctorCommandRunResult>;
 
-function fakeExecutor(outcome: Outcome): { executor: HostProbeExecutor; calls: RecordedCall[] } {
+function fakeExecutor(outcome: Outcome): {
+  executor: HostProbeExecutor;
+  calls: RecordedCall[];
+} {
   const calls: RecordedCall[] = [];
   return {
     calls,
@@ -111,7 +114,9 @@ function healthyExecutor(
 
 function argvsOf(steps: readonly HostProbeStep[]): string[][] {
   return steps
-    .map((step) => (step.kind === 'note' || step.kind === 'auth-file' ? undefined : step.argv))
+    .map((step) =>
+      step.kind === 'note' || step.kind === 'auth-file' ? undefined : step.argv,
+    )
     .filter((argv): argv is string[] => argv !== undefined);
 }
 
@@ -161,7 +166,7 @@ describe('planHostProbes', () => {
       [...SSH_PREFIX, 'git', '--version'],
       [...SSH_PREFIX, 'node', '--version'],
       [...SSH_PREFIX, 'opencode', '--version'],
-      [...SSH_PREFIX, 'mktemp', '-p', '/srv/fleet-v2/worktrees'],
+      [...SSH_PREFIX, 'mktemp', '/srv/fleet-v2/worktrees/.fleet-probe.XXXXXX'],
       [
         ...SSH_PREFIX,
         'curl',
@@ -180,7 +185,7 @@ describe('planHostProbes', () => {
       ['sh', '--version'],
       ['git', '--version'],
       ['node', '--version'],
-      ['mktemp', '-p', '/home/dev/fleet-v2'],
+      ['mktemp', '/home/dev/fleet-v2/.fleet-probe.XXXXXX'],
     ]);
   });
 
@@ -218,17 +223,26 @@ describe('planHostProbes', () => {
       'runner-capabilities',
     ]);
     const version = runStepOf(steps, 'version-agy');
-    expect(version?.argv).toEqual([...sshPrefixOf('agy-host'), 'agy', '--version']);
+    expect(version?.argv).toEqual([
+      ...sshPrefixOf('agy-host'),
+      'agy',
+      '--version',
+    ]);
   });
 
   it('plans the lane-runner worktree root visibility step only for a verifier', () => {
     const withoutIt = planHostProbes(sshSpec);
-    expect(withoutIt.some((step) => step.check === 'lane-runner-worktree-visible')).toBe(false);
+    expect(
+      withoutIt.some((step) => step.check === 'lane-runner-worktree-visible'),
+    ).toBe(false);
 
     const withIt = planHostProbes({
       ...localSpec,
       name: 'sunrise',
-      laneRunnerWorktreeRoot: { hostName: 'midnight', worktreeRoot: '/srv/fleet-v2/worktrees' },
+      laneRunnerWorktreeRoot: {
+        hostName: 'midnight',
+        worktreeRoot: '/srv/fleet-v2/worktrees',
+      },
     });
     const step = runStepOf(withIt, 'lane-runner-worktree-visible');
     expect(step?.argv).toEqual(['test', '-d', '/srv/fleet-v2/worktrees']);
@@ -251,11 +265,15 @@ describe('planHostProbes', () => {
       'runner-capabilities',
     );
     expect(undeclared?.status).toBe('UNKNOWN');
-    expect(undeclared?.detail).toBe('capability source undeclared, filesystemScope unknown');
+    expect(undeclared?.detail).toBe(
+      'capability source undeclared, filesystemScope unknown',
+    );
   });
 
   it('plans the auth-file owner and mode steps locally, with a BSD stat fallback', () => {
-    const step = planHostProbes(sshSpec).find((entry) => entry.check === 'file-owner-mode');
+    const step = planHostProbes(sshSpec).find(
+      (entry) => entry.check === 'file-owner-mode',
+    );
     expect(step?.kind).toBe('auth-file');
     if (step?.kind !== 'auth-file') {
       return;
@@ -278,7 +296,10 @@ describe('planHostProbes', () => {
   });
 
   it('plans nothing to run for an alias that could be read as an ssh option', () => {
-    const steps = planHostProbes({ ...sshSpec, sshAlias: '-oProxyCommand=touch /tmp/pwn' });
+    const steps = planHostProbes({
+      ...sshSpec,
+      sshAlias: '-oProxyCommand=touch /tmp/pwn',
+    });
     expect(steps).toEqual([
       {
         kind: 'note',
@@ -286,7 +307,8 @@ describe('planHostProbes', () => {
         subject: 'midnight',
         check: 'ssh-alias',
         status: 'FAIL',
-        detail: 'the ssh alias is not a safe host string; no command was run on this host',
+        detail:
+          'the ssh alias is not a safe host string; no command was run on this host',
       },
     ]);
   });
@@ -296,7 +318,9 @@ describe('planHostProbes', () => {
     expect(steps.find((step) => step.check === 'reachable')).toMatchObject({
       timeoutMs: 10_000,
     });
-    expect(steps.find((step) => step.check === 'server-loopback')).toMatchObject({
+    expect(
+      steps.find((step) => step.check === 'server-loopback'),
+    ).toMatchObject({
       timeoutMs: 10_000,
     });
   });
@@ -348,10 +372,12 @@ describe('runHostProbes', () => {
       ['sh', '--version'],
       ['git', '--version'],
       ['node', '--version'],
-      ['mktemp', '-p', '/home/dev/fleet-v2'],
+      ['mktemp', '/home/dev/fleet-v2/.fleet-probe.XXXXXX'],
       ['rm', '--', '/home/dev/fleet-v2/tmp.a1b2c3'],
     ]);
-    const writable = lines.find((line) => line.check === 'worktree-root-writable');
+    const writable = lines.find(
+      (line) => line.check === 'worktree-root-writable',
+    );
     expect(writable?.status).toBe('PASS');
     expect(writable?.detail).toContain('/home/dev/fleet-v2');
   });
@@ -364,15 +390,30 @@ describe('runHostProbes', () => {
       return succeeded();
     });
     await probeHost(sshSpec, executor);
-    expect(calls[5]?.argv).toEqual([...SSH_PREFIX, 'mktemp', '-p', '/srv/fleet-v2/worktrees']);
-    expect(calls[6]?.argv).toEqual([...SSH_PREFIX, 'rm', '--', '/srv/fleet-v2/worktrees/tmp.zz9']);
+    expect(calls[5]?.argv).toEqual([
+      ...SSH_PREFIX,
+      'mktemp',
+      '/srv/fleet-v2/worktrees/.fleet-probe.XXXXXX',
+    ]);
+    expect(calls[6]?.argv).toEqual([
+      ...SSH_PREFIX,
+      'rm',
+      '--',
+      '/srv/fleet-v2/worktrees/tmp.zz9',
+    ]);
   });
 
   it('refuses a mktemp answer outside the worktree root and removes nothing', async () => {
-    for (const answer of ['/etc/passwd', '/srv/fleet-v2/worktrees/../secrets', '/tmp/tmp.x']) {
+    for (const answer of [
+      '/etc/passwd',
+      '/srv/fleet-v2/worktrees/../secrets',
+      '/tmp/tmp.x',
+    ]) {
       const { executor, calls } = fakeExecutor(() => succeeded(`${answer}\n`));
       const lines = await probeHost(localSpec, executor);
-      const writable = lines.find((line) => line.check === 'worktree-root-writable');
+      const writable = lines.find(
+        (line) => line.check === 'worktree-root-writable',
+      );
       expect(writable?.status).toBe('FAIL');
       expect(writable?.detail).toContain('nothing was removed');
       expect(calls.some((call) => call.argv.includes('rm'))).toBe(false);
@@ -386,7 +427,9 @@ describe('runHostProbes', () => {
         : succeeded(),
     );
     const lines = await probeHost(localSpec, executor);
-    const writable = lines.find((line) => line.check === 'worktree-root-writable');
+    const writable = lines.find(
+      (line) => line.check === 'worktree-root-writable',
+    );
     expect(writable?.status).toBe('FAIL');
     expect(writable?.detail).toContain('not writable');
   });
@@ -402,7 +445,9 @@ describe('runHostProbes', () => {
       return succeeded();
     });
     const lines = await probeHost(localSpec, executor);
-    const writable = lines.find((line) => line.check === 'worktree-root-writable');
+    const writable = lines.find(
+      (line) => line.check === 'worktree-root-writable',
+    );
     expect(writable?.status).toBe('FAIL');
     expect(writable?.detail).toContain('/home/dev/fleet-v2/tmp.left');
   });
@@ -420,7 +465,9 @@ describe('runHostProbes', () => {
     expect(git?.detail).toBe('git: version git version 2.43.0');
 
     const dash = fakeExecutor((call) =>
-      call.argv[0] === 'sh' ? { exitCode: 2, stderr: 'sh: 0: Illegal option --' } : succeeded(),
+      call.argv[0] === 'sh'
+        ? { exitCode: 2, stderr: 'sh: 0: Illegal option --' }
+        : succeeded(),
     );
     const dashLines = await probeHost(localSpec, dash.executor);
     const sh = dashLines.find((line) => line.check === 'version-sh');
@@ -433,7 +480,9 @@ describe('runHostProbes', () => {
       call.argv[0] === 'git' ? { error: 'spawn git ENOENT' } : succeeded(),
     );
     const lines = await probeHost(localSpec, executor);
-    expect(lines.find((line) => line.check === 'version-git')?.status).toBe('FAIL');
+    expect(lines.find((line) => line.check === 'version-git')?.status).toBe(
+      'FAIL',
+    );
   });
 
   it('reports an unanswered loopback server as unknown so the host is still addable', async () => {
@@ -466,7 +515,9 @@ describe('runHostProbes', () => {
     // the lane diff check flags; the redaction rule still catches it.
     const secret = 'sk-testtoken';
     const { executor } = fakeExecutor((call) =>
-      call.argv[0] === 'git' ? succeeded(`${secret} ${'v'.repeat(400)}\n`) : succeeded(),
+      call.argv[0] === 'git'
+        ? succeeded(`${secret} ${'v'.repeat(400)}\n`)
+        : succeeded(),
     );
     const lines = await probeHost(localSpec, executor);
     const git = lines.find((line) => line.check === 'version-git');
@@ -504,12 +555,17 @@ describe('runHostProbes', () => {
       return succeeded('501 600 Regular File\n');
     });
     const lines = await probeHost(sshSpec, executor);
-    expect(lines.find((line) => line.check === 'file-owner-mode')?.status).toBe('PASS');
+    expect(lines.find((line) => line.check === 'file-owner-mode')?.status).toBe(
+      'PASS',
+    );
   });
 
   it('fails the auth file on a foreign owner, a group-readable mode or a directory', async () => {
     const cases = [
-      { stat: '1001 600 regular file\n', detail: 'not by the orchestrator user' },
+      {
+        stat: '1001 600 regular file\n',
+        detail: 'not by the orchestrator user',
+      },
       { stat: '1000 644 regular file\n', detail: 'group- or world-accessible' },
       { stat: '1000 700 directory\n', detail: 'not a regular file' },
     ];
@@ -561,7 +617,10 @@ describe('runHostProbes', () => {
     expect(unknownOnly.some((line) => line.status === 'FAIL')).toBe(false);
     expect(hostProbesHaveFailure(unknownOnly)).toBe(false);
 
-    const failing = await probeHost(sshSpec, fakeExecutor(() => ({ exitCode: 255 })).executor);
+    const failing = await probeHost(
+      sshSpec,
+      fakeExecutor(() => ({ exitCode: 255 })).executor,
+    );
     expect(hostProbesHaveFailure(failing)).toBe(true);
   });
 });

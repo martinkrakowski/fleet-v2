@@ -6,15 +6,15 @@
  * format is decided here: `parseInstallation` stays the authority, so a draft
  * can only ever be a proposal the loader has the last word on.
  *
- * The safe-host rule is copied from `WorkspaceAdapter` on purpose. It is a
- * safety boundary every surface that builds ssh argv must hold, and importing
- * a context package into the engine would invert the dependency direction.
- * The pattern, and the two leading-dash guards the regex alone does not
- * cover, are identical to the ones that adapter applies.
+ * The safe-host rule is held by the loader (`isSafeSshHost`, copied there
+ * from `WorkspaceAdapter` on purpose) and re-exported here: it is a safety
+ * boundary every surface that builds ssh argv must hold, and importing a
+ * context package into the engine would invert the dependency direction.
  */
 
 import { isAbsolute } from 'node:path';
 
+import { isSafeSshHost } from '@fleet/installation';
 import type {
   AgyAcknowledgement,
   HostRole,
@@ -24,29 +24,21 @@ import type {
   RunnerCapabilityDeclaration,
 } from '@fleet/installation';
 
-/** The strict safe-host rule: an optional `user@` prefix, then a host. */
-const SAFE_SSH_HOST_PATTERN = /^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$/;
+/**
+ * The safe-host rule itself lives in `@fleet/installation` (`isSafeSshHost`),
+ * copied there from `WorkspaceAdapter` on purpose: the loader is the first
+ * gate, and importing a context package into the engine would invert the
+ * dependency direction. It is re-exported here so every surface that drafts
+ * hosts keeps one import path for the rule it holds.
+ */
+export { isSafeSshHost };
 
 /** The roles a host may hold; the loader refuses anything else. */
-const HOST_ROLES: readonly HostRole[] = ['orchestrator', 'lane-runner', 'verifier'];
-
-/**
- * True when `host` is safe to place in an ssh argv as a destination: it
- * matches `^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$`, it is not empty, and
- * neither it nor the part after `@` starts with `-`, so it can never be read
- * as an option. An unsafe string never reaches a subprocess from anywhere in
- * this package.
- */
-export function isSafeSshHost(host: string): boolean {
-  if (host.length === 0 || host.startsWith('-')) {
-    return false;
-  }
-  const atIndex = host.indexOf('@');
-  if (atIndex !== -1 && host.slice(atIndex + 1).startsWith('-')) {
-    return false;
-  }
-  return SAFE_SSH_HOST_PATTERN.test(host);
-}
+const HOST_ROLES: readonly HostRole[] = [
+  'orchestrator',
+  'lane-runner',
+  'verifier',
+];
 
 /** An opencode runner as the operator described it. */
 export interface OpencodeHostRunnerDraft {
@@ -114,11 +106,17 @@ function copyCapabilityDeclaration(
   errors: string[],
 ): RunnerCapabilityDeclaration | undefined {
   if (Object.hasOwn(declaration, 'source')) {
-    errors.push(`${path}.source: is derived by the loader and is never drafted`);
+    errors.push(
+      `${path}.source: is derived by the loader and is never drafted`,
+    );
     return undefined;
   }
-  const { networkEgressRestricted, cpuAndMemoryLimited, processTreeTermination, filesystemScope } =
-    declaration;
+  const {
+    networkEgressRestricted,
+    cpuAndMemoryLimited,
+    processTreeTermination,
+    filesystemScope,
+  } = declaration;
   return {
     networkEgressRestricted,
     cpuAndMemoryLimited,
@@ -146,7 +144,11 @@ function buildHostRunner(
   const capabilities =
     input.capabilities === undefined
       ? undefined
-      : copyCapabilityDeclaration(input.capabilities, `${path}.capabilities`, errors);
+      : copyCapabilityDeclaration(
+          input.capabilities,
+          `${path}.capabilities`,
+          errors,
+        );
   const common = {
     port: input.port,
     ...(input.authFile !== undefined ? { authFile: input.authFile } : {}),
@@ -268,27 +270,68 @@ export function baseV2File(current: unknown): HostDraftCandidate | undefined {
   };
 }
 
-/** The candidate file, or the reasons there is none. */
+/** The candidate file, or the reason there is none, with its errors. */
 export type ApplyHostDraftResult =
   | { readonly ok: true; readonly candidate: HostDraftCandidate }
-  | { readonly ok: false; readonly errors: readonly string[] };
+  | {
+      readonly ok: false;
+      /**
+       * Why no candidate exists: the mode refused the name (`exists` on an
+       * add, `missing` on an edit) or the current file is not a v2 file the
+       * draft can apply to (`not-v2`).
+       */
+      readonly reason: 'exists' | 'missing' | 'not-v2';
+      readonly errors: readonly string[];
+    };
+
+/**
+ * How the draft is applied: `add` files a new host and refuses a name that
+ * is already in the file; `edit` replaces an existing host and refuses a
+ * name that is not there. Neither mode silently upgrades to the other.
+ */
+export type ApplyHostDraftMode = 'add' | 'edit';
 
 /**
  * Apply one draft to a copy of the current installation value and return the
  * candidate file. The current value is never mutated: the candidate is a new
- * object whose `hosts` record is the current one plus the drafted entry,
- * which also replaces an entry of the same name (an edit). A file of
- * schema version 1 carries no hosts and converting one is a mapping step of
- * its own (the conversion forces the isolation acknowledgement), so it is
- * refused here rather than half-done.
+ * object whose `hosts` record is the current one plus the drafted entry. In
+ * `add` mode a name already in the file is refused with `reason: "exists"`;
+ * in `edit` mode a name that is not there is refused with `reason: "missing"`.
+ * A file of schema version 1 carries no hosts and converting one is a mapping
+ * step of its own (the conversion forces the isolation acknowledgement), so
+ * it is refused here rather than half-done.
  */
-export function applyHostDraft(current: unknown, draft: HostDraft): ApplyHostDraftResult {
+export function applyHostDraft(
+  current: unknown,
+  draft: HostDraft,
+  mode: ApplyHostDraftMode,
+): ApplyHostDraftResult {
   const base = baseV2File(current);
   if (base === undefined) {
     return {
       ok: false,
+      reason: 'not-v2',
       errors: [
-        'installation: hosts can only be added to a schema version 2 file; converting an older file is the caller\'s step',
+        "installation: hosts can only be added to a schema version 2 file; converting an older file is the caller's step",
+      ],
+    };
+  }
+  const exists = Object.hasOwn(base.hosts, draft.name);
+  if (mode === 'add' && exists) {
+    return {
+      ok: false,
+      reason: 'exists',
+      errors: [
+        `hosts.${draft.name}: already in the installation file; editing is a separate mode`,
+      ],
+    };
+  }
+  if (mode === 'edit' && !exists) {
+    return {
+      ok: false,
+      reason: 'missing',
+      errors: [
+        `hosts.${draft.name}: not in the installation file; adding is a separate mode`,
       ],
     };
   }

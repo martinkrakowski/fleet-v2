@@ -11,7 +11,9 @@
  * no other host's server can answer.
  *
  * Two steps need more than one command and are expressed as their own kinds:
- * the worktree-root check creates one path with `mktemp -p <root>` and removes
+ * the worktree-root check creates one path with
+ * `mktemp <root>/.fleet-probe.XXXXXX` — the template form, which works with
+ * both GNU and BSD mktemp where `mktemp -p <root>` does not — and removes
  * exactly that path with `rm`, and the auth-file check compares the file's
  * owner against the orchestrator's own user id. Both run their commands as
  * argv arrays too; nothing is ever interpolated into a shell.
@@ -20,11 +22,17 @@
  * is bounded and redacted exactly as the doctor engine bounds its own lines.
  */
 
-import type { HostTransport, RunnerCapabilityDeclaration } from '@fleet/installation';
+import type {
+  HostTransport,
+  RunnerCapabilityDeclaration,
+} from '@fleet/installation';
 import { BUILT_IN_TOOLS } from '@fleet/tooling';
 
 import { boundDoctorDetail } from '../doctor/run-doctor.js';
-import type { DoctorCommandExecutor, DoctorCommandRunResult } from '../doctor/probes-node.js';
+import type {
+  DoctorCommandExecutor,
+  DoctorCommandRunResult,
+} from '../doctor/probes-node.js';
 import type { DoctorLine, DoctorScope, DoctorStatus } from '../doctor/types.js';
 
 import { isSafeSshHost, type HostDraft } from './draft.js';
@@ -84,7 +92,9 @@ export function hostProbeSpecFromDraft(draft: HostDraft): HostProbeSpec {
   return {
     name: draft.name,
     transport: draft.host.transport,
-    ...(draft.host.sshAlias !== undefined ? { sshAlias: draft.host.sshAlias } : {}),
+    ...(draft.host.sshAlias !== undefined
+      ? { sshAlias: draft.host.sshAlias }
+      : {}),
     worktreeRoot: draft.host.worktreeRoot,
     ...(draft.host.tmpDir !== undefined ? { tmpDir: draft.host.tmpDir } : {}),
     ...(runner === undefined
@@ -93,8 +103,12 @@ export function hostProbeSpecFromDraft(draft: HostDraft): HostProbeSpec {
           runner: {
             kind: runner.kind,
             port: runner.port,
-            ...(runner.authFile !== undefined ? { authFile: runner.authFile } : {}),
-            ...(runner.capabilities !== undefined ? { capabilities: runner.capabilities } : {}),
+            ...(runner.authFile !== undefined
+              ? { authFile: runner.authFile }
+              : {}),
+            ...(runner.capabilities !== undefined
+              ? { capabilities: runner.capabilities }
+              : {}),
           },
         }),
   };
@@ -167,11 +181,12 @@ function versionArgvOf(kind: HostRunnerKind): readonly string[] | undefined {
 }
 
 /** `sh`, `git` and `node` on every host, plus the runner's own tool. */
-const PLATFORM_VERSION_ARGV: readonly (readonly [string, readonly string[]])[] = [
-  ['sh', ['sh', '--version']],
-  ['git', ['git', '--version']],
-  ['node', ['node', '--version']],
-];
+const PLATFORM_VERSION_ARGV: readonly (readonly [string, readonly string[]])[] =
+  [
+    ['sh', ['sh', '--version']],
+    ['git', ['git', '--version']],
+    ['node', ['node', '--version']],
+  ];
 
 /**
  * The ordered probe plan for one host: reachability, the platform and runner
@@ -196,12 +211,16 @@ export function planHostProbes(spec: HostProbeSpec): HostProbeStep[] {
         subject,
         check: 'ssh-alias',
         status: 'FAIL',
-        detail: 'the ssh alias is not a safe host string; no command was run on this host',
+        detail:
+          'the ssh alias is not a safe host string; no command was run on this host',
       },
     ];
   }
   const transportPrefix = alias === undefined ? [] : sshPrefixOf(alias);
-  const remote = (argv: readonly string[]): string[] => [...transportPrefix, ...argv];
+  const remote = (argv: readonly string[]): string[] => [
+    ...transportPrefix,
+    ...argv,
+  ];
   const steps: HostProbeStep[] = [];
 
   steps.push({
@@ -263,7 +282,7 @@ export function planHostProbes(spec: HostProbeSpec): HostProbeStep[] {
     subject,
     check: 'worktree-root-writable',
     worktreeRoot: spec.worktreeRoot,
-    argv: remote(['mktemp', '-p', spec.worktreeRoot]),
+    argv: remote(['mktemp', `${spec.worktreeRoot}/.fleet-probe.XXXXXX`]),
     transportPrefix,
     timeoutMs: PROBE_TIMEOUT_MS,
   });
@@ -388,7 +407,10 @@ function isInsideRoot(root: string, candidate: string): boolean {
     return false;
   }
   const segments = candidate.slice(prefix.length).split('/');
-  return segments.length > 0 && segments.every((part) => part !== '' && part !== '.' && part !== '..');
+  return (
+    segments.length > 0 &&
+    segments.every((part) => part !== '' && part !== '.' && part !== '..')
+  );
 }
 
 /** Run a probe; a throw becomes `undefined` and reports as unknown. */
@@ -400,7 +422,11 @@ async function safely<T>(run: () => Promise<T>): Promise<T | undefined> {
   }
 }
 
-function line(step: HostProbeStep, status: DoctorStatus, detail: string): DoctorLine {
+function line(
+  step: HostProbeStep,
+  status: DoctorStatus,
+  detail: string,
+): DoctorLine {
   return {
     scope: step.scope,
     subject: step.subject,
@@ -415,7 +441,9 @@ async function runStep(
   step: Extract<HostProbeStep, { kind: 'run' }>,
   executor: HostProbeExecutor,
 ): Promise<DoctorLine> {
-  const result = await safely(() => executor.run(step.argv, { timeoutMs: step.timeoutMs }));
+  const result = await safely(() =>
+    executor.run(step.argv, { timeoutMs: step.timeoutMs }),
+  );
   if (result === undefined) {
     return line(step, 'UNKNOWN', `${step.label}: the probe could not be run`);
   }
@@ -435,13 +463,21 @@ async function runStep(
     // A POSIX `sh` need not implement `--version`: it answered by exiting, so
     // it exists and its version stays unknown instead of refusing the host.
     if (result.exitCode === 0) {
-      return line(step, 'UNKNOWN', `${step.label}: version absent or unparsable`);
+      return line(
+        step,
+        'UNKNOWN',
+        `${step.label}: version absent or unparsable`,
+      );
     }
     return line(step, 'UNKNOWN', failureDetail(step, result));
   }
   if (result.exitCode === 0) {
     if (step.outcome === 'server') {
-      return line(step, 'PASS', `${step.label} answered on the host's own loopback`);
+      return line(
+        step,
+        'PASS',
+        `${step.label} answered on the host's own loopback`,
+      );
     }
     if (step.outcome === 'directory') {
       return line(step, 'PASS', `${step.label} is visible`);
@@ -467,7 +503,11 @@ async function runMktempStep(
     executor.run(step.argv, { timeoutMs: step.timeoutMs }),
   );
   if (created === undefined) {
-    return line(step, 'UNKNOWN', `${root}: the writability probe could not be run`);
+    return line(
+      step,
+      'UNKNOWN',
+      `${root}: the writability probe could not be run`,
+    );
   }
   if (created.error !== undefined) {
     return line(
@@ -501,7 +541,11 @@ async function runMktempStep(
     }),
   );
   if (removed === undefined) {
-    return line(step, 'UNKNOWN', `${root}: the created path could not be checked for removal`);
+    return line(
+      step,
+      'UNKNOWN',
+      `${root}: the created path could not be checked for removal`,
+    );
   }
   if (removed.error !== undefined || removed.exitCode !== 0) {
     return line(
@@ -510,7 +554,11 @@ async function runMktempStep(
       `${root}: created ${answer} was not removed (rm exited ${removed.exitCode ?? 'null'})`,
     );
   }
-  return line(step, 'PASS', `${root}: writable (created and removed one path inside the root)`);
+  return line(
+    step,
+    'PASS',
+    `${root}: writable (created and removed one path inside the root)`,
+  );
 }
 
 /**
@@ -530,7 +578,9 @@ async function runAuthFileStep(
     executor.run(step.ownerArgv, { timeoutMs: step.timeoutMs }),
   );
   const ownerUid =
-    ownerResult === undefined || ownerResult.error !== undefined || ownerResult.exitCode !== 0
+    ownerResult === undefined ||
+    ownerResult.error !== undefined ||
+    ownerResult.exitCode !== 0
       ? undefined
       : firstLine(ownerResult.stdout);
   if (ownerUid === undefined || !/^\d+$/.test(ownerUid)) {
@@ -553,12 +603,22 @@ async function runAuthFileStep(
       executor.run(step.statFallbackArgv, { timeoutMs: step.timeoutMs }),
     );
   }
-  if (statResult === undefined || statResult.error !== undefined || statResult.exitCode !== 0) {
+  if (
+    statResult === undefined ||
+    statResult.error !== undefined ||
+    statResult.exitCode !== 0
+  ) {
     return line(step, 'UNKNOWN', `${path}: mode probe failed`);
   }
-  const fields = (firstLine(statResult.stdout) ?? '').split(/\s+/).filter((field) => field !== '');
+  const fields = (firstLine(statResult.stdout) ?? '')
+    .split(/\s+/)
+    .filter((field) => field !== '');
   if (fields.length < 3) {
-    return line(step, 'UNKNOWN', `${path}: stat answered without owner, mode and type`);
+    return line(
+      step,
+      'UNKNOWN',
+      `${path}: stat answered without owner, mode and type`,
+    );
   }
   const [rawUid, rawMode] = fields;
   // BSD/macOS `%HT` answers a two-word type ("Regular File"), GNU `%F` one.

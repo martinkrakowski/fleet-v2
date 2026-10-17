@@ -76,7 +76,9 @@ describe('parseInstallation hardening', () => {
       });
       expect(result.ok).toBe(false);
       if (!result.ok) {
-        expect(result.errors).toEqual(['verification.procedures.check: unknown key']);
+        expect(result.errors).toEqual([
+          'verification.procedures.check: unknown key',
+        ]);
         expect(result.errors[0]).not.toContain('PROC_KEY_SECRET');
       }
     });
@@ -94,7 +96,9 @@ describe('parseInstallation hardening', () => {
       });
       expect(result.ok).toBe(false);
       if (!result.ok) {
-        expect(result.errors).toEqual(['verification.procedures: invalid procedure name']);
+        expect(result.errors).toEqual([
+          'verification.procedures: invalid procedure name',
+        ]);
         expect(result.errors[0]).not.toContain('BAD_PROC_NAME_WITH_SENTINEL');
       }
     });
@@ -126,7 +130,9 @@ describe('parseInstallation hardening', () => {
       // Buffer.from decodes both to 32 zero bytes:
       expect(Buffer.from(nonCanonical, 'base64').length).toBe(32);
       // But re-encoding does not match nonCanonical:
-      expect(Buffer.from(nonCanonical, 'base64').toString('base64')).not.toBe(nonCanonical);
+      expect(Buffer.from(nonCanonical, 'base64').toString('base64')).not.toBe(
+        nonCanonical,
+      );
 
       const result = parseInstallation({
         schemaVersion: 1,
@@ -138,7 +144,9 @@ describe('parseInstallation hardening', () => {
       });
       expect(result.ok).toBe(false);
       if (!result.ok) {
-        expect(result.errors).toEqual(['waves.ownerPublicKey: must be base64 of exactly 32 bytes']);
+        expect(result.errors).toEqual([
+          'waves.ownerPublicKey: must be base64 of exactly 32 bytes',
+        ]);
       }
     });
 
@@ -156,7 +164,9 @@ describe('parseInstallation hardening', () => {
       });
       expect(result16.ok).toBe(false);
       if (!result16.ok) {
-        expect(result16.errors).toEqual(['waves.ownerPublicKey: must be base64 of exactly 32 bytes']);
+        expect(result16.errors).toEqual([
+          'waves.ownerPublicKey: must be base64 of exactly 32 bytes',
+        ]);
       }
 
       const result33 = parseInstallation({
@@ -169,7 +179,9 @@ describe('parseInstallation hardening', () => {
       });
       expect(result33.ok).toBe(false);
       if (!result33.ok) {
-        expect(result33.errors).toEqual(['waves.ownerPublicKey: must be base64 of exactly 32 bytes']);
+        expect(result33.errors).toEqual([
+          'waves.ownerPublicKey: must be base64 of exactly 32 bytes',
+        ]);
       }
     });
 
@@ -185,7 +197,9 @@ describe('parseInstallation hardening', () => {
       });
       expect(result.ok).toBe(false);
       if (!result.ok) {
-        expect(result.errors).toEqual(['waves.ownerPublicKey: must be base64 of exactly 32 bytes']);
+        expect(result.errors).toEqual([
+          'waves.ownerPublicKey: must be base64 of exactly 32 bytes',
+        ]);
       }
     });
   });
@@ -203,7 +217,9 @@ describe('parseInstallation hardening', () => {
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.installation.verification?.procedures).toBeDefined();
-        expect(Object.getPrototypeOf(result.installation.verification!.procedures)).toBeNull();
+        expect(
+          Object.getPrototypeOf(result.installation.verification!.procedures),
+        ).toBeNull();
       }
     });
 
@@ -218,7 +234,9 @@ describe('parseInstallation hardening', () => {
       });
       expect(result.ok).toBe(false);
       if (!result.ok) {
-        expect(result.errors).toEqual(['verification.procedures: invalid procedure name']);
+        expect(result.errors).toEqual([
+          'verification.procedures: invalid procedure name',
+        ]);
       }
     });
 
@@ -233,7 +251,9 @@ describe('parseInstallation hardening', () => {
       });
       expect(result.ok).toBe(false);
       if (!result.ok) {
-        expect(result.errors).toEqual(['verification.procedures: invalid procedure name']);
+        expect(result.errors).toEqual([
+          'verification.procedures: invalid procedure name',
+        ]);
       }
     });
 
@@ -244,7 +264,9 @@ describe('parseInstallation hardening', () => {
       const result = parseInstallation(parsed);
       expect(result.ok).toBe(false);
       if (!result.ok) {
-        expect(result.errors).toEqual(['verification.procedures: invalid procedure name']);
+        expect(result.errors).toEqual([
+          'verification.procedures: invalid procedure name',
+        ]);
       }
     });
 
@@ -259,7 +281,9 @@ describe('parseInstallation hardening', () => {
       });
       expect(result.ok).toBe(false);
       if (!result.ok) {
-        expect(result.errors).toEqual(['verification.procedures: invalid procedure name']);
+        expect(result.errors).toEqual([
+          'verification.procedures: invalid procedure name',
+        ]);
       }
     });
   });
@@ -335,5 +359,65 @@ describe('parseInstallation hardening', () => {
       });
       expect(result.ok).toBe(true);
     });
+  });
+});
+
+describe('parseInstallation host sshAlias safety', () => {
+  const baseFile = {
+    schemaVersion: 2,
+    forge: { mode: 'none' },
+    hosts: {
+      here: {
+        transport: 'local',
+        worktreeRoot: '/home/dev/fleet-v2',
+        roles: ['orchestrator', 'lane-runner'],
+        runner: { kind: 'opencode', port: 46000 },
+      },
+    },
+  };
+
+  function fileWith(sshAlias: string) {
+    return {
+      ...baseFile,
+      hosts: {
+        ...baseFile.hosts,
+        midnight: {
+          transport: 'ssh',
+          sshAlias,
+          worktreeRoot: '/srv/fleet-v2/worktrees',
+          roles: ['verifier'],
+        },
+      },
+    };
+  }
+
+  it('refuses an alias that could be read as an ssh option', () => {
+    const result = parseInstallation(fileWith('-oProxyCommand=x'));
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.errors).toEqual([
+      'hosts.midnight.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option',
+    ]);
+    expect(JSON.stringify(result.errors)).not.toContain('-oProxyCommand');
+  });
+
+  it('refuses an alias that is an option at the destination position (-J)', () => {
+    const result = parseInstallation(fileWith('-J'));
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.errors).toEqual([
+      'hosts.midnight.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option',
+    ]);
+  });
+
+  it('accepts a valid alias, a user@alias and a dotted host', () => {
+    for (const sshAlias of ['midnight', 'deployer@midnight', 'midnight.lan']) {
+      const result = parseInstallation(fileWith(sshAlias));
+      expect(result.ok).toBe(true);
+    }
   });
 });

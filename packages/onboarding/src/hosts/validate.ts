@@ -13,7 +13,12 @@
 import { parseInstallation } from '@fleet/installation';
 import type { FleetInstallation } from '@fleet/installation';
 
-import { applyHostDraft, type HostDraft, type HostDraftCandidate } from './draft.js';
+import {
+  applyHostDraft,
+  type ApplyHostDraftMode,
+  type HostDraft,
+  type HostDraftCandidate,
+} from './draft.js';
 
 /**
  * The outcome of validating a drafted host against the current installation:
@@ -45,8 +50,9 @@ export type ValidateHostDraftResult =
 export function validateHostDraft(
   current: unknown,
   draft: HostDraft,
+  mode: ApplyHostDraftMode,
 ): ValidateHostDraftResult {
-  const applied = applyHostDraft(current, draft);
+  const applied = applyHostDraft(current, draft, mode);
   if (!applied.ok) {
     return { ok: false, errors: applied.errors };
   }
@@ -54,5 +60,9 @@ export function validateHostDraft(
   if (!parsed.ok) {
     return { ok: false, candidate: applied.candidate, errors: parsed.errors };
   }
-  return { ok: true, candidate: applied.candidate, installation: parsed.installation };
+  return {
+    ok: true,
+    candidate: applied.candidate,
+    installation: parsed.installation,
+  };
 }

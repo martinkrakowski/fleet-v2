@@ -29,7 +29,9 @@ const currentFile = {
 function draft(input: HostDraftInput): HostDraft {
   const result = draftHost(input);
   if (!result.ok) {
-    throw new Error(`the fixture draft itself must be draftable: ${result.errors.join('; ')}`);
+    throw new Error(
+      `the fixture draft itself must be draftable: ${result.errors.join('; ')}`,
+    );
   }
   return result.draft;
 }
@@ -51,7 +53,7 @@ describe('validateHostDraft', () => {
       worktreeRoot: '/srv/fleet-v2/verify',
       roles: ['verifier'],
     });
-    const result = validateHostDraft(currentFile, verifier);
+    const result = validateHostDraft(currentFile, verifier, 'add');
     expect(result.ok).toBe(true);
     if (!result.ok) {
       return;
@@ -75,12 +77,14 @@ describe('validateHostDraft', () => {
       roles: ['lane-runner'],
       runner: { kind: 'opencode', port: 4166 },
     });
-    const result = validateHostDraft(currentFile, secondRunner);
+    const result = validateHostDraft(currentFile, secondRunner, 'add');
     expect(result.ok).toBe(false);
     if (result.ok) {
       return;
     }
-    expect(result.errors).toEqual(['hosts: at most one host may hold the lane-runner role']);
+    expect(result.errors).toEqual([
+      'hosts: at most one host may hold the lane-runner role',
+    ]);
     const reparsed = parseInstallation(result.candidate);
     expect(reparsed.ok).toBe(false);
     if (!reparsed.ok) {
@@ -98,7 +102,7 @@ describe('validateHostDraft', () => {
       roles: ['verifier'],
       runner: { kind: 'opencode', port: 45999 },
     });
-    const result = validateHostDraft(currentFile, colliding);
+    const result = validateHostDraft(currentFile, colliding, 'add');
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.errors).toEqual([
@@ -108,8 +112,12 @@ describe('validateHostDraft', () => {
   });
 
   it('reports an ssh orchestrator host', () => {
-    const remoteOrchestrator = draft({ ...hereRunner, transport: 'ssh', sshAlias: 'here.lan' });
-    const result = validateHostDraft(currentFile, remoteOrchestrator);
+    const remoteOrchestrator = draft({
+      ...hereRunner,
+      transport: 'ssh',
+      sshAlias: 'here.lan',
+    });
+    const result = validateHostDraft(currentFile, remoteOrchestrator, 'edit');
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.errors).toEqual([
@@ -123,7 +131,7 @@ describe('validateHostDraft', () => {
       ...hereRunner,
       runner: { kind: 'agy', agyMode: 'full', port: 46000 },
     });
-    const result = validateHostDraft(currentFile, agyFull);
+    const result = validateHostDraft(currentFile, agyFull, 'edit');
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.errors).toEqual([
@@ -135,10 +143,14 @@ describe('validateHostDraft', () => {
 
   it('reports an unknown key in a drafted host instead of writing it', () => {
     const tampered = draft(hereRunner);
-    const result = validateHostDraft(currentFile, {
-      ...tampered,
-      host: { ...tampered.host, tunnel: { port: 4167 } } as never,
-    });
+    const result = validateHostDraft(
+      currentFile,
+      {
+        ...tampered,
+        host: { ...tampered.host, tunnel: { port: 4167 } } as never,
+      },
+      'edit',
+    );
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.errors).toEqual(['hosts.here: unknown key']);
@@ -154,7 +166,7 @@ describe('validateHostDraft', () => {
       roles: ['lane-runner'],
       runner: { kind: 'opencode', port: 4166 },
     });
-    const result = validateHostDraft(undefined, laneRunner);
+    const result = validateHostDraft(undefined, laneRunner, 'add');
     expect(result.ok).toBe(false);
     if (result.ok) {
       return;
@@ -175,7 +187,7 @@ describe('validateHostDraft', () => {
       roles: ['lane-runner'],
       runner: { kind: 'opencode', port: 4166 },
     });
-    const result = validateHostDraft({ schemaVersion: 1 }, laneRunner);
+    const result = validateHostDraft({ schemaVersion: 1 }, laneRunner, 'add');
     expect(result.ok).toBe(false);
     if (result.ok) {
       return;
@@ -184,5 +196,28 @@ describe('validateHostDraft', () => {
     expect(result.errors).toEqual([
       "installation: hosts can only be added to a schema version 2 file; converting an older file is the caller's step",
     ]);
+  });
+
+  it('refuses a HostDraft built directly with an unsafe sshAlias, with the loader error unchanged', () => {
+    // Not produced by draftHost: the alias bypassed the draft step entirely,
+    // so only the loader's own rule can refuse it.
+    const unsafe: HostDraft = {
+      name: 'midnight',
+      host: {
+        transport: 'ssh',
+        sshAlias: '-oProxyCommand=x',
+        worktreeRoot: '/srv/fleet-v2/worktrees',
+        roles: ['verifier'],
+      },
+    };
+    const result = validateHostDraft(currentFile, unsafe, 'add');
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.errors).toEqual([
+      'hosts.midnight.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option',
+    ]);
+    expect(JSON.stringify(result.errors)).not.toContain('-oProxyCommand');
   });
 });

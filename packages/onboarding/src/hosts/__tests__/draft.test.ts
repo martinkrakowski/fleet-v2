@@ -111,7 +111,9 @@ describe('draftHost', () => {
   });
 
   it('refuses an unsafe ssh alias and never repeats it in the error', () => {
-    const result = draftHost(sshInput({ sshAlias: '-oProxyCommand=touch /tmp/pwn' }));
+    const result = draftHost(
+      sshInput({ sshAlias: '-oProxyCommand=touch /tmp/pwn' }),
+    );
     expect(result.ok).toBe(false);
     if (result.ok) {
       return;
@@ -147,7 +149,9 @@ describe('draftHost', () => {
   });
 
   it('refuses a relative worktree root or tmp dir', () => {
-    const result = draftHost(sshInput({ worktreeRoot: 'worktrees', tmpDir: 'tmp' }));
+    const result = draftHost(
+      sshInput({ worktreeRoot: 'worktrees', tmpDir: 'tmp' }),
+    );
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.errors).toEqual([
@@ -161,7 +165,9 @@ describe('draftHost', () => {
     const empty = draftHost(sshInput({ roles: [] }));
     expect(empty.ok).toBe(false);
     if (!empty.ok) {
-      expect(empty.errors).toEqual(['hosts.midnight.roles: at least one role is required']);
+      expect(empty.errors).toEqual([
+        'hosts.midnight.roles: at least one role is required',
+      ]);
     }
 
     const unknown = draftHost(
@@ -176,7 +182,9 @@ describe('draftHost', () => {
   });
 
   it('refuses a runner port outside 1..65535', () => {
-    const result = draftHost(sshInput({ runner: { kind: 'opencode', port: 0 } }));
+    const result = draftHost(
+      sshInput({ runner: { kind: 'opencode', port: 0 } }),
+    );
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.errors).toEqual([
@@ -224,7 +232,10 @@ describe('draftHost', () => {
           kind: 'agy',
           agyMode: 'edit-only',
           port: 4166,
-          agyAcknowledgement: { textVersion: 'agy-1', acceptedAt: '2026-10-17T00:00:00Z' },
+          agyAcknowledgement: {
+            textVersion: 'agy-1',
+            acceptedAt: '2026-10-17T00:00:00Z',
+          },
         },
       }),
     );
@@ -234,7 +245,10 @@ describe('draftHost', () => {
         kind: 'agy',
         port: 4166,
         agyMode: 'edit-only',
-        agyAcknowledgement: { textVersion: 'agy-1', acceptedAt: '2026-10-17T00:00:00Z' },
+        agyAcknowledgement: {
+          textVersion: 'agy-1',
+          acceptedAt: '2026-10-17T00:00:00Z',
+        },
       });
     }
 
@@ -249,7 +263,10 @@ describe('draftHost', () => {
     );
     expect(opencode.ok).toBe(true);
     if (opencode.ok) {
-      expect(Object.keys(opencode.draft.host.runner ?? {})).toEqual(['kind', 'port']);
+      expect(Object.keys(opencode.draft.host.runner ?? {})).toEqual([
+        'kind',
+        'port',
+      ]);
     }
   });
 });
@@ -280,7 +297,7 @@ describe('applyHostDraft', () => {
 
   it('adds the host to a copy without touching the current value', () => {
     const before = JSON.stringify(currentFile);
-    const result = applyHostDraft(currentFile, draft);
+    const result = applyHostDraft(currentFile, draft, 'add');
     expect(result.ok).toBe(true);
     if (!result.ok) {
       return;
@@ -291,8 +308,8 @@ describe('applyHostDraft', () => {
     expect(result.candidate.forge).toEqual({ mode: 'none' });
   });
 
-  it('replaces an existing host of the same name instead of duplicating it', () => {
-    const result = applyHostDraft(currentFile, {
+  it('replaces an existing host of the same name only in edit mode, and add refuses it as existing', () => {
+    const replacement: HostDraft = {
       ...draft,
       name: 'here',
       host: {
@@ -301,17 +318,39 @@ describe('applyHostDraft', () => {
         roles: ['orchestrator', 'lane-runner'],
         runner: { kind: 'opencode', port: 46000 },
       },
-    });
-    expect(result.ok).toBe(true);
-    if (!result.ok) {
-      return;
+    };
+    const edited = applyHostDraft(currentFile, replacement, 'edit');
+    expect(edited.ok).toBe(true);
+    if (edited.ok) {
+      expect(Object.keys(edited.candidate.hosts)).toEqual(['here']);
+      expect(edited.candidate.hosts['here'].worktreeRoot).toBe(
+        '/home/dev/other',
+      );
     }
-    expect(Object.keys(result.candidate.hosts)).toEqual(['here']);
-    expect(result.candidate.hosts['here'].worktreeRoot).toBe('/home/dev/other');
+
+    const added = applyHostDraft(currentFile, replacement, 'add');
+    expect(added.ok).toBe(false);
+    if (!added.ok) {
+      expect(added.reason).toBe('exists');
+      expect(added.errors).toEqual([
+        'hosts.here: already in the installation file; editing is a separate mode',
+      ]);
+    }
+  });
+
+  it('edit refuses a name that is not in the file as missing', () => {
+    const result = applyHostDraft(currentFile, draft, 'edit');
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('missing');
+      expect(result.errors).toEqual([
+        'hosts.midnight: not in the installation file; adding is a separate mode',
+      ]);
+    }
   });
 
   it('starts an absent installation as a v2 file with only the drafted host', () => {
-    const result = applyHostDraft(undefined, draft);
+    const result = applyHostDraft(undefined, draft, 'add');
     expect(result.ok).toBe(true);
     if (!result.ok) {
       return;
@@ -326,7 +365,7 @@ describe('applyHostDraft', () => {
       'not an object',
       [{ schemaVersion: 2 }],
     ]) {
-      const result = applyHostDraft(current, draft);
+      const result = applyHostDraft(current, draft, 'add');
       expect(result.ok).toBe(false);
       if (!result.ok) {
         expect(result.errors).toEqual([

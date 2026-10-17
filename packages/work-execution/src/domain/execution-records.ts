@@ -63,6 +63,13 @@ export interface AttemptRunnerRecord {
   /** The opencode tunnel port. `null` for agy runs, which have no port. */
   readonly remotePort: number | null;
   readonly host: string | null;
+  /**
+   * The installation host name the attempt ran on. A v2 installation records
+   * the selected lane-runner host's name; legacy mode (a v1 or absent
+   * installation) records `null`, as do records persisted before this field
+   * existed — those are read with `runner.host`, which holds the alias.
+   */
+  readonly hostName?: string | null;
   readonly agent: string | null;
   readonly model: string | null;
   readonly variant: string | null;

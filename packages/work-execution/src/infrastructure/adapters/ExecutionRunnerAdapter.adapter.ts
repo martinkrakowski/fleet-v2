@@ -65,12 +65,38 @@ export type SubprocessRunner = (
   env?: Readonly<Record<string, string>>,
 ) => Promise<SubprocessResult>;
 
+/**
+ * The installation's selected lane-runner host, as the adapter receives it
+ * from the composition root. With this option the adapter runs in v2 mode: the
+ * host is the only source of the runner's routing, and no environment variable
+ * can move the lane elsewhere.
+ */
+export interface ExecutionRunnerHost {
+  /** The installation host name recorded on the attempt. */
+  readonly hostName: string;
+  readonly transport: 'local' | 'ssh';
+  /** The ssh alias to dial. Required for `ssh`; ignored for `local`. */
+  readonly sshAlias?: string;
+  /** The server port on that host. Absent means dispatch refuses. */
+  readonly remotePort?: number | null;
+  /** The orchestrator-side auth file `ocm-run` sources as shell. */
+  readonly authFile?: string;
+}
+
 export interface ExecutionRunnerAdapterOptions {
+  /**
+   * The installation's selected lane-runner host (v2 mode). Its presence is
+   * the switch: with it the adapter sets `OCM_HOST`, `OCM_REMOTE_PORT` and
+   * `OPENCODE_AUTH_FILE` itself and reads nothing from `process.env`; without
+   * it the adapter runs in legacy mode (a v1 or absent installation) and keeps
+   * today's environment-based behaviour.
+   */
+  readonly host?: ExecutionRunnerHost;
   /** Path of the ocm-run binary; the bundled `bin/ocm-run` when found, else `ocm-run` from PATH when omitted. */
   readonly ocmRunBin?: string;
-  /** Port passed as OCM_REMOTE_PORT to the runner subprocess. */
+  /** Legacy mode only: port passed as OCM_REMOTE_PORT to the runner subprocess. */
   readonly remotePort?: number;
-  /** SSH host passed as OCM_HOST to the runner subprocess when configured. */
+  /** Legacy mode only: SSH host passed as OCM_HOST to the runner subprocess when configured. */
   readonly remoteHost?: string;
   /** Optional resolver for cross-process lookup of an attempt's worktree path when not cached in memory. */
   readonly resolveWorktreePath?: (attemptId: string) => Promise<string | null> | string | null;
@@ -87,7 +113,8 @@ export interface ExecutionRunnerAdapterOptions {
   /** Capability overrides on top of the enforced defaults. */
   readonly capabilities?: Partial<RunnerIsolationCapabilities>;
   /**
-   * Transport of the host holding the lane-runner role (D5). A `local` host's
+   * Legacy mode only: transport of the host holding the lane-runner role (D5).
+   * In v2 mode the selected host's own transport decides. A `local` host's
    * runner environment drops `SSH_AUTH_SOCK`; an `ssh` host and an unset
    * transport keep the full allow-list.
    */
@@ -118,6 +145,11 @@ const capabilityBooleans: readonly (keyof RunnerIsolationCapabilities)[] = [
  * The only host environment variables a runner subprocess may inherit. Every
  * other variable (credentials, tokens, host configuration) is stripped so the
  * reviewed runner never observes secrets it does not need.
+ *
+ * `OCM_HOST` and `OCM_REMOTE_PORT` are deliberately absent: they route the
+ * lane, so the adapter always sets them explicitly from the selected host
+ * (v2) or from its resolved legacy configuration, and an inherited value can
+ * never be mistaken for a route. Narrowing the inherited set is deliberate.
  */
 export const RUNNER_ENV_ALLOWLIST: readonly string[] = [
   'PATH',
@@ -130,8 +162,6 @@ export const RUNNER_ENV_ALLOWLIST: readonly string[] = [
   'TERM',
   'TMPDIR',
   'SSH_AUTH_SOCK',
-  'OCM_REMOTE_PORT',
-  'OCM_HOST',
   'YARN_NM_MODE',
   'SYSTEMROOT',
 ];
@@ -268,11 +298,27 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
 
   constructor(private readonly options?: ExecutionRunnerAdapterOptions) {}
 
+  /**
+   * The installation host this adapter addresses, or `undefined` in legacy
+   * mode. Its presence is the switch between "the installation decides" and
+   * today's environment-based mapping.
+   */
+  private host(): ExecutionRunnerHost | undefined {
+    return this.options?.host;
+  }
+
   describeCapabilities(): RunnerIsolationCapabilities {
     return { ...defaultCapabilities, ...this.options?.capabilities };
   }
 
   configuredRemotePort(): number | undefined {
+    const host = this.host();
+    if (host !== undefined) {
+      // v2: the installation host's port, and nothing else, ever.
+      return typeof host.remotePort === 'number' && Number.isFinite(host.remotePort)
+        ? host.remotePort
+        : undefined;
+    }
     if (this.options?.remotePort !== undefined) return this.options.remotePort;
     const envPort = process.env.OCM_REMOTE_PORT;
     if (envPort !== undefined && envPort.trim() !== '') {
@@ -283,7 +329,22 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   }
 
   configuredRemoteHost(): string | null {
+    const host = this.host();
+    if (host !== undefined) {
+      // v2: an `ssh` host is reached by its alias; a `local` host has none.
+      if (host.transport !== 'ssh') return null;
+      const alias = host.sshAlias?.trim() ?? '';
+      return alias === '' ? null : alias;
+    }
     return this.options?.remoteHost ?? (process.env.OCM_HOST?.trim() || null);
+  }
+
+  /** The installation host name recorded on the attempt; `null` in legacy mode. */
+  configuredHostName(): string | null {
+    const host = this.host();
+    if (host === undefined) return null;
+    const name = host.hostName.trim();
+    return name === '' ? null : name;
   }
 
   describeRunner(): AttemptRunnerRecord | undefined {
@@ -293,6 +354,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       kind: 'opencode',
       remotePort: port,
       host: this.configuredRemoteHost(),
+      hostName: this.configuredHostName(),
       agent: null,
       model: null,
       variant: null,
@@ -309,6 +371,27 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       );
     if (unsatisfied) {
       return { outcome: 'refused', reason: 'Runner does not satisfy required isolation capabilities' };
+    }
+
+    const host = this.host();
+    if (host !== undefined) {
+      // A v2 installation addresses exactly one host, so an incomplete host is
+      // refused rather than guessed at: without a port `ocm-run` cannot dial,
+      // and without an alias an `ssh` host would be dialled on the
+      // orchestrator's own loopback. Both are silent redirects, not defaults.
+      const port = this.configuredRemotePort();
+      if (port === undefined) {
+        return {
+          outcome: 'refused',
+          reason: `Runner host '${this.configuredHostName() ?? ''}' declares no port; a dispatch cannot be addressed`,
+        };
+      }
+      if (host.transport === 'ssh' && this.configuredRemoteHost() === null) {
+        return {
+          outcome: 'refused',
+          reason: `Runner host '${this.configuredHostName() ?? ''}' is ssh but declares no ssh alias; a dispatch cannot be addressed`,
+        };
+      }
     }
 
     const remoteHost = this.configuredRemoteHost();
@@ -361,6 +444,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
                   kind: 'opencode',
                   remotePort: port,
                   host: this.configuredRemoteHost(),
+                  hostName: this.configuredHostName(),
                   agent: agent ?? null,
                   model,
                   variant: variant ?? null,
@@ -663,7 +747,15 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     );
   }
 
-  /** Configured remote port/host as runner environment; absent when neither is set. */
+  /**
+   * The routing variables of one runner subprocess, always set explicitly.
+   *
+   * With a v2 installation host they come from that host alone:
+   * `OCM_REMOTE_PORT` is its port, `OCM_HOST` is its ssh alias or the empty
+   * string when it is `local` (never the inherited value), and
+   * `OPENCODE_AUTH_FILE` is its auth file. In legacy mode the resolved
+   * options-or-environment port and host are used, exactly as before.
+   */
   private remotePortEnv(
     overridePort?: number,
     overrideHost?: string,
@@ -673,9 +765,23 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     if (port !== undefined) {
       overrides.OCM_REMOTE_PORT = String(port);
     }
-    const host = overrideHost ?? this.configuredRemoteHost();
-    if (host !== null && host !== undefined) {
-      overrides.OCM_HOST = host;
+
+    const host = this.host();
+    if (host !== undefined) {
+      // A `local` host is dialled directly, so OCM_HOST must be present and
+      // empty rather than absent: an inherited alias would tunnel the lane to
+      // another machine.
+      overrides.OCM_HOST = overrideHost ?? (host.transport === 'ssh' ? this.configuredRemoteHost() ?? '' : '');
+      const authFile = host.authFile?.trim();
+      if (authFile !== undefined && authFile !== '') {
+        overrides.OPENCODE_AUTH_FILE = authFile;
+      }
+      return Object.keys(overrides).length === 0 ? undefined : overrides;
+    }
+
+    const legacyHost = overrideHost ?? this.configuredRemoteHost();
+    if (legacyHost !== null && legacyHost !== undefined) {
+      overrides.OCM_HOST = legacyHost;
     }
     return Object.keys(overrides).length === 0 ? undefined : overrides;
   }
@@ -687,16 +793,16 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   ): Promise<SubprocessResult> {
     // D5: the lane-runner host's transport decides whether the runner
     // environment keeps `SSH_AUTH_SOCK`; every non-runner subprocess keeps
-    // the full allow-list regardless.
-    const envOptions: RunnerEnvOptions = { transport: this.options?.runnerTransport };
+    // the full allow-list regardless. A v2 installation's own transport wins.
+    const envOptions: RunnerEnvOptions = { transport: this.host()?.transport ?? this.options?.runnerTransport };
     const injected = this.options?.runSubprocess;
     if (injected !== undefined) return injected(command, args, env);
     const executor = this.options?.executor;
     if (executor !== undefined) {
       // Exactly what the legacy path applied: the allow-listed host
-      // environment (from process.env) plus the OCM overrides — never the
-      // full process env and never only the two OCM variables — and the
-      // same 64 MiB output budget the legacy execFile path enforced.
+      // environment (from process.env) plus the explicitly resolved routing
+      // variables — never the full process env, never only the OCM pair —
+      // and the same 64 MiB output budget the legacy execFile path enforced.
       const runEnv = buildRunnerEnv(env as Record<string, string> | undefined, envOptions);
       return executor
         .run([command, ...args], {

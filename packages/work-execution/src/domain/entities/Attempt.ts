@@ -12,9 +12,7 @@ import type {
   AttemptSeatOverrideRecord,
 } from '../execution-records.js';
 import type { AttemptStateValue } from '../value-objects/AttemptState.vo.js';
-import { AttemptState } from '../value-objects/AttemptState.vo.js';
-
-const CAPACITY_RELEASE_STATES: readonly AttemptStateValue[] = ['ended', 'collected', 'cancelled'];
+import { CAPACITY_RELEASE_STATES, AttemptState } from '../value-objects/AttemptState.vo.js';
 
 export class Attempt {
   private constructor(private record: AttemptRecord) {

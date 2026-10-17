@@ -16,8 +16,8 @@
  *   completed write (0 done, 1 refused, 2 usage).
  */
 
-import { mkdir } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
 
 import {
   buildInitPlan,
@@ -34,15 +34,15 @@ import {
   type InitAnswers,
   type InitHostAnswer,
   type InitPlanResult,
-} from '@fleet/onboarding';
-import { isToolId, BUILT_IN_TOOLS } from '@fleet/tooling';
+} from "@fleet/onboarding";
+import { isToolId, BUILT_IN_TOOLS } from "@fleet/tooling";
 import {
   loadInstallation,
   resolveInstallationFile,
   type LoadResult,
-} from '@fleet/installation';
+} from "@fleet/installation";
 
-import { formatDoctorLine, type CliIo } from './index.js';
+import { formatDoctorLine, type CliIo } from "./index.js";
 
 /** Options the driver and tests inject; every default composes the real thing. */
 export interface InitCliOptions {
@@ -121,33 +121,39 @@ type ParsedInitArgs =
  * since the rest of this CLI is kebab-case.
  */
 const VALUE_FLAGS: ReadonlySet<string> = new Set([
-  'profile',
-  'tools',
-  'isolation',
-  'forge',
-  'forgeRepo',
-  'forge-repo',
-  'shelf',
-  'shelfRepo',
-  'shelf-repo',
-  'hosts',
+  "profile",
+  "tools",
+  "isolation",
+  "forge",
+  "forgeRepo",
+  "forge-repo",
+  "shelf",
+  "shelfRepo",
+  "shelf-repo",
+  "hosts",
 ]);
 
 /** Normalise the accepted spellings to one canonical name. */
 const FLAG_ALIASES: Readonly<Record<string, string>> = {
-  'forge-repo': 'forgeRepo',
-  'shelf-repo': 'shelfRepo',
+  "forge-repo": "forgeRepo",
+  "shelf-repo": "shelfRepo",
 };
-const BOOLEAN_FLAGS: ReadonlySet<string> = new Set(['recommend', 'yes', 'force']);
+const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
+  "recommend",
+  "yes",
+  "force",
+]);
 
 /**
  * Tool aliases the plan's own example command uses: `claude` names the
  * claude-code tool. Anything else must be a built-in id.
  */
-const TOOL_ALIASES: Readonly<Record<string, string>> = { claude: 'claude-code' };
+const TOOL_ALIASES: Readonly<Record<string, string>> = {
+  claude: "claude-code",
+};
 
 function isHelpToken(token: string): boolean {
-  return token === 'help' || token === '--help' || token === '-h';
+  return token === "help" || token === "--help" || token === "-h";
 }
 
 function usage(error: string): ParsedInitArgs {
@@ -165,13 +171,17 @@ function parseInitArgs(tokens: readonly string[]): ParsedInitArgs {
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (isHelpToken(token)) {
-      return { ok: true, help: true, args: { answers: undefined as never, yes: false, force: false } };
+      return {
+        ok: true,
+        help: true,
+        args: { answers: undefined as never, yes: false, force: false },
+      };
     }
-    if (!token.startsWith('--') || token === '--') {
+    if (!token.startsWith("--") || token === "--") {
       return usage(`Unexpected argument: ${token}`);
     }
     const body = token.slice(2);
-    const separator = body.indexOf('=');
+    const separator = body.indexOf("=");
     const rawFlag = separator === -1 ? body : body.slice(0, separator);
     const flag = FLAG_ALIASES[rawFlag] ?? rawFlag;
     let value = separator === -1 ? undefined : body.slice(separator + 1);
@@ -199,85 +209,93 @@ function parseInitArgs(tokens: readonly string[]): ParsedInitArgs {
     values.set(flag, value);
   }
 
-  const profile = values.get('profile');
-  if (profile !== 'single' && profile !== 'multi') {
+  const profile = values.get("profile");
+  if (profile !== "single" && profile !== "multi") {
     return usage('--profile must be "single" or "multi"');
   }
-  const toolsText = values.get('tools');
+  const toolsText = values.get("tools");
   if (toolsText === undefined) {
-    return usage('--tools is required (a comma-separated list of built-in tool ids)');
+    return usage(
+      "--tools is required (a comma-separated list of built-in tool ids)",
+    );
   }
   const tools = toolsText
-    .split(',')
+    .split(",")
     .map((entry) => TOOL_ALIASES[entry.trim()] ?? entry.trim());
-  if (tools.some((tool) => tool === '')) {
-    return usage("--tools must name built-in tool ids, e.g. opencode,claude-code");
+  if (tools.some((tool) => tool === "")) {
+    return usage(
+      "--tools must name built-in tool ids, e.g. opencode,claude-code",
+    );
   }
   for (const tool of tools) {
     if (!isToolId(tool)) {
       return usage(
-        `--tools: '${tool}' is not a built-in tool (built in: ${BUILT_IN_TOOLS.map((entry) => entry.id).join(', ')})`,
+        `--tools: '${tool}' is not a built-in tool (built in: ${BUILT_IN_TOOLS.map((entry) => entry.id).join(", ")})`,
       );
     }
   }
-  const isolation = values.get('isolation');
+  const isolation = values.get("isolation");
   if (isolation === undefined) {
-    return usage('--isolation is required (none, container or custom)');
+    return usage("--isolation is required (none, container or custom)");
   }
-  if (isolation !== 'none' && isolation !== 'container' && isolation !== 'custom') {
-    return usage('--isolation must be none, container or custom');
+  if (
+    isolation !== "none" &&
+    isolation !== "container" &&
+    isolation !== "custom"
+  ) {
+    return usage("--isolation must be none, container or custom");
   }
-  if (isolation === 'custom') {
+  if (isolation === "custom") {
     return usage(
       "--isolation custom needs the four declaration values, which only the interactive path asks for; use none or container here",
     );
   }
-  const forge = values.get('forge');
+  const forge = values.get("forge");
   if (forge === undefined) {
-    return usage('--forge is required (none or github)');
+    return usage("--forge is required (none or github)");
   }
-  if (forge !== 'none' && forge !== 'github') {
-    return usage('--forge must be none or github');
+  if (forge !== "none" && forge !== "github") {
+    return usage("--forge must be none or github");
   }
-  const forgeRepo = values.get('forgeRepo');
-  if (forge === 'github' && forgeRepo === undefined) {
-    return usage('--forge github requires --forgeRepo owner/repo');
+  const forgeRepo = values.get("forgeRepo");
+  if (forge === "github" && forgeRepo === undefined) {
+    return usage("--forge github requires --forgeRepo owner/repo");
   }
-  if (forge === 'none' && forgeRepo !== undefined) {
-    return usage('--forgeRepo belongs to --forge github');
+  if (forge === "none" && forgeRepo !== undefined) {
+    return usage("--forgeRepo belongs to --forge github");
   }
-  const shelf = values.get('shelf');
+  const shelf = values.get("shelf");
   if (shelf === undefined) {
-    return usage('--shelf is required (local or git)');
+    return usage("--shelf is required (local or git)");
   }
-  if (shelf !== 'local' && shelf !== 'git') {
-    return usage('--shelf must be local or git');
+  if (shelf !== "local" && shelf !== "git") {
+    return usage("--shelf must be local or git");
   }
-  const shelfRepo = values.get('shelfRepo');
-  if (shelf === 'git' && shelfRepo === undefined) {
-    return usage('--shelf git requires --shelfRepo <path>');
+  const shelfRepo = values.get("shelfRepo");
+  if (shelf === "git" && shelfRepo === undefined) {
+    return usage("--shelf git requires --shelfRepo <path>");
   }
-  if (shelf === 'local' && shelfRepo !== undefined) {
-    return usage('--shelfRepo belongs to --shelf git');
+  if (shelf === "local" && shelfRepo !== undefined) {
+    return usage("--shelfRepo belongs to --shelf git");
   }
   let hosts: readonly InitHostAnswer[] | undefined;
-  const hostsText = values.get('hosts');
+  const hostsText = values.get("hosts");
   if (hostsText !== undefined) {
-    if (profile !== 'multi') {
-      return usage('--hosts belongs to --profile multi');
+    if (profile !== "multi") {
+      return usage("--hosts belongs to --profile multi");
     }
     let parsedJson: unknown;
     try {
       parsedJson = JSON.parse(hostsText);
     } catch {
-      return usage('--hosts must be one JSON array of host drafts');
+      return usage("--hosts must be one JSON array of host drafts");
     }
     if (!Array.isArray(parsedJson)) {
-      return usage('--hosts must be one JSON array of host drafts');
+      return usage("--hosts must be one JSON array of host drafts");
     }
     hosts = parsedJson as readonly InitHostAnswer[];
-  } else if (profile === 'multi') {
-    return usage('--profile multi requires --hosts <json>');
+  } else if (profile === "multi") {
+    return usage("--profile multi requires --hosts <json>");
   }
   return {
     ok: true,
@@ -286,16 +304,16 @@ function parseInitArgs(tokens: readonly string[]): ParsedInitArgs {
       answers: {
         profile,
         tools,
-        recommend: booleans.has('recommend'),
+        recommend: booleans.has("recommend"),
         isolation,
-        ...(forge === 'github' && forgeRepo !== undefined ? { forgeRepo } : {}),
+        ...(forge === "github" && forgeRepo !== undefined ? { forgeRepo } : {}),
         forge,
         shelf,
-        ...(shelf === 'git' && shelfRepo !== undefined ? { shelfRepo } : {}),
+        ...(shelf === "git" && shelfRepo !== undefined ? { shelfRepo } : {}),
         ...(hosts !== undefined ? { hosts } : {}),
       },
-      yes: booleans.has('yes'),
-      force: booleans.has('force'),
+      yes: booleans.has("yes"),
+      force: booleans.has("force"),
     },
   };
 }
@@ -307,7 +325,11 @@ function printErrors(io: CliIo, errors: readonly string[]): void {
 }
 
 /** The seat recommendation as the table step 5 shows, or its refusal reasons. */
-function printRecommendation(io: CliIo, answers: InitAnswers, plan: InitPlanResult): void {
+function printRecommendation(
+  io: CliIo,
+  answers: InitAnswers,
+  plan: InitPlanResult,
+): void {
   if (!answers.recommend || !plan.ok) {
     return;
   }
@@ -315,11 +337,11 @@ function printRecommendation(io: CliIo, answers: InitAnswers, plan: InitPlanResu
   if (recommendation === undefined) {
     return;
   }
-  io.stdout('seats\n');
-  if (recommendation.outcome === 'catalogue') {
+  io.stdout("seats\n");
+  if (recommendation.outcome === "catalogue") {
     for (const seat of recommendation.seats) {
       io.stdout(
-        `  ${seat.id}  ${seat.tool} ${seat.model}${seat.variant !== undefined ? `#${seat.variant}` : ''}  ${seat.roles.join(', ')}  ${seat.costClass}\n`,
+        `  ${seat.id}  ${seat.tool} ${seat.model}${seat.variant !== undefined ? `#${seat.variant}` : ""}  ${seat.roles.join(", ")}  ${seat.costClass}\n`,
       );
       const reason = recommendation.reasons[seat.id];
       if (reason !== undefined) {
@@ -337,10 +359,13 @@ function printRecommendation(io: CliIo, answers: InitAnswers, plan: InitPlanResu
 }
 
 /** The credential checklist (step 10): paths and chmod commands, created never. */
-function printCredentialChecklist(io: CliIo, credentials: readonly { path?: string; command: string; note?: string }[]): void {
-  io.stdout('credential checklist (nothing is created)\n');
+function printCredentialChecklist(
+  io: CliIo,
+  credentials: readonly { path?: string; command: string; note?: string }[],
+): void {
+  io.stdout("credential checklist (nothing is created)\n");
   if (credentials.length === 0) {
-    io.stdout('  no credential files are needed for the chosen features\n');
+    io.stdout("  no credential files are needed for the chosen features\n");
     return;
   }
   for (const credential of credentials) {
@@ -375,11 +400,13 @@ export async function initCommand(
     resolveInstallationFile(undefined, process.env, process.cwd());
 
   const read = await readInstallationFile(file);
-  if (read.status === 'unreadable') {
-    io.stderr(`${file}: could not be read (${read.reason}); nothing was written\n`);
+  if (read.status === "unreadable") {
+    io.stderr(
+      `${file}: could not be read (${read.reason}); nothing was written\n`,
+    );
     return 1;
   }
-  if (read.status === 'read' && !force) {
+  if (read.status === "read" && !force) {
     io.stderr(
       `refusing to overwrite an existing installation file (${file}); pass --force to replace it\n`,
     );
@@ -392,19 +419,21 @@ export async function initCommand(
   );
   const plan = buildInitPlan(answers, detection);
   if (!plan.ok) {
-    io.stderr('init refused:\n');
+    io.stderr("init refused:\n");
     printErrors(io, plan.errors);
     return 1;
   }
 
-  io.stdout('installation plan\n');
-  io.stdout(`  profile ${answers.profile}  tools ${answers.tools.join(', ')}\n`);
+  io.stdout("installation plan\n");
+  io.stdout(
+    `  profile ${answers.profile}  tools ${answers.tools.join(", ")}\n`,
+  );
   io.stdout(
     `  isolation ${answers.isolation}  forge ${answers.forge}  shelf ${answers.shelf}\n`,
   );
   for (const missing of plan.plan.missingTools) {
     io.stdout(
-      `  missing tool: ${missing}${plan.plan.requiredMissingTools.includes(missing) ? ' (needed by the chosen features)' : ''}\n`,
+      `  missing tool: ${missing}${plan.plan.requiredMissingTools.includes(missing) ? " (needed by the chosen features)" : ""}\n`,
     );
   }
   if (plan.plan.isolationNote !== undefined) {
@@ -416,13 +445,13 @@ export async function initCommand(
   io.stdout(plan.plan.text);
 
   if (!yes) {
-    io.stdout('nothing was written (pass --yes to write)\n');
+    io.stdout("nothing was written (pass --yes to write)\n");
     return 0;
   }
 
   // A first write may target a directory that does not exist yet; the write
   // node locks `<file>.lock` in it and never creates directories itself.
-  if (read.status === 'absent') {
+  if (read.status === "absent") {
     await mkdir(dirname(file), { recursive: true });
   }
   const result = await writeInstallation({
@@ -430,9 +459,9 @@ export async function initCommand(
     candidate: plan.plan.candidate,
     expectedHash: readHashOf(read),
   });
-  if (result.status === 'refused') {
+  if (result.status === "refused") {
     printErrors(io, result.errors);
-    io.stderr('nothing was written\n');
+    io.stderr("nothing was written\n");
     return 1;
   }
   io.stdout(`written ${file} (sha256 ${result.hash})\n`);
@@ -442,13 +471,13 @@ export async function initCommand(
   const loadResult = options.loadForDoctor
     ? options.loadForDoctor(file)
     : loadInstallation({ file });
-  if (loadResult.status === 'invalid') {
-    io.stderr('the written file failed to load:\n');
+  if (loadResult.status === "invalid") {
+    io.stderr("the written file failed to load:\n");
     printErrors(io, loadResult.errors);
     return 1;
   }
-  if (loadResult.status === 'absent') {
-    io.stderr('the written file could not be loaded back\n');
+  if (loadResult.status === "absent") {
+    io.stderr("the written file could not be loaded back\n");
     return 1;
   }
   const probes = options.doctorProbes ?? createNodeDoctorProbes();
@@ -457,7 +486,7 @@ export async function initCommand(
 
 /** Print the doctor lines and finish; the exit code stays init's own. */
 async function runDoctorAfterWrite(
-  loadResult: Exclude<LoadResult, { status: 'invalid' }>,
+  loadResult: Exclude<LoadResult, { status: "invalid" }>,
   probes: DoctorProbes,
   io: CliIo,
 ): Promise<number> {
@@ -469,9 +498,9 @@ async function runDoctorAfterWrite(
     lines.push(doctorLine);
     io.stdout(`${formatDoctorLine(doctorLine)}\n`);
   }
-  if (lines.some((line) => line.status !== 'PASS')) {
+  if (lines.some((line) => line.status !== "PASS")) {
     io.stdout(
-      'doctor reported non-PASS lines; run fleet-v2 doctor for the authoritative report and exit code\n',
+      "doctor reported non-PASS lines; run fleet-v2 doctor for the authoritative report and exit code\n",
     );
   }
   return 0;

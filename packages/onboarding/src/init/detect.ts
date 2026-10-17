@@ -12,24 +12,24 @@
  * `curl` for waves).
  */
 
-import { BUILT_IN_TOOLS, detectTool } from '@fleet/tooling';
-import type { CommandRunner, ToolDetection } from '@fleet/tooling';
+import { BUILT_IN_TOOLS, detectTool } from "@fleet/tooling";
+import type { CommandRunner, ToolDetection } from "@fleet/tooling";
 
-import type { DoctorCommandExecutor } from '../doctor/probes-node.js';
+import type { DoctorCommandExecutor } from "../doctor/probes-node.js";
 
 /** Wall-clock budget for one detection probe. */
 const DETECT_TIMEOUT_MS = 10_000;
 
 /** The platform tools init always reports, in report order. */
 export const INIT_PLATFORM_TOOLS: readonly string[] = [
-  'node',
-  'yarn',
-  'git',
-  'gh',
-  'sh',
-  'nc',
-  'curl',
-  'ssh',
+  "node",
+  "yarn",
+  "git",
+  "gh",
+  "sh",
+  "nc",
+  "curl",
+  "ssh",
 ];
 
 /** One platform tool the detection observed. */
@@ -64,28 +64,28 @@ export interface InitDetection {
 
 /** The probe argv per platform tool. */
 const VERSION_PROBES: Readonly<Record<string, readonly string[]>> = {
-  node: ['node', '--version'],
-  yarn: ['yarn', '--version'],
-  git: ['git', '--version'],
-  gh: ['gh', '--version'],
-  sh: ['sh', '-c', 'true'],
-  nc: ['nc', '-h'],
-  curl: ['curl', '--version'],
-  ssh: ['ssh', '-V'],
+  node: ["node", "--version"],
+  yarn: ["yarn", "--version"],
+  git: ["git", "--version"],
+  gh: ["gh", "--version"],
+  sh: ["sh", "-c", "true"],
+  nc: ["nc", "-h"],
+  curl: ["curl", "--version"],
+  ssh: ["ssh", "-V"],
 };
 
 /**
  * Tools whose probe is presence-only: their output is usage text, not a
  * version, so it is never reported as one.
  */
-const PRESENCE_ONLY: ReadonlySet<string> = new Set(['sh', 'nc']);
+const PRESENCE_ONLY: ReadonlySet<string> = new Set(["sh", "nc"]);
 
 /** First non-empty line of a probe output, trimmed. */
 function firstLine(text: string): string | undefined {
   return text
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .find((line) => line !== '');
+    .find((line) => line !== "");
 }
 
 async function probePlatformTool(
@@ -127,32 +127,40 @@ export async function detectInitEnvironment(
     const result = await executor.run(argv, { timeoutMs: DETECT_TIMEOUT_MS });
     return { exitCode: result.exitCode ?? -1, stdout: result.stdout };
   };
-  const [uname, pwd, platformTools, enabledToolsDetections] = await Promise.all([
-    (async () => {
-      try {
-        const result = await executor.run(['uname', '-s'], {
-          timeoutMs: DETECT_TIMEOUT_MS,
-        });
-        return result.exitCode === 0 ? (firstLine(result.stdout) ?? 'unknown') : 'unknown';
-      } catch {
-        return 'unknown';
-      }
-    })(),
-    (async () => {
-      try {
-        const result = await executor.run(['pwd'], { timeoutMs: DETECT_TIMEOUT_MS });
-        return result.exitCode === 0 ? (firstLine(result.stdout) ?? '') : '';
-      } catch {
-        return '';
-      }
-    })(),
-    Promise.all(INIT_PLATFORM_TOOLS.map((name) => probePlatformTool(executor, name))),
-    Promise.all(
-      BUILT_IN_TOOLS.filter((tool) => enabledTools.includes(tool.id)).map((tool) =>
-        detectTool(tool, runner),
+  const [uname, pwd, platformTools, enabledToolsDetections] = await Promise.all(
+    [
+      (async () => {
+        try {
+          const result = await executor.run(["uname", "-s"], {
+            timeoutMs: DETECT_TIMEOUT_MS,
+          });
+          return result.exitCode === 0
+            ? (firstLine(result.stdout) ?? "unknown")
+            : "unknown";
+        } catch {
+          return "unknown";
+        }
+      })(),
+      (async () => {
+        try {
+          const result = await executor.run(["pwd"], {
+            timeoutMs: DETECT_TIMEOUT_MS,
+          });
+          return result.exitCode === 0 ? (firstLine(result.stdout) ?? "") : "";
+        } catch {
+          return "";
+        }
+      })(),
+      Promise.all(
+        INIT_PLATFORM_TOOLS.map((name) => probePlatformTool(executor, name)),
       ),
-    ),
-  ]);
+      Promise.all(
+        BUILT_IN_TOOLS.filter((tool) => enabledTools.includes(tool.id)).map(
+          (tool) => detectTool(tool, runner),
+        ),
+      ),
+    ],
+  );
   return {
     platform: uname,
     cwd: pwd,

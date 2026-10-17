@@ -9,7 +9,14 @@
  * checklist lists paths without creating them.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
@@ -38,7 +45,10 @@ function mockIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
   const stderr: string[] = [];
   return {
-    io: { stdout: (text) => stdout.push(text), stderr: (text) => stderr.push(text) },
+    io: {
+      stdout: (text) => stdout.push(text),
+      stderr: (text) => stderr.push(text),
+    },
     stdout,
     stderr,
   };
@@ -46,7 +56,10 @@ function mockIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
 
 /** The detection environment: every platform tool present, tools signed in. */
 function detectionExecutor(cwd: string): DoctorCommandExecutor {
-  const table: Record<string, { exitCode: number; stdout?: string; stderr?: string }> = {
+  const table: Record<
+    string,
+    { exitCode: number; stdout?: string; stderr?: string }
+  > = {
     "uname -s": { exitCode: 0, stdout: "Linux\n" },
     pwd: { exitCode: 0, stdout: `${cwd}\n` },
     "node --version": { exitCode: 0, stdout: "v20.11.0\n" },
@@ -65,7 +78,13 @@ function detectionExecutor(cwd: string): DoctorCommandExecutor {
     async run(argv) {
       const answer = table[argv.join(" ")];
       if (answer === undefined) {
-        return { exitCode: null, signal: null, stdout: "", stderr: "", error: "not probed" };
+        return {
+          exitCode: null,
+          signal: null,
+          stdout: "",
+          stderr: "",
+          error: "not probed",
+        };
       }
       return {
         exitCode: answer.exitCode,
@@ -85,7 +104,10 @@ function passingDoctorProbes(): DoctorProbes {
     toolVersion: async () => "1.0.0",
     fileMode: async () => 0o600,
     worktreeRootWritable: async () => true,
-    ocmRunBinary: async () => ({ path: "/repo/bin/ocm-run", sha256: "c".repeat(64) }),
+    ocmRunBinary: async () => ({
+      path: "/repo/bin/ocm-run",
+      sha256: "c".repeat(64),
+    }),
     expectedOcmRunHash: async () => "c".repeat(64),
     seatProbe: async () => ({ outcome: "pass", reason: "answered" }),
   };
@@ -105,11 +127,18 @@ async function runInit(
   } = {},
 ): Promise<RunResult> {
   const { io, stdout, stderr } = mockIo();
-  const code = await runCli(["init", ...argv], io, undefined, undefined, undefined, {
-    installationFile: path.join(directory, "installation", "fleet.json"),
-    detectionExecutor: detectionExecutor(directory),
-    doctorProbes: overrides.doctorProbes ?? passingDoctorProbes(),
-  });
+  const code = await runCli(
+    ["init", ...argv],
+    io,
+    undefined,
+    undefined,
+    undefined,
+    {
+      installationFile: path.join(directory, "installation", "fleet.json"),
+      detectionExecutor: detectionExecutor(directory),
+      doctorProbes: overrides.doctorProbes ?? passingDoctorProbes(),
+    },
+  );
   return { code, stdout: stdout.join(""), stderr: stderr.join("") };
 }
 
@@ -151,7 +180,9 @@ describe("fleet-v2 init", () => {
     });
     // The doctor engine ran and its lines were printed.
     expect(result.stdout).toMatch(/PASS installation schema/);
-    expect(result.stdout).toContain("dispatch will refuse until the declaration changes");
+    expect(result.stdout).toContain(
+      "dispatch will refuse until the declaration changes",
+    );
   });
 
   it("refuses to overwrite an existing file without --force, and the bytes are unchanged", async () => {
@@ -192,7 +223,10 @@ describe("fleet-v2 init", () => {
 
   it("rejects an unknown flag and a missing required flag with exit 2", async () => {
     const directory = makeTempDir();
-    const unknown = await runInit([...EXAMPLE_COMMAND.slice(0, -1), "--wat"], directory);
+    const unknown = await runInit(
+      [...EXAMPLE_COMMAND.slice(0, -1), "--wat"],
+      directory,
+    );
     expect(unknown.code).toBe(2);
     expect(unknown.stderr).toContain("--wat");
     const missing = await runInit(
@@ -235,17 +269,33 @@ describe("fleet-v2 init", () => {
       directory,
     );
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("credential checklist (nothing is created)");
+    expect(result.stdout).toContain(
+      "credential checklist (nothing is created)",
+    );
     expect(result.stdout).toContain("gh auth status");
     // Only the installation file exists; the checklist created nothing.
-    const listing = readFileSync(path.join(directory, "installation", "fleet.json"), "utf8");
+    const listing = readFileSync(
+      path.join(directory, "installation", "fleet.json"),
+      "utf8",
+    );
     expect(listing).toContain('"forge"');
   });
 
   it("needs --hosts for the multi profile and drafts the answered hosts", async () => {
     const directory = makeTempDir();
     const missing = await runInit(
-      ["--profile", "multi", "--tools", "claude", "--isolation", "none", "--forge", "none", "--shelf", "local"],
+      [
+        "--profile",
+        "multi",
+        "--tools",
+        "claude",
+        "--isolation",
+        "none",
+        "--forge",
+        "none",
+        "--shelf",
+        "local",
+      ],
       directory,
     );
     expect(missing.code).toBe(2);
@@ -285,7 +335,12 @@ describe("fleet-v2 init", () => {
     expect(result.stderr).toBe("");
     expect(result.code).toBe(0);
     const parsed = parseInstallation(
-      JSON.parse(readFileSync(path.join(directory, "installation", "fleet.json"), "utf8")),
+      JSON.parse(
+        readFileSync(
+          path.join(directory, "installation", "fleet.json"),
+          "utf8",
+        ),
+      ),
     );
     expect(parsed.ok).toBe(true);
     const hosts = (parsed.ok ? parsed.installation.hosts : {}) as Record<

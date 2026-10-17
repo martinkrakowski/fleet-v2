@@ -15,7 +15,7 @@
  * ever propose what the loader would accept.
  */
 
-import { join } from 'node:path';
+import { join } from "node:path";
 
 import {
   parseInstallation,
@@ -25,26 +25,30 @@ import {
   type SeatSection,
   type VerificationProceduresSection,
   type WavesSection,
-} from '@fleet/installation';
-import { isToolId, recommendSeats } from '@fleet/tooling';
-import type { ModelInfo, ModelInfoList, SeatRecommendation } from '@fleet/tooling';
+} from "@fleet/installation";
+import { isToolId, recommendSeats } from "@fleet/tooling";
+import type {
+  ModelInfo,
+  ModelInfoList,
+  SeatRecommendation,
+} from "@fleet/tooling";
 
-import type { HostDraftCandidate, HostDraftInput } from '../hosts/draft.js';
-import { draftHost } from '../hosts/draft.js';
-import { serialiseInstallationCandidate } from '../hosts/write.js';
-import type { InitDetection } from './detect.js';
+import type { HostDraftCandidate, HostDraftInput } from "../hosts/draft.js";
+import { draftHost } from "../hosts/draft.js";
+import { serialiseInstallationCandidate } from "../hosts/write.js";
+import type { InitDetection } from "./detect.js";
 
 /** The two profiles init can set up (plan section 5, step 2). */
-export type InitProfile = 'single' | 'multi';
+export type InitProfile = "single" | "multi";
 
 /** The isolation answers (plan section 5, step 4 / D4, D5). */
-export type InitIsolation = 'none' | 'container' | 'custom';
+export type InitIsolation = "none" | "container" | "custom";
 
 /** The forge answers (plan section 5, step 6 / D6). */
-export type InitForge = 'none' | 'github';
+export type InitForge = "none" | "github";
 
 /** The shelf answers (plan section 5, step 9 / D1). */
-export type InitShelf = 'local' | 'git';
+export type InitShelf = "local" | "git";
 
 /** One host draft for the multi profile, in the shape `hosts add` drafts. */
 export type InitHostAnswer = HostDraftInput;
@@ -118,7 +122,7 @@ export type InitPlanResult =
   | { readonly ok: false; readonly errors: readonly string[] };
 
 /** The single profile's host: the machine init runs on, doing every role. */
-const SINGLE_HOST_NAME = 'this-machine';
+const SINGLE_HOST_NAME = "this-machine";
 
 /** The single profile's runner port (the example installation's value). */
 const SINGLE_RUNNER_PORT = 46000;
@@ -127,8 +131,8 @@ const SINGLE_RUNNER_PORT = 46000;
 const SINGLE_MAX_LANES = 1;
 
 /** The git shelf's default branch and path prefix (plan D1 plumbing). */
-const GIT_SHELF_BRANCH = 'fleet-keepers';
-const GIT_SHELF_PATH_PREFIX = 'keepers';
+const GIT_SHELF_BRANCH = "fleet-keepers";
+const GIT_SHELF_PATH_PREFIX = "keepers";
 
 /**
  * The isolation declaration each answer writes (D4, D5): `none` asserts
@@ -140,40 +144,47 @@ function isolationDeclaration(
   answers: InitAnswers,
   errors: string[],
 ): RunnerCapabilityDeclaration | undefined {
-  if (answers.isolation === 'none') {
+  if (answers.isolation === "none") {
     return {
       networkEgressRestricted: false,
       cpuAndMemoryLimited: false,
       processTreeTermination: false,
-      filesystemScope: 'inherited-directory',
+      filesystemScope: "inherited-directory",
     };
   }
-  if (answers.isolation === 'container') {
+  if (answers.isolation === "container") {
     return {
       networkEgressRestricted: true,
       cpuAndMemoryLimited: true,
       processTreeTermination: true,
-      filesystemScope: 'scoped-worktree',
+      filesystemScope: "scoped-worktree",
     };
   }
   const custom = answers.isolationCustom;
   if (custom === undefined) {
     errors.push(
-      'isolation: custom needs the four declaration values (isolationCustom); the non-interactive path cannot ask for them',
+      "isolation: custom needs the four declaration values (isolationCustom); the non-interactive path cannot ask for them",
     );
     return undefined;
   }
-  if (Object.hasOwn(custom, 'source')) {
-    errors.push('isolationCustom.source: is derived by the loader and is never drafted');
+  if (Object.hasOwn(custom, "source")) {
+    errors.push(
+      "isolationCustom.source: is derived by the loader and is never drafted",
+    );
     return undefined;
   }
-  const { networkEgressRestricted, cpuAndMemoryLimited, processTreeTermination, filesystemScope } =
-    custom;
+  const {
+    networkEgressRestricted,
+    cpuAndMemoryLimited,
+    processTreeTermination,
+    filesystemScope,
+  } = custom;
   if (
-    typeof networkEgressRestricted !== 'boolean' ||
-    typeof cpuAndMemoryLimited !== 'boolean' ||
-    typeof processTreeTermination !== 'boolean' ||
-    (filesystemScope !== 'inherited-directory' && filesystemScope !== 'scoped-worktree')
+    typeof networkEgressRestricted !== "boolean" ||
+    typeof cpuAndMemoryLimited !== "boolean" ||
+    typeof processTreeTermination !== "boolean" ||
+    (filesystemScope !== "inherited-directory" &&
+      filesystemScope !== "scoped-worktree")
   ) {
     errors.push(
       'isolationCustom: must carry networkEgressRestricted, cpuAndMemoryLimited and processTreeTermination as booleans and filesystemScope as "inherited-directory" or "scoped-worktree"',
@@ -194,14 +205,14 @@ function parseForgeRepo(
   errors: string[],
 ): { readonly owner: string; readonly repo: string } | undefined {
   if (forgeRepo === undefined) {
-    errors.push('forge: mode github requires an owner/repo (forgeRepo)');
+    errors.push("forge: mode github requires an owner/repo (forgeRepo)");
     return undefined;
   }
-  const separator = forgeRepo.indexOf('/');
-  const owner = separator === -1 ? '' : forgeRepo.slice(0, separator);
+  const separator = forgeRepo.indexOf("/");
+  const owner = separator === -1 ? "" : forgeRepo.slice(0, separator);
   const repo = forgeRepo.slice(separator + 1);
-  if (owner === '' || repo === '' || forgeRepo.includes(' ')) {
-    errors.push('forgeRepo: must be owner/repo');
+  if (owner === "" || repo === "" || forgeRepo.includes(" ")) {
+    errors.push("forgeRepo: must be owner/repo");
     return undefined;
   }
   return { owner, repo };
@@ -214,17 +225,17 @@ function parseForgeRepo(
  */
 function requiredToolNames(answers: InitAnswers): ReadonlySet<string> {
   const required = new Set<string>();
-  if (answers.forge === 'github') {
-    required.add('gh');
+  if (answers.forge === "github") {
+    required.add("gh");
   }
-  if (answers.shelf === 'git') {
-    required.add('git');
+  if (answers.shelf === "git") {
+    required.add("git");
   }
-  if ((answers.hosts ?? []).some((host) => host.transport === 'ssh')) {
-    required.add('ssh');
+  if ((answers.hosts ?? []).some((host) => host.transport === "ssh")) {
+    required.add("ssh");
   }
   if (answers.waves !== undefined) {
-    required.add('curl');
+    required.add("curl");
   }
   return required;
 }
@@ -244,7 +255,7 @@ export function buildInitPlan(
   const errors: string[] = [];
 
   if (answers.tools.length === 0) {
-    errors.push('tools: at least one tool is required');
+    errors.push("tools: at least one tool is required");
   }
   for (const tool of answers.tools) {
     if (!isToolId(tool)) {
@@ -259,19 +270,19 @@ export function buildInitPlan(
   // applies the chosen isolation declaration to every runner that does not
   // name its own.
   const hostDrafts: HostDraftInput[] = [];
-  if (answers.profile === 'single') {
+  if (answers.profile === "single") {
     if (answers.hosts !== undefined) {
-      errors.push('hosts: only the multi profile takes host drafts');
+      errors.push("hosts: only the multi profile takes host drafts");
     }
-    const worktreeRoot = join(detected.cwd, 'worktrees');
+    const worktreeRoot = join(detected.cwd, "worktrees");
     hostDrafts.push({
       name: SINGLE_HOST_NAME,
-      transport: 'local',
+      transport: "local",
       worktreeRoot,
-      tmpDir: join(worktreeRoot, '.tmp'),
-      roles: ['orchestrator', 'lane-runner', 'verifier'],
+      tmpDir: join(worktreeRoot, ".tmp"),
+      roles: ["orchestrator", "lane-runner", "verifier"],
       runner: {
-        kind: 'opencode',
+        kind: "opencode",
         port: SINGLE_RUNNER_PORT,
         maxLanes: SINGLE_MAX_LANES,
         ...(declaration !== undefined ? { capabilities: declaration } : {}),
@@ -280,7 +291,7 @@ export function buildInitPlan(
   } else {
     const answered = answers.hosts ?? [];
     if (answered.length === 0) {
-      errors.push('hosts: the multi profile requires host drafts (--hosts)');
+      errors.push("hosts: the multi profile requires host drafts (--hosts)");
     }
     hostDrafts.push(...answered);
   }
@@ -288,7 +299,9 @@ export function buildInitPlan(
   const hosts: Record<string, HostSection> = Object.create(null);
   for (const input of hostDrafts) {
     const withIsolation =
-      input.runner === undefined || input.runner.capabilities !== undefined || declaration === undefined
+      input.runner === undefined ||
+      input.runner.capabilities !== undefined ||
+      declaration === undefined
         ? input
         : { ...input, runner: { ...input.runner, capabilities: declaration } };
     const drafted = draftHost(withIsolation);
@@ -300,36 +313,40 @@ export function buildInitPlan(
   }
 
   // Forge (D6): required in every v2 file.
-  let forge: { readonly mode: 'none' } | { readonly mode: 'github'; owner: string; repo: string };
-  if (answers.forge === 'none') {
-    forge = { mode: 'none' };
+  let forge:
+    | { readonly mode: "none" }
+    | { readonly mode: "github"; owner: string; repo: string };
+  if (answers.forge === "none") {
+    forge = { mode: "none" };
   } else {
     const parsed = parseForgeRepo(answers.forgeRepo, errors);
     forge =
       parsed === undefined
         ? // Placeholder; the errors above refuse the plan before any write.
-          { mode: 'none' }
-        : { mode: 'github', owner: parsed.owner, repo: parsed.repo };
+          { mode: "none" }
+        : { mode: "github", owner: parsed.owner, repo: parsed.repo };
   }
 
   // Shelf (D1): local is today's file behaviour; git is the plumbing-only
   // provider with the engine's fixed branch and path prefix.
   let shelf:
-    | { readonly provider: 'local' }
+    | { readonly provider: "local" }
     | {
-        readonly provider: 'git';
+        readonly provider: "git";
         repoDir: string;
         branch: string;
         pathPrefix: string;
       }
     | undefined;
-  if (answers.shelf === 'local') {
-    shelf = { provider: 'local' };
+  if (answers.shelf === "local") {
+    shelf = { provider: "local" };
   } else if (answers.shelfRepo === undefined) {
-    errors.push('shelf: provider git requires a repository directory (shelfRepo)');
+    errors.push(
+      "shelf: provider git requires a repository directory (shelfRepo)",
+    );
   } else {
     shelf = {
-      provider: 'git',
+      provider: "git",
       repoDir: answers.shelfRepo,
       branch: GIT_SHELF_BRANCH,
       pathPrefix: GIT_SHELF_PATH_PREFIX,
@@ -354,9 +371,9 @@ export function buildInitPlan(
     const models: Record<string, ModelInfoList> = {};
     for (const detectedTool of detected.enabledTools) {
       models[detectedTool.id] =
-        detectedTool.models === 'unknown'
-          ? 'unknown'
-          : ('source' in detectedTool.models
+        detectedTool.models === "unknown"
+          ? "unknown"
+          : ("source" in detectedTool.models
               ? detectedTool.models.models
               : detectedTool.models
             ).flatMap((model): ModelInfo[] =>
@@ -366,11 +383,14 @@ export function buildInitPlan(
             );
     }
     recommendation = recommendSeats({
-      tools: detected.enabledTools.map((tool) => ({ id: tool.id, signIn: tool.signIn })),
+      tools: detected.enabledTools.map((tool) => ({
+        id: tool.id,
+        signIn: tool.signIn,
+      })),
       models,
       policy: {},
     });
-    if (recommendation.outcome === 'catalogue') {
+    if (recommendation.outcome === "catalogue") {
       seats = recommendation.seats;
       chains = recommendation.chains;
     }
@@ -390,7 +410,9 @@ export function buildInitPlan(
     ...(chains !== undefined ? { chains } : {}),
     ...(shelf !== undefined ? { shelf } : {}),
     forge,
-    ...(answers.verification !== undefined ? { verification: answers.verification } : {}),
+    ...(answers.verification !== undefined
+      ? { verification: answers.verification }
+      : {}),
     ...(answers.waves !== undefined ? { waves: answers.waves } : {}),
   };
 
@@ -416,9 +438,9 @@ export function buildInitPlan(
       command: `chmod 600 ${answers.waves.tokenFile}`,
     });
   }
-  if (answers.forge === 'github') {
+  if (answers.forge === "github") {
     credentials.push({
-      command: 'gh auth status',
+      command: "gh auth status",
       note: "a github forge uses gh's own credential store; run 'gh auth login' if it is not signed in — init never reads or creates it",
     });
   }
@@ -432,7 +454,7 @@ export function buildInitPlan(
       requiredMissingTools: requiredMissing,
       recommendation,
       isolationNote:
-        answers.isolation === 'none'
+        answers.isolation === "none"
           ? "isolation is 'none': dispatch will refuse until the declaration changes"
           : undefined,
       credentials,

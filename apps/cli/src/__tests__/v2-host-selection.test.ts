@@ -180,7 +180,9 @@ describe("v2 CLI host selection (H3b)", () => {
     expect(result.reservation.hostName).toBe("here");
     // The path is the attempt digest under the host's worktree root; no
     // caller text appears in it.
-    expect(result.worktreePath).toMatch(/^\/srv\/fleet\/worktrees\/[0-9a-f]{32}$/);
+    expect(result.worktreePath).toMatch(
+      /^\/srv\/fleet\/worktrees\/[0-9a-f]{32}$/,
+    );
   });
 
   it("refuses an operator hostId for evidence request-verification with a usage error", async () => {

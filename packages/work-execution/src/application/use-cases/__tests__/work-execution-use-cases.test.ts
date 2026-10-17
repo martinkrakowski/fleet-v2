@@ -1362,6 +1362,25 @@ describe('DispatchAttemptUseCase', () => {
     expect(setup.journal.entries).toHaveLength(0);
   });
 
+  it('refuses a worktree path other than the one the reservation allocated (review of #125)', async () => {
+    const setup = makeDispatchSetup();
+    setup.journal.reservations.set(
+      'res-1',
+      storedReservation({ id: 'res-1', attemptId: 'attempt-1', worktreePath: '/srv/wt/allocated-digest' }),
+    );
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Worktree path does not match the path allocated by the capacity reservation',
+    });
+    expect(setup.runner.startCalls).toHaveLength(0);
+    expect(setup.journal.entries).toHaveLength(0);
+  });
+
   it('dispatches a reservation held on the configured runner host', async () => {
     const setup = makeDispatchSetup({
       runnerOptions: {

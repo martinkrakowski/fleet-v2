@@ -169,6 +169,18 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         reason: `Reservation host ${reservationHostName} is not the configured runner host ${runnerHostName}; several lane-runner hosts need H9b/H10`,
       };
     }
+    // The reservation's allocated worktree is the only one this attempt may
+    // dispatch into (review of #125): a v2 reserve allocates the path under
+    // its lock, and the busy-worktree check only ever saw that path. A null
+    // path is a legacy or pre-H9a2 record and passes as before. The reason
+    // names neither path.
+    const reservedWorktreePath = heldReservation.worktreePath ?? null;
+    if (reservedWorktreePath !== null && reservedWorktreePath !== request.worktreePath) {
+      return {
+        outcome: 'refused',
+        reason: 'Worktree path does not match the path allocated by the capacity reservation',
+      };
+    }
 
     const runnerCapabilities = this.deps.runner.describeCapabilities();
     // Requirements come from the frozen brief's lane profile only; the

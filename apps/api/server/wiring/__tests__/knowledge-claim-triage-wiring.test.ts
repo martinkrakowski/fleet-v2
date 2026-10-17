@@ -16,7 +16,10 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import type { DecisionsSectionV2 } from "@fleet/installation";
 
-import { createConfiguredKnowledgeComposition, type KnowledgeComposition } from "../knowledge/composition";
+import {
+  createConfiguredKnowledgeComposition,
+  type KnowledgeComposition,
+} from "../knowledge/composition";
 
 const FIXTURE_DIR = new URL(
   "../../../../../packages/brief-knowledge/src/infrastructure/adapters/__fixtures__/jev/",
@@ -24,7 +27,10 @@ const FIXTURE_DIR = new URL(
 );
 
 /** Proves the fixture dir resolves; the shape of the answers is irrelevant. */
-readFileSync(fileURLToPath(new URL("jev-score-response.json", FIXTURE_DIR)), "utf8");
+readFileSync(
+  fileURLToPath(new URL("jev-score-response.json", FIXTURE_DIR)),
+  "utf8",
+);
 
 const PROJECT_ID = "proj-k6";
 
@@ -33,7 +39,8 @@ const NOTES_REQUEST = {
   attemptId: "att-k6-1",
   workOrderId: "wo-k6-1",
   headCommitSha: "def5678",
-  notesMarkdown: "- The API root wires claim triage behind the acknowledgement\n",
+  notesMarkdown:
+    "- The API root wires claim triage behind the acknowledgement\n",
 };
 
 /**
@@ -45,7 +52,10 @@ function spyFetch(): typeof fetch & { calls: unknown[] } {
   const calls: unknown[] = [];
   const fn = (async (url: unknown, init?: RequestInit) => {
     calls.push({ url: String(url), init });
-    return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    return new Response("{}", {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
   }) as typeof fetch & { calls: unknown[] };
   fn.calls = calls;
   return fn;
@@ -88,9 +98,10 @@ const JEV_WITH_UNREADABLE_KEY: DecisionsSectionV2 = {
 async function capture(
   composition: KnowledgeComposition,
 ): Promise<{ outcome: string }> {
-  const result = await composition.captureCompletedAttemptNotes.captureCompletedAttemptNotes(
-    NOTES_REQUEST,
-  );
+  const result =
+    await composition.captureCompletedAttemptNotes.captureCompletedAttemptNotes(
+      NOTES_REQUEST,
+    );
   return { outcome: result.outcome };
 }
 
@@ -109,12 +120,15 @@ const createdDirs = new Set<string>();
 
 afterAll(async () => {
   await Promise.all(
-    [...createdDirs].map((directory) => rm(directory, { recursive: true, force: true })),
+    [...createdDirs].map((directory) =>
+      rm(directory, { recursive: true, force: true }),
+    ),
   );
 });
 
 async function makeTempStateDir(): Promise<string> {
-  const directory = await mkdtemp(path.join(tmpdir(), "fleet-api-k6-"));  createdDirs.add(directory);
+  const directory = await mkdtemp(path.join(tmpdir(), "fleet-api-k6-"));
+  createdDirs.add(directory);
   return directory;
 }
 
@@ -131,7 +145,9 @@ describe("knowledge composition claim triage wiring", () => {
     expect((await capture(composition)).outcome).toBe("captured");
     await settle();
     expect(fetch.calls).toHaveLength(0);
-    await expect(readFile(monthReceiptPath(stateDir), "utf8")).rejects.toThrow("ENOENT");
+    await expect(readFile(monthReceiptPath(stateDir), "utf8")).rejects.toThrow(
+      "ENOENT",
+    );
   });
 
   it("with everything set and an injected fetch a capture triggers exactly one triage request", async () => {

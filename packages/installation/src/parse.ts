@@ -77,25 +77,70 @@ const V2_VERIFICATION_KEYS: readonly string[] = ['procedures'];
 const PROCEDURE_KEYS: readonly string[] = ['command', 'args'];
 const FORGE_KEYS: readonly string[] = ['owner', 'repo'];
 const SEAT_KEYS: readonly string[] = ['agent', 'model', 'variant'];
-const WAVES_KEYS: readonly string[] = ['baseUrl', 'tokenFile', 'caFile', 'ownerPublicKey'];
+const WAVES_KEYS: readonly string[] = [
+  'baseUrl',
+  'tokenFile',
+  'caFile',
+  'ownerPublicKey',
+];
 const SHELF_KEYS: readonly string[] = ['baseUrl', 'keyFile'];
-const HOST_KEYS: readonly string[] = ['transport', 'sshAlias', 'worktreeRoot', 'tmpDir', 'roles', 'runner'];
-const HOST_RUNNER_KEYS: readonly string[] = ['kind', 'port', 'authFile', 'capabilities', 'maxLanes'];
+const HOST_KEYS: readonly string[] = [
+  'transport',
+  'sshAlias',
+  'worktreeRoot',
+  'tmpDir',
+  'roles',
+  'runner',
+];
+const HOST_RUNNER_KEYS: readonly string[] = [
+  'kind',
+  'port',
+  'authFile',
+  'capabilities',
+  'maxLanes',
+];
 // An agy runner carries the mode and, for `full`, the security acknowledgement (D7).
-const AGY_HOST_RUNNER_KEYS: readonly string[] = [...HOST_RUNNER_KEYS, 'agyMode', 'agyAcknowledgement'];
-const AGY_ACKNOWLEDGEMENT_KEYS: readonly string[] = ['textVersion', 'acceptedAt'];
+const AGY_HOST_RUNNER_KEYS: readonly string[] = [
+  ...HOST_RUNNER_KEYS,
+  'agyMode',
+  'agyAcknowledgement',
+];
+const AGY_ACKNOWLEDGEMENT_KEYS: readonly string[] = [
+  'textVersion',
+  'acceptedAt',
+];
 const CAPABILITY_KEYS: readonly string[] = [
   'networkEgressRestricted',
   'cpuAndMemoryLimited',
   'processTreeTermination',
   'filesystemScope',
 ];
-const V2_SEAT_KEYS: readonly string[] = ['id', 'tool', 'model', 'variant', 'agent', 'roles', 'costClass'];
-const CHAIN_KEYS: readonly (keyof ChainsSection)[] = ['implementer', 'reviewer', 'high-risk-reviewer'];
+const V2_SEAT_KEYS: readonly string[] = [
+  'id',
+  'tool',
+  'model',
+  'variant',
+  'agent',
+  'roles',
+  'costClass',
+];
+const CHAIN_KEYS: readonly (keyof ChainsSection)[] = [
+  'implementer',
+  'reviewer',
+  'high-risk-reviewer',
+];
 const CHAIN_STEP_KEYS: readonly string[] = ['seatId', 'triggers'];
-const POLICY_KEYS: readonly string[] = ['forbiddenRoutes', 'perLaneCostCeiling'];
+const POLICY_KEYS: readonly string[] = [
+  'forbiddenRoutes',
+  'perLaneCostCeiling',
+];
 const FORBIDDEN_ROUTE_KEYS: readonly string[] = ['tool', 'modelPattern'];
-const GIT_SHELF_KEYS: readonly string[] = ['provider', 'repoDir', 'branch', 'pathPrefix'];
+const GIT_SHELF_KEYS: readonly string[] = [
+  'provider',
+  'repoDir',
+  'branch',
+  'pathPrefix',
+];
 const GITHUB_FORGE_KEYS: readonly string[] = ['mode', 'owner', 'repo'];
 const NO_DECISIONS_KEYS: readonly string[] = ['provider'];
 const JEV_DECISIONS_KEYS: readonly string[] = [
@@ -109,23 +154,44 @@ const JEV_DECISIONS_KEYS: readonly string[] = [
   'disabledProjects',
   'consumers',
 ];
-const ANSWER_FILE_DECISIONS_KEYS: readonly string[] = ['provider', 'answerFile', 'consumers'];
+const ANSWER_FILE_DECISIONS_KEYS: readonly string[] = [
+  'provider',
+  'answerFile',
+  'consumers',
+];
 // Per-consumer settings (K3): two known consumers, each with its own keys.
 const DECISION_CONSUMERS_KEYS: readonly (keyof DecisionConsumers)[] = [
   'knowledge-ranking',
   'claim-triage',
 ];
-const KNOWLEDGE_RANKING_CONSUMER_KEYS: readonly string[] = ['minConfidence', 'monthlyBudgetUsd'];
+const KNOWLEDGE_RANKING_CONSUMER_KEYS: readonly string[] = [
+  'minConfidence',
+  'monthlyBudgetUsd',
+];
 const CLAIM_TRIAGE_CONSUMER_KEYS: readonly string[] = [
   'minConfidence',
   'monthlyBudgetUsd',
   'acknowledgeCandidateClaimsLeaveHost',
 ];
 
-const HOST_ROLES: readonly HostRole[] = ['orchestrator', 'lane-runner', 'verifier'];
-const SEAT_ROLES: readonly SeatRole[] = ['implementer', 'reviewer', 'high-risk-reviewer'];
+const HOST_ROLES: readonly HostRole[] = [
+  'orchestrator',
+  'lane-runner',
+  'verifier',
+];
+const SEAT_ROLES: readonly SeatRole[] = [
+  'implementer',
+  'reviewer',
+  'high-risk-reviewer',
+];
 const COST_CLASSES: readonly CostClass[] = ['free', 'plan-quota', 'paid'];
-const CHAIN_TRIGGERS: readonly ChainTrigger[] = ['429', '402', 'timeout', 'quota', 'no-commit'];
+const CHAIN_TRIGGERS: readonly ChainTrigger[] = [
+  '429',
+  '402',
+  'timeout',
+  'quota',
+  'no-commit',
+];
 
 const PROCEDURE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const FORBIDDEN_PROCEDURE_NAMES: ReadonlySet<string> = new Set([
@@ -204,7 +270,12 @@ function readOptionalPort(
     return undefined;
   }
   const value = record[key];
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 65535) {
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < 1 ||
+    value > 65535
+  ) {
     errors.push(`${fieldPath}: must be an integer 1..65535`);
     return undefined;
   }
@@ -262,7 +333,11 @@ function readOptionalPositiveInteger(
 function isHttpsUrl(value: string): boolean {
   try {
     const parsed = new URL(value);
-    return parsed.protocol === 'https:' && parsed.username === '' && parsed.password === '';
+    return (
+      parsed.protocol === 'https:' &&
+      parsed.username === '' &&
+      parsed.password === ''
+    );
   } catch {
     return false;
   }
@@ -388,9 +463,24 @@ function buildSeat(
   entryPath: string,
   errors: string[],
 ): FallbackSeat | undefined {
-  const agent = readRequiredString(entry, 'agent', `${entryPath}.agent`, errors);
-  const model = readRequiredString(entry, 'model', `${entryPath}.model`, errors);
-  const variant = readOptionalString(entry, 'variant', `${entryPath}.variant`, errors);
+  const agent = readRequiredString(
+    entry,
+    'agent',
+    `${entryPath}.agent`,
+    errors,
+  );
+  const model = readRequiredString(
+    entry,
+    'model',
+    `${entryPath}.model`,
+    errors,
+  );
+  const variant = readOptionalString(
+    entry,
+    'variant',
+    `${entryPath}.variant`,
+    errors,
+  );
   if (agent === undefined || model === undefined) {
     return undefined;
   }
@@ -430,7 +520,10 @@ function parseFallbackChain(
   return seats;
 }
 
-function parseRunnerSection(value: JsonObject, errors: string[]): RunnerSection | undefined {
+function parseRunnerSection(
+  value: JsonObject,
+  errors: string[],
+): RunnerSection | undefined {
   if (!Object.hasOwn(value, 'runner')) {
     return undefined;
   }
@@ -442,10 +535,25 @@ function parseRunnerSection(value: JsonObject, errors: string[]): RunnerSection 
   collectUnknownKeys(section, RUNNER_KEYS, 'runner', errors);
   const agent = readRequiredString(section, 'agent', 'runner.agent', errors);
   const model = readRequiredString(section, 'model', 'runner.model', errors);
-  const variant = readOptionalString(section, 'variant', 'runner.variant', errors);
-  const remotePort = readOptionalPort(section, 'remotePort', 'runner.remotePort', errors);
+  const variant = readOptionalString(
+    section,
+    'variant',
+    'runner.variant',
+    errors,
+  );
+  const remotePort = readOptionalPort(
+    section,
+    'remotePort',
+    'runner.remotePort',
+    errors,
+  );
   const host = readOptionalString(section, 'host', 'runner.host', errors);
-  const ocmRunBin = readOptionalString(section, 'ocmRunBin', 'runner.ocmRunBin', errors);
+  const ocmRunBin = readOptionalString(
+    section,
+    'ocmRunBin',
+    'runner.ocmRunBin',
+    errors,
+  );
   const fallbackChain = parseFallbackChain(section, errors);
   if (agent === undefined || model === undefined) {
     return undefined;
@@ -462,7 +570,10 @@ function parseRunnerSection(value: JsonObject, errors: string[]): RunnerSection 
   return runner;
 }
 
-function parseWorktreeSection(value: JsonObject, errors: string[]): WorktreeSection | undefined {
+function parseWorktreeSection(
+  value: JsonObject,
+  errors: string[],
+): WorktreeSection | undefined {
   if (!Object.hasOwn(value, 'worktree')) {
     return undefined;
   }
@@ -472,7 +583,12 @@ function parseWorktreeSection(value: JsonObject, errors: string[]): WorktreeSect
     return undefined;
   }
   collectUnknownKeys(section, WORKTREE_KEYS, 'worktree', errors);
-  const sshHost = readRequiredString(section, 'sshHost', 'worktree.sshHost', errors);
+  const sshHost = readRequiredString(
+    section,
+    'sshHost',
+    'worktree.sshHost',
+    errors,
+  );
   if (sshHost === undefined) {
     return undefined;
   }
@@ -485,7 +601,10 @@ function parseProcedures(
 ): Readonly<Record<string, VerificationProcedure>> {
   const procedures: Record<string, VerificationProcedure> = Object.create(null);
   for (const name of Object.keys(record)) {
-    if (!PROCEDURE_NAME_PATTERN.test(name) || FORBIDDEN_PROCEDURE_NAMES.has(name.toLowerCase())) {
+    if (
+      !PROCEDURE_NAME_PATTERN.test(name) ||
+      FORBIDDEN_PROCEDURE_NAMES.has(name.toLowerCase())
+    ) {
       errors.push('verification.procedures: invalid procedure name');
       continue;
     }
@@ -496,8 +615,18 @@ function parseProcedures(
       continue;
     }
     collectUnknownKeys(entry, PROCEDURE_KEYS, procedurePath, errors);
-    const command = readRequiredString(entry, 'command', `${procedurePath}.command`, errors);
-    const args = readOptionalStringArray(entry, 'args', `${procedurePath}.args`, errors);
+    const command = readRequiredString(
+      entry,
+      'command',
+      `${procedurePath}.command`,
+      errors,
+    );
+    const args = readOptionalStringArray(
+      entry,
+      'args',
+      `${procedurePath}.args`,
+      errors,
+    );
     if (command === undefined) {
       continue;
     }
@@ -522,7 +651,12 @@ function parseVerificationSection(
     return undefined;
   }
   collectUnknownKeys(section, VERIFICATION_KEYS, 'verification', errors);
-  const sshHost = readOptionalString(section, 'sshHost', 'verification.sshHost', errors);
+  const sshHost = readOptionalString(
+    section,
+    'sshHost',
+    'verification.sshHost',
+    errors,
+  );
   let procedures: Readonly<Record<string, VerificationProcedure>> | undefined;
   if (!Object.hasOwn(section, 'procedures')) {
     errors.push('verification.procedures: required');
@@ -543,7 +677,10 @@ function parseVerificationSection(
   };
 }
 
-function parseForgeSection(value: JsonObject, errors: string[]): ForgeSection | undefined {
+function parseForgeSection(
+  value: JsonObject,
+  errors: string[],
+): ForgeSection | undefined {
   if (!Object.hasOwn(value, 'forge')) {
     return undefined;
   }
@@ -561,7 +698,10 @@ function parseForgeSection(value: JsonObject, errors: string[]): ForgeSection | 
   return { owner, repo };
 }
 
-function parseReviewerSection(value: JsonObject, errors: string[]): ReviewerSection | undefined {
+function parseReviewerSection(
+  value: JsonObject,
+  errors: string[],
+): ReviewerSection | undefined {
   if (!Object.hasOwn(value, 'reviewer')) {
     return undefined;
   }
@@ -574,7 +714,10 @@ function parseReviewerSection(value: JsonObject, errors: string[]): ReviewerSect
   return buildSeat(section, 'reviewer', errors);
 }
 
-function parseWavesSection(value: JsonObject, errors: string[]): WavesSection | undefined {
+function parseWavesSection(
+  value: JsonObject,
+  errors: string[],
+): WavesSection | undefined {
   if (!Object.hasOwn(value, 'waves')) {
     return undefined;
   }
@@ -584,9 +727,24 @@ function parseWavesSection(value: JsonObject, errors: string[]): WavesSection | 
     return undefined;
   }
   collectUnknownKeys(section, WAVES_KEYS, 'waves', errors);
-  const baseUrl = readRequiredHttpsUrl(section, 'baseUrl', 'waves.baseUrl', errors);
-  const tokenFile = readRequiredAbsolutePath(section, 'tokenFile', 'waves.tokenFile', errors);
-  const caFile = readOptionalAbsolutePath(section, 'caFile', 'waves.caFile', errors);
+  const baseUrl = readRequiredHttpsUrl(
+    section,
+    'baseUrl',
+    'waves.baseUrl',
+    errors,
+  );
+  const tokenFile = readRequiredAbsolutePath(
+    section,
+    'tokenFile',
+    'waves.tokenFile',
+    errors,
+  );
+  const caFile = readOptionalAbsolutePath(
+    section,
+    'caFile',
+    'waves.caFile',
+    errors,
+  );
   const ownerPublicKey = readOptionalOwnerPublicKey(
     section,
     'ownerPublicKey',
@@ -604,7 +762,10 @@ function parseWavesSection(value: JsonObject, errors: string[]): WavesSection | 
   };
 }
 
-function parseShelfSection(value: JsonObject, errors: string[]): ShelfSection | undefined {
+function parseShelfSection(
+  value: JsonObject,
+  errors: string[],
+): ShelfSection | undefined {
   if (!Object.hasOwn(value, 'shelf')) {
     return undefined;
   }
@@ -614,8 +775,18 @@ function parseShelfSection(value: JsonObject, errors: string[]): ShelfSection | 
     return undefined;
   }
   collectUnknownKeys(section, SHELF_KEYS, 'shelf', errors);
-  const baseUrl = readRequiredHttpsUrl(section, 'baseUrl', 'shelf.baseUrl', errors);
-  const keyFile = readRequiredAbsolutePath(section, 'keyFile', 'shelf.keyFile', errors);
+  const baseUrl = readRequiredHttpsUrl(
+    section,
+    'baseUrl',
+    'shelf.baseUrl',
+    errors,
+  );
+  const keyFile = readRequiredAbsolutePath(
+    section,
+    'keyFile',
+    'shelf.keyFile',
+    errors,
+  );
   if (baseUrl === undefined || keyFile === undefined) {
     return undefined;
   }
@@ -736,8 +907,18 @@ function parseAgyAcknowledgement(
     return undefined;
   }
   collectUnknownKeys(section, AGY_ACKNOWLEDGEMENT_KEYS, fieldPath, errors);
-  const textVersion = readRequiredString(section, 'textVersion', `${fieldPath}.textVersion`, errors);
-  const acceptedAt = readRequiredString(section, 'acceptedAt', `${fieldPath}.acceptedAt`, errors);
+  const textVersion = readRequiredString(
+    section,
+    'textVersion',
+    `${fieldPath}.textVersion`,
+    errors,
+  );
+  const acceptedAt = readRequiredString(
+    section,
+    'acceptedAt',
+    `${fieldPath}.acceptedAt`,
+    errors,
+  );
   if (acceptedAt !== undefined && !isIsoTimestamp(acceptedAt)) {
     errors.push(`${fieldPath}.acceptedAt: must be an ISO 8601 timestamp`);
     return undefined;
@@ -746,7 +927,9 @@ function parseAgyAcknowledgement(
     return undefined;
   }
   if (textVersion !== AGY_SECURITY_TEXT_VERSION) {
-    errors.push(`${fieldPath}: agyAcknowledgement is stale; re-confirm with init or /settings`);
+    errors.push(
+      `${fieldPath}: agyAcknowledgement is stale; re-confirm with init or /settings`,
+    );
     return undefined;
   }
   return { textVersion, acceptedAt };
@@ -775,11 +958,22 @@ function parseHostRunner(
     }
   }
   const port = readRequiredPort(runner, 'port', `${runnerPath}.port`, errors);
-  const authFile = readOptionalAbsolutePath(runner, 'authFile', `${runnerPath}.authFile`, errors);
+  const authFile = readOptionalAbsolutePath(
+    runner,
+    'authFile',
+    `${runnerPath}.authFile`,
+    errors,
+  );
   const capabilities = parseRunnerCapabilities(runner, runnerPath, errors);
-  const maxLanes = readOptionalPositiveInteger(runner, 'maxLanes', `${runnerPath}.maxLanes`, errors);
+  const maxLanes = readOptionalPositiveInteger(
+    runner,
+    'maxLanes',
+    `${runnerPath}.maxLanes`,
+    errors,
+  );
   let agyMode: 'edit-only' | 'full' | undefined;
-  let agyAcknowledgement: { textVersion: string; acceptedAt: string } | undefined;
+  let agyAcknowledgement:
+    { textVersion: string; acceptedAt: string } | undefined;
   if (kind === 'agy') {
     agyMode = readRequiredEnum(
       runner,
@@ -856,7 +1050,10 @@ function parseRoles<T extends string>(
   let repeated = false;
   for (let index = 0; index < value.length; index += 1) {
     const role = value[index];
-    if (typeof role !== 'string' || !(allowed as readonly string[]).includes(role)) {
+    if (
+      typeof role !== 'string' ||
+      !(allowed as readonly string[]).includes(role)
+    ) {
       errors.push(`${rolesPath}[${index}]: ${problem}`);
       continue;
     }
@@ -876,7 +1073,33 @@ function parseRoles<T extends string>(
   return roles;
 }
 
-function parseHost(entry: JsonObject, hostPath: string, errors: string[]): HostSection | undefined {
+/**
+ * Validate that an SSH host string is safe to pass to subprocess commands.
+ * Matches `^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$` and does not start with `-`.
+ *
+ * The same rule `WorkspaceAdapter` applies before an ssh destination reaches
+ * an argv; it is copied here on purpose so the loader is the first gate, and
+ * importing a context package into the loader would invert the dependency
+ * direction.
+ */
+const SAFE_SSH_HOST_PATTERN = /^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$/;
+
+export function isSafeSshHost(host: string): boolean {
+  if (typeof host !== 'string' || host.startsWith('-')) {
+    return false;
+  }
+  const atIndex = host.indexOf('@');
+  if (atIndex !== -1 && host.slice(atIndex + 1).startsWith('-')) {
+    return false;
+  }
+  return SAFE_SSH_HOST_PATTERN.test(host);
+}
+
+function parseHost(
+  entry: JsonObject,
+  hostPath: string,
+  errors: string[],
+): HostSection | undefined {
   collectUnknownKeys(entry, HOST_KEYS, hostPath, errors);
   const transport = readRequiredEnum(
     entry,
@@ -889,9 +1112,23 @@ function parseHost(entry: JsonObject, hostPath: string, errors: string[]): HostS
   let sshAlias: string | undefined;
   if (Object.hasOwn(entry, 'sshAlias')) {
     if (transport === 'local') {
-      errors.push(`${hostPath}.sshAlias: must be absent when transport is "local"`);
+      errors.push(
+        `${hostPath}.sshAlias: must be absent when transport is "local"`,
+      );
     } else {
-      sshAlias = readOptionalString(entry, 'sshAlias', `${hostPath}.sshAlias`, errors);
+      sshAlias = readOptionalString(
+        entry,
+        'sshAlias',
+        `${hostPath}.sshAlias`,
+        errors,
+      );
+      if (sshAlias !== undefined && !isSafeSshHost(sshAlias)) {
+        // The value never appears in the message: an alias is operator input.
+        errors.push(
+          `${hostPath}.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option`,
+        );
+        sshAlias = undefined;
+      }
     }
   } else if (transport === 'ssh') {
     errors.push(`${hostPath}.sshAlias: required when transport is "ssh"`);
@@ -902,8 +1139,19 @@ function parseHost(entry: JsonObject, hostPath: string, errors: string[]): HostS
     `${hostPath}.worktreeRoot`,
     errors,
   );
-  const tmpDir = readOptionalAbsolutePath(entry, 'tmpDir', `${hostPath}.tmpDir`, errors);
-  const roles = parseRoles(entry, hostPath, HOST_ROLES, 'must be a known host role', errors);
+  const tmpDir = readOptionalAbsolutePath(
+    entry,
+    'tmpDir',
+    `${hostPath}.tmpDir`,
+    errors,
+  );
+  const roles = parseRoles(
+    entry,
+    hostPath,
+    HOST_ROLES,
+    'must be a known host role',
+    errors,
+  );
   let runner: HostRunnerSection | undefined;
   if (Object.hasOwn(entry, 'runner')) {
     const runnerValue = entry.runner;
@@ -913,13 +1161,19 @@ function parseHost(entry: JsonObject, hostPath: string, errors: string[]): HostS
       runner = parseHostRunner(runnerValue, `${hostPath}.runner`, errors);
     }
   }
-  if (transport === undefined || worktreeRoot === undefined || roles === undefined) {
+  if (
+    transport === undefined ||
+    worktreeRoot === undefined ||
+    roles === undefined
+  ) {
     return undefined;
   }
   // A lane-runner host without a runner block is an undeclared runner (D4):
   // the loader refuses it instead of deriving an undispatchable host.
   if (roles.includes('lane-runner') && !Object.hasOwn(entry, 'runner')) {
-    errors.push(`${hostPath}.runner: required when the host holds the lane-runner role`);
+    errors.push(
+      `${hostPath}.runner: required when the host holds the lane-runner role`,
+    );
   }
   return {
     transport,
@@ -931,7 +1185,10 @@ function parseHost(entry: JsonObject, hostPath: string, errors: string[]): HostS
   };
 }
 
-function parseV2Hosts(value: JsonObject, errors: string[]): Readonly<Record<string, HostSection>> | undefined {
+function parseV2Hosts(
+  value: JsonObject,
+  errors: string[],
+): Readonly<Record<string, HostSection>> | undefined {
   if (!Object.hasOwn(value, 'hosts')) {
     errors.push('hosts: required');
     return undefined;
@@ -978,12 +1235,17 @@ function parseV2Hosts(value: JsonObject, errors: string[]): Readonly<Record<stri
     // runner kind: a local host dials its own `port`, an ssh host the
     // `port + 1` forward. Two equal dial ports would race for one server.
     if (host.runner !== undefined) {
-      const dialPort = host.transport === 'local' ? host.runner.port : host.runner.port + 1;
+      const dialPort =
+        host.transport === 'local' ? host.runner.port : host.runner.port + 1;
       if (dialPort > 65535) {
         // An ssh host on 65535 would need forward port 65536, which cannot be bound.
-        errors.push(`hosts.${name}.runner.port: must leave room for the ssh forward port`);
+        errors.push(
+          `hosts.${name}.runner.port: must leave room for the ssh forward port`,
+        );
       } else if (dialPorts.has(dialPort)) {
-        errors.push(`hosts.${name}.runner.port: derived dial port must be unique across hosts`);
+        errors.push(
+          `hosts.${name}.runner.port: derived dial port must be unique across hosts`,
+        );
       } else {
         dialPorts.set(dialPort, name);
       }
@@ -1000,7 +1262,10 @@ function parseV2Hosts(value: JsonObject, errors: string[]): Readonly<Record<stri
   return hosts;
 }
 
-function parseV2Tools(value: JsonObject, errors: string[]): string[] | undefined {
+function parseV2Tools(
+  value: JsonObject,
+  errors: string[],
+): string[] | undefined {
   if (!Object.hasOwn(value, 'tools')) {
     return undefined;
   }
@@ -1030,7 +1295,10 @@ function parseV2Tools(value: JsonObject, errors: string[]): string[] | undefined
   return tools;
 }
 
-function parseV2Seats(value: JsonObject, errors: string[]): SeatSection[] | undefined {
+function parseV2Seats(
+  value: JsonObject,
+  errors: string[],
+): SeatSection[] | undefined {
   if (!Object.hasOwn(value, 'seats')) {
     return undefined;
   }
@@ -1052,10 +1320,31 @@ function parseV2Seats(value: JsonObject, errors: string[]): SeatSection[] | unde
     collectUnknownKeys(entry, V2_SEAT_KEYS, seatPath, errors);
     const id = readRequiredString(entry, 'id', `${seatPath}.id`, errors);
     const tool = readRequiredString(entry, 'tool', `${seatPath}.tool`, errors);
-    const model = readRequiredString(entry, 'model', `${seatPath}.model`, errors);
-    const variant = readOptionalString(entry, 'variant', `${seatPath}.variant`, errors);
-    const agent = readOptionalString(entry, 'agent', `${seatPath}.agent`, errors);
-    const roles = parseRoles(entry, seatPath, SEAT_ROLES, 'must be a known seat role', errors);
+    const model = readRequiredString(
+      entry,
+      'model',
+      `${seatPath}.model`,
+      errors,
+    );
+    const variant = readOptionalString(
+      entry,
+      'variant',
+      `${seatPath}.variant`,
+      errors,
+    );
+    const agent = readOptionalString(
+      entry,
+      'agent',
+      `${seatPath}.agent`,
+      errors,
+    );
+    const roles = parseRoles(
+      entry,
+      seatPath,
+      SEAT_ROLES,
+      'must be a known seat role',
+      errors,
+    );
     const costClass = readRequiredEnum(
       entry,
       'costClass',
@@ -1071,7 +1360,13 @@ function parseV2Seats(value: JsonObject, errors: string[]): SeatSection[] | unde
         seenIds.add(id);
       }
     }
-    if (id === undefined || tool === undefined || model === undefined || roles === undefined || costClass === undefined) {
+    if (
+      id === undefined ||
+      tool === undefined ||
+      model === undefined ||
+      roles === undefined ||
+      costClass === undefined
+    ) {
       continue;
     }
     seats.push({
@@ -1112,7 +1407,12 @@ function parseChainSteps(
       continue;
     }
     collectUnknownKeys(step, CHAIN_STEP_KEYS, stepPath, errors);
-    const seatId = readRequiredString(step, 'seatId', `${stepPath}.seatId`, errors);
+    const seatId = readRequiredString(
+      step,
+      'seatId',
+      `${stepPath}.seatId`,
+      errors,
+    );
     let triggers: ChainTrigger[] | undefined;
     if (Object.hasOwn(step, 'triggers')) {
       const triggerValue = step.triggers;
@@ -1120,14 +1420,20 @@ function parseChainSteps(
         errors.push(`${stepPath}.triggers: must be an array`);
       } else {
         const list: ChainTrigger[] = [];
-        for (let triggerIndex = 0; triggerIndex < triggerValue.length; triggerIndex += 1) {
+        for (
+          let triggerIndex = 0;
+          triggerIndex < triggerValue.length;
+          triggerIndex += 1
+        ) {
           const trigger = triggerValue[triggerIndex];
           const known =
             typeof trigger === 'string'
               ? CHAIN_TRIGGERS.find((candidate) => candidate === trigger)
               : undefined;
           if (known === undefined) {
-            errors.push(`${stepPath}.triggers[${triggerIndex}]: must be a known trigger`);
+            errors.push(
+              `${stepPath}.triggers[${triggerIndex}]: must be a known trigger`,
+            );
             continue;
           }
           list.push(known);
@@ -1179,7 +1485,10 @@ function parseV2Chains(
   return chains;
 }
 
-function parseV2Policy(value: JsonObject, errors: string[]): PolicySection | undefined {
+function parseV2Policy(
+  value: JsonObject,
+  errors: string[],
+): PolicySection | undefined {
   if (!Object.hasOwn(value, 'policy')) {
     return undefined;
   }
@@ -1204,7 +1513,12 @@ function parseV2Policy(value: JsonObject, errors: string[]): PolicySection | und
           continue;
         }
         collectUnknownKeys(route, FORBIDDEN_ROUTE_KEYS, routePath, errors);
-        const tool = readRequiredString(route, 'tool', `${routePath}.tool`, errors);
+        const tool = readRequiredString(
+          route,
+          'tool',
+          `${routePath}.tool`,
+          errors,
+        );
         const modelPattern = readRequiredString(
           route,
           'modelPattern',
@@ -1222,7 +1536,11 @@ function parseV2Policy(value: JsonObject, errors: string[]): PolicySection | und
   let perLaneCostCeiling: number | undefined;
   if (Object.hasOwn(section, 'perLaneCostCeiling')) {
     const ceiling = section.perLaneCostCeiling;
-    if (typeof ceiling !== 'number' || !Number.isFinite(ceiling) || ceiling < 0) {
+    if (
+      typeof ceiling !== 'number' ||
+      !Number.isFinite(ceiling) ||
+      ceiling < 0
+    ) {
       errors.push('policy.perLaneCostCeiling: must be a non-negative number');
     } else {
       perLaneCostCeiling = ceiling;
@@ -1234,7 +1552,10 @@ function parseV2Policy(value: JsonObject, errors: string[]): PolicySection | und
   };
 }
 
-function parseV2Shelf(value: JsonObject, errors: string[]): ShelfSectionV2 | undefined {
+function parseV2Shelf(
+  value: JsonObject,
+  errors: string[],
+): ShelfSectionV2 | undefined {
   if (!Object.hasOwn(value, 'shelf')) {
     return undefined;
   }
@@ -1255,10 +1576,29 @@ function parseV2Shelf(value: JsonObject, errors: string[]): ShelfSectionV2 | und
   }
   if (provider === 'git') {
     collectUnknownKeys(section, GIT_SHELF_KEYS, 'shelf', errors);
-    const repoDir = readRequiredAbsolutePath(section, 'repoDir', 'shelf.repoDir', errors);
-    const branch = readRequiredString(section, 'branch', 'shelf.branch', errors);
-    const pathPrefix = readRequiredString(section, 'pathPrefix', 'shelf.pathPrefix', errors);
-    if (repoDir === undefined || branch === undefined || pathPrefix === undefined) {
+    const repoDir = readRequiredAbsolutePath(
+      section,
+      'repoDir',
+      'shelf.repoDir',
+      errors,
+    );
+    const branch = readRequiredString(
+      section,
+      'branch',
+      'shelf.branch',
+      errors,
+    );
+    const pathPrefix = readRequiredString(
+      section,
+      'pathPrefix',
+      'shelf.pathPrefix',
+      errors,
+    );
+    if (
+      repoDir === undefined ||
+      branch === undefined ||
+      pathPrefix === undefined
+    ) {
       return undefined;
     }
     return { provider: 'git', repoDir, branch, pathPrefix };
@@ -1268,7 +1608,10 @@ function parseV2Shelf(value: JsonObject, errors: string[]): ShelfSectionV2 | und
   return undefined;
 }
 
-function parseV2Forge(value: JsonObject, errors: string[]): ForgeSectionV2 | undefined {
+function parseV2Forge(
+  value: JsonObject,
+  errors: string[],
+): ForgeSectionV2 | undefined {
   // A v2 file always declares a forge mode (D6); only the v1 file and the
   // env-only setup may run without one.
   if (!Object.hasOwn(value, 'forge')) {
@@ -1314,7 +1657,12 @@ function readOptionalFraction(
     return undefined;
   }
   const value = record[key];
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+  if (
+    typeof value !== 'number' ||
+    !Number.isFinite(value) ||
+    value < 0 ||
+    value > 1
+  ) {
     errors.push(`${fieldPath}: must be a number between 0 and 1`);
     return undefined;
   }
@@ -1384,7 +1732,12 @@ function parseDecisionConsumers(
     errors.push('decisions.consumers: must be an object');
     return undefined;
   }
-  collectUnknownKeys(consumersValue, DECISION_CONSUMERS_KEYS, 'decisions.consumers', errors);
+  collectUnknownKeys(
+    consumersValue,
+    DECISION_CONSUMERS_KEYS,
+    'decisions.consumers',
+    errors,
+  );
   const consumers: Mutable<DecisionConsumers> = {};
   if (Object.hasOwn(consumersValue, 'knowledge-ranking')) {
     const entry = consumersValue['knowledge-ranking'];
@@ -1392,7 +1745,12 @@ function parseDecisionConsumers(
     if (!isJsonObject(entry)) {
       errors.push(`${entryPath}: must be an object`);
     } else {
-      collectUnknownKeys(entry, KNOWLEDGE_RANKING_CONSUMER_KEYS, entryPath, errors);
+      collectUnknownKeys(
+        entry,
+        KNOWLEDGE_RANKING_CONSUMER_KEYS,
+        entryPath,
+        errors,
+      );
       const minConfidence = readOptionalFraction(
         entry,
         'minConfidence',
@@ -1432,9 +1790,13 @@ function parseDecisionConsumers(
       );
       let acknowledged = false;
       if (!Object.hasOwn(entry, 'acknowledgeCandidateClaimsLeaveHost')) {
-        errors.push(`${entryPath}.acknowledgeCandidateClaimsLeaveHost: required`);
+        errors.push(
+          `${entryPath}.acknowledgeCandidateClaimsLeaveHost: required`,
+        );
       } else if (entry.acknowledgeCandidateClaimsLeaveHost !== true) {
-        errors.push(`${entryPath}.acknowledgeCandidateClaimsLeaveHost: must be true`);
+        errors.push(
+          `${entryPath}.acknowledgeCandidateClaimsLeaveHost: must be true`,
+        );
       } else {
         acknowledged = true;
       }
@@ -1474,7 +1836,10 @@ function enforceConsumerSubBudgets(
   }
 }
 
-function parseV2Decisions(value: JsonObject, errors: string[]): DecisionsSectionV2 | undefined {
+function parseV2Decisions(
+  value: JsonObject,
+  errors: string[],
+): DecisionsSectionV2 | undefined {
   if (!Object.hasOwn(value, 'decisions')) {
     return undefined;
   }
@@ -1495,8 +1860,18 @@ function parseV2Decisions(value: JsonObject, errors: string[]): DecisionsSection
   }
   if (provider === 'jev') {
     collectUnknownKeys(section, JEV_DECISIONS_KEYS, 'decisions', errors);
-    const model = readRequiredString(section, 'model', 'decisions.model', errors);
-    const keyFile = readRequiredAbsolutePath(section, 'keyFile', 'decisions.keyFile', errors);
+    const model = readRequiredString(
+      section,
+      'model',
+      'decisions.model',
+      errors,
+    );
+    const keyFile = readRequiredAbsolutePath(
+      section,
+      'keyFile',
+      'decisions.keyFile',
+      errors,
+    );
     const minConfidence = readRequiredFraction(
       section,
       'minConfidence',
@@ -1556,7 +1931,12 @@ function parseV2Decisions(value: JsonObject, errors: string[]): DecisionsSection
     };
   }
   if (provider === 'answer-file') {
-    collectUnknownKeys(section, ANSWER_FILE_DECISIONS_KEYS, 'decisions', errors);
+    collectUnknownKeys(
+      section,
+      ANSWER_FILE_DECISIONS_KEYS,
+      'decisions',
+      errors,
+    );
     const answerFile = readRequiredAbsolutePath(
       section,
       'answerFile',
@@ -1634,7 +2014,11 @@ function parseInstallationV1(value: JsonObject): ParseResult {
     errors.push('schemaVersion: required');
   } else {
     const version = value.schemaVersion;
-    if (typeof version !== 'number' || !Number.isInteger(version) || version !== 1) {
+    if (
+      typeof version !== 'number' ||
+      !Number.isInteger(version) ||
+      version !== 1
+    ) {
       errors.push('schemaVersion: must be 1 or 2');
     }
   }

@@ -192,6 +192,29 @@ function nestedArr<T>(payload: Payload, key: string): T[] | undefined {
   return Array.isArray(value) ? (value as T[]) : undefined;
 }
 
+/**
+ * A JSON array of strings the request shape requires: the flag value is one
+ * JSON document (e.g. --allowedPathPrefixes '["packages/x/src"]'). Anything
+ * else is a usage error, never a guess.
+ */
+function jsonStrArr(payload: Payload, key: string, label: string): string[] {
+  const value = payload[key];
+  if (value === undefined) return [];
+  const parsed = typeof value === 'string' ? safeJsonParse(value) : value;
+  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== 'string')) {
+    throw new CliUsageError(`${label} requires a JSON array of strings in '--${key}'`);
+  }
+  return parsed as string[];
+}
+
+function safeJsonParse(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
 function kebabToCamel(key: string): string {
   return key.replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase());
 }
@@ -668,6 +691,10 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
               },
         independentReviewer: str(p, 'independentReviewer'),
         ownedPaths: strArr(p, 'ownedPaths'),
+        // The edit-only diff check's allowed prefixes: one JSON array (or an
+        // array in --json). A malformed value is a usage error (exit 2),
+        // never a silent empty list.
+        allowedPathPrefixes: jsonStrArr(p, 'allowedPathPrefixes', 'brief prepare'),
         permissions: strArr(p, 'permissions'),
         acceptanceChecks: strArr(p, 'acceptanceChecks'),
         stepLimit: num(p, 'stepLimit', 200),
@@ -1711,7 +1738,7 @@ Commands:
   work-order register|inspect
   doctor [--probe-seats] [--host <name>] [--json]
   hosts list|add|edit|remove
-  brief prepare
+  brief prepare [--allowedPathPrefixes '["packages/x/src"]']
   capacity reserve
   attempt dispatch|reconcile|stop|collect|fix|accept
   forge execute

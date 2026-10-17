@@ -43,6 +43,13 @@ export interface PrepareBriefPackageRequest {
   readonly modelAssignment: BriefModelAssignment;
   readonly independentReviewer: string;
   readonly ownedPaths: readonly string[];
+  /**
+   * The relative path prefixes a lane may touch, checked by the edit-only
+   * diff check (`LaneDiffCheckPort`). Optional for opencode seats; REQUIRED
+   * when the seat tool is `agy`. Validated at prepare time and frozen into
+   * the manifest, so the digest covers it; old manifests read it as absent.
+   */
+  readonly allowedPathPrefixes?: readonly string[];
   readonly permissions: readonly string[];
   readonly acceptanceChecks: readonly string[];
   readonly stepLimit: number;

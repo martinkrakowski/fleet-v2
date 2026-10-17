@@ -3,6 +3,34 @@
 // KeeperPublicationAdapter; the helpers built on it report only whether or
 // where a secret shape appears, never the matched text itself.
 
+/**
+ * Stable rule names for the registry above, positional order preserved. The
+ * diff check reports a finding's rule as `secret-pattern:<name>`; the matched
+ * text itself is never reported.
+ */
+export const SECRET_PATTERN_NAMES: readonly string[] = [
+  'private-key-block',
+  'github-token',
+  'openai-style-key',
+  'aws-access-key',
+  'slack-token',
+  'jwt',
+];
+
+/** One registry entry with its reporting rule name. */
+export interface NamedSecretPattern {
+  readonly name: string;
+  readonly regex: RegExp;
+}
+
+/** Zip the registry with its names; the lengths are checked, never guessed. */
+export function namedSecretPatterns(): readonly NamedSecretPattern[] {
+  if (SECRET_PATTERN_NAMES.length !== SECRET_PATTERNS.length) {
+    throw new Error('secret-pattern registry: names and patterns diverge');
+  }
+  return SECRET_PATTERNS.map((regex, index) => ({ name: SECRET_PATTERN_NAMES[index], regex }));
+}
+
 export const SECRET_PATTERNS: readonly RegExp[] = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,

@@ -1,8 +1,12 @@
 export {
   SECRET_PATTERNS,
+  SECRET_PATTERN_NAMES,
   containsSecretShape,
   findSecretShapeLines,
+  namedSecretPatterns,
 } from './secret-patterns.js';
+
+export type { NamedSecretPattern } from './secret-patterns.js';
 
 export type {
   QuestionKind,

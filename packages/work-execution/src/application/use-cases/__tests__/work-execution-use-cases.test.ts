@@ -927,6 +927,83 @@ describe('PrepareBriefPackageUseCase', () => {
     }
   });
 
+  it('requires allowedPathPrefixes for an agy seat and rejects invalid prefixes (O14d1)', async () => {
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring().port,
+      artifactPort: makeArtifactPort().port,
+    });
+
+    const agyMissing = await useCase.prepareBriefPackage(
+      validBriefRequest({
+        modelAssignment: {
+          model: 'implementer-model',
+          variant: 'default',
+          fallbackModel: 'fallback-model',
+          seatTool: 'agy',
+        },
+      }),
+    );
+    expect(agyMissing).toEqual({
+      outcome: 'rejected',
+      reason: 'allowedPathPrefixes is required when the seat tool is agy',
+    });
+
+    const agyEmpty = await useCase.prepareBriefPackage(
+      validBriefRequest({
+        modelAssignment: {
+          model: 'implementer-model',
+          variant: 'default',
+          fallbackModel: 'fallback-model',
+          seatTool: 'agy',
+        },
+        allowedPathPrefixes: [],
+      }),
+    );
+    expect(agyEmpty.outcome).toBe('rejected');
+
+    for (const prefix of ['/etc/passwd', '../escape', 'packages/../..', '.git', '.lane', '']) {
+      const invalid = await useCase.prepareBriefPackage(
+        validBriefRequest({ allowedPathPrefixes: [prefix as string] }),
+      );
+      expect(invalid.outcome).toBe('rejected');
+      expect((invalid as { reason: string }).reason).toContain('allowedPathPrefixes');
+    }
+  });
+
+  it('freezes allowedPathPrefixes into the manifest, where the digest covers it (O14d1)', async () => {
+    const authoring = makeBriefAuthoring();
+    const artifacts = makeArtifactPort();
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: authoring.port,
+      artifactPort: artifacts.port,
+    });
+
+    const withPrefixes = await useCase.prepareBriefPackage(
+      validBriefRequest({
+        attemptId: 'attempt-prefix-1',
+        worktreePath: '/lanes/attempt-prefix-1',
+        allowedPathPrefixes: ['packages/x/src', 'docs/plans'],
+      }),
+    );
+    expect(withPrefixes.outcome).toBe('prepared');
+
+    // An opencode seat may omit the field: it freezes as an empty list and
+    // old manifests that never carried the field keep reading as absent.
+    const withoutPrefixes = await useCase.prepareBriefPackage(
+      validBriefRequest({
+        attemptId: 'attempt-prefix-2',
+        worktreePath: '/lanes/attempt-prefix-2',
+      }),
+    );
+    expect(withoutPrefixes.outcome).toBe('prepared');
+
+    const manifests = artifacts.placedCalls.map((call) =>
+      JSON.parse(call.manifestJson) as { allowedPathPrefixes?: unknown },
+    );
+    expect(manifests[0].allowedPathPrefixes).toEqual(['packages/x/src', 'docs/plans']);
+    expect(manifests[1].allowedPathPrefixes).toEqual([]);
+  });
+
   it('freezes the seat tool into the manifest, where the digest covers it (H8)', async () => {
     const authoring = makeBriefAuthoring({ proseMarkdown: '# Prose A' });
     const artifacts = makeArtifactPort();
@@ -957,6 +1034,7 @@ describe('PrepareBriefPackageUseCase', () => {
           fallbackModel: 'fallback-model',
           seatTool: 'agy',
         },
+        allowedPathPrefixes: ['packages/x'],
       }),
     );
 

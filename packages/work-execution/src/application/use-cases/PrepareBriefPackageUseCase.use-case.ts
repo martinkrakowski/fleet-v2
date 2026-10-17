@@ -7,6 +7,7 @@
  */
 
 import { parseSeatTool } from '../../domain/execution-records.js';
+import { validateAllowedPathPrefix } from '../../domain/lane-diff-check.js';
 import type {
   PrepareBriefPackagePort,
   PrepareBriefPackageRequest,
@@ -103,6 +104,34 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
         reason: 'Model assignment requires a declared seat tool (opencode or agy)',
       };
     }
+    // The allowed path prefixes feed the edit-only diff check. Required for
+    // an agy seat, optional for opencode; every entry must be a non-empty
+    // relative path that never names `.git` or `.lane`.
+    const allowedPathPrefixes = request.allowedPathPrefixes ?? [];
+    // `execute` takes untyped input from the CLI and the API: a string here
+    // would pass the length and per-character checks and be frozen into the
+    // manifest as a string, so the shape is checked first.
+    if (
+      !Array.isArray(allowedPathPrefixes) ||
+      !allowedPathPrefixes.every((prefix) => typeof prefix === 'string')
+    ) {
+      return {
+        outcome: 'rejected',
+        reason: 'allowedPathPrefixes must be an array of strings',
+      };
+    }
+    if (request.modelAssignment.seatTool === 'agy' && allowedPathPrefixes.length === 0) {
+      return {
+        outcome: 'rejected',
+        reason: 'allowedPathPrefixes is required when the seat tool is agy',
+      };
+    }
+    for (const prefix of allowedPathPrefixes) {
+      const invalidPrefix = validateAllowedPathPrefix(prefix);
+      if (invalidPrefix !== null) {
+        return { outcome: 'rejected', reason: invalidPrefix };
+      }
+    }
     if (!isNonEmpty(request.independentReviewer)) {
       return { outcome: 'rejected', reason: 'Independent reviewer must be named' };
     }
@@ -155,6 +184,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
         modelAssignment: request.modelAssignment,
         independentReviewer: request.independentReviewer,
         ownedPaths: request.ownedPaths,
+        allowedPathPrefixes,
         permissions: request.permissions,
         acceptanceChecks: request.acceptanceChecks,
         stepLimit: request.stepLimit,

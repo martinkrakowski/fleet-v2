@@ -6,7 +6,6 @@
  * mismatch, and the worktree path allocated from the attempt digest.
  */
 
-import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -23,6 +22,7 @@ import type {
   ReserveCapacityAtomicallyResult,
 } from "../src/application/ports/out/ExecutionJournalPort.out-port.js";
 import { ReserveExecutionCapacityUseCase } from "../src/application/use-cases/ReserveExecutionCapacityUseCase.use-case.js";
+import { simpleDeterministicHexDigest } from "../src/application/use-cases/PrepareBriefPackageUseCase.use-case.js";
 import type { ReserveExecutionCapacityCandidateHost } from "../src/application/ports/in/ReserveExecutionCapacityPort.in-port.js";
 import { ExecutionJournalAdapter } from "../src/infrastructure/adapters/ExecutionJournalAdapter.adapter.js";
 
@@ -203,7 +203,7 @@ function heldReservation(
 }
 
 function digestOf(attemptId: string): string {
-  return createHash("sha256").update(attemptId).digest("hex").slice(0, 32);
+  return simpleDeterministicHexDigest(attemptId).slice(0, 32);
 }
 
 // ---------------------------------------------------------------------------

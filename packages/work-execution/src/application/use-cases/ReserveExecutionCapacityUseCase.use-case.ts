@@ -10,7 +10,7 @@
  * reservation in the journal authorizes later dispatch.
  */
 
-import { createHash } from 'node:crypto';
+import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
 
 import type { AttemptStateValue } from '../../domain/value-objects/AttemptState.vo.js';
 import { parseSeatTool } from '../../domain/execution-records.js';
@@ -27,6 +27,12 @@ import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out
 export interface ReserveExecutionCapacityDependencies {
   readonly journal: ExecutionJournalPort;
   readonly attemptRepo: AttemptRepositoryPort;
+  /**
+   * Infrastructure digest for the worktree directory name; when absent the
+   * pure helper is used, so the application layer stays free of Node
+   * built-ins. Only determinism matters here: the path carries no caller text.
+   */
+  readonly computeDigest?: (content: string) => string;
 }
 
 /**
@@ -249,7 +255,7 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
     // H9a2: the worktree path is allocated from the attempt id's digest, so
     // no caller text ever reaches a path. The chosen host's root is prepended
     // inside the lock, after the host is selected.
-    const worktreeDigest = createHash('sha256').update(request.attemptId).digest('hex').slice(0, 32);
+    const worktreeDigest = (deps.computeDigest ?? simpleDeterministicHexDigest)(request.attemptId).slice(0, 32);
 
     type ChosenHost = {
       hostName: string;

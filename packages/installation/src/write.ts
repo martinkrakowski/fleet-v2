@@ -7,6 +7,7 @@
 
 import type {
   ChainsSection,
+  DecisionConsumers,
   DecisionsSectionV2,
   FleetInstallation,
   FleetInstallationV2,
@@ -207,7 +208,13 @@ function serializeDecisions(decisions: DecisionsSectionV2): Record<string, unkno
     return { provider: 'none' };
   }
   if (decisions.provider === 'answer-file') {
-    return { provider: 'answer-file', answerFile: decisions.answerFile };
+    return {
+      provider: 'answer-file',
+      answerFile: decisions.answerFile,
+      ...(decisions.consumers !== undefined
+        ? { consumers: serializeConsumers(decisions.consumers) }
+        : {}),
+    };
   }
   return {
     provider: 'jev',
@@ -220,7 +227,35 @@ function serializeDecisions(decisions: DecisionsSectionV2): Record<string, unkno
     ...(decisions.disabledProjects !== undefined
       ? { disabledProjects: [...decisions.disabledProjects] }
       : {}),
+    ...(decisions.consumers !== undefined
+      ? { consumers: serializeConsumers(decisions.consumers) }
+      : {}),
   };
+}
+
+/** Serialize the per-consumer settings map (K3) with a stable consumer order. */
+function serializeConsumers(consumers: DecisionConsumers): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const ranking = consumers['knowledge-ranking'];
+  if (ranking !== undefined) {
+    out['knowledge-ranking'] = {
+      ...(ranking.minConfidence !== undefined ? { minConfidence: ranking.minConfidence } : {}),
+      ...(ranking.monthlyBudgetUsd !== undefined
+        ? { monthlyBudgetUsd: ranking.monthlyBudgetUsd }
+        : {}),
+    };
+  }
+  const triage = consumers['claim-triage'];
+  if (triage !== undefined) {
+    out['claim-triage'] = {
+      ...(triage.minConfidence !== undefined ? { minConfidence: triage.minConfidence } : {}),
+      ...(triage.monthlyBudgetUsd !== undefined
+        ? { monthlyBudgetUsd: triage.monthlyBudgetUsd }
+        : {}),
+      acknowledgeCandidateClaimsLeaveHost: triage.acknowledgeCandidateClaimsLeaveHost,
+    };
+  }
+  return out;
 }
 
 function serializeWaves(waves: WavesSection): Record<string, unknown> {

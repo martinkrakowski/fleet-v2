@@ -6,6 +6,7 @@
 
 import type {
   ChainStep,
+  DecisionConsumers,
   DecisionsSectionV2,
   DerivedRunnerCapabilities,
   FleetInstallation,
@@ -107,8 +108,17 @@ function deriveModelFromV2(installation: FleetInstallation): ModelOutcome {
 
 /** Field-by-field copy of the decisions block (D3): no extra key survives. */
 function copyDecisions(decisions: DecisionsSectionV2): DecisionsSectionV2 {
-  if (decisions.provider === 'none' || decisions.provider === 'answer-file') {
+  if (decisions.provider === 'none') {
     return { ...decisions };
+  }
+  if (decisions.provider === 'answer-file') {
+    return {
+      provider: 'answer-file',
+      answerFile: decisions.answerFile,
+      ...(decisions.consumers !== undefined
+        ? { consumers: copyConsumers(decisions.consumers) }
+        : {}),
+    };
   }
   return {
     provider: 'jev',
@@ -121,7 +131,37 @@ function copyDecisions(decisions: DecisionsSectionV2): DecisionsSectionV2 {
     ...(decisions.disabledProjects !== undefined
       ? { disabledProjects: [...decisions.disabledProjects] }
       : {}),
+    ...(decisions.consumers !== undefined
+      ? { consumers: copyConsumers(decisions.consumers) }
+      : {}),
   };
+}
+
+/** Field-by-field copy of the per-consumer settings map (K3). */
+function copyConsumers(consumers: DecisionConsumers): DecisionConsumers {
+  const out: {
+    -readonly [K in keyof DecisionConsumers]: DecisionConsumers[K];
+  } = {};
+  const ranking = consumers['knowledge-ranking'];
+  if (ranking !== undefined) {
+    out['knowledge-ranking'] = {
+      ...(ranking.minConfidence !== undefined ? { minConfidence: ranking.minConfidence } : {}),
+      ...(ranking.monthlyBudgetUsd !== undefined
+        ? { monthlyBudgetUsd: ranking.monthlyBudgetUsd }
+        : {}),
+    };
+  }
+  const triage = consumers['claim-triage'];
+  if (triage !== undefined) {
+    out['claim-triage'] = {
+      ...(triage.minConfidence !== undefined ? { minConfidence: triage.minConfidence } : {}),
+      ...(triage.monthlyBudgetUsd !== undefined
+        ? { monthlyBudgetUsd: triage.monthlyBudgetUsd }
+        : {}),
+      acknowledgeCandidateClaimsLeaveHost: triage.acknowledgeCandidateClaimsLeaveHost,
+    };
+  }
+  return out;
 }
 
 function deriveHostRunner(runner: NonNullable<HostSection['runner']>): HostRunnerModel {

@@ -564,9 +564,9 @@ bounded_contexts:
         use_cases: [CaptureCompletedAttemptNotesUseCase, CheckKnowledgeClaimUseCase, DecideKnowledgeDispositionUseCase, ListCandidateClaimsUseCase, PublishAcceptedKeeperUseCase, ProposeBriefContextUseCase, RecordContextSelectionUseCase, RecordKnowledgeReuseUseCase, SupersedeKnowledgeEntryUseCase]
         ports:
           in: [CaptureCompletedAttemptNotesPort, CheckKnowledgeClaimPort, DecideKnowledgeDispositionPort, ListCandidateClaimsPort, PublishAcceptedKeeperPort, ProposeBriefContextPort, RecordContextSelectionPort, RecordKnowledgeReusePort, SupersedeKnowledgeEntryPort]
-          out: [KnowledgeEntryRepositoryPort, KnowledgeRetrievalPort, ClaimVerificationPort, KeeperPublicationPort, KnowledgeRankingAdvicePort, DecisionReceiptJournalPort]
+          out: [KnowledgeEntryRepositoryPort, KnowledgeRetrievalPort, ClaimVerificationPort, KeeperPublicationPort, KnowledgeRankingAdvicePort, ClaimTriagePort, DecisionReceiptJournalPort]
       infrastructure:
-        adapters: [KnowledgeEntryRepositoryAdapter, KnowledgeRetrievalAdapter, ClaimVerificationAdapter, KeeperPublicationAdapter, NullRankingAdviceAdapter, AdvisedKnowledgeRetrievalAdapter, JevRankingAdviceAdapter, AnswerFileRankingAdviceAdapter, BudgetedRankingAdviceAdapter, FileDecisionReceiptJournalAdapter, NotConfiguredReceiptJournal]
+        adapters: [KnowledgeEntryRepositoryAdapter, KnowledgeRetrievalAdapter, ClaimVerificationAdapter, KeeperPublicationAdapter, NullRankingAdviceAdapter, AdvisedKnowledgeRetrievalAdapter, JevRankingAdviceAdapter, AnswerFileRankingAdviceAdapter, BudgetedRankingAdviceAdapter, JevClaimTriageAdapter, FileDecisionReceiptJournalAdapter, NotConfiguredReceiptJournal]
     contracts:
       CaptureCompletedAttemptNotesPort: "Accept bounded notes with completed-attempt identity and record missing/incomplete reports; every bullet becomes a candidate claim."
       CheckKnowledgeClaimPort: "Record orchestrator-chosen evidence for a scoped claim without executing instructions supplied by the note."
@@ -582,6 +582,7 @@ bounded_contexts:
       ClaimVerificationPort: "Perform a bounded allow-listed check selected by the orchestrator and return evidence, not model confidence."
       KeeperPublicationPort: "Write attributed keeper entries to an optional external shelf without revealing its key to agents."
       KnowledgeRankingAdvicePort: "Ask a bounded advisory ranking judgement for explicit candidates and return scores or an unknown reason that preserves today's deterministic behaviour."
+      ClaimTriagePort: "Ask the decision kernel one triage judgement per candidate claim of an attempt, batched within the state caps, and return advice-only escalation flags and reuse scores or an unknown reason that leaves every candidate unflagged in capture order."
       DecisionReceiptJournalPort: "Append decision receipts and report month-to-date spend in UTC so a paid decision is never invisible to its budget."
     adapter_bindings:
       - { adapter: KnowledgeEntryRepositoryAdapter, implements: KnowledgeEntryRepositoryPort, integration: local-transactional-store }
@@ -593,6 +594,7 @@ bounded_contexts:
       - { adapter: JevRankingAdviceAdapter, implements: KnowledgeRankingAdvicePort, integration: openrouter-jev-decisions-endpoint }
       - { adapter: BudgetedRankingAdviceAdapter, implements: KnowledgeRankingAdvicePort, integration: budgeted-receipted-decision-decorator }
       - { adapter: AnswerFileRankingAdviceAdapter, implements: KnowledgeRankingAdvicePort, integration: owner-recorded-answer-file }
+      - { adapter: JevClaimTriageAdapter, implements: ClaimTriagePort, integration: openrouter-jev-decisions-endpoint }
       - { adapter: FileDecisionReceiptJournalAdapter, implements: DecisionReceiptJournalPort, integration: local-jsonl-receipt-journal }
       - { adapter: NotConfiguredReceiptJournal, implements: DecisionReceiptJournalPort, integration: not-configured-null }
     domain_specification:

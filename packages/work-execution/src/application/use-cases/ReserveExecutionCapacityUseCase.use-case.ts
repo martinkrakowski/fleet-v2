@@ -150,7 +150,7 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
     // The candidate hosts (H9a2): validated up front; the choice itself runs
     // inside the journal's locked read-modify-write so held reservations are
     // counted under the same lock that grants the slot.
-    let candidates: {
+    const candidates: {
       name: string;
       kind: RunnerKind;
       transport: 'local' | 'ssh';

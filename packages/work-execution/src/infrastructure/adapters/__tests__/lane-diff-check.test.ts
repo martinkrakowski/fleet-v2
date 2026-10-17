@@ -536,7 +536,12 @@ describe("LaneDiffCheckAdapter", () => {
 
   it("a `test -L` that gives no answer (ssh exit 255) fails closed (re-check of #129)", async () => {
     const repo = makeRepo();
-    symlinkSync(`/tmp/${tok}`, join(repo, "packages/x/src/link.ts"));
+    // The link text is secret-shaped and its target is a harmless file, so
+    // following the link would scan the target and come back clean.
+    const outside = mkdtempSync(join(tmpdir(), "lane-diff-outside-"));
+    dirs.push(outside);
+    writeFileSync(join(outside, tok), "harmless\n");
+    symlinkSync(join(outside, tok), join(repo, "packages/x/src/link.ts"));
     const flaky = {
       async run(argv: readonly string[], options?: { cwd?: string }) {
         if (argv[0] === "test" && argv[1] === "-L")

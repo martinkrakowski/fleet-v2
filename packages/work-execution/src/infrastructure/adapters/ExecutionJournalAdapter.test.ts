@@ -157,6 +157,30 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
     const contentAfter = await fs.readFile(filePath, 'utf8');
     expect(contentAfter).toBe(corruptContent);
   });
+
+  it('reads a reservation persisted before seatTool existed with seatTool null (H8)', async () => {
+    // Pre-H8 file shape: no seatTool field on the record at all.
+    await fs.writeFile(
+      path.join(tempDir, 'reservations.json'),
+      JSON.stringify([
+        {
+          id: 'res-legacy',
+          attemptId: 'att-legacy',
+          hostId: 'host-1',
+          slotIndex: 0,
+          held: true,
+          reservedAtIso: '2026-10-15T10:00:00.000Z',
+          releasedAtIso: null,
+        },
+      ]),
+      'utf8',
+    );
+
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    const active = await adapter.listActiveReservations('host-1');
+    expect(active.map((r) => r.id)).toEqual(['res-legacy']);
+    expect(active[0]?.seatTool).toBeNull();
+  });
 });
 
 describe('ExecutionJournalAdapter atomic capacity arbitration', () => {

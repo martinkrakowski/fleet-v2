@@ -261,7 +261,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     }
 
     const manifestModelAssignment = parsedManifest.modelAssignment as
-      | { readonly model?: string; readonly agent?: string; readonly variant?: string }
+      | { readonly model?: string; readonly agent?: string; readonly variant?: string; readonly seatTool?: unknown }
       | undefined;
 
     if (!manifestModelAssignment || !manifestModelAssignment.model || manifestModelAssignment.model.trim() === '') {
@@ -291,17 +291,20 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     // an opencode seat. A selection without an implemented runner refuses
     // before the dispatch intent is recorded and before anything spawns.
     if (this.deps.runnerSelector) {
-      // H8: the frozen manifest's seat tool decides the seat; only a manifest
-      // written before the field existed reads as the opencode seat. A
-      // malformed tool is passed through untouched — the selector refuses an
-      // undeclared kind rather than falling back.
-      const manifestSeatTool = parseSeatTool(parsedManifest.seatTool);
-      const rawSeatTool = parsedManifest.seatTool;
-      const seatTool =
-        manifestSeatTool ??
-        (typeof rawSeatTool === 'string' && rawSeatTool.trim() !== ''
-          ? rawSeatTool.trim()
-          : 'opencode');
+      // H8: the seat tool lives on the manifest's model assignment — the
+      // shape PrepareBriefPackageUseCase writes. Only a model assignment
+      // written before the field existed (legacy manifests) reads as the
+      // opencode seat. A present but undeclared tool is a named refusal, not
+      // a fallback.
+      const rawSeatTool = manifestModelAssignment.seatTool;
+      const manifestSeatTool = parseSeatTool(rawSeatTool);
+      if (rawSeatTool !== undefined && manifestSeatTool === undefined) {
+        return {
+          outcome: 'refused',
+          reason: `Frozen brief manifest model assignment declares an unknown seat tool: ${JSON.stringify(rawSeatTool)}`,
+        };
+      }
+      const seatTool = manifestSeatTool ?? 'opencode';
       const selection = this.deps.runnerSelector.selectRunner({ seatTool });
       if (!selection.ok) {
         return { outcome: 'refused', reason: selection.reason };

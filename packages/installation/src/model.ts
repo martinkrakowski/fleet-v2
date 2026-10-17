@@ -4,10 +4,9 @@
  * derives every runner capability `source`; a file can never choose it (D4).
  */
 
-import { copyDecisionConsumers } from './decision-consumers.js';
+import { copyDecisions } from './decision-consumers.js';
 import type {
   ChainStep,
-  DecisionsSectionV2,
   DerivedRunnerCapabilities,
   FleetInstallation,
   FleetInstallationModel,
@@ -106,36 +105,6 @@ function deriveModelFromV2(installation: FleetInstallation): ModelOutcome {
   };
 }
 
-/** Field-by-field copy of the decisions block (D3): no extra key survives. */
-function copyDecisions(decisions: DecisionsSectionV2): DecisionsSectionV2 {
-  if (decisions.provider === 'none') {
-    return { ...decisions };
-  }
-  if (decisions.provider === 'answer-file') {
-    return {
-      provider: 'answer-file',
-      answerFile: decisions.answerFile,
-      ...(decisions.consumers !== undefined
-        ? { consumers: copyDecisionConsumers(decisions.consumers) }
-        : {}),
-    };
-  }
-  return {
-    provider: 'jev',
-    model: decisions.model,
-    keyFile: decisions.keyFile,
-    minConfidence: decisions.minConfidence,
-    monthlyBudgetUsd: decisions.monthlyBudgetUsd,
-    assumedCostPerCallUsd: decisions.assumedCostPerCallUsd,
-    acknowledgeProseLeavesHost: decisions.acknowledgeProseLeavesHost,
-    ...(decisions.disabledProjects !== undefined
-      ? { disabledProjects: [...decisions.disabledProjects] }
-      : {}),
-    ...(decisions.consumers !== undefined
-      ? { consumers: copyDecisionConsumers(decisions.consumers) }
-      : {}),
-  };
-}
 
 
 function deriveHostRunner(runner: NonNullable<HostSection['runner']>): HostRunnerModel {

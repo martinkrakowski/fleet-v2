@@ -5,7 +5,7 @@
  * never written: it is not a file field (D4).
  */
 
-import { copyDecisionConsumers } from './decision-consumers.js';
+import { copyDecisions } from './decision-consumers.js';
 import type {
   ChainsSection,
   DecisionsSectionV2,
@@ -204,33 +204,8 @@ function serializeVerification(
 }
 
 function serializeDecisions(decisions: DecisionsSectionV2): Record<string, unknown> {
-  if (decisions.provider === 'none') {
-    return { provider: 'none' };
-  }
-  if (decisions.provider === 'answer-file') {
-    return {
-      provider: 'answer-file',
-      answerFile: decisions.answerFile,
-      ...(decisions.consumers !== undefined
-        ? { consumers: copyDecisionConsumers(decisions.consumers) }
-        : {}),
-    };
-  }
-  return {
-    provider: 'jev',
-    model: decisions.model,
-    keyFile: decisions.keyFile,
-    minConfidence: decisions.minConfidence,
-    monthlyBudgetUsd: decisions.monthlyBudgetUsd,
-    assumedCostPerCallUsd: decisions.assumedCostPerCallUsd,
-    acknowledgeProseLeavesHost: decisions.acknowledgeProseLeavesHost,
-    ...(decisions.disabledProjects !== undefined
-      ? { disabledProjects: [...decisions.disabledProjects] }
-      : {}),
-    ...(decisions.consumers !== undefined
-      ? { consumers: copyDecisionConsumers(decisions.consumers) }
-      : {}),
-  };
+  // The same field-by-field copy the model uses; written in the same key order.
+  return { ...copyDecisions(decisions) };
 }
 
 

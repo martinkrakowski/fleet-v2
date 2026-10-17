@@ -439,6 +439,7 @@ describe('Fleet CLI workflow', () => {
           variant: 'default',
           fallbackModel: 'openrouter/z-ai/glm-5.3-flash',
         },
+        seatTool: 'opencode',
         independentReviewer: 'openrouter/anthropic/claude-sonnet-4.5',
         ownedPaths: ['packages/demo/src'],
         permissions: ['edit'],
@@ -494,6 +495,7 @@ describe('Fleet CLI workflow', () => {
         hostId: 'host-1',
         worktreePath: laneRepoDir,
         maxSlots: 2,
+        seatTool: 'opencode',
       }),
     ]);
     expect(reserve.code).toBe(0);
@@ -1154,6 +1156,65 @@ describe('Fleet CLI workflow', () => {
     expect(badKind.code).toBe(2);
     expect(badKind.stderr).toContain("forge kind must be 'push-and-open-pr' or 'merge-pr'");
 
+    // H8: the seat tool is required and never defaulted; missing or
+    // undeclared is a usage error (exit 2) on both request commands.
+    const missingReserveSeat = await cli([
+      'capacity',
+      'reserve',
+      '--json',
+      jsonArg({
+        reservationId: 'res-seat',
+        attemptId: 'attempt-seat',
+        workOrderId: WORK_ORDER_ID,
+        hostId: 'host-1',
+        worktreePath: '/lanes/attempt-seat',
+        maxSlots: 1,
+      }),
+    ]);
+    expect(missingReserveSeat.code).toBe(2);
+    expect(missingReserveSeat.stderr).toContain('capacity reserve requires --seatTool');
+
+    const badReserveSeat = await cli([
+      'capacity',
+      'reserve',
+      '--json',
+      jsonArg({
+        reservationId: 'res-seat',
+        attemptId: 'attempt-seat',
+        workOrderId: WORK_ORDER_ID,
+        hostId: 'host-1',
+        worktreePath: '/lanes/attempt-seat',
+        maxSlots: 1,
+        seatTool: 'claude',
+      }),
+    ]);
+    expect(badReserveSeat.code).toBe(2);
+    expect(badReserveSeat.stderr).toContain('capacity reserve requires --seatTool');
+
+    const missingBriefSeat = await cli([
+      'brief',
+      'prepare',
+      '--json',
+      jsonArg({ workOrderId: WORK_ORDER_ID, laneId: LANE_ID, baseCommit: 'abc', ownedPaths: ['p'] }),
+    ]);
+    expect(missingBriefSeat.code).toBe(2);
+    expect(missingBriefSeat.stderr).toContain('brief prepare requires --seatTool');
+
+    const badBriefSeat = await cli([
+      'brief',
+      'prepare',
+      '--json',
+      jsonArg({
+        workOrderId: WORK_ORDER_ID,
+        laneId: LANE_ID,
+        baseCommit: 'abc',
+        ownedPaths: ['p'],
+        seatTool: 'OpenCode',
+      }),
+    ]);
+    expect(badBriefSeat.code).toBe(2);
+    expect(badBriefSeat.stderr).toContain('brief prepare requires --seatTool');
+
     // A duplicate identity is refused by the work order use case and exits 1.
     const duplicate = await cli([
       'work-order',
@@ -1188,6 +1249,7 @@ describe('Fleet CLI workflow', () => {
         hostId: 'host-1',
         worktreePath: laneRepoDir,
         maxSlots: 0,
+        seatTool: 'opencode',
       }),
     ]);
     expect(refusedReserve.code).toBe(1);
@@ -1431,6 +1493,7 @@ describe('Fleet CLI workflow', () => {
           variant: 'default',
           fallbackModel: 'openrouter/z-ai/glm-5.3-flash',
         },
+        seatTool: 'opencode',
         independentReviewer: 'openrouter/anthropic/claude-sonnet-4.5',
         ownedPaths: ['packages/demo/src'],
         permissions: ['edit'],
@@ -1475,6 +1538,7 @@ describe('Fleet CLI workflow', () => {
         hostId: 'host-1',
         worktreePath: multiProcLaneRepo,
         maxSlots: 2,
+        seatTool: 'opencode',
       }),
     ]);
     expect(reserve.code).toBe(0);

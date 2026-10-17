@@ -357,6 +357,7 @@ describe('Attempts record the installation host name (H3a)', () => {
             hostId: 'midnight',
             slotIndex: 0,
             held: true,
+            seatTool: 'opencode',
             reservedAtIso: '2026-10-15T07:00:00.000Z',
             releasedAtIso: null,
           },

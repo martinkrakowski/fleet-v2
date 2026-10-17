@@ -6,6 +6,7 @@
  * digest is integrity, not a truth claim. Nothing enters the brief unreviewed.
  */
 
+import { parseSeatTool } from '../../domain/execution-records.js';
 import type {
   PrepareBriefPackagePort,
   PrepareBriefPackageRequest,
@@ -93,6 +94,14 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     }
     if (!request.modelAssignment || !isNonEmpty(request.modelAssignment.model)) {
       return { outcome: 'rejected', reason: 'Model assignment requires a non-empty model' };
+    }
+    // The seat tool is frozen into the manifest and covered by the digest
+    // (H8); it is required and never defaulted to a declared kind.
+    if (parseSeatTool(request.modelAssignment.seatTool) === undefined) {
+      return {
+        outcome: 'rejected',
+        reason: 'Model assignment requires a declared seat tool (opencode or agy)',
+      };
     }
     if (!isNonEmpty(request.independentReviewer)) {
       return { outcome: 'rejected', reason: 'Independent reviewer must be named' };

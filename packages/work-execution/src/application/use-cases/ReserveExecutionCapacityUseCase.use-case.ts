@@ -11,6 +11,7 @@
  */
 
 import type { AttemptStateValue } from '../../domain/value-objects/AttemptState.vo.js';
+import { parseSeatTool } from '../../domain/execution-records.js';
 import type {
   ReserveExecutionCapacityPort,
   ReserveExecutionCapacityRequest,
@@ -76,6 +77,16 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
       return { outcome: 'refused', reason: `Missing required reservation fields: ${missingFields.join(', ')}` };
     }
 
+    // The seat tool is required and never defaulted (H8): a blank, unknown or
+    // wrong-case tool is a refusal, not an opencode seat.
+    const seatTool = parseSeatTool(request.seatTool);
+    if (seatTool === undefined) {
+      return {
+        outcome: 'refused',
+        reason: 'seatTool must be a declared runner kind (opencode or agy)',
+      };
+    }
+
     // The busy-worktree, duplicate-attempt and slot-budget checks all run
     // inside the journal's locked read-modify-write (Opus note on #58): a
     // conflicting reservation that lands between the request and the append
@@ -85,6 +96,7 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
       id: request.reservationId,
       attemptId: request.attemptId,
       hostId: request.hostId,
+      seatTool,
       held: true,
       reservedAtIso: nowIso,
       releasedAtIso: null,

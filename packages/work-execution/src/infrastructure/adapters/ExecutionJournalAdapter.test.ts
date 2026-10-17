@@ -79,6 +79,7 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
       hostId: 'host-1',
       slotIndex: 0,
       held: true,
+      seatTool: 'opencode',
       reservedAtIso: '2026-10-15T10:00:00.000Z',
       releasedAtIso: null,
     };
@@ -89,6 +90,7 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
       hostId: 'host-1',
       slotIndex: 1,
       held: true,
+      seatTool: 'opencode',
       reservedAtIso: '2026-10-15T10:01:00.000Z',
       releasedAtIso: null,
     };
@@ -145,6 +147,7 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
       hostId: 'host-1',
       slotIndex: 0,
       held: true,
+      seatTool: 'opencode',
       reservedAtIso: '2026-10-15T10:00:00.000Z',
       releasedAtIso: null,
     };
@@ -153,6 +156,30 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
 
     const contentAfter = await fs.readFile(filePath, 'utf8');
     expect(contentAfter).toBe(corruptContent);
+  });
+
+  it('reads a reservation persisted before seatTool existed with seatTool null (H8)', async () => {
+    // Pre-H8 file shape: no seatTool field on the record at all.
+    await fs.writeFile(
+      path.join(tempDir, 'reservations.json'),
+      JSON.stringify([
+        {
+          id: 'res-legacy',
+          attemptId: 'att-legacy',
+          hostId: 'host-1',
+          slotIndex: 0,
+          held: true,
+          reservedAtIso: '2026-10-15T10:00:00.000Z',
+          releasedAtIso: null,
+        },
+      ]),
+      'utf8',
+    );
+
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    const active = await adapter.listActiveReservations('host-1');
+    expect(active.map((r) => r.id)).toEqual(['res-legacy']);
+    expect(active[0]?.seatTool).toBeNull();
   });
 });
 
@@ -178,6 +205,7 @@ describe('ExecutionJournalAdapter atomic capacity arbitration', () => {
         id: overrides.id ?? 'res-race',
         attemptId,
         hostId: overrides.hostId ?? 'host-1',
+        seatTool: 'opencode',
         held: true,
         reservedAtIso: '2026-10-15T11:00:00.000Z',
         releasedAtIso: null,
@@ -292,6 +320,7 @@ describe('ExecutionJournalAdapter atomic capacity arbitration', () => {
         hostId: 'host-1',
         slotIndex: 1,
         held: true,
+        seatTool: 'opencode',
         reservedAtIso: '2026-10-15T11:01:00.000Z',
         releasedAtIso: null,
       }),
@@ -327,6 +356,7 @@ describe('ExecutionJournalAdapter in-memory atomic capacity arbitration', () => 
         id: overrides.id ?? 'res-mem-race',
         attemptId,
         hostId: 'host-1',
+        seatTool: 'opencode',
         held: true,
         reservedAtIso: '2026-10-15T11:00:00.000Z',
         releasedAtIso: null,

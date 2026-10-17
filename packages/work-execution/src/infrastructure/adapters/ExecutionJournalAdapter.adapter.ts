@@ -17,6 +17,7 @@ import type {
   ActionJournalEntryRecord,
   CapacityReservationRecord,
 } from '../../domain/execution-records.js';
+import { parseSeatTool } from '../../domain/execution-records.js';
 import type {
   ExecutionJournalPort,
   ReserveCapacityAtomicallyRequest,
@@ -296,7 +297,11 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       throw new Error(`ExecutionJournalAdapter expects a record list in ${target}`);
     }
     for (const item of parsed) {
-      if (isCapacityReservationRecord(item)) map.set(item.id, item);
+      if (isCapacityReservationRecord(item)) {
+        // A reservation stored before `seatTool` existed reads with `null`;
+        // it is never defaulted to a declared kind.
+        map.set(item.id, { ...item, seatTool: parseSeatTool(item.seatTool) ?? null });
+      }
     }
     return map;
   }

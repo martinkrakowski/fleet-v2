@@ -357,6 +357,7 @@ describe("configured compositions execute real operations", () => {
       hostId: "host-1",
       worktreePath: path.join(stateDir, "worktrees", "att-api-1"),
       maxSlots: 2,
+      seatTool: "opencode",
     });
     expect(reserved.outcome).toBe("reserved");
 
@@ -758,7 +759,12 @@ describe("configured compositions execute real operations", () => {
       repository: WORK_ORDER_REQUEST.repository,
       baseCommit: WORK_ORDER_REQUEST.baseCommit,
       policyRevision: WORK_ORDER_REQUEST.policyRevision,
-      modelAssignment: { model: "seat/implementer", variant: "default", fallbackModel: "fallback" },
+      modelAssignment: {
+        model: "seat/implementer",
+        variant: "default",
+        fallbackModel: "fallback",
+        seatTool: "opencode",
+      },
       independentReviewer: "seat/reviewer",
       ownedPaths: WORK_ORDER_REQUEST.ownedPaths,
       permissions: [],

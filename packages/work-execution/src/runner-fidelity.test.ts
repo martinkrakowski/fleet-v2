@@ -86,6 +86,7 @@ function createInMemoryJournal(): ExecutionJournalPort & {
       hostId: 'host-1',
       slotIndex: 0,
       held: true,
+      seatTool: 'opencode',
       reservedAtIso: '2026-10-15T00:00:00.000Z',
       releasedAtIso: null,
     },
@@ -1549,6 +1550,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           hostId: 'host-1',
           slotIndex: 0,
           held: true,
+          seatTool: 'opencode',
           reservedAtIso: '2026-10-15T00:00:00.000Z',
           releasedAtIso: null,
         });

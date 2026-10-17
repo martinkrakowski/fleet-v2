@@ -53,6 +53,16 @@ export type AttemptKind = 'initial' | 'fix';
 /** The lane runner tool that executed the attempt's worker command. */
 export type RunnerKind = 'opencode' | 'agy';
 
+/**
+ * Parse a seat tool value into a declared `RunnerKind`. Only the declared
+ * kinds are accepted: a blank, unknown, wrong-case or non-string value yields
+ * `undefined`, never a default to opencode. Callers decide what an absent
+ * tool means; this function only classifies the value it is given.
+ */
+export function parseSeatTool(value: unknown): RunnerKind | undefined {
+  return value === 'opencode' || value === 'agy' ? value : undefined;
+}
+
 /** Runner session details recorded at dispatch time for port and host fidelity. */
 export interface AttemptRunnerRecord {
   /**
@@ -124,6 +134,12 @@ export interface CapacityReservationRecord {
   readonly hostId: string;
   readonly slotIndex: number;
   readonly held: boolean;
+  /**
+   * The seat tool the reservation was made for. Records persisted before
+   * this field existed are read with `null`; it is never defaulted to a
+   * declared kind.
+   */
+  readonly seatTool: RunnerKind | null;
   readonly reservedAtIso: string;
   readonly releasedAtIso: string | null;
 }

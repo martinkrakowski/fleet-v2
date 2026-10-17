@@ -100,6 +100,7 @@ describe('ReserveExecutionCapacityUseCase (Appendix A)', () => {
       hostId: 'host-1',
       worktreePath: '/tmp/worktree-1',
       maxSlots: 1.5,
+      seatTool: 'opencode',
     });
 
     expect(result.outcome).toBe('refused');
@@ -120,6 +121,7 @@ describe('ReserveExecutionCapacityUseCase (Appendix A)', () => {
       hostId: 'host-1',
       worktreePath: '/tmp/worktree-1',
       maxSlots: 0,
+      seatTool: 'opencode',
     });
     expect(zeroResult.outcome).toBe('refused');
 
@@ -130,6 +132,7 @@ describe('ReserveExecutionCapacityUseCase (Appendix A)', () => {
       hostId: 'host-1',
       worktreePath: '/tmp/worktree-1',
       maxSlots: -2,
+      seatTool: 'opencode',
     });
     expect(negativeResult.outcome).toBe('refused');
   });
@@ -147,6 +150,7 @@ describe('ReserveExecutionCapacityUseCase (Appendix A)', () => {
       hostId: 'host-1',
       worktreePath: '/tmp/worktree-1',
       maxSlots: 2,
+      seatTool: 'opencode',
     });
     expect(first.outcome).toBe('reserved');
 
@@ -158,6 +162,7 @@ describe('ReserveExecutionCapacityUseCase (Appendix A)', () => {
       hostId: 'host-1',
       worktreePath: '/tmp/worktree-2',
       maxSlots: 2,
+      seatTool: 'opencode',
     });
     expect(second.outcome).toBe('refused');
     if (second.outcome === 'refused') {
@@ -172,6 +177,7 @@ describe('ReserveExecutionCapacityUseCase (Appendix A)', () => {
       hostId: 'host-2',
       worktreePath: '/tmp/worktree-3',
       maxSlots: 2,
+      seatTool: 'opencode',
     });
     expect(differentHost.outcome).toBe('refused');
     if (differentHost.outcome === 'refused') {
@@ -192,6 +198,7 @@ describe('ReserveExecutionCapacityUseCase (Appendix A)', () => {
       hostId: 'host-1',
       worktreePath: '/tmp/worktree-1',
       maxSlots: 2,
+      seatTool: 'opencode',
     });
     expect(first.outcome).toBe('reserved');
 
@@ -206,6 +213,7 @@ describe('ReserveExecutionCapacityUseCase (Appendix A)', () => {
       hostId: 'host-1',
       worktreePath: '/tmp/worktree-1',
       maxSlots: 2,
+      seatTool: 'opencode',
     });
     expect(second.outcome).toBe('reserved');
   });

@@ -212,6 +212,7 @@ function heldReservation(
     hostId: "midnight",
     slotIndex: 0,
     held: true,
+    seatTool: "opencode",
     reservedAtIso: "2026-10-17T08:00:00.000Z",
     releasedAtIso: null,
     ...overrides,

@@ -43,7 +43,7 @@ const OPTIONS = {
 };
 
 describe("createClaimTriage", () => {
-  it("gives undefined when the acknowledgement is the string \"true\"", () => {
+  it('gives undefined when the acknowledgement is the string "true"', () => {
     const port = createClaimTriage({
       ...OPTIONS,
       decisions: decisionsWith({ acknowledgement: "true" }),

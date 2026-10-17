@@ -67,8 +67,7 @@ describe('validateHostDraft', () => {
     });
   });
 
-  it('surfaces the loader errors of the candidate unchanged', () => {
-    // A second lane runner: the loader's one-lane-runner rule, before H9a.
+  it('accepts a second lane runner now that the loader allows several (H9a)', () => {
     const secondRunner = draft({
       name: 'midnight',
       transport: 'ssh',
@@ -78,18 +77,7 @@ describe('validateHostDraft', () => {
       runner: { kind: 'opencode', port: 4166 },
     });
     const result = validateHostDraft(currentFile, secondRunner, 'add');
-    expect(result.ok).toBe(false);
-    if (result.ok) {
-      return;
-    }
-    expect(result.errors).toEqual([
-      'hosts: at most one host may hold the lane-runner role',
-    ]);
-    const reparsed = parseInstallation(result.candidate);
-    expect(reparsed.ok).toBe(false);
-    if (!reparsed.ok) {
-      expect(result.errors).toEqual(reparsed.errors);
-    }
+    expect(result.ok).toBe(true);
   });
 
   it('reports the derived dial-port collision the loader applies across hosts', () => {

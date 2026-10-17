@@ -12,7 +12,8 @@ export interface InspectAttemptRequest {
 
 export type InspectAttemptResult =
   | { readonly outcome: 'found'; readonly attempt: AttemptRecord }
-  | { readonly outcome: 'not-found'; readonly attemptId: string };
+  | { readonly outcome: 'not-found'; readonly attemptId: string }
+  | { readonly outcome: 'unknown'; readonly attemptId: string; readonly reason: string };
 
 export interface InspectAttemptPort {
   /** Inspect one attempt without modifying state or invoking runner. */

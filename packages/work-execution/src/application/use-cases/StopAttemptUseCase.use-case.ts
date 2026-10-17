@@ -12,11 +12,18 @@ import type { StopAttemptPort, StopAttemptRequest, StopAttemptResult } from '../
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
+import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 
 export interface StopAttemptDependencies {
   readonly attemptRepo: AttemptRepositoryPort;
   readonly journal: ExecutionJournalPort;
   readonly runner: ExecutionRunnerPort;
+  /**
+   * Optional (H9b1). When given, an attempt whose recorded host changed or
+   * was removed is refused, naming the recorded host, before any intent is
+   * recorded or subprocess runs. Without it the behaviour is unchanged.
+   */
+  readonly runnerForAttempt?: RunnerForAttemptPort;
 }
 
 type JournalEntryDraft = Omit<ActionJournalEntryRecord, 'id'>;
@@ -61,6 +68,20 @@ export class StopAttemptUseCase implements StopAttemptPort {
 
     const nowIso = request.nowIso ?? new Date().toISOString();
 
+    // Resolve the runner through the attempt's recorded host (H9b1). A
+    // recorded host that changed or was removed refuses before any journal
+    // intent or subprocess; the reason names the recorded host.
+    let runner: ExecutionRunnerPort = this.deps.runner;
+    if (this.deps.runnerForAttempt) {
+      const selection = this.deps.runnerForAttempt.runnerForAttempt({
+        runner: attempt.runner ?? null,
+      });
+      if (!selection.ok) {
+        return { outcome: 'refused', reason: selection.reason };
+      }
+      runner = selection.runner;
+    }
+
     await appendJournalEntry(this.deps.journal, {
       attemptId: attempt.id,
       workOrderId: attempt.workOrderId,
@@ -72,7 +93,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
       detail: 'Stop intent recorded before cancellation request',
     });
 
-    const stopResult = await this.deps.runner.stopSession({
+    const stopResult = await runner.stopSession({
       attemptId: attempt.id,
       sessionId: attempt.sessionId,
       worktreePath: attempt.worktreePath,

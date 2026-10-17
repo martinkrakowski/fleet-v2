@@ -12,6 +12,7 @@ import {
   ForgeActionAdapter,
   OwnerDecisionAdapter,
   AttemptOwnerDecisionAdapter,
+  RunnerForAttemptAdapter,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
   resolveExecutionRunnerHost,
@@ -294,6 +295,22 @@ export function createConfiguredWorkComposition(
     resolveAttempt: async (attemptId) =>
       await attemptRepo.findAttemptById(attemptId),
   });
+  // H9b1: inspect, reconcile, stop and collect act through the attempt's
+  // recorded host. One adapter per host name is built and cached from the
+  // installation's hosts with the same options as the single runner above;
+  // legacy attempts (no recorded hostName) keep this single runner.
+  const runnerForAttempt = new RunnerForAttemptAdapter({
+    hosts: options?.installation?.hosts,
+    legacyRunner: runner,
+    ocmRunBin,
+    executor: roleExecutors.orchestrator,
+    ...(runnerProfile !== undefined ? { capabilities: runnerProfile.capabilities } : {}),
+    ...(runnerProfile !== undefined ? { runnerTransport: runnerProfile.transport } : {}),
+    resolveWorktreePath: async (attemptId) =>
+      (await attemptRepo.findAttemptById(attemptId))?.worktreePath ?? null,
+    resolveAttempt: async (attemptId) =>
+      await attemptRepo.findAttemptById(attemptId),
+  });
   const acceptancePort = new AcceptanceAssessmentAdapter(crossContext?.acceptance);
   const acceptanceEvidencePort = new AcceptanceEvidenceAdapter(crossContext?.acceptanceEvidence);
   const briefKnowledge = new BriefKnowledgeAdapter(crossContext?.briefKnowledge);
@@ -310,7 +327,7 @@ export function createConfiguredWorkComposition(
     ...(runnerHost !== undefined ? { runnerHost } : {}),
     registerWorkOrder: new RegisterWorkOrderUseCase({ workOrderRepo }),
     inspectWorkOrder: new InspectWorkOrderUseCase({ workOrderRepo, attemptRepo, journal }),
-    inspectAttempt: new InspectAttemptUseCase({ attemptRepo }),
+    inspectAttempt: new InspectAttemptUseCase({ attemptRepo, runnerForAttempt }),
     prepareBriefPackage: new PrepareBriefPackageUseCase({
       briefAuthoring,
       artifactPort,
@@ -326,13 +343,24 @@ export function createConfiguredWorkComposition(
       observation,
       artifactPort,
     }),
-    reconcileAttempt: new ReconcileAttemptUseCase({ attemptRepo, journal, runner }),
-    stopAttempt: new StopAttemptUseCase({ attemptRepo, journal, runner }),
+    reconcileAttempt: new ReconcileAttemptUseCase({
+      attemptRepo,
+      journal,
+      runner,
+      runnerForAttempt,
+    }),
+    stopAttempt: new StopAttemptUseCase({
+      attemptRepo,
+      journal,
+      runner,
+      runnerForAttempt,
+    }),
     collectAttemptArtifacts: new CollectAttemptArtifactsUseCase({
       attemptRepo,
       journal,
       artifactPort,
       briefKnowledge,
+      runnerForAttempt,
     }),
     prepareFixAttempt: new PrepareFixAttemptUseCase({ attemptRepo }),
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({

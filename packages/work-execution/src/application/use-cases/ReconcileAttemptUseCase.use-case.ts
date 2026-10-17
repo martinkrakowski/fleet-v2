@@ -16,11 +16,18 @@ import type {
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
+import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 
 export interface ReconcileAttemptDependencies {
   readonly attemptRepo: AttemptRepositoryPort;
   readonly journal: ExecutionJournalPort;
   readonly runner: ExecutionRunnerPort;
+  /**
+   * Optional (H9b1). When given, an attempt whose recorded host changed or
+   * was removed refuses, naming the recorded host, before any state change.
+   * Without it the behaviour is unchanged.
+   */
+  readonly runnerForAttempt?: RunnerForAttemptPort;
 }
 
 type JournalEntryDraft = Omit<ActionJournalEntryRecord, 'id'>;
@@ -54,6 +61,20 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
 
     const nowIso = request.nowIso ?? new Date().toISOString();
 
+    // Resolve the runner through the attempt's recorded host (H9b1). A
+    // recorded host that changed or was removed refuses, naming the recorded
+    // host, before any state change or runner contact.
+    let runner: ExecutionRunnerPort = this.deps.runner;
+    if (this.deps.runnerForAttempt) {
+      const selection = this.deps.runnerForAttempt.runnerForAttempt({
+        runner: attempt.runner ?? null,
+      });
+      if (!selection.ok) {
+        return { outcome: 'refused', reason: selection.reason };
+      }
+      runner = selection.runner;
+    }
+
     if (!attempt.sessionId) {
       const reconciling: AttemptRecord = { ...attempt, state: 'reconciling', updatedAtIso: nowIso };
       await this.deps.attemptRepo.saveAttempt(reconciling);
@@ -70,7 +91,7 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
       return { outcome: 'unknown', attempt: reconciling, reason: 'No sessionId recorded for attempt' };
     }
 
-    const status = await this.deps.runner.inspectSession({
+    const status = await runner.inspectSession({
       attemptId: attempt.id,
       sessionId: attempt.sessionId,
       worktreePath: attempt.worktreePath,

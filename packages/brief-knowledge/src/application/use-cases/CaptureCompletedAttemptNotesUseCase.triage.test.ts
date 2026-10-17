@@ -130,6 +130,7 @@ describe("CaptureCompletedAttemptNotesUseCase post-capture triage hook", () => {
     expect(triage.queries.length).toBe(1);
     const query = triage.queries[0];
     expect(query.attemptId).toBe("att-1");
+    expect(query.projectId).toBe("proj-1");
     expect(query.candidates.map((candidate) => candidate.id)).toEqual([
       "ke-att-1-1",
       "ke-att-1-2",

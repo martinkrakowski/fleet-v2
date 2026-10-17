@@ -93,6 +93,12 @@ export interface JevClaimTriageAdapterDependencies {
   readonly fetch: typeof fetch;
   /** Injected key reader; defaults to `readKeyFile`. */
   readonly readKey?: (path: string) => Promise<string>;
+  /**
+   * Projects whose candidate claims are never triaged (the installation's
+   * `decisions.disabledProjects`): mirrors JevRankingAdviceAdapter's gate —
+   * an owner who disabled a project keeps its prose off the provider too.
+   */
+  readonly disabledProjects?: readonly string[];
   readonly timeoutMs?: number;
 }
 
@@ -115,6 +121,7 @@ export class JevClaimTriageAdapter implements ClaimTriagePort {
   private readonly consumerBudgetUsd: number | undefined;
   private readonly fetchFn: typeof fetch;
   private readonly readKey: (path: string) => Promise<string>;
+  private readonly disabledProjects: readonly string[];
   private readonly timeoutMs: number;
 
   constructor(deps: JevClaimTriageAdapterDependencies) {
@@ -146,6 +153,7 @@ export class JevClaimTriageAdapter implements ClaimTriagePort {
     this.consumerBudgetUsd = deps.consumerBudgetUsd;
     this.fetchFn = deps.fetch;
     this.readKey = deps.readKey ?? readKeyFile;
+    this.disabledProjects = deps.disabledProjects ?? [];
     this.timeoutMs = deps.timeoutMs ?? DEFAULT_JEV_TIMEOUT_MS;
   }
 
@@ -173,6 +181,13 @@ export class JevClaimTriageAdapter implements ClaimTriagePort {
       typeof query !== "object" ||
       typeof query.attemptId !== "string"
     ) {
+      return { status: "unknown", reason: "not-configured" };
+    }
+    // A disabled project's candidate claims never leave the host: the gate
+    // mirrors JevRankingAdviceAdapter's, answers the same unknown reason and
+    // comes before any reservation, key read or fetch (no budget is reserved
+    // and nothing is sent).
+    if (this.disabledProjects.includes(query.projectId)) {
       return { status: "unknown", reason: "not-configured" };
     }
 

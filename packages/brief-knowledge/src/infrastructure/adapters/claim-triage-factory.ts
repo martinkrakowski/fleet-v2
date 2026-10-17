@@ -138,6 +138,11 @@ export function createClaimTriage(
     assumedCostUsd: decisions.assumedCostPerCallUsd,
     monthlyBudgetUsd: decisions.monthlyBudgetUsd,
     ...(consumerBudgetUsd === undefined ? {} : { consumerBudgetUsd }),
+    // Mirrors the ranking factory: the block's disabled projects gate the
+    // adapter's own triage calls per attempt, before anything is sent.
+    ...(decisions.disabledProjects === undefined
+      ? {}
+      : { disabledProjects: decisions.disabledProjects }),
     fetch: options.fetch,
     ...(options.readKey === undefined ? {} : { readKey: options.readKey }),
   });

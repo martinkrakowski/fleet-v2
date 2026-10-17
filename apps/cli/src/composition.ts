@@ -84,6 +84,7 @@ import {
   CaptureCompletedAttemptNotesUseCase,
   CheckKnowledgeClaimUseCase,
   ClaimVerificationAdapter,
+  createClaimTriage,
   createRankingAdvice,
   DecideKnowledgeDispositionUseCase,
   type DecisionReceiptJournalPort,
@@ -683,6 +684,19 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     knowledgeRetrieval,
     rankingAdvice,
   );
+  // Candidate-claim triage (K6): the same decisions block, key source and
+  // receipt journal the ranking advice uses. The factory returns undefined
+  // unless the block is enabled, a key source is declared, the claim-triage
+  // consumer carries `acknowledgeCandidateClaimsLeaveHost: true` and a fetch
+  // was injected — triage stays off otherwise and capture is unchanged.
+  const claimTriage = createClaimTriage({
+    ...(options?.installation?.decisions !== undefined
+      ? { decisions: options.installation.decisions }
+      : {}),
+    ...(stateDir !== undefined ? { stateDir } : {}),
+    fetch: options?.adviceFetch ?? globalThis.fetch,
+    ...(options?.adviceReadKey !== undefined ? { readKey: options.adviceReadKey } : {}),
+  });
   // The decision receipt journal (K4): the same `<stateDir>/decision-receipts`
   // store the ranking advice adapter writes. With no state dir nothing was
   // ever reserved or settled, so the unconfigured journal answers reads with
@@ -699,6 +713,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     knowledgeRetrieval,
     captureCompletedAttemptNotes: new CaptureCompletedAttemptNotesUseCase({
       repo: knowledgeEntryRepository,
+      ...(claimTriage !== undefined ? { triage: claimTriage } : {}),
     }),
     checkKnowledgeClaim: new CheckKnowledgeClaimUseCase({
       repo: knowledgeEntryRepository,

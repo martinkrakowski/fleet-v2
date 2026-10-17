@@ -1,6 +1,7 @@
 import {
   AdvisedKnowledgeRetrievalAdapter,
   ClaimVerificationAdapter,
+  createClaimTriage,
   createRankingAdvice,
   KeeperPublicationAdapter,
   KnowledgeEntryRepositoryAdapter,
@@ -93,11 +94,25 @@ export function createConfiguredKnowledgeComposition(
     ...(options?.readKey !== undefined ? { readKey: options.readKey } : {}),
   });
   const retrieval = new AdvisedKnowledgeRetrievalAdapter(plainRetrieval, advice);
+  // Candidate-claim triage (K6): the same decisions block, key source and
+  // receipt journal the ranking advice uses. The factory returns undefined
+  // unless the block is enabled, a key source is declared, the claim-triage
+  // consumer carries `acknowledgeCandidateClaimsLeaveHost: true` and a fetch
+  // was injected — triage stays off otherwise and capture is unchanged.
+  const claimTriage = createClaimTriage({
+    ...(options?.decisions !== undefined ? { decisions: options.decisions } : {}),
+    ...(stateDir !== undefined ? { stateDir } : {}),
+    fetch: options?.fetch ?? globalThis.fetch,
+    ...(options?.readKey !== undefined ? { readKey: options.readKey } : {}),
+  });
   const verifier = new ClaimVerificationAdapter();
   const publisher = new KeeperPublicationAdapter({ stateDir });
 
   return {
-    captureCompletedAttemptNotes: new CaptureCompletedAttemptNotesUseCase({ repo }),
+    captureCompletedAttemptNotes: new CaptureCompletedAttemptNotesUseCase({
+      repo,
+      ...(claimTriage !== undefined ? { triage: claimTriage } : {}),
+    }),
     checkKnowledgeClaim: new CheckKnowledgeClaimUseCase({ repo, verifier }),
     decideKnowledgeDisposition: new DecideKnowledgeDispositionUseCase({ repo }),
     proposeBriefContext: new ProposeBriefContextUseCase({ repo, retrieval }),

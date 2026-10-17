@@ -3,7 +3,8 @@
 # orchestrator has about a lane: is one running, wait for it, stop it. Sibling of bin/ocm-run.
 #
 #   agy-run --dir <worktree> --model <model> [--effort low|medium|high|xhigh|max] [--agent <name>]
-#           [--mode accept-edits|auto|plan] [--sandbox] [--timeout <45m>] [--brief <.lane/brief.md>] [--detach]
+#           [--mode accept-edits|auto|plan|full] [--isolation-declared] [--sandbox] [--timeout <45m>]
+#           [--brief <.lane/brief.md>] [--detach]
 #   agy-run --status --dir <worktree>   # exit 0: nothing runs there; 3: a lane is running (pid printed)
 #   agy-run --wait   --dir <worktree>   # 0: nothing runs there; 75: GAVE UP after AGY_WAIT_MAX, a lane still runs
 #   agy-run --abort  --dir <worktree>   # stops the lane running there; 0 once nothing runs
@@ -14,10 +15,18 @@
 # ORDER. No free text reaches the model from the command line, so the dispatch command is the same for
 # every lane and one permission rule covers it. A fix round is a new brief, never a new prompt.
 #
-# WHAT IS NEVER PASSED: --dangerously-skip-permissions (refused, exit 2). agy's own permission rules
-# (its settings.json on the host that runs the lane) decide what a lane may touch; widening them is an
-# owner decision on that host, not a flag. --disable-slash-commands is not passed either: agy ignores
-# --mode while it is set, and the fixed prompt contains no slash command to expand.
+# PERMISSIONS. In every mode but `full`, agy's own permission rules (its settings.json on the host that
+# runs the lane) decide what a lane may touch; widening them is an owner decision on that host, not a
+# dispatch flag, so --dangerously-skip-permissions is refused (exit 2). `full` is the one mode that
+# widens them: it is agy's `auto` plus --dangerously-skip-permissions, and it is accepted only together
+# with --isolation-declared — the dispatcher's assertion that this host declares the isolation floor (a
+# scoped worktree mount, restricted network egress, process-tree termination) and carries the
+# acknowledgement for the security text shipped with this build. agy-run cannot verify any of that: the
+# installation loader refuses such a host before a dispatch line is ever written, and --isolation-declared
+# keeps `full` from being a typo or a copied argv. --isolation-declared on its own, and
+# --dangerously-skip-permissions with any other --mode, are usage errors (exit 2): the pair is never a
+# general permission knob. No other flag is ever passed. --disable-slash-commands is not passed at all:
+# agy ignores --mode while it is set, and the fixed prompt contains no slash command to expand.
 #
 # Rules, as for ocm-run:
 #   1. A dispatch is REFUSED (exit 75) when a lane is already running in --dir. AGY_ALLOW_BUSY=1 overrides.
@@ -44,13 +53,20 @@ set -u
 usage() {
   cat <<'USAGE'
 Usage: agy-run [--status|--wait|--abort|--check|--detach] --dir <worktree> --model <model>
-               [--effort low|medium|high|xhigh|max] [--agent <name>] [--mode accept-edits|auto|plan]
-               [--sandbox] [--timeout <duration, default 45m>] [--brief <path inside --dir, default .lane/brief.md>]
+               [--effort low|medium|high|xhigh|max] [--agent <name>] [--mode accept-edits|auto|plan|full]
+               [--isolation-declared] [--sandbox] [--timeout <duration, default 45m>] [--brief <path inside --dir, default .lane/brief.md>]
+--mode full additionally requires --isolation-declared and is the only mode that passes
+--dangerously-skip-permissions to agy (as agy's --mode auto plus that one flag).
 The prompt is fixed: agy reads the brief and carries out its WORK ORDER. No prompt text is accepted.
 USAGE
 }
 
 die_usage() { echo "agy-run: $1" >&2; usage >&2; exit 2; }
+
+refuse_permissions() {
+  echo "agy-run: refusing --dangerously-skip-permissions. Only --mode full --isolation-declared widens a lane's permissions; every other mode runs agy under the permission rules on this host." >&2
+  exit 2
+}
 
 AGY_BIN=${AGY_BIN:-agy}
 mode=run
@@ -60,6 +76,8 @@ model=''
 effort=''
 agent=''
 agymode=accept-edits
+isolation=0
+widen=0
 sandbox=${AGY_SANDBOX:-0}
 timeout=45m
 brief=.lane/brief.md
@@ -82,14 +100,13 @@ while [ "$#" -gt 0 ]; do
     --agent=*) agent=${1#--agent=} ;;
     --mode) need "$@"; agymode=$2; shift ;;
     --mode=*) agymode=${1#--mode=} ;;
+    --isolation-declared) isolation=1 ;;
     --sandbox) sandbox=1 ;;
     --timeout) need "$@"; timeout=$2; shift ;;
     --timeout=*) timeout=${1#--timeout=} ;;
     --brief) need "$@"; brief=$2; shift ;;
     --brief=*) brief=${1#--brief=} ;;
-    --dangerously-skip-permissions)
-      echo "agy-run: refusing --dangerously-skip-permissions. A lane's powers come from agy's permission rules on this host, never from a dispatch flag." >&2
-      exit 2 ;;
+    --dangerously-skip-permissions) widen=1 ;;
     --print | -p | --prompt | --prompt-interactive | -i | --continue | -c | --conversation | --add-dir | --input-format | --json-schema | --remote-control | --output-format | --print-timeout | --disable-slash-commands)
       die_usage "do not pass $1; agy-run sets agy's print, output and workspace options itself" ;;
     -*) die_usage "unknown option $1" ;;
@@ -98,7 +115,15 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-case "$agymode" in accept-edits | auto | plan) ;; *) die_usage "--mode must be accept-edits, auto or plan" ;; esac
+case "$agymode" in accept-edits | auto | plan | full) ;; *) die_usage "--mode must be accept-edits, auto, plan or full" ;; esac
+# The permission-widening flag belongs to the `full` pair and to nothing else, whichever order it came in.
+if [ "$widen" = 1 ] && { [ "$agymode" != full ] || [ "$isolation" != 1 ]; }; then refuse_permissions; fi
+if [ "$agymode" = full ] && [ "$isolation" != 1 ]; then
+  die_usage "--mode full requires --isolation-declared: the isolation floor and the acknowledgement are declared for this host, never assumed here"
+fi
+if [ "$isolation" = 1 ] && [ "$agymode" != full ]; then
+  die_usage "--isolation-declared is only accepted with --mode full; it declares the isolation floor a full lane runs under"
+fi
 case "$effort" in '' | low | medium | high | xhigh | max) ;; *) die_usage "--effort must be low, medium, high, xhigh or max" ;; esac
 case "$timeout" in
   *[!0-9smh]* | '' | [smh]* | *[0-9]) die_usage "--timeout must be a whole number followed by s, m or h (for example 45m)" ;;
@@ -239,7 +264,14 @@ err=$lane/agy-run.err
 
 prompt="Read the file $brief in the current directory and carry out its WORK ORDER exactly as written. Do not read, change or run anything outside the current directory. Do not read files under .git: this worktree's git metadata lives outside it and is off-limits; the brief states the branch and base commit. When you are done, reply with the list of files you changed."
 
-set -- --print "$prompt" --output-format json --print-timeout "$timeout" --mode "$agymode" --model "$model"
+set -- --print "$prompt" --output-format json --print-timeout "$timeout" --model "$model"
+# `full` is agy's `auto` plus the one flag that widens a lane's permissions; every other --mode is
+# handed to agy unchanged and never widens anything.
+if [ "$agymode" = full ]; then
+  set -- "$@" --mode auto --dangerously-skip-permissions
+else
+  set -- "$@" --mode "$agymode"
+fi
 [ -n "$effort" ] && set -- "$@" --effort "$effort"
 [ -n "$agent" ] && set -- "$@" --agent "$agent"
 [ "$sandbox" = 1 ] && set -- "$@" --sandbox

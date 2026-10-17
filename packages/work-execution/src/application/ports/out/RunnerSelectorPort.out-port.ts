@@ -4,9 +4,10 @@
  * RunnerSelectorPort: given the installation's lane-runner hosts and the
  * attempt's seat tool, return which runner kind and host to use. The input is
  * a structural subset of `@fleet/installation`'s derived model, so
- * work-execution stays free of a dependency on that package. Only `opencode`
- * has an implemented adapter; an `agy` selection is refused with
- * `runner-not-available` and dispatch never spawns for it.
+ * work-execution stays free of a dependency on that package. A kind selects
+ * only where an adapter for it exists; until the roots provide one, an `agy`
+ * selection is refused with `runner-not-available` and dispatch never spawns
+ * for it.
  */
 
 import type { RunnerKind } from '../../../domain/execution-records.js';
@@ -32,7 +33,8 @@ export interface SelectRunnerRequest {
 
 /**
  * The selection outcome. `ok: true` names the runner kind and, when a
- * matching lane-runner host exists, the host to use. A `ok: false` refusal
+ * matching lane-runner host exists, the host to use. `agy` runs no tunnel
+ * port, so its selection carries `remotePort: null`. A `ok: false` refusal
  * (kind without an implemented adapter, or no host for a non-opencode seat)
  * is never a fallback to another kind.
  */

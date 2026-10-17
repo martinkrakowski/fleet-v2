@@ -11,7 +11,7 @@
 import type {
   LaneDiffFinding,
   LaneDiffSecretPattern,
-} from '../../../domain/lane-diff-check.js';
+} from "../../../domain/lane-diff-check.js";
 
 export type { LaneDiffFinding, LaneDiffSecretPattern };
 
@@ -29,11 +29,14 @@ export interface LaneDiffCheckRequest {
 }
 
 export type LaneDiffCheckResult =
-  | { readonly outcome: 'clean' }
+  | { readonly outcome: "clean" }
   /** At least one finding; the change set is refused. */
-  | { readonly outcome: 'findings'; readonly findings: readonly LaneDiffFinding[] }
+  | {
+      readonly outcome: "findings";
+      readonly findings: readonly LaneDiffFinding[];
+    }
   /** The change set could not be collected; the check fails closed. */
-  | { readonly outcome: 'error'; readonly reason: string };
+  | { readonly outcome: "error"; readonly reason: string };
 
 export interface LaneDiffCheckPort {
   /** Check one worktree's change set against the frozen brief's prefixes. */

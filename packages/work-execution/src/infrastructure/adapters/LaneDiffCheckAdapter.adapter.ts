@@ -16,15 +16,15 @@ import type {
   LaneDiffCheckPort,
   LaneDiffCheckRequest,
   LaneDiffCheckResult,
-} from '../../application/ports/out/LaneDiffCheckPort.out-port.js';
-import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
+} from "../../application/ports/out/LaneDiffCheckPort.out-port.js";
+import type { CommandExecutorPort } from "../../application/ports/out/CommandExecutorPort.out-port.js";
 import type {
   LaneDiffChangedPath,
   LaneDiffSecretPattern,
   LaneDiffFileStatus,
-} from '../../domain/lane-diff-check.js';
-import { checkLaneDiff } from '../../domain/lane-diff-check.js';
-import { LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
+} from "../../domain/lane-diff-check.js";
+import { checkLaneDiff } from "../../domain/lane-diff-check.js";
+import { LANE_DIFF_SECRET_PATTERNS } from "@fleet/shared";
 
 interface CommandOutcome {
   readonly ok: boolean;
@@ -43,23 +43,32 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     private readonly options?: LaneDiffCheckAdapterOptions,
   ) {}
 
-  async checkLaneDiff(request: LaneDiffCheckRequest): Promise<LaneDiffCheckResult> {
-    const git = async (argv: readonly string[], what: string): Promise<CommandOutcome> => {
+  async checkLaneDiff(
+    request: LaneDiffCheckRequest,
+  ): Promise<LaneDiffCheckResult> {
+    const git = async (
+      argv: readonly string[],
+      what: string,
+    ): Promise<CommandOutcome> => {
       const run = await this.commandExecutor.run(
-        ['git', '-c', 'core.quotePath=false', ...argv],
+        ["git", "-c", "core.quotePath=false", ...argv],
         { cwd: request.worktreePath },
       );
       if (run.error !== undefined || run.exitCode !== 0) {
-        return { ok: false, stdout: '', reason: `lane diff check: could not ${what}` };
+        return {
+          ok: false,
+          stdout: "",
+          reason: `lane diff check: could not ${what}`,
+        };
       }
-      return { ok: true, stdout: run.stdout, reason: '' };
+      return { ok: true, stdout: run.stdout, reason: "" };
     };
 
     const status = await git(
-      ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
-      'list the changed files',
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+      "list the changed files",
     );
-    if (!status.ok) return { outcome: 'error', reason: status.reason };
+    if (!status.ok) return { outcome: "error", reason: status.reason };
 
     const changed = new Map<string, LaneDiffChangedPath>();
     const untracked: string[] = [];
@@ -68,38 +77,55 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     const addedLines = new Map<string, { line: number; text: string }[]>();
 
     const diff = await git(
-      ['diff', '--no-ext-diff', '-U0', '--no-renames', request.baseCommit],
-      'read the added lines',
+      ["diff", "--no-ext-diff", "-U0", "--no-renames", request.baseCommit],
+      "read the added lines",
     );
-    if (!diff.ok) return { outcome: 'error', reason: diff.reason };
+    if (!diff.ok) return { outcome: "error", reason: diff.reason };
     this.collectAddedLines(diff.stdout, addedLines);
 
     // Committed changes since the base are still reviewed, like the script's
     // `base...HEAD` collection. HEAD-unchanged-since-dispatch is the caller's
     // step 1; this keeps the verdicts identical if the caller defers it.
     const committed = await git(
-      ['diff', '--no-ext-diff', '-U0', '--no-renames', `${request.baseCommit}...HEAD`],
-      'read the committed added lines',
+      [
+        "diff",
+        "--no-ext-diff",
+        "-U0",
+        "--no-renames",
+        `${request.baseCommit}...HEAD`,
+      ],
+      "read the committed added lines",
     );
-    if (!committed.ok) return { outcome: 'error', reason: committed.reason };
+    if (!committed.ok) return { outcome: "error", reason: committed.reason };
     this.collectAddedLines(committed.stdout, addedLines);
 
     // An untracked file's whole content is added lines.
     for (const path of untracked) {
-      const run = await this.commandExecutor.run(['cat', '--', path], { cwd: request.worktreePath });
+      const run = await this.commandExecutor.run(["cat", "--", path], {
+        cwd: request.worktreePath,
+      });
       if (run.error !== undefined || run.exitCode !== 0) {
-        return { outcome: 'error', reason: 'lane diff check: could not read an untracked file' };
+        return {
+          outcome: "error",
+          reason: "lane diff check: could not read an untracked file",
+        };
       }
       addedLines.set(
         path,
-        run.stdout.split('\n').map((text, index) => ({ line: index + 1, text })),
+        run.stdout
+          .split("\n")
+          .map((text, index) => ({ line: index + 1, text })),
       );
     }
 
-    const changedPaths: LaneDiffChangedPath[] = [...changed.values()].map((entry) => ({
-      ...entry,
-      ...(addedLines.has(entry.path) ? { addedLines: addedLines.get(entry.path) } : {}),
-    }));
+    const changedPaths: LaneDiffChangedPath[] = [...changed.values()].map(
+      (entry) => ({
+        ...entry,
+        ...(addedLines.has(entry.path)
+          ? { addedLines: addedLines.get(entry.path) }
+          : {}),
+      }),
+    );
 
     const verdict = checkLaneDiff({
       changedPaths,
@@ -109,9 +135,14 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
         : {}),
       ...(request.secretPatterns !== undefined
         ? { secretPatterns: request.secretPatterns }
-        : { secretPatterns: this.options?.secretPatterns ?? defaultSecretPatterns() }),
+        : {
+            secretPatterns:
+              this.options?.secretPatterns ?? defaultSecretPatterns(),
+          }),
     });
-    return verdict.ok ? { outcome: 'clean' } : { outcome: 'findings', findings: verdict.findings };
+    return verdict.ok
+      ? { outcome: "clean" }
+      : { outcome: "findings", findings: verdict.findings };
   }
 
   /**
@@ -125,28 +156,33 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     changed: Map<string, LaneDiffChangedPath>,
     untracked: string[],
   ): void {
-    const fields = stdout.split('\0');
+    const fields = stdout.split("\0");
     for (let index = 0; index < fields.length; index += 1) {
       const entry = fields[index];
       if (entry.length < 4) continue;
       const x = entry[0];
       const y = entry[1];
       const path = entry.slice(3);
-      if (x === '?' && y === '?') {
+      if (x === "?" && y === "?") {
         untracked.push(path);
-        changed.set(path, { path, status: 'untracked' });
+        changed.set(path, { path, status: "untracked" });
         continue;
       }
-      if (x === 'R' || x === 'C' || y === 'R' || y === 'C') {
-        const original = fields[index + 1] ?? '';
+      if (x === "R" || x === "C" || y === "R" || y === "C") {
+        const original = fields[index + 1] ?? "";
         index += 1;
-        if (original !== '') {
-          changed.set(original, { path: original, status: 'deleted' });
+        if (original !== "") {
+          changed.set(original, { path: original, status: "deleted" });
         }
-        changed.set(path, { path, status: 'added' });
+        changed.set(path, { path, status: "added" });
         continue;
       }
-      const status: LaneDiffFileStatus = x === 'A' || y === 'A' ? 'added' : y === 'D' || x === 'D' ? 'deleted' : 'modified';
+      const status: LaneDiffFileStatus =
+        x === "A" || y === "A"
+          ? "added"
+          : y === "D" || x === "D"
+            ? "deleted"
+            : "modified";
       changed.set(path, { path, status });
     }
   }
@@ -156,27 +192,33 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
    * each `@@ -a,b +m,n @@` hunk header sets the next 1-based new-file line
    * number for the `+` lines that follow.
    */
-  private collectAddedLines(diff: string, addedLines: Map<string, { line: number; text: string }[]>): void {
+  private collectAddedLines(
+    diff: string,
+    addedLines: Map<string, { line: number; text: string }[]>,
+  ): void {
     let current: string | null = null;
     let nextLine = 1;
-    for (const rawLine of diff.split('\n')) {
-      if (rawLine.startsWith('+++ ')) {
-        current = rawLine === '+++ /dev/null' ? null : rawLine.slice(4).replace(/^b\//, '');
+    for (const rawLine of diff.split("\n")) {
+      if (rawLine.startsWith("+++ ")) {
+        current =
+          rawLine === "+++ /dev/null"
+            ? null
+            : rawLine.slice(4).replace(/^b\//, "");
         continue;
       }
-      if (rawLine.startsWith('@@')) {
+      if (rawLine.startsWith("@@")) {
         const match = /^@@ -\d+(?:,\d+)? \+(\d+)/.exec(rawLine);
         nextLine = match === null ? nextLine : Number(match[1]);
         continue;
       }
-      if (rawLine.startsWith('+') && current !== null) {
+      if (rawLine.startsWith("+") && current !== null) {
         const lines = addedLines.get(current) ?? [];
         lines.push({ line: nextLine, text: rawLine.slice(1) });
         addedLines.set(current, lines);
         nextLine += 1;
         continue;
       }
-      if (rawLine.startsWith(' ')) nextLine += 1;
+      if (rawLine.startsWith(" ")) nextLine += 1;
     }
   }
 }

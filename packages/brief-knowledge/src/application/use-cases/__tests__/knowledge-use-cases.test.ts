@@ -1,6 +1,6 @@
 // Layer-local unit tests for the brief-knowledge application use cases.
 import { describe, expect, it } from 'vitest';
-import type { KnowledgeEntryRecord } from '../../../domain/knowledge-records.js';
+import type { KnowledgeEntryRecord, KnowledgeTriageFlag } from '../../../domain/knowledge-records.js';
 import type { ContextSelectionProps } from '../../../domain/value-objects/ContextSelection.vo.js';
 import type { KnowledgeReuseOutcomeValue } from '../../../domain/value-objects/KnowledgeReuseOutcome.vo.js';
 import type {
@@ -53,6 +53,12 @@ class InMemoryKnowledgeEntryRepository implements KnowledgeEntryRepositoryPort {
     const all = [...this.entries.values()];
     return projectId === undefined ? all : all.filter((entry) => entry.projectId === projectId);
   }
+
+  async listEntriesBySourceAttempt(attemptId: string): Promise<readonly KnowledgeEntryRecord[]> {
+    return [...this.entries.values()].filter((entry) => entry.sourceAttemptId === attemptId);
+  }
+
+  async setTriageFlag(_entryId: string, _flag: KnowledgeTriageFlag): Promise<void> {}
 
   async saveContextSelections(attemptId: string, selections: readonly ContextSelectionProps[]): Promise<void> {
     const existing = this.selectionsByAttempt.get(attemptId) ?? [];

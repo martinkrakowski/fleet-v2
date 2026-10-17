@@ -145,3 +145,79 @@ describe('KnowledgeEntryRepositoryAdapter cross-process safe persistence', () =>
     expect(contentAfter).toBe(corruptContent);
   });
 });
+
+describe('KnowledgeEntryRepositoryAdapter setTriageFlag write-once', () => {
+  function candidateRecord(id: string, overrides: Partial<KnowledgeEntryRecord> = {}): KnowledgeEntryRecord {
+    return {
+      id,
+      version: 'v1',
+      projectId: 'proj-1',
+      sourceAttemptId: 'att-1',
+      sourceCommitSha: 'sha-1',
+      claimText: 'A candidate claim worth checking',
+      pathPrefixes: ['src/'],
+      sharedAcrossProjects: false,
+      disposition: 'candidate',
+      verification: 'unverified',
+      checkerId: null,
+      dispositionReason: null,
+      supersededById: null,
+      checks: [],
+      reuses: [],
+      revision: 1,
+      createdAtIso: '2026-10-15T10:00:00.000Z',
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  it('attaches the flag to a candidate and bumps the revision', async () => {
+    const adapter = new KnowledgeEntryRepositoryAdapter();
+    await adapter.saveEntry(candidateRecord('ke-1'));
+
+    await adapter.setTriageFlag('ke-1', 'instruction-like');
+
+    const stored = await adapter.findEntryById('ke-1');
+    expect(stored?.triageFlag).toBe('instruction-like');
+    expect(stored?.revision).toBe(2);
+  });
+
+  it('refuses a second flag: the flag is write-once', async () => {
+    const adapter = new KnowledgeEntryRepositoryAdapter();
+    await adapter.saveEntry(candidateRecord('ke-1'));
+    await adapter.setTriageFlag('ke-1', 'policy-like');
+
+    await expect(adapter.setTriageFlag('ke-1', 'instruction-like')).rejects.toThrow(
+      'Triage flag is write-once: entry ke-1 already carries a triage flag',
+    );
+    const stored = await adapter.findEntryById('ke-1');
+    expect(stored?.triageFlag).toBe('policy-like');
+  });
+
+  it('refuses a flag on an entry that already has a disposition', async () => {
+    const adapter = new KnowledgeEntryRepositoryAdapter();
+    await adapter.saveEntry(
+      candidateRecord('ke-1', { disposition: 'accepted', checkerId: 'checker-1' }),
+    );
+
+    await expect(adapter.setTriageFlag('ke-1', 'policy-like')).rejects.toThrow(
+      'Triage flag refused: entry ke-1 already has a disposition (accepted)',
+    );
+    const stored = await adapter.findEntryById('ke-1');
+    expect(stored?.triageFlag).toBeUndefined();
+  });
+
+  it('refuses an unknown entry id and an undeclared flag value', async () => {
+    const adapter = new KnowledgeEntryRepositoryAdapter();
+    await adapter.saveEntry(candidateRecord('ke-1'));
+
+    await expect(adapter.setTriageFlag('ke-missing', 'policy-like')).rejects.toThrow(
+      'Knowledge entry not found: ke-missing',
+    );
+    await expect(
+      // Cast: the port type declares the two flags; the adapter still refuses
+      // anything else arriving through an untyped boundary.
+      adapter.setTriageFlag('ke-1', 'unknown' as 'policy-like'),
+    ).rejects.toThrow('policy-like');
+  });
+});

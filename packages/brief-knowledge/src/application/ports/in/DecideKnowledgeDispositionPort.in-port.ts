@@ -14,6 +14,14 @@ export interface DecideKnowledgeDispositionRequest {
   readonly disposition: KnowledgeDispositionValue;
   readonly checkerId: string;
   readonly reason: string;
+  /**
+   * The checker's justification for accepting a triage-flagged candidate.
+   * Required only when the entry carries a `triageFlag` and the disposition
+   * is `accepted`; it never substitutes for `reason` or for the policy
+   * proposal guard. Refused when it is empty, longer than 1024 characters or
+   * credential-shaped — never redacted.
+   */
+  readonly overrideReason?: string;
   readonly nowIso?: string;
 }
 

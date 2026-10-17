@@ -621,6 +621,8 @@ describe('ProposeBriefContextUseCase reports the ranking contextRef', () => {
       findEntryById: async (entryId) => entries.find((entry) => entry.id === entryId) ?? null,
       listEntriesByProject: async (projectId) =>
         projectId === undefined ? entries : entries.filter((entry) => entry.projectId === projectId),
+      listEntriesBySourceAttempt: async () => [],
+      setTriageFlag: async () => undefined,
       saveContextSelections: async (_attemptId: string, _selections: readonly ContextSelectionProps[]) => undefined,
       listContextSelections: async () => [],
     };

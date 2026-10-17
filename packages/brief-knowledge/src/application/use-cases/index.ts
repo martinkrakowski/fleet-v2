@@ -3,6 +3,7 @@
 export * from "./CaptureCompletedAttemptNotesUseCase.use-case.js";
 export * from "./CheckKnowledgeClaimUseCase.use-case.js";
 export * from "./DecideKnowledgeDispositionUseCase.use-case.js";
+export * from "./ListCandidateClaimsUseCase.use-case.js";
 export * from "./ProposeBriefContextUseCase.use-case.js";
 export * from "./PublishAcceptedKeeperUseCase.use-case.js";
 export * from "./RecordContextSelectionUseCase.use-case.js";

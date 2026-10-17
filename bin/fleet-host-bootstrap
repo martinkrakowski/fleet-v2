@@ -1,0 +1,112 @@
+#!/bin/sh
+# fleet-host-bootstrap — the pinned script `fleet-v2 hosts bootstrap <alias>` copies over ssh and
+# runs ON the new host, as the lane user, with no sudo (plan 2026-10-16_add-host.md, section 9).
+#
+# It provisions only what is missing, only at user level:
+#   - detects the OS (`uname -s`; on Linux, ID and VERSION_ID from /etc/os-release, read, never sourced);
+#   - checks for git, node, the opencode CLI and the agent CLIs the plan names (agy until O14e1),
+#     reporting each found or missing with its version, and installing nothing system-wide;
+#   - creates the user-level directories the plan names (worktree root, TMPDIR, the opencode config
+#     dir) with mode 700;
+#   - prints ONE single-line JSON descriptor on stdout: os, arch, tools, paths, uid;
+#   - never reads or prints any credential file's content — the auth file is stat'ed only, and the
+#     descriptor holds at most its path and whether it exists.
+#
+# Idempotent: a second run changes nothing and says so (a marker under the worktree root records the
+# first provisioning). Every human word goes to stderr; stdout carries the descriptor and nothing else.
+#
+# Hardening (section 9): refuses to run as root; never calls sudo; versions are only reported, never
+# downloaded — a pinned-install mode belongs to a later lane, not to this script.
+set -eu
+umask 077
+
+say() { printf 'fleet-host-bootstrap: %s\n' "$*" >&2; }
+die() { say "$*"; exit 1; }
+
+# JSON string escape: backslashes and double quotes first, then every control byte other than
+# LF, CR and TAB is deleted, and LF, CR and TAB become \n, \r and \t (a descriptor is one line).
+jesc() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' \
+    | tr -d '\000-\010\013\014\016-\037' \
+    | awk '{ gsub(/\r/, "\\r"); gsub(/\t/, "\\t"); if (NR > 1) printf "\\n"; printf "%s", $0 }'
+}
+
+[ "$(id -u)" -ne 0 ] || die "refusing to run as root; this script provisions a user account only"
+[ -n "${HOME:-}" ] || die "HOME is not set"
+
+os=$(uname -s)
+arch=$(uname -m)
+
+os_json="\"sysname\":\"$(jesc "$os")\""
+if [ "$os" = "Linux" ]; then
+  if [ -r /etc/os-release ]; then
+    # Read, never source: os-release values become words, never code.
+    os_id=$(sed -n 's/^ID=//p' /etc/os-release | head -n 1 | tr -d '"')
+    os_ver=$(sed -n 's/^VERSION_ID=//p' /etc/os-release | head -n 1 | tr -d '"')
+    os_json="$os_json,\"id\":\"$(jesc "${os_id:-unknown}")\",\"versionId\":\"$(jesc "${os_ver:-unknown}")\""
+  else
+    os_json="$os_json,\"id\":\"unknown\",\"versionId\":\"unknown\""
+  fi
+fi
+
+say "os: $os ($arch)"
+
+tools_json=""
+sep=""
+for name in git node opencode agy; do
+  if command -v "$name" >/dev/null 2>&1; then
+    ver=$("$name" --version 2>/dev/null | head -n 1 || true)
+    [ -n "$ver" ] || ver="unknown"
+    say "found $name: $ver"
+    tools_json="$tools_json$sep{\"name\":\"$name\",\"found\":true,\"version\":\"$(jesc "$ver")\"}"
+  else
+    say "missing $name (reported, not installed)"
+    tools_json="$tools_json$sep{\"name\":\"$name\",\"found\":false,\"version\":\"\"}"
+  fi
+  sep=","
+done
+
+# Environment overrides must be absolute paths: they are used as directory names below.
+for var in FLEET_WORKTREE_ROOT FLEET_TMPDIR FLEET_OPENCODE_CONFIG_DIR XDG_CONFIG_HOME; do
+  eval "val=\${$var:-}"
+  if [ -n "$val" ]; then
+    case $val in
+      /*) ;;
+      *) say "$var must be an absolute path"; exit 2 ;;
+    esac
+  fi
+done
+
+worktree_root=${FLEET_WORKTREE_ROOT:-$HOME/fleet/worktrees}
+tmp_dir=${FLEET_TMPDIR:-$HOME/.local/state/fleet/tmp}
+config_dir=${FLEET_OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}
+
+marker="$worktree_root/.fleet-host-bootstrap.done"
+if [ -f "$marker" ] && [ -d "$worktree_root" ] && [ -d "$tmp_dir" ] && [ -d "$config_dir" ]; then
+  say "already provisioned; nothing changed (dirs kept as they are, nothing re-created)"
+else
+  for d in "$worktree_root" "$tmp_dir" "$config_dir"; do
+    if [ -d "$d" ]; then
+      say "exists: $d (mode left as it is)"
+    else
+      mkdir -p -- "$d"
+      chmod 700 -- "$d"
+      say "created: $d (mode 700)"
+    fi
+  done
+  # Only after the dirs exist; the marker is what makes the next run a no-op.
+  : > "$marker"
+fi
+
+# The opencode auth file is never read: stat only, and the descriptor holds its path and existence.
+auth_json=""
+if [ -n "${OPENCODE_AUTH_FILE:-}" ]; then
+  if [ -e "$OPENCODE_AUTH_FILE" ]; then
+    auth_json=",\"authFile\":{\"path\":\"$(jesc "$OPENCODE_AUTH_FILE")\",\"exists\":true}"
+  else
+    auth_json=",\"authFile\":{\"path\":\"$(jesc "$OPENCODE_AUTH_FILE")\",\"exists\":false}"
+  fi
+fi
+
+descriptor="{\"os\":{$os_json},\"arch\":\"$(jesc "$arch")\",\"tools\":[$tools_json],\"paths\":{\"worktreeRoot\":\"$(jesc "$worktree_root")\",\"tmpDir\":\"$(jesc "$tmp_dir")\",\"configDir\":\"$(jesc "$config_dir")\"},\"uid\":$(id -u)$auth_json}"
+printf '%s\n' "$descriptor"

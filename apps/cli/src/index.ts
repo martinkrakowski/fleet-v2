@@ -10,6 +10,7 @@
  */
 
 import { join, resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
 
 import type {
   AttemptSeatOverrideRecord,
@@ -29,6 +30,12 @@ import {
   type RecordContextSelectionItem,
 } from '@fleet/brief-knowledge';
 import { COORDINATION_KINDS } from '@fleet/operator-coordination';
+import type {
+  AnswerOwnerQuestionRequest,
+  AskOwnerQuestionRequest,
+  ListOwnerQuestionsRequest,
+  OwnerQuestionState,
+} from '@fleet/operator-coordination';
 
 import { loadInstallation, type LoadResult } from '@fleet/installation';
 import type {
@@ -157,9 +164,23 @@ function kebabToCamel(key: string): string {
   return key.replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase());
 }
 
-/** Parse remaining tokens into a payload: flags first, `--json` overlay last. */
-function parseFlags(tokens: readonly string[]): Payload {
+/** Options for `parseFlags`; only the `questions` id subcommands opt in today. */
+interface ParseFlagsOptions {
+  /**
+   * Collect bare positional tokens (the question id) under the `positional`
+   * key instead of refusing them; handlers that read `positional` validate it.
+   */
+  readonly allowPositional?: boolean;
+}
+
+/**
+ * Parse remaining tokens into a payload: flags first, `--json` overlay last.
+ * Bare positional tokens are a usage error unless `allowPositional` is set,
+ * so a mistyped argument never silently disappears.
+ */
+function parseFlags(tokens: readonly string[], options?: ParseFlagsOptions): Payload {
   const payload: Payload = {};
+  const positionals: string[] = [];
   let jsonPayload: Payload | undefined;
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
@@ -184,6 +205,10 @@ function parseFlags(tokens: readonly string[]): Payload {
       continue;
     }
     if (!token.startsWith('--') || token === '--') {
+      if (options?.allowPositional === true) {
+        positionals.push(token);
+        continue;
+      }
       throw new CliUsageError(`Unexpected argument: ${token}`);
     }
     const body = token.slice(2);
@@ -203,6 +228,9 @@ function parseFlags(tokens: readonly string[]): Payload {
   }
   if (jsonPayload !== undefined) {
     Object.assign(payload, jsonPayload);
+  }
+  if (positionals.length > 0) {
+    payload['positional'] = positionals;
   }
   return payload;
 }
@@ -271,10 +299,18 @@ const NON_ZERO_OUTCOMES: ReadonlySet<string> = new Set([
   'unknown',
 ]);
 
-function exitCodeForResult(result: unknown): number {
+function exitCodeForResult(result: unknown, group?: string, subcommand?: string): number {
   if (typeof result === 'object' && result !== null && 'outcome' in result) {
     const outcome = (result as { outcome: unknown }).outcome;
-    if (typeof outcome === 'string' && NON_ZERO_OUTCOMES.has(outcome)) return 1;
+    if (typeof outcome === 'string') {
+      // `questions wait` reports the settled lifecycle state itself: answered
+      // and acknowledged complete the wait, while rejected, expired and
+      // timeout are refusal-family exits with the state named in the body.
+      if (group === 'questions' && subcommand === 'wait') {
+        return outcome === 'answered' || outcome === 'acknowledged' ? 0 : 1;
+      }
+      if (NON_ZERO_OUTCOMES.has(outcome)) return 1;
+    }
   }
   return 0;
 }
@@ -314,6 +350,109 @@ async function bindImplementerSeat(
     );
   }
   return { bound: true, implementerModel: seat.model };
+}
+
+// ---------------------------------------------------------------------------
+// `questions` helpers. The group takes the question id as a positional
+// argument and reads the ask payload from a file, so it carries a few small
+// boundary helpers; every domain rule stays in the use cases.
+// ---------------------------------------------------------------------------
+
+const OWNER_QUESTION_STATES: readonly OwnerQuestionState[] = [
+  'open',
+  'answered',
+  'rejected',
+  'expired',
+  'acknowledged',
+];
+
+/**
+ * The lifecycle states that settle a `questions wait` poll. `open` keeps the
+ * poll running; every other state ends it with the wait exit code.
+ */
+const TERMINAL_WAIT_STATES: readonly OwnerQuestionState[] = [
+  'answered',
+  'acknowledged',
+  'rejected',
+  'expired',
+];
+
+/** An ISO timestamp with an explicit zone, as `questions list --since` requires. */
+const ISO_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
+const DEFAULT_WAIT_MAX_MS = 30 * 60 * 1000;
+const DEFAULT_WAIT_INTERVAL_MS = 15 * 1000;
+
+/** `questions` subcommands whose first bare argument is the question id. */
+const QUESTIONS_POSITIONAL_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  'show',
+  'answer',
+  'acknowledge',
+  'wait',
+]);
+
+/** The positional question id a `questions` subcommand requires. */
+function questionIdPositional(payload: Payload, subcommand: string): string {
+  const positionals = payload['positional'];
+  const first = Array.isArray(positionals) ? positionals[0] : undefined;
+  const id = typeof first === 'string' ? first.trim() : '';
+  if (id === '') {
+    throw new CliUsageError(`questions ${subcommand} requires a question id: fleet-v2 questions ${subcommand} <id>`);
+  }
+  return id;
+}
+
+/**
+ * Read and parse the JSON question record handed to `questions ask --file`.
+ * The driver only guarantees one readable JSON object; the ask use case owns
+ * every domain rule about the record's contents.
+ */
+function readQuestionFile(filePath: string): AskOwnerQuestionRequest {
+  let content: string;
+  try {
+    content = readFileSync(filePath, 'utf8');
+  } catch (error) {
+    throw new CliUsageError(
+      `questions ask cannot read '${filePath}': ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    throw new CliUsageError(
+      `questions ask file '${filePath}' is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new CliUsageError(`questions ask file '${filePath}' must hold one JSON object`);
+  }
+  return parsed as AskOwnerQuestionRequest;
+}
+
+/**
+ * Parse a duration flag like `30m`, `15s`, `500ms` or `2h`. A bare number is
+ * refused so the unit is always explicit; the subcommand default applies when
+ * the flag is absent.
+ */
+function parseDurationOption(payload: Payload, key: string, fallbackMs: number): number {
+  const raw = optStr(payload, key);
+  if (raw === undefined) return fallbackMs;
+  const match = /^(\d+)(ms|s|m|h)$/.exec(raw);
+  if (match === null) {
+    throw new CliUsageError(
+      `'--${key}' must be a duration with a unit of ms, s, m or h (e.g. 30m), not '${raw}'`,
+    );
+  }
+  const unitMs = match[2] === 'ms' ? 1 : match[2] === 's' ? 1000 : match[2] === 'm' ? 60_000 : 3_600_000;
+  return Number(match[1]) * unitMs;
+}
+
+/** Sleep for one poll interval; the only timer the CLI driver creates itself. */
+function sleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +957,117 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         projectId: optStr(p, 'projectId'),
       }),
   },
+  questions: {
+    ask: async (p, rt) => {
+      const filePath = optStr(p, 'file');
+      if (filePath === undefined) {
+        throw new CliUsageError(
+          "questions ask requires '--file <path>' pointing at one JSON question record",
+        );
+      }
+      return rt.coordination.askOwnerQuestion.askOwnerQuestion(readQuestionFile(filePath));
+    },
+    list: async (p, rt) => {
+      const state = optStr(p, 'state');
+      const since = optStr(p, 'since');
+      if (since !== undefined && (!ISO_WITH_ZONE.test(since) || Number.isNaN(Date.parse(since)))) {
+        throw new CliUsageError(
+          "questions list '--since' must be an ISO timestamp with an explicit zone (e.g. 2026-10-16T08:00:00Z or +02:00)",
+        );
+      }
+      const request: ListOwnerQuestionsRequest = {
+        ...(state !== undefined
+          ? { state: enumOf(p, 'state', OWNER_QUESTION_STATES, 'questions list state') }
+          : {}),
+        ...(since !== undefined ? { since } : {}),
+      };
+      return rt.coordination.listOwnerQuestions.listOwnerQuestions(request);
+    },
+    show: async (p, rt) =>
+      rt.coordination.readOwnerQuestion.readOwnerQuestion({
+        questionId: questionIdPositional(p, 'show'),
+      }),
+    answer: async (p, rt) => {
+      const questionId = questionIdPositional(p, 'answer');
+      const revision = num(p, 'revision', Number.NaN);
+      if (!Number.isInteger(revision) || revision < 1) {
+        throw new CliUsageError(
+          "questions answer requires '--revision <n>' naming the question revision you are answering",
+        );
+      }
+      const accepts = p['accept'] === true;
+      const rejects = p['reject'] === true;
+      const optionId = optStr(p, 'option');
+      const text = optStr(p, 'text');
+      const reason = optStr(p, 'reason');
+      const shapeCount = (accepts ? 1 : 0) + (rejects ? 1 : 0) + (optionId !== undefined ? 1 : 0);
+      if (shapeCount !== 1) {
+        throw new CliUsageError(
+          "questions answer requires exactly one of '--accept', '--reject' or '--option <id>'",
+        );
+      }
+      if (accepts && (reason !== undefined || text !== undefined)) {
+        throw new CliUsageError("'--accept' records the recommendation and takes no '--reason' or '--text'");
+      }
+      if (rejects && (optionId !== undefined || text !== undefined)) {
+        throw new CliUsageError("'--reject' takes an optional '--reason' only");
+      }
+      if (optionId === undefined && text !== undefined) {
+        throw new CliUsageError("'--text' answers alongside '--option <id>'");
+      }
+      const request: AnswerOwnerQuestionRequest = {
+        questionId,
+        questionRevision: revision,
+        shape: accepts ? 'accept' : rejects ? 'reject' : 'answer',
+        answeredVia: 'cli',
+        ...(optionId !== undefined ? { optionId } : {}),
+        ...(text !== undefined ? { text } : {}),
+        ...(reason !== undefined ? { reason } : {}),
+      };
+      return rt.coordination.answerOwnerQuestion.answerOwnerQuestion(request);
+    },
+    sync: async (_p, rt) => rt.coordination.syncOneWayOwnerQuestions.syncOneWayOwnerQuestions(),
+    expire: async (_p, rt) => rt.coordination.expireOwnerQuestions.expireOwnerQuestions(),
+    acknowledge: async (p, rt) => {
+      const by = optStr(p, 'by');
+      if (by === undefined) {
+        throw new CliUsageError("questions acknowledge requires '--by <name>' naming who acted on the answer");
+      }
+      return rt.coordination.acknowledgeOwnerAnswer.acknowledgeOwnerAnswer({
+        questionId: questionIdPositional(p, 'acknowledge'),
+        by,
+      });
+    },
+    wait: async (p, rt) => {
+      const questionId = questionIdPositional(p, 'wait');
+      const maxMs = parseDurationOption(p, 'max', DEFAULT_WAIT_MAX_MS);
+      const intervalMs = parseDurationOption(p, 'interval', DEFAULT_WAIT_INTERVAL_MS);
+      if (intervalMs <= 0) {
+        throw new CliUsageError("'--interval' must be greater than zero");
+      }
+      const deadline = Date.now() + maxMs;
+      for (;;) {
+        // Every round syncs first: a one-way question is settled by the signed
+        // owner decision its linked request carries, never by this poll.
+        await rt.coordination.syncOneWayOwnerQuestions.syncOneWayOwnerQuestions();
+        const read = await rt.coordination.readOwnerQuestion.readOwnerQuestion({ questionId });
+        if (read.outcome === 'found' && TERMINAL_WAIT_STATES.includes(read.question.state)) {
+          return { outcome: read.question.state, question: read.question };
+        }
+        if (Date.now() >= deadline) {
+          return {
+            outcome: 'timeout',
+            ...(read.outcome === 'found' ? { question: read.question } : {}),
+            reason:
+              read.outcome === 'found'
+                ? `the question is still ${read.question.state} after the waited time`
+                : 'no owner question is recorded for that id',
+          };
+        }
+        await sleep(Math.min(intervalMs, deadline - Date.now()));
+      }
+    },
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -880,6 +1130,10 @@ function formatDoctorLine(doctorLine: DoctorLine): string {
  * The exit code follows `doctorExitCode`: 0 only when every line passed. A
  * missing or invalid installation is refused with exit 1, not a usage error.
  */
+function isHelpToken(token: string | undefined): boolean {
+  return token === 'help' || token === '--help' || token === '-h';
+}
+
 export async function doctorCommand(
   argv: readonly string[],
   io: CliIo,
@@ -916,6 +1170,47 @@ export async function doctorCommand(
 // Help text
 // ---------------------------------------------------------------------------
 
+const QUESTIONS_HELP = `Usage: fleet-v2 questions <subcommand> [flags]
+
+Owner questions the orchestrator asks the owner to answer. A two-way question
+is answered here; a one-way question is answered only by the owner's signed
+decision file for its linked request, which 'questions sync' and 'questions
+wait' pick up. An answer records advice and unblocks; it grants nothing,
+fires no action and touches no coordination request.
+
+  ask --file <path>              record one new question from a JSON file
+                                 carrying questionId, askedBy, title, body,
+                                 options, recommendation, and optionally
+                                 doorKind ('two-way' is the only door this
+                                 CLI can answer), linkedRequestId, blocks
+                                 and expiresAt
+  list [--state <s>] [--since <iso>]
+                                 list questions, optionally only one state
+                                 (open, answered, rejected, expired,
+                                 acknowledged) and/or asked at or after an
+                                 ISO timestamp with an explicit zone
+                                 (e.g. 2026-10-16T08:00:00Z or +02:00)
+  show <id>                      print one question's full record
+  answer <id> --revision <n>     answer a two-way question at the revision
+                                 you saw, with exactly one of:
+    --accept                       record the recommended option
+    --reject [--reason <text>]     reject it, with an optional reason
+    --option <id> [--text <text>]  answer with another option and free text
+  sync                           re-read every open one-way question's linked
+                                 signed decision and settle answered/rejected
+  expire                         move open two-way questions past their
+                                 expiry to expired; they stay blocking and
+                                 are re-asked, never dropped
+  acknowledge <id> --by <name>   record that the asker acted on the answer
+  wait <id> [--max 30m] [--interval 15s]
+                                 poll until the question settles, syncing
+                                 one-way questions each round; exits 0
+                                 answered/acknowledged, 1 rejected/expired/
+                                 timeout (the JSON body says which)
+
+Durations take a unit of ms, s, m or h. Exit codes: 0 completed,
+1 refused/rejected/blocked/unknown/not-found, 2 usage error.`;
+
 const HELP_TEXT = `fleet-v2 — Fleet CLI operator driver across the four bounded contexts.
 
 Usage: fleet-v2 [--state-dir <path>] <command> <subcommand> [--json '<payload>'] [--flag value ...]
@@ -941,6 +1236,7 @@ Commands:
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|record-reuse|supersede
   coordination register-profile|capabilities|request-decision|resolve-auth|consume-auth|publish-observation|attention|send-relay|ack-relay|outstanding
+  questions ask|list|show|answer|sync|expire|acknowledge|wait
   help | --help
 
 Exit codes: 0 completed, 1 refused/rejected/blocked/unknown result, 2 usage error.`;
@@ -971,6 +1267,17 @@ export async function runCli(
     const group = restArgv[0];
     if (group === 'doctor') {
       return await doctorCommand(restArgv.slice(1), io, doctorOptions ?? {});
+    }
+    // The questions group carries its own help block; a help request never
+    // composes the runtime and never counts as a usage error.
+    if (
+      group === 'questions' &&
+      // Only the help positions count (`questions --help`, `questions answer --help`):
+      // a free-text flag value such as `--reason -h` must never be read as help.
+      (isHelpToken(restArgv[1]) || (restArgv.length === 3 && isHelpToken(restArgv[2])))
+    ) {
+      io.stdout(`${QUESTIONS_HELP}\n`);
+      return 0;
     }
     // An explicitly injected runtime stays authoritative; only a call without
     // one composes a fresh runtime bound to the resolved state directory.
@@ -1017,10 +1324,12 @@ export async function runCli(
       io.stderr(`Unknown ${group} subcommand: ${subcommand}\n${groupHelp(group)}\n`);
       return 2;
     }
-    const payload = parseFlags(rest);
+    const allowPositional =
+      group === 'questions' && QUESTIONS_POSITIONAL_SUBCOMMANDS.has(subcommand);
+    const payload = parseFlags(rest, { allowPositional });
     const result = await handler(payload, activeRuntime);
     io.stdout(`${JSON.stringify(result)}\n`);
-    return exitCodeForResult(result);
+    return exitCodeForResult(result, group, subcommand);
   } catch (error) {
     if (error instanceof CliUsageError) {
       io.stderr(`${error.message}\n`);

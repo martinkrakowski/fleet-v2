@@ -3,9 +3,10 @@
 // both must reach the same verdicts on the same inputs.
 /**
  * LaneDiffCheckPort: given a worktree and the base commit it is checked
- * against, collect the worktree's tracked and untracked changes and run the
- * pure `checkLaneDiff` over them. Findings carry path, line and rule name
- * only — a matched secret value is never printed, returned or logged.
+ * against, collect the worktree's tracked and untracked changed paths and
+ * run the pure `checkLaneDiff` over their whole scanned content. Findings
+ * carry path, line and rule name only — a matched secret value is never
+ * printed, returned or logged.
  */
 
 import type {

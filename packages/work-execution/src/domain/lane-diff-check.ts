@@ -5,15 +5,16 @@
 // name only.
 
 /**
- * Status of one changed path. `untracked` files carry their whole content as
- * added lines; `deleted` files carry none and pass when under a prefix.
+ * Status of one changed path. Non-deleted paths carry their whole scanned
+ * content (worktree and index) as `addedLines`; `deleted` files carry none
+ * and pass when under a prefix.
  */
 export type LaneDiffFileStatus = "added" | "modified" | "deleted" | "untracked";
 
 export interface LaneDiffChangedPath {
   readonly path: string;
   readonly status: LaneDiffFileStatus;
-  /** 1-based line numbers with their added text, for added/modified/untracked. */
+  /** 1-based line numbers with the scanned text (whole content), for non-deleted paths. */
   readonly addedLines?: readonly {
     readonly line: number;
     readonly text: string;
@@ -75,12 +76,19 @@ const FIXED_PROTECTED_PREFIXES: readonly string[] = [
   "installation",
 ];
 
-/** Lockfiles and package manifests are protected at any depth. */
+/**
+ * Lockfiles, package manifests and git plumbing files are protected at any
+ * depth. `.gitattributes` can suppress diff output and point filters at
+ * files; `.gitmodules` can wire a submodule — both are protected wherever
+ * they appear.
+ */
 const FIXED_PROTECTED_FILES: readonly string[] = [
   "yarn.lock",
   "package-lock.json",
   "pnpm-lock.yaml",
   "package.json",
+  ".gitattributes",
+  ".gitmodules",
 ];
 
 /** Root-only files the script anchors with `$`. */
@@ -148,7 +156,8 @@ export function isFixedProtectedPath(path: string): boolean {
 }
 
 /**
- * Scan the added lines for secret shapes and report every hit as
+ * Scan the scanned content lines (whole file content for non-deleted
+ * paths) for secret shapes and report every hit as
  * `secret-pattern:<name>` with its 1-based line. The matched text is never
  * part of a finding.
  */

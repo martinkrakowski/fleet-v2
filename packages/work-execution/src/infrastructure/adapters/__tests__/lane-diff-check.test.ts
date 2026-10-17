@@ -46,6 +46,14 @@ function git(repo: string, ...args: string[]): void {
   execFileSync("git", args, { cwd: repo });
 }
 
+/** The base tag's full commit sha: the only shape the adapter accepts. */
+function base(repo: string): string {
+  return execFileSync("git", ["rev-parse", "base"], {
+    cwd: repo,
+    encoding: "utf8",
+  }).trim();
+}
+
 afterAll(() => {
   for (const repo of dirs) rmSync(repo, { recursive: true, force: true });
 });
@@ -55,7 +63,7 @@ describe("LaneDiffCheckAdapter", () => {
     const repo = makeRepo();
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     expect(result).toEqual({ outcome: "clean" });
@@ -66,7 +74,7 @@ describe("LaneDiffCheckAdapter", () => {
     writeFileSync(join(repo, "packages/x/src/a.ts"), "export const a = 2;\n");
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     expect(result).toEqual({ outcome: "clean" });
@@ -77,7 +85,7 @@ describe("LaneDiffCheckAdapter", () => {
     writeFileSync(join(repo, "packages/x/src/b.ts"), `const t = "${tok}";\n`);
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     if (result.outcome !== "findings")
@@ -96,7 +104,7 @@ describe("LaneDiffCheckAdapter", () => {
     writeFileSync(join(repo, ".github/workflows/gate.yml"), "name: gate2\n");
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     if (result.outcome !== "findings")
@@ -112,7 +120,7 @@ describe("LaneDiffCheckAdapter", () => {
     writeFileSync(join(repo, "packages/x/yarn.lock"), "# lockfile\n");
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     if (result.outcome !== "findings")
@@ -127,7 +135,7 @@ describe("LaneDiffCheckAdapter", () => {
     rmSync(join(repo, "packages/x/src/a.ts"));
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     expect(result).toEqual({ outcome: "clean" });
@@ -139,7 +147,7 @@ describe("LaneDiffCheckAdapter", () => {
     writeFileSync(join(repo, "docs/notes.md"), "n\n");
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     if (result.outcome !== "findings")
@@ -154,7 +162,7 @@ describe("LaneDiffCheckAdapter", () => {
     git(repo, "mv", ".github/workflows/gate.yml", "packages/x/gate.yml");
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     if (result.outcome !== "findings")
@@ -169,10 +177,24 @@ describe("LaneDiffCheckAdapter", () => {
     const repo = makeRepo();
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "no-such-ref",
+      // A well-formed commit sha that does not exist: git itself fails.
+      baseCommit: "a".repeat(40),
       allowedPathPrefixes: PREFIXES,
     });
     expect(result.outcome).toBe("error");
+  });
+
+  it("a baseCommit that is not a commit object name is refused before any git call", async () => {
+    const repo = makeRepo();
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: "--output=/tmp/x",
+      allowedPathPrefixes: PREFIXES,
+    });
+    expect(result).toEqual({
+      outcome: "error",
+      reason: "invalid-base-commit",
+    });
   });
 
   it("an explicitly allowed .github prefix lifts the protection", async () => {
@@ -180,7 +202,7 @@ describe("LaneDiffCheckAdapter", () => {
     writeFileSync(join(repo, ".github/workflows/gate.yml"), "name: gate2\n");
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: [".github"],
     });
     expect(result).toEqual({ outcome: "clean" });
@@ -191,7 +213,7 @@ describe("LaneDiffCheckAdapter", () => {
     writeFileSync(join(repo, "packages/x/src/b.ts"), `const t = "${tok}";\n`);
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     expect(JSON.stringify(result)).not.toContain("abcdefghij");
@@ -205,7 +227,7 @@ describe("LaneDiffCheckAdapter", () => {
     git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "wip");
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     if (result.outcome !== "findings")
@@ -234,7 +256,7 @@ describe("LaneDiffCheckAdapter", () => {
     );
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     if (result.outcome !== "findings")
@@ -256,7 +278,7 @@ describe("LaneDiffCheckAdapter", () => {
     );
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     if (result.outcome !== "findings")
@@ -275,7 +297,7 @@ describe("LaneDiffCheckAdapter", () => {
     writeFileSync(join(repo, `packages/x/src/with${"\t"}tab.ts`), "x\n");
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     expect(result).toEqual({
@@ -293,7 +315,7 @@ describe("LaneDiffCheckAdapter", () => {
     writeFileSync(join(repo, "packages/x/src/b.ts"), `const t = "${tok}";\n`);
     const result = await adapter.checkLaneDiff({
       worktreePath: repo,
-      baseCommit: "base",
+      baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
     if (result.outcome !== "findings")
@@ -305,5 +327,102 @@ describe("LaneDiffCheckAdapter", () => {
         rule: "secret-pattern:github-token",
       },
     ]);
+  });
+
+  it("a tracked file named with a space is scanned despite the diff header TAB (O14d1 R3)", async () => {
+    const repo = makeRepo();
+    // Tracked and clean in the index; the secret exists in the worktree
+    // only, so the worktree content scan is what catches it.
+    const spaced = "packages/x/a b.ts";
+    writeFileSync(join(repo, spaced), "export const a = 1;\n");
+    git(repo, "add", "--", spaced);
+    git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "spaced");
+    writeFileSync(join(repo, spaced), `const t = "${tok}";\n`);
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: base(repo),
+      allowedPathPrefixes: PREFIXES,
+    });
+    if (result.outcome !== "findings")
+      throw new Error(`expected findings, got ${result.outcome}`);
+    expect(result.findings).toEqual([
+      {
+        path: "packages/x/a b.ts",
+        line: 1,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+  });
+
+  it("a `* -diff` .gitattributes cannot hide a secret, and .gitattributes itself is protected (O14d1 R3)", async () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "packages/x/.gitattributes"), "* -diff\n");
+    git(repo, "add", "packages/x/.gitattributes");
+    writeFileSync(join(repo, "packages/x/src/a.ts"), `const t = "${tok}";\n`);
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: base(repo),
+      allowedPathPrefixes: PREFIXES,
+    });
+    if (result.outcome !== "findings")
+      throw new Error(`expected findings, got ${result.outcome}`);
+    expect(result.findings).toEqual(
+      expect.arrayContaining([
+        {
+          path: "packages/x/src/a.ts",
+          line: 1,
+          rule: "secret-pattern:github-token",
+        },
+        { path: "packages/x/.gitattributes", rule: "protected-path" },
+      ]),
+    );
+  });
+
+  it("a NUL byte cannot make a tracked file's secret invisible (O14d1 R3)", async () => {
+    const repo = makeRepo();
+    writeFileSync(
+      join(repo, "packages/x/src/a.ts"),
+      `before${"\0"}after\nconst t = "${tok}";\n`,
+    );
+    git(repo, "add", "packages/x/src/a.ts");
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: base(repo),
+      allowedPathPrefixes: PREFIXES,
+    });
+    if (result.outcome !== "findings")
+      throw new Error(`expected findings, got ${result.outcome}`);
+    expect(result.findings).toEqual([
+      {
+        path: "packages/x/src/a.ts",
+        line: 2,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+  });
+
+  it("a repository-local clean filter cannot hide a staged secret (O14d1 R3)", async () => {
+    const repo = makeRepo();
+    git(repo, "config", "filter.x.clean", "cat /dev/null");
+    writeFileSync(join(repo, "packages/x/.gitattributes"), "*.ts filter=x\n");
+    git(repo, "add", "packages/x/.gitattributes");
+    writeFileSync(join(repo, "packages/x/src/a.ts"), `const t = "${tok}";\n`);
+    git(repo, "add", "packages/x/src/a.ts");
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: base(repo),
+      allowedPathPrefixes: PREFIXES,
+    });
+    if (result.outcome !== "findings")
+      throw new Error(`expected findings, got ${result.outcome}`);
+    expect(result.findings).toEqual(
+      expect.arrayContaining([
+        {
+          path: "packages/x/src/a.ts",
+          line: 1,
+          rule: "secret-pattern:github-token",
+        },
+      ]),
+    );
   });
 });

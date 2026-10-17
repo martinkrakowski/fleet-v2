@@ -2,17 +2,23 @@
 /**
  * LaneDiffCheckAdapter implements LaneDiffCheckPort over an injected
  * CommandExecutorPort: it collects the worktree's tracked and untracked
- * changes (`git status --porcelain=v1 -z --untracked-files=all`, the name
- * status and `-U0` added-line diffs against the base (which include the
- * committed and staged delta since the base), the committed `base...HEAD`
- * delta and the staged `--cached` delta, mirroring
- * `scripts/lane-diff-check.sh`), then calls the pure `checkLaneDiff`. It
- * mirrors the script's collection: git plumbing never lists anything under
- * `.git/`, so no snapshot comparison exists there and the fixed `.git/`
- * protected rule stays as defense in depth. Detecting changes under `.git/`
- * (hooks, config) needs a snapshot taken at dispatch — that is lane O14d2's
- * job and is deliberately not implemented here. Every command failure fails
- * closed as `error`; no file content is ever printed or carried in a finding.
+ * changed paths (`git status --porcelain=v1 -z --untracked-files=all`, the
+ * name status against the base and the staged `--cached` name status), then
+ * scans the WHOLE CONTENT of every changed path that is not deleted — the
+ * worktree bytes (`cat --`) and the index blob (`git cat-file blob :<path>`,
+ * which needs no diff, textconv or clean filter) — with the secret patterns,
+ * and calls the pure `checkLaneDiff`. Content scanning, not added-line diff
+ * parsing, is the reference approach: a filename with a space, a `* -diff`
+ * attribute, a NUL byte or a textconv/clean filter cannot hide a secret,
+ * because no diff is parsed at all. Like `scripts/lane-diff-check.sh`, whole
+ * content scanning can flag a secret that already existed in a touched file;
+ * that is intended. Git plumbing never lists anything under `.git/`, so no
+ * snapshot comparison exists there and the fixed `.git/` protected rule
+ * stays as defense in depth. Detecting changes under `.git/` (hooks,
+ * config) needs a snapshot taken at dispatch — that is lane O14d2's job and
+ * is deliberately not implemented here. Every command failure, a base ref
+ * outside the commit-shape or an unreadable changed path fails closed as
+ * `error`; no file content is ever printed or carried in a finding.
  */
 
 import type {
@@ -35,6 +41,83 @@ interface CommandOutcome {
   readonly reason: string;
 }
 
+/** A base ref must be a plain commit object name: 40–64 lowercase hex digits. */
+const BASE_COMMIT_PATTERN = /^[0-9a-f]{40,64}$/;
+
+/** Per-read captured-output cap, matching the runner's reviewed 64 MiB. */
+const MAX_SCAN_BUFFER_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Applied to every git command: the parser pin (no colors, no quoted paths,
+ * no mnemonic or missing a/b prefixes) plus the hardening overrides — no
+ * fsmonitor, no repository hooks, no attributes file, short submodule
+ * summaries, no external diff driver and no lfs filter process — mirroring
+ * GitShelfProvider's hardened prefix. Content is read with `cat` and
+ * `git cat-file blob` anyway, neither of which consults these settings.
+ */
+const GIT_CONFIG_ARGS = [
+  "-c",
+  "color.ui=never",
+  "-c",
+  "core.quotePath=false",
+  "-c",
+  "diff.mnemonicPrefix=false",
+  "-c",
+  "diff.noprefix=false",
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "core.hooksPath=/dev/null",
+  "-c",
+  "core.attributesFile=/dev/null",
+  "-c",
+  "diff.submodule=short",
+  "-c",
+  "diff.external=",
+  "-c",
+  "filter.lfs.clean=",
+  "-c",
+  "filter.lfs.smudge=",
+  "-c",
+  "filter.lfs.process=",
+  "-c",
+  "filter.lfs.required=false",
+] as const;
+
+/** Whole content as 1-based numbered lines; line 1 is the first line. */
+function contentLines(content: string): { line: number; text: string }[] {
+  return content.split("\n").map((text, index) => ({ line: index + 1, text }));
+}
+
+/**
+ * The worktree and index scans of one path both number lines from 1, so a
+ * (line, text) pair seen in both scans is kept once. Different texts at the
+ * same line — the worktree changed since staging — are all kept, so a secret
+ * in either version is scanned.
+ */
+function mergeContentLines(
+  merged: Map<number, Set<string>>,
+  content: string,
+): void {
+  for (const { line, text } of contentLines(content)) {
+    const texts = merged.get(line) ?? new Set<string>();
+    texts.add(text);
+    merged.set(line, texts);
+  }
+}
+
+function flattenContentLines(
+  merged: Map<number, Set<string>>,
+): { line: number; text: string }[] {
+  const lines: { line: number; text: string }[] = [];
+  for (const [line, texts] of [...merged.entries()].sort(
+    (a, b) => a[0] - b[0],
+  )) {
+    for (const text of texts) lines.push({ line, text });
+  }
+  return lines;
+}
+
 export interface LaneDiffCheckAdapterOptions {
   /** Secret shapes to scan with; absent is the shared registry. */
   readonly secretPatterns?: readonly LaneDiffSecretPattern[];
@@ -49,27 +132,26 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
   async checkLaneDiff(
     request: LaneDiffCheckRequest,
   ): Promise<LaneDiffCheckResult> {
+    // Fail closed before any git call: the base ref must be a plain commit
+    // object name. Anything else — an option-looking value like
+    // `--output=/tmp/x`, a refspeed shortcut — is refused outright.
+    if (!BASE_COMMIT_PATTERN.test(request.baseCommit)) {
+      return { outcome: "error", reason: "invalid-base-commit" };
+    }
+
     const git = async (
       argv: readonly string[],
       what: string,
     ): Promise<CommandOutcome> => {
-      // The config overrides pin the parser input against the lane's local
-      // git config: no colors, no quoted paths, no mnemonic or missing
-      // a/b prefixes. `--no-color` and explicit prefixes are passed again on
-      // every diff for the same reason.
+      // The config overrides pin every command against the lane's local git
+      // config: no colors, no quoted paths, no mnemonic or missing a/b
+      // prefixes, no fsmonitor, no hooks, no attributes file, short submodule
+      // summaries, no external diff driver and no clean/smudge filter
+      // process — mirroring GitShelfProvider's hardened prefix. Content is
+      // read with `cat` and `git cat-file blob` anyway, neither of which
+      // consults any of these settings.
       const run = await this.commandExecutor.run(
-        [
-          "git",
-          "-c",
-          "color.ui=never",
-          "-c",
-          "core.quotePath=false",
-          "-c",
-          "diff.mnemonicPrefix=false",
-          "-c",
-          "diff.noprefix=false",
-          ...argv,
-        ],
+        ["git", ...GIT_CONFIG_ARGS, ...argv],
         { cwd: request.worktreePath },
       );
       if (run.error !== undefined || run.exitCode !== 0) {
@@ -89,15 +171,13 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     if (!status.ok) return { outcome: "error", reason: status.reason };
 
     const changed = new Map<string, LaneDiffChangedPath>();
-    const untracked: string[] = [];
-    this.collectStatusEntries(status.stdout, changed, untracked);
+    this.collectStatusEntries(status.stdout, changed);
 
     const addedLines = new Map<string, { line: number; text: string }[]>();
 
-    // Committed changes since the base are still reviewed: the worktree diff
-    // against the base carries them (plus the staged and unstaged delta), and
-    // its name status lists paths a `-U0` diff cannot name, such as committed
-    // deletions and mode-only changes.
+    // Committed changes since the base are still reviewed: the name status
+    // against the base lists every path the base..worktree and base..HEAD
+    // deltas touch, including committed deletions and mode-only changes.
     const nameStatus = await git(
       [
         "diff",
@@ -114,58 +194,8 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     if (!nameStatus.ok) return { outcome: "error", reason: nameStatus.reason };
     this.collectNameStatusEntries(nameStatus.stdout, changed);
 
-    const diff = await git(
-      [
-        "diff",
-        "--no-ext-diff",
-        "--no-color",
-        "--no-renames",
-        "-U0",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-        request.baseCommit,
-      ],
-      "read the added lines",
-    );
-    if (!diff.ok) return { outcome: "error", reason: diff.reason };
-    this.collectAddedLines(diff.stdout, addedLines);
-
-    // The committed delta since the base, like the script's `base...HEAD`
-    // collection. HEAD-unchanged-since-dispatch is the caller's step 1; this
-    // keeps the verdicts identical if the caller defers it.
-    const committed = await git(
-      [
-        "diff",
-        "--no-ext-diff",
-        "--no-color",
-        "--no-renames",
-        "-U0",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-        `${request.baseCommit}...HEAD`,
-      ],
-      "read the committed added lines",
-    );
-    if (!committed.ok) return { outcome: "error", reason: committed.reason };
-    this.collectAddedLines(committed.stdout, addedLines);
-
     // A secret that is staged and then reverted in the worktree never shows
-    // in a worktree diff; the staged delta still has to be reviewed.
-    const cached = await git(
-      [
-        "diff",
-        "--cached",
-        "--no-ext-diff",
-        "--no-color",
-        "--no-renames",
-        "-U0",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-      ],
-      "read the staged added lines",
-    );
-    if (!cached.ok) return { outcome: "error", reason: cached.reason };
-    this.collectAddedLines(cached.stdout, addedLines);
+    // in the worktree content; the index blob still has to be scanned.
     const cachedNames = await git(
       ["diff", "--cached", "--no-color", "--no-renames", "--name-status", "-z"],
       "list the staged files",
@@ -174,31 +204,51 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
       return { outcome: "error", reason: cachedNames.reason };
     this.collectNameStatusEntries(cachedNames.stdout, changed);
 
-    // Fail closed on paths the line-by-line review cannot handle, without
-    // echoing the path anywhere.
+    // Fail closed on paths the content scan cannot handle, without echoing
+    // the path anywhere.
     for (const path of changed.keys()) {
       if (hasUnsupportedPathCharacters(path)) {
         return { outcome: "error", reason: "unsupported-path-characters" };
       }
     }
 
-    // An untracked file's whole content is added lines.
-    for (const path of untracked) {
-      const run = await this.commandExecutor.run(["cat", "--", path], {
-        cwd: request.worktreePath,
-      });
-      if (run.error !== undefined || run.exitCode !== 0) {
+    // Scan the WHOLE CONTENT of every changed path that is not deleted: the
+    // worktree bytes (`cat --`) and, for tracked paths, the index blob
+    // (`git cat-file blob :<path>` — stage 0, no diff, no textconv, no
+    // filter). No binary heuristic is applied: the raw bytes travel as text,
+    // so a NUL byte cannot stop the scan (the executor decodes as UTF-8,
+    // which preserves NUL as U+0000 and maps every ASCII byte to itself, so
+    // no ASCII pattern can be hidden by the decoding). A directory, an
+    // embedded repository or any other non-file path fails the read and the
+    // check gives an error. The 64 MiB cap applies per read; exceeding it is
+    // an error, never a silent truncation.
+    for (const entry of changed.values()) {
+      if (entry.status === "deleted") continue;
+      const worktree = await this.commandExecutor.run(
+        ["cat", "--", entry.path],
+        {
+          cwd: request.worktreePath,
+          maxBufferBytes: MAX_SCAN_BUFFER_BYTES,
+        },
+      );
+      if (worktree.error !== undefined || worktree.exitCode !== 0) {
         return {
           outcome: "error",
-          reason: "lane diff check: could not read an untracked file",
+          reason:
+            "lane diff check: could not read a changed file's worktree content",
         };
       }
-      addedLines.set(
-        path,
-        run.stdout
-          .split("\n")
-          .map((text, index) => ({ line: index + 1, text })),
-      );
+      const merged = new Map<number, Set<string>>();
+      mergeContentLines(merged, worktree.stdout);
+      if (entry.status !== "untracked") {
+        const index = await git(
+          ["cat-file", "blob", `:${entry.path}`],
+          "read a changed file's index blob",
+        );
+        if (!index.ok) return { outcome: "error", reason: index.reason };
+        mergeContentLines(merged, index.stdout);
+      }
+      addedLines.set(entry.path, flattenContentLines(merged));
     }
 
     const changedPaths: LaneDiffChangedPath[] = [...changed.values()].map(
@@ -223,9 +273,22 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
               this.options?.secretPatterns ?? defaultSecretPatterns(),
           }),
     });
-    return verdict.ok
-      ? { outcome: "clean" }
-      : { outcome: "findings", findings: verdict.findings };
+    // Both content scans of a path can yield the same (line, text) pair;
+    // the domain already merges identical (line, text) pairs, and identical
+    // (path, line, rule) findings — the same secret shape matched by two
+    // scans of different text at one line — collapse here. Findings carry
+    // path, line and rule only, never a matched value.
+    if (verdict.ok) return { outcome: "clean" };
+    const seen = new Set<string>();
+    const findings = verdict.findings.filter((finding) => {
+      const key = `${finding.path}\u0000${finding.rule}\u0000${String(
+        finding.line ?? "",
+      )}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    return { outcome: "findings", findings };
   }
 
   /**
@@ -237,7 +300,6 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
   private collectStatusEntries(
     stdout: string,
     changed: Map<string, LaneDiffChangedPath>,
-    untracked: string[],
   ): void {
     const fields = stdout.split("\0");
     for (let index = 0; index < fields.length; index += 1) {
@@ -247,7 +309,6 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
       const y = entry[1];
       const path = entry.slice(3);
       if (x === "?" && y === "?") {
-        untracked.push(path);
         changed.set(path, { path, status: "untracked" });
         continue;
       }
@@ -301,67 +362,6 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
       if (!changed.has(path)) {
         changed.set(path, { path, status });
       }
-    }
-  }
-
-  /**
-   * Parse a `-U0` unified diff with explicit a/ and b/ prefixes. A
-   * `+++ b/<path>` header names the file only on the line directly after a
-   * `--- ` header, inside the file's header block; everything after the
-   * first `@@` of a file is content, so an added line whose own text starts
-   * with `++ ` (rendered `+++ ...` by git) can never be mistaken for a
-   * header. Each `@@ -a,b +m,n @@` hunk header sets the next 1-based
-   * new-file line number for the `+` lines that follow.
-   */
-  private collectAddedLines(
-    diff: string,
-    addedLines: Map<string, { line: number; text: string }[]>,
-  ): void {
-    let current: string | null = null;
-    let nextLine = 1;
-    let inHeader = false;
-    let sawMinusHeader = false;
-    for (const rawLine of diff.split("\n")) {
-      if (rawLine.startsWith("diff --git ")) {
-        current = null;
-        nextLine = 1;
-        inHeader = true;
-        sawMinusHeader = false;
-        continue;
-      }
-      if (inHeader) {
-        if (rawLine.startsWith("--- ")) {
-          sawMinusHeader = true;
-          continue;
-        }
-        if (rawLine.startsWith("+++ ")) {
-          if (sawMinusHeader) {
-            current =
-              rawLine === "+++ /dev/null"
-                ? null
-                : rawLine.slice(4).replace(/^b\//, "");
-          }
-          continue;
-        }
-        if (rawLine.startsWith("@@")) {
-          inHeader = false;
-        } else {
-          continue;
-        }
-      }
-      if (rawLine.startsWith("@@")) {
-        const match = /^@@ -\d+(?:,\d+)? \+(\d+)/.exec(rawLine);
-        nextLine = match === null ? nextLine : Number(match[1]);
-        continue;
-      }
-      if (rawLine.startsWith("+") && current !== null) {
-        const lines = addedLines.get(current) ?? [];
-        lines.push({ line: nextLine, text: rawLine.slice(1) });
-        addedLines.set(current, lines);
-        nextLine += 1;
-        continue;
-      }
-      if (rawLine.startsWith(" ")) nextLine += 1;
     }
   }
 }

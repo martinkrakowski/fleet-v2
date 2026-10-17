@@ -44,6 +44,11 @@ export class AnswerFileRankingAdviceAdapter implements KnowledgeRankingAdvicePor
   }
 
   async adviseRanking(req: AdviseRankingQuery): Promise<RankingAdvice> {
+    // A non-finite threshold is a configuration error, not a recorded answer:
+    // refused before the file is read so the gate can never accept everything.
+    if (!Number.isFinite(this.minConfidence)) {
+      return { status: 'unknown', reason: 'not-configured' };
+    }
     const state = buildRankingAdviceState(req);
     if (!state.ok) {
       // Consistent with the live adapter: a refused state is never answered.

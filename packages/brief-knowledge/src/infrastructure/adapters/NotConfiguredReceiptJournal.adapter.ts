@@ -9,6 +9,7 @@
  */
 
 import type {
+  AppendDecisionOutcome,
   DecisionCallReceipt,
   DecisionReceiptJournalPort,
   ReserveDecisionQuery,
@@ -28,5 +29,13 @@ export class NotConfiguredReceiptJournal implements DecisionReceiptJournalPort {
 
   async monthSpendUsd(_monthUtc: Date): Promise<number> {
     return 0;
+  }
+
+  /**
+   * Outcomes are best effort: without a durable store there is no settled
+   * receipt to join one to, so it is skipped rather than raised at the caller.
+   */
+  async appendOutcome(_outcome: AppendDecisionOutcome): Promise<void> {
+    return;
   }
 }

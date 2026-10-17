@@ -43,7 +43,8 @@ EOF
   export HOME PATH
 }
 
-run() { sh "$SCRIPT" 2>"$T/err"; }
+run() { "$RUNSH" "$SCRIPT" 2>"$T/err"; }
+mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 stdout_lines() { wc -l <"$T/out" | tr -d ' '; }
 
 # --- first run creates the dirs, mode 700 ---
@@ -54,9 +55,9 @@ check "first run: exactly one stdout line (the descriptor)" '[ "$(stdout_lines)"
 check "first run: worktree root created" '[ -d "$T/home/fleet/worktrees" ]'
 check "first run: TMPDIR created" '[ -d "$T/home/.local/state/fleet/tmp" ]'
 check "first run: opencode config dir created" '[ -d "$T/home/.config/opencode" ]'
-check "first run: worktree root mode 700" '[ "$(stat -c %a "$T/home/fleet/worktrees")" = 700 ]'
-check "first run: TMPDIR mode 700" '[ "$(stat -c %a "$T/home/.local/state/fleet/tmp")" = 700 ]'
-check "first run: config dir mode 700" '[ "$(stat -c %a "$T/home/.config/opencode")" = 700 ]'
+check "first run: worktree root mode 700" '[ "$(mode "$T/home/fleet/worktrees")" = 700 ]'
+check "first run: TMPDIR mode 700" '[ "$(mode "$T/home/.local/state/fleet/tmp")" = 700 ]'
+check "first run: config dir mode 700" '[ "$(mode "$T/home/.config/opencode")" = 700 ]'
 check "first run: the marker is written" '[ -f "$T/home/fleet/worktrees/.fleet-host-bootstrap.done" ]'
 
 # --- the descriptor is valid JSON (checked with node) ---
@@ -91,7 +92,7 @@ mkdir -p "$T/fakepkg"
 printf '#!/bin/sh\necho "apt-get ran" >> "%s/pkg.log"\nexit 0\n' "$T" > "$T/fakepkg/apt-get"
 printf '#!/bin/sh\necho "snap ran" >> "%s/pkg.log"\nexit 0\n' "$T" > "$T/fakepkg/snap"
 chmod +x "$T/fakepkg"/*
-PATH="$T/bin:$T/fakepkg:$REAL_PATH" sh "$SCRIPT" >"$T/out" 2>"$T/err"
+PATH="$T/bin:$T/fakepkg:$REAL_PATH" "$RUNSH" "$SCRIPT" >"$T/out" 2>"$T/err"
 check "missing tool: exit 0 (reported, not fatal here)" '[ $? = 0 ]'
 check "missing tool: reported on stderr" 'grep -q "missing agy" "$T/err"'
 check "missing tool: nothing was installed" '[ ! -s "$T/pkg.log" ]'
@@ -120,15 +121,91 @@ run >"$T/out"
 check "linux: descriptor carries the os-release ID" \
   '"$REAL_NODE" -e "const d=JSON.parse(require(\"fs\").readFileSync(0,\"utf8\"));process.exit(d.os.sysname===\"Linux\"&&typeof d.os.id===\"string\"&&d.os.id.length>0?0:1)" <"$T/out"'
 
+# --- a tool whose --version prints CRLF and an ESC colour code still gives valid JSON ---
+setup Linux
+printf '#!/bin/sh\ncase "$1" in --version) printf "git version 2.43.0\\r\\033[31;1mred\\033[0m\\n" ;; *) exit 1 ;; esac\n' > "$T/bin/git"
+chmod +x "$T/bin/git"
+run >"$T/out"
+check "escapes: exit 0" '[ $? = 0 ]'
+check "escapes: no raw ESC byte reaches stdout" '! grep -q "$(printf "\033")" "$T/out"'
+if [ -n "$REAL_NODE" ]; then
+  check "escapes: CR kept as an escape, ESC deleted, JSON valid" \
+    '"$REAL_NODE" -e "const d=JSON.parse(require(\"fs\").readFileSync(0,\"utf8\"));const g=d.tools.find(t=>t.name===\"git\");process.exit(g&&g.found&&g.version===\"git version 2.43.0\r[31;1mred[0m\"?0:1)" <"$T/out"'
+else
+  bad "escapes: CR kept as an escape, ESC deleted, JSON valid (no real node on this machine)"
+fi
+
+# --- a HOME containing a space and a double quote still gives valid JSON with the exact path ---
+setup Linux
+QUOTED_HOME="$T/ho me\"q"
+mkdir -p "$QUOTED_HOME"
+HOME="$QUOTED_HOME"
+export HOME
+run >"$T/out"
+check "quoted home: exit 0" '[ $? = 0 ]'
+check "quoted home: dirs were created inside it" '[ -d "$QUOTED_HOME/fleet/worktrees" ] && [ -d "$QUOTED_HOME/.config/opencode" ]'
+if [ -n "$REAL_NODE" ]; then
+  check "quoted home: descriptor carries the exact paths" \
+    '"$REAL_NODE" -e "const d=JSON.parse(require(\"fs\").readFileSync(0,\"utf8\"));process.exit(d.paths.worktreeRoot===process.env.HOME+\"/fleet/worktrees\"&&d.paths.configDir===process.env.HOME+\"/.config/opencode\"?0:1)" <"$T/out"'
+else
+  bad "quoted home: descriptor carries the exact paths (no real node on this machine)"
+fi
+
+# --- a relative FLEET_TMPDIR is refused with exit 2 ---
+setup ''
+FLEET_TMPDIR=relative/tmp "$RUNSH" "$SCRIPT" >"$T/out" 2>"$T/err"
+check "relative FLEET_TMPDIR: exit 2" '[ $? = 2 ]'
+check "relative FLEET_TMPDIR: stderr names the variable" 'grep -q "FLEET_TMPDIR must be an absolute path" "$T/err"'
+check "relative FLEET_TMPDIR: nothing on stdout" '[ ! -s "$T/out" ]'
+check "relative FLEET_TMPDIR: no dir was created" '[ ! -e "$T/relative" ]'
+
+# --- OPENCODE_AUTH_FILE pointing at a missing file gives exists:false ---
+setup Linux
+OPENCODE_AUTH_FILE="$T/does-not-exist" "$RUNSH" "$SCRIPT" >"$T/out" 2>"$T/err"
+check "auth file missing: exit 0" '[ $? = 0 ]'
+if [ -n "$REAL_NODE" ]; then
+  check "auth file missing: descriptor says exists:false" \
+    '"$REAL_NODE" -e "const d=JSON.parse(require(\"fs\").readFileSync(0,\"utf8\"));process.exit(d.authFile&&d.authFile.exists===false?0:1)" <"$T/out"'
+else
+  bad "auth file missing: descriptor says exists:false (no real node on this machine)"
+fi
+
+# --- a pre-existing dir keeps its mode ---
+setup Linux
+mkdir -p "$T/home/fleet/worktrees"
+chmod 755 "$T/home/fleet/worktrees"
+run >"$T/out"
+check "pre-existing dir: exit 0" '[ $? = 0 ]'
+check "pre-existing dir: mode kept at 755" '[ "$(mode "$T/home/fleet/worktrees")" = 755 ]'
+
+# --- a sudo stub on PATH is never called ---
+setup Linux
+rm "$T/bin/agy"
+mkdir -p "$T/fakepkg"
+printf '#!/bin/sh\necho "sudo ran" >> "%s/pkg.log"\nexit 0\n' "$T" > "$T/fakepkg/sudo"
+chmod +x "$T/fakepkg/sudo"
+PATH="$T/bin:$T/fakepkg:$REAL_PATH" "$RUNSH" "$SCRIPT" >"$T/out" 2>"$T/err"
+check "sudo stub: exit 0" '[ $? = 0 ]'
+check "sudo stub: never invoked" '[ ! -s "$T/pkg.log" ]'
+check "sudo stub: nothing on stderr mentions sudo" '! grep -q sudo "$T/err"'
+
+# --- the script is pinned: its sha256 equals scripts/fleet-host-bootstrap-hash.txt ---
+check "pin: sha256 of bin/fleet-host-bootstrap equals the hash file" '
+  sum=$( (command -v sha256sum >/dev/null 2>&1 && sha256sum "$here/bin/fleet-host-bootstrap" || shasum -a 256 "$here/bin/fleet-host-bootstrap") | cut -c1-64 )
+  read -r want pinjunk < "$here/scripts/fleet-host-bootstrap-hash.txt"
+  [ -n "$sum" ] && [ "$sum" = "$want" ]
+'
+check "pin: the hash file names the script" 'grep -q "bin/fleet-host-bootstrap" "$here/scripts/fleet-host-bootstrap-hash.txt"'
+
 # --- refusals ---
 setup ''
-check "no HOME: refused, nothing on stdout" '! env -u HOME sh "$SCRIPT" >"$T/out" 2>"$T/err"'
+check "no HOME: refused, nothing on stdout" '! env -u HOME "$RUNSH" "$SCRIPT" >"$T/out" 2>"$T/err"'
 
 # the root refusal needs id to answer 0; use a stubbed id instead of becoming root
 rm -rf "$T/home"; mkdir -p "$T/home" "$T/bin"
 printf '#!/bin/sh\ncase "$1" in -u) echo 0 ;; *) exit 1 ;; esac\n' > "$T/bin/id"
 chmod +x "$T/bin/id"
-PATH="$T/bin:$REAL_PATH" HOME="$T/home" sh "$SCRIPT" >"$T/out" 2>"$T/err"
+PATH="$T/bin:$REAL_PATH" HOME="$T/home" "$RUNSH" "$SCRIPT" >"$T/out" 2>"$T/err"
 check "as root: refused (exit 1), stderr explains" '[ $? = 1 ] && grep -q "refusing to run as root" "$T/err"'
 check "as root: nothing was created" '[ ! -d "$T/home/fleet" ]'
 

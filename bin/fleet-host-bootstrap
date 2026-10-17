@@ -23,9 +23,12 @@ umask 077
 say() { printf 'fleet-host-bootstrap: %s\n' "$*" >&2; }
 die() { say "$*"; exit 1; }
 
-# JSON string escape: backslashes, double quotes, and newlines (a descriptor is one line).
+# JSON string escape: backslashes and double quotes first, then every control byte other than
+# LF, CR and TAB is deleted, and LF, CR and TAB become \n, \r and \t (a descriptor is one line).
 jesc() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' \
+    | tr -d '\000-\010\013\014\016-\037' \
+    | awk '{ gsub(/\r/, "\\r"); gsub(/\t/, "\\t"); if (NR > 1) printf "\\n"; printf "%s", $0 }'
 }
 
 [ "$(id -u)" -ne 0 ] || die "refusing to run as root; this script provisions a user account only"
@@ -63,6 +66,17 @@ for name in git node opencode agy; do
   sep=","
 done
 
+# Environment overrides must be absolute paths: they are used as directory names below.
+for var in FLEET_WORKTREE_ROOT FLEET_TMPDIR FLEET_OPENCODE_CONFIG_DIR XDG_CONFIG_HOME; do
+  eval "val=\${$var:-}"
+  if [ -n "$val" ]; then
+    case $val in
+      /*) ;;
+      *) say "$var must be an absolute path"; exit 2 ;;
+    esac
+  fi
+done
+
 worktree_root=${FLEET_WORKTREE_ROOT:-$HOME/fleet/worktrees}
 tmp_dir=${FLEET_TMPDIR:-$HOME/.local/state/fleet/tmp}
 config_dir=${FLEET_OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}
@@ -75,8 +89,8 @@ else
     if [ -d "$d" ]; then
       say "exists: $d (mode left as it is)"
     else
-      mkdir -p "$d"
-      chmod 700 "$d"
+      mkdir -p -- "$d"
+      chmod 700 -- "$d"
       say "created: $d (mode 700)"
     fi
   done

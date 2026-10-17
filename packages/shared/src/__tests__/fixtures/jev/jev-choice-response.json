@@ -1,0 +1,45 @@
+{
+  "model": "typesafe/jev-1.14-20261014",
+  "answers": {
+    "k0": {
+      "type": "choice",
+      "choice": "instruction",
+      "probabilities": {
+        "lesson": 0.17,
+        "policy_proposal": 0.01,
+        "instruction": 0.82,
+        "status_noise": 0
+      },
+      "confidence": 0.76
+    },
+    "k1": {
+      "type": "choice",
+      "choice": "instruction",
+      "probabilities": {
+        "lesson": 0,
+        "policy_proposal": 0.4,
+        "instruction": 0.6,
+        "status_noise": 0
+      },
+      "confidence": 0.47
+    },
+    "k2": {
+      "type": "choice",
+      "choice": "status_noise",
+      "probabilities": {
+        "lesson": 0,
+        "policy_proposal": 0,
+        "instruction": 0.01,
+        "status_noise": 0.99
+      },
+      "confidence": 0.99
+    }
+  },
+  "usage": {
+    "input_tokens": 628,
+    "output_tokens": 142,
+    "cost": 0.000026376
+  },
+  "id": "gen-fixture-choice",
+  "provider": "TypeSafe"
+}

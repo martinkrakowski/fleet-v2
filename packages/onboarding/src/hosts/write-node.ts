@@ -19,7 +19,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { open, readFile, rename, rm } from "node:fs/promises";
+import { open, readFile, rename, rm, stat } from "node:fs/promises";
 
 import {
   isFleetInstallationV2,
@@ -215,8 +215,10 @@ export async function writeInstallation(
     }
     return { status: "written", file, hash: sha256Of(bytes) };
   } finally {
-    // Remove the lock first, so a failing close can never leave it behind.
-    await rm(lockFile, { force: true }).catch(() => undefined);
+    // Remove the lock first, so a failing close can never leave it behind,
+    // but only while the path is still our own lock: if an operator removed
+    // it and another writer has since taken it, that writer's lock stays.
+    await releaseOwnLock(lock, lockFile);
     await lock.close().catch(() => undefined);
   }
 }
@@ -226,6 +228,21 @@ export async function writeInstallation(
  * longer exists on this host is named as a stale lock with the exact path to
  * remove; the lock is never removed automatically.
  */
+async function releaseOwnLock(
+  lock: Awaited<ReturnType<typeof open>>,
+  lockFile: string,
+): Promise<void> {
+  try {
+    const own = await lock.stat();
+    if (own.nlink === 0) return;
+    const atPath = await stat(lockFile);
+    if (atPath.dev !== own.dev || atPath.ino !== own.ino) return;
+    await rm(lockFile, { force: true });
+  } catch {
+    // Already gone, or unreadable: nothing of ours to remove.
+  }
+}
+
 async function describeHeldLock(lockFile: string): Promise<string> {
   let owner = "";
   try {

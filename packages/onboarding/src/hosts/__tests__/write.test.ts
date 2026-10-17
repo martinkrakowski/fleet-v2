@@ -1,3 +1,4 @@
+import { rmSync, writeFileSync } from "node:fs";
 /**
  * The write step against a real temp directory: the compare-and-swap hash
  * check, the loader's refusal at the moment of writing, and the atomic
@@ -380,6 +381,36 @@ describe("writeInstallation", () => {
       }
     },
   );
+
+  it("never removes a lock another writer took after ours was removed by hand", async () => {
+    const dir = await tempDir();
+    const file = join(dir, "fleet.json");
+    try {
+      await writeFile(file, `${JSON.stringify(baseFile, null, 2)}\n`);
+      const read = await readInstallationFile(file);
+      // While our write is in flight (the candidate is re-validated), our lock
+      // is removed by hand and another writer takes the path.
+      const candidate = candidateFile();
+      const planted = `${process.pid} other-writer\n`;
+      const swapping = new Proxy(candidate as object, {
+        get(target, key, receiver) {
+          if (key === "hosts") {
+            rmSync(`${file}.lock`, { force: true });
+            writeFileSync(`${file}.lock`, planted);
+          }
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      await writeInstallation({
+        file,
+        candidate: swapping as typeof candidate,
+        expectedHash: readHashOf(read),
+      });
+      expect(await readFile(`${file}.lock`, "utf8")).toBe(planted);
+    } finally {
+      await remove(dir);
+    }
+  });
 
   it("leaves no lock file behind after a successful write", async () => {
     const dir = await tempDir();

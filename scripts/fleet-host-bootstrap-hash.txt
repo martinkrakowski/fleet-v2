@@ -1,1 +1,1 @@
-5b885ef82bfff0dcd24f19e942d78d88a69abc23e518e1a20c35d242995d9b0c  bin/fleet-host-bootstrap
+14be5fc5c8597d42a508c1b17c2f9d608ccff368670d682a2ec2883a84607355  bin/fleet-host-bootstrap

@@ -8,6 +8,9 @@ set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
 SCRIPT=${BOOTSTRAP_TEST_SCRIPT:-$here/bin/fleet-host-bootstrap}
 RUNSH=${BOOTSTRAP_TEST_SH:-sh}
+# A clean environment: CI runners set XDG_CONFIG_HOME, and an operator may set
+# FLEET_* overrides; the cases below set these themselves where they test them.
+unset XDG_CONFIG_HOME FLEET_WORKTREE_ROOT FLEET_TMPDIR FLEET_OPENCODE_CONFIG_DIR OPENCODE_AUTH_FILE
 REAL_NODE=$(command -v node || true)
 REAL_PATH=$PATH
 T=$(mktemp -d "${TMPDIR:-/tmp}/fleet-host-bootstrap-test.XXXXXX") || exit 1

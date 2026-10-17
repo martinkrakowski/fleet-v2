@@ -15,7 +15,7 @@ import type {
 } from "../../doctor/probes-node.js";
 
 import { detectInitEnvironment } from "../detect.js";
-import type { DetectedPlatformTool, InitDetection } from "../detect.js";
+import type { InitDetection } from "../detect.js";
 import { buildInitPlan } from "../plan.js";
 import type { InitAnswers } from "../plan.js";
 

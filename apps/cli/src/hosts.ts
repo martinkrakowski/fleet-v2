@@ -810,7 +810,7 @@ async function listHosts(file: string, io: CliIo): Promise<number> {
     return 0;
   }
   const hosts = state.installation.hosts ?? {};
-  const names = [...Object.keys(hosts)].sort();
+  const names = [...Object.keys(hosts)].sort((a, b) => a.localeCompare(b));
   if (names.length === 0) {
     io.stdout("no hosts are configured\n");
     return 0;

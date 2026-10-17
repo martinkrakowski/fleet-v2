@@ -767,6 +767,46 @@ describe('parseInstallation v2', () => {
     expect(result.ok).toBe(true);
   });
 
+  function twoRunners(
+    a: { transport: 'local' | 'ssh'; port: number },
+    b: { transport: 'local' | 'ssh'; port: number },
+  ) {
+    const host = (t: 'local' | 'ssh', port: number, roles: string[], alias: string) => ({
+      transport: t,
+      ...(t === 'ssh' ? { sshAlias: alias } : {}),
+      worktreeRoot: '/srv/fleet/w',
+      roles,
+      runner: { kind: 'opencode', port },
+    });
+    return parseInstallation({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        orch: { transport: 'local', worktreeRoot: '/srv/fleet/o', roles: ['orchestrator'] },
+        first: host(a.transport, a.port, ['lane-runner'], 'first.example'),
+        second: host(b.transport, b.port, ['verifier'], 'second.example'),
+      },
+    });
+  }
+
+  it('refuses equal dial ports between two ssh runners and between two local runners', () => {
+    expect(twoRunners({ transport: 'ssh', port: 46000 }, { transport: 'ssh', port: 46000 })).toEqual({
+      ok: false,
+      errors: ['hosts.second.runner.port: derived dial port must be unique across hosts'],
+    });
+    expect(twoRunners({ transport: 'local', port: 46000 }, { transport: 'local', port: 46000 })).toEqual({
+      ok: false,
+      errors: ['hosts.second.runner.port: derived dial port must be unique across hosts'],
+    });
+  });
+
+  it('refuses an ssh runner on 65535: its forward port 65536 cannot be bound', () => {
+    expect(twoRunners({ transport: 'ssh', port: 65535 }, { transport: 'ssh', port: 46000 })).toEqual({
+      ok: false,
+      errors: ['hosts.first.runner.port: must leave room for the ssh forward port'],
+    });
+  });
+
   it('rejects empty or repeated host roles', () => {
     const empty = parseInstallation({
       schemaVersion: 2,

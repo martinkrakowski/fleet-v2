@@ -979,7 +979,10 @@ function parseV2Hosts(value: JsonObject, errors: string[]): Readonly<Record<stri
     // `port + 1` forward. Two equal dial ports would race for one server.
     if (host.runner !== undefined) {
       const dialPort = host.transport === 'local' ? host.runner.port : host.runner.port + 1;
-      if (dialPorts.has(dialPort)) {
+      if (dialPort > 65535) {
+        // An ssh host on 65535 would need forward port 65536, which cannot be bound.
+        errors.push(`hosts.${name}.runner.port: must leave room for the ssh forward port`);
+      } else if (dialPorts.has(dialPort)) {
         errors.push(`hosts.${name}.runner.port: derived dial port must be unique across hosts`);
       } else {
         dialPorts.set(dialPort, name);

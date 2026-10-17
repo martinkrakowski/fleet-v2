@@ -7,3 +7,5 @@ export * from './hosts/validate.js';
 export * from './hosts/probe-plan.js';
 export * from './hosts/write.js';
 export * from './hosts/write-node.js';
+export * from './init/detect.js';
+export * from './init/plan.js';

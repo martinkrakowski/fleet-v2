@@ -100,6 +100,13 @@ export function createClaimTriage(
   if (!declared || declared.acknowledgeCandidateClaimsLeaveHost !== true) {
     return undefined;
   }
+  // The root's key gate (K6): a jev block always declares an absolute
+  // `keyFile`, but a structurally mirrored block without one (or with an
+  // empty one) has no key source, so triage stays off rather than failing
+  // at call time.
+  if (typeof decisions.keyFile !== "string" || decisions.keyFile.length === 0) {
+    return undefined;
+  }
   if (stateDir === undefined || stateDir.trim().length === 0) {
     // No durable receipt store → nothing is made (invariant 5).
     return undefined;

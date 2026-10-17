@@ -14,6 +14,7 @@ import {
   AttemptOwnerDecisionAdapter,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
+  resolveExecutionRunnerHost,
   resolveInstallationForgeMode,
   resolveRoleExecutors,
   resolveRunnerCapabilityProfile,
@@ -22,6 +23,7 @@ import {
   type ActionAuthorizationDelegate,
   type BriefKnowledgeDelegate,
   type ExecutionObservationDelegate,
+  type ExecutionRunnerHost,
   type ForgeActionDelegate,
   type OwnerDecisionDelegate,
   type AttemptOwnerDecisionDelegate,
@@ -54,6 +56,13 @@ export type AttemptImplementerSeatResolver = (
 ) => Promise<ImplementerSeatResolution>;
 
 export interface WorkComposition {
+  /** The parsed installation the composition was configured with, if any. */
+  readonly installation?: FleetInstallation;
+  /**
+   * The installation's selected lane-runner host (v2 mode); undefined for
+   * a v1 or absent installation, which keeps the adapter in legacy mode.
+   */
+  readonly runnerHost?: ExecutionRunnerHost;
   registerWorkOrder: RegisterWorkOrderUseCase;
   inspectWorkOrder: InspectWorkOrderUseCase;
   inspectAttempt: InspectAttemptUseCase;
@@ -97,6 +106,15 @@ export interface ResolvedWorkRunnerSettings {
 /**
  * Resolves runner and worktree host configuration.
  * Resolution precedence: options.<x> ?? installation.<x> ?? <env read>.
+ *
+ * A v2 installation's own hosts section is the only routing source (plan
+ * section 3, "Runtime reads the selected host, never the environment"): the
+ * environment variables that redirect a legacy run (`OCM_REMOTE_PORT`,
+ * `OCM_HOST`, `FLEET_WORKTREE_SSH_HOST`, `FLEET_RUNNER_*`) are ignored, the
+ * `worktreeSshHost` override is dropped, and only the ocm-run binary path
+ * (`FLEET_OCM_RUN_BIN`) stays environmental. The selected lane-runner host is
+ * passed to the runner adapter separately through `resolveExecutionRunnerHost`.
+ * A v1 or absent installation keeps today's behaviour byte-for-byte.
  */
 export function resolveWorkRunnerSettings(
   options?: WorkCompositionOptions,
@@ -104,6 +122,14 @@ export function resolveWorkRunnerSettings(
   env: Record<string, string | undefined> = process.env,
 ): ResolvedWorkRunnerSettings {
   const inst = options?.installation ?? installation;
+  if (inst?.schemaVersion === 2) {
+    return {
+      ocmRunBin:
+        options?.ocmRunBin ??
+        inst?.runner?.ocmRunBin ??
+        (env.FLEET_OCM_RUN_BIN?.trim() || undefined),
+    };
+  }
   const parsedPort = env.OCM_REMOTE_PORT ? Number(env.OCM_REMOTE_PORT) : Number.NaN;
   return {
     worktreeSshHost:
@@ -221,13 +247,6 @@ export function createConfiguredWorkComposition(
     runnerRemoteHost,
   } = resolveWorkRunnerSettings(options);
 
-  // One executor per role: the installation's hosts (v2) or the v1 mapping
-  // decides local versus ssh per host; the orchestrator runs where this root
-  // runs. runnerRemoteHost/ocmRunBin stay runner settings, separate from the
-  // worktree executor's host.
-  const roleExecutors = resolveRoleExecutors(options?.installation, {
-    worktreeSshHost,
-  });
   // The loader-derived model (D4) supplies the runner capability profile and
   // the forge mode (D6); a v1 installation maps onto it unchanged.
   const installationModel = options?.installation
@@ -235,6 +254,18 @@ export function createConfiguredWorkComposition(
     : undefined;
   const runnerProfile = resolveRunnerCapabilityProfile(installationModel?.hosts);
   const forgeMode = resolveInstallationForgeMode(options?.installation);
+  // The installation's selected lane-runner host (v2): its presence routes the
+  // runner from the host entry and ignores the routing environment (plan
+  // section 3). Undefined for v1 and absent installations keeps legacy mode.
+  const runnerHost = resolveExecutionRunnerHost(options?.installation);
+  // One executor per role: the installation's hosts (v2) or the v1 mapping
+  // decides local versus ssh per host; the orchestrator runs where this root
+  // runs. runnerRemoteHost/ocmRunBin stay runner settings, separate from the
+  // worktree executor's host. For v2 the worktreeSshHost override is never
+  // set (resolveWorkRunnerSettings drops it), so the hosts section decides.
+  const roleExecutors = resolveRoleExecutors(options?.installation, {
+    worktreeSshHost,
+  });
 
   const workOrderRepo = new WorkOrderRepositoryAdapter({ stateDir });
   const attemptRepo = new AttemptRepositoryAdapter({ stateDir });
@@ -248,6 +279,10 @@ export function createConfiguredWorkComposition(
     ocmRunBin,
     remotePort: runnerRemotePort,
     remoteHost: runnerRemoteHost,
+    // A v2 installation routes the runner from its selected lane-runner host;
+    // the host's presence switches the adapter to v2 mode (no env fallbacks,
+    // OCM_HOST/OCM_REMOTE_PORT/OPENCODE_AUTH_FILE set from the host alone).
+    ...(runnerHost !== undefined ? { host: runnerHost } : {}),
     executor: roleExecutors.orchestrator,
     // The capability report comes from the installation's lane-runner entry
     // with the loader-derived source (D4); the transport trims the runner
@@ -271,6 +306,8 @@ export function createConfiguredWorkComposition(
   );
 
   return {
+    installation: options?.installation,
+    ...(runnerHost !== undefined ? { runnerHost } : {}),
     registerWorkOrder: new RegisterWorkOrderUseCase({ workOrderRepo }),
     inspectWorkOrder: new InspectWorkOrderUseCase({ workOrderRepo, attemptRepo, journal }),
     inspectAttempt: new InspectAttemptUseCase({ attemptRepo }),

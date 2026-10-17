@@ -13,6 +13,8 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
+import { isValidHostName } from '@fleet/shared';
+
 import type {
   ExecutionRunnerPort,
   RunnerIsolationCapabilities,
@@ -339,12 +341,18 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     return this.options?.remoteHost ?? (process.env.OCM_HOST?.trim() || null);
   }
 
-  /** The installation host name recorded on the attempt; `null` in legacy mode. */
+  /**
+   * The installation host name recorded on the attempt; `null` in legacy mode.
+   * The name is the loader-validated host-map key, so it is validated again
+   * here against the loader's own rule: a name that fails it is refused, never
+   * recorded, and the dispatch refuses rather than guessing a route.
+   */
   configuredHostName(): string | null {
     const host = this.host();
     if (host === undefined) return null;
     const name = host.hostName.trim();
-    return name === '' ? null : name;
+    if (name === '' || !isValidHostName(name)) return null;
+    return name;
   }
 
   describeRunner(): AttemptRunnerRecord | undefined {
@@ -377,19 +385,28 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     if (host !== undefined) {
       // A v2 installation addresses exactly one host, so an incomplete host is
       // refused rather than guessed at: without a port `ocm-run` cannot dial,
-      // and without an alias an `ssh` host would be dialled on the
-      // orchestrator's own loopback. Both are silent redirects, not defaults.
+      // without an alias an `ssh` host would be dialled on the
+      // orchestrator's own loopback, and a host name that fails the loader's
+      // own host-name rule never reaches a subprocess. All three are silent
+      // redirects, not defaults.
+      const hostName = this.configuredHostName();
+      if (hostName === null) {
+        return {
+          outcome: 'refused',
+          reason: `Runner host name '${host.hostName}' is missing or not a valid installation host name; a dispatch cannot be addressed`,
+        };
+      }
       const port = this.configuredRemotePort();
       if (port === undefined) {
         return {
           outcome: 'refused',
-          reason: `Runner host '${this.configuredHostName() ?? ''}' declares no port; a dispatch cannot be addressed`,
+          reason: `Runner host '${hostName}' declares no port; a dispatch cannot be addressed`,
         };
       }
       if (host.transport === 'ssh' && this.configuredRemoteHost() === null) {
         return {
           outcome: 'refused',
-          reason: `Runner host '${this.configuredHostName() ?? ''}' is ssh but declares no ssh alias; a dispatch cannot be addressed`,
+          reason: `Runner host '${hostName}' is ssh but declares no ssh alias; a dispatch cannot be addressed`,
         };
       }
     }

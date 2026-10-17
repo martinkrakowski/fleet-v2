@@ -27,9 +27,26 @@ export interface RunDoctorOptions {
    * `UNKNOWN` line per seat and calls `seatProbe` zero times.
    */
   readonly probeSeats: boolean;
+  /**
+   * The operator environment the routing check inspects (H3b). The engine
+   * itself never reads `process.env`; the CLI root passes it. When omitted,
+   * no routing lines are reported.
+   */
+  readonly env?: Readonly<Record<string, string | undefined>>;
 }
 
 const PLATFORM_TOOLS = ['sh', 'nc', 'curl'] as const;
+
+/**
+ * The routing variables a v2 installation ignores (plan section 3, "Runtime
+ * reads the selected host, never the environment"). `FLEET_OCM_RUN_BIN` is
+ * deliberately absent: it is a binary path, not a route.
+ */
+export const ROUTING_ENV_VARS: readonly string[] = [
+  'OCM_REMOTE_PORT',
+  'OCM_HOST',
+  'FLEET_WORKTREE_SSH_HOST',
+];
 
 /** Longest detail a probe may contribute to a doctor line. */
 const MAX_DETAIL_CHARS = 200;
@@ -106,6 +123,37 @@ function line(
 /** The host string probes address: the ssh alias for ssh hosts, `local` otherwise. */
 function probeHostOf(name: string, host: HostModel): string {
   return host.transport === 'ssh' ? (host.sshAlias ?? name) : 'local';
+}
+
+/**
+ * One FAIL line per routing variable set while a v2 installation is loaded
+ * (plan section 3): the variable is named, never valued, and the detail says
+ * where the setting belongs instead. A blank value counts as unset, the same
+ * way the composition roots treat it. A v1 or absent installation keeps
+ * today's environment behaviour, so no line is reported for it.
+ */
+function routingEnvLines(
+  result: DoctorableInstallation,
+  env: Readonly<Record<string, string | undefined>> | undefined,
+): DoctorLine[] {
+  if (env === undefined || result.installation.schemaVersion !== 2) {
+    return [];
+  }
+  const lines: DoctorLine[] = [];
+  for (const name of ROUTING_ENV_VARS) {
+    const value = env[name];
+    if (value === undefined || value.trim() === '') continue;
+    lines.push(
+      line(
+        'installation',
+        name,
+        'routing-env',
+        'FAIL',
+        `${name} is set but ignored for v2; set it on the host entry`,
+      ),
+    );
+  }
+  return lines;
 }
 
 /** Installation-level lines: schema version and any accepted-and-ignored v1 fields. */
@@ -402,6 +450,9 @@ export async function* runDoctor(
   options: RunDoctorOptions,
 ): AsyncGenerator<DoctorLine> {
   for (const doctorLine of await installationLines(result)) {
+    yield doctorLine;
+  }
+  for (const doctorLine of routingEnvLines(result, options.env)) {
     yield doctorLine;
   }
   for (const doctorLine of await hostLines(result.model, probes)) {

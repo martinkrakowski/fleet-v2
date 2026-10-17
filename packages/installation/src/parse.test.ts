@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { parseInstallation } from './parse.js';
+import { isValidHostName, parseInstallation } from './parse.js';
 
 describe('parseInstallation hardening', () => {
   describe('Part A1: error text never includes key name or procedure name', () => {
@@ -418,6 +418,33 @@ describe('parseInstallation host sshAlias safety', () => {
     for (const sshAlias of ['midnight', 'deployer@midnight', 'midnight.lan']) {
       const result = parseInstallation(fileWith(sshAlias));
       expect(result.ok).toBe(true);
+    }
+  });
+});
+
+describe('isValidHostName (H3b export)', () => {
+  it('accepts the host-map keys the loader accepts', () => {
+    for (const name of [
+      'here',
+      'midnight',
+      'midnight.lan',
+      'host-1',
+      'a.b_c-d',
+    ]) {
+      expect(isValidHostName(name)).toBe(true);
+    }
+  });
+
+  it('refuses names the loader refuses as hosts keys', () => {
+    for (const name of [
+      '',
+      '../escape',
+      '-oProxyCommand=x',
+      'a..b',
+      'constructor',
+      'x'.repeat(129),
+    ]) {
+      expect(isValidHostName(name)).toBe(false);
     }
   });
 });

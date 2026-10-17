@@ -42,3 +42,5 @@ export type { DecisionCallReceipt } from './decisions/receipt.js';
 
 export { budgetAllows } from './decisions/budget.js';
 export type { BudgetInput, BudgetDecision } from './decisions/budget.js';
+
+export { isValidHostName } from './host-name.js';

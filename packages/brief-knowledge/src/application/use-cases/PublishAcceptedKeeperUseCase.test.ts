@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { KnowledgeEntryRecord } from '../../domain/knowledge-records.js';
+import type { KnowledgeEntryRecord, KnowledgeTriageFlag } from '../../domain/knowledge-records.js';
 import type { ContextSelectionProps } from '../../domain/value-objects/ContextSelection.vo.js';
 import type {
   KeeperPublicationPort,
@@ -26,6 +26,12 @@ class InMemoryKnowledgeEntryRepository implements KnowledgeEntryRepositoryPort {
     if (!projectId) return all;
     return all.filter((entry) => entry.projectId === projectId);
   }
+
+  async listEntriesBySourceAttempt(attemptId: string): Promise<readonly KnowledgeEntryRecord[]> {
+    return [...this.entries.values()].filter((entry) => entry.sourceAttemptId === attemptId);
+  }
+
+  async setTriageFlag(_entryId: string, _flag: KnowledgeTriageFlag): Promise<void> {}
 
   async saveContextSelections(_attemptId: string, _selections: readonly ContextSelectionProps[]): Promise<void> {}
 

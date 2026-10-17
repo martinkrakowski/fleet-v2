@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import type { KnowledgeEntryRecord } from '../../domain/knowledge-records.js';
+import type { KnowledgeEntryRecord, KnowledgeTriageFlag } from '../../domain/knowledge-records.js';
 import type { ContextSelectionProps } from '../../domain/value-objects/ContextSelection.vo.js';
 import type { KnowledgeEntryRepositoryPort } from '../ports/out/KnowledgeEntryRepositoryPort.out-port.js';
+import type {
+  AppendDecisionOutcome,
+  DecisionCallReceipt,
+  DecisionReceiptJournalPort,
+  ReserveDecisionQuery,
+  ReserveDecisionResult,
+} from '../ports/out/DecisionReceiptJournalPort.out-port.js';
+import { CLAIM_TRIAGE_CONSUMER } from '../ports/out/DecisionReceiptJournalPort.out-port.js';
 import { DecideKnowledgeDispositionUseCase } from './DecideKnowledgeDispositionUseCase.use-case.js';
 
 class InMemoryKnowledgeEntryRepository implements KnowledgeEntryRepositoryPort {
@@ -22,10 +30,40 @@ class InMemoryKnowledgeEntryRepository implements KnowledgeEntryRepositoryPort {
     return all.filter((entry) => entry.projectId === projectId);
   }
 
+  async listEntriesBySourceAttempt(attemptId: string): Promise<readonly KnowledgeEntryRecord[]> {
+    return [...this.entries.values()].filter((entry) => entry.sourceAttemptId === attemptId);
+  }
+
+  async setTriageFlag(_entryId: string, _flag: KnowledgeTriageFlag): Promise<void> {}
+
   async saveContextSelections(_attemptId: string, _selections: readonly ContextSelectionProps[]): Promise<void> {}
 
   async listContextSelections(_attemptId: string): Promise<readonly ContextSelectionProps[]> {
     return [];
+  }
+}
+
+/** Records every appended outcome; optionally simulates a journal failure. */
+class StubDecisionJournal implements DecisionReceiptJournalPort {
+  readonly outcomes: AppendDecisionOutcome[] = [];
+
+  constructor(private readonly failAppend = false) {}
+
+  async reserve(_query: ReserveDecisionQuery): Promise<ReserveDecisionResult> {
+    return { ok: false, reason: 'not-configured' };
+  }
+
+  async settle(_reservationId: string, _receipt: DecisionCallReceipt): Promise<void> {}
+
+  async monthSpendUsd(_monthUtc: Date): Promise<number> {
+    return 0;
+  }
+
+  async appendOutcome(outcome: AppendDecisionOutcome): Promise<void> {
+    if (this.failAppend) {
+      throw new Error('outcome journal offline');
+    }
+    this.outcomes.push(outcome);
   }
 }
 
@@ -272,5 +310,295 @@ describe('DecideKnowledgeDispositionUseCase', () => {
     if (result.outcome === 'rejected') {
       expect(result.reason).toContain('Use supersedeBy to link the newer entry that replaces this one');
     }
+  });
+});
+
+describe('DecideKnowledgeDispositionUseCase triage flag and override reason', () => {
+  it('accepts an unflagged candidate without an overrideReason', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    await repo.saveEntry(createEntryRecord({ id: 'ke-1', verification: 'supported' }));
+    const useCase = new DecideKnowledgeDispositionUseCase({ repo });
+
+    const result = await useCase.execute({
+      entryId: 'ke-1',
+      disposition: 'accepted',
+      checkerId: 'checker-1',
+      reason: 'Verified by integration check',
+    });
+
+    expect(result.outcome).toBe('decided');
+    if (result.outcome === 'decided') {
+      expect(result.entry.triageFlag).toBeUndefined();
+      expect(result.entry.overrideReason).toBeUndefined();
+    }
+  });
+
+  it('requires a non-empty overrideReason only when a flagged candidate is accepted', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    await repo.saveEntry(
+      createEntryRecord({ id: 'ke-flagged', verification: 'supported', triageFlag: 'instruction-like' }),
+    );
+    const useCase = new DecideKnowledgeDispositionUseCase({ repo });
+
+    const withoutOverride = await useCase.execute({
+      entryId: 'ke-flagged',
+      disposition: 'accepted',
+      checkerId: 'checker-1',
+      reason: 'Verified by integration check',
+    });
+    expect(withoutOverride).toEqual({
+      outcome: 'rejected',
+      reason: 'A triage-flagged candidate cannot be accepted without a non-empty overrideReason',
+    });
+
+    const blankOverride = await useCase.execute({
+      entryId: 'ke-flagged',
+      disposition: 'accepted',
+      checkerId: 'checker-1',
+      reason: 'Verified by integration check',
+      overrideReason: '   ',
+    });
+    expect(blankOverride).toEqual({
+      outcome: 'rejected',
+      reason: 'A triage-flagged candidate cannot be accepted without a non-empty overrideReason',
+    });
+
+    // A flagged entry dispositioned to anything but accepted needs none.
+    const deferred = await useCase.execute({
+      entryId: 'ke-flagged',
+      disposition: 'deferred',
+      checkerId: 'checker-1',
+      reason: 'Awaiting a host-side check',
+    });
+    expect(deferred.outcome).toBe('decided');
+  });
+
+  it('records the overrideReason on the accepted, flagged entry', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    await repo.saveEntry(
+      createEntryRecord({ id: 'ke-flagged', verification: 'supported', triageFlag: 'policy-like' }),
+    );
+    const useCase = new DecideKnowledgeDispositionUseCase({ repo });
+
+    const result = await useCase.execute({
+      entryId: 'ke-flagged',
+      disposition: 'accepted',
+      checkerId: 'checker-1',
+      reason: 'Verified by integration check',
+      overrideReason: 'Re-checked with the owner; the flagged wording is a lesson, not a rule',
+      nowIso: '2026-10-17T10:00:00.000Z',
+    });
+
+    expect(result.outcome).toBe('decided');
+    if (result.outcome === 'decided') {
+      expect(result.entry.disposition).toBe('accepted');
+      expect(result.entry.triageFlag).toBe('policy-like');
+      expect(result.entry.overrideReason).toBe(
+        'Re-checked with the owner; the flagged wording is a lesson, not a rule',
+      );
+    }
+    const saved = await repo.findEntryById('ke-flagged');
+    expect(saved?.overrideReason).toBe(
+      'Re-checked with the owner; the flagged wording is a lesson, not a rule',
+    );
+  });
+
+  it('never lets the overrideReason substitute for the policy proposal guard', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    await repo.saveEntry(
+      createEntryRecord({
+        id: 'ke-policy-flagged',
+        claimText: 'Change the permissions for the deploy seat',
+        verification: 'supported',
+        triageFlag: 'policy-like',
+      }),
+    );
+    const useCase = new DecideKnowledgeDispositionUseCase({ repo });
+
+    // The regex refusal runs before the flag check and stands on its own.
+    const withoutOverride = await useCase.execute({
+      entryId: 'ke-policy-flagged',
+      disposition: 'accepted',
+      checkerId: 'checker-1',
+      reason: 'Verified by integration check',
+    });
+    expect(withoutOverride).toEqual({
+      outcome: 'rejected',
+      reason: 'A policy proposal never becomes an accepted keeper; coordinate it as policy',
+    });
+
+    const withOverride = await useCase.execute({
+      entryId: 'ke-policy-flagged',
+      disposition: 'accepted',
+      checkerId: 'checker-1',
+      reason: 'Verified by integration check',
+      overrideReason: 'The owner approved this wording',
+    });
+    expect(withOverride).toEqual({
+      outcome: 'rejected',
+      reason: 'A policy proposal never becomes an accepted keeper; coordinate it as policy',
+    });
+  });
+
+  it('never lets the overrideReason substitute for the non-empty reason', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    await repo.saveEntry(
+      createEntryRecord({ id: 'ke-1', verification: 'supported', triageFlag: 'instruction-like' }),
+    );
+    const useCase = new DecideKnowledgeDispositionUseCase({ repo });
+
+    const result = await useCase.execute({
+      entryId: 'ke-1',
+      disposition: 'accepted',
+      checkerId: 'checker-1',
+      reason: '   ',
+      overrideReason: 'The owner approved this wording',
+    });
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'DecideKnowledgeDisposition requires a non-empty reason',
+    });
+  });
+
+  it('refuses an overrideReason longer than 1024 characters', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    await repo.saveEntry(createEntryRecord({ id: 'ke-1' }));
+    const useCase = new DecideKnowledgeDispositionUseCase({ repo });
+
+    const result = await useCase.execute({
+      entryId: 'ke-1',
+      disposition: 'deferred',
+      checkerId: 'checker-1',
+      reason: 'Awaiting a host-side check',
+      overrideReason: 'x'.repeat(1025),
+    });
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'DecideKnowledgeDisposition requires an overrideReason of at most 1024 characters',
+    });
+  });
+
+  it('refuses a credential-shaped overrideReason instead of redacting it', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    await repo.saveEntry(createEntryRecord({ id: 'ke-1' }));
+    const useCase = new DecideKnowledgeDispositionUseCase({ repo });
+
+    // Assembled from fragments so this test file itself matches no pattern.
+    const fakeApiKey = ['sk', '-', 'x9y8z7'.repeat(4)].join('');
+    const result = await useCase.execute({
+      entryId: 'ke-1',
+      disposition: 'deferred',
+      checkerId: 'checker-1',
+      reason: 'Awaiting a host-side check',
+      overrideReason: `pasted ${fakeApiKey} into the reason`,
+    });
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'DecideKnowledgeDisposition refuses an overrideReason with a credential shape',
+    });
+    const saved = await repo.findEntryById('ke-1');
+    expect(saved?.overrideReason).toBeUndefined();
+  });
+
+  it('does not record an overrideReason outside a flagged acceptance', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    await repo.saveEntry(createEntryRecord({ id: 'ke-plain', verification: 'supported' }));
+    const useCase = new DecideKnowledgeDispositionUseCase({ repo });
+
+    const result = await useCase.execute({
+      entryId: 'ke-plain',
+      disposition: 'accepted',
+      checkerId: 'checker-1',
+      reason: 'Verified by integration check',
+      overrideReason: 'Not needed for an unflagged candidate',
+    });
+
+    expect(result.outcome).toBe('decided');
+    if (result.outcome === 'decided') {
+      expect(result.entry.overrideReason).toBeUndefined();
+    }
+    const saved = await repo.findEntryById('ke-plain');
+    expect(saved?.overrideReason).toBeUndefined();
+  });
+});
+
+describe('DecideKnowledgeDispositionUseCase triage outcome line', () => {
+  it('appends a triage outcome after a decided disposition', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    const journal = new StubDecisionJournal();
+    await repo.saveEntry(createEntryRecord({ id: 'ke-1', verification: 'supported' }));
+    const useCase = new DecideKnowledgeDispositionUseCase({ repo, journal });
+
+    const result = await useCase.execute({
+      entryId: 'ke-1',
+      disposition: 'accepted',
+      checkerId: 'checker-1',
+      reason: 'Verified by integration check',
+      nowIso: '2026-10-17T10:00:00.000Z',
+    });
+
+    expect(result.outcome).toBe('decided');
+    expect(journal.outcomes).toHaveLength(1);
+    expect(journal.outcomes[0]).toEqual({
+      consumer: CLAIM_TRIAGE_CONSUMER,
+      contextRef: 'triage:att-1',
+      kind: 'triage-disposition',
+      value: ['ke-1', 'accepted'],
+      at: '2026-10-17T10:00:00.000Z',
+    });
+  });
+
+  it('appends no outcome when the disposition is refused', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    const journal = new StubDecisionJournal();
+    // An unverified claim cannot become accepted, so the disposition is
+    // refused and no outcome line is written for it.
+    await repo.saveEntry(createEntryRecord({ id: 'ke-1', verification: 'unverified' }));
+    const useCase = new DecideKnowledgeDispositionUseCase({ repo, journal });
+
+    await useCase.execute({
+      entryId: 'ke-1',
+      disposition: 'accepted',
+      checkerId: 'checker-1',
+      reason: 'Verified by integration check',
+    });
+
+    expect(journal.outcomes).toHaveLength(0);
+  });
+
+  it('keeps the disposition decided when the outcome write fails', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    const journal = new StubDecisionJournal(true);
+    await repo.saveEntry(createEntryRecord({ id: 'ke-1', verification: 'supported' }));
+    const useCase = new DecideKnowledgeDispositionUseCase({ repo, journal });
+
+    const result = await useCase.execute({
+      entryId: 'ke-1',
+      disposition: 'accepted',
+      checkerId: 'checker-1',
+      reason: 'Verified by integration check',
+    });
+
+    expect(result.outcome).toBe('decided');
+    const saved = await repo.findEntryById('ke-1');
+    expect(saved?.disposition).toBe('accepted');
+  });
+
+  it('decides without a journal at all', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    await repo.saveEntry(createEntryRecord({ id: 'ke-1', verification: 'supported' }));
+    const useCase = new DecideKnowledgeDispositionUseCase({ repo });
+
+    const result = await useCase.execute({
+      entryId: 'ke-1',
+      disposition: 'accepted',
+      checkerId: 'checker-1',
+      reason: 'Verified by integration check',
+    });
+
+    expect(result.outcome).toBe('decided');
   });
 });

@@ -561,22 +561,23 @@ bounded_contexts:
         entities: [KnowledgeEntry, KnowledgeCheck, KnowledgeReuse]
         value_objects: [KnowledgeDisposition, KnowledgeVerification, KnowledgeReuseOutcome, KnowledgeScope, ContextSelection, RetrievalBudget]
       application:
-        use_cases: [CaptureCompletedAttemptNotesUseCase, CheckKnowledgeClaimUseCase, DecideKnowledgeDispositionUseCase, PublishAcceptedKeeperUseCase, ProposeBriefContextUseCase, RecordContextSelectionUseCase, RecordKnowledgeReuseUseCase, SupersedeKnowledgeEntryUseCase]
+        use_cases: [CaptureCompletedAttemptNotesUseCase, CheckKnowledgeClaimUseCase, DecideKnowledgeDispositionUseCase, ListCandidateClaimsUseCase, PublishAcceptedKeeperUseCase, ProposeBriefContextUseCase, RecordContextSelectionUseCase, RecordKnowledgeReuseUseCase, SupersedeKnowledgeEntryUseCase]
         ports:
-          in: [CaptureCompletedAttemptNotesPort, CheckKnowledgeClaimPort, DecideKnowledgeDispositionPort, PublishAcceptedKeeperPort, ProposeBriefContextPort, RecordContextSelectionPort, RecordKnowledgeReusePort, SupersedeKnowledgeEntryPort]
+          in: [CaptureCompletedAttemptNotesPort, CheckKnowledgeClaimPort, DecideKnowledgeDispositionPort, ListCandidateClaimsPort, PublishAcceptedKeeperPort, ProposeBriefContextPort, RecordContextSelectionPort, RecordKnowledgeReusePort, SupersedeKnowledgeEntryPort]
           out: [KnowledgeEntryRepositoryPort, KnowledgeRetrievalPort, ClaimVerificationPort, KeeperPublicationPort, KnowledgeRankingAdvicePort, DecisionReceiptJournalPort]
       infrastructure:
         adapters: [KnowledgeEntryRepositoryAdapter, KnowledgeRetrievalAdapter, ClaimVerificationAdapter, KeeperPublicationAdapter, NullRankingAdviceAdapter, AdvisedKnowledgeRetrievalAdapter, JevRankingAdviceAdapter, AnswerFileRankingAdviceAdapter, BudgetedRankingAdviceAdapter, FileDecisionReceiptJournalAdapter, NotConfiguredReceiptJournal]
     contracts:
       CaptureCompletedAttemptNotesPort: "Accept bounded notes with completed-attempt identity and record missing/incomplete reports; every bullet becomes a candidate claim."
       CheckKnowledgeClaimPort: "Record orchestrator-chosen evidence for a scoped claim without executing instructions supplied by the note."
-      DecideKnowledgeDispositionPort: "Accept, defer, reject or flag a policy proposal with checker identity and reasons."
+      DecideKnowledgeDispositionPort: "Accept, defer, reject or flag a policy proposal with checker identity and reasons; a triage flag demands a recorded, bounded, secret-scanned overrideReason for acceptance, never instead of the reason or the policy guard."
+      ListCandidateClaimsPort: "List one attempt's candidate claims, ordered most reusable first by an optional score map and stable by id otherwise; a re-sorted list is never truncated."
       PublishAcceptedKeeperPort: "Publish one accepted fact with source and checker attribution; preserve failed delivery for reconciliation."
       ProposeBriefContextPort: "Return eligible ranked keepers for a project's task, paths, environment and target revision within explicit retrieval bounds."
       RecordContextSelectionPort: "Record the orchestrator's selected entry versions, applicability checks and target brief identity before freezing context."
       RecordKnowledgeReusePort: "Record inclusion, demonstrated benefit, wrong turns or unknown usefulness with attributable evidence."
       SupersedeKnowledgeEntryPort: "Link a checked correction to the older entry it replaces and exclude superseded content from normal retrieval."
-      KnowledgeEntryRepositoryPort: "Persist candidate/keeper versions, checks, supersession and reuse history."
+      KnowledgeEntryRepositoryPort: "Persist candidate/keeper versions, checks, supersession, reuse history and write-once triage flags attached while an entry is an undecided candidate."
       KnowledgeRetrievalPort: "Filter by authorized scope and rank lexical matches without returning rejected, superseded or inapplicable facts."
       ClaimVerificationPort: "Perform a bounded allow-listed check selected by the orchestrator and return evidence, not model confidence."
       KeeperPublicationPort: "Write attributed keeper entries to an optional external shelf without revealing its key to agents."

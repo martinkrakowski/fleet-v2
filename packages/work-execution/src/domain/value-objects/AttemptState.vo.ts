@@ -20,7 +20,17 @@ export type AttemptStateValue = (typeof ATTEMPT_STATES)[number];
 
 const ATTEMPT_STATE_VALUES: readonly string[] = ATTEMPT_STATES;
 
-const CAPACITY_RELEASE_STATES: readonly AttemptStateValue[] = ['ended', 'collected', 'cancelled'];
+/**
+ * The one and only list of states whose attempt releases its capacity slot.
+ * Exported from the domain so every caller (capacity accounting, and
+ * `fleet-v2 hosts remove`, which refuses a host that still holds work) reads
+ * the same set instead of a hand-written copy that can drift.
+ */
+export const CAPACITY_RELEASE_STATES: readonly AttemptStateValue[] = [
+  'ended',
+  'collected',
+  'cancelled',
+];
 
 export class AttemptState {
   private constructor(private readonly value: AttemptStateValue) {

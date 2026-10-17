@@ -1,8 +1,8 @@
 #!/bin/sh
 # Tests for bin/ocm-run. Nothing here can reach midnight or a real opencode:
 #   - a fake opencode server (python3, loopback only) listens on a random port pair;
-#   - a fake `opencode` is first on PATH;
-#   - OCM_HOST is an ssh alias that does not exist, so the tunnel branch, if it ever ran, fails.
+#   - a fake `opencode` and a fake `ssh` (records every call, never forwards) are first on PATH;
+#   - OCM_HOST is an ssh alias that does not exist, so a tunnel attempt fails at once and is recorded.
 # The FIRST checks prove those three guards and stop the file if one is missing.
 # Run it as `sh`, `dash` or `zsh tests/ocm-run.test.sh`. The script under test runs under OCM_TEST_SH
 # (default sh; dash passes too; the script is not meant to be run with zsh).
@@ -145,6 +145,16 @@ exit "${FAKE_RC:-0}"
 OC
 chmod +x "$T/bin/opencode"
 
+# A fake ssh that records every call and never forwards: the tunnel branch, if it ever ran,
+# would fail at once, and $T/ssh.log proves --check (and everything else) never even tried.
+cat > "$T/bin/ssh" <<'SSH'
+#!/bin/sh
+echo "$*" >> "$T/ssh.log"
+exit 255
+SSH
+chmod +x "$T/bin/ssh"
+: > "$T/ssh.log"
+
 # run [VAR=value ...] -- <arguments of ocm-run>: the script under test, in the fake world
 run() (
   OPENCODE_AUTH_FILE="$T/no-auth-file"
@@ -155,6 +165,7 @@ run() (
   while [ "$1" != "--" ]; do
     case "$1" in
       OCM_HOST=) unset OCM_HOST ;;
+      OCM_REMOTE_PORT=) unset OCM_REMOTE_PORT ;;
       *) export "$1" ;;
     esac
     shift
@@ -175,6 +186,7 @@ runbg() {
     while [ "$1" != "--" ]; do
       case "$1" in
         OCM_HOST=) unset OCM_HOST ;;
+        OCM_REMOTE_PORT=) unset OCM_REMOTE_PORT ;;
         *) export "$1" ;;
       esac
       shift
@@ -184,7 +196,7 @@ runbg() {
   ) &
 }
 busy() { printf '%s\n%s\n' "${3:-busy}" "$2" > "$T/sessions/$1"; }
-clear_all() { rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/auth-required"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; }
+clear_all() { rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/auth-required"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; }
 
 # --- 0. the guards
 check "guard: the server on the test port is the fake" '[ "$(curl -s -m 3 http://127.0.0.1:$P/__who)" = fake-opencode-server ]'
@@ -209,12 +221,57 @@ clear_all; : > "$T/locked-once"
 run -- --dir "$D" "p" > /dev/null 2> "$T/err"; rc=$?
 check "an early 'database is locked' is retried once" '[ "$rc" = 0 ] && [ "$(wc -l < "$T/args.log" | tr -d " ")" = 2 ] && grep -q "retrying once" "$T/err"'
 
-# --- 1b. OCM_HOST: no default host, environment override
+# --- 1b. the dial port: an ssh host is dialled at remote + 1, a local host at the remote port itself
 clear_all
-out=$(run OCM_HOST= -- --check 2>&1); rc=$?
-check "OCM_HOST: has no product default (no host name is a product constant)" '[ "$rc" = 0 ] && ! echo "$out" | grep -q " via "'
+out=$(run -- --check 2>&1); rc=$?
+check "OCM_HOST set: the dial port is remote + 1 (the ok line names 127.0.0.1:<remote + 1>)" '[ "$rc" = 0 ] && echo "$out" | grep -q "http://127.0.0.1:$P via "'
+check "OCM_HOST set: --check ran no ssh while the dial port was listening" '[ ! -s "$T/ssh.log" ]'
 out=$(run OCM_HOST=custom-host -- --check 2>&1); rc=$?
 check "OCM_HOST: uses environment override when set" '[ "$rc" = 0 ] && echo "$out" | grep -q " via custom-host, remote port "'
+out=$(run OCM_HOST= -- --check 2>&1); rc=$?
+check "OCM_HOST empty and nothing on the remote port: --check reports it, exit 1, no ssh" '[ "$rc" = 1 ] && echo "$out" | grep -q "nothing is listening on the dial port 127.0.0.1:$R" && [ ! -s "$T/ssh.log" ]'
+
+out=$(run OCM_REMOTE_PORT= -- --check 2>&1); rc=$?
+check "no OCM_REMOTE_PORT (unset) is a usage error (2): the 4096 default is gone" '[ "$rc" = 2 ] && echo "$out" | grep -q "OCM_REMOTE_PORT"'
+out=$(run OCM_REMOTE_PORT= -- --dir "$D" "p" 2>&1); rc=$?
+check "no OCM_REMOTE_PORT: a real dispatch is refused too (2)" '[ "$rc" = 2 ] && [ ! -s "$T/args.log" ]'
+out=$(run OCM_REMOTE_PORT=40x96 -- --check 2>&1); rc=$?
+check "a non-numeric OCM_REMOTE_PORT is refused (2)" '[ "$rc" = 2 ]'
+out=$(run OCM_REMOTE_PORT=70000 -- --check 2>&1); rc=$?
+check "an OCM_REMOTE_PORT above 65535 is refused (2)" '[ "$rc" = 2 ]'
+out=$(run OCM_REMOTE_PORT=65535 -- --check 2>&1); rc=$?
+check "65535 with OCM_HOST set is refused (2): no room for the forward" '[ "$rc" = 2 ] && echo "$out" | grep -q "no room for the forward"'
+
+# A second free pair: nothing listens on Q or Q + 1.
+Q=''
+for try in 1 2 3 4 5 6 7 8; do
+  c=$(( ( $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 20000 ) + 41000 ))
+  nc -z 127.0.0.1 "$c" 2>/dev/null && continue
+  nc -z 127.0.0.1 "$((c + 1))" 2>/dev/null && continue
+  Q=$c; break
+done
+[ -n "$Q" ] || { echo "no second free port pair"; exit 1; }
+clear_all
+out=$(run OCM_REMOTE_PORT=$Q -- --check 2>&1); rc=$?
+check "--check with nothing on the dial port is exit 1, never a forward" '[ "$rc" = 1 ] && echo "$out" | grep -q "nothing is listening on the dial port" && [ ! -s "$T/ssh.log" ]'
+out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
+check "a real dispatch with nothing on the dial port opens the forward (and fails: the ssh is fake)" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel"'
+check "the forward rule is unchanged: local Q + 1 forwards to the remote Q" 'grep -q -- "-L 127.0.0.1:$((Q + 1)):127.0.0.1:$Q ocm-test-host-that-does-not-exist" "$T/ssh.log"'
+
+# The local host needs its listener on the remote port itself: a second fake server on $R.
+clear_all
+python3 "$T/server.py" "$T" "$R" &
+SRV2=$!
+echo "$SRV2" >> "$T/pids"
+i=0; while ! nc -z 127.0.0.1 "$R" 2>/dev/null; do i=$((i + 1)); [ "$i" -gt 50 ] && { echo "the second fake server did not start"; exit 1; }; sleep 0.1; done
+out=$(run OCM_HOST= -- --check 2>&1); rc=$?
+check "OCM_HOST empty: --check dials the remote port directly (ok, no via, no ssh)" '[ "$rc" = 0 ] && echo "$out" | grep -q "http://127.0.0.1:$R," && ! echo "$out" | grep -q " via " && [ ! -s "$T/ssh.log" ]'
+run OCM_HOST= -- --dir "$D" --agent lane "hello local" > /dev/null 2>&1; rc=$?
+check "OCM_HOST empty: a run dispatches to 127.0.0.1:<remote> directly" '[ "$rc" = 0 ] && grep -q "^run --attach http://127.0.0.1:$R --dir $D --agent lane hello local$" "$T/args.log"'
+check "OCM_HOST empty: a run never touches ssh" '[ ! -s "$T/ssh.log" ]'
+out=$(run OCM_HOST= OCM_REMOTE_PORT=65535 -- --check 2>&1); rc=$?
+check "65535 with OCM_HOST empty is a legal dial port (exit 1 only because nothing listens there)" '[ "$rc" = 1 ] && echo "$out" | grep -q "127.0.0.1:65535" && [ ! -s "$T/ssh.log" ]'
+kill "$SRV2" 2>/dev/null
 
 # --- 2. our own flags never reach opencode
 clear_all

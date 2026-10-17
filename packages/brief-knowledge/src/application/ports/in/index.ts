@@ -3,6 +3,7 @@
 export * from "./CaptureCompletedAttemptNotesPort.in-port.js";
 export * from "./CheckKnowledgeClaimPort.in-port.js";
 export * from "./DecideKnowledgeDispositionPort.in-port.js";
+export * from "./ListCandidateClaimsPort.in-port.js";
 export * from "./ProposeBriefContextPort.in-port.js";
 export * from "./PublishAcceptedKeeperPort.in-port.js";
 export * from "./RecordContextSelectionPort.in-port.js";

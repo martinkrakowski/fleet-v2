@@ -852,6 +852,7 @@ describe('ExecutionRunnerAdapter', () => {
         kind: 'opencode',
         remotePort: 7777,
         host: null,
+        hostName: null,
         agent: 'opencode',
         model: 'glm-5',
         variant: 'fast',
@@ -1275,6 +1276,7 @@ describe('ExecutionRunnerAdapter', () => {
         kind: 'opencode',
         remotePort: 4166,
         host: 'midnight.lan',
+        hostName: null,
         agent: null,
         model: 'glm-5',
         variant: null,
@@ -1296,12 +1298,12 @@ describe('ExecutionRunnerAdapter', () => {
   it('rejects --attach from the caller with exit 2', async () => {
     await expect(
       execFileAsync(repoRootBin, ['--attach=bad'], {
-        env: { ...process.env, OCM_PORT: '' },
+        env: { ...process.env, OCM_REMOTE_PORT: '65431', OCM_PORT: '' },
       }),
     ).rejects.toMatchObject({ code: 2, stderr: expect.stringContaining('do not pass --attach') });
   });
 
-  it('refuses --check on an unused port without OCM_HOST with exit 2', async () => {
+  it('reports --check on an unused port without OCM_HOST with exit 1 and opens no forward', async () => {
     await expect(
       execFileAsync(repoRootBin, ['--check'], {
         env: {
@@ -1312,7 +1314,7 @@ describe('ExecutionRunnerAdapter', () => {
         },
       }),
     ).rejects.toMatchObject({
-      code: 2,
+      code: 1,
       stderr: expect.stringContaining('OCM_HOST is not set'),
     });
   });

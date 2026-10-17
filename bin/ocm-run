@@ -7,7 +7,7 @@
 #   ocm-run --wait   --dir <path>   # 0: nothing runs there (read twice); 75: GAVE UP after OCM_WAIT_MAX,
 #                                   #    a session still runs; 1: the status could not be read
 #   ocm-run --abort  --dir <path>   # stops every session running there; 0 once nothing runs
-#   ocm-run --check                 # exit 0 iff the dispatch path works. Runs nothing.
+#   ocm-run --check                 # exit 0 iff the dispatch path works. Runs nothing, opens no forward.
 #   ocm-run --help | -h             # print usage and exit 0
 #
 # THE SESSION LIVES ON THE SERVER, NOT IN THIS PROCESS.
@@ -20,8 +20,11 @@
 #      --wait says "nothing runs" only after TWO status reads in a row, OCM_WAIT_CONFIRM seconds
 #      apart, both answered by the server and both listing nothing; a read that fails ends it with 1.
 #
-# Env: OCM_REMOTE_PORT (default 4096), OCM_HOST (ssh host/alias when tunnel is not already listening).
-#      The local port is always remote + 1; an OCM_PORT that differs is refused.
+# Env: OCM_REMOTE_PORT (required; there is no default any more, a missing one is a usage error),
+#      OCM_HOST (ssh host/alias when the tunnel is not already listening; empty or unset means the
+#      local host, dialled directly at the remote port with no tunnel). The dial port is the remote
+#      port for a local host and remote + 1 for an ssh host, so 65535 with OCM_HOST set has no room
+#      for the forward. An OCM_PORT that differs from the dial port is refused.
 #      OCM_ALLOW_BUSY=1; OCM_WAIT_INTERVAL (seconds between looks, default 15);
 #      OCM_WAIT_MAX (seconds before --wait gives up with 75, default 1500);
 #      OCM_WAIT_CONFIRM (seconds before the second read that confirms "nothing runs", default 5).
@@ -58,11 +61,33 @@ if [ -n "${OPENCODE_SERVER_PASSWORD:-}" ]; then
   export OPENCODE_SERVER_USERNAME OPENCODE_SERVER_PASSWORD OPENCODE_PASSWORD
 fi
 
-remote="${OCM_REMOTE_PORT:-4096}"
-port="${OCM_PORT:-$((remote + 1))}"
+if [ -z "${OCM_REMOTE_PORT:-}" ]; then
+  echo "ocm-run: OCM_REMOTE_PORT is not set; there is no default port. Set it to the port the opencode server listens on (a local host is dialled there directly, an ssh host at that port + 1)." >&2
+  exit 2
+fi
+remote=$OCM_REMOTE_PORT
+case "$remote" in
+  '' | *[!0-9]* | 0?* | ??????*)
+    echo "ocm-run: OCM_REMOTE_PORT=$remote is not a port number (1 to 65535)" >&2
+    exit 2
+    ;;
+esac
+if [ "$remote" -lt 1 ] || [ "$remote" -gt 65535 ]; then
+  echo "ocm-run: OCM_REMOTE_PORT=$remote is not a port number (1 to 65535)" >&2
+  exit 2
+fi
 host="${OCM_HOST:-}"
-if [ "$port" != "$((remote + 1))" ]; then
-  echo "ocm-run: OCM_PORT=$port does not match OCM_REMOTE_PORT=$remote (expected $((remote + 1))); unset OCM_PORT" >&2
+if [ -n "$host" ]; then
+  if [ "$remote" -eq 65535 ]; then
+    echo "ocm-run: OCM_REMOTE_PORT=65535 with OCM_HOST set leaves no room for the forward on $((remote + 1)); use a port below 65535" >&2
+    exit 2
+  fi
+  port=$((remote + 1))
+else
+  port=$remote
+fi
+if [ -n "${OCM_PORT:-}" ] && [ "$OCM_PORT" != "$port" ]; then
+  echo "ocm-run: OCM_PORT=$OCM_PORT does not match the dial port $port for OCM_REMOTE_PORT=$remote${host:+ on $host}; unset OCM_PORT" >&2
   exit 2
 fi
 url="http://127.0.0.1:$port"
@@ -147,6 +172,14 @@ if [ "$has_variant" = 1 ]; then
 fi
 
 if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
+  if [ "$mode" = check ]; then
+    if [ -n "$host" ]; then
+      echo "ocm-run: --check: nothing is listening on the dial port 127.0.0.1:$port (OCM_REMOTE_PORT=$remote on $host); --check opens no forward, a real dispatch would" >&2
+    else
+      echo "ocm-run: --check: nothing is listening on the dial port 127.0.0.1:$port (OCM_REMOTE_PORT=$remote) and OCM_HOST is not set; start the server on this host, a real dispatch opens no forward and exits 2" >&2
+    fi
+    exit 1
+  fi
   if [ -z "$host" ]; then
     echo "ocm-run: server not listening on 127.0.0.1:$port and OCM_HOST is not set" >&2
     exit 2

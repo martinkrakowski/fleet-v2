@@ -18,22 +18,22 @@
  * sees a half-written installation file.
  */
 
-import { createHash, randomBytes } from 'node:crypto';
-import { open, readFile, rename, rm } from 'node:fs/promises';
+import { createHash, randomBytes } from "node:crypto";
+import { open, readFile, rename, rm } from "node:fs/promises";
 
 import {
   isFleetInstallationV2,
   parseInstallation,
   writeInstallationV2,
-} from '@fleet/installation';
+} from "@fleet/installation";
 
-import type { HostDraftCandidate } from './draft.js';
-import { readHashOf } from './write.js';
-import type { ExpectedFileHash, InstallationFileRead } from './write.js';
+import type { HostDraftCandidate } from "./draft.js";
+import { readHashOf } from "./write.js";
+import type { ExpectedFileHash, InstallationFileRead } from "./write.js";
 
 /** sha256 of the bytes about to be written, lowercase hex. */
 export function sha256Of(content: string | Uint8Array): string {
-  return createHash('sha256').update(content).digest('hex');
+  return createHash("sha256").update(content).digest("hex");
 }
 
 /**
@@ -49,19 +49,19 @@ export async function readInstallationFile(
     bytes = await readFile(file);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') {
-      return { status: 'absent' };
+    if (code === "ENOENT") {
+      return { status: "absent" };
     }
-    return { status: 'unreadable', reason: code ?? 'unknown' };
+    return { status: "unreadable", reason: code ?? "unknown" };
   }
-  const text = bytes.toString('utf8');
+  const text = bytes.toString("utf8");
   let value: unknown;
   try {
     value = JSON.parse(text);
   } catch {
     value = undefined;
   }
-  return { status: 'read', hash: sha256Of(bytes), text, value };
+  return { status: "read", hash: sha256Of(bytes), text, value };
 }
 
 /** One compare-and-swap write: the candidate, the file, the expected hash. */
@@ -79,18 +79,19 @@ export interface WriteInstallationRequest {
 /** The outcome of a compare-and-swap write. */
 export type WriteInstallationResult =
   | {
-      readonly status: 'written';
+      readonly status: "written";
       readonly file: string;
       /** The sha256 of the bytes now on disk. */
       readonly hash: string;
     }
   | {
-      readonly status: 'refused';
+      readonly status: "refused";
       readonly file: string;
       /** The hash the file holds now, so a caller can reload and re-confirm. */
-      readonly currentHash: ExpectedFileHash;
+      /** `unknown` when the refusal came before the file could be read (a held lock, a lock that could not be taken). */
+      readonly currentHash: ExpectedFileHash | "unknown";
       readonly reason:
-        'changed' | 'invalid' | 'unreadable' | 'locked' | 'write-failed';
+        "changed" | "invalid" | "unreadable" | "locked" | "write-failed";
       readonly errors: readonly string[];
     };
 
@@ -112,49 +113,55 @@ export async function writeInstallation(
 ): Promise<WriteInstallationResult> {
   const { file, candidate, expectedHash } = request;
 
+  const lockFile = `${file}.lock`;
   let lock: Awaited<ReturnType<typeof open>>;
   try {
-    lock = await open(`${file}.lock`, 'wx', 0o600);
+    lock = await open(lockFile, "wx", 0o600);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'EEXIST') {
+    if (code === "EEXIST") {
       return {
-        status: 'refused',
+        status: "refused",
         file,
-        currentHash: 'absent',
-        reason: 'locked',
-        errors: [
-          `${file}: another write holds the lock; nothing was read or changed`,
-        ],
+        currentHash: "unknown",
+        reason: "locked",
+        errors: [await describeHeldLock(lockFile)],
       };
     }
     return {
-      status: 'refused',
+      status: "refused",
       file,
-      currentHash: 'absent',
-      reason: 'write-failed',
+      currentHash: "unknown",
+      reason: "write-failed",
       errors: [`${file}: could not be locked (${(error as Error).message})`],
     };
+  }
+  try {
+    // Who holds it and since when, so a lock left by a crashed writer can be
+    // told apart from a live one and removed by the operator.
+    await lock.writeFile(`${process.pid} ${new Date().toISOString()}\n`);
+  } catch {
+    // The lock is held either way; the owner line only improves the message.
   }
 
   try {
     const current = await readInstallationFile(file);
-    if (current.status === 'unreadable') {
+    if (current.status === "unreadable") {
       return {
-        status: 'refused',
+        status: "refused",
         file,
-        currentHash: 'absent',
-        reason: 'unreadable',
+        currentHash: "absent",
+        reason: "unreadable",
         errors: [`${file}: unreadable`],
       };
     }
     const currentHash = readHashOf(current);
     if (currentHash !== expectedHash) {
       return {
-        status: 'refused',
+        status: "refused",
         file,
         currentHash,
-        reason: 'changed',
+        reason: "changed",
         errors: [
           `${file}: changed on disk since it was read (expected ${expectedHash}, found ${currentHash}); reload and confirm again`,
         ],
@@ -166,29 +173,29 @@ export async function writeInstallation(
     const parsed = parseInstallation(candidate);
     if (!parsed.ok) {
       return {
-        status: 'refused',
+        status: "refused",
         file,
         currentHash,
-        reason: 'invalid',
+        reason: "invalid",
         errors: parsed.errors,
       };
     }
     if (!isFleetInstallationV2(parsed.installation)) {
       return {
-        status: 'refused',
+        status: "refused",
         file,
         currentHash,
-        reason: 'invalid',
-        errors: ['installation: the candidate is not a schema version 2 file'],
+        reason: "invalid",
+        errors: ["installation: the candidate is not a schema version 2 file"],
       };
     }
 
     // Already loader-accepted and narrowed to v2 above, so these are the exact
     // bytes the file will hold and the hash the caller gets back.
-    const bytes = Buffer.from(writeInstallationV2(parsed.installation), 'utf8');
-    const temporary = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+    const bytes = Buffer.from(writeInstallationV2(parsed.installation), "utf8");
+    const temporary = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
     try {
-      const handle = await open(temporary, 'wx', 0o600);
+      const handle = await open(temporary, "wx", 0o600);
       try {
         await handle.writeFile(bytes);
         await handle.sync();
@@ -199,16 +206,51 @@ export async function writeInstallation(
     } catch (error) {
       await rm(temporary, { force: true }).catch(() => undefined);
       return {
-        status: 'refused',
+        status: "refused",
         file,
         currentHash,
-        reason: 'write-failed',
+        reason: "write-failed",
         errors: [`${file}: could not be written (${(error as Error).message})`],
       };
     }
-    return { status: 'written', file, hash: sha256Of(bytes) };
+    return { status: "written", file, hash: sha256Of(bytes) };
   } finally {
-    await lock.close();
-    await rm(`${file}.lock`, { force: true }).catch(() => undefined);
+    // Remove the lock first, so a failing close can never leave it behind.
+    await rm(lockFile, { force: true }).catch(() => undefined);
+    await lock.close().catch(() => undefined);
+  }
+}
+
+/**
+ * The refusal text for a lock another writer holds. A holder whose process no
+ * longer exists on this host is named as a stale lock with the exact path to
+ * remove; the lock is never removed automatically.
+ */
+async function describeHeldLock(lockFile: string): Promise<string> {
+  let owner = "";
+  try {
+    owner = (await readFile(lockFile, "utf8")).trim();
+  } catch {
+    // Unreadable or already gone: describe it without an owner.
+  }
+  const [pidText, since] = owner.split(" ");
+  const pid = Number(pidText);
+  const holder =
+    Number.isInteger(pid) && pid > 0
+      ? `pid ${pid}${since ? ` since ${since}` : ""}`
+      : "an unknown writer";
+  if (Number.isInteger(pid) && pid > 0 && !isProcessAlive(pid)) {
+    return `${lockFile}: stale lock held by ${holder}, which is no longer running; if no fleet write is in progress, remove ${lockFile} and retry. Nothing was read or changed.`;
+  }
+  return `${lockFile}: held by ${holder}; another write is in progress. If no fleet write is running, remove ${lockFile} and retry. Nothing was read or changed.`;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: the process exists but belongs to another user.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }

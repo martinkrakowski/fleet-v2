@@ -98,7 +98,7 @@ function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
       collectedArtifactPaths: [],
       notes: 'present',
     },
-    runner: { remotePort: 4166, host: null, agent: null, model: SEAT_MODEL, variant: null },
+    runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: SEAT_MODEL, variant: null },
     createdAtIso: FIXED_NOW,
     updatedAtIso: FIXED_NOW,
     ...overrides,
@@ -546,6 +546,7 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       attemptRepo: new InMemoryAttemptRepository([
         makeAttempt({
           runner: {
+            kind: 'opencode',
             remotePort: 4166,
             host: null,
             agent: null,

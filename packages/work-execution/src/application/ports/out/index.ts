@@ -14,5 +14,6 @@ export * from "./ExecutionObservationPort.out-port.js";
 export * from "./ExecutionRunnerPort.out-port.js";
 export * from "./ForgeActionPort.out-port.js";
 export * from "./OwnerDecisionPort.out-port.js";
+export * from "./RunnerSelectorPort.out-port.js";
 export * from "./WorkOrderRepositoryPort.out-port.js";
 export * from "./WorkspacePort.out-port.js";

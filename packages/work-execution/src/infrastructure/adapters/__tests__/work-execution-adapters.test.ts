@@ -9,6 +9,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import type {
   ActionJournalEntryRecord,
   AttemptRecord,
+  AttemptRunnerRecord,
   CapacityReservationRecord,
   CommandCompletionReceipt,
   WorkOrderRecord,
@@ -848,6 +849,7 @@ describe('ExecutionRunnerAdapter', () => {
       outcome: 'started',
       sessionId: 'ses_lower',
       runner: {
+        kind: 'opencode',
         remotePort: 7777,
         host: null,
         agent: 'opencode',
@@ -977,7 +979,8 @@ describe('ExecutionRunnerAdapter', () => {
   });
 
   it('treats idle and nothing-running status text as ended', async () => {
-    const runnerRecord = {
+    const runnerRecord: AttemptRunnerRecord = {
+      kind: 'opencode',
       remotePort: 4166,
       host: null,
       agent: null,
@@ -1020,14 +1023,15 @@ describe('ExecutionRunnerAdapter', () => {
     const status = await adapter.inspectSession({
       attemptId: 'att-9',
       sessionId: 'ses_orphan',
-      runner: { remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
     });
     expect(status.runnerReachable).toBe('unknown');
     expect(calls).toHaveLength(0);
   });
 
   it('reports unknown when the status command fails or exits non-zero', async () => {
-    const runnerRecord = {
+    const runnerRecord: AttemptRunnerRecord = {
+      kind: 'opencode',
       remotePort: 4166,
       host: null,
       agent: null,
@@ -1075,7 +1079,7 @@ describe('ExecutionRunnerAdapter', () => {
       sessionId: 'ses_a',
       worktreePath: runnerWorktreePath,
       gracePeriodSeconds: 30,
-      runner: { remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
     });
     expect(result.outcome).toBe('terminated');
     if (result.outcome !== 'terminated') return;
@@ -1099,7 +1103,7 @@ describe('ExecutionRunnerAdapter', () => {
       sessionId: 'ses_a',
       worktreePath: runnerWorktreePath,
       gracePeriodSeconds: 30,
-      runner: { remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
     });
     expect(still).toEqual({ outcome: 'still-running', reason: 'still running' });
 
@@ -1112,7 +1116,7 @@ describe('ExecutionRunnerAdapter', () => {
       sessionId: 'ses_a',
       worktreePath: runnerWorktreePath,
       gracePeriodSeconds: 30,
-      runner: { remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
     });
     expect(thrown.outcome).toBe('unknown');
     if (thrown.outcome === 'unknown') {
@@ -1162,7 +1166,7 @@ describe('ExecutionRunnerAdapter', () => {
       attemptId: 'att-1',
       sessionId: 'ses_abc',
       worktreePath: runnerWorktreePath,
-      runner: { remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
     });
     expect(status).toEqual({
       runnerReachable: 'reachable',
@@ -1186,7 +1190,7 @@ describe('ExecutionRunnerAdapter', () => {
       attemptId: 'att-1',
       sessionId: 'ses_a',
       worktreePath: '/path',
-      runner: { remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
     });
     expect(status.workerCommand).toBe('ended');
     expect(status.runnerReachable).toBe('reachable');
@@ -1211,6 +1215,7 @@ describe('ExecutionRunnerAdapter', () => {
           ? ({
               ...makeAttempt({ id: 'att-1', worktreePath: recordedWorktree }),
               runner: {
+                kind: 'opencode',
                 remotePort: 4166,
                 host: null,
                 agent: null,
@@ -1247,7 +1252,7 @@ describe('ExecutionRunnerAdapter', () => {
     const status = await adapter.inspectSession({
       attemptId: 'att-missing',
       sessionId: 'ses_orphan',
-      runner: { remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
     });
     expect(status.runnerReachable).toBe('unknown');
     expect(calls).toHaveLength(0);
@@ -1267,6 +1272,7 @@ describe('ExecutionRunnerAdapter', () => {
       outcome: 'started',
       sessionId: 'ses_hosted',
       runner: {
+        kind: 'opencode',
         remotePort: 4166,
         host: 'midnight.lan',
         agent: null,

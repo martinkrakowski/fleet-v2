@@ -16,6 +16,7 @@ export * from "./file-store.js";
 export * from "./ForgeActionAdapter.adapter.js";
 export * from "./LocalExecutor.adapter.js";
 export * from "./OwnerDecisionAdapter.adapter.js";
+export * from "./RunnerSelectorAdapter.adapter.js";
 export * from "./spawn-run.js";
 export * from "./SshExecutor.adapter.js";
 export * from "./WorkOrderRepositoryAdapter.adapter.js";

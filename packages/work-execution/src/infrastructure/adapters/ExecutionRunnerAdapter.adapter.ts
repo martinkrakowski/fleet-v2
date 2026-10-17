@@ -290,6 +290,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     const port = this.configuredRemotePort();
     if (port === undefined) return undefined;
     return {
+      kind: 'opencode',
       remotePort: port,
       host: this.configuredRemoteHost(),
       agent: null,
@@ -357,6 +358,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
           runner:
             port !== undefined
               ? {
+                  kind: 'opencode',
                   remotePort: port,
                   host: this.configuredRemoteHost(),
                   agent: agent ?? null,
@@ -387,7 +389,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     }
 
     // Refuse when attempt has no recorded port (old records without it read as unknown)
-    if (!recordedRunner || recordedRunner.remotePort === undefined || recordedRunner.remotePort === null) {
+    if (!recordedRunner || recordedRunner.remotePort === null) {
       return {
         runnerReachable: 'unknown',
         workspacePreparation: 'unprepared',
@@ -581,7 +583,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     }
 
     // Refuse when attempt has no recorded port (legacy records without runner)
-    if (!recordedRunner || recordedRunner.remotePort === undefined || recordedRunner.remotePort === null) {
+    if (!recordedRunner || recordedRunner.remotePort === null) {
       return { outcome: 'refused', reason: 'Attempt has no recorded runner port' };
     }
 

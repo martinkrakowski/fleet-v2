@@ -415,15 +415,7 @@ export function readGitHeadOverSsh(worktreePath: string, sshHost: string): Promi
 
 /** Read HEAD locally (the worktree lives on this host). */
 export function readGitHeadLocally(worktreePath: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile('git', ['-C', worktreePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }, (error, stdout) => {
-      if (error === null) {
-        resolve(String(stdout).trim());
-        return;
-      }
-      reject(error);
-    });
-  });
+  return runGitCommand(['-C', worktreePath, 'rev-parse', 'HEAD']);
 }
 
 /** How a HEAD read reaches the worktree: over an ssh alias, or locally. */
@@ -445,7 +437,8 @@ export function headRouteForExecutor(executor: CommandExecutorPort): RecordedHea
 }
 
 /** Run one local git command, resolving with stdout or rejecting on failure. */
-function runGitCommand(args: readonly string[]): Promise<string> {  return new Promise((resolve, reject) => {
+function runGitCommand(args: readonly string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
     execFile('git', [...args], { encoding: 'utf8' }, (error, stdout) => {
       if (error === null) {
         resolve(String(stdout).trim());

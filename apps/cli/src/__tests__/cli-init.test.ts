@@ -381,7 +381,9 @@ describe("fleet-v2 init", () => {
       directory,
     );
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("credential checklist (nothing is created)");
+    expect(result.stdout).toContain(
+      "credential checklist (nothing is created)",
+    );
     // The checklist names the authFile in a quoted chmod command…
     expect(result.stdout).toContain(`chmod 600 '${authFile}'`);
     // …and nothing created it.

@@ -178,9 +178,7 @@ const HOST_DRAFT_KEYS: ReadonlySet<string> = new Set([
  * `worktreeRoot`, and no key outside the draft shape. Any problem is a
  * usage error, never a cast past it.
  */
-function hostDraftShapeError(
-  drafts: readonly unknown[],
-): string | undefined {
+function hostDraftShapeError(drafts: readonly unknown[]): string | undefined {
   const expected = `expected keys: ${[...HOST_DRAFT_KEYS].join(", ")}`;
   for (const [index, draft] of drafts.entries()) {
     if (typeof draft !== "object" || draft === null || Array.isArray(draft)) {

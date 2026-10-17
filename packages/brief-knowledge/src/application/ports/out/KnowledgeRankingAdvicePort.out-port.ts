@@ -15,6 +15,12 @@ export interface RankingAdviceCandidate {
 
 export interface AdviseRankingQuery {
   readonly projectId: string;
+  /**
+   * The lane the brief is for. It names the ranking `contextRef` the receipt,
+   * its outcome and a recorded selection join on; absent scopes the reference
+   * to `unscoped`.
+   */
+  readonly laneId?: string;
   readonly taskSummary: string;
   readonly pathPrefixes: readonly string[];
   readonly candidates: readonly RankingAdviceCandidate[];
@@ -48,4 +54,15 @@ export type RankingAdvice = AdvisedRanking | UnknownRankingAdvice;
 export interface KnowledgeRankingAdvicePort {
   /** Ask for an advisory ranking of the given candidates; unknown never throws. */
   adviseRanking(req: AdviseRankingQuery): Promise<RankingAdvice>;
+}
+
+/**
+ * Exposed by the budgeted decorator: the ranking `contextRef` of the last call
+ * that settled a receipt, `null` whenever no receipt was settled (advice off,
+ * budget refused, or a settlement that could not be recorded). A caller uses
+ * it to report the reference an outcome joins on; it is `null` until an
+ * advised call completes.
+ */
+export interface RankingContextRefCarrier {
+  readonly lastContextRef?: string | null;
 }

@@ -13,7 +13,10 @@ import type {
   ProposeBriefContextRequest,
   ProposeBriefContextResult,
 } from '../ports/in/ProposeBriefContextPort.in-port.js';
-import type { KnowledgeRetrievalPort } from '../ports/out/KnowledgeRetrievalPort.out-port.js';
+import type {
+  KnowledgeRetrievalPort,
+  RankingContextRefReporter,
+} from '../ports/out/KnowledgeRetrievalPort.out-port.js';
 import type { KnowledgeEntryRepositoryPort } from '../ports/out/KnowledgeEntryRepositoryPort.out-port.js';
 
 const DEFAULT_MAX_ENTRIES = 5;
@@ -21,7 +24,11 @@ const DEFAULT_MAX_TOTAL_CHARS = 4000;
 
 export interface ProposeBriefContextDependencies {
   readonly repo: KnowledgeEntryRepositoryPort;
-  readonly retrieval: KnowledgeRetrievalPort;
+  /**
+   * Retrieval is the advised decorator when decisions are enabled; a plain
+   * retrieval port simply reports no ranking `contextRef`.
+   */
+  readonly retrieval: KnowledgeRetrievalPort & RankingContextRefReporter;
 }
 
 export class ProposeBriefContextUseCase implements ProposeBriefContextPort {
@@ -88,6 +95,7 @@ export class ProposeBriefContextUseCase implements ProposeBriefContextPort {
 
     const ranked = await retrieval.rankEligibleKeepers({
       projectId: request.projectId,
+      laneId: request.laneId,
       taskSummary: request.taskSummary,
       pathPrefixes: request.pathPrefixes ?? [],
       maxEntries,
@@ -103,7 +111,16 @@ export class ProposeBriefContextUseCase implements ProposeBriefContextPort {
       proposedBecause: match.matchReason,
     }));
 
-    return { outcome: 'proposed', proposals };
+    // Reported only when a decision call settled a receipt: with advice off
+    // the result is byte-for-byte what it was before the decision kernel.
+    const rankingContextRef = retrieval.lastRankingContextRef;
+    return {
+      outcome: 'proposed',
+      proposals,
+      ...(typeof rankingContextRef === 'string' && rankingContextRef.length > 0
+        ? { rankingContextRef }
+        : {}),
+    };
   }
 }
 

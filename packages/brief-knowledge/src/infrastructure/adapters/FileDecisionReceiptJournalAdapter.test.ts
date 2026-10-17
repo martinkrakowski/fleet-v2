@@ -1,6 +1,11 @@
 // Lane D4 (decision port plan, 2026-10-16): receipt journal file adapter and
 // budget ledger. Costs use binary-exact values (0.25, 0.5, 0.75, 1) so the
 // budget comparisons never depend on floating-point rounding.
+//
+// Lane K2 (decision-kernel plan, §3) extended the format: every line carries
+// its consumer and every settled line its contextRef, latencyMs and question
+// kinds. `rankingReceipt` builds the full envelope so each case still states
+// only the field it is about.
 
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
@@ -13,12 +18,33 @@ import {
 } from './FileDecisionReceiptJournalAdapter.adapter.js';
 import { FileLockTimeoutError } from './file-store.js';
 import { NotConfiguredReceiptJournal } from './NotConfiguredReceiptJournal.adapter.js';
+import type { RankingDecisionCallReceipt } from '../../application/ports/out/DecisionReceiptJournalPort.out-port.js';
 
 /** A reserved line's stateSha256 must be a lowercase hex SHA-256 digest. */
 const SHA_A = 'a'.repeat(64);
 const SHA_B = 'b'.repeat(64);
 const SHA_C = 'c'.repeat(64);
 const SHA_D = 'd'.repeat(64);
+
+/** A fixed contextRef in the ranking format, for cases that do not test it. */
+const CONTEXT_REF = `ranking:lane-d4:${'d'.repeat(64)}`;
+
+/** The K2 ranking envelope; each case overrides only what it is about. */
+function rankingReceipt(
+  overrides: Partial<RankingDecisionCallReceipt> = {},
+): RankingDecisionCallReceipt {
+  return {
+    consumer: 'knowledge-ranking',
+    contextRef: CONTEXT_REF,
+    provider: 'jev',
+    model: 'typesafe/jev-1.14',
+    questionKinds: ['score'],
+    latencyMs: 12,
+    lexicalOrder: ['bk-1'],
+    decidedOrder: ['bk-1'],
+    ...overrides,
+  };
+}
 
 /** chmod 0o000 cannot stop a root process from reading, so skip there. */
 const itAsNonRoot = process.getuid?.() === 0 ? it.skip : it;
@@ -27,6 +53,7 @@ const itAsNonRoot = process.getuid?.() === 0 ? it.skip : it;
 interface ReservedLine {
   kind: 'reserved';
   id: string;
+  consumer?: string;
   assumedCostUsd: number;
   stateSha256: string;
   at: string;
@@ -35,11 +62,16 @@ interface ReservedLine {
 interface SettledLine {
   kind: 'settled';
   reservationId: string;
+  consumer?: string;
+  contextRef?: string;
   provider: string;
   model: string;
   requestId?: string;
   costUsd: number;
   estimated: boolean;
+  questionKinds?: string[];
+  minConfidenceObserved?: number;
+  latencyMs?: number;
   lexicalOrder: string[];
   decidedOrder: string[];
   unknownReason?: string;
@@ -113,13 +145,7 @@ describe('FileDecisionReceiptJournalAdapter', () => {
     });
     if (!reserved.ok) throw new Error('reserve below budget must succeed');
 
-    await adapter.settle(reserved.reservationId, {
-      provider: 'jev',
-      model: 'typesafe/jev-1.14',
-      costUsd: 0.125,
-      lexicalOrder: ['bk-1', 'bk-2'],
-      decidedOrder: ['bk-2', 'bk-1'],
-    });
+    await adapter.settle(reserved.reservationId, rankingReceipt({ costUsd: 0.125 }));
     expect(await adapter.monthSpendUsd(new Date('2026-01-20T00:00:00.000Z'))).toBe(0.125);
 
     // The settled cost freed budget: 0.125 + 0.75 stays below 1 and is allowed…
@@ -142,13 +168,7 @@ describe('FileDecisionReceiptJournalAdapter', () => {
     });
     if (!reserved.ok) throw new Error('reserve below budget must succeed');
 
-    await adapter.settle(reserved.reservationId, {
-      provider: 'jev',
-      model: 'typesafe/jev-1.14',
-      lexicalOrder: ['bk-1'],
-      decidedOrder: ['bk-1'],
-      unknownReason: 'timeout',
-    });
+    await adapter.settle(reserved.reservationId, rankingReceipt({ unknownReason: 'timeout' }));
 
     const lines = await readJournalLines(tempDir, '2026-01');
     expect(lines).toHaveLength(2);
@@ -166,13 +186,7 @@ describe('FileDecisionReceiptJournalAdapter', () => {
       stateSha256: SHA_D,
     });
     if (!second.ok) throw new Error('reserve below budget must succeed');
-    await adapter.settle(second.reservationId, {
-      provider: 'jev',
-      model: 'typesafe/jev-1.14',
-      costUsd: 0.125,
-      lexicalOrder: ['bk-1'],
-      decidedOrder: ['bk-1'],
-    });
+    await adapter.settle(second.reservationId, rankingReceipt({ costUsd: 0.125 }));
     const after = await readJournalLines(tempDir, '2026-01');
     const settledSecond = after[3] as SettledLine;
     expect(settledSecond.estimated).toBe(false);
@@ -204,19 +218,8 @@ describe('FileDecisionReceiptJournalAdapter', () => {
       stateSha256: SHA_A,
     });
     if (!reservedEarlier.ok) throw new Error('reserve must succeed');
-    await lateJanuary.settle(reserved.reservationId, {
-      provider: 'jev',
-      model: 'typesafe/jev-1.14',
-      costUsd: 0.125,
-      lexicalOrder: ['bk-1'],
-      decidedOrder: ['bk-1'],
-    });
-    await beforeBoundary.settle(reservedEarlier.reservationId, {
-      provider: 'jev',
-      model: 'typesafe/jev-1.14',
-      lexicalOrder: ['bk-1'],
-      decidedOrder: ['bk-1'],
-    });
+    await lateJanuary.settle(reserved.reservationId, rankingReceipt({ costUsd: 0.125 }));
+    await beforeBoundary.settle(reservedEarlier.reservationId, rankingReceipt());
 
     const januaryPath = path.join(tempDir, 'decision-receipts', '2026-01.jsonl');
     await expect(fs.access(januaryPath)).resolves.toBeUndefined();
@@ -290,13 +293,7 @@ describe('FileDecisionReceiptJournalAdapter', () => {
       stateSha256: SHA_A,
     });
     if (!reserved.ok) throw new Error('reserve must succeed');
-    await adapter.settle(reserved.reservationId, {
-      provider: 'jev',
-      model: 'typesafe/jev-1.14',
-      costUsd: 0.125,
-      lexicalOrder: ['bk-1'],
-      decidedOrder: ['bk-1'],
-    });
+    await adapter.settle(reserved.reservationId, rankingReceipt({ costUsd: 0.125 }));
 
     const created = await fs.readdir(tempDir, { recursive: true });
     expect(created.length).toBeGreaterThan(0);
@@ -359,13 +356,7 @@ describe('FileDecisionReceiptJournalAdapter', () => {
     );
 
     await expect(
-      adapter.settle('no-such-reservation', {
-        provider: 'jev',
-        model: 'typesafe/jev-1.14',
-        costUsd: 0.125,
-        lexicalOrder: ['bk-1'],
-        decidedOrder: ['bk-1'],
-      }),
+      adapter.settle('no-such-reservation', rankingReceipt({ costUsd: 0.125 })),
     ).rejects.toThrow(/unknown reservation/);
 
     // Nothing was appended for the refused settle.
@@ -385,13 +376,7 @@ describe('FileDecisionReceiptJournalAdapter', () => {
       stateSha256: SHA_A,
     });
     if (!reserved.ok) throw new Error('reserve below budget must succeed');
-    const receipt = {
-      provider: 'jev',
-      model: 'typesafe/jev-1.14',
-      costUsd: 0.125,
-      lexicalOrder: ['bk-1'],
-      decidedOrder: ['bk-1'],
-    } as const;
+    const receipt = rankingReceipt({ costUsd: 0.125 });
     await adapter.settle(reserved.reservationId, receipt);
 
     await expect(adapter.settle(reserved.reservationId, receipt)).rejects.toThrow(
@@ -465,13 +450,7 @@ describe('FileDecisionReceiptJournalAdapter', () => {
     const corrupted = await fs.readFile(filePath, 'utf8');
 
     await expect(
-      adapter.settle(reserved.reservationId, {
-        provider: 'jev',
-        model: 'typesafe/jev-1.14',
-        costUsd: 0.125,
-        lexicalOrder: ['bk-1'],
-        decidedOrder: ['bk-1'],
-      }),
+      adapter.settle(reserved.reservationId, rankingReceipt({ costUsd: 0.125 })),
     ).rejects.toThrow(MalformedReceiptLineError);
 
     expect(await fs.readFile(filePath, 'utf8')).toBe(corrupted);
@@ -488,14 +467,12 @@ describe('FileDecisionReceiptJournalAdapter', () => {
       stateSha256: SHA_A,
     });
     if (!reserved.ok) throw new Error('reserve below budget must succeed');
-    await adapter.settle(reserved.reservationId, {
-      provider: 'jev',
-      model: 'typesafe/jev-1.14',
+    await adapter.settle(reserved.reservationId, rankingReceipt({
       requestId: 'req-1',
       costUsd: 0.125,
       lexicalOrder: ['bk-1', 'bk-2'],
       decidedOrder: ['bk-2', 'bk-1'],
-    });
+    }));
 
     const raw = await fs.readFile(
       path.join(tempDir, 'decision-receipts', '2026-01.jsonl'),
@@ -508,19 +485,24 @@ describe('FileDecisionReceiptJournalAdapter', () => {
     expect(Object.keys(reservedLine).sort()).toEqual([
       'assumedCostUsd',
       'at',
+      'consumer',
       'id',
       'kind',
       'stateSha256',
     ]);
     expect(Object.keys(settledLine).sort()).toEqual([
       'at',
+      'consumer',
+      'contextRef',
       'costUsd',
       'decidedOrder',
       'estimated',
       'kind',
+      'latencyMs',
       'lexicalOrder',
       'model',
       'provider',
+      'questionKinds',
       'requestId',
       'reservationId',
     ]);
@@ -551,12 +533,17 @@ describe('NotConfiguredReceiptJournal', () => {
     ).toEqual({ ok: false, reason: 'not-configured' });
     expect(await journal.monthSpendUsd(new Date('2026-01-15T00:00:00.000Z'))).toBe(0);
     await expect(
-      journal.settle('any', {
-        provider: 'jev',
-        model: 'typesafe/jev-1.14',
-        lexicalOrder: ['bk-1'],
-        decidedOrder: ['bk-1'],
-      }),
+      journal.settle('any', rankingReceipt()),
     ).rejects.toThrow(/not configured/);
+    // Outcomes are best effort: without a durable store one is skipped.
+    await expect(
+      journal.appendOutcome({
+        consumer: 'knowledge-ranking',
+        contextRef: CONTEXT_REF,
+        kind: 'ranking-selection',
+        value: ['bk-1'],
+        at: '2026-01-15T00:00:00.000Z',
+      }),
+    ).resolves.toBeUndefined();
   });
 });

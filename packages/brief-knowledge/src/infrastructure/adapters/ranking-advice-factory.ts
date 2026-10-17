@@ -9,7 +9,8 @@
  *    contacted (invariant 5: without a durable receipt store nothing is made);
  *  - `provider: 'jev'` → BudgetedRankingAdviceAdapter(JevRankingAdviceAdapter,
  *    FileDecisionReceiptJournalAdapter(stateDir), provider 'jev', assumed
- *    cost `assumedCostPerCallUsd`, budget `monthlyBudgetUsd`);
+ *    cost `assumedCostPerCallUsd`, budget `monthlyBudgetUsd`, sub-budget
+ *    `consumers['knowledge-ranking'].monthlyBudgetUsd` when declared);
  *  - `provider: 'answer-file'` → BudgetedRankingAdviceAdapter(
  *    AnswerFileRankingAdviceAdapter(answerFile), File journal, provider
  *    'answer-file', assumed cost 0, budget Number.MAX_SAFE_INTEGER — a
@@ -48,8 +49,40 @@ export type RankingAdviceDecisions =
       readonly assumedCostPerCallUsd: number;
       readonly acknowledgeProseLeavesHost: true;
       readonly disabledProjects?: readonly string[];
+      readonly consumers?: RankingAdviceConsumers;
     }
-  | { readonly provider: 'answer-file'; readonly answerFile: string };
+  | {
+      readonly provider: 'answer-file';
+      readonly answerFile: string;
+      readonly consumers?: RankingAdviceConsumers;
+    };
+
+/**
+ * Per-consumer settings (plan §2): an absent `monthlyBudgetUsd` means the
+ * consumer has no sub-budget clause and only the block total applies. Mirrors
+ * `DecisionConsumers` in @fleet/installation; brief-knowledge may not depend on
+ * that package.
+ */
+export interface RankingAdviceConsumers {
+  readonly 'knowledge-ranking'?: {
+    readonly minConfidence?: number;
+    readonly monthlyBudgetUsd?: number;
+  };
+}
+
+/**
+ * The ranking consumer's own sub-budget, when the installation declares one.
+ * Anything else (no map, no entry, no budget) has no clause at all.
+ */
+function rankingConsumerBudgetUsd(decisions: RankingAdviceDecisions): number | undefined {
+  if (decisions.provider === 'none') {
+    return undefined;
+  }
+  const budgetUsd = decisions.consumers?.['knowledge-ranking']?.monthlyBudgetUsd;
+  return typeof budgetUsd === 'number' && Number.isFinite(budgetUsd) && budgetUsd > 0
+    ? budgetUsd
+    : undefined;
+}
 
 export interface CreateRankingAdviceOptions {
   /** The installation's v2 `decisions` block; undefined means 'none'. */
@@ -93,12 +126,14 @@ export function createRankingAdvice(options: CreateRankingAdviceOptions): Knowle
       stateDir === undefined || stateDir.trim().length === 0
         ? new NotConfiguredReceiptJournal()
         : new FileDecisionReceiptJournalAdapter(stateDir);
+    const consumerBudgetUsd = rankingConsumerBudgetUsd(decisions);
     return new BudgetedRankingAdviceAdapter({
       inner,
       journal,
       provider: 'jev',
       assumedCostUsd: decisions.assumedCostPerCallUsd,
       monthlyBudgetUsd: decisions.monthlyBudgetUsd,
+      ...(consumerBudgetUsd === undefined ? {} : { consumerBudgetUsd }),
     });
   }
 
@@ -111,6 +146,7 @@ export function createRankingAdvice(options: CreateRankingAdviceOptions): Knowle
     stateDir === undefined || stateDir.trim().length === 0
       ? new NotConfiguredReceiptJournal()
       : new FileDecisionReceiptJournalAdapter(stateDir);
+  const consumerBudgetUsd = rankingConsumerBudgetUsd(decisions);
   return new BudgetedRankingAdviceAdapter({
     inner,
     journal,
@@ -118,5 +154,6 @@ export function createRankingAdvice(options: CreateRankingAdviceOptions): Knowle
     // A recorded answer is free: assume no cost and never exhaust a budget.
     assumedCostUsd: 0,
     monthlyBudgetUsd: Number.MAX_SAFE_INTEGER,
+    ...(consumerBudgetUsd === undefined ? {} : { consumerBudgetUsd }),
   });
 }

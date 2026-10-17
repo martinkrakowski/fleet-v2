@@ -16,6 +16,7 @@ import type {
 import type {
   KnowledgeRankingAdvicePort,
   RankingAdvice,
+  RankingContextRefCarrier,
 } from '../../application/ports/out/KnowledgeRankingAdvicePort.out-port.js';
 
 /** Weight of the decision score in the combined order key. */
@@ -25,6 +26,7 @@ export class AdvisedKnowledgeRetrievalAdapter implements KnowledgeRetrievalPort 
   private readonly inner: KnowledgeRetrievalPort;
   private readonly advice: KnowledgeRankingAdvicePort;
   private readonly weight: number;
+  private lastRankingContextRefValue: string | null = null;
 
   constructor(
     inner: KnowledgeRetrievalPort,
@@ -45,7 +47,19 @@ export class AdvisedKnowledgeRetrievalAdapter implements KnowledgeRetrievalPort 
     this.weight = weight;
   }
 
+  /**
+   * The ranking `contextRef` of the last ranking whose receipt was settled
+   * (even when the answer was unknown, so its outcome still joins), or `null`
+   * when advice was off, the budget refused or nothing could be settled.
+   */
+  get lastRankingContextRef(): string | null {
+    return this.lastRankingContextRefValue;
+  }
+
   async rankEligibleKeepers(query: RankKeepersQuery): Promise<readonly RankedKeeperMatch[]> {
+    // Every ranking starts from a clean slate: a later unadvised call must not
+    // report the previous call's reference.
+    this.lastRankingContextRefValue = null;
     // 1. The inner port is called with the original query.
     const innerResult = await this.inner.rankEligibleKeepers(query);
 
@@ -58,6 +72,7 @@ export class AdvisedKnowledgeRetrievalAdapter implements KnowledgeRetrievalPort 
     try {
       advice = await this.advice.adviseRanking({
         projectId: query.projectId,
+        ...(query.laneId === undefined ? {} : { laneId: query.laneId }),
         taskSummary: query.taskSummary,
         pathPrefixes: query.pathPrefixes,
         candidates: innerResult.map((match) => ({
@@ -69,6 +84,7 @@ export class AdvisedKnowledgeRetrievalAdapter implements KnowledgeRetrievalPort 
       // A throwing advice port is unknown: the deterministic result stands.
       return innerResult;
     }
+    this.lastRankingContextRefValue = settledContextRefOf(this.advice);
 
     if (advice.status !== 'advised') {
       // 5. On unknown, return the inner result object unchanged.
@@ -96,6 +112,12 @@ export class AdvisedKnowledgeRetrievalAdapter implements KnowledgeRetrievalPort 
     reordered.sort((a, b) => keyOf(b) - keyOf(a) || a.entry.id.localeCompare(b.entry.id));
     return reordered;
   }
+}
+
+/** The contextRef an advice port settled, when it exposes one at all. */
+function settledContextRefOf(advice: KnowledgeRankingAdvicePort): string | null {
+  const reported = (advice as RankingContextRefCarrier).lastContextRef;
+  return typeof reported === 'string' && reported.length > 0 ? reported : null;
 }
 
 /** Validate every decision score is a finite number in [0,1]; missing ids fail. */

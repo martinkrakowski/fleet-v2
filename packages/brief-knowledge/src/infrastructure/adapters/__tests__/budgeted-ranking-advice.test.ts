@@ -267,6 +267,7 @@ describe('BudgetedRankingAdviceAdapter', () => {
           throw new Error('append failed');
         },
         monthSpendUsd: (month) => realJournal.monthSpendUsd(month),
+        appendOutcome: (outcome) => realJournal.appendOutcome(outcome),
       };
       const { adapter } = makeBudgeted(stateDir, {
         answer: {
@@ -331,6 +332,9 @@ describe('BudgetedRankingAdviceAdapter', () => {
           throw new Error('journal unavailable');
         },
         monthSpendUsd: async () => 0,
+        appendOutcome: async () => {
+          throw new Error('journal unavailable');
+        },
       };
       const { adapter, inner } = makeBudgeted(stateDir, { journal });
       const result = await adapter.adviseRanking(QUERY);

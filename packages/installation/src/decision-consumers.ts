@@ -1,29 +1,32 @@
 // Shared by model.ts and write.ts so the per-consumer copy exists once.
 import type { DecisionConsumers } from './types.js';
 
-/** Field-by-field copy of the per-consumer settings map (K3). */
+interface ConsumerSettings {
+  readonly minConfidence?: number;
+  readonly monthlyBudgetUsd?: number;
+}
+
+/** Copy the optional settings every consumer shares, omitting absent ones. */
+function copySettings(settings: ConsumerSettings): ConsumerSettings {
+  return {
+    ...(settings.minConfidence !== undefined ? { minConfidence: settings.minConfidence } : {}),
+    ...(settings.monthlyBudgetUsd !== undefined ? { monthlyBudgetUsd: settings.monthlyBudgetUsd } : {}),
+  };
+}
+
+/** Field-by-field copy of the per-consumer settings map (K3), in a stable order. */
 export function copyDecisionConsumers(consumers: DecisionConsumers): DecisionConsumers {
-  const out: {
-    -readonly [K in keyof DecisionConsumers]: DecisionConsumers[K];
-  } = {};
   const ranking = consumers['knowledge-ranking'];
-  if (ranking !== undefined) {
-    out['knowledge-ranking'] = {
-      ...(ranking.minConfidence !== undefined ? { minConfidence: ranking.minConfidence } : {}),
-      ...(ranking.monthlyBudgetUsd !== undefined
-        ? { monthlyBudgetUsd: ranking.monthlyBudgetUsd }
-        : {}),
-    };
-  }
   const triage = consumers['claim-triage'];
-  if (triage !== undefined) {
-    out['claim-triage'] = {
-      ...(triage.minConfidence !== undefined ? { minConfidence: triage.minConfidence } : {}),
-      ...(triage.monthlyBudgetUsd !== undefined
-        ? { monthlyBudgetUsd: triage.monthlyBudgetUsd }
-        : {}),
-      acknowledgeCandidateClaimsLeaveHost: triage.acknowledgeCandidateClaimsLeaveHost,
-    };
-  }
-  return out;
+  return {
+    ...(ranking !== undefined ? { 'knowledge-ranking': copySettings(ranking) } : {}),
+    ...(triage !== undefined
+      ? {
+          'claim-triage': {
+            ...copySettings(triage),
+            acknowledgeCandidateClaimsLeaveHost: triage.acknowledgeCandidateClaimsLeaveHost,
+          },
+        }
+      : {}),
+  };
 }

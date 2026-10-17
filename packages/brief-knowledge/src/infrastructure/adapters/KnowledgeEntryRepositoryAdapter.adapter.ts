@@ -1,16 +1,22 @@
-// Implemented for lane bk-usecases-adapters (migration step 6).
+// Implemented for lane bk-usecases-adapters (migration step 6); triage flag
+// and attempt read refined for lane K5a (decision-kernel plan, 2026-10-16, §5).
 /**
  * KnowledgeEntryRepositoryAdapter implements KnowledgeEntryRepositoryPort
  * (local-transactional-store): an in-memory Map with optional stateDir JSON
  * persistence (`knowledge-entries.json`, `context-selections.json`) under exclusive
  * file locks and optimistic concurrency enforced on `revision` evaluated against
  * the freshly read record. Records are stored exactly as the use case produced them;
- * the repository adds no domain decisions.
+ * the repository adds no domain decisions — its one storage-side guard is the
+ * port's declared write-once `setTriageFlag`.
  */
 
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
-import type { KnowledgeEntryRecord } from '../../domain/knowledge-records.js';
+import type {
+  KnowledgeEntryRecord,
+  KnowledgeTriageFlag,
+} from '../../domain/knowledge-records.js';
+import { isKnowledgeTriageFlag } from '../../domain/knowledge-records.js';
 import type { ContextSelectionProps } from '../../domain/value-objects/ContextSelection.vo.js';
 import type { KnowledgeEntryRepositoryPort } from '../../application/ports/out/KnowledgeEntryRepositoryPort.out-port.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
@@ -98,6 +104,60 @@ export class KnowledgeEntryRepositoryAdapter implements KnowledgeEntryRepository
       return all;
     }
     return all.filter((entry) => entry.projectId === projectId);
+  }
+
+  /** The attempt's entries in capture (insertion) order; known absence is empty. */
+  async listEntriesBySourceAttempt(attemptId: string): Promise<readonly KnowledgeEntryRecord[]> {
+    if (typeof attemptId !== 'string' || attemptId.trim().length === 0) {
+      throw new Error('KnowledgeEntryRepositoryAdapter requires a non-empty attemptId');
+    }
+    const stateDir = this.deps?.stateDir;
+    if (!stateDir) {
+      return [...this.inMemoryEntries.values()].filter((entry) => entry.sourceAttemptId === attemptId);
+    }
+    const target = join(stateDir, ENTRIES_FILE);
+    const entries = await this.readEntriesFromDisk(target);
+    return [...entries.values()].filter((entry) => entry.sourceAttemptId === attemptId);
+  }
+
+  /**
+   * Write-once by contract: the flag is attached only while the entry is an
+   * undecided candidate without a flag, and the read-check-write runs under
+   * the store's lock so a concurrent disposition or flag write cannot slip
+   * between the check and the append. Refusal throws; nothing is redacted.
+   */
+  async setTriageFlag(entryId: string, flag: KnowledgeTriageFlag): Promise<void> {
+    if (typeof entryId !== 'string' || entryId.trim().length === 0) {
+      throw new Error('KnowledgeEntryRepositoryAdapter requires a non-empty entryId to set a triage flag');
+    }
+    if (!isKnowledgeTriageFlag(flag)) {
+      throw new Error("KnowledgeEntryRepositoryAdapter requires a triage flag of 'policy-like' or 'instruction-like'");
+    }
+
+    const stateDir = this.deps?.stateDir;
+    if (!stateDir) {
+      const stored = this.inMemoryEntries.get(entryId);
+      if (!stored) {
+        throw new Error(`Knowledge entry not found: ${entryId}`);
+      }
+      // No await between the check and the set: the write-once guard cannot
+      // interleave with another in-memory mutation.
+      this.inMemoryEntries.set(entryId, withTriageFlag(stored, flag));
+      return;
+    }
+
+    const target = join(stateDir, ENTRIES_FILE);
+    const lockPath = `${target}.lock`;
+
+    await withFileLock(lockPath, async () => {
+      const entries = await this.readEntriesFromDisk(target);
+      const stored = entries.get(entryId);
+      if (!stored) {
+        throw new Error(`Knowledge entry not found: ${entryId}`);
+      }
+      entries.set(entryId, withTriageFlag(stored, flag));
+      await writeJsonAtomically(target, [...entries.values()]);
+    });
   }
 
   async saveContextSelections(attemptId: string, selections: readonly ContextSelectionProps[]): Promise<void> {
@@ -190,6 +250,24 @@ function isEnoent(error: unknown): boolean {
     'code' in error &&
     (error as { code?: unknown }).code === 'ENOENT'
   );
+}
+
+/**
+ * The write-once guard shared by both store paths: refuses a second flag and
+ * a flag on an entry that already has a decided disposition. The revision
+ * bump keeps the optimistic-concurrency check honest; timestamps stay with
+ * the use cases that own the clock.
+ */
+function withTriageFlag(stored: KnowledgeEntryRecord, flag: KnowledgeTriageFlag): KnowledgeEntryRecord {
+  if (stored.triageFlag !== undefined) {
+    throw new Error(`Triage flag is write-once: entry ${stored.id} already carries a triage flag`);
+  }
+  if (stored.disposition !== 'candidate') {
+    throw new Error(
+      `Triage flag refused: entry ${stored.id} already has a disposition (${stored.disposition})`,
+    );
+  }
+  return { ...stored, triageFlag: flag, revision: stored.revision + 1 };
 }
 
 function errorMessage(error: unknown): string {

@@ -10,7 +10,17 @@
  * settings and permissions never change through keeper promotion.
  */
 
-import type { KnowledgeCheckRecord, KnowledgeEntryRecord, KnowledgeReuseRecord } from '../knowledge-records.js';
+import { containsSecretShape } from '@fleet/shared';
+import type {
+  KnowledgeCheckRecord,
+  KnowledgeEntryRecord,
+  KnowledgeReuseRecord,
+} from '../knowledge-records.js';
+import {
+  KNOWLEDGE_TRIAGE_FLAGS,
+  MAX_OVERRIDE_REASON_CHARS,
+  isKnowledgeTriageFlag,
+} from '../knowledge-records.js';
 import type { KnowledgeDispositionValue } from '../value-objects/KnowledgeDisposition.vo.js';
 import { KnowledgeDisposition } from '../value-objects/KnowledgeDisposition.vo.js';
 import type { KnowledgeVerificationValue } from '../value-objects/KnowledgeVerification.vo.js';
@@ -70,6 +80,17 @@ export class KnowledgeEntry {
       (typeof record.supersededById !== 'string' || record.supersededById.trim().length === 0)
     ) {
       throw new Error('KnowledgeEntry supersededById must be null or a non-empty string');
+    }
+    // Triage fields are optional so records written before triage existed
+    // load unchanged; when present each must be individually well formed.
+    // Refusal, never redaction: a credential-shaped reason never persists.
+    if (record.triageFlag !== undefined && !isKnowledgeTriageFlag(record.triageFlag)) {
+      throw new Error(
+        `KnowledgeEntry triageFlag must be one of ${KNOWLEDGE_TRIAGE_FLAGS.join(', ')}`,
+      );
+    }
+    if (record.overrideReason !== undefined) {
+      validateOverrideReasonShape(record.overrideReason, 'KnowledgeEntry overrideReason');
     }
     if (record.disposition === 'superseded' && record.supersededById === null) {
       throw new Error('A superseded entry must link the newer entry that replaced it');
@@ -177,6 +198,8 @@ export class KnowledgeEntry {
     readonly disposition: KnowledgeDispositionValue;
     readonly checkerId: string;
     readonly reason: string | null;
+    /** Recorded on the entry when a triage-flagged candidate is accepted. */
+    readonly overrideReason?: string;
     readonly nowIso: string;
   }): KnowledgeEntryRecord {
     const next = KnowledgeDisposition.create(input.disposition);
@@ -185,6 +208,9 @@ export class KnowledgeEntry {
     }
     if (typeof input.checkerId !== 'string' || input.checkerId.trim().length === 0) {
       throw new Error('A disposition decision requires a checker identity');
+    }
+    if (input.overrideReason !== undefined) {
+      validateOverrideReasonShape(input.overrideReason, 'A disposition overrideReason');
     }
     if (input.disposition === 'accepted') {
       if (this.record.disposition === 'policy-proposal') {
@@ -196,6 +222,14 @@ export class KnowledgeEntry {
       if (this.record.verification !== 'supported') {
         throw new Error('An unverified claim cannot become accepted; run a supported check first');
       }
+      if (
+        this.record.triageFlag !== undefined &&
+        (input.overrideReason === undefined || input.overrideReason.trim().length === 0)
+      ) {
+        throw new Error(
+          'A triage-flagged candidate cannot be accepted without a non-empty overrideReason',
+        );
+      }
     }
     if (input.disposition === 'superseded') {
       throw new Error('Use supersedeBy to link the newer entry that replaces this one');
@@ -205,6 +239,7 @@ export class KnowledgeEntry {
       disposition: input.disposition,
       checkerId: input.checkerId,
       dispositionReason: input.reason,
+      ...(input.overrideReason === undefined ? {} : { overrideReason: input.overrideReason }),
       revision: this.record.revision + 1,
       updatedAtIso: input.nowIso,
     };
@@ -288,5 +323,21 @@ export class KnowledgeEntry {
       checks: this.record.checks.map((check) => ({ ...check })),
       reuses: this.record.reuses.map((reuse) => ({ ...reuse })),
     };
+  }
+}
+
+/**
+ * A recorded `overrideReason` is a bounded, non-empty, credential-free
+ * string. Anything else is refused — never redacted and never truncated.
+ */
+function validateOverrideReasonShape(value: string, label: string): void {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`${label} must be a non-empty string`);
+  }
+  if (value.length > MAX_OVERRIDE_REASON_CHARS) {
+    throw new Error(`${label} must be at most ${MAX_OVERRIDE_REASON_CHARS} characters`);
+  }
+  if (containsSecretShape(value)) {
+    throw new Error(`${label} must not contain a credential shape`);
   }
 }

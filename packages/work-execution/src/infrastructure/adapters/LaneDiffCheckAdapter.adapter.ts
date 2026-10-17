@@ -253,7 +253,13 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
           ["test", "-L", absolutePath],
           { cwd: request.worktreePath },
         );
-        if (isLink.error !== undefined) {
+        // `test -L` answers 0 (a link) or 1 (not a link); anything else —
+        // an ssh transport failure is 255 — is no answer and fails closed,
+        // or a link could be followed and its target scanned instead.
+        if (
+          isLink.error !== undefined ||
+          (isLink.exitCode !== 0 && isLink.exitCode !== 1)
+        ) {
           return {
             outcome: "error",
             reason:

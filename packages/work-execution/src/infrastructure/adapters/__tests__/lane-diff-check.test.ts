@@ -534,6 +534,24 @@ describe("LaneDiffCheckAdapter", () => {
     ]);
   });
 
+  it("a `test -L` that gives no answer (ssh exit 255) fails closed (re-check of #129)", async () => {
+    const repo = makeRepo();
+    symlinkSync(`/tmp/${tok}`, join(repo, "packages/x/src/link.ts"));
+    const flaky = {
+      async run(argv: readonly string[], options?: { cwd?: string }) {
+        if (argv[0] === "test" && argv[1] === "-L")
+          return { exitCode: 255, signal: null, stdout: "", stderr: "" };
+        return new LocalExecutor().run(argv, options);
+      },
+    };
+    const result = await new LaneDiffCheckAdapter(flaky).checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: base(repo),
+      allowedPathPrefixes: PREFIXES,
+    });
+    expect(result.outcome).toBe("error");
+  });
+
   it("a link to a FIFO is read as link text and never blocks on the pipe (review of #129)", async () => {
     // git lists no bare FIFO as a change, but it does list a link to one;
     // `cat` would wait on the pipe until the executor's timeout.

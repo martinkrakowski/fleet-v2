@@ -1,5 +1,6 @@
 // Implemented for lane D4 (decision port plan, 2026-10-16); extended for lane
-// K2 (decision-kernel plan, 2026-10-16, §3).
+// K2 (decision-kernel plan, 2026-10-16, §3) and lane K4 (the same plan, §4:
+// the measurement read over every recorded month).
 /**
  * FileDecisionReceiptJournalAdapter implements DecisionReceiptJournalPort
  * (local-jsonl-receipt-journal): one append-only JSONL file per UTC month at
@@ -15,6 +16,12 @@
  * fields read as empty, so an existing month file keeps parsing. Outcomes go
  * to a separate file, `<stateDir>/decision-receipts/outcomes-<YYYY-MM>.jsonl`
  * under its own lock, so this parser never meets a line kind it does not know.
+ *
+ * K4: `readJournal` reads every recorded month of both files for one
+ * consumer, each under its own lock. Fix round: a malformed line of either
+ * file is skipped and counted on the snapshot's `skippedLines` instead of
+ * thrown, so one corrupt line cannot hide the whole recorded history; every
+ * budget path stays strict and still throws.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -24,10 +31,14 @@ import { budgetAllows, containsSecretShape } from '@fleet/shared';
 import type {
   AppendDecisionOutcome,
   DecisionCallReceipt,
+  DecisionJournalSnapshot,
   DecisionOutcomeKind,
+  DecisionOutcomeRecord,
   DecisionReceiptJournalPort,
+  ReadDecisionJournalQuery,
   ReserveDecisionQuery,
   ReserveDecisionResult,
+  SettledDecisionReceiptRecord,
 } from '../../application/ports/out/DecisionReceiptJournalPort.out-port.js';
 import { KNOWLEDGE_RANKING_CONSUMER } from '../../application/ports/out/DecisionReceiptJournalPort.out-port.js';
 import { withFileLock } from './file-store.js';
@@ -70,7 +81,11 @@ interface SettledEntry {
   readonly estimated: boolean;
   readonly questionKinds: readonly string[];
   readonly minConfidenceObserved?: number;
-  readonly latencyMs: number;
+  /**
+   * K4: absent on a line written before K2, which carries no measurement —
+   * a report reads no latency there, never a fabricated zero.
+   */
+  readonly latencyMs?: number;
   readonly lexicalOrder: readonly string[];
   readonly decidedOrder: readonly string[];
   readonly unknownReason?: string;
@@ -165,10 +180,10 @@ function requireContextRef(context: ParseContext, value: unknown): string {
   return requireNonEmptyString(context, value, 'contextRef');
 }
 
-/** A settled line before K2 carries no latency; it reads as no measurement. */
-function requireLatencyMs(context: ParseContext, value: unknown): number {
+/** A settled line before K2 carries no latency; K4 reads no measurement, not zero. */
+function requireLatencyMs(context: ParseContext, value: unknown): number | undefined {
   if (value === undefined) {
-    return 0;
+    return undefined;
   }
   return requireNonNegativeNumber(context, value, 'latencyMs');
 }
@@ -233,6 +248,93 @@ function parseEntry(line: string, filePath: string, lineNumber: number): Journal
     };
   }
   malformed(context, `unknown kind ${JSON.stringify(entry.kind)}`);
+}
+
+/** `<YYYY-MM>.jsonl` — a recorded month; lock files end `.lock` and never match. */
+const MONTH_FILE_PATTERN = /^\d{4}-\d{2}\.jsonl$/;
+
+/** `outcomes-<YYYY-MM>.jsonl` — a recorded outcomes month. */
+const OUTCOME_FILE_PATTERN = /^outcomes-\d{4}-\d{2}\.jsonl$/;
+
+/**
+ * The consumer a report reads: a usable declared string, refused never
+ * redacted, exactly as the write paths require one.
+ */
+function requireReadableConsumer(query: ReadDecisionJournalQuery): string {
+  if (!query || typeof query !== 'object' || typeof query.consumer !== 'string') {
+    throw new Error('FileDecisionReceiptJournalAdapter requires a readJournal query with a consumer');
+  }
+  const consumer = query.consumer;
+  if (consumer.trim().length === 0 || consumer.length > MAX_CONSUMER_CHARS || containsSecretShape(consumer)) {
+    throw new Error(
+      `FileDecisionReceiptJournalAdapter requires a usable consumer of at most ${MAX_CONSUMER_CHARS} chars`,
+    );
+  }
+  return consumer;
+}
+
+/** The public record of one settled line; absent K4 fields stay absent. */
+function settledRecordOf(entry: SettledEntry): SettledDecisionReceiptRecord {
+  return {
+    consumer: entry.consumer,
+    contextRef: entry.contextRef,
+    provider: entry.provider,
+    model: entry.model,
+    requestId: entry.requestId,
+    costUsd: entry.costUsd,
+    estimated: entry.estimated,
+    questionKinds: [...entry.questionKinds],
+    minConfidenceObserved: entry.minConfidenceObserved,
+    latencyMs: entry.latencyMs,
+    lexicalOrder: [...entry.lexicalOrder],
+    decidedOrder: [...entry.decidedOrder],
+    unknownReason: entry.unknownReason,
+    at: entry.at,
+  };
+}
+
+/**
+ * Parse one outcome line, fail closed like the budget parser: a report
+ * built from skipped or half-parsed lines would under-report what the
+ * journal actually recorded. The shape is exactly what `readOutcomeEntry`
+ * appends.
+ */
+function parseOutcomeEntry(line: string, filePath: string, lineNumber: number): DecisionOutcomeRecord {
+  const context: ParseContext = { filePath, lineNumber };
+  if (line.trim().length === 0) {
+    malformed(context, 'blank line');
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(line);
+  } catch (error: unknown) {
+    malformed(context, `invalid JSON (${error instanceof Error ? error.message : String(error)})`);
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    malformed(context, 'outcome is not a JSON object');
+  }
+  const entry = value as Record<string, unknown>;
+  const consumer = requireNonEmptyString(context, entry.consumer, 'consumer');
+  if (consumer.length > MAX_CONSUMER_CHARS) {
+    malformed(context, `consumer must be at most ${MAX_CONSUMER_CHARS} chars`);
+  }
+  const contextRef = requireNonEmptyString(context, entry.contextRef, 'contextRef');
+  if (contextRef.length > MAX_CONTEXT_REF_CHARS) {
+    malformed(context, `contextRef must be at most ${MAX_CONTEXT_REF_CHARS} chars`);
+  }
+  const kind = entry.kind;
+  if (typeof kind !== 'string' || !OUTCOME_KINDS.includes(kind as DecisionOutcomeKind)) {
+    malformed(context, `unknown outcome kind ${JSON.stringify(kind)}`);
+  }
+  const ids = requireStringArray(context, entry.value, 'value');
+  if (ids.length === 0 || ids.some((id) => id.trim().length === 0)) {
+    malformed(context, 'value must be a non-empty array of non-empty strings');
+  }
+  const at = requireNonEmptyString(context, entry.at, 'at');
+  if (Number.isNaN(Date.parse(at))) {
+    malformed(context, 'at must be an ISO 8601 instant');
+  }
+  return { consumer, contextRef, kind: kind as DecisionOutcomeKind, value: ids, at };
 }
 
 /** The month's spend, in total and per consumer, from one set of entries. */
@@ -664,6 +766,138 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
     return { consumer, contextRef, kind, value: [...value], at };
   }
 
+  /**
+   * K4, fix round: one consumer's whole recorded history, every month of both
+   * files, each read under its own lock (never nested, so nothing can wait on
+   * this read). A malformed line of either file is skipped and counted on
+   * `skippedLines` rather than thrown: the report still states what it read
+   * and how much it could not. The budget paths stay strict — they still
+   * throw, so spend is never computed from skipped input.
+   */
+  async readJournal(query: ReadDecisionJournalQuery): Promise<DecisionJournalSnapshot> {
+    const consumer = requireReadableConsumer(query);
+    const receipts: SettledDecisionReceiptRecord[] = [];
+    const outcomes: DecisionOutcomeRecord[] = [];
+    let skippedLines = 0;
+    for (const monthKey of await this.listMonthKeys()) {
+      // Each month is read under its own month lock, like monthSpendUsd:
+      // a concurrent append must never be observed as a torn line.
+      const read = await withFileLock(
+        this.monthLockPath(monthKey),
+        async () => this.readMonthEntriesForReport(monthKey),
+        this.lockOptions(),
+      );
+      skippedLines += read.skipped;
+      for (const entry of read.entries) {
+        if (entry.kind === 'settled' && entry.consumer === consumer) {
+          receipts.push(settledRecordOf(entry));
+        }
+      }
+    }
+    for (const monthKey of await this.listOutcomeMonthKeys()) {
+      const read = await withFileLock(
+        this.outcomesLockPath(monthKey),
+        async () => this.readOutcomeEntriesForReport(monthKey),
+        this.lockOptions(),
+      );
+      skippedLines += read.skipped;
+      for (const outcome of read.entries) {
+        if (outcome.consumer === consumer) {
+          outcomes.push(outcome);
+        }
+      }
+    }
+    return { receipts, outcomes, skippedLines };
+  }
+
+  /**
+   * The report's receipt read: like `readMonthEntries`, but a line that
+   * fails the strict parser is skipped and counted instead of thrown.
+   */
+  private async readMonthEntriesForReport(
+    monthKey: string,
+  ): Promise<{ entries: JournalEntry[]; skipped: number }> {
+    const filePath = this.monthFilePath(monthKey);
+    const entries: JournalEntry[] = [];
+    let skipped = 0;
+    for (const [index, line] of (await this.readFileLines(filePath)).entries()) {
+      try {
+        entries.push(parseEntry(line, filePath, index + 1));
+      } catch (error: unknown) {
+        if (!(error instanceof MalformedReceiptLineError)) {
+          throw error;
+        }
+        skipped += 1;
+      }
+    }
+    return { entries, skipped };
+  }
+
+  /**
+   * The report's outcomes read: like `readOutcomeEntries`, but a line that
+   * fails the strict parser is skipped and counted instead of thrown.
+   */
+  private async readOutcomeEntriesForReport(
+    monthKey: string,
+  ): Promise<{ entries: DecisionOutcomeRecord[]; skipped: number }> {
+    const filePath = this.outcomesFilePath(monthKey);
+    const entries: DecisionOutcomeRecord[] = [];
+    let skipped = 0;
+    for (const [index, line] of (await this.readFileLines(filePath)).entries()) {
+      try {
+        entries.push(parseOutcomeEntry(line, filePath, index + 1));
+      } catch (error: unknown) {
+        if (!(error instanceof MalformedReceiptLineError)) {
+          throw error;
+        }
+        skipped += 1;
+      }
+    }
+    return { entries, skipped };
+  }
+
+  /** Every recorded `<YYYY-MM>.jsonl` month, oldest first; none when the directory is absent. */
+  private async listMonthKeys(): Promise<string[]> {
+    const names = await this.listReceiptsDir();
+    return names
+      .filter((name) => MONTH_FILE_PATTERN.test(name))
+      .sort((a, b) => a.localeCompare(b))
+      .map((name) => name.slice(0, name.length - '.jsonl'.length));
+  }
+
+  /** Every recorded `outcomes-<YYYY-MM>.jsonl` month, oldest first. */
+  private async listOutcomeMonthKeys(): Promise<string[]> {
+    const names = await this.listReceiptsDir();
+    return names
+      .filter((name) => OUTCOME_FILE_PATTERN.test(name))
+      .sort((a, b) => a.localeCompare(b))
+      .map((name) => name.slice('outcomes-'.length, name.length - '.jsonl'.length));
+  }
+
+  /** The receipts directory listing; empty when nothing was ever recorded. */
+  private async listReceiptsDir(): Promise<string[]> {
+    try {
+      return await fs.readdir(path.join(this.stateDir, RECEIPTS_DIRNAME), 'utf8');
+    } catch (error: unknown) {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        (error as { code?: string }).code === 'ENOENT'
+      ) {
+        return [];
+      }
+      throw error;
+    }
+  }
+
+  /** Parse one outcomes file; a malformed line throws with its location. */
+  private async readOutcomeEntries(monthKey: string): Promise<DecisionOutcomeRecord[]> {
+    const filePath = this.outcomesFilePath(monthKey);
+    return (await this.readFileLines(filePath)).map((line, index) =>
+      parseOutcomeEntry(line, filePath, index + 1),
+    );
+  }
+
   /** A settled line for this reference in this month or the one before it. */
   private async hasSettledReceipt(contextRef: string, atDate: Date): Promise<boolean> {
     const settled = (entries: readonly JournalEntry[]): boolean =>
@@ -694,6 +928,17 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
 
   private async readMonthEntries(monthKey: string): Promise<JournalEntry[]> {
     const filePath = this.monthFilePath(monthKey);
+    return (await this.readFileLines(filePath)).map((line, index) =>
+      parseEntry(line, filePath, index + 1),
+    );
+  }
+
+  /**
+   * The file's lines; an absent file reads as none. A single trailing '' is
+   * the file's final newline, not a blank line. Every read — strict or
+   * report — goes through here, so both see the same lines.
+   */
+  private async readFileLines(filePath: string): Promise<string[]> {
     let raw: string;
     try {
       raw = await fs.readFile(filePath, 'utf8');
@@ -708,11 +953,10 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
       throw error;
     }
     const lines = raw.split('\n');
-    // A single trailing '' is the file's final newline, not a blank line.
     if (lines.length > 0 && lines[lines.length - 1] === '') {
       lines.pop();
     }
-    return lines.map((line, index) => parseEntry(line, filePath, index + 1));
+    return lines;
   }
 
   private async appendEntry(monthKey: string, entry: JournalEntry): Promise<void> {

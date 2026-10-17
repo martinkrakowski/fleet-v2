@@ -29,9 +29,13 @@ import type {
   VerificationReceiptRecord,
 } from '@fleet/evidence-and-acceptance';
 import {
+  computeRankingTrialFigures,
   KNOWLEDGE_DISPOSITIONS,
+  KNOWLEDGE_RANKING_CONSUMER,
   KNOWLEDGE_REUSE_OUTCOMES,
   type RecordContextSelectionItem,
+  type RankingTrialContextFigures,
+  type TrialFigure,
 } from '@fleet/brief-knowledge';
 import { COORDINATION_KINDS } from '@fleet/operator-coordination';
 import type {
@@ -89,6 +93,23 @@ class CliUsageError extends Error {}
 type Payload = Record<string, unknown>;
 
 type CommandHandler = (payload: Payload, runtime: FleetCliRuntime) => Promise<unknown>;
+
+/**
+ * A line-oriented command result: one stdout line per record instead of one
+ * JSON document. The `outcome` field keeps the shared exit-code contract.
+ */
+interface CliPerLineResult {
+  readonly outcome?: string;
+  readonly lines: readonly unknown[];
+}
+
+function isPerLineResult(result: unknown): result is CliPerLineResult {
+  return (
+    typeof result === 'object' &&
+    result !== null &&
+    Array.isArray((result as { lines?: unknown }).lines)
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Payload coercion helpers. Values arrive from `--json` (typed JSON) or from
@@ -309,6 +330,40 @@ const NON_ZERO_OUTCOMES: ReadonlySet<string> = new Set([
   'unknown',
 ]);
 
+/** A latency figure as the report prints it: ms when measured, the port's
+ * not-persisted sentinel when the settled lines carried no measurement. */
+function latencyText(figure: TrialFigure): string {
+  return typeof figure === 'number' ? `${figure}ms` : figure;
+}
+
+/** One contextRef's trial figures as one report line (plan §4, K4). */
+function decisionsReportLine(figure: RankingTrialContextFigures): string {
+  const unknownText =
+    Object.keys(figure.unknownRateByReason).length === 0
+      ? 'none'
+      : Object.entries(figure.unknownRateByReason)
+          .map(([reason, rate]) => `${reason}:${rate}`)
+          .join(',');
+  const yesNo = (value: boolean | 'tie' | null): string =>
+    value === null ? 'n/a' : value === 'tie' ? 'tie' : value ? 'yes' : 'no';
+  return [
+    figure.contextRef,
+    `calls=${figure.calls}`,
+    `orderChanged=${figure.orderChanged ? 'yes' : 'no'}`,
+    `top1Changed=${figure.top1Changed ? 'yes' : 'no'}`,
+    `kendallTau=${figure.kendallTau === null ? 'n/a' : figure.kendallTau}`,
+    `unknown=${unknownText}`,
+    `lowestConfidence=${figure.lowestConfidence === null ? 'n/a' : figure.lowestConfidence}`,
+    `latencyP50=${latencyText(figure.latencyP50Ms)}`,
+    `latencyP95=${latencyText(figure.latencyP95Ms)}`,
+    `costUsd=${figure.costUsd}`,
+    `estimatedCalls=${figure.estimatedCalls}`,
+    `selectionRecorded=${figure.selectionRecorded ? 'yes' : 'no'}`,
+    `agreesDecided=${yesNo(figure.selectionAgreesWithDecided)}`,
+    `agreesLexical=${yesNo(figure.selectionAgreesWithLexical)}`,
+  ].join(' ');
+}
+
 function exitCodeForResult(result: unknown, group?: string, subcommand?: string): number {
   if (typeof result === 'object' && result !== null && 'outcome' in result) {
     const outcome = (result as { outcome: unknown }).outcome;
@@ -401,11 +456,16 @@ const QUESTIONS_POSITIONAL_SUBCOMMANDS: ReadonlySet<string> = new Set([
   'wait',
 ]);
 
-/** The positional question id a `questions` subcommand requires. */
-function questionIdPositional(payload: Payload, subcommand: string): string {
+/** The first bare positional token, trimmed; '' when none was given. */
+function firstPositional(payload: Payload): string {
   const positionals = payload['positional'];
   const first = Array.isArray(positionals) ? positionals[0] : undefined;
-  const id = typeof first === 'string' ? first.trim() : '';
+  return typeof first === 'string' ? first.trim() : '';
+}
+
+/** The positional question id a `questions` subcommand requires. */
+function questionIdPositional(payload: Payload, subcommand: string): string {
+  const id = firstPositional(payload);
   if (id === '') {
     throw new CliUsageError(`questions ${subcommand} requires a question id: fleet-v2 questions ${subcommand} <id>`);
   }
@@ -471,6 +531,38 @@ function sleep(ms: number): Promise<void> {
 // ---------------------------------------------------------------------------
 
 const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>>> = {
+  decisions: {
+    // `fleet-v2 decisions report --consumer knowledge-ranking` (K4): the
+    // ten-proposal trial figures, one line per contextRef, computed by the
+    // pure brief-knowledge function from the journal's own read. Nothing is
+    // invented: a figure the receipts cannot carry prints as the
+    // not-persisted sentinel the port declares.
+    report: async (p, rt) => {
+      const consumer = str(p, 'consumer');
+      if (consumer.trim() === '') {
+        throw new CliUsageError('decisions report requires --consumer <name>');
+      }
+      if (consumer !== KNOWLEDGE_RANKING_CONSUMER) {
+        throw new CliUsageError(
+          `decisions report supports only --consumer ${KNOWLEDGE_RANKING_CONSUMER}`,
+        );
+      }
+      const snapshot = await rt.knowledge.decisionReceiptJournal.readJournal({ consumer });
+      const figures = computeRankingTrialFigures(snapshot);
+      // Fix round: the read skips malformed lines instead of failing, and
+      // the report says so rather than reading as if nothing were missing.
+      const lines = figures.map((figure) => decisionsReportLine(figure));
+      if (snapshot.skippedLines > 0) {
+        lines.push(`skipped malformed lines: ${snapshot.skippedLines}`);
+      }
+      return {
+        outcome: 'reported',
+        consumer,
+        contextCount: figures.length,
+        lines,
+      };
+    },
+  },
   'work-order': {
     register: async (p, rt) =>
       rt.execution.registerWorkOrder.registerWorkOrder({
@@ -898,8 +990,56 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
       return rt.knowledge.recordContextSelection.recordContextSelection({
         attemptId: str(p, 'attemptId'),
         selections,
+        // The ranking contextRef the proposals carried (K4): when given, the
+        // recorded selection also appends the best-effort ranking-selection
+        // outcome the trial report joins. Absent or blank records nothing
+        // beyond the selections themselves.
+        rankingContextRef: optStr(p, 'rankingContextRef'),
         nowIso: optStr(p, 'nowIso'),
       });
+    },
+    candidates: async (p, rt) => {
+      // `fleet-v2 knowledge candidates <attemptId>`: the disposition queue
+      // for one attempt, most reusable first, never truncated.
+      const attemptId = str(p, 'attemptId') || firstPositional(p);
+      if (attemptId.trim() === '') {
+        throw new CliUsageError('knowledge candidates requires an attempt id: fleet-v2 knowledge candidates <attemptId>');
+      }
+      // Scores arrive as a JSON object (via --json) or a JSON string (via
+      // --scores '<json>'); parse the string form here so the use case
+      // always sees the map shape it validates.
+      let scores = nested<Record<string, number>>(p, 'scores');
+      if (scores === undefined && typeof p['scores'] === 'string') {
+        try {
+          const parsed: unknown = JSON.parse(p['scores'] as string);
+          if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+            scores = parsed as Record<string, number>;
+          }
+        } catch {
+          // Fall through to the usage error below.
+        }
+        if (scores === undefined) {
+          throw new CliUsageError("knowledge candidates --scores must be a JSON object of scores");
+        }
+      }
+      const result = await rt.knowledge.listCandidateClaims.listCandidateClaims({
+        attemptId,
+        ...(scores !== undefined ? { scores } : {}),
+      });
+      if (result.outcome === 'rejected') {
+        return { outcome: result.outcome, reason: result.reason, lines: [] };
+      }
+      return {
+        outcome: result.outcome,
+        attemptId,
+        count: result.candidates.length,
+        lines: result.candidates.map((candidate) => {
+          const score = scores?.[candidate.id];
+          const scoreText =
+            typeof score === 'number' && Number.isFinite(score) ? String(score) : '-';
+          return `${candidate.id}  score=${scoreText}  ${candidate.claimText}`;
+        }),
+      };
     },
     'record-reuse': async (p, rt) =>
       rt.knowledge.recordKnowledgeReuse.recordKnowledgeReuse({
@@ -1468,7 +1608,8 @@ Commands:
   attempt dispatch|reconcile|stop|collect|fix|accept
   forge execute
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
-  knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|record-reuse|supersede
+  knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede
+  decisions report --consumer knowledge-ranking
   coordination register-profile|capabilities|request-decision|resolve-auth|consume-auth|publish-observation|attention|send-relay|ack-relay|outstanding
   questions ask|list|show|answer|sync|expire|acknowledge|wait
   help | --help
@@ -1566,11 +1707,23 @@ export async function runCli(
       io.stderr(`Unknown ${group} subcommand: ${subcommand}\n${groupHelp(group)}\n`);
       return 2;
     }
+    // `questions` id subcommands and `knowledge candidates` take one bare
+    // positional id; every other group keeps the strict flags-only shape.
     const allowPositional =
-      group === 'questions' && QUESTIONS_POSITIONAL_SUBCOMMANDS.has(subcommand);
+      (group === 'questions' && QUESTIONS_POSITIONAL_SUBCOMMANDS.has(subcommand)) ||
+      (group === 'knowledge' && subcommand === 'candidates');
     const payload = parseFlags(rest, { allowPositional });
     const result = await handler(payload, activeRuntime);
-    io.stdout(`${JSON.stringify(result)}\n`);
+    // Line-oriented outputs (`knowledge candidates`, `decisions report`)
+    // print one line per record instead of one JSON document; a refusal
+    // carries no lines and falls back to the JSON document that names it.
+    if (isPerLineResult(result) && result.lines.length > 0) {
+      for (const line of result.lines) {
+        io.stdout(`${line}\n`);
+      }
+    } else {
+      io.stdout(`${JSON.stringify(result)}\n`);
+    }
     return exitCodeForResult(result, group, subcommand);
   } catch (error) {
     if (error instanceof CliUsageError) {

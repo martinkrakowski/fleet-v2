@@ -1,5 +1,6 @@
 // Refined for lanes D1 and D4 (decision port plan, 2026-10-16); refined again
-// for lane K2 (decision-kernel plan, 2026-10-16, §3).
+// for lane K2 (decision-kernel plan, 2026-10-16, §3), and for lane K4 (the
+// same plan, §4: the measurement read and the trial figures).
 /**
  * DecisionReceiptJournalPort: append-only record of decision calls, of
  * month-to-date spend and of the outcomes those calls produced. "Recorded or
@@ -15,16 +16,16 @@
  * `@fleet/shared`.
  */
 
-import type { DecisionCallReceipt as DecisionReceiptEnvelope } from '@fleet/shared';
+import type { DecisionCallReceipt as DecisionReceiptEnvelope } from "@fleet/shared";
 
 /** The consumer this context records a ranking judgement for. */
-export const KNOWLEDGE_RANKING_CONSUMER = 'knowledge-ranking';
+export const KNOWLEDGE_RANKING_CONSUMER = "knowledge-ranking";
 
 /** The consumer this context records a candidate-claim triage for (K5). */
-export const CLAIM_TRIAGE_CONSUMER = 'claim-triage';
+export const CLAIM_TRIAGE_CONSUMER = "claim-triage";
 
 /** The kernel envelope as the caller declares it; the journal owns the rest. */
-type DeclaredReceiptFields = Omit<DecisionReceiptEnvelope, 'at' | 'estimated'>;
+type DeclaredReceiptFields = Omit<DecisionReceiptEnvelope, "at" | "estimated">;
 
 /**
  * A settled ranking call: the advisory scores were applied to an order of the
@@ -57,7 +58,8 @@ export interface ClaimTriageDecisionCallReceipt extends DeclaredReceiptFields {
 }
 
 /** Caller-supplied outcome of one decision call, appended against a reservation. */
-export type DecisionCallReceipt = RankingDecisionCallReceipt | ClaimTriageDecisionCallReceipt;
+export type DecisionCallReceipt =
+  RankingDecisionCallReceipt | ClaimTriageDecisionCallReceipt;
 
 export interface ReserveDecisionQuery {
   /**
@@ -80,10 +82,13 @@ export interface ReserveDecisionQuery {
 
 export type ReserveDecisionResult =
   | { readonly ok: true; readonly reservationId: string }
-  | { readonly ok: false; readonly reason: 'budget-exhausted' | 'not-configured' };
+  | {
+      readonly ok: false;
+      readonly reason: "budget-exhausted" | "not-configured";
+    };
 
 /** What one decision call ended up deciding, recorded best effort. */
-export type DecisionOutcomeKind = 'ranking-selection' | 'triage-disposition';
+export type DecisionOutcomeKind = "ranking-selection" | "triage-disposition";
 
 export interface AppendDecisionOutcome {
   readonly consumer: string;
@@ -125,4 +130,85 @@ export interface DecisionReceiptJournalPort {
    * fail the operation it describes. Outcomes live in their own file.
    */
   appendOutcome(outcome: AppendDecisionOutcome): Promise<void>;
+  /**
+   * Read one consumer's settled receipts and recorded outcomes for
+   * measurement (lane K4's `decisions report`): append order is preserved,
+   * a receipt joins its outcomes by `contextRef`, and nothing is invented —
+   * a field a line never carried reads as absent, never as zero. Reading is
+   * pure: it appends nothing and decides nothing.
+   */
+  readJournal(
+    query: ReadDecisionJournalQuery,
+  ): Promise<DecisionJournalSnapshot>;
 }
+
+// ---------------------------------------------------------------------------
+// K4 measurement read: the records the journal hands a report, and the pure
+// figures computed from them (decision-kernel plan §4).
+// ---------------------------------------------------------------------------
+
+/**
+ * One settled receipt as the journal recorded it. The line's own consumer is
+ * carried, so a report never attributes a call to the consumer it did not
+ * settle as. `latencyMs` is absent on a line written before K2, which carries
+ * no measurement to read.
+ */
+export interface SettledDecisionReceiptRecord {
+  readonly consumer: string;
+  readonly contextRef: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly requestId?: string;
+  readonly costUsd: number;
+  readonly estimated: boolean;
+  readonly questionKinds: readonly string[];
+  readonly minConfidenceObserved?: number;
+  /** Call latency in ms; absent when the settled line carries none (pre-K2). */
+  readonly latencyMs?: number;
+  readonly lexicalOrder: readonly string[];
+  readonly decidedOrder: readonly string[];
+  readonly unknownReason?: string;
+  readonly at: string;
+}
+
+/** One recorded outcome line, as it was appended. */
+export interface DecisionOutcomeRecord {
+  readonly consumer: string;
+  readonly contextRef: string;
+  readonly kind: DecisionOutcomeKind;
+  readonly value: readonly string[];
+  readonly at: string;
+}
+
+export interface ReadDecisionJournalQuery {
+  /** Only this consumer's receipts and outcomes are read. */
+  readonly consumer: string;
+}
+
+/** One consumer's receipts and outcomes, in append order. */
+export interface DecisionJournalSnapshot {
+  readonly receipts: readonly SettledDecisionReceiptRecord[];
+  readonly outcomes: readonly DecisionOutcomeRecord[];
+  /**
+   * Lines of either journal file that the read skipped as unparseable instead
+   * of failing the report (K4 fix): 0 when nothing was skipped. The budget
+   * paths stay strict — a malformed line there still throws.
+   */
+  readonly skippedLines: number;
+}
+
+// ---------------------------------------------------------------------------
+// K4 trial figures: moved to `../../services/RankingTrialFigures.ts` (review
+// of #121). The moved names are re-exported here, so every import that read
+// them from this module — including the CLI through the package root — keeps
+// working.
+// ---------------------------------------------------------------------------
+
+export {
+  FIGURE_NOT_PERSISTED,
+  computeRankingTrialFigures,
+} from "../../services/RankingTrialFigures.js";
+export type {
+  RankingTrialContextFigures,
+  TrialFigure,
+} from "../../services/RankingTrialFigures.js";

@@ -13,10 +13,22 @@ import type {
   RecordBriefContextSelectionResult,
   RecordContextSelectionPort,
 } from '../ports/in/RecordContextSelectionPort.in-port.js';
+import type {
+  AppendDecisionOutcome,
+  DecisionReceiptJournalPort,
+} from '../ports/out/DecisionReceiptJournalPort.out-port.js';
+import { KNOWLEDGE_RANKING_CONSUMER } from '../ports/out/DecisionReceiptJournalPort.out-port.js';
 import type { KnowledgeEntryRepositoryPort } from '../ports/out/KnowledgeEntryRepositoryPort.out-port.js';
 
 export interface RecordContextSelectionDependencies {
   readonly repo: KnowledgeEntryRepositoryPort;
+  /**
+   * When configured, a recorded selection appends a best-effort
+   * ranking-selection outcome for the `rankingContextRef` the proposals
+   * carried (decision-kernel plan §4, lane K4); a journal failure, or a
+   * reference with no settled receipt, never fails the recording.
+   */
+  readonly journal?: DecisionReceiptJournalPort;
 }
 
 export class RecordContextSelectionUseCase implements RecordContextSelectionPort {
@@ -108,7 +120,47 @@ export class RecordContextSelectionUseCase implements RecordContextSelectionPort
 
     await this.deps.repo.saveContextSelections(request.attemptId, selections);
 
+    await this.appendRankingOutcome(request, selections);
+
     return { outcome: 'recorded', recordedCount: selections.length };
+  }
+
+  /**
+   * Best effort by contract (K4): the selection joins the ranking receipt it
+   * was advised by, through the `rankingContextRef` the proposals carried.
+   * The journal skips silently when no settled receipt exists for the
+   * reference, and any failure here — a journal that throws, an unwritable
+   * store — never fails the selection that was already recorded.
+   */
+  private async appendRankingOutcome(
+    request: RecordBriefContextSelectionRequest,
+    selections: readonly ContextSelectionProps[],
+  ): Promise<void> {
+    const journal = this.deps?.journal;
+    const contextRef = request.rankingContextRef;
+    if (!journal || typeof contextRef !== 'string' || contextRef.trim().length === 0) {
+      return;
+    }
+    // Declared ids only, per the journal port: the entry ids the
+    // orchestrator selected and accepted, in the order it selected them.
+    const acceptedIds = selections
+      .filter((selection) => selection.accepted)
+      .map((selection) => selection.knowledgeEntryId);
+    if (acceptedIds.length === 0) {
+      return;
+    }
+    const outcome: AppendDecisionOutcome = {
+      consumer: KNOWLEDGE_RANKING_CONSUMER,
+      contextRef,
+      kind: 'ranking-selection',
+      value: acceptedIds,
+      at: request.nowIso ?? new Date().toISOString(),
+    };
+    try {
+      await journal.appendOutcome(outcome);
+    } catch {
+      // Recording the outcome is never worth failing the recorded selection.
+    }
   }
 }
 

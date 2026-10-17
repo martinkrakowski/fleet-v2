@@ -262,6 +262,68 @@ describe('FileDecisionReceiptJournalAdapter', () => {
     expect(await fs.readFile(filePath, 'utf8')).toBe(corrupted);
   });
 
+  it('fix round: the report read skips a corrupt line in either file and counts them', async () => {
+    const adapter = new FileDecisionReceiptJournalAdapter(
+      tempDir,
+      () => new Date('2026-01-15T10:00:00.000Z'),
+    );
+    const reserved = await adapter.reserve({
+      assumedCostUsd: 0.25,
+      monthlyBudgetUsd: 1,
+      stateSha256: SHA_A,
+    });
+    if (!reserved.ok) throw new Error('reserve refused');
+    await adapter.settle(reserved.reservationId, rankingReceipt());
+
+    const receiptsPath = path.join(tempDir, 'decision-receipts', '2026-01.jsonl');
+    const outcomesPath = path.join(tempDir, 'decision-receipts', 'outcomes-2026-01.jsonl');
+    await fs.appendFile(receiptsPath, '{"kind":"reser\n');
+    await fs.appendFile(
+      outcomesPath,
+      `${JSON.stringify({
+        consumer: 'knowledge-ranking',
+        contextRef: CONTEXT_REF,
+        kind: 'ranking-selection',
+        value: ['bk-1'],
+        at: '2026-01-15T10:05:00.000Z',
+      })}\n{'nope'\n`,
+    );
+
+    const snapshot = await adapter.readJournal({ consumer: 'knowledge-ranking' });
+    expect(snapshot.skippedLines).toBe(2);
+    // The valid lines of both files survived the skips, in append order.
+    expect(snapshot.receipts).toHaveLength(1);
+    expect(snapshot.receipts[0]?.contextRef).toBe(CONTEXT_REF);
+    expect(snapshot.outcomes).toHaveLength(1);
+    expect(snapshot.outcomes[0]?.value).toEqual(['bk-1']);
+  });
+
+  it('fix round: the budget path still throws on the same corrupt files', async () => {
+    const adapter = new FileDecisionReceiptJournalAdapter(
+      tempDir,
+      () => new Date('2026-01-15T10:00:00.000Z'),
+    );
+    const receiptsPath = path.join(tempDir, 'decision-receipts', '2026-01.jsonl');
+    const outcomesPath = path.join(tempDir, 'decision-receipts', 'outcomes-2026-01.jsonl');
+    await fs.mkdir(path.join(tempDir, 'decision-receipts'), { recursive: true });
+    await fs.writeFile(receiptsPath, `{"kind":"reser\n`, 'utf8');
+    await fs.writeFile(
+      outcomesPath,
+      `${JSON.stringify({
+        consumer: 'knowledge-ranking',
+        contextRef: CONTEXT_REF,
+        kind: 'ranking-selection',
+        value: ['bk-1'],
+        at: '2026-01-15T10:05:00.000Z',
+      })}\n{'nope'\n`,
+      'utf8',
+    );
+
+    await expect(
+      adapter.monthSpendUsd(new Date('2026-01-20T00:00:00.000Z')),
+    ).rejects.toThrow(MalformedReceiptLineError);
+  });
+
   it('lets only one of two concurrent reserves succeed at the budget edge', async () => {
     const clock = () => new Date('2026-03-15T10:00:00.000Z');
     const adapterA = new FileDecisionReceiptJournalAdapter(tempDir, clock);

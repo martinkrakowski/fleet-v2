@@ -25,6 +25,8 @@ import type {
   AppendDecisionOutcome,
   DecisionCallReceipt,
   DecisionReceiptJournalPort,
+  DecisionJournalSnapshot,
+  ReadDecisionJournalQuery,
   ReserveDecisionQuery,
   ReserveDecisionResult,
 } from '../../../application/ports/out/DecisionReceiptJournalPort.out-port.js';
@@ -820,6 +822,10 @@ class InterleavedJournal implements DecisionReceiptJournalPort {
 
   async appendOutcome(_outcome: AppendDecisionOutcome): Promise<void> {
     // Outcomes are not what this journal is here to observe.
+  }
+
+  async readJournal(_query: ReadDecisionJournalQuery): Promise<DecisionJournalSnapshot> {
+    return { receipts: [], outcomes: [], skippedLines: 0 };
   }
 }
 

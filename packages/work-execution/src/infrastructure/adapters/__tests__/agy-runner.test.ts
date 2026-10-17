@@ -3,11 +3,18 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
+import type {
+  CommandExecutorPort,
+  CommandRunOptions,
+  CommandRunResult,
+} from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { StartRunnerSessionRequest } from '../../../application/ports/out/ExecutionRunnerPort.out-port.js';
 import type { AttemptRecord, AttemptRunnerRecord } from '../../../domain/execution-records.js';
 import {
+  AGY_MODEL_PATTERN,
   AGY_RUNNER_ENV_ALLOWLIST,
   AgyRunnerAdapter,
+  agyRunArgv,
   buildAgyRunnerEnv,
   parseAgyRunResult,
 } from '../AgyRunnerAdapter.adapter.js';
@@ -121,12 +128,17 @@ function agyRecord(overrides: Partial<AttemptRunnerRecord> = {}): AttemptRunnerR
 
 function makeAdapter(
   lane: FakeLane,
-  options: { mode?: 'edit-only' | 'full'; resolveAttempt?: () => AttemptRecord | null } = {},
+  options: {
+    mode?: 'edit-only' | 'full';
+    transport?: 'local' | 'ssh';
+    resolveAttempt?: () => AttemptRecord | null;
+  } = {},
 ): AgyRunnerAdapter {
   return new AgyRunnerAdapter({
     executor: new LocalExecutor(),
     agyRunBin: lane.bin,
     ...(options.mode !== undefined ? { mode: options.mode } : {}),
+    ...(options.transport !== undefined ? { transport: options.transport } : {}),
     ...(options.resolveAttempt !== undefined
       ? { resolveAttempt: () => options.resolveAttempt?.() ?? null }
       : {}),
@@ -262,6 +274,88 @@ describe('AgyRunnerAdapter argv (both modes)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// The model is a value, never a flag
+// ---------------------------------------------------------------------------
+
+describe('AgyRunnerAdapter model validation', () => {
+  /** An executor that must never be reached while the models are refused. */
+  function zeroSpawnExecutor(): { port: CommandExecutorPort; spawns: string[] } {
+    const spawns: string[] = [];
+    const port: CommandExecutorPort = {
+      async run(argv: readonly string[]) {
+        spawns.push(argv.join(' '));
+        return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+      },
+    };
+    return { port, spawns };
+  }
+
+  it('refuses a model that would become a flag before anything is spawned', async () => {
+    const lane = await makeFakeLane();
+    const { port, spawns } = zeroSpawnExecutor();
+    const adapter = new AgyRunnerAdapter({ executor: port, agyRunBin: lane.bin });
+
+    for (const model of ['--dangerously-skip-permissions', '-x', 'a b']) {
+      expect(await adapter.startSession(makeStartRequest({ model }))).toEqual({
+        outcome: 'refused',
+        reason: `Refusing model '${model}': it must match ${AGY_MODEL_PATTERN.source} so it can never become a flag on agy's command line`,
+      });
+    }
+    expect(spawns).toEqual([]);
+    await expect(fs.access(path.join(lane.dir, 'args.log'))).rejects.toThrow();
+  });
+
+  it('refuses an empty, whitespace-padded or oversized model and a seat override with one', async () => {
+    const lane = await makeFakeLane();
+    const { port, spawns } = zeroSpawnExecutor();
+    const adapter = new AgyRunnerAdapter({ executor: port, agyRunBin: lane.bin });
+
+    expect(
+      await adapter.startSession(
+        makeStartRequest({
+          model: 'gemini-3.1-pro',
+          seatOverride: {
+            model: '-x',
+            reason: 'operator override',
+            setBy: 'owner',
+            expiresAtIso: '2026-10-17T00:00:00.000Z',
+          },
+        }),
+      ),
+    ).toEqual({
+      outcome: 'refused',
+      reason: `Refusing model '-x': it must match ${AGY_MODEL_PATTERN.source} so it can never become a flag on agy's command line`,
+    });
+    for (const model of [' model', 'model ', 'm\nx', 'm\tx', `${'a'.repeat(129)}`]) {
+      expect(await adapter.startSession(makeStartRequest({ model }))).toMatchObject({
+        outcome: 'refused',
+      });
+    }
+    expect(spawns).toEqual([]);
+    await expect(fs.access(path.join(lane.dir, 'args.log'))).rejects.toThrow();
+  });
+
+  it('accepts the reviewed model shapes on the pinned argv', async () => {
+    const lane = await makeFakeLane();
+    const adapter = makeAdapter(lane);
+
+    for (const model of ['gemini-3.1-pro', 'prov/model-x', 'z-ai/glm-5.3-flash', 'a'.repeat(128)]) {
+      const result = await adapter.startSession(makeStartRequest({ model }));
+      expect(result.outcome).toBe('started');
+      expect(await recordedArgv(lane)).toContain(model);
+    }
+  });
+
+  it('agyRunArgv refuses to build an argv for a flag-shaped model', () => {
+    for (const model of ['--dangerously-skip-permissions', '-x', 'a b', '']) {
+      expect(() =>
+        agyRunArgv({ bin: 'agy-run', worktreePath: '/lanes/att-1', model, mode: 'edit-only' }),
+      ).toThrow(/never become a flag on agy's command line/);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The environment allow-list, per mode
 // ---------------------------------------------------------------------------
 
@@ -298,7 +392,7 @@ describe('AgyRunnerAdapter environment allow-list (both modes)', () => {
     return recordedEnv(lane);
   }
 
-  it('keeps only the six allow-listed variables and drops every credential, in both modes', async () => {
+  it('keeps only the six lane variables and drops every credential, in both modes', async () => {
     try {
       for (const [key, value] of Object.entries({ ...planted, ...allowed })) {
         process.env[key] = value;
@@ -309,7 +403,10 @@ describe('AgyRunnerAdapter environment allow-list (both modes)', () => {
 
         // PATH and HOME come from this host; PWD is set by /bin/sh itself as it
         // starts, never by the adapter, which handed over the allow-list only.
-        expect(Object.keys(env).sort()).toEqual([...AGY_RUNNER_ENV_ALLOWLIST, 'PWD'].sort());
+        // SSH_AUTH_SOCK is planted here and must still be dropped: no ssh
+        // transport is declared, so it belongs to no process in this lane.
+        const laneAllowlist = AGY_RUNNER_ENV_ALLOWLIST.filter((key) => key !== 'SSH_AUTH_SOCK');
+        expect(Object.keys(env).sort()).toEqual([...laneAllowlist, 'PWD'].sort());
         for (const key of Object.keys(allowed)) expect(env[key]).toBe(allowed[key]);
         // Named explicitly, per mode: the ssh agent, both GitHub tokens, every
         // GIT_* variable, every OPENROUTER* and every *_API_KEY.
@@ -325,13 +422,14 @@ describe('AgyRunnerAdapter environment allow-list (both modes)', () => {
     }
   });
 
-  it('names exactly the reviewed allow-list', () => {
+  it('names exactly the reviewed allow-list, with SSH_AUTH_SOCK as the ssh-only entry', () => {
     expect(AGY_RUNNER_ENV_ALLOWLIST).toEqual([
       'PATH',
       'HOME',
       'LANG',
       'LC_ALL',
       'TMPDIR',
+      'SSH_AUTH_SOCK',
       'AGY_BIN',
     ]);
   });
@@ -348,6 +446,78 @@ describe('AgyRunnerAdapter environment allow-list (both modes)', () => {
       const previous = snapshot['GITHUB_TOKEN'];
       if (previous === undefined) delete process.env['GITHUB_TOKEN'];
       else process.env['GITHUB_TOKEN'] = previous;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The environment allow-list across executor transports (D5)
+// ---------------------------------------------------------------------------
+
+describe('AgyRunnerAdapter environment across transports', () => {
+  const planted: Record<string, string> = {
+    SSH_AUTH_SOCK: '/tmp/fleet-agent.sock',
+    GH_TOKEN: 'gho-planted',
+  };
+
+  /** An executor that records the environment each run was handed, and spawns nothing. */
+  function capturingExecutor(): { port: CommandExecutorPort; envs: Record<string, string>[] } {
+    const envs: Record<string, string>[] = [];
+    const port: CommandExecutorPort = {
+      async run(_argv: readonly string[], options?: CommandRunOptions): Promise<CommandRunResult> {
+        envs.push({ ...(options?.env ?? {}) });
+        return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+      },
+    };
+    return { port, envs };
+  }
+
+  it('keeps SSH_AUTH_SOCK in the executor environment only for an ssh transport', async () => {
+    const snapshot = Object.fromEntries(
+      Object.entries(planted).map(([key]) => [key, process.env[key]]),
+    );
+    try {
+      for (const [key, value] of Object.entries(planted)) process.env[key] = value;
+
+      for (const transport of ['local', 'ssh'] as const) {
+        const { port, envs } = capturingExecutor();
+        const adapter = new AgyRunnerAdapter({
+          executor: port,
+          agyRunBin: 'agy-run',
+          transport,
+        });
+        await adapter.startSession(makeStartRequest());
+
+        // The env travels to the executor's local process: for ssh, the local
+        // ssh client. The remote command never receives any of it.
+        expect(envs).toHaveLength(1);
+        if (transport === 'ssh') {
+          expect(envs[0]['SSH_AUTH_SOCK']).toBe('/tmp/fleet-agent.sock');
+        } else {
+          expect(envs[0]['SSH_AUTH_SOCK']).toBeUndefined();
+        }
+        expect(envs[0]['GH_TOKEN']).toBeUndefined();
+      }
+    } finally {
+      for (const [key, value] of Object.entries(snapshot)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it('drops SSH_AUTH_SOCK from a built environment unless the transport is ssh', () => {
+    const previous = process.env['SSH_AUTH_SOCK'];
+    try {
+      process.env['SSH_AUTH_SOCK'] = '/tmp/fleet-agent.sock';
+      expect(buildAgyRunnerEnv(undefined, { transport: 'ssh' })['SSH_AUTH_SOCK']).toBe(
+        '/tmp/fleet-agent.sock',
+      );
+      expect(buildAgyRunnerEnv(undefined, { transport: 'local' })['SSH_AUTH_SOCK']).toBeUndefined();
+      expect(buildAgyRunnerEnv()['SSH_AUTH_SOCK']).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env['SSH_AUTH_SOCK'];
+      else process.env['SSH_AUTH_SOCK'] = previous;
     }
   });
 });

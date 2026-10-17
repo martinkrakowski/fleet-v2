@@ -88,6 +88,10 @@ run --dir "$WT" --model m --effort ultra; check 'an unknown --effort is refused 
 run --dir "$WT" --model m --timeout 5x; check 'a malformed --timeout is refused (2)' '[ "$(rc)" = 2 ]'
 run --dir "$WT" --model m --brief ../x.md; check 'a --brief outside the dir is refused (2)' '[ "$(rc)" = 2 ]'
 run --dir "$WT" --model m --brief /etc/x.md; check 'an absolute --brief is refused (2)' '[ "$(rc)" = 2 ]'
+run --dir "$WT" --model --dangerously-skip-permissions; check 'a --model value that is itself a flag is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
+run --dir "$WT" --model=-x; check 'a --model= value starting with - is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
+run --dir "$WT" --model -x; check 'a --model value starting with - is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
+run --dir "$WT" --model 'a b'; check 'a --model value containing whitespace is refused (2)' '[ "$(rc)" = 2 ] && grep -q "contain whitespace" "$T/e"'
 run --status --wait --dir "$WT"; check 'two modes at once is a usage error (2)' '[ "$(rc)" = 2 ]'
 check 'no fake agy ran during the usage checks' '[ ! -f "$T/args.log" ]'
 

@@ -238,6 +238,10 @@ fi
 
 # A run.
 [ -n "$model" ] || die_usage "a run needs --model <model>; never rely on agy's default model"
+# The model travels as one argv word beside --model, never as a flag of its own:
+# a value like --dangerously-skip-permissions or -x, or one with whitespace in
+# it, would be read by agy as flags and is refused before anything is built.
+case "$model" in -*|*[[:space:]]*|'') die_usage "--model must not start with '-' or contain whitespace" ;; esac
 [ -f "$dir/$brief" ] || { echo "agy-run: no brief at $dir/$brief" >&2; exit 1; }
 git -C "$dir" check-ignore -q "$brief" || { echo "agy-run: $brief is not gitignored in $dir; a brief is never committed" >&2; exit 1; }
 

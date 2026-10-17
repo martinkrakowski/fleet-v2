@@ -21,6 +21,19 @@
  *    what makes the wall-clock budget below safe: an exceeded budget kills the
  *    dispatcher, not the lane, and the lane is still reachable through
  *    `agy-run --status` / `--abort`.
+ *  - **The model is a value, never a flag.** The seat's model must match
+ *    `^[A-Za-z0-9][A-Za-z0-9._/:#@-]{0,127}$` or the run is refused before
+ *    anything is spawned: a model such as `--dangerously-skip-permissions`
+ *    or `-x` would otherwise arrive on agy's command line as a flag of its
+ *    own, and whitespace would split it into several.
+ *  - **The environment allow-list governs the local process, never a remote
+ *    command.** `buildAgyRunnerEnv` builds the environment handed to the
+ *    executor that owns the lane-runner host's subprocesses — for an `ssh`
+ *    executor that is the local ssh client's environment, and the remote
+ *    command itself runs in the lane host's login environment, which ssh
+ *    never populates from it. `SSH_AUTH_SOCK` is kept only for an `ssh`
+ *    transport (the local client's agent) and is never passed into the
+ *    remote command.
  *  - **There is no ambiguous middle.** A run that ended with a non-empty
  *    response is `started`; exit 1 or 4 (agy failed, or reported a model or
  *    agent error), an empty response, a refused busy worktree (75) and a
@@ -70,11 +83,17 @@ const AGY_RUN_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 const AGY_RUN_DEFAULT_TIMEOUT_MS = 45 * 60 * 1000;
 
 /**
- * The only host environment variables an agy lane may inherit (D5, D7). Every
- * other variable is dropped, in both modes: `SSH_AUTH_SOCK`, `GH_TOKEN`,
+ * The only host environment variables the lane's executor process may inherit
+ * (D5, D7). This environment governs the LOCAL process the executor spawns —
+ * for an ssh executor, the local ssh client; the remote command on the lane
+ * host runs in that host's login environment, which ssh never populates from
+ * this. Every other variable is dropped, in both modes: `GH_TOKEN`,
  * `GITHUB_TOKEN`, every `GIT_*`, every `OPENROUTER*` and every `*_API_KEY`.
  * `HOME` stays because agy's sign-in lives under it; `full` can read anything
  * that user can read, which is what the security text says out loud.
+ * `SSH_AUTH_SOCK` is the one ssh-transport-only allowance: the local ssh
+ * client's agent, kept only when the executor transport is `ssh` and never
+ * passed into the remote command.
  */
 export const AGY_RUNNER_ENV_ALLOWLIST: readonly string[] = [
   'PATH',
@@ -82,15 +101,34 @@ export const AGY_RUNNER_ENV_ALLOWLIST: readonly string[] = [
   'LANG',
   'LC_ALL',
   'TMPDIR',
+  'SSH_AUTH_SOCK',
   'AGY_BIN',
 ];
+
+/** The executor transport the lane's environment is built for (D5). */
+export interface AgyRunnerEnvOptions {
+  /**
+   * Transport of the executor owning the lane-runner host's subprocesses. The
+   * allow-list applies to that local process — for `ssh`, the local ssh
+   * client — and `SSH_AUTH_SOCK` is kept only then; an undeclared transport
+   * keeps the trimmed environment.
+   */
+  readonly transport?: 'local' | 'ssh';
+}
 
 /** Build the sanitized agy lane environment from the allow-list plus overrides. */
 export function buildAgyRunnerEnv(
   overrides?: Readonly<Record<string, string>>,
+  options?: AgyRunnerEnvOptions,
 ): Record<string, string> {
+  // SSH_AUTH_SOCK belongs to the local ssh client only; a local lane child
+  // and a remote command never receive it.
+  const sshTransport = options?.transport === 'ssh';
   const sanitized: Record<string, string> = {};
   for (const key of AGY_RUNNER_ENV_ALLOWLIST) {
+    if (key === 'SSH_AUTH_SOCK' && !sshTransport) {
+      continue;
+    }
     const value = process.env[key];
     if (value !== undefined) {
       sanitized[key] = value;
@@ -114,6 +152,22 @@ function resolveBundledAgyRunPath(): string {
 
 const DEFAULT_AGY_RUN_PATH = resolveBundledAgyRunPath();
 
+/**
+ * The only shape a model may take on agy-run's argv: at most 128 characters,
+ * starting with a letter or digit, and never a `-`, whitespace or any other
+ * character that could make it read as a flag or split into several words.
+ */
+export const AGY_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/:#@-]{0,127}$/;
+
+/** True when `model` is safe to hand to agy-run's `--model` as one value. */
+export function isValidAgyModel(model: string): boolean {
+  return AGY_MODEL_PATTERN.test(model);
+}
+
+function agyModelRefusal(model: string): string {
+  return `Refusing model '${model}': it must match ${AGY_MODEL_PATTERN.source} so it can never become a flag on agy's command line`;
+}
+
 /** The argv of one agy lane, exactly as pinned per mode (D7). */
 export function agyRunArgv(options: {
   readonly bin: string;
@@ -121,6 +175,11 @@ export function agyRunArgv(options: {
   readonly model: string;
   readonly mode: AgyRunnerMode;
 }): string[] {
+  // The model is one value beside --model, never a flag of its own: refuse
+  // anything that could be read as one before any argv is built.
+  if (!isValidAgyModel(options.model)) {
+    throw new Error(agyModelRefusal(options.model));
+  }
   return [
     options.bin,
     '--dir',
@@ -191,6 +250,14 @@ export interface AgyRunnerAdapterOptions {
   readonly mode?: AgyRunnerMode;
   /** Path of the agy-run script; the bundled `bin/agy-run` when found, else `agy-run` from PATH. */
   readonly agyRunBin?: string;
+  /**
+   * Transport of the executor owning the lane-runner host's subprocesses (D5).
+   * The environment allow-list governs that local process — for `ssh`, the
+   * local ssh client, which is then the only place `SSH_AUTH_SOCK` is kept;
+   * the remote command runs in the lane host's login environment and never
+   * receives it. An undeclared transport keeps the trimmed environment.
+   */
+  readonly transport?: 'local' | 'ssh';
   /** Capability overrides on top of the enforced defaults. */
   readonly capabilities?: Partial<RunnerIsolationCapabilities>;
   /** Optional resolver for cross-process lookup of an attempt's worktree path when not cached in memory. */
@@ -270,6 +337,11 @@ export class AgyRunnerAdapter implements ExecutionRunnerPort {
     const model = seatOverride?.model ?? request.model ?? request.modelAssignment?.model;
     if (!model || model.trim() === '') {
       return { outcome: 'refused', reason: 'No model specified for runner session' };
+    }
+    // The model is a value beside --model, never a flag: refuse anything that
+    // could be read as one before a single process is spawned.
+    if (!isValidAgyModel(model)) {
+      return { outcome: 'refused', reason: agyModelRefusal(model) };
     }
     // agy's argv is pinned: no --agent and no --variant exist. A seat that
     // names one is refused rather than quietly run as a different seat.
@@ -448,15 +520,18 @@ export class AgyRunnerAdapter implements ExecutionRunnerPort {
 
   /**
    * Run one agy-run argv on the lane-runner host's executor with the agy
-   * environment allow-list. A refused command is a result like any other; only
-   * an unreadable executor throws, and the caller maps that to a failed run.
+   * environment allow-list, which governs the local process the executor
+   * spawns (the local ssh client when the transport is ssh) — never a remote
+   * command, whose environment is the lane host's login environment. A
+   * refused command is a result like any other; only an unreadable executor
+   * throws, and the caller maps that to a failed run.
    */
   private async run(
     argv: readonly string[],
     options?: { readonly timeoutMs?: number },
   ): Promise<{ readonly exitCode: number | null; readonly signal: string | null; readonly stdout: string; readonly stderr: string; readonly error?: string }> {
     return this.options.executor.run(argv, {
-      env: buildAgyRunnerEnv(),
+      env: buildAgyRunnerEnv(undefined, { transport: this.options.transport }),
       ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       maxBufferBytes: AGY_RUN_MAX_BUFFER_BYTES,
     });

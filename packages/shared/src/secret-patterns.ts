@@ -40,6 +40,34 @@ export const SECRET_PATTERNS: readonly RegExp[] = [
   /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/,
 ];
 
+/**
+ * The complete registry mirrored from `scripts/lane-diff-check.sh` (S2): all
+ * 17 named patterns, in the script's table order, with each POSIX ERE
+ * translated to an equivalent JS RegExp. This is the registry the lane diff
+ * check scans with; `SECRET_PATTERNS` above stays untouched for the contexts
+ * that already rely on it. The matched text is never reported — only the
+ * rule name.
+ */
+export const LANE_DIFF_SECRET_PATTERNS: readonly NamedSecretPattern[] = [
+  { name: 'aws-access-key', regex: /AKIA[0-9A-Z]{16}/ },
+  { name: 'github-token', regex: /gh[pousr]_[A-Za-z0-9]{20,}/ },
+  { name: 'github-fine-grained-token', regex: /github_pat_[A-Za-z0-9_]{20,}/ },
+  { name: 'private-key-block', regex: /BEGIN [A-Z ]*PRIVATE KEY/ },
+  { name: 'google-oauth-access-token', regex: /ya29\.[A-Za-z0-9_-]{20,}/ },
+  { name: 'google-api-key', regex: /AIza[0-9A-Za-z_-]{30,}/ },
+  { name: 'openai-style-key', regex: /sk-[A-Za-z0-9_-]{20,}/ },
+  { name: 'openrouter-key', regex: /sk-or-v1-[0-9a-f]{20,}/ },
+  { name: 'slack-token', regex: /xox[abpr]-[A-Za-z0-9-]{10,}/ },
+  { name: 'jwt', regex: /eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/ },
+  { name: 'ssh-public-key-material', regex: /ssh-(rsa|ed25519|dss|ecdsa) AAAA[A-Za-z0-9+/]{20,}/ },
+  { name: 'opencode-server-password', regex: /OPENCODE_SERVER_PASSWORD\s*=\s*\S+/ },
+  { name: 'agy-oauth-file', regex: /antigravity-oauth-token/ },
+  { name: 'home-credential-path', regex: /\/home\/[a-z]+\/\.(ssh|config\/gh|gemini|aws|docker\/config\.json)/ },
+  { name: 'password-assignment', regex: /[Pp]assword\s*[:=]\s*["'][^"']{6,}["']/ },
+  { name: 'token-assignment', regex: /[Tt]oken\s*[:=]\s*["'][A-Za-z0-9_./+=-]{16,}["']/ },
+  { name: 'basic-auth-url', regex: /https?:\/\/[^/:@\s]+:[^/@\s]{6,}@/ },
+];
+
 /** True when any secret pattern matches anywhere in `text`. */
 export function containsSecretShape(text: string): boolean {
   return SECRET_PATTERNS.some((pattern) => pattern.test(text));

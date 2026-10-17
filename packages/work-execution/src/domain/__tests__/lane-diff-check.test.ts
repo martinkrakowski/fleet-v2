@@ -171,9 +171,22 @@ describe('checkLaneDiff (allowed prefixes)', () => {
       const verdict = checkLaneDiff({
         changedPaths: [{ path: 'packages/x/src/a.ts', status: 'modified' }],
         ...(allowedPathPrefixes !== undefined ? { allowedPathPrefixes } : {}),
-      } as Parameters<typeof checkLaneDiff>[0]);
-      expect(verdict.findings).toEqual([{ path: 'packages/x/src/a.ts', rule: 'outside-allowed-paths' }]);
+      } as unknown as Parameters<typeof checkLaneDiff>[0]);
+      expect(verdict.findings).toEqual([
+        { path: 'packages/x/src/a.ts', rule: 'outside-allowed-paths' },
+        { path: 'packages/x/src/a.ts', rule: 'secret-patterns-missing' },
+      ]);
     }
+  });
+
+  it('an empty secretPatterns list is a refusal finding, never a silent pass', () => {
+    const verdict = checkLaneDiff({
+      changedPaths: [{ path: 'packages/x/src/a.ts', status: 'modified', addedLines: [{ line: 1, text: 'export const a = 2;' }] }],
+      allowedPathPrefixes: PREFIXES,
+      secretPatterns: [],
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.findings).toEqual([{ path: 'packages/x/src/a.ts', rule: 'secret-patterns-missing' }]);
   });
 });
 

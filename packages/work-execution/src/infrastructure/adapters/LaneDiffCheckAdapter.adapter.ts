@@ -24,7 +24,7 @@ import type {
   LaneDiffFileStatus,
 } from '../../domain/lane-diff-check.js';
 import { checkLaneDiff } from '../../domain/lane-diff-check.js';
-import { namedSecretPatterns } from '@fleet/shared';
+import { LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
 interface CommandOutcome {
   readonly ok: boolean;
@@ -181,7 +181,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
   }
 }
 
-/** The shared registry (Q0) with rule names; imported lazily to stay injected. */
+/** The complete script registry (all 17 patterns) with rule names. */
 function defaultSecretPatterns(): readonly LaneDiffSecretPattern[] {
-  return namedSecretPatterns().map((entry) => ({ name: entry.name, regex: entry.regex }));
+  return LANE_DIFF_SECRET_PATTERNS;
 }

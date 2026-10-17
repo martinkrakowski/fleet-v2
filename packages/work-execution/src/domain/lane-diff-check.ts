@@ -33,8 +33,12 @@ export interface CheckLaneDiffInput {
   readonly allowedPathPrefixes: readonly string[];
   /** Policy additions to the fixed protected list. */
   readonly policyProtectedPaths?: readonly string[];
-  /** Secret shapes; when omitted no secret scan runs. */
-  readonly secretPatterns?: readonly LaneDiffSecretPattern[];
+  /**
+   * Secret shapes to scan with. Required and never empty: an empty list is
+   * a refusal (`secret-patterns-missing`), never a silent pass — the check
+   * must not report clean when it could not scan.
+   */
+  readonly secretPatterns: readonly LaneDiffSecretPattern[];
 }
 
 export interface LaneDiffFinding {
@@ -124,6 +128,7 @@ export function checkLaneDiff(input: CheckLaneDiffInput): LaneDiffVerdict {
   const findings: LaneDiffFinding[] = [];
   const prefixes = input.allowedPathPrefixes ?? [];
   const policyProtectedPaths = input.policyProtectedPaths ?? [];
+  // Fail closed: a missing list is the same as an empty one — a refusal.
   const patterns = input.secretPatterns ?? [];
 
   for (const changed of input.changedPaths) {
@@ -146,7 +151,13 @@ export function checkLaneDiff(input: CheckLaneDiffInput): LaneDiffVerdict {
       findings.push({ path: changed.path, rule: 'protected-path' });
     }
     // Rule 3: secret shapes on added lines, with path, line and rule only.
-    findings.push(...secretFindings(changed, patterns));
+    // Fail closed: without any pattern the check cannot have scanned, so it
+    // refuses instead of passing.
+    if (patterns.length === 0) {
+      findings.push({ path: changed.path, rule: 'secret-patterns-missing' });
+    } else {
+      findings.push(...secretFindings(changed, patterns));
+    }
   }
 
   return { ok: findings.length === 0, findings };

@@ -396,6 +396,7 @@ __metadata:
   dependencies:
     "@eslint/js": "npm:^9.0.0"
     "@fleet/evidence-and-acceptance": "workspace:*"
+    "@fleet/shared": "workspace:*"
     eslint: "npm:^9.0.0"
     typescript: "npm:^5.5.4"
     typescript-eslint: "npm:^8.0.0"
@@ -513,6 +514,7 @@ __metadata:
     "@fleet/brief-knowledge": "workspace:*"
     "@fleet/evidence-and-acceptance": "workspace:*"
     "@fleet/operator-coordination": "workspace:*"
+    "@fleet/shared": "workspace:*"
     eslint: "npm:^9.0.0"
     typescript: "npm:^5.5.4"
     typescript-eslint: "npm:^8.0.0"

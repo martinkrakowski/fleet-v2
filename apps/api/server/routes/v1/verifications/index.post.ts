@@ -3,6 +3,7 @@ import { getEvidenceUseCases } from "../../../wiring/evidence/composition.js";
 import { evidenceResponse, isNotImplemented } from "../../../wiring/evidence/errors.js";
 import { readObjectBody } from "../../../wiring/http-input";
 import { workComposition } from "../../../wiring/work/composition.js";
+import { resolveInstallationHostForRole } from "@fleet/work-execution";
 
 type VerificationRequestBody = Record<string, unknown>;
 
@@ -32,7 +33,32 @@ async function bindImplementerSeat(
 
 export default defineEventHandler(async (event) => {
   const useCase = getEvidenceUseCases().requestVerification;
-  const body = await readObjectBody(event);
+  let body = await readObjectBody(event);
+  // A v2 installation names the verifier host itself (plan section 8); the
+  // caller never supplies one. The host comes from the installation's hosts
+  // entry — the verifier host's name.
+  const installation = workComposition().installation;
+  if (installation?.schemaVersion === 2) {
+    if (body.hostId !== undefined) {
+      throw createError({
+        statusCode: 400,
+        statusMessage:
+          "hostId is not accepted for a v2 installation; the host comes from the installation's hosts entry (the verifier host's name)",
+      });
+    }
+    const verifierHostId = resolveInstallationHostForRole(
+      installation,
+      "verifier",
+    );
+    if (verifierHostId === undefined) {
+      throw createError({
+        statusCode: 400,
+        statusMessage:
+          "the installation declares no verifier host; add one to the installation's hosts entry before requesting verification",
+      });
+    }
+    body = { ...body, hostId: verifierHostId };
+  }
   let bound: VerificationRequestBody | { outcome: "rejected"; reason: string };
   try {
     bound = await bindImplementerSeat(body);

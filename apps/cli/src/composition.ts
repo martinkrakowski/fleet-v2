@@ -53,9 +53,11 @@ import {
   forgeActionScope,
   isSafeSshHost,
   observationEventKind,
+  resolveExecutionRunnerHost,
   resolveInstallationForgeMode,
   resolveRoleExecutors,
   resolveRunnerCapabilityProfile,
+  type ExecutionRunnerHost,
   type GhInvocationResult,
   type SubprocessRunner,
 } from '@fleet/work-execution';
@@ -179,6 +181,15 @@ export interface ResolvedRunnerSettings {
 /**
  * Resolves runner and worktree host configuration.
  * Resolution precedence: options.<x> ?? installation.<x> ?? <env read>.
+ *
+ * A v2 installation's own hosts section is the only routing source (plan
+ * section 3, "Runtime reads the selected host, never the environment"): the
+ * environment variables that redirect a legacy run (`OCM_REMOTE_PORT`,
+ * `OCM_HOST`, `FLEET_WORKTREE_SSH_HOST`, `FLEET_RUNNER_*`) are ignored, the
+ * `worktreeSshHost` override is dropped, and only the ocm-run binary path
+ * (`FLEET_OCM_RUN_BIN`) stays environmental. The selected lane-runner host is
+ * passed to the runner adapter separately through `resolveExecutionRunnerHost`.
+ * A v1 or absent installation keeps today's behaviour byte-for-byte.
  */
 export function resolveRunnerSettings(
   options?: FleetCliRuntimeOptions,
@@ -186,6 +197,14 @@ export function resolveRunnerSettings(
   env: Record<string, string | undefined> = process.env,
 ): ResolvedRunnerSettings {
   const inst = options?.installation ?? installation;
+  if (inst?.schemaVersion === 2) {
+    return {
+      ocmRunBin:
+        options?.ocmRunBin ??
+        inst?.runner?.ocmRunBin ??
+        (env.FLEET_OCM_RUN_BIN?.trim() || undefined),
+    };
+  }
   const parsedPort = env.OCM_REMOTE_PORT ? Number(env.OCM_REMOTE_PORT) : Number.NaN;
   return {
     worktreeSshHost:
@@ -394,6 +413,8 @@ function runGitCommand(args: readonly string[]): Promise<string> {
  * adapters the driver derives input from are exposed alongside them.
  */
 export interface FleetCliRuntime {
+  /** The parsed installation the runtime was composed with, if any. */
+  readonly installation?: FleetInstallation;
   readonly coordination: {
     readonly projectProfileRepository: ProjectProfileRepositoryAdapter;
     readonly coordinationRequestRepository: CoordinationRequestRepositoryAdapter;
@@ -457,6 +478,11 @@ export interface FleetCliRuntime {
     readonly executionJournal: ExecutionJournalAdapter;
     readonly workspace: WorkspaceAdapter;
     readonly runner: ExecutionRunnerAdapter;
+    /**
+     * The installation's selected lane-runner host (v2 mode); undefined for
+     * a v1 or absent installation, which keeps the adapter in legacy mode.
+     */
+    readonly runnerHost?: ExecutionRunnerHost;
     /** The runner entry's declared lane budget; undefined without one. */
     readonly runnerMaxLanes?: number;
     readonly attemptArtifact: AttemptArtifactAdapter;
@@ -501,10 +527,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     : undefined;
   const runnerProfile = resolveRunnerCapabilityProfile(installationModel?.hosts);
   const forgeMode = resolveInstallationForgeMode(options?.installation);
+  // The installation's selected lane-runner host (v2): its presence routes the
+  // runner from the host entry and ignores the routing environment (plan
+  // section 3). Undefined for v1 and absent installations keeps legacy mode.
+  const runnerHost = resolveExecutionRunnerHost(options?.installation);
   // One executor per role: the installation's hosts (v2) or the v1 mapping
   // decides local versus ssh per host; the orchestrator runs where this root
   // runs. runnerRemoteHost/ocmRunBin stay runner settings, separate from the
-  // worktree executor's host.
+  // worktree executor's host. For v2 the worktreeSshHost override is never
+  // set (resolveRunnerSettings drops it), so the hosts section decides alone.
   const roleExecutors = resolveRoleExecutors(options?.installation, {
     worktreeSshHost,
   });
@@ -809,6 +840,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     ocmRunBin,
     remotePort: runnerRemotePort,
     remoteHost: runnerRemoteHost,
+    // A v2 installation routes the runner from its selected lane-runner host;
+    // the host's presence switches the adapter to v2 mode (no env fallbacks,
+    // OCM_HOST/OCM_REMOTE_PORT/OPENCODE_AUTH_FILE set from the host alone).
+    ...(runnerHost !== undefined ? { host: runnerHost } : {}),
     executor: roleExecutors.orchestrator,
     runSubprocess: options?.runSubprocess,
     // The capability report comes from the installation's lane-runner entry
@@ -1140,6 +1175,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     executionJournal,
     workspace,
     runner,
+    ...(runnerHost !== undefined ? { runnerHost } : {}),
     // The runner entry's lane budget (D4/D6 plan item 4); undefined without a
     // declared lane-runner entry, in which case the request default applies.
     runnerMaxLanes: runnerProfile?.maxLanes,
@@ -1218,5 +1254,11 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
 
   attemptLookup.inspectAttempt = execution.inspectAttempt;
 
-  return { coordination, knowledge, evidence, execution };
+  return {
+    installation: options?.installation,
+    coordination,
+    knowledge,
+    evidence,
+    execution,
+  };
 }

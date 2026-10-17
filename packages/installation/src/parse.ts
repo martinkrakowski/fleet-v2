@@ -1,5 +1,7 @@
 import { isAbsolute } from 'node:path';
 
+import { isValidHostName } from '@fleet/shared';
+
 import { AGY_SECURITY_TEXT_VERSION } from './agy-security.js';
 
 import type {
@@ -195,13 +197,6 @@ const CHAIN_TRIGGERS: readonly ChainTrigger[] = [
 
 const PROCEDURE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const FORBIDDEN_PROCEDURE_NAMES: ReadonlySet<string> = new Set([
-  'constructor',
-  'prototype',
-  '__proto__',
-  'hasownproperty',
-]);
-const HOST_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-const FORBIDDEN_HOST_NAMES: ReadonlySet<string> = new Set([
   'constructor',
   'prototype',
   '__proto__',
@@ -797,14 +792,14 @@ function parseShelfSection(
 // Schema v2 sections
 // ---------------------------------------------------------------------------
 
-function isValidHostName(name: string): boolean {
-  return (
-    name.length <= 128 &&
-    HOST_NAME_PATTERN.test(name) &&
-    !name.includes('..') &&
-    !FORBIDDEN_HOST_NAMES.has(name.toLowerCase())
-  );
-}
+/**
+ * The loader's host-map key rule, exported for the composition roots' adapters
+ * (H3b): a host name passed to a runner adapter must be one the loader would
+ * accept as a v2 `hosts` key, so an unvalidated name can never reach a
+ * subprocess. The implementation lives in `@fleet/shared` so the runtime
+ * adapters validate with the same rule without a cross-context dependency.
+ */
+export { isValidHostName };
 
 function readRequiredEnum<T extends string>(
   record: JsonObject,

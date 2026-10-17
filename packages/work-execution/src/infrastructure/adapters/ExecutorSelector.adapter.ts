@@ -16,6 +16,7 @@
 
 import { LocalExecutor } from './LocalExecutor.adapter.js';
 import { SshExecutor } from './SshExecutor.adapter.js';
+import type { ExecutionRunnerHost } from './ExecutionRunnerAdapter.adapter.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { RunnerIsolationCapabilities } from '../../application/ports/out/ExecutionRunnerPort.out-port.js';
 
@@ -147,6 +148,86 @@ function verifierSpecOf(
   if (verification === undefined) return undefined;
   if ('sshHost' in verification && verification.sshHost !== undefined) {
     return { transport: 'ssh', sshAlias: verification.sshHost };
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// The selected lane-runner host (plan section 3, H3b): what the roots hand to
+// ExecutionRunnerAdapter for a v2 installation
+// ---------------------------------------------------------------------------
+
+/** One host as the runner-host resolver reads it (a v2 `hosts` entry). */
+export interface RunnerHostSelectionSpec {
+  readonly transport?: 'local' | 'ssh';
+  readonly sshAlias?: string;
+  readonly roles?: readonly string[];
+  readonly runner?: { readonly port?: number; readonly authFile?: string };
+}
+
+/** The installation shape the runner-host resolver reads. */
+export interface InstallationRunnerHostInputs {
+  readonly schemaVersion?: number;
+  readonly hosts?: Readonly<Record<string, RunnerHostSelectionSpec>>;
+}
+
+/**
+ * The installation's selected lane-runner host, as `ExecutionRunnerHost`, for
+ * a v2 installation only. A v1 or absent installation returns `undefined`, so
+ * the roots keep today's environment-based behaviour byte-for-byte, and for
+ * v2 the host entry is the only source of the runner's routing: the roots
+ * never read `OCM_REMOTE_PORT`, `OCM_HOST` or `FLEET_WORKTREE_SSH_HOST`.
+ *
+ * The host name is the loader-validated host-map key; the port is the
+ * server's port on its own host (the adapter and `ocm-run` derive the dial
+ * port), and `authFile` is the orchestrator-side file `ocm-run` sources. A
+ * lane-runner host without a runner section still selects the host: the
+ * adapter's v2 mode then refuses dispatch for the missing port instead of
+ * silently falling back to the environment.
+ */
+export function resolveExecutionRunnerHost(
+  installation?: InstallationRunnerHostInputs,
+): ExecutionRunnerHost | undefined {
+  if (installation?.schemaVersion !== 2 || installation.hosts === undefined) {
+    return undefined;
+  }
+  for (const name of Object.keys(installation.hosts)) {
+    const host = installation.hosts[name];
+    if (!host.roles?.includes('lane-runner')) continue;
+    return {
+      hostName: name,
+      transport: host.transport === 'ssh' ? 'ssh' : 'local',
+      ...(host.transport === 'ssh' &&
+      host.sshAlias !== undefined &&
+      host.sshAlias.trim() !== ''
+        ? { sshAlias: host.sshAlias }
+        : {}),
+      remotePort:
+        typeof host.runner?.port === 'number' ? host.runner.port : null,
+      ...(host.runner?.authFile !== undefined &&
+      host.runner.authFile.trim() !== ''
+        ? { authFile: host.runner.authFile }
+        : {}),
+    };
+  }
+  return undefined;
+}
+
+/**
+ * The name of the first host carrying `role` in a v2 installation's hosts
+ * section, or `undefined` for a v1 or absent installation (which keeps the
+ * operator-typed value). This is the loader-validated host-map key the
+ * installation records itself, so an operator never types a host name.
+ */
+export function resolveInstallationHostForRole(
+  installation?: InstallationRunnerHostInputs,
+  role = 'lane-runner',
+): string | undefined {
+  if (installation?.schemaVersion !== 2 || installation.hosts === undefined) {
+    return undefined;
+  }
+  for (const name of Object.keys(installation.hosts)) {
+    if (installation.hosts[name]?.roles?.includes(role)) return name;
   }
   return undefined;
 }

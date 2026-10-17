@@ -18,6 +18,10 @@ import type {
   BriefModelAssignment,
   CommandCompletionReceipt,
 } from '@fleet/work-execution';
+import {
+  resolveExecutionRunnerHost,
+  resolveInstallationHostForRole,
+} from '@fleet/work-execution';
 import { resolveImplementerSeat } from '@fleet/work-execution/use-cases';
 import type {
   FindingDispositionRecord,
@@ -537,11 +541,27 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
           );
         }
       }
+      // A v2 installation records the installation's own host name (plan
+      // section 3); the operator never types one. The host comes from the
+      // installation's hosts entry — the lane-runner host's name.
+      const v2HostId = resolveExecutionRunnerHost(rt.installation)?.hostName;
+      if (rt.installation?.schemaVersion === 2) {
+        if (p['hostId'] !== undefined) {
+          throw new CliUsageError(
+            "'hostId' is not accepted for a v2 installation; the host comes from the installation's hosts entry (the lane-runner host's name)",
+          );
+        }
+        if (v2HostId === undefined) {
+          throw new CliUsageError(
+            "the installation declares no lane-runner host; add one to the installation's hosts entry before reserving capacity",
+          );
+        }
+      }
       return rt.execution.reserveExecutionCapacity.reserveExecutionCapacity({
         reservationId: str(p, 'reservationId'),
         attemptId: str(p, 'attemptId'),
         workOrderId: str(p, 'workOrderId'),
-        hostId: str(p, 'hostId'),
+        hostId: v2HostId ?? str(p, 'hostId'),
         worktreePath: str(p, 'worktreePath'),
         maxSlots: declaredMaxLanes ?? num(p, 'maxSlots', 1),
         nowIso: optStr(p, 'nowIso'),
@@ -706,6 +726,27 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   },
   evidence: {
     'request-verification': async (p, rt) => {
+      // A v2 installation names the verifier host itself (plan section 8);
+      // the operator never supplies one. The host comes from the
+      // installation's hosts entry — the verifier host's name. A usage error
+      // precedes the seat binding: no domain lookup is owed to a request the
+      // boundary refuses.
+      const v2HostId = resolveInstallationHostForRole(
+        rt.installation,
+        'verifier',
+      );
+      if (rt.installation?.schemaVersion === 2) {
+        if (p['hostId'] !== undefined) {
+          throw new CliUsageError(
+            "'hostId' is not accepted for a v2 installation; the host comes from the installation's hosts entry (the verifier host's name)",
+          );
+        }
+        if (v2HostId === undefined) {
+          throw new CliUsageError(
+            "the installation declares no verifier host; add one to the installation's hosts entry before requesting verification",
+          );
+        }
+      }
       // The assessment records the attempt's own implementer seat at creation;
       // an unresolvable seat is a typed rejection, never an assumed model.
       const seat = await bindImplementerSeat(rt, p);
@@ -718,7 +759,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         attemptId: str(p, 'attemptId'),
         candidateHeadSha: str(p, 'candidateHeadSha'),
         policyRevision: str(p, 'policyRevision'),
-        hostId: str(p, 'hostId'),
+        hostId: v2HostId ?? str(p, 'hostId'),
         implementerModel: seat.implementerModel,
         requiredChecks: strArr(p, 'requiredChecks'),
         nowIso: optStr(p, 'nowIso'),
@@ -1159,7 +1200,12 @@ export async function doctorCommand(
   }
   const probes = options.probes ?? createNodeDoctorProbes();
   const lines: DoctorLine[] = [];
-  for await (const doctorLine of runDoctor(loadResult, probes, { probeSeats })) {
+  for await (const doctorLine of runDoctor(loadResult, probes, {
+    probeSeats,
+    // H3b: the routing check inspects the operator's environment; the engine
+    // itself never reads process.env.
+    env: process.env,
+  })) {
     lines.push(doctorLine);
     io.stdout(json ? `${JSON.stringify(doctorLine)}\n` : `${formatDoctorLine(doctorLine)}\n`);
   }

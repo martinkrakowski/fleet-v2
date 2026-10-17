@@ -205,6 +205,34 @@ describe('ExecutionRunnerAdapter v2 host routing (H3a)', () => {
     expect(envs).toEqual([]);
   });
 
+  it('refuses a host name that fails the loader host-name rule (H3b)', async () => {
+    plantStaleRoutingEnvironment();
+    const { runner, envs } = scriptedRunner();
+    const adapter = new ExecutionRunnerAdapter({
+      runSubprocess: runner,
+      host: {
+        hostName: '../escape',
+        transport: 'ssh',
+        sshAlias: 'm',
+        remotePort: 4166,
+      },
+    });
+
+    // The name passed in is the loader-validated host-map key; a name the
+    // loader would refuse never reaches a subprocess.
+    expect(adapter.configuredHostName()).toBeNull();
+
+    const result = await adapter.startSession(startRequest);
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: "Runner host name '../escape' is missing or not a valid installation host name; a dispatch cannot be addressed",
+    });
+    expect(envs).toEqual([]);
+    // Nothing is recorded under the invalid name.
+    expect(adapter.describeRunner()?.hostName).toBeNull();
+  });
+
   it('keeps OCM_HOST and OCM_REMOTE_PORT out of the inherited allow-list', () => {
     expect(RUNNER_ENV_ALLOWLIST).not.toContain('OCM_HOST');
     expect(RUNNER_ENV_ALLOWLIST).not.toContain('OCM_REMOTE_PORT');

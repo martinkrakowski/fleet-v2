@@ -9,7 +9,10 @@ import type {
 import type { DoctorProbes, SeatProbeResult } from '../probes.js';
 import type { DoctorLine } from '../types.js';
 import { doctorExitCode, runDoctor } from '../run-doctor.js';
-import type { DoctorableInstallation } from '../run-doctor.js';
+import type {
+  DoctorableInstallation,
+  RunDoctorOptions,
+} from '../run-doctor.js';
 import { createNodeDoctorProbes } from '../probes-node.js';
 
 /** A v2 model: one local runner host, one ssh verifier, two tools, two seats. */
@@ -120,7 +123,7 @@ function fakeProbes(
 async function collect(
   result: DoctorableInstallation,
   probes: DoctorProbes,
-  options = { probeSeats: true },
+  options: RunDoctorOptions = { probeSeats: true },
 ): Promise<DoctorLine[]> {
   const lines: DoctorLine[] = [];
   for await (const line of runDoctor(result, probes, options)) {
@@ -128,6 +131,67 @@ async function collect(
   }
   return lines;
 }
+
+describe('runDoctor routing environment (H3b)', () => {
+  const model = sampleModel();
+
+  it('reports one FAIL line per routing variable set while a v2 installation is loaded', async () => {
+    const { probes } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes, {
+      probeSeats: true,
+      env: {
+        OCM_REMOTE_PORT: '59999',
+        OCM_HOST: 'stale-tunnel-host',
+        FLEET_WORKTREE_SSH_HOST: '',
+        FLEET_OCM_RUN_BIN: '/opt/fleet/ocm-run',
+      },
+    });
+
+    const routingLines = lines.filter(
+      (doctorLine) => doctorLine.check === 'routing-env',
+    );
+    expect(routingLines).toHaveLength(2);
+    // Each line names the variable and never values it.
+    expect(routingLines.map((doctorLine) => doctorLine.subject).sort()).toEqual(
+      ['OCM_HOST', 'OCM_REMOTE_PORT'],
+    );
+    for (const doctorLine of routingLines) {
+      expect(doctorLine).toMatchObject({
+        scope: 'installation',
+        status: 'FAIL',
+        detail: `${doctorLine.subject} is set but ignored for v2; set it on the host entry`,
+      });
+      expect(doctorLine.detail).not.toContain('59999');
+      expect(doctorLine.detail).not.toContain('stale-tunnel-host');
+    }
+    expect(doctorExitCode(lines)).toBe(1);
+  });
+
+  it('reports no routing lines for a v1 installation or an unset environment', async () => {
+    const { probes } = fakeProbes();
+    const v1Result: DoctorableInstallation = {
+      status: 'loaded',
+      file: '/installation/fleet.json',
+      installation: { schemaVersion: 1 },
+      model,
+      warnings: [],
+    };
+    const withEnv = await collect(v1Result, probes, {
+      probeSeats: true,
+      env: { OCM_REMOTE_PORT: '59999', OCM_HOST: 'stale-tunnel-host' },
+    });
+    expect(
+      withEnv.filter((doctorLine) => doctorLine.check === 'routing-env'),
+    ).toEqual([]);
+
+    const withoutEnv = await collect(loadedResult(model), probes, {
+      probeSeats: true,
+    });
+    expect(
+      withoutEnv.filter((doctorLine) => doctorLine.check === 'routing-env'),
+    ).toEqual([]);
+  });
+});
 
 describe('runDoctor', () => {
   it('reports every check PASS on an all-pass installation', async () => {

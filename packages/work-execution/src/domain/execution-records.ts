@@ -64,10 +64,11 @@ export interface AttemptRunnerRecord {
   readonly remotePort: number | null;
   readonly host: string | null;
   /**
-   * The installation host name the attempt ran on. A v2 installation records
-   * the selected lane-runner host's name; legacy mode (a v1 or absent
-   * installation) records `null`, as do records persisted before this field
-   * existed — those are read with `runner.host`, which holds the alias.
+   * The installation host name the attempt ran on. The composition roots pass
+   * the installation's selected lane-runner host, so a v2 installation
+   * records that host's name; legacy mode (a v1 or absent installation)
+   * records `null`, as do records persisted before this field existed —
+   * those are read with `runner.host`, which holds the alias.
    */
   readonly hostName?: string | null;
   readonly agent: string | null;

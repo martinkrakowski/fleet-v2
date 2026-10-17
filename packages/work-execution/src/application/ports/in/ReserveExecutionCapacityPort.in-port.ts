@@ -7,6 +7,19 @@
 
 import type { CapacityReservationRecord, RunnerKind } from '../../../domain/execution-records.js';
 
+/**
+ * The lane-runner host a reservation is made on (H9a1). It is optional for
+ * now: no caller passes it yet (H9a2 wires host selection into the reserve),
+ * and an absent `host` leaves the reservation's behaviour unchanged.
+ */
+export interface ReserveExecutionCapacityHost {
+  readonly hostName: string;
+  readonly hostKind: RunnerKind;
+  readonly transport: 'local' | 'ssh';
+  readonly sshAlias: string | null;
+  readonly port: number | null;
+}
+
 export interface ReserveExecutionCapacityRequest {
   readonly reservationId: string;
   readonly attemptId: string;
@@ -20,6 +33,12 @@ export interface ReserveExecutionCapacityRequest {
    * opencode seat.
    */
   readonly seatTool: RunnerKind;
+  /**
+   * The lane-runner host to record on the reservation (H9a1). When given it
+   * is validated and recorded; when absent the reservation records a `null`
+   * host on every field.
+   */
+  readonly host?: ReserveExecutionCapacityHost | null;
   readonly nowIso?: string;
 }
 

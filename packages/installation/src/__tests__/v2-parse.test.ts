@@ -665,7 +665,7 @@ describe('parseInstallation v2', () => {
     });
   });
 
-  it('refuses a second lane-runner host: exactly one lane-runner host', () => {
+  it('loads two lane-runner hosts (H9a1: at least one lane-runner host)', () => {
     const result = parseInstallation({
       schemaVersion: 2,
       forge: { mode: 'none' },
@@ -686,8 +686,31 @@ describe('parseInstallation v2', () => {
       },
     });
     expect(result).toEqual({
+      ok: true,
+      installation: expect.objectContaining({
+        hosts: expect.objectContaining({
+          first: expect.objectContaining({ roles: ['orchestrator', 'lane-runner'] }),
+          second: expect.objectContaining({ roles: ['lane-runner'] }),
+        }),
+      }),
+    });
+  });
+
+  it('still refuses an installation with no lane-runner host', () => {
+    const result = parseInstallation({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        only: {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/only',
+          roles: ['orchestrator'],
+        },
+      },
+    });
+    expect(result).toEqual({
       ok: false,
-      errors: ['hosts: at most one host may hold the lane-runner role'],
+      errors: ['hosts: at least one host must hold the lane-runner role'],
     });
   });
 

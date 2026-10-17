@@ -12,6 +12,7 @@
 
 import type { AttemptStateValue } from '../../domain/value-objects/AttemptState.vo.js';
 import { parseSeatTool } from '../../domain/execution-records.js';
+import type { RunnerKind } from '../../domain/execution-records.js';
 import type {
   ReserveExecutionCapacityPort,
   ReserveExecutionCapacityRequest,
@@ -87,6 +88,54 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
       };
     }
 
+    // The host fields (H9a1): validated when given, all null when absent.
+    let host: {
+      hostName: string | null;
+      hostKind: RunnerKind | null;
+      transport: 'local' | 'ssh' | null;
+      sshAlias: string | null;
+      port: number | null;
+    } = { hostName: null, hostKind: null, transport: null, sshAlias: null, port: null };
+    if (request.host !== undefined && request.host !== null) {
+      const given = request.host;
+      if (typeof given !== 'object' || Array.isArray(given)) {
+        return { outcome: 'refused', reason: 'host must be an object' };
+      }
+      const hostName = typeof given.hostName === 'string' ? given.hostName.trim() : '';
+      if (hostName === '') {
+        return { outcome: 'refused', reason: 'host.hostName must be a non-empty string' };
+      }
+      const hostKind = parseSeatTool(given.hostKind);
+      if (hostKind === undefined) {
+        return {
+          outcome: 'refused',
+          reason: 'host.hostKind must be a declared runner kind (opencode or agy)',
+        };
+      }
+      const transport = given.transport;
+      if (transport !== 'local' && transport !== 'ssh') {
+        return { outcome: 'refused', reason: 'host.transport must be "local" or "ssh"' };
+      }
+      const sshAlias =
+        typeof given.sshAlias === 'string' && given.sshAlias.trim() !== ''
+          ? given.sshAlias.trim()
+          : null;
+      if (transport === 'ssh' && sshAlias === null) {
+        return {
+          outcome: 'refused',
+          reason: 'host.sshAlias is required when host.transport is "ssh"',
+        };
+      }
+      const port = typeof given.port === 'number' ? given.port : null;
+      if (port !== null && (!Number.isInteger(port) || port < 1)) {
+        return {
+          outcome: 'refused',
+          reason: 'host.port must be a positive integer or null',
+        };
+      }
+      host = { hostName, hostKind, transport, sshAlias, port };
+    }
+
     // The busy-worktree, duplicate-attempt and slot-budget checks all run
     // inside the journal's locked read-modify-write (Opus note on #58): a
     // conflicting reservation that lands between the request and the append
@@ -97,6 +146,7 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
       attemptId: request.attemptId,
       hostId: request.hostId,
       seatTool,
+      ...host,
       held: true,
       reservedAtIso: nowIso,
       releasedAtIso: null,

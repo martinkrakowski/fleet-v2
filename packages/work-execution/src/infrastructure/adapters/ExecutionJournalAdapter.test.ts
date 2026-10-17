@@ -181,6 +181,63 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
     expect(active.map((r) => r.id)).toEqual(['res-legacy']);
     expect(active[0]?.seatTool).toBeNull();
   });
+
+  it('reads a pre-H9a reservation with all host fields null (H9a1)', async () => {
+    // Pre-H9a file shape: seatTool present, no host fields at all.
+    await fs.writeFile(
+      path.join(tempDir, 'reservations.json'),
+      JSON.stringify([
+        {
+          id: 'res-legacy-h9a',
+          attemptId: 'att-legacy-h9a',
+          hostId: 'host-1',
+          slotIndex: 0,
+          held: true,
+          seatTool: 'opencode',
+          reservedAtIso: '2026-10-16T10:00:00.000Z',
+          releasedAtIso: null,
+        },
+      ]),
+      'utf8',
+    );
+
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    const active = await adapter.listActiveReservations('host-1');
+    expect(active.map((r) => r.id)).toEqual(['res-legacy-h9a']);
+    expect(active[0]?.hostName).toBeNull();
+    expect(active[0]?.hostKind).toBeNull();
+    expect(active[0]?.transport).toBeNull();
+    expect(active[0]?.sshAlias).toBeNull();
+    expect(active[0]?.port).toBeNull();
+  });
+
+  it('round-trips a reservation with host fields through disk (H9a1)', async () => {
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await adapter.saveCapacityReservation({
+      id: 'res-host',
+      attemptId: 'att-host',
+      hostId: 'host-1',
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      hostName: 'midnight',
+      hostKind: 'opencode',
+      transport: 'ssh',
+      sshAlias: 'm',
+      port: 4166,
+      reservedAtIso: '2026-10-16T10:00:00.000Z',
+      releasedAtIso: null,
+    });
+
+    const reloaded = new ExecutionJournalAdapter({ stateDir: tempDir });
+    const active = await reloaded.listActiveReservations('host-1');
+    expect(active.map((r) => r.id)).toEqual(['res-host']);
+    expect(active[0]?.hostName).toBe('midnight');
+    expect(active[0]?.hostKind).toBe('opencode');
+    expect(active[0]?.transport).toBe('ssh');
+    expect(active[0]?.sshAlias).toBe('m');
+    expect(active[0]?.port).toBe(4166);
+  });
 });
 
 describe('ExecutionJournalAdapter atomic capacity arbitration', () => {

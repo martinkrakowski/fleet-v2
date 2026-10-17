@@ -42,6 +42,10 @@ function isCapacityReservationRecord(value: unknown): value is CapacityReservati
   return typeof candidate.id === 'string' && typeof candidate.attemptId === 'string';
 }
 
+function isNonEmptyStringField(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
 /**
  * One locked read-modify-write decision over the freshly read held
  * reservations: a claim by an attempt that already holds one is refused, a
@@ -299,8 +303,25 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
     for (const item of parsed) {
       if (isCapacityReservationRecord(item)) {
         // A reservation stored before `seatTool` existed reads with `null`;
-        // it is never defaulted to a declared kind.
-        map.set(item.id, { ...item, seatTool: parseSeatTool(item.seatTool) ?? null });
+        // it is never defaulted to a declared kind. The host fields (H9a1)
+        // read the same way: absent or malformed values read as `null`.
+        map.set(item.id, {
+          ...item,
+          seatTool: parseSeatTool(item.seatTool) ?? null,
+          hostName: isNonEmptyStringField(item.hostName) ? item.hostName : null,
+          hostKind: parseSeatTool(item.hostKind) ?? null,
+          transport:
+            item.transport === 'local' || item.transport === 'ssh'
+              ? item.transport
+              : null,
+          sshAlias: isNonEmptyStringField(item.sshAlias) ? item.sshAlias : null,
+          port:
+            typeof item.port === 'number' &&
+            Number.isInteger(item.port) &&
+            item.port > 0
+              ? item.port
+              : null,
+        });
       }
     }
     return map;

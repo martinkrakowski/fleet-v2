@@ -27,6 +27,7 @@ import type {
   LaneDiffCheckResult,
 } from "../../application/ports/out/LaneDiffCheckPort.out-port.js";
 import type { CommandExecutorPort } from "../../application/ports/out/CommandExecutorPort.out-port.js";
+import { join } from "node:path";
 import type {
   LaneDiffChangedPath,
   LaneDiffSecretPattern,
@@ -150,8 +151,12 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
       // process — mirroring GitShelfProvider's hardened prefix. Content is
       // read with `cat` and `git cat-file blob` anyway, neither of which
       // consults any of these settings.
+      // `-C <worktreePath>` anchors every git command at the worktree: the
+      // executor may ignore `cwd` (batch-mode ssh runs in the remote home
+      // directory), so the flag, not the option, is the source of truth.
+      // `cwd` is kept too; it is harmless locally.
       const run = await this.commandExecutor.run(
-        ["git", ...GIT_CONFIG_ARGS, ...argv],
+        ["git", "-C", request.worktreePath, ...GIT_CONFIG_ARGS, ...argv],
         { cwd: request.worktreePath },
       );
       if (run.error !== undefined || run.exitCode !== 0) {
@@ -171,7 +176,10 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     if (!status.ok) return { outcome: "error", reason: status.reason };
 
     const changed = new Map<string, LaneDiffChangedPath>();
-    this.collectStatusEntries(status.stdout, changed);
+    // Paths whose worktree file is gone (porcelain Y is `D`): they are
+    // scanned from the index blob alone, which is not an error.
+    const worktreeDeleted = new Set<string>();
+    this.collectStatusEntries(status.stdout, changed, worktreeDeleted);
 
     const addedLines = new Map<string, { line: number; text: string }[]>();
 
@@ -213,34 +221,53 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     }
 
     // Scan the WHOLE CONTENT of every changed path that is not deleted: the
-    // worktree bytes (`cat --`) and, for tracked paths, the index blob
-    // (`git cat-file blob :<path>` — stage 0, no diff, no textconv, no
-    // filter). No binary heuristic is applied: the raw bytes travel as text,
-    // so a NUL byte cannot stop the scan (the executor decodes as UTF-8,
-    // which preserves NUL as U+0000 and maps every ASCII byte to itself, so
-    // no ASCII pattern can be hidden by the decoding). A directory, an
-    // embedded repository or any other non-file path fails the read and the
-    // check gives an error. The 64 MiB cap applies per read; exceeding it is
-    // an error, never a silent truncation.
+    // worktree bytes (`cat --`) and, whenever the index has the path, the
+    // index blob (`git cat-file blob :<path>` — stage 0, no diff, no
+    // textconv, no filter). `deleted` means the INDEX no longer has the
+    // path (porcelain X is `D`); a staged change whose worktree copy was
+    // then removed (porcelain `MD` or `AD`) still has its index blob —
+    // exactly the blob `write-tree` would commit — so it is scanned from
+    // the index alone, which is not an error. No binary heuristic is
+    // applied: the raw bytes travel as text, so a NUL byte cannot stop the
+    // scan (the executor decodes as UTF-8, which preserves NUL as U+0000
+    // and maps every ASCII byte to itself, so no ASCII pattern can be
+    // hidden by the decoding). A directory, an embedded repository or any
+    // other unreadable non-file path fails the read and the check gives an
+    // error. The 64 MiB cap applies per read; exceeding it is an error,
+    // never a silent truncation.
     for (const entry of changed.values()) {
       if (entry.status === "deleted") continue;
-      const worktree = await this.commandExecutor.run(
-        ["cat", "--", entry.path],
-        {
-          cwd: request.worktreePath,
-          maxBufferBytes: MAX_SCAN_BUFFER_BYTES,
-        },
-      );
-      if (worktree.error !== undefined || worktree.exitCode !== 0) {
-        return {
-          outcome: "error",
-          reason:
-            "lane diff check: could not read a changed file's worktree content",
-        };
-      }
       const merged = new Map<number, Set<string>>();
-      mergeContentLines(merged, worktree.stdout);
+      if (!worktreeDeleted.has(entry.path)) {
+        // The worktree copy is read only when it exists, and always by its
+        // absolute path: the executor may ignore `cwd`, so `cat --` gets
+        // `<worktreePath>/<path>` rather than relying on the working
+        // directory (`cwd` is kept; it is harmless locally).
+        const worktree = await this.commandExecutor.run(
+          ["cat", "--", join(request.worktreePath, entry.path)],
+          {
+            cwd: request.worktreePath,
+            maxBufferBytes: MAX_SCAN_BUFFER_BYTES,
+          },
+        );
+        if (worktree.error !== undefined || worktree.exitCode !== 0) {
+          return {
+            outcome: "error",
+            reason:
+              "lane diff check: could not read a changed file's worktree content",
+          };
+        }
+        mergeContentLines(merged, worktree.stdout);
+      }
       if (entry.status !== "untracked") {
+        // Scan the index blob whenever the index has the path; `cat-file -e`
+        // is the existence probe, and its failure fails closed.
+        const probe = await git(
+          ["cat-file", "-e", `:${entry.path}`],
+          "probe a changed file's index blob",
+        );
+        if (!probe.ok)
+          return { outcome: "error", reason: "lane diff check: could not probe a changed file's index blob" };
         const index = await git(
           ["cat-file", "blob", `:${entry.path}`],
           "read a changed file's index blob",
@@ -295,11 +322,16 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
    * Parse `git status --porcelain=v1 -z`: NUL-separated entries of two status
    * letters, a space and the path. Renames carry the original path as a
    * second NUL-separated field and are split into delete + add so a protected
-   * source path is seen, exactly like the script.
+   * source path is seen, exactly like the script. `deleted` means the INDEX
+   * no longer has the path (porcelain X is `D`): a staged change whose
+   * worktree copy was then removed (`MD`, `AD`) stays scannable from its
+   * index blob, so it is classified by the index letter and its missing
+   * worktree file is recorded in `worktreeDeleted`.
    */
   private collectStatusEntries(
     stdout: string,
     changed: Map<string, LaneDiffChangedPath>,
+    worktreeDeleted: Set<string>,
   ): void {
     const fields = stdout.split("\0");
     for (let index = 0; index < fields.length; index += 1) {
@@ -321,12 +353,9 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
         changed.set(path, { path, status: "added" });
         continue;
       }
+      if (y === "D") worktreeDeleted.add(path);
       const status: LaneDiffFileStatus =
-        x === "A" || y === "A"
-          ? "added"
-          : y === "D" || x === "D"
-            ? "deleted"
-            : "modified";
+        x === "D" ? "deleted" : x === "A" || y === "A" ? "added" : "modified";
       changed.set(path, { path, status });
     }
   }

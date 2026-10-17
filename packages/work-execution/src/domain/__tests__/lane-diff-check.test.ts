@@ -376,4 +376,34 @@ describe("isFixedProtectedPath (script parity, O14d1)", () => {
       expect(isFixedProtectedPath(sample), sample).toBe(true);
     }
   });
+
+  it("a supplied regex carrying the g flag still matches on every line", () => {
+    // With `g` kept, lastIndex would survive across `.test()` calls and the
+    // second line would silently be skipped.
+    const verdict = check(
+      [
+        {
+          path: "packages/x/src/a.ts",
+          status: "modified",
+          addedLines: [
+            { line: 1, text: `const t = "${tok}";` },
+            { line: 2, text: `const u = "${tok}";` },
+          ],
+        },
+      ],
+      { secretPatterns: [{ name: "github-token", regex: /gh[pousr]_[A-Za-z0-9]{20,}/g }] },
+    );
+    expect(verdict.findings).toEqual([
+      {
+        path: "packages/x/src/a.ts",
+        line: 1,
+        rule: "secret-pattern:github-token",
+      },
+      {
+        path: "packages/x/src/a.ts",
+        line: 2,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+  });
 });

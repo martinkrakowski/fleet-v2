@@ -401,6 +401,98 @@ describe("LaneDiffCheckAdapter", () => {
     ]);
   });
 
+  it("a secret staged then deleted from the worktree (MD) is scanned from the index blob", async () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "packages/x/src/a.ts"), `const t = "${tok}";\n`);
+    git(repo, "add", "packages/x/src/a.ts");
+    rmSync(join(repo, "packages/x/src/a.ts"));
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: base(repo),
+      allowedPathPrefixes: PREFIXES,
+    });
+    if (result.outcome !== "findings")
+      throw new Error(`expected findings, got ${result.outcome}`);
+    expect(result.findings).toEqual([
+      {
+        path: "packages/x/src/a.ts",
+        line: 1,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+  });
+
+  it("a staged add then worktree deletion (AD) is scanned from the index blob", async () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "packages/x/src/n.ts"), `const t = "${tok}";\n`);
+    git(repo, "add", "packages/x/src/n.ts");
+    rmSync(join(repo, "packages/x/src/n.ts"));
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: base(repo),
+      allowedPathPrefixes: PREFIXES,
+    });
+    if (result.outcome !== "findings")
+      throw new Error(`expected findings, got ${result.outcome}`);
+    expect(result.findings).toEqual([
+      {
+        path: "packages/x/src/n.ts",
+        line: 1,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+  });
+
+  it("an executor that ignores cwd still yields the right findings, with -C and an absolute cat path", async () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "packages/x/src/b.ts"), `const t = "${tok}";\n`);
+    const gitArgvs: string[][] = [];
+    const catArgvs: string[][] = [];
+    // The fake ignores `cwd` completely and always spawns in an unrelated
+    // directory, like a batch-mode ssh transport would.
+    const oblivious = {
+      async run(argv: readonly string[]) {
+        if (argv[0] === "git") gitArgvs.push([...argv]);
+        if (argv[0] === "cat") catArgvs.push([...argv]);
+        const out = execFileSync(argv[0], argv.slice(1), {
+          cwd: tmpdir(),
+          encoding: "utf8",
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: out,
+          stderr: "",
+        };
+      },
+    };
+    const obliviousAdapter = new LaneDiffCheckAdapter(oblivious);
+    const result = await obliviousAdapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: base(repo),
+      allowedPathPrefixes: PREFIXES,
+    });
+    if (result.outcome !== "findings")
+      throw new Error(`expected findings, got ${result.outcome}`);
+    expect(result.findings).toEqual([
+      {
+        path: "packages/x/src/b.ts",
+        line: 1,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+    expect(gitArgvs.length).toBeGreaterThan(0);
+    for (const argv of gitArgvs) {
+      expect(argv.slice(0, 3)).toEqual(["git", "-C", repo]);
+    }
+    for (const argv of catArgvs) {
+      expect(argv[0]).toBe("cat");
+      expect(argv[1]).toBe("--");
+      expect(argv[2]).toBe(join(repo, "packages/x/src/b.ts"));
+      expect(argv[2]).toMatch(/^\//);
+    }
+  });
+
   it("a repository-local clean filter cannot hide a staged secret (O14d1 R3)", async () => {
     const repo = makeRepo();
     git(repo, "config", "filter.x.clean", "cat /dev/null");

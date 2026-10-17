@@ -168,7 +168,15 @@ function secretFindings(
   const findings: LaneDiffFinding[] = [];
   for (const added of changed.addedLines ?? []) {
     for (const pattern of patterns) {
-      if (pattern.regex.test(added.text)) {
+      // Copy without the `g`/`y` flags: a supplied regex carrying `g` keeps
+      // `lastIndex` across `.test()` calls and would silently skip lines,
+      // and `y` anchors at lastIndex. The copy is line-local, so no state
+      // survives between lines.
+      const matcher = new RegExp(
+        pattern.regex.source,
+        pattern.regex.flags.replace(/[gy]/g, ""),
+      );
+      if (matcher.test(added.text)) {
         findings.push({
           path: changed.path,
           line: added.line,

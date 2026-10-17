@@ -27,6 +27,9 @@ import type {
   VerifyIgnoredPathsResult,
 } from '../../application/ports/out/AttemptArtifactPort.out-port.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
+import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
+import { hasRecordedHostName } from './ConfirmRecordedHost.js';
+import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
 
 export interface AttemptArtifactAdapterOptions {
   /**
@@ -35,6 +38,16 @@ export interface AttemptArtifactAdapterOptions {
    * operator-authored prose.
    */
   readonly executor?: CommandExecutorPort;
+  /**
+   * H9b2. When given, a read for an attempt recorded on a named host runs
+   * through that recorded host's executor (the recorded host is the truth);
+   * a host that changed or was removed is refused, naming the recorded
+   * host. Legacy records (no recorded host name) keep `executor`. Brief
+   * placement (a write before dispatch) always keeps `executor`.
+   */
+  readonly executorForRecordedHost?: (
+    recorded: AttemptRunnerRecord | null | undefined,
+  ) => ExecutorForRecordedHostResult;
 }
 
 /** Wall-clock budget for one brief-placement command (`mkdir`). */
@@ -55,8 +68,25 @@ const CAT_TIMEOUT_MS = 60 * 1000;
 export class AttemptArtifactAdapter implements AttemptArtifactPort {
   constructor(private readonly options?: AttemptArtifactAdapterOptions) {}
 
-  /** The executor is the only transport; without one there is nothing to run. */
-  private requireExecutor(): CommandExecutorPort {
+  /**
+   * The executor for one read: a read carrying a recorded host name goes to
+   * that recorded host's executor when the helper is wired; everything else
+   * keeps the configured executor. The executor is the only transport;
+   * without one there is nothing to run.
+   */
+  private executorFor(
+    recordedHost?: AttemptRunnerRecord | null,
+  ): CommandExecutorPort {
+    if (
+      this.options?.executorForRecordedHost !== undefined &&
+      hasRecordedHostName(recordedHost)
+    ) {
+      const resolved = this.options.executorForRecordedHost(recordedHost);
+      if (!resolved.ok) {
+        throw new Error(resolved.reason);
+      }
+      return resolved.executor;
+    }
     const executor = this.options?.executor;
     if (executor === undefined) {
       throw new Error('AttemptArtifactAdapter requires a configured CommandExecutorPort executor');
@@ -77,7 +107,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
   }
 
   async placeFrozenBrief(request: PlaceFrozenBriefRequest): Promise<PlaceFrozenBriefResult> {
-    const executor = this.requireExecutor();
+    const executor = this.executorFor();
     const briefTargets = ['.lane/brief.md', '.lane/brief-manifest.json'];
     const ignored = await this.verifyIgnoredPaths({
       worktreePath: request.worktreePath,
@@ -131,9 +161,10 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     }
 
     const { worktreePath } = request;
+    const executor = this.executorFor(request.recordedHost);
     let headCommit: string;
     try {
-      headCommit = (await this.runGit(worktreePath, ['rev-parse', 'HEAD'])).trim();
+      headCommit = (await this.runGit(worktreePath, ['rev-parse', 'HEAD'], executor)).trim();
     } catch (error) {
       throw new Error(`Unable to read HEAD commit in ${worktreePath}: ${String(error)}`, {
         cause: error,
@@ -145,7 +176,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
       const stdout = await this.runGit(worktreePath, [
         'rev-list',
         `${request.baseCommit}..HEAD`,
-      ]);
+      ], executor);
       commitsSinceBase = stdout.split('\n').filter((line) => line.trim() !== '');
     } catch (error) {
       throw new Error(
@@ -155,7 +186,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     }
 
     const notesPath = path.join(worktreePath, '.lane', 'notes.md');
-    const notesExists = await this.pathExists(worktreePath, notesPath);
+    const notesExists = await this.pathExists(worktreePath, notesPath, executor);
     const notes: 'present' | 'missing' = notesExists ? 'present' : 'missing';
 
     const candidateArtifactPaths = [
@@ -170,6 +201,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
       const exists = await this.pathExists(
         worktreePath,
         path.join(worktreePath, artifactPath),
+        executor,
       );
       if (exists) collectedArtifactPaths.push(artifactPath);
     }
@@ -181,8 +213,11 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
   }
 
   /** Read-only git in the worktree, through the executor, within its budget. */
-  private async runGit(worktreePath: string, args: readonly string[]): Promise<string> {
-    const executor = this.requireExecutor();
+  private async runGit(
+    worktreePath: string,
+    args: readonly string[],
+    executor: CommandExecutorPort,
+  ): Promise<string> {
     const result = await executor.run(['git', '-C', worktreePath, ...args], {
       timeoutMs: GIT_TIMEOUT_MS,
     });
@@ -196,8 +231,11 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
   }
 
   /** Existence of one absolute path in the worktree's filesystem. */
-  private async pathExists(worktreePath: string, targetPath: string): Promise<boolean> {
-    const executor = this.requireExecutor();
+  private async pathExists(
+    worktreePath: string,
+    targetPath: string,
+    executor: CommandExecutorPort,
+  ): Promise<boolean> {
     const result = await executor.run(['test', '-e', targetPath], {
       timeoutMs: PROBE_TIMEOUT_MS,
     });
@@ -212,7 +250,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
 
   /** Exit 0 means ignored; exit 1 means not ignored; anything else is an error. */
   private async checkIgnored(worktreePath: string, candidatePath: string): Promise<boolean> {
-    const executor = this.requireExecutor();
+    const executor = this.executorFor();
     const result = await executor.run(
       [
         'git',
@@ -233,9 +271,13 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     );
   }
 
-  async readBriefManifest(worktreePath: string, manifestPath?: string): Promise<string | null> {
+  async readBriefManifest(
+    worktreePath: string,
+    manifestPath?: string,
+    recordedHost?: AttemptRunnerRecord | null,
+  ): Promise<string | null> {
     const targetPath = manifestPath ?? path.join(worktreePath, '.lane', 'brief-manifest.json');
-    const executor = this.requireExecutor();
+    const executor = this.executorFor(recordedHost);
     const result = await executor.run(['cat', targetPath], { timeoutMs: CAT_TIMEOUT_MS });
     // A null exit code (spawn failure, timeout) is a failed read, not an
     // absent manifest; only exit 1 and friends mean "no such file".

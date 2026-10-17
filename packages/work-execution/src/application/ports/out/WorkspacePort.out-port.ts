@@ -5,10 +5,20 @@
  * on the runner port; the first adapter uses reviewed Git subprocesses.
  */
 
+import type { AttemptRunnerRecord } from '../../../domain/execution-records.js';
+
 export interface WorktreeInspectionRequest {
   readonly worktreePath: string;
   readonly baseCommit: string;
   readonly expectedArtifactPaths: readonly string[];
+  /**
+   * H9b2. The attempt's recorded runner block, when the read is for a
+   * recorded attempt: the recorded host is the truth, so the read goes
+   * through that host's executor. A legacy record (no host name) keeps the
+   * configured executor. Absent on reads that are not for a recorded
+   * attempt.
+   */
+  readonly recordedHost?: AttemptRunnerRecord | null;
 }
 
 /**
@@ -30,5 +40,9 @@ export interface WorkspacePort {
   inspectWorktree(request: WorktreeInspectionRequest): Promise<WorktreeInspection>;
 
   /** Read a text file from the worktree, locally or remotely. Returns null if missing. */
-  readWorktreeFile?(worktreePath: string, relativePath: string): Promise<string | null>;
+  readWorktreeFile?(
+    worktreePath: string,
+    relativePath: string,
+    recordedHost?: AttemptRunnerRecord | null,
+  ): Promise<string | null>;
 }

@@ -5,6 +5,7 @@
  */
 
 import type {
+  AttemptRunnerRecord,
   CollectedAttemptArtifacts,
   CommandCompletionReceipt,
 } from '../../../domain/execution-records.js';
@@ -40,6 +41,12 @@ export interface CollectCompletedAttemptArtifactsRequest {
   readonly baseCommit: string;
   readonly expectedArtifactPaths: readonly string[];
   readonly completionReceipt: CommandCompletionReceipt;
+  /**
+   * H9b2. The attempt's recorded runner block: the recorded host is the
+   * truth, so the artifact read goes through that host's executor. A legacy
+   * record (no host name) keeps the configured executor.
+   */
+  readonly recordedHost?: AttemptRunnerRecord | null;
 }
 
 export type CollectCompletedAttemptArtifactsResult =
@@ -59,5 +66,9 @@ export interface AttemptArtifactPort {
   ): Promise<CollectCompletedAttemptArtifactsResult>;
 
   /** Read a brief manifest from the worktree, locally or remotely. Returns null if missing. */
-  readBriefManifest?(worktreePath: string, manifestPath?: string): Promise<string | null>;
+  readBriefManifest?(
+    worktreePath: string,
+    manifestPath?: string,
+    recordedHost?: AttemptRunnerRecord | null,
+  ): Promise<string | null>;
 }

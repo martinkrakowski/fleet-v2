@@ -28,29 +28,23 @@ import type {
 import type { CommandExecutorPort } from "../../application/ports/out/CommandExecutorPort.out-port.js";
 import type {
   AttemptRecord,
-  RunnerKind,
+  AttemptRunnerRecord,
 } from "../../domain/execution-records.js";
+import {
+  confirmRecordedHost,
+  hasRecordedHostName,
+  type RunnerForAttemptHostSpec,
+} from "./ConfirmRecordedHost.js";
 import {
   ExecutionRunnerAdapter,
   type ExecutionRunnerHost,
   type SubprocessRunner,
 } from "./ExecutionRunnerAdapter.adapter.js";
 
-/**
- * One host as this adapter reads it — a structural subset of
- * `@fleet/installation`'s host section and derived model, so work-execution
- * stays free of a dependency on that package.
- */
-export interface RunnerForAttemptHostSpec {
-  readonly transport?: "local" | "ssh";
-  readonly sshAlias?: string;
-  readonly roles?: readonly string[];
-  readonly runner?: {
-    readonly kind?: RunnerKind;
-    readonly port?: number;
-    readonly authFile?: string;
-  };
-}
+export type { RunnerForAttemptHostSpec } from "./ConfirmRecordedHost.js";
+
+// The host spec shape lives in `ConfirmRecordedHost` and is re-exported
+// above, so existing imports of `RunnerForAttemptHostSpec` keep resolving.
 
 export interface RunnerForAttemptAdapterOptions {
   /**
@@ -80,13 +74,6 @@ export interface RunnerForAttemptAdapterOptions {
 }
 
 /** The confirm-or-unknown refusal, naming the recorded host. */
-function changedReason(hostName: string): RunnerForAttemptResult {
-  return {
-    ok: false,
-    reason: `recorded host ${hostName} changed or was removed`,
-  };
-}
-
 export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
   /** One adapter per host name, built once and cached. */
   private readonly adapters = new Map<string, ExecutionRunnerPort>();
@@ -95,56 +82,35 @@ export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
 
   runnerForAttempt(request: RunnerForAttemptRequest): RunnerForAttemptResult {
     const recorded = request.runner;
-    const recordedHostName = recorded?.hostName;
-    if (
-      recorded === null ||
-      recorded === undefined ||
-      recordedHostName === null ||
-      recordedHostName === undefined ||
-      recordedHostName.trim() === ""
-    ) {
+    if (!hasRecordedHostName(recorded)) {
       // Legacy attempt: the single legacy runner, exactly as today.
       return { ok: true, runner: this.options.legacyRunner };
     }
 
-    const name = recordedHostName.trim();
-    const hosts = this.options?.hosts;
-    const spec = hosts?.[name];
-    if (spec === undefined) {
-      return changedReason(name);
-    }
-    if (spec.roles !== undefined && !spec.roles.includes("lane-runner")) {
-      // The host exists but no longer serves the lane-runner role: it has
-      // changed; never fall back to whichever host does.
-      return changedReason(name);
+    // H9b2: the confirm-or-unknown comparison is the shared one in
+    // `ConfirmRecordedHost`, so the executor helper enforces the same rule.
+    const confirmed = confirmRecordedHost(
+      recorded as AttemptRunnerRecord,
+      this.options?.hosts,
+    );
+    if (!confirmed.ok) {
+      return { ok: false, reason: confirmed.reason };
     }
 
-    const currentKind = spec.runner?.kind ?? "opencode";
-    if (recorded.kind !== currentKind) {
-      return changedReason(name);
+    // H9b1 follow-up (Fable review): only the `opencode` runner kind has an
+    // adapter. A confirmed host whose current runner kind is not `opencode`
+    // is refused instead of building an ocm-run adapter for it.
+    const currentKind = confirmed.spec.runner?.kind ?? "opencode";
+    if (currentKind !== "opencode") {
+      return {
+        ok: false,
+        reason: `recorded host ${confirmed.name} runner kind ${currentKind} has no adapter`,
+      };
     }
 
-    const currentTransport = spec.transport === "ssh" ? "ssh" : "local";
-    // A v2 dispatch records the ssh alias on `host` for an ssh host and
-    // `null` for a local host, so the recorded alias decides the transport.
-    const recordedAlias = recorded.host?.trim() ?? "";
-    const recordedTransport = recordedAlias !== "" ? "ssh" : "local";
-    if (currentTransport !== recordedTransport) {
-      return changedReason(name);
-    }
-    if (currentTransport === "ssh") {
-      const currentAlias = spec.sshAlias?.trim() ?? "";
-      if (currentAlias === "" || currentAlias !== recordedAlias) {
-        return changedReason(name);
-      }
-    }
-
-    const currentPort =
-      typeof spec.runner?.port === "number" ? spec.runner.port : null;
-    if ((recorded.remotePort ?? null) !== currentPort) {
-      return changedReason(name);
-    }
-
+    const name = confirmed.name;
+    const spec = confirmed.spec;
+    const currentTransport = confirmed.transport;
     const cached = this.adapters.get(name);
     if (cached !== undefined) return { ok: true, runner: cached };
 

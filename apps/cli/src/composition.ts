@@ -47,9 +47,12 @@ import {
   RequestAttemptAcceptanceUseCase,
   ReserveExecutionCapacityUseCase,
   RunnerForAttemptAdapter,
+  SshExecutor,
   StopAttemptUseCase,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
+  ExecutorForHost,
+  hasRecordedHostName,
   consumptionId,
   forgeActionScope,
   isSafeSshHost,
@@ -61,6 +64,7 @@ import {
   type ExecutionRunnerHost,
   type GhInvocationResult,
   type SubprocessRunner,
+  type CommandExecutorPort,
 } from '@fleet/work-execution';
 
 import {
@@ -371,24 +375,33 @@ function runGhSubprocess(
  * reports the outcome as ambiguous for reconciliation instead of guessing.
  * When the worktree lives on another host, the same read-only rev-parse runs
  * over the reviewed ssh alias instead.
+ *
+ * H9b2: this signature is the legacy path only. An attempt recorded on a
+ * named host decides local-versus-ssh from the recorded transport (see the
+ * forge wiring below); the `existsSync(worktreePath)` heuristic here is kept
+ * exactly for legacy records and is no longer part of the recorded-host
+ * decision.
  */
 export function readGitHead(worktreePath: string, sshHost?: string): Promise<string> {
   if (sshHost !== undefined && !existsSync(worktreePath)) {
-    if (!isSafeSshHost(sshHost)) {
-      return Promise.reject(new Error(`Refusing to read HEAD over SSH: unsafe host '${sshHost}'`));
-    }
+    return readGitHeadOverSsh(worktreePath, sshHost);
   }
-  const invocation =
-    sshHost !== undefined && !existsSync(worktreePath)
-      ? {
-          command: 'ssh',
-          args: [
-            sshHost,
-            '--',
-            ['git', '-C', worktreePath, 'rev-parse', 'HEAD'].map(posixQuote).join(' '),
-          ],
-        }
-      : { command: 'git', args: ['-C', worktreePath, 'rev-parse', 'HEAD'] };
+  return readGitHeadLocally(worktreePath);
+}
+
+/** Read HEAD through the reviewed ssh alias (a worktree on another host). */
+export function readGitHeadOverSsh(worktreePath: string, sshHost: string): Promise<string> {
+  if (!isSafeSshHost(sshHost)) {
+    return Promise.reject(new Error(`Refusing to read HEAD over SSH: unsafe host '${sshHost}'`));
+  }
+  const invocation = {
+    command: 'ssh',
+    args: [
+      sshHost,
+      '--',
+      ['git', '-C', worktreePath, 'rev-parse', 'HEAD'].map(posixQuote).join(' '),
+    ],
+  };
   return new Promise((resolve, reject) => {
     execFile(invocation.command, invocation.args, { encoding: 'utf8' }, (error, stdout) => {
       if (error === null) {
@@ -400,9 +413,39 @@ export function readGitHead(worktreePath: string, sshHost?: string): Promise<str
   });
 }
 
-/** Run one local git command, resolving with stdout or rejecting on failure. */
-function runGitCommand(args: readonly string[]): Promise<string> {
+/** Read HEAD locally (the worktree lives on this host). */
+export function readGitHeadLocally(worktreePath: string): Promise<string> {
   return new Promise((resolve, reject) => {
+    execFile('git', ['-C', worktreePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }, (error, stdout) => {
+      if (error === null) {
+        resolve(String(stdout).trim());
+        return;
+      }
+      reject(error);
+    });
+  });
+}
+
+/** How a HEAD read reaches the worktree: over an ssh alias, or locally. */
+export type RecordedHeadRoute =
+  | { readonly route: 'ssh'; readonly alias: string }
+  | { readonly route: 'local' };
+
+/**
+ * H9b2: the recorded transport decides local-versus-remote git reads. The
+ * executor resolved for the recorded host carries the decision — an
+ * `SshExecutor` reads through its alias, a local executor reads locally.
+ * The legacy `existsSync(worktreePath)` heuristic is no longer part of this
+ * decision.
+ */
+export function headRouteForExecutor(executor: CommandExecutorPort): RecordedHeadRoute {
+  return executor instanceof SshExecutor
+    ? { route: 'ssh', alias: executor.sshHost }
+    : { route: 'local' };
+}
+
+/** Run one local git command, resolving with stdout or rejecting on failure. */
+function runGitCommand(args: readonly string[]): Promise<string> {  return new Promise((resolve, reject) => {
     execFile('git', [...args], { encoding: 'utf8' }, (error, stdout) => {
       if (error === null) {
         resolve(String(stdout).trim());
@@ -877,7 +920,17 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const workOrderRepository = new WorkOrderRepositoryAdapter({ stateDir });
   const attemptRepository = new AttemptRepositoryAdapter({ stateDir });
   const executionJournal = new ExecutionJournalAdapter({ stateDir });
-  const workspace = new WorkspaceAdapter({ executor: roleExecutors.worktree });
+  // H9b2: workspace and artifact reads for an attempt recorded on a named
+  // host run through that recorded host's executor (the recorded host is the
+  // truth); legacy records keep the worktree-role executor exactly as before.
+  const executorForHost = new ExecutorForHost({
+    hosts: options?.installation?.hosts,
+    legacyExecutor: roleExecutors.worktree,
+  });
+  const workspace = new WorkspaceAdapter({
+    executor: roleExecutors.worktree,
+    executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
+  });
   // Wraps the reviewed `ocm-run` runner subprocess. The bundled repository
   // script is the default; the worktree locator is resolved from the recorded
   // attempt so a later CLI process (reconcile, stop, collect) addresses the
@@ -919,7 +972,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     resolveAttempt: async (attemptId) =>
       await attemptRepository.findAttemptById(attemptId),
   });
-  const attemptArtifact = new AttemptArtifactAdapter({ executor: roleExecutors.worktree });
+  const attemptArtifact = new AttemptArtifactAdapter({
+    executor: roleExecutors.worktree,
+    executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
+  });
   // Hand-written brief files arrive per request; no default prose is assumed.
   const briefAuthoring = new BriefAuthoringAdapter();
   // The reviewed GitHub CLI subprocess behind a host-side delegate; every
@@ -932,16 +988,79 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       if (attempt === null) {
         throw new Error(`No attempt is recorded for ${request.attemptId}`);
       }
-      const head = await readGitHead(attempt.worktreePath, worktreeSshHost);
+      // H9b2: the recorded host is the truth. An attempt recorded on a named
+      // host reads its HEAD and pushes from that host's transport — local
+      // reads locally, an ssh host through its alias — and a host that
+      // changed or was removed refuses, naming the recorded host. The
+      // `existsSync(worktreePath)` heuristic stays behind the legacy branch
+      // only (legacy records keep today's behaviour exactly).
+      const recorded = attempt.runner ?? null;
+      const recordedIsNamed = hasRecordedHostName(recorded);
+      const recordedExecutor = recordedIsNamed
+        ? executorForHost.executorForRecordedHost(recorded)
+        : null;
+      if (recordedExecutor !== null && !recordedExecutor.ok) {
+        // A changed or removed host refuses, naming the recorded host.
+        throw new Error(recordedExecutor.reason);
+      }
+      const recordedRoute =
+        recordedExecutor !== null && recordedExecutor.ok
+          ? headRouteForExecutor(recordedExecutor.executor)
+          : null;
+      const recordedSshAlias = recordedRoute?.route === 'ssh' ? recordedRoute.alias : null;
+      const head =
+        recordedRoute !== null
+          ? recordedRoute.route === 'ssh'
+            ? await readGitHeadOverSsh(attempt.worktreePath, recordedRoute.alias)
+            : await readGitHeadLocally(attempt.worktreePath)
+          : await readGitHead(attempt.worktreePath, worktreeSshHost);
       // A worktree that lives on another host has its branch only on that
       // host's repository; `gh pr create` needs the branch on origin, so the
       // verified head is fetched across and pushed before the PR is opened.
       const branchRef = `${head}:refs/heads/${branchName}`;
+      const recordedWantsSeed =
+        recordedIsNamed
+          ? recordedSshAlias !== null ||
+            process.env.FLEET_FORGE_PUSH_ORIGIN === '1'
+          : null;
       const shouldSeedOrigin =
         request.kind === 'push-and-open-pr' &&
         head === request.expectedHeadSha &&
-        (worktreeSshHost !== undefined || process.env.FLEET_FORGE_PUSH_ORIGIN === '1');
-      if (shouldSeedOrigin && worktreeSshHost !== undefined && !existsSync(attempt.worktreePath)) {
+        (recordedWantsSeed !== null
+          ? recordedWantsSeed
+          : worktreeSshHost !== undefined ||
+            process.env.FLEET_FORGE_PUSH_ORIGIN === '1');
+      if (shouldSeedOrigin && recordedSshAlias !== null) {
+        if (!isSafeSshHost(recordedSshAlias)) {
+          throw new Error(
+            `Refusing to fetch from unsafe SSH host: '${recordedSshAlias}'`,
+          );
+        }
+        await runGitCommand([
+          'fetch',
+          `${recordedSshAlias}:${attempt.worktreePath}`,
+          branchRef,
+          '--force',
+        ]);
+        await runGitCommand(['push', '-f', 'origin', branchRef]);
+      } else if (
+        shouldSeedOrigin &&
+        recordedIsNamed &&
+        recordedSshAlias === null &&
+        process.env.FLEET_FORGE_PUSH_ORIGIN === '1'
+      ) {
+        // A recorded local host: the worktree lives on this machine, so the
+        // orchestrator fetches from the worktree path itself.
+        await runGitCommand(['fetch', attempt.worktreePath, branchRef, '--force']);
+        await runGitCommand(['push', '-f', 'origin', branchRef]);
+      } else if (
+        shouldSeedOrigin &&
+        !recordedIsNamed &&
+        worktreeSshHost !== undefined &&
+        !existsSync(attempt.worktreePath)
+      ) {
+        // Legacy record: today's fetch across the configured worktree ssh
+        // host, unchanged.
         if (!isSafeSshHost(worktreeSshHost)) {
           throw new Error(`Refusing to fetch from unsafe SSH host: '${worktreeSshHost}'`);
         }

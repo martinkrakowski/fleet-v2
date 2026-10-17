@@ -49,6 +49,11 @@ export function sshArgvFor(host: string, argv: readonly string[]): string[] {
 export class SshExecutor implements CommandExecutorPort {
   constructor(private readonly options: SshExecutorOptions) {}
 
+  /** The ssh destination this executor carries commands to. */
+  get sshHost(): string {
+    return this.options.host;
+  }
+
   async run(argv: readonly string[], options?: CommandRunOptions): Promise<CommandRunResult> {
     const host = this.options.host;
     if (!isSafeSshHost(host)) {

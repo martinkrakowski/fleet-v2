@@ -93,6 +93,8 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
       baseCommit: attempt.baseCommit,
       expectedArtifactPaths: request.expectedArtifacts,
       completionReceipt: request.completionReceipt,
+      // H9b2: the artifact read runs on the attempt's recorded host.
+      recordedHost: attempt.runner ?? null,
     });
     if (collected.outcome === 'refused') {
       return { outcome: 'refused', reason: collected.reason };

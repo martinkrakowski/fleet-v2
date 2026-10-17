@@ -88,7 +88,11 @@ async function readFrozenManifestModel(
     let raw: string | null = null;
     try {
       raw = ports.artifactPort?.readBriefManifest
-        ? await ports.artifactPort.readBriefManifest(attempt.worktreePath, candidate)
+        ? await ports.artifactPort.readBriefManifest(
+            attempt.worktreePath,
+            candidate,
+            attempt.runner ?? null,
+          )
         : null;
     } catch {
       continue;

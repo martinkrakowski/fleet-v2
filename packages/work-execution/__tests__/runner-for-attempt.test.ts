@@ -20,6 +20,8 @@ import type {
 import { RunnerForAttemptAdapter } from "../src/infrastructure/adapters/RunnerForAttemptAdapter.adapter.js";
 import { InspectAttemptUseCase } from "../src/application/use-cases/InspectAttemptUseCase.use-case.js";
 import { StopAttemptUseCase } from "../src/application/use-cases/StopAttemptUseCase.use-case.js";
+import { ReconcileAttemptUseCase } from "../src/application/use-cases/ReconcileAttemptUseCase.use-case.js";
+import { CollectAttemptArtifactsUseCase } from "../src/application/use-cases/CollectAttemptArtifactsUseCase.use-case.js";
 
 /** A runner stub whose identity is observable. */
 function runnerStub(name: string): ExecutionRunnerPort {
@@ -217,6 +219,96 @@ describe("RunnerForAttemptAdapter", () => {
       reason: "recorded host re-kinded changed or was removed",
     });
   });
+
+  // H9b1 follow-up (Fable review): refusal tests for a changed alias, a
+  // changed transport and a removed role.
+  it("refuses a host whose ssh alias changed", () => {
+    const changedAliasHosts = {
+      "host-a": {
+        transport: "ssh" as const,
+        sshAlias: "moved.example",
+        roles: ["lane-runner"],
+        runner: { kind: "opencode" as const, port: 4001 },
+      },
+    };
+    const adapter = new RunnerForAttemptAdapter({
+      hosts: changedAliasHosts,
+      legacyRunner: legacy,
+    });
+    const result = adapter.runnerForAttempt({
+      runner: attemptRunner("host-a", "a.example", 4001),
+    });
+    expect(result).toEqual({
+      ok: false,
+      reason: "recorded host host-a changed or was removed",
+    });
+  });
+
+  it("refuses a host whose transport changed", () => {
+    const changedTransportHosts = {
+      "host-a": {
+        transport: "local" as const,
+        roles: ["lane-runner"],
+        runner: { kind: "opencode" as const, port: 4001 },
+      },
+    };
+    const adapter = new RunnerForAttemptAdapter({
+      hosts: changedTransportHosts,
+      legacyRunner: legacy,
+    });
+    const result = adapter.runnerForAttempt({
+      runner: attemptRunner("host-a", "a.example", 4001),
+    });
+    expect(result).toEqual({
+      ok: false,
+      reason: "recorded host host-a changed or was removed",
+    });
+  });
+
+  it("refuses a host that no longer serves the lane-runner role", () => {
+    const removedRoleHosts = {
+      "host-a": {
+        transport: "ssh" as const,
+        sshAlias: "a.example",
+        roles: ["verifier"],
+        runner: { kind: "opencode" as const, port: 4001 },
+      },
+    };
+    const adapter = new RunnerForAttemptAdapter({
+      hosts: removedRoleHosts,
+      legacyRunner: legacy,
+    });
+    const result = adapter.runnerForAttempt({
+      runner: attemptRunner("host-a", "a.example", 4001),
+    });
+    expect(result).toEqual({
+      ok: false,
+      reason: "recorded host host-a changed or was removed",
+    });
+  });
+
+  it("refuses a host whose current runner kind has no adapter", () => {
+    const agyHosts = {
+      "agy-host": {
+        transport: "local" as const,
+        roles: ["lane-runner"],
+        runner: { kind: "agy" as const },
+      },
+    };
+    const adapter = new RunnerForAttemptAdapter({
+      hosts: agyHosts,
+      legacyRunner: legacy,
+    });
+    // The recorded kind matches the current kind; the refusal is about the
+    // kind having no runner adapter, not about a changed host.
+    const result = adapter.runnerForAttempt({
+      runner: { ...attemptRunner("agy-host", null, null), kind: "agy" },
+    });
+    expect(result).toEqual({
+      ok: false,
+      reason: "recorded host agy-host runner kind agy has no adapter",
+    });
+  });
 });
 
 describe("H9b1 gating in the use cases", () => {
@@ -357,5 +449,79 @@ describe("H9b1 gating in the use cases", () => {
     const result = await useCase.stopAttempt({ attemptId: "a1" });
     expect(result.outcome).toBe("terminated");
     expect(stoppedBy).toBe("a1");
+  });
+
+  // H9b1 follow-up (Fable review): reconcile and collect gate on the
+  // recorded host the same way.
+  it("reconcile refuses for a changed host before any state change", async () => {
+    const journalStub = { ...journal, entries: [] as unknown[] };
+    const useCase = new ReconcileAttemptUseCase({
+      attemptRepo: attemptRepo(
+        attempt({ runner: attemptRunner("changed-host", null, 4001) }),
+      ) as never,
+      journal: journalStub as never,
+      runner: legacy,
+      runnerForAttempt: selection,
+    });
+    const result = await useCase.reconcileAttempt({ attemptId: "a1" });
+    expect(result).toEqual({
+      outcome: "refused",
+      reason: "recorded host changed-host changed or was removed",
+    });
+    expect(journalStub.entries).toHaveLength(0);
+  });
+
+  it("reconcile keeps the legacy runner for an attempt recorded without a hostName", async () => {
+    const useCase = new ReconcileAttemptUseCase({
+      attemptRepo: attemptRepo(
+        attempt({ runner: attemptRunner(null, "old-alias", 4001) }),
+      ) as never,
+      journal: journal as never,
+      runner: legacy,
+      runnerForAttempt: selection,
+    });
+    const result = await useCase.reconcileAttempt({ attemptId: "a1" });
+    // The legacy runner is unreachable in the stub; the refusal must not be
+    // about the recorded host.
+    if (result.outcome === "refused") {
+      throw new Error(`unexpected refusal: ${result.reason}`);
+    }
+    expect(result.outcome).toBe("unknown");
+  });
+
+  it("collect refuses for a changed host before any artifact read", async () => {
+    let artifactReads = 0;
+    const useCase = new CollectAttemptArtifactsUseCase({
+      attemptRepo: attemptRepo(
+        attempt({
+          state: "ended",
+          runner: attemptRunner("changed-host", null, 4001),
+        }),
+      ) as never,
+      journal: journal as never,
+      artifactPort: {
+        async collectCompletedAttemptArtifacts() {
+          artifactReads += 1;
+          throw new Error("artifact read must not run for a changed host");
+        },
+      } as never,
+      runnerForAttempt: selection,
+    });
+    const result = await useCase.collectAttemptArtifacts({
+      attemptId: "a1",
+      completionReceipt: {
+        attemptId: "a1",
+        sessionId: "ses_x",
+        endedAtIso: "2026-10-16T01:00:00Z",
+        authoritative: true,
+        exitStatus: 0,
+        stoppedByRequest: false,
+      },
+    });
+    expect(result).toEqual({
+      outcome: "refused",
+      reason: "recorded host changed-host changed or was removed",
+    });
+    expect(artifactReads).toBe(0);
   });
 });

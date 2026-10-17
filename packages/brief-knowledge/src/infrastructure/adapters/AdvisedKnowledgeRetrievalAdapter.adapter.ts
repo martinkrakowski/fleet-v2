@@ -1,4 +1,5 @@
-// Implemented for lane D1 (decision port plan, 2026-10-16).
+// Implemented for lane D1 (decision port plan, 2026-10-16); refined for lane
+// K2 (decision-kernel plan, 2026-10-16, §3).
 /**
  * AdvisedKnowledgeRetrievalAdapter decorates an inner KnowledgeRetrievalPort
  * with an optional advisory reorder. Decisions only reorder the deterministic
@@ -6,17 +7,22 @@
  * On `unknown` (and on any malformed advice) the inner result object is
  * returned unchanged, reference-equal. With fewer than two entries the advice
  * port is never called (no fee, no receipt).
+ *
+ * K2: the ranking `contextRef` is returned with the ranking
+ * (`rankEligibleKeepersWithContext`), read from the advice answer that
+ * produced it. It is never held per instance, so two concurrent rankings
+ * through one adapter each report their own reference.
  */
 
 import type {
   KnowledgeRetrievalPort,
+  RankEligibleKeepersResult,
   RankKeepersQuery,
   RankedKeeperMatch,
 } from '../../application/ports/out/KnowledgeRetrievalPort.out-port.js';
 import type {
   KnowledgeRankingAdvicePort,
   RankingAdvice,
-  RankingContextRefCarrier,
 } from '../../application/ports/out/KnowledgeRankingAdvicePort.out-port.js';
 
 /** Weight of the decision score in the combined order key. */
@@ -26,7 +32,6 @@ export class AdvisedKnowledgeRetrievalAdapter implements KnowledgeRetrievalPort 
   private readonly inner: KnowledgeRetrievalPort;
   private readonly advice: KnowledgeRankingAdvicePort;
   private readonly weight: number;
-  private lastRankingContextRefValue: string | null = null;
 
   constructor(
     inner: KnowledgeRetrievalPort,
@@ -47,25 +52,23 @@ export class AdvisedKnowledgeRetrievalAdapter implements KnowledgeRetrievalPort 
     this.weight = weight;
   }
 
-  /**
-   * The ranking `contextRef` of the last ranking whose receipt was settled
-   * (even when the answer was unknown, so its outcome still joins), or `null`
-   * when advice was off, the budget refused or nothing could be settled.
-   */
-  get lastRankingContextRef(): string | null {
-    return this.lastRankingContextRefValue;
+  async rankEligibleKeepers(query: RankKeepersQuery): Promise<readonly RankedKeeperMatch[]> {
+    return (await this.rankEligibleKeepersWithContext(query)).matches;
   }
 
-  async rankEligibleKeepers(query: RankKeepersQuery): Promise<readonly RankedKeeperMatch[]> {
-    // Every ranking starts from a clean slate: a later unadvised call must not
-    // report the previous call's reference.
-    this.lastRankingContextRefValue = null;
+  /**
+   * The same ranking as `rankEligibleKeepers`, plus the ranking `contextRef`
+   * this ranking's advice answer settled (even when the answer was unknown, so
+   * its outcome still joins). No reference when advice was off, the budget
+   * refused or nothing could be settled.
+   */
+  async rankEligibleKeepersWithContext(query: RankKeepersQuery): Promise<RankEligibleKeepersResult> {
     // 1. The inner port is called with the original query.
     const innerResult = await this.inner.rankEligibleKeepers(query);
 
     // 4. With 0 or 1 entries the advice port is not called (no fee, no receipt).
     if (!Array.isArray(innerResult) || innerResult.length < 2) {
-      return innerResult;
+      return { matches: innerResult };
     }
 
     let advice: RankingAdvice;
@@ -82,25 +85,30 @@ export class AdvisedKnowledgeRetrievalAdapter implements KnowledgeRetrievalPort 
       });
     } catch {
       // A throwing advice port is unknown: the deterministic result stands.
-      return innerResult;
+      return { matches: innerResult };
     }
-    this.lastRankingContextRefValue = settledContextRefOf(this.advice);
+
+    // Read from this call's own answer, so no other call can contribute a
+    // reference to it and an unadvised call can never inherit one.
+    const rankingContextRef = settledContextRefOf(advice);
+    const settled = (matches: readonly RankedKeeperMatch[]): RankEligibleKeepersResult =>
+      rankingContextRef === null ? { matches } : { matches, rankingContextRef };
 
     if (advice.status !== 'advised') {
       // 5. On unknown, return the inner result object unchanged.
-      return innerResult;
+      return settled(innerResult);
     }
 
     const scores = validateScores(advice, innerResult);
     if (!scores) {
       // Malformed advice behaves exactly like unknown.
-      return innerResult;
+      return settled(innerResult);
     }
 
     // 3. Order key: inner score / set maximum (in (0,1]) + weight × decisionScore.
     const maxScore = Math.max(...innerResult.map((match) => match.score));
     if (!Number.isFinite(maxScore) || maxScore <= 0) {
-      return innerResult;
+      return settled(innerResult);
     }
 
     const reordered: RankedKeeperMatch[] = innerResult.map((match) => ({
@@ -110,14 +118,15 @@ export class AdvisedKnowledgeRetrievalAdapter implements KnowledgeRetrievalPort 
     const keyOf = (match: RankedKeeperMatch): number =>
       match.score / maxScore + this.weight * scores[match.entry.id];
     reordered.sort((a, b) => keyOf(b) - keyOf(a) || a.entry.id.localeCompare(b.entry.id));
-    return reordered;
+    return settled(reordered);
   }
 }
 
-/** The contextRef an advice port settled, when it exposes one at all. */
-function settledContextRefOf(advice: KnowledgeRankingAdvicePort): string | null {
-  const reported = (advice as RankingContextRefCarrier).lastContextRef;
-  return typeof reported === 'string' && reported.length > 0 ? reported : null;
+/** The contextRef one advice answer carries, when it settled a receipt at all. */
+function settledContextRefOf(advice: RankingAdvice): string | null {
+  return typeof advice.contextRef === 'string' && advice.contextRef.length > 0
+    ? advice.contextRef
+    : null;
 }
 
 /** Validate every decision score is a finite number in [0,1]; missing ids fail. */

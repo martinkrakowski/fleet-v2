@@ -18,7 +18,7 @@ import {
   type RankingAdviceDecisions,
 } from '../ranking-advice-factory.js';
 import { FileDecisionReceiptJournalAdapter } from '../FileDecisionReceiptJournalAdapter.adapter.js';
-import { buildRankingAdviceState } from '../jev-advice-state.js';
+import { buildRankingAdviceState, rankingContextRef } from '../jev-advice-state.js';
 import type {
   AdviseRankingQuery,
   KnowledgeRankingAdvicePort,
@@ -54,6 +54,12 @@ const SECRET_QUERY: AdviseRankingQuery = {
     { id: 'entry-b', claimText: QUERY.candidates[1].claimText },
   ],
 };
+
+/** The reference QUERY's receipts carry: QUERY declares no lane. */
+const QUERY_CONTEXT_REF = rankingContextRef({
+  taskSummary: QUERY.taskSummary,
+  candidates: QUERY.candidates,
+});
 
 interface JournalLine {
   kind: string;
@@ -244,11 +250,18 @@ describe('BudgetedRankingAdviceAdapter', () => {
         receipt: null,
       });
       const result = await adapter.adviseRanking(QUERY);
-      expect(result).toEqual({ status: 'unknown', reason: 'timeout' });
+      expect(result).toEqual({
+        status: 'unknown',
+        reason: 'timeout',
+        // A settled receipt names its reference: this answer's outcome joins
+        // on it even though no score was applied.
+        contextRef: QUERY_CONTEXT_REF,
+      });
       const lines = await readJournal(stateDir);
       expect(lines).toHaveLength(2);
       const settled = lines[1];
       expect(settled.unknownReason).toBe('timeout');
+      expect(settled.contextRef).toBe(QUERY_CONTEXT_REF);
       expect(settled.lexicalOrder).toEqual(['entry-a', 'entry-b']);
       expect(settled.decidedOrder).toEqual(['entry-a', 'entry-b']);
       expect(settled.model).toBe('jev');
@@ -358,7 +371,11 @@ describe('BudgetedRankingAdviceAdapter', () => {
         monthlyBudgetUsd: 0.01,
       });
       const result = await adapter.adviseRanking(QUERY);
-      expect(result).toEqual({ status: 'unknown', reason: 'transport' });
+      expect(result).toEqual({
+        status: 'unknown',
+        reason: 'transport',
+        contextRef: QUERY_CONTEXT_REF,
+      });
 
       const lines = await readJournal(stateDir);
       expect(lines).toHaveLength(2);
@@ -366,6 +383,7 @@ describe('BudgetedRankingAdviceAdapter', () => {
       const settled = lines[1];
       expect(settled.kind).toBe('settled');
       expect(settled.unknownReason).toBe('transport');
+      expect(settled.contextRef).toBe(QUERY_CONTEXT_REF);
       expect(settled.lexicalOrder).toEqual(['entry-a', 'entry-b']);
       expect(settled.decidedOrder).toEqual(['entry-a', 'entry-b']);
     } finally {
@@ -544,13 +562,20 @@ describe('createRankingAdvice', () => {
         readKey: async () => 'sk-test-key-value-not-real',
       });
       const result = await port.adviseRanking(QUERY);
-      expect(result).toEqual({ status: 'unknown', reason: 'not-configured' });
+      expect(result).toEqual({
+        status: 'unknown',
+        reason: 'not-configured',
+        // The inner port never ran, but the reservation was still settled, so
+        // the reference names the ranking this project never got advice for.
+        contextRef: QUERY_CONTEXT_REF,
+      });
       expect(fetch.calls).toHaveLength(0);
 
       // The reserve happened and the unknown inner answer was still settled.
       const lines = await readJournal(stateDir);
       expect(lines).toHaveLength(2);
       expect(lines[1].kind).toBe('settled');
+      expect(lines[1].contextRef).toBe(QUERY_CONTEXT_REF);
       expect(lines[1].unknownReason).toBe('not-configured');
     } finally {
       await rm(stateDir, { recursive: true, force: true });
@@ -573,7 +598,11 @@ describe('createRankingAdvice', () => {
         },
       });
       const result = await port.adviseRanking(QUERY);
-      expect(result).toEqual({ status: 'unknown', reason: 'low-confidence' });
+      expect(result).toEqual({
+        status: 'unknown',
+        reason: 'low-confidence',
+        contextRef: QUERY_CONTEXT_REF,
+      });
       expect(readKeyPaths).toEqual([JEV_DECISIONS.keyFile]);
 
       const lines = await readJournal(stateDir);
@@ -582,7 +611,80 @@ describe('createRankingAdvice', () => {
       expect(settled.kind).toBe('settled');
       expect(settled.costUsd).toBe(0.000018102);
       expect(settled.estimated).toBe(false);
+      expect(settled.contextRef).toBe(QUERY_CONTEXT_REF);
       expect(settled.unknownReason).toBe('low-confidence');
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a stricter consumer minConfidence gates the answer the block's threshold would accept", async () => {
+    const stateDir = await newTempStateDir();
+    try {
+      // The same served answers, one notch less confident: 0.87 clears the
+      // block's 0.5 but not a consumer's 0.9.
+      const served = JSON.parse(JSON.stringify(FIXTURE_RESPONSE)) as {
+        answers: Record<string, { confidence: number }>;
+      };
+      served.answers.k0!.confidence = 0.87;
+      served.answers.k1!.confidence = 0.87;
+
+      const withoutConsumer = createRankingAdvice({
+        decisions: JEV_DECISIONS,
+        stateDir,
+        fetch: spyFetch(served),
+        readKey: async () => 'sk-test-key-value-not-real',
+      });
+      const advised = await withoutConsumer.adviseRanking(QUERY);
+      expect(advised.status).toBe('advised');
+      if (advised.status === 'advised') {
+        expect(advised.confidence).toBe(0.87);
+      }
+
+      const withConsumer = createRankingAdvice({
+        decisions: {
+          ...JEV_DECISIONS,
+          consumers: { 'knowledge-ranking': { minConfidence: 0.9 } },
+        },
+        stateDir,
+        fetch: spyFetch(served),
+        readKey: async () => 'sk-test-key-value-not-real',
+      });
+      const answered = await withConsumer.adviseRanking(QUERY);
+      expect(answered.status).toBe('unknown');
+      if (answered.status !== 'unknown') {
+        throw new Error('expected the consumer threshold to refuse the answer');
+      }
+      expect(answered.reason).toBe('low-confidence');
+      expect(answered.contextRef).toBe(QUERY_CONTEXT_REF);
+
+      // The refused answer is still receipted: the call was paid.
+      const settled = (await readJournal(stateDir)).filter((line) => line.kind === 'settled');
+      expect(settled).toHaveLength(2);
+      expect(settled[1]?.unknownReason).toBe('low-confidence');
+      expect(settled[1]?.minConfidenceObserved).toBeUndefined();
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a consumer minConfidence equal to the block's changes nothing", async () => {
+    const stateDir = await newTempStateDir();
+    try {
+      const port = createRankingAdvice({
+        decisions: {
+          ...JEV_DECISIONS,
+          consumers: { 'knowledge-ranking': { minConfidence: 0.5, monthlyBudgetUsd: 0.01 } },
+        },
+        stateDir,
+        fetch: spyFetch(FIXTURE_RESPONSE),
+        readKey: async () => 'sk-test-key-value-not-real',
+      });
+      const result = await port.adviseRanking(QUERY);
+      expect(result.status).toBe('advised');
+      // The declared sub-budget is enforced alongside the threshold.
+      const lines = await readJournal(stateDir);
+      expect(lines.filter((line) => line.kind === 'settled')).toHaveLength(1);
     } finally {
       await rm(stateDir, { recursive: true, force: true });
     }

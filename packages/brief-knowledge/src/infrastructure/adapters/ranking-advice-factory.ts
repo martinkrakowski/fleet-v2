@@ -112,7 +112,11 @@ export function createRankingAdvice(options: CreateRankingAdviceOptions): Knowle
     const inner = new JevRankingAdviceAdapter({
       model: decisions.model,
       keyFile: decisions.keyFile,
-      minConfidence: decisions.minConfidence,
+      // The consumer's own threshold wins over the block's: a declared
+      // `consumers['knowledge-ranking'].minConfidence` gates ranking answers
+      // strictly, and only an absent one falls back to the block (plan §2).
+      minConfidence:
+        decisions.consumers?.['knowledge-ranking']?.minConfidence ?? decisions.minConfidence,
       ...(decisions.disabledProjects === undefined
         ? {}
         : { disabledProjects: decisions.disabledProjects }),

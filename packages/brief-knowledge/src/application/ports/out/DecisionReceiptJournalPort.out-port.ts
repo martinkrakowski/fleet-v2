@@ -38,25 +38,22 @@ export interface RankingDecisionCallReceipt extends DeclaredReceiptFields {
   readonly decidedOrder: readonly string[];
 }
 
-/** One triaged candidate: its class and its reusability score, never its text. */
-export interface CandidateTriageDisposition {
-  readonly candidateId: string;
-  readonly chosenClass: string;
-  readonly reusability: number;
-}
-
 /**
  * A settled triage call (written from lane K5). It orders nothing, so its
  * `lexicalOrder` and `decidedOrder` are empty: that keeps a triage line
  * readable by an older build's parser after a rollback, and keeps the
  * budget's fail-closed parser from ever meeting a line kind it does not know.
+ *
+ * K2 leaves the per-candidate `dispositions` (`candidateId`, `chosenClass`,
+ * `reusability`) out of this contract rather than declaring a field nothing
+ * settles: until K5a persists them, a triage line carries no dispositions,
+ * and a line that carries extra keys is still parsed — the reader ignores
+ * what it does not know, so a rollback keeps reading either way.
  */
 export interface ClaimTriageDecisionCallReceipt extends DeclaredReceiptFields {
   readonly consumer: typeof CLAIM_TRIAGE_CONSUMER;
   readonly lexicalOrder: readonly string[];
   readonly decidedOrder: readonly string[];
-  /** Per candidate the chosen class and reusability score; empty when unknown. */
-  readonly dispositions?: readonly CandidateTriageDisposition[];
 }
 
 /** Caller-supplied outcome of one decision call, appended against a reservation. */

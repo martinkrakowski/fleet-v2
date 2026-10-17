@@ -28,9 +28,10 @@
  *     used.
  *
  * A settled call keeps the reservation in the ledger even when the answer is
- * not used, so a paid call is never invisible to the budget. The settled
- * call's `lastContextRef` is exposed for the consumer to report the reference
- * its outcome joins on; it is `null` whenever nothing was settled.
+ * not used, so a paid call is never invisible to the budget. The reference the
+ * settled receipt carries travels back on that answer's `contextRef`, so the
+ * consumer reports exactly the reference its own call settled; an answer from
+ * a call that settled nothing carries none.
  */
 
 import type { QuestionKind } from '@fleet/shared';
@@ -38,7 +39,6 @@ import type {
   AdviseRankingQuery,
   KnowledgeRankingAdvicePort,
   RankingAdvice,
-  RankingContextRefCarrier,
 } from '../../application/ports/out/KnowledgeRankingAdvicePort.out-port.js';
 import type {
   DecisionReceiptJournalPort,
@@ -76,16 +76,13 @@ export interface BudgetedRankingAdviceAdapterDependencies {
   readonly consumerBudgetUsd?: number;
 }
 
-export class BudgetedRankingAdviceAdapter
-implements KnowledgeRankingAdvicePort, RankingContextRefCarrier
-{
+export class BudgetedRankingAdviceAdapter implements KnowledgeRankingAdvicePort {
   private readonly inner: BudgetedRankingAdviceAdapterDependencies['inner'];
   private readonly journal: DecisionReceiptJournalPort;
   private readonly provider: string;
   private readonly assumedCostUsd: number;
   private readonly monthlyBudgetUsd: number;
   private readonly consumerBudgetUsd: number | undefined;
-  private lastContextRefValue: string | null = null;
 
   constructor(deps: BudgetedRankingAdviceAdapterDependencies) {
     if (!deps || typeof deps !== 'object') {
@@ -128,17 +125,7 @@ implements KnowledgeRankingAdvicePort, RankingContextRefCarrier
     this.consumerBudgetUsd = deps.consumerBudgetUsd;
   }
 
-  /**
-   * The ranking `contextRef` of the last call whose receipt was settled, or
-   * `null` when nothing was settled. Every call starts from a clean slate, so
-   * a refused or unrecorded call never leaves a stale reference behind.
-   */
-  get lastContextRef(): string | null {
-    return this.lastContextRefValue;
-  }
-
   async adviseRanking(req: AdviseRankingQuery): Promise<RankingAdvice> {
-    this.lastContextRefValue = null;
     try {
       return await this.adviseRankingInner(req);
     } catch {
@@ -243,8 +230,18 @@ implements KnowledgeRankingAdvicePort, RankingContextRefCarrier
       // reservation still counts, so a paid call stays visible to the budget.
       return { status: 'unknown', reason: 'not-configured' };
     }
-    this.lastContextRefValue = contextRef;
 
-    return answer;
+    // The settled reference belongs to this answer alone: a concurrent call
+    // settles its own reference and neither can read the other's.
+    if (answer.status === 'advised') {
+      return {
+        status: 'advised',
+        scores: answer.scores,
+        model: answer.model,
+        confidence: answer.confidence,
+        contextRef,
+      };
+    }
+    return { status: 'unknown', reason: answer.reason, contextRef };
   }
 }

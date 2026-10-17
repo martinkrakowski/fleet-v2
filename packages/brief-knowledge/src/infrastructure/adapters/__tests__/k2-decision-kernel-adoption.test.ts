@@ -21,6 +21,13 @@ import type {
 } from '../../../application/ports/out/KnowledgeRankingAdvicePort.out-port.js';
 import type { KnowledgeEntryRepositoryPort } from '../../../application/ports/out/KnowledgeEntryRepositoryPort.out-port.js';
 import type { KnowledgeRetrievalPort, RankedKeeperMatch } from '../../../application/ports/out/KnowledgeRetrievalPort.out-port.js';
+import type {
+  AppendDecisionOutcome,
+  DecisionCallReceipt,
+  DecisionReceiptJournalPort,
+  ReserveDecisionQuery,
+  ReserveDecisionResult,
+} from '../../../application/ports/out/DecisionReceiptJournalPort.out-port.js';
 import type { KnowledgeEntryRecord } from '../../../domain/knowledge-records.js';
 import type { ContextSelectionProps } from '../../../domain/value-objects/ContextSelection.vo.js';
 
@@ -122,6 +129,82 @@ describe('rankingContextRef', () => {
       expect(contextRef).not.toContain(candidate.claimText);
     }
     expect(contextRef).not.toContain(QUERY.taskSummary);
+  });
+
+  it('keeps a usable lane and replaces every other lane with its own digest prefix', () => {
+    const base = { taskSummary: QUERY.taskSummary, candidates: QUERY.candidates };
+    // 64 chars is the cap; 65 is the first lane that must be replaced.
+    expect(rankingContextRef({ ...base, laneId: 'a'.repeat(64) })).toContain(
+      `ranking:${'a'.repeat(64)}:`,
+    );
+    const unusableLanes = [
+      'a'.repeat(65),
+      'lane:with:colons',
+      'lane/with/slashes',
+      'ghp_abcdefghijklmnopqrstuvwxyz012345',
+    ];
+    for (const laneId of unusableLanes) {
+      const contextRef = rankingContextRef({ ...base, laneId });
+      expect(contextRef).toMatch(/^ranking:[0-9a-f]{16}:[0-9a-f]{64}$/);
+      // Nothing of the declared lane survives, and the whole reference stays
+      // inside the journal's 256-character cap.
+      expect(contextRef).not.toContain(laneId);
+      expect(contextRef.length).toBeLessThanOrEqual(256);
+      // Deterministic: the same lane always names the same ranking.
+      expect(rankingContextRef({ ...base, laneId })).toBe(contextRef);
+    }
+    // Distinct lanes never collide once they are replaced.
+    expect(new Set(unusableLanes.map((laneId) => rankingContextRef({ ...base, laneId }))).size).toBe(
+      unusableLanes.length,
+    );
+  });
+
+  it('scopes a blank lane to unscoped and never leaks a secret-shaped one', () => {
+    const base = { taskSummary: QUERY.taskSummary, candidates: QUERY.candidates };
+    expect(rankingContextRef({ ...base, laneId: '   ' })).toMatch(/^ranking:unscoped:[0-9a-f]{64}$/);
+    for (const laneId of [
+      'sk-abcdefghijklmnopqrstuvwx',
+      'AKIAIOSFODNN7EXAMPLE',
+      'ghp_abcdefghijklmnopqrstuvwxyz012345',
+    ]) {
+      expect(rankingContextRef({ ...base, laneId })).toMatch(/^ranking:[0-9a-f]{16}:[0-9a-f]{64}$/);
+    }
+  });
+});
+
+describe('a hostile laneId still settles a receipt', () => {
+  it('writes the reference with the lane replaced by its digest prefix', async () => {
+    const stateDir = await newStateDir();
+    try {
+      const adapter = new FileDecisionReceiptJournalAdapter(stateDir, AT_JANUARY);
+      const advice = new BudgetedRankingAdviceAdapter({
+        inner: fakeAdvice(ADVISED),
+        journal: adapter,
+        provider: 'jev',
+        assumedCostUsd: 0.001,
+        monthlyBudgetUsd: 1,
+      });
+      const laneIds = [
+        'lane'.repeat(40),
+        'lane:with:colons',
+        'ghp_abcdefghijklmnopqrstuvwxyz012345',
+      ];
+      const refs: string[] = [];
+      for (const laneId of laneIds) {
+        const answer = await advice.adviseRanking({ ...QUERY, laneId });
+        // The settlement succeeded, so the answer is used and names its own
+        // reference rather than failing on an unusable lane segment.
+        expect(answer.status).toBe('advised');
+        expect(answer.contextRef).toMatch(/^ranking:[0-9a-f]{16}:[0-9a-f]{64}$/);
+        refs.push(answer.contextRef ?? '');
+      }
+      const settled = (await readLines(monthPath(stateDir))).filter(
+        (line) => line.kind === 'settled',
+      );
+      expect(settled.map((line) => line.contextRef)).toEqual(refs);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -319,7 +402,7 @@ describe('outcomes', () => {
     });
     const answer = await advice.adviseRanking(QUERY);
     expect(answer.status).toBe('advised');
-    return { adapter, contextRef: advice.lastContextRef ?? '' };
+    return { adapter, contextRef: answer.contextRef ?? '' };
   }
 
   it('is skipped when no settled receipt has that contextRef', async () => {
@@ -439,7 +522,7 @@ describe('the ranking receipt envelope', () => {
         assumedCostUsd: 0.001,
         monthlyBudgetUsd: 1,
       });
-      await advice.adviseRanking(QUERY);
+      const answer = await advice.adviseRanking(QUERY);
 
       const [reserved, settled] = await readLines(monthPath(stateDir));
       expect(reserved?.kind).toBe('reserved');
@@ -450,7 +533,8 @@ describe('the ranking receipt envelope', () => {
         candidates: QUERY.candidates,
       });
       expect(settled?.contextRef).toBe(expectedRef);
-      expect(advice.lastContextRef).toBe(expectedRef);
+      // The reference travels back on the answer, never as port state.
+      expect(answer.contextRef).toBe(expectedRef);
       expect(settled?.questionKinds).toEqual(['score']);
       expect(settled?.minConfidenceObserved).toBe(0.91);
       expect(typeof settled?.latencyMs).toBe('number');
@@ -473,19 +557,19 @@ describe('the ranking receipt envelope', () => {
         assumedCostUsd: 0.001,
         monthlyBudgetUsd: 1,
       });
-      await advice.adviseRanking(QUERY);
+      const answer = await advice.adviseRanking(QUERY);
       const settled = (await readLines(monthPath(stateDir)))[1];
       expect(settled?.unknownReason).toBe('timeout');
       expect(settled?.minConfidenceObserved).toBeUndefined();
       // A settled receipt still names its reference: its outcome joins on it.
       expect(typeof settled?.contextRef).toBe('string');
-      expect(advice.lastContextRef).toBe(settled?.contextRef);
+      expect(answer.contextRef).toBe(settled?.contextRef);
     } finally {
       await rm(stateDir, { recursive: true, force: true });
     }
   });
 
-  it('exposes no reference when the budget refuses the call', async () => {
+  it('carries no reference when the budget refuses the call', async () => {
     const stateDir = await newStateDir();
     try {
       const adapter = new FileDecisionReceiptJournalAdapter(stateDir, AT_JANUARY);
@@ -496,8 +580,10 @@ describe('the ranking receipt envelope', () => {
         assumedCostUsd: 1,
         monthlyBudgetUsd: 0.5,
       });
-      expect(await advice.adviseRanking(QUERY)).toEqual({ status: 'unknown', reason: 'budget' });
-      expect(advice.lastContextRef).toBeNull();
+      const answer = await advice.adviseRanking(QUERY);
+      expect(answer).toEqual({ status: 'unknown', reason: 'budget' });
+      // Nothing was settled, so the answer names no reference at all.
+      expect(answer.contextRef).toBeUndefined();
       expect(await readLines(monthPath(stateDir))).toEqual([]);
     } finally {
       await rm(stateDir, { recursive: true, force: true });
@@ -630,7 +716,110 @@ describe('ProposeBriefContextUseCase reports the ranking contextRef', () => {
       await rm(stateDir, { recursive: true, force: true });
     }
   });
+
+  it('gives each of two concurrent proposals its own contextRef', async () => {
+    const journal = new InterleavedJournal();
+    const advice = new BudgetedRankingAdviceAdapter({
+      // Both calls are held inside the inner port until each has arrived, so
+      // they settle one after the other with both in flight.
+      inner: interleavedAdvice(ADVISED),
+      journal,
+      provider: 'jev',
+      assumedCostUsd: 0.001,
+      monthlyBudgetUsd: 1,
+    });
+    const useCase = new ProposeBriefContextUseCase({
+      repo: repoWith(MATCHES.map((match) => match.entry)),
+      retrieval: new AdvisedKnowledgeRetrievalAdapter(delayedRetrievalOf(MATCHES), advice),
+    });
+
+    const [first, second] = await Promise.all([
+      useCase.proposeBriefContext({ ...REQUEST, laneId: 'lane-concurrent-a' }),
+      useCase.proposeBriefContext({ ...REQUEST, laneId: 'lane-concurrent-b' }),
+    ]);
+    expect(first.outcome).toBe('proposed');
+    expect(second.outcome).toBe('proposed');
+    if (first.outcome !== 'proposed' || second.outcome !== 'proposed') {
+      throw new Error('expected two proposed outcomes');
+    }
+
+    // Each proposal names the reference its own call settled: no shared state
+    // hands one proposal the other's reference.
+    expect(first.rankingContextRef).toBe(expectedRefFor('lane-concurrent-a'));
+    expect(second.rankingContextRef).toBe(expectedRefFor('lane-concurrent-b'));
+    expect(first.rankingContextRef).not.toBe(second.rankingContextRef);
+    expect(journal.settledContextRefs.slice().sort()).toEqual(
+      [first.rankingContextRef, second.rankingContextRef].sort(),
+    );
+  });
 });
+
+/** The reference one lane's proposal must report, from the same inputs. */
+function expectedRefFor(laneId: string): string {
+  return rankingContextRef({
+    laneId,
+    taskSummary: QUERY.taskSummary,
+    candidates: [
+      { id: 'bk-1', claimText: 'Date strings are parsed with parseISO.' },
+      { id: 'bk-2', claimText: 'The README badge links to the CI workflow.' },
+    ],
+  });
+}
+
+/** Holds every call in the advice port until two of them have arrived. */
+function interleavedAdvice(answer: RankingAdvice): KnowledgeRankingAdvicePort {
+  let arrived = 0;
+  let release!: () => void;
+  const bothArrived = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return {
+    async adviseRanking(): Promise<RankingAdvice> {
+      arrived += 1;
+      if (arrived >= 2) {
+        release();
+      }
+      await bothArrived;
+      return answer;
+    },
+  };
+}
+
+/** The deterministic set, handed over a tick later than the call asked. */
+function delayedRetrievalOf(matches: readonly RankedKeeperMatch[]): KnowledgeRetrievalPort {
+  return {
+    rankEligibleKeepers: async () => {
+      await Promise.resolve();
+      return matches;
+    },
+  };
+}
+
+/**
+ * In-memory journal: `settle` resolves without touching a filesystem, so the
+ * two calls' settlements interleave the same way on every run.
+ */
+class InterleavedJournal implements DecisionReceiptJournalPort {
+  readonly settledContextRefs: string[] = [];
+  private reservations = 0;
+
+  async reserve(_query: ReserveDecisionQuery): Promise<ReserveDecisionResult> {
+    this.reservations += 1;
+    return { ok: true, reservationId: `reservation-${this.reservations}` };
+  }
+
+  async settle(_reservationId: string, receipt: DecisionCallReceipt): Promise<void> {
+    this.settledContextRefs.push(receipt.contextRef);
+  }
+
+  async monthSpendUsd(_monthUtc: Date): Promise<number> {
+    return 0;
+  }
+
+  async appendOutcome(_outcome: AppendDecisionOutcome): Promise<void> {
+    // Outcomes are not what this journal is here to observe.
+  }
+}
 
 describe('a non-finite minConfidence is a configuration error at the call site', () => {
   it('answers not-configured without reading the answer file', async () => {

@@ -591,6 +591,11 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
    * Best effort by contract: a contextRef with no settled receipt is skipped,
    * and no read, lock, parse or append failure ever reaches the caller — the
    * operation the outcome describes must not fail because it was not recorded.
+   *
+   * The budget file is read under the month lock it is appended to, and under
+   * the previous month's: a concurrent reserve or settle must never be observed
+   * mid-append as a torn line. The outcomes lock is always taken first and the
+   * month locks in a fixed order, so no two paths can wait on each other.
    */
   async appendOutcome(outcome: AppendDecisionOutcome): Promise<void> {
     const entry = this.readOutcomeEntry(outcome);
@@ -603,12 +608,28 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
       await withFileLock(
         this.outcomesLockPath(monthKey),
         async () => {
-          if (!(await this.hasSettledReceipt(entry.contextRef, atDate))) {
-            // No settled receipt for this reference: nothing was decided by a
-            // call, so there is no outcome to join.
-            return;
-          }
-          await fs.appendFile(this.outcomesFilePath(monthKey), `${JSON.stringify(entry)}\n`, 'utf8');
+          await withFileLock(
+            this.monthLockPath(monthKey),
+            async () => {
+              await withFileLock(
+                this.monthLockPath(previousUtcMonthKey(atDate)),
+                async () => {
+                  if (!(await this.hasSettledReceipt(entry.contextRef, atDate))) {
+                    // No settled receipt for this reference: nothing was decided
+                    // by a call, so there is no outcome to join.
+                    return;
+                  }
+                  await fs.appendFile(
+                    this.outcomesFilePath(monthKey),
+                    `${JSON.stringify(entry)}\n`,
+                    'utf8',
+                  );
+                },
+                this.lockOptions(),
+              );
+            },
+            this.lockOptions(),
+          );
         },
         this.lockOptions(),
       );

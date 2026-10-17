@@ -15,7 +15,8 @@ import type {
 } from '../ports/in/ProposeBriefContextPort.in-port.js';
 import type {
   KnowledgeRetrievalPort,
-  RankingContextRefReporter,
+  RankEligibleKeepersResult,
+  RankKeepersQuery,
 } from '../ports/out/KnowledgeRetrievalPort.out-port.js';
 import type { KnowledgeEntryRepositoryPort } from '../ports/out/KnowledgeEntryRepositoryPort.out-port.js';
 
@@ -28,7 +29,7 @@ export interface ProposeBriefContextDependencies {
    * Retrieval is the advised decorator when decisions are enabled; a plain
    * retrieval port simply reports no ranking `contextRef`.
    */
-  readonly retrieval: KnowledgeRetrievalPort & RankingContextRefReporter;
+  readonly retrieval: KnowledgeRetrievalPort;
 }
 
 export class ProposeBriefContextUseCase implements ProposeBriefContextPort {
@@ -93,7 +94,7 @@ export class ProposeBriefContextUseCase implements ProposeBriefContextPort {
         entry.supersededById === null,
     );
 
-    const ranked = await retrieval.rankEligibleKeepers({
+    const rankedWithContext = await rankEligibleKeepers(retrieval, {
       projectId: request.projectId,
       laneId: request.laneId,
       taskSummary: request.taskSummary,
@@ -102,6 +103,7 @@ export class ProposeBriefContextUseCase implements ProposeBriefContextPort {
       maxTotalChars,
       candidateKeepers: eligibleKeepers,
     });
+    const ranked = rankedWithContext.matches;
 
     const proposals: BriefKnowledgeProposal[] = ranked.map((match, index) => ({
       proposalId: `bkp-${match.entry.id}-${index + 1}`,
@@ -111,9 +113,11 @@ export class ProposeBriefContextUseCase implements ProposeBriefContextPort {
       proposedBecause: match.matchReason,
     }));
 
-    // Reported only when a decision call settled a receipt: with advice off
-    // the result is byte-for-byte what it was before the decision kernel.
-    const rankingContextRef = retrieval.lastRankingContextRef;
+    // Reported only when this proposal's own decision call settled a receipt:
+    // with advice off the result is byte-for-byte what it was before the
+    // decision kernel, and a concurrent proposal cannot lend this one its
+    // reference.
+    const { rankingContextRef } = rankedWithContext;
     return {
       outcome: 'proposed',
       proposals,
@@ -122,6 +126,20 @@ export class ProposeBriefContextUseCase implements ProposeBriefContextPort {
         : {}),
     };
   }
+}
+
+/**
+ * The ranking plus the reference it settled. The reference travels with this
+ * call's result; a retrieval port that advises nothing reports none.
+ */
+async function rankEligibleKeepers(
+  retrieval: KnowledgeRetrievalPort,
+  query: RankKeepersQuery,
+): Promise<RankEligibleKeepersResult> {
+  if (typeof retrieval.rankEligibleKeepersWithContext === 'function') {
+    return retrieval.rankEligibleKeepersWithContext(query);
+  }
+  return { matches: await retrieval.rankEligibleKeepers(query) };
 }
 
 function isValidRequest(request: unknown): request is ProposeBriefContextRequest {

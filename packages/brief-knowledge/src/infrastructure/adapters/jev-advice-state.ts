@@ -190,19 +190,44 @@ export interface RankingContextRefRequest {
   readonly candidates: readonly RankingAdviceStateCandidate[];
 }
 
+/** A lane that needs no substitution: 1–64 chars of `[A-Za-z0-9._-]`. */
+const SAFE_LANE_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+
 /**
- * `ranking:<laneId>:<sha256>` — the stable per-consumer reference a receipt,
+ * The lane segment of a ranking `contextRef`. An absent or blank lane reads as
+ * `unscoped`. Every other lane that is not 1–64 characters of
+ * `[A-Za-z0-9._-]`, or that carries a secret shape, is replaced by the first
+ * 16 hex characters of `sha256(laneId)` — deterministic, so the same lane
+ * always yields the same reference. The reference is therefore always
+ * `ranking:<safe>:<sha256>`, at most 256 characters, and a caller-supplied
+ * lane can neither forge a second segment, overflow the journal's contextRef
+ * cap, nor leave the state carrying something credential-shaped.
+ */
+function laneSegment(laneId: unknown): string {
+  if (typeof laneId !== 'string') {
+    return 'unscoped';
+  }
+  const lane = laneId.trim();
+  if (lane.length === 0) {
+    return 'unscoped';
+  }
+  return SAFE_LANE_PATTERN.test(lane) && !containsSecretShape(lane)
+    ? lane
+    : sha256Hex(lane).slice(0, 16);
+}
+
+/**
+ * `ranking:<lane>:<sha256>` — the stable per-consumer reference a receipt,
  * its outcome line and a recorded selection all join on (plan §3). The digest
  * covers the sorted candidate entry ids and the task summary, so the same
  * inputs always produce the same reference regardless of the order the
- * candidates were retrieved in, and two lanes never collide.
+ * candidates were retrieved in, and two lanes never collide. The lane segment
+ * is bounded and sanitized by `laneSegment`: a usable lane is kept as declared,
+ * and any other is replaced by its own digest prefix, so the reference stays
+ * within the journal's 256-character cap and never carries a raw lane id.
  */
 export function rankingContextRef(req: RankingContextRefRequest): string {
-  const lane =
-    typeof req.laneId === 'string' && req.laneId.trim().length > 0
-      ? req.laneId.trim()
-      : 'unscoped';
   const candidateIds = req.candidates.map((candidate) => candidate.id).sort();
   const digest = sha256Hex(JSON.stringify({ candidateIds, taskSummary: req.taskSummary }));
-  return `ranking:${lane}:${digest}`;
+  return `ranking:${laneSegment(req.laneId)}:${digest}`;
 }

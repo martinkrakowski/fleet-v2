@@ -30,17 +30,29 @@ export interface RankedKeeperMatch {
   readonly matchReason: string;
 }
 
+/**
+ * One ranking plus the ranking `contextRef` its receipt settled. The reference
+ * travels with the result it belongs to, never as per-instance state on the
+ * port, so two concurrent rankings each report their own reference.
+ */
+export interface RankEligibleKeepersResult {
+  /** Exactly the matches `rankEligibleKeepers` returns for the same query. */
+  readonly matches: readonly RankedKeeperMatch[];
+  /**
+   * Present when an advised reordering settled a receipt; absent when advice
+   * was off, the budget refused, fewer than two entries made an advice call
+   * pointless, or no settlement could be recorded.
+   */
+  readonly rankingContextRef?: string;
+}
+
 export interface KnowledgeRetrievalPort {
   /** Rank eligible keepers within explicit bounds; inapplicable facts are filtered out before ranking. */
   rankEligibleKeepers(query: RankKeepersQuery): Promise<readonly RankedKeeperMatch[]>;
-}
-
-/**
- * Exposed by the advised decorator: the ranking `contextRef` of the last
- * ranking whose receipt was settled, `null` when advice was off, the budget
- * refused or nothing could be settled. The plain retrieval adapter has no
- * such reference and stays assignable to this optional shape.
- */
-export interface RankingContextRefReporter {
-  readonly lastRankingContextRef?: string | null;
+  /**
+   * Optional: the same ranking as `rankEligibleKeepers`, plus the ranking
+   * `contextRef` its receipt settled. The plain lexical adapter advises
+   * nothing, answers no reference, and stays assignable to this port.
+   */
+  rankEligibleKeepersWithContext?(query: RankKeepersQuery): Promise<RankEligibleKeepersResult>;
 }

@@ -514,7 +514,7 @@ describe('apps/cli composition', () => {
     // case can bind the implementer and reach the door re-check.
     await rt.execution.attemptRepository.saveAttempt({
       ...makeAttempt('att-door-e2e', 'wo-att-door-e2e', HEAD, [doorRef]),
-      runner: { remotePort: 0, host: null, agent: null, model: 'seat/implementer', variant: null },
+      runner: { kind: 'opencode', remotePort: 0, host: null, agent: null, model: 'seat/implementer', variant: null },
     });
     const grantId = 'grant-door-e2e';
     await rt.coordination.coordinationRequestRepository.saveRequest(

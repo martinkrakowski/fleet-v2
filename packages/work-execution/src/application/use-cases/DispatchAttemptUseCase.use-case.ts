@@ -23,6 +23,7 @@ import type { ExecutionObservationPort } from '../ports/out/ExecutionObservation
 import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
+import type { RunnerSelectorPort } from '../ports/out/RunnerSelectorPort.out-port.js';
 
 export interface DispatchAttemptDependencies {
   readonly workOrderRepo: WorkOrderRepositoryPort;
@@ -32,6 +33,11 @@ export interface DispatchAttemptDependencies {
   readonly runner: ExecutionRunnerPort;
   readonly observation?: ExecutionObservationPort;
   readonly artifactPort?: AttemptArtifactPort;
+  /**
+   * Optional runner-kind selection (O14c1). When wired, an attempt whose seat
+   * tool has no implemented runner (e.g. `agy`) refuses before any spawn.
+   */
+  readonly runnerSelector?: RunnerSelectorPort;
 }
 
 /** Boolean capabilities a dispatch may require the runner to enforce. */
@@ -199,7 +205,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     }
 
     const runnerInfo = this.deps.runner.describeRunner?.();
-    if (!runnerInfo || runnerInfo.remotePort === undefined || runnerInfo.remotePort === null) {
+    if (!runnerInfo || runnerInfo.remotePort === null) {
       return { outcome: 'refused', reason: 'No runner port can be described for dispatch' };
     }
     const runnerPort = runnerInfo.remotePort;
@@ -278,6 +284,22 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     }
 
     const nowIso = request.nowIso ?? new Date().toISOString();
+
+    // O14c1: the seat's tool decides which runner kind runs the lane. The
+    // frozen brief records the seat tool; a brief from before it did carries
+    // an opencode seat. A selection without an implemented runner refuses
+    // before the dispatch intent is recorded and before anything spawns.
+    if (this.deps.runnerSelector) {
+      const manifestSeatTool = parsedManifest.seatTool;
+      const seatTool =
+        typeof manifestSeatTool === 'string' && manifestSeatTool.trim() !== ''
+          ? manifestSeatTool.trim()
+          : 'opencode';
+      const selection = this.deps.runnerSelector.selectRunner({ seatTool });
+      if (!selection.ok) {
+        return { outcome: 'refused', reason: selection.reason };
+      }
+    }
 
     const existingAttempt = await this.deps.attemptRepo.findAttemptById(request.attemptId);
 
@@ -364,6 +386,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     }
 
     const initialRunner: AttemptRunnerRecord = {
+      kind: 'opencode',
       remotePort: runnerPort,
       host: runnerHost,
       agent: effectiveAgent ?? null,

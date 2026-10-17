@@ -50,9 +50,18 @@ export interface WorkOrderRecord {
 /** Fix rounds are fresh attempts; they never resume the prior conversation. */
 export type AttemptKind = 'initial' | 'fix';
 
+/** The lane runner tool that executed the attempt's worker command. */
+export type RunnerKind = 'opencode' | 'agy';
+
 /** Runner session details recorded at dispatch time for port and host fidelity. */
 export interface AttemptRunnerRecord {
-  readonly remotePort: number;
+  /**
+   * The runner tool (D7). Records persisted before this field existed were
+   * opencode runs; the record repository reads them as `'opencode'`.
+   */
+  readonly kind: RunnerKind;
+  /** The opencode tunnel port. `null` for agy runs, which have no port. */
+  readonly remotePort: number | null;
   readonly host: string | null;
   readonly agent: string | null;
   readonly model: string | null;

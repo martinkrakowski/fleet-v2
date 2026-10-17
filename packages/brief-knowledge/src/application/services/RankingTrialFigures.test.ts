@@ -156,6 +156,26 @@ describe("computeRankingTrialFigures", () => {
     expect(figures[0].latencyP50Ms).toBe(FIGURE_NOT_PERSISTED);
   });
 
+  it("leaves out pre-K2 lines with no contextRef instead of grouping them as one context", () => {
+    const snapshot: DecisionJournalSnapshot = {
+      receipts: [
+        receipt({
+          contextRef: "",
+          lexicalOrder: ["ke-a", "ke-b"],
+          decidedOrder: ["ke-b", "ke-a"],
+        }),
+        receipt({
+          contextRef: "",
+          lexicalOrder: ["ke-c", "ke-d"],
+          decidedOrder: ["ke-c", "ke-d"],
+        }),
+      ],
+      outcomes: [],
+      skippedLines: 0,
+    };
+    expect(computeRankingTrialFigures(snapshot)).toEqual([]);
+  });
+
   it("ignores another consumer's receipts and outcomes", () => {
     const snapshot: DecisionJournalSnapshot = {
       receipts: [

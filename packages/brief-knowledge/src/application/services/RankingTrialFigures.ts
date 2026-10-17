@@ -84,7 +84,12 @@ export function computeRankingTrialFigures(
 ): readonly RankingTrialContextFigures[] {
   const callsByRef = new Map<string, SettledDecisionReceiptRecord[]>();
   for (const receipt of snapshot.receipts) {
-    if (receipt.consumer !== KNOWLEDGE_RANKING_CONSUMER) {
+    // A line written before K2 carries no contextRef (read as ""): it joins
+    // no proposal, so it is not a context of its own.
+    if (
+      receipt.consumer !== KNOWLEDGE_RANKING_CONSUMER ||
+      receipt.contextRef === ""
+    ) {
       continue;
     }
     const calls = callsByRef.get(receipt.contextRef);
@@ -102,7 +107,8 @@ export function computeRankingTrialFigures(
   for (const outcome of snapshot.outcomes) {
     if (
       outcome.consumer !== KNOWLEDGE_RANKING_CONSUMER ||
-      outcome.kind !== "ranking-selection"
+      outcome.kind !== "ranking-selection" ||
+      outcome.contextRef === ""
     ) {
       continue;
     }

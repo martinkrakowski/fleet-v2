@@ -102,7 +102,11 @@ async function probePlatformTool(
   } catch {
     return { name, present: false };
   }
-  const present = result.exitCode === 0;
+  // A presence-only probe asks "is it here", not "did the usage text
+  // parse": BSD nc exits 1 on `-h`, so 0 or 1 both mean present.
+  const present = PRESENCE_ONLY.has(name)
+    ? result.exitCode === 0 || result.exitCode === 1
+    : result.exitCode === 0;
   const version = PRESENCE_ONLY.has(name)
     ? undefined
     : (firstLine(result.stdout) ?? firstLine(result.stderr));

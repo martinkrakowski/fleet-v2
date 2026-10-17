@@ -85,7 +85,8 @@ printed.
                               "scoped-worktree"
   --forge none|github         the v2 forge mode (D6)
   --forgeRepo owner/repo      required with --forge github
-  --shelf local|git           the keeper shelf provider (D1)
+  --shelf local|git           the keeper shelf provider (D1); absent means
+                              local
   --shelfRepo <path>          required with --shelf git (the shelf
                               repository directory)
   --hosts <json>              --profile multi only: one JSON array of host
@@ -158,6 +159,50 @@ function isHelpToken(token: string): boolean {
 
 function usage(error: string): ParsedInitArgs {
   return { ok: false, error: `${error}\n${INIT_HELP}` };
+}
+
+/** The keys one host draft may carry (the `hosts add` draft shape). */
+const HOST_DRAFT_KEYS: ReadonlySet<string> = new Set([
+  "name",
+  "transport",
+  "sshAlias",
+  "worktreeRoot",
+  "tmpDir",
+  "roles",
+  "runner",
+]);
+
+/**
+ * The shape every host draft must have before the engine sees it: an
+ * object with a string `name`, a `roles` array and a string
+ * `worktreeRoot`, and no key outside the draft shape. Any problem is a
+ * usage error, never a cast past it.
+ */
+function hostDraftShapeError(
+  drafts: readonly unknown[],
+): string | undefined {
+  const expected = `expected keys: ${[...HOST_DRAFT_KEYS].join(", ")}`;
+  for (const [index, draft] of drafts.entries()) {
+    if (typeof draft !== "object" || draft === null || Array.isArray(draft)) {
+      return `--hosts: entry ${index} is not a host draft object (${expected})`;
+    }
+    const entry = draft as Record<string, unknown>;
+    for (const key of Object.keys(entry)) {
+      if (!HOST_DRAFT_KEYS.has(key)) {
+        return `--hosts: entry ${index} has unknown key '${key}' (${expected})`;
+      }
+    }
+    if (typeof entry.name !== "string") {
+      return `--hosts: entry ${index} needs a string 'name' (${expected})`;
+    }
+    if (!Array.isArray(entry.roles)) {
+      return `--hosts: entry ${index} needs a 'roles' array (${expected})`;
+    }
+    if (typeof entry.worktreeRoot !== "string") {
+      return `--hosts: entry ${index} needs a string 'worktreeRoot' (${expected})`;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -264,10 +309,8 @@ function parseInitArgs(tokens: readonly string[]): ParsedInitArgs {
   if (forge === "none" && forgeRepo !== undefined) {
     return usage("--forgeRepo belongs to --forge github");
   }
-  const shelf = values.get("shelf");
-  if (shelf === undefined) {
-    return usage("--shelf is required (local or git)");
-  }
+  // Plan step 9, "default no → local": an absent --shelf means local.
+  const shelf = values.get("shelf") ?? "local";
   if (shelf !== "local" && shelf !== "git") {
     return usage("--shelf must be local or git");
   }
@@ -292,6 +335,10 @@ function parseInitArgs(tokens: readonly string[]): ParsedInitArgs {
     }
     if (!Array.isArray(parsedJson)) {
       return usage("--hosts must be one JSON array of host drafts");
+    }
+    const shapeError = hostDraftShapeError(parsedJson);
+    if (shapeError !== undefined) {
+      return usage(shapeError);
     }
     hosts = parsedJson as readonly InitHostAnswer[];
   } else if (profile === "multi") {

@@ -5,6 +5,11 @@
  * already accepted.
  */
 
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { parseInstallation } from "@fleet/installation";
@@ -108,6 +113,15 @@ describe("detectInitEnvironment", () => {
     // `sh` and `nc` are presence-only probes.
     expect(byName.get("sh")).toEqual({ name: "sh", present: true });
     expect(byName.get("nc")).toEqual({ name: "nc", present: true });
+  });
+
+  it("accepts a BSD nc that exits 1 on -h as present", async () => {
+    // BSD nc prints its usage and exits 1; that is still presence.
+    const detection = await fullDetection([], {
+      "nc -h": { exitCode: 1, stdout: "", stderr: "usage: nc\n" },
+    });
+    const nc = detection.platformTools.find((tool) => tool.name === "nc");
+    expect(nc).toEqual({ name: "nc", present: true });
   });
 
   it("reports a missing tool as present:false and never throws", async () => {
@@ -479,9 +493,63 @@ describe("buildInitPlan", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     const commands = result.plan.credentials.map((entry) => entry.command);
-    expect(commands).toContain("chmod 600 /run/fleet/opencode-auth");
-    expect(commands).toContain("chmod 600 /run/fleet/waves-token");
+    expect(commands).toContain("chmod 600 '/run/fleet/opencode-auth'");
+    expect(commands).toContain("chmod 600 '/run/fleet/waves-token'");
     expect(commands).toContain("gh auth status");
     // The engine touches no filesystem: there is nothing to clean up.
+  });
+
+  it("shell-quotes the credential chmod lines an operator path could break", async () => {
+    const result = buildInitPlan(
+      baseAnswers({
+        profile: "multi",
+        hosts: [
+          {
+            name: "head",
+            transport: "local",
+            worktreeRoot: "/srv/fleet/worktrees",
+            roles: ["orchestrator", "lane-runner"],
+            runner: {
+              kind: "opencode",
+              port: 46000,
+              authFile: "/run/fleet/opencode auth;touch /tmp/pwned",
+            },
+          },
+        ],
+      }),
+      await fullDetection(),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const command = result.plan.credentials[0]?.command;
+    // One single-quoted command naming one file — never two commands.
+    expect(command).toBe(
+      "chmod 600 '/run/fleet/opencode auth;touch /tmp/pwned'",
+    );
+    // Given to `sh -c` against a PATH holding only a logging chmod stub,
+    // the line runs exactly one command and nothing else.
+    const stub = mkdtempSync(path.join(tmpdir(), "fleet-quote-stub-"));
+    try {
+      // The line parses as shell syntax…
+      expect(execFileSync("/bin/sh", ["-n", "-c", command]).toString()).toBe(
+        "",
+      );
+      const log = path.join(stub, "chmod.log");
+      writeFileSync(
+        path.join(stub, "chmod"),
+        '#!/bin/sh\necho "$@" >> "$FLEET_CHMOD_LOG"\n',
+        { mode: 0o755 },
+      );
+      const output = execFileSync("/bin/sh", ["-c", command], {
+        env: { PATH: stub, FLEET_CHMOD_LOG: log },
+      });
+      expect(output.toString()).toBe("");
+      // Exactly one chmod invocation, with the whole path as one argument.
+      expect(readFileSync(log, "utf8")).toBe(
+        `600 /run/fleet/opencode auth;touch /tmp/pwned\n`,
+      );
+    } finally {
+      rmSync(stub, { recursive: true, force: true });
+    }
   });
 });

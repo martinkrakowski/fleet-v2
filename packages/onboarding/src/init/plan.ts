@@ -85,6 +85,15 @@ export interface InitAnswers {
   readonly hosts?: readonly InitHostAnswer[];
 }
 
+/**
+ * POSIX single-quote one value for a shell command line: the path an
+ * operator chose may contain spaces, `;`, `&`, anything — the printed
+ * command must stay one command naming one file.
+ */
+export function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 /** One entry of the credential checklist (plan section 5, step 10). */
 export interface InitCredentialEntry {
   /** The credential file's path, when the feature names one. */
@@ -428,14 +437,14 @@ export function buildInitPlan(
     if (input.runner?.authFile !== undefined) {
       credentials.push({
         path: input.runner.authFile,
-        command: `chmod 600 ${input.runner.authFile}`,
+        command: `chmod 600 ${shellQuote(input.runner.authFile)}`,
       });
     }
   }
   if (answers.waves?.tokenFile !== undefined) {
     credentials.push({
       path: answers.waves.tokenFile,
-      command: `chmod 600 ${answers.waves.tokenFile}`,
+      command: `chmod 600 ${shellQuote(answers.waves.tokenFile)}`,
     });
   }
   if (answers.forge === "github") {

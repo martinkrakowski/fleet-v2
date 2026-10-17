@@ -142,7 +142,7 @@ async function runInit(
   return { code, stdout: stdout.join(""), stderr: stderr.join("") };
 }
 
-/** The exact command from plan section 5. */
+/** The exact command from plan section 5; --shelf is absent and means local. */
 const EXAMPLE_COMMAND = [
   "--profile",
   "single",
@@ -153,8 +153,6 @@ const EXAMPLE_COMMAND = [
   "none",
   "--forge",
   "none",
-  "--shelf",
-  "local",
   "--yes",
 ];
 
@@ -354,5 +352,139 @@ describe("fleet-v2 init", () => {
       processTreeTermination: true,
       filesystemScope: "scoped-worktree",
     });
+  });
+
+  it("names a multi-profile authFile in the checklist and creates nothing", async () => {
+    const directory = makeTempDir();
+    const authFile = path.join(directory, "opencode auth");
+    const result = await runInit(
+      [
+        "--profile",
+        "multi",
+        "--tools",
+        "claude",
+        "--isolation",
+        "none",
+        "--forge",
+        "none",
+        "--hosts",
+        JSON.stringify([
+          {
+            name: "head",
+            transport: "local",
+            worktreeRoot: path.join(directory, "worktrees"),
+            roles: ["orchestrator", "lane-runner"],
+            runner: { kind: "opencode", port: 46000, authFile },
+          },
+        ]),
+      ],
+      directory,
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("credential checklist (nothing is created)");
+    // The checklist names the authFile in a quoted chmod command…
+    expect(result.stdout).toContain(`chmod 600 '${authFile}'`);
+    // …and nothing created it.
+    expect(existsSync(authFile)).toBe(false);
+  });
+
+  it("refuses a --hosts draft that is not the draft shape with exit 2", async () => {
+    const directory = makeTempDir();
+    const draft = {
+      name: "head",
+      transport: "local",
+      worktreeRoot: "/w",
+      roles: ["orchestrator"],
+    };
+    const bad = await runInit(
+      [
+        "--profile",
+        "multi",
+        "--tools",
+        "claude",
+        "--isolation",
+        "none",
+        "--forge",
+        "none",
+        "--hosts",
+        JSON.stringify([{ ...draft, extra: 1 }]),
+      ],
+      directory,
+    );
+    expect(bad.code).toBe(2);
+    expect(bad.stderr).toContain("unknown key 'extra'");
+    expect(bad.stderr).toContain("expected keys:");
+
+    const notAnObject = await runInit(
+      [
+        "--profile",
+        "multi",
+        "--tools",
+        "claude",
+        "--isolation",
+        "none",
+        "--forge",
+        "none",
+        "--hosts",
+        JSON.stringify(["head"]),
+      ],
+      directory,
+    );
+    expect(notAnObject.code).toBe(2);
+    expect(notAnObject.stderr).toContain("is not a host draft object");
+
+    const noName = await runInit(
+      [
+        "--profile",
+        "multi",
+        "--tools",
+        "claude",
+        "--isolation",
+        "none",
+        "--forge",
+        "none",
+        "--hosts",
+        JSON.stringify([{ ...draft, name: 7 }]),
+      ],
+      directory,
+    );
+    expect(noName.code).toBe(2);
+    expect(noName.stderr).toContain("a string 'name'");
+
+    const noRoles = await runInit(
+      [
+        "--profile",
+        "multi",
+        "--tools",
+        "claude",
+        "--isolation",
+        "none",
+        "--forge",
+        "none",
+        "--hosts",
+        JSON.stringify([{ ...draft, roles: undefined }]),
+      ],
+      directory,
+    );
+    expect(noRoles.code).toBe(2);
+    expect(noRoles.stderr).toContain("'roles' array");
+
+    const badWorktree = await runInit(
+      [
+        "--profile",
+        "multi",
+        "--tools",
+        "claude",
+        "--isolation",
+        "none",
+        "--forge",
+        "none",
+        "--hosts",
+        JSON.stringify([{ ...draft, worktreeRoot: 7 }]),
+      ],
+      directory,
+    );
+    expect(badWorktree.code).toBe(2);
+    expect(badWorktree.stderr).toContain("a string 'worktreeRoot'");
   });
 });

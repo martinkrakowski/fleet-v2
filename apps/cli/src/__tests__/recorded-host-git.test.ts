@@ -9,10 +9,7 @@ import {
   LocalExecutor,
   type AttemptRunnerRecord,
 } from "@fleet/work-execution";
-import {
-  headRouteForExecutor,
-  readGitHead,
-} from "../composition.js";
+import { headRouteForExecutor, readGitHead } from "../composition.js";
 
 function attemptRunner(
   hostName: string | null,

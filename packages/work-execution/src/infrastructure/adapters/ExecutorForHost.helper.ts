@@ -60,7 +60,11 @@ export class ExecutorForHost {
   executorForRecordedHost(
     recorded: AttemptRunnerRecord | null | undefined,
   ): ExecutorForRecordedHostResult {
-    if (recorded === null || recorded === undefined || !hasRecordedHostName(recorded)) {
+    if (
+      recorded === null ||
+      recorded === undefined ||
+      !hasRecordedHostName(recorded)
+    ) {
       return { ok: true, executor: this.options.legacyExecutor };
     }
     const confirmed = confirmRecordedHost(recorded, this.options?.hosts);

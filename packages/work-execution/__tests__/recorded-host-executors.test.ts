@@ -96,7 +96,11 @@ describe("ExecutorForHost", () => {
   const helper = new ExecutorForHost({ hosts, legacyExecutor });
 
   it("returns the legacy executor for a legacy record", () => {
-    for (const recorded of [null, undefined, attemptRunner(null, "a.example", 4001)]) {
+    for (const recorded of [
+      null,
+      undefined,
+      attemptRunner(null, "a.example", 4001),
+    ]) {
       const result = helper.executorForRecordedHost(recorded);
       expect(result).toEqual({ ok: true, executor: legacyExecutor });
     }
@@ -167,8 +171,9 @@ describe("H9b2 reads through the recorded host's executor", () => {
   function adapterOptions() {
     return {
       executor: legacyExecutor,
-      executorForRecordedHost: (recorded: AttemptRunnerRecord | null | undefined) =>
-        helper.executorForRecordedHost(recorded),
+      executorForRecordedHost: (
+        recorded: AttemptRunnerRecord | null | undefined,
+      ) => helper.executorForRecordedHost(recorded),
     };
   }
 

@@ -5,7 +5,9 @@ import type { KnowledgeEntryRepositoryPort } from '../ports/out/KnowledgeEntryRe
 import type {
   AppendDecisionOutcome,
   DecisionCallReceipt,
+  DecisionJournalSnapshot,
   DecisionReceiptJournalPort,
+  ReadDecisionJournalQuery,
   ReserveDecisionQuery,
   ReserveDecisionResult,
 } from '../ports/out/DecisionReceiptJournalPort.out-port.js';
@@ -64,6 +66,13 @@ class StubDecisionJournal implements DecisionReceiptJournalPort {
       throw new Error('outcome journal offline');
     }
     this.outcomes.push(outcome);
+  }
+
+  async readJournal(query: ReadDecisionJournalQuery): Promise<DecisionJournalSnapshot> {
+    return {
+      receipts: [],
+      outcomes: this.outcomes.filter((outcome) => outcome.consumer === query.consumer),
+    };
   }
 }
 

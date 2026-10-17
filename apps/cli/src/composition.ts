@@ -86,9 +86,13 @@ import {
   ClaimVerificationAdapter,
   createRankingAdvice,
   DecideKnowledgeDispositionUseCase,
+  type DecisionReceiptJournalPort,
+  FileDecisionReceiptJournalAdapter,
   KeeperPublicationAdapter,
   KnowledgeEntryRepositoryAdapter,
   KnowledgeRetrievalAdapter,
+  ListCandidateClaimsUseCase,
+  NotConfiguredReceiptJournal,
   ProposeBriefContextUseCase,
   PublishAcceptedKeeperUseCase,
   RecordContextSelectionUseCase,
@@ -450,9 +454,16 @@ export interface FleetCliRuntime {
     readonly captureCompletedAttemptNotes: CaptureCompletedAttemptNotesUseCase;
     readonly checkKnowledgeClaim: CheckKnowledgeClaimUseCase;
     readonly decideKnowledgeDisposition: DecideKnowledgeDispositionUseCase;
+    readonly listCandidateClaims: ListCandidateClaimsUseCase;
     readonly publishAcceptedKeeper: PublishAcceptedKeeperUseCase;
     readonly proposeBriefContext: ProposeBriefContextUseCase;
     readonly recordContextSelection: RecordContextSelectionUseCase;
+    /**
+     * The decision receipt journal (K4): selections join their ranking
+     * outcome through it and `decisions report` reads it. Unconfigured
+     * without a state dir — nothing was ever reserved or settled there.
+     */
+    readonly decisionReceiptJournal: DecisionReceiptJournalPort;
     readonly recordKnowledgeReuse: RecordKnowledgeReuseUseCase;
     readonly supersedeKnowledgeEntry: SupersedeKnowledgeEntryUseCase;
   };
@@ -672,6 +683,14 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     knowledgeRetrieval,
     rankingAdvice,
   );
+  // The decision receipt journal (K4): the same `<stateDir>/decision-receipts`
+  // store the ranking advice adapter writes. With no state dir nothing was
+  // ever reserved or settled, so the unconfigured journal answers reads with
+  // an empty snapshot and the selection outcome is skipped silently.
+  const decisionReceiptJournal: DecisionReceiptJournalPort =
+    stateDir === undefined || stateDir.trim().length === 0
+      ? new NotConfiguredReceiptJournal()
+      : new FileDecisionReceiptJournalAdapter(stateDir);
 
   const knowledge = {
     knowledgeEntryRepository,
@@ -688,6 +707,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     decideKnowledgeDisposition: new DecideKnowledgeDispositionUseCase({
       repo: knowledgeEntryRepository,
     }),
+    listCandidateClaims: new ListCandidateClaimsUseCase({
+      repo: knowledgeEntryRepository,
+    }),
     publishAcceptedKeeper: new PublishAcceptedKeeperUseCase({
       repo: knowledgeEntryRepository,
       publisher: keeperPublication,
@@ -696,9 +718,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       repo: knowledgeEntryRepository,
       retrieval: advisedRetrieval,
     }),
-    recordContextSelection: new RecordContextSelectionUseCase({ repo: knowledgeEntryRepository }),
+    recordContextSelection: new RecordContextSelectionUseCase({
+      repo: knowledgeEntryRepository,
+      // The selection outcome joins the ranking receipt the proposals named
+      // (K4); best effort by contract, never failing the recording.
+      journal: decisionReceiptJournal,
+    }),
     recordKnowledgeReuse: new RecordKnowledgeReuseUseCase({ repo: knowledgeEntryRepository }),
     supersedeKnowledgeEntry: new SupersedeKnowledgeEntryUseCase({ repo: knowledgeEntryRepository }),
+    decisionReceiptJournal,
   };
 
   // --- evidence-and-acceptance ------------------------------------------------

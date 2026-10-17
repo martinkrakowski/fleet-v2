@@ -13,7 +13,9 @@ import { buildTriageBatches, triageContextRef } from "../claim-triage-state.js";
 import { CLAIM_TRIAGE_CONSUMER } from "../../../application/ports/out/DecisionReceiptJournalPort.out-port.js";
 import type {
   DecisionCallReceipt,
+  DecisionJournalSnapshot,
   DecisionReceiptJournalPort,
+  ReadDecisionJournalQuery,
 } from "../../../application/ports/out/DecisionReceiptJournalPort.out-port.js";
 import type { TriageAttemptQuery } from "../../../application/ports/out/ClaimTriagePort.out-port.js";
 
@@ -143,6 +145,10 @@ class FakeJournal implements DecisionReceiptJournalPort {
 
   async appendOutcome(): Promise<void> {
     return undefined;
+  }
+
+  async readJournal(_query: ReadDecisionJournalQuery): Promise<DecisionJournalSnapshot> {
+    return { receipts: [], outcomes: [] };
   }
 }
 

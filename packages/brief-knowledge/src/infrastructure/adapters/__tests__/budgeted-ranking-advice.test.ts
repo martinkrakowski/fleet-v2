@@ -281,6 +281,7 @@ describe('BudgetedRankingAdviceAdapter', () => {
         },
         monthSpendUsd: (month) => realJournal.monthSpendUsd(month),
         appendOutcome: (outcome) => realJournal.appendOutcome(outcome),
+        readJournal: (query) => realJournal.readJournal(query),
       };
       const { adapter } = makeBudgeted(stateDir, {
         answer: {
@@ -346,6 +347,9 @@ describe('BudgetedRankingAdviceAdapter', () => {
         },
         monthSpendUsd: async () => 0,
         appendOutcome: async () => {
+          throw new Error('journal unavailable');
+        },
+        readJournal: async () => {
           throw new Error('journal unavailable');
         },
       };

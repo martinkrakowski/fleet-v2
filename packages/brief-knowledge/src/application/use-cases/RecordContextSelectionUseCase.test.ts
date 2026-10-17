@@ -2,6 +2,14 @@ import { describe, expect, it } from 'vitest';
 import type { KnowledgeEntryRecord, KnowledgeTriageFlag } from '../../domain/knowledge-records.js';
 import type { ContextSelectionProps } from '../../domain/value-objects/ContextSelection.vo.js';
 import type { KnowledgeEntryRepositoryPort } from '../ports/out/KnowledgeEntryRepositoryPort.out-port.js';
+import type {
+  AppendDecisionOutcome,
+  DecisionJournalSnapshot,
+  DecisionReceiptJournalPort,
+  ReadDecisionJournalQuery,
+  ReserveDecisionQuery,
+  ReserveDecisionResult,
+} from '../ports/out/DecisionReceiptJournalPort.out-port.js';
 import { RecordContextSelectionUseCase } from './RecordContextSelectionUseCase.use-case.js';
 
 class InMemoryKnowledgeEntryRepository implements KnowledgeEntryRepositoryPort {
@@ -60,6 +68,50 @@ function createEntryRecord(overrides: Partial<KnowledgeEntryRecord> = {}): Knowl
     updatedAtIso: '2026-10-15T10:00:00.000Z',
     ...overrides,
   };
+}
+
+/**
+ * Journal stub honouring the port's outcome contract (K4): an outcome for a
+ * reference with no settled receipt is skipped silently, and the use case's
+ * swallowed-throw path is exercised through `failAppend`.
+ */
+class RecordingSelectionJournal implements DecisionReceiptJournalPort {
+  readonly appended: AppendDecisionOutcome[] = [];
+  appendCalls = 0;
+
+  constructor(
+    private readonly settledContextRefs: readonly string[] = [],
+    private readonly failAppend = false,
+  ) {}
+
+  async reserve(_query: ReserveDecisionQuery): Promise<ReserveDecisionResult> {
+    return { ok: false, reason: 'not-configured' };
+  }
+
+  async settle(): Promise<void> {}
+
+  async monthSpendUsd(): Promise<number> {
+    return 0;
+  }
+
+  async appendOutcome(outcome: AppendDecisionOutcome): Promise<void> {
+    this.appendCalls += 1;
+    // No settled receipt for this reference: skipped silently, per the port.
+    if (!this.settledContextRefs.includes(outcome.contextRef)) {
+      return;
+    }
+    if (this.failAppend) {
+      throw new Error('outcome journal offline');
+    }
+    this.appended.push(outcome);
+  }
+
+  async readJournal(query: ReadDecisionJournalQuery): Promise<DecisionJournalSnapshot> {
+    return {
+      receipts: [],
+      outcomes: this.appended.filter((outcome) => outcome.consumer === query.consumer),
+    };
+  }
 }
 
 describe('RecordContextSelectionUseCase', () => {
@@ -374,5 +426,160 @@ describe('RecordContextSelectionUseCase', () => {
     expect(recorded[1].knowledgeEntryId).toBe('ke-contra');
     expect(recorded[2].accepted).toBe(false);
     expect(recorded[2].knowledgeEntryId).toBe('ke-old');
+  });
+
+  it('writes the ranking-selection outcome when a rankingContextRef with a settled receipt is given', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    const keeper = createEntryRecord({
+      id: 'ke-accepted-1',
+      disposition: 'accepted',
+      verification: 'supported',
+      checkerId: 'checker-ci',
+      dispositionReason: 'verified by smoke tests',
+      supersededById: null,
+    });
+    const secondKeeper = createEntryRecord({
+      id: 'ke-accepted-2',
+      disposition: 'accepted',
+      verification: 'supported',
+      checkerId: 'checker-ci',
+      dispositionReason: 'verified by smoke tests',
+      supersededById: null,
+    });
+    await repo.saveEntry(keeper);
+    await repo.saveEntry(secondKeeper);
+
+    const contextRef = `ranking:lane-k4:${'a'.repeat(64)}`;
+    const journal = new RecordingSelectionJournal([contextRef]);
+    const useCase = new RecordContextSelectionUseCase({ repo, journal });
+    const result = await useCase.execute({
+      attemptId: 'att-lane-42',
+      rankingContextRef: contextRef,
+      nowIso: '2026-10-17T10:00:00.000Z',
+      selections: [
+        {
+          proposalId: 'bkp-ke-accepted-2-2',
+          knowledgeEntryId: 'ke-accepted-2',
+          version: '1.0.0',
+          accepted: true,
+          decisionBecause: 'Highest lexical match after advice',
+        },
+        {
+          proposalId: 'bkp-ke-accepted-1-1',
+          knowledgeEntryId: 'ke-accepted-1',
+          version: '1.0.0',
+          accepted: true,
+          decisionBecause: 'Second match',
+        },
+      ],
+    });
+
+    expect(result).toEqual({ outcome: 'recorded', recordedCount: 2 });
+    expect(journal.appended).toEqual([
+      {
+        consumer: 'knowledge-ranking',
+        contextRef,
+        kind: 'ranking-selection',
+        value: ['ke-accepted-2', 'ke-accepted-1'],
+        at: '2026-10-17T10:00:00.000Z',
+      },
+    ]);
+  });
+
+  it('skips the outcome when no rankingContextRef is given', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    const keeper = createEntryRecord({
+      id: 'ke-accepted-1',
+      disposition: 'accepted',
+      verification: 'supported',
+      checkerId: 'checker-ci',
+      supersededById: null,
+    });
+    await repo.saveEntry(keeper);
+
+    const journal = new RecordingSelectionJournal(['ranking:anywhere']);
+    const useCase = new RecordContextSelectionUseCase({ repo, journal });
+    const result = await useCase.execute({
+      attemptId: 'att-1',
+      selections: [
+        {
+          proposalId: 'prop-1',
+          knowledgeEntryId: 'ke-accepted-1',
+          version: '1.0.0',
+          accepted: true,
+          decisionBecause: 'Directly applies',
+        },
+      ],
+    });
+
+    expect(result).toEqual({ outcome: 'recorded', recordedCount: 1 });
+    expect(journal.appendCalls).toBe(0);
+    expect(journal.appended).toHaveLength(0);
+  });
+
+  it('skips the outcome silently when the journal has no settled receipt for the reference', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    const keeper = createEntryRecord({
+      id: 'ke-accepted-1',
+      disposition: 'accepted',
+      verification: 'supported',
+      checkerId: 'checker-ci',
+      supersededById: null,
+    });
+    await repo.saveEntry(keeper);
+
+    const contextRef = `ranking:lane-k4:${'b'.repeat(64)}`;
+    const journal = new RecordingSelectionJournal([]);
+    const useCase = new RecordContextSelectionUseCase({ repo, journal });
+    const result = await useCase.execute({
+      attemptId: 'att-1',
+      rankingContextRef: contextRef,
+      selections: [
+        {
+          proposalId: 'prop-1',
+          knowledgeEntryId: 'ke-accepted-1',
+          version: '1.0.0',
+          accepted: true,
+          decisionBecause: 'Directly applies',
+        },
+      ],
+    });
+
+    expect(result).toEqual({ outcome: 'recorded', recordedCount: 1 });
+    expect(journal.appendCalls).toBe(1);
+    expect(journal.appended).toHaveLength(0);
+  });
+
+  it('never fails the recording when appendOutcome throws', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    const keeper = createEntryRecord({
+      id: 'ke-accepted-1',
+      disposition: 'accepted',
+      verification: 'supported',
+      checkerId: 'checker-ci',
+      supersededById: null,
+    });
+    await repo.saveEntry(keeper);
+
+    const contextRef = `ranking:lane-k4:${'c'.repeat(64)}`;
+    const journal = new RecordingSelectionJournal([contextRef], true);
+    const useCase = new RecordContextSelectionUseCase({ repo, journal });
+    const result = await useCase.execute({
+      attemptId: 'att-1',
+      rankingContextRef: contextRef,
+      selections: [
+        {
+          proposalId: 'prop-1',
+          knowledgeEntryId: 'ke-accepted-1',
+          version: '1.0.0',
+          accepted: true,
+          decisionBecause: 'Directly applies',
+        },
+      ],
+    });
+
+    expect(result).toEqual({ outcome: 'recorded', recordedCount: 1 });
+    const recorded = await repo.listContextSelections('att-1');
+    expect(recorded).toHaveLength(1);
   });
 });

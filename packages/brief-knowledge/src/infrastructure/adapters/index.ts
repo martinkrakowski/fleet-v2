@@ -9,6 +9,7 @@ export * from "./ClaimVerificationAdapter.adapter.js";
 export * from "./file-store.js";
 export * from "./FileDecisionReceiptJournalAdapter.adapter.js";
 export * from "./GitShelfProvider.adapter.js";
+export * from "./InMemoryDecisionReceiptJournalAdapter.adapter.js";
 export * from "./jev-advice-state.js";
 export * from "./jev-advice-validator.js";
 export * from "./JevClaimTriageAdapter.adapter.js";

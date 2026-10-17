@@ -12,8 +12,8 @@
  * uses the single legacy runner exactly as today.
  */
 
-import type { AttemptRunnerRecord } from '../../../domain/execution-records.js';
-import type { ExecutionRunnerPort } from './ExecutionRunnerPort.out-port.js';
+import type { AttemptRunnerRecord } from "../../../domain/execution-records.js";
+import type { ExecutionRunnerPort } from "./ExecutionRunnerPort.out-port.js";
 
 export interface RunnerForAttemptRequest {
   /** The attempt's recorded runner block; `null` for a legacy attempt. */

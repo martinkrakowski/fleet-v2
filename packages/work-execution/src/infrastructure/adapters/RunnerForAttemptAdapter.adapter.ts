@@ -19,19 +19,22 @@
 import type {
   ExecutionRunnerPort,
   RunnerIsolationCapabilities,
-} from '../../application/ports/out/ExecutionRunnerPort.out-port.js';
+} from "../../application/ports/out/ExecutionRunnerPort.out-port.js";
 import type {
   RunnerForAttemptPort,
   RunnerForAttemptRequest,
   RunnerForAttemptResult,
-} from '../../application/ports/out/RunnerForAttemptPort.out-port.js';
-import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
-import type { AttemptRecord, RunnerKind } from '../../domain/execution-records.js';
+} from "../../application/ports/out/RunnerForAttemptPort.out-port.js";
+import type { CommandExecutorPort } from "../../application/ports/out/CommandExecutorPort.out-port.js";
+import type {
+  AttemptRecord,
+  RunnerKind,
+} from "../../domain/execution-records.js";
 import {
   ExecutionRunnerAdapter,
   type ExecutionRunnerHost,
   type SubprocessRunner,
-} from './ExecutionRunnerAdapter.adapter.js';
+} from "./ExecutionRunnerAdapter.adapter.js";
 
 /**
  * One host as this adapter reads it — a structural subset of
@@ -39,7 +42,7 @@ import {
  * stays free of a dependency on that package.
  */
 export interface RunnerForAttemptHostSpec {
-  readonly transport?: 'local' | 'ssh';
+  readonly transport?: "local" | "ssh";
   readonly sshAlias?: string;
   readonly roles?: readonly string[];
   readonly runner?: {
@@ -67,8 +70,10 @@ export interface RunnerForAttemptAdapterOptions {
   readonly executor?: CommandExecutorPort;
   readonly runSubprocess?: SubprocessRunner;
   readonly capabilities?: Partial<RunnerIsolationCapabilities>;
-  readonly runnerTransport?: 'local' | 'ssh';
-  readonly resolveWorktreePath?: (attemptId: string) => Promise<string | null> | string | null;
+  readonly runnerTransport?: "local" | "ssh";
+  readonly resolveWorktreePath?: (
+    attemptId: string,
+  ) => Promise<string | null> | string | null;
   readonly resolveAttempt?: (
     attemptId: string,
   ) => Promise<AttemptRecord | null> | AttemptRecord | null;
@@ -76,7 +81,10 @@ export interface RunnerForAttemptAdapterOptions {
 
 /** The confirm-or-unknown refusal, naming the recorded host. */
 function changedReason(hostName: string): RunnerForAttemptResult {
-  return { ok: false, reason: `recorded host ${hostName} changed or was removed` };
+  return {
+    ok: false,
+    reason: `recorded host ${hostName} changed or was removed`,
+  };
 }
 
 export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
@@ -93,7 +101,7 @@ export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
       recorded === undefined ||
       recordedHostName === null ||
       recordedHostName === undefined ||
-      recordedHostName.trim() === ''
+      recordedHostName.trim() === ""
     ) {
       // Legacy attempt: the single legacy runner, exactly as today.
       return { ok: true, runner: this.options.legacyRunner };
@@ -105,33 +113,34 @@ export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
     if (spec === undefined) {
       return changedReason(name);
     }
-    if (spec.roles !== undefined && !spec.roles.includes('lane-runner')) {
+    if (spec.roles !== undefined && !spec.roles.includes("lane-runner")) {
       // The host exists but no longer serves the lane-runner role: it has
       // changed; never fall back to whichever host does.
       return changedReason(name);
     }
 
-    const currentKind = spec.runner?.kind ?? 'opencode';
+    const currentKind = spec.runner?.kind ?? "opencode";
     if (recorded.kind !== currentKind) {
       return changedReason(name);
     }
 
-    const currentTransport = spec.transport === 'ssh' ? 'ssh' : 'local';
+    const currentTransport = spec.transport === "ssh" ? "ssh" : "local";
     // A v2 dispatch records the ssh alias on `host` for an ssh host and
     // `null` for a local host, so the recorded alias decides the transport.
-    const recordedAlias = recorded.host?.trim() ?? '';
-    const recordedTransport = recordedAlias !== '' ? 'ssh' : 'local';
+    const recordedAlias = recorded.host?.trim() ?? "";
+    const recordedTransport = recordedAlias !== "" ? "ssh" : "local";
     if (currentTransport !== recordedTransport) {
       return changedReason(name);
     }
-    if (currentTransport === 'ssh') {
-      const currentAlias = spec.sshAlias?.trim() ?? '';
-      if (currentAlias === '' || currentAlias !== recordedAlias) {
+    if (currentTransport === "ssh") {
+      const currentAlias = spec.sshAlias?.trim() ?? "";
+      if (currentAlias === "" || currentAlias !== recordedAlias) {
         return changedReason(name);
       }
     }
 
-    const currentPort = typeof spec.runner?.port === 'number' ? spec.runner.port : null;
+    const currentPort =
+      typeof spec.runner?.port === "number" ? spec.runner.port : null;
     if ((recorded.remotePort ?? null) !== currentPort) {
       return changedReason(name);
     }
@@ -148,14 +157,18 @@ export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
   private buildRunner(
     name: string,
     spec: RunnerForAttemptHostSpec,
-    transport: 'local' | 'ssh',
+    transport: "local" | "ssh",
   ): ExecutionRunnerPort {
     const host: ExecutionRunnerHost = {
       hostName: name,
       transport,
-      ...(transport === 'ssh' && spec.sshAlias !== undefined ? { sshAlias: spec.sshAlias } : {}),
-      remotePort: typeof spec.runner?.port === 'number' ? spec.runner.port : null,
-      ...(spec.runner?.authFile !== undefined && spec.runner.authFile.trim() !== ''
+      ...(transport === "ssh" && spec.sshAlias !== undefined
+        ? { sshAlias: spec.sshAlias }
+        : {}),
+      remotePort:
+        typeof spec.runner?.port === "number" ? spec.runner.port : null,
+      ...(spec.runner?.authFile !== undefined &&
+      spec.runner.authFile.trim() !== ""
         ? { authFile: spec.runner.authFile }
         : {}),
     };

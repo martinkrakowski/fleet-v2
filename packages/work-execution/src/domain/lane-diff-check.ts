@@ -55,18 +55,40 @@ export interface LaneDiffVerdict {
   readonly findings: readonly LaneDiffFinding[];
 }
 
-/** The fixed protected paths: lane plumbing, GitHub workflows, the lane's own brief directory, the installation tree and lockfiles. */
+/**
+ * The fixed protected paths: lane plumbing, GitHub workflows, the lane's own
+ * brief directory, the installation tree and lockfiles. The list mirrors
+ * `scripts/lane-diff-check.sh`'s PROTECTED regex (line 84) plus the plan's
+ * `.git/`, `installation/`, `package-lock.json` and `pnpm-lock.yaml`.
+ */
 const FIXED_PROTECTED_PREFIXES: readonly string[] = [
   ".git",
   ".github",
+  ".gemini",
+  ".agents",
+  ".agy",
   ".lane",
+  "bin",
+  "scripts",
+  ".architecture",
+  "deploy",
   "installation",
 ];
 
+/** Lockfiles and package manifests are protected at any depth. */
 const FIXED_PROTECTED_FILES: readonly string[] = [
   "yarn.lock",
   "package-lock.json",
   "pnpm-lock.yaml",
+  "package.json",
+];
+
+/** Root-only files the script anchors with `$`. */
+const FIXED_PROTECTED_ROOT_FILES: readonly string[] = [
+  "AGENTS.md",
+  "CLAUDE.md",
+  "GEMINI.md",
+  "Dockerfile",
 ];
 
 /** Strip trailing slashes so a prefix compares as a path segment. */
@@ -111,14 +133,18 @@ function basename(path: string): string {
   return path.slice(path.lastIndexOf("/") + 1);
 }
 
-function isProtectedPath(
-  path: string,
-  policyProtectedPaths: readonly string[],
-): boolean {
+/**
+ * The fixed protected rule, matching the reference script's PROTECTED regex
+ * plus the plan's additions. Exported for the parity test that reads the
+ * script's line 84 and checks every alternative is covered here.
+ */
+export function isFixedProtectedPath(path: string): boolean {
   if (FIXED_PROTECTED_FILES.includes(basename(path))) return true;
-  if (FIXED_PROTECTED_PREFIXES.some((prefix) => path.startsWith(`${prefix}/`)))
-    return true;
-  return policyProtectedPaths.some((entry) => pathUnderPrefix(path, entry));
+  if (FIXED_PROTECTED_ROOT_FILES.includes(path)) return true;
+  if (path.startsWith(".yarnrc") || path.startsWith(".pnp.")) return true;
+  return FIXED_PROTECTED_PREFIXES.some((prefix) =>
+    path.startsWith(`${prefix}/`),
+  );
 }
 
 /**
@@ -168,15 +194,12 @@ export function checkLaneDiff(input: CheckLaneDiffInput): LaneDiffVerdict {
     }
     // Rule 2: protected paths are refused. The fixed list is lifted only by
     // a prefix that explicitly names the protected path or directory; policy
-    // additions are never lifted.
-    const lockfile = FIXED_PROTECTED_FILES.includes(basename(changed.path));
+    // additions are never lifted — they are OR-ed in and apply even when the
+    // brief explicitly allows a fixed protected prefix.
     if (
-      lockfile ||
-      FIXED_PROTECTED_PREFIXES.some((prefix) =>
-        changed.path.startsWith(`${prefix}/`),
-      )
-        ? !prefixExplicitlyAllowsProtected(changed.path, prefixes)
-        : isProtectedPath(changed.path, policyProtectedPaths)
+      (isFixedProtectedPath(changed.path) &&
+        !prefixExplicitlyAllowsProtected(changed.path, prefixes)) ||
+      policyProtectedPaths.some((entry) => pathUnderPrefix(changed.path, entry))
     ) {
       findings.push({ path: changed.path, rule: "protected-path" });
     }

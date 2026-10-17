@@ -2,7 +2,7 @@
 // runtime from harmless parts, so this test file itself matches nothing; the
 // helpers report whether or where a shape appears, never the matched text.
 import { describe, expect, it } from 'vitest';
-import { SECRET_PATTERNS, containsSecretShape, findSecretShapeLines } from '../secret-patterns.js';
+import { LANE_DIFF_SECRET_PATTERNS, SECRET_PATTERNS, containsSecretShape, findSecretShapeLines } from '../secret-patterns.js';
 
 // Each fake value is built from fragments so no pattern literal ever appears
 // contiguously in this file.
@@ -84,5 +84,24 @@ describe('findSecretShapeLines', () => {
     const lines = findSecretShapeLines(text);
     expect(lines).toEqual([2]);
     expect(JSON.stringify(lines)).toMatch(/^\[[0-9,\s]*\]$/);
+  });
+});
+
+describe('LANE_DIFF_SECRET_PATTERNS POSIX space parity (O14d1)', () => {
+  it('the four assignment patterns use explicit [[:space:]]-equivalent classes, never \\s or \\S', () => {
+    for (const pattern of LANE_DIFF_SECRET_PATTERNS) {
+      expect(pattern.regex.source, pattern.name).not.toContain('\\s');
+      expect(pattern.regex.source, pattern.name).not.toContain('\\S');
+    }
+  });
+
+  it('a tab-separated password assignment still matches like the POSIX classes', () => {
+    const tab = String.fromCharCode(9);
+    const entry = LANE_DIFF_SECRET_PATTERNS.find(
+      (pattern) => pattern.name === 'opencode-server-password',
+    );
+    expect(entry).toBeDefined();
+    const value = ['OPENCODE_SERVER_PASSWORD', '=', 'placeholder-value'].join(tab);
+    expect(entry!.regex.test(value)).toBe(true);
   });
 });

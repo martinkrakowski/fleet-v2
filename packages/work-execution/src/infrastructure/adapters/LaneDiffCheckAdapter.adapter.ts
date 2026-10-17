@@ -2,14 +2,17 @@
 /**
  * LaneDiffCheckAdapter implements LaneDiffCheckPort over an injected
  * CommandExecutorPort: it collects the worktree's tracked and untracked
- * changes (`git status --porcelain=v1 -z --untracked-files=all`,
- * `git diff --no-ext-diff -U0 <base>` plus the committed delta since the
- * base, mirroring `scripts/lane-diff-check.sh`), then calls the pure
- * `checkLaneDiff`. It mirrors the script's collection: git plumbing never
- * lists anything under `.git/`, so no snapshot comparison exists there
- * and the fixed `.git/` protected rule stays as defense in depth. Every command
- * failure fails closed as `error`; no file content is ever printed or
- * carried in a finding.
+ * changes (`git status --porcelain=v1 -z --untracked-files=all`, the name
+ * status and `-U0` added-line diffs against the base (which include the
+ * committed and staged delta since the base), the committed `base...HEAD`
+ * delta and the staged `--cached` delta, mirroring
+ * `scripts/lane-diff-check.sh`), then calls the pure `checkLaneDiff`. It
+ * mirrors the script's collection: git plumbing never lists anything under
+ * `.git/`, so no snapshot comparison exists there and the fixed `.git/`
+ * protected rule stays as defense in depth. Detecting changes under `.git/`
+ * (hooks, config) needs a snapshot taken at dispatch — that is lane O14d2's
+ * job and is deliberately not implemented here. Every command failure fails
+ * closed as `error`; no file content is ever printed or carried in a finding.
  */
 
 import type {
@@ -50,8 +53,23 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
       argv: readonly string[],
       what: string,
     ): Promise<CommandOutcome> => {
+      // The config overrides pin the parser input against the lane's local
+      // git config: no colors, no quoted paths, no mnemonic or missing
+      // a/b prefixes. `--no-color` and explicit prefixes are passed again on
+      // every diff for the same reason.
       const run = await this.commandExecutor.run(
-        ["git", "-c", "core.quotePath=false", ...argv],
+        [
+          "git",
+          "-c",
+          "color.ui=never",
+          "-c",
+          "core.quotePath=false",
+          "-c",
+          "diff.mnemonicPrefix=false",
+          "-c",
+          "diff.noprefix=false",
+          ...argv,
+        ],
         { cwd: request.worktreePath },
       );
       if (run.error !== undefined || run.exitCode !== 0) {
@@ -76,28 +94,93 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
 
     const addedLines = new Map<string, { line: number; text: string }[]>();
 
+    // Committed changes since the base are still reviewed: the worktree diff
+    // against the base carries them (plus the staged and unstaged delta), and
+    // its name status lists paths a `-U0` diff cannot name, such as committed
+    // deletions and mode-only changes.
+    const nameStatus = await git(
+      [
+        "diff",
+        "--no-color",
+        "--no-renames",
+        "--name-status",
+        "-z",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        request.baseCommit,
+      ],
+      "list the committed and staged files",
+    );
+    if (!nameStatus.ok) return { outcome: "error", reason: nameStatus.reason };
+    this.collectNameStatusEntries(nameStatus.stdout, changed);
+
     const diff = await git(
-      ["diff", "--no-ext-diff", "-U0", "--no-renames", request.baseCommit],
+      [
+        "diff",
+        "--no-ext-diff",
+        "--no-color",
+        "--no-renames",
+        "-U0",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        request.baseCommit,
+      ],
       "read the added lines",
     );
     if (!diff.ok) return { outcome: "error", reason: diff.reason };
     this.collectAddedLines(diff.stdout, addedLines);
 
-    // Committed changes since the base are still reviewed, like the script's
-    // `base...HEAD` collection. HEAD-unchanged-since-dispatch is the caller's
-    // step 1; this keeps the verdicts identical if the caller defers it.
+    // The committed delta since the base, like the script's `base...HEAD`
+    // collection. HEAD-unchanged-since-dispatch is the caller's step 1; this
+    // keeps the verdicts identical if the caller defers it.
     const committed = await git(
       [
         "diff",
         "--no-ext-diff",
-        "-U0",
+        "--no-color",
         "--no-renames",
+        "-U0",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
         `${request.baseCommit}...HEAD`,
       ],
       "read the committed added lines",
     );
     if (!committed.ok) return { outcome: "error", reason: committed.reason };
     this.collectAddedLines(committed.stdout, addedLines);
+
+    // A secret that is staged and then reverted in the worktree never shows
+    // in a worktree diff; the staged delta still has to be reviewed.
+    const cached = await git(
+      [
+        "diff",
+        "--cached",
+        "--no-ext-diff",
+        "--no-color",
+        "--no-renames",
+        "-U0",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+      ],
+      "read the staged added lines",
+    );
+    if (!cached.ok) return { outcome: "error", reason: cached.reason };
+    this.collectAddedLines(cached.stdout, addedLines);
+    const cachedNames = await git(
+      ["diff", "--cached", "--no-color", "--no-renames", "--name-status", "-z"],
+      "list the staged files",
+    );
+    if (!cachedNames.ok)
+      return { outcome: "error", reason: cachedNames.reason };
+    this.collectNameStatusEntries(cachedNames.stdout, changed);
+
+    // Fail closed on paths the line-by-line review cannot handle, without
+    // echoing the path anywhere.
+    for (const path of changed.keys()) {
+      if (hasUnsupportedPathCharacters(path)) {
+        return { outcome: "error", reason: "unsupported-path-characters" };
+      }
+    }
 
     // An untracked file's whole content is added lines.
     for (const path of untracked) {
@@ -188,9 +271,47 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
   }
 
   /**
-   * Parse a `-U0` unified diff: the `+++ b/<path>` header names the file and
-   * each `@@ -a,b +m,n @@` hunk header sets the next 1-based new-file line
-   * number for the `+` lines that follow.
+   * Parse `git diff --name-status -z`: NUL-separated status letters then
+   * paths. With `--no-renames` a rename arrives as a delete/add pair; a
+   * copy still carries a second path and is split the same way. Paths are
+   * merged into the changed set without overriding an entry the status
+   * already named.
+   */
+  private collectNameStatusEntries(
+    stdout: string,
+    changed: Map<string, LaneDiffChangedPath>,
+  ): void {
+    const fields = stdout.split("\0");
+    for (let index = 0; index < fields.length; index += 1) {
+      const statusField = fields[index];
+      if (statusField === "") continue;
+      const x = statusField[0];
+      const path = fields[index + 1] ?? "";
+      index += 1;
+      if (path === "") continue;
+      if (x === "C") {
+        const copied = fields[index + 1] ?? "";
+        index += 1;
+        if (copied !== "") {
+          changed.set(copied, { path: copied, status: "added" });
+        }
+      }
+      const status: LaneDiffFileStatus =
+        x === "A" ? "added" : x === "D" ? "deleted" : "modified";
+      if (!changed.has(path)) {
+        changed.set(path, { path, status });
+      }
+    }
+  }
+
+  /**
+   * Parse a `-U0` unified diff with explicit a/ and b/ prefixes. A
+   * `+++ b/<path>` header names the file only on the line directly after a
+   * `--- ` header, inside the file's header block; everything after the
+   * first `@@` of a file is content, so an added line whose own text starts
+   * with `++ ` (rendered `+++ ...` by git) can never be mistaken for a
+   * header. Each `@@ -a,b +m,n @@` hunk header sets the next 1-based
+   * new-file line number for the `+` lines that follow.
    */
   private collectAddedLines(
     diff: string,
@@ -198,13 +319,35 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
   ): void {
     let current: string | null = null;
     let nextLine = 1;
+    let inHeader = false;
+    let sawMinusHeader = false;
     for (const rawLine of diff.split("\n")) {
-      if (rawLine.startsWith("+++ ")) {
-        current =
-          rawLine === "+++ /dev/null"
-            ? null
-            : rawLine.slice(4).replace(/^b\//, "");
+      if (rawLine.startsWith("diff --git ")) {
+        current = null;
+        nextLine = 1;
+        inHeader = true;
+        sawMinusHeader = false;
         continue;
+      }
+      if (inHeader) {
+        if (rawLine.startsWith("--- ")) {
+          sawMinusHeader = true;
+          continue;
+        }
+        if (rawLine.startsWith("+++ ")) {
+          if (sawMinusHeader) {
+            current =
+              rawLine === "+++ /dev/null"
+                ? null
+                : rawLine.slice(4).replace(/^b\//, "");
+          }
+          continue;
+        }
+        if (rawLine.startsWith("@@")) {
+          inHeader = false;
+        } else {
+          continue;
+        }
       }
       if (rawLine.startsWith("@@")) {
         const match = /^@@ -\d+(?:,\d+)? \+(\d+)/.exec(rawLine);
@@ -221,6 +364,23 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
       if (rawLine.startsWith(" ")) nextLine += 1;
     }
   }
+}
+
+/**
+ * Fail closed: a path with a double quote, a backslash or any control
+ * character (tab, newline, …) cannot be reviewed line by line safely.
+ */
+function hasUnsupportedPathCharacters(path: string): boolean {
+  for (const character of path) {
+    if (
+      character === '"' ||
+      character === "\\" ||
+      character.codePointAt(0)! < 0x20
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** The complete script registry (all 17 patterns) with rule names. */

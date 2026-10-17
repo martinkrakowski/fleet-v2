@@ -196,4 +196,114 @@ describe("LaneDiffCheckAdapter", () => {
     });
     expect(JSON.stringify(result)).not.toContain("abcdefghij");
   });
+
+  it("a committed .github change and a committed secret are both findings (O14d1 B1)", async () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, ".github/x.yml"), "name: x\n");
+    writeFileSync(join(repo, "packages/x/src/s.ts"), `const t = "${tok}";\n`);
+    git(repo, "add", "-A");
+    git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "wip");
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: "base",
+      allowedPathPrefixes: PREFIXES,
+    });
+    if (result.outcome !== "findings")
+      throw new Error(`expected findings, got ${result.outcome}`);
+    expect(result.findings).toEqual(
+      expect.arrayContaining([
+        { path: ".github/x.yml", rule: "outside-allowed-paths" },
+        { path: ".github/x.yml", rule: "protected-path" },
+        {
+          path: "packages/x/src/s.ts",
+          line: 1,
+          rule: "secret-pattern:github-token",
+        },
+      ]),
+    );
+  });
+
+  it("a secret staged and then reverted in the worktree is still a finding (O14d1 S1b)", async () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "packages/x/src/a.ts"), `const t = "${tok}";\n`);
+    git(repo, "add", "packages/x/src/a.ts");
+    execFileSync(
+      "git",
+      ["restore", "--worktree", "--source=HEAD", "packages/x/src/a.ts"],
+      { cwd: repo },
+    );
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: "base",
+      allowedPathPrefixes: PREFIXES,
+    });
+    if (result.outcome !== "findings")
+      throw new Error(`expected findings, got ${result.outcome}`);
+    expect(result.findings).toEqual([
+      {
+        path: "packages/x/src/a.ts",
+        line: 1,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+  });
+
+  it("an added line starting with '++ ' is content, never a file header (O14d1 B2)", async () => {
+    const repo = makeRepo();
+    writeFileSync(
+      join(repo, "packages/x/src/a.ts"),
+      `export const a = 2;\n++ x\nconst t = "${tok}";\n`,
+    );
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: "base",
+      allowedPathPrefixes: PREFIXES,
+    });
+    if (result.outcome !== "findings")
+      throw new Error(`expected findings, got ${result.outcome}`);
+    expect(result.findings).toEqual([
+      {
+        path: "packages/x/src/a.ts",
+        line: 3,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+  });
+
+  it("a tab in a changed file name fails closed without echoing the path (O14d1 B3)", async () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, `packages/x/src/with${"\t"}tab.ts`), "x\n");
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: "base",
+      allowedPathPrefixes: PREFIXES,
+    });
+    expect(result).toEqual({
+      outcome: "error",
+      reason: "unsupported-path-characters",
+    });
+    expect(JSON.stringify(result)).not.toContain("tab");
+  });
+
+  it("a hostile local git config cannot change the parser input (O14d1 S1)", async () => {
+    const repo = makeRepo();
+    git(repo, "config", "color.ui", "always");
+    git(repo, "config", "diff.noprefix", "true");
+    git(repo, "config", "diff.mnemonicPrefix", "true");
+    writeFileSync(join(repo, "packages/x/src/b.ts"), `const t = "${tok}";\n`);
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: "base",
+      allowedPathPrefixes: PREFIXES,
+    });
+    if (result.outcome !== "findings")
+      throw new Error(`expected findings, got ${result.outcome}`);
+    expect(result.findings).toEqual([
+      {
+        path: "packages/x/src/b.ts",
+        line: 1,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+  });
 });

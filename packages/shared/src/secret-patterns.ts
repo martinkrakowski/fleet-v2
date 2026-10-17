@@ -60,12 +60,12 @@ export const LANE_DIFF_SECRET_PATTERNS: readonly NamedSecretPattern[] = [
   { name: 'slack-token', regex: /xox[abpr]-[A-Za-z0-9-]{10,}/ },
   { name: 'jwt', regex: /eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/ },
   { name: 'ssh-public-key-material', regex: /ssh-(rsa|ed25519|dss|ecdsa) AAAA[A-Za-z0-9+/]{20,}/ },
-  { name: 'opencode-server-password', regex: /OPENCODE_SERVER_PASSWORD\s*=\s*\S+/ },
+  { name: 'opencode-server-password', regex: /OPENCODE_SERVER_PASSWORD[ \t\v\f\r]*=[ \t\v\f\r]*[^ \t\v\f\r]+/ },
   { name: 'agy-oauth-file', regex: /antigravity-oauth-token/ },
   { name: 'home-credential-path', regex: /\/home\/[a-z]+\/\.(ssh|config\/gh|gemini|aws|docker\/config\.json)/ },
-  { name: 'password-assignment', regex: /[Pp]assword\s*[:=]\s*["'][^"']{6,}["']/ },
-  { name: 'token-assignment', regex: /[Tt]oken\s*[:=]\s*["'][A-Za-z0-9_./+=-]{16,}["']/ },
-  { name: 'basic-auth-url', regex: /https?:\/\/[^/:@\s]+:[^/@\s]{6,}@/ },
+  { name: 'password-assignment', regex: /[Pp]assword[ \t\v\f\r]*[:=][ \t\v\f\r]*["'][^"']{6,}["']/ },
+  { name: 'token-assignment', regex: /[Tt]oken[ \t\v\f\r]*[:=][ \t\v\f\r]*["'][A-Za-z0-9_./+=-]{16,}["']/ },
+  { name: 'basic-auth-url', regex: /https?:\/\/[^/:@ \t\v\f\r]+:[^/@ \t\v\f\r]{6,}@/ },
 ];
 
 /** True when any secret pattern matches anywhere in `text`. */

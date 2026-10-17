@@ -4,15 +4,32 @@
 // file itself matches none of the patterns. Findings carry path, line and
 // rule name only — never a matched value.
 
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import {
   checkLaneDiff,
+  isFixedProtectedPath,
   pathUnderPrefix,
   validateAllowedPathPrefix,
   type LaneDiffChangedPath,
   type LaneDiffSecretPattern,
 } from "../lane-diff-check.js";
+
+/** The repo root, found by walking up from this test file. */
+function repoRoot(): string {
+  let dir = path.dirname(fileURLToPath(import.meta.url));
+  while (!existsSync(path.join(dir, "scripts", "lane-diff-check.sh"))) {
+    const parent = path.dirname(dir);
+    if (parent === dir)
+      throw new Error("could not locate scripts/lane-diff-check.sh");
+    dir = parent;
+  }
+  return dir;
+}
 
 // The script's pattern table, narrowed to the fixtures below. Patterns live
 // in the input; the pure function never invents any.
@@ -300,5 +317,63 @@ describe("pathUnderPrefix", () => {
     expect(pathUnderPrefix("packages/x/src/a.ts", "packages/x")).toBe(true);
     expect(pathUnderPrefix("packages/x/src/a.ts", "packages/x/")).toBe(true);
     expect(pathUnderPrefix("packages/xtra/a.ts", "packages/x")).toBe(false);
+  });
+});
+
+describe("checkLaneDiff (policy additions are never lifted, O14d1 S3)", () => {
+  it("a policy-protected path applies even when the brief explicitly allows the fixed protected prefix", () => {
+    const verdict = checkLaneDiff({
+      changedPaths: [
+        { path: ".github/workflows/ci.yml", status: "modified" },
+      ],
+      allowedPathPrefixes: [".github"],
+      policyProtectedPaths: [".github/workflows/"],
+      secretPatterns: SCRIPT_PATTERNS,
+    });
+    expect(verdict.findings).toEqual([
+      { path: ".github/workflows/ci.yml", rule: "protected-path" },
+    ]);
+  });
+});
+
+describe("isFixedProtectedPath (script parity, O14d1)", () => {
+  /** One sample path that the script's regex alternative must match. */
+  function sampleFor(alternative: string): string {
+    const unescaped = alternative.replaceAll("\\.", ".");
+    if (unescaped.endsWith("$")) {
+      return unescaped.slice(0, -1).replaceAll("[^/]+", "x");
+    }
+    if (unescaped.endsWith("/")) {
+      return `${unescaped}sample.txt`;
+    }
+    // A literal prefix such as `.yarnrc` or `.pnp.`
+    return unescaped;
+  }
+
+  it("covers every alternative of the script's PROTECTED regex (line 84)", () => {
+    const lines = readFileSync(
+      path.join(repoRoot(), "scripts", "lane-diff-check.sh"),
+      "utf8",
+    ).split("\n");
+    const line = lines[83] ?? "";
+    const match = /^PROTECTED='\^\((.*)\)'\r?$/.exec(line);
+    expect(match, "the script's PROTECTED line 84 was not found").not.toBeNull();
+    const alternatives = match![1]!.split("|");
+    expect(alternatives.length).toBeGreaterThan(0);
+    for (const alternative of alternatives) {
+      const sample = sampleFor(alternative);
+      expect(isFixedProtectedPath(sample), alternative).toBe(true);
+    }
+  });
+
+  it("also covers the plan's additions", () => {
+    for (const sample of [
+      ".git/hooks/pre-commit",
+      "installation/config.yaml",
+      "package-lock.json",
+      "pnpm-lock.yaml",
+    ]) {
+      expect(isFixedProtectedPath(sample), sample).toBe(true);
+    }
   });
 });

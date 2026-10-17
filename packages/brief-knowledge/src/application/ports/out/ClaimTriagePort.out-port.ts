@@ -25,6 +25,8 @@ export interface TriageCandidateClaim {
 export interface TriageAttemptQuery {
   /** The attempt the candidates were captured from; names the `contextRef`. */
   readonly attemptId: string;
+  /** The project the attempt belongs to; a disabled project is never triaged. */
+  readonly projectId: string;
   /** The attempt's declared path prefixes, sent with the claim text. */
   readonly pathPrefixes: readonly string[];
   /** The attempt's captured candidate claims, in capture order. */

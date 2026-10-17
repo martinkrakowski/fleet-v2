@@ -22,6 +22,7 @@ import type { TriageAttemptQuery } from "../../../application/ports/out/ClaimTri
 const ATTEMPT = "attempt-42";
 const QUERY: TriageAttemptQuery = {
   attemptId: ATTEMPT,
+  projectId: "proj-alpha",
   pathPrefixes: ["src/utils"],
   candidates: [
     { id: "entry-a", claimText: "Date strings are parsed with parseISO." },
@@ -184,14 +185,17 @@ function makeAdapter(
     journal: DecisionReceiptJournalPort;
     minConfidence: number;
     timeoutMs: number;
+    disabledProjects: readonly string[];
   }>,
 ): {
   adapter: JevClaimTriageAdapter;
   journal: FakeJournal;
   calls: RecordedCall[];
+  keyReads: number[];
 } {
   const journal = new FakeJournal();
   const calls: RecordedCall[] = [];
+  const keyReads: number[] = [];
   const adapter = new JevClaimTriageAdapter({
     model: "typesafe/jev-1.14",
     keyFile: "/tmp/jev-key",
@@ -200,7 +204,13 @@ function makeAdapter(
     assumedCostUsd: 0.002,
     monthlyBudgetUsd: 100,
     fetch: overrides?.fetch ?? fetchAnswering([advisedBody()], calls),
-    readKey: async () => "test-key",
+    readKey: async () => {
+      keyReads.push(1);
+      return "test-key";
+    },
+    ...(overrides?.disabledProjects !== undefined
+      ? { disabledProjects: overrides.disabledProjects }
+      : {}),
     ...(overrides?.minConfidence !== undefined
       ? { minConfidence: overrides.minConfidence }
       : {}),
@@ -208,7 +218,7 @@ function makeAdapter(
       ? { timeoutMs: overrides.timeoutMs }
       : {}),
   });
-  return { adapter, journal, calls };
+  return { adapter, journal, calls, keyReads };
 }
 
 describe("JevClaimTriageAdapter", () => {
@@ -565,5 +575,35 @@ describe("JevClaimTriageAdapter", () => {
     };
     expect(Object.keys(firstState.claims)).toEqual(["k0", "k1", "k2", "k3"]);
     expect(firstState.claims.k3).toBe(bigClaim("D"));
+  });
+
+  it("triages nothing for a disabled project before any key read, fetch or receipt", async () => {
+    const calls: RecordedCall[] = [];
+    const { adapter, journal, keyReads } = makeAdapter({
+      fetch: fetchAnswering([advisedBody()], calls),
+      disabledProjects: ["proj-alpha"],
+    });
+    const advice = await adapter.triageAttempt(QUERY);
+    // Same unknown reason the ranking adapter answers for a disabled project.
+    expect(advice).toEqual({ status: "unknown", reason: "not-configured" });
+    // Nothing was reserved, nothing was paid, nothing left the host.
+    expect(calls.length).toBe(0);
+    expect(keyReads.length).toBe(0);
+    expect(journal.reserves.length).toBe(0);
+    expect(journal.settles.length).toBe(0);
+  });
+
+  it("still triages a project that is not disabled", async () => {
+    const calls: RecordedCall[] = [];
+    const { adapter, journal, keyReads } = makeAdapter({
+      fetch: fetchAnswering([advisedBody()], calls),
+      disabledProjects: ["proj-other"],
+    });
+    const advice = await adapter.triageAttempt(QUERY);
+    expect(advice.status).toBe("advised");
+    expect(calls.length).toBe(1);
+    expect(keyReads.length).toBe(1);
+    expect(journal.reserves.length).toBe(1);
+    expect(journal.settles.length).toBe(1);
   });
 });

@@ -162,6 +162,7 @@ export class CaptureCompletedAttemptNotesUseCase implements CaptureCompletedAtte
     if (this.deps.triage && candidateEntries.length > 0) {
       const onSettled = this.deps.onTriageSettled;
       void this.runPostCaptureTriage(
+        request.projectId,
         request.attemptId,
         request.pathPrefixes ?? [],
         candidateEntries,
@@ -188,6 +189,7 @@ export class CaptureCompletedAttemptNotesUseCase implements CaptureCompletedAtte
    * repository's own write-once rule is the second guard.
    */
   private async runPostCaptureTriage(
+    projectId: string,
     attemptId: string,
     pathPrefixes: readonly string[],
     candidateEntries: readonly KnowledgeEntryRecord[],
@@ -198,6 +200,7 @@ export class CaptureCompletedAttemptNotesUseCase implements CaptureCompletedAtte
     }
     try {
       const advice = await triage.triageAttempt({
+        projectId,
         attemptId,
         pathPrefixes,
         candidates: candidateEntries.map((entry) => ({

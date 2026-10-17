@@ -12,7 +12,8 @@ each referenced credential file with mode `600` (for example
   It still loads unchanged in meaning; `v1` shelf fields are accepted and
   ignored with a warning.
 - `single-machine/fleet.json` — schema v2, one local host holding every role.
-- `multi-machine/fleet.json` — schema v2, roles spread over ssh hosts.
+- `multi-machine/fleet.json` — schema v2, a local orchestrator host with the
+  lane-runner and verifier hosts reached over ssh.
 
 ## Schema v2
 
@@ -20,7 +21,8 @@ A v2 file names `hosts` (each with a `transport`, a `worktreeRoot`, `roles`
 and an optional `runner`), the enabled `tools`, `seats` and per-role `chains`,
 a `policy`, a `shelf` provider, a `forge` mode, and the `verification`
 procedures and `waves` sections carried over from v1. Exactly one host holds
-the `orchestrator` role and at least one holds `lane-runner`. A verifier host
+the `orchestrator` role and its `transport` must be `"local"`; exactly one
+host holds `lane-runner`. A verifier host
 replaces the v1 `verification.sshHost`; hosts with `transport: "ssh"` name
 their `sshAlias`.
 

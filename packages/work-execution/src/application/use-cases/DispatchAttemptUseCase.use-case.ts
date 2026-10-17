@@ -389,6 +389,10 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       kind: 'opencode',
       remotePort: runnerPort,
       host: runnerHost,
+      // The installation host name travels with the record so a host's running
+      // work can be found later. Legacy mode records null, as do records
+      // written before the field existed.
+      hostName: runnerInfo.hostName ?? null,
       agent: effectiveAgent ?? null,
       model: effectiveModel,
       variant: effectiveVariant ?? null,

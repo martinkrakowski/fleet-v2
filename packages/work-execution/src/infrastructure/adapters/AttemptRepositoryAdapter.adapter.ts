@@ -40,19 +40,27 @@ function isAttemptRecord(value: unknown): value is AttemptRecord {
  * an opencode port. Reading them normalizes to `kind: 'opencode'` and a
  * `remotePort` of `null` when absent, so downstream code never sees a record
  * without a kind and never crashes on a missing port.
+ *
+ * Records persisted before the host name existed (lane H3a) normalize the
+ * same way: `hostName: null`. Those are legacy records whose ssh alias lives in
+ * `host`, and after-dispatch actions apply the legacy rule to them.
  */
 function normalizeRecord(record: AttemptRecord): AttemptRecord {
   const runner = record.runner;
   if (runner === undefined || runner === null) return record;
-  const raw = runner as AttemptRunnerRecord & { kind?: RunnerKind };
+  const raw = runner as AttemptRunnerRecord & { kind?: RunnerKind; hostName?: string | null };
   const kind: RunnerKind = raw.kind === 'agy' ? 'agy' : 'opencode';
-  if (kind === runner.kind && runner.remotePort !== undefined) return record;
+  const hostName = typeof raw.hostName === 'string' && raw.hostName.trim() !== '' ? raw.hostName : null;
+  if (kind === runner.kind && runner.remotePort !== undefined && runner.hostName === hostName) {
+    return record;
+  }
   return {
     ...record,
     runner: {
       ...runner,
       kind,
       remotePort: runner.remotePort ?? null,
+      hostName,
     },
   };
 }

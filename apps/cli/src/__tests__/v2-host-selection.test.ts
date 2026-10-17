@@ -173,4 +173,76 @@ describe("v2 CLI host selection (H3b)", () => {
     // is absent and the host entry is the sole source.
     expect(resolved).toEqual({ ocmRunBin: "/opt/env/ocm-run" });
   });
+
+  it("falls back to the orchestrator host for local verification when no host is a verifier (H4 follow-up)", async () => {
+    const installation = parseV2({
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        here: {
+          transport: "local",
+          worktreeRoot: "/srv/fleet/worktrees",
+          roles: ["orchestrator", "lane-runner"],
+          runner: { kind: "opencode", port: 46000 },
+        },
+      },
+    });
+    stateDir = mkdtempSync(path.join(tmpdir(), "fleet-v2-host-"));
+    runtime = createFleetCliRuntime({ stateDir, installation });
+    await runtime.execution.attemptRepository.saveAttempt({
+      id: "attempt-nv-1",
+      workOrderId: "wo-nv-1",
+      kind: "initial",
+      fixNumber: 0,
+      priorAttemptId: null,
+      worktreePath: "/srv/fleet/worktrees/attempt-nv-1",
+      baseCommit: "0".repeat(40),
+      state: "ended",
+      outcome: "done",
+      briefDigest: null,
+      briefPackagePath: null,
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: null,
+      runner: {
+        kind: "opencode",
+        remotePort: 46000,
+        host: null,
+        hostName: "here",
+        agent: "lane",
+        model: "provider/glm-5.3",
+        variant: null,
+      },
+      createdAtIso: "2026-10-17T08:00:00.000Z",
+      updatedAtIso: "2026-10-17T08:00:00.000Z",
+    });
+    const { io, stdout, stderr } = mockIo();
+    const code = await runCli(
+      [
+        "evidence",
+        "request-verification",
+        "--json",
+        JSON.stringify({
+          assessmentId: "assess-nv-1",
+          projectId: "proj-nv-1",
+          attemptId: "attempt-nv-1",
+          candidateHeadSha: "a".repeat(40),
+          policyRevision: "policy-nv-1",
+          requiredChecks: ["gate"],
+        }),
+      ],
+      io,
+      runtime,
+    );
+    // No refusal: the request records the orchestrator host as the
+    // verification host, and the receipts carry it.
+    expect(code).toBe(0);
+    expect(stderr.join("")).not.toContain("declares no verifier host");
+    const result = JSON.parse(stdout.join("")) as {
+      outcome: string;
+      receipts: ReadonlyArray<{ hostId: string }>;
+    };
+    expect(result.outcome).toBe("completed");
+    expect(result.receipts[0]?.hostId).toBe("here");
+  });
 });

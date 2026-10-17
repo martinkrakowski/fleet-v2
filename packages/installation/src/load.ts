@@ -37,7 +37,8 @@ export type LoadResult =
     }
   | { status: 'invalid'; file: string; errors: string[] };
 
-type EnvRecord = Record<string, string | undefined>;
+/** The environment shape the loader and its resolution helpers read. */
+export type EnvRecord = Record<string, string | undefined>;
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 
 function readErrorCode(error: unknown): string | undefined {
@@ -63,7 +64,13 @@ function readEnvironmentValue(env: EnvRecord, name: string): string | undefined 
   return trimmed === '' ? undefined : trimmed;
 }
 
-function resolveInstallationFile(file: string | undefined, env: EnvRecord, cwd: string): string {
+/**
+ * The installation file path the loader reads: an explicit file, then the
+ * `FLEET_INSTALLATION_FILE` environment value, then `<cwd>/installation/fleet.json`.
+ * Exported so the hosts commands write the file the loader reads; a second
+ * copy of the rule in a surface would drift from the loader's resolution.
+ */
+export function resolveInstallationFile(file: string | undefined, env: EnvRecord, cwd: string): string {
   if (file !== undefined) {
     return resolve(cwd, file);
   }

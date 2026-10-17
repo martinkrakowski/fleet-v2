@@ -41,14 +41,19 @@ import type {
   OwnerQuestionState,
 } from '@fleet/operator-coordination';
 
-import { loadInstallation, type LoadResult } from '@fleet/installation';
+import { loadInstallation, type HostSection, type LoadResult } from '@fleet/installation';
 import type {
   DoctorLine,
   DoctorProbes,
+  HostProbeExecutor,
+  HostProbeSpec,
 } from '@fleet/onboarding';
 import {
+  boundDoctorDetail,
+  createNodeDoctorExecutor,
   createNodeDoctorProbes,
   doctorExitCode,
+  probeHost,
   runDoctor,
 } from '@fleet/onboarding';
 
@@ -59,6 +64,7 @@ import {
   resolveRunnerSettings,
   type FleetCliRuntime,
 } from './composition.js';
+import { hostsCommand, type HostsCliOptions } from './hosts.js';
 
 export { resolveRunnerSettings };
 
@@ -728,22 +734,18 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
     'request-verification': async (p, rt) => {
       // A v2 installation names the verifier host itself (plan section 8);
       // the operator never supplies one. The host comes from the
-      // installation's hosts entry — the verifier host's name. A usage error
-      // precedes the seat binding: no domain lookup is owed to a request the
-      // boundary refuses.
-      const v2HostId = resolveInstallationHostForRole(
-        rt.installation,
-        'verifier',
-      );
+      // installation's hosts entry — the verifier host's name, and with no
+      // verifier role the orchestrator host's name, so verification runs
+      // locally instead of being refused (plan section 3: "none: local").
+      // A usage error precedes the seat binding: no domain lookup is owed to
+      // a request the boundary refuses.
+      const v2HostId =
+        resolveInstallationHostForRole(rt.installation, 'verifier') ??
+        resolveInstallationHostForRole(rt.installation, 'orchestrator');
       if (rt.installation?.schemaVersion === 2) {
         if (p['hostId'] !== undefined) {
           throw new CliUsageError(
-            "'hostId' is not accepted for a v2 installation; the host comes from the installation's hosts entry (the verifier host's name)",
-          );
-        }
-        if (v2HostId === undefined) {
-          throw new CliUsageError(
-            "the installation declares no verifier host; add one to the installation's hosts entry before requesting verification",
+            "'hostId' is not accepted for a v2 installation; the host comes from the installation's hosts entry (the verifier host's name, or the orchestrator's when none is a verifier)",
           );
         }
       }
@@ -1123,9 +1125,14 @@ export interface DoctorCliOptions {
   readonly loadResult?: LoadResult;
   /** Probe implementation; the node probes compose one when omitted. */
   readonly probes?: DoctorProbes;
+  /**
+   * Argv executor for `doctor --host` (the host probe subset and the
+   * leftover-forward check); the node doctor executor composes when omitted.
+   */
+  readonly hostProbeExecutor?: HostProbeExecutor;
 }
 
-const DOCTOR_HELP = `Usage: fleet-v2 doctor [--probe-seats] [--json]
+const DOCTOR_HELP = `Usage: fleet-v2 doctor [--probe-seats] [--host <name>] [--json]
 
 Read-only checks over the loaded installation: hosts and roles, platform
 tools, configured tool versions, credential file modes (never contents), the
@@ -1134,6 +1141,11 @@ bundled ocm-run hash and each configured seat.
   --probe-seats  run each seat's one-step probe (a live model call). Seat
                  probes run from the operator's machine — the host running
                  fleet-v2 doctor — never on a remote host.
+  --host <name>  run only that host's probe subset from the installation's
+                 hosts entry (reachability, tool versions, worktree root,
+                 loopback server, declared capabilities, the auth file),
+                 plus one check for a leftover forward on a port no
+                 configured host owns; never together with --probe-seats
   --json         print one JSON document per doctor line
 
 Exit codes: 0 all PASS, 1 any FAIL or UNKNOWN — and also a missing or invalid
@@ -1145,10 +1157,13 @@ installation defines seats.`;
 function parseDoctorFlags(tokens: readonly string[]): {
   probeSeats: boolean;
   json: boolean;
+  host?: string;
 } {
   let probeSeats = false;
   let json = false;
-  for (const token of tokens) {
+  let host: string | undefined;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
     if (token === '--probe-seats') {
       probeSeats = true;
       continue;
@@ -1157,13 +1172,175 @@ function parseDoctorFlags(tokens: readonly string[]): {
       json = true;
       continue;
     }
+    if (token === '--host' || token.startsWith('--host=')) {
+      const value = token === '--host' ? tokens[index + 1] : token.slice('--host='.length);
+      if (value === undefined || value.trim() === '' || value.startsWith('--')) {
+        throw new CliUsageError(`--host requires a host name\n${DOCTOR_HELP}`);
+      }
+      if (token === '--host') {
+        index += 1;
+      }
+      host = value;
+      continue;
+    }
     throw new CliUsageError(`Unknown doctor option: ${token}\n${DOCTOR_HELP}`);
   }
-  return { probeSeats, json };
+  if (host !== undefined && probeSeats) {
+    throw new CliUsageError(
+      `doctor --host runs one host's probes; --probe-seats belongs to the full doctor run\n${DOCTOR_HELP}`,
+    );
+  }
+  return { probeSeats, json, host };
 }
 
-function formatDoctorLine(doctorLine: DoctorLine): string {
+export function formatDoctorLine(doctorLine: DoctorLine): string {
   return `${doctorLine.status} ${doctorLine.scope} ${doctorLine.subject} ${doctorLine.check} — ${doctorLine.detail}`;
+}
+
+/** Run one probe; a throw becomes `undefined` and reports as unknown. */
+async function probeSafely(
+  run: () => Promise<{ exitCode: number | null; error?: string }>,
+): Promise<{ exitCode: number | null; error?: string } | undefined> {
+  try {
+    return await run();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * One line for a leftover forward on a port no configured host owns: the
+ * port next to the named host's runner port that the configuration does not
+ * dial (an ssh host dials `port + 1` here, a local host dials `port` there
+ * directly), checked on the orchestrator's loopback, where `ocm-run` leaves
+ * `ssh -f -N` forwards behind. Nothing is removed; the detail says how to
+ * close it by hand.
+ */
+async function unownedForwardLine(
+  name: string,
+  hosts: Readonly<Record<string, HostSection>>,
+  executor: HostProbeExecutor,
+): Promise<DoctorLine | undefined> {
+  const runner = hosts[name]?.runner;
+  if (runner === undefined) {
+    return undefined;
+  }
+  const owned = new Set<number>();
+  for (const host of Object.values(hosts)) {
+    if (host.runner !== undefined) {
+      owned.add(host.transport === 'local' ? host.runner.port : host.runner.port + 1);
+    }
+  }
+  const port = [runner.port, runner.port + 1].find((candidate) => !owned.has(candidate));
+  if (port === undefined) {
+    return undefined;
+  }
+  const result = await probeSafely(() =>
+    executor.run(['nc', '-z', '127.0.0.1', String(port)], { timeoutMs: 5_000 }),
+  );
+  const base = {
+    scope: 'host' as const,
+    subject: name,
+    check: 'unowned-forward',
+  };
+  if (result === undefined) {
+    return {
+      ...base,
+      status: 'UNKNOWN',
+      detail: boundDoctorDetail(`127.0.0.1:${port}: the leftover-forward check could not be run`),
+    };
+  }
+  if (result.error !== undefined) {
+    return {
+      ...base,
+      status: 'UNKNOWN',
+      detail: boundDoctorDetail(
+        `127.0.0.1:${port}: the leftover-forward check could not be run (${result.error})`,
+      ),
+    };
+  }
+  if (result.exitCode === 0) {
+    return {
+      ...base,
+      status: 'FAIL',
+      detail: boundDoctorDetail(
+        `127.0.0.1:${port} is listening but no configured host owns it; if it is a leftover ssh -f -N forward, close it: pgrep -f 'ssh .*-L 127.0.0.1:${port}' then kill the pid`,
+      ),
+    };
+  }
+  return {
+    ...base,
+    status: 'PASS',
+    detail: boundDoctorDetail(
+      `nothing is listening on 127.0.0.1:${port}, which no configured host owns`,
+    ),
+  };
+}
+
+/**
+ * `doctor --host <name>` (plan section 4): the named host's own probe subset
+ * through the engine's probe plan, plus the leftover-forward check. The exit
+ * code is doctor's own: 0 only when every line passed.
+ */
+async function doctorHostCommand(
+  hostName: string,
+  loadResult: Exclude<LoadResult, { status: 'invalid' }>,
+  io: CliIo,
+  json: boolean,
+  executor: HostProbeExecutor,
+): Promise<number> {
+  const installation = loadResult.installation;
+  if (installation.schemaVersion !== 2 || installation.hosts === undefined) {
+    io.stderr('doctor --host needs a schema version 2 installation with named hosts\n');
+    return 1;
+  }
+  const hosts = installation.hosts;
+  const hostEntry = Object.hasOwn(hosts, hostName) ? hosts[hostName] : undefined;
+  if (hostEntry === undefined) {
+    io.stderr(`no host named '${hostName}' is configured in the installation\n`);
+    return 1;
+  }
+  const laneRunnerName = resolveInstallationHostForRole(installation, 'lane-runner');
+  const laneRunnerHost = laneRunnerName !== undefined ? hosts[laneRunnerName] : undefined;
+  const runner = hostEntry.runner;
+  const spec: HostProbeSpec = {
+    name: hostName,
+    transport: hostEntry.transport,
+    ...(hostEntry.sshAlias !== undefined ? { sshAlias: hostEntry.sshAlias } : {}),
+    worktreeRoot: hostEntry.worktreeRoot,
+    ...(hostEntry.tmpDir !== undefined ? { tmpDir: hostEntry.tmpDir } : {}),
+    ...(runner !== undefined
+      ? {
+          runner: {
+            kind: runner.kind,
+            port: runner.port,
+            ...(runner.authFile !== undefined ? { authFile: runner.authFile } : {}),
+            ...(runner.capabilities !== undefined
+              ? { capabilities: runner.capabilities }
+              : {}),
+          },
+        }
+      : {}),
+    ...(hostEntry.roles.includes('verifier') &&
+    laneRunnerName !== undefined &&
+    laneRunnerHost !== undefined
+      ? {
+          laneRunnerWorktreeRoot: {
+            hostName: laneRunnerName,
+            worktreeRoot: laneRunnerHost.worktreeRoot,
+          },
+        }
+      : {}),
+  };
+  const lines = await probeHost(spec, executor);
+  const unowned = await unownedForwardLine(hostName, hosts, executor);
+  if (unowned !== undefined) {
+    lines.push(unowned);
+  }
+  for (const doctorLine of lines) {
+    io.stdout(json ? `${JSON.stringify(doctorLine)}\n` : `${formatDoctorLine(doctorLine)}\n`);
+  }
+  return doctorExitCode(lines);
 }
 
 /**
@@ -1184,7 +1361,7 @@ export async function doctorCommand(
     io.stdout(`${DOCTOR_HELP}\n`);
     return 0;
   }
-  const { probeSeats, json } = parseDoctorFlags(argv);
+  const { probeSeats, json, host } = parseDoctorFlags(argv);
   const loadResult = options.loadResult ?? loadInstallation();
   if (loadResult.status === 'invalid') {
     io.stderr(`installation invalid (${loadResult.file}):\n`);
@@ -1197,6 +1374,12 @@ export async function doctorCommand(
   if (loadResult.status === 'absent') {
     io.stderr('installation missing: doctor has no installation to check\n');
     return 1;
+  }
+  if (host !== undefined) {
+    // One host's own probe subset, never the seat probes: those belong to
+    // the full sweep and run from the operator's machine.
+    const executor = options.hostProbeExecutor ?? createNodeDoctorExecutor();
+    return doctorHostCommand(host, loadResult, io, json, executor);
   }
   const probes = options.probes ?? createNodeDoctorProbes();
   const lines: DoctorLine[] = [];
@@ -1271,10 +1454,15 @@ prints to stdout as one JSON document.
 
 doctor prints one check per line (JSON documents with --json). Without
 --probe-seats every seat is UNKNOWN, so doctor exits 1 when seats exist.
+doctor --host <name> prints only that host's probe subset.
+
+The hosts group manages the installation file's named hosts: list, add,
+edit and remove, each write confirmed and compare-and-swapped.
 
 Commands:
   work-order register|inspect
-  doctor [--probe-seats] [--json]
+  doctor [--probe-seats] [--host <name>] [--json]
+  hosts list|add|edit|remove
   brief prepare
   capacity reserve
   attempt dispatch|reconcile|stop|collect|fix|accept
@@ -1301,6 +1489,7 @@ export async function runCli(
   io: CliIo = processIo,
   runtime?: FleetCliRuntime,
   doctorOptions?: DoctorCliOptions,
+  hostsOptions?: HostsCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -1313,6 +1502,13 @@ export async function runCli(
     const group = restArgv[0];
     if (group === 'doctor') {
       return await doctorCommand(restArgv.slice(1), io, doctorOptions ?? {});
+    }
+    // The hosts group manages the installation file itself on the shared
+    // onboarding engine; it reads the file and composes only the state-backed
+    // stores remove's live-work check needs.
+    if (group === 'hosts') {
+      const hostsStateDir = hostsOptions?.stateDir ?? stateDir;
+      return await hostsCommand(restArgv.slice(1), io, { ...hostsOptions, stateDir: hostsStateDir });
     }
     // The questions group carries its own help block; a help request never
     // composes the runtime and never counts as a usage error.

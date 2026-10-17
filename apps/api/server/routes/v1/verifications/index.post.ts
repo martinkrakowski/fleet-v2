@@ -36,28 +36,22 @@ export default defineEventHandler(async (event) => {
   let body = await readObjectBody(event);
   // A v2 installation names the verifier host itself (plan section 8); the
   // caller never supplies one. The host comes from the installation's hosts
-  // entry — the verifier host's name.
+  // entry — the verifier host's name, and with no verifier role the
+  // orchestrator host's name, so verification runs locally instead of being
+  // refused (plan section 3: "none: local").
   const installation = workComposition().installation;
   if (installation?.schemaVersion === 2) {
     if (body.hostId !== undefined) {
       throw createError({
         statusCode: 400,
         statusMessage:
-          "hostId is not accepted for a v2 installation; the host comes from the installation's hosts entry (the verifier host's name)",
+          "hostId is not accepted for a v2 installation; the host comes from the installation's hosts entry (the verifier host's name, or the orchestrator's when none is a verifier)",
       });
     }
-    const verifierHostId = resolveInstallationHostForRole(
-      installation,
-      "verifier",
-    );
-    if (verifierHostId === undefined) {
-      throw createError({
-        statusCode: 400,
-        statusMessage:
-          "the installation declares no verifier host; add one to the installation's hosts entry before requesting verification",
-      });
-    }
-    body = { ...body, hostId: verifierHostId };
+    const verificationHostId =
+      resolveInstallationHostForRole(installation, "verifier") ??
+      resolveInstallationHostForRole(installation, "orchestrator");
+    body = { ...body, hostId: verificationHostId };
   }
   let bound: VerificationRequestBody | { outcome: "rejected"; reason: string };
   try {

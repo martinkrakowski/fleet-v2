@@ -116,6 +116,12 @@ export function createClaimTriage(
       ? declared.monthlyBudgetUsd
       : undefined;
 
+  if (options.fetch === undefined) {
+    // No transport injected: nothing is made, rather than an adapter that
+    // throws at construction (the root wiring must pass fetch).
+    return undefined;
+  }
+
   return new JevClaimTriageAdapter({
     model: decisions.model,
     keyFile: decisions.keyFile,
@@ -125,7 +131,7 @@ export function createClaimTriage(
     assumedCostUsd: decisions.assumedCostPerCallUsd,
     monthlyBudgetUsd: decisions.monthlyBudgetUsd,
     ...(consumerBudgetUsd === undefined ? {} : { consumerBudgetUsd }),
-    fetch: options.fetch as unknown as typeof fetch,
+    fetch: options.fetch,
     ...(options.readKey === undefined ? {} : { readKey: options.readKey }),
   });
 }

@@ -346,7 +346,7 @@ export class JevClaimTriageAdapter implements ClaimTriagePort {
         consumer: CLAIM_TRIAGE_CONSUMER,
         contextRef,
         provider: this.provider,
-        model: validated.model || this.provider,
+        model: validated.model || this.model,
         ...(validated.requestId ? { requestId: validated.requestId } : {}),
         costUsd: validated.costUsd,
         questionKinds: hadAdvice

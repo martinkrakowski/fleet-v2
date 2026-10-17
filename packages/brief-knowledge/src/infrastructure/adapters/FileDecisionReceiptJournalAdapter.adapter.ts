@@ -861,7 +861,7 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
     const names = await this.listReceiptsDir();
     return names
       .filter((name) => MONTH_FILE_PATTERN.test(name))
-      .sort()
+      .sort((a, b) => a.localeCompare(b))
       .map((name) => name.slice(0, name.length - '.jsonl'.length));
   }
 
@@ -870,7 +870,7 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
     const names = await this.listReceiptsDir();
     return names
       .filter((name) => OUTCOME_FILE_PATTERN.test(name))
-      .sort()
+      .sort((a, b) => a.localeCompare(b))
       .map((name) => name.slice('outcomes-'.length, name.length - '.jsonl'.length));
   }
 

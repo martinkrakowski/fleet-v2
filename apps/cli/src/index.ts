@@ -1016,8 +1016,10 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
             scores = parsed as Record<string, number>;
           }
         } catch {
-          // The use case rejects a malformed map; passing undefined keeps
-          // the request shape honest rather than inventing scores.
+          // Fall through to the usage error below.
+        }
+        if (scores === undefined) {
+          throw new CliUsageError("knowledge candidates --scores must be a JSON object of scores");
         }
       }
       const result = await rt.knowledge.listCandidateClaims.listCandidateClaims({

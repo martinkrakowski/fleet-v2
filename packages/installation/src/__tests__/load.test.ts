@@ -528,6 +528,8 @@ describe('loadInstallation', () => {
         'verify-host',
       ]);
       expect(result.model.hosts['orchestrator-host']?.roles).toEqual(['orchestrator']);
+      expect(result.model.hosts['orchestrator-host']?.transport).toBe('local');
+      expect(result.model.hosts['lane-host']?.transport).toBe('ssh');
       expect(result.model.hosts['lane-host']?.runner?.capabilities.source).toBe('declared');
       expect(result.model.hosts['lane-host']?.runner?.capabilities.filesystemScope).toBe(
         'scoped-worktree',

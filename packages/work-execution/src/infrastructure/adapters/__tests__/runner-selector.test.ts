@@ -49,6 +49,49 @@ describe('RunnerSelectorAdapter', () => {
     });
   });
 
+  it('selects the agy lane-runner host, on no port, once an agy adapter is provided', () => {
+    const selector = new RunnerSelectorAdapter({
+      hosts: agyHosts,
+      implementedRunnerKinds: ['opencode', 'agy'],
+    });
+    expect(selector.selectRunner({ seatTool: 'agy' })).toEqual({
+      ok: true,
+      kind: 'agy',
+      hostName: 'lane',
+      transport: 'local',
+      remotePort: null,
+    });
+  });
+
+  it('still refuses an agy seat when the root has no agy adapter, and never falls back', () => {
+    expect(
+      new RunnerSelectorAdapter({
+        hosts: agyHosts,
+        implementedRunnerKinds: ['opencode'],
+      }).selectRunner({ seatTool: 'agy' }),
+    ).toEqual({ ok: false, reason: 'runner-not-available' });
+    expect(
+      new RunnerSelectorAdapter({ hosts: agyHosts, implementedRunnerKinds: ['agy'] }).selectRunner({
+        seatTool: 'opencode',
+      }),
+    ).toEqual({ ok: false, reason: 'runner-not-available' });
+  });
+
+  it('leaves the opencode selection unchanged when an agy adapter joins it', () => {
+    const selector = new RunnerSelectorAdapter({
+      hosts: opencodeHosts,
+      implementedRunnerKinds: ['opencode', 'agy'],
+    });
+    expect(selector.selectRunner({ seatTool: 'opencode' })).toEqual({
+      ok: true,
+      kind: 'opencode',
+      hostName: 'lane',
+      transport: 'ssh',
+      sshAlias: 'lane-host.lan',
+      remotePort: 4166,
+    });
+  });
+
   it('refuses a seat whose tool does not match the lane-runner host kind', () => {
     const selector = new RunnerSelectorAdapter({ hosts: opencodeHosts });
     expect(selector.selectRunner({ seatTool: 'agy' })).toEqual({

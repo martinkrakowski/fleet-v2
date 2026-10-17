@@ -187,6 +187,12 @@ export class JevRankingAdviceAdapter implements KnowledgeRankingAdvicePort {
   }
 
   private async adviseRankingInner(req: AdviseRankingQuery): Promise<RankingAdvice> {
+    // A non-finite threshold is a configuration error, never a low-confidence
+    // answer: the kernel's gate would accept everything, so it is refused
+    // before the state is built and before any key is read or fetch is made.
+    if (!Number.isFinite(this.minConfidence)) {
+      return { status: 'unknown', reason: 'not-configured' };
+    }
     if (this.disabledProjects.includes(req.projectId)) {
       return { status: 'unknown', reason: 'not-configured' };
     }

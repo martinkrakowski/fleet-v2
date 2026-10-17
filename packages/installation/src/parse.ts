@@ -959,12 +959,34 @@ function parseV2Hosts(value: JsonObject, errors: string[]): Readonly<Record<stri
   }
   let orchestrators = 0;
   let laneRunners = 0;
-  for (const host of Object.values(hosts)) {
+  const dialPorts = new Map<number, string>();
+  for (const [name, host] of Object.entries(hosts)) {
     if (host.roles.includes('orchestrator')) {
       orchestrators += 1;
+      // The runtime always forces a local orchestrator executor, so an
+      // orchestrator host reached over ssh could never run it (plan section 1).
+      if (host.transport !== 'local') {
+        errors.push(
+          `hosts.${name}.transport: must be "local" when the host holds the orchestrator role`,
+        );
+      }
     }
     if (host.roles.includes('lane-runner')) {
       laneRunners += 1;
+    }
+    // Every host with a runner takes part in the dial-port rule, whatever the
+    // runner kind: a local host dials its own `port`, an ssh host the
+    // `port + 1` forward. Two equal dial ports would race for one server.
+    if (host.runner !== undefined) {
+      const dialPort = host.transport === 'local' ? host.runner.port : host.runner.port + 1;
+      if (dialPort > 65535) {
+        // An ssh host on 65535 would need forward port 65536, which cannot be bound.
+        errors.push(`hosts.${name}.runner.port: must leave room for the ssh forward port`);
+      } else if (dialPorts.has(dialPort)) {
+        errors.push(`hosts.${name}.runner.port: derived dial port must be unique across hosts`);
+      } else {
+        dialPorts.set(dialPort, name);
+      }
     }
   }
   if (orchestrators !== 1) {
@@ -972,6 +994,8 @@ function parseV2Hosts(value: JsonObject, errors: string[]): Readonly<Record<stri
   }
   if (laneRunners < 1) {
     errors.push('hosts: at least one host must hold the lane-runner role');
+  } else if (laneRunners > 1) {
+    errors.push('hosts: at most one host may hold the lane-runner role');
   }
   return hosts;
 }
@@ -1587,8 +1611,9 @@ function parseV2Verification(
  * Every problem is collected as `"<json path>: <problem>"`; a field's value is
  * never echoed in an error. Unknown keys anywhere are rejected. A v1 file
  * carries only v1 sections, a v2 file only v2 sections, and the v2 rules
- * (exactly one orchestrator, at least one lane-runner, and a required forge
- * section, D6) hold.
+ * (exactly one orchestrator host on the local transport, exactly one
+ * lane-runner host, unique derived dial ports, and a required forge section,
+ * D6) hold.
  */
 export function parseInstallation(value: unknown): ParseResult {
   if (!isJsonObject(value)) {

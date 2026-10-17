@@ -1,9 +1,13 @@
-// Implemented for lane D2 (decision port plan, 2026-10-16).
+// Implemented for lane D2 (decision port plan, 2026-10-16); adopted from the
+// decision kernel in lane K2 (2026-10-16_decision-kernel-and-claim-triage, §1).
 /**
- * Strict validator for Jev `score` answer bodies. Pure: no I/O, no network.
- * The same rules are applied to live provider responses and to the
- * owner-recorded answer file, so a served or recorded answer is only used
- * when it exactly matches the recorded shape.
+ * Ranking consumer's binding to the decision kernel (`@fleet/shared`). The
+ * rules live in the kernel's `validateScoreAnswer` and `isValidIdOrModel`;
+ * this module is the thin wrapper that maps one multi-key Jev response body
+ * onto the kernel's per-answer validator and keeps the ranking scale. The same
+ * kernel validator is applied to live provider responses and to the
+ * owner-recorded answer file, so a served or recorded answer is only used when
+ * it exactly matches the recorded shape.
  *
  * Every asked key must be present with `type: 'score'`; `probabilities` is an
  * OBJECT keyed exactly "0".."levels-1"; every probability is a finite number
@@ -13,6 +17,9 @@
  * confidence below `minConfidence` is `low-confidence`. No body content ever
  * appears in a failure reason.
  */
+
+import { isValidIdOrModel, validateScoreAnswer } from '@fleet/shared';
+import type { ScoreQuestion } from '@fleet/shared';
 
 export const DEFAULT_DECISION_LEVELS = 4;
 
@@ -24,17 +31,8 @@ export const JEV_CRITERIA_LEVELS: readonly string[] = [
   'highly relevant',
 ];
 
-/** Maximum allowed drift of the probability sum from 1. */
-const PROBABILITY_SUM_TOLERANCE = 0.02;
-
-/** `model` and `id` must be short, opaque identifier strings. */
-const ID_OR_MODEL_PATTERN = /^[A-Za-z0-9._/:-]+$/;
-
-export function isValidIdOrModel(value: unknown): value is string {
-  return (
-    typeof value === 'string' && value.length <= 128 && ID_OR_MODEL_PATTERN.test(value)
-  );
-}
+/** The kernel's id and model rule; re-exported so callers import one module. */
+export { isValidIdOrModel };
 
 export interface ScoreAnswersValid {
   readonly ok: true;
@@ -53,9 +51,22 @@ export interface ScoreAnswersInvalid {
 
 export type ScoreAnswersValidation = ScoreAnswersValid | ScoreAnswersInvalid;
 
-/** Expected probability object keys for the given level count: "0".."levels-1". */
-function expectedProbabilityKeys(levels: number): string[] {
-  return Array.from({ length: levels }, (_, i) => String(i));
+/** A fresh shape failure; no body content ever travels with it. */
+function shape(): ScoreAnswersInvalid {
+  return { ok: false, reason: 'shape' };
+}
+
+/**
+ * The kernel asks a `score` question against named level strings and reads
+ * only its length ("0".."n-1"); the ranking scale is the declared one, padded
+ * with generated names when a caller asks for more levels than it declares.
+ */
+function scoreQuestion(levels: number): ScoreQuestion {
+  return {
+    kind: 'score',
+    instructions: 'How relevant is the candidate to the task?',
+    levels: Array.from({ length: levels }, (_, index) => JEV_CRITERIA_LEVELS[index] ?? `level ${index}`),
+  };
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -66,6 +77,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * Validate a Jev response body against the asked question keys. `levels` is
  * the number of criteria levels (default 4); `minConfidence` is the lowest
  * acceptable per-answer confidence. Never throws; failures carry no content.
+ *
+ * Shape first, gate second: every asked key is validated with the kernel at
+ * `minConfidence` 0, then the lowest observed confidence is gated once, so a
+ * malformed key anywhere in the body is still a `shape` failure.
  */
 export function validateScoreAnswers(
   body: unknown,
@@ -74,88 +89,47 @@ export function validateScoreAnswers(
   minConfidence: number = 0,
 ): ScoreAnswersValidation {
   if (!Array.isArray(askedKeys) || askedKeys.length === 0) {
-    return { ok: false, reason: 'shape' };
+    return shape();
   }
   if (!Number.isInteger(levels) || levels < 2) {
-    return { ok: false, reason: 'shape' };
+    return shape();
   }
   if (!Number.isFinite(minConfidence)) {
-    return { ok: false, reason: 'shape' };
+    return shape();
   }
   if (!isPlainObject(body)) {
-    return { ok: false, reason: 'shape' };
+    return shape();
   }
   if (!isValidIdOrModel(body.model)) {
-    return { ok: false, reason: 'shape' };
+    return shape();
   }
   if (body.id !== undefined && !isValidIdOrModel(body.id)) {
-    return { ok: false, reason: 'shape' };
+    return shape();
   }
-  if (!isPlainObject(body.answers)) {
-    return { ok: false, reason: 'shape' }
+  const answers = body.answers;
+  if (!isPlainObject(answers)) {
+    return shape();
   }
 
-  const answers = body.answers;
+  const question = scoreQuestion(levels);
   const scores: Record<string, number> = {};
   let confidence = Number.POSITIVE_INFINITY;
 
   for (const key of askedKeys) {
     if (typeof key !== 'string' || key.length === 0) {
-      return { ok: false, reason: 'shape' };
+      return shape();
     }
-    const answer = answers[key];
-    if (!isPlainObject(answer)) {
-      return { ok: false, reason: 'shape' };
+    const answer = validateScoreAnswer(answers[key], question, 0);
+    if (!answer.ok) {
+      return shape();
     }
-    if (answer.type !== 'score') {
-      return { ok: false, reason: 'shape' };
+    // The kernel reports a value for a score answer; a missing one is a shape
+    // failure rather than a silent zero.
+    if (typeof answer.value !== 'number' || !Number.isFinite(answer.value)) {
+      return shape();
     }
-    // Probabilities are an object keyed by level index strings, exactly
-    // "0".."levels-1" — an array or a different key set is a shape failure.
-    const probabilities = answer.probabilities;
-    if (!isPlainObject(probabilities)) {
-      return { ok: false, reason: 'shape' };
-    }
-    const expectedKeys = expectedProbabilityKeys(levels);
-    const actualKeys = Object.keys(probabilities);
-    if (
-      actualKeys.length !== expectedKeys.length ||
-      !expectedKeys.every((expected) => actualKeys.includes(expected))
-    ) {
-      return { ok: false, reason: 'shape' };
-    }
-
-    let sum = 0;
-    const values: number[] = [];
-    for (const probabilityKey of expectedKeys) {
-      const value = probabilities[probabilityKey];
-      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
-        return { ok: false, reason: 'shape' };
-      }
-      values.push(value);
-      sum += value;
-    }
-    if (Math.abs(sum - 1) > PROBABILITY_SUM_TOLERANCE) {
-      return { ok: false, reason: 'shape' };
-    }
-
-    const answerConfidence = answer.confidence;
-    if (
-      typeof answerConfidence !== 'number' ||
-      !Number.isFinite(answerConfidence) ||
-      answerConfidence < 0 ||
-      answerConfidence > 1
-    ) {
-      return { ok: false, reason: 'shape' };
-    }
-
-    // decisionScore = Σ p_i × i / (levels − 1), in [0,1].
-    let expectation = 0;
-    for (let i = 0; i < values.length; i++) {
-      expectation += values[i] * i;
-    }
-    scores[key] = expectation / (levels - 1);
-    confidence = Math.min(confidence, answerConfidence);
+    scores[key] = answer.value;
+    confidence = Math.min(confidence, answer.confidence);
   }
 
   if (confidence < minConfidence) {

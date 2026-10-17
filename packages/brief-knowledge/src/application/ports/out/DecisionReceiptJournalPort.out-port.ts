@@ -1,42 +1,79 @@
-// Refined for lanes D1 and D4 (decision port plan, 2026-10-16).
+// Refined for lanes D1 and D4 (decision port plan, 2026-10-16); refined again
+// for lane K2 (decision-kernel plan, 2026-10-16, §3).
 /**
- * DecisionReceiptJournalPort: append-only record of decision calls and
- * month-to-date spend. "Recorded or not made" — every decision reserves
- * budget here before the call is made and its receipt is settled before the
- * answer is used, so a paid call is never invisible to the budget.
+ * DecisionReceiptJournalPort: append-only record of decision calls, of
+ * month-to-date spend and of the outcomes those calls produced. "Recorded or
+ * not made" — every decision reserves budget here before the call is made and
+ * its receipt is settled before the answer is used, so a paid call is never
+ * invisible to the budget.
+ *
+ * The common receipt fields are the kernel's envelope
+ * (`DecisionCallReceipt` in `@fleet/shared`) minus `at` (the journal stamps
+ * it) and `estimated` (the journal derives it from whether a cost was
+ * reported). The consumer-specific variants live here, with their consumer:
+ * `knowledge-ranking` and `claim-triage`, so a new consumer never edits
+ * `@fleet/shared`.
  */
 
+import type { DecisionCallReceipt as DecisionReceiptEnvelope } from '@fleet/shared';
+
+/** The consumer this context records a ranking judgement for. */
+export const KNOWLEDGE_RANKING_CONSUMER = 'knowledge-ranking';
+
+/** The consumer this context records a candidate-claim triage for (K5). */
+export const CLAIM_TRIAGE_CONSUMER = 'claim-triage';
+
+/** The kernel envelope as the caller declares it; the journal owns the rest. */
+type DeclaredReceiptFields = Omit<DecisionReceiptEnvelope, 'at' | 'estimated'>;
+
 /**
- * Caller-supplied outcome of one decision call, appended against a
- * reservation. Declared fields only.
+ * A settled ranking call: the advisory scores were applied to an order of the
+ * candidate ids. `lexicalOrder` is the order the deterministic retrieval
+ * produced; `decidedOrder` is the order finally used (equal to `lexicalOrder`
+ * when the answer was unknown).
  */
-export interface DecisionCallReceipt {
-  /** Provider identifier, e.g. 'jev' or 'answer-file'. */
-  readonly provider: string;
-  /** Served model id, recorded not trusted. */
-  readonly model: string;
-  /** Optional provider request id. */
-  readonly requestId?: string;
-  /**
-   * Reported cost in USD. When absent the journal records the reservation's
-   * assumed cost and marks the receipt `estimated`. Callers must pass
-   * `undefined` — never `0` — when the provider reported no cost: `0` would
-   * be recorded as a real, paid cost of zero.
-   */
-  readonly costUsd?: number;
-  /** Candidate ids in the order the deterministic retrieval produced. */
+export interface RankingDecisionCallReceipt extends DeclaredReceiptFields {
+  readonly consumer: typeof KNOWLEDGE_RANKING_CONSUMER;
   readonly lexicalOrder: readonly string[];
-  /** Candidate ids in the order finally used (equal to lexicalOrder on unknown). */
   readonly decidedOrder: readonly string[];
-  /** Present when the call produced no usable answer. */
-  readonly unknownReason?: string;
 }
 
+/**
+ * A settled triage call (written from lane K5). It orders nothing, so its
+ * `lexicalOrder` and `decidedOrder` are empty: that keeps a triage line
+ * readable by an older build's parser after a rollback, and keeps the
+ * budget's fail-closed parser from ever meeting a line kind it does not know.
+ *
+ * K2 leaves the per-candidate `dispositions` (`candidateId`, `chosenClass`,
+ * `reusability`) out of this contract rather than declaring a field nothing
+ * settles: until K5a persists them, a triage line carries no dispositions,
+ * and a line that carries extra keys is still parsed — the reader ignores
+ * what it does not know, so a rollback keeps reading either way.
+ */
+export interface ClaimTriageDecisionCallReceipt extends DeclaredReceiptFields {
+  readonly consumer: typeof CLAIM_TRIAGE_CONSUMER;
+  readonly lexicalOrder: readonly string[];
+  readonly decidedOrder: readonly string[];
+}
+
+/** Caller-supplied outcome of one decision call, appended against a reservation. */
+export type DecisionCallReceipt = RankingDecisionCallReceipt | ClaimTriageDecisionCallReceipt;
+
 export interface ReserveDecisionQuery {
+  /**
+   * Consumer discriminator the pending spend is attributed to; a reservation
+   * without one reads as `knowledge-ranking`.
+   */
+  readonly consumer?: string;
   /** Cost assumed for the call when no settled cost arrives. */
   readonly assumedCostUsd: number;
   /** Month-to-date budget the journal enforces, in USD. */
   readonly monthlyBudgetUsd: number;
+  /**
+   * This consumer's own month-to-date sub-budget, in USD. Omit when the
+   * consumer has none: only the total applies.
+   */
+  readonly consumerBudgetUsd?: number;
   /** SHA-256 of the declared state that will be sent. */
   readonly stateSha256: string;
 }
@@ -45,10 +82,29 @@ export type ReserveDecisionResult =
   | { readonly ok: true; readonly reservationId: string }
   | { readonly ok: false; readonly reason: 'budget-exhausted' | 'not-configured' };
 
+/** What one decision call ended up deciding, recorded best effort. */
+export type DecisionOutcomeKind = 'ranking-selection' | 'triage-disposition';
+
+export interface AppendDecisionOutcome {
+  readonly consumer: string;
+  /** Joins the outcome to the settled receipt of the same decision call. */
+  readonly contextRef: string;
+  readonly kind: DecisionOutcomeKind;
+  /**
+   * Declared ids only: the entry ids the orchestrator selected for a ranking,
+   * or the candidate id and disposition a checker recorded for a triage. Never
+   * claim text.
+   */
+  readonly value: readonly string[];
+  /** ISO 8601 instant the outcome was recorded. */
+  readonly at: string;
+}
+
 export interface DecisionReceiptJournalPort {
   /**
-   * Reserve this month's budget for one call: refuses when the month-to-date
-   * spend plus the assumed cost would exceed the budget, otherwise appends a
+   * Reserve this month's budget for one call: refuses when the consumer's
+   * month-to-date spend (its own sub-budget, when it has one) or the month's
+   * total plus the assumed cost would reach the budget, otherwise appends a
    * `reserved` entry and returns its reservation id.
    */
   reserve(query: ReserveDecisionQuery): Promise<ReserveDecisionResult>;
@@ -62,4 +118,11 @@ export interface DecisionReceiptJournalPort {
   settle(reservationId: string, receipt: DecisionCallReceipt): Promise<void>;
   /** Sum of settled and reserved costs for the UTC month containing `monthUtc`. */
   monthSpendUsd(monthUtc: Date): Promise<number>;
+  /**
+   * Record what one decision call ended up deciding, best effort: a
+   * `contextRef` with no settled receipt is skipped silently and a failed
+   * write is never raised at the caller, so recording an outcome can never
+   * fail the operation it describes. Outcomes live in their own file.
+   */
+  appendOutcome(outcome: AppendDecisionOutcome): Promise<void>;
 }

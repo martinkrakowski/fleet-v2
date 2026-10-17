@@ -95,15 +95,22 @@ import {
 } from '@fleet/brief-knowledge';
 
 import {
+  AcknowledgeOwnerAnswerUseCase,
+  AnswerOwnerQuestionUseCase,
+  AskOwnerQuestionUseCase,
   AttentionReadAdapter,
   CheckOwnerDecisionUseCase,
   CoordinationRequestRepositoryAdapter,
   DecisionTransportAdapter,
+  ExpireOwnerQuestionsUseCase,
   InspectConfiguredCapabilitiesUseCase,
   InspectOutstandingCoordinationUseCase,
+  ListOwnerQuestionsUseCase,
   ObservationPublicationAdapter,
+  OwnerQuestionRepositoryAdapter,
   ProjectProfileRepositoryAdapter,
   PublishProjectObservationUseCase,
+  ReadOwnerQuestionUseCase,
   ReadProjectAttentionUseCase,
   RecordAuthorizationConsumptionUseCase,
   RecordRelayAcknowledgementUseCase,
@@ -112,6 +119,8 @@ import {
   RequestScopedDecisionUseCase,
   ResolveActionAuthorizationUseCase,
   SendFleetRelayUseCase,
+  SyncOneWayOwnerQuestionsUseCase,
+  type OwnerQuestionClock,
 } from '@fleet/operator-coordination';
 import { deriveInstallationModel, type FleetInstallation } from '@fleet/installation';
 
@@ -403,6 +412,14 @@ export interface FleetCliRuntime {
     readonly recordRelayAcknowledgement: RecordRelayAcknowledgementUseCase;
     readonly inspectOutstandingCoordination: InspectOutstandingCoordinationUseCase;
     readonly checkOwnerDecision: CheckOwnerDecisionUseCase;
+    readonly ownerQuestionRepository: OwnerQuestionRepositoryAdapter;
+    readonly askOwnerQuestion: AskOwnerQuestionUseCase;
+    readonly answerOwnerQuestion: AnswerOwnerQuestionUseCase;
+    readonly listOwnerQuestions: ListOwnerQuestionsUseCase;
+    readonly readOwnerQuestion: ReadOwnerQuestionUseCase;
+    readonly syncOneWayOwnerQuestions: SyncOneWayOwnerQuestionsUseCase;
+    readonly expireOwnerQuestions: ExpireOwnerQuestionsUseCase;
+    readonly acknowledgeOwnerAnswer: AcknowledgeOwnerAnswerUseCase;
   };
   readonly knowledge: {
     readonly knowledgeEntryRepository: KnowledgeEntryRepositoryAdapter;
@@ -512,6 +529,13 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   });
   // No attention reader is configured in the scaffold; reads report absence.
   const attentionRead = new AttentionReadAdapter();
+  // Owner questions are their own aggregate beside the coordination requests,
+  // persisted to `<stateDir>/owner-questions.json` and in-memory without a
+  // stateDir. The clock is the composition root's alone: no request body ever
+  // supplies the moment a question is asked, answered, expired or
+  // acknowledged.
+  const ownerQuestionRepository = new OwnerQuestionRepositoryAdapter({ stateDir });
+  const ownerQuestionClock: OwnerQuestionClock = { nowIso: () => new Date().toISOString() };
 
   const coordination = {
     projectProfileRepository,
@@ -555,6 +579,41 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     inspectOutstandingCoordination: new InspectOutstandingCoordinationUseCase({
       requestRepo: coordinationRequestRepository,
       publicationPort: observationPublication,
+    }),
+    // Owner questions: two-way questions are answered through the answer use
+    // case with `answeredVia 'cli'`; one-way questions are settled only by the
+    // signed owner decision their linked request carries, read through the
+    // same decision transport that verifies forge-time approvals. An answer
+    // unblocks; it grants nothing and writes no coordination request.
+    ownerQuestionRepository,
+    askOwnerQuestion: new AskOwnerQuestionUseCase({
+      ownerQuestionRepo: ownerQuestionRepository,
+      requestRepo: coordinationRequestRepository,
+      clock: ownerQuestionClock,
+    }),
+    answerOwnerQuestion: new AnswerOwnerQuestionUseCase({
+      ownerQuestionRepo: ownerQuestionRepository,
+      clock: ownerQuestionClock,
+    }),
+    listOwnerQuestions: new ListOwnerQuestionsUseCase({
+      ownerQuestionRepo: ownerQuestionRepository,
+    }),
+    readOwnerQuestion: new ReadOwnerQuestionUseCase({
+      ownerQuestionRepo: ownerQuestionRepository,
+    }),
+    syncOneWayOwnerQuestions: new SyncOneWayOwnerQuestionsUseCase({
+      ownerQuestionRepo: ownerQuestionRepository,
+      requestRepo: coordinationRequestRepository,
+      decisionTransport,
+      clock: ownerQuestionClock,
+    }),
+    expireOwnerQuestions: new ExpireOwnerQuestionsUseCase({
+      ownerQuestionRepo: ownerQuestionRepository,
+      clock: ownerQuestionClock,
+    }),
+    acknowledgeOwnerAnswer: new AcknowledgeOwnerAnswerUseCase({
+      ownerQuestionRepo: ownerQuestionRepository,
+      clock: ownerQuestionClock,
     }),
   };
 

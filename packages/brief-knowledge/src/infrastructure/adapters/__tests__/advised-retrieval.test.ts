@@ -1,5 +1,6 @@
 // Tests for lane D1 (decision port plan, 2026-10-16): the advised retrieval
 // decorator's pure reorder, reference-equal unknown behaviour and spy checks.
+// Lane K2 adds the ranking `contextRef` returned with the ranking itself.
 import { describe, expect, it, vi } from 'vitest';
 import { AdvisedKnowledgeRetrievalAdapter } from '../AdvisedKnowledgeRetrievalAdapter.adapter.js';
 import { NullRankingAdviceAdapter } from '../NullRankingAdviceAdapter.adapter.js';
@@ -110,6 +111,60 @@ describe('NullRankingAdviceAdapter', () => {
       candidates: [{ id: 'a', claimText: 'c' }],
     });
     expect(result).toEqual({ status: 'unknown', reason: 'not-configured' });
+  });
+});
+
+describe('rankEligibleKeepersWithContext', () => {
+  const REF = `ranking:lane-d1:${'a'.repeat(64)}`;
+
+  it('returns the reference the advice answer settled, alongside the same matches', async () => {
+    const innerResult = [match('a', 1), match('b', 0.5)];
+    const settledAnswer: RankingAdvice = {
+      ...advised({ a: 0.1, b: 0.9 }, 'jev-1.14', 0.8),
+      contextRef: REF,
+    };
+    const decorator = new AdvisedKnowledgeRetrievalAdapter(
+      spyInner(innerResult),
+      spyAdvice(settledAnswer),
+    );
+    const withContext = await decorator.rankEligibleKeepersWithContext(query(innerResult));
+    expect(withContext.rankingContextRef).toBe(REF);
+    // The old method still answers the same ranking for every other caller.
+    const plain = await decorator.rankEligibleKeepers(query(innerResult));
+    expect(plain.map((m) => m.entry.id)).toEqual(
+      withContext.matches.map((m) => m.entry.id),
+    );
+  });
+
+  it('reports a settled reference even when the answer was unknown, and none otherwise', async () => {
+    const innerResult = [match('a', 1), match('b', 0.5)];
+    const unknown = new AdvisedKnowledgeRetrievalAdapter(
+      spyInner(innerResult),
+      spyAdvice({ status: 'unknown', reason: 'timeout', contextRef: REF }),
+    );
+    const settledUnknown = await unknown.rankEligibleKeepersWithContext(query(innerResult));
+    expect(settledUnknown.rankingContextRef).toBe(REF);
+    expect(settledUnknown.matches).toBe(innerResult);
+
+    const off = new AdvisedKnowledgeRetrievalAdapter(
+      spyInner(innerResult),
+      new NullRankingAdviceAdapter(),
+    );
+    const none = await off.rankEligibleKeepersWithContext(query(innerResult));
+    expect(none.rankingContextRef).toBeUndefined();
+    expect(Object.keys(none)).toEqual(['matches']);
+  });
+
+  it('reports nothing when fewer than two entries make an advice call pointless', async () => {
+    const innerResult = [match('a', 1)];
+    const { decorator, advice } = makeDecorator(innerResult, {
+      ...advised({ a: 1 }),
+      contextRef: REF,
+    });
+    const result = await decorator.rankEligibleKeepersWithContext(query(innerResult));
+    expect(result.rankingContextRef).toBeUndefined();
+    expect(result.matches).toBe(innerResult);
+    expect(advice.calls).toHaveLength(0);
   });
 });
 

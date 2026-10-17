@@ -75,6 +75,12 @@ run; check 'no arguments is a usage error (2)' '[ "$(rc)" = 2 ]'
 run --dir "$WT"; check 'a run without --model is refused (2)' '[ "$(rc)" = 2 ] && grep -q "needs --model" "$T/e"'
 run --dir "$WT" --model m "do this"; check 'a prompt argument is refused (2)' '[ "$(rc)" = 2 ] && grep -q "takes no prompt" "$T/e"'
 run --dir "$WT" --model m --dangerously-skip-permissions; check '--dangerously-skip-permissions is refused (2)' '[ "$(rc)" = 2 ] && grep -q "refusing --dangerously-skip-permissions" "$T/e"'
+run --dir "$WT" --model m --isolation-declared --dangerously-skip-permissions; check '--isolation-declared alone does not widen permissions (2)' '[ "$(rc)" = 2 ] && grep -q "refusing --dangerously-skip-permissions" "$T/e"'
+run --dir "$WT" --model m --mode plan --isolation-declared --dangerously-skip-permissions; check '--dangerously-skip-permissions with a non-full mode is refused (2)' '[ "$(rc)" = 2 ] && grep -q "refusing --dangerously-skip-permissions" "$T/e"'
+run --dir "$WT" --model m --mode full; check '--mode full without --isolation-declared is refused (2)' '[ "$(rc)" = 2 ] && grep -q "requires --isolation-declared" "$T/e"'
+run --check --dir "$WT" --mode full --isolation-declared --dangerously-skip-permissions; check 'the full pair needs no separate widen flag to be accepted (0)' '[ "$(rc)" = 0 ]'
+run --dir "$WT" --model m --isolation-declared; check '--isolation-declared without --mode full is refused (2)' '[ "$(rc)" = 2 ] && grep -q "only accepted with --mode full" "$T/e"'
+run --dir "$WT" --model m --mode auto --isolation-declared; check '--isolation-declared does not pair with --mode auto (2)' '[ "$(rc)" = 2 ] && grep -q "only accepted with --mode full" "$T/e"'
 run --dir "$WT" --model m --print x; check 'agy print options are refused (2)' '[ "$(rc)" = 2 ]'
 run --dir "$WT" --model m --disable-slash-commands; check '--disable-slash-commands is refused (2)' '[ "$(rc)" = 2 ]'
 run --dir "$WT" --model m --mode yolo; check 'an unknown --mode is refused (2)' '[ "$(rc)" = 2 ]'
@@ -82,6 +88,10 @@ run --dir "$WT" --model m --effort ultra; check 'an unknown --effort is refused 
 run --dir "$WT" --model m --timeout 5x; check 'a malformed --timeout is refused (2)' '[ "$(rc)" = 2 ]'
 run --dir "$WT" --model m --brief ../x.md; check 'a --brief outside the dir is refused (2)' '[ "$(rc)" = 2 ]'
 run --dir "$WT" --model m --brief /etc/x.md; check 'an absolute --brief is refused (2)' '[ "$(rc)" = 2 ]'
+run --dir "$WT" --model --dangerously-skip-permissions; check 'a --model value that is itself a flag is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
+run --dir "$WT" --model=-x; check 'a --model= value starting with - is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
+run --dir "$WT" --model -x; check 'a --model value starting with - is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
+run --dir "$WT" --model 'a b'; check 'a --model value containing whitespace is refused (2)' '[ "$(rc)" = 2 ] && grep -q "contain whitespace" "$T/e"'
 run --status --wait --dir "$WT"; check 'two modes at once is a usage error (2)' '[ "$(rc)" = 2 ]'
 check 'no fake agy ran during the usage checks' '[ ! -f "$T/args.log" ]'
 
@@ -126,6 +136,14 @@ check 'the summary line names the exit and the model' 'grep -q "ended after [0-9
 
 run --dir "$WT" --model m --effort high --agent lane --mode plan --sandbox --timeout 20m --brief .lane/brief.md
 check 'effort, agent, mode, sandbox and timeout pass through' 'grep -A1 -x -- "--effort" "$T/args.log" | grep -qx high && grep -A1 -x -- "--agent" "$T/args.log" | grep -qx lane && grep -A1 -x -- "--mode" "$T/args.log" | grep -qx plan && grep -qx -- "--sandbox" "$T/args.log" && grep -A1 -x -- "--print-timeout" "$T/args.log" | grep -qx 20m'
+run --dir "$WT" --model prov/model-x --mode auto
+check '--mode auto alone is agy auto and nothing more' '[ "$(rc)" = 0 ] && grep -A1 -x -- "--mode" "$T/args.log" | grep -qx auto && ! grep -q "dangerously" "$T/args.log"'
+run --dir "$WT" --model prov/model-x --mode full --isolation-declared
+check 'a full run exits 0' '[ "$(rc)" = 0 ]'
+check 'a full lane runs agy in --mode auto' 'grep -A1 -x -- "--mode" "$T/args.log" | grep -qx auto'
+check 'a full lane is the only one that gets --dangerously-skip-permissions' 'grep -qx -- "--dangerously-skip-permissions" "$T/args.log"'
+check 'a full lane still gets the fixed prompt and its model' 'grep -q "^Read the file .lane/brief.md in the current directory" "$T/args.log" && grep -A1 -x -- "--model" "$T/args.log" | grep -qx prov/model-x'
+check 'agy-run.last records the full mode and no denied actions' 'tail -n1 "$WT/.lane/agy-run.last" | grep -q "exit=0 secs=[0-9]* tokens=6 denied=0 model=prov/model-x mode=full"'
 erun AGY_SANDBOX=1 "$RUNSH" "$SCRIPT" --dir "$WT" --model m
 check 'AGY_SANDBOX=1 adds --sandbox' 'grep -qx -- "--sandbox" "$T/args.log"'
 echo '# fix 1' > "$WT/.lane/fix-1.md"

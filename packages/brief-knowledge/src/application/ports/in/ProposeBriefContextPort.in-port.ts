@@ -25,7 +25,18 @@ export interface BriefKnowledgeProposal {
 }
 
 export type ProposeBriefContextResult =
-  | { readonly outcome: 'proposed'; readonly proposals: readonly BriefKnowledgeProposal[] }
+  | {
+      readonly outcome: 'proposed';
+      readonly proposals: readonly BriefKnowledgeProposal[];
+      /**
+       * The ranking `contextRef` (`ranking:<laneId>:<sha256>`) of the decision
+       * call that receipted this ordering, when one settled. Absent when advice
+       * was off, the budget refused or nothing could be settled; the orchestrator
+       * reports it back when it records its selection, so the ten-proposal trial
+       * can join a selection to the receipt that advised it.
+       */
+      readonly rankingContextRef?: string;
+    }
   | { readonly outcome: 'rejected'; readonly reason: string };
 
 export interface ProposeBriefContextPort {

@@ -574,6 +574,17 @@ describe('fleet-v2 questions command group', () => {
     }
   });
 
+  it('a free-text flag value of -h or --help is never read as a help request', async () => {
+    for (const value of ['-h', '--help']) {
+      const result = await cli(['questions', 'answer', 'q-missing', '--revision', '1', '--reject', '--reason', value]);
+      expect(result.text).not.toContain('Usage: fleet-v2 questions');
+      expect(result.code).not.toBe(0);
+    }
+    const subHelp = await cli(['questions', 'answer', '--help']);
+    expect(subHelp.code).toBe(0);
+    expect(subHelp.text).toContain('Usage: fleet-v2 questions');
+  });
+
   it('the composed runtime answers through --state-dir without an injected runtime', async () => {
     const asked = await composedCli([
       '--state-dir',

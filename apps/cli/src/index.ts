@@ -1130,6 +1130,10 @@ function formatDoctorLine(doctorLine: DoctorLine): string {
  * The exit code follows `doctorExitCode`: 0 only when every line passed. A
  * missing or invalid installation is refused with exit 1, not a usage error.
  */
+function isHelpToken(token: string | undefined): boolean {
+  return token === 'help' || token === '--help' || token === '-h';
+}
+
 export async function doctorCommand(
   argv: readonly string[],
   io: CliIo,
@@ -1268,9 +1272,9 @@ export async function runCli(
     // composes the runtime and never counts as a usage error.
     if (
       group === 'questions' &&
-      (restArgv[1] === 'help' ||
-        restArgv.slice(1).includes('--help') ||
-        restArgv.slice(1).includes('-h'))
+      // Only the help positions count (`questions --help`, `questions answer --help`):
+      // a free-text flag value such as `--reason -h` must never be read as help.
+      (isHelpToken(restArgv[1]) || (restArgv.length === 3 && isHelpToken(restArgv[2])))
     ) {
       io.stdout(`${QUESTIONS_HELP}\n`);
       return 0;

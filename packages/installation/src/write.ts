@@ -5,9 +5,9 @@
  * never written: it is not a file field (D4).
  */
 
+import { copyDecisionConsumers } from './decision-consumers.js';
 import type {
   ChainsSection,
-  DecisionConsumers,
   DecisionsSectionV2,
   FleetInstallation,
   FleetInstallationV2,
@@ -212,7 +212,7 @@ function serializeDecisions(decisions: DecisionsSectionV2): Record<string, unkno
       provider: 'answer-file',
       answerFile: decisions.answerFile,
       ...(decisions.consumers !== undefined
-        ? { consumers: serializeConsumers(decisions.consumers) }
+        ? { consumers: copyDecisionConsumers(decisions.consumers) }
         : {}),
     };
   }
@@ -228,35 +228,11 @@ function serializeDecisions(decisions: DecisionsSectionV2): Record<string, unkno
       ? { disabledProjects: [...decisions.disabledProjects] }
       : {}),
     ...(decisions.consumers !== undefined
-      ? { consumers: serializeConsumers(decisions.consumers) }
+      ? { consumers: copyDecisionConsumers(decisions.consumers) }
       : {}),
   };
 }
 
-/** Serialize the per-consumer settings map (K3) with a stable consumer order. */
-function serializeConsumers(consumers: DecisionConsumers): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  const ranking = consumers['knowledge-ranking'];
-  if (ranking !== undefined) {
-    out['knowledge-ranking'] = {
-      ...(ranking.minConfidence !== undefined ? { minConfidence: ranking.minConfidence } : {}),
-      ...(ranking.monthlyBudgetUsd !== undefined
-        ? { monthlyBudgetUsd: ranking.monthlyBudgetUsd }
-        : {}),
-    };
-  }
-  const triage = consumers['claim-triage'];
-  if (triage !== undefined) {
-    out['claim-triage'] = {
-      ...(triage.minConfidence !== undefined ? { minConfidence: triage.minConfidence } : {}),
-      ...(triage.monthlyBudgetUsd !== undefined
-        ? { monthlyBudgetUsd: triage.monthlyBudgetUsd }
-        : {}),
-      acknowledgeCandidateClaimsLeaveHost: triage.acknowledgeCandidateClaimsLeaveHost,
-    };
-  }
-  return out;
-}
 
 function serializeWaves(waves: WavesSection): Record<string, unknown> {
   const out: Record<string, unknown> = {

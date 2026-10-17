@@ -1,0 +1,46 @@
+{
+  "model": "typesafe/jev-1.14-20261014",
+  "answers": {
+    "k0": {
+      "type": "score",
+      "score": 2.92,
+      "legend": {
+        "0": "not relevant",
+        "1": "slightly relevant",
+        "2": "relevant",
+        "3": "highly relevant"
+      },
+      "probabilities": {
+        "0": 0.01,
+        "1": 0.01,
+        "2": 0.04,
+        "3": 0.94
+      },
+      "confidence": 0.91
+    },
+    "k1": {
+      "type": "score",
+      "score": 0,
+      "legend": {
+        "0": "not relevant",
+        "1": "slightly relevant",
+        "2": "relevant",
+        "3": "highly relevant"
+      },
+      "probabilities": {
+        "0": 1,
+        "1": 0,
+        "2": 0,
+        "3": 0
+      },
+      "confidence": 1
+    }
+  },
+  "usage": {
+    "input_tokens": 431,
+    "output_tokens": 32,
+    "cost": 0.000018102
+  },
+  "provider": "TypeSafe",
+  "id": "gen-fixture"
+}

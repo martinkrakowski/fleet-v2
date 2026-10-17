@@ -7,6 +7,7 @@ import type {
   ChainTrigger,
   ChainsSection,
   CostClass,
+  DecisionConsumers,
   DecisionsSectionV2,
   FallbackSeat,
   FleetInstallation,
@@ -106,8 +107,20 @@ const JEV_DECISIONS_KEYS: readonly string[] = [
   'assumedCostPerCallUsd',
   'acknowledgeProseLeavesHost',
   'disabledProjects',
+  'consumers',
 ];
-const ANSWER_FILE_DECISIONS_KEYS: readonly string[] = ['provider', 'answerFile'];
+const ANSWER_FILE_DECISIONS_KEYS: readonly string[] = ['provider', 'answerFile', 'consumers'];
+// Per-consumer settings (K3): two known consumers, each with its own keys.
+const DECISION_CONSUMERS_KEYS: readonly (keyof DecisionConsumers)[] = [
+  'knowledge-ranking',
+  'claim-triage',
+];
+const KNOWLEDGE_RANKING_CONSUMER_KEYS: readonly string[] = ['minConfidence', 'monthlyBudgetUsd'];
+const CLAIM_TRIAGE_CONSUMER_KEYS: readonly string[] = [
+  'minConfidence',
+  'monthlyBudgetUsd',
+  'acknowledgeCandidateClaimsLeaveHost',
+];
 
 const HOST_ROLES: readonly HostRole[] = ['orchestrator', 'lane-runner', 'verifier'];
 const SEAT_ROLES: readonly SeatRole[] = ['implementer', 'reviewer', 'high-risk-reviewer'];
@@ -1327,6 +1340,116 @@ function readRequiredPositiveNumber(
   return readOptionalPositiveNumber(record, key, fieldPath, errors);
 }
 
+/**
+ * Parse the optional per-consumer settings map of a decisions block (K3, plan
+ * section 2). Unknown consumer names and unknown keys inside an entry are
+ * refused; `minConfidence` must be a finite number in [0,1]; a
+ * `monthlyBudgetUsd` must be finite and greater than 0; the `claim-triage`
+ * acknowledgement must be literally true whenever the entry is present.
+ * Messages name the field, never the value.
+ */
+function parseDecisionConsumers(
+  section: JsonObject,
+  errors: string[],
+): DecisionConsumers | undefined {
+  if (!Object.hasOwn(section, 'consumers')) {
+    return undefined;
+  }
+  const consumersValue = section.consumers;
+  if (!isJsonObject(consumersValue)) {
+    errors.push('decisions.consumers: must be an object');
+    return undefined;
+  }
+  collectUnknownKeys(consumersValue, DECISION_CONSUMERS_KEYS, 'decisions.consumers', errors);
+  const consumers: Mutable<DecisionConsumers> = {};
+  if (Object.hasOwn(consumersValue, 'knowledge-ranking')) {
+    const entry = consumersValue['knowledge-ranking'];
+    const entryPath = 'decisions.consumers.knowledge-ranking';
+    if (!isJsonObject(entry)) {
+      errors.push(`${entryPath}: must be an object`);
+    } else {
+      collectUnknownKeys(entry, KNOWLEDGE_RANKING_CONSUMER_KEYS, entryPath, errors);
+      const minConfidence = readOptionalFraction(
+        entry,
+        'minConfidence',
+        `${entryPath}.minConfidence`,
+        errors,
+      );
+      const monthlyBudgetUsd = readOptionalPositiveNumber(
+        entry,
+        'monthlyBudgetUsd',
+        `${entryPath}.monthlyBudgetUsd`,
+        errors,
+      );
+      consumers['knowledge-ranking'] = {
+        ...(minConfidence !== undefined ? { minConfidence } : {}),
+        ...(monthlyBudgetUsd !== undefined ? { monthlyBudgetUsd } : {}),
+      };
+    }
+  }
+  if (Object.hasOwn(consumersValue, 'claim-triage')) {
+    const entry = consumersValue['claim-triage'];
+    const entryPath = 'decisions.consumers.claim-triage';
+    if (!isJsonObject(entry)) {
+      errors.push(`${entryPath}: must be an object`);
+    } else {
+      collectUnknownKeys(entry, CLAIM_TRIAGE_CONSUMER_KEYS, entryPath, errors);
+      const minConfidence = readOptionalFraction(
+        entry,
+        'minConfidence',
+        `${entryPath}.minConfidence`,
+        errors,
+      );
+      const monthlyBudgetUsd = readOptionalPositiveNumber(
+        entry,
+        'monthlyBudgetUsd',
+        `${entryPath}.monthlyBudgetUsd`,
+        errors,
+      );
+      let acknowledged = false;
+      if (!Object.hasOwn(entry, 'acknowledgeCandidateClaimsLeaveHost')) {
+        errors.push(`${entryPath}.acknowledgeCandidateClaimsLeaveHost: required`);
+      } else if (entry.acknowledgeCandidateClaimsLeaveHost !== true) {
+        errors.push(`${entryPath}.acknowledgeCandidateClaimsLeaveHost: must be true`);
+      } else {
+        acknowledged = true;
+      }
+      if (acknowledged) {
+        consumers['claim-triage'] = {
+          ...(minConfidence !== undefined ? { minConfidence } : {}),
+          ...(monthlyBudgetUsd !== undefined ? { monthlyBudgetUsd } : {}),
+          acknowledgeCandidateClaimsLeaveHost: true,
+        };
+      }
+    }
+  }
+  return consumers;
+}
+
+/**
+ * A consumer `monthlyBudgetUsd` must not sit above the block's own
+ * `monthlyBudgetUsd` (K3). Answer-file blocks carry no block budget, so the
+ * check only runs when the block declares a valid one. The message names both
+ * fields and never a value.
+ */
+function enforceConsumerSubBudgets(
+  consumers: DecisionConsumers | undefined,
+  blockMonthlyBudgetUsd: number | undefined,
+  errors: string[],
+): void {
+  if (consumers === undefined || blockMonthlyBudgetUsd === undefined) {
+    return;
+  }
+  for (const name of DECISION_CONSUMERS_KEYS) {
+    const budget = consumers[name]?.monthlyBudgetUsd;
+    if (budget !== undefined && budget > blockMonthlyBudgetUsd) {
+      errors.push(
+        `decisions.consumers.${name}.monthlyBudgetUsd: must not exceed decisions.monthlyBudgetUsd`,
+      );
+    }
+  }
+}
+
 function parseV2Decisions(value: JsonObject, errors: string[]): DecisionsSectionV2 | undefined {
   if (!Object.hasOwn(value, 'decisions')) {
     return undefined;
@@ -1382,6 +1505,10 @@ function parseV2Decisions(value: JsonObject, errors: string[]): DecisionsSection
       'decisions.disabledProjects',
       errors,
     );
+    const consumers = parseDecisionConsumers(section, errors);
+    // A consumer sub-budget must not exceed the block total; an invalid block
+    // budget is refused on its own, so the comparison only runs on a valid one.
+    enforceConsumerSubBudgets(consumers, monthlyBudgetUsd, errors);
     if (
       model === undefined ||
       keyFile === undefined ||
@@ -1401,6 +1528,7 @@ function parseV2Decisions(value: JsonObject, errors: string[]): DecisionsSection
       assumedCostPerCallUsd,
       acknowledgeProseLeavesHost: true,
       ...(disabledProjects !== undefined ? { disabledProjects } : {}),
+      ...(consumers !== undefined ? { consumers } : {}),
     };
   }
   if (provider === 'answer-file') {
@@ -1411,10 +1539,17 @@ function parseV2Decisions(value: JsonObject, errors: string[]): DecisionsSection
       'decisions.answerFile',
       errors,
     );
+    // An answer-file block declares no block budget, so any finite positive
+    // consumer sub-budget is accepted (K3).
+    const consumers = parseDecisionConsumers(section, errors);
     if (answerFile === undefined) {
       return undefined;
     }
-    return { provider: 'answer-file', answerFile };
+    return {
+      provider: 'answer-file',
+      answerFile,
+      ...(consumers !== undefined ? { consumers } : {}),
+    };
   }
   collectUnknownKeys(section, JEV_DECISIONS_KEYS, 'decisions', errors);
   errors.push('decisions.provider: must be a known provider');

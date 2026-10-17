@@ -10,7 +10,7 @@
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
-import type { AttemptRecord } from '../../domain/execution-records.js';
+import type { AttemptRecord, AttemptRunnerRecord, RunnerKind } from '../../domain/execution-records.js';
 import type { AttemptRepositoryPort } from '../../application/ports/out/AttemptRepositoryPort.out-port.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
 
@@ -35,6 +35,28 @@ function isAttemptRecord(value: unknown): value is AttemptRecord {
   return typeof candidate.id === 'string' && typeof candidate.workOrderId === 'string';
 }
 
+/**
+ * Records persisted before lane O14c1 carry no runner `kind` and always had
+ * an opencode port. Reading them normalizes to `kind: 'opencode'` and a
+ * `remotePort` of `null` when absent, so downstream code never sees a record
+ * without a kind and never crashes on a missing port.
+ */
+function normalizeRecord(record: AttemptRecord): AttemptRecord {
+  const runner = record.runner;
+  if (runner === undefined || runner === null) return record;
+  const raw = runner as AttemptRunnerRecord & { kind?: RunnerKind };
+  const kind: RunnerKind = raw.kind === 'agy' ? 'agy' : 'opencode';
+  if (kind === runner.kind && runner.remotePort !== undefined) return record;
+  return {
+    ...record,
+    runner: {
+      ...runner,
+      kind,
+      remotePort: runner.remotePort ?? null,
+    },
+  };
+}
+
 export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
   private readonly inMemoryRecords = new Map<string, AttemptRecord>();
 
@@ -54,7 +76,7 @@ export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
           );
         }
       }
-      this.inMemoryRecords.set(record.id, record);
+      this.inMemoryRecords.set(record.id, normalizeRecord(record));
       return;
     }
 
@@ -74,7 +96,7 @@ export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
           );
         }
       }
-      records.set(record.id, record);
+      records.set(record.id, normalizeRecord(record));
       await writeJsonAtomically(target, [...records.values()]);
     });
   }
@@ -137,7 +159,7 @@ export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
       throw new Error(`AttemptRepositoryAdapter expects a record list in ${target}`);
     }
     for (const item of parsed) {
-      if (isAttemptRecord(item)) map.set(item.id, item);
+      if (isAttemptRecord(item)) map.set(item.id, normalizeRecord(item));
     }
     return map;
   }

@@ -242,6 +242,33 @@ export interface NoDecisionsSection {
   readonly provider: 'none';
 }
 
+/**
+ * Per-consumer decision settings (K3, plan section 2). Every field is
+ * optional: an absent `minConfidence` falls back to the block's, and an
+ * absent `monthlyBudgetUsd` means the consumer has no sub-budget clause
+ * (only the block total applies).
+ */
+export interface ConsumerSettings {
+  readonly minConfidence?: number;
+  readonly monthlyBudgetUsd?: number;
+}
+
+/**
+ * Settings of the `claim-triage` consumer (K3, plan section 2): a
+ * `ConsumerSettings` plus the acknowledgement that unreviewed candidate
+ * claims may leave the host. It is required whenever the `claim-triage`
+ * entry is present.
+ */
+export interface ClaimTriageSettings extends ConsumerSettings {
+  readonly acknowledgeCandidateClaimsLeaveHost: true;
+}
+
+/** The per-consumer settings map of a `decisions` block (K3). */
+export interface DecisionConsumers {
+  readonly 'knowledge-ranking'?: ConsumerSettings;
+  readonly 'claim-triage'?: ClaimTriageSettings;
+}
+
 /** The v2 `decisions` block with the Jev provider (D3). */
 export interface JevDecisionsSection {
   readonly provider: 'jev';
@@ -252,12 +279,14 @@ export interface JevDecisionsSection {
   readonly assumedCostPerCallUsd: number;
   readonly acknowledgeProseLeavesHost: true;
   readonly disabledProjects?: readonly string[];
+  readonly consumers?: DecisionConsumers;
 }
 
 /** The v2 `decisions` block with the answer-file provider (D3). */
 export interface AnswerFileDecisionsSection {
   readonly provider: 'answer-file';
   readonly answerFile: string;
+  readonly consumers?: DecisionConsumers;
 }
 
 /** The v2 `decisions` block (D3). */

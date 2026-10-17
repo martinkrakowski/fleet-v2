@@ -440,7 +440,7 @@ describe('apps/api runtime wiring', () => {
       if (attemptRepo) {
         await attemptRepo.saveAttempt({
           ...makeAttempt(attemptId, workOrderId, headH, [doorRef]),
-          runner: { remotePort: 0, host: null, model: 'seat/implementer', variant: null, agent: null },
+          runner: { kind: 'opencode', remotePort: 0, host: null, model: 'seat/implementer', variant: null, agent: null },
         });
       }
       const reqRepo = (operator.checkOwnerDecision as unknown as {

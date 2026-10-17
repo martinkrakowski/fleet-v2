@@ -64,7 +64,7 @@ async function seedAttempt(stateDir: string, withSeat: boolean): Promise<void> {
       notes: "missing",
     },
     runner: withSeat
-      ? { remotePort: 4166, host: null, agent: null, model: SEAT_MODEL, variant: null }
+      ? { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: SEAT_MODEL, variant: null }
       : null,
     createdAtIso: "2026-10-16T08:00:00.000Z",
     updatedAtIso: "2026-10-16T08:30:00.000Z",

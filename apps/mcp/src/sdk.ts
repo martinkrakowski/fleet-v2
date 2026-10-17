@@ -10,6 +10,29 @@
 
 export interface McpServerLike {
   connect(transport: unknown): Promise<void>;
+  /**
+   * Register a tool. `inputSchema` is a zod schema (raw shape or object
+   * schema); the handler receives no arguments and returns a
+   * CallToolResult-shaped object.
+   */
+  registerTool(
+    name: string,
+    config: {
+      description?: string;
+      inputSchema?: unknown;
+    },
+    handler: () => Promise<unknown>,
+  ): unknown;
+  /** Register a static resource; the read callback returns a ReadResourceResult-shaped object. */
+  registerResource(
+    name: string,
+    uri: string,
+    config: {
+      description?: string;
+      mimeType?: string;
+    },
+    read: () => Promise<unknown>,
+  ): unknown;
 }
 
 export type StdioTransportLike = object;

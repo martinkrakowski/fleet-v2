@@ -61,6 +61,7 @@ function createMockAttempt(overrides?: Partial<AttemptRecord>): AttemptRecord {
     completionReceipt: null,
     artifacts: null,
     runner: {
+      kind: 'opencode',
       remotePort: 4166,
       host: null,
       agent: null,
@@ -336,6 +337,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           artifactPersistence: true,
         }),
         describeRunner: () => ({
+          kind: 'opencode',
           remotePort: 4166,
           host: 'runner-host.lan',
           agent: 'lane-agent',
@@ -346,6 +348,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           outcome: 'started',
           sessionId: 'ses_started_4166',
           runner: {
+            kind: 'opencode',
             remotePort: 4166,
             host: 'runner-host.lan',
             agent: 'lane-agent',
@@ -415,6 +418,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         sessionId: 'ses_1',
         worktreePath: '/worktrees/lane-1',
         runner: {
+          kind: 'opencode',
           remotePort: 4166, // Recorded port was 4166
           host: null,
           agent: null,
@@ -438,6 +442,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         sessionId: 'ses_1',
         worktreePath: '/worktrees/lane-1',
         runner: {
+          kind: 'opencode',
           remotePort: 4166,
           host: 'expected-host.lan',
           agent: null,
@@ -470,6 +475,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         sessionId: 'ses_idle_test',
         worktreePath: '/worktrees/idle-fix',
         runner: {
+          kind: 'opencode',
           remotePort: 4166,
           host: null,
           agent: null,
@@ -501,6 +507,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         sessionId: 'ses_error_test',
         worktreePath: '/worktrees/error-retry',
         runner: {
+          kind: 'opencode',
           remotePort: 4166,
           host: null,
           agent: null,
@@ -533,6 +540,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           sessionId: 'ses_1',
           worktreePath: '/worktrees/lane-1',
           runner: {
+            kind: 'opencode',
             remotePort: 4166,
             host: null,
             agent: null,
@@ -567,6 +575,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         sessionId: '',
         worktreePath: '/worktrees/lane-1',
         runner: {
+          kind: 'opencode',
           remotePort: 4166,
           host: null,
           agent: null,
@@ -715,6 +724,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         attemptId: 'att-unknown-dir',
         sessionId: 'ses_fallback_test',
         runner: {
+          kind: 'opencode',
           remotePort: 4166,
           host: null,
           agent: null,
@@ -744,6 +754,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         sessionId: 'ses_fallback_test',
         gracePeriodSeconds: 10,
         runner: {
+          kind: 'opencode',
           remotePort: 4166,
           host: null,
           agent: null,
@@ -777,6 +788,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         worktreePath: '/worktrees/lane-1',
         gracePeriodSeconds: 10,
         runner: {
+          kind: 'opencode',
           remotePort: 4166,
           host: null,
           agent: null,
@@ -960,6 +972,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           artifactPersistence: true,
         }),
         describeRunner: () => ({
+          kind: 'opencode',
           remotePort: 4096,
           host: null,
           agent: null,
@@ -972,6 +985,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
             outcome: 'started',
             sessionId: 'ses_override_test',
             runner: {
+              kind: 'opencode',
               remotePort: 4096,
               host: null,
               agent: req.agent ?? null,
@@ -1270,6 +1284,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         sessionId: 'ses_1',
         worktreePath: '/worktrees/lane-1',
         runner: {
+          kind: 'opencode',
           remotePort: 4166,
           host: '-unsafe-host',
           agent: null,
@@ -1299,6 +1314,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         sessionId: 'ses_1',
         worktreePath: '/worktrees/lane-1',
         runner: {
+          kind: 'opencode',
           remotePort: 4166,
           host: '-injected-host',
           agent: null,
@@ -1359,6 +1375,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         gracePeriodSeconds: 0,
         worktreePath: '/worktrees/lane-1',
         runner: {
+          kind: 'opencode',
           remotePort: 4167,
           host: null,
           agent: null,
@@ -1388,6 +1405,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         id: 'att-wrong-port',
         state: 'running',
         runner: {
+          kind: 'opencode',
           remotePort: 4167,
           host: null,
           agent: null,
@@ -1467,6 +1485,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         gracePeriodSeconds: 0,
         worktreePath: '/worktrees/lane-1',
         runner: {
+          kind: 'opencode',
           remotePort: 4166,
           host: '-unsafe-flag',
           agent: null,
@@ -1500,6 +1519,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         gracePeriodSeconds: 0,
         worktreePath: '/worktrees/lane-1',
         runner: {
+          kind: 'opencode',
           remotePort: 4166,
           host: null,
           agent: null,
@@ -1560,6 +1580,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           artifactPersistence: true,
         }),
         describeRunner: () => ({
+          kind: 'opencode',
           remotePort: 4166,
           host: null,
           agent: null,
@@ -1572,6 +1593,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
             outcome: 'started',
             sessionId: 'ses_dispatch_test',
             runner: {
+              kind: 'opencode',
               remotePort: 4166,
               host: null,
               agent: req.agent ?? null,

@@ -1027,6 +1027,7 @@ function makeRunner(
       options.describeRunner !== undefined
         ? options.describeRunner
         : () => ({
+            kind: 'opencode',
             remotePort: 4166,
             host: null,
             agent: null,

@@ -269,6 +269,7 @@ describe('CLI installation wiring', () => {
         completionReceipt: null,
         artifacts: null,
         runner: {
+          kind: 'opencode',
           remotePort: 4166,
           host: null,
           agent: null,

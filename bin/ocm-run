@@ -173,7 +173,11 @@ fi
 
 if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
   if [ "$mode" = check ]; then
-    echo "ocm-run: --check: nothing is listening on the dial port 127.0.0.1:$port (OCM_REMOTE_PORT=$remote${host:+ on $host}); --check opens no forward, a real dispatch would" >&2
+    if [ -n "$host" ]; then
+      echo "ocm-run: --check: nothing is listening on the dial port 127.0.0.1:$port (OCM_REMOTE_PORT=$remote on $host); --check opens no forward, a real dispatch would" >&2
+    else
+      echo "ocm-run: --check: nothing is listening on the dial port 127.0.0.1:$port (OCM_REMOTE_PORT=$remote) and OCM_HOST is not set; start the server on this host, a real dispatch opens no forward and exits 2" >&2
+    fi
     exit 1
   fi
   if [ -z "$host" ]; then

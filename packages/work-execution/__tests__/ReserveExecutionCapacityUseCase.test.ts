@@ -56,9 +56,10 @@ class InMemoryJournal implements ExecutionJournalPort {
         existingReservationId: duplicate.id,
       };
     }
-    const heldOnHost = held.filter((r) => r.hostId === request.record.hostId);
-    if (heldOnHost.length >= request.maxSlots) {
-      return { outcome: 'no-free-slot', heldCount: heldOnHost.length, maxSlots: request.maxSlots };
+    const heldOnHost = held.filter((r) => r.hostId === request.record?.hostId);
+    const maxSlots = request.maxSlots ?? 0;
+    if (heldOnHost.length >= maxSlots) {
+      return { outcome: 'no-free-slot', heldCount: heldOnHost.length, maxSlots };
     }
     const usedSlots = new Set(heldOnHost.map((r) => r.slotIndex));
     let slotIndex = 0;

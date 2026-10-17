@@ -94,11 +94,61 @@ describe("v2 CLI host selection (H3b)", () => {
     );
     expect(code).toBe(2);
     expect(stderr.join("")).toContain(
-      "'hostId' is not accepted for a v2 installation; the host comes from the installation's hosts entry",
+      "'hostId' is not accepted for a v2 installation",
     );
   });
 
-  it("records the installation lane-runner host name when the operator passes none", async () => {
+  it("refuses an operator maxSlots for capacity reserve with a usage error (H9a2)", async () => {
+    compose();
+    const { io, stderr } = mockIo();
+    const code = await runCli(
+      [
+        "capacity",
+        "reserve",
+        "--json",
+        JSON.stringify({
+          reservationId: "res-v2-maxslots",
+          attemptId: "attempt-v2-maxslots",
+          workOrderId: "wo-v2-maxslots",
+          maxSlots: 2,
+          seatTool: "opencode",
+        }),
+      ],
+      io,
+      runtime,
+    );
+    expect(code).toBe(2);
+    expect(stderr.join("")).toContain(
+      "'maxSlots' is not accepted for a v2 installation",
+    );
+  });
+
+  it("refuses an operator worktreePath for capacity reserve with a usage error (H9a2)", async () => {
+    compose();
+    const { io, stderr } = mockIo();
+    const code = await runCli(
+      [
+        "capacity",
+        "reserve",
+        "--json",
+        JSON.stringify({
+          reservationId: "res-v2-wtp",
+          attemptId: "attempt-v2-wtp",
+          workOrderId: "wo-v2-wtp",
+          worktreePath: stateDir,
+          seatTool: "opencode",
+        }),
+      ],
+      io,
+      runtime,
+    );
+    expect(code).toBe(2);
+    expect(stderr.join("")).toContain(
+      "'worktreePath' is not accepted for a v2 installation",
+    );
+  });
+
+  it("reserves through the installation's lane-runner hosts: the chosen host and digest path are recorded (H9a2)", async () => {
     compose();
     const { io, stdout } = mockIo();
     const code = await runCli(
@@ -110,7 +160,6 @@ describe("v2 CLI host selection (H3b)", () => {
           reservationId: "res-v2-2",
           attemptId: "attempt-v2-2",
           workOrderId: "wo-v2-2",
-          worktreePath: stateDir,
           seatTool: "opencode",
         }),
       ],
@@ -120,10 +169,18 @@ describe("v2 CLI host selection (H3b)", () => {
     expect(code).toBe(0);
     const result = JSON.parse(stdout.join("")) as {
       outcome: string;
-      reservation: { hostId: string };
+      chosenHost: string;
+      worktreePath: string;
+      reservation: { hostId: string; hostName: string; worktreePath: string };
     };
     expect(result.outcome).toBe("reserved");
+    expect(result.chosenHost).toBe("here");
+    expect(result.worktreePath).toBe(result.reservation.worktreePath);
     expect(result.reservation.hostId).toBe("here");
+    expect(result.reservation.hostName).toBe("here");
+    // The path is the attempt digest under the host's worktree root; no
+    // caller text appears in it.
+    expect(result.worktreePath).toMatch(/^\/srv\/fleet\/worktrees\/[0-9a-f]{32}$/);
   });
 
   it("refuses an operator hostId for evidence request-verification with a usage error", async () => {

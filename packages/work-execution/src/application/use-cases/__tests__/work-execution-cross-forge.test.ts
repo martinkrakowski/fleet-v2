@@ -199,7 +199,7 @@ class InMemoryJournal implements ExecutionJournalPort {
   }
 
   async reserveCapacityAtomically(request: ReserveCapacityAtomicallyRequest) {
-    const reservation: CapacityReservationRecord = { ...request.record, slotIndex: 0 };
+    const reservation: CapacityReservationRecord = { ...request.record!, slotIndex: 0 };
     return { outcome: 'reserved' as const, reservation };
   }
 }

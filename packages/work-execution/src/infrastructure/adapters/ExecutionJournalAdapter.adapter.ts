@@ -19,9 +19,11 @@ import type {
 } from '../../domain/execution-records.js';
 import { parseSeatTool } from '../../domain/execution-records.js';
 import type {
+  CapacityReservationClaim,
   ExecutionJournalPort,
   ReserveCapacityAtomicallyRequest,
   ReserveCapacityAtomicallyResult,
+  SelectRecordUnderLockVerdict,
 } from '../../application/ports/out/ExecutionJournalPort.out-port.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
 
@@ -50,32 +52,36 @@ function isNonEmptyStringField(value: unknown): value is string {
  * One locked read-modify-write decision over the freshly read held
  * reservations: a claim by an attempt that already holds one is refused, a
  * claim over the host's budget is refused, and only a passing claim is
- * assigned the lowest free slot index. Nothing is ever superseded.
+ * assigned the lowest free slot index. Nothing is ever superseded. The claim
+ * and its host's budget are either the request's own (legacy) or the ones an
+ * in-lock `selectRecord` chose (H9a2).
  */
 function arbitrateReservation(
-  request: ReserveCapacityAtomicallyRequest,
+  attemptId: string,
+  claim: CapacityReservationClaim,
+  maxSlots: number,
   held: readonly CapacityReservationRecord[],
 ): ReserveCapacityAtomicallyResult {
-  const duplicate = held.find((reservation) => reservation.attemptId === request.attemptId);
+  const duplicate = held.find((reservation) => reservation.attemptId === attemptId);
   if (duplicate !== undefined) {
     return {
       outcome: 'duplicate-attempt',
-      attemptId: request.attemptId,
+      attemptId,
       existingReservationId: duplicate.id,
     };
   }
   const heldOnHost = held.filter(
-    (reservation) => reservation.hostId === request.record.hostId,
+    (reservation) => reservation.hostId === claim.hostId,
   );
-  if (heldOnHost.length >= request.maxSlots) {
-    return { outcome: 'no-free-slot', heldCount: heldOnHost.length, maxSlots: request.maxSlots };
+  if (heldOnHost.length >= maxSlots) {
+    return { outcome: 'no-free-slot', heldCount: heldOnHost.length, maxSlots };
   }
   const usedSlots = new Set(heldOnHost.map((reservation) => reservation.slotIndex));
   let slotIndex = 0;
   while (usedSlots.has(slotIndex)) {
     slotIndex += 1;
   }
-  return { outcome: 'reserved', reservation: { ...request.record, slotIndex } };
+  return { outcome: 'reserved', reservation: { ...claim, slotIndex } };
 }
 
 export class ExecutionJournalAdapter implements ExecutionJournalPort {
@@ -156,6 +162,26 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
         : null;
     };
 
+    /**
+     * In-lock record selection (H9a2): without a selector the request's own
+     * claim and budget arbitrate; with one, the selector decides under the
+     * lock on the freshly read held reservations. A `no-capacity` or refused
+     * verdict ends the claim without writing.
+     */
+    const selectUnderLock = async (
+      held: readonly CapacityReservationRecord[],
+    ): Promise<SelectRecordUnderLockVerdict> => {
+      if (request.selectRecord === undefined) {
+        if (request.record === undefined || request.maxSlots === undefined) {
+          throw new Error(
+            'reserveCapacityAtomically requires record and maxSlots when selectRecord is not supplied',
+          );
+        }
+        return { outcome: 'selected', record: request.record, maxSlots: request.maxSlots };
+      }
+      return await request.selectRecord(held);
+    };
+
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
       // In-memory branch: the busy-worktree verdict is re-run whenever the
@@ -167,6 +193,10 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
         const held = [...this.inMemoryReservationsById.values()].filter(
           (reservation) => reservation.held === true,
         );
+        const chosen = await selectUnderLock(held);
+        if (chosen.outcome !== 'selected') {
+          return chosen;
+        }
         const busy = await busyUnderLock(held);
         if (busy !== null) {
           return busy;
@@ -175,13 +205,18 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
           (reservation) => reservation.held === true,
         );
         if (
-          request.checkBusyWorktree !== undefined &&
+          (request.checkBusyWorktree !== undefined || request.selectRecord !== undefined) &&
           (fresh.length !== held.length ||
             fresh.some((reservation) => !held.includes(reservation)))
         ) {
           continue;
         }
-        const result = arbitrateReservation(request, fresh);
+        const result = arbitrateReservation(
+          request.attemptId,
+          chosen.record,
+          chosen.maxSlots,
+          fresh,
+        );
         if (result.outcome === 'reserved') {
           this.inMemoryReservationsById.set(result.reservation.id, result.reservation);
         }
@@ -197,11 +232,15 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       const held = [...reservations.values()].filter(
         (reservation) => reservation.held === true,
       );
+      const chosen = await selectUnderLock(held);
+      if (chosen.outcome !== 'selected') {
+        return chosen;
+      }
       const busy = await busyUnderLock(held);
       if (busy !== null) {
         return busy;
       }
-      const result = arbitrateReservation(request, held);
+      const result = arbitrateReservation(request.attemptId, chosen.record, chosen.maxSlots, held);
       if (result.outcome === 'reserved') {
         reservations.set(result.reservation.id, result.reservation);
         await writeJsonAtomically(target, [...reservations.values()]);
@@ -321,6 +360,9 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
             item.port > 0
               ? item.port
               : null,
+          // The claimed worktree path (H9a2) reads the same way: absent or
+          // malformed values read as `null`.
+          worktreePath: isNonEmptyStringField(item.worktreePath) ? item.worktreePath : null,
         });
       }
     }

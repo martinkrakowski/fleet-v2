@@ -125,16 +125,17 @@ function makeJournal(): ExecutionJournalPort & {
           existingReservationId: duplicate.id,
         };
       }
-      const heldOnHost = held.filter((reservation) => reservation.hostId === request.record.hostId);
-      if (heldOnHost.length >= request.maxSlots) {
-        return { outcome: 'no-free-slot', heldCount: heldOnHost.length, maxSlots: request.maxSlots };
+      const heldOnHost = held.filter((reservation) => reservation.hostId === request.record?.hostId);
+      const maxSlots = request.maxSlots ?? 0;
+      if (heldOnHost.length >= maxSlots) {
+        return { outcome: 'no-free-slot', heldCount: heldOnHost.length, maxSlots };
       }
       const usedSlots = new Set(heldOnHost.map((reservation) => reservation.slotIndex));
       let slotIndex = 0;
       while (usedSlots.has(slotIndex)) {
         slotIndex += 1;
       }
-      const reservation: CapacityReservationRecord = { ...request.record, slotIndex };
+      const reservation: CapacityReservationRecord = { ...request.record!, slotIndex };
       reservations.set(reservation.id, reservation);
       return { outcome: 'reserved', reservation };
     },
@@ -536,6 +537,7 @@ describe('ReserveExecutionCapacityUseCase', () => {
         transport: null,
         sshAlias: null,
         port: null,
+        worktreePath: '/lanes/attempt-9',
         reservedAtIso: '2026-10-15T08:00:00.000Z',
         releasedAtIso: null,
       },

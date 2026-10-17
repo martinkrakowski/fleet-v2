@@ -23,6 +23,13 @@ export interface DispatchAttemptRequest {
   readonly nowIso?: string;
   readonly seatOverride?: AttemptSeatOverrideRecord;
   readonly reviewerSeat?: string;
+  /**
+   * The installation schema version the dispatching root runs under (H9a2).
+   * A v2 installation never defaults the seat tool: a frozen manifest whose
+   * model assignment carries no `seatTool` refuses. A v1 or absent
+   * installation keeps the legacy opencode default.
+   */
+  readonly installationSchemaVersion?: number;
 }
 
 export type DispatchAttemptResult =

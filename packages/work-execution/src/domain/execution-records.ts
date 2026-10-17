@@ -151,6 +151,12 @@ export interface CapacityReservationRecord {
   readonly transport?: 'local' | 'ssh' | null;
   readonly sshAlias?: string | null;
   readonly port?: number | null;
+  /**
+   * The worktree path the reservation claims (H9a2). Records persisted
+   * before the field existed read with `null`; a `null` path never blocks a
+   * busy-worktree check.
+   */
+  readonly worktreePath?: string | null;
   readonly reservedAtIso: string;
   readonly releasedAtIso: string | null;
 }

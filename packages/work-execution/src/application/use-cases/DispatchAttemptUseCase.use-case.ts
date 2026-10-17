@@ -304,6 +304,15 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           reason: `Frozen brief manifest model assignment declares an unknown seat tool: ${JSON.stringify(rawSeatTool)}`,
         };
       }
+      // H9a2: a v2 installation never defaults the seat tool. A manifest
+      // whose model assignment predates the field refuses with a named
+      // reason; v1 and absent installations keep the legacy opencode seat.
+      if (manifestSeatTool === undefined && request.installationSchemaVersion === 2) {
+        return {
+          outcome: 'refused',
+          reason: 'Frozen brief manifest model assignment declares no seat tool; a v2 installation never defaults to opencode',
+        };
+      }
       const seatTool = manifestSeatTool ?? 'opencode';
       const selection = this.deps.runnerSelector.selectRunner({ seatTool });
       if (!selection.ok) {

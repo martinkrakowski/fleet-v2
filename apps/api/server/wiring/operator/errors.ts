@@ -29,6 +29,16 @@ export function mapOperatorError(error: unknown): ApiErrorMapping | null {
   return { status: 501, code: "NOT_IMPLEMENTED" };
 }
 
+/** A use case refused the request on its own terms: a client error, not a fault. */
+export function refusedEnvelope(operationId: string, reason: string): OperatorErrorResponse {
+  return { statusCode: 422, body: { operationId, code: "REFUSED", result: { reason } } };
+}
+
+/** Known absence: the named aggregate does not exist. */
+export function notFoundEnvelope(operationId: string): OperatorErrorResponse {
+  return { statusCode: 404, body: { operationId, code: "NOT_FOUND", result: null } };
+}
+
 export function errorEnvelope(operationId: string, error: unknown): OperatorErrorResponse {
   if (error instanceof Error && error.message.startsWith("Not implemented:")) {
     return { statusCode: 501, body: { operationId, code: "NOT_IMPLEMENTED", result: null } };

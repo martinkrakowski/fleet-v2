@@ -388,7 +388,7 @@ bounded_contexts:
             - ExecutionObservationPort
             - RunnerSelectorPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, LocalExecutor, SshExecutor]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, LocalExecutor, SshExecutor]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -425,6 +425,7 @@ bounded_contexts:
       - { adapter: ExecutionJournalAdapter, implements: ExecutionJournalPort, integration: local-transactional-journal-and-capacity-arbitration }
       - { adapter: BriefAuthoringAdapter, implements: BriefAuthoringPort, integration: reviewed-harness-or-hand-written-file }
       - { adapter: ExecutionRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-ocm-run-subprocess }
+      - { adapter: AgyRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-agy-run-subprocess-behind-runner-mode }
       - { adapter: RunnerSelectorAdapter, implements: RunnerSelectorPort, integration: installation-host-structural-selection }
       - { adapter: LocalExecutor, implements: CommandExecutorPort, integration: local-execfile-argv-no-shell }
       - { adapter: SshExecutor, implements: CommandExecutorPort, integration: batch-mode-ssh-quoted-argv }

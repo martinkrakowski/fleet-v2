@@ -3,9 +3,11 @@
  * RunnerSelectorAdapter implements RunnerSelectorPort: pick the runner kind
  * and host for an attempt's seat from an installation's lane-runner hosts.
  * The installation's runner model is a union on `kind`; the selector narrows
- * on it against the seat's tool. Only `opencode` has an implemented adapter
- * in this lane, so an `agy` selection is refused with
- * `runner-not-available` and dispatch refuses before any spawn.
+ * on it against the seat's tool. A kind selects only when an adapter for it
+ * was provided to the selector, so an `agy` selection is refused with
+ * `runner-not-available` — and dispatch refuses before any spawn — until the
+ * roots hand over the `agy` adapter (lane O14c2 implemented the adapter;
+ * O14e1 wires it).
  *
  * The input is a structural subset of `@fleet/installation`'s derived model,
  * so this module keeps work-execution free of a dependency on that package.
@@ -17,6 +19,7 @@ import type {
   RunnerSelectorPort,
   SelectRunnerRequest,
 } from '../../application/ports/out/RunnerSelectorPort.out-port.js';
+import type { RunnerKind } from '../../domain/execution-records.js';
 
 export type { RunnerSelectorLaneRunnerHost };
 
@@ -28,6 +31,13 @@ export interface RunnerSelectorAdapterOptions {
    * any other tool is refused.
    */
   readonly hosts?: Readonly<Record<string, RunnerSelectorLaneRunnerHost>>;
+  /**
+   * The runner kinds this composition root has an adapter for. Absent is
+   * `['opencode']` — today's behaviour: an `agy` seat is refused as
+   * `runner-not-available` rather than selected for an adapter that does not
+   * exist. An explicit empty list refuses every kind.
+   */
+  readonly implementedRunnerKinds?: readonly RunnerKind[];
 }
 
 /** First host whose roles include `role`, or undefined. */
@@ -64,10 +74,22 @@ export class RunnerSelectorAdapter implements RunnerSelectorPort {
     if (runnerKind !== tool) {
       return { ok: false, reason: 'runner-not-available' };
     }
-    if (runnerKind === 'agy') {
-      // Only opencode has an implemented adapter in this lane; an agy
-      // selection refuses and dispatch never spawns.
+    const implemented = this.options?.implementedRunnerKinds ?? ['opencode'];
+    if (!implemented.includes(runnerKind)) {
+      // The host declares the kind but no adapter was provided for it: the
+      // seat is refused, never retried as another kind.
       return { ok: false, reason: 'runner-not-available' };
+    }
+    if (runnerKind === 'agy') {
+      // agy runs no tunnel port, so the selection carries a null one.
+      return {
+        ok: true,
+        kind: 'agy',
+        hostName: laneRunnerHost.name,
+        ...(laneRunnerHost.host.transport !== undefined ? { transport: laneRunnerHost.host.transport } : {}),
+        ...(laneRunnerHost.host.sshAlias !== undefined ? { sshAlias: laneRunnerHost.host.sshAlias } : {}),
+        remotePort: null,
+      };
     }
     return {
       ok: true,

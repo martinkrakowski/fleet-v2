@@ -62,6 +62,18 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
     // legacy budget check applies only when no candidates are given (H9a2):
     // with candidates the budget is each chosen host's `maxLanes`.
     const candidatesGiven = request.candidateHosts !== undefined && request.candidateHosts !== null;
+    // The id fields are required on BOTH paths (H9a fix, review): a request
+    // without a reservation id or attempt id must refuse, not skip into the
+    // candidates path where those ids are still written into the record.
+    // `hostId`/`worktreePath` stay legacy-path-only: with candidates the host
+    // and path are chosen in-lock instead.
+    const requiredFields: readonly (keyof ReserveExecutionCapacityRequest)[] = candidatesGiven
+      ? ['reservationId', 'attemptId']
+      : ['reservationId', 'attemptId', 'hostId', 'worktreePath'];
+    const missingFields = requiredFields.filter((field) => !isNonEmpty(request[field]));
+    if (missingFields.length > 0) {
+      return { outcome: 'refused', reason: `Missing required reservation fields: ${missingFields.join(', ')}` };
+    }
     if (!candidatesGiven) {
       if (
         typeof request.maxSlots !== 'number' ||
@@ -72,16 +84,6 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
       }
       if (!Number.isInteger(request.maxSlots)) {
         return { outcome: 'refused', reason: 'maxSlots must be a positive integer' };
-      }
-      const requiredFields: readonly (keyof ReserveExecutionCapacityRequest)[] = [
-        'reservationId',
-        'attemptId',
-        'hostId',
-        'worktreePath',
-      ];
-      const missingFields = requiredFields.filter((field) => !isNonEmpty(request[field]));
-      if (missingFields.length > 0) {
-        return { outcome: 'refused', reason: `Missing required reservation fields: ${missingFields.join(', ')}` };
       }
     }
 

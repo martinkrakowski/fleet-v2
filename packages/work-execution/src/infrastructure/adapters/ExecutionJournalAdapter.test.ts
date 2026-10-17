@@ -449,4 +449,52 @@ describe('ExecutionJournalAdapter in-memory atomic capacity arbitration', () => 
     expect(refused).toHaveLength(1);
     expect(await adapter.listActiveReservations('host-1')).toHaveLength(1);
   });
+
+  // H9a fix (review): with the in-lock `selectRecord` the same exclusion must
+  // hold — two concurrent reserves fighting for the last slot on a host yield
+  // exactly one `reserved`, never two reservations on a one-slot host.
+  it('gives exactly one reserved when two concurrent selectRecord claims race for the last slot', async () => {
+    const adapter = new ExecutionJournalAdapter({});
+    const makeSelectClaim = (overrides: { id?: string; attemptId?: string } = {}) => {
+      const attemptId = overrides.attemptId ?? 'att-mem-select';
+      const request: ReserveCapacityAtomicallyRequest = {
+        attemptId,
+        selectRecord: async (held) => {
+          const heldOnHost = held.filter((reservation) => reservation.held && (reservation.hostName ?? reservation.hostId) === 'host-solo');
+          if (heldOnHost.length >= 1) {
+            return { outcome: 'no-capacity' as const };
+          }
+          return {
+            outcome: 'selected' as const,
+            maxSlots: 1,
+            record: {
+              id: overrides.id ?? 'res-mem-select',
+              attemptId,
+              hostId: 'host-solo',
+              hostName: 'host-solo',
+              hostKind: 'opencode' as const,
+              transport: 'local' as const,
+              sshAlias: null,
+              port: null,
+              worktreePath: `/srv/worktrees/${attemptId}`,
+              seatTool: 'opencode' as const,
+              held: true,
+              reservedAtIso: '2026-10-15T11:00:00.000Z',
+              releasedAtIso: null,
+            },
+          };
+        },
+      };
+      return request;
+    };
+    const results = await Promise.all([
+      adapter.reserveCapacityAtomically(makeSelectClaim({ id: 'res-sel-a', attemptId: 'att-sel-a' })),
+      adapter.reserveCapacityAtomically(makeSelectClaim({ id: 'res-sel-b', attemptId: 'att-sel-b' })),
+    ]);
+    const outcomes = results.map((result) => result.outcome).sort();
+    expect(outcomes).toEqual(['no-capacity', 'reserved']);
+    expect(
+      (await adapter.listActiveReservations('host-solo')).map((reservation) => reservation.id).sort(),
+    ).toHaveLength(1);
+  });
 });

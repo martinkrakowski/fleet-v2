@@ -149,8 +149,25 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     }
 
     const activeReservations = await this.deps.journal.listActiveReservations();
-    if (!activeReservations.some((reservation) => reservation.attemptId === request.attemptId && reservation.held)) {
+    const heldReservation = activeReservations.find(
+      (reservation) => reservation.attemptId === request.attemptId && reservation.held,
+    );
+    if (!heldReservation) {
       return { outcome: 'refused', reason: 'No active capacity reservation for attempt' };
+    }
+
+    // H9a fix (review): a reservation recorded for another host must never
+    // dispatch here. The runner's own host name comes from the installation
+    // (v2); it is null for v1 or absent installations, so legacy and pre-H9a
+    // records with a null hostName pass through untouched. This refuses
+    // before any start call and before any journal write.
+    const runnerHostName = this.deps.runner.describeRunner?.()?.hostName ?? null;
+    const reservationHostName = heldReservation.hostName ?? null;
+    if (reservationHostName !== null && reservationHostName !== runnerHostName) {
+      return {
+        outcome: 'refused',
+        reason: `Reservation host ${reservationHostName} is not the configured runner host ${runnerHostName}; several lane-runner hosts need H9b/H10`,
+      };
     }
 
     const runnerCapabilities = this.deps.runner.describeCapabilities();

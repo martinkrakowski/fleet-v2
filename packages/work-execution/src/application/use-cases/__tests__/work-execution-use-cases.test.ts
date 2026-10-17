@@ -1331,6 +1331,75 @@ describe('DispatchAttemptUseCase', () => {
     expect(setup.journal.entries).toHaveLength(0);
   });
 
+  it('refuses a reservation held on another host before any start call (H9a fix)', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        describeRunner: () => ({
+          kind: 'opencode',
+          remotePort: 4166,
+          host: null,
+          hostName: 'host-a',
+          agent: null,
+          model: null,
+          variant: null,
+        }),
+      },
+    });
+    setup.journal.reservations.set(
+      'res-1',
+      storedReservation({ id: 'res-1', attemptId: 'attempt-1', hostName: 'host-b' }),
+    );
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Reservation host host-b is not the configured runner host host-a; several lane-runner hosts need H9b/H10',
+    });
+    expect(setup.runner.startCalls).toHaveLength(0);
+    expect(setup.journal.entries).toHaveLength(0);
+  });
+
+  it('dispatches a reservation held on the configured runner host', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        describeRunner: () => ({
+          kind: 'opencode',
+          remotePort: 4166,
+          host: null,
+          hostName: 'host-a',
+          agent: null,
+          model: null,
+          variant: null,
+        }),
+      },
+    });
+    setup.journal.reservations.set(
+      'res-1',
+      storedReservation({ id: 'res-1', attemptId: 'attempt-1', hostName: 'host-a' }),
+    );
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('started');
+    expect(setup.runner.startCalls).toHaveLength(1);
+  });
+
+  it('dispatches a legacy reservation with a null host name as before', async () => {
+    const setup = makeDispatchSetup();
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('started');
+    expect(setup.runner.startCalls).toHaveLength(1);
+  });
+
   it('refuses dispatch when runner capabilities do not satisfy required isolation', async () => {
     const scopedRunner = makeDispatchSetup({
       runnerOptions: { capabilities: { filesystemScope: 'inherited-directory' } },

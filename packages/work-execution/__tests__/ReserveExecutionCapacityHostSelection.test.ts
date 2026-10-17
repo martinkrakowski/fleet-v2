@@ -403,6 +403,34 @@ describe("ReserveExecutionCapacityUseCase candidate hosts (H9a2)", () => {
     expect(result.reservation.hostName).toBeNull();
     expect(result.reservation.worktreePath).toBe("/legacy/path");
   });
+
+  // H9a fix (review): the id fields are required on the candidates path too;
+  // the check must not be wrapped in the legacy-path branch.
+  it("refuses candidates with an empty attempt id and an empty reservation id", async () => {
+    const useCase = makeUseCase();
+    const emptyAttemptId = await useCase.reserveExecutionCapacity(
+      reserveRequest({
+        reservationId: "res-x",
+        attemptId: "   ",
+        candidates: [candidate({ name: "alpha" })],
+      }),
+    );
+    expect(emptyAttemptId).toEqual({
+      outcome: "refused",
+      reason: "Missing required reservation fields: attemptId",
+    });
+    const emptyReservationId = await useCase.reserveExecutionCapacity(
+      reserveRequest({
+        reservationId: "",
+        attemptId: "att-x",
+        candidates: [candidate({ name: "alpha" })],
+      }),
+    );
+    expect(emptyReservationId).toEqual({
+      outcome: "refused",
+      reason: "Missing required reservation fields: reservationId",
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -968,6 +968,17 @@ describe('PrepareBriefPackageUseCase', () => {
       expect(invalid.outcome).toBe('rejected');
       expect((invalid as { reason: string }).reason).toContain('allowedPathPrefixes');
     }
+
+    // Untyped input from the CLI or the API (review of #129).
+    for (const notAnArray of ['x', { 0: 'x' }, ['x', 7]]) {
+      const shaped = await useCase.prepareBriefPackage(
+        validBriefRequest({ allowedPathPrefixes: notAnArray as unknown as string[] }),
+      );
+      expect(shaped).toEqual({
+        outcome: 'rejected',
+        reason: 'allowedPathPrefixes must be an array of strings',
+      });
+    }
   });
 
   it('freezes allowedPathPrefixes into the manifest, where the digest covers it (O14d1)', async () => {

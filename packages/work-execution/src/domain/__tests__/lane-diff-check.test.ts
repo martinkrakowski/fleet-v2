@@ -252,6 +252,32 @@ describe("checkLaneDiff (allowed prefixes)", () => {
     expect(verdict).toEqual({ ok: true, findings: [] });
   });
 
+  it("lifting a protected directory does not lift the protected files inside it (review of #129)", () => {
+    const paths = [
+      "scripts/package.json",
+      "scripts/yarn.lock",
+      "scripts/.gitattributes",
+      "scripts/.gitmodules",
+    ];
+    const verdict = checkLaneDiff({
+      changedPaths: [
+        ...paths.map((path) => ({ path, status: "modified" as const })),
+        { path: "scripts/tool.sh", status: "modified" },
+      ],
+      allowedPathPrefixes: ["scripts"],
+      secretPatterns: SCRIPT_PATTERNS,
+    });
+    expect(verdict.findings).toEqual(
+      paths.map((path) => ({ path, rule: "protected-path" })),
+    );
+    const exact = checkLaneDiff({
+      changedPaths: [{ path: "scripts/package.json", status: "modified" }],
+      allowedPathPrefixes: ["scripts", "scripts/package.json"],
+      secretPatterns: SCRIPT_PATTERNS,
+    });
+    expect(exact).toEqual({ ok: true, findings: [] });
+  });
+
   it("an absent or empty prefixes list refuses every path (fail closed)", () => {
     for (const allowedPathPrefixes of [[], undefined]) {
       const verdict = checkLaneDiff({

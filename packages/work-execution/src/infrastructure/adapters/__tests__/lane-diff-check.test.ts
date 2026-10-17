@@ -4,7 +4,7 @@
 // credential is assembled at run time from harmless parts.
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -454,16 +454,18 @@ describe("LaneDiffCheckAdapter", () => {
       async run(argv: readonly string[]) {
         if (argv[0] === "git") gitArgvs.push([...argv]);
         if (argv[0] === "cat") catArgvs.push([...argv]);
-        const out = execFileSync(argv[0], argv.slice(1), {
-          cwd: tmpdir(),
-          encoding: "utf8",
-        });
-        return {
-          exitCode: 0,
-          signal: null,
-          stdout: out,
-          stderr: "",
-        };
+        try {
+          const out = execFileSync(argv[0], argv.slice(1), {
+            cwd: tmpdir(),
+            encoding: "utf8",
+          });
+          return { exitCode: 0, signal: null, stdout: out, stderr: "" };
+        } catch (error) {
+          // A non-zero exit is an answer (`test -L` on a regular file), not
+          // a transport error, exactly as the real executors report it.
+          const status = (error as { status?: number }).status ?? 1;
+          return { exitCode: status, signal: null, stdout: "", stderr: "" };
+        }
       },
     };
     const obliviousAdapter = new LaneDiffCheckAdapter(oblivious);
@@ -492,6 +494,61 @@ describe("LaneDiffCheckAdapter", () => {
       expect(argv[2]).toMatch(/^\//);
     }
   });
+
+  it("an untracked symbolic link is scanned as its target text, never the target's contents (review of #129)", async () => {
+    const repo = makeRepo();
+    const outside = mkdtempSync(join(tmpdir(), "lane-diff-outside-"));
+    try {
+      writeFileSync(join(outside, "secret.txt"), `const t = "${tok}";\n`);
+      symlinkSync(
+        join(outside, "secret.txt"),
+        join(repo, "packages/x/src/link.ts"),
+      );
+      const result = await adapter.checkLaneDiff({
+        worktreePath: repo,
+        baseCommit: base(repo),
+        allowedPathPrefixes: PREFIXES,
+      });
+      expect(result.outcome).toBe("clean");
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("a link whose target text is secret-shaped is still found (review of #129)", async () => {
+    const repo = makeRepo();
+    symlinkSync(`/tmp/${tok}`, join(repo, "packages/x/src/link.ts"));
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: base(repo),
+      allowedPathPrefixes: PREFIXES,
+    });
+    if (result.outcome !== "findings")
+      throw new Error(`expected findings, got ${result.outcome}`);
+    expect(result.findings).toEqual([
+      {
+        path: "packages/x/src/link.ts",
+        line: 1,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+  });
+
+  it("a link to a FIFO is read as link text and never blocks on the pipe (review of #129)", async () => {
+    // git lists no bare FIFO as a change, but it does list a link to one;
+    // `cat` would wait on the pipe until the executor's timeout.
+    const repo = makeRepo();
+    const fifo = join(repo, "pipe");
+    execFileSync("mkfifo", [fifo]);
+    writeFileSync(join(repo, ".git/info/exclude"), "pipe\n");
+    symlinkSync(fifo, join(repo, "packages/x/src/pipe.ts"));
+    const result = await adapter.checkLaneDiff({
+      worktreePath: repo,
+      baseCommit: base(repo),
+      allowedPathPrefixes: PREFIXES,
+    });
+    expect(result.outcome).toBe("clean");
+  }, 10_000);
 
   it("a repository-local clean filter cannot hide a staged secret (O14d1 R3)", async () => {
     const repo = makeRepo();

@@ -243,8 +243,40 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
         // absolute path: the executor may ignore `cwd`, so `cat --` gets
         // `<worktreePath>/<path>` rather than relying on the working
         // directory (`cwd` is kept; it is harmless locally).
+        // `cat` follows symbolic links, so a link to a FIFO could stall the
+        // check and a link to another file would scan the target instead of
+        // what git commits for a link (its target text). A link is read
+        // with `readlink`; any other path must be a regular file, or the
+        // check fails closed.
+        const absolutePath = join(request.worktreePath, entry.path);
+        const isLink = await this.commandExecutor.run(
+          ["test", "-L", absolutePath],
+          { cwd: request.worktreePath },
+        );
+        if (isLink.error !== undefined) {
+          return {
+            outcome: "error",
+            reason:
+              "lane diff check: could not inspect a changed file's worktree path",
+          };
+        }
+        if (isLink.exitCode !== 0) {
+          const isFile = await this.commandExecutor.run(
+            ["test", "-f", absolutePath],
+            { cwd: request.worktreePath },
+          );
+          if (isFile.error !== undefined || isFile.exitCode !== 0) {
+            return {
+              outcome: "error",
+              reason:
+                "lane diff check: a changed worktree path is not a regular file or a symbolic link",
+            };
+          }
+        }
         const worktree = await this.commandExecutor.run(
-          ["cat", "--", join(request.worktreePath, entry.path)],
+          isLink.exitCode === 0
+            ? ["readlink", "--", absolutePath]
+            : ["cat", "--", absolutePath],
           {
             cwd: request.worktreePath,
             maxBufferBytes: MAX_SCAN_BUFFER_BYTES,

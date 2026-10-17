@@ -108,6 +108,18 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     // an agy seat, optional for opencode; every entry must be a non-empty
     // relative path that never names `.git` or `.lane`.
     const allowedPathPrefixes = request.allowedPathPrefixes ?? [];
+    // `execute` takes untyped input from the CLI and the API: a string here
+    // would pass the length and per-character checks and be frozen into the
+    // manifest as a string, so the shape is checked first.
+    if (
+      !Array.isArray(allowedPathPrefixes) ||
+      !allowedPathPrefixes.every((prefix) => typeof prefix === 'string')
+    ) {
+      return {
+        outcome: 'rejected',
+        reason: 'allowedPathPrefixes must be an array of strings',
+      };
+    }
     if (request.modelAssignment.seatTool === 'agy' && allowedPathPrefixes.length === 0) {
       return {
         outcome: 'rejected',

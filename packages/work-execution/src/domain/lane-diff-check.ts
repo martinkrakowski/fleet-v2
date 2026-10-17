@@ -121,17 +121,23 @@ export function pathUnderPrefix(path: string, prefix: string): boolean {
  * contents are exempt only when a prefix names that directory itself
  * (`.github`, `.lane`, …). A prefixes list that never mentions them keeps
  * them protected — a broad prefix like `packages/x` never lifts the rule.
+ * A protected file (lockfile, `package.json`, `.gitattributes`,
+ * `.gitmodules`) inside a lifted directory stays protected unless a prefix
+ * names it exactly: lifting `scripts` does not lift `scripts/package.json`.
  */
 function prefixExplicitlyAllowsProtected(
   path: string,
   prefixes: readonly string[],
 ): boolean {
   const top = path.split("/")[0];
+  const isProtectedFile = FIXED_PROTECTED_FILES.includes(basename(path));
   return prefixes.some((prefix) => {
     const normalized = normalizePrefix(prefix);
     return (
       normalized === path ||
-      (FIXED_PROTECTED_PREFIXES.includes(top) && normalized === top)
+      (!isProtectedFile &&
+        FIXED_PROTECTED_PREFIXES.includes(top) &&
+        normalized === top)
     );
   });
 }
@@ -166,21 +172,24 @@ function secretFindings(
   patterns: readonly LaneDiffSecretPattern[],
 ): LaneDiffFinding[] {
   const findings: LaneDiffFinding[] = [];
+  // Copy each pattern once without the `g`/`y` flags: a supplied regex
+  // carrying `g` keeps `lastIndex` across `.test()` calls and would silently
+  // skip lines, and `y` anchors at lastIndex. Without them `.test()` keeps
+  // no state, so one copy serves every line.
+  const matchers = patterns.map((pattern) => ({
+    name: pattern.name,
+    matcher: new RegExp(
+      pattern.regex.source,
+      pattern.regex.flags.replace(/[gy]/g, ""),
+    ),
+  }));
   for (const added of changed.addedLines ?? []) {
-    for (const pattern of patterns) {
-      // Copy without the `g`/`y` flags: a supplied regex carrying `g` keeps
-      // `lastIndex` across `.test()` calls and would silently skip lines,
-      // and `y` anchors at lastIndex. The copy is line-local, so no state
-      // survives between lines.
-      const matcher = new RegExp(
-        pattern.regex.source,
-        pattern.regex.flags.replace(/[gy]/g, ""),
-      );
+    for (const { name, matcher } of matchers) {
       if (matcher.test(added.text)) {
         findings.push({
           path: changed.path,
           line: added.line,
-          rule: `secret-pattern:${pattern.name}`,
+          rule: `secret-pattern:${name}`,
         });
       }
     }

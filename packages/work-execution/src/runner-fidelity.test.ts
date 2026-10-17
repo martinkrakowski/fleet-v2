@@ -132,16 +132,17 @@ function createInMemoryJournal(): ExecutionJournalPort & {
           existingReservationId: duplicate.id,
         };
       }
-      const heldOnHost = held.filter((r) => r.hostId === request.record.hostId);
-      if (heldOnHost.length >= request.maxSlots) {
-        return { outcome: 'no-free-slot', heldCount: heldOnHost.length, maxSlots: request.maxSlots };
+      const heldOnHost = held.filter((r) => r.hostId === request.record?.hostId);
+      const maxSlots = request.maxSlots ?? 0;
+      if (heldOnHost.length >= maxSlots) {
+        return { outcome: 'no-free-slot', heldCount: heldOnHost.length, maxSlots };
       }
       const usedSlots = new Set(heldOnHost.map((r) => r.slotIndex));
       let slotIndex = 0;
       while (usedSlots.has(slotIndex)) {
         slotIndex += 1;
       }
-      const reservation: CapacityReservationRecord = { ...request.record, slotIndex };
+      const reservation: CapacityReservationRecord = { ...request.record!, slotIndex };
       reservations.push(reservation);
       return { outcome: 'reserved', reservation };
     },

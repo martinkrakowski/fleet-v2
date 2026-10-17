@@ -140,6 +140,23 @@ export interface CapacityReservationRecord {
    * declared kind.
    */
   readonly seatTool: RunnerKind | null;
+  /**
+   * The lane-runner host the capacity is reserved on (H9a1). Records
+   * persisted before these fields existed are read with all of them
+   * `null`; a `null` hostName is never defaulted to the current
+   * installation's lane-runner host.
+   */
+  readonly hostName?: string | null;
+  readonly hostKind?: RunnerKind | null;
+  readonly transport?: 'local' | 'ssh' | null;
+  readonly sshAlias?: string | null;
+  readonly port?: number | null;
+  /**
+   * The worktree path the reservation claims (H9a2). Records persisted
+   * before the field existed read with `null`; a `null` path never blocks a
+   * busy-worktree check.
+   */
+  readonly worktreePath?: string | null;
   readonly reservedAtIso: string;
   readonly releasedAtIso: string | null;
 }

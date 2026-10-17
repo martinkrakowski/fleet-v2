@@ -96,9 +96,10 @@ A schema version 1 file is converted to v2 on the first write.
   remove <name> [--yes]        remove a host; refuses the orchestrator host,
                                the last lane-runner and a host with live work
 
-Roles: orchestrator, lane-runner, verifier. Until the loader allows several
-lane-runner hosts, adding or editing a host with the lane-runner role moves
-that role from the host that holds it.
+Roles: orchestrator, lane-runner, verifier. hosts add/edit keep one
+lane-runner role: adding or editing a host with the lane-runner role moves that
+role from the host that holds it. Multi-host dispatch lands with H10; until
+then exactly one host runs lanes.
 
 Exit codes: 0 written (or listed), 1 refused — a probe FAIL, a loader
 refusal, a changed or locked file, live work on remove — 2 usage error.

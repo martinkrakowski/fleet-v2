@@ -11,9 +11,10 @@ import type {
   ReserveCapacityAtomicallyResult,
 } from '../src/application/ports/out/ExecutionJournalPort.out-port.js';
 import { ReserveExecutionCapacityUseCase } from '../src/application/use-cases/ReserveExecutionCapacityUseCase.use-case.js';
+import type { ReserveExecutionCapacityRequest } from '../src/application/ports/in/ReserveExecutionCapacityPort.in-port.js';
 
 class InMemoryJournal implements ExecutionJournalPort {
-  private reservations = new Map<string, CapacityReservationRecord>();
+  readonly reservations = new Map<string, CapacityReservationRecord>();
 
   async appendJournalEntry(_entry: ActionJournalEntryRecord): Promise<void> {}
   async listJournalEntriesForAttempt(_attemptId: string): Promise<readonly ActionJournalEntryRecord[]> {
@@ -55,9 +56,10 @@ class InMemoryJournal implements ExecutionJournalPort {
         existingReservationId: duplicate.id,
       };
     }
-    const heldOnHost = held.filter((r) => r.hostId === request.record.hostId);
-    if (heldOnHost.length >= request.maxSlots) {
-      return { outcome: 'no-free-slot', heldCount: heldOnHost.length, maxSlots: request.maxSlots };
+    const heldOnHost = held.filter((r) => r.hostId === request.record?.hostId);
+    const maxSlots = request.maxSlots ?? 0;
+    if (heldOnHost.length >= maxSlots) {
+      return { outcome: 'no-free-slot', heldCount: heldOnHost.length, maxSlots };
     }
     const usedSlots = new Set(heldOnHost.map((r) => r.slotIndex));
     let slotIndex = 0;
@@ -216,5 +218,99 @@ describe('ReserveExecutionCapacityUseCase (Appendix A)', () => {
       seatTool: 'opencode',
     });
     expect(second.outcome).toBe('reserved');
+  });
+
+  // --- H9a1: the reservation records the lane-runner host -----------------
+
+  function baseRequest(
+    overrides: Partial<ReserveExecutionCapacityRequest> = {},
+  ) {
+    return {
+      reservationId: 'res-host',
+      attemptId: 'att-host',
+      workOrderId: 'wo-1',
+      hostId: 'host-1',
+      worktreePath: '/tmp/worktree-1',
+      maxSlots: 2,
+      seatTool: 'opencode' as const,
+      ...overrides,
+    };
+  }
+
+  it('records the host fields on the reservation when a host is given (H9a1)', async () => {
+    const journal = new InMemoryJournal();
+    const attemptRepo = new InMemoryAttemptRepo();
+    const useCase = new ReserveExecutionCapacityUseCase({ journal, attemptRepo });
+
+    const result = await useCase.reserveExecutionCapacity(
+      baseRequest({
+        host: {
+          hostName: 'midnight',
+          hostKind: 'opencode',
+          transport: 'ssh',
+          sshAlias: 'm',
+          port: 4166,
+        },
+      }) as Parameters<ReserveExecutionCapacityUseCase['reserveExecutionCapacity']>[0],
+    );
+    expect(result.outcome).toBe('reserved');
+    if (result.outcome !== 'reserved') throw new Error('expected a reservation');
+    expect(result.reservation.hostName).toBe('midnight');
+    expect(result.reservation.hostKind).toBe('opencode');
+    expect(result.reservation.transport).toBe('ssh');
+    expect(result.reservation.sshAlias).toBe('m');
+    expect(result.reservation.port).toBe(4166);
+    // The claim is also recorded in the journal's durable record.
+    expect(journal.reservations.get('res-host')).toMatchObject({
+      hostName: 'midnight',
+      hostKind: 'opencode',
+      transport: 'ssh',
+      sshAlias: 'm',
+      port: 4166,
+    });
+  });
+
+  it('records null host fields when no host is given (H9a1)', async () => {
+    const journal = new InMemoryJournal();
+    const attemptRepo = new InMemoryAttemptRepo();
+    const useCase = new ReserveExecutionCapacityUseCase({ journal, attemptRepo });
+
+    const result = await useCase.reserveExecutionCapacity(
+      baseRequest() as Parameters<ReserveExecutionCapacityUseCase['reserveExecutionCapacity']>[0],
+    );
+    expect(result.outcome).toBe('reserved');
+    if (result.outcome !== 'reserved') throw new Error('expected a reservation');
+    expect(result.reservation.hostName).toBeNull();
+    expect(result.reservation.hostKind).toBeNull();
+    expect(result.reservation.transport).toBeNull();
+    expect(result.reservation.sshAlias).toBeNull();
+    expect(result.reservation.port).toBeNull();
+  });
+
+  it('refuses malformed host objects with a reason naming the field (H9a1)', async () => {
+    const journal = new InMemoryJournal();
+    const attemptRepo = new InMemoryAttemptRepo();
+    const useCase = new ReserveExecutionCapacityUseCase({ journal, attemptRepo });
+
+    const cases: readonly [unknown, string][] = [
+      [42, 'host must be an object'],
+      [{ hostName: '   ', hostKind: 'opencode', transport: 'local', sshAlias: null, port: null }, 'host.hostName must be a non-empty string'],
+      [{ hostName: 'm', hostKind: 'claude', transport: 'local', sshAlias: null, port: null }, 'host.hostKind must be a declared runner kind (opencode or agy)'],
+      [{ hostName: 'm', hostKind: 'opencode', transport: 'teleport', sshAlias: null, port: null }, 'host.transport must be "local" or "ssh"'],
+      [{ hostName: 'm', hostKind: 'opencode', transport: 'ssh', sshAlias: null, port: null }, 'host.sshAlias is required when host.transport is "ssh"'],
+      [{ hostName: 'm', hostKind: 'opencode', transport: 'ssh', sshAlias: 'm', port: 0 }, 'host.port must be a positive integer or null'],
+      [{ hostName: 'm', hostKind: 'opencode', transport: 'local', sshAlias: null, port: 1.5 }, 'host.port must be a positive integer or null'],
+    ];
+    for (const [host, reason] of cases) {
+      const result = await useCase.reserveExecutionCapacity(
+        baseRequest({ host: host as never }) as Parameters<ReserveExecutionCapacityUseCase['reserveExecutionCapacity']>[0],
+      );
+      expect(result.outcome).toBe('refused');
+      if (result.outcome === 'refused') {
+        expect(result.reason).toBe(reason);
+      }
+    }
+    // Nothing was recorded by a refused request.
+    expect(journal.reservations.size).toBe(0);
   });
 });

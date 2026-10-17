@@ -149,8 +149,37 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     }
 
     const activeReservations = await this.deps.journal.listActiveReservations();
-    if (!activeReservations.some((reservation) => reservation.attemptId === request.attemptId && reservation.held)) {
+    const heldReservation = activeReservations.find(
+      (reservation) => reservation.attemptId === request.attemptId && reservation.held,
+    );
+    if (!heldReservation) {
       return { outcome: 'refused', reason: 'No active capacity reservation for attempt' };
+    }
+
+    // H9a fix (review): a reservation recorded for another host must never
+    // dispatch here. The runner's own host name comes from the installation
+    // (v2); it is null for v1 or absent installations, so legacy and pre-H9a
+    // records with a null hostName pass through untouched. This refuses
+    // before any start call and before any journal write.
+    const runnerHostName = this.deps.runner.describeRunner?.()?.hostName ?? null;
+    const reservationHostName = heldReservation.hostName ?? null;
+    if (reservationHostName !== null && reservationHostName !== runnerHostName) {
+      return {
+        outcome: 'refused',
+        reason: `Reservation host ${reservationHostName} is not the configured runner host ${runnerHostName}; several lane-runner hosts need H9b/H10`,
+      };
+    }
+    // The reservation's allocated worktree is the only one this attempt may
+    // dispatch into (review of #125): a v2 reserve allocates the path under
+    // its lock, and the busy-worktree check only ever saw that path. A null
+    // path is a legacy or pre-H9a2 record and passes as before. The reason
+    // names neither path.
+    const reservedWorktreePath = heldReservation.worktreePath ?? null;
+    if (reservedWorktreePath !== null && reservedWorktreePath !== request.worktreePath) {
+      return {
+        outcome: 'refused',
+        reason: 'Worktree path does not match the path allocated by the capacity reservation',
+      };
     }
 
     const runnerCapabilities = this.deps.runner.describeCapabilities();
@@ -302,6 +331,15 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         return {
           outcome: 'refused',
           reason: `Frozen brief manifest model assignment declares an unknown seat tool: ${JSON.stringify(rawSeatTool)}`,
+        };
+      }
+      // H9a2: a v2 installation never defaults the seat tool. A manifest
+      // whose model assignment predates the field refuses with a named
+      // reason; v1 and absent installations keep the legacy opencode seat.
+      if (manifestSeatTool === undefined && request.installationSchemaVersion === 2) {
+        return {
+          outcome: 'refused',
+          reason: 'Frozen brief manifest model assignment declares no seat tool; a v2 installation never defaults to opencode',
         };
       }
       const seatTool = manifestSeatTool ?? 'opencode';

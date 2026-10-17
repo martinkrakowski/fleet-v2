@@ -17,10 +17,18 @@ export type CapacityReservationClaim = Omit<CapacityReservationRecord, 'slotInde
 export interface ReserveCapacityAtomicallyRequest {
   /** The attempt claiming the slot; it must hold no active reservation. */
   readonly attemptId: string;
-  /** The claiming host's shared slot budget. */
-  readonly maxSlots: number;
-  /** The reservation appended when the claim is granted; `slotIndex` is assigned under the lock. */
-  readonly record: CapacityReservationClaim;
+  /**
+   * The claiming host's shared slot budget. Required only when
+   * `selectRecord` is absent (H9a2); with a selector the chosen host's
+   * `maxLanes` arbitrates instead.
+   */
+  readonly maxSlots?: number;
+  /**
+   * The reservation appended when the claim is granted; `slotIndex` is
+   * assigned under the lock. Required only when `selectRecord` is absent
+   * (H9a2); with a selector the selected claim is appended instead.
+   */
+  readonly record?: CapacityReservationClaim;
   /**
    * Busy-worktree arbitration, run under the reservations lock after the held
    * reservations are re-read (Opus note on #58). It receives the freshly read
@@ -32,7 +40,29 @@ export interface ReserveCapacityAtomicallyRequest {
   readonly checkBusyWorktree?: (
     held: readonly CapacityReservationRecord[],
   ) => Promise<BusyWorktreeCheck>;
+  /**
+   * In-lock record selection (H9a2). When supplied it runs under the
+   * reservations lock on the freshly read held reservations and decides which
+   * claim — and which host's slot budget — arbitrates, or reports that no
+   * candidate host has a free slot (`no-capacity`) or refuses with a reason.
+   * When absent, `record` and `maxSlots` arbitrate as before.
+   */
+  readonly selectRecord?: (
+    held: readonly CapacityReservationRecord[],
+  ) => Promise<SelectRecordUnderLockVerdict>;
 }
+
+/** The verdict of an in-lock record selection (H9a2). */
+export type SelectRecordUnderLockVerdict =
+  | {
+      readonly outcome: 'selected';
+      /** The claim appended when arbitration grants the slot. */
+      readonly record: CapacityReservationClaim;
+      /** The selected host's slot budget. */
+      readonly maxSlots: number;
+    }
+  | { readonly outcome: 'no-capacity' }
+  | { readonly outcome: 'refused'; readonly reason: string };
 
 /** The busy-worktree verdict of a claim, decided under the lock. */
 export type BusyWorktreeCheck =
@@ -54,7 +84,9 @@ export type ReserveCapacityAtomicallyResult =
       readonly outcome: 'no-free-slot';
       readonly heldCount: number;
       readonly maxSlots: number;
-    };
+    }
+  | { readonly outcome: 'no-capacity' }
+  | { readonly outcome: 'refused'; readonly reason: string };
 
 export interface ExecutionJournalPort {
   /** Append one journal entry; the journal is append-only evidence. */

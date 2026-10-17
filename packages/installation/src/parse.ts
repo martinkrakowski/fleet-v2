@@ -1249,10 +1249,11 @@ function parseV2Hosts(
   if (orchestrators !== 1) {
     errors.push('hosts: exactly one host must hold the orchestrator role');
   }
+  // At least one lane-runner host is required (H9a1); several lane-runner
+  // hosts now load. The host a lane runs on is chosen when capacity is
+  // reserved (H9a2), not here.
   if (laneRunners < 1) {
     errors.push('hosts: at least one host must hold the lane-runner role');
-  } else if (laneRunners > 1) {
-    errors.push('hosts: at most one host may hold the lane-runner role');
   }
   return hosts;
 }

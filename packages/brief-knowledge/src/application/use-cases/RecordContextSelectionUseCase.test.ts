@@ -110,6 +110,7 @@ class RecordingSelectionJournal implements DecisionReceiptJournalPort {
     return {
       receipts: [],
       outcomes: this.appended.filter((outcome) => outcome.consumer === query.consumer),
+      skippedLines: 0,
     };
   }
 }
@@ -484,6 +485,114 @@ describe('RecordContextSelectionUseCase', () => {
         at: '2026-10-17T10:00:00.000Z',
       },
     ]);
+  });
+
+  it('outcome value holds only accepted entry ids, in order; skipped when none accepted', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    const keeper = createEntryRecord({
+      id: 'ke-accepted-1',
+      disposition: 'accepted',
+      verification: 'supported',
+      checkerId: 'checker-ci',
+      supersededById: null,
+    });
+    const secondKeeper = createEntryRecord({
+      id: 'ke-accepted-2',
+      disposition: 'accepted',
+      verification: 'supported',
+      checkerId: 'checker-ci',
+      supersededById: null,
+    });
+    await repo.saveEntry(keeper);
+    await repo.saveEntry(secondKeeper);
+    // A rejected item may reference any existing entry; these are not keepers.
+    await repo.saveEntry(
+      createEntryRecord({
+        id: 'ke-candidate-rejected',
+        verification: 'unverified',
+      }),
+    );
+    await repo.saveEntry(
+      createEntryRecord({
+        id: 'ke-superseded-rejected',
+        disposition: 'superseded',
+        supersededById: 'ke-newer',
+      }),
+    );
+
+    const contextRef = `ranking:lane-k4:${'d'.repeat(64)}`;
+    const journal = new RecordingSelectionJournal([contextRef]);
+    const useCase = new RecordContextSelectionUseCase({ repo, journal });
+    const result = await useCase.execute({
+      attemptId: 'att-1',
+      rankingContextRef: contextRef,
+      nowIso: '2026-10-17T10:00:00.000Z',
+      selections: [
+        {
+          proposalId: 'prop-1',
+          knowledgeEntryId: 'ke-candidate-rejected',
+          version: '1.0.0',
+          accepted: false,
+          decisionBecause: 'Rejected by orchestrator',
+        },
+        {
+          proposalId: 'prop-2',
+          knowledgeEntryId: 'ke-accepted-2',
+          version: '1.0.0',
+          accepted: true,
+          decisionBecause: 'Best lexical match',
+        },
+        {
+          proposalId: 'prop-3',
+          knowledgeEntryId: 'ke-superseded-rejected',
+          version: '1.0.0',
+          accepted: false,
+          decisionBecause: 'Superseded, excluded',
+        },
+        {
+          proposalId: 'prop-4',
+          knowledgeEntryId: 'ke-accepted-1',
+          version: '1.0.0',
+          accepted: true,
+          decisionBecause: 'Second accepted',
+        },
+      ],
+    });
+
+    expect(result).toEqual({ outcome: 'recorded', recordedCount: 4 });
+    expect(journal.appended).toHaveLength(1);
+    expect(journal.appended[0]?.value).toEqual(['ke-accepted-2', 'ke-accepted-1']);
+  });
+
+  it('skips the outcome entirely when no selection is accepted', async () => {
+    const repo = new InMemoryKnowledgeEntryRepository();
+    const candidateEntry = createEntryRecord({
+      id: 'ke-cand',
+      disposition: 'candidate',
+      verification: 'unverified',
+    });
+    await repo.saveEntry(candidateEntry);
+
+    const contextRef = `ranking:lane-k4:${'e'.repeat(64)}`;
+    const journal = new RecordingSelectionJournal([contextRef]);
+    const useCase = new RecordContextSelectionUseCase({ repo, journal });
+    const result = await useCase.execute({
+      attemptId: 'att-1',
+      rankingContextRef: contextRef,
+      selections: [
+        {
+          proposalId: 'prop-1',
+          knowledgeEntryId: 'ke-cand',
+          version: '1.0.0',
+          accepted: false,
+          decisionBecause: 'Rejected by orchestrator',
+        },
+      ],
+    });
+
+    expect(result).toEqual({ outcome: 'recorded', recordedCount: 1 });
+    expect(journal.appendCalls).toBe(0);
+    expect(journal.appended).toHaveLength(0);
   });
 
   it('skips the outcome when no rankingContextRef is given', async () => {

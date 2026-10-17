@@ -18,8 +18,10 @@
  * under its own lock, so this parser never meets a line kind it does not know.
  *
  * K4: `readJournal` reads every recorded month of both files for one
- * consumer, each under its own lock, and fails closed on a malformed line
- * of either kind — a report never silently under-reports.
+ * consumer, each under its own lock. Fix round: a malformed line of either
+ * file is skipped and counted on the snapshot's `skippedLines` instead of
+ * thrown, so one corrupt line cannot hide the whole recorded history; every
+ * budget path stays strict and still throws.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -765,42 +767,93 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
   }
 
   /**
-   * K4: one consumer's whole recorded history, every month of both files,
-   * each read under its own lock (never nested, so nothing can wait on this
-   * read). A malformed line of either kind throws, exactly as the budget
-   * parser does: a report built from skipped lines would under-report.
+   * K4, fix round: one consumer's whole recorded history, every month of both
+   * files, each read under its own lock (never nested, so nothing can wait on
+   * this read). A malformed line of either file is skipped and counted on
+   * `skippedLines` rather than thrown: the report still states what it read
+   * and how much it could not. The budget paths stay strict — they still
+   * throw, so spend is never computed from skipped input.
    */
   async readJournal(query: ReadDecisionJournalQuery): Promise<DecisionJournalSnapshot> {
     const consumer = requireReadableConsumer(query);
     const receipts: SettledDecisionReceiptRecord[] = [];
     const outcomes: DecisionOutcomeRecord[] = [];
+    let skippedLines = 0;
     for (const monthKey of await this.listMonthKeys()) {
       // Each month is read under its own month lock, like monthSpendUsd:
       // a concurrent append must never be observed as a torn line.
-      const entries = await withFileLock(
+      const read = await withFileLock(
         this.monthLockPath(monthKey),
-        async () => this.readMonthEntries(monthKey),
+        async () => this.readMonthEntriesForReport(monthKey),
         this.lockOptions(),
       );
-      for (const entry of entries) {
+      skippedLines += read.skipped;
+      for (const entry of read.entries) {
         if (entry.kind === 'settled' && entry.consumer === consumer) {
           receipts.push(settledRecordOf(entry));
         }
       }
     }
     for (const monthKey of await this.listOutcomeMonthKeys()) {
-      const monthOutcomes = await withFileLock(
+      const read = await withFileLock(
         this.outcomesLockPath(monthKey),
-        async () => this.readOutcomeEntries(monthKey),
+        async () => this.readOutcomeEntriesForReport(monthKey),
         this.lockOptions(),
       );
-      for (const outcome of monthOutcomes) {
+      skippedLines += read.skipped;
+      for (const outcome of read.entries) {
         if (outcome.consumer === consumer) {
           outcomes.push(outcome);
         }
       }
     }
-    return { receipts, outcomes };
+    return { receipts, outcomes, skippedLines };
+  }
+
+  /**
+   * The report's receipt read: like `readMonthEntries`, but a line that
+   * fails the strict parser is skipped and counted instead of thrown.
+   */
+  private async readMonthEntriesForReport(
+    monthKey: string,
+  ): Promise<{ entries: JournalEntry[]; skipped: number }> {
+    const filePath = this.monthFilePath(monthKey);
+    const entries: JournalEntry[] = [];
+    let skipped = 0;
+    for (const [index, line] of (await this.readFileLines(filePath)).entries()) {
+      try {
+        entries.push(parseEntry(line, filePath, index + 1));
+      } catch (error: unknown) {
+        if (!(error instanceof MalformedReceiptLineError)) {
+          throw error;
+        }
+        skipped += 1;
+      }
+    }
+    return { entries, skipped };
+  }
+
+  /**
+   * The report's outcomes read: like `readOutcomeEntries`, but a line that
+   * fails the strict parser is skipped and counted instead of thrown.
+   */
+  private async readOutcomeEntriesForReport(
+    monthKey: string,
+  ): Promise<{ entries: DecisionOutcomeRecord[]; skipped: number }> {
+    const filePath = this.outcomesFilePath(monthKey);
+    const entries: DecisionOutcomeRecord[] = [];
+    let skipped = 0;
+    for (const [index, line] of (await this.readFileLines(filePath)).entries()) {
+      try {
+        entries.push(parseOutcomeEntry(line, filePath, index + 1));
+      } catch (error: unknown) {
+        if (!(error instanceof MalformedReceiptLineError)) {
+          throw error;
+        }
+        skipped += 1;
+      }
+    }
+    return { entries, skipped };
   }
 
   /** Every recorded `<YYYY-MM>.jsonl` month, oldest first; none when the directory is absent. */
@@ -840,25 +893,9 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
   /** Parse one outcomes file; a malformed line throws with its location. */
   private async readOutcomeEntries(monthKey: string): Promise<DecisionOutcomeRecord[]> {
     const filePath = this.outcomesFilePath(monthKey);
-    let raw: string;
-    try {
-      raw = await fs.readFile(filePath, 'utf8');
-    } catch (error: unknown) {
-      if (
-        typeof error === 'object' &&
-        error !== null &&
-        (error as { code?: string }).code === 'ENOENT'
-      ) {
-        return [];
-      }
-      throw error;
-    }
-    const lines = raw.split('\n');
-    // A single trailing '' is the file's final newline, not a blank line.
-    if (lines.length > 0 && lines[lines.length - 1] === '') {
-      lines.pop();
-    }
-    return lines.map((line, index) => parseOutcomeEntry(line, filePath, index + 1));
+    return (await this.readFileLines(filePath)).map((line, index) =>
+      parseOutcomeEntry(line, filePath, index + 1),
+    );
   }
 
   /** A settled line for this reference in this month or the one before it. */
@@ -891,6 +928,17 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
 
   private async readMonthEntries(monthKey: string): Promise<JournalEntry[]> {
     const filePath = this.monthFilePath(monthKey);
+    return (await this.readFileLines(filePath)).map((line, index) =>
+      parseEntry(line, filePath, index + 1),
+    );
+  }
+
+  /**
+   * The file's lines; an absent file reads as none. A single trailing '' is
+   * the file's final newline, not a blank line. Every read — strict or
+   * report — goes through here, so both see the same lines.
+   */
+  private async readFileLines(filePath: string): Promise<string[]> {
     let raw: string;
     try {
       raw = await fs.readFile(filePath, 'utf8');
@@ -905,11 +953,10 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
       throw error;
     }
     const lines = raw.split('\n');
-    // A single trailing '' is the file's final newline, not a blank line.
     if (lines.length > 0 && lines[lines.length - 1] === '') {
       lines.pop();
     }
-    return lines.map((line, index) => parseEntry(line, filePath, index + 1));
+    return lines;
   }
 
   private async appendEntry(monthKey: string, entry: JournalEntry): Promise<void> {

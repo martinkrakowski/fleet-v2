@@ -36,7 +36,7 @@ import {
   type HostProbeExecutor,
   type HostRunnerDraft,
   type InstallationFileRead,
-} from '@fleet/onboarding';
+} from "@fleet/onboarding";
 import {
   isSafeSshHost,
   isValidHostName,
@@ -46,15 +46,15 @@ import {
   type HostRole,
   type HostSection,
   type RunnerCapabilityDeclaration,
-} from '@fleet/installation';
+} from "@fleet/installation";
 import {
   AttemptRepositoryAdapter,
   CAPACITY_RELEASE_STATES,
   ExecutionJournalAdapter,
   resolveInstallationHostForRole,
-} from '@fleet/work-execution';
+} from "@fleet/work-execution";
 
-import { formatDoctorLine, type CliIo } from './index.js';
+import { formatDoctorLine, type CliIo } from "./index.js";
 
 /** Options the driver and tests inject; every default composes the real thing. */
 export interface HostsCliOptions {
@@ -104,7 +104,11 @@ Exit codes: 0 written (or listed), 1 refused — a probe FAIL, a loader
 refusal, a changed or locked file, live work on remove — 2 usage error.
 There is no --force.`;
 
-const HOST_ROLES: readonly HostRole[] = ['orchestrator', 'lane-runner', 'verifier'];
+const HOST_ROLES: readonly HostRole[] = [
+  "orchestrator",
+  "lane-runner",
+  "verifier",
+];
 
 /**
  * The isolation floor a converted v1 runner is written with: exactly what
@@ -115,15 +119,15 @@ const CONVERSION_ISOLATION_FLOOR: RunnerCapabilityDeclaration = {
   networkEgressRestricted: true,
   cpuAndMemoryLimited: true,
   processTreeTermination: true,
-  filesystemScope: 'scoped-worktree',
+  filesystemScope: "scoped-worktree",
 };
 
 /** Which flags each subcommand accepts; anything else is a usage error. */
 const SUBCOMMAND_FLAGS: Readonly<Record<string, ReadonlySet<string>>> = {
   list: new Set([]),
-  add: new Set(['ssh', 'port', 'worktree-root', 'role', 'yes']),
-  edit: new Set(['ssh', 'port', 'worktree-root', 'role', 'yes']),
-  remove: new Set(['yes']),
+  add: new Set(["ssh", "port", "worktree-root", "role", "yes"]),
+  edit: new Set(["ssh", "port", "worktree-root", "role", "yes"]),
+  remove: new Set(["yes"]),
 };
 
 interface HostsArgs {
@@ -141,13 +145,13 @@ type ParsedHostsArgs =
   | { readonly ok: false; readonly error: string };
 
 function isHelpToken(token: string): boolean {
-  return token === 'help' || token === '--help' || token === '-h';
+  return token === "help" || token === "--help" || token === "-h";
 }
 
 /** Parse one hosts invocation; every problem is a usage message, never a guess. */
 function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
-  const emptyArgs: HostsArgs = { subcommand: '', roles: [], yes: false };
-  const subcommand = tokens[0] ?? '';
+  const emptyArgs: HostsArgs = { subcommand: "", roles: [], yes: false };
+  const subcommand = tokens[0] ?? "";
   if (isHelpToken(subcommand)) {
     return { ok: true, help: true, args: emptyArgs };
   }
@@ -155,7 +159,7 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
   if (allowed === undefined) {
     return {
       ok: false,
-      error: `Unknown hosts subcommand: ${subcommand === '' ? '(none)' : subcommand}\n${HOSTS_HELP}`,
+      error: `Unknown hosts subcommand: ${subcommand === "" ? "(none)" : subcommand}\n${HOSTS_HELP}`,
     };
   }
   const args: {
@@ -172,23 +176,30 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
     if (isHelpToken(token)) {
       return { ok: true, help: true, args: emptyArgs };
     }
-    if (!token.startsWith('--') || token === '--') {
+    if (!token.startsWith("--") || token === "--") {
       if (args.name !== undefined) {
-        return { ok: false, error: `Unexpected argument: ${token}\n${HOSTS_HELP}` };
+        return {
+          ok: false,
+          error: `Unexpected argument: ${token}\n${HOSTS_HELP}`,
+        };
       }
       args.name = token;
       continue;
     }
     const body = token.slice(2);
-    const separator = body.indexOf('=');
+    const separator = body.indexOf("=");
     const flag = separator === -1 ? body : body.slice(0, separator);
-    const inlineValue = separator === -1 ? undefined : body.slice(separator + 1);
+    const inlineValue =
+      separator === -1 ? undefined : body.slice(separator + 1);
     if (!allowed.has(flag)) {
-      return { ok: false, error: `Unknown hosts ${subcommand} option: --${flag}\n${HOSTS_HELP}` };
+      return {
+        ok: false,
+        error: `Unknown hosts ${subcommand} option: --${flag}\n${HOSTS_HELP}`,
+      };
     }
-    if (flag === 'yes') {
+    if (flag === "yes") {
       if (inlineValue !== undefined) {
-        return { ok: false, error: '--yes takes no value\n' + HOSTS_HELP };
+        return { ok: false, error: "--yes takes no value\n" + HOSTS_HELP };
       }
       args.yes = true;
       continue;
@@ -196,36 +207,45 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
     let value = inlineValue;
     if (value === undefined) {
       const next = tokens[index + 1];
-      if (next === undefined || next.startsWith('--')) {
-        return { ok: false, error: `--${flag} requires a value\n${HOSTS_HELP}` };
+      if (next === undefined || next.startsWith("--")) {
+        return {
+          ok: false,
+          error: `--${flag} requires a value\n${HOSTS_HELP}`,
+        };
       }
       value = next;
       index += 1;
     }
-    if (value.trim() === '') {
+    if (value.trim() === "") {
       return { ok: false, error: `--${flag} requires a value\n${HOSTS_HELP}` };
     }
-    if (flag === 'ssh') {
+    if (flag === "ssh") {
       args.sshAlias = value;
-    } else if (flag === 'worktree-root') {
+    } else if (flag === "worktree-root") {
       args.worktreeRoot = value;
-    } else if (flag === 'port') {
+    } else if (flag === "port") {
       if (!/^\d+$/.test(value)) {
-        return { ok: false, error: `--port must be an integer, not '${value}'\n${HOSTS_HELP}` };
+        return {
+          ok: false,
+          error: `--port must be an integer, not '${value}'\n${HOSTS_HELP}`,
+        };
       }
       args.port = Number(value);
     } else {
-      const segments = value.split(',');
+      const segments = value.split(",");
       const roles: HostRole[] = [];
       for (const segment of segments) {
         const role = segment.trim();
-        if (role === '') {
-          return { ok: false, error: `--role requires role names, not '${value}'\n${HOSTS_HELP}` };
+        if (role === "") {
+          return {
+            ok: false,
+            error: `--role requires role names, not '${value}'\n${HOSTS_HELP}`,
+          };
         }
         if (!HOST_ROLES.includes(role as HostRole)) {
           return {
             ok: false,
-            error: `--role must be one of: ${HOST_ROLES.join(', ')}\n${HOSTS_HELP}`,
+            error: `--role must be one of: ${HOST_ROLES.join(", ")}\n${HOSTS_HELP}`,
           };
         }
         roles.push(role as HostRole);
@@ -238,24 +258,24 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
 
 /** The file on disk plus the loader's verdict on it. */
 type InstallationState =
-  | { readonly status: 'absent'; readonly read: InstallationFileRead }
+  | { readonly status: "absent"; readonly read: InstallationFileRead }
   | {
-      readonly status: 'unreadable';
+      readonly status: "unreadable";
       readonly read: InstallationFileRead;
       readonly reason: string;
     }
   | {
-      readonly status: 'invalid';
+      readonly status: "invalid";
       readonly read: InstallationFileRead;
       readonly errors: readonly string[];
     }
   | {
-      readonly status: 'v1';
+      readonly status: "v1";
       readonly read: InstallationFileRead;
       readonly installation: FleetInstallation;
     }
   | {
-      readonly status: 'v2';
+      readonly status: "v2";
       readonly read: InstallationFileRead;
       readonly installation: FleetInstallation;
       /** The decoded file value, verbatim; candidates copy it untouched. */
@@ -264,19 +284,24 @@ type InstallationState =
 
 async function readInstallationState(file: string): Promise<InstallationState> {
   const read = await readInstallationFile(file);
-  if (read.status === 'unreadable') {
-    return { status: 'unreadable', read, reason: read.reason };
+  if (read.status === "unreadable") {
+    return { status: "unreadable", read, reason: read.reason };
   }
-  if (read.status === 'absent') {
-    return { status: 'absent', read };
+  if (read.status === "absent") {
+    return { status: "absent", read };
   }
   const parsed = parseInstallation(read.value);
   if (!parsed.ok) {
-    return { status: 'invalid', read, errors: parsed.errors };
+    return { status: "invalid", read, errors: parsed.errors };
   }
   return parsed.installation.schemaVersion === 1
-    ? { status: 'v1', read, installation: parsed.installation }
-    : { status: 'v2', read, installation: parsed.installation, value: read.value };
+    ? { status: "v1", read, installation: parsed.installation }
+    : {
+        status: "v2",
+        read,
+        installation: parsed.installation,
+        value: read.value,
+      };
 }
 
 function printErrors(io: CliIo, errors: readonly string[]): void {
@@ -300,8 +325,8 @@ function convertV1File(installation: FleetInstallation): HostDraftCandidate {
   return {
     schemaVersion: 2 as const,
     hosts: {},
-    ...(forge !== undefined && 'owner' in forge
-      ? { forge: { mode: 'github', owner: forge.owner, repo: forge.repo } }
+    ...(forge !== undefined && "owner" in forge
+      ? { forge: { mode: "github", owner: forge.owner, repo: forge.repo } }
       : {}),
     ...(verification !== undefined
       ? { verification: { procedures: verification.procedures } }
@@ -311,11 +336,11 @@ function convertV1File(installation: FleetInstallation): HostDraftCandidate {
 }
 
 function hostsOf(value: unknown): Record<string, HostSection> | undefined {
-  if (typeof value !== 'object' || value === null) {
+  if (typeof value !== "object" || value === null) {
     return undefined;
   }
   const hosts = (value as { readonly hosts?: unknown }).hosts;
-  return typeof hosts === 'object' && hosts !== null && !Array.isArray(hosts)
+  return typeof hosts === "object" && hosts !== null && !Array.isArray(hosts)
     ? (hosts as Record<string, HostSection>)
     : undefined;
 }
@@ -333,18 +358,24 @@ function moveLaneRunnerRole(
   const movedFrom: string[] = [];
   let nextHosts: Record<string, HostSection> | undefined;
   for (const [hostName, host] of Object.entries(hosts)) {
-    if (hostName === name || !host.roles.includes('lane-runner')) {
+    if (hostName === name || !host.roles.includes("lane-runner")) {
       continue;
     }
     movedFrom.push(hostName);
     nextHosts ??= { ...hosts };
-    nextHosts[hostName] = { ...host, roles: host.roles.filter((role) => role !== 'lane-runner') };
+    nextHosts[hostName] = {
+      ...host,
+      roles: host.roles.filter((role) => role !== "lane-runner"),
+    };
   }
   if (nextHosts === undefined) {
     return { value: current, movedFrom: [] };
   }
   return {
-    value: { ...(current as Readonly<Record<string, unknown>>), hosts: nextHosts },
+    value: {
+      ...(current as Readonly<Record<string, unknown>>),
+      hosts: nextHosts,
+    },
     movedFrom,
   };
 }
@@ -356,46 +387,47 @@ function confirmFromStdin(io: CliIo): (question: string) => Promise<boolean> {
       io.stdout(`${question} `);
       const stdin = process.stdin;
       if (stdin.readableEnded) {
-        io.stdout('\n');
+        io.stdout("\n");
         resolve(false);
         return;
       }
       let settled = false;
-      let answer = '';
+      let answer = "";
       const finish = (confirmed: boolean) => {
         if (settled) {
           return;
         }
         settled = true;
-        stdin.removeListener('data', onData);
-        stdin.removeListener('end', onEnd);
-        stdin.removeListener('error', onError);
+        stdin.removeListener("data", onData);
+        stdin.removeListener("end", onEnd);
+        stdin.removeListener("error", onError);
         stdin.pause();
         resolve(confirmed);
       };
       const decided = (): boolean => {
-        const newline = answer.indexOf('\n');
-        const line = newline === -1 ? answer.trim() : answer.slice(0, newline).trim();
+        const newline = answer.indexOf("\n");
+        const line =
+          newline === -1 ? answer.trim() : answer.slice(0, newline).trim();
         finish(/^y(?:es)?$/i.test(line));
         return true;
       };
       const onData = (chunk: Buffer | string): void => {
-        answer += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-        if (answer.includes('\n')) {
+        answer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+        if (answer.includes("\n")) {
           decided();
         }
       };
       const onEnd = (): void => {
-        if (answer.trim() !== '') {
+        if (answer.trim() !== "") {
           decided();
           return;
         }
         finish(false);
       };
       const onError = (): void => finish(false);
-      stdin.on('data', onData);
-      stdin.on('end', onEnd);
-      stdin.on('error', onError);
+      stdin.on("data", onData);
+      stdin.on("end", onEnd);
+      stdin.on("error", onError);
       stdin.resume();
     });
 }
@@ -412,7 +444,7 @@ function runnerDraftFor(
       return undefined;
     }
     return {
-      kind: 'opencode',
+      kind: "opencode",
       port,
       ...(converting ? { capabilities: CONVERSION_ISOLATION_FLOOR } : {}),
     };
@@ -420,12 +452,14 @@ function runnerDraftFor(
   const common = {
     port: port ?? runner.port,
     ...(runner.authFile !== undefined ? { authFile: runner.authFile } : {}),
-    ...(runner.capabilities !== undefined ? { capabilities: runner.capabilities } : {}),
+    ...(runner.capabilities !== undefined
+      ? { capabilities: runner.capabilities }
+      : {}),
     ...(runner.maxLanes !== undefined ? { maxLanes: runner.maxLanes } : {}),
   };
-  if (runner.kind === 'agy') {
+  if (runner.kind === "agy") {
     return {
-      kind: 'agy',
+      kind: "agy",
       ...common,
       agyMode: runner.agyMode,
       ...(runner.agyAcknowledgement !== undefined
@@ -433,15 +467,22 @@ function runnerDraftFor(
         : {}),
     };
   }
-  return { kind: 'opencode', ...common };
+  return { kind: "opencode", ...common };
 }
 
 /** Diff the file as it sits against the candidate as the write would put it. */
-function printDiff(io: CliIo, currentText: string, candidate: HostDraftCandidate): void {
+function printDiff(
+  io: CliIo,
+  currentText: string,
+  candidate: HostDraftCandidate,
+): void {
   const diff = renderInstallationDiff(
-    diffInstallationText(currentText, serialiseInstallationCandidate(candidate)),
+    diffInstallationText(
+      currentText,
+      serialiseInstallationCandidate(candidate),
+    ),
   );
-  io.stdout(diff === '' ? 'no changes\n' : `${diff}\n`);
+  io.stdout(diff === "" ? "no changes\n" : `${diff}\n`);
 }
 
 /** Probe, diff, confirm, then the compare-and-swap write. */
@@ -453,12 +494,12 @@ async function confirmAndWrite(
   io: CliIo,
   options: HostsCliOptions,
 ): Promise<number> {
-  const currentText = read.status === 'read' ? read.text : '';
+  const currentText = read.status === "read" ? read.text : "";
   printDiff(io, currentText, candidate);
   if (!args.yes) {
     const confirm = options.confirm ?? confirmFromStdin(io);
     if (!(await confirm(`write ${file} with this change? [y/N]`))) {
-      io.stderr('not confirmed; nothing was written\n');
+      io.stderr("not confirmed; nothing was written\n");
       return 1;
     }
   }
@@ -467,9 +508,9 @@ async function confirmAndWrite(
     candidate,
     expectedHash: readHashOf(read),
   });
-  if (result.status === 'refused') {
+  if (result.status === "refused") {
     printErrors(io, result.errors);
-    io.stderr('nothing was written\n');
+    io.stderr("nothing was written\n");
     return 1;
   }
   io.stdout(`written ${file} (sha256 ${result.hash})\n`);
@@ -477,14 +518,14 @@ async function confirmAndWrite(
 }
 
 async function writeHost(
-  mode: 'add' | 'edit',
+  mode: "add" | "edit",
   args: HostsArgs,
   file: string,
   io: CliIo,
   options: HostsCliOptions,
 ): Promise<number> {
   const name = args.name;
-  if (name === undefined || name.trim() === '') {
+  if (name === undefined || name.trim() === "") {
     io.stderr(`hosts ${mode} requires a host name\n${HOSTS_HELP}\n`);
     return 2;
   }
@@ -503,50 +544,66 @@ async function writeHost(
     );
     return 2;
   }
-  if (mode === 'add' && args.worktreeRoot === undefined) {
+  if (mode === "add" && args.worktreeRoot === undefined) {
     io.stderr(`hosts add requires --worktree-root <path>\n${HOSTS_HELP}\n`);
     return 2;
   }
   const state = await readInstallationState(file);
-  if (state.status === 'unreadable') {
+  if (state.status === "unreadable") {
     io.stderr(`${file}: could not be read (${state.reason})\n`);
     return 1;
   }
-  if (state.status === 'invalid') {
-    io.stderr(`the installation file is invalid; fix it by hand before changing hosts:\n`);
+  if (state.status === "invalid") {
+    io.stderr(
+      `the installation file is invalid; fix it by hand before changing hosts:\n`,
+    );
     printErrors(io, state.errors);
     return 1;
   }
-  const converting = state.status === 'v1';
-  if (converting && mode === 'add') {
+  const converting = state.status === "v1";
+  if (converting && mode === "add") {
     io.stdout(
-      'converting the schema version 1 file to version 2: the v1 runner, worktree, reviewer and shelf sections do not carry over, and neither do their seats — add seats with init or by hand before the next dispatch\n',
+      "converting the schema version 1 file to version 2: the v1 runner, worktree, reviewer and shelf sections do not carry over, and neither do their seats — add seats with init or by hand before the next dispatch\n",
     );
   }
-  const existing = state.status === 'v2' ? state.installation.hosts?.[name] : undefined;
-  if (mode === 'edit' && existing === undefined) {
+  const existing =
+    state.status === "v2" ? state.installation.hosts?.[name] : undefined;
+  if (mode === "edit" && existing === undefined) {
     // The engine reports the same fact for a v1 or absent file; name it here.
-    io.stderr(`hosts.${name}: not in the installation file; adding is a separate mode\n`);
+    io.stderr(
+      `hosts.${name}: not in the installation file; adding is a separate mode\n`,
+    );
     return 1;
   }
-  if (mode === 'edit' && args.sshAlias !== undefined && existing?.transport === 'local') {
-    io.stderr(`hosts.${name}: the entry's transport is local; --ssh changes an ssh host's alias\n`);
+  if (
+    mode === "edit" &&
+    args.sshAlias !== undefined &&
+    existing?.transport === "local"
+  ) {
+    io.stderr(
+      `hosts.${name}: the entry's transport is local; --ssh changes an ssh host's alias\n`,
+    );
     return 2;
   }
 
   const roles = args.roles.length > 0 ? args.roles : undefined;
-  const runner = runnerDraftFor(existing, args.port, converting && mode === 'add');
+  const runner = runnerDraftFor(
+    existing,
+    args.port,
+    converting && mode === "add",
+  );
   const input: HostDraftInput = {
     name,
-    transport: existing?.transport ?? (args.sshAlias === undefined ? 'local' : 'ssh'),
+    transport:
+      existing?.transport ?? (args.sshAlias === undefined ? "local" : "ssh"),
     ...(args.sshAlias !== undefined
       ? { sshAlias: args.sshAlias }
-      : existing?.transport === 'ssh' && existing.sshAlias !== undefined
+      : existing?.transport === "ssh" && existing.sshAlias !== undefined
         ? { sshAlias: existing.sshAlias }
         : {}),
-    worktreeRoot: args.worktreeRoot ?? existing?.worktreeRoot ?? '',
+    worktreeRoot: args.worktreeRoot ?? existing?.worktreeRoot ?? "",
     ...(existing?.tmpDir !== undefined ? { tmpDir: existing.tmpDir } : {}),
-    roles: roles ?? [...(existing?.roles ?? ['lane-runner'])],
+    roles: roles ?? [...(existing?.roles ?? ["lane-runner"])],
     ...(runner !== undefined ? { runner } : {}),
   };
   const drafted = draftHost(input);
@@ -557,13 +614,13 @@ async function writeHost(
   const draft = drafted.draft;
 
   let current: unknown;
-  if (state.status === 'v1') {
-    current = mode === 'add' ? convertV1File(state.installation) : undefined;
-  } else if (state.status === 'v2') {
+  if (state.status === "v1") {
+    current = mode === "add" ? convertV1File(state.installation) : undefined;
+  } else if (state.status === "v2") {
     current = state.value;
   }
   let movedFrom: readonly string[] = [];
-  if (draft.host.roles.includes('lane-runner')) {
+  if (draft.host.roles.includes("lane-runner")) {
     const moved = moveLaneRunnerRole(current, name);
     current = moved.value;
     movedFrom = moved.movedFrom;
@@ -571,10 +628,14 @@ async function writeHost(
 
   const validated = validateHostDraft(current, draft, mode);
   if (!validated.ok) {
-    io.stderr('the loader refuses this change:\n');
+    io.stderr("the loader refuses this change:\n");
     printErrors(io, validated.errors);
     if (validated.candidate !== undefined) {
-      printDiff(io, state.read.status === 'read' ? state.read.text : '', validated.candidate);
+      printDiff(
+        io,
+        state.read.status === "read" ? state.read.text : "",
+        validated.candidate,
+      );
     }
     return 1;
   }
@@ -582,14 +643,17 @@ async function writeHost(
 
   // A verifier host must see the lane-runner's worktree root; the candidate
   // is the post-apply file, so a role moved in this same write counts.
-  const laneRunnerName = resolveInstallationHostForRole(validated.installation, 'lane-runner');
+  const laneRunnerName = resolveInstallationHostForRole(
+    validated.installation,
+    "lane-runner",
+  );
   const laneRunnerHost =
     laneRunnerName !== undefined
       ? validated.installation.hosts?.[laneRunnerName]
       : undefined;
   const spec = {
     ...hostProbeSpecFromDraft(draft),
-    ...(draft.host.roles.includes('verifier') &&
+    ...(draft.host.roles.includes("verifier") &&
     laneRunnerName !== undefined &&
     laneRunnerHost !== undefined
       ? {
@@ -606,12 +670,12 @@ async function writeHost(
     io.stdout(`${formatDoctorLine(line)}\n`);
   }
   if (hostProbesHaveFailure(lines)) {
-    io.stderr('refused: a probe reported FAIL; nothing was written\n');
+    io.stderr("refused: a probe reported FAIL; nothing was written\n");
     return 1;
   }
   if (movedFrom.length > 0) {
     io.stdout(
-      `lanes now run on ${name} (the lane-runner role moved from ${movedFrom.join(', ')})\n`,
+      `lanes now run on ${name} (the lane-runner role moved from ${movedFrom.join(", ")})\n`,
     );
   }
   return confirmAndWrite(file, state.read, candidate, args, io, options);
@@ -624,27 +688,29 @@ async function removeHost(
   options: HostsCliOptions,
 ): Promise<number> {
   const name = args.name;
-  if (name === undefined || name.trim() === '') {
+  if (name === undefined || name.trim() === "") {
     io.stderr(`hosts remove requires a host name\n${HOSTS_HELP}\n`);
     return 2;
   }
   const state = await readInstallationState(file);
-  if (state.status === 'unreadable') {
+  if (state.status === "unreadable") {
     io.stderr(`${file}: could not be read (${state.reason})\n`);
     return 1;
   }
-  if (state.status === 'absent') {
-    io.stderr('no installation file; there is no host to remove\n');
+  if (state.status === "absent") {
+    io.stderr("no installation file; there is no host to remove\n");
     return 1;
   }
-  if (state.status === 'invalid') {
-    io.stderr('the installation file is invalid; fix it by hand before changing hosts:\n');
+  if (state.status === "invalid") {
+    io.stderr(
+      "the installation file is invalid; fix it by hand before changing hosts:\n",
+    );
     printErrors(io, state.errors);
     return 1;
   }
-  if (state.status === 'v1') {
+  if (state.status === "v1") {
     io.stderr(
-      'the installation file is schema version 1 and has no named hosts; the first hosts add converts it\n',
+      "the installation file is schema version 1 and has no named hosts; the first hosts add converts it\n",
     );
     return 1;
   }
@@ -654,16 +720,17 @@ async function removeHost(
     io.stderr(`hosts.${name}: not in the installation file\n`);
     return 1;
   }
-  if (host.roles.includes('orchestrator')) {
+  if (host.roles.includes("orchestrator")) {
     io.stderr(
       `hosts.${name} holds the orchestrator role, and an installation needs exactly one orchestrator host; move the role to another host first (hosts edit)\n`,
     );
     return 1;
   }
   const otherLaneRunner = Object.entries(hosts).find(
-    ([hostName, entry]) => hostName !== name && entry.roles.includes('lane-runner'),
+    ([hostName, entry]) =>
+      hostName !== name && entry.roles.includes("lane-runner"),
   );
-  if (host.roles.includes('lane-runner') && otherLaneRunner === undefined) {
+  if (host.roles.includes("lane-runner") && otherLaneRunner === undefined) {
     io.stderr(
       `hosts.${name} is the last lane-runner host; move the lane-runner role to another host before removing it\n`,
     );
@@ -697,7 +764,7 @@ async function removeHost(
     return 1;
   }
 
-  if (host.runner !== undefined && host.transport === 'ssh') {
+  if (host.runner !== undefined && host.transport === "ssh") {
     io.stdout(
       `note: a leftover ssh -f -N forward for this host may still listen on 127.0.0.1:${host.runner.port + 1}; find it with pgrep -f 'ssh .*-L 127.0.0.1:${host.runner.port + 1}' and kill the pid\n`,
     );
@@ -711,39 +778,41 @@ async function removeHost(
     hosts: remaining,
   };
   if (
-    host.transport === 'ssh' &&
-    Object.values(remaining).every((entry) => entry.transport !== 'ssh')
+    host.transport === "ssh" &&
+    Object.values(remaining).every((entry) => entry.transport !== "ssh")
   ) {
-    io.stdout('the installation is single-machine again: no host is reached over ssh\n');
+    io.stdout(
+      "the installation is single-machine again: no host is reached over ssh\n",
+    );
   }
   return confirmAndWrite(file, state.read, candidate, args, io, options);
 }
 
 async function listHosts(file: string, io: CliIo): Promise<number> {
   const state = await readInstallationState(file);
-  if (state.status === 'unreadable') {
+  if (state.status === "unreadable") {
     io.stderr(`${file}: could not be read (${state.reason})\n`);
     return 1;
   }
-  if (state.status === 'invalid') {
-    io.stderr('the installation file is invalid; fix it by hand:\n');
+  if (state.status === "invalid") {
+    io.stderr("the installation file is invalid; fix it by hand:\n");
     printErrors(io, state.errors);
     return 1;
   }
-  if (state.status === 'absent') {
-    io.stdout('no installation file\n');
+  if (state.status === "absent") {
+    io.stdout("no installation file\n");
     return 0;
   }
-  if (state.status === 'v1') {
+  if (state.status === "v1") {
     io.stdout(
-      'the installation file is schema version 1; it has no named hosts, and the first hosts add converts it to version 2\n',
+      "the installation file is schema version 1; it has no named hosts, and the first hosts add converts it to version 2\n",
     );
     return 0;
   }
   const hosts = state.installation.hosts ?? {};
   const names = [...Object.keys(hosts)].sort();
   if (names.length === 0) {
-    io.stdout('no hosts are configured\n');
+    io.stdout("no hosts are configured\n");
     return 0;
   }
   for (const name of names) {
@@ -752,14 +821,14 @@ async function listHosts(file: string, io: CliIo): Promise<number> {
       name,
       host.transport,
       ...(host.sshAlias !== undefined ? [`alias ${host.sshAlias}`] : []),
-      `roles: ${host.roles.join(', ')}`,
+      `roles: ${host.roles.join(", ")}`,
       `worktree-root: ${host.worktreeRoot}`,
       ...(host.tmpDir !== undefined ? [`tmp-dir: ${host.tmpDir}`] : []),
       ...(host.runner !== undefined
         ? [`runner: ${host.runner.kind}, port ${host.runner.port}`]
         : []),
     ];
-    io.stdout(`${parts.join('  ')}\n`);
+    io.stdout(`${parts.join("  ")}\n`);
   }
   return 0;
 }
@@ -781,12 +850,19 @@ export async function hostsCommand(
   }
   const args = parsed.args;
   const file =
-    options.installationFile ?? resolveInstallationFile(undefined, process.env, process.cwd());
-  if (args.subcommand === 'list') {
+    options.installationFile ??
+    resolveInstallationFile(undefined, process.env, process.cwd());
+  if (args.subcommand === "list") {
     return listHosts(file, io);
   }
-  if (args.subcommand === 'remove') {
+  if (args.subcommand === "remove") {
     return removeHost(args, file, io, options);
   }
-  return writeHost(args.subcommand === 'edit' ? 'edit' : 'add', args, file, io, options);
+  return writeHost(
+    args.subcommand === "edit" ? "edit" : "add",
+    args,
+    file,
+    io,
+    options,
+  );
 }

@@ -23,7 +23,10 @@ import {
   configureEvidenceUseCases,
   createConfiguredEvidenceUseCases,
 } from "../evidence/composition";
-import { configureWorkComposition, createConfiguredWorkComposition } from "../work/composition";
+import {
+  configureWorkComposition,
+  createConfiguredWorkComposition,
+} from "../work/composition";
 import verificationsIndexPost from "../../routes/v1/verifications/index.post";
 
 // The route references Nitro's auto-imported createError; a unit test must
@@ -74,9 +77,12 @@ beforeAll(async () => {
   const app = createApp();
   app.use(router);
   apiServer = createServer(toNodeListener(app));
-  await new Promise<void>((resolve) => apiServer.listen(0, "127.0.0.1", () => resolve()));
+  await new Promise<void>((resolve) =>
+    apiServer.listen(0, "127.0.0.1", () => resolve()),
+  );
   const address = apiServer.address();
-  const port = typeof address === "object" && address !== null ? address.port : 0;
+  const port =
+    typeof address === "object" && address !== null ? address.port : 0;
   apiBaseUrl = `http://127.0.0.1:${port}`;
 });
 
@@ -92,7 +98,9 @@ afterAll(async () => {
     });
   });
   await Promise.all(
-    [...createdDirs].map((directory) => rm(directory, { recursive: true, force: true })),
+    [...createdDirs].map((directory) =>
+      rm(directory, { recursive: true, force: true }),
+    ),
   );
 });
 
@@ -126,8 +134,12 @@ describe("POST /v1/verifications with a v2 installation (H4 follow-ups)", () => 
   it("answers 400 when the body carries a hostId", async () => {
     const stateDir = await makeTempDir();
     const installation = noVerifierInstallation();
-    configureWorkComposition(createConfiguredWorkComposition({ stateDir, installation }));
-    configureEvidenceUseCases(createConfiguredEvidenceUseCases({ stateDir, installation }));
+    configureWorkComposition(
+      createConfiguredWorkComposition({ stateDir, installation }),
+    );
+    configureEvidenceUseCases(
+      createConfiguredEvidenceUseCases({ stateDir, installation }),
+    );
 
     const response = await callVerifications({
       assessmentId: "assess-400",
@@ -179,8 +191,12 @@ describe("POST /v1/verifications with a v2 installation (H4 follow-ups)", () => 
       createdAtIso: "2026-10-17T08:00:00.000Z",
       updatedAtIso: "2026-10-17T08:00:00.000Z",
     });
-    configureWorkComposition(createConfiguredWorkComposition({ stateDir, installation }));
-    configureEvidenceUseCases(createConfiguredEvidenceUseCases({ stateDir, installation }));
+    configureWorkComposition(
+      createConfiguredWorkComposition({ stateDir, installation }),
+    );
+    configureEvidenceUseCases(
+      createConfiguredEvidenceUseCases({ stateDir, installation }),
+    );
 
     const response = await callVerifications({
       assessmentId: "assess-nv",

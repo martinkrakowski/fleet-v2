@@ -338,6 +338,8 @@ export class InMemoryDecisionReceiptJournalAdapter implements DecisionReceiptJou
       outcomes: this.outcomes
         .filter((outcome) => outcome.consumer === consumer)
         .map((outcome) => ({ ...outcome, value: [...outcome.value] })),
+      // Nothing is ever on disk here, so nothing is ever skipped as malformed.
+      skippedLines: 0,
     };
   }
 

@@ -344,8 +344,8 @@ function decisionsReportLine(figure: RankingTrialContextFigures): string {
       : Object.entries(figure.unknownRateByReason)
           .map(([reason, rate]) => `${reason}:${rate}`)
           .join(',');
-  const yesNo = (value: boolean | null): string =>
-    value === null ? 'n/a' : value ? 'yes' : 'no';
+  const yesNo = (value: boolean | 'tie' | null): string =>
+    value === null ? 'n/a' : value === 'tie' ? 'tie' : value ? 'yes' : 'no';
   return [
     figure.contextRef,
     `calls=${figure.calls}`,
@@ -549,11 +549,17 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
       }
       const snapshot = await rt.knowledge.decisionReceiptJournal.readJournal({ consumer });
       const figures = computeRankingTrialFigures(snapshot);
+      // Fix round: the read skips malformed lines instead of failing, and
+      // the report says so rather than reading as if nothing were missing.
+      const lines = figures.map((figure) => decisionsReportLine(figure));
+      if (snapshot.skippedLines > 0) {
+        lines.push(`skipped malformed lines: ${snapshot.skippedLines}`);
+      }
       return {
         outcome: 'reported',
         consumer,
         contextCount: figures.length,
-        lines: figures.map((figure) => decisionsReportLine(figure)),
+        lines,
       };
     },
   },

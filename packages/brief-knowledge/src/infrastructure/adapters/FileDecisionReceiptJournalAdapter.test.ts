@@ -7,41 +7,41 @@
 // kinds. `rankingReceipt` builds the full envelope so each case still states
 // only the field it is about.
 
-import { promises as fs } from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { promises as fs } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   FileDecisionReceiptJournalAdapter,
   MalformedReceiptLineError,
-} from './FileDecisionReceiptJournalAdapter.adapter.js';
-import { FileLockTimeoutError } from './file-store.js';
-import { NotConfiguredReceiptJournal } from './NotConfiguredReceiptJournal.adapter.js';
-import type { RankingDecisionCallReceipt } from '../../application/ports/out/DecisionReceiptJournalPort.out-port.js';
+} from "./FileDecisionReceiptJournalAdapter.adapter.js";
+import { FileLockTimeoutError } from "./file-store.js";
+import { NotConfiguredReceiptJournal } from "./NotConfiguredReceiptJournal.adapter.js";
+import type { RankingDecisionCallReceipt } from "../../application/ports/out/DecisionReceiptJournalPort.out-port.js";
 
 /** A reserved line's stateSha256 must be a lowercase hex SHA-256 digest. */
-const SHA_A = 'a'.repeat(64);
-const SHA_B = 'b'.repeat(64);
-const SHA_C = 'c'.repeat(64);
-const SHA_D = 'd'.repeat(64);
+const SHA_A = "a".repeat(64);
+const SHA_B = "b".repeat(64);
+const SHA_C = "c".repeat(64);
+const SHA_D = "d".repeat(64);
 
 /** A fixed contextRef in the ranking format, for cases that do not test it. */
-const CONTEXT_REF = `ranking:lane-d4:${'d'.repeat(64)}`;
+const CONTEXT_REF = `ranking:lane-d4:${"d".repeat(64)}`;
 
 /** The K2 ranking envelope; each case overrides only what it is about. */
 function rankingReceipt(
   overrides: Partial<RankingDecisionCallReceipt> = {},
 ): RankingDecisionCallReceipt {
   return {
-    consumer: 'knowledge-ranking',
+    consumer: "knowledge-ranking",
     contextRef: CONTEXT_REF,
-    provider: 'jev',
-    model: 'typesafe/jev-1.14',
-    questionKinds: ['score'],
+    provider: "jev",
+    model: "typesafe/jev-1.14",
+    questionKinds: ["score"],
     latencyMs: 12,
-    lexicalOrder: ['bk-1'],
-    decidedOrder: ['bk-1'],
+    lexicalOrder: ["bk-1"],
+    decidedOrder: ["bk-1"],
     ...overrides,
   };
 }
@@ -51,7 +51,7 @@ const itAsNonRoot = process.getuid?.() === 0 ? it.skip : it;
 
 /** The JSONL line shapes, as written by the adapter. */
 interface ReservedLine {
-  kind: 'reserved';
+  kind: "reserved";
   id: string;
   consumer?: string;
   assumedCostUsd: number;
@@ -60,7 +60,7 @@ interface ReservedLine {
 }
 
 interface SettledLine {
-  kind: 'settled';
+  kind: "settled";
   reservationId: string;
   consumer?: string;
   contextRef?: string;
@@ -80,29 +80,37 @@ interface SettledLine {
 
 type JournalLine = ReservedLine | SettledLine;
 
-async function readJournalLines(stateDir: string, month: string): Promise<JournalLine[]> {
-  const raw = await fs.readFile(path.join(stateDir, 'decision-receipts', `${month}.jsonl`), 'utf8');
+async function readJournalLines(
+  stateDir: string,
+  month: string,
+): Promise<JournalLine[]> {
+  const raw = await fs.readFile(
+    path.join(stateDir, "decision-receipts", `${month}.jsonl`),
+    "utf8",
+  );
   return raw
-    .split('\n')
+    .split("\n")
     .filter((line) => line.length > 0)
     .map((line) => JSON.parse(line) as JournalLine);
 }
 
-describe('FileDecisionReceiptJournalAdapter', () => {
+describe("FileDecisionReceiptJournalAdapter", () => {
   let tempDir: string;
 
   beforeEach(async () => {
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-d4-receipts-test-'));
+    tempDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "fleet-d4-receipts-test-"),
+    );
   });
 
   afterEach(async () => {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   });
 
-  it('reserves below budget and refuses at or above it', async () => {
+  it("reserves below budget and refuses at or above it", async () => {
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
+      () => new Date("2026-01-15T10:00:00.000Z"),
     );
 
     const below = await adapter.reserve({
@@ -117,7 +125,7 @@ describe('FileDecisionReceiptJournalAdapter', () => {
       monthlyBudgetUsd: 1,
       stateSha256: SHA_B,
     });
-    expect(at).toEqual({ ok: false, reason: 'budget-exhausted' });
+    expect(at).toEqual({ ok: false, reason: "budget-exhausted" });
 
     const justBelow = await adapter.reserve({
       assumedCostUsd: 0.5,
@@ -127,57 +135,77 @@ describe('FileDecisionReceiptJournalAdapter', () => {
     expect(justBelow.ok).toBe(true);
 
     // Only the two accepted reservations were appended.
-    expect(await adapter.monthSpendUsd(new Date('2026-01-20T00:00:00.000Z'))).toBe(0.75);
-    const lines = await readJournalLines(tempDir, '2026-01');
+    expect(
+      await adapter.monthSpendUsd(new Date("2026-01-20T00:00:00.000Z")),
+    ).toBe(0.75);
+    const lines = await readJournalLines(tempDir, "2026-01");
     expect(lines).toHaveLength(2);
-    expect(lines.every((line) => line.kind === 'reserved')).toBe(true);
+    expect(lines.every((line) => line.kind === "reserved")).toBe(true);
   });
 
-  it('lets a settled cost replace the reserved assumed cost in the budget ledger', async () => {
+  it("lets a settled cost replace the reserved assumed cost in the budget ledger", async () => {
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
+      () => new Date("2026-01-15T10:00:00.000Z"),
     );
     const reserved = await adapter.reserve({
       assumedCostUsd: 0.5,
       monthlyBudgetUsd: 1,
       stateSha256: SHA_A,
     });
-    if (!reserved.ok) throw new Error('reserve below budget must succeed');
+    if (!reserved.ok) throw new Error("reserve below budget must succeed");
 
-    await adapter.settle(reserved.reservationId, rankingReceipt({ costUsd: 0.125 }));
-    expect(await adapter.monthSpendUsd(new Date('2026-01-20T00:00:00.000Z'))).toBe(0.125);
+    await adapter.settle(
+      reserved.reservationId,
+      rankingReceipt({ costUsd: 0.125 }),
+    );
+    expect(
+      await adapter.monthSpendUsd(new Date("2026-01-20T00:00:00.000Z")),
+    ).toBe(0.125);
 
     // The settled cost freed budget: 0.125 + 0.75 stays below 1 and is allowed…
-    const below = await adapter.reserve({ assumedCostUsd: 0.75, monthlyBudgetUsd: 1, stateSha256: SHA_B });
+    const below = await adapter.reserve({
+      assumedCostUsd: 0.75,
+      monthlyBudgetUsd: 1,
+      stateSha256: SHA_B,
+    });
     expect(below.ok).toBe(true);
     // …and reaching the cap exactly is refused.
-    const at = await adapter.reserve({ assumedCostUsd: 0.125, monthlyBudgetUsd: 1, stateSha256: SHA_B });
-    expect(at).toEqual({ ok: false, reason: 'budget-exhausted' });
+    const at = await adapter.reserve({
+      assumedCostUsd: 0.125,
+      monthlyBudgetUsd: 1,
+      stateSha256: SHA_B,
+    });
+    expect(at).toEqual({ ok: false, reason: "budget-exhausted" });
   });
 
-  it('keeps the assumed cost and marks estimated when the receipt has no cost', async () => {
+  it("keeps the assumed cost and marks estimated when the receipt has no cost", async () => {
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
+      () => new Date("2026-01-15T10:00:00.000Z"),
     );
     const reserved = await adapter.reserve({
       assumedCostUsd: 0.5,
       monthlyBudgetUsd: 1,
       stateSha256: SHA_A,
     });
-    if (!reserved.ok) throw new Error('reserve below budget must succeed');
+    if (!reserved.ok) throw new Error("reserve below budget must succeed");
 
-    await adapter.settle(reserved.reservationId, rankingReceipt({ unknownReason: 'timeout' }));
+    await adapter.settle(
+      reserved.reservationId,
+      rankingReceipt({ unknownReason: "timeout" }),
+    );
 
-    const lines = await readJournalLines(tempDir, '2026-01');
+    const lines = await readJournalLines(tempDir, "2026-01");
     expect(lines).toHaveLength(2);
     const settled = lines[1] as SettledLine;
     expect(settled.reservationId).toBe(reserved.reservationId);
     expect(settled.costUsd).toBe(0.5);
     expect(settled.estimated).toBe(true);
-    expect(settled.unknownReason).toBe('timeout');
-    expect(await adapter.monthSpendUsd(new Date('2026-01-20T00:00:00.000Z'))).toBe(0.5);
+    expect(settled.unknownReason).toBe("timeout");
+    expect(
+      await adapter.monthSpendUsd(new Date("2026-01-20T00:00:00.000Z")),
+    ).toBe(0.5);
 
     // A receipt that does report its cost is recorded with estimated: false.
     const second = await adapter.reserve({
@@ -185,25 +213,28 @@ describe('FileDecisionReceiptJournalAdapter', () => {
       monthlyBudgetUsd: 1,
       stateSha256: SHA_D,
     });
-    if (!second.ok) throw new Error('reserve below budget must succeed');
-    await adapter.settle(second.reservationId, rankingReceipt({ costUsd: 0.125 }));
-    const after = await readJournalLines(tempDir, '2026-01');
+    if (!second.ok) throw new Error("reserve below budget must succeed");
+    await adapter.settle(
+      second.reservationId,
+      rankingReceipt({ costUsd: 0.125 }),
+    );
+    const after = await readJournalLines(tempDir, "2026-01");
     const settledSecond = after[3] as SettledLine;
     expect(settledSecond.estimated).toBe(false);
     expect(settledSecond.costUsd).toBe(0.125);
   });
 
-  it('keys months on UTC, so 23:30 on the last day stays in that UTC month', async () => {
+  it("keys months on UTC, so 23:30 on the last day stays in that UTC month", async () => {
     // A host running UTC+2 whose local clock reads 2026-01-31 23:30 (or even
     // 2026-02-01 00:30 local, i.e. 2026-01-31T22:30Z) is still inside UTC
     // January: the journal uses UTC getters only, never the local month.
     const lateJanuary = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-31T23:30:00.000Z'),
+      () => new Date("2026-01-31T23:30:00.000Z"),
     );
     const beforeBoundary = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-31T22:30:00.000Z'),
+      () => new Date("2026-01-31T22:30:00.000Z"),
     );
 
     const reserved = await lateJanuary.reserve({
@@ -211,59 +242,167 @@ describe('FileDecisionReceiptJournalAdapter', () => {
       monthlyBudgetUsd: 1,
       stateSha256: SHA_A,
     });
-    if (!reserved.ok) throw new Error('reserve must succeed');
+    if (!reserved.ok) throw new Error("reserve must succeed");
     const reservedEarlier = await beforeBoundary.reserve({
       assumedCostUsd: 0.25,
       monthlyBudgetUsd: 1,
       stateSha256: SHA_A,
     });
-    if (!reservedEarlier.ok) throw new Error('reserve must succeed');
-    await lateJanuary.settle(reserved.reservationId, rankingReceipt({ costUsd: 0.125 }));
-    await beforeBoundary.settle(reservedEarlier.reservationId, rankingReceipt());
+    if (!reservedEarlier.ok) throw new Error("reserve must succeed");
+    await lateJanuary.settle(
+      reserved.reservationId,
+      rankingReceipt({ costUsd: 0.125 }),
+    );
+    await beforeBoundary.settle(
+      reservedEarlier.reservationId,
+      rankingReceipt(),
+    );
 
-    const januaryPath = path.join(tempDir, 'decision-receipts', '2026-01.jsonl');
+    const januaryPath = path.join(
+      tempDir,
+      "decision-receipts",
+      "2026-01.jsonl",
+    );
     await expect(fs.access(januaryPath)).resolves.toBeUndefined();
     await expect(
-      fs.access(path.join(tempDir, 'decision-receipts', '2026-02.jsonl')),
-    ).rejects.toMatchObject({ code: 'ENOENT' });
-    expect(await readJournalLines(tempDir, '2026-01')).toHaveLength(4);
+      fs.access(path.join(tempDir, "decision-receipts", "2026-02.jsonl")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readJournalLines(tempDir, "2026-01")).toHaveLength(4);
 
     // The next UTC month starts a fresh file and a fresh budget.
     const february = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-02-01T00:30:00.000Z'),
+      () => new Date("2026-02-01T00:30:00.000Z"),
     );
-    await february.reserve({ assumedCostUsd: 0.25, monthlyBudgetUsd: 1, stateSha256: SHA_B });
-    expect(await readJournalLines(tempDir, '2026-02')).toHaveLength(1);
-    expect(await february.monthSpendUsd(new Date('2026-02-15T00:00:00.000Z'))).toBe(0.25);
+    await february.reserve({
+      assumedCostUsd: 0.25,
+      monthlyBudgetUsd: 1,
+      stateSha256: SHA_B,
+    });
+    expect(await readJournalLines(tempDir, "2026-02")).toHaveLength(1);
+    expect(
+      await february.monthSpendUsd(new Date("2026-02-15T00:00:00.000Z")),
+    ).toBe(0.25);
     // January: settled 0.125 (replaces its 0.25 reservation) + estimated 0.25.
-    expect(await february.monthSpendUsd(new Date('2026-01-15T00:00:00.000Z'))).toBe(0.375);
+    expect(
+      await february.monthSpendUsd(new Date("2026-01-15T00:00:00.000Z")),
+    ).toBe(0.375);
   });
 
-  it('throws on a corrupt line instead of skipping it, and preserves the file', async () => {
+  it("throws on a corrupt line instead of skipping it, and preserves the file", async () => {
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
+      () => new Date("2026-01-15T10:00:00.000Z"),
     );
-    await adapter.reserve({ assumedCostUsd: 0.25, monthlyBudgetUsd: 1, stateSha256: SHA_B });
-    const filePath = path.join(tempDir, 'decision-receipts', '2026-01.jsonl');
+    await adapter.reserve({
+      assumedCostUsd: 0.25,
+      monthlyBudgetUsd: 1,
+      stateSha256: SHA_B,
+    });
+    const filePath = path.join(tempDir, "decision-receipts", "2026-01.jsonl");
 
     await fs.appendFile(filePath, '{"kind":"reser\n');
-    const corrupted = await fs.readFile(filePath, 'utf8');
+    const corrupted = await fs.readFile(filePath, "utf8");
 
-    await expect(adapter.monthSpendUsd(new Date('2026-01-20T00:00:00.000Z'))).rejects.toThrow(
-      MalformedReceiptLineError,
-    );
     await expect(
-      adapter.reserve({ assumedCostUsd: 0.25, monthlyBudgetUsd: 1, stateSha256: SHA_B }),
+      adapter.monthSpendUsd(new Date("2026-01-20T00:00:00.000Z")),
+    ).rejects.toThrow(MalformedReceiptLineError);
+    await expect(
+      adapter.reserve({
+        assumedCostUsd: 0.25,
+        monthlyBudgetUsd: 1,
+        stateSha256: SHA_B,
+      }),
     ).rejects.toThrow(MalformedReceiptLineError);
 
     // The refused reserve appended nothing to the corrupt file.
-    expect(await fs.readFile(filePath, 'utf8')).toBe(corrupted);
+    expect(await fs.readFile(filePath, "utf8")).toBe(corrupted);
   });
 
-  it('lets only one of two concurrent reserves succeed at the budget edge', async () => {
-    const clock = () => new Date('2026-03-15T10:00:00.000Z');
+  it("fix round: the report read skips a corrupt line in either file and counts them", async () => {
+    const adapter = new FileDecisionReceiptJournalAdapter(
+      tempDir,
+      () => new Date("2026-01-15T10:00:00.000Z"),
+    );
+    const reserved = await adapter.reserve({
+      assumedCostUsd: 0.25,
+      monthlyBudgetUsd: 1,
+      stateSha256: SHA_A,
+    });
+    if (!reserved.ok) throw new Error("reserve refused");
+    await adapter.settle(reserved.reservationId, rankingReceipt());
+
+    const receiptsPath = path.join(
+      tempDir,
+      "decision-receipts",
+      "2026-01.jsonl",
+    );
+    const outcomesPath = path.join(
+      tempDir,
+      "decision-receipts",
+      "outcomes-2026-01.jsonl",
+    );
+    await fs.appendFile(receiptsPath, '{"kind":"reser\n');
+    await fs.appendFile(
+      outcomesPath,
+      `${JSON.stringify({
+        consumer: "knowledge-ranking",
+        contextRef: CONTEXT_REF,
+        kind: "ranking-selection",
+        value: ["bk-1"],
+        at: "2026-01-15T10:05:00.000Z",
+      })}\n{'nope'\n`,
+    );
+
+    const snapshot = await adapter.readJournal({
+      consumer: "knowledge-ranking",
+    });
+    expect(snapshot.skippedLines).toBe(2);
+    // The valid lines of both files survived the skips, in append order.
+    expect(snapshot.receipts).toHaveLength(1);
+    expect(snapshot.receipts[0]?.contextRef).toBe(CONTEXT_REF);
+    expect(snapshot.outcomes).toHaveLength(1);
+    expect(snapshot.outcomes[0]?.value).toEqual(["bk-1"]);
+  });
+
+  it("fix round: the budget path still throws on the same corrupt files", async () => {
+    const adapter = new FileDecisionReceiptJournalAdapter(
+      tempDir,
+      () => new Date("2026-01-15T10:00:00.000Z"),
+    );
+    const receiptsPath = path.join(
+      tempDir,
+      "decision-receipts",
+      "2026-01.jsonl",
+    );
+    const outcomesPath = path.join(
+      tempDir,
+      "decision-receipts",
+      "outcomes-2026-01.jsonl",
+    );
+    await fs.mkdir(path.join(tempDir, "decision-receipts"), {
+      recursive: true,
+    });
+    await fs.writeFile(receiptsPath, `{"kind":"reser\n`, "utf8");
+    await fs.writeFile(
+      outcomesPath,
+      `${JSON.stringify({
+        consumer: "knowledge-ranking",
+        contextRef: CONTEXT_REF,
+        kind: "ranking-selection",
+        value: ["bk-1"],
+        at: "2026-01-15T10:05:00.000Z",
+      })}\n{'nope'\n`,
+      "utf8",
+    );
+
+    await expect(
+      adapter.monthSpendUsd(new Date("2026-01-20T00:00:00.000Z")),
+    ).rejects.toThrow(MalformedReceiptLineError);
+  });
+
+  it("lets only one of two concurrent reserves succeed at the budget edge", async () => {
+    const clock = () => new Date("2026-03-15T10:00:00.000Z");
     const adapterA = new FileDecisionReceiptJournalAdapter(tempDir, clock);
     const adapterB = new FileDecisionReceiptJournalAdapter(tempDir, clock);
     const query = {
@@ -272,277 +411,329 @@ describe('FileDecisionReceiptJournalAdapter', () => {
       stateSha256: SHA_A,
     } as const;
 
-    const results = await Promise.all([adapterA.reserve(query), adapterB.reserve(query)]);
+    const results = await Promise.all([
+      adapterA.reserve(query),
+      adapterB.reserve(query),
+    ]);
     const accepted = results.filter((result) => result.ok);
     const refused = results.filter((result) => !result.ok);
     expect(accepted).toHaveLength(1);
-    expect(refused).toEqual([{ ok: false, reason: 'budget-exhausted' }]);
+    expect(refused).toEqual([{ ok: false, reason: "budget-exhausted" }]);
 
-    expect(await adapterA.monthSpendUsd(new Date('2026-03-20T00:00:00.000Z'))).toBe(0.5);
-    expect(await readJournalLines(tempDir, '2026-03')).toHaveLength(1);
+    expect(
+      await adapterA.monthSpendUsd(new Date("2026-03-20T00:00:00.000Z")),
+    ).toBe(0.5);
+    expect(await readJournalLines(tempDir, "2026-03")).toHaveLength(1);
   });
 
-  it('never writes under the owner-decision inbox decisions/', async () => {
+  it("never writes under the owner-decision inbox decisions/", async () => {
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
+      () => new Date("2026-01-15T10:00:00.000Z"),
     );
     const reserved = await adapter.reserve({
       assumedCostUsd: 0.25,
       monthlyBudgetUsd: 1,
       stateSha256: SHA_A,
     });
-    if (!reserved.ok) throw new Error('reserve must succeed');
-    await adapter.settle(reserved.reservationId, rankingReceipt({ costUsd: 0.125 }));
+    if (!reserved.ok) throw new Error("reserve must succeed");
+    await adapter.settle(
+      reserved.reservationId,
+      rankingReceipt({ costUsd: 0.125 }),
+    );
 
     const created = await fs.readdir(tempDir, { recursive: true });
     expect(created.length).toBeGreaterThan(0);
     for (const entry of created) {
-      expect(entry.split(path.sep)[0]).toBe('decision-receipts');
+      expect(entry.split(path.sep)[0]).toBe("decision-receipts");
     }
     await expect(
-      fs.access(path.join(tempDir, 'decision-receipts', '2026-01.jsonl')),
+      fs.access(path.join(tempDir, "decision-receipts", "2026-01.jsonl")),
     ).resolves.toBeUndefined();
   });
 
-  it('reports zero spend for a month with no journal file', async () => {
+  it("reports zero spend for a month with no journal file", async () => {
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
+      () => new Date("2026-01-15T10:00:00.000Z"),
     );
-    expect(await adapter.monthSpendUsd(new Date('2026-03-01T00:00:00.000Z'))).toBe(0);
+    expect(
+      await adapter.monthSpendUsd(new Date("2026-03-01T00:00:00.000Z")),
+    ).toBe(0);
   });
 
-  it('counts a settled entry whose reservation lives outside the month file', async () => {
+  it("counts a settled entry whose reservation lives outside the month file", async () => {
     // Hand-written orphan settled line: a paid call is never invisible.
-    const filePath = path.join(tempDir, 'decision-receipts', '2026-01.jsonl');
+    const filePath = path.join(tempDir, "decision-receipts", "2026-01.jsonl");
     await fs.mkdir(path.dirname(filePath), { recursive: true });
     await fs.writeFile(
       filePath,
       `${JSON.stringify({
-        kind: 'settled',
-        reservationId: 'orphan',
-        provider: 'jev',
-        model: 'typesafe/jev-1.14',
+        kind: "settled",
+        reservationId: "orphan",
+        provider: "jev",
+        model: "typesafe/jev-1.14",
         costUsd: 0.25,
         estimated: false,
-        lexicalOrder: ['bk-1'],
-        decidedOrder: ['bk-1'],
-        at: '2026-01-02T00:00:00.000Z',
+        lexicalOrder: ["bk-1"],
+        decidedOrder: ["bk-1"],
+        at: "2026-01-02T00:00:00.000Z",
       })}\n`,
-      'utf8',
+      "utf8",
     );
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
+      () => new Date("2026-01-15T10:00:00.000Z"),
     );
-    expect(await adapter.monthSpendUsd(new Date('2026-01-20T00:00:00.000Z'))).toBe(0.25);
+    expect(
+      await adapter.monthSpendUsd(new Date("2026-01-20T00:00:00.000Z")),
+    ).toBe(0.25);
   });
 
-  it('refuses to settle an unknown reservation even when a cost is reported, leaving the file unchanged', async () => {
+  it("refuses to settle an unknown reservation even when a cost is reported, leaving the file unchanged", async () => {
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
+      () => new Date("2026-01-15T10:00:00.000Z"),
     );
     const reserved = await adapter.reserve({
       assumedCostUsd: 0.25,
       monthlyBudgetUsd: 1,
       stateSha256: SHA_A,
     });
-    if (!reserved.ok) throw new Error('reserve below budget must succeed');
+    if (!reserved.ok) throw new Error("reserve below budget must succeed");
     const before = await fs.readFile(
-      path.join(tempDir, 'decision-receipts', '2026-01.jsonl'),
-      'utf8',
+      path.join(tempDir, "decision-receipts", "2026-01.jsonl"),
+      "utf8",
     );
 
     await expect(
-      adapter.settle('no-such-reservation', rankingReceipt({ costUsd: 0.125 })),
+      adapter.settle("no-such-reservation", rankingReceipt({ costUsd: 0.125 })),
     ).rejects.toThrow(/unknown reservation/);
 
     // Nothing was appended for the refused settle.
-    expect(await fs.readFile(path.join(tempDir, 'decision-receipts', '2026-01.jsonl'), 'utf8')).toBe(
-      before,
-    );
+    expect(
+      await fs.readFile(
+        path.join(tempDir, "decision-receipts", "2026-01.jsonl"),
+        "utf8",
+      ),
+    ).toBe(before);
   });
 
-  it('refuses a second settle of the same reservation, leaving spend unchanged', async () => {
+  it("refuses a second settle of the same reservation, leaving spend unchanged", async () => {
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
+      () => new Date("2026-01-15T10:00:00.000Z"),
     );
     const reserved = await adapter.reserve({
       assumedCostUsd: 0.5,
       monthlyBudgetUsd: 1,
       stateSha256: SHA_A,
     });
-    if (!reserved.ok) throw new Error('reserve below budget must succeed');
+    if (!reserved.ok) throw new Error("reserve below budget must succeed");
     const receipt = rankingReceipt({ costUsd: 0.125 });
     await adapter.settle(reserved.reservationId, receipt);
 
-    await expect(adapter.settle(reserved.reservationId, receipt)).rejects.toThrow(
-      /already settled/,
-    );
+    await expect(
+      adapter.settle(reserved.reservationId, receipt),
+    ).rejects.toThrow(/already settled/);
     // Spend still reflects the single settled cost.
-    expect(await adapter.monthSpendUsd(new Date('2026-01-20T00:00:00.000Z'))).toBe(0.125);
+    expect(
+      await adapter.monthSpendUsd(new Date("2026-01-20T00:00:00.000Z")),
+    ).toBe(0.125);
   });
 
-  itAsNonRoot('refuses reserve and monthSpendUsd when the month file is unreadable', async () => {
-    const adapter = new FileDecisionReceiptJournalAdapter(
-      tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
-    );
-    const reserved = await adapter.reserve({
-      assumedCostUsd: 0.25,
-      monthlyBudgetUsd: 1,
-      stateSha256: SHA_A,
-    });
-    expect(reserved.ok).toBe(true);
-    const filePath = path.join(tempDir, 'decision-receipts', '2026-01.jsonl');
-    await fs.chmod(filePath, 0o000);
-    try {
-      await expect(adapter.monthSpendUsd(new Date('2026-01-20T00:00:00.000Z'))).rejects.toMatchObject(
-        { code: 'EACCES' },
+  itAsNonRoot(
+    "refuses reserve and monthSpendUsd when the month file is unreadable",
+    async () => {
+      const adapter = new FileDecisionReceiptJournalAdapter(
+        tempDir,
+        () => new Date("2026-01-15T10:00:00.000Z"),
       );
-      await expect(
-        adapter.reserve({ assumedCostUsd: 0.25, monthlyBudgetUsd: 1, stateSha256: SHA_B }),
-      ).rejects.toMatchObject({ code: 'EACCES' });
-    } finally {
-      await fs.chmod(filePath, 0o644);
-    }
-  });
+      const reserved = await adapter.reserve({
+        assumedCostUsd: 0.25,
+        monthlyBudgetUsd: 1,
+        stateSha256: SHA_A,
+      });
+      expect(reserved.ok).toBe(true);
+      const filePath = path.join(tempDir, "decision-receipts", "2026-01.jsonl");
+      await fs.chmod(filePath, 0o000);
+      try {
+        await expect(
+          adapter.monthSpendUsd(new Date("2026-01-20T00:00:00.000Z")),
+        ).rejects.toMatchObject({ code: "EACCES" });
+        await expect(
+          adapter.reserve({
+            assumedCostUsd: 0.25,
+            monthlyBudgetUsd: 1,
+            stateSha256: SHA_B,
+          }),
+        ).rejects.toMatchObject({ code: "EACCES" });
+      } finally {
+        await fs.chmod(filePath, 0o644);
+      }
+    },
+  );
 
-  it('times out with the configured lockTimeoutMs against a pre-existing lock file', async () => {
-    const receiptsDir = path.join(tempDir, 'decision-receipts');
+  it("times out with the configured lockTimeoutMs against a pre-existing lock file", async () => {
+    const receiptsDir = path.join(tempDir, "decision-receipts");
     await fs.mkdir(receiptsDir, { recursive: true });
     // A lock held by some other process is never taken over.
     await fs.writeFile(
-      path.join(receiptsDir, '2026-01.jsonl.lock'),
+      path.join(receiptsDir, "2026-01.jsonl.lock"),
       `${process.pid + 1}-notourtoken-${Date.now()}`,
-      'utf8',
+      "utf8",
     );
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
+      () => new Date("2026-01-15T10:00:00.000Z"),
       { lockTimeoutMs: 200 },
     );
     await expect(
-      adapter.reserve({ assumedCostUsd: 0.25, monthlyBudgetUsd: 1, stateSha256: SHA_A }),
+      adapter.reserve({
+        assumedCostUsd: 0.25,
+        monthlyBudgetUsd: 1,
+        stateSha256: SHA_A,
+      }),
     ).rejects.toThrow(FileLockTimeoutError);
     // The foreign lock file was left in place.
     await expect(
-      fs.access(path.join(receiptsDir, '2026-01.jsonl.lock')),
+      fs.access(path.join(receiptsDir, "2026-01.jsonl.lock")),
     ).resolves.toBeUndefined();
   });
 
-  it('refuses to settle against a corrupt month file and appends nothing', async () => {
+  it("refuses to settle against a corrupt month file and appends nothing", async () => {
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
+      () => new Date("2026-01-15T10:00:00.000Z"),
     );
     const reserved = await adapter.reserve({
       assumedCostUsd: 0.25,
       monthlyBudgetUsd: 1,
       stateSha256: SHA_A,
     });
-    if (!reserved.ok) throw new Error('reserve below budget must succeed');
-    const filePath = path.join(tempDir, 'decision-receipts', '2026-01.jsonl');
+    if (!reserved.ok) throw new Error("reserve below budget must succeed");
+    const filePath = path.join(tempDir, "decision-receipts", "2026-01.jsonl");
     await fs.appendFile(filePath, '{"kind":"settl\n');
-    const corrupted = await fs.readFile(filePath, 'utf8');
+    const corrupted = await fs.readFile(filePath, "utf8");
 
     await expect(
-      adapter.settle(reserved.reservationId, rankingReceipt({ costUsd: 0.125 })),
+      adapter.settle(
+        reserved.reservationId,
+        rankingReceipt({ costUsd: 0.125 }),
+      ),
     ).rejects.toThrow(MalformedReceiptLineError);
 
-    expect(await fs.readFile(filePath, 'utf8')).toBe(corrupted);
+    expect(await fs.readFile(filePath, "utf8")).toBe(corrupted);
   });
 
-  it('writes exactly the declared key sets for a reserved and a settled line', async () => {
+  it("writes exactly the declared key sets for a reserved and a settled line", async () => {
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
+      () => new Date("2026-01-15T10:00:00.000Z"),
     );
     const reserved = await adapter.reserve({
       assumedCostUsd: 0.25,
       monthlyBudgetUsd: 1,
       stateSha256: SHA_A,
     });
-    if (!reserved.ok) throw new Error('reserve below budget must succeed');
-    await adapter.settle(reserved.reservationId, rankingReceipt({
-      requestId: 'req-1',
-      costUsd: 0.125,
-      lexicalOrder: ['bk-1', 'bk-2'],
-      decidedOrder: ['bk-2', 'bk-1'],
-    }));
+    if (!reserved.ok) throw new Error("reserve below budget must succeed");
+    await adapter.settle(
+      reserved.reservationId,
+      rankingReceipt({
+        requestId: "req-1",
+        costUsd: 0.125,
+        lexicalOrder: ["bk-1", "bk-2"],
+        decidedOrder: ["bk-2", "bk-1"],
+      }),
+    );
 
     const raw = await fs.readFile(
-      path.join(tempDir, 'decision-receipts', '2026-01.jsonl'),
-      'utf8',
+      path.join(tempDir, "decision-receipts", "2026-01.jsonl"),
+      "utf8",
     );
     const [reservedLine, settledLine] = raw
-      .split('\n')
+      .split("\n")
       .filter((line) => line.length > 0)
       .map((line) => JSON.parse(line) as Record<string, unknown>);
     expect(Object.keys(reservedLine).sort()).toEqual([
-      'assumedCostUsd',
-      'at',
-      'consumer',
-      'id',
-      'kind',
-      'stateSha256',
+      "assumedCostUsd",
+      "at",
+      "consumer",
+      "id",
+      "kind",
+      "stateSha256",
     ]);
     expect(Object.keys(settledLine).sort()).toEqual([
-      'at',
-      'consumer',
-      'contextRef',
-      'costUsd',
-      'decidedOrder',
-      'estimated',
-      'kind',
-      'latencyMs',
-      'lexicalOrder',
-      'model',
-      'provider',
-      'questionKinds',
-      'requestId',
-      'reservationId',
+      "at",
+      "consumer",
+      "contextRef",
+      "costUsd",
+      "decidedOrder",
+      "estimated",
+      "kind",
+      "latencyMs",
+      "lexicalOrder",
+      "model",
+      "provider",
+      "questionKinds",
+      "requestId",
+      "reservationId",
     ]);
   });
 
-  it('refuses a reserve whose stateSha256 is not a lowercase hex SHA-256', async () => {
+  it("refuses a reserve whose stateSha256 is not a lowercase hex SHA-256", async () => {
     const adapter = new FileDecisionReceiptJournalAdapter(
       tempDir,
-      () => new Date('2026-01-15T10:00:00.000Z'),
+      () => new Date("2026-01-15T10:00:00.000Z"),
     );
     await expect(
-      adapter.reserve({ assumedCostUsd: 0.25, monthlyBudgetUsd: 1, stateSha256: 'not-hex' }),
+      adapter.reserve({
+        assumedCostUsd: 0.25,
+        monthlyBudgetUsd: 1,
+        stateSha256: "not-hex",
+      }),
     ).rejects.toThrow(/stateSha256/);
     await expect(
-      adapter.reserve({ assumedCostUsd: 0.25, monthlyBudgetUsd: 1, stateSha256: 'A'.repeat(64) }),
+      adapter.reserve({
+        assumedCostUsd: 0.25,
+        monthlyBudgetUsd: 1,
+        stateSha256: "A".repeat(64),
+      }),
     ).rejects.toThrow(/stateSha256/);
     await expect(
-      adapter.reserve({ assumedCostUsd: 0.25, monthlyBudgetUsd: 1, stateSha256: 'a'.repeat(63) }),
+      adapter.reserve({
+        assumedCostUsd: 0.25,
+        monthlyBudgetUsd: 1,
+        stateSha256: "a".repeat(63),
+      }),
     ).rejects.toThrow(/stateSha256/);
   });
 });
 
-describe('NotConfiguredReceiptJournal', () => {
-  it('refuses every reservation with not-configured and reports zero spend', async () => {
+describe("NotConfiguredReceiptJournal", () => {
+  it("refuses every reservation with not-configured and reports zero spend", async () => {
     const journal = new NotConfiguredReceiptJournal();
     expect(
-      await journal.reserve({ assumedCostUsd: 0.25, monthlyBudgetUsd: 1, stateSha256: SHA_A }),
-    ).toEqual({ ok: false, reason: 'not-configured' });
-    expect(await journal.monthSpendUsd(new Date('2026-01-15T00:00:00.000Z'))).toBe(0);
-    await expect(
-      journal.settle('any', rankingReceipt()),
-    ).rejects.toThrow(/not configured/);
+      await journal.reserve({
+        assumedCostUsd: 0.25,
+        monthlyBudgetUsd: 1,
+        stateSha256: SHA_A,
+      }),
+    ).toEqual({ ok: false, reason: "not-configured" });
+    expect(
+      await journal.monthSpendUsd(new Date("2026-01-15T00:00:00.000Z")),
+    ).toBe(0);
+    await expect(journal.settle("any", rankingReceipt())).rejects.toThrow(
+      /not configured/,
+    );
     // Outcomes are best effort: without a durable store one is skipped.
     await expect(
       journal.appendOutcome({
-        consumer: 'knowledge-ranking',
+        consumer: "knowledge-ranking",
         contextRef: CONTEXT_REF,
-        kind: 'ranking-selection',
-        value: ['bk-1'],
-        at: '2026-01-15T00:00:00.000Z',
+        kind: "ranking-selection",
+        value: ["bk-1"],
+        at: "2026-01-15T00:00:00.000Z",
       }),
     ).resolves.toBeUndefined();
   });

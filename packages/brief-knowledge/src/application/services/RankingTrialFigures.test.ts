@@ -5,11 +5,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  FIGURE_NOT_PERSISTED,
-  computeRankingTrialFigures,
   type DecisionJournalSnapshot,
   type SettledDecisionReceiptRecord,
-} from "./DecisionReceiptJournalPort.out-port.js";
+} from "../ports/out/DecisionReceiptJournalPort.out-port.js";
+import {
+  FIGURE_NOT_PERSISTED,
+  computeRankingTrialFigures,
+} from "./RankingTrialFigures.js";
 
 const REF_REORDERED = "ranking:lane-k4:" + "a".repeat(64);
 const REF_STABLE = "ranking:lane-k4:" + "b".repeat(64);
@@ -77,11 +79,12 @@ const SNAPSHOT: DecisionJournalSnapshot = {
       kind: "ranking-selection",
       // The orchestrator picked [b, a]: closer to the lexical order's shared
       // pair than to the decided order's (both taus read -1 here, so the
-      // agreement figures are computable and lexical is not strictly better).
+      // agreement figures are computable and read as a tie).
       value: ["ke-b", "ke-a"],
       at: "2026-10-17T10:05:00.000Z",
     },
   ],
+  skippedLines: 0,
 };
 
 describe("computeRankingTrialFigures", () => {
@@ -113,7 +116,8 @@ describe("computeRankingTrialFigures", () => {
     expect(reordered.selectionRecorded).toBe(true);
     expect(reordered.selectionKendallTauDecided).toBe(-1);
     expect(reordered.selectionKendallTauLexical).toBe(-1);
-    expect(reordered.selectionAgreesWithDecided).toBe(true);
+    // Both taus are -1: a tie, not agreement.
+    expect(reordered.selectionAgreesWithDecided).toBe("tie");
     expect(reordered.selectionAgreesWithLexical).toBe(false);
 
     const stable = figures[1];
@@ -142,6 +146,7 @@ describe("computeRankingTrialFigures", () => {
           at: "2026-10-17T10:05:00.000Z",
         },
       ],
+      skippedLines: 0,
     };
     const figures = computeRankingTrialFigures(snapshot);
     expect(figures).toHaveLength(1);
@@ -170,6 +175,7 @@ describe("computeRankingTrialFigures", () => {
           at: "2026-10-17T10:05:00.000Z",
         },
       ],
+      skippedLines: 0,
     };
     expect(computeRankingTrialFigures(snapshot)).toEqual([]);
   });
@@ -184,6 +190,7 @@ describe("computeRankingTrialFigures", () => {
         }),
       ],
       outcomes: [],
+      skippedLines: 0,
     };
     const figures = computeRankingTrialFigures(snapshot);
     expect(figures[0].kendallTau).toBeNull();

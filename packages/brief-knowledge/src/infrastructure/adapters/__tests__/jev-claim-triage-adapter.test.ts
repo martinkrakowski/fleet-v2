@@ -150,7 +150,7 @@ class FakeJournal implements DecisionReceiptJournalPort {
   async readJournal(
     _query: ReadDecisionJournalQuery,
   ): Promise<DecisionJournalSnapshot> {
-    return { receipts: [], outcomes: [] };
+    return { receipts: [], outcomes: [], skippedLines: 0 };
   }
 }
 

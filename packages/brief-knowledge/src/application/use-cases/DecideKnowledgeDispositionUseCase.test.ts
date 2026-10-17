@@ -72,6 +72,7 @@ class StubDecisionJournal implements DecisionReceiptJournalPort {
     return {
       receipts: [],
       outcomes: this.outcomes.filter((outcome) => outcome.consumer === query.consumer),
+      skippedLines: 0,
     };
   }
 }

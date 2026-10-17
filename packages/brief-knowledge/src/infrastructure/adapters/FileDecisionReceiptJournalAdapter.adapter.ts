@@ -18,14 +18,16 @@
  * under its own lock, so this parser never meets a line kind it does not know.
  *
  * K4: `readJournal` reads every recorded month of both files for one
- * consumer, each under its own lock, and fails closed on a malformed line
- * of either kind — a report never silently under-reports.
+ * consumer, each under its own lock. Fix round: a malformed line of either
+ * file is skipped and counted on the snapshot's `skippedLines` instead of
+ * thrown, so one corrupt line cannot hide the whole recorded history; every
+ * budget path stays strict and still throws.
  */
 
-import { randomUUID } from 'node:crypto';
-import { promises as fs } from 'node:fs';
-import * as path from 'node:path';
-import { budgetAllows, containsSecretShape } from '@fleet/shared';
+import { randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
+import { budgetAllows, containsSecretShape } from "@fleet/shared";
 import type {
   AppendDecisionOutcome,
   DecisionCallReceipt,
@@ -37,12 +39,12 @@ import type {
   ReserveDecisionQuery,
   ReserveDecisionResult,
   SettledDecisionReceiptRecord,
-} from '../../application/ports/out/DecisionReceiptJournalPort.out-port.js';
-import { KNOWLEDGE_RANKING_CONSUMER } from '../../application/ports/out/DecisionReceiptJournalPort.out-port.js';
-import { withFileLock } from './file-store.js';
+} from "../../application/ports/out/DecisionReceiptJournalPort.out-port.js";
+import { KNOWLEDGE_RANKING_CONSUMER } from "../../application/ports/out/DecisionReceiptJournalPort.out-port.js";
+import { withFileLock } from "./file-store.js";
 
 /** Own receipts directory; distinct from the owner-decision inbox `decisions/`. */
-const RECEIPTS_DIRNAME = 'decision-receipts';
+const RECEIPTS_DIRNAME = "decision-receipts";
 
 /** A stateSha256 is always a lowercase hex SHA-256 digest. */
 const STATE_SHA256_PATTERN = /^[0-9a-f]{64}$/;
@@ -58,7 +60,7 @@ const DEFAULT_CONSUMER = KNOWLEDGE_RANKING_CONSUMER;
 
 /** Appended before a call: `{kind:'reserved', id, consumer, assumedCostUsd, stateSha256, at}`. */
 interface ReservedEntry {
-  readonly kind: 'reserved';
+  readonly kind: "reserved";
   readonly id: string;
   readonly consumer: string;
   readonly assumedCostUsd: number;
@@ -68,7 +70,7 @@ interface ReservedEntry {
 
 /** Appended after a call: `{kind:'settled', reservationId, ...receipt}` with the cost resolved. */
 interface SettledEntry {
-  readonly kind: 'settled';
+  readonly kind: "settled";
   readonly reservationId: string;
   readonly consumer: string;
   readonly contextRef: string;
@@ -97,8 +99,10 @@ export class MalformedReceiptLineError extends Error {
   readonly lineNumber: number;
 
   constructor(filePath: string, lineNumber: number, detail: string) {
-    super(`Malformed decision receipt line at ${filePath}:${lineNumber}: ${detail}`);
-    this.name = 'MalformedReceiptLineError';
+    super(
+      `Malformed decision receipt line at ${filePath}:${lineNumber}: ${detail}`,
+    );
+    this.name = "MalformedReceiptLineError";
     this.filePath = filePath;
     this.lineNumber = lineNumber;
     Object.setPrototypeOf(this, new.target.prototype);
@@ -107,14 +111,16 @@ export class MalformedReceiptLineError extends Error {
 
 /** `YYYY-MM` for the UTC month containing `date`; never a local month. */
 function utcMonthKey(date: Date): string {
-  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
 /** `YYYY-MM` for the UTC month before the one containing `date`. */
 function previousUtcMonthKey(date: Date): string {
   const year = date.getUTCFullYear();
   const month = date.getUTCMonth() + 1;
-  return month === 1 ? `${year - 1}-12` : `${year}-${String(month - 1).padStart(2, '0')}`;
+  return month === 1
+    ? `${year - 1}-12`
+    : `${year}-${String(month - 1).padStart(2, "0")}`;
 }
 
 /** Location of a JSONL line, for fail-closed error reporting. */
@@ -125,33 +131,49 @@ interface ParseContext {
 
 /** A malformed line always throws; spend is never computed from skipped input. */
 function malformed(context: ParseContext, detail: string): never {
-  throw new MalformedReceiptLineError(context.filePath, context.lineNumber, detail);
+  throw new MalformedReceiptLineError(
+    context.filePath,
+    context.lineNumber,
+    detail,
+  );
 }
 
-function requireNonEmptyString(context: ParseContext, value: unknown, field: string): string {
-  if (typeof value !== 'string' || value.trim().length === 0) {
+function requireNonEmptyString(
+  context: ParseContext,
+  value: unknown,
+  field: string,
+): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
     malformed(context, `${field} must be a non-empty string`);
   }
   return value;
 }
 
-function requireNonNegativeNumber(context: ParseContext, value: unknown, field: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+function requireNonNegativeNumber(
+  context: ParseContext,
+  value: unknown,
+  field: string,
+): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
     malformed(context, `${field} must be a finite non-negative number`);
   }
   return value;
 }
 
-function requireStringArray(context: ParseContext, value: unknown, field: string): string[] {
-  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+function requireStringArray(
+  context: ParseContext,
+  value: unknown,
+  field: string,
+): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
     malformed(context, `${field} must be an array of strings`);
   }
   return [...value];
 }
 
 function requireStateSha256(context: ParseContext, value: unknown): string {
-  if (typeof value !== 'string' || !STATE_SHA256_PATTERN.test(value)) {
-    malformed(context, 'stateSha256 must match /^[0-9a-f]{64}$/');
+  if (typeof value !== "string" || !STATE_SHA256_PATTERN.test(value)) {
+    malformed(context, "stateSha256 must match /^[0-9a-f]{64}$/");
   }
   return value;
 }
@@ -164,8 +186,15 @@ function requireConsumer(context: ParseContext, value: unknown): string {
   if (value === undefined) {
     return DEFAULT_CONSUMER;
   }
-  if (typeof value !== 'string' || value.trim().length === 0 || value.length > MAX_CONSUMER_CHARS) {
-    malformed(context, `consumer must be a non-empty string of at most ${MAX_CONSUMER_CHARS} chars`);
+  if (
+    typeof value !== "string" ||
+    value.trim().length === 0 ||
+    value.length > MAX_CONSUMER_CHARS
+  ) {
+    malformed(
+      context,
+      `consumer must be a non-empty string of at most ${MAX_CONSUMER_CHARS} chars`,
+    );
   }
   return value;
 }
@@ -173,76 +202,113 @@ function requireConsumer(context: ParseContext, value: unknown): string {
 /** A settled line before K2 carries no contextRef; it joins no outcome. */
 function requireContextRef(context: ParseContext, value: unknown): string {
   if (value === undefined) {
-    return '';
+    return "";
   }
-  return requireNonEmptyString(context, value, 'contextRef');
+  return requireNonEmptyString(context, value, "contextRef");
 }
 
 /** A settled line before K2 carries no latency; K4 reads no measurement, not zero. */
-function requireLatencyMs(context: ParseContext, value: unknown): number | undefined {
+function requireLatencyMs(
+  context: ParseContext,
+  value: unknown,
+): number | undefined {
   if (value === undefined) {
     return undefined;
   }
-  return requireNonNegativeNumber(context, value, 'latencyMs');
+  return requireNonNegativeNumber(context, value, "latencyMs");
 }
 
-function parseEntry(line: string, filePath: string, lineNumber: number): JournalEntry {
+function parseEntry(
+  line: string,
+  filePath: string,
+  lineNumber: number,
+): JournalEntry {
   const context: ParseContext = { filePath, lineNumber };
   if (line.trim().length === 0) {
-    malformed(context, 'blank line');
+    malformed(context, "blank line");
   }
   let value: unknown;
   try {
     value = JSON.parse(line);
   } catch (error: unknown) {
-    malformed(context, `invalid JSON (${error instanceof Error ? error.message : String(error)})`);
+    malformed(
+      context,
+      `invalid JSON (${error instanceof Error ? error.message : String(error)})`,
+    );
   }
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    malformed(context, 'entry is not a JSON object');
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    malformed(context, "entry is not a JSON object");
   }
   const entry = value as Record<string, unknown>;
-  if (entry.kind === 'reserved') {
+  if (entry.kind === "reserved") {
     return {
-      kind: 'reserved',
-      id: requireNonEmptyString(context, entry.id, 'id'),
+      kind: "reserved",
+      id: requireNonEmptyString(context, entry.id, "id"),
       consumer: requireConsumer(context, entry.consumer),
-      assumedCostUsd: requireNonNegativeNumber(context, entry.assumedCostUsd, 'assumedCostUsd'),
+      assumedCostUsd: requireNonNegativeNumber(
+        context,
+        entry.assumedCostUsd,
+        "assumedCostUsd",
+      ),
       stateSha256: requireStateSha256(context, entry.stateSha256),
-      at: requireNonEmptyString(context, entry.at, 'at'),
+      at: requireNonEmptyString(context, entry.at, "at"),
     };
   }
-  if (entry.kind === 'settled') {
+  if (entry.kind === "settled") {
     return {
-      kind: 'settled',
-      reservationId: requireNonEmptyString(context, entry.reservationId, 'reservationId'),
+      kind: "settled",
+      reservationId: requireNonEmptyString(
+        context,
+        entry.reservationId,
+        "reservationId",
+      ),
       consumer: requireConsumer(context, entry.consumer),
       contextRef: requireContextRef(context, entry.contextRef),
-      provider: requireNonEmptyString(context, entry.provider, 'provider'),
-      model: requireNonEmptyString(context, entry.model, 'model'),
+      provider: requireNonEmptyString(context, entry.provider, "provider"),
+      model: requireNonEmptyString(context, entry.model, "model"),
       requestId:
         entry.requestId === undefined
           ? undefined
-          : requireNonEmptyString(context, entry.requestId, 'requestId'),
-      costUsd: requireNonNegativeNumber(context, entry.costUsd, 'costUsd'),
+          : requireNonEmptyString(context, entry.requestId, "requestId"),
+      costUsd: requireNonNegativeNumber(context, entry.costUsd, "costUsd"),
       estimated:
-        typeof entry.estimated === 'boolean'
+        typeof entry.estimated === "boolean"
           ? entry.estimated
-          : malformed(context, 'estimated must be a boolean'),
-      questionKinds: entry.questionKinds === undefined ? [] : requireStringArray(context, entry.questionKinds, 'questionKinds'),
+          : malformed(context, "estimated must be a boolean"),
+      questionKinds:
+        entry.questionKinds === undefined
+          ? []
+          : requireStringArray(context, entry.questionKinds, "questionKinds"),
       minConfidenceObserved:
         entry.minConfidenceObserved === undefined
           ? undefined
-          : requireNonNegativeNumber(context, entry.minConfidenceObserved, 'minConfidenceObserved'),
+          : requireNonNegativeNumber(
+              context,
+              entry.minConfidenceObserved,
+              "minConfidenceObserved",
+            ),
       latencyMs: requireLatencyMs(context, entry.latencyMs),
       // A triage line declares empty orders, so both stay string arrays: the
       // ranking budget never mistakes a triage call for a reordering.
-      lexicalOrder: requireStringArray(context, entry.lexicalOrder, 'lexicalOrder'),
-      decidedOrder: requireStringArray(context, entry.decidedOrder, 'decidedOrder'),
+      lexicalOrder: requireStringArray(
+        context,
+        entry.lexicalOrder,
+        "lexicalOrder",
+      ),
+      decidedOrder: requireStringArray(
+        context,
+        entry.decidedOrder,
+        "decidedOrder",
+      ),
       unknownReason:
         entry.unknownReason === undefined
           ? undefined
-          : requireNonEmptyString(context, entry.unknownReason, 'unknownReason'),
-      at: requireNonEmptyString(context, entry.at, 'at'),
+          : requireNonEmptyString(
+              context,
+              entry.unknownReason,
+              "unknownReason",
+            ),
+      at: requireNonEmptyString(context, entry.at, "at"),
     };
   }
   malformed(context, `unknown kind ${JSON.stringify(entry.kind)}`);
@@ -259,11 +325,21 @@ const OUTCOME_FILE_PATTERN = /^outcomes-\d{4}-\d{2}\.jsonl$/;
  * redacted, exactly as the write paths require one.
  */
 function requireReadableConsumer(query: ReadDecisionJournalQuery): string {
-  if (!query || typeof query !== 'object' || typeof query.consumer !== 'string') {
-    throw new Error('FileDecisionReceiptJournalAdapter requires a readJournal query with a consumer');
+  if (
+    !query ||
+    typeof query !== "object" ||
+    typeof query.consumer !== "string"
+  ) {
+    throw new Error(
+      "FileDecisionReceiptJournalAdapter requires a readJournal query with a consumer",
+    );
   }
   const consumer = query.consumer;
-  if (consumer.trim().length === 0 || consumer.length > MAX_CONSUMER_CHARS || containsSecretShape(consumer)) {
+  if (
+    consumer.trim().length === 0 ||
+    consumer.length > MAX_CONSUMER_CHARS ||
+    containsSecretShape(consumer)
+  ) {
     throw new Error(
       `FileDecisionReceiptJournalAdapter requires a usable consumer of at most ${MAX_CONSUMER_CHARS} chars`,
     );
@@ -297,42 +373,65 @@ function settledRecordOf(entry: SettledEntry): SettledDecisionReceiptRecord {
  * journal actually recorded. The shape is exactly what `readOutcomeEntry`
  * appends.
  */
-function parseOutcomeEntry(line: string, filePath: string, lineNumber: number): DecisionOutcomeRecord {
+function parseOutcomeEntry(
+  line: string,
+  filePath: string,
+  lineNumber: number,
+): DecisionOutcomeRecord {
   const context: ParseContext = { filePath, lineNumber };
   if (line.trim().length === 0) {
-    malformed(context, 'blank line');
+    malformed(context, "blank line");
   }
   let value: unknown;
   try {
     value = JSON.parse(line);
   } catch (error: unknown) {
-    malformed(context, `invalid JSON (${error instanceof Error ? error.message : String(error)})`);
+    malformed(
+      context,
+      `invalid JSON (${error instanceof Error ? error.message : String(error)})`,
+    );
   }
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    malformed(context, 'outcome is not a JSON object');
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    malformed(context, "outcome is not a JSON object");
   }
   const entry = value as Record<string, unknown>;
-  const consumer = requireNonEmptyString(context, entry.consumer, 'consumer');
+  const consumer = requireNonEmptyString(context, entry.consumer, "consumer");
   if (consumer.length > MAX_CONSUMER_CHARS) {
     malformed(context, `consumer must be at most ${MAX_CONSUMER_CHARS} chars`);
   }
-  const contextRef = requireNonEmptyString(context, entry.contextRef, 'contextRef');
+  const contextRef = requireNonEmptyString(
+    context,
+    entry.contextRef,
+    "contextRef",
+  );
   if (contextRef.length > MAX_CONTEXT_REF_CHARS) {
-    malformed(context, `contextRef must be at most ${MAX_CONTEXT_REF_CHARS} chars`);
+    malformed(
+      context,
+      `contextRef must be at most ${MAX_CONTEXT_REF_CHARS} chars`,
+    );
   }
   const kind = entry.kind;
-  if (typeof kind !== 'string' || !OUTCOME_KINDS.includes(kind as DecisionOutcomeKind)) {
+  if (
+    typeof kind !== "string" ||
+    !OUTCOME_KINDS.includes(kind as DecisionOutcomeKind)
+  ) {
     malformed(context, `unknown outcome kind ${JSON.stringify(kind)}`);
   }
-  const ids = requireStringArray(context, entry.value, 'value');
+  const ids = requireStringArray(context, entry.value, "value");
   if (ids.length === 0 || ids.some((id) => id.trim().length === 0)) {
-    malformed(context, 'value must be a non-empty array of non-empty strings');
+    malformed(context, "value must be a non-empty array of non-empty strings");
   }
-  const at = requireNonEmptyString(context, entry.at, 'at');
+  const at = requireNonEmptyString(context, entry.at, "at");
   if (Number.isNaN(Date.parse(at))) {
-    malformed(context, 'at must be an ISO 8601 instant');
+    malformed(context, "at must be an ISO 8601 instant");
   }
-  return { consumer, contextRef, kind: kind as DecisionOutcomeKind, value: ids, at };
+  return {
+    consumer,
+    contextRef,
+    kind: kind as DecisionOutcomeKind,
+    value: ids,
+    at,
+  };
 }
 
 /** The month's spend, in total and per consumer, from one set of entries. */
@@ -349,14 +448,20 @@ interface MonthSpend {
  * call is never invisible to the budget.
  */
 function monthSpendFromEntries(entries: readonly JournalEntry[]): MonthSpend {
-  const reservedCostById = new Map<string, { cost: number; consumer: string }>();
+  const reservedCostById = new Map<
+    string,
+    { cost: number; consumer: string }
+  >();
   const settledCostByReservationId = new Map<
     string,
     { cost: number; consumer: string }
   >();
   for (const entry of entries) {
-    if (entry.kind === 'reserved') {
-      reservedCostById.set(entry.id, { cost: entry.assumedCostUsd, consumer: entry.consumer });
+    if (entry.kind === "reserved") {
+      reservedCostById.set(entry.id, {
+        cost: entry.assumedCostUsd,
+        consumer: entry.consumer,
+      });
     } else {
       settledCostByReservationId.set(entry.reservationId, {
         cost: entry.costUsd,
@@ -392,37 +497,54 @@ function requireValidatedQuery(query: ReserveDecisionQuery): {
   consumerBudgetUsd?: number;
   stateSha256: string;
 } {
-  if (!query || typeof query !== 'object') {
-    throw new Error('FileDecisionReceiptJournalAdapter requires a reserve query');
+  if (!query || typeof query !== "object") {
+    throw new Error(
+      "FileDecisionReceiptJournalAdapter requires a reserve query",
+    );
   }
   const { assumedCostUsd, monthlyBudgetUsd, stateSha256 } = query;
-  if (typeof assumedCostUsd !== 'number' || !Number.isFinite(assumedCostUsd) || assumedCostUsd < 0) {
-    throw new Error('FileDecisionReceiptJournalAdapter requires a finite non-negative assumedCostUsd');
+  if (
+    typeof assumedCostUsd !== "number" ||
+    !Number.isFinite(assumedCostUsd) ||
+    assumedCostUsd < 0
+  ) {
+    throw new Error(
+      "FileDecisionReceiptJournalAdapter requires a finite non-negative assumedCostUsd",
+    );
   }
   if (
-    typeof monthlyBudgetUsd !== 'number' ||
+    typeof monthlyBudgetUsd !== "number" ||
     !Number.isFinite(monthlyBudgetUsd) ||
     monthlyBudgetUsd < 0
   ) {
-    throw new Error('FileDecisionReceiptJournalAdapter requires a finite non-negative monthlyBudgetUsd');
+    throw new Error(
+      "FileDecisionReceiptJournalAdapter requires a finite non-negative monthlyBudgetUsd",
+    );
   }
   if (
     query.consumerBudgetUsd !== undefined &&
-    (typeof query.consumerBudgetUsd !== 'number' ||
+    (typeof query.consumerBudgetUsd !== "number" ||
       !Number.isFinite(query.consumerBudgetUsd) ||
       query.consumerBudgetUsd <= 0)
   ) {
     throw new Error(
-      'FileDecisionReceiptJournalAdapter requires a consumerBudgetUsd greater than 0',
+      "FileDecisionReceiptJournalAdapter requires a consumerBudgetUsd greater than 0",
     );
   }
-  if (typeof stateSha256 !== 'string' || !STATE_SHA256_PATTERN.test(stateSha256)) {
+  if (
+    typeof stateSha256 !== "string" ||
+    !STATE_SHA256_PATTERN.test(stateSha256)
+  ) {
     throw new Error(
-      'FileDecisionReceiptJournalAdapter requires stateSha256 to match /^[0-9a-f]{64}$/',
+      "FileDecisionReceiptJournalAdapter requires stateSha256 to match /^[0-9a-f]{64}$/",
     );
   }
   const consumer = query.consumer ?? DEFAULT_CONSUMER;
-  if (typeof consumer !== 'string' || consumer.trim().length === 0 || consumer.length > MAX_CONSUMER_CHARS) {
+  if (
+    typeof consumer !== "string" ||
+    consumer.trim().length === 0 ||
+    consumer.length > MAX_CONSUMER_CHARS
+  ) {
     throw new Error(
       `FileDecisionReceiptJournalAdapter requires a consumer of at most ${MAX_CONSUMER_CHARS} chars`,
     );
@@ -431,7 +553,9 @@ function requireValidatedQuery(query: ReserveDecisionQuery): {
     consumer,
     assumedCostUsd,
     monthlyBudgetUsd,
-    ...(query.consumerBudgetUsd === undefined ? {} : { consumerBudgetUsd: query.consumerBudgetUsd }),
+    ...(query.consumerBudgetUsd === undefined
+      ? {}
+      : { consumerBudgetUsd: query.consumerBudgetUsd }),
     stateSha256,
   };
 }
@@ -452,14 +576,20 @@ interface ValidatedReceipt {
   readonly unknownReason?: string;
 }
 
-function requireDeclaredText(value: unknown, field: string, maxChars: number): string {
+function requireDeclaredText(
+  value: unknown,
+  field: string,
+  maxChars: number,
+): string {
   if (
-    typeof value !== 'string' ||
+    typeof value !== "string" ||
     value.trim().length === 0 ||
     value.length > maxChars ||
     containsSecretShape(value)
   ) {
-    throw new Error(`FileDecisionReceiptJournalAdapter requires a usable ${field}`);
+    throw new Error(
+      `FileDecisionReceiptJournalAdapter requires a usable ${field}`,
+    );
   }
   return value;
 }
@@ -468,15 +598,21 @@ function requireValidatedReceipt(
   reservationId: string,
   receipt: DecisionCallReceipt,
 ): ValidatedReceipt {
-  if (typeof reservationId !== 'string' || reservationId.trim().length === 0) {
-    throw new Error('FileDecisionReceiptJournalAdapter requires a non-empty reservationId');
+  if (typeof reservationId !== "string" || reservationId.trim().length === 0) {
+    throw new Error(
+      "FileDecisionReceiptJournalAdapter requires a non-empty reservationId",
+    );
   }
-  if (!receipt || typeof receipt !== 'object') {
-    throw new Error(`FileDecisionReceiptJournalAdapter requires a receipt for reservation ${reservationId}`);
+  if (!receipt || typeof receipt !== "object") {
+    throw new Error(
+      `FileDecisionReceiptJournalAdapter requires a receipt for reservation ${reservationId}`,
+    );
   }
   const requireText = (value: unknown, field: string): string => {
-    if (typeof value !== 'string' || value.trim().length === 0) {
-      throw new Error(`FileDecisionReceiptJournalAdapter requires a non-empty ${field}`);
+    if (typeof value !== "string" || value.trim().length === 0) {
+      throw new Error(
+        `FileDecisionReceiptJournalAdapter requires a non-empty ${field}`,
+      );
     }
     return value;
   };
@@ -488,40 +624,62 @@ function requireValidatedReceipt(
   const optionalCost =
     receipt.costUsd === undefined
       ? undefined
-      : typeof receipt.costUsd === 'number' && Number.isFinite(receipt.costUsd) && receipt.costUsd >= 0
+      : typeof receipt.costUsd === "number" &&
+          Number.isFinite(receipt.costUsd) &&
+          receipt.costUsd >= 0
         ? receipt.costUsd
-        : failField('costUsd must be a finite non-negative number');
-  const requireIds = (value: readonly string[], field: string): readonly string[] => {
-    if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
-      throw new Error(`FileDecisionReceiptJournalAdapter requires ${field} to be an array of strings`);
+        : failField("costUsd must be a finite non-negative number");
+  const requireIds = (
+    value: readonly string[],
+    field: string,
+  ): readonly string[] => {
+    if (
+      !Array.isArray(value) ||
+      value.some((item) => typeof item !== "string")
+    ) {
+      throw new Error(
+        `FileDecisionReceiptJournalAdapter requires ${field} to be an array of strings`,
+      );
     }
     return value;
   };
-  if (typeof receipt.latencyMs !== 'number' || !Number.isFinite(receipt.latencyMs) || receipt.latencyMs < 0) {
-    failField('latencyMs must be a finite non-negative number');
+  if (
+    typeof receipt.latencyMs !== "number" ||
+    !Number.isFinite(receipt.latencyMs) ||
+    receipt.latencyMs < 0
+  ) {
+    failField("latencyMs must be a finite non-negative number");
   }
   const minConfidenceObserved =
     receipt.minConfidenceObserved === undefined
       ? undefined
-      : typeof receipt.minConfidenceObserved === 'number' &&
+      : typeof receipt.minConfidenceObserved === "number" &&
           Number.isFinite(receipt.minConfidenceObserved) &&
           receipt.minConfidenceObserved >= 0 &&
           receipt.minConfidenceObserved <= 1
         ? receipt.minConfidenceObserved
-        : failField('minConfidenceObserved must be a number in [0,1]');
+        : failField("minConfidenceObserved must be a number in [0,1]");
   return {
-    consumer: requireDeclaredText(receipt.consumer, 'consumer', MAX_CONSUMER_CHARS),
-    contextRef: requireDeclaredText(receipt.contextRef, 'contextRef', MAX_CONTEXT_REF_CHARS),
-    provider: requireText(receipt.provider, 'provider'),
-    model: requireText(receipt.model, 'model'),
-    requestId: optionalText(receipt.requestId, 'requestId'),
+    consumer: requireDeclaredText(
+      receipt.consumer,
+      "consumer",
+      MAX_CONSUMER_CHARS,
+    ),
+    contextRef: requireDeclaredText(
+      receipt.contextRef,
+      "contextRef",
+      MAX_CONTEXT_REF_CHARS,
+    ),
+    provider: requireText(receipt.provider, "provider"),
+    model: requireText(receipt.model, "model"),
+    requestId: optionalText(receipt.requestId, "requestId"),
     costUsd: optionalCost,
-    questionKinds: requireIds(receipt.questionKinds, 'questionKinds'),
+    questionKinds: requireIds(receipt.questionKinds, "questionKinds"),
     ...(minConfidenceObserved === undefined ? {} : { minConfidenceObserved }),
     latencyMs: receipt.latencyMs,
-    lexicalOrder: requireIds(receipt.lexicalOrder, 'lexicalOrder'),
-    decidedOrder: requireIds(receipt.decidedOrder, 'decidedOrder'),
-    unknownReason: optionalText(receipt.unknownReason, 'unknownReason'),
+    lexicalOrder: requireIds(receipt.lexicalOrder, "lexicalOrder"),
+    decidedOrder: requireIds(receipt.decidedOrder, "decidedOrder"),
+    unknownReason: optionalText(receipt.unknownReason, "unknownReason"),
   };
 }
 
@@ -534,7 +692,10 @@ interface OutcomeEntry {
   readonly at: string;
 }
 
-const OUTCOME_KINDS: readonly DecisionOutcomeKind[] = ['ranking-selection', 'triage-disposition'];
+const OUTCOME_KINDS: readonly DecisionOutcomeKind[] = [
+  "ranking-selection",
+  "triage-disposition",
+];
 
 export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournalPort {
   private readonly stateDir: string;
@@ -546,19 +707,25 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
     now: () => Date = () => new Date(),
     options: { readonly lockTimeoutMs?: number } = {},
   ) {
-    if (typeof stateDir !== 'string' || stateDir.trim().length === 0) {
-      throw new Error('FileDecisionReceiptJournalAdapter requires a non-empty stateDir');
+    if (typeof stateDir !== "string" || stateDir.trim().length === 0) {
+      throw new Error(
+        "FileDecisionReceiptJournalAdapter requires a non-empty stateDir",
+      );
     }
-    if (typeof now !== 'function') {
-      throw new Error('FileDecisionReceiptJournalAdapter requires a now() clock');
+    if (typeof now !== "function") {
+      throw new Error(
+        "FileDecisionReceiptJournalAdapter requires a now() clock",
+      );
     }
     if (
       options.lockTimeoutMs !== undefined &&
-      (typeof options.lockTimeoutMs !== 'number' ||
+      (typeof options.lockTimeoutMs !== "number" ||
         !Number.isFinite(options.lockTimeoutMs) ||
         options.lockTimeoutMs <= 0)
     ) {
-      throw new Error('FileDecisionReceiptJournalAdapter requires a positive finite lockTimeoutMs');
+      throw new Error(
+        "FileDecisionReceiptJournalAdapter requires a positive finite lockTimeoutMs",
+      );
     }
     this.stateDir = stateDir;
     this.now = now;
@@ -567,7 +734,9 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
   }
 
   private lockOptions(): { readonly timeoutMs: number } | undefined {
-    return this.lockTimeoutMs === undefined ? undefined : { timeoutMs: this.lockTimeoutMs };
+    return this.lockTimeoutMs === undefined
+      ? undefined
+      : { timeoutMs: this.lockTimeoutMs };
   }
 
   async reserve(query: ReserveDecisionQuery): Promise<ReserveDecisionResult> {
@@ -580,7 +749,9 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
       async () => {
         // Both sums are read under the one month lock, so the sub-budget and
         // the total are judged against the same snapshot.
-        const spend = monthSpendFromEntries(await this.readMonthEntries(monthKey));
+        const spend = monthSpendFromEntries(
+          await this.readMonthEntries(monthKey),
+        );
         // Refuse at or above the cap (owner, 2026-10-16): spend never reaches
         // the budget exactly. A consumer without a sub-budget has no clause.
         const allowed = budgetAllows({
@@ -593,10 +764,10 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
           assumedCost: validated.assumedCostUsd,
         });
         if (!allowed.ok) {
-          return { ok: false as const, reason: 'budget-exhausted' as const };
+          return { ok: false as const, reason: "budget-exhausted" as const };
         }
         const entry: ReservedEntry = {
-          kind: 'reserved',
+          kind: "reserved",
           id: reservationId,
           consumer: validated.consumer,
           assumedCostUsd: validated.assumedCostUsd,
@@ -610,61 +781,69 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
     );
   }
 
-  async settle(reservationId: string, receipt: DecisionCallReceipt): Promise<void> {
+  async settle(
+    reservationId: string,
+    receipt: DecisionCallReceipt,
+  ): Promise<void> {
     const validated = requireValidatedReceipt(reservationId, receipt);
     const atDate = this.now();
     const monthKey = utcMonthKey(atDate);
     await withFileLock(
       this.monthLockPath(monthKey),
       async () => {
-      // The reservation is always resolved, whether or not the receipt
-      // reports a cost: the current month's file first, then the previous
-      // month's (a call may cross a UTC month boundary between reserve and
-      // settle).
-      const monthEntries = await this.readMonthEntries(monthKey);
-      let previousEntries: JournalEntry[] = [];
-      let reservation: ReservedEntry | undefined = findReservedEntry(monthEntries, reservationId);
-      if (!reservation) {
-        previousEntries = await this.readMonthEntries(previousUtcMonthKey(atDate));
-        reservation = findReservedEntry(previousEntries, reservationId);
-      }
-      if (!reservation) {
-        throw new Error(
-          `FileDecisionReceiptJournalAdapter cannot settle unknown reservation ${reservationId}`,
+        // The reservation is always resolved, whether or not the receipt
+        // reports a cost: the current month's file first, then the previous
+        // month's (a call may cross a UTC month boundary between reserve and
+        // settle).
+        const monthEntries = await this.readMonthEntries(monthKey);
+        let previousEntries: JournalEntry[] = [];
+        let reservation: ReservedEntry | undefined = findReservedEntry(
+          monthEntries,
+          reservationId,
         );
-      }
-      // Settling is once only: spend stays monotone per reservation.
-      if (
-        findSettledEntry(monthEntries, reservationId) !== undefined ||
-        findSettledEntry(previousEntries, reservationId) !== undefined
-      ) {
-        throw new Error(
-          `FileDecisionReceiptJournalAdapter reservation ${reservationId} is already settled`,
-        );
-      }
-      // No reported cost: record the reservation's assumed cost, marked
-      // estimated. The check-and-append above runs inside this month's lock.
-      const costUsd = validated.costUsd ?? reservation.assumedCostUsd;
-      const estimated = validated.costUsd === undefined;
-      const entry: SettledEntry = {
-        kind: 'settled',
-        reservationId,
-        consumer: validated.consumer,
-        contextRef: validated.contextRef,
-        provider: validated.provider,
-        model: validated.model,
-        requestId: validated.requestId,
-        costUsd,
-        estimated,
-        questionKinds: [...validated.questionKinds],
-        minConfidenceObserved: validated.minConfidenceObserved,
-        latencyMs: validated.latencyMs,
-        lexicalOrder: [...validated.lexicalOrder],
-        decidedOrder: [...validated.decidedOrder],
-        unknownReason: validated.unknownReason,
-        at: atDate.toISOString(),
-      };
-      await this.appendEntry(monthKey, entry);
+        if (!reservation) {
+          previousEntries = await this.readMonthEntries(
+            previousUtcMonthKey(atDate),
+          );
+          reservation = findReservedEntry(previousEntries, reservationId);
+        }
+        if (!reservation) {
+          throw new Error(
+            `FileDecisionReceiptJournalAdapter cannot settle unknown reservation ${reservationId}`,
+          );
+        }
+        // Settling is once only: spend stays monotone per reservation.
+        if (
+          findSettledEntry(monthEntries, reservationId) !== undefined ||
+          findSettledEntry(previousEntries, reservationId) !== undefined
+        ) {
+          throw new Error(
+            `FileDecisionReceiptJournalAdapter reservation ${reservationId} is already settled`,
+          );
+        }
+        // No reported cost: record the reservation's assumed cost, marked
+        // estimated. The check-and-append above runs inside this month's lock.
+        const costUsd = validated.costUsd ?? reservation.assumedCostUsd;
+        const estimated = validated.costUsd === undefined;
+        const entry: SettledEntry = {
+          kind: "settled",
+          reservationId,
+          consumer: validated.consumer,
+          contextRef: validated.contextRef,
+          provider: validated.provider,
+          model: validated.model,
+          requestId: validated.requestId,
+          costUsd,
+          estimated,
+          questionKinds: [...validated.questionKinds],
+          minConfidenceObserved: validated.minConfidenceObserved,
+          latencyMs: validated.latencyMs,
+          lexicalOrder: [...validated.lexicalOrder],
+          decidedOrder: [...validated.decidedOrder],
+          unknownReason: validated.unknownReason,
+          at: atDate.toISOString(),
+        };
+        await this.appendEntry(monthKey, entry);
       },
       this.lockOptions(),
     );
@@ -672,7 +851,9 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
 
   async monthSpendUsd(monthUtc: Date): Promise<number> {
     if (!(monthUtc instanceof Date) || Number.isNaN(monthUtc.getTime())) {
-      throw new Error('FileDecisionReceiptJournalAdapter requires a valid monthUtc Date');
+      throw new Error(
+        "FileDecisionReceiptJournalAdapter requires a valid monthUtc Date",
+      );
     }
     const monthKey = utcMonthKey(monthUtc);
     // Lock the pure read too: a concurrent append must never be observed as a
@@ -714,7 +895,9 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
               await withFileLock(
                 this.monthLockPath(previousUtcMonthKey(atDate)),
                 async () => {
-                  if (!(await this.hasSettledReceipt(entry.contextRef, atDate))) {
+                  if (
+                    !(await this.hasSettledReceipt(entry.contextRef, atDate))
+                  ) {
                     // No settled receipt for this reference: nothing was decided
                     // by a call, so there is no outcome to join.
                     return;
@@ -722,7 +905,7 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
                   await fs.appendFile(
                     this.outcomesFilePath(monthKey),
                     `${JSON.stringify(entry)}\n`,
-                    'utf8',
+                    "utf8",
                   );
                 },
                 this.lockOptions(),
@@ -739,12 +922,17 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
   }
 
   /** Declared, bounded fields only; anything unusable is skipped, never thrown. */
-  private readOutcomeEntry(outcome: AppendDecisionOutcome): OutcomeEntry | null {
-    if (!outcome || typeof outcome !== 'object') {
+  private readOutcomeEntry(
+    outcome: AppendDecisionOutcome,
+  ): OutcomeEntry | null {
+    if (!outcome || typeof outcome !== "object") {
       return null;
     }
     const { consumer, contextRef, kind, value, at } = outcome;
-    if (!isBoundedText(consumer, MAX_CONSUMER_CHARS) || !isBoundedText(contextRef, MAX_CONTEXT_REF_CHARS)) {
+    if (
+      !isBoundedText(consumer, MAX_CONSUMER_CHARS) ||
+      !isBoundedText(contextRef, MAX_CONTEXT_REF_CHARS)
+    ) {
       return null;
     }
     if (!OUTCOME_KINDS.includes(kind)) {
@@ -753,12 +941,18 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
     if (
       !Array.isArray(value) ||
       value.length === 0 ||
-      value.some((item) => typeof item !== 'string' || item.trim().length === 0) ||
+      value.some(
+        (item) => typeof item !== "string" || item.trim().length === 0,
+      ) ||
       containsSecretShape(JSON.stringify(value))
     ) {
       return null;
     }
-    if (typeof at !== 'string' || at.trim().length === 0 || Number.isNaN(Date.parse(at))) {
+    if (
+      typeof at !== "string" ||
+      at.trim().length === 0 ||
+      Number.isNaN(Date.parse(at))
+    ) {
       return null;
     }
     return { consumer, contextRef, kind, value: [...value], at };
@@ -770,37 +964,100 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
    * read). A malformed line of either kind throws, exactly as the budget
    * parser does: a report built from skipped lines would under-report.
    */
-  async readJournal(query: ReadDecisionJournalQuery): Promise<DecisionJournalSnapshot> {
+  /**
+   * K4, fix round: one consumer's whole recorded history, every month of both
+   * files, each read under its own lock (never nested, so nothing can wait on
+   * this read). A malformed line of either file is skipped and counted on
+   * `skippedLines` rather than thrown: the report still states what it read
+   * and how much it could not. The budget paths stay strict — they still
+   * throw, so spend is never computed from skipped input.
+   */
+  async readJournal(
+    query: ReadDecisionJournalQuery,
+  ): Promise<DecisionJournalSnapshot> {
     const consumer = requireReadableConsumer(query);
     const receipts: SettledDecisionReceiptRecord[] = [];
     const outcomes: DecisionOutcomeRecord[] = [];
+    let skippedLines = 0;
     for (const monthKey of await this.listMonthKeys()) {
       // Each month is read under its own month lock, like monthSpendUsd:
       // a concurrent append must never be observed as a torn line.
-      const entries = await withFileLock(
+      const read = await withFileLock(
         this.monthLockPath(monthKey),
-        async () => this.readMonthEntries(monthKey),
+        async () => this.readMonthEntriesForReport(monthKey),
         this.lockOptions(),
       );
-      for (const entry of entries) {
-        if (entry.kind === 'settled' && entry.consumer === consumer) {
+      skippedLines += read.skipped;
+      for (const entry of read.entries) {
+        if (entry.kind === "settled" && entry.consumer === consumer) {
           receipts.push(settledRecordOf(entry));
         }
       }
     }
     for (const monthKey of await this.listOutcomeMonthKeys()) {
-      const monthOutcomes = await withFileLock(
+      const read = await withFileLock(
         this.outcomesLockPath(monthKey),
-        async () => this.readOutcomeEntries(monthKey),
+        async () => this.readOutcomeEntriesForReport(monthKey),
         this.lockOptions(),
       );
-      for (const outcome of monthOutcomes) {
+      skippedLines += read.skipped;
+      for (const outcome of read.entries) {
         if (outcome.consumer === consumer) {
           outcomes.push(outcome);
         }
       }
     }
-    return { receipts, outcomes };
+    return { receipts, outcomes, skippedLines };
+  }
+
+  /**
+   * The report's receipt read: like `readMonthEntries`, but a line that
+   * fails the strict parser is skipped and counted instead of thrown.
+   */
+  private async readMonthEntriesForReport(
+    monthKey: string,
+  ): Promise<{ entries: JournalEntry[]; skipped: number }> {
+    const filePath = this.monthFilePath(monthKey);
+    const entries: JournalEntry[] = [];
+    let skipped = 0;
+    for (const [index, line] of (
+      await this.readFileLines(filePath)
+    ).entries()) {
+      try {
+        entries.push(parseEntry(line, filePath, index + 1));
+      } catch (error: unknown) {
+        if (!(error instanceof MalformedReceiptLineError)) {
+          throw error;
+        }
+        skipped += 1;
+      }
+    }
+    return { entries, skipped };
+  }
+
+  /**
+   * The report's outcomes read: like `readOutcomeEntries`, but a line that
+   * fails the strict parser is skipped and counted instead of thrown.
+   */
+  private async readOutcomeEntriesForReport(
+    monthKey: string,
+  ): Promise<{ entries: DecisionOutcomeRecord[]; skipped: number }> {
+    const filePath = this.outcomesFilePath(monthKey);
+    const entries: DecisionOutcomeRecord[] = [];
+    let skipped = 0;
+    for (const [index, line] of (
+      await this.readFileLines(filePath)
+    ).entries()) {
+      try {
+        entries.push(parseOutcomeEntry(line, filePath, index + 1));
+      } catch (error: unknown) {
+        if (!(error instanceof MalformedReceiptLineError)) {
+          throw error;
+        }
+        skipped += 1;
+      }
+    }
+    return { entries, skipped };
   }
 
   /** Every recorded `<YYYY-MM>.jsonl` month, oldest first; none when the directory is absent. */
@@ -809,7 +1066,7 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
     return names
       .filter((name) => MONTH_FILE_PATTERN.test(name))
       .sort()
-      .map((name) => name.slice(0, name.length - '.jsonl'.length));
+      .map((name) => name.slice(0, name.length - ".jsonl".length));
   }
 
   /** Every recorded `outcomes-<YYYY-MM>.jsonl` month, oldest first. */
@@ -818,18 +1075,23 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
     return names
       .filter((name) => OUTCOME_FILE_PATTERN.test(name))
       .sort()
-      .map((name) => name.slice('outcomes-'.length, name.length - '.jsonl'.length));
+      .map((name) =>
+        name.slice("outcomes-".length, name.length - ".jsonl".length),
+      );
   }
 
   /** The receipts directory listing; empty when nothing was ever recorded. */
   private async listReceiptsDir(): Promise<string[]> {
     try {
-      return await fs.readdir(path.join(this.stateDir, RECEIPTS_DIRNAME), 'utf8');
+      return await fs.readdir(
+        path.join(this.stateDir, RECEIPTS_DIRNAME),
+        "utf8",
+      );
     } catch (error: unknown) {
       if (
-        typeof error === 'object' &&
+        typeof error === "object" &&
         error !== null &&
-        (error as { code?: string }).code === 'ENOENT'
+        (error as { code?: string }).code === "ENOENT"
       ) {
         return [];
       }
@@ -838,31 +1100,20 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
   }
 
   /** Parse one outcomes file; a malformed line throws with its location. */
-  private async readOutcomeEntries(monthKey: string): Promise<DecisionOutcomeRecord[]> {
+  private async readOutcomeEntries(
+    monthKey: string,
+  ): Promise<DecisionOutcomeRecord[]> {
     const filePath = this.outcomesFilePath(monthKey);
-    let raw: string;
-    try {
-      raw = await fs.readFile(filePath, 'utf8');
-    } catch (error: unknown) {
-      if (
-        typeof error === 'object' &&
-        error !== null &&
-        (error as { code?: string }).code === 'ENOENT'
-      ) {
-        return [];
-      }
-      throw error;
-    }
-    const lines = raw.split('\n');
-    // A single trailing '' is the file's final newline, not a blank line.
-    if (lines.length > 0 && lines[lines.length - 1] === '') {
-      lines.pop();
-    }
-    return lines.map((line, index) => parseOutcomeEntry(line, filePath, index + 1));
+    return (await this.readFileLines(filePath)).map((line, index) =>
+      parseOutcomeEntry(line, filePath, index + 1),
+    );
   }
 
   /** A settled line for this reference in this month or the one before it. */
-  private async hasSettledReceipt(contextRef: string, atDate: Date): Promise<boolean> {
+  private async hasSettledReceipt(
+    contextRef: string,
+    atDate: Date,
+  ): Promise<boolean> {
     const settled = (entries: readonly JournalEntry[]): boolean =>
       findSettledByContextRef(entries, contextRef) !== undefined;
     if (settled(await this.readMonthEntries(utcMonthKey(atDate)))) {
@@ -882,7 +1133,11 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
 
   /** Outcomes live in their own file under their own lock (plan §3). */
   private outcomesFilePath(monthKey: string): string {
-    return path.join(this.stateDir, RECEIPTS_DIRNAME, `outcomes-${monthKey}.jsonl`);
+    return path.join(
+      this.stateDir,
+      RECEIPTS_DIRNAME,
+      `outcomes-${monthKey}.jsonl`,
+    );
   }
 
   private outcomesLockPath(monthKey: string): string {
@@ -891,38 +1146,55 @@ export class FileDecisionReceiptJournalAdapter implements DecisionReceiptJournal
 
   private async readMonthEntries(monthKey: string): Promise<JournalEntry[]> {
     const filePath = this.monthFilePath(monthKey);
+    return (await this.readFileLines(filePath)).map((line, index) =>
+      parseEntry(line, filePath, index + 1),
+    );
+  }
+
+  /**
+   * The file's lines; an absent file reads as none. A single trailing '' is
+   * the file's final newline, not a blank line. Every read — strict or
+   * report — goes through here, so both see the same lines.
+   */
+  private async readFileLines(filePath: string): Promise<string[]> {
     let raw: string;
     try {
-      raw = await fs.readFile(filePath, 'utf8');
+      raw = await fs.readFile(filePath, "utf8");
     } catch (error: unknown) {
       if (
-        typeof error === 'object' &&
+        typeof error === "object" &&
         error !== null &&
-        (error as { code?: string }).code === 'ENOENT'
+        (error as { code?: string }).code === "ENOENT"
       ) {
         return [];
       }
       throw error;
     }
-    const lines = raw.split('\n');
-    // A single trailing '' is the file's final newline, not a blank line.
-    if (lines.length > 0 && lines[lines.length - 1] === '') {
+    const lines = raw.split("\n");
+    if (lines.length > 0 && lines[lines.length - 1] === "") {
       lines.pop();
     }
-    return lines.map((line, index) => parseEntry(line, filePath, index + 1));
+    return lines;
   }
 
-  private async appendEntry(monthKey: string, entry: JournalEntry): Promise<void> {
+  private async appendEntry(
+    monthKey: string,
+    entry: JournalEntry,
+  ): Promise<void> {
     // The receipts directory exists by the time this runs: acquiring the lock
     // creates it (withFileLock mkdirs the lock file's directory).
-    await fs.appendFile(this.monthFilePath(monthKey), `${JSON.stringify(entry)}\n`, 'utf8');
+    await fs.appendFile(
+      this.monthFilePath(monthKey),
+      `${JSON.stringify(entry)}\n`,
+      "utf8",
+    );
   }
 }
 
 /** A declared string that is non-empty, bounded and not credential-shaped. */
 function isBoundedText(value: unknown, maxChars: number): value is string {
   return (
-    typeof value === 'string' &&
+    typeof value === "string" &&
     value.trim().length > 0 &&
     value.length <= maxChars &&
     !containsSecretShape(value)
@@ -935,7 +1207,7 @@ function findReservedEntry(
 ): ReservedEntry | undefined {
   let found: ReservedEntry | undefined;
   for (const entry of entries) {
-    if (entry.kind === 'reserved' && entry.id === reservationId) {
+    if (entry.kind === "reserved" && entry.id === reservationId) {
       found = entry;
     }
   }
@@ -948,7 +1220,7 @@ function findSettledEntry(
 ): SettledEntry | undefined {
   let found: SettledEntry | undefined;
   for (const entry of entries) {
-    if (entry.kind === 'settled' && entry.reservationId === reservationId) {
+    if (entry.kind === "settled" && entry.reservationId === reservationId) {
       found = entry;
     }
   }
@@ -962,7 +1234,7 @@ function findSettledByContextRef(
 ): SettledEntry | undefined {
   let found: SettledEntry | undefined;
   for (const entry of entries) {
-    if (entry.kind === 'settled' && entry.contextRef === contextRef) {
+    if (entry.kind === "settled" && entry.contextRef === contextRef) {
       found = entry;
     }
   }

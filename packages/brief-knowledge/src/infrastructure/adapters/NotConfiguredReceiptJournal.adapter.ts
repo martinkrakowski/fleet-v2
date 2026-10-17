@@ -18,16 +18,19 @@ import type {
   ReadDecisionJournalQuery,
   ReserveDecisionQuery,
   ReserveDecisionResult,
-} from '../../application/ports/out/DecisionReceiptJournalPort.out-port.js';
+} from "../../application/ports/out/DecisionReceiptJournalPort.out-port.js";
 
 export class NotConfiguredReceiptJournal implements DecisionReceiptJournalPort {
   async reserve(_query: ReserveDecisionQuery): Promise<ReserveDecisionResult> {
-    return { ok: false, reason: 'not-configured' };
+    return { ok: false, reason: "not-configured" };
   }
 
-  async settle(_reservationId: string, _receipt: DecisionCallReceipt): Promise<void> {
+  async settle(
+    _reservationId: string,
+    _receipt: DecisionCallReceipt,
+  ): Promise<void> {
     throw new Error(
-      'Decision receipt journal is not configured: no reservation exists to settle',
+      "Decision receipt journal is not configured: no reservation exists to settle",
     );
   }
 
@@ -47,7 +50,9 @@ export class NotConfiguredReceiptJournal implements DecisionReceiptJournalPort {
    * Nothing was ever reserved, settled or joined here, so a measurement read
    * finds an empty history rather than refusing one.
    */
-  async readJournal(_query: ReadDecisionJournalQuery): Promise<DecisionJournalSnapshot> {
-    return { receipts: [], outcomes: [] };
+  async readJournal(
+    _query: ReadDecisionJournalQuery,
+  ): Promise<DecisionJournalSnapshot> {
+    return { receipts: [], outcomes: [], skippedLines: 0 };
   }
 }

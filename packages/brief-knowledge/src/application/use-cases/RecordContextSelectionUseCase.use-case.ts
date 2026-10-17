@@ -141,13 +141,19 @@ export class RecordContextSelectionUseCase implements RecordContextSelectionPort
     if (!journal || typeof contextRef !== 'string' || contextRef.trim().length === 0) {
       return;
     }
+    // Declared ids only, per the journal port: the entry ids the
+    // orchestrator selected and accepted, in the order it selected them.
+    const acceptedIds = selections
+      .filter((selection) => selection.accepted)
+      .map((selection) => selection.knowledgeEntryId);
+    if (acceptedIds.length === 0) {
+      return;
+    }
     const outcome: AppendDecisionOutcome = {
       consumer: KNOWLEDGE_RANKING_CONSUMER,
       contextRef,
       kind: 'ranking-selection',
-      // Declared ids only, per the journal port: the entry ids the
-      // orchestrator selected, in the order it selected them.
-      value: selections.map((selection) => selection.knowledgeEntryId),
+      value: acceptedIds,
       at: request.nowIso ?? new Date().toISOString(),
     };
     try {

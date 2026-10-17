@@ -25,6 +25,9 @@ import type {
   WorkspacePort,
 } from '../../application/ports/out/WorkspacePort.out-port.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
+import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
+import { hasRecordedHostName } from './ConfirmRecordedHost.js';
+import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
 
 export interface WorkspaceAdapterOptions {
   /**
@@ -33,6 +36,15 @@ export interface WorkspaceAdapterOptions {
    * transport the executor carries.
    */
   readonly executor?: CommandExecutorPort;
+  /**
+   * H9b2. When given, a read for an attempt recorded on a named host runs
+   * through that recorded host's executor (the recorded host is the truth);
+   * a host that changed or was removed is refused, naming the recorded
+   * host. Legacy records (no recorded host name) keep `executor`.
+   */
+  readonly executorForRecordedHost?: (
+    recorded: AttemptRunnerRecord | null | undefined,
+  ) => ExecutorForRecordedHostResult;
 }
 
 /** Residue markers a previous attempt may have left in the worktree. */
@@ -75,8 +87,25 @@ function unquotePorcelainPath(porcelainPath: string): string {
 export class WorkspaceAdapter implements WorkspacePort {
   constructor(private readonly options?: WorkspaceAdapterOptions) {}
 
-  /** The executor is the only transport; without one there is nothing to run. */
-  private requireExecutor(): CommandExecutorPort {
+  /**
+   * The executor for one read: a read carrying a recorded host name goes to
+   * that recorded host's executor when the helper is wired; everything else
+   * keeps the configured executor. The executor is the only transport;
+   * without one there is nothing to run.
+   */
+  private executorFor(
+    recordedHost?: AttemptRunnerRecord | null,
+  ): CommandExecutorPort {
+    if (
+      this.options?.executorForRecordedHost !== undefined &&
+      hasRecordedHostName(recordedHost)
+    ) {
+      const resolved = this.options.executorForRecordedHost(recordedHost);
+      if (!resolved.ok) {
+        throw new Error(resolved.reason);
+      }
+      return resolved.executor;
+    }
     const executor = this.options?.executor;
     if (executor === undefined) {
       throw new Error('WorkspaceAdapter requires a configured CommandExecutorPort executor');
@@ -86,10 +115,11 @@ export class WorkspaceAdapter implements WorkspacePort {
 
   async inspectWorktree(request: WorktreeInspectionRequest): Promise<WorktreeInspection> {
     const { worktreePath, baseCommit } = request;
+    const executor = this.executorFor(request.recordedHost);
 
     let checkedOutCommit: string;
     try {
-      checkedOutCommit = (await this.runGit(worktreePath, ['rev-parse', 'HEAD'])).trim();
+      checkedOutCommit = (await this.runGit(worktreePath, ['rev-parse', 'HEAD'], executor)).trim();
     } catch (error) {
       throw new Error(`Unable to read HEAD commit in ${worktreePath}: ${String(error)}`, {
         cause: error,
@@ -98,7 +128,7 @@ export class WorkspaceAdapter implements WorkspacePort {
 
     let statusOutput: string;
     try {
-      statusOutput = await this.runGit(worktreePath, ['status', '--porcelain=v1', '-uall']);
+      statusOutput = await this.runGit(worktreePath, ['status', '--porcelain=v1', '-uall'], executor);
     } catch (error) {
       throw new Error(`Unable to read git status in ${worktreePath}: ${String(error)}`, {
         cause: error,
@@ -122,13 +152,13 @@ export class WorkspaceAdapter implements WorkspacePort {
     const residueFromEarlierAttempts: string[] = [];
     for (const residueFile of laneResidueFiles) {
       const residuePath = path.join(worktreePath, residueFile);
-      if (await this.pathExists(worktreePath, residuePath)) residueFromEarlierAttempts.push(residueFile);
+      if (await this.pathExists(worktreePath, residuePath, executor)) residueFromEarlierAttempts.push(residueFile);
     }
 
     const missingExpectedArtifacts: string[] = [];
     for (const expectedPath of request.expectedArtifactPaths) {
       const absolutePath = path.join(worktreePath, expectedPath);
-      if (!(await this.pathExists(worktreePath, absolutePath))) {
+      if (!(await this.pathExists(worktreePath, absolutePath, executor))) {
         missingExpectedArtifacts.push(expectedPath);
       }
     }
@@ -148,8 +178,11 @@ export class WorkspaceAdapter implements WorkspacePort {
   }
 
   /** Read-only git in the worktree, through the executor, within its budget. */
-  private async runGit(worktreePath: string, args: readonly string[]): Promise<string> {
-    const executor = this.requireExecutor();
+  private async runGit(
+    worktreePath: string,
+    args: readonly string[],
+    executor: CommandExecutorPort,
+  ): Promise<string> {
     const result = await executor.run(['git', '-C', worktreePath, ...args], {
       timeoutMs: GIT_TIMEOUT_MS,
     });
@@ -163,8 +196,11 @@ export class WorkspaceAdapter implements WorkspacePort {
   }
 
   /** Existence of one absolute path in the worktree's filesystem. */
-  private async pathExists(worktreePath: string, targetPath: string): Promise<boolean> {
-    const executor = this.requireExecutor();
+  private async pathExists(
+    worktreePath: string,
+    targetPath: string,
+    executor: CommandExecutorPort,
+  ): Promise<boolean> {
     const result = await executor.run(['test', '-e', targetPath], {
       timeoutMs: PROBE_TIMEOUT_MS,
     });
@@ -177,11 +213,15 @@ export class WorkspaceAdapter implements WorkspacePort {
     return result.exitCode === 0;
   }
 
-  async readWorktreeFile(worktreePath: string, relativePath: string): Promise<string | null> {
+  async readWorktreeFile(
+    worktreePath: string,
+    relativePath: string,
+    recordedHost?: AttemptRunnerRecord | null,
+  ): Promise<string | null> {
     const targetPath = path.isAbsolute(relativePath)
       ? relativePath
       : path.join(worktreePath, relativePath);
-    const executor = this.requireExecutor();
+    const executor = this.executorFor(recordedHost);
     const result = await executor.run(['cat', targetPath], { timeoutMs: CAT_TIMEOUT_MS });
     // A null exit code (spawn failure, timeout) is a failed read, not an
     // absent file; only exit 1 and friends mean "no such file".

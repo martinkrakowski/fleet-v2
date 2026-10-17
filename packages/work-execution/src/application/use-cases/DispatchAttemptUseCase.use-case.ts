@@ -199,6 +199,9 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       worktreePath: request.worktreePath,
       baseCommit: request.baseCommit,
       expectedArtifactPaths: request.expectedArtifacts ?? [],
+      // H9b2: the inspection runs where the dispatching runner's host lives;
+      // a legacy runner describes no host and keeps the configured executor.
+      recordedHost: this.deps.runner.describeRunner?.() ?? null,
     });
     if (!inspection.matchesBaseCommit) {
       return {
@@ -255,6 +258,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           raw = await this.deps.artifactPort.readBriefManifest(
             request.worktreePath,
             candidate,
+            this.deps.runner.describeRunner?.() ?? null,
           );
         } else if (this.deps.workspace.readWorktreeFile) {
           raw = await this.deps.workspace.readWorktreeFile(

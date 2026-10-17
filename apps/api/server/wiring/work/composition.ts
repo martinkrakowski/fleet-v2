@@ -15,6 +15,7 @@ import {
   RunnerForAttemptAdapter,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
+  ExecutorForHost,
   resolveExecutionRunnerHost,
   resolveInstallationForgeMode,
   resolveRoleExecutors,
@@ -272,8 +273,21 @@ export function createConfiguredWorkComposition(
   const attemptRepo = new AttemptRepositoryAdapter({ stateDir });
   const journal = new ExecutionJournalAdapter({ stateDir });
   const briefAuthoring = new BriefAuthoringAdapter();
-  const workspace = new WorkspaceAdapter({ executor: roleExecutors.worktree });
-  const artifactPort = new AttemptArtifactAdapter({ executor: roleExecutors.worktree });
+  // H9b2: workspace and artifact reads for an attempt recorded on a named
+  // host run through that recorded host's executor (the recorded host is the
+  // truth); legacy records keep the worktree-role executor exactly as before.
+  const executorForHost = new ExecutorForHost({
+    hosts: options?.installation?.hosts,
+    legacyExecutor: roleExecutors.worktree,
+  });
+  const workspace = new WorkspaceAdapter({
+    executor: roleExecutors.worktree,
+    executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
+  });
+  const artifactPort = new AttemptArtifactAdapter({
+    executor: roleExecutors.worktree,
+    executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
+  });
   // The worktree locator is resolved from the recorded attempt so a request
   // arriving in a later process addresses the same directory as its dispatch.
   const runner = new ExecutionRunnerAdapter({

@@ -19,6 +19,7 @@ import type {
   CommandCompletionReceipt,
 } from '@fleet/work-execution';
 import {
+  parseSeatTool,
   resolveExecutionRunnerHost,
   resolveInstallationHostForRole,
 } from '@fleet/work-execution';
@@ -595,6 +596,26 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
           );
         }
       }
+      // H8: the seat tool is required and frozen into the manifest, so it is
+      // covered by the digest. Missing or undeclared is a usage error (exit
+      // 2), never a default to opencode.
+      const nestedAssignment = nested<BriefModelAssignment>(p, 'modelAssignment');
+      const rawSeatTool = p['seatTool'] ?? nestedAssignment?.seatTool;
+      const seatTool = parseSeatTool(rawSeatTool);
+      if (seatTool === undefined) {
+        throw new CliUsageError(
+          'brief prepare requires --seatTool naming a declared runner kind (opencode or agy)',
+        );
+      }
+      if (
+        nestedAssignment !== undefined &&
+        nestedAssignment.seatTool !== undefined &&
+        nestedAssignment.seatTool !== seatTool
+      ) {
+        throw new CliUsageError(
+          `'--seatTool ${String(seatTool)}' conflicts with the seat tool in --modelAssignment`,
+        );
+      }
       return rt.execution.prepareBriefPackage.prepareBriefPackage({
         workOrderId: str(p, 'workOrderId'),
         projectId: str(p, 'projectId'),
@@ -604,11 +625,14 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         baseCommit: str(p, 'baseCommit'),
         policyRevision: str(p, 'policyRevision'),
         modelAssignment:
-          nested<BriefModelAssignment>(p, 'modelAssignment') ?? {
-            model: str(p, 'model'),
-            variant: str(p, 'variant') || 'default',
-            fallbackModel: str(p, 'fallbackModel'),
-          },
+          nestedAssignment !== undefined
+            ? { ...nestedAssignment, seatTool }
+            : {
+                model: str(p, 'model'),
+                variant: str(p, 'variant') || 'default',
+                fallbackModel: str(p, 'fallbackModel'),
+                seatTool,
+              },
         independentReviewer: str(p, 'independentReviewer'),
         ownedPaths: strArr(p, 'ownedPaths'),
         permissions: strArr(p, 'permissions'),
@@ -655,6 +679,14 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
           );
         }
       }
+      // H8: the seat tool comes from the request's chain seat and is required;
+      // missing or undeclared is a usage error (exit 2), never a default.
+      const seatTool = parseSeatTool(p['seatTool']);
+      if (seatTool === undefined) {
+        throw new CliUsageError(
+          'capacity reserve requires --seatTool naming a declared runner kind (opencode or agy)',
+        );
+      }
       return rt.execution.reserveExecutionCapacity.reserveExecutionCapacity({
         reservationId: str(p, 'reservationId'),
         attemptId: str(p, 'attemptId'),
@@ -662,6 +694,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         hostId: v2HostId ?? str(p, 'hostId'),
         worktreePath: str(p, 'worktreePath'),
         maxSlots: declaredMaxLanes ?? num(p, 'maxSlots', 1),
+        seatTool,
         nowIso: optStr(p, 'nowIso'),
       });
     },

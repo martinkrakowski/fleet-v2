@@ -79,6 +79,7 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
       hostId: 'host-1',
       slotIndex: 0,
       held: true,
+      seatTool: 'opencode',
       reservedAtIso: '2026-10-15T10:00:00.000Z',
       releasedAtIso: null,
     };
@@ -89,6 +90,7 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
       hostId: 'host-1',
       slotIndex: 1,
       held: true,
+      seatTool: 'opencode',
       reservedAtIso: '2026-10-15T10:01:00.000Z',
       releasedAtIso: null,
     };
@@ -145,6 +147,7 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
       hostId: 'host-1',
       slotIndex: 0,
       held: true,
+      seatTool: 'opencode',
       reservedAtIso: '2026-10-15T10:00:00.000Z',
       releasedAtIso: null,
     };
@@ -178,6 +181,7 @@ describe('ExecutionJournalAdapter atomic capacity arbitration', () => {
         id: overrides.id ?? 'res-race',
         attemptId,
         hostId: overrides.hostId ?? 'host-1',
+        seatTool: 'opencode',
         held: true,
         reservedAtIso: '2026-10-15T11:00:00.000Z',
         releasedAtIso: null,
@@ -292,6 +296,7 @@ describe('ExecutionJournalAdapter atomic capacity arbitration', () => {
         hostId: 'host-1',
         slotIndex: 1,
         held: true,
+        seatTool: 'opencode',
         reservedAtIso: '2026-10-15T11:01:00.000Z',
         releasedAtIso: null,
       }),
@@ -327,6 +332,7 @@ describe('ExecutionJournalAdapter in-memory atomic capacity arbitration', () => 
         id: overrides.id ?? 'res-mem-race',
         attemptId,
         hostId: 'host-1',
+        seatTool: 'opencode',
         held: true,
         reservedAtIso: '2026-10-15T11:00:00.000Z',
         releasedAtIso: null,

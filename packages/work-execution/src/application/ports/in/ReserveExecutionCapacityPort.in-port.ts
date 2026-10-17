@@ -5,7 +5,7 @@
  * refusal is distinguished from "no free slot".
  */
 
-import type { CapacityReservationRecord } from '../../../domain/execution-records.js';
+import type { CapacityReservationRecord, RunnerKind } from '../../../domain/execution-records.js';
 
 export interface ReserveExecutionCapacityRequest {
   readonly reservationId: string;
@@ -14,6 +14,12 @@ export interface ReserveExecutionCapacityRequest {
   readonly hostId: string;
   readonly worktreePath: string;
   readonly maxSlots: number;
+  /**
+   * The seat tool the lane will run, from the request's chain seat. Required
+   * and never defaulted: a blank or unknown tool is a refusal, not an
+   * opencode seat.
+   */
+  readonly seatTool: RunnerKind;
   readonly nowIso?: string;
 }
 

@@ -5,6 +5,8 @@
  * dispatch. The runtime validates the manifest; the lane reads the prose.
  */
 
+import type { RunnerKind } from '../../../domain/execution-records.js';
+
 export interface BriefContextDecision {
   readonly proposalId: string;
   readonly knowledgeEntryId: string;
@@ -22,6 +24,12 @@ export interface BriefModelAssignment {
   readonly model: string;
   readonly variant: string;
   readonly fallbackModel: string;
+  /**
+   * The runner tool the implementer seat runs. Frozen into the brief
+   * manifest, so it is covered by the digest; dispatch reads it back from
+   * there and never from a request.
+   */
+  readonly seatTool: RunnerKind;
 }
 
 export interface PrepareBriefPackageRequest {

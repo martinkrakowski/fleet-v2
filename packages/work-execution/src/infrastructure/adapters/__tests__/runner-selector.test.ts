@@ -16,6 +16,7 @@ import { AttemptRepositoryAdapter } from '../AttemptRepositoryAdapter.adapter.js
 import { DispatchAttemptUseCase } from '../../../application/use-cases/DispatchAttemptUseCase.use-case.js';
 import { RunnerSelectorAdapter } from '../RunnerSelectorAdapter.adapter.js';
 import type { RunnerSelectorLaneRunnerHost } from '../RunnerSelectorAdapter.adapter.js';
+import type { RunnerSelectorPort } from '../../../application/ports/out/RunnerSelectorPort.out-port.js';
 
 // ---------------------------------------------------------------------------
 // RunnerSelectorAdapter
@@ -284,7 +285,7 @@ function makeAttemptRepo() {
   };
 }
 
-function makeJournal() {
+function makeJournal(extraReservations: { id: string; attemptId: string }[] = []) {
   const entries: unknown[] = [];
   const port: ExecutionJournalPort = {
     async appendJournalEntry(entry) {
@@ -301,9 +302,20 @@ function makeJournal() {
           hostId: 'h',
           slotIndex: 0,
           held: true,
+          seatTool: 'opencode',
           reservedAtIso: '',
           releasedAtIso: null,
         },
+        ...extraReservations.map((reservation, index) => ({
+          id: reservation.id,
+          attemptId: reservation.attemptId,
+          hostId: 'h',
+          slotIndex: index + 1,
+          held: true,
+          seatTool: 'opencode' as const,
+          reservedAtIso: '',
+          releasedAtIso: null,
+        })),
       ];
     },
     async releaseCapacityReservation() {
@@ -432,5 +444,51 @@ describe('DispatchAttemptUseCase runner selection (O14c1)', () => {
     expect(setup.runner.startCalls).toEqual([]);
     expect(setup.journal.entries).toEqual([]);
     expect(setup.attemptRepo.attempts.size).toBe(0);
+  });
+
+  it('passes the frozen manifest seat tool to the selector, and only a manifest written before the field existed reads as opencode (H8)', async () => {
+    const selectionCalls: string[] = [];
+    let manifestSeatTool: unknown;
+    const selector: RunnerSelectorPort = {
+      selectRunner(request) {
+        (selectionCalls as string[]).push(request.seatTool);
+        return { ok: true, kind: 'opencode', hostName: null, remotePort: null };
+      },
+    };
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder());
+    const attemptRepo = makeAttemptRepo();
+    const workspace = makeWorkspace();
+    const baseFile = await workspace.port.readWorktreeFile?.('/lanes/attempt-1', '.lane/brief-manifest.json');
+    const base = JSON.parse(baseFile ?? '{}') as Record<string, unknown>;
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo: workOrderRepo.port,
+      attemptRepo: attemptRepo.port,
+      journal: makeJournal([{ id: 'res-2', attemptId: 'attempt-2' }]).port,
+      workspace: {
+        ...workspace.port,
+        readWorktreeFile: async (_path: string, relativePath: string) =>
+          relativePath === '.lane/brief-manifest.json'
+            ? JSON.stringify({ ...base, seatTool: manifestSeatTool })
+            : null,
+      } as WorkspacePort,
+      runner: makeRunnerSpy().port,
+      runnerSelector: selector,
+    });
+
+    manifestSeatTool = 'agy';
+    const agyDispatch = await useCase.dispatchAttempt(dispatchRequest());
+    expect(agyDispatch.outcome).toBe('started');
+    expect(selectionCalls).toEqual(['agy']);
+
+    // A manifest with no seatTool keeps today's behaviour: the opencode seat.
+    manifestSeatTool = undefined;
+    selectionCalls.length = 0;
+    const legacyDispatch = await useCase.dispatchAttempt({
+      ...dispatchRequest(),
+      attemptId: 'attempt-2',
+    });
+    expect(legacyDispatch.outcome).toBe('started');
+    expect(selectionCalls).toEqual(['opencode']);
   });
 });

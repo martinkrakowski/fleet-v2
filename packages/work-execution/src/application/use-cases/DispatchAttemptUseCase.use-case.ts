@@ -13,6 +13,7 @@ import type {
   AttemptRecord,
   AttemptRunnerRecord,
 } from '../../domain/execution-records.js';
+import { parseSeatTool } from '../../domain/execution-records.js';
 import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import type { DispatchAttemptPort, DispatchAttemptRequest, DispatchAttemptResult } from '../ports/in/DispatchAttemptPort.in-port.js';
 import type { RunnerIsolationCapabilities } from '../ports/out/ExecutionRunnerPort.out-port.js';
@@ -290,11 +291,17 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     // an opencode seat. A selection without an implemented runner refuses
     // before the dispatch intent is recorded and before anything spawns.
     if (this.deps.runnerSelector) {
-      const manifestSeatTool = parsedManifest.seatTool;
+      // H8: the frozen manifest's seat tool decides the seat; only a manifest
+      // written before the field existed reads as the opencode seat. A
+      // malformed tool is passed through untouched — the selector refuses an
+      // undeclared kind rather than falling back.
+      const manifestSeatTool = parseSeatTool(parsedManifest.seatTool);
+      const rawSeatTool = parsedManifest.seatTool;
       const seatTool =
-        typeof manifestSeatTool === 'string' && manifestSeatTool.trim() !== ''
-          ? manifestSeatTool.trim()
-          : 'opencode';
+        manifestSeatTool ??
+        (typeof rawSeatTool === 'string' && rawSeatTool.trim() !== ''
+          ? rawSeatTool.trim()
+          : 'opencode');
       const selection = this.deps.runnerSelector.selectRunner({ seatTool });
       if (!selection.ok) {
         return { outcome: 'refused', reason: selection.reason };

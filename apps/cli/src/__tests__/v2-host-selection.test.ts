@@ -111,6 +111,7 @@ describe("v2 CLI host selection (H3b)", () => {
           attemptId: "attempt-v2-2",
           workOrderId: "wo-v2-2",
           worktreePath: stateDir,
+          seatTool: "opencode",
         }),
       ],
       io,

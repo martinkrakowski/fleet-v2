@@ -170,6 +170,7 @@ function storedReservation(overrides: Partial<CapacityReservationRecord> = {}): 
     hostId: 'host-1',
     slotIndex: 0,
     held: true,
+    seatTool: 'opencode',
     reservedAtIso: '2026-10-15T08:00:00.000Z',
     releasedAtIso: null,
     ...overrides,
@@ -430,6 +431,7 @@ function validReservationRequest(overrides: Record<string, unknown> = {}) {
     hostId: 'host-1',
     worktreePath: '/lanes/attempt-9',
     maxSlots: 2,
+    seatTool: 'opencode',
     nowIso: '2026-10-15T08:00:00.000Z',
     ...overrides,
   };
@@ -471,6 +473,39 @@ describe('ReserveExecutionCapacityUseCase', () => {
     });
   });
 
+  it('refuses a blank or unknown seatTool and never defaults it (H8)', async () => {
+    const useCase = new ReserveExecutionCapacityUseCase({ journal: makeJournal(), attemptRepo: makeAttemptRepo() });
+
+    for (const seatTool of ['', '   ', 'claude', 'OpenCode']) {
+      const result = await useCase.reserveExecutionCapacity(
+        validReservationRequest({ seatTool }) as Parameters<
+          ReserveExecutionCapacityUseCase['reserveExecutionCapacity']
+        >[0],
+      );
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: 'seatTool must be a declared runner kind (opencode or agy)',
+      });
+    }
+  });
+
+  it('records a valid seat tool on the reservation', async () => {
+    const journal = makeJournal();
+    const useCase = new ReserveExecutionCapacityUseCase({ journal, attemptRepo: makeAttemptRepo() });
+
+    const result = await useCase.reserveExecutionCapacity(
+      validReservationRequest({ seatTool: 'agy' }) as Parameters<
+        ReserveExecutionCapacityUseCase['reserveExecutionCapacity']
+      >[0],
+    );
+
+    expect(result.outcome).toBe('reserved');
+    if (result.outcome === 'reserved') {
+      expect(result.reservation.seatTool).toBe('agy');
+    }
+    expect(journal.reservations.get('res-9')?.seatTool).toBe('agy');
+  });
+
   it('reserves the lowest free slot and persists the reservation', async () => {
     const journal = makeJournal();
     const attemptRepo = makeAttemptRepo();
@@ -495,6 +530,7 @@ describe('ReserveExecutionCapacityUseCase', () => {
         hostId: 'host-1',
         slotIndex: 0,
         held: true,
+        seatTool: 'opencode',
         reservedAtIso: '2026-10-15T08:00:00.000Z',
         releasedAtIso: null,
       },
@@ -757,7 +793,12 @@ function validBriefRequest(overrides: Record<string, unknown> = {}): PrepareBrie
     repository: 'git@example.org:acme/app.git',
     baseCommit: 'abc123',
     policyRevision: 'policy-7',
-    modelAssignment: { model: 'implementer-model', variant: 'default', fallbackModel: 'fallback-model' },
+    modelAssignment: {
+      model: 'implementer-model',
+      variant: 'default',
+      fallbackModel: 'fallback-model',
+      seatTool: 'opencode',
+    },
     independentReviewer: 'reviewer-model',
     ownedPaths: ['packages/app-a/**'],
     permissions: ['filesystem:worktree'],
@@ -855,6 +896,81 @@ describe('PrepareBriefPackageUseCase', () => {
     });
   });
 
+  it('rejects a brief whose model assignment carries no declared seat tool (H8)', async () => {
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring().port,
+      artifactPort: makeArtifactPort().port,
+    });
+
+    for (const seatTool of ['', '   ', 'claude', 'OpenCode', 1, undefined]) {
+      const result = await useCase.prepareBriefPackage(
+        validBriefRequest({
+          modelAssignment: {
+            model: 'implementer-model',
+            variant: 'default',
+            fallbackModel: 'fallback-model',
+            seatTool: seatTool as never,
+          },
+        }),
+      );
+      expect(result).toEqual({
+        outcome: 'rejected',
+        reason: 'Model assignment requires a declared seat tool (opencode or agy)',
+      });
+    }
+  });
+
+  it('freezes the seat tool into the manifest, where the digest covers it (H8)', async () => {
+    const authoring = makeBriefAuthoring({ proseMarkdown: '# Prose A' });
+    const artifacts = makeArtifactPort();
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: authoring.port,
+      artifactPort: artifacts.port,
+    });
+
+    const opencode = await useCase.prepareBriefPackage(
+      validBriefRequest({
+        attemptId: 'attempt-seat-1',
+        worktreePath: '/lanes/attempt-seat-1',
+        modelAssignment: {
+          model: 'implementer-model',
+          variant: 'default',
+          fallbackModel: 'fallback-model',
+          seatTool: 'opencode',
+        },
+      }),
+    );
+    const agy = await useCase.prepareBriefPackage(
+      validBriefRequest({
+        attemptId: 'attempt-seat-1',
+        worktreePath: '/lanes/attempt-seat-1',
+        modelAssignment: {
+          model: 'implementer-model',
+          variant: 'default',
+          fallbackModel: 'fallback-model',
+          seatTool: 'agy',
+        },
+      }),
+    );
+
+    expect(opencode.outcome).toBe('prepared');
+    expect(agy.outcome).toBe('prepared');
+    if (opencode.outcome !== 'prepared' || agy.outcome !== 'prepared') {
+      throw new Error('unreachable');
+    }
+    const firstManifest = JSON.parse(artifacts.placedCalls[0].manifestJson) as {
+      modelAssignment: { seatTool?: unknown };
+    };
+    const secondManifest = JSON.parse(artifacts.placedCalls[1].manifestJson) as {
+      modelAssignment: { seatTool?: unknown };
+    };
+    expect(firstManifest.modelAssignment.seatTool).toBe('opencode');
+    expect(secondManifest.modelAssignment.seatTool).toBe('agy');
+    // The seat tool is part of the frozen manifest, so changing it changes
+    // the digest even when every other byte is identical.
+    expect(agy.prepared.briefDigest).not.toBe(opencode.prepared.briefDigest);
+  });
+
   it('rejects when the authoring port cannot produce a brief', async () => {
     const useCase = new PrepareBriefPackageUseCase({
       briefAuthoring: makeBriefAuthoring({ unavailableReason: 'orchestrator offline' }).port,
@@ -934,6 +1050,7 @@ describe('PrepareBriefPackageUseCase', () => {
       model: 'implementer-model',
       variant: 'default',
       fallbackModel: 'fallback-model',
+      seatTool: 'opencode',
     });
     expect(manifest.independentReviewer).toBe('reviewer-model');
     expect(manifest.stepLimit).toBe(40);

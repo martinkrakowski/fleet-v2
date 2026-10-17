@@ -18,12 +18,19 @@ import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-p
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { BriefKnowledgePort } from '../ports/out/BriefKnowledgePort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
+import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 
 export interface CollectAttemptArtifactsDependencies {
   readonly attemptRepo: AttemptRepositoryPort;
   readonly journal: ExecutionJournalPort;
   readonly artifactPort: AttemptArtifactPort;
   readonly briefKnowledge?: BriefKnowledgePort;
+  /**
+   * Optional (H9b1). When given, an attempt whose recorded host changed or
+   * was removed is refused, naming the recorded host. Without it the
+   * behaviour is unchanged.
+   */
+  readonly runnerForAttempt?: RunnerForAttemptPort;
 }
 
 type JournalEntryDraft = Omit<ActionJournalEntryRecord, 'id'>;
@@ -67,6 +74,17 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
     }
     if (request.baseCommit !== undefined && request.baseCommit !== attempt.baseCommit) {
       return { outcome: 'refused', reason: 'baseCommit differs from recorded attempt' };
+    }
+
+    if (this.deps.runnerForAttempt) {
+      // The recorded host is the truth: a recorded host that changed or was
+      // removed refuses, naming the recorded host.
+      const selection = this.deps.runnerForAttempt.runnerForAttempt({
+        runner: attempt.runner ?? null,
+      });
+      if (!selection.ok) {
+        return { outcome: 'refused', reason: selection.reason };
+      }
     }
 
     const collected = await this.deps.artifactPort.collectCompletedAttemptArtifacts({

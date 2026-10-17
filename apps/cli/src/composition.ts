@@ -46,6 +46,7 @@ import {
   RegisterWorkOrderUseCase,
   RequestAttemptAcceptanceUseCase,
   ReserveExecutionCapacityUseCase,
+  RunnerForAttemptAdapter,
   StopAttemptUseCase,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
@@ -490,6 +491,8 @@ export interface FleetCliRuntime {
     readonly executionJournal: ExecutionJournalAdapter;
     readonly workspace: WorkspaceAdapter;
     readonly runner: ExecutionRunnerAdapter;
+    /** H9b1: resolves the runner for an attempt's recorded host. */
+    readonly runnerForAttempt: RunnerForAttemptAdapter;
     /**
      * The installation's selected lane-runner host (v2 mode); undefined for
      * a v1 or absent installation, which keeps the adapter in legacy mode.
@@ -899,6 +902,23 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     resolveAttempt: async (attemptId) =>
       await attemptRepository.findAttemptById(attemptId),
   });
+  // H9b1: inspect, reconcile, stop and collect act through the attempt's
+  // recorded host. One adapter per host name is built and cached from the
+  // installation's hosts with the same options as the single runner above;
+  // legacy attempts (no recorded hostName) keep this single runner.
+  const runnerForAttempt = new RunnerForAttemptAdapter({
+    hosts: options?.installation?.hosts,
+    legacyRunner: runner,
+    ocmRunBin,
+    executor: roleExecutors.orchestrator,
+    runSubprocess: options?.runSubprocess,
+    ...(runnerProfile !== undefined ? { capabilities: runnerProfile.capabilities } : {}),
+    ...(runnerProfile !== undefined ? { runnerTransport: runnerProfile.transport } : {}),
+    resolveWorktreePath: async (attemptId) =>
+      (await attemptRepository.findAttemptById(attemptId))?.worktreePath ?? null,
+    resolveAttempt: async (attemptId) =>
+      await attemptRepository.findAttemptById(attemptId),
+  });
   const attemptArtifact = new AttemptArtifactAdapter({ executor: roleExecutors.worktree });
   // Hand-written brief files arrive per request; no default prose is assumed.
   const briefAuthoring = new BriefAuthoringAdapter();
@@ -1218,6 +1238,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     executionJournal,
     workspace,
     runner,
+    runnerForAttempt,
     ...(runnerHost !== undefined ? { runnerHost } : {}),
     // The runner entry's lane budget (D4/D6 plan item 4); undefined without a
     // declared lane-runner entry, in which case the request default applies.
@@ -1236,7 +1257,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       attemptRepo: attemptRepository,
       journal: executionJournal,
     }),
-    inspectAttempt: new InspectAttemptUseCase({ attemptRepo: attemptRepository }),
+    inspectAttempt: new InspectAttemptUseCase({
+      attemptRepo: attemptRepository,
+      runnerForAttempt,
+    }),
     prepareBriefPackage: new PrepareBriefPackageUseCase({
       briefAuthoring,
       artifactPort: attemptArtifact,
@@ -1259,17 +1283,20 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       attemptRepo: attemptRepository,
       journal: executionJournal,
       runner,
+      runnerForAttempt,
     }),
     stopAttempt: new StopAttemptUseCase({
       attemptRepo: attemptRepository,
       journal: executionJournal,
       runner,
+      runnerForAttempt,
     }),
     collectAttemptArtifacts: new CollectAttemptArtifactsUseCase({
       attemptRepo: attemptRepository,
       journal: executionJournal,
       artifactPort: attemptArtifact,
       briefKnowledge,
+      runnerForAttempt,
     }),
     prepareFixAttempt: new PrepareFixAttemptUseCase({ attemptRepo: attemptRepository }),
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({

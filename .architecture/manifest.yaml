@@ -387,8 +387,9 @@ bounded_contexts:
             - ActionAuthorizationPort
             - ExecutionObservationPort
             - RunnerSelectorPort
+            - RunnerForAttemptPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, LocalExecutor, SshExecutor]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, RunnerForAttemptAdapter, LocalExecutor, SshExecutor]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -408,6 +409,7 @@ bounded_contexts:
       BriefAuthoringPort: "Obtain a project orchestrator's brief or a hand-written file without introducing provider inference into the control plane."
       ExecutionRunnerPort: "Start, inspect and stop a matching attempt/session with explicit capabilities and strict per-lane directory isolation."
       RunnerSelectorPort: "Given the installation's lane-runner hosts and the attempt's seat tool, return the runner kind and host to use; a kind without an implemented adapter is refused as runner-not-available."
+      RunnerForAttemptPort: "Given the attempt's recorded runner block, return the runner that addresses the recorded host; a host that changed, was renamed or was removed is refused naming the recorded host, and a legacy attempt keeps the single legacy runner."
       CommandExecutorPort: "Run one reviewed argv array without a shell through a local or ssh transport and report its completed outcome, never a launch as completion."
       WorkspacePort: "Prepare scoped Git worktrees and inspect base/head commits and commit deltas without resetting user work."
       AttemptArtifactPort: "Place frozen briefs and templates under verified ignored paths and collect bounded immutable artifacts after lane completion."
@@ -427,6 +429,7 @@ bounded_contexts:
       - { adapter: ExecutionRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-ocm-run-subprocess }
       - { adapter: AgyRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-agy-run-subprocess-behind-runner-mode }
       - { adapter: RunnerSelectorAdapter, implements: RunnerSelectorPort, integration: installation-host-structural-selection }
+      - { adapter: RunnerForAttemptAdapter, implements: RunnerForAttemptPort, integration: per-host-cached-ocm-run-adapters-with-confirm-or-unknown }
       - { adapter: LocalExecutor, implements: CommandExecutorPort, integration: local-execfile-argv-no-shell }
       - { adapter: SshExecutor, implements: CommandExecutorPort, integration: batch-mode-ssh-quoted-argv }
       - { adapter: WorkspaceAdapter, implements: WorkspacePort, integration: reviewed-git-worktree-subprocess }

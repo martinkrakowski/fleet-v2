@@ -17,7 +17,8 @@ export type ReconcileAttemptResult =
   | { readonly outcome: 'active'; readonly attempt: AttemptRecord; readonly status: RunnerSessionStatus }
   | { readonly outcome: 'ended'; readonly attempt: AttemptRecord; readonly receipt: CommandCompletionReceipt }
   | { readonly outcome: 'unknown'; readonly attempt: AttemptRecord; readonly reason: string }
-  | { readonly outcome: 'not-found'; readonly attemptId: string };
+  | { readonly outcome: 'not-found'; readonly attemptId: string }
+  | { readonly outcome: 'refused'; readonly reason: string };
 
 export interface ReconcileAttemptPort {
   /** Reconcile one attempt against its runner session before acting again. */

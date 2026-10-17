@@ -9,9 +9,16 @@ import type {
   InspectAttemptResult,
 } from '../ports/in/InspectAttemptPort.in-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 
 export interface InspectAttemptDependencies {
   readonly attemptRepo: AttemptRepositoryPort;
+  /**
+   * Optional (H9b1). When given, an attempt whose recorded host no longer
+   * matches the current installation inspects as `unknown` with the reason,
+   * never a guess from another host. Without it the behaviour is unchanged.
+   */
+  readonly runnerForAttempt?: RunnerForAttemptPort;
 }
 
 export class InspectAttemptUseCase implements InspectAttemptPort {
@@ -29,6 +36,17 @@ export class InspectAttemptUseCase implements InspectAttemptPort {
     const attempt = await this.deps.attemptRepo.findAttemptById(request.attemptId);
     if (!attempt) {
       return { outcome: 'not-found', attemptId: request.attemptId };
+    }
+
+    if (this.deps.runnerForAttempt) {
+      // The recorded host is the truth: a recorded host that changed or was
+      // removed inspects as unknown with the reason, never a guess.
+      const selection = this.deps.runnerForAttempt.runnerForAttempt({
+        runner: attempt.runner ?? null,
+      });
+      if (!selection.ok) {
+        return { outcome: 'unknown', attemptId: request.attemptId, reason: selection.reason };
+      }
     }
 
     return { outcome: 'found', attempt };

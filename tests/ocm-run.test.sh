@@ -1,5 +1,5 @@
 #!/bin/sh
-# Tests for bin/ocm-run. Nothing here can reach midnight or a real opencode:
+# Tests for bin/ocm-run. Nothing here can reach a real host or a real opencode:
 #   - a fake opencode server (python3, loopback only) listens on a random port pair;
 #   - a fake `opencode` and a fake `ssh` (records every call, never forwards) are first on PATH;
 #   - OCM_HOST is an ssh alias that does not exist, so a tunnel attempt fails at once and is recorded.

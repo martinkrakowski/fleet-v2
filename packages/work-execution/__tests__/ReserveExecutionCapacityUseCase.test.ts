@@ -245,7 +245,7 @@ describe('ReserveExecutionCapacityUseCase (Appendix A)', () => {
     const result = await useCase.reserveExecutionCapacity(
       baseRequest({
         host: {
-          hostName: 'midnight',
+          hostName: 'lanehost',
           hostKind: 'opencode',
           transport: 'ssh',
           sshAlias: 'm',
@@ -255,14 +255,14 @@ describe('ReserveExecutionCapacityUseCase (Appendix A)', () => {
     );
     expect(result.outcome).toBe('reserved');
     if (result.outcome !== 'reserved') throw new Error('expected a reservation');
-    expect(result.reservation.hostName).toBe('midnight');
+    expect(result.reservation.hostName).toBe('lanehost');
     expect(result.reservation.hostKind).toBe('opencode');
     expect(result.reservation.transport).toBe('ssh');
     expect(result.reservation.sshAlias).toBe('m');
     expect(result.reservation.port).toBe(4166);
     // The claim is also recorded in the journal's durable record.
     expect(journal.reservations.get('res-host')).toMatchObject({
-      hostName: 'midnight',
+      hostName: 'lanehost',
       hostKind: 'opencode',
       transport: 'ssh',
       sshAlias: 'm',

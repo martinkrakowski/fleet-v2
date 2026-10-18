@@ -215,7 +215,7 @@ const HOST_LOAD_RESULT = {
         worktreeRoot: '/srv/fleet/worktrees',
         roles: ['orchestrator', 'verifier'],
       },
-      midnight: {
+      lanehost: {
         transport: 'ssh',
         sshAlias: 'm',
         worktreeRoot: '/srv/fleet/worktrees',
@@ -275,20 +275,20 @@ describe('fleet-v2 doctor --host', () => {
   it("runs the host's probe subset and the leftover-forward check, exiting 0 when all pass", async () => {
     const { io, stdout } = captureIo();
     const { executor, calls } = hostProbeExecutor(() => false);
-    const code = await runCli(['doctor', '--host', 'midnight'], io, undefined, {
+    const code = await runCli(['doctor', '--host', 'lanehost'], io, undefined, {
       loadResult: HOST_LOAD_RESULT,
       hostProbeExecutor: executor,
     });
     expect(code).toBe(0);
     const text = stdout.join('');
-    expect(text).toContain('PASS host midnight reachable — reachable via m');
+    expect(text).toContain('PASS host lanehost reachable — reachable via m');
     expect(text).toContain('version-sh');
-    expect(text).toContain('tool midnight/opencode version-opencode');
+    expect(text).toContain('tool lanehost/opencode version-opencode');
     expect(text).toContain('worktree-root-writable');
     expect(text).toContain('server-loopback');
     // The forward port of an ssh host is owned by it; the adjacent port is
     // checked and reported when nothing else listens there.
-    expect(text).toContain('PASS host midnight unowned-forward — nothing is listening on 127.0.0.1:4166');
+    expect(text).toContain('PASS host lanehost unowned-forward — nothing is listening on 127.0.0.1:4166');
     expect(calls.some((argv) => argv.includes('nc') && argv.includes('4166'))).toBe(true);
     // The seat probes never run for a single host's subset.
     expect(text).not.toContain('seat');
@@ -297,14 +297,14 @@ describe('fleet-v2 doctor --host', () => {
   it('reports a listening forward on a port no configured host owns as FAIL', async () => {
     const { io, stdout } = captureIo();
     const { executor } = hostProbeExecutor(() => true);
-    const code = await runCli(['doctor', '--host', 'midnight'], io, undefined, {
+    const code = await runCli(['doctor', '--host', 'lanehost'], io, undefined, {
       loadResult: HOST_LOAD_RESULT,
       hostProbeExecutor: executor,
     });
     expect(code).toBe(1);
     const text = stdout.join('');
     expect(text).toContain(
-      'FAIL host midnight unowned-forward — 127.0.0.1:4166 is listening but no configured host owns it',
+      'FAIL host lanehost unowned-forward — 127.0.0.1:4166 is listening but no configured host owns it',
     );
     expect(text).toContain("pgrep -f 'ssh .*-L 127.0.0.1:4166'");
   });
@@ -318,7 +318,7 @@ describe('fleet-v2 doctor --host', () => {
     });
     expect(code).toBe(0);
     const text = stdout.join('');
-    expect(text).toContain('PASS host mac lane-runner-worktree-visible — lane-runner worktree root /srv/fleet/worktrees on midnight is visible');
+    expect(text).toContain('PASS host mac lane-runner-worktree-visible — lane-runner worktree root /srv/fleet/worktrees on lanehost is visible');
     expect(text).not.toContain('unowned-forward');
   });
 
@@ -335,14 +335,14 @@ describe('fleet-v2 doctor --host', () => {
 
   it('refuses --host together with --probe-seats as a usage error', async () => {
     const { io, stderr } = captureIo();
-    const code = await runCli(['doctor', '--host', 'midnight', '--probe-seats'], io);
+    const code = await runCli(['doctor', '--host', 'lanehost', '--probe-seats'], io);
     expect(code).toBe(2);
     expect(stderr.join('')).toContain('--probe-seats belongs to the full doctor run');
   });
 
   it('refuses --host on an installation with no named hosts', async () => {
     const { io, stderr } = captureIo();
-    const code = await runCli(['doctor', '--host', 'midnight'], io, undefined, {
+    const code = await runCli(['doctor', '--host', 'lanehost'], io, undefined, {
       loadResult: {
         status: 'loaded',
         file: '/installation/fleet.json',

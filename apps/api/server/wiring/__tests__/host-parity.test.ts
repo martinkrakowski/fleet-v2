@@ -103,15 +103,15 @@ describe("v2 runner-host parity between the CLI and API roots", () => {
           worktreeRoot: "/srv/fleet/worktrees",
           roles: ["orchestrator", "verifier"],
         },
-        midnight: {
+        lanehost: {
           transport: "ssh",
           sshAlias: "m",
-          worktreeRoot: "/mnt/pool/cloud-services/projects/.worktrees/fleet-v2",
+          worktreeRoot: "/srv/fleet/projects/.worktrees/fleet-v2",
           roles: ["lane-runner"],
           runner: {
             kind: "opencode",
             port: 4166,
-            authFile: "/run/fleet/midnight-auth",
+            authFile: "/run/fleet/lanehost-auth",
           },
         },
       },
@@ -123,11 +123,11 @@ describe("v2 runner-host parity between the CLI and API roots", () => {
     expect(api.runnerHost).toBeDefined();
     expect(cli.execution.runnerHost).toEqual(api.runnerHost);
     expect(cli.execution.runnerHost).toEqual({
-      hostName: "midnight",
+      hostName: "lanehost",
       transport: "ssh",
       sshAlias: "m",
       remotePort: 4166,
-      authFile: "/run/fleet/midnight-auth",
+      authFile: "/run/fleet/lanehost-auth",
     });
     // The stale environment alias never routes the lane to another machine.
     expect(cli.execution.runner.configuredRemoteHost()).toBe("m");
@@ -143,7 +143,7 @@ describe("v2 runner-host parity between the CLI and API roots", () => {
         remotePort: 4321,
         host: "tunnel-host",
       },
-      worktree: { sshHost: "midnight" },
+      worktree: { sshHost: "lanehost" },
       forge: { owner: "o", repo: "r" },
     });
 

@@ -54,9 +54,9 @@ function succeeded(stdout = ''): Partial<DoctorCommandRunResult> {
 }
 
 const sshSpec: HostProbeSpec = {
-  name: 'midnight',
+  name: 'lanehost',
   transport: 'ssh',
-  sshAlias: 'midnight',
+  sshAlias: 'lanehost',
   worktreeRoot: '/srv/fleet-v2/worktrees',
   runner: {
     kind: 'opencode',
@@ -82,7 +82,7 @@ function sshPrefixOf(alias: string): string[] {
   return ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', alias, '--'];
 }
 
-const SSH_PREFIX = sshPrefixOf('midnight');
+const SSH_PREFIX = sshPrefixOf('lanehost');
 
 /**
  * A fake executor that answers every step of `spec` the way a healthy host
@@ -238,9 +238,9 @@ describe('planHostProbes', () => {
 
     const withIt = planHostProbes({
       ...localSpec,
-      name: 'sunrise',
+      name: 'verifyhost',
       laneRunnerWorktreeRoot: {
-        hostName: 'midnight',
+        hostName: 'lanehost',
         worktreeRoot: '/srv/fleet-v2/worktrees',
       },
     });
@@ -304,7 +304,7 @@ describe('planHostProbes', () => {
       {
         kind: 'note',
         scope: 'host',
-        subject: 'midnight',
+        subject: 'lanehost',
         check: 'ssh-alias',
         status: 'FAIL',
         detail:
@@ -327,9 +327,9 @@ describe('planHostProbes', () => {
 
   it('maps a drafted host onto its probe spec', () => {
     const drafted = draftHost({
-      name: 'midnight',
+      name: 'lanehost',
       transport: 'ssh',
-      sshAlias: 'midnight',
+      sshAlias: 'lanehost',
       worktreeRoot: '/srv/fleet-v2/worktrees',
       tmpDir: '/tmp/fleet-v2',
       roles: ['lane-runner'],
@@ -344,9 +344,9 @@ describe('planHostProbes', () => {
       return;
     }
     expect(hostProbeSpecFromDraft(drafted.draft)).toEqual({
-      name: 'midnight',
+      name: 'lanehost',
       transport: 'ssh',
-      sshAlias: 'midnight',
+      sshAlias: 'lanehost',
       worktreeRoot: '/srv/fleet-v2/worktrees',
       tmpDir: '/tmp/fleet-v2',
       runner: {
@@ -503,7 +503,7 @@ describe('runHostProbes', () => {
     );
     const lines = await probeHost(sshSpec, executor);
     expect(lines.find((line) => line.check === 'reachable')?.detail).toBe(
-      'reachable via midnight',
+      'reachable via lanehost',
     );
     const server = lines.find((line) => line.check === 'server-loopback');
     expect(server?.status).toBe('PASS');

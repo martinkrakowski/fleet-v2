@@ -12,7 +12,7 @@ import { resolveRunnerSettings } from '../composition.js';
 
 const v1OwnerShape: FleetInstallation = {
   schemaVersion: 1,
-  worktree: { sshHost: 'midnight' },
+  worktree: { sshHost: 'lanehost' },
   runner: {
     host: 'tunnel-host',
     remotePort: 4321,
@@ -34,7 +34,7 @@ describe('v1 installation executor and runner resolution', () => {
 
   it('keeps runner.host and runner.ocmRunBin separate from worktree.sshHost', () => {
     const settings = resolveRunnerSettings({}, v1OwnerShape, {});
-    expect(settings.worktreeSshHost).toBe('midnight');
+    expect(settings.worktreeSshHost).toBe('lanehost');
     expect(settings.runnerRemoteHost).toBe('tunnel-host');
     expect(settings.ocmRunBin).toBe('/opt/fleet/bin/ocm-run');
     expect(settings.runnerRemotePort).toBe(4321);

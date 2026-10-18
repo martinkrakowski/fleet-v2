@@ -47,9 +47,9 @@ const hereRunner: HostDraftInput = {
 describe('validateHostDraft', () => {
   it('accepts a draft that satisfies every loader rule', () => {
     const verifier = draft({
-      name: 'twilight',
+      name: 'verifymac',
       transport: 'ssh',
-      sshAlias: 'twilight.lan',
+      sshAlias: 'verifymac.example',
       worktreeRoot: '/srv/fleet-v2/verify',
       roles: ['verifier'],
     });
@@ -59,7 +59,7 @@ describe('validateHostDraft', () => {
       return;
     }
     expect(result.installation.schemaVersion).toBe(2);
-    expect(Object.keys(result.candidate.hosts)).toEqual(['here', 'twilight']);
+    expect(Object.keys(result.candidate.hosts)).toEqual(['here', 'verifymac']);
     // The loader's own answer on the same candidate value, unchanged.
     expect(parseInstallation(result.candidate)).toEqual({
       ok: true,
@@ -69,9 +69,9 @@ describe('validateHostDraft', () => {
 
   it('accepts a second lane runner now that the loader allows several (H9a)', () => {
     const secondRunner = draft({
-      name: 'midnight',
+      name: 'lanehost',
       transport: 'ssh',
-      sshAlias: 'midnight',
+      sshAlias: 'lanehost',
       worktreeRoot: '/srv/fleet-v2/worktrees',
       roles: ['lane-runner'],
       runner: { kind: 'opencode', port: 4166 },
@@ -83,9 +83,9 @@ describe('validateHostDraft', () => {
   it('reports the derived dial-port collision the loader applies across hosts', () => {
     // The new ssh host's forward is port + 1 = 46000, the local runner's port.
     const colliding = draft({
-      name: 'midnight',
+      name: 'lanehost',
       transport: 'ssh',
-      sshAlias: 'midnight',
+      sshAlias: 'lanehost',
       worktreeRoot: '/srv/fleet-v2/verify',
       roles: ['verifier'],
       runner: { kind: 'opencode', port: 45999 },
@@ -94,7 +94,7 @@ describe('validateHostDraft', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.errors).toEqual([
-        'hosts.midnight.runner.port: derived dial port must be unique across hosts',
+        'hosts.lanehost.runner.port: derived dial port must be unique across hosts',
       ]);
     }
   });
@@ -103,7 +103,7 @@ describe('validateHostDraft', () => {
     const remoteOrchestrator = draft({
       ...hereRunner,
       transport: 'ssh',
-      sshAlias: 'here.lan',
+      sshAlias: 'here.example',
     });
     const result = validateHostDraft(currentFile, remoteOrchestrator, 'edit');
     expect(result.ok).toBe(false);
@@ -147,9 +147,9 @@ describe('validateHostDraft', () => {
 
   it('reports what an absent installation is still missing, and still returns the candidate', () => {
     const laneRunner = draft({
-      name: 'midnight',
+      name: 'lanehost',
       transport: 'ssh',
-      sshAlias: 'midnight',
+      sshAlias: 'lanehost',
       worktreeRoot: '/srv/fleet-v2/worktrees',
       roles: ['lane-runner'],
       runner: { kind: 'opencode', port: 4166 },
@@ -168,9 +168,9 @@ describe('validateHostDraft', () => {
 
   it('refuses a schema version 1 file with the caller-step message, no candidate', () => {
     const laneRunner = draft({
-      name: 'midnight',
+      name: 'lanehost',
       transport: 'ssh',
-      sshAlias: 'midnight',
+      sshAlias: 'lanehost',
       worktreeRoot: '/srv/fleet-v2/worktrees',
       roles: ['lane-runner'],
       runner: { kind: 'opencode', port: 4166 },
@@ -190,7 +190,7 @@ describe('validateHostDraft', () => {
     // Not produced by draftHost: the alias bypassed the draft step entirely,
     // so only the loader's own rule can refuse it.
     const unsafe: HostDraft = {
-      name: 'midnight',
+      name: 'lanehost',
       host: {
         transport: 'ssh',
         sshAlias: '-oProxyCommand=x',
@@ -204,7 +204,7 @@ describe('validateHostDraft', () => {
       return;
     }
     expect(result.errors).toEqual([
-      'hosts.midnight.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option',
+      'hosts.lanehost.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option',
     ]);
     expect(JSON.stringify(result.errors)).not.toContain('-oProxyCommand');
   });

@@ -294,7 +294,7 @@ describe("API Security and Hardening", () => {
     it("refuses non-whitelisted Origin with 403", async () => {
       setActiveApiToken(VALID_TOKEN);
       configureFleetApiRuntime({ stateDir: tempDir });
-      process.env.FLEET_API_ALLOWED_ORIGINS = "http://localhost:3000,http://fleet-v2.midnight.lan";
+      process.env.FLEET_API_ALLOWED_ORIGINS = "http://localhost:3000,http://fleet-v2.lanehost.example";
 
       const res = await fetch(`${baseUrl}/v1/test`, {
         headers: {
@@ -308,7 +308,7 @@ describe("API Security and Hardening", () => {
     it("allows whitelisted Origin with 200", async () => {
       setActiveApiToken(VALID_TOKEN);
       configureFleetApiRuntime({ stateDir: tempDir });
-      process.env.FLEET_API_ALLOWED_ORIGINS = "http://localhost:3000,http://fleet-v2.midnight.lan";
+      process.env.FLEET_API_ALLOWED_ORIGINS = "http://localhost:3000,http://fleet-v2.lanehost.example";
 
       const res = await fetch(`${baseUrl}/v1/test`, {
         headers: {

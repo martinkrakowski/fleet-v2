@@ -220,7 +220,7 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
       slotIndex: 0,
       held: true,
       seatTool: 'opencode',
-      hostName: 'midnight',
+      hostName: 'lanehost',
       hostKind: 'opencode',
       transport: 'ssh',
       sshAlias: 'm',
@@ -232,7 +232,7 @@ describe('ExecutionJournalAdapter cross-process safe persistence', () => {
     const reloaded = new ExecutionJournalAdapter({ stateDir: tempDir });
     const active = await reloaded.listActiveReservations('host-1');
     expect(active.map((r) => r.id)).toEqual(['res-host']);
-    expect(active[0]?.hostName).toBe('midnight');
+    expect(active[0]?.hostName).toBe('lanehost');
     expect(active[0]?.hostKind).toBe('opencode');
     expect(active[0]?.transport).toBe('ssh');
     expect(active[0]?.sshAlias).toBe('m');

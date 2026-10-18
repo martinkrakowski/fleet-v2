@@ -82,7 +82,7 @@ const CONVERSION_FLOOR = {
   filesystemScope: "scoped-worktree",
 };
 
-/** A loader-valid two-host v2 installation: mac orchestrates, midnight runs lanes. */
+/** A loader-valid two-host v2 installation: mac orchestrates, lanehost runs lanes. */
 function v2Installation(worktreeRoot: string): unknown {
   return {
     schemaVersion: 2,
@@ -93,10 +93,10 @@ function v2Installation(worktreeRoot: string): unknown {
         worktreeRoot,
         roles: ["orchestrator", "verifier"],
       },
-      midnight: {
+      lanehost: {
         transport: "ssh",
         sshAlias: "m",
-        worktreeRoot: `${worktreeRoot}/midnight`,
+        worktreeRoot: `${worktreeRoot}/lanehost`,
         roles: ["lane-runner"],
         runner: { kind: "opencode", port: 4166 },
       },
@@ -192,7 +192,7 @@ function attemptRecord(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
       kind: "opencode",
       remotePort: 4166,
       host: "m",
-      hostName: "midnight",
+      hostName: "lanehost",
       agent: "lane",
       model: "provider/glm-5.3",
       variant: null,
@@ -209,7 +209,7 @@ function heldReservation(
   return {
     id: "res-1",
     attemptId: "att-1",
-    hostId: "midnight",
+    hostId: "lanehost",
     slotIndex: 0,
     held: true,
     seatTool: "opencode",
@@ -254,7 +254,7 @@ describe("fleet-v2 hosts list", () => {
     expect(code).toBe(0);
     expect(stdout).toContain("mac  local  roles: orchestrator, verifier");
     expect(stdout).toContain(
-      "midnight  ssh  alias m  roles: lane-runner  worktree-root:",
+      "lanehost  ssh  alias m  roles: lane-runner  worktree-root:",
     );
     expect(stdout).toContain("runner: opencode, port 4166");
   });
@@ -298,13 +298,13 @@ describe("fleet-v2 hosts add", () => {
     const { code, stdout, calls } = await runHosts(
       [
         "add",
-        "sunrise",
+        "verifyhost",
         "--ssh",
-        "sunrise.example",
+        "verifyhost.example",
         "--port",
         "47000",
         "--worktree-root",
-        path.join(dir, "sunrise"),
+        path.join(dir, "verifyhost"),
         "--role",
         "verifier",
         "--yes",
@@ -322,16 +322,16 @@ describe("fleet-v2 hosts add", () => {
       "-o",
       "ConnectTimeout=10",
     ]);
-    expect(reachability?.[5]).toBe("sunrise.example");
+    expect(reachability?.[5]).toBe("verifyhost.example");
     expect(reachability?.[6]).toBe("--");
     const parsed = readInstallationFile(file) as {
       hosts: Record<string, { roles: string[]; runner?: { port: number } }>;
     };
-    expect(parsed.hosts.sunrise?.roles).toEqual(["verifier"]);
-    expect(parsed.hosts.sunrise?.runner?.port).toBe(47000);
+    expect(parsed.hosts.verifyhost?.roles).toEqual(["verifier"]);
+    expect(parsed.hosts.verifyhost?.runner?.port).toBe(47000);
     // The existing hosts are untouched.
     expect(parsed.hosts.mac?.roles).toEqual(["orchestrator", "verifier"]);
-    expect(parsed.hosts.midnight?.roles).toEqual(["lane-runner"]);
+    expect(parsed.hosts.lanehost?.roles).toEqual(["lane-runner"]);
   });
 
   it("refuses with exit 1 and writes nothing when a probe FAILs", async () => {
@@ -342,13 +342,13 @@ describe("fleet-v2 hosts add", () => {
     const { code, stdout, stderr } = await runHosts(
       [
         "add",
-        "sunrise",
+        "verifyhost",
         "--ssh",
-        "sunrise.example",
+        "verifyhost.example",
         "--port",
         "47000",
         "--worktree-root",
-        path.join(dir, "sunrise"),
+        path.join(dir, "verifyhost"),
         "--role",
         "verifier",
         "--yes",
@@ -360,7 +360,7 @@ describe("fleet-v2 hosts add", () => {
     expect(stderr).toContain(
       "refused: a probe reported FAIL; nothing was written",
     );
-    expect(stdout).toContain("FAIL host sunrise reachable —");
+    expect(stdout).toContain("FAIL host verifyhost reachable —");
     expect(readFileSync(file, "utf8")).toBe(before);
   });
 
@@ -371,11 +371,11 @@ describe("fleet-v2 hosts add", () => {
     const { code, stderr, calls } = await runHosts(
       [
         "add",
-        "sunrise",
+        "verifyhost",
         "--ssh",
         "-oProxyCommand=evil",
         "--worktree-root",
-        path.join(dir, "sunrise"),
+        path.join(dir, "verifyhost"),
         "--yes",
       ],
       file,
@@ -484,26 +484,26 @@ describe("fleet-v2 hosts add", () => {
     const { code, stdout } = await runHosts(
       [
         "add",
-        "midnight",
+        "lanehost",
         "--ssh",
         "m",
         "--port",
         "4166",
         "--worktree-root",
-        path.join(dir, "midnight"),
+        path.join(dir, "lanehost"),
         "--yes",
       ],
       file,
     );
     expect(code).toBe(0);
     expect(stdout).toContain(
-      "lanes now run on midnight (the lane-runner role moved from mac)",
+      "lanes now run on lanehost (the lane-runner role moved from mac)",
     );
     const parsed = readInstallationFile(file) as {
       hosts: Record<string, { roles: string[] }>;
     };
     expect(parsed.hosts.mac?.roles).toEqual(["orchestrator"]);
-    expect(parsed.hosts.midnight?.roles).toEqual(["lane-runner"]);
+    expect(parsed.hosts.lanehost?.roles).toEqual(["lane-runner"]);
   });
 
   it("refuses a name that is already in the file with the engine refusal", async () => {
@@ -513,13 +513,13 @@ describe("fleet-v2 hosts add", () => {
     const { code, stderr } = await runHosts(
       [
         "add",
-        "midnight",
+        "lanehost",
         "--ssh",
         "m",
         "--port",
         "4266",
         "--worktree-root",
-        path.join(dir, "midnight"),
+        path.join(dir, "lanehost"),
         "--yes",
       ],
       file,
@@ -538,13 +538,13 @@ describe("fleet-v2 hosts add", () => {
     const { code, stderr } = await runHosts(
       [
         "add",
-        "sunrise",
+        "verifyhost",
         "--ssh",
-        "sunrise.example",
+        "verifyhost.example",
         "--port",
         "47000",
         "--worktree-root",
-        path.join(dir, "sunrise"),
+        path.join(dir, "verifyhost"),
         "--role",
         "verifier",
       ],
@@ -568,13 +568,13 @@ describe("fleet-v2 hosts add", () => {
     const { code, stderr } = await runHosts(
       [
         "add",
-        "sunrise",
+        "verifyhost",
         "--ssh",
-        "sunrise.example",
+        "verifyhost.example",
         "--port",
         "47000",
         "--worktree-root",
-        path.join(dir, "sunrise"),
+        path.join(dir, "verifyhost"),
         "--role",
         "verifier",
         "--yes",
@@ -603,7 +603,7 @@ describe("fleet-v2 hosts edit", () => {
     const file = path.join(dir, "fleet.json");
     writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
     const { code, stdout } = await runHosts(
-      ["edit", "midnight", "--port", "4266", "--yes"],
+      ["edit", "lanehost", "--port", "4266", "--yes"],
       file,
     );
     expect(code).toBe(0);
@@ -619,10 +619,10 @@ describe("fleet-v2 hosts edit", () => {
         }
       >;
     };
-    expect(parsed.hosts.midnight?.runner?.port).toBe(4266);
-    expect(parsed.hosts.midnight?.runner?.kind).toBe("opencode");
-    expect(parsed.hosts.midnight?.sshAlias).toBe("m");
-    expect(parsed.hosts.midnight?.roles).toEqual(["lane-runner"]);
+    expect(parsed.hosts.lanehost?.runner?.port).toBe(4266);
+    expect(parsed.hosts.lanehost?.runner?.kind).toBe("opencode");
+    expect(parsed.hosts.lanehost?.sshAlias).toBe("m");
+    expect(parsed.hosts.lanehost?.roles).toEqual(["lane-runner"]);
   });
 
   it("edits the roles of an existing host", async () => {
@@ -630,21 +630,21 @@ describe("fleet-v2 hosts edit", () => {
     const file = path.join(dir, "fleet.json");
     writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
     const { code } = await runHosts(
-      ["edit", "midnight", "--role", "lane-runner,verifier", "--yes"],
+      ["edit", "lanehost", "--role", "lane-runner,verifier", "--yes"],
       file,
     );
     expect(code).toBe(0);
     const parsed = readInstallationFile(file) as {
       hosts: Record<string, { roles: string[] }>;
     };
-    expect(parsed.hosts.midnight?.roles).toEqual(["lane-runner", "verifier"]);
+    expect(parsed.hosts.lanehost?.roles).toEqual(["lane-runner", "verifier"]);
   });
 
   it("refuses a lane-runner move that would leave the other host with no role", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
     writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
-    // Moving the lane-runner role onto mac would leave midnight with no role;
+    // Moving the lane-runner role onto mac would leave lanehost with no role;
     // the loader refuses the candidate with its own message.
     const { code, stderr } = await runHosts(
       ["edit", "mac", "--role", "orchestrator,verifier,lane-runner", "--yes"],
@@ -653,7 +653,7 @@ describe("fleet-v2 hosts edit", () => {
     expect(code).toBe(1);
     expect(stderr).toContain("the loader refuses this change");
     expect(stderr).toContain(
-      "hosts.midnight.roles: at least one role is required",
+      "hosts.lanehost.roles: at least one role is required",
     );
   });
 
@@ -691,7 +691,7 @@ describe("fleet-v2 hosts remove", () => {
     const file = path.join(dir, "fleet.json");
     writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
     const { code, stderr } = await runHosts(
-      ["remove", "midnight", "--yes"],
+      ["remove", "lanehost", "--yes"],
       file,
     );
     expect(code).toBe(1);
@@ -702,10 +702,10 @@ describe("fleet-v2 hosts remove", () => {
     const stateDir = makeTempDir();
     const file = path.join(stateDir, "fleet.json");
     const installation = v2Installation(path.join(stateDir, "worktrees"));
-    (installation as { hosts: Record<string, unknown> }).hosts.sunrise = {
+    (installation as { hosts: Record<string, unknown> }).hosts.verifyhost = {
       transport: "ssh",
-      sshAlias: "sunrise.example",
-      worktreeRoot: path.join(stateDir, "sunrise"),
+      sshAlias: "verifyhost.example",
+      worktreeRoot: path.join(stateDir, "verifyhost"),
       roles: ["verifier"],
     };
     writeJsonFile(file, installation);
@@ -717,18 +717,18 @@ describe("fleet-v2 hosts remove", () => {
         runner: {
           kind: "opencode",
           remotePort: 47000,
-          host: "sunrise.example",
-          hostName: "sunrise",
+          host: "verifyhost.example",
+          hostName: "verifyhost",
           agent: "lane",
           model: "provider/glm-5.3",
           variant: null,
         },
       }),
     );
-    const argv = ["remove", "sunrise", "--yes", "--state-dir", stateDir];
+    const argv = ["remove", "verifyhost", "--yes", "--state-dir", stateDir];
     const refused = await runHosts(argv, file);
     expect(refused.code).toBe(1);
-    expect(refused.stderr).toContain("attempt att-1 is running on sunrise");
+    expect(refused.stderr).toContain("attempt att-1 is running on verifyhost");
     expect(refused.stderr).toContain("has live work; nothing was removed");
     // An attempt whose state is in CAPACITY_RELEASE_STATES no longer blocks.
     await attempts.saveAttempt(attemptRecord({ id: "att-1", state: "ended" }));
@@ -740,24 +740,24 @@ describe("fleet-v2 hosts remove", () => {
     const stateDir = makeTempDir();
     const file = path.join(stateDir, "fleet.json");
     const installation = v2Installation(path.join(stateDir, "worktrees"));
-    (installation as { hosts: Record<string, unknown> }).hosts.sunrise = {
+    (installation as { hosts: Record<string, unknown> }).hosts.verifyhost = {
       transport: "ssh",
-      sshAlias: "sunrise.example",
-      worktreeRoot: path.join(stateDir, "sunrise"),
+      sshAlias: "verifyhost.example",
+      worktreeRoot: path.join(stateDir, "verifyhost"),
       roles: ["verifier"],
     };
     writeJsonFile(file, installation);
     const journal = new ExecutionJournalAdapter({ stateDir });
     await journal.saveCapacityReservation(
-      heldReservation({ hostId: "sunrise" }),
+      heldReservation({ hostId: "verifyhost" }),
     );
     const { code, stderr } = await runHosts(
-      ["remove", "sunrise", "--yes", "--state-dir", stateDir],
+      ["remove", "verifyhost", "--yes", "--state-dir", stateDir],
       file,
     );
     expect(code).toBe(1);
     expect(stderr).toContain(
-      "reservation res-1 holds a slot for attempt att-1 on sunrise",
+      "reservation res-1 holds a slot for attempt att-1 on verifyhost",
     );
     expect(stderr).toContain("has live work; nothing was removed");
   });
@@ -766,16 +766,16 @@ describe("fleet-v2 hosts remove", () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
     const installation = v2Installation(path.join(dir, "worktrees"));
-    (installation as { hosts: Record<string, unknown> }).hosts.sunrise = {
+    (installation as { hosts: Record<string, unknown> }).hosts.verifyhost = {
       transport: "ssh",
-      sshAlias: "sunrise.example",
-      worktreeRoot: path.join(dir, "sunrise"),
+      sshAlias: "verifyhost.example",
+      worktreeRoot: path.join(dir, "verifyhost"),
       roles: ["verifier"],
       runner: { kind: "opencode", port: 47000 },
     };
     writeJsonFile(file, installation);
     const { code, stdout } = await runHosts(
-      ["remove", "sunrise", "--yes"],
+      ["remove", "verifyhost", "--yes"],
       file,
     );
     expect(code).toBe(0);
@@ -783,28 +783,28 @@ describe("fleet-v2 hosts remove", () => {
       "note: a leftover ssh -f -N forward for this host may still listen on 127.0.0.1:47001",
     );
     expect(stdout).toContain("pgrep -f 'ssh .*-L 127.0.0.1:47001'");
-    // midnight is still ssh, so the installation is not single-machine.
+    // lanehost is still ssh, so the installation is not single-machine.
     expect(stdout).not.toContain("single-machine again");
     const parsed = readInstallationFile(file) as {
       hosts: Record<string, unknown>;
     };
-    expect(parsed.hosts.sunrise).toBeUndefined();
-    expect(parsed.hosts.midnight).toBeDefined();
+    expect(parsed.hosts.verifyhost).toBeUndefined();
+    expect(parsed.hosts.lanehost).toBeDefined();
   });
 
   it("notes when removing the last ssh host returns the install to single machine", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
     const installation = singleMachineInstallation(path.join(dir, "worktrees"));
-    (installation as { hosts: Record<string, unknown> }).hosts.midnight = {
+    (installation as { hosts: Record<string, unknown> }).hosts.lanehost = {
       transport: "ssh",
       sshAlias: "m",
-      worktreeRoot: path.join(dir, "midnight"),
+      worktreeRoot: path.join(dir, "lanehost"),
       roles: ["verifier"],
     };
     writeJsonFile(file, installation);
     const { code, stdout } = await runHosts(
-      ["remove", "midnight", "--yes"],
+      ["remove", "lanehost", "--yes"],
       file,
     );
     expect(code).toBe(0);
@@ -814,7 +814,7 @@ describe("fleet-v2 hosts remove", () => {
     const parsed = readInstallationFile(file) as {
       hosts: Record<string, unknown>;
     };
-    expect(parsed.hosts.midnight).toBeUndefined();
+    expect(parsed.hosts.lanehost).toBeUndefined();
     expect(parsed.hosts.mac).toBeDefined();
   });
 });
@@ -856,15 +856,15 @@ describe("fleet-v2 hosts usage", () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
     writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
-    const noRoot = await runHosts(["add", "sunrise", "--yes"], file);
+    const noRoot = await runHosts(["add", "verifyhost", "--yes"], file);
     expect(noRoot.code).toBe(2);
     expect(noRoot.stderr).toContain("hosts add requires --worktree-root");
     const badRole = await runHosts(
       [
         "add",
-        "sunrise",
+        "verifyhost",
         "--worktree-root",
-        path.join(dir, "sunrise"),
+        path.join(dir, "verifyhost"),
         "--role",
         "wizard",
         "--yes",

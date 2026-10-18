@@ -12,6 +12,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 RUNSH=${STD_TEST_SH:-sh}
 T=$(mktemp -d "${TMPDIR:-/tmp}/staging-deploy-test.XXXXXX") || exit 1
+T=$(cd "$T" && pwd -P) || exit 1
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" || exit 1
 fails=0
@@ -171,6 +172,17 @@ check "e: an unsubstituted placeholder is a refusal (1)" '[ "$rc" = 1 ]'
 check "e: ... it says a placeholder survived" 'grep -q "STAGING_ placeholder" "$T/err"'
 check "e: ... and ssh never received an apply" '! grep -q "kubectl apply" "$T/calls.log"'
 check "e: ... while the earlier checks still ran" 'grep -q "kubectl kustomize deploy/staging" "$T/calls.log"'
+
+echo '# f. a value that starts with -'
+clear_log
+rm -f "$R/deploy/staging/staging.env"
+run "STAGING_REGISTRY=$REG" "STAGING_DOCKER_CONTEXT=$CTX" "STAGING_SSH=-oProxyCommand=true" \
+  "STAGING_HOST=$HOST" "STAGING_CLUSTER_ISSUER=$CA"; rc=$(rc)
+check "f: a value that starts with - is a usage error (2)" '[ "$rc" = 2 ]'
+check "f: ... it says the value may not start with -" 'grep -q "may not start with -" "$T/err"'
+check "f: ... the message names STAGING_SSH" 'grep -q "STAGING_SSH" "$T/err"'
+check "f: ... and never the value" '! grep -q "ProxyCommand" "$T/err" && ! grep -q "ProxyCommand" "$T/out"'
+check "f: ... no tool was called" '[ ! -s "$T/calls.log" ]'
 
 echo
 echo "$(grep -c '^check ' "$self") checks defined, $fails failed"

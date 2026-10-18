@@ -65,6 +65,10 @@ fi
 # named, never printed.
 usable() {
   case "$2" in
+    -*)
+      echo "deploy.sh: $1 is not usable: it may not start with -." >&2
+      exit 2
+      ;;
     *[!A-Za-z0-9._:/-]*)
       echo "deploy.sh: $1 is not usable: letters, digits and . _ : / - only." >&2
       exit 2

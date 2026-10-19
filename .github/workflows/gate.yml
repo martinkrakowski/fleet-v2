@@ -43,11 +43,5 @@ jobs:
         run: yarn test
       - name: yarn sync:check
         run: yarn sync:check
-      - name: ocm-run tests
-        run: sh tests/ocm-run.test.sh
-      - name: agy-run tests
-        run: sh tests/agy-run.test.sh
-      - name: lane-diff-check tests
-        run: sh tests/lane-diff-check.test.sh
-      - name: fleet-host-bootstrap tests
-        run: sh tests/fleet-host-bootstrap.test.sh
+      - name: shell tests (every tests/*.test.sh)
+        run: yarn test:bin

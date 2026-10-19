@@ -14,7 +14,7 @@
     "lint": "turbo lint",
     "typecheck": "turbo typecheck",
     "test": "turbo test",
-    "test:bin": "for t in tests/*.test.sh; do sh \"$t\" || exit 1; done",
+    "test:bin": "sh scripts/test-bin.sh",
     "clean": "turbo clean",
     "sync": "hexagen sync",
     "sync:dry": "hexagen sync --dry-run",

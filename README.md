@@ -24,7 +24,7 @@ What each boundary does today:
 | Waves observations, decisions, relays, attention | Observations and relays go to local outbox directories; decisions are read from local answer files; attention reads report absence. The HTTP adapter to a live Waves service is not wired. |
 | Knowledge shelf | Keepers append to a local shelf file under the state directory. Publication to an external shelf is not wired. |
 | Web app | Views read fixtures; `api-client.ts` exists and is not yet used by pages. Every mutating action opens a confirmation first. |
-| Staging | A deployment script for a Kubernetes namespace is in `deploy/staging/` (`yarn staging:deploy --yes`). It currently hard-codes the author's own registry (`registry.midnight.lan`) and namespace (`fleet-v2-staging`); edit `deploy/staging/` for another installation. |
+| Staging | A deployment script for a Kubernetes namespace is in `deploy/staging/` (`yarn staging:deploy --yes`). It reads its target from `deploy/staging/staging.env` (see the tracked `staging.env.example`) and deploys into the namespace `fleet-v2-staging`. |
 | Continuous integration | GitHub Actions workflow `.github/workflows/gate.yml` runs the gate checks on pull requests and main. |
 
 Every boundary above that is not yet wired refuses or reports its own absence rather than inventing an answer. That is by design: an unconfigured port is never an implicit pass.

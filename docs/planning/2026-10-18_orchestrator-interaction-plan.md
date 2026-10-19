@@ -167,8 +167,10 @@ receive updates.
   - **the existing full-power token loses the `verdict` scope** in the same change that adds
     scopes: the legacy on-disk token keeps today's routes for the CLI but is refused on the
     verdict route (403), and it is rotated then, so no copy that predates scopes still works.
-    Only a session-minted, in-memory token can post a verdict; a test proves the on-disk token
-    gets 403 there.
+    Only a session-minted, in-memory token can post a verdict. The legacy token also cannot
+    **mint** one: the session exchange that issues verdict-scoped tokens requires the owner's
+    interactive session (the TUI's or web's login), never a bearer token from disk. Tests prove the
+    on-disk token gets 403 on both the verdict route and the exchange.
 - **One verdict:** the first verdict wins; clients show who answered.
 - **Untrusted text:** orchestrator updates, tool inputs and lane output are displayed as text,
   never as markup, and never as an approval.
@@ -266,8 +268,9 @@ CodeRabbit on PR #130 (rev 2), 2026-10-18: four findings, all applied in rev 3.
 - Major: `PermissionRequest` does not fire for pre-authorised calls, so excluding outward tools
   from its matcher did not stop them. T5 adds a `PreToolUse` deny guard and `permissions.deny`
   rules (§4.1).
-- Major: the legacy full-power token could still post a verdict. It loses the `verdict` scope and
-  is rotated when scopes land; a test proves the 403 (§4.5).
+- Major: the legacy full-power token could still post a verdict, or mint a token that can. It loses
+  the `verdict` scope, cannot call the session exchange, and is rotated when scopes land; tests prove
+  both 403s (§4.5).
 - Minor: both hook answers use the `hookSpecificOutput` envelope (§4.2).
 - Minor: a minimum Claude Code version for `onFailure: "block"`, found in T5 and checked at start
   (§4.3). The reviewer's version number was not taken on trust.

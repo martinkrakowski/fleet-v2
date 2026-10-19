@@ -1202,9 +1202,9 @@ describe('ExecutionRunnerAdapter', () => {
   it('resolves the status and abort directory from the recorded attempt', async () => {
     // A fresh adapter stands in for a later CLI process: nothing is cached in
     // memory, so the locator must come from the persisted attempt record.
-    const recordedWorktree = '/mnt/pool/cloud-services/worktrees/att-1';
+    const recordedWorktree = '/srv/fleet/worktrees/att-1';
     const { runner, calls } = scriptedRunner([
-      { exitCode: 3, stdout: 'ocm-run: running in /mnt/pool:\nses_a', stderr: '' },
+      { exitCode: 3, stdout: 'ocm-run: running in /srv:\nses_a', stderr: '' },
       { exitCode: 0, stdout: 'aborted', stderr: '' },
     ]);
     const adapter = new ExecutionRunnerAdapter({
@@ -1267,7 +1267,7 @@ describe('ExecutionRunnerAdapter', () => {
     const adapter = new ExecutionRunnerAdapter({
       runSubprocess: runner,
       remotePort: 4166,
-      remoteHost: 'midnight.lan',
+      remoteHost: 'lanehost.example',
     });
     const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
     expect(result).toEqual({
@@ -1276,14 +1276,14 @@ describe('ExecutionRunnerAdapter', () => {
       runner: {
         kind: 'opencode',
         remotePort: 4166,
-        host: 'midnight.lan',
+        host: 'lanehost.example',
         hostName: null,
         agent: null,
         model: 'glm-5',
         variant: null,
       },
     });
-    expect(calls[0]?.env).toEqual({ OCM_REMOTE_PORT: '4166', OCM_HOST: 'midnight.lan' });
+    expect(calls[0]?.env).toEqual({ OCM_REMOTE_PORT: '4166', OCM_HOST: 'lanehost.example' });
   });
 
   const repoRootBin = path.resolve(

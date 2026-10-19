@@ -35,9 +35,9 @@ const opencodeRunner: HostRunnerDraft = {
 
 function sshInput(overrides: Partial<HostDraftInput> = {}): HostDraftInput {
   return {
-    name: 'midnight',
+    name: 'lanehost',
     transport: 'ssh',
-    sshAlias: 'midnight',
+    sshAlias: 'lanehost',
     worktreeRoot: '/srv/fleet-v2/worktrees',
     roles: ['lane-runner'],
     runner: opencodeRunner,
@@ -47,9 +47,9 @@ function sshInput(overrides: Partial<HostDraftInput> = {}): HostDraftInput {
 
 describe('isSafeSshHost', () => {
   it('accepts an alias, a user@alias and a dotted host', () => {
-    expect(isSafeSshHost('midnight')).toBe(true);
-    expect(isSafeSshHost('midnight.lan')).toBe(true);
-    expect(isSafeSshHost('user@midnight')).toBe(true);
+    expect(isSafeSshHost('lanehost')).toBe(true);
+    expect(isSafeSshHost('lanehost.example')).toBe(true);
+    expect(isSafeSshHost('user@lanehost')).toBe(true);
     expect(isSafeSshHost('deployer@192.168.1.50')).toBe(true);
     expect(isSafeSshHost('user.name@host-1.example.com')).toBe(true);
   });
@@ -75,7 +75,7 @@ describe('draftHost', () => {
     if (!result.ok) {
       return;
     }
-    expect(result.draft.name).toBe('midnight');
+    expect(result.draft.name).toBe('lanehost');
     expect(Object.keys(result.draft.host)).toEqual([
       'transport',
       'sshAlias',
@@ -103,7 +103,7 @@ describe('draftHost', () => {
     }
     expect(result.draft.host).toEqual({
       transport: 'ssh',
-      sshAlias: 'midnight',
+      sshAlias: 'lanehost',
       worktreeRoot: '/srv/fleet-v2/worktrees',
       roles: ['lane-runner'],
       runner: { kind: 'opencode', port: 4166 },
@@ -119,7 +119,7 @@ describe('draftHost', () => {
       return;
     }
     expect(result.errors).toEqual([
-      'hosts.midnight.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option',
+      'hosts.lanehost.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option',
     ]);
     expect(result.errors.join(' ')).not.toContain('ProxyCommand');
   });
@@ -129,14 +129,14 @@ describe('draftHost', () => {
     expect(missing.ok).toBe(false);
     if (!missing.ok) {
       expect(missing.errors).toEqual([
-        'hosts.midnight.sshAlias: required when transport is "ssh"',
+        'hosts.lanehost.sshAlias: required when transport is "ssh"',
       ]);
     }
 
     const local = draftHost({
       name: 'here',
       transport: 'local',
-      sshAlias: 'midnight',
+      sshAlias: 'lanehost',
       worktreeRoot: '/srv/fleet-v2/worktrees',
       roles: ['orchestrator'],
     });
@@ -155,8 +155,8 @@ describe('draftHost', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.errors).toEqual([
-        'hosts.midnight.worktreeRoot: must be an absolute path',
-        'hosts.midnight.tmpDir: must be an absolute path',
+        'hosts.lanehost.worktreeRoot: must be an absolute path',
+        'hosts.lanehost.tmpDir: must be an absolute path',
       ]);
     }
   });
@@ -166,7 +166,7 @@ describe('draftHost', () => {
     expect(empty.ok).toBe(false);
     if (!empty.ok) {
       expect(empty.errors).toEqual([
-        'hosts.midnight.roles: at least one role is required',
+        'hosts.lanehost.roles: at least one role is required',
       ]);
     }
 
@@ -176,7 +176,7 @@ describe('draftHost', () => {
     expect(unknown.ok).toBe(false);
     if (!unknown.ok) {
       expect(unknown.errors).toEqual([
-        'hosts.midnight.roles[1]: must be a known host role',
+        'hosts.lanehost.roles[1]: must be a known host role',
       ]);
     }
   });
@@ -188,7 +188,7 @@ describe('draftHost', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.errors).toEqual([
-        'hosts.midnight.runner.port: must be an integer 1..65535',
+        'hosts.lanehost.runner.port: must be an integer 1..65535',
       ]);
     }
   });
@@ -202,7 +202,7 @@ describe('draftHost', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.errors).toEqual([
-        'hosts.midnight.runner.authFile: must be an absolute path',
+        'hosts.lanehost.runner.authFile: must be an absolute path',
       ]);
     }
   });
@@ -220,7 +220,7 @@ describe('draftHost', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.errors).toEqual([
-        'hosts.midnight.runner.capabilities.source: is derived by the loader and is never drafted',
+        'hosts.lanehost.runner.capabilities.source: is derived by the loader and is never drafted',
       ]);
     }
   });
@@ -273,10 +273,10 @@ describe('draftHost', () => {
 
 describe('applyHostDraft', () => {
   const draft: HostDraft = {
-    name: 'midnight',
+    name: 'lanehost',
     host: {
       transport: 'ssh',
-      sshAlias: 'midnight',
+      sshAlias: 'lanehost',
       worktreeRoot: '/srv/fleet-v2/worktrees',
       roles: ['lane-runner'],
       runner: { kind: 'opencode', port: 4166 },
@@ -303,8 +303,8 @@ describe('applyHostDraft', () => {
       return;
     }
     expect(JSON.stringify(currentFile)).toBe(before);
-    expect(Object.keys(result.candidate.hosts)).toEqual(['here', 'midnight']);
-    expect(result.candidate.hosts['midnight']).toEqual(draft.host);
+    expect(Object.keys(result.candidate.hosts)).toEqual(['here', 'lanehost']);
+    expect(result.candidate.hosts['lanehost']).toEqual(draft.host);
     expect(result.candidate.forge).toEqual({ mode: 'none' });
   });
 
@@ -344,7 +344,7 @@ describe('applyHostDraft', () => {
     if (!result.ok) {
       expect(result.reason).toBe('missing');
       expect(result.errors).toEqual([
-        'hosts.midnight: not in the installation file; adding is a separate mode',
+        'hosts.lanehost: not in the installation file; adding is a separate mode',
       ]);
     }
   });
@@ -356,7 +356,7 @@ describe('applyHostDraft', () => {
       return;
     }
     expect(result.candidate.schemaVersion).toBe(2);
-    expect(Object.keys(result.candidate.hosts)).toEqual(['midnight']);
+    expect(Object.keys(result.candidate.hosts)).toEqual(['lanehost']);
   });
 
   it('refuses a file of another schema version instead of half-converting it', () => {

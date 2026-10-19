@@ -319,7 +319,7 @@ describe("ReserveExecutionCapacityUseCase candidate hosts (H9a2)", () => {
       reserveRequest({
         candidates: [
           candidate({
-            name: "midnight",
+            name: "lanehost",
             transport: "ssh",
             sshAlias: "m",
             port: 4166,
@@ -331,12 +331,12 @@ describe("ReserveExecutionCapacityUseCase candidate hosts (H9a2)", () => {
     expect(result.outcome).toBe("reserved");
     if (result.outcome !== "reserved")
       throw new Error("expected a reservation");
-    expect(result.reservation.hostName).toBe("midnight");
+    expect(result.reservation.hostName).toBe("lanehost");
     expect(result.reservation.hostKind).toBe("opencode");
     expect(result.reservation.transport).toBe("ssh");
     expect(result.reservation.sshAlias).toBe("m");
     expect(result.reservation.port).toBe(4166);
-    expect(result.reservation.hostId).toBe("midnight");
+    expect(result.reservation.hostId).toBe("lanehost");
   });
 
   it("never takes the same last slot twice: two concurrent reserves on the file journal", async () => {

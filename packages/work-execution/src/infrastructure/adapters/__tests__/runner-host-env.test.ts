@@ -116,7 +116,7 @@ describe('ExecutionRunnerAdapter v2 host routing (H3a)', () => {
     const adapter = new ExecutionRunnerAdapter({
       runSubprocess: runner,
       host: {
-        hostName: 'midnight',
+        hostName: 'lanehost',
         transport: 'ssh',
         sshAlias: 'm',
         remotePort: 4166,
@@ -163,7 +163,7 @@ describe('ExecutionRunnerAdapter v2 host routing (H3a)', () => {
     }).startSession(startRequest);
     await new ExecutionRunnerAdapter({
       executor: ssh.executor,
-      host: { hostName: 'midnight', transport: 'ssh', sshAlias: 'm', remotePort: 4166 },
+      host: { hostName: 'lanehost', transport: 'ssh', sshAlias: 'm', remotePort: 4166 },
     }).startSession(startRequest);
 
     expect(local.envs[0].SSH_AUTH_SOCK).toBeUndefined();
@@ -175,14 +175,14 @@ describe('ExecutionRunnerAdapter v2 host routing (H3a)', () => {
     const { runner, envs } = scriptedRunner();
     const adapter = new ExecutionRunnerAdapter({
       runSubprocess: runner,
-      host: { hostName: 'midnight', transport: 'ssh', sshAlias: 'm', authFile: '/tmp/auth.env' },
+      host: { hostName: 'lanehost', transport: 'ssh', sshAlias: 'm', authFile: '/tmp/auth.env' },
     });
 
     const result = await adapter.startSession(startRequest);
 
     expect(result).toEqual({
       outcome: 'refused',
-      reason: "Runner host 'midnight' declares no port; a dispatch cannot be addressed",
+      reason: "Runner host 'lanehost' declares no port; a dispatch cannot be addressed",
     });
     // Zero spawns, and the planted port was never borrowed as a substitute.
     expect(envs).toEqual([]);
@@ -193,14 +193,14 @@ describe('ExecutionRunnerAdapter v2 host routing (H3a)', () => {
     const { runner, envs } = scriptedRunner();
     const adapter = new ExecutionRunnerAdapter({
       runSubprocess: runner,
-      host: { hostName: 'midnight', transport: 'ssh', remotePort: 4166 },
+      host: { hostName: 'lanehost', transport: 'ssh', remotePort: 4166 },
     });
 
     const result = await adapter.startSession(startRequest);
 
     expect(result).toEqual({
       outcome: 'refused',
-      reason: "Runner host 'midnight' is ssh but declares no ssh alias; a dispatch cannot be addressed",
+      reason: "Runner host 'lanehost' is ssh but declares no ssh alias; a dispatch cannot be addressed",
     });
     expect(envs).toEqual([]);
   });
@@ -250,13 +250,13 @@ describe('ExecutionRunnerAdapter legacy mode is unchanged (H3a)', () => {
     const adapter = new ExecutionRunnerAdapter({
       runSubprocess: runner,
       remotePort: 4166,
-      remoteHost: 'midnight.lan',
+      remoteHost: 'lanehost.example',
     });
 
     const result = await adapter.startSession(startRequest);
 
     expect(result.outcome).toBe('started');
-    expect(envs[0]).toEqual({ OCM_REMOTE_PORT: '4166', OCM_HOST: 'midnight.lan' });
+    expect(envs[0]).toEqual({ OCM_REMOTE_PORT: '4166', OCM_HOST: 'lanehost.example' });
   });
 
   it('still falls back to the environment when no option is configured', async () => {
@@ -273,12 +273,12 @@ describe('ExecutionRunnerAdapter legacy mode is unchanged (H3a)', () => {
 
   it('records no host name in legacy mode', async () => {
     plantStaleRoutingEnvironment();
-    const adapter = new ExecutionRunnerAdapter({ remotePort: 4166, remoteHost: 'midnight.lan' });
+    const adapter = new ExecutionRunnerAdapter({ remotePort: 4166, remoteHost: 'lanehost.example' });
 
     expect(adapter.describeRunner()).toEqual({
       kind: 'opencode',
       remotePort: 4166,
-      host: 'midnight.lan',
+      host: 'lanehost.example',
       hostName: null,
       agent: null,
       model: null,
@@ -302,14 +302,14 @@ describe('Attempts record the installation host name (H3a)', () => {
     const { runner } = scriptedRunner();
     const adapter = new ExecutionRunnerAdapter({
       runSubprocess: runner,
-      host: { hostName: 'midnight', transport: 'ssh', sshAlias: 'm', remotePort: 4166 },
+      host: { hostName: 'lanehost', transport: 'ssh', sshAlias: 'm', remotePort: 4166 },
     });
 
-    expect(adapter.describeRunner()?.hostName).toBe('midnight');
+    expect(adapter.describeRunner()?.hostName).toBe('lanehost');
     const result = await adapter.startSession(startRequest);
     expect(result).toMatchObject({
       outcome: 'started',
-      runner: { hostName: 'midnight', host: 'm', remotePort: 4166 },
+      runner: { hostName: 'lanehost', host: 'm', remotePort: 4166 },
     });
   });
 
@@ -354,7 +354,7 @@ describe('Attempts record the installation host name (H3a)', () => {
           {
             id: 'res-1',
             attemptId: 'attempt-1',
-            hostId: 'midnight',
+            hostId: 'lanehost',
             slotIndex: 0,
             held: true,
             seatTool: 'opencode',
@@ -390,7 +390,7 @@ describe('Attempts record the installation host name (H3a)', () => {
     const { runner } = scriptedRunner();
     const runnerAdapter = new ExecutionRunnerAdapter({
       runSubprocess: runner,
-      host: { hostName: 'midnight', transport: 'ssh', sshAlias: 'm', remotePort: 4166 },
+      host: { hostName: 'lanehost', transport: 'ssh', sshAlias: 'm', remotePort: 4166 },
     });
     const useCase = new DispatchAttemptUseCase({
       workOrderRepo,
@@ -414,7 +414,7 @@ describe('Attempts record the installation host name (H3a)', () => {
     });
 
     expect(result.outcome).toBe('started');
-    expect(attempts.get('attempt-1')?.runner?.hostName).toBe('midnight');
+    expect(attempts.get('attempt-1')?.runner?.hostName).toBe('lanehost');
   });
 
   it('reads a record persisted before the host name existed with hostName null', async () => {
@@ -481,7 +481,7 @@ describe('Attempts record the installation host name (H3a)', () => {
           kind: 'opencode',
           remotePort: 4166,
           host: 'm',
-          hostName: 'midnight',
+          hostName: 'lanehost',
           agent: null,
           model: 'm',
           variant: null,
@@ -490,7 +490,7 @@ describe('Attempts record the installation host name (H3a)', () => {
         updatedAtIso: '2026-10-15T08:00:00.000Z',
       });
 
-      expect((await adapter.findAttemptById('att-named'))?.runner?.hostName).toBe('midnight');
+      expect((await adapter.findAttemptById('att-named'))?.runner?.hostName).toBe('lanehost');
     } finally {
       await fs.rm(stateDir, { recursive: true, force: true });
     }

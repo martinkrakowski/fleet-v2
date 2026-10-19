@@ -341,7 +341,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         describeRunner: () => ({
           kind: 'opencode',
           remotePort: 4166,
-          host: 'runner-host.lan',
+          host: 'runner-host.example',
           agent: 'lane-agent',
           model: 'nvidia/z-ai/glm-5.3',
           variant: 'low',
@@ -352,7 +352,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           runner: {
             kind: 'opencode',
             remotePort: 4166,
-            host: 'runner-host.lan',
+            host: 'runner-host.example',
             agent: 'lane-agent',
             model: 'nvidia/z-ai/glm-5.3',
             variant: 'low',
@@ -389,7 +389,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
       const saved = attempts.get(attempt.id)!;
       expect(saved.runner).toBeDefined();
       expect(saved.runner?.remotePort).toBe(4166);
-      expect(saved.runner?.host).toBe('runner-host.lan');
+      expect(saved.runner?.host).toBe('runner-host.example');
       expect(saved.runner?.model).toBe('nvidia/z-ai/glm-5.3');
     });
 
@@ -436,7 +436,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
     it('inspectSession refuses when configured remoteHost differs from recorded host', async () => {
       const adapter = new ExecutionRunnerAdapter({
         remotePort: 4166,
-        remoteHost: 'wrong-host.lan',
+        remoteHost: 'wrong-host.example',
       });
 
       const status = await adapter.inspectSession({
@@ -446,7 +446,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         runner: {
           kind: 'opencode',
           remotePort: 4166,
-          host: 'expected-host.lan',
+          host: 'expected-host.example',
           agent: null,
           model: 'nvidia/z-ai/glm-5.3',
           variant: null,

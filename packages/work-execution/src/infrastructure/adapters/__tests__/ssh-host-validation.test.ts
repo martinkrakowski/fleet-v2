@@ -5,9 +5,9 @@ import { AttemptArtifactAdapter } from '../AttemptArtifactAdapter.adapter.js';
 
 describe('isSafeSshHost', () => {
   it('accepts valid ssh host strings', () => {
-    expect(isSafeSshHost('midnight')).toBe(true);
+    expect(isSafeSshHost('lanehost')).toBe(true);
     expect(isSafeSshHost('runner.local')).toBe(true);
-    expect(isSafeSshHost('user@midnight')).toBe(true);
+    expect(isSafeSshHost('user@lanehost')).toBe(true);
     expect(isSafeSshHost('deployer@192.168.1.50')).toBe(true);
     expect(isSafeSshHost('host-name-1')).toBe(true);
     expect(isSafeSshHost('user.name@host-1.example.com')).toBe(true);

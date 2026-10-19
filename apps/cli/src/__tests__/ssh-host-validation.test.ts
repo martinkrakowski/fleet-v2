@@ -46,13 +46,13 @@ describe('apps/cli readGitHead SSH host validation', () => {
       },
     );
 
-    const head = await readGitHead('/nonexistent/remote/worktree', 'midnight');
+    const head = await readGitHead('/nonexistent/remote/worktree', 'lanehost');
 
     expect(head).toBe('abc1234567890');
     expect(execFileMock).toHaveBeenCalled();
     const [file, args] = execFileMock.mock.calls[0] as [string, readonly string[]];
     expect(file).toBe('ssh');
-    expect(args[0]).toBe('midnight');
+    expect(args[0]).toBe('lanehost');
     expect(args[1]).toBe('--');
   });
 

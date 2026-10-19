@@ -41,7 +41,7 @@ describe('WavesHttpClient', () => {
       };
 
       const client = new WavesHttpClient({
-        baseUrl: 'https://waves.midnight.lan:8443',
+        baseUrl: 'https://waves.lanehost.example:8443',
         tokenFile: tokenFilePath,
         request: mockRequest,
       });
@@ -52,7 +52,7 @@ describe('WavesHttpClient', () => {
       expect(JSON.parse(response.body)).toEqual({ ok: true });
 
       expect(calledUrl).toBeDefined();
-      expect(calledUrl?.href).toBe('https://waves.midnight.lan:8443/api/v1/attention');
+      expect(calledUrl?.href).toBe('https://waves.lanehost.example:8443/api/v1/attention');
 
       expect(calledInit).toBeDefined();
       expect(calledInit?.method).toBe('GET');

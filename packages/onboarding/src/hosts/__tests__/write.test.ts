@@ -57,10 +57,10 @@ const baseFile = {
 
 /** A draft that adds a remote verifier, which the loader accepts. */
 const verifierDraft: HostDraft = {
-  name: "twilight",
+  name: "verifymac",
   host: {
     transport: "ssh",
-    sshAlias: "twilight.lan",
+    sshAlias: "verifymac.example",
     worktreeRoot: "/srv/fleet-v2/verify",
     roles: ["verifier"],
   },
@@ -153,8 +153,8 @@ describe("diff", () => {
 
   it("diffs the current installation value against the candidate write", () => {
     const diff = diffInstallation(baseFile, candidateFile());
-    expect(diff.added.some((line) => line.includes("twilight"))).toBe(true);
-    expect(diff.added.some((line) => line.includes("twilight.lan"))).toBe(true);
+    expect(diff.added.some((line) => line.includes("verifymac"))).toBe(true);
+    expect(diff.added.some((line) => line.includes("verifymac.example"))).toBe(true);
     // The current orchestrator host is untouched, so nothing of it is removed.
     expect(diff.removed.some((line) => line.includes("here"))).toBe(false);
   });

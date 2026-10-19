@@ -89,13 +89,13 @@ describe('LocalExecutor', () => {
 describe('SshExecutor argv construction', () => {
   it('builds the exact batch-mode ssh argv with POSIX quoting', () => {
     expect(
-      sshArgvFor('midnight', ['git', '-C', '/worktree with space', 'log', "--format='%h'"]),
+      sshArgvFor('lanehost', ['git', '-C', '/worktree with space', 'log', "--format='%h'"]),
     ).toEqual([
       '-o',
       'BatchMode=yes',
       '-o',
       'ConnectTimeout=15',
-      'midnight',
+      'lanehost',
       '--',
       "'git' '-C' '/worktree with space' 'log' '--format='\\''%h'\\'''",
     ]);
@@ -143,7 +143,7 @@ describe('SshExecutor argv construction', () => {
     vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
     try {
       const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
-      const executor = new FreshSshExecutor({ host: 'midnight' });
+      const executor = new FreshSshExecutor({ host: 'lanehost' });
       const pending = executor.run(['cat'], { input: 'remote-stdin-bytes', env: { HOME: '/h' } });
       setImmediate(() => {
         child.emit('close', 0, null);
@@ -178,7 +178,7 @@ describe('SshExecutor argv construction', () => {
     vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
     try {
       const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
-      const executor = new FreshSshExecutor({ host: 'midnight' });
+      const executor = new FreshSshExecutor({ host: 'lanehost' });
       const pending = executor.run(['sleep', '999'], { input: 'ignored', timeoutMs: 300 });
       const result = await pending;
       expect(result.exitCode).toBeNull();
@@ -377,7 +377,7 @@ describe('AttemptArtifactAdapter with a fake executor', () => {
 describe('resolveRoleExecutors', () => {
   it('maps a v1 installation to the owner hosts: worktree ssh host, runner host, port kept separate', () => {
     const executors = resolveRoleExecutors({
-      worktree: { sshHost: 'midnight' },
+      worktree: { sshHost: 'lanehost' },
       runner: { host: 'tunnel-host', ocmRunBin: '/opt/ocm-run' },
       verification: { sshHost: 'verifier.internal', procedures: {} },
     });
@@ -546,7 +546,7 @@ describe('default child environment (spawn-run allow-list)', () => {
     vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
     try {
       const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
-      const executor = new FreshSshExecutor({ host: 'midnight' });
+      const executor = new FreshSshExecutor({ host: 'lanehost' });
       const pending = executor.run(['git', 'status']);
       setImmediate(() => child.emit('close', 0, null));
       const result = await pending;

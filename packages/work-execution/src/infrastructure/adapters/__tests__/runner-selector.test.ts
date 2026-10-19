@@ -24,7 +24,7 @@ import type { RunnerSelectorPort } from '../../../application/ports/out/RunnerSe
 
 describe('RunnerSelectorAdapter', () => {
   const opencodeHosts: Record<string, RunnerSelectorLaneRunnerHost> = {
-    lane: { transport: 'ssh', sshAlias: 'lane-host.lan', roles: ['lane-runner'], runner: { kind: 'opencode', port: 4166 } },
+    lane: { transport: 'ssh', sshAlias: 'lane-host.example', roles: ['lane-runner'], runner: { kind: 'opencode', port: 4166 } },
   };
   const agyHosts: Record<string, RunnerSelectorLaneRunnerHost> = {
     lane: { transport: 'local', roles: ['lane-runner'], runner: { kind: 'agy', port: 46000 } },
@@ -37,7 +37,7 @@ describe('RunnerSelectorAdapter', () => {
       kind: 'opencode',
       hostName: 'lane',
       transport: 'ssh',
-      sshAlias: 'lane-host.lan',
+      sshAlias: 'lane-host.example',
       remotePort: 4166,
     });
   });
@@ -88,7 +88,7 @@ describe('RunnerSelectorAdapter', () => {
       kind: 'opencode',
       hostName: 'lane',
       transport: 'ssh',
-      sshAlias: 'lane-host.lan',
+      sshAlias: 'lane-host.example',
       remotePort: 4166,
     });
   });

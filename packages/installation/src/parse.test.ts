@@ -381,7 +381,7 @@ describe('parseInstallation host sshAlias safety', () => {
       ...baseFile,
       hosts: {
         ...baseFile.hosts,
-        midnight: {
+        lanehost: {
           transport: 'ssh',
           sshAlias,
           worktreeRoot: '/srv/fleet-v2/worktrees',
@@ -398,7 +398,7 @@ describe('parseInstallation host sshAlias safety', () => {
       return;
     }
     expect(result.errors).toEqual([
-      'hosts.midnight.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option',
+      'hosts.lanehost.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option',
     ]);
     expect(JSON.stringify(result.errors)).not.toContain('-oProxyCommand');
   });
@@ -410,12 +410,12 @@ describe('parseInstallation host sshAlias safety', () => {
       return;
     }
     expect(result.errors).toEqual([
-      'hosts.midnight.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option',
+      'hosts.lanehost.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option',
     ]);
   });
 
   it('accepts a valid alias, a user@alias and a dotted host', () => {
-    for (const sshAlias of ['midnight', 'deployer@midnight', 'midnight.lan']) {
+    for (const sshAlias of ['lanehost', 'deployer@lanehost', 'lanehost.example']) {
       const result = parseInstallation(fileWith(sshAlias));
       expect(result.ok).toBe(true);
     }
@@ -426,8 +426,8 @@ describe('isValidHostName (H3b export)', () => {
   it('accepts the host-map keys the loader accepts', () => {
     for (const name of [
       'here',
-      'midnight',
-      'midnight.lan',
+      'lanehost',
+      'lanehost.example',
       'host-1',
       'a.b_c-d',
     ]) {

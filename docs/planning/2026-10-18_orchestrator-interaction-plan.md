@@ -2,8 +2,9 @@
 
 - **Date:** 2026-10-18
 - **Target repository:** `fleet-v2`
-- **Status:** rev 2, after the Fable review of rev 1 (2026-10-18: not ready, two blockers in the
-  approval path; all ten findings applied, see §10)
+- **Status:** rev 3: the CodeRabbit findings on PR #130 (two major, two minor) applied on top of
+  rev 2, which followed the Fable review of rev 1 (not ready, two blockers in the approval path; all
+  ten findings applied). See §10
 - **Builds on:** `2026-10-16_owner-questions-in-ui.md` (Q0–Q3 merged, Q4–Q6 open),
   `2026-10-16_mcp-server.md` (M1 merged, M2–M4 open), `2026-10-16_onboarding-settings-ui.md`
   (the web-session pattern, U3, unbuilt)
@@ -78,10 +79,15 @@ out-port, the use cases, a contract line and the invariants below.
 **Invariants.** An entry never writes a coordination request and never grants authority. An
 `owner-message` is input to the orchestrator, not a decision record. A `permission-verdict` does
 let one Claude Code tool call run, so its reach is stated explicitly: it applies only to tool calls
-that are already inside the approved two-way policy, and the hook's matcher excludes the tools
-that act outward (forge, merge, push, deploy, anything named in "Hard to undo"). The API cannot
-check what a tool call means, so this boundary lives in the hook matcher and the rule book, and
-the plan says so rather than implying the API enforces it.
+that are already inside the approved two-way policy. Excluding the outward tools (forge, merge,
+push, deploy, anything named in "Hard to undo") from the hook's matcher is **not** enough on its
+own: `PermissionRequest` fires only when Claude Code would ask, so a call that a settings `allow`
+rule or a permission mode already permits never reaches the hook. T5 therefore also ships a
+`PreToolUse` guard (and matching `permissions.deny` rules) that returns
+`permissionDecision: "deny"` for those outward actions whatever the permission mode, so they cannot
+run through a pre-authorised path and only the owner does them, outside the thread. The API cannot
+check what a tool call means, so this boundary lives in the hook configuration and the rule book,
+and the plan says so rather than implying the API enforces it.
 
 ### 4.2 API
 
@@ -93,9 +99,13 @@ the plan says so rather than implying the API enforces it.
 - `POST /v1/threads/:id/permissions` (hook scope only): the `PermissionRequest` hook creates a
   request from the hook body's `tool_name` and `tool_input`, stored **verbatim** as the exact
   input the owner is shown. **The API issues the `requestId`**; the hook never names one. The call
-  then long-polls for the verdict and returns an explicit `{"behavior":"deny"}` itself at 540 s,
+  then long-polls for the verdict and returns an explicit deny itself at 540 s,
   strictly before the hook's 600 s timeout, so a missing verdict is a deny and never a fall-through.
   The API never returns `updatedInput`, so an approval can never rewrite the tool call.
+  Both answers use the `PermissionRequest` hook's response envelope, never a bare body:
+  `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`
+  and the same with `"behavior":"deny"` plus a `message` (who denied, or "no verdict in 540 s").
+  T2c's tests assert both shapes against the schema of the Claude Code version T5 pins.
 - `POST /v1/threads/:id/permissions/:requestId/verdict` (verdict scope only): `allow` | `deny`,
   idempotent; **the first verdict wins**, and a second one gets 409 with the first.
 - Question answers keep the existing `/v1/questions/:id/answers`; Q5 adds the web variant.
@@ -114,6 +124,10 @@ receive updates.
    answers with an explicit deny at 540 s (above). The hook config sets `onFailure: "block"`, so a
    network failure also denies, and passes its hook-scoped token through `headers` with
    `allowedEnvVars`. It lives in the operator's settings, not in the repository.
+   `onFailure: "block"` exists only in recent Claude Code releases, and an older client ignores it
+   and fails open. T5 records the minimum version that supports it (from the changelog, checked
+   in that lane, not assumed here), and the orchestrator's start-up check refuses to begin a
+   threaded session on an older `claude --version`.
    Where Channels is enabled, a later adapter pushes owner messages instead of waiting for a read.
 2. **Agent SDK adapter (later; API-key billing; needs the owner's decision).**
    A long-lived `fleet-v2 orchestrator serve` process owns `query()` in streaming-input mode. Its
@@ -149,7 +163,12 @@ receive updates.
   - the hook's token has the `hook` scope only, and the MCP server's has `read` and `message`
     (orchestrator updates) only;
   - an `owner-message` from source `cli` (where the full token is on disk) is refused, or stored
-    labelled `unverified`, for the same reason.
+    labelled `unverified`, for the same reason;
+  - **the existing full-power token loses the `verdict` scope** in the same change that adds
+    scopes: the legacy on-disk token keeps today's routes for the CLI but is refused on the
+    verdict route (403), and it is rotated then, so no copy that predates scopes still works.
+    Only a session-minted, in-memory token can post a verdict; a test proves the on-disk token
+    gets 403 there.
 - **One verdict:** the first verdict wins; clients show who answered.
 - **Untrusted text:** orchestrator updates, tool inputs and lane output are displayed as text,
   never as markup, and never as an approval.
@@ -176,7 +195,7 @@ receive updates.
 | T3b | Minting: the session exchange that issues an in-memory verdict token to the TUI or web; no verdict token on disk | T3a | Fable (security) |
 | T2c | API: permission requests (hook scope, API-issued id, verbatim input, 540 s explicit deny, no `updatedInput`) and verdicts (verdict scope, first wins) | T3a | Fable (it approves tool use) |
 | T4 | MCP tools `fleet_thread_read` (typed entries) and `fleet_thread_post`; M3 `fleet_ask_owner` and `fleet_wait_for_answer`. Waits for the MCP plan's M2 and M4, or supersedes them, recorded in that plan | T2a, T2b, T3a | Opus |
-| T5 | `PermissionRequest` hook recipe: matcher that excludes outward tools, `onFailure: "block"`, `headers` and `allowedEnvVars`; operator settings example | T2c | Fable (it approves tool use) |
+| T5 | `PermissionRequest` hook recipe: matcher that excludes outward tools, a `PreToolUse` guard and `permissions.deny` rules that deny them in every mode, `onFailure: "block"` with a minimum Claude Code version and a start-up check, `headers` and `allowedEnvVars`; operator settings example | T2c | Fable (it approves tool use) |
 | T6 | Web session (U3) and the first web write route (Q5) | T3b | Fable (security) |
 | T7 | Web Questions view (Q4) and Conversation view, through the web's server proxy | T6 | Opus |
 | T8a | TUI shell: `fleet-v2 tui`, the library choice, the stream view and reconnect | T2a, T3b | Opus |
@@ -242,3 +261,13 @@ all applied in rev 2.
   and the manifest text; the port's layer; input versus authority made structural; T1, T2, T3
   and T8 split; T4 ordered after M2 and M4, and T8 after the token minting.
 - Nits: `UserPromptSubmit`'s 30 s timeout; the web reaches `/v1` through its server proxy.
+
+CodeRabbit on PR #130 (rev 2), 2026-10-18: four findings, all applied in rev 3.
+- Major: `PermissionRequest` does not fire for pre-authorised calls, so excluding outward tools
+  from its matcher did not stop them. T5 adds a `PreToolUse` deny guard and `permissions.deny`
+  rules (§4.1).
+- Major: the legacy full-power token could still post a verdict. It loses the `verdict` scope and
+  is rotated when scopes land; a test proves the 403 (§4.5).
+- Minor: both hook answers use the `hookSpecificOutput` envelope (§4.2).
+- Minor: a minimum Claude Code version for `onFailure: "block"`, found in T5 and checked at start
+  (§4.3). The reviewer's version number was not taken on trust.

@@ -12,15 +12,15 @@ import {
   renderFreeTierStatus,
   summariseFreeTier,
   type FreeTierAction,
-} from '@fleet/onboarding';
-import { resolveInstallationFile } from '@fleet/installation';
+} from "@fleet/onboarding";
+import { resolveInstallationFile } from "@fleet/installation";
 import {
   confirmAndWrite,
   printDiff,
   printErrors,
   readInstallationState,
-} from './hosts.js';
-import type { CliIo } from './index.js';
+} from "./hosts.js";
+import type { CliIo } from "./index.js";
 
 /** Options the driver and tests inject; every default composes the real thing. */
 export interface SeatsCliOptions {
@@ -47,6 +47,9 @@ no policy: migrate to v2 first.
   on       use free seats (removes useFreeSeats: false)
   off      do not use free seats (writes useFreeSeats: false)
 
+off then on restores a file byte for byte only when the file was already in
+the writer's canonical form (the first write normalises formatting).
+
 The API reads the file once at start: a change takes effect for the API after
 it restarts; CLI dispatches use it at once.
 
@@ -57,38 +60,38 @@ type ParsedSeatsArgs =
   | {
       readonly ok: true;
       readonly help: boolean;
-      readonly action: FreeTierAction | 'status';
+      readonly action: FreeTierAction | "status";
       readonly yes: boolean;
     }
   | { readonly ok: false; readonly error: string };
 
 function isHelpToken(token: string): boolean {
-  return token === 'help' || token === '--help' || token === '-h';
+  return token === "help" || token === "--help" || token === "-h";
 }
 
 /** Parse one seats invocation; every problem is a usage message, never a guess. */
 function parseSeatsArgs(tokens: readonly string[]): ParsedSeatsArgs {
   if (tokens.some(isHelpToken)) {
-    return { ok: true, help: true, action: 'status', yes: false };
+    return { ok: true, help: true, action: "status", yes: false };
   }
-  if (tokens[0] !== 'free-tier') {
+  if (tokens[0] !== "free-tier") {
     return {
       ok: false,
-      error: `Unknown seats subcommand: ${tokens[0] ?? '(none)'}\n${SEATS_HELP}`,
+      error: `Unknown seats subcommand: ${tokens[0] ?? "(none)"}\n${SEATS_HELP}`,
     };
   }
-  let action: FreeTierAction | 'status' = 'status';
+  let action: FreeTierAction | "status" = "status";
   let actionGiven = false;
   let yes = false;
   for (const token of tokens.slice(1)) {
-    if (!token.startsWith('--') || token === '--') {
+    if (!token.startsWith("--") || token === "--") {
       if (actionGiven) {
         return {
           ok: false,
           error: `Unexpected argument: ${token}\n${SEATS_HELP}`,
         };
       }
-      if (token !== 'status' && token !== 'on' && token !== 'off') {
+      if (token !== "status" && token !== "on" && token !== "off") {
         return {
           ok: false,
           error: `Unknown free-tier action: ${token}\n${SEATS_HELP}`,
@@ -99,11 +102,11 @@ function parseSeatsArgs(tokens: readonly string[]): ParsedSeatsArgs {
       continue;
     }
     const body = token.slice(2);
-    const separator = body.indexOf('=');
+    const separator = body.indexOf("=");
     const flag = separator === -1 ? body : body.slice(0, separator);
     const inlineValue =
       separator === -1 ? undefined : body.slice(separator + 1);
-    if (flag !== 'yes') {
+    if (flag !== "yes") {
       return {
         ok: false,
         error: `Unknown seats free-tier option: --${flag}\n${SEATS_HELP}`,
@@ -114,7 +117,7 @@ function parseSeatsArgs(tokens: readonly string[]): ParsedSeatsArgs {
     }
     yes = true;
   }
-  if (yes && action === 'status') {
+  if (yes && action === "status") {
     return {
       ok: false,
       error: `--yes applies to on and off only\n${SEATS_HELP}`,
@@ -126,22 +129,22 @@ function parseSeatsArgs(tokens: readonly string[]): ParsedSeatsArgs {
 /** `seats free-tier status`: print the setting, free seats and role counts. */
 async function showFreeTierStatus(file: string, io: CliIo): Promise<number> {
   const state = await readInstallationState(file);
-  if (state.status === 'unreadable') {
+  if (state.status === "unreadable") {
     io.stderr(`${file}: could not be read (${state.reason})\n`);
     return 1;
   }
-  if (state.status === 'invalid') {
-    io.stderr('the installation file is invalid; fix it by hand:\n');
+  if (state.status === "invalid") {
+    io.stderr("the installation file is invalid; fix it by hand:\n");
     printErrors(io, state.errors);
     return 1;
   }
-  if (state.status === 'absent') {
-    io.stdout('no installation file; free-tier: on (the default)\n');
+  if (state.status === "absent") {
+    io.stdout("no installation file; free-tier: on (the default)\n");
     return 0;
   }
-  if (state.status === 'v1') {
+  if (state.status === "v1") {
     io.stdout(
-      'free-tier: on (schema version 1 has no policy section; migrate to v2 to change it)\n',
+      "free-tier: on (schema version 1 has no policy section; migrate to v2 to change it)\n",
     );
     return 0;
   }
@@ -160,47 +163,47 @@ async function changeFreeTier(
   options: SeatsCliOptions,
 ): Promise<number> {
   const state = await readInstallationState(file);
-  if (state.status === 'unreadable') {
+  if (state.status === "unreadable") {
     io.stderr(`${file}: could not be read (${state.reason})\n`);
     return 1;
   }
-  if (state.status === 'invalid') {
+  if (state.status === "invalid") {
     io.stderr(
-      'the installation file is invalid; fix it by hand before changing free-tier:\n',
+      "the installation file is invalid; fix it by hand before changing free-tier:\n",
     );
     printErrors(io, state.errors);
     return 1;
   }
-  if (state.status === 'absent') {
-    if (action === 'off') {
-      io.stderr('no installation file; run fleet-v2 init first\n');
+  if (state.status === "absent") {
+    if (action === "off") {
+      io.stderr("no installation file; run fleet-v2 init first\n");
       return 1;
     }
     io.stdout(
-      'free-tier is already on (no installation file); nothing was written\n',
+      "free-tier is already on (no installation file); nothing was written\n",
     );
     return 0;
   }
-  if (state.status === 'v1') {
-    if (action === 'off') {
+  if (state.status === "v1") {
+    if (action === "off") {
       io.stderr(
-        'the installation file is schema version 1, which has no policy section; migrate to v2 before turning free seats off\n',
+        "the installation file is schema version 1, which has no policy section; migrate to v2 before turning free seats off\n",
       );
       return 1;
     }
-    io.stdout('free-tier is already on (schema version 1); nothing was written\n');
+    io.stdout("free-tier is already on (schema version 1); nothing was written\n");
     return 0;
   }
 
   const draft = draftFreeTier(state.value, action);
-  if (draft.status === 'invalid') {
+  if (draft.status === "invalid") {
     io.stderr(
-      'the installation file is invalid; fix it by hand before changing free-tier:\n',
+      "the installation file is invalid; fix it by hand before changing free-tier:\n",
     );
     printErrors(io, draft.errors);
     return 1;
   }
-  if (draft.status === 'unchanged') {
+  if (draft.status === "unchanged") {
     io.stdout(`free-tier is already ${action}; nothing was written\n`);
     return 0;
   }
@@ -211,14 +214,14 @@ async function changeFreeTier(
     }
   }
   if (draft.errors.length > 0) {
-    io.stderr('refused: the installation would be invalid with this change:\n');
+    io.stderr("refused: the installation would be invalid with this change:\n");
     printErrors(io, draft.errors);
     printDiff(
       io,
-      state.read.status === 'read' ? state.read.text : '',
+      state.read.status === "read" ? state.read.text : "",
       draft.candidate,
     );
-    io.stderr('nothing was written\n');
+    io.stderr("nothing was written\n");
     return 1;
   }
 
@@ -232,7 +235,7 @@ async function changeFreeTier(
   );
   if (code === 0) {
     io.stdout(
-      'takes effect for the API after it restarts; CLI dispatches use it at once\n',
+      "takes effect for the API after it restarts; CLI dispatches use it at once\n",
     );
   }
   return code;
@@ -256,7 +259,7 @@ export async function seatsCommand(
   const file =
     options.installationFile ??
     resolveInstallationFile(undefined, process.env, process.cwd());
-  return parsed.action === 'status'
+  return parsed.action === "status"
     ? showFreeTierStatus(file, io)
     : changeFreeTier(file, parsed.action, parsed.yes, io, options);
 }

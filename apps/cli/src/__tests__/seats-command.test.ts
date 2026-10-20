@@ -7,7 +7,14 @@
  * compare-and-swap conflict and the byte-for-byte F8 canonical form.
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
@@ -367,6 +374,59 @@ describe("fleet-v2 seats free-tier on|off", () => {
     const { code, stderr } = await runSeats(["off", "--yes"], file);
     expect(code).toBe(1);
     expect(stderr).toContain("migrate to v2");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// broken files
+// ---------------------------------------------------------------------------
+
+describe("fleet-v2 seats free-tier refuses broken files", () => {
+  it("m: an unreadable installation file exits 1 without prompting or writing", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    mkdirSync(file);
+    let confirmCalls = 0;
+    const { code, stderr } = await runSeats(["off"], file, async () => {
+      confirmCalls += 1;
+      return true;
+    });
+    expect(code).toBe(1);
+    expect(stderr).toContain("could not be read");
+    expect(confirmCalls).toBe(0);
+    expect(readdirSync(dir)).toEqual(["fleet.json"]);
+  });
+
+  it("n: invalid JSON exits 1 without prompting and leaves the bytes unchanged", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const bytes = `{"schemaVersion": 2,\n`;
+    writeFileSync(file, bytes, "utf8");
+    let confirmCalls = 0;
+    const { code, stderr } = await runSeats(["off"], file, async () => {
+      confirmCalls += 1;
+      return true;
+    });
+    expect(code).toBe(1);
+    expect(stderr).toContain("invalid");
+    expect(confirmCalls).toBe(0);
+    expect(readFileSync(file, "utf8")).toBe(bytes);
+  });
+
+  it("o: a file that parses but fails the v2 schema exits 1 without prompting and leaves the bytes unchanged", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const bytes = `${JSON.stringify({ schemaVersion: 2 }, null, 2)}\n`;
+    writeFileSync(file, bytes, "utf8");
+    let confirmCalls = 0;
+    const { code, stderr } = await runSeats(["off"], file, async () => {
+      confirmCalls += 1;
+      return true;
+    });
+    expect(code).toBe(1);
+    expect(stderr).toContain("invalid");
+    expect(confirmCalls).toBe(0);
+    expect(readFileSync(file, "utf8")).toBe(bytes);
   });
 });
 

@@ -35,10 +35,10 @@ export interface AllowedSeatAdapterOptions {
   readonly policy?: { readonly useFreeSeats?: boolean };
 }
 
-/** Normalise a variant for equality: absent, null or blank is "none". */
+/** Normalise a variant for equality: absent, null or blank is "none"; case-insensitive. */
 function normaliseVariant(variant: string | null | undefined): string {
   const trimmed = variant?.trim() ?? '';
-  return trimmed === '' ? 'none' : trimmed;
+  return trimmed === '' ? 'none' : trimmed.toLowerCase();
 }
 
 export class AllowedSeatAdapter implements AllowedSeatPort {
@@ -48,14 +48,15 @@ export class AllowedSeatAdapter implements AllowedSeatPort {
     if (this.options?.policy?.useFreeSeats !== false) {
       return { allowed: true, useFreeSeats: true };
     }
+    const model = query.model.trim();
     const queryVariant = normaliseVariant(query.variant);
     const matches = (this.options?.seats ?? []).filter(
       (seat) =>
         seat.tool === query.tool &&
-        seat.model === query.model &&
+        seat.model === model &&
         normaliseVariant(seat.variant) === queryVariant,
     );
-    const subject = `Seat (tool ${query.tool}, model ${query.model}, variant ${query.variant ?? 'none'})`;
+    const subject = `Seat (tool ${query.tool}, model ${model}, variant ${query.variant ?? 'none'})`;
     return this.verdictForMatches(subject, matches);
   }
 
@@ -63,12 +64,22 @@ export class AllowedSeatAdapter implements AllowedSeatPort {
     if (this.options?.policy?.useFreeSeats !== false) {
       return { allowed: true, useFreeSeats: true };
     }
-    const matches = (this.options?.seats ?? []).filter(
-      (seat) =>
-        seat.model === query.model ||
-        (seat.variant !== undefined && `${seat.model}:${seat.variant}` === query.model),
-    );
-    const subject = `Reviewer model ${query.model}`;
+    const model = query.model.trim();
+    const lastColon = model.lastIndexOf(':');
+    const firstSlash = model.indexOf('/');
+    const hasVariant = lastColon !== -1 && lastColon > firstSlash;
+    const base = hasVariant ? model.slice(0, lastColon) : model;
+    const queryVariant = hasVariant ? normaliseVariant(model.slice(lastColon + 1)) : null;
+    const matches = (this.options?.seats ?? []).filter((seat) => {
+      if (seat.model === model) {
+        return true;
+      }
+      if (queryVariant !== null && seat.model === base) {
+        return normaliseVariant(seat.variant) === queryVariant;
+      }
+      return false;
+    });
+    const subject = `Reviewer model ${model}`;
     return this.verdictForMatches(subject, matches);
   }
 

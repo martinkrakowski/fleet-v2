@@ -427,7 +427,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           : 'opencode';
       const verdict = this.deps.allowedSeats.checkDispatchSeat({
         tool: checkTool,
-        model: effectiveModel,
+        model: effectiveModel.trim(),
         variant: effectiveVariant ?? null,
       });
       if (!verdict.allowed) {

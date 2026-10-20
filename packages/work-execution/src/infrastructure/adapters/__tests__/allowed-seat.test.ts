@@ -16,7 +16,8 @@ const seats: readonly AllowedSeatCatalogueSeat[] = [
   },
   { id: 'glm-free', tool: 'opencode', model: 'nvidia/z-ai/glm-5.3', variant: 'default', costClass: 'free' },
   { id: 'xy-paid', tool: 'opencode', model: 'x/y', costClass: 'paid' },
-  { id: 'xy-free', tool: 'opencode', model: 'x/y', variant: 'free', costClass: 'free' },
+  { id: 'xy-paid-default', tool: 'opencode', model: 'x/y', variant: 'default', costClass: 'paid' },
+  { id: 'xy-free', tool: 'opencode', model: 'x/y', variant: 'Free', costClass: 'free' },
   { id: 'twin-free', tool: 'opencode', model: 't/twin', costClass: 'free' },
   { id: 'twin-paid', tool: 'opencode', model: 't/twin', costClass: 'paid' },
 ];
@@ -101,6 +102,32 @@ describe('AllowedSeatAdapter', () => {
         allowed: false,
         useFreeSeats: false,
         reason: 'Reviewer model x/y:free is a free seat (xy-free); policy.useFreeSeats is false',
+      });
+    });
+
+    it('matches a reviewer model variant case-insensitively against a paid seat (FS3a review)', () => {
+      // `x/y:Default` must match the seat whose variant is `default` even
+      // though the query spells it with an uppercase D.
+      expect(adapter.checkReviewerModel({ model: 'x/y:Default' })).toEqual({
+        allowed: true,
+        useFreeSeats: false,
+      });
+    });
+
+    it('refuses a reviewer model whose variant case differs from a free seat (FS3a review)', () => {
+      // `x/y:FREE` and a seat with variant `Free` declared free must be
+      // refused, not missed by a case-sensitive comparison.
+      expect(adapter.checkReviewerModel({ model: 'x/y:FREE' })).toEqual({
+        allowed: false,
+        useFreeSeats: false,
+        reason: 'Reviewer model x/y:FREE is a free seat (xy-free); policy.useFreeSeats is false',
+      });
+    });
+
+    it('matches a padded model after trimming (FS3a review)', () => {
+      expect(adapter.checkDispatchSeat({ tool: 'opencode', model: ' x/y ' })).toEqual({
+        allowed: true,
+        useFreeSeats: false,
       });
     });
 

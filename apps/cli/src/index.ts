@@ -70,6 +70,7 @@ import {
   type FleetCliRuntime,
 } from './composition.js';
 import { hostsCommand, type HostsCliOptions } from './hosts.js';
+import { seatsCommand, type SeatsCliOptions } from './seats.js';
 import { initCommand, type InitCliOptions } from './init.js';
 
 export { resolveRunnerSettings };
@@ -1735,6 +1736,9 @@ doctor --host <name> prints only that host's probe subset.
 The hosts group manages the installation file's named hosts: list, add,
 edit and remove, each write confirmed and compare-and-swapped.
 
+The seats group shows or changes policy.useFreeSeats: seats free-tier status|on|off,
+each change confirmed and compare-and-swapped.
+
 init sets up a fresh installation file non-interactively (every step is a
 flag); run 'fleet-v2 init --help' for its flags.
 
@@ -1742,6 +1746,7 @@ Commands:
   work-order register|inspect
   doctor [--probe-seats] [--host <name>] [--json]
   hosts list|add|edit|remove
+  seats free-tier [status|on|off] [--yes]
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
   brief prepare [--allowedPathPrefixes '["packages/x/src"]']
   capacity reserve
@@ -1772,6 +1777,7 @@ export async function runCli(
   doctorOptions?: DoctorCliOptions,
   hostsOptions?: HostsCliOptions,
   initOptions?: InitCliOptions,
+  seatsOptions?: SeatsCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -1796,6 +1802,10 @@ export async function runCli(
     // engine; it reads the file and composes no state-backed stores.
     if (group === 'init') {
       return await initCommand(restArgv.slice(1), io, initOptions ?? {});
+    }
+    // The seats group manages the free-tier flag on the shared onboarding engine.
+    if (group === 'seats') {
+      return await seatsCommand(restArgv.slice(1), io, seatsOptions ?? {});
     }
     // The questions group carries its own help block; a help request never
     // composes the runtime and never counts as a usage error.

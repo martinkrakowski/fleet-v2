@@ -569,9 +569,13 @@ describe('runDoctor', () => {
 
     expect(lines.length).toBeGreaterThan(0);
     // The only lines that do not depend on a throwing probe are the schema
-    // line and the runner capability declaration (derived, not probed).
+    // line, the runner capability declaration and the free-tier policy line
+    // (all derived, not probed).
     const expectedUnknown = lines.filter(
-      (line) => line.check !== 'schema-version' && line.check !== 'runner-capabilities',
+      (line) =>
+        line.check !== 'schema-version' &&
+        line.check !== 'runner-capabilities' &&
+        line.check !== 'free-tier',
     );
     const unknownLines = lines.filter((line) => line.status === 'UNKNOWN');
     expect(unknownLines).toHaveLength(expectedUnknown.length);
@@ -595,5 +599,112 @@ describe('runDoctor', () => {
     expect(firstIndex('tool')).toBeLessThan(firstIndex('credential'));
     expect(firstIndex('credential')).toBeLessThan(firstIndex('runner-binary'));
     expect(firstIndex('runner-binary')).toBeLessThan(firstIndex('seat'));
+  });
+});
+
+describe('runDoctor free-tier (FS4)', () => {
+  const freeTierSeats: SeatModel[] = [
+    {
+      id: 'free1',
+      tool: 'opencode',
+      model: 'acme/alpha-1',
+      roles: ['implementer'],
+      costClass: 'free',
+    },
+    {
+      id: 'paid1',
+      tool: 'opencode',
+      model: 'acme/alpha-2',
+      roles: ['implementer'],
+      costClass: 'paid',
+    },
+    {
+      id: 'nv',
+      tool: 'opencode',
+      model: 'nvidia/acme/beta-2',
+      roles: ['reviewer'],
+      costClass: 'paid',
+    },
+  ];
+
+  it('a: flag false disables free seats, warns on an nvidia paid seat, exit 0', async () => {
+    const model: FleetInstallationModel = {
+      ...sampleModel({ seats: freeTierSeats }),
+      policy: { useFreeSeats: false },
+    };
+    const { probes, calls } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes, {
+      probeSeats: true,
+    });
+
+    const policyLine = lines.find(
+      (line) => line.scope === 'installation' && line.check === 'free-tier',
+    );
+    expect(policyLine).toMatchObject({
+      subject: 'policy',
+      status: 'PASS',
+      detail: 'off (policy.useFreeSeats false); 1 free seat(s) disabled',
+    });
+
+    const free1Lines = lines.filter(
+      (line) => line.scope === 'seat' && line.subject === 'free1',
+    );
+    expect(free1Lines).toHaveLength(1);
+    expect(free1Lines[0]).toMatchObject({
+      check: 'free-tier',
+      status: 'PASS',
+    });
+
+    expect(calls).not.toContain('seatProbe:free1');
+    expect(calls).toContain('seatProbe:paid1');
+
+    const nvLine = lines.find((line) => line.check === 'nvidia-cost-class');
+    expect(nvLine).toMatchObject({
+      scope: 'seat',
+      subject: 'nv',
+      status: 'PASS',
+    });
+    expect(nvLine?.detail.startsWith('warning:')).toBe(true);
+
+    expect(doctorExitCode(lines)).toBe(0);
+  });
+
+  it('b: flag absent shows on and probes free seats', async () => {
+    const model = sampleModel({ seats: freeTierSeats });
+    const { probes, calls } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes, {
+      probeSeats: true,
+    });
+
+    const policyLine = lines.find(
+      (line) => line.scope === 'installation' && line.check === 'free-tier',
+    );
+    expect(policyLine?.detail).toBe(
+      'on (policy.useFreeSeats absent; absent means on)',
+    );
+    expect(
+      lines.filter(
+        (line) =>
+          line.scope === 'seat' &&
+          (line.check === 'free-tier' || line.check === 'nvidia-cost-class'),
+      ),
+    ).toEqual([]);
+    expect(calls).toContain('seatProbe:free1');
+  });
+
+  it('c: flag true reports on', async () => {
+    const model: FleetInstallationModel = {
+      ...sampleModel({ seats: freeTierSeats }),
+      policy: { useFreeSeats: true },
+    };
+    const { probes } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes, {
+      probeSeats: true,
+    });
+
+    const policyLine = lines.find(
+      (line) => line.scope === 'installation' && line.check === 'free-tier',
+    );
+    expect(policyLine?.detail).toBe('on (policy.useFreeSeats true)');
   });
 });

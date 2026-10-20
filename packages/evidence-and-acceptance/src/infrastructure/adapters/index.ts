@@ -3,6 +3,7 @@
 export * from "./AttemptOwnerDecisionAdapter.adapter.js";
 export * from "./EvidenceArchiveAdapter.adapter.js";
 export * from "./EvidenceAssessmentRepositoryAdapter.adapter.js";
+export * from "./EvidenceSeatPolicyAdapter.adapter.js";
 export * from "./file-store.js";
 export * from "./ForgeEvidenceAdapter.adapter.js";
 export * from "./IndependentReviewAdapter.adapter.js";

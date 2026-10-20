@@ -6,6 +6,7 @@ import {
   AttemptOwnerDecisionAdapter,
   EvidenceArchiveAdapter,
   EvidenceAssessmentRepositoryAdapter,
+  EvidenceSeatPolicyAdapter,
   ForgeEvidenceAdapter,
   IndependentReviewAdapter,
   OwnerDecisionAdapter,
@@ -92,6 +93,12 @@ export function createConfiguredEvidenceUseCases(
   const installationModel = options?.installation
     ? requireValidInstallationModel(options.installation)
     : undefined;
+  // Free-seat flag (F5): a structural subset of the derived model; absent
+  // installation or flag means allowed.
+  const seatPolicy = new EvidenceSeatPolicyAdapter({
+    useFreeSeats: installationModel?.policy?.useFreeSeats,
+    seats: installationModel?.seats,
+  });
   const forgeMode = installationModel?.forge?.mode;
   const forgeSection =
     installationModel?.forge !== undefined && "mode" in installationModel.forge
@@ -126,8 +133,9 @@ export function createConfiguredEvidenceUseCases(
       repo,
       reviewer,
       archive,
+      seatPolicy,
     }),
-    recordReviewReceipt: new RecordReviewReceiptUseCase({ repo }),
+    recordReviewReceipt: new RecordReviewReceiptUseCase({ repo, seatPolicy }),
     assessHeadAcceptance: new AssessHeadAcceptanceUseCase({
       repo,
       // Mode `github` binds the forge-evidence port (with owner/repo); mode

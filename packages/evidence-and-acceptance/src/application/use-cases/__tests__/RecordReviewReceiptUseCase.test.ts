@@ -5,6 +5,11 @@ import type {
   ReviewReceiptRecord,
 } from '../../../domain/evidence-records.js';
 import type { EvidenceAssessmentRepositoryPort } from '../../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
+import type {
+  CheckReviewerSeatRequest,
+  EvidenceSeatPolicyPort,
+  ReviewerSeatCheck,
+} from '../../ports/out/EvidenceSeatPolicyPort.out-port.js';
 import { RecordReviewReceiptUseCase } from '../RecordReviewReceiptUseCase.use-case.js';
 
 const HEAD = '1111111111111111111111111111111111111111';
@@ -56,6 +61,17 @@ function sampleRecord(overrides: Partial<EvidenceAssessmentRecord> = {}): Eviden
     updatedAtIso: '2026-10-15T12:00:00.000Z',
     ...overrides,
   };
+}
+
+class StubSeatPolicy implements EvidenceSeatPolicyPort {
+  calls: string[] = [];
+
+  constructor(private readonly result: ReviewerSeatCheck) {}
+
+  async checkReviewerSeat(request: CheckReviewerSeatRequest): Promise<ReviewerSeatCheck> {
+    this.calls.push(request.reviewerModel);
+    return this.result;
+  }
 }
 
 function sampleReceipt(overrides: Partial<ReviewReceiptRecord> = {}): ReviewReceiptRecord {
@@ -227,5 +243,98 @@ describe('RecordReviewReceiptUseCase blank model handling', () => {
     }
     const stored = await repo.findAssessmentById('asm-1');
     expect(stored?.reviewReceipts).toHaveLength(0);
+  });
+});
+
+describe('free-seat policy and requested reviewer (FS3b)', () => {
+  it('refuses a receipt naming a reviewer other than the requested one', async () => {
+    const repo = new InMemoryAssessmentRepo([
+      sampleRecord({ requestedReviewerModel: 'openai/gpt-4o' }),
+    ]);
+    const useCase = new RecordReviewReceiptUseCase({ repo });
+
+    const result = await useCase.recordReviewReceipt({
+      assessmentId: 'asm-1',
+      receipt: sampleReceipt({ reviewerModel: 'openai/gpt-5' }),
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.reason).toContain("requested reviewer 'openai/gpt-4o'");
+    }
+    const stored = await repo.findAssessmentById('asm-1');
+    expect(stored?.reviewReceipts).toHaveLength(0);
+  });
+
+  it('records a receipt naming the requested reviewer', async () => {
+    const repo = new InMemoryAssessmentRepo([
+      sampleRecord({ requestedReviewerModel: 'openai/gpt-4o' }),
+    ]);
+    const useCase = new RecordReviewReceiptUseCase({ repo });
+
+    const result = await useCase.recordReviewReceipt({
+      assessmentId: 'asm-1',
+      receipt: sampleReceipt(),
+    });
+
+    expect(result.outcome).toBe('recorded');
+    const stored = await repo.findAssessmentById('asm-1');
+    expect(stored?.reviewReceipts).toHaveLength(1);
+  });
+
+  it('keeps today behaviour when no review was requested', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const useCase = new RecordReviewReceiptUseCase({ repo });
+
+    const result = await useCase.recordReviewReceipt({
+      assessmentId: 'asm-1',
+      receipt: sampleReceipt(),
+    });
+
+    expect(result.outcome).toBe('recorded');
+    const stored = await repo.findAssessmentById('asm-1');
+    expect(stored?.reviewReceipts).toHaveLength(1);
+  });
+
+  it('refuses with the seat policy reason and does not save', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const seatPolicy = new StubSeatPolicy({
+      outcome: 'refused',
+      reason: 'reviewer model is free',
+    });
+    const useCase = new RecordReviewReceiptUseCase({ repo, seatPolicy });
+
+    const result = await useCase.recordReviewReceipt({
+      assessmentId: 'asm-1',
+      receipt: sampleReceipt(),
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.reason).toBe('reviewer model is free');
+    }
+    const stored = await repo.findAssessmentById('asm-1');
+    expect(stored?.revision).toBe(0);
+  });
+
+  it('refuses when the requested reviewer matches but the seat policy refuses', async () => {
+    const repo = new InMemoryAssessmentRepo([
+      sampleRecord({ requestedReviewerModel: 'openai/gpt-4o' }),
+    ]);
+    const seatPolicy = new StubSeatPolicy({
+      outcome: 'refused',
+      reason: 'reviewer model is free',
+    });
+    const useCase = new RecordReviewReceiptUseCase({ repo, seatPolicy });
+
+    const result = await useCase.recordReviewReceipt({
+      assessmentId: 'asm-1',
+      receipt: sampleReceipt(),
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.reason).toBe('reviewer model is free');
+    }
   });
 });

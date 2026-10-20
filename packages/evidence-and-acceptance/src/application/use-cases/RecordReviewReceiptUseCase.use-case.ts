@@ -2,7 +2,10 @@
 /**
  * RecordReviewReceiptUseCase retains an attributable, read-only review of one
  * exact head. A review by the implementer's own underlying model is refused:
- * a different provider seat alone is not an independent review.
+ * a different provider seat alone is not an independent review. When the
+ * assessment records a requested reviewer, the receipt must name the same
+ * model. When the free-seat policy port is bound and the flag is false, a
+ * free, unknown or ambiguous reviewer is refused.
  */
 
 import type { EvidenceAssessmentRecord } from '../../domain/evidence-records.js';
@@ -10,6 +13,7 @@ import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js'
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import { ReviewReceipt, isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
+import type { EvidenceSeatPolicyPort } from '../ports/out/EvidenceSeatPolicyPort.out-port.js';
 import type {
   RecordReviewReceiptPort,
   RecordReviewReceiptRequest,
@@ -18,6 +22,7 @@ import type {
 
 export interface RecordReviewReceiptDependencies {
   readonly repo: EvidenceAssessmentRepositoryPort;
+  readonly seatPolicy?: EvidenceSeatPolicyPort;
 }
 
 const NOT_IMPLEMENTED = 'Not implemented: RecordReviewReceiptUseCase';
@@ -130,6 +135,23 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
         outcome: 'rejected',
         reason: `Reviewer ${receipt.reviewerModel} shares the same underlying model as the implementer ${assessment.implementerModel}`,
       };
+    }
+    if (
+      assessment.requestedReviewerModel !== undefined &&
+      receipt.reviewerModel.trim() !== assessment.requestedReviewerModel
+    ) {
+      return {
+        outcome: 'rejected',
+        reason: `Review receipt names reviewer '${receipt.reviewerModel}', but assessment '${assessment.id}' requested reviewer '${assessment.requestedReviewerModel}'`,
+      };
+    }
+    if (deps.seatPolicy) {
+      const check = await deps.seatPolicy.checkReviewerSeat({
+        reviewerModel: receipt.reviewerModel,
+      });
+      if (check.outcome === 'refused') {
+        return { outcome: 'rejected', reason: check.reason };
+      }
     }
 
     const validatedReceipt = ReviewReceipt.create(receipt);

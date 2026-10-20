@@ -258,7 +258,7 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
 }
 
 /** The file on disk plus the loader's verdict on it. */
-type InstallationState =
+export type InstallationState =
   | { readonly status: "absent"; readonly read: InstallationFileRead }
   | {
       readonly status: "unreadable";
@@ -283,7 +283,7 @@ type InstallationState =
       readonly value: unknown;
     };
 
-async function readInstallationState(file: string): Promise<InstallationState> {
+export async function readInstallationState(file: string): Promise<InstallationState> {
   const read = await readInstallationFile(file);
   if (read.status === "unreadable") {
     return { status: "unreadable", read, reason: read.reason };
@@ -305,7 +305,7 @@ async function readInstallationState(file: string): Promise<InstallationState> {
       };
 }
 
-function printErrors(io: CliIo, errors: readonly string[]): void {
+export function printErrors(io: CliIo, errors: readonly string[]): void {
   for (const error of errors) {
     io.stderr(`${error}\n`);
   }
@@ -472,7 +472,7 @@ function runnerDraftFor(
 }
 
 /** Diff the file as it sits against the candidate as the write would put it. */
-function printDiff(
+export function printDiff(
   io: CliIo,
   currentText: string,
   candidate: HostDraftCandidate,
@@ -487,13 +487,13 @@ function printDiff(
 }
 
 /** Probe, diff, confirm, then the compare-and-swap write. */
-async function confirmAndWrite(
+export async function confirmAndWrite(
   file: string,
   read: InstallationFileRead,
   candidate: HostDraftCandidate,
-  args: HostsArgs,
+  args: { readonly yes: boolean },
   io: CliIo,
-  options: HostsCliOptions,
+  options: { readonly confirm?: (question: string) => Promise<boolean> },
 ): Promise<number> {
   const currentText = read.status === "read" ? read.text : "";
   printDiff(io, currentText, candidate);

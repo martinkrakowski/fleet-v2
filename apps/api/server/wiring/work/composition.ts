@@ -2,6 +2,7 @@ import {
   AcceptanceAssessmentAdapter,
   AcceptanceEvidenceAdapter,
   ActionAuthorizationAdapter,
+  AllowedSeatAdapter,
   AttemptArtifactAdapter,
   AttemptRepositoryAdapter,
   BriefAuthoringAdapter,
@@ -324,6 +325,27 @@ export function createConfiguredWorkComposition(
     resolveAttempt: async (attemptId) =>
       await attemptRepo.findAttemptById(attemptId),
   });
+  // Free-seat policy (plan F3/F5): the adapter reads the installation's seat
+  // catalogue and policy as a structural subset. A seat mapped from a v1 file
+  // carries no cost class, so it stays out of the catalogue: with the flag
+  // off it cannot be proven non-free and is refused as not in the catalogue.
+  // An absent installation keeps the flag on (every seat allowed).
+  const allowedSeats = new AllowedSeatAdapter({
+    seats: (installationModel?.seats ?? []).flatMap((seat) =>
+      seat.costClass === undefined
+        ? []
+        : [
+            {
+              id: seat.id,
+              tool: seat.tool,
+              model: seat.model,
+              ...(seat.variant !== undefined ? { variant: seat.variant } : {}),
+              costClass: seat.costClass,
+            },
+          ],
+    ),
+    policy: installationModel?.policy,
+  });
   const acceptancePort = new AcceptanceAssessmentAdapter(crossContext?.acceptance);
   const acceptanceEvidencePort = new AcceptanceEvidenceAdapter(crossContext?.acceptanceEvidence);
   const briefKnowledge = new BriefKnowledgeAdapter(crossContext?.briefKnowledge);
@@ -355,6 +377,7 @@ export function createConfiguredWorkComposition(
       runner,
       observation,
       artifactPort,
+      allowedSeats,
     }),
     reconcileAttempt: new ReconcileAttemptUseCase({
       attemptRepo,
@@ -381,6 +404,7 @@ export function createConfiguredWorkComposition(
       workOrderRepo,
       acceptancePort,
       artifactPort,
+      allowedSeats,
     }),
     executeAuthorizedForgeAction: new ExecuteAuthorizedForgeActionUseCase({
       attemptRepo,

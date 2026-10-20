@@ -15,6 +15,10 @@ import type {
   WorkOrderRecord,
 } from '../../../domain/execution-records.js';
 import type { DispatchAttemptRequest } from '../../ports/in/DispatchAttemptPort.in-port.js';
+import type {
+  AllowedSeatCatalogueSeat,
+  AllowedSeatPort,
+} from '../../ports/out/AllowedSeatPort.out-port.js';
 import type { AttemptArtifactPort } from '../../ports/out/AttemptArtifactPort.out-port.js';
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import type { BriefAuthoringPort } from '../../ports/out/BriefAuthoringPort.out-port.js';
@@ -47,6 +51,7 @@ import { RegisterWorkOrderUseCase } from '../RegisterWorkOrderUseCase.use-case.j
 import { ReconcileAttemptUseCase } from '../ReconcileAttemptUseCase.use-case.js';
 import { ReserveExecutionCapacityUseCase } from '../ReserveExecutionCapacityUseCase.use-case.js';
 import { StopAttemptUseCase } from '../StopAttemptUseCase.use-case.js';
+import { AllowedSeatAdapter } from '../../../infrastructure/adapters/AllowedSeatAdapter.adapter.js';
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 
 function makeAttemptRepo(): AttemptRepositoryPort & { attempts: Map<string, AttemptRecord> } {
@@ -1342,6 +1347,7 @@ function makeDispatchSetup(
     runnerOptions?: Parameters<typeof makeRunner>[0];
     workspaceInspection?: Partial<WorktreeInspection>;
     workspaceOptions?: Parameters<typeof makeWorkspace>[0];
+    allowedSeats?: AllowedSeatPort;
   } = {},
 ) {
   const workOrderRepo = makeWorkOrderRepo();
@@ -1364,6 +1370,7 @@ function makeDispatchSetup(
     workspace: workspace.port,
     runner: runner.port,
     observation: observation.port,
+    ...(options.allowedSeats !== undefined ? { allowedSeats: options.allowedSeats } : {}),
   });
   return { workOrderRepo, attemptRepo, journal, runner, workspace, observation, useCase };
 }
@@ -1875,6 +1882,144 @@ describe('DispatchAttemptUseCase', () => {
     );
     expect(result.outcome).toBe('refused');
     expect((result as { reason: string }).reason).toContain('Unable to read frozen brief manifest');
+  });
+});
+
+describe('DispatchAttemptUseCase free-seat check (F3, F4, F7)', () => {
+  // The same catalogue the AllowedSeatAdapter tests use (free-seat plan
+  // FS3a-B). The default fake manifest freezes nvidia/z-ai/glm-5.3 variant
+  // default and no seat tool, so the checked triple is (opencode,
+  // nvidia/z-ai/glm-5.3, default).
+  const seats: readonly AllowedSeatCatalogueSeat[] = [
+    { id: 'paid', tool: 'opencode', model: 'b/paid-model', variant: 'default', costClass: 'paid' },
+    { id: 'glm-free', tool: 'opencode', model: 'nvidia/z-ai/glm-5.3', variant: 'default', costClass: 'free' },
+    { id: 'xy-paid', tool: 'opencode', model: 'x/y', costClass: 'paid' },
+    { id: 'xy-free', tool: 'opencode', model: 'x/y', variant: 'free', costClass: 'free' },
+    { id: 'twin-free', tool: 'opencode', model: 't/twin', costClass: 'free' },
+    { id: 'twin-paid', tool: 'opencode', model: 't/twin', costClass: 'paid' },
+  ];
+
+  it('refuses a brief frozen with the free model and records the refusal durably', async () => {
+    const setup = makeDispatchSetup({
+      allowedSeats: new AllowedSeatAdapter({ seats, policy: { useFreeSeats: false } }),
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('refused');
+    expect(result.outcome === 'refused' && result.reason).toContain('is a free seat');
+    expect(setup.runner.startCalls).toHaveLength(0);
+    expect(setup.attemptRepo.attempts.size).toBe(0);
+    expect(setup.journal.entries).toHaveLength(1);
+    const entry = setup.journal.entries[0];
+    expect(entry.action).toBe('dispatch');
+    expect(entry.status).toBe('refused');
+    expect(entry.detail).toContain('nvidia/z-ai/glm-5.3');
+    expect(entry.detail).toContain('useFreeSeats false');
+    // The reservation is still held, as every pre-intent refusal keeps it.
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+  });
+
+  it('dispatches the same brief through a seat override to a paid seat and records the flag', async () => {
+    const setup = makeDispatchSetup({
+      allowedSeats: new AllowedSeatAdapter({ seats, policy: { useFreeSeats: false } }),
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest({
+        seatOverride: {
+          model: 'b/paid-model',
+          reason: 'flag off',
+          setBy: 'operator',
+          expiresAtIso: '2026-10-16T08:00:00.000Z',
+        },
+      }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('started');
+    expect(setup.runner.startCalls[0].model).toBe('b/paid-model');
+    const saved = setup.attemptRepo.attempts.get('attempt-1');
+    expect(saved?.runner?.useFreeSeats).toBe(false);
+  });
+
+  it('refuses a seat override to the free x/y variant through the variant', async () => {
+    const setup = makeDispatchSetup({
+      allowedSeats: new AllowedSeatAdapter({ seats, policy: { useFreeSeats: false } }),
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest({
+        seatOverride: {
+          model: 'x/y',
+          variant: 'free',
+          reason: 'flag off',
+          setBy: 'operator',
+          expiresAtIso: '2026-10-16T08:00:00.000Z',
+        },
+      }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('refused');
+    expect(result.outcome === 'refused' && result.reason).toContain('is a free seat (xy-free)');
+    expect(setup.runner.startCalls).toHaveLength(0);
+  });
+
+  it('refuses a triple that is not in the catalogue at all', async () => {
+    const setup = makeDispatchSetup({
+      allowedSeats: new AllowedSeatAdapter({
+        seats: seats.filter((seat) => seat.model !== 'nvidia/z-ai/glm-5.3'),
+        policy: { useFreeSeats: false },
+      }),
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('refused');
+    expect(result.outcome === 'refused' && result.reason).toContain(
+      "is not in the installation's seat catalogue",
+    );
+    expect(setup.runner.startCalls).toHaveLength(0);
+  });
+
+  it('refuses a triple matched by seats of mixed cost class (F3)', async () => {
+    // Seats that differ only in agent collapse to the same triple; one free
+    // and one paid match is ambiguous and refused.
+    const mixed: readonly AllowedSeatCatalogueSeat[] = [
+      ...seats.filter((seat) => seat.id !== 'glm-free'),
+      { id: 'brief-free', tool: 'opencode', model: 'nvidia/z-ai/glm-5.3', variant: 'default', costClass: 'free' },
+      { id: 'brief-paid', tool: 'opencode', model: 'nvidia/z-ai/glm-5.3', variant: 'default', costClass: 'paid' },
+    ];
+    const setup = makeDispatchSetup({
+      allowedSeats: new AllowedSeatAdapter({ seats: mixed, policy: { useFreeSeats: false } }),
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('refused');
+    expect(result.outcome === 'refused' && result.reason).toContain('mixed cost class');
+    expect(result.outcome === 'refused' && result.reason).toContain('brief-free');
+    expect(result.outcome === 'refused' && result.reason).toContain('brief-paid');
+    expect(setup.runner.startCalls).toHaveLength(0);
+  });
+
+  it('dispatches the free brief when no flag is set and records the flag it saw', async () => {
+    const setup = makeDispatchSetup({
+      allowedSeats: new AllowedSeatAdapter({ seats }),
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('started');
+    const saved = setup.attemptRepo.attempts.get('attempt-1');
+    expect(saved?.runner?.useFreeSeats).toBe(true);
   });
 });
 

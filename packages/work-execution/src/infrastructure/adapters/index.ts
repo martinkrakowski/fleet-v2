@@ -4,6 +4,7 @@ export * from "./AcceptanceAssessmentAdapter.adapter.js";
 export * from "./AcceptanceEvidenceAdapter.adapter.js";
 export * from "./ActionAuthorizationAdapter.adapter.js";
 export * from "./AgyRunnerAdapter.adapter.js";
+export * from "./AllowedSeatAdapter.adapter.js";
 export * from "./AttemptArtifactAdapter.adapter.js";
 export * from "./AttemptOwnerDecisionAdapter.adapter.js";
 export * from "./AttemptRepositoryAdapter.adapter.js";

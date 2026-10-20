@@ -187,7 +187,8 @@ export function validateSeatPolicy(
       const variantLooksFree =
         variant !== undefined &&
         (variant.toLowerCase() === 'free' || variant.toLowerCase().endsWith('-free'));
-      const modelLooksFree = seat.model.endsWith(':free') || seat.model.endsWith('-free');
+      const modelLooksFree =
+        seat.model.toLowerCase().endsWith(':free') || seat.model.toLowerCase().endsWith('-free');
       if (modelLooksFree || variantLooksFree) {
         const variantPart = variantLooksFree ? ` variant "${variant}"` : '';
         errors.push(

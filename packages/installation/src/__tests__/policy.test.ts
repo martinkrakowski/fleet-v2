@@ -557,6 +557,16 @@ describe('loader policy enforcement', () => {
         expected:
           'seats.impl: model "x/y" variant "turbo-free" looks free but costClass is "paid"; declare it free or remove it',
       },
+      {
+        seat: { id: 'impl', model: 'x/y:FREE', costClass: 'paid' },
+        expected:
+          'seats.impl: model "x/y:FREE" looks free but costClass is "paid"; declare it free or remove it',
+      },
+      {
+        seat: { id: 'impl', model: 'x/y-Free', costClass: 'plan-quota' },
+        expected:
+          'seats.impl: model "x/y-Free" looks free but costClass is "plan-quota"; declare it free or remove it',
+      },
     ];
     for (const { seat: seatOverrides, expected } of cases) {
       const file = writeV2({

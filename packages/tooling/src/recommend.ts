@@ -11,7 +11,7 @@
  *   working free or plan-quota seat, so an input with no free or plan-quota
  *   implementer seat yields no catalogue at all. With `policy.useFreeSeats`
  *   false, free and free-looking candidates are skipped with a reason and a
- *   paid seat may lead.
+ *   paid seat may lead. Absent or true changes nothing.
  * - Reviewer and high-risk reviewer: the strongest seat whose model family
  *   is absent from the implementer chain (the same strongest seat holds both
  *   reviewer roles). Strength comes from the ordered table below.
@@ -34,8 +34,7 @@
  * must not be the only seat of a role, and no seat holding a reviewer role
  * may share a model family with the implementer chain. Both are enforced by
  * the validator; the selection below never builds a chain that violates
- * them, and refuses the catalogue when no valid assignment exists. Absent
- * or true changes nothing.
+ * them, and refuses the catalogue when no valid assignment exists.
  */
 
 import {

@@ -529,6 +529,29 @@ describe('recommendSeats', () => {
       expect(looksFreeSkips).toHaveLength(2);
     });
 
+    it('skips a model ending -free and a variant ending -free, both declared paid', () => {
+      const result = expectValidCatalogue({
+        tools,
+        models: {
+          opencode: [
+            model('openrouter/poolside/laguna-s-2.1-free', 'paid'),
+            model('openrouter/minimax/minimax-m3', 'paid', 'fast-free'),
+            model('openrouter/z-ai/glm-5.3-flash', 'paid'),
+          ],
+          grok: [model('grok-4.7')],
+        },
+        policy: { useFreeSeats: false },
+      });
+      expect(result.chains.implementer?.map((step) => step.seatId)).toEqual([
+        'opencode-openrouter-z-ai-glm-5.3-flash',
+      ]);
+      expect(result.chains.reviewer?.map((step) => step.seatId)).toEqual(['grok-grok-4.7']);
+      const looksFreeSkips = result.skipped.filter((skip) => skip.includes('looks free'));
+      expect(looksFreeSkips).toHaveLength(2);
+      expect(looksFreeSkips.join(' ')).toContain('laguna-s-2.1-free');
+      expect(looksFreeSkips.join(' ')).toContain('minimax-m3');
+    });
+
     it('explicit true equals absent', () => {
       const withTrue = recommendSeats({
         tools,

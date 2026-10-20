@@ -85,6 +85,11 @@ export interface EvidenceAssessmentRecord {
    * reference every review receipt is checked against.
    */
   readonly implementerModel: string;
+  /**
+   * The reviewer the last request-review named; a recorded review receipt must
+   * name the same model. Absent when no review was requested.
+   */
+  readonly requestedReviewerModel?: string;
   readonly requiredChecks: readonly string[];
   readonly state: AssessmentStateValue;
   /**

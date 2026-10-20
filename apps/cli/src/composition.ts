@@ -72,6 +72,7 @@ import {
   AttemptOwnerDecisionAdapter,
   EvidenceArchiveAdapter,
   EvidenceAssessmentRepositoryAdapter,
+  EvidenceSeatPolicyAdapter,
   ForgeEvidenceAdapter,
   IndependentReviewAdapter,
   InspectAcceptanceEvidenceUseCase,
@@ -799,6 +800,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   });
   // No independent review transport is configured; requests report that.
   const independentReview = new IndependentReviewAdapter();
+  // Free-seat flag (F5): a structural subset of the derived model; absent
+  // installation or flag means allowed.
+  const seatPolicy = new EvidenceSeatPolicyAdapter({
+    useFreeSeats: installationModel?.policy?.useFreeSeats,
+    seats: installationModel?.seats,
+  });
   // Instantiated for the station that binds a live forge transport. With
   // forge mode `github` (D6) it is bound to AssessHeadAcceptanceUseCase with
   // the installation's owner/repo; with mode `none` acceptance is
@@ -886,11 +893,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       repo: evidenceAssessmentRepository,
       reviewer: independentReview,
       archive: evidenceArchive,
+      seatPolicy,
     }),
     recordVerificationReceipt: new RecordVerificationReceiptUseCase({
       repo: evidenceAssessmentRepository,
     }),
-    recordReviewReceipt: new RecordReviewReceiptUseCase({ repo: evidenceAssessmentRepository }),
+    recordReviewReceipt: new RecordReviewReceiptUseCase({
+      repo: evidenceAssessmentRepository,
+      seatPolicy,
+    }),
     recordFindingDisposition: new RecordFindingDispositionUseCase({
       repo: evidenceAssessmentRepository,
     }),

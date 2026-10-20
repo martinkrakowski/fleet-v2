@@ -89,8 +89,19 @@ function seatSteps(chains: ChainsSection | undefined, role: SeatRole): readonly 
  * chain; a seat holding implementer and a reviewer role is refused; a free
  * seat is never the only seat of a role; forbidden routes refuse matching
  * seats; the per-lane cost ceiling is a positive number when present.
+ *
+ * `fileChains` are the chains as the installation file writes them. The two
+ * reference rules report the positions of the chains they iterate, so the
+ * loader hands the file chains in whenever the derived chains differ from
+ * the file (`useFreeSeats` false drops free seats, FS1): the errors then
+ * name the file's positions, and every other rule keeps running on the
+ * derived chains. Without the parameter the derived chains are checked, as
+ * before, and each reference error is still reported once.
  */
-export function validateSeatPolicy(installation: FleetInstallationModel): string[] {
+export function validateSeatPolicy(
+  installation: FleetInstallationModel,
+  fileChains?: ChainsSection,
+): string[] {
   const errors: string[] = [];
   const seats = installation.seats ?? [];
   const chains = installation.chains;
@@ -120,8 +131,22 @@ export function validateSeatPolicy(installation: FleetInstallationModel): string
 
   const chainSeatIds = new Map<SeatRole, string[]>();
   for (const role of CHAIN_ROLES) {
-    const steps = seatSteps(chains, role);
     const ids: string[] = [];
+    for (const step of seatSteps(chains, role)) {
+      if (seatsById.has(step.seatId)) {
+        ids.push(step.seatId);
+      }
+    }
+    chainSeatIds.set(role, ids);
+  }
+
+  // The two reference rules report the positions of the chains they
+  // iterate: the file chains when they are handed in (the flag is off, so
+  // the derived chains lost their free seats), the derived chains
+  // otherwise. One iteration over one chain set keeps every reference
+  // error singular.
+  for (const role of CHAIN_ROLES) {
+    const steps = seatSteps(fileChains ?? chains, role);
     for (let index = 0; index < steps.length; index += 1) {
       const step = steps[index];
       const seat = seatsById.get(step.seatId);
@@ -134,9 +159,7 @@ export function validateSeatPolicy(installation: FleetInstallationModel): string
           `chains.${role}[${index}]: seat "${step.seatId}" does not hold the role "${role}"`,
         );
       }
-      ids.push(step.seatId);
     }
-    chainSeatIds.set(role, ids);
   }
 
   // A free seat is never the only seat of a role.
@@ -147,6 +170,29 @@ export function validateSeatPolicy(installation: FleetInstallationModel): string
       if (seat !== undefined && seat.costClass === 'free') {
         errors.push(
           `chains.${role}: the free seat "${seat.id}" must not be the only seat of the role`,
+        );
+      }
+    }
+  }
+
+  // With the flag off, a seat that looks free but is declared paid or
+  // plan-quota is refused: the declaration is the source of truth, and the
+  // pattern is a backstop against a mislabelled seat surviving (F2).
+  if (policy?.useFreeSeats === false) {
+    for (const seat of seats) {
+      if (seat.costClass !== 'paid' && seat.costClass !== 'plan-quota') {
+        continue;
+      }
+      const variant = seat.variant;
+      const variantLooksFree =
+        variant !== undefined &&
+        (variant.toLowerCase() === 'free' || variant.toLowerCase().endsWith('-free'));
+      const modelLooksFree =
+        seat.model.toLowerCase().endsWith(':free') || seat.model.toLowerCase().endsWith('-free');
+      if (modelLooksFree || variantLooksFree) {
+        const variantPart = variantLooksFree ? ` variant "${variant}"` : '';
+        errors.push(
+          `seats.${seat.id}: model "${seat.model}"${variantPart} looks free but costClass is "${seat.costClass}"; declare it free or remove it`,
         );
       }
     }

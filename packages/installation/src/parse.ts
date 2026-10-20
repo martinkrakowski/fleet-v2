@@ -135,6 +135,7 @@ const CHAIN_STEP_KEYS: readonly string[] = ['seatId', 'triggers'];
 const POLICY_KEYS: readonly string[] = [
   'forbiddenRoutes',
   'perLaneCostCeiling',
+  'useFreeSeats',
 ];
 const FORBIDDEN_ROUTE_KEYS: readonly string[] = ['tool', 'modelPattern'];
 const GIT_SHELF_KEYS: readonly string[] = [
@@ -1542,9 +1543,19 @@ function parseV2Policy(
       perLaneCostCeiling = ceiling;
     }
   }
+  let useFreeSeats: boolean | undefined;
+  if (Object.hasOwn(section, 'useFreeSeats')) {
+    const value = section.useFreeSeats;
+    if (typeof value !== 'boolean') {
+      errors.push('policy.useFreeSeats: must be a boolean');
+    } else {
+      useFreeSeats = value;
+    }
+  }
   return {
     ...(forbiddenRoutes !== undefined ? { forbiddenRoutes } : {}),
     ...(perLaneCostCeiling !== undefined ? { perLaneCostCeiling } : {}),
+    ...(useFreeSeats !== undefined ? { useFreeSeats } : {}),
   };
 }
 

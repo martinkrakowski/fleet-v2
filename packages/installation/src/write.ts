@@ -165,6 +165,9 @@ function serializePolicy(policy: PolicySection): Record<string, unknown> {
   if (policy.perLaneCostCeiling !== undefined) {
     out.perLaneCostCeiling = policy.perLaneCostCeiling;
   }
+  if (policy.useFreeSeats !== undefined) {
+    out.useFreeSeats = policy.useFreeSeats;
+  }
   return out;
 }
 

@@ -217,9 +217,12 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
     errors.push(...merged.errors);
     installation = merged.installation;
   }
-  const { model, warnings } = deriveInstallationModel(installation);
+  const { model, warnings, errors: modelErrors } = deriveInstallationModel(installation);
   if (installation.schemaVersion === 2) {
-    errors.push(...validateSeatPolicy(model));
+    errors.push(...(modelErrors ?? []));
+    // The file chains go along so the reference rules report file
+    // positions when useFreeSeats false reduced the derived chains (FS1).
+    errors.push(...validateSeatPolicy(model, installation.chains));
   } else {
     // v1 files get no new refusals: their single runner/reviewer pair is
     // checked only for the family rule and reported as a warning.

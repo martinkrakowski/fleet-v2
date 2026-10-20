@@ -73,6 +73,9 @@ function detectionExecutor(cwd: string): DoctorCommandExecutor {
     "opencode --version": { exitCode: 0, stdout: "1.0.0\n" },
     "claude --version": { exitCode: 0, stdout: "1.0.0\n" },
     "claude auth status": { exitCode: 0, stdout: "signed in as someone\n" },
+    "grok --version": { exitCode: 0, stdout: "1.0.0\n" },
+    "grok auth status": { exitCode: 0, stdout: "signed in as someone\n" },
+    "grok models": { exitCode: 0, stdout: "Available models:\ngrok-4.7\n" },
   };
   return {
     async run(argv) {
@@ -157,6 +160,33 @@ const EXAMPLE_COMMAND = [
 ];
 
 describe("fleet-v2 init", () => {
+  it("golden: init --recommend output is unchanged apart from the flag line", async () => {
+    const directory = makeTempDir();
+    const result = await runInit(
+      [
+        "--profile",
+        "single",
+        "--tools",
+        "claude,grok",
+        "--recommend",
+        "--isolation",
+        "none",
+        "--forge",
+        "none",
+      ],
+      directory,
+    );
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const normalised = result.stdout.split(directory).join("<dir>");
+    const lines = normalised.split("\n");
+    const withoutFlag = lines.filter((line) => !line.startsWith("  free seats ")).join("\n");
+    expect(withoutFlag).toMatchSnapshot();
+    expect(
+      lines.filter((line) => line.startsWith("  free seats ")),
+    ).toEqual(["  free seats on (policy.useFreeSeats absent; absent means true)"]);
+  });
+
   it("the section 5 example command writes a file that loads, with the isolation block as specified", async () => {
     const directory = makeTempDir();
     const result = await runInit(EXAMPLE_COMMAND, directory);
@@ -181,6 +211,9 @@ describe("fleet-v2 init", () => {
     expect(result.stdout).toContain(
       "dispatch will refuse until the declaration changes",
     );
+    // Absent --no-free-seats writes no policy section (absent means true).
+    const text = readFileSync(file, "utf8");
+    expect(text).not.toContain("useFreeSeats");
   });
 
   it("refuses to overwrite an existing file without --force, and the bytes are unchanged", async () => {
@@ -488,5 +521,64 @@ describe("fleet-v2 init", () => {
     );
     expect(badWorktree.code).toBe(2);
     expect(badWorktree.stderr).toContain("a string 'worktreeRoot'");
+  });
+
+  it("--no-free-seats writes policy.useFreeSeats false and prints the flag line", async () => {
+    const directory = makeTempDir();
+    const result = await runInit(
+      [
+        "--profile",
+        "single",
+        "--tools",
+        "claude,grok",
+        "--recommend",
+        "--no-free-seats",
+        "--isolation",
+        "none",
+        "--forge",
+        "none",
+        "--yes",
+      ],
+      directory,
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("  free seats off (policy.useFreeSeats false)");
+    const file = path.join(directory, "installation", "fleet.json");
+    const written = JSON.parse(readFileSync(file, "utf8")) as {
+      policy?: { useFreeSeats?: boolean };
+    };
+    expect(written.policy?.useFreeSeats).toBe(false);
+  });
+
+  it("rejects --no-free-seats=1 with exit 2", async () => {
+    const directory = makeTempDir();
+    const result = await runInit(
+      [...EXAMPLE_COMMAND.slice(0, -1), "--no-free-seats=1"],
+      directory,
+    );
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain("--no-free-seats takes no value");
+  });
+
+  it("refuses --no-free-seats on a schema version 1 installation, bytes unchanged", async () => {
+    const directory = makeTempDir();
+    const file = path.join(directory, "installation", "fleet.json");
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, '{"schemaVersion": 1}\n', "utf8");
+    const before = readFileSync(file, "utf8");
+    const result = await runInit(
+      [...EXAMPLE_COMMAND, "--force", "--no-free-seats"],
+      directory,
+    );
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("migrate to v2");
+    expect(readFileSync(file, "utf8")).toBe(before);
+  });
+
+  it("--help lists --no-free-seats", async () => {
+    const directory = makeTempDir();
+    const result = await runInit(["--help"], directory);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("--no-free-seats");
   });
 });

@@ -53,6 +53,31 @@ describe('recommendSeats', () => {
     expect(result.version).toBe('1');
   });
 
+  it('golden: the default output is unchanged by FS2', () => {
+    const onlyFree = recommendSeats({
+      tools: [tool('opencode'), tool('grok')],
+      models: {
+        opencode: [model('nvidia/z-ai/glm-5.3', 'free'), model('glm-5.3-flash', 'free')],
+        grok: [model('grok-4.7-fast', 'free'), model('grok-code-fast-4.7', 'free')],
+      },
+      policy: NO_POLICY,
+    });
+    expect(onlyFree).toMatchSnapshot();
+
+    const freePlusPaid = recommendSeats({
+      tools: [tool('opencode'), tool('grok')],
+      models: {
+        opencode: [
+          model('openrouter/z-ai/glm-5.3-flash', 'paid'),
+          model('nvidia/z-ai/glm-5.3', 'free'),
+        ],
+        grok: [model('grok-4.7')],
+      },
+      policy: NO_POLICY,
+    });
+    expect(freePlusPaid).toMatchSnapshot();
+  });
+
   describe('table: only free seats', () => {
     const tools = [tool('opencode'), tool('grok')];
     const models: ModelsByTool = {
@@ -419,6 +444,111 @@ describe('recommendSeats', () => {
         allAgyHostsFull: false,
       });
       expect(explicitFalse).toEqual(omitted);
+    });
+  });
+
+  describe('table: policy.useFreeSeats false', () => {
+    const tools = [tool('opencode'), tool('grok')];
+    const freePlusPaidModels: ModelsByTool = {
+      opencode: [
+        model('openrouter/z-ai/glm-5.3-flash', 'paid'),
+        model('nvidia/z-ai/glm-5.3', 'free'),
+      ],
+      grok: [model('grok-4.7')],
+    };
+    const onlyFreeModels: ModelsByTool = {
+      opencode: [model('nvidia/z-ai/glm-5.3', 'free'), model('glm-5.3-flash', 'free')],
+      grok: [model('grok-4.7-fast', 'free'), model('grok-code-fast-4.7', 'free')],
+    };
+
+    it('skips free seats, lets a paid seat lead, and keeps the paid-free chain', () => {
+      const result = expectValidCatalogue({
+        tools,
+        models: freePlusPaidModels,
+        policy: { useFreeSeats: false },
+      });
+      expect(result.chains.implementer?.map((step) => step.seatId)).toEqual([
+        'opencode-openrouter-z-ai-glm-5.3-flash',
+      ]);
+      expect(result.chains.reviewer?.map((step) => step.seatId)).toEqual(['grok-grok-4.7']);
+      expect(result.seats.some((seat) => seat.costClass === 'free')).toBe(false);
+      expect(result.skipped.join(' ')).toContain('nvidia/z-ai/glm-5.3');
+      expect(result.skipped.join(' ')).toContain('policy.useFreeSeats is false');
+      expect(result.reasons['opencode-openrouter-z-ai-glm-5.3-flash']).toContain(
+        'a paid seat may lead',
+      );
+    });
+
+    it('lets paid-only implementers through when the flag is false', () => {
+      const result = expectValidCatalogue({
+        tools,
+        models: {
+          opencode: [model('openrouter/z-ai/glm-5.3-flash', 'paid')],
+          grok: [model('grok-4.7')],
+        },
+        policy: { useFreeSeats: false },
+      });
+      expect(result.chains.implementer?.map((step) => step.seatId)).toEqual([
+        'opencode-openrouter-z-ai-glm-5.3-flash',
+      ]);
+    });
+
+    it('refuses the catalogue when every implementer is free', () => {
+      const result = recommendSeats({
+        tools,
+        models: onlyFreeModels,
+        policy: { useFreeSeats: false },
+      });
+      expect(result.outcome).toBe('no-valid-catalogue');
+      if (result.outcome === 'no-valid-catalogue') {
+        expect(result.reasons.join(' ')).toContain('no implementer seat');
+        expect(result.skipped).toHaveLength(4);
+        for (const skip of result.skipped) {
+          expect(skip).toContain('it is a free seat and policy.useFreeSeats is false');
+        }
+      }
+    });
+
+    it('skips mislabelled free-looking seats while keeping the paid one', () => {
+      const result = expectValidCatalogue({
+        tools,
+        models: {
+          opencode: [
+            model('openrouter/poolside/laguna-s-2.1:free', 'paid'),
+            model('openrouter/minimax/minimax-m3', 'paid', 'FREE'),
+            model('openrouter/z-ai/glm-5.3-flash', 'paid'),
+          ],
+          grok: [model('grok-4.7')],
+        },
+        policy: { useFreeSeats: false },
+      });
+      expect(result.chains.implementer?.map((step) => step.seatId)).toEqual([
+        'opencode-openrouter-z-ai-glm-5.3-flash',
+      ]);
+      const looksFreeSkips = result.skipped.filter((skip) => skip.includes('looks free'));
+      expect(looksFreeSkips).toHaveLength(2);
+    });
+
+    it('explicit true equals absent', () => {
+      const withTrue = recommendSeats({
+        tools,
+        models: onlyFreeModels,
+        policy: { useFreeSeats: true },
+      });
+      const withAbsent = recommendSeats({ tools, models: onlyFreeModels, policy: NO_POLICY });
+      expect(withTrue).toEqual(withAbsent);
+
+      const withTruePaid = recommendSeats({
+        tools,
+        models: freePlusPaidModels,
+        policy: { useFreeSeats: true },
+      });
+      const withAbsentPaid = recommendSeats({
+        tools,
+        models: freePlusPaidModels,
+        policy: NO_POLICY,
+      });
+      expect(withTruePaid).toEqual(withAbsentPaid);
     });
   });
 

@@ -9,7 +9,9 @@
  *   edit-only (a read-only tool can only review). Free and plan-quota seats
  *   come first, then paid seats; a paid seat is proposed only after a
  *   working free or plan-quota seat, so an input with no free or plan-quota
- *   implementer seat yields no catalogue at all.
+ *   implementer seat yields no catalogue at all. With `policy.useFreeSeats`
+ *   false, free and free-looking candidates are skipped with a reason and a
+ *   paid seat may lead.
  * - Reviewer and high-risk reviewer: the strongest seat whose model family
  *   is absent from the implementer chain (the same strongest seat holds both
  *   reviewer roles). Strength comes from the ordered table below.
@@ -32,7 +34,8 @@
  * must not be the only seat of a role, and no seat holding a reviewer role
  * may share a model family with the implementer chain. Both are enforced by
  * the validator; the selection below never builds a chain that violates
- * them, and refuses the catalogue when no valid assignment exists.
+ * them, and refuses the catalogue when no valid assignment exists. Absent
+ * or true changes nothing.
  */
 
 import {
@@ -225,6 +228,16 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(`^${source}$`, 'i');
 }
 
+/** True when a model id or variant looks free (the F2 backstop pattern). */
+function looksFree(modelId: string, variant: string | undefined): boolean {
+  return (
+    modelId.toLowerCase().endsWith(':free') ||
+    modelId.toLowerCase().endsWith('-free') ||
+    (variant !== undefined &&
+      (variant.toLowerCase() === 'free' || variant.toLowerCase().endsWith('-free')))
+  );
+}
+
 /**
  * Resolve one model entry onto a candidate. `undefined` marks a model the
  * recommender must skip; the returned reason says why.
@@ -386,6 +399,7 @@ export function recommendSeats(input: {
   const skipped: string[] = [];
   const tierSeenOrder = new Map<string, number>();
   const agyMode = agySeatMode(input.allAgyHostsFull === true);
+  const freeSeatsOff = input.policy.useFreeSeats === false;
 
   // Usable candidates, per tool, in input order. Tools whose sign-in could
   // not be confirmed and model lists reported `unknown` are skipped.
@@ -464,11 +478,29 @@ export function recommendSeats(input: {
     allowed.push(candidate);
   }
 
+  // With policy.useFreeSeats false, free and free-looking candidates are
+  // skipped with a reason before any ranking or role selection, so a paid
+  // seat may lead the implementer chain.
+  const eligible: Candidate[] = [];
+  for (const candidate of allowed) {
+    if (freeSeatsOff && candidate.costClass === 'free') {
+      skipped.push(
+        `model ${candidate.modelId} on ${candidate.displayName} skipped: it is a free seat and policy.useFreeSeats is false`,
+      );
+    } else if (freeSeatsOff && looksFree(candidate.modelId, candidate.variant)) {
+      skipped.push(
+        `model ${candidate.modelId} on ${candidate.displayName} skipped: its model or variant looks free but its cost class is "${candidate.costClass}", and policy.useFreeSeats is false`,
+      );
+    } else {
+      eligible.push(candidate);
+    }
+  }
+
   // Implementer candidates: tools that can run commands, plus edit-only
   // tools whose checks and commits the orchestrator runs. A read-only tool
   // can only review. An agy seat's capabilities follow its mode (D7):
   // edit-only by default, `full` only when every agy lane-runner host is.
-  const implementerCandidates = allowed.filter((candidate) => {
+  const implementerCandidates = eligible.filter((candidate) => {
     const descriptor = BUILT_IN_TOOLS.find((entry) => entry.id === candidate.tool);
     if (descriptor === undefined) {
       return false;
@@ -484,7 +516,7 @@ export function recommendSeats(input: {
   const paidImplementers = implementerCandidates.filter(
     (candidate) => COST_RANK[candidate.costClass] === COST_RANK.paid,
   );
-  if (freeOrPlan.length === 0 && paidImplementers.length > 0) {
+  if (!freeSeatsOff && freeOrPlan.length === 0 && paidImplementers.length > 0) {
     return {
       version: RECOMMENDER_VERSION,
       outcome: 'no-valid-catalogue',
@@ -512,7 +544,7 @@ export function recommendSeats(input: {
   // Reviewer candidates: every usable seat whose family is absent from the
   // implementer chain (read-only tools can review; so can every other tool).
   const implementerFamilies = new Set(implementerOrdered.map((candidate) => candidate.family));
-  const reviewerCandidates = allowed.filter((candidate) => !implementerFamilies.has(candidate.family));
+  const reviewerCandidates = eligible.filter((candidate) => !implementerFamilies.has(candidate.family));
   const reviewerPick = pickReviewers(reviewerCandidates);
   if (implementerOrdered.length === 0 || reviewerPick === undefined) {
     const reasons: string[] = [];
@@ -548,7 +580,9 @@ export function recommendSeats(input: {
     });
     reasons[id] =
       candidate.costClass === 'paid'
-        ? `implementer: paid seat on ${candidate.displayName} (${candidate.modelId}); paid only after the free or plan-quota seats${modeClause(candidate.tool, agyMode)}`
+        ? freeSeatsOff
+          ? `implementer: paid seat on ${candidate.displayName} (${candidate.modelId}); policy.useFreeSeats is false, so no free seat is proposed and a paid seat may lead${modeClause(candidate.tool, agyMode)}`
+          : `implementer: paid seat on ${candidate.displayName} (${candidate.modelId}); paid only after the free or plan-quota seats${modeClause(candidate.tool, agyMode)}`
         : `implementer: ${candidate.costClass} seat on ${candidate.displayName} (${candidate.modelId}); free and plan-quota seats come first${modeClause(candidate.tool, agyMode)}`;
     implementerSteps.push({ seatId: id });
   }

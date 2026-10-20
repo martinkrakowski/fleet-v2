@@ -9,7 +9,10 @@ import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import { ReviewReceipt, isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
-import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
+import {
+  EvidenceAssessmentRevisionConflictError,
+  type EvidenceAssessmentRepositoryPort,
+} from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { EvidenceArchivePort } from '../ports/out/EvidenceArchivePort.out-port.js';
 import type { IndependentReviewPort } from '../ports/out/IndependentReviewPort.out-port.js';
 import type { EvidenceSeatPolicyPort } from '../ports/out/EvidenceSeatPolicyPort.out-port.js';
@@ -147,12 +150,19 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       diffSummary: request.diffSummary,
     });
     if (run.outcome === 'unavailable') {
-      await deps.repo.saveAssessment({
-        ...existing,
-        requestedReviewerModel: request.reviewerModel,
-        revision: existing.revision + 1,
-        updatedAtIso: nowIso,
-      });
+      try {
+        await deps.repo.saveAssessment({
+          ...existing,
+          requestedReviewerModel: request.reviewerModel.trim(),
+          revision: existing.revision + 1,
+          updatedAtIso: nowIso,
+        });
+      } catch (error) {
+        if (error instanceof EvidenceAssessmentRevisionConflictError) {
+          return { outcome: 'rejected', reason: run.reason };
+        }
+        throw error;
+      }
       return { outcome: 'rejected', reason: run.reason };
     }
     if (!run.readOnlyVerified) {
@@ -194,7 +204,7 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
 
     const assessment = EvidenceAssessment.fromRecord({
       ...existing,
-      requestedReviewerModel: request.reviewerModel,
+      requestedReviewerModel: request.reviewerModel.trim(),
     });
     assessment.appendReviewReceipt(receipt, nowIso);
     const merged = assessment.toRecord();

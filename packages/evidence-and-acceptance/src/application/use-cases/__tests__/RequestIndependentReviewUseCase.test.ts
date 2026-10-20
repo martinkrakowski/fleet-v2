@@ -6,7 +6,10 @@ import type {
   ArchiveEvidenceResult,
   EvidenceArchivePort,
 } from '../../ports/out/EvidenceArchivePort.out-port.js';
-import type { EvidenceAssessmentRepositoryPort } from '../../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
+import {
+  EvidenceAssessmentRevisionConflictError,
+  type EvidenceAssessmentRepositoryPort,
+} from '../../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type {
   IndependentReviewPort,
   RunIndependentReviewRequest,
@@ -47,6 +50,17 @@ class InMemoryAssessmentRepo implements EvidenceAssessmentRepositoryPort {
       }
     }
     return null;
+  }
+}
+
+/** A repository whose save is refused as a lost race (stale revision). */
+class RevisionConflictOnSaveRepo extends InMemoryAssessmentRepo {
+  async saveAssessment(record: EvidenceAssessmentRecord): Promise<void> {
+    throw new EvidenceAssessmentRevisionConflictError(
+      record.id,
+      record.revision,
+      'store revision moved under the writer',
+    );
   }
 }
 
@@ -276,5 +290,52 @@ describe('free-seat policy and requested reviewer (FS3b)', () => {
     const stored = await repo.findAssessmentById('asm-1');
     expect(stored?.requestedReviewerModel).toBe('openai/gpt-4o');
     expect(stored?.revision).toBe(1);
+  });
+
+  it('stores the requested reviewer trimmed when the request carries whitespace', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const reviewer = new StubReviewer();
+    const archive = new StubArchive();
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });
+
+    const result = await useCase.requestIndependentReview({
+      assessmentId: 'asm-1',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      reviewerModel: ' openai/gpt-4o ',
+    });
+
+    expect(result.outcome).toBe('reviewed');
+    const stored = await repo.findAssessmentById('asm-1');
+    expect(stored?.requestedReviewerModel).toBe('openai/gpt-4o');
+  });
+
+  it('returns the rejection, not a throw, when the unavailable-path save hits a revision conflict', async () => {
+    const repo = new RevisionConflictOnSaveRepo([sampleRecord()]);
+    const reviewer = new StubReviewer();
+    reviewer.runIndependentReview = async () => ({
+      outcome: 'unavailable',
+      reason: 'seat is busy',
+    });
+    const archive = new StubArchive();
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });
+
+    const result = await useCase.requestIndependentReview({
+      assessmentId: 'asm-1',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      reviewerModel: 'openai/gpt-4o',
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.reason).toBe('seat is busy');
+    }
   });
 });

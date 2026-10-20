@@ -422,6 +422,105 @@ describe("buildInitPlan", () => {
     expect(result.plan.candidate.chains).toBeDefined();
   });
 
+  it("golden: the default plan text and recommendation are unchanged by FS2", async () => {
+    const detection = await fullDetection(["claude-code", "grok"], {
+      "claude --version": { exitCode: 0, stdout: "1.0.0" },
+      "claude auth status": { exitCode: 0, stdout: "signed in as someone" },
+      "grok --version": { exitCode: 0, stdout: "1.0.0" },
+      "grok auth status": { exitCode: 0, stdout: "signed in as someone" },
+      "grok models": { exitCode: 0, stdout: "Available models:\ngrok-4.7\n" },
+    });
+    const result = buildInitPlan(baseAnswers({ recommend: true }), detection);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.plan.recommendation?.outcome).toBe("catalogue");
+    expect(result.plan.text).toMatchSnapshot();
+    expect(result.plan.recommendation).toMatchSnapshot();
+  });
+
+  it("useFreeSeats false writes policy.useFreeSeats false and recommends without free seats", async () => {
+    const detection = await fullDetection(["claude-code", "grok"], {
+      "claude --version": { exitCode: 0, stdout: "1.0.0" },
+      "claude auth status": { exitCode: 0, stdout: "signed in as someone" },
+      "grok --version": { exitCode: 0, stdout: "1.0.0" },
+      "grok auth status": { exitCode: 0, stdout: "signed in as someone" },
+      "grok models": { exitCode: 0, stdout: "Available models:\ngrok-4.7\n" },
+    });
+    const result = buildInitPlan(
+      baseAnswers({ recommend: true, useFreeSeats: false }),
+      detection,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.plan.useFreeSeats).toBe(false);
+    expect(result.plan.candidate.policy).toEqual({ useFreeSeats: false });
+    expect(result.plan.text).toContain('"useFreeSeats": false');
+    expect(result.plan.recommendation?.outcome).toBe("catalogue");
+    const parsed = parseInstallation(result.plan.candidate);
+    expect(parsed.ok).toBe(true);
+  });
+
+  it("absent useFreeSeats keeps the default: no policy section and useFreeSeats true", async () => {
+    const detection = await fullDetection(["claude-code", "grok"], {
+      "claude --version": { exitCode: 0, stdout: "1.0.0" },
+      "claude auth status": { exitCode: 0, stdout: "signed in as someone" },
+      "grok --version": { exitCode: 0, stdout: "1.0.0" },
+      "grok auth status": { exitCode: 0, stdout: "signed in as someone" },
+      "grok models": { exitCode: 0, stdout: "Available models:\ngrok-4.7\n" },
+    });
+    const result = buildInitPlan(baseAnswers({ recommend: true }), detection);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.plan.useFreeSeats).toBe(true);
+    expect(result.plan.candidate.policy).toBeUndefined();
+    expect(result.plan.text).not.toContain("useFreeSeats");
+  });
+
+  it("the free-seat flag reaches the recommender: a free-looking model is skipped when false and proposed when absent", async () => {
+    // Detection cannot attach a cost class to a model: cost is derived from
+    // the tool descriptor (no built-in tool is free-tier), so a genuinely
+    // free seat cannot flow through init today. The smallest detection that
+    // makes the flag observable is a paid model whose id ends "-free": with
+    // useFreeSeats false the recommender skips it (the F2 backstop), and
+    // without the flag it is proposed. This test fails if `useFreeSeats`
+    // never reaches the recommender.
+    const detection = await fullDetection(["claude-code", "grok"], {
+      "claude --version": { exitCode: 0, stdout: "1.0.0" },
+      "claude auth status": { exitCode: 0, stdout: "signed in as someone" },
+      "grok --version": { exitCode: 0, stdout: "1.0.0" },
+      "grok auth status": { exitCode: 0, stdout: "signed in as someone" },
+      "grok models": { exitCode: 0, stdout: "Available models:\ngrok-4.7-free\n" },
+    });
+
+    // Flag absent: the free-looking model is proposed (the grok reviewer).
+    const proposed = buildInitPlan(baseAnswers({ recommend: true }), detection);
+    expect(proposed.ok).toBe(true);
+    if (!proposed.ok) return;
+    expect(proposed.plan.recommendation?.outcome).toBe("catalogue");
+    if (proposed.plan.recommendation?.outcome === "catalogue") {
+      expect(proposed.plan.recommendation.seats.map((seat) => seat.id)).toContain(
+        "grok-grok-4.7-free",
+      );
+    }
+
+    // Flag false: the same model is skipped with a reason and never proposed;
+    // with no disjoint reviewer left no catalogue is built.
+    const blocked = buildInitPlan(
+      baseAnswers({ recommend: true, useFreeSeats: false }),
+      detection,
+    );
+    expect(blocked.ok).toBe(true);
+    if (!blocked.ok) return;
+    const recommendation = blocked.plan.recommendation;
+    expect(recommendation?.outcome).toBe("no-valid-catalogue");
+    if (recommendation?.outcome === "no-valid-catalogue") {
+      expect(recommendation.skipped.join(" ")).toContain("grok-4.7-free");
+      expect(recommendation.skipped.join(" ")).toContain(
+        "policy.useFreeSeats is false",
+      );
+    }
+  });
+
   it("reports a recommender refusal without refusing the plan (seats can come later)", async () => {
     const detection = await fullDetection(["claude-code"], {
       "claude --version": { exitCode: 0, stdout: "1.0.0" },

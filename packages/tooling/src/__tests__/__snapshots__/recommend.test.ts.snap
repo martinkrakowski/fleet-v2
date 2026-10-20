@@ -1,0 +1,144 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`recommendSeats > golden: the default output is unchanged by FS2 1`] = `
+{
+  "chains": {
+    "high-risk-reviewer": [
+      {
+        "seatId": "grok-grok-4.7-fast",
+      },
+      {
+        "seatId": "grok-grok-code-fast-4.7",
+      },
+    ],
+    "implementer": [
+      {
+        "seatId": "opencode-nvidia-z-ai-glm-5.3",
+      },
+      {
+        "seatId": "opencode-glm-5.3-flash",
+      },
+    ],
+    "reviewer": [
+      {
+        "seatId": "grok-grok-4.7-fast",
+      },
+      {
+        "seatId": "grok-grok-code-fast-4.7",
+      },
+    ],
+  },
+  "outcome": "catalogue",
+  "reasons": {
+    "grok-grok-4.7-fast": "reviewer and high-risk reviewer: strongest seat (grok-4.7-fast on Grok CLI) whose model family is absent from the implementer chain",
+    "grok-grok-code-fast-4.7": "reviewer and high-risk reviewer: second seat (grok-code-fast-4.7 on Grok CLI) so the free seat is not the only seat of the role",
+    "opencode-glm-5.3-flash": "implementer: free seat on OpenCode (glm-5.3-flash); free and plan-quota seats come first",
+    "opencode-nvidia-z-ai-glm-5.3": "implementer: free seat on OpenCode (nvidia/z-ai/glm-5.3); free and plan-quota seats come first",
+  },
+  "seats": [
+    {
+      "costClass": "free",
+      "id": "opencode-nvidia-z-ai-glm-5.3",
+      "model": "nvidia/z-ai/glm-5.3",
+      "roles": [
+        "implementer",
+      ],
+      "tool": "opencode",
+    },
+    {
+      "costClass": "free",
+      "id": "opencode-glm-5.3-flash",
+      "model": "glm-5.3-flash",
+      "roles": [
+        "implementer",
+      ],
+      "tool": "opencode",
+    },
+    {
+      "costClass": "free",
+      "id": "grok-grok-4.7-fast",
+      "model": "grok-4.7-fast",
+      "roles": [
+        "reviewer",
+        "high-risk-reviewer",
+      ],
+      "tool": "grok",
+    },
+    {
+      "costClass": "free",
+      "id": "grok-grok-code-fast-4.7",
+      "model": "grok-code-fast-4.7",
+      "roles": [
+        "reviewer",
+        "high-risk-reviewer",
+      ],
+      "tool": "grok",
+    },
+  ],
+  "skipped": [],
+  "version": "1",
+}
+`;
+
+exports[`recommendSeats > golden: the default output is unchanged by FS2 2`] = `
+{
+  "chains": {
+    "high-risk-reviewer": [
+      {
+        "seatId": "grok-grok-4.7",
+      },
+    ],
+    "implementer": [
+      {
+        "seatId": "opencode-nvidia-z-ai-glm-5.3",
+      },
+      {
+        "seatId": "opencode-openrouter-z-ai-glm-5.3-flash",
+      },
+    ],
+    "reviewer": [
+      {
+        "seatId": "grok-grok-4.7",
+      },
+    ],
+  },
+  "outcome": "catalogue",
+  "reasons": {
+    "grok-grok-4.7": "reviewer and high-risk reviewer: strongest seat (grok-4.7 on Grok CLI) whose model family is absent from the implementer chain",
+    "opencode-nvidia-z-ai-glm-5.3": "implementer: free seat on OpenCode (nvidia/z-ai/glm-5.3); free and plan-quota seats come first",
+    "opencode-openrouter-z-ai-glm-5.3-flash": "implementer: paid seat on OpenCode (openrouter/z-ai/glm-5.3-flash); paid only after the free or plan-quota seats",
+  },
+  "seats": [
+    {
+      "costClass": "free",
+      "id": "opencode-nvidia-z-ai-glm-5.3",
+      "model": "nvidia/z-ai/glm-5.3",
+      "roles": [
+        "implementer",
+      ],
+      "tool": "opencode",
+    },
+    {
+      "costClass": "paid",
+      "id": "opencode-openrouter-z-ai-glm-5.3-flash",
+      "model": "openrouter/z-ai/glm-5.3-flash",
+      "roles": [
+        "implementer",
+      ],
+      "tool": "opencode",
+    },
+    {
+      "costClass": "paid",
+      "id": "grok-grok-4.7",
+      "model": "grok-4.7",
+      "roles": [
+        "reviewer",
+        "high-risk-reviewer",
+      ],
+      "tool": "grok",
+    },
+  ],
+  "skipped": [],
+  "version": "1",
+}
+`;

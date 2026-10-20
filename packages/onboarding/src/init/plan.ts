@@ -64,6 +64,11 @@ export interface InitAnswers {
   readonly tools: readonly string[];
   /** True when the seat recommender proposes the seats and chains. */
   readonly recommend: boolean;
+  /**
+   * `false` writes `policy.useFreeSeats: false` and the recommender proposes
+   * no free seat; absent writes no policy section (absent means true).
+   */
+  readonly useFreeSeats?: boolean;
   /** Operator-named seats, used verbatim when `recommend` is false. */
   readonly seats?: readonly SeatSection[];
   readonly isolation: InitIsolation;
@@ -120,6 +125,8 @@ export interface InitPlan {
   readonly requiredMissingTools: readonly string[];
   /** The recommender's outcome, when the answers asked for one. */
   readonly recommendation: SeatRecommendation | undefined;
+  /** The effective flag: false only when the answers say false. */
+  readonly useFreeSeats: boolean;
   /** The isolation warning, when the declaration is `none` (D5). */
   readonly isolationNote: string | undefined;
   /** The credential checklist (step 10): paths listed, never created. */
@@ -397,7 +404,7 @@ export function buildInitPlan(
         signIn: tool.signIn,
       })),
       models,
-      policy: {},
+      policy: answers.useFreeSeats === false ? { useFreeSeats: false } : {},
     });
     if (recommendation.outcome === "catalogue") {
       seats = recommendation.seats;
@@ -417,6 +424,7 @@ export function buildInitPlan(
     tools: [...answers.tools],
     ...(seats !== undefined ? { seats } : {}),
     ...(chains !== undefined ? { chains } : {}),
+    ...(answers.useFreeSeats === false ? { policy: { useFreeSeats: false } } : {}),
     ...(shelf !== undefined ? { shelf } : {}),
     forge,
     ...(answers.verification !== undefined
@@ -462,6 +470,7 @@ export function buildInitPlan(
       missingTools: missing,
       requiredMissingTools: requiredMissing,
       recommendation,
+      useFreeSeats: answers.useFreeSeats !== false,
       isolationNote:
         answers.isolation === "none"
           ? "isolation is 'none': dispatch will refuse until the declaration changes"

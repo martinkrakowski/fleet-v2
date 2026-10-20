@@ -1,0 +1,120 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`fleet-v2 init > golden: init --recommend output is unchanged apart from the flag line 1`] = `
+"installation plan
+  profile single  tools claude-code, grok
+  isolation none  forge none  shelf local
+  isolation is 'none': dispatch will refuse until the declaration changes
+seats
+  claude-code-claude-opus-4-5  claude-code claude-opus-4-5  implementer  plan-quota
+    implementer: plan-quota seat on Claude Code (claude-opus-4-5); free and plan-quota seats come first
+  claude-code-claude-sonnet-4-5  claude-code claude-sonnet-4-5  implementer  plan-quota
+    implementer: plan-quota seat on Claude Code (claude-sonnet-4-5); free and plan-quota seats come first
+  claude-code-claude-haiku-4-5  claude-code claude-haiku-4-5  implementer  plan-quota
+    implementer: plan-quota seat on Claude Code (claude-haiku-4-5); free and plan-quota seats come first
+  grok-grok-4.7  grok grok-4.7  reviewer, high-risk-reviewer  paid
+    reviewer and high-risk reviewer: strongest seat (grok-4.7 on Grok CLI) whose model family is absent from the implementer chain
+credential checklist (nothing is created)
+  no credential files are needed for the chosen features
+would write <dir>/installation/fleet.json:
+{
+  "schemaVersion": 2,
+  "hosts": {
+    "this-machine": {
+      "transport": "local",
+      "worktreeRoot": "<dir>/worktrees",
+      "tmpDir": "<dir>/worktrees/.tmp",
+      "roles": [
+        "orchestrator",
+        "lane-runner",
+        "verifier"
+      ],
+      "runner": {
+        "kind": "opencode",
+        "port": 46000,
+        "capabilities": {
+          "networkEgressRestricted": false,
+          "cpuAndMemoryLimited": false,
+          "processTreeTermination": false,
+          "filesystemScope": "inherited-directory"
+        },
+        "maxLanes": 1
+      }
+    }
+  },
+  "tools": [
+    "claude-code",
+    "grok"
+  ],
+  "seats": [
+    {
+      "id": "claude-code-claude-opus-4-5",
+      "tool": "claude-code",
+      "model": "claude-opus-4-5",
+      "roles": [
+        "implementer"
+      ],
+      "costClass": "plan-quota"
+    },
+    {
+      "id": "claude-code-claude-sonnet-4-5",
+      "tool": "claude-code",
+      "model": "claude-sonnet-4-5",
+      "roles": [
+        "implementer"
+      ],
+      "costClass": "plan-quota"
+    },
+    {
+      "id": "claude-code-claude-haiku-4-5",
+      "tool": "claude-code",
+      "model": "claude-haiku-4-5",
+      "roles": [
+        "implementer"
+      ],
+      "costClass": "plan-quota"
+    },
+    {
+      "id": "grok-grok-4.7",
+      "tool": "grok",
+      "model": "grok-4.7",
+      "roles": [
+        "reviewer",
+        "high-risk-reviewer"
+      ],
+      "costClass": "paid"
+    }
+  ],
+  "chains": {
+    "implementer": [
+      {
+        "seatId": "claude-code-claude-opus-4-5"
+      },
+      {
+        "seatId": "claude-code-claude-sonnet-4-5"
+      },
+      {
+        "seatId": "claude-code-claude-haiku-4-5"
+      }
+    ],
+    "reviewer": [
+      {
+        "seatId": "grok-grok-4.7"
+      }
+    ],
+    "high-risk-reviewer": [
+      {
+        "seatId": "grok-grok-4.7"
+      }
+    ]
+  },
+  "shelf": {
+    "provider": "local"
+  },
+  "forge": {
+    "mode": "none"
+  }
+}
+nothing was written (pass --yes to write)
+"
+`;

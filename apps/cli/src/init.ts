@@ -78,6 +78,9 @@ printed.
   --recommend                 let the seat recommender propose seats and
                               chains; a catalogue it cannot build is
                               reported, not fatal
+  --no-free-seats             write policy.useFreeSeats false: the
+                              recommender proposes no free seat and a
+                              paid seat may lead a chain (v2 only)
   --isolation none|container  the runner capability declaration (D4, D5):
                               none writes all three booleans false and
                               filesystemScope "inherited-directory";
@@ -141,6 +144,7 @@ const FLAG_ALIASES: Readonly<Record<string, string>> = {
 };
 const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   "recommend",
+  "no-free-seats",
   "yes",
   "force",
 ]);
@@ -350,6 +354,7 @@ function parseInitArgs(tokens: readonly string[]): ParsedInitArgs {
         profile,
         tools,
         recommend: booleans.has("recommend"),
+        ...(booleans.has("no-free-seats") ? { useFreeSeats: false } : {}),
         isolation,
         ...(forge === "github" && forgeRepo !== undefined ? { forgeRepo } : {}),
         forge,
@@ -451,6 +456,19 @@ export async function initCommand(
     );
     return 1;
   }
+  if (
+    answers.useFreeSeats === false &&
+    read.status === "read" &&
+    read.value !== null &&
+    typeof read.value === "object" &&
+    !Array.isArray(read.value) &&
+    (read.value as { schemaVersion?: unknown }).schemaVersion === 1
+  ) {
+    io.stderr(
+      `init --no-free-seats: ${file} is a schema version 1 installation; migrate to v2 first (policy.useFreeSeats exists only in v2); nothing was written\n`,
+    );
+    return 1;
+  }
   if (read.status === "read" && !force) {
     io.stderr(
       `refusing to overwrite an existing installation file (${file}); pass --force to replace it\n`,
@@ -475,6 +493,11 @@ export async function initCommand(
   );
   io.stdout(
     `  isolation ${answers.isolation}  forge ${answers.forge}  shelf ${answers.shelf}\n`,
+  );
+  io.stdout(
+    plan.plan.useFreeSeats
+      ? "  free seats on (policy.useFreeSeats absent; absent means true)\n"
+      : "  free seats off (policy.useFreeSeats false)\n",
   );
   for (const missing of plan.plan.missingTools) {
     io.stdout(

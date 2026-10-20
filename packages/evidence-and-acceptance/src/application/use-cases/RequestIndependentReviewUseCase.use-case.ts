@@ -9,9 +9,13 @@ import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import { ReviewReceipt, isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
-import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
+import {
+  EvidenceAssessmentRevisionConflictError,
+  type EvidenceAssessmentRepositoryPort,
+} from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { EvidenceArchivePort } from '../ports/out/EvidenceArchivePort.out-port.js';
 import type { IndependentReviewPort } from '../ports/out/IndependentReviewPort.out-port.js';
+import type { EvidenceSeatPolicyPort } from '../ports/out/EvidenceSeatPolicyPort.out-port.js';
 import type {
   RequestIndependentReviewPort,
   RequestIndependentReviewRequest,
@@ -22,6 +26,7 @@ export interface RequestIndependentReviewDependencies {
   readonly repo: EvidenceAssessmentRepositoryPort;
   readonly reviewer: IndependentReviewPort;
   readonly archive: EvidenceArchivePort;
+  readonly seatPolicy?: EvidenceSeatPolicyPort;
 }
 
 const NOT_IMPLEMENTED = 'Not implemented: RequestIndependentReviewUseCase';
@@ -89,6 +94,14 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
         reason: `Independent review requires a distinct underlying model: ${request.reviewerModel} and ${request.implementerModel} share the same underlying model`,
       };
     }
+    if (deps.seatPolicy) {
+      const check = await deps.seatPolicy.checkReviewerSeat({
+        reviewerModel: request.reviewerModel,
+      });
+      if (check.outcome === 'refused') {
+        return { outcome: 'rejected', reason: check.reason };
+      }
+    }
 
     const existing = await deps.repo.findAssessmentById(request.assessmentId);
     if (existing === null) {
@@ -137,6 +150,19 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       diffSummary: request.diffSummary,
     });
     if (run.outcome === 'unavailable') {
+      try {
+        await deps.repo.saveAssessment({
+          ...existing,
+          requestedReviewerModel: request.reviewerModel.trim(),
+          revision: existing.revision + 1,
+          updatedAtIso: nowIso,
+        });
+      } catch (error) {
+        if (error instanceof EvidenceAssessmentRevisionConflictError) {
+          return { outcome: 'rejected', reason: run.reason };
+        }
+        throw error;
+      }
       return { outcome: 'rejected', reason: run.reason };
     }
     if (!run.readOnlyVerified) {
@@ -176,7 +202,10 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
     }
     const receipt = validated.value.toRecord();
 
-    const assessment = EvidenceAssessment.fromRecord(existing);
+    const assessment = EvidenceAssessment.fromRecord({
+      ...existing,
+      requestedReviewerModel: request.reviewerModel.trim(),
+    });
     assessment.appendReviewReceipt(receipt, nowIso);
     const merged = assessment.toRecord();
     const blockers = EvidenceAssessment.fromRecord(merged).collectBlockers();

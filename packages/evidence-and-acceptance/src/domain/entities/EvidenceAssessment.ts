@@ -33,6 +33,11 @@ export interface EvidenceAssessmentProps {
   readonly policyRevision: string;
   /** The implementer seat recorded at creation; absent means refused. */
   readonly implementerModel: string;
+  /**
+   * The reviewer the last request-review named; a recorded review receipt must
+   * name the same model. Absent when no review was requested.
+   */
+  readonly requestedReviewerModel?: string;
   readonly requiredChecks: readonly string[];
   readonly state: AssessmentStateValue;
   /**
@@ -92,6 +97,12 @@ export class EvidenceAssessment {
       return {
         success: false,
         error: new Error("EvidenceAssessment forgeEvidence must be 'not-configured' when present"),
+      };
+    }
+    if (props.requestedReviewerModel !== undefined && !isNonEmptyTrimmedString(props.requestedReviewerModel)) {
+      return {
+        success: false,
+        error: new Error('EvidenceAssessment requestedReviewerModel must be a non-empty string when present'),
       };
     }
     const state = AssessmentState.create(props.state);

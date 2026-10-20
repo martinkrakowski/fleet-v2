@@ -10,7 +10,10 @@ import { join } from 'node:path';
 import type {
   EvidenceAssessmentRecord,
 } from '../../domain/evidence-records.js';
-import type { EvidenceAssessmentRepositoryPort } from '../../application/ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
+import {
+  EvidenceAssessmentRevisionConflictError,
+  type EvidenceAssessmentRepositoryPort,
+} from '../../application/ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface EvidenceAssessmentRepositoryOptions {
@@ -59,7 +62,9 @@ export class EvidenceAssessmentRepositoryAdapter implements EvidenceAssessmentRe
     if (stateFilePath === null) {
       const existing = this.inMemoryAssessments.get(record.id);
       if (existing !== undefined && record.revision <= existing.revision) {
-        throw new Error(
+        throw new EvidenceAssessmentRevisionConflictError(
+          record.id,
+          record.revision,
           `Optimistic concurrency conflict for assessment ${record.id}: revision ${record.revision} does not advance stored revision ${existing.revision}`,
         );
       }
@@ -73,7 +78,9 @@ export class EvidenceAssessmentRepositoryAdapter implements EvidenceAssessmentRe
       const assessments = await this.readAssessmentsFromDisk(stateFilePath);
       const existing = assessments.get(record.id);
       if (existing !== undefined && record.revision <= existing.revision) {
-        throw new Error(
+        throw new EvidenceAssessmentRevisionConflictError(
+          record.id,
+          record.revision,
           `Optimistic concurrency conflict for assessment ${record.id}: revision ${record.revision} does not advance stored revision ${existing.revision}`,
         );
       }

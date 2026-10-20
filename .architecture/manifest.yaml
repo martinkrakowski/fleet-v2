@@ -504,9 +504,9 @@ bounded_contexts:
         use_cases: [RequestVerificationUseCase, RequestIndependentReviewUseCase, RecordVerificationReceiptUseCase, RecordReviewReceiptUseCase, RecordFindingDispositionUseCase, AssessHeadAcceptanceUseCase, InspectAcceptanceEvidenceUseCase]
         ports:
           in: [RequestVerificationPort, RequestIndependentReviewPort, RecordVerificationReceiptPort, RecordReviewReceiptPort, RecordFindingDispositionPort, AssessHeadAcceptancePort, InspectAcceptanceEvidencePort]
-          out: [EvidenceAssessmentRepositoryPort, EvidenceArchivePort, VerificationExecutorPort, ForgeEvidencePort, IndependentReviewPort, OwnerDecisionPort, AttemptOwnerDecisionPort, CommandExecutorPort]
+          out: [EvidenceAssessmentRepositoryPort, EvidenceArchivePort, VerificationExecutorPort, ForgeEvidencePort, IndependentReviewPort, OwnerDecisionPort, AttemptOwnerDecisionPort, CommandExecutorPort, EvidenceSeatPolicyPort]
       infrastructure:
-        adapters: [EvidenceAssessmentRepositoryAdapter, EvidenceArchiveAdapter, VerificationExecutorAdapter, ForgeEvidenceAdapter, IndependentReviewAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, LocalExecutor, SshExecutor]
+        adapters: [EvidenceAssessmentRepositoryAdapter, EvidenceArchiveAdapter, VerificationExecutorAdapter, ForgeEvidenceAdapter, IndependentReviewAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, LocalExecutor, SshExecutor, EvidenceSeatPolicyAdapter]
     contracts:
       RequestVerificationPort: "Request the required completed checks on configured verification hosts for a precise head and acceptance-policy revision."
       RequestIndependentReviewPort: "Request a read-only review using an underlying model distinct from the implementer's and bind its result to the reviewed head."
@@ -523,6 +523,7 @@ bounded_contexts:
       OwnerDecisionPort: "Resolve owner decision references through operator coordination's CheckOwnerDecisionPort before head acceptance; an undecided, declined or unreadable decision blocks."
       AttemptOwnerDecisionPort: "Read the owner decision references the product froze into an attempt's brief package; an attempt recorded without them is unknown and blocks acceptance."
       CommandExecutorPort: "Run one reviewed argv array without a shell through a local or ssh transport and report its completed outcome, never a launch as completion."
+      EvidenceSeatPolicyPort: "Given the installation's seat catalogue and free-seat flag as a structural subset, say whether a reviewer model may be bound; with the flag false a free, unknown or ambiguous reviewer is refused."
     adapter_bindings:
       - { adapter: EvidenceAssessmentRepositoryAdapter, implements: EvidenceAssessmentRepositoryPort, integration: local-transactional-store }
       - { adapter: EvidenceArchiveAdapter, implements: EvidenceArchivePort, integration: immutable-artifact-files }
@@ -539,6 +540,7 @@ bounded_contexts:
         delegates_to: [work-execution/InspectAttemptPort]
       - { adapter: LocalExecutor, implements: CommandExecutorPort, integration: local-execfile-argv-no-shell }
       - { adapter: SshExecutor, implements: CommandExecutorPort, integration: batch-mode-ssh-quoted-argv }
+      - { adapter: EvidenceSeatPolicyAdapter, implements: EvidenceSeatPolicyPort, integration: installation-seat-structural-check }
     domain_specification:
       aggregate_roots: [EvidenceAssessment]
       child_ownership: { VerificationReceipt: EvidenceAssessment, ReviewReceipt: EvidenceAssessment, FindingDisposition: EvidenceAssessment }

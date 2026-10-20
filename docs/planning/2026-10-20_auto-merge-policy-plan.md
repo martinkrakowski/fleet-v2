@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-20
 - **Target repository:** `fleet-v2`
-- **Status:** rev 2: the Opus review of rev 1 applied (two blockers: pending checks are
+- **Status:** rev 3: CodeRabbit on rev 2 applied (§11). Rev 2: the Opus review of rev 1 applied (two blockers: pending checks are
   indistinguishable from failures, and attention items have no store; five should-fixes). See §11.
   Nothing built.
 - **Owner request (2026-10-20):** "We should create a setting to allow the developer to toggle 'auto'
@@ -53,11 +53,11 @@ Everything from grant consumption onward is today's merge path, unchanged.
 |---|---|---|
 | A1 | The key is `policy.autoMerge: { enabled: boolean; allowHighRisk: boolean; onBlocked: 'ask-owner' \| 'hold' }`. Absent key = `{enabled: false, allowHighRisk: false, onBlocked: 'ask-owner'}`. A present block must name all three fields. **v2 only:** a v1 file is refused with "migrate to v2", as in the free-seat plan (F1) | The owner chose "off by default" and "high-risk excluded unless opted in"; an explicit block avoids half-set values |
 | A2 | `autoMergeRevision` is a content hash (sha256 of the canonical JSON of the `autoMerge` block, first 12 hex), computed by `@fleet/installation`. It is unrelated to the work order's `policyRevision`, which stays the caller-supplied string it is today, so toggling the setting never makes an acceptance stale | Grants and journal entries need to name which setting authorised them; the installation has no revision field to reuse |
-| A3 | A **policy grant** is an ordinary `CoordinationRequest`: kind `action-decision`, state `approved`, scope `forge:merge-pr`, `expectedHeadSha` = the accepted head, `policyRevision` = the work order's, `decisionRevision` = `policy:autoMerge@<autoMergeRevision>`, `proposalDigest` over (attempt id, head, acceptance receipt id). A new `IssuePolicyMergeGrantUseCase` (operator-coordination) records it **with the attempt coordinates** the consumption adapter reads, and **cancels every earlier unconsumed policy grant for the same work order** in the same write. Resolve, consume and journal code are unchanged; the auto-merge path always passes the grant id explicitly | One grant shape keeps "one grant, one action, once". Cancelling earlier grants stops stale policy grants from shadowing an owner's `resolve-auth` for another lane (resolve without an id takes the newest approved request for the scope) |
+| A3 | A **policy grant** is an ordinary `CoordinationRequest`: kind `action-decision`, state `approved`, scope `forge:merge-pr`, `expectedHeadSha` = the accepted head, `policyRevision` = the work order's, `decisionRevision` = `policy:autoMerge@<autoMergeRevision>`, `proposalDigest` over (attempt id, head, acceptance receipt id). A new `IssuePolicyMergeGrantUseCase` (operator-coordination) records it **with the attempt coordinates** the consumption adapter reads, and **cancels every earlier unconsumed policy grant for the same work order** in the same write. Consume and journal code are unchanged; the auto-merge path always passes the grant id explicitly. **Resolve changes in one place:** its no-id fallback skips requests whose `decisionRevision` starts with `policy:` and takes only a request whose `expectedHeadSha` equals the requested head, so a policy grant for lane A never shadows (or blocks) an owner grant for lane B | One grant shape keeps "one grant, one action, once". Cancelling earlier grants stops stale policy grants from shadowing an owner's `resolve-auth` for another lane (resolve without an id takes the newest approved request for the scope) |
 | A4 | **Eligibility** (all must hold, else no grant): `enabled`; acceptance `accepted` at the head with a receipt id (this already covers CI, review and unresolved threads); the brief names **no** one-way door, read through `attemptOwnerDecisionPort` as the merge does; work order risk `standard`, or `high` with `allowHighRisk`; forge mode `github`; the work order is not merged and has no ambiguous forge entry awaiting reconciliation | A one-way door is the owner's by definition; the rest are the owner's two choices plus facts the merge depends on |
 | A5 | Work orders gain `risk: 'standard' \| 'high'`, set at registration and frozen with the brief. **Absent = `high`** (fail closed): every existing work order, and any registered without a risk, is excluded from auto-merge | A lane that touches data safety, security or user-facing behaviour must not auto-merge because nobody labelled it |
 | A6 | **Trigger:** CLI only in v1. `fleet-v2 attempt accept`, when it returns `accepted` and `enabled` is true, runs the auto-merge use case in the same invocation; `fleet-v2 attempt auto-merge <attemptId>` runs it explicitly (second look, re-try after a hold). The contexts are joined only in the CLI composition root; work-execution's application layer never imports `@fleet/operator-coordination` | Dispatch is CLI-only today; a merge side effect on an HTTP route widens what the single bearer token does |
-| A7 | Turning the setting off cancels every unconsumed policy grant (state `cancelled`) | Off must mean off for grants issued a moment earlier |
+| A7 | **Any** write that changes `autoMergeRevision` (turning `enabled` off, turning `allowHighRisk` off, changing `onBlocked`) cancels every unconsumed policy grant issued under another revision; the writer (CLI, and later setup mode through the same engine) does it in the same command. Before calling the merge, the auto-merge use case re-reads the setting and refuses a grant whose `decisionRevision` names a revision other than the current one | Narrowing the setting must narrow what is already granted: a high-risk grant issued while `allowHighRisk` was on must not stay usable after it is turned off |
 | A8 | Each merge's journal entry names who authorised it (`owner-decision` or `policy:autoMerge@rev`) | An audit can separate the owner's merges from the policy's |
 | A9 | The `/v1` API gains **no** route that writes the setting; editing from the web goes through setup mode (§5), as the free-seat plan's F9 | A leaked `/v1` token must not be able to turn on auto-merge |
 | A10 | Turning `enabled` on (and `allowHighRisk` on) prints the eligibility rules and asks y/N; off never asks. Every write is compare-and-swap with a before/after diff | On grants authority; off only removes it |
@@ -104,7 +104,7 @@ Each lane is one PR, about 45 minutes of lane time.
 |---|---|---|---|---|
 | AM1 | `policy.autoMerge` in types, parser (strict keys), writer; defaults; `autoMergeRevision` (A2); tests: absent key, partial block refused, v1 refused, hash stable across key order | packages/installation | — | O |
 | AM2 | `risk` on `WorkOrderRecord`/`WorkOrder`, set at `RegisterWorkOrderUseCase`, frozen; absent = `high`; `work-order register --risk`; stored records without the field read as `high` | packages/work-execution, apps/cli | — | O |
-| AM3a | `IssuePolicyMergeGrantUseCase` (A3: coordinates recorded, earlier policy grants for the work order cancelled) and `CancelPolicyGrantsUseCase` (A7); manifest entries; tests: one live grant per work order, resolve-without-id is not shadowed by a cancelled policy grant, cancel leaves consumed grants alone | packages/operator-coordination | — | O |
+| AM3a | `IssuePolicyMergeGrantUseCase` (A3: coordinates recorded, earlier policy grants for the work order cancelled), `CancelPolicyGrantsUseCase` (A7: by revision), and the resolver's no-id fallback (A3: owner grants only, matching head); manifest entries; tests: one live grant per work order, resolve-without-id is not shadowed by a cancelled policy grant, cancel leaves consumed grants alone | packages/operator-coordination | — | O |
 | AM3b | Attention store (A12): write port, file and in-memory stores, `RecordAttentionItemUseCase`, `ReadProjectAttentionUseCase` reading it, dismissal; replace the scaffold `AttentionReadAdapter` | packages/operator-coordination, apps/cli wiring | — | O |
 | AM3c | Structured blockers (A11) in `AssessHeadAcceptanceUseCase` and its in-port; work-execution's acceptance out-port and the CLI/API adapters carry kinds; existing text unchanged | packages/evidence-and-acceptance, packages/work-execution (port), apps/cli, apps/api wiring | — | O |
 | AM4b | Forge adapter: refusal kinds (`conflict`, `protection`, `permission`, `other`) from `gh` output, unknown = `other`; a PR-state read for A13; tests with recorded `gh` outputs | packages/work-execution (infrastructure) | — | O |
@@ -135,7 +135,10 @@ the manifest updated for every new port and use case.
 - A new policy grant for a work order cancels its earlier one; an owner's `resolve-auth` without an
   id for another lane is not answered by a policy grant.
 - Turning off with an unconsumed policy grant: the grant is `cancelled` and `forge execute` with it
-  is refused.
+  is refused. Turning only `allowHighRisk` off cancels an unconsumed grant for a `high` lane; a grant
+  whose revision is not the current one is refused by the auto-merge use case.
+- Two lanes, A with a newer policy grant and B with an owner grant: `resolve-auth` without an id for
+  B's head returns B's owner grant, never A's policy grant.
 
 ## 8. Risks
 
@@ -185,3 +188,8 @@ receipt; this plan takes neither and asks the reviewer which is worth it.
 - CLI group is `attempt`, not `execution`; the door check reads `attemptOwnerDecisionPort`;
   `AutoMergeAttemptUseCase` goes in the manifest; layering (work-execution → operator-coordination
   through composition-root adapters) confirmed acyclic.
+
+**CodeRabbit, rev 2 (2026-10-20).** Applied in rev 3: A7 cancels unconsumed policy grants on any
+change of the setting's revision (so removing `allowHighRisk` revokes high-risk grants) and the
+auto-merge path refuses a grant from another revision; A3's resolver fallback ignores policy grants
+and requires the requested head, so lanes cannot shadow each other. Tests added.

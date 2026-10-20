@@ -30,7 +30,7 @@ import {
   type OwnerDecisionDelegate,
   type AttemptOwnerDecisionDelegate,
 } from "@fleet/work-execution";
-import { deriveInstallationModel, type FleetInstallation } from "@fleet/installation";
+import { requireValidInstallationModel, type FleetInstallation } from "@fleet/installation";
 import {
   CollectAttemptArtifactsUseCase,
   DispatchAttemptUseCase,
@@ -249,10 +249,9 @@ export function createConfiguredWorkComposition(
     runnerRemoteHost,
   } = resolveWorkRunnerSettings(options);
 
-  // The loader-derived model (D4) supplies the runner capability profile and
-  // the forge mode (D6); a v1 installation maps onto it unchanged.
+  // an invalid installation throws here, never runs
   const installationModel = options?.installation
-    ? deriveInstallationModel(options.installation).model
+    ? requireValidInstallationModel(options.installation)
     : undefined;
   const runnerProfile = resolveRunnerCapabilityProfile(installationModel?.hosts);
   const forgeMode = resolveInstallationForgeMode(options?.installation);

@@ -14,7 +14,7 @@ import {
   type OwnerDecisionDelegate,
 } from "@fleet/evidence-and-acceptance";
 import { resolveRoleExecutors } from "@fleet/work-execution";
-import { deriveInstallationModel, type FleetInstallation } from "@fleet/installation";
+import { requireValidInstallationModel, type FleetInstallation } from "@fleet/installation";
 import {
   AssessHeadAcceptanceUseCase,
   InspectAcceptanceEvidenceUseCase,
@@ -88,11 +88,9 @@ export function createConfiguredEvidenceUseCases(
   const archive = new EvidenceArchiveAdapter(
     stateDir === undefined ? {} : { archiveDir: join(stateDir, "evidence-archive") },
   );
-  // The forge mode comes from the loader-derived model (D6): mode `github`
-  // binds the forge-evidence port, mode `none` keeps acceptance receipt-only
-  // and records `forgeEvidence: 'not-configured'`.
+  // an invalid installation throws here, never runs
   const installationModel = options?.installation
-    ? deriveInstallationModel(options.installation).model
+    ? requireValidInstallationModel(options.installation)
     : undefined;
   const forgeMode = installationModel?.forge?.mode;
   const forgeSection =

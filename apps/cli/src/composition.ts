@@ -134,7 +134,7 @@ import {
   SyncOneWayOwnerQuestionsUseCase,
   type OwnerQuestionClock,
 } from '@fleet/operator-coordination';
-import { deriveInstallationModel, type FleetInstallation } from '@fleet/installation';
+import { requireValidInstallationModel, type FleetInstallation } from '@fleet/installation';
 
 export interface FleetCliRuntimeOptions {
   /** Directory for file-backed state; every store is in-memory when omitted. */
@@ -571,10 +571,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     ocmRunBin,
     runnerRemoteHost,
   } = resolveRunnerSettings(options);
-  // The loader-derived model (D4) supplies the runner capability profile and
-  // the forge mode (D6); a v1 installation maps onto it unchanged.
+  // an invalid installation throws here, never runs
   const installationModel = options?.installation
-    ? deriveInstallationModel(options.installation).model
+    ? requireValidInstallationModel(options.installation)
     : undefined;
   const runnerProfile = resolveRunnerCapabilityProfile(installationModel?.hosts);
   const forgeMode = resolveInstallationForgeMode(options?.installation);

@@ -168,6 +168,43 @@ async function installationLines(
   lines.push(
     line('installation', 'schema', 'schema-version', 'PASS', mapped),
   );
+  if (result.installation.schemaVersion === 2) {
+    const freeFlag = result.model.policy?.useFreeSeats;
+    if (freeFlag === false) {
+      const freeCount = (result.model.seats ?? []).filter(
+        (seat) => seat.costClass === 'free',
+      ).length;
+      lines.push(
+        line(
+          'installation',
+          'policy',
+          'free-tier',
+          'PASS',
+          `off (policy.useFreeSeats false); ${freeCount} free seat(s) disabled`,
+        ),
+      );
+    } else if (freeFlag === undefined) {
+      lines.push(
+        line(
+          'installation',
+          'policy',
+          'free-tier',
+          'PASS',
+          'on (policy.useFreeSeats absent; absent means on)',
+        ),
+      );
+    } else {
+      lines.push(
+        line(
+          'installation',
+          'policy',
+          'free-tier',
+          'PASS',
+          'on (policy.useFreeSeats true)',
+        ),
+      );
+    }
+  }
   for (const warning of result.warnings) {
     // The loader's warnings name accepted-and-ignored v1 fields (D1); they
     // are never failures because nothing consumes those fields today.
@@ -407,7 +444,35 @@ async function seatLines(
   options: RunDoctorOptions,
 ): Promise<DoctorLine[]> {
   const lines: DoctorLine[] = [];
+  const freeOff = model.policy?.useFreeSeats === false;
   for (const seat of model.seats ?? []) {
+    if (
+      freeOff &&
+      seat.model.toLowerCase().startsWith('nvidia/') &&
+      seat.costClass !== 'free'
+    ) {
+      lines.push(
+        line(
+          'seat',
+          seat.id,
+          'nvidia-cost-class',
+          'PASS',
+          `warning: an nvidia/ model declared ${seat.costClass}; NVIDIA also serves free routes, so confirm this seat is the paid route`,
+        ),
+      );
+    }
+    if (freeOff && seat.costClass === 'free') {
+      lines.push(
+        line(
+          'seat',
+          seat.id,
+          'free-tier',
+          'PASS',
+          'disabled: costClass free and policy.useFreeSeats is false; not probed',
+        ),
+      );
+      continue;
+    }
     if (!options.probeSeats) {
       lines.push(
         line('seat', seat.id, 'probe', 'UNKNOWN', 'not probed (--probe-seats)'),

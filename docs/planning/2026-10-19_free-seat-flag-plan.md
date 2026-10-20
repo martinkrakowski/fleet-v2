@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-19
 - **Target repository:** `fleet-v2`
-- **Status:** rev 2: the Opus review of rev 1 applied (two blockers: the review-receipt path and the
+- **Status:** rev 3: CodeRabbit on rev 2 applied (§11). Rev 2: the Opus review of rev 1 applied (two blockers: the review-receipt path and the
   port direction; five should-fixes; nits). See §11. Nothing built.
 - **Owner request (2026-10-19):** "allow the free tier model selection to be a flag. That means when
   true the same free tier seats as are today run. If flag is false, meaning do not use free tier,
@@ -53,12 +53,12 @@ Without the second, a brief frozen with a free model would still run with the fl
 |---|---|---|
 | F1 | The key is `policy.useFreeSeats: boolean`, default `true` when absent. **v2 installations only:** v1 has no `policy` (`parse.ts:2068`) and its seats no `costClass` (`types.ts:375`); `seats free-tier off` and `init --no-free-seats` refuse a v1 file with "migrate to v2" | An installation written before this plan keeps its behaviour; `policy` is where the free-seat rule already lives |
 | F2 | "Free" means the seat's declared `costClass: free`. With the flag false, a seat whose model id or variant ends in `:free` or `-free` but is declared `paid` or `plan-quota` is a **validation error**; an `nvidia/` seat declared paid is a **doctor warning** only (a paid NVIDIA route exists) | The declaration is the source of truth; the pattern is a backstop against a mislabelled seat silently surviving the flag |
-| F3 | With the flag false, **dispatch fails closed**: the effective (seat tool, model, variant) — tool from the manifest's seat tool, model and variant from the brief or the override — must match a catalogue seat whose `costClass` is not `free`. The variant counts: the override parser turns `x/y:free` into model `x/y`, variant `free` (`index.ts:839-842`). A triple not in the catalogue is refused (exit 1, `refused`, reason names the model and the flag). The check sits right after `effectiveModel` (`DispatchAttemptUseCase:403`), before the journal intent (`:413`) | Dispatch has no other way to know a model's cost; an unknown model could be free. `costClass` belongs to a seat (tool + model), not a model |
+| F3 | With the flag false, **dispatch fails closed**: the effective (seat tool, model, variant) — tool from the manifest's seat tool, model and variant from the brief or the override — must match a catalogue seat whose `costClass` is not `free`. The variant counts: the override parser turns `x/y:free` into model `x/y`, variant `free` (`index.ts:839-842`). A triple not in the catalogue is refused (exit 1, `refused`, reason names the model and the flag). The check sits right after `effectiveModel` (`DispatchAttemptUseCase:403`), before the journal intent (`:413`) A triple matched by more than one catalogue seat (seats that differ only in `agent` or routing metadata) counts as allowed only when **every** matching seat is non-free; mixed matches are refused as ambiguous | Dispatch has no other way to know a model's cost; an unknown model could be free. `costClass` belongs to a seat (tool + model), not a model |
 | F4 | A brief frozen with a free model is not rewritten when the flag turns false. Its dispatch is refused; the operator re-prepares the brief or passes a seat override to a non-free seat (the override path already records reason, setter, expiry) | Frozen briefs are never edited (`AGENTS.md`); the refusal is visible and recorded |
 | F5 | Reviews: the same check on the reviewer model at all three entry points — `accept`, `request-review` **and the receipt** (`evidence record-review`, `POST /v1/reviews/[id]/receipt`). The receipt's `reviewerModel` must also equal the reviewer the request named | A review is a seat too. Without the receipt check, a free reviewer's receipt becomes acceptance evidence even when the request named a paid one (rev-1 blocker) |
 | F6 | Chains: with the flag false, `deriveModelFromV2` (`packages/installation/src/model.ts:92`) drops free seats from every chain in the derived model (not the file), and the installation is **refused when a role whose chain was non-empty before the drop is left empty**. Roles with no chain to begin with are unaffected. `validateSeatPolicy` (a pure validator returning `string[]`, `policy.ts:93`) then runs on the reduced model; "a free seat is never the only seat" stays for the true case. Dropping free implementers also relaxes the reviewer-family check (`policy.ts:157-185`), which is correct: a family no longer in use needs no independence | A role with no seat must fail at load, not at 2 a.m. dispatch. Only `policy.ts` reads derived chains; `recommend` builds its own, doctor reads only `model.seats` (`run-doctor.ts:410`), so nothing else breaks. Both CLI and API call `deriveInstallationModel`, so they agree |
 | F7 | Each attempt records the flag value seen at dispatch (in the attempt's seat record) | A later audit can tell why a lane ran where it did |
-| F8 | Changing the flag is a two-way door: no signed decision needed, but every write goes through the compare-and-swap writer and prints the before/after diff | It removes or restores seats; it grants nothing |
+| F8 | Changing the flag is a two-way door: no signed decision needed, but every write goes through the compare-and-swap writer and prints the before/after diff Canonical form: `off` writes `useFreeSeats: false`; `on` **removes** the key (absent means true) when it holds `false`, and leaves an explicit `true` or an absent key untouched | It removes or restores seats; it grants nothing |
 | F9 | The authenticated `/v1` API does **not** gain a route that writes the flag. Editing from the web goes through the planned setup mode (§5) | The settings-UI plan's rule: "the authenticated `/v1` API never gains the power to rewrite its own configuration". A single full-power token that could also flip seats would widen what a leaked token does |
 
 ## 4. Behaviour by surface
@@ -78,7 +78,9 @@ Without the second, a brief frozen with a free model would still run with the fl
 **Yes, with one constraint.** The flag can be shown everywhere at once, but changing it should go
 through the same channel as every other installation edit, not through the everyday `/v1` API.
 
-- **CLI (first, small):** `fleet-v2 seats free-tier [status|on|off] [--yes]`. It prints the diff
+- **CLI (first, small):** `fleet-v2 seats free-tier [status|on|off] [--yes]`. After a write it prints
+  "takes effect for the API after it restarts; CLI dispatches use it at once" (the API loads the
+  installation once). It prints the diff
   (which seats are enabled or disabled, which roles are left with how many seats), asks y/N like
   `hosts edit`, writes with compare-and-swap, exits 0 / 1 (refused: a role would be left empty) / 2.
 - **Web:**
@@ -133,7 +135,11 @@ After each lane: `yarn build && yarn typecheck && yarn lint && yarn lint:arch`, 
   unknown triple is refused; a free reviewer is refused at `accept`, at `request-review` and at the
   receipt; a receipt naming a reviewer other than the requested one is refused.
 - A v1 installation: `seats free-tier off` and `init --no-free-seats` refuse with "migrate to v2".
-- Flipping the flag with `seats free-tier off` then `on` restores the file byte for byte.
+- Flipping the flag with `seats free-tier off` then `on` restores a file that had no key byte for
+  byte, and a file with explicit `true` to the same meaning (F8's canonical form); `status` reads both
+  as on.
+- Two catalogue seats with the same (tool, model, variant), one free and one paid, with the flag
+  false: dispatch on that triple is refused as ambiguous (F3).
 
 ## 8. Risks
 
@@ -173,3 +179,7 @@ with a refusal; F3 matches (tool, model, variant), including the `:free` variant
 and FS3b. Nits: `COST_RANK` and review citations corrected; dispatch is CLI-only; the runtime
 "companion seat" dropped from F5; the `nvidia/` backstop is a warning. Confirmed: the lane choke point
 is `startSession` and both runner adapters take the model from the request.
+
+**CodeRabbit, rev 2 (2026-10-20).** Applied in rev 3: F3 refuses a triple matched by seats of mixed
+cost class (seat identity beyond the model); F8 fixes the written form (`off` writes `false`, `on`
+removes it); the CLI states that the API needs a restart. Tests added for each.

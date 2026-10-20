@@ -956,6 +956,41 @@ describe('parseInstallation v2', () => {
     });
   });
 
+  it('parses useFreeSeats as a boolean and refuses any other value', () => {
+    const withFalse = parseInstallation({
+      ...validV2,
+      policy: { useFreeSeats: false },
+    });
+    expect(withFalse).toEqual({
+      ok: true,
+      installation: { ...validV2, policy: { useFreeSeats: false } },
+    });
+
+    const withTrue = parseInstallation({
+      ...validV2,
+      policy: { useFreeSeats: true },
+    });
+    expect(withTrue).toEqual({
+      ok: true,
+      installation: { ...validV2, policy: { useFreeSeats: true } },
+    });
+
+    const withNo = parseInstallation({
+      ...validV2,
+      policy: { useFreeSeats: 'no' },
+    });
+    expect(withNo).toEqual({
+      ok: false,
+      errors: ['policy.useFreeSeats: must be a boolean'],
+    });
+
+    const absent = parseInstallation(validV2);
+    expect(absent.ok).toBe(true);
+    if (absent.ok) {
+      expect(absent.installation.policy?.useFreeSeats).toBeUndefined();
+    }
+  });
+
   it('refuses v1 shelf fields in a v2 file', () => {
     const result = parseInstallation({
       schemaVersion: 2,

@@ -152,6 +152,28 @@ export function validateSeatPolicy(installation: FleetInstallationModel): string
     }
   }
 
+  // With the flag off, a seat that looks free but is declared paid or
+  // plan-quota is refused: the declaration is the source of truth, and the
+  // pattern is a backstop against a mislabelled seat surviving (F2).
+  if (policy?.useFreeSeats === false) {
+    for (const seat of seats) {
+      if (seat.costClass !== 'paid' && seat.costClass !== 'plan-quota') {
+        continue;
+      }
+      const variant = seat.variant;
+      const variantLooksFree =
+        variant !== undefined &&
+        (variant.toLowerCase() === 'free' || variant.toLowerCase().endsWith('-free'));
+      const modelLooksFree = seat.model.endsWith(':free') || seat.model.endsWith('-free');
+      if (modelLooksFree || variantLooksFree) {
+        const variantPart = variantLooksFree ? ` variant "${variant}"` : '';
+        errors.push(
+          `seats.${seat.id}: model "${seat.model}"${variantPart} looks free but costClass is "${seat.costClass}"; declare it free or remove it`,
+        );
+      }
+    }
+  }
+
   // No seat holding a reviewer role shares a family with any implementer
   // seat, whether or not the seat is a chain member.
   const implementerIds = chainSeatIds.get('implementer') ?? [];

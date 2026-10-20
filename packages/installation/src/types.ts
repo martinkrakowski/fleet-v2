@@ -199,6 +199,8 @@ export interface ForbiddenRouteRule {
 export interface PolicySection {
   readonly forbiddenRoutes?: readonly ForbiddenRouteRule[];
   readonly perLaneCostCeiling?: number;
+  /** Absent means true: free-tier seats are used. */
+  readonly useFreeSeats?: boolean;
 }
 
 /** The v2 `shelf` section with the local provider (D1, default). */

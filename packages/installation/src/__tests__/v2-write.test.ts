@@ -194,4 +194,28 @@ describe('writeInstallationV2', () => {
     const written = writeInstallationV2(installation);
     expect(written).not.toContain('"source"');
   });
+
+  it('round-trips a policy without useFreeSeats without writing it', () => {
+    const installation = parseV2Fixture(validV2);
+    const written = writeInstallationV2(installation);
+    expect(written).not.toContain('useFreeSeats');
+    expect(parseInstallation(JSON.parse(written))).toEqual({
+      ok: true,
+      installation,
+    });
+  });
+
+  it('writes useFreeSeats when it is defined', () => {
+    const installation = parseV2Fixture({
+      ...validV2,
+      policy: { useFreeSeats: false },
+    });
+    const written = writeInstallationV2(installation);
+    const document = JSON.parse(written) as { policy?: { useFreeSeats?: boolean } };
+    expect(document.policy?.useFreeSeats).toBe(false);
+    expect(parseInstallation(JSON.parse(written))).toEqual({
+      ok: true,
+      installation,
+    });
+  });
 });

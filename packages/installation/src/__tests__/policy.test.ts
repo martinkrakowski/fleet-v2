@@ -357,4 +357,148 @@ describe('loader policy enforcement', () => {
       cleanup();
     }
   });
+
+  const policyHosts = {
+    host: {
+      transport: 'local',
+      worktreeRoot: '/tmp/wt',
+      roles: ['orchestrator', 'lane-runner', 'verifier'],
+      runner: { kind: 'opencode', port: 4166, maxLanes: 1 },
+    },
+  };
+
+  it('with useFreeSeats false, drops free seats from chains and keeps paid ones', () => {
+    const file = writeV2({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: policyHosts,
+      seats: [
+        seat({ id: 'free-impl', model: 'a/m1', costClass: 'free' }),
+        seat({ id: 'paid-impl', model: 'b/m2', costClass: 'paid' }),
+      ],
+      chains: {
+        implementer: [{ seatId: 'free-impl' }, { seatId: 'paid-impl' }],
+      },
+      policy: { useFreeSeats: false },
+    });
+    try {
+      const result = loadInstallation({ file, env: {} });
+      expect(result.status).toBe('loaded');
+      if (result.status === 'loaded') {
+        expect(result.model.chains?.implementer).toEqual([{ seatId: 'paid-impl' }]);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('with useFreeSeats false, refuses a role left without any seat', () => {
+    const file = writeV2({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: policyHosts,
+      seats: [seat({ id: 'free-impl', model: 'a/m1', costClass: 'free' })],
+      chains: { implementer: [{ seatId: 'free-impl' }] },
+      policy: { useFreeSeats: false },
+    });
+    try {
+      const result = loadInstallation({ file, env: {} });
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.errors).toContainEqual(
+          'chains.implementer: every seat is free and policy.useFreeSeats is false; add a paid or plan-quota seat',
+        );
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('with useFreeSeats false, does not report a role with no chain', () => {
+    const file = writeV2({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: policyHosts,
+      seats: [
+        seat({ id: 'free-impl', model: 'a/m1', costClass: 'free' }),
+        seat({
+          id: 'paid-reviewer',
+          model: 'b/m2',
+          roles: ['reviewer'],
+          costClass: 'paid',
+        }),
+      ],
+      chains: { reviewer: [{ seatId: 'paid-reviewer' }] },
+      policy: { useFreeSeats: false },
+    });
+    try {
+      const result = loadInstallation({ file, env: {} });
+      expect(result.status).toBe('loaded');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('with useFreeSeats false, refuses seats that look free but are not declared free', () => {
+    const cases: { seat: Partial<SeatModel> & { id: string }; expected: string }[] = [
+      {
+        seat: { id: 'impl', model: 'x/y:free', costClass: 'paid' },
+        expected:
+          'seats.impl: model "x/y:free" looks free but costClass is "paid"; declare it free or remove it',
+      },
+      {
+        seat: { id: 'impl', model: 'x/y', variant: 'free', costClass: 'paid' },
+        expected:
+          'seats.impl: model "x/y" variant "free" looks free but costClass is "paid"; declare it free or remove it',
+      },
+      {
+        seat: { id: 'impl', model: 'x/y', variant: 'FREE', costClass: 'plan-quota' },
+        expected:
+          'seats.impl: model "x/y" variant "FREE" looks free but costClass is "plan-quota"; declare it free or remove it',
+      },
+    ];
+    for (const { seat: seatOverrides, expected } of cases) {
+      const file = writeV2({
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: policyHosts,
+        seats: [seat(seatOverrides)],
+        chains: { implementer: [{ seatId: 'impl' }] },
+        policy: { useFreeSeats: false },
+      });
+      try {
+        const result = loadInstallation({ file, env: {} });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.errors).toContainEqual(expected);
+        }
+      } finally {
+        cleanup();
+      }
+    }
+  });
+
+  it('without the flag, a single free implementer seat still fails the only-seat rule', () => {
+    const base = {
+      schemaVersion: 2 as const,
+      forge: { mode: 'none' as const },
+      hosts: policyHosts,
+      seats: [seat({ id: 'free-impl', model: 'a/m1', costClass: 'free' })],
+      chains: { implementer: [{ seatId: 'free-impl' }] },
+    };
+    for (const policy of [undefined, { useFreeSeats: true }]) {
+      const file = writeV2(policy === undefined ? base : { ...base, policy });
+      try {
+        const result = loadInstallation({ file, env: {} });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.errors).toContainEqual(
+            'chains.implementer: the free seat "free-impl" must not be the only seat of the role',
+          );
+        }
+      } finally {
+        cleanup();
+      }
+    }
+  });
 });

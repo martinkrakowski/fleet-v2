@@ -7,6 +7,7 @@
 import { copyDecisions } from './decision-consumers.js';
 import type {
   ChainStep,
+  ChainsSection,
   DerivedRunnerCapabilities,
   FleetInstallation,
   FleetInstallationModel,
@@ -21,6 +22,8 @@ import type {
   SeatSection,
 } from './types.js';
 
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
 /**
  * Warning recorded in the load result when a v1 file still carries the
  * `shelf.baseUrl`/`keyFile` transport (D1): the fields are accepted and
@@ -32,6 +35,8 @@ export const V1_SHELF_IGNORED_WARNING =
 export interface ModelOutcome {
   readonly model: FleetInstallationModel;
   readonly warnings: string[];
+  /** Derivation-time errors, present only when the chain filtering finds one. */
+  readonly errors?: string[];
 }
 
 /** Capabilities a v1 or env-only runner asserts today, before D4 declarations. */
@@ -51,6 +56,9 @@ const UNDECLARED_CAPABILITIES: DerivedRunnerCapabilities = {
   cpuAndMemoryLimited: null,
   processTreeTermination: null,
 };
+
+/** Roles a v2 chain may carry, in the order they appear in the file. */
+const CHAIN_ROLES = ['implementer', 'reviewer', 'high-risk-reviewer'] as const;
 
 /**
  * Map an installation of either file version onto the v2 model and derive
@@ -83,13 +91,44 @@ function deriveModelFromV2(installation: FleetInstallation): ModelOutcome {
   const v2Shelf = installation.shelf !== undefined && 'provider' in installation.shelf
     ? installation.shelf
     : undefined;
+  // With the flag off, drop free seats from every chain in the derived model
+  // (the file is never changed); a role whose non-empty chain becomes empty
+  // is a derivation error that fails the load (F6).
+  const dropFreeSeats = installation.policy?.useFreeSeats === false;
+  let chains = installation.chains;
+  const errors: string[] = [];
+  if (dropFreeSeats && installation.chains !== undefined) {
+    const seatsById = new Map<string, SeatSection>(
+      (installation.seats ?? []).map((seat) => [seat.id, seat]),
+    );
+    const derivedChains: Mutable<ChainsSection> = {};
+    for (const role of CHAIN_ROLES) {
+      const steps = installation.chains[role];
+      if (steps === undefined) {
+        continue;
+      }
+      const kept = steps.filter((step) => {
+        const seat = seatsById.get(step.seatId);
+        return seat === undefined || seat.costClass !== 'free';
+      });
+      if (steps.length > 0 && kept.length === 0) {
+        errors.push(
+          `chains.${role}: every seat is free and policy.useFreeSeats is false; add a paid or plan-quota seat`,
+        );
+      }
+      if (kept.length > 0) {
+        derivedChains[role] = kept;
+      }
+    }
+    chains = derivedChains;
+  }
   return {
     model: {
       schemaVersion: 2,
       hosts,
       ...(installation.tools !== undefined ? { tools: [...installation.tools] } : {}),
       ...(installation.seats !== undefined ? { seats: installation.seats.map(copySeat) } : {}),
-      ...(installation.chains !== undefined ? { chains: installation.chains } : {}),
+      ...(chains !== undefined ? { chains } : {}),
       ...(installation.policy !== undefined ? { policy: installation.policy } : {}),
       ...(v2Shelf !== undefined ? { shelf: v2Shelf } : {}),
       ...(installation.forge !== undefined ? { forge: v2ForgeOf(installation.forge) } : {}),
@@ -102,6 +141,7 @@ function deriveModelFromV2(installation: FleetInstallation): ModelOutcome {
         : {}),
     },
     warnings: [],
+    ...(errors.length > 0 ? { errors } : {}),
   };
 }
 

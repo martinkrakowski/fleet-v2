@@ -217,8 +217,9 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
     errors.push(...merged.errors);
     installation = merged.installation;
   }
-  const { model, warnings } = deriveInstallationModel(installation);
+  const { model, warnings, errors: modelErrors } = deriveInstallationModel(installation);
   if (installation.schemaVersion === 2) {
+    errors.push(...(modelErrors ?? []));
     errors.push(...validateSeatPolicy(model));
   } else {
     // v1 files get no new refusals: their single runner/reviewer pair is

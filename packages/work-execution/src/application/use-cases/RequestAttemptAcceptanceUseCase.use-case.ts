@@ -32,6 +32,7 @@ import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.o
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { AttemptRecord, WorkOrderRecord } from '../../domain/execution-records.js';
 import { WorkOrder } from '../../domain/entities/WorkOrder.js';
+import type { AllowedSeatPort } from '../ports/out/AllowedSeatPort.out-port.js';
 
 /**
  * Strip one `<provider>/` prefix so `a/model` and `b/model` compare as the
@@ -155,6 +156,8 @@ export interface RequestAttemptAcceptanceDependencies {
   readonly acceptancePort: AcceptanceAssessmentPort;
   /** Reads the frozen brief manifest when the attempt records no runner seat. */
   readonly artifactPort?: Pick<AttemptArtifactPort, 'readBriefManifest'>;
+  /** Free-seat check (plan F5): refuses a free or unknown reviewer when wired. */
+  readonly allowedSeats?: AllowedSeatPort;
   /**
    * Composition-root clock for revision timestamps; the wall-clock default
    * is a scaffold convenience, not an authority source.
@@ -212,6 +215,16 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
         outcome: 'rejected',
         reason: `Reviewer model ${request.reviewerModel} matches implementer model ${implementerModel}; an independent reviewer is required`,
       };
+    }
+
+    // Free-seat policy (plan F5): with the flag off, a reviewer model must be
+    // a catalogue seat that is not free; a free or unknown reviewer is
+    // rejected before any verification is requested.
+    if (deps.allowedSeats) {
+      const verdict = deps.allowedSeats.checkReviewerModel({ model: request.reviewerModel });
+      if (!verdict.allowed) {
+        return { outcome: 'rejected', reason: verdict.reason };
+      }
     }
 
     const workOrder = deps.workOrderRepo

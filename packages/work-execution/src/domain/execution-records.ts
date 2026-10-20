@@ -84,6 +84,12 @@ export interface AttemptRunnerRecord {
   readonly agent: string | null;
   readonly model: string | null;
   readonly variant: string | null;
+  /**
+   * The installation's policy.useFreeSeats as the dispatch seat check saw it
+   * (F7). Absent when no check was wired and on records written before the
+   * field existed.
+   */
+  readonly useFreeSeats?: boolean;
 }
 
 /** Scoped operator seat override accepted at dispatch. */

@@ -15,6 +15,7 @@ import { RequestAttemptAcceptanceUseCase } from '../RequestAttemptAcceptanceUseC
 import { ExecuteAuthorizedForgeActionUseCase } from '../ExecuteAuthorizedForgeActionUseCase.use-case.js';
 import { AcceptanceAssessmentAdapter } from '../../../infrastructure/adapters/AcceptanceAssessmentAdapter.adapter.js';
 import { ActionAuthorizationAdapter } from '../../../infrastructure/adapters/ActionAuthorizationAdapter.adapter.js';
+import { AllowedSeatAdapter } from '../../../infrastructure/adapters/AllowedSeatAdapter.adapter.js';
 import { BriefKnowledgeAdapter } from '../../../infrastructure/adapters/BriefKnowledgeAdapter.adapter.js';
 import { ExecutionObservationAdapter } from '../../../infrastructure/adapters/ExecutionObservationAdapter.adapter.js';
 import { ForgeActionAdapter } from '../../../infrastructure/adapters/ForgeActionAdapter.adapter.js';
@@ -639,6 +640,48 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     const result = await useCase.execute(acceptanceRequest());
 
     expect(result).toEqual({
+      outcome: 'accepted',
+      candidateHeadSha: HEAD_SHA,
+      receiptId: 'receipt-1',
+    });
+  });
+
+  it('rejects a free reviewer and accepts a paid one when the flag is off (F5)', async () => {
+    const acceptancePort = new FakeAcceptanceAssessment();
+    const useCase = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([makeAttempt()]),
+      workOrderRepo: new InMemoryWorkOrderRepository([makeWorkOrder()]),
+      acceptancePort,
+      allowedSeats: new AllowedSeatAdapter({
+        seats: [
+          {
+            id: 'free-reviewer',
+            tool: 'opencode',
+            model: 'opencode/longcat-2.5-preview-free',
+            costClass: 'free',
+          },
+          {
+            id: 'paid-reviewer',
+            tool: 'opencode',
+            model: 'openrouter/anthropic/claude-sonnet-4.5',
+            costClass: 'paid',
+          },
+        ],
+        policy: { useFreeSeats: false },
+      }),
+    });
+
+    const free = await useCase.requestAttemptAcceptance(
+      acceptanceRequest({ reviewerModel: 'opencode/longcat-2.5-preview-free' }),
+    );
+
+    expect(free.outcome).toBe('rejected');
+    expect(free.outcome === 'rejected' && free.reason).toContain('is a free seat');
+    expect(acceptancePort.requests).toHaveLength(0);
+
+    const paid = await useCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(paid).toEqual({
       outcome: 'accepted',
       candidateHeadSha: HEAD_SHA,
       receiptId: 'receipt-1',

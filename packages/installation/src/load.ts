@@ -217,17 +217,9 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
     errors.push(...merged.errors);
     installation = merged.installation;
   }
-  const { model, warnings, errors: modelErrors } = deriveInstallationModel(installation);
-  if (installation.schemaVersion === 2) {
-    errors.push(...(modelErrors ?? []));
-    // The file chains go along so the reference rules report file
-    // positions when useFreeSeats false reduced the derived chains (FS1).
-    errors.push(...validateSeatPolicy(model, installation.chains));
-  } else {
-    // v1 files get no new refusals: their single runner/reviewer pair is
-    // checked only for the family rule and reported as a warning.
-    warnings.push(...v1FamilyWarnings(model));
-  }
+  const checked = checkInstallationModel(installation);
+  const { model, warnings } = checked;
+  errors.push(...checked.errors);
   if (options.validatePolicy !== undefined) {
     errors.push(...options.validatePolicy(model));
   }
@@ -238,4 +230,45 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
     return { status: 'loaded', file, installation, model, warnings };
   }
   return { status: 'absent', installation, model, warnings };
+}
+
+/** The derived model with every load-time refusal and warning (v2: model errors, then seat policy). */
+export interface CheckedInstallationModel {
+  readonly model: FleetInstallationModel;
+  readonly warnings: string[];
+  readonly errors: string[];
+}
+
+export function checkInstallationModel(installation: FleetInstallation): CheckedInstallationModel {
+  const { model, warnings, errors: modelErrors } = deriveInstallationModel(installation);
+  const errors: string[] = [];
+  if (installation.schemaVersion === 2) {
+    errors.push(...(modelErrors ?? []));
+    // The file chains go along so the reference rules report file
+    // positions when useFreeSeats false reduced the derived chains (FS1).
+    errors.push(...validateSeatPolicy(model, installation.chains));
+  } else {
+    // v1 files get no new refusals: their single runner/reviewer pair is
+    // checked only for the family rule and reported as a warning.
+    warnings.push(...v1FamilyWarnings(model));
+  }
+  return { model, warnings, errors };
+}
+
+export class InvalidInstallationError extends Error {
+  readonly errors: readonly string[];
+  constructor(errors: readonly string[]) {
+    super(`installation invalid:\n${errors.join('\n')}`);
+    this.name = 'InvalidInstallationError';
+    this.errors = [...errors];
+  }
+}
+
+/** The one composition boundary: the checked model, or a throw naming every error. */
+export function requireValidInstallationModel(installation: FleetInstallation): FleetInstallationModel {
+  const checked = checkInstallationModel(installation);
+  if (checked.errors.length > 0) {
+    throw new InvalidInstallationError(checked.errors);
+  }
+  return checked.model;
 }

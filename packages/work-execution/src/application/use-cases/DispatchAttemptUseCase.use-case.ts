@@ -25,6 +25,7 @@ import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-p
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
 import type { RunnerSelectorPort } from '../ports/out/RunnerSelectorPort.out-port.js';
+import type { AllowedSeatPort } from '../ports/out/AllowedSeatPort.out-port.js';
 
 export interface DispatchAttemptDependencies {
   readonly workOrderRepo: WorkOrderRepositoryPort;
@@ -39,6 +40,8 @@ export interface DispatchAttemptDependencies {
    * tool has no implemented runner (e.g. `agy`) refuses before any spawn.
    */
   readonly runnerSelector?: RunnerSelectorPort;
+  /** Free-seat check (plan F3): refuses a free or unknown seat when wired. */
+  readonly allowedSeats?: AllowedSeatPort;
 }
 
 /** Boolean capabilities a dispatch may require the runner to enforce. */
@@ -411,6 +414,38 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       return { outcome: 'refused', reason: 'No model specified for dispatch' };
     }
 
+    // Free-seat policy (plan F3): with the flag off, only a catalogue seat
+    // that is not free may run. A refusal is durable (F7): it appends a
+    // `refused` journal entry before returning, keeps the reservation and
+    // saves no attempt.
+    let seatPolicyFlag: boolean | undefined;
+    if (this.deps.allowedSeats) {
+      const rawCheckTool = manifestModelAssignment.seatTool;
+      const checkTool =
+        typeof rawCheckTool === 'string' && rawCheckTool.trim() !== ''
+          ? rawCheckTool.trim()
+          : 'opencode';
+      const verdict = this.deps.allowedSeats.checkDispatchSeat({
+        tool: checkTool,
+        model: effectiveModel.trim(),
+        variant: effectiveVariant ?? null,
+      });
+      if (!verdict.allowed) {
+        await appendJournalEntry(this.deps.journal, {
+          attemptId: request.attemptId,
+          workOrderId: request.workOrderId,
+          action: 'dispatch',
+          baseCommit: request.baseCommit,
+          recordedAtIso: nowIso,
+          status: 'refused',
+          sessionId: null,
+          detail: `Free-seat policy refused dispatch: tool ${checkTool}, model ${effectiveModel}, variant ${effectiveVariant ?? 'none'}, useFreeSeats false: ${verdict.reason}`,
+        });
+        return { outcome: 'refused', reason: verdict.reason };
+      }
+      seatPolicyFlag = verdict.useFreeSeats;
+    }
+
     // Durable intent first: the journal records the dispatch before the
     // runner subprocess is contacted.
     await appendJournalEntry(this.deps.journal, {
@@ -448,6 +483,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       agent: effectiveAgent ?? null,
       model: effectiveModel,
       variant: effectiveVariant ?? null,
+      ...(seatPolicyFlag !== undefined ? { useFreeSeats: seatPolicyFlag } : {}),
     };
 
     const dispatchingAttempt: AttemptRecord = existingAttempt
@@ -508,7 +544,9 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         ...dispatchingAttempt,
         state: 'running',
         sessionId: startResult.sessionId,
-        runner: startResult.runner ?? dispatchingAttempt.runner ?? null,
+        runner: startResult.runner
+          ? { ...startResult.runner, ...(seatPolicyFlag !== undefined ? { useFreeSeats: seatPolicyFlag } : {}) }
+          : dispatchingAttempt.runner ?? null,
         updatedAtIso: nowIso,
       };
       await this.deps.attemptRepo.saveAttempt(runningAttempt);

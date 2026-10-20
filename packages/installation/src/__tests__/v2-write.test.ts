@@ -218,4 +218,18 @@ describe('writeInstallationV2', () => {
       installation,
     });
   });
+
+  it('round-trips an explicit useFreeSeats true with the key still true', () => {
+    const installation = parseV2Fixture({
+      ...validV2,
+      policy: { useFreeSeats: true },
+    });
+    const written = writeInstallationV2(installation);
+    const document = JSON.parse(written) as { policy?: { useFreeSeats?: boolean } };
+    expect(document.policy?.useFreeSeats).toBe(true);
+    expect(parseInstallation(JSON.parse(written))).toEqual({
+      ok: true,
+      installation,
+    });
+  });
 });

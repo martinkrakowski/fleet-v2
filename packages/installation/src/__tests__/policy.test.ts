@@ -132,6 +132,43 @@ describe('validateSeatPolicy', () => {
     );
   });
 
+  it('reports unknown chain seats at the file positions when file chains are given', () => {
+    // The derived chains come from a useFreeSeats false installation, so
+    // free-a is already dropped and ghost's reduced position is 0; the file
+    // position is 1 and must be named exactly once.
+    const errors = validateSeatPolicy(
+      installation({
+        seats: [seat({ id: 'free-a', model: 'a/m1', costClass: 'free' })],
+        chains: { implementer: [{ seatId: 'ghost' }] },
+        policy: { useFreeSeats: false },
+      }),
+      { implementer: [{ seatId: 'free-a' }, { seatId: 'ghost' }] },
+    );
+    expect(errors).toEqual(['chains.implementer[1]: references unknown seat "ghost"']);
+  });
+
+  it('reports chain role errors at the file positions when file chains are given', () => {
+    // The reduced position of wrong is 0 (free-a was dropped); the file
+    // position is 1 and must be the one the message names.
+    const errors = validateSeatPolicy(
+      installation({
+        seats: [
+          seat({ id: 'free-a', model: 'a/m1', costClass: 'free' }),
+          seat({ id: 'wrong', model: 'b/m2', roles: ['reviewer'], costClass: 'paid' }),
+        ],
+        chains: { implementer: [{ seatId: 'wrong' }] },
+        policy: { useFreeSeats: false },
+      }),
+      { implementer: [{ seatId: 'free-a' }, { seatId: 'wrong' }] },
+    );
+    expect(errors).toContainEqual(
+      'chains.implementer[1]: seat "wrong" does not hold the role "implementer"',
+    );
+    expect(errors).not.toContainEqual(
+      'chains.implementer[0]: seat "wrong" does not hold the role "implementer"',
+    );
+  });
+
   it('refuses a seat holding implementer and a reviewer role', () => {
     const errors = validateSeatPolicy(
       installation({
@@ -439,6 +476,60 @@ describe('loader policy enforcement', () => {
     }
   });
 
+  it('with useFreeSeats false, an unknown chain seat is refused at the file position', () => {
+    // The parser refuses the unknown seat before the policy runs and names
+    // the position itself: ghost sits at file position 1, while the reduced
+    // chain (free-a dropped) would place it at 0.
+    const file = writeV2({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: policyHosts,
+      seats: [seat({ id: 'free-a', model: 'a/m1', costClass: 'free' })],
+      chains: { implementer: [{ seatId: 'free-a' }, { seatId: 'ghost' }] },
+      policy: { useFreeSeats: false },
+    });
+    try {
+      const result = loadInstallation({ file, env: {} });
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.errors).toContainEqual('chains.implementer[1].seatId: unknown seat');
+        expect(result.errors).not.toContainEqual('chains.implementer[0].seatId: unknown seat');
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('with useFreeSeats false, chain role errors name the file position', () => {
+    // free-a is dropped from the derived chain, so the reduced position of
+    // wrong is 0; the reported position must be the file's 1.
+    const file = writeV2({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: policyHosts,
+      seats: [
+        seat({ id: 'free-a', model: 'a/m1', costClass: 'free' }),
+        seat({ id: 'wrong', model: 'b/m2', roles: ['reviewer'], costClass: 'paid' }),
+      ],
+      chains: { implementer: [{ seatId: 'free-a' }, { seatId: 'wrong' }] },
+      policy: { useFreeSeats: false },
+    });
+    try {
+      const result = loadInstallation({ file, env: {} });
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.errors).toContainEqual(
+          'chains.implementer[1]: seat "wrong" does not hold the role "implementer"',
+        );
+        expect(result.errors).not.toContainEqual(
+          'chains.implementer[0]: seat "wrong" does not hold the role "implementer"',
+        );
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
   it('with useFreeSeats false, refuses seats that look free but are not declared free', () => {
     const cases: { seat: Partial<SeatModel> & { id: string }; expected: string }[] = [
       {
@@ -455,6 +546,16 @@ describe('loader policy enforcement', () => {
         seat: { id: 'impl', model: 'x/y', variant: 'FREE', costClass: 'plan-quota' },
         expected:
           'seats.impl: model "x/y" variant "FREE" looks free but costClass is "plan-quota"; declare it free or remove it',
+      },
+      {
+        seat: { id: 'impl', model: 'x/y-free', costClass: 'paid' },
+        expected:
+          'seats.impl: model "x/y-free" looks free but costClass is "paid"; declare it free or remove it',
+      },
+      {
+        seat: { id: 'impl', model: 'x/y', variant: 'turbo-free', costClass: 'paid' },
+        expected:
+          'seats.impl: model "x/y" variant "turbo-free" looks free but costClass is "paid"; declare it free or remove it',
       },
     ];
     for (const { seat: seatOverrides, expected } of cases) {
@@ -478,6 +579,71 @@ describe('loader policy enforcement', () => {
     }
   });
 
+  it('with useFreeSeats false, an explicit empty chain is not reported as emptied', () => {
+    // The parser refuses an empty chain outright, before the free-seat drop
+    // could empty it; the emptied message never appears.
+    const file = writeV2({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: policyHosts,
+      seats: [seat({ id: 'paid-impl', model: 'b/m2', costClass: 'paid' })],
+      chains: { implementer: [{ seatId: 'paid-impl' }], reviewer: [] },
+      policy: { useFreeSeats: false },
+    });
+    try {
+      const result = loadInstallation({ file, env: {} });
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.errors).toContainEqual('chains.reviewer: must be a non-empty array');
+        expect(result.errors).not.toContainEqual(
+          'chains.reviewer: every seat is free and policy.useFreeSeats is false; add a paid or plan-quota seat',
+        );
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('with useFreeSeats false, a dropped free implementer relaxes the reviewer family rule', () => {
+    // free-impl (family m) shares a family with the reviewer rev; the flag
+    // absent refuses that file. With the flag off the drop removes the
+    // family from the implementer chain and the error disappears.
+    const base = {
+      schemaVersion: 2 as const,
+      forge: { mode: 'none' as const },
+      hosts: policyHosts,
+      seats: [
+        seat({ id: 'free-impl', model: 'a/m1', costClass: 'free' }),
+        seat({ id: 'paid-impl', model: 'b/gpt2', costClass: 'paid' }),
+        seat({ id: 'rev', model: 'c/m1', roles: ['reviewer'], costClass: 'paid' }),
+      ],
+      chains: {
+        implementer: [{ seatId: 'free-impl' }, { seatId: 'paid-impl' }],
+        reviewer: [{ seatId: 'rev' }],
+      },
+    };
+    const familyError =
+      'chains.reviewer: seat "rev" shares the implementer chain\'s model family (c/m1)';
+    try {
+      const absent = loadInstallation({ file: writeV2(base), env: {} });
+      expect(absent.status).toBe('invalid');
+      if (absent.status === 'invalid') {
+        expect(absent.errors).toContainEqual(familyError);
+      }
+      cleanup();
+      const off = loadInstallation({
+        file: writeV2({ ...base, policy: { useFreeSeats: false } }),
+        env: {},
+      });
+      expect(off.status).toBe('loaded');
+      if (off.status === 'loaded') {
+        expect(off.model.chains?.implementer).toEqual([{ seatId: 'paid-impl' }]);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
   it('without the flag, a single free implementer seat still fails the only-seat rule', () => {
     const base = {
       schemaVersion: 2 as const,
@@ -496,6 +662,25 @@ describe('loader policy enforcement', () => {
             'chains.implementer: the free seat "free-impl" must not be the only seat of the role',
           );
         }
+      } finally {
+        cleanup();
+      }
+    }
+  });
+
+  it('with the flag absent or true, a free-looking paid seat produces no looks-free error', () => {
+    const base = {
+      schemaVersion: 2 as const,
+      forge: { mode: 'none' as const },
+      hosts: policyHosts,
+      seats: [seat({ id: 'impl', model: 'x/y:free', costClass: 'paid' })],
+      chains: { implementer: [{ seatId: 'impl' }] },
+    };
+    for (const policy of [undefined, { useFreeSeats: true }]) {
+      const file = writeV2(policy === undefined ? base : { ...base, policy });
+      try {
+        const result = loadInstallation({ file, env: {} });
+        expect(result.status).toBe('loaded');
       } finally {
         cleanup();
       }

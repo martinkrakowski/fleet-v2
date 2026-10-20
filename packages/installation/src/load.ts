@@ -220,7 +220,9 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
   const { model, warnings, errors: modelErrors } = deriveInstallationModel(installation);
   if (installation.schemaVersion === 2) {
     errors.push(...(modelErrors ?? []));
-    errors.push(...validateSeatPolicy(model));
+    // The file chains go along so the reference rules report file
+    // positions when useFreeSeats false reduced the derived chains (FS1).
+    errors.push(...validateSeatPolicy(model, installation.chains));
   } else {
     // v1 files get no new refusals: their single runner/reviewer pair is
     // checked only for the family rule and reported as a warning.

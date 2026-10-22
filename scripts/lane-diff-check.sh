@@ -1,16 +1,22 @@
 #!/bin/sh
 # lane-diff-check — what an orchestrator runs over a lane's worktree BEFORE it commits or pushes what
 # a model produced. Three questions, answered without printing a single matched value:
-#   1. Did the lane touch a protected path? (.github, .gemini, .agents, .lane, .claude, .opencode,
-#      opencode.json*, bin, scripts, AGENTS.md, CLAUDE.md, GEMINI.md, package.json, yarn.lock,
-#      .architecture, .yarnrc*, .pnp.*, Dockerfile, deploy). A changed workflow runs on GitHub the
-#      moment it is pushed; a changed agent or permission file changes what the next lane may do.
-#      .claude/, .opencode/ and opencode.json* are matched case-insensitively at any depth. Every
-#      ignored, untracked file (except dependency/build output and the worktree's ignored .lane/
-#      directory) is reviewed too, so .gitignore cannot hide protected files or secrets. Decision D3
-#      (plan §3): the brief's integrity is checked by digest at dispatch (lane L7a); an ignored
-#      .lane/ file is skipped because the brief lives there in every worktree, but a .lane/ path
-#      that is tracked or committed in the diff is a protected finding.
+#   1. Did the lane touch a protected path? (.github, .gemini, .agents, .agy, .lane, .architecture,
+#      bin, scripts, deploy, installation, .yarn/plugins|releases|patches, .husky, .claude,
+#      .opencode, .cursor, .vscode, opencode.json*, AGENTS.md, CLAUDE.md, CLAUDE.local.md,
+#      GEMINI.md, .mcp.json, .cursorrules, .windsurfrules, .github/copilot-instructions.md,
+#      .gitattributes, .gitmodules, package.json, .yarnrc, .yarnrc.yml, .npmrc, yarn.lock,
+#      package-lock.json, pnpm-lock.yaml, .pnp.*, Dockerfile, Makefile, .envrc). A changed workflow
+#      runs on GitHub the moment it is pushed; a changed agent or permission file changes what the
+#      next lane may do. Agent instruction/editor files and package manifests are matched at any
+#      depth and case-insensitively (macOS volumes are case-insensitive); .yarn/plugins|releases|
+#      patches, .husky, Makefiles, .envrc, Dockerfile and .pnp.* are root-only. The protected check
+#      runs BEFORE the ignored-file keep-list, so .agents/node_modules/x or .claude/dist/x is still
+#      a protected finding while dependency/build output and the worktree's ignored .lane/ stay out
+#      of the review; package manifests under node_modules are dependency internals and are not
+#      protected. Decision D3 (plan §3): an ignored .lane/ file is skipped because the brief lives
+#      there in every worktree, but a .lane/ path that is tracked or committed in the diff is a
+#      protected finding.
 #   2. Does any changed, untracked or reviewed ignored file contain something that looks like a
 #      credential? Reported as file:line and the pattern's name only. The content is never printed.
 #      A file containing a NUL byte is still scanned, a file over 5 MiB is reported as
@@ -73,11 +79,14 @@ trap 'rm -rf "$T"' EXIT
 # delete + add so a protected source path is seen; names are taken NUL-delimited and unquoted so
 # unusual names are scanned as the real file. Any collection failure fails closed (exit 2).
 #
-# Ignored, untracked paths skipped from review: dependency trees, build output, yarn cache/state, and
-# the worktree's ignored .lane/ directory. Decision D3 (plan §3): the brief's integrity is checked by
-# digest at dispatch (lane L7a); an ignored .lane/ file is skipped because the brief lives there in
-# every worktree, but a .lane/ path that is tracked or committed in the diff is a protected finding.
-IGNORED_SKIP='(^|/)(node_modules|dist|\.next|\.turbo|\.output|coverage)/|^\.yarn/(cache/|install-state\.gz$)|^\.lane(/|$)'
+# Dependency/build output is skipped from review AFTER the protected check; the worktree's own
+# ignored .lane/ directory is also skipped (the brief lives there in every worktree). Decision D3
+# (plan §3): the brief's integrity is checked by digest at dispatch (lane L7a); an ignored .lane/
+# file is skipped because the brief lives there in every worktree, but a .lane/ path that is tracked
+# or committed in the diff is a protected finding (the protected check runs over the base list, so
+# a tracked .lane/ is still caught).
+DEP_BUILD_SKIP='(^|/)(node_modules|dist|\.next|\.turbo|\.output|coverage)/|^\.yarn/(cache/|install-state\.gz$)'
+IGNORED_SKIP="$DEP_BUILD_SKIP|^\.lane(/|$)"
 # The same pins as LaneDiffCheckAdapter's GIT_CONFIG_ARGS: a lane can write the shared .git/config,
 # and the gate's own git calls must never run a lane-chosen fsmonitor, hook, external diff or
 # filter (Fable review of L1).
@@ -100,39 +109,57 @@ collect() {
   if ! g ls-files --others --ignored --exclude-standard -z > "$T/ignored0"; then
     return 1
   fi
-  if [ "$(tr -cd '\n' < "$T/ignored0" | wc -c | tr -d ' ')" != 0 ]; then
-    return 1
-  fi
-  tr '\0' '\n' < "$T/ignored0" |
-    grep -avE "$IGNORED_SKIP" |
-    tr '\n' '\0'
 }
-collect > "$T/files0" || { echo "lane-diff-check: could not list changed files" >&2; exit 2; }
+collect > "$T/files-base0" || { echo "lane-diff-check: could not list changed files" >&2; exit 2; }
 # A file name containing a newline cannot be reviewed line by line: refuse.
-if [ "$(tr -cd '\n' < "$T/files0" | wc -c | tr -d ' ')" != 0 ]; then
+if [ "$(tr -cd '\n' < "$T/files-base0" | wc -c | tr -d ' ')" != 0 ] ||
+   [ "$(tr -cd '\n' < "$T/ignored0" | wc -c | tr -d ' ')" != 0 ]; then
   echo "lane-diff-check: a changed file name contains a newline; refusing" >&2
   exit 2
 fi
-tr '\0' '\n' < "$T/files0" | grep -av '^$' | sort -u > "$T/files"
+tr '\0' '\n' < "$T/ignored0" | grep -av '^$' > "$T/ignored"
+
+# The protected check runs over every reviewed candidate BEFORE the ignored-file keep-list
+# (L1b item 3): committed/changed/untracked paths plus all ignored files except the worktree's own
+# ignored .lane/ (the brief lives there in every worktree). The dependency/build keep-list is
+# applied only for the secret- and brief-scan list below, so .agents/node_modules/x or
+# .claude/dist/x is still a protected finding while ignored node_modules/dist output is not scanned.
+{
+  tr '\0' '\n' < "$T/files-base0" | grep -av '^$'
+  grep -avE '^\.lane(/|$)' "$T/ignored"
+} | sort -u > "$T/protected-candidates"
+
+# The secret- and brief-scan list drops the full ignored keep-list.
+grep -avE "$IGNORED_SKIP" "$T/protected-candidates" > "$T/files"
 
 say() { [ "$quiet" = 1 ] || echo "$@"; }
 findings=0
 warnings=0
 
-PROTECTED='^(\.github/|\.gemini/|\.agents/|\.agy/|\.lane/|bin/|scripts/|AGENTS\.md$|CLAUDE\.md$|GEMINI\.md$|package\.json$|[^/]+/[^/]+/package\.json$|yarn\.lock$|\.yarnrc|\.architecture/|\.pnp\.|Dockerfile$|deploy/|\.claude/|\.opencode/|opencode\.json)'
-PROTECTED_AGENT_CONFIG='(^|/)\.claude/|(^|/)\.opencode/|(^|/)opencode\.json'
+# Root-only classes (directories, files and name prefixes), case-sensitive.
+PROTECTED='^(\.github/|\.gemini/|\.agents/|\.agy/|\.lane/|\.architecture/|bin/|scripts/|deploy/|installation/|\.yarn/plugins/|\.yarn/releases/|\.yarn/patches/|\.husky/|Dockerfile$|\.pnp\.|\.claude/|\.opencode/)'
+# Root-only classes matched case-insensitively (macOS volumes).
+PROTECTED_ROOT_CI='^(Makefile$|makefile$|GNUmakefile$|\.envrc$|\.husky/)'
+# Agent instruction/editor tool files at any depth, case-insensitively.
+PROTECTED_AGENT_CONFIG='(^|/)\.claude/|(^|/)\.opencode/|(^|/)opencode\.json|(^|/)\.cursor/|(^|/)\.vscode/|(^|/)CLAUDE\.md$|(^|/)CLAUDE\.local\.md$|(^|/)AGENTS\.md$|(^|/)GEMINI\.md$|(^|/)\.mcp\.json$|(^|/)\.cursorrules$|(^|/)\.windsurfrules$|(^|/)\.github/copilot-instructions\.md$|(^|/)\.gitattributes$|(^|/)\.gitmodules$'
+# Package-manager and lockfile files at any depth, case-sensitive; dependency internals under
+# node_modules are not protected.
+PROTECTED_AGENT_FILES='(^|/)package\.json$|(^|/)\.yarnrc$|(^|/)\.yarnrc\.yml$|(^|/)\.npmrc$|(^|/)yarn\.lock$|(^|/)package-lock\.json$|(^|/)pnpm-lock\.yaml$'
 while IFS= read -r f; do
-  if ! printf '%s\n' "$f" | grep -Eq "$PROTECTED" &&
-     ! printf '%s\n' "$f" | grep -Eiq "$PROTECTED_AGENT_CONFIG"; then
-    continue
+  under_nm=0
+  printf '%s\n' "$f" | grep -Eq '(^|/)node_modules/' && under_nm=1
+  if { printf '%s\n' "$f" | grep -Eq "$PROTECTED"; } ||
+     { printf '%s\n' "$f" | grep -Eiq "$PROTECTED_ROOT_CI"; } ||
+     { printf '%s\n' "$f" | grep -Eiq "$PROTECTED_AGENT_CONFIG"; } ||
+     { [ "$under_nm" = 0 ] && printf '%s\n' "$f" | grep -Eq "$PROTECTED_AGENT_FILES"; }; then
+    if [ -n "$allow" ] && printf '%s\n' "$f" | grep -Eq "$allow"; then
+      say "allowed-protected: $f"
+      continue
+    fi
+    say "protected: $f"
+    findings=$((findings + 1))
   fi
-  if [ -n "$allow" ] && printf '%s\n' "$f" | grep -Eq "$allow"; then
-    say "allowed-protected: $f"
-    continue
-  fi
-  say "protected: $f"
-  findings=$((findings + 1))
-done < "$T/files"
+done < "$T/protected-candidates"
 
 # name|extended regex. Names are what the report prints; the matched text never is.
 cat > "$T/patterns" <<'PAT'

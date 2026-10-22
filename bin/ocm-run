@@ -98,6 +98,30 @@ if [ -n "${OCM_PORT:-}" ] && [ "$OCM_PORT" != "$port" ]; then
 fi
 url="http://127.0.0.1:$port"
 
+# curl --config is line-based: a CR or LF in a credential would end the quoted value and start a
+# new directive (Grok review of L3). Refuse such credentials before any request; name the
+# variable, never its value.
+case "${OPENCODE_SERVER_USERNAME:-}${OPENCODE_SERVER_PASSWORD:-}" in
+  *"$(printf '\r')"* | *"
+"*)
+    echo "ocm-run: OPENCODE_SERVER_USERNAME or OPENCODE_SERVER_PASSWORD contains a line break; refusing" >&2
+    exit 2
+    ;;
+esac
+
+# True when some process listening on 127.0.0.1:$port is `ssh` forwarding that port to $host
+# (lsof -Fpn gives the pids; their argv must contain ssh, -L 127.0.0.1:$port: and $host).
+ocm_port_held_by_our_forward() {
+  command -v lsof >/dev/null 2>&1 || return 1
+  for p in $(LC_ALL=C lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fpn 2>/dev/null | sed -n 's/^p//p'); do
+    a=$(LC_ALL=C ps -ww -o args= -p "$p" 2>/dev/null) || continue
+    case "$a" in
+      *ssh*"-L 127.0.0.1:$port:"*" $host"|*ssh*"-L 127.0.0.1:$port:"*" $host "*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 ocm_quote_config() { # $1 -> escaped for a curl --config quoted value
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
@@ -197,8 +221,11 @@ if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
   fi
   ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes \
     -L "127.0.0.1:$port:127.0.0.1:$remote" "$host" || {
-    if nc -z 127.0.0.1 "$port" 2>/dev/null; then
-      : # a simultaneous dispatch's forward landed between the check and ours; carry on
+    # A simultaneous dispatch's forward may have landed between the check and ours. Accept the port
+    # only when its holder is an ssh forward of this port to $host (Grok review of L3): any other
+    # listener would receive the session POST and the server credentials.
+    if nc -z 127.0.0.1 "$port" 2>/dev/null && ocm_port_held_by_our_forward; then
+      :
     else
       echo "ocm-run: could not open the tunnel to $host" >&2
       exit 1

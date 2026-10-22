@@ -373,13 +373,28 @@ cat > "$T/bin/ssh" <<SSH
 echo "\$*" >> "\$T/ssh.log"
 python3 "\$T/server.py" "\$T" "$((Q + 1))" > /dev/null 2>&1 &
 echo \$! > "\$T/racepid"
+echo \$! > "\$T/lsof-pid"
 sleep 0.3
 exit 255
 SSH
 chmod +x "$T/bin/ssh"
+# The port's holder must be an ssh forward of this port to OCM_HOST (Grok review of L3).
+printf 'ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:%s:127.0.0.1:%s ocm-test-host-that-does-not-exist\n' "$((Q + 1))" "$Q" > "$T/ps-cmd"
 out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
-check "tunnel race: after a failed ssh -L, a re-check that finds the port up still dispatches (0)" '[ "$rc" = 0 ] && grep -qF "run --attach http://127.0.0.1:$((Q + 1))" "$T/args.log" && ! echo "$out" | grep -q "could not open the tunnel"'
+check "tunnel race: after a failed ssh -L, a port held by our ssh forward still dispatches (0)" '[ "$rc" = 0 ] && grep -qF "run --attach http://127.0.0.1:$((Q + 1))" "$T/args.log" && ! echo "$out" | grep -q "could not open the tunnel"'
 [ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
+# Any other holder is refused: the session POST and the credentials must not go to it.
+clear_all
+printf 'python3 server.py\n' > "$T/ps-cmd"
+out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
+check "tunnel race: a port held by another process is refused (1), nothing dispatched" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel" && ! grep -qF "run --attach" "$T/args.log" 2>/dev/null'
+[ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
+clear_all
+printf 'ssh -f -N -L 127.0.0.1:%s:127.0.0.1:%s some-other-host\n' "$((Q + 1))" "$Q" > "$T/ps-cmd"
+out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
+check "tunnel race: an ssh forward to a different host is refused (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel"'
+[ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
+rm -f "$T/ps-cmd" "$T/lsof-pid"
 cat > "$T/bin/ssh" <<'SSH'
 #!/bin/sh
 echo "$*" >> "$T/ssh.log"
@@ -480,6 +495,11 @@ echo 4242 > "$T/lsof-pid"
 echo "ssh -N -L $P:127.0.0.1:$R m" > "$T/ps-cmd"
 out=$(run -- --check 2>&1); rc=$?
 check "holder (n): ps fallback with plain mismatch to 'm' still fails (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "goes to '\''m'\'', not OCM_HOST="'
+# Grok review of L3: a line break in a credential would add curl --config directives.
+clear_all
+out=$(run OPENCODE_SERVER_PASSWORD="$(printf 'pw\noutput="/tmp/x"')" -- --dir "$D" "p" 2>&1); rc=$?
+check "a password containing a line break is refused (2) before any request, value never printed" '[ "$rc" = 2 ] && echo "$out" | grep -q "contains a line break" && ! echo "$out" | grep -q "/tmp/x" && [ ! -s "$T/curl.args.log" ]'
+
 clear_all
 echo 4242 > "$T/lsof-pid"
 echo "ssh -N -L $P:127.0.0.1:$R ocm-test-host-that-does-not-exist" > "$T/ps-cmd"

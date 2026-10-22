@@ -55,21 +55,6 @@ done
 if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ] && [ -r "${OPENCODE_AUTH_FILE:-$HOME/.config/opencode/server-auth.env}" ]; then
   . "${OPENCODE_AUTH_FILE:-$HOME/.config/opencode/server-auth.env}"
 fi
-ocm_cr=$(printf '\r')
-ocm_nl='
-'
-case "${OPENCODE_SERVER_USERNAME:-}" in
-  *"$ocm_cr"* | *"$ocm_nl"*)
-    echo "ocm-run: OPENCODE_SERVER_USERNAME must not contain a newline or carriage return" >&2
-    exit 2
-    ;;
-esac
-case "${OPENCODE_SERVER_PASSWORD:-}" in
-  *"$ocm_cr"* | *"$ocm_nl"*)
-    echo "ocm-run: OPENCODE_SERVER_PASSWORD must not contain a newline or carriage return" >&2
-    exit 2
-    ;;
-esac
 if [ -n "${OPENCODE_SERVER_PASSWORD:-}" ]; then
   OPENCODE_SERVER_USERNAME="${OPENCODE_SERVER_USERNAME:-opencode}"
   OPENCODE_PASSWORD="$OPENCODE_SERVER_PASSWORD"
@@ -114,7 +99,7 @@ fi
 url="http://127.0.0.1:$port"
 
 ocm_quote_config() { # $1 -> escaped for a curl --config quoted value
-  printf '%s\n' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 ocm_curl() {
@@ -197,10 +182,33 @@ if [ "$has_variant" = 1 ]; then
   esac
 fi
 
-# $1: "check" (--check: log holder, refuse when an ssh forward goes to another host)
-#  or "race"  (failed ssh -L followed by nc -z ok: require an ssh forward of $port to $host)
-ocm_check_holder() {
-  ocm_hmode=$1
+if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
+  if [ "$mode" = check ]; then
+    if [ -n "$host" ]; then
+      echo "ocm-run: --check: nothing is listening on the dial port 127.0.0.1:$port (OCM_REMOTE_PORT=$remote on $host); --check opens no forward, a real dispatch would" >&2
+    else
+      echo "ocm-run: --check: nothing is listening on the dial port 127.0.0.1:$port (OCM_REMOTE_PORT=$remote) and OCM_HOST is not set; start the server on this host, a real dispatch opens no forward and exits 2" >&2
+    fi
+    exit 1
+  fi
+  if [ -z "$host" ]; then
+    echo "ocm-run: server not listening on 127.0.0.1:$port and OCM_HOST is not set" >&2
+    exit 2
+  fi
+  ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes \
+    -L "127.0.0.1:$port:127.0.0.1:$remote" "$host" || {
+    if nc -z 127.0.0.1 "$port" 2>/dev/null; then
+      : # a simultaneous dispatch's forward landed between the check and ours; carry on
+    else
+      echo "ocm-run: could not open the tunnel to $host" >&2
+      exit 1
+    fi
+  }
+fi
+
+# --check only: say who holds the dial port, and refuse when the holder is an ssh
+# forward to some other host (2026-10-18: a stale forward to the old host looked ok).
+if [ "$mode" = check ]; then
   lsof_out=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fpn 2>/dev/null)
   hpids=''
   cur_pid=''
@@ -233,185 +241,103 @@ ocm_check_holder() {
   IFS=$old_ifs
   set +f
   if [ -z "$hpids" ]; then
-    if [ "$ocm_hmode" = check ]; then
-      echo "ocm-run: --check: 127.0.0.1:$port is listening; its holder is unknown (lsof found no owner it may read), so its destination was NOT checked against OCM_HOST" >&2
-      return 0
-    fi
-    echo "ocm-run: could not open the tunnel to $host: 127.0.0.1:$port is listening, but its holder is unknown (lsof found no owner it may read)" >&2
-    return 1
-  fi
-  norm_host=$host
-  case "$norm_host" in
-    ssh://*)
-      norm_host=${norm_host#ssh://}
-      norm_host=${norm_host#*@}
-      norm_host=${norm_host%:*}
-      ;;
-    *)
-      norm_host=${norm_host#*@}
-      ;;
-  esac
-  bad_holder=0
-  for hpid in $hpids; do
-    from_proc=0
-    hargs=''
-    cmdline_file="${OCM_PROC_ROOT:-/proc}/$hpid/cmdline"
-    if [ -r "$cmdline_file" ]; then
-      hargs=$(tr '\0' '\n' < "$cmdline_file" 2>/dev/null)
-    fi
-    if [ -n "$hargs" ]; then
-      from_proc=1
-      hcmd=$(printf '%s' "$hargs" | tr '\n' ' ')
-      hcmd=${hcmd% }
-    else
-      hcmd=$(ps -ww -o command= -p "$hpid" 2>/dev/null)
-    fi
-    if [ "$ocm_hmode" = check ]; then
-      echo "ocm-run: --check: 127.0.0.1:$port is held by pid $hpid: $hcmd" >&2
-    fi
-    first=''
-    dest=''
-    has_l=0
-    if [ -n "$host" ] && [ -n "$hcmd" ]; then
-      set -f
-      skip=0
-      want_l=0
-      if [ "$from_proc" = 1 ]; then
-        IFS='
-'
-        hwords=$hargs
-      else
-        hwords=$hcmd
+    echo "ocm-run: --check: 127.0.0.1:$port is listening; its holder is unknown (lsof found no owner it may read), so its destination was NOT checked against OCM_HOST" >&2
+  else
+    norm_host=$host
+    case "$norm_host" in
+      ssh://*)
+        norm_host=${norm_host#ssh://}
+        norm_host=${norm_host#*@}
+        norm_host=${norm_host%:*}
+        ;;
+      *)
+        norm_host=${norm_host#*@}
+        ;;
+    esac
+    bad_holder=0
+    for hpid in $hpids; do
+      from_proc=0
+      hargs=''
+      cmdline_file="${OCM_PROC_ROOT:-/proc}/$hpid/cmdline"
+      if [ -r "$cmdline_file" ]; then
+        hargs=$(tr '\0' '\n' < "$cmdline_file" 2>/dev/null)
       fi
-      for w in $hwords; do
-        if [ -z "$first" ]; then
-          first=${w##*/}
-          [ "$first" = ssh ] || break
-          continue
+      if [ -n "$hargs" ]; then
+        from_proc=1
+        hcmd=$(printf '%s' "$hargs" | tr '\n' ' ')
+        hcmd=${hcmd% }
+      else
+        hcmd=$(ps -ww -o command= -p "$hpid" 2>/dev/null)
+      fi
+      echo "ocm-run: --check: 127.0.0.1:$port is held by pid $hpid: $hcmd" >&2
+      if [ -n "$host" ] && [ -n "$hcmd" ]; then
+        set -f
+        first=''
+        dest=''
+        skip=0
+        if [ "$from_proc" = 1 ]; then
+          IFS='
+'
+          hwords=$hargs
+        else
+          hwords=$hcmd
         fi
-        if [ "$want_l" = 1 ]; then
-          want_l=0
+        for w in $hwords; do
+          if [ -z "$first" ]; then
+            first=${w##*/}
+            [ "$first" = ssh ] || break
+            continue
+          fi
+          if [ "$skip" = 1 ]; then
+            skip=0
+            continue
+          fi
           case "$w" in
-            "127.0.0.1:$port:"* | "localhost:$port:"* | "*:$port:"* | "[::1]:$port:"* | "[::]:$port:"* | "$port:"*)
-              has_l=1
+            -[BbcDEeFIiJLlmOopQRSWw])
+              skip=1
+              ;;
+            -[BbcDEeFIiJLlmOopQRSWw]* | -*)
+              ;;
+            *)
+              dest=$w
+              break
               ;;
           esac
-          continue
-        fi
-        if [ "$skip" = 1 ]; then
-          skip=0
-          continue
-        fi
-        case "$w" in
-          -L)
-            want_l=1
-            ;;
-          -L*)
-            lspec=${w#-L}
-            case "$lspec" in
-              "127.0.0.1:$port:"* | "localhost:$port:"* | "*:$port:"* | "[::1]:$port:"* | "[::]:$port:"* | "$port:"*)
-                has_l=1
-                ;;
-            esac
-            ;;
-          -[BbcDEeFIiJlmOopQRSWw])
-            skip=1
-            ;;
-          -[BbcDEeFIiJLlmOopQRSWw]* | -*)
-            ;;
-          *)
-            dest=$w
-            break
-            ;;
-        esac
-      done
-      IFS=$old_ifs
-      set +f
-      if [ "$first" = ssh ] && [ -n "$dest" ]; then
-        case "$dest" in
-          ssh://*)
-            dest=${dest#ssh://}
-            dest=${dest#*@}
-            dest=${dest%:*}
-            ;;
-          *)
-            dest=${dest#*@}
-            ;;
-        esac
-        if [ "$dest" != "$norm_host" ]; then
-          if [ "$from_proc" = 0 ]; then
-            case "$hcmd" in
-              *ProxyCommand* | *RemoteCommand* | *"'"* | *'"'*)
-                if [ "$ocm_hmode" = check ]; then
+        done
+        IFS=$old_ifs
+        set +f
+        if [ "$first" = ssh ] && [ -n "$dest" ]; then
+          case "$dest" in
+            ssh://*)
+              dest=${dest#ssh://}
+              dest=${dest#*@}
+              dest=${dest%:*}
+              ;;
+            *)
+              dest=${dest#*@}
+              ;;
+          esac
+          if [ "$dest" != "$norm_host" ]; then
+            if [ "$from_proc" = 0 ]; then
+              case "$hcmd" in
+                *ProxyCommand* | *RemoteCommand* | *"'"* | *'"'*)
                   echo "ocm-run: --check: could not parse pid $hpid's ssh arguments reliably ('$dest' vs OCM_HOST='$host'); check it by hand" >&2
-                else
-                  echo "ocm-run: could not open the tunnel to $host: could not parse pid $hpid's ssh arguments reliably ('$dest' vs OCM_HOST='$host')" >&2
-                  bad_holder=1
-                fi
-                ;;
-              *)
-                if [ "$ocm_hmode" = check ]; then
+                  ;;
+                *)
                   echo "ocm-run: --check: the forward on 127.0.0.1:$port goes to '$dest', not OCM_HOST='$host'; close it (kill $hpid) and run again" >&2
-                else
-                  echo "ocm-run: could not open the tunnel to $host: the forward on 127.0.0.1:$port (pid $hpid) goes to '$dest', not OCM_HOST='$host'" >&2
-                fi
-                bad_holder=1
-                ;;
-            esac
-          else
-            if [ "$ocm_hmode" = check ]; then
-              echo "ocm-run: --check: the forward on 127.0.0.1:$port goes to '$dest', not OCM_HOST='$host'; close it (kill $hpid) and run again" >&2
+                  bad_holder=1
+                  ;;
+              esac
             else
-              echo "ocm-run: could not open the tunnel to $host: the forward on 127.0.0.1:$port (pid $hpid) goes to '$dest', not OCM_HOST='$host'" >&2
+              echo "ocm-run: --check: the forward on 127.0.0.1:$port goes to '$dest', not OCM_HOST='$host'; close it (kill $hpid) and run again" >&2
+              bad_holder=1
             fi
-            bad_holder=1
           fi
-        elif [ "$ocm_hmode" = race ] && [ "$has_l" = 0 ]; then
-          echo "ocm-run: could not open the tunnel to $host: 127.0.0.1:$port is held by pid $hpid ($hcmd), not an ssh forward of port $port to $host" >&2
-          bad_holder=1
         fi
-      elif [ "$ocm_hmode" = race ]; then
-        echo "ocm-run: could not open the tunnel to $host: 127.0.0.1:$port is held by pid $hpid ($hcmd), not an ssh forward to $host" >&2
-        bad_holder=1
       fi
-    elif [ "$ocm_hmode" = race ]; then
-      echo "ocm-run: could not open the tunnel to $host: 127.0.0.1:$port is held by pid $hpid (${hcmd:-unknown}), not an ssh forward to $host" >&2
-      bad_holder=1
-    fi
-  done
-  [ "$bad_holder" = 0 ]
-}
-
-if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
-  if [ "$mode" = check ]; then
-    if [ -n "$host" ]; then
-      echo "ocm-run: --check: nothing is listening on the dial port 127.0.0.1:$port (OCM_REMOTE_PORT=$remote on $host); --check opens no forward, a real dispatch would" >&2
-    else
-      echo "ocm-run: --check: nothing is listening on the dial port 127.0.0.1:$port (OCM_REMOTE_PORT=$remote) and OCM_HOST is not set; start the server on this host, a real dispatch opens no forward and exits 2" >&2
-    fi
-    exit 1
+    done
+    [ "$bad_holder" = 1 ] && exit 1
   fi
-  if [ -z "$host" ]; then
-    echo "ocm-run: server not listening on 127.0.0.1:$port and OCM_HOST is not set" >&2
-    exit 2
-  fi
-  ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes \
-    -L "127.0.0.1:$port:127.0.0.1:$remote" "$host" || {
-    if nc -z 127.0.0.1 "$port" 2>/dev/null; then
-      # A simultaneous dispatch's forward may have landed between our check and ssh -L;
-      # carry on only if the holder of 127.0.0.1:$port is an ssh forward of this port to $host.
-      ocm_check_holder race || exit 1
-    else
-      echo "ocm-run: could not open the tunnel to $host" >&2
-      exit 1
-    fi
-  }
-fi
-
-# --check only: say who holds the dial port, and refuse when the holder is an ssh
-# forward to some other host (2026-10-18: a stale forward to the old host looked ok).
-if [ "$mode" = check ]; then
-  ocm_check_holder check || exit 1
 fi
 
 probe=$(ocm_curl -s -m 5 -w '\n%{http_code}:%{content_type}' "$url/api/info") || {

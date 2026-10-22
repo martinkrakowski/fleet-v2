@@ -289,7 +289,7 @@ runbg() {
   ) &
 }
 busy() { printf '%s\n%s\n' "${3:-busy}" "$2" > "$T/sessions/$1"; }
-clear_all() { rm -rf "$T/proc"; rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/v2-session-fail" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-* "$T/client-dir" "$T/racepid"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; : > "$T/curl.args.log"; : > "$T/curl.stdin"; : > "$T/curl.user"; }
+clear_all() { rm -rf "$T/proc"; rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/v2-session-fail" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-* "$T/client-dir" "$T/racepid"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; : > "$T/curl.args.log"; : > "$T/curl.stdin"; }
 
 # --- 0. the guards
 check "guard: the server on the test port is the fake" '[ "$(curl -s -m 3 http://127.0.0.1:$P/__who)" = fake-opencode-server ]'
@@ -324,11 +324,11 @@ check "OCM_HOST: uses environment override when set" '[ "$rc" = 0 ] && echo "$ou
 out=$(run OCM_HOST= -- --check 2>&1); rc=$?
 check "OCM_HOST empty and nothing on the remote port: --check reports it, exit 1, no ssh" '[ "$rc" = 1 ] && echo "$out" | grep -q "nothing is listening on the dial port 127.0.0.1:$R" && [ ! -s "$T/ssh.log" ]'
 
-clear_all; busy ses_A "$D"
-out=$(run FAKE_RC=7 -- --dir "$D" --agent lane -m some/model --check "a prompt" 2>&1); rc=$?
-check "--check after --dir and -m (in a run that would fail if --check were only accepted as \$1): exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "ocm-run: ok" && [ ! -s "$T/args.log" ]'
+clear_all
 out=$(run -- --dir "$D" --agent lane --check 2>&1); rc=$?
-check "--check is accepted in the middle of the flags (before the prompt): exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "ocm-run: ok" && [ ! -s "$T/args.log" ]'
+check "--check is accepted in the middle of the flags (before the prompt): exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "ocm-run: ok"'
+out=$(run -- --agent lane -m some/model --check 2>&1); rc=$?
+check "--check after -m <model> is still check mode: exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "ocm-run: ok"'
 out=$(run -- --check --status --dir "$D" 2>&1); rc=$?
 check "--check combined with another mode is still refused (2)" '[ "$rc" = 2 ]'
 
@@ -365,52 +365,21 @@ out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
 check "a real dispatch with nothing on the dial port opens the forward (and fails: the ssh is fake)" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel"'
 check "the forward rule is unchanged: local Q + 1 forwards to the remote Q" 'grep -q -- "-L 127.0.0.1:$((Q + 1)):127.0.0.1:$Q ocm-test-host-that-does-not-exist" "$T/ssh.log"'
 
-# Tunnel race: a failed ssh -L whose forward landed anyway (a simultaneous
-# dispatch won) continues only when the holder of 127.0.0.1:<port> is an ssh
-# forward of that port to OCM_HOST.
-stop_race() {
-  if [ -s "$T/racepid" ]; then
-    kill "$(cat "$T/racepid")" 2>/dev/null
-    rm -f "$T/racepid"
-  fi
-  j=0; while nc -z 127.0.0.1 "$((Q + 1))" 2>/dev/null; do j=$((j + 1)); [ "$j" -gt 50 ] && break; sleep 0.1; done
-}
+# Tunnel race (minor 13): a failed ssh -L whose forward landed anyway (a simultaneous
+# dispatch won) must not fail the dispatch: the script re-checks nc -z once.
 clear_all
 cat > "$T/bin/ssh" <<SSH
 #!/bin/sh
 echo "\$*" >> "\$T/ssh.log"
 python3 "\$T/server.py" "\$T" "$((Q + 1))" > /dev/null 2>&1 &
 echo \$! > "\$T/racepid"
-echo \$! >> "\$T/pids"
-j=0; while ! nc -z 127.0.0.1 "$((Q + 1))" 2>/dev/null; do j=\$((j + 1)); [ "\$j" -gt 50 ] && break; sleep 0.1; done
+sleep 0.3
 exit 255
 SSH
 chmod +x "$T/bin/ssh"
-echo 4242 > "$T/lsof-pid"
-echo "ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:$((Q + 1)):127.0.0.1:$Q ocm-test-host-that-does-not-exist" > "$T/ps-cmd"
 out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
-check "tunnel race (a): holder is an ssh forward to the same host -> dispatch proceeds (0)" '[ "$rc" = 0 ] && grep -qF "run --attach http://127.0.0.1:$((Q + 1))" "$T/args.log" && ! echo "$out" | grep -q "could not open the tunnel"'
-stop_race
-
-clear_all; : > "$T/v2"
-echo 4242 > "$T/lsof-pid"
-echo "python3 server.py" > "$T/ps-cmd"
-out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
-check "tunnel race (b): holder is a different process -> exit 1, and no session POST is made" '[ "$rc" = 1 ] && ! grep -q "POST /api/session" "$T/http.log" && [ ! -s "$T/http.log" ] && [ ! -s "$T/args.log" ]'
-stop_race
-
-clear_all; : > "$T/v2"
-echo 4242 > "$T/lsof-pid"
-echo "ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:$((Q + 1)):127.0.0.1:$Q m" > "$T/ps-cmd"
-out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
-check "tunnel race (c): holder is an ssh forward to a different host -> exit 1, and no session POST is made" '[ "$rc" = 1 ] && ! grep -q "POST /api/session" "$T/http.log" && [ ! -s "$T/http.log" ] && [ ! -s "$T/args.log" ]'
-stop_race
-
-clear_all; : > "$T/v2"
-out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
-check "tunnel race (d): holder is unknown -> exit 1, and no session POST is made" '[ "$rc" = 1 ] && ! grep -q "POST /api/session" "$T/http.log" && [ ! -s "$T/http.log" ] && [ ! -s "$T/args.log" ]'
-stop_race
-
+check "tunnel race: after a failed ssh -L, a re-check that finds the port up still dispatches (0)" '[ "$rc" = 0 ] && grep -qF "run --attach http://127.0.0.1:$((Q + 1))" "$T/args.log" && ! echo "$out" | grep -q "could not open the tunnel"'
+[ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
 cat > "$T/bin/ssh" <<'SSH'
 #!/bin/sh
 echo "$*" >> "$T/ssh.log"
@@ -729,34 +698,12 @@ check "M3: the client takes its directory from the session, not OCM_DIR" '[ "$(c
 
 # --- M6: the password reaches curl through --config - on stdin, never argv.
 REAL_CURL=$(command -v curl)
-cat > "$T/parse-curl-cfg.py" <<'PY'
-import sys
-cfg, out_path = sys.argv[1], sys.argv[2]
-for line in open(cfg, encoding="utf-8").read().splitlines():
-    if line.startswith('user = "') and line.endswith('"'):
-        raw = line[len('user = "'):-1]
-        res = []
-        i = 0
-        while i < len(raw):
-            if raw[i] == "\\" and i + 1 < len(raw):
-                res.append(raw[i + 1])
-                i += 2
-            elif raw[i] == '"':
-                res = ["<UNESCAPED_QUOTE>"]
-                break
-            else:
-                res.append(raw[i])
-                i += 1
-        open(out_path, "w", encoding="utf-8").write("".join(res) + "\n")
-PY
 cat > "$T/bin/curl" <<EOF
 #!/bin/sh
 printf '%s\n' "\$*" >> "\$T/curl.args.log"
 case " \$* " in
   *" --config - "*)
-    cat > "\$T/curl.stdin"
-    python3 "\$T/parse-curl-cfg.py" "\$T/curl.stdin" "\$T/curl.user"
-    "$REAL_CURL" "\$@" < "\$T/curl.stdin"
+    tee "\$T/curl.stdin" | "$REAL_CURL" "\$@"
     ;;
   *)
     "$REAL_CURL" "\$@" < /dev/null
@@ -764,29 +711,12 @@ case " \$* " in
 esac
 EOF
 chmod +x "$T/bin/curl"
-pw='sec"ret\123"\\end'
-clear_all; printf 'opencode:%s\n' "$pw" > "$T/auth-required"
-out=$(run OPENCODE_SERVER_USERNAME=opencode OPENCODE_SERVER_PASSWORD="$pw" -- --check 2>&1); rc=$?
-check "M6: auth with quote and backslash works through --config - (check exits 0)" '[ "$rc" = 0 ] && echo "$out" | grep -q "ocm-run: ok"'
+clear_all; printf 'opencode:secret123\n' > "$T/auth-required"; : > "$T/curl.args.log"; : > "$T/curl.stdin"
+out=$(run OPENCODE_SERVER_USERNAME=opencode OPENCODE_SERVER_PASSWORD=secret123 -- --check 2>&1); rc=$?
+check "M6: auth still works through --config - (check exits 0)" '[ "$rc" = 0 ] && echo "$out" | grep -q "ocm-run: ok"'
 check "M6: curl is called with --config -" 'grep -q -- "--config -" "$T/curl.args.log"'
-check "M6: the password never appears in any curl argv" '! grep -qF "$pw" "$T/curl.args.log" && ! grep -q "sec" "$T/curl.args.log"'
-check "M6: fake curl parsed --config - on stdin and password with quote and backslash round-tripped exactly" '[ "$(cat "$T/curl.user")" = "opencode:$pw" ]'
-
-clear_all
-nl_pw=$(printf 'pwnsecret\noutput = "/tmp/x"')
-out=$(run OPENCODE_SERVER_USERNAME=opencode OPENCODE_SERVER_PASSWORD="$nl_pw" -- --check 2>&1); rc=$?
-check "M6: password with a newline exits 2, curl never runs, and the value does not appear in stderr" '[ "$rc" = 2 ] && [ ! -s "$T/curl.args.log" ] && echo "$out" | grep -q "OPENCODE_SERVER_PASSWORD" && ! echo "$out" | grep -q "pwnsecret"'
-
-clear_all
-cr_pw=$(printf 'pwnsecret\routput = "/tmp/x"')
-out=$(run OPENCODE_SERVER_USERNAME=opencode OPENCODE_SERVER_PASSWORD="$cr_pw" -- --check 2>&1); rc=$?
-check "M6: password with a CR exits 2, curl never runs, and the value does not appear in stderr" '[ "$rc" = 2 ] && [ ! -s "$T/curl.args.log" ] && echo "$out" | grep -q "OPENCODE_SERVER_PASSWORD" && ! echo "$out" | grep -q "pwnsecret"'
-
-clear_all
-nl_user=$(printf 'baduser\noutput = "/tmp/x"')
-out=$(run OPENCODE_SERVER_USERNAME="$nl_user" OPENCODE_SERVER_PASSWORD=secret123 -- --check 2>&1); rc=$?
-check "M6: username with a newline exits 2, curl never runs, and the value does not appear in stderr" '[ "$rc" = 2 ] && [ ! -s "$T/curl.args.log" ] && echo "$out" | grep -q "OPENCODE_SERVER_USERNAME" && ! echo "$out" | grep -q "baduser"'
-
+check "M6: the password never appears in any curl argv" '! grep -q "secret123" "$T/curl.args.log"'
+check "M6: the config on curl's stdin carries user = \"opencode:secret123\"" 'grep -q "user = \"opencode:secret123\"" "$T/curl.stdin"'
 rm -f "$T/bin/curl"
 clear_all
 

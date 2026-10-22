@@ -662,6 +662,8 @@ describe("isFixedProtectedPath (script parity, O14d1)", () => {
         });
       }
     },
+    // It runs the real script over 40+ paths in a temporary repository: about 8 s under load.
+    60_000,
   );
 
   it("also covers the plan's additions, case-variant yarn/npm/package rules, and non-package.json rules under node_modules", () => {

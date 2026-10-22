@@ -263,6 +263,30 @@ echo '{"scripts":{}}' > packages/x/node_modules/y/package.json
 run "$R" --base base
 check 'a package.json under node_modules is not a finding (L1b)' '[ "$(rc)" = 0 ] && ! grep -q "node_modules/y/package.json" "$T/o"'
 rm -rf packages/x/node_modules
+mkdir -p .Yarn/plugins
+echo '{"scripts":{}}' > Package.json
+echo 'y' > .Yarnrc.yml
+echo 'n' > .NPMRC
+echo 'p' > .PNP.cjs
+echo 'x' > .Yarn/plugins/x
+run "$R" --base base
+check 'case-variant Package.json is a protected finding (L1b fix-1)' '[ "$(rc)" = 1 ] && grep -q "^protected: Package.json$" "$T/o"'
+check 'case-variant .Yarnrc.yml is a protected finding (L1b fix-1)' 'grep -q "^protected: .Yarnrc.yml$" "$T/o"'
+check 'case-variant .NPMRC is a protected finding (L1b fix-1)' 'grep -q "^protected: .NPMRC$" "$T/o"'
+check 'case-variant .PNP.cjs is a protected finding (L1b fix-1)' 'grep -q "^protected: .PNP.cjs$" "$T/o"'
+check 'case-variant .Yarn/plugins/x is a protected finding (L1b fix-1)' 'grep -q "^protected: .Yarn/plugins/x$" "$T/o"'
+rm -rf Package.json .Yarnrc.yml .NPMRC .PNP.cjs .Yarn
+mkdir -p node_modules/x packages/app/node_modules
+echo 'r' > node_modules/AGENTS.md
+echo 'r' > packages/app/node_modules/.cursorrules
+echo 'x' > node_modules/x/.yarnrc
+echo 'x' > node_modules/x/.gitattributes
+run "$R" --base base
+check 'node_modules/AGENTS.md is a protected finding (L1b fix-1)' '[ "$(rc)" = 1 ] && grep -q "^protected: node_modules/AGENTS.md$" "$T/o"'
+check 'packages/app/node_modules/.cursorrules is a protected finding (L1b fix-1)' 'grep -q "^protected: packages/app/node_modules/.cursorrules$" "$T/o"'
+check 'node_modules/x/.yarnrc is a protected finding (L1b fix-1)' 'grep -q "^protected: node_modules/x/.yarnrc$" "$T/o"'
+check 'node_modules/x/.gitattributes is a protected finding (L1b fix-1)' 'grep -q "^protected: node_modules/x/.gitattributes$" "$T/o"'
+rm -rf node_modules packages/app/node_modules
 
 echo '# L1b item 2: agent instruction and tool files at any depth'
 mkdir -p packages/app/.cursor packages/app/.vscode packages/app/.github
@@ -292,7 +316,6 @@ mkdir -p .husky packages/app/.husky
 echo 'x' > .envrc
 echo 'x' > .husky/pre-commit
 echo 'all:' > Makefile
-echo 'all:' > makefile
 echo 'all:' > GNUmakefile
 echo 'x' > packages/app/.envrc
 echo 'x' > packages/app/.husky/pre-commit
@@ -301,11 +324,13 @@ run "$R" --base base
 check 'a root .envrc is a protected finding (L1b)' '[ "$(rc)" = 1 ] && grep -q "^protected: .envrc$" "$T/o"'
 check 'a root .husky/pre-commit is a protected finding (L1b)' 'grep -q "^protected: .husky/pre-commit$" "$T/o"'
 check 'a root Makefile is a protected finding (L1b)' 'grep -q "^protected: Makefile$" "$T/o"'
-check 'a root makefile is a protected finding (L1b)' 'grep -q "^protected: makefile$" "$T/o"'
 check 'a root GNUmakefile is a protected finding (L1b)' 'grep -q "^protected: GNUmakefile$" "$T/o"'
 check 'a nested .envrc is not a finding (root only, L1b)' '! grep -q "^protected: packages/app/.envrc$" "$T/o"'
-check 'a nested .husky/ is not a finding (root only, L1b)' '! grep -q "^protected: packages/app/.husky/" "$T/o"'
+check 'a nested .husky/ is not a finding (root only, L1b)' '! grep -q "^protected: packages/app/.husky/pre-commit$" "$T/o"'
 check 'a nested Makefile is not a finding (root only, L1b)' '! grep -q "^protected: packages/app/Makefile$" "$T/o"'
+rm -f Makefile && echo 'all:' > makefile
+run "$R" --base base
+check 'a root makefile is a protected finding (L1b)' '[ "$(rc)" = 1 ] && grep -q "^protected: makefile$" "$T/o"'
 rm -rf .envrc .husky Makefile makefile GNUmakefile packages/app/.envrc packages/app/.husky packages/app/Makefile
 echo 'x' > packages/x/.gitattributes
 echo 'x' > packages/x/.gitmodules
@@ -316,13 +341,13 @@ rm -f packages/x/.gitattributes packages/x/.gitmodules
 
 echo '# L1b item 3: the protected check runs before the ignored-file keep-list'
 cp .gitignore "$T/gitignore.bak"
-printf '/.claude/\n' >> .gitignore
+printf '/.claude/\n.agents/\nnode_modules/\ndist/\n' >> .gitignore
 mkdir -p .agents/node_modules .claude/dist
 echo '{"tools":[]}' > .agents/node_modules/x.json
 echo '{"hooks":[]}' > .claude/dist/x.json
 run "$R" --base base
-check '.agents/node_modules/x is still a protected finding (L1b)' '[ "$(rc)" = 1 ] && grep -q "^protected: .agents/node_modules/x.json$" "$T/o"'
-check '.claude/dist/x is still a protected finding (L1b)' 'grep -q "^protected: .claude/dist/x.json$" "$T/o"'
+check '.agents/node_modules/x is still a protected finding (L1b)' 'git check-ignore -q .agents/node_modules/x.json && [ "$(rc)" = 1 ] && grep -q "^protected: .agents/node_modules/x.json$" "$T/o"'
+check '.claude/dist/x is still a protected finding (L1b)' 'git check-ignore -q .claude/dist/x.json && grep -q "^protected: .claude/dist/x.json$" "$T/o"'
 rm -rf .agents/node_modules .claude/dist
 cp "$T/gitignore.bak" .gitignore
 
@@ -330,14 +355,25 @@ echo '# L1b item 5: git config filter drivers are reported and neutralised'
 git config filter.evil.clean "touch $T/evil-ran"
 git config filter.evil.smudge "touch $T/evil-ran-smudge"
 git config filter.evil.process "touch $T/evil-ran-process"
-echo 'x' > packages/x/src/e.ts
+echo '* filter=evil' > .gitattributes
+echo 'export const a = 333;' > packages/x/src/a.ts
 run "$R" --base base
 check 'a non-lfs git config filter driver is a finding (L1b)' '[ "$(rc)" = 1 ] && grep -q "^git-config-filter: evil$" "$T/o"'
 check 'the gate never ran the lane-set filter driver (L1b)' '[ ! -e "$T/evil-ran" ] && [ ! -e "$T/evil-ran-smudge" ] && [ ! -e "$T/evil-ran-process" ]'
 git config --unset filter.evil.clean
 git config --unset filter.evil.smudge
 git config --unset filter.evil.process
-rm -f packages/x/src/e.ts
+git checkout -q -- packages/x/src/a.ts
+rm -f .gitattributes
+printf '[filter "inc"]\n\tclean = touch %s/inc-ran\n' "$T" > "$T/inc.gitconfig"
+git config include.path "$T/inc.gitconfig"
+echo '* filter=inc' > .gitattributes
+echo 'export const a = 333;' > packages/x/src/a.ts
+run "$R" --base base
+check 'a filter driver set via include.path is reported and never run (L1b)' '[ "$(rc)" = 1 ] && grep -q "^git-config-filter: inc$" "$T/o" && [ ! -e "$T/inc-ran" ]'
+git config --unset include.path
+git checkout -q -- packages/x/src/a.ts
+rm -f .gitattributes "$T/inc.gitconfig"
 
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"

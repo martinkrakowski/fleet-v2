@@ -2,41 +2,42 @@
 # pattern: ERE fragment; a trailing "/" is a directory, a trailing "*" is a name
 #   prefix, anything else is the exact file name (may contain "/").
 # anyDepth: 1 = match at any depth, 0 = repository root only.
-# caseInsensitive: 1 = match case-insensitively (macOS volumes are case-insensitive).
+# caseInsensitive: 1 = match case-insensitively (every rule is 1: macOS volumes
+#   are case-insensitive).
 # This table is the single source the shell reads and the TypeScript domain mirrors
 # (packages/work-execution/src/domain/lane-diff-check.ts); a parity test keeps them equal.
-\.git/	0	0
-\.github/	0	0
-\.gemini/	0	0
-\.agents/	0	0
-\.agy/	0	0
-\.lane/	0	0
-\.architecture/	0	0
-bin/	0	0
-scripts/	0	0
-deploy/	0	0
-installation/	0	0
-\.yarn/plugins/	0	0
-\.yarn/releases/	0	0
-\.yarn/patches/	0	0
+\.git/	0	1
+\.github/	0	1
+\.gemini/	0	1
+\.agents/	0	1
+\.agy/	0	1
+\.lane/	0	1
+\.architecture/	0	1
+bin/	0	1
+scripts/	0	1
+deploy/	0	1
+installation/	0	1
+\.yarn/plugins/	0	1
+\.yarn/releases/	0	1
+\.yarn/patches/	0	1
 \.husky/	0	1
 \.claude/	1	1
 \.opencode/	1	1
 \.cursor/	1	1
 \.vscode/	1	1
-Dockerfile	0	0
+Dockerfile	0	1
 Makefile	0	1
 makefile	0	1
 GNUmakefile	0	1
 \.envrc	0	1
-\.pnp\.*	0	0
-package\.json	1	0
-\.yarnrc	1	0
-\.yarnrc\.yml	1	0
-\.npmrc	1	0
-yarn\.lock	1	0
-package-lock\.json	1	0
-pnpm-lock\.yaml	1	0
+\.pnp\.*	0	1
+package\.json	1	1
+\.yarnrc	1	1
+\.yarnrc\.yml	1	1
+\.npmrc	1	1
+yarn\.lock	1	1
+package-lock\.json	1	1
+pnpm-lock\.yaml	1	1
 CLAUDE\.md	1	1
 CLAUDE\.local\.md	1	1
 AGENTS\.md	1	1

@@ -61,11 +61,11 @@ export interface LaneDiffVerdict {
  * `scripts/lane-diff-check.protected`: a trailing "/" is a directory rule, a
  * trailing "*" is a name-prefix rule, anything else is the exact file name
  * (it may contain "/"). `anyDepth` matches at any depth (repository root only
- * otherwise); `caseInsensitive` folds case (macOS volumes are
- * case-insensitive). File and prefix rules do not apply under a
- * `node_modules/` directory — dependency internals are never manifests or
- * agent files — while directory rules still do, so `.agents/node_modules/x`
- * stays protected.
+ * otherwise); `caseInsensitive` folds case (every rule is case-insensitive:
+ * macOS volumes are case-insensitive). Only `package.json` is exempted under a
+ * `node_modules/` directory (dependency manifests); every other rule still
+ * applies under `node_modules/`, so `node_modules/AGENTS.md`,
+ * `node_modules/x/.yarnrc` and `.agents/node_modules/x` stay protected.
  */
 export interface LaneDiffProtectedRule {
   readonly pattern: string;
@@ -80,20 +80,20 @@ export interface LaneDiffProtectedRule {
  */
 export const PROTECTED_PATH_RULES: readonly LaneDiffProtectedRule[] = [
   // Repository-root directories.
-  { pattern: "\\.git/", anyDepth: false, caseInsensitive: false },
-  { pattern: "\\.github/", anyDepth: false, caseInsensitive: false },
-  { pattern: "\\.gemini/", anyDepth: false, caseInsensitive: false },
-  { pattern: "\\.agents/", anyDepth: false, caseInsensitive: false },
-  { pattern: "\\.agy/", anyDepth: false, caseInsensitive: false },
-  { pattern: "\\.lane/", anyDepth: false, caseInsensitive: false },
-  { pattern: "\\.architecture/", anyDepth: false, caseInsensitive: false },
-  { pattern: "bin/", anyDepth: false, caseInsensitive: false },
-  { pattern: "scripts/", anyDepth: false, caseInsensitive: false },
-  { pattern: "deploy/", anyDepth: false, caseInsensitive: false },
-  { pattern: "installation/", anyDepth: false, caseInsensitive: false },
-  { pattern: "\\.yarn/plugins/", anyDepth: false, caseInsensitive: false },
-  { pattern: "\\.yarn/releases/", anyDepth: false, caseInsensitive: false },
-  { pattern: "\\.yarn/patches/", anyDepth: false, caseInsensitive: false },
+  { pattern: "\\.git/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.github/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.gemini/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.agents/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.agy/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.lane/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.architecture/", anyDepth: false, caseInsensitive: true },
+  { pattern: "bin/", anyDepth: false, caseInsensitive: true },
+  { pattern: "scripts/", anyDepth: false, caseInsensitive: true },
+  { pattern: "deploy/", anyDepth: false, caseInsensitive: true },
+  { pattern: "installation/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.yarn/plugins/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.yarn/releases/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.yarn/patches/", anyDepth: false, caseInsensitive: true },
   { pattern: "\\.husky/", anyDepth: false, caseInsensitive: true },
   // Directories at any depth (agent and editor tool trees).
   { pattern: "\\.claude/", anyDepth: true, caseInsensitive: true },
@@ -101,21 +101,21 @@ export const PROTECTED_PATH_RULES: readonly LaneDiffProtectedRule[] = [
   { pattern: "\\.cursor/", anyDepth: true, caseInsensitive: true },
   { pattern: "\\.vscode/", anyDepth: true, caseInsensitive: true },
   // Repository-root files.
-  { pattern: "Dockerfile", anyDepth: false, caseInsensitive: false },
+  { pattern: "Dockerfile", anyDepth: false, caseInsensitive: true },
   { pattern: "Makefile", anyDepth: false, caseInsensitive: true },
   { pattern: "makefile", anyDepth: false, caseInsensitive: true },
   { pattern: "GNUmakefile", anyDepth: false, caseInsensitive: true },
   { pattern: "\\.envrc", anyDepth: false, caseInsensitive: true },
   // Repository-root name prefixes.
-  { pattern: "\\.pnp\\.*", anyDepth: false, caseInsensitive: false },
+  { pattern: "\\.pnp\\.*", anyDepth: false, caseInsensitive: true },
   // Files at any depth (package managers, lockfiles, git plumbing).
-  { pattern: "package\\.json", anyDepth: true, caseInsensitive: false },
-  { pattern: "\\.yarnrc", anyDepth: true, caseInsensitive: false },
-  { pattern: "\\.yarnrc\\.yml", anyDepth: true, caseInsensitive: false },
-  { pattern: "\\.npmrc", anyDepth: true, caseInsensitive: false },
-  { pattern: "yarn\\.lock", anyDepth: true, caseInsensitive: false },
-  { pattern: "package-lock\\.json", anyDepth: true, caseInsensitive: false },
-  { pattern: "pnpm-lock\\.yaml", anyDepth: true, caseInsensitive: false },
+  { pattern: "package\\.json", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.yarnrc", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.yarnrc\\.yml", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.npmrc", anyDepth: true, caseInsensitive: true },
+  { pattern: "yarn\\.lock", anyDepth: true, caseInsensitive: true },
+  { pattern: "package-lock\\.json", anyDepth: true, caseInsensitive: true },
+  { pattern: "pnpm-lock\\.yaml", anyDepth: true, caseInsensitive: true },
   // Agent instruction and tool files at any depth, case-insensitively.
   { pattern: "CLAUDE\\.md", anyDepth: true, caseInsensitive: true },
   { pattern: "CLAUDE\\.local\\.md", anyDepth: true, caseInsensitive: true },
@@ -160,11 +160,10 @@ interface ProtectedRuleMatcher {
   readonly regex: RegExp;
 }
 
-/** Precompiled matchers, mirroring the shell's grep groups exactly. */
+/** Precompiled matchers, mirroring the shell's case-insensitive grep groups. */
 const PROTECTED_MATCHERS: readonly ProtectedRuleMatcher[] =
   PROTECTED_PATH_RULES.map((rule) => {
     const body = ruleBody(rule);
-    const flags = rule.caseInsensitive ? "i" : "";
     const any = `(^|/)${body}`;
     const root = `^${body}`;
     let source: string;
@@ -179,19 +178,19 @@ const PROTECTED_MATCHERS: readonly ProtectedRuleMatcher[] =
         source = `${rule.anyDepth ? any : root}$`;
         break;
     }
-    return { rule, regex: new RegExp(source, flags) };
+    return { rule, regex: new RegExp(source, "i") };
   });
 
 /** True when some ancestor directory of the path is named `node_modules`. */
 function isUnderNodeModules(path: string): boolean {
-  return new RegExp("(^|/)node_modules/").test(path);
+  return /(^|\/)node_modules\//i.test(path);
 }
 
-/** Every rule that protects `path` (file rules suppressed under node_modules). */
+/** Every rule that protects `path` (only `package.json` is exempted under `node_modules/`). */
 function protectingMatchers(path: string): readonly ProtectedRuleMatcher[] {
   return PROTECTED_MATCHERS.filter(({ rule, regex }) => {
     if (!regex.test(path)) return false;
-    if (ruleKind(rule.pattern) !== "dir" && isUnderNodeModules(path)) {
+    if (rule.pattern === "package\\.json" && isUnderNodeModules(path)) {
       return false;
     }
     return true;

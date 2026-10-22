@@ -34,19 +34,17 @@ set -u
 LC_ALL=C; export LC_ALL; unset LANGUAGE 2>/dev/null || true
 
 # The protected-path table is the single source for this script and the TypeScript domain
-# (S2); see scripts/lane-diff-check.protected for the format. Four grep regexes are built from
-# it: root-only vs any-depth, each case-sensitive and case-insensitive.
+# (S2); see scripts/lane-diff-check.protected for the format. Every rule is matched
+# case-insensitively (grep -i): macOS volumes are case-insensitive. Only package.json is
+# exempted under a node_modules/ directory (dependency manifests); every other rule still
+# applies under node_modules/, so node_modules/AGENTS.md, node_modules/x/.yarnrc and
+# .agents/node_modules/x stay protected (L1b items 1-3, fix-1).
 self_dir=$(CDPATH= cd -P "$(dirname "$0")" 2>/dev/null && pwd) || exit 2
 RULE_FILE="$self_dir/lane-diff-check.protected"
 [ -f "$RULE_FILE" ] || { echo "lane-diff-check: missing $RULE_FILE" >&2; exit 2; }
 
-# Eight groups: root-only vs any-depth, directory/prefix vs file rules, case-sensitive vs
-# case-insensitive. File rules do not apply under any node_modules/ directory (dependency
-# internals are never protected as manifests or agent files), while directory rules still do, so
-# .agents/node_modules/x stays protected (L1b items 1 and 3).
-ROOT_DIRPRE_CS=''; ROOT_DIRPRE_CI=''; ANY_DIRPRE_CS=''; ANY_DIRPRE_CI=''
-ROOT_FILE_CS=''; ROOT_FILE_CI=''; ANY_FILE_CS=''; ANY_FILE_CI=''
-while IFS='	' read -r pat any ci; do
+ROOT_CI=''; ANY_CI=''; NM_EXEMPT_CI=''
+while IFS='	' read -r pat any _ci; do
   case "$pat" in '' | \#*) continue ;; esac
   case "$pat" in
     */) kind=dir; body=${pat%/} ;;
@@ -58,21 +56,12 @@ while IFS='	' read -r pat any ci; do
     pre)  [ "$any" = 1 ] && a="(^|/)$body" || a="^$body" ;;
     file) [ "$any" = 1 ] && a="(^|/)$body\$" || a="^$body\$" ;;
   esac
-  case "$kind" in dir) g=dirpre ;; *) g=file ;; esac
-  if [ "$ci" = 1 ]; then
-    case "$g:$any" in
-      dirpre:1) ANY_DIRPRE_CI="${ANY_DIRPRE_CI:+$ANY_DIRPRE_CI|}$a" ;;
-      dirpre:0) ROOT_DIRPRE_CI="${ROOT_DIRPRE_CI:+$ROOT_DIRPRE_CI|}$a" ;;
-      file:1) ANY_FILE_CI="${ANY_FILE_CI:+$ANY_FILE_CI|}$a" ;;
-      file:0) ROOT_FILE_CI="${ROOT_FILE_CI:+$ROOT_FILE_CI|}$a" ;;
-    esac
+  if [ "$pat" = 'package\.json' ]; then
+    NM_EXEMPT_CI="${NM_EXEMPT_CI:+$NM_EXEMPT_CI|}$a"
+  elif [ "$any" = 1 ]; then
+    ANY_CI="${ANY_CI:+$ANY_CI|}$a"
   else
-    case "$g:$any" in
-      dirpre:1) ANY_DIRPRE_CS="${ANY_DIRPRE_CS:+$ANY_DIRPRE_CS|}$a" ;;
-      dirpre:0) ROOT_DIRPRE_CS="${ROOT_DIRPRE_CS:+$ROOT_DIRPRE_CS|}$a" ;;
-      file:1) ANY_FILE_CS="${ANY_FILE_CS:+$ANY_FILE_CS|}$a" ;;
-      file:0) ROOT_FILE_CS="${ROOT_FILE_CS:+$ROOT_FILE_CS|}$a" ;;
-    esac
+    ROOT_CI="${ROOT_CI:+$ROOT_CI|}$a"
   fi
 done < "$RULE_FILE"
 
@@ -139,26 +128,26 @@ g() {
     -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.process= $FILTER_ARGS "$@"
 }
 
-# Filter drivers in the shared git config: read with the pinned g(), never a plain git. Collect
-# every non-lfs clean/smudge/process driver (a lane can write .git/config); they are reported after
-# collection and neutralised here for every git call that follows.
-drivers=$(g config --get-regexp '^filter\..*\.(clean|smudge|process)$' 2>/dev/null || true)
+# Filter drivers in the shared git config (including any file pulled in via include.path): read
+# with the pinned g(), never a plain git. Collect every non-lfs clean/smudge/process driver (a
+# lane can write .git/config); they are reported after collection and neutralised here for every
+# git call that follows.
+drivers=$(g config --includes --get-regexp '^filter\..*\.(clean|smudge|process)$' 2>/dev/null || true)
 FILTER_LIST=''
 if [ -n "$drivers" ]; then
-  oldIFS=$IFS; IFS='
-'
-  set -- $drivers
-  IFS=$oldIFS
-  for cfg in "$@"; do
+  while IFS= read -r cfg; do
+    [ -n "$cfg" ] || continue
     key=${cfg%% *}
     driver=${key#filter.}
     case "$driver" in *.clean|*.smudge|*.process) driver=${driver%.*} ;; esac
     [ -n "$driver" ] && [ "$driver" != lfs ] || continue
     case "$FILTER_LIST" in *"|$driver|"*) ;; *) FILTER_LIST="$FILTER_LIST|$driver|" ;; esac
-  done
+  done <<EOF
+$drivers
+EOF
   for d in $(printf '%s' "$FILTER_LIST" | tr '|' ' '); do
     [ -n "$d" ] || continue
-    FILTER_ARGS="$FILTER_ARGS -c filter.$d.clean= -c filter.$d.smudge= -c filter.$d.process="
+    FILTER_ARGS="$FILTER_ARGS -c filter.$d.clean= -c filter.$d.smudge= -c filter.$d.process= -c filter.$d.required=false"
   done
 fi
 collect() {
@@ -204,24 +193,14 @@ warnings=0
 
 while IFS= read -r f; do
   under_nm=0
-  printf '%s\n' "$f" | grep -Eq '(^|/)node_modules/' && under_nm=1
-  dirpre=0
-  if { [ -n "$ROOT_DIRPRE_CS" ] && printf '%s\n' "$f" | grep -Eq "$ROOT_DIRPRE_CS"; } ||
-     { [ -n "$ROOT_DIRPRE_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ROOT_DIRPRE_CI"; } ||
-     { [ -n "$ANY_DIRPRE_CS" ] && printf '%s\n' "$f" | grep -Eq "$ANY_DIRPRE_CS"; } ||
-     { [ -n "$ANY_DIRPRE_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ANY_DIRPRE_CI"; }; then
-    dirpre=1
+  printf '%s\n' "$f" | grep -Eiq '(^|/)node_modules/' && under_nm=1
+  hit=0
+  if { [ -n "$ROOT_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ROOT_CI"; } ||
+     { [ -n "$ANY_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ANY_CI"; } ||
+     { [ "$under_nm" = 0 ] && [ -n "$NM_EXEMPT_CI" ] && printf '%s\n' "$f" | grep -Eiq "$NM_EXEMPT_CI"; }; then
+    hit=1
   fi
-  filehit=0
-  if [ "$under_nm" = 0 ]; then
-    if { [ -n "$ROOT_FILE_CS" ] && printf '%s\n' "$f" | grep -Eq "$ROOT_FILE_CS"; } ||
-       { [ -n "$ROOT_FILE_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ROOT_FILE_CI"; } ||
-       { [ -n "$ANY_FILE_CS" ] && printf '%s\n' "$f" | grep -Eq "$ANY_FILE_CS"; } ||
-       { [ -n "$ANY_FILE_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ANY_FILE_CI"; }; then
-      filehit=1
-    fi
-  fi
-  if [ "$dirpre" = 1 ] || [ "$filehit" = 1 ]; then
+  if [ "$hit" = 1 ]; then
     if [ -n "$allow" ] && printf '%s\n' "$f" | grep -Eq "$allow"; then
       say "allowed-protected: $f"
       continue

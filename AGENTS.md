@@ -65,8 +65,8 @@ runner environment allowlist to smuggle a setting through.
   script. `yarn test:bin` runs every shell test under `tests/`.
 
 Before committing what any lane produced, run `scripts/lane-diff-check.sh <worktree>`
-(protected paths, credential-shaped strings, files outside the brief); it prints file, line and
-pattern name only, never a matched value.
+(protected paths including ignored ones, credential-shaped strings, files outside the brief); it prints
+file, line and pattern name only, never a matched value.
 
 ## Web UI action rules
 

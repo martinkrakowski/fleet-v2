@@ -19,7 +19,7 @@ rc() { cat "$T/rc"; }
 R=$T/repo
 mkdir -p "$R/packages/x/src" "$R/.github/workflows" && cd "$R" || exit 1
 git init -q . && git config user.email t@example.invalid && git config user.name t
-printf '/.lane/\n' > .gitignore
+printf '/.lane/\n.agents/\n.env\n' > .gitignore
 echo 'export const a = 1;' > packages/x/src/a.ts
 echo 'name: gate' > .github/workflows/gate.yml
 git add . && git -c commit.gpgsign=false commit -q -m init
@@ -65,10 +65,10 @@ pk="-----BEGIN"; pk="$pk OPENSSH PRIVATE KEY-----"
 { echo 'line one'; echo "$pk"; } > packages/x/src/key.txt
 run "$R" --base base; check 'a private key block is a finding with its line' 'grep -q "^secret-pattern: packages/x/src/key.txt:2 (private-key-block)" "$T/o"'
 rm -f packages/x/src/key.txt
-echo 'see /home/martin/.ssh/id_ed25519 for the key' > packages/x/src/note.md
+printf 'see /home/%s/.ssh/id_ed25519 for the key\n' martin > packages/x/src/note.md
 run "$R" --base base; check 'a home credential path is a finding' 'grep -q "(home-credential-path)" "$T/o"'
 rm -f packages/x/src/note.md
-echo 'const password = "hunter2hunter2";' > packages/x/src/c.ts
+printf 'const password = "%s";\n' hunter2hunter2 > packages/x/src/c.ts
 run "$R" --base base; check 'a password assignment is a finding' 'grep -q "(password-assignment)" "$T/o"'
 rm -f packages/x/src/c.ts
 echo 'const password = process.env.PASSWORD;' > packages/x/src/d.ts
@@ -101,6 +101,46 @@ run "$R" --base base --brief .lane/brief2.md --strict-brief; check 'a root-level
 rm -f README.md
 U=$T/unborn; mkdir -p "$U/.github" && ( cd "$U" && git init -q . && echo x > .github/w.yml && git add .github/w.yml )
 run "$U"; check 'a staged protected file before the first commit is a finding' '[ "$(rc)" = 1 ] && grep -q "^protected: .github/w.yml" "$T/o"'
+
+echo '# L1 security remediation (B3, M1, shell minors 9-11)'
+# B3: Claude Code and opencode configuration paths are protected.
+mkdir -p .claude .opencode
+echo '{"hooks":{}}' > .claude/settings.json
+echo '{"permissions":[]}' > .opencode/opencode.json
+echo '{}' > opencode.json
+run "$R" --base base
+check 'Claude Code and opencode permission files are findings (B3)' '[ "$(rc)" = 1 ] && grep -q "^protected: .claude/settings.json" "$T/o" && grep -q "^protected: .opencode/opencode.json" "$T/o" && grep -q "^protected: opencode.json" "$T/o"'
+rm -rf .claude .opencode opencode.json
+
+# M1: ignored files under protected prefixes and ignored secret-shaped files are reviewed.
+mkdir -p .agents
+echo '{"tools":[]}' > .agents/x.json
+printf '%s=%s\n' OPENCODE_SERVER_PASSWORD hunter2hunter2 > .env
+run "$R" --base base
+check 'ignored protected and secret-shaped files are findings (M1)' '[ "$(rc)" = 1 ] && grep -q "^protected: .agents/x.json" "$T/o" && grep -q "(opencode-server-password)" "$T/o"'
+rm -rf .agents .env
+
+# Shell minor 10: a NUL-containing file is scanned (grep -a), not skipped as binary.
+printf 'const x = 1;\000const t = "%s";\n' "$tok" > packages/x/src/nul.ts
+run "$R" --base base
+check 'a NUL-containing file is still scanned' '[ "$(rc)" = 1 ] && grep -q "(github-token)" "$T/o"'
+rm -f packages/x/src/nul.ts
+
+# Shell minor 11: a symlink whose target leaves the worktree is a finding.
+mkdir -p "$T/outside" && echo 'nothing secret here' > "$T/outside/thing"
+ln -s "$T/outside/thing" packages/x/src/abs-link
+ln -s ../../outside/thing packages/rel-link
+run "$R" --base base
+check 'a symlink leaving the worktree is a finding' '[ "$(rc)" = 1 ] && grep -q "^symlink-outside-worktree: packages/x/src/abs-link" "$T/o" && grep -q "^symlink-outside-worktree: packages/rel-link" "$T/o"'
+rm -f packages/x/src/abs-link packages/rel-link
+
+# Shell minor 9: a bare directory word in a brief does not put the tree in scope.
+printf '# brief\n\nFiles: packages, docs/notes.md.\n' > .lane/brief3.md
+mkdir -p docs && echo n > docs/notes.md
+echo z > packages/x/src/extra.ts
+run "$R" --base base --brief .lane/brief3.md --strict-brief
+check 'a bare directory word does not put the tree in scope' 'grep -q "^outside-brief: packages/x/src/extra.ts" "$T/o"'
+rm -rf docs packages/x/src/extra.ts .lane/brief3.md
 
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"

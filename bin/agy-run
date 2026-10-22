@@ -40,6 +40,7 @@
 # Env: AGY_BIN (default: agy), AGY_ALLOW_BUSY=1, AGY_SANDBOX=1 (same as --sandbox),
 #      AGY_DENIED_IS_FAILURE=1 (a run that ends with denied actions exits 5),
 #      AGY_WAIT_INTERVAL (seconds between looks, default 15), AGY_WAIT_MAX (default 1500),
+#      AGY_RUN_ABORT_WAIT (seconds before --abort sends SIGKILL, default 10),
 #      AGY_HOME (default ~/.gemini/antigravity-cli): agy's state dir, read after a run that ended with denied
 #      actions to name the denied targets (agy's JSON names only the tool). Paths only are printed.
 # Exit: 0 the lane ended with a non-empty response; 1 agy is missing, the dir does not qualify, the
@@ -152,17 +153,51 @@ set_paths() {
   lock=$lane/agy-run.lock
 }
 
-# Prints the pid of the lane running in $dir, nothing when none. A lock whose pid is gone is stale:
-# it is removed and the lane counts as ended.
+pid_start() {
+  LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null
+}
+
+readable_start() {
+  case "$1" in
+    unknown) return 1 ;;
+    *[![:space:]]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prints the pid of the lane running in $dir, nothing when none. Returns 0 when the outcome
+# is known (running, gone or reused) and 1 when kill -0 succeeds but the start time is empty,
+# unreadable or unknown (the lock is kept and the pid is printed so callers never delete a
+# live lane's lock or signal an unverified pid).
+# Residual risk: ps lstart has one-second resolution, so a pid reused within the same second
+# compares equal. That is accepted, and abort's re-check before every signal narrows it.
 lane_running() {
   [ -f "$lock" ] || return 0
   lr_pid=$(head -n 1 "$lock" 2>/dev/null)
+  lr_start=$(sed -n 2p "$lock" 2>/dev/null)
   case "$lr_pid" in '' | *[!0-9]*) rm -f "$lock"; return 0 ;; esac
-  if kill -0 "$lr_pid" 2>/dev/null; then
+  if ! kill -0 "$lr_pid" 2>/dev/null; then
+    echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
+    rm -f "$lock"
+    return 0
+  fi
+  lr_now=$(pid_start "$lr_pid")
+  if ! readable_start "$lr_start" || ! readable_start "$lr_now"; then
+    # The lane may have exited and been reaped between kill -0 and ps (CodeRabbit on #148): an
+    # empty ps for a pid that is now gone is "gone", not "unreadable".
+    if ! kill -0 "$lr_pid" 2>/dev/null; then
+      echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
+      rm -f "$lock"
+      return 0
+    fi
+    echo "$lr_pid"
+    return 1
+  fi
+  if [ "$lr_now" = "$lr_start" ]; then
     echo "$lr_pid"
     return 0
   fi
-  echo "agy-run: the lane in $dir ended (pid $lr_pid is gone); its result is in .lane/agy-run.out" >&2
+  echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
   rm -f "$lock"
   return 0
 }
@@ -183,10 +218,15 @@ set_paths
 mkdir -p "$lane"
 
 if [ "$mode" != run ]; then
-  pid=$(lane_running)
   case "$mode" in
     status)
+      pid=$(lane_running)
+      lr_rc=$?
       [ -z "$pid" ] && { echo "agy-run: nothing is running in $dir"; exit 0; }
+      if [ "$lr_rc" != 0 ]; then
+        echo "agy-run: running (start time unreadable), pid $pid in $dir"
+        exit 3
+      fi
       echo "agy-run: running in $dir (pid $pid, since $(sed -n 2p "$lock"), model $(sed -n 3p "$lock"))"
       exit 3
       ;;
@@ -198,6 +238,7 @@ if [ "$mode" != run ]; then
       done
       [ "$every" -ge 1 ] || { echo "agy-run: AGY_WAIT_INTERVAL must be at least 1 second" >&2; exit 2; }
       waited=0
+      pid=$(lane_running)
       while [ -n "$pid" ]; do
         if [ "$waited" -ge "$max" ]; then
           echo "agy-run: WAIT GAVE UP (exit 75), the lane has NOT ended: still running in $dir after $waited s (pid $pid)" >&2
@@ -211,21 +252,52 @@ if [ "$mode" != run ]; then
       exit 0
       ;;
     abort)
+      abort_wait=${AGY_RUN_ABORT_WAIT:-10}
+      # 1-999 seconds, no leading zero: dash reads 08 and 09 as illegal octal in [ -lt ].
+      case "$abort_wait" in [1-9] | [1-9][0-9] | [1-9][0-9][0-9]) ;; *) echo "agy-run: AGY_RUN_ABORT_WAIT must be whole seconds, 1 to 999" >&2; exit 2 ;; esac
+      pid=$(lane_running) || {
+        echo "agy-run: refusing to abort in $dir: start time of pid $pid is unreadable; check pid $pid by hand" >&2
+        exit 1
+      }
       [ -z "$pid" ] && { echo "agy-run: nothing is running in $dir"; exit 0; }
       kill -TERM "$pid" 2>/dev/null
       echo "agy-run: asked pid $pid to stop" >&2
+      pid=''
       tries=0
-      while [ "$tries" -lt 10 ]; do
-        kill -0 "$pid" 2>/dev/null || break
+      while [ "$tries" -lt "$abort_wait" ]; do
+        # Re-verify by pid and start time so a pid recycled during the wait is never signalled.
+        pid=$(lane_running) || {
+          echo "agy-run: refusing to abort in $dir: start time of pid $pid is unreadable; check pid $pid by hand" >&2
+          exit 1
+        }
+        if [ -z "$pid" ]; then
+          rm -f "$lock"
+          echo "agy-run: the lane in $dir stopped"
+          exit 0
+        fi
+        pid=''
         sleep 1
         tries=$((tries + 1))
       done
-      if kill -0 "$pid" 2>/dev/null; then
-        kill -KILL "$pid" 2>/dev/null
-        echo "agy-run: pid $pid did not stop in 10 s; killed" >&2
-        sleep 1
+      # Re-check immediately before SIGKILL; never signal a pid kept from before a sleep.
+      pid=$(lane_running) || {
+        echo "agy-run: refusing to abort in $dir: start time of pid $pid is unreadable; check pid $pid by hand" >&2
+        exit 1
+      }
+      if [ -z "$pid" ]; then
+        rm -f "$lock"
+        echo "agy-run: the lane in $dir stopped"
+        exit 0
       fi
-      if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null
+      echo "agy-run: pid $pid did not stop in $abort_wait s; killed" >&2
+      pid=''
+      sleep 1
+      pid=$(lane_running) || {
+        echo "agy-run: refusing to abort in $dir: start time of pid $pid is unreadable; check pid $pid by hand" >&2
+        exit 1
+      }
+      if [ -n "$pid" ]; then
         echo "agy-run: still running in $dir after the abort (pid $pid)" >&2
         exit 1
       fi
@@ -242,6 +314,9 @@ fi
 # a value like --dangerously-skip-permissions or -x, or one with whitespace in
 # it, would be read by agy as flags and is refused before anything is built.
 case "$model" in -*|*[[:space:]]*|'') die_usage "--model must not start with '-' or contain whitespace" ;; esac
+# The agent travels the same way, so it gets the same guard. An empty value is just
+# no agent, so unlike --model it is not refused.
+case "$agent" in -*|*[[:space:]]*) die_usage "--agent must not start with '-' or contain whitespace" ;; esac
 [ -f "$dir/$brief" ] || { echo "agy-run: no brief at $dir/$brief" >&2; exit 1; }
 git -C "$dir" check-ignore -q "$brief" || { echo "agy-run: $brief is not gitignored in $dir; a brief is never committed" >&2; exit 1; }
 
@@ -254,7 +329,7 @@ if [ -n "$busy" ] && [ "${AGY_ALLOW_BUSY:-0}" != 1 ]; then
 fi
 
 # The lock is taken with noclobber so two dispatches in the same second cannot both win.
-if ! ( set -C; printf '%s\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$model" "$agymode" > "$lock" ) 2>/dev/null; then
+if ! ( set -C; printf '%s\n' "$$" "$(pid_start "$$")" "$model" "$agymode" > "$lock" ) 2>/dev/null; then
   echo "agy-run: another dispatch took the lock in $dir at the same moment; not dispatching" >&2
   exit 75
 fi
@@ -324,7 +399,18 @@ else
   ( cd "$dir" && exec "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
 fi
 child=$!
-printf '%s\n' "$child" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$model" "$agymode" > "$lock"
+# $child is this script's own child and is not reaped until `wait` below, so its pid cannot be
+# recycled during these retries. The kill -0 guard stops early if it has already exited, so a
+# start time is only ever read for the process just launched.
+cstart=$(pid_start "$child")
+tries=0
+while ! readable_start "$cstart" && [ "$tries" -lt 5 ] && kill -0 "$child" 2>/dev/null; do
+  sleep 0.2
+  cstart=$(pid_start "$child")
+  tries=$((tries + 1))
+done
+readable_start "$cstart" || cstart=unknown
+printf '%s\n' "$child" "$cstart" "$model" "$agymode" > "$lock"
 wait "$child"
 rc=$?
 child=''

@@ -43,6 +43,36 @@ chmod +x "$T/bin/agy"
 PATH="$T/bin:$PATH"
 export PATH
 
+# The fake ps: logs its arguments, then behaves like `ps -o lstart= -p <pid>` according to
+# $T/ps-mode (default: fixed start time for a living pid; empty: nothing; locale: German-style
+# date unless LC_ALL=C and TZ=UTC).
+cat > "$T/bin/ps" <<FAKEPS
+#!/bin/sh
+printf '%s\n' "\$@" >> "$T/ps.log"
+prev=''
+for a in "\$@"; do
+  [ "\$prev" = -p ] && pid=\$a
+  prev=\$a
+done
+case "\$pid" in '' | *[!0-9]*) exit 1 ;; esac
+if kill -0 "\$pid" 2>/dev/null; then
+  case "\$(cat "$T/ps-mode" 2>/dev/null)" in
+    empty) exit 0 ;;
+    locale)
+      if [ "\${LC_ALL:-}" = C ] && [ "\${TZ:-}" = UTC ]; then
+        echo 'Thu Jan  1 00:00:00 2026'
+      else
+        echo "Do 1. Jan 00:00:00 \${LC_ALL:-de} \${TZ:-CET} 2026"
+      fi
+      exit 0
+      ;;
+    *) echo 'Thu Jan  1 00:00:00 2026'; exit 0 ;;
+  esac
+fi
+exit 1
+FAKEPS
+chmod +x "$T/bin/ps"
+
 # A worktree that qualifies: a git repo whose .lane/ is ignored, with a brief inside.
 mkrepo() { # $1: dir, $2: gitignore content
   mkdir -p "$1" && cd "$1" || exit 1
@@ -92,6 +122,10 @@ run --dir "$WT" --model --dangerously-skip-permissions; check 'a --model value t
 run --dir "$WT" --model=-x; check 'a --model= value starting with - is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
 run --dir "$WT" --model -x; check 'a --model value starting with - is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
 run --dir "$WT" --model 'a b'; check 'a --model value containing whitespace is refused (2)' '[ "$(rc)" = 2 ] && grep -q "contain whitespace" "$T/e"'
+run --dir "$WT" --model m --agent --dangerously-skip-permissions; check 'a --agent value that is itself a flag is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
+run --dir "$WT" --model m --agent=-x; check 'a --agent= value starting with - is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
+run --dir "$WT" --model m --agent -x; check 'a --agent value starting with - is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
+run --dir "$WT" --model m --agent 'a b'; check 'a --agent value containing whitespace is refused (2)' '[ "$(rc)" = 2 ] && grep -q "contain whitespace" "$T/e"'
 run --status --wait --dir "$WT"; check 'two modes at once is a usage error (2)' '[ "$(rc)" = 2 ]'
 check 'no fake agy ran during the usage checks' '[ ! -f "$T/args.log" ]'
 
@@ -186,7 +220,7 @@ check 'the refused dispatch did not start agy' '[ "$(cat "$T/fake-mode")" = slee
 erun AGY_WAIT_INTERVAL=1 AGY_WAIT_MAX=1 "$RUNSH" "$SCRIPT" --wait --dir "$WT"
 check '--wait gives up (75) while the lane runs' '[ "$(rc)" = 75 ] && grep -q "GAVE UP" "$T/e"'
 run --abort --dir "$WT"
-check '--abort stops the lane (0)' '[ "$(rc)" = 0 ] && grep -q "nothing is running" "$T/o"'
+check '--abort stops the lane (0)' '[ "$(rc)" = 0 ] && grep -q "the lane in .* stopped" "$T/o"'
 wait "$BG" 2>/dev/null; bgrc=$?
 check 'the dispatcher ended once its lane was aborted' '[ "$bgrc" != 0 ] && [ ! -f "$WT/.lane/agy-run.lock" ]'
 run --status --dir "$WT"
@@ -226,6 +260,81 @@ echo '# a stale lock'
 printf '%s\n' 999999 2026-01-01T00:00:00Z m accept-edits > "$WT/.lane/agy-run.lock"
 run --status --dir "$WT"
 check 'a lock whose pid is gone reads as ended (0) and is removed' '[ "$(rc)" = 0 ] && [ ! -f "$WT/.lane/agy-run.lock" ] && grep -q "ended" "$T/e"'
+
+echo '# the lock compares pid and process start time'
+sleep 300 &
+OFDPID=$!
+echo "$OFDPID" >> "$T/pids"
+printf '%s\n' "$OFDPID" 'Thu Jan  1 00:00:00 1999' m accept-edits > "$WT/.lane/agy-run.lock"
+run --status --dir "$WT"
+check 'status consults ps for the recorded pid' 'grep -q -x "$OFDPID" "$T/ps.log"'
+check 'a live pid whose start time differs reads as nothing (0)' '[ "$(rc)" = 0 ] && grep -q "nothing is running" "$T/o"'
+check 'the stale lock is removed after that status' '[ ! -f "$WT/.lane/agy-run.lock" ]'
+printf '%s\n' "$OFDPID" 'Thu Jan  1 00:00:00 1999' m accept-edits > "$WT/.lane/agy-run.lock"
+run --abort --dir "$WT"
+check 'abort never signals a recycled pid (0)' '[ "$(rc)" = 0 ] && grep -q "nothing is running" "$T/o"'
+check 'the foreign process is still alive after the abort' 'kill -0 "$OFDPID" 2>/dev/null'
+kill "$OFDPID" 2>/dev/null
+
+MATCHPID=$(sh -c 'sleep 300 >/dev/null 2>&1 & echo $!')
+echo "$MATCHPID" >> "$T/pids"
+printf '%s\n' "$MATCHPID" 'Thu Jan  1 00:00:00 2026' m accept-edits > "$WT/.lane/agy-run.lock"
+run --status --dir "$WT"
+check 'a live pid with a matching start time reads as running (3) with the pid' '[ "$(rc)" = 3 ] && grep -q "running in $WT (pid $MATCHPID," "$T/o"'
+run --abort --dir "$WT"
+check 'abort signals a live pid whose start time matches (0) and it is gone afterwards' '[ "$(rc)" = 0 ] && ! kill -0 "$MATCHPID" 2>/dev/null && [ ! -f "$WT/.lane/agy-run.lock" ]'
+
+erun AGY_RUN_ABORT_WAIT=1s "$RUNSH" "$SCRIPT" --abort --dir "$WT"
+check 'a non-digit AGY_RUN_ABORT_WAIT is a usage error (2)' '[ "$(rc)" = 2 ]'
+erun AGY_RUN_ABORT_WAIT=08 "$RUNSH" "$SCRIPT" --abort --dir "$WT"
+check 'a leading-zero AGY_RUN_ABORT_WAIT (dash octal) is a usage error (2)' '[ "$(rc)" = 2 ]'
+rm -f "$T/ign.ready"
+IGNPID=$(sh -c '( trap "" TERM; : > "$1"; exec sleep 60 ) >/dev/null 2>&1 & echo $!' - "$T/ign.ready")
+echo "$IGNPID" >> "$T/pids"
+n=0; while [ ! -f "$T/ign.ready" ] && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+printf '%s\n' "$IGNPID" 'Thu Jan  1 00:00:00 2026' m accept-edits > "$WT/.lane/agy-run.lock"
+erun AGY_RUN_ABORT_WAIT=1 "$RUNSH" "$SCRIPT" --abort --dir "$WT"
+check 'abort escalates to SIGKILL when a matching process ignores TERM (0)' '[ "$(rc)" = 0 ] && ! kill -0 "$IGNPID" 2>/dev/null && grep -q "did not stop in 1 s; killed" "$T/e" && [ ! -f "$WT/.lane/agy-run.lock" ]'
+
+UNRPID=$(sh -c 'sleep 300 >/dev/null 2>&1 & echo $!')
+echo "$UNRPID" >> "$T/pids"
+echo empty > "$T/ps-mode"
+printf '%s\n' "$UNRPID" 'Thu Jan  1 00:00:00 2026' m accept-edits > "$WT/.lane/agy-run.lock"
+run --status --dir "$WT"
+check 'an empty ps result for a live pid reports start time unreadable (3) and keeps the lock' '[ "$(rc)" = 3 ] && grep -q "running (start time unreadable), pid $UNRPID" "$T/o" && [ -f "$WT/.lane/agy-run.lock" ]'
+run --abort --dir "$WT"
+check 'abort refuses (1) when start time is unreadable and leaves the process alive' '[ "$(rc)" = 1 ] && kill -0 "$UNRPID" 2>/dev/null && [ -f "$WT/.lane/agy-run.lock" ] && grep -q "check pid $UNRPID by hand" "$T/e"'
+kill "$UNRPID" 2>/dev/null
+rm -f "$WT/.lane/agy-run.lock" "$T/ps-mode"
+
+echo empty > "$T/ps-mode"
+echo sleep > "$T/fake-mode"
+"$RUNSH" "$SCRIPT" --detach --dir "$WT" --model m > "$T/bg.o" 2> "$T/bg.e" &
+BG=$!; echo "$BG" >> "$T/pids"
+n=0; while [ "$(sed -n 2p "$WT/.lane/agy-run.lock" 2>/dev/null)" != unknown ] && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+unkpid=$(head -n 1 "$WT/.lane/agy-run.lock" 2>/dev/null)
+echo "$unkpid" >> "$T/pids"
+rm -f "$T/ps-mode"
+check 'a launch whose ps stays empty after retries writes unknown to the lock' '[ "$(sed -n 2p "$WT/.lane/agy-run.lock")" = unknown ]'
+run --status --dir "$WT"
+check 'a lock with unknown start time is treated as unreadable by status (3)' '[ "$(rc)" = 3 ] && grep -q "running (start time unreadable), pid $unkpid" "$T/o"'
+run --abort --dir "$WT"
+check 'a lock with unknown start time is refused by abort (1)' '[ "$(rc)" = 1 ] && kill -0 "$unkpid" 2>/dev/null'
+kill -9 "$unkpid" "$BG" 2>/dev/null; wait "$BG" 2>/dev/null
+rm -f "$WT/.lane/agy-run.lock"
+
+echo locale > "$T/ps-mode"
+echo sleep > "$T/fake-mode"
+env LC_ALL=de_DE.UTF-8 TZ=Europe/Berlin "$RUNSH" "$SCRIPT" --dir "$WT" --model m > "$T/bg.o" 2> "$T/bg.e" &
+BG=$!; echo "$BG" >> "$T/pids"
+n=0; while { [ ! -s "$WT/.lane/agy-run.lock" ] || [ "$(head -n 1 "$WT/.lane/agy-run.lock" 2>/dev/null)" = "$BG" ]; } && [ "$n" -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+sleep 0.2
+erun LC_ALL=de_DE.UTF-8 TZ=Europe/Berlin "$RUNSH" "$SCRIPT" --status --dir "$WT"
+check 'a locale-dependent ps writes and reads a matching C/UTC start time (3)' '[ "$(rc)" = 3 ] && [ "$(sed -n 2p "$WT/.lane/agy-run.lock")" = "Thu Jan  1 00:00:00 2026" ]'
+erun LC_ALL=de_DE.UTF-8 TZ=Europe/Berlin "$RUNSH" "$SCRIPT" --abort --dir "$WT"
+check 'abort through a locale-dependent ps matches and stops the lane (0)' '[ "$(rc)" = 0 ]'
+wait "$BG" 2>/dev/null
+rm -f "$T/ps-mode"
 
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"

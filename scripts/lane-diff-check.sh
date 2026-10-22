@@ -187,6 +187,8 @@ symlink_leaves_worktree() {
   esac
 }
 
+# The worktree root, physically: a path whose directory resolves elsewhere is read nowhere.
+top_phys=$(CDPATH= cd -P "$top" 2>/dev/null && pwd -P) || exit 2
 while IFS= read -r f; do
   if [ -L "$f" ]; then
     symlink_leaves_worktree "$f" "$top"
@@ -200,6 +202,13 @@ while IFS= read -r f; do
     fi
     continue
   fi
+  # A directory symlink ABOVE the path: the leaf is a plain file, but its physical directory lies
+  # outside the worktree, so reading it would read outside (Grok re-review of L1). Never read it.
+  d=$(CDPATH= cd -P "$(dirname "./$f")" 2>/dev/null && pwd -P) || continue
+  case "$d" in
+    "$top_phys"|"$top_phys"/*) ;;
+    *) say "symlink-escape: $f"; findings=$((findings + 1)); continue ;;
+  esac
   [ -f "$f" ] || continue
   sz=$(wc -c < "$f" 2>/dev/null | tr -d '[:space:]')
   if [ -z "$sz" ] || [ "$sz" -gt 5242880 ]; then

@@ -137,11 +137,14 @@ rm -rf node_modules
 
 # Fix 4 (D3): a committed .lane/brief.md is protected; an ignored, untracked .lane/brief.md is skipped.
 run "$R" --base base
-check 'an ignored, untracked .lane/brief.md is not a finding (Fix 4)' '[ "$(rc)" = 0 ] && ! grep -q "\.lane" "$T/o"'
-git add -f .lane/brief.md && git -c commit.gpgsign=false commit -q -m lane-brief
-run "$R" --base base
-check 'a committed .lane/brief.md is a protected finding (Fix 4)' '[ "$(rc)" = 1 ] && grep -q "^protected: .lane/brief.md$" "$T/o"'
-git reset -q HEAD~1 && git reset -q -- .lane/brief.md
+check 'an ignored, untracked .lane/brief.md is not a finding (Fix 4)' '[ -f .lane/brief.md ] && [ "$(rc)" = 0 ] && ! grep -q "\.lane" "$T/o"'
+if git add -f .lane/brief.md && git -c commit.gpgsign=false commit -q -m lane-brief; then
+  run "$R" --base base
+  check 'a committed .lane/brief.md is a protected finding (Fix 4)' '[ "$(rc)" = 1 ] && grep -q "^protected: .lane/brief.md$" "$T/o"'
+  git reset -q HEAD~1 && git reset -q -- .lane/brief.md
+else
+  check 'the committed .lane/brief.md fixture was created (Fix 4)' 'false'
+fi
 
 # Shell minor 10 + Fix 5: a NUL-containing file is scanned (grep -a), not skipped as binary.
 printf 'const x = 1;\000const t = "%s";\n' "$tok" > packages/x/src/nul.ts
@@ -164,6 +167,19 @@ run "$R" --base base
 check 'a symlink to a directory outside is symlink-escape (Fix 1)' '[ "$(rc)" = 1 ] && grep -q "^symlink-escape: sub/out$" "$T/o"'
 check 'a chained symlink escape reports symlink-escape and never scans the outside file (Fix 1)' '[ "$(rc)" = 1 ] && grep -q "^symlink-escape: link$" "$T/o" && ! grep -q "secret-pattern" "$T/o" && ! grep -q "abcdefghij" "$T/o"'
 rm -rf sub link
+
+# Fix 1 (re-review): a directory symlink ABOVE a tracked file. The leaf is a plain file, so only the
+# physical directory shows it lives outside; the scan must never read it.
+mkdir -p "$T/outside2" && printf 'const t = "%s";\n' "$tok" > "$T/outside2/secret.ts"
+mkdir -p dsub && printf 'const x = 1;\n' > dsub/secret.ts
+if git add dsub/secret.ts && git -c commit.gpgsign=false commit -q -m dsub; then
+  rm -rf dsub && ln -s "$T/outside2" dsub
+  run "$R" --base base
+  check 'a directory symlink above a tracked file is symlink-escape and is never scanned (Fix 1)' '[ "$(rc)" = 1 ] && grep -q "^symlink-escape: dsub/secret.ts$" "$T/o" && ! grep -q "^secret-pattern: dsub" "$T/o"'
+  rm -f dsub && git reset -q --hard HEAD~1
+else
+  check 'the dsub fixture was created (Fix 1)' 'false'
+fi
 ln -s does-not-exist packages/x/src/dangling
 run "$R" --base base
 check 'a dangling symlink is symlink-unresolved (Fix 1)' '[ "$(rc)" = 1 ] && grep -q "^symlink-unresolved: packages/x/src/dangling$" "$T/o"'

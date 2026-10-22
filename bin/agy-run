@@ -39,9 +39,12 @@
 # recording pid, start time, model, mode and the process command name. The lane can write anything
 # under its worktree, so a lock inside it could be planted and steer the operator's --status and
 # --abort; the state dir is where the lane cannot reach. The directory is created with umask 077
-# and refused when it is a symlink or not owned by the current user. Under <dir>/.lane (which must
-# be gitignored): agy-run.out (agy's JSON result), agy-run.err (agy's stderr), agy-run.before
-# (HEAD at dispatch), agy-run.last (one line per ended run: exit, seconds, tokens, denied actions).
+# and refused when it is a symlink or not owned by the current user. Only the lane's own artifacts
+# stay under <dir>/.lane (which must be gitignored): agy-run.out (agy's JSON result), agy-run.err
+# (agy's stderr), agy-run.before (HEAD at dispatch), agy-run.last (one line per ended run: exit,
+# seconds, tokens, denied actions). agy-run refuses (exit 2) when .lane itself or any of those
+# files is a symlink, or when .lane is not a directory, and creates the output files fresh via a
+# temp file plus mv, never by following an existing path.
 # Env: AGY_BIN (default: agy), AGY_ALLOW_BUSY=1, AGY_SANDBOX=1 (same as --sandbox),
 #      AGY_DENIED_IS_FAILURE=1 (a run that ends with denied actions exits 5),
 #      AGY_WAIT_INTERVAL (seconds between looks, default 15), AGY_WAIT_MAX (default 1500),
@@ -148,7 +151,6 @@ qualify_dir() {
   here=$(cd "$dir" && pwd -P)
   [ "$top" = "$here" ] || { echo "agy-run: $dir is not the root of its worktree ($top is)" >&2; exit 1; }
   dir=$here
-  git -C "$dir" check-ignore -q .lane/agy-run.lock 2>/dev/null || { echo "agy-run: .lane/ is not gitignored in $dir; a lane's lock and brief must never be committed" >&2; exit 1; }
 }
 
 lane=''
@@ -174,6 +176,25 @@ ensure_lock_dir() {
   else
     ( umask 077; mkdir -p "$lkdir" ) || { echo "agy-run: cannot create $lkdir" >&2; exit 2; }
   fi
+}
+
+# The worktree is the lane's playground: .lane may have been prepared by it. Never write lane
+# output through a symlink (or a non-directory) in .lane; refuse before anything is written.
+check_lane_safe() {
+  if [ -L "$lane" ]; then
+    echo "agy-run: $lane is a symlink; refusing to write lane output through it" >&2
+    exit 2
+  fi
+  if [ -e "$lane" ] && [ ! -d "$lane" ]; then
+    echo "agy-run: $lane is not a directory" >&2
+    exit 2
+  fi
+  for f in agy-run.out agy-run.err agy-run.before agy-run.last; do
+    if [ -L "$lane/$f" ]; then
+      echo "agy-run: $lane/$f is a symlink; refusing to write through it" >&2
+      exit 2
+    fi
+  done
 }
 
 pid_start() {
@@ -356,6 +377,8 @@ case "$model" in -*|*[[:space:]]*|'') die_usage "--model must not start with '-'
 # The agent travels the same way, so it gets the same guard. An empty value is just
 # no agent, so unlike --model it is not refused.
 case "$agent" in -*|*[[:space:]]*) die_usage "--agent must not start with '-' or contain whitespace" ;; esac
+check_lane_safe
+git -C "$dir" check-ignore -q .lane/agy-run.lock 2>/dev/null || { echo "agy-run: .lane/ is not gitignored in $dir; a lane's brief must never be committed" >&2; exit 1; }
 [ -f "$dir/$brief" ] || { echo "agy-run: no brief at $dir/$brief" >&2; exit 1; }
 git -C "$dir" check-ignore -q "$brief" || { echo "agy-run: $brief is not gitignored in $dir; a brief is never committed" >&2; exit 1; }
 
@@ -375,12 +398,18 @@ if ! ( umask 077; set -C; printf '%s\n' "$$" "$(pid_start "$$")" "$model" "$agym
   exit 75
 fi
 
+mkdir -p "$lane"
 before=$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo none)
-printf '%s\n' "$before" > "$lane/agy-run.before"
+tmp=$lane/.agy-run.before.tmp.$$
+printf '%s\n' "$before" > "$tmp"
+mv -f "$tmp" "$lane/agy-run.before"
 out=$lane/agy-run.out
 err=$lane/agy-run.err
-: > "$out"
-: > "$err"
+for f in "$out" "$err"; do
+  tmp=$lane/.agy-run.tmp.$$
+  : > "$tmp"
+  mv -f "$tmp" "$f"
+done
 
 prompt="Read the file $brief in the current directory and carry out its WORK ORDER exactly as written. Do not read, change or run anything outside the current directory. Do not read files under .git: this worktree's git metadata lives outside it and is off-limits; the brief states the branch and base commit. When you are done, reply with the list of files you changed."
 
@@ -405,6 +434,10 @@ finish_run() { # $1: exit status to report; writes agy-run.last, prints the summ
   tokens=$(printf '%s' "$flat" | sed -n 's/.*"total_tokens":\([0-9]*\).*/\1/p')
   denied=$(printf '%s' "$flat" | sed -n 's/.*"denied_actions":\[\(.*\)\].*/\1/p' | grep -o '"action":"[^"]*"' | sed 's/"action":"//;s/"$//' | sort -u | tr '\n' ' ')
   dcount=$(printf '%s' "$denied" | wc -w | tr -d ' ')
+  if [ -L "$lane/agy-run.last" ]; then
+    echo "agy-run: $lane/agy-run.last is a symlink; refusing to write through it" >&2
+    exit 2
+  fi
   printf 'end=%s exit=%s secs=%s tokens=%s denied=%s model=%s mode=%s before=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$secs" "${tokens:-?}" "$dcount" "$model" "$agymode" "$before" >> "$lane/agy-run.last"
   rm -f "$lock"

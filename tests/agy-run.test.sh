@@ -394,6 +394,23 @@ check 'abort through a locale-dependent ps matches and stops the lane (0)' '[ "$
 wait "$BG" 2>/dev/null
 rm -f "$T/ps-mode"
 
+echo '# agy-run never writes through a symlink in .lane'
+mkdir -p "$T/target"
+echo keep > "$T/target/marker"
+rm -rf "$WT/.lane"
+ln -s "$T/target" "$WT/.lane"
+run --dir "$WT" --model m
+check '.lane as a symlink is refused (2)' '[ "$(rc)" = 2 ] && grep -q "symlink" "$T/e"'
+check 'the symlink target is untouched' '[ "$(cat "$T/target/marker")" = keep ] && [ ! -e "$T/target/agy-run.out" ]'
+rm -f "$WT/.lane"
+mkdir -p "$WT/.lane"
+echo '# brief' > "$WT/.lane/brief.md"
+ln -s "$T/target/marker" "$WT/.lane/agy-run.out"
+run --dir "$WT" --model m
+check '.lane/agy-run.out as a symlink is refused (2)' '[ "$(rc)" = 2 ] && grep -q "symlink" "$T/e"'
+check 'the agy-run.out symlink target is untouched' '[ "$(cat "$T/target/marker")" = keep ]'
+rm -f "$WT/.lane/agy-run.out"
+
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"
 [ "$fails" = 0 ]

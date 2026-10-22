@@ -57,71 +57,177 @@ export interface LaneDiffVerdict {
 }
 
 /**
- * The fixed protected paths: lane plumbing, GitHub workflows, agent and
- * permission configuration (Claude Code `.claude/`, opencode `.opencode/`
- * and `opencode.json*`, matched at any depth and case-insensitively), the
- * lane's own brief directory, the installation tree and lockfiles. The list
- * mirrors `scripts/lane-diff-check.sh`'s PROTECTED regex plus the plan's
- * `.git/`, `installation/`, `package-lock.json` and `pnpm-lock.yaml`.
- *
- * Decision D3 (plan §3): the brief's integrity is checked by digest at
- * dispatch (lane L7a). In `scripts/lane-diff-check.sh`, an ignored `.lane/`
- * file is skipped (it is where the brief lives in every worktree), but a
- * `.lane/` path that is tracked or committed in the diff is a `protected`
- * finding; this TypeScript mirror keeps `.lane` protected for diff paths, so
- * both agree.
+ * One protected-path rule. `pattern` is an ERE fragment shared with
+ * `scripts/lane-diff-check.protected`: a trailing "/" is a directory rule, a
+ * trailing "*" is a name-prefix rule, anything else is the exact file name
+ * (it may contain "/"). `anyDepth` matches at any depth (repository root only
+ * otherwise); `caseInsensitive` folds case (every rule is case-insensitive:
+ * macOS volumes are case-insensitive). Only `package.json` is exempted under a
+ * `node_modules/` directory (dependency manifests); every other rule still
+ * applies under `node_modules/`, so `node_modules/AGENTS.md`,
+ * `node_modules/x/.yarnrc` and `.agents/node_modules/x` stay protected.
  */
-const FIXED_PROTECTED_PREFIXES: readonly string[] = [
-  ".git",
-  ".github",
-  ".gemini",
-  ".agents",
-  ".agy",
-  ".lane",
-  ".claude",
-  ".opencode",
-  "bin",
-  "scripts",
-  ".architecture",
-  "deploy",
-  "installation",
-];
+export interface LaneDiffProtectedRule {
+  readonly pattern: string;
+  readonly anyDepth: boolean;
+  readonly caseInsensitive: boolean;
+}
 
 /**
- * Lockfiles, package manifests and git plumbing files are protected at any
- * depth. `.gitattributes` can suppress diff output and point filters at
- * files; `.gitmodules` can wire a submodule — both are protected wherever
- * they appear.
+ * The single protected-path table, mirrored from `scripts/lane-diff-check.protected`
+ * (S2); the parity test asserts the two produce the same verdict on a shared
+ * fixture list. Keep them in lockstep.
  */
-const FIXED_PROTECTED_FILES: readonly string[] = [
-  "yarn.lock",
-  "package-lock.json",
-  "pnpm-lock.yaml",
-  "package.json",
-  ".gitattributes",
-  ".gitmodules",
+export const PROTECTED_PATH_RULES: readonly LaneDiffProtectedRule[] = [
+  // Repository-root directories.
+  { pattern: "\\.git/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.github/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.gemini/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.agents/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.agy/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.lane/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.architecture/", anyDepth: false, caseInsensitive: true },
+  { pattern: "bin/", anyDepth: false, caseInsensitive: true },
+  { pattern: "scripts/", anyDepth: false, caseInsensitive: true },
+  { pattern: "deploy/", anyDepth: false, caseInsensitive: true },
+  { pattern: "installation/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.yarn/plugins/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.yarn/releases/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.yarn/patches/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.husky/", anyDepth: false, caseInsensitive: true },
+  // Directories at any depth (agent and editor tool trees).
+  { pattern: "\\.claude/", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.opencode/", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.cursor/", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.vscode/", anyDepth: true, caseInsensitive: true },
+  // Repository-root files.
+  { pattern: "Dockerfile", anyDepth: false, caseInsensitive: true },
+  { pattern: "Makefile", anyDepth: false, caseInsensitive: true },
+  { pattern: "makefile", anyDepth: false, caseInsensitive: true },
+  { pattern: "GNUmakefile", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.envrc", anyDepth: false, caseInsensitive: true },
+  // Repository-root name prefixes.
+  { pattern: "\\.pnp\\.*", anyDepth: false, caseInsensitive: true },
+  // Files at any depth (package managers, lockfiles, git plumbing).
+  { pattern: "package\\.json", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.yarnrc", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.yarnrc\\.yml", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.npmrc", anyDepth: true, caseInsensitive: true },
+  { pattern: "yarn\\.lock", anyDepth: true, caseInsensitive: true },
+  { pattern: "package-lock\\.json", anyDepth: true, caseInsensitive: true },
+  { pattern: "pnpm-lock\\.yaml", anyDepth: true, caseInsensitive: true },
+  // Agent instruction and tool files at any depth, case-insensitively.
+  { pattern: "CLAUDE\\.md", anyDepth: true, caseInsensitive: true },
+  { pattern: "CLAUDE\\.local\\.md", anyDepth: true, caseInsensitive: true },
+  { pattern: "AGENTS\\.md", anyDepth: true, caseInsensitive: true },
+  { pattern: "GEMINI\\.md", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.mcp\\.json", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.cursorrules", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.windsurfrules", anyDepth: true, caseInsensitive: true },
+  {
+    pattern: "\\.github/copilot-instructions\\.md",
+    anyDepth: true,
+    caseInsensitive: true,
+  },
+  { pattern: "\\.gitattributes", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.gitmodules", anyDepth: true, caseInsensitive: true },
+  // Name prefixes at any depth.
+  { pattern: "opencode\\.json*", anyDepth: true, caseInsensitive: true },
+  // Host-tool loaders added after Fable's review of #149.
+  { pattern: "\\.devcontainer/", anyDepth: true, caseInsensitive: true },
+  { pattern: "mise\\.toml", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.mise\\.toml", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.mise/", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.tool-versions", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.windsurf/", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.clinerules*", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.roo/", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.aider\\.conf\\.yml", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.idea/", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.zed/", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.dir-locals\\.el", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.yarn/sdks/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.claude-plugin/", anyDepth: true, caseInsensitive: true },
+  { pattern: "pnpm-workspace\\.yaml", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.pnpmfile\\.cjs", anyDepth: true, caseInsensitive: true },
 ];
 
-/** Root-only files the script anchors with `$`. */
-const FIXED_PROTECTED_ROOT_FILES: readonly string[] = [
-  "AGENTS.md",
-  "CLAUDE.md",
-  "GEMINI.md",
-  "Dockerfile",
-];
+type LaneDiffProtectedRuleKind = "dir" | "prefix" | "file";
 
-/**
- * `.claude/`, `.opencode/` and `opencode.json*` match at any depth and
- * case-insensitively (macOS volumes are case-insensitive), mirroring
- * `PROTECTED_AGENT_CONFIG` with `grep -i` in `scripts/lane-diff-check.sh`.
- */
-function isAgentConfigProtectedPath(path: string): boolean {
-  const segments = path.toLowerCase().split("/");
-  const dirSegments = segments.slice(0, -1);
-  if (dirSegments.includes(".claude") || dirSegments.includes(".opencode")) {
+function ruleKind(pattern: string): LaneDiffProtectedRuleKind {
+  if (pattern.endsWith("/")) return "dir";
+  if (pattern.endsWith("*")) return "prefix";
+  return "file";
+}
+
+function ruleBody(rule: LaneDiffProtectedRule): string {
+  const kind = ruleKind(rule.pattern);
+  return kind === "dir" || kind === "prefix"
+    ? rule.pattern.slice(0, -1)
+    : rule.pattern;
+}
+
+/** The rule's plain name (ERE escapes removed), for path-segment comparison. */
+function ruleName(rule: LaneDiffProtectedRule): string {
+  return ruleBody(rule).replaceAll("\\.", ".");
+}
+
+interface ProtectedRuleMatcher {
+  readonly rule: LaneDiffProtectedRule;
+  readonly regex: RegExp;
+}
+
+/** Precompiled matchers, mirroring the shell's case-insensitive grep groups. */
+const PROTECTED_MATCHERS: readonly ProtectedRuleMatcher[] =
+  PROTECTED_PATH_RULES.map((rule) => {
+    const body = ruleBody(rule);
+    const any = `(^|/)${body}`;
+    const root = `^${body}`;
+    let source: string;
+    switch (ruleKind(rule.pattern)) {
+      case "dir":
+        source = `${rule.anyDepth ? any : root}(/|$)`;
+        break;
+      case "prefix":
+        source = rule.anyDepth ? any : root;
+        break;
+      default:
+        source = `${rule.anyDepth ? any : root}$`;
+        break;
+    }
+    // ASCII-only case folding, the same as the shell's `grep -i` under LC_ALL=C (Grok re-review
+    // of L1b): the `i` flag would also fold non-ASCII letters (U+017F matches "s"), so the two
+    // gates would disagree. The source and the path are both ASCII-lowercased instead.
+    return { rule, regex: new RegExp(asciiLower(source)) };
+  });
+
+/** Lower-cases ASCII A-Z only, as `grep -i` does in the C locale. */
+function asciiLower(text: string): string {
+  return text.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+}
+
+/** True when some ancestor directory of the path is named `node_modules`. */
+function isUnderNodeModules(path: string): boolean {
+  return /(^|\/)node_modules\//.test(asciiLower(path));
+}
+
+/** Every rule that protects `path` (only `package.json` is exempted under `node_modules/`). */
+function protectingMatchers(path: string): readonly ProtectedRuleMatcher[] {
+  return PROTECTED_MATCHERS.filter(({ rule, regex }) => {
+    if (!regex.test(asciiLower(path))) return false;
+    if (rule.pattern === "package\\.json" && isUnderNodeModules(path)) {
+      return false;
+    }
     return true;
-  }
-  return segments.some((segment) => segment.startsWith("opencode.json"));
+  });
+}
+
+/**
+ * The fixed protected rule, matching the table in
+ * `scripts/lane-diff-check.protected`. Exported for the parity test.
+ */
+export function isFixedProtectedPath(path: string): boolean {
+  return protectingMatchers(path).length > 0;
 }
 
 /** Strip trailing slashes so a prefix compares as a path segment. */
@@ -156,43 +262,17 @@ function prefixExplicitlyAllowsProtected(
   prefixes: readonly string[],
 ): boolean {
   const top = path.split("/")[0];
-  const isNestedOrFileAgentConfig =
-    isAgentConfigProtectedPath(path) &&
-    top !== ".claude" &&
-    top !== ".opencode";
-  const isProtectedFile =
-    FIXED_PROTECTED_FILES.includes(basename(path)) || isNestedOrFileAgentConfig;
   return prefixes.some((prefix) => {
     const normalized = normalizePrefix(prefix);
-    return (
-      normalized === path ||
-      (!isProtectedFile &&
-        FIXED_PROTECTED_PREFIXES.includes(top) &&
-        normalized === top)
+    if (normalized === path) return true;
+    if (normalized !== top) return false;
+    const matchers = protectingMatchers(path);
+    if (matchers.length === 0) return false;
+    return matchers.every(
+      ({ rule }) =>
+        ruleKind(rule.pattern) === "dir" && ruleName(rule) === top,
     );
   });
-}
-
-/** The path's final segment; lockfiles are protected at any depth. */
-function basename(path: string): string {
-  return path.slice(path.lastIndexOf("/") + 1);
-}
-
-/**
- * The fixed protected rule, matching the reference script's PROTECTED regex
- * plus the plan's additions. Exported for the parity test that reads the
- * script's regex and checks every alternative is covered here.
- */
-export function isFixedProtectedPath(path: string): boolean {
-  if (FIXED_PROTECTED_FILES.includes(basename(path))) return true;
-  if (FIXED_PROTECTED_ROOT_FILES.includes(path)) return true;
-  if (isAgentConfigProtectedPath(path)) return true;
-  if (path.startsWith(".yarnrc") || path.startsWith(".pnp.")) {
-    return true;
-  }
-  return FIXED_PROTECTED_PREFIXES.some((prefix) =>
-    path.startsWith(`${prefix}/`),
-  );
 }
 
 /**

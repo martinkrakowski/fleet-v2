@@ -4,7 +4,16 @@
 // file itself matches none of the patterns. Findings carry path, line and
 // rule name only — never a matched value.
 
-import { existsSync, readFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -15,6 +24,7 @@ import {
   isFixedProtectedPath,
   pathUnderPrefix,
   validateAllowedPathPrefix,
+  PROTECTED_PATH_RULES,
   type LaneDiffChangedPath,
   type LaneDiffSecretPattern,
 } from "../lane-diff-check.js";
@@ -403,44 +413,260 @@ describe("checkLaneDiff (policy additions are never lifted, O14d1 S3)", () => {
 });
 
 describe("isFixedProtectedPath (script parity, O14d1)", () => {
-  /** One sample path that the script's regex alternative must match. */
-  function sampleFor(alternative: string): string {
-    const unescaped = alternative.replaceAll("\\.", ".");
-    if (unescaped.endsWith("$")) {
-      return unescaped.slice(0, -1).replaceAll("[^/]+", "x");
+  function hasShAndGit(): boolean {
+    for (const [cmd, args] of [
+      ["sh", ["-c", "exit 0"]],
+      ["git", ["--version"]],
+    ] as const) {
+      const res = spawnSync(cmd, args, { stdio: "ignore" });
+      if (res.error || res.status !== 0) return false;
     }
-    if (unescaped.endsWith("/")) {
-      return `${unescaped}sample.txt`;
-    }
-    // A literal prefix such as `.yarnrc` or `.pnp.`
-    return unescaped;
+    return true;
   }
 
-  it("covers every alternative of the script's PROTECTED regex", () => {
-    const script = readFileSync(
-      path.join(repoRoot(), "scripts", "lane-diff-check.sh"),
-      "utf8",
-    );
-    const lines = script.split("\n");
-    const match =
-      /^PROTECTED='\^\((.*)\)'\r?$/.exec(
-        lines.find((candidate) =>
-          /^PROTECTED='\^\((.*)\)'\r?$/.test(candidate),
-        ) ?? "",
-      ) ?? null;
-    expect(
-      match,
-      "the script's PROTECTED regex was not found",
-    ).not.toBeNull();
-    const alternatives = match![1]!.split("|");
-    expect(alternatives.length).toBeGreaterThan(0);
-    for (const alternative of alternatives) {
-      const sample = sampleFor(alternative);
-      expect(isFixedProtectedPath(sample), alternative).toBe(true);
+  /**
+   * Partition fixture paths into batches where no two paths in the same batch
+   * collide case-insensitively on any path prefix, so case-insensitive volumes
+   * (macOS APFS) keep the exact casing of every fixture path.
+   */
+  function partitionCaseSafe(paths: readonly string[]): string[][] {
+    const batches: {
+      paths: string[];
+      prefixes: Map<string, string>;
+      files: Set<string>;
+    }[] = [];
+    for (const relPath of paths) {
+      const parts = relPath.split("/");
+      const prefixes: string[] = [];
+      for (let i = 0; i < parts.length; i++) {
+        prefixes.push(parts.slice(0, i + 1).join("/"));
+      }
+      let placed = false;
+      for (const batch of batches) {
+        const collides = prefixes.some((p) => {
+          const lower = p.toLowerCase();
+          if (batch.files.has(lower)) return true;
+          const existing = batch.prefixes.get(lower);
+          if (existing === undefined) return false;
+          return p === relPath || existing !== p;
+        });
+        if (!collides) {
+          for (const p of prefixes) {
+            batch.prefixes.set(p.toLowerCase(), p);
+          }
+          batch.files.add(relPath.toLowerCase());
+          batch.paths.push(relPath);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        const prefixMap = new Map<string, string>();
+        for (const p of prefixes) {
+          prefixMap.set(p.toLowerCase(), p);
+        }
+        batches.push({
+          paths: [relPath],
+          prefixes: prefixMap,
+          files: new Set([relPath.toLowerCase()]),
+        });
+      }
     }
+    return batches.map((b) => b.paths);
+  }
+
+  /**
+   * Write the fixture paths as files into temporary git repository batches,
+   * run the real `sh scripts/lane-diff-check.sh <repo>`, and collect its
+   * `protected: <path>` lines.
+   */
+  function runRealScriptProtectedSet(paths: readonly string[]): Set<string> {
+    const scriptPath = path.join(repoRoot(), "scripts", "lane-diff-check.sh");
+    const protectedSet = new Set<string>();
+    for (const batch of partitionCaseSafe(paths)) {
+      const tmpRepo = mkdtempSync(path.join(os.tmpdir(), "ldc-parity-"));
+      try {
+        execFileSync("git", ["init", "-q", "."], {
+          cwd: tmpRepo,
+          stdio: "ignore",
+        });
+        execFileSync("git", ["config", "core.excludesFile", "/dev/null"], {
+          cwd: tmpRepo,
+          stdio: "ignore",
+        });
+        for (const relPath of batch) {
+          const fullPath = path.join(tmpRepo, relPath);
+          mkdirSync(path.dirname(fullPath), { recursive: true });
+          writeFileSync(fullPath, "x\n");
+        }
+        const res = spawnSync("sh", [scriptPath, tmpRepo], {
+          encoding: "utf8",
+        });
+        expect([0, 1]).toContain(res.status);
+        for (const outLine of (res.stdout ?? "").split("\n")) {
+          const match = /^protected: (.+)$/.exec(outLine);
+          if (match) {
+            protectedSet.add(match[1]);
+          }
+        }
+      } finally {
+        rmSync(tmpRepo, { recursive: true, force: true });
+      }
+    }
+    return protectedSet;
+  }
+
+  /**
+   * Shared fixture for the shell/domain parity: every protected rule against
+   * root and nested paths, case variants, and non-protected look-alikes
+   * (L1b item 4, fix-1).
+   */
+  const PROTECTED_FIXTURE: readonly [string, boolean][] = [
+    // Yarn/npm/manifest at any depth, case-insensitively (L1b item 1, fix-1).
+    [".yarnrc", true],
+    ["packages/x/.yarnrc", true],
+    [".yarnrc.yml", true],
+    [".Yarnrc.yml", true],
+    ["packages/app/.yarnrc.yml", true],
+    [".npmrc", true],
+    [".NPMRC", true],
+    ["packages/x/.npmrc", true],
+    [".yarn/plugins/plugin.js", true],
+    [".Yarn/plugins/x", true],
+    [".yarn/releases/yarn.cjs", true],
+    [".yarn/patches/pkg.patch", true],
+    [".pnp.cjs", true],
+    [".PNP.cjs", true],
+    [".pnp.loader.mjs", true],
+    ["package.json", true],
+    ["Package.json", true],
+    ["packages/x/package.json", true],
+    ["packages/a/b/c/package.json", true],
+    ["node_modules/pkg/package.json", false],
+    ["packages/x/node_modules/y/package.json", false],
+    ["node_modules/AGENTS.md", true],
+    ["packages/app/node_modules/.cursorrules", true],
+    ["node_modules/x/.yarnrc", true],
+    ["node_modules/x/.gitattributes", true],
+    ["mypackage.jsonc", false],
+    ["package.jsonc", false],
+    ["yarn.lock", true],
+    ["packages/x/yarn.lock", true],
+    ["package-lock.json", true],
+    ["packages/x/package-lock.json", true],
+    ["pnpm-lock.yaml", true],
+    // Agent instruction and tool files at any depth, case-insensitively (L1b item 2).
+    ["AGENTS.md", true],
+    ["packages/app/AGENTS.md", true],
+    ["packages/app/agents.md", true],
+    ["CLAUDE.md", true],
+    ["packages/app/CLAUDE.md", true],
+    ["CLAUDE.local.md", true],
+    ["packages/app/claude.local.md", true],
+    ["GEMINI.md", true],
+    ["packages/app/gemini.md", true],
+    [".mcp.json", true],
+    ["packages/app/.mcp.json", true],
+    [".cursor/rules.mdc", true],
+    ["packages/app/.cursor/rules.mdc", true],
+    [".cursorrules", true],
+    ["packages/app/.cursorrules", true],
+    [".windsurfrules", true],
+    ["packages/app/.WindsurfRules", true],
+    [".github/copilot-instructions.md", true],
+    ["packages/app/.github/copilot-instructions.md", true],
+    [".vscode/tasks.json", true],
+    ["packages/app/.vscode/launch.json", true],
+    [".envrc", true],
+    ["packages/app/.envrc", false],
+    [".husky/pre-commit", true],
+    ["packages/app/.husky/pre-commit", false],
+    ["Makefile", true],
+    ["makefile", true],
+    ["GNUmakefile", true],
+    ["packages/app/Makefile", false],
+    // Git plumbing and the existing root-only classes.
+    [".gitattributes", true],
+    ["packages/x/.gitattributes", true],
+    [".gitmodules", true],
+    ["packages/x/.gitmodules", true],
+    [".github/workflows/ci.yml", true],
+    ["packages/app/.github/workflows/ci.yml", false],
+    [".claude/settings.json", true],
+    ["packages/app/.claude/settings.json", true],
+    [".opencode/opencode.json", true],
+    ["opencode.json", true],
+    ["opencode.jsonc", true],
+    ["OpenCode.JSON5", true],
+    [".gemini/settings.json", true],
+    [".agents/x.json", true],
+    [".agy/lane.txt", true],
+    [".lane/brief.md", true],
+    ["bin/tool.sh", true],
+    ["scripts/tool.sh", true],
+    [".architecture/manifest.yaml", true],
+    ["deploy/x.yaml", true],
+    ["installation/config.yaml", true],
+    ["Dockerfile", true],
+    ["packages/app/Dockerfile", false],
+    // Look-alikes.
+    ["docs/claude.md.txt", false],
+    ["docs/claude.md", true],
+    ["myAGENTS.md.bak", false],
+    ["packages/app/CLAUDE.md.backup", false],
+  ];
+
+  it("the exported table matches scripts/lane-diff-check.protected row for row", () => {
+    const ruleFile = path.join(
+      repoRoot(),
+      "scripts",
+      "lane-diff-check.protected",
+    );
+    const rows = readFileSync(ruleFile, "utf8")
+      .split("\n")
+      .filter((line) => {
+        const trimmed = line.trim();
+        return trimmed !== "" && !trimmed.startsWith("#");
+      })
+      .map((line) => {
+        const fields = line.split("\t");
+        expect(fields).toHaveLength(3);
+        const [pattern, anyDepth, caseInsensitive] = fields;
+        expect(Number(caseInsensitive)).toBe(1);
+        return [pattern, Number(anyDepth), Number(caseInsensitive)];
+      });
+    expect(rows.length).toBeGreaterThanOrEqual(35);
+    expect(
+      PROTECTED_PATH_RULES.map((rule) => [
+        rule.pattern,
+        rule.anyDepth ? 1 : 0,
+        rule.caseInsensitive ? 1 : 0,
+      ]),
+    ).toEqual(rows);
   });
 
-  it("also covers the plan's additions and case/depth agent config rules", () => {
+  it.skipIf(!hasShAndGit())(
+    "shell and domain reach the same verdict on the shared fixture list (L1b item 4)",
+    () => {
+      expect(PROTECTED_FIXTURE.length).toBeGreaterThanOrEqual(40);
+      const shellProtected = runRealScriptProtectedSet(
+        PROTECTED_FIXTURE.map(([relPath]) => relPath),
+      );
+      for (const [relPath, expected] of PROTECTED_FIXTURE) {
+        const ts = isFixedProtectedPath(relPath);
+        const shell = shellProtected.has(relPath);
+        expect({ path: relPath, ts, shell }).toEqual({
+          path: relPath,
+          ts: expected,
+          shell: expected,
+        });
+      }
+    },
+    // It runs the real script over 40+ paths in a temporary repository: about 8 s under load.
+    60_000,
+  );
+
+  it("also covers the plan's additions, case-variant yarn/npm/package rules, and non-package.json rules under node_modules", () => {
     for (const sample of [
       ".git/hooks/pre-commit",
       "installation/config.yaml",
@@ -453,8 +679,26 @@ describe("isFixedProtectedPath (script parity, O14d1)", () => {
       "opencode.jsonc",
       "packages/app/opencode.jsonc",
       "OpenCode.JSON5",
+      "Package.json",
+      ".Yarnrc.yml",
+      ".NPMRC",
+      ".PNP.cjs",
+      ".Yarn/plugins/x",
+      "node_modules/AGENTS.md",
+      "packages/app/node_modules/.cursorrules",
+      "node_modules/x/.yarnrc",
+      "node_modules/x/.gitattributes",
     ]) {
       expect(isFixedProtectedPath(sample), sample).toBe(true);
+    }
+    for (const allowed of [
+      // ASCII-only folding, as the shell's grep -i under LC_ALL=C: U+017F (long s) is not "s".
+      ".hu\u017Fky/pre-commit",
+      "foo/.git/config",
+      "node_modules/pkg/package.json",
+      "packages/x/node_modules/y/package.json",
+    ]) {
+      expect(isFixedProtectedPath(allowed), allowed).toBe(false);
     }
   });
 

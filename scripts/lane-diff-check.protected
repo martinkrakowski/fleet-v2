@@ -1,0 +1,68 @@
+# One protected-path rule per line: pattern<TAB>anyDepth<TAB>caseInsensitive.
+# pattern: ERE fragment; a trailing "/" is a directory, a trailing "*" is a name
+#   prefix, anything else is the exact file name (may contain "/").
+# anyDepth: 1 = match at any depth, 0 = repository root only.
+# caseInsensitive: 1 = match case-insensitively (every rule is 1: macOS volumes
+#   are case-insensitive).
+# This table is the single source the shell reads and the TypeScript domain mirrors
+# (packages/work-execution/src/domain/lane-diff-check.ts); a parity test keeps them equal.
+\.git/	0	1
+\.github/	0	1
+\.gemini/	0	1
+\.agents/	0	1
+\.agy/	0	1
+\.lane/	0	1
+\.architecture/	0	1
+bin/	0	1
+scripts/	0	1
+deploy/	0	1
+installation/	0	1
+\.yarn/plugins/	0	1
+\.yarn/releases/	0	1
+\.yarn/patches/	0	1
+\.husky/	0	1
+\.claude/	1	1
+\.opencode/	1	1
+\.cursor/	1	1
+\.vscode/	1	1
+Dockerfile	0	1
+Makefile	0	1
+makefile	0	1
+GNUmakefile	0	1
+\.envrc	0	1
+\.pnp\.*	0	1
+package\.json	1	1
+\.yarnrc	1	1
+\.yarnrc\.yml	1	1
+\.npmrc	1	1
+yarn\.lock	1	1
+package-lock\.json	1	1
+pnpm-lock\.yaml	1	1
+CLAUDE\.md	1	1
+CLAUDE\.local\.md	1	1
+AGENTS\.md	1	1
+GEMINI\.md	1	1
+\.mcp\.json	1	1
+\.cursorrules	1	1
+\.windsurfrules	1	1
+\.github/copilot-instructions\.md	1	1
+\.gitattributes	1	1
+\.gitmodules	1	1
+opencode\.json*	1	1
+# Host-tool loaders added after Fable's review of #149 (devcontainers, version managers, more agent and editor configs).
+\.devcontainer/	1	1
+mise\.toml	1	1
+\.mise\.toml	1	1
+\.mise/	1	1
+\.tool-versions	1	1
+\.windsurf/	1	1
+\.clinerules*	1	1
+\.roo/	1	1
+\.aider\.conf\.yml	1	1
+\.idea/	1	1
+\.zed/	1	1
+\.dir-locals\.el	1	1
+\.yarn/sdks/	0	1
+\.claude-plugin/	1	1
+pnpm-workspace\.yaml	0	1
+\.pnpmfile\.cjs	1	1

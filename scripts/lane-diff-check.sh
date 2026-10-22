@@ -1,16 +1,20 @@
 #!/bin/sh
 # lane-diff-check — what an orchestrator runs over a lane's worktree BEFORE it commits or pushes what
 # a model produced. Three questions, answered without printing a single matched value:
-#   1. Did the lane touch a protected path? (.github, .gemini, .agents, .lane, .claude, .opencode,
-#      opencode.json*, bin, scripts, AGENTS.md, CLAUDE.md, GEMINI.md, package.json, yarn.lock,
-#      .architecture, .yarnrc*, .pnp.*, Dockerfile, deploy). A changed workflow runs on GitHub the
-#      moment it is pushed; a changed agent or permission file changes what the next lane may do.
-#      .claude/, .opencode/ and opencode.json* are matched case-insensitively at any depth. Every
-#      ignored, untracked file (except dependency/build output and the worktree's ignored .lane/
-#      directory) is reviewed too, so .gitignore cannot hide protected files or secrets. Decision D3
-#      (plan §3): the brief's integrity is checked by digest at dispatch (lane L7a); an ignored
-#      .lane/ file is skipped because the brief lives there in every worktree, but a .lane/ path
-#      that is tracked or committed in the diff is a protected finding.
+#   1. Did the lane touch a protected path? The rules live in ONE table,
+#      scripts/lane-diff-check.protected, read here and mirrored by the TypeScript domain; a parity
+#      test keeps them equal. Protected classes: github workflows, agent instruction/editor tool
+#      files (CLAUDE.md, AGENTS.md, GEMINI.md, .mcp.json, .cursor/, .vscode/, …), yarn/npm/package
+#      manifests and lockfiles at any depth, git attributes/modules, lane plumbing (.lane, .agents,
+#      …), install trees and scripts/bin. A changed workflow runs on GitHub the moment it is pushed;
+#      a changed agent or permission file changes what the next lane may do. The protected check runs
+#      BEFORE the ignored-file keep-list, so .agents/node_modules/x or .claude/dist/x is still a
+#      protected finding while dependency/build output and the worktree's ignored .lane/ stay out of
+#      the review. Decision D3 (plan §3): an ignored .lane/ file is skipped because the brief lives
+#      there in every worktree, but a .lane/ path that is tracked or committed in the diff is a
+#      protected finding. Filter drivers in the shared .git/config other than lfs are reported as
+#      git-config-filter and neutralised before the first diff, so the gate never runs a
+#      lane-chosen filter.
 #   2. Does any changed, untracked or reviewed ignored file contain something that looks like a
 #      credential? Reported as file:line and the pattern's name only. The content is never printed.
 #      A file containing a NUL byte is still scanned, a file over 5 MiB is reported as
@@ -29,12 +33,20 @@ set -u
 # would empty the review list and the gate would pass with 0 files.
 LC_ALL=C; export LC_ALL; unset LANGUAGE 2>/dev/null || true
 
+# The protected-path table is the single source for this script and the TypeScript domain
+# (S2); see scripts/lane-diff-check.protected for the format. Every rule is matched
+# case-insensitively (grep -i): macOS volumes are case-insensitive. Only package.json is
+# exempted under a node_modules/ directory (dependency manifests); every other rule still
+# applies under node_modules/, so node_modules/AGENTS.md, node_modules/x/.yarnrc and
+# .agents/node_modules/x stay protected (L1b items 1-3, fix-1).
+
 wt=''
 base=''
 brief=''
 strict=0
 allow=''
 quiet=0
+rules=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --base) [ "$#" -ge 2 ] || { echo "lane-diff-check: --base needs a value" >&2; exit 2; }; base=$2; shift ;;
@@ -42,13 +54,57 @@ while [ "$#" -gt 0 ]; do
     --strict-brief) strict=1 ;;
     --allow-protected) [ "$#" -ge 2 ] || { echo "lane-diff-check: --allow-protected needs a value" >&2; exit 2; }; allow=$2; shift ;;
     --quiet) quiet=1 ;;
+    --rules) [ "$#" -ge 2 ] || { echo "lane-diff-check: --rules needs a value" >&2; exit 2; }; rules=$2; shift ;;
     -h | --help) sed -n '2,25p' "$0"; exit 0 ;;
     -*) echo "lane-diff-check: unknown option $1" >&2; exit 2 ;;
     *) [ -z "$wt" ] || { echo "lane-diff-check: one worktree at a time" >&2; exit 2; }; wt=$1 ;;
   esac
   shift
 done
-[ -n "$wt" ] || { echo "usage: lane-diff-check.sh <worktree> [--base <ref>] [--brief <file>] [--strict-brief] [--allow-protected <regex>] [--quiet]" >&2; exit 2; }
+self_dir=$(CDPATH= cd -P "$(dirname "$0")" 2>/dev/null && pwd) || exit 2
+# --rules names the table explicitly: the trusted copy, when this script is piped (sh -s) or run
+# from a trusted checkout against a lane worktree (Fable review of #149).
+RULE_FILE=${rules:-$self_dir/lane-diff-check.protected}
+[ -f "$RULE_FILE" ] || { echo "lane-diff-check: missing $RULE_FILE" >&2; exit 2; }
+
+ROOT_CI=''; ANY_CI=''; NM_EXEMPT_CI=''
+CR=$(printf '\r')
+rules_n=0
+while IFS='	' read -r pat any _ci; do
+  case "$pat" in '' | \#*) continue ;; esac
+  # Fail closed on a malformed row: a space instead of a tab, a missing or extra field, or a flag
+  # that is not 0/1 must never silently weaken a rule (Fable review of #149).
+  _ci=${_ci%"$CR"}
+  case "$pat" in *[[:space:]]*) echo "lane-diff-check: malformed rule row in $RULE_FILE" >&2; exit 2 ;; esac
+  case "$any:$_ci" in 0:1 | 1:1 | 0:0 | 1:0) ;; *) echo "lane-diff-check: malformed rule row in $RULE_FILE" >&2; exit 2 ;; esac
+  rules_n=$((rules_n + 1))
+  case "$pat" in
+    */) kind=dir; body=${pat%/} ;;
+    *\*) kind=pre; body=${pat%\*} ;;
+    *) kind=file; body=$pat ;;
+  esac
+  case "$kind" in
+    dir)  [ "$any" = 1 ] && a="(^|/)$body(/|$)" || a="^$body(/|$)" ;;
+    pre)  [ "$any" = 1 ] && a="(^|/)$body" || a="^$body" ;;
+    file) [ "$any" = 1 ] && a="(^|/)$body\$" || a="^$body\$" ;;
+  esac
+  if [ "$pat" = 'package\.json' ]; then
+    NM_EXEMPT_CI="${NM_EXEMPT_CI:+$NM_EXEMPT_CI|}$a"
+  elif [ "$any" = 1 ]; then
+    ANY_CI="${ANY_CI:+$ANY_CI|}$a"
+  else
+    ROOT_CI="${ROOT_CI:+$ROOT_CI|}$a"
+  fi
+done < "$RULE_FILE"
+# Fail closed on a table that loaded too few rules, or a pattern grep cannot compile (exit 2 from
+# grep would otherwise read as "no match").
+[ "$rules_n" -ge 40 ] || { echo "lane-diff-check: $RULE_FILE has $rules_n rules (expected at least 40)" >&2; exit 2; }
+for re in "$ROOT_CI" "$ANY_CI" "$NM_EXEMPT_CI"; do
+  [ -n "$re" ] || continue
+  printf 'x\n' | grep -Eiq -- "$re"
+  [ "$?" -ne 2 ] || { echo "lane-diff-check: a rule in $RULE_FILE is not a valid pattern" >&2; exit 2; }
+done
+[ -n "$wt" ] || { echo "usage: lane-diff-check.sh <worktree> [--base <ref>] [--brief <file>] [--strict-brief] [--allow-protected <regex>] [--quiet] [--rules <table>]" >&2; exit 2; }
 [ -d "$wt" ] || { echo "lane-diff-check: $wt is not a directory" >&2; exit 2; }
 cd "$wt" || exit 2
 git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "lane-diff-check: $wt is not a git worktree" >&2; exit 2; }
@@ -73,19 +129,55 @@ trap 'rm -rf "$T"' EXIT
 # delete + add so a protected source path is seen; names are taken NUL-delimited and unquoted so
 # unusual names are scanned as the real file. Any collection failure fails closed (exit 2).
 #
-# Ignored, untracked paths skipped from review: dependency trees, build output, yarn cache/state, and
-# the worktree's ignored .lane/ directory. Decision D3 (plan §3): the brief's integrity is checked by
-# digest at dispatch (lane L7a); an ignored .lane/ file is skipped because the brief lives there in
-# every worktree, but a .lane/ path that is tracked or committed in the diff is a protected finding.
-IGNORED_SKIP='(^|/)(node_modules|dist|\.next|\.turbo|\.output|coverage)/|^\.yarn/(cache/|install-state\.gz$)|^\.lane(/|$)'
+# Dependency/build output is skipped from review AFTER the protected check; the worktree's own
+# ignored .lane/ directory is also skipped (the brief lives there in every worktree). Decision D3
+# (plan §3): the brief's integrity is checked by digest at dispatch (lane L7a); an ignored .lane/
+# file is skipped because the brief lives there in every worktree, but a .lane/ path that is tracked
+# or committed in the diff is a protected finding (the protected check runs over the base list, so
+# a tracked .lane/ is still caught).
+DEP_BUILD_SKIP='(^|/)(node_modules|dist|\.next|\.turbo|\.output|coverage)/|^\.yarn/(cache/|install-state\.gz$)'
+IGNORED_SKIP="$DEP_BUILD_SKIP|^\.lane(/|$)"
 # The same pins as LaneDiffCheckAdapter's GIT_CONFIG_ARGS: a lane can write the shared .git/config,
 # and the gate's own git calls must never run a lane-chosen fsmonitor, hook, external diff or
-# filter (Fable review of L1).
+# filter (Fable review of L1). Any non-lfs filter driver found in the shared config is appended to
+# FILTER_ARGS below, before the first diff, so the gate never runs a lane-chosen filter.
+FILTER_ARGS=''
 g() {
   git -c color.ui=never -c core.quotePath=false -c core.fsmonitor=false -c core.hooksPath=/dev/null \
     -c core.attributesFile=/dev/null -c diff.external= -c diff.noprefix=false \
-    -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.process= "$@"
+    -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.process= $FILTER_ARGS "$@"
 }
+
+# Filter drivers in the shared git config (including any file pulled in via include.path): read
+# with the pinned g(), never a plain git. Collect every non-lfs clean/smudge/process driver (a
+# lane can write .git/config); they are reported after collection and neutralised here for every
+# git call that follows.
+# Only the key NAMES are read, NUL-separated (`-z --name-only`): a key cannot contain a newline or
+# NUL, so no lane-written value can end or forge the list (Grok re-review of L1b: a value line
+# "EOF" ended the old heredoc early). A driver name outside [A-Za-z0-9_.-] cannot be neutralised
+# safely, because FILTER_ARGS is word-split into git's argv, where a name with spaces would inject
+# its own -c option. So the gate fails closed on it before running any diff.
+g config -z --includes --name-only --get-regexp '^filter\..*\.(clean|smudge|process)$' 2>/dev/null |
+  tr '\0' '\n' > "$T/filter-keys" || true
+FILTER_LIST=''
+while IFS= read -r key; do
+  [ -n "$key" ] || continue
+  driver=${key#filter.}
+  driver=${driver%.*}
+  [ "$driver" != lfs ] || continue
+  case "$driver" in
+    '' | *[!A-Za-z0-9_.-]*)
+      echo "git-config-filter-unsafe: a filter driver name in the git config cannot be neutralised; refusing to run git"
+      echo "lane-diff-check: 0 file(s) reviewed, 1 finding(s), 0 warning(s)"
+      exit 1
+      ;;
+  esac
+  case "$FILTER_LIST" in *"|$driver|"*) ;; *) FILTER_LIST="$FILTER_LIST|$driver|" ;; esac
+done < "$T/filter-keys"
+for d in $(printf '%s' "$FILTER_LIST" | tr '|' ' '); do
+  [ -n "$d" ] || continue
+  FILTER_ARGS="$FILTER_ARGS -c filter.$d.clean= -c filter.$d.smudge= -c filter.$d.process= -c filter.$d.required=false"
+done
 collect() {
   if git rev-parse --verify -q HEAD >/dev/null; then
     if [ -n "$base" ]; then
@@ -100,39 +192,59 @@ collect() {
   if ! g ls-files --others --ignored --exclude-standard -z > "$T/ignored0"; then
     return 1
   fi
-  if [ "$(tr -cd '\n' < "$T/ignored0" | wc -c | tr -d ' ')" != 0 ]; then
-    return 1
-  fi
-  tr '\0' '\n' < "$T/ignored0" |
-    grep -avE "$IGNORED_SKIP" |
-    tr '\n' '\0'
 }
-collect > "$T/files0" || { echo "lane-diff-check: could not list changed files" >&2; exit 2; }
+collect > "$T/files-base0" || { echo "lane-diff-check: could not list changed files" >&2; exit 2; }
 # A file name containing a newline cannot be reviewed line by line: refuse.
-if [ "$(tr -cd '\n' < "$T/files0" | wc -c | tr -d ' ')" != 0 ]; then
+if [ "$(tr -cd '\n' < "$T/files-base0" | wc -c | tr -d ' ')" != 0 ] ||
+   [ "$(tr -cd '\n' < "$T/ignored0" | wc -c | tr -d ' ')" != 0 ]; then
   echo "lane-diff-check: a changed file name contains a newline; refusing" >&2
   exit 2
 fi
-tr '\0' '\n' < "$T/files0" | grep -av '^$' | sort -u > "$T/files"
+tr '\0' '\n' < "$T/ignored0" | grep -av '^$' > "$T/ignored"
+
+# The protected check runs over every reviewed candidate BEFORE the ignored-file keep-list
+# (L1b item 3): committed/changed/untracked paths plus all ignored files except the worktree's own
+# ignored .lane/ (the brief lives there in every worktree). The dependency/build keep-list is
+# applied only for the secret- and brief-scan list below, so .agents/node_modules/x or
+# .claude/dist/x is still a protected finding while ignored node_modules/dist output is not scanned.
+{
+  tr '\0' '\n' < "$T/files-base0" | grep -av '^$'
+  grep -avE '^\.lane(/|$)' "$T/ignored"
+} | sort -u > "$T/protected-candidates"
+
+# The secret- and brief-scan list drops the full ignored keep-list.
+grep -avE "$IGNORED_SKIP" "$T/protected-candidates" > "$T/files"
 
 say() { [ "$quiet" = 1 ] || echo "$@"; }
 findings=0
 warnings=0
 
-PROTECTED='^(\.github/|\.gemini/|\.agents/|\.agy/|\.lane/|bin/|scripts/|AGENTS\.md$|CLAUDE\.md$|GEMINI\.md$|package\.json$|[^/]+/[^/]+/package\.json$|yarn\.lock$|\.yarnrc|\.architecture/|\.pnp\.|Dockerfile$|deploy/|\.claude/|\.opencode/|opencode\.json)'
-PROTECTED_AGENT_CONFIG='(^|/)\.claude/|(^|/)\.opencode/|(^|/)opencode\.json'
 while IFS= read -r f; do
-  if ! printf '%s\n' "$f" | grep -Eq "$PROTECTED" &&
-     ! printf '%s\n' "$f" | grep -Eiq "$PROTECTED_AGENT_CONFIG"; then
-    continue
+  under_nm=0
+  printf '%s\n' "$f" | grep -Eiq '(^|/)node_modules/' && under_nm=1
+  hit=0
+  if { [ -n "$ROOT_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ROOT_CI"; } ||
+     { [ -n "$ANY_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ANY_CI"; } ||
+     { [ "$under_nm" = 0 ] && [ -n "$NM_EXEMPT_CI" ] && printf '%s\n' "$f" | grep -Eiq "$NM_EXEMPT_CI"; }; then
+    hit=1
   fi
-  if [ -n "$allow" ] && printf '%s\n' "$f" | grep -Eq "$allow"; then
-    say "allowed-protected: $f"
-    continue
+  if [ "$hit" = 1 ]; then
+    if [ -n "$allow" ] && printf '%s\n' "$f" | grep -Eq "$allow"; then
+      say "allowed-protected: $f"
+      continue
+    fi
+    say "protected: $f"
+    findings=$((findings + 1))
   fi
-  say "protected: $f"
+done < "$T/protected-candidates"
+
+# Report non-lfs filter drivers found in the shared git config; their neutralisation was applied to
+# every git call above, before any diff ran them.
+for d in $(printf '%s' "$FILTER_LIST" | tr '|' ' '); do
+  [ -n "$d" ] || continue
+  say "git-config-filter: $d"
   findings=$((findings + 1))
-done < "$T/files"
+done
 
 # name|extended regex. Names are what the report prints; the matched text never is.
 cat > "$T/patterns" <<'PAT'

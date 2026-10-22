@@ -34,7 +34,7 @@ afterAll(async () => {
   );
 });
 
-const FAKE_AGY_RUN = `#!/bin/sh
+const FAKE_AGY_RUN = `#!/bin/bash
 # A fake agy-run: it is not the reviewed script and it runs no model. It records
 # the argv it was handed and then answers as \`fake-mode\` in this directory says.
 printf '%s\\n' "$0" "$@" > "__DIR__/args.log"
@@ -401,12 +401,21 @@ describe('AgyRunnerAdapter environment allow-list (both modes)', () => {
       for (const mode of ['edit-only', 'full'] as const) {
         const env = await runLaneAndReadEnv(mode);
 
-        // PATH and HOME come from this host; PWD is set by /bin/sh itself as it
-        // starts, never by the adapter, which handed over the allow-list only.
-        // SSH_AUTH_SOCK is planted here and must still be dropped: no ssh
-        // transport is declared, so it belongs to no process in this lane.
+        // PATH and HOME come from this host; PWD is set by the child shell
+        // itself as it starts, never by the adapter, which handed over the
+        // allow-list only. The child shell may also export its own SHLVL and
+        // `_` (bash — including macOS's /bin/sh — does those), so the
+        // allow-list is asserted as a subset plus PWD, and every remaining
+        // variable must be one of those two shell-owned ones, never an adapter
+        // leak (T1). SSH_AUTH_SOCK is planted here and must still be dropped:
+        // no ssh transport is declared, so it belongs to no process in this lane.
         const laneAllowlist = AGY_RUNNER_ENV_ALLOWLIST.filter((key) => key !== 'SSH_AUTH_SOCK');
-        expect(Object.keys(env).sort()).toEqual([...laneAllowlist, 'PWD'].sort());
+        const expectedKeys = [...laneAllowlist, 'PWD'];
+        for (const key of expectedKeys) {
+          expect(env).toHaveProperty(key);
+        }
+        const extras = Object.keys(env).filter((key) => !expectedKeys.includes(key));
+        expect(extras.every((key) => key === 'SHLVL' || key === '_')).toBe(true);
         for (const key of Object.keys(allowed)) expect(env[key]).toBe(allowed[key]);
         // Named explicitly, per mode: the ssh agent, both GitHub tokens, every
         // GIT_* variable, every OPENROUTER* and every *_API_KEY.

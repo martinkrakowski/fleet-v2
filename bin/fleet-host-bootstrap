@@ -90,7 +90,7 @@ else
       say "exists: $d (mode left as it is)"
     else
       mkdir -p -- "$d"
-      chmod 700 -- "$d"
+      chmod -- 700 "$d"
       say "created: $d (mode 700)"
     fi
   done

@@ -1,7 +1,9 @@
 #!/bin/sh
 # Tests for bin/fleet-host-bootstrap. The script is meant to run on a fresh host; here it runs in a
 # temp HOME with stub tools first on PATH (a real node is kept aside for the JSON check, a real
-# coreutils PATH is kept behind the stubs). No network, no system change, nothing installed.
+# coreutils PATH is kept behind the stubs — except in the cases that must not see the host at all,
+# which run the script on a PATH built from the stubs and TOOLBIN, a directory of symlinks to only
+# the system tools the script needs). No network, no system change, nothing installed.
 # Run it as `sh`, `dash` or `zsh tests/fleet-host-bootstrap.test.sh`.
 set -u
 [ -n "${ZSH_VERSION:-}" ] && emulate sh
@@ -14,12 +16,31 @@ unset XDG_CONFIG_HOME FLEET_WORKTREE_ROOT FLEET_TMPDIR FLEET_OPENCODE_CONFIG_DIR
 REAL_NODE=$(command -v node || true)
 REAL_PATH=$PATH
 T=$(mktemp -d "${TMPDIR:-/tmp}/fleet-host-bootstrap-test.XXXXXX") || exit 1
+# A decoy agy on the host PATH, as on a Mac with a Homebrew or ~/.local/bin agy: the missing-tool
+# case below must still report agy missing, which proves it cannot see the host's own tools
+# (Grok review of L2: without a decoy the case passed on a clean runner even if isolation regressed).
+mkdir -p "$T/hostbin" && printf '#!/bin/sh\necho "agy 9.9.9 (host decoy)"\n' > "$T/hostbin/agy" && chmod +x "$T/hostbin/agy"
+REAL_PATH="$T/hostbin:$REAL_PATH"
 fails=0
 ok() { printf 'ok   %s\n' "$1"; }
 bad() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 finish() { rm -rf "$T"; }
 trap finish EXIT
+
+# TOOLBIN: symlinks to the ONLY system tools the script and its stubs need (the stubs' `cat`, the
+# script's id/uname/sed/tr/awk/head/mkdir/chmod, node, and the shell $RUNSH names), each resolved
+# once with command -v from REAL_PATH before any stub exists. git, opencode and agy are never
+# linked: they are the cases' own stubs, and a case that removes one must not be able to find the
+# host's real one through REAL_PATH — a Mac with a Homebrew agy made the missing-tool case lie.
+# The cases below that must be independent of the host run the script with "$T/bin:$T/fakepkg:$TOOLBIN".
+TOOLBIN=$T/toolbin
+mkdir -p "$TOOLBIN"
+for t in sh cat id uname sed tr awk head mkdir chmod node "$(basename "$RUNSH")"; do
+  [ -e "$TOOLBIN/$t" ] && continue
+  p=$(PATH="$REAL_PATH"; command -v "$t" 2>/dev/null || true)
+  [ -n "$p" ] && ln -s "$p" "$TOOLBIN/$t"
+done
 
 setup() { # a fresh HOME and a stub bin dir; $1 = the word `uname` prints (empty: no uname stub)
   rm -rf "$T/home" "$T/bin"
@@ -95,7 +116,8 @@ mkdir -p "$T/fakepkg"
 printf '#!/bin/sh\necho "apt-get ran" >> "%s/pkg.log"\nexit 0\n' "$T" > "$T/fakepkg/apt-get"
 printf '#!/bin/sh\necho "snap ran" >> "%s/pkg.log"\nexit 0\n' "$T" > "$T/fakepkg/snap"
 chmod +x "$T/fakepkg"/*
-PATH="$T/bin:$T/fakepkg:$REAL_PATH" "$RUNSH" "$SCRIPT" >"$T/out" 2>"$T/err"
+# no REAL_PATH on this run: the host's real agy must stay invisible, or the case tests the host
+PATH="$T/bin:$T/fakepkg:$TOOLBIN" "$RUNSH" "$SCRIPT" >"$T/out" 2>"$T/err"
 check "missing tool: exit 0 (reported, not fatal here)" '[ $? = 0 ]'
 check "missing tool: reported on stderr" 'grep -q "missing agy" "$T/err"'
 check "missing tool: nothing was installed" '[ ! -s "$T/pkg.log" ]'
@@ -187,7 +209,8 @@ rm "$T/bin/agy"
 mkdir -p "$T/fakepkg"
 printf '#!/bin/sh\necho "sudo ran" >> "%s/pkg.log"\nexit 0\n' "$T" > "$T/fakepkg/sudo"
 chmod +x "$T/fakepkg/sudo"
-PATH="$T/bin:$T/fakepkg:$REAL_PATH" "$RUNSH" "$SCRIPT" >"$T/out" 2>"$T/err"
+# the same host-blind PATH: the removed agy stub must not be replaced by the host's real agy
+PATH="$T/bin:$T/fakepkg:$TOOLBIN" "$RUNSH" "$SCRIPT" >"$T/out" 2>"$T/err"
 check "sudo stub: exit 0" '[ $? = 0 ]'
 check "sudo stub: never invoked" '[ ! -s "$T/pkg.log" ]'
 check "sudo stub: nothing on stderr mentions sudo" '! grep -q sudo "$T/err"'

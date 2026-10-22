@@ -88,14 +88,14 @@ describe("checkLaneDiff (script parity)", () => {
     ]);
   });
 
-  it("a lane plumbing change under .lane is a protected-path finding", () => {
-    const verdict = check([
-      { path: ".lane/brief-manifest.json", status: "untracked" },
-    ]);
-    expect(verdict.findings).toEqual([
-      { path: ".lane/brief-manifest.json", rule: "outside-allowed-paths" },
-      { path: ".lane/brief-manifest.json", rule: "protected-path" },
-    ]);
+  it("a lane plumbing change under .lane is a protected-path finding (D3)", () => {
+    for (const status of ["added", "modified", "untracked"] as const) {
+      const verdict = check([{ path: ".lane/brief.md", status }]);
+      expect(verdict.findings).toEqual([
+        { path: ".lane/brief.md", rule: "outside-allowed-paths" },
+        { path: ".lane/brief.md", rule: "protected-path" },
+      ]);
+    }
   });
 
   it("a policy addition extends the protected list (.gemini)", () => {
@@ -122,7 +122,29 @@ describe("checkLaneDiff (script parity)", () => {
   });
 
   it("opencode config (.opencode/, opencode.json*) is a protected-path finding (B3)", () => {
-    for (const path of [".opencode/auth.json", "opencode.json", "opencode.json5"]) {
+    for (const path of [
+      ".opencode/auth.json",
+      "opencode.json",
+      "opencode.jsonc",
+      "opencode.json5",
+    ]) {
+      const verdict = check([{ path, status: "untracked" }]);
+      expect(verdict.findings).toContainEqual({
+        path,
+        rule: "protected-path",
+      });
+    }
+  });
+
+  it(".claude/, .opencode/ and opencode.json* match at any depth and case-insensitively (Fix 3)", () => {
+    for (const path of [
+      ".Claude/settings.json",
+      "packages/app/.claude/settings.json",
+      "packages/x/.Claude/settings.json",
+      "packages/x/.OpenCode/auth.json",
+      "packages/x/opencode.jsonc",
+      "packages/x/OpenCode.JSON5",
+    ]) {
       const verdict = check([{ path, status: "untracked" }]);
       expect(verdict.findings).toContainEqual({
         path,
@@ -418,12 +440,19 @@ describe("isFixedProtectedPath (script parity, O14d1)", () => {
     }
   });
 
-  it("also covers the plan's additions", () => {
+  it("also covers the plan's additions and case/depth agent config rules", () => {
     for (const sample of [
       ".git/hooks/pre-commit",
       "installation/config.yaml",
       "package-lock.json",
       "pnpm-lock.yaml",
+      ".lane/brief.md",
+      ".Claude/settings.json",
+      "packages/app/.claude/settings.json",
+      "packages/app/.OpenCode/opencode.json",
+      "opencode.jsonc",
+      "packages/app/opencode.jsonc",
+      "OpenCode.JSON5",
     ]) {
       expect(isFixedProtectedPath(sample), sample).toBe(true);
     }

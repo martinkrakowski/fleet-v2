@@ -19,7 +19,7 @@ rc() { cat "$T/rc"; }
 R=$T/repo
 mkdir -p "$R/packages/x/src" "$R/.github/workflows" && cd "$R" || exit 1
 git init -q . && git config user.email t@example.invalid && git config user.name t
-printf '/.lane/\n.agents/\n.env\n' > .gitignore
+printf '/.lane/\n.agents/\n.env\nsecrets/\n/CLAUDE.md\nnode_modules/\n' > .gitignore
 echo 'export const a = 1;' > packages/x/src/a.ts
 echo 'name: gate' > .github/workflows/gate.yml
 git add . && git -c commit.gpgsign=false commit -q -m init
@@ -102,45 +102,86 @@ rm -f README.md
 U=$T/unborn; mkdir -p "$U/.github" && ( cd "$U" && git init -q . && echo x > .github/w.yml && git add .github/w.yml )
 run "$U"; check 'a staged protected file before the first commit is a finding' '[ "$(rc)" = 1 ] && grep -q "^protected: .github/w.yml" "$T/o"'
 
-echo '# L1 security remediation (B3, M1, shell minors 9-11)'
-# B3: Claude Code and opencode configuration paths are protected.
+echo '# L1 security remediation (B3, M1, shell minors 9-11, fix-1)'
+# B3 + Fix 3: Claude Code and opencode configuration paths are protected at any depth and case-insensitively.
 mkdir -p .claude .opencode
 echo '{"hooks":{}}' > .claude/settings.json
 echo '{"permissions":[]}' > .opencode/opencode.json
 echo '{}' > opencode.json
 run "$R" --base base
-check 'Claude Code and opencode permission files are findings (B3)' '[ "$(rc)" = 1 ] && grep -q "^protected: .claude/settings.json" "$T/o" && grep -q "^protected: .opencode/opencode.json" "$T/o" && grep -q "^protected: opencode.json" "$T/o"'
+check 'Claude Code and opencode permission files are findings (B3)' '[ "$(rc)" = 1 ] && grep -q "^protected: .claude/settings.json$" "$T/o" && grep -q "^protected: .opencode/opencode.json$" "$T/o" && grep -q "^protected: opencode.json$" "$T/o"'
 rm -rf .claude .opencode opencode.json
+mkdir -p .Claude packages/app/.claude
+echo '{}' > .Claude/settings.json
+echo '{}' > packages/app/.claude/settings.json
+echo '{}' > opencode.jsonc
+run "$R" --base base
+check 'case-insensitive and nested Claude/opencode paths are protected (Fix 3)' '[ "$(rc)" = 1 ] && grep -q "^protected: .Claude/settings.json$" "$T/o" && grep -q "^protected: packages/app/.claude/settings.json$" "$T/o" && grep -q "^protected: opencode.jsonc$" "$T/o"'
+rm -rf .Claude packages/app opencode.jsonc
 
-# M1: ignored files under protected prefixes and ignored secret-shaped files are reviewed.
-mkdir -p .agents
+# M1 + Fix 2: every ignored, untracked file outside the dependency/build skip list is reviewed.
+mkdir -p .agents secrets
 echo '{"tools":[]}' > .agents/x.json
 printf '%s=%s\n' OPENCODE_SERVER_PASSWORD hunter2hunter2 > .env
+printf 'const t = "%s";\n' "$tok" > secrets/token.txt
+echo '# rules' > CLAUDE.md
 run "$R" --base base
-check 'ignored protected and secret-shaped files are findings (M1)' '[ "$(rc)" = 1 ] && grep -q "^protected: .agents/x.json" "$T/o" && grep -q "(opencode-server-password)" "$T/o"'
-rm -rf .agents .env
+check 'ignored protected and secret-shaped files are findings (M1)' '[ "$(rc)" = 1 ] && grep -q "^protected: .agents/x.json$" "$T/o" && grep -q "(opencode-server-password)" "$T/o"'
+check 'ignored secrets/token.txt and ignored root CLAUDE.md are findings (Fix 2)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: secrets/token.txt:1 (github-token)$" "$T/o" && grep -q "^protected: CLAUDE.md$" "$T/o"'
+rm -rf .agents .env secrets CLAUDE.md
+mkdir -p node_modules/pkg
+printf 'const t = "%s";\n' "$tok" > node_modules/pkg/index.js
+run "$R" --base base
+check 'an ignored file under node_modules/ is skipped (Fix 2)' '[ "$(rc)" = 0 ] && ! grep -q "node_modules" "$T/o"'
+rm -rf node_modules
 
-# Shell minor 10: a NUL-containing file is scanned (grep -a), not skipped as binary.
+# Fix 4 (D3): a committed .lane/brief.md is protected; an ignored, untracked .lane/brief.md is skipped.
+run "$R" --base base
+check 'an ignored, untracked .lane/brief.md is not a finding (Fix 4)' '[ "$(rc)" = 0 ] && ! grep -q "\.lane" "$T/o"'
+git add -f .lane/brief.md && git -c commit.gpgsign=false commit -q -m lane-brief
+run "$R" --base base
+check 'a committed .lane/brief.md is a protected finding (Fix 4)' '[ "$(rc)" = 1 ] && grep -q "^protected: .lane/brief.md$" "$T/o"'
+git reset -q HEAD~1 && git reset -q -- .lane/brief.md
+
+# Shell minor 10 + Fix 5: a NUL-containing file is scanned (grep -a), not skipped as binary.
 printf 'const x = 1;\000const t = "%s";\n' "$tok" > packages/x/src/nul.ts
 run "$R" --base base
-check 'a NUL-containing file is still scanned' '[ "$(rc)" = 1 ] && grep -q "(github-token)" "$T/o"'
+check 'a NUL-containing file is still scanned' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/nul.ts:1 (github-token)$" "$T/o" && ! grep -q "Binary file" "$T/o" && ! grep -q "Binary file" "$T/e"'
 rm -f packages/x/src/nul.ts
 
-# Shell minor 11: a symlink whose target leaves the worktree is a finding.
+# Shell minor 11 + Fix 1: symlinks are resolved up to 40 hops and never followed when scanning.
 mkdir -p "$T/outside" && echo 'nothing secret here' > "$T/outside/thing"
+printf 'const t = "%s";\n' "$tok" > "$T/outside/file"
 ln -s "$T/outside/thing" packages/x/src/abs-link
 ln -s ../../outside/thing packages/rel-link
 run "$R" --base base
-check 'a symlink leaving the worktree is a finding' '[ "$(rc)" = 1 ] && grep -q "^symlink-outside-worktree: packages/x/src/abs-link" "$T/o" && grep -q "^symlink-outside-worktree: packages/rel-link" "$T/o"'
+check 'a symlink leaving the worktree is a finding' '[ "$(rc)" = 1 ] && grep -q "^symlink-escape: packages/x/src/abs-link$" "$T/o" && grep -q "^symlink-escape: packages/rel-link$" "$T/o"'
 rm -f packages/x/src/abs-link packages/rel-link
+mkdir -p sub
+ln -s "$T/outside" sub/out
+ln -s sub/out/file link
+run "$R" --base base
+check 'a symlink to a directory outside is symlink-escape (Fix 1)' '[ "$(rc)" = 1 ] && grep -q "^symlink-escape: sub/out$" "$T/o"'
+check 'a chained symlink escape reports symlink-escape and never scans the outside file (Fix 1)' '[ "$(rc)" = 1 ] && grep -q "^symlink-escape: link$" "$T/o" && ! grep -q "secret-pattern" "$T/o" && ! grep -q "abcdefghij" "$T/o"'
+rm -rf sub link
+ln -s does-not-exist packages/x/src/dangling
+run "$R" --base base
+check 'a dangling symlink is symlink-unresolved (Fix 1)' '[ "$(rc)" = 1 ] && grep -q "^symlink-unresolved: packages/x/src/dangling$" "$T/o"'
+rm -f packages/x/src/dangling
 
-# Shell minor 9: a bare directory word in a brief does not put the tree in scope.
+# Shell minor 9 + Fix 6: a bare directory word in a brief does not put the tree in scope.
 printf '# brief\n\nFiles: packages, docs/notes.md.\n' > .lane/brief3.md
 mkdir -p docs && echo n > docs/notes.md
 echo z > packages/x/src/extra.ts
 run "$R" --base base --brief .lane/brief3.md --strict-brief
-check 'a bare directory word does not put the tree in scope' 'grep -q "^outside-brief: packages/x/src/extra.ts" "$T/o"'
+check 'a bare directory word does not put the tree in scope' '[ "$(rc)" = 1 ] && grep -q "^outside-brief: packages/x/src/extra.ts$" "$T/o" && ! grep -q "outside-brief.*docs/notes.md" "$T/o"'
 rm -rf docs packages/x/src/extra.ts .lane/brief3.md
+
+# Fix 7: a reviewed file over 5 MiB is not grepped and is reported as unscanned-large-file.
+dd if=/dev/zero of=packages/x/src/big.bin bs=1024 count=5121 2>/dev/null
+run "$R" --base base
+check 'a file over 5 MiB is reported as unscanned-large-file (Fix 7)' '[ "$(rc)" = 1 ] && grep -q "^unscanned-large-file: packages/x/src/big.bin$" "$T/o"'
+rm -f packages/x/src/big.bin
 
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"

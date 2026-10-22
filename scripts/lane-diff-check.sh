@@ -2,15 +2,20 @@
 # lane-diff-check — what an orchestrator runs over a lane's worktree BEFORE it commits or pushes what
 # a model produced. Three questions, answered without printing a single matched value:
 #   1. Did the lane touch a protected path? (.github, .gemini, .agents, .lane, .claude, .opencode,
-#      opencode.json*, bin, scripts, AGENTS.md, package.json, yarn.lock, .architecture, .yarnrc*).
-#      A changed workflow runs on GitHub the moment it is pushed; a changed agent or permission file
-#      changes what the next lane may do. Ignored files under protected prefixes and ignored
-#      secret-shaped files (.env, *.pem, …) are listed too, so .gitignore cannot hide them. The
-#      lane's own .lane/ scaffolding (the frozen brief and manifest) is excluded: it is always
-#      present and ignored, and its integrity is enforced at dispatch by the brief digest (plan L7a).
-#   2. Does any changed or new file contain something that looks like a credential? Reported as
-#      file:line and the pattern's name only. The content is never printed. A file containing a NUL
-#      byte is still scanned, and a symlink whose target leaves the worktree is itself a finding.
+#      opencode.json*, bin, scripts, AGENTS.md, CLAUDE.md, GEMINI.md, package.json, yarn.lock,
+#      .architecture, .yarnrc*, .pnp.*, Dockerfile, deploy). A changed workflow runs on GitHub the
+#      moment it is pushed; a changed agent or permission file changes what the next lane may do.
+#      .claude/, .opencode/ and opencode.json* are matched case-insensitively at any depth. Every
+#      ignored, untracked file (except dependency/build output and the worktree's ignored .lane/
+#      directory) is reviewed too, so .gitignore cannot hide protected files or secrets. Decision D3
+#      (plan §3): the brief's integrity is checked by digest at dispatch (lane L7a); an ignored
+#      .lane/ file is skipped because the brief lives there in every worktree, but a .lane/ path
+#      that is tracked or committed in the diff is a protected finding.
+#   2. Does any changed, untracked or reviewed ignored file contain something that looks like a
+#      credential? Reported as file:line and the pattern's name only. The content is never printed.
+#      A file containing a NUL byte is still scanned, a file over 5 MiB is reported as
+#      unscanned-large-file, and symlinks are resolved up to 40 hops without ever reading their
+#      targets (reporting symlink-escape or symlink-unresolved).
 #   3. (with --brief) Did the lane change files the brief never mentioned? A warning, unless --strict-brief.
 #      A bare directory word in the brief (e.g. "packages") does not put the whole tree in scope.
 #
@@ -33,7 +38,7 @@ while [ "$#" -gt 0 ]; do
     --strict-brief) strict=1 ;;
     --allow-protected) [ "$#" -ge 2 ] || { echo "lane-diff-check: --allow-protected needs a value" >&2; exit 2; }; allow=$2; shift ;;
     --quiet) quiet=1 ;;
-    -h | --help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,25p' "$0"; exit 0 ;;
     -*) echo "lane-diff-check: unknown option $1" >&2; exit 2 ;;
     *) [ -z "$wt" ] || { echo "lane-diff-check: one worktree at a time" >&2; exit 2; }; wt=$1 ;;
   esac
@@ -60,9 +65,15 @@ T=$(mktemp -d "${TMPDIR:-/tmp}/lane-diff-check.XXXXXX") || exit 2
 trap 'rm -rf "$T"' EXIT
 
 # The files under review: committed since base, changed in the working tree or index, untracked (not
-# ignored), and the ignored files that matter (protected prefixes and secret-shaped names). Renames are
-# split into delete + add so a protected source path is seen; names are taken NUL-delimited and unquoted
-# so unusual names are scanned as the real file. Any collection failure fails closed (exit 2).
+# ignored), and every ignored, untracked file outside the skip list below. Renames are split into
+# delete + add so a protected source path is seen; names are taken NUL-delimited and unquoted so
+# unusual names are scanned as the real file. Any collection failure fails closed (exit 2).
+#
+# Ignored, untracked paths skipped from review: dependency trees, build output, yarn cache/state, and
+# the worktree's ignored .lane/ directory. Decision D3 (plan §3): the brief's integrity is checked by
+# digest at dispatch (lane L7a); an ignored .lane/ file is skipped because the brief lives there in
+# every worktree, but a .lane/ path that is tracked or committed in the diff is a protected finding.
+IGNORED_SKIP='(^|/)(node_modules|dist|\.next|\.turbo|\.output|coverage)/|^\.yarn/(cache/|install-state\.gz$)|^\.lane(/|$)'
 g() { git -c core.quotePath=false "$@"; }
 collect() {
   if git rev-parse --verify -q HEAD >/dev/null; then
@@ -75,19 +86,14 @@ collect() {
     g diff --cached --no-renames --name-only -z || return 1
   fi
   g ls-files --others --exclude-standard -z || return 1
-  # Ignored files become reviewable too (M1): a .gitignore can hide a protected
-  # path or a secret-shaped file. Only those matter — dependency trees and build
-  # output (node_modules/, dist/, .next/, …) stay out of the review. The lane's
-  # own .lane/ scaffolding is excluded too: it is always present and ignored, and
-  # its integrity is enforced at dispatch by the brief digest (plan L7a). Any
-  # git failure fails closed; the filter pipeline itself never fails the collect.
   if ! g ls-files --others --ignored --exclude-standard -z > "$T/ignored0"; then
     return 1
   fi
+  if [ "$(tr -cd '\n' < "$T/ignored0" | wc -c | tr -d ' ')" != 0 ]; then
+    return 1
+  fi
   tr '\0' '\n' < "$T/ignored0" |
-    grep -v '^\.lane/' | grep -v '^\.lane$' |
-    grep -vE '(^|/)node_modules/' |
-    grep -E '^(\.github/|\.gemini/|\.agents/|\.agy/|bin/|scripts/|\.architecture/|deploy/|installation/|\.claude/|\.opencode/|opencode\.json)|(^|/)\.env([._-][^/]*)?$|\.pem$' |
+    grep -vE "$IGNORED_SKIP" |
     tr '\n' '\0'
 }
 collect > "$T/files0" || { echo "lane-diff-check: could not list changed files" >&2; exit 2; }
@@ -96,15 +102,19 @@ if [ "$(tr -cd '\n' < "$T/files0" | wc -c | tr -d ' ')" != 0 ]; then
   echo "lane-diff-check: a changed file name contains a newline; refusing" >&2
   exit 2
 fi
-tr '\0' '\n' < "$T/files0" | grep -v '^$' | grep -v '^\.lane/' | grep -v '^\.lane$' | sort -u > "$T/files"
+tr '\0' '\n' < "$T/files0" | grep -v '^$' | sort -u > "$T/files"
 
 say() { [ "$quiet" = 1 ] || echo "$@"; }
 findings=0
 warnings=0
 
 PROTECTED='^(\.github/|\.gemini/|\.agents/|\.agy/|\.lane/|bin/|scripts/|AGENTS\.md$|CLAUDE\.md$|GEMINI\.md$|package\.json$|[^/]+/[^/]+/package\.json$|yarn\.lock$|\.yarnrc|\.architecture/|\.pnp\.|Dockerfile$|deploy/|\.claude/|\.opencode/|opencode\.json)'
+PROTECTED_AGENT_CONFIG='(^|/)\.claude/|(^|/)\.opencode/|(^|/)opencode\.json'
 while IFS= read -r f; do
-  printf '%s\n' "$f" | grep -Eq "$PROTECTED" || continue
+  if ! printf '%s\n' "$f" | grep -Eq "$PROTECTED" &&
+     ! printf '%s\n' "$f" | grep -Eiq "$PROTECTED_AGENT_CONFIG"; then
+    continue
+  fi
   if [ -n "$allow" ] && printf '%s\n' "$f" | grep -Eq "$allow"; then
     say "allowed-protected: $f"
     continue
@@ -134,58 +144,69 @@ token-assignment|[Tt]oken[[:space:]]*[:=][[:space:]]*["'][A-Za-z0-9_./+=-]{16,}[
 basic-auth-url|https?://[^/:@[:space:]]+:[^/@[:space:]]{6,}@
 PAT
 
-# Canonicalize $1 (absolute or resolved) into a normalized absolute path so a
-# symlink target can be containment-checked without following the link.
-canonicalize() {
+# Resolve symbolic link $1 up to 40 hops against the physical worktree root $2.
+# Returns 0 = symlink-escape (leaves worktree), 1 = inside worktree, 2 = symlink-unresolved.
+symlink_leaves_worktree() {
+  root=$(CDPATH= cd -P "$2" 2>/dev/null && pwd -P) || return 2
   case "$1" in
-    /*) p=$1 ;;
-    *) p=$PWD/$1 ;;
+    /*) cur=$1 ;;
+    *) cur=./$1 ;;
   esac
-  while :; do case "$p" in */) p=${p%/} ;; *) break ;; esac; done
-  oifs=$IFS; IFS=/; set -f; set -- $p; set +f; IFS=$oifs
-  out=''
-  for seg in "$@"; do
-    case "$seg" in
-      '' | .) ;;
-      ..)
-        if [ "$out" = / ] || [ -z "$out" ]; then out=/; else out=${out%/*}; [ -n "$out" ] || out=/; fi
+  hops=0
+  while [ -L "$cur" ]; do
+    hops=$((hops + 1))
+    [ "$hops" -le 40 ] || return 2
+    link=$(readlink "$cur" 2>/dev/null) || return 2
+    [ -n "$link" ] || return 2
+    case "$link" in
+      /*) cur=$link ;;
+      *)
+        d=$(CDPATH= cd -P "$(dirname "$cur")" 2>/dev/null && pwd -P) || return 2
+        cur=${d%/}/$link
         ;;
-      *) out=$out/$seg ;;
+    esac
+    while [ "$cur" != / ] && [ "${cur%/}" != "$cur" ]; do
+      cur=${cur%/}
+    done
+    case "$cur" in
+      / | */. | */..)
+        cur=$(CDPATH= cd -P "$cur" 2>/dev/null && pwd -P) || return 2
+        ;;
+      *)
+        d=$(CDPATH= cd -P "$(dirname "$cur")" 2>/dev/null && pwd -P) || return 2
+        cur=${d%/}/$(basename "$cur")
+        ;;
     esac
   done
-  [ -n "$out" ] || out=/
-  printf '%s\n' "$out"
-}
-
-# True when the symbolic link $1 resolves to a target outside the worktree root
-# $2. Inside links are scanned via their target as before; escaping links are a
-# finding (shell minor 11). Returns 0 = leaves, 1 = inside, 2 = unresolvable.
-symlink_leaves_worktree() {
-  link=$(readlink "$1") || return 2
-  case "$link" in
-    /*) tgt=$link ;;
-    *)
-      d=$(CDPATH= cd -P "$(dirname "$1")" 2>/dev/null && pwd) || return 2
-      tgt=$d/$link
+  case "$cur" in
+    "$root" | "$root"/*)
+      [ -e "$cur" ] || return 2
+      return 1
       ;;
-  esac
-  target=$(canonicalize "$tgt") || return 2
-  root=$(canonicalize "$2") || return 2
-  case "$target" in
-    "$root" | "$root"/*) return 1 ;;
     *) return 0 ;;
   esac
 }
 
 while IFS= read -r f; do
   if [ -L "$f" ]; then
-    if symlink_leaves_worktree "$f" "$top"; then
-      say "symlink-outside-worktree: $f"
+    symlink_leaves_worktree "$f" "$top"
+    rc=$?
+    if [ "$rc" = 0 ]; then
+      say "symlink-escape: $f"
       findings=$((findings + 1))
-      continue
+    elif [ "$rc" = 2 ]; then
+      say "symlink-unresolved: $f"
+      findings=$((findings + 1))
     fi
+    continue
   fi
   [ -f "$f" ] || continue
+  sz=$(wc -c < "$f" 2>/dev/null | tr -d '[:space:]')
+  if [ -z "$sz" ] || [ "$sz" -gt 5242880 ]; then
+    say "unscanned-large-file: $f"
+    findings=$((findings + 1))
+    continue
+  fi
   while IFS='|' read -r name re; do
     [ -n "$name" ] || continue
     # -a keeps a NUL-containing file scannable instead of skipping it as binary

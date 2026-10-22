@@ -13,16 +13,19 @@ cd "$root"
 # --- is the bootstrap suite's pin check: sha256 of the script compared with the
 # --- first field of its hash file, and the hash file names the script.
 check_pin() { # $1: script path, $2: hash file path
-  [ -f "$root/$2" ] || { echo "test-bin: missing pin file $2" >&2; return 1; }
-  sum=$( (command -v sha256sum >/dev/null 2>&1 && sha256sum "$root/$1" || shasum -a 256 "$root/$1") | cut -c1-64 )
-  read -r want pinjunk < "$root/$2" || true
+  script=$1
+  pinfile=$2
+  [ -f "$root/$pinfile" ] || { echo "test-bin: missing pin file $pinfile" >&2; return 1; }
+  sum=$( (command -v sha256sum >/dev/null 2>&1 && sha256sum "$root/$script" || shasum -a 256 "$root/$script") | cut -c1-64 )
+  read -r want pinjunk < "$root/$pinfile" || true
   if [ -z "$want" ] || [ "$sum" != "$want" ]; then
-    echo "test-bin: pin FAIL for $1 (got ${sum:-<none>}, want ${want:-<empty>})" >&2
+    echo "test-bin: pin FAIL for $script (got ${sum:-<none>}, want ${want:-<empty>})" >&2
     return 1
   fi
-  # The pin line's path field must be exactly $1, not merely contain it (Grok review of L2).
-  awk -v f="$1" '$2 == f { found = 1 } END { exit !found }' "$root/$2" || { echo "test-bin: pin file $2 does not name $1" >&2; return 1; }
-  echo "test-bin: pin ok $1"
+  # The pin line's path field must be exactly the script, not merely contain it (Grok review of L2).
+  awk -v f="$script" '$2 == f { found = 1 } END { exit !found }' "$root/$pinfile" || { echo "test-bin: pin file $pinfile does not name $script" >&2; return 1; }
+  echo "test-bin: pin ok $script"
+  return 0
 }
 check_pin bin/ocm-run scripts/ocm-run-hash.txt
 check_pin bin/agy-run scripts/agy-run-hash.txt

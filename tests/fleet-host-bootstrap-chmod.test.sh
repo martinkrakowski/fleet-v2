@@ -16,10 +16,10 @@ unset XDG_CONFIG_HOME FLEET_WORKTREE_ROOT FLEET_TMPDIR FLEET_OPENCODE_CONFIG_DIR
 REAL_PATH=$PATH
 T=$(mktemp -d "${TMPDIR:-/tmp}/fleet-host-bootstrap-chmod-test.XXXXXX") || exit 1
 fails=0
-ok() { printf 'ok   %s\n' "$1"; }
-bad() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
-check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
-finish() { rm -rf "$T"; }
+ok() { name=$1; printf 'ok   %s\n' "$name"; return 0; }
+bad() { name=$1; printf 'FAIL %s\n' "$name"; fails=$((fails + 1)); return 0; }
+check() { name=$1; expr=$2; if eval "$expr"; then ok "$name"; else bad "$name"; fi; return 0; }
+finish() { rm -rf "$T"; return 0; }
 trap finish EXIT
 
 mkdir -p "$T/home" "$T/bin"

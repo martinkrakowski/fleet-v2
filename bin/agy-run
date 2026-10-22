@@ -34,9 +34,14 @@
 #      the lane then outlives this process on purpose, and --wait / --abort are how it is followed.
 #   3. "Has the lane ended" is --status or --wait, never the end of a local process.
 #
-# Files under <dir>/.lane (which must be gitignored): agy-run.lock (pid, start, model, mode),
-# agy-run.out (agy's JSON result), agy-run.err (agy's stderr), agy-run.before (HEAD at dispatch),
-# agy-run.last (one line per ended run: exit, seconds, tokens, denied actions).
+# The lock lives OUTSIDE the worktree, in the per-user state directory
+# ${XDG_STATE_HOME:-$HOME/.local/state}/agy-run/locks/<sha256 of the physical worktree path>.lock,
+# recording pid, start time, model, mode and the process command name. The lane can write anything
+# under its worktree, so a lock inside it could be planted and steer the operator's --status and
+# --abort; the state dir is where the lane cannot reach. The directory is created with umask 077
+# and refused when it is a symlink or not owned by the current user. Under <dir>/.lane (which must
+# be gitignored): agy-run.out (agy's JSON result), agy-run.err (agy's stderr), agy-run.before
+# (HEAD at dispatch), agy-run.last (one line per ended run: exit, seconds, tokens, denied actions).
 # Env: AGY_BIN (default: agy), AGY_ALLOW_BUSY=1, AGY_SANDBOX=1 (same as --sandbox),
 #      AGY_DENIED_IS_FAILURE=1 (a run that ends with denied actions exits 5),
 #      AGY_WAIT_INTERVAL (seconds between looks, default 15), AGY_WAIT_MAX (default 1500),
@@ -150,11 +155,33 @@ lane=''
 lock=''
 set_paths() {
   lane=$dir/.lane
-  lock=$lane/agy-run.lock
+  state=${XDG_STATE_HOME:-$HOME/.local/state}
+  lkdir=$state/agy-run/locks
+  lkhash=$(printf '%s' "$dir" | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | awk '{print $1}')
+  lock=$lkdir/$lkhash.lock
+}
+
+# The lock directory is per-user state, not part of the worktree the lane can write. It is
+# created privately (umask 077) and refused when it is a symlink or not owned by this user.
+ensure_lock_dir() {
+  if [ -L "$lkdir" ]; then
+    echo "agy-run: $lkdir is a symlink; refusing to use it for lane locks" >&2
+    exit 2
+  fi
+  if [ -e "$lkdir" ]; then
+    [ -d "$lkdir" ] || { echo "agy-run: $lkdir is not a directory" >&2; exit 2; }
+    [ -O "$lkdir" ] || { echo "agy-run: $lkdir is not owned by the current user; refusing" >&2; exit 2; }
+  else
+    ( umask 077; mkdir -p "$lkdir" ) || { echo "agy-run: cannot create $lkdir" >&2; exit 2; }
+  fi
 }
 
 pid_start() {
   LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null
+}
+
+pid_comm() {
+  LC_ALL=C ps -o comm= -p "$1" 2>/dev/null
 }
 
 readable_start() {
@@ -166,15 +193,16 @@ readable_start() {
 }
 
 # Prints the pid of the lane running in $dir, nothing when none. Returns 0 when the outcome
-# is known (running, gone or reused) and 1 when kill -0 succeeds but the start time is empty,
-# unreadable or unknown (the lock is kept and the pid is printed so callers never delete a
-# live lane's lock or signal an unverified pid).
-# Residual risk: ps lstart has one-second resolution, so a pid reused within the same second
-# compares equal. That is accepted, and abort's re-check before every signal narrows it.
+# is known (running, gone or reused) and 1 when the start time or command name is empty or
+# unreadable (the lock is kept and the pid is printed so callers never delete a live lane's
+# lock or signal an unverified pid). Residual risk: ps lstart has one-second resolution, so a
+# pid reused within the same second by the same command name compares equal; the recorded
+# command name catches reuse by another program.
 lane_running() {
   [ -f "$lock" ] || return 0
   lr_pid=$(head -n 1 "$lock" 2>/dev/null)
   lr_start=$(sed -n 2p "$lock" 2>/dev/null)
+  lr_cmd=$(sed -n 5p "$lock" 2>/dev/null)
   case "$lr_pid" in '' | *[!0-9]*) rm -f "$lock"; return 0 ;; esac
   if ! kill -0 "$lr_pid" 2>/dev/null; then
     echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
@@ -192,6 +220,17 @@ lane_running() {
     fi
     echo "$lr_pid"
     return 1
+  fi
+  lr_nowcmd=$(pid_comm "$lr_pid")
+  if [ -z "$lr_nowcmd" ]; then
+    echo "$lr_pid"
+    return 1
+  fi
+  if [ "$lr_cmd" != "$lr_nowcmd" ]; then
+    # The recorded command name differs: the pid now belongs to a different program.
+    echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
+    rm -f "$lock"
+    return 0
   fi
   if [ "$lr_now" = "$lr_start" ]; then
     echo "$lr_pid"
@@ -215,7 +254,7 @@ fi
 
 qualify_dir
 set_paths
-mkdir -p "$lane"
+ensure_lock_dir
 
 if [ "$mode" != run ]; then
   case "$mode" in
@@ -328,8 +367,10 @@ if [ -n "$busy" ] && [ "${AGY_ALLOW_BUSY:-0}" != 1 ]; then
   exit 75
 fi
 
-# The lock is taken with noclobber so two dispatches in the same second cannot both win.
-if ! ( set -C; printf '%s\n' "$$" "$(pid_start "$$")" "$model" "$agymode" > "$lock" ) 2>/dev/null; then
+# The lock is taken with noclobber so two dispatches in the same second cannot both win. The
+# lock directory is private (umask 077); the record carries pid, start time, model, mode and
+# the command name so status and abort verify the whole identity before reporting or signalling.
+if ! ( umask 077; set -C; printf '%s\n' "$$" "$(pid_start "$$")" "$model" "$agymode" "$(pid_comm "$$")" > "$lock" ) 2>/dev/null; then
   echo "agy-run: another dispatch took the lock in $dir at the same moment; not dispatching" >&2
   exit 75
 fi
@@ -410,7 +451,7 @@ while ! readable_start "$cstart" && [ "$tries" -lt 5 ] && kill -0 "$child" 2>/de
   tries=$((tries + 1))
 done
 readable_start "$cstart" || cstart=unknown
-printf '%s\n' "$child" "$cstart" "$model" "$agymode" > "$lock"
+printf '%s\n' "$child" "$cstart" "$model" "$agymode" "$(pid_comm "$child")" > "$lock"
 wait "$child"
 rc=$?
 child=''

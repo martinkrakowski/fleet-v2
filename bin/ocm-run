@@ -626,13 +626,22 @@ ocm_launch() {
             return
             ;;
         esac
-        ocm_sresp=$(ocm_curl -sf -m 8 -H 'Content-Type: application/json' -d "{\"location\":{\"directory\":\"$dir\"}}" "$url/api/session") || ocm_sresp=''
+        ocm_sresp=$(ocm_curl -sf -m 8 -H 'Content-Type: application/json' -d "{\"location\":{\"directory\":\"$dir\"}}" "$url/api/session") || {
+          echo "ocm-run: could not create a session on the server for $dir (POST $url/api/session)" >&2
+          rc=1
+          return
+        }
         ocm_sid=$(printf '%s' "$ocm_sresp" | grep -o '"id":"ses_[^"]*"' | head -n 1 | sed 's/"id":"//;s/"//')
+        [ -n "$ocm_sid" ] || {
+          echo "ocm-run: the server answered the session create but gave no session id" >&2
+          rc=1
+          return
+        }
       fi
       if [ -n "$ocm_sid" ]; then
-        OCM_DIR="$dir" opencode run --server "$url" -s "$ocm_sid" "$@" < /dev/null 2> "$errf" &
+        opencode run --server "$url" -s "$ocm_sid" "$@" < /dev/null 2> "$errf" &
       else
-        OCM_DIR="$dir" opencode run --server "$url" "$@" < /dev/null 2> "$errf" &
+        opencode run --server "$url" "$@" < /dev/null 2> "$errf" &
       fi
     fi
   else

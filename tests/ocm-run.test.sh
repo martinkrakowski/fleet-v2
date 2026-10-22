@@ -37,7 +37,7 @@ done
 P=$((R + 1))
 
 cat > "$T/server.py" <<'PY'
-import base64, http.server, os, sys, urllib.parse
+import base64, http.server, json, os, sys, urllib.parse
 T, port = sys.argv[1], int(sys.argv[2])
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -103,6 +103,21 @@ class H(http.server.BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path); parts = u.path.strip("/").split("/")
         open(os.path.join(T, "http.log"), "a").write("POST " + u.path + "\n")
         if not self.auth_ok(): return self.send(401, '{"error":"unauthorized"}')
+        if len(parts) == 2 and parts[0] == "api" and parts[1] == "session":
+            if os.path.exists(os.path.join(T, "v2-session-fail")):
+                return self.send(500, '{"error":"session create failed"}')
+            length = int(self.headers.get("Content-Length", 0))
+            data = self.rfile.read(length).decode()
+            try:
+                loc = json.loads(data)["location"]["directory"]
+            except Exception:
+                return self.send(400, '{"error":"bad session body"}')
+            n = 1
+            while os.path.exists(os.path.join(T, "sessions", "ses_http%d" % n)):
+                n += 1
+            sid = "ses_http%d" % n
+            open(os.path.join(T, "sessions", sid), "w").write("busy\n" + loc + "\n")
+            return self.send(200, '{"data":{"id":"%s","location":{"directory":"%s"}}}' % (sid, loc))
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "session" and parts[3] == "interrupt":
             open(os.path.join(T, "interrupts"), "a").write(parts[2] + "\n")
             try: os.remove(os.path.join(T, "sessions", parts[2]))
@@ -130,10 +145,23 @@ printf '%s\n' "$*" >> "$T/args.log"
 if [ -e "$T/locked-once" ]; then rm -f "$T/locked-once"; echo "Error: database is locked" >&2; exit 1; fi
 # FAKE_START_TICKS: the client's start-up, during which the server knows no session yet
 i=0; while [ "$i" -lt "${FAKE_START_TICKS:-0}" ]; do sleep 0.1; i=$((i + 1)); done
-d=''; prev=''
-for a in "$@"; do case "$a" in --dir=*) d=${a#--dir=} ;; esac; [ "$prev" = --dir ] && d=$a; prev=$a; done
-[ -n "$d" ] || d="${OCM_DIR:-$(pwd)}"
+d=''; sid=''; prev=''
+for a in "$@"; do
+  case "$a" in
+    --dir=*) d=${a#--dir=} ;;
+    -s) ;;
+  esac
+  [ "$prev" = --dir ] && d=$a
+  [ "$prev" = -s ] && sid=$a
+  prev=$a
+done
 id="ses_fake$n"
+if [ -n "$sid" ]; then
+  id=$sid
+  d=$(sed -n '2p' "$T/sessions/$id" 2>/dev/null)
+fi
+[ -n "$d" ] || d="$(pwd)"
+echo "$d" > "$T/client-dir"
 printf 'busy\n%s\n' "$d" > "$T/sessions/$id"
 if [ -n "${FAKE_DEAF:-}" ]; then trap '' TERM; else trap 'exit 143' TERM; fi
 printf '{"type":"step_start","sessionID":"%s"}\n\tline with a tab and  two spaces\n' "$id" | tee "$T/expected"
@@ -261,7 +289,7 @@ runbg() {
   ) &
 }
 busy() { printf '%s\n%s\n' "${3:-busy}" "$2" > "$T/sessions/$1"; }
-clear_all() { rm -rf "$T/proc"; rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-*; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; }
+clear_all() { rm -rf "$T/proc"; rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/v2-session-fail" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-* "$T/client-dir" "$T/racepid"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; : > "$T/curl.args.log"; : > "$T/curl.stdin"; }
 
 # --- 0. the guards
 check "guard: the server on the test port is the fake" '[ "$(curl -s -m 3 http://127.0.0.1:$P/__who)" = fake-opencode-server ]'
@@ -603,7 +631,7 @@ check "v2 --abort: calls POST /api/session/<id>/interrupt and never /session/<id
 
 clear_all
 run -- --dir "$D" --agent lane-glm --variant low -m provider/model --format json "hello v2" > /dev/null 2>&1; rc=$?
-check "v2 run: rewrites --server, drops --dir, and folds --variant low into -m provider/model#low" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P --agent lane-glm -m provider/model#low --format json hello v2$" "$T/args.log"'
+check "v2 run: rewrites --server, drops --dir, and folds --variant low into -m provider/model#low, carrying -s <id>" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P -s ses_http1 --agent lane-glm -m provider/model#low --format json hello v2$" "$T/args.log"'
 out=$(run -- --dir "$D" --agent lane-glm --variant low -m provider/model#high "hello" 2>&1); rc=$?
 check "v2 run: combining --variant and an already hashed -m is refused (2)" '[ "$rc" = 2 ] && [ "$(wc -l < "$T/args.log" | tr -d " ")" = 1 ]'
 out=$(run -- --dir "$D" --server http://x "hello" 2>&1); rc=$?
@@ -612,13 +640,24 @@ check "v2 run: passing --server directly is refused (2)" '[ "$rc" = 2 ]'
 # NVIDIA rewrite tests
 clear_all
 run -- --dir "$D" --agent lane-glm --variant low -m nvidia/z-ai/glm-5.3 --format json "hello nvidia" > /dev/null 2>&1; rc=$?
-check "v2 run: rewrites nvidia/* with --variant low to variant none (#none)" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P --agent lane-glm -m nvidia/z-ai/glm-5.3#none --format json hello nvidia$" "$T/args.log"'
+check "v2 run: rewrites nvidia/* with --variant low to variant none (#none), carrying -s <id>" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P -s ses_http1 --agent lane-glm -m nvidia/z-ai/glm-5.3#none --format json hello nvidia$" "$T/args.log"'
 clear_all
 run -- --dir "$D" --variant=low --model=nvidia/z-ai/glm-5.3 --format json "hello nvidia flag" > /dev/null 2>&1; rc=$?
-check "v2 run: rewrites nvidia/* with --variant=low and --model=... to #none" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P -m nvidia/z-ai/glm-5.3#none --format json hello nvidia flag$" "$T/args.log"'
+check "v2 run: rewrites nvidia/* with --variant=low and --model=... to #none, carrying -s <id>" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P -s ses_http1 -m nvidia/z-ai/glm-5.3#none --format json hello nvidia flag$" "$T/args.log"'
 clear_all
 run -- --dir "$D" --agent lane-glm --variant high -m nvidia/z-ai/glm-5.3 --format json "hello nvidia high" > /dev/null 2>&1; rc=$?
-check "v2 run: leaves nvidia/* with --variant high as #high" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P --agent lane-glm -m nvidia/z-ai/glm-5.3#high --format json hello nvidia high$" "$T/args.log"'
+check "v2 run: leaves nvidia/* with --variant high as #high, carrying -s <id>" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P -s ses_http1 --agent lane-glm -m nvidia/z-ai/glm-5.3#high --format json hello nvidia high$" "$T/args.log"'
+
+# --- 7c. M3: a failed POST /api/session is exit 1; a v2 non-local dispatch
+# --- carries -s <id>, and the client takes its directory from the session, not OCM_DIR.
+clear_all; : > "$T/v2"; : > "$T/v2-session-fail"
+out=$(run -- --dir "$D" --agent lane "p" 2>&1); rc=$?
+check "M3: a failed POST /api/session exits 1" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not create a session"'
+check "M3: ... and opencode is never started" '[ ! -s "$T/args.log" ]'
+clear_all; : > "$T/v2"
+run OCM_DIR=/bogus -- --dir "$D" --agent lane "p" > /dev/null 2>&1; rc=$?
+check "M3: a v2 non-local dispatch creates a session on the server and carries -s <id>" '[ "$rc" = 0 ] && grep -q -- "-s ses_http1" "$T/args.log"'
+check "M3: the client takes its directory from the session, not OCM_DIR" '[ "$(cat "$T/client-dir")" = "$D" ]'
 
 printf '%s failed\n' "$fails"
 [ "$fails" = 0 ]

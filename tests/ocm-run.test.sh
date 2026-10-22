@@ -659,5 +659,29 @@ run OCM_DIR=/bogus -- --dir "$D" --agent lane "p" > /dev/null 2>&1; rc=$?
 check "M3: a v2 non-local dispatch creates a session on the server and carries -s <id>" '[ "$rc" = 0 ] && grep -q -- "-s ses_http1" "$T/args.log"'
 check "M3: the client takes its directory from the session, not OCM_DIR" '[ "$(cat "$T/client-dir")" = "$D" ]'
 
+# --- M6: the password reaches curl through --config - on stdin, never argv.
+REAL_CURL=$(command -v curl)
+cat > "$T/bin/curl" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "\$T/curl.args.log"
+case " \$* " in
+  *" --config - "*)
+    tee "\$T/curl.stdin" | "$REAL_CURL" "\$@"
+    ;;
+  *)
+    "$REAL_CURL" "\$@" < /dev/null
+    ;;
+esac
+EOF
+chmod +x "$T/bin/curl"
+clear_all; printf 'opencode:secret123\n' > "$T/auth-required"; : > "$T/curl.args.log"; : > "$T/curl.stdin"
+out=$(run OPENCODE_SERVER_USERNAME=opencode OPENCODE_SERVER_PASSWORD=secret123 -- --check 2>&1); rc=$?
+check "M6: auth still works through --config - (check exits 0)" '[ "$rc" = 0 ] && echo "$out" | grep -q "ocm-run: ok"'
+check "M6: curl is called with --config -" 'grep -q -- "--config -" "$T/curl.args.log"'
+check "M6: the password never appears in any curl argv" '! grep -q "secret123" "$T/curl.args.log"'
+check "M6: the config on curl's stdin carries user = \"opencode:secret123\"" 'grep -q "user = \"opencode:secret123\"" "$T/curl.stdin"'
+rm -f "$T/bin/curl"
+clear_all
+
 printf '%s failed\n' "$fails"
 [ "$fails" = 0 ]

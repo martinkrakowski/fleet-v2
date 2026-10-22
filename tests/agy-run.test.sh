@@ -43,11 +43,12 @@ chmod +x "$T/bin/agy"
 PATH="$T/bin:$PATH"
 export PATH
 
-# The fake ps: logs its arguments, then answers the queries the script makes — `ps -o
-# lstart= -p <pid>` (start time), `ps -p <pid> -o pid=` (existence) and `ps -o comm= -p
-# <pid>` (command name) — according to $T/ps-mode (default: fixed start time and "sleep" as
-# the command for a living pid; empty: no start time; locale: German-style date unless LC_ALL=C
-# and TZ=UTC).
+# The fake ps: logs its arguments, then answers the three queries the script makes —
+# `ps -o lstart= -p <pid>` (start time), `ps -p <pid> -o pid=` (existence) and
+# `ps -o comm= -p <pid>` (command name) — according to $T/ps-mode (default: fixed start
+# time and "sleep" as the command for a living pid; empty: no start time; locale: German-style
+# date unless LC_ALL=C and TZ=UTC; eperm: report the pid as existing even when kill cannot
+# signal it, to fake a permission error).
 cat > "$T/bin/ps" <<FAKEPS
 #!/bin/sh
 printf '%s\n' "\$@" >> "$T/ps.log"
@@ -70,8 +71,10 @@ done
 case "\$pid" in '' | *[!0-9]*) exit 1 ;; esac
 case "\$opt" in
   pid)
-    if kill -0 "\$pid" 2>/dev/null; then echo "\$pid"; exit 0; fi
-    exit 1
+    case "\$(cat "$T/ps-mode" 2>/dev/null)" in
+      eperm) echo "\$pid"; exit 0 ;;
+      *) if kill -0 "\$pid" 2>/dev/null; then echo "\$pid"; exit 0; fi; exit 1 ;;
+    esac
     ;;
   comm)
     cat "$T/ps-comm" 2>/dev/null || echo sleep
@@ -97,6 +100,16 @@ case "\$opt" in
 esac
 FAKEPS
 chmod +x "$T/bin/ps"
+
+# The fake rm records every call (the abort tests count how many times the lock is removed),
+# then delegates to the real rm.
+realrm=$(command -v rm)
+cat > "$T/bin/rm" <<FAKERM
+#!/bin/sh
+printf '%s\n' "\$@" >> "$T/rm.log"
+exec $realrm "\$@"
+FAKERM
+chmod +x "$T/bin/rm"
 
 # A worktree that qualifies: a git repo whose .lane/ is ignored, with a brief inside.
 mkrepo() { # $1: dir, $2: gitignore content
@@ -155,6 +168,7 @@ run --dir "$WT" --model m --effort ultra; check 'an unknown --effort is refused 
 run --dir "$WT" --model m --timeout 5x; check 'a malformed --timeout is refused (2)' '[ "$(rc)" = 2 ]'
 run --dir "$WT" --model m --brief ../x.md; check 'a --brief outside the dir is refused (2)' '[ "$(rc)" = 2 ]'
 run --dir "$WT" --model m --brief /etc/x.md; check 'an absolute --brief is refused (2)' '[ "$(rc)" = 2 ]'
+run --dir "$WT" --model m --brief 'a b'; check 'a --brief value containing whitespace is refused (2)' '[ "$(rc)" = 2 ] && grep -q "whitespace" "$T/e"'
 run --dir "$WT" --model --dangerously-skip-permissions; check 'a --model value that is itself a flag is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
 run --dir "$WT" --model=-x; check 'a --model= value starting with - is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
 run --dir "$WT" --model -x; check 'a --model value starting with - is refused (2)' '[ "$(rc)" = 2 ] && grep -q "must not start with" "$T/e"'
@@ -365,6 +379,15 @@ check 'abort refuses (1) when start time is unreadable and leaves the process al
 kill "$UNRPID" 2>/dev/null
 rm -f "$LK" "$T/ps-mode"
 
+echo '# a pid that exists but cannot be signalled is unknown, never gone'
+echo eperm > "$T/ps-mode"
+mk_lock 999999 'Thu Jan  1 00:00:00 2026'
+run --status --dir "$WT"
+check 'a pid ps reports but kill cannot signal is unknown (3) and keeps the lock' '[ "$(rc)" = 3 ] && grep -q "cannot be verified" "$T/o" && [ -f "$LK" ]'
+run --abort --dir "$WT"
+check 'abort refuses (1) an unverifiable pid and keeps the lock' '[ "$(rc)" = 1 ] && [ -f "$LK" ] && grep -q "cannot be verified" "$T/e"'
+rm -f "$LK" "$T/ps-mode"
+
 echo empty > "$T/ps-mode"
 echo sleep > "$T/fake-mode"
 "$RUNSH" "$SCRIPT" --detach --dir "$WT" --model m > "$T/bg.o" 2> "$T/bg.e" &
@@ -393,6 +416,22 @@ erun LC_ALL=de_DE.UTF-8 TZ=Europe/Berlin "$RUNSH" "$SCRIPT" --abort --dir "$WT"
 check 'abort through a locale-dependent ps matches and stops the lane (0)' '[ "$(rc)" = 0 ]'
 wait "$BG" 2>/dev/null
 rm -f "$T/ps-mode"
+
+echo '# abort cleans the lock exactly once (no redundant rm after lane_running)'
+sleep 300 &
+ABPID=$!
+echo "$ABPID" >> "$T/pids"
+: > "$T/rm.log"
+mk_lock "$ABPID" 'Thu Jan  1 00:00:00 2026'
+run --abort --dir "$WT"
+check 'abort stops a matching pid (0)' '[ "$(rc)" = 0 ] && grep -q "the lane in .* stopped" "$T/o"'
+check 'abort issued exactly one rm of the lock, not a redundant second' '[ "$(grep -c -- "$LK" "$T/rm.log")" = 1 ]'
+IGN2PID=$(sh -c '( trap "" TERM; exec sleep 60 ) >/dev/null 2>&1 & echo $!')
+echo "$IGN2PID" >> "$T/pids"
+: > "$T/rm.log"
+mk_lock "$IGN2PID" 'Thu Jan  1 00:00:00 2026'
+erun AGY_RUN_ABORT_WAIT=1 "$RUNSH" "$SCRIPT" --abort --dir "$WT"
+check 'abort escalates and cleans the lock exactly once' '[ "$(rc)" = 0 ] && grep -q "did not stop in 1 s; killed" "$T/e" && [ "$(grep -c -- "$LK" "$T/rm.log")" = 1 ]'
 
 echo '# agy-run never writes through a symlink in .lane'
 mkdir -p "$T/target"

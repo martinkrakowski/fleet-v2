@@ -13,7 +13,8 @@
 #
 # THE PROMPT IS FIXED. agy is told to read the brief file inside the worktree and carry out its WORK
 # ORDER. No free text reaches the model from the command line, so the dispatch command is the same for
-# every lane and one permission rule covers it. A fix round is a new brief, never a new prompt.
+# every lane and one permission rule covers it. A fix round is a new brief, never a new prompt. Like
+# --model, --brief is a single word (whitespace is refused), so only a path can enter the prompt.
 #
 # PERMISSIONS. In every mode but `full`, agy's own permission rules (its settings.json on the host that
 # runs the lane) decide what a lane may touch; widening them is an owner decision on that host, not a
@@ -139,11 +140,13 @@ case "$timeout" in
 esac
 case "$brief" in
   /* | *../* | ../* | *'/..' | ..) die_usage "--brief must be a relative path inside --dir" ;;
+  *[[:space:]]*) die_usage "--brief must not contain whitespace" ;;
 esac
 
 command -v "$AGY_BIN" >/dev/null 2>&1 || { echo "agy-run: $AGY_BIN is not on PATH" >&2; exit 1; }
 
-# A dir qualifies when it is the root of a git worktree and .lane is gitignored there.
+# A dir qualifies when it is the root of a git worktree (a run additionally requires .lane to be
+# gitignored, checked after the symlink safety pass).
 qualify_dir() {
   [ -n "$dir" ] || { echo "agy-run: --$mode needs --dir <worktree>" >&2; exit 2; }
   [ -d "$dir" ] || { echo "agy-run: $dir is not a directory" >&2; exit 1; }
@@ -214,26 +217,37 @@ readable_start() {
 }
 
 # Prints the pid of the lane running in $dir, nothing when none. Returns 0 when the outcome
-# is known (running, gone or reused) and 1 when the start time or command name is empty or
-# unreadable (the lock is kept and the pid is printed so callers never delete a live lane's
-# lock or signal an unverified pid). Residual risk: ps lstart has one-second resolution, so a
-# pid reused within the same second by the same command name compares equal; the recorded
-# command name catches reuse by another program.
+# is known (running, gone or reused), 1 when the start time is unreadable, and 2 when the pid
+# exists but cannot be verified (command name unreadable, or the pid cannot be signalled — a
+# permission error is not "gone"); the lock is kept and the pid is printed so callers never
+# delete a live lane's lock or signal an unverified pid. Existence is read from ps, not kill:
+# a pid that exists but cannot be signalled (EPERM) is unknown, never gone. Residual risk: ps
+# lstart has one-second resolution, so a pid reused within the same second by the same
+# command name compares equal; the recorded command name catches reuse by another program.
 lane_running() {
   [ -f "$lock" ] || return 0
   lr_pid=$(head -n 1 "$lock" 2>/dev/null)
   lr_start=$(sed -n 2p "$lock" 2>/dev/null)
   lr_cmd=$(sed -n 5p "$lock" 2>/dev/null)
   case "$lr_pid" in '' | *[!0-9]*) rm -f "$lock"; return 0 ;; esac
-  if ! kill -0 "$lr_pid" 2>/dev/null; then
-    echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
-    rm -f "$lock"
-    return 0
+  lr_exists=$(LC_ALL=C ps -p "$lr_pid" -o pid= 2>/dev/null)
+  if [ -z "$lr_exists" ]; then
+    # ps does not show the pid; confirm with kill. A pid invisible to ps is gone unless kill
+    # still sees it (then it exists and we proceed to compare identity below).
+    if ! kill -0 "$lr_pid" 2>/dev/null; then
+      echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
+      rm -f "$lock"
+      return 0
+    fi
+  elif ! kill -0 "$lr_pid" 2>/dev/null; then
+    # The pid exists (ps shows it) but cannot be signalled: a permission error keeps the lock.
+    echo "$lr_pid"
+    return 2
   fi
   lr_now=$(pid_start "$lr_pid")
   if ! readable_start "$lr_start" || ! readable_start "$lr_now"; then
-    # The lane may have exited and been reaped between kill -0 and ps (CodeRabbit on #148): an
-    # empty ps for a pid that is now gone is "gone", not "unreadable".
+    # The lane may have exited and been reaped between ps and start-time reads (CodeRabbit on
+    # #148): an empty ps for a pid that is now gone is "gone", not "unreadable".
     if ! kill -0 "$lr_pid" 2>/dev/null; then
       echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
       rm -f "$lock"
@@ -245,7 +259,7 @@ lane_running() {
   lr_nowcmd=$(pid_comm "$lr_pid")
   if [ -z "$lr_nowcmd" ]; then
     echo "$lr_pid"
-    return 1
+    return 2
   fi
   if [ "$lr_cmd" != "$lr_nowcmd" ]; then
     # The recorded command name differs: the pid now belongs to a different program.
@@ -260,6 +274,15 @@ lane_running() {
   echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
   rm -f "$lock"
   return 0
+}
+
+refuse_abort() { # $1: pid that could not be verified; $? is lane_running's code (1 or 2)
+  if [ "$?" = 1 ]; then
+    echo "agy-run: refusing to abort in $dir: start time of pid $1 is unreadable; check pid $1 by hand" >&2
+  else
+    echo "agy-run: refusing to abort in $dir: pid $1 exists but cannot be verified; check pid $1 by hand" >&2
+  fi
+  exit 1
 }
 
 if [ "$mode" = check ]; then
@@ -283,8 +306,12 @@ if [ "$mode" != run ]; then
       pid=$(lane_running)
       lr_rc=$?
       [ -z "$pid" ] && { echo "agy-run: nothing is running in $dir"; exit 0; }
-      if [ "$lr_rc" != 0 ]; then
+      if [ "$lr_rc" = 1 ]; then
         echo "agy-run: running (start time unreadable), pid $pid in $dir"
+        exit 3
+      fi
+      if [ "$lr_rc" = 2 ]; then
+        echo "agy-run: running (pid $pid cannot be verified) in $dir"
         exit 3
       fi
       echo "agy-run: running in $dir (pid $pid, since $(sed -n 2p "$lock"), model $(sed -n 3p "$lock"))"
@@ -315,23 +342,18 @@ if [ "$mode" != run ]; then
       abort_wait=${AGY_RUN_ABORT_WAIT:-10}
       # 1-999 seconds, no leading zero: dash reads 08 and 09 as illegal octal in [ -lt ].
       case "$abort_wait" in [1-9] | [1-9][0-9] | [1-9][0-9][0-9]) ;; *) echo "agy-run: AGY_RUN_ABORT_WAIT must be whole seconds, 1 to 999" >&2; exit 2 ;; esac
-      pid=$(lane_running) || {
-        echo "agy-run: refusing to abort in $dir: start time of pid $pid is unreadable; check pid $pid by hand" >&2
-        exit 1
-      }
+      pid=$(lane_running) || refuse_abort "$pid"
       [ -z "$pid" ] && { echo "agy-run: nothing is running in $dir"; exit 0; }
       kill -TERM "$pid" 2>/dev/null
       echo "agy-run: asked pid $pid to stop" >&2
       pid=''
       tries=0
       while [ "$tries" -lt "$abort_wait" ]; do
-        # Re-verify by pid and start time so a pid recycled during the wait is never signalled.
-        pid=$(lane_running) || {
-          echo "agy-run: refusing to abort in $dir: start time of pid $pid is unreadable; check pid $pid by hand" >&2
-          exit 1
-        }
+        # Re-verify by pid, start time and command so a pid recycled during the wait is never signalled.
+        pid=$(lane_running) || refuse_abort "$pid"
         if [ -z "$pid" ]; then
-          rm -f "$lock"
+          # lane_running already removed the stale lock; never rm again (a lock a new dispatch
+          # took in between must survive).
           echo "agy-run: the lane in $dir stopped"
           exit 0
         fi
@@ -340,12 +362,8 @@ if [ "$mode" != run ]; then
         tries=$((tries + 1))
       done
       # Re-check immediately before SIGKILL; never signal a pid kept from before a sleep.
-      pid=$(lane_running) || {
-        echo "agy-run: refusing to abort in $dir: start time of pid $pid is unreadable; check pid $pid by hand" >&2
-        exit 1
-      }
+      pid=$(lane_running) || refuse_abort "$pid"
       if [ -z "$pid" ]; then
-        rm -f "$lock"
         echo "agy-run: the lane in $dir stopped"
         exit 0
       fi
@@ -353,15 +371,11 @@ if [ "$mode" != run ]; then
       echo "agy-run: pid $pid did not stop in $abort_wait s; killed" >&2
       pid=''
       sleep 1
-      pid=$(lane_running) || {
-        echo "agy-run: refusing to abort in $dir: start time of pid $pid is unreadable; check pid $pid by hand" >&2
-        exit 1
-      }
+      pid=$(lane_running) || refuse_abort "$pid"
       if [ -n "$pid" ]; then
         echo "agy-run: still running in $dir after the abort (pid $pid)" >&2
         exit 1
       fi
-      rm -f "$lock"
       echo "agy-run: nothing is running in $dir"
       exit 0
       ;;

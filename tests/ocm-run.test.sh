@@ -156,17 +156,52 @@ chmod +x "$T/bin/ssh"
 : > "$T/ssh.log"
 
 # Fake lsof and ps, driven by files so tests pick who "holds" the dial port:
-# - "$T/lsof-pid": the pid lsof prints (else nothing, exit 0);
-# - "$T/ps-cmd": the command line `ps` prints for it (else exit 1).
+# - "$T/lsof-pid": the pid(s) lsof prints when given -iTCP:<port> and -sTCP:LISTEN (else nothing, exit 1);
+# - "$T/ps-cmd" (or "$T/ps-cmd-<pid>"): the command line `ps` prints when given -ww and -p <pid> (else nothing, exit 1).
 cat > "$T/bin/lsof" <<'LSOF'
 #!/bin/sh
-[ -e "$T/lsof-pid" ] && cat "$T/lsof-pid"
-exit 0
+[ -e "$T/lsof-pid" ] || exit 1
+want=${LSOF_PORT:-}
+if [ -z "$want" ] && [ -n "${OCM_REMOTE_PORT:-}" ]; then
+  if [ -n "${OCM_HOST:-}" ]; then
+    want=$((OCM_REMOTE_PORT + 1))
+  else
+    want=$OCM_REMOTE_PORT
+  fi
+fi
+has_i=0
+has_s=0
+for a in "$@"; do
+  [ "$a" = "-iTCP:$want" ] && has_i=1
+  [ "$a" = "-sTCP:LISTEN" ] && has_s=1
+done
+if [ "$has_i" = 1 ] && [ "$has_s" = 1 ]; then
+  cat "$T/lsof-pid"
+  exit 0
+fi
+exit 1
 LSOF
 chmod +x "$T/bin/lsof"
 cat > "$T/bin/ps" <<'PS'
 #!/bin/sh
-[ -e "$T/ps-cmd" ] && cat "$T/ps-cmd" && exit 0
+has_ww=0
+pid=''
+prev=''
+for a in "$@"; do
+  [ "$a" = "-ww" ] && has_ww=1
+  [ "$prev" = "-p" ] && pid=$a
+  prev=$a
+done
+if [ "$has_ww" = 1 ] && [ -n "$pid" ]; then
+  if [ -e "$T/ps-cmd-$pid" ]; then
+    cat "$T/ps-cmd-$pid"
+    exit 0
+  fi
+  if [ -e "$T/ps-cmd" ] && [ -e "$T/lsof-pid" ] && [ "$pid" = "$(cat "$T/lsof-pid")" ]; then
+    cat "$T/ps-cmd"
+    exit 0
+  fi
+fi
 exit 1
 PS
 chmod +x "$T/bin/ps"
@@ -212,7 +247,7 @@ runbg() {
   ) &
 }
 busy() { printf '%s\n%s\n' "${3:-busy}" "$2" > "$T/sessions/$1"; }
-clear_all() { rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; }
+clear_all() { rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-*; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; }
 
 # --- 0. the guards
 check "guard: the server on the test port is the fake" '[ "$(curl -s -m 3 http://127.0.0.1:$P/__who)" = fake-opencode-server ]'
@@ -292,22 +327,48 @@ kill "$SRV2" 2>/dev/null
 # --- 1c. --check names who holds the dial port; a forward to another host fails
 clear_all
 out=$(run -- --check 2>&1); rc=$?
-check "holder: port held, no lsof answer: exit 0 and 'holder is unknown'" '[ "$rc" = 0 ] && echo "$out" | grep -q "holder is unknown"'
+check "holder (a): port held, no lsof answer: exit 0 and 'holder is unknown'" '[ "$rc" = 0 ] && echo "$out" | grep -q "holder is unknown (lsof found no owner it may read)"'
 clear_all
 echo 4242 > "$T/lsof-pid"
-echo "ssh -f -N -L 127.0.0.1:$P:127.0.0.1:$R ocm-test-host-that-does-not-exist" > "$T/ps-cmd"
+echo "ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:$P:127.0.0.1:$R ocm-test-host-that-does-not-exist" > "$T/ps-cmd"
 out=$(run -- --check 2>&1); rc=$?
-check "holder: an ssh forward to OCM_HOST is fine: exit 0 and names the pid" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242"'
+check "holder (b): an ssh forward to OCM_HOST is fine: exit 0 and names the pid" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242"'
 clear_all
 echo 4242 > "$T/lsof-pid"
-echo "ssh -f -N -L 127.0.0.1:$P:127.0.0.1:$R m" > "$T/ps-cmd"
+echo "ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:$P:127.0.0.1:$R m" > "$T/ps-cmd"
 out=$(run -- --check 2>&1); rc=$?
-check "holder: a forward to another host fails (1) before any probe" '[ "$rc" = 1 ] && echo "$out" | grep -q "goes to '\''m'\'', not OCM_HOST=" && [ ! -s "$T/http.log" ]'
+check "holder (c): a forward to another host fails (1) before any probe" '[ "$rc" = 1 ] && echo "$out" | grep -q "goes to '\''m'\'', not OCM_HOST=" && [ ! -s "$T/http.log" ]'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "/usr/bin/ssh -N -L $P:127.0.0.1:$R m" > "$T/ps-cmd"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (d): /usr/bin/ssh with no bind address in -L to another host fails (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "goes to '\''m'\''"'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "ssh -N -L $P:127.0.0.1:$R someone@ocm-test-host-that-does-not-exist" > "$T/ps-cmd"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (e): user@ prefix on destination is stripped: exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242"'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "ssh -L $P:127.0.0.1:$R m sleep 600" > "$T/ps-cmd"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (f): remote command after destination does not mask destination: exit 1" '[ "$rc" = 1 ] && echo "$out" | grep -q "goes to '\''m'\''"'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "ssh -J jump.example -p 2222 -L $P:127.0.0.1:$R ocm-test-host-that-does-not-exist" > "$T/ps-cmd"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (g): ssh options with arguments (-J, -p) before destination: exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242"'
 clear_all
 echo 4242 > "$T/lsof-pid"
 echo "python3 server.py" > "$T/ps-cmd"
 out=$(run -- --check 2>&1); rc=$?
-check "holder: a non-ssh holder does not fail: exit 0 and names the pid" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242"'
+check "holder (h): a non-ssh holder does not fail: exit 0 and 'held by'" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242"'
+clear_all
+printf '4242\n4243\n' > "$T/lsof-pid"
+echo "ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:$P:127.0.0.1:$R ocm-test-host-that-does-not-exist" > "$T/ps-cmd-4242"
+echo "ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:$P:127.0.0.1:$R m" > "$T/ps-cmd-4243"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (i): two pids, one good forward and one to 'm': prints both and exits 1" '[ "$rc" = 1 ] && echo "$out" | grep -q "held by pid 4242" && echo "$out" | grep -q "held by pid 4243" && echo "$out" | grep -q "goes to '\''m'\''"'
 clear_all
 python3 "$T/server.py" "$T" "$R" &
 SRV3=$!
@@ -316,7 +377,7 @@ i=0; while ! nc -z 127.0.0.1 "$R" 2>/dev/null; do i=$((i + 1)); [ "$i" -gt 50 ] 
 echo 4242 > "$T/lsof-pid"
 echo "ssh -f -N -L 127.0.0.1:$R:127.0.0.1:$R m" > "$T/ps-cmd"
 out=$(run OCM_HOST= -- --check 2>&1); rc=$?
-check "holder: local mode (OCM_HOST unset) skips the host comparison: exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242" && ! echo "$out" | grep -q "goes to"'
+check "holder (j): local mode (OCM_HOST unset) skips the host comparison: exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242" && ! echo "$out" | grep -q "goes to"'
 kill "$SRV3" 2>/dev/null
 
 # --- 2. our own flags never reach opencode

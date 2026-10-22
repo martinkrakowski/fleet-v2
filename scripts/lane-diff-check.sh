@@ -132,24 +132,32 @@ g() {
 # with the pinned g(), never a plain git. Collect every non-lfs clean/smudge/process driver (a
 # lane can write .git/config); they are reported after collection and neutralised here for every
 # git call that follows.
-drivers=$(g config --includes --get-regexp '^filter\..*\.(clean|smudge|process)$' 2>/dev/null || true)
+# Only the key NAMES are read, NUL-separated (`-z --name-only`): a key cannot contain a newline or
+# NUL, so no lane-written value can end or forge the list (Grok re-review of L1b: a value line
+# "EOF" ended the old heredoc early). A driver name outside [A-Za-z0-9_.-] cannot be neutralised
+# safely, because FILTER_ARGS is word-split into git's argv, where a name with spaces would inject
+# its own -c option. So the gate fails closed on it before running any diff.
+g config -z --includes --name-only --get-regexp '^filter\..*\.(clean|smudge|process)$' 2>/dev/null |
+  tr '\0' '\n' > "$T/filter-keys" || true
 FILTER_LIST=''
-if [ -n "$drivers" ]; then
-  while IFS= read -r cfg; do
-    [ -n "$cfg" ] || continue
-    key=${cfg%% *}
-    driver=${key#filter.}
-    case "$driver" in *.clean|*.smudge|*.process) driver=${driver%.*} ;; esac
-    [ -n "$driver" ] && [ "$driver" != lfs ] || continue
-    case "$FILTER_LIST" in *"|$driver|"*) ;; *) FILTER_LIST="$FILTER_LIST|$driver|" ;; esac
-  done <<EOF
-$drivers
-EOF
-  for d in $(printf '%s' "$FILTER_LIST" | tr '|' ' '); do
-    [ -n "$d" ] || continue
-    FILTER_ARGS="$FILTER_ARGS -c filter.$d.clean= -c filter.$d.smudge= -c filter.$d.process= -c filter.$d.required=false"
-  done
-fi
+while IFS= read -r key; do
+  [ -n "$key" ] || continue
+  driver=${key#filter.}
+  driver=${driver%.*}
+  [ "$driver" != lfs ] || continue
+  case "$driver" in
+    '' | *[!A-Za-z0-9_.-]*)
+      echo "git-config-filter-unsafe: a filter driver name in the git config cannot be neutralised; refusing to run git"
+      echo "lane-diff-check: 0 file(s) reviewed, 1 finding(s), 0 warning(s)"
+      exit 1
+      ;;
+  esac
+  case "$FILTER_LIST" in *"|$driver|"*) ;; *) FILTER_LIST="$FILTER_LIST|$driver|" ;; esac
+done < "$T/filter-keys"
+for d in $(printf '%s' "$FILTER_LIST" | tr '|' ' '); do
+  [ -n "$d" ] || continue
+  FILTER_ARGS="$FILTER_ARGS -c filter.$d.clean= -c filter.$d.smudge= -c filter.$d.process= -c filter.$d.required=false"
+done
 collect() {
   if git rev-parse --verify -q HEAD >/dev/null; then
     if [ -n "$base" ]; then

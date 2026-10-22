@@ -375,6 +375,27 @@ git config --unset include.path
 git checkout -q -- packages/x/src/a.ts
 rm -f .gitattributes "$T/inc.gitconfig"
 
+# Grok re-review of L1b: a stored value containing a line "EOF" must not cut the driver list short.
+printf '* filter=late\n' > .gitattributes
+printf '// late\n' >> packages/x/src/a.ts
+git config filter.early.clean "$(printf 'true\nEOF\nmore')"
+git config filter.late.clean "touch $T/late-ran"
+run "$R" --base base
+check 'a config value containing EOF cannot hide a later filter driver (L1b re-review)' '[ "$(rc)" = 1 ] && grep -q "^git-config-filter: late$" "$T/o" && [ ! -e "$T/late-ran" ]'
+git config --remove-section filter.early; git config --remove-section filter.late
+git checkout -q -- packages/x/src/a.ts; rm -f .gitattributes
+
+# A driver name with spaces would be word-split into git's argv as its own -c option, after the
+# gate's pins: the gate refuses to run git at all.
+git config "filter.x -c core.fsmonitor=touch $T/inj -c x.clean" cat 2>/dev/null || git config --file .git/config "filter.x -c core.fsmonitor=touch $T/inj -c x.clean" cat 2>/dev/null || true
+if git config --name-only --get-regexp '^filter\..*\.clean$' 2>/dev/null | grep -q ' '; then
+  run "$R" --base base
+  check 'an unsafe filter driver name fails closed before any git diff (L1b re-review)' '[ "$(rc)" = 1 ] && grep -q "^git-config-filter-unsafe:" "$T/o" && [ ! -e "$T/inj" ]'
+  git config --remove-section "filter.x -c core.fsmonitor=touch $T/inj -c x" 2>/dev/null || true
+else
+  check 'the unsafe filter driver fixture was created (L1b re-review)' 'false'
+fi
+
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"
 [ "$fails" = 0 ]

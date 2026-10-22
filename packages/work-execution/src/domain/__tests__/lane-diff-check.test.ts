@@ -692,6 +692,8 @@ describe("isFixedProtectedPath (script parity, O14d1)", () => {
       expect(isFixedProtectedPath(sample), sample).toBe(true);
     }
     for (const allowed of [
+      // ASCII-only folding, as the shell's grep -i under LC_ALL=C: U+017F (long s) is not "s".
+      ".hu\u017Fky/pre-commit",
       "foo/.git/config",
       "node_modules/pkg/package.json",
       "packages/x/node_modules/y/package.json",

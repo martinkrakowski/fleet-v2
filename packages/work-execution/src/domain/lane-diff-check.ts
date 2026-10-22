@@ -178,18 +178,26 @@ const PROTECTED_MATCHERS: readonly ProtectedRuleMatcher[] =
         source = `${rule.anyDepth ? any : root}$`;
         break;
     }
-    return { rule, regex: new RegExp(source, "i") };
+    // ASCII-only case folding, the same as the shell's `grep -i` under LC_ALL=C (Grok re-review
+    // of L1b): the `i` flag would also fold non-ASCII letters (U+017F matches "s"), so the two
+    // gates would disagree. The source and the path are both ASCII-lowercased instead.
+    return { rule, regex: new RegExp(asciiLower(source)) };
   });
+
+/** Lower-cases ASCII A-Z only, as `grep -i` does in the C locale. */
+function asciiLower(text: string): string {
+  return text.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+}
 
 /** True when some ancestor directory of the path is named `node_modules`. */
 function isUnderNodeModules(path: string): boolean {
-  return /(^|\/)node_modules\//i.test(path);
+  return /(^|\/)node_modules\//.test(asciiLower(path));
 }
 
 /** Every rule that protects `path` (only `package.json` is exempted under `node_modules/`). */
 function protectingMatchers(path: string): readonly ProtectedRuleMatcher[] {
   return PROTECTED_MATCHERS.filter(({ rule, regex }) => {
-    if (!regex.test(path)) return false;
+    if (!regex.test(asciiLower(path))) return false;
     if (rule.pattern === "package\\.json" && isUnderNodeModules(path)) {
       return false;
     }

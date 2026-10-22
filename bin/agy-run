@@ -35,17 +35,18 @@
 #      the lane then outlives this process on purpose, and --wait / --abort are how it is followed.
 #   3. "Has the lane ended" is --status or --wait, never the end of a local process.
 #
-# The lock lives OUTSIDE the worktree, in the per-user state directory
-# ${XDG_STATE_HOME:-$HOME/.local/state}/agy-run/locks/<sha256 of the physical worktree path>.lock,
-# recording pid, start time, model, mode and the process command name. The lane can write anything
-# under its worktree, so a lock inside it could be planted and steer the operator's --status and
-# --abort; the state dir is where the lane cannot reach. The directory is created with umask 077
-# and refused when it is a symlink or not owned by the current user. Only the lane's own artifacts
-# stay under <dir>/.lane (which must be gitignored): agy-run.out (agy's JSON result), agy-run.err
-# (agy's stderr), agy-run.before (HEAD at dispatch), agy-run.last (one line per ended run: exit,
-# seconds, tokens, denied actions). agy-run refuses (exit 2) when .lane itself or any of those
-# files is a symlink, or when .lane is not a directory, and creates the output files fresh via a
-# temp file plus mv, never by following an existing path.
+# Every agy-run-owned file lives OUTSIDE the worktree, in a per-worktree run directory:
+#   RUN_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/agy-run/runs/<sha256 of the physical worktree path>/
+# Specifically: `lock` (pid, start time, model, mode, and sha256 of `ps -ww -o args=`), `out` (agy's
+# JSON result), `err` (agy's stderr), `before` (HEAD at dispatch), `last` (one line per ended run:
+# exit, seconds, tokens, denied actions), and every temp file (`mktemp "$RUN_DIR/.tmp.XXXXXX"` plus
+# `mv -f`). agy-run writes nothing under the worktree; `.lane/` inside the worktree (which must be
+# gitignored) is only where the brief is read from. `ensure_private_dir` requires the state root to
+# be absolute and walks the chain component by component (`STATE`, `agy-run`, `runs`, `<hash>`),
+# creating missing components with `umask 077; mkdir` (no `-p`) and refusing symlinks, non-directories,
+# paths not owned by the current user, and group- or world-writable directories.
+# NOTE: Inside agy-lanes the agent runs as the same user, so the run dir's safety relies on agy's
+# `--sandbox` limiting the agent's writes to its workspace.
 # Env: AGY_BIN (default: agy), AGY_ALLOW_BUSY=1, AGY_SANDBOX=1 (same as --sandbox),
 #      AGY_DENIED_IS_FAILURE=1 (a run that ends with denied actions exits 5),
 #      AGY_WAIT_INTERVAL (seconds between looks, default 15), AGY_WAIT_MAX (default 1500),
@@ -146,7 +147,7 @@ esac
 command -v "$AGY_BIN" >/dev/null 2>&1 || { echo "agy-run: $AGY_BIN is not on PATH" >&2; exit 1; }
 
 # A dir qualifies when it is the root of a git worktree (a run additionally requires .lane to be
-# gitignored, checked after the symlink safety pass).
+# gitignored).
 qualify_dir() {
   [ -n "$dir" ] || { echo "agy-run: --$mode needs --dir <worktree>" >&2; exit 2; }
   [ -d "$dir" ] || { echo "agy-run: $dir is not a directory" >&2; exit 1; }
@@ -156,56 +157,99 @@ qualify_dir() {
   dir=$here
 }
 
-lane=''
+sha256_str() {
+  printf '%s' "$1" | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | awk '{print $1}'
+}
+
+STATE=''
+RUN_DIR=''
 lock=''
+out=''
+err=''
+before_file=''
+last=''
 set_paths() {
-  lane=$dir/.lane
-  state=${XDG_STATE_HOME:-$HOME/.local/state}
-  lkdir=$state/agy-run/locks
-  lkhash=$(printf '%s' "$dir" | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | awk '{print $1}')
-  lock=$lkdir/$lkhash.lock
+  STATE=${XDG_STATE_HOME:-$HOME/.local/state}
+  run_hash=$(sha256_str "$dir")
+  RUN_DIR=${STATE%/}/agy-run/runs/$run_hash
+  lock=$RUN_DIR/lock
+  out=$RUN_DIR/out
+  err=$RUN_DIR/err
+  before_file=$RUN_DIR/before
+  last=$RUN_DIR/last
 }
 
-# The lock directory is per-user state, not part of the worktree the lane can write. It is
-# created privately (umask 077) and refused when it is a symlink or not owned by this user.
-ensure_lock_dir() {
-  if [ -L "$lkdir" ]; then
-    echo "agy-run: $lkdir is a symlink; refusing to use it for lane locks" >&2
+check_one_private_dir() { # $1: existing path
+  if [ -L "$1" ]; then
+    echo "agy-run: $1 is a symlink; refusing to use it" >&2
     exit 2
   fi
-  if [ -e "$lkdir" ]; then
-    [ -d "$lkdir" ] || { echo "agy-run: $lkdir is not a directory" >&2; exit 2; }
-    [ -O "$lkdir" ] || { echo "agy-run: $lkdir is not owned by the current user; refusing" >&2; exit 2; }
-  else
-    ( umask 077; mkdir -p "$lkdir" ) || { echo "agy-run: cannot create $lkdir" >&2; exit 2; }
-  fi
-}
-
-# The worktree is the lane's playground: .lane may have been prepared by it. Never write lane
-# output through a symlink (or a non-directory) in .lane; refuse before anything is written.
-check_lane_safe() {
-  if [ -L "$lane" ]; then
-    echo "agy-run: $lane is a symlink; refusing to write lane output through it" >&2
-    exit 2
-  fi
-  if [ -e "$lane" ] && [ ! -d "$lane" ]; then
-    echo "agy-run: $lane is not a directory" >&2
-    exit 2
-  fi
-  for f in agy-run.out agy-run.err agy-run.before agy-run.last; do
-    if [ -L "$lane/$f" ]; then
-      echo "agy-run: $lane/$f is a symlink; refusing to write through it" >&2
+  [ -d "$1" ] || { echo "agy-run: $1 is not a directory" >&2; exit 2; }
+  [ -O "$1" ] || { echo "agy-run: $1 is not owned by the current user; refusing" >&2; exit 2; }
+  copd_mode=$(LC_ALL=C ls -ld "$1" 2>/dev/null) || { echo "agy-run: cannot stat $1" >&2; exit 2; }
+  case "$copd_mode" in
+    ?????w* | ????????w*)
+      echo "agy-run: $1 is group- or world-writable; refusing" >&2
       exit 2
-    fi
+      ;;
+  esac
+}
+
+ensure_one_private_dir() { # $1: component path
+  if [ -L "$1" ] || [ -e "$1" ]; then
+    check_one_private_dir "$1"
+  else
+    ( umask 077; mkdir "$1" ) 2>/dev/null || { echo "agy-run: cannot create $1" >&2; exit 2; }
+    check_one_private_dir "$1"
+  fi
+}
+
+# Walks the directory chain from $STATE downward component by component (STATE, agy-run, runs,
+# <hash>), requiring $STATE to be absolute and every component to be a private, non-symlink
+# directory owned by the current user.
+ensure_private_dir() { # $1: target directory under $STATE
+  case "$STATE" in
+    /*) ;;
+    *) echo "agy-run: state directory $STATE must be an absolute path" >&2; exit 2 ;;
+  esac
+  epd_cur=${STATE%/}
+  [ -n "$epd_cur" ] || epd_cur=/
+  case "$1" in
+    "$epd_cur" | "$epd_cur"/*) ;;
+    *) echo "agy-run: $1 is not under state directory $STATE" >&2; exit 2 ;;
+  esac
+  ensure_one_private_dir "$epd_cur"
+  epd_rest=${1#"$epd_cur"}
+  epd_rest=${epd_rest#/}
+  epd_ifs=$IFS
+  IFS=/
+  set -f
+  for epd_part in $epd_rest; do
+    [ -n "$epd_part" ] || continue
+    epd_cur=$epd_cur/$epd_part
+    ensure_one_private_dir "$epd_cur"
   done
+  set +f
+  IFS=$epd_ifs
+}
+
+mk_run_tmp() {
+  ( umask 077; mktemp "$RUN_DIR/.tmp.XXXXXX" ) 2>/dev/null || {
+    echo "agy-run: cannot create temp file in $RUN_DIR" >&2
+    exit 1
+  }
 }
 
 pid_start() {
   LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null
 }
 
-pid_comm() {
-  LC_ALL=C ps -o comm= -p "$1" 2>/dev/null
+pid_args_hash() {
+  pa=$(LC_ALL=C ps -ww -o args= -p "$1" 2>/dev/null)
+  case "$pa" in
+    *[![:space:]]*) sha256_str "$pa" ;;
+    *) printf '' ;;
+  esac
 }
 
 readable_start() {
@@ -216,63 +260,79 @@ readable_start() {
   esac
 }
 
+# Probes pid $1 with `kill -0` under LC_ALL=C. Returns 0 when the pid exists and can be
+# signalled, 1 when it is gone ("No such process" / ESRCH), and 2 when unknown ("Operation not
+# permitted" / EPERM or any other failure).
+probe_pid() {
+  pp_err=$(LC_ALL=C env kill -0 "$1" 2>&1) && return 0
+  case "$pp_err" in
+    *'No such process'* | *'no such process'*) return 1 ;;
+  esac
+  return 2
+}
+
 # Prints the pid of the lane running in $dir, nothing when none. Returns 0 when the outcome
 # is known (running, gone or reused), 1 when the start time is unreadable, and 2 when the pid
-# exists but cannot be verified (command name unreadable, or the pid cannot be signalled — a
-# permission error is not "gone"); the lock is kept and the pid is printed so callers never
-# delete a live lane's lock or signal an unverified pid. Existence is read from ps, not kill:
-# a pid that exists but cannot be signalled (EPERM) is unknown, never gone. Residual risk: ps
-# lstart has one-second resolution, so a pid reused within the same second by the same
-# command name compares equal; the recorded command name catches reuse by another program.
+# cannot be verified (kill -0 fails with anything other than "No such process", or ps args are
+# unreadable); the lock is kept and the pid is printed so callers never delete a live lane's
+# lock or signal an unverified pid. Do not delete a lock because ps printed nothing.
 lane_running() {
   [ -f "$lock" ] || return 0
   lr_pid=$(head -n 1 "$lock" 2>/dev/null)
   lr_start=$(sed -n 2p "$lock" 2>/dev/null)
-  lr_cmd=$(sed -n 5p "$lock" 2>/dev/null)
+  lr_args=$(sed -n 5p "$lock" 2>/dev/null)
   case "$lr_pid" in '' | *[!0-9]*) rm -f "$lock"; return 0 ;; esac
-  lr_exists=$(LC_ALL=C ps -p "$lr_pid" -o pid= 2>/dev/null)
-  if [ -z "$lr_exists" ]; then
-    # ps does not show the pid; confirm with kill. A pid invisible to ps is gone unless kill
-    # still sees it (then it exists and we proceed to compare identity below).
-    if ! kill -0 "$lr_pid" 2>/dev/null; then
-      echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
+  probe_pid "$lr_pid"
+  case "$?" in
+    1)
+      echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in $out" >&2
       rm -f "$lock"
       return 0
-    fi
-  elif ! kill -0 "$lr_pid" 2>/dev/null; then
-    # The pid exists (ps shows it) but cannot be signalled: a permission error keeps the lock.
-    echo "$lr_pid"
-    return 2
-  fi
+      ;;
+    2)
+      echo "$lr_pid"
+      return 2
+      ;;
+  esac
   lr_now=$(pid_start "$lr_pid")
   if ! readable_start "$lr_start" || ! readable_start "$lr_now"; then
-    # The lane may have exited and been reaped between ps and start-time reads (CodeRabbit on
-    # #148): an empty ps for a pid that is now gone is "gone", not "unreadable".
-    if ! kill -0 "$lr_pid" 2>/dev/null; then
-      echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
-      rm -f "$lock"
-      return 0
-    fi
+    probe_pid "$lr_pid"
+    case "$?" in
+      1)
+        echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in $out" >&2
+        rm -f "$lock"
+        return 0
+        ;;
+      2)
+        echo "$lr_pid"
+        return 2
+        ;;
+    esac
     echo "$lr_pid"
     return 1
   fi
-  lr_nowcmd=$(pid_comm "$lr_pid")
-  if [ -z "$lr_nowcmd" ]; then
-    echo "$lr_pid"
-    return 2
-  fi
-  if [ "$lr_cmd" != "$lr_nowcmd" ]; then
-    # The recorded command name differs: the pid now belongs to a different program.
-    echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
+  if [ "$lr_now" != "$lr_start" ]; then
+    echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in $out" >&2
     rm -f "$lock"
     return 0
   fi
-  if [ "$lr_now" = "$lr_start" ]; then
+  lr_nowargs=$(pid_args_hash "$lr_pid")
+  if [ -z "$lr_args" ] || [ "$lr_args" = unknown ] || [ -z "$lr_nowargs" ]; then
+    probe_pid "$lr_pid"
+    if [ "$?" = 1 ]; then
+      echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in $out" >&2
+      rm -f "$lock"
+      return 0
+    fi
     echo "$lr_pid"
+    return 2
+  fi
+  if [ "$lr_nowargs" != "$lr_args" ]; then
+    echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in $out" >&2
+    rm -f "$lock"
     return 0
   fi
-  echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
-  rm -f "$lock"
+  echo "$lr_pid"
   return 0
 }
 
@@ -298,23 +358,23 @@ fi
 
 qualify_dir
 set_paths
-ensure_lock_dir
+ensure_private_dir "$RUN_DIR"
 
 if [ "$mode" != run ]; then
   case "$mode" in
     status)
       pid=$(lane_running)
       lr_rc=$?
-      [ -z "$pid" ] && { echo "agy-run: nothing is running in $dir"; exit 0; }
+      [ -z "$pid" ] && { echo "agy-run: nothing is running in $dir (out: $out)"; exit 0; }
       if [ "$lr_rc" = 1 ]; then
-        echo "agy-run: running (start time unreadable), pid $pid in $dir"
+        echo "agy-run: running (start time unreadable), pid $pid in $dir (out: $out)"
         exit 3
       fi
       if [ "$lr_rc" = 2 ]; then
-        echo "agy-run: running (pid $pid cannot be verified) in $dir"
+        echo "agy-run: running (pid $pid cannot be verified) in $dir (out: $out)"
         exit 3
       fi
-      echo "agy-run: running in $dir (pid $pid, since $(sed -n 2p "$lock"), model $(sed -n 3p "$lock"))"
+      echo "agy-run: running in $dir (pid $pid, since $(sed -n 2p "$lock"), model $(sed -n 3p "$lock")) (out: $out)"
       exit 3
       ;;
     wait)
@@ -344,12 +404,12 @@ if [ "$mode" != run ]; then
       case "$abort_wait" in [1-9] | [1-9][0-9] | [1-9][0-9][0-9]) ;; *) echo "agy-run: AGY_RUN_ABORT_WAIT must be whole seconds, 1 to 999" >&2; exit 2 ;; esac
       pid=$(lane_running) || refuse_abort "$pid"
       [ -z "$pid" ] && { echo "agy-run: nothing is running in $dir"; exit 0; }
-      kill -TERM "$pid" 2>/dev/null
+      env kill -TERM "$pid" 2>/dev/null
       echo "agy-run: asked pid $pid to stop" >&2
       pid=''
       tries=0
       while [ "$tries" -lt "$abort_wait" ]; do
-        # Re-verify by pid, start time and command so a pid recycled during the wait is never signalled.
+        # Re-verify by pid, start time and args hash so a pid recycled during the wait is never signalled.
         pid=$(lane_running) || refuse_abort "$pid"
         if [ -z "$pid" ]; then
           # lane_running already removed the stale lock; never rm again (a lock a new dispatch
@@ -367,7 +427,7 @@ if [ "$mode" != run ]; then
         echo "agy-run: the lane in $dir stopped"
         exit 0
       fi
-      kill -KILL "$pid" 2>/dev/null
+      env kill -KILL "$pid" 2>/dev/null
       echo "agy-run: pid $pid did not stop in $abort_wait s; killed" >&2
       pid=''
       sleep 1
@@ -391,8 +451,7 @@ case "$model" in -*|*[[:space:]]*|'') die_usage "--model must not start with '-'
 # The agent travels the same way, so it gets the same guard. An empty value is just
 # no agent, so unlike --model it is not refused.
 case "$agent" in -*|*[[:space:]]*) die_usage "--agent must not start with '-' or contain whitespace" ;; esac
-check_lane_safe
-git -C "$dir" check-ignore -q .lane/agy-run.lock 2>/dev/null || { echo "agy-run: .lane/ is not gitignored in $dir; a lane's brief must never be committed" >&2; exit 1; }
+git -C "$dir" check-ignore -q .lane/brief.md 2>/dev/null || { echo "agy-run: .lane/ is not gitignored in $dir; a lane's brief must never be committed" >&2; exit 1; }
 [ -f "$dir/$brief" ] || { echo "agy-run: no brief at $dir/$brief" >&2; exit 1; }
 git -C "$dir" check-ignore -q "$brief" || { echo "agy-run: $brief is not gitignored in $dir; a brief is never committed" >&2; exit 1; }
 
@@ -405,22 +464,19 @@ if [ -n "$busy" ] && [ "${AGY_ALLOW_BUSY:-0}" != 1 ]; then
 fi
 
 # The lock is taken with noclobber so two dispatches in the same second cannot both win. The
-# lock directory is private (umask 077); the record carries pid, start time, model, mode and
-# the command name so status and abort verify the whole identity before reporting or signalling.
-if ! ( umask 077; set -C; printf '%s\n' "$$" "$(pid_start "$$")" "$model" "$agymode" "$(pid_comm "$$")" > "$lock" ) 2>/dev/null; then
+# run directory is private (umask 077); the record carries pid, start time, model, mode and
+# the args hash so status and abort verify the whole identity before reporting or signalling.
+if ! ( umask 077; set -C; printf '%s\n' "$$" "$(pid_start "$$")" "$model" "$agymode" "$(pid_args_hash "$$")" > "$lock" ) 2>/dev/null; then
   echo "agy-run: another dispatch took the lock in $dir at the same moment; not dispatching" >&2
   exit 75
 fi
 
-mkdir -p "$lane"
 before=$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo none)
-tmp=$lane/.agy-run.before.tmp.$$
+tmp=$(mk_run_tmp)
 printf '%s\n' "$before" > "$tmp"
-mv -f "$tmp" "$lane/agy-run.before"
-out=$lane/agy-run.out
-err=$lane/agy-run.err
+mv -f "$tmp" "$before_file"
 for f in "$out" "$err"; do
-  tmp=$lane/.agy-run.tmp.$$
+  tmp=$(mk_run_tmp)
   : > "$tmp"
   mv -f "$tmp" "$f"
 done
@@ -442,18 +498,19 @@ fi
 child=''
 start=$(date +%s)
 
-finish_run() { # $1: exit status to report; writes agy-run.last, prints the summary, frees the lock
+finish_run() { # $1: exit status to report; writes last in RUN_DIR via mktemp+mv, frees the lock
   secs=$(( $(date +%s) - start ))
   flat=$(tr -d ' \n\r\t' < "$out" 2>/dev/null)
   tokens=$(printf '%s' "$flat" | sed -n 's/.*"total_tokens":\([0-9]*\).*/\1/p')
   denied=$(printf '%s' "$flat" | sed -n 's/.*"denied_actions":\[\(.*\)\].*/\1/p' | grep -o '"action":"[^"]*"' | sed 's/"action":"//;s/"$//' | sort -u | tr '\n' ' ')
   dcount=$(printf '%s' "$denied" | wc -w | tr -d ' ')
-  if [ -L "$lane/agy-run.last" ]; then
-    echo "agy-run: $lane/agy-run.last is a symlink; refusing to write through it" >&2
-    exit 2
-  fi
-  printf 'end=%s exit=%s secs=%s tokens=%s denied=%s model=%s mode=%s before=%s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$secs" "${tokens:-?}" "$dcount" "$model" "$agymode" "$before" >> "$lane/agy-run.last"
+  tmp=$(mk_run_tmp)
+  {
+    [ -f "$last" ] && cat "$last" 2>/dev/null
+    printf 'end=%s exit=%s secs=%s tokens=%s denied=%s model=%s mode=%s before=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$secs" "${tokens:-?}" "$dcount" "$model" "$agymode" "$before"
+  } > "$tmp"
+  mv -f "$tmp" "$last"
   rm -f "$lock"
 }
 
@@ -464,8 +521,8 @@ stop_run() { # $1: exit status
     exit "$1"
   fi
   if [ -n "$child" ]; then
-    kill -TERM "$child" 2>/dev/null
-    ( sleep 10; kill -KILL "$child" 2>/dev/null ) >/dev/null 2>&1 &
+    env kill -TERM "$child" 2>/dev/null
+    ( sleep 10; env kill -KILL "$child" 2>/dev/null ) >/dev/null 2>&1 &
     dog=$!
     wait "$child" 2>/dev/null
     kill "$dog" 2>/dev/null
@@ -491,14 +548,19 @@ child=$!
 # recycled during these retries. The kill -0 guard stops early if it has already exited, so a
 # start time is only ever read for the process just launched.
 cstart=$(pid_start "$child")
+cargs=$(pid_args_hash "$child")
 tries=0
-while ! readable_start "$cstart" && [ "$tries" -lt 5 ] && kill -0 "$child" 2>/dev/null; do
+while { ! readable_start "$cstart" || [ -z "$cargs" ]; } && [ "$tries" -lt 5 ] && probe_pid "$child"; do
   sleep 0.2
-  cstart=$(pid_start "$child")
+  readable_start "$cstart" || cstart=$(pid_start "$child")
+  [ -n "$cargs" ] || cargs=$(pid_args_hash "$child")
   tries=$((tries + 1))
 done
 readable_start "$cstart" || cstart=unknown
-printf '%s\n' "$child" "$cstart" "$model" "$agymode" "$(pid_comm "$child")" > "$lock"
+[ -n "$cargs" ] || cargs=unknown
+tmp=$(mk_run_tmp)
+printf '%s\n' "$child" "$cstart" "$model" "$agymode" "$cargs" > "$tmp"
+mv -f "$tmp" "$lock"
 wait "$child"
 rc=$?
 child=''
@@ -537,5 +599,5 @@ case "$flat" in
     ;;
 esac
 finish_run "$status"
-echo "agy-run: ended after $(( $(date +%s) - start )) s with exit $status (model $model, mode $agymode, HEAD before: $before)" >&2
+echo "agy-run: ended after $(( $(date +%s) - start )) s with exit $status (model $model, mode $agymode, HEAD before: $before, out: $out)" >&2
 exit "$status"

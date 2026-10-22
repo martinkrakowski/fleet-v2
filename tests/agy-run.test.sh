@@ -43,6 +43,27 @@ chmod +x "$T/bin/agy"
 PATH="$T/bin:$PATH"
 export PATH
 
+# The fake ps: logs its arguments, then behaves like `ps -o lstart= -p <pid>`: a living pid
+# gets a fixed start time, a pid that is gone yields nothing. The script under test compares the
+# stored start time against this, so the lock tests below control recycling by writing a
+# different start time than the fake reports for a live pid.
+cat > "$T/bin/ps" <<FAKEPS
+#!/bin/sh
+printf '%s\n' "\$@" >> "$T/ps.log"
+prev=''
+for a in "\$@"; do
+  [ "\$prev" = -p ] && pid=\$a
+  prev=\$a
+done
+case "\$pid" in '' | *[!0-9]*) exit 1 ;; esac
+if kill -0 "\$pid" 2>/dev/null; then
+  echo 'Thu Jan  1 00:00:00 2026'
+  exit 0
+fi
+exit 1
+FAKEPS
+chmod +x "$T/bin/ps"
+
 # A worktree that qualifies: a git repo whose .lane/ is ignored, with a brief inside.
 mkrepo() { # $1: dir, $2: gitignore content
   mkdir -p "$1" && cd "$1" || exit 1
@@ -230,6 +251,21 @@ echo '# a stale lock'
 printf '%s\n' 999999 2026-01-01T00:00:00Z m accept-edits > "$WT/.lane/agy-run.lock"
 run --status --dir "$WT"
 check 'a lock whose pid is gone reads as ended (0) and is removed' '[ "$(rc)" = 0 ] && [ ! -f "$WT/.lane/agy-run.lock" ] && grep -q "ended" "$T/e"'
+
+echo '# the lock compares pid and process start time'
+sleep 300 &
+OFDPID=$!
+echo "$OFDPID" >> "$T/pids"
+printf '%s\n' "$OFDPID" 'Thu Jan  1 00:00:00 1999' m accept-edits > "$WT/.lane/agy-run.lock"
+run --status --dir "$WT"
+check 'status consults ps for the recorded pid' 'grep -q -x "$OFDPID" "$T/ps.log"'
+check 'a live pid whose start time differs reads as nothing (0)' '[ "$(rc)" = 0 ] && grep -q "nothing is running" "$T/o"'
+check 'the stale lock is removed after that status' '[ ! -f "$WT/.lane/agy-run.lock" ]'
+printf '%s\n' "$OFDPID" 'Thu Jan  1 00:00:00 1999' m accept-edits > "$WT/.lane/agy-run.lock"
+run --abort --dir "$WT"
+check 'abort never signals a recycled pid (0)' '[ "$(rc)" = 0 ] && grep -q "nothing is running" "$T/o"'
+check 'the foreign process is still alive after the abort' 'kill -0 "$OFDPID" 2>/dev/null'
+kill "$OFDPID" 2>/dev/null
 
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"

@@ -152,17 +152,21 @@ set_paths() {
   lock=$lane/agy-run.lock
 }
 
-# Prints the pid of the lane running in $dir, nothing when none. A lock whose pid is gone is stale:
-# it is removed and the lane counts as ended.
+# Prints the pid of the lane running in $dir, nothing when none. The lock records the pid
+# and the process start time it had at dispatch; a lock whose pid is gone, or whose recorded
+# start time does not match the live process (a recycled pid), is stale: it is removed and
+# the lane counts as ended.
 lane_running() {
   [ -f "$lock" ] || return 0
   lr_pid=$(head -n 1 "$lock" 2>/dev/null)
+  lr_start=$(sed -n 2p "$lock" 2>/dev/null)
   case "$lr_pid" in '' | *[!0-9]*) rm -f "$lock"; return 0 ;; esac
-  if kill -0 "$lr_pid" 2>/dev/null; then
+  lr_now=$(ps -o lstart= -p "$lr_pid" 2>/dev/null)
+  if [ -n "$lr_now" ] && [ "$lr_now" = "$lr_start" ]; then
     echo "$lr_pid"
     return 0
   fi
-  echo "agy-run: the lane in $dir ended (pid $lr_pid is gone); its result is in .lane/agy-run.out" >&2
+  echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
   rm -f "$lock"
   return 0
 }
@@ -216,16 +220,19 @@ if [ "$mode" != run ]; then
       echo "agy-run: asked pid $pid to stop" >&2
       tries=0
       while [ "$tries" -lt 10 ]; do
-        kill -0 "$pid" 2>/dev/null || break
+        # Re-verify by pid and start time so a pid recycled during the wait is never signalled.
+        pid=$(lane_running)
+        [ -z "$pid" ] && break
         sleep 1
         tries=$((tries + 1))
       done
-      if kill -0 "$pid" 2>/dev/null; then
+      if [ -n "$pid" ]; then
         kill -KILL "$pid" 2>/dev/null
         echo "agy-run: pid $pid did not stop in 10 s; killed" >&2
         sleep 1
+        pid=$(lane_running)
       fi
-      if kill -0 "$pid" 2>/dev/null; then
+      if [ -n "$pid" ]; then
         echo "agy-run: still running in $dir after the abort (pid $pid)" >&2
         exit 1
       fi
@@ -257,7 +264,7 @@ if [ -n "$busy" ] && [ "${AGY_ALLOW_BUSY:-0}" != 1 ]; then
 fi
 
 # The lock is taken with noclobber so two dispatches in the same second cannot both win.
-if ! ( set -C; printf '%s\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$model" "$agymode" > "$lock" ) 2>/dev/null; then
+if ! ( set -C; printf '%s\n' "$$" "$(ps -o lstart= -p "$$" 2>/dev/null)" "$model" "$agymode" > "$lock" ) 2>/dev/null; then
   echo "agy-run: another dispatch took the lock in $dir at the same moment; not dispatching" >&2
   exit 75
 fi
@@ -327,7 +334,7 @@ else
   ( cd "$dir" && exec "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
 fi
 child=$!
-printf '%s\n' "$child" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$model" "$agymode" > "$lock"
+printf '%s\n' "$child" "$(ps -o lstart= -p "$child" 2>/dev/null)" "$model" "$agymode" > "$lock"
 wait "$child"
 rc=$?
 child=''

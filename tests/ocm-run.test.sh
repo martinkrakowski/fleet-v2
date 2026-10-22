@@ -155,13 +155,78 @@ SSH
 chmod +x "$T/bin/ssh"
 : > "$T/ssh.log"
 
+# Fake lsof and ps, driven by files so tests pick who "holds" the dial port:
+# - "$T/lsof-pid": the pid(s) (or raw -Fpn p/n lines) lsof prints when given -iTCP:<port> -sTCP:LISTEN -Fpn (else nothing, exit 1);
+# - "$T/ps-cmd" (or "$T/ps-cmd-<pid>"): the command line `ps` prints when given -ww and -p <pid> (else nothing, exit 1).
+cat > "$T/bin/lsof" <<'LSOF'
+#!/bin/sh
+[ -e "$T/lsof-pid" ] || exit 1
+want=${LSOF_PORT:-}
+if [ -z "$want" ] && [ -n "${OCM_REMOTE_PORT:-}" ]; then
+  if [ -n "${OCM_HOST:-}" ]; then
+    want=$((OCM_REMOTE_PORT + 1))
+  else
+    want=$OCM_REMOTE_PORT
+  fi
+fi
+has_i=0
+has_s=0
+has_f=0
+for a in "$@"; do
+  [ "$a" = "-iTCP:$want" ] && has_i=1
+  [ "$a" = "-sTCP:LISTEN" ] && has_s=1
+  [ "$a" = "-Fpn" ] && has_f=1
+done
+if [ "$has_i" = 1 ] && [ "$has_s" = 1 ] && [ "$has_f" = 1 ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      p* | n* | f*)
+        printf '%s\n' "$line"
+        ;;
+      ?*)
+        printf 'p%s\nn127.0.0.1:%s\n' "$line" "$want"
+        ;;
+    esac
+  done < "$T/lsof-pid"
+  exit 0
+fi
+exit 1
+LSOF
+chmod +x "$T/bin/lsof"
+cat > "$T/bin/ps" <<'PS'
+#!/bin/sh
+has_ww=0
+pid=''
+prev=''
+for a in "$@"; do
+  [ "$a" = "-ww" ] && has_ww=1
+  [ "$prev" = "-p" ] && pid=$a
+  prev=$a
+done
+if [ "$has_ww" = 1 ] && [ -n "$pid" ]; then
+  if [ -e "$T/ps-cmd-$pid" ]; then
+    cat "$T/ps-cmd-$pid"
+    exit 0
+  fi
+  if [ -e "$T/ps-cmd" ] && [ -e "$T/lsof-pid" ]; then
+    lpid=$(sed -n 's/^p//p; /^[0-9][0-9]*$/p' "$T/lsof-pid")
+    if [ "$pid" = "$lpid" ]; then
+      cat "$T/ps-cmd"
+      exit 0
+    fi
+  fi
+fi
+exit 1
+PS
+chmod +x "$T/bin/ps"
+
 # run [VAR=value ...] -- <arguments of ocm-run>: the script under test, in the fake world
 run() (
   OPENCODE_AUTH_FILE="$T/no-auth-file"
   OPENCODE_SERVER_PASSWORD=""
   OPENCODE_PASSWORD=""
   export OPENCODE_AUTH_FILE OPENCODE_SERVER_PASSWORD OPENCODE_PASSWORD
-  export T PATH="$T/bin:$PATH" OCM_REMOTE_PORT="$R" OCM_HOST=ocm-test-host-that-does-not-exist OCM_RETRY_SLEEP=0
+  export T PATH="$T/bin:$PATH" OCM_REMOTE_PORT="$R" OCM_HOST=ocm-test-host-that-does-not-exist OCM_RETRY_SLEEP=0 OCM_PROC_ROOT="$T/proc"
   while [ "$1" != "--" ]; do
     case "$1" in
       OCM_HOST=) unset OCM_HOST ;;
@@ -182,7 +247,7 @@ runbg() {
     OPENCODE_SERVER_PASSWORD=""
     OPENCODE_PASSWORD=""
     export OPENCODE_AUTH_FILE OPENCODE_SERVER_PASSWORD OPENCODE_PASSWORD
-    export T PATH="$T/bin:$PATH" OCM_REMOTE_PORT="$R" OCM_HOST=ocm-test-host-that-does-not-exist OCM_RETRY_SLEEP=0
+    export T PATH="$T/bin:$PATH" OCM_REMOTE_PORT="$R" OCM_HOST=ocm-test-host-that-does-not-exist OCM_RETRY_SLEEP=0 OCM_PROC_ROOT="$T/proc"
     while [ "$1" != "--" ]; do
       case "$1" in
         OCM_HOST=) unset OCM_HOST ;;
@@ -196,7 +261,7 @@ runbg() {
   ) &
 }
 busy() { printf '%s\n%s\n' "${3:-busy}" "$2" > "$T/sessions/$1"; }
-clear_all() { rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/auth-required"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; }
+clear_all() { rm -rf "$T/proc"; rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-*; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; }
 
 # --- 0. the guards
 check "guard: the server on the test port is the fake" '[ "$(curl -s -m 3 http://127.0.0.1:$P/__who)" = fake-opencode-server ]'
@@ -272,6 +337,89 @@ check "OCM_HOST empty: a run never touches ssh" '[ ! -s "$T/ssh.log" ]'
 out=$(run OCM_HOST= OCM_REMOTE_PORT=65535 -- --check 2>&1); rc=$?
 check "65535 with OCM_HOST empty is a legal dial port (exit 1 only because nothing listens there)" '[ "$rc" = 1 ] && echo "$out" | grep -q "127.0.0.1:65535" && [ ! -s "$T/ssh.log" ]'
 kill "$SRV2" 2>/dev/null
+
+# --- 1c. --check names who holds the dial port; a forward to another host fails
+clear_all
+out=$(run -- --check 2>&1); rc=$?
+check "holder (a): port held, no lsof answer: exit 0 and 'holder is unknown'" '[ "$rc" = 0 ] && echo "$out" | grep -q "holder is unknown (lsof found no owner it may read)"'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:$P:127.0.0.1:$R ocm-test-host-that-does-not-exist" > "$T/ps-cmd"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (b): an ssh forward to OCM_HOST is fine: exit 0 and names the pid" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242"'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:$P:127.0.0.1:$R m" > "$T/ps-cmd"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (c): a forward to another host fails (1) before any probe" '[ "$rc" = 1 ] && echo "$out" | grep -q "goes to '\''m'\'', not OCM_HOST=" && [ ! -s "$T/http.log" ]'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "/usr/bin/ssh -N -L $P:127.0.0.1:$R m" > "$T/ps-cmd"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (d): /usr/bin/ssh with no bind address in -L to another host fails (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "goes to '\''m'\''"'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "ssh -N -L $P:127.0.0.1:$R someone@ocm-test-host-that-does-not-exist" > "$T/ps-cmd"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (e): user@ prefix on destination is stripped: exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242"'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "ssh -L $P:127.0.0.1:$R m sleep 600" > "$T/ps-cmd"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (f): remote command after destination does not mask destination: exit 1" '[ "$rc" = 1 ] && echo "$out" | grep -q "goes to '\''m'\''"'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "ssh -J jump.example -p 2222 -L $P:127.0.0.1:$R ocm-test-host-that-does-not-exist" > "$T/ps-cmd"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (g): ssh options with arguments (-J, -p) before destination: exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242"'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "python3 server.py" > "$T/ps-cmd"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (h): a non-ssh holder does not fail: exit 0 and 'held by'" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242"'
+clear_all
+printf '4242\n4243\n' > "$T/lsof-pid"
+echo "ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:$P:127.0.0.1:$R ocm-test-host-that-does-not-exist" > "$T/ps-cmd-4242"
+echo "ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:$P:127.0.0.1:$R m" > "$T/ps-cmd-4243"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (i): two pids, one good forward and one to 'm': prints both and exits 1" '[ "$rc" = 1 ] && echo "$out" | grep -q "held by pid 4242" && echo "$out" | grep -q "held by pid 4243" && echo "$out" | grep -q "goes to '\''m'\''"'
+clear_all
+python3 "$T/server.py" "$T" "$R" &
+SRV3=$!
+echo "$SRV3" >> "$T/pids"
+i=0; while ! nc -z 127.0.0.1 "$R" 2>/dev/null; do i=$((i + 1)); [ "$i" -gt 50 ] && { echo "the local server did not start"; exit 1; }; sleep 0.1; done
+echo 4242 > "$T/lsof-pid"
+echo "ssh -f -N -L 127.0.0.1:$R:127.0.0.1:$R m" > "$T/ps-cmd"
+out=$(run OCM_HOST= -- --check 2>&1); rc=$?
+check "holder (j): local mode (OCM_HOST unset) skips the host comparison: exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242" && ! echo "$out" | grep -q "goes to"'
+kill "$SRV3" 2>/dev/null
+clear_all
+printf 'p4241\nn10.0.0.5:%s\np4242\nn127.0.0.1:%s\n' "$P" "$P" > "$T/lsof-pid"
+echo "ssh -f -N -L 10.0.0.5:$P:127.0.0.1:$R m" > "$T/ps-cmd-4241"
+echo "ssh -f -N -L 127.0.0.1:$P:127.0.0.1:$R ocm-test-host-that-does-not-exist" > "$T/ps-cmd-4242"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (k): listener on 10.0.0.5:$P to 'm' is ignored while 127.0.0.1:$P to OCM_HOST passes: exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242" && ! echo "$out" | grep -q "4241"'
+clear_all
+echo 4242 > "$T/lsof-pid"
+mkdir -p "$T/proc/4242"
+printf '%s\0' ssh -o 'ProxyCommand=ssh -W %h:%p jump' -L "$P:127.0.0.1:$R" ocm-test-host-that-does-not-exist > "$T/proc/4242/cmdline"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (l): Linux /proc/<pid>/cmdline with ProxyCommand spaces parses exact args: exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242" && ! echo "$out" | grep -q "could not parse"'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "ssh -o ProxyCommand=ssh -W %h:%p jump -L $P:127.0.0.1:$R ocm-test-host-that-does-not-exist" > "$T/ps-cmd"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (m): ps fallback with ProxyCommand warns could not parse reliably and exits 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "could not parse pid 4242'\''s ssh arguments reliably ('\''jump'\'' vs OCM_HOST='\''ocm-test-host-that-does-not-exist'\''); check it by hand"'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "ssh -N -L $P:127.0.0.1:$R m" > "$T/ps-cmd"
+out=$(run -- --check 2>&1); rc=$?
+check "holder (n): ps fallback with plain mismatch to 'm' still fails (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "goes to '\''m'\'', not OCM_HOST="'
+clear_all
+echo 4242 > "$T/lsof-pid"
+echo "ssh -N -L $P:127.0.0.1:$R ocm-test-host-that-does-not-exist" > "$T/ps-cmd"
+out=$(run OCM_HOST=ssh://ocm-test-host-that-does-not-exist:2222 -- --check 2>&1); rc=$?
+check "holder (o): OCM_HOST=ssh://...:port is normalised like destination: exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "held by pid 4242"'
 
 # --- 2. our own flags never reach opencode
 clear_all

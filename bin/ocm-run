@@ -191,6 +191,140 @@ if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
   }
 fi
 
+# --check only: say who holds the dial port, and refuse when the holder is an ssh
+# forward to some other host (2026-10-18: a stale forward to the old host looked ok).
+if [ "$mode" = check ]; then
+  lsof_out=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fpn 2>/dev/null)
+  hpids=''
+  cur_pid=''
+  old_ifs=${IFS- 	
+}
+  set -f
+  IFS='
+'
+  for line in $lsof_out; do
+    case "$line" in
+      p*)
+        cur_pid=${line#p}
+        ;;
+      n*)
+        addr=${line#n}
+        addr=${addr%:*}
+        case "$addr" in
+          127.0.0.1 | localhost | '*' | '[::1]' | '[::]')
+            if [ -n "$cur_pid" ]; then
+              case " $hpids " in
+                *" $cur_pid "*) ;;
+                *) hpids="${hpids:+$hpids }$cur_pid" ;;
+              esac
+            fi
+            ;;
+        esac
+        ;;
+    esac
+  done
+  IFS=$old_ifs
+  set +f
+  if [ -z "$hpids" ]; then
+    echo "ocm-run: --check: 127.0.0.1:$port is listening; its holder is unknown (lsof found no owner it may read), so its destination was NOT checked against OCM_HOST" >&2
+  else
+    norm_host=$host
+    case "$norm_host" in
+      ssh://*)
+        norm_host=${norm_host#ssh://}
+        norm_host=${norm_host#*@}
+        norm_host=${norm_host%:*}
+        ;;
+      *)
+        norm_host=${norm_host#*@}
+        ;;
+    esac
+    bad_holder=0
+    for hpid in $hpids; do
+      from_proc=0
+      hargs=''
+      cmdline_file="${OCM_PROC_ROOT:-/proc}/$hpid/cmdline"
+      if [ -r "$cmdline_file" ]; then
+        hargs=$(tr '\0' '\n' < "$cmdline_file" 2>/dev/null)
+      fi
+      if [ -n "$hargs" ]; then
+        from_proc=1
+        hcmd=$(printf '%s' "$hargs" | tr '\n' ' ')
+        hcmd=${hcmd% }
+      else
+        hcmd=$(ps -ww -o command= -p "$hpid" 2>/dev/null)
+      fi
+      echo "ocm-run: --check: 127.0.0.1:$port is held by pid $hpid: $hcmd" >&2
+      if [ -n "$host" ] && [ -n "$hcmd" ]; then
+        set -f
+        first=''
+        dest=''
+        skip=0
+        if [ "$from_proc" = 1 ]; then
+          IFS='
+'
+          hwords=$hargs
+        else
+          hwords=$hcmd
+        fi
+        for w in $hwords; do
+          if [ -z "$first" ]; then
+            first=${w##*/}
+            [ "$first" = ssh ] || break
+            continue
+          fi
+          if [ "$skip" = 1 ]; then
+            skip=0
+            continue
+          fi
+          case "$w" in
+            -[BbcDEeFIiJLlmOopQRSWw])
+              skip=1
+              ;;
+            -[BbcDEeFIiJLlmOopQRSWw]* | -*)
+              ;;
+            *)
+              dest=$w
+              break
+              ;;
+          esac
+        done
+        IFS=$old_ifs
+        set +f
+        if [ "$first" = ssh ] && [ -n "$dest" ]; then
+          case "$dest" in
+            ssh://*)
+              dest=${dest#ssh://}
+              dest=${dest#*@}
+              dest=${dest%:*}
+              ;;
+            *)
+              dest=${dest#*@}
+              ;;
+          esac
+          if [ "$dest" != "$norm_host" ]; then
+            if [ "$from_proc" = 0 ]; then
+              case "$hcmd" in
+                *ProxyCommand* | *RemoteCommand* | *"'"* | *'"'*)
+                  echo "ocm-run: --check: could not parse pid $hpid's ssh arguments reliably ('$dest' vs OCM_HOST='$host'); check it by hand" >&2
+                  ;;
+                *)
+                  echo "ocm-run: --check: the forward on 127.0.0.1:$port goes to '$dest', not OCM_HOST='$host'; close it (kill $hpid) and run again" >&2
+                  bad_holder=1
+                  ;;
+              esac
+            else
+              echo "ocm-run: --check: the forward on 127.0.0.1:$port goes to '$dest', not OCM_HOST='$host'; close it (kill $hpid) and run again" >&2
+              bad_holder=1
+            fi
+          fi
+        fi
+      fi
+    done
+    [ "$bad_holder" = 1 ] && exit 1
+  fi
+fi
+
 probe=$(ocm_curl -s -m 5 -w '\n%{http_code}:%{content_type}' "$url/api/info") || {
   echo "ocm-run: could not reach opencode server at $url (remote port $remote${host:+ on $host})" >&2
   exit 1

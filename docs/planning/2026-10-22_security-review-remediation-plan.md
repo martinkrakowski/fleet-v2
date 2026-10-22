@@ -16,8 +16,8 @@
 
 ## 1. Goal
 
-Close the four blockers and twenty majors of the 2026-10-22 review in sixteen lanes of about 45
-minutes each, ordered so that the gate that checks every later lane's diff is fixed first, the
+Close the four blockers and twenty majors of the 2026-10-22 review in twenty-two lanes of about
+45 minutes each (§4; L15b runs only if D6 chooses wiring), ordered so that the gate that checks every later lane's diff is fixed first, the
 dispatch kernel second, and the supplier contexts, roots, web and deployment after. Minors ride
 with the lane that owns their file; those with no owning lane are listed in §6 for a later wave.
 

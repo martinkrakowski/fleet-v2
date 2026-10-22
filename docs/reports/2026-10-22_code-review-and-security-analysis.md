@@ -8,7 +8,7 @@ Method: the project gates were run locally; six delegated read-only sweeps (shel
 
 The codebase is disciplined where it matters most: no shell interpolation, allow-listed subprocess environments, Ed25519 decisions over canonical bytes, a bearer-token API that fails closed when unconfigured, atomic locked JSON stores in most repositories, and a web UI whose twelve mutating buttons all go through the confirmation box. The gates are green on CI.
 
-Four blockers remain, all on the paths that matter most (dispatch, lane diff gate, knowledge shelf), and the dispatch blocker is the same H3 the 2026-10-15 review named. Seventeen majors follow. Several of the 2026-10-15 findings are fixed (API auth S1, ssh host validation S3, grant scope at consumption H7, GET reconcile M9, file locks for most repositories H4); H3, the independence check (H1 in a new shape), the unchecked brief digest (M3) and branch protection (O1) are still open.
+Four blockers remain, all on the paths that matter most (dispatch, lane diff gate, knowledge shelf), and the dispatch blocker is the same H3 the 2026-10-15 review named. Twenty majors follow. Several of the 2026-10-15 findings are fixed (API auth S1, ssh host validation S3, grant scope at consumption H7, GET reconcile M9, file locks for most repositories H4); H3, the independence check (H1 in a new shape), the unchecked brief digest (M3) and branch protection (O1) are still open.
 
 ## Gates (local, macOS, Node 25.2.0)
 
@@ -88,7 +88,7 @@ M20. `apps/web/src/app/brief/page.tsx:12-19, 57`. A fresh freeze shows a digest 
 
 ## Operations
 
-O1. `main` on GitHub has no branch protection (404) and no rulesets (0); the repository is public; `gate.yml` runs on PRs but nothing requires it. Verified with `gh api` today. Still open since 2026-10-15. Owner decision: enable a ruleset requiring the gate and a review before merge.
+O1. `main` on GitHub had no branch protection (404) and no rulesets (0) when this snapshot was taken (2026-10-22, about 16:00 UTC, `gh api`); the repository is public; `gate.yml` ran on PRs but nothing required it. Open since 2026-10-15. **Closed the same day:** on the owner's "yes", ruleset 25655899 (pull request required, `gate` required, review threads resolved, no force push, no deletion, no bypass) was applied at 16:24 UTC; the remediation plan's D1 records it.
 
 O2. `yarn npm audit`: 4 high, 6 moderate, all transitive. postcss 8.4.31 via next 15.5.27 (three advisories: sourceMappingURL file read, one XSS); braces 3.0.3 via micromatch (ReDoS); node-forge 1.4.0 via listhen (PKCS#1 verification); @vitest/mocker (dev); eslint 9.39.5 end of life; glob 10.5.0 via archiver-utils. None is reachable from a request path today (postcss runs at build time; node-forge only in the dev listener). Fix: bump next and eslint, add resolutions for braces and glob.
 
@@ -125,7 +125,7 @@ Subprocess hygiene is consistent: argument arrays, no shell, allow-listed enviro
 ## Status of the 2026-10-15 review
 
 Fixed: S1 (API auth, origin, content type), S3 (ssh host validation), H7 (grant scope at consumption), M9 (GET no longer reconciles), H4 for most repositories (locked atomic file stores; the attempt repository still lacks a revision check, M10), H6 in part (branch validated, `-R` present; force push remains).
-Open: H3 (B1 here), the independence check (M8, new shape), M3 brief digest (M9 here), O1 branch protection.
+Open: H3 (B1 here), the independence check (M8, new shape), M3 brief digest (M9 here). O1 branch protection: closed on 2026-10-22 after this snapshot (see O1).
 
 ## Needs the owner's decision
 

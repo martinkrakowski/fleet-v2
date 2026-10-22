@@ -106,7 +106,8 @@ jobs:
           cosign attest --yes --new-bundle-format=false --use-signing-config=false --type spdxjson \
             --predicate "$RUNNER_TEMP/sbom.spdx.json" "$IMAGE@$DIGEST"
       - name: Record the digest for the promotion pull request
-        run: echo "Promote with a platform pull request (apps/staging/fleet-v2): \`$IMAGE@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          echo "Promote with a platform pull request (apps/staging/fleet-v2): \`$IMAGE@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
       - name: Log out and clean up
         if: always()
         run: |

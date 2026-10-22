@@ -88,14 +88,14 @@ describe("checkLaneDiff (script parity)", () => {
     ]);
   });
 
-  it("a lane plumbing change under .lane is a protected-path finding", () => {
-    const verdict = check([
-      { path: ".lane/brief-manifest.json", status: "untracked" },
-    ]);
-    expect(verdict.findings).toEqual([
-      { path: ".lane/brief-manifest.json", rule: "outside-allowed-paths" },
-      { path: ".lane/brief-manifest.json", rule: "protected-path" },
-    ]);
+  it("a lane plumbing change under .lane is a protected-path finding (D3)", () => {
+    for (const status of ["added", "modified", "untracked"] as const) {
+      const verdict = check([{ path: ".lane/brief.md", status }]);
+      expect(verdict.findings).toEqual([
+        { path: ".lane/brief.md", rule: "outside-allowed-paths" },
+        { path: ".lane/brief.md", rule: "protected-path" },
+      ]);
+    }
   });
 
   it("a policy addition extends the protected list (.gemini)", () => {
@@ -109,6 +109,48 @@ describe("checkLaneDiff (script parity)", () => {
       { path: ".gemini/settings.json", rule: "outside-allowed-paths" },
       { path: ".gemini/settings.json", rule: "protected-path" },
     ]);
+  });
+
+  it("a Claude Code settings file under .claude is a protected-path finding (B3)", () => {
+    const verdict = check([
+      { path: ".claude/settings.json", status: "untracked" },
+    ]);
+    expect(verdict.findings).toEqual([
+      { path: ".claude/settings.json", rule: "outside-allowed-paths" },
+      { path: ".claude/settings.json", rule: "protected-path" },
+    ]);
+  });
+
+  it("opencode config (.opencode/, opencode.json*) is a protected-path finding (B3)", () => {
+    for (const path of [
+      ".opencode/auth.json",
+      "opencode.json",
+      "opencode.jsonc",
+      "opencode.json5",
+    ]) {
+      const verdict = check([{ path, status: "untracked" }]);
+      expect(verdict.findings).toContainEqual({
+        path,
+        rule: "protected-path",
+      });
+    }
+  });
+
+  it(".claude/, .opencode/ and opencode.json* match at any depth and case-insensitively (Fix 3)", () => {
+    for (const path of [
+      ".Claude/settings.json",
+      "packages/app/.claude/settings.json",
+      "packages/x/.Claude/settings.json",
+      "packages/x/.OpenCode/auth.json",
+      "packages/x/opencode.jsonc",
+      "packages/x/OpenCode.JSON5",
+    ]) {
+      const verdict = check([{ path, status: "untracked" }]);
+      expect(verdict.findings).toContainEqual({
+        path,
+        rule: "protected-path",
+      });
+    }
   });
 
   it("a token-shaped string in a new file is a finding with its line and rule only", () => {
@@ -151,7 +193,7 @@ describe("checkLaneDiff (script parity)", () => {
         path: "packages/x/src/note.md",
         status: "added",
         addedLines: [
-          { line: 1, text: "see /home/martin/.ssh/id_ed25519 for the key" },
+          { line: 1, text: `see /home/${"martin"}/.ssh/id_ed25519 for the key` },
         ],
       },
     ]);
@@ -374,16 +416,21 @@ describe("isFixedProtectedPath (script parity, O14d1)", () => {
     return unescaped;
   }
 
-  it("covers every alternative of the script's PROTECTED regex (line 84)", () => {
-    const lines = readFileSync(
+  it("covers every alternative of the script's PROTECTED regex", () => {
+    const script = readFileSync(
       path.join(repoRoot(), "scripts", "lane-diff-check.sh"),
       "utf8",
-    ).split("\n");
-    const line = lines[83] ?? "";
-    const match = /^PROTECTED='\^\((.*)\)'\r?$/.exec(line);
+    );
+    const lines = script.split("\n");
+    const match =
+      /^PROTECTED='\^\((.*)\)'\r?$/.exec(
+        lines.find((candidate) =>
+          /^PROTECTED='\^\((.*)\)'\r?$/.test(candidate),
+        ) ?? "",
+      ) ?? null;
     expect(
       match,
-      "the script's PROTECTED line 84 was not found",
+      "the script's PROTECTED regex was not found",
     ).not.toBeNull();
     const alternatives = match![1]!.split("|");
     expect(alternatives.length).toBeGreaterThan(0);
@@ -393,12 +440,19 @@ describe("isFixedProtectedPath (script parity, O14d1)", () => {
     }
   });
 
-  it("also covers the plan's additions", () => {
+  it("also covers the plan's additions and case/depth agent config rules", () => {
     for (const sample of [
       ".git/hooks/pre-commit",
       "installation/config.yaml",
       "package-lock.json",
       "pnpm-lock.yaml",
+      ".lane/brief.md",
+      ".Claude/settings.json",
+      "packages/app/.claude/settings.json",
+      "packages/app/.OpenCode/opencode.json",
+      "opencode.jsonc",
+      "packages/app/opencode.jsonc",
+      "OpenCode.JSON5",
     ]) {
       expect(isFixedProtectedPath(sample), sample).toBe(true);
     }

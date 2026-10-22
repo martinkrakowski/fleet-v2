@@ -57,10 +57,19 @@ export interface LaneDiffVerdict {
 }
 
 /**
- * The fixed protected paths: lane plumbing, GitHub workflows, the lane's own
- * brief directory, the installation tree and lockfiles. The list mirrors
- * `scripts/lane-diff-check.sh`'s PROTECTED regex (line 84) plus the plan's
+ * The fixed protected paths: lane plumbing, GitHub workflows, agent and
+ * permission configuration (Claude Code `.claude/`, opencode `.opencode/`
+ * and `opencode.json*`, matched at any depth and case-insensitively), the
+ * lane's own brief directory, the installation tree and lockfiles. The list
+ * mirrors `scripts/lane-diff-check.sh`'s PROTECTED regex plus the plan's
  * `.git/`, `installation/`, `package-lock.json` and `pnpm-lock.yaml`.
+ *
+ * Decision D3 (plan §3): the brief's integrity is checked by digest at
+ * dispatch (lane L7a). In `scripts/lane-diff-check.sh`, an ignored `.lane/`
+ * file is skipped (it is where the brief lives in every worktree), but a
+ * `.lane/` path that is tracked or committed in the diff is a `protected`
+ * finding; this TypeScript mirror keeps `.lane` protected for diff paths, so
+ * both agree.
  */
 const FIXED_PROTECTED_PREFIXES: readonly string[] = [
   ".git",
@@ -69,6 +78,8 @@ const FIXED_PROTECTED_PREFIXES: readonly string[] = [
   ".agents",
   ".agy",
   ".lane",
+  ".claude",
+  ".opencode",
   "bin",
   "scripts",
   ".architecture",
@@ -99,6 +110,20 @@ const FIXED_PROTECTED_ROOT_FILES: readonly string[] = [
   "Dockerfile",
 ];
 
+/**
+ * `.claude/`, `.opencode/` and `opencode.json*` match at any depth and
+ * case-insensitively (macOS volumes are case-insensitive), mirroring
+ * `PROTECTED_AGENT_CONFIG` with `grep -i` in `scripts/lane-diff-check.sh`.
+ */
+function isAgentConfigProtectedPath(path: string): boolean {
+  const segments = path.toLowerCase().split("/");
+  const dirSegments = segments.slice(0, -1);
+  if (dirSegments.includes(".claude") || dirSegments.includes(".opencode")) {
+    return true;
+  }
+  return segments.some((segment) => segment.startsWith("opencode.json"));
+}
+
 /** Strip trailing slashes so a prefix compares as a path segment. */
 function normalizePrefix(prefix: string): string {
   let normalized = prefix.trim();
@@ -122,15 +147,21 @@ export function pathUnderPrefix(path: string, prefix: string): boolean {
  * (`.github`, `.lane`, …). A prefixes list that never mentions them keeps
  * them protected — a broad prefix like `packages/x` never lifts the rule.
  * A protected file (lockfile, `package.json`, `.gitattributes`,
- * `.gitmodules`) inside a lifted directory stays protected unless a prefix
- * names it exactly: lifting `scripts` does not lift `scripts/package.json`.
+ * `.gitmodules`, or nested agent config) inside a lifted directory stays
+ * protected unless a prefix names it exactly: lifting `scripts` does not
+ * lift `scripts/package.json` or `scripts/.claude/settings.json`.
  */
 function prefixExplicitlyAllowsProtected(
   path: string,
   prefixes: readonly string[],
 ): boolean {
   const top = path.split("/")[0];
-  const isProtectedFile = FIXED_PROTECTED_FILES.includes(basename(path));
+  const isNestedOrFileAgentConfig =
+    isAgentConfigProtectedPath(path) &&
+    top !== ".claude" &&
+    top !== ".opencode";
+  const isProtectedFile =
+    FIXED_PROTECTED_FILES.includes(basename(path)) || isNestedOrFileAgentConfig;
   return prefixes.some((prefix) => {
     const normalized = normalizePrefix(prefix);
     return (
@@ -150,12 +181,15 @@ function basename(path: string): string {
 /**
  * The fixed protected rule, matching the reference script's PROTECTED regex
  * plus the plan's additions. Exported for the parity test that reads the
- * script's line 84 and checks every alternative is covered here.
+ * script's regex and checks every alternative is covered here.
  */
 export function isFixedProtectedPath(path: string): boolean {
   if (FIXED_PROTECTED_FILES.includes(basename(path))) return true;
   if (FIXED_PROTECTED_ROOT_FILES.includes(path)) return true;
-  if (path.startsWith(".yarnrc") || path.startsWith(".pnp.")) return true;
+  if (isAgentConfigProtectedPath(path)) return true;
+  if (path.startsWith(".yarnrc") || path.startsWith(".pnp.")) {
+    return true;
+  }
   return FIXED_PROTECTED_PREFIXES.some((prefix) =>
     path.startsWith(`${prefix}/`),
   );

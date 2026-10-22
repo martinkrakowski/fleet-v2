@@ -191,6 +191,37 @@ if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
   }
 fi
 
+# --check only: say who holds the dial port, and refuse when the holder is an ssh
+# forward to some other host (2026-10-18: a stale forward to the old host looked ok).
+if [ "$mode" = check ]; then
+  hpid=$(lsof -nP -iTCP@127.0.0.1:"$port" -sTCP:LISTEN -t 2>/dev/null | head -n 1)
+  if [ -z "$hpid" ]; then
+    echo "ocm-run: --check: 127.0.0.1:$port is listening; its holder is unknown (lsof found no owner)" >&2
+  else
+    hcmd=$(ps -o command= -p "$hpid" 2>/dev/null)
+    echo "ocm-run: --check: 127.0.0.1:$port is held by pid $hpid: $hcmd" >&2
+    if [ -n "$host" ] && [ -n "$hcmd" ]; then
+      first=${hcmd%% *}
+      case "$first" in
+        *ssh) ;;
+        *) first='' ;;
+      esac
+      if [ -n "$first" ]; then
+        case "$hcmd" in
+          *"-L 127.0.0.1:$port:"* | *"-L127.0.0.1:$port:"*)
+            dest=''
+            for w in $hcmd; do dest=$w; done
+            if [ "$dest" != "$host" ]; then
+              echo "ocm-run: --check: the forward on 127.0.0.1:$port goes to '$dest', not OCM_HOST='$host'; close it (kill $hpid) and run again" >&2
+              exit 1
+            fi
+            ;;
+        esac
+      fi
+    fi
+  fi
+fi
+
 probe=$(ocm_curl -s -m 5 -w '\n%{http_code}:%{content_type}' "$url/api/info") || {
   echo "ocm-run: could not reach opencode server at $url (remote port $remote${host:+ on $host})" >&2
   exit 1

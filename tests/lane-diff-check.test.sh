@@ -326,6 +326,18 @@ check '.claude/dist/x is still a protected finding (L1b)' 'grep -q "^protected: 
 rm -rf .agents/node_modules .claude/dist
 cp "$T/gitignore.bak" .gitignore
 
+echo '# L1b item 5: git config filter drivers are reported and neutralised'
+git config filter.evil.clean "touch $T/evil-ran"
+git config filter.evil.smudge "touch $T/evil-ran-smudge"
+git config filter.evil.process "touch $T/evil-ran-process"
+echo 'x' > packages/x/src/e.ts
+run "$R" --base base
+check 'a non-lfs git config filter driver is a finding (L1b)' '[ "$(rc)" = 1 ] && grep -q "^git-config-filter: evil$" "$T/o"'
+check 'the gate never ran the lane-set filter driver (L1b)' '[ ! -e "$T/evil-ran" ] && [ ! -e "$T/evil-ran-smudge" ] && [ ! -e "$T/evil-ran-process" ]'
+git config --unset filter.evil.clean
+git config --unset filter.evil.smudge
+git config --unset filter.evil.process
+rm -f packages/x/src/e.ts
 
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"

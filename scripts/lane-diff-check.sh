@@ -12,7 +12,9 @@
 #      protected finding while dependency/build output and the worktree's ignored .lane/ stay out of
 #      the review. Decision D3 (plan §3): an ignored .lane/ file is skipped because the brief lives
 #      there in every worktree, but a .lane/ path that is tracked or committed in the diff is a
-#      protected finding.
+#      protected finding. Filter drivers in the shared .git/config other than lfs are reported as
+#      git-config-filter and neutralised before the first diff, so the gate never runs a
+#      lane-chosen filter.
 #   2. Does any changed, untracked or reviewed ignored file contain something that looks like a
 #      credential? Reported as file:line and the pattern's name only. The content is never printed.
 #      A file containing a NUL byte is still scanned, a file over 5 MiB is reported as
@@ -128,12 +130,37 @@ DEP_BUILD_SKIP='(^|/)(node_modules|dist|\.next|\.turbo|\.output|coverage)/|^\.ya
 IGNORED_SKIP="$DEP_BUILD_SKIP|^\.lane(/|$)"
 # The same pins as LaneDiffCheckAdapter's GIT_CONFIG_ARGS: a lane can write the shared .git/config,
 # and the gate's own git calls must never run a lane-chosen fsmonitor, hook, external diff or
-# filter (Fable review of L1).
+# filter (Fable review of L1). Any non-lfs filter driver found in the shared config is appended to
+# FILTER_ARGS below, before the first diff, so the gate never runs a lane-chosen filter.
+FILTER_ARGS=''
 g() {
   git -c color.ui=never -c core.quotePath=false -c core.fsmonitor=false -c core.hooksPath=/dev/null \
     -c core.attributesFile=/dev/null -c diff.external= -c diff.noprefix=false \
-    -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.process= "$@"
+    -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.process= $FILTER_ARGS "$@"
 }
+
+# Filter drivers in the shared git config: read with the pinned g(), never a plain git. Collect
+# every non-lfs clean/smudge/process driver (a lane can write .git/config); they are reported after
+# collection and neutralised here for every git call that follows.
+drivers=$(g config --get-regexp '^filter\..*\.(clean|smudge|process)$' 2>/dev/null || true)
+FILTER_LIST=''
+if [ -n "$drivers" ]; then
+  oldIFS=$IFS; IFS='
+'
+  set -- $drivers
+  IFS=$oldIFS
+  for cfg in "$@"; do
+    key=${cfg%% *}
+    driver=${key#filter.}
+    case "$driver" in *.clean|*.smudge|*.process) driver=${driver%.*} ;; esac
+    [ -n "$driver" ] && [ "$driver" != lfs ] || continue
+    case "$FILTER_LIST" in *"|$driver|"*) ;; *) FILTER_LIST="$FILTER_LIST|$driver|" ;; esac
+  done
+  for d in $(printf '%s' "$FILTER_LIST" | tr '|' ' '); do
+    [ -n "$d" ] || continue
+    FILTER_ARGS="$FILTER_ARGS -c filter.$d.clean= -c filter.$d.smudge= -c filter.$d.process="
+  done
+fi
 collect() {
   if git rev-parse --verify -q HEAD >/dev/null; then
     if [ -n "$base" ]; then
@@ -203,6 +230,14 @@ while IFS= read -r f; do
     findings=$((findings + 1))
   fi
 done < "$T/protected-candidates"
+
+# Report non-lfs filter drivers found in the shared git config; their neutralisation was applied to
+# every git call above, before any diff ran them.
+for d in $(printf '%s' "$FILTER_LIST" | tr '|' ' '); do
+  [ -n "$d" ] || continue
+  say "git-config-filter: $d"
+  findings=$((findings + 1))
+done
 
 # name|extended regex. Names are what the report prints; the matched text never is.
 cat > "$T/patterns" <<'PAT'

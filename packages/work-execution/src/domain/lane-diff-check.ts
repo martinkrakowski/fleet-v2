@@ -133,6 +133,23 @@ export const PROTECTED_PATH_RULES: readonly LaneDiffProtectedRule[] = [
   { pattern: "\\.gitmodules", anyDepth: true, caseInsensitive: true },
   // Name prefixes at any depth.
   { pattern: "opencode\\.json*", anyDepth: true, caseInsensitive: true },
+  // Host-tool loaders added after Fable's review of #149.
+  { pattern: "\\.devcontainer/", anyDepth: true, caseInsensitive: true },
+  { pattern: "mise\\.toml", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.mise\\.toml", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.mise/", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.tool-versions", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.windsurf/", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.clinerules*", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.roo/", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.aider\\.conf\\.yml", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.idea/", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.zed/", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.dir-locals\\.el", anyDepth: true, caseInsensitive: true },
+  { pattern: "\\.yarn/sdks/", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.claude-plugin/", anyDepth: true, caseInsensitive: true },
+  { pattern: "pnpm-workspace\\.yaml", anyDepth: false, caseInsensitive: true },
+  { pattern: "\\.pnpmfile\\.cjs", anyDepth: true, caseInsensitive: true },
 ];
 
 type LaneDiffProtectedRuleKind = "dir" | "prefix" | "file";

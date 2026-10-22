@@ -396,6 +396,22 @@ else
   check 'the unsafe filter driver fixture was created (L1b re-review)' 'false'
 fi
 
+# Fable review of #149: the table loader fails closed, and --rules lets a trusted copy run.
+good="$(dirname "$SCRIPT")/lane-diff-check.protected"
+sed 's/^\(\\\.github\/\)	0	1$/\1 0 1/' "$good" > "$T/rules-space"
+run "$R" --base base --rules "$T/rules-space"
+check 'a rule row with spaces instead of tabs fails closed (2)' '[ "$(rc)" = 2 ] && grep -q "malformed rule row" "$T/e"'
+{ cat "$good"; printf '(unclosed\t1\t1\n'; } > "$T/rules-bad-ere"
+run "$R" --base base --rules "$T/rules-bad-ere"
+check 'an invalid pattern in the table fails closed (2)' '[ "$(rc)" = 2 ] && grep -q "not a valid pattern" "$T/e"'
+grep '^#' "$good" > "$T/rules-empty"; printf '\\.github/\t0\t1\n' >> "$T/rules-empty"
+run "$R" --base base --rules "$T/rules-empty"
+check 'a table with too few rules fails closed (2)' '[ "$(rc)" = 2 ] && grep -q "expected at least 40" "$T/e"'
+mkdir -p .devcontainer && printf '{}\n' > .devcontainer/devcontainer.json
+"$RUNSH" -s "$R" --base base --rules "$good" < "$SCRIPT" > "$T/o" 2> "$T/e"; echo $? > "$T/rc"
+check 'piped with --rules, the trusted table loads and .devcontainer/ is protected' '[ "$(rc)" = 1 ] && grep -q "^protected: .devcontainer/devcontainer.json$" "$T/o"'
+rm -rf .devcontainer
+
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"
 [ "$fails" = 0 ]

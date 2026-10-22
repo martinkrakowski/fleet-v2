@@ -49,3 +49,20 @@ GEMINI\.md	1	1
 \.gitattributes	1	1
 \.gitmodules	1	1
 opencode\.json*	1	1
+# Host-tool loaders added after Fable's review of #149 (devcontainers, version managers, more agent and editor configs).
+\.devcontainer/	1	1
+mise\.toml	1	1
+\.mise\.toml	1	1
+\.mise/	1	1
+\.tool-versions	1	1
+\.windsurf/	1	1
+\.clinerules*	1	1
+\.roo/	1	1
+\.aider\.conf\.yml	1	1
+\.idea/	1	1
+\.zed/	1	1
+\.dir-locals\.el	1	1
+\.yarn/sdks/	0	1
+\.claude-plugin/	1	1
+pnpm-workspace\.yaml	0	1
+\.pnpmfile\.cjs	1	1

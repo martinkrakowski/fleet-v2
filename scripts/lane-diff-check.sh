@@ -39,13 +39,45 @@ LC_ALL=C; export LC_ALL; unset LANGUAGE 2>/dev/null || true
 # exempted under a node_modules/ directory (dependency manifests); every other rule still
 # applies under node_modules/, so node_modules/AGENTS.md, node_modules/x/.yarnrc and
 # .agents/node_modules/x stay protected (L1b items 1-3, fix-1).
+
+wt=''
+base=''
+brief=''
+strict=0
+allow=''
+quiet=0
+rules=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --base) [ "$#" -ge 2 ] || { echo "lane-diff-check: --base needs a value" >&2; exit 2; }; base=$2; shift ;;
+    --brief) [ "$#" -ge 2 ] || { echo "lane-diff-check: --brief needs a value" >&2; exit 2; }; brief=$2; shift ;;
+    --strict-brief) strict=1 ;;
+    --allow-protected) [ "$#" -ge 2 ] || { echo "lane-diff-check: --allow-protected needs a value" >&2; exit 2; }; allow=$2; shift ;;
+    --quiet) quiet=1 ;;
+    --rules) [ "$#" -ge 2 ] || { echo "lane-diff-check: --rules needs a value" >&2; exit 2; }; rules=$2; shift ;;
+    -h | --help) sed -n '2,25p' "$0"; exit 0 ;;
+    -*) echo "lane-diff-check: unknown option $1" >&2; exit 2 ;;
+    *) [ -z "$wt" ] || { echo "lane-diff-check: one worktree at a time" >&2; exit 2; }; wt=$1 ;;
+  esac
+  shift
+done
 self_dir=$(CDPATH= cd -P "$(dirname "$0")" 2>/dev/null && pwd) || exit 2
-RULE_FILE="$self_dir/lane-diff-check.protected"
+# --rules names the table explicitly: the trusted copy, when this script is piped (sh -s) or run
+# from a trusted checkout against a lane worktree (Fable review of #149).
+RULE_FILE=${rules:-$self_dir/lane-diff-check.protected}
 [ -f "$RULE_FILE" ] || { echo "lane-diff-check: missing $RULE_FILE" >&2; exit 2; }
 
 ROOT_CI=''; ANY_CI=''; NM_EXEMPT_CI=''
+CR=$(printf '\r')
+rules_n=0
 while IFS='	' read -r pat any _ci; do
   case "$pat" in '' | \#*) continue ;; esac
+  # Fail closed on a malformed row: a space instead of a tab, a missing or extra field, or a flag
+  # that is not 0/1 must never silently weaken a rule (Fable review of #149).
+  _ci=${_ci%"$CR"}
+  case "$pat" in *[[:space:]]*) echo "lane-diff-check: malformed rule row in $RULE_FILE" >&2; exit 2 ;; esac
+  case "$any:$_ci" in 0:1 | 1:1 | 0:0 | 1:0) ;; *) echo "lane-diff-check: malformed rule row in $RULE_FILE" >&2; exit 2 ;; esac
+  rules_n=$((rules_n + 1))
   case "$pat" in
     */) kind=dir; body=${pat%/} ;;
     *\*) kind=pre; body=${pat%\*} ;;
@@ -64,27 +96,15 @@ while IFS='	' read -r pat any _ci; do
     ROOT_CI="${ROOT_CI:+$ROOT_CI|}$a"
   fi
 done < "$RULE_FILE"
-
-wt=''
-base=''
-brief=''
-strict=0
-allow=''
-quiet=0
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --base) [ "$#" -ge 2 ] || { echo "lane-diff-check: --base needs a value" >&2; exit 2; }; base=$2; shift ;;
-    --brief) [ "$#" -ge 2 ] || { echo "lane-diff-check: --brief needs a value" >&2; exit 2; }; brief=$2; shift ;;
-    --strict-brief) strict=1 ;;
-    --allow-protected) [ "$#" -ge 2 ] || { echo "lane-diff-check: --allow-protected needs a value" >&2; exit 2; }; allow=$2; shift ;;
-    --quiet) quiet=1 ;;
-    -h | --help) sed -n '2,25p' "$0"; exit 0 ;;
-    -*) echo "lane-diff-check: unknown option $1" >&2; exit 2 ;;
-    *) [ -z "$wt" ] || { echo "lane-diff-check: one worktree at a time" >&2; exit 2; }; wt=$1 ;;
-  esac
-  shift
+# Fail closed on a table that loaded too few rules, or a pattern grep cannot compile (exit 2 from
+# grep would otherwise read as "no match").
+[ "$rules_n" -ge 40 ] || { echo "lane-diff-check: $RULE_FILE has $rules_n rules (expected at least 40)" >&2; exit 2; }
+for re in "$ROOT_CI" "$ANY_CI" "$NM_EXEMPT_CI"; do
+  [ -n "$re" ] || continue
+  printf 'x\n' | grep -Eiq -- "$re"
+  [ "$?" -ne 2 ] || { echo "lane-diff-check: a rule in $RULE_FILE is not a valid pattern" >&2; exit 2; }
 done
-[ -n "$wt" ] || { echo "usage: lane-diff-check.sh <worktree> [--base <ref>] [--brief <file>] [--strict-brief] [--allow-protected <regex>] [--quiet]" >&2; exit 2; }
+[ -n "$wt" ] || { echo "usage: lane-diff-check.sh <worktree> [--base <ref>] [--brief <file>] [--strict-brief] [--allow-protected <regex>] [--quiet] [--rules <table>]" >&2; exit 2; }
 [ -d "$wt" ] || { echo "lane-diff-check: $wt is not a directory" >&2; exit 2; }
 cd "$wt" || exit 2
 git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "lane-diff-check: $wt is not a git worktree" >&2; exit 2; }

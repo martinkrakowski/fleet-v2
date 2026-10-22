@@ -57,10 +57,12 @@ export interface LaneDiffVerdict {
 }
 
 /**
- * The fixed protected paths: lane plumbing, GitHub workflows, the lane's own
- * brief directory, the installation tree and lockfiles. The list mirrors
- * `scripts/lane-diff-check.sh`'s PROTECTED regex (line 84) plus the plan's
- * `.git/`, `installation/`, `package-lock.json` and `pnpm-lock.yaml`.
+ * The fixed protected paths: lane plumbing, GitHub workflows, agent and
+ * permission configuration (Claude Code `.claude/`, opencode `.opencode/`
+ * and `opencode.json*`), the lane's own brief directory, the installation
+ * tree and lockfiles. The list mirrors `scripts/lane-diff-check.sh`'s
+ * PROTECTED regex plus the plan's `.git/`, `installation/`,
+ * `package-lock.json` and `pnpm-lock.yaml`.
  */
 const FIXED_PROTECTED_PREFIXES: readonly string[] = [
   ".git",
@@ -69,6 +71,8 @@ const FIXED_PROTECTED_PREFIXES: readonly string[] = [
   ".agents",
   ".agy",
   ".lane",
+  ".claude",
+  ".opencode",
   "bin",
   "scripts",
   ".architecture",
@@ -150,12 +154,18 @@ function basename(path: string): string {
 /**
  * The fixed protected rule, matching the reference script's PROTECTED regex
  * plus the plan's additions. Exported for the parity test that reads the
- * script's line 84 and checks every alternative is covered here.
+ * script's regex and checks every alternative is covered here.
  */
 export function isFixedProtectedPath(path: string): boolean {
   if (FIXED_PROTECTED_FILES.includes(basename(path))) return true;
   if (FIXED_PROTECTED_ROOT_FILES.includes(path)) return true;
-  if (path.startsWith(".yarnrc") || path.startsWith(".pnp.")) return true;
+  if (
+    path.startsWith(".yarnrc") ||
+    path.startsWith(".pnp.") ||
+    path.startsWith("opencode.json")
+  ) {
+    return true;
+  }
   return FIXED_PROTECTED_PREFIXES.some((prefix) =>
     path.startsWith(`${prefix}/`),
   );

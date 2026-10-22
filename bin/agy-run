@@ -246,7 +246,8 @@ if [ "$mode" != run ]; then
       ;;
     abort)
       abort_wait=${AGY_RUN_ABORT_WAIT:-10}
-      case "$abort_wait" in '' | *[!0-9]*) echo "agy-run: AGY_RUN_ABORT_WAIT must be whole seconds" >&2; exit 2 ;; esac
+      # 1-999 seconds, no leading zero: dash reads 08 and 09 as illegal octal in [ -lt ].
+      case "$abort_wait" in [1-9] | [1-9][0-9] | [1-9][0-9][0-9]) ;; *) echo "agy-run: AGY_RUN_ABORT_WAIT must be whole seconds, 1 to 999" >&2; exit 2 ;; esac
       pid=$(lane_running) || {
         echo "agy-run: refusing to abort in $dir: start time of pid $pid is unreadable; check pid $pid by hand" >&2
         exit 1
@@ -264,7 +265,7 @@ if [ "$mode" != run ]; then
         }
         if [ -z "$pid" ]; then
           rm -f "$lock"
-          echo "agy-run: nothing is running in $dir"
+          echo "agy-run: the lane in $dir stopped"
           exit 0
         fi
         pid=''
@@ -278,7 +279,7 @@ if [ "$mode" != run ]; then
       }
       if [ -z "$pid" ]; then
         rm -f "$lock"
-        echo "agy-run: nothing is running in $dir"
+        echo "agy-run: the lane in $dir stopped"
         exit 0
       fi
       kill -KILL "$pid" 2>/dev/null
@@ -391,9 +392,12 @@ else
   ( cd "$dir" && exec "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
 fi
 child=$!
+# $child is this script's own child and is not reaped until `wait` below, so its pid cannot be
+# recycled during these retries. The kill -0 guard stops early if it has already exited, so a
+# start time is only ever read for the process just launched.
 cstart=$(pid_start "$child")
 tries=0
-while ! readable_start "$cstart" && [ "$tries" -lt 5 ]; do
+while ! readable_start "$cstart" && [ "$tries" -lt 5 ] && kill -0 "$child" 2>/dev/null; do
   sleep 0.2
   cstart=$(pid_start "$child")
   tries=$((tries + 1))

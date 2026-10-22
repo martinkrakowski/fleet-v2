@@ -220,7 +220,7 @@ check 'the refused dispatch did not start agy' '[ "$(cat "$T/fake-mode")" = slee
 erun AGY_WAIT_INTERVAL=1 AGY_WAIT_MAX=1 "$RUNSH" "$SCRIPT" --wait --dir "$WT"
 check '--wait gives up (75) while the lane runs' '[ "$(rc)" = 75 ] && grep -q "GAVE UP" "$T/e"'
 run --abort --dir "$WT"
-check '--abort stops the lane (0)' '[ "$(rc)" = 0 ] && grep -q "nothing is running" "$T/o"'
+check '--abort stops the lane (0)' '[ "$(rc)" = 0 ] && grep -q "the lane in .* stopped" "$T/o"'
 wait "$BG" 2>/dev/null; bgrc=$?
 check 'the dispatcher ended once its lane was aborted' '[ "$bgrc" != 0 ] && [ ! -f "$WT/.lane/agy-run.lock" ]'
 run --status --dir "$WT"
@@ -286,6 +286,8 @@ check 'abort signals a live pid whose start time matches (0) and it is gone afte
 
 erun AGY_RUN_ABORT_WAIT=1s "$RUNSH" "$SCRIPT" --abort --dir "$WT"
 check 'a non-digit AGY_RUN_ABORT_WAIT is a usage error (2)' '[ "$(rc)" = 2 ]'
+erun AGY_RUN_ABORT_WAIT=08 "$RUNSH" "$SCRIPT" --abort --dir "$WT"
+check 'a leading-zero AGY_RUN_ABORT_WAIT (dash octal) is a usage error (2)' '[ "$(rc)" = 2 ]'
 rm -f "$T/ign.ready"
 IGNPID=$(sh -c '( trap "" TERM; : > "$1"; exec sleep 60 ) >/dev/null 2>&1 & echo $!' - "$T/ign.ready")
 echo "$IGNPID" >> "$T/pids"

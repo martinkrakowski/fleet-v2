@@ -20,7 +20,8 @@ check_pin() { # $1: script path, $2: hash file path
     echo "test-bin: pin FAIL for $1 (got ${sum:-<none>}, want ${want:-<empty>})" >&2
     return 1
   fi
-  grep -q "$1" "$root/$2" || { echo "test-bin: pin file $2 does not name $1" >&2; return 1; }
+  # The pin line's path field must be exactly $1, not merely contain it (Grok review of L2).
+  awk -v f="$1" '$2 == f { found = 1 } END { exit !found }' "$root/$2" || { echo "test-bin: pin file $2 does not name $1" >&2; return 1; }
   echo "test-bin: pin ok $1"
 }
 check_pin bin/ocm-run scripts/ocm-run-hash.txt

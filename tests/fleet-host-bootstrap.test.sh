@@ -16,6 +16,11 @@ unset XDG_CONFIG_HOME FLEET_WORKTREE_ROOT FLEET_TMPDIR FLEET_OPENCODE_CONFIG_DIR
 REAL_NODE=$(command -v node || true)
 REAL_PATH=$PATH
 T=$(mktemp -d "${TMPDIR:-/tmp}/fleet-host-bootstrap-test.XXXXXX") || exit 1
+# A decoy agy on the host PATH, as on a Mac with a Homebrew or ~/.local/bin agy: the missing-tool
+# case below must still report agy missing, which proves it cannot see the host's own tools
+# (Grok review of L2: without a decoy the case passed on a clean runner even if isolation regressed).
+mkdir -p "$T/hostbin" && printf '#!/bin/sh\necho "agy 9.9.9 (host decoy)"\n' > "$T/hostbin/agy" && chmod +x "$T/hostbin/agy"
+REAL_PATH="$T/hostbin:$REAL_PATH"
 fails=0
 ok() { printf 'ok   %s\n' "$1"; }
 bad() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }

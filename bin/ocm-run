@@ -196,7 +196,7 @@ fi
 if [ "$mode" = check ]; then
   hpids=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null)
   if [ -z "$hpids" ]; then
-    echo "ocm-run: --check: 127.0.0.1:$port is listening; its holder is unknown (lsof found no owner it may read)" >&2
+    echo "ocm-run: --check: 127.0.0.1:$port is listening; its holder is unknown (lsof found no owner it may read), so its destination was NOT checked against OCM_HOST" >&2
   else
     bad_holder=0
     for hpid in $hpids; do

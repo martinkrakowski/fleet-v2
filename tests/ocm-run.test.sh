@@ -324,6 +324,14 @@ check "OCM_HOST: uses environment override when set" '[ "$rc" = 0 ] && echo "$ou
 out=$(run OCM_HOST= -- --check 2>&1); rc=$?
 check "OCM_HOST empty and nothing on the remote port: --check reports it, exit 1, no ssh" '[ "$rc" = 1 ] && echo "$out" | grep -q "nothing is listening on the dial port 127.0.0.1:$R" && [ ! -s "$T/ssh.log" ]'
 
+clear_all
+out=$(run -- --dir "$D" --agent lane --check 2>&1); rc=$?
+check "--check is accepted in the middle of the flags (before the prompt): exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "ocm-run: ok"'
+out=$(run -- --agent lane -m some/model --check 2>&1); rc=$?
+check "--check after -m <model> is still check mode: exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "ocm-run: ok"'
+out=$(run -- --check --status --dir "$D" 2>&1); rc=$?
+check "--check combined with another mode is still refused (2)" '[ "$rc" = 2 ]'
+
 out=$(run OCM_REMOTE_PORT= -- --check 2>&1); rc=$?
 check "no OCM_REMOTE_PORT (unset) is a usage error (2): the 4096 default is gone" '[ "$rc" = 2 ] && echo "$out" | grep -q "OCM_REMOTE_PORT"'
 out=$(run OCM_REMOTE_PORT= -- --dir "$D" "p" 2>&1); rc=$?
@@ -334,6 +342,12 @@ out=$(run OCM_REMOTE_PORT=70000 -- --check 2>&1); rc=$?
 check "an OCM_REMOTE_PORT above 65535 is refused (2)" '[ "$rc" = 2 ]'
 out=$(run OCM_REMOTE_PORT=65535 -- --check 2>&1); rc=$?
 check "65535 with OCM_HOST set is refused (2): no room for the forward" '[ "$rc" = 2 ] && echo "$out" | grep -q "no room for the forward"'
+
+clear_all
+out=$(run OCM_HOST=-oProxyCommand=evil -- --check 2>&1); rc=$?
+check "OCM_HOST starting with '-' is refused (2), never passed to ssh" '[ "$rc" = 2 ] && echo "$out" | grep -q "OCM_HOST" && [ ! -s "$T/ssh.log" ]'
+out=$(run OCM_HOST=-W -- --check 2>&1); rc=$?
+check "OCM_HOST='-' alone is refused too (2)" '[ "$rc" = 2 ]'
 
 # A second free pair: nothing listens on Q or Q + 1.
 Q=''
@@ -350,6 +364,29 @@ check "--check with nothing on the dial port is exit 1, never a forward" '[ "$rc
 out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
 check "a real dispatch with nothing on the dial port opens the forward (and fails: the ssh is fake)" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel"'
 check "the forward rule is unchanged: local Q + 1 forwards to the remote Q" 'grep -q -- "-L 127.0.0.1:$((Q + 1)):127.0.0.1:$Q ocm-test-host-that-does-not-exist" "$T/ssh.log"'
+
+# Tunnel race (minor 13): a failed ssh -L whose forward landed anyway (a simultaneous
+# dispatch won) must not fail the dispatch: the script re-checks nc -z once.
+clear_all
+cat > "$T/bin/ssh" <<SSH
+#!/bin/sh
+echo "\$*" >> "\$T/ssh.log"
+python3 "\$T/server.py" "\$T" "$((Q + 1))" > /dev/null 2>&1 &
+echo \$! > "\$T/racepid"
+sleep 0.3
+exit 255
+SSH
+chmod +x "$T/bin/ssh"
+out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
+check "tunnel race: after a failed ssh -L, a re-check that finds the port up still dispatches (0)" '[ "$rc" = 0 ] && grep -qF "run --attach http://127.0.0.1:$((Q + 1))" "$T/args.log" && ! echo "$out" | grep -q "could not open the tunnel"'
+[ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
+cat > "$T/bin/ssh" <<'SSH'
+#!/bin/sh
+echo "$*" >> "$T/ssh.log"
+exit 255
+SSH
+chmod +x "$T/bin/ssh"
+clear_all
 
 # The local host needs its listener on the remote port itself: a second fake server on $R.
 clear_all

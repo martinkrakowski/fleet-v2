@@ -78,6 +78,12 @@ if [ "$remote" -lt 1 ] || [ "$remote" -gt 65535 ]; then
 fi
 host="${OCM_HOST:-}"
 if [ -n "$host" ]; then
+  case "$host" in
+    -*)
+      echo "ocm-run: OCM_HOST=$host starts with '-': it would be read as an ssh option" >&2
+      exit 2
+      ;;
+  esac
   if [ "$remote" -eq 65535 ]; then
     echo "ocm-run: OCM_REMOTE_PORT=65535 with OCM_HOST set leaves no room for the forward on $((remote + 1)); use a port below 65535" >&2
     exit 2
@@ -116,7 +122,6 @@ model=''
 has_model=0
 has_session=0
 prev=''
-[ "${1:-}" = "--check" ] && mode=check
 for arg do
   shift
   case "$arg" in
@@ -124,7 +129,7 @@ for arg do
       echo "ocm-run: do not pass ${arg%%=*}; ocm-run connects to $url itself" >&2
       exit 2
       ;;
-    --status | --wait | --abort)
+    --status | --wait | --abort | --check)
       [ "$mode" = run ] || { echo "ocm-run: one of --status, --wait, --abort, --check at a time" >&2; exit 2; }
       mode=${arg#--}
       prev=''
@@ -192,8 +197,12 @@ if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
   fi
   ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes \
     -L "127.0.0.1:$port:127.0.0.1:$remote" "$host" || {
-    echo "ocm-run: could not open the tunnel to $host" >&2
-    exit 1
+    if nc -z 127.0.0.1 "$port" 2>/dev/null; then
+      : # a simultaneous dispatch's forward landed between the check and ours; carry on
+    else
+      echo "ocm-run: could not open the tunnel to $host" >&2
+      exit 1
+    fi
   }
 fi
 

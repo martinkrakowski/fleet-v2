@@ -183,6 +183,13 @@ lane_running() {
   fi
   lr_now=$(pid_start "$lr_pid")
   if ! readable_start "$lr_start" || ! readable_start "$lr_now"; then
+    # The lane may have exited and been reaped between kill -0 and ps (CodeRabbit on #148): an
+    # empty ps for a pid that is now gone is "gone", not "unreadable".
+    if ! kill -0 "$lr_pid" 2>/dev/null; then
+      echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in .lane/agy-run.out" >&2
+      rm -f "$lock"
+      return 0
+    fi
     echo "$lr_pid"
     return 1
   fi

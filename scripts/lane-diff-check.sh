@@ -1,20 +1,16 @@
 #!/bin/sh
 # lane-diff-check — what an orchestrator runs over a lane's worktree BEFORE it commits or pushes what
 # a model produced. Three questions, answered without printing a single matched value:
-#   1. Did the lane touch a protected path? (.github, .gemini, .agents, .agy, .lane, .architecture,
-#      bin, scripts, deploy, installation, .yarn/plugins|releases|patches, .husky, .claude,
-#      .opencode, .cursor, .vscode, opencode.json*, AGENTS.md, CLAUDE.md, CLAUDE.local.md,
-#      GEMINI.md, .mcp.json, .cursorrules, .windsurfrules, .github/copilot-instructions.md,
-#      .gitattributes, .gitmodules, package.json, .yarnrc, .yarnrc.yml, .npmrc, yarn.lock,
-#      package-lock.json, pnpm-lock.yaml, .pnp.*, Dockerfile, Makefile, .envrc). A changed workflow
-#      runs on GitHub the moment it is pushed; a changed agent or permission file changes what the
-#      next lane may do. Agent instruction/editor files and package manifests are matched at any
-#      depth and case-insensitively (macOS volumes are case-insensitive); .yarn/plugins|releases|
-#      patches, .husky, Makefiles, .envrc, Dockerfile and .pnp.* are root-only. The protected check
-#      runs BEFORE the ignored-file keep-list, so .agents/node_modules/x or .claude/dist/x is still
-#      a protected finding while dependency/build output and the worktree's ignored .lane/ stay out
-#      of the review; package manifests under node_modules are dependency internals and are not
-#      protected. Decision D3 (plan §3): an ignored .lane/ file is skipped because the brief lives
+#   1. Did the lane touch a protected path? The rules live in ONE table,
+#      scripts/lane-diff-check.protected, read here and mirrored by the TypeScript domain; a parity
+#      test keeps them equal. Protected classes: github workflows, agent instruction/editor tool
+#      files (CLAUDE.md, AGENTS.md, GEMINI.md, .mcp.json, .cursor/, .vscode/, …), yarn/npm/package
+#      manifests and lockfiles at any depth, git attributes/modules, lane plumbing (.lane, .agents,
+#      …), install trees and scripts/bin. A changed workflow runs on GitHub the moment it is pushed;
+#      a changed agent or permission file changes what the next lane may do. The protected check runs
+#      BEFORE the ignored-file keep-list, so .agents/node_modules/x or .claude/dist/x is still a
+#      protected finding while dependency/build output and the worktree's ignored .lane/ stay out of
+#      the review. Decision D3 (plan §3): an ignored .lane/ file is skipped because the brief lives
 #      there in every worktree, but a .lane/ path that is tracked or committed in the diff is a
 #      protected finding.
 #   2. Does any changed, untracked or reviewed ignored file contain something that looks like a
@@ -34,6 +30,49 @@ set -u
 # invalid byte sequence as binary and suppresses it AND every later line, so one crafted file name
 # would empty the review list and the gate would pass with 0 files.
 LC_ALL=C; export LC_ALL; unset LANGUAGE 2>/dev/null || true
+
+# The protected-path table is the single source for this script and the TypeScript domain
+# (S2); see scripts/lane-diff-check.protected for the format. Four grep regexes are built from
+# it: root-only vs any-depth, each case-sensitive and case-insensitive.
+self_dir=$(CDPATH= cd -P "$(dirname "$0")" 2>/dev/null && pwd) || exit 2
+RULE_FILE="$self_dir/lane-diff-check.protected"
+[ -f "$RULE_FILE" ] || { echo "lane-diff-check: missing $RULE_FILE" >&2; exit 2; }
+
+# Eight groups: root-only vs any-depth, directory/prefix vs file rules, case-sensitive vs
+# case-insensitive. File rules do not apply under any node_modules/ directory (dependency
+# internals are never protected as manifests or agent files), while directory rules still do, so
+# .agents/node_modules/x stays protected (L1b items 1 and 3).
+ROOT_DIRPRE_CS=''; ROOT_DIRPRE_CI=''; ANY_DIRPRE_CS=''; ANY_DIRPRE_CI=''
+ROOT_FILE_CS=''; ROOT_FILE_CI=''; ANY_FILE_CS=''; ANY_FILE_CI=''
+while IFS='	' read -r pat any ci; do
+  case "$pat" in '' | \#*) continue ;; esac
+  case "$pat" in
+    */) kind=dir; body=${pat%/} ;;
+    *\*) kind=pre; body=${pat%\*} ;;
+    *) kind=file; body=$pat ;;
+  esac
+  case "$kind" in
+    dir)  [ "$any" = 1 ] && a="(^|/)$body(/|$)" || a="^$body(/|$)" ;;
+    pre)  [ "$any" = 1 ] && a="(^|/)$body" || a="^$body" ;;
+    file) [ "$any" = 1 ] && a="(^|/)$body\$" || a="^$body\$" ;;
+  esac
+  case "$kind" in dir) g=dirpre ;; *) g=file ;; esac
+  if [ "$ci" = 1 ]; then
+    case "$g:$any" in
+      dirpre:1) ANY_DIRPRE_CI="${ANY_DIRPRE_CI:+$ANY_DIRPRE_CI|}$a" ;;
+      dirpre:0) ROOT_DIRPRE_CI="${ROOT_DIRPRE_CI:+$ROOT_DIRPRE_CI|}$a" ;;
+      file:1) ANY_FILE_CI="${ANY_FILE_CI:+$ANY_FILE_CI|}$a" ;;
+      file:0) ROOT_FILE_CI="${ROOT_FILE_CI:+$ROOT_FILE_CI|}$a" ;;
+    esac
+  else
+    case "$g:$any" in
+      dirpre:1) ANY_DIRPRE_CS="${ANY_DIRPRE_CS:+$ANY_DIRPRE_CS|}$a" ;;
+      dirpre:0) ROOT_DIRPRE_CS="${ROOT_DIRPRE_CS:+$ROOT_DIRPRE_CS|}$a" ;;
+      file:1) ANY_FILE_CS="${ANY_FILE_CS:+$ANY_FILE_CS|}$a" ;;
+      file:0) ROOT_FILE_CS="${ROOT_FILE_CS:+$ROOT_FILE_CS|}$a" ;;
+    esac
+  fi
+done < "$RULE_FILE"
 
 wt=''
 base=''
@@ -136,22 +175,26 @@ say() { [ "$quiet" = 1 ] || echo "$@"; }
 findings=0
 warnings=0
 
-# Root-only classes (directories, files and name prefixes), case-sensitive.
-PROTECTED='^(\.github/|\.gemini/|\.agents/|\.agy/|\.lane/|\.architecture/|bin/|scripts/|deploy/|installation/|\.yarn/plugins/|\.yarn/releases/|\.yarn/patches/|\.husky/|Dockerfile$|\.pnp\.|\.claude/|\.opencode/)'
-# Root-only classes matched case-insensitively (macOS volumes).
-PROTECTED_ROOT_CI='^(Makefile$|makefile$|GNUmakefile$|\.envrc$|\.husky/)'
-# Agent instruction/editor tool files at any depth, case-insensitively.
-PROTECTED_AGENT_CONFIG='(^|/)\.claude/|(^|/)\.opencode/|(^|/)opencode\.json|(^|/)\.cursor/|(^|/)\.vscode/|(^|/)CLAUDE\.md$|(^|/)CLAUDE\.local\.md$|(^|/)AGENTS\.md$|(^|/)GEMINI\.md$|(^|/)\.mcp\.json$|(^|/)\.cursorrules$|(^|/)\.windsurfrules$|(^|/)\.github/copilot-instructions\.md$|(^|/)\.gitattributes$|(^|/)\.gitmodules$'
-# Package-manager and lockfile files at any depth, case-sensitive; dependency internals under
-# node_modules are not protected.
-PROTECTED_AGENT_FILES='(^|/)package\.json$|(^|/)\.yarnrc$|(^|/)\.yarnrc\.yml$|(^|/)\.npmrc$|(^|/)yarn\.lock$|(^|/)package-lock\.json$|(^|/)pnpm-lock\.yaml$'
 while IFS= read -r f; do
   under_nm=0
   printf '%s\n' "$f" | grep -Eq '(^|/)node_modules/' && under_nm=1
-  if { printf '%s\n' "$f" | grep -Eq "$PROTECTED"; } ||
-     { printf '%s\n' "$f" | grep -Eiq "$PROTECTED_ROOT_CI"; } ||
-     { printf '%s\n' "$f" | grep -Eiq "$PROTECTED_AGENT_CONFIG"; } ||
-     { [ "$under_nm" = 0 ] && printf '%s\n' "$f" | grep -Eq "$PROTECTED_AGENT_FILES"; }; then
+  dirpre=0
+  if { [ -n "$ROOT_DIRPRE_CS" ] && printf '%s\n' "$f" | grep -Eq "$ROOT_DIRPRE_CS"; } ||
+     { [ -n "$ROOT_DIRPRE_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ROOT_DIRPRE_CI"; } ||
+     { [ -n "$ANY_DIRPRE_CS" ] && printf '%s\n' "$f" | grep -Eq "$ANY_DIRPRE_CS"; } ||
+     { [ -n "$ANY_DIRPRE_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ANY_DIRPRE_CI"; }; then
+    dirpre=1
+  fi
+  filehit=0
+  if [ "$under_nm" = 0 ]; then
+    if { [ -n "$ROOT_FILE_CS" ] && printf '%s\n' "$f" | grep -Eq "$ROOT_FILE_CS"; } ||
+       { [ -n "$ROOT_FILE_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ROOT_FILE_CI"; } ||
+       { [ -n "$ANY_FILE_CS" ] && printf '%s\n' "$f" | grep -Eq "$ANY_FILE_CS"; } ||
+       { [ -n "$ANY_FILE_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ANY_FILE_CI"; }; then
+      filehit=1
+    fi
+  fi
+  if [ "$dirpre" = 1 ] || [ "$filehit" = 1 ]; then
     if [ -n "$allow" ] && printf '%s\n' "$f" | grep -Eq "$allow"; then
       say "allowed-protected: $f"
       continue

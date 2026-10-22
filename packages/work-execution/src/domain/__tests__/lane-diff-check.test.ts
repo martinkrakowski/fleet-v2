@@ -15,6 +15,7 @@ import {
   isFixedProtectedPath,
   pathUnderPrefix,
   validateAllowedPathPrefix,
+  PROTECTED_PATH_RULES,
   type LaneDiffChangedPath,
   type LaneDiffSecretPattern,
 } from "../lane-diff-check.js";
@@ -403,40 +404,223 @@ describe("checkLaneDiff (policy additions are never lifted, O14d1 S3)", () => {
 });
 
 describe("isFixedProtectedPath (script parity, O14d1)", () => {
-  /** One sample path that the script's regex alternative must match. */
-  function sampleFor(alternative: string): string {
-    const unescaped = alternative.replaceAll("\\.", ".");
-    if (unescaped.endsWith("$")) {
-      return unescaped.slice(0, -1).replaceAll("[^/]+", "x");
+  /**
+   * Reads `scripts/lane-diff-check.protected` exactly as the shell script does
+   * and rebuilds its eight grep groups (root vs any depth × directory/prefix
+   * vs file × case-sensitive vs case-insensitive).
+   */
+  function shellGroups(): Record<string, string[]> {
+    const ruleFile = path.join(
+      repoRoot(),
+      "scripts",
+      "lane-diff-check.protected",
+    );
+    const groups: Record<string, string[]> = {
+      rootDirPreCS: [],
+      rootDirPreCI: [],
+      anyDirPreCS: [],
+      anyDirPreCI: [],
+      rootFileCS: [],
+      rootFileCI: [],
+      anyFileCS: [],
+      anyFileCI: [],
+    };
+    for (const line of readFileSync(ruleFile, "utf8").split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed === "" || trimmed.startsWith("#")) continue;
+      const fields = line.split("\t");
+      expect(fields).toHaveLength(3);
+      const [pattern, anyDepth, caseInsensitive] = fields;
+      let body = pattern;
+      let kind: "dir" | "pre" | "file";
+      if (pattern.endsWith("/")) {
+        kind = "dir";
+        body = pattern.slice(0, -1);
+      } else if (pattern.endsWith("*")) {
+        kind = "pre";
+        body = pattern.slice(0, -1);
+      } else {
+        kind = "file";
+      }
+      let alt: string;
+      if (kind === "dir") {
+        alt =
+          anyDepth === "1" ? `(^|/)${body}(/|$)` : `^${body}(/|$)`;
+      } else if (kind === "pre") {
+        alt = anyDepth === "1" ? `(^|/)${body}` : `^${body}`;
+      } else {
+        alt = anyDepth === "1" ? `(^|/)${body}$` : `^${body}$`;
+      }
+      const group =
+        caseInsensitive === "1"
+          ? anyDepth === "1"
+            ? "anyDirPreCI"
+            : "rootDirPreCI"
+          : anyDepth === "1"
+            ? "anyDirPreCS"
+            : "rootDirPreCS";
+      if (kind !== "dir") {
+        const fileGroup = group.replace("DirPre", "File");
+        groups[fileGroup].push(alt);
+      } else {
+        groups[group].push(alt);
+      }
     }
-    if (unescaped.endsWith("/")) {
-      return `${unescaped}sample.txt`;
-    }
-    // A literal prefix such as `.yarnrc` or `.pnp.`
-    return unescaped;
+    return groups;
   }
 
-  it("covers every alternative of the script's PROTECTED regex", () => {
-    const script = readFileSync(
-      path.join(repoRoot(), "scripts", "lane-diff-check.sh"),
-      "utf8",
+  /** The shell's protected verdict for one path (directory rules always, file rules outside node_modules). */
+  function shellProtectedVerdict(path: string): boolean {
+    const groups = shellGroups();
+    const matchAny = (alts: string[], ci: boolean) =>
+      alts.some((alt) => new RegExp(alt, ci ? "i" : "").test(path));
+    const underNodeModules = new RegExp("(^|/)node_modules/").test(path);
+    const dirPre =
+      matchAny(groups.rootDirPreCS, false) ||
+      matchAny(groups.rootDirPreCI, true) ||
+      matchAny(groups.anyDirPreCS, false) ||
+      matchAny(groups.anyDirPreCI, true);
+    if (dirPre) return true;
+    if (underNodeModules) return false;
+    return (
+      matchAny(groups.rootFileCS, false) ||
+      matchAny(groups.rootFileCI, true) ||
+      matchAny(groups.anyFileCS, false) ||
+      matchAny(groups.anyFileCI, true)
     );
-    const lines = script.split("\n");
-    const match =
-      /^PROTECTED='\^\((.*)\)'\r?$/.exec(
-        lines.find((candidate) =>
-          /^PROTECTED='\^\((.*)\)'\r?$/.test(candidate),
-        ) ?? "",
-      ) ?? null;
+  }
+
+  /**
+   * Shared fixture for the shell/domain parity: every protected rule against
+   * root and nested paths, case variants, and non-protected look-alikes
+   * (L1b item 4).
+   */
+  const PROTECTED_FIXTURE: readonly [string, boolean][] = [
+    // Yarn/npm/manifest at any depth (L1b item 1).
+    [".yarnrc", true],
+    ["packages/x/.yarnrc", true],
+    [".yarnrc.yml", true],
+    ["packages/app/.yarnrc.yml", true],
+    [".npmrc", true],
+    ["packages/x/.npmrc", true],
+    [".yarn/plugins/plugin.js", true],
+    [".yarn/releases/yarn.cjs", true],
+    [".yarn/patches/pkg.patch", true],
+    [".pnp.cjs", true],
+    [".pnp.loader.mjs", true],
+    ["package.json", true],
+    ["packages/x/package.json", true],
+    ["packages/a/b/c/package.json", true],
+    ["node_modules/pkg/package.json", false],
+    ["packages/x/node_modules/y/package.json", false],
+    ["mypackage.jsonc", false],
+    ["package.jsonc", false],
+    ["yarn.lock", true],
+    ["packages/x/yarn.lock", true],
+    ["package-lock.json", true],
+    ["packages/x/package-lock.json", true],
+    ["pnpm-lock.yaml", true],
+    // Agent instruction and tool files at any depth, case-insensitively (L1b item 2).
+    ["AGENTS.md", true],
+    ["packages/app/AGENTS.md", true],
+    ["packages/app/agents.md", true],
+    ["CLAUDE.md", true],
+    ["packages/app/CLAUDE.md", true],
+    ["CLAUDE.local.md", true],
+    ["packages/app/claude.local.md", true],
+    ["GEMINI.md", true],
+    ["packages/app/gemini.md", true],
+    [".mcp.json", true],
+    ["packages/app/.mcp.json", true],
+    [".cursor/rules.mdc", true],
+    ["packages/app/.cursor/rules.mdc", true],
+    [".cursorrules", true],
+    ["packages/app/.cursorrules", true],
+    [".windsurfrules", true],
+    ["packages/app/.WindsurfRules", true],
+    [".github/copilot-instructions.md", true],
+    ["packages/app/.github/copilot-instructions.md", true],
+    [".vscode/tasks.json", true],
+    ["packages/app/.vscode/launch.json", true],
+    [".envrc", true],
+    ["packages/app/.envrc", false],
+    [".husky/pre-commit", true],
+    ["packages/app/.husky/pre-commit", false],
+    ["Makefile", true],
+    ["makefile", true],
+    ["GNUmakefile", true],
+    ["packages/app/Makefile", false],
+    // Git plumbing and the existing root-only classes.
+    [".gitattributes", true],
+    ["packages/x/.gitattributes", true],
+    [".gitmodules", true],
+    ["packages/x/.gitmodules", true],
+    [".github/workflows/ci.yml", true],
+    ["packages/app/.github/workflows/ci.yml", false],
+    [".claude/settings.json", true],
+    ["packages/app/.claude/settings.json", true],
+    [".opencode/opencode.json", true],
+    ["opencode.json", true],
+    ["opencode.jsonc", true],
+    ["OpenCode.JSON5", true],
+    [".gemini/settings.json", true],
+    [".agents/x.json", true],
+    [".agy/lane.txt", true],
+    [".lane/brief.md", true],
+    ["bin/tool.sh", true],
+    ["scripts/tool.sh", true],
+    [".architecture/manifest.yaml", true],
+    ["deploy/x.yaml", true],
+    ["installation/config.yaml", true],
+    ["Dockerfile", true],
+    ["packages/app/Dockerfile", false],
+    // Look-alikes.
+    ["docs/claude.md.txt", false],
+    ["docs/claude.md", true],
+    ["myAGENTS.md.bak", false],
+    ["packages/app/CLAUDE.md.backup", false],
+    [".git/hooks/pre-commit", true],
+    ["foo/.git/config", false],
+  ];
+
+  it("the exported table matches scripts/lane-diff-check.protected row for row", () => {
+    const ruleFile = path.join(
+      repoRoot(),
+      "scripts",
+      "lane-diff-check.protected",
+    );
+    const rows = readFileSync(ruleFile, "utf8")
+      .split("\n")
+      .filter((line) => {
+        const trimmed = line.trim();
+        return trimmed !== "" && !trimmed.startsWith("#");
+      })
+      .map((line) => {
+        const fields = line.split("\t");
+        expect(fields).toHaveLength(3);
+        const [pattern, anyDepth, caseInsensitive] = fields;
+        return [pattern, Number(anyDepth), Number(caseInsensitive)];
+      });
+    expect(rows.length).toBeGreaterThanOrEqual(35);
     expect(
-      match,
-      "the script's PROTECTED regex was not found",
-    ).not.toBeNull();
-    const alternatives = match![1]!.split("|");
-    expect(alternatives.length).toBeGreaterThan(0);
-    for (const alternative of alternatives) {
-      const sample = sampleFor(alternative);
-      expect(isFixedProtectedPath(sample), alternative).toBe(true);
+      PROTECTED_PATH_RULES.map((rule) => [
+        rule.pattern,
+        rule.anyDepth ? 1 : 0,
+        rule.caseInsensitive ? 1 : 0,
+      ]),
+    ).toEqual(rows);
+  });
+
+  it("shell and domain reach the same verdict on the shared fixture list (L1b item 4)", () => {
+    expect(PROTECTED_FIXTURE.length).toBeGreaterThanOrEqual(40);
+    for (const [path, expected] of PROTECTED_FIXTURE) {
+      const ts = isFixedProtectedPath(path);
+      const shell = shellProtectedVerdict(path);
+      expect({ path, ts, shell }).toEqual({
+        path,
+        ts: expected,
+        shell: expected,
+      });
     }
   });
 

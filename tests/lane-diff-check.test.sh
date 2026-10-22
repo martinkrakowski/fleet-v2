@@ -199,6 +199,46 @@ run "$R" --base base
 check 'a file over 5 MiB is reported as unscanned-large-file (Fix 7)' '[ "$(rc)" = 1 ] && grep -q "^unscanned-large-file: packages/x/src/big.bin$" "$T/o"'
 rm -f packages/x/src/big.bin
 
+# Fable review of L1: a file whose name is not valid UTF-8 is still reviewed. In a UTF-8 locale GNU
+# grep treats that line as binary and drops it from the list (3.11 drops the line; older versions
+# drop every later line too), so a secret in such a file was never scanned.
+bad=$(printf 'packages/x/src/\377.ts')
+# APFS (macOS) refuses a name that is not valid UTF-8, so there the case cannot arise: skip it.
+if printf 'const t = "%s";\n' "$tok" > "$bad" 2>/dev/null; then
+  mkdir -p .claude && printf '{}\n' > .claude/settings.json
+  LC_ALL=C.UTF-8 LANG=C.UTF-8 run "$R" --base base
+  check 'a file with an invalid-UTF-8 name is still scanned, and later paths still listed (Fable 1)' '[ "$(rc)" = 1 ] && grep -aq "(github-token)" "$T/o" && grep -q "^protected: .claude/settings.json$" "$T/o"'
+  rm -rf "$bad" .claude
+else
+  echo "skip invalid-UTF-8 file name: this filesystem refuses such names"
+fi
+
+# Fable review of L1: a secret committed and then removed from the worktree is still scanned, from
+# the committed blob, because that is what gets pushed.
+printf 'const t = "%s";\n' "$tok" > packages/x/src/gone.ts
+if git add packages/x/src/gone.ts && git -c commit.gpgsign=false commit -q -m gone; then
+  rm -f packages/x/src/gone.ts
+  run "$R" --base base
+  check 'a committed secret deleted from the worktree is still found (Fable 2)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/gone.ts (committed):1 (github-token)$" "$T/o"'
+  git reset -q --hard HEAD~1
+else
+  check 'the gone.ts fixture was created (Fable 2)' 'false'
+fi
+
+# Fable review of L1: an unreadable file is a finding, never a silent skip.
+if [ "$(id -u)" != 0 ]; then
+  printf 'x\n' > packages/x/src/locked.ts && chmod 000 packages/x/src/locked.ts
+  run "$R" --base base
+  check 'an unreadable file is a finding (Fable 2)' '[ "$(rc)" = 1 ] && grep -q "^unreadable: packages/x/src/locked.ts$" "$T/o"'
+  chmod 600 packages/x/src/locked.ts; rm -f packages/x/src/locked.ts
+fi
+
+# Fable review of L1: a lane-set core.fsmonitor in the shared .git/config never runs in the gate.
+git config core.fsmonitor "touch $T/fsmonitor-ran #"
+run "$R" --base base
+check 'a lane-set core.fsmonitor never runs in the gate (Fable 5)' '[ ! -e "$T/fsmonitor-ran" ]'
+git config --unset core.fsmonitor
+
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"
 [ "$fails" = 0 ]

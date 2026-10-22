@@ -24,6 +24,10 @@
 # --base defaults to origin/main when it exists, else the working tree is compared with HEAD only.
 # Exit: 0 clean; 1 at least one finding; 2 usage or not a git worktree.
 set -u
+# Byte semantics everywhere (Fable review of L1): in a UTF-8 locale GNU grep treats a line with an
+# invalid byte sequence as binary and suppresses it AND every later line, so one crafted file name
+# would empty the review list and the gate would pass with 0 files.
+LC_ALL=C; export LC_ALL; unset LANGUAGE 2>/dev/null || true
 
 wt=''
 base=''
@@ -74,7 +78,14 @@ trap 'rm -rf "$T"' EXIT
 # digest at dispatch (lane L7a); an ignored .lane/ file is skipped because the brief lives there in
 # every worktree, but a .lane/ path that is tracked or committed in the diff is a protected finding.
 IGNORED_SKIP='(^|/)(node_modules|dist|\.next|\.turbo|\.output|coverage)/|^\.yarn/(cache/|install-state\.gz$)|^\.lane(/|$)'
-g() { git -c core.quotePath=false "$@"; }
+# The same pins as LaneDiffCheckAdapter's GIT_CONFIG_ARGS: a lane can write the shared .git/config,
+# and the gate's own git calls must never run a lane-chosen fsmonitor, hook, external diff or
+# filter (Fable review of L1).
+g() {
+  git -c color.ui=never -c core.quotePath=false -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+    -c core.attributesFile=/dev/null -c diff.external= -c diff.noprefix=false \
+    -c filter.lfs.clean= -c filter.lfs.smudge= -c filter.lfs.process= "$@"
+}
 collect() {
   if git rev-parse --verify -q HEAD >/dev/null; then
     if [ -n "$base" ]; then
@@ -93,7 +104,7 @@ collect() {
     return 1
   fi
   tr '\0' '\n' < "$T/ignored0" |
-    grep -vE "$IGNORED_SKIP" |
+    grep -avE "$IGNORED_SKIP" |
     tr '\n' '\0'
 }
 collect > "$T/files0" || { echo "lane-diff-check: could not list changed files" >&2; exit 2; }
@@ -102,7 +113,7 @@ if [ "$(tr -cd '\n' < "$T/files0" | wc -c | tr -d ' ')" != 0 ]; then
   echo "lane-diff-check: a changed file name contains a newline; refusing" >&2
   exit 2
 fi
-tr '\0' '\n' < "$T/files0" | grep -v '^$' | sort -u > "$T/files"
+tr '\0' '\n' < "$T/files0" | grep -av '^$' | sort -u > "$T/files"
 
 say() { [ "$quiet" = 1 ] || echo "$@"; }
 findings=0
@@ -204,13 +215,27 @@ while IFS= read -r f; do
   fi
   # A directory symlink ABOVE the path: the leaf is a plain file, but its physical directory lies
   # outside the worktree, so reading it would read outside (Grok re-review of L1). Never read it.
-  d=$(CDPATH= cd -P "$(dirname "./$f")" 2>/dev/null && pwd -P) || continue
-  case "$d" in
-    "$top_phys"|"$top_phys"/*) ;;
-    *) say "symlink-escape: $f"; findings=$((findings + 1)); continue ;;
-  esac
-  [ -f "$f" ] || continue
-  sz=$(wc -c < "$f" 2>/dev/null | tr -d '[:space:]')
+  # Not in the worktree: a real deletion is fine, but a path that exists in HEAD was committed and
+  # then removed or hidden from the worktree, so its committed content is what gets pushed: scan
+  # that blob (Fable review of L1). Never read through a missing parent.
+  if [ ! -e "$f" ]; then
+    if g cat-file -e "HEAD:$f" 2>/dev/null; then
+      g cat-file blob "HEAD:$f" > "$T/blob" 2>/dev/null || { say "unreadable: $f"; findings=$((findings + 1)); continue; }
+      scan_target="$T/blob"; label="$f (committed)"
+    else
+      continue
+    fi
+  else
+    d=$(CDPATH= cd -P "$(dirname "./$f")" 2>/dev/null && pwd -P) || { say "unreadable: $f"; findings=$((findings + 1)); continue; }
+    case "$d" in
+      "$top_phys"|"$top_phys"/*) ;;
+      *) say "symlink-escape: $f"; findings=$((findings + 1)); continue ;;
+    esac
+    [ -f "$f" ] || continue
+    [ -r "$f" ] || { say "unreadable: $f"; findings=$((findings + 1)); continue; }
+    scan_target="$f"; label="$f"
+  fi
+  sz=$(wc -c < "$scan_target" 2>/dev/null | tr -d '[:space:]')
   if [ -z "$sz" ] || [ "$sz" -gt 5242880 ]; then
     say "unscanned-large-file: $f"
     findings=$((findings + 1))
@@ -220,9 +245,9 @@ while IFS= read -r f; do
     [ -n "$name" ] || continue
     # -a keeps a NUL-containing file scannable instead of skipping it as binary
     # (shell minor 10).
-    lines=$(grep -naE -e "$re" -- "$f" 2>/dev/null | cut -d: -f1 | tr '\n' ',' | sed 's/,$//')
+    lines=$(grep -naE -e "$re" -- "$scan_target" 2>/dev/null | cut -d: -f1 | tr '\n' ',' | sed 's/,$//')
     [ -n "$lines" ] || continue
-    say "secret-pattern: $f:$lines ($name)"
+    say "secret-pattern: $label:$lines ($name)"
     findings=$((findings + 1))
   done < "$T/patterns"
 done < "$T/files"

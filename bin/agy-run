@@ -132,6 +132,12 @@ if [ "$widen" = 1 ] && { [ "$agymode" != full ] || [ "$isolation" != 1 ]; }; the
 if [ "$agymode" = full ] && [ "$isolation" != 1 ]; then
   die_usage "--mode full requires --isolation-declared: the isolation floor and the acknowledgement are declared for this host, never assumed here"
 fi
+# The run dir (lock, out, last) lives outside the worktree but under the same uid, so in `full` the
+# agent must be confined to its workspace by agy's sandbox, or it could rewrite them (Fable review
+# of #151). A full lane without --sandbox is refused.
+if [ "$agymode" = full ] && [ "$sandbox" != 1 ]; then
+  die_usage "--mode full requires --sandbox: the agent runs as this user, and only agy's sandbox keeps it out of agy-run's run directory"
+fi
 if [ "$isolation" = 1 ] && [ "$agymode" != full ]; then
   die_usage "--isolation-declared is only accepted with --mode full; it declares the isolation floor a full lane runs under"
 fi
@@ -148,10 +154,18 @@ command -v "$AGY_BIN" >/dev/null 2>&1 || { echo "agy-run: $AGY_BIN is not on PAT
 
 # A dir qualifies when it is the root of a git worktree (a run additionally requires .lane to be
 # gitignored).
+# Every git call is pinned: the worktree's .git file is agent-writable in `full`, so a redirected
+# gitdir or a planted core.fsmonitor/hooksPath must never run in the operator's context (Fable
+# review of #151). These commands (rev-parse, check-ignore) run nothing else from the config.
+g() {
+  git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.untrackedCache=false \
+    -c core.attributesFile=/dev/null "$@"
+}
+
 qualify_dir() {
   [ -n "$dir" ] || { echo "agy-run: --$mode needs --dir <worktree>" >&2; exit 2; }
   [ -d "$dir" ] || { echo "agy-run: $dir is not a directory" >&2; exit 1; }
-  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || { echo "agy-run: $dir is not inside a git worktree" >&2; exit 1; }
+  top=$(g -C "$dir" rev-parse --show-toplevel 2>/dev/null) || { echo "agy-run: $dir is not inside a git worktree" >&2; exit 1; }
   here=$(cd "$dir" && pwd -P)
   [ "$top" = "$here" ] || { echo "agy-run: $dir is not the root of its worktree ($top is)" >&2; exit 1; }
   dir=$here
@@ -327,9 +341,11 @@ lane_running() {
     return 2
   fi
   if [ "$lr_nowargs" != "$lr_args" ]; then
-    echo "agy-run: the lane in $dir ended (pid $lr_pid is gone or recycled); its result is in $out" >&2
-    rm -f "$lock"
-    return 0
+    # Alive with the same start time but different args: the hash may have been read before exec,
+    # or through a wrapper. Never call that "gone" (that would free the lock under a live lane);
+    # report it unverified, keep the lock, and let abort refuse (Fable review of #151).
+    echo "$lr_pid"
+    return 2
   fi
   echo "$lr_pid"
   return 0
@@ -349,7 +365,7 @@ if [ "$mode" = check ]; then
     qualify_dir
     set_paths
     [ -f "$dir/$brief" ] || { echo "agy-run: no brief at $dir/$brief" >&2; exit 1; }
-    git -C "$dir" check-ignore -q "$brief" || { echo "agy-run: $brief is not gitignored in $dir" >&2; exit 1; }
+    g -C "$dir" check-ignore -q "$brief" || { echo "agy-run: $brief is not gitignored in $dir" >&2; exit 1; }
   fi
   echo "agy-run: ok ($(command -v "$AGY_BIN")${dir:+, $dir qualifies})"
   exit 0
@@ -450,9 +466,9 @@ case "$model" in -*|*[[:space:]]*|'') die_usage "--model must not start with '-'
 # The agent travels the same way, so it gets the same guard. An empty value is just
 # no agent, so unlike --model it is not refused.
 case "$agent" in -*|*[[:space:]]*) die_usage "--agent must not start with '-' or contain whitespace" ;; esac
-git -C "$dir" check-ignore -q .lane/brief.md 2>/dev/null || { echo "agy-run: .lane/ is not gitignored in $dir; a lane's brief must never be committed" >&2; exit 1; }
+g -C "$dir" check-ignore -q .lane/brief.md 2>/dev/null || { echo "agy-run: .lane/ is not gitignored in $dir; a lane's brief must never be committed" >&2; exit 1; }
 [ -f "$dir/$brief" ] || { echo "agy-run: no brief at $dir/$brief" >&2; exit 1; }
-git -C "$dir" check-ignore -q "$brief" || { echo "agy-run: $brief is not gitignored in $dir; a brief is never committed" >&2; exit 1; }
+g -C "$dir" check-ignore -q "$brief" || { echo "agy-run: $brief is not gitignored in $dir; a brief is never committed" >&2; exit 1; }
 
 # Rule 1: never a second lane in a worktree where one is running.
 busy=$(lane_running)
@@ -470,7 +486,7 @@ if ! ( umask 077; set -C; printf '%s\n' "$$" "$(pid_start "$$")" "$model" "$agym
   exit 75
 fi
 
-before=$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo none)
+before=$(g -C "$dir" rev-parse HEAD 2>/dev/null || echo none)
 tmp=$(mk_run_tmp) || exit 1
 printf '%s\n' "$before" > "$tmp"
 mv -f "$tmp" "$before_file"

@@ -191,6 +191,9 @@ export function agyRunArgv(options: {
     // `full` is the only mode that widens a lane's permissions, and agy-run
     // widens none at all without this declaration travelling with it.
     ...(options.mode === 'full' ? ['--isolation-declared'] : []),
+    // agy-run refuses `full` without agy's sandbox: the agent runs as the same user as agy-run,
+    // and only the sandbox keeps it out of agy-run's run directory (Fable review of #151).
+    ...(options.mode === 'full' ? ['--sandbox'] : []),
     '--detach',
   ];
 }

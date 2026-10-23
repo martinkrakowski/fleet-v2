@@ -181,8 +181,9 @@ run --dir "$WT" --model m "do this"; check 'a prompt argument is refused (2)' '[
 run --dir "$WT" --model m --dangerously-skip-permissions; check '--dangerously-skip-permissions is refused (2)' '[ "$(rc)" = 2 ] && grep -q "refusing --dangerously-skip-permissions" "$T/e"'
 run --dir "$WT" --model m --isolation-declared --dangerously-skip-permissions; check '--isolation-declared alone does not widen permissions (2)' '[ "$(rc)" = 2 ] && grep -q "refusing --dangerously-skip-permissions" "$T/e"'
 run --dir "$WT" --model m --mode plan --isolation-declared --dangerously-skip-permissions; check '--dangerously-skip-permissions with a non-full mode is refused (2)' '[ "$(rc)" = 2 ] && grep -q "refusing --dangerously-skip-permissions" "$T/e"'
+run --dir "$WT" --model m --mode full --isolation-declared; check '--mode full without --sandbox is refused (2) (Fable review of #151)' '[ "$(rc)" = 2 ] && grep -q "requires --sandbox" "$T/e"'
 run --dir "$WT" --model m --mode full; check '--mode full without --isolation-declared is refused (2)' '[ "$(rc)" = 2 ] && grep -q "requires --isolation-declared" "$T/e"'
-run --check --dir "$WT" --mode full --isolation-declared --dangerously-skip-permissions; check 'the full pair needs no separate widen flag to be accepted (0)' '[ "$(rc)" = 0 ]'
+run --check --dir "$WT" --mode full --isolation-declared --sandbox --dangerously-skip-permissions; check 'the full pair needs no separate widen flag to be accepted (0)' '[ "$(rc)" = 0 ]'
 run --dir "$WT" --model m --isolation-declared; check '--isolation-declared without --mode full is refused (2)' '[ "$(rc)" = 2 ] && grep -q "only accepted with --mode full" "$T/e"'
 run --dir "$WT" --model m --mode auto --isolation-declared; check '--isolation-declared does not pair with --mode auto (2)' '[ "$(rc)" = 2 ] && grep -q "only accepted with --mode full" "$T/e"'
 run --dir "$WT" --model m --print x; check 'agy print options are refused (2)' '[ "$(rc)" = 2 ]'
@@ -250,7 +251,7 @@ run --dir "$WT" --model m --effort high --agent lane --mode plan --sandbox --tim
 check 'effort, agent, mode, sandbox and timeout pass through' 'grep -A1 -x -- "--effort" "$T/args.log" | grep -qx high && grep -A1 -x -- "--agent" "$T/args.log" | grep -qx lane && grep -A1 -x -- "--mode" "$T/args.log" | grep -qx plan && grep -qx -- "--sandbox" "$T/args.log" && grep -A1 -x -- "--print-timeout" "$T/args.log" | grep -qx 20m'
 run --dir "$WT" --model prov/model-x --mode auto
 check '--mode auto alone is agy auto and nothing more' '[ "$(rc)" = 0 ] && grep -A1 -x -- "--mode" "$T/args.log" | grep -qx auto && ! grep -q "dangerously" "$T/args.log"'
-run --dir "$WT" --model prov/model-x --mode full --isolation-declared
+run --dir "$WT" --model prov/model-x --mode full --isolation-declared --sandbox
 check 'a full run exits 0' '[ "$(rc)" = 0 ]'
 check 'a full lane runs agy in --mode auto' 'grep -A1 -x -- "--mode" "$T/args.log" | grep -qx auto'
 check 'a full lane is the only one that gets --dangerously-skip-permissions' 'grep -qx -- "--dangerously-skip-permissions" "$T/args.log"'
@@ -356,11 +357,11 @@ echo "$CMDPID" >> "$T/pids"
 OTHER_HASH=$(sha256_str 'node other-script.js')
 mk_lock "$CMDPID" 'Thu Jan  1 00:00:00 2026' m accept-edits "$OTHER_HASH"
 run --status --dir "$WT"
-check 'a state-dir lock whose args hash differs is consulted, reported recycled and removed (0)' '[ "$(rc)" = 0 ] && grep -q "nothing is running" "$T/o" && grep -q "gone or recycled" "$T/e" && [ ! -f "$LK" ]'
+check 'a live pid whose args hash differs is unverified (3), never "gone": the lock is kept (Fable review of #151)' '[ "$(rc)" = 3 ] && grep -q "cannot be verified" "$T/o" && [ -f "$LK" ]'
 mk_lock "$CMDPID" 'Thu Jan  1 00:00:00 2026' m accept-edits "$OTHER_HASH"
 : > "$T/kill.log"
 run --abort --dir "$WT"
-check 'abort consults the state-dir lock, removes it on args-hash mismatch and never signals the pid (0)' '[ "$(rc)" = 0 ] && grep -q "gone or recycled" "$T/e" && [ ! -f "$LK" ] && kill -0 "$CMDPID" 2>/dev/null && ! grep -q -- "-TERM" "$T/kill.log"'
+check 'abort refuses (1) on an args-hash mismatch, keeps the lock and never signals the pid' '[ "$(rc)" = 1 ] && grep -q "cannot be verified" "$T/e" && [ -f "$LK" ] && kill -0 "$CMDPID" 2>/dev/null && ! grep -q -- "-TERM" "$T/kill.log"'
 mk_lock "$CMDPID" 'Thu Jan  1 00:00:00 2026' m accept-edits "$DEFAULT_ARGS_HASH"
 run --status --dir "$WT"
 check 'a state-dir lock whose args hash matches reads as running (3)' '[ "$(rc)" = 3 ] && grep -q "running in $WT (pid $CMDPID," "$T/o"'

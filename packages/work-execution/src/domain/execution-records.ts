@@ -102,6 +102,29 @@ export interface AttemptSeatOverrideRecord {
   readonly expiresAtIso: string;
 }
 
+/**
+ * Usage measurement for one attempt's opencode session (S3). `costUsd` is
+ * what opencode recorded: a free seat records 0 and an unreadable value is
+ * `null`, never 0. When `source` is `'unavailable'`, every measurement field
+ * is `null` and `reason` names why.
+ */
+export interface AttemptUsageRecord {
+  readonly source: 'opencode-db' | 'unavailable';
+  readonly readAtIso: string;
+  readonly sessionId: string | null;
+  readonly steps: number | null;
+  readonly wallSeconds: number | null;
+  readonly tokensInput: number | null;
+  readonly tokensOutput: number | null;
+  readonly tokensReasoning: number | null;
+  readonly tokensCacheRead: number | null;
+  readonly tokensCacheWrite: number | null;
+  readonly costUsd: number | null;
+  readonly model: string | null;
+  readonly agent: string | null;
+  readonly reason: string | null;
+}
+
 /** Serializable record of one dispatch or one fresh fix session. */
 export interface AttemptRecord {
   readonly id: string;
@@ -120,6 +143,13 @@ export interface AttemptRecord {
   readonly artifacts: CollectedAttemptArtifacts | null;
   readonly runner?: AttemptRunnerRecord | null;
   readonly seatOverride?: AttemptSeatOverrideRecord | null;
+  /**
+   * Usage of the attempt's opencode session (S3), read from opencode's own
+   * database on the recorded runner host. Absent on records written before
+   * S3 means "not measured", which is not the same as `source:
+   * 'unavailable'`.
+   */
+  readonly usage?: AttemptUsageRecord | null;
   readonly reviewerSeat?: string | null;
   /**
    * Owner decision references the product froze into the brief package, read

@@ -79,13 +79,15 @@ function makeAttemptRepo(): AttemptRepositoryPort & { attempts: Map<string, Atte
 function makeJournal(): ExecutionJournalPort & {
   entries: ActionJournalEntryRecord[];
   reservations: Map<string, CapacityReservationRecord>;
+  releaseCount: number;
   heldFor(attemptId: string): boolean;
 } {
   const entries: ActionJournalEntryRecord[] = [];
   const reservations = new Map<string, CapacityReservationRecord>();
-  return {
+  const journalState = {
     entries,
     reservations,
+    releaseCount: 0,
     heldFor(attemptId) {
       return [...reservations.values()].some((r) => r.attemptId === attemptId && r.held);
     },
@@ -104,6 +106,7 @@ function makeJournal(): ExecutionJournalPort & {
       );
     },
     async releaseCapacityReservation(attemptId, releasedAtIso) {
+      journalState.releaseCount += 1;
       for (const [id, reservation] of reservations) {
         if (reservation.attemptId === attemptId && reservation.held) {
           reservations.set(id, { ...reservation, held: false, releasedAtIso });
@@ -148,6 +151,7 @@ function makeJournal(): ExecutionJournalPort & {
       return { outcome: 'reserved', reservation };
     },
   };
+  return journalState;
 }
 
 function storedAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
@@ -2920,10 +2924,17 @@ describe('attempt revision compare-and-swap retry', () => {
     expect(journal.entries).toHaveLength(0);
   });
 
-  it('stop retries once when its cancelled save conflicts', async () => {
+  it('stop conflicts after a terminated stop: stopSession runs once, cancelled is saved on the fresh record, release runs once', async () => {
+    const seed = storedAttempt({ state: 'running' });
+    const fresh = storedAttempt({
+      state: 'running',
+      revision: 3,
+      updatedAtIso: '2026-10-15T08:04:00.000Z',
+    });
     const attemptRepo = makeFailingSaveAttemptRepo({
-      seed: storedAttempt({ state: 'running' }),
+      seed,
       conflictOnSave: 1,
+      freshAfterConflict: fresh,
     });
     const journal = makeJournal();
     journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
@@ -2934,8 +2945,41 @@ describe('attempt revision compare-and-swap retry', () => {
     const result = await useCase.stopAttempt({ attemptId: 'attempt-1' });
 
     expect(result.outcome).toBe('terminated');
-    expect(attemptRepo.saveCalls).toBe(2);
-    expect(attemptRepo.attempts.get('attempt-1')?.state).toBe('cancelled');
+    expect(runner.stopCalls).toHaveLength(1);
+    const stored = attemptRepo.attempts.get('attempt-1');
+    expect(stored?.state).toBe('cancelled');
+    expect(stored?.revision).toBe((fresh.revision ?? 0) + 1);
+    expect(stored?.completionReceipt).toEqual(receipt);
+    expect(journal.releaseCount).toBe(1);
+    expect(journal.heldFor('attempt-1')).toBe(false);
+  });
+
+  it('stop conflicts and the fresh record is already cancelled: no second save, release runs once, stopSession once', async () => {
+    const seed = storedAttempt({ state: 'running' });
+    const fresh = storedAttempt({
+      state: 'cancelled',
+      outcome: 'stopped',
+      revision: 2,
+      updatedAtIso: '2026-10-15T08:04:00.000Z',
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      seed,
+      conflictOnSave: 1,
+      freshAfterConflict: fresh,
+    });
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const receipt = completionReceipt({ stoppedByRequest: true });
+    const runner = makeRunner({ stopResult: { outcome: 'terminated', receipt } });
+    const useCase = new StopAttemptUseCase({ attemptRepo, journal, runner: runner.port });
+
+    const result = await useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('terminated');
+    expect(runner.stopCalls).toHaveLength(1);
+    expect(attemptRepo.saveCalls).toBe(1);
+    expect(attemptRepo.attempts.get('attempt-1')).toEqual(fresh);
+    expect(journal.releaseCount).toBe(1);
     expect(journal.heldFor('attempt-1')).toBe(false);
   });
 

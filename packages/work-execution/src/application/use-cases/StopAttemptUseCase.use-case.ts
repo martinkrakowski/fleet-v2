@@ -46,6 +46,18 @@ async function appendJournalEntry(
   return entry;
 }
 
+/**
+ * A record that already reached a state the stop decision cannot improve on:
+ * cancelled, collected, or ended with an authoritative receipt.
+ */
+function isTerminalAttempt(record: AttemptRecord): boolean {
+  return (
+    record.state === 'cancelled' ||
+    record.state === 'collected' ||
+    (record.state === 'ended' && record.completionReceipt?.authoritative === true)
+  );
+}
+
 export class StopAttemptUseCase implements StopAttemptPort {
   constructor(private readonly deps?: StopAttemptDependencies) {}
 
@@ -59,41 +71,37 @@ export class StopAttemptUseCase implements StopAttemptPort {
       return { outcome: 'refused', reason: 'Attempt not found or has no sessionId' };
     }
 
-    return this.stopAttemptOnce(request, attempt, false);
+    return this.stopAttemptOnce(request, attempt);
   }
 
   /**
-   * Run the stop decision on one recorded attempt, at most twice. A stale
-   * write throws `AttemptRevisionConflictError`, handled here: the attempt is
-   * re-read once and the decision runs again on the fresh record (terminal
-   * states are already refused at the top of the decision). A second conflict
-   * propagates.
+   * Run the stop decision on one recorded attempt, exactly once. A conflict
+   * on a save that follows the runner side effect never re-runs the decision
+   * or `stopSession`: the fresh record is re-read once, the same transition
+   * is rebuilt on top of it (or skipped when the fresh record is already
+   * terminal), and a second conflict propagates.
    */
   private async stopAttemptOnce(
     request: StopAttemptRequest,
     attempt: AttemptRecord,
-    retried: boolean,
   ): Promise<StopAttemptResult> {
     const deps = this.deps!;
-    try {
-      // The private method is self-contained: it is called from the public
-      // wrapper after the same guard, and again after a conflict re-read.
-      if (!attempt.sessionId) {
-        return { outcome: 'refused', reason: 'Attempt not found or has no sessionId' };
-      }
+    if (!attempt.sessionId) {
+      return { outcome: 'refused', reason: 'Attempt not found or has no sessionId' };
+    }
 
-      if (
-        attempt.state === 'collected' ||
-        attempt.state === 'cancelled' ||
-        (attempt.state === 'ended' && attempt.completionReceipt?.authoritative === true)
-      ) {
-        return {
-          outcome: 'refused',
-          reason: `Attempt ${attempt.id} is in terminal state '${attempt.state}' and cannot be stopped`,
-        };
-      }
+    if (
+      attempt.state === 'collected' ||
+      attempt.state === 'cancelled' ||
+      (attempt.state === 'ended' && attempt.completionReceipt?.authoritative === true)
+    ) {
+      return {
+        outcome: 'refused',
+        reason: `Attempt ${attempt.id} is in terminal state '${attempt.state}' and cannot be stopped`,
+      };
+    }
 
-      const nowIso = request.nowIso ?? new Date().toISOString();
+    const nowIso = request.nowIso ?? new Date().toISOString();
 
     // Resolve the runner through the attempt's recorded host (H9b1). A
     // recorded host that changed or was removed refuses before any journal
@@ -129,15 +137,10 @@ export class StopAttemptUseCase implements StopAttemptPort {
     });
 
     if (stopResult.outcome === 'terminated' && stopResult.receipt.authoritative === true) {
-      const cancelled: AttemptRecord = {
-        ...attempt,
-        revision: nextAttemptRevision(attempt),
-        state: 'cancelled',
-        outcome: 'stopped',
-        completionReceipt: stopResult.receipt,
-        updatedAtIso: nowIso,
-      };
-      await deps.attemptRepo.saveAttempt(cancelled);
+      const cancelled = await this.saveCancelledOrSkip(attempt, stopResult.receipt, nowIso);
+      // Capacity release and the completion entry always run after a
+      // terminated stop, whether the save went in on the first try, went in
+      // on the rebuilt record, or was skipped as already terminal.
       const capacityReleased = await deps.journal.releaseCapacityReservation(attempt.id, nowIso);
       await appendJournalEntry(deps.journal, {
         attemptId: attempt.id,
@@ -186,13 +189,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
       return { outcome: 'still-running', attempt, reason: stopResult.reason };
     }
 
-    const reconciling: AttemptRecord = {
-      ...attempt,
-      revision: nextAttemptRevision(attempt),
-      state: 'reconciling',
-      updatedAtIso: nowIso,
-    };
-    await deps.attemptRepo.saveAttempt(reconciling);
+    const reconciling = await this.saveReconcilingOrSkip(attempt, nowIso);
     const failureReason =
       (stopResult as { reason?: string }).reason ?? 'Termination receipt was not authoritative';
     await appendJournalEntry(deps.journal, {
@@ -206,18 +203,73 @@ export class StopAttemptUseCase implements StopAttemptPort {
       detail: failureReason,
     });
     return { outcome: 'unknown', attempt: reconciling, reason: failureReason };
+  }
+
+  /**
+   * Save the `cancelled` transition after a terminated stop. On a revision
+   * conflict the fresh record is re-read once: a terminal fresh record skips
+   * the save, otherwise the same transition is rebuilt on top of the fresh
+   * record and saved once. A second conflict propagates.
+   */
+  private async saveCancelledOrSkip(
+    attempt: AttemptRecord,
+    receipt: NonNullable<AttemptRecord['completionReceipt']>,
+    nowIso: string,
+  ): Promise<AttemptRecord> {
+    const build = (base: AttemptRecord): AttemptRecord => ({
+      ...base,
+      revision: nextAttemptRevision(base),
+      state: 'cancelled',
+      outcome: 'stopped',
+      completionReceipt: receipt,
+      updatedAtIso: nowIso,
+    });
+    try {
+      const cancelled = build(attempt);
+      await this.deps!.attemptRepo.saveAttempt(cancelled);
+      return cancelled;
     } catch (error) {
-      if (error instanceof AttemptRevisionConflictError) {
-        if (retried) {
-          throw error;
-        }
-        const fresh = await deps.attemptRepo.findAttemptById(request.attemptId);
-        if (!fresh || !fresh.sessionId) {
-          return { outcome: 'refused', reason: 'Attempt not found or has no sessionId' };
-        }
-        return this.stopAttemptOnce(request, fresh, true);
+      if (!(error instanceof AttemptRevisionConflictError)) {
+        throw error;
       }
-      throw error;
+      const fresh = await this.deps!.attemptRepo.findAttemptById(attempt.id);
+      if (fresh && isTerminalAttempt(fresh)) {
+        return fresh;
+      }
+      const rebuilt = build(fresh ?? attempt);
+      await this.deps!.attemptRepo.saveAttempt(rebuilt);
+      return rebuilt;
+    }
+  }
+
+  /**
+   * Save the `reconciling` transition after a non-authoritative stop. On a
+   * revision conflict the fresh record is re-read once: a terminal fresh
+   * record skips the save, otherwise the same transition is rebuilt on top
+   * of the fresh record and saved once. A second conflict propagates.
+   */
+  private async saveReconcilingOrSkip(attempt: AttemptRecord, nowIso: string): Promise<AttemptRecord> {
+    const build = (base: AttemptRecord): AttemptRecord => ({
+      ...base,
+      revision: nextAttemptRevision(base),
+      state: 'reconciling',
+      updatedAtIso: nowIso,
+    });
+    try {
+      const reconciling = build(attempt);
+      await this.deps!.attemptRepo.saveAttempt(reconciling);
+      return reconciling;
+    } catch (error) {
+      if (!(error instanceof AttemptRevisionConflictError)) {
+        throw error;
+      }
+      const fresh = await this.deps!.attemptRepo.findAttemptById(attempt.id);
+      if (fresh && isTerminalAttempt(fresh)) {
+        return fresh;
+      }
+      const rebuilt = build(fresh ?? attempt);
+      await this.deps!.attemptRepo.saveAttempt(rebuilt);
+      return rebuilt;
     }
   }
 

@@ -78,6 +78,23 @@ export type SubprocessRunner = (
 ) => Promise<SubprocessResult>;
 
 /**
+ * A runner subprocess ended without an exit code (killed on its timeout, for
+ * example). It carries whatever output the subprocess had produced, so an
+ * ambiguous start can still be judged by the output the start itself named.
+ */
+export class RunnerSubprocessError extends Error {
+  readonly stdout: string;
+  readonly stderr: string;
+
+  constructor(message: string, stdout: string, stderr: string) {
+    super(message);
+    this.name = 'RunnerSubprocessError';
+    this.stdout = stdout;
+    this.stderr = stderr;
+  }
+}
+
+/**
  * The installation's selected lane-runner host, as the adapter receives it
  * from the composition root. With this option the adapter runs in v2 mode: the
  * host is the only source of the runner's routing, and no environment variable
@@ -516,13 +533,21 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
         startCall: true,
       });
     } catch (error) {
+      // A killed start still owns its output: whatever the subprocess had
+      // printed (an abort notice, a named session) travels into the lookup.
+      const carried =
+        error instanceof RunnerSubprocessError
+          ? { stdout: error.stdout, stderr: error.stderr, message: error.message }
+          : { stdout: '', stderr: '', message: String(error) };
       return this.startUnknownAfterLookup(
         request.worktreePath,
         env,
-        `Runner start failed: ${String(error)}`,
+        `Runner start failed: ${carried.message}`,
         agent,
         model,
         variant,
+        carried.stdout,
+        carried.stderr,
       );
     }
 
@@ -1005,7 +1030,11 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
         })
         .then((result) => {
           if (result.exitCode === null) {
-            throw new Error(result.error ?? 'Runner subprocess ended without an exit code');
+            throw new RunnerSubprocessError(
+              result.error ?? 'Runner subprocess ended without an exit code',
+              result.stdout,
+              result.stderr,
+            );
           }
           return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
         });

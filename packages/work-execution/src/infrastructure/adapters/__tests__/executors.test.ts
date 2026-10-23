@@ -865,3 +865,47 @@ describe('LocalExecutor killProcessTree option', () => {
     }
   });
 });
+
+describe('ExecutionRunnerAdapter: executor timeout on the start path', () => {
+  const capabilitiesRequest = {
+    attemptId: 'att-1',
+    worktreePath: '/wt',
+    briefPackagePath: '/wt/.lane/brief.md',
+    baseCommit: 'base000',
+    stepLimit: 10,
+    timeLimitSeconds: 60,
+    requiredCapabilities: {
+      source: 'legacy-asserted',
+      filesystemScope: 'scoped-worktree',
+      networkEgressRestricted: true,
+      cpuAndMemoryLimited: true,
+      processTreeTermination: true,
+      authoritativeCompletion: true,
+      artifactPersistence: true,
+    },
+    modelAssignment: { model: 'glm-5' },
+  } as const;
+
+  it('keeps the killed start output for the status lookup and reports unknown', async () => {
+    const { executor, calls } = fakeExecutor((_call, index) =>
+      index === 0
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: '',
+            stderr: 'ocm-run: aborted the session ses_z\n',
+            error: 'timeout',
+          }
+        : { exitCode: 3, stdout: 'ocm-run: running in /wt:\nses_z\n', stderr: '' },
+    );
+    const adapter = new ExecutionRunnerAdapter({ executor, ocmRunBin: '/bin/echo' });
+    const result = await adapter.startSession(capabilitiesRequest);
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('timeout');
+    }
+    // The status lookup still ran after the killed start.
+    expect(calls).toHaveLength(2);
+    expect(calls[1].argv.slice(1, 3)).toEqual(['--status', '--dir']);
+  });
+});

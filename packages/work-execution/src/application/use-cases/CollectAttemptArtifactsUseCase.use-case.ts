@@ -170,15 +170,31 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
       await this.deps.attemptRepo.saveAttempt(collectedAttempt);
     } catch (error) {
       if (error instanceof AttemptRevisionConflictError) {
-        // Never redo collection: re-read once and refuse naming the
-        // conflicting state.
+        // Never redo collection: re-read once. If the fresh record is still
+        // `ended`, rebuild the same `collected` transition on top of it with
+        // the artifacts and usage already gathered and save once (a second
+        // conflict propagates); release and the journal entry still run.
+        // Any other fresh state keeps the refusal naming that state.
         const fresh = await this.deps.attemptRepo.findAttemptById(attempt.id);
-        return {
-          outcome: 'refused',
-          reason: `Attempt ${attempt.id} changed to ${fresh?.state ?? 'unknown'} while collecting artifacts`,
+        if (fresh?.state !== 'ended') {
+          return {
+            outcome: 'refused',
+            reason: `Attempt ${attempt.id} changed to ${fresh?.state ?? 'unknown'} while collecting artifacts`,
+          };
+        }
+        const rebuilt: AttemptRecord = {
+          ...fresh,
+          revision: nextAttemptRevision(fresh),
+          state: 'collected',
+          outcome,
+          artifacts: collected.artifacts,
+          ...(usageResult !== undefined ? { usage: usageResult.usage } : {}),
+          updatedAtIso: nowIso,
         };
+        await this.deps.attemptRepo.saveAttempt(rebuilt);
+      } else {
+        throw error;
       }
-      throw error;
     }
     // Release is idempotent: false simply means no reservation was held.
     await this.deps.journal.releaseCapacityReservation(attempt.id, nowIso);

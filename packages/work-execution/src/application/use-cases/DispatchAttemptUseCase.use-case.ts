@@ -100,6 +100,18 @@ function readOwnerDecisionReferences(
 }
 
 /**
+ * A record that already reached a state no further runner work can change:
+ * cancelled, collected, or ended with an authoritative receipt.
+ */
+function isTerminalAfterWork(record: AttemptRecord): boolean {
+  return (
+    record.state === 'cancelled' ||
+    record.state === 'collected' ||
+    (record.state === 'ended' && record.completionReceipt?.authoritative === true)
+  );
+}
+
+/**
  * Append one journal entry with a deterministic identity derived from the
  * attempt's append-only history. Intent must be durable before the runner
  * subprocess runs, so every lifecycle use case appends through here.
@@ -548,17 +560,18 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     });
 
     if (startResult.outcome === 'started') {
+      const runnerValue = startResult.runner
+        ? { ...startResult.runner, ...(seatPolicyFlag !== undefined ? { useFreeSeats: seatPolicyFlag } : {}) }
+        : dispatchingAttempt.runner ?? null;
       const runningAttempt: AttemptRecord = {
         ...dispatchingAttempt,
         revision: nextAttemptRevision(dispatchingAttempt),
         state: 'running',
         sessionId: startResult.sessionId,
-        runner: startResult.runner
-          ? { ...startResult.runner, ...(seatPolicyFlag !== undefined ? { useFreeSeats: seatPolicyFlag } : {}) }
-          : dispatchingAttempt.runner ?? null,
+        runner: runnerValue,
         updatedAtIso: nowIso,
       };
-      const runningConflict = await this.saveAttemptOrConflict(runningAttempt, true);
+      const runningConflict = await this.saveRunningOrConflict(runningAttempt, startResult.sessionId, runnerValue, nowIso);
       if (runningConflict) {
         return runningConflict;
       }
@@ -613,10 +626,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       state: 'cancelled',
       updatedAtIso: nowIso,
     };
-    const cancelledConflict = await this.saveAttemptOrConflict(cancelledAttempt, false);
-    if (cancelledConflict) {
-      return cancelledConflict;
-    }
+    await this.saveRefusedCancelledOrSkip(cancelledAttempt, nowIso);
     await appendJournalEntry(this.deps.journal, {
       attemptId: request.attemptId,
       workOrderId: request.workOrderId,
@@ -661,6 +671,92 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         outcome: 'refused',
         reason: `Attempt ${record.id} changed to ${state} while dispatching`,
       };
+    }
+  }
+
+  /**
+   * Save the `running` transition after `startSession` succeeded. A conflict
+   * never re-runs the start: the fresh record is re-read once. A terminal
+   * fresh record skips the save and returns an `unknown` result whose reason
+   * names the session id, with a journal entry carrying it so the session is
+   * never lost; otherwise the same transition is rebuilt on top of the fresh
+   * record and saved once. A second conflict propagates.
+   */
+  private async saveRunningOrConflict(
+    runningAttempt: AttemptRecord,
+    sessionId: string,
+    runnerValue: AttemptRecord['runner'],
+    nowIso: string,
+  ): Promise<DispatchAttemptResult | null> {
+    const deps = this.deps!;
+    try {
+      await deps.attemptRepo.saveAttempt(runningAttempt);
+      return null;
+    } catch (error) {
+      if (!(error instanceof AttemptRevisionConflictError)) {
+        throw error;
+      }
+      const fresh = await deps.attemptRepo.findAttemptById(runningAttempt.id);
+      const state = fresh?.state ?? 'unknown';
+      if (
+        fresh &&
+        (fresh.state === 'cancelled' ||
+          fresh.state === 'collected' ||
+          (fresh.state === 'ended' && fresh.completionReceipt?.authoritative === true))
+      ) {
+        const reason = `Attempt ${runningAttempt.id} changed to ${state} while dispatching; session ${sessionId} is not recorded`;
+        await appendJournalEntry(deps.journal, {
+          attemptId: runningAttempt.id,
+          workOrderId: runningAttempt.workOrderId,
+          action: 'dispatch',
+          baseCommit: runningAttempt.baseCommit,
+          recordedAtIso: nowIso,
+          status: 'ambiguous',
+          sessionId,
+          detail: reason,
+        });
+        return { outcome: 'unknown', attempt: fresh, reason };
+      }
+      const rebuilt: AttemptRecord = {
+        ...(fresh ?? runningAttempt),
+        revision: nextAttemptRevision(fresh ?? runningAttempt),
+        state: 'running',
+        sessionId,
+        runner: runnerValue,
+        updatedAtIso: nowIso,
+      };
+      await deps.attemptRepo.saveAttempt(rebuilt);
+      return null;
+    }
+  }
+
+  /**
+   * Save the `cancelled` transition after a refused start. Nothing is
+   * running, so on a conflict the fresh record is re-read once: a terminal
+   * fresh record skips the save, otherwise the same transition is rebuilt on
+   * top of the fresh record and saved once. Either way the caller continues
+   * to the journal entry and the capacity release. A second conflict
+   * propagates.
+   */
+  private async saveRefusedCancelledOrSkip(cancelledAttempt: AttemptRecord, nowIso: string): Promise<void> {
+    const deps = this.deps!;
+    const build = (base: AttemptRecord): AttemptRecord => ({
+      ...base,
+      revision: nextAttemptRevision(base),
+      state: 'cancelled',
+      updatedAtIso: nowIso,
+    });
+    try {
+      await deps.attemptRepo.saveAttempt(cancelledAttempt);
+    } catch (error) {
+      if (!(error instanceof AttemptRevisionConflictError)) {
+        throw error;
+      }
+      const fresh = await deps.attemptRepo.findAttemptById(cancelledAttempt.id);
+      if (fresh && isTerminalAfterWork(fresh)) {
+        return;
+      }
+      await deps.attemptRepo.saveAttempt(build(fresh ?? cancelledAttempt));
     }
   }
 

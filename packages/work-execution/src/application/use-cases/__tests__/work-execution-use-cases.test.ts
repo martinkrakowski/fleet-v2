@@ -2983,8 +2983,40 @@ describe('attempt revision compare-and-swap retry', () => {
     expect(journal.heldFor('attempt-1')).toBe(false);
   });
 
-  it('dispatch does not start a second session when the running save conflicts', async () => {
+  it('dispatch conflicts on the running save: the fresh record carries the sessionId, startSession runs once', async () => {
     const attemptRepo = makeFailingSaveAttemptRepo({ conflictOnSave: 2 });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner(); // default start: started with session-1
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(runner.startCalls).toHaveLength(1);
+    expect(result.outcome).toBe('started');
+    const stored = attemptRepo.attempts.get('attempt-1');
+    expect(stored?.state).toBe('running');
+    expect(stored?.sessionId).toBe('session-1');
+  });
+
+  it('dispatch conflicts on the running save with a terminal fresh record: unknown naming the session, journal entry carries the sessionId', async () => {
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      conflictOnSave: 2,
+      freshAfterConflict: storedAttempt({ state: 'cancelled', revision: 5 }),
+    });
     const workOrderRepo = makeWorkOrderRepo();
     workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
     const journal = makeJournal();
@@ -3008,7 +3040,98 @@ describe('attempt revision compare-and-swap retry', () => {
     expect(runner.startCalls).toHaveLength(1);
     expect(result.outcome).toBe('unknown');
     if (result.outcome === 'unknown') {
-      expect(result.reason).toContain('changed to dispatching while dispatching');
+      expect(result.reason).toContain('session-1');
     }
+    const sessionEntries = journal.entries.filter((entry) => entry.sessionId === 'session-1');
+    expect(sessionEntries.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('dispatch refused start whose cancelled save conflicts still releases capacity once', async () => {
+    const attemptRepo = makeFailingSaveAttemptRepo({ conflictOnSave: 2 });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner({
+      startResult: { outcome: 'refused', reason: 'no seat available' },
+    });
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('refused');
+    expect(runner.startCalls).toHaveLength(1);
+    expect(attemptRepo.attempts.get('attempt-1')?.state).toBe('cancelled');
+    expect(journal.releaseCount).toBe(1);
+    expect(journal.heldFor('attempt-1')).toBe(false);
+  });
+
+  it('collect conflicts with the fresh record still ended: collected is rebuilt and saved, release runs once', async () => {
+    const seed = storedAttempt({
+      state: 'ended',
+      sessionId: 'session-1',
+      completionReceipt: completionReceipt(),
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({ seed, conflictOnSave: 1 });
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const artifacts = makeArtifactPort();
+    const useCase = new CollectAttemptArtifactsUseCase({
+      attemptRepo,
+      journal,
+      artifactPort: artifacts.port,
+    });
+
+    const result = await useCase.collectAttemptArtifacts(
+      validCollectRequest() as Parameters<CollectAttemptArtifactsUseCase['collectAttemptArtifacts']>[0],
+    );
+
+    expect(result.outcome).toBe('collected');
+    expect(attemptRepo.attempts.get('attempt-1')?.state).toBe('collected');
+    expect(journal.releaseCount).toBe(1);
+    expect(journal.heldFor('attempt-1')).toBe(false);
+  });
+
+  it('collect conflicts with the fresh record no longer ended: refused without release', async () => {
+    const seed = storedAttempt({
+      state: 'ended',
+      sessionId: 'session-1',
+      completionReceipt: completionReceipt(),
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      seed,
+      conflictOnSave: 1,
+      freshAfterConflict: storedAttempt({ state: 'cancelled', revision: 2 }),
+    });
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const artifacts = makeArtifactPort();
+    const useCase = new CollectAttemptArtifactsUseCase({
+      attemptRepo,
+      journal,
+      artifactPort: artifacts.port,
+    });
+
+    const result = await useCase.collectAttemptArtifacts(
+      validCollectRequest() as Parameters<CollectAttemptArtifactsUseCase['collectAttemptArtifacts']>[0],
+    );
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Attempt attempt-1 changed to cancelled while collecting artifacts',
+    });
+    expect(attemptRepo.attempts.get('attempt-1')?.state).toBe('cancelled');
+    expect(journal.releaseCount).toBe(0);
   });
 });

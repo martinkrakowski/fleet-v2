@@ -228,6 +228,25 @@ export function runSpawnOutcome(
       settle({ exitCode: null, signal: null, stdout, stderr, error });
     });
 
+    // Without a tree kill, a surviving grandchild may hold the inherited
+    // stdio pipes open, so 'close' could never come. Once the killed child
+    // has exited, drain briefly, then close the pipes and settle anyway.
+    child.on('exit', (_code: number | null, signal: NodeJS.Signals | null) => {
+      if (killTree || killed === null) return;
+      setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        const signalName = signal ?? killed;
+        settle({
+          exitCode: null,
+          signal: typeof signalName === 'string' ? signalName : null,
+          stdout,
+          stderr,
+          ...(error !== undefined ? { error } : {}),
+        });
+      }, KILL_GRACE_MS).unref();
+    });
+
     child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
       const signalName = signal ?? killed;
       // A timed-out or overran run was killed, so the child's exit code (0

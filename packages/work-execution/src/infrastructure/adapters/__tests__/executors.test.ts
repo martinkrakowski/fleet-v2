@@ -8,7 +8,7 @@ import { runSpawnOutcome } from '../spawn-run.js';
 import { executorForHost, resolveRoleExecutors } from '../ExecutorSelector.adapter.js';
 import { WorkspaceAdapter } from '../WorkspaceAdapter.adapter.js';
 import { AttemptArtifactAdapter } from '../AttemptArtifactAdapter.adapter.js';
-import { ExecutionRunnerAdapter } from '../ExecutionRunnerAdapter.adapter.js';
+import { ExecutionRunnerAdapter, RunnerSubprocessError, runViaExecFile } from '../ExecutionRunnerAdapter.adapter.js';
 import type { CommandRunOptions, CommandRunResult, CommandExecutorPort } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 
 type RunCall = { argv: readonly string[]; options?: CommandRunOptions };
@@ -803,6 +803,44 @@ describe('runner start budget (ExecutionRunnerAdapter)', () => {
     // The --status lookup after the ambiguous start is bounded too.
     expect(calls[1]?.argv.slice(1, 3)).toEqual(['--status', '--dir']);
     expect(calls[1]?.options?.timeoutMs).toBe(30_000);
+  });
+});
+
+describe('killed runs keep their output', () => {
+  it('a timed-out execFile start throws RunnerSubprocessError with the output printed before the kill', async () => {
+    const failure = await runViaExecFile(
+      'sh',
+      ['-c', 'echo "ocm-run: session started: ses_q (detached)"; exec sleep 5'],
+      undefined,
+      undefined,
+      { timeoutMs: 300 },
+    ).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(RunnerSubprocessError);
+    expect((failure as RunnerSubprocessError).stdout).toContain('ses_q');
+  });
+
+  it('settles when a surviving grandchild holds the pipes open (killProcessTree false)', async () => {
+    const pidfile = `/tmp/fleet-executors-test-${String(process.pid)}-pipe.pid`;
+    const started = Date.now();
+    try {
+      const result = await new LocalExecutor().run(
+        ['sh', '-c', 'echo before; sleep 30 & echo $! > "$1"; exec sleep 5', 'sh', pidfile],
+        { timeoutMs: 300, killProcessTree: false },
+      );
+      expect(result.exitCode).toBeNull();
+      expect(result.stdout).toContain('before');
+      expect(Date.now() - started).toBeLessThan(4000);
+    } finally {
+      try {
+        process.kill(Number(await readFile(pidfile, 'utf8')), 'SIGKILL');
+      } catch {
+        // The grandchild already exited.
+      }
+      await rm(pidfile, { force: true });
+    }
   });
 });
 

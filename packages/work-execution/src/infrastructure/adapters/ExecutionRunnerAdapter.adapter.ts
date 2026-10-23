@@ -236,8 +236,12 @@ export function buildRunnerEnv(
   return overrides === undefined ? sanitized : { ...sanitized, ...overrides };
 }
 
-/** Default subprocess runner: exit codes become values, spawn failures throw. */
-async function runViaExecFile(
+/**
+ * Default subprocess runner: exit codes become values, spawn failures throw,
+ * and a run killed by its timeout throws a RunnerSubprocessError carrying the
+ * output it printed before the kill. Exported for tests only.
+ */
+export async function runViaExecFile(
   command: string,
   args: readonly string[],
   env?: Readonly<Record<string, string>>,
@@ -259,13 +263,26 @@ async function runViaExecFile(
     });
     return { exitCode: 0, stdout: String(stdout), stderr: String(stderr) };
   } catch (error) {
-    const failed = error as { code?: number | string; stdout?: string; stderr?: string };
+    const failed = error as {
+      code?: number | string | null;
+      stdout?: string;
+      stderr?: string;
+      killed?: boolean;
+      signal?: string | null;
+    };
     if (typeof failed.code === 'number') {
       return {
         exitCode: failed.code,
         stdout: String(failed.stdout ?? ''),
         stderr: String(failed.stderr ?? ''),
       };
+    }
+    if (failed.killed === true || (failed.signal !== undefined && failed.signal !== null)) {
+      throw new RunnerSubprocessError(
+        error instanceof Error ? error.message : String(error),
+        String(failed.stdout ?? ''),
+        String(failed.stderr ?? ''),
+      );
     }
     throw error;
   }

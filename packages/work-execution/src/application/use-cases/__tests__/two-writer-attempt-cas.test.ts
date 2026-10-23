@@ -125,6 +125,7 @@ describe('attempt revision CAS two-writer race (reconcile vs stop)', () => {
       // Reconcile's inspectSession parks until released, then reports active.
       let inspectStarted = false;
       let releaseInspect!: () => void;
+      let inspectCount = 0;
       const inspectGate = new Promise<void>((resolve) => {
         releaseInspect = resolve;
       });
@@ -135,6 +136,7 @@ describe('attempt revision CAS two-writer race (reconcile vs stop)', () => {
         },
         async inspectSession() {
           inspectStarted = true;
+          inspectCount += 1;
           await inspectGate;
           return ACTIVE_STATUS;
         },
@@ -186,6 +188,7 @@ describe('attempt revision CAS two-writer race (reconcile vs stop)', () => {
       if (stopResult.outcome === 'terminated') {
         expect(stopResult.capacityReleased).toBe(true);
       }
+      const stopRevision = stopResult.outcome === 'terminated' ? stopResult.attempt.revision : undefined;
 
       // Release reconcile's inspect: it now writes a stale `running` (revision
       // 1 over the stored cancelled revision 1), conflicts, re-reads once and
@@ -203,6 +206,11 @@ describe('attempt revision CAS two-writer race (reconcile vs stop)', () => {
       expect(finalA?.state).toBe('cancelled');
       expect(finalB?.state).toBe('cancelled');
       expect(finalA?.revision).toBe(1);
+      expect(finalA?.revision).toBe(stopRevision);
+      // inspectSession ran once before the conflict, plus at most once on
+      // the post-conflict re-read.
+      expect(inspectCount).toBeGreaterThanOrEqual(1);
+      expect(inspectCount).toBeLessThanOrEqual(2);
       expect(journal.releaseCount).toBe(1);
     } finally {
       await fs.rm(stateDir, { recursive: true, force: true });

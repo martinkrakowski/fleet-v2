@@ -68,7 +68,10 @@ class H(http.server.BaseHTTPRequestHandler):
             out = []
             for n in sorted(os.listdir(os.path.join(T, "sessions"))):
                 kind, where = open(os.path.join(T, "sessions", n)).read().split("\n")[:2]
-                if kind == "idle": continue
+                # A created-but-not-yet-started session (POST, kind "created") is not
+                # listed: only a session whose client has started ("busy") counts, and an
+                # idle one never does. This is the readiness gap that proves D5's poll.
+                if kind in ("idle", "created"): continue
                 out.append('"%s":{"type":"%s"}' % (n, kind))
             return self.send(200, '{"data":{' + ",".join(out) + '}}')
         if u.path.startswith("/api/session/ses_") and os.path.exists(os.path.join(T, "v2")):
@@ -116,7 +119,11 @@ class H(http.server.BaseHTTPRequestHandler):
             while os.path.exists(os.path.join(T, "sessions", "ses_http%d" % n)):
                 n += 1
             sid = "ses_http%d" % n
-            open(os.path.join(T, "sessions", sid), "w").write("busy\n" + loc + "\n")
+            # The session is only *created* here; it is not listed in /api/session/active
+            # until the fake client has started and flipped it to "busy" below. That is the
+            # readiness gap D5's poll is built on (the server lists an id only after the
+            # client posts its prompt).
+            open(os.path.join(T, "sessions", sid), "w").write("created\n" + loc + "\n")
             return self.send(200, '{"data":{"id":"%s","location":{"directory":"%s"}}}' % (sid, loc))
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "session" and parts[3] == "interrupt":
             open(os.path.join(T, "interrupts"), "a").write(parts[2] + "\n")
@@ -162,6 +169,9 @@ if [ -n "$sid" ]; then
 fi
 [ -n "$d" ] || d="$(pwd)"
 echo "$d" > "$T/client-dir"
+# The readiness handshake: the server created this session as "created" (POST); the
+# client's start is exactly the moment it flips the session to "busy", which makes it
+# visible in /api/session/active. FAKE_START_TICKS delays this flip.
 printf 'busy\n%s\n' "$d" > "$T/sessions/$id"
 if [ -n "${FAKE_DEAF:-}" ]; then trap '' TERM; else trap 'exit 143' TERM; fi
 printf '{"type":"step_start","sessionID":"%s"}\n\tline with a tab and  two spaces\n' "$id" | tee "$T/expected"
@@ -789,6 +799,19 @@ check "M6: the password never appears in any curl argv" '! grep -q "secret123" "
 check "M6: the config on curl's stdin carries user = \"opencode:secret123\"" 'grep -q "user = \"opencode:secret123\"" "$T/curl.stdin"'
 rm -f "$T/bin/curl"
 clear_all
+
+# --- 8. D5 (L5a): --detach on a v2 server returns with the session id.
+# The fake server lists a session in /api/session/active only after the fake client has
+# started (POST creates a "created" session; the client flips it to "busy"), so these
+# tests prove the readiness poll.
+
+# (b): with a start delay, --detach does not print before the id is listed.
+clear_all
+runbg FAKE_START_TICKS=25 FAKE_TICKS=100 -- --detach --dir "$D" "p" > "$T/out" 2>&1; bg=$!
+sleep 1
+check "D5(b): no 'session started' before the id is listed" '! grep -q "session started" "$T/out"'
+wait "$bg"; rc=$?
+check "D5(b): once the id is listed it prints the line and exits 0" '[ "$rc" = 0 ] && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
 
 printf '%s failed\n' "$fails"
 [ "$fails" = 0 ]

@@ -18,5 +18,6 @@ export * from "./LaneDiffCheckPort.out-port.js";
 export * from "./OwnerDecisionPort.out-port.js";
 export * from "./RunnerForAttemptPort.out-port.js";
 export * from "./RunnerSelectorPort.out-port.js";
+export * from "./UsagePort.out-port.js";
 export * from "./WorkOrderRepositoryPort.out-port.js";
 export * from "./WorkspacePort.out-port.js";

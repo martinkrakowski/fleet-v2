@@ -390,8 +390,9 @@ bounded_contexts:
             - RunnerForAttemptPort
             - LaneDiffCheckPort
             - AllowedSeatPort
+            - UsagePort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, LocalExecutor, SshExecutor]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, OpencodeDbUsageAdapter, LocalExecutor, SshExecutor]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -425,6 +426,7 @@ bounded_contexts:
       BriefKnowledgePort: "Request bounded context proposals, record selected versions and forward only completed-attempt notes to the knowledge context."
       ActionAuthorizationPort: "Obtain and durably consume an applicable scope-bound grant from operator coordination; pending or unknown results block the action."
       ExecutionObservationPort: "Publish recorded lifecycle observations through coordination; preserve a delivery gap without failing the lane."
+      UsagePort: "Read what an attempt's recorded opencode session cost from opencode's own database on the recorded runner host; an attempt with no session id is unavailable with reason no session id, and a failed read never changes collection."
     adapter_bindings:
       - { adapter: WorkOrderRepositoryAdapter, implements: WorkOrderRepositoryPort, integration: local-transactional-store }
       - { adapter: AttemptRepositoryAdapter, implements: AttemptRepositoryPort, integration: local-transactional-store }
@@ -436,6 +438,7 @@ bounded_contexts:
       - { adapter: AllowedSeatAdapter, implements: AllowedSeatPort, integration: installation-seat-catalogue-structural-check }
       - { adapter: RunnerForAttemptAdapter, implements: RunnerForAttemptPort, integration: per-host-cached-ocm-run-adapters-with-confirm-or-unknown }
       - { adapter: LaneDiffCheckAdapter, implements: LaneDiffCheckPort, integration: injected-command-executor-git-collection }
+      - { adapter: OpencodeDbUsageAdapter, implements: UsagePort, integration: opencode-db-read-via-recorded-host-node-script }
       - { adapter: LocalExecutor, implements: CommandExecutorPort, integration: local-execfile-argv-no-shell }
       - { adapter: SshExecutor, implements: CommandExecutorPort, integration: batch-mode-ssh-quoted-argv }
       - { adapter: WorkspaceAdapter, implements: WorkspacePort, integration: reviewed-git-worktree-subprocess }

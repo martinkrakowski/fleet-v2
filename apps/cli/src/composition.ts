@@ -41,6 +41,7 @@ import {
   ForgeActionAdapter,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
+  OpencodeDbUsageAdapter,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
   ReconcileAttemptUseCase,
@@ -539,6 +540,8 @@ export interface FleetCliRuntime {
     /** The runner entry's declared lane budget; undefined without one. */
     readonly runnerMaxLanes?: number;
     readonly attemptArtifact: AttemptArtifactAdapter;
+    /** S3: reads an attempt's opencode session usage on its recorded host. */
+    readonly opencodeDbUsage: OpencodeDbUsageAdapter;
     readonly briefAuthoring: BriefAuthoringAdapter;
     readonly acceptanceAssessment: AcceptanceAssessmentAdapter;
     readonly acceptanceEvidence: AcceptanceEvidenceAdapter;
@@ -980,6 +983,20 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     executor: roleExecutors.worktree,
     executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
   });
+  // S3: the usage read runs on the attempt's recorded runner host through the
+  // same recorded-host executor the artifact read uses; a recorded host that
+  // changed or was removed refuses (throws), which the adapter reports as
+  // `unavailable`.
+  const opencodeDbUsage = new OpencodeDbUsageAdapter({
+    executorForRecordedHost: (attempt) => {
+      const resolved = executorForHost.executorForRecordedHost(attempt.runner ?? null);
+      if (!resolved.ok) {
+        throw new Error(resolved.reason);
+      }
+      return resolved.executor;
+    },
+    nodeBin: process.env.FLEET_USAGE_NODE_BIN?.trim() || undefined,
+  });
   // Hand-written brief files arrive per request; no default prose is assumed.
   const briefAuthoring = new BriefAuthoringAdapter();
   // The reviewed GitHub CLI subprocess behind a host-side delegate; every
@@ -1389,6 +1406,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     // declared lane-runner entry, in which case the request default applies.
     runnerMaxLanes: runnerProfile?.maxLanes,
     attemptArtifact,
+    opencodeDbUsage,
     briefAuthoring,
     acceptanceAssessment,
     acceptanceEvidence,
@@ -1443,6 +1461,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       artifactPort: attemptArtifact,
       briefKnowledge,
       runnerForAttempt,
+      usage: opencodeDbUsage,
     }),
     prepareFixAttempt: new PrepareFixAttemptUseCase({ attemptRepo: attemptRepository }),
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({

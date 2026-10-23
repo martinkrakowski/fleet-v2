@@ -2869,6 +2869,7 @@ describe('PrepareFixAttemptUseCase', () => {
 function makeFailingSaveAttemptRepo(
   options: {
     conflictOnSave?: number;
+    conflictOnSaves?: readonly number[];
     freshAfterConflict?: AttemptRecord;
     seed?: AttemptRecord;
   } = {},
@@ -2877,12 +2878,14 @@ function makeFailingSaveAttemptRepo(
   if (options.seed) {
     attempts.set(options.seed.id, options.seed);
   }
+  const conflictSaves =
+    options.conflictOnSaves ?? (options.conflictOnSave !== undefined ? [options.conflictOnSave] : []);
   const repo = {
     attempts,
     saveCalls: 0,
     async saveAttempt(record: AttemptRecord): Promise<void> {
       repo.saveCalls += 1;
-      if (repo.saveCalls === (options.conflictOnSave ?? Infinity)) {
+      if (conflictSaves.includes(repo.saveCalls)) {
         if (options.freshAfterConflict) {
           attempts.set(options.freshAfterConflict.id, options.freshAfterConflict);
         }
@@ -3147,6 +3150,98 @@ describe('attempt revision compare-and-swap retry', () => {
     expect(attemptRepo.attempts.get('attempt-1')?.state).toBe('cancelled');
     expect(journal.releaseCount).toBe(1);
     expect(journal.heldFor('attempt-1')).toBe(false);
+  });
+
+  it('dispatch with running and rebuilt saves both conflicting stops the started session once and journals completed then ambiguous', async () => {
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      conflictOnSaves: [2, 3],
+      freshAfterConflict: storedAttempt({ state: 'reconciling', sessionId: null, revision: 5 }),
+    });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const receipt = completionReceipt({ stoppedByRequest: true });
+    const runner = makeRunner({ stopResult: { outcome: 'terminated', receipt } });
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(runner.startCalls).toHaveLength(1);
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('second revision conflict');
+    }
+    expect(runner.stopCalls).toHaveLength(1);
+    expect(runner.stopCalls[0]?.sessionId).toBe('session-1');
+    const completed = journal.entries.filter((entry) => entry.status === 'completed');
+    expect(completed).toHaveLength(1);
+    const ambiguous = journal.entries.filter(
+      (entry) =>
+        entry.status === 'ambiguous' &&
+        entry.sessionId === 'session-1' &&
+        entry.detail.includes('second revision conflict') &&
+        entry.detail.includes('session-1'),
+    );
+    expect(ambiguous).toHaveLength(1);
+    expect(journal.heldFor('attempt-1')).toBe(true);
+  });
+
+  it('dispatch with running and preserved saves both conflicting stops the started session once and journals completed then ambiguous', async () => {
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      conflictOnSaves: [2, 3],
+      freshAfterConflict: storedAttempt({ state: 'running', sessionId: null, revision: 5 }),
+    });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const receipt = completionReceipt({ stoppedByRequest: true });
+    const runner = makeRunner({ stopResult: { outcome: 'terminated', receipt } });
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(runner.startCalls).toHaveLength(1);
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('second revision conflict');
+    }
+    expect(runner.stopCalls).toHaveLength(1);
+    expect(runner.stopCalls[0]?.sessionId).toBe('session-1');
+    const completed = journal.entries.filter((entry) => entry.status === 'completed');
+    expect(completed).toHaveLength(1);
+    const ambiguous = journal.entries.filter(
+      (entry) =>
+        entry.status === 'ambiguous' &&
+        entry.sessionId === 'session-1' &&
+        entry.detail.includes('second revision conflict') &&
+        entry.detail.includes('session-1'),
+    );
+    expect(ambiguous).toHaveLength(1);
+    expect(journal.heldFor('attempt-1')).toBe(true);
   });
 
   it('collect conflicts with the fresh record still ended: collected is rebuilt and saved, release runs once', async () => {

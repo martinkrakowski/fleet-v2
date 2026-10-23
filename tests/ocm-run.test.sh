@@ -63,6 +63,18 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.send(404, "", "text/plain")
         if u.path == "/api/session/active" and os.path.exists(os.path.join(T, "v2")):
             if os.path.exists(os.path.join(T, "broken")): return self.send(500, "boom", "text/plain")
+            # "$T/active-seq": how many reads still answer normally before ONE 500, then
+            # normal again — a single unreadable read at an exact position in the poll.
+            sq = os.path.join(T, "active-seq")
+            if os.path.exists(sq):
+                try: n = int(open(sq).read().strip())
+                except Exception: n = 0
+                if n > 0:
+                    open(sq, "w").write(str(n - 1))
+                else:
+                    os.remove(sq); return self.send(500, "boom", "text/plain")
+            if os.path.exists(os.path.join(T, "broken-once")):
+                os.remove(os.path.join(T, "broken-once")); return self.send(500, "boom", "text/plain")
             if os.path.exists(os.path.join(T, "broken-json")): return self.send(400, '{"error": "bad request"}')
             if os.path.exists(os.path.join(T, "v2-unknown-shape")): return self.send(200, '{"unexpected":123}')
             out = []
@@ -308,7 +320,7 @@ runbg() {
   ) &
 }
 busy() { printf '%s\n%s\n' "${3:-busy}" "$2" > "$T/sessions/$1"; }
-clear_all() { rm -rf "$T/proc"; rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/v2-session-fail" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-* "$T/client-dir" "$T/racepid"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; : > "$T/curl.args.log"; : > "$T/curl.stdin"; }
+clear_all() { rm -rf "$T/proc"; rm -f "$T/sessions"/* "$T/broken" "$T/broken-once" "$T/active-seq" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/v2-session-fail" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-* "$T/client-dir" "$T/racepid"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; : > "$T/curl.args.log"; : > "$T/curl.stdin"; }
 
 # --- 0. the guards
 check "guard: the server on the test port is the fake" '[ "$(curl -s -m 3 http://127.0.0.1:$P/__who)" = fake-opencode-server ]'
@@ -827,10 +839,27 @@ clear_all; : > "$T/v2-session-fail"
 out=$(run -- --detach --dir "$D" --agent lane "p" 2>&1); rc=$?
 check "D5(c): a failed session create exits 1 and starts nothing" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not create a session" && [ ! -s "$T/args.log" ]'
 clear_all
+p0=$(wc -l < "$T/fakepids")
 out=$(run FAKE_START_TICKS=10000 OCM_START_MAX=2 -- --detach --dir "$D" "p" 2>&1); rc=$?
 check "D5(c): a budget overrun exits 1" '[ "$rc" = 1 ] && echo "$out" | grep -q "did not appear within 2 s"'
 check "D5(c): the created id was aborted" 'grep -q "^ses_http1$" "$T/interrupts"'
 check "D5(c): no session is left behind" '[ ! -e "$T/sessions/ses_http1" ]'
+left=''
+for p in $(LC_ALL=C tail -n +"$((p0 + 1))" "$T/fakepids"); do kill -0 "$p" 2>/dev/null && left="$left $p"; done
+check "D5(c): a client was launched (the pid list grew)" '[ -n "$(LC_ALL=C tail -n +"$((p0 + 1))" "$T/fakepids")" ]'
+check "D5(c): the detached client was killed on the overrun" '[ -z "$left" ]'
+
+# One unreadable status read during the poll is "not yet"; the poll goes on to success.
+# active-seq=1: the pre-dispatch busy read passes, the first poll read fails, the next ones
+# answer (the client flips its session to busy 0.3 s in, the poll sleeps 1 s between looks).
+clear_all; printf '1\n' > "$T/active-seq"
+out=$(run FAKE_START_TICKS=3 FAKE_TICKS=50 -- --detach --dir "$D" "p" > "$T/out" 2>&1); rc=$?
+check "D5: one unreadable status read during the poll is 'not yet'; the poll goes on" '[ "$rc" = 0 ] && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
+
+# -c/--continue is not a session id: --detach refuses it before anything is created.
+clear_all
+out=$(run -- --detach --dir "$D" -c "p" 2>&1); rc=$?
+check "D5: --detach -c is refused with exit 2 and creates nothing" '[ "$rc" = 2 ] && echo "$out" | grep -q -- "--detach needs a session id" && ! grep -q "^POST /api/session$" "$T/http.log" && [ ! -s "$T/args.log" ]'
 
 # (d): the detached client's stderr is in the log (a non-local dispatch logs under
 # TMPDIR; the local-directory branch logs in <dir>/.lane, checked with D5(f)).

@@ -713,21 +713,36 @@ ocm_launch() {
 ocm_create_session() {
   ocm_sid=''
   if [ "$has_session" = 1 ]; then
+    # Only -s <id>, --session <id> and --session=<id> carry a caller id;
+    # -c/--continue does not (opencode continues the latest session itself).
     prev=''
+    ocm_bare=0
     for a in "$@"; do
+      case "$a" in
+        -s | --session) ocm_bare=1 ;;
+      esac
       case "$prev" in
-        -s | --session | -c | --continue) ocm_sid=$a; break ;;
+        -s | --session) ocm_sid=$a; break ;;
       esac
       case "$a" in
         --session=*) ocm_sid=${a#--session=}; break ;;
       esac
       prev=$a
     done
-    [ -n "$ocm_sid" ] || {
+    if [ -n "$ocm_sid" ]; then
+      rc=0
+      return
+    fi
+    if [ "$ocm_bare" = 1 ]; then
       echo "ocm-run: -s was given without a session id" >&2
       rc=2
       return
-    }
+    fi
+    if [ "$detach" = 1 ]; then
+      echo "ocm-run: --detach needs a session id: pass -s <id> or none" >&2
+      rc=2
+      return
+    fi
     rc=0
     return
   fi
@@ -830,10 +845,9 @@ ocm_detach_run() {
   ocm_detach_launch "$@"
   [ "$rc" = 0 ] || { ocm_detach_cleanup; exit "$rc"; }
   while :; do
-    now=$(ocm_running) || {
-      echo "ocm-run: could not read the session status; cannot confirm $ocm_sid is running" >&2
-      exit 1
-    }
+    # One unreadable status read is "not yet", not the end: keep polling until the
+    # budget runs out; only the overrun aborts and exits 1.
+    now=$(ocm_running) || now=''
     case " $now " in
       *" $ocm_sid "*)
         echo "session started: $ocm_sid (detached)"
@@ -842,7 +856,7 @@ ocm_detach_run() {
     esac
     if [ $(( $(date +%s) - start )) -ge "$max" ]; then
       echo "ocm-run: session $ocm_sid did not appear within $max s; aborting it" >&2
-      ocm_abort "$ocm_sid"
+      ocm_detach_cleanup
       exit 1
     fi
     if [ "$ocm_retried" = 0 ] && LC_ALL=C grep -q "database is locked" "$ocm_log" 2>/dev/null; then

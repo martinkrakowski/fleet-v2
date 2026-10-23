@@ -8,6 +8,7 @@ import {
 } from './composition.js';
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 import type { AttemptRecord, WorkOrderRecord } from '@fleet/work-execution';
+import { nextAttemptRevision } from '@fleet/work-execution';
 
 function makeHeadH(): string {
   return '1111111111111111111111111111111111111111';
@@ -512,9 +513,11 @@ describe('apps/cli composition', () => {
     });
     // The attempt was dispatched on a recorded seat, so the acceptance use
     // case can bind the implementer and reach the door re-check.
+    const storedAttempt = await rt.execution.attemptRepository.findAttemptById('att-door-e2e');
     await rt.execution.attemptRepository.saveAttempt({
-      ...makeAttempt('att-door-e2e', 'wo-att-door-e2e', HEAD, [doorRef]),
+      ...storedAttempt!,
       runner: { kind: 'opencode', remotePort: 0, host: null, agent: null, model: 'seat/implementer', variant: null },
+      revision: nextAttemptRevision(storedAttempt!),
     });
     const grantId = 'grant-door-e2e';
     await rt.coordination.coordinationRequestRepository.saveRequest(

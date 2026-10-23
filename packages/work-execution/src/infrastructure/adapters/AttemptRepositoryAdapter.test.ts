@@ -233,9 +233,8 @@ describe('AttemptRepositoryAdapter revision compare-and-swap', () => {
   }
 
   it('reads a legacy on-disk record without a revision as 0 and accepts revision 1 (stateDir)', async () => {
-    const legacy: AttemptRecord = makeAttempt({ state: 'running', sessionId: 'ses-legacy' });
-    const { revision: _dropped, ...withoutRevision } = legacy;
-    await fs.writeFile(path.join(tempDir, 'attempts.json'), JSON.stringify([withoutRevision]), 'utf8');
+    const legacy = makeAttempt({ state: 'running', sessionId: 'ses-legacy' });
+    await fs.writeFile(path.join(tempDir, 'attempts.json'), JSON.stringify([legacy]), 'utf8');
 
     const adapter = makeRepo(true);
     const loaded = await adapter.findAttemptById('att-1');

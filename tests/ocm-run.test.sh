@@ -1017,5 +1017,12 @@ check "D5: a .lane failure with the caller's own -s id exits 1" '[ "$rc" = 1 ] &
 check "D5: the caller's own -s id is not interrupted by the .lane failure" '! grep -q ses_http9 "$T/interrupts"'
 check "D5: the caller's own -s session still exists after the .lane failure" '[ -e "$T/sessions/ses_http9" ]'
 
+# An already-active caller id is refused even with OCM_ALLOW_BUSY=1: it would satisfy the
+# first readiness poll before the new client started (CodeRabbit).
+clear_all; busy ses_http9 "$D"
+out=$(run OCM_ALLOW_BUSY=1 -- --detach --dir "$D" -s ses_http9 "p" 2>&1); rc=$?
+check "D5: an active caller -s id is refused with exit 75 under OCM_ALLOW_BUSY=1" '[ "$rc" = 75 ] && echo "$out" | grep -q "already running; --detach needs an idle session"'
+check "D5: the refused active id launched no client and was not interrupted" '[ ! -s "$T/args.log" ] && ! grep -q ses_http9 "$T/interrupts" && [ -e "$T/sessions/ses_http9" ]'
+
 printf '%s failed\n' "$fails"
 [ "$fails" = 0 ]

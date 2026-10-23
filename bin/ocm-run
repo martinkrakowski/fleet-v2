@@ -837,6 +837,21 @@ ocm_detach_launch() {
   ocm_create_session "$@"
   [ "$rc" = 0 ] || return
   ocm_sid_caller=$has_session
+  # A caller id that is already active would satisfy the first readiness poll before the
+  # new client has started (possible only with OCM_ALLOW_BUSY=1, which skips the busy
+  # guard): refuse it (exit 75), and never detach blind when the status cannot be read.
+  if [ "$ocm_sid_caller" = 1 ]; then
+    ocm_before=$(ocm_running) || {
+      echo "ocm-run: could not read the session status from $url; not detaching blind" >&2
+      rc=1
+      return
+    }
+    if printf '%s\n' "$ocm_before" | LC_ALL=C grep -qxF -- "$ocm_sid"; then
+      echo "ocm-run: session $ocm_sid is already running; --detach needs an idle session" >&2
+      rc=75
+      return
+    fi
+  fi
   if [ -d "$dir" ]; then
     ocm_logdir="$dir/.lane"
     mkdir -p "$ocm_logdir" 2>/dev/null || {

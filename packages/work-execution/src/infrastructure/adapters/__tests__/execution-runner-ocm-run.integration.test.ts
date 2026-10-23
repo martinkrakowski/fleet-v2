@@ -268,15 +268,33 @@ function makeStartRequest(
   };
 }
 
-function snapshotEnv(): { HOME?: string; PATH?: string } {
-  return { HOME: process.env.HOME, PATH: process.env.PATH };
+/**
+ * Environment keys the integration suite touches. The OCM/FLEET keys are
+ * deleted before every run: a host operator's runner routing must never
+ * point this suite at a real host.
+ */
+const SNAPSHOT_ENV_KEYS = [
+  'HOME',
+  'PATH',
+  'OCM_HOST',
+  'OCM_REMOTE_PORT',
+  'OCM_PORT',
+  'FLEET_OCM_RUN_BIN',
+] as const;
+
+function snapshotEnv(): Partial<Record<(typeof SNAPSHOT_ENV_KEYS)[number], string | undefined>> {
+  const snapshot: Partial<Record<(typeof SNAPSHOT_ENV_KEYS)[number], string | undefined>> = {};
+  for (const key of SNAPSHOT_ENV_KEYS) snapshot[key] = process.env[key];
+  return snapshot;
 }
 
-function restoreEnv(snapshot: { HOME?: string; PATH?: string }): void {
-  if (snapshot.HOME === undefined) delete process.env.HOME;
-  else process.env.HOME = snapshot.HOME;
-  if (snapshot.PATH === undefined) delete process.env.PATH;
-  else process.env.PATH = snapshot.PATH;
+function restoreEnv(
+  snapshot: Partial<Record<(typeof SNAPSHOT_ENV_KEYS)[number], string | undefined>>,
+): void {
+  for (const key of SNAPSHOT_ENV_KEYS) {
+    if (snapshot[key] === undefined) delete process.env[key];
+    else process.env[key] = snapshot[key];
+  }
 }
 
 interface SetupContext {
@@ -300,11 +318,30 @@ async function setup(flip: boolean): Promise<SetupContext> {
   const originalEnv = snapshotEnv();
   process.env.HOME = homeDir;
   process.env.PATH = `${binDir}:${process.env.PATH ?? ''}`;
+  // The suite talks only to the fake in-process server it started itself.
+  delete process.env.OCM_HOST;
+  delete process.env.OCM_REMOTE_PORT;
+  delete process.env.OCM_PORT;
+  delete process.env.FLEET_OCM_RUN_BIN;
 
   const adapter = new ExecutionRunnerAdapter({
     remotePort: port,
     startBudgetSeconds: 10,
     ocmRunBin,
+  });
+
+  // Assertion-free guard: if operator routing reappears, starting a session
+  // fails loudly instead of reaching a real host.
+  const realStartSession = adapter.startSession.bind(adapter);
+  Object.defineProperty(adapter, 'startSession', {
+    value: (request: StartRunnerSessionRequest) => {
+      if (process.env.OCM_HOST !== undefined) {
+        throw new Error(
+          'OCM_HOST is set while the integration suite starts a session; it must never reach a real host',
+        );
+      }
+      return realStartSession(request);
+    },
   });
 
   let cleaned = false;

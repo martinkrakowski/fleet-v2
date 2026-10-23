@@ -2,9 +2,11 @@
 
 - **Date:** 2026-10-23
 - **Target repository:** `fleet-v2`
-- **Status:** proposal, nothing built. Three candidate stations (§4) and three decisions for the
-  owner (§7). It schedules nothing before wave 1 of
-  `2026-10-22_security-review-remediation-plan.md` is merged (§8).
+- **Status:** rev 2: D1 to D3 decided as recommended by the owner on 2026-10-23 ("Proceed with
+  your recommendations"); S3 starts first (§8), S1 and S2 wait for wave 1 of
+  `2026-10-22_security-review-remediation-plan.md`. Rev 1 answered four review minors on S1 and
+  S2 (the attempt record's existing fields, the refusal-to-fix transition, `proof[]` removed, the
+  acceptance hand-off).
 - **Owner request (2026-10-23):** research a CNCF Sandbox internal developer platform for
   Kubernetes and "assert if there is something fleet-v2 can learn" from it; then "file the
   write-up as a planning doc and open the PR".
@@ -155,7 +157,7 @@ reproducible; it must not make the CLI the thing that decides a merge.
   behind adapters" in `AGENTS.md` is the right instinct; S3 wraps `lane-usage`'s query rather
   than replacing the measurement idea.
 
-## 7. Decisions for the owner
+## 7. Decisions (D1 to D3 decided as recommended, owner 2026-10-23)
 
 - **D1.** Does `SeatPlan` replace `ModelAssignment.fallbackModel` outright (one-way for the
   stored records; a migration of existing attempts) or sit beside it with the single fallback as
@@ -169,10 +171,11 @@ reproducible; it must not make the CLI the thing that decides a merge.
 
 ## 8. Sequencing
 
-After wave 1 of the 2026-10-22 remediation plan (B1 to B4) is merged, because S1 and S2 touch
-`DispatchAttempt` and the diff gate that wave 1 fixes. Order: S3 (Tier 1, restores the "measure
-every lane" rule), then S1, then S2. Five lanes of about 45 minutes; each PR names its tier and
-Grok rounds. No production target is involved.
+S3 first and now: it adds a port, an adapter and an optional record field, touching neither
+`DispatchAttempt` nor the diff gate, so it does not wait for wave 1 and it restores the "measure
+every lane" rule. S1 and S2 after wave 1 of the 2026-10-22 remediation plan (B1 to B4) is
+merged, because they touch what wave 1 fixes. Five lanes of about 45 minutes; each PR names its
+tier and Grok rounds. No production target is involved.
 
 ## Hard to undo
 

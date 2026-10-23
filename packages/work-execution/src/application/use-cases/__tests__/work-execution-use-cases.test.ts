@@ -2679,6 +2679,11 @@ describe('CollectAttemptArtifactsUseCase', () => {
     );
 
     expect(result.outcome).toBe('collected');
+    // The port, not the use case, decides "no session id": the use case must
+    // still have called it exactly once, with the null-session attempt.
+    expect(usage.calls).toHaveLength(1);
+    expect(usage.calls[0]?.attempt.id).toBe('attempt-1');
+    expect(usage.calls[0]?.attempt.sessionId).toBeNull();
     const saved = setup.attemptRepo.attempts.get('attempt-1');
     expect(saved?.usage?.source).toBe('unavailable');
     expect(saved?.usage?.reason).toBe('no session id');

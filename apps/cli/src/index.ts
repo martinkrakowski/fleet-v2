@@ -423,7 +423,12 @@ function laneRunnerCandidateHosts(
   return candidates;
 }
 
-function exitCodeForResult(result: unknown, group?: string, subcommand?: string): number {
+/**
+ * The process exit code for one command result: an outcome in
+ * NON_ZERO_OUTCOMES is a refusal-family exit (1), anything else completes
+ * (0). Exported for the CLI's exit-code tests, like the helpers around it.
+ */
+export function exitCodeForResult(result: unknown, group?: string, subcommand?: string): number {
   if (typeof result === 'object' && result !== null && 'outcome' in result) {
     const outcome = (result as { outcome: unknown }).outcome;
     if (typeof outcome === 'string') {

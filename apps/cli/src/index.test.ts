@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { FleetInstallation } from '@fleet/installation';
 import type { SubprocessRunner } from '@fleet/work-execution';
-import { resolveRunnerSettings, runCli, type CliIo } from './index.js';
+import { exitCodeForResult, resolveRunnerSettings, runCli, type CliIo } from './index.js';
 import { createFleetCliRuntime } from './composition.js';
 
 describe('CLI installation wiring', () => {
@@ -223,7 +223,7 @@ describe('CLI installation wiring', () => {
     });
   });
 
-  describe('attempt dispatch and stop CLI commands', () => {
+  describe('attempt dispatch, stop and usage CLI commands', () => {
     it('refuses attempt dispatch --model gpt-5 with usage error naming the field', async () => {
       const dummyRuntime = createFleetCliRuntime({ stateDir: tempDir });
       const { io, stderr } = createMockIo();
@@ -296,6 +296,50 @@ describe('CLI installation wiring', () => {
 
       const parsedStdout = JSON.parse(stdout.join(''));
       expect(parsedStdout.outcome).toBe('terminated');
+    });
+
+    it('attempt usage exits 1 when the read is unavailable and 0 when it reads', async () => {
+      // The command returns the usage port's result, so the outcome alone
+      // decides the exit code: `unavailable` is a refusal-family exit (1),
+      // `read` completes (0).
+      expect(exitCodeForResult({ outcome: 'unavailable' }, 'attempt', 'usage')).toBe(1);
+      expect(exitCodeForResult({ outcome: 'read' }, 'attempt', 'usage')).toBe(0);
+
+      // End to end through the same command path the neighbouring cases
+      // use: an attempt with no session id is an unavailable read (the port
+      // decides; nothing is run), so the command exits 1 while still
+      // printing the result and storing the unavailable usage record.
+      const runtime = createFleetCliRuntime({ stateDir: tempDir });
+      const attemptId = 'att-usage-no-session';
+      await runtime.execution.attemptRepository.saveAttempt({
+        id: attemptId,
+        workOrderId: 'wo-1',
+        kind: 'initial',
+        fixNumber: 0,
+        priorAttemptId: null,
+        worktreePath: tempDir,
+        baseCommit: 'commit-base',
+        state: 'ended',
+        outcome: null,
+        briefDigest: 'digest-1',
+        briefPackagePath: '.lane/brief.md',
+        sessionId: null,
+        completionReceipt: null,
+        artifacts: null,
+        runner: null,
+        createdAtIso: '2026-10-15T00:00:00.000Z',
+        updatedAtIso: '2026-10-15T00:00:00.000Z',
+      });
+
+      const { io, stdout } = createMockIo();
+      const exitCode = await runCli(['attempt', 'usage', '--attemptId', attemptId], io, runtime);
+
+      expect(exitCode).toBe(1);
+      const parsed = JSON.parse(stdout.join(''));
+      expect(parsed.outcome).toBe('unavailable');
+      expect(parsed.usage.reason).toBe('no session id');
+      const saved = await runtime.execution.attemptRepository.findAttemptById(attemptId);
+      expect(saved?.usage?.reason).toBe('no session id');
     });
   });
 });

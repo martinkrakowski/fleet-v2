@@ -718,9 +718,40 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         await deps.attemptRepo.saveAttempt(rebuilt);
         return { kind: 'saved', stored: rebuilt };
       }
-      if (fresh.sessionId === null) {
-        // The state stays whatever someone else set it to; only the session
-        // is recorded so reconcile can find it.
+      const freshIsTerminal =
+        fresh.state === 'cancelled' || fresh.state === 'collected' || fresh.state === 'ended';
+      if (freshIsTerminal || fresh.sessionId !== null) {
+        // Someone else ended the attempt or recorded another session while
+        // this call started one. The new session is never attached to that
+        // record (reconcile would demote a terminal state or release capacity
+        // twice); it is stopped instead, once, and the outcome journalled.
+        const stopResult = await deps.runner.stopSession({
+          attemptId: runningAttempt.id,
+          sessionId,
+          gracePeriodSeconds: 10,
+          worktreePath: runningAttempt.worktreePath,
+          runner: runnerValue,
+        });
+        const reason =
+          `Attempt ${runningAttempt.id} is in state ${fresh.state}` +
+          (fresh.sessionId !== null ? ` with session ${fresh.sessionId}` : '') +
+          `; started session ${sessionId} was not recorded and its stop was ${stopResult.outcome}`;
+        await appendJournalEntry(deps.journal, {
+          attemptId: runningAttempt.id,
+          workOrderId: runningAttempt.workOrderId,
+          action: 'dispatch',
+          baseCommit: runningAttempt.baseCommit,
+          recordedAtIso: nowIso,
+          status: 'ambiguous',
+          sessionId,
+          detail: reason,
+        });
+        return { kind: 'conflict', result: { outcome: 'unknown', attempt: fresh, reason } };
+      }
+      {
+        // A non-terminal record without a session: the state stays whatever
+        // someone else set it to; only the session is recorded so reconcile
+        // can find it.
         const preserved: AttemptRecord = {
           ...fresh,
           sessionId,
@@ -742,18 +773,6 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         });
         return { kind: 'conflict', result: { outcome: 'unknown', attempt: preserved, reason } };
       }
-      const reason = `Attempt ${runningAttempt.id} is in state ${fresh.state} with session ${fresh.sessionId}; started session ${sessionId} is not recorded`;
-      await appendJournalEntry(deps.journal, {
-        attemptId: runningAttempt.id,
-        workOrderId: runningAttempt.workOrderId,
-        action: 'dispatch',
-        baseCommit: runningAttempt.baseCommit,
-        recordedAtIso: nowIso,
-        status: 'ambiguous',
-        sessionId,
-        detail: reason,
-      });
-      return { kind: 'conflict', result: { outcome: 'unknown', attempt: fresh, reason } };
     }
   }
 

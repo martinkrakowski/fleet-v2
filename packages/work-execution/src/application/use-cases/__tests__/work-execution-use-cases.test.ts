@@ -3187,7 +3187,7 @@ describe('attempt revision compare-and-swap retry', () => {
     expect(refusedEntries[0]?.detail).toContain('state running');
   });
 
-  it('dispatch running-save conflicts with a fresh non-authoritative ended record and no session: state stays ended, the session is recorded, unknown', async () => {
+  it('dispatch running-save conflicts with a fresh non-authoritative ended record and no session: the started session is stopped, never attached, unknown', async () => {
     const freshEnded = storedAttempt({
       state: 'ended',
       sessionId: null,
@@ -3224,10 +3224,50 @@ describe('attempt revision compare-and-swap retry', () => {
     }
     const stored = attemptRepo.attempts.get('attempt-1');
     expect(stored?.state).toBe('ended');
-    expect(stored?.sessionId).toBe('session-1');
-    expect(stored?.revision).toBe(6);
+    expect(stored?.sessionId).toBeNull();
+    expect(stored?.revision).toBe(5);
+    expect(runner.stopCalls).toHaveLength(1);
+    expect(runner.stopCalls[0]?.sessionId).toBe('session-1');
     const sessionEntries = journal.entries.filter((entry) => entry.sessionId === 'session-1');
     expect(sessionEntries.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('dispatch running-save conflicts with a fresh record holding another session: the started session is stopped, the other session is kept', async () => {
+    const freshOther = storedAttempt({
+      state: 'running',
+      sessionId: 'session-other',
+      revision: 5,
+      updatedAtIso: '2026-10-15T08:06:00.000Z',
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({ conflictOnSave: 2, freshAfterConflict: freshOther });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner();
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(runner.startCalls).toHaveLength(1);
+    expect(runner.stopCalls).toHaveLength(1);
+    expect(runner.stopCalls[0]?.sessionId).toBe('session-1');
+    expect(result.outcome).toBe('unknown');
+    const stored = attemptRepo.attempts.get('attempt-1');
+    expect(stored?.sessionId).toBe('session-other');
+    expect(stored?.state).toBe('running');
+    expect(stored?.revision).toBe(5);
   });
 
   it('stop without an authoritative receipt conflicts with a fresh non-authoritative ended record: no reconciling write', async () => {

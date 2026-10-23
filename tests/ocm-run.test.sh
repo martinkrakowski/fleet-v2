@@ -63,12 +63,27 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.send(404, "", "text/plain")
         if u.path == "/api/session/active" and os.path.exists(os.path.join(T, "v2")):
             if os.path.exists(os.path.join(T, "broken")): return self.send(500, "boom", "text/plain")
+            # "$T/active-seq": how many reads still answer normally before ONE 500, then
+            # normal again — a single unreadable read at an exact position in the poll.
+            sq = os.path.join(T, "active-seq")
+            if os.path.exists(sq):
+                try: n = int(open(sq).read().strip())
+                except Exception: n = 0
+                if n > 0:
+                    open(sq, "w").write(str(n - 1))
+                else:
+                    os.remove(sq); return self.send(500, "boom", "text/plain")
+            if os.path.exists(os.path.join(T, "broken-once")):
+                os.remove(os.path.join(T, "broken-once")); return self.send(500, "boom", "text/plain")
             if os.path.exists(os.path.join(T, "broken-json")): return self.send(400, '{"error": "bad request"}')
             if os.path.exists(os.path.join(T, "v2-unknown-shape")): return self.send(200, '{"unexpected":123}')
             out = []
             for n in sorted(os.listdir(os.path.join(T, "sessions"))):
                 kind, where = open(os.path.join(T, "sessions", n)).read().split("\n")[:2]
-                if kind == "idle": continue
+                # A created-but-not-yet-started session (POST, kind "created") is not
+                # listed: only a session whose client has started ("busy") counts, and an
+                # idle one never does. This is the readiness gap that proves D5's poll.
+                if kind in ("idle", "created"): continue
                 out.append('"%s":{"type":"%s"}' % (n, kind))
             return self.send(200, '{"data":{' + ",".join(out) + '}}')
         if u.path.startswith("/api/session/ses_") and os.path.exists(os.path.join(T, "v2")):
@@ -106,6 +121,9 @@ class H(http.server.BaseHTTPRequestHandler):
         if len(parts) == 2 and parts[0] == "api" and parts[1] == "session":
             if os.path.exists(os.path.join(T, "v2-session-fail")):
                 return self.send(500, '{"error":"session create failed"}')
+            if os.path.exists(os.path.join(T, "slow-create")):
+                import time
+                time.sleep(3)
             length = int(self.headers.get("Content-Length", 0))
             data = self.rfile.read(length).decode()
             try:
@@ -116,7 +134,11 @@ class H(http.server.BaseHTTPRequestHandler):
             while os.path.exists(os.path.join(T, "sessions", "ses_http%d" % n)):
                 n += 1
             sid = "ses_http%d" % n
-            open(os.path.join(T, "sessions", sid), "w").write("busy\n" + loc + "\n")
+            # The session is only *created* here; it is not listed in /api/session/active
+            # until the fake client has started and flipped it to "busy" below. That is the
+            # readiness gap D5's poll is built on (the server lists an id only after the
+            # client posts its prompt).
+            open(os.path.join(T, "sessions", sid), "w").write("created\n" + loc + "\n")
             return self.send(200, '{"data":{"id":"%s","location":{"directory":"%s"}}}' % (sid, loc))
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "session" and parts[3] == "interrupt":
             open(os.path.join(T, "interrupts"), "a").write(parts[2] + "\n")
@@ -143,6 +165,13 @@ echo "$$" >> "$T/fakepids"
 n=$(( $(cat "$T/count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/count"
 printf '%s\n' "$*" >> "$T/args.log"
 if [ -e "$T/locked-once" ]; then rm -f "$T/locked-once"; echo "Error: database is locked" >&2; exit 1; fi
+# locked-hang: the client reports the lock and then hangs; only a TERM can stop it.
+if [ -e "$T/locked-hang" ]; then
+  rm -f "$T/locked-hang"
+  echo "Error: database is locked" >&2
+  trap 'exit 143' TERM
+  while :; do sleep 0.1; done
+fi
 # FAKE_START_TICKS: the client's start-up, during which the server knows no session yet
 i=0; while [ "$i" -lt "${FAKE_START_TICKS:-0}" ]; do sleep 0.1; i=$((i + 1)); done
 d=''; sid=''; prev=''
@@ -162,6 +191,9 @@ if [ -n "$sid" ]; then
 fi
 [ -n "$d" ] || d="$(pwd)"
 echo "$d" > "$T/client-dir"
+# The readiness handshake: the server created this session as "created" (POST); the
+# client's start is exactly the moment it flips the session to "busy", which makes it
+# visible in /api/session/active. FAKE_START_TICKS delays this flip.
 printf 'busy\n%s\n' "$d" > "$T/sessions/$id"
 if [ -n "${FAKE_DEAF:-}" ]; then trap '' TERM; else trap 'exit 143' TERM; fi
 printf '{"type":"step_start","sessionID":"%s"}\n\tline with a tab and  two spaces\n' "$id" | tee "$T/expected"
@@ -298,7 +330,26 @@ runbg() {
   ) &
 }
 busy() { printf '%s\n%s\n' "${3:-busy}" "$2" > "$T/sessions/$1"; }
-clear_all() { rm -rf "$T/proc"; rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/v2-session-fail" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-* "$T/client-dir" "$T/racepid"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; : > "$T/curl.args.log"; : > "$T/curl.stdin"; }
+# A fake client outlives its test when only the session was aborted (--abort stops the
+# session, not the watching client): left running, it deletes its session file when it ends,
+# which can be the next test's id. Every test therefore starts with no fake client alive.
+fake_alive() {
+  case "$(ps -o args= -p "$1" 2>/dev/null)" in
+    *"$T/bin/opencode"*) return 0 ;;
+  esac
+  return 1
+}
+kill_fake_clients() {
+  for p in $(cat "$T/fakepids" 2>/dev/null); do
+    fake_alive "$p" && kill "$p" 2>/dev/null
+  done
+  for p in $(cat "$T/fakepids" 2>/dev/null); do
+    j=0
+    while [ "$j" -lt 50 ] && fake_alive "$p"; do sleep 0.1; j=$((j + 1)); done
+    fake_alive "$p" && kill -9 "$p" 2>/dev/null
+  done
+}
+clear_all() { kill_fake_clients; rm -rf "$T/proc"; rm -f "$T/sessions"/* "$T/broken" "$T/broken-once" "$T/active-seq" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/v2-session-fail" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-* "$T/client-dir" "$T/racepid" "$T/slow-create" "$T/locked-hang"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; : > "$T/curl.args.log"; : > "$T/curl.stdin"; }
 
 # --- 0. the guards
 check "guard: the server on the test port is the fake" '[ "$(curl -s -m 3 http://127.0.0.1:$P/__who)" = fake-opencode-server ]'
@@ -621,13 +672,6 @@ runbg FAKE_TICKS=300 -- --dir "$D" "p" > /dev/null 2>&1; bg=$!
 started "$c0"; id="ses_fake$(cat "$T/count")"; pid=$(cat "$T/runpid"); echo "$pid" >> "$T/pids"
 kill -HUP "$pid"; wait "$bg"; rc=$?
 check "HUP (a closed terminal or ssh): exit 129 and the session is aborted" '[ "$rc" = 129 ] && grep -q "^$id " "$T/aborts"'
-clear_all; c0=$(cat "$T/count")
-runbg FAKE_TICKS=300 -- --detach --dir "$D" "p" > /dev/null 2> "$T/err"; bg=$!
-started "$c0"; id="ses_fake$(cat "$T/count")"; pid=$(cat "$T/runpid"); echo "$pid" >> "$T/pids"
-kill -TERM "$pid"; wait "$bg"; rc=$?
-check "--detach: stopped, it aborts nothing and the session runs on" '[ "$rc" = 143 ] && [ ! -s "$T/aborts" ] && [ -e "$T/sessions/$id" ] && grep -q "runs on" "$T/err"'
-out=$(run -- --status --dir "$D" 2>&1); rc=$?
-check "... and --status then shows it" '[ "$rc" = 3 ] && echo "$out" | grep -q "^$id$"'
 clear_all; busy ses_OLD "$D"; c0=$(cat "$T/count")
 runbg FAKE_TICKS=300 OCM_ALLOW_BUSY=1 -- --dir "$D" "p" > /dev/null 2>&1; bg=$!
 started "$c0"; id="ses_fake$(cat "$T/count")"; pid=$(cat "$T/runpid"); echo "$pid" >> "$T/pids"
@@ -789,6 +833,196 @@ check "M6: the password never appears in any curl argv" '! grep -q "secret123" "
 check "M6: the config on curl's stdin carries user = \"opencode:secret123\"" 'grep -q "user = \"opencode:secret123\"" "$T/curl.stdin"'
 rm -f "$T/bin/curl"
 clear_all
+
+# --- 8. D5 (L5a): --detach on a v2 server returns with the session id.
+# The fake server lists a session in /api/session/active only after the fake client has
+# started (POST creates a "created" session; the client flips it to "busy"), so these
+# tests prove the readiness poll.
+
+# (b): with a start delay, --detach does not print before the id is listed. The run is
+# bounded by a watchdog: still running after 20 s, it is killed and the checks fail.
+clear_all; rm -f "$T/watchdog"
+runbg FAKE_START_TICKS=25 FAKE_TICKS=100 -- --detach --dir "$D" "p" > "$T/out" 2>&1; bg=$!
+# Watchdog: fires only if the run is still alive after 20 s, then kills it.
+( sleep 20; rp=$(cat "$T/runpid" 2>/dev/null); if kill -0 "$rp" 2>/dev/null; then touch "$T/watchdog"; kill "$rp" 2>/dev/null; fi ) &
+wd=$!
+sleep 1
+check "D5(b): the id exists on the server but is not yet listed (still 'created')" '[ "$(head -n 1 "$T/sessions/ses_http1" 2>/dev/null)" = created ]'
+check "D5(b): no 'session started' before the id is listed" '! grep -q "session started" "$T/out"'
+j=0
+while ! grep -q "session started" "$T/out" 2>/dev/null; do
+  sleep 0.1; j=$((j + 1))
+  if [ "$j" -gt 200 ]; then touch "$T/watchdog"; break; fi
+done
+kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+[ -e "$T/watchdog" ] && kill "$(cat "$T/runpid" 2>/dev/null)" 2>/dev/null
+wait "$bg"; rc=$?
+[ -e "$T/watchdog" ] && rc=1
+check "D5(b): once the id is listed it prints the line and exits 0" '[ "$rc" = 0 ] && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
+
+# (a)+(g): --detach returns within the start budget, prints "session started: ses_…
+# (detached)", exits 0, and the session keeps running: --status lists it, --abort stops
+# it, --wait returns 0 after. (g) — "--detach: stopped, it aborts nothing and the
+# session runs on" — now sits beside the two TERM trap checks that follow.
+clear_all
+run FAKE_TICKS=600 -- --detach --dir "$D" --agent lane "p" > "$T/out" 2> "$T/err"; rc=$?
+check "D5(a/g): --detach returns by itself (exit 0) and prints the session line" '[ "$rc" = 0 ] && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
+check "D5(g): the session is still running after it returned" '[ -e "$T/sessions/ses_http1" ]'
+out=$(run -- --status --dir "$D" 2>&1); rc=$?
+check "D5(a): --status exit 3 lists the detached session" '[ "$rc" = 3 ] && echo "$out" | grep -q "^ses_http1$"'
+out=$(run -- --abort --dir "$D" 2>&1); rc=$?
+check "D5(a): --abort stops it (interrupt recorded, session gone)" '[ "$rc" = 0 ] && grep -q "^ses_http1$" "$T/interrupts" && [ ! -e "$T/sessions/ses_http1" ]'
+out=$(run OCM_WAIT_INTERVAL=1 OCM_WAIT_CONFIRM=1 -- --wait --dir "$D" 2>&1); rc=$?
+check "D5(a): --wait returns 0 after the abort" '[ "$rc" = 0 ]'
+
+# The detach trap branch: a TERM between the create and the launch aborts the created id
+# and launches nothing. The slow create keeps the run inside the POST while the signal
+# lands; ocm_stop takes the id from the create answer (ocm_sresp) and aborts it.
+clear_all; : > "$T/slow-create"
+runbg -- --detach --dir "$D" "p" > /dev/null 2> "$T/err"; bg=$!
+j=0
+while ! grep -q "^POST /api/session$" "$T/http.log" 2>/dev/null; do
+  sleep 0.05; j=$((j + 1)); [ "$j" -ge 20 ] && break
+done
+kill -TERM "$(cat "$T/runpid")"
+wait "$bg"; rc=$?
+check "D5: a TERM between create and launch exits 143" '[ "$rc" = 143 ]'
+check "D5: a TERM between create and launch aborts the created id" 'grep -q "^ses_http1$" "$T/interrupts"'
+check "D5: a TERM between create and launch leaves no session" '[ ! -e "$T/sessions/ses_http1" ]'
+check "D5: a TERM between create and launch launches no client" '[ ! -s "$T/args.log" ]'
+rm -f "$T/slow-create"
+
+# A TERM after the launch leaves the session running: the handoff already happened.
+clear_all
+runbg FAKE_START_TICKS=100 FAKE_TICKS=300 -- --detach --dir "$D" "p" > /dev/null 2> "$T/err"; bg=$!
+j=0
+while [ ! -s "$T/args.log" ]; do
+  sleep 0.1; j=$((j + 1)); [ "$j" -ge 50 ] && break
+done
+kill -TERM "$(cat "$T/runpid")"
+wait "$bg"; rc=$?
+check "D5: a TERM after the launch exits 143" '[ "$rc" = 143 ]'
+check "D5: a TERM after the launch aborts nothing" '[ ! -s "$T/interrupts" ]'
+check "D5: a TERM after the launch leaves the session running" '[ -e "$T/sessions/ses_http1" ]'
+check "D5: a TERM after the launch says the session runs on" 'grep -q "runs on" "$T/err"'
+cpid=$(LC_ALL=C tail -n 1 "$T/fakepids")
+run -- --abort --dir "$D" > /dev/null 2>&1
+# The abort removes the session but does not stop the detached client (it is still in its
+# start-up); stop it too so its later flip and exit cannot leak into the following tests.
+kill "$cpid" 2>/dev/null
+j=0
+while kill -0 "$cpid" 2>/dev/null && [ "$j" -lt 50 ]; do sleep 0.1; j=$((j + 1)); done
+
+# (c): a failed create exits 1 and starts nothing; a budget overrun exits 1 and aborts
+# the created id, leaving no session behind.
+clear_all; : > "$T/v2-session-fail"
+out=$(run -- --detach --dir "$D" --agent lane "p" 2>&1); rc=$?
+check "D5(c): a failed session create exits 1 and starts nothing" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not create a session" && [ ! -s "$T/args.log" ]'
+clear_all
+p0=$(wc -l < "$T/fakepids")
+out=$(run FAKE_START_TICKS=10000 OCM_START_MAX=2 -- --detach --dir "$D" "p" 2>&1); rc=$?
+check "D5(c): a budget overrun exits 1" '[ "$rc" = 1 ] && echo "$out" | grep -q "did not appear within 2 s"'
+check "D5(c): the created id was aborted" 'grep -q "^ses_http1$" "$T/interrupts"'
+check "D5(c): no session is left behind" '[ ! -e "$T/sessions/ses_http1" ]'
+left=''
+for p in $(LC_ALL=C tail -n +"$((p0 + 1))" "$T/fakepids"); do kill -0 "$p" 2>/dev/null && left="$left $p"; done
+check "D5(c): a client was launched (the pid list grew)" '[ -n "$(LC_ALL=C tail -n +"$((p0 + 1))" "$T/fakepids")" ]'
+check "D5(c): the detached client was killed on the overrun" '[ -z "$left" ]'
+
+# One unreadable status read during the poll is "not yet"; the poll goes on to success.
+# active-seq=1: the pre-dispatch busy read passes, the first poll read fails, the next ones
+# answer (the client flips its session to busy 0.3 s in, the poll sleeps 1 s between looks).
+clear_all; printf '1\n' > "$T/active-seq"
+out=$(run FAKE_START_TICKS=3 FAKE_TICKS=50 -- --detach --dir "$D" "p" > "$T/out" 2>&1); rc=$?
+check "D5: one unreadable status read during the poll is 'not yet'; the poll goes on" '[ "$rc" = 0 ] && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
+
+# -c/--continue is not a session id: --detach refuses it before anything is created.
+clear_all
+out=$(run -- --detach --dir "$D" -c "p" 2>&1); rc=$?
+check "D5: --detach -c is refused with exit 2 and creates nothing" '[ "$rc" = 2 ] && echo "$out" | grep -q -- "--detach needs a session id" && ! grep -q "^POST /api/session$" "$T/http.log" && [ ! -s "$T/args.log" ]'
+
+# A caller -s id that ocm-run would use in a path is refused before anything happens.
+clear_all
+out=$(run -- --detach --dir "$D" -s '../x' "p" 2>&1); rc=$?
+check "D5: a session id ocm-run refuses is a usage error (2)" '[ "$rc" = 2 ] && echo "$out" | grep -q "refusing session id"'
+check "D5: the refused id made no POST and launched nothing" '! grep -q "^POST /api/session$" "$T/http.log" && [ ! -s "$T/args.log" ]'
+
+# OCM_RETRY_SLEEP is validated and counted inside the start budget (fix 6).
+clear_all
+out=$(run OCM_RETRY_SLEEP=x -- --detach --dir "$D" "p" 2>&1); rc=$?
+check "D5: OCM_RETRY_SLEEP that is not a whole number is a usage error (2)" '[ "$rc" = 2 ] && ! grep -q "^POST /api/session$" "$T/http.log"'
+clear_all; : > "$T/locked-once"
+out=$(run OCM_RETRY_SLEEP=5 OCM_START_MAX=3 -- --detach --dir "$D" "p" 2>&1); rc=$?
+check "D5: a retry that would not fit in the budget is skipped (no relaunch); the id is aborted" '[ "$rc" = 1 ] && echo "$out" | grep -q "did not appear within 3 s" && [ "$(wc -l < "$T/args.log" | tr -d " ")" = 1 ] && grep -q "^ses_http1$" "$T/interrupts"'
+
+# (d): the detached client's stderr is in the log (a non-local dispatch logs under
+# TMPDIR in an unpredictable mktemp name; the local-directory branch logs in <dir>/.lane,
+# checked with D5(f)).
+clear_all; rm -f "${TMPDIR:-/tmp}"/ocm-run.ses_http1.*
+run FAKE_TICKS=50 -- --detach --dir "$D" "p" > /dev/null 2>&1; rc=$?
+tmplog=$(LC_ALL=C ls "${TMPDIR:-/tmp}"/ocm-run.ses_http1.* 2>/dev/null | head -n 1)
+check "D5(d): the detached stderr lands in the tmp log" '[ "$rc" = 0 ] && [ -n "$tmplog" ] && grep -q "a line on stderr" "$tmplog"'
+rm -f "${TMPDIR:-/tmp}"/ocm-run.ses_http1.*
+
+# (e): "database is locked" on the first launch relaunches once, then succeeds. The first
+# client hangs (locked-hang), so only ocm_detach_kill_client can stop it. The retry reuses
+# the SAME session id: one session created, the first id printed, nothing aborted. The
+# second client lives (FAKE_TICKS) so the poll sees its session before it ends.
+clear_all; : > "$T/locked-hang"
+p1=$(wc -l < "$T/fakepids" 2>/dev/null || echo 0)
+out=$(run FAKE_TICKS=50 -- --detach --dir "$D" --agent lane "p" > "$T/out" 2> "$T/err"); rc=$?
+check "D5(e): database locked relaunches once, then success" '[ "$rc" = 0 ] && [ "$(wc -l < "$T/args.log" | tr -d " ")" = 2 ] && grep -q "retrying once" "$T/err" && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
+check "D5(e): the retry reused the first id: only one session was created" '[ "$(grep -c "^POST /api/session$" "$T/http.log")" = 1 ]'
+check "D5(e): the first id was not aborted by the retry" '[ ! -s "$T/interrupts" ]'
+fp1=$(LC_ALL=C sed -n "$((p1 + 1))p" "$T/fakepids")
+check "D5(e): the first client is not left running by the retry" '[ -n "$fp1" ] && ! kill -0 "$fp1" 2>/dev/null'
+
+# A failure after the create (here: <dir>/.lane cannot be created) aborts the created id
+# and leaves no session behind.
+clear_all; L2="$T/localfail"; mkdir -p "$L2"; : > "$L2/.lane"
+out=$(run -- --detach --dir "$L2" "p" 2>&1); rc=$?
+check "D5: a failed .lane creation exits 1" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not create"'
+check "D5: the created id was aborted after the .lane failure" 'grep -q "^ses_http1$" "$T/interrupts"'
+check "D5: no session is left behind after the .lane failure" '[ ! -e "$T/sessions/ses_http1" ]'
+
+# (f): the local-directory branch (a real local dir) creates the session the same way
+# (POST), passes -s, prints an id too, and logs the detached client's stderr in
+# <dir>/.lane/ocm-run.<id>.log.
+clear_all; L="$T/localwt"; mkdir -p "$L"
+run FAKE_TICKS=50 -- --detach --dir "$L" "p" > "$T/out" 2>&1; rc=$?
+check "D5(f): the local-directory branch prints an id too" '[ "$rc" = 0 ] && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
+check "D5(f): the client takes the local directory from the session" '[ "$(cat "$T/client-dir")" = "$L" ]'
+check "D5(d): the detached stderr is in <dir>/.lane/ocm-run.<id>.log" 'grep -q "a line on stderr" "$L/.lane/ocm-run.ses_http1.log"'
+
+# A resumed session (-s <id> given by the caller) is the id polled and printed: the
+# script does not create a new session and returns the resumed one.
+clear_all
+printf 'created\n%s\n' "$D" > "$T/sessions/ses_http9"
+out=$(run FAKE_TICKS=50 -- --detach --dir "$D" -s ses_http9 "p" > "$T/out" 2>&1); rc=$?
+check "D5(f): a resumed session (-s) is the one polled and printed" '[ "$rc" = 0 ] && grep -q "^session started: ses_http9 (detached)$" "$T/out"'
+check "D5(f): the resumed session created no new session (no POST /api/session)" '! grep -q "^POST /api/session$" "$T/http.log"'
+
+# The caller's own -s session is never interrupted: a budget overrun (or a .lane failure)
+# after the create must not abort an id the caller passed itself.
+clear_all
+printf 'created\n%s\n' "$D" > "$T/sessions/ses_http9"
+out=$(run FAKE_START_TICKS=10000 OCM_START_MAX=2 -- --detach --dir "$D" -s ses_http9 "p" 2>&1); rc=$?
+check "D5: a budget overrun with the caller's own -s id exits 1" '[ "$rc" = 1 ]'
+check "D5: the caller's own -s id is never interrupted" '! grep -q ses_http9 "$T/interrupts"'
+check "D5: the caller's own -s session still exists" '[ -e "$T/sessions/ses_http9" ]'
+clear_all; L2="$T/localfail"; mkdir -p "$L2"; rm -rf "$L2/.lane"; : > "$L2/.lane"
+printf 'created\n%s\n' "$L2" > "$T/sessions/ses_http9"
+out=$(run -- --detach --dir "$L2" -s ses_http9 "p" 2>&1); rc=$?
+check "D5: a .lane failure with the caller's own -s id exits 1" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not create"'
+check "D5: the caller's own -s id is not interrupted by the .lane failure" '! grep -q ses_http9 "$T/interrupts"'
+check "D5: the caller's own -s session still exists after the .lane failure" '[ -e "$T/sessions/ses_http9" ]'
+
+# An already-active caller id is refused even with OCM_ALLOW_BUSY=1: it would satisfy the
+# first readiness poll before the new client started (CodeRabbit).
+clear_all; busy ses_http9 "$D"
+out=$(run OCM_ALLOW_BUSY=1 -- --detach --dir "$D" -s ses_http9 "p" 2>&1); rc=$?
+check "D5: an active caller -s id is refused with exit 75 under OCM_ALLOW_BUSY=1" '[ "$rc" = 75 ] && echo "$out" | grep -q "already running; --detach needs an idle session"'
+check "D5: the refused active id launched no client and was not interrupted" '[ ! -s "$T/args.log" ] && ! grep -q ses_http9 "$T/interrupts" && [ -e "$T/sessions/ses_http9" ]'
 
 printf '%s failed\n' "$fails"
 [ "$fails" = 0 ]

@@ -548,7 +548,7 @@ check "holder (n): ps fallback with plain mismatch to 'm' still fails (1)" '[ "$
 # Grok review of L3: a line break in a credential would add curl --config directives.
 clear_all
 out=$(run OPENCODE_SERVER_PASSWORD="$(printf 'pw\noutput="/tmp/x"')" -- --dir "$D" "p" 2>&1); rc=$?
-check "a password containing a line break is refused (2) before any request, value never printed" '[ "$rc" = 2 ] && echo "$out" | grep -q "contains a line break" && ! echo "$out" | grep -q "/tmp/x" && [ ! -s "$T/curl.args.log" ]'
+check "a password containing a line break is refused (2) before any request, value never printed" '[ "$rc" = 2 ] && echo "$out" | grep -q "contains a line break" && ! echo "$out" | grep -q "/tmp/x" && [ ! -s "$T/http.log" ]'
 
 clear_all
 echo 4242 > "$T/lsof-pid"

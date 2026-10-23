@@ -590,6 +590,8 @@ errf=$(mktemp "${TMPDIR:-/tmp}/ocm-run.XXXXXX") || exit 1
 child=''
 ocm_sid=''
 ocm_launched=0
+ocm_cpid=''
+ocm_sid_caller=0
 
 # Rule 2: told to stop, this process stops what it started on the server.
 ocm_stop() { # $1: exit status
@@ -767,6 +769,7 @@ ocm_launch_detached() {
       nohup opencode "$@" < /dev/null > "$ocm_log" 2>&1 &
     fi
   fi
+  ocm_cpid=$!
   ocm_launched=1
   rc=0
 }
@@ -778,6 +781,7 @@ ocm_launch_detached() {
 ocm_detach_launch() {
   ocm_create_session "$@"
   [ "$rc" = 0 ] || return
+  ocm_sid_caller=$has_session
   if [ -d "$dir" ]; then
     ocm_logdir="$dir/.lane"
     mkdir -p "$ocm_logdir" 2>/dev/null || {
@@ -796,6 +800,24 @@ ocm_detach_launch() {
   fi
 }
 
+# Any failure after the session was created but before "session started" is printed must
+# leave nothing behind: stop the client (if one was launched; TERM, then KILL after a
+# bounded wait) and abort the id — unless it is the caller's own -s id.
+ocm_detach_cleanup() {
+  if [ -n "$ocm_cpid" ]; then
+    kill "$ocm_cpid" 2>/dev/null
+    ( sleep 5; kill -9 "$ocm_cpid" 2>/dev/null ) > /dev/null 2>&1 &
+    ocm_dog=$!
+    wait "$ocm_cpid" 2>/dev/null
+    kill "$ocm_dog" 2>/dev/null
+    ocm_cpid=''
+  fi
+  if [ -n "$ocm_sid" ] && [ "$ocm_sid_caller" != 1 ]; then
+    ocm_abort "$ocm_sid"
+    echo "ocm-run: aborted the session $ocm_sid" >&2
+  fi
+}
+
 # --detach poll: wait until the session is listed in /api/session/active, or OCM_START_MAX
 # seconds run out (then abort it and exit 1). While waiting, a "database is locked" log
 # entry relaunches once (the OCM_RETRY_SLEEP retry).
@@ -806,7 +828,7 @@ ocm_detach_run() {
   esac
   ocm_retried=0
   ocm_detach_launch "$@"
-  [ "$rc" = 0 ] || exit "$rc"
+  [ "$rc" = 0 ] || { ocm_detach_cleanup; exit "$rc"; }
   while :; do
     now=$(ocm_running) || {
       echo "ocm-run: could not read the session status; cannot confirm $ocm_sid is running" >&2
@@ -828,8 +850,14 @@ ocm_detach_run() {
       sleep "${OCM_RETRY_SLEEP:-20}" &
       wait "$!"
       ocm_retried=1
-      ocm_detach_launch "$@"
-      [ "$rc" = 0 ] || exit "$rc"
+      # The retry reuses the SAME session id: do not create a second one, relaunch
+      # the client with -s <same id>.
+      if [ "$has_session" = 1 ]; then
+        ocm_launch_detached run --server "$url" "$@"
+      else
+        ocm_launch_detached run --server "$url" -s "$ocm_sid" "$@"
+      fi
+      [ "$rc" = 0 ] || { ocm_detach_cleanup; exit 1; }
       continue
     fi
     sleep 1

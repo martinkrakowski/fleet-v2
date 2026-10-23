@@ -839,10 +839,21 @@ run FAKE_TICKS=50 -- --detach --dir "$D" "p" > /dev/null 2>&1; rc=$?
 check "D5(d): the detached stderr lands in the tmp log" '[ "$rc" = 0 ] && grep -q "a line on stderr" "${TMPDIR:-/tmp}/ocm-run.ses_http1.log"'
 
 # (e): "database is locked" on the first launch relaunches once, then succeeds. The
-# second client lives (FAKE_TICKS) so the poll sees its session before it ends.
+# retry reuses the SAME session id: one session created, the first id printed, nothing
+# aborted. The second client lives (FAKE_TICKS) so the poll sees its session before it ends.
 clear_all; : > "$T/locked-once"
 out=$(run FAKE_TICKS=50 -- --detach --dir "$D" --agent lane "p" > "$T/out" 2> "$T/err"); rc=$?
-check "D5(e): database locked relaunches once, then success" '[ "$rc" = 0 ] && [ "$(wc -l < "$T/args.log" | tr -d " ")" = 2 ] && grep -q "retrying once" "$T/err" && grep -q "^session started: ses_http2 (detached)$" "$T/out"'
+check "D5(e): database locked relaunches once, then success" '[ "$rc" = 0 ] && [ "$(wc -l < "$T/args.log" | tr -d " ")" = 2 ] && grep -q "retrying once" "$T/err" && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
+check "D5(e): the retry reused the first id: only one session was created" '[ "$(grep -c "^POST /api/session$" "$T/http.log")" = 1 ]'
+check "D5(e): the first id was not aborted by the retry" '[ ! -s "$T/interrupts" ]'
+
+# A failure after the create (here: <dir>/.lane cannot be created) aborts the created id
+# and leaves no session behind.
+clear_all; L2="$T/localfail"; mkdir -p "$L2"; : > "$L2/.lane"
+out=$(run -- --detach --dir "$L2" "p" 2>&1); rc=$?
+check "D5: a failed .lane creation exits 1" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not create"'
+check "D5: the created id was aborted after the .lane failure" 'grep -q "^ses_http1$" "$T/interrupts"'
+check "D5: no session is left behind after the .lane failure" '[ ! -e "$T/sessions/ses_http1" ]'
 
 # (f): the local-directory branch (a real local dir) creates the session the same way
 # (POST), passes -s, prints an id too, and logs the detached client's stderr in

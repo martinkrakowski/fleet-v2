@@ -224,13 +224,22 @@ chmod +x "$T/bin/lsof"
 cat > "$T/bin/ps" <<'PS'
 #!/bin/sh
 has_ww=0
+has_comm=0
 pid=''
 prev=''
 for a in "$@"; do
   [ "$a" = "-ww" ] && has_ww=1
+  [ "$a" = "comm=" ] && has_comm=1
   [ "$prev" = "-p" ] && pid=$a
   prev=$a
 done
+# -o comm=: the executable's name. "$T/ps-comm" overrides it; otherwise it is the basename of the
+# first word of the faked command line (so an argv that only claims to be ssh can be told apart).
+if [ "$has_comm" = 1 ] && [ -n "$pid" ] && { [ -e "$T/ps-cmd-$pid" ] || [ -e "$T/ps-cmd" ]; }; then
+  if [ -e "$T/ps-comm" ]; then cat "$T/ps-comm"; exit 0; fi
+  f="$T/ps-cmd-$pid"; [ -e "$f" ] || f="$T/ps-cmd"
+  w=$(sed -n '1s/ .*//p' "$f"); echo "${w##*/}"; exit 0
+fi
 if [ "$has_ww" = 1 ] && [ -n "$pid" ]; then
   if [ -e "$T/ps-cmd-$pid" ]; then
     cat "$T/ps-cmd-$pid"
@@ -393,6 +402,47 @@ clear_all
 printf 'ssh -f -N -L 127.0.0.1:%s:127.0.0.1:%s some-other-host\n' "$((Q + 1))" "$Q" > "$T/ps-cmd"
 out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
 check "tunnel race: an ssh forward to a different host is refused (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel"'
+[ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
+rm -f "$T/ps-cmd" "$T/lsof-pid"
+rm -f "$T/ps-comm"
+# Grok re-review of L3: the holder must be an ssh executable listening on exactly 127.0.0.1:<port>,
+# forwarding to 127.0.0.1:<remote>.
+clear_all
+printf 'p4242\nn[::1]:%s\n' "$((Q + 1))" > "$T/lsof-pid.static"
+cat > "$T/bin/ssh" <<SSH
+#!/bin/sh
+echo "\$*" >> "\$T/ssh.log"
+python3 "\$T/server.py" "\$T" "$((Q + 1))" > /dev/null 2>&1 &
+echo \$! > "\$T/racepid"
+cp "\$T/lsof-pid.static" "\$T/lsof-pid"
+sleep 0.3
+exit 255
+SSH
+chmod +x "$T/bin/ssh"
+printf 'ssh -f -N -L 127.0.0.1:%s:127.0.0.1:%s ocm-test-host-that-does-not-exist\n' "$((Q + 1))" "$Q" > "$T/ps-cmd-4242"
+out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
+check "tunnel race: an ssh forward listening on [::1], not 127.0.0.1, does not vouch (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel"'
+[ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
+clear_all; rm -f "$T/ps-cmd-4242" "$T/lsof-pid.static"
+cat > "$T/bin/ssh" <<SSH
+#!/bin/sh
+echo "\$*" >> "\$T/ssh.log"
+python3 "\$T/server.py" "\$T" "$((Q + 1))" > /dev/null 2>&1 &
+echo \$! > "\$T/racepid"
+echo \$! > "\$T/lsof-pid"
+sleep 0.3
+exit 255
+SSH
+chmod +x "$T/bin/ssh"
+printf 'ssh -f -N -L 127.0.0.1:%s:127.0.0.1:%s ocm-test-host-that-does-not-exist\n' "$((Q + 1))" "$Q" > "$T/ps-cmd"
+echo python3 > "$T/ps-comm"
+out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
+check "tunnel race: a non-ssh executable whose argv claims ssh is refused (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel"'
+[ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
+clear_all; rm -f "$T/ps-comm"
+printf 'ssh -f -N -L 127.0.0.1:%s:10.0.0.9:22 ocm-test-host-that-does-not-exist\n' "$((Q + 1))" > "$T/ps-cmd"
+out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
+check "tunnel race: an ssh forward to a different target is refused (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel"'
 [ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
 rm -f "$T/ps-cmd" "$T/lsof-pid"
 cat > "$T/bin/ssh" <<'SSH'

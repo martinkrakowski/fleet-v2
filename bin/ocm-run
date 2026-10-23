@@ -109,15 +109,26 @@ case "${OPENCODE_SERVER_USERNAME:-}${OPENCODE_SERVER_PASSWORD:-}" in
     ;;
 esac
 
-# True when some process listening on 127.0.0.1:$port is `ssh` forwarding that port to $host
-# (lsof -Fpn gives the pids; their argv must contain ssh, -L 127.0.0.1:$port: and $host).
+# True when the process listening on exactly 127.0.0.1:$port is ssh forwarding
+# 127.0.0.1:$port:127.0.0.1:$remote to $host (Grok re-review of L3):
+# - lsof -Fpn pairs each p<pid> with its n<address> lines; only a pid with an n line equal to
+#   127.0.0.1:$port counts (a listener on [::1] or another address never vouches for it);
+# - the process's own name (ps -o comm=, the executable, not argv) must be ssh, so a binary that
+#   merely puts "ssh" in its argv does not pass;
+# - argv must carry the exact forward -L 127.0.0.1:$port:127.0.0.1:$remote and end with $host.
 ocm_port_held_by_our_forward() {
   command -v lsof >/dev/null 2>&1 || return 1
-  for p in $(LC_ALL=C lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fpn 2>/dev/null | sed -n 's/^p//p'); do
+  pids=$(LC_ALL=C lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fpn 2>/dev/null | awk -v want="127.0.0.1:$port" '
+    /^p/ { pid = substr($0, 2); next }
+    /^n/ { if (substr($0, 2) == want && pid != "") print pid }')
+  for p in $pids; do
+    c=$(LC_ALL=C ps -o comm= -p "$p" 2>/dev/null) || continue
+    case "${c##*/}" in ssh) ;; *) continue ;; esac
     a=$(LC_ALL=C ps -ww -o args= -p "$p" 2>/dev/null) || continue
-    case "$a" in
-      *ssh*"-L 127.0.0.1:$port:"*" $host"|*ssh*"-L 127.0.0.1:$port:"*" $host "*) return 0 ;;
-    esac
+    # The exact forward, followed by a space (so remote 1234 never matches 12345)...
+    case "$a" in *" -L 127.0.0.1:$port:127.0.0.1:$remote "*) ;; *) continue ;; esac
+    # ...and $host as a whole word: at the end of argv, or followed by more arguments.
+    case "$a" in *" $host" | *" $host "*) return 0 ;; esac
   done
   return 1
 }

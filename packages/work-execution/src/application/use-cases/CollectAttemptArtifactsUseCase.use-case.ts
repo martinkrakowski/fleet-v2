@@ -7,7 +7,7 @@
  * fact, never as success.
  */
 
-import type { ActionJournalEntryRecord, AttemptRecord } from '../../domain/execution-records.js';
+import type { ActionJournalEntryRecord, AttemptRecord, AttemptUsageRecord } from '../../domain/execution-records.js';
 import type { AttemptOutcomeValue } from '../../domain/value-objects/AttemptOutcome.vo.js';
 import type {
   CollectAttemptArtifactsPort,
@@ -19,6 +19,7 @@ import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.o
 import type { BriefKnowledgePort } from '../ports/out/BriefKnowledgePort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
+import type { ReadUsageResult, UsagePort } from '../ports/out/UsagePort.out-port.js';
 
 export interface CollectAttemptArtifactsDependencies {
   readonly attemptRepo: AttemptRepositoryPort;
@@ -31,6 +32,40 @@ export interface CollectAttemptArtifactsDependencies {
    * behaviour is unchanged.
    */
   readonly runnerForAttempt?: RunnerForAttemptPort;
+  /**
+   * Optional (S3). When given, the attempt's opencode session usage is read
+   * and stored on the collected record. A usage failure never changes the
+   * collection outcome.
+   */
+  readonly usage?: UsagePort;
+}
+
+/**
+ * The unavailable usage record stored when the usage read itself fails (the
+ * port contract already returns `unavailable` for business failures; this is
+ * only a defensive fallback so collection never changes because of usage).
+ */
+function unavailableUsage(
+  attempt: AttemptRecord,
+  nowIso: string,
+  reason: string,
+): AttemptUsageRecord {
+  return {
+    source: 'unavailable',
+    readAtIso: nowIso,
+    sessionId: attempt.sessionId,
+    steps: null,
+    wallSeconds: null,
+    tokensInput: null,
+    tokensOutput: null,
+    tokensReasoning: null,
+    tokensCacheRead: null,
+    tokensCacheWrite: null,
+    costUsd: null,
+    model: null,
+    agent: null,
+    reason,
+  };
 }
 
 type JournalEntryDraft = Omit<ActionJournalEntryRecord, 'id'>;
@@ -103,16 +138,38 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
     const outcome: AttemptOutcomeValue = collected.artifacts.commitsSinceBase.length > 0 ? 'done' : 'no-commit';
 
     const nowIso = new Date().toISOString();
+    // S3: read the attempt's opencode session usage when a usage port is
+    // wired. A usage failure never changes the collection outcome. Both arms
+    // carry a usage record; absent `deps.usage` leaves the record untouched.
+    let usageResult: ReadUsageResult | undefined;
+    if (this.deps.usage) {
+      try {
+        usageResult = await this.deps.usage.readUsage({ attempt });
+      } catch {
+        usageResult = {
+          outcome: 'unavailable',
+          usage: unavailableUsage(attempt, nowIso, 'usage read failed'),
+        };
+      }
+    }
+
     const collectedAttempt: AttemptRecord = {
       ...attempt,
       state: 'collected',
       outcome,
       artifacts: collected.artifacts,
+      ...(usageResult !== undefined ? { usage: usageResult.usage } : {}),
       updatedAtIso: nowIso,
     };
     await this.deps.attemptRepo.saveAttempt(collectedAttempt);
     // Release is idempotent: false simply means no reservation was held.
     await this.deps.journal.releaseCapacityReservation(attempt.id, nowIso);
+    const usageDetail =
+      usageResult === undefined
+        ? `Artifacts collected with outcome ${outcome}`
+        : usageResult.outcome === 'read'
+          ? 'usage read'
+          : `usage unavailable: ${usageResult.usage.reason}`;
     await appendJournalEntry(this.deps.journal, {
       attemptId: attempt.id,
       workOrderId: attempt.workOrderId,
@@ -121,7 +178,7 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
       recordedAtIso: nowIso,
       status: 'completed',
       sessionId: request.completionReceipt.sessionId,
-      detail: `Artifacts collected with outcome ${outcome}`,
+      detail: usageDetail,
     });
     return { outcome: 'collected', artifacts: collected.artifacts };
   }

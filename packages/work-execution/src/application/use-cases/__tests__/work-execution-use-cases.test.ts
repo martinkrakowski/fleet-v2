@@ -10,6 +10,7 @@ import type {
   ActionJournalEntryRecord,
   AttemptRecord,
   AttemptRunnerRecord,
+  AttemptUsageRecord,
   CapacityReservationRecord,
   CommandCompletionReceipt,
   WorkOrderRecord,
@@ -39,6 +40,7 @@ import type {
 import type { CollectCompletedAttemptArtifactsResult } from '../../ports/out/AttemptArtifactPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { WorkspacePort, WorktreeInspection } from '../../ports/out/WorkspacePort.out-port.js';
+import type { ReadUsageResult, UsagePort } from '../../ports/out/UsagePort.out-port.js';
 import { DispatchAttemptUseCase } from '../DispatchAttemptUseCase.use-case.js';
 import { InspectWorkOrderUseCase } from '../InspectWorkOrderUseCase.use-case.js';
 import { CollectAttemptArtifactsUseCase } from '../CollectAttemptArtifactsUseCase.use-case.js';
@@ -2382,6 +2384,40 @@ function validCollectRequest(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function makeUsagePort(
+  options: {
+    readResult?: (request: { attempt: AttemptRecord }) => ReadUsageResult;
+  } = {},
+) {
+  const calls: { attempt: AttemptRecord }[] = [];
+  const port: UsagePort = {
+    async readUsage(request) {
+      calls.push(request);
+      if (options.readResult) {
+        return options.readResult(request);
+      }
+      const usage: AttemptUsageRecord = {
+        source: 'opencode-db',
+        readAtIso: '2026-10-23T12:00:00.000Z',
+        sessionId: request.attempt.sessionId,
+        steps: 3,
+        wallSeconds: 12.5,
+        tokensInput: 100,
+        tokensOutput: 50,
+        tokensReasoning: 10,
+        tokensCacheRead: 20,
+        tokensCacheWrite: 5,
+        costUsd: 0.02,
+        model: 'inception/mercury-3',
+        agent: 'opencode',
+        reason: null,
+      };
+      return { outcome: 'read', usage };
+    },
+  };
+  return { port, calls };
+}
+
 function makeCollectSetup(
   options: {
     attempt?: Partial<AttemptRecord>;
@@ -2542,6 +2578,111 @@ describe('CollectAttemptArtifactsUseCase', () => {
     expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('ended');
     expect(setup.journal.heldFor('attempt-1')).toBe(true);
     expect(setup.journal.entries).toHaveLength(0);
+  });
+
+  it('stores usage on the collected record when the usage port reads', async () => {
+    const setup = makeCollectSetup();
+    const usage = makeUsagePort();
+    const useCase = new CollectAttemptArtifactsUseCase({
+      attemptRepo: setup.attemptRepo,
+      journal: setup.journal,
+      artifactPort: setup.artifacts.port,
+      usage: usage.port,
+    });
+
+    const result = await useCase.collectAttemptArtifacts(
+      validCollectRequest() as Parameters<CollectAttemptArtifactsUseCase['collectAttemptArtifacts']>[0],
+    );
+
+    expect(result.outcome).toBe('collected');
+    const saved = setup.attemptRepo.attempts.get('attempt-1');
+    expect(saved?.usage?.source).toBe('opencode-db');
+    expect(saved?.usage?.steps).toBe(3);
+    expect(saved?.usage?.sessionId).toBe('session-1');
+    expect(usage.calls).toHaveLength(1);
+    expect(setup.journal.entries[0]?.detail).toBe('usage read');
+  });
+
+  it('still collects and stores unavailable usage when the usage port is unavailable', async () => {
+    const setup = makeCollectSetup();
+    const usage = makeUsagePort({
+      readResult: () => ({
+        outcome: 'unavailable',
+        usage: {
+          source: 'unavailable',
+          readAtIso: '2026-10-23T12:00:00.000Z',
+          sessionId: 'session-1',
+          steps: null,
+          wallSeconds: null,
+          tokensInput: null,
+          tokensOutput: null,
+          tokensReasoning: null,
+          tokensCacheRead: null,
+          tokensCacheWrite: null,
+          costUsd: null,
+          model: null,
+          agent: null,
+          reason: 'schema mismatch',
+        },
+      }),
+    });
+    const useCase = new CollectAttemptArtifactsUseCase({
+      attemptRepo: setup.attemptRepo,
+      journal: setup.journal,
+      artifactPort: setup.artifacts.port,
+      usage: usage.port,
+    });
+
+    const result = await useCase.collectAttemptArtifacts(
+      validCollectRequest() as Parameters<CollectAttemptArtifactsUseCase['collectAttemptArtifacts']>[0],
+    );
+
+    expect(result.outcome).toBe('collected');
+    const saved = setup.attemptRepo.attempts.get('attempt-1');
+    expect(saved?.usage?.source).toBe('unavailable');
+    expect(saved?.usage?.reason).toBe('schema mismatch');
+    expect(setup.journal.entries[0]?.detail).toBe('usage unavailable: schema mismatch');
+  });
+
+  it('stores the port-provided no-session-id reason when the attempt has no sessionId', async () => {
+    const setup = makeCollectSetup({ attempt: { sessionId: null } });
+    const usage = makeUsagePort({
+      readResult: () => ({
+        outcome: 'unavailable',
+        usage: {
+          source: 'unavailable',
+          readAtIso: '2026-10-23T12:00:00.000Z',
+          sessionId: null,
+          steps: null,
+          wallSeconds: null,
+          tokensInput: null,
+          tokensOutput: null,
+          tokensReasoning: null,
+          tokensCacheRead: null,
+          tokensCacheWrite: null,
+          costUsd: null,
+          model: null,
+          agent: null,
+          reason: 'no session id',
+        },
+      }),
+    });
+    const useCase = new CollectAttemptArtifactsUseCase({
+      attemptRepo: setup.attemptRepo,
+      journal: setup.journal,
+      artifactPort: setup.artifacts.port,
+      usage: usage.port,
+    });
+
+    const result = await useCase.collectAttemptArtifacts(
+      validCollectRequest() as Parameters<CollectAttemptArtifactsUseCase['collectAttemptArtifacts']>[0],
+    );
+
+    expect(result.outcome).toBe('collected');
+    const saved = setup.attemptRepo.attempts.get('attempt-1');
+    expect(saved?.usage?.source).toBe('unavailable');
+    expect(saved?.usage?.reason).toBe('no session id');
+    expect(setup.journal.entries[0]?.detail).toBe('usage unavailable: no session id');
   });
 });
 

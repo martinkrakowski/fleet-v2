@@ -36,7 +36,9 @@
 #      OCM_ALLOW_BUSY=1; OCM_WAIT_INTERVAL (seconds between looks, default 15);
 #      OCM_WAIT_MAX (seconds before --wait gives up with 75, default 1500);
 #      OCM_WAIT_CONFIRM (seconds before the second read that confirms "nothing runs", default 5);
-#      OCM_START_MAX (seconds --detach waits for the session to become visible, default 60).
+#      OCM_START_MAX (seconds --detach waits for the session to become visible, default 60);
+#      OCM_RETRY_SLEEP (seconds before the single "database is locked" retry, default 20;
+#      --detach counts it inside OCM_START_MAX and requires a non-negative whole number).
 #      OPENCODE_SERVER_USERNAME (default opencode) and OPENCODE_SERVER_PASSWORD (or
 #      OPENCODE_AUTH_FILE, default ~/.config/opencode/server-auth.env) for v2 basic auth.
 # Server calls used:
@@ -758,7 +760,7 @@ ocm_create_session() {
     rc=1
     return
   }
-  ocm_sid=$(printf '%s' "$ocm_sresp" | LC_ALL=C grep -o '"id":"ses_[^"]*"' | head -n 1 | sed 's/"id":"//;s/"//')
+  ocm_sid=$(printf '%s' "$ocm_sresp" | LC_ALL=C grep -o '"id":"ses_[^"]*"' | head -n 1 | LC_ALL=C sed 's/"id":"//;s/"//')
   [ -n "$ocm_sid" ] || {
     echo "ocm-run: the server answered the session create but gave no session id" >&2
     rc=1
@@ -842,6 +844,10 @@ ocm_detach_run() {
     '' | *[!0-9]* | 0?* | ??????*) echo "ocm-run: OCM_START_MAX must be a whole number of seconds (0 to 99999)" >&2; exit 2 ;;
   esac
   ocm_retried=0
+  retry_sleep=${OCM_RETRY_SLEEP:-20}
+  case "$retry_sleep" in
+    '' | *[!0-9]* | 0?* | ??????*) echo "ocm-run: OCM_RETRY_SLEEP must be a whole number of seconds (0 to 99999)" >&2; exit 2 ;;
+  esac
   ocm_detach_launch "$@"
   [ "$rc" = 0 ] || { ocm_detach_cleanup; exit "$rc"; }
   while :; do
@@ -860,7 +866,12 @@ ocm_detach_run() {
       exit 1
     fi
     if [ "$ocm_retried" = 0 ] && LC_ALL=C grep -q "database is locked" "$ocm_log" 2>/dev/null; then
-      echo "ocm-run: opencode database was locked at launch; retrying once in ${OCM_RETRY_SLEEP:-20} s" >&2
+      if [ $(( $(date +%s) - start + retry_sleep )) -gt "$max" ]; then
+        echo "ocm-run: the retry would not fit in the $max s budget: session $ocm_sid did not appear within $max s; aborting it" >&2
+        ocm_detach_cleanup
+        exit 1
+      fi
+      echo "ocm-run: opencode database was locked at launch; retrying once in $retry_sleep s" >&2
       sleep "${OCM_RETRY_SLEEP:-20}" &
       wait "$!"
       ocm_retried=1

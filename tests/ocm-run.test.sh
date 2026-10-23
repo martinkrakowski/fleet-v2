@@ -810,12 +810,21 @@ clear_all
 # started (POST creates a "created" session; the client flips it to "busy"), so these
 # tests prove the readiness poll.
 
-# (b): with a start delay, --detach does not print before the id is listed.
-clear_all
+# (b): with a start delay, --detach does not print before the id is listed. The run is
+# bounded by a watchdog: still running after 20 s, it is killed and the checks fail.
+clear_all; rm -f "$T/watchdog"
 runbg FAKE_START_TICKS=25 FAKE_TICKS=100 -- --detach --dir "$D" "p" > "$T/out" 2>&1; bg=$!
+# Watchdog: fires only if the run is still alive after 20 s, then kills it.
+( sleep 20; rp=$(cat "$T/runpid" 2>/dev/null); if kill -0 "$rp" 2>/dev/null; then touch "$T/watchdog"; kill "$rp" 2>/dev/null; fi ) &
 sleep 1
+check "D5(b): the id exists on the server but is not yet listed (still 'created')" '[ "$(head -n 1 "$T/sessions/ses_http1" 2>/dev/null)" = created ]'
 check "D5(b): no 'session started' before the id is listed" '! grep -q "session started" "$T/out"'
-wait "$bg"; rc=$?
+j=0
+while ! grep -q "session started" "$T/out" 2>/dev/null; do
+  sleep 0.1; j=$((j + 1))
+  if [ "$j" -gt 200 ]; then touch "$T/watchdog"; break; fi
+done
+rc=0; [ -e "$T/watchdog" ] && rc=1
 check "D5(b): once the id is listed it prints the line and exits 0" '[ "$rc" = 0 ] && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
 
 # (a)+(g): --detach returns within the start budget, prints "session started: ses_…
@@ -861,9 +870,17 @@ clear_all
 out=$(run -- --detach --dir "$D" -c "p" 2>&1); rc=$?
 check "D5: --detach -c is refused with exit 2 and creates nothing" '[ "$rc" = 2 ] && echo "$out" | grep -q -- "--detach needs a session id" && ! grep -q "^POST /api/session$" "$T/http.log" && [ ! -s "$T/args.log" ]'
 
+# OCM_RETRY_SLEEP is validated and counted inside the start budget (fix 6).
+clear_all
+out=$(run OCM_RETRY_SLEEP=x -- --detach --dir "$D" "p" 2>&1); rc=$?
+check "D5: OCM_RETRY_SLEEP that is not a whole number is a usage error (2)" '[ "$rc" = 2 ] && ! grep -q "^POST /api/session$" "$T/http.log"'
+clear_all; : > "$T/locked-once"
+out=$(run OCM_RETRY_SLEEP=5 OCM_START_MAX=3 -- --detach --dir "$D" "p" 2>&1); rc=$?
+check "D5: a retry that would not fit in the budget is skipped (no relaunch); the id is aborted" '[ "$rc" = 1 ] && echo "$out" | grep -q "did not appear within 3 s" && [ "$(wc -l < "$T/args.log" | tr -d " ")" = 1 ] && grep -q "^ses_http1$" "$T/interrupts"'
+
 # (d): the detached client's stderr is in the log (a non-local dispatch logs under
 # TMPDIR; the local-directory branch logs in <dir>/.lane, checked with D5(f)).
-clear_all
+clear_all; rm -f "${TMPDIR:-/tmp}/ocm-run.ses_http1.log"
 run FAKE_TICKS=50 -- --detach --dir "$D" "p" > /dev/null 2>&1; rc=$?
 check "D5(d): the detached stderr lands in the tmp log" '[ "$rc" = 0 ] && grep -q "a line on stderr" "${TMPDIR:-/tmp}/ocm-run.ses_http1.log"'
 
@@ -899,6 +916,7 @@ clear_all
 printf 'created\n%s\n' "$D" > "$T/sessions/ses_http9"
 out=$(run FAKE_TICKS=50 -- --detach --dir "$D" -s ses_http9 "p" > "$T/out" 2>&1); rc=$?
 check "D5(f): a resumed session (-s) is the one polled and printed" '[ "$rc" = 0 ] && grep -q "^session started: ses_http9 (detached)$" "$T/out"'
+check "D5(f): the resumed session created no new session (no POST /api/session)" '! grep -q "^POST /api/session$" "$T/http.log"'
 
 printf '%s failed\n' "$fails"
 [ "$fails" = 0 ]

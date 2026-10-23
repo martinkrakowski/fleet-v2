@@ -924,6 +924,7 @@ describe('ExecutionRunnerAdapter: executor timeout on the start path', () => {
     expect(result.outcome).toBe('unknown');
     if (result.outcome === 'unknown') {
       expect(result.reason).toContain('timeout');
+      expect(result.reason).toContain('which this start reported aborting');
     }
     // The status lookup still ran after the killed start.
     expect(calls).toHaveLength(2);

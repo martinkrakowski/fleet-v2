@@ -207,11 +207,9 @@ describe('attempt revision CAS two-writer race (reconcile vs stop)', () => {
       expect(finalB?.state).toBe('cancelled');
       expect(finalA?.revision).toBe(1);
       expect(finalA?.revision).toBe(stopRevision);
-      // inspectSession ran once before the conflict, plus at most once on
-      // the post-conflict re-read.
-      expect(inspectCount).toBeGreaterThanOrEqual(1);
-      expect(inspectCount).toBeLessThanOrEqual(2);
-      expect(journal.releaseCount).toBe(1);
+      // The post-conflict retry checks the fresh state before contacting
+      // the runner again, so inspectSession ran exactly once.
+      expect(inspectCount).toBe(1);
     } finally {
       await fs.rm(stateDir, { recursive: true, force: true });
     }

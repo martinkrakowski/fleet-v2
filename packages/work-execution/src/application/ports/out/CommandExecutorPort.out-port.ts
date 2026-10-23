@@ -21,6 +21,12 @@ export interface CommandRunOptions {
    * truncated silently.
    */
   readonly maxBufferBytes?: number;
+  /**
+   * Whether a timeout or overrun may signal the child's whole process group
+   * (default true). `false` signals only the direct child, never its process
+   * group, so a detached grandchild survives the executor's timeout.
+   */
+  readonly killProcessTree?: boolean;
 }
 
 /** Completed outcome of one command run, as far as this port needs it. */

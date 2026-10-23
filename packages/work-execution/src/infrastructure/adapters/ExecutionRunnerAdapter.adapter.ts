@@ -513,6 +513,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     try {
       result = await this.run(this.binPath(), args, startEnv, {
         timeoutMs: startBudgetSeconds * 1000 + RUNNER_START_TIMEOUT_GRACE_MS,
+        startCall: true,
       });
     } catch (error) {
       return this.startUnknownAfterLookup(
@@ -977,7 +978,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     command: string,
     args: readonly string[],
     env?: Readonly<Record<string, string>>,
-    options?: { readonly timeoutMs?: number },
+    options?: { readonly timeoutMs?: number; readonly startCall?: boolean },
   ): Promise<SubprocessResult> {
     // D5: the lane-runner host's transport decides whether the runner
     // environment keeps `SSH_AUTH_SOCK`; every non-runner subprocess keeps
@@ -997,6 +998,10 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
           env: { ...runEnv } as Record<string, string>,
           maxBufferBytes: RUNNER_MAX_BUFFER_BYTES,
           timeoutMs: options?.timeoutMs ?? RUNNER_SUBPROCESS_TIMEOUT_MS,
+          // The start's own timeout must never group-kill ocm-run's detached
+          // session: a killed start stays `unknown`, but a murdered grandchild
+          // would destroy a session the status lookup could have adopted.
+          ...(options?.startCall === true ? { killProcessTree: false } : {}),
         })
         .then((result) => {
           if (result.exitCode === null) {

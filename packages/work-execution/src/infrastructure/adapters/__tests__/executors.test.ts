@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { readFile, rm } from 'node:fs/promises';
 
 import { LocalExecutor } from '../LocalExecutor.adapter.js';
 import { SshExecutor, posixQuote, sshArgvFor } from '../SshExecutor.adapter.js';
@@ -802,5 +803,65 @@ describe('runner start budget (ExecutionRunnerAdapter)', () => {
     // The --status lookup after the ambiguous start is bounded too.
     expect(calls[1]?.argv.slice(1, 3)).toEqual(['--status', '--dir']);
     expect(calls[1]?.options?.timeoutMs).toBe(30_000);
+  });
+});
+
+describe('LocalExecutor killProcessTree option', () => {
+  // The grandchild's own output goes to /dev/null so it never holds the
+  // child's stdio pipes open; the child keeps running until the timeout.
+  const grandchildScript = 'sleep 30 >/dev/null 2>&1 & echo $! > "$1"; exec sleep 5';
+
+  it('leaves the detached grandchild alive when killProcessTree is false', async () => {
+    const pidfile = `/tmp/fleet-executors-test-${String(process.pid)}-keep.pid`;
+    try {
+      await new LocalExecutor().run(['sh', '-c', grandchildScript, 'sh', pidfile], {
+        timeoutMs: 300,
+        killProcessTree: false,
+      });
+      const pid = Number(await readFile(pidfile, 'utf8'));
+      expect(Number.isFinite(pid)).toBe(true);
+      expect(() => process.kill(pid, 0)).not.toThrow();
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // The grandchild already exited.
+      }
+    } finally {
+      await rm(pidfile, { force: true });
+    }
+  });
+
+  it('kills the whole tree when the option is omitted', async () => {
+    const pidfile = `/tmp/fleet-executors-test-${String(process.pid)}-kill.pid`;
+    let pid: number | undefined;
+    try {
+      await new LocalExecutor().run(['sh', '-c', grandchildScript, 'sh', pidfile], {
+        timeoutMs: 300,
+      });
+      const killedPid = Number(await readFile(pidfile, 'utf8'));
+      expect(Number.isFinite(killedPid)).toBe(true);
+      pid = killedPid;
+      // Poll up to 2 s for the group kill to reach the grandchild.
+      for (let waited = 0; waited < 2000; waited += 50) {
+        let alive = true;
+        try {
+          process.kill(pid, 0);
+        } catch {
+          alive = false;
+        }
+        if (!alive) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(() => process.kill(killedPid, 0)).toThrow();
+    } finally {
+      if (pid !== undefined && Number.isFinite(pid)) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // Already dead.
+        }
+      }
+      await rm(pidfile, { force: true });
+    }
   });
 });

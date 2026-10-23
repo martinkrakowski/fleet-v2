@@ -631,13 +631,6 @@ runbg FAKE_TICKS=300 -- --dir "$D" "p" > /dev/null 2>&1; bg=$!
 started "$c0"; id="ses_fake$(cat "$T/count")"; pid=$(cat "$T/runpid"); echo "$pid" >> "$T/pids"
 kill -HUP "$pid"; wait "$bg"; rc=$?
 check "HUP (a closed terminal or ssh): exit 129 and the session is aborted" '[ "$rc" = 129 ] && grep -q "^$id " "$T/aborts"'
-clear_all; c0=$(cat "$T/count")
-runbg FAKE_TICKS=300 -- --detach --dir "$D" "p" > /dev/null 2> "$T/err"; bg=$!
-started "$c0"; id="ses_fake$(cat "$T/count")"; pid=$(cat "$T/runpid"); echo "$pid" >> "$T/pids"
-kill -TERM "$pid"; wait "$bg"; rc=$?
-check "--detach: stopped, it aborts nothing and the session runs on" '[ "$rc" = 143 ] && [ ! -s "$T/aborts" ] && [ -e "$T/sessions/$id" ] && grep -q "runs on" "$T/err"'
-out=$(run -- --status --dir "$D" 2>&1); rc=$?
-check "... and --status then shows it" '[ "$rc" = 3 ] && echo "$out" | grep -q "^$id$"'
 clear_all; busy ses_OLD "$D"; c0=$(cat "$T/count")
 runbg FAKE_TICKS=300 OCM_ALLOW_BUSY=1 -- --dir "$D" "p" > /dev/null 2>&1; bg=$!
 started "$c0"; id="ses_fake$(cat "$T/count")"; pid=$(cat "$T/runpid"); echo "$pid" >> "$T/pids"
@@ -812,6 +805,44 @@ sleep 1
 check "D5(b): no 'session started' before the id is listed" '! grep -q "session started" "$T/out"'
 wait "$bg"; rc=$?
 check "D5(b): once the id is listed it prints the line and exits 0" '[ "$rc" = 0 ] && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
+
+# (a)+(g): --detach returns within the start budget, prints "session started: ses_…
+# (detached)", exits 0, and the session keeps running: --status lists it, --abort stops
+# it, --wait returns 0 after. (g) replaces the old "--detach: stopped, it aborts nothing
+# and the session runs on" check: --detach returns by itself and the lane survives.
+clear_all
+run FAKE_TICKS=600 -- --detach --dir "$D" --agent lane "p" > "$T/out" 2> "$T/err"; rc=$?
+check "D5(a/g): --detach returns by itself (exit 0) and prints the session line" '[ "$rc" = 0 ] && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
+check "D5(g): the session is still running after it returned" '[ -e "$T/sessions/ses_http1" ]'
+out=$(run -- --status --dir "$D" 2>&1); rc=$?
+check "D5(a): --status exit 3 lists the detached session" '[ "$rc" = 3 ] && echo "$out" | grep -q "^ses_http1$"'
+out=$(run -- --abort --dir "$D" 2>&1); rc=$?
+check "D5(a): --abort stops it (interrupt recorded, session gone)" '[ "$rc" = 0 ] && grep -q "^ses_http1$" "$T/interrupts" && [ ! -e "$T/sessions/ses_http1" ]'
+out=$(run OCM_WAIT_INTERVAL=1 OCM_WAIT_CONFIRM=1 -- --wait --dir "$D" 2>&1); rc=$?
+check "D5(a): --wait returns 0 after the abort" '[ "$rc" = 0 ]'
+
+# (c): a failed create exits 1 and starts nothing; a budget overrun exits 1 and aborts
+# the created id, leaving no session behind.
+clear_all; : > "$T/v2-session-fail"
+out=$(run -- --detach --dir "$D" --agent lane "p" 2>&1); rc=$?
+check "D5(c): a failed session create exits 1 and starts nothing" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not create a session" && [ ! -s "$T/args.log" ]'
+clear_all
+out=$(run FAKE_START_TICKS=10000 OCM_START_MAX=2 -- --detach --dir "$D" "p" 2>&1); rc=$?
+check "D5(c): a budget overrun exits 1" '[ "$rc" = 1 ] && echo "$out" | grep -q "did not appear within 2 s"'
+check "D5(c): the created id was aborted" 'grep -q "^ses_http1$" "$T/interrupts"'
+check "D5(c): no session is left behind" '[ ! -e "$T/sessions/ses_http1" ]'
+
+# (d): the detached client's stderr is in the log (a non-local dispatch logs under
+# TMPDIR; the local-directory branch logs in <dir>/.lane, checked with D5(f)).
+clear_all
+run FAKE_TICKS=50 -- --detach --dir "$D" "p" > /dev/null 2>&1; rc=$?
+check "D5(d): the detached stderr lands in the tmp log" '[ "$rc" = 0 ] && grep -q "a line on stderr" "${TMPDIR:-/tmp}/ocm-run.ses_http1.log"'
+
+# (e): "database is locked" on the first launch relaunches once, then succeeds. The
+# second client lives (FAKE_TICKS) so the poll sees its session before it ends.
+clear_all; : > "$T/locked-once"
+out=$(run FAKE_TICKS=50 -- --detach --dir "$D" --agent lane "p" > "$T/out" 2> "$T/err"); rc=$?
+check "D5(e): database locked relaunches once, then success" '[ "$rc" = 0 ] && [ "$(wc -l < "$T/args.log" | tr -d " ")" = 2 ] && grep -q "retrying once" "$T/err" && grep -q "^session started: ses_http2 (detached)$" "$T/out"'
 
 printf '%s failed\n' "$fails"
 [ "$fails" = 0 ]

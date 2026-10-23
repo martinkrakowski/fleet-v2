@@ -16,6 +16,14 @@
 #   2. When this process is told to stop (INT, TERM, HUP), it ABORTS the session it
 #      started before it exits. --detach switches that off: the lane then outlives
 #      this process on purpose, and --wait / --abort are how it is followed.
+#      On a v2 server --detach returns at once: it creates the session, launches
+#      opencode disowned in its own process session, polls /api/session/active until
+#      that id is listed or OCM_START_MAX seconds (default 60) pass, prints
+#      "session started: <id> (detached)" and exits 0; a budget overrun aborts the
+#      session and exits 1. A signal between the create and the launch aborts the
+#      created id in the trap; after the launch a signal leaves the lane running.
+#      On a v1 server --detach stays as above: it only disables the abort-on-signal
+#      trap and still waits for the lane to end.
 #   3. "Has the lane ended" is --status or --wait, never the end of a local process.
 #      --wait says "nothing runs" only after TWO status reads in a row, OCM_WAIT_CONFIRM seconds
 #      apart, both answered by the server and both listing nothing; a read that fails ends it with 1.
@@ -27,12 +35,14 @@
 #      for the forward. An OCM_PORT that differs from the dial port is refused.
 #      OCM_ALLOW_BUSY=1; OCM_WAIT_INTERVAL (seconds between looks, default 15);
 #      OCM_WAIT_MAX (seconds before --wait gives up with 75, default 1500);
-#      OCM_WAIT_CONFIRM (seconds before the second read that confirms "nothing runs", default 5).
+#      OCM_WAIT_CONFIRM (seconds before the second read that confirms "nothing runs", default 5);
+#      OCM_START_MAX (seconds --detach waits for the session to become visible, default 60).
 #      OPENCODE_SERVER_USERNAME (default opencode) and OPENCODE_SERVER_PASSWORD (or
 #      OPENCODE_AUTH_FILE, default ~/.config/opencode/server-auth.env) for v2 basic auth.
 # Server calls used:
 #   v2 (opencode 2.x): GET /api/info (probe), GET /api/session/active, GET /api/session/<id>,
-#                      POST /api/session/<id>/interrupt, POST /api/session (remote --dir).
+#                      POST /api/session/<id>/interrupt, POST /api/session (--dir; --detach
+#                      local --dir too).
 #   v1 (opencode 1.18): GET /session/status?directory=…, POST /session/<id>/abort?directory=….
 # Exit: the run's own status; 1 the tunnel, the server or its session status could not be used or
 # read, opencode is not on PATH, or a session still runs after --abort; 2 usage;
@@ -578,6 +588,8 @@ fi
 
 errf=$(mktemp "${TMPDIR:-/tmp}/ocm-run.XXXXXX") || exit 1
 child=''
+ocm_sid=''
+ocm_launched=0
 
 # Rule 2: told to stop, this process stops what it started on the server.
 ocm_stop() { # $1: exit status
@@ -603,7 +615,12 @@ $id
       echo "ocm-run: stopped; asked the server to abort $id" >&2
     done
   elif [ "$detach" = 1 ]; then
-    echo "ocm-run: stopped; --detach was given, the session runs on in $dir" >&2
+    if [ -n "$ocm_sid" ] && [ "$ocm_launched" != 1 ]; then
+      ocm_abort "$ocm_sid"
+      echo "ocm-run: stopped; aborted the session $ocm_sid before it was launched" >&2
+    else
+      echo "ocm-run: stopped; --detach was given, the session runs on in $dir" >&2
+    fi
   fi
   if [ -n "$child" ]; then
     wait "$child" 2>/dev/null
@@ -670,31 +687,12 @@ ocm_launch() {
     if [ -d "$dir" ]; then
       ( cd "$dir" && exec opencode run --server "$url" "$@" ) < /dev/null 2> "$errf" &
     else
-      ocm_sid=''
-      if [ "$has_session" = 0 ]; then
-        case "$dir" in
-          *'"'* | *'\'*)
-            echo "ocm-run: refusing --dir with quote or backslash" >&2
-            rc=2
-            return
-            ;;
-        esac
-        ocm_sresp=$(ocm_curl -sf -m 8 -H 'Content-Type: application/json' -d "{\"location\":{\"directory\":\"$dir\"}}" "$url/api/session") || {
-          echo "ocm-run: could not create a session on the server for $dir (POST $url/api/session)" >&2
-          rc=1
-          return
-        }
-        ocm_sid=$(printf '%s' "$ocm_sresp" | grep -o '"id":"ses_[^"]*"' | head -n 1 | sed 's/"id":"//;s/"//')
-        [ -n "$ocm_sid" ] || {
-          echo "ocm-run: the server answered the session create but gave no session id" >&2
-          rc=1
-          return
-        }
-      fi
-      if [ -n "$ocm_sid" ]; then
-        opencode run --server "$url" -s "$ocm_sid" "$@" < /dev/null 2> "$errf" &
-      else
+      ocm_create_session "$@"
+      [ "$rc" = 0 ] || return
+      if [ "$has_session" = 1 ]; then
         opencode run --server "$url" "$@" < /dev/null 2> "$errf" &
+      else
+        opencode run --server "$url" -s "$ocm_sid" "$@" < /dev/null 2> "$errf" &
       fi
     fi
   else
@@ -706,7 +704,130 @@ ocm_launch() {
   child=''
 }
 
+# v2: make sure a session exists for this dispatch and set ocm_sid to it. With -s <id>
+# (or --session <id>) given by the caller, that id is ocm_sid and no session is created;
+# otherwise POST /api/session and take the id from the answer (a failed create, or an
+# answer with no id, is exit 1).
+ocm_create_session() {
+  ocm_sid=''
+  if [ "$has_session" = 1 ]; then
+    prev=''
+    for a in "$@"; do
+      case "$prev" in
+        -s | --session | -c | --continue) ocm_sid=$a; break ;;
+      esac
+      case "$a" in
+        --session=*) ocm_sid=${a#--session=}; break ;;
+      esac
+      prev=$a
+    done
+    [ -n "$ocm_sid" ] || {
+      echo "ocm-run: -s was given without a session id" >&2
+      rc=2
+      return
+    }
+    rc=0
+    return
+  fi
+  case "$dir" in
+    *'"'* | *'\'*)
+      echo "ocm-run: refusing --dir with quote or backslash" >&2
+      rc=2
+      return
+      ;;
+  esac
+  ocm_sresp=$(ocm_curl -sf -m 8 -H 'Content-Type: application/json' -d "{\"location\":{\"directory\":\"$dir\"}}" "$url/api/session") || {
+    echo "ocm-run: could not create a session on the server for $dir (POST $url/api/session)" >&2
+    rc=1
+    return
+  }
+  ocm_sid=$(printf '%s' "$ocm_sresp" | LC_ALL=C grep -o '"id":"ses_[^"]*"' | head -n 1 | sed 's/"id":"//;s/"//')
+  [ -n "$ocm_sid" ] || {
+    echo "ocm-run: the server answered the session create but gave no session id" >&2
+    rc=1
+    return
+  }
+  rc=0
+}
+
+# Launch opencode disowned in its own process session (setsid when available, else nohup
+# plus &), stdin /dev/null, stdout and stderr to $ocm_log. The lane keeps running after
+# this process exits; ocm_launched marks that handoff.
+ocm_launch_detached() {
+  if [ -d "$dir" ]; then
+    if command -v setsid >/dev/null 2>&1; then
+      ( cd "$dir" && exec setsid opencode "$@" ) < /dev/null > "$ocm_log" 2>&1 &
+    else
+      ( cd "$dir" && exec nohup opencode "$@" ) < /dev/null > "$ocm_log" 2>&1 &
+    fi
+  else
+    if command -v setsid >/dev/null 2>&1; then
+      setsid opencode "$@" < /dev/null > "$ocm_log" 2>&1 &
+    else
+      nohup opencode "$@" < /dev/null > "$ocm_log" 2>&1 &
+    fi
+  fi
+  ocm_launched=1
+  rc=0
+}
+
+# --detach on a v2 server: create the session (or take the resumed one), launch opencode
+# disowned, and return at once; ocm_detach_run polls for the session.
+ocm_detach_launch() {
+  ocm_create_session "$@"
+  [ "$rc" = 0 ] || return
+  ocm_log="${TMPDIR:-/tmp}/ocm-run.$ocm_sid.log"
+  if [ "$has_session" = 1 ]; then
+    ocm_launch_detached run --server "$url" "$@"
+  else
+    ocm_launch_detached run --server "$url" -s "$ocm_sid" "$@"
+  fi
+}
+
+# --detach poll: wait until the session is listed in /api/session/active, or OCM_START_MAX
+# seconds run out (then abort it and exit 1). While waiting, a "database is locked" log
+# entry relaunches once (the OCM_RETRY_SLEEP retry).
+ocm_detach_run() {
+  max=${OCM_START_MAX:-60}
+  case "$max" in
+    '' | *[!0-9]* | 0?* | ??????*) echo "ocm-run: OCM_START_MAX must be a whole number of seconds (0 to 99999)" >&2; exit 2 ;;
+  esac
+  ocm_retried=0
+  ocm_detach_launch "$@"
+  [ "$rc" = 0 ] || exit "$rc"
+  while :; do
+    now=$(ocm_running) || {
+      echo "ocm-run: could not read the session status; cannot confirm $ocm_sid is running" >&2
+      exit 1
+    }
+    case " $now " in
+      *" $ocm_sid "*)
+        echo "session started: $ocm_sid (detached)"
+        exit 0
+        ;;
+    esac
+    if [ $(( $(date +%s) - start )) -ge "$max" ]; then
+      echo "ocm-run: session $ocm_sid did not appear within $max s; aborting it" >&2
+      ocm_abort "$ocm_sid"
+      exit 1
+    fi
+    if [ "$ocm_retried" = 0 ] && LC_ALL=C grep -q "database is locked" "$ocm_log" 2>/dev/null; then
+      echo "ocm-run: opencode database was locked at launch; retrying once in ${OCM_RETRY_SLEEP:-20} s" >&2
+      sleep "${OCM_RETRY_SLEEP:-20}" &
+      wait "$!"
+      ocm_retried=1
+      ocm_detach_launch "$@"
+      [ "$rc" = 0 ] || exit "$rc"
+      continue
+    fi
+    sleep 1
+  done
+}
+
 start=$(date +%s)
+if [ "$api" = v2 ] && [ "$detach" = 1 ]; then
+  ocm_detach_run "$@"
+fi
 ocm_launch "$@"
 if [ "$rc" -ne 0 ] && [ $(( $(date +%s) - start )) -lt 10 ] && grep -q "database is locked" "$errf"; then
   cat "$errf" >&2

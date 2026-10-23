@@ -816,6 +816,7 @@ clear_all; rm -f "$T/watchdog"
 runbg FAKE_START_TICKS=25 FAKE_TICKS=100 -- --detach --dir "$D" "p" > "$T/out" 2>&1; bg=$!
 # Watchdog: fires only if the run is still alive after 20 s, then kills it.
 ( sleep 20; rp=$(cat "$T/runpid" 2>/dev/null); if kill -0 "$rp" 2>/dev/null; then touch "$T/watchdog"; kill "$rp" 2>/dev/null; fi ) &
+wd=$!
 sleep 1
 check "D5(b): the id exists on the server but is not yet listed (still 'created')" '[ "$(head -n 1 "$T/sessions/ses_http1" 2>/dev/null)" = created ]'
 check "D5(b): no 'session started' before the id is listed" '! grep -q "session started" "$T/out"'
@@ -824,6 +825,7 @@ while ! grep -q "session started" "$T/out" 2>/dev/null; do
   sleep 0.1; j=$((j + 1))
   if [ "$j" -gt 200 ]; then touch "$T/watchdog"; break; fi
 done
+kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
 rc=0; [ -e "$T/watchdog" ] && rc=1
 check "D5(b): once the id is listed it prints the line and exits 0" '[ "$rc" = 0 ] && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
 
@@ -888,10 +890,13 @@ check "D5(d): the detached stderr lands in the tmp log" '[ "$rc" = 0 ] && grep -
 # retry reuses the SAME session id: one session created, the first id printed, nothing
 # aborted. The second client lives (FAKE_TICKS) so the poll sees its session before it ends.
 clear_all; : > "$T/locked-once"
+p1=$(wc -l < "$T/fakepids" 2>/dev/null || echo 0)
 out=$(run FAKE_TICKS=50 -- --detach --dir "$D" --agent lane "p" > "$T/out" 2> "$T/err"); rc=$?
 check "D5(e): database locked relaunches once, then success" '[ "$rc" = 0 ] && [ "$(wc -l < "$T/args.log" | tr -d " ")" = 2 ] && grep -q "retrying once" "$T/err" && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
 check "D5(e): the retry reused the first id: only one session was created" '[ "$(grep -c "^POST /api/session$" "$T/http.log")" = 1 ]'
 check "D5(e): the first id was not aborted by the retry" '[ ! -s "$T/interrupts" ]'
+fp1=$(LC_ALL=C sed -n "$((p1 + 1))p" "$T/fakepids")
+check "D5(e): the first client is not left running by the retry" '[ -n "$fp1" ] && ! kill -0 "$fp1" 2>/dev/null'
 
 # A failure after the create (here: <dir>/.lane cannot be created) aborts the created id
 # and leaves no session behind.

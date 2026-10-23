@@ -820,7 +820,9 @@ ocm_detach_launch() {
 # Any failure after the session was created but before "session started" is printed must
 # leave nothing behind: stop the client (if one was launched; TERM, then KILL after a
 # bounded wait) and abort the id — unless it is the caller's own -s id.
-ocm_detach_cleanup() {
+# The client stop is its own helper so the "database is locked" retry can also kill the
+# first client before it relaunches: it must never abort the session itself.
+ocm_detach_kill_client() {
   if [ -n "$ocm_cpid" ]; then
     kill "$ocm_cpid" 2>/dev/null
     ( sleep 5; kill -9 "$ocm_cpid" 2>/dev/null ) > /dev/null 2>&1 &
@@ -829,6 +831,10 @@ ocm_detach_cleanup() {
     kill "$ocm_dog" 2>/dev/null
     ocm_cpid=''
   fi
+}
+
+ocm_detach_cleanup() {
+  ocm_detach_kill_client
   if [ -n "$ocm_sid" ] && [ "$ocm_sid_caller" != 1 ]; then
     ocm_abort "$ocm_sid"
     echo "ocm-run: aborted the session $ocm_sid" >&2
@@ -875,6 +881,9 @@ ocm_detach_run() {
       sleep "${OCM_RETRY_SLEEP:-20}" &
       wait "$!"
       ocm_retried=1
+      # Stop the first client before the relaunch overwrites ocm_cpid: a client that
+      # is still alive would otherwise be left running with no pid left to stop it.
+      ocm_detach_kill_client
       # The retry reuses the SAME session id: do not create a second one, relaunch
       # the client with -s <same id>.
       if [ "$has_session" = 1 ]; then

@@ -853,5 +853,12 @@ check "D5(f): the local-directory branch prints an id too" '[ "$rc" = 0 ] && gre
 check "D5(f): the client takes the local directory from the session" '[ "$(cat "$T/client-dir")" = "$L" ]'
 check "D5(d): the detached stderr is in <dir>/.lane/ocm-run.<id>.log" 'grep -q "a line on stderr" "$L/.lane/ocm-run.ses_http1.log"'
 
+# A resumed session (-s <id> given by the caller) is the id polled and printed: the
+# script does not create a new session and returns the resumed one.
+clear_all
+printf 'created\n%s\n' "$D" > "$T/sessions/ses_http9"
+out=$(run FAKE_TICKS=50 -- --detach --dir "$D" -s ses_http9 "p" > "$T/out" 2>&1); rc=$?
+check "D5(f): a resumed session (-s) is the one polled and printed" '[ "$rc" = 0 ] && grep -q "^session started: ses_http9 (detached)$" "$T/out"'
+
 printf '%s failed\n' "$fails"
 [ "$fails" = 0 ]

@@ -54,20 +54,32 @@ So the shape is already there. The gaps are three records the kernel does not ke
 
 **Gap.** `ModelAssignment` has one fallback; the owner's rule is an ordered list with trigger
 classes (NVIDIA 429 or timeout → MiniMax free → longcat free → paid GLM flash → Laguna; a
-Mercury gate failure → the second-pass implementer, no second Mercury round). `AttemptOutcome`
-has no stop reason, and nothing records what actually ran: final model, server port, session id,
-steps, wall seconds, tokens, cost. The seats registry is hand-written because that record is
-missing.
+Mercury gate failure → the second-pass implementer, no second Mercury round). The persisted
+`AttemptRecord` already holds `sessionId`, `briefDigest`, `briefPackagePath`, `runner` (kind,
+remote port, host) and `seatOverride`; what it lacks is a typed stop reason (a runner refusal is
+saved as state `cancelled` with the reason as free text in the journal entry's `detail`), the seat
+that actually ran (model, variant, agent; `seatOverride` holds only an override, not the result),
+and usage (steps, wall seconds, tokens, cost). The seats registry is hand-written because those
+three are missing.
 
 **Change.** In `work-execution`, domain only plus one repository field:
 - `SeatPlan` value object: an ordered list of `{model, variant, agent, on: [trigger classes]}`
   entries; `ModelAssignment` becomes the first entry plus a reference to the plan. Trigger
   classes: `rate-limited`, `payment`, `timeout`, `model-missing`, `no-commit`, `gate-failed`,
   `length`, `step-cap`.
-- `AttemptRecord` value object on `Attempt`: `stopReason` (one of the classes above or `none`),
-  `seatUsed` (model, variant, agent, server port), `sessionId`, and a `Usage` slot (S3).
-- `PrepareFixAttempt` and `DispatchAttempt` read the plan: a refused or stopped attempt
-  produces the NEXT attempt on the next entry whose `on` matches the stop reason; a model is
+- Three new fields on the existing `AttemptRecord`, none duplicating one it has: `stopReason`
+  (one of the classes above or `none`), `seatUsed` (model, variant, agent; the port and host stay
+  in `runner`), and a `usage` slot (S3). `sessionId` and `runner` are reused as they are. Records
+  written before the fields existed read as `stopReason: unknown`, which selects no seat.
+- The refusal-to-fix transition: today `DispatchAttempt`, on a runner start refusal, saves the
+  attempt as `cancelled`, journals `action: dispatch, status: refused` with the reason text in
+  `detail`, and releases capacity. S1 has the runner port return a typed `reasonClass` beside its
+  text (the adapter maps HTTP 429 → `rate-limited`, 402 → `payment`, a deadline → `timeout`, an
+  unknown model → `model-missing`); `DispatchAttempt` persists it as `stopReason` on that
+  cancelled record. `ReconcileAttempt` does the same for a lane that ended on `length`, the step
+  cap or with no commit. `PrepareFixAttempt` then accepts a `cancelled` prior attempt as
+  `priorAttemptId` (today it refuses any prior that has not `ended`), reads `prior.stopReason`,
+  and prepares the next attempt on the first `SeatPlan` entry whose `on` contains it; a model is
   never retried before its reset.
 
 **Acceptance.** A refused dispatch (`429`) followed by `PrepareFixAttempt` yields an attempt on
@@ -84,12 +96,19 @@ The orchestrator runs those by hand and, on 2026-10-22, lost one round to zsh wo
 
 **Change.**
 - `AcceptanceSpec` value object in `BriefPackage`: `commitRequired: true`, `commands[]` (each a
-  fixed argv, no shell string), `diffCheck: true`, `proof[]` (free text the PR must carry).
-  `PrepareBriefPackage` refuses a package without it; the brief's Markdown keeps the prose.
-- `RequestAttemptAcceptance` evaluates the spec through the existing executor ports
-  (`LocalExecutor`, `SshExecutor`) and `LaneDiffCheckAdapter`, and journals one entry per
-  predicate with its exit code; the use case's verdict is the gate. Model reports are never an
-  input.
+  fixed argv, no shell string), `diffCheck: true`. Nothing else: the proof a PR carries is the
+  rendering of this spec's journal entries (S3's CLI prints them), not a separate list the spec
+  cannot check. `PrepareBriefPackage` refuses a package without a spec; the brief's Markdown keeps
+  the prose.
+- The hand-off: `RequestAttemptAcceptance` loads the attempt, reads the manifest at
+  `briefPackagePath`, recomputes its digest and refuses on a mismatch with `briefDigest`, then
+  passes the parsed `acceptanceSpec` in an extended `AcceptanceAssessmentRequest` (today: attempt
+  id, work order id, candidate head, policy revision). `AcceptanceAssessmentAdapter` runs each
+  command through `LocalExecutor` or `SshExecutor` on the attempt's worktree, the diff check
+  through `LaneDiffCheckAdapter`, and the commit predicate against `baseCommit`, and returns one
+  result per predicate (name, exit code or verdict, duration). The use case journals one entry
+  per result and derives the verdict; a `rejected` verdict names the first failing predicate.
+  Model reports are never an input.
 
 **Acceptance.** A package whose spec is missing is refused at preparation; a spec with a failing
 command yields `rejected` with the command and exit code journaled; a passing spec yields the

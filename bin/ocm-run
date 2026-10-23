@@ -619,7 +619,7 @@ $id
       echo "ocm-run: stopped; asked the server to abort $id" >&2
     done
   elif [ "$detach" = 1 ]; then
-    if [ -n "$ocm_sid" ] && [ "$ocm_launched" != 1 ]; then
+    if [ -n "$ocm_sid" ] && [ "$ocm_launched" != 1 ] && [ "$has_session" = 0 ]; then
       ocm_abort "$ocm_sid"
       echo "ocm-run: stopped; aborted the session $ocm_sid before it was launched" >&2
     else
@@ -860,8 +860,12 @@ ocm_detach_run() {
     # One unreadable status read is "not yet", not the end: keep polling until the
     # budget runs out; only the overrun aborts and exits 1.
     now=$(ocm_running) || now=''
-    case " $now " in
-      *" $ocm_sid "*)
+    case "
+$now
+" in
+      *"
+$ocm_sid
+"*)
         echo "session started: $ocm_sid (detached)"
         exit 0
         ;;

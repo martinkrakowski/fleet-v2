@@ -826,7 +826,9 @@ while ! grep -q "session started" "$T/out" 2>/dev/null; do
   if [ "$j" -gt 200 ]; then touch "$T/watchdog"; break; fi
 done
 kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
-rc=0; [ -e "$T/watchdog" ] && rc=1
+[ -e "$T/watchdog" ] && kill "$(cat "$T/runpid" 2>/dev/null)" 2>/dev/null
+wait "$bg"; rc=$?
+[ -e "$T/watchdog" ] && rc=1
 check "D5(b): once the id is listed it prints the line and exits 0" '[ "$rc" = 0 ] && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
 
 # (a)+(g): --detach returns within the start budget, prints "session started: ses_…

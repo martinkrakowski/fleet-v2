@@ -78,6 +78,12 @@ if [ "$remote" -lt 1 ] || [ "$remote" -gt 65535 ]; then
 fi
 host="${OCM_HOST:-}"
 if [ -n "$host" ]; then
+  case "$host" in
+    -*)
+      echo "ocm-run: OCM_HOST=$host starts with '-': it would be read as an ssh option" >&2
+      exit 2
+      ;;
+  esac
   if [ "$remote" -eq 65535 ]; then
     echo "ocm-run: OCM_REMOTE_PORT=65535 with OCM_HOST set leaves no room for the forward on $((remote + 1)); use a port below 65535" >&2
     exit 2
@@ -92,9 +98,50 @@ if [ -n "${OCM_PORT:-}" ] && [ "$OCM_PORT" != "$port" ]; then
 fi
 url="http://127.0.0.1:$port"
 
+# curl --config is line-based: a CR or LF in a credential would end the quoted value and start a
+# new directive (Grok review of L3). Refuse such credentials before any request; name the
+# variable, never its value.
+case "${OPENCODE_SERVER_USERNAME:-}${OPENCODE_SERVER_PASSWORD:-}" in
+  *"$(printf '\r')"* | *"
+"*)
+    echo "ocm-run: OPENCODE_SERVER_USERNAME or OPENCODE_SERVER_PASSWORD contains a line break; refusing" >&2
+    exit 2
+    ;;
+esac
+
+# True when the process listening on exactly 127.0.0.1:$port is ssh forwarding
+# 127.0.0.1:$port:127.0.0.1:$remote to $host (Grok re-review of L3):
+# - lsof -Fpn pairs each p<pid> with its n<address> lines; only a pid with an n line equal to
+#   127.0.0.1:$port counts (a listener on [::1] or another address never vouches for it);
+# - the process's own name (ps -o comm=, the executable, not argv) must be ssh, so a binary that
+#   merely puts "ssh" in its argv does not pass;
+# - argv must carry the exact forward -L 127.0.0.1:$port:127.0.0.1:$remote and end with $host.
+ocm_port_held_by_our_forward() {
+  command -v lsof >/dev/null 2>&1 || return 1
+  pids=$(LC_ALL=C lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fpn 2>/dev/null | awk -v want="127.0.0.1:$port" '
+    /^p/ { pid = substr($0, 2); next }
+    /^n/ { if (substr($0, 2) == want && pid != "") print pid }')
+  for p in $pids; do
+    c=$(LC_ALL=C ps -o comm= -p "$p" 2>/dev/null) || continue
+    case "${c##*/}" in ssh) ;; *) continue ;; esac
+    a=$(LC_ALL=C ps -ww -o args= -p "$p" 2>/dev/null) || continue
+    # The exact forward, followed by a space (so remote 1234 never matches 12345)...
+    case "$a" in *" -L 127.0.0.1:$port:127.0.0.1:$remote "*) ;; *) continue ;; esac
+    # ...and $host as a whole word: at the end of argv, or followed by more arguments.
+    case "$a" in *" $host" | *" $host "*) return 0 ;; esac
+  done
+  return 1
+}
+
+ocm_quote_config() { # $1 -> escaped for a curl --config quoted value
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
 ocm_curl() {
   if [ -n "${OPENCODE_SERVER_PASSWORD:-}" ]; then
-    curl -u "${OPENCODE_SERVER_USERNAME:-opencode}:$OPENCODE_SERVER_PASSWORD" "$@"
+    {
+      printf 'user = "%s:%s"\n' "$(ocm_quote_config "${OPENCODE_SERVER_USERNAME:-opencode}")" "$(ocm_quote_config "$OPENCODE_SERVER_PASSWORD")"
+    } | curl --config - "$@"
   else
     curl "$@"
   fi
@@ -110,7 +157,6 @@ model=''
 has_model=0
 has_session=0
 prev=''
-[ "${1:-}" = "--check" ] && mode=check
 for arg do
   shift
   case "$arg" in
@@ -118,7 +164,7 @@ for arg do
       echo "ocm-run: do not pass ${arg%%=*}; ocm-run connects to $url itself" >&2
       exit 2
       ;;
-    --status | --wait | --abort)
+    --status | --wait | --abort | --check)
       [ "$mode" = run ] || { echo "ocm-run: one of --status, --wait, --abort, --check at a time" >&2; exit 2; }
       mode=${arg#--}
       prev=''
@@ -186,8 +232,15 @@ if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
   fi
   ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes \
     -L "127.0.0.1:$port:127.0.0.1:$remote" "$host" || {
-    echo "ocm-run: could not open the tunnel to $host" >&2
-    exit 1
+    # A simultaneous dispatch's forward may have landed between the check and ours. Accept the port
+    # only when its holder is an ssh forward of this port to $host (Grok review of L3): any other
+    # listener would receive the session POST and the server credentials.
+    if nc -z 127.0.0.1 "$port" 2>/dev/null && ocm_port_held_by_our_forward; then
+      :
+    else
+      echo "ocm-run: could not open the tunnel to $host" >&2
+      exit 1
+    fi
   }
 fi
 
@@ -626,13 +679,22 @@ ocm_launch() {
             return
             ;;
         esac
-        ocm_sresp=$(ocm_curl -sf -m 8 -H 'Content-Type: application/json' -d "{\"location\":{\"directory\":\"$dir\"}}" "$url/api/session") || ocm_sresp=''
+        ocm_sresp=$(ocm_curl -sf -m 8 -H 'Content-Type: application/json' -d "{\"location\":{\"directory\":\"$dir\"}}" "$url/api/session") || {
+          echo "ocm-run: could not create a session on the server for $dir (POST $url/api/session)" >&2
+          rc=1
+          return
+        }
         ocm_sid=$(printf '%s' "$ocm_sresp" | grep -o '"id":"ses_[^"]*"' | head -n 1 | sed 's/"id":"//;s/"//')
+        [ -n "$ocm_sid" ] || {
+          echo "ocm-run: the server answered the session create but gave no session id" >&2
+          rc=1
+          return
+        }
       fi
       if [ -n "$ocm_sid" ]; then
-        OCM_DIR="$dir" opencode run --server "$url" -s "$ocm_sid" "$@" < /dev/null 2> "$errf" &
+        opencode run --server "$url" -s "$ocm_sid" "$@" < /dev/null 2> "$errf" &
       else
-        OCM_DIR="$dir" opencode run --server "$url" "$@" < /dev/null 2> "$errf" &
+        opencode run --server "$url" "$@" < /dev/null 2> "$errf" &
       fi
     fi
   else

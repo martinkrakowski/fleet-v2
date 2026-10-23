@@ -37,7 +37,7 @@ done
 P=$((R + 1))
 
 cat > "$T/server.py" <<'PY'
-import base64, http.server, os, sys, urllib.parse
+import base64, http.server, json, os, sys, urllib.parse
 T, port = sys.argv[1], int(sys.argv[2])
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -103,6 +103,21 @@ class H(http.server.BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path); parts = u.path.strip("/").split("/")
         open(os.path.join(T, "http.log"), "a").write("POST " + u.path + "\n")
         if not self.auth_ok(): return self.send(401, '{"error":"unauthorized"}')
+        if len(parts) == 2 and parts[0] == "api" and parts[1] == "session":
+            if os.path.exists(os.path.join(T, "v2-session-fail")):
+                return self.send(500, '{"error":"session create failed"}')
+            length = int(self.headers.get("Content-Length", 0))
+            data = self.rfile.read(length).decode()
+            try:
+                loc = json.loads(data)["location"]["directory"]
+            except Exception:
+                return self.send(400, '{"error":"bad session body"}')
+            n = 1
+            while os.path.exists(os.path.join(T, "sessions", "ses_http%d" % n)):
+                n += 1
+            sid = "ses_http%d" % n
+            open(os.path.join(T, "sessions", sid), "w").write("busy\n" + loc + "\n")
+            return self.send(200, '{"data":{"id":"%s","location":{"directory":"%s"}}}' % (sid, loc))
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "session" and parts[3] == "interrupt":
             open(os.path.join(T, "interrupts"), "a").write(parts[2] + "\n")
             try: os.remove(os.path.join(T, "sessions", parts[2]))
@@ -130,10 +145,23 @@ printf '%s\n' "$*" >> "$T/args.log"
 if [ -e "$T/locked-once" ]; then rm -f "$T/locked-once"; echo "Error: database is locked" >&2; exit 1; fi
 # FAKE_START_TICKS: the client's start-up, during which the server knows no session yet
 i=0; while [ "$i" -lt "${FAKE_START_TICKS:-0}" ]; do sleep 0.1; i=$((i + 1)); done
-d=''; prev=''
-for a in "$@"; do case "$a" in --dir=*) d=${a#--dir=} ;; esac; [ "$prev" = --dir ] && d=$a; prev=$a; done
-[ -n "$d" ] || d="${OCM_DIR:-$(pwd)}"
+d=''; sid=''; prev=''
+for a in "$@"; do
+  case "$a" in
+    --dir=*) d=${a#--dir=} ;;
+    -s) ;;
+  esac
+  [ "$prev" = --dir ] && d=$a
+  [ "$prev" = -s ] && sid=$a
+  prev=$a
+done
 id="ses_fake$n"
+if [ -n "$sid" ]; then
+  id=$sid
+  d=$(sed -n '2p' "$T/sessions/$id" 2>/dev/null)
+fi
+[ -n "$d" ] || d="$(pwd)"
+echo "$d" > "$T/client-dir"
 printf 'busy\n%s\n' "$d" > "$T/sessions/$id"
 if [ -n "${FAKE_DEAF:-}" ]; then trap '' TERM; else trap 'exit 143' TERM; fi
 printf '{"type":"step_start","sessionID":"%s"}\n\tline with a tab and  two spaces\n' "$id" | tee "$T/expected"
@@ -196,13 +224,22 @@ chmod +x "$T/bin/lsof"
 cat > "$T/bin/ps" <<'PS'
 #!/bin/sh
 has_ww=0
+has_comm=0
 pid=''
 prev=''
 for a in "$@"; do
   [ "$a" = "-ww" ] && has_ww=1
+  [ "$a" = "comm=" ] && has_comm=1
   [ "$prev" = "-p" ] && pid=$a
   prev=$a
 done
+# -o comm=: the executable's name. "$T/ps-comm" overrides it; otherwise it is the basename of the
+# first word of the faked command line (so an argv that only claims to be ssh can be told apart).
+if [ "$has_comm" = 1 ] && [ -n "$pid" ] && { [ -e "$T/ps-cmd-$pid" ] || [ -e "$T/ps-cmd" ]; }; then
+  if [ -e "$T/ps-comm" ]; then cat "$T/ps-comm"; exit 0; fi
+  f="$T/ps-cmd-$pid"; [ -e "$f" ] || f="$T/ps-cmd"
+  w=$(sed -n '1s/ .*//p' "$f"); echo "${w##*/}"; exit 0
+fi
 if [ "$has_ww" = 1 ] && [ -n "$pid" ]; then
   if [ -e "$T/ps-cmd-$pid" ]; then
     cat "$T/ps-cmd-$pid"
@@ -261,7 +298,7 @@ runbg() {
   ) &
 }
 busy() { printf '%s\n%s\n' "${3:-busy}" "$2" > "$T/sessions/$1"; }
-clear_all() { rm -rf "$T/proc"; rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-*; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; }
+clear_all() { rm -rf "$T/proc"; rm -f "$T/sessions"/* "$T/broken" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/v2-session-fail" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-* "$T/client-dir" "$T/racepid"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; : > "$T/curl.args.log"; : > "$T/curl.stdin"; }
 
 # --- 0. the guards
 check "guard: the server on the test port is the fake" '[ "$(curl -s -m 3 http://127.0.0.1:$P/__who)" = fake-opencode-server ]'
@@ -296,6 +333,14 @@ check "OCM_HOST: uses environment override when set" '[ "$rc" = 0 ] && echo "$ou
 out=$(run OCM_HOST= -- --check 2>&1); rc=$?
 check "OCM_HOST empty and nothing on the remote port: --check reports it, exit 1, no ssh" '[ "$rc" = 1 ] && echo "$out" | grep -q "nothing is listening on the dial port 127.0.0.1:$R" && [ ! -s "$T/ssh.log" ]'
 
+clear_all
+out=$(run -- --dir "$D" --agent lane --check 2>&1); rc=$?
+check "--check is accepted in the middle of the flags (before the prompt): exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "ocm-run: ok"'
+out=$(run -- --agent lane -m some/model --check 2>&1); rc=$?
+check "--check after -m <model> is still check mode: exit 0" '[ "$rc" = 0 ] && echo "$out" | grep -q "ocm-run: ok"'
+out=$(run -- --check --status --dir "$D" 2>&1); rc=$?
+check "--check combined with another mode is still refused (2)" '[ "$rc" = 2 ]'
+
 out=$(run OCM_REMOTE_PORT= -- --check 2>&1); rc=$?
 check "no OCM_REMOTE_PORT (unset) is a usage error (2): the 4096 default is gone" '[ "$rc" = 2 ] && echo "$out" | grep -q "OCM_REMOTE_PORT"'
 out=$(run OCM_REMOTE_PORT= -- --dir "$D" "p" 2>&1); rc=$?
@@ -306,6 +351,12 @@ out=$(run OCM_REMOTE_PORT=70000 -- --check 2>&1); rc=$?
 check "an OCM_REMOTE_PORT above 65535 is refused (2)" '[ "$rc" = 2 ]'
 out=$(run OCM_REMOTE_PORT=65535 -- --check 2>&1); rc=$?
 check "65535 with OCM_HOST set is refused (2): no room for the forward" '[ "$rc" = 2 ] && echo "$out" | grep -q "no room for the forward"'
+
+clear_all
+out=$(run OCM_HOST=-oProxyCommand=evil -- --check 2>&1); rc=$?
+check "OCM_HOST starting with '-' is refused (2), never passed to ssh" '[ "$rc" = 2 ] && echo "$out" | grep -q "OCM_HOST" && [ ! -s "$T/ssh.log" ]'
+out=$(run OCM_HOST=-W -- --check 2>&1); rc=$?
+check "OCM_HOST='-' alone is refused too (2)" '[ "$rc" = 2 ]'
 
 # A second free pair: nothing listens on Q or Q + 1.
 Q=''
@@ -322,6 +373,85 @@ check "--check with nothing on the dial port is exit 1, never a forward" '[ "$rc
 out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
 check "a real dispatch with nothing on the dial port opens the forward (and fails: the ssh is fake)" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel"'
 check "the forward rule is unchanged: local Q + 1 forwards to the remote Q" 'grep -q -- "-L 127.0.0.1:$((Q + 1)):127.0.0.1:$Q ocm-test-host-that-does-not-exist" "$T/ssh.log"'
+
+# Tunnel race (minor 13): a failed ssh -L whose forward landed anyway (a simultaneous
+# dispatch won) must not fail the dispatch: the script re-checks nc -z once.
+clear_all
+cat > "$T/bin/ssh" <<SSH
+#!/bin/sh
+echo "\$*" >> "\$T/ssh.log"
+python3 "\$T/server.py" "\$T" "$((Q + 1))" > /dev/null 2>&1 &
+echo \$! > "\$T/racepid"
+echo \$! > "\$T/lsof-pid"
+sleep 0.3
+exit 255
+SSH
+chmod +x "$T/bin/ssh"
+# The port's holder must be an ssh forward of this port to OCM_HOST (Grok review of L3).
+printf 'ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -L 127.0.0.1:%s:127.0.0.1:%s ocm-test-host-that-does-not-exist\n' "$((Q + 1))" "$Q" > "$T/ps-cmd"
+out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
+check "tunnel race: after a failed ssh -L, a port held by our ssh forward still dispatches (0)" '[ "$rc" = 0 ] && grep -qF "run --attach http://127.0.0.1:$((Q + 1))" "$T/args.log" && ! echo "$out" | grep -q "could not open the tunnel"'
+[ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
+# Any other holder is refused: the session POST and the credentials must not go to it.
+clear_all
+printf 'python3 server.py\n' > "$T/ps-cmd"
+out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
+check "tunnel race: a port held by another process is refused (1), nothing dispatched" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel" && ! grep -qF "run --attach" "$T/args.log" 2>/dev/null'
+[ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
+clear_all
+printf 'ssh -f -N -L 127.0.0.1:%s:127.0.0.1:%s some-other-host\n' "$((Q + 1))" "$Q" > "$T/ps-cmd"
+out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
+check "tunnel race: an ssh forward to a different host is refused (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel"'
+[ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
+rm -f "$T/ps-cmd" "$T/lsof-pid"
+rm -f "$T/ps-comm"
+# Grok re-review of L3: the holder must be an ssh executable listening on exactly 127.0.0.1:<port>,
+# forwarding to 127.0.0.1:<remote>.
+clear_all
+printf 'p4242\nn[::1]:%s\n' "$((Q + 1))" > "$T/lsof-pid.static"
+cat > "$T/bin/ssh" <<SSH
+#!/bin/sh
+echo "\$*" >> "\$T/ssh.log"
+python3 "\$T/server.py" "\$T" "$((Q + 1))" > /dev/null 2>&1 &
+echo \$! > "\$T/racepid"
+cp "\$T/lsof-pid.static" "\$T/lsof-pid"
+sleep 0.3
+exit 255
+SSH
+chmod +x "$T/bin/ssh"
+printf 'ssh -f -N -L 127.0.0.1:%s:127.0.0.1:%s ocm-test-host-that-does-not-exist\n' "$((Q + 1))" "$Q" > "$T/ps-cmd-4242"
+out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
+check "tunnel race: an ssh forward listening on [::1], not 127.0.0.1, does not vouch (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel"'
+[ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
+clear_all; rm -f "$T/ps-cmd-4242" "$T/lsof-pid.static"
+cat > "$T/bin/ssh" <<SSH
+#!/bin/sh
+echo "\$*" >> "\$T/ssh.log"
+python3 "\$T/server.py" "\$T" "$((Q + 1))" > /dev/null 2>&1 &
+echo \$! > "\$T/racepid"
+echo \$! > "\$T/lsof-pid"
+sleep 0.3
+exit 255
+SSH
+chmod +x "$T/bin/ssh"
+printf 'ssh -f -N -L 127.0.0.1:%s:127.0.0.1:%s ocm-test-host-that-does-not-exist\n' "$((Q + 1))" "$Q" > "$T/ps-cmd"
+echo python3 > "$T/ps-comm"
+out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
+check "tunnel race: a non-ssh executable whose argv claims ssh is refused (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel"'
+[ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
+clear_all; rm -f "$T/ps-comm"
+printf 'ssh -f -N -L 127.0.0.1:%s:10.0.0.9:22 ocm-test-host-that-does-not-exist\n' "$((Q + 1))" > "$T/ps-cmd"
+out=$(run OCM_REMOTE_PORT=$Q -- --dir "$D" "p" 2>&1); rc=$?
+check "tunnel race: an ssh forward to a different target is refused (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not open the tunnel"'
+[ -s "$T/racepid" ] && kill "$(cat "$T/racepid")" 2>/dev/null
+rm -f "$T/ps-cmd" "$T/lsof-pid"
+cat > "$T/bin/ssh" <<'SSH'
+#!/bin/sh
+echo "$*" >> "$T/ssh.log"
+exit 255
+SSH
+chmod +x "$T/bin/ssh"
+clear_all
 
 # The local host needs its listener on the remote port itself: a second fake server on $R.
 clear_all
@@ -415,6 +545,11 @@ echo 4242 > "$T/lsof-pid"
 echo "ssh -N -L $P:127.0.0.1:$R m" > "$T/ps-cmd"
 out=$(run -- --check 2>&1); rc=$?
 check "holder (n): ps fallback with plain mismatch to 'm' still fails (1)" '[ "$rc" = 1 ] && echo "$out" | grep -q "goes to '\''m'\'', not OCM_HOST="'
+# Grok review of L3: a line break in a credential would add curl --config directives.
+clear_all
+out=$(run OPENCODE_SERVER_PASSWORD="$(printf 'pw\noutput="/tmp/x"')" -- --dir "$D" "p" 2>&1); rc=$?
+check "a password containing a line break is refused (2) before any request, value never printed" '[ "$rc" = 2 ] && echo "$out" | grep -q "contains a line break" && ! echo "$out" | grep -q "/tmp/x" && [ ! -s "$T/http.log" ]'
+
 clear_all
 echo 4242 > "$T/lsof-pid"
 echo "ssh -N -L $P:127.0.0.1:$R ocm-test-host-that-does-not-exist" > "$T/ps-cmd"
@@ -603,7 +738,7 @@ check "v2 --abort: calls POST /api/session/<id>/interrupt and never /session/<id
 
 clear_all
 run -- --dir "$D" --agent lane-glm --variant low -m provider/model --format json "hello v2" > /dev/null 2>&1; rc=$?
-check "v2 run: rewrites --server, drops --dir, and folds --variant low into -m provider/model#low" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P --agent lane-glm -m provider/model#low --format json hello v2$" "$T/args.log"'
+check "v2 run: rewrites --server, drops --dir, and folds --variant low into -m provider/model#low, carrying -s <id>" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P -s ses_http1 --agent lane-glm -m provider/model#low --format json hello v2$" "$T/args.log"'
 out=$(run -- --dir "$D" --agent lane-glm --variant low -m provider/model#high "hello" 2>&1); rc=$?
 check "v2 run: combining --variant and an already hashed -m is refused (2)" '[ "$rc" = 2 ] && [ "$(wc -l < "$T/args.log" | tr -d " ")" = 1 ]'
 out=$(run -- --dir "$D" --server http://x "hello" 2>&1); rc=$?
@@ -612,13 +747,48 @@ check "v2 run: passing --server directly is refused (2)" '[ "$rc" = 2 ]'
 # NVIDIA rewrite tests
 clear_all
 run -- --dir "$D" --agent lane-glm --variant low -m nvidia/z-ai/glm-5.3 --format json "hello nvidia" > /dev/null 2>&1; rc=$?
-check "v2 run: rewrites nvidia/* with --variant low to variant none (#none)" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P --agent lane-glm -m nvidia/z-ai/glm-5.3#none --format json hello nvidia$" "$T/args.log"'
+check "v2 run: rewrites nvidia/* with --variant low to variant none (#none), carrying -s <id>" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P -s ses_http1 --agent lane-glm -m nvidia/z-ai/glm-5.3#none --format json hello nvidia$" "$T/args.log"'
 clear_all
 run -- --dir "$D" --variant=low --model=nvidia/z-ai/glm-5.3 --format json "hello nvidia flag" > /dev/null 2>&1; rc=$?
-check "v2 run: rewrites nvidia/* with --variant=low and --model=... to #none" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P -m nvidia/z-ai/glm-5.3#none --format json hello nvidia flag$" "$T/args.log"'
+check "v2 run: rewrites nvidia/* with --variant=low and --model=... to #none, carrying -s <id>" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P -s ses_http1 -m nvidia/z-ai/glm-5.3#none --format json hello nvidia flag$" "$T/args.log"'
 clear_all
 run -- --dir "$D" --agent lane-glm --variant high -m nvidia/z-ai/glm-5.3 --format json "hello nvidia high" > /dev/null 2>&1; rc=$?
-check "v2 run: leaves nvidia/* with --variant high as #high" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P --agent lane-glm -m nvidia/z-ai/glm-5.3#high --format json hello nvidia high$" "$T/args.log"'
+check "v2 run: leaves nvidia/* with --variant high as #high, carrying -s <id>" '[ "$rc" = 0 ] && grep -q "^run --server http://127.0.0.1:$P -s ses_http1 --agent lane-glm -m nvidia/z-ai/glm-5.3#high --format json hello nvidia high$" "$T/args.log"'
+
+# --- 7c. M3: a failed POST /api/session is exit 1; a v2 non-local dispatch
+# --- carries -s <id>, and the client takes its directory from the session, not OCM_DIR.
+clear_all; : > "$T/v2"; : > "$T/v2-session-fail"
+out=$(run -- --dir "$D" --agent lane "p" 2>&1); rc=$?
+check "M3: a failed POST /api/session exits 1" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not create a session"'
+check "M3: ... and opencode is never started" '[ ! -s "$T/args.log" ]'
+clear_all; : > "$T/v2"
+run OCM_DIR=/bogus -- --dir "$D" --agent lane "p" > /dev/null 2>&1; rc=$?
+check "M3: a v2 non-local dispatch creates a session on the server and carries -s <id>" '[ "$rc" = 0 ] && grep -q -- "-s ses_http1" "$T/args.log"'
+check "M3: the client takes its directory from the session, not OCM_DIR" '[ "$(cat "$T/client-dir")" = "$D" ]'
+
+# --- M6: the password reaches curl through --config - on stdin, never argv.
+REAL_CURL=$(command -v curl)
+cat > "$T/bin/curl" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "\$T/curl.args.log"
+case " \$* " in
+  *" --config - "*)
+    tee "\$T/curl.stdin" | "$REAL_CURL" "\$@"
+    ;;
+  *)
+    "$REAL_CURL" "\$@" < /dev/null
+    ;;
+esac
+EOF
+chmod +x "$T/bin/curl"
+clear_all; printf 'opencode:secret123\n' > "$T/auth-required"; : > "$T/curl.args.log"; : > "$T/curl.stdin"
+out=$(run OPENCODE_SERVER_USERNAME=opencode OPENCODE_SERVER_PASSWORD=secret123 -- --check 2>&1); rc=$?
+check "M6: auth still works through --config - (check exits 0)" '[ "$rc" = 0 ] && echo "$out" | grep -q "ocm-run: ok"'
+check "M6: curl is called with --config -" 'grep -q -- "--config -" "$T/curl.args.log"'
+check "M6: the password never appears in any curl argv" '! grep -q "secret123" "$T/curl.args.log"'
+check "M6: the config on curl's stdin carries user = \"opencode:secret123\"" 'grep -q "user = \"opencode:secret123\"" "$T/curl.stdin"'
+rm -f "$T/bin/curl"
+clear_all
 
 printf '%s failed\n' "$fails"
 [ "$fails" = 0 ]

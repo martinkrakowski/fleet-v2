@@ -19,6 +19,7 @@ import type {
   StartRunnerSessionRequest,
 } from '../../../application/ports/out/ExecutionRunnerPort.out-port.js';
 import type { SubprocessResult, SubprocessRunner } from '../ExecutionRunnerAdapter.adapter.js';
+import { nextAttemptRevision } from '../../../application/ports/out/AttemptRepositoryPort.out-port.js';
 import {
   RUNNER_ENV_ALLOWLIST,
   buildRunnerEnv,
@@ -96,6 +97,7 @@ function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
     priorAttemptId: null,
     worktreePath: '/tmp/fleet-test-worktree',
     baseCommit: 'abc123',
+    revision: 0,
     state: 'intent-recorded',
     outcome: null,
     briefDigest: null,
@@ -280,7 +282,13 @@ describe('AttemptRepositoryAdapter', () => {
   it('allows guarded lifecycle updates', async () => {
     const adapter = new AttemptRepositoryAdapter();
     await adapter.saveAttempt(makeAttempt({ state: 'dispatching' }));
-    await adapter.saveAttempt(makeAttempt({ state: 'running', sessionId: 'ses_9' }));
+    const stored = (await adapter.findAttemptById('att-1'))!;
+    await adapter.saveAttempt({
+      ...stored,
+      state: 'running',
+      sessionId: 'ses_9',
+      revision: nextAttemptRevision(stored),
+    });
     const found = await adapter.findAttemptById('att-1');
     expect(found?.state).toBe('running');
     expect(found?.sessionId).toBe('ses_9');

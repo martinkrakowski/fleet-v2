@@ -7,8 +7,42 @@
 
 import type { AttemptRecord } from '../../../domain/execution-records.js';
 
+/**
+ * Thrown when a save of an existing attempt is not built on the stored
+ * revision. Writers must chain from the record they read, so their revision is
+ * exactly one more than the stored one; anything else is a stale write.
+ * `expectedRevision` is the stored revision the writer should have built on;
+ * `actualRevision` is the revision the writer sent.
+ */
+export class AttemptRevisionConflictError extends Error {
+  readonly attemptId: string;
+  readonly expectedRevision: number;
+  readonly actualRevision: number;
+
+  constructor(attemptId: string, expectedRevision: number, actualRevision: number) {
+    super(
+      `Stale attempt revision for ${attemptId}: expected ${expectedRevision + 1}, got ${actualRevision}`,
+    );
+    this.name = 'AttemptRevisionConflictError';
+    this.attemptId = attemptId;
+    this.expectedRevision = expectedRevision;
+    this.actualRevision = actualRevision;
+  }
+}
+
+/** Next revision for an update built from `record`; a missing revision reads as 0. */
+export function nextAttemptRevision(record: AttemptRecord): number {
+  return (record.revision ?? 0) + 1;
+}
+
 export interface AttemptRepositoryPort {
-  /** Persist one attempt record; lifecycle updates stay guarded by the use case. */
+  /**
+   * Persist one attempt record:
+   * - a new id is stored with the record's revision, `0` if absent;
+   * - an existing id is stored only when `record.revision === stored.revision + 1`,
+   *   otherwise `AttemptRevisionConflictError` is thrown;
+   * - immutable identity fields are always guarded.
+   */
   saveAttempt(record: AttemptRecord): Promise<void>;
 
   /** Known absence is null; unreadable state is an error. */

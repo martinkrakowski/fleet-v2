@@ -15,7 +15,10 @@ import type {
   CollectAttemptArtifactsResult,
 } from '../ports/in/CollectAttemptArtifactsPort.in-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
-import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import {
+  nextAttemptRevision,
+  type AttemptRepositoryPort,
+} from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { BriefKnowledgePort } from '../ports/out/BriefKnowledgePort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
@@ -155,6 +158,7 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
 
     const collectedAttempt: AttemptRecord = {
       ...attempt,
+      revision: nextAttemptRevision(attempt),
       state: 'collected',
       outcome,
       artifacts: collected.artifacts,

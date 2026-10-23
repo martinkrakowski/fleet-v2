@@ -135,6 +135,8 @@ export interface AttemptRecord {
   readonly worktreePath: string;
   readonly baseCommit: string;
   readonly state: AttemptStateValue;
+  /** Optimistic-concurrency revision; absent reads as 0 (legacy records). */
+  readonly revision?: number;
   readonly outcome: AttemptOutcomeValue | null;
   readonly briefDigest: string | null;
   readonly briefPackagePath: string | null;

@@ -20,6 +20,7 @@ import type {
   ReserveExecutionCapacityCandidateHost,
 } from '@fleet/work-execution';
 import {
+  nextAttemptRevision,
   parseSeatTool,
   resolveInstallationHostForRole,
 } from '@fleet/work-execution';
@@ -937,6 +938,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         ...attempt,
         usage: result.usage,
         updatedAtIso: new Date().toISOString(),
+        revision: nextAttemptRevision(attempt),
       });
       return result;
     },

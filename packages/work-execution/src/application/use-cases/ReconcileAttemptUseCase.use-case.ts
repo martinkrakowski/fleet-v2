@@ -13,7 +13,10 @@ import type {
   ReconcileAttemptRequest,
   ReconcileAttemptResult,
 } from '../ports/in/ReconcileAttemptPort.in-port.js';
-import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import {
+  nextAttemptRevision,
+  type AttemptRepositoryPort,
+} from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
@@ -76,7 +79,12 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
     }
 
     if (!attempt.sessionId) {
-      const reconciling: AttemptRecord = { ...attempt, state: 'reconciling', updatedAtIso: nowIso };
+      const reconciling: AttemptRecord = {
+        ...attempt,
+        revision: nextAttemptRevision(attempt),
+        state: 'reconciling',
+        updatedAtIso: nowIso,
+      };
       await this.deps.attemptRepo.saveAttempt(reconciling);
       await appendJournalEntry(this.deps.journal, {
         attemptId: attempt.id,
@@ -99,7 +107,12 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
     });
 
     if (status.runnerReachable !== 'reachable') {
-      const reconciling: AttemptRecord = { ...attempt, state: 'reconciling', updatedAtIso: nowIso };
+      const reconciling: AttemptRecord = {
+        ...attempt,
+        revision: nextAttemptRevision(attempt),
+        state: 'reconciling',
+        updatedAtIso: nowIso,
+      };
       await this.deps.attemptRepo.saveAttempt(reconciling);
       await appendJournalEntry(this.deps.journal, {
         attemptId: attempt.id,
@@ -129,6 +142,7 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
     if (receiptMatches && receipt) {
       const ended: AttemptRecord = {
         ...attempt,
+        revision: nextAttemptRevision(attempt),
         state: 'ended',
         completionReceipt: receipt,
         updatedAtIso: nowIso,
@@ -149,7 +163,12 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
     }
 
     if (status.workerCommand === 'active') {
-      const running: AttemptRecord = { ...attempt, state: 'running', updatedAtIso: nowIso };
+      const running: AttemptRecord = {
+        ...attempt,
+        revision: nextAttemptRevision(attempt),
+        state: 'running',
+        updatedAtIso: nowIso,
+      };
       await this.deps.attemptRepo.saveAttempt(running);
       await appendJournalEntry(this.deps.journal, {
         attemptId: attempt.id,
@@ -164,7 +183,12 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
       return { outcome: 'active', attempt: running, status };
     }
 
-    const reconciling: AttemptRecord = { ...attempt, state: 'reconciling', updatedAtIso: nowIso };
+    const reconciling: AttemptRecord = {
+      ...attempt,
+      revision: nextAttemptRevision(attempt),
+      state: 'reconciling',
+      updatedAtIso: nowIso,
+    };
     await this.deps.attemptRepo.saveAttempt(reconciling);
     await appendJournalEntry(this.deps.journal, {
       attemptId: attempt.id,

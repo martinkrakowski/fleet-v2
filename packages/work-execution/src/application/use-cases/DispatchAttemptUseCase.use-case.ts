@@ -18,7 +18,10 @@ import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-ac
 import type { DispatchAttemptPort, DispatchAttemptRequest, DispatchAttemptResult } from '../ports/in/DispatchAttemptPort.in-port.js';
 import type { RunnerIsolationCapabilities } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
-import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import {
+  nextAttemptRevision,
+  type AttemptRepositoryPort,
+} from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { ExecutionObservationPort } from '../ports/out/ExecutionObservationPort.out-port.js';
 import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
@@ -489,6 +492,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     const dispatchingAttempt: AttemptRecord = existingAttempt
       ? {
           ...existingAttempt,
+          revision: nextAttemptRevision(existingAttempt),
           worktreePath: request.worktreePath,
           baseCommit: request.baseCommit,
           state: 'dispatching',
@@ -542,6 +546,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     if (startResult.outcome === 'started') {
       const runningAttempt: AttemptRecord = {
         ...dispatchingAttempt,
+        revision: nextAttemptRevision(dispatchingAttempt),
         state: 'running',
         sessionId: startResult.sessionId,
         runner: startResult.runner
@@ -574,6 +579,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       // Unknown keeps the reservation; reconciliation decides before retry.
       const reconcilingAttempt: AttemptRecord = {
         ...dispatchingAttempt,
+        revision: nextAttemptRevision(dispatchingAttempt),
         state: 'reconciling',
         updatedAtIso: nowIso,
       };
@@ -593,6 +599,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
 
     const cancelledAttempt: AttemptRecord = {
       ...dispatchingAttempt,
+      revision: nextAttemptRevision(dispatchingAttempt),
       state: 'cancelled',
       updatedAtIso: nowIso,
     };

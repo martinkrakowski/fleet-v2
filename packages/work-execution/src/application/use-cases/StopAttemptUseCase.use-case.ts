@@ -9,7 +9,10 @@
 
 import type { ActionJournalEntryRecord, AttemptRecord } from '../../domain/execution-records.js';
 import type { StopAttemptPort, StopAttemptRequest, StopAttemptResult } from '../ports/in/StopAttemptPort.in-port.js';
-import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import {
+  nextAttemptRevision,
+  type AttemptRepositoryPort,
+} from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
@@ -104,6 +107,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
     if (stopResult.outcome === 'terminated' && stopResult.receipt.authoritative === true) {
       const cancelled: AttemptRecord = {
         ...attempt,
+        revision: nextAttemptRevision(attempt),
         state: 'cancelled',
         outcome: 'stopped',
         completionReceipt: stopResult.receipt,
@@ -158,7 +162,12 @@ export class StopAttemptUseCase implements StopAttemptPort {
       return { outcome: 'still-running', attempt, reason: stopResult.reason };
     }
 
-    const reconciling: AttemptRecord = { ...attempt, state: 'reconciling', updatedAtIso: nowIso };
+    const reconciling: AttemptRecord = {
+      ...attempt,
+      revision: nextAttemptRevision(attempt),
+      state: 'reconciling',
+      updatedAtIso: nowIso,
+    };
     await this.deps.attemptRepo.saveAttempt(reconciling);
     const failureReason =
       (stopResult as { reason?: string }).reason ?? 'Termination receipt was not authoritative';

@@ -2,8 +2,8 @@
 
 - **Date:** 2026-10-23
 - **Target repository:** `fleet-v2` (with a closing step in `fleet`)
-- **Status:** proposal, nothing built. Inventory checked 2026-10-23 (§2). Four decisions for the
-  owner (§6).
+- **Status:** decided, nothing built. Inventory checked 2026-10-23 (§2). D1–D4 decided by the
+  owner on 2026-10-23 ("Proceed with all recommendations"), each as recommended (§6).
 - **Owner request (2026-10-23):** "I noticed we are still making updates to the original
   ~/Projects/fleet project. All of the dev-server side scripts, e.g. scripts that run on
   midnight/solstice, are still mostly contained within fleet. Research how we can package both the
@@ -116,16 +116,16 @@ a worktree. Everything else is a copy that can move back.
 
 ## 6. Decisions for the owner
 
-- **D1.** Scope of class B: all of it (the table), or only the lane infrastructure that fleet-v2's
+- **D1.** **Decided (owner, 2026-10-23): all of class B.** Scope of class B: all of it (the table), or only the lane infrastructure that fleet-v2's
   dispatch depends on (`lxd-lanes-*`, `worktrees-per-project`, `key-proxy-host`), leaving egress and
   the test database in `fleet`? Recommendation: all of class B; the egress and test-database
   programs are what make a lane container safe to dispatch into, so they are part of the product.
-- **D2.** `--apply` at all, or print-only forever (the `init` precedent)? Recommendation: `--apply`
+- **D2.** **Decided (owner, 2026-10-23): `--apply` behind the authority flag.** `--apply` at all, or print-only forever (the `init` precedent)? Recommendation: `--apply`
   behind the authority flag, because the current practice is the owner pasting a command printed
   by an orchestrator, which is `--apply` with a human relay.
-- **D3.** Does `fleet` keep `registry/` and `policy.md`, or do those move too? Recommendation:
+- **D3.** **Decided (owner, 2026-10-23): `registry/` and `policy.md` stay in `fleet`.** Does `fleet` keep `registry/` and `policy.md`, or do those move too? Recommendation:
   they stay; they are the owner's records and rules, not the product.
-- **D4.** `key-proxy-nvidia-host.sh` (a draft never run): move or delete? Recommendation: delete
+- **D4.** **Decided (owner, 2026-10-23): delete in P6.** `key-proxy-nvidia-host.sh` (a draft never run): move or delete? Recommendation: delete
   in P6; a reviewed version can be written in `hosts/` when needed.
 
 ## 7. Assumptions

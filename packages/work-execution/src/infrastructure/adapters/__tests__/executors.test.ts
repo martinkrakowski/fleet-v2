@@ -787,15 +787,17 @@ describe('exit code null is failure/unknown, never an answer (adapters)', () => 
 });
 
 describe('runner start budget (ExecutionRunnerAdapter)', () => {
-  it('passes the explicit 120s runner budget and a timed-out start (exitCode null) is unknown, never started', async () => {
+  it('runs the start under the start budget plus grace and reports a timed-out start as unknown, never started', async () => {
     const { executor, calls } = fakeExecutor(() => ({ exitCode: null, error: 'timeout' }));
     const adapter = new ExecutionRunnerAdapter({
       executor: executor,
       remotePort: 4321,
       ocmRunBin: '/bin/echo',
+      startBudgetSeconds: 10,
     });
     const result = await adapter.startSession(sessionRequest);
     expect(result.outcome).toBe('unknown');
-    expect(calls[0].options?.timeoutMs).toBe(120_000);
+    // 10 s budget + 30 s grace.
+    expect(calls[0].options?.timeoutMs).toBe(40_000);
   });
 });

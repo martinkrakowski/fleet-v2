@@ -132,6 +132,7 @@ describe('ExecutionRunnerAdapter v2 host routing (H3a)', () => {
       OCM_REMOTE_PORT: '4166',
       OCM_HOST: 'm',
       OPENCODE_AUTH_FILE: '/home/operator/.config/opencode/server-auth.env',
+      OCM_START_MAX: '60',
     });
   });
 
@@ -256,7 +257,7 @@ describe('ExecutionRunnerAdapter legacy mode is unchanged (H3a)', () => {
     const result = await adapter.startSession(startRequest);
 
     expect(result.outcome).toBe('started');
-    expect(envs[0]).toEqual({ OCM_REMOTE_PORT: '4166', OCM_HOST: 'lanehost.example' });
+    expect(envs[0]).toEqual({ OCM_REMOTE_PORT: '4166', OCM_HOST: 'lanehost.example', OCM_START_MAX: '60' });
   });
 
   it('still falls back to the environment when no option is configured', async () => {
@@ -293,7 +294,7 @@ describe('ExecutionRunnerAdapter legacy mode is unchanged (H3a)', () => {
     const result = await adapter.startSession(startRequest);
 
     expect(result.outcome).toBe('started');
-    expect(envs[0]).toEqual({});
+    expect(envs[0]).toEqual({ OCM_START_MAX: '60' });
   });
 });
 

@@ -10,6 +10,7 @@
 import type { ActionJournalEntryRecord, AttemptRecord } from '../../domain/execution-records.js';
 import type { StopAttemptPort, StopAttemptRequest, StopAttemptResult } from '../ports/in/StopAttemptPort.in-port.js';
 import {
+  AttemptRevisionConflictError,
   nextAttemptRevision,
   type AttemptRepositoryPort,
 } from '../ports/out/AttemptRepositoryPort.out-port.js';
@@ -58,25 +59,48 @@ export class StopAttemptUseCase implements StopAttemptPort {
       return { outcome: 'refused', reason: 'Attempt not found or has no sessionId' };
     }
 
-    if (
-      attempt.state === 'collected' ||
-      attempt.state === 'cancelled' ||
-      (attempt.state === 'ended' && attempt.completionReceipt?.authoritative === true)
-    ) {
-      return {
-        outcome: 'refused',
-        reason: `Attempt ${attempt.id} is in terminal state '${attempt.state}' and cannot be stopped`,
-      };
-    }
+    return this.stopAttemptOnce(request, attempt, false);
+  }
 
-    const nowIso = request.nowIso ?? new Date().toISOString();
+  /**
+   * Run the stop decision on one recorded attempt, at most twice. A stale
+   * write throws `AttemptRevisionConflictError`, handled here: the attempt is
+   * re-read once and the decision runs again on the fresh record (terminal
+   * states are already refused at the top of the decision). A second conflict
+   * propagates.
+   */
+  private async stopAttemptOnce(
+    request: StopAttemptRequest,
+    attempt: AttemptRecord,
+    retried: boolean,
+  ): Promise<StopAttemptResult> {
+    const deps = this.deps!;
+    try {
+      // The private method is self-contained: it is called from the public
+      // wrapper after the same guard, and again after a conflict re-read.
+      if (!attempt.sessionId) {
+        return { outcome: 'refused', reason: 'Attempt not found or has no sessionId' };
+      }
+
+      if (
+        attempt.state === 'collected' ||
+        attempt.state === 'cancelled' ||
+        (attempt.state === 'ended' && attempt.completionReceipt?.authoritative === true)
+      ) {
+        return {
+          outcome: 'refused',
+          reason: `Attempt ${attempt.id} is in terminal state '${attempt.state}' and cannot be stopped`,
+        };
+      }
+
+      const nowIso = request.nowIso ?? new Date().toISOString();
 
     // Resolve the runner through the attempt's recorded host (H9b1). A
     // recorded host that changed or was removed refuses before any journal
     // intent or subprocess; the reason names the recorded host.
-    let runner: ExecutionRunnerPort = this.deps.runner;
-    if (this.deps.runnerForAttempt) {
-      const selection = this.deps.runnerForAttempt.runnerForAttempt({
+    let runner: ExecutionRunnerPort = deps.runner;
+    if (deps.runnerForAttempt) {
+      const selection = deps.runnerForAttempt.runnerForAttempt({
         runner: attempt.runner ?? null,
       });
       if (!selection.ok) {
@@ -85,7 +109,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
       runner = selection.runner;
     }
 
-    await appendJournalEntry(this.deps.journal, {
+    await appendJournalEntry(deps.journal, {
       attemptId: attempt.id,
       workOrderId: attempt.workOrderId,
       action: 'stop',
@@ -113,9 +137,9 @@ export class StopAttemptUseCase implements StopAttemptPort {
         completionReceipt: stopResult.receipt,
         updatedAtIso: nowIso,
       };
-      await this.deps.attemptRepo.saveAttempt(cancelled);
-      const capacityReleased = await this.deps.journal.releaseCapacityReservation(attempt.id, nowIso);
-      await appendJournalEntry(this.deps.journal, {
+      await deps.attemptRepo.saveAttempt(cancelled);
+      const capacityReleased = await deps.journal.releaseCapacityReservation(attempt.id, nowIso);
+      await appendJournalEntry(deps.journal, {
         attemptId: attempt.id,
         workOrderId: attempt.workOrderId,
         action: 'stop',
@@ -134,7 +158,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
     }
 
     if (stopResult.outcome === 'refused') {
-      await appendJournalEntry(this.deps.journal, {
+      await appendJournalEntry(deps.journal, {
         attemptId: attempt.id,
         workOrderId: attempt.workOrderId,
         action: 'stop',
@@ -149,7 +173,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
 
     if (stopResult.outcome === 'still-running') {
       // Capacity stays held until the session's actual end is established.
-      await appendJournalEntry(this.deps.journal, {
+      await appendJournalEntry(deps.journal, {
         attemptId: attempt.id,
         workOrderId: attempt.workOrderId,
         action: 'stop',
@@ -168,10 +192,10 @@ export class StopAttemptUseCase implements StopAttemptPort {
       state: 'reconciling',
       updatedAtIso: nowIso,
     };
-    await this.deps.attemptRepo.saveAttempt(reconciling);
+    await deps.attemptRepo.saveAttempt(reconciling);
     const failureReason =
       (stopResult as { reason?: string }).reason ?? 'Termination receipt was not authoritative';
-    await appendJournalEntry(this.deps.journal, {
+    await appendJournalEntry(deps.journal, {
       attemptId: attempt.id,
       workOrderId: attempt.workOrderId,
       action: 'stop',
@@ -182,6 +206,19 @@ export class StopAttemptUseCase implements StopAttemptPort {
       detail: failureReason,
     });
     return { outcome: 'unknown', attempt: reconciling, reason: failureReason };
+    } catch (error) {
+      if (error instanceof AttemptRevisionConflictError) {
+        if (retried) {
+          throw error;
+        }
+        const fresh = await deps.attemptRepo.findAttemptById(request.attemptId);
+        if (!fresh || !fresh.sessionId) {
+          return { outcome: 'refused', reason: 'Attempt not found or has no sessionId' };
+        }
+        return this.stopAttemptOnce(request, fresh, true);
+      }
+      throw error;
+    }
   }
 
   async execute(input?: unknown): Promise<StopAttemptResult> {

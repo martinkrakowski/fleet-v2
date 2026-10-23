@@ -16,6 +16,7 @@ import type {
 } from '../ports/in/CollectAttemptArtifactsPort.in-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
 import {
+  AttemptRevisionConflictError,
   nextAttemptRevision,
   type AttemptRepositoryPort,
 } from '../ports/out/AttemptRepositoryPort.out-port.js';
@@ -165,7 +166,20 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
       ...(usageResult !== undefined ? { usage: usageResult.usage } : {}),
       updatedAtIso: nowIso,
     };
-    await this.deps.attemptRepo.saveAttempt(collectedAttempt);
+    try {
+      await this.deps.attemptRepo.saveAttempt(collectedAttempt);
+    } catch (error) {
+      if (error instanceof AttemptRevisionConflictError) {
+        // Never redo collection: re-read once and refuse naming the
+        // conflicting state.
+        const fresh = await this.deps.attemptRepo.findAttemptById(attempt.id);
+        return {
+          outcome: 'refused',
+          reason: `Attempt ${attempt.id} changed to ${fresh?.state ?? 'unknown'} while collecting artifacts`,
+        };
+      }
+      throw error;
+    }
     // Release is idempotent: false simply means no reservation was held.
     await this.deps.journal.releaseCapacityReservation(attempt.id, nowIso);
     const usageDetail =

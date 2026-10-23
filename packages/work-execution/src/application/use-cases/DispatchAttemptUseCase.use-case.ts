@@ -19,6 +19,7 @@ import type { DispatchAttemptPort, DispatchAttemptRequest, DispatchAttemptResult
 import type { RunnerIsolationCapabilities } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
 import {
+  AttemptRevisionConflictError,
   nextAttemptRevision,
   type AttemptRepositoryPort,
 } from '../ports/out/AttemptRepositoryPort.out-port.js';
@@ -527,7 +528,10 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           createdAtIso: nowIso,
           updatedAtIso: nowIso,
         };
-    await this.deps.attemptRepo.saveAttempt(dispatchingAttempt);
+    const dispatchingConflict = await this.saveAttemptOrConflict(dispatchingAttempt, false);
+    if (dispatchingConflict) {
+      return dispatchingConflict;
+    }
 
     const startResult = await this.deps.runner.startSession({
       attemptId: request.attemptId,
@@ -554,7 +558,10 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           : dispatchingAttempt.runner ?? null,
         updatedAtIso: nowIso,
       };
-      await this.deps.attemptRepo.saveAttempt(runningAttempt);
+      const runningConflict = await this.saveAttemptOrConflict(runningAttempt, true);
+      if (runningConflict) {
+        return runningConflict;
+      }
       const completedEntry = await appendJournalEntry(this.deps.journal, {
         attemptId: request.attemptId,
         workOrderId: request.workOrderId,
@@ -583,7 +590,10 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         state: 'reconciling',
         updatedAtIso: nowIso,
       };
-      await this.deps.attemptRepo.saveAttempt(reconcilingAttempt);
+      const reconcilingConflict = await this.saveAttemptOrConflict(reconcilingAttempt, true);
+      if (reconcilingConflict) {
+        return reconcilingConflict;
+      }
       await appendJournalEntry(this.deps.journal, {
         attemptId: request.attemptId,
         workOrderId: request.workOrderId,
@@ -603,7 +613,10 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       state: 'cancelled',
       updatedAtIso: nowIso,
     };
-    await this.deps.attemptRepo.saveAttempt(cancelledAttempt);
+    const cancelledConflict = await this.saveAttemptOrConflict(cancelledAttempt, false);
+    if (cancelledConflict) {
+      return cancelledConflict;
+    }
     await appendJournalEntry(this.deps.journal, {
       attemptId: request.attemptId,
       workOrderId: request.workOrderId,
@@ -616,6 +629,39 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     });
     await this.deps.journal.releaseCapacityReservation(request.attemptId, nowIso);
     return { outcome: 'refused', reason: startResult.reason };
+  }
+
+  /**
+   * Save one attempt record, catching `AttemptRevisionConflictError`. A
+   * conflict re-reads once and returns a refused or unknown result naming the
+   * conflicting state instead of redoing any work: dispatch must never start a
+   * second session.
+   */
+  private async saveAttemptOrConflict(
+    record: AttemptRecord,
+    unknownOnConflict: boolean,
+  ): Promise<DispatchAttemptResult | null> {
+    try {
+      await this.deps!.attemptRepo.saveAttempt(record);
+      return null;
+    } catch (error) {
+      if (!(error instanceof AttemptRevisionConflictError)) {
+        throw error;
+      }
+      const fresh = await this.deps!.attemptRepo.findAttemptById(record.id);
+      const state = fresh?.state ?? 'unknown';
+      if (unknownOnConflict) {
+        return {
+          outcome: 'unknown',
+          attempt: fresh ?? record,
+          reason: `Attempt ${record.id} changed to ${state} while dispatching`,
+        };
+      }
+      return {
+        outcome: 'refused',
+        reason: `Attempt ${record.id} changed to ${state} while dispatching`,
+      };
+    }
   }
 
   async execute(input?: unknown): Promise<DispatchAttemptResult> {

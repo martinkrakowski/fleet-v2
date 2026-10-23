@@ -14,6 +14,7 @@ import type {
   ReconcileAttemptResult,
 } from '../ports/in/ReconcileAttemptPort.in-port.js';
 import {
+  AttemptRevisionConflictError,
   nextAttemptRevision,
   type AttemptRepositoryPort,
 } from '../ports/out/AttemptRepositoryPort.out-port.js';
@@ -62,14 +63,31 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
       return { outcome: 'not-found', attemptId: request.attemptId };
     }
 
-    const nowIso = request.nowIso ?? new Date().toISOString();
+    return this.reconcileAttemptOnce(request, attempt, false);
+  }
+
+  /**
+   * Run the reconcile decision on one recorded attempt, at most twice. A
+   * stale write throws `AttemptRevisionConflictError`, handled here: the
+   * attempt is re-read once and the decision runs again on the fresh record.
+   * On the retry a fresh terminal state (cancelled, collected or ended)
+   * writes nothing and refuses; a second conflict propagates.
+   */
+  private async reconcileAttemptOnce(
+    request: ReconcileAttemptRequest,
+    attempt: AttemptRecord,
+    retried: boolean,
+  ): Promise<ReconcileAttemptResult> {
+    const deps = this.deps!;
+    try {
+      const nowIso = request.nowIso ?? new Date().toISOString();
 
     // Resolve the runner through the attempt's recorded host (H9b1). A
     // recorded host that changed or was removed refuses, naming the recorded
     // host, before any state change or runner contact.
-    let runner: ExecutionRunnerPort = this.deps.runner;
-    if (this.deps.runnerForAttempt) {
-      const selection = this.deps.runnerForAttempt.runnerForAttempt({
+    let runner: ExecutionRunnerPort = deps.runner;
+    if (deps.runnerForAttempt) {
+      const selection = deps.runnerForAttempt.runnerForAttempt({
         runner: attempt.runner ?? null,
       });
       if (!selection.ok) {
@@ -85,8 +103,8 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
         state: 'reconciling',
         updatedAtIso: nowIso,
       };
-      await this.deps.attemptRepo.saveAttempt(reconciling);
-      await appendJournalEntry(this.deps.journal, {
+      await deps.attemptRepo.saveAttempt(reconciling);
+      await appendJournalEntry(deps.journal, {
         attemptId: attempt.id,
         workOrderId: attempt.workOrderId,
         action: 'reconcile',
@@ -113,8 +131,8 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
         state: 'reconciling',
         updatedAtIso: nowIso,
       };
-      await this.deps.attemptRepo.saveAttempt(reconciling);
-      await appendJournalEntry(this.deps.journal, {
+      await deps.attemptRepo.saveAttempt(reconciling);
+      await appendJournalEntry(deps.journal, {
         attemptId: attempt.id,
         workOrderId: attempt.workOrderId,
         action: 'reconcile',
@@ -147,9 +165,9 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
         completionReceipt: receipt,
         updatedAtIso: nowIso,
       };
-      await this.deps.attemptRepo.saveAttempt(ended);
-      await this.deps.journal.releaseCapacityReservation(attempt.id, nowIso);
-      await appendJournalEntry(this.deps.journal, {
+      await deps.attemptRepo.saveAttempt(ended);
+      await deps.journal.releaseCapacityReservation(attempt.id, nowIso);
+      await appendJournalEntry(deps.journal, {
         attemptId: attempt.id,
         workOrderId: attempt.workOrderId,
         action: 'reconcile',
@@ -169,8 +187,8 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
         state: 'running',
         updatedAtIso: nowIso,
       };
-      await this.deps.attemptRepo.saveAttempt(running);
-      await appendJournalEntry(this.deps.journal, {
+      await deps.attemptRepo.saveAttempt(running);
+      await appendJournalEntry(deps.journal, {
         attemptId: attempt.id,
         workOrderId: attempt.workOrderId,
         action: 'reconcile',
@@ -189,8 +207,8 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
       state: 'reconciling',
       updatedAtIso: nowIso,
     };
-    await this.deps.attemptRepo.saveAttempt(reconciling);
-    await appendJournalEntry(this.deps.journal, {
+    await deps.attemptRepo.saveAttempt(reconciling);
+    await appendJournalEntry(deps.journal, {
       attemptId: attempt.id,
       workOrderId: attempt.workOrderId,
       action: 'reconcile',
@@ -205,6 +223,29 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
       attempt: reconciling,
       reason: 'Ambiguous worker command state or mismatched receipt',
     };
+    } catch (error) {
+      if (error instanceof AttemptRevisionConflictError) {
+        if (retried) {
+          throw error;
+        }
+        const fresh = await deps.attemptRepo.findAttemptById(request.attemptId);
+        if (!fresh) {
+          return { outcome: 'not-found', attemptId: request.attemptId };
+        }
+        if (
+          fresh.state === 'cancelled' ||
+          fresh.state === 'collected' ||
+          fresh.state === 'ended'
+        ) {
+          return {
+            outcome: 'refused',
+            reason: `Attempt ${fresh.id} changed to ${fresh.state} while reconciling`,
+          };
+        }
+        return this.reconcileAttemptOnce(request, fresh, true);
+      }
+      throw error;
+    }
   }
 
   async execute(input?: unknown): Promise<ReconcileAttemptResult> {

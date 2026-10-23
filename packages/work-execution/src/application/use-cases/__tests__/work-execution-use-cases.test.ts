@@ -22,6 +22,7 @@ import type {
 } from '../../ports/out/AllowedSeatPort.out-port.js';
 import type { AttemptArtifactPort } from '../../ports/out/AttemptArtifactPort.out-port.js';
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
+import { AttemptRevisionConflictError } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import type { BriefAuthoringPort } from '../../ports/out/BriefAuthoringPort.out-port.js';
 import type { BriefKnowledgePort } from '../../ports/out/BriefKnowledgePort.out-port.js';
 import type {
@@ -2850,5 +2851,120 @@ describe('PrepareFixAttemptUseCase', () => {
       updatedAtIso: '2026-10-15T10:00:00.000Z',
     });
     expect(setup.attemptRepo.attempts.get('attempt-fix-1')?.sessionId).toBeNull();
+  });
+});
+
+function makeFailingSaveAttemptRepo(
+  options: {
+    conflictOnSave?: number;
+    freshAfterConflict?: AttemptRecord;
+    seed?: AttemptRecord;
+  } = {},
+): AttemptRepositoryPort & { attempts: Map<string, AttemptRecord>; saveCalls: number } {
+  const attempts = new Map<string, AttemptRecord>();
+  if (options.seed) {
+    attempts.set(options.seed.id, options.seed);
+  }
+  const repo = {
+    attempts,
+    saveCalls: 0,
+    async saveAttempt(record: AttemptRecord): Promise<void> {
+      repo.saveCalls += 1;
+      if (repo.saveCalls === (options.conflictOnSave ?? Infinity)) {
+        if (options.freshAfterConflict) {
+          attempts.set(options.freshAfterConflict.id, options.freshAfterConflict);
+        }
+        throw new AttemptRevisionConflictError(record.id, 0, record.revision ?? 0);
+      }
+      attempts.set(record.id, record);
+    },
+    async findAttemptById(attemptId: string) {
+      return attempts.get(attemptId) ?? null;
+    },
+    async listAttemptsByWorkOrder(workOrderId: string) {
+      return [...attempts.values()].filter((a) => a.workOrderId === workOrderId);
+    },
+    async listAllAttempts() {
+      return [...attempts.values()];
+    },
+  };
+  return repo;
+}
+
+describe('attempt revision compare-and-swap retry', () => {
+  it('reconcile retries once and refuses on a fresh cancelled record without saving', async () => {
+    const seed = storedAttempt({ state: 'running' });
+    const freshCancelled = storedAttempt({
+      id: 'attempt-1',
+      state: 'cancelled',
+      updatedAtIso: '2026-10-15T08:05:00.000Z',
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      seed,
+      conflictOnSave: 1,
+      freshAfterConflict: freshCancelled,
+    });
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner(); // default inspectStatus: active
+    const useCase = new ReconcileAttemptUseCase({ attemptRepo, journal, runner: runner.port });
+
+    const result = await useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Attempt attempt-1 changed to cancelled while reconciling',
+    });
+    expect(attemptRepo.saveCalls).toBe(1);
+    expect(attemptRepo.attempts.get('attempt-1')?.state).toBe('cancelled');
+    expect(journal.entries).toHaveLength(0);
+  });
+
+  it('stop retries once when its cancelled save conflicts', async () => {
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      seed: storedAttempt({ state: 'running' }),
+      conflictOnSave: 1,
+    });
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const receipt = completionReceipt({ stoppedByRequest: true });
+    const runner = makeRunner({ stopResult: { outcome: 'terminated', receipt } });
+    const useCase = new StopAttemptUseCase({ attemptRepo, journal, runner: runner.port });
+
+    const result = await useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('terminated');
+    expect(attemptRepo.saveCalls).toBe(2);
+    expect(attemptRepo.attempts.get('attempt-1')?.state).toBe('cancelled');
+    expect(journal.heldFor('attempt-1')).toBe(false);
+  });
+
+  it('dispatch does not start a second session when the running save conflicts', async () => {
+    const attemptRepo = makeFailingSaveAttemptRepo({ conflictOnSave: 2 });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner(); // default start: started with session-1
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(runner.startCalls).toHaveLength(1);
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('changed to dispatching while dispatching');
+    }
   });
 });

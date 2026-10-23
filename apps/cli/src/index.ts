@@ -13,6 +13,7 @@ import { join, resolve } from 'node:path';
 import { readFileSync } from 'node:fs';
 
 import type {
+  AttemptRecord,
   AttemptSeatOverrideRecord,
   BriefContextDecision,
   BriefModelAssignment,
@@ -20,6 +21,7 @@ import type {
   ReserveExecutionCapacityCandidateHost,
 } from '@fleet/work-execution';
 import {
+  AttemptRevisionConflictError,
   nextAttemptRevision,
   parseSeatTool,
   resolveInstallationHostForRole,
@@ -934,12 +936,28 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         return { outcome: 'refused', reason: `Attempt not found: ${attemptId}` };
       }
       const result = await rt.execution.opencodeDbUsage.readUsage({ attempt });
-      await rt.execution.attemptRepository.saveAttempt({
-        ...attempt,
-        usage: result.usage,
-        updatedAtIso: new Date().toISOString(),
-        revision: nextAttemptRevision(attempt),
-      });
+      const saveUsage = async (base: AttemptRecord): Promise<void> => {
+        await rt.execution.attemptRepository.saveAttempt({
+          ...base,
+          usage: result.usage,
+          updatedAtIso: new Date().toISOString(),
+          revision: nextAttemptRevision(base),
+        });
+      };
+      try {
+        await saveUsage(attempt);
+      } catch (error) {
+        if (error instanceof AttemptRevisionConflictError) {
+          // Re-read once and retry that save once with the fresh record.
+          const fresh = await rt.execution.attemptRepository.findAttemptById(attemptId);
+          if (fresh === null) {
+            return { outcome: 'refused', reason: `Attempt not found: ${attemptId}` };
+          }
+          await saveUsage(fresh);
+        } else {
+          throw error;
+        }
+      }
       return result;
     },
     fix: async (p, rt) =>

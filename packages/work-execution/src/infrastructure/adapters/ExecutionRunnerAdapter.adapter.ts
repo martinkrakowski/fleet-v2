@@ -311,13 +311,51 @@ function parseSessionId(stdout: string): string | null {
   return match?.[1] ?? null;
 }
 
-/** Every distinct `ses_` token in a subprocess stdout stream. */
-function collectSessionIds(stdout: string): string[] {
+const STATUS_HEADER_PATTERN = /^ocm-run: running in .*:$/;
+const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
+
+/**
+ * Session ids the runner's `--status` output actually lists: only lines
+ * after the `ocm-run: running in <dir>:` header count, and each must be a
+ * bare session id. A `ses_…` inside the directory path never counts.
+ */
+function statusSessionIds(stdout: string): string[] {
+  const lines = stdout.split('\n');
+  const headerIndex = lines.findIndex((line) => STATUS_HEADER_PATTERN.test(line));
+  if (headerIndex === -1) return [];
   const ids = new Set<string>();
-  for (const match of stdout.matchAll(/\b(ses_[A-Za-z0-9_-]+)\b/g)) {
-    ids.add(match[1]);
+  for (const rawLine of lines.slice(headerIndex + 1)) {
+    const line = rawLine.trim();
+    if (SESSION_ID_PATTERN.test(line)) ids.add(line);
   }
   return [...ids];
+}
+
+/** A runner output line that reports the runner aborted a session. */
+function isAbortLine(line: string): boolean {
+  return /aborted the session/.test(line) || /aborting it/.test(line);
+}
+
+/**
+ * Session ids the start subprocess itself named, split by whether the start
+ * reported aborting them. Every `ses_…` id in either stream is "named"; ids
+ * on the runner's abort lines ("aborted the session <id>", "… aborting it")
+ * are additionally "aborted".
+ */
+function startOutputIds(stdout: string, stderr: string): { named: Set<string>; aborted: Set<string> } {
+  const named = new Set<string>();
+  const aborted = new Set<string>();
+  for (const line of [...stdout.split('\n'), ...stderr.split('\n')]) {
+    for (const match of line.matchAll(/\b(ses_[A-Za-z0-9_-]+)\b/g)) {
+      named.add(match[1]);
+    }
+    if (isAbortLine(line)) {
+      for (const match of line.matchAll(/\b(ses_[A-Za-z0-9_-]+)\b/g)) {
+        aborted.add(match[1]);
+      }
+    }
+  }
+  return { named, aborted };
 }
 
 /** An ssh destination that could inject options or split words never spawns. */
@@ -502,7 +540,16 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       result.exitCode === 0
         ? result.stderr || result.stdout || 'Runner exited 0 without returning a sessionId'
         : result.stderr || result.stdout || `Runner start outcome ambiguous (exit ${result.exitCode})`;
-    return this.startUnknownAfterLookup(request.worktreePath, env, startDetail, agent, model, variant);
+    return this.startUnknownAfterLookup(
+      request.worktreePath,
+      env,
+      startDetail,
+      agent,
+      model,
+      variant,
+      result.stdout,
+      result.stderr,
+    );
   }
 
   private startedSessionResult(
@@ -551,10 +598,22 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     agent: string | null | undefined,
     model: string,
     variant: string | null | undefined,
+    startStdout = '',
+    startStderr = '',
   ): Promise<StartRunnerSessionResult> {
     const status = await this.lookUpRunningSession(worktreePath, env);
-    if (status.outcome === 'started') {
-      return this.startedSessionResult(status.sessionId, agent, model, variant);
+    if (status.ids.length === 1) {
+      const id = status.ids[0];
+      // Only adopt a status id the start itself named, and never one the
+      // start reported aborting: the start subprocess owns this outcome.
+      const { named, aborted } = startOutputIds(startStdout, startStderr);
+      if (named.has(id) && !aborted.has(id)) {
+        return this.startedSessionResult(id, agent, model, variant);
+      }
+      return {
+        outcome: 'unknown',
+        reason: `${startDetail}; status lists ${id}, which this start did not create`,
+      };
     }
     return { outcome: 'unknown', reason: `${startDetail}; status: ${status.reason}` };
   }
@@ -562,7 +621,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   private async lookUpRunningSession(
     worktreePath: string,
     env: Readonly<Record<string, string>> | undefined,
-  ): Promise<{ outcome: 'started'; sessionId: string } | { outcome: 'unknown'; reason: string }> {
+  ): Promise<{ ids: string[]; reason: string }> {
     let result: SubprocessResult;
     try {
       // Bounded like the start itself: a stuck status call must not hang startSession.
@@ -570,23 +629,23 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
         timeoutMs: RUNNER_STATUS_LOOKUP_TIMEOUT_MS,
       });
     } catch (error) {
-      return { outcome: 'unknown', reason: `status command failed: ${String(error)}` };
+      return { ids: [], reason: `status command failed: ${String(error)}` };
     }
     if (result.exitCode === 3) {
-      const ids = collectSessionIds(result.stdout);
+      const ids = statusSessionIds(result.stdout);
       if (ids.length === 1) {
-        return { outcome: 'started', sessionId: ids[0] };
+        return { ids, reason: 'status listed one session' };
       }
       return {
-        outcome: 'unknown',
+        ids,
         reason: `status exit 3 listed ${ids.length} sessions (${ids.join(', ') || 'none'})`,
       };
     }
     if (result.exitCode === 0) {
-      return { outcome: 'unknown', reason: 'status reports nothing running' };
+      return { ids: [], reason: 'status reports nothing running' };
     }
     return {
-      outcome: 'unknown',
+      ids: [],
       reason: `status command exited ${result.exitCode}: ${result.stderr || result.stdout || 'no output'}`,
     };
   }

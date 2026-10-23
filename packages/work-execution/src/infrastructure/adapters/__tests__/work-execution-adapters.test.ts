@@ -917,7 +917,7 @@ describe('ExecutionRunnerAdapter', () => {
 
   it('recovers a started session from status after the start subprocess is killed (exit 143)', async () => {
     const { runner, calls } = scriptedRunner([
-      { exitCode: 143, stdout: '', stderr: '' },
+      { exitCode: 143, stdout: '{"sessionID":"ses_rec"}\n', stderr: '' },
       { exitCode: 3, stdout: 'ocm-run: running in /tmp/fleet-test-worktree:\nses_rec', stderr: '' },
     ]);
     const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
@@ -970,26 +970,18 @@ describe('ExecutionRunnerAdapter', () => {
     expect(calls).toHaveLength(2);
   });
 
-  it('recovers a started session from status when the start subprocess throws', async () => {
+  it('reports unknown when the start subprocess throws without naming a session', async () => {
     const { runner } = scriptedRunner([
       new Error('network timeout'),
       { exitCode: 3, stdout: 'ocm-run: running in /tmp/fleet-test-worktree:\nses_thrown', stderr: '' },
     ]);
     const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
     const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
-    expect(result).toEqual({
-      outcome: 'started',
-      sessionId: 'ses_thrown',
-      runner: {
-        kind: 'opencode',
-        remotePort: 4166,
-        host: null,
-        hostName: null,
-        agent: null,
-        model: 'glm-5',
-        variant: null,
-      },
-    });
+    // A bare throw carries no start output, so the status id stays unadopted.
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('network timeout');
+    }
   });
 
   it('reports unknown when the start subprocess throws and status finds nothing', async () => {
@@ -1429,5 +1421,67 @@ describe('ExecutionRunnerAdapter', () => {
       code: 1,
       stderr: expect.stringContaining('OCM_HOST is not set'),
     });
+  });
+});
+
+describe('ExecutionRunnerAdapter: status adoption after an ambiguous start', () => {
+  function scriptedAdapter(
+    steps: Array<(args: readonly string[]) => SubprocessResult>,
+  ): ExecutionRunnerAdapter {
+    let call = 0;
+    const runSubprocess: SubprocessRunner = (_command, args) => {
+      const step = steps[call] ?? (() => ({ exitCode: 0, stdout: '', stderr: '' }));
+      call += 1;
+      return Promise.resolve(step(args));
+    };
+    return new ExecutionRunnerAdapter({ ocmRunBin: '/bin/echo', runSubprocess });
+  }
+
+  it('never adopts a status id the start reported aborting', async () => {
+    const adapter = scriptedAdapter([
+      () => ({ exitCode: 1, stdout: '', stderr: 'ocm-run: aborted the session ses_a\n' }),
+      () => ({ exitCode: 3, stdout: 'ocm-run: running in /wt:\nses_b\n', stderr: '' }),
+    ]);
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('which this start did not create');
+    }
+  });
+
+  it('adopts a status id the start itself named and did not abort', async () => {
+    const adapter = scriptedAdapter([
+      () => ({ exitCode: 1, stdout: '{"sessionID":"ses_a"}\n', stderr: '' }),
+      () => ({ exitCode: 3, stdout: 'ocm-run: running in /wt:\nses_a\n', stderr: '' }),
+    ]);
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('started');
+    expect((result as { sessionId: string }).sessionId).toBe('ses_a');
+  });
+
+  it('never adopts a status id the start output never named', async () => {
+    const adapter = scriptedAdapter([
+      () => ({ exitCode: 1, stdout: '', stderr: 'runner died' }),
+      () => ({ exitCode: 3, stdout: 'ocm-run: running in /wt:\nses_a\n', stderr: '' }),
+    ]);
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('which this start did not create');
+    }
+  });
+
+  it('reads status ids only from lines after the running-in header, never from the dir path', async () => {
+    const adapter = scriptedAdapter([
+      () => ({ exitCode: 1, stdout: 'named ses_ok\n', stderr: '' }),
+      () => ({
+        exitCode: 3,
+        stdout: 'ocm-run: running in /x/ses_dir/wt:\nses_ok\n',
+        stderr: '',
+      }),
+    ]);
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('started');
+    expect((result as { sessionId: string }).sessionId).toBe('ses_ok');
   });
 });

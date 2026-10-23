@@ -6,6 +6,7 @@
  */
 
 import type { AttemptRecord } from '../../../domain/execution-records.js';
+import type { AttemptStateValue } from '../../../domain/value-objects/AttemptState.vo.js';
 
 /**
  * Thrown when a save of an existing attempt is not built on the stored
@@ -33,6 +34,20 @@ export class AttemptRevisionConflictError extends Error {
 /** Next revision for an update built from `record`; a missing revision reads as 0. */
 export function nextAttemptRevision(record: AttemptRecord): number {
   return (record.revision ?? 0) + 1;
+}
+
+/**
+ * The one and only gate for rebuilding a transition after a revision
+ * conflict: the fresh record may be overwritten only when its state is one of
+ * the states the original transition was allowed to start from. Anything
+ * else means someone else moved the attempt on, so the state must never be
+ * overwritten. A missing fresh record is decided by the caller, not here.
+ */
+export function canOverwriteAfterConflict(
+  fresh: AttemptRecord | null,
+  expectedFrom: readonly AttemptStateValue[],
+): boolean {
+  return fresh !== null && expectedFrom.includes(fresh.state);
 }
 
 export interface AttemptRepositoryPort {

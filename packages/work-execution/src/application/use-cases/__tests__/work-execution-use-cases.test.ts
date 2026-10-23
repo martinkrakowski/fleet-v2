@@ -22,7 +22,10 @@ import type {
 } from '../../ports/out/AllowedSeatPort.out-port.js';
 import type { AttemptArtifactPort } from '../../ports/out/AttemptArtifactPort.out-port.js';
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
-import { AttemptRevisionConflictError } from '../../ports/out/AttemptRepositoryPort.out-port.js';
+import {
+  AttemptRevisionConflictError,
+  canOverwriteAfterConflict,
+} from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import type { BriefAuthoringPort } from '../../ports/out/BriefAuthoringPort.out-port.js';
 import type { BriefKnowledgePort } from '../../ports/out/BriefKnowledgePort.out-port.js';
 import type {
@@ -3138,5 +3141,166 @@ describe('attempt revision compare-and-swap retry', () => {
     });
     expect(attemptRepo.attempts.get('attempt-1')?.state).toBe('cancelled');
     expect(journal.releaseCount).toBe(0);
+  });
+
+  it('dispatch refused start conflicts with a fresh running record holding a session: no save, no release, refused naming the fresh state', async () => {
+    const freshRunning = storedAttempt({
+      state: 'running',
+      sessionId: 'session-9',
+      revision: 5,
+      updatedAtIso: '2026-10-15T08:06:00.000Z',
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({ conflictOnSave: 2, freshAfterConflict: freshRunning });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner({
+      startResult: { outcome: 'refused', reason: 'no seat available' },
+    });
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(runner.startCalls).toHaveLength(1);
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Attempt attempt-1 changed to running while refusing dispatch; capacity not released',
+    });
+    expect(attemptRepo.saveCalls).toBe(2);
+    expect(attemptRepo.attempts.get('attempt-1')).toEqual(freshRunning);
+    expect(journal.releaseCount).toBe(0);
+    expect(journal.heldFor('attempt-1')).toBe(true);
+    const refusedEntries = journal.entries.filter((entry) => entry.status === 'refused');
+    expect(refusedEntries).toHaveLength(1);
+    expect(refusedEntries[0]?.detail).toContain('state running');
+  });
+
+  it('dispatch running-save conflicts with a fresh non-authoritative ended record and no session: state stays ended, the session is recorded, unknown', async () => {
+    const freshEnded = storedAttempt({
+      state: 'ended',
+      sessionId: null,
+      completionReceipt: completionReceipt({ authoritative: false }),
+      revision: 5,
+      updatedAtIso: '2026-10-15T08:06:00.000Z',
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({ conflictOnSave: 2, freshAfterConflict: freshEnded });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner(); // default start: started with session-1
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(runner.startCalls).toHaveLength(1);
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('session-1');
+      expect(result.attempt.state).toBe('ended');
+    }
+    const stored = attemptRepo.attempts.get('attempt-1');
+    expect(stored?.state).toBe('ended');
+    expect(stored?.sessionId).toBe('session-1');
+    expect(stored?.revision).toBe(6);
+    const sessionEntries = journal.entries.filter((entry) => entry.sessionId === 'session-1');
+    expect(sessionEntries.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('stop without an authoritative receipt conflicts with a fresh non-authoritative ended record: no reconciling write', async () => {
+    const seed = storedAttempt({ state: 'running' });
+    const freshEnded = storedAttempt({
+      state: 'ended',
+      sessionId: 'session-1',
+      completionReceipt: completionReceipt({ authoritative: false }),
+      revision: 3,
+      updatedAtIso: '2026-10-15T08:06:00.000Z',
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      seed,
+      conflictOnSave: 1,
+      freshAfterConflict: freshEnded,
+    });
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner({ stopResult: { outcome: 'unknown', reason: 'receipt lost' } });
+    const useCase = new StopAttemptUseCase({ attemptRepo, journal, runner: runner.port });
+
+    const result = await useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(runner.stopCalls).toHaveLength(1);
+    expect(result.outcome).toBe('unknown');
+    expect(attemptRepo.saveCalls).toBe(1);
+    expect(attemptRepo.attempts.get('attempt-1')).toEqual(freshEnded);
+    expect(journal.releaseCount).toBe(0);
+    expect(journal.heldFor('attempt-1')).toBe(true);
+  });
+
+  it('dispatch running-save rebuilt after a conflict returns the stored revision', async () => {
+    const attemptRepo = makeFailingSaveAttemptRepo({ conflictOnSave: 2 });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner(); // default start: started with session-1
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('started');
+    const stored = attemptRepo.attempts.get('attempt-1');
+    expect(stored?.state).toBe('running');
+    if (result.outcome === 'started') {
+      expect(result.attempt.revision).toBe(stored?.revision);
+      expect(result.attempt).toEqual(stored);
+    }
+  });
+
+  it('canOverwriteAfterConflict allows only the states the transition may start from', () => {
+    expect(canOverwriteAfterConflict(storedAttempt({ state: 'dispatching' }), ['dispatching'])).toBe(true);
+    expect(canOverwriteAfterConflict(storedAttempt({ state: 'running' }), ['running', 'reconciling'])).toBe(true);
+    expect(canOverwriteAfterConflict(storedAttempt({ state: 'ended' }), ['running', 'reconciling'])).toBe(false);
+    expect(
+      canOverwriteAfterConflict(
+        storedAttempt({ state: 'ended', completionReceipt: completionReceipt({ authoritative: true }) }),
+        ['running', 'reconciling'],
+      ),
+    ).toBe(false);
+    expect(canOverwriteAfterConflict(storedAttempt({ state: 'cancelled' }), ['dispatching'])).toBe(false);
+    expect(canOverwriteAfterConflict(null, ['dispatching'])).toBe(false);
   });
 });

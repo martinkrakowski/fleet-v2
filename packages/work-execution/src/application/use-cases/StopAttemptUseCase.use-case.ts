@@ -11,6 +11,7 @@ import type { ActionJournalEntryRecord, AttemptRecord } from '../../domain/execu
 import type { StopAttemptPort, StopAttemptRequest, StopAttemptResult } from '../ports/in/StopAttemptPort.in-port.js';
 import {
   AttemptRevisionConflictError,
+  canOverwriteAfterConflict,
   nextAttemptRevision,
   type AttemptRepositoryPort,
 } from '../ports/out/AttemptRepositoryPort.out-port.js';
@@ -244,9 +245,12 @@ export class StopAttemptUseCase implements StopAttemptPort {
 
   /**
    * Save the `reconciling` transition after a non-authoritative stop. On a
-   * revision conflict the fresh record is re-read once: a terminal fresh
-   * record skips the save, otherwise the same transition is rebuilt on top
-   * of the fresh record and saved once. A second conflict propagates.
+   * revision conflict the fresh record is re-read once: `reconciling` is
+   * rebuilt only when the fresh record is still `running`, `reconciling` or
+   * `dispatching` (a vanished record rebuilds from the pre-conflict record).
+   * Any `ended` — authoritative or not — plus `cancelled` and `collected`,
+   * is someone else's move: the save is skipped and the fresh record is
+   * returned untouched. A second conflict propagates.
    */
   private async saveReconcilingOrSkip(attempt: AttemptRecord, nowIso: string): Promise<AttemptRecord> {
     const build = (base: AttemptRecord): AttemptRecord => ({
@@ -264,7 +268,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
         throw error;
       }
       const fresh = await this.deps!.attemptRepo.findAttemptById(attempt.id);
-      if (fresh && isTerminalAttempt(fresh)) {
+      if (fresh && !canOverwriteAfterConflict(fresh, ['running', 'reconciling', 'dispatching'])) {
         return fresh;
       }
       const rebuilt = build(fresh ?? attempt);

@@ -169,7 +169,7 @@ describe('AgyRunnerAdapter argv (both modes)', () => {
     ]);
   });
 
-  it('runs a full lane with --isolation-declared alongside --mode full', async () => {
+  it('runs a full lane with --isolation-declared and --sandbox alongside --mode full', async () => {
     const lane = await makeFakeLane();
     const adapter = makeAdapter(lane, { mode: 'full' });
 
@@ -185,6 +185,7 @@ describe('AgyRunnerAdapter argv (both modes)', () => {
       '--mode',
       'full',
       '--isolation-declared',
+      '--sandbox',
       '--detach',
     ]);
   });
@@ -198,6 +199,7 @@ describe('AgyRunnerAdapter argv (both modes)', () => {
     const argv = await recordedArgv(lane);
     expect(argv).toContain('accept-edits');
     expect(argv).not.toContain('--isolation-declared');
+    expect(argv).not.toContain('--sandbox');
   });
 
   it('never puts prompt text on the command line and never passes the agent or a variant', async () => {

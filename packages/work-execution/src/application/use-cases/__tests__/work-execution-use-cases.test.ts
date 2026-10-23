@@ -2991,6 +2991,70 @@ describe('attempt revision compare-and-swap retry', () => {
     expect(journal.heldFor('attempt-1')).toBe(false);
   });
 
+  it('stop conflicts and the fresh record holds a different session: no cancelled write, no release, stopSession once', async () => {
+    const seed = storedAttempt({ state: 'running', sessionId: 'session-1' });
+    const fresh = storedAttempt({
+      state: 'running',
+      sessionId: 'session-redispatch',
+      revision: 4,
+      updatedAtIso: '2026-10-15T08:04:00.000Z',
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      seed,
+      conflictOnSave: 1,
+      freshAfterConflict: fresh,
+    });
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const receipt = completionReceipt({ stoppedByRequest: true });
+    const runner = makeRunner({ stopResult: { outcome: 'terminated', receipt } });
+    const useCase = new StopAttemptUseCase({ attemptRepo, journal, runner: runner.port });
+
+    const result = await useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('terminated');
+    if (result.outcome === 'terminated') {
+      expect(result.capacityReleased).toBe(false);
+    }
+    expect(runner.stopCalls).toHaveLength(1);
+    expect(runner.stopCalls[0]?.sessionId).toBe('session-1');
+    expect(attemptRepo.saveCalls).toBe(1);
+    expect(attemptRepo.attempts.get('attempt-1')).toEqual(fresh);
+    expect(journal.releaseCount).toBe(0);
+    expect(journal.heldFor('attempt-1')).toBe(true);
+  });
+
+  it('dispatch with an unknown start whose reconciling save conflicts still journals the ambiguous start', async () => {
+    const attemptRepo = makeFailingSaveAttemptRepo({ conflictOnSave: 2 });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner({ startResult: { outcome: 'unknown', reason: 'start was ambiguous' } });
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(runner.startCalls).toHaveLength(1);
+    expect(result.outcome).toBe('unknown');
+    const ambiguous = journal.entries.filter(
+      (entry) => entry.status === 'ambiguous' && entry.detail === 'start was ambiguous',
+    );
+    expect(ambiguous).toHaveLength(1);
+    expect(journal.heldFor('attempt-1')).toBe(true);
+  });
+
   it('dispatch conflicts on the running save: the fresh record carries the sessionId, startSession runs once', async () => {
     const attemptRepo = makeFailingSaveAttemptRepo({ conflictOnSave: 2 });
     const workOrderRepo = makeWorkOrderRepo();

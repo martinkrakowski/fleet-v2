@@ -138,11 +138,19 @@ export class StopAttemptUseCase implements StopAttemptPort {
     });
 
     if (stopResult.outcome === 'terminated' && stopResult.receipt.authoritative === true) {
-      const cancelled = await this.saveCancelledOrSkip(attempt, stopResult.receipt, nowIso);
-      // Capacity release and the completion entry always run after a
-      // terminated stop, whether the save went in on the first try, went in
-      // on the rebuilt record, or was skipped as already terminal.
-      const capacityReleased = await deps.journal.releaseCapacityReservation(attempt.id, nowIso);
+      const { record: cancelled, ownsReservation } = await this.saveCancelledOrSkip(
+        attempt,
+        stopResult.receipt,
+        nowIso,
+      );
+      // Capacity release and the completion entry run after a terminated
+      // stop whether the save went in on the first try, went in on the
+      // rebuilt record, or was skipped as already terminal. The one exception:
+      // the fresh record holds a different session (a re-dispatch), whose
+      // reservation is not this stop's to release.
+      const capacityReleased = ownsReservation
+        ? await deps.journal.releaseCapacityReservation(attempt.id, nowIso)
+        : false;
       await appendJournalEntry(deps.journal, {
         attemptId: attempt.id,
         workOrderId: attempt.workOrderId,
@@ -216,7 +224,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
     attempt: AttemptRecord,
     receipt: NonNullable<AttemptRecord['completionReceipt']>,
     nowIso: string,
-  ): Promise<AttemptRecord> {
+  ): Promise<{ readonly record: AttemptRecord; readonly ownsReservation: boolean }> {
     const build = (base: AttemptRecord): AttemptRecord => ({
       ...base,
       revision: nextAttemptRevision(base),
@@ -228,18 +236,23 @@ export class StopAttemptUseCase implements StopAttemptPort {
     try {
       const cancelled = build(attempt);
       await this.deps!.attemptRepo.saveAttempt(cancelled);
-      return cancelled;
+      return { record: cancelled, ownsReservation: true };
     } catch (error) {
       if (!(error instanceof AttemptRevisionConflictError)) {
         throw error;
       }
       const fresh = await this.deps!.attemptRepo.findAttemptById(attempt.id);
       if (fresh && isTerminalAttempt(fresh)) {
-        return fresh;
+        return { record: fresh, ownsReservation: true };
+      }
+      if (fresh && fresh.sessionId !== null && fresh.sessionId !== attempt.sessionId) {
+        // A re-dispatch recorded another live session: the stopped session's
+        // receipt never lands on it and its reservation is left alone.
+        return { record: fresh, ownsReservation: false };
       }
       const rebuilt = build(fresh ?? attempt);
       await this.deps!.attemptRepo.saveAttempt(rebuilt);
-      return rebuilt;
+      return { record: rebuilt, ownsReservation: true };
     }
   }
 

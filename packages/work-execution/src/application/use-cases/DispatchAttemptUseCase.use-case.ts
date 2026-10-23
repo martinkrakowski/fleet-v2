@@ -597,10 +597,8 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         state: 'reconciling',
         updatedAtIso: nowIso,
       };
-      const reconcilingConflict = await this.saveAttemptOrConflict(reconcilingAttempt, true);
-      if (reconcilingConflict) {
-        return reconcilingConflict;
-      }
+      // Journal the ambiguous start first: a session may exist on the runner,
+      // and the evidence must survive a conflicting save.
       await appendJournalEntry(this.deps.journal, {
         attemptId: request.attemptId,
         workOrderId: request.workOrderId,
@@ -611,6 +609,10 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         sessionId: null,
         detail: startResult.reason,
       });
+      const reconcilingConflict = await this.saveAttemptOrConflict(reconcilingAttempt, true);
+      if (reconcilingConflict) {
+        return reconcilingConflict;
+      }
       return { outcome: 'unknown', attempt: reconcilingAttempt, reason: startResult.reason };
     }
 

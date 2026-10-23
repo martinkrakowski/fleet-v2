@@ -935,30 +935,30 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
       if (attempt === null) {
         return { outcome: 'refused', reason: `Attempt not found: ${attemptId}` };
       }
-      const result = await rt.execution.opencodeDbUsage.readUsage({ attempt });
-      const saveUsage = async (base: AttemptRecord): Promise<void> => {
+      const measureAndSave = async (base: AttemptRecord) => {
+        const measured = await rt.execution.opencodeDbUsage.readUsage({ attempt: base });
         await rt.execution.attemptRepository.saveAttempt({
           ...base,
-          usage: result.usage,
+          usage: measured.usage,
           updatedAtIso: new Date().toISOString(),
           revision: nextAttemptRevision(base),
         });
+        return measured;
       };
       try {
-        await saveUsage(attempt);
+        return await measureAndSave(attempt);
       } catch (error) {
-        if (error instanceof AttemptRevisionConflictError) {
-          // Re-read once and retry that save once with the fresh record.
-          const fresh = await rt.execution.attemptRepository.findAttemptById(attemptId);
-          if (fresh === null) {
-            return { outcome: 'refused', reason: `Attempt not found: ${attemptId}` };
-          }
-          await saveUsage(fresh);
-        } else {
+        if (!(error instanceof AttemptRevisionConflictError)) {
           throw error;
         }
+        // Re-read once and measure again from the fresh record, so an older
+        // measurement (or another session's usage) never overwrites a newer one.
+        const fresh = await rt.execution.attemptRepository.findAttemptById(attemptId);
+        if (fresh === null) {
+          return { outcome: 'refused', reason: `Attempt not found: ${attemptId}` };
+        }
+        return measureAndSave(fresh);
       }
-      return result;
     },
     fix: async (p, rt) =>
       rt.execution.prepareFixAttempt.prepareFixAttempt({

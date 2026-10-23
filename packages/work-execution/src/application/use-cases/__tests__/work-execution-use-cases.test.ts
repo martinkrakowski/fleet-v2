@@ -84,7 +84,12 @@ function makeJournal(): ExecutionJournalPort & {
 } {
   const entries: ActionJournalEntryRecord[] = [];
   const reservations = new Map<string, CapacityReservationRecord>();
-  const journalState = {
+  const journalState: ExecutionJournalPort & {
+    entries: ActionJournalEntryRecord[];
+    reservations: Map<string, CapacityReservationRecord>;
+    releaseCount: number;
+    heldFor(attemptId: string): boolean;
+  } = {
     entries,
     reservations,
     releaseCount: 0,

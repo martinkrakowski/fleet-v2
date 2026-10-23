@@ -886,6 +886,27 @@ describe('ExecutionRunnerAdapter: executor timeout on the start path', () => {
     modelAssignment: { model: 'glm-5' },
   } as const;
 
+  it('adopts the id a killed start had already printed, and never group-kills the start', async () => {
+    const { executor, calls } = fakeExecutor((_call, index) =>
+      index === 0
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: 'ocm-run: session started: ses_z (detached)\n',
+            stderr: '',
+            error: 'timeout',
+          }
+        : { exitCode: 3, stdout: 'ocm-run: running in /wt:\nses_z\n', stderr: '' },
+    );
+    const adapter = new ExecutionRunnerAdapter({ executor, ocmRunBin: '/bin/echo' });
+    const result = await adapter.startSession(capabilitiesRequest);
+    // Only the carried stdout names ses_z: discarding it would answer unknown.
+    expect(result.outcome).toBe('started');
+    expect((result as { sessionId: string }).sessionId).toBe('ses_z');
+    expect(calls[0].options?.killProcessTree).toBe(false);
+    expect(calls[1].options?.killProcessTree).not.toBe(false);
+  });
+
   it('keeps the killed start output for the status lookup and reports unknown', async () => {
     const { executor, calls } = fakeExecutor((_call, index) =>
       index === 0

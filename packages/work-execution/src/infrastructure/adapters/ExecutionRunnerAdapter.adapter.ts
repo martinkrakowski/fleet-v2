@@ -362,21 +362,23 @@ function isAbortLine(line: string): boolean {
 
 /**
  * Session ids the start subprocess itself named, split by whether the start
- * reported aborting them. Every `ses_…` id in either stream is "named"; ids
- * on the runner's abort lines ("aborted the session <id>", "… aborting it")
- * are additionally "aborted".
+ * reported aborting them. An id is "named" only where the runner reports one:
+ * after the word `session` ("session started: <id>", "aborted the session
+ * <id>", "session <id> did not appear") or in a JSON `"sessionID"`/`"id"`
+ * field; a `ses_…` inside a directory path never counts. Ids on the runner's
+ * abort lines are additionally "aborted".
  */
 function startOutputIds(stdout: string, stderr: string): { named: Set<string>; aborted: Set<string> } {
   const named = new Set<string>();
   const aborted = new Set<string>();
   for (const line of [...stdout.split('\n'), ...stderr.split('\n')]) {
-    for (const match of line.matchAll(/\b(ses_[A-Za-z0-9_-]+)\b/g)) {
-      named.add(match[1]);
-    }
-    if (isAbortLine(line)) {
-      for (const match of line.matchAll(/\b(ses_[A-Za-z0-9_-]+)\b/g)) {
-        aborted.add(match[1]);
-      }
+    const ids = [
+      ...line.matchAll(/\bsession(?: started:)? (ses_[A-Za-z0-9_-]+)\b/g),
+      ...line.matchAll(/"(?:sessionID|id)"\s*:\s*"(ses_[A-Za-z0-9_-]+)"/g),
+    ].map((match) => match[1]);
+    for (const id of ids) {
+      named.add(id);
+      if (isAbortLine(line)) aborted.add(id);
     }
   }
   return { named, aborted };
@@ -655,7 +657,9 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       }
       return {
         outcome: 'unknown',
-        reason: `${startDetail}; status lists ${id}, which this start did not create`,
+        reason: aborted.has(id)
+          ? `${startDetail}; status lists ${id}, which this start reported aborting`
+          : `${startDetail}; status lists ${id}, which this start did not create`,
       };
     }
     return { outcome: 'unknown', reason: `${startDetail}; status: ${status.reason}` };

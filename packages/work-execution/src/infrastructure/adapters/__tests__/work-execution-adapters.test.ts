@@ -1449,6 +1449,31 @@ describe('ExecutionRunnerAdapter: status adoption after an ambiguous start', () 
     }
   });
 
+  it('never adopts the very id the start reported aborting', async () => {
+    const adapter = scriptedAdapter([
+      () => ({ exitCode: 1, stdout: '', stderr: 'ocm-run: session ses_a did not appear within 60 s; aborting it\n' }),
+      () => ({ exitCode: 3, stdout: 'ocm-run: running in /wt:\nses_a\n', stderr: '' }),
+    ]);
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('which this start reported aborting');
+    }
+  });
+
+  it('never treats a ses_ segment of a path in the start output as a named id', async () => {
+    const adapter = scriptedAdapter([
+      () => ({
+        exitCode: 143,
+        stdout: '',
+        stderr: 'ocm-run: stopped; --detach was given, the session runs on in /x/ses_live/wt\n',
+      }),
+      () => ({ exitCode: 3, stdout: 'ocm-run: running in /x/ses_live/wt:\nses_live\n', stderr: '' }),
+    ]);
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('unknown');
+  });
+
   it('adopts a status id the start itself named and did not abort', async () => {
     const adapter = scriptedAdapter([
       () => ({ exitCode: 1, stdout: '{"sessionID":"ses_a"}\n', stderr: '' }),
@@ -1473,7 +1498,7 @@ describe('ExecutionRunnerAdapter: status adoption after an ambiguous start', () 
 
   it('reads status ids only from lines after the running-in header, never from the dir path', async () => {
     const adapter = scriptedAdapter([
-      () => ({ exitCode: 1, stdout: 'named ses_ok\n', stderr: '' }),
+      () => ({ exitCode: 1, stdout: 'ocm-run: session started: ses_ok (detached)\n', stderr: '' }),
       () => ({
         exitCode: 3,
         stdout: 'ocm-run: running in /x/ses_dir/wt:\nses_ok\n',

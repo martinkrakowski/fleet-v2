@@ -47,6 +47,9 @@ const RUNNER_SUBPROCESS_TIMEOUT_MS = 120_000;
 /** Grace added to the start budget before the start subprocess is killed. */
 const RUNNER_START_TIMEOUT_GRACE_MS = 30_000;
 
+/** Bound on the --status lookup that follows an ambiguous start. */
+const RUNNER_STATUS_LOOKUP_TIMEOUT_MS = 30_000;
+
 /** Bundled runner script at the repository's `bin/ocm-run`. */
 function resolveBundledOcmRunPath(): string {
   // Works from both the compiled dist tree and vitest's src tree.
@@ -562,7 +565,10 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   ): Promise<{ outcome: 'started'; sessionId: string } | { outcome: 'unknown'; reason: string }> {
     let result: SubprocessResult;
     try {
-      result = await this.run(this.binPath(), ['--status', '--dir', worktreePath], env);
+      // Bounded like the start itself: a stuck status call must not hang startSession.
+      result = await this.run(this.binPath(), ['--status', '--dir', worktreePath], env, {
+        timeoutMs: RUNNER_STATUS_LOOKUP_TIMEOUT_MS,
+      });
     } catch (error) {
       return { outcome: 'unknown', reason: `status command failed: ${String(error)}` };
     }

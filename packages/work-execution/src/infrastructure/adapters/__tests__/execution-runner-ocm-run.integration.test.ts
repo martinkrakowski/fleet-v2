@@ -4,7 +4,7 @@ import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it } from 'vitest';
 
 import type { StartRunnerSessionRequest } from '../../../application/ports/out/ExecutionRunnerPort.out-port.js';
 import { ExecutionRunnerAdapter } from '../ExecutionRunnerAdapter.adapter.js';
@@ -33,6 +33,12 @@ const toolsAvailable = (() => {
 })();
 
 const createdDirs = new Set<string>();
+/** Cleanups of setups whose test has not cleaned up yet (a hung start skips its finally). */
+const pendingCleanups = new Set<() => Promise<void>>();
+
+afterEach(async () => {
+  for (const cleanup of [...pendingCleanups]) await cleanup();
+});
 
 async function makeTempDir(prefix: string): Promise<string> {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -221,21 +227,20 @@ async function killRecordedProcesses(pidsFile: string): Promise<void> {
   } catch {
     return;
   }
-  for (const pid of pids) {
-    try {
-      process.kill(Number(pid), 'SIGTERM');
-    } catch {
-      // Already gone.
+  // The detached client runs in its own process group (setsid when available), so the
+  // group is signalled first and its sleep children go with it; the pid itself after.
+  const signal = (pid: number, sig: NodeJS.Signals): void => {
+    for (const target of [-pid, pid]) {
+      try {
+        process.kill(target, sig);
+      } catch {
+        // Already gone, or not a group leader.
+      }
     }
-  }
+  };
+  for (const pid of pids) signal(Number(pid), 'SIGTERM');
   await new Promise((resolve) => setTimeout(resolve, 300));
-  for (const pid of pids) {
-    try {
-      process.kill(Number(pid), 'SIGKILL');
-    } catch {
-      // Already gone.
-    }
-  }
+  for (const pid of pids) signal(Number(pid), 'SIGKILL');
 }
 
 const requiredCapabilities = {
@@ -302,12 +307,20 @@ async function setup(flip: boolean): Promise<SetupContext> {
     ocmRunBin,
   });
 
+  let cleaned = false;
   const cleanup = async (): Promise<void> => {
-    await killRecordedProcesses(pidsFile);
-    await server.close();
-    restoreEnv(originalEnv);
+    if (cleaned) return;
+    cleaned = true;
+    pendingCleanups.delete(cleanup);
+    try {
+      await killRecordedProcesses(pidsFile);
+      await server.close();
+    } finally {
+      restoreEnv(originalEnv);
+    }
   };
 
+  pendingCleanups.add(cleanup);
   return { adapter, server, worktreePath, cleanup };
 }
 

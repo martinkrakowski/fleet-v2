@@ -799,5 +799,8 @@ describe('runner start budget (ExecutionRunnerAdapter)', () => {
     expect(result.outcome).toBe('unknown');
     // 10 s budget + 30 s grace.
     expect(calls[0].options?.timeoutMs).toBe(40_000);
+    // The --status lookup after the ambiguous start is bounded too.
+    expect(calls[1]?.argv.slice(1, 3)).toEqual(['--status', '--dir']);
+    expect(calls[1]?.options?.timeoutMs).toBe(30_000);
   });
 });

@@ -619,6 +619,12 @@ $id
       echo "ocm-run: stopped; asked the server to abort $id" >&2
     done
   elif [ "$detach" = 1 ]; then
+    # A signal that lands during the create POST leaves the answer in ocm_sresp with no
+    # id taken from it yet: take the id from the answer before deciding what to abort.
+    if [ -z "$ocm_sid" ] && [ -n "${ocm_sresp:-}" ]; then
+      ocm_sid=$(ocm_sid_from_resp "$ocm_sresp")
+      ocm_sid_ok "$ocm_sid" || ocm_sid=''
+    fi
     if [ -n "$ocm_sid" ] && [ "$ocm_launched" != 1 ] && [ "$has_session" = 0 ]; then
       ocm_abort "$ocm_sid"
       echo "ocm-run: stopped; aborted the session $ocm_sid before it was launched" >&2
@@ -708,12 +714,31 @@ ocm_launch() {
   child=''
 }
 
+# The session id inside a POST /api/session answer ('' when there is none).
+ocm_sid_from_resp() {
+  printf '%s' "$1" | LC_ALL=C grep -o '"id":"ses_[^"]*"' | head -n 1 | LC_ALL=C sed 's/"id":"//;s/"//'
+}
+
+# 0 when $1 is a session id ocm-run will use in paths: "ses_" followed only by letters,
+# digits, '_' and '-'; 1 otherwise.
+ocm_sid_ok() {
+  case "$1" in
+    ses_*) ;;
+    *) return 1 ;;
+  esac
+  case "${1#ses_}" in
+    '' | *[!A-Za-z0-9_-]*) return 1 ;;
+  esac
+  return 0
+}
+
 # v2: make sure a session exists for this dispatch and set ocm_sid to it. With -s <id>
 # (or --session <id>) given by the caller, that id is ocm_sid and no session is created;
 # otherwise POST /api/session and take the id from the answer (a failed create, or an
 # answer with no id, is exit 1).
 ocm_create_session() {
   ocm_sid=''
+  ocm_sresp=''
   if [ "$has_session" = 1 ]; then
     # Only -s <id>, --session <id> and --session=<id> carry a caller id;
     # -c/--continue does not (opencode continues the latest session itself).
@@ -732,6 +757,12 @@ ocm_create_session() {
       prev=$a
     done
     if [ -n "$ocm_sid" ]; then
+      ocm_sid_ok "$ocm_sid" || {
+        echo "ocm-run: refusing session id $ocm_sid" >&2
+        ocm_sid=''
+        rc=2
+        return
+      }
       rc=0
       return
     fi
@@ -760,9 +791,16 @@ ocm_create_session() {
     rc=1
     return
   }
-  ocm_sid=$(printf '%s' "$ocm_sresp" | LC_ALL=C grep -o '"id":"ses_[^"]*"' | head -n 1 | LC_ALL=C sed 's/"id":"//;s/"//')
+  ocm_sid=$(ocm_sid_from_resp "$ocm_sresp")
   [ -n "$ocm_sid" ] || {
     echo "ocm-run: the server answered the session create but gave no session id" >&2
+    rc=1
+    return
+  }
+  ocm_sid_ok "$ocm_sid" || {
+    # A server id ocm-run would not use in a path is not trusted: abort nothing.
+    ocm_sid=''
+    echo "ocm-run: the server answered with a session id ocm-run refuses to use" >&2
     rc=1
     return
   }
@@ -808,7 +846,12 @@ ocm_detach_launch() {
     }
     ocm_log="$ocm_logdir/ocm-run.$ocm_sid.log"
   else
-    ocm_log="${TMPDIR:-/tmp}/ocm-run.$ocm_sid.log"
+    # An unpredictable name: the id alone must not let another process guess the file.
+    ocm_log=$(mktemp "${TMPDIR:-/tmp}/ocm-run.$ocm_sid.XXXXXX") || {
+      echo "ocm-run: could not create the detached log file under ${TMPDIR:-/tmp}" >&2
+      rc=1
+      return
+    }
   fi
   if [ "$has_session" = 1 ]; then
     ocm_launch_detached run --server "$url" "$@"
@@ -876,13 +919,13 @@ $ocm_sid
       exit 1
     fi
     if [ "$ocm_retried" = 0 ] && LC_ALL=C grep -q "database is locked" "$ocm_log" 2>/dev/null; then
-      if [ $(( $(date +%s) - start + retry_sleep )) -gt "$max" ]; then
+      if [ $(( $(date +%s) - start + retry_sleep )) -ge "$max" ]; then
         echo "ocm-run: the retry would not fit in the $max s budget: session $ocm_sid did not appear within $max s; aborting it" >&2
         ocm_detach_cleanup
         exit 1
       fi
       echo "ocm-run: opencode database was locked at launch; retrying once in $retry_sleep s" >&2
-      sleep "${OCM_RETRY_SLEEP:-20}" &
+      sleep "$retry_sleep" &
       wait "$!"
       ocm_retried=1
       # Stop the first client before the relaunch overwrites ocm_cpid: a client that
@@ -895,7 +938,6 @@ $ocm_sid
       else
         ocm_launch_detached run --server "$url" -s "$ocm_sid" "$@"
       fi
-      [ "$rc" = 0 ] || { ocm_detach_cleanup; exit 1; }
       continue
     fi
     sleep 1

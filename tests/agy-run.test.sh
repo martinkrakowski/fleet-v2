@@ -71,6 +71,9 @@ done
 case "\$pid" in '' | *[!0-9]*) exit 1 ;; esac
 case "\$opt" in
   args)
+    # Like BSD ps, an args request without -ww is treated as truncated: nothing usable is printed,
+    # so dropping -ww from agy-run would break the args-hash tests (Grok re-review of L4b).
+    case " \$* " in *" -ww "*) ;; *) exit 1 ;; esac
     if kill -0 "\$pid" 2>/dev/null; then
       case "\$(cat "$T/ps-mode" 2>/dev/null)" in
         empty-args) exit 0 ;;

@@ -221,16 +221,15 @@ ensure_private_dir() { # $1: target directory under $STATE
   ensure_one_private_dir "$epd_cur"
   epd_rest=${1#"$epd_cur"}
   epd_rest=${epd_rest#/}
-  epd_ifs=$IFS
-  IFS=/
-  set -f
-  for epd_part in $epd_rest; do
+  # Split on "/" by parameter expansion: no IFS or set -f change, so no shell state leaks out of
+  # this function (Grok re-review of L4b: the IFS save/restore left IFS empty when it started unset).
+  while [ -n "$epd_rest" ]; do
+    epd_part=${epd_rest%%/*}
+    case "$epd_rest" in */*) epd_rest=${epd_rest#*/} ;; *) epd_rest='' ;; esac
     [ -n "$epd_part" ] || continue
     epd_cur=$epd_cur/$epd_part
     ensure_one_private_dir "$epd_cur"
   done
-  set +f
-  IFS=$epd_ifs
 }
 
 mk_run_tmp() {
@@ -472,11 +471,11 @@ if ! ( umask 077; set -C; printf '%s\n' "$$" "$(pid_start "$$")" "$model" "$agym
 fi
 
 before=$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo none)
-tmp=$(mk_run_tmp)
+tmp=$(mk_run_tmp) || exit 1
 printf '%s\n' "$before" > "$tmp"
 mv -f "$tmp" "$before_file"
 for f in "$out" "$err"; do
-  tmp=$(mk_run_tmp)
+  tmp=$(mk_run_tmp) || exit 1
   : > "$tmp"
   mv -f "$tmp" "$f"
 done
@@ -504,7 +503,7 @@ finish_run() { # $1: exit status to report; writes last in RUN_DIR via mktemp+mv
   tokens=$(printf '%s' "$flat" | sed -n 's/.*"total_tokens":\([0-9]*\).*/\1/p')
   denied=$(printf '%s' "$flat" | sed -n 's/.*"denied_actions":\[\(.*\)\].*/\1/p' | grep -o '"action":"[^"]*"' | sed 's/"action":"//;s/"$//' | sort -u | tr '\n' ' ')
   dcount=$(printf '%s' "$denied" | wc -w | tr -d ' ')
-  tmp=$(mk_run_tmp)
+  tmp=$(mk_run_tmp) || exit 1
   {
     [ -f "$last" ] && cat "$last" 2>/dev/null
     printf 'end=%s exit=%s secs=%s tokens=%s denied=%s model=%s mode=%s before=%s\n' \
@@ -558,7 +557,7 @@ while { ! readable_start "$cstart" || [ -z "$cargs" ]; } && [ "$tries" -lt 5 ] &
 done
 readable_start "$cstart" || cstart=unknown
 [ -n "$cargs" ] || cargs=unknown
-tmp=$(mk_run_tmp)
+tmp=$(mk_run_tmp) || exit 1
 printf '%s\n' "$child" "$cstart" "$model" "$agymode" "$cargs" > "$tmp"
 mv -f "$tmp" "$lock"
 wait "$child"

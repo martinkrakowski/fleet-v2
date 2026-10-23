@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { readFile, rm } from 'node:fs/promises';
 
 import { LocalExecutor } from '../LocalExecutor.adapter.js';
 import { SshExecutor, posixQuote, sshArgvFor } from '../SshExecutor.adapter.js';
@@ -7,7 +8,7 @@ import { runSpawnOutcome } from '../spawn-run.js';
 import { executorForHost, resolveRoleExecutors } from '../ExecutorSelector.adapter.js';
 import { WorkspaceAdapter } from '../WorkspaceAdapter.adapter.js';
 import { AttemptArtifactAdapter } from '../AttemptArtifactAdapter.adapter.js';
-import { ExecutionRunnerAdapter } from '../ExecutionRunnerAdapter.adapter.js';
+import { ExecutionRunnerAdapter, RunnerSubprocessError, runViaExecFile } from '../ExecutionRunnerAdapter.adapter.js';
 import type { CommandRunOptions, CommandRunResult, CommandExecutorPort } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 
 type RunCall = { argv: readonly string[]; options?: CommandRunOptions };
@@ -787,15 +788,184 @@ describe('exit code null is failure/unknown, never an answer (adapters)', () => 
 });
 
 describe('runner start budget (ExecutionRunnerAdapter)', () => {
-  it('passes the explicit 120s runner budget and a timed-out start (exitCode null) is unknown, never started', async () => {
+  it('runs the start under the start budget plus grace and reports a timed-out start as unknown, never started', async () => {
     const { executor, calls } = fakeExecutor(() => ({ exitCode: null, error: 'timeout' }));
     const adapter = new ExecutionRunnerAdapter({
       executor: executor,
       remotePort: 4321,
       ocmRunBin: '/bin/echo',
+      startBudgetSeconds: 10,
     });
     const result = await adapter.startSession(sessionRequest);
     expect(result.outcome).toBe('unknown');
-    expect(calls[0].options?.timeoutMs).toBe(120_000);
+    // 10 s budget + 60 s grace.
+    expect(calls[0].options?.timeoutMs).toBe(70_000);
+    // The --status lookup after the ambiguous start is bounded too.
+    expect(calls[1]?.argv.slice(1, 3)).toEqual(['--status', '--dir']);
+    expect(calls[1]?.options?.timeoutMs).toBe(30_000);
+  });
+});
+
+describe('killed runs keep their output', () => {
+  it('a timed-out execFile start throws RunnerSubprocessError with the output printed before the kill', async () => {
+    const failure = await runViaExecFile(
+      'sh',
+      ['-c', 'echo "ocm-run: session started: ses_q (detached)"; exec sleep 5'],
+      undefined,
+      undefined,
+      { timeoutMs: 300 },
+    ).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(RunnerSubprocessError);
+    expect((failure as RunnerSubprocessError).stdout).toContain('ses_q');
+  });
+
+  it('settles when a surviving grandchild holds the pipes open (killProcessTree false)', async () => {
+    const pidfile = `/tmp/fleet-executors-test-${String(process.pid)}-pipe.pid`;
+    const started = Date.now();
+    try {
+      const result = await new LocalExecutor().run(
+        ['sh', '-c', 'echo before; sleep 30 & echo $! > "$1"; exec sleep 5', 'sh', pidfile],
+        { timeoutMs: 300, killProcessTree: false },
+      );
+      expect(result.exitCode).toBeNull();
+      expect(result.stdout).toContain('before');
+      expect(Date.now() - started).toBeLessThan(4000);
+    } finally {
+      try {
+        process.kill(Number(await readFile(pidfile, 'utf8')), 'SIGKILL');
+      } catch {
+        // The grandchild already exited.
+      }
+      await rm(pidfile, { force: true });
+    }
+  });
+});
+
+describe('LocalExecutor killProcessTree option', () => {
+  // The grandchild's own output goes to /dev/null so it never holds the
+  // child's stdio pipes open; the child keeps running until the timeout.
+  const grandchildScript = 'sleep 30 >/dev/null 2>&1 & echo $! > "$1"; exec sleep 5';
+
+  it('leaves the detached grandchild alive when killProcessTree is false', async () => {
+    const pidfile = `/tmp/fleet-executors-test-${String(process.pid)}-keep.pid`;
+    try {
+      await new LocalExecutor().run(['sh', '-c', grandchildScript, 'sh', pidfile], {
+        timeoutMs: 300,
+        killProcessTree: false,
+      });
+      const pid = Number(await readFile(pidfile, 'utf8'));
+      expect(Number.isFinite(pid)).toBe(true);
+      expect(() => process.kill(pid, 0)).not.toThrow();
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // The grandchild already exited.
+      }
+    } finally {
+      await rm(pidfile, { force: true });
+    }
+  });
+
+  it('kills the whole tree when the option is omitted', async () => {
+    const pidfile = `/tmp/fleet-executors-test-${String(process.pid)}-kill.pid`;
+    let pid: number | undefined;
+    try {
+      await new LocalExecutor().run(['sh', '-c', grandchildScript, 'sh', pidfile], {
+        timeoutMs: 300,
+      });
+      const killedPid = Number(await readFile(pidfile, 'utf8'));
+      expect(Number.isFinite(killedPid)).toBe(true);
+      pid = killedPid;
+      // Poll up to 2 s for the group kill to reach the grandchild.
+      for (let waited = 0; waited < 2000; waited += 50) {
+        let alive = true;
+        try {
+          process.kill(pid, 0);
+        } catch {
+          alive = false;
+        }
+        if (!alive) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(() => process.kill(killedPid, 0)).toThrow();
+    } finally {
+      if (pid !== undefined && Number.isFinite(pid)) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // Already dead.
+        }
+      }
+      await rm(pidfile, { force: true });
+    }
+  });
+});
+
+describe('ExecutionRunnerAdapter: executor timeout on the start path', () => {
+  const capabilitiesRequest = {
+    attemptId: 'att-1',
+    worktreePath: '/wt',
+    briefPackagePath: '/wt/.lane/brief.md',
+    baseCommit: 'base000',
+    stepLimit: 10,
+    timeLimitSeconds: 60,
+    requiredCapabilities: {
+      source: 'legacy-asserted',
+      filesystemScope: 'scoped-worktree',
+      networkEgressRestricted: true,
+      cpuAndMemoryLimited: true,
+      processTreeTermination: true,
+      authoritativeCompletion: true,
+      artifactPersistence: true,
+    },
+    modelAssignment: { model: 'glm-5' },
+  } as const;
+
+  it('adopts the id a killed start had already printed, and never group-kills the start', async () => {
+    const { executor, calls } = fakeExecutor((_call, index) =>
+      index === 0
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: 'ocm-run: session started: ses_z (detached)\n',
+            stderr: '',
+            error: 'timeout',
+          }
+        : { exitCode: 3, stdout: 'ocm-run: running in /wt:\nses_z\n', stderr: '' },
+    );
+    const adapter = new ExecutionRunnerAdapter({ executor, ocmRunBin: '/bin/echo' });
+    const result = await adapter.startSession(capabilitiesRequest);
+    // Only the carried stdout names ses_z: discarding it would answer unknown.
+    expect(result.outcome).toBe('started');
+    expect((result as { sessionId: string }).sessionId).toBe('ses_z');
+    expect(calls[0].options?.killProcessTree).toBe(false);
+    expect(calls[1].options?.killProcessTree).not.toBe(false);
+  });
+
+  it('keeps the killed start output for the status lookup and reports unknown', async () => {
+    const { executor, calls } = fakeExecutor((_call, index) =>
+      index === 0
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: '',
+            stderr: 'ocm-run: aborted the session ses_z\n',
+            error: 'timeout',
+          }
+        : { exitCode: 3, stdout: 'ocm-run: running in /wt:\nses_z\n', stderr: '' },
+    );
+    const adapter = new ExecutionRunnerAdapter({ executor, ocmRunBin: '/bin/echo' });
+    const result = await adapter.startSession(capabilitiesRequest);
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('timeout');
+      expect(result.reason).toContain('which this start reported aborting');
+    }
+    // The status lookup still ran after the killed start.
+    expect(calls).toHaveLength(2);
+    expect(calls[1].argv.slice(1, 3)).toEqual(['--status', '--dir']);
   });
 });

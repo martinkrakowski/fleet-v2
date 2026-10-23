@@ -37,8 +37,25 @@ const execFileAsync = promisify(execFile);
 /** Reviewed runner output budget: NDJSON runs must not truncate. */
 const RUNNER_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
-/** Runner subprocess budget; the runner is started with --detach, so it returns well within this. */
-const RUNNER_START_TIMEOUT_MS = 120_000;
+/**
+ * Budget for non-start runner subprocesses (status/wait/abort): unchanged
+ * today's behaviour — the execFile path has no timeout and the executor path
+ * keeps the historical 120 s cap.
+ */
+const RUNNER_SUBPROCESS_TIMEOUT_MS = 120_000;
+
+/**
+ * Grace added to the start budget before the start subprocess is killed.
+ * Derived from the runner's own phases: preflight probe (5 s) + busy check
+ * (8 s + 8 s per active session) + create (8 s) + late overrun detection
+ * (one poll, 8 s) + cleanup (5 s client kill + 8 s abort) ≈ 42 s plus 8 s
+ * per already-active session. 60 s covers two active sessions; beyond that
+ * the start is reported `unknown` and the status lookup decides.
+ */
+const RUNNER_START_TIMEOUT_GRACE_MS = 60_000;
+
+/** Bound on the --status lookup that follows an ambiguous start. */
+const RUNNER_STATUS_LOOKUP_TIMEOUT_MS = 30_000;
 
 /** Bundled runner script at the repository's `bin/ocm-run`. */
 function resolveBundledOcmRunPath(): string {
@@ -66,6 +83,23 @@ export type SubprocessRunner = (
   args: readonly string[],
   env?: Readonly<Record<string, string>>,
 ) => Promise<SubprocessResult>;
+
+/**
+ * A runner subprocess ended without an exit code (killed on its timeout, for
+ * example). It carries whatever output the subprocess had produced, so an
+ * ambiguous start can still be judged by the output the start itself named.
+ */
+export class RunnerSubprocessError extends Error {
+  readonly stdout: string;
+  readonly stderr: string;
+
+  constructor(message: string, stdout: string, stderr: string) {
+    super(message);
+    this.name = 'RunnerSubprocessError';
+    this.stdout = stdout;
+    this.stderr = stderr;
+  }
+}
 
 /**
  * The installation's selected lane-runner host, as the adapter receives it
@@ -100,6 +134,11 @@ export interface ExecutionRunnerAdapterOptions {
   readonly remotePort?: number;
   /** Legacy mode only: SSH host passed as OCM_HOST to the runner subprocess when configured. */
   readonly remoteHost?: string;
+  /**
+   * Whole seconds the start subprocess waits for the session to become visible
+   * (`OCM_START_MAX`); default 60. Non-integers and values ≤ 0 fall back to 60.
+   */
+  readonly startBudgetSeconds?: number;
   /** Optional resolver for cross-process lookup of an attempt's worktree path when not cached in memory. */
   readonly resolveWorktreePath?: (attemptId: string) => Promise<string | null> | string | null;
   /** Optional resolver for attempt record (used to verify recorded runner port/host). */
@@ -197,12 +236,17 @@ export function buildRunnerEnv(
   return overrides === undefined ? sanitized : { ...sanitized, ...overrides };
 }
 
-/** Default subprocess runner: exit codes become values, spawn failures throw. */
-async function runViaExecFile(
+/**
+ * Default subprocess runner: exit codes become values, spawn failures throw,
+ * and a run killed by its timeout throws a RunnerSubprocessError carrying the
+ * output it printed before the kill. Exported for tests only.
+ */
+export async function runViaExecFile(
   command: string,
   args: readonly string[],
   env?: Readonly<Record<string, string>>,
   envOptions?: RunnerEnvOptions,
+  options?: { readonly timeoutMs?: number },
 ): Promise<SubprocessResult> {
   try {
     const { stdout, stderr } = await execFileAsync(command, [...args], {
@@ -210,16 +254,35 @@ async function runViaExecFile(
       // A live `ocm-run --format json` run streams NDJSON on stdout; the
       // default 1 MiB node buffer truncates it and reports a runner failure.
       maxBuffer: RUNNER_MAX_BUFFER_BYTES,
+      // The start subprocess runs under the start budget plus grace; a
+      // killed start is handled as unknown (status lookup), never a refusal.
+      // Other calls keep today's no-timeout behaviour.
+      ...(options?.timeoutMs !== undefined
+        ? { timeout: options.timeoutMs, killSignal: 'SIGTERM' as const }
+        : {}),
     });
     return { exitCode: 0, stdout: String(stdout), stderr: String(stderr) };
   } catch (error) {
-    const failed = error as { code?: number | string; stdout?: string; stderr?: string };
+    const failed = error as {
+      code?: number | string | null;
+      stdout?: string;
+      stderr?: string;
+      killed?: boolean;
+      signal?: string | null;
+    };
     if (typeof failed.code === 'number') {
       return {
         exitCode: failed.code,
         stdout: String(failed.stdout ?? ''),
         stderr: String(failed.stderr ?? ''),
       };
+    }
+    if (failed.killed === true || (failed.signal !== undefined && failed.signal !== null)) {
+      throw new RunnerSubprocessError(
+        error instanceof Error ? error.message : String(error),
+        String(failed.stdout ?? ''),
+        String(failed.stderr ?? ''),
+      );
     }
     throw error;
   }
@@ -287,6 +350,55 @@ function parseSessionId(stdout: string): string | null {
   }
   const match = /\b(ses_[A-Za-z0-9_-]+)\b/.exec(stdout);
   return match?.[1] ?? null;
+}
+
+const STATUS_HEADER_PATTERN = /^ocm-run: running in .*:$/;
+const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
+
+/**
+ * Session ids the runner's `--status` output actually lists: only lines
+ * after the `ocm-run: running in <dir>:` header count, and each must be a
+ * bare session id. A `ses_…` inside the directory path never counts.
+ */
+function statusSessionIds(stdout: string): string[] {
+  const lines = stdout.split('\n');
+  const headerIndex = lines.findIndex((line) => STATUS_HEADER_PATTERN.test(line));
+  if (headerIndex === -1) return [];
+  const ids = new Set<string>();
+  for (const rawLine of lines.slice(headerIndex + 1)) {
+    const line = rawLine.trim();
+    if (SESSION_ID_PATTERN.test(line)) ids.add(line);
+  }
+  return [...ids];
+}
+
+/** A runner output line that reports the runner aborted a session. */
+function isAbortLine(line: string): boolean {
+  return /aborted the session/.test(line) || /aborting it/.test(line);
+}
+
+/**
+ * Session ids the start subprocess itself named, split by whether the start
+ * reported aborting them. An id is "named" only where the runner reports one:
+ * after the word `session` ("session started: <id>", "aborted the session
+ * <id>", "session <id> did not appear") or in a JSON `"sessionID"`/`"id"`
+ * field; a `ses_…` inside a directory path never counts. Ids on the runner's
+ * abort lines are additionally "aborted".
+ */
+function startOutputIds(stdout: string, stderr: string): { named: Set<string>; aborted: Set<string> } {
+  const named = new Set<string>();
+  const aborted = new Set<string>();
+  for (const line of [...stdout.split('\n'), ...stderr.split('\n')]) {
+    const ids = [
+      ...line.matchAll(/\bsession(?: started:)? (ses_[A-Za-z0-9_-]+)\b/g),
+      ...line.matchAll(/"(?:sessionID|id)"\s*:\s*"(ses_[A-Za-z0-9_-]+)"/g),
+    ].map((match) => match[1]);
+    for (const id of ids) {
+      named.add(id);
+      if (isAbortLine(line)) aborted.add(id);
+    }
+  }
+  return { named, aborted };
 }
 
 /** An ssh destination that could inject options or split words never spawns. */
@@ -437,46 +549,168 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     args.push('--format', 'json', `Read and execute ${request.briefPackagePath}`);
 
     const env = this.remotePortEnv();
+    const startBudgetSeconds = this.resolveStartBudgetSeconds();
+    const startEnv = { ...(env ?? {}), OCM_START_MAX: String(startBudgetSeconds) };
 
     let result: SubprocessResult;
     try {
-      result = await this.run(this.binPath(), args, env);
+      result = await this.run(this.binPath(), args, startEnv, {
+        timeoutMs: startBudgetSeconds * 1000 + RUNNER_START_TIMEOUT_GRACE_MS,
+        startCall: true,
+      });
     } catch (error) {
-      return { outcome: 'unknown', reason: `Runner start failed: ${String(error)}` };
+      // A killed start still owns its output: whatever the subprocess had
+      // printed (an abort notice, a named session) travels into the lookup.
+      const carried =
+        error instanceof RunnerSubprocessError
+          ? { stdout: error.stdout, stderr: error.stderr, message: error.message }
+          : { stdout: '', stderr: '', message: String(error) };
+      return this.startUnknownAfterLookup(
+        request.worktreePath,
+        env,
+        `Runner start failed: ${carried.message}`,
+        agent,
+        model,
+        variant,
+        carried.stdout,
+        carried.stderr,
+      );
     }
 
     if (result.exitCode === 75) {
       return { outcome: 'refused', reason: 'Worktree already has an active session (exit 75)' };
     }
+
+    if (result.exitCode === 2) {
+      // A usage error created nothing, so refusing is safe.
+      return {
+        outcome: 'refused',
+        reason: `Runner refused the start (exit 2, usage error): ${result.stderr || result.stdout || 'no output'}`,
+      };
+    }
+
     if (result.exitCode === 0) {
       const sessionId = parseSessionId(result.stdout);
       if (sessionId !== null) {
-        const port = this.configuredRemotePort();
-        return {
-          outcome: 'started',
-          sessionId,
-          runner:
-            port !== undefined
-              ? {
-                  kind: 'opencode',
-                  remotePort: port,
-                  host: this.configuredRemoteHost(),
-                  hostName: this.configuredHostName(),
-                  agent: agent ?? null,
-                  model,
-                  variant: variant ?? null,
-                }
-              : undefined,
-        };
+        return this.startedSessionResult(sessionId, agent, model, variant);
+      }
+    }
+
+    const startDetail =
+      result.exitCode === 0
+        ? result.stderr || result.stdout || 'Runner exited 0 without returning a sessionId'
+        : result.stderr || result.stdout || `Runner start outcome ambiguous (exit ${result.exitCode})`;
+    return this.startUnknownAfterLookup(
+      request.worktreePath,
+      env,
+      startDetail,
+      agent,
+      model,
+      variant,
+      result.stdout,
+      result.stderr,
+    );
+  }
+
+  private startedSessionResult(
+    sessionId: string,
+    agent: string | null | undefined,
+    model: string,
+    variant: string | null | undefined,
+  ): StartRunnerSessionResult {
+    const port = this.configuredRemotePort();
+    return {
+      outcome: 'started',
+      sessionId,
+      runner:
+        port !== undefined
+          ? {
+              kind: 'opencode',
+              remotePort: port,
+              host: this.configuredRemoteHost(),
+              hostName: this.configuredHostName(),
+              agent: agent ?? null,
+              model,
+              variant: variant ?? null,
+            }
+          : undefined,
+    };
+  }
+
+  private resolveStartBudgetSeconds(): number {
+    const configured = this.options?.startBudgetSeconds;
+    if (typeof configured !== 'number' || !Number.isInteger(configured) || configured <= 0) {
+      return 60;
+    }
+    // `ocm-run` parses OCM_START_MAX as a bounded integer; values beyond its
+    // own ceiling are clamped, not passed through.
+    return Math.min(configured, 99_999);
+  }
+
+  /**
+   * An ambiguous start is never refused: before answering, ask `ocm-run
+   * --status` whether a session came up anyway. A status exit 3 listing
+   * exactly one session id means the lane is running; anything else stays
+   * `unknown` and carries both the start detail and the status result.
+   */
+  private async startUnknownAfterLookup(
+    worktreePath: string,
+    env: Readonly<Record<string, string>> | undefined,
+    startDetail: string,
+    agent: string | null | undefined,
+    model: string,
+    variant: string | null | undefined,
+    startStdout = '',
+    startStderr = '',
+  ): Promise<StartRunnerSessionResult> {
+    const status = await this.lookUpRunningSession(worktreePath, env);
+    if (status.ids.length === 1) {
+      const id = status.ids[0];
+      // Only adopt a status id the start itself named, and never one the
+      // start reported aborting: the start subprocess owns this outcome.
+      const { named, aborted } = startOutputIds(startStdout, startStderr);
+      if (named.has(id) && !aborted.has(id)) {
+        return this.startedSessionResult(id, agent, model, variant);
       }
       return {
         outcome: 'unknown',
-        reason: result.stderr || result.stdout || 'Runner exited 0 without returning a sessionId',
+        reason: aborted.has(id)
+          ? `${startDetail}; status lists ${id}, which this start reported aborting`
+          : `${startDetail}; status lists ${id}, which this start did not create`,
       };
     }
+    return { outcome: 'unknown', reason: `${startDetail}; status: ${status.reason}` };
+  }
+
+  private async lookUpRunningSession(
+    worktreePath: string,
+    env: Readonly<Record<string, string>> | undefined,
+  ): Promise<{ ids: string[]; reason: string }> {
+    let result: SubprocessResult;
+    try {
+      // Bounded like the start itself: a stuck status call must not hang startSession.
+      result = await this.run(this.binPath(), ['--status', '--dir', worktreePath], env, {
+        timeoutMs: RUNNER_STATUS_LOOKUP_TIMEOUT_MS,
+      });
+    } catch (error) {
+      return { ids: [], reason: `status command failed: ${String(error)}` };
+    }
+    if (result.exitCode === 3) {
+      const ids = statusSessionIds(result.stdout);
+      if (ids.length === 1) {
+        return { ids, reason: 'status listed one session' };
+      }
+      return {
+        ids,
+        reason: `status exit 3 listed ${ids.length} sessions (${ids.join(', ') || 'none'})`,
+      };
+    }
+    if (result.exitCode === 0) {
+      return { ids: [], reason: 'status reports nothing running' };
+    }
     return {
-      outcome: 'unknown',
-      reason: result.stderr || result.stdout || 'Runner start outcome ambiguous',
+      ids: [],
+      reason: `status command exited ${result.exitCode}: ${result.stderr || result.stdout || 'no output'}`,
     };
   }
 
@@ -807,6 +1041,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     command: string,
     args: readonly string[],
     env?: Readonly<Record<string, string>>,
+    options?: { readonly timeoutMs?: number; readonly startCall?: boolean },
   ): Promise<SubprocessResult> {
     // D5: the lane-runner host's transport decides whether the runner
     // environment keeps `SSH_AUTH_SOCK`; every non-runner subprocess keeps
@@ -825,15 +1060,23 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
         .run([command, ...args], {
           env: { ...runEnv } as Record<string, string>,
           maxBufferBytes: RUNNER_MAX_BUFFER_BYTES,
-          timeoutMs: RUNNER_START_TIMEOUT_MS,
+          timeoutMs: options?.timeoutMs ?? RUNNER_SUBPROCESS_TIMEOUT_MS,
+          // The start's own timeout must never group-kill ocm-run's detached
+          // session: a killed start stays `unknown`, but a murdered grandchild
+          // would destroy a session the status lookup could have adopted.
+          ...(options?.startCall === true ? { killProcessTree: false } : {}),
         })
         .then((result) => {
           if (result.exitCode === null) {
-            throw new Error(result.error ?? 'Runner subprocess ended without an exit code');
+            throw new RunnerSubprocessError(
+              result.error ?? 'Runner subprocess ended without an exit code',
+              result.stdout,
+              result.stderr,
+            );
           }
           return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
         });
     }
-    return runViaExecFile(command, args, env, envOptions);
+    return runViaExecFile(command, args, env, envOptions, options);
   }
 }

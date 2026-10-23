@@ -827,7 +827,7 @@ describe('ExecutionRunnerAdapter', () => {
       'json',
       `Read and execute ${runnerBriefPackagePath}`,
     ]);
-    expect(calls[0]?.env).toBeUndefined();
+    expect(calls[0]?.env).toEqual({ OCM_START_MAX: '60' });
   });
 
   it('passes configured runner options, model flags and remote port env', async () => {
@@ -874,7 +874,7 @@ describe('ExecutionRunnerAdapter', () => {
       'json',
       `Read and execute ${runnerBriefPackagePath}`,
     ]);
-    expect(calls[0]?.env).toEqual({ OCM_REMOTE_PORT: '7777' });
+    expect(calls[0]?.env).toEqual({ OCM_REMOTE_PORT: '7777', OCM_START_MAX: '60' });
   });
 
   it('parses a bare ses_ token when stdout is not JSON', async () => {
@@ -887,7 +887,7 @@ describe('ExecutionRunnerAdapter', () => {
   });
 
   it('refuses a start when the worktree already has an active session (exit 75)', async () => {
-    const { runner } = scriptedRunner([
+    const { runner, calls } = scriptedRunner([
       { exitCode: 75, stdout: '', stderr: 'session already active' },
     ]);
     const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner });
@@ -896,33 +896,132 @@ describe('ExecutionRunnerAdapter', () => {
       outcome: 'refused',
       reason: 'Worktree already has an active session (exit 75)',
     });
+    // Exit 75 is a refusal, never a started/unknown ambiguity: no status lookup.
+    expect(calls).toHaveLength(1);
   });
 
-  it('reports unknown when the runner exits 0 without a sessionId', async () => {
-    const { runner } = scriptedRunner([{ exitCode: 0, stdout: '', stderr: '' }]);
+  it('reports unknown when the runner exits 0 without a sessionId and status finds nothing', async () => {
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 0, stdout: '', stderr: '' },
+      { exitCode: 0, stdout: 'nothing running', stderr: '' },
+    ]);
     const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner });
     const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
-    expect(result).toEqual({
-      outcome: 'unknown',
-      reason: 'Runner exited 0 without returning a sessionId',
-    });
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('exited 0');
+      expect(result.reason).toContain('nothing running');
+    }
+    expect(calls).toHaveLength(2);
   });
 
-  it('reports unknown for non-zero exits and subprocess failures', async () => {
-    const failing = new ExecutionRunnerAdapter({
-      runSubprocess: scriptedRunner([{ exitCode: 1, stdout: '', stderr: 'runner unavailable' }])
-        .runner,
+  it('recovers a started session from status after the start subprocess is killed (exit 143)', async () => {
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 143, stdout: '{"sessionID":"ses_rec"}\n', stderr: '' },
+      { exitCode: 3, stdout: 'ocm-run: running in /tmp/fleet-test-worktree:\nses_rec', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result).toEqual({
+      outcome: 'started',
+      sessionId: 'ses_rec',
+      runner: {
+        kind: 'opencode',
+        remotePort: 4166,
+        host: null,
+        hostName: null,
+        agent: null,
+        model: 'glm-5',
+        variant: null,
+      },
     });
-    const failed = await failing.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
-    expect(failed).toEqual({ outcome: 'unknown', reason: 'runner unavailable' });
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.args).toEqual(['--status', '--dir', runnerWorktreePath]);
+    expect(calls[1]?.env).toEqual({ OCM_REMOTE_PORT: '4166' });
+  });
 
-    const throwing = new ExecutionRunnerAdapter({
-      runSubprocess: scriptedRunner([new Error('network timeout')]).runner,
+  it('reports unknown when the start is killed and status finds nothing running', async () => {
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 143, stdout: '', stderr: 'terminated' },
+      { exitCode: 0, stdout: 'ocm-run: nothing is running in /tmp/fleet-test-worktree', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner });
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('terminated');
+      expect(result.reason).toContain('nothing running');
+    }
+    expect(calls).toHaveLength(2);
+  });
+
+  it('reports unknown when the start fails and status lists two sessions', async () => {
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 1, stdout: '', stderr: 'runner unavailable' },
+      { exitCode: 3, stdout: 'ocm-run: running in /tmp/fleet-test-worktree:\nses_a\nses_b', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner });
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('runner unavailable');
+      expect(result.reason).toContain('2 sessions');
+    }
+    expect(calls).toHaveLength(2);
+  });
+
+  it('reports unknown when the start subprocess throws without naming a session', async () => {
+    const { runner } = scriptedRunner([
+      new Error('network timeout'),
+      { exitCode: 3, stdout: 'ocm-run: running in /tmp/fleet-test-worktree:\nses_thrown', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    // A bare throw carries no start output, so the status id stays unadopted.
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('network timeout');
+    }
+  });
+
+  it('reports unknown when the start subprocess throws and status finds nothing', async () => {
+    const { runner, calls } = scriptedRunner([
+      new Error('network timeout'),
+      { exitCode: 0, stdout: 'nothing running', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner });
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('network timeout');
+      expect(result.reason).toContain('nothing running');
+    }
+    expect(calls).toHaveLength(2);
+  });
+
+  it('passes a configured start budget as OCM_START_MAX and falls back to 60', async () => {
+    const custom = scriptedRunner([
+      { exitCode: 0, stdout: '{"sessionID":"ses_budget"}', stderr: '' },
+    ]);
+    const customAdapter = new ExecutionRunnerAdapter({
+      runSubprocess: custom.runner,
+      remotePort: 7777,
+      startBudgetSeconds: 10,
     });
-    const thrown = await throwing.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
-    expect(thrown.outcome).toBe('unknown');
-    if (thrown.outcome === 'unknown') {
-      expect(thrown.reason).toContain('network timeout');
+    await customAdapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(custom.calls[0]?.env).toEqual({ OCM_REMOTE_PORT: '7777', OCM_START_MAX: '10' });
+
+    for (const invalid of [0, -5, 2.5, Number.NaN]) {
+      const fallback = scriptedRunner([
+        { exitCode: 0, stdout: '{"sessionID":"ses_x"}', stderr: '' },
+      ]);
+      const fallbackAdapter = new ExecutionRunnerAdapter({
+        runSubprocess: fallback.runner,
+        remotePort: 7777,
+        startBudgetSeconds: invalid,
+      });
+      await fallbackAdapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+      expect(fallback.calls[0]?.env).toEqual({ OCM_REMOTE_PORT: '7777', OCM_START_MAX: '60' });
     }
   });
 
@@ -1283,7 +1382,11 @@ describe('ExecutionRunnerAdapter', () => {
         variant: null,
       },
     });
-    expect(calls[0]?.env).toEqual({ OCM_REMOTE_PORT: '4166', OCM_HOST: 'lanehost.example' });
+    expect(calls[0]?.env).toEqual({
+      OCM_REMOTE_PORT: '4166',
+      OCM_HOST: 'lanehost.example',
+      OCM_START_MAX: '60',
+    });
   });
 
   const repoRootBin = path.resolve(
@@ -1318,5 +1421,125 @@ describe('ExecutionRunnerAdapter', () => {
       code: 1,
       stderr: expect.stringContaining('OCM_HOST is not set'),
     });
+  });
+});
+
+describe('ExecutionRunnerAdapter: status adoption after an ambiguous start', () => {
+  function scriptedAdapter(
+    steps: Array<(args: readonly string[]) => SubprocessResult>,
+  ): ExecutionRunnerAdapter {
+    let call = 0;
+    const runSubprocess: SubprocessRunner = (_command, args) => {
+      const step = steps[call] ?? (() => ({ exitCode: 0, stdout: '', stderr: '' }));
+      call += 1;
+      return Promise.resolve(step(args));
+    };
+    return new ExecutionRunnerAdapter({ ocmRunBin: '/bin/echo', runSubprocess });
+  }
+
+  it('never adopts a status id the start reported aborting', async () => {
+    const adapter = scriptedAdapter([
+      () => ({ exitCode: 1, stdout: '', stderr: 'ocm-run: aborted the session ses_a\n' }),
+      () => ({ exitCode: 3, stdout: 'ocm-run: running in /wt:\nses_b\n', stderr: '' }),
+    ]);
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('which this start did not create');
+    }
+  });
+
+  it('never adopts the very id the start reported aborting', async () => {
+    const adapter = scriptedAdapter([
+      () => ({ exitCode: 1, stdout: '', stderr: 'ocm-run: session ses_a did not appear within 60 s; aborting it\n' }),
+      () => ({ exitCode: 3, stdout: 'ocm-run: running in /wt:\nses_a\n', stderr: '' }),
+    ]);
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('which this start reported aborting');
+    }
+  });
+
+  it('never treats a ses_ segment of a path in the start output as a named id', async () => {
+    const adapter = scriptedAdapter([
+      () => ({
+        exitCode: 143,
+        stdout: '',
+        stderr: 'ocm-run: stopped; --detach was given, the session runs on in /x/ses_live/wt\n',
+      }),
+      () => ({ exitCode: 3, stdout: 'ocm-run: running in /x/ses_live/wt:\nses_live\n', stderr: '' }),
+    ]);
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('unknown');
+  });
+
+  it('adopts a status id the start itself named and did not abort', async () => {
+    const adapter = scriptedAdapter([
+      () => ({ exitCode: 1, stdout: '{"sessionID":"ses_a"}\n', stderr: '' }),
+      () => ({ exitCode: 3, stdout: 'ocm-run: running in /wt:\nses_a\n', stderr: '' }),
+    ]);
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('started');
+    expect((result as { sessionId: string }).sessionId).toBe('ses_a');
+  });
+
+  it('never adopts a status id the start output never named', async () => {
+    const adapter = scriptedAdapter([
+      () => ({ exitCode: 1, stdout: '', stderr: 'runner died' }),
+      () => ({ exitCode: 3, stdout: 'ocm-run: running in /wt:\nses_a\n', stderr: '' }),
+    ]);
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('which this start did not create');
+    }
+  });
+
+  it('reads status ids only from lines after the running-in header, never from the dir path', async () => {
+    const adapter = scriptedAdapter([
+      () => ({ exitCode: 1, stdout: 'ocm-run: session started: ses_ok (detached)\n', stderr: '' }),
+      () => ({
+        exitCode: 3,
+        stdout: 'ocm-run: running in /x/ses_dir/wt:\nses_ok\n',
+        stderr: '',
+      }),
+    ]);
+    const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
+    expect(result.outcome).toBe('started');
+    expect((result as { sessionId: string }).sessionId).toBe('ses_ok');
+  });
+});
+
+describe('ExecutionRunnerAdapter: exit 2 refusal and start budget clamp', () => {
+  it('reports refused (never unknown) when ocm-run exits 2 on the start', async () => {
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 2, stdout: '', stderr: 'unknown flag: --nope' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.startSession(
+      makeStartRequest({ modelAssignment: { model: 'glm-5' } }),
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Runner refused the start (exit 2, usage error): unknown flag: --nope',
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('clamps a huge start budget to 99999 in OCM_START_MAX', async () => {
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 0, stdout: '{"sessionID":"ses_big"}', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({
+      runSubprocess: runner,
+      remotePort: 4166,
+      startBudgetSeconds: 200000,
+    });
+    const result = await adapter.startSession(
+      makeStartRequest({ modelAssignment: { model: 'glm-5' } }),
+    );
+    expect(result.outcome).toBe('started');
+    expect(calls[0].env?.OCM_START_MAX).toBe('99999');
   });
 });

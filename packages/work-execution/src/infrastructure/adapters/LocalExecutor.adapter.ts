@@ -35,6 +35,7 @@ export class LocalExecutor implements CommandExecutorPort {
       ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       ...(options?.input !== undefined ? { input: options.input } : {}),
       ...(options?.maxBufferBytes !== undefined ? { maxBufferBytes: options.maxBufferBytes } : {}),
+      ...(options?.killProcessTree !== undefined ? { killProcessTree: options.killProcessTree } : {}),
     });
     return {
       exitCode: outcome.exitCode,

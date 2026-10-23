@@ -19,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      # ubuntu-latest has curl and nc: the ocm-run integration suite must run, never silently skip.
+      OCM_IT_REQUIRE: "1"
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

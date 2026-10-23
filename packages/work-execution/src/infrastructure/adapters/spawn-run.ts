@@ -75,19 +75,33 @@ export interface SpawnRunOptions {
   readonly timeoutMs?: number;
   readonly input?: string;
   readonly maxBufferBytes?: number;
+  /**
+   * Whether the timeout and overrun terminations may signal the child's whole
+   * process group (default true). `false` signals only the direct child, so a
+   * detached grandchild survives the run's own timeout.
+   */
+  readonly killProcessTree?: boolean;
 }
 
 /** Kill the whole process tree (POSIX group kill), falling back to the child. */
-function killProcessTree(child: ChildProcess): void {
+function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGKILL', tree = true): void {
+  if (!tree) {
+    try {
+      child.kill(signal);
+    } catch {
+      // The child already exited.
+    }
+    return;
+  }
   if (child.pid === undefined) {
-    child.kill('SIGKILL');
+    child.kill(signal);
     return;
   }
   try {
-    process.kill(-child.pid, 'SIGKILL');
+    process.kill(-child.pid, signal);
   } catch {
     try {
-      child.kill('SIGKILL');
+      child.kill(signal);
     } catch {
       // The child already exited.
     }
@@ -114,6 +128,7 @@ export function runSpawnOutcome(
 
     const maxBufferBytes = options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES;
     const timeoutMs = options.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+    const killTree = options.killProcessTree !== false;
     let buffered = 0;
     let overran = false;
 
@@ -143,16 +158,18 @@ export function runSpawnOutcome(
       if (settled || killed !== null) return;
       killed = signal;
       error = reason;
-      killProcessTree(child);
+      killProcessTree(child, 'SIGKILL', killTree);
       // The process tree was SIGKILLed; a close event still follows.
     };
 
     const timer = setTimeout(() => {
       if (killed === null) {
         killed = 'SIGTERM';
-        error = `command exceeded its ${String(timeoutMs)}ms timeout and its process tree was killed`;
+        error = killTree
+          ? `command exceeded its ${String(timeoutMs)}ms timeout and its process tree was killed`
+          : `command exceeded its ${String(timeoutMs)}ms timeout and was killed`;
         // SIGTERM first so a well-behaved tree can flush; SIGKILL follows.
-        if (child.pid !== undefined) {
+        if (killTree && child.pid !== undefined) {
           try {
             process.kill(-child.pid, 'SIGTERM');
           } catch {
@@ -162,11 +179,17 @@ export function runSpawnOutcome(
               // already exited
             }
           }
+        } else {
+          try {
+            child.kill('SIGTERM');
+          } catch {
+            // already exited
+          }
         }
       }
       killGrace = setTimeout(() => {
         if (child.exitCode === null && child.signalCode === null) {
-          killProcessTree(child);
+          killProcessTree(child, 'SIGKILL', killTree);
         }
       }, KILL_GRACE_MS);
     }, timeoutMs);
@@ -203,6 +226,25 @@ export function runSpawnOutcome(
       // Spawn failure (for example ENOENT): reported, never guessed.
       error = failure.message ?? String(failure);
       settle({ exitCode: null, signal: null, stdout, stderr, error });
+    });
+
+    // Without a tree kill, a surviving grandchild may hold the inherited
+    // stdio pipes open, so 'close' could never come. Once the killed child
+    // has exited, drain briefly, then close the pipes and settle anyway.
+    child.on('exit', (_code: number | null, signal: NodeJS.Signals | null) => {
+      if (killTree || killed === null) return;
+      setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        const signalName = signal ?? killed;
+        settle({
+          exitCode: null,
+          signal: typeof signalName === 'string' ? signalName : null,
+          stdout,
+          stderr,
+          ...(error !== undefined ? { error } : {}),
+        });
+      }, KILL_GRACE_MS).unref();
     });
 
     child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {

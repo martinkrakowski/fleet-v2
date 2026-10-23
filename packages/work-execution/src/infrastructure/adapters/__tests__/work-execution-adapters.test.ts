@@ -1485,3 +1485,36 @@ describe('ExecutionRunnerAdapter: status adoption after an ambiguous start', () 
     expect((result as { sessionId: string }).sessionId).toBe('ses_ok');
   });
 });
+
+describe('ExecutionRunnerAdapter: exit 2 refusal and start budget clamp', () => {
+  it('reports refused (never unknown) when ocm-run exits 2 on the start', async () => {
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 2, stdout: '', stderr: 'unknown flag: --nope' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.startSession(
+      makeStartRequest({ modelAssignment: { model: 'glm-5' } }),
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Runner refused the start (exit 2, usage error): unknown flag: --nope',
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('clamps a huge start budget to 99999 in OCM_START_MAX', async () => {
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 0, stdout: '{"sessionID":"ses_big"}', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({
+      runSubprocess: runner,
+      remotePort: 4166,
+      startBudgetSeconds: 200000,
+    });
+    const result = await adapter.startSession(
+      makeStartRequest({ modelAssignment: { model: 'glm-5' } }),
+    );
+    expect(result.outcome).toBe('started');
+    expect(calls[0].env?.OCM_START_MAX).toBe('99999');
+  });
+});

@@ -44,8 +44,15 @@ const RUNNER_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
  */
 const RUNNER_SUBPROCESS_TIMEOUT_MS = 120_000;
 
-/** Grace added to the start budget before the start subprocess is killed. */
-const RUNNER_START_TIMEOUT_GRACE_MS = 30_000;
+/**
+ * Grace added to the start budget before the start subprocess is killed.
+ * Derived from the runner's own phases: preflight probe (5 s) + busy check
+ * (8 s + 8 s per active session) + create (8 s) + late overrun detection
+ * (one poll, 8 s) + cleanup (5 s client kill + 8 s abort) ≈ 42 s plus 8 s
+ * per already-active session. 60 s covers two active sessions; beyond that
+ * the start is reported `unknown` and the status lookup decides.
+ */
+const RUNNER_START_TIMEOUT_GRACE_MS = 60_000;
 
 /** Bound on the --status lookup that follows an ambiguous start. */
 const RUNNER_STATUS_LOOKUP_TIMEOUT_MS = 30_000;
@@ -555,6 +562,14 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       return { outcome: 'refused', reason: 'Worktree already has an active session (exit 75)' };
     }
 
+    if (result.exitCode === 2) {
+      // A usage error created nothing, so refusing is safe.
+      return {
+        outcome: 'refused',
+        reason: `Runner refused the start (exit 2, usage error): ${result.stderr || result.stdout || 'no output'}`,
+      };
+    }
+
     if (result.exitCode === 0) {
       const sessionId = parseSessionId(result.stdout);
       if (sessionId !== null) {
@@ -608,7 +623,9 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     if (typeof configured !== 'number' || !Number.isInteger(configured) || configured <= 0) {
       return 60;
     }
-    return configured;
+    // `ocm-run` parses OCM_START_MAX as a bounded integer; values beyond its
+    // own ceiling are clamped, not passed through.
+    return Math.min(configured, 99_999);
   }
 
   /**

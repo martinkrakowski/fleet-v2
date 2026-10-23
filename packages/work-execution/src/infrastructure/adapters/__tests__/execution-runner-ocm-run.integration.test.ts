@@ -32,6 +32,13 @@ const toolsAvailable = (() => {
   return probe.status === 0;
 })();
 
+// OCM_IT_REQUIRE=1 makes the tool check a hard failure instead of a skip.
+if (!toolsAvailable && process.env.OCM_IT_REQUIRE === '1') {
+  it('OCM_IT_REQUIRE=1 but curl/nc are missing', () => {
+    throw new Error('OCM_IT_REQUIRE=1 but curl/nc are missing');
+  });
+}
+
 const createdDirs = new Set<string>();
 /** Cleanups of setups whose test has not cleaned up yet (a hung start skips its finally). */
 const pendingCleanups = new Set<() => Promise<void>>();

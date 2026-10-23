@@ -1010,10 +1010,10 @@ out=$(run FAKE_START_TICKS=10000 OCM_START_MAX=2 -- --detach --dir "$D" -s ses_h
 check "D5: a budget overrun with the caller's own -s id exits 1" '[ "$rc" = 1 ]'
 check "D5: the caller's own -s id is never interrupted" '! grep -q ses_http9 "$T/interrupts"'
 check "D5: the caller's own -s session still exists" '[ -e "$T/sessions/ses_http9" ]'
-clear_all
+clear_all; L2="$T/localfail"; mkdir -p "$L2"; rm -rf "$L2/.lane"; : > "$L2/.lane"
 printf 'created\n%s\n' "$L2" > "$T/sessions/ses_http9"
-out=$(run FAKE_START_TICKS=10000 OCM_START_MAX=2 -- --detach --dir "$L2" -s ses_http9 "p" 2>&1); rc=$?
-check "D5: a .lane failure with the caller's own -s id exits 1" '[ "$rc" = 1 ]'
+out=$(run -- --detach --dir "$L2" -s ses_http9 "p" 2>&1); rc=$?
+check "D5: a .lane failure with the caller's own -s id exits 1" '[ "$rc" = 1 ] && echo "$out" | grep -q "could not create"'
 check "D5: the caller's own -s id is not interrupted by the .lane failure" '! grep -q ses_http9 "$T/interrupts"'
 check "D5: the caller's own -s session still exists after the .lane failure" '[ -e "$T/sessions/ses_http9" ]'
 

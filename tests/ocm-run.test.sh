@@ -844,5 +844,14 @@ clear_all; : > "$T/locked-once"
 out=$(run FAKE_TICKS=50 -- --detach --dir "$D" --agent lane "p" > "$T/out" 2> "$T/err"); rc=$?
 check "D5(e): database locked relaunches once, then success" '[ "$rc" = 0 ] && [ "$(wc -l < "$T/args.log" | tr -d " ")" = 2 ] && grep -q "retrying once" "$T/err" && grep -q "^session started: ses_http2 (detached)$" "$T/out"'
 
+# (f): the local-directory branch (a real local dir) creates the session the same way
+# (POST), passes -s, prints an id too, and logs the detached client's stderr in
+# <dir>/.lane/ocm-run.<id>.log.
+clear_all; L="$T/localwt"; mkdir -p "$L"
+run FAKE_TICKS=50 -- --detach --dir "$L" "p" > "$T/out" 2>&1; rc=$?
+check "D5(f): the local-directory branch prints an id too" '[ "$rc" = 0 ] && grep -q "^session started: ses_http1 (detached)$" "$T/out"'
+check "D5(f): the client takes the local directory from the session" '[ "$(cat "$T/client-dir")" = "$L" ]'
+check "D5(d): the detached stderr is in <dir>/.lane/ocm-run.<id>.log" 'grep -q "a line on stderr" "$L/.lane/ocm-run.ses_http1.log"'
+
 printf '%s failed\n' "$fails"
 [ "$fails" = 0 ]

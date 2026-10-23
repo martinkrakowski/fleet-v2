@@ -772,11 +772,23 @@ ocm_launch_detached() {
 }
 
 # --detach on a v2 server: create the session (or take the resumed one), launch opencode
-# disowned, and return at once; ocm_detach_run polls for the session.
+# disowned, and return at once; ocm_detach_run polls for the session. The detached log
+# is <dir>/.lane/ocm-run.<id>.log when <dir> exists locally (.lane is created if missing),
+# otherwise a file under ${TMPDIR:-/tmp}.
 ocm_detach_launch() {
   ocm_create_session "$@"
   [ "$rc" = 0 ] || return
-  ocm_log="${TMPDIR:-/tmp}/ocm-run.$ocm_sid.log"
+  if [ -d "$dir" ]; then
+    ocm_logdir="$dir/.lane"
+    mkdir -p "$ocm_logdir" 2>/dev/null || {
+      echo "ocm-run: could not create $ocm_logdir for the detached log" >&2
+      rc=1
+      return
+    }
+    ocm_log="$ocm_logdir/ocm-run.$ocm_sid.log"
+  else
+    ocm_log="${TMPDIR:-/tmp}/ocm-run.$ocm_sid.log"
+  fi
   if [ "$has_session" = 1 ]; then
     ocm_launch_detached run --server "$url" "$@"
   else

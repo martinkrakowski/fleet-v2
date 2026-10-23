@@ -500,6 +500,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       ? {
           ...existingAttempt,
           revision: nextAttemptRevision(existingAttempt),
+          dispatchRevision: nextAttemptRevision(existingAttempt),
           worktreePath: request.worktreePath,
           baseCommit: request.baseCommit,
           state: 'dispatching',
@@ -522,6 +523,8 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           baseCommit: request.baseCommit,
           state: 'dispatching',
           outcome: null,
+          revision: 0,
+          dispatchRevision: 0,
           briefDigest: request.briefDigest,
           briefPackagePath: request.briefPackagePath,
           sessionId: null,

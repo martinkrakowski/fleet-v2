@@ -921,6 +921,20 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         completionReceipt: receipt,
       });
     },
+    usage: async (p, rt) => {
+      const attemptId = str(p, 'attemptId');
+      const attempt = await rt.execution.attemptRepository.findAttemptById(attemptId);
+      if (attempt === null) {
+        return { outcome: 'refused', reason: `Attempt not found: ${attemptId}` };
+      }
+      const result = await rt.execution.opencodeDbUsage.readUsage({ attempt });
+      await rt.execution.attemptRepository.saveAttempt({
+        ...attempt,
+        usage: result.usage,
+        updatedAtIso: new Date().toISOString(),
+      });
+      return result;
+    },
     fix: async (p, rt) =>
       rt.execution.prepareFixAttempt.prepareFixAttempt({
         fixAttemptId: str(p, 'fixAttemptId'),
@@ -1750,7 +1764,7 @@ Commands:
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
   brief prepare [--allowedPathPrefixes '["packages/x/src"]']
   capacity reserve
-  attempt dispatch|reconcile|stop|collect|fix|accept
+  attempt dispatch|reconcile|stop|collect|usage|fix|accept
   forge execute
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede

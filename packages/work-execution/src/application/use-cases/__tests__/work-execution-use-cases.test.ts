@@ -2450,6 +2450,9 @@ function makeStopSetup(
   options: {
     attempt?: Partial<AttemptRecord>;
     stopResult?: StopRunnerSessionResult;
+    worktreeState?: WorktreeRunState;
+    abortResult?: AbortWorktreeRunResult;
+    withoutWorktreeMethods?: boolean;
     withReservation?: boolean;
   } = {},
 ) {
@@ -2459,7 +2462,12 @@ function makeStopSetup(
   if (options.withReservation ?? true) {
     journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
   }
-  const runner = makeRunner({ stopResult: options.stopResult });
+  const runner = makeRunner({
+    stopResult: options.stopResult,
+    worktreeState: options.worktreeState,
+    abortResult: options.abortResult,
+    withoutWorktreeMethods: options.withoutWorktreeMethods,
+  });
   const useCase = new StopAttemptUseCase({ attemptRepo, journal, runner: runner.port });
   return { attemptRepo, journal, runner, useCase };
 }
@@ -2604,6 +2612,85 @@ describe('StopAttemptUseCase', () => {
     });
     expect(setup.journal.heldFor('attempt-1')).toBe(true);
     expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('reconciling');
+  });
+
+  it('cancels a session-less blocked attempt by worktree abort and releases the reservation', async () => {
+    const setup = makeStopSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      abortResult: { outcome: 'aborted', endedAtIso: '2026-10-22T12:00:00.000Z' },
+    });
+
+    const result = await setup.useCase.stopAttempt({ attemptId: 'attempt-1', gracePeriodSeconds: 20 });
+
+    expect(result).toMatchObject({ outcome: 'cancelled', capacityReleased: true });
+    if (result.outcome !== 'cancelled') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('cancelled');
+    expect(result.attempt.outcome).toBe('stopped');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('cancelled');
+    expect(setup.journal.heldFor('attempt-1')).toBe(false);
+    expect(setup.runner.abortWorktreeCalls).toEqual([
+      {
+        attemptId: 'attempt-1',
+        worktreePath: '/lanes/attempt-1',
+        runner: undefined,
+        gracePeriodSeconds: 20,
+      },
+    ]);
+    expect(setup.runner.stopCalls).toHaveLength(0);
+    expect(setup.journal.entries[0]).toMatchObject({
+      action: 'stop',
+      status: 'intent-recorded',
+      sessionId: null,
+    });
+    expect(setup.journal.entries[1]).toMatchObject({
+      action: 'stop',
+      status: 'completed',
+      sessionId: null,
+      detail: 'Worktree aborted and attempt cancelled',
+    });
+  });
+
+  it('keeps a session-less blocked attempt unchanged when the worktree is still running', async () => {
+    const setup = makeStopSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      abortResult: { outcome: 'still-running', reason: 'grace period elapsed' },
+    });
+
+    const result = await setup.useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toMatchObject({ outcome: 'still-running', reason: 'grace period elapsed' });
+    if (result.outcome !== 'still-running') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('blocked');
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries[1]).toMatchObject({
+      action: 'stop',
+      status: 'ambiguous',
+      detail: 'grace period elapsed',
+    });
+  });
+
+  it('refuses to stop a session-less non-blocked attempt and leaves the reservation held', async () => {
+    const setup = makeStopSetup({
+      attempt: { state: 'running', sessionId: null },
+      abortResult: { outcome: 'aborted', endedAtIso: '2026-10-22T12:00:00.000Z' },
+    });
+
+    const result = await setup.useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Attempt not found or has no sessionId',
+    });
+    expect(setup.runner.abortWorktreeCalls).toHaveLength(0);
+    expect(setup.runner.stopCalls).toHaveLength(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries).toHaveLength(0);
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('running');
   });
 });
 

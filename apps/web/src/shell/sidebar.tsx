@@ -34,7 +34,9 @@ export function Sidebar() {
         <Suspense fallback={null}>
           <ProjectNav />
         </Suspense>
-        <div className="sidebar-footer">fixture station · no live runner</div>
+        <div className="sidebar-footer">
+          fixture views are labelled · Lanes reads the API when configured
+        </div>
       </aside>
       <div className="sidebar-backdrop" onClick={closeDrawer} />
     </>

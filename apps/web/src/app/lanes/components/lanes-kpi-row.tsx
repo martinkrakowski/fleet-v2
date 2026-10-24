@@ -5,9 +5,9 @@ export interface LanesKpiRowProps {
   unknown: number;
   blocked: number;
   held: number;
-  slots: number;
-  host: string;
-  port: number;
+  slots: number | null;
+  host: string | null;
+  port: number | null;
   queuedAll: number;
 }
 
@@ -21,6 +21,8 @@ export function LanesKpiRow({
   port,
   queuedAll
 }: LanesKpiRowProps) {
+  const queuedText =
+    queuedAll === 1 ? "queued intent" : "queued intents";
   return (
     <div className="row col-4">
       <StatCard
@@ -45,16 +47,26 @@ export function LanesKpiRow({
         tone="accent"
         label="slots held"
         value={
-          <>
-            {held}
-            <small>/{slots}</small>
-          </>
+          slots !== null ? (
+            <>
+              {held}
+              <small>/{slots}</small>
+            </>
+          ) : (
+            held
+          )
         }
         subtext={
-          <>
-            {host} · port {port} · {queuedAll} queued intent
-            {queuedAll === 1 ? "" : "s"} behind them
-          </>
+          slots !== null ? (
+            <>
+              {host} · port {port} · {queuedAll} {queuedText} behind them
+            </>
+          ) : (
+            <>
+              slot budget not served by the API · {queuedAll} {queuedText}{" "}
+              behind them
+            </>
+          )
         }
       />
     </div>

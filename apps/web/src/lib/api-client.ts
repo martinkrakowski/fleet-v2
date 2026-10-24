@@ -45,6 +45,10 @@ export interface FleetWebApiClient {
     attemptId: string,
     fallback: T,
   ): Promise<LiveEndpointResult<T>>;
+  fetchAttemptList<T>(
+    query: { readonly limit?: number; readonly projectId?: string },
+    fallback: T,
+  ): Promise<LiveEndpointResult<T>>;
   fetchHeadEvidenceView<T>(
     headSha: string,
     fallback: T,
@@ -156,6 +160,9 @@ export function createFleetWebApiClient(
     try {
       response = await fetchImpl(url, {
         headers,
+        // Server renders must never reuse a cached list: the live data layer
+        // is the only source for the Lanes page.
+        cache: "no-store",
       });
     } catch (error) {
       return fixtureFallback(
@@ -212,6 +219,23 @@ export function createFleetWebApiClient(
       fallback: T,
     ): Promise<LiveEndpointResult<T>> {
       return read(`/v1/attempts/${encodeURIComponent(attemptId)}`, fallback);
+    },
+    fetchAttemptList<T>(
+      query: { readonly limit?: number; readonly projectId?: string },
+      fallback: T,
+    ): Promise<LiveEndpointResult<T>> {
+      const params = new URLSearchParams();
+      if (query.limit !== undefined) {
+        params.set("limit", String(query.limit));
+      }
+      if (query.projectId !== undefined) {
+        params.set("projectId", query.projectId);
+      }
+      const queryString = params.toString();
+      return read(
+        queryString ? `/v1/attempts?${queryString}` : "/v1/attempts",
+        fallback,
+      );
     },
     fetchHeadEvidenceView<T>(
       headSha: string,

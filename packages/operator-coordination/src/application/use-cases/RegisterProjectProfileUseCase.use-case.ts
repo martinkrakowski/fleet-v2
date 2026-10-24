@@ -114,6 +114,27 @@ export class RegisterProjectProfileUseCase implements RegisterProjectProfilePort
     const existing = await this.deps.profileRepo.findProfileById(request.projectId);
     // The composition root supplies the clock; no authority depends on it here.
     const nowIso = isFilled(request.nowIso) ? request.nowIso : new Date().toISOString();
+    // A new profile starts with the entity's v2 defaults; a re-registration
+    // carries the stored v2 fields forward unchanged so clones and the last
+    // probe are never wiped by a re-registration.
+    const v2Fields =
+      existing === null
+        ? {
+            status: 'active' as const,
+            defaultBranch: null,
+            clones: {},
+            gateProcedures: [],
+            defaultAllowedPathPrefixes: [],
+            lastProbe: null,
+          }
+        : {
+            status: existing.status,
+            defaultBranch: existing.defaultBranch,
+            clones: existing.clones,
+            gateProcedures: existing.gateProcedures,
+            defaultAllowedPathPrefixes: existing.defaultAllowedPathPrefixes,
+            lastProbe: existing.lastProbe,
+          };
     const candidate: ProjectProfileRecord = {
       projectId: request.projectId.trim(),
       displayName: request.displayName.trim(),
@@ -124,6 +145,7 @@ export class RegisterProjectProfileUseCase implements RegisterProjectProfilePort
       runnerCapabilities: Object.freeze({ ...capabilities }),
       revision: existing === null ? 0 : existing.revision + 1,
       updatedAtIso: nowIso,
+      ...v2Fields,
     };
     let profile: ProjectProfileRecord;
     try {

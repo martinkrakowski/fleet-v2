@@ -10,6 +10,38 @@ import type { CoordinationKindValue } from './value-objects/CoordinationKind.vo.
 import type { CoordinationStateValue } from './value-objects/CoordinationState.vo.js';
 
 /**
+ * One clone of a project's repository on an installation host. `path` is the
+ * clone directory; `worktreeRoot` is the directory holding the clone's
+ * worktrees, and must lie outside the clone itself.
+ */
+export interface ProjectCloneRecord {
+  readonly path: string;
+  readonly worktreeRoot: string;
+}
+
+/** Outcome of one probe check: verified, failed, or not exercised. */
+export type ProjectProbeResult = 'pass' | 'fail' | 'unknown';
+
+/**
+ * One named check in a probe receipt. `host` is the host the check ran on, or
+ * null when the check is not host-specific; `detail` carries human-readable
+ * evidence and never a credential, token or secret value.
+ */
+export interface ProjectProbeCheckRecord {
+  readonly name: string;
+  readonly host: string | null;
+  readonly result: ProjectProbeResult;
+  readonly detail: string;
+}
+
+/** Durable receipt proving a project was probed at a point in time. */
+export interface ProjectProbeReceiptRecord {
+  readonly probedAtIso: string;
+  readonly probedFrom: string;
+  readonly checks: readonly ProjectProbeCheckRecord[];
+}
+
+/**
  * Private installation references for one project. It names the designated
  * dispatcher host and the approved policy revision; it never stores a
  * credential, token or secret value.
@@ -24,7 +56,39 @@ export interface ProjectProfileRecord {
   readonly runnerCapabilities: Readonly<Record<string, boolean | string>>;
   readonly revision: number;
   readonly updatedAtIso: string;
+  readonly status: 'active' | 'retired';
+  readonly defaultBranch: string | null;
+  readonly clones: Readonly<Record<string, ProjectCloneRecord>>;
+  readonly gateProcedures: readonly string[];
+  readonly defaultAllowedPathPrefixes: readonly string[];
+  readonly lastProbe: ProjectProbeReceiptRecord | null;
 }
+
+/**
+ * Input shape accepted by `ProjectProfile.fromRecord`. The six fields added in
+ * profile v2 are optional here because records written before this lane lack
+ * them; the entity fills defaults for a missing field.
+ */
+export type ProjectProfileInput = Omit<
+  ProjectProfileRecord,
+  | 'status'
+  | 'defaultBranch'
+  | 'clones'
+  | 'gateProcedures'
+  | 'defaultAllowedPathPrefixes'
+  | 'lastProbe'
+> &
+  Partial<
+    Pick<
+      ProjectProfileRecord,
+      | 'status'
+      | 'defaultBranch'
+      | 'clones'
+      | 'gateProcedures'
+      | 'defaultAllowedPathPrefixes'
+      | 'lastProbe'
+    >
+  >;
 
 /**
  * Durable receipt binding one grant to one action id and attempt. A second,

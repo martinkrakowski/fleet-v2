@@ -156,6 +156,41 @@ describe('RequestAttemptAcceptanceUseCase independence', () => {
     expect(acceptancePort.requests).toHaveLength(0);
   });
 
+  it('rejects a request whose reviewerModel is not a string', async () => {
+    const acceptancePort = new FakeAcceptanceAssessment();
+    const useCase = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([makeAttempt()]),
+      acceptancePort,
+    });
+
+    const result = await useCase.requestAttemptAcceptance(
+      acceptanceRequest({ reviewerModel: undefined as unknown as string }),
+    );
+
+    expect(result).toEqual({ outcome: 'rejected', reason: 'reviewerModel is required' });
+    expect(acceptancePort.requests).toHaveLength(0);
+  });
+
+  it('rejects a reviewer model with an empty family', async () => {
+    const acceptancePort = new FakeAcceptanceAssessment();
+    const useCase = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([
+        makeAttempt({ runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'openrouter/inception/mercury-3', variant: null } }),
+      ]),
+      acceptancePort,
+    });
+
+    const result = await useCase.requestAttemptAcceptance(
+      acceptanceRequest({ reviewerModel: '4o-mini' }),
+    );
+
+    expect(result.outcome).toBe('rejected');
+    expect(result.outcome === 'rejected' && result.reason).toContain(
+      'an independent reviewer is required',
+    );
+    expect(acceptancePort.requests).toHaveLength(0);
+  });
+
   it('accepts a reviewer of a different family past the independence check', async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const useCase = new RequestAttemptAcceptanceUseCase({

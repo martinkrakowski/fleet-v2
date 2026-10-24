@@ -200,6 +200,11 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
       return { outcome: 'rejected', reason: implementerSeat.reason };
     }
     const implementerModel = implementerSeat.model;
+    // The reviewer seat must be named; a missing one is refused before any
+    // independence or free-seat check is evaluated.
+    if (!isNonEmptyString(request.reviewerModel)) {
+      return { outcome: 'rejected', reason: 'reviewerModel is required' };
+    }
     // Independence is the owner-decided family rule: the same underlying model
     // family (after the provider path and any `#`, `:` or `@` suffix are
     // dropped) is never independence, and an empty family fails closed.

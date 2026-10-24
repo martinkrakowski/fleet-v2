@@ -207,9 +207,11 @@ describe('Fleet CLI workflow', () => {
     process.env.FLEET_OCM_RUN_BIN = path.join(binDir, 'ocm-run');
     process.env.PATH = `${binDir}:${originalPath ?? ''}`;
 
-    // The lane worktree stays pristine: it must match the base commit with no
-    // untracked files and no earlier-attempt residue when dispatch inspects it.
-    laneHead = initGitRepo(laneRepoDir, []);
+    // The lane worktree must match the base commit with no untracked files
+    // and no earlier-attempt residue when dispatch inspects it; the frozen
+    // brief package lives in its gitignored `.lane/` directory and is an
+    // active brief file for the dispatch that reads it.
+    laneHead = initGitRepo(laneRepoDir, ['.lane/', 'docs/demo-summary.md']);
     // The brief worktree ignores the frozen-brief targets and the expected
     // artifact path, which prepare-brief-package proves before placement.
     initGitRepo(briefRepoDir, ['.lane/', 'docs/demo-summary.md']);
@@ -460,7 +462,7 @@ describe('Fleet CLI workflow', () => {
           },
         ],
         attemptId: ATTEMPT_ID,
-        worktreePath: briefRepoDir,
+        worktreePath: laneRepoDir,
         handWrittenBriefPath: briefFilePath,
       }),
     ]);
@@ -481,7 +483,7 @@ describe('Fleet CLI workflow', () => {
       { knowledgeEntryId: entryId, version: '1.0.0' },
     ]);
     briefDigest = prepared.prepared.briefDigest;
-    expect(prepared.prepared.prosePath).toBe(path.join(briefRepoDir, '.lane', 'brief.md'));
+    expect(prepared.prepared.prosePath).toBe(path.join(laneRepoDir, '.lane', 'brief.md'));
 
     // --- work-execution: reserve capacity and dispatch ----------------------
     const reserve = await cli([
@@ -1369,7 +1371,7 @@ describe('Fleet CLI workflow', () => {
     const mpWorkOrderId = 'wo-mp-1';
     const mpAttemptId = 'attempt-mp-1';
     mkdirSync(multiProcStateDir);
-    const mpLaneHead = initGitRepo(multiProcLaneRepo, []);
+    const mpLaneHead = initGitRepo(multiProcLaneRepo, ['.lane/', 'docs/demo-summary.md']);
     initGitRepo(multiProcBriefRepo, ['.lane/', 'docs/demo-summary.md']);
     writeFileSync(
       multiProcBriefFile,
@@ -1573,7 +1575,7 @@ describe('Fleet CLI workflow', () => {
           },
         ],
         attemptId: mpAttemptId,
-        worktreePath: multiProcBriefRepo,
+        worktreePath: multiProcLaneRepo,
         handWrittenBriefPath: multiProcBriefFile,
       }),
     ]);

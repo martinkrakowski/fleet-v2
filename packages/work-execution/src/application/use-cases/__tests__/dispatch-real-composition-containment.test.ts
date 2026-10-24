@@ -92,6 +92,12 @@ function makeRunnerPort(): ExecutionRunnerPort {
     async startSession(): Promise<never> {
       throw new Error('startSession must never run in this test');
     },
+    async inspectSession(): Promise<never> {
+      throw new Error('inspectSession must never run in this test');
+    },
+    async stopSession(): Promise<never> {
+      throw new Error('stopSession must never run in this test');
+    },
   };
 }
 

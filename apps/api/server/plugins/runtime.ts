@@ -6,6 +6,7 @@
 // unconfigured deployment never exposes live dispatch or forge behaviour.
 import { loadInstallation } from "@fleet/installation";
 
+import { listenHostRefusal } from "../wiring/listen-host";
 import { configureFleetApiRuntime } from "../wiring/runtime";
 import { readApiTokenFromFile, setActiveApiToken } from "../wiring/token";
 
@@ -51,5 +52,10 @@ const definePlugin =
     : <T>(plugin: T) => plugin;
 
 export default definePlugin(() => {
+  const refusal = listenHostRefusal(process.env);
+  if (refusal !== null) {
+    process.stderr.write(`fleet-api: refusing to start: ${refusal}\n`);
+    process.exit(1);
+  }
   bootstrapFleetApiFromEnv(process.env);
 });

@@ -108,6 +108,33 @@ describe("laneIdLine", () => {
     expect(laneIdLine(pending)).not.toContain("null bound");
     expect(laneIdLine(pending)).toContain("no session");
   });
+
+  it("renders recorded no-session rows by capacity and terminal state", () => {
+    const runningHeld: AttemptSummary = {
+      ...recorded("running"),
+      session: null,
+      capacity: "held",
+      slot: 1,
+    };
+    expect(laneIdLine(runningHeld)).toContain("no session recorded · slot 1");
+    expect(laneIdLine(runningHeld)).not.toContain("released");
+
+    const dispatchingReleased: AttemptSummary = {
+      ...recorded("dispatching"),
+      session: null,
+      capacity: "released",
+    };
+    expect(laneIdLine(dispatchingReleased)).toContain(
+      "no session recorded · no slot held",
+    );
+
+    const collectedNoSession: AttemptSummary = {
+      ...recorded("collected"),
+      session: null,
+      capacity: "released",
+    };
+    expect(laneIdLine(collectedNoSession)).toContain("ended · slot released");
+  });
 });
 
 describe("woOf", () => {

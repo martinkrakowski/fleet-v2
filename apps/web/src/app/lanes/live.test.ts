@@ -65,10 +65,19 @@ const ENVELOPE = {
 
 type AttemptListReply =
   | { source: "api"; data: unknown }
-  | { source: "fixture-fallback"; fallbackReason: string };
+  | { source: "fixture-fallback"; fallbackReason: string | null };
 
-function fakeClient(reply: AttemptListReply): FleetWebApiClient {
+type AttemptListQuery = {
+  readonly limit?: number;
+  readonly projectId?: string;
+};
+
+function fakeClient(
+  reply: AttemptListReply,
+): FleetWebApiClient & { readonly queries: AttemptListQuery[] } {
+  const queries: AttemptListQuery[] = [];
   return {
+    queries,
     fetchWorkOrderView: async () => {
       throw new Error("unused");
     },
@@ -85,9 +94,10 @@ function fakeClient(reply: AttemptListReply): FleetWebApiClient {
       throw new Error("unused");
     },
     fetchAttemptList: async <T>(
-      _query: { readonly limit?: number; readonly projectId?: string },
+      query: AttemptListQuery,
       fallback: T,
     ): Promise<LiveEndpointResult<T>> => {
+      queries.push(query);
       if (reply.source === "api") {
         return {
           source: "api",
@@ -110,11 +120,10 @@ describe("loadLanesData", () => {
   const now = () => new Date("2026-10-24T12:00:00Z");
 
   it("maps a valid API envelope with source api and no capacity budget", async () => {
-    const data = await loadLanesData(
-      fakeClient({ source: "api", data: ENVELOPE }),
-      now,
-    );
+    const client = fakeClient({ source: "api", data: ENVELOPE });
+    const data = await loadLanesData(client, now);
 
+    expect(client.queries).toEqual([{ limit: 200 }]);
     expect(data.source).toBe("api");
     expect(data.fallbackReason).toBeNull();
     expect(data.observedAtIso).toBe("2026-10-24T12:00:00.000Z");
@@ -138,6 +147,62 @@ describe("loadLanesData", () => {
     });
   });
 
+  it("keeps a real workOrder summary when another row for the same workOrderId has null workOrder", async () => {
+    const withWorkOrder = {
+      ...ENVELOPE.result.attempts[0],
+      attempt: {
+        ...ENVELOPE.result.attempts[0].attempt,
+        id: "att_wo_1",
+        workOrderId: "wo-1",
+      },
+      workOrder: {
+        id: "wo-1",
+        projectId: "fleet-v2",
+        taskId: "Task one",
+        laneId: "lane-a",
+      },
+    };
+    const withoutWorkOrder = {
+      ...ENVELOPE.result.attempts[1],
+      attempt: {
+        ...ENVELOPE.result.attempts[1].attempt,
+        id: "att_wo_2",
+        workOrderId: "wo-1",
+      },
+      workOrder: null,
+    };
+
+    const forward = await loadLanesData(
+      fakeClient({
+        source: "api",
+        data: {
+          ...ENVELOPE,
+          result: {
+            ...ENVELOPE.result,
+            attempts: [withWorkOrder, withoutWorkOrder],
+          },
+        },
+      }),
+      now,
+    );
+    expect(forward.workOrders["wo-1"].project).toBe("fleet-v2");
+
+    const reverse = await loadLanesData(
+      fakeClient({
+        source: "api",
+        data: {
+          ...ENVELOPE,
+          result: {
+            ...ENVELOPE.result,
+            attempts: [withoutWorkOrder, withWorkOrder],
+          },
+        },
+      }),
+      now,
+    );
+    expect(reverse.workOrders["wo-1"].project).toBe("fleet-v2");
+  });
+
   it("falls back to the fixture with the client's reason", async () => {
     const data = await loadLanesData(
       fakeClient({
@@ -158,6 +223,19 @@ describe("loadLanesData", () => {
     expect(data.total).toBe(fixtureAttempts.length);
     expect(data.truncated).toBe(false);
     expect(data.observedAtIso).toBe("2026-10-24T12:00:00.000Z");
+  });
+
+  it("uses the default fallback reason when the client gives null", async () => {
+    const data = await loadLanesData(
+      fakeClient({
+        source: "fixture-fallback",
+        fallbackReason: null,
+      }),
+      now,
+    );
+
+    expect(data.source).toBe("fixture-fallback");
+    expect(data.fallbackReason).toBe("the api client gave no fallback reason");
   });
 
   it("falls back to the fixture when the API shape is unexpected", async () => {

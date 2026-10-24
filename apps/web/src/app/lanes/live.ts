@@ -56,7 +56,10 @@ export async function loadLanesData(
   const endpoint = await client.fetchAttemptList({ limit: 200 }, null);
 
   if (endpoint.source === "fixture-fallback") {
-    return fixtureLanesData(endpoint.fallbackReason ?? "", observedAtIso);
+    return fixtureLanesData(
+      endpoint.fallbackReason ?? "the api client gave no fallback reason",
+      observedAtIso,
+    );
   }
 
   const parsed = parseAttemptListEnvelope(endpoint.data);
@@ -70,7 +73,10 @@ export async function loadLanesData(
   const attempts = parsed.rows.map(toAttemptSummary);
   const workOrders: Record<string, WorkOrderSummary> = {};
   for (const row of parsed.rows) {
-    workOrders[row.attempt.workOrderId] = toWorkOrderSummary(row);
+    const woId = row.attempt.workOrderId;
+    if (row.workOrder !== null || !(woId in workOrders)) {
+      workOrders[woId] = toWorkOrderSummary(row);
+    }
   }
 
   return {

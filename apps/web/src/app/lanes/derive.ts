@@ -129,7 +129,14 @@ export function laneIdLine(
         }no session`
       : a.session
         ? `${a.session}${portPart}${slotPart}`
-        : "ended · slot released";
+        : a.capacity === "held"
+          ? `no session recorded${slotPart}`
+          : a.basis === "recorded" &&
+              a.recordedState !== "ended" &&
+              a.recordedState !== "collected" &&
+              a.recordedState !== "cancelled"
+            ? "no session recorded · no slot held"
+            : "ended · slot released";
   const silent =
     a.facts.reachable === "unknown" && a.lastKnown
       ? ` · silent since ${a.lastKnown.at}`

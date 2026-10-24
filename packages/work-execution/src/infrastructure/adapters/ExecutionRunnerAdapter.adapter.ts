@@ -16,6 +16,8 @@ import { promisify } from 'node:util';
 import { isValidHostName } from '@fleet/shared';
 
 import type {
+  AbortWorktreeRunRequest,
+  AbortWorktreeRunResult,
   ExecutionRunnerPort,
   RunnerIsolationCapabilities,
   RunnerSessionRef,
@@ -24,6 +26,8 @@ import type {
   StartRunnerSessionResult,
   StopRunnerSessionRequest,
   StopRunnerSessionResult,
+  WorktreeRunRef,
+  WorktreeRunState,
 } from '../../application/ports/out/ExecutionRunnerPort.out-port.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import type {
@@ -406,6 +410,17 @@ function isSafeSshHost(host: string): boolean {
   return host.length > 0 && !host.startsWith('-') && !/\s/.test(host);
 }
 
+/** Fail-closed status: nothing observed, nothing concluded. */
+function unknownRunnerStatus(): RunnerSessionStatus {
+  return {
+    runnerReachable: 'unknown',
+    workspacePreparation: 'unprepared',
+    workerCommand: 'not-started',
+    completionReceipt: null,
+    artifactsCollected: false,
+  };
+}
+
 export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   /** Locator for status/abort calls: the attempt's worktree when known. */
   private readonly worktreeByAttemptId = new Map<string, string>();
@@ -578,7 +593,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     }
 
     if (result.exitCode === 75) {
-      return { outcome: 'refused', reason: 'Worktree already has an active session (exit 75)' };
+      return { outcome: 'blocked', reason: 'Worktree already has an active session (exit 75)' };
     }
 
     if (result.exitCode === 2) {
@@ -715,101 +730,20 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   }
 
   async inspectSession(session: RunnerSessionRef): Promise<RunnerSessionStatus> {
-    // Resolve recorded runner
-    let recordedRunner = session.runner;
-    let attemptRecord: AttemptRecord | null = null;
-    if (!recordedRunner && this.options?.resolveAttempt) {
-      attemptRecord = await this.options.resolveAttempt(session.attemptId);
-      recordedRunner = attemptRecord?.runner ?? null;
+    const guarded = await this.resolveRecordedRunner(session);
+    if (!guarded.ok) {
+      return unknownRunnerStatus();
     }
-
-    // Refuse when attempt has no recorded port (old records without it read as unknown)
-    if (!recordedRunner || recordedRunner.remotePort === null) {
-      return {
-        runnerReachable: 'unknown',
-        workspacePreparation: 'unprepared',
-        workerCommand: 'not-started',
-        completionReceipt: null,
-        artifactsCollected: false,
-      };
-    }
-
-    const configuredPort = this.configuredRemotePort();
-    const configuredHost = this.configuredRemoteHost();
-
-    if (configuredHost !== null && !isSafeSshHost(configuredHost)) {
-      return {
-        runnerReachable: 'unknown',
-        workspacePreparation: 'unprepared',
-        workerCommand: 'not-started',
-        completionReceipt: null,
-        artifactsCollected: false,
-      };
-    }
-
-    if (
-      recordedRunner.host !== null &&
-      recordedRunner.host !== undefined &&
-      !isSafeSshHost(recordedRunner.host)
-    ) {
-      return {
-        runnerReachable: 'unknown',
-        workspacePreparation: 'unprepared',
-        workerCommand: 'not-started',
-        completionReceipt: null,
-        artifactsCollected: false,
-      };
-    }
-
-    // Refuse when configured port or host differs from recorded one
-    if (
-      configuredPort !== recordedRunner.remotePort ||
-      (configuredHost ?? null) !== (recordedRunner.host ?? null)
-    ) {
-      return {
-        runnerReachable: 'unknown',
-        workspacePreparation: 'unprepared',
-        workerCommand: 'not-started',
-        completionReceipt: null,
-        artifactsCollected: false,
-      };
-    }
-
-    // L1: Resolve worktree directory; never fall back to session.sessionId
-    const resolved =
-      session.worktreePath ??
-      this.worktreeByAttemptId.get(session.attemptId) ??
-      (await this.options?.resolveWorktreePath?.(session.attemptId)) ??
-      attemptRecord?.worktreePath ??
-      (this.options?.resolveAttempt ? (await this.options.resolveAttempt(session.attemptId))?.worktreePath : null) ??
-      null;
-
-    if (!resolved || resolved.trim() === '') {
-      return {
-        runnerReachable: 'unknown',
-        workspacePreparation: 'unprepared',
-        workerCommand: 'not-started',
-        completionReceipt: null,
-        artifactsCollected: false,
-      };
-    }
-
-    const dir = resolved;
+    const dir = guarded.dir;
     let result: SubprocessResult;
     try {
       result = await this.run(
         this.binPath(),
         ['--status', '--dir', dir],
-        this.remotePortEnv(recordedRunner.remotePort, recordedRunner.host ?? undefined),
+        this.remotePortEnv(guarded.remotePort, guarded.recordedRunner.host ?? undefined),
       );
     } catch {
-      return {
-        runnerReachable: 'unknown',
-        workspacePreparation: 'unprepared',
-        workerCommand: 'not-started',
-        completionReceipt: null,
-        artifactsCollected: false,
-      };
+      return unknownRunnerStatus();
     }
 
     // M1: classify ocm-run --status by exit code only:
@@ -909,65 +843,17 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   }
 
   async stopSession(request: StopRunnerSessionRequest): Promise<StopRunnerSessionResult> {
-    // Resolve recorded runner
-    let recordedRunner = request.runner;
-    let attemptRecord: AttemptRecord | null = null;
-    if (!recordedRunner && this.options?.resolveAttempt) {
-      attemptRecord = await this.options.resolveAttempt(request.attemptId);
-      recordedRunner = attemptRecord?.runner ?? null;
+    const guarded = await this.resolveRecordedRunner(request);
+    if (!guarded.ok) {
+      return { outcome: 'refused', reason: guarded.reason };
     }
-
-    // Refuse when attempt has no recorded port (legacy records without runner)
-    if (!recordedRunner || recordedRunner.remotePort === null) {
-      return { outcome: 'refused', reason: 'Attempt has no recorded runner port' };
-    }
-
-    const configuredPort = this.configuredRemotePort();
-    const configuredHost = this.configuredRemoteHost();
-
-    if (configuredHost !== null && !isSafeSshHost(configuredHost)) {
-      return { outcome: 'refused', reason: `Unsafe OCM_HOST configured: ${configuredHost}` };
-    }
-
-    if (
-      recordedRunner.host !== null &&
-      recordedRunner.host !== undefined &&
-      !isSafeSshHost(recordedRunner.host)
-    ) {
-      return { outcome: 'refused', reason: `Unsafe recorded runner host: ${recordedRunner.host}` };
-    }
-
-    // Refuse when configured port or host differs from recorded one
-    if (
-      configuredPort !== recordedRunner.remotePort ||
-      (configuredHost ?? null) !== (recordedRunner.host ?? null)
-    ) {
-      return {
-        outcome: 'refused',
-        reason: 'Configured runner port or host differs from recorded runner',
-      };
-    }
-
-    const resolved =
-      request.worktreePath ??
-      this.worktreeByAttemptId.get(request.attemptId) ??
-      (await this.options?.resolveWorktreePath?.(request.attemptId)) ??
-      attemptRecord?.worktreePath ??
-      (this.options?.resolveAttempt ? (await this.options.resolveAttempt(request.attemptId))?.worktreePath : null) ??
-      null;
-
-    // L1: never fall back to request.sessionId; refuse!
-    if (!resolved || resolved.trim() === '') {
-      return { outcome: 'refused', reason: 'Worktree directory not resolved for session abort' };
-    }
-
-    const dir = resolved;
+    const dir = guarded.dir;
     let result: SubprocessResult;
     try {
       result = await this.run(
         this.binPath(),
         ['--abort', '--dir', dir],
-        this.remotePortEnv(recordedRunner.remotePort, recordedRunner.host ?? undefined),
+        this.remotePortEnv(guarded.remotePort, guarded.recordedRunner.host ?? undefined),
       );
     } catch (error) {
       return { outcome: 'unknown', reason: `Abort command failed: ${String(error)}` };
@@ -983,6 +869,149 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
         stoppedByRequest: true,
       };
       return { outcome: 'terminated', receipt };
+    }
+    return {
+      outcome: 'still-running',
+      reason: result.stderr || result.stdout || 'Abort did not confirm termination',
+    };
+  }
+
+  /**
+   * The recorded-runner guards shared by inspectSession, stopSession,
+   * inspectWorktreeRun and abortWorktreeRun: resolve the recorded runner,
+   * refuse a missing recorded port, reject unsafe hosts, require the
+   * configured port and host to equal the recorded ones, and resolve the
+   * worktree directory. Returns the verified runner and directory, or a
+   * reason for the refusal.
+   */
+  private async resolveRecordedRunner(
+    ref: {
+      readonly attemptId: string;
+      readonly worktreePath?: string;
+      readonly runner?: AttemptRunnerRecord | null;
+    },
+  ): Promise<
+    | {
+        readonly ok: true;
+        readonly recordedRunner: AttemptRunnerRecord;
+        readonly remotePort: number;
+        readonly dir: string;
+      }
+    | { readonly ok: false; readonly reason: string }
+  > {
+    let recordedRunner = ref.runner;
+    let attemptRecord: AttemptRecord | null = null;
+    if (!recordedRunner && this.options?.resolveAttempt) {
+      attemptRecord = await this.options.resolveAttempt(ref.attemptId);
+      recordedRunner = attemptRecord?.runner ?? null;
+    }
+
+    if (!recordedRunner || recordedRunner.remotePort === null) {
+      return { ok: false, reason: 'Attempt has no recorded runner port' };
+    }
+    const remotePort = recordedRunner.remotePort;
+
+    const configuredPort = this.configuredRemotePort();
+    const configuredHost = this.configuredRemoteHost();
+
+    if (configuredHost !== null && !isSafeSshHost(configuredHost)) {
+      return { ok: false, reason: `Unsafe OCM_HOST configured: ${configuredHost}` };
+    }
+
+    if (
+      recordedRunner.host !== null &&
+      recordedRunner.host !== undefined &&
+      !isSafeSshHost(recordedRunner.host)
+    ) {
+      return { ok: false, reason: `Unsafe recorded runner host: ${recordedRunner.host}` };
+    }
+
+    if (
+      configuredPort !== recordedRunner.remotePort ||
+      (configuredHost ?? null) !== (recordedRunner.host ?? null)
+    ) {
+      return { ok: false, reason: 'Configured runner port or host differs from recorded runner' };
+    }
+
+    const resolved =
+      ref.worktreePath ??
+      this.worktreeByAttemptId.get(ref.attemptId) ??
+      (await this.options?.resolveWorktreePath?.(ref.attemptId)) ??
+      attemptRecord?.worktreePath ??
+      (this.options?.resolveAttempt ? (await this.options.resolveAttempt(ref.attemptId))?.worktreePath : null) ??
+      null;
+
+    if (!resolved || resolved.trim() === '') {
+      return { ok: false, reason: 'Worktree directory not resolved for runner command' };
+    }
+
+    return { ok: true, recordedRunner, remotePort, dir: resolved };
+  }
+
+  /**
+   * What runs in a worktree directory, without a session id: the same
+   * recorded-runner guards as inspectSession, then `ocm-run --status`.
+   * Exit 0 means idle; exit 3 listing exactly one session id means running.
+   * Anything else, including a failed guard or a thrown subprocess, is
+   * unknown.
+   */
+  async inspectWorktreeRun(ref: WorktreeRunRef): Promise<WorktreeRunState> {
+    const guarded = await this.resolveRecordedRunner(ref);
+    if (!guarded.ok) {
+      return { state: 'unknown', reason: guarded.reason };
+    }
+    let result: SubprocessResult;
+    try {
+      result = await this.run(
+        this.binPath(),
+        ['--status', '--dir', guarded.dir],
+        this.remotePortEnv(guarded.remotePort, guarded.recordedRunner.host ?? undefined),
+      );
+    } catch (error) {
+      return { state: 'unknown', reason: `Status command failed: ${String(error)}` };
+    }
+    if (result.exitCode === 0) {
+      return { state: 'idle' };
+    }
+    if (result.exitCode === 3) {
+      const ids = statusSessionIds(result.stdout);
+      if (ids.length === 1) {
+        return { state: 'running', sessionId: ids[0] };
+      }
+      return {
+        state: 'unknown',
+        reason: `status exit 3 listed ${ids.length} sessions (${ids.join(', ') || 'none'})`,
+      };
+    }
+    return {
+      state: 'unknown',
+      reason: `status command exited ${result.exitCode}: ${result.stderr || result.stdout || 'no output'}`,
+    };
+  }
+
+  /**
+   * Abort whatever runs in a worktree directory, by directory: the same
+   * recorded-runner guards and `--abort --dir` call as stopSession. Exit 0
+   * confirms the abort; non-zero exits stay `still-running`, a failed guard
+   * is `refused`, and a thrown subprocess is `unknown`.
+   */
+  async abortWorktreeRun(request: AbortWorktreeRunRequest): Promise<AbortWorktreeRunResult> {
+    const guarded = await this.resolveRecordedRunner(request);
+    if (!guarded.ok) {
+      return { outcome: 'refused', reason: guarded.reason };
+    }
+    let result: SubprocessResult;
+    try {
+      result = await this.run(
+        this.binPath(),
+        ['--abort', '--dir', guarded.dir],
+        this.remotePortEnv(guarded.remotePort, guarded.recordedRunner.host ?? undefined),
+      );
+    } catch (error) {
+      return { outcome: 'unknown', reason: `Abort command failed: ${String(error)}` };
+    }
+    if (result.exitCode === 0) {
+      return { outcome: 'aborted', endedAtIso: new Date().toISOString() };
     }
     return {
       outcome: 'still-running',

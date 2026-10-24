@@ -36,11 +36,13 @@
  *    remote command.
  *  - **There is no ambiguous middle.** A run that ended with a non-empty
  *    response is `started`; exit 1 or 4 (agy failed, or reported a model or
- *    agent error), an empty response, a refused busy worktree (75) and a
- *    timeout or signal kill (no exit code at all) are all failed runs and are
- *    reported `refused` with the exit named. `unknown` is never returned: it
- *    would retain capacity and send the attempt into reconciliation as if a
- *    killed lane might still succeed.
+ *    agent error) or an empty response is a failed run reported `refused`
+ *    with the exit named. A refused busy worktree (75) and a timeout or
+ *    signal kill (no exit code at all) are `blocked`: the reservation is
+ *    kept until `attempt reconcile` or `attempt stop` resolves the
+ *    worktree. `unknown` is never returned: it would retain capacity and
+ *    send the attempt into reconciliation as if a killed lane might still
+ *    succeed.
  *
  * Nothing here is reachable from dispatch until a composition root injects
  * this adapter (lane O14e1); the selector still refuses an agy seat until it
@@ -53,6 +55,8 @@ import { fileURLToPath } from 'node:url';
 
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import type {
+  AbortWorktreeRunRequest,
+  AbortWorktreeRunResult,
   ExecutionRunnerPort,
   RunnerIsolationCapabilities,
   RunnerSessionRef,
@@ -61,6 +65,8 @@ import type {
   StartRunnerSessionResult,
   StopRunnerSessionRequest,
   StopRunnerSessionResult,
+  WorktreeRunRef,
+  WorktreeRunState,
 } from '../../application/ports/out/ExecutionRunnerPort.out-port.js';
 import type { AttemptRecord, AttemptRunnerRecord } from '../../domain/execution-records.js';
 
@@ -373,18 +379,38 @@ export class AgyRunnerAdapter implements ExecutionRunnerPort {
     const result = await this.run(argv, { timeoutMs });
 
     // No exit code at all: the budget expired, the process tree was signalled,
-    // or the script never started. That is a failed run, not an ambiguity, and
-    // `--detach` means the lane may still be running in the worktree.
+    // or the script never started. `--detach` means the lane may still be
+    // running in the worktree, so the start is blocked: the reservation is
+    // kept and reconcile or stop resolve the worktree.
     if (result.exitCode === null) {
       return {
-        outcome: 'refused',
+        outcome: 'blocked',
+        runner: {
+          kind: 'agy',
+          remotePort: null,
+          host: null,
+          agent: null,
+          model,
+          variant: null,
+        },
         reason: `agy run ended without an exit status (${
           result.error ?? result.signal ?? 'unknown cause'
         }); the lane may still be running in the worktree, so inspect it with agy-run --status before retrying`,
       };
     }
     if (result.exitCode === AGY_RUN_EXIT_BUSY) {
-      return { outcome: 'refused', reason: 'Worktree already has an active session (agy-run exit 75)' };
+      return {
+        outcome: 'blocked',
+        runner: {
+          kind: 'agy',
+          remotePort: null,
+          host: null,
+          agent: null,
+          model,
+          variant: null,
+        },
+        reason: 'Worktree already has an active session (agy-run exit 75)',
+      };
     }
     if (result.exitCode !== 0) {
       return {
@@ -474,6 +500,82 @@ export class AgyRunnerAdapter implements ExecutionRunnerPort {
           stoppedByRequest: true,
         },
       };
+    }
+    if (result.exitCode === null) {
+      return {
+        outcome: 'unknown',
+        reason: `agy-run --abort ended without an exit status: ${
+          result.error ?? result.signal ?? 'unknown cause'
+        }`,
+      };
+    }
+    return {
+      outcome: 'still-running',
+      reason: result.stderr || result.stdout || 'agy-run --abort did not confirm termination',
+    };
+  }
+
+  /**
+   * What runs in a worktree directory, without a session id: `agy-run
+   * --status` on the recorded agy lane's worktree. Exit 0 means idle; exit 3
+   * means running with the session id convention `startSession` already uses.
+   * Anything else, including a ref that is not an agy lane, is unknown.
+   */
+  async inspectWorktreeRun(ref: WorktreeRunRef): Promise<WorktreeRunState> {
+    const worktreePath = await this.agyWorktreePath(ref);
+    if (worktreePath === null) {
+      return { state: 'unknown', reason: 'Not an agy lane worktree' };
+    }
+    let result: {
+      readonly exitCode: number | null;
+      readonly signal: string | null;
+      readonly stdout: string;
+      readonly stderr: string;
+      readonly error?: string;
+    };
+    try {
+      result = await this.run([this.binPath(), '--status', '--dir', worktreePath]);
+    } catch (error) {
+      return { state: 'unknown', reason: `Status command failed: ${String(error)}` };
+    }
+    if (result.exitCode === 0) {
+      return { state: 'idle' };
+    }
+    if (result.exitCode === 3) {
+      return { state: 'running', sessionId: `agy-${ref.attemptId}` };
+    }
+    return {
+      state: 'unknown',
+      reason: `status command exited ${result.exitCode}: ${result.stderr || result.stdout || 'no output'}`,
+    };
+  }
+
+  /**
+   * Abort whatever runs in a worktree directory, by directory: `agy-run
+   * --abort` on the recorded agy lane's worktree, mapped like stopSession.
+   * Exit 0 confirms the abort; non-zero exits stay `still-running`, a ref
+   * that is not an agy lane is `refused`, and a thrown subprocess is
+   * `unknown`.
+   */
+  async abortWorktreeRun(request: AbortWorktreeRunRequest): Promise<AbortWorktreeRunResult> {
+    const worktreePath = await this.agyWorktreePath(request);
+    if (worktreePath === null) {
+      return { outcome: 'refused', reason: 'Worktree directory not resolved for agy worktree abort' };
+    }
+    let result: {
+      readonly exitCode: number | null;
+      readonly signal: string | null;
+      readonly stdout: string;
+      readonly stderr: string;
+      readonly error?: string;
+    };
+    try {
+      result = await this.run([this.binPath(), '--abort', '--dir', worktreePath]);
+    } catch (error) {
+      return { outcome: 'unknown', reason: `Abort command failed: ${String(error)}` };
+    }
+    if (result.exitCode === 0) {
+      return { outcome: 'aborted', endedAtIso: new Date().toISOString() };
     }
     if (result.exitCode === null) {
       return {

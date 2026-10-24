@@ -37,6 +37,24 @@ export interface ReconcileAttemptDependencies {
 type JournalEntryDraft = Omit<ActionJournalEntryRecord, 'id'>;
 
 /** Append one journal entry with an identity derived from the attempt's history. */
+/**
+ * True when `detail` names `sessionId` as a whole token: the id is bounded by
+ * the start or end of the text or by a character that cannot be part of a
+ * session id, so `ses_a` never matches inside `ses_ab`.
+ */
+export function detailNamesSession(detail: string, sessionId: string): boolean {
+  if (sessionId.length === 0) return false;
+  const isIdChar = (ch: string | undefined): boolean =>
+    ch !== undefined && /[A-Za-z0-9_-]/.test(ch);
+  let from = 0;
+  for (;;) {
+    const at = detail.indexOf(sessionId, from);
+    if (at < 0) return false;
+    if (!isIdChar(detail[at - 1]) && !isIdChar(detail[at + sessionId.length])) return true;
+    from = at + 1;
+  }
+}
+
 async function appendJournalEntry(
   journal: ExecutionJournalPort,
   draft: JournalEntryDraft,
@@ -82,6 +100,49 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
     try {
       const nowIso = request.nowIso ?? new Date().toISOString();
 
+    // A terminal attempt is already resolved (minor 7): reconciling it could
+    // write it back into a claiming state. Refuse before any runner contact
+    // or attempt change. A crash between saving a terminal record and
+    // releasing its capacity reservation (the blocked-idle path below, or the
+    // `ended` path) would otherwise leave the reservation held forever, so it
+    // is released here for `cancelled`, `collected`, and `ended` with an
+    // authoritative completion receipt; the release is a no-op when nothing is
+    // held. An `ended` attempt without an authoritative completion receipt
+    // refuses before any runner contact, saves nothing, appends no journal
+    // entry, and keeps its reservation held. The retry path's own check below
+    // stays.
+    if (
+      attempt.state === 'cancelled' ||
+      attempt.state === 'collected' ||
+      (attempt.state === 'ended' && attempt.completionReceipt?.authoritative === true)
+    ) {
+      const released = await deps.journal.releaseCapacityReservation(attempt.id, nowIso);
+      if (released) {
+        await appendJournalEntry(deps.journal, {
+          attemptId: attempt.id,
+          workOrderId: attempt.workOrderId,
+          action: 'reconcile',
+          baseCommit: attempt.baseCommit,
+          recordedAtIso: nowIso,
+          status: 'completed',
+          sessionId: attempt.sessionId ?? null,
+          detail: `Released a capacity reservation still held by terminal attempt (${attempt.state})`,
+        });
+      }
+      return {
+        outcome: 'refused',
+        reason: `Attempt ${attempt.id} is in terminal state '${attempt.state}' and cannot be reconciled${
+          released ? '; a reservation it still held was released' : ''
+        }`,
+      };
+    }
+    if (attempt.state === 'ended') {
+      return {
+        outcome: 'refused',
+        reason: `Attempt ${attempt.id} ended without an authoritative completion receipt and cannot be reconciled; its reservation stays held`,
+      };
+    }
+
     // Resolve the runner through the attempt's recorded host (H9b1). A
     // recorded host that changed or was removed refuses, naming the recorded
     // host, before any state change or runner contact.
@@ -94,6 +155,176 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
         return { outcome: 'refused', reason: selection.reason };
       }
       runner = selection.runner;
+    }
+
+    // A session-less attempt in a claiming state (dispatching, reconciling,
+    // blocked) keeps its reservation; the worktree may still be running a
+    // lane. Resolve it by directory, not by session id. A session-less
+    // `intent-recorded` attempt keeps the fallback below. An idle `dispatching`
+    // worktree is not proof the start failed (`DispatchAttemptUseCase` saves
+    // `dispatching` before awaiting the runner start), so reconcile leaves it
+    // and its reservation untouched (`attempt stop` is the explicit operator
+    // exit for a crashed dispatch; `StopAttemptUseCase` is unchanged).
+    if (
+      !attempt.sessionId &&
+      (attempt.state === 'dispatching' || attempt.state === 'reconciling' || attempt.state === 'blocked')
+    ) {
+      if (!runner.inspectWorktreeRun) {
+        return {
+          outcome: 'unknown',
+          attempt,
+          reason: 'Runner cannot inspect a worktree without a session',
+        };
+      }
+      const worktreeState = await runner.inspectWorktreeRun({
+        attemptId: attempt.id,
+        worktreePath: attempt.worktreePath,
+        runner: attempt.runner,
+      });
+      // Journal details and result reasons name the actual state, not always
+      // 'blocked' (brief-fix2 item 1a).
+      const stateLabel = `${attempt.state[0]!.toUpperCase()}${attempt.state.slice(1)}`;
+
+      if (worktreeState.state === 'idle') {
+        if (attempt.state === 'dispatching') {
+          const reason =
+            "Nothing runs in the dispatching attempt's worktree yet; a start may still be in progress. Run 'attempt reconcile' again later, or 'attempt stop' to cancel it";
+          await appendJournalEntry(deps.journal, {
+            attemptId: attempt.id,
+            workOrderId: attempt.workOrderId,
+            action: 'reconcile',
+            baseCommit: attempt.baseCommit,
+            recordedAtIso: nowIso,
+            status: 'ambiguous',
+            sessionId: null,
+            detail: reason,
+          });
+          return {
+            outcome: 'unknown',
+            attempt,
+            reason,
+          };
+        }
+
+        const cancelled: AttemptRecord = {
+          ...attempt,
+          revision: nextAttemptRevision(attempt),
+          state: 'cancelled',
+          outcome: 'stopped',
+          updatedAtIso: nowIso,
+        };
+        await deps.attemptRepo.saveAttempt(cancelled);
+        await deps.journal.releaseCapacityReservation(attempt.id, nowIso);
+        await appendJournalEntry(deps.journal, {
+          attemptId: attempt.id,
+          workOrderId: attempt.workOrderId,
+          action: 'reconcile',
+          baseCommit: attempt.baseCommit,
+          recordedAtIso: nowIso,
+          status: 'completed',
+          sessionId: null,
+          detail: `Nothing runs in the ${attempt.state} attempt's worktree; cancelled and capacity released`,
+        });
+        return {
+          outcome: 'cancelled',
+          attempt: cancelled,
+          reason: `Nothing runs in the ${attempt.state} attempt's worktree; cancelled and capacity released`,
+        };
+      }
+
+      if (worktreeState.state === 'running') {
+        const observedId = worktreeState.sessionId;
+        // Adoption has an ownership check (brief-fix2 item 2b): the id is
+        // adopted only when this attempt's own history named it — a journal
+        // entry for this attempt with sessionId === id, or an ambiguous
+        // DISPATCH entry whose detail names the id as a whole token (how an
+        // ambiguous start records the session it may have created). Reconcile
+        // and stop entries never name: a refusal below writes the id into its
+        // own detail, and that must not make the next reconcile adopt it. An
+        // id that appears only in a blocked entry's observedSessionIds is
+        // evidence, never proof, and never names. The agy runner reports only
+        // that a lane runs and derives a synthetic id from the attempt id, so
+        // that id is never adoptable.
+        const syntheticAgyId = `agy-${attempt.id}`;
+        let refusalReason: string | undefined;
+        if (observedId.length === 0) {
+          refusalReason = `Worktree runs a lane that reports no session id, which attempt ${attempt.id} cannot adopt; run 'attempt stop' to abort it`;
+        } else if (observedId === syntheticAgyId) {
+          refusalReason = `Worktree runs session ${observedId}, which attempt ${attempt.id} never started; run 'attempt stop' to abort it`;
+        } else {
+          const history = await deps.journal.listJournalEntriesForAttempt(attempt.id);
+          const namedByHistory =
+            history.some((entry) => entry.sessionId === observedId) ||
+            history.some(
+              (entry) =>
+                entry.action === 'dispatch' &&
+                entry.status === 'ambiguous' &&
+                entry.detail !== null &&
+                detailNamesSession(entry.detail, observedId),
+            );
+          if (!namedByHistory) {
+            refusalReason = `Worktree runs session ${observedId}, which attempt ${attempt.id} never started; run 'attempt stop' to abort it`;
+          }
+        }
+        if (refusalReason !== undefined) {
+          // Not adoptable: no save, the reservation stays held, and the
+          // operator is pointed at 'attempt stop'.
+          await appendJournalEntry(deps.journal, {
+            attemptId: attempt.id,
+            workOrderId: attempt.workOrderId,
+            action: 'reconcile',
+            baseCommit: attempt.baseCommit,
+            recordedAtIso: nowIso,
+            status: 'ambiguous',
+            sessionId: null,
+            detail: refusalReason,
+          });
+          return { outcome: 'unknown', attempt, reason: refusalReason };
+        }
+        const running: AttemptRecord = {
+          ...attempt,
+          revision: nextAttemptRevision(attempt),
+          state: 'running',
+          sessionId: observedId,
+          updatedAtIso: nowIso,
+        };
+        await deps.attemptRepo.saveAttempt(running);
+        await appendJournalEntry(deps.journal, {
+          attemptId: attempt.id,
+          workOrderId: attempt.workOrderId,
+          action: 'reconcile',
+          baseCommit: attempt.baseCommit,
+          recordedAtIso: nowIso,
+          status: 'completed',
+          sessionId: observedId,
+          detail: `${stateLabel} attempt adopted the session running in its worktree: ${observedId}`,
+        });
+        return {
+          outcome: 'active',
+          attempt: running,
+          status: {
+            runnerReachable: 'reachable',
+            workspacePreparation: 'prepared',
+            workerCommand: 'active',
+            completionReceipt: null,
+            artifactsCollected: false,
+          },
+        };
+      }
+
+      // unknown: nothing is established, so nothing is written and the
+      // reservation stays held.
+      await appendJournalEntry(deps.journal, {
+        attemptId: attempt.id,
+        workOrderId: attempt.workOrderId,
+        action: 'reconcile',
+        baseCommit: attempt.baseCommit,
+        recordedAtIso: nowIso,
+        status: 'ambiguous',
+        sessionId: null,
+        detail: worktreeState.reason,
+      });
+      return { outcome: 'unknown', attempt, reason: worktreeState.reason };
     }
 
     if (!attempt.sessionId) {

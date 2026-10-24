@@ -410,7 +410,7 @@ bounded_contexts:
       AttemptRepositoryPort: "Persist immutable dispatch identity and guarded lifecycle updates; return known absence separately from unreadable state."
       ExecutionJournalPort: "Atomically record intent, capacity and action receipts; a host has one designated dispatcher until shared arbitration is implemented."
       BriefAuthoringPort: "Obtain a project orchestrator's brief or a hand-written file without introducing provider inference into the control plane."
-      ExecutionRunnerPort: "Start, inspect and stop a matching attempt/session with explicit capabilities and strict per-lane directory isolation."
+      ExecutionRunnerPort: "Start, inspect and stop a matching attempt/session with explicit capabilities and strict per-lane directory isolation; a busy-worktree start is blocked and keeps its reservation until reconcile or stop resolves the worktree, and a worktree can be inspected or aborted by directory without a session id."
       RunnerSelectorPort: "Given the installation's lane-runner hosts and the attempt's seat tool, return the runner kind and host to use; a kind without an implemented adapter is refused as runner-not-available."
       AllowedSeatPort: "Given the installation's seat catalogue and policy.useFreeSeats, decide whether a dispatch seat (tool, model, variant) or a reviewer model may be used; with the flag false only seats that are all not free are allowed, and an unknown or mixed match is refused."
       RunnerForAttemptPort: "Given the attempt's recorded runner block, return the runner that addresses the recorded host; a host that changed, was renamed or was removed is refused naming the recorded host, and a legacy attempt keeps the single legacy runner."

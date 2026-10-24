@@ -775,7 +775,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       }
       const freshIsTerminal =
         fresh.state === 'cancelled' || fresh.state === 'collected' || fresh.state === 'ended';
-      if (freshIsTerminal || fresh.sessionId !== null) {
+      if (freshIsTerminal || (fresh.sessionId !== null && fresh.sessionId !== sessionId)) {
         // Someone else ended the attempt or recorded another session while
         // this call started one. The new session is never attached to that
         // record (reconcile would demote a terminal state or release capacity
@@ -802,6 +802,11 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           detail: reason,
         });
         return { kind: 'conflict', result: { outcome: 'unknown', attempt: fresh, reason } };
+      }
+      if (fresh.sessionId === sessionId) {
+        // The fresh record already carries the session this dispatch started:
+        // it is recorded, so there is nothing to stop and nothing to save.
+        return { kind: 'saved', stored: fresh };
       }
       {
         // A non-terminal record without a session: the state stays whatever

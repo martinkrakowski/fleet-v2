@@ -3458,6 +3458,48 @@ describe('attempt revision compare-and-swap retry', () => {
     expect(journal.heldFor('attempt-1')).toBe(true);
   });
 
+  it('dispatch running-save conflicts with a fresh record already carrying the started session: no stop, treated as recorded', async () => {
+    const freshRecorded = storedAttempt({
+      state: 'running',
+      sessionId: 'session-1',
+      revision: 5,
+      updatedAtIso: '2026-10-15T08:06:00.000Z',
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      conflictOnSave: 2,
+      freshAfterConflict: freshRecorded,
+    });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner(); // default start: started with session-1
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('started');
+    expect(runner.startCalls).toHaveLength(1);
+    expect(runner.stopCalls).toHaveLength(0);
+    expect(attemptRepo.saveCalls).toBe(2);
+    expect(attemptRepo.attempts.get('attempt-1')).toEqual(freshRecorded);
+    if (result.outcome === 'started') {
+      expect(result.attempt).toEqual(freshRecorded);
+      expect(result.sessionId).toBe('session-1');
+    }
+  });
+
   it('dispatch refused start conflicts with a foreign re-dispatching record: refused, no cancelled save, capacity kept', async () => {
     const freshDispatching = storedAttempt({
       state: 'dispatching',

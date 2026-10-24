@@ -36,6 +36,9 @@ This project is a generated, CLI-first hexagonal scaffold. Read
 - `@fleet/api` is a Nitro server started from `apps/api/.output/server/index.mjs`.
   Its runtime bootstrap plugin reads `FLEET_STATE_DIR`; without it the API stays
   unconfigured rather than silently serving empty state.
+  It refuses to start (exit 1) unless its listen host (`NITRO_HOST`, else `HOST`) is
+  loopback, or `FLEET_API_ALLOW_REMOTE=1` is set explicitly; the `dev` and `preview`
+  scripts set `HOST=127.0.0.1`. `/health` answers unauthenticated with no configuration detail.
 
 ## Live runner and worktree configuration
 

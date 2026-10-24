@@ -1,0 +1,12 @@
+# gitleaks configuration: the default rules, plus narrow allowlists for known test fixtures and
+# placeholders. Each entry names the file AND the rule, so a different kind of leak in the same
+# file is still caught. Add an entry only for a reviewed fixture, never for a real value.
+title = "fleet-v2"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "brief-knowledge redaction tests: an expired, unsigned JWT fixture"
+targetRules = ["jwt"]
+paths = ['''^packages/brief-knowledge/src/infrastructure/adapters/__tests__/git-shelf-provider\.test\.ts$''']

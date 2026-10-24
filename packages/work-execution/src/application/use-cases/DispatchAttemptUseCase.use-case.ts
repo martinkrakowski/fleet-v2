@@ -703,9 +703,30 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     nowIso: string,
   ): Promise<RunningSaveOutcome> {
     const deps = this.deps!;
+    const alreadyRecorded = (record: AttemptRecord): RunningSaveOutcome => {
+      // The record already carries the session this dispatch started: nothing
+      // to stop and nothing to save. A non-terminal record is the started
+      // attempt; a terminal one is reported as unknown, never as started.
+      if (record.state === 'cancelled' || record.state === 'collected' || record.state === 'ended') {
+        return {
+          kind: 'conflict',
+          result: {
+            outcome: 'unknown',
+            attempt: record,
+            reason: `Attempt ${record.id} is in state ${record.state} with session ${sessionId} already recorded`,
+          },
+        };
+      }
+      return { kind: 'saved', stored: record };
+    };
     const handleSecondConflict = async (): Promise<RunningSaveOutcome> => {
       // A second revision conflict while a started session is live must not
-      // leave it running and unrecorded: stop it once and journal the id.
+      // leave it running and unrecorded: stop it once and journal the id,
+      // unless the winning write already recorded this very session.
+      const winner = await deps.attemptRepo.findAttemptById(runningAttempt.id);
+      if (winner !== null && winner.sessionId === sessionId) {
+        return alreadyRecorded(winner);
+      }
       const stopResult = await deps.runner.stopSession({
         attemptId: runningAttempt.id,
         sessionId,
@@ -738,10 +759,15 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         return handleSecondConflict();
       }
     };
-    const savePreservedOrHandleConflict = async (preserved: AttemptRecord): Promise<RunningSaveOutcome> => {
+    const savePreservedOrHandleConflict = async (
+      preserved: AttemptRecord,
+      reason: string,
+    ): Promise<RunningSaveOutcome> => {
       try {
         await deps.attemptRepo.saveAttempt(preserved);
-        return { kind: 'saved', stored: preserved };
+        // The session is recorded on someone else's state, so the dispatch
+        // is reported as unknown (reconcile decides), never as started.
+        return { kind: 'conflict', result: { outcome: 'unknown', attempt: preserved, reason } };
       } catch (error) {
         if (!(error instanceof AttemptRevisionConflictError)) {
           throw error;
@@ -773,9 +799,12 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         };
         return saveRebuiltOrHandleConflict(rebuilt);
       }
+      if (fresh.sessionId === sessionId) {
+        return alreadyRecorded(fresh);
+      }
       const freshIsTerminal =
         fresh.state === 'cancelled' || fresh.state === 'collected' || fresh.state === 'ended';
-      if (freshIsTerminal || (fresh.sessionId !== null && fresh.sessionId !== sessionId)) {
+      if (freshIsTerminal || fresh.sessionId !== null) {
         // Someone else ended the attempt or recorded another session while
         // this call started one. The new session is never attached to that
         // record (reconcile would demote a terminal state or release capacity
@@ -803,11 +832,6 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         });
         return { kind: 'conflict', result: { outcome: 'unknown', attempt: fresh, reason } };
       }
-      if (fresh.sessionId === sessionId) {
-        // The fresh record already carries the session this dispatch started:
-        // it is recorded, so there is nothing to stop and nothing to save.
-        return { kind: 'saved', stored: fresh };
-      }
       {
         // A non-terminal record without a session: the state stays whatever
         // someone else set it to; only the session is recorded so reconcile
@@ -830,7 +854,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           sessionId,
           detail: reason,
         });
-        return savePreservedOrHandleConflict(preserved);
+        return savePreservedOrHandleConflict(preserved, reason);
       }
     }
   }
@@ -876,7 +900,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       }
       const reason =
         fresh.state === 'dispatching'
-          ? `Attempt ${cancelledAttempt.id} attempt re-dispatched concurrently while refusing dispatch; capacity not released`
+          ? `Attempt ${cancelledAttempt.id} was re-dispatched concurrently while refusing dispatch; capacity not released`
           : `Attempt ${cancelledAttempt.id} changed to ${fresh.state} while refusing dispatch; capacity not released`;
       await appendJournalEntry(deps.journal, {
         attemptId: cancelledAttempt.id,
@@ -888,7 +912,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         sessionId: null,
         detail:
           fresh.state === 'dispatching'
-            ? `Refused dispatch start found attempt ${cancelledAttempt.id} attempt re-dispatched concurrently`
+            ? `Refused dispatch start found attempt ${cancelledAttempt.id} re-dispatched concurrently`
             : `Refused dispatch start found attempt ${cancelledAttempt.id} in state ${fresh.state}`,
       });
       return { outcome: 'refused', reason };

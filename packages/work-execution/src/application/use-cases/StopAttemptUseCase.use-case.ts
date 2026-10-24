@@ -299,7 +299,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
         throw error;
       }
       const fresh = await this.deps!.attemptRepo.findAttemptById(attempt.id);
-      if (fresh && !canOverwriteAfterConflict(fresh, ['running', 'reconciling', 'dispatching'])) {
+      if (fresh && !canOverwriteAfterConflict(fresh, ['running', 'reconciling', 'dispatching'], attempt)) {
         return fresh;
       }
       const rebuilt = build(fresh ?? attempt);

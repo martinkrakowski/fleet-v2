@@ -6,26 +6,31 @@ Approved work becomes a frozen brief, a disposable lane, a commit, verification,
 
 Fleet is a CLI-first modular system in four bounded contexts, built on a hexagonal architecture generated and checked by [Hexagen](https://github.com/hexagen-monaco/hexagen-monaco) from `.architecture/manifest.yaml`. Domain code is pure. Application code depends on ports. Filesystem, subprocess, network and vendor code live in infrastructure adapters.
 
-## Status (2026-10-15)
+## Status (2026-10-24)
 
-The four contexts, the CLI, the HTTP API and the web app build, typecheck, lint, pass the architecture lint and the test suite, and match the manifest. The end-to-end workflow runs across separate CLI processes on one state directory, from profile registration to an authorised merge.
+The contexts, the CLI, the HTTP API, the MCP server and the web app build, typecheck, lint, pass the architecture lint and the test suite, and match the manifest. The end-to-end workflow runs across separate CLI processes on one state directory, from profile registration to an authorised merge.
 
-What each boundary does today:
+"Not wired" below means the port and an adapter exist, but no composition root (`apps/cli`, `apps/api`) binds the adapter yet, so the boundary refuses or reports its own absence.
 
 | Boundary | State |
 |---|---|
-| Lane dispatch, status, stop | Live. Wraps the bundled `bin/ocm-run` (override with `FLEET_OCM_RUN_BIN`; remote host from `OCM_HOST`) with an argument array and an environment allow-list. Status comes from the lane server, never from the local watcher. |
-| Worktree inspection, brief placement, artifact collection | Live, over SSH to the host that owns the worktrees. A brief is placed only under an ignored path. Commits are counted against the pre-dispatch tip. |
-| Verification checks | The adapter runs only allow-listed procedures mapped to executables, and never interpolates a command string. The shipped composition root configures no allow-list yet, so every check reports that it cannot run. |
-| Pull request create and merge | Live through `gh`, and only after acceptance of the exact candidate head. A moved head is refused. |
-| Durable state (work orders, attempts, journal, evidence, receipts, keepers) | File-backed under `--state-dir` / `FLEET_STATE_DIR`, written atomically. Without a state directory every store is in-memory and the process is disposable. |
-| Independent review | Port and independence checks exist (the reviewer's model must differ from the implementer's). No review transport is configured yet, so requests report `unavailable`. |
-| Forge evidence (CI state, unresolved threads) | Port exists; no `gh pr checks` transport is bound yet, so evidence reads as `unknown`. |
-| Waves observations, decisions, relays, attention | Observations and relays go to local outbox directories; decisions are read from local answer files; attention reads report absence. The HTTP adapter to a live Waves service is not wired. |
-| Knowledge shelf | Keepers append to a local shelf file under the state directory. Publication to an external shelf is not wired. |
-| Web app | Views read fixtures; `api-client.ts` exists and is not yet used by pages. Every mutating action opens a confirmation first. |
-| Staging | A deployment script for a Kubernetes namespace is in `deploy/staging/` (`yarn staging:deploy --yes`). It reads its target from `deploy/staging/staging.env` (see the tracked `staging.env.example`) and deploys into the namespace `fleet-v2-staging`. |
-| Continuous integration | GitHub Actions workflow `.github/workflows/gate.yml` runs the gate checks on pull requests and main. |
+| Lane dispatch, status, stop | Live through the bundled `bin/ocm-run`, with an argument array and an environment allow-list. A busy worktree (exit 75) is a refusal. Status comes from the lane server, never from the local watcher. A start that is refused or blocked keeps its capacity reservation, and an attempt with no recorded session is reconciled or stopped by its worktree directory. |
+| agy (Antigravity CLI) lanes | `bin/agy-run` runs a headless agy lane with a fixed prompt that reads the brief; `bin/agy-round` drives one fix round in a container clone. The `AgyRunnerAdapter` exists but is not wired: dispatch always uses `ocm-run`. |
+| Worktree inspection, brief placement, artifact collection | Live, locally or over SSH to the attempt's recorded host. Every caller-supplied worktree path is checked against the worktree root. A brief is placed only under a path proven gitignored. Artifacts are collected only against a completion receipt bound to the attempt. |
+| Lane diff gate | `scripts/lane-diff-check.sh` reviews a lane's diff before its output is committed: protected paths (agent, editor, package-manager and git files, `scripts/lane-diff-check.protected`), git filter drivers, symlink escapes, credential-shaped strings and files outside the brief. It prints file, line and pattern name, never a matched value. The operator runs it; the TypeScript port mirrors its rules and is not wired. |
+| Verification checks | Runs only the procedures the installation allow-lists, mapped to executables, never a command string. With no installation every check reports `unknown`. |
+| Pull request create and merge | Live in the CLI through `gh` from fixed paths, only after acceptance of the exact candidate head; merges are pinned to that head. Not wired in the API. |
+| Durable state | File-backed under `--state-dir` / `FLEET_STATE_DIR`: JSON under a file lock, atomic writes, and a revision check that refuses a stale attempt write. Without a state directory every store is in-memory and the process is disposable. |
+| Usage | `attempt usage` reads a finished attempt's tokens and cost from the lane server's database on the recorded host and saves them on the attempt. Not exposed by the API. |
+| Evidence and acceptance | Review receipts, verification receipts and finding dispositions are validated before they are stored. Every reported finding starts unresolved and blocks acceptance until a disposition is recorded. The independent review transport is not wired, so review requests report `unavailable`; the reviewer's model must differ from the implementer's. |
+| Forge evidence (CI state, unresolved threads) | Read through `gh` when the installation configures a GitHub forge; otherwise `unknown` or `not-configured`. |
+| Waves observations, decisions, relays, attention | Observations and relays go to local outbox directories; signed decisions are read from local answer files; attention reads report absence. The HTTP adapter to a live Waves service is not wired. |
+| Knowledge shelf | Keepers append to a local shelf file under the state directory. The git shelf provider is not wired. |
+| HTTP API | Nitro. Refuses to start on a non-loopback host unless `FLEET_API_ALLOW_REMOTE=1`. `/health` answers without auth. Every `/v1` route needs a bearer token from `FLEET_API_TOKEN_FILE` and an allowed Origin, and stays `501` until a state directory and token are configured. |
+| MCP server | `apps/mcp`, stdio. Every tool calls the API's `/v1` routes; without `FLEET_API_URL` and `FLEET_API_TOKEN_FILE` it answers "not configured". |
+| Web app | Views read fixtures; `api-client.ts` exists and pages do not use it yet. Every mutating action opens a confirmation first. |
+| Container image and staging | `build-image.yml` builds the image on pull requests and scans it; on `main` it pushes by digest, scans again, writes an SBOM and signs it. It never deploys: staging runs a digest pinned in the operator's platform repository. `deploy/staging/` holds a manual deploy script whose targets come from `staging.env` (see `staging.env.example`). |
+| Continuous integration | `gate.yml` runs the gate below plus the model-family fixture check and the shell tests. `gitleaks.yml` scans for secrets. |
 
 Every boundary above that is not yet wired refuses or reports its own absence rather than inventing an answer. That is by design: an unconfigured port is never an implicit pass.
 
@@ -38,8 +43,12 @@ Every boundary above that is not yet wired refuses or reports its own absence ra
 | `packages/brief-knowledge` | Candidate notes, checked lessons, lexical retrieval with a budget, and brief context selection |
 | `packages/operator-coordination` | Project profiles and capabilities, scoped decisions, relays, observations, and the Waves anti-corruption boundary |
 | `packages/ui` | Presentation primitives shared by the web app |
+| `packages/installation` | Loading and validating the operator's installation file |
+| `packages/onboarding` | `init`, `doctor`, `hosts` and `seats`: setting up and checking an installation |
+| `packages/tooling` | Detecting the agent CLIs a host offers (opencode, agy, Claude Code, Grok) |
+| `packages/shared` | Small pure helpers shared across contexts (host names, secret patterns, decision types) |
 
-`apps/cli` is the operator entry point and the composition root. `apps/api` (Nitro) and `apps/web` (Next.js) are the operator surfaces. They call application ports and own no domain rules.
+`apps/cli` is the operator entry point and a composition root. `apps/api` (Nitro, its own composition root), `apps/mcp` (an MCP server over the API) and `apps/web` (Next.js) are the operator surfaces. They call application ports and own no domain rules.
 
 Dependency direction, trust rules and the migration order are in [docs/architecture.md](docs/architecture.md). How the tree was generated is in [docs/scaffold-verification.md](docs/scaffold-verification.md). Runbooks for a first run, reconciling an attempt and checking runner readiness are under [docs/runbooks](docs/runbooks).
 
@@ -68,7 +77,9 @@ FLEET_STATE_DIR=./.fleet/state yarn workspace @fleet/api dev        # http://loc
 FLEET_API_URL=http://localhost:3001 yarn workspace @fleet/web dev    # http://localhost:3000
 ```
 
-Without `FLEET_STATE_DIR` the API answers `501` for every use case instead of serving empty state.
+The API's `dev` and `preview` scripts listen on `127.0.0.1`. Without `FLEET_STATE_DIR` and `FLEET_API_TOKEN_FILE` it answers `501` for every use case instead of serving empty state. To listen on another address (inside a container, say), set `HOST` and `FLEET_API_ALLOW_REMOTE=1`; without the flag it refuses to start.
+
+`node apps/cli/dist/bin.js --help` lists every command group: work orders, briefs, capacity, attempts, the forge, evidence, knowledge, decisions, coordination, questions, and the installation commands `init`, `doctor`, `hosts` and `seats`.
 
 ## Configuration
 
@@ -82,7 +93,15 @@ These values belong to the operator's installation, never to this repository.
 | `FLEET_RUNNER_AGENT`, `FLEET_RUNNER_MODEL`, `FLEET_RUNNER_VARIANT` | The runner seat. The model and variant are recorded in the frozen brief manifest. |
 | `OCM_REMOTE_PORT` | The single port passed to the runner subprocess. |
 | `FLEET_FORGE_PUSH_ORIGIN`, `FLEET_PR_TITLE`, `FLEET_PR_BODY`, `FLEET_PR_DELETE_BRANCH` | Forge settings used by `gh` after acceptance. |
-| `FLEET_API_URL`, `NEXT_PUBLIC_FLEET_API_URL` | Base URL for the web app's HTTP API client (`api-client.ts`). Pages currently render fixtures. |
+| `FLEET_API_URL`, `NEXT_PUBLIC_FLEET_API_URL` | Base URL of the HTTP API for the MCP server and the web app's client (`api-client.ts`). Pages currently render fixtures. |
+| `FLEET_API_TOKEN_FILE` | File holding the API's bearer token, read by the API, the MCP server and the web client. |
+| `FLEET_API_ALLOWED_ORIGINS` | Origins the API accepts. |
+| `FLEET_API_ALLOW_REMOTE` | `1` lets the API listen on a non-loopback host. |
+| `FLEET_OWNER_PUBLIC_KEY` | Public key that verifies signed decisions. |
+| `OCM_HOST` | SSH target `bin/ocm-run` uses for its tunnel to the lane server. |
+| `FLEET_OCM_RUN_BIN`, `FLEET_USAGE_NODE_BIN` | Overrides for the runner binary and for the node binary that reads usage on the runner host. |
+| `AGY_BIN` | The agy binary `bin/agy-run` runs, set on the lane host. |
+| `AGY_ROUND_SSH`, `AGY_ROUND_ROOT`, `AGY_ROUND_GUARD_SSH`, `AGY_ROUND_GUARD_CMD` | Where `bin/agy-round` finds the lane container, its clones, and the hash check. No defaults. |
 
 Put installation data (hosts, paths, project registries, model seats, variants, fallbacks, capacities, service URLs) under the ignored `installation/` directory. Runtime artifacts belong under `.fleet/`. Lane briefs and notes stay in ignored paths inside the lane's own worktree.
 
@@ -95,12 +114,15 @@ yarn lint
 yarn lint:arch
 yarn test
 yarn sync:check
+yarn test:bin
 ```
 
 `yarn sync:check` proves the tree still matches the manifest. Change the manifest before adding a context, port, use case or adapter, then regenerate with `yarn sync`. Root files are protected; pass `--force-root` only when their templates should be rewritten.
 
 ## Trust boundaries
 
+- Every path a caller supplies for a worktree, a brief or an artifact is resolved against the worktree root and refused if it escapes.
+- A lane's output is reviewed by the lane diff gate before it is committed, and the bundled runner scripts are pinned by SHA-256 in `scripts/*-hash.txt`.
 - Lanes run in scoped worktrees or sandboxes. They never receive provider credentials, and they cannot push, open pull requests, merge, or reach Waves or the knowledge shelf.
 - The provider boundary is a host-side key proxy outside this product. Tool deny-lists and prompt text do not substitute for runtime isolation.
 - A signed Waves decision proves a scoped answer; the controller still checks applicability, revision, action scope and prior consumption. Silence is not approval. A Waves outage must not corrupt an attempt.
@@ -111,7 +133,7 @@ yarn sync:check
 
 Waves stays an independently usable product: projects publish versioned observations, and signed decisions bind a particular proposal and revision. Fleet consumes those contracts through an adapter and never merges Waves' source.
 
-This repository is the distribution of a process that first ran as shell scripts in a private workshop. Those scripts move behind typed ports one workflow at a time, after the port exists and the behaviour is proved against the current command. Until the operator declares a workflow moved, the script remains the live path for it. The bundled `bin/ocm-run` derives from the workshop copy and differs on purpose: it has `--help`, rewrites `--model=` to `-m`, and sets no default `OCM_HOST`. `scripts/ocm-run-hash.txt` pins the bundled copy.
+This repository is the distribution of a process that first ran as shell scripts in a private workshop. Those scripts move behind typed ports one workflow at a time, after the port exists and the behaviour is proved against the current command. Until the operator declares a workflow moved, the script remains the live path for it. The bundled `bin/ocm-run` derives from the workshop copy and differs on purpose: it has `--help`, rewrites `--model=` to `-m`, and sets no default `OCM_HOST`. `scripts/ocm-run-hash.txt` pins the bundled copy, as `scripts/agy-run-hash.txt` pins `bin/agy-run`.
 
 ## Contributing
 

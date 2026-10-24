@@ -2,8 +2,9 @@
 
 - **Date:** 2026-10-24
 - **Target repository:** `fleet-v2`
-- **Status:** draft for the owner's decisions (§6). Nothing built. Inventory checked against `main`
-  at `7dce304` on 2026-10-24 (§2).
+- **Status:** decided, nothing built. D1–D6 decided by the owner on 2026-10-24 ("Proceed with your
+  recommendations"), each as recommended (§6). Inventory checked against `main` at `7dce304` on
+  2026-10-24 (§2).
 - **Owner request (2026-10-24):** "Check if we had a plan to implement new project onboarding as
   well as existing project and server configs within the UI/TUI?", then "Write a plan/workbook to
   implement the missing functionality."
@@ -137,7 +138,7 @@ its PR merges, and note the PR number.
 
 | Lane | Scope | Depends on | Tier | Pre-merge | Done |
 |---|---|---|---|---|---|
-| **P0** | This plan: owner decisions D1–D6 recorded | — | 0 | owner | ☐ |
+| **P0** | This plan: owner decisions D1–D6 recorded | — | 0 | owner | ☑ (2026-10-24) |
 | **P1** | Profile v2: record fields, defaults for old records, `status`, `expectedRevision` CAS in the repository adapter, `listProfiles()` on the port. Manifest + Hexagen scaffold. | P0 | 2 (data) | Fable | ☐ |
 | **P2** | `ProjectProbePort` + `ProjectProbeAdapter` on `CommandExecutorPort`: the four check groups of §3.3, fixed argv, `UNKNOWN` on unreachable, typed receipt. Fake-executor tests per check. | P1 | 2 (subprocess, ssh) | Fable | ☐ |
 | **P3a** | Use cases: `RegisterProjectProfile` becomes create-only and validates host and procedure names against the installation; `UpdateProjectProfile` (CAS); `RetireProjectProfile`. | P1 | 2 | Fable | ☐ |
@@ -197,7 +198,7 @@ its PR merges, and note the PR number.
 
 ## 6. Decisions for the owner
 
-| Id | Question | Recommendation |
+| Id | Question | Recommendation (decided 2026-10-24 as recommended) |
 |---|---|---|
 | D1 | Do projects live in the state directory (profiles via `/v1` and the CLI) or in the installation file (setup mode only)? | **State directory.** Projects change more often than the station, belong to operators rather than to the host, and already have a `/v1` route; profiles refer to installation entries by name (§3.1). |
 | D2 | When a probe finds no clone or no worktree root, does fleet-v2 create them, or print the commands for the developer to run? | **Print the commands.** This matches `init` ("installs nothing and prints commands"), and keeps host changes out of `/v1`. A later lane can add a confirmed `--apply` to the CLI only. |

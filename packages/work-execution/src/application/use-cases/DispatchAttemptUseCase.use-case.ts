@@ -368,6 +368,22 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
 
     const existingAttempt = await this.deps.attemptRepo.findAttemptById(request.attemptId);
 
+    // A claim-state attempt is live: dispatching it again would start a second
+    // session in the same worktree. Refuse before any journal entry or save;
+    // an `intent-recorded` prepared attempt still dispatches.
+    if (
+      existingAttempt &&
+      (existingAttempt.state === 'dispatching' ||
+        existingAttempt.state === 'running' ||
+        existingAttempt.state === 'reconciling' ||
+        existingAttempt.state === 'blocked')
+    ) {
+      return {
+        outcome: 'refused',
+        reason: `Attempt ${existingAttempt.id} is ${existingAttempt.state}; run 'attempt reconcile' (it resolves an attempt with no recorded session by inspecting its worktree) or 'attempt stop' before dispatching again`,
+      };
+    }
+
     const manifestReviewer = typeof parsedManifest.independentReviewer === 'string'
       ? parsedManifest.independentReviewer
       : (parsedManifest.reviewerSeat as string | undefined);
@@ -619,6 +635,54 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         return reconcilingConflict;
       }
       return { outcome: 'unknown', attempt: reconcilingAttempt, reason: startResult.reason };
+    }
+
+    if (startResult.outcome === 'blocked') {
+      // Blocked keeps the reservation; reconcile or stop resolves the worktree.
+      const blockedAttempt: AttemptRecord = {
+        ...dispatchingAttempt,
+        revision: nextAttemptRevision(dispatchingAttempt),
+        state: 'blocked',
+        sessionId: null,
+        runner: startResult.runner ?? dispatchingAttempt.runner ?? null,
+        updatedAtIso: nowIso,
+      };
+      // Record what ran at block time (brief-fix2 item 2a): session ids seen
+      // running in the worktree are evidence only, never proof of ownership.
+      // An unknown answer or a runner without inspectWorktreeRun omits the
+      // field; the ids stay out of the entry's detail.
+      let observedSessionIds: readonly string[] | undefined;
+      if (this.deps.runner.inspectWorktreeRun) {
+        const observed = await this.deps.runner.inspectWorktreeRun({
+          attemptId: request.attemptId,
+          worktreePath: request.worktreePath,
+          runner: blockedAttempt.runner,
+        });
+        if (observed.state === 'running') {
+          observedSessionIds = [observed.sessionId];
+        } else if (observed.state === 'idle') {
+          observedSessionIds = [];
+        }
+      }
+      // Journal the ambiguous start first: the worktree may hold a live lane,
+      // and the evidence must survive a conflicting save. Capacity is never
+      // released.
+      await appendJournalEntry(this.deps.journal, {
+        attemptId: request.attemptId,
+        workOrderId: request.workOrderId,
+        action: 'dispatch',
+        baseCommit: request.baseCommit,
+        recordedAtIso: nowIso,
+        status: 'ambiguous',
+        sessionId: null,
+        detail: `Blocked: ${startResult.reason}; reservation kept until 'attempt reconcile' or 'attempt stop' resolves the worktree`,
+        ...(observedSessionIds !== undefined ? { observedSessionIds } : {}),
+      });
+      const blockedConflict = await this.saveAttemptOrConflict(blockedAttempt, true);
+      if (blockedConflict) {
+        return blockedConflict;
+      }
+      return { outcome: 'blocked', attempt: blockedAttempt, reason: startResult.reason };
     }
 
     const cancelledAttempt: AttemptRecord = {

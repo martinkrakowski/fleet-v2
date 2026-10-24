@@ -35,11 +35,15 @@ import type {
 } from '../../ports/out/ExecutionJournalPort.out-port.js';
 import type { ExecutionObservationPort } from '../../ports/out/ExecutionObservationPort.out-port.js';
 import type {
+  AbortWorktreeRunRequest,
+  AbortWorktreeRunResult,
   ExecutionRunnerPort,
   RunnerIsolationCapabilities,
   RunnerSessionStatus,
   StartRunnerSessionResult,
   StopRunnerSessionResult,
+  WorktreeRunRef,
+  WorktreeRunState,
 } from '../../ports/out/ExecutionRunnerPort.out-port.js';
 import type { CollectCompletedAttemptArtifactsResult } from '../../ports/out/AttemptArtifactPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../../ports/out/WorkOrderRepositoryPort.out-port.js';
@@ -1238,6 +1242,9 @@ function makeRunner(
     startResult?: StartRunnerSessionResult;
     inspectStatus?: RunnerSessionStatus;
     stopResult?: StopRunnerSessionResult;
+    worktreeState?: WorktreeRunState;
+    abortResult?: AbortWorktreeRunResult;
+    withoutWorktreeMethods?: boolean;
     describeRunner?: () => AttemptRunnerRecord | undefined;
     onStart?: () => void;
   } = {},
@@ -1254,6 +1261,8 @@ function makeRunner(
   const startCalls: StartSessionCall[] = [];
   const inspectCalls: InspectSessionCall[] = [];
   const stopCalls: StopSessionCall[] = [];
+  const inspectWorktreeCalls: WorktreeRunRef[] = [];
+  const abortWorktreeCalls: AbortWorktreeRunRequest[] = [];
   const port: ExecutionRunnerPort = {
     describeCapabilities: () => capabilities,
     describeRunner:
@@ -1289,7 +1298,25 @@ function makeRunner(
       return options.stopResult ?? { outcome: 'still-running', reason: 'grace period elapsed' };
     },
   };
-  return { port, capabilities, startCalls, inspectCalls, stopCalls };
+  if (!options.withoutWorktreeMethods) {
+    port.inspectWorktreeRun = async (ref) => {
+      inspectWorktreeCalls.push(ref);
+      return options.worktreeState ?? { state: 'idle' };
+    };
+    port.abortWorktreeRun = async (request) => {
+      abortWorktreeCalls.push(request);
+      return options.abortResult ?? { outcome: 'aborted', endedAtIso: '2026-10-22T12:00:00.000Z' };
+    };
+  }
+  return {
+    port,
+    capabilities,
+    startCalls,
+    inspectCalls,
+    stopCalls,
+    inspectWorktreeCalls,
+    abortWorktreeCalls,
+  };
 }
 
 function makeWorkspace(
@@ -1835,6 +1862,175 @@ describe('DispatchAttemptUseCase', () => {
     expect(result.attempt.state).toBe('running');
   });
 
+  it('saves blocked on a blocked start, keeps the reservation and journals before saving', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        startResult: {
+          outcome: 'blocked',
+          reason: 'Worktree already has an active session (exit 75)',
+          runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+        },
+      },
+    });
+    const callOrder: string[] = [];
+    const innerAppend = setup.journal.appendJournalEntry.bind(setup.journal);
+    setup.journal.appendJournalEntry = async (entry) => {
+      callOrder.push('journal.appendJournalEntry');
+      await innerAppend(entry);
+    };
+    const innerSave = setup.attemptRepo.saveAttempt.bind(setup.attemptRepo);
+    setup.attemptRepo.saveAttempt = async (record) => {
+      callOrder.push('attemptRepo.saveAttempt');
+      await innerSave(record);
+    };
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result).toMatchObject({
+      outcome: 'blocked',
+      reason: 'Worktree already has an active session (exit 75)',
+    });
+    if (result.outcome !== 'blocked') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(result.attempt.sessionId).toBeNull();
+    expect(result.attempt.runner).toEqual({
+      kind: 'opencode',
+      remotePort: 4166,
+      host: null,
+      agent: null,
+      model: 'glm-5',
+      variant: null,
+    });
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('blocked');
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries[1]).toMatchObject({
+      action: 'dispatch',
+      status: 'ambiguous',
+      detail: `Blocked: Worktree already has an active session (exit 75); reservation kept until 'attempt reconcile' or 'attempt stop' resolves the worktree`,
+    });
+    expect(callOrder).toHaveLength(4);
+    expect(callOrder.slice(-2)).toEqual(['journal.appendJournalEntry', 'attemptRepo.saveAttempt']);
+  });
+
+  // brief-fix2 item 2a: the blocked dispatch entry records what ran at block
+  // time; the ids stay out of the entry's detail.
+  it('records observedSessionIds on the blocked dispatch entry and keeps them out of the detail', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        startResult: {
+          outcome: 'blocked',
+          reason: 'Worktree already has an active session (exit 75)',
+        },
+        worktreeState: { state: 'running', sessionId: 'ses_observed_1' },
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('blocked');
+    expect(setup.runner.inspectWorktreeCalls).toHaveLength(1);
+    expect(setup.journal.entries[1]).toMatchObject({
+      action: 'dispatch',
+      status: 'ambiguous',
+      observedSessionIds: ['ses_observed_1'],
+    });
+    expect(setup.journal.entries[1]?.detail ?? '').not.toContain('ses_observed_1');
+  });
+
+  it('records an empty observedSessionIds on the blocked dispatch entry when the worktree is idle', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        startResult: {
+          outcome: 'blocked',
+          reason: 'Worktree already has an active session (exit 75)',
+        },
+        worktreeState: { state: 'idle' },
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('blocked');
+    expect(setup.journal.entries[1]?.observedSessionIds).toEqual([]);
+  });
+
+  it('omits observedSessionIds from the blocked dispatch entry when the worktree state is unknown', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        startResult: {
+          outcome: 'blocked',
+          reason: 'Worktree already has an active session (exit 75)',
+        },
+        worktreeState: { state: 'unknown', reason: 'status lookup failed' },
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('blocked');
+    expect(setup.journal.entries[1]?.observedSessionIds).toBeUndefined();
+  });
+
+  it('omits observedSessionIds from the blocked dispatch entry when the runner cannot inspect a worktree', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        startResult: {
+          outcome: 'blocked',
+          reason: 'Worktree already has an active session (exit 75)',
+        },
+        withoutWorktreeMethods: true,
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('blocked');
+    expect(setup.journal.entries[1]?.observedSessionIds).toBeUndefined();
+  });
+
+  it.each(['dispatching', 'running', 'reconciling', 'blocked'] as const)(
+    'refuses dispatch on an existing attempt in the $state claiming state without starting or journalling',
+    async (state) => {
+      const setup = makeDispatchSetup();
+      setup.attemptRepo.attempts.set('attempt-1', storedAttempt({ state }));
+
+      const result = await setup.useCase.dispatchAttempt(
+        validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+      );
+
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: `Attempt attempt-1 is ${state}; run 'attempt reconcile' (it resolves an attempt with no recorded session by inspecting its worktree) or 'attempt stop' before dispatching again`,
+      });
+      expect(setup.runner.startCalls).toHaveLength(0);
+      expect(setup.journal.entries).toHaveLength(0);
+    },
+  );
+
+  it('still dispatches an intent-recorded prepared attempt', async () => {
+    const setup = makeDispatchSetup();
+    setup.attemptRepo.attempts.set('attempt-1', storedAttempt({ state: 'intent-recorded' }));
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('started');
+    expect(setup.runner.startCalls).toHaveLength(1);
+  });
+
   it('refuses dispatch when request carries model, agent, variant, modelAssignment, runnerPort, remotePort, runnerHost, or host', async () => {
     const setup = makeDispatchSetup();
 
@@ -2054,6 +2250,8 @@ function makeReconcileSetup(
   options: {
     attempt?: Partial<AttemptRecord>;
     inspectStatus?: RunnerSessionStatus;
+    worktreeState?: WorktreeRunState;
+    withoutWorktreeMethods?: boolean;
     withReservation?: boolean;
   } = {},
 ) {
@@ -2063,7 +2261,11 @@ function makeReconcileSetup(
   if (options.withReservation ?? true) {
     journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
   }
-  const runner = makeRunner({ inspectStatus: options.inspectStatus });
+  const runner = makeRunner({
+    inspectStatus: options.inspectStatus,
+    worktreeState: options.worktreeState,
+    withoutWorktreeMethods: options.withoutWorktreeMethods,
+  });
   const useCase = new ReconcileAttemptUseCase({ attemptRepo, journal, runner: runner.port });
   return { attemptRepo, journal, runner, useCase };
 }
@@ -2107,7 +2309,9 @@ describe('ReconcileAttemptUseCase', () => {
   });
 
   it('stays unknown without a recorded sessionId and keeps the reservation', async () => {
-    const setup = makeReconcileSetup({ attempt: { sessionId: null } });
+    // A session-less `intent-recorded` attempt keeps the fallback behaviour:
+    // re-saved `reconciling`, answered `unknown` (brief-fix2 item 1a).
+    const setup = makeReconcileSetup({ attempt: { state: 'intent-recorded', sessionId: null } });
 
     const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
 
@@ -2222,12 +2426,498 @@ describe('ReconcileAttemptUseCase', () => {
     expect(missingReceipt.journal.heldFor('attempt-1')).toBe(true);
     expect(missingReceipt.attemptRepo.attempts.get('attempt-1')?.state).toBe('reconciling');
   });
+
+  it.each(['cancelled', 'collected', 'ended'] as const)(
+    'refuses to reconcile a terminal $state attempt without contacting the runner or saving',
+    async (state) => {
+      const setup = makeReconcileSetup({ attempt: { state, sessionId: null }, withReservation: false });
+
+      const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: `Attempt attempt-1 is in terminal state '${state}' and cannot be reconciled`,
+      });
+      expect(setup.runner.inspectCalls).toHaveLength(0);
+      expect(setup.runner.inspectWorktreeCalls).toHaveLength(0);
+      expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe(state);
+      expect(setup.journal.entries).toHaveLength(0);
+    },
+  );
+
+  it.each(['cancelled', 'collected', 'ended'] as const)(
+    'releases a reservation still held by a terminal $state attempt, refuses, and saves nothing',
+    async (state) => {
+      const setup = makeReconcileSetup({ attempt: { state, sessionId: null } });
+      expect(setup.journal.heldFor('attempt-1')).toBe(true);
+
+      const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: `Attempt attempt-1 is in terminal state '${state}' and cannot be reconciled; a reservation it still held was released`,
+      });
+      expect(setup.runner.inspectCalls).toHaveLength(0);
+      expect(setup.runner.inspectWorktreeCalls).toHaveLength(0);
+      expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe(state);
+      expect(setup.journal.heldFor('attempt-1')).toBe(false);
+      expect(setup.journal.releaseCount).toBe(1);
+      expect(setup.journal.entries).toHaveLength(1);
+      expect(setup.journal.entries[0]).toMatchObject({
+        action: 'reconcile',
+        status: 'completed',
+        sessionId: null,
+        detail: `Released a capacity reservation still held by terminal attempt (${state})`,
+      });
+    },
+  );
+
+  it('cancels a session-less blocked attempt and releases the reservation when the worktree is idle', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'idle' },
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toMatchObject({
+      outcome: 'cancelled',
+      reason: "Nothing runs in the blocked attempt's worktree; cancelled and capacity released",
+    });
+    if (result.outcome !== 'cancelled') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('cancelled');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('cancelled');
+    expect(setup.journal.heldFor('attempt-1')).toBe(false);
+    expect(setup.journal.entries[0]).toMatchObject({
+      action: 'reconcile',
+      status: 'completed',
+      detail: "Nothing runs in the blocked attempt's worktree; cancelled and capacity released",
+    });
+    expect(setup.runner.inspectWorktreeCalls).toHaveLength(1);
+    expect(setup.runner.inspectCalls).toHaveLength(0);
+  });
+
+  it('adopts the running session in a session-less blocked attempt worktree when the history names it', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_adopted_1' },
+    });
+    setup.journal.entries.push({
+      id: 'je-dispatch-1',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'completed',
+      sessionId: 'ses_adopted_1',
+      detail: 'Session started: ses_adopted_1',
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('active');
+    if (result.outcome !== 'active') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('running');
+    expect(result.attempt.sessionId).toBe('ses_adopted_1');
+    expect(result.status).toEqual({
+      runnerReachable: 'reachable',
+      workspacePreparation: 'prepared',
+      workerCommand: 'active',
+      completionReceipt: null,
+      artifactsCollected: false,
+    });
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('running');
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries[1]).toMatchObject({
+      action: 'reconcile',
+      status: 'completed',
+      sessionId: 'ses_adopted_1',
+      detail: 'Blocked attempt adopted the session running in its worktree: ses_adopted_1',
+    });
+  });
+
+  it('keeps a session-less blocked attempt unchanged when the worktree state is unknown', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'unknown', reason: 'status lookup failed' },
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toMatchObject({ outcome: 'unknown', reason: 'status lookup failed' });
+    if (result.outcome !== 'unknown') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('blocked');
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries[0]).toMatchObject({
+      action: 'reconcile',
+      status: 'ambiguous',
+      detail: 'status lookup failed',
+    });
+  });
+
+  it('stays unknown for a session-less blocked attempt when the runner cannot inspect a worktree', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      withoutWorktreeMethods: true,
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toMatchObject({
+      outcome: 'unknown',
+      reason: 'Runner cannot inspect a worktree without a session',
+    });
+    if (result.outcome !== 'unknown') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('blocked');
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries).toHaveLength(0);
+  });
+
+  // brief-fix2 item 1: the directory-scoped path applies to every session-less
+  // attempt in dispatching, reconciling or blocked; journal details and result
+  // reasons name the actual state.
+  it.each(['dispatching', 'reconciling', 'blocked'] as const)(
+    'cancels a session-less $state attempt and releases the reservation when the worktree is idle',
+    async (state) => {
+      const setup = makeReconcileSetup({
+        attempt: { state, sessionId: null },
+        worktreeState: { state: 'idle' },
+      });
+
+      const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+      expect(result).toMatchObject({
+        outcome: 'cancelled',
+        reason: `Nothing runs in the ${state} attempt's worktree; cancelled and capacity released`,
+      });
+      if (result.outcome !== 'cancelled') {
+        throw new Error('unreachable');
+      }
+      expect(result.attempt.state).toBe('cancelled');
+      expect(result.attempt.outcome).toBe('stopped');
+      expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('cancelled');
+      expect(setup.journal.releaseCount).toBe(1);
+      expect(setup.journal.heldFor('attempt-1')).toBe(false);
+      expect(setup.journal.entries[0]).toMatchObject({
+        action: 'reconcile',
+        status: 'completed',
+        detail: `Nothing runs in the ${state} attempt's worktree; cancelled and capacity released`,
+      });
+    },
+  );
+
+  it.each(['dispatching', 'reconciling', 'blocked'] as const)(
+    'stops a session-less $state attempt by worktree abort and releases the reservation exactly once',
+    async (state) => {
+      const setup = makeStopSetup({
+        attempt: { state, sessionId: null },
+        abortResult: { outcome: 'aborted', endedAtIso: '2026-10-22T12:00:00.000Z' },
+      });
+
+      const result = await setup.useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+      expect(result).toMatchObject({ outcome: 'cancelled', capacityReleased: true });
+      if (result.outcome !== 'cancelled') {
+        throw new Error('unreachable');
+      }
+      expect(result.attempt.state).toBe('cancelled');
+      expect(result.attempt.outcome).toBe('stopped');
+      expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('cancelled');
+      expect(setup.journal.releaseCount).toBe(1);
+      expect(setup.journal.heldFor('attempt-1')).toBe(false);
+      expect(setup.runner.abortWorktreeCalls).toHaveLength(1);
+      expect(setup.runner.stopCalls).toHaveLength(0);
+    },
+  );
+
+  it.each(['dispatching', 'reconciling', 'blocked'] as const)(
+    'keeps a session-less $state attempt unchanged and held when the worktree state is unknown',
+    async (state) => {
+      const setup = makeReconcileSetup({
+        attempt: { state, sessionId: null },
+        worktreeState: { state: 'unknown', reason: 'status lookup failed' },
+      });
+
+      const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+      expect(result).toMatchObject({ outcome: 'unknown', reason: 'status lookup failed' });
+      if (result.outcome !== 'unknown') {
+        throw new Error('unreachable');
+      }
+      expect(result.attempt.state).toBe(state);
+      expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe(state);
+      expect(setup.attemptRepo.attempts.get('attempt-1')?.revision).toBe(
+        storedAttempt({ state, sessionId: null }).revision,
+      );
+      expect(setup.journal.releaseCount).toBe(0);
+      expect(setup.journal.heldFor('attempt-1')).toBe(true);
+      expect(setup.journal.entries[0]).toMatchObject({
+        action: 'reconcile',
+        status: 'ambiguous',
+        detail: 'status lookup failed',
+      });
+    },
+  );
+
+  // brief-fix2 item 2: adoption has an ownership check — the id is adopted
+  // only when the attempt's own history named it.
+  it('refuses to adopt a foreign session id the attempt never started, without saving', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_foreign_1' },
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    const reason =
+      "Worktree runs session ses_foreign_1, which attempt attempt-1 never started; run 'attempt stop' to abort it";
+    expect(result).toEqual({ outcome: 'unknown', attempt: expect.anything(), reason });
+    if (result.outcome !== 'unknown') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(result.attempt.sessionId).toBeNull();
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('blocked');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.sessionId).toBeNull();
+    expect(setup.journal.releaseCount).toBe(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries[0]).toMatchObject({
+      action: 'reconcile',
+      status: 'ambiguous',
+      detail: reason,
+    });
+  });
+
+  it('adopts a session id named by the attempt\u2019s own earlier completed dispatch entry', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_adopted_2' },
+    });
+    setup.journal.entries.push({
+      id: 'je-dispatch-2',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'completed',
+      sessionId: 'ses_adopted_2',
+      detail: 'Session started: ses_adopted_2',
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('active');
+    if (result.outcome !== 'active') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('running');
+    expect(result.attempt.sessionId).toBe('ses_adopted_2');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('running');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.sessionId).toBe('ses_adopted_2');
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+  });
+
+  it('refuses an id that appears only in a blocked entry\u2019s observedSessionIds', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_observed_only' },
+    });
+    // The blocked dispatch entry recorded the id as evidence; it named the
+    // session nowhere else (no sessionId on any entry, detail without the id).
+    setup.journal.entries.push({
+      id: 'je-blocked-1',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'ambiguous',
+      sessionId: null,
+      detail: "Blocked: Worktree already has an active session (exit 75); reservation kept until 'attempt reconcile' or 'attempt stop' resolves the worktree",
+      observedSessionIds: ['ses_observed_only'],
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome !== 'unknown') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(result.attempt.sessionId).toBeNull();
+    expect(setup.journal.releaseCount).toBe(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries[1]).toMatchObject({
+      action: 'reconcile',
+      status: 'ambiguous',
+      detail: "Worktree runs session ses_observed_only, which attempt attempt-1 never started; run 'attempt stop' to abort it",
+    });
+  });
+
+  it('refuses the agy synthetic session id even when the journal names it', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'agy-attempt-1' },
+    });
+    // agy-run --status reports only that a lane runs; the synthetic id is
+    // derived from the attempt id, so a history match proves nothing.
+    setup.journal.entries.push({
+      id: 'je-agy-1',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'completed',
+      sessionId: 'agy-attempt-1',
+      detail: null,
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome !== 'unknown') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(result.attempt.sessionId).toBeNull();
+    expect(setup.journal.releaseCount).toBe(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+  });
+
+  it('adopts a session id named only in an ambiguous detail', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_from_amb' },
+    });
+    // L5b's unknown start records the session in the ambiguous detail.
+    setup.journal.entries.push({
+      id: 'je-amb-1',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'ambiguous',
+      sessionId: null,
+      detail: 'start was ambiguous: worktree runs ses_from_amb',
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('active');
+    if (result.outcome !== 'active') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('running');
+    expect(result.attempt.sessionId).toBe('ses_from_amb');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.sessionId).toBe('ses_from_amb');
+  });
+
+  // A refusal journals the foreign id in its own detail; that entry must not
+  // count as the attempt's history naming it on the next reconcile.
+  it.each([
+    ['a foreign id with no history', null],
+    ['an id seen only in observedSessionIds', 'observed'],
+  ] as const)('keeps refusing %s on a second reconcile', async (_label, evidence) => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_foreign_2' },
+    });
+    if (evidence === 'observed') {
+      setup.journal.entries.push({
+        id: 'je-blocked-2',
+        attemptId: 'attempt-1',
+        workOrderId: 'wo-1',
+        action: 'dispatch',
+        baseCommit: 'abc123',
+        recordedAtIso: '2026-10-15T08:01:00.000Z',
+        status: 'ambiguous',
+        sessionId: null,
+        detail: "Blocked: Worktree already has an active session (exit 75); reservation kept until 'attempt reconcile' or 'attempt stop' resolves the worktree",
+        observedSessionIds: ['ses_foreign_2'],
+      });
+    }
+
+    const first = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+    const second = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(first.outcome).toBe('unknown');
+    expect(second.outcome).toBe('unknown');
+    const stored = setup.attemptRepo.attempts.get('attempt-1');
+    expect(stored?.state).toBe('blocked');
+    expect(stored?.sessionId).toBeNull();
+    expect(stored?.revision ?? 0).toBe(0);
+    expect(setup.journal.releaseCount).toBe(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+  });
+
+  it('does not adopt an id named only in a reconcile entry’s ambiguous detail', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_from_reconcile' },
+    });
+    setup.journal.entries.push({
+      id: 'je-reconcile-1',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'reconcile',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'ambiguous',
+      sessionId: null,
+      detail: 'status exit 3 listed 2 sessions (ses_from_reconcile, ses_other)',
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('unknown');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.sessionId).toBeNull();
+  });
+
+  it('does not adopt an id that a dispatch detail names only as a prefix of a longer id', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_a' },
+    });
+    setup.journal.entries.push({
+      id: 'je-amb-2',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'ambiguous',
+      sessionId: null,
+      detail: 'start was ambiguous: worktree runs ses_ab',
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('unknown');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.sessionId).toBeNull();
+  });
 });
 
 function makeStopSetup(
   options: {
     attempt?: Partial<AttemptRecord>;
     stopResult?: StopRunnerSessionResult;
+    worktreeState?: WorktreeRunState;
+    abortResult?: AbortWorktreeRunResult;
+    withoutWorktreeMethods?: boolean;
     withReservation?: boolean;
   } = {},
 ) {
@@ -2237,7 +2927,12 @@ function makeStopSetup(
   if (options.withReservation ?? true) {
     journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
   }
-  const runner = makeRunner({ stopResult: options.stopResult });
+  const runner = makeRunner({
+    stopResult: options.stopResult,
+    worktreeState: options.worktreeState,
+    abortResult: options.abortResult,
+    withoutWorktreeMethods: options.withoutWorktreeMethods,
+  });
   const useCase = new StopAttemptUseCase({ attemptRepo, journal, runner: runner.port });
   return { attemptRepo, journal, runner, useCase };
 }
@@ -2382,6 +3077,142 @@ describe('StopAttemptUseCase', () => {
     });
     expect(setup.journal.heldFor('attempt-1')).toBe(true);
     expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('reconciling');
+  });
+
+  it('cancels a session-less blocked attempt by worktree abort and releases the reservation', async () => {
+    const setup = makeStopSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      abortResult: { outcome: 'aborted', endedAtIso: '2026-10-22T12:00:00.000Z' },
+    });
+
+    const result = await setup.useCase.stopAttempt({ attemptId: 'attempt-1', gracePeriodSeconds: 20 });
+
+    expect(result).toMatchObject({ outcome: 'cancelled', capacityReleased: true });
+    if (result.outcome !== 'cancelled') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('cancelled');
+    expect(result.attempt.outcome).toBe('stopped');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('cancelled');
+    expect(setup.journal.heldFor('attempt-1')).toBe(false);
+    expect(setup.runner.abortWorktreeCalls).toEqual([
+      {
+        attemptId: 'attempt-1',
+        worktreePath: '/lanes/attempt-1',
+        runner: undefined,
+        gracePeriodSeconds: 20,
+      },
+    ]);
+    expect(setup.runner.stopCalls).toHaveLength(0);
+    expect(setup.journal.entries[0]).toMatchObject({
+      action: 'stop',
+      status: 'intent-recorded',
+      sessionId: null,
+    });
+    expect(setup.journal.entries[1]).toMatchObject({
+      action: 'stop',
+      status: 'completed',
+      sessionId: null,
+      detail: 'Worktree aborted and attempt cancelled',
+    });
+  });
+
+  it('reports unknown without releasing when the aborted save loses to a concurrent session adopt', async () => {
+    const seed = storedAttempt({ state: 'blocked', sessionId: null });
+    const fresh = storedAttempt({
+      state: 'running',
+      sessionId: 'ses_adopted_elsewhere',
+      revision: 3,
+      updatedAtIso: '2026-10-15T08:06:00.000Z',
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      seed,
+      conflictOnSave: 1,
+      freshAfterConflict: fresh,
+    });
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner({
+      abortResult: { outcome: 'aborted', endedAtIso: '2026-10-22T12:00:00.000Z' },
+    });
+    const useCase = new StopAttemptUseCase({ attemptRepo, journal, runner: runner.port });
+
+    const result = await useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    const reason = `Worktree aborted, but attempt attempt-1 changed concurrently to running (session ses_adopted_elsewhere); run 'attempt reconcile'`;
+    expect(result).toEqual({ outcome: 'unknown', attempt: fresh, reason });
+    expect(attemptRepo.attempts.get('attempt-1')?.state).toBe('running');
+    expect(journal.heldFor('attempt-1')).toBe(true);
+    expect(journal.releaseCount).toBe(0);
+    expect(journal.entries).toHaveLength(2);
+    expect(journal.entries[1]).toMatchObject({
+      action: 'stop',
+      status: 'ambiguous',
+      sessionId: null,
+      detail: reason,
+    });
+  });
+
+  it('keeps a session-less blocked attempt unchanged when the worktree is still running', async () => {
+    const setup = makeStopSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      abortResult: { outcome: 'still-running', reason: 'grace period elapsed' },
+    });
+
+    const result = await setup.useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toMatchObject({ outcome: 'still-running', reason: 'grace period elapsed' });
+    if (result.outcome !== 'still-running') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('blocked');
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries[1]).toMatchObject({
+      action: 'stop',
+      status: 'ambiguous',
+      detail: 'grace period elapsed',
+    });
+  });
+
+  it('refuses to stop a session-less non-blocked attempt and leaves the reservation held', async () => {
+    const setup = makeStopSetup({
+      attempt: { state: 'running', sessionId: null },
+      abortResult: { outcome: 'aborted', endedAtIso: '2026-10-22T12:00:00.000Z' },
+    });
+
+    const result = await setup.useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Attempt not found or has no sessionId',
+    });
+    expect(setup.runner.abortWorktreeCalls).toHaveLength(0);
+    expect(setup.runner.stopCalls).toHaveLength(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries).toHaveLength(0);
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('running');
+  });
+
+  it('refuses to stop a session-less intent-recorded attempt and leaves the reservation held', async () => {
+    // brief-fix2 item 1b: only dispatching, reconciling and blocked resolve
+    // by worktree abort; any other session-less state still refuses.
+    const setup = makeStopSetup({
+      attempt: { state: 'intent-recorded', sessionId: null },
+      abortResult: { outcome: 'aborted', endedAtIso: '2026-10-22T12:00:00.000Z' },
+    });
+
+    const result = await setup.useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Attempt not found or has no sessionId',
+    });
+    expect(setup.runner.abortWorktreeCalls).toHaveLength(0);
+    expect(setup.runner.stopCalls).toHaveLength(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries).toHaveLength(0);
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('intent-recorded');
   });
 });
 
@@ -2798,8 +3629,9 @@ describe('PrepareFixAttemptUseCase', () => {
     expect(otherResult).toEqual({ outcome: 'refused', reason: 'Prior attempt not found for work order' });
   });
 
-  it('refuses a fix attempt while the prior attempt is still running', async () => {
-    for (const state of ['running', 'reconciling', 'dispatching', 'intent-recorded', 'blocked'] as const) {
+  it.each(['running', 'reconciling', 'dispatching', 'intent-recorded', 'blocked'] as const)(
+    'refuses a fix attempt while the prior attempt is still $state',
+    async (state) => {
       const setup = makeFixSetup({ prior: { state } });
       const result = await setup.useCase.prepareFixAttempt(
         validFixRequest() as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0],
@@ -2808,8 +3640,8 @@ describe('PrepareFixAttemptUseCase', () => {
         outcome: 'refused',
         reason: 'Cannot prepare fix attempt before prior attempt has ended',
       });
-    }
-  });
+    },
+  );
 
   it('refuses a fix attempt when the fix identity already exists', async () => {
     const setup = makeFixSetup({

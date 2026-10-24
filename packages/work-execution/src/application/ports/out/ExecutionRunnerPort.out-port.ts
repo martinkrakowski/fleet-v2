@@ -88,7 +88,16 @@ export type StartRunnerSessionResult =
       readonly runner?: AttemptRunnerRecord;
     }
   | { readonly outcome: 'refused'; readonly reason: string }
-  | { readonly outcome: 'unknown'; readonly reason: string };
+  | { readonly outcome: 'unknown'; readonly reason: string }
+  /**
+   * The start created nothing, a session may be live in the worktree, so the
+   * reservation is kept and the attempt is resolved by reconcile or stop.
+   */
+  | {
+      readonly outcome: 'blocked';
+      readonly reason: string;
+      readonly runner?: AttemptRunnerRecord;
+    };
 
 export interface RunnerSessionRef {
   readonly attemptId: string;
@@ -116,6 +125,34 @@ export type StopRunnerSessionResult =
   | { readonly outcome: 'refused'; readonly reason: string }
   | { readonly outcome: 'unknown'; readonly reason: string };
 
+/**
+ * A runner command addressed to a worktree directory rather than to a
+ * recorded session id: used when an attempt carries no session id but the
+ * worktree may still hold a live lane (a `blocked` start).
+ */
+export interface WorktreeRunRef {
+  readonly attemptId: string;
+  readonly worktreePath: string;
+  readonly runner?: AttemptRunnerRecord | null;
+}
+
+/** What runs in a worktree directory, without a session id. */
+export type WorktreeRunState =
+  | { readonly state: 'idle' }
+  | { readonly state: 'running'; readonly sessionId: string }
+  | { readonly state: 'unknown'; readonly reason: string };
+
+/** Abort whatever runs in a worktree directory, by directory. */
+export interface AbortWorktreeRunRequest extends WorktreeRunRef {
+  readonly gracePeriodSeconds: number;
+}
+
+export type AbortWorktreeRunResult =
+  | { readonly outcome: 'aborted'; readonly endedAtIso: string }
+  | { readonly outcome: 'still-running'; readonly reason: string }
+  | { readonly outcome: 'refused'; readonly reason: string }
+  | { readonly outcome: 'unknown'; readonly reason: string };
+
 export interface ExecutionRunnerPort {
   /** Capabilities this runner can actually enforce, declared before dispatch. */
   describeCapabilities(): RunnerIsolationCapabilities;
@@ -131,4 +168,16 @@ export interface ExecutionRunnerPort {
 
   /** Request cancellation and establish the session's actual end. */
   stopSession(request: StopRunnerSessionRequest): Promise<StopRunnerSessionResult>;
+
+  /**
+   * Optional: report what runs in a worktree directory, without a session id.
+   * A missing method means "cannot tell".
+   */
+  inspectWorktreeRun?(ref: WorktreeRunRef): Promise<WorktreeRunState>;
+
+  /**
+   * Optional: abort whatever runs in a worktree directory, by directory.
+   * A missing method means "cannot tell".
+   */
+  abortWorktreeRun?(request: AbortWorktreeRunRequest): Promise<AbortWorktreeRunResult>;
 }

@@ -35,7 +35,13 @@ export interface DispatchAttemptRequest {
 export type DispatchAttemptResult =
   | { readonly outcome: 'started'; readonly attempt: AttemptRecord; readonly sessionId: string }
   | { readonly outcome: 'unknown'; readonly attempt: AttemptRecord; readonly reason: string }
-  | { readonly outcome: 'refused'; readonly reason: string };
+  | { readonly outcome: 'refused'; readonly reason: string }
+  /**
+   * The start was blocked because a session may be live in the worktree. The
+   * reservation is kept and the attempt stays `blocked` until reconcile or
+   * stop resolves the worktree.
+   */
+  | { readonly outcome: 'blocked'; readonly attempt: AttemptRecord; readonly reason: string };
 
 export interface DispatchAttemptPort {
   /** Start one prepared attempt; `unknown` never releases capacity. */

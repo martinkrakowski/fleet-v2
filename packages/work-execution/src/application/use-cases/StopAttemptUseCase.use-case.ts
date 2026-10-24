@@ -59,6 +59,22 @@ function isTerminalAttempt(record: AttemptRecord): boolean {
   );
 }
 
+/**
+ * Session-less states a stop resolves by aborting whatever runs in the
+ * attempt's worktree directory, not by session id (brief-fix2 item 1b). Any
+ * other session-less state is still refused.
+ */
+const SESSION_LESS_ABORTABLE_STATES: readonly AttemptRecord['state'][] = [
+  'dispatching',
+  'reconciling',
+  'blocked',
+];
+
+/** True when a session-less record is in a state the worktree abort cannot resolve. */
+function isSessionLessRefused(record: AttemptRecord): boolean {
+  return !record.sessionId && !SESSION_LESS_ABORTABLE_STATES.includes(record.state);
+}
+
 export class StopAttemptUseCase implements StopAttemptPort {
   constructor(private readonly deps?: StopAttemptDependencies) {}
 
@@ -68,7 +84,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
     }
 
     const attempt = await this.deps.attemptRepo.findAttemptById(request.attemptId);
-    if (!attempt || !attempt.sessionId) {
+    if (!attempt || isSessionLessRefused(attempt)) {
       return { outcome: 'refused', reason: 'Attempt not found or has no sessionId' };
     }
 
@@ -87,7 +103,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
     attempt: AttemptRecord,
   ): Promise<StopAttemptResult> {
     const deps = this.deps!;
-    if (!attempt.sessionId) {
+    if (isSessionLessRefused(attempt)) {
       return { outcome: 'refused', reason: 'Attempt not found or has no sessionId' };
     }
 
@@ -116,6 +132,104 @@ export class StopAttemptUseCase implements StopAttemptPort {
         return { outcome: 'refused', reason: selection.reason };
       }
       runner = selection.runner;
+    }
+
+    // A session-less attempt in a claiming state (dispatching, reconciling,
+    // blocked) is resolved by aborting whatever runs in its worktree
+    // directory, not by session id. Any other session-less state was refused
+    // above.
+    if (!attempt.sessionId) {
+      if (!runner.abortWorktreeRun) {
+        return { outcome: 'refused', reason: 'Runner cannot abort a worktree without a session' };
+      }
+      await appendJournalEntry(deps.journal, {
+        attemptId: attempt.id,
+        workOrderId: attempt.workOrderId,
+        action: 'stop',
+        baseCommit: attempt.baseCommit,
+        recordedAtIso: nowIso,
+        status: 'intent-recorded',
+        sessionId: null,
+        detail: 'Stop intent recorded before worktree abort',
+      });
+
+      const abortResult = await runner.abortWorktreeRun({
+        attemptId: attempt.id,
+        worktreePath: attempt.worktreePath,
+        runner: attempt.runner,
+        gracePeriodSeconds: request.gracePeriodSeconds ?? 10,
+      });
+
+      if (abortResult.outcome === 'aborted') {
+        const { record: cancelled, ownsReservation, reason } = await this.saveCancelledAfterWorktreeAbort(
+          attempt,
+          nowIso,
+        );
+        if (!ownsReservation) {
+          // The fresh record is neither terminal nor ours (a concurrent
+          // reconcile adopted another session, or a re-dispatch took the
+          // attempt over): nothing was cancelled and the reservation is not
+          // this stop's to release. Journal the ambiguity and let a
+          // reconcile resolve the fresh record.
+          const detail = `Worktree aborted, but attempt ${cancelled.id} changed concurrently to ${cancelled.state} (session ${cancelled.sessionId ?? 'none'}); run 'attempt reconcile'`;
+          await appendJournalEntry(deps.journal, {
+            attemptId: attempt.id,
+            workOrderId: attempt.workOrderId,
+            action: 'stop',
+            baseCommit: attempt.baseCommit,
+            recordedAtIso: nowIso,
+            status: 'ambiguous',
+            sessionId: null,
+            detail,
+          });
+          return { outcome: 'unknown', attempt: cancelled, reason: detail };
+        }
+        const capacityReleased = ownsReservation
+          ? await deps.journal.releaseCapacityReservation(attempt.id, nowIso)
+          : false;
+        await appendJournalEntry(deps.journal, {
+          attemptId: attempt.id,
+          workOrderId: attempt.workOrderId,
+          action: 'stop',
+          baseCommit: attempt.baseCommit,
+          recordedAtIso: nowIso,
+          status: 'completed',
+          sessionId: null,
+          detail: 'Worktree aborted and attempt cancelled',
+        });
+        return {
+          outcome: 'cancelled',
+          attempt: cancelled,
+          capacityReleased,
+          ...(reason !== undefined ? { reason } : {}),
+        };
+      }
+
+      // still-running, refused or unknown: no state change, no release.
+      if (abortResult.outcome === 'refused') {
+        await appendJournalEntry(deps.journal, {
+          attemptId: attempt.id,
+          workOrderId: attempt.workOrderId,
+          action: 'stop',
+          baseCommit: attempt.baseCommit,
+          recordedAtIso: nowIso,
+          status: 'refused',
+          sessionId: null,
+          detail: abortResult.reason,
+        });
+        return { outcome: 'refused', reason: abortResult.reason };
+      }
+      await appendJournalEntry(deps.journal, {
+        attemptId: attempt.id,
+        workOrderId: attempt.workOrderId,
+        action: 'stop',
+        baseCommit: attempt.baseCommit,
+        recordedAtIso: nowIso,
+        status: 'ambiguous',
+        sessionId: null,
+        detail: abortResult.reason,
+      });
+      return { outcome: abortResult.outcome, attempt, reason: abortResult.reason };
     }
 
     await appendJournalEntry(deps.journal, {
@@ -263,9 +377,70 @@ export class StopAttemptUseCase implements StopAttemptPort {
         fresh.state === 'dispatching' &&
         !canOverwriteAfterConflict(fresh, ['dispatching'], attempt)
       ) {
-        // A concurrent re-dispatch took the attempt over while this stop was
-        // running: the record stays `dispatching`, the receipt never lands
-        // on it, and the reservation is not this stop's to release.
+        // Defence in depth: dispatch now refuses a claiming state, so only a
+        // writer that bypasses DispatchAttemptUseCase (an older binary
+        // sharing the state dir, a direct repository write) can produce this
+        // record. The record stays `dispatching`, the receipt never lands on
+        // it, and the reservation is not this stop's to release.
+        return { record: fresh, ownsReservation: false, reason: 'attempt re-dispatched concurrently' };
+      }
+      const rebuilt = build(fresh ?? attempt);
+      await this.deps!.attemptRepo.saveAttempt(rebuilt);
+      return { record: rebuilt, ownsReservation: true };
+    }
+  }
+
+  /**
+   * Save the `cancelled` transition after a worktree abort, following the
+   * same conflict pattern as `saveCancelledOrSkip`: on a revision conflict
+   * the fresh record is re-read once, a terminal fresh record skips the
+   * save, a foreign re-dispatched record (different session or a
+   * `dispatching` takeover) is never overwritten and its reservation is left
+   * alone, and otherwise the same transition is rebuilt on the fresh record.
+   * A second conflict propagates.
+   */
+  private async saveCancelledAfterWorktreeAbort(
+    attempt: AttemptRecord,
+    nowIso: string,
+  ): Promise<{
+    readonly record: AttemptRecord;
+    readonly ownsReservation: boolean;
+    readonly reason?: string;
+  }> {
+    const build = (base: AttemptRecord): AttemptRecord => ({
+      ...base,
+      revision: nextAttemptRevision(base),
+      state: 'cancelled',
+      outcome: 'stopped',
+      updatedAtIso: nowIso,
+    });
+    try {
+      const cancelled = build(attempt);
+      await this.deps!.attemptRepo.saveAttempt(cancelled);
+      return { record: cancelled, ownsReservation: true };
+    } catch (error) {
+      if (!(error instanceof AttemptRevisionConflictError)) {
+        throw error;
+      }
+      const fresh = await this.deps!.attemptRepo.findAttemptById(attempt.id);
+      if (fresh && isTerminalAttempt(fresh)) {
+        return { record: fresh, ownsReservation: true };
+      }
+      if (fresh && fresh.sessionId !== null && fresh.sessionId !== attempt.sessionId) {
+        // A re-dispatch recorded another live session: its reservation is
+        // not this stop's to release.
+        return { record: fresh, ownsReservation: false, reason: 'attempt re-dispatched concurrently' };
+      }
+      if (
+        fresh &&
+        fresh.state === 'dispatching' &&
+        !canOverwriteAfterConflict(fresh, ['dispatching'], attempt)
+      ) {
+        // Defence in depth: dispatch now refuses a claiming state, so only a
+        // writer that bypasses DispatchAttemptUseCase (an older binary
+        // sharing the state dir, a direct repository write) can produce this
+        // record. The record stays `dispatching` and the reservation is not
+        // this stop's to release.
         return { record: fresh, ownsReservation: false, reason: 'attempt re-dispatched concurrently' };
       }
       const rebuilt = build(fresh ?? attempt);

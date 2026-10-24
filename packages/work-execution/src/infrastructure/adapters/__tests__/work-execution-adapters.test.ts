@@ -434,6 +434,20 @@ describe('ExecutionJournalAdapter', () => {
     expect(persisted[0]?.held).toBe(false);
     expect(persisted[0]?.releasedAtIso).toBe('2026-10-15T12:00:00.000Z');
   });
+
+  it('persists observedSessionIds on journal entries and round-trips them', async () => {
+    const stateDir = await makeTempDir('fleet-state-');
+    const writer = new ExecutionJournalAdapter({ stateDir });
+    await writer.appendJournalEntry(
+      makeJournalEntry({ id: 'je-obs', observedSessionIds: ['ses_a', 'ses_b'] }),
+    );
+
+    const reader = new ExecutionJournalAdapter({ stateDir });
+    const entries = await reader.listJournalEntriesForAttempt('att-1');
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.id).toBe('je-obs');
+    expect(entries[0]?.observedSessionIds).toEqual(['ses_a', 'ses_b']);
+  });
 });
 
 describe('WorkspaceAdapter', () => {
@@ -894,18 +908,139 @@ describe('ExecutionRunnerAdapter', () => {
     expect(result).toEqual({ outcome: 'started', sessionId: 'ses_tok-42' });
   });
 
-  it('refuses a start when the worktree already has an active session (exit 75)', async () => {
+  it('blocks a start when the worktree already has an active session (exit 75)', async () => {
     const { runner, calls } = scriptedRunner([
       { exitCode: 75, stdout: '', stderr: 'session already active' },
     ]);
     const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner });
     const result = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
     expect(result).toEqual({
-      outcome: 'refused',
+      outcome: 'blocked',
       reason: 'Worktree already has an active session (exit 75)',
     });
-    // Exit 75 is a refusal, never a started/unknown ambiguity: no status lookup.
+    // Exit 75 is a block, never a started/unknown ambiguity: no status lookup.
     expect(calls).toHaveLength(1);
+  });
+
+  it('inspects a worktree as idle when status reports nothing running', async () => {
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 0, stdout: 'nothing running', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.inspectWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: runnerWorktreePath,
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+    });
+    expect(result).toEqual({ state: 'idle' });
+    expect(calls[0]?.args).toEqual(['--status', '--dir', runnerWorktreePath]);
+  });
+
+  it('inspects a worktree as running when status lists exactly one session id', async () => {
+    const { runner } = scriptedRunner([
+      { exitCode: 3, stdout: 'ocm-run: running in /tmp/fleet-test-worktree:\nses_wt', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.inspectWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: runnerWorktreePath,
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+    });
+    expect(result).toEqual({ state: 'running', sessionId: 'ses_wt' });
+  });
+
+  it('inspects a worktree as unknown when status exit 3 lists no session ids', async () => {
+    const { runner } = scriptedRunner([
+      { exitCode: 3, stdout: 'ocm-run: running in /tmp/fleet-test-worktree:', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.inspectWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: runnerWorktreePath,
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+    });
+    expect(result.state).toBe('unknown');
+  });
+
+  it('inspects a worktree as unknown when status exit 3 lists two session ids', async () => {
+    const { runner } = scriptedRunner([
+      { exitCode: 3, stdout: 'ocm-run: running in /tmp/fleet-test-worktree:\nses_a\nses_b', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.inspectWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: runnerWorktreePath,
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+    });
+    expect(result.state).toBe('unknown');
+  });
+
+  it('inspects a worktree as unknown on a guard failure (port mismatch)', async () => {
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 0, stdout: 'nothing running', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.inspectWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: runnerWorktreePath,
+      runner: { kind: 'opencode', remotePort: 7777, host: null, agent: null, model: 'glm-5', variant: null },
+    });
+    expect(result.state).toBe('unknown');
+    if (result.state === 'unknown') {
+      expect(result.reason).toContain('Configured runner port or host differs');
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('inspects a worktree as unknown when the status command throws', async () => {
+    const { runner } = scriptedRunner([new Error('connection refused')]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.inspectWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: runnerWorktreePath,
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+    });
+    expect(result.state).toBe('unknown');
+  });
+
+  it('aborts a worktree run and reports aborted on exit 0', async () => {
+    const { runner, calls } = scriptedRunner([{ exitCode: 0, stdout: 'aborted', stderr: '' }]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.abortWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: runnerWorktreePath,
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+      gracePeriodSeconds: 30,
+    });
+    expect(result.outcome).toBe('aborted');
+    if (result.outcome === 'aborted') {
+      expect(Number.isNaN(Date.parse(result.endedAtIso))).toBe(false);
+    }
+    expect(calls[0]?.args).toEqual(['--abort', '--dir', runnerWorktreePath]);
+  });
+
+  it('aborts a worktree run and reports still-running when abort exits non-zero', async () => {
+    const { runner } = scriptedRunner([{ exitCode: 1, stdout: '', stderr: 'still running' }]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.abortWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: runnerWorktreePath,
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+      gracePeriodSeconds: 30,
+    });
+    expect(result).toEqual({ outcome: 'still-running', reason: 'still running' });
+  });
+
+  it('aborts a worktree run and reports unknown when the abort throws', async () => {
+    const { runner } = scriptedRunner([new Error('abort failed')]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.abortWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: runnerWorktreePath,
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+      gracePeriodSeconds: 30,
+    });
+    expect(result.outcome).toBe('unknown');
   });
 
   it('reports unknown when the runner exits 0 without a sessionId and status finds nothing', async () => {

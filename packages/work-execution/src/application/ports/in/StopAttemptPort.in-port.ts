@@ -25,7 +25,13 @@ export type StopAttemptResult =
     }
   | { readonly outcome: 'still-running'; readonly attempt: AttemptRecord; readonly reason: string }
   | { readonly outcome: 'unknown'; readonly attempt: AttemptRecord; readonly reason: string }
-  | { readonly outcome: 'refused'; readonly reason: string };
+  | { readonly outcome: 'refused'; readonly reason: string }
+  /**
+   * A session-less `blocked` attempt whose worktree was aborted by
+   * directory: the attempt is saved cancelled, and `capacityReleased`
+   * reports whether this stop released the reservation.
+   */
+  | { readonly outcome: 'cancelled'; readonly attempt: AttemptRecord; readonly capacityReleased: boolean };
 
 export interface StopAttemptPort {
   /** Stop one attempt; only a confirmed termination releases capacity. */

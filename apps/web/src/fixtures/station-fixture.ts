@@ -9,7 +9,7 @@
 
 export type FactValue = "yes" | "no" | "unknown";
 export type FactState = FactValue | "stale";
-export type CapacityState = "pending" | "held" | "released";
+export type CapacityState = "pending" | "held" | "released" | "unrecorded";
 export type FactName = "reachable" | "prepared" | "active" | "ended" | "collected";
 
 export interface Facts {

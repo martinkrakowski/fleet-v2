@@ -203,6 +203,52 @@ describe("loadLanesData", () => {
     expect(reverse.workOrders["wo-1"].project).toBe("fleet-v2");
   });
 
+  it("writes own workOrders properties for prototype keys like constructor and __proto__", async () => {
+    const constructorRow = {
+      ...ENVELOPE.result.attempts[0],
+      attempt: {
+        ...ENVELOPE.result.attempts[0].attempt,
+        id: "att_proto_1",
+        workOrderId: "constructor",
+      },
+      workOrder: null,
+    };
+    const protoRow = {
+      ...ENVELOPE.result.attempts[0],
+      attempt: {
+        ...ENVELOPE.result.attempts[0].attempt,
+        id: "att_proto_2",
+        workOrderId: "__proto__",
+      },
+      workOrder: {
+        id: "__proto__",
+        projectId: "fleet-v2",
+        taskId: "Proto task",
+        laneId: "lane-proto",
+      },
+    };
+
+    const data = await loadLanesData(
+      fakeClient({
+        source: "api",
+        data: {
+          ...ENVELOPE,
+          result: {
+            ...ENVELOPE.result,
+            attempts: [constructorRow, protoRow],
+          },
+        },
+      }),
+      now,
+    );
+
+    expect(Object.hasOwn(data.workOrders, "constructor")).toBe(true);
+    expect(Object.hasOwn(data.workOrders, "__proto__")).toBe(true);
+    expect(data.workOrders["constructor"].task).toBe(
+      "work order constructor (record missing)",
+    );
+  });
+
   it("falls back to the fixture with the client's reason", async () => {
     const data = await loadLanesData(
       fakeClient({
@@ -256,6 +302,22 @@ describe("loadLanesData", () => {
     );
     expect(data.attempts).toBe(fixtureAttempts);
     expect(data.total).toBe(fixtureAttempts.length);
+  });
+
+  it("reports the envelope code when the payload has a non-OK string code", async () => {
+    const data = await loadLanesData(
+      fakeClient({
+        source: "api",
+        data: { code: "REFUSED" },
+      }),
+      now,
+    );
+
+    expect(data.source).toBe("fixture-fallback");
+    expect(data.fallbackReason).toBe(
+      "api boundary answered REFUSED for /v1/attempts",
+    );
+    expect(data.attempts).toBe(fixtureAttempts);
   });
 
   it("uses the injected clock for observedAtIso", async () => {

@@ -61,7 +61,13 @@ function parseAttempt(value: unknown): ListedAttemptWire["attempt"] | null {
   if (typeof value.createdAtIso !== "string") return null;
   if (typeof value.updatedAtIso !== "string") return null;
   if (value.kind !== "initial" && value.kind !== "fix") return null;
-  if (typeof value.fixNumber !== "number") return null;
+  if (
+    typeof value.fixNumber !== "number" ||
+    !Number.isInteger(value.fixNumber) ||
+    value.fixNumber < 0
+  ) {
+    return null;
+  }
   if (value.priorAttemptId !== null && typeof value.priorAttemptId !== "string") {
     return null;
   }
@@ -115,7 +121,13 @@ function parseReservationWire(
   if (value.hostName !== null && typeof value.hostName !== "string") {
     return undefined;
   }
-  if (typeof value.slotIndex !== "number") return undefined;
+  if (
+    typeof value.slotIndex !== "number" ||
+    !Number.isInteger(value.slotIndex) ||
+    value.slotIndex < 0
+  ) {
+    return undefined;
+  }
   return {
     hostId: value.hostId,
     hostName: value.hostName,
@@ -188,7 +200,9 @@ export function toAttemptSummary(row: ListedAttemptWire): AttemptSummary {
     ? "held"
     : state === "intent-recorded"
       ? "pending"
-      : "released";
+      : ENDED_STATES.has(state)
+        ? "released"
+        : "unrecorded";
   const pending = capacity === "pending";
 
   return {

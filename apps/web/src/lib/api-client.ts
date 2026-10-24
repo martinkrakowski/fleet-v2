@@ -160,8 +160,7 @@ export function createFleetWebApiClient(
     try {
       response = await fetchImpl(url, {
         headers,
-        // Server renders must never reuse a cached list: the live data layer
-        // is the only source for the Lanes page.
+        // Every API read is live state: a server render must never reuse a cached answer.
         cache: "no-store",
       });
     } catch (error) {

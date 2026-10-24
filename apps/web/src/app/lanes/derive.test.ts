@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { attempts, workOrders } from "./fixture";
 import type { AttemptSummary } from "./fixture";
-import { isLive, laneIdLine, summary, woOf } from "./derive";
+import { attemptHref, isLive, laneIdLine, summary, woOf } from "./derive";
 
 function recorded(state: string): AttemptSummary {
   return {
@@ -46,9 +46,14 @@ function recorded(state: string): AttemptSummary {
 
 describe("summary", () => {
   it("applies the recorded state table", () => {
-    expect(summary(recorded("intent-recorded"))).toEqual([
+    expect(
+      summary({ ...recorded("intent-recorded"), capacity: "pending" }),
+    ).toEqual(["queued", "intent recorded · waiting for a slot"]);
+    expect(
+      summary({ ...recorded("intent-recorded"), capacity: "held" }),
+    ).toEqual([
       "queued",
-      "intent recorded · waiting for a slot",
+      "intent recorded · slot reserved · not yet dispatching",
     ]);
     expect(summary(recorded("dispatching"))).toEqual([
       "active",
@@ -119,13 +124,13 @@ describe("laneIdLine", () => {
     expect(laneIdLine(runningHeld)).toContain("no session recorded · slot 1");
     expect(laneIdLine(runningHeld)).not.toContain("released");
 
-    const dispatchingReleased: AttemptSummary = {
-      ...recorded("dispatching"),
+    const runningUnrecorded: AttemptSummary = {
+      ...recorded("running"),
       session: null,
-      capacity: "released",
+      capacity: "unrecorded",
     };
-    expect(laneIdLine(dispatchingReleased)).toContain(
-      "no session recorded · no slot held",
+    expect(laneIdLine(runningUnrecorded)).toContain(
+      "no session recorded · no slot recorded",
     );
 
     const collectedNoSession: AttemptSummary = {
@@ -133,7 +138,11 @@ describe("laneIdLine", () => {
       session: null,
       capacity: "released",
     };
-    expect(laneIdLine(collectedNoSession)).toContain("ended · slot released");
+    expect(laneIdLine(collectedNoSession)).toContain("ended · no slot held");
+
+    expect(laneIdLine({ ...attempts[4], session: null })).toContain(
+      "ended · slot released",
+    );
   });
 });
 
@@ -146,7 +155,23 @@ describe("woOf", () => {
     });
   });
 
+  it("returns the placeholder for wo constructor on an empty map", () => {
+    expect(woOf({ ...attempts[0], wo: "constructor" }, {})).toEqual({
+      project: "(unknown)",
+      task: "work order constructor (record missing)",
+      lane: "",
+    });
+  });
+
   it("returns the fixture map entry when present", () => {
     expect(woOf(attempts[0])).toBe(workOrders["wo-0142"]);
+  });
+});
+
+describe("attemptHref", () => {
+  it("URL-encodes an id containing & and #", () => {
+    expect(attemptHref({ ...attempts[0], id: "att_1&2#3" })).toBe(
+      "/attempt?id=att_1%262%233",
+    );
   });
 });

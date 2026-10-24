@@ -33,7 +33,12 @@ export const STATE_FILTERS = [
 function recordedSummary(a: AttemptSummary): [word: string, note: string] {
   switch (a.recordedState) {
     case "intent-recorded":
-      return ["queued", "intent recorded · waiting for a slot"];
+      return [
+        "queued",
+        a.capacity === "held"
+          ? "intent recorded · slot reserved · not yet dispatching"
+          : "intent recorded · waiting for a slot",
+      ];
     case "dispatching":
       return ["active", "dispatching · recorded, not observed"];
     case "running":
@@ -94,15 +99,18 @@ export const woOf = (
   a: AttemptSummary,
   woMap: Record<string, WorkOrderSummary> = workOrders,
 ): WorkOrderSummary =>
-  woMap[a.wo] ?? {
-    project: "(unknown)",
-    task: `work order ${a.wo} (record missing)`,
-    lane: "",
-  };
+  Object.hasOwn(woMap, a.wo)
+    ? woMap[a.wo]
+    : {
+        project: "(unknown)",
+        task: `work order ${a.wo} (record missing)`,
+        lane: "",
+      };
 
 export const attemptsOf = (wo: string, list: AttemptSummary[] = attempts) =>
   list.filter((a) => a.wo === wo);
-export const attemptHref = (a: AttemptSummary) => `/attempt?id=${a.id}`;
+export const attemptHref = (a: AttemptSummary) =>
+  `/attempt?id=${encodeURIComponent(a.id)}`;
 export const isLive = (a: AttemptSummary) =>
   a.basis !== "recorded" && a.facts.active === "yes" && a.facts.ended === "no";
 
@@ -131,12 +139,15 @@ export function laneIdLine(
         ? `${a.session}${portPart}${slotPart}`
         : a.capacity === "held"
           ? `no session recorded${slotPart}`
-          : a.basis === "recorded" &&
-              a.recordedState !== "ended" &&
-              a.recordedState !== "collected" &&
-              a.recordedState !== "cancelled"
-            ? "no session recorded · no slot held"
-            : "ended · slot released";
+          : a.capacity === "unrecorded" ||
+              (a.basis === "recorded" &&
+                a.recordedState !== "ended" &&
+                a.recordedState !== "collected" &&
+                a.recordedState !== "cancelled")
+            ? "no session recorded · no slot recorded"
+            : a.basis === "recorded"
+              ? "ended · no slot held"
+              : "ended · slot released";
   const silent =
     a.facts.reachable === "unknown" && a.lastKnown
       ? ` · silent since ${a.lastKnown.at}`

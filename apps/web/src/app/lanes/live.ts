@@ -64,18 +64,31 @@ export async function loadLanesData(
 
   const parsed = parseAttemptListEnvelope(endpoint.data);
   if (!parsed) {
-    return fixtureLanesData(
-      "api boundary returned an unexpected attempt list shape",
-      observedAtIso,
-    );
+    const code =
+      typeof endpoint.data === "object" &&
+      endpoint.data !== null &&
+      typeof (endpoint.data as Record<string, unknown>).code === "string"
+        ? ((endpoint.data as Record<string, unknown>).code as string)
+        : null;
+    const reason =
+      code !== null && code !== "OK"
+        ? `api boundary answered ${code} for /v1/attempts`
+        : "api boundary returned an unexpected attempt list shape";
+    return fixtureLanesData(reason, observedAtIso);
   }
 
   const attempts = parsed.rows.map(toAttemptSummary);
   const workOrders: Record<string, WorkOrderSummary> = {};
   for (const row of parsed.rows) {
     const woId = row.attempt.workOrderId;
-    if (row.workOrder !== null || !(woId in workOrders)) {
-      workOrders[woId] = toWorkOrderSummary(row);
+    if (row.workOrder !== null || !Object.hasOwn(workOrders, woId)) {
+      const summary = toWorkOrderSummary(row);
+      Object.defineProperty(workOrders, woId, {
+        value: summary,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
   }
 

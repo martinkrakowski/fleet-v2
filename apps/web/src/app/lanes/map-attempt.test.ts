@@ -122,6 +122,27 @@ describe("toAttemptSummary", () => {
     expect(summary.facts.collected).toBe("yes");
     expect(summary.recordedState).toBe("collected");
   });
+
+  it("maps non-terminal states without a reservation to unrecorded and cancelled to released", () => {
+    for (const state of ["running", "dispatching", "reconciling", "blocked"]) {
+      const summary = toAttemptSummary(
+        wireRow({
+          attempt: { ...wireRow().attempt, state },
+          reservation: null,
+        }),
+      );
+      expect(summary.capacity).toBe("unrecorded");
+      expect(summary.slot).toBeNull();
+    }
+
+    const cancelled = toAttemptSummary(
+      wireRow({
+        attempt: { ...wireRow().attempt, state: "cancelled" },
+        reservation: null,
+      }),
+    );
+    expect(cancelled.capacity).toBe("released");
+  });
 });
 
 describe("toWorkOrderSummary", () => {
@@ -176,6 +197,82 @@ describe("parseAttemptListEnvelope", () => {
           total: 1,
           truncated: false,
           attempts: [badRow],
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null when slotIndex or fixNumber is not a non-negative integer", () => {
+    for (const slotIndex of [-1, 0.5]) {
+      expect(
+        parseAttemptListEnvelope({
+          code: "OK",
+          result: {
+            outcome: "listed",
+            total: 1,
+            truncated: false,
+            attempts: [
+              wireRow({
+                reservation: {
+                  hostId: "host-a",
+                  hostName: "execution host A",
+                  slotIndex,
+                },
+              }),
+            ],
+          },
+        }),
+      ).toBeNull();
+    }
+
+    expect(
+      parseAttemptListEnvelope({
+        code: "OK",
+        result: {
+          outcome: "listed",
+          total: 1,
+          truncated: false,
+          attempts: [
+            wireRow({
+              attempt: { ...wireRow().attempt, fixNumber: -1 },
+            }),
+          ],
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null when result.outcome is rejected or a workOrder is missing laneId", () => {
+    expect(
+      parseAttemptListEnvelope({
+        code: "OK",
+        result: {
+          outcome: "rejected",
+          total: 1,
+          truncated: false,
+          attempts: [wireRow()],
+        },
+      }),
+    ).toBeNull();
+
+    expect(
+      parseAttemptListEnvelope({
+        code: "OK",
+        result: {
+          outcome: "listed",
+          total: 1,
+          truncated: false,
+          attempts: [
+            {
+              attempt: wireRow().attempt,
+              workOrder: {
+                id: "wo-live-1",
+                projectId: "fleet-v2",
+                taskId: "Task one",
+              },
+              reservation: wireRow().reservation,
+            },
+          ],
         },
       }),
     ).toBeNull();

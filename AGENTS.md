@@ -69,6 +69,9 @@ runner environment allowlist to smuggle a setting through.
   fixed to the brief inside the worktree, `--model` is mandatory, and
   `--dangerously-skip-permissions` is refused. `scripts/agy-run-hash.txt` pins the
   script. `yarn test:bin` runs every shell test under `tests/`.
+- `AGY_ROUND_SSH`, `AGY_ROUND_ROOT`, `AGY_ROUND_GUARD_SSH`, `AGY_ROUND_GUARD_CMD` and
+  `AGY_ROUND_SETTLE` are the environment (all but the last required) of `bin/agy-round`, the
+  orchestrator's one-command-per-step driver for an agy fix round.
 
 Before committing what any lane produced, run `scripts/lane-diff-check.sh <worktree>`
 (protected paths including ignored ones — github workflows, agent/editor instruction and tool files,

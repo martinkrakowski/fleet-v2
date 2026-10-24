@@ -1,0 +1,266 @@
+#!/bin/sh
+# agy-round — one command per step of an Argon (agy) fix round, run from the orchestrator's
+# machine (macOS and Linux, POSIX sh). Today the orchestrator types four long ssh/scp/git
+# commands per round; this script makes each step one command. Sibling of bin/agy-run: the
+# lane runs in the container, this script drives it from outside.
+#
+# Subcommands:
+#   agy-round prepare --name <n> --branch <b> --brief <local file> [--from <local git dir>]
+#   agy-round run --name <n> --model <m> --brief <.lane/x.md> [--timeout <45m>] [--log <file>]
+#   agy-round commit --name <n> --message-file <local file> -- <path>...
+#   agy-round fetch --name <n> --branch <b> [--into <local git dir>]
+#   agy-round --help
+#
+# Environment (no defaults; a missing or empty one is a usage error, exit 2):
+#   AGY_ROUND_SSH           ssh destination of the lane container.
+#   AGY_ROUND_ROOT          absolute directory inside the container under which each lane's clone
+#                           lives ($AGY_ROUND_ROOT/<name>).
+#   AGY_ROUND_GUARD_SSH     ssh destination of the host that checks the container's pinned hashes.
+#   AGY_ROUND_GUARD_CMD     the single command run there (as one ssh argument) that prints the hash
+#                           check; its exit status is the verdict (0 clean).
+#   AGY_ROUND_SETTLE        optional seconds to wait after the last ssh before the "after" hash
+#                           check, default 20.
+#
+# Exit codes: 0 ok, 1 failure, 2 usage, 75 refused.
+# The orchestrator runs the project's gate on the fetched branch before pushing it anywhere; this
+# script never pushes to a forge.
+
+set -u
+
+usage() {
+  cat <<'USAGE'
+Usage: agy-round <subcommand> [options]
+Subcommands:
+  prepare --name <n> --branch <b> --brief <local file> [--from <local git dir>]
+  run --name <n> --model <m> --brief <.lane/x.md> [--timeout <45m>] [--log <file>]
+  commit --name <n> --message-file <local file> -- <path>...
+  fetch --name <n> --branch <b> [--into <local git dir>]
+Environment (no defaults; a missing one is a usage error, exit 2):
+  AGY_ROUND_SSH, AGY_ROUND_ROOT, AGY_ROUND_GUARD_SSH, AGY_ROUND_GUARD_CMD,
+  AGY_ROUND_SETTLE (optional, default 20).
+USAGE
+}
+
+die_usage() { echo "agy-round: $1" >&2; usage >&2; exit 2; }
+
+# shq: single-quote one argument for the remote shell (' becomes '\'').
+shq() {
+  case "$1" in
+    *\'*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+    *) printf "'%s'" "$1" ;;
+  esac
+}
+
+require_env() { # names, one per remaining argument
+  while [ "$#" -gt 0 ]; do
+    v=$1; shift
+    eval "val=\${$v:-}"
+    [ -n "$val" ] || die_usage "environment variable $v is required"
+  done
+}
+
+validate_name() {
+  case "$1" in
+    '' | *..* | *[!a-z0-9._-]* | [!a-z0-9]*)
+      die_usage "invalid --name '$1': lowercase letter or digit first, then letters/digits/._- , at most 64"
+      ;;
+  esac
+  [ "${#1}" -le 64 ] || die_usage "invalid --name '$1': longer than 64 characters"
+}
+
+validate_branch() {
+  git check-ref-format --branch "$1" >/dev/null 2>&1 || die_usage "invalid branch '$1'"
+}
+
+validate_brief() {
+  case "$1" in
+    .lane/*) ;;
+    *) die_usage "--brief must be a relative path under .lane/" ;;
+  esac
+  case "$1" in
+    *..* | *[[:space:]]*) die_usage "--brief must contain no .. and no whitespace" ;;
+  esac
+}
+
+cmd=${1:-}
+case "$cmd" in
+  '') die_usage "missing subcommand" ;;
+  --help | -h) usage; exit 0 ;;
+esac
+shift
+
+case "$cmd" in
+  prepare)
+    name=''; branch=''; brief=''; from='.'
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --name) [ "$#" -ge 2 ] || die_usage "--name needs a value"; name=$2; shift ;;
+        --name=*) name=${1#--name=} ;;
+        --branch) [ "$#" -ge 2 ] || die_usage "--branch needs a value"; branch=$2; shift ;;
+        --branch=*) branch=${1#--branch=} ;;
+        --brief) [ "$#" -ge 2 ] || die_usage "--brief needs a value"; brief=$2; shift ;;
+        --brief=*) brief=${1#--brief=} ;;
+        --from) [ "$#" -ge 2 ] || die_usage "--from needs a value"; from=$2; shift ;;
+        --from=*) from=${1#--from=} ;;
+        -*) die_usage "unknown option $1" ;;
+        *) die_usage "unexpected argument $1" ;;
+      esac
+      shift
+    done
+    validate_name "$name"
+    validate_branch "$branch"
+    require_env AGY_ROUND_SSH AGY_ROUND_ROOT
+    dir="$AGY_ROUND_ROOT/$name"
+    # Refuse when the lane's clone already exists in the container.
+    if ssh -o BatchMode=yes "$AGY_ROUND_SSH" "test -e $(shq "$dir")"; then
+      echo "agy-round: $dir already exists in the container" >&2
+      exit 75
+    fi
+    ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git init -q $(shq "$dir")" \
+      || { echo "agy-round: git init failed in the container" >&2; exit 1; }
+    git -C "$from" -c core.hooksPath=/dev/null push -q "$AGY_ROUND_SSH:$dir" "HEAD:refs/heads/$branch" \
+      || { echo "agy-round: push to the container failed" >&2; exit 1; }
+    ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") -c core.hooksPath=/dev/null checkout -q $(shq "$branch")" \
+      || { echo "agy-round: checkout in the container failed" >&2; exit 1; }
+    ssh -o BatchMode=yes "$AGY_ROUND_SSH" "mkdir -p $(shq "$dir/.lane")" \
+      || { echo "agy-round: mkdir .lane in the container failed" >&2; exit 1; }
+    base=$(basename "$brief")
+    scp -q "$brief" "$AGY_ROUND_SSH:$dir/.lane/$base" \
+      || { echo "agy-round: scp brief failed" >&2; exit 1; }
+    if ! ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") check-ignore -q $(shq ".lane/$base")"; then
+      echo "agy-round: brief path is not gitignored" >&2
+      exit 1
+    fi
+    ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") log --oneline -1" \
+      || { echo "agy-round: git log in the container failed" >&2; exit 1; }
+    echo ".lane/$base"
+    ;;
+  run)
+    name=''; model=''; brief=''; timeout=45m; log=''
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --name) [ "$#" -ge 2 ] || die_usage "--name needs a value"; name=$2; shift ;;
+        --name=*) name=${1#--name=} ;;
+        --model) [ "$#" -ge 2 ] || die_usage "--model needs a value"; model=$2; shift ;;
+        --model=*) model=${1#--model=} ;;
+        --brief) [ "$#" -ge 2 ] || die_usage "--brief needs a value"; brief=$2; shift ;;
+        --brief=*) brief=${1#--brief=} ;;
+        --timeout) [ "$#" -ge 2 ] || die_usage "--timeout needs a value"; timeout=$2; shift ;;
+        --timeout=*) timeout=${1#--timeout=} ;;
+        --log) [ "$#" -ge 2 ] || die_usage "--log needs a value"; log=$2; shift ;;
+        --log=*) log=${1#--log=} ;;
+        -*) die_usage "unknown option $1" ;;
+        *) die_usage "unexpected argument $1" ;;
+      esac
+      shift
+    done
+    [ -n "$model" ] || die_usage "--model is required"
+    validate_name "$name"
+    validate_brief "$brief"
+    require_env AGY_ROUND_SSH AGY_ROUND_ROOT AGY_ROUND_GUARD_SSH AGY_ROUND_GUARD_CMD
+    dir="$AGY_ROUND_ROOT/$name"
+    # Guard check BEFORE: refuse to start agy when the container is not clean.
+    if ! ssh -o BatchMode=yes "$AGY_ROUND_GUARD_SSH" "$AGY_ROUND_GUARD_CMD"; then
+      echo "agy-round: hash check failed before the run" >&2
+      exit 1
+    fi
+    cmd="agy-run --dir $(shq "$dir") --model $(shq "$model") --mode full --isolation-declared --sandbox --timeout $(shq "$timeout") --brief $(shq "$brief")"
+    if [ -n "$log" ]; then
+      ssh -o BatchMode=yes "$AGY_ROUND_SSH" "$cmd" > "$log"
+      rc=$?
+    else
+      ssh -o BatchMode=yes "$AGY_ROUND_SSH" "$cmd"
+      rc=$?
+    fi
+    sleep "${AGY_ROUND_SETTLE:-20}"
+    # Guard check AFTER.
+    if ! ssh -o BatchMode=yes "$AGY_ROUND_GUARD_SSH" "$AGY_ROUND_GUARD_CMD"; then
+      echo "agy-round: hash check failed after the run" >&2
+      exit 1
+    fi
+    changes=$(ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") status --porcelain")
+    echo '--- git status --porcelain ---'
+    [ -z "$changes" ] || echo "$changes"
+    echo '--- git diff --stat ---'
+    ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") diff --stat"
+    [ "$rc" -eq 0 ] || exit "$rc"
+    if [ -n "$changes" ]; then
+      exit 0
+    fi
+    echo "agy-round: no edits" >&2
+    exit 1
+    ;;
+  commit)
+    name=''; msg=''
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --name) [ "$#" -ge 2 ] || die_usage "--name needs a value"; name=$2; shift ;;
+        --name=*) name=${1#--name=} ;;
+        --message-file) [ "$#" -ge 2 ] || die_usage "--message-file needs a value"; msg=$2; shift ;;
+        --message-file=*) msg=${1#--message-file=} ;;
+        --) shift; break ;;
+        -*) die_usage "unknown option $1" ;;
+        *) die_usage "unexpected argument $1" ;;
+      esac
+      shift
+    done
+    [ "$#" -ge 1 ] || die_usage "commit requires at least one path"
+    validate_name "$name"
+    [ -n "$msg" ] || die_usage "--message-file is required"
+    require_env AGY_ROUND_SSH AGY_ROUND_ROOT
+    dir="$AGY_ROUND_ROOT/$name"
+    add_cmd="git -C $(shq "$dir") add --"
+    while [ "$#" -gt 0 ]; do
+      p=$1; shift
+      case "$p" in
+        '' | /* | *..*) die_usage "invalid path '$p': must be relative with no .." ;;
+        .lane | .lane/* | .git | .git/*) die_usage "refusing protected path '$p'" ;;
+      esac
+      add_cmd="$add_cmd $(shq "$p")"
+    done
+    tmp="$dir/.lane/.commit-msg.$$"
+    scp -q "$msg" "$AGY_ROUND_SSH:$tmp" \
+      || { echo "agy-round: scp message failed" >&2; exit 1; }
+    if ! ssh -o BatchMode=yes "$AGY_ROUND_SSH" "$add_cmd"; then
+      ssh -o BatchMode=yes "$AGY_ROUND_SSH" "rm -f $(shq "$tmp")"
+      echo "agy-round: git add in the container failed" >&2
+      exit 1
+    fi
+    if ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") diff --cached --quiet"; then
+      ssh -o BatchMode=yes "$AGY_ROUND_SSH" "rm -f $(shq "$tmp")"
+      echo "agy-round: nothing was staged" >&2
+      exit 1
+    fi
+    ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") -c core.hooksPath=/dev/null commit -q -F $(shq "$tmp")" \
+      || { ssh -o BatchMode=yes "$AGY_ROUND_SSH" "rm -f $(shq "$tmp")"; echo "agy-round: commit in the container failed" >&2; exit 1; }
+    ssh -o BatchMode=yes "$AGY_ROUND_SSH" "rm -f $(shq "$tmp")"
+    ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") log --oneline -1" \
+      || { echo "agy-round: git log in the container failed" >&2; exit 1; }
+    ;;
+  fetch)
+    name=''; branch=''; into='.'
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --name) [ "$#" -ge 2 ] || die_usage "--name needs a value"; name=$2; shift ;;
+        --name=*) name=${1#--name=} ;;
+        --branch) [ "$#" -ge 2 ] || die_usage "--branch needs a value"; branch=$2; shift ;;
+        --branch=*) branch=${1#--branch=} ;;
+        --into) [ "$#" -ge 2 ] || die_usage "--into needs a value"; into=$2; shift ;;
+        --into=*) into=${1#--into=} ;;
+        -*) die_usage "unknown option $1" ;;
+        *) die_usage "unexpected argument $1" ;;
+      esac
+      shift
+    done
+    validate_name "$name"
+    validate_branch "$branch"
+    require_env AGY_ROUND_SSH AGY_ROUND_ROOT
+    dir="$AGY_ROUND_ROOT/$name"
+    # The -argon ref is this script's own: the fetch is forced (+).
+    git -C "$into" -c core.hooksPath=/dev/null fetch -q "$AGY_ROUND_SSH:$dir" "+$branch:refs/heads/$branch-argon" \
+      || { echo "agy-round: fetch failed" >&2; exit 1; }
+    git -C "$into" log --oneline -1 "$branch-argon" \
+      || { echo "agy-round: no ref $branch-argon" >&2; exit 1; }
+    ;;
+  *) die_usage "unknown subcommand $cmd" ;;
+esac

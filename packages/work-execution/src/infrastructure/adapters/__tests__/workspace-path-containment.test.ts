@@ -88,4 +88,27 @@ describe('WorkspaceAdapter readWorktreeFile path containment', () => {
     expect(await adapter.readWorktreeFile('/wt', '.lane/brief-manifest.json')).toBe('manifest-bytes');
     expect(calls[0].argv).toEqual(['cat', '/wt/.lane/brief-manifest.json']);
   });
+
+  it('reads under the worktree for dot and trailing-slash relative paths', async () => {
+    const { executor, calls } = fakeExecutor(() => ({ stdout: 'payload-bytes' }));
+    const adapter = new WorkspaceAdapter({ executor });
+
+    expect(await adapter.readWorktreeFile('/wt', '.')).toBe('payload-bytes');
+    expect(calls[0].argv).toEqual(['cat', '/wt']);
+    expect(await adapter.readWorktreeFile('/wt', 'a/b/')).toBe('payload-bytes');
+    expect(calls[1].argv).toEqual(['cat', '/wt/a/b/']);
+  });
+
+  it('throws WorktreePathRefusedError for a path containing NUL bytes', async () => {
+    const { executor, calls } = fakeExecutor(() => ({}));
+    const adapter = new WorkspaceAdapter({ executor });
+
+    await expect(adapter.readWorktreeFile('/wt', 'a/b\0/c')).rejects.toBeInstanceOf(
+      WorktreePathRefusedError,
+    );
+    await expect(adapter.readWorktreeFile('/wt', 'a/b\0/c')).rejects.toMatchObject({
+      relativePath: 'a/b\0/c',
+    });
+    expect(calls).toHaveLength(0);
+  });
 });

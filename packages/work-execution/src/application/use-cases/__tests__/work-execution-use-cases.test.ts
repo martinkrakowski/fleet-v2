@@ -66,12 +66,12 @@ import { AllowedSeatAdapter } from '../../../infrastructure/adapters/AllowedSeat
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 
 /**
- * The fake workspace serves one JSON document for every worktree-relative
- * path (manifest candidates and the prose read alike), so the dispatch digest
- * check sees the same bytes for prose and manifest. Every default dispatch
- * request carries the digest this content actually produces; tests that
- * override the fake file content must pass the digest of that content.
+ * The fake workspace serves both the frozen prose (`.lane/brief.md`) and the
+ * frozen manifest (`.lane/brief-manifest.json`), and every default dispatch
+ * request carries the digest those two files really produce.
  */
+const FAKE_BRIEF_PROSE = '# Frozen brief prose';
+
 const FAKE_BRIEF_FILE = JSON.stringify({
   modelAssignment: {
     model: 'nvidia/z-ai/glm-5.3',
@@ -82,7 +82,7 @@ const FAKE_BRIEF_FILE = JSON.stringify({
 });
 
 /** The digest `dispatchAttempt` recomputes for the default fake brief. */
-const FAKE_BRIEF_DIGEST = simpleDeterministicHexDigest(FAKE_BRIEF_FILE + '\n' + FAKE_BRIEF_FILE);
+const FAKE_BRIEF_DIGEST = simpleDeterministicHexDigest(FAKE_BRIEF_PROSE + '\n' + FAKE_BRIEF_FILE);
 
 function makeAttemptRepo(): AttemptRepositoryPort & { attempts: Map<string, AttemptRecord> } {
   const attempts = new Map<string, AttemptRecord>();
@@ -1363,7 +1363,8 @@ function makeWorkspace(
     },
     readWorktreeFile:
       options.readWorktreeFile ??
-      (async () => FAKE_BRIEF_FILE),
+      (async (_worktreePath, relativePath) =>
+        relativePath === '.lane/brief-manifest.json' ? FAKE_BRIEF_FILE : FAKE_BRIEF_PROSE),
   };
   return { port, calls };
 }
@@ -1711,13 +1712,14 @@ describe('DispatchAttemptUseCase', () => {
     });
     const setup = makeDispatchSetup({
       workspaceOptions: {
-        readWorktreeFile: async () => manifestJson,
+        readWorktreeFile: async (_worktreePath, relativePath) =>
+          relativePath === '.lane/brief-manifest.json' ? manifestJson : FAKE_BRIEF_PROSE,
       },
     });
 
     const result = await setup.useCase.dispatchAttempt(
       validDispatchRequest({
-        briefDigest: simpleDeterministicHexDigest(manifestJson + '\n' + manifestJson),
+        briefDigest: simpleDeterministicHexDigest(FAKE_BRIEF_PROSE + '\n' + manifestJson),
       }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
     );
 
@@ -1754,13 +1756,14 @@ describe('DispatchAttemptUseCase', () => {
       });
       const setup = makeDispatchSetup({
         workspaceOptions: {
-          readWorktreeFile: async () => manifestJson,
+          readWorktreeFile: async (_worktreePath, relativePath) =>
+            relativePath === '.lane/brief-manifest.json' ? manifestJson : FAKE_BRIEF_PROSE,
         },
       });
 
       const result = await setup.useCase.dispatchAttempt(
         validDispatchRequest({
-          briefDigest: simpleDeterministicHexDigest(manifestJson + '\n' + manifestJson),
+          briefDigest: simpleDeterministicHexDigest(FAKE_BRIEF_PROSE + '\n' + manifestJson),
         }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
       );
 
@@ -2233,11 +2236,16 @@ describe('DispatchAttemptUseCase', () => {
   });
 
   it('refuses dispatch when the frozen prose read throws (D3)', async () => {
+    let manifestRead = false;
     const setup = makeDispatchSetup({
       workspaceOptions: {
-        readWorktreeFile: async (worktreePath, relativePath) => {
+        readWorktreeFile: async (_worktreePath, relativePath) => {
           if (relativePath === '.lane/brief-manifest.json') {
+            manifestRead = true;
             return FAKE_BRIEF_FILE;
+          }
+          if (!manifestRead) {
+            return null;
           }
           throw new Error('permission denied');
         },

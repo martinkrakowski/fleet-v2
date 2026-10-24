@@ -33,6 +33,7 @@ import {
 } from '../ExecutionRunnerAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../AttemptRepositoryAdapter.adapter.js';
 import { DispatchAttemptUseCase } from '../../../application/use-cases/DispatchAttemptUseCase.use-case.js';
+import { simpleDeterministicHexDigest } from '../../../application/use-cases/PrepareBriefPackageUseCase.use-case.js';
 
 const capabilities: RunnerIsolationCapabilities = {
   source: 'legacy-asserted',
@@ -372,6 +373,8 @@ describe('Attempts record the installation host name (H3a)', () => {
         throw new Error('reserveCapacityAtomically must not be called');
       },
     };
+    const prose = '# Frozen brief';
+    const manifest = JSON.stringify({ modelAssignment: { model: 'm', agent: null, variant: null } });
     const workspace: WorkspacePort = {
       async inspectWorktree(request) {
         return {
@@ -384,8 +387,8 @@ describe('Attempts record the installation host name (H3a)', () => {
           missingExpectedArtifacts: [],
         };
       },
-      async readWorktreeFile() {
-        return JSON.stringify({ modelAssignment: { model: 'm', agent: null, variant: null } });
+      async readWorktreeFile(_worktreePath, relativePath) {
+        return relativePath === '.lane/brief-manifest.json' ? manifest : prose;
       },
     };
     const { runner } = scriptedRunner();
@@ -406,7 +409,7 @@ describe('Attempts record the installation host name (H3a)', () => {
       workOrderId: 'wo-1',
       worktreePath: '/lanes/attempt-1',
       briefPackagePath: '.lane/brief.md',
-      briefDigest: 'digest-1',
+      briefDigest: simpleDeterministicHexDigest(prose + '\n' + manifest),
       baseCommit: 'abc123',
       stepLimit: 40,
       timeLimitSeconds: 3600,

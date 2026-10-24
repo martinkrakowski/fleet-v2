@@ -441,6 +441,7 @@ describe("DispatchAttemptUseCase installationSchemaVersion (H9a2)", () => {
   it("refuses a manifest whose model assignment carries no seat tool for a v2 installation, and keeps the legacy default otherwise", async () => {
     const { DispatchAttemptUseCase } =
       await import("../src/application/use-cases/DispatchAttemptUseCase.use-case.js");
+    const prose = "# Brief prose";
     const manifest = JSON.stringify({
       modelAssignment: { model: "m", agent: null, variant: null },
     });
@@ -459,8 +460,8 @@ describe("DispatchAttemptUseCase installationSchemaVersion (H9a2)", () => {
           missingExpectedArtifacts: [],
         };
       },
-      async readWorktreeFile() {
-        return manifest;
+      async readWorktreeFile(_worktreePath: string, relativePath: string) {
+        return relativePath === ".lane/brief-manifest.json" ? manifest : prose;
       },
     };
     const runner = {
@@ -552,7 +553,7 @@ describe("DispatchAttemptUseCase installationSchemaVersion (H9a2)", () => {
       workOrderId: "wo-1",
       worktreePath: "/lanes/att-v2-dispatch",
       briefPackagePath: ".lane/brief.md",
-      briefDigest: "digest-1",
+      briefDigest: simpleDeterministicHexDigest(prose + "\n" + manifest),
       baseCommit: "abc123",
       stepLimit: 40,
       timeLimitSeconds: 3600,

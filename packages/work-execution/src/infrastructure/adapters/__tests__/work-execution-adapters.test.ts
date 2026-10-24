@@ -734,6 +734,26 @@ describe('AttemptArtifactAdapter', () => {
     const missing = await adapter.readBriefManifest(repoPath, path.join(repoPath, '.lane', 'missing-manifest.json'));
     expect(missing).toBeNull();
   });
+
+  it('reads a brief file when present, returns null when absent, and refuses ../x or an absolute path', async () => {
+    const repoPath = await createGitRepo();
+    await fs.mkdir(path.join(repoPath, '.lane'), { recursive: true });
+    await fs.writeFile(path.join(repoPath, '.lane', 'brief.md'), '# Frozen brief\n', 'utf8');
+    const adapter = new AttemptArtifactAdapter({ executor: new LocalExecutor() });
+
+    const content = await adapter.readBriefFile(repoPath, '.lane/brief.md');
+    expect(content).toBe('# Frozen brief\n');
+
+    const missing = await adapter.readBriefFile(repoPath, '.lane/missing-brief.md');
+    expect(missing).toBeNull();
+
+    await expect(adapter.readBriefFile(repoPath, '../x')).rejects.toThrow(
+      "Refused worktree path '../x': path must stay within the worktree (no .. segments)",
+    );
+    await expect(adapter.readBriefFile(repoPath, '/etc/passwd')).rejects.toThrow(
+      "Refused worktree path '/etc/passwd': path must be worktree-relative, not absolute",
+    );
+  });
 });
 
 describe('ExecutionRunnerAdapter', () => {

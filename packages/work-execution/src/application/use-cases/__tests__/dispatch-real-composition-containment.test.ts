@@ -202,6 +202,19 @@ describe('dispatch through the real adapters refuses uncontained brief paths', (
     }
     expect(calls.filter((call) => call.argv.some((argument) => argument === '../x'))).toHaveLength(0);
   });
+
+  it('readBriefFile refuses ../x and an absolute path and never cats them', async () => {
+    const { executor, calls } = fakeExecutor();
+    const adapter = new AttemptArtifactAdapter({ executor });
+
+    await expect(adapter.readBriefFile('/wt', '../x')).rejects.toThrow(
+      "Refused worktree path '../x': path must stay within the worktree (no .. segments)",
+    );
+    await expect(adapter.readBriefFile('/wt', '/etc/passwd')).rejects.toThrow(
+      "Refused worktree path '/etc/passwd': path must be worktree-relative, not absolute",
+    );
+    expect(calls).toHaveLength(0);
+  });
 });
 
 describe('dispatch through the real adapters recomputes the frozen brief digest (D3)', () => {
@@ -231,7 +244,7 @@ describe('dispatch through the real adapters recomputes the frozen brief digest 
     return { repoPath, head: stdout.trim() };
   }
 
-  function makeStartedRunner(): ExecutionRunnerPort & { startCalls: unknown[] } {
+  function makeStartedRunner(): { runner: ExecutionRunnerPort; startCalls: unknown[] } {
     const startCalls: unknown[] = [];
     const runner: ExecutionRunnerPort = {
       describeCapabilities: () => ({
@@ -270,7 +283,7 @@ describe('dispatch through the real adapters recomputes the frozen brief digest 
     return { runner, startCalls };
   }
 
-  function makeRealDispatchSetup(repoPath: string, head: string, runner: ExecutionRunnerPort) {
+  function makeRealDispatchSetup(repoPath: string, runner: ExecutionRunnerPort) {
     const workOrderRepo = makeWorkOrderRepo();
     const attempts = new Map<string, AttemptRecord>();
     const attemptRepo: AttemptRepositoryPort & { attempts: Map<string, AttemptRecord> } = {
@@ -316,7 +329,12 @@ describe('dispatch through the real adapters recomputes the frozen brief digest 
       repository: 'git@example.org:acme/app.git',
       baseCommit: head,
       policyRevision: 'policy-7',
-      modelAssignment: { model: 'implementer-model', variant: 'default', seatTool: 'opencode' },
+      modelAssignment: {
+        model: 'implementer-model',
+        variant: 'default',
+        fallbackModel: 'fallback-model',
+        seatTool: 'opencode',
+      },
       independentReviewer: 'reviewer-model',
       ownedPaths: ['src/**'],
       permissions: ['filesystem:worktree'],
@@ -324,7 +342,7 @@ describe('dispatch through the real adapters recomputes the frozen brief digest 
       stepLimit: 40,
       timeLimitSeconds: 3600,
       resourceBounds: { cpu: '2' },
-      expectedArtifacts: ['docs/report.md'],
+      expectedArtifacts: [],
       ownerDecisionReferences: [],
       contextDecisions: [],
       attemptId: 'attempt-1',
@@ -355,18 +373,20 @@ describe('dispatch through the real adapters recomputes the frozen brief digest 
   it('dispatches past the digest check when the brief still matches its prepared digest', { timeout: 30000 }, async () => {
     const { repoPath, head } = await createTempGitWorktree();
     const prepared = await prepareRealBrief(repoPath, head);
-    const { runner, useCase } = makeRealDispatchSetup(repoPath, head, makeStartedRunner().runner);
+    const { runner, startCalls } = makeStartedRunner();
+    const { useCase } = makeRealDispatchSetup(repoPath, runner);
 
     const result = await useCase.dispatchAttempt(realDispatchRequest(repoPath, head, prepared));
 
     expect(result.outcome).toBe('started');
+    expect(startCalls).toHaveLength(1);
   });
 
   it('refuses when the frozen prose is edited after prepare, saving nothing and starting no runner', { timeout: 30000 }, async () => {
     const { repoPath, head } = await createTempGitWorktree();
     const prepared = await prepareRealBrief(repoPath, head);
     const { runner, startCalls } = makeStartedRunner();
-    const { attemptRepo, journal, useCase } = makeRealDispatchSetup(repoPath, head, runner);
+    const { attemptRepo, journal, useCase } = makeRealDispatchSetup(repoPath, runner);
 
     await fs.appendFile(prepared.prosePath, '\nEDITED AFTER PREPARE\n', 'utf8');
 

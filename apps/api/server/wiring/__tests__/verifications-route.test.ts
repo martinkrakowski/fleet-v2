@@ -18,6 +18,10 @@ import { afterEach, afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { parseInstallation, type FleetInstallation } from "@fleet/installation";
 import { AttemptRepositoryAdapter } from "@fleet/work-execution";
+import {
+  assessmentIdForAttempt,
+  EvidenceAssessmentRepositoryAdapter,
+} from "@fleet/evidence-and-acceptance";
 
 import {
   configureEvidenceUseCases,
@@ -61,6 +65,37 @@ function noVerifierInstallation(): FleetInstallation {
 }
 
 const createdDirs = new Set<string>();
+
+/** A minimal ended attempt record the seat resolver can read. */
+function seededAttempt(id: string) {
+  return {
+    id,
+    workOrderId: `wo-${id}`,
+    kind: "initial",
+    fixNumber: 0,
+    priorAttemptId: null,
+    worktreePath: `/srv/fleet/worktrees/${id}`,
+    baseCommit: "0".repeat(40),
+    state: "ended",
+    outcome: "done",
+    briefDigest: null,
+    briefPackagePath: null,
+    sessionId: null,
+    completionReceipt: null,
+    artifacts: null,
+    runner: {
+      kind: "opencode",
+      remotePort: 46000,
+      host: null,
+      hostName: "here",
+      agent: "lane",
+      model: "provider/glm-5.3",
+      variant: null,
+    },
+    createdAtIso: "2026-10-17T08:00:00.000Z",
+    updatedAtIso: "2026-10-17T08:00:00.000Z",
+  } as const;
+}
 
 async function makeTempDir(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "fleet-verifications-route-"));
@@ -142,7 +177,6 @@ describe("POST /v1/verifications with a v2 installation (H4 follow-ups)", () => 
     );
 
     const response = await callVerifications({
-      assessmentId: "assess-400",
       projectId: "proj",
       attemptId: "att-400",
       candidateHeadSha: "a".repeat(40),
@@ -199,7 +233,6 @@ describe("POST /v1/verifications with a v2 installation (H4 follow-ups)", () => 
     );
 
     const response = await callVerifications({
-      assessmentId: "assess-nv",
       projectId: "proj",
       attemptId: "att-nv",
       candidateHeadSha: "a".repeat(40),
@@ -220,5 +253,58 @@ describe("POST /v1/verifications with a v2 installation (H4 follow-ups)", () => 
     // checks run locally instead of the request being refused.
     expect(envelope.result.receipts[0]?.hostId).toBe("here");
     expect(envelope.result.receipts[0]?.result).toBe("unknown");
+  });
+
+  it("derives assessment-<attemptId> when assessmentId is omitted", async () => {
+    const stateDir = await makeTempDir();
+    const installation = noVerifierInstallation();
+    const attempts = new AttemptRepositoryAdapter({ stateDir });
+    await attempts.saveAttempt({ ...seededAttempt("att-nv") });
+    configureWorkComposition(
+      createConfiguredWorkComposition({ stateDir, installation }),
+    );
+    configureEvidenceUseCases(
+      createConfiguredEvidenceUseCases({ stateDir, installation }),
+    );
+
+    const response = await callVerifications({
+      projectId: "proj",
+      attemptId: "att-nv",
+      candidateHeadSha: "a".repeat(40),
+      policyRevision: "policy-1",
+      requiredChecks: ["gate"],
+    });
+    expect(response.status).toBe(200);
+    const repo = new EvidenceAssessmentRepositoryAdapter({ stateDir });
+    const record = await repo.findAssessmentById(assessmentIdForAttempt("att-nv"));
+    expect(record).not.toBeNull();
+    expect(record?.attemptId).toBe("att-nv");
+  });
+
+  it("answers 400 when assessmentId does not match the attempt's derived id", async () => {
+    const stateDir = await makeTempDir();
+    const installation = noVerifierInstallation();
+    const attempts = new AttemptRepositoryAdapter({ stateDir });
+    await attempts.saveAttempt({ ...seededAttempt("att-400") });
+    configureWorkComposition(
+      createConfiguredWorkComposition({ stateDir, installation }),
+    );
+    configureEvidenceUseCases(
+      createConfiguredEvidenceUseCases({ stateDir, installation }),
+    );
+
+    const response = await callVerifications({
+      assessmentId: "assessment-other",
+      projectId: "proj",
+      attemptId: "att-400",
+      candidateHeadSha: "a".repeat(40),
+      policyRevision: "policy-1",
+      requiredChecks: ["gate"],
+    });
+    expect(response.status).toBe(400);
+    expect(response.payload).toMatchObject({
+      statusCode: 400,
+      statusMessage: expect.stringContaining("assessment-att-400"),
+    });
   });
 });

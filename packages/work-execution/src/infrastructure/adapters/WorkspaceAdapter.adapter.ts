@@ -20,16 +20,15 @@
 import * as path from 'node:path';
 
 import {
-  WorktreePathRefusedError,
   type WorktreeInspection,
   type WorktreeInspectionRequest,
   type WorkspacePort,
 } from '../../application/ports/out/WorkspacePort.out-port.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
-import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { hasRecordedHostName } from './ConfirmRecordedHost.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
+import { resolveWorktreeTarget } from './worktree-target.js';
 
 export interface WorkspaceAdapterOptions {
   /**
@@ -159,7 +158,9 @@ export class WorkspaceAdapter implements WorkspacePort {
 
     const missingExpectedArtifacts: string[] = [];
     for (const expectedPath of request.expectedArtifactPaths) {
-      const absolutePath = path.join(worktreePath, expectedPath);
+      // Every caller-supplied expected-artifact path is contained here: an
+      // absolute or escaping entry is refused before any probe runs.
+      const absolutePath = resolveWorktreeTarget(worktreePath, expectedPath);
       if (!(await this.pathExists(worktreePath, absolutePath, executor))) {
         missingExpectedArtifacts.push(expectedPath);
       }
@@ -220,32 +221,11 @@ export class WorkspaceAdapter implements WorkspacePort {
     relativePath: string,
     recordedHost?: AttemptRunnerRecord | null,
   ): Promise<string | null> {
-    // A worktree can never be the filesystem root and can never be a
-    // relative path: both make the containment prefix degenerate (with an
-    // empty root every absolute path "lies inside" the worktree). Refuse
-    // such a worktree before any path conversion and before any command,
-    // whatever the requested relative path is.
-    const trimmedWorktreeRoot = worktreePath.replace(/\/+$/, '');
-    if (trimmedWorktreeRoot === '' || !worktreePath.startsWith('/')) {
-      throw new WorktreePathRefusedError(
-        relativePath,
-        'worktree path must be an absolute path that is not the filesystem root',
-      );
-    }
-    // An absolute path is still accepted when it lies inside the worktree
-    // itself (callers may pass `${worktreePath}/.lane/brief.md`); it is
-    // rewritten to its worktree-relative form before validation. Any other
-    // absolute path is refused outright.
-    let candidatePath = relativePath;
-    const worktreeRoot = trimmedWorktreeRoot;
-    if (candidatePath.startsWith('/') && candidatePath.startsWith(`${worktreeRoot}/`)) {
-      candidatePath = candidatePath.slice(worktreeRoot.length + 1);
-    }
-    const refusedReason = validateWorktreeRelativePath(candidatePath);
-    if (refusedReason !== null) {
-      throw new WorktreePathRefusedError(relativePath, refusedReason);
-    }
-    const targetPath = path.join(worktreePath, candidatePath);
+    // Containment lives in the shared adapter helper: the worktree must be
+    // an absolute path that is not the filesystem root, an absolute candidate
+    // is accepted only when it lies inside the worktree itself, and the
+    // relative form must pass the domain check — all before any command.
+    const targetPath = resolveWorktreeTarget(worktreePath, relativePath);
     const executor = this.executorFor(recordedHost);
     const result = await executor.run(['cat', targetPath], { timeoutMs: CAT_TIMEOUT_MS });
     // A null exit code (spawn failure, timeout) is a failed read, not an

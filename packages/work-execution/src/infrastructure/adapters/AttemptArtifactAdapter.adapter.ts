@@ -30,6 +30,7 @@ import type { CommandExecutorPort } from '../../application/ports/out/CommandExe
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { hasRecordedHostName } from './ConfirmRecordedHost.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
+import { resolveWorktreeTarget, worktreeRootRefusal } from './worktree-target.js';
 
 export interface AttemptArtifactAdapterOptions {
   /**
@@ -107,6 +108,12 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
   }
 
   async placeFrozenBrief(request: PlaceFrozenBriefRequest): Promise<PlaceFrozenBriefResult> {
+    // Brief placement joins only fixed `.lane` names, but the worktree itself
+    // must still be a sound containment prefix before any command runs.
+    const rootRefusal = worktreeRootRefusal(request.worktreePath);
+    if (rootRefusal !== null) {
+      return { outcome: 'refused', reason: rootRefusal };
+    }
     const executor = this.executorFor();
     const briefTargets = ['.lane/brief.md', '.lane/brief-manifest.json'];
     const ignored = await this.verifyIgnoredPaths({
@@ -198,9 +205,11 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     for (const artifactPath of candidateArtifactPaths) {
       if (seenPaths.has(artifactPath)) continue;
       seenPaths.add(artifactPath);
+      // Every caller-supplied expected-artifact path is contained here: an
+      // absolute or escaping entry is refused before any probe runs.
       const exists = await this.pathExists(
         worktreePath,
-        path.join(worktreePath, artifactPath),
+        resolveWorktreeTarget(worktreePath, artifactPath),
         executor,
       );
       if (exists) collectedArtifactPaths.push(artifactPath);
@@ -276,7 +285,13 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     manifestPath?: string,
     recordedHost?: AttemptRunnerRecord | null,
   ): Promise<string | null> {
-    const targetPath = manifestPath ?? path.join(worktreePath, '.lane', 'brief-manifest.json');
+    // The manifest path — the caller-supplied one or the `.lane` default —
+    // is contained here, so an absolute or escaping path is refused before
+    // any `cat` runs.
+    const targetPath = resolveWorktreeTarget(
+      worktreePath,
+      manifestPath ?? '.lane/brief-manifest.json',
+    );
     const executor = this.executorFor(recordedHost);
     const result = await executor.run(['cat', targetPath], { timeoutMs: CAT_TIMEOUT_MS });
     // A null exit code (spawn failure, timeout) is a failed read, not an

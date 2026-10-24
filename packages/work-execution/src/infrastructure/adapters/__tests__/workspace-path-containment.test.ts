@@ -123,6 +123,22 @@ describe('WorkspaceAdapter readWorktreeFile path containment', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it('refuses an escaping expected artifact path before any probe in inspection', async () => {
+    const { executor, calls } = fakeExecutor(() => ({ stdout: 'abc123\n' }));
+    const adapter = new WorkspaceAdapter({ executor });
+
+    await expect(
+      adapter.inspectWorktree({
+        worktreePath: '/wt',
+        baseCommit: 'abc123',
+        expectedArtifactPaths: ['../x'],
+      }),
+    ).rejects.toBeInstanceOf(WorktreePathRefusedError);
+    expect(calls.filter((call) => call.argv.some((argument) => argument === '../x'))).toHaveLength(
+      0,
+    );
+  });
+
   it('throws WorktreePathRefusedError for a path containing NUL bytes', async () => {
     const { executor, calls } = fakeExecutor(() => ({}));
     const adapter = new WorkspaceAdapter({ executor });

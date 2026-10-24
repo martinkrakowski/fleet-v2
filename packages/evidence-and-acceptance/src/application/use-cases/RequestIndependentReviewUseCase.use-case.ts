@@ -188,7 +188,14 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       implementerModel: request.implementerModel,
       readOnlyVerified: run.readOnlyVerified,
       result: run.result,
-      findings: run.findings.map((finding) => ({ ...finding })),
+      // A reviewer-reported state is not a disposition: findings are stored
+      // unresolved, and only RecordFindingDispositionUseCase resolves them.
+      findings: run.findings.map((finding) => ({
+        ...finding,
+        state: 'unresolved' as const,
+        dispositionReason: null,
+        dispositionEvidenceRef: null,
+      })),
       evidenceRef: archived.evidenceRef,
       policyRevision: request.policyRevision,
       completedAtIso: run.completedAtIso,

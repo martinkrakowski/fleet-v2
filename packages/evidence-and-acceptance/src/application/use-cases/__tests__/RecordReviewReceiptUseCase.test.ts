@@ -246,6 +246,48 @@ describe('RecordReviewReceiptUseCase blank model handling', () => {
   });
 });
 
+describe('RecordReviewReceiptUseCase finding normalisation', () => {
+  it('stores incoming findings as unresolved with null disposition fields', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const useCase = new RecordReviewReceiptUseCase({ repo });
+
+    const receipt = sampleReceipt({
+      findings: [
+        {
+          findingId: 'f-1',
+          severity: 'major',
+          summary: 'summary for f-1',
+          filePath: null,
+          line: null,
+          state: 'fixed',
+          dispositionReason: 'caller-supplied reason',
+          dispositionEvidenceRef: 'evidence://caller-supplied',
+        },
+      ],
+    });
+
+    const result = await useCase.recordReviewReceipt({
+      assessmentId: 'asm-1',
+      receipt,
+    });
+
+    expect(result.outcome).toBe('recorded');
+    const stored = await repo.findAssessmentById('asm-1');
+    expect(stored?.reviewReceipts[0]?.findings).toEqual([
+      {
+        findingId: 'f-1',
+        severity: 'major',
+        summary: 'summary for f-1',
+        filePath: null,
+        line: null,
+        state: 'unresolved',
+        dispositionReason: null,
+        dispositionEvidenceRef: null,
+      },
+    ]);
+  });
+});
+
 describe('free-seat policy and requested reviewer (FS3b)', () => {
   it('refuses a receipt naming a reviewer other than the requested one', async () => {
     const repo = new InMemoryAssessmentRepo([

@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { Card, CardBody, CardHeader, RouteChip } from "@fleet/ui";
 import type { AttemptSummary } from "../fixture";
-import { attemptHref, summary } from "../derive";
+import { liveViewHref, summary } from "../derive";
 import styles from "../lanes.module.css";
 
 export function CapacityCard({
@@ -64,13 +64,9 @@ export function CapacityCard({
         {queuedAll > 0 ? (
           <div>
             <span className={styles.qLbl}>queued behind them</span>
-            {pendingAttempts.map((a) => (
-              <Link
-                key={a.id}
-                href={attemptHref(a)}
-                title={a.id}
-                className={styles.qitem}
-              >
+            {pendingAttempts.map((a) => {
+              const href = liveViewHref(a);
+              const chip = (
                 <span className={styles.qchip}>
                   <b className={styles.mono}>{a.id}</b>
                   <span>{a.wo}</span>
@@ -78,8 +74,26 @@ export function CapacityCard({
                     <span className={styles.mono}>{a.queueBound} bound</span>
                   ) : null}
                 </span>
-              </Link>
-            ))}
+              );
+              return href !== null ? (
+                <Link
+                  key={a.id}
+                  href={href}
+                  title={a.id}
+                  className={styles.qitem}
+                >
+                  {chip}
+                </Link>
+              ) : (
+                <span
+                  key={a.id}
+                  className={styles.qitem}
+                  title="the attempt view does not read the API yet"
+                >
+                  {chip}
+                </span>
+              );
+            })}
           </div>
         ) : (
           <p className={styles.qNone}>no queued intents</p>

@@ -33,7 +33,7 @@ function buildAttentionItems(attempts: AttemptSummary[]): AttentionItem[] {
             <b>{a.id}</b> runner did not answer
           </>
         ),
-        ss: `${note} · slot ${a.slot ?? "no slot recorded"} stays held · reconcile returns 409, not a guess`
+        ss: `${note} · ${a.slot === null ? "no slot recorded" : `slot ${a.slot} stays held`} · reconcile returns 409, not a guess`
       });
     }
     const decision = a.receipts.decision;

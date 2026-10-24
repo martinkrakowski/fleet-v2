@@ -26,10 +26,21 @@ describe("LanesClient live-source wiring", () => {
   it("labels live API rows and never links them to the fixture-only attempt view", () => {
     expect(client).toContain("live · GET /v1/attempts");
     expect(client).not.toContain('import { attempts');
-    expect(row).toContain('attempt.basis === "recorded"');
+    expect(row).toMatch(
+      /import\s*\{[^}]*\bliveViewHref\b[^}]*\}\s*from\s*"\.\.\/derive"/,
+    );
+    expect(row).toContain("liveViewHref(attempt)");
+    expect(row).not.toContain("href={attemptHref(");
     expect(row).toContain("no live view");
     expect(row).toContain('aria-disabled="true"');
     expect(row).toContain("the attempt view does not read the API yet");
+    expect(row).toContain("observedLine(attempt, note)");
+    expect(capacity).toMatch(
+      /import\s*\{[^}]*\bliveViewHref\b[^}]*\}\s*from\s*"\.\.\/derive"/,
+    );
+    expect(capacity).toContain("liveViewHref(a)");
+    expect(capacity).not.toContain("href={attemptHref(");
+    expect(capacity).toContain("the attempt view does not read the API yet");
   });
 
   it("reports that the API does not serve the slot budget", () => {
@@ -40,7 +51,9 @@ describe("LanesClient live-source wiring", () => {
   });
 
   it("labels recorded rows without a slot", () => {
-    expect(attention).toContain('a.slot ?? "no slot recorded"');
+    expect(attention).toContain(
+      'a.slot === null ? "no slot recorded" : `slot ${a.slot} stays held`',
+    );
   });
 
   it("refreshes only the visible live source on a schedule", () => {

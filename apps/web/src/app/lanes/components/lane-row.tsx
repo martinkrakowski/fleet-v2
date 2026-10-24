@@ -3,7 +3,14 @@
 import Link from "next/link";
 import { Badge } from "@fleet/ui";
 import type { AttemptSummary, WorkOrderSummary } from "../fixture";
-import { attemptHref, isLive, laneIdLine, summary, woOf } from "../derive";
+import {
+  isLive,
+  laneIdLine,
+  liveViewHref,
+  observedLine,
+  summary,
+  woOf,
+} from "../derive";
 import { LiveClock } from "./live-clock";
 import styles from "../lanes.module.css";
 
@@ -24,7 +31,7 @@ export function LaneRow({
 }: LaneRowProps) {
   const [word, note] = summary(attempt);
   const wo = woOf(attempt, workOrders);
-  const href = attemptHref(attempt);
+  const href = liveViewHref(attempt);
   const live = isLive(attempt);
   return (
     <li className={`${styles.lane}${selected ? ` ${styles.laneSel}` : ""}`}>
@@ -60,7 +67,11 @@ export function LaneRow({
             {laneIdLine(attempt, attempts)}
           </span>
         </button>
-        {attempt.basis === "recorded" ? (
+        {href !== null ? (
+          <Link className={styles.openLink} href={href}>
+            Open
+          </Link>
+        ) : (
           <span
             className={styles.openLink}
             aria-disabled="true"
@@ -68,15 +79,11 @@ export function LaneRow({
           >
             no live view
           </span>
-        ) : (
-          <Link className={styles.openLink} href={href}>
-            Open
-          </Link>
         )}
       </div>
       {selected ? (
         <div className={`${styles.laneMore} ${styles.mono}`}>
-          observed {attempt.observedAt} · {attempt.observedFrom} · {note}
+          {observedLine(attempt, note)}
         </div>
       ) : null}
     </li>

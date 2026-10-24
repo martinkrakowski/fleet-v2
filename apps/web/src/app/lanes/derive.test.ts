@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { attempts, workOrders } from "./fixture";
 import type { AttemptSummary } from "./fixture";
-import { attemptHref, isLive, laneIdLine, summary, woOf } from "./derive";
+import {
+  attemptHref,
+  isLive,
+  laneIdLine,
+  liveViewHref,
+  observedLine,
+  summary,
+  woOf,
+} from "./derive";
 
 function recorded(state: string): AttemptSummary {
   return {
@@ -172,6 +180,33 @@ describe("attemptHref", () => {
   it("URL-encodes an id containing & and #", () => {
     expect(attemptHref({ ...attempts[0], id: "att_1&2#3" })).toBe(
       "/attempt?id=att_1%262%233",
+    );
+  });
+});
+
+describe("liveViewHref", () => {
+  it("is null for a recorded row and /attempt?id=<encoded id> for a fixture row", () => {
+    expect(liveViewHref(recorded("running"))).toBeNull();
+    expect(liveViewHref({ ...attempts[0], id: "att_1&2#3" })).toBe(
+      "/attempt?id=att_1%262%233",
+    );
+  });
+});
+
+describe("observedLine", () => {
+  it("starts with recorded for a recorded row and observed for a fixture row", () => {
+    const rec = recorded("running");
+    const recLine = observedLine(rec, summary(rec)[1]);
+    expect(recLine.startsWith("recorded ")).toBe(true);
+    expect(recLine).toBe(
+      "recorded 2026-10-24T10:05:00Z · recorded state · running · recorded, not observed",
+    );
+
+    const fix = attempts[0];
+    const fixLine = observedLine(fix, summary(fix)[1]);
+    expect(fixLine.startsWith("observed ")).toBe(true);
+    expect(fixLine).toBe(
+      `observed ${fix.observedAt} · ${fix.observedFrom} · running · 21 lane min`,
     );
   });
 });

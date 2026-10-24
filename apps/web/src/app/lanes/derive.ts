@@ -111,6 +111,13 @@ export const attemptsOf = (wo: string, list: AttemptSummary[] = attempts) =>
   list.filter((a) => a.wo === wo);
 export const attemptHref = (a: AttemptSummary) =>
   `/attempt?id=${encodeURIComponent(a.id)}`;
+export function liveViewHref(a: AttemptSummary): string | null {
+  return a.basis === "recorded" ? null : attemptHref(a);
+}
+export function observedLine(a: AttemptSummary, note: string): string {
+  const verb = a.basis === "recorded" ? "recorded" : "observed";
+  return `${verb} ${a.observedAt} · ${a.observedFrom} · ${note}`;
+}
 export const isLive = (a: AttemptSummary) =>
   a.basis !== "recorded" && a.facts.active === "yes" && a.facts.ended === "no";
 

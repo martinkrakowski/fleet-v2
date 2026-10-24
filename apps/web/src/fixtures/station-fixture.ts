@@ -66,7 +66,7 @@ export interface AttemptSummary {
   number: number;
   fixOf: string | null;
   session: string | null;
-  port: number;
+  port: number | null;
   slot: number | null;
   capacity: CapacityState;
   startedAt: string | null;
@@ -88,6 +88,10 @@ export interface AttemptSummary {
   cost: { steps: number; minutes: number; usd: number } | null;
   legal: string[];
   notOffered: NotOffered[];
+  /** Absent means observed (the fixture); recorded rows come from the API list. */
+  basis?: "observed" | "recorded";
+  /** The API's recorded state word, present only when `basis` is "recorded". */
+  recordedState?: string;
 }
 
 export const capacity = { host: "execution host A", port: 4166, slots: 3 };

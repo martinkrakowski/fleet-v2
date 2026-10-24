@@ -678,6 +678,26 @@ describe('RecordVerificationReceiptUseCase', () => {
   });
 });
 
+describe('RecordVerificationReceiptUseCase malformed input', () => {
+  it('returns rejected instead of throwing for null, string, number and an object missing a required field', async () => {
+    const repo = fakeRepository([assessmentRecord()]);
+    const useCase = new RecordVerificationReceiptUseCase({ repo });
+
+    const missingRequiredField = verificationReceipt();
+    delete (missingRequiredField as { evidenceRef?: string }).evidenceRef;
+
+    const inputs: unknown[] = [null, 'x', 42, missingRequiredField];
+    for (const receipt of inputs) {
+      const result = await useCase.recordVerificationReceipt({
+        assessmentId: 'ea-1',
+        receipt: receipt as never,
+      });
+      expect(result.outcome).toBe('rejected');
+    }
+    expect(repo.saved).toBe(0);
+  });
+});
+
 describe('RecordReviewReceiptUseCase', () => {
   it('rejects a review that was not verified read-only', async () => {
     const useCase = new RecordReviewReceiptUseCase({
@@ -877,6 +897,31 @@ describe('RecordFindingDispositionUseCase', () => {
     }
     expect(result.assessment.reviewReceipts[0]?.findings[0]?.state).toBe('refuted');
     expect(result.assessment.blockers).toEqual([]);
+  });
+});
+
+describe('RecordFindingDispositionUseCase malformed input', () => {
+  it('returns rejected instead of throwing for null, string, number and an object missing a required field', async () => {
+    const repo = fakeRepository([
+      assessmentRecord({
+        requiredChecks: [],
+        reviewReceipts: [reviewReceipt({ result: 'fail', findings: [finding('f-1')] })],
+      }),
+    ]);
+    const useCase = new RecordFindingDispositionUseCase({ repo });
+
+    const missingRequiredField = disposition();
+    delete (missingRequiredField as { recordedBy?: string }).recordedBy;
+
+    const inputs: unknown[] = [null, 'x', 42, missingRequiredField];
+    for (const received of inputs) {
+      const result = await useCase.recordFindingDisposition({
+        assessmentId: 'ea-1',
+        disposition: received as never,
+      });
+      expect(result.outcome).toBe('rejected');
+    }
+    expect(repo.saved).toBe(0);
   });
 });
 

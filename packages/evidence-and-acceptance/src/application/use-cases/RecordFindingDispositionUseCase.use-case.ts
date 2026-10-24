@@ -7,6 +7,7 @@
 
 import type { EvidenceAssessmentRecord, ReviewFindingRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
+import { FindingDisposition } from '../../domain/entities/FindingDisposition.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type {
@@ -77,6 +78,16 @@ export class RecordFindingDispositionUseCase implements RecordFindingDisposition
       return { outcome: 'rejected', reason: 'Recording requires an assessmentId and a disposition' };
     }
     const disposition = request.disposition;
+
+    // Malformed dispositions are typed rejections, never throws.
+    const validatedDisposition = FindingDisposition.create(disposition);
+    if (!validatedDisposition.success || validatedDisposition.value === undefined) {
+      return {
+        outcome: 'rejected',
+        reason: validatedDisposition.error?.message ?? 'Invalid finding disposition',
+      };
+    }
+
     const dispositionState = disposition.state;
 
     const assessment = await deps.repo.findAssessmentById(request.assessmentId);

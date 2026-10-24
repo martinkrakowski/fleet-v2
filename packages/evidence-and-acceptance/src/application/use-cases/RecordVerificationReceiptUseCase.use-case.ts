@@ -7,6 +7,7 @@
 
 import type { EvidenceAssessmentRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
+import { VerificationReceipt } from '../../domain/entities/VerificationReceipt.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type {
@@ -58,6 +59,15 @@ export class RecordVerificationReceiptUseCase implements RecordVerificationRecei
       return { outcome: 'rejected', reason: 'Recording requires an assessmentId and a receipt' };
     }
     const receipt = request.receipt;
+
+    // Malformed receipts are typed rejections, never throws.
+    const validatedReceipt = VerificationReceipt.create(receipt);
+    if (!validatedReceipt.success || validatedReceipt.value === undefined) {
+      return {
+        outcome: 'rejected',
+        reason: validatedReceipt.error?.message ?? 'Invalid verification receipt',
+      };
+    }
 
     const assessment = await deps.repo.findAssessmentById(request.assessmentId);
     if (assessment === null) {

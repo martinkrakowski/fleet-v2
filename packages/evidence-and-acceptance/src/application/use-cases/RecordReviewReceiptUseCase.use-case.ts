@@ -154,7 +154,22 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
       }
     }
 
-    const validatedReceipt = ReviewReceipt.create(receipt);
+    // Caller-supplied finding states are not trusted: every incoming finding is
+    // normalised to unresolved with null disposition fields. Dispositions are
+    // recorded only through RecordFindingDispositionUseCase.
+    const normalizedReceipt = Array.isArray(receipt.findings)
+      ? {
+          ...receipt,
+          findings: receipt.findings.map((finding) => ({
+            ...finding,
+            state: 'unresolved' as const,
+            dispositionReason: null,
+            dispositionEvidenceRef: null,
+          })),
+        }
+      : receipt;
+
+    const validatedReceipt = ReviewReceipt.create(normalizedReceipt);
     if (!validatedReceipt.success || validatedReceipt.value === undefined) {
       return {
         outcome: 'rejected',
@@ -163,7 +178,7 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
     }
 
     const aggregate = EvidenceAssessment.fromRecord(assessment);
-    aggregate.appendReviewReceipt(receipt, isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString());
+    aggregate.appendReviewReceipt(normalizedReceipt, isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString());
     const merged = aggregate.toRecord();
     const blockers = EvidenceAssessment.fromRecord(merged).collectBlockers();
     const updated: EvidenceAssessmentRecord = {

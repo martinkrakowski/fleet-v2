@@ -355,6 +355,7 @@ bounded_contexts:
           - StopAttemptUseCase
           - InspectWorkOrderUseCase
           - InspectAttemptUseCase
+          - ListAttemptsUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -369,6 +370,7 @@ bounded_contexts:
             - StopAttemptPort
             - InspectWorkOrderPort
             - InspectAttemptPort
+            - ListAttemptsPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -406,6 +408,7 @@ bounded_contexts:
       StopAttemptPort: "Request cancellation of the identified runner session and establish its actual end before releasing capacity."
       InspectWorkOrderPort: "Return the work order, attempt identities and separately reported/observed status with source and revision references."
       InspectAttemptPort: "Return the attempt record safely without invoking the runner or mutating server state."
+      ListAttemptsPort: "Return recorded attempts newest first, each with its work-order summary and held capacity reservation, without invoking the runner or mutating server state; recorded state is never presented as a runner observation."
       WorkOrderRepositoryPort: "Persist work-order revisions with optimistic concurrency and retrieve orders by project and dependency identity."
       AttemptRepositoryPort: "Persist immutable dispatch identity and guarded lifecycle updates; return known absence separately from unreadable state."
       ExecutionJournalPort: "Atomically record intent, capacity and action receipts; a host has one designated dispatcher until shared arbitration is implemented."

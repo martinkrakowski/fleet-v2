@@ -21,6 +21,7 @@ import {
   resolveInstallationForgeMode,
   resolveRoleExecutors,
   resolveRunnerCapabilityProfile,
+  sha256HexDigest,
   type AcceptanceAssessmentDelegate,
   type AcceptanceEvidenceDelegate,
   type ActionAuthorizationDelegate,
@@ -367,6 +368,7 @@ export function createConfiguredWorkComposition(
       briefAuthoring,
       artifactPort,
       briefKnowledge,
+      computeDigest: sha256HexDigest,
     }),
     reserveExecutionCapacity: new ReserveExecutionCapacityUseCase({ journal, attemptRepo }),
     dispatchAttempt: new DispatchAttemptUseCase({
@@ -377,6 +379,7 @@ export function createConfiguredWorkComposition(
       runner,
       observation,
       artifactPort,
+      computeDigest: sha256HexDigest,
       allowedSeats,
     }),
     reconcileAttempt: new ReconcileAttemptUseCase({

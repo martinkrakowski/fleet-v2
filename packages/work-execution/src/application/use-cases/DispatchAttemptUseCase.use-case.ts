@@ -173,6 +173,13 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       };
     }
 
+    if (typeof request.briefPackagePath !== 'string' || !request.briefPackagePath.endsWith('.md')) {
+      return {
+        outcome: 'refused',
+        reason: `briefPackagePath must name the frozen prose (.md), got ${String(request.briefPackagePath)}`,
+      };
+    }
+
     // Request-validation entry check: every expected-artifact path must be a
     // contained worktree-relative path, refused here before any inspection.
     for (const artifact of request.expectedArtifacts ?? []) {
@@ -295,7 +302,6 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     let manifestRaw: string | null = null;
     let parsedManifest: Record<string, unknown> | null = null;
     const manifestCandidates = [
-      request.briefPackagePath,
       request.briefPackagePath.replace(/\.md$/, '-manifest.json'),
       '.lane/brief-manifest.json',
     ];

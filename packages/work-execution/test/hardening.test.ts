@@ -33,7 +33,7 @@ function createMockAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecor
     state: 'ended',
     outcome: 'done',
     briefDigest: 'sha256-brief',
-    briefPackagePath: '/briefs/brief.json',
+    briefPackagePath: '/briefs/brief.md',
     sessionId: 'session-1',
     completionReceipt: {
       attemptId: 'att-1',

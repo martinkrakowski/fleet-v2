@@ -24,7 +24,7 @@ import {
   RUNNER_ENV_ALLOWLIST,
   buildRunnerEnv,
 } from '../ExecutionRunnerAdapter.adapter.js';
-import { AttemptArtifactAdapter } from '../AttemptArtifactAdapter.adapter.js';
+import { AttemptArtifactAdapter, sha256HexDigest } from '../AttemptArtifactAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../AttemptRepositoryAdapter.adapter.js';
 import { BriefAuthoringAdapter } from '../BriefAuthoringAdapter.adapter.js';
 import { ExecutionJournalAdapter } from '../ExecutionJournalAdapter.adapter.js';
@@ -752,6 +752,12 @@ describe('AttemptArtifactAdapter', () => {
     );
     await expect(adapter.readBriefFile(repoPath, '/etc/passwd')).rejects.toThrow(
       'Refused worktree-relative path /etc/passwd: worktree-relative path must be relative',
+    );
+  });
+
+  it('computes sha256HexDigest against the known SHA-256 vector', () => {
+    expect(sha256HexDigest('abc')).toBe(
+      'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
     );
   });
 });

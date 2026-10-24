@@ -180,26 +180,42 @@ describe('dispatch through the real adapters refuses uncontained brief paths', (
     const { executor, calls } = fakeExecutor();
     const useCase = makeDispatchUseCase(executor);
 
-    const result = await useCase.dispatchAttempt(dispatchRequest('/etc/passwd'));
+    const nonMd = await useCase.dispatchAttempt(dispatchRequest('/etc/passwd'));
+    expect(nonMd).toEqual({
+      outcome: 'refused',
+      reason: 'briefPackagePath must name the frozen prose (.md), got /etc/passwd',
+    });
+
+    const result = await useCase.dispatchAttempt(dispatchRequest('/etc/passwd.md'));
 
     expect(result.outcome).toBe('refused');
     if (result.outcome === 'refused') {
       expect(result.reason).toContain('Failed to read brief manifest');
     }
-    expect(calls.filter((call) => call.argv.some((argument) => argument === '/etc/passwd'))).toHaveLength(0);
+    expect(
+      calls.filter((call) => call.argv.some((argument) => argument.includes('/etc/passwd'))),
+    ).toHaveLength(0);
   });
 
   it('refuses a ../x brief package path and never cats it', async () => {
     const { executor, calls } = fakeExecutor();
     const useCase = makeDispatchUseCase(executor);
 
-    const result = await useCase.dispatchAttempt(dispatchRequest('../x'));
+    const nonMd = await useCase.dispatchAttempt(dispatchRequest('../x'));
+    expect(nonMd).toEqual({
+      outcome: 'refused',
+      reason: 'briefPackagePath must name the frozen prose (.md), got ../x',
+    });
+
+    const result = await useCase.dispatchAttempt(dispatchRequest('../x.md'));
 
     expect(result.outcome).toBe('refused');
     if (result.outcome === 'refused') {
       expect(result.reason).toContain('Failed to read brief manifest');
     }
-    expect(calls.filter((call) => call.argv.some((argument) => argument === '../x'))).toHaveLength(0);
+    expect(
+      calls.filter((call) => call.argv.some((argument) => argument.includes('../x'))),
+    ).toHaveLength(0);
   });
 
   it('readBriefFile refuses ../x and an absolute path and never cats them', async () => {
@@ -388,6 +404,33 @@ describe('dispatch through the real adapters recomputes the frozen brief digest 
     const { attemptRepo, journal, useCase } = makeRealDispatchSetup(repoPath, runner);
 
     await fs.appendFile(prepared.prosePath, '\nEDITED AFTER PREPARE\n', 'utf8');
+
+    const result = await useCase.dispatchAttempt(realDispatchRequest(repoPath, head, prepared));
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason:
+        'Frozen brief digest mismatch for attempt attempt-1: the brief or its manifest changed after it was prepared; run \'brief prepare\' again',
+    });
+    expect(startCalls).toHaveLength(0);
+    expect(journal.entries).toHaveLength(0);
+    expect(attemptRepo.attempts.size).toBe(0);
+    expect(journal.heldFor('attempt-1')).toBe(true);
+  });
+
+  it('refuses when .lane/brief-manifest.json is edited after prepare, saving nothing and starting no runner', { timeout: 30000 }, async () => {
+    const { repoPath, head } = await createTempGitWorktree();
+    const prepared = await prepareRealBrief(repoPath, head);
+    const { runner, startCalls } = makeStartedRunner();
+    const { attemptRepo, journal, useCase } = makeRealDispatchSetup(repoPath, runner);
+
+    const manifestPath = path.join(repoPath, '.lane', 'brief-manifest.json');
+    const manifestRaw = await fs.readFile(manifestPath, 'utf8');
+    await fs.writeFile(
+      manifestPath,
+      manifestRaw.replace('implementer-model', 'edited-model'),
+      'utf8',
+    );
 
     const result = await useCase.dispatchAttempt(realDispatchRequest(repoPath, head, prepared));
 

@@ -15,6 +15,7 @@
  * operator-authored prose.
  */
 
+import { createHash } from 'node:crypto';
 import * as path from 'node:path';
 
 import type {
@@ -65,6 +66,11 @@ const PROBE_TIMEOUT_MS = 60 * 1000;
 
 /** Wall-clock budget for one file read (`cat`). */
 const CAT_TIMEOUT_MS = 60 * 1000;
+
+/** Cryptographic SHA-256 hex digest injected by production composition roots. */
+export function sha256HexDigest(content: string): string {
+  return createHash('sha256').update(content, 'utf8').digest('hex');
+}
 
 export class AttemptArtifactAdapter implements AttemptArtifactPort {
   constructor(private readonly options?: AttemptArtifactAdapterOptions) {}

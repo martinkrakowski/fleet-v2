@@ -371,21 +371,11 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
         // Always delegate to the use case: it re-checks the attempt's one-way
         // doors before its idempotent accepted path, so a stored acceptance
         // whose owner decision has been withdrawn still blocks here.
-        let result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
+        const result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
           assessmentId: assessmentIdForAttempt(request.attemptId),
           candidateHeadSha: request.candidateHeadSha,
           policyRevision: request.policyRevision,
         });
-        // Legacy bare-id fallback: assessments written before the shared
-        // `assessment-<attemptId>` prefix still resolve through the assess
-        // path, mirroring the read path's fallback.
-        if (result.outcome === "rejected" && result.reason === "Assessment not found") {
-          result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
-            assessmentId: request.attemptId,
-            candidateHeadSha: request.candidateHeadSha,
-            policyRevision: request.policyRevision,
-          });
-        }
         switch (result.outcome) {
           case "accepted": {
             acceptedReceiptByHead[result.candidateHeadSha] = result.receiptId;

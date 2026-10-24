@@ -2678,6 +2678,42 @@ describe('StopAttemptUseCase', () => {
     });
   });
 
+  it('reports unknown without releasing when the aborted save loses to a concurrent session adopt', async () => {
+    const seed = storedAttempt({ state: 'blocked', sessionId: null });
+    const fresh = storedAttempt({
+      state: 'running',
+      sessionId: 'ses_adopted_elsewhere',
+      revision: 3,
+      updatedAtIso: '2026-10-15T08:06:00.000Z',
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      seed,
+      conflictOnSave: 1,
+      freshAfterConflict: fresh,
+    });
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner({
+      abortResult: { outcome: 'aborted', endedAtIso: '2026-10-22T12:00:00.000Z' },
+    });
+    const useCase = new StopAttemptUseCase({ attemptRepo, journal, runner: runner.port });
+
+    const result = await useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    const reason = `Worktree aborted, but attempt attempt-1 changed concurrently to running (session ses_adopted_elsewhere); run 'attempt reconcile'`;
+    expect(result).toEqual({ outcome: 'unknown', attempt: fresh, reason });
+    expect(attemptRepo.attempts.get('attempt-1')?.state).toBe('running');
+    expect(journal.heldFor('attempt-1')).toBe(true);
+    expect(journal.releaseCount).toBe(0);
+    expect(journal.entries).toHaveLength(2);
+    expect(journal.entries[1]).toMatchObject({
+      action: 'stop',
+      status: 'ambiguous',
+      sessionId: null,
+      detail: reason,
+    });
+  });
+
   it('keeps a session-less blocked attempt unchanged when the worktree is still running', async () => {
     const setup = makeStopSetup({
       attempt: { state: 'blocked', sessionId: null },

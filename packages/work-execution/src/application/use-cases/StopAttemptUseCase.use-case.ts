@@ -147,6 +147,25 @@ export class StopAttemptUseCase implements StopAttemptPort {
           attempt,
           nowIso,
         );
+        if (!ownsReservation) {
+          // The fresh record is neither terminal nor ours (a concurrent
+          // reconcile adopted another session, or a re-dispatch took the
+          // attempt over): nothing was cancelled and the reservation is not
+          // this stop's to release. Journal the ambiguity and let a
+          // reconcile resolve the fresh record.
+          const detail = `Worktree aborted, but attempt ${cancelled.id} changed concurrently to ${cancelled.state} (session ${cancelled.sessionId ?? 'none'}); run 'attempt reconcile'`;
+          await appendJournalEntry(deps.journal, {
+            attemptId: attempt.id,
+            workOrderId: attempt.workOrderId,
+            action: 'stop',
+            baseCommit: attempt.baseCommit,
+            recordedAtIso: nowIso,
+            status: 'ambiguous',
+            sessionId: null,
+            detail,
+          });
+          return { outcome: 'unknown', attempt: cancelled, reason: detail };
+        }
         const capacityReleased = ownsReservation
           ? await deps.journal.releaseCapacityReservation(attempt.id, nowIso)
           : false;

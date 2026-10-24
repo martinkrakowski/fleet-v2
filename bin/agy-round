@@ -36,15 +36,32 @@ Subcommands:
   commit --name <n> --message-file <local file> -- <path>...
   fetch --name <n> --branch <b> [--into <local git dir>]
 Environment (no defaults; a missing one is a usage error, exit 2):
-  AGY_ROUND_SSH, AGY_ROUND_ROOT, AGY_ROUND_GUARD_SSH, AGY_ROUND_GUARD_CMD,
-  AGY_ROUND_SETTLE (optional, default 20).
+  AGY_ROUND_SSH=<container>        ssh destination of the lane container
+  AGY_ROUND_ROOT=<root>            absolute path inside <container> for lane clones
+  AGY_ROUND_GUARD_SSH=<guard-host> ssh destination of the guard host
+  AGY_ROUND_GUARD_CMD=<command>    guard command run on <guard-host>
+  AGY_ROUND_SETTLE=<seconds>       optional settle delay before post-run guard (default 20)
 USAGE
 }
 
 die_usage() { echo "agy-round: $1" >&2; usage >&2; exit 2; }
 
+nl='
+'
+cr=$(printf '\r')
+at=$(printf '\100')
+
+reject_nl() { # $1: label, $2: value
+  case "$2" in
+    *"$nl"* | *"$cr"* | *[[:cntrl:]]*)
+      die_usage "$1 must not contain a newline or carriage return"
+      ;;
+  esac
+}
+
 # shq: single-quote one argument for the remote shell (' becomes '\'').
 shq() {
+  reject_nl "remote argument" "$1"
   case "$1" in
     *\'*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
     *) printf "'%s'" "$1" ;;
@@ -56,10 +73,25 @@ require_env() { # names, one per remaining argument
     v=$1; shift
     eval "val=\${$v:-}"
     [ -n "$val" ] || die_usage "environment variable $v is required"
+    reject_nl "$v" "$val"
   done
 }
 
+validate_root() {
+  reject_nl "AGY_ROUND_ROOT" "$AGY_ROUND_ROOT"
+  case "$AGY_ROUND_ROOT" in
+    /*) ;;
+    *) die_usage "AGY_ROUND_ROOT must be an absolute path" ;;
+  esac
+  case "$AGY_ROUND_ROOT" in
+    *[!A-Za-z0-9._/-]*)
+      die_usage "AGY_ROUND_ROOT contains invalid characters"
+      ;;
+  esac
+}
+
 validate_name() {
+  reject_nl "--name" "$1"
   case "$1" in
     '' | *..* | *[!a-z0-9._-]* | [!a-z0-9]*)
       die_usage "invalid --name '$1': lowercase letter or digit first, then letters/digits/._- , at most 64"
@@ -69,16 +101,47 @@ validate_name() {
 }
 
 validate_branch() {
+  reject_nl "--branch" "$1"
+  [ -n "$1" ] || die_usage "--branch is required"
   git check-ref-format --branch "$1" >/dev/null 2>&1 || die_usage "invalid branch '$1'"
 }
 
 validate_brief() {
+  reject_nl "--brief" "$1"
   case "$1" in
-    .lane/*) ;;
+    .lane/?*) ;;
     *) die_usage "--brief must be a relative path under .lane/" ;;
   esac
   case "$1" in
     *..* | *[[:space:]]*) die_usage "--brief must contain no .. and no whitespace" ;;
+  esac
+}
+
+validate_filename() { # $1: label, $2: filename
+  reject_nl "$1" "$2"
+  case "$2" in
+    '' | [!A-Za-z0-9]* | *[!A-Za-z0-9._-]*)
+      die_usage "invalid $1 '$2'"
+      ;;
+  esac
+}
+
+validate_model() {
+  reject_nl "--model" "$1"
+  case "$1" in
+    '' | [!A-Za-z0-9]* | *[!A-Za-z0-9._:/-]*)
+      die_usage "invalid --model '$1'"
+      ;;
+  esac
+}
+
+validate_timeout() {
+  reject_nl "--timeout" "$1"
+  t_digits=${1%[smh]}
+  case "$t_digits" in
+    '' | *[!0-9]*)
+      die_usage "invalid --timeout '$1'"
+      ;;
   esac
 }
 
@@ -109,7 +172,16 @@ case "$cmd" in
     done
     validate_name "$name"
     validate_branch "$branch"
+    [ -n "$brief" ] || die_usage "--brief is required"
+    reject_nl "--brief" "$brief"
+    case "$brief" in
+      */) die_usage "invalid --brief '$brief'" ;;
+    esac
+    base=$(basename "$brief")
+    validate_filename "brief basename" "$base"
+    [ -f "$brief" ] || die_usage "--brief '$brief' must be an existing regular file"
     require_env AGY_ROUND_SSH AGY_ROUND_ROOT
+    validate_root
     dir="$AGY_ROUND_ROOT/$name"
     # Refuse when the lane's clone already exists in the container.
     if ssh -o BatchMode=yes "$AGY_ROUND_SSH" "test -e $(shq "$dir")"; then
@@ -118,17 +190,21 @@ case "$cmd" in
     fi
     ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git init -q $(shq "$dir")" \
       || { echo "agy-round: git init failed in the container" >&2; exit 1; }
-    git -C "$from" -c core.hooksPath=/dev/null push -q "$AGY_ROUND_SSH:$dir" "HEAD:refs/heads/$branch" \
+    GIT_SSH_COMMAND='ssh -o BatchMode=yes' git -C "$from" -c core.hooksPath=/dev/null push -q "$AGY_ROUND_SSH:$dir" "HEAD:refs/heads/$branch" \
       || { echo "agy-round: push to the container failed" >&2; exit 1; }
     ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") -c core.hooksPath=/dev/null checkout -q $(shq "$branch")" \
       || { echo "agy-round: checkout in the container failed" >&2; exit 1; }
     ssh -o BatchMode=yes "$AGY_ROUND_SSH" "mkdir -p $(shq "$dir/.lane")" \
       || { echo "agy-round: mkdir .lane in the container failed" >&2; exit 1; }
-    base=$(basename "$brief")
-    scp -q "$brief" "$AGY_ROUND_SSH:$dir/.lane/$base" \
+    scp -q -o BatchMode=yes "$brief" "$AGY_ROUND_SSH:$dir/.lane/$base" \
       || { echo "agy-round: scp brief failed" >&2; exit 1; }
-    if ! ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") check-ignore -q $(shq ".lane/$base")"; then
+    ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") check-ignore -q $(shq ".lane/$base")"
+    ci_rc=$?
+    if [ "$ci_rc" -eq 1 ]; then
       echo "agy-round: brief path is not gitignored" >&2
+      exit 1
+    elif [ "$ci_rc" -ne 0 ]; then
+      echo "agy-round: could not check the brief path" >&2
       exit 1
     fi
     ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") log --oneline -1" \
@@ -156,8 +232,11 @@ case "$cmd" in
     done
     [ -n "$model" ] || die_usage "--model is required"
     validate_name "$name"
+    validate_model "$model"
+    validate_timeout "$timeout"
     validate_brief "$brief"
     require_env AGY_ROUND_SSH AGY_ROUND_ROOT AGY_ROUND_GUARD_SSH AGY_ROUND_GUARD_CMD
+    validate_root
     dir="$AGY_ROUND_ROOT/$name"
     # Guard check BEFORE: refuse to start agy when the container is not clean.
     if ! ssh -o BatchMode=yes "$AGY_ROUND_GUARD_SSH" "$AGY_ROUND_GUARD_CMD"; then
@@ -179,6 +258,11 @@ case "$cmd" in
       exit 1
     fi
     changes=$(ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") status --porcelain")
+    status_rc=$?
+    if [ "$status_rc" -ne 0 ]; then
+      echo "agy-round: could not read the clone's status" >&2
+      exit 1
+    fi
     echo '--- git status --porcelain ---'
     [ -z "$changes" ] || echo "$changes"
     echo '--- git diff --stat ---'
@@ -207,19 +291,40 @@ case "$cmd" in
     [ "$#" -ge 1 ] || die_usage "commit requires at least one path"
     validate_name "$name"
     [ -n "$msg" ] || die_usage "--message-file is required"
-    require_env AGY_ROUND_SSH AGY_ROUND_ROOT
-    dir="$AGY_ROUND_ROOT/$name"
-    add_cmd="git -C $(shq "$dir") add --"
+    reject_nl "--message-file" "$msg"
+    [ -f "$msg" ] || die_usage "--message-file '$msg' must be an existing regular file"
+    quoted_paths=''
     while [ "$#" -gt 0 ]; do
-      p=$1; shift
-      case "$p" in
-        '' | /* | *..*) die_usage "invalid path '$p': must be relative with no .." ;;
-        .lane | .lane/* | .git | .git/*) die_usage "refusing protected path '$p'" ;;
+      raw_p=$1; shift
+      reject_nl "commit path" "$raw_p"
+      case "$raw_p" in
+        '' | /*) die_usage "invalid path '$raw_p': must be a relative path" ;;
+        *[!A-Za-z0-9._/$at+-]*) die_usage "invalid path '$raw_p': contains forbidden characters" ;;
       esac
-      add_cmd="$add_cmd $(shq "$p")"
+      p=$raw_p
+      while :; do
+        case "$p" in
+          ./*) p=${p#./} ;;
+          *) break ;;
+        esac
+      done
+      case "$p" in
+        '' | /*) die_usage "invalid path '$raw_p': must be a non-empty relative path" ;;
+      esac
+      case "/$p/" in
+        */../*) die_usage "invalid path '$raw_p': must not contain .." ;;
+        */.lane/* | */.git/*) die_usage "refusing protected path '$raw_p'" ;;
+      esac
+      quoted_paths="$quoted_paths $(shq "$p")"
     done
-    tmp="$dir/.lane/.commit-msg.$$"
-    scp -q "$msg" "$AGY_ROUND_SSH:$tmp" \
+    require_env AGY_ROUND_SSH AGY_ROUND_ROOT
+    validate_root
+    dir="$AGY_ROUND_ROOT/$name"
+    add_cmd="git -C $(shq "$dir") add --$quoted_paths"
+    msg_base='agy-round-msg.txt'
+    validate_filename "message temp name" "$msg_base"
+    tmp="$dir/.lane/$msg_base"
+    scp -q -o BatchMode=yes "$msg" "$AGY_ROUND_SSH:$tmp" \
       || { echo "agy-round: scp message failed" >&2; exit 1; }
     if ! ssh -o BatchMode=yes "$AGY_ROUND_SSH" "$add_cmd"; then
       ssh -o BatchMode=yes "$AGY_ROUND_SSH" "rm -f $(shq "$tmp")"
@@ -255,9 +360,10 @@ case "$cmd" in
     validate_name "$name"
     validate_branch "$branch"
     require_env AGY_ROUND_SSH AGY_ROUND_ROOT
+    validate_root
     dir="$AGY_ROUND_ROOT/$name"
     # The -argon ref is this script's own: the fetch is forced (+).
-    git -C "$into" -c core.hooksPath=/dev/null fetch -q "$AGY_ROUND_SSH:$dir" "+$branch:refs/heads/$branch-argon" \
+    GIT_SSH_COMMAND='ssh -o BatchMode=yes' git -C "$into" -c core.hooksPath=/dev/null fetch -q "$AGY_ROUND_SSH:$dir" "+$branch:refs/heads/$branch-argon" \
       || { echo "agy-round: fetch failed" >&2; exit 1; }
     git -C "$into" log --oneline -1 "$branch-argon" \
       || { echo "agy-round: no ref $branch-argon" >&2; exit 1; }

@@ -56,6 +56,29 @@ describe('WorkspaceAdapter readWorktreeFile path containment', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it('reads an absolute path that lies inside the worktree', async () => {
+    const { executor, calls } = fakeExecutor(() => ({ stdout: 'brief-bytes' }));
+    const adapter = new WorkspaceAdapter({ executor });
+
+    expect(await adapter.readWorktreeFile('/wt', '/wt/.lane/brief.md')).toBe('brief-bytes');
+    expect(calls[0].argv).toEqual(['cat', '/wt/.lane/brief.md']);
+  });
+
+  it('throws WorktreePathRefusedError for absolute paths outside or beside the worktree', async () => {
+    const { executor, calls } = fakeExecutor(() => ({}));
+    const adapter = new WorkspaceAdapter({ executor });
+
+    for (const relativePath of ['/wt/../etc/passwd', '/wtx/a', '/etc/passwd']) {
+      await expect(adapter.readWorktreeFile('/wt', relativePath)).rejects.toBeInstanceOf(
+        WorktreePathRefusedError,
+      );
+      await expect(adapter.readWorktreeFile('/wt', relativePath)).rejects.toMatchObject({
+        relativePath,
+      });
+    }
+    expect(calls).toHaveLength(0);
+  });
+
   it('still reads a contained worktree file through the executor', async () => {
     const { executor, calls } = fakeExecutor((_call, index) =>
       index === 0 ? { stdout: 'manifest-bytes' } : { exitCode: 1 },

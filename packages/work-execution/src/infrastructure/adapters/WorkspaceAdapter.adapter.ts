@@ -220,11 +220,20 @@ export class WorkspaceAdapter implements WorkspacePort {
     relativePath: string,
     recordedHost?: AttemptRunnerRecord | null,
   ): Promise<string | null> {
-    const refusedReason = validateWorktreeRelativePath(relativePath);
+    // An absolute path is still accepted when it lies inside the worktree
+    // itself (callers may pass `${worktreePath}/.lane/brief.md`); it is
+    // rewritten to its worktree-relative form before validation. Any other
+    // absolute path is refused outright.
+    let candidatePath = relativePath;
+    const worktreeRoot = worktreePath.replace(/\/+$/, '');
+    if (candidatePath.startsWith('/') && candidatePath.startsWith(`${worktreeRoot}/`)) {
+      candidatePath = candidatePath.slice(worktreeRoot.length + 1);
+    }
+    const refusedReason = validateWorktreeRelativePath(candidatePath);
     if (refusedReason !== null) {
       throw new WorktreePathRefusedError(relativePath, refusedReason);
     }
-    const targetPath = path.join(worktreePath, relativePath);
+    const targetPath = path.join(worktreePath, candidatePath);
     const executor = this.executorFor(recordedHost);
     const result = await executor.run(['cat', targetPath], { timeoutMs: CAT_TIMEOUT_MS });
     // A null exit code (spawn failure, timeout) is a failed read, not an

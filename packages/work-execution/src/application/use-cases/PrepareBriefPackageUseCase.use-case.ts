@@ -140,6 +140,16 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     if (!isNonEmpty(worktreePath)) {
       return { outcome: 'rejected', reason: 'worktreePath is required' };
     }
+    // The worktree must be an absolute path that is not the filesystem root:
+    // a relative or root path makes the containment prefix degenerate (with
+    // an empty root every absolute path "lies inside" the worktree).
+    const trimmedWorktreePath = worktreePath.replace(/\/+$/, '');
+    if (trimmedWorktreePath === '' || !worktreePath.startsWith('/')) {
+      return {
+        outcome: 'rejected',
+        reason: 'worktreePath must be an absolute path that is not the filesystem root',
+      };
+    }
     // Expected artifacts are verified and frozen as relative paths; an
     // absolute or `..` entry would escape the worktree when read back.
     if (!Array.isArray(request.expectedArtifacts)) {

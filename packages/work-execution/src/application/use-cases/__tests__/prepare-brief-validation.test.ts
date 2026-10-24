@@ -113,6 +113,24 @@ describe('PrepareBriefPackageUseCase path validation', () => {
     }
   });
 
+  it('rejects a worktree path that is not absolute or is the filesystem root', async () => {
+    const useCase = makeUseCase();
+
+    for (const worktreePath of ['.', 'wt', '/', '//']) {
+      const result = await useCase.prepareBriefPackage(validRequest({ worktreePath }));
+      expect(result).toEqual({
+        outcome: 'rejected',
+        reason: 'worktreePath must be an absolute path that is not the filesystem root',
+      });
+    }
+  });
+
+  it('accepts an absolute non-root worktree path', async () => {
+    const useCase = makeUseCase();
+    const result = await useCase.prepareBriefPackage(validRequest({ worktreePath: '/wt' }));
+    expect(result.outcome).not.toBe('rejected');
+  });
+
   it('rejects when expectedArtifacts is not an array', async () => {
     const useCase = makeUseCase();
 

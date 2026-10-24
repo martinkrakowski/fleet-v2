@@ -361,7 +361,7 @@ share a wave with O12, U5 or each other, since all of them edit `scripts`.
 - Developers have git and a GitHub account if they choose `forge.mode: github`; `gh` is checked, never
   installed.
 - opencode is the default lane runner for both profiles; other runners arrive through O14.
-- The dated review report (`docs/reports/2026-10-15_port-completeness-and-security-review.md`) is a
+- The dated review report (the 2026-10-15 review report (moved to the private fleet repository, `docs/reports/fleet-v2/`)) is a
   historical record and keeps its wording; it is not product documentation.
 
 ## Decisions taken in this revision (owner may change)

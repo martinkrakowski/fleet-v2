@@ -380,7 +380,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     ) {
       return {
         outcome: 'refused',
-        reason: `Attempt ${existingAttempt.id} is ${existingAttempt.state}; run 'attempt reconcile' or 'attempt stop' before dispatching again`,
+        reason: `Attempt ${existingAttempt.id} is ${existingAttempt.state}; run 'attempt reconcile' (it resolves an attempt with no recorded session by inspecting its worktree) or 'attempt stop' before dispatching again`,
       };
     }
 

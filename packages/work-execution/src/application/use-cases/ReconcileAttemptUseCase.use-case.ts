@@ -129,9 +129,14 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
       runner = selection.runner;
     }
 
-    // A session-less blocked attempt keeps its reservation; the worktree may
-    // still be running a lane. Resolve it by directory, not by session id.
-    if (attempt.state === 'blocked' && !attempt.sessionId) {
+    // A session-less attempt in a claiming state (dispatching, reconciling,
+    // blocked) keeps its reservation; the worktree may still be running a
+    // lane. Resolve it by directory, not by session id. A session-less
+    // `intent-recorded` attempt keeps the fallback below.
+    if (
+      !attempt.sessionId &&
+      (attempt.state === 'dispatching' || attempt.state === 'reconciling' || attempt.state === 'blocked')
+    ) {
       if (!runner.inspectWorktreeRun) {
         return {
           outcome: 'unknown',
@@ -144,12 +149,16 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
         worktreePath: attempt.worktreePath,
         runner: attempt.runner,
       });
+      // Journal details and result reasons name the actual state, not always
+      // 'blocked' (brief-fix2 item 1a).
+      const stateLabel = `${attempt.state[0]!.toUpperCase()}${attempt.state.slice(1)}`;
 
       if (worktreeState.state === 'idle') {
         const cancelled: AttemptRecord = {
           ...attempt,
           revision: nextAttemptRevision(attempt),
           state: 'cancelled',
+          outcome: 'stopped',
           updatedAtIso: nowIso,
         };
         await deps.attemptRepo.saveAttempt(cancelled);
@@ -162,12 +171,12 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
           recordedAtIso: nowIso,
           status: 'completed',
           sessionId: null,
-          detail: "Nothing runs in the blocked attempt's worktree; cancelled and capacity released",
+          detail: `Nothing runs in the ${attempt.state} attempt's worktree; cancelled and capacity released`,
         });
         return {
           outcome: 'cancelled',
           attempt: cancelled,
-          reason: "Nothing runs in the blocked attempt's worktree; cancelled and capacity released",
+          reason: `Nothing runs in the ${attempt.state} attempt's worktree; cancelled and capacity released`,
         };
       }
 
@@ -188,7 +197,7 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
           recordedAtIso: nowIso,
           status: 'completed',
           sessionId: worktreeState.sessionId,
-          detail: `Blocked attempt adopted the session running in its worktree: ${worktreeState.sessionId}`,
+          detail: `${stateLabel} attempt adopted the session running in its worktree: ${worktreeState.sessionId}`,
         });
         return {
           outcome: 'active',

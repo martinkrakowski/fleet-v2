@@ -59,6 +59,22 @@ function isTerminalAttempt(record: AttemptRecord): boolean {
   );
 }
 
+/**
+ * Session-less states a stop resolves by aborting whatever runs in the
+ * attempt's worktree directory, not by session id (brief-fix2 item 1b). Any
+ * other session-less state is still refused.
+ */
+const SESSION_LESS_ABORTABLE_STATES: readonly AttemptRecord['state'][] = [
+  'dispatching',
+  'reconciling',
+  'blocked',
+];
+
+/** True when a session-less record is in a state the worktree abort cannot resolve. */
+function isSessionLessRefused(record: AttemptRecord): boolean {
+  return !record.sessionId && !SESSION_LESS_ABORTABLE_STATES.includes(record.state);
+}
+
 export class StopAttemptUseCase implements StopAttemptPort {
   constructor(private readonly deps?: StopAttemptDependencies) {}
 
@@ -68,7 +84,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
     }
 
     const attempt = await this.deps.attemptRepo.findAttemptById(request.attemptId);
-    if (!attempt || (!attempt.sessionId && attempt.state !== 'blocked')) {
+    if (!attempt || isSessionLessRefused(attempt)) {
       return { outcome: 'refused', reason: 'Attempt not found or has no sessionId' };
     }
 
@@ -87,7 +103,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
     attempt: AttemptRecord,
   ): Promise<StopAttemptResult> {
     const deps = this.deps!;
-    if (!attempt.sessionId && attempt.state !== 'blocked') {
+    if (isSessionLessRefused(attempt)) {
       return { outcome: 'refused', reason: 'Attempt not found or has no sessionId' };
     }
 
@@ -118,8 +134,10 @@ export class StopAttemptUseCase implements StopAttemptPort {
       runner = selection.runner;
     }
 
-    // A session-less blocked attempt is resolved by aborting whatever runs in
-    // its worktree directory, not by session id.
+    // A session-less attempt in a claiming state (dispatching, reconciling,
+    // blocked) is resolved by aborting whatever runs in its worktree
+    // directory, not by session id. Any other session-less state was refused
+    // above.
     if (!attempt.sessionId) {
       if (!runner.abortWorktreeRun) {
         return { outcome: 'refused', reason: 'Runner cannot abort a worktree without a session' };
@@ -359,9 +377,11 @@ export class StopAttemptUseCase implements StopAttemptPort {
         fresh.state === 'dispatching' &&
         !canOverwriteAfterConflict(fresh, ['dispatching'], attempt)
       ) {
-        // A concurrent re-dispatch took the attempt over while this stop was
-        // running: the record stays `dispatching`, the receipt never lands
-        // on it, and the reservation is not this stop's to release.
+        // Defence in depth: dispatch now refuses a claiming state, so only a
+        // writer that bypasses DispatchAttemptUseCase (an older binary
+        // sharing the state dir, a direct repository write) can produce this
+        // record. The record stays `dispatching`, the receipt never lands on
+        // it, and the reservation is not this stop's to release.
         return { record: fresh, ownsReservation: false, reason: 'attempt re-dispatched concurrently' };
       }
       const rebuilt = build(fresh ?? attempt);
@@ -416,8 +436,10 @@ export class StopAttemptUseCase implements StopAttemptPort {
         fresh.state === 'dispatching' &&
         !canOverwriteAfterConflict(fresh, ['dispatching'], attempt)
       ) {
-        // A concurrent re-dispatch took the attempt over while this stop was
-        // running: the record stays `dispatching` and the reservation is not
+        // Defence in depth: dispatch now refuses a claiming state, so only a
+        // writer that bypasses DispatchAttemptUseCase (an older binary
+        // sharing the state dir, a direct repository write) can produce this
+        // record. The record stays `dispatching` and the reservation is not
         // this stop's to release.
         return { record: fresh, ownsReservation: false, reason: 'attempt re-dispatched concurrently' };
       }

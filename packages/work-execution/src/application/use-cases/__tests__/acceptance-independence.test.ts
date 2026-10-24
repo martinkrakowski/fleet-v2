@@ -116,7 +116,7 @@ describe('RequestAttemptAcceptanceUseCase independence', () => {
     ['nvidia/z-ai/glm-5.3', 'openrouter/z-ai/glm-5.3-flash'],
     ['x/glm-5.3#low', 'glm-5.3'],
     ['a/claude-sonnet-4-5@20250929', 'claude-3-5-sonnet'],
-  ])('rejects reviewer %s for implementer %s as the same family', async (implementerModel, reviewerModel) => {
+  ])('rejects implementer %s with reviewer %s as the same family', async (implementerModel, reviewerModel) => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([

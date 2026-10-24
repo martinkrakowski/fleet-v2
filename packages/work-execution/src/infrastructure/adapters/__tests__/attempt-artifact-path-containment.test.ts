@@ -86,7 +86,13 @@ describe('AttemptArtifactAdapter path containment', () => {
       }),
     ).rejects.toBeInstanceOf(WorktreePathRefusedError);
     expect(
-      calls.filter((call) => call.argv.some((argument) => argument === '../x')),
+      calls.filter((call) =>
+        call.argv.some(
+          (argument) =>
+            /(^|\/)\.\.(\/|$)/.test(argument) ||
+            (argument.startsWith('/') && argument !== '/wt' && !argument.startsWith('/wt/')),
+        ),
+      ),
     ).toHaveLength(0);
   });
 

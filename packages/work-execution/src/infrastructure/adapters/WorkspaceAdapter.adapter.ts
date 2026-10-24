@@ -81,7 +81,6 @@ export function worktreeRootRefusal(worktreePath: string): string | null {
   }
   return null;
 }
-import { resolveWorktreeTarget } from './worktree-target.js';
 
 export interface WorkspaceAdapterOptions {
   /**

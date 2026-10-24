@@ -4,6 +4,7 @@ import { evidenceResponse, isNotImplemented } from "../../../wiring/evidence/err
 import { readObjectBody } from "../../../wiring/http-input";
 import { workComposition } from "../../../wiring/work/composition.js";
 import { resolveInstallationHostForRole } from "@fleet/work-execution";
+import { assessmentIdForAttempt } from "@fleet/evidence-and-acceptance";
 
 type VerificationRequestBody = Record<string, unknown>;
 
@@ -34,6 +35,21 @@ async function bindImplementerSeat(
 export default defineEventHandler(async (event) => {
   const useCase = getEvidenceUseCases().requestVerification;
   let body = await readObjectBody(event);
+  // The assessment id is derived from the attempt, not chosen by the client.
+  // An omitted id is filled in; a mismatching one is refused so the record
+  // cannot be filed under an id that does not name the attempt.
+  const attemptId = typeof body.attemptId === "string" ? body.attemptId : "";
+  const expected = assessmentIdForAttempt(attemptId);
+  if (attemptId !== "") {
+    if (body.assessmentId === undefined || body.assessmentId === "") {
+      body = { ...body, assessmentId: expected };
+    } else if (body.assessmentId !== expected) {
+      throw createError({
+        statusCode: 400,
+        statusMessage: `assessmentId must be ${expected} (the attempt's assessment id) or omitted`,
+      });
+    }
+  }
   // A v2 installation names the verifier host itself (plan section 8); the
   // caller never supplies one. The host comes from the installation's hosts
   // entry — the verifier host's name, and with no verifier role the

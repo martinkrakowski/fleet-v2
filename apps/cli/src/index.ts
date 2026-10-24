@@ -131,6 +131,23 @@ function optStr(payload: Payload, key: string): string | undefined {
   return value.trim() === '' ? undefined : value;
 }
 
+/**
+ * The assessment id is derived from the attempt, never freely chosen. An
+ * explicit override is accepted only when it agrees with the attempt's own
+ * assessment id; a mismatching one is refused at the boundary.
+ */
+function evidenceAssessmentId(p: Payload): string {
+  const attemptId = optStr(p, 'attemptId');
+  const explicit = optStr(p, 'assessmentId');
+  const derived = attemptId ? assessmentIdForAttempt(attemptId) : '';
+  if (explicit && derived && explicit !== derived) {
+    throw new CliUsageError(
+      `'assessmentId' ${explicit} does not match attempt ${attemptId}; its assessment id is ${derived}`,
+    );
+  }
+  return explicit || derived;
+}
+
 function strOrNull(payload: Payload, key: string): string | null {
   const value = payload[key];
   return typeof value === 'string' ? value : null;
@@ -1004,7 +1021,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         return seat.rejection;
       }
       return rt.evidence.requestVerification.requestVerification({
-        assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),
+        assessmentId: evidenceAssessmentId(p),
         projectId: str(p, 'projectId'),
         attemptId: str(p, 'attemptId'),
         candidateHeadSha: str(p, 'candidateHeadSha'),
@@ -1017,7 +1034,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
     },
     'record-verification': async (p, rt) =>
       rt.evidence.recordVerificationReceipt.recordVerificationReceipt({
-        assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),
+        assessmentId: evidenceAssessmentId(p),
         receipt: requiredNested<VerificationReceiptRecord>(p, 'receipt', 'evidence record-verification'),
         nowIso: optStr(p, 'nowIso'),
       }),
@@ -1027,7 +1044,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         return seat.rejection;
       }
       return rt.evidence.requestIndependentReview.requestIndependentReview({
-        assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),
+        assessmentId: evidenceAssessmentId(p),
         projectId: str(p, 'projectId'),
         attemptId: str(p, 'attemptId'),
         candidateHeadSha: str(p, 'candidateHeadSha'),
@@ -1053,14 +1070,14 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
       // The receipt's implementer field restates the recorded seat; it is
       // bound, never caller-authored.
       return rt.evidence.recordReviewReceipt.recordReviewReceipt({
-        assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),
+        assessmentId: evidenceAssessmentId(p),
         receipt: { ...receipt, implementerModel: seat.implementerModel },
         nowIso: optStr(p, 'nowIso'),
       });
     },
     disposition: async (p, rt) =>
       rt.evidence.recordFindingDisposition.recordFindingDisposition({
-        assessmentId: str(p, 'assessmentId') || assessmentIdForAttempt(str(p, 'attemptId')),
+        assessmentId: evidenceAssessmentId(p),
         disposition: requiredNested<FindingDispositionRecord>(p, 'disposition', 'evidence disposition'),
         nowIso: optStr(p, 'nowIso'),
       }),
@@ -1073,9 +1090,8 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
           "'--ownerDecisionReferences' is forbidden; owner decisions come from the attempt record",
         );
       }
-      const attemptId = optStr(p, 'attemptId');
       return rt.evidence.assessHeadAcceptance.assessHeadAcceptance({
-        assessmentId: str(p, 'assessmentId') || (attemptId ? assessmentIdForAttempt(attemptId) : ''),
+        assessmentId: evidenceAssessmentId(p),
         candidateHeadSha: str(p, 'candidateHeadSha'),
         policyRevision: str(p, 'policyRevision'),
         nowIso: optStr(p, 'nowIso'),

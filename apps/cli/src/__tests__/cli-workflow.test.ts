@@ -1297,6 +1297,36 @@ describe('Fleet CLI workflow', () => {
     expect(withFlag.stderr).toContain("'--ownerDecisionReferences' is forbidden");
   });
 
+  it('refuses a record-verification whose assessmentId does not match the attempt', async () => {
+    // The assessment id is derived from the attempt; a mismatching override
+    // is a usage error at the boundary, never a silently accepted filing.
+    const mismatch = await cli([
+      'evidence',
+      'record-verification',
+      '--json',
+      jsonArg({
+        attemptId: 'attempt-1',
+        assessmentId: 'assessment-other',
+        receipt: {
+          id: 'vr-1',
+          assessmentId: 'assessment-other',
+          projectId: 'proj',
+          attemptId: 'attempt-1',
+          candidateHeadSha: laneHead,
+          hostId: 'host-1',
+          procedureName: 'gate',
+          result: 'pass',
+          exitCode: 0,
+          evidenceRef: 'ev-1',
+          policyRevision: POLICY_REVISION,
+          completedAtIso: '2026-10-24T08:00:00.000Z',
+        },
+      }),
+    ]);
+    expect(mismatch.code).toBe(2);
+    expect(mismatch.stderr).toContain('does not match attempt');
+  });
+
   it('completes the merge across separate runCli processes on one state dir', async () => {
     // Cutover pilot: every invocation below passes a brand-new FleetCliRuntime
     // composed solely from `multiProcStateDir` on disk. Receipts and

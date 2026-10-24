@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   PrepareBriefPackageUseCase,
@@ -128,17 +128,69 @@ describe('PrepareBriefPackageUseCase path validation', () => {
   });
 
   it('rejects when an expectedArtifacts entry escapes the worktree', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+
+    for (const [artifact, reason] of [
+      ['/etc/passwd', 'expectedArtifacts entry is not a valid worktree-relative path: /etc/passwd'],
+      ['../escape', 'expectedArtifacts entry is not a valid worktree-relative path: ../escape'],
+      [
+        'a/../../escape',
+        'expectedArtifacts entry is not a valid worktree-relative path: a/../../escape',
+      ],
+      ['C:\\x', 'expectedArtifacts entry is not a valid worktree-relative path: C:\\x'],
+    ] as const) {
+      const result = await useCase.prepareBriefPackage(
+        validRequest({ expectedArtifacts: [artifact] }),
+      );
+      expect(result).toEqual({ outcome: 'rejected', reason });
+    }
+  });
+
+  it('rejects a non-string expectedArtifacts entry by name', async () => {
     const useCase = makeUseCase();
 
-    for (const artifact of ['/etc/passwd', '../escape', 'a/../../escape', 'C:\\x', 42]) {
-      const result = await useCase.prepareBriefPackage(
-        validRequest({ expectedArtifacts: [artifact as unknown as string] }),
-      );
-      expect(result.outcome).toBe('rejected');
-      if (result.outcome === 'rejected') {
-        expect(result.reason).toContain('expectedArtifacts entry');
-        expect(result.reason).toContain(String(artifact));
-      }
+    const result = await useCase.prepareBriefPackage(
+      validRequest({ expectedArtifacts: [42 as unknown as string] }),
+    );
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'expectedArtifacts entry is not a valid worktree-relative path: 42',
+    });
+  });
+
+  it('does not call authorBrief on any rejection', async () => {
+    const authorBrief = vi.fn(async () => {
+      return {
+        outcome: 'authored' as const,
+        brief: {
+          proseMarkdown: '# Frozen brief prose',
+          provenance: 'orchestrator' as const,
+        },
+      };
+    });
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: { authorBrief },
+      artifactPort: makeArtifactPort(),
+      worktreePath: '/wt',
+    });
+
+    await useCase.prepareBriefPackage(validRequest({ expectedArtifacts: undefined as unknown as string[] }));
+    await useCase.prepareBriefPackage(validRequest({ expectedArtifacts: ['/etc/passwd'] }));
+    await useCase.prepareBriefPackage(validRequest({ expectedArtifacts: ['../escape'] }));
+
+    expect(authorBrief).not.toHaveBeenCalled();
+  });
+
+  it('satisfies the worktreePath requirement from deps when the request omits it', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const request = validRequest();
+    delete (request as { worktreePath?: string }).worktreePath;
+    const result = await useCase.prepareBriefPackage(request);
+
+    expect(result.outcome).toBe('prepared');
+    if (result.outcome === 'prepared') {
+      expect(result.prepared.prosePath).toBe('.lane/brief.md');
+      expect(result.prepared.manifestPath).toBe('.lane/brief-manifest.json');
     }
   });
 

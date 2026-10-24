@@ -280,6 +280,28 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     );
   }
 
+  /**
+   * One contained worktree-relative file read. The caller resolves the
+   * target path with `resolveWorktreeTarget` first, so an absolute or
+   * escaping path is refused before any `cat` runs. A null exit code
+   * (spawn failure, timeout) is a failed read, not an absent file; only
+   * exit 1 and friends mean "no such file".
+   */
+  private async readContainedFile(
+    worktreePath: string,
+    targetPath: string,
+    recordedHost?: AttemptRunnerRecord | null,
+  ): Promise<string | null> {
+    const executor = this.executorFor(recordedHost);
+    const result = await executor.run(['cat', targetPath], { timeoutMs: CAT_TIMEOUT_MS });
+    if (result.exitCode === null) {
+      throw new Error(
+        `Unable to read ${targetPath}` + (result.error !== undefined ? `: ${result.error}` : ''),
+      );
+    }
+    return result.exitCode === 0 ? result.stdout : null;
+  }
+
   async readBriefManifest(
     worktreePath: string,
     manifestPath?: string,
@@ -292,15 +314,18 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
       worktreePath,
       manifestPath ?? '.lane/brief-manifest.json',
     );
-    const executor = this.executorFor(recordedHost);
-    const result = await executor.run(['cat', targetPath], { timeoutMs: CAT_TIMEOUT_MS });
-    // A null exit code (spawn failure, timeout) is a failed read, not an
-    // absent manifest; only exit 1 and friends mean "no such file".
-    if (result.exitCode === null) {
-      throw new Error(
-        `Unable to read ${targetPath}` + (result.error !== undefined ? `: ${result.error}` : ''),
-      );
-    }
-    return result.exitCode === 0 ? result.stdout : null;
+    return this.readContainedFile(worktreePath, targetPath, recordedHost);
+  }
+
+  async readBriefFile(
+    worktreePath: string,
+    relativePath: string,
+    recordedHost?: AttemptRunnerRecord | null,
+  ): Promise<string | null> {
+    // The prose path — the caller-supplied brief package path — is contained
+    // here with the same rule as the manifest, so an absolute or escaping
+    // path is refused before any `cat` runs.
+    const targetPath = resolveWorktreeTarget(worktreePath, relativePath);
+    return this.readContainedFile(worktreePath, targetPath, recordedHost);
   }
 }

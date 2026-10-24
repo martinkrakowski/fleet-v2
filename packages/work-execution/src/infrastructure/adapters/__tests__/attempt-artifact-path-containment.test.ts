@@ -70,6 +70,34 @@ describe('AttemptArtifactAdapter path containment', () => {
     expect(calls[0].argv).toEqual(['cat', '/wt/.lane/brief-manifest.json']);
   });
 
+  it('refuses an absolute brief-file path before any cat', async () => {
+    const { executor, calls } = fakeExecutor(() => ({}));
+    const adapter = new AttemptArtifactAdapter({ executor });
+
+    await expect(adapter.readBriefFile('/wt', '/etc/passwd')).rejects.toBeInstanceOf(
+      WorktreePathRefusedError,
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it('refuses an escaping brief-file path before any cat', async () => {
+    const { executor, calls } = fakeExecutor(() => ({}));
+    const adapter = new AttemptArtifactAdapter({ executor });
+
+    await expect(adapter.readBriefFile('/wt', '../x')).rejects.toBeInstanceOf(
+      WorktreePathRefusedError,
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it('reads a worktree-relative brief file under the worktree', async () => {
+    const { executor, calls } = fakeExecutor(() => ({ stdout: 'prose-bytes' }));
+    const adapter = new AttemptArtifactAdapter({ executor });
+
+    expect(await adapter.readBriefFile('/wt', '.lane/brief.md')).toBe('prose-bytes');
+    expect(calls[0].argv).toEqual(['cat', '/wt/.lane/brief.md']);
+  });
+
   it('refuses an escaping expected artifact before any probe in collection', async () => {
     const { executor, calls } = fakeExecutor((call) =>
       call.argv[0] === 'git' ? { stdout: 'abc123\n' } : { exitCode: 1 },

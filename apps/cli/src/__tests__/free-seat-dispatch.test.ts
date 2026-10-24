@@ -18,6 +18,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createFleetCliRuntime } from '../composition.js';
 import type { FleetInstallation } from '@fleet/installation';
+import { simpleDeterministicHexDigest } from '@fleet/work-execution';
 import type { WorkOrderRecord } from '@fleet/work-execution';
 
 const ATTEMPT_ID = 'att-free-seat-dispatch';
@@ -73,6 +74,8 @@ let suiteDir: string;
 let laneRepoDir: string;
 let briefDir: string;
 let baseCommit: string;
+let freeManifest: { path: string; digest: string };
+let paidManifest: { path: string; digest: string };
 
 function initGitRepo(dir: string): string {
   mkdirSync(dir, { recursive: true });

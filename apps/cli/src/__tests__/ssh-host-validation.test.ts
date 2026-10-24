@@ -71,6 +71,12 @@ describe('apps/cli readGitHead SSH host validation', () => {
       runnerCapabilities: {},
       revision: 0,
       updatedAtIso: '2026-10-15T00:00:00Z',
+      status: 'active',
+      defaultBranch: null,
+      clones: {},
+      gateProcedures: [],
+      defaultAllowedPathPrefixes: [],
+      lastProbe: null,
     });
 
     await runtime.execution.attemptRepository.saveAttempt({

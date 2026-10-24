@@ -66,65 +66,76 @@ case "$dest" in
     exit 0
     ;;
 esac
-eval "set -- $cmd"
-printf '%s\n' "$@" >> "__T__/ssh-decoded.log"
-case "$1" in
-  git)
-    shift
-    d=''
-    if [ "${1:-}" = -C ]; then d=$2; shift 2; fi
-    while [ "${1:-}" = -c ] && [ "$#" -ge 2 ]; do shift 2; done
-    sub=${1:-}; shift
-    case "$sub" in
-      init) [ "$1" = -q ] && shift; mkdir -p "$(dirname "$1")"; git init -q "$1" ;;
-      checkout) [ "$1" = -q ] && shift; git -C "$d" checkout -q "$1" ;;
-      check-ignore)
-        [ -f "__T__/ignore-err" ] && exit 255
-        [ ! -f "__T__/ignore-fail" ]
-        ;;
-      status)
-        [ -f "__T__/status-fail" ] && exit 255
-        git -C "$d" status --porcelain
-        ;;
-      diff)
-        if [ "$1" = --stat ]; then git -C "$d" diff --stat
-        elif [ "$1" = --cached ] && [ "$2" = --quiet ]; then git -C "$d" diff --cached --quiet
-        fi
-        ;;
-      add) shift; git -C "$d" add -- "$@" ;;
-      commit)
-        f=''; prev=''
-        for a in "$@"; do [ "$prev" = -F ] && f=$a; prev=$a; done
-        git -C "$d" -c core.hooksPath=/dev/null commit -q -F "$f"
-        ;;
-      log) git -C "$d" log --oneline -1 ;;
-    esac
-    ;;
-  agy-run)
-    printf '%s\n' "$@" >> "__T__/agyrun.log"
-    d=''; prev=''
-    for a in "$@"; do [ "$prev" = --dir ] && d=$a; prev=$a; done
-    if [ -f "__T__/agy-make-changes" ] && [ -n "$d" ]; then
-      if [ -f "$d/a.ts" ]; then echo 'change' >> "$d/a.ts"; else echo 'change' > "$d/new.md"; fi
-    fi
-    if [ -f "__T__/agy-out" ]; then cat "__T__/agy-out"; fi
-    rc=$(cat "__T__/agyrc" 2>/dev/null)
-    exit "${rc:-0}"
-    ;;
-  mkdir) shift; mkdir -p "$@" ;;
-  rm) shift; rm -f "$@" ;;
-  git-receive-pack)
-    printf '%s\n' "${GIT_SSH_COMMAND:-}" > "__T__/push-git-ssh-cmd"
-    shift; mkdir -p "$(dirname "$1")"
-    [ -d "$1" ] || git init -q "$1"
-    exec git receive-pack "$1"
-    ;;
-  git-upload-pack)
-    printf '%s\n' "${GIT_SSH_COMMAND:-}" > "__T__/fetch-git-ssh-cmd"
-    shift; exec git upload-pack "$1"
-    ;;
-  test) shift; [ "$1" = -e ] && shift; test -e "$1" ;;
-esac
+run_one() {
+  eval "set -- $1"
+  printf '%s\n' "$@" >> "__T__/ssh-decoded.log"
+  case "$1" in
+    git)
+      shift
+      d=''
+      if [ "${1:-}" = -C ]; then d=$2; shift 2; fi
+      while [ "${1:-}" = -c ] && [ "$#" -ge 2 ]; do shift 2; done
+      sub=${1:-}; shift
+      case "$sub" in
+        init) [ "$1" = -q ] && shift; mkdir -p "$(dirname "$1")"; git -c init.defaultBranch=main init -q "$1" ;;
+        symbolic-ref) git -C "$d" symbolic-ref "$@" ;;
+        checkout) [ "$1" = -q ] && shift; git -C "$d" checkout -q "$1" ;;
+        check-ignore)
+          [ -f "__T__/ignore-err" ] && exit 255
+          [ ! -f "__T__/ignore-fail" ]
+          ;;
+        status)
+          [ -f "__T__/status-fail" ] && exit 255
+          git -C "$d" status --porcelain
+          ;;
+        diff)
+          if [ "$1" = --stat ]; then git -C "$d" diff --stat
+          elif [ "$1" = --cached ] && [ "$2" = --quiet ]; then git -C "$d" diff --cached --quiet
+          fi
+          ;;
+        add) shift; git -C "$d" add -- "$@" ;;
+        commit)
+          f=''; prev=''
+          for a in "$@"; do [ "$prev" = -F ] && f=$a; prev=$a; done
+          git -C "$d" -c core.hooksPath=/dev/null commit -q -F "$f"
+          ;;
+        log) git -C "$d" log --oneline -1 ;;
+      esac
+      ;;
+    agy-run)
+      printf '%s\n' "$@" >> "__T__/agyrun.log"
+      d=''; prev=''
+      for a in "$@"; do [ "$prev" = --dir ] && d=$a; prev=$a; done
+      if [ -f "__T__/agy-make-changes" ] && [ -n "$d" ]; then
+        if [ -f "$d/a.ts" ]; then echo 'change' >> "$d/a.ts"; else echo 'change' > "$d/new.md"; fi
+      fi
+      if [ -f "__T__/agy-out" ]; then cat "__T__/agy-out"; fi
+      rc=$(cat "__T__/agyrc" 2>/dev/null)
+      exit "${rc:-0}"
+      ;;
+    mkdir) shift; mkdir -p "$@" ;;
+    rm) shift; rm -f "$@" ;;
+    git-receive-pack)
+      [ -f "__T__/push-fail" ] && exit 1
+      printf '%s\n' "${GIT_SSH_COMMAND:-}" > "__T__/push-git-ssh-cmd"
+      shift; mkdir -p "$(dirname "$1")"
+      [ -d "$1" ] || git init -q "$1"
+      exec git receive-pack "$1"
+      ;;
+    git-upload-pack)
+      printf '%s\n' "${GIT_SSH_COMMAND:-}" > "__T__/fetch-git-ssh-cmd"
+      shift; exec git upload-pack "$1"
+      ;;
+    test) shift; [ "$1" = -e ] && shift; test -e "$1" ;;
+  esac
+}
+while [ -n "$cmd" ]; do
+  case "$cmd" in
+    *' && '*) one=${cmd%% && *}; cmd=${cmd#* && } ;;
+    *) one=$cmd; cmd='' ;;
+  esac
+  run_one "$one" || exit $?
+done
 FAKESSH
 fakefrom ssh "$T/ssh.src"
 
@@ -152,7 +163,7 @@ fakefrom scp "$T/scp.src"
 cat > "$T/sleep.src" <<'FAKESLEEP'
 #!/bin/sh
 printf '%s\n' "$@" >> "__T__/sleep.log"
-exit 0
+[ ! -f "__T__/sleep-fail" ]
 FAKESLEEP
 fakefrom sleep "$T/sleep.src"
 
@@ -160,6 +171,16 @@ rm -f "$T/ssh.src" "$T/scp.src" "$T/sleep.src"
 
 PATH="$T/bin:$PATH"
 export PATH
+
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_AUTHOR_NAME=t
+export GIT_AUTHOR_EMAIL=t@example.invalid
+export GIT_COMMITTER_NAME=t
+export GIT_COMMITTER_EMAIL=t@example.invalid
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=commit.gpgsign
+export GIT_CONFIG_VALUE_0=false
 
 export AGY_ROUND_SSH=lane
 export AGY_ROUND_ROOT="$T/container"
@@ -250,6 +271,8 @@ AGY_ROUND_ROOT=rel/root "$RUNSH" "$SCRIPT" run --name n --model m --brief .lane/
 check 'a relative AGY_ROUND_ROOT is a usage error (2) naming AGY_ROUND_ROOT' '[ "$(rc)" = 2 ] && grep -q "AGY_ROUND_ROOT" "$T/e"'
 AGY_ROUND_ROOT='/tmp/bad;root' "$RUNSH" "$SCRIPT" run --name n --model m --brief .lane/x.md > "$T/o" 2> "$T/e"; echo $? > "$T/rc"
 check 'a shell-active AGY_ROUND_ROOT is a usage error (2) naming AGY_ROUND_ROOT' '[ "$(rc)" = 2 ] && grep -q "AGY_ROUND_ROOT" "$T/e"'
+AGY_ROUND_SETTLE=20s "$RUNSH" "$SCRIPT" run --name n --model m --brief .lane/x.md > "$T/o" 2> "$T/e"; echo $? > "$T/rc"
+check 'a bad AGY_ROUND_SETTLE (20s) is a usage error (2) naming AGY_ROUND_SETTLE and never invokes agy-run' '[ "$(rc)" = 2 ] && grep -q "AGY_ROUND_SETTLE" "$T/e" && [ ! -f "$T/agyrun.log" ]'
 run run --name n --model m --brief x.md
 check 'a run brief outside .lane/ is a usage error (2)' '[ "$(rc)" = 2 ]'
 run run --name n --model m --brief .lane/../x
@@ -290,6 +313,10 @@ rm -f "$T/agyrun.log"; : > "$T/guard-count"; echo 2 > "$T/guard-fail-on"
 run run --name n --model m --brief .lane/x.md
 check 'guard failing after the run is 1' '[ "$(rc)" = 1 ] && grep -q "hash check failed after the run" "$T/e"'
 check 'agy-run ran before the after-guard failed' '[ -f "$T/agyrun.log" ]'
+rm -f "$T/guard-fail-on" "$T/agyrun.log"; : > "$T/guard-count"; touch "$T/sleep-fail"
+run run --name n --model m --brief .lane/x.md
+check 'a failing sleep exits 1 with settle wait failed and does not run the after-guard' '[ "$(rc)" = 1 ] && grep -q "settle wait failed" "$T/e" && [ "$(cat "$T/guard-count")" = 1 ]'
+rm -f "$T/sleep-fail"
 
 echo '# run: exact flags and results'
 rm -f "$T/guard-fail-on" "$T/agy-make-changes"; : > "$T/guard-count"; rm -f "$T/agyrun.log"
@@ -326,6 +353,14 @@ check 'prepare prints the clone log' 'grep -q "init" "$T/o"'
 check 'prepare prints the brief path for run' 'grep -qx ".lane/brief.md" "$T/o"'
 check 'the clone is on the pushed branch' '[ "$(git -C "$T/container/p" rev-parse --abbrev-ref HEAD)" = feat/x ]'
 check 'the brief landed in the clone .lane' '[ -f "$T/container/p/.lane/brief.md" ]'
+run prepare --name p-main --branch main --brief "$T/brief.md" --from "$T/from"
+check 'prepare --branch main succeeds and the clone ends on main' '[ "$(rc)" = 0 ] && [ "$(git -C "$T/container/p-main" rev-parse --abbrev-ref HEAD)" = main ]'
+touch "$T/push-fail"
+run prepare --name p-retry --branch feat/x --brief "$T/brief.md" --from "$T/from"
+check 'a failing push exits 1 and leaves no directory' '[ "$(rc)" = 1 ] && [ ! -e "$T/container/p-retry" ]'
+rm -f "$T/push-fail"
+run prepare --name p-retry --branch feat/x --brief "$T/brief.md" --from "$T/from"
+check 'a second prepare with the same name after a failing push does not exit 75' '[ "$(rc)" = 0 ]'
 touch "$T/ignore-fail"
 run prepare --name p-unignored --branch feat/x --brief "$T/brief.md" --from "$T/from"
 check 'prepare when check-ignore fails (1) exits 1 with brief path is not gitignored' '[ "$(rc)" = 1 ] && grep -q "brief path is not gitignored" "$T/e"'

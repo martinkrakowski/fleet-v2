@@ -146,6 +146,23 @@ validate_timeout() {
   esac
 }
 
+validate_settle() {
+  if [ -n "${AGY_ROUND_SETTLE+x}" ]; then
+    reject_nl "AGY_ROUND_SETTLE" "$AGY_ROUND_SETTLE"
+    case "$AGY_ROUND_SETTLE" in
+      '' | *[!0-9]*)
+        die_usage "invalid AGY_ROUND_SETTLE '$AGY_ROUND_SETTLE'"
+        ;;
+    esac
+  fi
+}
+
+fail_prepare() { # $1: dir, $2: message
+  ssh -o BatchMode=yes "$AGY_ROUND_SSH" "rm -rf -- $(shq "$1")"
+  echo "agy-round: $2" >&2
+  exit 1
+}
+
 cmd=${1:-}
 case "$cmd" in
   '') die_usage "missing subcommand" ;;
@@ -189,27 +206,25 @@ case "$cmd" in
       echo "agy-round: $dir already exists in the container" >&2
       exit 75
     fi
-    ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git init -q $(shq "$dir")" \
-      || { echo "agy-round: git init failed in the container" >&2; exit 1; }
+    ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git init -q $(shq "$dir") && git -C $(shq "$dir") symbolic-ref HEAD refs/heads/agy-round-unborn" \
+      || fail_prepare "$dir" "git init failed in the container"
     GIT_SSH_COMMAND='ssh -o BatchMode=yes' git -C "$from" -c core.hooksPath=/dev/null push -q "$AGY_ROUND_SSH:$dir" "HEAD:refs/heads/$branch" \
-      || { echo "agy-round: push to the container failed" >&2; exit 1; }
+      || fail_prepare "$dir" "push to the container failed"
     ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") -c core.hooksPath=/dev/null checkout -q $(shq "$branch")" \
-      || { echo "agy-round: checkout in the container failed" >&2; exit 1; }
+      || fail_prepare "$dir" "checkout in the container failed"
     ssh -o BatchMode=yes "$AGY_ROUND_SSH" "mkdir -p $(shq "$dir/.lane")" \
-      || { echo "agy-round: mkdir .lane in the container failed" >&2; exit 1; }
+      || fail_prepare "$dir" "mkdir .lane in the container failed"
     scp -q -o BatchMode=yes "$brief" "$AGY_ROUND_SSH:$dir/.lane/$base" \
-      || { echo "agy-round: scp brief failed" >&2; exit 1; }
+      || fail_prepare "$dir" "scp brief failed"
     ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") check-ignore -q $(shq ".lane/$base")"
     ci_rc=$?
     if [ "$ci_rc" -eq 1 ]; then
-      echo "agy-round: brief path is not gitignored" >&2
-      exit 1
+      fail_prepare "$dir" "brief path is not gitignored"
     elif [ "$ci_rc" -ne 0 ]; then
-      echo "agy-round: could not check the brief path" >&2
-      exit 1
+      fail_prepare "$dir" "could not check the brief path"
     fi
     ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") log --oneline -1" \
-      || { echo "agy-round: git log in the container failed" >&2; exit 1; }
+      || fail_prepare "$dir" "git log in the container failed"
     echo ".lane/$base"
     ;;
   run)
@@ -238,6 +253,7 @@ case "$cmd" in
     validate_brief "$brief"
     require_env AGY_ROUND_SSH AGY_ROUND_ROOT AGY_ROUND_GUARD_SSH AGY_ROUND_GUARD_CMD
     validate_root
+    validate_settle
     dir="$AGY_ROUND_ROOT/$name"
     # Guard check BEFORE: refuse to start agy when the container is not clean.
     if ! ssh -o BatchMode=yes "$AGY_ROUND_GUARD_SSH" "$AGY_ROUND_GUARD_CMD"; then
@@ -252,7 +268,10 @@ case "$cmd" in
       ssh -o BatchMode=yes "$AGY_ROUND_SSH" "$cmd"
       rc=$?
     fi
-    sleep "${AGY_ROUND_SETTLE:-20}"
+    if ! sleep "${AGY_ROUND_SETTLE:-20}"; then
+      echo "agy-round: settle wait failed" >&2
+      exit 1
+    fi
     # Guard check AFTER.
     if ! ssh -o BatchMode=yes "$AGY_ROUND_GUARD_SSH" "$AGY_ROUND_GUARD_CMD"; then
       echo "agy-round: hash check failed after the run" >&2

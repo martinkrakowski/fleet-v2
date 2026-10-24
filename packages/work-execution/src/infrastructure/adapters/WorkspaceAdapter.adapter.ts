@@ -220,12 +220,24 @@ export class WorkspaceAdapter implements WorkspacePort {
     relativePath: string,
     recordedHost?: AttemptRunnerRecord | null,
   ): Promise<string | null> {
+    // A worktree can never be the filesystem root and can never be a
+    // relative path: both make the containment prefix degenerate (with an
+    // empty root every absolute path "lies inside" the worktree). Refuse
+    // such a worktree before any path conversion and before any command,
+    // whatever the requested relative path is.
+    const trimmedWorktreeRoot = worktreePath.replace(/\/+$/, '');
+    if (trimmedWorktreeRoot === '' || !worktreePath.startsWith('/')) {
+      throw new WorktreePathRefusedError(
+        relativePath,
+        'worktree path must be an absolute path that is not the filesystem root',
+      );
+    }
     // An absolute path is still accepted when it lies inside the worktree
     // itself (callers may pass `${worktreePath}/.lane/brief.md`); it is
     // rewritten to its worktree-relative form before validation. Any other
     // absolute path is refused outright.
     let candidatePath = relativePath;
-    const worktreeRoot = worktreePath.replace(/\/+$/, '');
+    const worktreeRoot = trimmedWorktreeRoot;
     if (candidatePath.startsWith('/') && candidatePath.startsWith(`${worktreeRoot}/`)) {
       candidatePath = candidatePath.slice(worktreeRoot.length + 1);
     }

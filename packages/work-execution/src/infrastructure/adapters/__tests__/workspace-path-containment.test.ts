@@ -99,6 +99,30 @@ describe('WorkspaceAdapter readWorktreeFile path containment', () => {
     expect(calls[1].argv).toEqual(['cat', '/wt/a/b/']);
   });
 
+  it('refuses a root, slash-only or empty worktree path before any command', async () => {
+    const { executor, calls } = fakeExecutor(() => ({}));
+    const adapter = new WorkspaceAdapter({ executor });
+
+    for (const worktreePath of ['/', '//', '']) {
+      for (const relativePath of ['/etc/passwd', '.lane/brief.md']) {
+        await expect(adapter.readWorktreeFile(worktreePath, relativePath)).rejects.toBeInstanceOf(
+          WorktreePathRefusedError,
+        );
+      }
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('refuses a relative worktree path before any command', async () => {
+    const { executor, calls } = fakeExecutor(() => ({}));
+    const adapter = new WorkspaceAdapter({ executor });
+
+    await expect(adapter.readWorktreeFile('wt', '.lane/brief.md')).rejects.toBeInstanceOf(
+      WorktreePathRefusedError,
+    );
+    expect(calls).toHaveLength(0);
+  });
+
   it('throws WorktreePathRefusedError for a path containing NUL bytes', async () => {
     const { executor, calls } = fakeExecutor(() => ({}));
     const adapter = new WorkspaceAdapter({ executor });

@@ -89,14 +89,22 @@ describe('WorkspaceAdapter readWorktreeFile path containment', () => {
     expect(calls[0].argv).toEqual(['cat', '/wt/.lane/brief-manifest.json']);
   });
 
-  it('reads under the worktree for dot and trailing-slash relative paths', async () => {
+  it('refuses a dot candidate: the worktree itself is not a file', async () => {
     const { executor, calls } = fakeExecutor(() => ({ stdout: 'payload-bytes' }));
     const adapter = new WorkspaceAdapter({ executor });
 
-    expect(await adapter.readWorktreeFile('/wt', '.')).toBe('payload-bytes');
-    expect(calls[0].argv).toEqual(['cat', '/wt']);
+    await expect(adapter.readWorktreeFile('/wt', '.')).rejects.toBeInstanceOf(
+      WorktreePathRefusedError,
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it('reads under the worktree for trailing-slash relative paths', async () => {
+    const { executor, calls } = fakeExecutor(() => ({ stdout: 'payload-bytes' }));
+    const adapter = new WorkspaceAdapter({ executor });
+
     expect(await adapter.readWorktreeFile('/wt', 'a/b/')).toBe('payload-bytes');
-    expect(calls[1].argv).toEqual(['cat', '/wt/a/b/']);
+    expect(calls[0].argv).toEqual(['cat', '/wt/a/b/']);
   });
 
   it('refuses a root, slash-only or empty worktree path before any command', async () => {

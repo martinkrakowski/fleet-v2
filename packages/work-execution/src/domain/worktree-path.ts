@@ -1,15 +1,21 @@
 // Domain (pure): validation of worktree-relative file paths. A valid path is
-// a non-empty relative string that never escapes the worktree root. No
-// filesystem, no subprocess, no Node builtins: the check only shapes the
-// string. ADR-0054 forbids Node builtins (including `node:path`) in the
-// domain, so the posix-style normalisation below is a local, pure twin of
-// `path.posix.normalize` restricted to relative paths; it yields the same
-// verdicts for every input that reaches it.
+// a non-empty relative string that never escapes the worktree root and never
+// names the worktree itself. No filesystem, no subprocess, no Node builtins:
+// the check only shapes the string. ADR-0054 forbids Node builtins
+// (including `node:path`) in the domain, so the posix-style normalisation
+// below is a local, pure normaliser of relative paths; it matches
+// `path.posix.normalize` on the `..` verdict only, which is the sole verdict
+// the validation relies on.
 
 /**
  * Pure posix-style normalisation of a relative path: resolves `.` and `..`
- * segments, collapses duplicate slashes and maps an empty result to `.`.
- * Equivalent to `path.posix.normalize` for relative inputs.
+ * segments and collapses duplicate and trailing slashes. This is NOT
+ * equivalent to `path.posix.normalize` in general: `path.posix.normalize`
+ * keeps a trailing slash and preserves interior `./` segments, while this
+ * function drops both. The only guarantee it makes — and the only thing any
+ * caller may rely on — is the `..` verdict: the result contains a `..`
+ * segment exactly when the input escapes the worktree root, and an empty or
+ * `.` result means the input names the worktree root itself, never a file.
  */
 function normalizeRelativePosixPath(input: string): string {
   const segments = input.split('/');
@@ -55,6 +61,11 @@ export function validateWorktreeRelativePath(path: unknown): string | null {
   const normalized = normalizeRelativePosixPath(path);
   if (normalized === '..' || normalized.startsWith('../')) {
     return 'worktree-relative path must not escape the worktree root';
+  }
+  // A path that normalises to `.` (or to empty) names the worktree itself,
+  // which is not a file: reading it (`cat /wt`) is refused, not performed.
+  if (normalized === '.' || normalized === '') {
+    return 'worktree-relative path must name a file inside the worktree, not the worktree itself';
   }
   return null;
 }

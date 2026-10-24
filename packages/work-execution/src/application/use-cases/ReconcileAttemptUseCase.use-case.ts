@@ -160,7 +160,11 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
     // A session-less attempt in a claiming state (dispatching, reconciling,
     // blocked) keeps its reservation; the worktree may still be running a
     // lane. Resolve it by directory, not by session id. A session-less
-    // `intent-recorded` attempt keeps the fallback below.
+    // `intent-recorded` attempt keeps the fallback below. An idle `dispatching`
+    // worktree is not proof the start failed (`DispatchAttemptUseCase` saves
+    // `dispatching` before awaiting the runner start), so reconcile leaves it
+    // and its reservation untouched (`attempt stop` is the explicit operator
+    // exit for a crashed dispatch; `StopAttemptUseCase` is unchanged).
     if (
       !attempt.sessionId &&
       (attempt.state === 'dispatching' || attempt.state === 'reconciling' || attempt.state === 'blocked')
@@ -182,6 +186,26 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
       const stateLabel = `${attempt.state[0]!.toUpperCase()}${attempt.state.slice(1)}`;
 
       if (worktreeState.state === 'idle') {
+        if (attempt.state === 'dispatching') {
+          const reason =
+            "Nothing runs in the dispatching attempt's worktree yet; a start may still be in progress. Run 'attempt reconcile' again later, or 'attempt stop' to cancel it";
+          await appendJournalEntry(deps.journal, {
+            attemptId: attempt.id,
+            workOrderId: attempt.workOrderId,
+            action: 'reconcile',
+            baseCommit: attempt.baseCommit,
+            recordedAtIso: nowIso,
+            status: 'ambiguous',
+            sessionId: null,
+            detail: reason,
+          });
+          return {
+            outcome: 'unknown',
+            attempt,
+            reason,
+          };
+        }
+
         const cancelled: AttemptRecord = {
           ...attempt,
           revision: nextAttemptRevision(attempt),

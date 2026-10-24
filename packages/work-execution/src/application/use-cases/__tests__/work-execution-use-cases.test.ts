@@ -2628,7 +2628,7 @@ describe('ReconcileAttemptUseCase', () => {
   // brief-fix2 item 1: the directory-scoped path applies to every session-less
   // attempt in dispatching, reconciling or blocked; journal details and result
   // reasons name the actual state.
-  it.each(['dispatching', 'reconciling', 'blocked'] as const)(
+  it.each(['reconciling', 'blocked'] as const)(
     'cancels a session-less $state attempt and releases the reservation when the worktree is idle',
     async (state) => {
       const setup = makeReconcileSetup({
@@ -2657,6 +2657,36 @@ describe('ReconcileAttemptUseCase', () => {
       });
     },
   );
+
+  it('returns unknown and keeps the reservation when a session-less dispatching worktree is still idle', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'dispatching', sessionId: null },
+      worktreeState: { state: 'idle' },
+    });
+    const expectedReason =
+      "Nothing runs in the dispatching attempt's worktree yet; a start may still be in progress. Run 'attempt reconcile' again later, or 'attempt stop' to cancel it";
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toMatchObject({
+      outcome: 'unknown',
+      reason: expectedReason,
+    });
+    if (result.outcome !== 'unknown') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('dispatching');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('dispatching');
+    expect(setup.journal.releaseCount).toBe(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries).toHaveLength(1);
+    expect(setup.journal.entries[0]).toMatchObject({
+      action: 'reconcile',
+      status: 'ambiguous',
+      sessionId: null,
+      detail: expectedReason,
+    });
+  });
 
   it.each(['dispatching', 'reconciling', 'blocked'] as const)(
     'stops a session-less $state attempt by worktree abort and releases the reservation exactly once',

@@ -10,14 +10,44 @@ describe('validateWorktreeRelativePath', () => {
   });
 
   it('refuses absolute paths', () => {
-    expect(validateWorktreeRelativePath('/etc/passwd')).toEqual(expect.any(String));
-    expect(validateWorktreeRelativePath('C:\\x')).toEqual(expect.any(String));
+    expect(validateWorktreeRelativePath('/etc/passwd')).toBe(
+      'worktree-relative path must be relative',
+    );
+    expect(validateWorktreeRelativePath('C:\\x')).toBe(
+      'worktree-relative path must not contain backslashes',
+    );
+  });
+
+  it('refuses drive-letter forms with or without a following slash', () => {
+    expect(validateWorktreeRelativePath('C:secret')).toBe('worktree-relative path must be relative');
+    expect(validateWorktreeRelativePath('c:/x')).toBe('worktree-relative path must be relative');
+    expect(validateWorktreeRelativePath('C:\\x')).toBe(
+      'worktree-relative path must not contain backslashes',
+    );
+  });
+
+  it('refuses any path containing a backslash', () => {
+    expect(validateWorktreeRelativePath('..\\outside')).toBe(
+      'worktree-relative path must not contain backslashes',
+    );
+    expect(validateWorktreeRelativePath('foo\\..\\..\\secret')).toBe(
+      'worktree-relative path must not contain backslashes',
+    );
+    expect(validateWorktreeRelativePath('a\\b')).toBe(
+      'worktree-relative path must not contain backslashes',
+    );
   });
 
   it('refuses paths that escape the worktree root', () => {
-    expect(validateWorktreeRelativePath('../x')).toEqual(expect.any(String));
-    expect(validateWorktreeRelativePath('a/../../x')).toEqual(expect.any(String));
-    expect(validateWorktreeRelativePath('..')).toEqual(expect.any(String));
+    expect(validateWorktreeRelativePath('../x')).toBe(
+      'worktree-relative path must not escape the worktree root',
+    );
+    expect(validateWorktreeRelativePath('a/../../x')).toBe(
+      'worktree-relative path must not escape the worktree root',
+    );
+    expect(validateWorktreeRelativePath('..')).toBe(
+      'worktree-relative path must not escape the worktree root',
+    );
   });
 
   it('refuses empty strings', () => {
@@ -25,7 +55,9 @@ describe('validateWorktreeRelativePath', () => {
   });
 
   it('refuses strings containing NUL bytes', () => {
-    expect(validateWorktreeRelativePath('a\0b')).toEqual(expect.any(String));
+    expect(validateWorktreeRelativePath('a\0b')).toBe(
+      'worktree-relative path must not contain NUL bytes',
+    );
   });
 
   it('refuses non-strings', () => {

@@ -33,9 +33,11 @@ function normalizeRelativePosixPath(input: string): string {
 
 /**
  * Validate one candidate worktree-relative path. Returns null when the path
- * is acceptable, otherwise a reason string. Absolute paths (POSIX leading
- * separators and Windows drive forms), NUL bytes and `..` escapes are refused
- * so a caller can safely join the path under a worktree root.
+ * is acceptable, otherwise a reason string. The check targets POSIX hosts:
+ * backslashes anywhere and drive-letter forms (with or without a following
+ * separator) are refused outright, as are absolute POSIX paths, NUL bytes
+ * and `..` escapes, so a caller can safely join the path under a worktree
+ * root.
  */
 export function validateWorktreeRelativePath(path: unknown): string | null {
   if (typeof path !== 'string' || path.length === 0) {
@@ -44,7 +46,10 @@ export function validateWorktreeRelativePath(path: unknown): string | null {
   if (path.includes('\0')) {
     return 'worktree-relative path must not contain NUL bytes';
   }
-  if (path.startsWith('/') || path.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(path)) {
+  if (path.includes('\\')) {
+    return 'worktree-relative path must not contain backslashes';
+  }
+  if (path.startsWith('/') || /^[A-Za-z]:/.test(path)) {
     return 'worktree-relative path must be relative';
   }
   const normalized = normalizeRelativePosixPath(path);

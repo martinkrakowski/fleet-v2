@@ -185,6 +185,7 @@ export function runSpawnOutcome(
     };
 
     if (child.stdout !== null) {
+      if (typeof child.stdout.setEncoding === 'function') child.stdout.setEncoding('utf8');
       child.stdout.on('data', (chunk: string | Buffer) => {
         const text = String(chunk);
         if (overran) return; // Drain but discard; the outcome is already an error.
@@ -192,6 +193,7 @@ export function runSpawnOutcome(
       });
     }
     if (child.stderr !== null) {
+      if (typeof child.stderr.setEncoding === 'function') child.stderr.setEncoding('utf8');
       child.stderr.on('data', (chunk: string | Buffer) => {
         const text = String(chunk);
         if (overran) return;

@@ -46,3 +46,19 @@ export interface WorkspacePort {
     recordedHost?: AttemptRunnerRecord | null,
   ): Promise<string | null>;
 }
+
+/**
+ * Thrown when a worktree file read is asked for a path that is not a safe
+ * worktree-relative path (absolute, `..` escape, NUL, or not a non-empty
+ * string). The read is refused before any command runs, so the runner host
+ * never sees the path.
+ */
+export class WorktreePathRefusedError extends Error {
+  readonly relativePath: string;
+
+  constructor(relativePath: string, reason: string) {
+    super(`Refused worktree-relative path ${relativePath}: ${reason}`);
+    this.name = 'WorktreePathRefusedError';
+    this.relativePath = relativePath;
+  }
+}

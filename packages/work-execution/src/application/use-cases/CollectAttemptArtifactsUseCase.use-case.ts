@@ -8,6 +8,7 @@
  */
 
 import type { ActionJournalEntryRecord, AttemptRecord, AttemptUsageRecord } from '../../domain/execution-records.js';
+import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import type { AttemptOutcomeValue } from '../../domain/value-objects/AttemptOutcome.vo.js';
 import type {
   CollectAttemptArtifactsPort,
@@ -94,6 +95,18 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
   async collectAttemptArtifacts(request: CollectAttemptArtifactsRequest): Promise<CollectAttemptArtifactsResult> {
     if (!this.deps) {
       throw new Error('Not implemented: CollectAttemptArtifactsUseCase');
+    }
+
+    // Request-validation entry check: every expected-artifact path must be a
+    // contained worktree-relative path, refused here before any collection.
+    for (const artifact of request.expectedArtifacts ?? []) {
+      const refusedReason = validateWorktreeRelativePath(artifact);
+      if (refusedReason !== null) {
+        return {
+          outcome: 'refused',
+          reason: `expectedArtifacts entry '${String(artifact)}' is refused: ${refusedReason}`,
+        };
+      }
     }
 
     const attempt = await this.deps.attemptRepo.findAttemptById(request.attemptId);

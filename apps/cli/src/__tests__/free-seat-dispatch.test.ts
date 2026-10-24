@@ -80,6 +80,9 @@ function initGitRepo(dir: string): string {
   execFileSync('git', ['-C', dir, 'config', 'user.email', 'fleet@example.invalid']);
   execFileSync('git', ['-C', dir, 'config', 'user.name', 'Fleet CLI Test']);
   execFileSync('git', ['-C', dir, 'config', 'commit.gpgsign', 'false']);
+  // The frozen brief package lives in the worktree's gitignored `.lane/`
+  // directory, where the containment rules allow it.
+  writeFileSync(path.join(dir, '.gitignore'), '.lane/\n');
   writeFileSync(path.join(dir, 'README.md'), '# lane worktree\n');
   execFileSync('git', ['-C', dir, 'add', '.']);
   execFileSync('git', ['-C', dir, 'commit', '-q', '-m', 'init']);
@@ -113,8 +116,10 @@ function makeWorkOrder(): WorkOrderRecord {
 beforeAll(() => {
   suiteDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-free-seat-dispatch-'));
   laneRepoDir = path.join(suiteDir, 'lane-repo');
-  briefDir = path.join(suiteDir, 'brief-files');
-  mkdirSync(briefDir);
+  // Brief files are staged inside the worktree's gitignored `.lane/` folder:
+  // dispatch reads the frozen brief only from contained worktree paths.
+  briefDir = path.join(laneRepoDir, '.lane');
+  mkdirSync(briefDir, { recursive: true });
   baseCommit = initGitRepo(laneRepoDir);
   writeManifest('free-manifest.json', FREE_MODEL);
   writeManifest('paid-manifest.json', PAID_MODEL);

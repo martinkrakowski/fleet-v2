@@ -5,3 +5,4 @@ export * from "./entities/index.js";
 export * from "./execution-records.js";
 export * from "./lane-diff-check.js";
 export * from "./value-objects/index.js";
+export * from "./worktree-path.js";

@@ -36,11 +36,13 @@
  *    remote command.
  *  - **There is no ambiguous middle.** A run that ended with a non-empty
  *    response is `started`; exit 1 or 4 (agy failed, or reported a model or
- *    agent error), an empty response, a refused busy worktree (75) and a
- *    timeout or signal kill (no exit code at all) are all failed runs and are
- *    reported `refused` with the exit named. `unknown` is never returned: it
- *    would retain capacity and send the attempt into reconciliation as if a
- *    killed lane might still succeed.
+ *    agent error) or an empty response is a failed run reported `refused`
+ *    with the exit named. A refused busy worktree (75) and a timeout or
+ *    signal kill (no exit code at all) are `blocked`: the reservation is
+ *    kept until `attempt reconcile` or `attempt stop` resolves the
+ *    worktree. `unknown` is never returned: it would retain capacity and
+ *    send the attempt into reconciliation as if a killed lane might still
+ *    succeed.
  *
  * Nothing here is reachable from dispatch until a composition root injects
  * this adapter (lane O14e1); the selector still refuses an agy seat until it

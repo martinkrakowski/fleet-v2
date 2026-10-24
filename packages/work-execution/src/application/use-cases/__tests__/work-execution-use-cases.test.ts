@@ -1872,6 +1872,17 @@ describe('DispatchAttemptUseCase', () => {
         },
       },
     });
+    const callOrder: string[] = [];
+    const innerAppend = setup.journal.appendJournalEntry.bind(setup.journal);
+    setup.journal.appendJournalEntry = async (entry) => {
+      callOrder.push('journal.appendJournalEntry');
+      await innerAppend(entry);
+    };
+    const innerSave = setup.attemptRepo.saveAttempt.bind(setup.attemptRepo);
+    setup.attemptRepo.saveAttempt = async (record) => {
+      callOrder.push('attemptRepo.saveAttempt');
+      await innerSave(record);
+    };
 
     const result = await setup.useCase.dispatchAttempt(
       validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
@@ -1901,6 +1912,8 @@ describe('DispatchAttemptUseCase', () => {
       status: 'ambiguous',
       detail: `Blocked: Worktree already has an active session (exit 75); reservation kept until 'attempt reconcile' or 'attempt stop' resolves the worktree`,
     });
+    expect(callOrder).toHaveLength(4);
+    expect(callOrder.slice(-2)).toEqual(['journal.appendJournalEntry', 'attemptRepo.saveAttempt']);
   });
 
   it('refuses dispatch on an existing attempt in a claiming state without starting or journalling', async () => {

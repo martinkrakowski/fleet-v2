@@ -16,6 +16,7 @@ import {
   type AttemptOwnerDecisionDelegate as WorkAttemptOwnerDecisionDelegate,
   type OwnerDecisionDelegate as WorkOwnerDecisionDelegate,
 } from "@fleet/work-execution";
+import { assessmentIdForAttempt } from "@fleet/evidence-and-acceptance";
 import type {
   AttemptOwnerDecisionDelegate as EvidenceAttemptOwnerDecisionDelegate,
   OwnerDecisionDelegate as EvidenceOwnerDecisionDelegate,
@@ -371,7 +372,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
         // doors before its idempotent accepted path, so a stored acceptance
         // whose owner decision has been withdrawn still blocks here.
         const result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
-          assessmentId: request.attemptId,
+          assessmentId: assessmentIdForAttempt(request.attemptId),
           candidateHeadSha: request.candidateHeadSha,
           policyRevision: request.policyRevision,
         });
@@ -517,7 +518,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
     acceptanceEvidence: {
       readAcceptance: async (request) => {
         let inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
-          assessmentId: `assessment-${request.attemptId}`,
+          assessmentId: assessmentIdForAttempt(request.attemptId),
           candidateHeadSha: request.candidateHeadSha,
         });
         if (inspected.outcome === "not-found") {
@@ -528,6 +529,15 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
         }
         // No head-only fallback: an assessment that is not bound to this
         // attempt is another attempt's evidence, and this attempt has none.
+        if (
+          inspected.outcome === "found" &&
+          inspected.assessment.attemptId !== request.attemptId
+        ) {
+          return {
+            outcome: "not-found",
+            reason: `No acceptance assessment found for head ${request.candidateHeadSha}`,
+          };
+        }
         if (inspected.outcome === "found") {
           return {
             outcome: "found",

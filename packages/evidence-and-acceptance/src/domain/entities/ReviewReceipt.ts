@@ -53,7 +53,9 @@ function isNonEmptyTrimmedString(value: unknown): value is string {
  *
  * An empty family (from `''`, `'4o-mini'`, `'/'`, `'z-ai/'`, `'#low'`) is
  * invalid; callers comparing families must fail closed and treat an empty
- * family as equal to every other family.
+ * family as equal to every other family. Known gap (follow-up, not handled):
+ * Bedrock-style `vendor.model` ids such as `anthropic.claude-...` key on the
+ * vendor, so they are not matched to `claude-...`.
  */
 export function underlyingModelFamily(model: string): string {
   let value = model.trim().toLowerCase();

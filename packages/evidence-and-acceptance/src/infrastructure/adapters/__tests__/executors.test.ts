@@ -243,7 +243,7 @@ describe('evidence default run timeout (spawn-run)', () => {
     ]);
     expect(outcome.exitCode).toBe(0);
     expect(outcome.stdout).toBe('—');
-    expect(outcome.stdout).not.toContain('');
+    expect(outcome.stdout).not.toContain('\ufffd');
   });
 
   it('decodes multi-byte UTF-8 characters split across stderr chunks without replacement characters', async () => {
@@ -253,7 +253,7 @@ describe('evidence default run timeout (spawn-run)', () => {
     ]);
     expect(outcome.exitCode).toBe(0);
     expect(outcome.stderr).toBe('—');
-    expect(outcome.stderr).not.toContain('');
+    expect(outcome.stderr).not.toContain('\ufffd');
   });
 });
 

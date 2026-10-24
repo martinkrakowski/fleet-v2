@@ -15,7 +15,11 @@ import type {
   CollectAttemptArtifactsResult,
 } from '../ports/in/CollectAttemptArtifactsPort.in-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
-import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import {
+  AttemptRevisionConflictError,
+  nextAttemptRevision,
+  type AttemptRepositoryPort,
+} from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { BriefKnowledgePort } from '../ports/out/BriefKnowledgePort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
@@ -155,13 +159,43 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
 
     const collectedAttempt: AttemptRecord = {
       ...attempt,
+      revision: nextAttemptRevision(attempt),
       state: 'collected',
       outcome,
       artifacts: collected.artifacts,
       ...(usageResult !== undefined ? { usage: usageResult.usage } : {}),
       updatedAtIso: nowIso,
     };
-    await this.deps.attemptRepo.saveAttempt(collectedAttempt);
+    try {
+      await this.deps.attemptRepo.saveAttempt(collectedAttempt);
+    } catch (error) {
+      if (error instanceof AttemptRevisionConflictError) {
+        // Never redo collection: re-read once. If the fresh record is still
+        // `ended`, rebuild the same `collected` transition on top of it with
+        // the artifacts and usage already gathered and save once (a second
+        // conflict propagates); release and the journal entry still run.
+        // Any other fresh state keeps the refusal naming that state.
+        const fresh = await this.deps.attemptRepo.findAttemptById(attempt.id);
+        if (fresh?.state !== 'ended') {
+          return {
+            outcome: 'refused',
+            reason: `Attempt ${attempt.id} changed to ${fresh?.state ?? 'unknown'} while collecting artifacts`,
+          };
+        }
+        const rebuilt: AttemptRecord = {
+          ...fresh,
+          revision: nextAttemptRevision(fresh),
+          state: 'collected',
+          outcome,
+          artifacts: collected.artifacts,
+          ...(usageResult !== undefined ? { usage: usageResult.usage } : {}),
+          updatedAtIso: nowIso,
+        };
+        await this.deps.attemptRepo.saveAttempt(rebuilt);
+      } else {
+        throw error;
+      }
+    }
     // Release is idempotent: false simply means no reservation was held.
     await this.deps.journal.releaseCapacityReservation(attempt.id, nowIso);
     const usageDetail =

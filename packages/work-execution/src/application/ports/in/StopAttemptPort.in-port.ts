@@ -20,6 +20,8 @@ export type StopAttemptResult =
       readonly attempt: AttemptRecord;
       readonly receipt: CommandCompletionReceipt;
       readonly capacityReleased: boolean;
+      /** Present when the termination left a foreign live attempt in place (e.g. a concurrent re-dispatch). */
+      readonly reason?: string;
     }
   | { readonly outcome: 'still-running'; readonly attempt: AttemptRecord; readonly reason: string }
   | { readonly outcome: 'unknown'; readonly attempt: AttemptRecord; readonly reason: string }

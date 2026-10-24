@@ -11,7 +11,10 @@ import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 import type { AttemptRecord, AttemptRunnerRecord, RunnerKind } from '../../domain/execution-records.js';
-import type { AttemptRepositoryPort } from '../../application/ports/out/AttemptRepositoryPort.out-port.js';
+import {
+  AttemptRevisionConflictError,
+  type AttemptRepositoryPort,
+} from '../../application/ports/out/AttemptRepositoryPort.out-port.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface AttemptRepositoryAdapterOptions {
@@ -46,16 +49,22 @@ function isAttemptRecord(value: unknown): value is AttemptRecord {
  * `host`, and after-dispatch actions apply the legacy rule to them.
  */
 function normalizeRecord(record: AttemptRecord): AttemptRecord {
+  // A missing or non-integer revision reads as 0, so every record coming out
+  // of the repository carries an integer revision.
+  const revision = Number.isInteger(record.revision) ? record.revision! : 0;
   const runner = record.runner;
-  if (runner === undefined || runner === null) return record;
+  if (runner === undefined || runner === null) {
+    return revision === record.revision ? record : { ...record, revision };
+  }
   const raw = runner as AttemptRunnerRecord & { kind?: RunnerKind; hostName?: string | null };
   const kind: RunnerKind = raw.kind === 'agy' ? 'agy' : 'opencode';
   const hostName = typeof raw.hostName === 'string' && raw.hostName.trim() !== '' ? raw.hostName : null;
   if (kind === runner.kind && runner.remotePort !== undefined && runner.hostName === hostName) {
-    return record;
+    return revision === record.revision ? record : { ...record, revision };
   }
   return {
     ...record,
+    revision,
     runner: {
       ...runner,
       kind,
@@ -72,17 +81,31 @@ export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
 
   async saveAttempt(record: AttemptRecord): Promise<void> {
     const stateDir = this.options?.stateDir;
+    const guardExisting = (existing: AttemptRecord): void => {
+      // Immutable identity fields are guarded first: a stale revision must
+      // never mask an identity mutation.
+      const changed = immutableAttemptIdentityFields.filter(
+        (field) => existing[field] !== record[field],
+      );
+      if (changed.length > 0) {
+        throw new Error(
+          `Immutable attempt identity changed for ${record.id}: ${changed.join(', ')}`,
+        );
+      }
+      // Compare-and-swap: the writer must build on exactly the stored
+      // revision, so its revision is stored + 1. Missing revisions on either
+      // side count as 0.
+      const expected = existing.revision ?? 0;
+      const actual = record.revision ?? 0;
+      if (actual !== expected + 1) {
+        throw new AttemptRevisionConflictError(record.id, expected, actual);
+      }
+    };
+
     if (stateDir === undefined) {
       const existing = this.inMemoryRecords.get(record.id);
       if (existing !== undefined) {
-        const changed = immutableAttemptIdentityFields.filter(
-          (field) => existing[field] !== record[field],
-        );
-        if (changed.length > 0) {
-          throw new Error(
-            `Immutable attempt identity changed for ${record.id}: ${changed.join(', ')}`,
-          );
-        }
+        guardExisting(existing);
       }
       this.inMemoryRecords.set(record.id, normalizeRecord(record));
       return;
@@ -95,14 +118,7 @@ export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
       const records = await this.readRecordsFromDisk(target);
       const existing = records.get(record.id);
       if (existing !== undefined) {
-        const changed = immutableAttemptIdentityFields.filter(
-          (field) => existing[field] !== record[field],
-        );
-        if (changed.length > 0) {
-          throw new Error(
-            `Immutable attempt identity changed for ${record.id}: ${changed.join(', ')}`,
-          );
-        }
+        guardExisting(existing);
       }
       records.set(record.id, normalizeRecord(record));
       await writeJsonAtomically(target, [...records.values()]);

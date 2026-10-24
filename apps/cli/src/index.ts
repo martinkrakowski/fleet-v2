@@ -13,6 +13,7 @@ import { join, resolve } from 'node:path';
 import { readFileSync } from 'node:fs';
 
 import type {
+  AttemptRecord,
   AttemptSeatOverrideRecord,
   BriefContextDecision,
   BriefModelAssignment,
@@ -20,6 +21,8 @@ import type {
   ReserveExecutionCapacityCandidateHost,
 } from '@fleet/work-execution';
 import {
+  AttemptRevisionConflictError,
+  nextAttemptRevision,
   parseSeatTool,
   resolveInstallationHostForRole,
 } from '@fleet/work-execution';
@@ -932,13 +935,30 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
       if (attempt === null) {
         return { outcome: 'refused', reason: `Attempt not found: ${attemptId}` };
       }
-      const result = await rt.execution.opencodeDbUsage.readUsage({ attempt });
-      await rt.execution.attemptRepository.saveAttempt({
-        ...attempt,
-        usage: result.usage,
-        updatedAtIso: new Date().toISOString(),
-      });
-      return result;
+      const measureAndSave = async (base: AttemptRecord) => {
+        const measured = await rt.execution.opencodeDbUsage.readUsage({ attempt: base });
+        await rt.execution.attemptRepository.saveAttempt({
+          ...base,
+          usage: measured.usage,
+          updatedAtIso: new Date().toISOString(),
+          revision: nextAttemptRevision(base),
+        });
+        return measured;
+      };
+      try {
+        return await measureAndSave(attempt);
+      } catch (error) {
+        if (!(error instanceof AttemptRevisionConflictError)) {
+          throw error;
+        }
+        // Re-read once and measure again from the fresh record, so an older
+        // measurement (or another session's usage) never overwrites a newer one.
+        const fresh = await rt.execution.attemptRepository.findAttemptById(attemptId);
+        if (fresh === null) {
+          return { outcome: 'refused', reason: `Attempt not found: ${attemptId}` };
+        }
+        return measureAndSave(fresh);
+      }
     },
     fix: async (p, rt) =>
       rt.execution.prepareFixAttempt.prepareFixAttempt({

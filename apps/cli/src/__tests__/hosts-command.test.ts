@@ -22,6 +22,7 @@ import { parseInstallation } from "@fleet/installation";
 import {
   AttemptRepositoryAdapter,
   ExecutionJournalAdapter,
+  nextAttemptRevision,
   type AttemptRecord,
   type CapacityReservationRecord,
 } from "@fleet/work-execution";
@@ -731,7 +732,12 @@ describe("fleet-v2 hosts remove", () => {
     expect(refused.stderr).toContain("attempt att-1 is running on verifyhost");
     expect(refused.stderr).toContain("has live work; nothing was removed");
     // An attempt whose state is in CAPACITY_RELEASE_STATES no longer blocks.
-    await attempts.saveAttempt(attemptRecord({ id: "att-1", state: "ended" }));
+    const storedAttempt = await attempts.findAttemptById("att-1");
+    await attempts.saveAttempt({
+      ...storedAttempt!,
+      state: "ended",
+      revision: nextAttemptRevision(storedAttempt!),
+    });
     const released = await runHosts(argv, file);
     expect(released.code).toBe(0);
   });

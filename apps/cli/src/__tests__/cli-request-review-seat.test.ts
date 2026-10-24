@@ -14,6 +14,7 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { AttemptRecord } from '@fleet/work-execution';
+import { nextAttemptRevision } from '@fleet/work-execution';
 
 import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
@@ -146,9 +147,11 @@ describe('evidence request-review implementer seat binding', () => {
   });
 
   it('refuses an attempt that records no implementer seat', async () => {
+    const stored = await runtime.execution.attemptRepository.findAttemptById(ATTEMPT_ID);
     await runtime.execution.attemptRepository.saveAttempt({
-      ...seatlessAttempt(),
+      ...stored!,
       runner: null,
+      revision: nextAttemptRevision(stored!),
     });
 
     const invocation = await cli(reviewRequest());

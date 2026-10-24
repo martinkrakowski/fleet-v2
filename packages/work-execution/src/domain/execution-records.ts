@@ -135,6 +135,10 @@ export interface AttemptRecord {
   readonly worktreePath: string;
   readonly baseCommit: string;
   readonly state: AttemptStateValue;
+  /** Optimistic-concurrency revision; absent reads as 0 (legacy records). */
+  readonly revision?: number;
+  /** Revision of the dispatching save that began this dispatch; a re-dispatch sets a new one, metadata-only writes (usage) keep it. Absent on legacy records. */
+  readonly dispatchRevision?: number;
   readonly outcome: AttemptOutcomeValue | null;
   readonly briefDigest: string | null;
   readonly briefPackagePath: string | null;

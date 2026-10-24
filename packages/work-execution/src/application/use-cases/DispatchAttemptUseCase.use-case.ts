@@ -18,7 +18,12 @@ import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-ac
 import type { DispatchAttemptPort, DispatchAttemptRequest, DispatchAttemptResult } from '../ports/in/DispatchAttemptPort.in-port.js';
 import type { RunnerIsolationCapabilities } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
-import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import {
+  AttemptRevisionConflictError,
+  canOverwriteAfterConflict,
+  nextAttemptRevision,
+  type AttemptRepositoryPort,
+} from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { ExecutionObservationPort } from '../ports/out/ExecutionObservationPort.out-port.js';
 import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
@@ -69,6 +74,11 @@ const BRIEF_RUNNER_REQUIREMENTS: RunnerIsolationCapabilities = {
 };
 
 type JournalEntryDraft = Omit<ActionJournalEntryRecord, 'id'>;
+
+/** Outcome of the post-`startSession` `running` save. */
+type RunningSaveOutcome =
+  | { readonly kind: 'saved'; readonly stored: AttemptRecord }
+  | { readonly kind: 'conflict'; readonly result: DispatchAttemptResult };
 
 /**
  * Owner decision references as frozen in the brief package. An absent field is
@@ -489,6 +499,8 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     const dispatchingAttempt: AttemptRecord = existingAttempt
       ? {
           ...existingAttempt,
+          revision: nextAttemptRevision(existingAttempt),
+          dispatchRevision: nextAttemptRevision(existingAttempt),
           worktreePath: request.worktreePath,
           baseCommit: request.baseCommit,
           state: 'dispatching',
@@ -511,6 +523,8 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           baseCommit: request.baseCommit,
           state: 'dispatching',
           outcome: null,
+          revision: 0,
+          dispatchRevision: 0,
           briefDigest: request.briefDigest,
           briefPackagePath: request.briefPackagePath,
           sessionId: null,
@@ -523,7 +537,10 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           createdAtIso: nowIso,
           updatedAtIso: nowIso,
         };
-    await this.deps.attemptRepo.saveAttempt(dispatchingAttempt);
+    const dispatchingConflict = await this.saveAttemptOrConflict(dispatchingAttempt, false);
+    if (dispatchingConflict) {
+      return dispatchingConflict;
+    }
 
     const startResult = await this.deps.runner.startSession({
       attemptId: request.attemptId,
@@ -540,16 +557,19 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     });
 
     if (startResult.outcome === 'started') {
+      const runnerValue = startResult.runner
+        ? { ...startResult.runner, ...(seatPolicyFlag !== undefined ? { useFreeSeats: seatPolicyFlag } : {}) }
+        : dispatchingAttempt.runner ?? null;
       const runningAttempt: AttemptRecord = {
         ...dispatchingAttempt,
+        revision: nextAttemptRevision(dispatchingAttempt),
         state: 'running',
         sessionId: startResult.sessionId,
-        runner: startResult.runner
-          ? { ...startResult.runner, ...(seatPolicyFlag !== undefined ? { useFreeSeats: seatPolicyFlag } : {}) }
-          : dispatchingAttempt.runner ?? null,
+        runner: runnerValue,
         updatedAtIso: nowIso,
       };
-      await this.deps.attemptRepo.saveAttempt(runningAttempt);
+      // The started session must never be lost: journal the completed start
+      // BEFORE the running save so a conflict or crash still records the id.
       const completedEntry = await appendJournalEntry(this.deps.journal, {
         attemptId: request.attemptId,
         workOrderId: request.workOrderId,
@@ -560,6 +580,10 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         sessionId: startResult.sessionId,
         detail: `Session started: ${startResult.sessionId}`,
       });
+      const runningSave = await this.saveRunningOrConflict(runningAttempt, startResult.sessionId, runnerValue, nowIso);
+      if (runningSave.kind === 'conflict') {
+        return runningSave.result;
+      }
       if (this.deps.observation) {
         // A delivery gap is preserved and visible; it never fails the lane.
         await this.deps.observation.publishExecutionObservation({
@@ -567,17 +591,19 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           projectId: workOrder.projectId,
         });
       }
-      return { outcome: 'started', attempt: runningAttempt, sessionId: startResult.sessionId };
+      return { outcome: 'started', attempt: runningSave.stored, sessionId: startResult.sessionId };
     }
 
     if (startResult.outcome === 'unknown') {
       // Unknown keeps the reservation; reconciliation decides before retry.
       const reconcilingAttempt: AttemptRecord = {
         ...dispatchingAttempt,
+        revision: nextAttemptRevision(dispatchingAttempt),
         state: 'reconciling',
         updatedAtIso: nowIso,
       };
-      await this.deps.attemptRepo.saveAttempt(reconcilingAttempt);
+      // Journal the ambiguous start first: a session may exist on the runner,
+      // and the evidence must survive a conflicting save.
       await appendJournalEntry(this.deps.journal, {
         attemptId: request.attemptId,
         workOrderId: request.workOrderId,
@@ -588,15 +614,25 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         sessionId: null,
         detail: startResult.reason,
       });
+      const reconcilingConflict = await this.saveAttemptOrConflict(reconcilingAttempt, true);
+      if (reconcilingConflict) {
+        return reconcilingConflict;
+      }
       return { outcome: 'unknown', attempt: reconcilingAttempt, reason: startResult.reason };
     }
 
     const cancelledAttempt: AttemptRecord = {
       ...dispatchingAttempt,
+      revision: nextAttemptRevision(dispatchingAttempt),
       state: 'cancelled',
       updatedAtIso: nowIso,
     };
-    await this.deps.attemptRepo.saveAttempt(cancelledAttempt);
+    const refusedSave = await this.saveRefusedCancelledOrSkip(cancelledAttempt, nowIso, dispatchingAttempt);
+    if (refusedSave) {
+      // Someone else moved the attempt on: no save happened, so the
+      // reservation is never released and the fresh state is reported.
+      return refusedSave;
+    }
     await appendJournalEntry(this.deps.journal, {
       attemptId: request.attemptId,
       workOrderId: request.workOrderId,
@@ -609,6 +645,278 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     });
     await this.deps.journal.releaseCapacityReservation(request.attemptId, nowIso);
     return { outcome: 'refused', reason: startResult.reason };
+  }
+
+  /**
+   * Save one attempt record, catching `AttemptRevisionConflictError`. A
+   * conflict re-reads once and returns a refused or unknown result naming the
+   * conflicting state instead of redoing any work: dispatch must never start a
+   * second session.
+   */
+  private async saveAttemptOrConflict(
+    record: AttemptRecord,
+    unknownOnConflict: boolean,
+  ): Promise<DispatchAttemptResult | null> {
+    try {
+      await this.deps!.attemptRepo.saveAttempt(record);
+      return null;
+    } catch (error) {
+      if (!(error instanceof AttemptRevisionConflictError)) {
+        throw error;
+      }
+      const fresh = await this.deps!.attemptRepo.findAttemptById(record.id);
+      const state = fresh?.state ?? 'unknown';
+      if (unknownOnConflict) {
+        return {
+          outcome: 'unknown',
+          attempt: fresh ?? record,
+          reason: `Attempt ${record.id} changed to ${state} while dispatching`,
+        };
+      }
+      return {
+        outcome: 'refused',
+        reason: `Attempt ${record.id} changed to ${state} while dispatching`,
+      };
+    }
+  }
+
+  /**
+   * Save the `running` transition after `startSession` succeeded. A conflict
+   * never re-runs the start: the fresh record is re-read once. The `running`
+   * transition is rebuilt only when the fresh record is still `dispatching`,
+   * or `reconciling` with no session; a vanished record rebuilds from the
+   * pre-conflict record. Anything else is someone else's move: the state is
+   * never overwritten — with a null session id the session is recorded on
+   * the fresh record so reconcile can find it, and with a session id already
+   * present nothing is saved. Either foreign-state case returns an `unknown`
+   * result naming the session id, with a journal entry carrying it so the
+   * session is never lost; a non-authoritative `ended` is never written
+   * back to `running`. A second conflict is never allowed to leave a live,
+   * unrecorded session: the started session is stopped once, the stop
+   * outcome and the id are journalled as `ambiguous`, and an `unknown`
+   * result naming the reason is returned instead of rethrowing.
+   */
+  private async saveRunningOrConflict(
+    runningAttempt: AttemptRecord,
+    sessionId: string,
+    runnerValue: AttemptRecord['runner'],
+    nowIso: string,
+  ): Promise<RunningSaveOutcome> {
+    const deps = this.deps!;
+    const alreadyRecorded = (record: AttemptRecord): RunningSaveOutcome => {
+      // The record already carries the session this dispatch started: nothing
+      // to stop and nothing to save. A non-terminal record is the started
+      // attempt; a terminal one is reported as unknown, never as started.
+      if (record.state === 'cancelled' || record.state === 'collected' || record.state === 'ended') {
+        return {
+          kind: 'conflict',
+          result: {
+            outcome: 'unknown',
+            attempt: record,
+            reason: `Attempt ${record.id} is in state ${record.state} with session ${sessionId} already recorded`,
+          },
+        };
+      }
+      return { kind: 'saved', stored: record };
+    };
+    const handleSecondConflict = async (): Promise<RunningSaveOutcome> => {
+      // A second revision conflict while a started session is live must not
+      // leave it running and unrecorded: stop it once and journal the id,
+      // unless the winning write already recorded this very session.
+      const winner = await deps.attemptRepo.findAttemptById(runningAttempt.id);
+      if (winner !== null && winner.sessionId === sessionId) {
+        return alreadyRecorded(winner);
+      }
+      const stopResult = await deps.runner.stopSession({
+        attemptId: runningAttempt.id,
+        sessionId,
+        gracePeriodSeconds: 10,
+        worktreePath: runningAttempt.worktreePath,
+        runner: runnerValue,
+      });
+      const reason = `second revision conflict; started session ${sessionId} stopped (${stopResult.outcome})`;
+      await appendJournalEntry(deps.journal, {
+        attemptId: runningAttempt.id,
+        workOrderId: runningAttempt.workOrderId,
+        action: 'dispatch',
+        baseCommit: runningAttempt.baseCommit,
+        recordedAtIso: nowIso,
+        status: 'ambiguous',
+        sessionId,
+        detail: reason,
+      });
+      const freshAgain = await deps.attemptRepo.findAttemptById(runningAttempt.id);
+      return { kind: 'conflict', result: { outcome: 'unknown', attempt: freshAgain ?? runningAttempt, reason } };
+    };
+    const saveRebuiltOrHandleConflict = async (rebuilt: AttemptRecord): Promise<RunningSaveOutcome> => {
+      try {
+        await deps.attemptRepo.saveAttempt(rebuilt);
+        return { kind: 'saved', stored: rebuilt };
+      } catch (error) {
+        if (!(error instanceof AttemptRevisionConflictError)) {
+          throw error;
+        }
+        return handleSecondConflict();
+      }
+    };
+    const savePreservedOrHandleConflict = async (
+      preserved: AttemptRecord,
+      reason: string,
+    ): Promise<RunningSaveOutcome> => {
+      try {
+        await deps.attemptRepo.saveAttempt(preserved);
+        // The session is recorded on someone else's state, so the dispatch
+        // is reported as unknown (reconcile decides), never as started.
+        return { kind: 'conflict', result: { outcome: 'unknown', attempt: preserved, reason } };
+      } catch (error) {
+        if (!(error instanceof AttemptRevisionConflictError)) {
+          throw error;
+        }
+        return handleSecondConflict();
+      }
+    };
+    try {
+      await deps.attemptRepo.saveAttempt(runningAttempt);
+      return { kind: 'saved', stored: runningAttempt };
+    } catch (error) {
+      if (!(error instanceof AttemptRevisionConflictError)) {
+        throw error;
+      }
+      const fresh = await deps.attemptRepo.findAttemptById(runningAttempt.id);
+      if (
+        fresh === null ||
+        canOverwriteAfterConflict(fresh, ['dispatching'], runningAttempt) ||
+        (fresh.state === 'reconciling' && fresh.sessionId === null)
+      ) {
+        const base = fresh ?? runningAttempt;
+        const rebuilt: AttemptRecord = {
+          ...base,
+          revision: nextAttemptRevision(base),
+          state: 'running',
+          sessionId,
+          runner: runnerValue,
+          updatedAtIso: nowIso,
+        };
+        return saveRebuiltOrHandleConflict(rebuilt);
+      }
+      if (fresh.sessionId === sessionId) {
+        return alreadyRecorded(fresh);
+      }
+      const freshIsTerminal =
+        fresh.state === 'cancelled' || fresh.state === 'collected' || fresh.state === 'ended';
+      if (freshIsTerminal || fresh.sessionId !== null) {
+        // Someone else ended the attempt or recorded another session while
+        // this call started one. The new session is never attached to that
+        // record (reconcile would demote a terminal state or release capacity
+        // twice); it is stopped instead, once, and the outcome journalled.
+        const stopResult = await deps.runner.stopSession({
+          attemptId: runningAttempt.id,
+          sessionId,
+          gracePeriodSeconds: 10,
+          worktreePath: runningAttempt.worktreePath,
+          runner: runnerValue,
+        });
+        const reason =
+          `Attempt ${runningAttempt.id} is in state ${fresh.state}` +
+          (fresh.sessionId !== null ? ` with session ${fresh.sessionId}` : '') +
+          `; started session ${sessionId} was not recorded and its stop was ${stopResult.outcome}`;
+        await appendJournalEntry(deps.journal, {
+          attemptId: runningAttempt.id,
+          workOrderId: runningAttempt.workOrderId,
+          action: 'dispatch',
+          baseCommit: runningAttempt.baseCommit,
+          recordedAtIso: nowIso,
+          status: 'ambiguous',
+          sessionId,
+          detail: reason,
+        });
+        return { kind: 'conflict', result: { outcome: 'unknown', attempt: fresh, reason } };
+      }
+      {
+        // A non-terminal record without a session: the state stays whatever
+        // someone else set it to; only the session is recorded so reconcile
+        // can find it.
+        const preserved: AttemptRecord = {
+          ...fresh,
+          sessionId,
+          runner: runnerValue,
+          revision: nextAttemptRevision(fresh),
+          updatedAtIso: nowIso,
+        };
+        const reason = `Attempt ${runningAttempt.id} is in state ${fresh.state} while dispatching; session ${sessionId} recorded on it`;
+        await appendJournalEntry(deps.journal, {
+          attemptId: runningAttempt.id,
+          workOrderId: runningAttempt.workOrderId,
+          action: 'dispatch',
+          baseCommit: runningAttempt.baseCommit,
+          recordedAtIso: nowIso,
+          status: 'ambiguous',
+          sessionId,
+          detail: reason,
+        });
+        return savePreservedOrHandleConflict(preserved, reason);
+      }
+    }
+  }
+
+  /**
+   * Save the `cancelled` transition after a refused start. On a conflict the
+   * fresh record is re-read once: `cancelled` is rebuilt and the caller may
+   * release capacity only when the fresh record is still `dispatching` with
+   * no session (a vanished record rebuilds from the pre-conflict record).
+   * A `dispatching` fresh record is overwritten only when it is the same
+   * dispatch — same `dispatchRevision` as the `base` dispatching record; a
+   * foreign re-dispatch is never overwritten. Anything else is someone
+   * else's move: no save, no capacity release, and a refused result naming
+   * the fresh state, with a journal entry recording that the refused start
+   * found the attempt in that state. A second conflict propagates.
+   */
+  private async saveRefusedCancelledOrSkip(
+    cancelledAttempt: AttemptRecord,
+    nowIso: string,
+    base: AttemptRecord,
+  ): Promise<DispatchAttemptResult | null> {
+    const deps = this.deps!;
+    const build = (base: AttemptRecord): AttemptRecord => ({
+      ...base,
+      revision: nextAttemptRevision(base),
+      state: 'cancelled',
+      updatedAtIso: nowIso,
+    });
+    try {
+      await deps.attemptRepo.saveAttempt(cancelledAttempt);
+      return null;
+    } catch (error) {
+      if (!(error instanceof AttemptRevisionConflictError)) {
+        throw error;
+      }
+      const fresh = await deps.attemptRepo.findAttemptById(cancelledAttempt.id);
+      if (
+        fresh === null ||
+        (canOverwriteAfterConflict(fresh, ['dispatching'], base) && fresh.sessionId === null)
+      ) {
+        await deps.attemptRepo.saveAttempt(build(fresh ?? cancelledAttempt));
+        return null;
+      }
+      const reason =
+        fresh.state === 'dispatching'
+          ? `Attempt ${cancelledAttempt.id} was re-dispatched concurrently while refusing dispatch; capacity not released`
+          : `Attempt ${cancelledAttempt.id} changed to ${fresh.state} while refusing dispatch; capacity not released`;
+      await appendJournalEntry(deps.journal, {
+        attemptId: cancelledAttempt.id,
+        workOrderId: cancelledAttempt.workOrderId,
+        action: 'dispatch',
+        baseCommit: cancelledAttempt.baseCommit,
+        recordedAtIso: nowIso,
+        status: 'refused',
+        sessionId: null,
+        detail:
+          fresh.state === 'dispatching'
+            ? `Refused dispatch start found attempt ${cancelledAttempt.id} re-dispatched concurrently`
+            : `Refused dispatch start found attempt ${cancelledAttempt.id} in state ${fresh.state}`,
+      });
+      return { outcome: 'refused', reason };
+    }
   }
 
   async execute(input?: unknown): Promise<DispatchAttemptResult> {

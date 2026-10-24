@@ -220,6 +220,26 @@ describe('AttemptRepositoryAdapter revision compare-and-swap', () => {
       );
     });
 
+    it(`names the stored revision and the required write revision in the conflict message (${mode.label})`, async () => {
+      const adapter = makeRepo(mode.useStateDir);
+      await adapter.saveAttempt(makeAttempt());
+      const created = (await adapter.findAttemptById('att-1'))!;
+      await adapter.saveAttempt({
+        ...created,
+        state: 'running',
+        sessionId: 'ses-1',
+        revision: nextAttemptRevision(created),
+      });
+      const stored = (await adapter.findAttemptById('att-1'))!;
+
+      await expect(adapter.saveAttempt({ ...stored, revision: 3 })).rejects.toSatisfy(
+        (error: unknown) =>
+          error instanceof AttemptRevisionConflictError &&
+          error.message ===
+            'Stale attempt revision for att-1: stored 1, write must be 2, got 3',
+      );
+    });
+
     it(`still guards immutable identity before revision checks (${mode.label})`, async () => {
       const adapter = makeRepo(mode.useStateDir);
       await adapter.saveAttempt(makeAttempt());

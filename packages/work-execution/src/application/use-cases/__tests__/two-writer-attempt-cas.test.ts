@@ -210,6 +210,9 @@ describe('attempt revision CAS two-writer race (reconcile vs stop)', () => {
       // The post-conflict retry checks the fresh state before contacting
       // the runner again, so inspectSession ran exactly once.
       expect(inspectCount).toBe(1);
+      // The header promises capacity is released once: stop released it,
+      // reconcile's refusal released nothing.
+      expect(journal.releaseCount).toBe(1);
     } finally {
       await fs.rm(stateDir, { recursive: true, force: true });
     }

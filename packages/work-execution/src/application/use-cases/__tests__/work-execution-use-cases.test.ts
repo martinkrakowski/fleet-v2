@@ -3191,8 +3191,8 @@ describe('attempt revision compare-and-swap retry', () => {
       (entry) =>
         entry.status === 'ambiguous' &&
         entry.sessionId === 'session-1' &&
-        entry.detail.includes('second revision conflict') &&
-        entry.detail.includes('session-1'),
+        (entry.detail ?? '').includes('second revision conflict') &&
+        (entry.detail ?? '').includes('session-1'),
     );
     expect(ambiguous).toHaveLength(1);
     expect(journal.heldFor('attempt-1')).toBe(true);
@@ -3237,8 +3237,8 @@ describe('attempt revision compare-and-swap retry', () => {
       (entry) =>
         entry.status === 'ambiguous' &&
         entry.sessionId === 'session-1' &&
-        entry.detail.includes('second revision conflict') &&
-        entry.detail.includes('session-1'),
+        (entry.detail ?? '').includes('second revision conflict') &&
+        (entry.detail ?? '').includes('session-1'),
     );
     expect(ambiguous).toHaveLength(1);
     expect(journal.heldFor('attempt-1')).toBe(true);

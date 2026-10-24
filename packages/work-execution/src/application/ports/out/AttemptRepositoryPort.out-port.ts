@@ -12,8 +12,10 @@ import type { AttemptStateValue } from '../../../domain/value-objects/AttemptSta
  * Thrown when a save of an existing attempt is not built on the stored
  * revision. Writers must chain from the record they read, so their revision is
  * exactly one more than the stored one; anything else is a stale write.
- * `expectedRevision` is the stored revision the writer should have built on;
- * `actualRevision` is the revision the writer sent.
+ * `expectedRevision` is the revision the writer must have read (the stored
+ * revision) and build on; `actualRevision` is the revision the writer sent.
+ * The message names the stored revision, the required next write revision and
+ * what the writer actually sent.
  */
 export class AttemptRevisionConflictError extends Error {
   readonly attemptId: string;
@@ -22,7 +24,7 @@ export class AttemptRevisionConflictError extends Error {
 
   constructor(attemptId: string, expectedRevision: number, actualRevision: number) {
     super(
-      `Stale attempt revision for ${attemptId}: expected ${expectedRevision + 1}, got ${actualRevision}`,
+      `Stale attempt revision for ${attemptId}: stored ${expectedRevision}, write must be ${expectedRevision + 1}, got ${actualRevision}`,
     );
     this.name = 'AttemptRevisionConflictError';
     this.attemptId = attemptId;

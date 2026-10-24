@@ -22,8 +22,9 @@
 #                           check, default 20.
 #
 # Exit codes: 0 ok, 1 failure, 2 usage, 75 refused.
-# The orchestrator runs the project's gate on the fetched branch before pushing it anywhere; this
-# script never pushes to a forge.
+# The orchestrator runs the project's gate on the fetched branch before pushing it anywhere. This
+# script pushes only to the operator-configured AGY_ROUND_SSH/AGY_ROUND_ROOT clone; it has no forge
+# step of its own, and pointing those variables at a forge is an operator error it cannot detect.
 
 set -u
 
@@ -261,6 +262,7 @@ case "$cmd" in
     status_rc=$?
     if [ "$status_rc" -ne 0 ]; then
       echo "agy-round: could not read the clone's status" >&2
+      [ "$rc" -eq 0 ] || exit "$rc"
       exit 1
     fi
     echo '--- git status --porcelain ---'

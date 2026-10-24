@@ -298,13 +298,17 @@ check 'run with no changes is 1 and says no edits' '[ "$(rc)" = 1 ] && grep -q "
 touch "$T/status-fail"; : > "$T/guard-count"; rm -f "$T/agyrun.log"
 run run --name n --model m --brief .lane/x.md
 check 'a failing status ssh exits 1 with could not read status, not no edits' '[ "$(rc)" = 1 ] && grep -q "could not read the clone'\''s status" "$T/e" && ! grep -q "no edits" "$T/e"'
-rm -f "$T/status-fail"
+echo 23 > "$T/agyrc"; : > "$T/guard-count"; rm -f "$T/agyrun.log"
+run run --name n --model m --brief .lane/x.md
+check 'a failing status ssh after a failed agy-run keeps agy-run'\''s exit code' '[ "$(rc)" = 23 ] && grep -q "could not read the clone'\''s status" "$T/e"'
+rm -f "$T/status-fail" "$T/agyrc"
 touch "$T/agy-make-changes"; : > "$T/guard-count"; rm -f "$T/agyrun.log"
 run run --name n --model prov/model-x --brief .lane/x.md
 check 'a run with edits exits 0' '[ "$(rc)" = 0 ]'
 check 'agy-run is passed --mode full' 'grep -A1 -x -- "--mode" "$T/agyrun.log" | grep -qx full'
 check 'agy-run is passed --isolation-declared' 'grep -qx -- "--isolation-declared" "$T/agyrun.log"'
 check 'agy-run is passed --sandbox' 'grep -qx -- "--sandbox" "$T/agyrun.log"'
+check 'agy-run gets exactly the documented argv, nothing more' '[ "$(cat "$T/agyrun.log" | tr "\n" " ")" = "agy-run --dir $T/container/n --model prov/model-x --mode full --isolation-declared --sandbox --timeout 45m --brief .lane/x.md " ]'
 check 'agy-run is never passed --dangerously-skip-permissions' '[ -s "$T/agyrun.log" ] && ! grep -q "dangerously" "$T/agyrun.log"'
 check 'the run prints git status --porcelain' 'grep -q -- "--- git status --porcelain ---" "$T/o"'
 check 'the run prints git diff --stat' 'grep -q -- "--- git diff --stat ---" "$T/o"'
@@ -338,6 +342,7 @@ echo 'edited' >> "$T/container/cm1/a.ts"
 : > "$T/scp.log"
 run commit --name cm1 --message-file "$T/msg" -- ./a.ts
 check 'commit exits 0' '[ "$(rc)" = 0 ]'
+check 'commit really commits the change with the message subject' '[ -z "$(git -C "$T/container/cm1" status --porcelain -- a.ts)" ] && git -C "$T/container/cm1" log -1 --format=%s | grep -qx "$(head -1 "$T/msg")"'
 check 'commit runs scp with -o BatchMode=yes' 'grep -A1 -x -- "-o" "$T/scp.log" | grep -qx "BatchMode=yes"'
 check 'commit uses fixed temp name .lane/agy-round-msg.txt' 'grep -q "\.lane/agy-round-msg\.txt$" "$T/scp.log"'
 

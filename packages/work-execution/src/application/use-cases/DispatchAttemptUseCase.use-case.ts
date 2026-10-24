@@ -627,7 +627,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       state: 'cancelled',
       updatedAtIso: nowIso,
     };
-    const refusedSave = await this.saveRefusedCancelledOrSkip(cancelledAttempt, nowIso);
+    const refusedSave = await this.saveRefusedCancelledOrSkip(cancelledAttempt, nowIso, dispatchingAttempt);
     if (refusedSave) {
       // Someone else moved the attempt on: no save happened, so the
       // reservation is never released and the fresh state is reported.
@@ -759,7 +759,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       const fresh = await deps.attemptRepo.findAttemptById(runningAttempt.id);
       if (
         fresh === null ||
-        canOverwriteAfterConflict(fresh, ['dispatching']) ||
+        canOverwriteAfterConflict(fresh, ['dispatching'], runningAttempt) ||
         (fresh.state === 'reconciling' && fresh.sessionId === null)
       ) {
         const base = fresh ?? runningAttempt;
@@ -835,14 +835,17 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
    * fresh record is re-read once: `cancelled` is rebuilt and the caller may
    * release capacity only when the fresh record is still `dispatching` with
    * no session (a vanished record rebuilds from the pre-conflict record).
-   * Anything else is someone else's move: no save, no capacity release, and
-   * a refused result naming the fresh state, with a journal entry recording
-   * that the refused start found the attempt in that state. A second
-   * conflict propagates.
+   * A `dispatching` fresh record is overwritten only when it is the same
+   * dispatch — same `dispatchRevision` as the `base` dispatching record; a
+   * foreign re-dispatch is never overwritten. Anything else is someone
+   * else's move: no save, no capacity release, and a refused result naming
+   * the fresh state, with a journal entry recording that the refused start
+   * found the attempt in that state. A second conflict propagates.
    */
   private async saveRefusedCancelledOrSkip(
     cancelledAttempt: AttemptRecord,
     nowIso: string,
+    base: AttemptRecord,
   ): Promise<DispatchAttemptResult | null> {
     const deps = this.deps!;
     const build = (base: AttemptRecord): AttemptRecord => ({
@@ -861,12 +864,15 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       const fresh = await deps.attemptRepo.findAttemptById(cancelledAttempt.id);
       if (
         fresh === null ||
-        (canOverwriteAfterConflict(fresh, ['dispatching']) && fresh.sessionId === null)
+        (canOverwriteAfterConflict(fresh, ['dispatching'], base) && fresh.sessionId === null)
       ) {
         await deps.attemptRepo.saveAttempt(build(fresh ?? cancelledAttempt));
         return null;
       }
-      const reason = `Attempt ${cancelledAttempt.id} changed to ${fresh.state} while refusing dispatch; capacity not released`;
+      const reason =
+        fresh.state === 'dispatching'
+          ? `Attempt ${cancelledAttempt.id} attempt re-dispatched concurrently while refusing dispatch; capacity not released`
+          : `Attempt ${cancelledAttempt.id} changed to ${fresh.state} while refusing dispatch; capacity not released`;
       await appendJournalEntry(deps.journal, {
         attemptId: cancelledAttempt.id,
         workOrderId: cancelledAttempt.workOrderId,
@@ -875,7 +881,10 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         recordedAtIso: nowIso,
         status: 'refused',
         sessionId: null,
-        detail: `Refused dispatch start found attempt ${cancelledAttempt.id} in state ${fresh.state}`,
+        detail:
+          fresh.state === 'dispatching'
+            ? `Refused dispatch start found attempt ${cancelledAttempt.id} attempt re-dispatched concurrently`
+            : `Refused dispatch start found attempt ${cancelledAttempt.id} in state ${fresh.state}`,
       });
       return { outcome: 'refused', reason };
     }

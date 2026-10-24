@@ -138,7 +138,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
     });
 
     if (stopResult.outcome === 'terminated' && stopResult.receipt.authoritative === true) {
-      const { record: cancelled, ownsReservation } = await this.saveCancelledOrSkip(
+      const { record: cancelled, ownsReservation, reason } = await this.saveCancelledOrSkip(
         attempt,
         stopResult.receipt,
         nowIso,
@@ -166,6 +166,7 @@ export class StopAttemptUseCase implements StopAttemptPort {
         attempt: cancelled,
         receipt: stopResult.receipt,
         capacityReleased,
+        ...(reason !== undefined ? { reason } : {}),
       };
     }
 
@@ -218,13 +219,20 @@ export class StopAttemptUseCase implements StopAttemptPort {
    * Save the `cancelled` transition after a terminated stop. On a revision
    * conflict the fresh record is re-read once: a terminal fresh record skips
    * the save, otherwise the same transition is rebuilt on top of the fresh
-   * record and saved once. A second conflict propagates.
+   * record and saved once. A foreign re-dispatched `dispatching` fresh
+   * record (different `dispatchRevision`) is never overwritten: the receipt
+   * never lands on it, the reservation is not this stop's to release, and a
+   * reason is surfaced to the caller. A second conflict propagates.
    */
   private async saveCancelledOrSkip(
     attempt: AttemptRecord,
     receipt: NonNullable<AttemptRecord['completionReceipt']>,
     nowIso: string,
-  ): Promise<{ readonly record: AttemptRecord; readonly ownsReservation: boolean }> {
+  ): Promise<{
+    readonly record: AttemptRecord;
+    readonly ownsReservation: boolean;
+    readonly reason?: string;
+  }> {
     const build = (base: AttemptRecord): AttemptRecord => ({
       ...base,
       revision: nextAttemptRevision(base),
@@ -248,7 +256,17 @@ export class StopAttemptUseCase implements StopAttemptPort {
       if (fresh && fresh.sessionId !== null && fresh.sessionId !== attempt.sessionId) {
         // A re-dispatch recorded another live session: the stopped session's
         // receipt never lands on it and its reservation is left alone.
-        return { record: fresh, ownsReservation: false };
+        return { record: fresh, ownsReservation: false, reason: 'attempt re-dispatched concurrently' };
+      }
+      if (
+        fresh &&
+        fresh.state === 'dispatching' &&
+        !canOverwriteAfterConflict(fresh, ['dispatching'], attempt)
+      ) {
+        // A concurrent re-dispatch took the attempt over while this stop was
+        // running: the record stays `dispatching`, the receipt never lands
+        // on it, and the reservation is not this stop's to release.
+        return { record: fresh, ownsReservation: false, reason: 'attempt re-dispatched concurrently' };
       }
       const rebuilt = build(fresh ?? attempt);
       await this.deps!.attemptRepo.saveAttempt(rebuilt);

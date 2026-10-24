@@ -3458,6 +3458,129 @@ describe('attempt revision compare-and-swap retry', () => {
     expect(journal.heldFor('attempt-1')).toBe(true);
   });
 
+  it('dispatch refused start conflicts with a foreign re-dispatching record: refused, no cancelled save, capacity kept', async () => {
+    const freshDispatching = storedAttempt({
+      state: 'dispatching',
+      sessionId: null,
+      dispatchRevision: 99,
+      revision: 5,
+      updatedAtIso: '2026-10-15T08:06:00.000Z',
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      conflictOnSave: 2,
+      freshAfterConflict: freshDispatching,
+    });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner({
+      startResult: { outcome: 'refused', reason: 'no seat available' },
+    });
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(runner.startCalls).toHaveLength(1);
+    expect(result.outcome).toBe('refused');
+    if (result.outcome === 'refused') {
+      expect(result.reason).toContain('attempt re-dispatched concurrently');
+    }
+    expect(attemptRepo.saveCalls).toBe(2);
+    expect(attemptRepo.attempts.get('attempt-1')).toEqual(freshDispatching);
+    expect(journal.releaseCount).toBe(0);
+    expect(journal.heldFor('attempt-1')).toBe(true);
+  });
+
+  it('dispatch refused start conflicts with a same-writer dispatching record (usage bump): cancelled rebuilt and capacity released', async () => {
+    const freshDispatching = storedAttempt({
+      state: 'dispatching',
+      sessionId: null,
+      dispatchRevision: 0,
+      revision: 5,
+      updatedAtIso: '2026-10-15T08:06:00.000Z',
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      conflictOnSave: 2,
+      freshAfterConflict: freshDispatching,
+    });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner({
+      startResult: { outcome: 'refused', reason: 'no seat available' },
+    });
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(runner.startCalls).toHaveLength(1);
+    expect(result.outcome).toBe('refused');
+    const stored = attemptRepo.attempts.get('attempt-1');
+    expect(stored?.state).toBe('cancelled');
+    expect(stored?.dispatchRevision).toBe(0);
+    expect(journal.releaseCount).toBe(1);
+    expect(journal.heldFor('attempt-1')).toBe(false);
+  });
+
+  it('stop conflicts with a foreign re-dispatching record: capacity kept, record left dispatching, reason mentions re-dispatched', async () => {
+    const seed = storedAttempt({ state: 'running' });
+    const freshDispatching = storedAttempt({
+      state: 'dispatching',
+      sessionId: null,
+      dispatchRevision: 99,
+      revision: 5,
+      updatedAtIso: '2026-10-15T08:06:00.000Z',
+    });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      seed,
+      conflictOnSave: 1,
+      freshAfterConflict: freshDispatching,
+    });
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const receipt = completionReceipt({ stoppedByRequest: true });
+    const runner = makeRunner({ stopResult: { outcome: 'terminated', receipt } });
+    const useCase = new StopAttemptUseCase({ attemptRepo, journal, runner: runner.port });
+
+    const result = await useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('terminated');
+    if (result.outcome === 'terminated') {
+      expect(result.capacityReleased).toBe(false);
+      expect(result.reason).toContain('attempt re-dispatched concurrently');
+      expect(result.attempt.state).toBe('dispatching');
+      expect(result.attempt.sessionId).toBeNull();
+    }
+    expect(attemptRepo.saveCalls).toBe(1);
+    expect(attemptRepo.attempts.get('attempt-1')).toEqual(freshDispatching);
+    expect(journal.releaseCount).toBe(0);
+    expect(journal.heldFor('attempt-1')).toBe(true);
+  });
+
   it('dispatch running-save rebuilt after a conflict returns the stored revision', async () => {
     const attemptRepo = makeFailingSaveAttemptRepo({ conflictOnSave: 2 });
     const workOrderRepo = makeWorkOrderRepo();
@@ -3490,7 +3613,21 @@ describe('attempt revision compare-and-swap retry', () => {
   });
 
   it('canOverwriteAfterConflict allows only the states the transition may start from', () => {
-    expect(canOverwriteAfterConflict(storedAttempt({ state: 'dispatching' }), ['dispatching'])).toBe(true);
+    expect(
+      canOverwriteAfterConflict(
+        storedAttempt({ state: 'dispatching', dispatchRevision: 1 }),
+        ['dispatching'],
+        storedAttempt({ state: 'dispatching', dispatchRevision: 1 }),
+      ),
+    ).toBe(true);
+    expect(
+      canOverwriteAfterConflict(
+        storedAttempt({ state: 'dispatching', dispatchRevision: 2 }),
+        ['dispatching'],
+        storedAttempt({ state: 'dispatching', dispatchRevision: 1 }),
+      ),
+    ).toBe(false);
+    expect(canOverwriteAfterConflict(storedAttempt({ state: 'dispatching' }), ['dispatching'])).toBe(false);
     expect(canOverwriteAfterConflict(storedAttempt({ state: 'running' }), ['running', 'reconciling'])).toBe(true);
     expect(canOverwriteAfterConflict(storedAttempt({ state: 'ended' }), ['running', 'reconciling'])).toBe(false);
     expect(

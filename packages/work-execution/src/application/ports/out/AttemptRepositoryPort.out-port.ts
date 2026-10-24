@@ -37,17 +37,30 @@ export function nextAttemptRevision(record: AttemptRecord): number {
 }
 
 /**
- * The one and only gate for rebuilding a transition after a revision
- * conflict: the fresh record may be overwritten only when its state is one of
- * the states the original transition was allowed to start from. Anything
- * else means someone else moved the attempt on, so the state must never be
- * overwritten. A missing fresh record is decided by the caller, not here.
+ * The gate for state-based overwrite decisions after a revision conflict: the
+ * fresh record may be overwritten only when its state is one of the states
+ * the original transition was allowed to start from. Terminal-state checks
+ * elsewhere use `isTerminalAttempt`. Same state is not the same writer — a
+ * `dispatching` record from another dispatch (different `dispatchRevision`)
+ * is foreign and never overwritten. A missing fresh record is decided by the
+ * caller, not here.
  */
 export function canOverwriteAfterConflict(
   fresh: AttemptRecord | null,
   expectedFrom: readonly AttemptStateValue[],
+  base?: AttemptRecord,
 ): boolean {
-  return fresh !== null && expectedFrom.includes(fresh.state);
+  if (fresh === null || !expectedFrom.includes(fresh.state)) {
+    return false;
+  }
+  if (fresh.state === 'dispatching') {
+    return (
+      base !== undefined &&
+      fresh.dispatchRevision !== undefined &&
+      fresh.dispatchRevision === base.dispatchRevision
+    );
+  }
+  return true;
 }
 
 export interface AttemptRepositoryPort {

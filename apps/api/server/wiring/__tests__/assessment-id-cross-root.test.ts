@@ -92,7 +92,11 @@ function makeAttempt() {
  * the evidence-and-acceptance adapters directly (the CLI's write path), with
  * no owner-decision doors recorded.
  */
-async function storeAcceptedAssessment(stateDir: string, assessmentId: string) {
+async function storeAcceptedAssessment(
+  stateDir: string,
+  assessmentId: string,
+  recordAttemptId: string = ATTEMPT_ID,
+) {
   const evidence = createConfiguredEvidenceUseCases(
     { stateDir, installation: makeInstallation() },
     {
@@ -108,7 +112,7 @@ async function storeAcceptedAssessment(stateDir: string, assessmentId: string) {
   const verified = await evidence.requestVerification.execute({
     assessmentId,
     projectId: PROJECT_ID,
-    attemptId: ATTEMPT_ID,
+    attemptId: recordAttemptId,
     candidateHeadSha: HEAD_SHA,
     policyRevision: POLICY_REVISION,
     hostId: "host-1",
@@ -123,7 +127,7 @@ async function storeAcceptedAssessment(stateDir: string, assessmentId: string) {
       id: `vr-${assessmentId}-1`,
       assessmentId,
       projectId: PROJECT_ID,
-      attemptId: ATTEMPT_ID,
+      attemptId: recordAttemptId,
       candidateHeadSha: HEAD_SHA,
       hostId: "host-1",
       procedureName: "typecheck",
@@ -142,7 +146,7 @@ async function storeAcceptedAssessment(stateDir: string, assessmentId: string) {
       id: `rr-${assessmentId}-1`,
       assessmentId,
       projectId: PROJECT_ID,
-      attemptId: ATTEMPT_ID,
+      attemptId: recordAttemptId,
       candidateHeadSha: HEAD_SHA,
       reviewerModel: REVIEWER_MODEL,
       implementerModel: IMPLEMENTER_MODEL,
@@ -290,6 +294,33 @@ describe("assessment id cross-root (L9 M17)", () => {
       for (const [name, content] of before) {
         expect(after.get(name)).toBe(content);
       }
+    } finally {
+      configureFleetApiRuntime(null);
+    }
+  });
+
+  it("a record stored under the bare id but naming another attempt is read as not-found", async () => {
+    const stateDir = await makeTempDir();
+
+    // The record lives under the bare attempt id (legacy state) but its
+    // attemptId field names a DIFFERENT attempt: it is that attempt's
+    // evidence, so this attempt's read must report not-found.
+    await storeAcceptedAssessment(stateDir, ATTEMPT_ID, "another-attempt");
+
+    await writeFile(join(stateDir, "attempts.json"), `${JSON.stringify([makeAttempt()], null, 2)}\n`, "utf8");
+
+    configureFleetApiRuntime({ stateDir });
+    try {
+      const work = workComposition();
+
+      const acceptanceEvidencePort = (work.executeAuthorizedForgeAction as unknown as {
+        deps: { acceptanceEvidencePort: AcceptanceEvidencePort };
+      }).deps.acceptanceEvidencePort;
+      const read = await acceptanceEvidencePort.readAcceptance({
+        attemptId: ATTEMPT_ID,
+        candidateHeadSha: HEAD_SHA,
+      });
+      expect(read.outcome).toBe("not-found");
     } finally {
       configureFleetApiRuntime(null);
     }

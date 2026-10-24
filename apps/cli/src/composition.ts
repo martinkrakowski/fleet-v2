@@ -1167,6 +1167,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       }
       // No head-only fallback: an assessment that is not bound to this attempt
       // is another attempt's evidence, and this attempt has none.
+      if (
+        inspected.outcome === 'found' &&
+        inspected.assessment.attemptId !== request.attemptId
+      ) {
+        return {
+          outcome: 'not-found',
+          reason: `No acceptance assessment found for head ${request.candidateHeadSha}`,
+        };
+      }
       if (inspected.outcome === 'found') {
         return {
           outcome: 'found',

@@ -37,6 +37,23 @@ export interface ReconcileAttemptDependencies {
 type JournalEntryDraft = Omit<ActionJournalEntryRecord, 'id'>;
 
 /** Append one journal entry with an identity derived from the attempt's history. */
+/**
+ * True when `detail` names `sessionId` as a whole token: the id is bounded by
+ * the start or end of the text or by a character that cannot be part of a
+ * session id, so `ses_a` never matches inside `ses_ab`.
+ */
+function detailNamesSession(detail: string, sessionId: string): boolean {
+  const isIdChar = (ch: string | undefined): boolean =>
+    ch !== undefined && /[A-Za-z0-9_-]/.test(ch);
+  let from = 0;
+  for (;;) {
+    const at = detail.indexOf(sessionId, from);
+    if (at < 0) return false;
+    if (!isIdChar(detail[at - 1]) && !isIdChar(detail[at + sessionId.length])) return true;
+    from = at + 1;
+  }
+}
+
 async function appendJournalEntry(
   journal: ExecutionJournalPort,
   draft: JournalEntryDraft,
@@ -184,11 +201,15 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
         const observedId = worktreeState.sessionId;
         // Adoption has an ownership check (brief-fix2 item 2b): the id is
         // adopted only when this attempt's own history named it — a journal
-        // entry for this attempt with sessionId === id, or an ambiguous entry
-        // whose detail contains the id. An id that appears only in a blocked
-        // entry's observedSessionIds is evidence, never proof, and never
-        // names. The agy runner reports only that a lane runs and derives a
-        // synthetic id from the attempt id, so that id is never adoptable.
+        // entry for this attempt with sessionId === id, or an ambiguous
+        // DISPATCH entry whose detail names the id as a whole token (how an
+        // ambiguous start records the session it may have created). Reconcile
+        // and stop entries never name: a refusal below writes the id into its
+        // own detail, and that must not make the next reconcile adopt it. An
+        // id that appears only in a blocked entry's observedSessionIds is
+        // evidence, never proof, and never names. The agy runner reports only
+        // that a lane runs and derives a synthetic id from the attempt id, so
+        // that id is never adoptable.
         const syntheticAgyId = `agy-${attempt.id}`;
         let refusalReason: string | undefined;
         if (observedId === syntheticAgyId) {
@@ -199,9 +220,10 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
             history.some((entry) => entry.sessionId === observedId) ||
             history.some(
               (entry) =>
+                entry.action === 'dispatch' &&
                 entry.status === 'ambiguous' &&
                 entry.detail !== null &&
-                entry.detail.includes(observedId),
+                detailNamesSession(entry.detail, observedId),
             );
           if (!namedByHistory) {
             refusalReason = `Worktree runs session ${observedId}, which attempt ${attempt.id} never started; run 'attempt stop' to abort it`;

@@ -1943,6 +1943,25 @@ describe('DispatchAttemptUseCase', () => {
     expect(setup.journal.entries[1]?.detail ?? '').not.toContain('ses_observed_1');
   });
 
+  it('records an empty observedSessionIds on the blocked dispatch entry when the worktree is idle', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        startResult: {
+          outcome: 'blocked',
+          reason: 'Worktree already has an active session (exit 75)',
+        },
+        worktreeState: { state: 'idle' },
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('blocked');
+    expect(setup.journal.entries[1]?.observedSessionIds).toEqual([]);
+  });
+
   it('omits observedSessionIds from the blocked dispatch entry when the worktree state is unknown', async () => {
     const setup = makeDispatchSetup({
       runnerOptions: {
@@ -2805,6 +2824,90 @@ describe('ReconcileAttemptUseCase', () => {
     expect(result.attempt.state).toBe('running');
     expect(result.attempt.sessionId).toBe('ses_from_amb');
     expect(setup.attemptRepo.attempts.get('attempt-1')?.sessionId).toBe('ses_from_amb');
+  });
+
+  // A refusal journals the foreign id in its own detail; that entry must not
+  // count as the attempt's history naming it on the next reconcile.
+  it.each([
+    ['a foreign id with no history', null],
+    ['an id seen only in observedSessionIds', 'observed'],
+  ] as const)('keeps refusing %s on a second reconcile', async (_label, evidence) => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_foreign_2' },
+    });
+    if (evidence === 'observed') {
+      setup.journal.entries.push({
+        id: 'je-blocked-2',
+        attemptId: 'attempt-1',
+        workOrderId: 'wo-1',
+        action: 'dispatch',
+        baseCommit: 'abc123',
+        recordedAtIso: '2026-10-15T08:01:00.000Z',
+        status: 'ambiguous',
+        sessionId: null,
+        detail: "Blocked: Worktree already has an active session (exit 75); reservation kept until 'attempt reconcile' or 'attempt stop' resolves the worktree",
+        observedSessionIds: ['ses_foreign_2'],
+      });
+    }
+
+    const first = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+    const second = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(first.outcome).toBe('unknown');
+    expect(second.outcome).toBe('unknown');
+    const stored = setup.attemptRepo.attempts.get('attempt-1');
+    expect(stored?.state).toBe('blocked');
+    expect(stored?.sessionId).toBeNull();
+    expect(stored?.revision ?? 0).toBe(0);
+    expect(setup.journal.releaseCount).toBe(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+  });
+
+  it('does not adopt an id named only in a reconcile entry’s ambiguous detail', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_from_reconcile' },
+    });
+    setup.journal.entries.push({
+      id: 'je-reconcile-1',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'reconcile',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'ambiguous',
+      sessionId: null,
+      detail: 'status exit 3 listed 2 sessions (ses_from_reconcile, ses_other)',
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('unknown');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.sessionId).toBeNull();
+  });
+
+  it('does not adopt an id that a dispatch detail names only as a prefix of a longer id', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_a' },
+    });
+    setup.journal.entries.push({
+      id: 'je-amb-2',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'ambiguous',
+      sessionId: null,
+      detail: 'start was ambiguous: worktree runs ses_ab',
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('unknown');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.sessionId).toBeNull();
   });
 });
 

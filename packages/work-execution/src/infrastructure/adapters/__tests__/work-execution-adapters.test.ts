@@ -432,6 +432,7 @@ describe('ExecutionJournalAdapter', () => {
     ) as Array<Record<string, unknown>>;
     expect(persisted).toHaveLength(1);
     expect(persisted[0]?.held).toBe(false);
+    expect(persisted[0]?.releasedAtIso).toBe('2026-10-15T12:00:00.000Z');
   });
 
   it('persists observedSessionIds on journal entries and round-trips them', async () => {

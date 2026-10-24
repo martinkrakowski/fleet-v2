@@ -150,7 +150,7 @@ describe('CollectAttemptArtifactsUseCase hardening', () => {
     const result = await useCase.collectAttemptArtifacts({
       attemptId: mock.id,
       workOrderId: mock.workOrderId,
-      expectedArtifacts: ['/out/patch.diff'],
+      expectedArtifacts: ['out/patch.diff'],
       completionReceipt: mock.completionReceipt!,
       worktreePath: '/worktrees/different',
     });
@@ -180,7 +180,7 @@ describe('CollectAttemptArtifactsUseCase hardening', () => {
     const result = await useCase.collectAttemptArtifacts({
       attemptId: mock.id,
       workOrderId: mock.workOrderId,
-      expectedArtifacts: ['/out/patch.diff'],
+      expectedArtifacts: ['out/patch.diff'],
       completionReceipt: mock.completionReceipt!,
       baseCommit: 'wrong-base-commit',
     });
@@ -210,7 +210,7 @@ describe('CollectAttemptArtifactsUseCase hardening', () => {
     const result = await useCase.collectAttemptArtifacts({
       attemptId: mock.id,
       workOrderId: mock.workOrderId,
-      expectedArtifacts: ['/out/patch.diff'],
+      expectedArtifacts: ['out/patch.diff'],
       completionReceipt: mock.completionReceipt!,
     });
 
@@ -238,7 +238,7 @@ describe('CollectAttemptArtifactsUseCase hardening', () => {
     const result = await useCase.collectAttemptArtifacts({
       attemptId: mock.id,
       workOrderId: mock.workOrderId,
-      expectedArtifacts: ['/out/patch.diff'],
+      expectedArtifacts: ['out/patch.diff'],
       completionReceipt: mock.completionReceipt!,
       worktreePath: mock.worktreePath,
       baseCommit: mock.baseCommit,

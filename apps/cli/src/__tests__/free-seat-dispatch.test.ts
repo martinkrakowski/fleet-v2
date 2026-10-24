@@ -94,8 +94,9 @@ function initGitRepo(dir: string): string {
 
 function writeManifest(fileName: string, model: string): string {
   const manifestPath = path.join(briefDir, fileName);
-  writeFileSync(manifestPath, JSON.stringify({ modelAssignment: { model } }, null, 2));
-  return manifestPath;
+  const content = JSON.stringify({ modelAssignment: { model } }, null, 2);
+  writeFileSync(manifestPath, content);
+  return content;
 }
 
 function makeWorkOrder(): WorkOrderRecord {
@@ -124,8 +125,16 @@ beforeAll(() => {
   briefDir = path.join(laneRepoDir, '.lane');
   mkdirSync(briefDir, { recursive: true });
   baseCommit = initGitRepo(laneRepoDir);
-  writeManifest('free-manifest.json', FREE_MODEL);
-  writeManifest('paid-manifest.json', PAID_MODEL);
+  const freeContent = writeManifest('free-manifest.json', FREE_MODEL);
+  freeManifest = {
+    path: path.join(briefDir, 'free-manifest.json'),
+    digest: simpleDeterministicHexDigest(`${freeContent}\n${freeContent}`),
+  };
+  const paidContent = writeManifest('paid-manifest.json', PAID_MODEL);
+  paidManifest = {
+    path: path.join(briefDir, 'paid-manifest.json'),
+    digest: simpleDeterministicHexDigest(`${paidContent}\n${paidContent}`),
+  };
 });
 
 afterAll(() => {
@@ -162,13 +171,12 @@ describe('free-seat dispatch wiring at the CLI composition boundary', () => {
     await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder());
     await reserveAttempt(rt);
 
-    const freeManifest = path.join(briefDir, 'free-manifest.json');
     const result = await rt.execution.dispatchAttempt.dispatchAttempt({
       attemptId: ATTEMPT_ID,
       workOrderId: WORK_ORDER_ID,
       worktreePath: laneRepoDir,
-      briefPackagePath: freeManifest,
-      briefDigest: 'digest-free',
+      briefPackagePath: freeManifest.path,
+      briefDigest: freeManifest.digest,
       baseCommit,
       stepLimit: 40,
       timeLimitSeconds: 3600,
@@ -195,13 +203,12 @@ describe('free-seat dispatch wiring at the CLI composition boundary', () => {
     await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder());
     await reserveAttempt(rt);
 
-    const paidManifest = path.join(briefDir, 'paid-manifest.json');
     const result = await rt.execution.dispatchAttempt.dispatchAttempt({
       attemptId: ATTEMPT_ID,
       workOrderId: WORK_ORDER_ID,
       worktreePath: laneRepoDir,
-      briefPackagePath: paidManifest,
-      briefDigest: 'digest-paid',
+      briefPackagePath: paidManifest.path,
+      briefDigest: paidManifest.digest,
       baseCommit,
       stepLimit: 40,
       timeLimitSeconds: 3600,

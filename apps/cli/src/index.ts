@@ -134,10 +134,14 @@ function optStr(payload: Payload, key: string): string | undefined {
 /**
  * The assessment id is derived from the attempt, never freely chosen. An
  * explicit override is accepted only when it agrees with the attempt's own
- * assessment id; a mismatching one is refused at the boundary.
+ * assessment id; a mismatching one is refused at the boundary. Commands whose
+ * attempt arrives inside a nested receipt pass that attempt id, so a bare
+ * legacy id cannot be written to by omitting the top-level `attemptId`.
  */
-function evidenceAssessmentId(p: Payload): string {
-  const attemptId = optStr(p, 'attemptId');
+function evidenceAssessmentId(p: Payload, nestedAttemptId?: unknown): string {
+  const nested =
+    typeof nestedAttemptId === 'string' && nestedAttemptId.trim() !== '' ? nestedAttemptId : undefined;
+  const attemptId = optStr(p, 'attemptId') ?? nested;
   const explicit = optStr(p, 'assessmentId');
   const derived = attemptId ? assessmentIdForAttempt(attemptId) : '';
   if (explicit && derived && explicit !== derived) {
@@ -1032,12 +1036,14 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         nowIso: optStr(p, 'nowIso'),
       });
     },
-    'record-verification': async (p, rt) =>
-      rt.evidence.recordVerificationReceipt.recordVerificationReceipt({
-        assessmentId: evidenceAssessmentId(p),
-        receipt: requiredNested<VerificationReceiptRecord>(p, 'receipt', 'evidence record-verification'),
+    'record-verification': async (p, rt) => {
+      const receipt = requiredNested<VerificationReceiptRecord>(p, 'receipt', 'evidence record-verification');
+      return rt.evidence.recordVerificationReceipt.recordVerificationReceipt({
+        assessmentId: evidenceAssessmentId(p, receipt.attemptId),
+        receipt,
         nowIso: optStr(p, 'nowIso'),
-      }),
+      });
+    },
     'request-review': async (p, rt) => {
       const seat = await bindImplementerSeat(rt, p);
       if (!seat.bound) {
@@ -1070,7 +1076,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
       // The receipt's implementer field restates the recorded seat; it is
       // bound, never caller-authored.
       return rt.evidence.recordReviewReceipt.recordReviewReceipt({
-        assessmentId: evidenceAssessmentId(p),
+        assessmentId: evidenceAssessmentId(p, receipt.attemptId),
         receipt: { ...receipt, implementerModel: seat.implementerModel },
         nowIso: optStr(p, 'nowIso'),
       });

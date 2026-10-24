@@ -42,7 +42,7 @@ type JournalEntryDraft = Omit<ActionJournalEntryRecord, 'id'>;
  * the start or end of the text or by a character that cannot be part of a
  * session id, so `ses_a` never matches inside `ses_ab`.
  */
-function detailNamesSession(detail: string, sessionId: string): boolean {
+export function detailNamesSession(detail: string, sessionId: string): boolean {
   if (sessionId.length === 0) return false;
   const isIdChar = (ch: string | undefined): boolean =>
     ch !== undefined && /[A-Za-z0-9_-]/.test(ch);

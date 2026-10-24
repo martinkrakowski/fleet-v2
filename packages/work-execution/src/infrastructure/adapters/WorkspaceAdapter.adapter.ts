@@ -19,13 +19,15 @@
 
 import * as path from 'node:path';
 
-import type {
-  WorktreeInspection,
-  WorktreeInspectionRequest,
-  WorkspacePort,
+import {
+  WorktreePathRefusedError,
+  type WorktreeInspection,
+  type WorktreeInspectionRequest,
+  type WorkspacePort,
 } from '../../application/ports/out/WorkspacePort.out-port.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
+import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { hasRecordedHostName } from './ConfirmRecordedHost.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
 
@@ -218,9 +220,11 @@ export class WorkspaceAdapter implements WorkspacePort {
     relativePath: string,
     recordedHost?: AttemptRunnerRecord | null,
   ): Promise<string | null> {
-    const targetPath = path.isAbsolute(relativePath)
-      ? relativePath
-      : path.join(worktreePath, relativePath);
+    const refusedReason = validateWorktreeRelativePath(relativePath);
+    if (refusedReason !== null) {
+      throw new WorktreePathRefusedError(relativePath, refusedReason);
+    }
+    const targetPath = path.join(worktreePath, relativePath);
     const executor = this.executorFor(recordedHost);
     const result = await executor.run(['cat', targetPath], { timeoutMs: CAT_TIMEOUT_MS });
     // A null exit code (spawn failure, timeout) is a failed read, not an

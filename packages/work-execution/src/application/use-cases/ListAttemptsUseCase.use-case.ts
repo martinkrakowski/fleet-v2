@@ -47,7 +47,12 @@ export class ListAttemptsUseCase implements ListAttemptsPort {
       throw new Error('Not implemented: ListAttemptsUseCase');
     }
 
-    if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    const isPlainObject =
+      typeof input === 'object' &&
+      input !== null &&
+      (Object.getPrototypeOf(input) === Object.prototype ||
+        Object.getPrototypeOf(input) === null);
+    if (!isPlainObject) {
       return { outcome: 'rejected', reason: 'list request must be an object' };
     }
     const record = input as Record<string, unknown>;

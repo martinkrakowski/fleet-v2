@@ -215,8 +215,8 @@ describe('ListAttemptsUseCase', () => {
           updatedAtIso: '2026-10-01T00:00:00.000Z',
         }),
         makeAttempt({
-          id: 'att-2',
-          workOrderId: 'wo-1',
+          id: 'att-4',
+          workOrderId: 'wo-2',
           updatedAtIso: '2026-10-03T00:00:00.000Z',
         }),
         makeAttempt({
@@ -225,8 +225,8 @@ describe('ListAttemptsUseCase', () => {
           updatedAtIso: '2026-10-02T00:00:00.000Z',
         }),
         makeAttempt({
-          id: 'att-4',
-          workOrderId: 'wo-2',
+          id: 'att-2',
+          workOrderId: 'wo-1',
           updatedAtIso: '2026-10-03T00:00:00.000Z',
         }),
       ],
@@ -412,6 +412,25 @@ describe('ListAttemptsUseCase', () => {
     await expect(useCase.execute('x')).resolves.toEqual({
       outcome: 'rejected',
       reason: 'list request must be an object',
+    });
+  });
+
+  it('execute accepts only plain objects, rejecting Date and Array while listing for null-prototype objects', async () => {
+    const { useCase } = makeUseCase({
+      attempts: [makeAttempt({ id: 'att-1' })],
+    });
+    await expect(useCase.execute(new Date())).resolves.toEqual({
+      outcome: 'rejected',
+      reason: 'list request must be an object',
+    });
+    await expect(useCase.execute([])).resolves.toEqual({
+      outcome: 'rejected',
+      reason: 'list request must be an object',
+    });
+    await expect(useCase.execute(Object.create(null))).resolves.toMatchObject({
+      outcome: 'listed',
+      total: 1,
+      truncated: false,
     });
   });
 

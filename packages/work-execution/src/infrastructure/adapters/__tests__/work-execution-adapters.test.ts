@@ -24,7 +24,7 @@ import {
   RUNNER_ENV_ALLOWLIST,
   buildRunnerEnv,
 } from '../ExecutionRunnerAdapter.adapter.js';
-import { AttemptArtifactAdapter } from '../AttemptArtifactAdapter.adapter.js';
+import { AttemptArtifactAdapter, sha256HexDigest } from '../AttemptArtifactAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../AttemptRepositoryAdapter.adapter.js';
 import { BriefAuthoringAdapter } from '../BriefAuthoringAdapter.adapter.js';
 import { ExecutionJournalAdapter } from '../ExecutionJournalAdapter.adapter.js';
@@ -733,6 +733,32 @@ describe('AttemptArtifactAdapter', () => {
 
     const missing = await adapter.readBriefManifest(repoPath, path.join(repoPath, '.lane', 'missing-manifest.json'));
     expect(missing).toBeNull();
+  });
+
+  it('reads a brief file when present, returns null when absent, and refuses ../x or an absolute path', async () => {
+    const repoPath = await createGitRepo();
+    await fs.mkdir(path.join(repoPath, '.lane'), { recursive: true });
+    await fs.writeFile(path.join(repoPath, '.lane', 'brief.md'), '# Frozen brief\n', 'utf8');
+    const adapter = new AttemptArtifactAdapter({ executor: new LocalExecutor() });
+
+    const content = await adapter.readBriefFile(repoPath, '.lane/brief.md');
+    expect(content).toBe('# Frozen brief\n');
+
+    const missing = await adapter.readBriefFile(repoPath, '.lane/missing-brief.md');
+    expect(missing).toBeNull();
+
+    await expect(adapter.readBriefFile(repoPath, '../x')).rejects.toThrow(
+      'Refused worktree-relative path ../x: worktree-relative path must not escape the worktree root',
+    );
+    await expect(adapter.readBriefFile(repoPath, '/etc/passwd')).rejects.toThrow(
+      'Refused worktree-relative path /etc/passwd: worktree-relative path must be relative',
+    );
+  });
+
+  it('computes sha256HexDigest against the known SHA-256 vector', () => {
+    expect(sha256HexDigest('abc')).toBe(
+      'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+    );
   });
 });
 

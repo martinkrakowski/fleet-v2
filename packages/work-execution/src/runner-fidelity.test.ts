@@ -4,6 +4,7 @@ import {
   type SubprocessRunner,
 } from './infrastructure/adapters/ExecutionRunnerAdapter.adapter.js';
 import { DispatchAttemptUseCase } from './application/use-cases/DispatchAttemptUseCase.use-case.js';
+import { simpleDeterministicHexDigest } from './application/use-cases/PrepareBriefPackageUseCase.use-case.js';
 import { ReconcileAttemptUseCase } from './application/use-cases/ReconcileAttemptUseCase.use-case.js';
 import { StopAttemptUseCase } from './application/use-cases/StopAttemptUseCase.use-case.js';
 import { underlyingModelFamily } from '@fleet/evidence-and-acceptance';
@@ -289,8 +290,17 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
 
   describe('2. H2: Record Runner Port & Host Fidelity in Reconcile', () => {
     it('records runner details on the attempt at dispatch', async () => {
+      const prose = '# Frozen brief';
+      const manifest = JSON.stringify({
+        modelAssignment: {
+          model: 'nvidia/z-ai/glm-5.3',
+          variant: 'low',
+          agent: 'lane-agent',
+        },
+      });
+      const briefDigest = simpleDeterministicHexDigest(prose + '\n' + manifest);
       const workOrder = createMockWorkOrder();
-      const attempt = createMockAttempt({ state: 'intent-recorded' });
+      const attempt = createMockAttempt({ state: 'intent-recorded', briefDigest });
       const attempts = new Map<string, AttemptRecord>([[attempt.id, attempt]]);
       const journal = createInMemoryJournal();
 
@@ -319,14 +329,8 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           residueFromEarlierAttempts: [],
           missingExpectedArtifacts: [],
         }),
-        readWorktreeFile: async () =>
-          JSON.stringify({
-            modelAssignment: {
-              model: 'nvidia/z-ai/glm-5.3',
-              variant: 'low',
-              agent: 'lane-agent',
-            },
-          }),
+        readWorktreeFile: async (_worktreePath, relativePath) =>
+          relativePath === '.lane/brief-manifest.json' ? manifest : prose,
       };
 
       const runnerPort: ExecutionRunnerPort = {
@@ -941,6 +945,18 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         listAllAttempts: async () => [...attempts.values()],
       };
 
+      const prose = '# Frozen brief';
+      const manifest = JSON.stringify({
+        modelAssignment: {
+          model: 'nvidia/z-ai/glm-5.3',
+          agent: 'lane-agent',
+          variant: 'default',
+          fallbackModel: 'openai/gpt-4o',
+        },
+        independentReviewer: 'reviewer-seat-1',
+      });
+      const briefDigest = simpleDeterministicHexDigest(prose + '\n' + manifest);
+
       const workspace: WorkspacePort = {
         inspectWorktree: async (req) => ({
           worktreePath: req.worktreePath,
@@ -951,16 +967,8 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           residueFromEarlierAttempts: [],
           missingExpectedArtifacts: [],
         }),
-        readWorktreeFile: async () =>
-          JSON.stringify({
-            modelAssignment: {
-              model: 'nvidia/z-ai/glm-5.3',
-              agent: 'lane-agent',
-              variant: 'default',
-              fallbackModel: 'openai/gpt-4o',
-            },
-            independentReviewer: 'reviewer-seat-1',
-          }),
+        readWorktreeFile: async (_worktreePath, relativePath) =>
+          relativePath === '.lane/brief-manifest.json' ? manifest : prose,
       };
 
       let startedModel: string | undefined;
@@ -1012,18 +1020,18 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         runner: runnerPort,
       });
 
-      return { useCase, attempts, journal, getStartedModel: () => startedModel };
+      return { useCase, attempts, journal, briefDigest, getStartedModel: () => startedModel };
     }
 
     it('refuses an override without a reason', async () => {
-      const { useCase } = setupDispatchWithOverride();
+      const { useCase, briefDigest } = setupDispatchWithOverride();
 
       const result = await useCase.dispatchAttempt({
         attemptId: 'att-1',
         workOrderId: 'wo-1',
         worktreePath: '/worktrees/lane-1',
         briefPackagePath: '.lane/brief.md',
-        briefDigest: 'digest-1',
+        briefDigest,
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
@@ -1040,14 +1048,14 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
     });
 
     it('refuses an override without expiresAtIso (required field)', async () => {
-      const { useCase } = setupDispatchWithOverride();
+      const { useCase, briefDigest } = setupDispatchWithOverride();
 
       const result = await useCase.dispatchAttempt({
         attemptId: 'att-1',
         workOrderId: 'wo-1',
         worktreePath: '/worktrees/lane-1',
         briefPackagePath: '.lane/brief.md',
-        briefDigest: 'digest-1',
+        briefDigest,
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
@@ -1063,14 +1071,14 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
     });
 
     it('refuses an override with empty expiresAtIso', async () => {
-      const { useCase } = setupDispatchWithOverride();
+      const { useCase, briefDigest } = setupDispatchWithOverride();
 
       const result = await useCase.dispatchAttempt({
         attemptId: 'att-1',
         workOrderId: 'wo-1',
         worktreePath: '/worktrees/lane-1',
         briefPackagePath: '.lane/brief.md',
-        briefDigest: 'digest-1',
+        briefDigest,
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
@@ -1087,14 +1095,14 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
     });
 
     it('refuses an expired override', async () => {
-      const { useCase } = setupDispatchWithOverride();
+      const { useCase, briefDigest } = setupDispatchWithOverride();
 
       const result = await useCase.dispatchAttempt({
         attemptId: 'att-1',
         workOrderId: 'wo-1',
         worktreePath: '/worktrees/lane-1',
         briefPackagePath: '.lane/brief.md',
-        briefDigest: 'digest-1',
+        briefDigest,
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
@@ -1116,14 +1124,14 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         state: 'intent-recorded',
         reviewerSeat: 'openrouter/z-ai/glm-5.3',
       });
-      const { useCase } = setupDispatchWithOverride(existing);
+      const { useCase, briefDigest } = setupDispatchWithOverride(existing);
 
       const result = await useCase.dispatchAttempt({
         attemptId: existing.id,
         workOrderId: 'wo-1',
         worktreePath: '/worktrees/lane-1',
         briefPackagePath: '.lane/brief.md',
-        briefDigest: 'digest-1',
+        briefDigest,
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
@@ -1145,14 +1153,14 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         state: 'intent-recorded',
         reviewerSeat: 'anthropic/claude-3-5-sonnet',
       });
-      const { useCase, attempts, journal, getStartedModel } = setupDispatchWithOverride(existing);
+      const { useCase, attempts, journal, briefDigest, getStartedModel } = setupDispatchWithOverride(existing);
 
       const result = await useCase.dispatchAttempt({
         attemptId: existing.id,
         workOrderId: 'wo-1',
         worktreePath: '/worktrees/lane-1',
         briefPackagePath: '.lane/brief.md',
-        briefDigest: 'digest-1',
+        briefDigest,
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
@@ -1661,6 +1669,14 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
 
     it('resolves seat from frozen brief manifest on remote worktree read through port', async () => {
       let readWorktreeArgs: { worktreePath: string; relativePath: string } | undefined;
+      const prose = '# Frozen brief';
+      const manifest = JSON.stringify({
+        modelAssignment: {
+          model: 'remote-manifest-seat-model',
+          agent: 'remote-agent',
+          variant: 'fast',
+        },
+      });
       const { useCase, getStartedSessionReq, attempts } = setupDispatchWithCustomWorkspace({
         inspectWorktree: async (req) => ({
           worktreePath: req.worktreePath,
@@ -1673,13 +1689,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         }),
         readWorktreeFile: async (worktreePath, relativePath) => {
           readWorktreeArgs = { worktreePath, relativePath };
-          return JSON.stringify({
-            modelAssignment: {
-              model: 'remote-manifest-seat-model',
-              agent: 'remote-agent',
-              variant: 'fast',
-            },
-          });
+          return relativePath === '.lane/brief-manifest.json' ? manifest : prose;
         },
       });
 
@@ -1688,7 +1698,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         workOrderId: 'wo-1',
         worktreePath: '/ssh-remote-worktree/lane-1',
         briefPackagePath: '.lane/brief.md',
-        briefDigest: 'digest-1',
+        briefDigest: simpleDeterministicHexDigest(prose + '\n' + manifest),
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
@@ -1794,6 +1804,9 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
     });
 
     it('compares seat override expiry with Date.parse correctly across timezones', async () => {
+      const prose = '# Frozen brief';
+      const manifest = JSON.stringify({ modelAssignment: { model: 'seat-1' } });
+      const briefDigest = simpleDeterministicHexDigest(prose + '\n' + manifest);
       const { useCase } = setupDispatchWithCustomWorkspace({
         inspectWorktree: async (req) => ({
           worktreePath: req.worktreePath,
@@ -1804,7 +1817,8 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
           residueFromEarlierAttempts: [],
           missingExpectedArtifacts: [],
         }),
-        readWorktreeFile: async () => JSON.stringify({ modelAssignment: { model: 'seat-1' } }),
+        readWorktreeFile: async (_worktreePath, relativePath) =>
+          relativePath === '.lane/brief-manifest.json' ? manifest : prose,
       });
 
       const resultExpired = await useCase.dispatchAttempt({
@@ -1812,7 +1826,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         workOrderId: 'wo-1',
         worktreePath: '/worktrees/lane-1',
         briefPackagePath: '.lane/brief.md',
-        briefDigest: 'digest-1',
+        briefDigest,
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,
@@ -1833,7 +1847,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
         workOrderId: 'wo-1',
         worktreePath: '/worktrees/lane-1',
         briefPackagePath: '.lane/brief.md',
-        briefDigest: 'digest-1',
+        briefDigest,
         baseCommit: 'commit-base-123',
         stepLimit: 100,
         timeLimitSeconds: 3600,

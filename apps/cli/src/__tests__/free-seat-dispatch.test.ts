@@ -18,6 +18,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createFleetCliRuntime } from '../composition.js';
 import type { FleetInstallation } from '@fleet/installation';
+import { sha256HexDigest, simpleDeterministicHexDigest } from '@fleet/work-execution';
 import type { WorkOrderRecord } from '@fleet/work-execution';
 
 const ATTEMPT_ID = 'att-free-seat-dispatch';
@@ -73,6 +74,8 @@ let suiteDir: string;
 let laneRepoDir: string;
 let briefDir: string;
 let baseCommit: string;
+let freeManifest: { path: string; digest: string; fnvDigest: string };
+let paidManifest: { path: string; digest: string; fnvDigest: string };
 
 function initGitRepo(dir: string): string {
   mkdirSync(dir, { recursive: true });
@@ -89,10 +92,22 @@ function initGitRepo(dir: string): string {
   return execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
 }
 
-function writeManifest(fileName: string, model: string): string {
-  const manifestPath = path.join(briefDir, fileName);
-  writeFileSync(manifestPath, JSON.stringify({ modelAssignment: { model } }, null, 2));
-  return manifestPath;
+function writeBriefPackage(
+  proseFileName: string,
+  model: string,
+): { path: string; digest: string; fnvDigest: string } {
+  const prosePath = path.join(briefDir, proseFileName);
+  const manifestPath = path.join(briefDir, proseFileName.replace(/\.md$/, '-manifest.json'));
+  const prose = `# Frozen brief for ${model}\n`;
+  const manifest = JSON.stringify({ modelAssignment: { model } }, null, 2);
+  writeFileSync(prosePath, prose);
+  writeFileSync(manifestPath, manifest);
+  const combined = `${prose}\n${manifest}`;
+  return {
+    path: prosePath,
+    digest: sha256HexDigest(combined),
+    fnvDigest: simpleDeterministicHexDigest(combined),
+  };
 }
 
 function makeWorkOrder(): WorkOrderRecord {
@@ -121,8 +136,8 @@ beforeAll(() => {
   briefDir = path.join(laneRepoDir, '.lane');
   mkdirSync(briefDir, { recursive: true });
   baseCommit = initGitRepo(laneRepoDir);
-  writeManifest('free-manifest.json', FREE_MODEL);
-  writeManifest('paid-manifest.json', PAID_MODEL);
+  freeManifest = writeBriefPackage('free-brief.md', FREE_MODEL);
+  paidManifest = writeBriefPackage('paid-brief.md', PAID_MODEL);
 });
 
 afterAll(() => {
@@ -159,13 +174,12 @@ describe('free-seat dispatch wiring at the CLI composition boundary', () => {
     await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder());
     await reserveAttempt(rt);
 
-    const freeManifest = path.join(briefDir, 'free-manifest.json');
     const result = await rt.execution.dispatchAttempt.dispatchAttempt({
       attemptId: ATTEMPT_ID,
       workOrderId: WORK_ORDER_ID,
       worktreePath: laneRepoDir,
-      briefPackagePath: freeManifest,
-      briefDigest: 'digest-free',
+      briefPackagePath: freeManifest.path,
+      briefDigest: freeManifest.digest,
       baseCommit,
       stepLimit: 40,
       timeLimitSeconds: 3600,
@@ -192,13 +206,12 @@ describe('free-seat dispatch wiring at the CLI composition boundary', () => {
     await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder());
     await reserveAttempt(rt);
 
-    const paidManifest = path.join(briefDir, 'paid-manifest.json');
     const result = await rt.execution.dispatchAttempt.dispatchAttempt({
       attemptId: ATTEMPT_ID,
       workOrderId: WORK_ORDER_ID,
       worktreePath: laneRepoDir,
-      briefPackagePath: paidManifest,
-      briefDigest: 'digest-paid',
+      briefPackagePath: paidManifest.path,
+      briefDigest: paidManifest.digest,
       baseCommit,
       stepLimit: 40,
       timeLimitSeconds: 3600,
@@ -212,5 +225,29 @@ describe('free-seat dispatch wiring at the CLI composition boundary', () => {
     const saved = await rt.execution.attemptRepository.findAttemptById(ATTEMPT_ID);
     expect(saved?.runner?.model).toBe(PAID_MODEL);
     expect(saved?.runner?.useFreeSeats).toBe(false);
+  });
+
+  it('refuses a dispatch whose digest is the FNV fallback instead of SHA-256', async () => {
+    const { rt, runnerStarts } = makeRuntime();
+    await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder());
+    await reserveAttempt(rt);
+
+    const result = await rt.execution.dispatchAttempt.dispatchAttempt({
+      attemptId: ATTEMPT_ID,
+      workOrderId: WORK_ORDER_ID,
+      worktreePath: laneRepoDir,
+      briefPackagePath: paidManifest.path,
+      briefDigest: paidManifest.fnvDigest,
+      baseCommit,
+      stepLimit: 40,
+      timeLimitSeconds: 3600,
+      nowIso: '2026-10-15T10:00:00.000Z',
+    });
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: `Frozen brief digest mismatch for attempt ${ATTEMPT_ID}: the brief or its manifest changed after it was prepared; run 'brief prepare' again`,
+    });
+    expect(runnerStarts()).toBe(0);
   });
 });

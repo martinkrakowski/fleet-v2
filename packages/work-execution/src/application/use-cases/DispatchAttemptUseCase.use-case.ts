@@ -6,6 +6,10 @@
  * journal before the runner subprocess is started. An unknown start outcome
  * keeps the reservation and enters reconciliation; it is never retried
  * blindly and never releases capacity.
+ *
+ * Dispatch recomputes the frozen brief digest from the worktree's prose and
+ * manifest before any save or runner contact and refuses a mismatch (D3): an
+ * edited brief never dispatches.
  */
 
 import type {
@@ -16,6 +20,7 @@ import type {
 import { parseSeatTool } from '../../domain/execution-records.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
+import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
 import type { DispatchAttemptPort, DispatchAttemptRequest, DispatchAttemptResult } from '../ports/in/DispatchAttemptPort.in-port.js';
 import type { RunnerIsolationCapabilities } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
@@ -41,6 +46,12 @@ export interface DispatchAttemptDependencies {
   readonly runner: ExecutionRunnerPort;
   readonly observation?: ExecutionObservationPort;
   readonly artifactPort?: AttemptArtifactPort;
+  /**
+   * Infrastructure digest for the frozen-brief recompute; when absent the
+   * pure helper is used, so the application layer stays free of Node
+   * built-ins.
+   */
+  readonly computeDigest?: (content: string) => string;
   /**
    * Optional runner-kind selection (O14c1). When wired, an attempt whose seat
    * tool has no implemented runner (e.g. `agy`) refuses before any spawn.
@@ -149,6 +160,24 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           reason: `'${field}' must not be specified; the seat is determined by the frozen brief manifest`,
         };
       }
+    }
+
+    // D3: a dispatch must carry the digest the frozen brief package was
+    // prepared with; without it nothing can prove the brief did not change
+    // between preparation and dispatch (for example a fix attempt whose
+    // record has no digest).
+    if (typeof request.briefDigest !== 'string' || request.briefDigest.trim() === '') {
+      return {
+        outcome: 'refused',
+        reason: "briefDigest is required: dispatch only a brief prepared by 'brief prepare'",
+      };
+    }
+
+    if (typeof request.briefPackagePath !== 'string' || !request.briefPackagePath.endsWith('.md')) {
+      return {
+        outcome: 'refused',
+        reason: `briefPackagePath must name the frozen prose (.md), got ${String(request.briefPackagePath)}`,
+      };
     }
 
     // Request-validation entry check: every expected-artifact path must be a
@@ -273,7 +302,6 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     let manifestRaw: string | null = null;
     let parsedManifest: Record<string, unknown> | null = null;
     const manifestCandidates = [
-      request.briefPackagePath,
       request.briefPackagePath.replace(/\.md$/, '-manifest.json'),
       '.lane/brief-manifest.json',
     ];
@@ -316,6 +344,45 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       return {
         outcome: 'refused',
         reason: `Unable to read frozen brief manifest for attempt ${request.attemptId}`,
+      };
+    }
+
+    // D3: recompute the frozen brief digest from the exact bytes the worktree
+    // still holds — the prose at the brief package path plus the chosen
+    // manifest — and refuse when it differs from the request's digest. This
+    // runs before any attempt save, journal write, capacity change or runner
+    // contact, so an edited brief never dispatches.
+    let proseRaw: string | null = null;
+    try {
+      if (this.deps.artifactPort?.readBriefFile) {
+        proseRaw = await this.deps.artifactPort.readBriefFile(
+          request.worktreePath,
+          request.briefPackagePath,
+          this.deps.runner.describeRunner?.() ?? null,
+        );
+      } else if (this.deps.workspace.readWorktreeFile) {
+        proseRaw = await this.deps.workspace.readWorktreeFile(
+          request.worktreePath,
+          request.briefPackagePath,
+        );
+      }
+    } catch (error) {
+      return {
+        outcome: 'refused',
+        reason: `Failed to read the frozen brief: ${String(error)}`,
+      };
+    }
+    if (proseRaw === null) {
+      return {
+        outcome: 'refused',
+        reason: `Unable to read the frozen brief at ${request.briefPackagePath} to check its digest`,
+      };
+    }
+    const computeDigest = this.deps.computeDigest ?? simpleDeterministicHexDigest;
+    if (computeDigest(proseRaw + '\n' + manifestRaw) !== request.briefDigest) {
+      return {
+        outcome: 'refused',
+        reason: `Frozen brief digest mismatch for attempt ${request.attemptId}: the brief or its manifest changed after it was prepared; run 'brief prepare' again`,
       };
     }
 

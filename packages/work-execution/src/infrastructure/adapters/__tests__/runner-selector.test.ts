@@ -14,6 +14,7 @@ import type { WorkOrderRepositoryPort } from '../../../application/ports/out/Wor
 import type { WorkspacePort } from '../../../application/ports/out/WorkspacePort.out-port.js';
 import { AttemptRepositoryAdapter } from '../AttemptRepositoryAdapter.adapter.js';
 import { DispatchAttemptUseCase } from '../../../application/use-cases/DispatchAttemptUseCase.use-case.js';
+import { simpleDeterministicHexDigest } from '../../../application/use-cases/PrepareBriefPackageUseCase.use-case.js';
 import { RunnerSelectorAdapter } from '../RunnerSelectorAdapter.adapter.js';
 import type { RunnerSelectorLaneRunnerHost } from '../RunnerSelectorAdapter.adapter.js';
 import type { RunnerSelectorPort } from '../../../application/ports/out/RunnerSelectorPort.out-port.js';
@@ -364,6 +365,12 @@ function makeRunnerSpy() {
   return { startCalls, port };
 }
 
+const FAKE_BRIEF_PROSE = '# Frozen brief';
+const FAKE_BRIEF_MANIFEST = JSON.stringify({
+  modelAssignment: { model: 'm', agent: null, variant: null },
+  independentReviewer: 'reviewer-m',
+});
+
 function makeWorkspace() {
   const port: WorkspacePort = {
     async inspectWorktree(request) {
@@ -378,11 +385,11 @@ function makeWorkspace() {
       };
     },
     async readWorktreeFile(_worktreePath: string, relativePath: string) {
-      if (relativePath === '.lane/brief-manifest.json' || relativePath === '.lane/brief.md') {
-        return JSON.stringify({
-          modelAssignment: { model: 'm', agent: null, variant: null },
-          independentReviewer: 'reviewer-m',
-        });
+      if (relativePath === '.lane/brief-manifest.json') {
+        return FAKE_BRIEF_MANIFEST;
+      }
+      if (relativePath === '.lane/brief.md') {
+        return FAKE_BRIEF_PROSE;
       }
       return null;
     },
@@ -396,7 +403,7 @@ function dispatchRequest() {
     workOrderId: 'wo-1',
     worktreePath: '/lanes/attempt-1',
     briefPackagePath: '.lane/brief.md',
-    briefDigest: 'digest-1',
+    briefDigest: simpleDeterministicHexDigest(`${FAKE_BRIEF_PROSE}\n${FAKE_BRIEF_MANIFEST}`),
     baseCommit: 'abc123',
     stepLimit: 40,
     timeLimitSeconds: 3600,
@@ -463,6 +470,11 @@ describe('DispatchAttemptUseCase runner selection (O14c1)', () => {
       modelAssignment: Record<string, unknown>;
       [key: string]: unknown;
     };
+    const manifestForSeatTool = (seatTool: unknown) =>
+      JSON.stringify({
+        ...base,
+        modelAssignment: { ...base.modelAssignment, seatTool },
+      });
     // The seat tool lives on the manifest's model assignment — the shape
     // PrepareBriefPackageUseCase writes — never at the manifest top level.
     const withSeatTool = (seatTool: unknown): WorkspacePort =>
@@ -470,11 +482,10 @@ describe('DispatchAttemptUseCase runner selection (O14c1)', () => {
         ...workspace.port,
         readWorktreeFile: async (_path: string, relativePath: string) =>
           relativePath === '.lane/brief-manifest.json'
-            ? JSON.stringify({
-                ...base,
-                modelAssignment: { ...base.modelAssignment, seatTool },
-              })
-            : null,
+            ? manifestForSeatTool(seatTool)
+            : relativePath === '.lane/brief.md'
+              ? FAKE_BRIEF_PROSE
+              : null,
       }) as WorkspacePort;
     const buildUseCase = (manifestWorkspace: WorkspacePort) =>
       new DispatchAttemptUseCase({
@@ -491,7 +502,12 @@ describe('DispatchAttemptUseCase runner selection (O14c1)', () => {
 
     // A manifest carrying agy on the model assignment reaches the selector as agy.
     const agyUseCase = buildUseCase(withSeatTool('agy'));
-    const agyDispatch = await agyUseCase.dispatchAttempt(dispatchRequest());
+    const agyDispatch = await agyUseCase.dispatchAttempt({
+      ...dispatchRequest(),
+      briefDigest: simpleDeterministicHexDigest(
+        `${FAKE_BRIEF_PROSE}\n${manifestForSeatTool('agy')}`,
+      ),
+    });
     expect(agyDispatch.outcome).toBe('started');
     expect(selectionCalls).toEqual(['agy']);
 
@@ -501,6 +517,9 @@ describe('DispatchAttemptUseCase runner selection (O14c1)', () => {
     const legacyDispatch = await legacyUseCase.dispatchAttempt({
       ...dispatchRequest(),
       attemptId: 'attempt-2',
+      briefDigest: simpleDeterministicHexDigest(
+        `${FAKE_BRIEF_PROSE}\n${manifestForSeatTool(undefined)}`,
+      ),
     });
     expect(legacyDispatch.outcome).toBe('started');
     expect(selectionCalls).toEqual(['opencode']);
@@ -511,6 +530,9 @@ describe('DispatchAttemptUseCase runner selection (O14c1)', () => {
     const invalidDispatch = await invalidUseCase.dispatchAttempt({
       ...dispatchRequest(),
       attemptId: 'attempt-3',
+      briefDigest: simpleDeterministicHexDigest(
+        `${FAKE_BRIEF_PROSE}\n${manifestForSeatTool('claude')}`,
+      ),
     });
     expect(invalidDispatch.outcome).toBe('refused');
     if (invalidDispatch.outcome === 'refused') {

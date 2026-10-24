@@ -63,6 +63,7 @@ import {
   resolveInstallationForgeMode,
   resolveRoleExecutors,
   resolveRunnerCapabilityProfile,
+  sha256HexDigest,
   type ExecutionRunnerHost,
   type GhInvocationResult,
   type SubprocessRunner,
@@ -1436,6 +1437,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       briefAuthoring,
       artifactPort: attemptArtifact,
       briefKnowledge,
+      computeDigest: sha256HexDigest,
     }),
     reserveExecutionCapacity: new ReserveExecutionCapacityUseCase({
       journal: executionJournal,
@@ -1449,6 +1451,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       runner,
       observation: executionObservation,
       artifactPort: attemptArtifact,
+      computeDigest: sha256HexDigest,
       allowedSeats,
     }),
     reconcileAttempt: new ReconcileAttemptUseCase({

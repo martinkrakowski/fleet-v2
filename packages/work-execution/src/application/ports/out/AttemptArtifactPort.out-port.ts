@@ -71,4 +71,15 @@ export interface AttemptArtifactPort {
     manifestPath?: string,
     recordedHost?: AttemptRunnerRecord | null,
   ): Promise<string | null>;
+
+  /**
+   * Read one worktree-relative brief file (for example the frozen prose at
+   * `.lane/brief.md`), locally or remotely, with the same containment and
+   * null-if-missing contract as `readBriefManifest`. Returns null if missing.
+   */
+  readBriefFile?(
+    worktreePath: string,
+    relativePath: string,
+    recordedHost?: AttemptRunnerRecord | null,
+  ): Promise<string | null>;
 }

@@ -598,6 +598,26 @@ describe('default run timeout (spawn-run)', () => {
     expect(outcome.stdout).toBe('fleet\n');
     expect(outcome.error).toBeUndefined();
   });
+
+  it('decodes multi-byte UTF-8 characters split across stdout chunks without replacement characters', async () => {
+    const outcome = await runSpawnOutcome(process.execPath, [
+      '-e',
+      'process.stdout.write(Buffer.from([0xe2,0x80])); setTimeout(() => process.stdout.write(Buffer.from([0x94])), 50)',
+    ]);
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.stdout).toBe('—');
+    expect(outcome.stdout).not.toContain('\ufffd');
+  });
+
+  it('decodes multi-byte UTF-8 characters split across stderr chunks without replacement characters', async () => {
+    const outcome = await runSpawnOutcome(process.execPath, [
+      '-e',
+      'process.stderr.write(Buffer.from([0xe2,0x80])); setTimeout(() => process.stderr.write(Buffer.from([0x94])), 50)',
+    ]);
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.stderr).toBe('—');
+    expect(outcome.stderr).not.toContain('\ufffd');
+  });
 });
 
 describe('explicit per-command budgets through the adapters', () => {

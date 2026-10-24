@@ -55,6 +55,7 @@ import { CollectAttemptArtifactsUseCase } from '../CollectAttemptArtifactsUseCas
 import { PrepareFixAttemptUseCase } from '../PrepareFixAttemptUseCase.use-case.js';
 import {
   PrepareBriefPackageUseCase,
+  simpleDeterministicHexDigest,
   type PrepareBriefPackageUseCaseRequest,
 } from '../PrepareBriefPackageUseCase.use-case.js';
 import { RegisterWorkOrderUseCase } from '../RegisterWorkOrderUseCase.use-case.js';
@@ -63,6 +64,25 @@ import { ReserveExecutionCapacityUseCase } from '../ReserveExecutionCapacityUseC
 import { StopAttemptUseCase } from '../StopAttemptUseCase.use-case.js';
 import { AllowedSeatAdapter } from '../../../infrastructure/adapters/AllowedSeatAdapter.adapter.js';
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
+
+/**
+ * The fake workspace serves both the frozen prose (`.lane/brief.md`) and the
+ * frozen manifest (`.lane/brief-manifest.json`), and every default dispatch
+ * request carries the digest those two files really produce.
+ */
+const FAKE_BRIEF_PROSE = '# Frozen brief prose';
+
+const FAKE_BRIEF_FILE = JSON.stringify({
+  modelAssignment: {
+    model: 'nvidia/z-ai/glm-5.3',
+    agent: 'lane-agent',
+    variant: 'default',
+  },
+  independentReviewer: 'reviewer-model',
+});
+
+/** The digest `dispatchAttempt` recomputes for the default fake brief. */
+const FAKE_BRIEF_DIGEST = simpleDeterministicHexDigest(FAKE_BRIEF_PROSE + '\n' + FAKE_BRIEF_FILE);
 
 function makeAttemptRepo(): AttemptRepositoryPort & { attempts: Map<string, AttemptRecord> } {
   const attempts = new Map<string, AttemptRecord>();
@@ -1343,15 +1363,8 @@ function makeWorkspace(
     },
     readWorktreeFile:
       options.readWorktreeFile ??
-      (async () =>
-        JSON.stringify({
-          modelAssignment: {
-            model: 'nvidia/z-ai/glm-5.3',
-            agent: 'lane-agent',
-            variant: 'default',
-          },
-          independentReviewer: 'reviewer-model',
-        })),
+      (async (_worktreePath, relativePath) =>
+        relativePath === '.lane/brief-manifest.json' ? FAKE_BRIEF_FILE : FAKE_BRIEF_PROSE),
   };
   return { port, calls };
 }
@@ -1373,7 +1386,7 @@ function validDispatchRequest(overrides: Record<string, unknown> = {}) {
     workOrderId: 'wo-1',
     worktreePath: '/lanes/attempt-1',
     briefPackagePath: '.lane/brief.md',
-    briefDigest: 'digest-1',
+    briefDigest: FAKE_BRIEF_DIGEST,
     baseCommit: 'abc123',
     stepLimit: 40,
     timeLimitSeconds: 3600,
@@ -1688,23 +1701,26 @@ describe('DispatchAttemptUseCase', () => {
   });
 
   it('records the frozen brief manifest owner decision references on the attempt', async () => {
+    const manifestJson = JSON.stringify({
+      modelAssignment: {
+        model: 'nvidia/z-ai/glm-5.3',
+        agent: 'lane-agent',
+        variant: 'default',
+      },
+      independentReviewer: 'reviewer-model',
+      ownerDecisionReferences: ['door-1', 'door-2'],
+    });
     const setup = makeDispatchSetup({
       workspaceOptions: {
-        readWorktreeFile: async () =>
-          JSON.stringify({
-            modelAssignment: {
-              model: 'nvidia/z-ai/glm-5.3',
-              agent: 'lane-agent',
-              variant: 'default',
-            },
-            independentReviewer: 'reviewer-model',
-            ownerDecisionReferences: ['door-1', 'door-2'],
-          }),
+        readWorktreeFile: async (_worktreePath, relativePath) =>
+          relativePath === '.lane/brief-manifest.json' ? manifestJson : FAKE_BRIEF_PROSE,
       },
     });
 
     const result = await setup.useCase.dispatchAttempt(
-      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+      validDispatchRequest({
+        briefDigest: simpleDeterministicHexDigest(FAKE_BRIEF_PROSE + '\n' + manifestJson),
+      }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
     );
 
     expect(result.outcome).toBe('started');
@@ -1733,19 +1749,22 @@ describe('DispatchAttemptUseCase', () => {
   it('refuses dispatch when the frozen manifest records malformed owner decision references', async () => {
     const malformed: readonly unknown[] = ['not-an-array', [42], [''], [{}]];
     for (const recorded of malformed) {
+      const manifestJson = JSON.stringify({
+        modelAssignment: { model: 'nvidia/z-ai/glm-5.3', agent: 'lane-agent', variant: 'default' },
+        independentReviewer: 'reviewer-model',
+        ownerDecisionReferences: recorded,
+      });
       const setup = makeDispatchSetup({
         workspaceOptions: {
-          readWorktreeFile: async () =>
-            JSON.stringify({
-              modelAssignment: { model: 'nvidia/z-ai/glm-5.3', agent: 'lane-agent', variant: 'default' },
-              independentReviewer: 'reviewer-model',
-              ownerDecisionReferences: recorded,
-            }),
+          readWorktreeFile: async (_worktreePath, relativePath) =>
+            relativePath === '.lane/brief-manifest.json' ? manifestJson : FAKE_BRIEF_PROSE,
         },
       });
 
       const result = await setup.useCase.dispatchAttempt(
-        validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+        validDispatchRequest({
+          briefDigest: simpleDeterministicHexDigest(FAKE_BRIEF_PROSE + '\n' + manifestJson),
+        }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
       );
 
       expect(result).toEqual({
@@ -2094,6 +2113,224 @@ describe('DispatchAttemptUseCase', () => {
     );
     expect(result.outcome).toBe('refused');
     expect((result as { reason: string }).reason).toContain('Unable to read frozen brief manifest');
+  });
+
+  it('refuses dispatch when briefDigest is missing or blank (D3)', async () => {
+    const setup = makeDispatchSetup();
+
+    const blank = await setup.useCase.dispatchAttempt(
+      validDispatchRequest({ briefDigest: '' }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+    expect(blank).toEqual({
+      outcome: 'refused',
+      reason: "briefDigest is required: dispatch only a brief prepared by 'brief prepare'",
+    });
+
+    const missing = await setup.useCase.dispatchAttempt(
+      validDispatchRequest({ briefDigest: undefined }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+    expect(missing).toEqual({
+      outcome: 'refused',
+      reason: "briefDigest is required: dispatch only a brief prepared by 'brief prepare'",
+    });
+
+    expect(setup.runner.startCalls).toHaveLength(0);
+    expect(setup.journal.entries).toHaveLength(0);
+    expect(await setup.attemptRepo.findAttemptById('attempt-1')).toBeNull();
+  });
+
+  it('refuses a fix-kind attempt whose request carries no digest until brief prepare runs again (D3)', async () => {
+    const setup = makeDispatchSetup();
+    setup.attemptRepo.attempts.set(
+      'attempt-1',
+      storedAttempt({ id: 'attempt-1', kind: 'fix', fixNumber: 1, priorAttemptId: 'attempt-0', state: 'intent-recorded', briefDigest: null }),
+    );
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest({ briefDigest: '' }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: "briefDigest is required: dispatch only a brief prepared by 'brief prepare'",
+    });
+    expect(setup.runner.startCalls).toHaveLength(0);
+    expect(setup.journal.entries).toHaveLength(0);
+    expect((await setup.attemptRepo.findAttemptById('attempt-1'))?.state).toBe('intent-recorded');
+  });
+
+  it('refuses dispatch when the frozen prose was edited after prepare (D3)', async () => {
+    const preparedProse = 'ORIGINAL PROSE';
+    const editedProse = 'EDITED PROSE AFTER PREPARE';
+    const setup = makeDispatchSetup({
+      workspaceOptions: {
+        readWorktreeFile: async (_worktreePath, relativePath) =>
+          relativePath === '.lane/brief-manifest.json' ? FAKE_BRIEF_FILE : editedProse,
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest({
+        briefDigest: simpleDeterministicHexDigest(preparedProse + '\n' + FAKE_BRIEF_FILE),
+      }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason:
+        'Frozen brief digest mismatch for attempt attempt-1: the brief or its manifest changed after it was prepared; run \'brief prepare\' again',
+    });
+    expect(setup.runner.startCalls).toHaveLength(0);
+    expect(setup.journal.entries).toHaveLength(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(await setup.attemptRepo.findAttemptById('attempt-1')).toBeNull();
+  });
+
+  it('refuses dispatch when the frozen manifest was edited after prepare (D3)', async () => {
+    const prose = 'PROSE (unchanged)';
+    const editedManifest = FAKE_BRIEF_FILE.replace('nvidia/z-ai/glm-5.3', 'nvidia/z-ai/glm-5.4');
+    const setup = makeDispatchSetup({
+      workspaceOptions: {
+        readWorktreeFile: async (_worktreePath, relativePath) =>
+          relativePath === '.lane/brief-manifest.json' ? editedManifest : prose,
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest({
+        briefDigest: simpleDeterministicHexDigest(prose + '\n' + FAKE_BRIEF_FILE),
+      }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason:
+        'Frozen brief digest mismatch for attempt attempt-1: the brief or its manifest changed after it was prepared; run \'brief prepare\' again',
+    });
+    expect(setup.runner.startCalls).toHaveLength(0);
+    expect(setup.journal.entries).toHaveLength(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(await setup.attemptRepo.findAttemptById('attempt-1')).toBeNull();
+  });
+
+  it('refuses dispatch when the frozen prose read returns null (D3)', async () => {
+    const setup = makeDispatchSetup({
+      workspaceOptions: {
+        readWorktreeFile: async (_worktreePath, relativePath) =>
+          relativePath === '.lane/brief-manifest.json' ? FAKE_BRIEF_FILE : null,
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Unable to read the frozen brief at .lane/brief.md to check its digest',
+    });
+    expect(setup.runner.startCalls).toHaveLength(0);
+    expect(setup.journal.entries).toHaveLength(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(await setup.attemptRepo.findAttemptById('attempt-1')).toBeNull();
+  });
+
+  it('refuses dispatch when the frozen prose read throws (D3)', async () => {
+    let manifestRead = false;
+    const setup = makeDispatchSetup({
+      workspaceOptions: {
+        readWorktreeFile: async (_worktreePath, relativePath) => {
+          if (relativePath === '.lane/brief-manifest.json') {
+            manifestRead = true;
+            return FAKE_BRIEF_FILE;
+          }
+          if (!manifestRead) {
+            return null;
+          }
+          throw new Error('permission denied');
+        },
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Failed to read the frozen brief: Error: permission denied',
+    });
+    expect(setup.runner.startCalls).toHaveLength(0);
+    expect(setup.journal.entries).toHaveLength(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(await setup.attemptRepo.findAttemptById('attempt-1')).toBeNull();
+  });
+
+  it('refuses a .json briefPackagePath before any read (D3)', async () => {
+    const setup = makeDispatchSetup();
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest({
+        briefPackagePath: '.lane/brief-manifest.json',
+      }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'briefPackagePath must name the frozen prose (.md), got .lane/brief-manifest.json',
+    });
+    expect(setup.workspace.calls).toHaveLength(0);
+    expect(setup.runner.startCalls).toHaveLength(0);
+    expect(setup.journal.entries).toHaveLength(0);
+    expect(await setup.attemptRepo.findAttemptById('attempt-1')).toBeNull();
+  });
+
+  it('does not replace the manifest when .lane/brief.md is valid JSON; reads its twin and refuses when the twin changes (D3)', async () => {
+    const jsonProse = JSON.stringify({
+      modelAssignment: {
+        model: 'forged/model',
+        agent: 'forged-agent',
+        variant: 'default',
+      },
+      independentReviewer: 'reviewer-model',
+    });
+    const preparedDigest = simpleDeterministicHexDigest(jsonProse + '\n' + FAKE_BRIEF_FILE);
+
+    const unchangedSetup = makeDispatchSetup({
+      workspaceOptions: {
+        readWorktreeFile: async (_worktreePath, relativePath) =>
+          relativePath === '.lane/brief-manifest.json' ? FAKE_BRIEF_FILE : jsonProse,
+      },
+    });
+    const started = await unchangedSetup.useCase.dispatchAttempt(
+      validDispatchRequest({
+        briefDigest: preparedDigest,
+      }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+    expect(started.outcome).toBe('started');
+    expect(unchangedSetup.runner.startCalls[0]?.model).toBe('nvidia/z-ai/glm-5.3');
+
+    const editedTwin = FAKE_BRIEF_FILE.replace('nvidia/z-ai/glm-5.3', 'nvidia/z-ai/glm-5.4');
+    const changedTwinSetup = makeDispatchSetup({
+      workspaceOptions: {
+        readWorktreeFile: async (_worktreePath, relativePath) =>
+          relativePath === '.lane/brief-manifest.json' ? editedTwin : jsonProse,
+      },
+    });
+    const refused = await changedTwinSetup.useCase.dispatchAttempt(
+      validDispatchRequest({
+        briefDigest: preparedDigest,
+      }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+    expect(refused).toEqual({
+      outcome: 'refused',
+      reason:
+        "Frozen brief digest mismatch for attempt attempt-1: the brief or its manifest changed after it was prepared; run 'brief prepare' again",
+    });
+    expect(changedTwinSetup.runner.startCalls).toHaveLength(0);
+    expect(changedTwinSetup.journal.entries).toHaveLength(0);
+    expect(changedTwinSetup.journal.heldFor('attempt-1')).toBe(true);
+    expect(await changedTwinSetup.attemptRepo.findAttemptById('attempt-1')).toBeNull();
   });
 });
 

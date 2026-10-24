@@ -38,10 +38,10 @@ export type PrepareBriefPackageUseCaseRequest = PrepareBriefPackageRequest & {
 };
 
 /**
- * Pure deterministic FNV-1a digest producing a 64-character hex string, used
- * when no infrastructure digest is injected. It replaces `node:crypto` so the
- * application layer stays free of Node built-ins. It is integrity only: the
- * same input always produces the same digest, never a truth claim.
+ * Pure deterministic FNV-1a digest producing a 64-character hex string. It is
+ * a test and fallback helper used only when no infrastructure digest is
+ * injected; production composition roots inject SHA-256 (`sha256HexDigest`).
+ * It keeps the application layer free of Node built-ins.
  */
 const DIGEST_SEEDS: readonly number[] = [
   0x811c9dc5, 0x01000193, 0x41c6ce57, 0x9e3779b9, 0xdeadbeef, 0x0badc0de, 0x12345678, 0x7fffffff,
@@ -56,6 +56,10 @@ function fnv1a32(content: string, seed: number): number {
   return hash >>> 0;
 }
 
+/**
+ * Pure deterministic FNV-1a test and fallback helper; production composition
+ * roots inject SHA-256 (`sha256HexDigest`).
+ */
 export function simpleDeterministicHexDigest(content: string): string {
   return DIGEST_SEEDS.map((seed) => fnv1a32(content, seed).toString(16).padStart(8, '0')).join('');
 }

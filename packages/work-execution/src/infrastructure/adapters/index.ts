@@ -28,4 +28,3 @@ export * from "./spawn-run.js";
 export * from "./SshExecutor.adapter.js";
 export * from "./WorkOrderRepositoryAdapter.adapter.js";
 export * from "./WorkspaceAdapter.adapter.js";
-export * from "./worktree-target.js";

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { WorktreePathRefusedError } from '../../../application/ports/out/WorkspacePort.out-port.js';
-import { resolveWorktreeTarget } from '../worktree-target.js';
+import { resolveWorktreeTarget } from '../WorkspaceAdapter.adapter.js';
 
 describe('resolveWorktreeTarget', () => {
   it('resolves an absolute candidate inside the worktree under a trailing-slash root', () => {

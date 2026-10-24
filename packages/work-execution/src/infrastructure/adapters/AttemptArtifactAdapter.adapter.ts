@@ -30,7 +30,7 @@ import type { CommandExecutorPort } from '../../application/ports/out/CommandExe
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { hasRecordedHostName } from './ConfirmRecordedHost.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
-import { resolveWorktreeTarget, worktreeRootRefusal } from './worktree-target.js';
+import { resolveWorktreeTarget, worktreeRootRefusal } from './WorkspaceAdapter.adapter.js';
 
 export interface AttemptArtifactAdapterOptions {
   /**

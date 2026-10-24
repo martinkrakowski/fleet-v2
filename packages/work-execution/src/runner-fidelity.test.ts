@@ -290,7 +290,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
   describe('2. H2: Record Runner Port & Host Fidelity in Reconcile', () => {
     it('records runner details on the attempt at dispatch', async () => {
       const workOrder = createMockWorkOrder();
-      const attempt = createMockAttempt({ state: 'dispatching' });
+      const attempt = createMockAttempt({ state: 'intent-recorded' });
       const attempts = new Map<string, AttemptRecord>([[attempt.id, attempt]]);
       const journal = createInMemoryJournal();
 
@@ -1113,6 +1113,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
 
     it('refuses an override whose model shares underlying family with recorded reviewer seat', async () => {
       const existing = createMockAttempt({
+        state: 'intent-recorded',
         reviewerSeat: 'openrouter/z-ai/glm-5.3',
       });
       const { useCase } = setupDispatchWithOverride(existing);
@@ -1141,6 +1142,7 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
 
     it('accepts valid override, starts session with override model, and records in journal and attempt', async () => {
       const existing = createMockAttempt({
+        state: 'intent-recorded',
         reviewerSeat: 'anthropic/claude-3-5-sonnet',
       });
       const { useCase, attempts, journal, getStartedModel } = setupDispatchWithOverride(existing);

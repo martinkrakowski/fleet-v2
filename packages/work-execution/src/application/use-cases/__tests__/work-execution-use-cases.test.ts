@@ -1835,6 +1835,77 @@ describe('DispatchAttemptUseCase', () => {
     expect(result.attempt.state).toBe('running');
   });
 
+  it('saves blocked on a blocked start, keeps the reservation and journals before saving', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        startResult: {
+          outcome: 'blocked',
+          reason: 'Worktree already has an active session (exit 75)',
+          runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+        },
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result).toMatchObject({
+      outcome: 'blocked',
+      reason: 'Worktree already has an active session (exit 75)',
+    });
+    if (result.outcome !== 'blocked') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(result.attempt.sessionId).toBeNull();
+    expect(result.attempt.runner).toEqual({
+      kind: 'opencode',
+      remotePort: 4166,
+      host: null,
+      agent: null,
+      model: 'glm-5',
+      variant: null,
+    });
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('blocked');
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries[1]).toMatchObject({
+      action: 'dispatch',
+      status: 'ambiguous',
+      detail: `Blocked: Worktree already has an active session (exit 75); reservation kept until 'attempt reconcile' or 'attempt stop' resolves the worktree`,
+    });
+  });
+
+  it('refuses dispatch on an existing attempt in a claiming state without starting or journalling', async () => {
+    for (const state of ['dispatching', 'running', 'reconciling', 'blocked'] as const) {
+      const setup = makeDispatchSetup();
+      setup.attemptRepo.attempts.set('attempt-1', storedAttempt({ state }));
+
+      const result = await setup.useCase.dispatchAttempt(
+        validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+      );
+
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: `Attempt attempt-1 is ${state}; run 'attempt reconcile' or 'attempt stop' before dispatching again`,
+      });
+      expect(setup.runner.startCalls).toHaveLength(0);
+      expect(setup.journal.entries).toHaveLength(0);
+    }
+  });
+
+  it('still dispatches an intent-recorded prepared attempt', async () => {
+    const setup = makeDispatchSetup();
+    setup.attemptRepo.attempts.set('attempt-1', storedAttempt({ state: 'intent-recorded' }));
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('started');
+    expect(setup.runner.startCalls).toHaveLength(1);
+  });
+
   it('refuses dispatch when request carries model, agent, variant, modelAssignment, runnerPort, remotePort, runnerHost, or host', async () => {
     const setup = makeDispatchSetup();
 

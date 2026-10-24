@@ -52,6 +52,7 @@ describe("API Security and Hardening", () => {
   let reconcilePostHandler: EventHandler;
   let stopPostHandler: EventHandler;
   let assessmentPostHandler: EventHandler;
+  let healthGetHandler: EventHandler;
 
   beforeAll(async () => {
     for (const [key, value] of Object.entries(h3)) {
@@ -78,6 +79,7 @@ describe("API Security and Hardening", () => {
     assessmentPostHandler = (
       await import("../server/routes/v1/heads/[sha]/assessment.post.js")
     ).default;
+    healthGetHandler = (await import("../server/routes/health.get.js")).default;
   });
 
   beforeEach(async () => {
@@ -116,10 +118,7 @@ describe("API Security and Hardening", () => {
       eventHandler(() => ({ status: "ok", app: "api" })),
     );
     app.use(router.handler);
-    app.use(
-      "/health",
-      eventHandler(() => ({ status: "up" })),
-    );
+    app.use("/health", healthGetHandler);
 
     server = createServer(toNodeListener(app));
     await new Promise<void>((resolve) => {

@@ -71,6 +71,7 @@ import {
 
 import {
   AssessHeadAcceptanceUseCase,
+  assessmentIdForAttempt,
   AttemptOwnerDecisionAdapter,
   EvidenceArchiveAdapter,
   EvidenceAssessmentRepositoryAdapter,
@@ -252,9 +253,7 @@ export function resolveRunnerSettings(
 }
 
 /** Deterministic identity of the acceptance assessment bound to one attempt. */
-export function assessmentIdForAttempt(attemptId: string): string {
-  return `assessment-${attemptId}`;
-}
+export { assessmentIdForAttempt } from '@fleet/evidence-and-acceptance';
 
 /**
  * Read one flat JSON record file as a plain object. ENOENT means {};

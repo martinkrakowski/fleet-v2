@@ -16,6 +16,7 @@ import {
   type AttemptOwnerDecisionDelegate as WorkAttemptOwnerDecisionDelegate,
   type OwnerDecisionDelegate as WorkOwnerDecisionDelegate,
 } from "@fleet/work-execution";
+import { assessmentIdForAttempt } from "@fleet/evidence-and-acceptance";
 import type {
   AttemptOwnerDecisionDelegate as EvidenceAttemptOwnerDecisionDelegate,
   OwnerDecisionDelegate as EvidenceOwnerDecisionDelegate,
@@ -370,11 +371,21 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
         // Always delegate to the use case: it re-checks the attempt's one-way
         // doors before its idempotent accepted path, so a stored acceptance
         // whose owner decision has been withdrawn still blocks here.
-        const result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
-          assessmentId: request.attemptId,
+        let result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
+          assessmentId: assessmentIdForAttempt(request.attemptId),
           candidateHeadSha: request.candidateHeadSha,
           policyRevision: request.policyRevision,
         });
+        // Legacy bare-id fallback: assessments written before the shared
+        // `assessment-<attemptId>` prefix still resolve through the assess
+        // path, mirroring the read path's fallback.
+        if (result.outcome === "rejected" && result.reason === "Assessment not found") {
+          result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
+            assessmentId: request.attemptId,
+            candidateHeadSha: request.candidateHeadSha,
+            policyRevision: request.policyRevision,
+          });
+        }
         switch (result.outcome) {
           case "accepted": {
             acceptedReceiptByHead[result.candidateHeadSha] = result.receiptId;
@@ -517,7 +528,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
     acceptanceEvidence: {
       readAcceptance: async (request) => {
         let inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
-          assessmentId: `assessment-${request.attemptId}`,
+          assessmentId: assessmentIdForAttempt(request.attemptId),
           candidateHeadSha: request.candidateHeadSha,
         });
         if (inspected.outcome === "not-found") {

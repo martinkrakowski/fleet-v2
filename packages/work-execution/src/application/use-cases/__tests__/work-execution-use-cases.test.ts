@@ -2431,7 +2431,14 @@ describe('ReconcileAttemptUseCase', () => {
   it.each(['cancelled', 'collected', 'ended'] as const)(
     'refuses to reconcile a terminal $state attempt without contacting the runner or saving',
     async (state) => {
-      const setup = makeReconcileSetup({ attempt: { state, sessionId: null }, withReservation: false });
+      const setup = makeReconcileSetup({
+        attempt: {
+          state,
+          sessionId: null,
+          completionReceipt: state === 'ended' ? completionReceipt() : null,
+        },
+        withReservation: false,
+      });
 
       const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
 
@@ -2449,7 +2456,13 @@ describe('ReconcileAttemptUseCase', () => {
   it.each(['cancelled', 'collected', 'ended'] as const)(
     'releases a reservation still held by a terminal $state attempt, refuses, and saves nothing',
     async (state) => {
-      const setup = makeReconcileSetup({ attempt: { state, sessionId: null } });
+      const setup = makeReconcileSetup({
+        attempt: {
+          state,
+          sessionId: null,
+          completionReceipt: state === 'ended' ? completionReceipt() : null,
+        },
+      });
       expect(setup.journal.heldFor('attempt-1')).toBe(true);
 
       const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
@@ -2470,6 +2483,33 @@ describe('ReconcileAttemptUseCase', () => {
         sessionId: null,
         detail: `Released a capacity reservation still held by terminal attempt (${state})`,
       });
+    },
+  );
+
+  it.each([
+    ['no receipt', null],
+    ['a non-authoritative receipt', completionReceipt({ authoritative: false })],
+  ] as const)(
+    'refuses an ended attempt with %s without releasing capacity, contacting the runner, or saving',
+    async (_label, receipt) => {
+      const setup = makeReconcileSetup({
+        attempt: { state: 'ended', sessionId: null, completionReceipt: receipt },
+      });
+      expect(setup.journal.heldFor('attempt-1')).toBe(true);
+
+      const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason:
+          'Attempt attempt-1 ended without an authoritative completion receipt and cannot be reconciled; its reservation stays held',
+      });
+      expect(setup.journal.heldFor('attempt-1')).toBe(true);
+      expect(setup.journal.releaseCount).toBe(0);
+      expect(setup.journal.entries).toHaveLength(0);
+      expect(setup.runner.inspectCalls).toHaveLength(0);
+      expect(setup.runner.inspectWorktreeCalls).toHaveLength(0);
+      expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('ended');
     },
   );
 
@@ -2909,6 +2949,44 @@ describe('ReconcileAttemptUseCase', () => {
 
     expect(result.outcome).toBe('unknown');
     expect(setup.attemptRepo.attempts.get('attempt-1')?.sessionId).toBeNull();
+  });
+
+  it('refuses to adopt an empty session id when the worktree reports a running lane without a session id', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: '' },
+    });
+    setup.journal.entries.push({
+      id: 'je-amb-empty',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'ambiguous',
+      sessionId: null,
+      detail: 'ses_ab',
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    const reason =
+      "Worktree runs a lane that reports no session id, which attempt attempt-1 cannot adopt; run 'attempt stop' to abort it";
+    expect(result).toEqual({ outcome: 'unknown', attempt: expect.anything(), reason });
+    if (result.outcome !== 'unknown') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(result.attempt.sessionId).toBeNull();
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('blocked');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.sessionId).toBeNull();
+    expect(setup.journal.releaseCount).toBe(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries[1]).toMatchObject({
+      action: 'reconcile',
+      status: 'ambiguous',
+      detail: reason,
+    });
   });
 });
 

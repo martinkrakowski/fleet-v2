@@ -43,6 +43,7 @@ type JournalEntryDraft = Omit<ActionJournalEntryRecord, 'id'>;
  * session id, so `ses_a` never matches inside `ses_ab`.
  */
 function detailNamesSession(detail: string, sessionId: string): boolean {
+  if (sessionId.length === 0) return false;
   const isIdChar = (ch: string | undefined): boolean =>
     ch !== undefined && /[A-Za-z0-9_-]/.test(ch);
   let from = 0;
@@ -104,12 +105,16 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
     // or attempt change. A crash between saving a terminal record and
     // releasing its capacity reservation (the blocked-idle path below, or the
     // `ended` path) would otherwise leave the reservation held forever, so it
-    // is released here; the release is a no-op when nothing is held. The
-    // retry path's own check below stays.
+    // is released here for `cancelled`, `collected`, and `ended` with an
+    // authoritative completion receipt; the release is a no-op when nothing is
+    // held. An `ended` attempt without an authoritative completion receipt
+    // refuses before any runner contact, saves nothing, appends no journal
+    // entry, and keeps its reservation held. The retry path's own check below
+    // stays.
     if (
       attempt.state === 'cancelled' ||
       attempt.state === 'collected' ||
-      attempt.state === 'ended'
+      (attempt.state === 'ended' && attempt.completionReceipt?.authoritative === true)
     ) {
       const released = await deps.journal.releaseCapacityReservation(attempt.id, nowIso);
       if (released) {
@@ -129,6 +134,12 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
         reason: `Attempt ${attempt.id} is in terminal state '${attempt.state}' and cannot be reconciled${
           released ? '; a reservation it still held was released' : ''
         }`,
+      };
+    }
+    if (attempt.state === 'ended') {
+      return {
+        outcome: 'refused',
+        reason: `Attempt ${attempt.id} ended without an authoritative completion receipt and cannot be reconciled; its reservation stays held`,
       };
     }
 
@@ -212,7 +223,9 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
         // that id is never adoptable.
         const syntheticAgyId = `agy-${attempt.id}`;
         let refusalReason: string | undefined;
-        if (observedId === syntheticAgyId) {
+        if (observedId.length === 0) {
+          refusalReason = `Worktree runs a lane that reports no session id, which attempt ${attempt.id} cannot adopt; run 'attempt stop' to abort it`;
+        } else if (observedId === syntheticAgyId) {
           refusalReason = `Worktree runs session ${observedId}, which attempt ${attempt.id} never started; run 'attempt stop' to abort it`;
         } else {
           const history = await deps.journal.listJournalEntriesForAttempt(attempt.id);

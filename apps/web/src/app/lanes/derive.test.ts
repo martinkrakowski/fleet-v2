@@ -4,10 +4,12 @@ import type { AttemptSummary } from "./fixture";
 import {
   attemptHref,
   isLive,
+  kpiScopeNote,
   laneIdLine,
   liveViewHref,
   observedLine,
   summary,
+  unknownAttention,
   woOf,
 } from "./derive";
 
@@ -207,6 +209,40 @@ describe("observedLine", () => {
     expect(fixLine.startsWith("observed ")).toBe(true);
     expect(fixLine).toBe(
       `observed ${fix.observedAt} · ${fix.observedFrom} · running · 21 lane min`,
+    );
+  });
+});
+
+describe("unknownAttention", () => {
+  it("reports state not established for recorded rows and runner did not answer for fixture rows", () => {
+    const paused = recorded("paused");
+    const pausedAttn = unknownAttention(paused, summary(paused)[1]);
+    expect(pausedAttn.title).toBe("state not established");
+    expect(pausedAttn.detail).toContain("unrecognised recorded state paused");
+    expect(pausedAttn.detail).toContain("no slot recorded");
+    expect(pausedAttn.detail).toContain("reconcile asks the runner");
+
+    const reconciling: AttemptSummary = { ...recorded("reconciling"), slot: 2 };
+    const recAttn = unknownAttention(reconciling, summary(reconciling)[1]);
+    expect(recAttn.title).toBe("state not established");
+    expect(recAttn.detail).toContain(
+      "reconciling · no runner answer recorded yet",
+    );
+    expect(recAttn.detail).toContain("slot 2 recorded as held");
+    expect(recAttn.detail).toContain("reconcile asks the runner");
+
+    const fix = attempts.find((a) => summary(a)[0] === "unknown") ?? attempts[0];
+    const fixAttn = unknownAttention(fix, summary(fix)[1]);
+    expect(fixAttn.title).toBe("runner did not answer");
+    expect(fixAttn.detail).toContain("reconcile returns 409, not a guess");
+  });
+});
+
+describe("kpiScopeNote", () => {
+  it("returns null when not truncated and the scope note when truncated", () => {
+    expect(kpiScopeNote(12, 12, false)).toBeNull();
+    expect(kpiScopeNote(250, 100, true)).toBe(
+      "counted over the newest 100 of 250",
     );
   });
 });

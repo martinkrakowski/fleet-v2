@@ -118,6 +118,32 @@ export function observedLine(a: AttemptSummary, note: string): string {
   const verb = a.basis === "recorded" ? "recorded" : "observed";
   return `${verb} ${a.observedAt} · ${a.observedFrom} · ${note}`;
 }
+export function unknownAttention(
+  a: AttemptSummary,
+  note: string,
+): { title: string; detail: string } {
+  if (a.basis === "recorded") {
+    return {
+      title: "state not established",
+      detail: `${note} · ${
+        a.slot === null ? "no slot recorded" : `slot ${a.slot} recorded as held`
+      } · reconcile asks the runner`,
+    };
+  }
+  return {
+    title: "runner did not answer",
+    detail: `${note} · ${
+      a.slot === null ? "no slot recorded" : `slot ${a.slot} stays held`
+    } · reconcile returns 409, not a guess`,
+  };
+}
+export function kpiScopeNote(
+  total: number,
+  shown: number,
+  truncated: boolean,
+): string | null {
+  return truncated ? `counted over the newest ${shown} of ${total}` : null;
+}
 export const isLive = (a: AttemptSummary) =>
   a.basis !== "recorded" && a.facts.active === "yes" && a.facts.ended === "no";
 

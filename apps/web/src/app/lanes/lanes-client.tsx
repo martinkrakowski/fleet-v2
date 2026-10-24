@@ -12,8 +12,8 @@ import {
   Switch
 } from "@fleet/ui";
 import type { LanesData } from "./live";
-import { STATE_ORDER, summary, woOf } from "./derive";
-import { useAutoRefresh } from "./use-auto-refresh";
+import { STATE_ORDER, kpiScopeNote, summary, woOf } from "./derive";
+import { NOT_CONFIGURED_REASON, useAutoRefresh } from "./use-auto-refresh";
 import { LanesKpiRow } from "./components/lanes-kpi-row";
 import { LanesToolbar } from "./components/lanes-toolbar";
 import { LaneRow } from "./components/lane-row";
@@ -22,7 +22,7 @@ import { AttentionCard } from "./components/attention-card";
 import styles from "./lanes.module.css";
 
 export function LanesClient({ data }: { data: LanesData }) {
-  useAutoRefresh(data.source);
+  useAutoRefresh(data.source, data.fallbackReason);
   const [showEnded, setShowEnded] = useState(true);
   const [stateFilter, setStateFilter] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -80,7 +80,11 @@ export function LanesClient({ data }: { data: LanesData }) {
       <p className={styles.meta}>
         {data.source === "api"
           ? `Recorded state, not runner observations · read ${data.observedAtIso} · refreshes every 30 s`
-          : `Sample data, not this station · read ${data.observedAtIso}`}
+          : `Sample data, not this station · read ${data.observedAtIso}${
+              data.fallbackReason !== NOT_CONFIGURED_REASON
+                ? " · the API did not answer; retrying every 30 s"
+                : ""
+            }`}
       </p>
       <LanesKpiRow
         queued={queued}
@@ -91,6 +95,11 @@ export function LanesClient({ data }: { data: LanesData }) {
         host={data.capacity?.host ?? null}
         port={data.capacity?.port ?? null}
         queuedAll={pendingAttempts.length}
+        scopeNote={kpiScopeNote(
+          data.total,
+          data.attempts.length,
+          data.truncated
+        )}
       />
       <LanesToolbar
         stateFilter={stateFilter}

@@ -4,13 +4,28 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ refresh: vi.fn() }),
 }));
 
-import { shouldRefresh } from "./use-auto-refresh";
+import { NOT_CONFIGURED_REASON, shouldRefresh } from "./use-auto-refresh";
 
 describe("shouldRefresh", () => {
-  it("refreshes only the live API source while the tab is visible", () => {
-    expect(shouldRefresh("api", "visible")).toBe(true);
-    expect(shouldRefresh("api", "hidden")).toBe(false);
-    expect(shouldRefresh("fixture-fallback", "visible")).toBe(false);
-    expect(shouldRefresh("fixture-fallback", "hidden")).toBe(false);
+  it("refreshes the live API or a failed configured API while the tab is visible", () => {
+    expect(shouldRefresh("api", null, "visible")).toBe(true);
+    expect(shouldRefresh("api", null, "hidden")).toBe(false);
+    expect(
+      shouldRefresh("fixture-fallback", NOT_CONFIGURED_REASON, "visible"),
+    ).toBe(false);
+    expect(
+      shouldRefresh(
+        "fixture-fallback",
+        "api boundary is unreachable: ECONNREFUSED",
+        "visible",
+      ),
+    ).toBe(true);
+    expect(
+      shouldRefresh(
+        "fixture-fallback",
+        "api boundary is unreachable: ECONNREFUSED",
+        "hidden",
+      ),
+    ).toBe(false);
   });
 });

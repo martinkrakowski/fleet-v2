@@ -11,7 +11,7 @@ import {
 } from "@fleet/ui";
 import type { AttemptSummary } from "../fixture";
 import { install } from "../fixture";
-import { attemptsOf, summary } from "../derive";
+import { attemptsOf, summary, unknownAttention } from "../derive";
 import styles from "../lanes.module.css";
 
 interface AttentionItem {
@@ -26,14 +26,15 @@ function buildAttentionItems(attempts: AttemptSummary[]): AttentionItem[] {
   attempts.forEach((a) => {
     const [word, note] = summary(a);
     if (word === "unknown") {
+      const { title, detail } = unknownAttention(a, note);
       items.push({
         tone: "warn",
         tt: (
           <>
-            <b>{a.id}</b> runner did not answer
+            <b>{a.id}</b> {title}
           </>
         ),
-        ss: `${note} · ${a.slot === null ? "no slot recorded" : `slot ${a.slot} stays held`} · reconcile returns 409, not a guess`
+        ss: detail
       });
     }
     const decision = a.receipts.decision;

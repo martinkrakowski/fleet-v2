@@ -882,7 +882,7 @@ describe('PrepareBriefPackageUseCase', () => {
     });
 
     const result = await useCase.prepareBriefPackage(
-      validBriefRequest({ independentReviewer: 'implementer-model' }),
+      validBriefRequest({ independentReviewer: 'implementer-model', worktreePath: '/wt' }),
     );
 
     expect(result).toEqual({
@@ -900,6 +900,7 @@ describe('PrepareBriefPackageUseCase', () => {
 
     const emptyDecision = await useCase.prepareBriefPackage(
       validBriefRequest({
+        worktreePath: '/wt',
         contextDecisions: [
           {
             proposalId: 'p-1',
@@ -1097,7 +1098,7 @@ describe('PrepareBriefPackageUseCase', () => {
       artifactPort: makeArtifactPort().port,
     });
 
-    const result = await useCase.prepareBriefPackage(validBriefRequest());
+    const result = await useCase.prepareBriefPackage(validBriefRequest({ worktreePath: '/wt' }));
 
     expect(result).toEqual({ outcome: 'rejected', reason: 'orchestrator offline' });
   });
@@ -1109,7 +1110,7 @@ describe('PrepareBriefPackageUseCase', () => {
       artifactPort: artifacts.port,
     });
 
-    const result = await useCase.prepareBriefPackage(validBriefRequest());
+    const result = await useCase.prepareBriefPackage(validBriefRequest({ worktreePath: '/wt' }));
 
     expect(result).toEqual({ outcome: 'rejected', reason: 'Paths not ignored: dist/report.json' });
     expect(artifacts.placedCalls).toHaveLength(0);

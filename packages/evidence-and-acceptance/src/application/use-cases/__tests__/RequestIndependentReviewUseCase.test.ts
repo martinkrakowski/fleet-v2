@@ -207,6 +207,59 @@ describe('RequestIndependentReviewUseCase assessment presence (M13)', () => {
     expect(stored?.reviewReceipts).toHaveLength(1);
     expect(stored?.reviewReceipts[0].reviewerModel).toBe('openai/gpt-4o');
   });
+
+  it('stores reviewer-reported finding states as unresolved with no disposition', async () => {
+    const existing = sampleRecord({ candidateHeadSha: HEAD1 });
+    const repo = new InMemoryAssessmentRepo([existing]);
+    class FixedFindingReviewer extends StubReviewer {
+      override async runIndependentReview(
+        request: RunIndependentReviewRequest,
+      ): Promise<RunIndependentReviewResult> {
+        const base = await super.runIndependentReview(request);
+        return {
+          ...base,
+          findings: [
+            {
+              findingId: 'f-1',
+              severity: 'major',
+              summary: 'claimed fixed by the reviewer',
+              filePath: null,
+              line: null,
+              state: 'fixed',
+              dispositionReason: 'reviewer says so',
+              dispositionEvidenceRef: 'nowhere',
+            },
+          ],
+        } as RunIndependentReviewResult;
+      }
+    }
+    const useCase = new RequestIndependentReviewUseCase({
+      repo,
+      reviewer: new FixedFindingReviewer(),
+      archive: new StubArchive(),
+    });
+
+    const result = await useCase.requestIndependentReview({
+      assessmentId: 'asm-1',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      reviewerModel: 'openai/gpt-4o',
+    });
+
+    expect(result.outcome).toBe('reviewed');
+    const stored = await repo.findAssessmentById('asm-1');
+    expect(stored?.reviewReceipts[0].findings).toEqual([
+      expect.objectContaining({
+        findingId: 'f-1',
+        state: 'unresolved',
+        dispositionReason: null,
+        dispositionEvidenceRef: null,
+      }),
+    ]);
+  });
 });
 
 describe('free-seat policy and requested reviewer (FS3b)', () => {

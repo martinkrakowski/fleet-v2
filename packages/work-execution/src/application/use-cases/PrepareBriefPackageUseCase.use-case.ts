@@ -8,6 +8,7 @@
 
 import { parseSeatTool } from '../../domain/execution-records.js';
 import { validateAllowedPathPrefix } from '../../domain/lane-diff-check.js';
+import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import type {
   PrepareBriefPackagePort,
   PrepareBriefPackageRequest,
@@ -132,6 +133,37 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
         return { outcome: 'rejected', reason: invalidPrefix };
       }
     }
+    // The worktree path names where the frozen package lands. It is required
+    // and never defaulted to the process's current directory; the request
+    // wins over the composition root, and both must be a non-empty string.
+    const worktreePath = request.worktreePath ?? this.deps.worktreePath;
+    if (!isNonEmpty(worktreePath)) {
+      return { outcome: 'rejected', reason: 'worktreePath is required' };
+    }
+    // The worktree must be an absolute path that is not the filesystem root:
+    // a relative or root path makes the containment prefix degenerate (with
+    // an empty root every absolute path "lies inside" the worktree).
+    const trimmedWorktreePath = worktreePath.replace(/\/+$/, '');
+    if (trimmedWorktreePath === '' || !worktreePath.startsWith('/')) {
+      return {
+        outcome: 'rejected',
+        reason: 'worktreePath must be an absolute path that is not the filesystem root',
+      };
+    }
+    // Expected artifacts are verified and frozen as relative paths; an
+    // absolute or `..` entry would escape the worktree when read back.
+    if (!Array.isArray(request.expectedArtifacts)) {
+      return { outcome: 'rejected', reason: 'expectedArtifacts must be an array of strings' };
+    }
+    for (const artifact of request.expectedArtifacts) {
+      const refusedReason = validateWorktreeRelativePath(artifact);
+      if (refusedReason !== null) {
+        return {
+          outcome: 'rejected',
+          reason: `expectedArtifacts entry is not a valid worktree-relative path: ${String(artifact)}`,
+        };
+      }
+    }
     if (!isNonEmpty(request.independentReviewer)) {
       return { outcome: 'rejected', reason: 'Independent reviewer must be named' };
     }
@@ -157,7 +189,6 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     }
 
     const attemptId = request.attemptId ?? this.deps.attemptId ?? `${request.workOrderId}-attempt-1`;
-    const worktreePath = request.worktreePath ?? this.deps.worktreePath ?? '.';
 
     const verified = await this.deps.artifactPort.verifyIgnoredPaths({
       worktreePath,

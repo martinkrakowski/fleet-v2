@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import type { EvidenceAssessmentRecord } from '../../../domain/evidence-records.js';
+import type {
+  EvidenceAssessmentRecord,
+  ReviewFindingRecord,
+  ReviewReceiptRecord,
+} from '../../../domain/evidence-records.js';
 import type { EvidenceAssessmentRepositoryPort } from '../../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { AttemptOwnerDecisionPort } from '../../ports/out/AttemptOwnerDecisionPort.out-port.js';
 import { AssessHeadAcceptanceUseCase } from '../AssessHeadAcceptanceUseCase.use-case.js';
+import { RecordFindingDispositionUseCase } from '../RecordFindingDispositionUseCase.use-case.js';
 
 const HEAD = '1111111111111111111111111111111111111111';
 const OTHER_HEAD = '2222222222222222222222222222222222222222';
@@ -76,6 +81,42 @@ function sampleRecord(overrides: Partial<EvidenceAssessmentRecord> = {}): Eviden
     blockers: [],
     revision: 0,
     updatedAtIso: '2026-10-15T12:00:00.000Z',
+    ...overrides,
+  };
+}
+
+function finding(findingId: string, overrides: Partial<ReviewFindingRecord> = {}): ReviewFindingRecord {
+  return {
+    findingId,
+    severity: 'major',
+    summary: `summary for ${findingId}`,
+    filePath: 'src/a.ts',
+    line: 12,
+    state: 'unresolved',
+    dispositionReason: null,
+    dispositionEvidenceRef: null,
+    ...overrides,
+  };
+}
+
+function independentReviewReceiptWithFindings(
+  findings: readonly ReviewFindingRecord[],
+  overrides: Partial<ReviewReceiptRecord> = {},
+): ReviewReceiptRecord {
+  return {
+    id: 'rr-1',
+    assessmentId: 'asm-1',
+    projectId: 'proj-1',
+    attemptId: 'att-1',
+    candidateHeadSha: HEAD,
+    reviewerModel: 'seat-a/reviewer',
+    implementerModel: 'seat-b/implementer',
+    readOnlyVerified: true,
+    result: 'pass',
+    findings,
+    evidenceRef: 'ref-1',
+    policyRevision: 'pol-1',
+    completedAtIso: '2026-10-15T12:00:00.000Z',
     ...overrides,
   };
 }
@@ -245,6 +286,123 @@ describe('AssessHeadAcceptanceUseCase', () => {
     if (result.outcome === 'blocked') {
       expect(result.blockers.join('\n')).toContain('rr-seat');
       expect(result.blockers.join('\n')).toContain('records implementer');
+    }
+  });
+
+  it('blocks acceptance when the only review finding arrives pre-marked fixed until a fixed disposition resolves it', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [independentReviewReceiptWithFindings([finding('f-1', { state: 'fixed' })])],
+    });
+    const repo = new InMemoryAssessmentRepo([record]);
+    const assess = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
+
+    const blocked = await assess.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(blocked.outcome).toBe('blocked');
+    if (blocked.outcome === 'blocked') {
+      expect(blocked.blockers).toContain("finding 'f-1' is unresolved");
+    }
+
+    const dispositionUseCase = new RecordFindingDispositionUseCase({ repo });
+    const recorded = await dispositionUseCase.recordFindingDisposition({
+      assessmentId: 'asm-1',
+      disposition: {
+        id: 'fd-1',
+        assessmentId: 'asm-1',
+        findingId: 'f-1',
+        candidateHeadSha: HEAD,
+        state: 'fixed',
+        reason: 'patched in the candidate head',
+        evidenceRef: 'evidence://fix-f-1',
+        recordedBy: 'orchestrator',
+        recordedAtIso: '2026-10-16T00:00:00.000Z',
+      },
+    });
+    expect(recorded.outcome).toBe('recorded');
+
+    const accepted = await assess.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(accepted.outcome).toBe('accepted');
+    if (accepted.outcome === 'accepted') {
+      expect(accepted.assessment.blockers).toEqual([]);
+    }
+  });
+
+  it('blocks acceptance when the only review finding arrives pre-marked refuted until a refuted disposition resolves it', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [independentReviewReceiptWithFindings([finding('f-1', { state: 'refuted' })])],
+    });
+    const repo = new InMemoryAssessmentRepo([record]);
+    const assess = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
+
+    const blocked = await assess.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(blocked.outcome).toBe('blocked');
+    if (blocked.outcome === 'blocked') {
+      expect(blocked.blockers).toContain("finding 'f-1' is unresolved");
+    }
+
+    const dispositionUseCase = new RecordFindingDispositionUseCase({ repo });
+    const recorded = await dispositionUseCase.recordFindingDisposition({
+      assessmentId: 'asm-1',
+      disposition: {
+        id: 'fd-1',
+        assessmentId: 'asm-1',
+        findingId: 'f-1',
+        candidateHeadSha: HEAD,
+        state: 'refuted',
+        reason: 'reproduced and the claim does not hold',
+        evidenceRef: 'evidence://refutation-f-1',
+        recordedBy: 'orchestrator',
+        recordedAtIso: '2026-10-16T00:00:00.000Z',
+      },
+    });
+    expect(recorded.outcome).toBe('recorded');
+
+    const accepted = await assess.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(accepted.outcome).toBe('accepted');
+    if (accepted.outcome === 'accepted') {
+      expect(accepted.assessment.blockers).toEqual([]);
+    }
+  });
+
+  it('reports a finding present in two receipts once', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [
+        independentReviewReceiptWithFindings([finding('f-1', { state: 'fixed' })]),
+        independentReviewReceiptWithFindings([finding('f-1', { state: 'refuted' })], {
+          id: 'rr-2',
+          reviewerModel: 'seat-c/reviewer',
+        }),
+      ],
+    });
+    const repo = new InMemoryAssessmentRepo([record]);
+    const assess = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
+
+    const result = await assess.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      const findingBlockers = result.blockers.filter(
+        (blocker) => blocker === "finding 'f-1' is unresolved",
+      );
+      expect(findingBlockers).toHaveLength(1);
     }
   });
 });

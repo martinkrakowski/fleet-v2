@@ -4,7 +4,7 @@
 - **Target repository:** `fleet-v2`
 - **Status:** rev 2: D1 to D3 decided as recommended by the owner on 2026-10-23 ("Proceed with
   your recommendations"); S3 starts first (§8), S1 and S2 wait for wave 1 of
-  `2026-10-22_security-review-remediation-plan.md`. Rev 1 answered four review minors on S1 and
+  the 2026-10-22 remediation plan (moved to the private fleet repository, `docs/planning/fleet-v2/`). Rev 1 answered four review minors on S1 and
   S2 (the attempt record's existing fields, the refusal-to-fix transition, `proof[]` removed, the
   acceptance hand-off).
 - **Owner request (2026-10-23):** research a CNCF Sandbox internal developer platform for

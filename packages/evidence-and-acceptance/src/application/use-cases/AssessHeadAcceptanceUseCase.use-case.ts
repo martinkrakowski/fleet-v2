@@ -132,22 +132,16 @@ function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly s
   return blockers;
 }
 
-/** Unresolved findings block acceptance until they are fixed or refuted. */
+/**
+ * Unresolved findings block acceptance until they are fixed or refuted. A
+ * finding blocks regardless of the state recorded on the receipt: only a
+ * recorded disposition whose state is not blocking resolves it. The aggregate
+ * already derives exactly this set, so it is reused.
+ */
 function collectFindingBlockers(assessment: EvidenceAssessmentRecord): readonly string[] {
-  const resolved = new Set(
-    assessment.findingDispositions
-      .filter((disposition) => disposition.state !== 'unresolved')
-      .map((disposition) => disposition.findingId),
-  );
-  const blockers: string[] = [];
-  for (const receipt of assessment.reviewReceipts) {
-    for (const finding of receipt.findings) {
-      if (finding.state === 'unresolved' && !resolved.has(finding.findingId)) {
-        blockers.push(`finding '${finding.findingId}' is unresolved`);
-      }
-    }
-  }
-  return blockers;
+  return EvidenceAssessment.fromRecord(assessment)
+    .unresolvedFindingIds()
+    .map((findingId) => `finding '${findingId}' is unresolved`);
 }
 
 export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {

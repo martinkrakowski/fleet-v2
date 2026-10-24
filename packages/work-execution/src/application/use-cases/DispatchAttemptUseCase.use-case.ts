@@ -14,6 +14,7 @@ import type {
   AttemptRunnerRecord,
 } from '../../domain/execution-records.js';
 import { parseSeatTool } from '../../domain/execution-records.js';
+import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import type { DispatchAttemptPort, DispatchAttemptRequest, DispatchAttemptResult } from '../ports/in/DispatchAttemptPort.in-port.js';
 import type { RunnerIsolationCapabilities } from '../ports/out/ExecutionRunnerPort.out-port.js';
@@ -146,6 +147,18 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         return {
           outcome: 'refused',
           reason: `'${field}' must not be specified; the seat is determined by the frozen brief manifest`,
+        };
+      }
+    }
+
+    // Request-validation entry check: every expected-artifact path must be a
+    // contained worktree-relative path, refused here before any inspection.
+    for (const artifact of request.expectedArtifacts ?? []) {
+      const refusedReason = validateWorktreeRelativePath(artifact);
+      if (refusedReason !== null) {
+        return {
+          outcome: 'refused',
+          reason: `expectedArtifacts entry '${String(artifact)}' is refused: ${refusedReason}`,
         };
       }
     }

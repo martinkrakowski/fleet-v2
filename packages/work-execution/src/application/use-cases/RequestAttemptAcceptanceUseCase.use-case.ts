@@ -4,8 +4,9 @@
  *
  * It requests verification and independent review of one exact candidate
  * head: the attempt must have ended and been collected, the candidate head
- * must match the collected artifacts exactly, and the reviewer's model must
- * differ from the implementer's (a provider prefix alone is insufficient).
+ * must match the collected artifacts exactly, and the reviewer's model
+ * family must differ from the implementer's (a provider prefix or a tier/
+ * suffix change alone is never independence).
  * The implementer is the attempt's own recorded seat — the runner model
  * dispatch wrote, or failing that the frozen brief manifest's model
  * assignment read through the artifact port. There is no default seat and no
@@ -32,16 +33,8 @@ import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.o
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { AttemptRecord, WorkOrderRecord } from '../../domain/execution-records.js';
 import { WorkOrder } from '../../domain/entities/WorkOrder.js';
+import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import type { AllowedSeatPort } from '../ports/out/AllowedSeatPort.out-port.js';
-
-/**
- * Strip one `<provider>/` prefix so `a/model` and `b/model` compare as the
- * same underlying model; a provider change alone is never independence.
- */
-function baseModelName(model: string): string {
-  const separator = model.indexOf('/');
-  return separator === -1 ? model : model.slice(separator + 1);
-}
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
@@ -207,9 +200,19 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
       return { outcome: 'rejected', reason: implementerSeat.reason };
     }
     const implementerModel = implementerSeat.model;
+    // The reviewer seat must be named; a missing one is refused before any
+    // independence or free-seat check is evaluated.
+    if (!isNonEmptyString(request.reviewerModel)) {
+      return { outcome: 'rejected', reason: 'reviewerModel is required' };
+    }
+    // Independence is the owner-decided family rule: the same underlying model
+    // family (after the provider path and any `#`, `:` or `@` suffix are
+    // dropped) is never independence, and an empty family fails closed.
     if (
-      implementerModel === request.reviewerModel ||
-      baseModelName(implementerModel) === baseModelName(request.reviewerModel)
+      isSameModelFamily(
+        underlyingModelFamily(implementerModel),
+        underlyingModelFamily(request.reviewerModel),
+      )
     ) {
       return {
         outcome: 'rejected',

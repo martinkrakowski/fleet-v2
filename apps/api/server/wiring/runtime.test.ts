@@ -425,8 +425,9 @@ describe('apps/api runtime wiring', () => {
       const workOrderId = 'wo-api-door-e2e';
       const doorRef = 'req-api-door-e2e';
       const grantId = 'grant-api-door-e2e';
-      // The API acceptance delegate addresses the assessment by the attempt id.
-      const assessmentId = attemptId;
+      // The API acceptance delegate addresses the assessment by the shared
+      // prefixed id (assessmentIdForAttempt).
+      const assessmentId = `assessment-${attemptId}`;
 
       const workOrderRepo = (work.registerWorkOrder as unknown as {
         deps?: { workOrderRepo: { saveWorkOrder: (w: WorkOrderRecord) => Promise<void> } };

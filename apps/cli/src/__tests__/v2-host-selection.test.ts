@@ -283,7 +283,6 @@ describe("v2 CLI host selection (H3b)", () => {
         "request-verification",
         "--json",
         JSON.stringify({
-          assessmentId: "assess-nv-1",
           projectId: "proj-nv-1",
           attemptId: "attempt-nv-1",
           candidateHeadSha: "a".repeat(40),

@@ -207,9 +207,11 @@ describe('Fleet CLI workflow', () => {
     process.env.FLEET_OCM_RUN_BIN = path.join(binDir, 'ocm-run');
     process.env.PATH = `${binDir}:${originalPath ?? ''}`;
 
-    // The lane worktree stays pristine: it must match the base commit with no
-    // untracked files and no earlier-attempt residue when dispatch inspects it.
-    laneHead = initGitRepo(laneRepoDir, []);
+    // The lane worktree must match the base commit with no untracked files
+    // and no earlier-attempt residue when dispatch inspects it; the frozen
+    // brief package lives in its gitignored `.lane/` directory and is an
+    // active brief file for the dispatch that reads it.
+    laneHead = initGitRepo(laneRepoDir, ['.lane/', 'docs/demo-summary.md']);
     // The brief worktree ignores the frozen-brief targets and the expected
     // artifact path, which prepare-brief-package proves before placement.
     initGitRepo(briefRepoDir, ['.lane/', 'docs/demo-summary.md']);
@@ -460,7 +462,7 @@ describe('Fleet CLI workflow', () => {
           },
         ],
         attemptId: ATTEMPT_ID,
-        worktreePath: briefRepoDir,
+        worktreePath: laneRepoDir,
         handWrittenBriefPath: briefFilePath,
       }),
     ]);
@@ -481,7 +483,7 @@ describe('Fleet CLI workflow', () => {
       { knowledgeEntryId: entryId, version: '1.0.0' },
     ]);
     briefDigest = prepared.prepared.briefDigest;
-    expect(prepared.prepared.prosePath).toBe(path.join(briefRepoDir, '.lane', 'brief.md'));
+    expect(prepared.prepared.prosePath).toBe(path.join(laneRepoDir, '.lane', 'brief.md'));
 
     // --- work-execution: reserve capacity and dispatch ----------------------
     const reserve = await cli([
@@ -1297,6 +1299,65 @@ describe('Fleet CLI workflow', () => {
     expect(withFlag.stderr).toContain("'--ownerDecisionReferences' is forbidden");
   });
 
+  it('refuses a record-verification whose assessmentId does not match the attempt', async () => {
+    // The assessment id is derived from the attempt; a mismatching override
+    // is a usage error at the boundary, never a silently accepted filing.
+    const mismatch = await cli([
+      'evidence',
+      'record-verification',
+      '--json',
+      jsonArg({
+        attemptId: 'attempt-1',
+        assessmentId: 'assessment-other',
+        receipt: {
+          id: 'vr-1',
+          assessmentId: 'assessment-other',
+          projectId: 'proj',
+          attemptId: 'attempt-1',
+          candidateHeadSha: laneHead,
+          hostId: 'host-1',
+          procedureName: 'gate',
+          result: 'pass',
+          exitCode: 0,
+          evidenceRef: 'ev-1',
+          policyRevision: POLICY_REVISION,
+          completedAtIso: '2026-10-24T08:00:00.000Z',
+        },
+      }),
+    ]);
+    expect(mismatch.code).toBe(2);
+    expect(mismatch.stderr).toContain('does not match attempt');
+  });
+
+  it('derives the assessment id from the receipt attempt when the top-level attemptId is omitted', async () => {
+    // Without a top-level attemptId the receipt names the attempt; a bare
+    // legacy id must not be written to by leaving the top-level field out.
+    const bare = await cli([
+      'evidence',
+      'record-verification',
+      '--json',
+      jsonArg({
+        assessmentId: 'attempt-1',
+        receipt: {
+          id: 'vr-2',
+          assessmentId: 'attempt-1',
+          projectId: 'proj',
+          attemptId: 'attempt-1',
+          candidateHeadSha: laneHead,
+          hostId: 'host-1',
+          procedureName: 'gate',
+          result: 'pass',
+          exitCode: 0,
+          evidenceRef: 'ev-2',
+          policyRevision: POLICY_REVISION,
+          completedAtIso: '2026-10-24T08:00:00.000Z',
+        },
+      }),
+    ]);
+    expect(bare.code).toBe(2);
+    expect(bare.stderr).toContain('does not match attempt attempt-1');
+  });
+
   it('completes the merge across separate runCli processes on one state dir', async () => {
     // Cutover pilot: every invocation below passes a brand-new FleetCliRuntime
     // composed solely from `multiProcStateDir` on disk. Receipts and
@@ -1310,7 +1371,7 @@ describe('Fleet CLI workflow', () => {
     const mpWorkOrderId = 'wo-mp-1';
     const mpAttemptId = 'attempt-mp-1';
     mkdirSync(multiProcStateDir);
-    const mpLaneHead = initGitRepo(multiProcLaneRepo, []);
+    const mpLaneHead = initGitRepo(multiProcLaneRepo, ['.lane/', 'docs/demo-summary.md']);
     initGitRepo(multiProcBriefRepo, ['.lane/', 'docs/demo-summary.md']);
     writeFileSync(
       multiProcBriefFile,
@@ -1514,7 +1575,7 @@ describe('Fleet CLI workflow', () => {
           },
         ],
         attemptId: mpAttemptId,
-        worktreePath: multiProcBriefRepo,
+        worktreePath: multiProcLaneRepo,
         handWrittenBriefPath: multiProcBriefFile,
       }),
     ]);

@@ -32,8 +32,14 @@ describe('ProjectProfileRepositoryAdapter cross-process safe persistence', () =>
         filesystemScope: 'scoped-worktree',
         networkEgressRestricted: true,
       },
-      revision: 1,
+      revision: 0,
       updatedAtIso: '2026-10-15T10:00:00.000Z',
+      status: 'active',
+      defaultBranch: null,
+      clones: {},
+      gateProcedures: [],
+      defaultAllowedPathPrefixes: [],
+      lastProbe: null,
     };
 
     const profile2: ProjectProfileRecord = {
@@ -47,8 +53,14 @@ describe('ProjectProfileRepositoryAdapter cross-process safe persistence', () =>
         filesystemScope: 'scoped-worktree',
         networkEgressRestricted: false,
       },
-      revision: 1,
+      revision: 0,
       updatedAtIso: '2026-10-15T10:01:00.000Z',
+      status: 'active',
+      defaultBranch: null,
+      clones: {},
+      gateProcedures: [],
+      defaultAllowedPathPrefixes: [],
+      lastProbe: null,
     };
 
     await Promise.all([adapterA.saveProfile(profile1), adapterB.saveProfile(profile2)]);
@@ -81,8 +93,14 @@ describe('ProjectProfileRepositoryAdapter cross-process safe persistence', () =>
         filesystemScope: 'scoped-worktree',
         networkEgressRestricted: true,
       },
-      revision: 1,
+      revision: 0,
       updatedAtIso: '2026-10-15T10:00:00.000Z',
+      status: 'active',
+      defaultBranch: null,
+      clones: {},
+      gateProcedures: [],
+      defaultAllowedPathPrefixes: [],
+      lastProbe: null,
     };
 
     await expect(adapter.saveProfile(profile)).rejects.toThrow();

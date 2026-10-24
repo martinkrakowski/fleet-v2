@@ -43,6 +43,12 @@ function profileRecord(overrides: Partial<ProjectProfileRecord> = {}): ProjectPr
     runnerCapabilities: { 'openai/gpt-5': true, 'local/vllm': false, s3: 'configured-unknown' },
     revision: 2,
     updatedAtIso: '2026-10-15T09:00:00.000Z',
+    status: 'active',
+    defaultBranch: null,
+    clones: {},
+    gateProcedures: [],
+    defaultAllowedPathPrefixes: [],
+    lastProbe: null,
     ...overrides,
   };
 }
@@ -334,6 +340,100 @@ describe('ProjectProfile', () => {
     expect(profile.getDispatcherHost()).toBe('dispatcher-01');
     expect(profile.getPolicyRevision()).toBe('policy-7');
     expect(profile.getMaxConcurrentLanes()).toBe(3);
+  });
+
+  it('reads an old record without v2 fields with all six defaults', () => {
+    const oldRecord = {
+      projectId: 'project-atlas',
+      displayName: 'Atlas',
+      repository: 'atlas/repo',
+      designatedDispatcherHost: 'dispatcher-01',
+      policyRevision: 'policy-7',
+      maxConcurrentLanes: 3,
+      runnerCapabilities: { 'openai/gpt-5': true },
+      revision: 1,
+      updatedAtIso: '2026-10-15T09:00:00.000Z',
+    };
+    const profile = ProjectProfile.fromRecord(oldRecord);
+    expect(profile.getStatus()).toBe('active');
+    expect(profile.isActive()).toBe(true);
+    expect(profile.toRecord().defaultBranch).toBeNull();
+    expect(profile.getClones()).toEqual({});
+    expect(profile.getGateProcedures()).toEqual([]);
+    expect(profile.toRecord().defaultAllowedPathPrefixes).toEqual([]);
+    expect(profile.toRecord().lastProbe).toBeNull();
+  });
+
+  it('refuses invalid v2 fields with the exact validation messages', () => {
+    expect(() =>
+      ProjectProfile.fromRecord(profileRecord({ status: 'paused' as never })),
+    ).toThrow('ProjectProfile requires status active or retired');
+    expect(() =>
+      ProjectProfile.fromRecord(profileRecord({ defaultBranch: '  ' })),
+    ).toThrow('ProjectProfile requires defaultBranch to be null or a non-empty branch name');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({
+          clones: [] as unknown as Readonly<Record<string, { path: string; worktreeRoot: string }>>,
+        }),
+      ),
+    ).toThrow('ProjectProfile requires a clones map');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({ clones: { '': { path: '/work', worktreeRoot: '/wt' } } }),
+      ),
+    ).toThrow('ProjectProfile clone host name is invalid: ');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({ clones: { hostApiKey: { path: '/work', worktreeRoot: '/wt' } } }),
+      ),
+    ).toThrow('ProjectProfile clone host name is invalid: hostApiKey');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({ clones: { host1: { path: '/work/../x', worktreeRoot: '/wt' } } }),
+      ),
+    ).toThrow('ProjectProfile clone host1 requires absolute paths without ..');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({ clones: { host1: { path: '/work', worktreeRoot: '/work/wt' } } }),
+      ),
+    ).toThrow('ProjectProfile clone host1 worktreeRoot must be outside the clone');
+    expect(() =>
+      ProjectProfile.fromRecord(profileRecord({ gateProcedures: ['verify', 'verify'] })),
+    ).toThrow('ProjectProfile requires gateProcedures to be unique non-empty names');
+    expect(() =>
+      ProjectProfile.fromRecord(profileRecord({ defaultAllowedPathPrefixes: ['/absolute'] })),
+    ).toThrow('ProjectProfile requires defaultAllowedPathPrefixes to be relative paths without ..');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({
+          lastProbe: {
+            probedAtIso: '2026-10-15T09:00:00.000Z',
+            probedFrom: 'host-1',
+            checks: [{ name: '', host: null, result: 'pass', detail: '' }],
+          },
+        }),
+      ),
+    ).toThrow('ProjectProfile requires lastProbe to be null or a probe receipt');
+  });
+
+  it('deep-copies clones and the probe receipt on toRecord', () => {
+    const profile = ProjectProfile.fromRecord(
+      profileRecord({
+        clones: { host1: { path: '/srv/clone', worktreeRoot: '/srv/wt' } },
+        lastProbe: {
+          probedAtIso: '2026-10-15T09:00:00.000Z',
+          probedFrom: 'host-1',
+          checks: [{ name: 'git-fetch', host: 'host-1', result: 'pass', detail: 'ok' }],
+        },
+      }),
+    );
+    const first = profile.toRecord();
+    Object.assign(first.clones, { host1: { path: '/hacked', worktreeRoot: '/hacked-wt' } });
+    Object.assign(first.lastProbe!.checks[0], { detail: 'mutated' });
+    const second = profile.toRecord();
+    expect(second.clones['host1']).toEqual({ path: '/srv/clone', worktreeRoot: '/srv/wt' });
+    expect(second.lastProbe!.checks[0].detail).toBe('ok');
   });
 });
 

@@ -948,6 +948,32 @@ describe('ExecutionRunnerAdapter', () => {
     expect(result).toEqual({ state: 'running', sessionId: 'ses_wt' });
   });
 
+  it('inspects a worktree as unknown when status exit 3 lists no session ids', async () => {
+    const { runner } = scriptedRunner([
+      { exitCode: 3, stdout: 'ocm-run: running in /tmp/fleet-test-worktree:', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.inspectWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: runnerWorktreePath,
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+    });
+    expect(result.state).toBe('unknown');
+  });
+
+  it('inspects a worktree as unknown when status exit 3 lists two session ids', async () => {
+    const { runner } = scriptedRunner([
+      { exitCode: 3, stdout: 'ocm-run: running in /tmp/fleet-test-worktree:\nses_a\nses_b', stderr: '' },
+    ]);
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const result = await adapter.inspectWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: runnerWorktreePath,
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+    });
+    expect(result.state).toBe('unknown');
+  });
+
   it('inspects a worktree as unknown on a guard failure (port mismatch)', async () => {
     const { runner, calls } = scriptedRunner([
       { exitCode: 0, stdout: 'nothing running', stderr: '' },

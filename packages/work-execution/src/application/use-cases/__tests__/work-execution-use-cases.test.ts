@@ -1981,8 +1981,9 @@ describe('DispatchAttemptUseCase', () => {
     expect(setup.journal.entries[1]?.observedSessionIds).toBeUndefined();
   });
 
-  it('refuses dispatch on an existing attempt in a claiming state without starting or journalling', async () => {
-    for (const state of ['dispatching', 'running', 'reconciling', 'blocked'] as const) {
+  it.each(['dispatching', 'running', 'reconciling', 'blocked'] as const)(
+    'refuses dispatch on an existing attempt in the $state claiming state without starting or journalling',
+    async (state) => {
       const setup = makeDispatchSetup();
       setup.attemptRepo.attempts.set('attempt-1', storedAttempt({ state }));
 
@@ -1996,8 +1997,8 @@ describe('DispatchAttemptUseCase', () => {
       });
       expect(setup.runner.startCalls).toHaveLength(0);
       expect(setup.journal.entries).toHaveLength(0);
-    }
-  });
+    },
+  );
 
   it('still dispatches an intent-recorded prepared attempt', async () => {
     const setup = makeDispatchSetup();
@@ -2407,8 +2408,9 @@ describe('ReconcileAttemptUseCase', () => {
     expect(missingReceipt.attemptRepo.attempts.get('attempt-1')?.state).toBe('reconciling');
   });
 
-  it('refuses to reconcile a terminal attempt without contacting the runner or saving', async () => {
-    for (const state of ['cancelled', 'collected', 'ended'] as const) {
+  it.each(['cancelled', 'collected', 'ended'] as const)(
+    'refuses to reconcile a terminal $state attempt without contacting the runner or saving',
+    async (state) => {
       const setup = makeReconcileSetup({ attempt: { state, sessionId: null }, withReservation: false });
 
       const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
@@ -2421,11 +2423,12 @@ describe('ReconcileAttemptUseCase', () => {
       expect(setup.runner.inspectWorktreeCalls).toHaveLength(0);
       expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe(state);
       expect(setup.journal.entries).toHaveLength(0);
-    }
-  });
+    },
+  );
 
-  it('releases a reservation still held by a terminal attempt, refuses, and saves nothing', async () => {
-    for (const state of ['cancelled', 'collected', 'ended'] as const) {
+  it.each(['cancelled', 'collected', 'ended'] as const)(
+    'releases a reservation still held by a terminal $state attempt, refuses, and saves nothing',
+    async (state) => {
       const setup = makeReconcileSetup({ attempt: { state, sessionId: null } });
       expect(setup.journal.heldFor('attempt-1')).toBe(true);
 
@@ -2447,8 +2450,8 @@ describe('ReconcileAttemptUseCase', () => {
         sessionId: null,
         detail: `Released a capacity reservation still held by terminal attempt (${state})`,
       });
-    }
-  });
+    },
+  );
 
   it('cancels a session-less blocked attempt and releases the reservation when the worktree is idle', async () => {
     const setup = makeReconcileSetup({
@@ -3523,8 +3526,9 @@ describe('PrepareFixAttemptUseCase', () => {
     expect(otherResult).toEqual({ outcome: 'refused', reason: 'Prior attempt not found for work order' });
   });
 
-  it('refuses a fix attempt while the prior attempt is still running', async () => {
-    for (const state of ['running', 'reconciling', 'dispatching', 'intent-recorded', 'blocked'] as const) {
+  it.each(['running', 'reconciling', 'dispatching', 'intent-recorded', 'blocked'] as const)(
+    'refuses a fix attempt while the prior attempt is still $state',
+    async (state) => {
       const setup = makeFixSetup({ prior: { state } });
       const result = await setup.useCase.prepareFixAttempt(
         validFixRequest() as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0],
@@ -3533,8 +3537,8 @@ describe('PrepareFixAttemptUseCase', () => {
         outcome: 'refused',
         reason: 'Cannot prepare fix attempt before prior attempt has ended',
       });
-    }
-  });
+    },
+  );
 
   it('refuses a fix attempt when the fix identity already exists', async () => {
     const setup = makeFixSetup({

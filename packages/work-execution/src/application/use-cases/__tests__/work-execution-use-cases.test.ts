@@ -35,11 +35,15 @@ import type {
 } from '../../ports/out/ExecutionJournalPort.out-port.js';
 import type { ExecutionObservationPort } from '../../ports/out/ExecutionObservationPort.out-port.js';
 import type {
+  AbortWorktreeRunRequest,
+  AbortWorktreeRunResult,
   ExecutionRunnerPort,
   RunnerIsolationCapabilities,
   RunnerSessionStatus,
   StartRunnerSessionResult,
   StopRunnerSessionResult,
+  WorktreeRunRef,
+  WorktreeRunState,
 } from '../../ports/out/ExecutionRunnerPort.out-port.js';
 import type { CollectCompletedAttemptArtifactsResult } from '../../ports/out/AttemptArtifactPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../../ports/out/WorkOrderRepositoryPort.out-port.js';
@@ -1238,6 +1242,9 @@ function makeRunner(
     startResult?: StartRunnerSessionResult;
     inspectStatus?: RunnerSessionStatus;
     stopResult?: StopRunnerSessionResult;
+    worktreeState?: WorktreeRunState;
+    abortResult?: AbortWorktreeRunResult;
+    withoutWorktreeMethods?: boolean;
     describeRunner?: () => AttemptRunnerRecord | undefined;
     onStart?: () => void;
   } = {},
@@ -1254,6 +1261,8 @@ function makeRunner(
   const startCalls: StartSessionCall[] = [];
   const inspectCalls: InspectSessionCall[] = [];
   const stopCalls: StopSessionCall[] = [];
+  const inspectWorktreeCalls: WorktreeRunRef[] = [];
+  const abortWorktreeCalls: AbortWorktreeRunRequest[] = [];
   const port: ExecutionRunnerPort = {
     describeCapabilities: () => capabilities,
     describeRunner:
@@ -1289,7 +1298,25 @@ function makeRunner(
       return options.stopResult ?? { outcome: 'still-running', reason: 'grace period elapsed' };
     },
   };
-  return { port, capabilities, startCalls, inspectCalls, stopCalls };
+  if (!options.withoutWorktreeMethods) {
+    port.inspectWorktreeRun = async (ref) => {
+      inspectWorktreeCalls.push(ref);
+      return options.worktreeState ?? { state: 'idle' };
+    };
+    port.abortWorktreeRun = async (request) => {
+      abortWorktreeCalls.push(request);
+      return options.abortResult ?? { outcome: 'aborted', endedAtIso: '2026-10-22T12:00:00.000Z' };
+    };
+  }
+  return {
+    port,
+    capabilities,
+    startCalls,
+    inspectCalls,
+    stopCalls,
+    inspectWorktreeCalls,
+    abortWorktreeCalls,
+  };
 }
 
 function makeWorkspace(
@@ -2125,6 +2152,8 @@ function makeReconcileSetup(
   options: {
     attempt?: Partial<AttemptRecord>;
     inspectStatus?: RunnerSessionStatus;
+    worktreeState?: WorktreeRunState;
+    withoutWorktreeMethods?: boolean;
     withReservation?: boolean;
   } = {},
 ) {
@@ -2134,7 +2163,11 @@ function makeReconcileSetup(
   if (options.withReservation ?? true) {
     journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
   }
-  const runner = makeRunner({ inspectStatus: options.inspectStatus });
+  const runner = makeRunner({
+    inspectStatus: options.inspectStatus,
+    worktreeState: options.worktreeState,
+    withoutWorktreeMethods: options.withoutWorktreeMethods,
+  });
   const useCase = new ReconcileAttemptUseCase({ attemptRepo, journal, runner: runner.port });
   return { attemptRepo, journal, runner, useCase };
 }
@@ -2292,6 +2325,124 @@ describe('ReconcileAttemptUseCase', () => {
     expect(missingResult.outcome).toBe('unknown');
     expect(missingReceipt.journal.heldFor('attempt-1')).toBe(true);
     expect(missingReceipt.attemptRepo.attempts.get('attempt-1')?.state).toBe('reconciling');
+  });
+
+  it('refuses to reconcile a terminal attempt without contacting the runner or saving', async () => {
+    for (const state of ['cancelled', 'collected', 'ended'] as const) {
+      const setup = makeReconcileSetup({ attempt: { state, sessionId: null } });
+
+      const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: `Attempt attempt-1 is in terminal state '${state}' and cannot be reconciled`,
+      });
+      expect(setup.runner.inspectCalls).toHaveLength(0);
+      expect(setup.runner.inspectWorktreeCalls).toHaveLength(0);
+      expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe(state);
+      expect(setup.journal.entries).toHaveLength(0);
+    }
+  });
+
+  it('cancels a session-less blocked attempt and releases the reservation when the worktree is idle', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'idle' },
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toMatchObject({
+      outcome: 'cancelled',
+      reason: "Nothing runs in the blocked attempt's worktree; cancelled and capacity released",
+    });
+    if (result.outcome !== 'cancelled') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('cancelled');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('cancelled');
+    expect(setup.journal.heldFor('attempt-1')).toBe(false);
+    expect(setup.journal.entries[0]).toMatchObject({
+      action: 'reconcile',
+      status: 'completed',
+      detail: "Nothing runs in the blocked attempt's worktree; cancelled and capacity released",
+    });
+    expect(setup.runner.inspectWorktreeCalls).toHaveLength(1);
+    expect(setup.runner.inspectCalls).toHaveLength(0);
+  });
+
+  it('adopts the running session in a session-less blocked attempt worktree', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_adopted_1' },
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('active');
+    if (result.outcome !== 'active') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('running');
+    expect(result.attempt.sessionId).toBe('ses_adopted_1');
+    expect(result.status).toEqual({
+      runnerReachable: 'reachable',
+      workspacePreparation: 'prepared',
+      workerCommand: 'active',
+      completionReceipt: null,
+      artifactsCollected: false,
+    });
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('running');
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries[0]).toMatchObject({
+      action: 'reconcile',
+      status: 'completed',
+      sessionId: 'ses_adopted_1',
+      detail: 'Blocked attempt adopted the session running in its worktree: ses_adopted_1',
+    });
+  });
+
+  it('keeps a session-less blocked attempt unchanged when the worktree state is unknown', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'unknown', reason: 'status lookup failed' },
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toMatchObject({ outcome: 'unknown', reason: 'status lookup failed' });
+    if (result.outcome !== 'unknown') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('blocked');
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries[0]).toMatchObject({
+      action: 'reconcile',
+      status: 'ambiguous',
+      detail: 'status lookup failed',
+    });
+  });
+
+  it('stays unknown for a session-less blocked attempt when the runner cannot inspect a worktree', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      withoutWorktreeMethods: true,
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toMatchObject({
+      outcome: 'unknown',
+      reason: 'Runner cannot inspect a worktree without a session',
+    });
+    if (result.outcome !== 'unknown') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('blocked');
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries).toHaveLength(0);
   });
 });
 

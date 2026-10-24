@@ -82,6 +82,20 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
     try {
       const nowIso = request.nowIso ?? new Date().toISOString();
 
+    // A terminal attempt is already resolved (minor 7): reconciling it could
+    // write it back into a claiming state. Refuse before any runner contact
+    // or state change. The retry path's own check below stays.
+    if (
+      attempt.state === 'cancelled' ||
+      attempt.state === 'collected' ||
+      attempt.state === 'ended'
+    ) {
+      return {
+        outcome: 'refused',
+        reason: `Attempt ${attempt.id} is in terminal state '${attempt.state}' and cannot be reconciled`,
+      };
+    }
+
     // Resolve the runner through the attempt's recorded host (H9b1). A
     // recorded host that changed or was removed refuses, naming the recorded
     // host, before any state change or runner contact.
@@ -94,6 +108,95 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
         return { outcome: 'refused', reason: selection.reason };
       }
       runner = selection.runner;
+    }
+
+    // A session-less blocked attempt keeps its reservation; the worktree may
+    // still be running a lane. Resolve it by directory, not by session id.
+    if (attempt.state === 'blocked' && !attempt.sessionId) {
+      if (!runner.inspectWorktreeRun) {
+        return {
+          outcome: 'unknown',
+          attempt,
+          reason: 'Runner cannot inspect a worktree without a session',
+        };
+      }
+      const worktreeState = await runner.inspectWorktreeRun({
+        attemptId: attempt.id,
+        worktreePath: attempt.worktreePath,
+        runner: attempt.runner,
+      });
+
+      if (worktreeState.state === 'idle') {
+        const cancelled: AttemptRecord = {
+          ...attempt,
+          revision: nextAttemptRevision(attempt),
+          state: 'cancelled',
+          updatedAtIso: nowIso,
+        };
+        await deps.attemptRepo.saveAttempt(cancelled);
+        await deps.journal.releaseCapacityReservation(attempt.id, nowIso);
+        await appendJournalEntry(deps.journal, {
+          attemptId: attempt.id,
+          workOrderId: attempt.workOrderId,
+          action: 'reconcile',
+          baseCommit: attempt.baseCommit,
+          recordedAtIso: nowIso,
+          status: 'completed',
+          sessionId: null,
+          detail: "Nothing runs in the blocked attempt's worktree; cancelled and capacity released",
+        });
+        return {
+          outcome: 'cancelled',
+          attempt: cancelled,
+          reason: "Nothing runs in the blocked attempt's worktree; cancelled and capacity released",
+        };
+      }
+
+      if (worktreeState.state === 'running') {
+        const running: AttemptRecord = {
+          ...attempt,
+          revision: nextAttemptRevision(attempt),
+          state: 'running',
+          sessionId: worktreeState.sessionId,
+          updatedAtIso: nowIso,
+        };
+        await deps.attemptRepo.saveAttempt(running);
+        await appendJournalEntry(deps.journal, {
+          attemptId: attempt.id,
+          workOrderId: attempt.workOrderId,
+          action: 'reconcile',
+          baseCommit: attempt.baseCommit,
+          recordedAtIso: nowIso,
+          status: 'completed',
+          sessionId: worktreeState.sessionId,
+          detail: `Blocked attempt adopted the session running in its worktree: ${worktreeState.sessionId}`,
+        });
+        return {
+          outcome: 'active',
+          attempt: running,
+          status: {
+            runnerReachable: 'reachable',
+            workspacePreparation: 'prepared',
+            workerCommand: 'active',
+            completionReceipt: null,
+            artifactsCollected: false,
+          },
+        };
+      }
+
+      // unknown: nothing is established, so nothing is written and the
+      // reservation stays held.
+      await appendJournalEntry(deps.journal, {
+        attemptId: attempt.id,
+        workOrderId: attempt.workOrderId,
+        action: 'reconcile',
+        baseCommit: attempt.baseCommit,
+        recordedAtIso: nowIso,
+        status: 'ambiguous',
+        sessionId: null,
+        detail: worktreeState.reason,
+      });
+      return { outcome: 'unknown', attempt, reason: worktreeState.reason };
     }
 
     if (!attempt.sessionId) {

@@ -2329,7 +2329,7 @@ describe('ReconcileAttemptUseCase', () => {
 
   it('refuses to reconcile a terminal attempt without contacting the runner or saving', async () => {
     for (const state of ['cancelled', 'collected', 'ended'] as const) {
-      const setup = makeReconcileSetup({ attempt: { state, sessionId: null } });
+      const setup = makeReconcileSetup({ attempt: { state, sessionId: null }, withReservation: false });
 
       const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
 
@@ -2341,6 +2341,32 @@ describe('ReconcileAttemptUseCase', () => {
       expect(setup.runner.inspectWorktreeCalls).toHaveLength(0);
       expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe(state);
       expect(setup.journal.entries).toHaveLength(0);
+    }
+  });
+
+  it('releases a reservation still held by a terminal attempt, refuses, and saves nothing', async () => {
+    for (const state of ['cancelled', 'collected', 'ended'] as const) {
+      const setup = makeReconcileSetup({ attempt: { state, sessionId: null } });
+      expect(setup.journal.heldFor('attempt-1')).toBe(true);
+
+      const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: `Attempt attempt-1 is in terminal state '${state}' and cannot be reconciled; a reservation it still held was released`,
+      });
+      expect(setup.runner.inspectCalls).toHaveLength(0);
+      expect(setup.runner.inspectWorktreeCalls).toHaveLength(0);
+      expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe(state);
+      expect(setup.journal.heldFor('attempt-1')).toBe(false);
+      expect(setup.journal.releaseCount).toBe(1);
+      expect(setup.journal.entries).toHaveLength(1);
+      expect(setup.journal.entries[0]).toMatchObject({
+        action: 'reconcile',
+        status: 'completed',
+        sessionId: null,
+        detail: `Released a capacity reservation still held by terminal attempt (${state})`,
+      });
     }
   });
 

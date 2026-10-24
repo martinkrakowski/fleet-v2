@@ -84,15 +84,34 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
 
     // A terminal attempt is already resolved (minor 7): reconciling it could
     // write it back into a claiming state. Refuse before any runner contact
-    // or state change. The retry path's own check below stays.
+    // or attempt change. A crash between saving a terminal record and
+    // releasing its capacity reservation (the blocked-idle path below, or the
+    // `ended` path) would otherwise leave the reservation held forever, so it
+    // is released here; the release is a no-op when nothing is held. The
+    // retry path's own check below stays.
     if (
       attempt.state === 'cancelled' ||
       attempt.state === 'collected' ||
       attempt.state === 'ended'
     ) {
+      const released = await deps.journal.releaseCapacityReservation(attempt.id, nowIso);
+      if (released) {
+        await appendJournalEntry(deps.journal, {
+          attemptId: attempt.id,
+          workOrderId: attempt.workOrderId,
+          action: 'reconcile',
+          baseCommit: attempt.baseCommit,
+          recordedAtIso: nowIso,
+          status: 'completed',
+          sessionId: attempt.sessionId ?? null,
+          detail: `Released a capacity reservation still held by terminal attempt (${attempt.state})`,
+        });
+      }
       return {
         outcome: 'refused',
-        reason: `Attempt ${attempt.id} is in terminal state '${attempt.state}' and cannot be reconciled`,
+        reason: `Attempt ${attempt.id} is in terminal state '${attempt.state}' and cannot be reconciled${
+          released ? '; a reservation it still held was released' : ''
+        }`,
       };
     }
 

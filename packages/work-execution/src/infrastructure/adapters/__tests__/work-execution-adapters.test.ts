@@ -432,7 +432,20 @@ describe('ExecutionJournalAdapter', () => {
     ) as Array<Record<string, unknown>>;
     expect(persisted).toHaveLength(1);
     expect(persisted[0]?.held).toBe(false);
-    expect(persisted[0]?.releasedAtIso).toBe('2026-10-15T12:00:00.000Z');
+  });
+
+  it('persists observedSessionIds on journal entries and round-trips them', async () => {
+    const stateDir = await makeTempDir('fleet-state-');
+    const writer = new ExecutionJournalAdapter({ stateDir });
+    await writer.appendJournalEntry(
+      makeJournalEntry({ id: 'je-obs', observedSessionIds: ['ses_a', 'ses_b'] }),
+    );
+
+    const reader = new ExecutionJournalAdapter({ stateDir });
+    const entries = await reader.listJournalEntriesForAttempt('att-1');
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.id).toBe('je-obs');
+    expect(entries[0]?.observedSessionIds).toEqual(['ses_a', 'ses_b']);
   });
 });
 

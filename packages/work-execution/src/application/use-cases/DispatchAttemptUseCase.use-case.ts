@@ -647,6 +647,23 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         runner: startResult.runner ?? dispatchingAttempt.runner ?? null,
         updatedAtIso: nowIso,
       };
+      // Record what ran at block time (brief-fix2 item 2a): session ids seen
+      // running in the worktree are evidence only, never proof of ownership.
+      // An unknown answer or a runner without inspectWorktreeRun omits the
+      // field; the ids stay out of the entry's detail.
+      let observedSessionIds: readonly string[] | undefined;
+      if (this.deps.runner.inspectWorktreeRun) {
+        const observed = await this.deps.runner.inspectWorktreeRun({
+          attemptId: request.attemptId,
+          worktreePath: request.worktreePath,
+          runner: blockedAttempt.runner,
+        });
+        if (observed.state === 'running') {
+          observedSessionIds = [observed.sessionId];
+        } else if (observed.state === 'idle') {
+          observedSessionIds = [];
+        }
+      }
       // Journal the ambiguous start first: the worktree may hold a live lane,
       // and the evidence must survive a conflicting save. Capacity is never
       // released.
@@ -659,6 +676,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         status: 'ambiguous',
         sessionId: null,
         detail: `Blocked: ${startResult.reason}; reservation kept until 'attempt reconcile' or 'attempt stop' resolves the worktree`,
+        ...(observedSessionIds !== undefined ? { observedSessionIds } : {}),
       });
       const blockedConflict = await this.saveAttemptOrConflict(blockedAttempt, true);
       if (blockedConflict) {

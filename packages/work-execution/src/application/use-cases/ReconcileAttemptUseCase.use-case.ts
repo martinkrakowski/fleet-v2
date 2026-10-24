@@ -181,11 +181,52 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
       }
 
       if (worktreeState.state === 'running') {
+        const observedId = worktreeState.sessionId;
+        // Adoption has an ownership check (brief-fix2 item 2b): the id is
+        // adopted only when this attempt's own history named it — a journal
+        // entry for this attempt with sessionId === id, or an ambiguous entry
+        // whose detail contains the id. An id that appears only in a blocked
+        // entry's observedSessionIds is evidence, never proof, and never
+        // names. The agy runner reports only that a lane runs and derives a
+        // synthetic id from the attempt id, so that id is never adoptable.
+        const syntheticAgyId = `agy-${attempt.id}`;
+        let refusalReason: string | undefined;
+        if (observedId === syntheticAgyId) {
+          refusalReason = `Worktree runs session ${observedId}, which attempt ${attempt.id} never started; run 'attempt stop' to abort it`;
+        } else {
+          const history = await deps.journal.listJournalEntriesForAttempt(attempt.id);
+          const namedByHistory =
+            history.some((entry) => entry.sessionId === observedId) ||
+            history.some(
+              (entry) =>
+                entry.status === 'ambiguous' &&
+                entry.detail !== null &&
+                entry.detail.includes(observedId),
+            );
+          if (!namedByHistory) {
+            refusalReason = `Worktree runs session ${observedId}, which attempt ${attempt.id} never started; run 'attempt stop' to abort it`;
+          }
+        }
+        if (refusalReason !== undefined) {
+          // Not adoptable: no save, the reservation stays held, and the
+          // operator is pointed at 'attempt stop'.
+          await appendJournalEntry(deps.journal, {
+            attemptId: attempt.id,
+            workOrderId: attempt.workOrderId,
+            action: 'reconcile',
+            baseCommit: attempt.baseCommit,
+            recordedAtIso: nowIso,
+            status: 'ambiguous',
+            sessionId: null,
+            detail: refusalReason,
+          });
+          return { outcome: 'unknown', attempt, reason: refusalReason };
+        }
         const running: AttemptRecord = {
           ...attempt,
           revision: nextAttemptRevision(attempt),
           state: 'running',
-          sessionId: worktreeState.sessionId,
+          sessionId: observedId,
           updatedAtIso: nowIso,
         };
         await deps.attemptRepo.saveAttempt(running);
@@ -196,8 +237,8 @@ export class ReconcileAttemptUseCase implements ReconcileAttemptPort {
           baseCommit: attempt.baseCommit,
           recordedAtIso: nowIso,
           status: 'completed',
-          sessionId: worktreeState.sessionId,
-          detail: `${stateLabel} attempt adopted the session running in its worktree: ${worktreeState.sessionId}`,
+          sessionId: observedId,
+          detail: `${stateLabel} attempt adopted the session running in its worktree: ${observedId}`,
         });
         return {
           outcome: 'active',

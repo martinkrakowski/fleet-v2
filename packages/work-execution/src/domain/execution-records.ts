@@ -212,4 +212,9 @@ export interface ActionJournalEntryRecord {
   readonly status: 'intent-recorded' | 'completed' | 'ambiguous' | 'refused';
   readonly sessionId: string | null;
   readonly detail: string | null;
+  /**
+   * Session ids seen running in the worktree when this entry was written;
+   * evidence only, never proof of ownership.
+   */
+  readonly observedSessionIds?: readonly string[];
 }

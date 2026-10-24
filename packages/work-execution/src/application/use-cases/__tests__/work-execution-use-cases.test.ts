@@ -1916,6 +1916,71 @@ describe('DispatchAttemptUseCase', () => {
     expect(callOrder.slice(-2)).toEqual(['journal.appendJournalEntry', 'attemptRepo.saveAttempt']);
   });
 
+  // brief-fix2 item 2a: the blocked dispatch entry records what ran at block
+  // time; the ids stay out of the entry's detail.
+  it('records observedSessionIds on the blocked dispatch entry and keeps them out of the detail', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        startResult: {
+          outcome: 'blocked',
+          reason: 'Worktree already has an active session (exit 75)',
+        },
+        worktreeState: { state: 'running', sessionId: 'ses_observed_1' },
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('blocked');
+    expect(setup.runner.inspectWorktreeCalls).toHaveLength(1);
+    expect(setup.journal.entries[1]).toMatchObject({
+      action: 'dispatch',
+      status: 'ambiguous',
+      observedSessionIds: ['ses_observed_1'],
+    });
+    expect(setup.journal.entries[1]?.detail ?? '').not.toContain('ses_observed_1');
+  });
+
+  it('omits observedSessionIds from the blocked dispatch entry when the worktree state is unknown', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        startResult: {
+          outcome: 'blocked',
+          reason: 'Worktree already has an active session (exit 75)',
+        },
+        worktreeState: { state: 'unknown', reason: 'status lookup failed' },
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('blocked');
+    expect(setup.journal.entries[1]?.observedSessionIds).toBeUndefined();
+  });
+
+  it('omits observedSessionIds from the blocked dispatch entry when the runner cannot inspect a worktree', async () => {
+    const setup = makeDispatchSetup({
+      runnerOptions: {
+        startResult: {
+          outcome: 'blocked',
+          reason: 'Worktree already has an active session (exit 75)',
+        },
+        withoutWorktreeMethods: true,
+      },
+    });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('blocked');
+    expect(setup.journal.entries[1]?.observedSessionIds).toBeUndefined();
+  });
+
   it('refuses dispatch on an existing attempt in a claiming state without starting or journalling', async () => {
     for (const state of ['dispatching', 'running', 'reconciling', 'blocked'] as const) {
       const setup = makeDispatchSetup();
@@ -2412,10 +2477,21 @@ describe('ReconcileAttemptUseCase', () => {
     expect(setup.runner.inspectCalls).toHaveLength(0);
   });
 
-  it('adopts the running session in a session-less blocked attempt worktree', async () => {
+  it('adopts the running session in a session-less blocked attempt worktree when the history names it', async () => {
     const setup = makeReconcileSetup({
       attempt: { state: 'blocked', sessionId: null },
       worktreeState: { state: 'running', sessionId: 'ses_adopted_1' },
+    });
+    setup.journal.entries.push({
+      id: 'je-dispatch-1',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'completed',
+      sessionId: 'ses_adopted_1',
+      detail: 'Session started: ses_adopted_1',
     });
 
     const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
@@ -2435,7 +2511,7 @@ describe('ReconcileAttemptUseCase', () => {
     });
     expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('running');
     expect(setup.journal.heldFor('attempt-1')).toBe(true);
-    expect(setup.journal.entries[0]).toMatchObject({
+    expect(setup.journal.entries[1]).toMatchObject({
       action: 'reconcile',
       status: 'completed',
       sessionId: 'ses_adopted_1',
@@ -2571,6 +2647,162 @@ describe('ReconcileAttemptUseCase', () => {
       });
     },
   );
+
+  // brief-fix2 item 2: adoption has an ownership check — the id is adopted
+  // only when the attempt's own history named it.
+  it('refuses to adopt a foreign session id the attempt never started, without saving', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_foreign_1' },
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    const reason =
+      "Worktree runs session ses_foreign_1, which attempt attempt-1 never started; run 'attempt stop' to abort it";
+    expect(result).toEqual({ outcome: 'unknown', attempt: expect.anything(), reason });
+    if (result.outcome !== 'unknown') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(result.attempt.sessionId).toBeNull();
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('blocked');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.sessionId).toBeNull();
+    expect(setup.journal.releaseCount).toBe(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries[0]).toMatchObject({
+      action: 'reconcile',
+      status: 'ambiguous',
+      detail: reason,
+    });
+  });
+
+  it('adopts a session id named by the attempt\u2019s own earlier completed dispatch entry', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_adopted_2' },
+    });
+    setup.journal.entries.push({
+      id: 'je-dispatch-2',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'completed',
+      sessionId: 'ses_adopted_2',
+      detail: 'Session started: ses_adopted_2',
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('active');
+    if (result.outcome !== 'active') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('running');
+    expect(result.attempt.sessionId).toBe('ses_adopted_2');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('running');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.sessionId).toBe('ses_adopted_2');
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+  });
+
+  it('refuses an id that appears only in a blocked entry\u2019s observedSessionIds', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_observed_only' },
+    });
+    // The blocked dispatch entry recorded the id as evidence; it named the
+    // session nowhere else (no sessionId on any entry, detail without the id).
+    setup.journal.entries.push({
+      id: 'je-blocked-1',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'ambiguous',
+      sessionId: null,
+      detail: "Blocked: Worktree already has an active session (exit 75); reservation kept until 'attempt reconcile' or 'attempt stop' resolves the worktree",
+      observedSessionIds: ['ses_observed_only'],
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome !== 'unknown') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(result.attempt.sessionId).toBeNull();
+    expect(setup.journal.releaseCount).toBe(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+    expect(setup.journal.entries[1]).toMatchObject({
+      action: 'reconcile',
+      status: 'ambiguous',
+      detail: "Worktree runs session ses_observed_only, which attempt attempt-1 never started; run 'attempt stop' to abort it",
+    });
+  });
+
+  it('refuses the agy synthetic session id even when the journal names it', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'agy-attempt-1' },
+    });
+    // agy-run --status reports only that a lane runs; the synthetic id is
+    // derived from the attempt id, so a history match proves nothing.
+    setup.journal.entries.push({
+      id: 'je-agy-1',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'completed',
+      sessionId: 'agy-attempt-1',
+      detail: null,
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome !== 'unknown') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('blocked');
+    expect(result.attempt.sessionId).toBeNull();
+    expect(setup.journal.releaseCount).toBe(0);
+    expect(setup.journal.heldFor('attempt-1')).toBe(true);
+  });
+
+  it('adopts a session id named only in an ambiguous detail', async () => {
+    const setup = makeReconcileSetup({
+      attempt: { state: 'blocked', sessionId: null },
+      worktreeState: { state: 'running', sessionId: 'ses_from_amb' },
+    });
+    // L5b's unknown start records the session in the ambiguous detail.
+    setup.journal.entries.push({
+      id: 'je-amb-1',
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'dispatch',
+      baseCommit: 'abc123',
+      recordedAtIso: '2026-10-15T08:01:00.000Z',
+      status: 'ambiguous',
+      sessionId: null,
+      detail: 'start was ambiguous: worktree runs ses_from_amb',
+    });
+
+    const result = await setup.useCase.reconcileAttempt({ attemptId: 'attempt-1' });
+
+    expect(result.outcome).toBe('active');
+    if (result.outcome !== 'active') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('running');
+    expect(result.attempt.sessionId).toBe('ses_from_amb');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.sessionId).toBe('ses_from_amb');
+  });
 });
 
 function makeStopSetup(

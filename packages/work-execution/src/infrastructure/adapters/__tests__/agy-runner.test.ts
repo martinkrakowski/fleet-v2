@@ -78,6 +78,16 @@ async function recordedArgv(lane: FakeLane): Promise<string[]> {
   return raw.split('\n').filter((line) => line !== '');
 }
 
+/** Whether the fake agy-run was invoked at all (its args log exists). */
+async function wasInvoked(lane: FakeLane): Promise<boolean> {
+  try {
+    await fs.access(path.join(lane.dir, 'args.log'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** The environment the fake was handed, as recorded (`NAME=value` per line). */
 async function recordedEnv(lane: FakeLane): Promise<Record<string, string>> {
   const raw = await fs.readFile(path.join(lane.dir, 'env.log'), 'utf8');
@@ -576,27 +586,133 @@ describe('AgyRunnerAdapter failed runs', () => {
     expect(result.outcome).toBe('refused');
   });
 
-  it('refuses a busy worktree (exit 75) as a refusal, not as a failure to start', async () => {
+  it('blocks a busy worktree (exit 75), keeping the reservation', async () => {
     const lane = await makeFakeLane();
     await fakeMode(lane, 'busy');
     const result = await makeAdapter(lane).startSession(makeStartRequest());
     expect(result).toEqual({
-      outcome: 'refused',
+      outcome: 'blocked',
+      runner: {
+        kind: 'agy',
+        remotePort: null,
+        host: null,
+        agent: null,
+        model: 'gemini-3.1-pro',
+        variant: null,
+      },
       reason: 'Worktree already has an active session (agy-run exit 75)',
     });
   });
 
-  it('treats an exceeded wall-clock budget (no exit code) as a failed run, never unknown', async () => {
+  it('blocks an exceeded wall-clock budget (no exit code), keeping the reservation', async () => {
     const lane = await makeFakeLane();
     await fakeMode(lane, 'hang');
     const result = await makeAdapter(lane).startSession(
       makeStartRequest({ timeLimitSeconds: 1 }),
     );
-    expect(result.outcome).toBe('refused');
-    if (result.outcome === 'refused') {
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.runner).toEqual({
+        kind: 'agy',
+        remotePort: null,
+        host: null,
+        agent: null,
+        model: 'gemini-3.1-pro',
+        variant: null,
+      });
       expect(result.reason).toContain('ended without an exit status');
       expect(result.reason).toContain('agy-run --status');
     }
+  });
+
+  it('inspects a blocked worktree as idle when agy-run --status exits 0', async () => {
+    const lane = await makeFakeLane();
+    const adapter = makeAdapter(lane);
+    const result = await adapter.inspectWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: '/lanes/att-1',
+      runner: agyRecord(),
+    });
+    expect(result).toEqual({ state: 'idle' });
+    expect(await recordedArgv(lane)).toEqual([lane.bin, '--status', '--dir', '/lanes/att-1']);
+  });
+
+  it('inspects a blocked worktree as running with the agy session convention on exit 3', async () => {
+    const lane = await makeFakeLane();
+    await fakeMode(lane, 'running');
+    const adapter = makeAdapter(lane);
+    const result = await adapter.inspectWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: '/lanes/att-1',
+      runner: agyRecord(),
+    });
+    expect(result).toEqual({ state: 'running', sessionId: 'agy-att-1' });
+  });
+
+  it('inspects a blocked worktree as unknown when agy-run --status exits non-zero', async () => {
+    const lane = await makeFakeLane();
+    await fakeMode(lane, 'missing');
+    const adapter = makeAdapter(lane);
+    const result = await adapter.inspectWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: '/lanes/att-1',
+      runner: agyRecord(),
+    });
+    expect(result.state).toBe('unknown');
+  });
+
+  it('inspects a ref that is not an agy lane as unknown without invoking agy-run', async () => {
+    const lane = await makeFakeLane();
+    const adapter = makeAdapter(lane);
+    const result = await adapter.inspectWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: '/lanes/att-1',
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+    });
+    expect(result.state).toBe('unknown');
+    expect(await wasInvoked(lane)).toBe(false);
+  });
+
+  it('aborts a blocked worktree run and reports aborted on exit 0', async () => {
+    const lane = await makeFakeLane();
+    const adapter = makeAdapter(lane);
+    const result = await adapter.abortWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: '/lanes/att-1',
+      runner: agyRecord(),
+      gracePeriodSeconds: 10,
+    });
+    expect(result.outcome).toBe('aborted');
+    if (result.outcome === 'aborted') {
+      expect(Number.isNaN(Date.parse(result.endedAtIso))).toBe(false);
+    }
+    expect(await recordedArgv(lane)).toEqual([lane.bin, '--abort', '--dir', '/lanes/att-1']);
+  });
+
+  it('aborts a blocked worktree run and reports still-running when abort exits non-zero', async () => {
+    const lane = await makeFakeLane();
+    await fakeMode(lane, 'abortfail');
+    const adapter = makeAdapter(lane);
+    const result = await adapter.abortWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: '/lanes/att-1',
+      runner: agyRecord(),
+      gracePeriodSeconds: 10,
+    });
+    expect(result.outcome).toBe('still-running');
+  });
+
+  it('aborts a ref that is not an agy lane as refused without invoking agy-run', async () => {
+    const lane = await makeFakeLane();
+    const adapter = makeAdapter(lane);
+    const result = await adapter.abortWorktreeRun({
+      attemptId: 'att-1',
+      worktreePath: '/lanes/att-1',
+      runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'glm-5', variant: null },
+      gracePeriodSeconds: 10,
+    });
+    expect(result.outcome).toBe('refused');
+    expect(await wasInvoked(lane)).toBe(false);
   });
 
   it('hands the request time limit to the executor as the lane budget', async () => {

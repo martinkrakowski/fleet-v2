@@ -18,7 +18,6 @@ import type {
   CommandRunOptions,
   CommandRunResult,
 } from '../../ports/out/CommandExecutorPort.out-port.js';
-import type { ExecutionJournalPort } from '../../ports/out/ExecutionJournalPort.out-port.js';
 import type { ExecutionRunnerPort } from '../../ports/out/ExecutionRunnerPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
@@ -208,10 +207,10 @@ describe('dispatch through the real adapters refuses uncontained brief paths', (
     const adapter = new AttemptArtifactAdapter({ executor });
 
     await expect(adapter.readBriefFile('/wt', '../x')).rejects.toThrow(
-      "Refused worktree path '../x': path must stay within the worktree (no .. segments)",
+      'Refused worktree-relative path ../x: worktree-relative path must not escape the worktree root',
     );
     await expect(adapter.readBriefFile('/wt', '/etc/passwd')).rejects.toThrow(
-      "Refused worktree path '/etc/passwd': path must be worktree-relative, not absolute",
+      'Refused worktree-relative path /etc/passwd: worktree-relative path must be relative',
     );
     expect(calls).toHaveLength(0);
   });

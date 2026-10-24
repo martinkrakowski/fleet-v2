@@ -748,10 +748,10 @@ describe('AttemptArtifactAdapter', () => {
     expect(missing).toBeNull();
 
     await expect(adapter.readBriefFile(repoPath, '../x')).rejects.toThrow(
-      "Refused worktree path '../x': path must stay within the worktree (no .. segments)",
+      'Refused worktree-relative path ../x: worktree-relative path must not escape the worktree root',
     );
     await expect(adapter.readBriefFile(repoPath, '/etc/passwd')).rejects.toThrow(
-      "Refused worktree path '/etc/passwd': path must be worktree-relative, not absolute",
+      'Refused worktree-relative path /etc/passwd: worktree-relative path must be relative',
     );
   });
 });

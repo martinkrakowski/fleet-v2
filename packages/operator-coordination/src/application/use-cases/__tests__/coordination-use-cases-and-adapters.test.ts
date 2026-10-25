@@ -672,12 +672,36 @@ describe('UpdateProjectProfileUseCase', () => {
     });
     expect(moved.outcome === 'updated' && moved.profile.lastProbe).toBeNull();
 
-    const recloned = await useCase.execute({
+    // A clones change must clear the probe on its own: start from a fresh
+    // profile that still carries a probe, so the repository leg above cannot
+    // have cleared it already.
+    const repo2 = new ProjectProfileRepositoryAdapter();
+    await repo2.saveProfile(profileRecord({ revision: 0, lastProbe: probe }));
+    const recloned = await new UpdateProjectProfileUseCase({ profileRepo: repo2 }).execute({
       projectId: 'project-atlas',
-      expectedRevision: 2,
+      expectedRevision: 0,
       changes: { clones: { host1: { path: '/srv/clone', worktreeRoot: '/srv/wt' } } },
     });
+    expect(recloned.outcome).toBe('updated');
     expect(recloned.outcome === 'updated' && recloned.profile.lastProbe).toBeNull();
+  });
+
+  it('refuses credential-shaped nested keys through the entity with nothing saved', async () => {
+    const repo = new StubProfileRepository({ 'project-atlas': profileRecord() });
+    const useCase = new UpdateProjectProfileUseCase({ profileRepo: repo });
+    const capability = await useCase.execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      changes: { runnerCapabilities: { apiToken: true } },
+    });
+    expect(capability.outcome).toBe('rejected');
+    const clone = await useCase.execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      changes: { clones: { access_key: { path: '/srv/clone', worktreeRoot: '/srv/wt' } } },
+    });
+    expect(clone.outcome).toBe('rejected');
+    expect(repo.saves).toHaveLength(0);
   });
 
   it('refuses an invalid clone path through the entity with nothing saved', async () => {

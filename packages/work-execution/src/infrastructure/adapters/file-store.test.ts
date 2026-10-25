@@ -183,7 +183,9 @@ describe('quarantineUnreadable', () => {
     expect(error.quarantinePath).not.toBeNull();
     expect(error.message).toContain(filePath);
     expect(error.message).toContain(error.quarantinePath!);
-    expect(error.message).toContain("run 'fleet-v2 state check'");
+    expect(error.message).toContain(
+      'restore it from that copy or repair it by hand; no command reads or writes this store until then',
+    );
 
     // The original file is untouched.
     expect(sha256Of(await fs.readFile(filePath))).toBe(sha256Of(bytes));
@@ -464,5 +466,65 @@ describe('quarantineUnreadable', () => {
     expect(error.quarantinePath).not.toBeNull();
     expect(error.quarantinePath!.endsWith('-dup1')).toBe(true);
     expect(sha256Of(await fs.readFile(error.quarantinePath!))).toBe(sha256Of(bytes));
+  });
+
+  it('writes one copy and names it in both errors when two failures have identical bytes', async () => {
+    const filePath = path.join(tempDir, 'attempts.json');
+    const bytes = Buffer.from('{ unchanged corrupt payload\n', 'utf8');
+    await fs.writeFile(filePath, bytes);
+
+    let error1: StateFileUnreadableError | null = null;
+    let error2: StateFileUnreadableError | null = null;
+    try {
+      await quarantineUnreadable(filePath, 'not valid JSON', bytes);
+    } catch (error) {
+      error1 = error as StateFileUnreadableError;
+    }
+    try {
+      await quarantineUnreadable(filePath, 'not valid JSON', bytes);
+    } catch (error) {
+      error2 = error as StateFileUnreadableError;
+    }
+
+    expect(error1).toBeInstanceOf(StateFileUnreadableError);
+    expect(error2).toBeInstanceOf(StateFileUnreadableError);
+    expect(error1!.quarantinePath).not.toBeNull();
+    expect(error2!.quarantinePath).toBe(error1!.quarantinePath);
+    expect(error1!.message).toContain(error1!.quarantinePath!);
+    expect(error2!.message).toContain(error1!.quarantinePath!);
+
+    const copies = await fs.readdir(path.join(tempDir, 'quarantine'));
+    expect(copies).toHaveLength(1);
+    expect(sha256Of(await fs.readFile(error1!.quarantinePath!))).toBe(sha256Of(bytes));
+  });
+
+  it('writes two copies when two failures have different bytes', async () => {
+    const filePath = path.join(tempDir, 'attempts.json');
+    const bytes1 = Buffer.from('{ corrupt payload first\n', 'utf8');
+    const bytes2 = Buffer.from('{ corrupt payload second\n', 'utf8');
+
+    let error1: StateFileUnreadableError | null = null;
+    let error2: StateFileUnreadableError | null = null;
+    try {
+      await quarantineUnreadable(filePath, 'not valid JSON', bytes1);
+    } catch (error) {
+      error1 = error as StateFileUnreadableError;
+    }
+    try {
+      await quarantineUnreadable(filePath, 'not valid JSON', bytes2);
+    } catch (error) {
+      error2 = error as StateFileUnreadableError;
+    }
+
+    expect(error1).toBeInstanceOf(StateFileUnreadableError);
+    expect(error2).toBeInstanceOf(StateFileUnreadableError);
+    expect(error1!.quarantinePath).not.toBeNull();
+    expect(error2!.quarantinePath).not.toBeNull();
+    expect(error1!.quarantinePath).not.toBe(error2!.quarantinePath);
+
+    const copies = await fs.readdir(path.join(tempDir, 'quarantine'));
+    expect(copies).toHaveLength(2);
+    expect(sha256Of(await fs.readFile(error1!.quarantinePath!))).toBe(sha256Of(bytes1));
+    expect(sha256Of(await fs.readFile(error2!.quarantinePath!))).toBe(sha256Of(bytes2));
   });
 });

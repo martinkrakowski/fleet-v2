@@ -211,4 +211,20 @@ describe('EvidenceAssessmentRepositoryAdapter quarantines unreadable state files
     const after = createHash('sha256').update(await fs.readFile(assessmentsPath())).digest('hex');
     expect(after).toBe(before);
   });
+
+  it('rejects saveAssessment with StateFileUnreadableError, keeps SHA-256 unchanged, and writes one quarantine copy when the file holds one valid and one invalid record', async () => {
+    await fs.writeFile(
+      assessmentsPath(),
+      JSON.stringify([makeAssessment(), { id: 'broken' }]),
+      'utf8',
+    );
+    const before = createHash('sha256').update(await fs.readFile(assessmentsPath())).digest('hex');
+    const adapter = new EvidenceAssessmentRepositoryAdapter({ stateDir: tempDir });
+    await expect(
+      adapter.saveAssessment({ ...makeAssessment(), id: 'assessment-2' }),
+    ).rejects.toBeInstanceOf(StateFileUnreadableError);
+    const after = createHash('sha256').update(await fs.readFile(assessmentsPath())).digest('hex');
+    expect(after).toBe(before);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
 });

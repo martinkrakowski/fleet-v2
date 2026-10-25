@@ -195,4 +195,20 @@ describe('WorkOrderRepositoryAdapter quarantines unreadable state files', () => 
     const after = createHash('sha256').update(await fs.readFile(workOrdersPath())).digest('hex');
     expect(after).toBe(before);
   });
+
+  it('rejects saveWorkOrder with StateFileUnreadableError, keeps SHA-256 unchanged, and writes one quarantine copy when the file holds one valid and one invalid record', async () => {
+    await fs.writeFile(
+      workOrdersPath(),
+      JSON.stringify([makeWorkOrder(), { id: 'broken' }]),
+      'utf8',
+    );
+    const before = createHash('sha256').update(await fs.readFile(workOrdersPath())).digest('hex');
+    const adapter = new WorkOrderRepositoryAdapter({ stateDir: tempDir });
+    await expect(
+      adapter.saveWorkOrder({ ...makeWorkOrder(), id: 'wo-2' }),
+    ).rejects.toBeInstanceOf(StateFileUnreadableError);
+    const after = createHash('sha256').update(await fs.readFile(workOrdersPath())).digest('hex');
+    expect(after).toBe(before);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
 });

@@ -610,4 +610,69 @@ describe('ExecutionJournalAdapter quarantines unreadable state files', () => {
     const after = createHash('sha256').update(await fs.readFile(reservationsPath())).digest('hex');
     expect(after).toBe(before);
   });
+
+  it('rejects appendJournalEntry with StateFileUnreadableError, keeps SHA-256 unchanged, and writes one quarantine copy when the journal holds one valid and one invalid record', async () => {
+    await fs.writeFile(journalPath(), JSON.stringify([journalEntry, { nope: true }]), 'utf8');
+    const before = createHash('sha256').update(await fs.readFile(journalPath())).digest('hex');
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await expect(
+      adapter.appendJournalEntry({ ...journalEntry, id: 'entry-q-2' }),
+    ).rejects.toBeInstanceOf(StateFileUnreadableError);
+    const after = createHash('sha256').update(await fs.readFile(journalPath())).digest('hex');
+    expect(after).toBe(before);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+
+  it('rejects saveCapacityReservation with StateFileUnreadableError, keeps SHA-256 unchanged, and writes one quarantine copy when reservations holds one valid and one invalid record', async () => {
+    await fs.writeFile(reservationsPath(), JSON.stringify([reservation, { bad: true }]), 'utf8');
+    const before = createHash('sha256').update(await fs.readFile(reservationsPath())).digest('hex');
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await expect(
+      adapter.saveCapacityReservation({
+        ...reservation,
+        id: 'res-q-2',
+        attemptId: 'att-2',
+        slotIndex: 1,
+      }),
+    ).rejects.toBeInstanceOf(StateFileUnreadableError);
+    const after = createHash('sha256').update(await fs.readFile(reservationsPath())).digest('hex');
+    expect(after).toBe(before);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+
+  it('rejects reserveCapacityAtomically with StateFileUnreadableError, keeps SHA-256 unchanged, and writes one quarantine copy when reservations holds one valid and one invalid record', async () => {
+    await fs.writeFile(reservationsPath(), JSON.stringify([reservation, { bad: true }]), 'utf8');
+    const before = createHash('sha256').update(await fs.readFile(reservationsPath())).digest('hex');
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await expect(
+      adapter.reserveCapacityAtomically({
+        attemptId: 'att-2',
+        maxSlots: 2,
+        record: {
+          id: 'res-q-2',
+          attemptId: 'att-2',
+          hostId: 'host-1',
+          seatTool: 'opencode',
+          held: true,
+          reservedAtIso: '2026-10-15T10:01:00.000Z',
+          releasedAtIso: null,
+        },
+      }),
+    ).rejects.toBeInstanceOf(StateFileUnreadableError);
+    const after = createHash('sha256').update(await fs.readFile(reservationsPath())).digest('hex');
+    expect(after).toBe(before);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+
+  it('rejects releaseCapacityReservation with StateFileUnreadableError, keeps SHA-256 unchanged, and writes one quarantine copy when reservations holds one valid and one invalid record', async () => {
+    await fs.writeFile(reservationsPath(), JSON.stringify([reservation, { bad: true }]), 'utf8');
+    const before = createHash('sha256').update(await fs.readFile(reservationsPath())).digest('hex');
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await expect(
+      adapter.releaseCapacityReservation('att-1', '2026-10-15T10:05:00.000Z'),
+    ).rejects.toBeInstanceOf(StateFileUnreadableError);
+    const after = createHash('sha256').update(await fs.readFile(reservationsPath())).digest('hex');
+    expect(after).toBe(before);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
 });

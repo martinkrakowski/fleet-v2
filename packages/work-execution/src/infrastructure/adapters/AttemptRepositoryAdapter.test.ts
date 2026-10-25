@@ -344,4 +344,20 @@ describe('AttemptRepositoryAdapter quarantines unreadable state files', () => {
     const after = createHash('sha256').update(await fs.readFile(attemptsPath())).digest('hex');
     expect(after).toBe(before);
   });
+
+  it('rejects saveAttempt with StateFileUnreadableError, keeps SHA-256 unchanged, and writes one quarantine copy when the file holds one valid and one invalid record', async () => {
+    await fs.writeFile(
+      attemptsPath(),
+      JSON.stringify([makeAttempt(), { id: 'broken', workOrderId: 42 }]),
+      'utf8',
+    );
+    const before = createHash('sha256').update(await fs.readFile(attemptsPath())).digest('hex');
+    const adapter = new AttemptRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.saveAttempt(makeAttempt({ id: 'att-2' }))).rejects.toBeInstanceOf(
+      StateFileUnreadableError,
+    );
+    const after = createHash('sha256').update(await fs.readFile(attemptsPath())).digest('hex');
+    expect(after).toBe(before);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
 });

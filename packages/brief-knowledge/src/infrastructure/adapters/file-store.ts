@@ -219,17 +219,17 @@ export class StateFileUnreadableError extends Error {
     ) {
       notes.push(`pruning old copies failed (${postWriteNotes.pruneFailures})`);
     }
-    const notesSuffix = notes.length > 0 ? `; ${notes.join('; ')}` : '';
-    const disposition =
-      quarantinePath !== null
-        ? `its bytes were kept at ${quarantinePath}${notesSuffix}`
-        : `its bytes could not be copied${
-            copyError instanceof Error && copyError.message !== ''
-              ? ` (${copyError.message})`
-              : ''
-          }`;
+    let disposition: string;
+    if (quarantinePath !== null) {
+      const notesSuffix = notes.length > 0 ? `; ${notes.join('; ')}` : '';
+      disposition = `its bytes were kept at ${quarantinePath}${notesSuffix}`;
+    } else if (copyError instanceof Error && copyError.message !== '') {
+      disposition = `its bytes could not be copied (${copyError.message})`;
+    } else {
+      disposition = 'its bytes could not be copied';
+    }
     super(
-      `State file ${filePath} is unreadable (${detail}); ${disposition}; run 'fleet-v2 state check'`,
+      `State file ${filePath} is unreadable (${detail}); ${disposition}; restore it from that copy or repair it by hand; no command reads or writes this store until then`,
     );
     this.name = 'StateFileUnreadableError';
     this.filePath = filePath;
@@ -330,6 +330,22 @@ export async function quarantineUnreadable(
   const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
   const basename = path.basename(filePath);
   const quarantineDir = path.join(path.dirname(filePath), 'quarantine');
+  const existingPattern = new RegExp(
+    `^${escapeRegExp(basename)}\\.\\d{8}T\\d{6}\\.\\d{3}Z-\\d+\\.${digest}(?:-dup\\d+)?$`,
+  );
+  try {
+    const entries = await fsImpl.readdir(quarantineDir);
+    const existing = entries.find((name) => existingPattern.test(name));
+    if (existing !== undefined) {
+      throw new StateFileUnreadableError(filePath, path.join(quarantineDir, existing), detail);
+    }
+  } catch (error: unknown) {
+    if (error instanceof StateFileUnreadableError) {
+      throw error;
+    }
+    // Directory may not exist yet; proceed to write a new copy.
+  }
+
   const baseName = `${basename}.${quarantineUtcStamp()}-${quarantineCounter++}.${digest}`;
 
   let quarantinePath: string | null = null;

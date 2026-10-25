@@ -5,7 +5,11 @@
  * missing or invalid installation, 2 usage).
  */
 
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, promises as fs, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as path from 'node:path';
+
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { FleetInstallationModel } from '@fleet/installation';
 import type { DoctorLine, DoctorProbes, HostProbeExecutor } from '@fleet/onboarding';
@@ -353,5 +357,69 @@ describe('fleet-v2 doctor --host', () => {
     });
     expect(code).toBe(1);
     expect(stderr.join('')).toContain('needs a schema version 2 installation with named hosts');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// doctor state line (lane E1b): one extra line for the JSON state stores when a
+// state directory is selected; never without one.
+// ---------------------------------------------------------------------------
+
+const createdDirs: string[] = [];
+
+afterAll(() => {
+  for (const directory of createdDirs) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function makeTempDir(): string {
+  const directory = mkdtempSync(path.join(tmpdir(), 'fleet-doctor-state-'));
+  createdDirs.push(directory);
+  return directory;
+}
+
+describe('doctor state line', () => {
+  beforeEach(() => {
+    vi.stubEnv('FLEET_STATE_DIR', '');
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('adds a PASS state line as the last stdout line for a clean directory', async () => {
+    const dir = makeTempDir();
+    const { io, stdout } = captureIo();
+    const code = await runCli(['--state-dir', dir, 'doctor', '--probe-seats'], io, undefined, {
+      loadResult: LOAD_RESULT,
+      probes: passingProbes(),
+    });
+    expect(code).toBe(0);
+    const last = stdout[stdout.length - 1];
+    expect(last.startsWith(`PASS state ${dir} state-files `)).toBe(true);
+  });
+
+  it('adds a FAIL state line naming the bad store and exits 1', async () => {
+    const dir = makeTempDir();
+    await fs.writeFile(path.join(dir, 'journal.json'), '{ nope');
+    const { io, stdout } = captureIo();
+    const code = await runCli(['--state-dir', dir, 'doctor', '--probe-seats'], io, undefined, {
+      loadResult: LOAD_RESULT,
+      probes: passingProbes(),
+    });
+    expect(code).toBe(1);
+    const last = stdout[stdout.length - 1];
+    expect(last).toBe(`FAIL state ${dir} state-files — unreadable: journal.json; run fleet-v2 state check\n`);
+  });
+
+  it('omits the state line without a state directory', async () => {
+    const { io, stdout } = captureIo();
+    const code = await runCli(['doctor', '--probe-seats'], io, undefined, {
+      loadResult: LOAD_RESULT,
+      probes: passingProbes(),
+    });
+    expect(code).toBe(0);
+    expect(stdout.some((text) => text.includes(' state-files '))).toBe(false);
   });
 });

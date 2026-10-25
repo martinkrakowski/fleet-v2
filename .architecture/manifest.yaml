@@ -644,14 +644,20 @@ bounded_contexts:
         entities: [ProjectProfile, CoordinationRequest, AuthorizationConsumption, RelayAcknowledgement, OwnerQuestion]
         value_objects: [CoordinationKind, CoordinationState, ActionAuthorization, PolicyReference, ObservationEnvelope]
       application:
-        use_cases: [RegisterProjectProfileUseCase, InspectConfiguredCapabilitiesUseCase, RequestScopedDecisionUseCase, ResolveActionAuthorizationUseCase, CheckOwnerDecisionUseCase, RecordAuthorizationConsumptionUseCase, PublishProjectObservationUseCase, ReadProjectAttentionUseCase, SendFleetRelayUseCase, RecordRelayAcknowledgementUseCase, InspectOutstandingCoordinationUseCase, AskOwnerQuestionUseCase, AnswerOwnerQuestionUseCase, ExpireOwnerQuestionsUseCase, AcknowledgeOwnerAnswerUseCase, ListOwnerQuestionsUseCase, ReadOwnerQuestionUseCase, SyncOneWayOwnerQuestionsUseCase]
+        use_cases: [RegisterProjectProfileUseCase, UpdateProjectProfileUseCase, RetireProjectProfileUseCase, ListProjectProfilesUseCase, InspectProjectProfileUseCase, RecordProjectProbeUseCase, InspectConfiguredCapabilitiesUseCase, RequestScopedDecisionUseCase, ResolveActionAuthorizationUseCase, CheckOwnerDecisionUseCase, RecordAuthorizationConsumptionUseCase, PublishProjectObservationUseCase, ReadProjectAttentionUseCase, SendFleetRelayUseCase, RecordRelayAcknowledgementUseCase, InspectOutstandingCoordinationUseCase, AskOwnerQuestionUseCase, AnswerOwnerQuestionUseCase, ExpireOwnerQuestionsUseCase, AcknowledgeOwnerAnswerUseCase, ListOwnerQuestionsUseCase, ReadOwnerQuestionUseCase, SyncOneWayOwnerQuestionsUseCase]
         ports:
-          in: [RegisterProjectProfilePort, InspectConfiguredCapabilitiesPort, RequestScopedDecisionPort, ResolveActionAuthorizationPort, CheckOwnerDecisionPort, RecordAuthorizationConsumptionPort, PublishProjectObservationPort, ReadProjectAttentionPort, SendFleetRelayPort, RecordRelayAcknowledgementPort, InspectOutstandingCoordinationPort, AskOwnerQuestionPort, AnswerOwnerQuestionPort, ExpireOwnerQuestionsPort, AcknowledgeOwnerAnswerPort, ListOwnerQuestionsPort, ReadOwnerQuestionPort, SyncOneWayOwnerQuestionsPort]
-          out: [ProjectProfileRepositoryPort, CoordinationRequestRepositoryPort, OwnerQuestionRepositoryPort, DecisionTransportPort, ObservationPublicationPort, AttentionReadPort, RelayTransportPort]
+          in: [RegisterProjectProfilePort, UpdateProjectProfilePort, RetireProjectProfilePort, ListProjectProfilesPort, InspectProjectProfilePort, RecordProjectProbePort, InspectConfiguredCapabilitiesPort, RequestScopedDecisionPort, ResolveActionAuthorizationPort, CheckOwnerDecisionPort, RecordAuthorizationConsumptionPort, PublishProjectObservationPort, ReadProjectAttentionPort, SendFleetRelayPort, RecordRelayAcknowledgementPort, InspectOutstandingCoordinationPort, AskOwnerQuestionPort, AnswerOwnerQuestionPort, ExpireOwnerQuestionsPort, AcknowledgeOwnerAnswerPort, ListOwnerQuestionsPort, ReadOwnerQuestionPort, SyncOneWayOwnerQuestionsPort]
+          out: [ProjectProfileRepositoryPort, InstallationReferencePort, CoordinationRequestRepositoryPort, OwnerQuestionRepositoryPort, DecisionTransportPort, ObservationPublicationPort, AttentionReadPort, RelayTransportPort]
       infrastructure:
-        adapters: [ProjectProfileRepositoryAdapter, CoordinationRequestRepositoryAdapter, OwnerQuestionRepositoryAdapter, DecisionTransportAdapter, ObservationPublicationAdapter, AttentionReadAdapter, RelayTransportAdapter]
+        adapters: [ProjectProfileRepositoryAdapter, InstallationReferenceAdapter, CoordinationRequestRepositoryAdapter, OwnerQuestionRepositoryAdapter, DecisionTransportAdapter, ObservationPublicationAdapter, AttentionReadAdapter, RelayTransportAdapter]
     contracts:
       RegisterProjectProfilePort: "Validate installation references, designated dispatcher, runner capabilities and approved policy without persisting credential values."
+      UpdateProjectProfilePort: "Change an active profile only when the caller names the revision it read; host, clone and gate procedure names are checked against the installation; a change of repository or clones clears the last probe."
+      RetireProjectProfilePort: "Mark a profile retired when the caller names the revision it read; history is kept and new work orders for it are refused elsewhere."
+      ListProjectProfilesPort: "Return every profile, optionally only active or only retired, sorted by project id, without mutating state."
+      InspectProjectProfilePort: "Return one profile with its revision, or a known absence, without mutating state."
+      RecordProjectProbePort: "Store a probe receipt as the profiles last probe only when the profile is still at the revision the probe started from.
+      InstallationReferencePort: Report the installations host names and verification procedure names so profile writes can refuse names the installation does not have; unknown when no installation is loaded."
       InspectConfiguredCapabilitiesPort: "Report the configured runner and integration capabilities, missing requirements and explicit unknowns."
       RequestScopedDecisionPort: "Record the exact proposal, expected revision and action scope before asking its authorized decider."
       ResolveActionAuthorizationPort: "Return an applicable grant from approved policy or a verified scoped decision; pending or ambiguous authority remains blocked."
@@ -678,6 +684,7 @@ bounded_contexts:
       RelayTransportPort: "Deliver notices or write a local outbox and return transport receipts without inferring acceptance."
     adapter_bindings:
       - { adapter: ProjectProfileRepositoryAdapter, implements: ProjectProfileRepositoryPort, integration: private-installation-config-and-local-store }
+      - { adapter: InstallationReferenceAdapter, implements: InstallationReferencePort, integration: names-from-the-loaded-installation }
       - { adapter: CoordinationRequestRepositoryAdapter, implements: CoordinationRequestRepositoryPort, integration: local-transactional-store }
       - { adapter: OwnerQuestionRepositoryAdapter, implements: OwnerQuestionRepositoryPort, integration: local-json-store }
       - { adapter: DecisionTransportAdapter, implements: DecisionTransportPort, integration: existing-waves-decision-client-or-owner-recorded-file }

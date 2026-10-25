@@ -17,6 +17,6 @@ export interface ChangeSignal {
   readonly written: { readonly mtimeMs: number; readonly size: number; readonly ino: number } | null;
 }
 export interface ChangeSignalPort {
-  /** Synchronous and must not throw into the caller; callers still guard it. */
+  /** Must be synchronous: a returned Promise is neither awaited nor caught. Must not throw into the caller; callers still guard it. */
   emit(signal: ChangeSignal): void;
 }

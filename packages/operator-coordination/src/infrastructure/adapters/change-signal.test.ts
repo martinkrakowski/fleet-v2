@@ -1,4 +1,4 @@
-import { promises as fs } from 'node:fs';
+import { existsSync, promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -8,13 +8,21 @@ import type { ProjectProfileRecord } from '../../domain/coordination-records.js'
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
 import { OwnerQuestionRepositoryAdapter } from './OwnerQuestionRepositoryAdapter.adapter.js';
 import { ProjectProfileRepositoryAdapter } from './ProjectProfileRepositoryAdapter.adapter.js';
-import { StateFileUnreadableError } from './file-store.js';
+import { StateFileUnreadableError, writeJsonAtomically } from './file-store.js';
 
 class RecordingChangeSignalPort implements ChangeSignalPort {
   readonly signals: ChangeSignal[] = [];
+  readonly lockHeldAtEmit: (boolean | null)[] = [];
+
+  private readonly lockPath?: string;
+
+  constructor(lockPath?: string) {
+    this.lockPath = lockPath;
+  }
 
   emit(signal: ChangeSignal): void {
     this.signals.push(signal);
+    this.lockHeldAtEmit.push(this.lockPath === undefined ? null : existsSync(this.lockPath));
   }
 
   clear(): void {
@@ -88,9 +96,9 @@ describe('change signals: OwnerQuestionRepositoryAdapter', () => {
   });
 
   it('save emits one question signal per successful save with kind, id, stateFile and written.size; before null then previous written ino', async () => {
-    const signals = new RecordingChangeSignalPort();
-    const adapter = new OwnerQuestionRepositoryAdapter({ stateDir: tempDir, changeSignal: signals });
     const target = path.resolve(path.join(tempDir, 'owner-questions.json'));
+    const signals = new RecordingChangeSignalPort(`${target}.lock`);
+    const adapter = new OwnerQuestionRepositoryAdapter({ stateDir: tempDir, changeSignal: signals });
 
     await adapter.save(makeOwnerQuestion(), 0);
     expect(signals.signals).toHaveLength(1);
@@ -109,6 +117,31 @@ describe('change signals: OwnerQuestionRepositoryAdapter', () => {
     expect(second.stateFile).toBe(target);
     expect(second.before).not.toBeNull();
     expect(second.before!.ino).toBe(first.written!.ino);
+    expect(signals.lockHeldAtEmit.every((held) => held === false)).toBe(true);
+  });
+
+  it('save reads before inside the lock and emits after releasing it, even when it waited on a foreign lock', async () => {
+    const target = path.join(tempDir, 'owner-questions.json');
+    const lockPath = `${target}.lock`;
+    const signals = new RecordingChangeSignalPort(lockPath);
+    const adapter = new OwnerQuestionRepositoryAdapter({ stateDir: tempDir, changeSignal: signals });
+    await adapter.save(makeOwnerQuestion(), 0);
+    const first = signals.signals[0]!;
+
+    await fs.writeFile(lockPath, 'held-by-test', 'utf8');
+    const pending = adapter.save({ ...makeOwnerQuestion(), revision: 2 }, 1);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    await writeJsonAtomically(target, JSON.parse(await fs.readFile(target, 'utf8')));
+    const swapped = await fs.stat(target);
+    expect(swapped.ino).not.toBe(first.written!.ino);
+
+    await fs.unlink(lockPath);
+    await pending;
+
+    const second = signals.signals[1]!;
+    expect(second.before?.ino).toBe(swapped.ino);
+    expect(signals.lockHeldAtEmit.every((held) => held === false)).toBe(true);
   });
 
   it('save emits nothing when the save throws on an unreadable file', async () => {
@@ -196,5 +229,35 @@ describe('change signals: ProjectProfileRepositoryAdapter', () => {
     const adapter = new ProjectProfileRepositoryAdapter({ stateDir: tempDir, changeSignal: signals });
     await expect(adapter.saveProfile(makeProfile())).rejects.toThrow(StateFileUnreadableError);
     expect(signals.signals).toHaveLength(0);
+  });
+});
+
+describe('a throwing emitter never fails a save', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-change-signal-throwing-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it.each([
+    {
+      name: 'saveProfile',
+      lockPath: 'project-profiles.json.lock',
+      run: async (stateDir: string): Promise<void> => {
+        const adapter = new ProjectProfileRepositoryAdapter({
+          stateDir,
+          changeSignal: new ThrowingChangeSignalPort(),
+        });
+        await expect(adapter.saveProfile(makeProfile())).resolves.toBeUndefined();
+        expect(adapter.signalEmitFailures).toBe(1);
+      },
+    },
+  ])('$name', async ({ lockPath, run }) => {
+    await run(tempDir);
+    expect(existsSync(path.join(tempDir, lockPath))).toBe(false);
   });
 });

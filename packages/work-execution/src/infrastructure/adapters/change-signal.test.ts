@@ -1,4 +1,4 @@
-import { promises as fs } from 'node:fs';
+import { existsSync, promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -12,13 +12,21 @@ import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out
 import { AttemptRepositoryAdapter } from './AttemptRepositoryAdapter.adapter.js';
 import { WorkOrderRepositoryAdapter } from './WorkOrderRepositoryAdapter.adapter.js';
 import { ExecutionJournalAdapter } from './ExecutionJournalAdapter.adapter.js';
-import { StateFileUnreadableError } from './file-store.js';
+import { StateFileUnreadableError, writeJsonAtomically } from './file-store.js';
 
 class RecordingChangeSignalPort implements ChangeSignalPort {
   readonly signals: ChangeSignal[] = [];
+  readonly lockHeldAtEmit: (boolean | null)[] = [];
+
+  private readonly lockPath?: string;
+
+  constructor(lockPath?: string) {
+    this.lockPath = lockPath;
+  }
 
   emit(signal: ChangeSignal): void {
     this.signals.push(signal);
+    this.lockHeldAtEmit.push(this.lockPath === undefined ? null : existsSync(this.lockPath));
   }
 
   clear(): void {
@@ -99,9 +107,9 @@ describe('change signals: AttemptRepositoryAdapter', () => {
   });
 
   it('saveAttempt emits one signal per successful save with kind, id, stateFile and written.size; before null then previous written ino', async () => {
-    const signals = new RecordingChangeSignalPort();
-    const adapter = new AttemptRepositoryAdapter({ stateDir: tempDir, changeSignal: signals });
     const target = path.resolve(path.join(tempDir, 'attempts.json'));
+    const signals = new RecordingChangeSignalPort(`${target}.lock`);
+    const adapter = new AttemptRepositoryAdapter({ stateDir: tempDir, changeSignal: signals });
 
     await adapter.saveAttempt(makeAttempt({ id: 'att-a' }));
     expect(signals.signals).toHaveLength(1);
@@ -120,6 +128,31 @@ describe('change signals: AttemptRepositoryAdapter', () => {
     expect(second.stateFile).toBe(target);
     expect(second.before).not.toBeNull();
     expect(second.before!.ino).toBe(first.written!.ino);
+    expect(signals.lockHeldAtEmit.every((held) => held === false)).toBe(true);
+  });
+
+  it('saveAttempt reads before inside the lock and emits after releasing it, even when it waited on a foreign lock', async () => {
+    const target = path.join(tempDir, 'attempts.json');
+    const lockPath = `${target}.lock`;
+    const signals = new RecordingChangeSignalPort(lockPath);
+    const adapter = new AttemptRepositoryAdapter({ stateDir: tempDir, changeSignal: signals });
+    await adapter.saveAttempt(makeAttempt());
+    const first = signals.signals[0]!;
+
+    await fs.writeFile(lockPath, 'held-by-test', 'utf8');
+    const pending = adapter.saveAttempt(makeAttempt({ revision: 1 }));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    await writeJsonAtomically(target, JSON.parse(await fs.readFile(target, 'utf8')));
+    const swapped = await fs.stat(target);
+    expect(swapped.ino).not.toBe(first.written!.ino);
+
+    await fs.unlink(lockPath);
+    await pending;
+
+    const second = signals.signals[1]!;
+    expect(second.before?.ino).toBe(swapped.ino);
+    expect(signals.lockHeldAtEmit.every((held) => held === false)).toBe(true);
   });
 
   it('saveAttempt emits nothing when the save throws on an unreadable file', async () => {
@@ -412,5 +445,84 @@ describe('change signals: ExecutionJournalAdapter releaseCapacityReservation', (
     const released = await adapter.releaseCapacityReservation('att-none', '2026-10-15T11:00:00.000Z');
     expect(released).toBe(false);
     expect(signals.signals).toHaveLength(0);
+  });
+});
+
+describe('a throwing emitter never fails a save', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-change-signal-throwing-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it.each([
+    {
+      name: 'saveWorkOrder',
+      lockPath: 'work-orders.json.lock',
+      run: async (stateDir: string): Promise<void> => {
+        const adapter = new WorkOrderRepositoryAdapter({
+          stateDir,
+          changeSignal: new ThrowingChangeSignalPort(),
+        });
+        await expect(adapter.saveWorkOrder(makeWorkOrder())).resolves.toBeUndefined();
+        expect(adapter.signalEmitFailures).toBe(1);
+      },
+    },
+    {
+      name: 'saveCapacityReservation',
+      lockPath: 'reservations.json.lock',
+      run: async (stateDir: string): Promise<void> => {
+        const adapter = new ExecutionJournalAdapter({
+          stateDir,
+          changeSignal: new ThrowingChangeSignalPort(),
+        });
+        await expect(adapter.saveCapacityReservation(makeReservation())).resolves.toBeUndefined();
+        expect(adapter.signalEmitFailures).toBe(1);
+      },
+    },
+    {
+      name: 'reserveCapacityAtomically',
+      lockPath: 'reservations.json.lock',
+      run: async (stateDir: string): Promise<void> => {
+        const adapter = new ExecutionJournalAdapter({
+          stateDir,
+          changeSignal: new ThrowingChangeSignalPort(),
+        });
+        const result = await adapter.reserveCapacityAtomically({
+          attemptId: 'att-a',
+          maxSlots: 5,
+          record: makeReservation({ id: 'res-a', attemptId: 'att-a' }),
+        });
+        expect(result.outcome).toBe('reserved');
+        expect(adapter.signalEmitFailures).toBe(1);
+      },
+    },
+    {
+      name: 'releaseCapacityReservation',
+      lockPath: 'reservations.json.lock',
+      run: async (stateDir: string): Promise<void> => {
+        const adapter = new ExecutionJournalAdapter({
+          stateDir,
+          changeSignal: new ThrowingChangeSignalPort(),
+        });
+        const reserveResult = await adapter.reserveCapacityAtomically({
+          attemptId: 'att-a',
+          maxSlots: 1,
+          record: makeReservation({ id: 'res-a', attemptId: 'att-a' }),
+        });
+        expect(reserveResult.outcome).toBe('reserved');
+        await expect(
+          adapter.releaseCapacityReservation('att-a', '2026-10-15T11:00:00.000Z'),
+        ).resolves.toBe(true);
+        expect(adapter.signalEmitFailures).toBe(2);
+      },
+    },
+  ])('$name', async ({ lockPath, run }) => {
+    await run(tempDir);
+    expect(existsSync(path.join(tempDir, lockPath))).toBe(false);
   });
 });

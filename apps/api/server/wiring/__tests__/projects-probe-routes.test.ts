@@ -27,12 +27,20 @@ import {
 } from "vitest";
 
 import { RegisterWorkOrderUseCase } from "@fleet/work-execution/use-cases";
-import { WorkOrderRepositoryAdapter } from "@fleet/work-execution";
+import {
+  WorkOrderRepositoryAdapter,
+  type ProbeProjectRequest,
+  type ProbeProjectResult,
+} from "@fleet/work-execution";
 
 import securityMiddleware from "../../middleware/security.js";
 import { setActiveApiToken } from "../token.js";
 import { createConfiguredOperatorComposition } from "../operator/composition";
 import { configureFleetApiRuntime } from "../runtime.js";
+import {
+  configureWorkComposition,
+  createConfiguredWorkComposition,
+} from "../work/composition";
 
 const VALID_TOKEN = "a".repeat(32);
 
@@ -268,5 +276,66 @@ describe("project probe and unregistered routes", () => {
     const listed = await call("GET", "/v1/projects/unregistered");
     expect(listed.status).toBe(501);
     expect(listed.body.code).toBe("NOT_IMPLEMENTED");
+  });
+
+  it("refuses a concurrent probe of the same project while one is held open", async () => {
+    const composition = createConfiguredWorkComposition({ stateDir: tempDir });
+    let startProbe!: () => void;
+    let finishProbe!: (result: ProbeProjectResult) => void;
+    const started = new Promise<void>((resolve) => {
+      startProbe = resolve;
+    });
+    const heldOpen = new Promise<ProbeProjectResult>((resolve) => {
+      finishProbe = resolve;
+    });
+
+    const probedReport = {
+      probedAtIso: "2026-10-25T00:00:00.000Z",
+      probedFrom: "orchestrator" as const,
+      checks: [
+        { name: "host-reachable", host: null, result: "pass" as const, detail: "ok" },
+      ],
+      defaultBranch: "main",
+      detectedScripts: [],
+    };
+
+    vi.spyOn(composition.probeProject, "execute").mockImplementation(
+      async (input) => {
+        const request = input as ProbeProjectRequest;
+        if (request.projectId === "proj-held") {
+          startProbe();
+          return heldOpen;
+        }
+        return {
+          outcome: "probed",
+          projectId: request.projectId,
+          report: probedReport,
+          recorded: true,
+        };
+      },
+    );
+    configureWorkComposition(composition);
+
+    const firstPending = call("POST", "/v1/projects/proj-held/probe");
+    await started;
+
+    const second = await call("POST", "/v1/projects/proj-held/probe");
+    expect(second.status).toBe(409);
+    expect(second.body.code).toBe("BUSY");
+    expect(second.body.result!.reason).toBe("a probe of proj-held is already running");
+
+    const other = await call("POST", "/v1/projects/proj-other/probe");
+    expect(other.status).toBe(200);
+    expect(other.body.code).toBe("OK");
+
+    finishProbe({
+      outcome: "probed",
+      projectId: "proj-held",
+      report: probedReport,
+      recorded: true,
+    });
+    const first = await firstPending;
+    expect(first.status).toBe(200);
+    expect(first.body.code).toBe("OK");
   });
 });

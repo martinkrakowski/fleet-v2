@@ -356,7 +356,7 @@ function hasDotDotSegment(value: string): boolean {
   return value.split('/').includes('..');
 }
 
-const BRANCH_NAME_PATTERN = /^[A-Za-z0-9._\/-]{1,200}$/;
+const BRANCH_NAME_PATTERN = /^[A-Za-z0-9._/-]{1,200}$/;
 
 function isValidBranchName(value: unknown): value is string {
   return (

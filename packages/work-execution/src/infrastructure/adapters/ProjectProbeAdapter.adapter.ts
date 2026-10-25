@@ -259,7 +259,9 @@ export class ProjectProbeAdapter implements ProjectProbePort {
     defaultBranch: string | null;
     refused?: boolean;
   }> {
-    if (repository === "" || repository.startsWith("-") || repository.includes("::")) {
+    // Remote-helper syntax is `<transport>::<address>` at the start; a `::`
+    // inside a bracketed IPv6 host (ssh://[::1]/p) is an address, not a helper.
+    if (repository === "" || repository.startsWith("-") || /^[A-Za-z0-9+.-]*::/.test(repository)) {
       return {
         check: this.check("repository-answers", null, "fail", "repository is not a plain URL or path"),
         defaultBranch: null,

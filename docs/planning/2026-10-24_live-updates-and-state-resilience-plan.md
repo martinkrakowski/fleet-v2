@@ -58,21 +58,30 @@ thread stream does, so the bearer token stays in a header and never in a URL. Ea
 **signal**, not a record:
 
 ```json
-{ "seq": 1842, "kind": "attempt", "id": "att_…", "at": "2026-10-24T13:02:11Z" }
+{ "stream": "s_01J…", "seq": 1842, "kind": "attempt", "id": "att_…", "at": "2026-10-24T13:02:11Z" }
 ```
 
 Kinds: `attempt`, `capacity`, `work-order`, `question`, `profile`. The client's only response to a
 signal is to re-read the matching route (`GET /v1/attempts`, `GET /v1/questions`, …). A signal
 never carries state, so a client cannot act on a stale payload.
 
-- **No history.** The server keeps a small in-memory ring for the current process. A client that
-  reconnects with `after=<seq>` from an older process, or that fell behind the ring, receives one
-  line `{ "kind": "resync" }` and re-reads everything. Losing signals costs a re-read, never a
-  wrong answer.
+- **No history, and a cursor that names its stream.** The server keeps a small in-memory ring for
+  the current process. Each process start mints a random `stream` id. A client reconnects with
+  `after=<stream>:<seq>`. If the stream id is not the current one (the API restarted, so `seq`
+  restarted too), or `seq` has fallen out of the ring, the server's first line is
+  `{ "kind": "resync" }`. A cursor from an older process therefore can never suppress new signals.
+  Losing signals costs a re-read, never a wrong answer.
+- **Delivery failures become a resync.** Emitting a signal never fails a save. If an emit fails,
+  the server marks every open connection as needing a resync, and sends a control `resync` line
+  that bypasses the bounded queue (or closes the connection, which makes the client reconnect and
+  resync). A client is never left with neither a signal nor a resync.
 - **Source of signals.** The repository adapters already funnel every write through
   `saveAttempt`, `saveCapacityReservation`, `saveProfile`, `saveQuestion`. A `ChangeSignalPort`
   is called after each successful save. A write made by another process (the CLI against the same
   state directory) is caught by a cheap `mtime` watch on the state files, which emits `resync`.
+  **The API's own writes are not echoed:** after each local save, the adapter records the file's
+  new `mtime` and size, and the watch ignores a change that matches the last local write. Only a
+  change nobody in this process made becomes a `resync`.
 - **Polling stays** as the fallback. The Lanes page keeps its 30 s refresh when the stream is
   unavailable or the token lacks the `read` scope.
 
@@ -80,9 +89,10 @@ never carries state, so a client cannot act on a stale payload.
 
 A `OwnerNotificationPort` in operator-coordination, with one local adapter (D1). It is triggered
 by three moments: an attempt reaches `ended` or `blocked`, an owner question is asked, acceptance
-records a blocker. The text is fixed and names only ids and kinds, for example "Attempt att_… ended:
+records a blocker. Rate limiting is keyed by **(trigger, id)**, so an attempt that blocks and
+later ends still produces both notifications. The text is fixed and names only ids and kinds, for example "Attempt att_… ended:
 collect is available". It never includes lane output, brief text or a path, since lane output may
-be untrusted or carry a secret. Notifications are rate-limited per id and can be switched off in
+be untrusted or carry a secret. Notifications can be switched off in
 the installation (`policy.notifications`, default on for a single-machine profile, off otherwise).
 
 ### 3.3 `attempt explain`
@@ -92,7 +102,15 @@ A read-only use case in work-execution returning ordered lines, each with its so
 `capacity` (reservation held or released, host and slot), `gate` (each acceptance predicate: met,
 unmet, unknown, and the receipt that decides it), `next` (the commands that are legal now and
 those refused, with the reason). A line whose source could not be read says `unknown` and why,
-never a guess. Exposed as `fleet-v2 attempt explain <id>` and `GET /v1/attempts/:id/explain`.
+never a guess.
+
+**Consistency contract.** The sources are read separately, so they can disagree. Each line carries
+the revision or timestamp it was read at: the attempt record's `revision`, the reservation's
+journal position, the receipts' head SHA, and the runner answer's time. `explain` reads the attempt
+record first and again last. If the revision changed in between, the whole answer is `unknown`
+with the reason "the attempt changed while it was being explained; run it again". `next` is
+derived only from lines that agree with the final record revision; a gate line whose receipt
+belongs to a different head than the record says `unknown`, never `met`. Exposed as `fleet-v2 attempt explain <id>` and `GET /v1/attempts/:id/explain`.
 
 ### 3.4 State-file resilience
 

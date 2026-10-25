@@ -9,6 +9,7 @@ export * from "./AttemptOwnerDecisionPort.out-port.js";
 export * from "./AttemptRepositoryPort.out-port.js";
 export * from "./BriefAuthoringPort.out-port.js";
 export * from "./BriefKnowledgePort.out-port.js";
+export * from "./ChangeSignalPort.out-port.js";
 export * from "./CommandExecutorPort.out-port.js";
 export * from "./ExecutionJournalPort.out-port.js";
 export * from "./ExecutionObservationPort.out-port.js";

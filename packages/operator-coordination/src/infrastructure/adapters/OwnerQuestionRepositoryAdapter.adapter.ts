@@ -12,7 +12,8 @@
  * typed OwnerQuestionRevisionConflictError rather than a silent overwrite.
  */
 
-import { join } from 'node:path';
+import { promises as fs } from 'node:fs';
+import { join, resolve } from 'node:path';
 
 import type { OwnerQuestionRecord } from '../../domain/owner-question-records.js';
 import { OwnerQuestion } from '../../domain/entities/OwnerQuestion.js';
@@ -21,6 +22,8 @@ import type {
   OwnerQuestionListQuery,
   OwnerQuestionRepositoryPort,
 } from '../../application/ports/out/OwnerQuestionRepositoryPort.out-port.js';
+import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
+import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
 import { readRecordList } from './record-list-store.js';
 
@@ -28,6 +31,8 @@ export interface OwnerQuestionRepositoryAdapterOptions {
   /** When set, questions are persisted here and reloaded on first use. */
   readonly stateDir?: string;
   readonly fileName?: string;
+  /** Emitter for post-save change signals; defaults to a no-op adapter. */
+  readonly changeSignal?: ChangeSignalPort;
 }
 
 const DEFAULT_FILE_NAME = 'owner-questions.json';
@@ -76,8 +81,24 @@ function copy(record: OwnerQuestionRecord): OwnerQuestionRecord {
 
 export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPort {
   private readonly inMemoryQuestions = new Map<string, OwnerQuestionRecord>();
+  private readonly changeSignal: ChangeSignalPort;
+  private signalEmitFailuresCount = 0;
 
-  constructor(private readonly options: OwnerQuestionRepositoryAdapterOptions = {}) {}
+  constructor(private readonly options: OwnerQuestionRepositoryAdapterOptions = {}) {
+    this.changeSignal = options.changeSignal ?? new NoopChangeSignalAdapter();
+  }
+
+  get signalEmitFailures(): number {
+    return this.signalEmitFailuresCount;
+  }
+
+  private signal(sig: ChangeSignal): void {
+    try {
+      this.changeSignal.emit(sig);
+    } catch {
+      this.signalEmitFailuresCount += 1;
+    }
+  }
 
   async save(record: OwnerQuestionRecord, expectedRevision: number): Promise<void> {
     const target = this.statePath;
@@ -91,10 +112,20 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
       }
       assertRevisionArithmetic(validated.revision, expectedRevision);
       this.inMemoryQuestions.set(validated.questionId, validated);
+      this.signal({ kind: 'question', id: validated.questionId, stateFile: null, before: null, written: null });
       return;
     }
 
+    let before: ChangeSignal['before'] = null;
+    let written: ChangeSignal['written'] = null;
+
     await withFileLock(`${target}.lock`, async () => {
+      try {
+        const stat = await fs.stat(target);
+        before = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+      } catch {
+        before = null;
+      }
       const records = await this.readRecordsFromDisk(target);
       const existing = records.get(validated.questionId);
       const storedRevision = existing === undefined ? 0 : existing.revision;
@@ -107,6 +138,20 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
         .sort((left, right) => left.questionId.localeCompare(right.questionId))
         .map(copy);
       await writeJsonAtomically(target, list);
+      try {
+        const stat = await fs.stat(target);
+        written = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+      } catch {
+        written = null;
+      }
+    });
+
+    this.signal({
+      kind: 'question',
+      id: validated.questionId,
+      stateFile: resolve(target),
+      before,
+      written,
     });
   }
 

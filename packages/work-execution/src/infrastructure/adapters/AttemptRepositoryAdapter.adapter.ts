@@ -15,11 +15,15 @@ import {
   AttemptRevisionConflictError,
   type AttemptRepositoryPort,
 } from '../../application/ports/out/AttemptRepositoryPort.out-port.js';
+import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
+import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
 import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface AttemptRepositoryAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
   readonly stateDir?: string;
+  /** Emitter for post-save change signals; defaults to a no-op adapter. */
+  readonly changeSignal?: ChangeSignalPort;
 }
 
 /** Identity established at dispatch time; lifecycle fields may change, these may not. */
@@ -76,8 +80,24 @@ function normalizeRecord(record: AttemptRecord): AttemptRecord {
 
 export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
   private readonly inMemoryRecords = new Map<string, AttemptRecord>();
+  private readonly changeSignal: ChangeSignalPort;
+  private signalEmitFailuresCount = 0;
 
-  constructor(private readonly options?: AttemptRepositoryAdapterOptions) {}
+  constructor(private readonly options?: AttemptRepositoryAdapterOptions) {
+    this.changeSignal = options?.changeSignal ?? new NoopChangeSignalAdapter();
+  }
+
+  get signalEmitFailures(): number {
+    return this.signalEmitFailuresCount;
+  }
+
+  private signal(sig: ChangeSignal): void {
+    try {
+      this.changeSignal.emit(sig);
+    } catch {
+      this.signalEmitFailuresCount += 1;
+    }
+  }
 
   async saveAttempt(record: AttemptRecord): Promise<void> {
     const stateDir = this.options?.stateDir;
@@ -108,13 +128,23 @@ export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
         guardExisting(existing);
       }
       this.inMemoryRecords.set(record.id, normalizeRecord(record));
+      this.signal({ kind: 'attempt', id: record.id, stateFile: null, before: null, written: null });
       return;
     }
 
     const target = path.join(stateDir, 'attempts.json');
     const lockPath = path.join(stateDir, 'attempts.json.lock');
 
+    let before: ChangeSignal['before'] = null;
+    let written: ChangeSignal['written'] = null;
+
     await withFileLock(lockPath, async () => {
+      try {
+        const stat = await fs.stat(target);
+        before = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+      } catch {
+        before = null;
+      }
       const records = await this.readRecordsFromDisk(target);
       const existing = records.get(record.id);
       if (existing !== undefined) {
@@ -122,6 +152,20 @@ export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
       }
       records.set(record.id, normalizeRecord(record));
       await writeJsonAtomically(target, [...records.values()]);
+      try {
+        const stat = await fs.stat(target);
+        written = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+      } catch {
+        written = null;
+      }
+    });
+
+    this.signal({
+      kind: 'attempt',
+      id: record.id,
+      stateFile: path.resolve(target),
+      before,
+      written,
     });
   }
 

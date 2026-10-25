@@ -887,7 +887,7 @@ describe('readQuarantineCopy', () => {
     expect(result.status).toBe('read');
     if (result.status === 'read') {
       expect(result.name).toBe(validName);
-      expect(result.path).toBe(path.join(quarantineDir, validName));
+      expect(result.path).toBe(path.join(await fs.realpath(quarantineDir), validName));
       expect(Buffer.from(result.bytes).equals(validBytes)).toBe(true);
     }
   });

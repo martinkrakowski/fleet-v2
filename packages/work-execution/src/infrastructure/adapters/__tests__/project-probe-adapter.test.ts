@@ -10,7 +10,7 @@ import type {
   CommandRunResult,
 } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { ExecutorForRecordedHostResult } from '../ExecutorForHost.helper.js';
-import { ProjectProbeAdapter } from '../ProjectProbeAdapter.adapter.js';
+import { ProjectProbeAdapter, redactUserinfo } from '../ProjectProbeAdapter.adapter.js';
 
 type RunCall = { argv: readonly string[]; options?: CommandRunOptions };
 
@@ -31,6 +31,8 @@ const EXPECTED_GIT_HARDENING = [
   'protocol.git.allow=always',
   '-c',
   'protocol.file.allow=always',
+  '-c',
+  'protocol.version=2',
 ];
 
 /**
@@ -85,26 +87,30 @@ const SYMREF_STDOUT =
   'ref: refs/heads/main\tHEAD\n' +
   '0123456789abcdef0123456789abcdef01234567\tHEAD\n';
 
-/** Canned responses for a fully passing host clone. */
-const PASSING_HOST_CANNED: Readonly<Record<string, Partial<CommandRunResult>>> = {
-  'rev-parse --is-inside-work-tree': { exitCode: 0, stdout: 'true\n' },
-  'remote get-url origin': { exitCode: 0, stdout: `${REPO}.git\n` },
-  'test -d': { exitCode: 0 },
-  'check-ignore -q .lane/probe.md': { exitCode: 0 },
-  'ls-files --error-unmatch AGENTS.md': { exitCode: 0 },
-  'cat-file blob HEAD:package.json': {
-    exitCode: 0,
-    stdout: JSON.stringify({
-      scripts: {
-        build: 'tsc',
-        'x; rm -rf': 'echo bad',
-        lint: 'eslint',
-        zzz: 'z',
-        '01-start': 'node start',
-      },
-    }),
-  },
-};
+/** Canned responses for a fully passing host clone at `path`. */
+function passingHostCanned(
+  path = '/lanes/a',
+): Readonly<Record<string, Partial<CommandRunResult>>> {
+  return {
+    'rev-parse --show-toplevel': { exitCode: 0, stdout: `${path}\n` },
+    'remote get-url origin': { exitCode: 0, stdout: `${REPO}.git\n` },
+    'test -d': { exitCode: 0 },
+    'check-ignore -q .lane/probe.md': { exitCode: 0 },
+    'ls-files --error-unmatch AGENTS.md': { exitCode: 0 },
+    'cat-file blob HEAD:package.json': {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        scripts: {
+          build: 'tsc',
+          'x; rm -rf': 'echo bad',
+          lint: 'eslint',
+          zzz: 'z',
+          '01-start': 'node start',
+        },
+      }),
+    },
+  };
+}
 
 function makeAdapter(
   orchestrator: CommandExecutorPort,
@@ -122,8 +128,8 @@ describe('ProjectProbeAdapter', () => {
     const orch = fakeExecutor({
       'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
     });
-    const hostA = fakeExecutor(PASSING_HOST_CANNED);
-    const hostB = fakeExecutor(PASSING_HOST_CANNED);
+    const hostA = fakeExecutor(passingHostCanned('/lanes/a'));
+    const hostB = fakeExecutor(passingHostCanned('/lanes/b'));
     const adapter = makeAdapter(orch.executor, {
       a: { executor: hostA.executor },
       b: { executor: hostB.executor },
@@ -157,7 +163,8 @@ describe('ProjectProbeAdapter', () => {
     expect(report.detectedScripts).toEqual(['01-start', 'build', 'lint', 'zzz']);
     expect(orch.calls).toHaveLength(1);
     expect(orch.calls[0].options?.cwd).toBe('/');
-    expect(hostA.calls.map((call) => call.argv)).toContainEqual([
+    const catFileCall = hostA.calls.find((call) => call.argv.includes('cat-file'))!;
+    expect(catFileCall.argv).toEqual([
       'git',
       ...EXPECTED_GIT_HARDENING,
       '-C',
@@ -166,10 +173,35 @@ describe('ProjectProbeAdapter', () => {
       'blob',
       'HEAD:package.json',
     ]);
+    expect(catFileCall.options?.maxBufferBytes).toBe(1048576);
+  });
+
+  it('passes flag-shaped clone paths as the operand of -C in every host command', async () => {
+    const orch = fakeExecutor({
+      'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
+    });
+    const hostA = fakeExecutor(passingHostCanned('--git-dir=/x'));
+    const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
+
+    const report = await adapter.probe({
+      repository: REPO,
+      clones: { a: { path: '--git-dir=/x', worktreeRoot: '-x' } },
+    });
+
+    for (const check of report.checks) expect(check.result).toBe('pass');
+    expect(hostA.calls.map((call) => call.argv)).toEqual([
+      ['git', ...EXPECTED_GIT_HARDENING, '-C', '--git-dir=/x', 'rev-parse', '--show-toplevel'],
+      ['git', ...EXPECTED_GIT_HARDENING, '-C', '--git-dir=/x', 'remote', 'get-url', 'origin'],
+      ['test', '-d', '-x'],
+      ['git', ...EXPECTED_GIT_HARDENING, '-C', '--git-dir=/x', 'check-ignore', '-q', '.lane/probe.md'],
+      ['git', ...EXPECTED_GIT_HARDENING, '-C', '--git-dir=/x', 'ls-files', '--error-unmatch', 'AGENTS.md'],
+      ['git', ...EXPECTED_GIT_HARDENING, '-C', '--git-dir=/x', 'cat-file', 'blob', 'HEAD:package.json'],
+    ]);
   });
 
   it.each([
     ['-oProxyCommand=x'],
+    [' -oProxyCommand=x'],
     ['ext::sh -c x'],
     [''],
   ])('refuses a non-plain repository %j without running anything', async (repository: string) => {
@@ -187,27 +219,58 @@ describe('ProjectProbeAdapter', () => {
     expect(orch.calls).toEqual([]);
   });
 
-  it('refuses a repository URL carrying a password in its userinfo without running anything', async () => {
-    const orch = fakeExecutor();
-    const hostA = fakeExecutor();
-    const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
+  it.each([
+    ['https://user:pw@host/r.git', 'pw'],
+    ['https://ghp_abc@github.com/o/r.git', 'ghp_abc'],
+    ['user:pw@host:o/r', 'pw'],
+  ])(
+    'refuses a credential-bearing repository URL %s without running anything',
+    async (repository: string, secret: string) => {
+      const orch = fakeExecutor();
+      const hostA = fakeExecutor();
+      const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
+
+      const report = await adapter.probe({
+        repository,
+        clones: { a: { path: '/lanes/a', worktreeRoot: '/lanes/a-root' } },
+      });
+
+      expect(report.checks).toEqual([
+        {
+          name: 'repository-answers',
+          host: null,
+          result: 'fail',
+          detail: 'repository URL carries a credential; register it without one',
+        },
+      ]);
+      expect(orch.calls).toEqual([]);
+      expect(hostA.calls).toEqual([]);
+      expect(JSON.stringify(report)).not.toContain(secret);
+    },
+  );
+
+  it('allows a bare ssh login name in ssh://git@host/p and runs ls-remote', async () => {
+    const orch = fakeExecutor({
+      'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
+    });
+    const adapter = makeAdapter(orch.executor, {});
 
     const report = await adapter.probe({
-      repository: 'https://user:pw@host/r.git',
-      clones: { a: { path: '/lanes/a', worktreeRoot: '/lanes/a-root' } },
+      repository: 'ssh://git@host/p',
+      clones: {},
     });
 
     expect(report.checks).toEqual([
       {
         name: 'repository-answers',
         host: null,
-        result: 'fail',
-        detail: 'repository URL carries a credential; register it without one',
+        result: 'pass',
+        detail: 'default branch main',
       },
     ]);
-    expect(orch.calls).toEqual([]);
-    expect(hostA.calls).toEqual([]);
-    expect(JSON.stringify(report)).not.toContain('pw');
+    expect(orch.calls.map((call) => call.argv)).toEqual([
+      ['git', ...EXPECTED_GIT_HARDENING, 'ls-remote', '--symref', 'ssh://git@host/p', 'HEAD'],
+    ]);
   });
 
   it('never copies credential-bearing stderr into a detail', async () => {
@@ -227,6 +290,24 @@ describe('ProjectProbeAdapter', () => {
       detail: 'git ls-remote exited 128',
     });
     expect(JSON.stringify(report)).not.toContain('secret');
+  });
+
+  it('reports repository-answers unknown when ls-remote exits with null exitCode and no error', async () => {
+    const orch = fakeExecutor({
+      'ls-remote --symref': { exitCode: null },
+    });
+    const adapter = makeAdapter(orch.executor, {});
+    const report = await adapter.probe({ repository: REPO, clones: {} });
+
+    expect(report.checks).toEqual([
+      {
+        name: 'repository-answers',
+        host: null,
+        result: 'unknown',
+        detail: 'orchestrator could not run git',
+      },
+    ]);
+    expect(report.defaultBranch).toBeNull();
   });
 
   it('rejects an unsafe defaultBranch ref name from ls-remote symref output', async () => {
@@ -279,7 +360,7 @@ describe('ProjectProbeAdapter', () => {
       'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
     });
     const hostA = fakeExecutor({
-      'rev-parse --is-inside-work-tree': {
+      'rev-parse --show-toplevel': {
         exitCode: 128,
         stderr: 'fatal: not a git repository\n',
       },
@@ -307,38 +388,78 @@ describe('ProjectProbeAdapter', () => {
     expect(report.detectedScripts).toEqual([]);
   });
 
+  it('fails clone-is-work-tree without a clone hint when path is inside another repository', async () => {
+    const orch = fakeExecutor({
+      'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
+    });
+    const hostA = fakeExecutor({
+      'rev-parse --show-toplevel': { exitCode: 0, stdout: '/lanes\n' },
+    });
+    const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
+
+    const report = await adapter.probe({
+      repository: REPO,
+      clones: { a: { path: '/lanes/a', worktreeRoot: '/lanes/a-root' } },
+    });
+
+    const cloneCheck = report.checks.find((check) => check.name === 'clone-is-work-tree')!;
+    expect(cloneCheck.result).toBe('fail');
+    expect(cloneCheck.detail).toBe(
+      "/lanes/a is inside another repository at /lanes; use the clone's own root",
+    );
+    expect(cloneCheck.detail).not.toContain('git clone');
+    expect(report.detectedScripts).toEqual([]);
+  });
+
   it('redacts userinfo and single-quotes paths with apostrophes in hints', async () => {
     const orch = fakeExecutor({
       'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
     });
     const hostA = fakeExecutor({
-      'rev-parse --is-inside-work-tree': { exitCode: 128 },
+      'rev-parse --show-toplevel': { exitCode: 128 },
       'test -d': { exitCode: 1 },
       'check-ignore -q .lane/probe.md': { exitCode: 1 },
     });
     const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
 
     const report = await adapter.probe({
-      repository: 'https://user@host/r.git',
+      repository: 'ssh://user@host/p',
       clones: { a: { path: "/srv/it's here", worktreeRoot: "/srv/it's here-root" } },
     });
 
     const cloneCheck = report.checks.find((check) => check.name === 'clone-is-work-tree')!;
     expect(cloneCheck.result).toBe('fail');
     expect(cloneCheck.detail).toBe(
-      "no git work tree at /srv/it's here; on a run: git clone 'https://host/r.git' '/srv/it'\\''s here'",
+      "no git work tree at /srv/it's here; on a run: git clone 'ssh://host/p' '/srv/it'\\''s here'",
     );
-    expect(cloneCheck.detail).toContain("'https://host/r.git'");
+    expect(cloneCheck.detail).toContain("'ssh://host/p'");
     expect(cloneCheck.detail).not.toContain('user');
     expect(cloneCheck.detail).toContain("'/srv/it'\\''s here'");
+
+    const ipv6Report = await adapter.probe({
+      repository: 'ssh://u@[::1]:8443/p',
+      clones: { a: { path: '/lanes/a', worktreeRoot: '/lanes/a-root' } },
+    });
+    const ipv6CloneCheck = ipv6Report.checks.find((check) => check.name === 'clone-is-work-tree')!;
+    expect(ipv6CloneCheck.detail).toContain("'ssh://[::1]:8443/p'");
+
+    const tagReport = await adapter.probe({
+      repository: 'ssh://host/path@tag',
+      clones: { a: { path: '/lanes/a', worktreeRoot: '/lanes/a-root' } },
+    });
+    const tagCloneCheck = tagReport.checks.find((check) => check.name === 'clone-is-work-tree')!;
+    expect(tagCloneCheck.detail).toContain("'ssh://host/path@tag'");
+
+    expect(redactUserinfo('https://u@[::1]:8443/p')).toBe('https://[::1]:8443/p');
+    expect(redactUserinfo('ssh://host/path@tag')).toBe('ssh://host/path@tag');
   });
 
-  it('fails clone-is-work-tree when rev-parse exits non-zero even if stdout is true', async () => {
+  it('fails clone-is-work-tree when rev-parse exits non-zero even if stdout matches path', async () => {
     const orch = fakeExecutor({
       'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
     });
     const hostA = fakeExecutor({
-      'rev-parse --is-inside-work-tree': { exitCode: 1, stdout: 'true\n' },
+      'rev-parse --show-toplevel': { exitCode: 1, stdout: '/lanes/a\n' },
     });
     const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
 
@@ -357,7 +478,7 @@ describe('ProjectProbeAdapter', () => {
       'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
     });
     const hostA = fakeExecutor({
-      'rev-parse --is-inside-work-tree': { error: 'spawn failed', exitCode: null },
+      'rev-parse --show-toplevel': { error: 'spawn failed', exitCode: null },
     });
     const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
 
@@ -379,7 +500,7 @@ describe('ProjectProbeAdapter', () => {
       'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
     });
     const hostA = fakeExecutor({
-      'rev-parse --is-inside-work-tree': { exitCode: 0, stdout: 'true\n' },
+      'rev-parse --show-toplevel': { exitCode: 0, stdout: '/lanes/a\n' },
       'remote get-url origin': { exitCode: 0, stdout: 'https://token@evil.example/x.git\n' },
     });
     const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
@@ -401,7 +522,7 @@ describe('ProjectProbeAdapter', () => {
       'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
     });
     const hostA = fakeExecutor({
-      'rev-parse --is-inside-work-tree': { exitCode: 0, stdout: 'true\n' },
+      'rev-parse --show-toplevel': { exitCode: 0, stdout: '/lanes/a\n' },
       'remote get-url origin': { exitCode: 0, stdout: 'git@github.com:o/r.git\n' },
     });
     const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
@@ -420,7 +541,7 @@ describe('ProjectProbeAdapter', () => {
       'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
     });
     const hostA = fakeExecutor({
-      'rev-parse --is-inside-work-tree': { exitCode: 0, stdout: 'true\n' },
+      'rev-parse --show-toplevel': { exitCode: 0, stdout: '/lanes/a\n' },
       'check-ignore -q .lane/probe.md': { exitCode: 1 },
     });
     const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
@@ -442,7 +563,7 @@ describe('ProjectProbeAdapter', () => {
       'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
     });
     const hostA = fakeExecutor({
-      'rev-parse --is-inside-work-tree': { exitCode: 0, stdout: 'true\n' },
+      'rev-parse --show-toplevel': { exitCode: 0, stdout: '/lanes/a\n' },
       'test -d': { exitCode: 1 },
     });
     const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
@@ -462,7 +583,7 @@ describe('ProjectProbeAdapter', () => {
       'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
     });
     const hostA = fakeExecutor({
-      'rev-parse --is-inside-work-tree': { exitCode: 0, stdout: 'true\n' },
+      'rev-parse --show-toplevel': { exitCode: 0, stdout: '/lanes/a\n' },
       'ls-files --error-unmatch AGENTS.md': { exitCode: 1 },
       'ls-files --error-unmatch CLAUDE.md': { exitCode: 0 },
     });
@@ -489,43 +610,87 @@ describe('ProjectProbeAdapter', () => {
     ]);
   });
 
-  it('hardens every git argv and never prompts for credentials', async () => {
+  it('caps detectedScripts at the first 200 sorted names and sets maxBufferBytes to 1 MiB', async () => {
+    const scripts: Record<string, string> = {};
+    for (let i = 299; i >= 0; i -= 1) {
+      scripts[`script-${String(i).padStart(3, '0')}`] = 'echo ok';
+    }
     const orch = fakeExecutor({
       'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
     });
-    const hostA = fakeExecutor(PASSING_HOST_CANNED);
-    const hostB = fakeExecutor(PASSING_HOST_CANNED);
+    const hostA = fakeExecutor({
+      ...passingHostCanned('/lanes/a'),
+      'cat-file blob HEAD:package.json': {
+        exitCode: 0,
+        stdout: JSON.stringify({ scripts }),
+      },
+    });
+    const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
+
+    const report = await adapter.probe({
+      repository: REPO,
+      clones: { a: { path: '/lanes/a', worktreeRoot: '/lanes/a-root' } },
+    });
+
+    expect(report.detectedScripts).toHaveLength(200);
+    expect(report.detectedScripts[0]).toBe('script-000');
+    expect(report.detectedScripts[199]).toBe('script-199');
+    const catFileCall = hostA.calls.find((call) => call.argv.includes('cat-file'))!;
+    expect(catFileCall.options?.maxBufferBytes).toBe(1048576);
+  });
+
+  it('hardens every git argv, passes minimal env with SSH_AUTH_SOCK only to orchestrator, and leaves host env unset', async () => {
+    const orch = fakeExecutor({
+      'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
+    });
+    const hostA = fakeExecutor(passingHostCanned('/lanes/a'));
+    const hostB = fakeExecutor(passingHostCanned('/lanes/b'));
     const adapter = makeAdapter(orch.executor, {
       a: { executor: hostA.executor },
       b: { executor: hostB.executor },
     });
 
-    await adapter.probe({
-      repository: REPO,
-      clones: {
-        a: { path: '/lanes/a', worktreeRoot: '/lanes/a-root' },
-        b: { path: '/lanes/b', worktreeRoot: '/lanes/b-root' },
-      },
-    });
+    const previousSock = process.env.SSH_AUTH_SOCK;
+    process.env.SSH_AUTH_SOCK = '/tmp/probe-agent.sock';
+    try {
+      await adapter.probe({
+        repository: REPO,
+        clones: {
+          a: { path: '/lanes/a', worktreeRoot: '/lanes/a-root' },
+          b: { path: '/lanes/b', worktreeRoot: '/lanes/b-root' },
+        },
+      });
+    } finally {
+      if (previousSock === undefined) {
+        delete process.env.SSH_AUTH_SOCK;
+      } else {
+        process.env.SSH_AUTH_SOCK = previousSock;
+      }
+    }
 
-    const allCalls = [...orch.calls, ...hostA.calls, ...hostB.calls];
-    expect(allCalls.length).toBeGreaterThan(0);
+    expect(orch.calls).toHaveLength(1);
+    expect(orch.calls[0].argv.slice(1, 1 + EXPECTED_GIT_HARDENING.length)).toEqual(
+      EXPECTED_GIT_HARDENING,
+    );
+    expect(orch.calls[0].options?.env?.GIT_TERMINAL_PROMPT).toBe('0');
+    expect(orch.calls[0].options?.env?.GIT_ASKPASS).toBe('/bin/false');
+    expect(orch.calls[0].options?.env?.SSH_ASKPASS).toBe('/bin/false');
+    expect(orch.calls[0].options?.env?.SSH_AUTH_SOCK).toBe('/tmp/probe-agent.sock');
+
     for (const [calls, worktreeRoot] of [
-      [orch.calls, null],
       [hostA.calls, '/lanes/a-root'],
       [hostB.calls, '/lanes/b-root'],
     ] as const) {
+      expect(calls.length).toBeGreaterThan(0);
       for (const call of calls) {
         if (call.argv[0] === 'git') {
           expect(call.argv.slice(1, 1 + EXPECTED_GIT_HARDENING.length)).toEqual(
             EXPECTED_GIT_HARDENING,
           );
-          expect(call.options?.env?.GIT_TERMINAL_PROMPT).toBe('0');
         } else {
           expect(call.argv).toEqual(['test', '-d', worktreeRoot]);
         }
-        expect(call.options?.env?.GIT_ASKPASS).toBe('/bin/false');
-        expect(call.options?.env?.SSH_ASKPASS).toBe('/bin/false');
+        expect(call.options?.env).toBeUndefined();
       }
     }
   });

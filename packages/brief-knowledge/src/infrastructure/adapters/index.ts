@@ -20,3 +20,4 @@ export * from "./KnowledgeRetrievalAdapter.adapter.js";
 export * from "./NotConfiguredReceiptJournal.adapter.js";
 export * from "./NullRankingAdviceAdapter.adapter.js";
 export * from "./ranking-advice-factory.js";
+export * from "./state-files.js";

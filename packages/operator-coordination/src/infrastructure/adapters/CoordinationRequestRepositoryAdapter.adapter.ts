@@ -68,6 +68,11 @@ function refuseRevisionConflict(
   }
 }
 
+/** The reader's record parser, shared with `fleet-v2 state check`. */
+export function parseCoordinationRequestStateRecord(raw: unknown): CoordinationRequestRecord | undefined {
+  return CoordinationRequest.fromRecord(raw as CoordinationRequestRecord).toRecord();
+}
+
 export class CoordinationRequestRepositoryAdapter implements CoordinationRequestRepositoryPort {
   private readonly inMemoryRequests = new Map<string, CoordinationRequestRecord>();
   private readonly inMemoryGrants = new Map<string, string>();
@@ -182,8 +187,7 @@ export class CoordinationRequestRepositoryAdapter implements CoordinationRequest
     const records = await readRecordList(
       path,
       'CoordinationRequestRepositoryAdapter',
-      (entry) =>
-        CoordinationRequest.fromRecord(entry as CoordinationRequestRecord).toRecord(),
+      parseCoordinationRequestStateRecord,
     );
     const map = new Map<string, CoordinationRequestRecord>();
     for (const record of records) {

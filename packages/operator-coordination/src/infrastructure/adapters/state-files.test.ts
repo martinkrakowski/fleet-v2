@@ -1,0 +1,173 @@
+import { promises as fs } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import type {
+  CoordinationRequestRecord,
+  ProjectProfileRecord,
+} from '../../domain/coordination-records.js';
+import type { OwnerQuestionRecord } from '../../domain/owner-question-records.js';
+import {
+  StateFileUnreadableError,
+  type StateFileDescriptor,
+  type StateFileInspection,
+} from './file-store.js';
+import { CoordinationRequestRepositoryAdapter } from './CoordinationRequestRepositoryAdapter.adapter.js';
+import { OwnerQuestionRepositoryAdapter } from './OwnerQuestionRepositoryAdapter.adapter.js';
+import { ProjectProfileRepositoryAdapter } from './ProjectProfileRepositoryAdapter.adapter.js';
+import { OPERATOR_COORDINATION_STATE_FILES } from './state-files.js';
+
+function profileRecord(): ProjectProfileRecord {
+  return {
+    projectId: 'proj-1',
+    displayName: 'Project One',
+    repository: 'org/repo-1',
+    designatedDispatcherHost: 'host-1',
+    policyRevision: 'pol-1',
+    maxConcurrentLanes: 2,
+    runnerCapabilities: {
+      filesystemScope: 'scoped-worktree',
+      networkEgressRestricted: true,
+    },
+    revision: 0,
+    updatedAtIso: '2026-10-15T10:00:00.000Z',
+    status: 'active',
+    defaultBranch: null,
+    clones: {},
+    gateProcedures: [],
+    defaultAllowedPathPrefixes: [],
+    lastProbe: null,
+  };
+}
+
+function questionRecord(): OwnerQuestionRecord {
+  return {
+    questionId: 'q-1',
+    revision: 1,
+    askedBy: 'orchestrator',
+    title: 'Which rollout door do we take?',
+    body: 'Choosing the rollout path for the migration.',
+    options: [
+      { id: 'a', label: 'Freeze first', consequence: 'Slower but reversible.' },
+      { id: 'b', label: 'Roll forward', consequence: 'Faster but commits.' },
+    ],
+    recommendation: { optionId: 'a', because: 'Reversibility beats speed here.' },
+    doorKind: 'one-way',
+    linkedRequestId: 'request-9',
+    blocks: [{ kind: 'lane', ref: 'lane-7' }],
+    state: 'open',
+    askedAt: '2026-10-16T10:00:00.000Z',
+    expiresAt: null,
+    answer: null,
+    acknowledgement: null,
+  };
+}
+
+function requestRecord(): CoordinationRequestRecord {
+  return {
+    id: 'req-1',
+    projectId: 'proj-1',
+    kind: 'action-decision',
+    actionScope: 'forge:push-and-open-pr',
+    expectedHeadSha: 'commit-1',
+    proposalDigest: 'prop-1',
+    policyRevision: 'pol-1',
+    decisionRevision: null,
+    grantId: 'grant-1',
+    state: 'proposed',
+    deliveryStatus: 'pending',
+    deliveryGapReason: null,
+    revision: 1,
+    consumptions: [],
+    acknowledgements: [],
+    createdAtIso: '2026-10-15T10:00:00.000Z',
+    updatedAtIso: '2026-10-15T10:00:00.000Z',
+  };
+}
+
+const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
+  'project-profiles.json': [profileRecord(), { ...profileRecord(), projectId: 'proj-2' }],
+  'coordination-requests.json': [requestRecord(), { ...requestRecord(), id: 'req-2' }],
+  'owner-questions.json': [questionRecord(), { ...questionRecord(), questionId: 'q-2' }],
+};
+
+const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
+  'project-profiles.json': (stateDir) =>
+    new ProjectProfileRepositoryAdapter({ stateDir }).listProfiles(),
+  'coordination-requests.json': (stateDir) =>
+    new CoordinationRequestRepositoryAdapter({ stateDir }).listRequests(),
+  'owner-questions.json': (stateDir) => new OwnerQuestionRepositoryAdapter({ stateDir }).list(),
+};
+
+type FixtureKind = 'valid' | 'not-json' | 'not-list' | 'bad-record';
+
+function bytesFor(basename: string, kind: FixtureKind): Buffer {
+  if (kind === 'not-json') return Buffer.from('{ not json');
+  if (kind === 'not-list') return Buffer.from('{}');
+  const first = VALID_FIXTURES[basename]![0];
+  if (kind === 'bad-record') {
+    return Buffer.from(JSON.stringify([first, { bogus: true }]));
+  }
+  return Buffer.from(JSON.stringify(VALID_FIXTURES[basename]));
+}
+
+const CASES: Array<{
+  basename: string;
+  kind: FixtureKind;
+  inspect: (bytes: Buffer) => StateFileInspection;
+  read: (stateDir: string) => Promise<unknown>;
+  bytes: Buffer;
+  expectedOk: boolean;
+}> = [];
+
+for (const descriptor of OPERATOR_COORDINATION_STATE_FILES) {
+  const kinds: readonly FixtureKind[] = ['valid', 'not-json', 'not-list', 'bad-record'];
+  for (const kind of kinds) {
+    const bytes = bytesFor(descriptor.basename, kind);
+    CASES.push({
+      basename: descriptor.basename,
+      kind,
+      inspect: (b: Buffer) => descriptor.inspect(b),
+      read: READS[descriptor.basename]!,
+      bytes,
+      expectedOk: kind === 'valid',
+    });
+  }
+}
+
+describe('operator-coordination state file descriptors match the store readers', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-e1b-state-files-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it.each(CASES)('$basename / $kind', async ({ basename, bytes, inspect, read, expectedOk }) => {
+    await fs.writeFile(path.join(tempDir, basename), bytes);
+    const inspection = inspect(bytes);
+    const outcome = await read(tempDir).then(
+      () => 'resolved',
+      (error: unknown) => error,
+    );
+    if (inspection.status === 'ok') {
+      expect(outcome).toBe('resolved');
+    } else {
+      expect(outcome).toBeInstanceOf(StateFileUnreadableError);
+      expect((outcome as StateFileUnreadableError).detail).toBe(inspection.detail);
+    }
+    expect(expectedOk).toBe(inspection.status === 'ok');
+  });
+
+  it('lists exactly the owned state files', () => {
+    expect(OPERATOR_COORDINATION_STATE_FILES.map((descriptor: StateFileDescriptor) => descriptor.basename)).toEqual([
+      'project-profiles.json',
+      'coordination-requests.json',
+      'owner-questions.json',
+    ]);
+  });
+});

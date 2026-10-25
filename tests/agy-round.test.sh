@@ -416,6 +416,8 @@ run commit --name n --message-file "$T/msg" -- 'a}b.ts'
 check 'commit refusing a path with } is a usage error (2)' '[ "$(rc)" = 2 ]'
 run commit --name n --message-file "$T/msg" -- 'a\b.ts'
 check 'commit refusing a path with a backslash is a usage error (2)' '[ "$(rc)" = 2 ]'
+run commit --name n --message-file "$T/msg" -- 'a b.ts'
+check 'commit refusing a path with a space is a usage error (2)' '[ "$(rc)" = 2 ]'
 
 echo '# fetch'
 mkcontainer f2

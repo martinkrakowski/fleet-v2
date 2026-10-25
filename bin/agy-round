@@ -8,6 +8,8 @@
 #   agy-round prepare --name <n> --branch <b> --brief <local file> [--from <local git dir>]
 #   agy-round run --name <n> --model <m> --brief <.lane/x.md> [--timeout <45m>] [--log <file>]
 #   agy-round commit --name <n> --message-file <local file> -- <path>...
+#                   (relative paths of letters, digits and . _ / @ + - [ ]; brackets
+#                   admit Next.js dynamic routes and are passed to git literally)
 #   agy-round fetch --name <n> --branch <b> [--into <local git dir>]
 #   agy-round --help
 #

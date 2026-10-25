@@ -12,7 +12,8 @@ export type DoctorScope =
   | 'tool'
   | 'seat'
   | 'credential'
-  | 'runner-binary';
+  | 'runner-binary'
+  | 'state';
 
 /** Outcome of one doctor check. `UNKNOWN` means the check could not tell. */
 export type DoctorStatus = 'PASS' | 'FAIL' | 'UNKNOWN';

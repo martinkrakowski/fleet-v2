@@ -31,6 +31,7 @@ import type {
 } from '../../ports/in/index.js';
 import type { CoordinationRequestRepositoryPort } from '../../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import { CoordinationRequestRevisionConflictError } from '../../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import { ProjectProfileRevisionConflictError } from '../../ports/out/ProjectProfileRepositoryPort.out-port.js';
 import type {
   DecisionAnswer,
   DecisionAnswerQuery,
@@ -74,6 +75,12 @@ function profileRecord(overrides: Partial<ProjectProfileRecord> = {}): ProjectPr
     runnerCapabilities: { 'openai/gpt-5': true, 'local/vllm': false, s3: 'configured-unknown' },
     revision: 0,
     updatedAtIso: NOW_ISO,
+    status: 'active',
+    defaultBranch: null,
+    clones: {},
+    gateProcedures: [],
+    defaultAllowedPathPrefixes: [],
+    lastProbe: null,
     ...overrides,
   };
 }
@@ -171,6 +178,12 @@ class StubProfileRepository implements ProjectProfileRepositoryPort {
 
   async findProfileById(projectId: string): Promise<ProjectProfileRecord | null> {
     return this.profiles[projectId] ?? null;
+  }
+
+  async listProfiles(): Promise<readonly ProjectProfileRecord[]> {
+    return Object.values(this.profiles).sort((left, right) =>
+      left.projectId.localeCompare(right.projectId),
+    );
   }
 }
 
@@ -274,6 +287,12 @@ describe('RegisterProjectProfileUseCase', () => {
     expect(result.profile.designatedDispatcherHost).toBe('dispatcher-01');
     expect(result.profile.revision).toBe(0);
     expect(result.profile.updatedAtIso).toBe(NOW_ISO);
+    expect(result.profile.status).toBe('active');
+    expect(result.profile.defaultBranch).toBeNull();
+    expect(result.profile.clones).toEqual({});
+    expect(result.profile.gateProcedures).toEqual([]);
+    expect(result.profile.defaultAllowedPathPrefixes).toEqual([]);
+    expect(result.profile.lastProbe).toBeNull();
     expect(repo.saves).toHaveLength(1);
     expect(Object.keys(result.profile.runnerCapabilities)).toEqual(['openai/gpt-5', 'local/vllm']);
   });
@@ -286,6 +305,85 @@ describe('RegisterProjectProfileUseCase', () => {
       validRequest,
     );
     expect(result.outcome === 'registered' && result.profile.revision).toBe(5);
+  });
+
+  it('looks up an existing profile with the trimmed projectId and updates it to revision 1', async () => {
+    const repo = new ProjectProfileRepositoryAdapter();
+    const useCase = new RegisterProjectProfileUseCase({ profileRepo: repo });
+    const first = await useCase.execute({ ...validRequest, projectId: 'atlas' });
+    expect(first.outcome).toBe('registered');
+    const second = await useCase.execute({
+      ...validRequest,
+      projectId: ' atlas ',
+      displayName: 'Atlas Updated',
+      nowIso: LATER_ISO,
+    });
+    expect(second.outcome).toBe('registered');
+    if (second.outcome !== 'registered') {
+      throw new Error('expected a registered profile');
+    }
+    expect(second.profile.projectId).toBe('atlas');
+    expect(second.profile.revision).toBe(1);
+    expect(second.profile.displayName).toBe('Atlas Updated');
+  });
+
+  it('turns two concurrent registrations of the same new id into one registered and one rejected', async () => {
+    const repo = new ProjectProfileRepositoryAdapter();
+    const useCase = new RegisterProjectProfileUseCase({ profileRepo: repo });
+    const firstPromise = useCase.execute({ ...validRequest, projectId: 'atlas' });
+    const secondPromise = useCase.execute({ ...validRequest, projectId: 'atlas' });
+    const outcomes = await Promise.all([firstPromise, secondPromise]);
+    const registered = outcomes.filter((result) => result.outcome === 'registered');
+    const rejected = outcomes.filter((result) => result.outcome === 'rejected');
+    expect(registered).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toEqual({
+      outcome: 'rejected',
+      reason: 'profile atlas changed while it was being registered; read it again and retry',
+    });
+  });
+
+  it('propagates a saveProfile error that is not a ProjectProfileRevisionConflictError', async () => {
+    class FailingProfileRepository implements ProjectProfileRepositoryPort {
+      async saveProfile(): Promise<void> {
+        throw new Error('ProjectProfileRepositoryAdapter could not write the store');
+      }
+      async findProfileById(): Promise<ProjectProfileRecord | null> {
+        return null;
+      }
+      async listProfiles(): Promise<readonly ProjectProfileRecord[]> {
+        return [];
+      }
+    }
+    await expect(
+      new RegisterProjectProfileUseCase({ profileRepo: new FailingProfileRepository() }).execute(
+        validRequest,
+      ),
+    ).rejects.toThrow('ProjectProfileRepositoryAdapter could not write the store');
+  });
+
+  it('keeps stored clones and the last probe on re-registration', async () => {
+    const seeded = profileRecord({
+      revision: 1,
+      clones: { host1: { path: '/srv/clone', worktreeRoot: '/srv/wt' } },
+      lastProbe: {
+        probedAtIso: LATER_ISO,
+        probedFrom: 'host-1',
+        checks: [{ name: 'git-fetch', host: 'host-1', result: 'pass', detail: 'ok' }],
+      },
+    });
+    const repo = new StubProfileRepository({ 'project-atlas': seeded });
+    const result = await new RegisterProjectProfileUseCase({ profileRepo: repo }).execute(
+      validRequest,
+    );
+    expect(result.outcome).toBe('registered');
+    if (result.outcome !== 'registered') {
+      throw new Error('expected a registered profile');
+    }
+    expect(result.profile.revision).toBe(2);
+    expect(result.profile.clones).toEqual(seeded.clones);
+    expect(result.profile.lastProbe).toEqual(seeded.lastProbe);
+    expect(result.profile.status).toBe('active');
   });
 
   it('refuses a runner capability or field that would persist a credential', async () => {
@@ -1315,17 +1413,17 @@ describe('ProjectProfileRepositoryAdapter', () => {
 
   it('refuses a stale or conflicting revision instead of overwriting', async () => {
     const adapter = new ProjectProfileRepositoryAdapter();
-    await adapter.saveProfile(profileRecord({ revision: 3 }));
+    await adapter.saveProfile(profileRecord({ revision: 0 }));
     await expect(
       adapter.saveProfile(profileRecord({ revision: 2, displayName: 'Stale' })),
-    ).rejects.toThrow(/stale revision 2/);
+    ).rejects.toThrow(ProjectProfileRevisionConflictError);
     await expect(
-      adapter.saveProfile(profileRecord({ revision: 3, displayName: 'Conflicting' })),
-    ).rejects.toThrow(/conflicting revision 3/);
+      adapter.saveProfile(profileRecord({ revision: 0, displayName: 'Conflicting' })),
+    ).rejects.toThrow(ProjectProfileRevisionConflictError);
     await expect(
-      adapter.saveProfile(profileRecord({ revision: 4, displayName: 'Newer' })),
+      adapter.saveProfile(profileRecord({ revision: 1, displayName: 'Newer' })),
     ).resolves.toBeUndefined();
-    expect((await adapter.findProfileById('project-atlas'))?.revision).toBe(4);
+    expect((await adapter.findProfileById('project-atlas'))?.revision).toBe(1);
   });
 
   it('refuses to persist a credential-shaped field', async () => {
@@ -1342,7 +1440,7 @@ describe('ProjectProfileRepositoryAdapter', () => {
   it('persists to the configured state directory and reloads it', async () => {
     await withTempDir(async (stateDir) => {
       const adapter = new ProjectProfileRepositoryAdapter({ stateDir });
-      await adapter.saveProfile(profileRecord({ revision: 1 }));
+      await adapter.saveProfile(profileRecord({ revision: 0 }));
       await adapter.saveProfile(
         profileRecord({ projectId: 'project-borealis', revision: 0, displayName: 'Borealis' }),
       );
@@ -1355,7 +1453,7 @@ describe('ProjectProfileRepositoryAdapter', () => {
       const found = await reloaded.findProfileById('project-borealis');
       expect(found?.displayName).toBe('Borealis');
       await expect(reloaded.saveProfile(profileRecord({ revision: 0 }))).rejects.toThrow(
-        /stale revision 0/,
+        /Stale project profile revision for project-atlas: stored 0, write must be 1/,
       );
     });
   });
@@ -1383,6 +1481,105 @@ describe('ProjectProfileRepositoryAdapter', () => {
       await writeFile(join(stateDir, 'project-profiles.json'), 'not json', 'utf8');
       const adapter = new ProjectProfileRepositoryAdapter({ stateDir });
       await expect(adapter.findProfileById('project-atlas')).rejects.toThrow(/could not parse/);
+    });
+  });
+
+  it('enforces a strict compare-and-swap in memory', async () => {
+    const adapter = new ProjectProfileRepositoryAdapter();
+    await adapter.saveProfile(profileRecord({ revision: 0 }));
+    await adapter.saveProfile(profileRecord({ revision: 1, displayName: 'Atlas v2' }));
+
+    const sameRevision = await adapter
+      .saveProfile(profileRecord({ revision: 1, displayName: 'different content' }))
+      .catch((error: unknown) => error);
+    expect(sameRevision).toBeInstanceOf(ProjectProfileRevisionConflictError);
+    if (sameRevision instanceof ProjectProfileRevisionConflictError) {
+      expect(sameRevision.projectId).toBe('project-atlas');
+      expect(sameRevision.expectedRevision).toBe(1);
+      expect(sameRevision.actualRevision).toBe(1);
+    }
+
+    const skip = await adapter
+      .saveProfile(profileRecord({ revision: 3 }))
+      .catch((error: unknown) => error);
+    expect(skip).toBeInstanceOf(ProjectProfileRevisionConflictError);
+    if (skip instanceof ProjectProfileRevisionConflictError) {
+      expect(skip.expectedRevision).toBe(1);
+      expect(skip.actualRevision).toBe(3);
+      expect(skip.message).toContain('stored 1, write must be 2, got 3');
+    }
+
+    const newIdSkip = await adapter
+      .saveProfile(profileRecord({ projectId: 'project-new', revision: 2 }))
+      .catch((error: unknown) => error);
+    expect(newIdSkip).toBeInstanceOf(ProjectProfileRevisionConflictError);
+    if (newIdSkip instanceof ProjectProfileRevisionConflictError) {
+      expect(newIdSkip.expectedRevision).toBe(-1);
+      expect(newIdSkip.actualRevision).toBe(2);
+      expect(newIdSkip.message).toContain('stored -1, write must be 0');
+    }
+  });
+
+  it('enforces a strict compare-and-swap on a temp stateDir', async () => {
+    await withTempDir(async (stateDir) => {
+      const adapter = new ProjectProfileRepositoryAdapter({ stateDir });
+      await adapter.saveProfile(profileRecord({ revision: 0 }));
+      await adapter.saveProfile(profileRecord({ revision: 1, displayName: 'Atlas v2' }));
+      await expect(
+        adapter.saveProfile(profileRecord({ revision: 1, displayName: 'different content' })),
+      ).rejects.toThrow(ProjectProfileRevisionConflictError);
+      await expect(adapter.saveProfile(profileRecord({ revision: 3 }))).rejects.toThrow(
+        ProjectProfileRevisionConflictError,
+      );
+      await expect(
+        adapter.saveProfile(profileRecord({ projectId: 'project-new', revision: 2 })),
+      ).rejects.toThrow(ProjectProfileRevisionConflictError);
+    });
+  });
+
+  it('lists every profile sorted by projectId including retired ones', async () => {
+    const adapter = new ProjectProfileRepositoryAdapter();
+    await adapter.saveProfile(profileRecord({ revision: 0 }));
+    await adapter.saveProfile(
+      profileRecord({
+        projectId: 'project-borealis',
+        revision: 0,
+        status: 'retired',
+        displayName: 'Borealis',
+      }),
+    );
+    const listed = await adapter.listProfiles();
+    expect(listed.map((profile) => profile.projectId)).toEqual(['project-atlas', 'project-borealis']);
+    expect(listed.map((profile) => profile.status)).toEqual(['active', 'retired']);
+  });
+
+  it('lists an old-format file with v2 defaults', async () => {
+    await withTempDir(async (stateDir) => {
+      const oldFormat = {
+        projectId: 'project-legacy',
+        displayName: 'Legacy',
+        repository: 'org/repo-legacy',
+        designatedDispatcherHost: 'host-1',
+        policyRevision: 'pol-1',
+        maxConcurrentLanes: 2,
+        runnerCapabilities: { filesystemScope: 'scoped-worktree' },
+        revision: 1,
+        updatedAtIso: '2026-10-15T10:00:00.000Z',
+      };
+      await writeFile(
+        join(stateDir, 'project-profiles.json'),
+        JSON.stringify([oldFormat]),
+        'utf8',
+      );
+      const adapter = new ProjectProfileRepositoryAdapter({ stateDir });
+      const listed = await adapter.listProfiles();
+      expect(listed).toHaveLength(1);
+      expect(listed[0].status).toBe('active');
+      expect(listed[0].defaultBranch).toBeNull();
+      expect(listed[0].clones).toEqual({});
+      expect(listed[0].gateProcedures).toEqual([]);
+      expect(listed[0].defaultAllowedPathPrefixes).toEqual([]);
+      expect(listed[0].lastProbe).toBeNull();
     });
   });
 });

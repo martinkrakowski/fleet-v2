@@ -9,13 +9,19 @@
  * rejected outright so installation configuration never accumulates secrets.
  */
 
-import type { ProjectProfileRecord } from '../coordination-records.js';
+import { isValidHostName } from '@fleet/shared';
+import type { ProjectProfileInput, ProjectProfileRecord } from '../coordination-records.js';
 
 export type {
   AuthorizationConsumptionRecord,
   CoordinationRequestRecord,
   ProjectAttentionSummaryRecord,
+  ProjectCloneRecord,
+  ProjectProfileInput,
   ProjectProfileRecord,
+  ProjectProbeCheckRecord,
+  ProjectProbeReceiptRecord,
+  ProjectProbeResult,
   RelayAcknowledgementRecord,
 } from '../coordination-records.js';
 
@@ -26,6 +32,10 @@ export type {
 const FORBIDDEN_FIELD_PATTERN =
   /(token|secret|credential|password|passphrase|api[-_]?key|private[-_]?key|access[-_]?key|authorization|cookie)/i;
 
+const ALLOWED_CLONE_KEYS = new Set(['path', 'worktreeRoot']);
+const ALLOWED_PROBE_KEYS = new Set(['probedAtIso', 'probedFrom', 'checks']);
+const ALLOWED_PROBE_CHECK_KEYS = new Set(['name', 'host', 'result', 'detail']);
+
 /** One configured capability: supported, explicitly unsupported, or not known. */
 export type CapabilityStatus = 'supported' | 'missing' | 'unknown';
 
@@ -34,7 +44,7 @@ export class ProjectProfile {
     // Invariants are validated in fromRecord.
   }
 
-  static fromRecord(record: ProjectProfileRecord): ProjectProfile {
+  static fromRecord(record: ProjectProfileInput): ProjectProfile {
     if (typeof record !== 'object' || record === null) {
       throw new Error('ProjectProfile requires a record');
     }
@@ -63,10 +73,154 @@ export class ProjectProfile {
       throw new Error('ProjectProfile requires a non-negative integer revision');
     }
     const capabilities = ProjectProfile.readCapabilities(record.runnerCapabilities);
+    const status = record.status ?? 'active';
+    if (status !== 'active' && status !== 'retired') {
+      throw new Error('ProjectProfile requires status active or retired');
+    }
+    const defaultBranch = record.defaultBranch ?? null;
+    if (defaultBranch !== null && !isValidBranchName(defaultBranch)) {
+      throw new Error('ProjectProfile requires defaultBranch to be null or a non-empty branch name');
+    }
+    const clones = ProjectProfile.readClones(record.clones);
+    const gateProcedures = ProjectProfile.readGateProcedures(record.gateProcedures);
+    const defaultAllowedPathPrefixes = ProjectProfile.readAllowedPathPrefixes(
+      record.defaultAllowedPathPrefixes,
+    );
+    const lastProbe = ProjectProfile.readLastProbe(record.lastProbe);
     return new ProjectProfile({
       ...record,
       runnerCapabilities: capabilities,
+      status,
+      defaultBranch,
+      clones,
+      gateProcedures,
+      defaultAllowedPathPrefixes,
+      lastProbe,
     });
+  }
+
+  private static readClones(
+    clones: ProjectProfileInput['clones'],
+  ): Readonly<Record<string, { readonly path: string; readonly worktreeRoot: string }>> {
+    const empty = clones === undefined;
+    const source = empty ? {} : clones;
+    if (typeof source !== 'object' || source === null || Array.isArray(source)) {
+      throw new Error('ProjectProfile requires a clones map');
+    }
+    const copy: Record<string, { readonly path: string; readonly worktreeRoot: string }> = {};
+    for (const [key, clone] of Object.entries(source)) {
+      if (!isValidHostName(key) || FORBIDDEN_FIELD_PATTERN.test(key)) {
+        throw new Error(`ProjectProfile clone host name is invalid: ${key}`);
+      }
+      if (typeof clone !== 'object' || clone === null || Array.isArray(clone)) {
+        throw new Error(`ProjectProfile clone ${key} requires normalised absolute paths`);
+      }
+      for (const cloneKey of Object.keys(clone)) {
+        if (!ALLOWED_CLONE_KEYS.has(cloneKey)) {
+          throw new Error(`ProjectProfile clone ${key} carries only path and worktreeRoot`);
+        }
+      }
+      const { path: clonePath, worktreeRoot } = clone as {
+        path?: unknown;
+        worktreeRoot?: unknown;
+      };
+      if (!isNormalisedAbsolutePath(clonePath) || !isNormalisedAbsolutePath(worktreeRoot)) {
+        throw new Error(`ProjectProfile clone ${key} requires normalised absolute paths`);
+      }
+      if (worktreeRoot === clonePath || worktreeRoot.startsWith(clonePath + '/')) {
+        throw new Error(`ProjectProfile clone ${key} worktreeRoot must be outside the clone`);
+      }
+      Object.defineProperty(copy, key, {
+        value: { path: clonePath, worktreeRoot },
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+    return Object.freeze(copy);
+  }
+
+  private static readGateProcedures(gateProcedures: ProjectProfileInput['gateProcedures']): readonly string[] {
+    const names = gateProcedures ?? [];
+    if (!Array.isArray(names)) {
+      throw new Error('ProjectProfile requires gateProcedures to be unique non-empty names');
+    }
+    for (const name of names) {
+      if (typeof name !== 'string' || name.trim().length === 0) {
+        throw new Error('ProjectProfile requires gateProcedures to be unique non-empty names');
+      }
+    }
+    if (new Set(names).size !== names.length) {
+      throw new Error('ProjectProfile requires gateProcedures to be unique non-empty names');
+    }
+    return Object.freeze([...names]);
+  }
+
+  private static readAllowedPathPrefixes(
+    defaultAllowedPathPrefixes: ProjectProfileInput['defaultAllowedPathPrefixes'],
+  ): readonly string[] {
+    const prefixes = defaultAllowedPathPrefixes ?? [];
+    if (!Array.isArray(prefixes)) {
+      throw new Error('ProjectProfile requires defaultAllowedPathPrefixes to be relative paths without ..');
+    }
+    for (const prefix of prefixes) {
+      if (
+        typeof prefix !== 'string' ||
+        prefix.trim().length === 0 ||
+        prefix.startsWith('/') ||
+        hasDotDotSegment(prefix)
+      ) {
+        throw new Error('ProjectProfile requires defaultAllowedPathPrefixes to be relative paths without ..');
+      }
+    }
+    return Object.freeze([...prefixes]);
+  }
+
+  private static readLastProbe(
+    lastProbe: ProjectProfileInput['lastProbe'],
+  ): ProjectProfileRecord['lastProbe'] {
+    if (lastProbe === undefined || lastProbe === null) {
+      return null;
+    }
+    const probe = lastProbe;
+    const isProbe =
+      typeof probe === 'object' &&
+      !Array.isArray(probe) &&
+      Object.keys(probe).every((key) => ALLOWED_PROBE_KEYS.has(key)) &&
+      typeof probe.probedAtIso === 'string' &&
+      probe.probedAtIso.trim().length > 0 &&
+      typeof probe.probedFrom === 'string' &&
+      isValidHostName(probe.probedFrom) &&
+      Array.isArray(probe.checks);
+    if (!isProbe) {
+      throw new Error('ProjectProfile requires lastProbe to be null or a probe receipt');
+    }
+    const checks = probe.checks.map((check) => {
+      const validCheck =
+        typeof check === 'object' &&
+        check !== null &&
+        !Array.isArray(check) &&
+        Object.keys(check).every((key) => ALLOWED_PROBE_CHECK_KEYS.has(key)) &&
+        typeof check.name === 'string' &&
+        check.name.trim().length > 0 &&
+        (check.host === null || (typeof check.host === 'string' && isValidHostName(check.host))) &&
+        (check.result === 'pass' || check.result === 'fail' || check.result === 'unknown') &&
+        typeof check.detail === 'string';
+      if (!validCheck) {
+        throw new Error('ProjectProfile requires lastProbe to be null or a probe receipt');
+      }
+      return {
+        name: check.name,
+        host: check.host,
+        result: check.result,
+        detail: check.detail,
+      };
+    });
+    return {
+      probedAtIso: probe.probedAtIso,
+      probedFrom: probe.probedFrom,
+      checks,
+    };
   }
 
   private static readCapabilities(
@@ -79,6 +233,9 @@ export class ProjectProfile {
     for (const [name, value] of Object.entries(capabilities)) {
       if (name.trim().length === 0) {
         throw new Error('ProjectProfile requires a non-empty runner capability name');
+      }
+      if (FORBIDDEN_FIELD_PATTERN.test(name)) {
+        throw new Error(`ProjectProfile must not carry a credential capability: ${name}`);
       }
       if (typeof value !== 'boolean' && typeof value !== 'string') {
         throw new Error(`Runner capability ${name} must be a boolean or a string`);
@@ -93,11 +250,56 @@ export class ProjectProfile {
   }
 
   toRecord(): ProjectProfileRecord {
-    return { ...this.record, runnerCapabilities: { ...this.record.runnerCapabilities } };
+    return {
+      ...this.record,
+      runnerCapabilities: { ...this.record.runnerCapabilities },
+      clones: Object.fromEntries(
+        Object.entries(this.record.clones).map(([key, clone]) => [
+          key,
+          { path: clone.path, worktreeRoot: clone.worktreeRoot },
+        ]),
+      ),
+      gateProcedures: [...this.record.gateProcedures],
+      defaultAllowedPathPrefixes: [...this.record.defaultAllowedPathPrefixes],
+      lastProbe:
+        this.record.lastProbe === null
+          ? null
+          : {
+              probedAtIso: this.record.lastProbe.probedAtIso,
+              probedFrom: this.record.lastProbe.probedFrom,
+              checks: this.record.lastProbe.checks.map((check) => ({
+                name: check.name,
+                host: check.host,
+                result: check.result,
+                detail: check.detail,
+              })),
+            },
+    };
   }
 
   getDispatcherHost(): string {
     return this.record.designatedDispatcherHost;
+  }
+
+  getStatus(): 'active' | 'retired' {
+    return this.record.status;
+  }
+
+  isActive(): boolean {
+    return this.record.status === 'active';
+  }
+
+  getClones(): Readonly<Record<string, { readonly path: string; readonly worktreeRoot: string }>> {
+    return Object.fromEntries(
+      Object.entries(this.record.clones).map(([key, clone]) => [
+        key,
+        { path: clone.path, worktreeRoot: clone.worktreeRoot },
+      ]),
+    );
+  }
+
+  getGateProcedures(): readonly string[] {
+    return [...this.record.gateProcedures];
   }
 
   getPolicyRevision(): string {
@@ -132,4 +334,39 @@ export class ProjectProfile {
   nextRevision(): number {
     return this.record.revision + 1;
   }
+}
+
+/**
+ * True when `value` starts with `/` and every segment after the leading slash
+ * is non-empty and neither `.` nor `..`.
+ */
+function isNormalisedAbsolutePath(value: unknown): value is string {
+  if (typeof value !== 'string' || !value.startsWith('/')) {
+    return false;
+  }
+  const segments = value.split('/').slice(1);
+  return (
+    segments.length > 0 &&
+    segments.every((segment) => segment.length > 0 && segment !== '.' && segment !== '..')
+  );
+}
+
+/** True when a path contains a `..` path segment. */
+function hasDotDotSegment(value: string): boolean {
+  return value.split('/').includes('..');
+}
+
+const BRANCH_NAME_PATTERN = /^[A-Za-z0-9._/-]{1,200}$/;
+
+function isValidBranchName(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    BRANCH_NAME_PATTERN.test(value) &&
+    !value.startsWith('-') &&
+    !value.startsWith('/') &&
+    !value.endsWith('/') &&
+    !value.endsWith('.lock') &&
+    !value.includes('..') &&
+    !value.includes('//')
+  );
 }

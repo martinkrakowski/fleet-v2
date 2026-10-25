@@ -17,6 +17,7 @@ import { join } from 'node:path';
 import type { ProjectProfileRecord } from '../../domain/coordination-records.js';
 import { ProjectProfile } from '../../domain/entities/ProjectProfile.js';
 import type { ProjectProfileRepositoryPort } from '../../application/ports/out/ProjectProfileRepositoryPort.out-port.js';
+import { ProjectProfileRevisionConflictError } from '../../application/ports/out/ProjectProfileRepositoryPort.out-port.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface ProjectProfileRepositoryAdapterOptions {
@@ -30,7 +31,7 @@ const DEFAULT_FILE_NAME = 'project-profiles.json';
 const SAFE_FILE_NAME = /^[A-Za-z0-9._-]{1,128}$/;
 
 function copy(record: ProjectProfileRecord): ProjectProfileRecord {
-  return { ...record, runnerCapabilities: { ...record.runnerCapabilities } };
+  return ProjectProfile.fromRecord(record).toRecord();
 }
 
 export class ProjectProfileRepositoryAdapter implements ProjectProfileRepositoryPort {
@@ -43,21 +44,7 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
     if (target === null) {
       const validated = ProjectProfile.fromRecord(record).toRecord();
       const existing = this.inMemoryProfiles.get(validated.projectId);
-      if (existing !== undefined) {
-        if (validated.revision < existing.revision) {
-          throw new Error(
-            `ProjectProfileRepositoryAdapter refuses stale revision ${validated.revision} for ${validated.projectId}; stored revision is ${existing.revision}`,
-          );
-        }
-        if (
-          validated.revision === existing.revision &&
-          JSON.stringify(copy(validated)) !== JSON.stringify(copy(existing))
-        ) {
-          throw new Error(
-            `ProjectProfileRepositoryAdapter refuses conflicting revision ${validated.revision} for ${validated.projectId}`,
-          );
-        }
-      }
+      this.assertWritable(existing, validated);
       this.inMemoryProfiles.set(validated.projectId, validated);
       return;
     }
@@ -68,21 +55,7 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
     await withFileLock(lockPath, async () => {
       const profiles = await this.readProfilesFromDisk(target);
       const existing = profiles.get(validated.projectId);
-      if (existing !== undefined) {
-        if (validated.revision < existing.revision) {
-          throw new Error(
-            `ProjectProfileRepositoryAdapter refuses stale revision ${validated.revision} for ${validated.projectId}; stored revision is ${existing.revision}`,
-          );
-        }
-        if (
-          validated.revision === existing.revision &&
-          JSON.stringify(copy(validated)) !== JSON.stringify(copy(existing))
-        ) {
-          throw new Error(
-            `ProjectProfileRepositoryAdapter refuses conflicting revision ${validated.revision} for ${validated.projectId}`,
-          );
-        }
-      }
+      this.assertWritable(existing, validated);
       profiles.set(validated.projectId, validated);
       const list = [...profiles.values()]
         .sort((left, right) => left.projectId.localeCompare(right.projectId))
@@ -100,6 +73,43 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
     const profiles = await this.readProfilesFromDisk(target);
     const found = profiles.get(projectId);
     return found === undefined ? null : copy(found);
+  }
+
+  async listProfiles(): Promise<readonly ProjectProfileRecord[]> {
+    const target = this.statePath;
+    if (target === null) {
+      return [...this.inMemoryProfiles.values()]
+        .sort((left, right) => left.projectId.localeCompare(right.projectId))
+        .map(copy);
+    }
+    const profiles = await this.readProfilesFromDisk(target);
+    return [...profiles.values()]
+      .sort((left, right) => left.projectId.localeCompare(right.projectId))
+      .map(copy);
+  }
+
+  /**
+   * Strict compare-and-swap: a new id is stored only at revision 0; an
+   * existing id is stored only when the incoming revision is exactly one more
+   * than the stored revision. Anything else is a `ProjectProfileRevisionConflictError`.
+   */
+  private assertWritable(
+    existing: ProjectProfileRecord | undefined,
+    incoming: ProjectProfileRecord,
+  ): void {
+    if (existing === undefined) {
+      if (incoming.revision !== 0) {
+        throw new ProjectProfileRevisionConflictError(incoming.projectId, -1, incoming.revision);
+      }
+      return;
+    }
+    if (incoming.revision !== existing.revision + 1) {
+      throw new ProjectProfileRevisionConflictError(
+        incoming.projectId,
+        existing.revision,
+        incoming.revision,
+      );
+    }
   }
 
   private get statePath(): string | null {

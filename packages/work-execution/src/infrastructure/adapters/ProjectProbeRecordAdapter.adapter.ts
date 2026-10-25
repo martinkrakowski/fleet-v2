@@ -34,7 +34,10 @@ export class ProjectProbeRecordAdapter implements ProjectProbeRecordPort {
       return { outcome: 'recorded' };
     }
     if (answerRecord.outcome === 'rejected') {
-      return { outcome: 'rejected', reason: String(answerRecord.reason ?? '') };
+      if (typeof answerRecord.reason !== 'string' || answerRecord.reason.trim() === '') {
+        throw new Error('ProjectProbeRecordAdapter received a rejection without a reason');
+      }
+      return { outcome: 'rejected', reason: answerRecord.reason };
     }
     throw new Error('ProjectProbeRecordAdapter received an unexpected answer');
   }

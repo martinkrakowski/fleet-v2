@@ -171,4 +171,35 @@ describe('ProjectProbeRecordAdapter', () => {
       /^Not implemented: ProjectProbeRecordAdapter$/,
     );
   });
+
+describe('delegate adapters refuse malformed answers at the boundary', () => {
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5])(
+    'refuses a profile revision of %s',
+    async (revision) => {
+      const adapter = new ProjectProfileReadAdapter({
+        inspect: async () => ({
+          outcome: 'found',
+          profile: { projectId: 'p', status: 'active', repository: 'r', clones: {}, gateProcedures: [], revision },
+        }),
+      });
+      await expect(adapter.readProjectProfile('p')).rejects.toThrow(
+        'ProjectProfileReadAdapter received a malformed profile for p',
+      );
+    },
+  );
+
+  it.each([{ outcome: 'rejected' }, { outcome: 'rejected', reason: '' }, { outcome: 'rejected', reason: { x: 1 } }])(
+    'refuses a rejection without a string reason: %j',
+    async (answer) => {
+      const adapter = new ProjectProbeRecordAdapter({ record: async () => answer });
+      await expect(
+        adapter.recordProjectProbe({
+          projectId: 'p',
+          expectedRevision: 0,
+          receipt: { probedAtIso: '2026-10-24T00:00:00.000Z', probedFrom: 'orchestrator', checks: [] },
+        }),
+      ).rejects.toThrow('ProjectProbeRecordAdapter received a rejection without a reason');
+    },
+  );
+});
 });

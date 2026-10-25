@@ -59,7 +59,7 @@ function mapProfile(projectId: string, profile: Record<string, unknown>): Projec
   if (!isStringArray(profile.gateProcedures)) {
     throw malformed(projectId);
   }
-  if (typeof profile.revision !== 'number') {
+  if (!Number.isInteger(profile.revision) || (profile.revision as number) < 0) {
     throw malformed(projectId);
   }
   return {

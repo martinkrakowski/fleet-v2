@@ -60,6 +60,7 @@ function fixtureProjectData(
 
 function shapeReason(
   payload: unknown,
+  path: string,
   fallback: string,
 ): string {
   const code =
@@ -69,7 +70,7 @@ function shapeReason(
       ? ((payload as Record<string, unknown>).code as string)
       : null;
   return code !== null && code !== "OK"
-    ? `api boundary answered ${code} for /v1/projects`
+    ? `api boundary answered ${code} for ${path}`
     : fallback;
 }
 
@@ -90,7 +91,11 @@ export async function loadProjects(
   const parsed = parseProjectListEnvelope(endpoint.data);
   if (!parsed) {
     return fixtureProjectsData(
-      shapeReason(endpoint.data, "api boundary returned an unexpected project list shape"),
+      shapeReason(
+        endpoint.data,
+        "/v1/projects",
+        "api boundary returned an unexpected project list shape",
+      ),
       observedAtIso,
     );
   }
@@ -131,7 +136,11 @@ export async function loadProject(
   const parsed = parseProjectEnvelope(endpoint.data);
   if (!parsed) {
     return fixtureProjectData(
-      shapeReason(endpoint.data, "api boundary returned an unexpected project shape"),
+      shapeReason(
+        endpoint.data,
+        `/v1/projects/${encodeURIComponent(projectId)}`,
+        "api boundary returned an unexpected project shape",
+      ),
       observedAtIso,
       projectId,
     );

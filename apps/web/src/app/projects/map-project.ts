@@ -174,6 +174,7 @@ function parseAllowedPathPrefixes(value: unknown): readonly string[] | undefined
     return undefined;
   }
   const out: string[] = [];
+  const seen = new Set<string>();
   for (const prefix of value) {
     if (
       !isNonEmptyString(prefix) ||
@@ -182,10 +183,16 @@ function parseAllowedPathPrefixes(value: unknown): readonly string[] | undefined
     ) {
       return undefined;
     }
-    out.push(prefix);
+    if (!seen.has(prefix)) {
+      seen.add(prefix);
+      out.push(prefix);
+    }
   }
   return Object.freeze(out);
 }
+
+const FORBIDDEN_CAPABILITY_NAME_PATTERN =
+  /(token|secret|credential|password|passphrase|api[-_]?key|private[-_]?key|access[-_]?key|authorization|cookie)/i;
 
 function parseCapabilities(
   value: unknown,
@@ -195,7 +202,12 @@ function parseCapabilities(
   }
   const copy: Record<string, boolean | string> = {};
   for (const [name, cap] of Object.entries(value)) {
-    if (name.trim().length === 0) {
+    const trimmed = name.trim();
+    if (
+      trimmed.length === 0 ||
+      FORBIDDEN_HOST_NAMES.has(trimmed.toLowerCase()) ||
+      FORBIDDEN_CAPABILITY_NAME_PATTERN.test(name)
+    ) {
       return undefined;
     }
     if (typeof cap !== "boolean" && typeof cap !== "string") {

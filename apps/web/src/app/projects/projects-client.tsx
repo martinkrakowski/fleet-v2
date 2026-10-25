@@ -68,9 +68,12 @@ export function ProjectsClient({ data }: { data: ProjectsData }) {
         {data.source === "api"
           ? `Recorded state, not a runner observation · read ${data.observedAtIso} · refreshes every 30 s`
           : `Sample data, not this station · read ${data.observedAtIso}${
-              data.fallbackReason !== NOT_CONFIGURED_REASON
-                ? " · the API did not answer; retrying every 30 s"
-                : ""
+              data.fallbackReason === NOT_CONFIGURED_REASON
+                ? ""
+                : data.fallbackReason?.startsWith("api boundary answered") ||
+                    data.fallbackReason?.startsWith("api boundary returned an unexpected")
+                  ? " · the API answered with something this page cannot read; retrying every 30 s"
+                  : " · the API did not answer; retrying every 30 s"
             }`}
       </p>
       <Card className={styles.listCard}>

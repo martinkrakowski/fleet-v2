@@ -176,6 +176,47 @@ describe("parseProjectListEnvelope", () => {
       parseProjectListEnvelope(listEnvelope([projectWire({ defaultBranch: null })])),
     )?.toHaveLength(1);
   });
+
+  it("returns null for forbidden or secret-shaped runner capability names", () => {
+    const protoCaps = JSON.parse('{"__proto__":true}');
+    expect(
+      parseProjectListEnvelope(
+        listEnvelope([projectWire({ runnerCapabilities: protoCaps })]),
+      ),
+    ).toBeNull();
+
+    for (const name of ["constructor", "prototype", "hasOwnProperty", "HASOWNPROPERTY", "apiToken"]) {
+      expect(
+        parseProjectListEnvelope(
+          listEnvelope([
+            projectWire({ runnerCapabilities: { [name]: true } }),
+          ]),
+        ),
+      ).toBeNull();
+    }
+  });
+
+  it("drops duplicate defaultAllowedPathPrefixes while keeping first occurrence", () => {
+    const parsed = parseProjectListEnvelope(
+      listEnvelope([
+        projectWire({
+          defaultAllowedPathPrefixes: [
+            "packages/**",
+            "apps/**",
+            "packages/**",
+            "docs/**",
+            "apps/**",
+          ],
+        }),
+      ]),
+    );
+
+    expect(parsed?.[0].defaultAllowedPathPrefixes).toEqual([
+      "packages/**",
+      "apps/**",
+      "docs/**",
+    ]);
+  });
 });
 
 describe("parseProjectEnvelope", () => {

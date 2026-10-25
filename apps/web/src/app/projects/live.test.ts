@@ -306,6 +306,22 @@ describe("loadProject", () => {
     );
     expect(data.project?.projectId).toBe("fleet-v2");
   });
+
+  it("reports the envelope code for /v1/projects/<id> when the payload has a non-OK string code", async () => {
+    const data = await loadProject(
+      "fleet-v2",
+      fakeClient({
+        view: { source: "api", data: { code: "REFUSED" } },
+      }),
+      now,
+    );
+
+    expect(data.source).toBe("fixture-fallback");
+    expect(data.fallbackReason).toBe(
+      "api boundary answered REFUSED for /v1/projects/fleet-v2",
+    );
+    expect(data.project?.projectId).toBe("fleet-v2");
+  });
 });
 
 describe("projects client source text", () => {
@@ -333,13 +349,24 @@ describe("projects client source text", () => {
     expect(fallbackBranch).not.toContain("the table is a recorded read of");
   });
 
-  it("pins both data.source header branches and the missing-sample branch in project-detail-client.tsx", () => {
+  it("pins both data.source header branches, the 404 branch, the missing-sample branch and the CLI commands card in project-detail-client.tsx", () => {
+    expect(detailSource).toContain(
+      "the API answered 404 for GET /v1/projects/{projectId}",
+    );
+    expect(detailSource).toContain(
+      "the API answered 404 for GET /v1/projects/${projectId}",
+    );
+    expect(detailSource).not.toContain("NOT_FOUND");
     expect(detailSource).toContain(
       "not in the sample data (the API is not answering: {reason})",
     );
     expect(detailSource).toContain(
       "not in the sample data (the API is not answering: ${reason})",
     );
+    expect(detailSource).toContain(
+      '<CardHeader title="CLI commands" subtitle="CLI commands for this project" />',
+    );
+    expect(detailSource).not.toContain('title="Actions"');
 
     const profileHeaderStart = detailSource.indexOf("title={project.displayName}");
     const actionsStart = detailSource.indexOf("actions={", profileHeaderStart);
@@ -354,5 +381,24 @@ describe("projects client source text", () => {
     expect(fallbackBranch).toContain("the rows are sample data");
     expect(fallbackBranch).toContain("not a live read of");
     expect(fallbackBranch).not.toContain("read live from");
+  });
+
+  it("pins both fixture-fallback meta line retry texts in projects-client.tsx and project-detail-client.tsx", () => {
+    for (const source of [listSource, detailSource]) {
+      const metaStart = source.indexOf("<p className={styles.meta}>");
+      const metaEnd = source.indexOf("</p>", metaStart);
+      const metaBlock = source.slice(metaStart, metaEnd);
+
+      expect(metaBlock).toContain('startsWith("api boundary answered")');
+      expect(metaBlock).toContain(
+        'startsWith("api boundary returned an unexpected")',
+      );
+      expect(metaBlock).toContain(
+        "the API answered with something this page cannot read; retrying every 30 s",
+      );
+      expect(metaBlock).toContain(
+        "the API did not answer; retrying every 30 s",
+      );
+    }
   });
 });

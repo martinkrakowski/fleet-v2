@@ -33,7 +33,7 @@ export function ProjectDetailClient({
           title="Project not registered"
           description={
             <>
-              The API answered <b>404 NOT_FOUND</b> for <b>{projectId}</b> —
+              <b>{projectId}</b> is not registered (the API answered 404 for GET /v1/projects/{projectId}) —
               live, not sample data. Register it first, then it will appear on{" "}
               <Link href="/projects">/projects</Link>.
             </>
@@ -42,7 +42,10 @@ export function ProjectDetailClient({
             <RouteChip>live · GET /v1/projects/{projectId}</RouteChip>
           }
         />
-        <Banner tone="warn" title={`${projectId} is not registered.`}>
+        <Banner
+          tone="warn"
+          title={`${projectId} is not registered (the API answered 404 for GET /v1/projects/${projectId}).`}
+        >
           <p>
             Use <code>fleet-v2 projects add</code> for a new project profile, or{" "}
             <code>fleet-v2 projects adopt</code> to register a project that
@@ -127,9 +130,12 @@ export function ProjectDetailClient({
         {data.source === "api"
           ? `Recorded state, not a runner observation · read ${data.observedAtIso} · refreshes every 30 s`
           : `Sample data, not this station · read ${data.observedAtIso}${
-              data.fallbackReason !== NOT_CONFIGURED_REASON
-                ? " · the API did not answer; retrying every 30 s"
-                : ""
+              data.fallbackReason === NOT_CONFIGURED_REASON
+                ? ""
+                : data.fallbackReason?.startsWith("api boundary answered") ||
+                    data.fallbackReason?.startsWith("api boundary returned an unexpected")
+                  ? " · the API answered with something this page cannot read; retrying every 30 s"
+                  : " · the API did not answer; retrying every 30 s"
             }`}
       </p>
       <div
@@ -262,7 +268,7 @@ export function ProjectDetailClient({
         </Card>
 
         <Card>
-          <CardHeader title="Actions" subtitle="CLI commands for this project" />
+          <CardHeader title="CLI commands" subtitle="CLI commands for this project" />
           <CardBody>
             <p className={styles.notice}>
               Writes from the web arrive with the web write path; use the CLI

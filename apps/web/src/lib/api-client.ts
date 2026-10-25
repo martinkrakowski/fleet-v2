@@ -15,6 +15,8 @@ import * as fs from "node:fs";
 /** Status the API boundary returns for a use case that is not implemented. */
 export const NOT_IMPLEMENTED_STATUS = 501;
 
+const DEFAULT_TIMEOUT_MS = 5000;
+
 export interface FleetWebApiClientOptions {
   /** Origin of the API boundary, e.g. `http://localhost:3001`. */
   readonly baseUrl?: string;
@@ -22,6 +24,8 @@ export interface FleetWebApiClientOptions {
   readonly fetchImpl?: typeof fetch;
   /** Explicit token file path override. */
   readonly tokenFile?: string;
+  /** Per-request timeout in milliseconds (default 5000). */
+  readonly timeoutMs?: number;
 }
 
 /** Where the payload in a `LiveEndpointResult` came from. */
@@ -89,6 +93,49 @@ function describeFailure(error: unknown): string {
   return error instanceof Error ? error.message : "unknown error";
 }
 
+function isAbortError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+  const name = (error as { readonly name?: unknown }).name;
+  return name === "TimeoutError" || name === "AbortError";
+}
+
+function withAbortSignal<T>(
+  promise: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  if (signal.aborted) {
+    return Promise.reject(
+      signal.reason ??
+        Object.assign(new Error("The operation was aborted"), {
+          name: "AbortError",
+        }),
+    );
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      reject(
+        signal.reason ??
+          Object.assign(new Error("The operation was aborted"), {
+            name: "AbortError",
+          }),
+      );
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 export function readWebClientApiToken(tokenFile?: string): string | null {
   if (typeof window !== "undefined") {
     return null;
@@ -138,6 +185,7 @@ export function createFleetWebApiClient(
           : undefined
         )?.trim() ?? "";
   const fetchImpl = options.fetchImpl ?? fetch;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const token = readWebClientApiToken(options.tokenFile);
 
   /**
@@ -164,14 +212,24 @@ export function createFleetWebApiClient(
       headers.authorization = `Bearer ${token}`;
     }
 
+    const signal = AbortSignal.timeout(timeoutMs);
+
     let response: Response;
     try {
       response = await fetchImpl(url, {
         headers,
         // Every API read is live state: a server render must never reuse a cached answer.
         cache: "no-store",
+        signal,
       });
     } catch (error) {
+      if (isAbortError(error)) {
+        return fixtureFallback(
+          null,
+          fallback,
+          `api boundary timed out after ${timeoutMs} ms for ${path}`,
+        );
+      }
       return fixtureFallback(
         null,
         fallback,
@@ -198,8 +256,15 @@ export function createFleetWebApiClient(
 
     let payload: unknown;
     try {
-      payload = await response.json();
+      payload = await withAbortSignal(response.json(), signal);
     } catch (error) {
+      if (isAbortError(error)) {
+        return fixtureFallback(
+          null,
+          fallback,
+          `api boundary timed out after ${timeoutMs} ms for ${path}`,
+        );
+      }
       return fixtureFallback(
         response.status,
         fallback,

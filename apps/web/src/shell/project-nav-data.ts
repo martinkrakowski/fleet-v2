@@ -6,7 +6,9 @@
  * be trusted (unconfigured, unreachable or an unexpected shape) falls back to
  * the deterministic station fixture list and reports why. Attempt counts are
  * best-effort: a failed or truncated attempts read yields null counts so the
- * nav shows no count rather than a wrong one.
+ * nav shows no count rather than a wrong one. "All" (`totalAttempts`) counts
+ * every attempt the API lists (all projects, retired and unregistered
+ * included), matching an unfiltered `/lanes`.
  */
 
 import {
@@ -29,20 +31,37 @@ export interface ProjectNavProject {
 export interface ProjectNavData {
   readonly source: "api" | "fixture-fallback";
   readonly fallbackReason: string | null;
+  readonly countsReason: string | null;
   readonly projects: readonly ProjectNavProject[];
+  /**
+   * Count for the "All" row: every attempt the API lists (all projects,
+   * retired and unregistered included), matching an unfiltered `/lanes`.
+   */
   readonly totalAttempts: number | null;
 }
 
-function fixtureProjectNavData(reason: string): ProjectNavData {
-  return {
-    source: "fixture-fallback",
-    fallbackReason: reason,
-    projects: getProjectAttemptCounts().map(([name, attempts]) => ({
+const FIXTURE_PROJECTS: readonly ProjectNavProject[] = Object.freeze(
+  getProjectAttemptCounts().map(([name, attempts]) =>
+    Object.freeze({
       projectId: name,
       label: name,
       attempts,
-    })),
-    totalAttempts: totalAttemptsCount,
+    }),
+  ),
+);
+
+const FIXTURE_PROJECT_NAV: ProjectNavData = Object.freeze({
+  source: "fixture-fallback",
+  fallbackReason: null,
+  countsReason: null,
+  projects: FIXTURE_PROJECTS,
+  totalAttempts: totalAttemptsCount,
+});
+
+function fixtureProjectNavData(reason: string): ProjectNavData {
+  return {
+    ...FIXTURE_PROJECT_NAV,
+    fallbackReason: reason,
   };
 }
 
@@ -123,9 +142,21 @@ async function loadProjectNavFrom(client: FleetWebApiClient): Promise<ProjectNav
 
   if (parsedAttempts === null || parsedAttempts.truncated) {
     // Keep the live project list; counts are unavailable, show none.
+    const countsReason =
+      attemptsEndpoint.source === "fixture-fallback"
+        ? (attemptsEndpoint.fallbackReason ??
+          "the api client gave no fallback reason")
+        : parsedAttempts === null
+          ? shapeReason(
+              attemptsEndpoint.data,
+              "/v1/attempts",
+              "api boundary returned an unexpected attempt list shape",
+            )
+          : "attempt counts unavailable: more than 200 attempts";
     return {
       source: "api",
       fallbackReason: null,
+      countsReason,
       projects: projects
         .map((project) => ({ ...project, attempts: null }))
         .sort((a, b) => compareByProjectId(a.projectId, b.projectId)),
@@ -144,12 +175,15 @@ async function loadProjectNavFrom(client: FleetWebApiClient): Promise<ProjectNav
   return {
     source: "api",
     fallbackReason: null,
+    countsReason: null,
     projects: projects
       .map((project) => ({
         ...project,
         attempts: counts.get(project.projectId) ?? 0,
       }))
       .sort((a, b) => compareByProjectId(a.projectId, b.projectId)),
+    // "All" counts every attempt the API lists (all projects, retired and
+    // unregistered included), matching an unfiltered /lanes.
     totalAttempts: parsedAttempts.rows.length,
   };
 }

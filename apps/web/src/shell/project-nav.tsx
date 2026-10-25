@@ -25,7 +25,7 @@ export function ProjectNav({ data }: { data: ProjectNavData }) {
     <div className="sidebar-section sidebar-projects">
       <div
         className="sidebar-label"
-        title={fallback ? (data.fallbackReason ?? undefined) : undefined}
+        title={fallback ? (data.fallbackReason ?? undefined) : (data.countsReason ?? undefined)}
       >
         {fallback ? "Projects · sample" : `Projects · ${data.projects.length}`}
       </div>

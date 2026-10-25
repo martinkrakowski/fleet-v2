@@ -204,6 +204,104 @@ describe("createFleetWebApiClient", () => {
     });
   });
 
+  describe("request timeout", () => {
+    it("passes an AbortSignal in the request init", async () => {
+      let capturedSignal: AbortSignal | null | undefined;
+      const client = createFleetWebApiClient({
+        baseUrl: BASE_URL,
+        fetchImpl: async (_input, init) => {
+          capturedSignal = init?.signal;
+          return jsonResponse(200, WORK_ORDER_FIXTURE);
+        },
+      });
+
+      await client.fetchCoordinationView(WORK_ORDER_FIXTURE);
+
+      expect(capturedSignal).toBeInstanceOf(AbortSignal);
+    });
+
+    it("falls back with the timeout reason when fetch never resolves until aborted", async () => {
+      const client = createFleetWebApiClient({
+        baseUrl: BASE_URL,
+        timeoutMs: 20,
+        fetchImpl: (_input, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal;
+            if (!signal) {
+              return;
+            }
+            if (signal.aborted) {
+              reject(signal.reason);
+              return;
+            }
+            signal.addEventListener(
+              "abort",
+              () => {
+                reject(signal.reason);
+              },
+              { once: true },
+            );
+          }),
+      });
+
+      const result = await client.fetchCoordinationView(WORK_ORDER_FIXTURE);
+
+      expect(result).toEqual({
+        source: "fixture-fallback",
+        status: null,
+        data: WORK_ORDER_FIXTURE,
+        fallbackReason:
+          "api boundary timed out after 20 ms for /v1/coordination",
+      });
+    });
+
+    it("covers response.json() with the same timeout signal and returns status null", async () => {
+      const client = createFleetWebApiClient({
+        baseUrl: BASE_URL,
+        timeoutMs: 20,
+        fetchImpl: async () =>
+          ({
+            ok: true,
+            status: 200,
+            json: () => new Promise<unknown>(() => {}),
+          }) as Response,
+      });
+
+      const result = await client.fetchAttentionView(WORK_ORDER_FIXTURE);
+
+      expect(result).toEqual({
+        source: "fixture-fallback",
+        status: null,
+        data: WORK_ORDER_FIXTURE,
+        fallbackReason: "api boundary timed out after 20 ms for /v1/attention",
+      });
+    });
+
+    it("treats an AbortError rejection as a timeout with status null", async () => {
+      const abortError = Object.assign(new Error("aborted"), {
+        name: "AbortError",
+      });
+      const client = createFleetWebApiClient({
+        baseUrl: BASE_URL,
+        timeoutMs: 20,
+        fetchImpl: () => Promise.reject(abortError),
+      });
+
+      const result = await client.fetchProjectList(
+        { status: "active" },
+        WORK_ORDER_FIXTURE,
+      );
+
+      expect(result).toEqual({
+        source: "fixture-fallback",
+        status: null,
+        data: WORK_ORDER_FIXTURE,
+        fallbackReason:
+          "api boundary timed out after 20 ms for /v1/projects?status=active",
+      });
+    });
+  });
+
   describe("other unsuccessful statuses", () => {
     it("falls back on a 404 and keeps the status", async () => {
       const client = clientWith(() =>

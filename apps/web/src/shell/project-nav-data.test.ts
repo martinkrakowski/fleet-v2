@@ -12,9 +12,10 @@ import {
   getProjectAttemptCounts,
   totalAttemptsCount,
 } from "../fixtures/station-fixture";
-import type {
-  FleetWebApiClient,
-  LiveEndpointResult,
+import {
+  createFleetWebApiClient,
+  type FleetWebApiClient,
+  type LiveEndpointResult,
 } from "../lib/api-client";
 
 const NOW = "2026-10-25T09:00:00Z";
@@ -188,6 +189,7 @@ describe("loadProjectNav", () => {
     expect(client.queries.attemptList).toEqual([{ limit: 200 }]);
     expect(data.source).toBe("api");
     expect(data.fallbackReason).toBeNull();
+    expect(data.countsReason).toBeNull();
     expect(data.projects).toEqual([
       { projectId: "alpha", label: "Alpha Name", attempts: 1 },
       { projectId: "beta", label: "Beta Name", attempts: 2 },
@@ -213,11 +215,39 @@ describe("loadProjectNav", () => {
     const data = await loadProjectNav(client);
 
     expect(data.source).toBe("api");
+    expect(data.fallbackReason).toBeNull();
+    expect(data.countsReason).toBeNull();
     expect(data.projects).toEqual([
       { projectId: "alpha", label: "Alpha Name", attempts: 0 },
       { projectId: "beta", label: "Beta Name", attempts: 1 },
     ]);
     expect(data.totalAttempts).toBe(1);
+  });
+
+  it("counts an attempt for a project not in the active list toward totalAttempts without adding a row", async () => {
+    const client = fakeClient(
+      {
+        source: "api",
+        data: projectsEnvelope([profile("alpha", "Alpha Name")]),
+      },
+      {
+        source: "api",
+        data: attemptsEnvelope([
+          attemptRow("att-1", "wo-alpha-1", "alpha"),
+          attemptRow("att-2", "wo-retired-1", "retired-or-unregistered"),
+        ]),
+      },
+    );
+
+    const data = await loadProjectNav(client);
+
+    expect(data.source).toBe("api");
+    expect(data.fallbackReason).toBeNull();
+    expect(data.countsReason).toBeNull();
+    expect(data.projects).toEqual([
+      { projectId: "alpha", label: "Alpha Name", attempts: 1 },
+    ]);
+    expect(data.totalAttempts).toBe(2);
   });
 
   it("sorts by explicit code-unit compare, not locale order", async () => {
@@ -258,6 +288,10 @@ describe("loadProjectNav", () => {
     const data = await loadProjectNav(client);
 
     expect(data.source).toBe("api");
+    expect(data.fallbackReason).toBeNull();
+    expect(data.countsReason).toBe(
+      "attempt counts unavailable: more than 200 attempts",
+    );
     expect(data.projects).toEqual([
       { projectId: "alpha", label: "Alpha Name", attempts: null },
     ]);
@@ -281,6 +315,9 @@ describe("loadProjectNav", () => {
 
     expect(data.source).toBe("api");
     expect(data.fallbackReason).toBeNull();
+    expect(data.countsReason).toBe(
+      "api boundary returned 501 NOT_IMPLEMENTED for /v1/attempts",
+    );
     expect(data.projects).toEqual([
       { projectId: "alpha", label: "Alpha Name", attempts: null },
     ]);
@@ -302,10 +339,32 @@ describe("loadProjectNav", () => {
     const data = await loadProjectNav(client);
 
     expect(data.source).toBe("api");
+    expect(data.fallbackReason).toBeNull();
+    expect(data.countsReason).toBe(
+      "api boundary returned an unexpected attempt list shape",
+    );
     expect(data.projects).toEqual([
       { projectId: "alpha", label: "Alpha Name", attempts: null },
     ]);
     expect(data.totalAttempts).toBeNull();
+  });
+
+  it("falls back to the fixture with 'api boundary is not configured' when given an unconfigured client", async () => {
+    const client = createFleetWebApiClient({ baseUrl: "" });
+
+    const data = await loadProjectNav(client);
+
+    expect(data.source).toBe("fixture-fallback");
+    expect(data.fallbackReason).toBe("api boundary is not configured");
+    expect(data.countsReason).toBeNull();
+    expect(data.projects).toEqual(
+      getProjectAttemptCounts().map(([name, attempts]) => ({
+        projectId: name,
+        label: name,
+        attempts,
+      })),
+    );
+    expect(data.totalAttempts).toBe(totalAttemptsCount);
   });
 
   it("falls back to the fixture with the client's reason when the project read fails", async () => {
@@ -324,6 +383,7 @@ describe("loadProjectNav", () => {
     expect(data.fallbackReason).toBe(
       "api boundary returned 501 NOT_IMPLEMENTED for /v1/projects",
     );
+    expect(data.countsReason).toBeNull();
     expect(data.projects).toEqual(
       getProjectAttemptCounts().map(([name, attempts]) => ({
         projectId: name,
@@ -349,6 +409,33 @@ describe("loadProjectNav", () => {
     expect(data.fallbackReason).toBe(
       "api boundary returned an unexpected project list shape",
     );
+    expect(data.countsReason).toBeNull();
+    expect(data.projects).toEqual(
+      getProjectAttemptCounts().map(([name, attempts]) => ({
+        projectId: name,
+        label: name,
+        attempts,
+      })),
+    );
+    expect(data.totalAttempts).toBe(totalAttemptsCount);
+  });
+
+  it("falls back with the envelope code when /v1/projects answers with a non-OK code", async () => {
+    const client = fakeClient(
+      {
+        source: "api",
+        data: { code: "REFUSED" },
+      },
+      { source: "api", data: attemptsEnvelope([]) },
+    );
+
+    const data = await loadProjectNav(client);
+
+    expect(data.source).toBe("fixture-fallback");
+    expect(data.fallbackReason).toBe(
+      "api boundary answered REFUSED for /v1/projects",
+    );
+    expect(data.countsReason).toBeNull();
     expect(data.projects).toEqual(
       getProjectAttemptCounts().map(([name, attempts]) => ({
         projectId: name,
@@ -369,6 +456,7 @@ describe("loadProjectNav", () => {
 
     expect(data.source).toBe("fixture-fallback");
     expect(data.fallbackReason).toBe("the api client gave no fallback reason");
+    expect(data.countsReason).toBeNull();
     expect(data.projects).toEqual(
       getProjectAttemptCounts().map(([name, attempts]) => ({
         projectId: name,
@@ -378,6 +466,7 @@ describe("loadProjectNav", () => {
     );
     expect(data.totalAttempts).toBe(totalAttemptsCount);
   });
+});
 
 describe("loadProjectNav never takes the layout down", () => {
   it("falls back to the labelled sample list when the client throws", async () => {
@@ -391,7 +480,7 @@ describe("loadProjectNav never takes the layout down", () => {
     const nav = await loadProjectNav(client);
     expect(nav.source).toBe("fixture-fallback");
     expect(nav.fallbackReason).toBe("the project list could not be loaded");
+    expect(nav.countsReason).toBeNull();
     expect(nav.projects.length).toBeGreaterThan(0);
   });
-});
 });

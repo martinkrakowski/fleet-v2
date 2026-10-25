@@ -51,9 +51,11 @@ describe("ProjectNav is fed by the server layout and stays client-bound", () => 
     expect(nav).toMatch(/data\.totalAttempts !== null/);
   });
 
-  it("labels fixture fallback sections as sample with the reason as title", () => {
+  it("labels fixture fallback sections as sample with the reason as title and exposes countsReason", () => {
     expect(nav).toContain("Projects · sample");
-    expect(nav).toContain("title={fallback ? (data.fallbackReason");
+    expect(nav).toContain(
+      "title={fallback ? (data.fallbackReason ?? undefined) : (data.countsReason ?? undefined)}",
+    );
   });
 
   it("never imports a loader or the api client at runtime (type imports only)", () => {

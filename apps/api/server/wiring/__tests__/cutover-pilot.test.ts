@@ -34,7 +34,11 @@ import capabilitiesGet from "../../routes/v1/capabilities.get";
 import coordinationGet from "../../routes/v1/coordination.get";
 import forgeIndexPost from "../../routes/v1/forge/index.post";
 import decisionsIndexPost from "../../routes/v1/decisions/index.post";
+import projectsIndexGet from "../../routes/v1/projects/index.get";
 import projectsIndexPost from "../../routes/v1/projects/index.post";
+import projectIdGet from "../../routes/v1/projects/[id].get";
+import projectIdPatch from "../../routes/v1/projects/[id].patch";
+import projectRetirePost from "../../routes/v1/projects/[id]/retire.post";
 import observationsIndexPost from "../../routes/v1/observations/index.post";
 import relaysIndexPost from "../../routes/v1/relays/index.post";
 import verificationsIndexPost from "../../routes/v1/verifications/index.post";
@@ -93,7 +97,7 @@ let apiServer: Server;
 
 beforeAll(async () => {
   const router = createRouter();
-  const registrations: ReadonlyArray<readonly [string, "get" | "post", EventHandler]> = [
+  const registrations: ReadonlyArray<readonly [string, "get" | "post" | "patch", EventHandler]> = [
     ["/v1/attention", "get", attentionGet],
     ["/v1/capabilities", "get", capabilitiesGet],
     ["/v1/coordination", "get", coordinationGet],
@@ -114,7 +118,11 @@ beforeAll(async () => {
     ["/v1/knowledge/:id/publish", "post", knowledgePublishPost],
     ["/v1/knowledge/:id/reuse", "post", knowledgeReusePost],
     ["/v1/knowledge/:id/supersede", "post", knowledgeSupersedePost],
+    ["/v1/projects", "get", projectsIndexGet],
     ["/v1/projects", "post", projectsIndexPost],
+    ["/v1/projects/:id", "get", projectIdGet],
+    ["/v1/projects/:id", "patch", projectIdPatch],
+    ["/v1/projects/:id/retire", "post", projectRetirePost],
     ["/v1/decisions", "post", decisionsIndexPost],
     ["/v1/authorizations/resolve", "post", authorizationsResolvePost],
     ["/v1/authorizations/:id/consume", "post", authorizationsConsumePost],
@@ -156,9 +164,9 @@ afterAll(async () => {
   );
 });
 
-/** Call one route; POST bodies default to the empty object `{}`. */
+/** Call one route; POST and PATCH bodies default to the empty object `{}`. */
 async function callRoute(
-  method: "get" | "post",
+  method: "get" | "post" | "patch",
   path: string,
   body?: unknown,
 ): Promise<{ status: number; payload: unknown }> {
@@ -344,7 +352,7 @@ const MATRIX_VERIFICATION_REQUEST = {
 // Route matrix tables.
 // ---------------------------------------------------------------------------
 
-const ALL_ROUTES: ReadonlyArray<{ method: "get" | "post"; path: string }> = [
+const ALL_ROUTES: ReadonlyArray<{ method: "get" | "post" | "patch"; path: string }> = [
   { method: "get", path: "/v1/work-orders/wo-matrix" },
   { method: "get", path: "/v1/attempts/attempt-matrix" },
   { method: "get", path: "/v1/heads/aaaabbbbccccdddd/evidence" },
@@ -371,7 +379,11 @@ const ALL_ROUTES: ReadonlyArray<{ method: "get" | "post"; path: string }> = [
   { method: "post", path: "/v1/knowledge/ke-matrix/publish" },
   { method: "post", path: "/v1/knowledge/ke-matrix/reuse" },
   { method: "post", path: "/v1/knowledge/ke-matrix/supersede" },
+  { method: "get", path: "/v1/projects" },
   { method: "post", path: "/v1/projects" },
+  { method: "get", path: "/v1/projects/proj-matrix" },
+  { method: "patch", path: "/v1/projects/proj-matrix" },
+  { method: "post", path: "/v1/projects/proj-matrix/retire" },
   { method: "post", path: "/v1/decisions" },
   { method: "post", path: "/v1/authorizations/resolve" },
   { method: "post", path: "/v1/authorizations/grant-matrix/consume" },
@@ -382,13 +394,17 @@ const ALL_ROUTES: ReadonlyArray<{ method: "get" | "post"; path: string }> = [
 
 /**
  * While configured, every route answers an empty `{}` body (or empty query)
- * with HTTP 200 and the bound use case's structured domain outcome instead
- * of `501 NOT_IMPLEMENTED`.
+ * with the bound use case's structured domain outcome instead of
+ * `501 NOT_IMPLEMENTED`. Most answer HTTP 200 with the OK envelope; a route
+ * that maps a rejected outcome to a client error carries its own status and
+ * envelope code.
  */
 const CONFIGURED_EMPTY_BODY_ROUTES: ReadonlyArray<{
-  method: "get" | "post";
+  method: "get" | "post" | "patch";
   path: string;
   outcome: string;
+  status?: number;
+  code?: string;
 }> = [
   { method: "post", path: "/v1/work-orders", outcome: "rejected" },
   { method: "get", path: "/v1/work-orders/wo-matrix", outcome: "not-found" },
@@ -413,7 +429,29 @@ const CONFIGURED_EMPTY_BODY_ROUTES: ReadonlyArray<{
   { method: "post", path: "/v1/knowledge/ke-matrix/publish", outcome: "rejected" },
   { method: "post", path: "/v1/knowledge/ke-matrix/reuse", outcome: "rejected" },
   { method: "post", path: "/v1/knowledge/ke-matrix/supersede", outcome: "rejected" },
-  { method: "post", path: "/v1/projects", outcome: "rejected" },
+  { method: "get", path: "/v1/projects", outcome: "listed" },
+  { method: "post", path: "/v1/projects", outcome: "rejected", status: 422, code: "REFUSED" },
+  {
+    method: "get",
+    path: "/v1/projects/proj-matrix",
+    outcome: "not-found",
+    status: 404,
+    code: "NOT_FOUND",
+  },
+  {
+    method: "patch",
+    path: "/v1/projects/proj-matrix",
+    outcome: "rejected",
+    status: 422,
+    code: "REFUSED",
+  },
+  {
+    method: "post",
+    path: "/v1/projects/proj-matrix/retire",
+    outcome: "rejected",
+    status: 422,
+    code: "REFUSED",
+  },
   { method: "get", path: "/v1/capabilities", outcome: "not-found" },
   { method: "post", path: "/v1/decisions", outcome: "rejected" },
   { method: "post", path: "/v1/authorizations/resolve", outcome: "blocked" },
@@ -557,7 +595,11 @@ describe("501-vs-validation matrix", () => {
     configureFleetApiRuntime(null);
 
     for (const route of ALL_ROUTES) {
-      const response = await callRoute(route.method, route.path, route.method === "post" ? {} : undefined);
+      const response = await callRoute(
+        route.method,
+        route.path,
+        route.method === "get" ? undefined : {},
+      );
       expect(response.status, `${route.method} ${route.path}`).toBe(501);
       expect(envelopeOf(response.payload).code, `${route.method} ${route.path}`).toBe(
         "NOT_IMPLEMENTED",
@@ -570,15 +612,26 @@ describe("501-vs-validation matrix", () => {
     expect(removed.status).toBe(404);
   });
 
-  it("answers empty bodies with 200 domain outcomes while configured", async () => {
+  it("answers empty bodies with domain outcomes while configured", async () => {
     configureFleetApiRuntime({ stateDir: matrixStateDir });
 
     for (const route of CONFIGURED_EMPTY_BODY_ROUTES) {
-      const response = await callRoute(route.method, route.path, route.method === "post" ? {} : undefined);
-      expect(response.status, `${route.method} ${route.path}`).toBe(200);
+      const response = await callRoute(
+        route.method,
+        route.path,
+        route.method === "get" ? undefined : {},
+      );
+      expect(response.status, `${route.method} ${route.path}`).toBe(route.status ?? 200);
       const envelope = envelopeOf(response.payload);
-      expect(envelope.code, `${route.method} ${route.path}`).toBe("OK");
-      expect(envelope.result?.outcome, `${route.method} ${route.path}`).toBe(route.outcome);
+      expect(envelope.code, `${route.method} ${route.path}`).toBe(route.code ?? "OK");
+      if (route.status === 404) {
+        expect(envelope.result, `${route.method} ${route.path}`).toBeNull();
+      } else if (route.status !== undefined && route.status >= 400) {
+        // A client-error envelope carries a reason instead of a domain outcome.
+        expect(typeof envelope.result?.reason, `${route.method} ${route.path}`).toBe("string");
+      } else {
+        expect(envelope.result?.outcome, `${route.method} ${route.path}`).toBe(route.outcome);
+      }
     }
 
     // The coordination read answers a fleet-wide list for an empty query.

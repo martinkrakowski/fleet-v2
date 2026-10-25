@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
@@ -844,22 +845,38 @@ describe('keepQuarantineCopy', () => {
 async function snapshotStateDir(
   dir: string,
   basename = 'x.json',
-): Promise<{ storeBytes: Buffer | null; quarantineListing: string[] }> {
+): Promise<{ storeBytes: Buffer | null; quarantineCopies: Array<{ name: string; sha256: string }> }> {
   let storeBytes: Buffer | null = null;
   try {
     storeBytes = await fs.readFile(path.join(dir, basename));
   } catch {
     storeBytes = null;
   }
-  let quarantineListing: string[] = [];
+  let quarantineCopies: Array<{ name: string; sha256: string }> = [];
   try {
-    quarantineListing = (await fs.readdir(path.join(dir, 'quarantine'))).sort((a, b) =>
-      a.localeCompare(b),
+    const entries = await fs.readdir(path.join(dir, 'quarantine'));
+    const results = await Promise.all(
+      entries.map(async (name) => {
+        const full = path.join(dir, 'quarantine', name);
+        try {
+          const stat = await fs.lstat(full);
+          if (!stat.isFile()) {
+            return null;
+          }
+          const bytes = await fs.readFile(full);
+          return { name, sha256: createHash('sha256').update(bytes).digest('hex') };
+        } catch {
+          return null;
+        }
+      }),
     );
+    quarantineCopies = results
+      .filter((entry): entry is { name: string; sha256: string } => entry !== null)
+      .sort((a, b) => a.name.localeCompare(b.name));
   } catch {
-    quarantineListing = [];
+    quarantineCopies = [];
   }
-  return { storeBytes, quarantineListing };
+  return { storeBytes, quarantineCopies };
 }
 
 describe('readQuarantineCopy', () => {
@@ -955,6 +972,38 @@ describe('readQuarantineCopy', () => {
       await fs.rm(emptyDir, { recursive: true, force: true }).catch(() => {});
     }
   });
+
+  it.skipIf(process.platform === 'win32')('refuses a FIFO named as a valid copy', async () => {
+    const fifoName = 'x.json.20261025T101501.123Z-1.0123456789ab';
+    execFileSync('mkfifo', [path.join(quarantineDir, fifoName)]);
+    const before = await snapshotStateDir(stateDir);
+    const result = await d.readQuarantineCopy(stateDir, fifoName);
+    expect(result).toEqual({ status: 'refused', reason: `${fifoName} is not a regular file` });
+    expect(await snapshotStateDir(stateDir)).toEqual(before);
+  });
+
+  it('refuses a real file in a subdirectory of quarantine', async () => {
+    const subDir = path.join(quarantineDir, 'sub');
+    await fs.mkdir(subDir);
+    const subName = 'x.json.20261025T101502.123Z-2.0123456789ab';
+    await fs.writeFile(path.join(subDir, subName), validBytes);
+    const before = await snapshotStateDir(stateDir);
+    const result = await d.readQuarantineCopy(stateDir, path.join(subDir, subName));
+    expect(result.status).toBe('refused');
+    expect((result as { reason: string }).reason).toContain('--from must name a file directly inside');
+    expect(await snapshotStateDir(stateDir)).toEqual(before);
+  });
+
+  it('refuses a valid copy name that does not exist', async () => {
+    const missingName = 'x.json.20261025T101503.123Z-3.0123456789ab';
+    const before = await snapshotStateDir(stateDir);
+    const result = await d.readQuarantineCopy(stateDir, missingName);
+    expect(result).toEqual({
+      status: 'refused',
+      reason: `${missingName} could not be opened (ENOENT)`,
+    });
+    expect(await snapshotStateDir(stateDir)).toEqual(before);
+  });
 });
 
 describe('restore', () => {
@@ -975,7 +1024,7 @@ describe('restore', () => {
     await fs.rm(stateDir, { recursive: true, force: true }).catch(() => {});
   });
 
-  async function snapshot(): Promise<{ storeBytes: Buffer | null; quarantineListing: string[] }> {
+  async function snapshot() {
     return snapshotStateDir(stateDir);
   }
 
@@ -1017,7 +1066,7 @@ describe('restore', () => {
 
     // A new copy of the old bytes was added; the candidate (restored) file exists.
     const after = await snapshot();
-    expect(after.quarantineListing).toHaveLength(before.quarantineListing.length + 1);
+    expect(after.quarantineCopies).toHaveLength(before.quarantineCopies.length + 1);
   });
 
   it('reuses an existing regular quarantine copy of the current unreadable bytes', async () => {
@@ -1147,5 +1196,34 @@ describe('restore', () => {
     expect(outcome.status).toBe('restored');
     expect(await fs.readFile(filePath)).toEqual(candidate);
     expect(await fs.readdir(quarantineDir)).toContain(candidateName);
+  });
+
+  it('refuses when the current store path is a directory', async () => {
+    await fs.mkdir(filePath);
+    const quarantineDir = path.join(stateDir, 'quarantine');
+    await fs.mkdir(quarantineDir, { recursive: true });
+    const before = await snapshot();
+    const outcome = await d.restore({ stateDir, candidate, expectedCurrentSha256: null });
+    expect(outcome).toEqual({
+      status: 'refused',
+      reason: 'the current file could not be read (EISDIR)',
+    });
+    expect((await fs.stat(filePath)).isDirectory()).toBe(true);
+    expect(await snapshot()).toEqual(before);
+  });
+
+  it('refuses a missing store when expectedCurrentSha256 is set and creates nothing', async () => {
+    const before = await snapshot();
+    const outcome = await d.restore({
+      stateDir,
+      candidate,
+      expectedCurrentSha256: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    });
+    expect(outcome).toEqual({
+      status: 'refused',
+      reason: 'the store changed since it was inspected; run state restore again',
+    });
+    expect(await snapshot()).toEqual(before);
+    await expect(fs.stat(filePath)).rejects.toThrow();
   });
 });

@@ -1818,7 +1818,9 @@ init sets up a fresh installation file non-interactively (every step is a
 flag); run 'fleet-v2 init --help' for its flags.
 
 state check reads every JSON state store under the state directory and reports
-ok, missing, unreadable or invalid record per file; it never writes.
+ok, missing, unreadable or invalid record per file; it never writes. state
+restore replaces a missing or unreadable store from a quarantine copy after
+confirmation; it is CLI only.
 
 Commands:
   work-order register|inspect
@@ -1827,7 +1829,7 @@ Commands:
   seats free-tier [status|on|off] [--yes]
   projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
-  state check
+  state check|restore
   brief prepare [--allowedPathPrefixes '["packages/x/src"]']
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|accept

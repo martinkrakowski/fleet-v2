@@ -77,10 +77,10 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       if (profile === null) {
         return {
           outcome: 'rejected',
-          reason: `project ${projectId} has no profile; register the project before creating work orders`,
+          reason: `project ${projectId} has no profile; register it with 'fleet-v2 projects add', or 'fleet-v2 projects adopt' when it already has work orders`,
         };
       }
-      if (profile.status === 'retired') {
+      if (profile.status !== 'active') {
         return {
           outcome: 'rejected',
           reason: `project ${projectId} is retired; it accepts no new work orders`,

@@ -382,13 +382,17 @@ const ALL_ROUTES: ReadonlyArray<{ method: "get" | "post"; path: string }> = [
 
 /**
  * While configured, every route answers an empty `{}` body (or empty query)
- * with HTTP 200 and the bound use case's structured domain outcome instead
- * of `501 NOT_IMPLEMENTED`.
+ * with the bound use case's structured domain outcome instead of
+ * `501 NOT_IMPLEMENTED`. Most answer HTTP 200 with the OK envelope; a route
+ * that maps a rejected outcome to a client error carries its own status and
+ * envelope code.
  */
 const CONFIGURED_EMPTY_BODY_ROUTES: ReadonlyArray<{
   method: "get" | "post";
   path: string;
   outcome: string;
+  status?: number;
+  code?: string;
 }> = [
   { method: "post", path: "/v1/work-orders", outcome: "rejected" },
   { method: "get", path: "/v1/work-orders/wo-matrix", outcome: "not-found" },
@@ -413,7 +417,7 @@ const CONFIGURED_EMPTY_BODY_ROUTES: ReadonlyArray<{
   { method: "post", path: "/v1/knowledge/ke-matrix/publish", outcome: "rejected" },
   { method: "post", path: "/v1/knowledge/ke-matrix/reuse", outcome: "rejected" },
   { method: "post", path: "/v1/knowledge/ke-matrix/supersede", outcome: "rejected" },
-  { method: "post", path: "/v1/projects", outcome: "rejected" },
+  { method: "post", path: "/v1/projects", outcome: "rejected", status: 422, code: "REFUSED" },
   { method: "get", path: "/v1/capabilities", outcome: "not-found" },
   { method: "post", path: "/v1/decisions", outcome: "rejected" },
   { method: "post", path: "/v1/authorizations/resolve", outcome: "blocked" },
@@ -570,15 +574,20 @@ describe("501-vs-validation matrix", () => {
     expect(removed.status).toBe(404);
   });
 
-  it("answers empty bodies with 200 domain outcomes while configured", async () => {
+  it("answers empty bodies with domain outcomes while configured", async () => {
     configureFleetApiRuntime({ stateDir: matrixStateDir });
 
     for (const route of CONFIGURED_EMPTY_BODY_ROUTES) {
       const response = await callRoute(route.method, route.path, route.method === "post" ? {} : undefined);
-      expect(response.status, `${route.method} ${route.path}`).toBe(200);
+      expect(response.status, `${route.method} ${route.path}`).toBe(route.status ?? 200);
       const envelope = envelopeOf(response.payload);
-      expect(envelope.code, `${route.method} ${route.path}`).toBe("OK");
-      expect(envelope.result?.outcome, `${route.method} ${route.path}`).toBe(route.outcome);
+      expect(envelope.code, `${route.method} ${route.path}`).toBe(route.code ?? "OK");
+      if (route.status !== undefined && route.status >= 400) {
+        // A client-error envelope carries a reason instead of a domain outcome.
+        expect(typeof envelope.result?.reason, `${route.method} ${route.path}`).toBe("string");
+      } else {
+        expect(envelope.result?.outcome, `${route.method} ${route.path}`).toBe(route.outcome);
+      }
     }
 
     // The coordination read answers a fleet-wide list for an empty query.

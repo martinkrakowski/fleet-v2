@@ -33,13 +33,15 @@ export interface ProjectProbeAdapterOptions {
 
 /**
  * Applied to every git command, hardening it against the repository's own
- * config and against credential prompts: no fsmonitor, no repository hooks,
- * no protocol transport outside the allowed set, and no terminal askpass.
- * `protocol.allow=never` closes every transport, then each protocol is
+ * config and against credential prompts: no pager, no fsmonitor, no repository
+ * hooks, no protocol transport outside the allowed set, and no terminal
+ * askpass. `protocol.allow=never` closes every transport, then each protocol is
  * re-opened explicitly — a plain URL is always https/ssh/git/file, never a
  * subordinate protocol like `ext::` or an `-oProxyCommand` injection.
  */
 export const GIT_HARDENING = [
+  "-c",
+  "core.pager=cat",
   "-c",
   "core.fsmonitor=false",
   "-c",
@@ -64,6 +66,16 @@ const PROBE_ENV = {
   GIT_ASKPASS: "/bin/false",
   SSH_ASKPASS: "/bin/false",
 } as const;
+
+/** Single-quote a value for a shell hint, escaping `'` as `'\''`. */
+function shellQuote(v: string): string {
+  return `'${v.replace(/'/g, "'\\''")}'`;
+}
+
+/** Strip `scheme://<userinfo>@` (up to the last `@` before the first `/`) to `scheme://`. */
+function redactUserinfo(url: string): string {
+  return url.replace(/^([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/]*@/, "$1");
+}
 
 /** Trim whitespace and strip one trailing `/` then one trailing `.git`. */
 function normaliseRepository(value: string): string {
@@ -92,6 +104,15 @@ export class ProjectProbeAdapter implements ProjectProbePort {
     const repositoryAnswers = await this.repositoryAnswers(request);
     checks.push(repositoryAnswers.check);
     defaultBranch = repositoryAnswers.defaultBranch;
+    if (repositoryAnswers.refused) {
+      return {
+        probedAtIso: this.now().toISOString(),
+        probedFrom: "orchestrator",
+        checks,
+        defaultBranch: null,
+        detectedScripts: [],
+      };
+    }
 
     const hostNames = Object.keys(request.clones).sort();
     for (const host of hostNames) {
@@ -115,7 +136,7 @@ export class ProjectProbeAdapter implements ProjectProbePort {
         // STOP this host's remaining checks: the host is not answering.
         continue;
       }
-      if (workTree.stdout.trim() === "true") {
+      if (workTree.exitCode === 0 && workTree.stdout.trim() === "true") {
         checks.push(this.check("clone-is-work-tree", host, "pass", `git work tree at ${clone.path}`));
         if (scriptsSource === null) scriptsSource = { host, path: clone.path, executor };
       } else {
@@ -124,7 +145,7 @@ export class ProjectProbeAdapter implements ProjectProbePort {
             "clone-is-work-tree",
             host,
             "fail",
-            `no git work tree at ${clone.path}; on ${host} run: git clone ${request.repository} ${clone.path}`,
+            `no git work tree at ${clone.path}; on ${host} run: git clone ${shellQuote(redactUserinfo(request.repository))} ${shellQuote(clone.path)}`,
           ),
         );
       }
@@ -154,7 +175,7 @@ export class ProjectProbeAdapter implements ProjectProbePort {
             "worktree-root-exists",
             host,
             "fail",
-            `missing; on ${host} run: mkdir -p ${clone.worktreeRoot}`,
+            `missing; on ${host} run: mkdir -p ${shellQuote(clone.worktreeRoot)}`,
           ),
         );
       } else {
@@ -179,7 +200,7 @@ export class ProjectProbeAdapter implements ProjectProbePort {
             "lane-dir-ignored",
             host,
             "fail",
-            `.lane/ is not ignored; add the line .lane/ to ${clone.path}/.gitignore`,
+            `.lane/ is not ignored; add the line .lane/ to ${shellQuote(clone.path + "/.gitignore")}`,
           ),
         );
       } else {
@@ -203,20 +224,33 @@ export class ProjectProbeAdapter implements ProjectProbePort {
   private async repositoryAnswers(request: ProjectProbeRequest): Promise<{
     check: ProjectProbeCheck;
     defaultBranch: string | null;
+    refused?: boolean;
   }> {
     const repository = request.repository;
     if (repository.trim() === "" || repository.startsWith("-") || repository.includes("::")) {
       return {
         check: this.check("repository-answers", null, "fail", "repository is not a plain URL or path"),
         defaultBranch: null,
+        refused: true,
       };
     }
-    const run = await this.runGit(this.options.orchestrator, [
-      "ls-remote",
-      "--symref",
-      repository,
-      "HEAD",
-    ]);
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/@]*:[^/@]*@/.test(repository)) {
+      return {
+        check: this.check(
+          "repository-answers",
+          null,
+          "fail",
+          "repository URL carries a credential; register it without one",
+        ),
+        defaultBranch: null,
+        refused: true,
+      };
+    }
+    const run = await this.runGit(
+      this.options.orchestrator,
+      ["ls-remote", "--symref", repository, "HEAD"],
+      "/",
+    );
     if (this.unreachable(run)) {
       return {
         check: this.check("repository-answers", null, "unknown", "orchestrator could not run git"),
@@ -230,7 +264,11 @@ export class ProjectProbeAdapter implements ProjectProbePort {
       };
     }
     const head = run.stdout.match(/^ref: refs\/heads\/([^\s\t]+)\tHEAD$/m);
-    if (head !== null) {
+    if (
+      head !== null &&
+      !head[1].startsWith("-") &&
+      /^[A-Za-z0-9._/-]{1,200}$/.test(head[1])
+    ) {
       return {
         check: this.check("repository-answers", null, "pass", `default branch ${head[1]}`),
         defaultBranch: head[1],
@@ -273,7 +311,8 @@ export class ProjectProbeAdapter implements ProjectProbePort {
     const run = await this.runGit(source.executor, [
       "-C",
       source.path,
-      "show",
+      "cat-file",
+      "blob",
       "HEAD:package.json",
     ]);
     if (this.unreachable(run) || run.exitCode !== 0) return [];
@@ -292,13 +331,25 @@ export class ProjectProbeAdapter implements ProjectProbePort {
   }
 
   /** Run an argv array with the probe's timeout and minimal environment. */
-  private runCommand(executor: CommandExecutorPort, argv: readonly string[]): Promise<CommandRunResult> {
-    return executor.run(argv, { timeoutMs: this.timeoutMs, env: { ...PROBE_ENV } });
+  private runCommand(
+    executor: CommandExecutorPort,
+    argv: readonly string[],
+    cwd?: string,
+  ): Promise<CommandRunResult> {
+    return executor.run(argv, {
+      ...(cwd !== undefined ? { cwd } : {}),
+      timeoutMs: this.timeoutMs,
+      env: { ...PROBE_ENV },
+    });
   }
 
   /** Every git call is `git` followed by the hardening overrides. */
-  private runGit(executor: CommandExecutorPort, args: readonly string[]): Promise<CommandRunResult> {
-    return this.runCommand(executor, ["git", ...GIT_HARDENING, ...args]);
+  private runGit(
+    executor: CommandExecutorPort,
+    args: readonly string[],
+    cwd?: string,
+  ): Promise<CommandRunResult> {
+    return this.runCommand(executor, ["git", ...GIT_HARDENING, ...args], cwd);
   }
 
   /** A run that never reported an exit — spawn failure, timeout, kill — is unreachable. */

@@ -2,8 +2,11 @@
  * ProjectProbePort is the outbound contract for a read-only probe of a
  * project before registration or after an edit: the repository answers, and
  * on each lane-runner host the clone is there and correctly set up. It never
- * runs a fix; an unreachable host is `unknown`; no command output that could
- * carry a credential (stderr, a remote URL) is ever copied into a `detail`.
+ * runs a fix; an unreachable host is `unknown`; a repository URL carrying a
+ * credential in its userinfo is refused without running anything; fix hints
+ * redact URL userinfo and single-quote every shell argument; and no command
+ * output that could carry a credential (stderr, a remote URL, an unsafe ref)
+ * is ever copied into a `detail` or `defaultBranch`.
  */
 
 export type ProjectProbeResult = 'pass' | 'fail' | 'unknown';

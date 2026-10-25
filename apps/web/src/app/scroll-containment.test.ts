@@ -92,10 +92,16 @@ describe("opt-in containment roots of the five routes", () => {
   });
 
   it("/lanes opts in on its root element", () => {
-    const lanes = read("lanes", "page.tsx");
+    const lanes = read("lanes", "lanes-client.tsx");
     expect(lanes).toContain(
       "<div className={styles.page} data-contained-scroll>",
     );
+  });
+
+  it("/lanes is a dynamic server page, not a client component", () => {
+    const page = read("lanes", "page.tsx");
+    expect(page).toContain('export const dynamic = "force-dynamic"');
+    expect(page).not.toContain('"use client"');
   });
 
   it("/attempt opts in on its root element", () => {
@@ -117,7 +123,7 @@ describe("opt-in containment roots of the five routes", () => {
 
 describe("keyboard-accessible scroll regions", () => {
   it("names the lanes board scroll and the rail", () => {
-    const lanes = read("lanes", "page.tsx");
+    const lanes = read("lanes", "lanes-client.tsx");
     expectScrollRegion(
       openingTag(lanes, /<CardBody[^>]*styles\.laneScroll[^>]*>/, "lanes board scroll body"),
       "Lanes",

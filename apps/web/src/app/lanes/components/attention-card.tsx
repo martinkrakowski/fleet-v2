@@ -9,8 +9,9 @@ import {
   EmptyState,
   type SemanticTone
 } from "@fleet/ui";
-import { attempts, install } from "../fixture";
-import { attemptsOf, summary } from "../derive";
+import type { AttemptSummary } from "../fixture";
+import { install } from "../fixture";
+import { attemptsOf, summary, unknownAttention } from "../derive";
 import styles from "../lanes.module.css";
 
 interface AttentionItem {
@@ -20,19 +21,20 @@ interface AttentionItem {
   rr?: ReactNode;
 }
 
-function buildAttentionItems(): AttentionItem[] {
+function buildAttentionItems(attempts: AttemptSummary[]): AttentionItem[] {
   const items: AttentionItem[] = [];
   attempts.forEach((a) => {
     const [word, note] = summary(a);
     if (word === "unknown") {
+      const { title, detail } = unknownAttention(a, note);
       items.push({
         tone: "warn",
         tt: (
           <>
-            <b>{a.id}</b> runner did not answer
+            <b>{a.id}</b> {title}
           </>
         ),
-        ss: `${note} · slot ${a.slot} stays held · reconcile returns 409, not a guess`
+        ss: detail
       });
     }
     const decision = a.receipts.decision;
@@ -72,7 +74,7 @@ function buildAttentionItems(): AttentionItem[] {
       });
     }
     if (word === "failed") {
-      const openFix = attemptsOf(a.wo).find(
+      const openFix = attemptsOf(a.wo, attempts).find(
         (x) =>
           x.id !== a.id && (x.capacity === "held" || x.capacity === "pending")
       );
@@ -117,8 +119,8 @@ function buildAttentionItems(): AttentionItem[] {
   return items;
 }
 
-export function AttentionCard() {
-  const items = buildAttentionItems();
+export function AttentionCard({ attempts }: { attempts: AttemptSummary[] }) {
+  const items = buildAttentionItems(attempts);
   return (
     <Card className={styles.attnCard}>
       <CardHeader

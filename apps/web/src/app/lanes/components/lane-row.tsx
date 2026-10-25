@@ -2,21 +2,36 @@
 
 import Link from "next/link";
 import { Badge } from "@fleet/ui";
-import type { AttemptSummary } from "../fixture";
-import { attemptHref, isLive, laneIdLine, summary, woOf } from "../derive";
+import type { AttemptSummary, WorkOrderSummary } from "../fixture";
+import {
+  isLive,
+  laneIdLine,
+  liveViewHref,
+  observedLine,
+  summary,
+  woOf,
+} from "../derive";
 import { LiveClock } from "./live-clock";
 import styles from "../lanes.module.css";
 
 export interface LaneRowProps {
   attempt: AttemptSummary;
+  workOrders: Record<string, WorkOrderSummary>;
+  attempts: AttemptSummary[];
   selected: boolean;
   onSelect: () => void;
 }
 
-export function LaneRow({ attempt, selected, onSelect }: LaneRowProps) {
+export function LaneRow({
+  attempt,
+  workOrders,
+  attempts,
+  selected,
+  onSelect
+}: LaneRowProps) {
   const [word, note] = summary(attempt);
-  const wo = woOf(attempt);
-  const href = attemptHref(attempt);
+  const wo = woOf(attempt, workOrders);
+  const href = liveViewHref(attempt);
   const live = isLive(attempt);
   return (
     <li className={`${styles.lane}${selected ? ` ${styles.laneSel}` : ""}`}>
@@ -49,16 +64,26 @@ export function LaneRow({ attempt, selected, onSelect }: LaneRowProps) {
             </span>
           </span>
           <span className={`${styles.sub} ${styles.mono} ${styles.idline}`}>
-            {laneIdLine(attempt)}
+            {laneIdLine(attempt, attempts)}
           </span>
         </button>
-        <Link className={styles.openLink} href={href}>
-          Open
-        </Link>
+        {href !== null ? (
+          <Link className={styles.openLink} href={href}>
+            Open
+          </Link>
+        ) : (
+          <span
+            className={styles.openLink}
+            aria-disabled="true"
+            title="the attempt view does not read the API yet"
+          >
+            no live view
+          </span>
+        )}
       </div>
       {selected ? (
         <div className={`${styles.laneMore} ${styles.mono}`}>
-          observed {attempt.observedAt} · {attempt.observedFrom} · {note}
+          {observedLine(attempt, note)}
         </div>
       ) : null}
     </li>

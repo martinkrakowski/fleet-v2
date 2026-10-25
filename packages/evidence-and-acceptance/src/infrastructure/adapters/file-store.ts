@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
@@ -169,4 +169,113 @@ export async function writeJsonAtomically(filePath: string, data: unknown): Prom
     }
     throw error;
   }
+}
+
+/**
+ * Error thrown when a JSON state file cannot be parsed or validated. The
+ * quarantine path names the byte-exact copy kept for recovery; it is null
+ * only when the copy itself failed.
+ */
+export class StateFileUnreadableError extends Error {
+  readonly filePath: string;
+  readonly quarantinePath: string | null;
+  readonly detail: string;
+
+  constructor(
+    filePath: string,
+    quarantinePath: string | null,
+    detail: string,
+    copyError?: unknown,
+  ) {
+    const disposition =
+      quarantinePath !== null
+        ? `its bytes were kept at ${quarantinePath}`
+        : `its bytes could not be copied${
+            copyError instanceof Error && copyError.message !== ''
+              ? ` (${copyError.message})`
+              : ''
+          }`;
+    super(
+      `State file ${filePath} is unreadable (${detail}); ${disposition}; run 'fleet-v2 state check'`,
+    );
+    this.name = 'StateFileUnreadableError';
+    this.filePath = filePath;
+    this.quarantinePath = quarantinePath;
+    this.detail = detail;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/** UTC stamp in the compact yyyymmddThhmmssZ form used in quarantine names. */
+function quarantineUtcStamp(): string {
+  const now = new Date();
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return (
+    `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}` +
+    `T${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}Z`
+  );
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Best-effort housekeeping: keep only the 5 newest quarantine copies for a
+ * basename by name order. A failure here never masks the quarantine of the
+ * bad file itself.
+ */
+async function pruneQuarantineCopies(
+  quarantineDir: string,
+  basename: string,
+): Promise<void> {
+  try {
+    const pattern = new RegExp(
+      `^${escapeRegExp(basename)}\\.\\d{8}T\\d{6}Z\\.[0-9a-f]{12}$`,
+    );
+    const copies = (await fs.readdir(quarantineDir))
+      .filter((name) => pattern.test(name))
+      .sort();
+    while (copies.length > 5) {
+      const oldest = copies.shift();
+      if (oldest !== undefined) {
+        await fs.rm(path.join(quarantineDir, oldest), { force: true });
+      }
+    }
+  } catch {
+    // Never mask the original unreadable-file problem.
+  }
+}
+
+/**
+ * Quarantine an unreadable or invalid state file: copy its exact bytes into a
+ * `<dirname>/quarantine/<basename>.<UTC stamp>.<first 12 hex of sha256>` file
+ * (directory mode 0o700, copy mode 0o600, keeping the 5 newest copies per
+ * basename), then throw `StateFileUnreadableError`. If the copy itself fails,
+ * the error still throws with `quarantinePath: null`.
+ */
+export async function quarantineUnreadable(
+  filePath: string,
+  detail: string,
+): Promise<never> {
+  let quarantinePath: string | null = null;
+  try {
+    const bytes = await fs.readFile(filePath);
+    const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
+    const basename = path.basename(filePath);
+    const quarantineDir = path.join(path.dirname(filePath), 'quarantine');
+    await fs.mkdir(quarantineDir, { recursive: true, mode: 0o700 });
+    await fs.chmod(quarantineDir, 0o700);
+    const dest = path.join(
+      quarantineDir,
+      `${basename}.${quarantineUtcStamp()}.${digest}`,
+    );
+    await fs.copyFile(filePath, dest);
+    await fs.chmod(dest, 0o600);
+    quarantinePath = dest;
+    await pruneQuarantineCopies(quarantineDir, basename);
+  } catch (error: unknown) {
+    throw new StateFileUnreadableError(filePath, null, detail, error);
+  }
+  throw new StateFileUnreadableError(filePath, quarantinePath, detail);
 }

@@ -13,6 +13,15 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import type { FleetInstallation } from '@fleet/installation';
 
+import {
+  ProbeProjectUseCase,
+  ProjectProbeAdapter,
+  ProjectProbeRecordAdapter,
+  ProjectProfileReadAdapter,
+  RegisterWorkOrderUseCase,
+  WorkOrderRepositoryAdapter,
+} from '@fleet/work-execution';
+
 import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
 import type { ProjectsCliOptions } from '../projects.js';
@@ -523,7 +532,7 @@ describe('fleet-v2 projects', () => {
     const rootHelpIo = mockIo();
     const rootCode = await runCli(['--help'], rootHelpIo.io, runtime);
     expect(rootCode).toBe(0);
-    expect(rootHelpIo.stdout.join('')).toContain('projects list|show|add|edit|retire');
+    expect(rootHelpIo.stdout.join('')).toContain('projects list|show|probe|add|adopt|edit|retire');
 
     const projectsHelp = await runProjects(['--help'], runtime);
     expect(projectsHelp.code).toBe(0);
@@ -537,5 +546,406 @@ describe('fleet-v2 projects', () => {
     expect(blank.err).toContain('projects show requires a project id');
     const trailingHelp = await runProjects(['retire', 'alpha', 'help'], runtime);
     expect(trailingHelp.code).toBe(2);
+  });
+});
+
+describe('fleet-v2 projects probe and adopt (P6b)', () => {
+  it('probes and reports an unknown host-reachable check with exit 1 when the installation does not name the clone host', async () => {
+    // Absent installation: add accepts hosts without installation name checks,
+    // so the profile can reference a host the probing runtime cannot name.
+    const stateDir = makeTempDir();
+    const absentRuntime = createFleetCliRuntime({ stateDir });
+    await runProjects(
+      [
+        'add',
+        '--project-id',
+        'probe-host',
+        '--display-name',
+        'Probe Host',
+        '--repository',
+        'file:///nonexistent',
+        '--dispatcher-host',
+        'unlisted-host',
+        '--policy-revision',
+        'pol-1',
+        '--max-lanes',
+        '1',
+        '--clones',
+        'missing-host=/srv/repos/probe-host:/srv/worktrees/probe-host',
+        '--yes',
+      ],
+      absentRuntime,
+    );
+
+    const probedAbsent = await runProjects(['probe', 'probe-host'], absentRuntime);
+    expect(probedAbsent.code).toBe(1);
+    expect(probedAbsent.out).toContain(
+      'unknown  host-reachable  missing-host  no v2 installation names lane hosts\n',
+    );
+    expect(probedAbsent.out).toContain(
+      'unknown  gate-procedures-known  -  no installation is loaded\n',
+    );
+    expect(probedAbsent.out).toContain('recorded\n');
+
+    // v2 installation on the same state directory whose hosts do not include
+    // `missing-host`: executorForHostName reports the missing v2 host reason.
+    const v2Runtime = makeV2Runtime(stateDir);
+    const probedV2 = await runProjects(['probe', 'probe-host'], v2Runtime);
+    expect(probedV2.code).toBe(1);
+    expect(probedV2.out).toContain(
+      'unknown  host-reachable  missing-host  host missing-host is not in the installation\n',
+    );
+    expect(probedV2.out).toContain('pass  gate-procedures-known  -  0 procedures known\n');
+    expect(probedV2.out).toContain('recorded\n');
+  });
+
+  it('exits 0 only when every probe check passes and the receipt is recorded', async () => {
+    const stateDir = makeTempDir();
+    const runtime = makeV2Runtime(stateDir);
+    await runProjects(['add', ...BASE_ADD_FLAGS, '--yes'], runtime);
+
+    const fakeProbe = new ProjectProbeAdapter({
+      orchestrator: {
+        run: async () => ({
+          exitCode: 0,
+          signal: null,
+          stdout: 'ref: refs/heads/main\tHEAD\nabc123\tHEAD\n',
+          stderr: '',
+        }),
+      },
+      executorForHost: () => ({ ok: false, reason: 'unused' }),
+    });
+    const profileRead = new ProjectProfileReadAdapter({
+      inspect: (req) => runtime.coordination.inspectProjectProfile.execute(req),
+    });
+
+    const recordedRuntime: FleetCliRuntime = {
+      ...runtime,
+      execution: {
+        ...runtime.execution,
+        probeProject: new ProbeProjectUseCase({
+          profileRead,
+          probe: fakeProbe,
+          probeRecord: new ProjectProbeRecordAdapter({
+            record: (req) => runtime.coordination.recordProjectProbe.execute(req),
+          }),
+          verificationProcedureNames: ['verify'],
+        }),
+      },
+    };
+    const passed = await runProjects(['probe', 'alpha'], recordedRuntime);
+    expect(passed.code).toBe(0);
+    expect(passed.out).toBe(
+      'pass  repository-answers  -  default branch main\npass  gate-procedures-known  -  0 procedures known\nrecorded\n',
+    );
+
+    const unrecordedRuntime: FleetCliRuntime = {
+      ...runtime,
+      execution: {
+        ...runtime.execution,
+        probeProject: new ProbeProjectUseCase({
+          profileRead,
+          probe: fakeProbe,
+          probeRecord: new ProjectProbeRecordAdapter({
+            record: async () => ({ outcome: 'rejected', reason: 'stale revision' }),
+          }),
+          verificationProcedureNames: ['verify'],
+        }),
+      },
+    };
+    const notRecorded = await runProjects(['probe', 'alpha'], unrecordedRuntime);
+    expect(notRecorded.code).toBe(1);
+    expect(notRecorded.out).toContain('not recorded: stale revision\n');
+  });
+
+  it('probes an unknown project and exits 1', async () => {
+    const runtime = makeV2Runtime(makeTempDir());
+    const probed = await runProjects(['probe', 'unknown-project'], runtime);
+    expect(probed.code).toBe(1);
+    expect(probed.err).toContain('project unknown-project is not registered');
+  });
+
+  it('adopt with no id prints none when empty and lists a project that has work orders but no profile', async () => {
+    const stateDir = makeTempDir();
+    const runtime = makeV2Runtime(stateDir);
+
+    const empty = await runProjects(['adopt'], runtime);
+    expect(empty.code).toBe(0);
+    expect(empty.out).toBe('none\n');
+
+    // Register the work order through a runtime composed without the guard: a
+    // bare RegisterWorkOrderUseCase on the same state directory.
+    const unguarded = new RegisterWorkOrderUseCase({
+      workOrderRepo: new WorkOrderRepositoryAdapter({ stateDir }),
+    });
+    await unguarded.registerWorkOrder({
+      workOrderId: 'wo-adopt-1',
+      projectId: 'gamma',
+      taskId: 'task-1',
+      laneId: 'lane-1',
+      repository: 'https://example.com/gamma.git',
+      baseCommit: 'abc123',
+      ownedPaths: ['packages/gamma'],
+      policyRevision: 'pol-1',
+    });
+
+    const listed = await runProjects(['adopt'], runtime);
+    expect(listed.code).toBe(0);
+    expect(listed.out).toContain(
+      'gamma  orders 1 (active 1)  repos https://example.com/gamma.git  last ',
+    );
+  });
+
+  it('adopts a candidate with flags, defaults display-name and single repository, confirms unless --yes, and refuses a second adopt or an id without work orders', async () => {
+    const stateDir = makeTempDir();
+    const runtime = makeV2Runtime(stateDir);
+    const unguarded = new RegisterWorkOrderUseCase({
+      workOrderRepo: new WorkOrderRepositoryAdapter({ stateDir }),
+    });
+    await unguarded.registerWorkOrder({
+      workOrderId: 'wo-adopt-2',
+      projectId: 'delta',
+      taskId: 'task-1',
+      laneId: 'lane-1',
+      repository: 'https://example.com/delta.git',
+      baseCommit: 'abc123',
+      ownedPaths: ['packages/delta'],
+      policyRevision: 'pol-1',
+    });
+
+    const noOrders = await runProjects(
+      [
+        'adopt',
+        'no-orders',
+        '--dispatcher-host',
+        'orch',
+        '--policy-revision',
+        'pol-1',
+        '--max-lanes',
+        '2',
+        '--yes',
+      ],
+      runtime,
+    );
+    expect(noOrders.code).toBe(1);
+    expect(noOrders.err).toContain('project no-orders has no work orders to adopt');
+
+    const declined = await runProjects(
+      [
+        'adopt',
+        'delta',
+        '--dispatcher-host',
+        'orch',
+        '--policy-revision',
+        'pol-1',
+        '--max-lanes',
+        '2',
+      ],
+      runtime,
+      { confirm: async () => false },
+    );
+    expect(declined.code).toBe(1);
+    expect(declined.out).toContain('nothing changed\n');
+
+    const adopted = await runProjects(
+      [
+        'adopt',
+        'delta',
+        '--dispatcher-host',
+        'orch',
+        '--policy-revision',
+        'pol-1',
+        '--max-lanes',
+        '2',
+      ],
+      runtime,
+      { confirm: async () => true },
+    );
+    expect(adopted.code).toBe(0);
+    expect(adopted.out).toContain('adopt project delta\n');
+    expect(adopted.out).toContain('  displayName: delta\n');
+    expect(adopted.out).toContain('  repository: https://example.com/delta.git\n');
+    expect(adopted.out).toContain('registered project delta (rev 0)\n');
+
+    const second = await runProjects(
+      [
+        'adopt',
+        'delta',
+        '--dispatcher-host',
+        'orch',
+        '--policy-revision',
+        'pol-1',
+        '--max-lanes',
+        '2',
+        '--yes',
+      ],
+      runtime,
+    );
+    expect(second.code).toBe(1);
+    expect(second.err).toContain('project delta is already registered');
+  });
+
+  it('refuses adopt with exit 1 naming --repository when the candidate has two repositories', async () => {
+    const stateDir = makeTempDir();
+    const runtime = makeV2Runtime(stateDir);
+    const unguarded = new RegisterWorkOrderUseCase({
+      workOrderRepo: new WorkOrderRepositoryAdapter({ stateDir }),
+    });
+    const repos = ['https://example.com/a.git', 'https://example.com/b.git'];
+    for (const [index, repo] of repos.entries()) {
+      await unguarded.registerWorkOrder({
+        workOrderId: `wo-two-repos-${index}`,
+        projectId: 'two-repos',
+        taskId: 'task-1',
+        laneId: 'lane-1',
+        repository: repo,
+        baseCommit: 'abc123',
+        ownedPaths: [`packages/two-repos/${index}`],
+        policyRevision: 'pol-1',
+      });
+    }
+
+    const adopted = await runProjects(
+      [
+        'adopt',
+        'two-repos',
+        '--dispatcher-host',
+        'orch',
+        '--policy-revision',
+        'pol-1',
+        '--max-lanes',
+        '2',
+        '--yes',
+      ],
+      runtime,
+    );
+    expect(adopted.code).toBe(1);
+    expect(adopted.err).toContain('--repository is required');
+  });
+
+  it('prints a warning before confirmation and adopts when --repository is not one of the candidate repositories', async () => {
+    const stateDir = makeTempDir();
+    const runtime = makeV2Runtime(stateDir);
+    const workOrderRepo = new WorkOrderRepositoryAdapter({ stateDir });
+    const unguarded = new RegisterWorkOrderUseCase({ workOrderRepo });
+    await unguarded.registerWorkOrder({
+      workOrderId: 'wo-unlisted-repo-1',
+      projectId: 'unlisted-repo',
+      taskId: 'task-1',
+      laneId: 'lane-1',
+      repository: 'https://example.com/r1.git',
+      baseCommit: 'abc123',
+      ownedPaths: ['packages/one'],
+      policyRevision: 'pol-1',
+    });
+    await unguarded.registerWorkOrder({
+      workOrderId: 'wo-unlisted-repo-2',
+      projectId: 'unlisted-repo',
+      taskId: 'task-2',
+      laneId: 'lane-2',
+      repository: 'https://example.com/r2.git',
+      baseCommit: 'abc123',
+      ownedPaths: ['packages/two'],
+      policyRevision: 'pol-1',
+    });
+
+    const { io, stdout, stderr } = mockIo();
+    let outAtConfirm = '';
+    const code = await runCli(
+      [
+        'projects',
+        'adopt',
+        'unlisted-repo',
+        '--repository',
+        'https://example.com/other.git',
+        '--dispatcher-host',
+        'orch',
+        '--policy-revision',
+        'pol-1',
+        '--max-lanes',
+        '2',
+      ],
+      io,
+      runtime,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        confirm: async () => {
+          outAtConfirm = stdout.join('');
+          return true;
+        },
+      },
+    );
+    expect(code).toBe(0);
+    expect(stderr.join('')).toBe('');
+    expect(outAtConfirm).toContain(
+      'warning: https://example.com/other.git is not among the repositories its work orders name (https://example.com/r1.git, https://example.com/r2.git)\n',
+    );
+    expect(stdout.join('')).toContain('registered project unlisted-repo (rev 0)\n');
+  });
+
+  it('refuses work-order register for a project without a profile with the guard reason across installation kinds', async () => {
+    for (const runtime of [
+      makeV2Runtime(makeTempDir()),
+      createFleetCliRuntime({ stateDir: makeTempDir(), installation: { schemaVersion: 1 } }),
+      createFleetCliRuntime({ stateDir: makeTempDir() }),
+    ]) {
+      const { io, stdout } = mockIo();
+      const code = await runCli(
+        [
+          'work-order',
+          'register',
+          '--json',
+          JSON.stringify({
+            workOrderId: 'wo-no-profile',
+            projectId: 'no-profile',
+            taskId: 'task-1',
+            laneId: 'lane-1',
+            repository: 'https://example.com/no-profile.git',
+            baseCommit: 'abc123',
+            ownedPaths: ['packages/no-profile'],
+            policyRevision: 'pol-1',
+          }),
+        ],
+        io,
+        runtime,
+      );
+      expect(code).toBe(1);
+      const parsed = JSON.parse(stdout.join('')) as { outcome: string; reason: string };
+      expect(parsed.outcome).toBe('rejected');
+      expect(parsed.reason).toContain('project no-profile has no profile');
+    }
+  });
+
+  it('registers the same work order after projects add creates the profile', async () => {
+    const stateDir = makeTempDir();
+    const runtime = makeV2Runtime(stateDir);
+    await runProjects(['add', ...BASE_ADD_FLAGS, '--yes'], runtime);
+
+    const { io, stdout } = mockIo();
+    const code = await runCli(
+      [
+        'work-order',
+        'register',
+        '--json',
+        JSON.stringify({
+          workOrderId: 'wo-after-add',
+          projectId: 'alpha',
+          taskId: 'task-1',
+          laneId: 'lane-1',
+          repository: 'https://example.com/alpha.git',
+          baseCommit: 'abc123',
+          ownedPaths: ['packages/alpha'],
+          policyRevision: 'pol-1',
+        }),
+      ],
+      io,
+      runtime,
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(stdout.join('')) as { outcome: string };
+    expect(parsed.outcome).toBe('registered');
   });
 });

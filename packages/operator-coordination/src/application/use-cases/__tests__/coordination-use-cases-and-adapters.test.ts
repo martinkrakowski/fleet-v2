@@ -2,7 +2,7 @@
  * Step 5 unit tests for the operator-coordination use cases and their
  * infrastructure adapters.
  *
- * The suite covers each of the ten inbound use cases against explicit test
+ * The suite covers each of the thirteen inbound use cases against explicit test
  * doubles and against the real adapters, and it exercises the four refusals
  * that carry the safety weight of this context: a profile that would persist a
  * credential, a grant that would authorize a second unrelated action, an
@@ -22,11 +22,13 @@ import type {
   CoordinationRequestRecord,
   ProjectAttentionSummaryRecord,
   ProjectProfileRecord,
+  ProjectProbeReceiptRecord,
   RelayAcknowledgementRecord,
 } from '../../../domain/coordination-records.js';
 import type { ObservationEnvelopeProps } from '../../../domain/value-objects/ObservationEnvelope.vo.js';
 import type {
   InspectConfiguredCapabilitiesRequest,
+  ListProjectProfilesRequest,
   RegisterProjectProfileRequest,
 } from '../../ports/in/index.js';
 import type { CoordinationRequestRepositoryPort } from '../../ports/out/CoordinationRequestRepositoryPort.out-port.js';
@@ -48,9 +50,12 @@ import { ProjectProfileRepositoryAdapter } from '../../../infrastructure/adapter
 import { RelayTransportAdapter } from '../../../infrastructure/adapters/RelayTransportAdapter.adapter.js';
 import { InspectConfiguredCapabilitiesUseCase } from '../InspectConfiguredCapabilitiesUseCase.use-case.js';
 import { InspectOutstandingCoordinationUseCase } from '../InspectOutstandingCoordinationUseCase.use-case.js';
+import { InspectProjectProfileUseCase } from '../InspectProjectProfileUseCase.use-case.js';
+import { ListProjectProfilesUseCase } from '../ListProjectProfilesUseCase.use-case.js';
 import { PublishProjectObservationUseCase } from '../PublishProjectObservationUseCase.use-case.js';
 import { ReadProjectAttentionUseCase } from '../ReadProjectAttentionUseCase.use-case.js';
 import { RecordAuthorizationConsumptionUseCase } from '../RecordAuthorizationConsumptionUseCase.use-case.js';
+import { RecordProjectProbeUseCase } from '../RecordProjectProbeUseCase.use-case.js';
 import { RecordRelayAcknowledgementUseCase } from '../RecordRelayAcknowledgementUseCase.use-case.js';
 import { RegisterProjectProfileUseCase } from '../RegisterProjectProfileUseCase.use-case.js';
 import { RequestScopedDecisionUseCase } from '../RequestScopedDecisionUseCase.use-case.js';
@@ -439,7 +444,279 @@ describe('RegisterProjectProfileUseCase', () => {
 });
 
 /* ------------------------------------------------------------------ *
- * Use case 2: InspectConfiguredCapabilitiesUseCase
+ * Use case 2: ListProjectProfilesUseCase
+ * ------------------------------------------------------------------ */
+
+describe('ListProjectProfilesUseCase', () => {
+  const activeAtlas = profileRecord();
+  const retiredBorealis = profileRecord({
+    projectId: 'project-borealis',
+    displayName: 'Borealis',
+    status: 'retired',
+    revision: 1,
+  });
+  const activeCygnus = profileRecord({
+    projectId: 'project-cygnus',
+    displayName: 'Cygnus',
+  });
+
+  class CountingProfileRepository extends StubProfileRepository {
+    listCalls = 0;
+
+    async listProfiles(): Promise<readonly ProjectProfileRecord[]> {
+      this.listCalls += 1;
+      return super.listProfiles();
+    }
+  }
+
+  it('lists every profile sorted by projectId with one repo read and no save', async () => {
+    const repo = new CountingProfileRepository({
+      'project-cygnus': activeCygnus,
+      'project-atlas': activeAtlas,
+      'project-borealis': retiredBorealis,
+    });
+    const result = await new ListProjectProfilesUseCase({ profileRepo: repo }).execute({});
+    expect(result).toEqual({
+      outcome: 'listed',
+      profiles: [activeAtlas, retiredBorealis, activeCygnus],
+    });
+    expect(repo.listCalls).toBe(1);
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('filters to active profiles only', async () => {
+    const repo = new CountingProfileRepository({
+      'project-cygnus': activeCygnus,
+      'project-atlas': activeAtlas,
+      'project-borealis': retiredBorealis,
+    });
+    const result = await new ListProjectProfilesUseCase({ profileRepo: repo }).execute({
+      status: 'active',
+    });
+    expect(result).toEqual({ outcome: 'listed', profiles: [activeAtlas, activeCygnus] });
+  });
+
+  it('filters to retired profiles only', async () => {
+    const repo = new CountingProfileRepository({
+      'project-cygnus': activeCygnus,
+      'project-atlas': activeAtlas,
+      'project-borealis': retiredBorealis,
+    });
+    const result = await new ListProjectProfilesUseCase({ profileRepo: repo }).execute({
+      status: 'retired',
+    });
+    expect(result).toEqual({ outcome: 'listed', profiles: [retiredBorealis] });
+  });
+
+  it('refuses a status that is not active or retired without reading the repo', async () => {
+    const repo = new CountingProfileRepository({ 'project-atlas': activeAtlas });
+    const result = await new ListProjectProfilesUseCase({ profileRepo: repo }).execute({
+      status: 'archived',
+    } as unknown as ListProjectProfilesRequest);
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'status must be active or retired',
+    });
+    expect(repo.listCalls).toBe(0);
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('refuses to run without dependencies or a request object', async () => {
+    await expect(
+      new ListProjectProfilesUseCase().execute({}),
+    ).rejects.toThrow('Not implemented: ListProjectProfilesUseCase');
+    const result = await new ListProjectProfilesUseCase({
+      profileRepo: new StubProfileRepository(),
+    }).execute(undefined);
+    expect(result).toEqual({ outcome: 'rejected', reason: 'request must be an object' });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 3: InspectProjectProfileUseCase
+ * ------------------------------------------------------------------ */
+
+describe('InspectProjectProfileUseCase', () => {
+  const seeded = profileRecord();
+
+  it('returns a stored profile as found', async () => {
+    const repo = new StubProfileRepository({ 'project-atlas': seeded });
+    const result = await new InspectProjectProfileUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+    });
+    expect(result).toEqual({ outcome: 'found', profile: seeded });
+  });
+
+  it('reports a known absence as not-found', async () => {
+    const result = await new InspectProjectProfileUseCase({
+      profileRepo: new StubProfileRepository(),
+    }).execute({ projectId: 'project-unknown' });
+    expect(result).toEqual({ outcome: 'not-found', projectId: 'project-unknown' });
+  });
+
+  it('refuses a blank projectId', async () => {
+    const result = await new InspectProjectProfileUseCase({
+      profileRepo: new StubProfileRepository(),
+    }).execute({ projectId: '   ' });
+    expect(result).toEqual({ outcome: 'rejected', reason: 'projectId is required' });
+  });
+
+  it('finds a profile when the projectId is surrounded by whitespace', async () => {
+    const repo = new StubProfileRepository({ 'project-atlas': seeded });
+    const result = await new InspectProjectProfileUseCase({ profileRepo: repo }).execute({
+      projectId: '  project-atlas ',
+    });
+    expect(result).toEqual({ outcome: 'found', profile: seeded });
+  });
+
+  it('refuses to run without dependencies or a request object', async () => {
+    await expect(
+      new InspectProjectProfileUseCase().execute({ projectId: 'project-atlas' }),
+    ).rejects.toThrow('Not implemented: InspectProjectProfileUseCase');
+    const result = await new InspectProjectProfileUseCase({
+      profileRepo: new StubProfileRepository(),
+    }).execute(undefined);
+    expect(result).toEqual({ outcome: 'rejected', reason: 'request must be an object' });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 4: RecordProjectProbeUseCase
+ * ------------------------------------------------------------------ */
+
+describe('RecordProjectProbeUseCase', () => {
+  const receipt: ProjectProbeReceiptRecord = {
+    probedAtIso: LATER_ISO,
+    probedFrom: 'host-1',
+    checks: [{ name: 'git-fetch', host: 'host-1', result: 'pass', detail: 'ok' }],
+  };
+
+  it('records a probe receipt, replacing only lastProbe and bumping the revision', async () => {
+    const seeded = profileRecord({ revision: 4 });
+    const repo = new StubProfileRepository({ 'project-atlas': seeded });
+    const result = await new RecordProjectProbeUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 4,
+      receipt,
+    });
+    expect(result.outcome).toBe('recorded');
+    if (result.outcome !== 'recorded') {
+      throw new Error('expected a recorded probe');
+    }
+    expect(result.profile).toEqual({ ...seeded, lastProbe: receipt, revision: 5 });
+    expect(repo.saves).toEqual([result.profile]);
+  });
+
+  it('refuses an unregistered project', async () => {
+    const repo = new StubProfileRepository();
+    const result = await new RecordProjectProbeUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-unknown',
+      expectedRevision: 0,
+      receipt,
+    });
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'project project-unknown is not registered',
+    });
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('refuses a retired project', async () => {
+    const seeded = profileRecord({ status: 'retired' });
+    const repo = new StubProfileRepository({ 'project-atlas': seeded });
+    const result = await new RecordProjectProbeUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      receipt,
+    });
+    expect(result).toEqual({ outcome: 'rejected', reason: 'project project-atlas is retired' });
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('refuses an expectedRevision that is not a non-negative integer', async () => {
+    const repo = new StubProfileRepository({ 'project-atlas': profileRecord() });
+    const badRevisions: unknown[] = [-1, 1.5, NaN, '0'];
+    for (const bad of badRevisions) {
+      const result = await new RecordProjectProbeUseCase({ profileRepo: repo }).execute({
+        projectId: 'project-atlas',
+        expectedRevision: bad as number,
+        receipt,
+      });
+      expect(result.outcome).toBe('rejected');
+      expect(result.outcome === 'rejected' && result.reason).toContain('expectedRevision');
+    }
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('refuses a probe whose stored revision moved on', async () => {
+    const seeded = profileRecord({ revision: 2 });
+    const repo = new StubProfileRepository({ 'project-atlas': seeded });
+    const result = await new RecordProjectProbeUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 1,
+      receipt,
+    });
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'project project-atlas changed since the probe started (revision 2, probe read 1); probe again',
+    });
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('refuses a receipt with a credential-shaped extra key and saves nothing', async () => {
+    const repo = new StubProfileRepository({ 'project-atlas': profileRecord() });
+    const result = await new RecordProjectProbeUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      receipt: { ...receipt, wavesApiToken: 'never-persisted' },
+    });
+    expect(result.outcome).toBe('rejected');
+    expect(result.outcome === 'rejected' && result.reason).toContain('lastProbe');
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('records one of two concurrent probes on the same revision and rejects the other', async () => {
+    const store = new ProjectProfileRepositoryAdapter();
+    await store.saveProfile(profileRecord({ revision: 0 }));
+    const useCase = new RecordProjectProbeUseCase({ profileRepo: store });
+    const outcomes = await Promise.all([
+      useCase.execute({
+        projectId: 'project-atlas',
+        expectedRevision: 0,
+        receipt: { ...receipt, probedAtIso: NOW_ISO },
+      }),
+      useCase.execute({
+        projectId: 'project-atlas',
+        expectedRevision: 0,
+        receipt: { ...receipt, probedAtIso: LATER_ISO },
+      }),
+    ]);
+    const recorded = outcomes.filter((result) => result.outcome === 'recorded');
+    const rejected = outcomes.filter((result) => result.outcome === 'rejected');
+    expect(recorded).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const stored = await store.findProfileById('project-atlas');
+    expect(stored?.revision).toBe(1);
+    expect(stored?.lastProbe).not.toBeNull();
+  });
+
+  it('refuses to run without dependencies or a request object', async () => {
+    await expect(
+      new RecordProjectProbeUseCase().execute({
+        projectId: 'project-atlas',
+        expectedRevision: 0,
+        receipt,
+      }),
+    ).rejects.toThrow('Not implemented: RecordProjectProbeUseCase');
+    const result = await new RecordProjectProbeUseCase({
+      profileRepo: new StubProfileRepository(),
+    }).execute(undefined);
+    expect(result).toEqual({ outcome: 'rejected', reason: 'request must be an object' });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 5: InspectConfiguredCapabilitiesUseCase
  * ------------------------------------------------------------------ */
 
 describe('InspectConfiguredCapabilitiesUseCase', () => {
@@ -1369,6 +1646,9 @@ describe('InspectOutstandingCoordinationUseCase', () => {
 describe('use case composition boundary', () => {
   const cases: ReadonlyArray<[string, { execute: (input: unknown) => Promise<unknown> }]> = [
     ['RegisterProjectProfileUseCase', new RegisterProjectProfileUseCase()],
+    ['ListProjectProfilesUseCase', new ListProjectProfilesUseCase()],
+    ['InspectProjectProfileUseCase', new InspectProjectProfileUseCase()],
+    ['RecordProjectProbeUseCase', new RecordProjectProbeUseCase()],
     ['InspectConfiguredCapabilitiesUseCase', new InspectConfiguredCapabilitiesUseCase()],
     ['RequestScopedDecisionUseCase', new RequestScopedDecisionUseCase()],
     ['ResolveActionAuthorizationUseCase', new ResolveActionAuthorizationUseCase()],

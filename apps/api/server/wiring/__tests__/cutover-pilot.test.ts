@@ -18,7 +18,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { createFleetWebApiClient } from "../../../../web/src/lib/api-client.js";
 import { createConfiguredEvidenceUseCases } from "../evidence/composition";
-import { createConfiguredOperatorComposition } from "../operator/composition";
+import {
+  createConfiguredOperatorComposition,
+  getOperatorComposition,
+} from "../operator/composition";
 import {
   configureFleetApiRuntime,
   persistAcceptedReceiptsToState,
@@ -36,8 +39,10 @@ import forgeIndexPost from "../../routes/v1/forge/index.post";
 import decisionsIndexPost from "../../routes/v1/decisions/index.post";
 import projectsIndexGet from "../../routes/v1/projects/index.get";
 import projectsIndexPost from "../../routes/v1/projects/index.post";
+import projectsUnregisteredGet from "../../routes/v1/projects/unregistered.get";
 import projectIdGet from "../../routes/v1/projects/[id].get";
 import projectIdPatch from "../../routes/v1/projects/[id].patch";
+import projectProbePost from "../../routes/v1/projects/[id]/probe.post";
 import projectRetirePost from "../../routes/v1/projects/[id]/retire.post";
 import observationsIndexPost from "../../routes/v1/observations/index.post";
 import relaysIndexPost from "../../routes/v1/relays/index.post";
@@ -120,8 +125,10 @@ beforeAll(async () => {
     ["/v1/knowledge/:id/supersede", "post", knowledgeSupersedePost],
     ["/v1/projects", "get", projectsIndexGet],
     ["/v1/projects", "post", projectsIndexPost],
+    ["/v1/projects/unregistered", "get", projectsUnregisteredGet],
     ["/v1/projects/:id", "get", projectIdGet],
     ["/v1/projects/:id", "patch", projectIdPatch],
+    ["/v1/projects/:id/probe", "post", projectProbePost],
     ["/v1/projects/:id/retire", "post", projectRetirePost],
     ["/v1/decisions", "post", decisionsIndexPost],
     ["/v1/authorizations/resolve", "post", authorizationsResolvePost],
@@ -381,8 +388,10 @@ const ALL_ROUTES: ReadonlyArray<{ method: "get" | "post" | "patch"; path: string
   { method: "post", path: "/v1/knowledge/ke-matrix/supersede" },
   { method: "get", path: "/v1/projects" },
   { method: "post", path: "/v1/projects" },
+  { method: "get", path: "/v1/projects/unregistered" },
   { method: "get", path: "/v1/projects/proj-matrix" },
   { method: "patch", path: "/v1/projects/proj-matrix" },
+  { method: "post", path: "/v1/projects/proj-matrix/probe" },
   { method: "post", path: "/v1/projects/proj-matrix/retire" },
   { method: "post", path: "/v1/decisions" },
   { method: "post", path: "/v1/authorizations/resolve" },
@@ -431,6 +440,7 @@ const CONFIGURED_EMPTY_BODY_ROUTES: ReadonlyArray<{
   { method: "post", path: "/v1/knowledge/ke-matrix/supersede", outcome: "rejected" },
   { method: "get", path: "/v1/projects", outcome: "listed" },
   { method: "post", path: "/v1/projects", outcome: "rejected", status: 422, code: "REFUSED" },
+  { method: "get", path: "/v1/projects/unregistered", outcome: "listed" },
   {
     method: "get",
     path: "/v1/projects/proj-matrix",
@@ -444,6 +454,13 @@ const CONFIGURED_EMPTY_BODY_ROUTES: ReadonlyArray<{
     outcome: "rejected",
     status: 422,
     code: "REFUSED",
+  },
+  {
+    method: "post",
+    path: "/v1/projects/proj-matrix/probe",
+    outcome: "not-found",
+    status: 404,
+    code: "NOT_FOUND",
   },
   {
     method: "post",
@@ -563,6 +580,13 @@ describe("bootstrapFleetApiFromEnv (Nitro startup plugin)", () => {
         FLEET_API_TOKEN_FILE: tokenFile,
       }),
     ).toBe(true);
+
+    // The work-order guard needs a profile; register one through the runtime's
+    // operator context first.
+    const profiled = await getOperatorComposition().registerProjectProfile.execute(
+      PILOT_PROFILE_REQUEST,
+    );
+    expect(profiled.outcome).toBe("registered");
 
     const registered = await workComposition().registerWorkOrder.execute(
       PILOT_WORK_ORDER_REQUEST,
@@ -796,7 +820,15 @@ describe("restarted API and web client loopback pilot", () => {
     expect((await operator.publishProjectObservation.execute(PILOT_OBSERVATION_REQUEST)).outcome)
       .toBe("published");
 
-    const work = createConfiguredWorkComposition({ stateDir: pilotStateDir });
+    const work = createConfiguredWorkComposition(
+      { stateDir: pilotStateDir },
+      {
+        projectProfile: {
+          inspect: async (request) => operator.inspectProjectProfile.execute(request),
+          record: async (request) => operator.recordProjectProbe.execute(request),
+        },
+      },
+    );
     expect((await work.registerWorkOrder.registerWorkOrder(PILOT_WORK_ORDER_REQUEST)).outcome)
       .toBe("registered");
 

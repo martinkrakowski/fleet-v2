@@ -60,7 +60,7 @@ import {
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
   ExecutorForHost,
-  executorForHost as selectExecutorForHost,
+  executorForInstallationHost,
   hasRecordedHostName,
   consumptionId,
   forgeActionScope,
@@ -759,22 +759,13 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   });
   // One executor per named installation host for the probe's read-only git
   // checks. A v2 installation names its hosts; a v1 or absent installation has
-  // no host names, so every name is refused.
-  const executorForHostName = (name: string): ExecutorForRecordedHostResult => {
-    if (options?.installation?.schemaVersion !== 2) {
-      return { ok: false, reason: 'no v2 installation names lane hosts' };
-    }
-    const hosts = options.installation.hosts;
-    const hostSpec = hosts !== undefined && Object.hasOwn(hosts, name) ? hosts[name] : undefined;
-    if (hostSpec === undefined) {
-      return { ok: false, reason: `host ${name} is not in the installation` };
-    }
-    try {
-      return { ok: true, executor: selectExecutorForHost(hostSpec) };
-    } catch (error) {
-      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
-    }
-  };
+  // no host names, so every name is refused. The shared helper keeps the CLI
+  // and API probe rules and reason strings identical.
+  const executorForHostName = (name: string): ExecutorForRecordedHostResult =>
+    executorForInstallationHost(
+      options?.installation?.schemaVersion === 2 ? options.installation.hosts : undefined,
+      name,
+    );
 
   // --- brief-knowledge -------------------------------------------------------
 

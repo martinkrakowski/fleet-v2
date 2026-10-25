@@ -11,12 +11,17 @@ import {
   ExecutionObservationAdapter,
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
+  LocalExecutor,
   OwnerDecisionAdapter,
   AttemptOwnerDecisionAdapter,
+  ProjectProbeAdapter,
+  ProjectProbeRecordAdapter,
+  ProjectProfileReadAdapter,
   RunnerForAttemptAdapter,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
   ExecutorForHost,
+  executorForInstallationHost,
   resolveExecutionRunnerHost,
   resolveInstallationForgeMode,
   resolveRoleExecutors,
@@ -40,8 +45,10 @@ import {
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   ListAttemptsUseCase,
+  ListUnregisteredProjectsUseCase,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
+  ProbeProjectUseCase,
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
   RequestAttemptAcceptanceUseCase,
@@ -72,6 +79,8 @@ export interface WorkComposition {
   inspectWorkOrder: InspectWorkOrderUseCase;
   inspectAttempt: InspectAttemptUseCase;
   listAttempts: ListAttemptsUseCase;
+  probeProject: ProbeProjectUseCase;
+  listUnregisteredProjects: ListUnregisteredProjectsUseCase;
   prepareBriefPackage: PrepareBriefPackageUseCase;
   reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
   dispatchAttempt: DispatchAttemptUseCase;
@@ -185,6 +194,15 @@ export interface WorkCrossContextDelegates {
   readonly forge?: ForgeActionDelegate;
   /** Accepted-receipt id per head; a merge without a receipt is refused. */
   readonly acceptedReceiptByHead?: Readonly<Record<string, string>>;
+  /**
+   * Cross-context project-profile read and probe-record delegates: the API
+   * runtime binds the operator-coordination inspect/record use cases. Without
+   * them the probe and the work-order guard refuse.
+   */
+  readonly projectProfile?: {
+    readonly inspect: (req: { projectId: string }) => Promise<unknown>;
+    readonly record: (req: unknown) => Promise<unknown>;
+  };
 }
 
 let current: WorkComposition | null = null;
@@ -196,6 +214,8 @@ function unconfiguredWorkComposition(): WorkComposition {
     inspectWorkOrder: new InspectWorkOrderUseCase(),
     inspectAttempt: new InspectAttemptUseCase(),
     listAttempts: new ListAttemptsUseCase(),
+    probeProject: new ProbeProjectUseCase(),
+    listUnregisteredProjects: new ListUnregisteredProjectsUseCase(),
     prepareBriefPackage: new PrepareBriefPackageUseCase(),
     reserveExecutionCapacity: new ReserveExecutionCapacityUseCase(),
     dispatchAttempt: new DispatchAttemptUseCase(),
@@ -229,6 +249,7 @@ function isWorkComposition(
 
 export function configureWorkComposition(
   custom: WorkComposition | WorkCompositionOptions | null,
+  crossContext?: WorkCrossContextDelegates,
 ): void {
   if (custom === null) {
     configured = null;
@@ -237,7 +258,7 @@ export function configureWorkComposition(
   }
   configured = isWorkComposition(custom)
     ? custom
-    : createConfiguredWorkComposition(custom);
+    : createConfiguredWorkComposition(custom, crossContext);
   current = null;
 }
 
@@ -360,11 +381,36 @@ export function createConfiguredWorkComposition(
   const attemptOwnerDecisionPort = new AttemptOwnerDecisionAdapter(
     crossContext?.attemptOwnerDecision,
   );
+  // The probe and the work-order guard read profiles through the operator
+  // context and record probe receipts there. The guard is on for every
+  // installation kind; without a projectProfile delegate the adapters refuse.
+  const profileRead = new ProjectProfileReadAdapter(crossContext?.projectProfile);
+  const probeRecord = new ProjectProbeRecordAdapter(crossContext?.projectProfile);
 
   return {
     installation: options?.installation,
     ...(runnerHost !== undefined ? { runnerHost } : {}),
-    registerWorkOrder: new RegisterWorkOrderUseCase({ workOrderRepo }),
+    probeProject: new ProbeProjectUseCase({
+      profileRead,
+      probe: new ProjectProbeAdapter({
+        orchestrator: new LocalExecutor(),
+        executorForHost: (name) =>
+          executorForInstallationHost(
+            options?.installation?.schemaVersion === 2 ? options.installation.hosts : undefined,
+            name,
+          ),
+      }),
+      probeRecord,
+      verificationProcedureNames:
+        options?.installation?.schemaVersion === 2
+          ? Object.keys(options?.installation?.verification?.procedures ?? {})
+          : null,
+    }),
+    listUnregisteredProjects: new ListUnregisteredProjectsUseCase({
+      workOrderRepo,
+      profileRead,
+    }),
+    registerWorkOrder: new RegisterWorkOrderUseCase({ workOrderRepo, profileRead }),
     inspectWorkOrder: new InspectWorkOrderUseCase({ workOrderRepo, attemptRepo, journal }),
     inspectAttempt: new InspectAttemptUseCase({ attemptRepo, runnerForAttempt }),
     listAttempts: new ListAttemptsUseCase({ attemptRepo, workOrderRepo, journal }),

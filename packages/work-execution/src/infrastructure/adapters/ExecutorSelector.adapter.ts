@@ -61,6 +61,34 @@ export function executorForHost(spec?: ExecutorHostSpec): CommandExecutorPort {
   return new LocalExecutor();
 }
 
+/**
+ * Select the executor for one named installation host (the probe's read-only
+ * git checks). `hosts` is the v2 installation's host map; undefined means no
+ * v2 installation names lane hosts, so every name is refused. The rules and
+ * reason strings are shared verbatim by the CLI and API composition roots.
+ */
+export function executorForInstallationHost(
+  hosts: Readonly<Record<string, ExecutorHostSpec>> | undefined,
+  name: string,
+): { ok: true; executor: CommandExecutorPort } | { ok: false; reason: string } {
+  if (hosts === undefined) {
+    return { ok: false, reason: 'no v2 installation names lane hosts' };
+  }
+  if (!Object.hasOwn(hosts, name)) {
+    return { ok: false, reason: `host ${name} is not in the installation` };
+  }
+  const transport = hosts[name].transport;
+  if (transport !== 'local' && transport !== 'ssh') {
+    // A host without a declared transport never gets a local executor here.
+    return { ok: false, reason: `host ${name} declares no transport` };
+  }
+  try {
+    return { ok: true, executor: executorForHost(hosts[name]) };
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 /** First host whose roles include `role`, or undefined. */
 function hostWithRole(
   hosts: Readonly<Record<string, ExecutorHostSpec>> | undefined,

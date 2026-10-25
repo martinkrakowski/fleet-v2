@@ -21,6 +21,7 @@ import type {
   AuthorizationConsumptionRecord,
   CoordinationRequestRecord,
   ProjectAttentionSummaryRecord,
+  ProjectProbeReceiptRecord,
   ProjectProfileRecord,
   ProjectProbeReceiptRecord,
   RelayAcknowledgementRecord,
@@ -30,6 +31,7 @@ import type {
   InspectConfiguredCapabilitiesRequest,
   ListProjectProfilesRequest,
   RegisterProjectProfileRequest,
+  UpdateProjectProfileRequest,
 } from '../../ports/in/index.js';
 import type { CoordinationRequestRepositoryPort } from '../../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import { CoordinationRequestRevisionConflictError } from '../../ports/out/CoordinationRequestRepositoryPort.out-port.js';
@@ -40,10 +42,12 @@ import type {
   DecisionTransportPort,
 } from '../../ports/out/DecisionTransportPort.out-port.js';
 import { canonicalDecisionBytes } from '../../../infrastructure/adapters/DecisionSignature.adapter.js';
+import type { InstallationReferences } from '../../ports/out/InstallationReferencePort.out-port.js';
 import type { ProjectProfileRepositoryPort } from '../../ports/out/ProjectProfileRepositoryPort.out-port.js';
 import type { RelayDeliveryOutcome, RelayNoticeRequest } from '../../ports/out/RelayTransportPort.out-port.js';
 import { AttentionReadAdapter } from '../../../infrastructure/adapters/AttentionReadAdapter.adapter.js';
 import { CoordinationRequestRepositoryAdapter } from '../../../infrastructure/adapters/CoordinationRequestRepositoryAdapter.adapter.js';
+import { InstallationReferenceAdapter } from '../../../infrastructure/adapters/InstallationReferenceAdapter.adapter.js';
 import { DecisionTransportAdapter } from '../../../infrastructure/adapters/DecisionTransportAdapter.adapter.js';
 import { ObservationPublicationAdapter } from '../../../infrastructure/adapters/ObservationPublicationAdapter.adapter.js';
 import { ProjectProfileRepositoryAdapter } from '../../../infrastructure/adapters/ProjectProfileRepositoryAdapter.adapter.js';
@@ -59,6 +63,8 @@ import { RecordProjectProbeUseCase } from '../RecordProjectProbeUseCase.use-case
 import { RecordRelayAcknowledgementUseCase } from '../RecordRelayAcknowledgementUseCase.use-case.js';
 import { RegisterProjectProfileUseCase } from '../RegisterProjectProfileUseCase.use-case.js';
 import { RequestScopedDecisionUseCase } from '../RequestScopedDecisionUseCase.use-case.js';
+import { RetireProjectProfileUseCase } from '../RetireProjectProfileUseCase.use-case.js';
+import { UpdateProjectProfileUseCase } from '../UpdateProjectProfileUseCase.use-case.js';
 import { ResolveActionAuthorizationUseCase } from '../ResolveActionAuthorizationUseCase.use-case.js';
 import { SendFleetRelayUseCase } from '../SendFleetRelayUseCase.use-case.js';
 
@@ -302,17 +308,20 @@ describe('RegisterProjectProfileUseCase', () => {
     expect(Object.keys(result.profile.runnerCapabilities)).toEqual(['openai/gpt-5', 'local/vllm']);
   });
 
-  it('moves the profile revision forward when it already exists', async () => {
+  it('refuses a profile whose id is already registered', async () => {
     const repo = new StubProfileRepository({
       'project-atlas': profileRecord({ revision: 4, updatedAtIso: LATER_ISO }),
     });
     const result = await new RegisterProjectProfileUseCase({ profileRepo: repo }).execute(
       validRequest,
     );
-    expect(result.outcome === 'registered' && result.profile.revision).toBe(5);
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'project project-atlas is already registered; edit it with update',
+    });
   });
 
-  it('looks up an existing profile with the trimmed projectId and updates it to revision 1', async () => {
+  it('looks up an existing profile with the trimmed projectId and refuses a second registration', async () => {
     const repo = new ProjectProfileRepositoryAdapter();
     const useCase = new RegisterProjectProfileUseCase({ profileRepo: repo });
     const first = await useCase.execute({ ...validRequest, projectId: 'atlas' });
@@ -323,13 +332,10 @@ describe('RegisterProjectProfileUseCase', () => {
       displayName: 'Atlas Updated',
       nowIso: LATER_ISO,
     });
-    expect(second.outcome).toBe('registered');
-    if (second.outcome !== 'registered') {
-      throw new Error('expected a registered profile');
-    }
-    expect(second.profile.projectId).toBe('atlas');
-    expect(second.profile.revision).toBe(1);
-    expect(second.profile.displayName).toBe('Atlas Updated');
+    expect(second).toEqual({
+      outcome: 'rejected',
+      reason: 'project atlas is already registered; edit it with update',
+    });
   });
 
   it('turns two concurrent registrations of the same new id into one registered and one rejected', async () => {
@@ -344,7 +350,7 @@ describe('RegisterProjectProfileUseCase', () => {
     expect(rejected).toHaveLength(1);
     expect(rejected[0]).toEqual({
       outcome: 'rejected',
-      reason: 'profile atlas changed while it was being registered; read it again and retry',
+      reason: 'profile atlas changed while it was being written; read it again and retry',
     });
   });
 
@@ -367,7 +373,7 @@ describe('RegisterProjectProfileUseCase', () => {
     ).rejects.toThrow('ProjectProfileRepositoryAdapter could not write the store');
   });
 
-  it('keeps stored clones and the last probe on re-registration', async () => {
+  it('keeps stored clones and the last probe when an edit does not touch repository or clones', async () => {
     const seeded = profileRecord({
       revision: 1,
       clones: { host1: { path: '/srv/clone', worktreeRoot: '/srv/wt' } },
@@ -378,12 +384,14 @@ describe('RegisterProjectProfileUseCase', () => {
       },
     });
     const repo = new StubProfileRepository({ 'project-atlas': seeded });
-    const result = await new RegisterProjectProfileUseCase({ profileRepo: repo }).execute(
-      validRequest,
-    );
-    expect(result.outcome).toBe('registered');
-    if (result.outcome !== 'registered') {
-      throw new Error('expected a registered profile');
+    const result = await new UpdateProjectProfileUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 1,
+      changes: { displayName: 'Atlas' },
+    });
+    expect(result.outcome).toBe('updated');
+    if (result.outcome !== 'updated') {
+      throw new Error('expected an updated profile');
     }
     expect(result.profile.revision).toBe(2);
     expect(result.profile.clones).toEqual(seeded.clones);
@@ -435,11 +443,396 @@ describe('RegisterProjectProfileUseCase', () => {
     await expect(
       new RegisterProjectProfileUseCase().execute(validRequest),
     ).rejects.toThrow('Not implemented: RegisterProjectProfileUseCase');
-    await expect(
-      new RegisterProjectProfileUseCase({ profileRepo: new StubProfileRepository() }).execute(
-        undefined,
-      ),
-    ).rejects.toThrow('Not implemented: RegisterProjectProfileUseCase');
+    const result = await new RegisterProjectProfileUseCase({
+      profileRepo: new StubProfileRepository(),
+    }).execute(undefined);
+    expect(result).toEqual({ outcome: 'rejected', reason: 'request must be an object' });
+  });
+
+  it('stores v2 fields supplied on the request', async () => {
+    const repo = new StubProfileRepository();
+    const result = await new RegisterProjectProfileUseCase({ profileRepo: repo }).execute({
+      ...validRequest,
+      defaultBranch: 'main',
+      clones: { host1: { path: '/srv/clone', worktreeRoot: '/srv/wt' } },
+      gateProcedures: ['verify-merge'],
+      defaultAllowedPathPrefixes: ['src/'],
+    });
+    expect(result.outcome).toBe('registered');
+    if (result.outcome !== 'registered') {
+      throw new Error('expected a registered profile');
+    }
+    expect(result.profile.defaultBranch).toBe('main');
+    expect(result.profile.clones).toEqual({
+      host1: { path: '/srv/clone', worktreeRoot: '/srv/wt' },
+    });
+    expect(result.profile.gateProcedures).toEqual(['verify-merge']);
+    expect(result.profile.defaultAllowedPathPrefixes).toEqual(['src/']);
+    expect(result.profile.revision).toBe(0);
+    expect(result.profile.lastProbe).toBeNull();
+  });
+
+  it('refuses a request that tries to set status, lastProbe or revision', async () => {
+    const repo = new StubProfileRepository();
+    const useCase = new RegisterProjectProfileUseCase({ profileRepo: repo });
+    for (const key of ['status', 'lastProbe', 'revision'] as const) {
+      const result = await useCase.execute({
+        ...validRequest,
+        [key]: key === 'status' ? 'retired' : key === 'revision' ? 3 : null,
+      } as unknown as RegisterProjectProfileRequest);
+      expect(result.outcome).toBe('rejected');
+      expect(result.outcome === 'rejected' && result.reason).toBe(`${key} cannot be set by registration`);
+    }
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('skips installation name checks when no installation references are injected', async () => {
+    const repo = new StubProfileRepository();
+    const result = await new RegisterProjectProfileUseCase({ profileRepo: repo }).execute({
+      ...validRequest,
+      designatedDispatcherHost: 'not-in-any-installation',
+    });
+    expect(result.outcome).toBe('registered');
+  });
+
+  it('refuses when the loaded installation is null', async () => {
+    const repo = new StubProfileRepository();
+    const result = await new RegisterProjectProfileUseCase({
+      profileRepo: repo,
+      installationRefs: new InstallationReferenceAdapter(null),
+    }).execute(validRequest);
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'no installation is loaded to check host and procedure names against',
+    });
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('refuses host and procedure names the installation does not have', async () => {
+    const repo = new StubProfileRepository();
+    const useCase = new RegisterProjectProfileUseCase({
+      profileRepo: repo,
+      installationRefs: new InstallationReferenceAdapter({
+        hostNames: ['dispatcher-01', 'worker-01'],
+        procedureNames: ['verify-merge'],
+      }),
+    });
+
+    const badDispatcher = await useCase.execute({
+      ...validRequest,
+      designatedDispatcherHost: 'ghost-host',
+    });
+    expect(badDispatcher).toEqual({
+      outcome: 'rejected',
+      reason: 'designatedDispatcherHost ghost-host is not a host in the installation',
+    });
+
+    const badClone = await useCase.execute({
+      ...validRequest,
+      clones: {
+        zhost: { path: '/srv/z', worktreeRoot: '/srv/wt-z' },
+        ahost: { path: '/srv/a', worktreeRoot: '/srv/wt-a' },
+      },
+    });
+    expect(badClone).toEqual({
+      outcome: 'rejected',
+      reason: 'clone host ahost is not a host in the installation',
+    });
+
+    const badProcedure = await useCase.execute({
+      ...validRequest,
+      gateProcedures: ['verify-merge', 'unlisted-procedure'],
+    });
+    expect(badProcedure).toEqual({
+      outcome: 'rejected',
+      reason: 'gate procedure unlisted-procedure is not a verification procedure in the installation',
+    });
+
+    expect(repo.saves).toHaveLength(0);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 1b: UpdateProjectProfileUseCase
+ * ------------------------------------------------------------------ */
+
+describe('UpdateProjectProfileUseCase', () => {
+  const validChange = { displayName: 'Atlas Updated' };
+
+  it('updates an active profile at the expected revision', async () => {
+    const seeded = profileRecord({ revision: 2 });
+    const repo = new StubProfileRepository({ 'project-atlas': seeded });
+    const result = await new UpdateProjectProfileUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 2,
+      changes: validChange,
+    });
+    expect(result.outcome).toBe('updated');
+    if (result.outcome !== 'updated') {
+      throw new Error('expected an updated profile');
+    }
+    expect(result.profile.revision).toBe(3);
+    expect(result.profile.displayName).toBe('Atlas Updated');
+    expect(result.profile.status).toBe('active');
+    expect(repo.saves).toHaveLength(1);
+    expect(repo.saves[0].revision).toBe(3);
+  });
+
+  it('refuses a missing, retired or stale profile', async () => {
+    const missing = await new UpdateProjectProfileUseCase({
+      profileRepo: new StubProfileRepository(),
+    }).execute({ projectId: 'project-atlas', expectedRevision: 0, changes: validChange });
+    expect(missing).toEqual({
+      outcome: 'rejected',
+      reason: 'project project-atlas is not registered',
+    });
+
+    const retired = await new UpdateProjectProfileUseCase({
+      profileRepo: new StubProfileRepository({
+        'project-atlas': profileRecord({ status: 'retired', revision: 1 }),
+      }),
+    }).execute({ projectId: 'project-atlas', expectedRevision: 1, changes: validChange });
+    expect(retired).toEqual({
+      outcome: 'rejected',
+      reason: 'project project-atlas is retired; a retired profile is not edited',
+    });
+
+    const stale = await new UpdateProjectProfileUseCase({
+      profileRepo: new StubProfileRepository({ 'project-atlas': profileRecord({ revision: 0 }) }),
+    }).execute({ projectId: 'project-atlas', expectedRevision: 2, changes: validChange });
+    expect(stale).toEqual({
+      outcome: 'rejected',
+      reason: 'project project-atlas is at revision 0, not 2; read it again',
+    });
+  });
+
+  it('refuses a non-negative-integer expectedRevision', async () => {
+    const repo = new StubProfileRepository({ 'project-atlas': profileRecord() });
+    const useCase = new UpdateProjectProfileUseCase({ profileRepo: repo });
+    for (const expectedRevision of [-1, 1.5]) {
+      const result = await useCase.execute({
+        projectId: 'project-atlas',
+        expectedRevision,
+        changes: validChange,
+      });
+      expect(result).toEqual({
+        outcome: 'rejected',
+        reason: 'expectedRevision must be a non-negative integer',
+      });
+    }
+  });
+
+  it('refuses empty or forbidden changes', async () => {
+    const repo = new StubProfileRepository({ 'project-atlas': profileRecord() });
+    const useCase = new UpdateProjectProfileUseCase({ profileRepo: repo });
+    const empty = await useCase.execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      changes: {},
+    });
+    expect(empty).toEqual({ outcome: 'rejected', reason: 'changes must name at least one field' });
+
+    for (const key of ['status', 'lastProbe', 'revision', 'projectId', 'bogus', 'apiToken']) {
+      const result = await useCase.execute({
+        projectId: 'project-atlas',
+        expectedRevision: 0,
+        changes: { [key]: 'anything' },
+      } as unknown as UpdateProjectProfileRequest);
+      expect(result).toEqual({
+        outcome: 'rejected',
+        reason: `change ${key} is not allowed`,
+      });
+    }
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('clears the last probe when the repository or clones change and keeps it otherwise', async () => {
+    const probe: ProjectProbeReceiptRecord = {
+      probedAtIso: LATER_ISO,
+      probedFrom: 'host-1',
+      checks: [{ name: 'git-fetch', host: 'host-1', result: 'pass', detail: 'ok' }],
+    };
+    const repo = new ProjectProfileRepositoryAdapter();
+    await repo.saveProfile(
+      profileRecord({ revision: 0, repository: 'atlas/repo', lastProbe: probe }),
+    );
+    const useCase = new UpdateProjectProfileUseCase({ profileRepo: repo });
+
+    const renamed = await useCase.execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      changes: { displayName: 'Atlas Renamed' },
+    });
+    expect(renamed.outcome === 'updated' && renamed.profile.lastProbe).toEqual(probe);
+
+    const moved = await useCase.execute({
+      projectId: 'project-atlas',
+      expectedRevision: 1,
+      changes: { repository: 'atlas/repo-v2' },
+    });
+    expect(moved.outcome === 'updated' && moved.profile.lastProbe).toBeNull();
+
+    const recloned = await useCase.execute({
+      projectId: 'project-atlas',
+      expectedRevision: 2,
+      changes: { clones: { host1: { path: '/srv/clone', worktreeRoot: '/srv/wt' } } },
+    });
+    expect(recloned.outcome === 'updated' && recloned.profile.lastProbe).toBeNull();
+  });
+
+  it('refuses an invalid clone path through the entity with nothing saved', async () => {
+    const repo = new StubProfileRepository({ 'project-atlas': profileRecord() });
+    const result = await new UpdateProjectProfileUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      changes: { clones: { host1: { path: 'relative/path', worktreeRoot: '/srv/wt' } } },
+    });
+    expect(result.outcome).toBe('rejected');
+    expect(result.outcome === 'rejected' && result.reason).toContain(
+      'ProjectProfile clone host1 requires normalised absolute paths',
+    );
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('refuses host and procedure names the installation does not have', async () => {
+    const repo = new StubProfileRepository({ 'project-atlas': profileRecord() });
+    const useCase = new UpdateProjectProfileUseCase({
+      profileRepo: repo,
+      installationRefs: new InstallationReferenceAdapter({
+        hostNames: ['dispatcher-01', 'worker-01'],
+        procedureNames: ['verify-merge'],
+      }),
+    });
+
+    const badDispatcher = await useCase.execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      changes: { designatedDispatcherHost: 'ghost-host' },
+    });
+    expect(badDispatcher).toEqual({
+      outcome: 'rejected',
+      reason: 'designatedDispatcherHost ghost-host is not a host in the installation',
+    });
+
+    const badClone = await useCase.execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      changes: {
+        clones: {
+          zhost: { path: '/srv/z', worktreeRoot: '/srv/wt-z' },
+          ahost: { path: '/srv/a', worktreeRoot: '/srv/wt-a' },
+        },
+      },
+    });
+    expect(badClone).toEqual({
+      outcome: 'rejected',
+      reason: 'clone host ahost is not a host in the installation',
+    });
+
+    const badProcedure = await useCase.execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      changes: { gateProcedures: ['verify-merge', 'unlisted-procedure'] },
+    });
+    expect(badProcedure).toEqual({
+      outcome: 'rejected',
+      reason: 'gate procedure unlisted-procedure is not a verification procedure in the installation',
+    });
+
+    expect(repo.saves).toHaveLength(0);
+  });
+
+  it('refuses when no installation is loaded', async () => {
+    const repo = new StubProfileRepository({ 'project-atlas': profileRecord() });
+    const result = await new UpdateProjectProfileUseCase({
+      profileRepo: repo,
+      installationRefs: new InstallationReferenceAdapter(null),
+    }).execute({ projectId: 'project-atlas', expectedRevision: 0, changes: validChange });
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'no installation is loaded to check host and procedure names against',
+    });
+    expect(repo.saves).toHaveLength(0);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Use case 1c: RetireProjectProfileUseCase
+ * ------------------------------------------------------------------ */
+
+describe('RetireProjectProfileUseCase', () => {
+  it('retires an active profile at the expected revision', async () => {
+    const seeded = profileRecord({ revision: 1, displayName: 'Atlas' });
+    const repo = new StubProfileRepository({ 'project-atlas': seeded });
+    const result = await new RetireProjectProfileUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 1,
+    });
+    expect(result.outcome).toBe('retired');
+    if (result.outcome !== 'retired') {
+      throw new Error('expected a retired profile');
+    }
+    expect(result.profile.status).toBe('retired');
+    expect(result.profile.revision).toBe(2);
+    expect(result.profile.displayName).toBe('Atlas');
+    expect(repo.saves).toHaveLength(1);
+  });
+
+  it('refuses an already retired profile', async () => {
+    const repo = new StubProfileRepository({
+      'project-atlas': profileRecord({ status: 'retired', revision: 4 }),
+    });
+    const result = await new RetireProjectProfileUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 4,
+    });
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'project project-atlas is already retired',
+    });
+  });
+
+  it('refuses a missing profile and a stale revision', async () => {
+    const missing = await new RetireProjectProfileUseCase({
+      profileRepo: new StubProfileRepository(),
+    }).execute({ projectId: 'project-atlas', expectedRevision: 0 });
+    expect(missing).toEqual({
+      outcome: 'rejected',
+      reason: 'project project-atlas is not registered',
+    });
+
+    const stale = await new RetireProjectProfileUseCase({
+      profileRepo: new StubProfileRepository({ 'project-atlas': profileRecord({ revision: 0 }) }),
+    }).execute({ projectId: 'project-atlas', expectedRevision: 3 });
+    expect(stale).toEqual({
+      outcome: 'rejected',
+      reason: 'project project-atlas is at revision 0, not 3; read it again',
+    });
+  });
+
+  it('settles a concurrent update and retire on the same revision to one winner', async () => {
+    const repo = new ProjectProfileRepositoryAdapter();
+    await repo.saveProfile(profileRecord({ revision: 0 }));
+    const updatePromise = new UpdateProjectProfileUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      changes: { displayName: 'Concurrent' },
+    });
+    const retirePromise = new RetireProjectProfileUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+    });
+    const outcomes = await Promise.all([updatePromise, retirePromise]);
+    const winners = outcomes.filter(
+      (result) => result.outcome === 'updated' || result.outcome === 'retired',
+    );
+    const rejected = outcomes.filter((result) => result.outcome === 'rejected');
+    expect(winners).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toEqual({
+      outcome: 'rejected',
+      reason: 'profile project-atlas changed while it was being written; read it again and retry',
+    });
   });
 });
 
@@ -1649,6 +2042,8 @@ describe('use case composition boundary', () => {
     ['ListProjectProfilesUseCase', new ListProjectProfilesUseCase()],
     ['InspectProjectProfileUseCase', new InspectProjectProfileUseCase()],
     ['RecordProjectProbeUseCase', new RecordProjectProbeUseCase()],
+    ['UpdateProjectProfileUseCase', new UpdateProjectProfileUseCase()],
+    ['RetireProjectProfileUseCase', new RetireProjectProfileUseCase()],
     ['InspectConfiguredCapabilitiesUseCase', new InspectConfiguredCapabilitiesUseCase()],
     ['RequestScopedDecisionUseCase', new RequestScopedDecisionUseCase()],
     ['ResolveActionAuthorizationUseCase', new ResolveActionAuthorizationUseCase()],
@@ -1861,6 +2256,35 @@ describe('ProjectProfileRepositoryAdapter', () => {
       expect(listed[0].defaultAllowedPathPrefixes).toEqual([]);
       expect(listed[0].lastProbe).toBeNull();
     });
+  });
+});
+
+describe('InstallationReferenceAdapter', () => {
+  it('returns frozen sorted copies of the installation references', () => {
+    const original: InstallationReferences = {
+      hostNames: ['worker-02', 'dispatcher-01'],
+      procedureNames: ['verify-merge', 'audit-logs'],
+    };
+    const adapter = new InstallationReferenceAdapter(original);
+    const refs = adapter.references();
+    expect(refs).toEqual({
+      hostNames: ['dispatcher-01', 'worker-02'],
+      procedureNames: ['audit-logs', 'verify-merge'],
+    });
+    expect(refs?.hostNames).not.toBe(original.hostNames);
+    expect(() => {
+      (refs?.hostNames as string[]).push('intruder');
+    }).toThrow(TypeError);
+    expect(() => {
+      (refs?.procedureNames as string[]).push('intruder');
+    }).toThrow(TypeError);
+    expect(original.hostNames).toEqual(['worker-02', 'dispatcher-01']);
+    expect(original.procedureNames).toEqual(['verify-merge', 'audit-logs']);
+  });
+
+  it('reports null when no installation is loaded', () => {
+    expect(new InstallationReferenceAdapter(null).references()).toBeNull();
+    expect(new InstallationReferenceAdapter().references()).toBeNull();
   });
 });
 

@@ -17,7 +17,7 @@ import {
 } from '../../application/ports/out/AttemptRepositoryPort.out-port.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
 import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
-import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
+import { inspectRecordListBytes, quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface AttemptRepositoryAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
@@ -76,6 +76,11 @@ function normalizeRecord(record: AttemptRecord): AttemptRecord {
       hostName,
     },
   };
+}
+
+/** The reader's record parser, shared with `fleet-v2 state check`. */
+export function parseAttemptStateRecord(raw: unknown): AttemptRecord | undefined {
+  return isAttemptRecord(raw) ? normalizeRecord(raw) : undefined;
 }
 
 export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
@@ -222,23 +227,12 @@ export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
       }
       throw error;
     }
-    const raw = buffer.toString('utf8');
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      await quarantineUnreadable(target, 'not valid JSON', buffer);
+    const inspection = inspectRecordListBytes(buffer, parseAttemptStateRecord);
+    if (inspection.status === 'unreadable') {
+      return quarantineUnreadable(target, inspection.detail, buffer);
     }
-    if (!Array.isArray(parsed)) {
-      await quarantineUnreadable(target, 'expects a record list', buffer);
-    }
-    const records = parsed as unknown[];
-    for (const [index, rawItem] of records.entries()) {
-      if (!isAttemptRecord(rawItem)) {
-        await quarantineUnreadable(target, `record ${index} failed validation`, buffer);
-      }
-      const item = rawItem as AttemptRecord;
-      map.set(item.id, normalizeRecord(item));
+    for (const item of inspection.records) {
+      map.set(item.id, item);
     }
     return map;
   }

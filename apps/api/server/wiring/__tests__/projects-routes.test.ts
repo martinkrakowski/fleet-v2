@@ -148,6 +148,47 @@ describe("project routes", () => {
     return { status: res.status, body: (await res.json()) as EnvelopeResponse };
   }
 
+  it("refuses a GET without a bearer token with 401", async () => {
+    const res = await fetch(`${baseUrl}/v1/projects/proj-a`);
+    expect(res.status).toBe(401);
+  });
+
+  it("refuses a PATCH without a bearer token with 401", async () => {
+    const res = await fetch(`${baseUrl}/v1/projects/proj-a`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedRevision: 0,
+        changes: { displayName: "Unauthorized" },
+      }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("refuses a PATCH without content-type: application/json with 415", async () => {
+    const res = await fetch(`${baseUrl}/v1/projects/proj-a`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        expectedRevision: 0,
+        changes: { displayName: "Unsupported Media Type" },
+      }),
+    });
+    expect(res.status).toBe(415);
+  });
+
+  it("refuses POST /v1/projects with an array JSON body with 400 BAD_REQUEST", async () => {
+    const res = await fetch(`${baseUrl}/v1/projects`, {
+      method: "POST",
+      headers: { ...authHeaders(), "content-type": "application/json" },
+      body: JSON.stringify([]),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe("BAD_REQUEST");
+    expect(body.result).toBeNull();
+  });
+
   it("registers a project and reads it back by id with revision 0", async () => {
     const registered = await registerProject(registerBody());
     expect(registered.status).toBe(200);
@@ -247,6 +288,44 @@ describe("project routes", () => {
     const staleBody = await stale.json();
     expect(staleBody.code).toBe("REFUSED");
     expect(staleBody.result.reason).toContain("revision");
+
+    const read = await fetch(`${baseUrl}/v1/projects/proj-a`, {
+      headers: authHeaders(),
+    });
+    expect(read.status).toBe(200);
+    const readBody = await read.json();
+    expect(readBody.result.profile.revision).toBe(0);
+    expect(readBody.result.profile.displayName).toBe("Project A");
+  });
+
+  it("refuses forbidden or unknown PATCH changes and leaves revision at 0", async () => {
+    await registerProject(registerBody());
+
+    for (const changes of [
+      { status: "retired" },
+      { revision: 9 },
+      { lastProbe: null },
+      { runnerCapabilities: { apiToken: true } },
+    ]) {
+      const refused = await fetch(`${baseUrl}/v1/projects/proj-a`, {
+        method: "PATCH",
+        headers: { ...authHeaders(), "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedRevision: 0,
+          changes,
+        }),
+      });
+      expect(refused.status).toBe(422);
+      const refusedBody = await refused.json();
+      expect(refusedBody.code).toBe("REFUSED");
+
+      const read = await fetch(`${baseUrl}/v1/projects/proj-a`, {
+        headers: authHeaders(),
+      });
+      expect(read.status).toBe(200);
+      const readBody = await read.json();
+      expect(readBody.result.profile.revision).toBe(0);
+    }
   });
 
   it("lets the route id override a differing body projectId on PATCH", async () => {
@@ -272,6 +351,28 @@ describe("project routes", () => {
       headers: authHeaders(),
     });
     expect(other.status).toBe(404);
+  });
+
+  it("refuses a stale retire with the revision reason and leaves the profile active", async () => {
+    await registerProject(registerBody());
+
+    const stale = await fetch(`${baseUrl}/v1/projects/proj-a/retire`, {
+      method: "POST",
+      headers: { ...authHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ expectedRevision: 5 }),
+    });
+    expect(stale.status).toBe(422);
+    const staleBody = await stale.json();
+    expect(staleBody.code).toBe("REFUSED");
+    expect(staleBody.result.reason).toContain("revision");
+
+    const read = await fetch(`${baseUrl}/v1/projects/proj-a`, {
+      headers: authHeaders(),
+    });
+    expect(read.status).toBe(200);
+    const readBody = await read.json();
+    expect(readBody.result.profile.status).toBe("active");
+    expect(readBody.result.profile.revision).toBe(0);
   });
 
   it("retires a project and refuses a second retire", async () => {

@@ -103,7 +103,7 @@ describe('fleet-v2 state', () => {
     for (let index = 0; index < STORE_ORDER.length; index += 1) {
       expect(missingLines[index]).toBe(`${STORE_ORDER[index]}: missing\n`);
     }
-    expect(stdout.join('')).toContain('state check: all 10 store files readable or missing\n');
+    expect(stdout.at(-1)).toBe('state check: all 10 store files readable or missing\n');
   });
 
   it('reports a valid attempts store as ok', async () => {
@@ -127,6 +127,7 @@ describe('fleet-v2 state', () => {
     const text = stdout.join('');
     expect(text).toContain('journal.json: unreadable: not valid JSON\n');
     expect(text).toContain('state check: 1 of 10 store files unreadable\n');
+    expect(stdout.at(-1)).toBe('nothing was changed; no quarantine copies exist yet\n');
   });
 
   it('reports a non-list store as expecting a record list', async () => {
@@ -154,20 +155,14 @@ describe('fleet-v2 state', () => {
     const dir = makeTempDir();
     await fs.writeFile(path.join(dir, 'journal.json'), '{ nope');
     const snapshot = async (): Promise<Array<{ rel: string; size: number; mtimeMs: number }>> => {
-      const out: Array<{ rel: string; size: number; mtimeMs: number }> = [];
-      const walk = async (rel: string): Promise<void> => {
-        for (const entry of await fs.readdir(path.join(dir, rel))) {
-          const full = path.join(dir, rel, entry);
-          const stat = await fs.stat(full);
-          if (stat.isDirectory()) {
-            await walk(path.join(rel, entry));
-          } else {
-            out.push({ rel: path.join(rel, entry), size: stat.size, mtimeMs: stat.mtimeMs });
-          }
-        }
-      };
-      await walk('.');
-      return out.sort((a, b) => a.rel.localeCompare(b.rel));
+      const entries = await fs.readdir(dir, { recursive: true });
+      const stats = await Promise.all(
+        entries.map(async (rel) => ({ rel, stat: await fs.lstat(path.join(dir, rel)) })),
+      );
+      return stats
+        .filter(({ stat }) => !stat.isDirectory())
+        .map(({ rel, stat }) => ({ rel, size: stat.size, mtimeMs: stat.mtimeMs }))
+        .sort((a, b) => a.rel.localeCompare(b.rel));
     };
     const before = await snapshot();
     const { io } = mockIo();
@@ -187,6 +182,9 @@ describe('fleet-v2 state', () => {
     const line = stdout.find((text) => text.startsWith('  quarantine attempts.json.'));
     expect(line).toBeDefined();
     expect(line!.endsWith(`unreadable: not valid JSON, ${garbage.length} bytes\n`)).toBe(true);
+    expect(stdout.at(-1)).toBe(
+      'nothing was changed; the quarantine copies listed above are kept for recovery\n',
+    );
   });
 
   it('lists only quarantine copies matching a store, and exits 0 when none is bad', async () => {
@@ -217,5 +215,15 @@ describe('fleet-v2 state', () => {
     expect(code).toBe(0);
     expect(stdout[0]).toMatch(/\(does not exist yet\)\n$/);
     await expect(fs.stat(dir)).rejects.toThrow();
+  });
+
+  it('reports a state directory path that is a regular file and exits 1', async () => {
+    const dir = makeTempDir();
+    const filePath = path.join(dir, 'not-a-dir');
+    await fs.writeFile(filePath, 'plain file');
+    const { io, stdout } = mockIo();
+    const code = await runCli(['--state-dir', filePath, 'state', 'check'], io);
+    expect(code).toBe(1);
+    expect(stdout[0]?.endsWith('(not a directory)\n')).toBe(true);
   });
 });

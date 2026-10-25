@@ -66,12 +66,17 @@ export async function checkStateDirectory(stateDir: string): Promise<StateFileCh
   return Promise.all(STATE_FILE_DESCRIPTORS.map((descriptor) => descriptor.check(stateDir)));
 }
 
-async function directoryExists(directory: string): Promise<boolean> {
+/** How the state directory looks, for the first output line. Never creates it. */
+async function describeStateDirectory(directory: string): Promise<string> {
   try {
-    await fs.stat(directory);
-    return true;
-  } catch {
-    return false;
+    const stat = await fs.stat(directory);
+    return stat.isDirectory() ? '' : ' (not a directory)';
+  } catch (error: unknown) {
+    const code =
+      typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string'
+        ? (error as { code: string }).code
+        : 'unknown';
+    return code === 'ENOENT' ? ' (does not exist yet)' : ` (cannot read: ${code})`;
   }
 }
 
@@ -80,8 +85,8 @@ async function stateCheck(argv: readonly string[], io: CliIo, stateDir: string):
     io.stderr(`Unknown state check argument: ${argv[0]}\n${STATE_HELP}\n`);
     return 2;
   }
-  const exists = await directoryExists(stateDir);
-  io.stdout(`state directory: ${stateDir}${exists ? '' : ' (does not exist yet)'}\n`);
+  const note = await describeStateDirectory(stateDir);
+  io.stdout(`state directory: ${stateDir}${note}\n`);
   const checks = await checkStateDirectory(stateDir);
   let bad = 0;
   for (const check of checks) {
@@ -99,7 +104,12 @@ async function stateCheck(argv: readonly string[], io: CliIo, stateDir: string):
     return 0;
   }
   io.stdout(`state check: ${bad} of ${checks.length} store files unreadable\n`);
-  io.stdout('nothing was changed; the quarantine copies listed above are kept for recovery\n');
+  const copies = checks.reduce((total, check) => total + check.quarantineCopies.length, 0);
+  io.stdout(
+    copies === 0
+      ? 'nothing was changed; no quarantine copies exist yet\n'
+      : 'nothing was changed; the quarantine copies listed above are kept for recovery\n',
+  );
   return 1;
 }
 

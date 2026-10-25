@@ -22,7 +22,7 @@ import type {
   OwnerQuestionListQuery,
   OwnerQuestionRepositoryPort,
 } from '../../application/ports/out/OwnerQuestionRepositoryPort.out-port.js';
-import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface OwnerQuestionRepositoryAdapterOptions {
   /** When set, questions are persisted here and reloaded on first use. */
@@ -166,9 +166,9 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
 
   private async readRecordsFromDisk(path: string): Promise<Map<string, OwnerQuestionRecord>> {
     const map = new Map<string, OwnerQuestionRecord>();
-    let contents: string;
+    let buffer: Buffer;
     try {
-      contents = await fs.readFile(path, 'utf8');
+      buffer = await fs.readFile(path);
     } catch (error: unknown) {
       if (isNotFound(error)) {
         return map;
@@ -179,18 +179,21 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(contents);
-    } catch (error: unknown) {
-      throw new Error(
-        `OwnerQuestionRepositoryAdapter could not parse ${path}: ${describe(error)}`,
-      );
+      parsed = JSON.parse(buffer.toString('utf8'));
+    } catch {
+      await quarantineUnreadable(path, 'not valid JSON', buffer);
     }
     if (!Array.isArray(parsed)) {
-      throw new Error(`OwnerQuestionRepositoryAdapter expects a record list in ${path}`);
+      await quarantineUnreadable(path, 'expects a record list', buffer);
     }
-    for (const entry of parsed) {
-      const record = OwnerQuestion.fromRecord(entry as OwnerQuestionRecord).toRecord();
-      map.set(record.questionId, record);
+    const records = parsed as unknown[];
+    for (const [index, entry] of records.entries()) {
+      try {
+        const record = OwnerQuestion.fromRecord(entry as OwnerQuestionRecord).toRecord();
+        map.set(record.questionId, record);
+      } catch {
+        await quarantineUnreadable(path, `record ${index} failed validation`, buffer);
+      }
     }
     return map;
   }

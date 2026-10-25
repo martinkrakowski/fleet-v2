@@ -18,7 +18,7 @@ import type { ProjectProfileRecord } from '../../domain/coordination-records.js'
 import { ProjectProfile } from '../../domain/entities/ProjectProfile.js';
 import type { ProjectProfileRepositoryPort } from '../../application/ports/out/ProjectProfileRepositoryPort.out-port.js';
 import { ProjectProfileRevisionConflictError } from '../../application/ports/out/ProjectProfileRepositoryPort.out-port.js';
-import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface ProjectProfileRepositoryAdapterOptions {
   /** When set, profiles are persisted here and reloaded on first use. */
@@ -126,9 +126,9 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
 
   private async readProfilesFromDisk(path: string): Promise<Map<string, ProjectProfileRecord>> {
     const map = new Map<string, ProjectProfileRecord>();
-    let contents: string;
+    let buffer: Buffer;
     try {
-      contents = await fs.readFile(path, 'utf8');
+      buffer = await fs.readFile(path);
     } catch (error: unknown) {
       if (isNotFound(error)) {
         return map;
@@ -139,18 +139,21 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(contents);
-    } catch (error: unknown) {
-      throw new Error(
-        `ProjectProfileRepositoryAdapter could not parse ${path}: ${describe(error)}`,
-      );
+      parsed = JSON.parse(buffer.toString('utf8'));
+    } catch {
+      await quarantineUnreadable(path, 'not valid JSON', buffer);
     }
     if (!Array.isArray(parsed)) {
-      throw new Error(`ProjectProfileRepositoryAdapter expects a record list in ${path}`);
+      await quarantineUnreadable(path, 'expects a record list', buffer);
     }
-    for (const entry of parsed) {
-      const profile = ProjectProfile.fromRecord(entry as ProjectProfileRecord).toRecord();
-      map.set(profile.projectId, profile);
+    const records = parsed as unknown[];
+    for (const [index, entry] of records.entries()) {
+      try {
+        const profile = ProjectProfile.fromRecord(entry as ProjectProfileRecord).toRecord();
+        map.set(profile.projectId, profile);
+      } catch {
+        await quarantineUnreadable(path, `record ${index} failed validation`, buffer);
+      }
     }
     return map;
   }

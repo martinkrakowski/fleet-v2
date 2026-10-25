@@ -50,6 +50,7 @@ import { InstallationReferenceAdapter } from '../../../infrastructure/adapters/I
 import { DecisionTransportAdapter } from '../../../infrastructure/adapters/DecisionTransportAdapter.adapter.js';
 import { ObservationPublicationAdapter } from '../../../infrastructure/adapters/ObservationPublicationAdapter.adapter.js';
 import { ProjectProfileRepositoryAdapter } from '../../../infrastructure/adapters/ProjectProfileRepositoryAdapter.adapter.js';
+import { StateFileUnreadableError } from '../../../infrastructure/adapters/file-store.js';
 import { RelayTransportAdapter } from '../../../infrastructure/adapters/RelayTransportAdapter.adapter.js';
 import { InspectConfiguredCapabilitiesUseCase } from '../InspectConfiguredCapabilitiesUseCase.use-case.js';
 import { InspectOutstandingCoordinationUseCase } from '../InspectOutstandingCoordinationUseCase.use-case.js';
@@ -2294,7 +2295,9 @@ describe('ProjectProfileRepositoryAdapter', () => {
     await withTempDir(async (stateDir) => {
       await writeFile(join(stateDir, 'project-profiles.json'), 'not json', 'utf8');
       const adapter = new ProjectProfileRepositoryAdapter({ stateDir });
-      await expect(adapter.findProfileById('project-atlas')).rejects.toThrow(/could not parse/);
+      await expect(adapter.findProfileById('project-atlas')).rejects.toBeInstanceOf(
+        StateFileUnreadableError,
+      );
     });
   });
 

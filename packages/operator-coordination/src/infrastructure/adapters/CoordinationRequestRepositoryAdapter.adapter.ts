@@ -20,7 +20,7 @@ import type { CoordinationRequestRecord } from '../../domain/coordination-record
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import { CoordinationRequestRevisionConflictError } from '../../application/ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import type { CoordinationRequestRepositoryPort } from '../../application/ports/out/CoordinationRequestRepositoryPort.out-port.js';
-import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface CoordinationRequestRepositoryAdapterOptions {
   /** When set, requests are persisted here and reloaded on first use. */
@@ -180,9 +180,9 @@ export class CoordinationRequestRepositoryAdapter implements CoordinationRequest
 
   private async readRecordsFromDisk(path: string): Promise<Map<string, CoordinationRequestRecord>> {
     const map = new Map<string, CoordinationRequestRecord>();
-    let contents: string;
+    let buffer: Buffer;
     try {
-      contents = await fs.readFile(path, 'utf8');
+      buffer = await fs.readFile(path);
     } catch (error: unknown) {
       if (isNotFound(error)) {
         return map;
@@ -193,18 +193,21 @@ export class CoordinationRequestRepositoryAdapter implements CoordinationRequest
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(contents);
-    } catch (error: unknown) {
-      throw new Error(
-        `CoordinationRequestRepositoryAdapter could not parse ${path}: ${describe(error)}`,
-      );
+      parsed = JSON.parse(buffer.toString('utf8'));
+    } catch {
+      await quarantineUnreadable(path, 'not valid JSON', buffer);
     }
     if (!Array.isArray(parsed)) {
-      throw new Error(`CoordinationRequestRepositoryAdapter expects a record list in ${path}`);
+      await quarantineUnreadable(path, 'expects a record list', buffer);
     }
-    for (const entry of parsed) {
-      const record = CoordinationRequest.fromRecord(entry as CoordinationRequestRecord).toRecord();
-      map.set(record.id, record);
+    const records = parsed as unknown[];
+    for (const [index, entry] of records.entries()) {
+      try {
+        const record = CoordinationRequest.fromRecord(entry as CoordinationRequestRecord).toRecord();
+        map.set(record.id, record);
+      } catch {
+        await quarantineUnreadable(path, `record ${index} failed validation`, buffer);
+      }
     }
     return map;
   }

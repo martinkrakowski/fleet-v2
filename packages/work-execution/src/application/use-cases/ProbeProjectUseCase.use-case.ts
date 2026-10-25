@@ -110,7 +110,7 @@ export class ProbeProjectUseCase implements ProbeProjectPort {
       return { ...base, result: 'unknown', detail: 'no installation is loaded' };
     }
     const missing = gateProcedures.filter((name) => !verificationProcedureNames.includes(name));
-    missing.sort();
+    missing.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     if (missing.length > 0) {
       return { ...base, result: 'fail', detail: `unknown gate procedure ${missing[0]}` };
     }

@@ -45,7 +45,9 @@ describe('ProjectProfileReadAdapter', () => {
       inspect: async () => ({ outcome: 'found', profile: answerProfile }),
     });
 
-    await expect(adapter.readProjectProfile('proj-a')).resolves.toEqual(profile);
+    const result = await adapter.readProjectProfile('proj-a');
+    expect(result).toEqual(profile);
+    expect(result?.clones).not.toBe(answerProfile.clones);
   });
 
   it('maps a not-found answer to null', async () => {
@@ -75,38 +77,115 @@ describe('ProjectProfileReadAdapter', () => {
       },
     },
     {
+      label: 'mismatched projectId',
+      answer: {
+        outcome: 'found',
+        profile: { projectId: 'proj-b', status: 'active', repository: 'r', clones: {}, gateProcedures: [], revision: 1 },
+      },
+    },
+    {
       label: 'invalid status',
       answer: {
         outcome: 'found',
-        profile: { projectId: 'p', status: 'weird', repository: 'r', clones: {}, gateProcedures: [], revision: 1 },
+        profile: { projectId: 'proj-a', status: 'weird', repository: 'r', clones: {}, gateProcedures: [], revision: 1 },
       },
     },
     {
       label: 'non-string repository',
       answer: {
         outcome: 'found',
-        profile: { projectId: 'p', status: 'active', repository: 7, clones: {}, gateProcedures: [], revision: 1 },
+        profile: { projectId: 'proj-a', status: 'active', repository: 7, clones: {}, gateProcedures: [], revision: 1 },
+      },
+    },
+    {
+      label: 'clones as an array',
+      answer: {
+        outcome: 'found',
+        profile: { projectId: 'proj-a', status: 'active', repository: 'r', clones: [], gateProcedures: [], revision: 1 },
+      },
+    },
+    {
+      label: 'clones as null',
+      answer: {
+        outcome: 'found',
+        profile: { projectId: 'proj-a', status: 'active', repository: 'r', clones: null, gateProcedures: [], revision: 1 },
       },
     },
     {
       label: 'malformed clone',
       answer: {
         outcome: 'found',
-        profile: { projectId: 'p', status: 'active', repository: 'r', clones: { h: { path: 1, worktreeRoot: 'w' } }, gateProcedures: [], revision: 1 },
+        profile: { projectId: 'proj-a', status: 'active', repository: 'r', clones: { h: { path: 1, worktreeRoot: '/w' } }, gateProcedures: [], revision: 1 },
+      },
+    },
+    {
+      label: 'clone with empty path',
+      answer: {
+        outcome: 'found',
+        profile: { projectId: 'proj-a', status: 'active', repository: 'r', clones: { h: { path: '', worktreeRoot: '/w' } }, gateProcedures: [], revision: 1 },
+      },
+    },
+    {
+      label: 'clone with relative path',
+      answer: {
+        outcome: 'found',
+        profile: { projectId: 'proj-a', status: 'active', repository: 'r', clones: { h: { path: 'rel/path', worktreeRoot: '/w' } }, gateProcedures: [], revision: 1 },
+      },
+    },
+    {
+      label: 'clone with empty worktreeRoot',
+      answer: {
+        outcome: 'found',
+        profile: { projectId: 'proj-a', status: 'active', repository: 'r', clones: { h: { path: '/p', worktreeRoot: '' } }, gateProcedures: [], revision: 1 },
+      },
+    },
+    {
+      label: 'clone with relative worktreeRoot',
+      answer: {
+        outcome: 'found',
+        profile: { projectId: 'proj-a', status: 'active', repository: 'r', clones: { h: { path: '/p', worktreeRoot: 'rel/w' } }, gateProcedures: [], revision: 1 },
+      },
+    },
+    {
+      label: 'clone key __proto__',
+      answer: {
+        outcome: 'found',
+        profile: {
+          projectId: 'proj-a',
+          status: 'active',
+          repository: 'r',
+          clones: { ['__proto__']: { path: '/p', worktreeRoot: '/w' } },
+          gateProcedures: [],
+          revision: 1,
+        },
+      },
+    },
+    {
+      label: 'clone key host 1',
+      answer: {
+        outcome: 'found',
+        profile: {
+          projectId: 'proj-a',
+          status: 'active',
+          repository: 'r',
+          clones: { 'host 1': { path: '/p', worktreeRoot: '/w' } },
+          gateProcedures: [],
+          revision: 1,
+        },
       },
     },
     {
       label: 'non-array gateProcedures',
       answer: {
         outcome: 'found',
-        profile: { projectId: 'p', status: 'active', repository: 'r', clones: {}, gateProcedures: 'nope', revision: 1 },
+        profile: { projectId: 'proj-a', status: 'active', repository: 'r', clones: {}, gateProcedures: 'nope', revision: 1 },
       },
     },
     {
       label: 'non-number revision',
       answer: {
         outcome: 'found',
-        profile: { projectId: 'p', status: 'active', repository: 'r', clones: {}, gateProcedures: [], revision: '1' },
+        profile: { projectId: 'proj-a', status: 'active', repository: 'r', clones: {}, gateProcedures: [], revision: '1' },
       },
     },
   ];
@@ -171,6 +250,7 @@ describe('ProjectProbeRecordAdapter', () => {
       /^Not implemented: ProjectProbeRecordAdapter$/,
     );
   });
+});
 
 describe('delegate adapters refuse malformed answers at the boundary', () => {
   it.each([Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5])(
@@ -201,5 +281,14 @@ describe('delegate adapters refuse malformed answers at the boundary', () => {
       ).rejects.toThrow('ProjectProbeRecordAdapter received a rejection without a reason');
     },
   );
-});
+
+  it.each([null, undefined, 'recorded', 42, true])(
+    'refuses a primitive or null record answer: %s',
+    async (answer) => {
+      const adapter = new ProjectProbeRecordAdapter({ record: async () => answer });
+      await expect(adapter.recordProjectProbe(makeRecordRequest())).rejects.toThrow(
+        /unexpected answer/,
+      );
+    },
+  );
 });

@@ -197,7 +197,7 @@ describe('ProbeProjectUseCase', () => {
       probe: new FakeProbe(makeReport()),
       probeRecord: new FakeProbeRecord({
         outcome: 'rejected',
-        reason: 'profile changed while probing',
+        reason: 'x',
       }),
       verificationProcedureNames: ['verify-head', 'review'],
     });
@@ -212,12 +212,39 @@ describe('ProbeProjectUseCase', () => {
     if (result.recorded) {
       throw new Error('expected recorded false');
     }
-    expect(result.recordReason).toBe('profile changed while probing');
+    expect(result.recordReason).toBe('x');
     expect(result.report.checks[result.report.checks.length - 1]).toEqual({
       ...GATE_CHECK,
       result: 'pass',
       detail: '2 procedures known',
     });
+  });
+
+  it('reads the profile once and uses the first read revision as expectedRevision', async () => {
+    let nextRevision = 7;
+    const readCalls: string[] = [];
+    const profileRead: ProjectProfileReadPort = {
+      readProjectProfile: async (projectId) => {
+        readCalls.push(projectId);
+        const revision = nextRevision;
+        nextRevision += 1;
+        return makeProfile({ revision });
+      },
+    };
+    const record = new FakeProbeRecord({ outcome: 'recorded' });
+    const useCase = new ProbeProjectUseCase({
+      profileRead,
+      probe: new FakeProbe(makeReport()),
+      probeRecord: record,
+      verificationProcedureNames: ['verify-head', 'review'],
+    });
+
+    const result = await useCase.execute({ projectId: 'proj-a' });
+
+    expect(result.outcome).toBe('probed');
+    expect(readCalls).toEqual(['proj-a']);
+    expect(record.calls).toHaveLength(1);
+    expect(record.calls[0]?.expectedRevision).toBe(7);
   });
 
   it('rejects a retired profile without probing', async () => {
@@ -327,5 +354,21 @@ describe('ProbeProjectUseCase', () => {
     });
 
     await expect(useCase.execute({ projectId: 'proj-a' })).rejects.toThrow('read exploded');
+  });
+
+  it('propagates a probe record error instead of returning it', async () => {
+    const probeRecord: ProjectProbeRecordPort = {
+      recordProjectProbe: async () => {
+        throw new Error('record exploded');
+      },
+    };
+    const useCase = new ProbeProjectUseCase({
+      profileRead: new FakeProfileRead(makeProfile()),
+      probe: new FakeProbe(makeReport()),
+      probeRecord,
+      verificationProcedureNames: [],
+    });
+
+    await expect(useCase.execute({ projectId: 'proj-a' })).rejects.toThrow('record exploded');
   });
 });

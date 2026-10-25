@@ -8,6 +8,8 @@
  * other or malformed answer throws a malformed-profile error.
  */
 
+import { isValidHostName } from '@fleet/shared';
+
 import type {
   ProjectProfileReadPort,
   ProjectProfileView,
@@ -21,22 +23,45 @@ function malformed(projectId: string): Error {
   return new Error(`ProjectProfileReadAdapter received a malformed profile for ${projectId}`);
 }
 
-function isClone(value: unknown): value is { path: string; worktreeRoot: string } {
-  if (value === null || typeof value !== 'object') {
-    return false;
-  }
-  const clone = value as Record<string, unknown>;
-  return typeof clone.path === 'string' && typeof clone.worktreeRoot === 'string';
-}
-
-function isClonesRecord(
-  value: unknown,
-): value is Readonly<Record<string, { path: string; worktreeRoot: string }>> {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return false;
   }
-  const clones = value as Record<string, unknown>;
-  return Object.values(clones).every(isClone);
+  const proto: unknown = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function isAbsolutePath(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.startsWith('/');
+}
+
+function isClone(value: unknown): value is { path: string; worktreeRoot: string } {
+  if (!isPlainObject(value)) {
+    return false;
+  }
+  return isAbsolutePath(value.path) && isAbsolutePath(value.worktreeRoot);
+}
+
+function readClones(
+  projectId: string,
+  value: unknown,
+): Readonly<Record<string, { path: string; worktreeRoot: string }>> {
+  if (!isPlainObject(value)) {
+    throw malformed(projectId);
+  }
+  const copy: Record<string, { path: string; worktreeRoot: string }> = {};
+  for (const [key, clone] of Object.entries(value)) {
+    if (!isValidHostName(key) || !isClone(clone)) {
+      throw malformed(projectId);
+    }
+    Object.defineProperty(copy, key, {
+      value: { path: clone.path, worktreeRoot: clone.worktreeRoot },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return copy;
 }
 
 function isStringArray(value: unknown): value is readonly string[] {
@@ -44,7 +69,7 @@ function isStringArray(value: unknown): value is readonly string[] {
 }
 
 function mapProfile(projectId: string, profile: Record<string, unknown>): ProjectProfileView {
-  if (typeof profile.projectId !== 'string') {
+  if (typeof profile.projectId !== 'string' || profile.projectId !== projectId) {
     throw malformed(projectId);
   }
   if (profile.status !== 'active' && profile.status !== 'retired') {
@@ -53,9 +78,7 @@ function mapProfile(projectId: string, profile: Record<string, unknown>): Projec
   if (typeof profile.repository !== 'string') {
     throw malformed(projectId);
   }
-  if (!isClonesRecord(profile.clones)) {
-    throw malformed(projectId);
-  }
+  const clones = readClones(projectId, profile.clones);
   if (!isStringArray(profile.gateProcedures)) {
     throw malformed(projectId);
   }
@@ -63,10 +86,10 @@ function mapProfile(projectId: string, profile: Record<string, unknown>): Projec
     throw malformed(projectId);
   }
   return {
-    projectId: profile.projectId as string,
-    status: profile.status as 'active' | 'retired',
-    repository: profile.repository as string,
-    clones: profile.clones,
+    projectId: profile.projectId,
+    status: profile.status,
+    repository: profile.repository,
+    clones,
     gateProcedures: profile.gateProcedures,
     revision: profile.revision as number,
   };

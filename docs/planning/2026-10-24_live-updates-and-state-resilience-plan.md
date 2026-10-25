@@ -159,8 +159,8 @@ Every lane follows the lane pipeline and its tier. Tick a lane when its PR merge
 
 | Lane | Scope | Depends on | Tier | Pre-merge | Done |
 |---|---|---|---|---|---|
-| **E0** | This plan: owner decisions D1–D4 recorded | — | 0 | owner | ☐ |
-| **E1a** | Quarantine-on-read-failure in the four `file-store.ts` copies plus tests per store (corrupt file → quarantine copy with identical bytes, throw names it, nothing written) | — | 2 (data) | Fable | ☐ |
+| **E0** | This plan: owner decisions D1–D4 recorded | — | 0 | owner | ☑ (owner, 2026-10-25) |
+| **E1a** | Quarantine-on-read-failure in the four `file-store.ts` copies plus tests per store (corrupt file → quarantine copy with identical bytes, throw names it, nothing written) | — | 2 (data) | Fable | E1a-i ☑ #180 (work-execution, evidence); E1a-ii ☐ (operator-coordination, brief-knowledge) |
 | **E1b** | `fleet-v2 state check` and `state restore`, plus the `doctor` line | E1a | 2 | Fable | ☐ |
 | **E2** | `ExplainAttemptUseCase`, `fleet-v2 attempt explain`, `GET /v1/attempts/:id/explain` | gate-predicates plan S1/S2 | 1 | Grok | ☐ |
 | **E3a** | `ChangeSignalPort` and an in-memory ring adapter; repository saves emit signals; `mtime` watch emits `resync` | — | 2 (concurrency) | Fable | ☐ |
@@ -199,7 +199,9 @@ Every lane follows the lane pipeline and its tier. Tick a lane when its PR merge
 
 ## 6. Decisions for the owner
 
-| Id | Question | Recommendation |
+Decided by the owner on 2026-10-25: all four as recommended ("yes, proceed with recommendations").
+
+| Id | Question | Recommendation (decided) |
 |---|---|---|
 | D1 | Where do owner notifications go? | **macOS desktop notifications on the orchestrator host first** (one local adapter). A Waves push adapter later, once Waves is wired. |
 | D2 | Signals only, or signals with state? | **Signals only.** A client re-reads the route, so a stale or lost signal can never show a wrong state. |

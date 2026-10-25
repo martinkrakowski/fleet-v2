@@ -2,6 +2,7 @@
 
 import { Suspense } from "react";
 import { ProjectNav } from "./project-nav";
+import type { ProjectNavData } from "./project-nav-data";
 import { ViewNav } from "./view-nav";
 
 function closeDrawer() {
@@ -18,7 +19,7 @@ function closeDrawer() {
  * on desktop via `body.sidebar-rail` and becomes an off-canvas drawer
  * on mobile via `body.sidebar-open`.
  */
-export function Sidebar() {
+export function Sidebar({ nav }: { nav: ProjectNavData }) {
   return (
     <>
       <aside className="sidebar">
@@ -32,7 +33,7 @@ export function Sidebar() {
         </div>
         <ViewNav />
         <Suspense fallback={null}>
-          <ProjectNav />
+          <ProjectNav data={nav} />
         </Suspense>
         <div className="sidebar-footer">
           fixture views are labelled · Lanes reads the API when configured

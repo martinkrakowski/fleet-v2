@@ -1,17 +1,14 @@
 "use client";
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import {
-  getProjectAttemptCounts,
-  totalAttemptsCount,
-} from "../fixtures/station-fixture";
+import type { ProjectNavData } from "./project-nav-data";
 
-export function ProjectNav() {
+export function ProjectNav({ data }: { data: ProjectNavData }) {
   const router = useRouter();
   const pathname = usePathname() ?? "/lanes";
   const searchParams = useSearchParams();
   const project = searchParams.get("project") ?? "";
-  const projects = getProjectAttemptCounts();
+  const fallback = data.source === "fixture-fallback";
 
   function choose(name: string) {
     const params = new URLSearchParams(searchParams.toString());
@@ -26,7 +23,12 @@ export function ProjectNav() {
 
   return (
     <div className="sidebar-section sidebar-projects">
-      <div className="sidebar-label">Projects · {projects.length}</div>
+      <div
+        className="sidebar-label"
+        title={fallback ? (data.fallbackReason ?? undefined) : (data.countsReason ?? undefined)}
+      >
+        {fallback ? "Projects · sample" : `Projects · ${data.projects.length}`}
+      </div>
       <nav className="sidebar-nav" aria-label="Projects">
         <button
           type="button"
@@ -35,18 +37,23 @@ export function ProjectNav() {
           onClick={() => choose("")}
         >
           <span className="sidebar-link-label">All</span>
-          <span className="sidebar-badge">{totalAttemptsCount}</span>
+          {data.totalAttempts !== null && (
+            <span className="sidebar-badge">{data.totalAttempts}</span>
+          )}
         </button>
-        {projects.map(([name, count]) => (
+        {data.projects.map((entry) => (
           <button
-            key={name}
+            key={entry.projectId}
             type="button"
             className="sidebar-link"
-            aria-current={project === name ? "true" : undefined}
-            onClick={() => choose(name)}
+            title={entry.projectId}
+            aria-current={project === entry.projectId ? "true" : undefined}
+            onClick={() => choose(entry.projectId)}
           >
-            <span className="sidebar-link-label">{name}</span>
-            <span className="sidebar-badge">{count}</span>
+            <span className="sidebar-link-label">{entry.label}</span>
+            {entry.attempts !== null && (
+              <span className="sidebar-badge">{entry.attempts}</span>
+            )}
           </button>
         ))}
       </nav>

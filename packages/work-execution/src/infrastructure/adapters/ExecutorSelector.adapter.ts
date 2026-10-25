@@ -77,6 +77,11 @@ export function executorForInstallationHost(
   if (!Object.hasOwn(hosts, name)) {
     return { ok: false, reason: `host ${name} is not in the installation` };
   }
+  const transport = hosts[name].transport;
+  if (transport !== 'local' && transport !== 'ssh') {
+    // A host without a declared transport never gets a local executor here.
+    return { ok: false, reason: `host ${name} declares no transport` };
+  }
   try {
     return { ok: true, executor: executorForHost(hosts[name]) };
   } catch (error) {

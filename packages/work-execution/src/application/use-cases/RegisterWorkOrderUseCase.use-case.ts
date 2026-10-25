@@ -20,7 +20,8 @@ export interface RegisterWorkOrderDependencies {
   readonly workOrderRepo: WorkOrderRepositoryPort;
   /**
    * When present, a new work order requires an active profile for its
-   * projectId; when absent (today's roots until P5), behaviour is unchanged.
+   * projectId (decision D4). Both composition roots pass it; it stays
+   * optional only for unit tests that exercise the work-order rules alone.
    */
   readonly profileRead?: ProjectProfileReadPort;
 }

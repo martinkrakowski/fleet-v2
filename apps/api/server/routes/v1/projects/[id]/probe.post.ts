@@ -6,6 +6,12 @@ import {
   newOperationId,
 } from "../../../../wiring/work/errors";
 
+// POST /v1/projects/:id/probe runs the read-only project probe: one local
+// `git ls-remote`, then up to seven commands over ssh per clone host the
+// installation names, each with its own timeout. The route is not throttled
+// and admits callers only through the bearer token, which already authorises
+// heavier remote work (dispatch). A per-project single-flight and a small
+// global cap are a planned follow-up.
 export default defineEventHandler(async (event) => {
   const operationId = newOperationId();
   try {

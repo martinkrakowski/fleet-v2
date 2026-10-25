@@ -448,6 +448,13 @@ describe('resolveRoleExecutors', () => {
 });
 
 describe('executorForInstallationHost', () => {
+  it('refuses a host that declares no transport instead of running it locally', () => {
+    expect(executorForInstallationHost({ orch: {} }, 'orch')).toEqual({
+      ok: false,
+      reason: 'host orch declares no transport',
+    });
+  });
+
   it('refuses every name when hosts is undefined with the no-v2 reason', () => {
     expect(executorForInstallationHost(undefined, 'orch')).toEqual({
       ok: false,

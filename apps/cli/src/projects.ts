@@ -194,6 +194,45 @@ function expectPositionals(parsed: Extract<ParsedTokens, { ok: true }>, count: n
   return `projects ${subcommand} requires a project id`;
 }
 
+type SingleProjectCommand =
+  | {
+      readonly projectId: string;
+      readonly flags: Readonly<Record<string, string | true>>;
+    }
+  | { readonly exit: number };
+
+/**
+ * Shared opening for `<subcommand> <projectId> [flags]`: parse tokens, handle
+ * `--help`, require exactly one positional project id, and report usage errors
+ * with exit code 2.
+ */
+function parseSingleProjectCommand(
+  tokens: readonly string[],
+  subcommand: ProjectsSubcommand,
+  io: CliIo,
+): SingleProjectCommand {
+  const parsed = parseProjectsTokens(tokens, subcommand);
+  if (!parsed.ok) {
+    io.stderr(`${parsed.error}\n`);
+    return { exit: 2 };
+  }
+  if (parsed.flags.help === true) {
+    io.stdout(`${PROJECTS_HELP}\n`);
+    return { exit: 0 };
+  }
+  const unexpected = expectPositionals(parsed, 1, subcommand);
+  if (unexpected !== null) {
+    io.stderr(`${unexpected}\n`);
+    return { exit: 2 };
+  }
+  const projectId = requireProjectId(parsed);
+  if (projectId === null) {
+    io.stderr(`projects ${subcommand} requires a project id\n`);
+    return { exit: 2 };
+  }
+  return { projectId, flags: parsed.flags };
+}
+
 function parsePositiveInteger(flag: string, value: string): number | null {
   if (!/^\d+$/.test(value)) {
     return null;
@@ -296,6 +335,15 @@ const SCALAR_FIELDS: readonly { readonly field: keyof import('@fleet/operator-co
   { field: 'defaultBranch', label: 'defaultBranch' },
 ];
 
+function formatProbeCheckLine(check: {
+  readonly result: string;
+  readonly name: string;
+  readonly host: string | null;
+  readonly detail: string;
+}): string {
+  return `${check.result}  ${check.name}  ${check.host ?? '-'}  ${check.detail}\n`;
+}
+
 /** Print one profile in full (show): scalars, one line per clone, probe checks. */
 function printProfile(io: CliIo, profile: import('@fleet/operator-coordination').ProjectProfileRecord): void {
   for (const { field, label } of SCALAR_FIELDS) {
@@ -312,7 +360,7 @@ function printProfile(io: CliIo, profile: import('@fleet/operator-coordination')
   }
   io.stdout(`lastProbe: probedAt ${profile.lastProbe.probedAtIso} from ${profile.lastProbe.probedFrom}\n`);
   for (const check of profile.lastProbe.checks) {
-    io.stdout(`  ${check.result}  ${check.name}  ${check.host ?? '-'}  ${check.detail}\n`);
+    io.stdout(`  ${formatProbeCheckLine(check)}`);
   }
 }
 
@@ -383,27 +431,13 @@ async function projectsShow(
   io: CliIo,
   runtime: FleetCliRuntime,
 ): Promise<number> {
-  const parsed = parseProjectsTokens(tokens, 'show');
-  if (!parsed.ok) {
-    io.stderr(`${parsed.error}\n`);
-    return 2;
+  const command = parseSingleProjectCommand(tokens, 'show', io);
+  if ('exit' in command) {
+    return command.exit;
   }
-  if (parsed.flags.help === true) {
-    io.stdout(`${PROJECTS_HELP}\n`);
-    return 0;
-  }
-  const unexpected = expectPositionals(parsed, 1, 'show');
-  if (unexpected !== null) {
-    io.stderr(`${unexpected}\n`);
-    return 2;
-  }
-  const projectId = requireProjectId(parsed);
-  if (projectId === null) {
-    io.stderr(`projects show requires a project id\n`);
-    return 2;
-  }
+  const { projectId, flags } = command;
   const result = await runtime.coordination.inspectProjectProfile.inspectProjectProfile({ projectId });
-  if (parsed.flags.json === true) {
+  if (flags.json === true) {
     io.stdout(`${JSON.stringify(result)}\n`);
     return exitCodeForResult(result);
   }
@@ -419,58 +453,55 @@ async function projectsShow(
   return 0;
 }
 
-async function projectsProbe(
-  tokens: readonly string[],
-  io: CliIo,
-  runtime: FleetCliRuntime,
-): Promise<number> {
-  const parsed = parseProjectsTokens(tokens, 'probe');
-  if (!parsed.ok) {
-    io.stderr(`${parsed.error}\n`);
-    return 2;
-  }
-  if (parsed.flags.help === true) {
-    io.stdout(`${PROJECTS_HELP}\n`);
-    return 0;
-  }
-  const unexpected = expectPositionals(parsed, 1, 'probe');
-  if (unexpected !== null) {
-    io.stderr(`${unexpected}\n`);
-    return 2;
-  }
-  const projectId = requireProjectId(parsed);
-  if (projectId === null) {
-    io.stderr(`projects probe requires a project id\n`);
-    return 2;
-  }
-  const result = await runtime.execution.probeProject.execute({ projectId });
-  if (result.outcome === 'rejected' || result.outcome === 'not-found') {
-    if (parsed.flags.json === true) {
-      io.stdout(`${JSON.stringify(result)}\n`);
-      return 1;
-    }
-    if (result.outcome === 'rejected') {
-      io.stderr(`${result.reason}\n`);
-    } else {
-      io.stderr(`project ${projectId} is not registered\n`);
-    }
-    return 1;
-  }
+type ProbeSuccessResult = Extract<
+  Awaited<ReturnType<FleetCliRuntime['execution']['probeProject']['execute']>>,
+  { readonly outcome: 'probed' }
+>;
+
+function probeExitCode(result: ProbeSuccessResult): number {
   const allPass = result.report.checks.every((check) => check.result === 'pass');
-  const ok = allPass && result.recorded;
-  if (parsed.flags.json === true) {
-    io.stdout(`${JSON.stringify(result)}\n`);
-    return ok ? 0 : 1;
-  }
+  return allPass && result.recorded ? 0 : 1;
+}
+
+function printProbeReport(io: CliIo, result: ProbeSuccessResult): void {
   for (const check of result.report.checks) {
-    io.stdout(`${check.result}  ${check.name}  ${check.host ?? '-'}  ${check.detail}\n`);
+    io.stdout(formatProbeCheckLine(check));
   }
   if (result.recorded) {
     io.stdout('recorded\n');
   } else {
     io.stdout(`not recorded: ${result.recordReason}\n`);
   }
-  return ok ? 0 : 1;
+}
+
+async function projectsProbe(
+  tokens: readonly string[],
+  io: CliIo,
+  runtime: FleetCliRuntime,
+): Promise<number> {
+  const command = parseSingleProjectCommand(tokens, 'probe', io);
+  if ('exit' in command) {
+    return command.exit;
+  }
+  const { projectId, flags } = command;
+  const result = await runtime.execution.probeProject.execute({ projectId });
+  if (result.outcome === 'rejected' || result.outcome === 'not-found') {
+    if (flags.json === true) {
+      io.stdout(`${JSON.stringify(result)}\n`);
+      return 1;
+    }
+    const reason =
+      result.outcome === 'rejected' ? result.reason : `project ${projectId} is not registered`;
+    io.stderr(`${reason}\n`);
+    return 1;
+  }
+  const exitCode = probeExitCode(result);
+  if (flags.json === true) {
+    io.stdout(`${JSON.stringify(result)}\n`);
+    return exitCode;
+  }
+  printProbeReport(io, result);
+  return exitCode;
 }
 
 /** Common registration fields parsed from add/adopt flags. */
@@ -499,13 +530,87 @@ type ParsedRegistrationFields =
   | { readonly ok: true; readonly fields: RegistrationFieldArgs }
   | { readonly ok: false; readonly error: string };
 
+function optionalStringFlag(
+  flags: Readonly<Record<string, string | true>>,
+  name: string,
+): string | undefined {
+  const value = flags[name];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function optionalListFlag(
+  flags: Readonly<Record<string, string | true>>,
+  name: string,
+): readonly string[] | undefined {
+  const value = optionalStringFlag(flags, name);
+  return value === undefined ? undefined : splitList(value);
+}
+
+type ParsedClonesAndCapabilities =
+  | {
+      readonly ok: true;
+      readonly clones?: Readonly<Record<string, ProjectCloneRecord>>;
+      readonly runnerCapabilities: Readonly<Record<string, boolean | string>>;
+    }
+  | { readonly ok: false; readonly error: string };
+
+function parseOptionalClonesAndCapabilities(
+  flags: Readonly<Record<string, string | true>>,
+): ParsedClonesAndCapabilities {
+  let clones: Readonly<Record<string, ProjectCloneRecord>> | undefined;
+  if (flags.clones !== undefined) {
+    const parsedClones = parseClones(String(flags.clones));
+    if (!parsedClones.ok) {
+      return parsedClones;
+    }
+    clones = parsedClones.clones;
+  }
+  let runnerCapabilities: Readonly<Record<string, boolean | string>> = {};
+  if (flags['runner-capabilities'] !== undefined) {
+    const parsedCapabilities = parseRunnerCapabilities(String(flags['runner-capabilities']));
+    if (!parsedCapabilities.ok) {
+      return parsedCapabilities;
+    }
+    runnerCapabilities = parsedCapabilities.capabilities;
+  }
+  return {
+    ok: true,
+    ...(clones !== undefined ? { clones } : {}),
+    runnerCapabilities,
+  };
+}
+
+function buildRegistrationFields(
+  flags: Readonly<Record<string, string | true>>,
+  base: {
+    readonly displayName: string;
+    readonly designatedDispatcherHost: string;
+    readonly policyRevision: string;
+    readonly maxConcurrentLanes: number;
+    readonly runnerCapabilities: Readonly<Record<string, boolean | string>>;
+    readonly clones?: Readonly<Record<string, ProjectCloneRecord>>;
+  },
+): RegistrationFieldArgs {
+  const repository = optionalStringFlag(flags, 'repository');
+  const defaultBranch = optionalStringFlag(flags, 'default-branch');
+  const gateProcedures = optionalListFlag(flags, 'gate-procedures');
+  const defaultAllowedPathPrefixes = optionalListFlag(flags, 'allowed-prefixes');
+  return {
+    ...base,
+    ...(repository !== undefined ? { repository } : {}),
+    ...(defaultBranch !== undefined ? { defaultBranch } : {}),
+    ...(gateProcedures !== undefined ? { gateProcedures } : {}),
+    ...(defaultAllowedPathPrefixes !== undefined ? { defaultAllowedPathPrefixes } : {}),
+    yes: flags.yes === true,
+  };
+}
+
 function parseRegistrationFieldFlags(
   flags: Readonly<Record<string, string | true>>,
   subcommand: 'add' | 'adopt',
   defaultDisplayName?: string,
 ): ParsedRegistrationFields {
-  const displayName =
-    typeof flags['display-name'] === 'string' ? flags['display-name'] : defaultDisplayName;
+  const displayName = optionalStringFlag(flags, 'display-name') ?? defaultDisplayName;
   if (displayName === undefined) {
     return { ok: false, error: `projects ${subcommand} requires --display-name` };
   }
@@ -529,48 +634,20 @@ function parseRegistrationFieldFlags(
       error: `--max-lanes must be a positive integer, not '${values['maxConcurrentLanes']}'`,
     };
   }
-  let clones: Readonly<Record<string, ProjectCloneRecord>> | undefined;
-  if (flags.clones !== undefined) {
-    const parsedClones = parseClones(String(flags.clones));
-    if (!parsedClones.ok) {
-      return { ok: false, error: parsedClones.error };
-    }
-    clones = parsedClones.clones;
+  const parsedMaps = parseOptionalClonesAndCapabilities(flags);
+  if (!parsedMaps.ok) {
+    return parsedMaps;
   }
-  let capabilities: Readonly<Record<string, boolean | string>> = {};
-  if (flags['runner-capabilities'] !== undefined) {
-    const parsedCapabilities = parseRunnerCapabilities(String(flags['runner-capabilities']));
-    if (!parsedCapabilities.ok) {
-      return { ok: false, error: parsedCapabilities.error };
-    }
-    capabilities = parsedCapabilities.capabilities;
-  }
-  const repository = typeof flags.repository === 'string' ? flags.repository : undefined;
-  const defaultBranch =
-    typeof flags['default-branch'] === 'string' ? flags['default-branch'] : undefined;
-  const gateProcedures =
-    typeof flags['gate-procedures'] === 'string'
-      ? splitList(flags['gate-procedures'])
-      : undefined;
-  const defaultAllowedPathPrefixes =
-    typeof flags['allowed-prefixes'] === 'string'
-      ? splitList(flags['allowed-prefixes'])
-      : undefined;
   return {
     ok: true,
-    fields: {
+    fields: buildRegistrationFields(flags, {
       displayName,
-      ...(repository !== undefined ? { repository } : {}),
       designatedDispatcherHost: values.designatedDispatcherHost,
       policyRevision: values.policyRevision,
       maxConcurrentLanes: maxLanes,
-      runnerCapabilities: capabilities,
-      ...(defaultBranch !== undefined ? { defaultBranch } : {}),
-      ...(clones !== undefined ? { clones } : {}),
-      ...(gateProcedures !== undefined ? { gateProcedures } : {}),
-      ...(defaultAllowedPathPrefixes !== undefined ? { defaultAllowedPathPrefixes } : {}),
-      yes: flags.yes === true,
-    },
+      runnerCapabilities: parsedMaps.runnerCapabilities,
+      ...(parsedMaps.clones !== undefined ? { clones: parsedMaps.clones } : {}),
+    }),
   };
 }
 
@@ -668,6 +745,24 @@ async function registerConfirmedCandidate(
   return 0;
 }
 
+/** Shared confirm-then-register tail of `add` and `adopt`. */
+async function confirmAndRegisterCandidate(
+  io: CliIo,
+  runtime: FleetCliRuntime,
+  options: ProjectsCliOptions,
+  args: AddArgs,
+  verb: 'register' | 'adopt',
+): Promise<number> {
+  if (!args.yes) {
+    const confirm = options.confirm ?? confirmFromStdin(io);
+    if (!(await confirm(`${verb} project ${args.projectId}? [y/N]`))) {
+      io.stdout('nothing changed\n');
+      return 1;
+    }
+  }
+  return registerConfirmedCandidate(io, runtime, args);
+}
+
 async function projectsAdd(
   tokens: readonly string[],
   io: CliIo,
@@ -685,14 +780,7 @@ async function projectsAdd(
   }
   const args = parsed.args;
   printRegisterCandidate(io, args, 'register');
-  if (!args.yes) {
-    const confirm = options.confirm ?? confirmFromStdin(io);
-    if (!(await confirm(`register project ${args.projectId}? [y/N]`))) {
-      io.stdout('nothing changed\n');
-      return 1;
-    }
-  }
-  return registerConfirmedCandidate(io, runtime, args);
+  return confirmAndRegisterCandidate(io, runtime, options, args, 'register');
 }
 
 /** The typed registration fields one adopt invocation parsed. */
@@ -700,36 +788,77 @@ interface AdoptArgs extends RegistrationFieldArgs {
   readonly projectId: string;
 }
 
-type ParsedAdopt =
-  | { readonly ok: true; readonly args: AdoptArgs }
-  | { readonly ok: false; readonly error: string };
-
-function parseAdoptArgs(tokens: readonly string[]): ParsedAdopt {
-  const parsed = parseProjectsTokens(tokens, 'adopt');
-  if (!parsed.ok) {
-    return { ok: false, error: parsed.error };
+function parseAdoptArgs(
+  tokens: readonly string[],
+  io: CliIo,
+): AdoptArgs | { readonly exit: number } {
+  const command = parseSingleProjectCommand(tokens, 'adopt', io);
+  if ('exit' in command) {
+    return command;
   }
-  if (parsed.flags.help === true) {
-    return { ok: false, error: '' };
-  }
-  const unexpected = expectPositionals(parsed, 1, 'adopt');
-  if (unexpected !== null) {
-    return { ok: false, error: unexpected };
-  }
-  const projectId = requireProjectId(parsed);
-  if (projectId === null) {
-    return { ok: false, error: 'projects adopt requires a project id' };
-  }
-  const common = parseRegistrationFieldFlags(parsed.flags, 'adopt', projectId);
+  const common = parseRegistrationFieldFlags(command.flags, 'adopt', command.projectId);
   if (!common.ok) {
-    return common;
+    io.stderr(`${common.error}\n`);
+    return { exit: 2 };
   }
   return {
-    ok: true,
-    args: {
-      ...common.fields,
-      projectId,
-    },
+    ...common.fields,
+    projectId: command.projectId,
+  };
+}
+
+async function listAdoptionCandidates(io: CliIo, runtime: FleetCliRuntime): Promise<number> {
+  const listed = await runtime.execution.listUnregisteredProjects.execute();
+  if (listed.projects.length === 0) {
+    io.stdout('none\n');
+    return 0;
+  }
+  for (const p of listed.projects) {
+    io.stdout(
+      `${p.projectId}  orders ${p.workOrderCount} (active ${p.activeWorkOrderCount})  repos ${p.repositories.join(',')}  last ${p.lastUpdatedAtIso}\n`,
+    );
+  }
+  return 0;
+}
+
+async function reportMissingAdoptCandidate(
+  io: CliIo,
+  runtime: FleetCliRuntime,
+  projectId: string,
+): Promise<number> {
+  const inspected = await runtime.coordination.inspectProjectProfile.inspectProjectProfile({
+    projectId,
+  });
+  if (inspected.outcome === 'found') {
+    io.stderr(`project ${projectId} is already registered\n`);
+  } else if (inspected.outcome === 'rejected') {
+    io.stderr(`${inspected.reason}\n`);
+  } else {
+    io.stderr(`project ${projectId} has no work orders to adopt\n`);
+  }
+  return 1;
+}
+
+function buildAdoptCandidate(
+  args: AdoptArgs,
+  repositories: readonly string[],
+  io: CliIo,
+): AddArgs | null {
+  let repository = args.repository;
+  if (repository === undefined) {
+    if (repositories.length !== 1) {
+      const count = repositories.length === 0 ? 'no' : String(repositories.length);
+      const list = repositories.join(',') || 'none';
+      io.stderr(
+        `--repository is required: project ${args.projectId} has ${count} repositories (${list})\n`,
+      );
+      return null;
+    }
+    repository = repositories[0];
+  }
+  return {
+    ...args,
+    repository,
   };
 }
 
@@ -742,72 +871,28 @@ async function projectsAdopt(
   // With no id, list adoption candidates: projects that have work orders but
   // no profile. Read-only; exit 0.
   if (tokens.length === 0) {
-    const listed = await runtime.execution.listUnregisteredProjects.execute();
-    if (listed.projects.length === 0) {
-      io.stdout('none\n');
-    } else {
-      for (const p of listed.projects) {
-        io.stdout(
-          `${p.projectId}  orders ${p.workOrderCount} (active ${p.activeWorkOrderCount})  repos ${p.repositories.join(',')}  last ${p.lastUpdatedAtIso}\n`,
-        );
-      }
-    }
-    return 0;
+    return listAdoptionCandidates(io, runtime);
   }
-  const parsed = parseAdoptArgs(tokens);
-  if (!parsed.ok) {
-    if (parsed.error !== '') {
-      io.stderr(`${parsed.error}\n`);
-      return 2;
-    }
-    io.stdout(`${PROJECTS_HELP}\n`);
-    return 0;
+  const args = parseAdoptArgs(tokens, io);
+  if ('exit' in args) {
+    return args.exit;
   }
-  const args = parsed.args;
   const listed = await runtime.execution.listUnregisteredProjects.execute();
   const candidate = listed.projects.find((p) => p.projectId === args.projectId);
   if (candidate === undefined) {
-    const inspected = await runtime.coordination.inspectProjectProfile.inspectProjectProfile({
-      projectId: args.projectId,
-    });
-    if (inspected.outcome === 'found') {
-      io.stderr(`project ${args.projectId} is already registered\n`);
-    } else if (inspected.outcome === 'rejected') {
-      io.stderr(`${inspected.reason}\n`);
-    } else {
-      io.stderr(`project ${args.projectId} has no work orders to adopt\n`);
-    }
+    return reportMissingAdoptCandidate(io, runtime, args.projectId);
+  }
+  const fullArgs = buildAdoptCandidate(args, candidate.repositories, io);
+  if (fullArgs === null) {
     return 1;
   }
-  let repository = args.repository;
-  if (repository === undefined) {
-    if (candidate.repositories.length === 1) {
-      repository = candidate.repositories[0];
-    } else {
-      io.stderr(
-        `--repository is required: project ${args.projectId} has ${candidate.repositories.length === 0 ? 'no' : String(candidate.repositories.length)} repositories (${candidate.repositories.join(',') || 'none'})\n`,
-      );
-      return 1;
-    }
-  }
-  const fullArgs: AddArgs = {
-    ...args,
-    repository,
-  };
   printRegisterCandidate(io, fullArgs, 'adopt');
-  if (!candidate.repositories.includes(repository)) {
+  if (!candidate.repositories.includes(fullArgs.repository)) {
     io.stdout(
-      `warning: ${repository} is not among the repositories its work orders name (${candidate.repositories.join(', ')})\n`,
+      `warning: ${fullArgs.repository} is not among the repositories its work orders name (${candidate.repositories.join(', ')})\n`,
     );
   }
-  if (!fullArgs.yes) {
-    const confirm = options.confirm ?? confirmFromStdin(io);
-    if (!(await confirm(`adopt project ${fullArgs.projectId}? [y/N]`))) {
-      io.stdout('nothing changed\n');
-      return 1;
-    }
-  }
-  return registerConfirmedCandidate(io, runtime, fullArgs);
+  return confirmAndRegisterCandidate(io, runtime, options, fullArgs, 'adopt');
 }
 
 /** The one field map an edit invocation parsed, keyed by record field name. */
@@ -824,64 +909,62 @@ type EditChanges = Partial<{
   defaultAllowedPathPrefixes: readonly string[];
 }>;
 
-type ParsedEdit =
-  | { readonly ok: true; readonly projectId: string; readonly changes: EditChanges; readonly yes: boolean }
+type ParsedEditChanges =
+  | { readonly ok: true; readonly changes: EditChanges }
   | { readonly ok: false; readonly error: string };
 
-function parseEditArgs(tokens: readonly string[]): ParsedEdit {
-  const parsed = parseProjectsTokens(tokens, 'edit');
-  if (!parsed.ok) {
-    return { ok: false, error: parsed.error };
+type ScalarStringEditField =
+  | 'displayName'
+  | 'repository'
+  | 'designatedDispatcherHost'
+  | 'policyRevision'
+  | 'defaultBranch';
+
+function applyStringEditFlags(
+  flags: Readonly<Record<string, string | true>>,
+  changes: EditChanges,
+  specs: Readonly<Array<readonly [string, ScalarStringEditField]>>,
+): void {
+  for (const [flag, field] of specs) {
+    if (flags[flag] !== undefined) {
+      changes[field] = String(flags[flag]);
+    }
   }
-  if (parsed.flags.help === true) {
-    return { ok: false, error: '' };
-  }
-  const unexpected = expectPositionals(parsed, 1, 'edit');
-  if (unexpected !== null) {
-    return { ok: false, error: unexpected };
-  }
-  const projectId = requireProjectId(parsed);
-  if (projectId === null) {
-    return { ok: false, error: "projects edit requires a project id" };
-  }
+}
+
+function parseEditChanges(
+  flags: Readonly<Record<string, string | true>>,
+): ParsedEditChanges {
   const changes: EditChanges = {};
-  if (parsed.flags['display-name'] !== undefined) {
-    changes.displayName = String(parsed.flags['display-name']);
-  }
-  if (parsed.flags.repository !== undefined) {
-    changes.repository = String(parsed.flags.repository);
-  }
-  if (parsed.flags['dispatcher-host'] !== undefined) {
-    changes.designatedDispatcherHost = String(parsed.flags['dispatcher-host']);
-  }
-  if (parsed.flags['policy-revision'] !== undefined) {
-    changes.policyRevision = String(parsed.flags['policy-revision']);
-  }
-  if (parsed.flags['max-lanes'] !== undefined) {
-    const maxLanes = parsePositiveInteger('max-lanes', String(parsed.flags['max-lanes']));
+  applyStringEditFlags(flags, changes, [
+    ['display-name', 'displayName'],
+    ['repository', 'repository'],
+    ['dispatcher-host', 'designatedDispatcherHost'],
+    ['policy-revision', 'policyRevision'],
+  ]);
+  if (flags['max-lanes'] !== undefined) {
+    const maxLanes = parsePositiveInteger('max-lanes', String(flags['max-lanes']));
     if (maxLanes === null) {
-      return { ok: false, error: `--max-lanes must be a positive integer, not '${String(parsed.flags['max-lanes'])}'` };
+      return { ok: false, error: `--max-lanes must be a positive integer, not '${String(flags['max-lanes'])}'` };
     }
     changes.maxConcurrentLanes = maxLanes;
   }
-  if (parsed.flags['default-branch'] !== undefined) {
-    changes.defaultBranch = String(parsed.flags['default-branch']);
-  }
-  if (parsed.flags.clones !== undefined) {
-    const parsedClones = parseClones(String(parsed.flags.clones));
+  applyStringEditFlags(flags, changes, [['default-branch', 'defaultBranch']]);
+  if (flags.clones !== undefined) {
+    const parsedClones = parseClones(String(flags.clones));
     if (!parsedClones.ok) {
       return { ok: false, error: parsedClones.error };
     }
     changes.clones = parsedClones.clones;
   }
-  if (parsed.flags['gate-procedures'] !== undefined) {
-    changes.gateProcedures = splitList(String(parsed.flags['gate-procedures']));
+  if (flags['gate-procedures'] !== undefined) {
+    changes.gateProcedures = splitList(String(flags['gate-procedures']));
   }
-  if (parsed.flags['allowed-prefixes'] !== undefined) {
-    changes.defaultAllowedPathPrefixes = splitList(String(parsed.flags['allowed-prefixes']));
+  if (flags['allowed-prefixes'] !== undefined) {
+    changes.defaultAllowedPathPrefixes = splitList(String(flags['allowed-prefixes']));
   }
-  if (parsed.flags['runner-capabilities'] !== undefined) {
-    const parsedCapabilities = parseRunnerCapabilities(String(parsed.flags['runner-capabilities']));
+  if (flags['runner-capabilities'] !== undefined) {
+    const parsedCapabilities = parseRunnerCapabilities(String(flags['runner-capabilities']));
     if (!parsedCapabilities.ok) {
       return { ok: false, error: parsedCapabilities.error };
     }
@@ -890,7 +973,7 @@ function parseEditArgs(tokens: readonly string[]): ParsedEdit {
   if (Object.keys(changes).length === 0) {
     return { ok: false, error: `projects edit requires at least one field flag` };
   }
-  return { ok: true, projectId, changes, yes: parsed.flags.yes === true };
+  return { ok: true, changes };
 }
 
 async function projectsEdit(
@@ -899,24 +982,25 @@ async function projectsEdit(
   runtime: FleetCliRuntime,
   options: ProjectsCliOptions,
 ): Promise<number> {
-  const parsed = parseEditArgs(tokens);
+  const command = parseSingleProjectCommand(tokens, 'edit', io);
+  if ('exit' in command) {
+    return command.exit;
+  }
+  const { projectId, flags } = command;
+  const parsed = parseEditChanges(flags);
   if (!parsed.ok) {
-    if (parsed.error !== '') {
-      io.stderr(`${parsed.error}\n`);
-      return 2;
-    }
-    io.stdout(`${PROJECTS_HELP}\n`);
-    return 0;
+    io.stderr(`${parsed.error}\n`);
+    return 2;
   }
   const inspected = await runtime.coordination.inspectProjectProfile.inspectProjectProfile({
-    projectId: parsed.projectId,
+    projectId,
   });
   if (inspected.outcome === 'rejected') {
     io.stderr(`${inspected.reason}\n`);
     return 1;
   }
   if (inspected.outcome !== 'found') {
-    io.stderr(`project ${parsed.projectId} is not registered\n`);
+    io.stderr(`project ${projectId} is not registered\n`);
     return 1;
   }
   const profile = inspected.profile;
@@ -924,15 +1008,15 @@ async function projectsEdit(
     io.stdout(`- ${field}: ${renderFieldValue(field, profile[field as keyof typeof profile])}\n`);
     io.stdout(`+ ${field}: ${renderFieldValue(field, next)}\n`);
   }
-  if (!parsed.yes) {
+  if (flags.yes !== true) {
     const confirm = options.confirm ?? confirmFromStdin(io);
-    if (!(await confirm(`update project ${parsed.projectId}? [y/N]`))) {
+    if (!(await confirm(`update project ${projectId}? [y/N]`))) {
       io.stdout('nothing changed\n');
       return 1;
     }
   }
   const result = await runtime.coordination.updateProjectProfile.updateProjectProfile({
-    projectId: parsed.projectId,
+    projectId,
     expectedRevision: profile.revision,
     changes: parsed.changes,
   });
@@ -940,7 +1024,7 @@ async function projectsEdit(
     io.stderr(`${result.reason}\n`);
     return 1;
   }
-  io.stdout(`updated project ${parsed.projectId} (rev ${result.profile.revision})\n`);
+  io.stdout(`updated project ${projectId} (rev ${result.profile.revision})\n`);
   return 0;
 }
 
@@ -950,25 +1034,11 @@ async function projectsRetire(
   runtime: FleetCliRuntime,
   options: ProjectsCliOptions,
 ): Promise<number> {
-  const parsed = parseProjectsTokens(tokens, 'retire');
-  if (!parsed.ok) {
-    io.stderr(`${parsed.error}\n`);
-    return 2;
+  const command = parseSingleProjectCommand(tokens, 'retire', io);
+  if ('exit' in command) {
+    return command.exit;
   }
-  if (parsed.flags.help === true) {
-    io.stdout(`${PROJECTS_HELP}\n`);
-    return 0;
-  }
-  const unexpected = expectPositionals(parsed, 1, 'retire');
-  if (unexpected !== null) {
-    io.stderr(`${unexpected}\n`);
-    return 2;
-  }
-  const projectId = requireProjectId(parsed);
-  if (projectId === null) {
-    io.stderr(`projects retire requires a project id\n`);
-    return 2;
-  }
+  const { projectId, flags } = command;
   const inspected = await runtime.coordination.inspectProjectProfile.inspectProjectProfile({ projectId });
   if (inspected.outcome === 'rejected') {
     io.stderr(`${inspected.reason}\n`);
@@ -980,7 +1050,7 @@ async function projectsRetire(
   }
   const profile = inspected.profile;
   io.stdout(`retire project ${projectId} at rev ${profile.revision}\n`);
-  if (parsed.flags.yes !== true) {
+  if (flags.yes !== true) {
     const confirm = options.confirm ?? confirmFromStdin(io);
     if (!(await confirm(`retire project ${projectId}? [y/N]`))) {
       io.stdout('nothing changed\n');

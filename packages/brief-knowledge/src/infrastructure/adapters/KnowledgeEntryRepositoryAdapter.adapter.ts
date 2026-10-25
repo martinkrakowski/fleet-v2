@@ -19,7 +19,7 @@ import type {
 import { isKnowledgeTriageFlag } from '../../domain/knowledge-records.js';
 import type { ContextSelectionProps } from '../../domain/value-objects/ContextSelection.vo.js';
 import type { KnowledgeEntryRepositoryPort } from '../../application/ports/out/KnowledgeEntryRepositoryPort.out-port.js';
-import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 const ENTRIES_FILE = 'knowledge-entries.json';
 const SELECTIONS_FILE = 'context-selections.json';
@@ -199,13 +199,16 @@ export class KnowledgeEntryRepositoryAdapter implements KnowledgeEntryRepository
     const map = new Map<string, KnowledgeEntryRecord>();
     const stored = await readJsonFile(target);
     if (stored === null) return map;
-    if (!Array.isArray(stored)) {
-      throw new Error(`Unreadable knowledge entries state at ${target}: expected a JSON array`);
+    const { buffer, parsed } = stored;
+    if (!Array.isArray(parsed)) {
+      await quarantineUnreadable(target, 'expects a record list', buffer);
     }
-    for (const record of stored) {
-      if (record && typeof (record as { id?: unknown }).id === 'string') {
-        map.set((record as KnowledgeEntryRecord).id, record as KnowledgeEntryRecord);
+    const records = parsed as unknown[];
+    for (const [index, rawRecord] of records.entries()) {
+      if (!(rawRecord && typeof (rawRecord as { id?: unknown }).id === 'string')) {
+        await quarantineUnreadable(target, `record ${index} failed validation`, buffer);
       }
+      map.set((rawRecord as KnowledgeEntryRecord).id, rawRecord as KnowledgeEntryRecord);
     }
     return map;
   }
@@ -213,34 +216,40 @@ export class KnowledgeEntryRepositoryAdapter implements KnowledgeEntryRepository
   private async readSelectionsFromDisk(target: string): Promise<ContextSelectionProps[]> {
     const stored = await readJsonFile(target);
     if (stored === null) return [];
-    if (!Array.isArray(stored)) {
-      throw new Error(`Unreadable context selections state at ${target}: expected a JSON array`);
+    const { buffer, parsed } = stored;
+    if (!Array.isArray(parsed)) {
+      await quarantineUnreadable(target, 'expects a record list', buffer);
     }
     const valid: ContextSelectionProps[] = [];
-    for (const props of stored) {
-      if (props && typeof (props as { attemptId?: unknown }).attemptId === 'string') {
-        valid.push(props as ContextSelectionProps);
+    for (const [index, rawProps] of (parsed as unknown[]).entries()) {
+      if (!(rawProps && typeof (rawProps as { attemptId?: unknown }).attemptId === 'string')) {
+        await quarantineUnreadable(target, `record ${index} failed validation`, buffer);
       }
+      valid.push(rawProps as ContextSelectionProps);
     }
     return valid;
   }
 }
 
-async function readJsonFile(filePath: string): Promise<unknown> {
-  let raw: string;
+async function readJsonFile(
+  filePath: string,
+): Promise<{ buffer: Buffer; parsed: unknown } | null> {
+  let buffer: Buffer;
   try {
-    raw = await fs.readFile(filePath, 'utf8');
+    buffer = await fs.readFile(filePath);
   } catch (error: unknown) {
     if (isEnoent(error)) {
       return null;
     }
-    throw new Error(`Unreadable knowledge state file at ${filePath}: ${errorMessage(error)}`);
+    throw error;
   }
+  let parsed: unknown;
   try {
-    return JSON.parse(raw) as unknown;
-  } catch (error: unknown) {
-    throw new Error(`Unreadable knowledge state file at ${filePath}: ${errorMessage(error)}`);
+    parsed = JSON.parse(buffer.toString('utf8'));
+  } catch {
+    await quarantineUnreadable(filePath, 'not valid JSON', buffer);
   }
+  return { buffer, parsed };
 }
 
 function isEnoent(error: unknown): boolean {
@@ -268,8 +277,4 @@ function withTriageFlag(stored: KnowledgeEntryRecord, flag: KnowledgeTriageFlag)
     );
   }
   return { ...stored, triageFlag: flag, revision: stored.revision + 1 };
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

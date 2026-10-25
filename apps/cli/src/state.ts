@@ -217,6 +217,7 @@ async function stateRestore(
       current = null;
     } else {
       io.stderr(`cannot read ${currentPath} (${code})\n`);
+      io.stdout('nothing changed\n');
       return 1;
     }
   }
@@ -261,7 +262,7 @@ async function stateRestore(
     });
   } catch (error: unknown) {
     io.stderr(`restore failed: ${error instanceof Error ? error.message : String(error)}\n`);
-    io.stdout('nothing changed\n');
+    io.stdout('the store file was not changed; run state check to see the quarantine copies\n');
     return 1;
   }
   if (outcome.status === 'refused') {

@@ -27,8 +27,8 @@ fleet-v2 --state-dir <state dir> state check
 ```
 
 One line per store file reports ok, missing, unreadable or invalid record; each
-quarantine copy follows with `ok (N records)` when it validates fully. When a
-copy is kept, state check prints how to restore it.
+quarantine copy follows with `ok (N records)` when it validates fully. When a store
+is unreadable and copies exist, state check ends with how to restore one.
 
 ## Choose a copy
 
@@ -44,14 +44,16 @@ fleet-v2 --state-dir <state dir> state restore attempts.json --from attempts.jso
 
 `--from` names a copy directly inside `<state dir>/quarantine` (no symlinks).
 Restore shows both record counts, asks for confirmation unless `--yes`, writes
-under the store's lock, and keeps the replaced bytes as a new quarantine copy.
+under the store's lock, and keeps the replaced bytes as a quarantine copy (reusing an existing copy
+with the same bytes, if there is one).
 It never repairs: it refuses a store that is readable, and the candidate must
 validate fully.
 
 ## Verify
 
 Run `fleet-v2 --state-dir <state dir> state check` again: the store now reads
-ok, and the old bytes are the newest quarantine copy.
+ok, and the replaced bytes are listed as a quarantine copy (restore prints its
+path).
 
 Restore is CLI only (owner decision D4): no API, MCP or web path can restore a
 store file.

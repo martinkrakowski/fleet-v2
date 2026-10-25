@@ -576,7 +576,7 @@ export function describeRecordListStore<T>(
       const quarantineCopies = await Promise.all(
         names
           .filter((entry) => pattern.test(entry))
-          .sort()
+          .sort((a, b) => a.localeCompare(b))
           .map((name) => checkQuarantineCopy(quarantineDir, name, inspect)),
       );
       return { basename, filePath, result, quarantineCopies };

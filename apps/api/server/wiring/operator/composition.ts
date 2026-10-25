@@ -3,12 +3,14 @@ import {
   CheckOwnerDecisionUseCase,
   CoordinationRequestRepositoryAdapter,
   DecisionTransportAdapter,
+  InstallationReferenceAdapter,
   ObservationPublicationAdapter,
   OwnerQuestionRepositoryAdapter,
   ProjectProfileRepositoryAdapter,
   RelayTransportAdapter,
 } from "@fleet/operator-coordination";
 
+import type { FleetInstallation } from "@fleet/installation";
 import { join } from "node:path";
 import {
   AcknowledgeOwnerAnswerUseCase,
@@ -17,17 +19,22 @@ import {
   ExpireOwnerQuestionsUseCase,
   InspectConfiguredCapabilitiesUseCase,
   InspectOutstandingCoordinationUseCase,
+  InspectProjectProfileUseCase,
   ListOwnerQuestionsUseCase,
+  ListProjectProfilesUseCase,
   PublishProjectObservationUseCase,
   ReadOwnerQuestionUseCase,
   ReadProjectAttentionUseCase,
   RecordAuthorizationConsumptionUseCase,
+  RecordProjectProbeUseCase,
   RecordRelayAcknowledgementUseCase,
   RegisterProjectProfileUseCase,
   RequestScopedDecisionUseCase,
   ResolveActionAuthorizationUseCase,
+  RetireProjectProfileUseCase,
   SendFleetRelayUseCase,
   SyncOneWayOwnerQuestionsUseCase,
+  UpdateProjectProfileUseCase,
 } from "@fleet/operator-coordination/use-cases";
 
 /** A real clock: the composition root alone supplies "now" to the use cases. */
@@ -46,6 +53,11 @@ export interface OperatorComposition {
   sendFleetRelay: SendFleetRelayUseCase;
   recordRelayAcknowledgement: RecordRelayAcknowledgementUseCase;
   registerProjectProfile: RegisterProjectProfileUseCase;
+  updateProjectProfile: UpdateProjectProfileUseCase;
+  retireProjectProfile: RetireProjectProfileUseCase;
+  listProjectProfiles: ListProjectProfilesUseCase;
+  inspectProjectProfile: InspectProjectProfileUseCase;
+  recordProjectProbe: RecordProjectProbeUseCase;
   listOwnerQuestions: ListOwnerQuestionsUseCase;
   readOwnerQuestion: ReadOwnerQuestionUseCase;
   askOwnerQuestion: AskOwnerQuestionUseCase;
@@ -58,6 +70,7 @@ export interface OperatorComposition {
 export interface OperatorCompositionOptions {
   readonly stateDir?: string;
   readonly ownerPublicKey?: string;
+  readonly installation?: FleetInstallation;
 }
 
 let composition: OperatorComposition | undefined;
@@ -77,6 +90,11 @@ function unconfiguredOperatorComposition(): OperatorComposition {
     sendFleetRelay: new SendFleetRelayUseCase(),
     recordRelayAcknowledgement: new RecordRelayAcknowledgementUseCase(),
     registerProjectProfile: new RegisterProjectProfileUseCase(),
+    updateProjectProfile: new UpdateProjectProfileUseCase(),
+    retireProjectProfile: new RetireProjectProfileUseCase(),
+    listProjectProfiles: new ListProjectProfilesUseCase(),
+    inspectProjectProfile: new InspectProjectProfileUseCase(),
+    recordProjectProbe: new RecordProjectProbeUseCase(),
     listOwnerQuestions: new ListOwnerQuestionsUseCase(),
     readOwnerQuestion: new ReadOwnerQuestionUseCase(),
     askOwnerQuestion: new AskOwnerQuestionUseCase(),
@@ -117,6 +135,18 @@ export function createConfiguredOperatorComposition(
   );
   const ownerQuestionRepo = new OwnerQuestionRepositoryAdapter({ stateDir });
 
+  // Installation name references for project profiles (P5a): a v2
+  // installation enables host and gate-procedure name checks behind profile
+  // registration and update; a v1 or absent installation passes no reference
+  // port, which keeps the no-install behaviour (no name checks).
+  const installationRefs =
+    options?.installation?.schemaVersion === 2
+      ? new InstallationReferenceAdapter({
+          hostNames: Object.keys(options.installation.hosts ?? {}),
+          procedureNames: Object.keys(options.installation.verification?.procedures ?? {}),
+        })
+      : undefined;
+
   return {
     coordinationRequestRepository: requestRepo,
     inspectConfiguredCapabilities: new InspectConfiguredCapabilitiesUseCase({ profileRepo }),
@@ -138,7 +168,18 @@ export function createConfiguredOperatorComposition(
     }),
     sendFleetRelay: new SendFleetRelayUseCase({ requestRepo, relayTransport }),
     recordRelayAcknowledgement: new RecordRelayAcknowledgementUseCase({ requestRepo }),
-    registerProjectProfile: new RegisterProjectProfileUseCase({ profileRepo }),
+    registerProjectProfile: new RegisterProjectProfileUseCase({
+      profileRepo,
+      ...(installationRefs !== undefined ? { installationRefs } : {}),
+    }),
+    updateProjectProfile: new UpdateProjectProfileUseCase({
+      profileRepo,
+      ...(installationRefs !== undefined ? { installationRefs } : {}),
+    }),
+    retireProjectProfile: new RetireProjectProfileUseCase({ profileRepo }),
+    listProjectProfiles: new ListProjectProfilesUseCase({ profileRepo }),
+    inspectProjectProfile: new InspectProjectProfileUseCase({ profileRepo }),
+    recordProjectProbe: new RecordProjectProbeUseCase({ profileRepo }),
     listOwnerQuestions: new ListOwnerQuestionsUseCase({ ownerQuestionRepo }),
     readOwnerQuestion: new ReadOwnerQuestionUseCase({ ownerQuestionRepo }),
     askOwnerQuestion: new AskOwnerQuestionUseCase({

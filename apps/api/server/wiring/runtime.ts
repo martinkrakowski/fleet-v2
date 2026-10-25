@@ -254,7 +254,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   const stateDir = options?.stateDir;
   const ownerPublicKey = options?.ownerPublicKey;
   const installation = options?.installation;
-  const operator = createConfiguredOperatorComposition({ stateDir, ownerPublicKey });
+  const operator = createConfiguredOperatorComposition({ stateDir, ownerPublicKey, installation });
   const knowledge = createConfiguredKnowledgeComposition({
     stateDir,
     // The installation's v2 decisions block only (D3); v1 files never carry

@@ -10,6 +10,7 @@ import { ClaimVerificationAdapter } from '../ClaimVerificationAdapter.adapter.js
 import { KeeperPublicationAdapter } from '../KeeperPublicationAdapter.adapter.js';
 import { KnowledgeEntryRepositoryAdapter } from '../KnowledgeEntryRepositoryAdapter.adapter.js';
 import { KnowledgeRetrievalAdapter } from '../KnowledgeRetrievalAdapter.adapter.js';
+import { StateFileUnreadableError } from '../file-store.js';
 
 const tempDirs: string[] = [];
 
@@ -147,7 +148,7 @@ describe('KnowledgeEntryRepositoryAdapter', () => {
     await writeFile(join(stateDir, 'knowledge-entries.json'), '{not json', 'utf8');
 
     const adapter = new KnowledgeEntryRepositoryAdapter({ stateDir });
-    await expect(adapter.findEntryById('e1')).rejects.toThrow(/Unreadable knowledge state file/);
+    await expect(adapter.findEntryById('e1')).rejects.toBeInstanceOf(StateFileUnreadableError);
   });
 
   it('treats absent state files as empty state', async () => {

@@ -566,6 +566,7 @@ describe('UpdateProjectProfileUseCase', () => {
       projectId: 'project-atlas',
       expectedRevision: 2,
       changes: validChange,
+      nowIso: LATER_ISO,
     });
     expect(result.outcome).toBe('updated');
     if (result.outcome !== 'updated') {
@@ -573,9 +574,42 @@ describe('UpdateProjectProfileUseCase', () => {
     }
     expect(result.profile.revision).toBe(3);
     expect(result.profile.displayName).toBe('Atlas Updated');
+    expect(result.profile.updatedAtIso).toBe(LATER_ISO);
     expect(result.profile.status).toBe('active');
     expect(repo.saves).toHaveLength(1);
     expect(repo.saves[0].revision).toBe(3);
+  });
+
+  it('trims string changes as registration does', async () => {
+    const repo = new StubProfileRepository({
+      'project-atlas': profileRecord({ revision: 0, designatedDispatcherHost: 'old-host' }),
+    });
+    const result = await new UpdateProjectProfileUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      changes: {
+        displayName: ' Atlas Trimmed ',
+        repository: ' atlas/repo ',
+        designatedDispatcherHost: ' dispatcher-01',
+        policyRevision: ' policy-8 ',
+        defaultBranch: ' main ',
+        gateProcedures: [' verify-merge '],
+        defaultAllowedPathPrefixes: [' src/ '],
+      },
+      nowIso: LATER_ISO,
+    });
+    expect(result.outcome).toBe('updated');
+    if (result.outcome !== 'updated') {
+      throw new Error('expected an updated profile');
+    }
+    expect(result.profile.displayName).toBe('Atlas Trimmed');
+    expect(result.profile.repository).toBe('atlas/repo');
+    expect(result.profile.designatedDispatcherHost).toBe('dispatcher-01');
+    expect(result.profile.policyRevision).toBe('policy-8');
+    expect(result.profile.defaultBranch).toBe('main');
+    expect(result.profile.gateProcedures).toEqual(['verify-merge']);
+    expect(result.profile.defaultAllowedPathPrefixes).toEqual(['src/']);
+    expect(result.profile.updatedAtIso).toBe(LATER_ISO);
   });
 
   it('refuses a missing, retired or stale profile', async () => {
@@ -646,6 +680,33 @@ describe('UpdateProjectProfileUseCase', () => {
     expect(repo.saves).toHaveLength(0);
   });
 
+  it('refuses any change whose value is undefined with nothing saved', async () => {
+    const repo = new StubProfileRepository({
+      'project-atlas': profileRecord({
+        defaultBranch: 'main',
+        clones: { host1: { path: '/srv/clone', worktreeRoot: '/srv/wt' } },
+        gateProcedures: ['verify-merge'],
+      }),
+    });
+    const useCase = new UpdateProjectProfileUseCase({ profileRepo: repo });
+    for (const [key, changes] of [
+      ['clones', { clones: undefined }],
+      ['gateProcedures', { gateProcedures: undefined }],
+      ['defaultBranch', { defaultBranch: undefined }],
+    ] as const) {
+      const result = await useCase.execute({
+        projectId: 'project-atlas',
+        expectedRevision: 0,
+        changes,
+      });
+      expect(result).toEqual({
+        outcome: 'rejected',
+        reason: `change ${key} has no value`,
+      });
+    }
+    expect(repo.saves).toHaveLength(0);
+  });
+
   it('clears the last probe when the repository or clones change and keeps it otherwise', async () => {
     const probe: ProjectProbeReceiptRecord = {
       probedAtIso: LATER_ISO,
@@ -695,12 +756,18 @@ describe('UpdateProjectProfileUseCase', () => {
       changes: { runnerCapabilities: { apiToken: true } },
     });
     expect(capability.outcome).toBe('rejected');
+    expect(capability.outcome === 'rejected' && capability.reason).toContain(
+      'must not carry a credential capability',
+    );
     const clone = await useCase.execute({
       projectId: 'project-atlas',
       expectedRevision: 0,
       changes: { clones: { access_key: { path: '/srv/clone', worktreeRoot: '/srv/wt' } } },
     });
     expect(clone.outcome).toBe('rejected');
+    expect(clone.outcome === 'rejected' && clone.reason).toContain(
+      'clone host name is invalid: access_key',
+    );
     expect(repo.saves).toHaveLength(0);
   });
 
@@ -766,6 +833,53 @@ describe('UpdateProjectProfileUseCase', () => {
     expect(repo.saves).toHaveLength(0);
   });
 
+  it('re-checks the whole merged profile against the installation and allows repairing a removed clone host', async () => {
+    const repo = new StubProfileRepository({
+      'project-atlas': profileRecord({
+        revision: 0,
+        clones: { 'worker-01': { path: '/srv/clone', worktreeRoot: '/srv/wt' } },
+      }),
+    });
+    const useCase = new UpdateProjectProfileUseCase({
+      profileRepo: repo,
+      installationRefs: new InstallationReferenceAdapter({
+        hostNames: ['dispatcher-01', 'worker-02'],
+        procedureNames: ['verify-merge'],
+      }),
+    });
+
+    const unfixed = await useCase.execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      changes: { displayName: 'x' },
+      nowIso: LATER_ISO,
+    });
+    expect(unfixed).toEqual({
+      outcome: 'rejected',
+      reason: 'clone host worker-01 is not a host in the installation',
+    });
+    expect(repo.saves).toHaveLength(0);
+
+    const repaired = await useCase.execute({
+      projectId: 'project-atlas',
+      expectedRevision: 0,
+      changes: {
+        displayName: 'x',
+        clones: { 'worker-02': { path: '/srv/clone', worktreeRoot: '/srv/wt' } },
+      },
+      nowIso: LATER_ISO,
+    });
+    expect(repaired.outcome).toBe('updated');
+    if (repaired.outcome !== 'updated') {
+      throw new Error('expected an updated profile');
+    }
+    expect(repaired.profile.displayName).toBe('x');
+    expect(repaired.profile.clones).toEqual({
+      'worker-02': { path: '/srv/clone', worktreeRoot: '/srv/wt' },
+    });
+    expect(repaired.profile.updatedAtIso).toBe(LATER_ISO);
+  });
+
   it('refuses when no installation is loaded', async () => {
     const repo = new StubProfileRepository({ 'project-atlas': profileRecord() });
     const result = await new UpdateProjectProfileUseCase({
@@ -791,6 +905,7 @@ describe('RetireProjectProfileUseCase', () => {
     const result = await new RetireProjectProfileUseCase({ profileRepo: repo }).execute({
       projectId: 'project-atlas',
       expectedRevision: 1,
+      nowIso: LATER_ISO,
     });
     expect(result.outcome).toBe('retired');
     if (result.outcome !== 'retired') {
@@ -799,6 +914,7 @@ describe('RetireProjectProfileUseCase', () => {
     expect(result.profile.status).toBe('retired');
     expect(result.profile.revision).toBe(2);
     expect(result.profile.displayName).toBe('Atlas');
+    expect(result.profile.updatedAtIso).toBe(LATER_ISO);
     expect(repo.saves).toHaveLength(1);
   });
 

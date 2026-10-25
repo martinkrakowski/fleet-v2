@@ -1,9 +1,11 @@
 // @generated inbound contract scaffold — refined for P3a.
 /**
  * UpdateProjectProfilePort: change an active profile only when the caller
- * names the revision it read; host, clone and gate procedure names are checked
- * against the installation; a change of repository or clones clears the last
- * probe.
+ * names the revision it read. The whole merged profile is re-checked against
+ * the installation (host, clone and gate procedure names), not only the
+ * changed fields, so a profile naming a host or procedure the installation no
+ * longer has must be repaired (or retired; retire is not name-checked) before
+ * any other edit. A change of repository or clones clears the last probe.
  */
 
 import type { ProjectCloneRecord, ProjectProfileRecord } from '../../../domain/coordination-records.js';
@@ -23,6 +25,7 @@ export interface UpdateProjectProfileRequest {
     readonly gateProcedures: readonly string[];
     readonly defaultAllowedPathPrefixes: readonly string[];
   }>;
+  readonly nowIso?: string;
 }
 
 export type UpdateProjectProfileResult =

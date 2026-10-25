@@ -24,21 +24,20 @@ export interface UpdateProjectProfileDependencies {
   readonly installationRefs?: InstallationReferencePort;
 }
 
-/**
- * Field and capability names that would move a secret into persisted
- * installation state. Only names are inspected; values are never read, copied
- * or compared.
- */
-const CREDENTIAL_NAME_PATTERN =
-  /(token|secret|credential|password|passphrase|api[-_]?key|private[-_]?key|access[-_]?key|authorization|cookie)/i;
+function isFilled(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
 
-function findCredentialName(names: readonly string[]): string | null {
-  for (const name of names) {
-    if (CREDENTIAL_NAME_PATTERN.test(name)) {
-      return name;
-    }
-  }
-  return null;
+function trimString<T>(value: T): T {
+  return (typeof value === 'string' ? value.trim() : value) as T;
+}
+
+function trimStringArray<T>(value: T): T {
+  return (
+    Array.isArray(value)
+      ? value.map((entry: unknown) => (typeof entry === 'string' ? entry.trim() : entry))
+      : value
+  ) as T;
 }
 
 /**
@@ -136,13 +135,42 @@ export class UpdateProjectProfileUseCase implements UpdateProjectProfilePort {
       return { outcome: 'rejected', reason: 'changes must name at least one field' };
     }
     for (const key of changeKeys) {
-      if (!ALLOWED_CHANGE_FIELDS.has(key) || findCredentialName([key]) !== null) {
+      if (!ALLOWED_CHANGE_FIELDS.has(key)) {
         return { outcome: 'rejected', reason: `change ${key} is not allowed` };
       }
+      if ((changes as Record<string, unknown>)[key] === undefined) {
+        return { outcome: 'rejected', reason: `change ${key} has no value` };
+      }
     }
+    // The composition root supplies the clock; no authority depends on it here.
+    const nowIso = isFilled(request.nowIso) ? request.nowIso : new Date().toISOString();
     const merged: ProjectProfileRecord = {
       ...stored,
       ...changes,
+      displayName:
+        changes.displayName !== undefined ? trimString(changes.displayName) : stored.displayName,
+      repository:
+        changes.repository !== undefined ? trimString(changes.repository) : stored.repository,
+      designatedDispatcherHost:
+        changes.designatedDispatcherHost !== undefined
+          ? trimString(changes.designatedDispatcherHost)
+          : stored.designatedDispatcherHost,
+      policyRevision:
+        changes.policyRevision !== undefined
+          ? trimString(changes.policyRevision)
+          : stored.policyRevision,
+      defaultBranch:
+        changes.defaultBranch !== undefined
+          ? trimString(changes.defaultBranch)
+          : stored.defaultBranch,
+      gateProcedures:
+        changes.gateProcedures !== undefined
+          ? trimStringArray(changes.gateProcedures)
+          : stored.gateProcedures,
+      defaultAllowedPathPrefixes:
+        changes.defaultAllowedPathPrefixes !== undefined
+          ? trimStringArray(changes.defaultAllowedPathPrefixes)
+          : stored.defaultAllowedPathPrefixes,
       runnerCapabilities:
         changes.runnerCapabilities !== undefined
           ? Object.freeze({ ...changes.runnerCapabilities })
@@ -150,7 +178,7 @@ export class UpdateProjectProfileUseCase implements UpdateProjectProfilePort {
       lastProbe:
         changes.repository !== undefined || changes.clones !== undefined ? null : stored.lastProbe,
       revision: stored.revision + 1,
-      updatedAtIso: new Date().toISOString(),
+      updatedAtIso: nowIso,
     };
     let profile: ProjectProfileRecord;
     try {

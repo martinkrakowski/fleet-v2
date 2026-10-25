@@ -20,6 +20,10 @@ export interface RetireProjectProfileDependencies {
   readonly profileRepo: ProjectProfileRepositoryPort;
 }
 
+function isFilled(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 export class RetireProjectProfileUseCase implements RetireProjectProfilePort {
   constructor(private readonly deps?: RetireProjectProfileDependencies) {}
 
@@ -54,11 +58,13 @@ export class RetireProjectProfileUseCase implements RetireProjectProfilePort {
         reason: `project ${projectId} is at revision ${stored.revision}, not ${request.expectedRevision}; read it again`,
       };
     }
+    // The composition root supplies the clock; no authority depends on it here.
+    const nowIso = isFilled(request.nowIso) ? request.nowIso : new Date().toISOString();
     const retired: ProjectProfileRecord = {
       ...stored,
       status: 'retired',
       revision: stored.revision + 1,
-      updatedAtIso: new Date().toISOString(),
+      updatedAtIso: nowIso,
     };
     let profile: ProjectProfileRecord;
     try {

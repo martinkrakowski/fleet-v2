@@ -10,6 +10,7 @@ import type { ProjectProfileRecord } from '../../../domain/coordination-records.
 export interface RetireProjectProfileRequest {
   readonly projectId: string;
   readonly expectedRevision: number;
+  readonly nowIso?: string;
 }
 
 export type RetireProjectProfileResult =

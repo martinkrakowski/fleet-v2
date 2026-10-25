@@ -2,6 +2,7 @@ import { Suspense, type ReactNode } from "react";
 import { Footer } from "../shell/footer";
 import { Sidebar } from "../shell/sidebar";
 import { Topbar } from "../shell/topbar";
+import { loadProjectNav } from "../shell/project-nav-data";
 import "./globals.css";
 
 /**
@@ -12,13 +13,17 @@ import "./globals.css";
  */
 const THEME_INIT_SCRIPT = `(function(){try{var stored=localStorage.getItem("theme");var sysDark=window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches;var theme=stored==="dark"||stored==="light"?stored:(sysDark?"dark":"light");document.documentElement.dataset.theme=theme;}catch(e){document.documentElement.dataset.theme="light";}})();`;
 
-export default function RootLayout({ children }: { children: ReactNode }) {
+export const dynamic = "force-dynamic";
+
+export default async function RootLayout({ children }: { children: ReactNode }) {
+  const nav = await loadProjectNav();
+
   return (
     <html lang="en" suppressHydrationWarning>
       <body>
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
         <div className="app-shell">
-          <Sidebar />
+          <Sidebar nav={nav} />
           <div className="main">
             <Topbar />
             <div className="page-wrapper">

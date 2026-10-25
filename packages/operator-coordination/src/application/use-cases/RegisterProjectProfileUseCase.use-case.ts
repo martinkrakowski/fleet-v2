@@ -18,7 +18,10 @@ import type {
   RegisterProjectProfileRequest,
   RegisterProjectProfileResult,
 } from '../ports/in/RegisterProjectProfilePort.in-port.js';
-import type { ProjectProfileRepositoryPort } from '../ports/out/ProjectProfileRepositoryPort.out-port.js';
+import {
+  ProjectProfileRevisionConflictError,
+  type ProjectProfileRepositoryPort,
+} from '../ports/out/ProjectProfileRepositoryPort.out-port.js';
 
 export interface RegisterProjectProfileDependencies {
   readonly profileRepo: ProjectProfileRepositoryPort;
@@ -111,7 +114,8 @@ export class RegisterProjectProfileUseCase implements RegisterProjectProfilePort
         reason: `runner capability must not carry a credential value: ${credentialCapability}`,
       };
     }
-    const existing = await this.deps.profileRepo.findProfileById(request.projectId);
+    const projectId = request.projectId.trim();
+    const existing = await this.deps.profileRepo.findProfileById(projectId);
     // The composition root supplies the clock; no authority depends on it here.
     const nowIso = isFilled(request.nowIso) ? request.nowIso : new Date().toISOString();
     // A new profile starts with the entity's v2 defaults; a re-registration
@@ -136,7 +140,7 @@ export class RegisterProjectProfileUseCase implements RegisterProjectProfilePort
             lastProbe: existing.lastProbe,
           };
     const candidate: ProjectProfileRecord = {
-      projectId: request.projectId.trim(),
+      projectId,
       displayName: request.displayName.trim(),
       repository: request.repository.trim(),
       designatedDispatcherHost: request.designatedDispatcherHost.trim(),
@@ -156,7 +160,17 @@ export class RegisterProjectProfileUseCase implements RegisterProjectProfilePort
         reason: error instanceof Error ? error.message : 'profile registration was refused',
       };
     }
-    await this.deps.profileRepo.saveProfile(profile);
+    try {
+      await this.deps.profileRepo.saveProfile(profile);
+    } catch (error) {
+      if (error instanceof ProjectProfileRevisionConflictError) {
+        return {
+          outcome: 'rejected',
+          reason: `profile ${projectId} changed while it was being registered; read it again and retry`,
+        };
+      }
+      throw error;
+    }
     return { outcome: 'registered', profile };
   }
 }

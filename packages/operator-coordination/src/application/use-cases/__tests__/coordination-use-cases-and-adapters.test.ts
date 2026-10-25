@@ -307,6 +307,61 @@ describe('RegisterProjectProfileUseCase', () => {
     expect(result.outcome === 'registered' && result.profile.revision).toBe(5);
   });
 
+  it('looks up an existing profile with the trimmed projectId and updates it to revision 1', async () => {
+    const repo = new ProjectProfileRepositoryAdapter();
+    const useCase = new RegisterProjectProfileUseCase({ profileRepo: repo });
+    const first = await useCase.execute({ ...validRequest, projectId: 'atlas' });
+    expect(first.outcome).toBe('registered');
+    const second = await useCase.execute({
+      ...validRequest,
+      projectId: ' atlas ',
+      displayName: 'Atlas Updated',
+      nowIso: LATER_ISO,
+    });
+    expect(second.outcome).toBe('registered');
+    if (second.outcome !== 'registered') {
+      throw new Error('expected a registered profile');
+    }
+    expect(second.profile.projectId).toBe('atlas');
+    expect(second.profile.revision).toBe(1);
+    expect(second.profile.displayName).toBe('Atlas Updated');
+  });
+
+  it('turns two concurrent registrations of the same new id into one registered and one rejected', async () => {
+    const repo = new ProjectProfileRepositoryAdapter();
+    const useCase = new RegisterProjectProfileUseCase({ profileRepo: repo });
+    const firstPromise = useCase.execute({ ...validRequest, projectId: 'atlas' });
+    const secondPromise = useCase.execute({ ...validRequest, projectId: 'atlas' });
+    const outcomes = await Promise.all([firstPromise, secondPromise]);
+    const registered = outcomes.filter((result) => result.outcome === 'registered');
+    const rejected = outcomes.filter((result) => result.outcome === 'rejected');
+    expect(registered).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toEqual({
+      outcome: 'rejected',
+      reason: 'profile atlas changed while it was being registered; read it again and retry',
+    });
+  });
+
+  it('propagates a saveProfile error that is not a ProjectProfileRevisionConflictError', async () => {
+    class FailingProfileRepository implements ProjectProfileRepositoryPort {
+      async saveProfile(): Promise<void> {
+        throw new Error('ProjectProfileRepositoryAdapter could not write the store');
+      }
+      async findProfileById(): Promise<ProjectProfileRecord | null> {
+        return null;
+      }
+      async listProfiles(): Promise<readonly ProjectProfileRecord[]> {
+        return [];
+      }
+    }
+    await expect(
+      new RegisterProjectProfileUseCase({ profileRepo: new FailingProfileRepository() }).execute(
+        validRequest,
+      ),
+    ).rejects.toThrow('ProjectProfileRepositoryAdapter could not write the store');
+  });
+
   it('keeps stored clones and the last probe on re-registration', async () => {
     const seeded = profileRecord({
       revision: 1,

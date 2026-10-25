@@ -9,6 +9,7 @@
  * rejected outright so installation configuration never accumulates secrets.
  */
 
+import { isValidHostName } from '@fleet/shared';
 import type { ProjectProfileInput, ProjectProfileRecord } from '../coordination-records.js';
 
 export type {
@@ -77,7 +78,7 @@ export class ProjectProfile {
       throw new Error('ProjectProfile requires status active or retired');
     }
     const defaultBranch = record.defaultBranch ?? null;
-    if (defaultBranch !== null && (typeof defaultBranch !== 'string' || defaultBranch.trim().length === 0)) {
+    if (defaultBranch !== null && !isValidBranchName(defaultBranch)) {
       throw new Error('ProjectProfile requires defaultBranch to be null or a non-empty branch name');
     }
     const clones = ProjectProfile.readClones(record.clones);
@@ -108,7 +109,7 @@ export class ProjectProfile {
     }
     const copy: Record<string, { readonly path: string; readonly worktreeRoot: string }> = {};
     for (const [key, clone] of Object.entries(source)) {
-      if (key.trim().length === 0 || FORBIDDEN_FIELD_PATTERN.test(key)) {
+      if (!isValidHostName(key) || FORBIDDEN_FIELD_PATTERN.test(key)) {
         throw new Error(`ProjectProfile clone host name is invalid: ${key}`);
       }
       if (typeof clone !== 'object' || clone === null || Array.isArray(clone)) {
@@ -129,7 +130,12 @@ export class ProjectProfile {
       if (worktreeRoot === clonePath || worktreeRoot.startsWith(clonePath + '/')) {
         throw new Error(`ProjectProfile clone ${key} worktreeRoot must be outside the clone`);
       }
-      copy[key] = { path: clonePath, worktreeRoot };
+      Object.defineProperty(copy, key, {
+        value: { path: clonePath, worktreeRoot },
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
     return Object.freeze(copy);
   }
@@ -184,7 +190,7 @@ export class ProjectProfile {
       typeof probe.probedAtIso === 'string' &&
       probe.probedAtIso.trim().length > 0 &&
       typeof probe.probedFrom === 'string' &&
-      probe.probedFrom.trim().length > 0 &&
+      isValidHostName(probe.probedFrom) &&
       Array.isArray(probe.checks);
     if (!isProbe) {
       throw new Error('ProjectProfile requires lastProbe to be null or a probe receipt');
@@ -197,7 +203,7 @@ export class ProjectProfile {
         Object.keys(check).every((key) => ALLOWED_PROBE_CHECK_KEYS.has(key)) &&
         typeof check.name === 'string' &&
         check.name.trim().length > 0 &&
-        (check.host === null || typeof check.host === 'string') &&
+        (check.host === null || (typeof check.host === 'string' && isValidHostName(check.host))) &&
         (check.result === 'pass' || check.result === 'fail' || check.result === 'unknown') &&
         typeof check.detail === 'string';
       if (!validCheck) {
@@ -227,6 +233,9 @@ export class ProjectProfile {
     for (const [name, value] of Object.entries(capabilities)) {
       if (name.trim().length === 0) {
         throw new Error('ProjectProfile requires a non-empty runner capability name');
+      }
+      if (FORBIDDEN_FIELD_PATTERN.test(name)) {
+        throw new Error(`ProjectProfile must not carry a credential capability: ${name}`);
       }
       if (typeof value !== 'boolean' && typeof value !== 'string') {
         throw new Error(`Runner capability ${name} must be a boolean or a string`);
@@ -345,4 +354,19 @@ function isNormalisedAbsolutePath(value: unknown): value is string {
 /** True when a path contains a `..` path segment. */
 function hasDotDotSegment(value: string): boolean {
   return value.split('/').includes('..');
+}
+
+const BRANCH_NAME_PATTERN = /^[A-Za-z0-9._\/-]{1,200}$/;
+
+function isValidBranchName(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    BRANCH_NAME_PATTERN.test(value) &&
+    !value.startsWith('-') &&
+    !value.startsWith('/') &&
+    !value.endsWith('/') &&
+    !value.endsWith('.lock') &&
+    !value.includes('..') &&
+    !value.includes('//')
+  );
 }

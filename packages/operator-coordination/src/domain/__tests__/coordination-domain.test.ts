@@ -371,6 +371,15 @@ describe('ProjectProfile', () => {
     expect(() =>
       ProjectProfile.fromRecord(profileRecord({ defaultBranch: '  ' })),
     ).toThrow('ProjectProfile requires defaultBranch to be null or a non-empty branch name');
+    for (const badBranch of ['-upload-pack=x', 'a..b', 'has space', 'x.lock', '/x']) {
+      expect(() =>
+        ProjectProfile.fromRecord(profileRecord({ defaultBranch: badBranch })),
+      ).toThrow('ProjectProfile requires defaultBranch to be null or a non-empty branch name');
+    }
+    expect(
+      ProjectProfile.fromRecord(profileRecord({ defaultBranch: 'release/1.2' })).toRecord()
+        .defaultBranch,
+    ).toBe('release/1.2');
     expect(() =>
       ProjectProfile.fromRecord(
         profileRecord({
@@ -383,6 +392,15 @@ describe('ProjectProfile', () => {
         profileRecord({ clones: { '': { path: '/work', worktreeRoot: '/wt' } } }),
       ),
     ).toThrow('ProjectProfile clone host name is invalid: ');
+    for (const badHost of ['__proto__', 'constructor', '../x', 'host 1']) {
+      expect(() =>
+        ProjectProfile.fromRecord(
+          profileRecord({
+            clones: { [badHost]: { path: '/work', worktreeRoot: '/wt' } },
+          }),
+        ),
+      ).toThrow(`ProjectProfile clone host name is invalid: ${badHost}`);
+    }
     expect(() =>
       ProjectProfile.fromRecord(
         profileRecord({ clones: { hostApiKey: { path: '/work', worktreeRoot: '/wt' } } }),
@@ -447,6 +465,35 @@ describe('ProjectProfile', () => {
         }),
       ),
     ).toThrow('ProjectProfile requires lastProbe to be null or a probe receipt');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({
+          lastProbe: {
+            probedAtIso: '2026-10-15T09:00:00.000Z',
+            probedFrom: 'host-1',
+            checks: [{ name: 'git-fetch', host: '', result: 'pass', detail: 'ok' }],
+          },
+        }),
+      ),
+    ).toThrow('ProjectProfile requires lastProbe to be null or a probe receipt');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({
+          lastProbe: {
+            probedAtIso: '2026-10-15T09:00:00.000Z',
+            probedFrom: 'bad host',
+            checks: [],
+          },
+        }),
+      ),
+    ).toThrow('ProjectProfile requires lastProbe to be null or a probe receipt');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({
+          runnerCapabilities: { githubToken: 'secret-value' },
+        }),
+      ),
+    ).toThrow('ProjectProfile must not carry a credential capability: githubToken');
     expect(() =>
       ProjectProfile.fromRecord(
         profileRecord({

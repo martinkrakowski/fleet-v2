@@ -25,7 +25,7 @@ import type {
   ReserveCapacityAtomicallyResult,
   SelectRecordUnderLockVerdict,
 } from '../../application/ports/out/ExecutionJournalPort.out-port.js';
-import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface ExecutionJournalAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
@@ -297,9 +297,9 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
 
   private async readJournalFromDisk(target: string): Promise<ActionJournalEntryRecord[]> {
     const entries: ActionJournalEntryRecord[] = [];
-    let raw: string;
+    let buffer: Buffer;
     try {
-      raw = await fs.readFile(target, 'utf8');
+      buffer = await fs.readFile(target);
     } catch (error: unknown) {
       if (
         typeof error === 'object' &&
@@ -310,21 +310,32 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       }
       throw error;
     }
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      throw new Error(`ExecutionJournalAdapter expects a record list in ${target}`);
+    const raw = buffer.toString('utf8');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      await quarantineUnreadable(target, 'not valid JSON', buffer);
     }
-    for (const item of parsed) {
-      if (isActionJournalEntryRecord(item)) entries.push(item);
+    if (!Array.isArray(parsed)) {
+      await quarantineUnreadable(target, 'expects a record list', buffer);
+    }
+    const records = parsed as unknown[];
+    for (const [index, rawItem] of records.entries()) {
+      if (!isActionJournalEntryRecord(rawItem)) {
+        await quarantineUnreadable(target, `record ${index} failed validation`, buffer);
+      }
+      const item = rawItem as ActionJournalEntryRecord;
+      entries.push(item);
     }
     return entries;
   }
 
   private async readReservationsFromDisk(target: string): Promise<Map<string, CapacityReservationRecord>> {
     const map = new Map<string, CapacityReservationRecord>();
-    let raw: string;
+    let buffer: Buffer;
     try {
-      raw = await fs.readFile(target, 'utf8');
+      buffer = await fs.readFile(target);
     } catch (error: unknown) {
       if (
         typeof error === 'object' &&
@@ -335,36 +346,45 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       }
       throw error;
     }
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      throw new Error(`ExecutionJournalAdapter expects a record list in ${target}`);
+    const raw = buffer.toString('utf8');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      await quarantineUnreadable(target, 'not valid JSON', buffer);
     }
-    for (const item of parsed) {
-      if (isCapacityReservationRecord(item)) {
-        // A reservation stored before `seatTool` existed reads with `null`;
-        // it is never defaulted to a declared kind. The host fields (H9a1)
-        // read the same way: absent or malformed values read as `null`.
-        map.set(item.id, {
-          ...item,
-          seatTool: parseSeatTool(item.seatTool) ?? null,
-          hostName: isNonEmptyStringField(item.hostName) ? item.hostName : null,
-          hostKind: parseSeatTool(item.hostKind) ?? null,
-          transport:
-            item.transport === 'local' || item.transport === 'ssh'
-              ? item.transport
-              : null,
-          sshAlias: isNonEmptyStringField(item.sshAlias) ? item.sshAlias : null,
-          port:
-            typeof item.port === 'number' &&
-            Number.isInteger(item.port) &&
-            item.port > 0
-              ? item.port
-              : null,
-          // The claimed worktree path (H9a2) reads the same way: absent or
-          // malformed values read as `null`.
-          worktreePath: isNonEmptyStringField(item.worktreePath) ? item.worktreePath : null,
-        });
+    if (!Array.isArray(parsed)) {
+      await quarantineUnreadable(target, 'expects a record list', buffer);
+    }
+    const records = parsed as unknown[];
+    for (const [index, rawItem] of records.entries()) {
+      if (!isCapacityReservationRecord(rawItem)) {
+        await quarantineUnreadable(target, `record ${index} failed validation`, buffer);
       }
+      const item = rawItem as CapacityReservationRecord;
+      // A reservation stored before `seatTool` existed reads with `null`;
+      // it is never defaulted to a declared kind. The host fields (H9a1)
+      // read the same way: absent or malformed values read as `null`.
+      map.set(item.id, {
+        ...item,
+        seatTool: parseSeatTool(item.seatTool) ?? null,
+        hostName: isNonEmptyStringField(item.hostName) ? item.hostName : null,
+        hostKind: parseSeatTool(item.hostKind) ?? null,
+        transport:
+          item.transport === 'local' || item.transport === 'ssh'
+            ? item.transport
+            : null,
+        sshAlias: isNonEmptyStringField(item.sshAlias) ? item.sshAlias : null,
+        port:
+          typeof item.port === 'number' &&
+          Number.isInteger(item.port) &&
+          item.port > 0
+            ? item.port
+            : null,
+        // The claimed worktree path (H9a2) reads the same way: absent or
+        // malformed values read as `null`.
+        worktreePath: isNonEmptyStringField(item.worktreePath) ? item.worktreePath : null,
+      });
     }
     return map;
   }

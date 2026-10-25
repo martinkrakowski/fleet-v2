@@ -12,7 +12,7 @@ import * as path from 'node:path';
 
 import type { WorkOrderRecord } from '../../domain/execution-records.js';
 import type { WorkOrderRepositoryPort } from '../../application/ports/out/WorkOrderRepositoryPort.out-port.js';
-import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface WorkOrderRepositoryAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
@@ -85,9 +85,9 @@ export class WorkOrderRepositoryAdapter implements WorkOrderRepositoryPort {
 
   private async readRecordsFromDisk(target: string): Promise<Map<string, WorkOrderRecord>> {
     const map = new Map<string, WorkOrderRecord>();
-    let raw: string;
+    let buffer: Buffer;
     try {
-      raw = await fs.readFile(target, 'utf8');
+      buffer = await fs.readFile(target);
     } catch (error: unknown) {
       if (
         typeof error === 'object' &&
@@ -98,12 +98,23 @@ export class WorkOrderRepositoryAdapter implements WorkOrderRepositoryPort {
       }
       throw error;
     }
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      throw new Error(`WorkOrderRepositoryAdapter expects a record list in ${target}`);
+    const raw = buffer.toString('utf8');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      await quarantineUnreadable(target, 'not valid JSON', buffer);
     }
-    for (const item of parsed) {
-      if (isWorkOrderRecord(item)) map.set(item.id, item);
+    if (!Array.isArray(parsed)) {
+      await quarantineUnreadable(target, 'expects a record list', buffer);
+    }
+    const records = parsed as unknown[];
+    for (const [index, rawItem] of records.entries()) {
+      if (!isWorkOrderRecord(rawItem)) {
+        await quarantineUnreadable(target, `record ${index} failed validation`, buffer);
+      }
+      const item = rawItem as WorkOrderRecord;
+      map.set(item.id, item);
     }
     return map;
   }

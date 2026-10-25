@@ -14,7 +14,7 @@ import {
   EvidenceAssessmentRevisionConflictError,
   type EvidenceAssessmentRepositoryPort,
 } from '../../application/ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
-import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface EvidenceAssessmentRepositoryOptions {
   /** When set, assessments are also persisted as `assessments.json`. */
@@ -128,9 +128,9 @@ export class EvidenceAssessmentRepositoryAdapter implements EvidenceAssessmentRe
     stateFilePath: string,
   ): Promise<Map<string, EvidenceAssessmentRecord>> {
     const map = new Map<string, EvidenceAssessmentRecord>();
-    let raw: string;
+    let buffer: Buffer;
     try {
-      raw = await fs.readFile(stateFilePath, 'utf8');
+      buffer = await fs.readFile(stateFilePath);
     } catch (error: unknown) {
       if (
         typeof error === 'object' &&
@@ -141,14 +141,23 @@ export class EvidenceAssessmentRepositoryAdapter implements EvidenceAssessmentRe
       }
       throw error;
     }
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      throw new Error(`EvidenceAssessmentRepositoryAdapter expects a record list in ${stateFilePath}`);
+    const raw = buffer.toString('utf8');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      await quarantineUnreadable(stateFilePath, 'not valid JSON', buffer);
     }
-    for (const record of parsed) {
-      if (isAssessmentRecord(record)) {
-        map.set(record.id, copyRecord(record));
+    if (!Array.isArray(parsed)) {
+      await quarantineUnreadable(stateFilePath, 'expects a record list', buffer);
+    }
+    const records = parsed as unknown[];
+    for (const [index, rawRecord] of records.entries()) {
+      if (!isAssessmentRecord(rawRecord)) {
+        await quarantineUnreadable(stateFilePath, `record ${index} failed validation`, buffer);
       }
+      const record = rawRecord as EvidenceAssessmentRecord;
+      map.set(record.id, copyRecord(record));
     }
     return map;
   }

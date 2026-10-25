@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -9,6 +10,7 @@ import {
   nextAttemptRevision,
 } from '../../application/ports/out/AttemptRepositoryPort.out-port.js';
 import { AttemptRepositoryAdapter } from './AttemptRepositoryAdapter.adapter.js';
+import { StateFileUnreadableError } from './file-store.js';
 
 describe('AttemptRepositoryAdapter cross-process safe persistence', () => {
   let tempDir: string;
@@ -267,5 +269,95 @@ describe('AttemptRepositoryAdapter revision compare-and-swap', () => {
     const saved = await adapter.findAttemptById('att-1');
     expect(saved?.revision).toBe(1);
     expect(saved?.state).toBe('ended');
+  });
+});
+
+describe('AttemptRepositoryAdapter quarantines unreadable state files', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-attempt-quarantine-test-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
+    return {
+      id: 'att-1',
+      workOrderId: 'wo-1',
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      worktreePath: '/tmp/worktree-1',
+      baseCommit: 'commit-1',
+      state: 'dispatching',
+      outcome: null,
+      briefDigest: 'digest-1',
+      briefPackagePath: null,
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: null,
+      createdAtIso: '2026-10-15T10:00:00.000Z',
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  const attemptsPath = () => path.join(tempDir, 'attempts.json');
+  const quarantineDir = () => path.join(tempDir, 'quarantine');
+
+  it('throws StateFileUnreadableError and quarantines garbage bytes', async () => {
+    await fs.writeFile(attemptsPath(), '{ not valid json', 'utf8');
+    const adapter = new AttemptRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.listAllAttempts()).rejects.toBeInstanceOf(StateFileUnreadableError);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+
+  it('throws StateFileUnreadableError and quarantines a wrong top-level shape', async () => {
+    await fs.writeFile(attemptsPath(), JSON.stringify({ not: 'a list' }), 'utf8');
+    const adapter = new AttemptRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.listAllAttempts()).rejects.toBeInstanceOf(StateFileUnreadableError);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+
+  it('throws StateFileUnreadableError instead of skipping a record that fails validation', async () => {
+    await fs.writeFile(
+      attemptsPath(),
+      JSON.stringify([makeAttempt(), { id: 'broken', workOrderId: 42 }]),
+      'utf8',
+    );
+    const adapter = new AttemptRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.listAllAttempts()).rejects.toBeInstanceOf(StateFileUnreadableError);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+
+  it('throws and leaves the bytes unchanged when a save reads an unreadable file', async () => {
+    const garbage = '{ not valid json';
+    await fs.writeFile(attemptsPath(), garbage, 'utf8');
+    const before = createHash('sha256').update(await fs.readFile(attemptsPath())).digest('hex');
+    const adapter = new AttemptRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.saveAttempt(makeAttempt({ id: 'att-corrupt' }))).rejects.toBeInstanceOf(
+      StateFileUnreadableError,
+    );
+    const after = createHash('sha256').update(await fs.readFile(attemptsPath())).digest('hex');
+    expect(after).toBe(before);
+  });
+
+  it('rejects saveAttempt with StateFileUnreadableError, keeps SHA-256 unchanged, and writes one quarantine copy when the file holds one valid and one invalid record', async () => {
+    await fs.writeFile(
+      attemptsPath(),
+      JSON.stringify([makeAttempt(), { id: 'broken', workOrderId: 42 }]),
+      'utf8',
+    );
+    const before = createHash('sha256').update(await fs.readFile(attemptsPath())).digest('hex');
+    const adapter = new AttemptRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.saveAttempt(makeAttempt({ id: 'att-2' }))).rejects.toBeInstanceOf(
+      StateFileUnreadableError,
+    );
+    const after = createHash('sha256').update(await fs.readFile(attemptsPath())).digest('hex');
+    expect(after).toBe(before);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
   });
 });

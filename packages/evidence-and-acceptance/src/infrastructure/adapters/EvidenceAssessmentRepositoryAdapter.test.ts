@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -5,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { EvidenceAssessmentRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessmentRepositoryAdapter } from './EvidenceAssessmentRepositoryAdapter.adapter.js';
+import { StateFileUnreadableError } from './file-store.js';
 
 describe('EvidenceAssessmentRepositoryAdapter cross-process safe persistence', () => {
   let tempDir: string;
@@ -136,5 +138,93 @@ describe('EvidenceAssessmentRepositoryAdapter cross-process safe persistence', (
 
     const contentAfter = await fs.readFile(filePath, 'utf8');
     expect(contentAfter).toBe(corruptContent);
+  });
+});
+
+describe('EvidenceAssessmentRepositoryAdapter quarantines unreadable state files', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-assessment-quarantine-test-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  function makeAssessment(): EvidenceAssessmentRecord {
+    return {
+      id: 'assessment-1',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: 'head-sha-1',
+      policyRevision: 'pol-1',
+      implementerModel: 'provider-b/model-implementer',
+      requiredChecks: ['test'],
+      state: 'pending',
+      verificationReceipts: [],
+      reviewReceipts: [],
+      findingDispositions: [],
+      acceptanceReceiptId: null,
+      blockers: [],
+      revision: 1,
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+  }
+
+  const assessmentsPath = () => path.join(tempDir, 'assessments.json');
+  const quarantineDir = () => path.join(tempDir, 'quarantine');
+
+  it('throws StateFileUnreadableError and quarantines garbage bytes', async () => {
+    await fs.writeFile(assessmentsPath(), '{ not valid json', 'utf8');
+    const adapter = new EvidenceAssessmentRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.findAssessmentById('nope')).rejects.toBeInstanceOf(StateFileUnreadableError);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+
+  it('throws StateFileUnreadableError and quarantines a wrong top-level shape', async () => {
+    await fs.writeFile(assessmentsPath(), JSON.stringify({ assessments: [] }), 'utf8');
+    const adapter = new EvidenceAssessmentRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.findAssessmentById('nope')).rejects.toBeInstanceOf(StateFileUnreadableError);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+
+  it('throws StateFileUnreadableError instead of skipping an assessment that fails validation', async () => {
+    await fs.writeFile(
+      assessmentsPath(),
+      JSON.stringify([makeAssessment(), { id: 'broken' }]),
+      'utf8',
+    );
+    const adapter = new EvidenceAssessmentRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.findAssessmentById('nope')).rejects.toBeInstanceOf(StateFileUnreadableError);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+
+  it('throws and leaves the bytes unchanged when a save reads an unreadable file', async () => {
+    const garbage = '{ not valid json';
+    await fs.writeFile(assessmentsPath(), garbage, 'utf8');
+    const before = createHash('sha256').update(await fs.readFile(assessmentsPath())).digest('hex');
+    const adapter = new EvidenceAssessmentRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.saveAssessment(makeAssessment())).rejects.toBeInstanceOf(
+      StateFileUnreadableError,
+    );
+    const after = createHash('sha256').update(await fs.readFile(assessmentsPath())).digest('hex');
+    expect(after).toBe(before);
+  });
+
+  it('rejects saveAssessment with StateFileUnreadableError, keeps SHA-256 unchanged, and writes one quarantine copy when the file holds one valid and one invalid record', async () => {
+    await fs.writeFile(
+      assessmentsPath(),
+      JSON.stringify([makeAssessment(), { id: 'broken' }]),
+      'utf8',
+    );
+    const before = createHash('sha256').update(await fs.readFile(assessmentsPath())).digest('hex');
+    const adapter = new EvidenceAssessmentRepositoryAdapter({ stateDir: tempDir });
+    await expect(
+      adapter.saveAssessment({ ...makeAssessment(), id: 'assessment-2' }),
+    ).rejects.toBeInstanceOf(StateFileUnreadableError);
+    const after = createHash('sha256').update(await fs.readFile(assessmentsPath())).digest('hex');
+    expect(after).toBe(before);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
   });
 });

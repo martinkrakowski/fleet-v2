@@ -9,5 +9,6 @@ export * from "./InstallationReferenceAdapter.adapter.js";
 export * from "./ObservationPublicationAdapter.adapter.js";
 export * from "./OwnerQuestionRepositoryAdapter.adapter.js";
 export * from "./ProjectProfileRepositoryAdapter.adapter.js";
+export * from "./record-list-store.js";
 export * from "./RelayTransportAdapter.adapter.js";
 export * from "./WavesHttpClient.adapter.js";

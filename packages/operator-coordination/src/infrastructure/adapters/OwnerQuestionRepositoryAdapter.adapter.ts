@@ -12,7 +12,6 @@
  * typed OwnerQuestionRevisionConflictError rather than a silent overwrite.
  */
 
-import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
 import type { OwnerQuestionRecord } from '../../domain/owner-question-records.js';
@@ -22,7 +21,8 @@ import type {
   OwnerQuestionListQuery,
   OwnerQuestionRepositoryPort,
 } from '../../application/ports/out/OwnerQuestionRepositoryPort.out-port.js';
-import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
+import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { readRecordList } from './record-list-store.js';
 
 export interface OwnerQuestionRepositoryAdapterOptions {
   /** When set, questions are persisted here and reloaded on first use. */
@@ -165,48 +165,15 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
   }
 
   private async readRecordsFromDisk(path: string): Promise<Map<string, OwnerQuestionRecord>> {
+    const records = await readRecordList(
+      path,
+      'OwnerQuestionRepositoryAdapter',
+      (entry) => OwnerQuestion.fromRecord(entry as OwnerQuestionRecord).toRecord(),
+    );
     const map = new Map<string, OwnerQuestionRecord>();
-    let buffer: Buffer;
-    try {
-      buffer = await fs.readFile(path);
-    } catch (error: unknown) {
-      if (isNotFound(error)) {
-        return map;
-      }
-      throw new Error(
-        `OwnerQuestionRepositoryAdapter could not read ${path}: ${describe(error)}`,
-      );
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(buffer.toString('utf8'));
-    } catch {
-      await quarantineUnreadable(path, 'not valid JSON', buffer);
-    }
-    if (!Array.isArray(parsed)) {
-      await quarantineUnreadable(path, 'expects a record list', buffer);
-    }
-    const records = parsed as unknown[];
-    for (const [index, entry] of records.entries()) {
-      try {
-        const record = OwnerQuestion.fromRecord(entry as OwnerQuestionRecord).toRecord();
-        map.set(record.questionId, record);
-      } catch {
-        await quarantineUnreadable(path, `record ${index} failed validation`, buffer);
-      }
+    for (const record of records) {
+      map.set(record.questionId, record);
     }
     return map;
   }
-}
-
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function isNotFound(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    (error as { code?: string }).code === 'ENOENT'
-  );
 }

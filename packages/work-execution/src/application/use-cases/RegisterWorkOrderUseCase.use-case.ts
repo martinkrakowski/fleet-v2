@@ -13,10 +13,16 @@ import type {
   RegisterWorkOrderRequest,
   RegisterWorkOrderResult,
 } from '../ports/in/RegisterWorkOrderPort.in-port.js';
+import type { ProjectProfileReadPort } from '../ports/out/ProjectProfileReadPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 
 export interface RegisterWorkOrderDependencies {
   readonly workOrderRepo: WorkOrderRepositoryPort;
+  /**
+   * When present, a new work order requires an active profile for its
+   * projectId; when absent (today's roots until P5), behaviour is unchanged.
+   */
+  readonly profileRead?: ProjectProfileReadPort;
 }
 
 function isNonEmpty(value: unknown): value is string {
@@ -62,6 +68,22 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     }
     if (request.ownedPaths.some((path) => !isNonEmpty(path))) {
       return { outcome: 'rejected', reason: 'Work order owned paths must be non-empty strings' };
+    }
+
+    if (this.deps.profileRead) {
+      const profile = await this.deps.profileRead.readProjectProfile(request.projectId.trim());
+      if (profile === null) {
+        return {
+          outcome: 'rejected',
+          reason: `project ${request.projectId} has no profile; register the project before creating work orders`,
+        };
+      }
+      if (profile.status === 'retired') {
+        return {
+          outcome: 'rejected',
+          reason: `project ${request.projectId} is retired; it accepts no new work orders`,
+        };
+      }
     }
 
     const existingById = await this.deps.workOrderRepo.findWorkOrderById(request.workOrderId);

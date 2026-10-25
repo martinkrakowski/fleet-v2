@@ -5,7 +5,7 @@
  * credential values.
  */
 
-import type { ProjectProfileRecord } from '../../../domain/coordination-records.js';
+import type { ProjectCloneRecord, ProjectProfileRecord } from '../../../domain/coordination-records.js';
 
 export interface RegisterProjectProfileRequest {
   readonly projectId: string;
@@ -16,6 +16,10 @@ export interface RegisterProjectProfileRequest {
   readonly maxConcurrentLanes: number;
   readonly runnerCapabilities: Readonly<Record<string, boolean | string>>;
   readonly nowIso?: string;
+  readonly defaultBranch?: string | null;
+  readonly clones?: Readonly<Record<string, ProjectCloneRecord>>;
+  readonly gateProcedures?: readonly string[];
+  readonly defaultAllowedPathPrefixes?: readonly string[];
 }
 
 export type RegisterProjectProfileResult =

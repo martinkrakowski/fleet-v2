@@ -10,6 +10,7 @@ export * from "./InspectOutstandingCoordinationUseCase.use-case.js";
 export * from "./InspectProjectProfileUseCase.use-case.js";
 export * from "./ListOwnerQuestionsUseCase.use-case.js";
 export * from "./ListProjectProfilesUseCase.use-case.js";
+export * from "./profile-write-checks.js";
 export * from "./PublishProjectObservationUseCase.use-case.js";
 export * from "./ReadOwnerQuestionUseCase.use-case.js";
 export * from "./ReadProjectAttentionUseCase.use-case.js";

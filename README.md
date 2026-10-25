@@ -6,7 +6,7 @@ Approved work becomes a frozen brief, a disposable lane, a commit, verification,
 
 Fleet is a CLI-first modular system in four bounded contexts, built on a hexagonal architecture generated and checked by [Hexagen](https://github.com/hexagen-monaco/hexagen-monaco) from `.architecture/manifest.yaml`. Domain code is pure. Application code depends on ports. Filesystem, subprocess, network and vendor code live in infrastructure adapters.
 
-## Status (2026-10-24)
+## Status (2026-10-25)
 
 The contexts, the CLI, the HTTP API, the MCP server and the web app build, typecheck, lint, pass the architecture lint and the test suite, and match the manifest. The end-to-end workflow runs across separate CLI processes on one state directory, from profile registration to an authorised merge.
 
@@ -20,6 +20,7 @@ The contexts, the CLI, the HTTP API, the MCP server and the web app build, typec
 | Lane diff gate | `scripts/lane-diff-check.sh` reviews a lane's diff before its output is committed: protected paths (agent, editor, package-manager and git files, `scripts/lane-diff-check.protected`), git filter drivers, symlink escapes, credential-shaped strings and files outside the brief. It prints file, line and pattern name, never a matched value. The operator runs it; the TypeScript port mirrors its rules and is not wired. |
 | Verification checks | Runs only the procedures the installation allow-lists, mapped to executables, never a command string. With no installation every check reports `unknown`. |
 | Pull request create and merge | Live in the CLI through `gh` from fixed paths, only after acceptance of the exact candidate head; merges are pinned to that head. Not wired in the API. |
+| Project profiles | `fleet-v2 projects list\|show\|add\|adopt\|edit\|retire\|probe` and `/v1/projects`. **A new work order needs an active profile** (CLI and API). Edits and retires are compare-and-swap on the revision read; on a v2 installation host and procedure names are checked against it. The probe is read-only and prints the command that would fix a failure. See [docs/runbooks/onboard-a-project.md](docs/runbooks/onboard-a-project.md). |
 | Durable state | File-backed under `--state-dir` / `FLEET_STATE_DIR`: JSON under a file lock, atomic writes, and a revision check that refuses a stale attempt write. Without a state directory every store is in-memory and the process is disposable. |
 | Usage | `attempt usage` reads a finished attempt's tokens and cost from the lane server's database on the recorded host and saves them on the attempt. Not exposed by the API. |
 | Evidence and acceptance | Review receipts, verification receipts and finding dispositions are validated before they are stored. Every reported finding starts unresolved and blocks acceptance until a disposition is recorded. The independent review transport is not wired, so review requests report `unavailable`; the reviewer's model must differ from the implementer's. |
@@ -28,7 +29,7 @@ The contexts, the CLI, the HTTP API, the MCP server and the web app build, typec
 | Knowledge shelf | Keepers append to a local shelf file under the state directory. The git shelf provider is not wired. |
 | HTTP API | Nitro. Refuses to start on a non-loopback host unless `FLEET_API_ALLOW_REMOTE=1`. `/health` answers without auth. Every `/v1` route needs a bearer token from `FLEET_API_TOKEN_FILE` and an allowed Origin, and stays `501` until a state directory and token are configured. |
 | MCP server | `apps/mcp`, stdio. Every tool calls the API's `/v1` routes; without `FLEET_API_URL` and `FLEET_API_TOKEN_FILE` it answers "not configured". |
-| Web app | Views read fixtures; `api-client.ts` exists and pages do not use it yet. Every mutating action opens a confirmation first. |
+| Web app | The Lanes page renders recorded attempts from `GET /v1/attempts` on every request and refreshes every 30 s, labelled as recorded state, not runner observations; without a configured API it shows the fixture and says why. Other views read fixtures. Every mutating action opens a confirmation first. |
 | Container image and staging | `build-image.yml` builds the image on pull requests and scans it; on `main` it pushes by digest, scans again, writes an SBOM and signs it. It never deploys: staging runs a digest pinned in the operator's platform repository. `deploy/staging/` holds a manual deploy script whose targets come from `staging.env` (see `staging.env.example`). |
 | Continuous integration | `gate.yml` runs the gate below plus the model-family fixture check and the shell tests. `gitleaks.yml` scans for secrets. |
 
@@ -64,8 +65,10 @@ Run the CLI:
 
 ```sh
 node apps/cli/dist/bin.js --help
-# template: replace <profile-json> with a profile matching the coordination schema
-node apps/cli/dist/bin.js --state-dir ./.fleet/state coordination register-profile --json '<profile-json>'
+# register a project before its first work order (see docs/runbooks/onboard-a-project.md)
+node apps/cli/dist/bin.js --state-dir ./.fleet/state projects add --project-id demo \
+  --display-name Demo --repository https://example.com/demo.git \
+  --dispatcher-host <host> --policy-revision 1 --max-lanes 2
 ```
 
 Every command takes its typed request as one JSON object with `--json`, or as `--kebab-case` flags. The typed result prints to stdout as one JSON document. Exit codes are part of the contract: `0` completed, `1` refused, rejected, blocked or unknown, `2` usage error.
@@ -79,7 +82,7 @@ FLEET_API_URL=http://localhost:3001 yarn workspace @fleet/web dev    # http://lo
 
 The API's `dev` and `preview` scripts listen on `127.0.0.1`. Without `FLEET_STATE_DIR` and `FLEET_API_TOKEN_FILE` it answers `501` for every use case instead of serving empty state. To listen on another address (inside a container, say), set `HOST` and `FLEET_API_ALLOW_REMOTE=1`; without the flag it refuses to start.
 
-`node apps/cli/dist/bin.js --help` lists every command group: work orders, briefs, capacity, attempts, the forge, evidence, knowledge, decisions, coordination, questions, and the installation commands `init`, `doctor`, `hosts` and `seats`.
+`node apps/cli/dist/bin.js --help` lists every command group: projects, work orders, briefs, capacity, attempts, the forge, evidence, knowledge, decisions, coordination, questions, and the installation commands `init`, `doctor`, `hosts` and `seats`.
 
 ## Configuration
 

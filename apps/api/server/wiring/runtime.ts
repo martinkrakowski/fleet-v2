@@ -570,6 +570,12 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
         return { outcome: "delivery-gap", reason: result.reason };
       },
     },
+    // The probe and the work-order guard read profiles and record receipts
+    // through the operator context's inspect/record use cases.
+    projectProfile: {
+      inspect: async (request) => operator.inspectProjectProfile.execute(request),
+      record: async (request) => operator.recordProjectProbe.execute(request),
+    },
     acceptedReceiptByHead,
   };
 

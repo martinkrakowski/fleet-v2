@@ -296,10 +296,10 @@ async function pruneQuarantineCopies(
       }
       return a.localeCompare(b);
     });
-  const toDeleteCount = Math.max(0, copies.length - 5);
-  const candidates = copies
-    .filter((name) => name !== justWrittenName)
-    .slice(0, toDeleteCount);
+  // The copy just written is always kept, even when a clock step makes it
+  // sort as the oldest; the other four kept are the newest of the rest.
+  const others = copies.filter((name) => name !== justWrittenName);
+  const candidates = others.slice(0, Math.max(0, others.length - 4));
   let failures = 0;
   for (const oldest of candidates) {
     try {

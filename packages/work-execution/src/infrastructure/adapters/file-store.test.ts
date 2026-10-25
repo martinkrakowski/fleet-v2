@@ -358,6 +358,40 @@ describe('quarantineUnreadable', () => {
     expect(await fs.readFile(filePath, 'utf8')).toBe(validReplacement);
   });
 
+  it('keeps the copy just written and the four newest others when the clock steps backwards', async () => {
+    const filePath = path.join(tempDir, 'attempts.json');
+    await fs.writeFile(filePath, 'garbage');
+    vi.useFakeTimers();
+    try {
+      const later: string[] = [];
+      for (let i = 0; i < 6; i += 1) {
+        vi.setSystemTime(new Date(Date.UTC(2026, 9, 25, 12, 0, i)));
+        try {
+          await quarantineUnreadable(filePath, 'not valid JSON', Buffer.from(`later-${i}`));
+        } catch (error) {
+          later.push((error as { quarantinePath: string }).quarantinePath);
+        }
+      }
+      vi.setSystemTime(new Date(Date.UTC(2026, 9, 25, 11, 0, 0)));
+      let earliest = '';
+      try {
+        await quarantineUnreadable(filePath, 'not valid JSON', Buffer.from('earlier'));
+      } catch (error) {
+        earliest = (error as { quarantinePath: string }).quarantinePath;
+      }
+      const kept = (await fs.readdir(path.join(tempDir, 'quarantine'))).map((name) =>
+        path.join(tempDir, 'quarantine', name),
+      );
+      expect(kept).toHaveLength(5);
+      expect(kept).toContain(earliest);
+      for (const newest of later.slice(2)) {
+        expect(kept).toContain(newest);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('tries every candidate when an rm fails during pruning and reports the failure count', async () => {
     const filePath = path.join(tempDir, 'attempts.json');
     const quarantineDir = path.join(tempDir, 'quarantine');

@@ -41,9 +41,15 @@ import {
   ForgeActionAdapter,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
+  ListUnregisteredProjectsUseCase,
+  LocalExecutor,
   OpencodeDbUsageAdapter,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
+  ProbeProjectUseCase,
+  ProjectProbeAdapter,
+  ProjectProbeRecordAdapter,
+  ProjectProfileReadAdapter,
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
   RequestAttemptAcceptanceUseCase,
@@ -54,6 +60,7 @@ import {
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
   ExecutorForHost,
+  executorForHost as selectExecutorForHost,
   hasRecordedHostName,
   consumptionId,
   forgeActionScope,
@@ -65,6 +72,7 @@ import {
   resolveRunnerCapabilityProfile,
   sha256HexDigest,
   type ExecutionRunnerHost,
+  type ExecutorForRecordedHostResult,
   type GhInvocationResult,
   type SubprocessRunner,
   type CommandExecutorPort,
@@ -572,6 +580,8 @@ export interface FleetCliRuntime {
     readonly prepareFixAttempt: PrepareFixAttemptUseCase;
     readonly requestAttemptAcceptance: RequestAttemptAcceptanceUseCase;
     readonly executeAuthorizedForgeAction: ExecuteAuthorizedForgeActionUseCase;
+    readonly probeProject: ProbeProjectUseCase;
+    readonly listUnregisteredProjects: ListUnregisteredProjectsUseCase;
   };
 }
 
@@ -735,6 +745,34 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       ownerQuestionRepo: ownerQuestionRepository,
       clock: ownerQuestionClock,
     }),
+  };
+
+  // --- project profiles and probes (P6b) --------------------------------------
+  // The execution context reads profiles and records probe receipts through
+  // the operator-coordination use cases, bound here (same delegate pattern as
+  // the other cross-context adapters).
+  const profileRead = new ProjectProfileReadAdapter({
+    inspect: (req) => coordination.inspectProjectProfile.execute(req),
+  });
+  const probeRecord = new ProjectProbeRecordAdapter({
+    record: (req) => coordination.recordProjectProbe.execute(req),
+  });
+  // One executor per named installation host for the probe's read-only git
+  // checks. A v2 installation names its hosts; a v1 or absent installation has
+  // no host names, so every name is refused.
+  const executorForHostName = (name: string): ExecutorForRecordedHostResult => {
+    if (options?.installation?.schemaVersion !== 2) {
+      return { ok: false, reason: 'no v2 installation names lane hosts' };
+    }
+    const hostSpec = options.installation.hosts?.[name];
+    if (hostSpec === undefined) {
+      return { ok: false, reason: `host ${name} is not in the installation` };
+    }
+    try {
+      return { ok: true, executor: selectExecutorForHost(hostSpec) };
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    }
   };
 
   // --- brief-knowledge -------------------------------------------------------
@@ -1457,7 +1495,26 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     briefKnowledge,
     executionObservation,
     forgeAction,
-    registerWorkOrder: new RegisterWorkOrderUseCase({ workOrderRepo: workOrderRepository }),
+    probeProject: new ProbeProjectUseCase({
+      profileRead,
+      probe: new ProjectProbeAdapter({
+        orchestrator: new LocalExecutor(),
+        executorForHost: executorForHostName,
+      }),
+      probeRecord,
+      verificationProcedureNames:
+        options?.installation?.schemaVersion === 2
+          ? Object.keys(options?.installation?.verification?.procedures ?? {})
+          : null,
+    }),
+    listUnregisteredProjects: new ListUnregisteredProjectsUseCase({
+      workOrderRepo: workOrderRepository,
+      profileRead,
+    }),
+    registerWorkOrder: new RegisterWorkOrderUseCase({
+      workOrderRepo: workOrderRepository,
+      profileRead,
+    }),
     inspectWorkOrder: new InspectWorkOrderUseCase({
       workOrderRepo: workOrderRepository,
       attemptRepo: attemptRepository,

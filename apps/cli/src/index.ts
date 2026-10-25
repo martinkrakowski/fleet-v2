@@ -1801,8 +1801,8 @@ edit and remove, each write confirmed and compare-and-swapped.
 The seats group shows or changes policy.useFreeSeats: seats free-tier status|on|off,
 each change confirmed and compare-and-swapped.
 
-The projects group lists, shows, registers, edits and retires project profiles;
-every change is confirmed unless --yes is given.
+The projects group lists, shows, probes, registers, adopts, edits and retires
+project profiles; every change is confirmed unless --yes is given.
 
 init sets up a fresh installation file non-interactively (every step is a
 flag); run 'fleet-v2 init --help' for its flags.
@@ -1812,7 +1812,7 @@ Commands:
   doctor [--probe-seats] [--host <name>] [--json]
   hosts list|add|edit|remove
   seats free-tier [status|on|off] [--yes]
-  projects list|show|add|edit|retire
+  projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
   brief prepare [--allowedPathPrefixes '["packages/x/src"]']
   capacity reserve

@@ -694,4 +694,27 @@ describe('ProjectProbeAdapter', () => {
       }
     }
   });
+
+  it.each([
+    'user:secret@host://x',
+    'u:p@h/path://repo.git',
+  ])('refuses a credential before a later scheme marker: %s', async (repository) => {
+    const orch = fakeExecutor({});
+    const adapter = makeAdapter(orch.executor, {});
+    const report = await adapter.probe({ repository, clones: {} });
+    const check = report.checks.find((c) => c.name === 'repository-answers')!;
+    expect(check.result).toBe('fail');
+    expect(check.detail).toBe('repository URL carries a credential; register it without one');
+    expect(orch.calls).toHaveLength(0);
+  });
+
+  it.each(['https://host/o/r.git', 'ssh://git@host/p', 'git@github.com:o/r'])(
+    'still probes a credential-free repository: %s',
+    async (repository) => {
+      const orch = fakeExecutor({ 'ls-remote --symref': { exitCode: 0, stdout: '' } });
+      const adapter = makeAdapter(orch.executor, {});
+      await adapter.probe({ repository, clones: {} });
+      expect(orch.calls.some((c) => c.argv.includes('ls-remote'))).toBe(true);
+    },
+  );
 });

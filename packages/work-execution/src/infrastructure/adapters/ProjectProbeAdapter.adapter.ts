@@ -97,21 +97,23 @@ export function redactUserinfo(url: string): string {
 }
 
 function hasRepositoryCredential(repository: string): boolean {
-  const schemeEnd = repository.indexOf("://");
-  if (schemeEnd !== -1) {
-    const scheme = repository.slice(0, schemeEnd).toLowerCase();
-    const rest = repository.slice(schemeEnd + 3);
-    const slash = rest.indexOf("/");
-    const authority = slash === -1 ? rest : rest.slice(0, slash);
-    const at = authority.lastIndexOf("@");
-    if (at === -1) return false;
-    if (scheme === "http" || scheme === "https") return true;
-    return authority.slice(0, at).includes(":");
-  }
+  // Scheme-less form (`user:secret@host:path`), checked on every input so a
+  // `user:secret@` before a later `://` is never missed.
   const slash = repository.indexOf("/");
   const beforeSlash = slash === -1 ? repository : repository.slice(0, slash);
-  const at = beforeSlash.indexOf("@");
-  return at !== -1 && beforeSlash.slice(0, at).includes(":");
+  const firstAt = beforeSlash.indexOf("@");
+  if (firstAt !== -1 && beforeSlash.slice(0, firstAt).includes(":")) return true;
+
+  const schemeEnd = repository.indexOf("://");
+  if (schemeEnd === -1) return false;
+  const scheme = repository.slice(0, schemeEnd).toLowerCase();
+  const rest = repository.slice(schemeEnd + 3);
+  const restSlash = rest.indexOf("/");
+  const authority = restSlash === -1 ? rest : rest.slice(0, restSlash);
+  const at = authority.lastIndexOf("@");
+  if (at === -1) return false;
+  if (scheme === "http" || scheme === "https") return true;
+  return authority.slice(0, at).includes(":");
 }
 
 /** Trim whitespace and strip one trailing `/` then one trailing `.git`. */

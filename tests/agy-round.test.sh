@@ -73,8 +73,15 @@ run_one() {
     git)
       shift
       d=''
-      if [ "${1:-}" = -C ]; then d=$2; shift 2; fi
-      while [ "${1:-}" = -c ] && [ "$#" -ge 2 ]; do shift 2; done
+      lit=''
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --literal-pathspecs) lit=--literal-pathspecs; shift ;;
+          -C) d=$2; shift 2 ;;
+          -c) shift 2 ;;
+          *) break ;;
+        esac
+      done
       sub=${1:-}; shift
       case "$sub" in
         init) [ "$1" = -q ] && shift; mkdir -p "$(dirname "$1")"; git -c init.defaultBranch=main init -q "$1" ;;
@@ -93,7 +100,7 @@ run_one() {
           elif [ "$1" = --cached ] && [ "$2" = --quiet ]; then git -C "$d" diff --cached --quiet
           fi
           ;;
-        add) shift; git -C "$d" add -- "$@" ;;
+        add) shift; git ${lit:+"$lit"} -C "$d" add -- "$@" ;;
         commit)
           f=''; prev=''
           for a in "$@"; do [ "$prev" = -F ] && f=$a; prev=$a; done
@@ -380,6 +387,37 @@ check 'commit exits 0' '[ "$(rc)" = 0 ]'
 check 'commit really commits the change with the message subject' '[ -z "$(git -C "$T/container/cm1" status --porcelain -- a.ts)" ] && git -C "$T/container/cm1" log -1 --format=%s | grep -qx "$(head -1 "$T/msg")"'
 check 'commit runs scp with -o BatchMode=yes' 'grep -A1 -x -- "-o" "$T/scp.log" | grep -qx "BatchMode=yes"'
 check 'commit uses fixed temp name .lane/agy-round-msg.txt' 'grep -q "\.lane/agy-round-msg\.txt$" "$T/scp.log"'
+
+# Next.js App Router bracket paths ([id]) are allowed and reach git as literal
+# pathspecs so they are never expanded as globs.
+bkpath='apps/web/src/app/projects/[id]/page.tsx'
+rm -f "$T/ssh-decoded.log"
+: > "$T/ssh.log"
+mkcontainer cmb
+mkdir -p "$T/container/cmb/apps/web/src/app/projects/[id]"
+echo 'export const p = 1;' > "$T/container/cmb/apps/web/src/app/projects/[id]/page.tsx"
+git -C "$T/container/cmb" add .
+git -C "$T/container/cmb" -c commit.gpgsign=false commit -q -m init
+echo 'edited' >> "$T/container/cmb/apps/web/src/app/projects/[id]/page.tsx"
+run commit --name cmb --message-file "$T/msg" -- "$bkpath"
+check 'commit accepts a Next.js bracket path and exits 0' '[ "$(rc)" = 0 ]'
+check 'the recorded remote command carries --literal-pathspecs' 'grep -Eq -- "--literal-pathspecs" "$T/ssh.log"'
+check 'the recorded remote command single-quotes the bracket path' 'grep -Fq "'\''$bkpath'\''" "$T/ssh.log"'
+check 'the decoded add argv includes --literal-pathspecs' 'grep -qx -- "--literal-pathspecs" "$T/ssh-decoded.log"'
+check 'the bracket file is committed' 'git -C "$T/container/cmb" ls-tree -r HEAD --name-only | grep -Fq "$bkpath"'
+check 'the bracketed change is fully committed' '[ -z "$(git -C "$T/container/cmb" status --porcelain)" ]'
+run commit --name n --message-file "$T/msg" -- 'a*b.ts'
+check 'commit refusing a path with * is a usage error (2)' '[ "$(rc)" = 2 ]'
+run commit --name n --message-file "$T/msg" -- 'a?b.ts'
+check 'commit refusing a path with ? is a usage error (2)' '[ "$(rc)" = 2 ]'
+run commit --name n --message-file "$T/msg" -- 'a{b.ts'
+check 'commit refusing a path with { is a usage error (2)' '[ "$(rc)" = 2 ]'
+run commit --name n --message-file "$T/msg" -- 'a}b.ts'
+check 'commit refusing a path with } is a usage error (2)' '[ "$(rc)" = 2 ]'
+run commit --name n --message-file "$T/msg" -- 'a\b.ts'
+check 'commit refusing a path with a backslash is a usage error (2)' '[ "$(rc)" = 2 ]'
+run commit --name n --message-file "$T/msg" -- 'a b.ts'
+check 'commit refusing a path with a space is a usage error (2)' '[ "$(rc)" = 2 ]'
 
 echo '# fetch'
 mkcontainer f2

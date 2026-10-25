@@ -8,6 +8,8 @@
 #   agy-round prepare --name <n> --branch <b> --brief <local file> [--from <local git dir>]
 #   agy-round run --name <n> --model <m> --brief <.lane/x.md> [--timeout <45m>] [--log <file>]
 #   agy-round commit --name <n> --message-file <local file> -- <path>...
+#                   (relative paths of letters, digits, the at sign and . _ / + - [ ]; brackets
+#                   admit Next.js dynamic routes and are passed to git literally)
 #   agy-round fetch --name <n> --branch <b> [--into <local git dir>]
 #   agy-round --help
 #
@@ -318,9 +320,14 @@ case "$cmd" in
     while [ "$#" -gt 0 ]; do
       raw_p=$1; shift
       reject_nl "commit path" "$raw_p"
+      # Allowed characters: letters, digits, and . _ / + - [ ] (plus the at
+      # sign), the brackets admitting Next.js App Router dynamic routes like
+      # projects/[id]/page.tsx. git receives these paths later as literal
+      # pathspecs (--literal-pathspecs) so the brackets are never read as glob
+      # metacharacters.
       case "$raw_p" in
         '' | /*) die_usage "invalid path '$raw_p': must be a relative path" ;;
-        *[!A-Za-z0-9._/$at+-]*) die_usage "invalid path '$raw_p': contains forbidden characters" ;;
+        *[!]A-Za-z0-9._/$at+[-]*) die_usage "invalid path '$raw_p': contains forbidden characters" ;;
       esac
       p=$raw_p
       while :; do
@@ -341,7 +348,7 @@ case "$cmd" in
     require_env AGY_ROUND_SSH AGY_ROUND_ROOT
     validate_root
     dir="$AGY_ROUND_ROOT/$name"
-    add_cmd="git -C $(shq "$dir") add --$quoted_paths"
+    add_cmd="git --literal-pathspecs -C $(shq "$dir") add --$quoted_paths"
     msg_base='agy-round-msg.txt'
     validate_filename "message temp name" "$msg_base"
     tmp="$dir/.lane/$msg_base"

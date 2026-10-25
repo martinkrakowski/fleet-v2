@@ -70,18 +70,20 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       return { outcome: 'rejected', reason: 'Work order owned paths must be non-empty strings' };
     }
 
+    // One trimmed id for the profile check, the conflict listing and the save.
+    const projectId = request.projectId.trim();
     if (this.deps.profileRead) {
-      const profile = await this.deps.profileRead.readProjectProfile(request.projectId.trim());
+      const profile = await this.deps.profileRead.readProjectProfile(projectId);
       if (profile === null) {
         return {
           outcome: 'rejected',
-          reason: `project ${request.projectId} has no profile; register the project before creating work orders`,
+          reason: `project ${projectId} has no profile; register the project before creating work orders`,
         };
       }
       if (profile.status === 'retired') {
         return {
           outcome: 'rejected',
-          reason: `project ${request.projectId} is retired; it accepts no new work orders`,
+          reason: `project ${projectId} is retired; it accepts no new work orders`,
         };
       }
     }
@@ -91,7 +93,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       return { outcome: 'rejected', reason: `Work order already registered: ${request.workOrderId}` };
     }
 
-    const existing = await this.deps.workOrderRepo.listWorkOrdersByProject(request.projectId);
+    const existing = await this.deps.workOrderRepo.listWorkOrdersByProject(projectId);
 
     for (const order of existing) {
       if (!isActiveWorkOrder(order.state)) {
@@ -119,7 +121,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     const nowIso = request.nowIso ?? new Date().toISOString();
     const record: WorkOrderRecord = {
       id: request.workOrderId,
-      projectId: request.projectId,
+      projectId,
       taskId: request.taskId,
       laneId: request.laneId,
       repository: request.repository,

@@ -482,9 +482,11 @@ describe('RegisterWorkOrderUseCase', () => {
     const profileRead = new FakeProfileRead(makeProfile());
     const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: makeWorkOrderRepo(), profileRead });
 
-    await useCase.registerWorkOrder(validWorkOrderRequest({ projectId: '  proj-1  ' }));
+    const result = await useCase.registerWorkOrder(validWorkOrderRequest({ projectId: '  proj-1  ' }));
 
     expect(profileRead.calls).toEqual(['proj-1']);
+    // The id that was checked is the id that is stored.
+    expect(result.outcome === 'registered' && result.workOrder.projectId).toBe('proj-1');
   });
 
   it('propagates an error thrown by the profile port and saves nothing', async () => {

@@ -823,9 +823,73 @@ describe('fleet-v2 projects probe and adopt (P6b)', () => {
     expect(adopted.err).toContain('--repository is required');
   });
 
+  it('prints a warning before confirmation and adopts when --repository is not one of the candidate repositories', async () => {
+    const stateDir = makeTempDir();
+    const runtime = makeV2Runtime(stateDir);
+    const workOrderRepo = new WorkOrderRepositoryAdapter({ stateDir });
+    const unguarded = new RegisterWorkOrderUseCase({ workOrderRepo });
+    await unguarded.registerWorkOrder({
+      workOrderId: 'wo-unlisted-repo-1',
+      projectId: 'unlisted-repo',
+      taskId: 'task-1',
+      laneId: 'lane-1',
+      repository: 'https://example.com/r1.git',
+      baseCommit: 'abc123',
+      ownedPaths: ['packages/one'],
+      policyRevision: 'pol-1',
+    });
+    await unguarded.registerWorkOrder({
+      workOrderId: 'wo-unlisted-repo-2',
+      projectId: 'unlisted-repo',
+      taskId: 'task-2',
+      laneId: 'lane-2',
+      repository: 'https://example.com/r2.git',
+      baseCommit: 'abc123',
+      ownedPaths: ['packages/two'],
+      policyRevision: 'pol-1',
+    });
+
+    const { io, stdout, stderr } = mockIo();
+    let outAtConfirm = '';
+    const code = await runCli(
+      [
+        'projects',
+        'adopt',
+        'unlisted-repo',
+        '--repository',
+        'https://example.com/other.git',
+        '--dispatcher-host',
+        'orch',
+        '--policy-revision',
+        'pol-1',
+        '--max-lanes',
+        '2',
+      ],
+      io,
+      runtime,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        confirm: async () => {
+          outAtConfirm = stdout.join('');
+          return true;
+        },
+      },
+    );
+    expect(code).toBe(0);
+    expect(stderr.join('')).toBe('');
+    expect(outAtConfirm).toContain(
+      'warning: https://example.com/other.git is not among the repositories its work orders name (https://example.com/r1.git, https://example.com/r2.git)\n',
+    );
+    expect(stdout.join('')).toContain('registered project unlisted-repo (rev 0)\n');
+  });
+
   it('refuses work-order register for a project without a profile with the guard reason across installation kinds', async () => {
     for (const runtime of [
       makeV2Runtime(makeTempDir()),
+      createFleetCliRuntime({ stateDir: makeTempDir(), installation: { schemaVersion: 1 } }),
       createFleetCliRuntime({ stateDir: makeTempDir() }),
     ]) {
       const { io, stdout } = mockIo();

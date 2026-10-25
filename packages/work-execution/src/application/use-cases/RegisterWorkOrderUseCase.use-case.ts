@@ -83,7 +83,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       if (profile.status !== 'active') {
         return {
           outcome: 'rejected',
-          reason: `project ${projectId} is retired; it accepts no new work orders`,
+          reason: `project ${projectId} is retired; it accepts no new work orders — register the work under a new project id`,
         };
       }
     }

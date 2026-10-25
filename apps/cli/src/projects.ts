@@ -473,11 +473,11 @@ async function projectsProbe(
   return ok ? 0 : 1;
 }
 
-/** The typed registration fields one add invocation parsed. */
-interface AddArgs {
-  readonly projectId: string;
+/** Common registration fields parsed from add/adopt flags. */
+interface RegistrationFieldArgs {
   readonly displayName: string;
-  readonly repository: string;
+  /** Omitted when the candidate's single repository should be used. */
+  readonly repository?: string;
   readonly designatedDispatcherHost: string;
   readonly policyRevision: string;
   readonly maxConcurrentLanes: number;
@@ -487,6 +487,91 @@ interface AddArgs {
   readonly gateProcedures?: readonly string[];
   readonly defaultAllowedPathPrefixes?: readonly string[];
   readonly yes: boolean;
+}
+
+/** The typed registration fields one add invocation parsed. */
+interface AddArgs extends RegistrationFieldArgs {
+  readonly projectId: string;
+  readonly repository: string;
+}
+
+type ParsedRegistrationFields =
+  | { readonly ok: true; readonly fields: RegistrationFieldArgs }
+  | { readonly ok: false; readonly error: string };
+
+function parseRegistrationFieldFlags(
+  flags: Readonly<Record<string, string | true>>,
+  subcommand: 'add' | 'adopt',
+  defaultDisplayName?: string,
+): ParsedRegistrationFields {
+  const displayName =
+    typeof flags['display-name'] === 'string' ? flags['display-name'] : defaultDisplayName;
+  if (displayName === undefined) {
+    return { ok: false, error: `projects ${subcommand} requires --display-name` };
+  }
+  const required: Readonly<Array<readonly [string, string]>> = [
+    ['dispatcher-host', 'designatedDispatcherHost'],
+    ['policy-revision', 'policyRevision'],
+    ['max-lanes', 'maxConcurrentLanes'],
+  ];
+  const values: Record<string, string> = {};
+  for (const [flag, field] of required) {
+    const value = flags[flag];
+    if (typeof value !== 'string') {
+      return { ok: false, error: `projects ${subcommand} requires --${flag}` };
+    }
+    values[field] = value;
+  }
+  const maxLanes = parsePositiveInteger('max-lanes', values['maxConcurrentLanes']);
+  if (maxLanes === null) {
+    return {
+      ok: false,
+      error: `--max-lanes must be a positive integer, not '${values['maxConcurrentLanes']}'`,
+    };
+  }
+  let clones: Readonly<Record<string, ProjectCloneRecord>> | undefined;
+  if (flags.clones !== undefined) {
+    const parsedClones = parseClones(String(flags.clones));
+    if (!parsedClones.ok) {
+      return { ok: false, error: parsedClones.error };
+    }
+    clones = parsedClones.clones;
+  }
+  let capabilities: Readonly<Record<string, boolean | string>> = {};
+  if (flags['runner-capabilities'] !== undefined) {
+    const parsedCapabilities = parseRunnerCapabilities(String(flags['runner-capabilities']));
+    if (!parsedCapabilities.ok) {
+      return { ok: false, error: parsedCapabilities.error };
+    }
+    capabilities = parsedCapabilities.capabilities;
+  }
+  const repository = typeof flags.repository === 'string' ? flags.repository : undefined;
+  const defaultBranch =
+    typeof flags['default-branch'] === 'string' ? flags['default-branch'] : undefined;
+  const gateProcedures =
+    typeof flags['gate-procedures'] === 'string'
+      ? splitList(flags['gate-procedures'])
+      : undefined;
+  const defaultAllowedPathPrefixes =
+    typeof flags['allowed-prefixes'] === 'string'
+      ? splitList(flags['allowed-prefixes'])
+      : undefined;
+  return {
+    ok: true,
+    fields: {
+      displayName,
+      ...(repository !== undefined ? { repository } : {}),
+      designatedDispatcherHost: values.designatedDispatcherHost,
+      policyRevision: values.policyRevision,
+      maxConcurrentLanes: maxLanes,
+      runnerCapabilities: capabilities,
+      ...(defaultBranch !== undefined ? { defaultBranch } : {}),
+      ...(clones !== undefined ? { clones } : {}),
+      ...(gateProcedures !== undefined ? { gateProcedures } : {}),
+      ...(defaultAllowedPathPrefixes !== undefined ? { defaultAllowedPathPrefixes } : {}),
+      yes: flags.yes === true,
+    },
+  };
 }
 
 type ParsedAdd =
@@ -505,67 +590,23 @@ function parseAddArgs(tokens: readonly string[]): ParsedAdd {
   if (unexpected !== null) {
     return { ok: false, error: unexpected };
   }
-  const required: Readonly<Array<readonly [string, string]>> = [
-    ['project-id', 'projectId'],
-    ['display-name', 'displayName'],
-    ['repository', 'repository'],
-    ['dispatcher-host', 'designatedDispatcherHost'],
-    ['policy-revision', 'policyRevision'],
-    ['max-lanes', 'maxConcurrentLanes'],
-  ];
-  const values: Record<string, string> = {};
-  for (const [flag, field] of required) {
-    const value = parsed.flags[flag];
-    if (typeof value !== 'string') {
-      return { ok: false, error: `projects add requires --${flag}` };
-    }
-    values[field] = value;
+  const projectId = parsed.flags['project-id'];
+  if (typeof projectId !== 'string') {
+    return { ok: false, error: 'projects add requires --project-id' };
   }
-  const maxLanes = parsePositiveInteger('max-lanes', values['maxConcurrentLanes']);
-  if (maxLanes === null) {
-    return { ok: false, error: `--max-lanes must be a positive integer, not '${values['maxConcurrentLanes']}'` };
+  const common = parseRegistrationFieldFlags(parsed.flags, 'add');
+  if (!common.ok) {
+    return common;
   }
-  let clones: Readonly<Record<string, ProjectCloneRecord>> | undefined;
-  if (parsed.flags.clones !== undefined) {
-    const parsedClones = parseClones(String(parsed.flags.clones));
-    if (!parsedClones.ok) {
-      return { ok: false, error: parsedClones.error };
-    }
-    clones = parsedClones.clones;
+  if (common.fields.repository === undefined) {
+    return { ok: false, error: 'projects add requires --repository' };
   }
-  let capabilities: Readonly<Record<string, boolean | string>> = {};
-  if (parsed.flags['runner-capabilities'] !== undefined) {
-    const parsedCapabilities = parseRunnerCapabilities(String(parsed.flags['runner-capabilities']));
-    if (!parsedCapabilities.ok) {
-      return { ok: false, error: parsedCapabilities.error };
-    }
-    capabilities = parsedCapabilities.capabilities;
-  }
-  const defaultBranch =
-    typeof parsed.flags['default-branch'] === 'string' ? parsed.flags['default-branch'] : undefined;
-  const gateProcedures =
-    typeof parsed.flags['gate-procedures'] === 'string'
-      ? splitList(parsed.flags['gate-procedures'])
-      : undefined;
-  const defaultAllowedPathPrefixes =
-    typeof parsed.flags['allowed-prefixes'] === 'string'
-      ? splitList(parsed.flags['allowed-prefixes'])
-      : undefined;
   return {
     ok: true,
     args: {
-      projectId: values.projectId,
-      displayName: values.displayName,
-      repository: values.repository,
-      designatedDispatcherHost: values.designatedDispatcherHost,
-      policyRevision: values.policyRevision,
-      maxConcurrentLanes: maxLanes,
-      runnerCapabilities: capabilities,
-      ...(defaultBranch !== undefined ? { defaultBranch } : {}),
-      ...(clones !== undefined ? { clones } : {}),
-      ...(gateProcedures !== undefined ? { gateProcedures } : {}),
-      ...(defaultAllowedPathPrefixes !== undefined ? { defaultAllowedPathPrefixes } : {}),
-      yes: parsed.flags.yes === true,
+      ...common.fields,
+      projectId,
+      repository: common.fields.repository,
     },
   };
 }
@@ -655,20 +696,8 @@ async function projectsAdd(
 }
 
 /** The typed registration fields one adopt invocation parsed. */
-interface AdoptArgs {
+interface AdoptArgs extends RegistrationFieldArgs {
   readonly projectId: string;
-  readonly displayName: string;
-  /** Omitted when the candidate's single repository should be used. */
-  readonly repository?: string;
-  readonly designatedDispatcherHost: string;
-  readonly policyRevision: string;
-  readonly maxConcurrentLanes: number;
-  readonly runnerCapabilities: Readonly<Record<string, boolean | string>>;
-  readonly defaultBranch?: string;
-  readonly clones?: Readonly<Record<string, ProjectCloneRecord>>;
-  readonly gateProcedures?: readonly string[];
-  readonly defaultAllowedPathPrefixes?: readonly string[];
-  readonly yes: boolean;
 }
 
 type ParsedAdopt =
@@ -691,66 +720,15 @@ function parseAdoptArgs(tokens: readonly string[]): ParsedAdopt {
   if (projectId === null) {
     return { ok: false, error: 'projects adopt requires a project id' };
   }
-  const required: Readonly<Array<readonly [string, string]>> = [
-    ['dispatcher-host', 'designatedDispatcherHost'],
-    ['policy-revision', 'policyRevision'],
-    ['max-lanes', 'maxConcurrentLanes'],
-  ];
-  const values: Record<string, string> = {};
-  for (const [flag, field] of required) {
-    const value = parsed.flags[flag];
-    if (typeof value !== 'string') {
-      return { ok: false, error: `projects adopt requires --${flag}` };
-    }
-    values[field] = value;
+  const common = parseRegistrationFieldFlags(parsed.flags, 'adopt', projectId);
+  if (!common.ok) {
+    return common;
   }
-  const maxLanes = parsePositiveInteger('max-lanes', values['maxConcurrentLanes']);
-  if (maxLanes === null) {
-    return { ok: false, error: `--max-lanes must be a positive integer, not '${values['maxConcurrentLanes']}'` };
-  }
-  let clones: Readonly<Record<string, ProjectCloneRecord>> | undefined;
-  if (parsed.flags.clones !== undefined) {
-    const parsedClones = parseClones(String(parsed.flags.clones));
-    if (!parsedClones.ok) {
-      return { ok: false, error: parsedClones.error };
-    }
-    clones = parsedClones.clones;
-  }
-  let capabilities: Readonly<Record<string, boolean | string>> = {};
-  if (parsed.flags['runner-capabilities'] !== undefined) {
-    const parsedCapabilities = parseRunnerCapabilities(String(parsed.flags['runner-capabilities']));
-    if (!parsedCapabilities.ok) {
-      return { ok: false, error: parsedCapabilities.error };
-    }
-    capabilities = parsedCapabilities.capabilities;
-  }
-  const defaultBranch =
-    typeof parsed.flags['default-branch'] === 'string' ? parsed.flags['default-branch'] : undefined;
-  const gateProcedures =
-    typeof parsed.flags['gate-procedures'] === 'string'
-      ? splitList(parsed.flags['gate-procedures'])
-      : undefined;
-  const defaultAllowedPathPrefixes =
-    typeof parsed.flags['allowed-prefixes'] === 'string'
-      ? splitList(parsed.flags['allowed-prefixes'])
-      : undefined;
-  const repository = typeof parsed.flags.repository === 'string' ? parsed.flags.repository : undefined;
   return {
     ok: true,
     args: {
+      ...common.fields,
       projectId,
-      displayName:
-        typeof parsed.flags['display-name'] === 'string' ? parsed.flags['display-name'] : projectId,
-      ...(repository !== undefined ? { repository } : {}),
-      designatedDispatcherHost: values.designatedDispatcherHost,
-      policyRevision: values.policyRevision,
-      maxConcurrentLanes: maxLanes,
-      runnerCapabilities: capabilities,
-      ...(defaultBranch !== undefined ? { defaultBranch } : {}),
-      ...(clones !== undefined ? { clones } : {}),
-      ...(gateProcedures !== undefined ? { gateProcedures } : {}),
-      ...(defaultAllowedPathPrefixes !== undefined ? { defaultAllowedPathPrefixes } : {}),
-      yes: parsed.flags.yes === true,
     },
   };
 }
@@ -817,6 +795,11 @@ async function projectsAdopt(
     repository,
   };
   printRegisterCandidate(io, fullArgs, 'adopt');
+  if (!candidate.repositories.includes(repository)) {
+    io.stdout(
+      `warning: ${repository} is not among the repositories its work orders name (${candidate.repositories.join(', ')})\n`,
+    );
+  }
   if (!fullArgs.yes) {
     const confirm = options.confirm ?? confirmFromStdin(io);
     if (!(await confirm(`adopt project ${fullArgs.projectId}? [y/N]`))) {

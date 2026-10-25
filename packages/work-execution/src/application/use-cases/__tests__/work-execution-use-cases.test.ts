@@ -459,7 +459,8 @@ describe('RegisterWorkOrderUseCase', () => {
 
     expect(result).toEqual({
       outcome: 'rejected',
-      reason: 'project proj-1 is retired; it accepts no new work orders',
+      reason:
+        'project proj-1 is retired; it accepts no new work orders — register the work under a new project id',
     });
     expect(repo.orders.size).toBe(0);
     expect(profileRead.calls).toEqual(['proj-1']);

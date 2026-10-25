@@ -183,6 +183,7 @@ export interface QuarantineFs {
     options?: { recursive?: boolean; mode?: number },
   ): Promise<unknown>;
   chmod(targetPath: string, mode: number): Promise<void>;
+  readFile(targetPath: string): Promise<Uint8Array>;
   writeFile(
     targetPath: string,
     data: Uint8Array,
@@ -316,7 +317,8 @@ async function pruneQuarantineCopies(
  * reader held into a
  * `<dirname>/quarantine/<basename>.<UTC stamp>-<n>.<first 12 hex of sha256>`
  * file (directory mode 0o700, copy mode 0o600, never overwriting an existing
- * copy, keeping the 5 newest copies per basename), then throw
+ * copy, reusing a pre-existing copy only when its contents equal `bytes`, and
+ * keeping the 5 newest copies per basename), then throw
  * `StateFileUnreadableError`. Only a failed write of the copy yields
  * `quarantinePath: null`; a later `chmod` or prune failure still reports the
  * written `quarantinePath`.
@@ -335,9 +337,20 @@ export async function quarantineUnreadable(
   );
   try {
     const entries = await fsImpl.readdir(quarantineDir);
-    const existing = entries.find((name) => existingPattern.test(name));
-    if (existing !== undefined) {
-      throw new StateFileUnreadableError(filePath, path.join(quarantineDir, existing), detail);
+    for (const name of entries) {
+      if (!existingPattern.test(name)) {
+        continue;
+      }
+      const existingPath = path.join(quarantineDir, name);
+      let read: Uint8Array;
+      try {
+        read = await fsImpl.readFile(existingPath);
+      } catch {
+        continue;
+      }
+      if (Buffer.from(read).equals(bytes)) {
+        throw new StateFileUnreadableError(filePath, existingPath, detail);
+      }
     }
   } catch (error: unknown) {
     if (error instanceof StateFileUnreadableError) {

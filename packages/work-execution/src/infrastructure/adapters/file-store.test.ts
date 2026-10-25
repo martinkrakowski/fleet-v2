@@ -234,6 +234,7 @@ describe('quarantineUnreadable', () => {
     const failingFs: QuarantineFs = {
       mkdir: fs.mkdir,
       chmod: fs.chmod,
+      readFile: fs.readFile,
       writeFile: async () => {
         throw new Error('ENOSPC: no space left on device');
       },
@@ -263,6 +264,7 @@ describe('quarantineUnreadable', () => {
       chmod: async () => {
         throw new Error('EPERM: operation not permitted');
       },
+      readFile: fs.readFile,
       writeFile: fs.writeFile,
       readdir: fs.readdir,
       rm: fs.rm,
@@ -338,6 +340,7 @@ describe('quarantineUnreadable', () => {
         return await fs.mkdir(dirPath, options);
       },
       chmod: fs.chmod,
+      readFile: fs.readFile,
       writeFile: fs.writeFile,
       readdir: fs.readdir,
       rm: fs.rm,
@@ -408,6 +411,7 @@ describe('quarantineUnreadable', () => {
     const partialRmFs: QuarantineFs = {
       mkdir: fs.mkdir,
       chmod: fs.chmod,
+      readFile: fs.readFile,
       writeFile: fs.writeFile,
       readdir: fs.readdir,
       rm: async (targetPath, options) => {
@@ -442,6 +446,7 @@ describe('quarantineUnreadable', () => {
     const collidingFs: QuarantineFs = {
       mkdir: fs.mkdir,
       chmod: fs.chmod,
+      readFile: fs.readFile,
       writeFile: async (targetPath, data, options) => {
         writeAttempts += 1;
         if (writeAttempts === 1) {
@@ -526,5 +531,124 @@ describe('quarantineUnreadable', () => {
     expect(copies).toHaveLength(2);
     expect(sha256Of(await fs.readFile(error1!.quarantinePath!))).toBe(sha256Of(bytes1));
     expect(sha256Of(await fs.readFile(error2!.quarantinePath!))).toBe(sha256Of(bytes2));
+  });
+
+  it('does not reuse a matching-name entry with truncated contents, writes a new copy equal to bytes, and leaves the truncated file unchanged', async () => {
+    const filePath = path.join(tempDir, 'attempts.json');
+    const quarantineDir = path.join(tempDir, 'quarantine');
+    await fs.mkdir(quarantineDir, { recursive: true, mode: 0o700 });
+
+    const bytes = Buffer.from('{ corrupt payload whose earlier write failed midway\n', 'utf8');
+    const digest = sha256Of(bytes).slice(0, 12);
+    const truncatedName = `attempts.json.20261025T010000.000Z-0.${digest}`;
+    const truncatedPath = path.join(quarantineDir, truncatedName);
+    const truncatedBytes = bytes.subarray(0, 8);
+    await fs.writeFile(truncatedPath, truncatedBytes);
+
+    let caught: unknown;
+    try {
+      await quarantineUnreadable(filePath, 'not valid JSON', bytes);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(StateFileUnreadableError);
+    const error = caught as StateFileUnreadableError;
+    expect(error.quarantinePath).not.toBeNull();
+    expect(error.quarantinePath).not.toBe(truncatedPath);
+    expect(Buffer.from(await fs.readFile(error.quarantinePath!)).equals(bytes)).toBe(true);
+    expect(Buffer.from(await fs.readFile(truncatedPath)).equals(truncatedBytes)).toBe(true);
+
+    const copies = await fs.readdir(quarantineDir);
+    expect(copies).toContain(truncatedName);
+    expect(copies).toContain(path.basename(error.quarantinePath!));
+  });
+
+  it('skips a matching-name entry whose readFile throws without reusing or deleting it', async () => {
+    const filePath = path.join(tempDir, 'attempts.json');
+    const quarantineDir = path.join(tempDir, 'quarantine');
+    await fs.mkdir(quarantineDir, { recursive: true, mode: 0o700 });
+
+    const bytes = Buffer.from('{ corrupt payload with unreadable existing candidate\n', 'utf8');
+    const digest = sha256Of(bytes).slice(0, 12);
+    const unreadableName = `attempts.json.20261025T010000.000Z-0.${digest}`;
+    const unreadablePath = path.join(quarantineDir, unreadableName);
+    await fs.writeFile(unreadablePath, bytes);
+
+    const removedPaths: string[] = [];
+    const readFailingFs: QuarantineFs = {
+      mkdir: fs.mkdir,
+      chmod: fs.chmod,
+      readFile: async (targetPath) => {
+        if (targetPath === unreadablePath) {
+          throw new Error('EACCES: permission denied');
+        }
+        return await fs.readFile(targetPath);
+      },
+      writeFile: fs.writeFile,
+      readdir: fs.readdir,
+      rm: async (targetPath, options) => {
+        removedPaths.push(targetPath);
+        await fs.rm(targetPath, options);
+      },
+    };
+
+    let caught: unknown;
+    try {
+      await quarantineUnreadable(filePath, 'not valid JSON', bytes, readFailingFs);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(StateFileUnreadableError);
+    const error = caught as StateFileUnreadableError;
+    expect(error.quarantinePath).not.toBeNull();
+    expect(error.quarantinePath).not.toBe(unreadablePath);
+    expect(removedPaths).not.toContain(unreadablePath);
+    expect(Buffer.from(await fs.readFile(error.quarantinePath!)).equals(bytes)).toBe(true);
+    expect(Buffer.from(await fs.readFile(unreadablePath)).equals(bytes)).toBe(true);
+  });
+
+  it('reuses a matching-name entry with equal contents without writing a new file, even after an earlier matching-name entry failed verification', async () => {
+    const filePath = path.join(tempDir, 'attempts.json');
+    const quarantineDir = path.join(tempDir, 'quarantine');
+    await fs.mkdir(quarantineDir, { recursive: true, mode: 0o700 });
+
+    const bytes = Buffer.from('{ corrupt payload already quarantined intact\n', 'utf8');
+    const digest = sha256Of(bytes).slice(0, 12);
+    const truncatedName = `attempts.json.20261025T010000.000Z-0.${digest}`;
+    const truncatedPath = path.join(quarantineDir, truncatedName);
+    await fs.writeFile(truncatedPath, bytes.subarray(0, 5));
+
+    const validName = `attempts.json.20261025T010001.000Z-1.${digest}`;
+    const validPath = path.join(quarantineDir, validName);
+    await fs.writeFile(validPath, bytes);
+
+    let writeCalled = false;
+    const trackingFs: QuarantineFs = {
+      mkdir: fs.mkdir,
+      chmod: fs.chmod,
+      readFile: fs.readFile,
+      writeFile: async (targetPath, data, options) => {
+        writeCalled = true;
+        await fs.writeFile(targetPath, data, options);
+      },
+      readdir: async () => [truncatedName, validName],
+      rm: fs.rm,
+    };
+
+    let caught: unknown;
+    try {
+      await quarantineUnreadable(filePath, 'not valid JSON', bytes, trackingFs);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(StateFileUnreadableError);
+    const error = caught as StateFileUnreadableError;
+    expect(error.quarantinePath).toBe(validPath);
+    expect(writeCalled).toBe(false);
+    const copies = (await fs.readdir(quarantineDir)).sort();
+    expect(copies).toEqual([truncatedName, validName]);
   });
 });

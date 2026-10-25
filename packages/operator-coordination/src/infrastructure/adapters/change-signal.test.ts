@@ -124,7 +124,7 @@ describe('change signals: OwnerQuestionRepositoryAdapter', () => {
       stateDir: tempDir,
       changeSignal: new ThrowingChangeSignalPort(),
     });
-    await expect(adapter.save(makeOwnerQuestion(), 0)).resolves.not.toThrow();
+    await expect(adapter.save(makeOwnerQuestion(), 0)).resolves.toBeUndefined();
     const onDisk = JSON.parse(
       await fs.readFile(path.join(tempDir, 'owner-questions.json'), 'utf8'),
     ) as unknown[];

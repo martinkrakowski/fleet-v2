@@ -135,7 +135,7 @@ describe('change signals: AttemptRepositoryAdapter', () => {
       stateDir: tempDir,
       changeSignal: new ThrowingChangeSignalPort(),
     });
-    await expect(adapter.saveAttempt(makeAttempt())).resolves.not.toThrow();
+    await expect(adapter.saveAttempt(makeAttempt())).resolves.toBeUndefined();
     expect(await adapter.findAttemptById('att-1')).not.toBeNull();
     expect(adapter.signalEmitFailures).toBe(1);
     const onDisk = JSON.parse(await fs.readFile(path.join(tempDir, 'attempts.json'), 'utf8')) as unknown[];
@@ -379,6 +379,8 @@ describe('change signals: ExecutionJournalAdapter releaseCapacityReservation', (
       record: makeReservation({ id: 'res-a', attemptId: 'att-a' }),
     });
     expect(reserveResult.outcome).toBe('reserved');
+    const reserveWritten = signals.signals[0]!.written;
+    expect(reserveWritten).not.toBeNull();
     signals.clear();
 
     const released = await adapter.releaseCapacityReservation('att-a', '2026-10-15T11:00:00.000Z');
@@ -389,6 +391,9 @@ describe('change signals: ExecutionJournalAdapter releaseCapacityReservation', (
     expect(signal.id).toBe('res-a');
     expect(signal.stateFile).toBe(target);
     expect(signal.written?.size).toBe((await fs.stat(target)).size);
+    expect(signal.before).not.toBeNull();
+    expect(signal.before?.ino).toBe(reserveWritten?.ino);
+    expect(signal.before?.size).toBe(reserveWritten?.size);
   });
 
   it('releaseCapacityReservation emits nothing when the read throws on an unreadable file', async () => {

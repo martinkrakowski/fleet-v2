@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { loadProject, loadProjects } from "./live";
 import { sampleProjects } from "./fixture";
@@ -264,22 +265,27 @@ describe("loadProject", () => {
     expect(data.project?.projectId).toBe("fleet-v2");
   });
 
-  it("falls back to the fixture with the first sample when the id is unknown to it", async () => {
+  it("returns project null on fixture-fallback when the id is not in the sample set", async () => {
+    const fallbackReason =
+      "api boundary returned 501 NOT_IMPLEMENTED for /v1/projects/ghost";
     const data = await loadProject(
       "ghost",
       fakeClient({
         view: {
           source: "fixture-fallback",
           status: 501,
-          fallbackReason: "api boundary returned 501 NOT_IMPLEMENTED for /v1/projects/ghost",
+          fallbackReason,
         },
       }),
       now,
     );
 
-    expect(data.source).toBe("fixture-fallback");
-    expect(data.fallbackReason).toContain("NOT_IMPLEMENTED");
-    expect(data.project?.projectId).toBe(sampleProjects[0].projectId);
+    expect(data).toEqual({
+      source: "fixture-fallback",
+      fallbackReason,
+      observedAtIso: "2026-10-24T12:00:00.000Z",
+      project: null,
+    });
   });
 
   it("falls back to the fixture when the API shape is unexpected", async () => {
@@ -299,5 +305,54 @@ describe("loadProject", () => {
       "api boundary returned an unexpected project shape",
     );
     expect(data.project?.projectId).toBe("fleet-v2");
+  });
+});
+
+describe("projects client source text", () => {
+  const listSource = readFileSync(
+    new URL("./projects-client.tsx", import.meta.url),
+    "utf8",
+  );
+  const detailSource = readFileSync(
+    new URL("./[id]/project-detail-client.tsx", import.meta.url),
+    "utf8",
+  );
+
+  it("pins both data.source header branches in projects-client.tsx", () => {
+    const headerStart = listSource.indexOf("<PageHeader");
+    const actionsStart = listSource.indexOf("actions={", headerStart);
+    const descriptionBlock = listSource.slice(headerStart, actionsStart);
+
+    expect(descriptionBlock).toContain('data.source === "api" ?');
+    const [apiBranch, fallbackBranch] =
+      descriptionBlock.split('data.source === "api" ?')[1]?.split(") : (") ?? [];
+
+    expect(apiBranch).toContain("One row per registered project profile.");
+    expect(apiBranch).toContain("the table is a recorded read of");
+    expect(fallbackBranch).toContain("The rows are sample data, not a live read of");
+    expect(fallbackBranch).not.toContain("the table is a recorded read of");
+  });
+
+  it("pins both data.source header branches and the missing-sample branch in project-detail-client.tsx", () => {
+    expect(detailSource).toContain(
+      "not in the sample data (the API is not answering: {reason})",
+    );
+    expect(detailSource).toContain(
+      "not in the sample data (the API is not answering: ${reason})",
+    );
+
+    const profileHeaderStart = detailSource.indexOf("title={project.displayName}");
+    const actionsStart = detailSource.indexOf("actions={", profileHeaderStart);
+    const descriptionBlock = detailSource.slice(profileHeaderStart, actionsStart);
+
+    expect(descriptionBlock).toContain('data.source === "api" ?');
+    const [apiBranch, fallbackBranch] =
+      descriptionBlock.split('data.source === "api" ?')[1]?.split(") : (") ?? [];
+
+    expect(apiBranch).toContain("The recorded profile for");
+    expect(apiBranch).toContain("read live from");
+    expect(fallbackBranch).toContain("the rows are sample data");
+    expect(fallbackBranch).toContain("not a live read of");
+    expect(fallbackBranch).not.toContain("read live from");
   });
 });

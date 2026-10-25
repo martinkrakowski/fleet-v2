@@ -39,11 +39,20 @@ export function ProjectsClient({ data }: { data: ProjectsData }) {
       <PageHeader
         title="Projects"
         description={
-          <>
-            One row per registered project profile. The status filter is view
-            state only; the table is a recorded read of <b>GET /v1/projects</b>,
-            never a live runner observation. Retired profiles stay listed.
-          </>
+          data.source === "api" ? (
+            <>
+              One row per registered project profile. The status filter is view
+              state only; the table is a recorded read of{" "}
+              <b>GET /v1/projects</b>, never a live runner observation. Retired
+              profiles stay listed.
+            </>
+          ) : (
+            <>
+              The rows are sample data, not a live read of{" "}
+              <b>GET /v1/projects</b>. The status filter is view state only.
+              Retired profiles stay listed.
+            </>
+          )
         }
         actions={
           data.source === "api" ? (

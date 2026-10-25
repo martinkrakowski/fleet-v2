@@ -49,7 +49,7 @@ function fixtureProjectData(
   projectId: string,
 ): ProjectDetailData {
   const project =
-    sampleProjects.find((p) => p.projectId === projectId) ?? sampleProjects[0];
+    sampleProjects.find((p) => p.projectId === projectId) ?? null;
   return {
     source: "fixture-fallback",
     fallbackReason: reason,

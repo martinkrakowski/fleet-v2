@@ -112,7 +112,7 @@ function isValidBranchName(value: unknown): value is string {
 }
 
 function parseDefaultBranch(value: unknown): string | null | undefined {
-  if (value === undefined || value === null) {
+  if (value === null) {
     return null;
   }
   return isValidBranchName(value) ? value : undefined;
@@ -121,12 +121,11 @@ function parseDefaultBranch(value: unknown): string | null | undefined {
 function parseClones(
   value: unknown,
 ): Readonly<Record<string, ProjectClone>> | undefined {
-  const source = value ?? {};
-  if (!isRecord(source)) {
+  if (!isRecord(value)) {
     return undefined;
   }
   const copy: Record<string, ProjectClone> = {};
-  for (const [key, clone] of Object.entries(source)) {
+  for (const [key, clone] of Object.entries(value)) {
     if (!isValidHostName(key)) {
       return undefined;
     }
@@ -152,13 +151,12 @@ function parseClones(
 }
 
 function parseNonEmptyUniqueStrings(value: unknown): readonly string[] | undefined {
-  const names = value ?? [];
-  if (!Array.isArray(names)) {
+  if (!Array.isArray(value)) {
     return undefined;
   }
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const name of names) {
+  for (const name of value) {
     if (!isNonEmptyString(name)) {
       return undefined;
     }
@@ -172,12 +170,11 @@ function parseNonEmptyUniqueStrings(value: unknown): readonly string[] | undefin
 }
 
 function parseAllowedPathPrefixes(value: unknown): readonly string[] | undefined {
-  const prefixes = value ?? [];
-  if (!Array.isArray(prefixes)) {
+  if (!Array.isArray(value)) {
     return undefined;
   }
   const out: string[] = [];
-  for (const prefix of prefixes) {
+  for (const prefix of value) {
     if (
       !isNonEmptyString(prefix) ||
       prefix.startsWith("/") ||
@@ -215,7 +212,7 @@ function parseCapabilities(
 }
 
 function parseLastProbe(value: unknown): ProjectLastProbe | null | undefined {
-  if (value === undefined || value === null) {
+  if (value === null) {
     return null;
   }
   if (!isRecord(value)) {
@@ -290,11 +287,10 @@ function parseProject(value: unknown): ProjectView | null {
     return null;
   }
 
-  const rawStatus = value.status ?? "active";
-  if (rawStatus !== "active" && rawStatus !== "retired") {
+  const status = value.status;
+  if (status !== "active" && status !== "retired") {
     return null;
   }
-  const status: ProjectStatus = rawStatus;
 
   const defaultBranch = parseDefaultBranch(value.defaultBranch);
   if (defaultBranch === undefined) {

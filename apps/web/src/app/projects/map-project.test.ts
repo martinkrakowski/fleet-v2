@@ -121,6 +121,61 @@ describe("parseProjectListEnvelope", () => {
   it("returns null when a prompt is not a record", () => {
     expect(parseProjectListEnvelope(listEnvelope([42]))).toBeNull();
   });
+
+  it("returns null when status is missing", () => {
+    const missingStatus = projectWire();
+    delete missingStatus.status;
+    expect(parseProjectListEnvelope(listEnvelope([missingStatus]))).toBeNull();
+    expect(
+      parseProjectListEnvelope(listEnvelope([projectWire({ status: undefined })])),
+    ).toBeNull();
+  });
+
+  it("returns null when clones is missing", () => {
+    const missingClones = projectWire();
+    delete missingClones.clones;
+    expect(parseProjectListEnvelope(listEnvelope([missingClones]))).toBeNull();
+    expect(
+      parseProjectListEnvelope(listEnvelope([projectWire({ clones: undefined })])),
+    ).toBeNull();
+  });
+
+  it("returns null when lastProbe is missing, while null remains valid", () => {
+    const missingProbe = projectWire();
+    delete missingProbe.lastProbe;
+    expect(parseProjectListEnvelope(listEnvelope([missingProbe]))).toBeNull();
+    expect(
+      parseProjectListEnvelope(listEnvelope([projectWire({ lastProbe: undefined })])),
+    ).toBeNull();
+    expect(
+      parseProjectListEnvelope(listEnvelope([projectWire({ lastProbe: null })])),
+    )?.toHaveLength(1);
+  });
+
+  it("returns null when revision is negative (-1)", () => {
+    expect(
+      parseProjectListEnvelope(listEnvelope([projectWire({ revision: -1 })])),
+    ).toBeNull();
+    expect(
+      parseProjectListEnvelope(listEnvelope([projectWire({ revision: 0 })])),
+    )?.toHaveLength(1);
+  });
+
+  it("returns null when required arrays, defaultBranch or updatedAtIso are missing", () => {
+    for (const field of [
+      "gateProcedures",
+      "defaultAllowedPathPrefixes",
+      "defaultBranch",
+      "updatedAtIso",
+    ]) {
+      const wire = projectWire();
+      delete wire[field];
+      expect(parseProjectListEnvelope(listEnvelope([wire]))).toBeNull();
+    }
+    expect(
+      parseProjectListEnvelope(listEnvelope([projectWire({ defaultBranch: null })])),
+    )?.toHaveLength(1);
+  });
 });
 
 describe("parseProjectEnvelope", () => {

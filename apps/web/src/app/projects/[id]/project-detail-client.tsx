@@ -56,7 +56,33 @@ export function ProjectDetailClient({
 
   const project = data.project;
   if (project === null) {
-    return null;
+    const reason =
+      data.fallbackReason ?? "the api client gave no fallback reason";
+    return (
+      <div className={styles.page} data-contained-scroll>
+        <PageHeader
+          title="Project not in sample data"
+          description={
+            <>
+              <b>{projectId}</b> is not in the sample data (the API is not answering: {reason}). See the sample profiles on{" "}
+              <Link href="/projects">/projects</Link>.
+            </>
+          }
+          actions={
+            <RouteChip variant="gap">fixture · {reason}</RouteChip>
+          }
+        />
+        <Banner
+          tone="warn"
+          title={`${projectId} is not in the sample data (the API is not answering: ${reason}).`}
+        >
+          <p>
+            Whether <b>{projectId}</b> is registered on this station cannot be
+            read while the API is not answering ({reason}).
+          </p>
+        </Banner>
+      </div>
+    );
   }
 
   const worst = worstProbeResult(project.lastProbe);
@@ -67,10 +93,17 @@ export function ProjectDetailClient({
         pretitle={<span className={styles.meta}>{project.projectId}</span>}
         title={project.displayName}
         description={
-          <>
-            The recorded profile for <b>{project.projectId}</b>, read live from{" "}
-            <b>GET /v1/projects/{projectId}</b>. Nothing here writes.
-          </>
+          data.source === "api" ? (
+            <>
+              The recorded profile for <b>{project.projectId}</b>, read live from{" "}
+              <b>GET /v1/projects/{projectId}</b>. Nothing here writes.
+            </>
+          ) : (
+            <>
+              Sample profile for <b>{project.projectId}</b> — the rows are sample data,
+              not a live read of <b>GET /v1/projects/{projectId}</b>. Nothing here writes.
+            </>
+          )
         }
         actions={
           <>

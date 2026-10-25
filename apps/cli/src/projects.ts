@@ -570,9 +570,13 @@ function parseAddArgs(tokens: readonly string[]): ParsedAdd {
   };
 }
 
-/** Print the registration candidate: `register project <id>` then each field. */
-function printRegisterCandidate(io: CliIo, args: AddArgs): void {
-  io.stdout(`register project ${args.projectId}\n`);
+/** Print the registration candidate: `<verb> project <id>` then each field. */
+function printRegisterCandidate(
+  io: CliIo,
+  args: AddArgs,
+  verb: 'register' | 'adopt' = 'register',
+): void {
+  io.stdout(`${verb} project ${args.projectId}\n`);
   io.stdout(`  displayName: ${args.displayName}\n`);
   io.stdout(`  repository: ${args.repository}\n`);
   io.stdout(`  designatedDispatcherHost: ${args.designatedDispatcherHost}\n`);
@@ -595,30 +599,11 @@ function printRegisterCandidate(io: CliIo, args: AddArgs): void {
   }
 }
 
-async function projectsAdd(
-  tokens: readonly string[],
+async function registerConfirmedCandidate(
   io: CliIo,
   runtime: FleetCliRuntime,
-  options: ProjectsCliOptions,
+  args: AddArgs,
 ): Promise<number> {
-  const parsed = parseAddArgs(tokens);
-  if (!parsed.ok) {
-    if (parsed.error !== '') {
-      io.stderr(`${parsed.error}\n`);
-      return 2;
-    }
-    io.stdout(`${PROJECTS_HELP}\n`);
-    return 0;
-  }
-  const args = parsed.args;
-  printRegisterCandidate(io, args);
-  if (!args.yes) {
-    const confirm = options.confirm ?? confirmFromStdin(io);
-    if (!(await confirm(`register project ${args.projectId}? [y/N]`))) {
-      io.stdout('nothing changed\n');
-      return 1;
-    }
-  }
   const result = await runtime.coordination.registerProjectProfile.registerProjectProfile({
     projectId: args.projectId,
     displayName: args.displayName,
@@ -640,6 +625,33 @@ async function projectsAdd(
   }
   io.stdout(`registered project ${args.projectId} (rev 0)\n`);
   return 0;
+}
+
+async function projectsAdd(
+  tokens: readonly string[],
+  io: CliIo,
+  runtime: FleetCliRuntime,
+  options: ProjectsCliOptions,
+): Promise<number> {
+  const parsed = parseAddArgs(tokens);
+  if (!parsed.ok) {
+    if (parsed.error !== '') {
+      io.stderr(`${parsed.error}\n`);
+      return 2;
+    }
+    io.stdout(`${PROJECTS_HELP}\n`);
+    return 0;
+  }
+  const args = parsed.args;
+  printRegisterCandidate(io, args, 'register');
+  if (!args.yes) {
+    const confirm = options.confirm ?? confirmFromStdin(io);
+    if (!(await confirm(`register project ${args.projectId}? [y/N]`))) {
+      io.stdout('nothing changed\n');
+      return 1;
+    }
+  }
+  return registerConfirmedCandidate(io, runtime, args);
 }
 
 /** The typed registration fields one adopt invocation parsed. */
@@ -782,6 +794,8 @@ async function projectsAdopt(
     });
     if (inspected.outcome === 'found') {
       io.stderr(`project ${args.projectId} is already registered\n`);
+    } else if (inspected.outcome === 'rejected') {
+      io.stderr(`${inspected.reason}\n`);
     } else {
       io.stderr(`project ${args.projectId} has no work orders to adopt\n`);
     }
@@ -798,55 +812,19 @@ async function projectsAdopt(
       return 1;
     }
   }
-  io.stdout(`adopt project ${args.projectId}\n`);
-  io.stdout(`  displayName: ${args.displayName}\n`);
-  io.stdout(`  repository: ${repository}\n`);
-  io.stdout(`  designatedDispatcherHost: ${args.designatedDispatcherHost}\n`);
-  io.stdout(`  policyRevision: ${args.policyRevision}\n`);
-  io.stdout(`  maxConcurrentLanes: ${args.maxConcurrentLanes}\n`);
-  io.stdout(`  runnerCapabilities: ${renderFieldValue('runnerCapabilities', args.runnerCapabilities)}\n`);
-  if (args.defaultBranch !== undefined) {
-    io.stdout(`  defaultBranch: ${args.defaultBranch}\n`);
-  }
-  if (args.clones !== undefined) {
-    for (const [host, clone] of Object.entries(args.clones)) {
-      io.stdout(`  clone ${host}: ${clone.path} (worktrees ${clone.worktreeRoot})\n`);
-    }
-  }
-  if (args.gateProcedures !== undefined) {
-    io.stdout(`  gateProcedures: ${args.gateProcedures.join(', ')}\n`);
-  }
-  if (args.defaultAllowedPathPrefixes !== undefined) {
-    io.stdout(`  defaultAllowedPathPrefixes: ${args.defaultAllowedPathPrefixes.join(', ')}\n`);
-  }
-  if (!args.yes) {
+  const fullArgs: AddArgs = {
+    ...args,
+    repository,
+  };
+  printRegisterCandidate(io, fullArgs, 'adopt');
+  if (!fullArgs.yes) {
     const confirm = options.confirm ?? confirmFromStdin(io);
-    if (!(await confirm(`adopt project ${args.projectId}? [y/N]`))) {
+    if (!(await confirm(`adopt project ${fullArgs.projectId}? [y/N]`))) {
       io.stdout('nothing changed\n');
       return 1;
     }
   }
-  const result = await runtime.coordination.registerProjectProfile.registerProjectProfile({
-    projectId: args.projectId,
-    displayName: args.displayName,
-    repository,
-    designatedDispatcherHost: args.designatedDispatcherHost,
-    policyRevision: args.policyRevision,
-    maxConcurrentLanes: args.maxConcurrentLanes,
-    runnerCapabilities: args.runnerCapabilities,
-    ...(args.defaultBranch !== undefined ? { defaultBranch: args.defaultBranch } : {}),
-    ...(args.clones !== undefined ? { clones: args.clones } : {}),
-    ...(args.gateProcedures !== undefined ? { gateProcedures: args.gateProcedures } : {}),
-    ...(args.defaultAllowedPathPrefixes !== undefined
-      ? { defaultAllowedPathPrefixes: args.defaultAllowedPathPrefixes }
-      : {}),
-  });
-  if (result.outcome === 'rejected') {
-    io.stderr(`${result.reason}\n`);
-    return 1;
-  }
-  io.stdout(`adopted project ${args.projectId} (rev 0)\n`);
-  return 0;
+  return registerConfirmedCandidate(io, runtime, fullArgs);
 }
 
 /** The one field map an edit invocation parsed, keyed by record field name. */

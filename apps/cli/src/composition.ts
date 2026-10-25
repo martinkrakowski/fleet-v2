@@ -764,7 +764,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     if (options?.installation?.schemaVersion !== 2) {
       return { ok: false, reason: 'no v2 installation names lane hosts' };
     }
-    const hostSpec = options.installation.hosts?.[name];
+    const hosts = options.installation.hosts;
+    const hostSpec = hosts !== undefined && Object.hasOwn(hosts, name) ? hosts[name] : undefined;
     if (hostSpec === undefined) {
       return { ok: false, reason: `host ${name} is not in the installation` };
     }

@@ -73,9 +73,10 @@ run_one() {
     git)
       shift
       d=''
+      lit=''
       while [ "$#" -gt 0 ]; do
         case "$1" in
-          --literal-pathspecs) shift ;;
+          --literal-pathspecs) lit=--literal-pathspecs; shift ;;
           -C) d=$2; shift 2 ;;
           -c) shift 2 ;;
           *) break ;;
@@ -99,7 +100,7 @@ run_one() {
           elif [ "$1" = --cached ] && [ "$2" = --quiet ]; then git -C "$d" diff --cached --quiet
           fi
           ;;
-        add) shift; git --literal-pathspecs -C "$d" add -- "$@" ;;
+        add) shift; git ${lit:+"$lit"} -C "$d" add -- "$@" ;;
         commit)
           f=''; prev=''
           for a in "$@"; do [ "$prev" = -F ] && f=$a; prev=$a; done
@@ -401,7 +402,7 @@ echo 'edited' >> "$T/container/cmb/apps/web/src/app/projects/[id]/page.tsx"
 run commit --name cmb --message-file "$T/msg" -- "$bkpath"
 check 'commit accepts a Next.js bracket path and exits 0' '[ "$(rc)" = 0 ]'
 check 'the recorded remote command carries --literal-pathspecs' 'grep -Eq -- "--literal-pathspecs" "$T/ssh.log"'
-check 'the recorded remote command single-quotes the bracket path' 'grep -Fq "'"$bkpath"'" "$T/ssh.log"'
+check 'the recorded remote command single-quotes the bracket path' 'grep -Fq "'\''$bkpath'\''" "$T/ssh.log"'
 check 'the decoded add argv includes --literal-pathspecs' 'grep -qx -- "--literal-pathspecs" "$T/ssh-decoded.log"'
 check 'the bracket file is committed' 'git -C "$T/container/cmb" ls-tree -r HEAD --name-only | grep -Fq "$bkpath"'
 check 'the bracketed change is fully committed' '[ -z "$(git -C "$T/container/cmb" status --porcelain)" ]'
@@ -409,6 +410,12 @@ run commit --name n --message-file "$T/msg" -- 'a*b.ts'
 check 'commit refusing a path with * is a usage error (2)' '[ "$(rc)" = 2 ]'
 run commit --name n --message-file "$T/msg" -- 'a?b.ts'
 check 'commit refusing a path with ? is a usage error (2)' '[ "$(rc)" = 2 ]'
+run commit --name n --message-file "$T/msg" -- 'a{b.ts'
+check 'commit refusing a path with { is a usage error (2)' '[ "$(rc)" = 2 ]'
+run commit --name n --message-file "$T/msg" -- 'a}b.ts'
+check 'commit refusing a path with } is a usage error (2)' '[ "$(rc)" = 2 ]'
+run commit --name n --message-file "$T/msg" -- 'a\b.ts'
+check 'commit refusing a path with a backslash is a usage error (2)' '[ "$(rc)" = 2 ]'
 
 echo '# fetch'
 mkcontainer f2

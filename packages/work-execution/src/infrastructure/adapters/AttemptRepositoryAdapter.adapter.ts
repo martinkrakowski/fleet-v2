@@ -15,7 +15,7 @@ import {
   AttemptRevisionConflictError,
   type AttemptRepositoryPort,
 } from '../../application/ports/out/AttemptRepositoryPort.out-port.js';
-import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface AttemptRepositoryAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
@@ -178,12 +178,22 @@ export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
       }
       throw error;
     }
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      throw new Error(`AttemptRepositoryAdapter expects a record list in ${target}`);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      await quarantineUnreadable(target, 'not valid JSON');
     }
-    for (const item of parsed) {
-      if (isAttemptRecord(item)) map.set(item.id, normalizeRecord(item));
+    if (!Array.isArray(parsed)) {
+      await quarantineUnreadable(target, 'expects a record list');
+    }
+    const records = parsed as unknown[];
+    for (const [index, rawItem] of records.entries()) {
+      if (!isAttemptRecord(rawItem)) {
+        await quarantineUnreadable(target, `record ${index} failed validation`);
+      }
+      const item = rawItem as AttemptRecord;
+      map.set(item.id, normalizeRecord(item));
     }
     return map;
   }

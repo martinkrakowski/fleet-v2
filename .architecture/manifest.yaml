@@ -357,6 +357,7 @@ bounded_contexts:
           - InspectAttemptUseCase
           - ListAttemptsUseCase
           - ProbeProjectUseCase
+          - ListUnregisteredProjectsUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -373,6 +374,7 @@ bounded_contexts:
             - InspectAttemptPort
             - ListAttemptsPort
             - ProbeProjectPort
+            - ListUnregisteredProjectsPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -434,6 +436,7 @@ bounded_contexts:
       BriefKnowledgePort: "Request bounded context proposals, record selected versions and forward only completed-attempt notes to the knowledge context."
       ActionAuthorizationPort: "Obtain and durably consume an applicable scope-bound grant from operator coordination; pending or unknown results block the action."
       ExecutionObservationPort: "Publish recorded lifecycle observations through coordination; preserve a delivery gap without failing the lane."
+      ListUnregisteredProjectsPort: "List each project id that has work orders but no profile, with what its work orders say about it (repositories, base commits, owned paths, counts), so it can be adopted; read-only."
       ProbeProjectPort: "Probe one registered project read-only: read its profile, check its repository and clones and that its gate procedures exist in the installation, and record the receipt only if the profile did not change while it was probed."
       ProjectProfileReadPort: "Read one project profile and its revision from the coordination context; known absence is null."
       ProjectProbeRecordPort: "Record a probe receipt on a profile at the revision the probe started from; a changed profile is a typed rejection, never an overwrite."

@@ -194,16 +194,17 @@ describe('fleet-v2 state', () => {
     const quarantineDir = path.join(dir, 'quarantine');
     await fs.mkdir(quarantineDir, { recursive: true });
     await fs.writeFile(path.join(quarantineDir, 'notes.txt'), 'irrelevant');
+    const copyContent = JSON.stringify([ATTEMPT_RECORD('a1'), ATTEMPT_RECORD('a2')]);
     await fs.writeFile(
       path.join(quarantineDir, 'attempts.json.20261025T101500.123Z-0.0123456789ab'),
-      JSON.stringify([ATTEMPT_RECORD('a1'), ATTEMPT_RECORD('a2')]),
+      copyContent,
     );
     const { io, stdout } = mockIo();
     const code = await runCli(['--state-dir', dir, 'state', 'check'], io);
     expect(code).toBe(0);
     const text = stdout.join('');
     expect(text).toContain(
-      '  quarantine attempts.json.20261025T101500.123Z-0.0123456789ab: ok (2 records)\n',
+      `  quarantine attempts.json.20261025T101500.123Z-0.0123456789ab: ok (2 records), ${copyContent.length} bytes\n`,
     );
     expect(text).not.toContain('notes.txt');
   });

@@ -211,6 +211,7 @@ export interface QuarantineFs {
   ): Promise<void>;
   readdir(dirPath: string): Promise<string[]>;
   rm(targetPath: string, options?: { force?: boolean }): Promise<void>;
+  lstat?(targetPath: string): Promise<{ isFile(): boolean }>;
 }
 
 /**
@@ -412,6 +413,9 @@ export async function keepQuarantineCopy(
       .map(async (name) => {
         const existingPath = path.join(quarantineDir, name);
         try {
+          if (fsImpl.lstat !== undefined && !(await fsImpl.lstat(existingPath)).isFile()) {
+            return null;
+          }
           return Buffer.from(await fsImpl.readFile(existingPath)).equals(bytes) ? existingPath : null;
         } catch {
           return null;

@@ -826,9 +826,11 @@ describe('keepQuarantineCopy', () => {
     const seedNames = Array.from({ length: 7 }, (_, i) =>
       `x.json.20261025T010000.000Z-${i}.0123456789ab`,
     );
-    for (const [index, name] of seedNames.entries()) {
-      await fs.writeFile(path.join(quarantineDir, name), `{ seed ${index}`, 'utf8');
-    }
+    await Promise.all(
+      seedNames.map((name, index) =>
+        fs.writeFile(path.join(quarantineDir, name), `{ seed ${index}`, 'utf8'),
+      ),
+    );
     const oldest = seedNames[0]!;
 
     await keepQuarantineCopy(filePath, Buffer.from('{ newest', 'utf8'), { protectNames: [oldest] });
@@ -838,6 +840,27 @@ describe('keepQuarantineCopy', () => {
     expect(kept).toHaveLength(6);
   });
 });
+
+async function snapshotStateDir(
+  dir: string,
+  basename = 'x.json',
+): Promise<{ storeBytes: Buffer | null; quarantineListing: string[] }> {
+  let storeBytes: Buffer | null = null;
+  try {
+    storeBytes = await fs.readFile(path.join(dir, basename));
+  } catch {
+    storeBytes = null;
+  }
+  let quarantineListing: string[] = [];
+  try {
+    quarantineListing = (await fs.readdir(path.join(dir, 'quarantine'))).sort((a, b) =>
+      a.localeCompare(b),
+    );
+  } catch {
+    quarantineListing = [];
+  }
+  return { storeBytes, quarantineListing };
+}
 
 describe('readQuarantineCopy', () => {
   let stateDir: string;
@@ -879,26 +902,32 @@ describe('readQuarantineCopy', () => {
 
   it('refuses a copy of another store', async () => {
     const otherName = 'y.json.20261025T101500.123Z-0.0123456789ab';
+    const before = await snapshotStateDir(stateDir);
     const result = await d.readQuarantineCopy(stateDir, otherName);
     expect(result).toEqual({
       status: 'refused',
       reason: `${otherName} is not a quarantine copy of x.json`,
     });
+    expect(await snapshotStateDir(stateDir)).toEqual(before);
   });
 
   it('refuses a valid-named file in the state dir root', async () => {
     const rootFile = path.join(stateDir, validName);
     await fs.writeFile(rootFile, validBytes);
+    const before = await snapshotStateDir(stateDir);
     const result = await d.readQuarantineCopy(stateDir, rootFile);
     expect(result.status).toBe('refused');
     expect((result as { reason: string }).reason).toContain('--from must name a file directly inside');
+    expect(await snapshotStateDir(stateDir)).toEqual(before);
   });
 
   it('refuses an absolute path that escapes the quarantine directory', async () => {
     const escaping = path.join(quarantineDir, '..', validName);
+    const before = await snapshotStateDir(stateDir);
     const result = await d.readQuarantineCopy(stateDir, escaping);
     expect(result.status).toBe('refused');
     expect((result as { reason: string }).reason).toContain('--from must name a file directly inside');
+    expect(await snapshotStateDir(stateDir)).toEqual(before);
   });
 
   it('refuses a symlink inside quarantine pointing outside', async () => {
@@ -906,18 +935,22 @@ describe('readQuarantineCopy', () => {
     await fs.writeFile(outsideTarget, 'out');
     const linkName = 'x.json.20261025T101501.123Z-1.0123456789ab';
     await fs.symlink(outsideTarget, path.join(quarantineDir, linkName));
+    const before = await snapshotStateDir(stateDir);
     const result = await d.readQuarantineCopy(stateDir, linkName);
     expect(result).toEqual({ status: 'refused', reason: `${linkName} is a symbolic link` });
+    expect(await snapshotStateDir(stateDir)).toEqual(before);
   });
 
   it('refuses a missing quarantine directory', async () => {
     const emptyDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-e1b-rqc-empty-'));
     try {
+      const before = await snapshotStateDir(emptyDir);
       const result = await d.readQuarantineCopy(emptyDir, validName);
       expect(result).toEqual({
         status: 'refused',
         reason: `${path.join(emptyDir, 'quarantine')} does not exist`,
       });
+      expect(await snapshotStateDir(emptyDir)).toEqual(before);
     } finally {
       await fs.rm(emptyDir, { recursive: true, force: true }).catch(() => {});
     }
@@ -943,28 +976,32 @@ describe('restore', () => {
   });
 
   async function snapshot(): Promise<{ storeBytes: Buffer | null; quarantineListing: string[] }> {
-    let storeBytes: Buffer | null = null;
-    try {
-      storeBytes = await fs.readFile(filePath);
-    } catch {
-      storeBytes = null;
-    }
-    let quarantineListing: string[] = [];
-    const quarantineDir = path.join(stateDir, 'quarantine');
-    try {
-      quarantineListing = (await fs.readdir(quarantineDir)).sort();
-    } catch {
-      quarantineListing = [];
-    }
-    return { storeBytes, quarantineListing };
+    return snapshotStateDir(stateDir);
   }
 
   it('restores an unreadable store, keeping the old bytes as a mode-600 copy', async () => {
     await fs.writeFile(filePath, currentGarbage);
+    const quarantineDir = path.join(stateDir, 'quarantine');
+    await fs.mkdir(quarantineDir, { recursive: true });
+    const candidateName = 'x.json.20261025T010000.000Z-0.0123456789ab';
+    const candidatePath = path.join(quarantineDir, candidateName);
+    await fs.writeFile(candidatePath, candidate);
+
+    const read = await d.readQuarantineCopy(stateDir, candidateName);
+    expect(read.status).toBe('read');
+    if (read.status !== 'read') {
+      return;
+    }
+
     const before = await snapshot();
     const currentSha = createHash('sha256').update(currentGarbage).digest('hex');
 
-    const outcome = await d.restore({ stateDir, candidate, expectedCurrentSha256: currentSha });
+    const outcome = await d.restore({
+      stateDir,
+      candidate: read.bytes,
+      expectedCurrentSha256: currentSha,
+      protectNames: [candidateName],
+    });
     expect(outcome.status).toBe('restored');
     if (outcome.status !== 'restored') {
       return;
@@ -976,10 +1013,55 @@ describe('restore', () => {
     const previousBytes = await fs.readFile(outcome.previousCopyPath!);
     expect(createHash('sha256').update(previousBytes).digest('hex')).toBe(currentSha);
     expect((await fs.stat(outcome.previousCopyPath!)).mode & 0o777).toBe(0o600);
+    expect(await fs.readFile(candidatePath)).toEqual(candidate);
 
     // A new copy of the old bytes was added; the candidate (restored) file exists.
     const after = await snapshot();
     expect(after.quarantineListing).toHaveLength(before.quarantineListing.length + 1);
+  });
+
+  it('reuses an existing regular quarantine copy of the current unreadable bytes', async () => {
+    await fs.writeFile(filePath, currentGarbage);
+    let existingCopyPath: string | null = null;
+    try {
+      await quarantineUnreadable(filePath, 'd', currentGarbage);
+    } catch (error) {
+      if (error instanceof StateFileUnreadableError) {
+        existingCopyPath = error.quarantinePath;
+      }
+    }
+    expect(existingCopyPath).not.toBeNull();
+    const currentSha = createHash('sha256').update(currentGarbage).digest('hex');
+
+    const outcome = await d.restore({ stateDir, candidate, expectedCurrentSha256: currentSha });
+    expect(outcome).toEqual({
+      status: 'restored',
+      recordCount: 2,
+      previousCopyPath: existingCopyPath,
+    });
+    expect(await fs.readFile(filePath)).toEqual(candidate);
+    expect(await fs.readFile(existingCopyPath!)).toEqual(currentGarbage);
+  });
+
+  it('does not reuse a symlink in quarantine pointing at the store file, writing a real copy of the old bytes instead', async () => {
+    await fs.writeFile(filePath, currentGarbage);
+    const currentSha = createHash('sha256').update(currentGarbage).digest('hex');
+    const quarantineDir = path.join(stateDir, 'quarantine');
+    await fs.mkdir(quarantineDir, { recursive: true });
+    const symlinkName = `x.json.20261025T010000.000Z-0.${currentSha.slice(0, 12)}`;
+    const symlinkPath = path.join(quarantineDir, symlinkName);
+    await fs.symlink(filePath, symlinkPath);
+
+    const outcome = await d.restore({ stateDir, candidate, expectedCurrentSha256: currentSha });
+    expect(outcome.status).toBe('restored');
+    if (outcome.status !== 'restored') {
+      return;
+    }
+    expect(outcome.previousCopyPath).not.toBeNull();
+    expect(outcome.previousCopyPath).not.toBe(symlinkPath);
+    expect((await fs.lstat(outcome.previousCopyPath!)).isFile()).toBe(true);
+    expect(await fs.readFile(outcome.previousCopyPath!)).toEqual(currentGarbage);
+    expect(await fs.readFile(filePath)).toEqual(candidate);
   });
 
   it('restores a missing store with expected null and no previous copy', async () => {
@@ -1045,10 +1127,14 @@ describe('restore', () => {
     const seedNames = Array.from({ length: 7 }, (_, i) =>
       `x.json.20261025T010000.000Z-${i}.0123456789ab`,
     );
-    for (const [index, name] of seedNames.entries()) {
-      const content = index === 0 ? candidate : Buffer.from(`{ seed ${index}`, 'utf8');
-      await fs.writeFile(path.join(quarantineDir, name), content);
-    }
+    await Promise.all(
+      seedNames.map((name, index) =>
+        fs.writeFile(
+          path.join(quarantineDir, name),
+          index === 0 ? candidate : Buffer.from(`{ seed ${index}`, 'utf8'),
+        ),
+      ),
+    );
     const candidateName = seedNames[0]!;
     const currentSha = createHash('sha256').update(currentGarbage).digest('hex');
 

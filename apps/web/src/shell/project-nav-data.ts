@@ -73,9 +73,20 @@ function compareByProjectId(a: string, b: string): number {
   return 0;
 }
 
-export async function loadProjectNav(
-  client: FleetWebApiClient = createFleetWebApiClient(),
-): Promise<ProjectNavData> {
+/**
+ * The sidebar's project list. It feeds the ROOT layout, so it never throws:
+ * any failure (including building the client) falls back to the labelled
+ * sample list rather than taking every page down.
+ */
+export async function loadProjectNav(client?: FleetWebApiClient): Promise<ProjectNavData> {
+  try {
+    return await loadProjectNavFrom(client ?? createFleetWebApiClient());
+  } catch {
+    return fixtureProjectNavData("the project list could not be loaded");
+  }
+}
+
+async function loadProjectNavFrom(client: FleetWebApiClient): Promise<ProjectNavData> {
   const projectsEndpoint = await client.fetchProjectList(
     { status: "active" },
     null,

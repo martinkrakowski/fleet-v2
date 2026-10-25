@@ -378,4 +378,20 @@ describe("loadProjectNav", () => {
     );
     expect(data.totalAttempts).toBe(totalAttemptsCount);
   });
+
+describe("loadProjectNav never takes the layout down", () => {
+  it("falls back to the labelled sample list when the client throws", async () => {
+    const client = fakeClient(
+      { source: "api", data: null },
+      { source: "api", data: null },
+    );
+    client.fetchProjectList = async () => {
+      throw new Error("socket hang up");
+    };
+    const nav = await loadProjectNav(client);
+    expect(nav.source).toBe("fixture-fallback");
+    expect(nav.fallbackReason).toBe("the project list could not be loaded");
+    expect(nav.projects.length).toBeGreaterThan(0);
+  });
+});
 });

@@ -21,15 +21,6 @@ function importStatements(source: string): string[] {
   return source.match(re) ?? [];
 }
 
-/** Import statements that reference a specific module specifier. */
-function importStatementsFor(source: string, moduleSpecifier: string): string[] {
-  return importStatements(source).filter(
-    (statement) =>
-      statement.includes(`from "${moduleSpecifier}"`) ||
-      statement.includes(`from '${moduleSpecifier}'`),
-  );
-}
-
 describe("ProjectNav is fed by the server layout and stays client-bound", () => {
   const nav = read("project-nav.tsx");
   const sidebar = read("sidebar.tsx");
@@ -66,10 +57,17 @@ describe("ProjectNav is fed by the server layout and stays client-bound", () => 
   });
 
   it("never imports a loader or the api client at runtime (type imports only)", () => {
-    for (const mod of ["./project-nav-data", "../../lib/api-client", "./live"]) {
-      for (const statement of importStatementsFor(nav, mod)) {
-        expect(statement.trimStart()).toMatch(/^import\s+type\b/);
+    // Every import (static, side-effect or dynamic) of the API client, a live
+    // loader or the nav loader from a client module must be a type import.
+    const serverOnly = /(api-client|\/live|project-nav-data)["']/;
+    for (const source of [nav, sidebar]) {
+      for (const statement of importStatements(source)) {
+        if (serverOnly.test(statement)) {
+          expect(statement.trimStart()).toMatch(/^import\s+type\b/);
+        }
       }
+      expect(source).not.toMatch(/import\s*\(\s*["'][^"']*(api-client|\/live|project-nav-data)/);
+      expect(source).not.toMatch(/^import\s+["'][^"']*(api-client|\/live|project-nav-data)/m);
     }
     expect(nav).toMatch(
       /import\s+type\s+\{[^}]*ProjectNavData[^}]*\}\s+from\s+"\.\/project-nav-data"/,

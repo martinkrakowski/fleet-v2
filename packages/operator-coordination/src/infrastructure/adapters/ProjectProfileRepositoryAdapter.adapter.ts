@@ -11,7 +11,6 @@
  * is null while unreadable state throws.
  */
 
-import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
 import type { ProjectProfileRecord } from '../../domain/coordination-records.js';
@@ -19,6 +18,7 @@ import { ProjectProfile } from '../../domain/entities/ProjectProfile.js';
 import type { ProjectProfileRepositoryPort } from '../../application/ports/out/ProjectProfileRepositoryPort.out-port.js';
 import { ProjectProfileRevisionConflictError } from '../../application/ports/out/ProjectProfileRepositoryPort.out-port.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { readRecordList } from './record-list-store.js';
 
 export interface ProjectProfileRepositoryAdapterOptions {
   /** When set, profiles are persisted here and reloaded on first use. */
@@ -125,45 +125,16 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
   }
 
   private async readProfilesFromDisk(path: string): Promise<Map<string, ProjectProfileRecord>> {
+    const records = await readRecordList(
+      path,
+      'ProjectProfileRepositoryAdapter',
+      (entry) =>
+        ProjectProfile.fromRecord(entry as ProjectProfileRecord).toRecord(),
+    );
     const map = new Map<string, ProjectProfileRecord>();
-    let contents: string;
-    try {
-      contents = await fs.readFile(path, 'utf8');
-    } catch (error: unknown) {
-      if (isNotFound(error)) {
-        return map;
-      }
-      throw new Error(
-        `ProjectProfileRepositoryAdapter could not read ${path}: ${describe(error)}`,
-      );
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(contents);
-    } catch (error: unknown) {
-      throw new Error(
-        `ProjectProfileRepositoryAdapter could not parse ${path}: ${describe(error)}`,
-      );
-    }
-    if (!Array.isArray(parsed)) {
-      throw new Error(`ProjectProfileRepositoryAdapter expects a record list in ${path}`);
-    }
-    for (const entry of parsed) {
-      const profile = ProjectProfile.fromRecord(entry as ProjectProfileRecord).toRecord();
+    for (const profile of records) {
       map.set(profile.projectId, profile);
     }
     return map;
   }
-}
-
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function isNotFound(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    (error as { code?: string }).code === 'ENOENT'
-  );
 }

@@ -13,7 +13,6 @@
  * a request.
  */
 
-import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
@@ -21,6 +20,7 @@ import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.j
 import { CoordinationRequestRevisionConflictError } from '../../application/ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import type { CoordinationRequestRepositoryPort } from '../../application/ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { readRecordList } from './record-list-store.js';
 
 export interface CoordinationRequestRepositoryAdapterOptions {
   /** When set, requests are persisted here and reloaded on first use. */
@@ -179,45 +179,16 @@ export class CoordinationRequestRepositoryAdapter implements CoordinationRequest
   }
 
   private async readRecordsFromDisk(path: string): Promise<Map<string, CoordinationRequestRecord>> {
+    const records = await readRecordList(
+      path,
+      'CoordinationRequestRepositoryAdapter',
+      (entry) =>
+        CoordinationRequest.fromRecord(entry as CoordinationRequestRecord).toRecord(),
+    );
     const map = new Map<string, CoordinationRequestRecord>();
-    let contents: string;
-    try {
-      contents = await fs.readFile(path, 'utf8');
-    } catch (error: unknown) {
-      if (isNotFound(error)) {
-        return map;
-      }
-      throw new Error(
-        `CoordinationRequestRepositoryAdapter could not read ${path}: ${describe(error)}`,
-      );
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(contents);
-    } catch (error: unknown) {
-      throw new Error(
-        `CoordinationRequestRepositoryAdapter could not parse ${path}: ${describe(error)}`,
-      );
-    }
-    if (!Array.isArray(parsed)) {
-      throw new Error(`CoordinationRequestRepositoryAdapter expects a record list in ${path}`);
-    }
-    for (const entry of parsed) {
-      const record = CoordinationRequest.fromRecord(entry as CoordinationRequestRecord).toRecord();
+    for (const record of records) {
       map.set(record.id, record);
     }
     return map;
   }
-}
-
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function isNotFound(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    (error as { code?: string }).code === 'ENOENT'
-  );
 }

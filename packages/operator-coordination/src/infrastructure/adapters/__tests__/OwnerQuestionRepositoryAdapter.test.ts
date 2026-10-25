@@ -7,6 +7,7 @@ import type { CoordinationRequestRecord } from '../../../domain/coordination-rec
 import { CoordinationRequestRepositoryAdapter } from '../CoordinationRequestRepositoryAdapter.adapter.js';
 import { OwnerQuestionRepositoryAdapter } from '../OwnerQuestionRepositoryAdapter.adapter.js';
 import { OwnerQuestionRevisionConflictError } from '../../../application/ports/out/OwnerQuestionRepositoryPort.out-port.js';
+import { StateFileUnreadableError } from '../file-store.js';
 import type { OwnerQuestionRecord } from '../../../domain/owner-question-records.js';
 
 /**
@@ -160,7 +161,7 @@ describe('OwnerQuestionRepositoryAdapter', () => {
     // Secret-shaped text injected behind the adapter's back must not become readable state.
     (tampered[0] as { title: string }).title = `Looks fine ${fakeSecretShape()}`;
     await fs.writeFile(filePath, JSON.stringify(tampered), 'utf8');
-    await expect(adapter.get('q-1')).rejects.toThrow(/secret-shaped value/);
+    await expect(adapter.get('q-1')).rejects.toBeInstanceOf(StateFileUnreadableError);
   });
 
   it('works fully in memory when no stateDir is configured', async () => {

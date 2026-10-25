@@ -6,6 +6,7 @@ export * from "./ExecuteAuthorizedForgeActionUseCase.use-case.js";
 export * from "./InspectAttemptUseCase.use-case.js";
 export * from "./InspectWorkOrderUseCase.use-case.js";
 export * from "./ListAttemptsUseCase.use-case.js";
+export * from "./ListUnregisteredProjectsUseCase.use-case.js";
 export * from "./PrepareBriefPackageUseCase.use-case.js";
 export * from "./PrepareFixAttemptUseCase.use-case.js";
 export * from "./ProbeProjectUseCase.use-case.js";

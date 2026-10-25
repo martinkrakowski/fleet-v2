@@ -165,9 +165,9 @@ export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
 
   private async readRecordsFromDisk(target: string): Promise<Map<string, AttemptRecord>> {
     const map = new Map<string, AttemptRecord>();
-    let raw: string;
+    let buffer: Buffer;
     try {
-      raw = await fs.readFile(target, 'utf8');
+      buffer = await fs.readFile(target);
     } catch (error: unknown) {
       if (
         typeof error === 'object' &&
@@ -178,19 +178,20 @@ export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
       }
       throw error;
     }
+    const raw = buffer.toString('utf8');
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      await quarantineUnreadable(target, 'not valid JSON');
+      await quarantineUnreadable(target, 'not valid JSON', buffer);
     }
     if (!Array.isArray(parsed)) {
-      await quarantineUnreadable(target, 'expects a record list');
+      await quarantineUnreadable(target, 'expects a record list', buffer);
     }
     const records = parsed as unknown[];
     for (const [index, rawItem] of records.entries()) {
       if (!isAttemptRecord(rawItem)) {
-        await quarantineUnreadable(target, `record ${index} failed validation`);
+        await quarantineUnreadable(target, `record ${index} failed validation`, buffer);
       }
       const item = rawItem as AttemptRecord;
       map.set(item.id, normalizeRecord(item));

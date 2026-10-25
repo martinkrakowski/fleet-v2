@@ -128,9 +128,9 @@ export class EvidenceAssessmentRepositoryAdapter implements EvidenceAssessmentRe
     stateFilePath: string,
   ): Promise<Map<string, EvidenceAssessmentRecord>> {
     const map = new Map<string, EvidenceAssessmentRecord>();
-    let raw: string;
+    let buffer: Buffer;
     try {
-      raw = await fs.readFile(stateFilePath, 'utf8');
+      buffer = await fs.readFile(stateFilePath);
     } catch (error: unknown) {
       if (
         typeof error === 'object' &&
@@ -141,19 +141,20 @@ export class EvidenceAssessmentRepositoryAdapter implements EvidenceAssessmentRe
       }
       throw error;
     }
+    const raw = buffer.toString('utf8');
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      await quarantineUnreadable(stateFilePath, 'not valid JSON');
+      await quarantineUnreadable(stateFilePath, 'not valid JSON', buffer);
     }
     if (!Array.isArray(parsed)) {
-      await quarantineUnreadable(stateFilePath, 'expects a record list');
+      await quarantineUnreadable(stateFilePath, 'expects a record list', buffer);
     }
     const records = parsed as unknown[];
     for (const [index, rawRecord] of records.entries()) {
       if (!isAssessmentRecord(rawRecord)) {
-        await quarantineUnreadable(stateFilePath, `record ${index} failed validation`);
+        await quarantineUnreadable(stateFilePath, `record ${index} failed validation`, buffer);
       }
       const record = rawRecord as EvidenceAssessmentRecord;
       map.set(record.id, copyRecord(record));

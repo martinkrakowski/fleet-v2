@@ -85,9 +85,9 @@ export class WorkOrderRepositoryAdapter implements WorkOrderRepositoryPort {
 
   private async readRecordsFromDisk(target: string): Promise<Map<string, WorkOrderRecord>> {
     const map = new Map<string, WorkOrderRecord>();
-    let raw: string;
+    let buffer: Buffer;
     try {
-      raw = await fs.readFile(target, 'utf8');
+      buffer = await fs.readFile(target);
     } catch (error: unknown) {
       if (
         typeof error === 'object' &&
@@ -98,19 +98,20 @@ export class WorkOrderRepositoryAdapter implements WorkOrderRepositoryPort {
       }
       throw error;
     }
+    const raw = buffer.toString('utf8');
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      await quarantineUnreadable(target, 'not valid JSON');
+      await quarantineUnreadable(target, 'not valid JSON', buffer);
     }
     if (!Array.isArray(parsed)) {
-      await quarantineUnreadable(target, 'expects a record list');
+      await quarantineUnreadable(target, 'expects a record list', buffer);
     }
     const records = parsed as unknown[];
     for (const [index, rawItem] of records.entries()) {
       if (!isWorkOrderRecord(rawItem)) {
-        await quarantineUnreadable(target, `record ${index} failed validation`);
+        await quarantineUnreadable(target, `record ${index} failed validation`, buffer);
       }
       const item = rawItem as WorkOrderRecord;
       map.set(item.id, item);

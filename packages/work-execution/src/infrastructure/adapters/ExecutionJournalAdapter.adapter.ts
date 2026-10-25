@@ -297,9 +297,9 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
 
   private async readJournalFromDisk(target: string): Promise<ActionJournalEntryRecord[]> {
     const entries: ActionJournalEntryRecord[] = [];
-    let raw: string;
+    let buffer: Buffer;
     try {
-      raw = await fs.readFile(target, 'utf8');
+      buffer = await fs.readFile(target);
     } catch (error: unknown) {
       if (
         typeof error === 'object' &&
@@ -310,19 +310,20 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       }
       throw error;
     }
+    const raw = buffer.toString('utf8');
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      await quarantineUnreadable(target, 'not valid JSON');
+      await quarantineUnreadable(target, 'not valid JSON', buffer);
     }
     if (!Array.isArray(parsed)) {
-      await quarantineUnreadable(target, 'expects a record list');
+      await quarantineUnreadable(target, 'expects a record list', buffer);
     }
     const records = parsed as unknown[];
     for (const [index, rawItem] of records.entries()) {
       if (!isActionJournalEntryRecord(rawItem)) {
-        await quarantineUnreadable(target, `record ${index} failed validation`);
+        await quarantineUnreadable(target, `record ${index} failed validation`, buffer);
       }
       const item = rawItem as ActionJournalEntryRecord;
       entries.push(item);
@@ -332,9 +333,9 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
 
   private async readReservationsFromDisk(target: string): Promise<Map<string, CapacityReservationRecord>> {
     const map = new Map<string, CapacityReservationRecord>();
-    let raw: string;
+    let buffer: Buffer;
     try {
-      raw = await fs.readFile(target, 'utf8');
+      buffer = await fs.readFile(target);
     } catch (error: unknown) {
       if (
         typeof error === 'object' &&
@@ -345,19 +346,20 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       }
       throw error;
     }
+    const raw = buffer.toString('utf8');
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      await quarantineUnreadable(target, 'not valid JSON');
+      await quarantineUnreadable(target, 'not valid JSON', buffer);
     }
     if (!Array.isArray(parsed)) {
-      await quarantineUnreadable(target, 'expects a record list');
+      await quarantineUnreadable(target, 'expects a record list', buffer);
     }
     const records = parsed as unknown[];
     for (const [index, rawItem] of records.entries()) {
       if (!isCapacityReservationRecord(rawItem)) {
-        await quarantineUnreadable(target, `record ${index} failed validation`);
+        await quarantineUnreadable(target, `record ${index} failed validation`, buffer);
       }
       const item = rawItem as CapacityReservationRecord;
       // A reservation stored before `seatTool` existed reads with `null`;

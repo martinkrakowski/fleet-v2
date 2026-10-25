@@ -573,6 +573,13 @@ describe('ExecutionJournalAdapter quarantines unreadable state files', () => {
     expect(await fs.readdir(quarantineDir())).toHaveLength(1);
   });
 
+  it('throws StateFileUnreadableError and quarantines reservations with a wrong top-level shape', async () => {
+    await fs.writeFile(reservationsPath(), JSON.stringify({ reservations: [] }), 'utf8');
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await expect(adapter.listActiveReservations()).rejects.toBeInstanceOf(StateFileUnreadableError);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+
   it('throws StateFileUnreadableError instead of skipping a reservation that fails validation', async () => {
     await fs.writeFile(reservationsPath(), JSON.stringify([reservation, { bad: true }]), 'utf8');
     const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });

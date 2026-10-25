@@ -76,6 +76,7 @@ import { hostsCommand, type HostsCliOptions } from './hosts.js';
 import { seatsCommand, type SeatsCliOptions } from './seats.js';
 import { initCommand, type InitCliOptions } from './init.js';
 import { projectsCommand, type ProjectsCliOptions } from './projects.js';
+import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
 
 export { resolveRunnerSettings };
 
@@ -1469,13 +1470,17 @@ export interface DoctorCliOptions {
    * leftover-forward check); the node doctor executor composes when omitted.
    */
   readonly hostProbeExecutor?: HostProbeExecutor;
+  /** The resolved state directory; when set, doctor adds one state-files line. */
+  readonly stateDir?: string;
 }
 
 const DOCTOR_HELP = `Usage: fleet-v2 doctor [--probe-seats] [--host <name>] [--json]
 
 Read-only checks over the loaded installation: hosts and roles, platform
 tools, configured tool versions, credential file modes (never contents), the
-bundled ocm-run hash and each configured seat.
+bundled ocm-run hash and each configured seat. With a state directory selected
+(--state-dir or FLEET_STATE_DIR) it adds one line for the JSON state stores
+(see fleet-v2 state check).
 
   --probe-seats  run each seat's one-step probe (a live model call). Seat
                  probes run from the operator's machine — the host running
@@ -1731,6 +1736,11 @@ export async function doctorCommand(
     lines.push(doctorLine);
     io.stdout(json ? `${JSON.stringify(doctorLine)}\n` : `${formatDoctorLine(doctorLine)}\n`);
   }
+  if (options.stateDir !== undefined) {
+    const stateLine = await stateDoctorLine(options.stateDir);
+    lines.push(stateLine);
+    io.stdout(json ? `${JSON.stringify(stateLine)}\n` : `${formatDoctorLine(stateLine)}\n`);
+  }
   return doctorExitCode(lines);
 }
 
@@ -1807,6 +1817,9 @@ project profiles; every change is confirmed unless --yes is given.
 init sets up a fresh installation file non-interactively (every step is a
 flag); run 'fleet-v2 init --help' for its flags.
 
+state check reads every JSON state store under the state directory and reports
+ok, missing, unreadable or invalid record per file; it never writes.
+
 Commands:
   work-order register|inspect
   doctor [--probe-seats] [--host <name>] [--json]
@@ -1814,6 +1827,7 @@ Commands:
   seats free-tier [status|on|off] [--yes]
   projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
+  state check
   brief prepare [--allowedPathPrefixes '["packages/x/src"]']
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|accept
@@ -1845,6 +1859,7 @@ export async function runCli(
   initOptions?: InitCliOptions,
   seatsOptions?: SeatsCliOptions,
   projectsOptions?: ProjectsCliOptions,
+  stateOptions?: StateCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -1856,7 +1871,7 @@ export async function runCli(
     // invalid one with exit 1; it never composes the state-backed runtime.
     const group = restArgv[0];
     if (group === 'doctor') {
-      return await doctorCommand(restArgv.slice(1), io, doctorOptions ?? {});
+      return await doctorCommand(restArgv.slice(1), io, { ...doctorOptions, stateDir: doctorOptions?.stateDir ?? stateDir });
     }
     // The hosts group manages the installation file itself on the shared
     // onboarding engine; it reads the file and composes only the state-backed
@@ -1873,6 +1888,11 @@ export async function runCli(
     // The seats group manages the free-tier flag on the shared onboarding engine.
     if (group === 'seats') {
       return await seatsCommand(restArgv.slice(1), io, seatsOptions ?? {});
+    }
+    // `state` reads the store files directly and never composes the runtime
+    // or loads the installation; it is CLI-only (owner decision D4).
+    if (group === 'state') {
+      return await stateCommand(restArgv.slice(1), io, { ...stateOptions, stateDir: stateOptions?.stateDir ?? stateDir });
     }
     // The questions group carries its own help block; a help request never
     // composes the runtime and never counts as a usage error.

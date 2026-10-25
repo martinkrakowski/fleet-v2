@@ -46,7 +46,7 @@
   4. Take at most 10.
 
   Entries from other work orders are never selected. They go in their own brief section, "Already tried and disproved; do not repeat", which counts toward the brief's size budget.
-- **Capture:** the orchestrator, or a reviewer's numbered findings marked "disproved", proposes `failed` candidates through the existing capture use case. No new port.
+- **Capture:** the orchestrator, or a reviewer's numbered finding marked "disproved", proposes a `failed` candidate through the existing capture use case only when the finding states both the approach tried and the reason it failed. The candidate's `claimText` holds the two parts in the §3.2 form. A finding without both parts is not proposed. No new port.
 
 ### 3.3 Sealed artifact manifest before teardown (work-execution)
 
@@ -57,7 +57,7 @@
 
   It is written with `writeJsonAtomically` (temp file, then rename) and then read back to confirm it. Only then is the collection reported complete. This is Agensh's `agent/archive.py` pattern: the manifest is complete only after size and digest are recorded and the write is atomic.
 - **A new check:** `verifyArtifactManifest(attemptId)` re-hashes every listed file and returns `sealed`, `missing` or `mismatch`.
-- **Gating removal:** `WorkspacePort.removeWorktree` (host-programs P5, live-updates §3.6) gets one more precondition. It refuses unless the attempt's manifest verifies as `sealed`. Without a manifest the reason is `artifacts not collected`; on a mismatch it is `artifacts changed since collection`. A manual override exists only as an explicit CLI flag that the owner types.
+- **Gating removal:** `WorkspacePort.removeWorktree` (host-programs P5, live-updates §3.6) gets one more precondition. It refuses unless the attempt's manifest verifies as `sealed`. Without a manifest the reason is `artifacts not collected`; on a mismatch it is `artifacts changed since collection`. A manual override exists only through `--force-unsealed`. The flag alone bypasses nothing: removal also needs an owner approval through the existing authorization path (an owner question answered with a decision), scoped to this one removal (the attempt id and worktree path). The removal's journal entry records that approval's reference.
 
 ### 3.4 Not in this plan
 
@@ -102,7 +102,7 @@ Each lane follows the standard pipeline: Mercury-3, gate, Grok, Argon fix rounds
 | D1 | Does the placeholder check also apply to receipts already stored? | **No:** new writes only. Tighten readers later, after `state check` |
 | D2 | Should placeholder evidence be refused outright, or warned about for a while first? | **Refuse.** Receipts are written by the orchestrator, not by end users |
 | D3 | Who may propose a `failed` note? | **The orchestrator and reviewers.** Never a lane about itself |
-| D4 | What overrides the sealed-manifest gate on worktree removal? | **An explicit `--force-unsealed` flag only**, typed by the owner, logged in the journal |
+| D4 | What overrides the sealed-manifest gate on worktree removal? | **`--force-unsealed` plus an owner approval** scoped to that removal through the existing authorization path; the journal records the approval's reference |
 | D5 | Copy Agensh's verifier code (MIT, with credit), or re-write it from the idea? | **Re-write.** It is 56 lines of Python; a TypeScript domain function is simpler written fresh |
 
 ## 7. Assumptions

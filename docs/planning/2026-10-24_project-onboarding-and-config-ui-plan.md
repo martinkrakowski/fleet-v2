@@ -140,12 +140,13 @@ its PR merges, and note the PR number.
 |---|---|---|---|---|---|
 | **P0** | This plan: owner decisions D1–D6 recorded | — | 0 | owner | ☑ (2026-10-24) |
 | **P1** | Profile v2: record fields, defaults for old records, `status`, `expectedRevision` CAS in the repository adapter, `listProfiles()` on the port. Manifest + Hexagen scaffold. | P0 | 2 (data) | Fable | ☐ |
-| **P2** | `ProjectProbePort` + `ProjectProbeAdapter` on `CommandExecutorPort`: the four check groups of §3.3, fixed argv, `UNKNOWN` on unreachable, typed receipt. Fake-executor tests per check. | P1 | 2 (subprocess, ssh) | Fable | ☐ |
+| **P2** | `ProjectProbePort` + `ProjectProbeAdapter` in **work-execution** (amendment A1) on `CommandExecutorPort`: checks 1, 2 and 4 of §3.3, fixed argv, `UNKNOWN` on unreachable, typed report. Fake-executor tests per check. | — | 2 (subprocess, ssh) | Fable | ☐ |
 | **P3a** | Use cases: `RegisterProjectProfile` becomes create-only and validates host and procedure names against the installation; `UpdateProjectProfile` (CAS); `RetireProjectProfile`. | P1 | 2 | Fable | ☐ |
-| **P3b** | Use cases: `ListProjectProfiles`, `InspectProjectProfile`, `ProbeProject` (records `lastProbe` with CAS), `ListUnregisteredProjects` (adopt candidates from work orders). | P1, P2 | 1 | Grok | ☐ |
+| **P3b** | Use cases in operator-coordination: `ListProjectProfiles`, `InspectProjectProfile`, `RecordProjectProbe` (writes `lastProbe` with CAS). | P1 | 1 | Grok | ☐ |
+| **P3c** | `ProbeProjectUseCase` in work-execution (amendment A1): reads the profile and records the receipt through adapters delegating to P3b's ports; checks 3 (procedure names) against the installation; `ListUnregisteredProjects` (adopt candidates from work orders). | P2, P3b | 2 | Fable | ☐ |
 | **P4** | Work-order guard: `RegisterWorkOrder` refuses an unknown or retired project (D4), naming `fleet-v2 projects adopt`. Existing work orders are untouched. | P3a | 2 | Fable | ☐ |
-| **P5** | API: `GET /v1/projects`, `GET /v1/projects/:id`, `POST /v1/projects` (create), `PATCH /v1/projects/:id` (`expectedRevision`), `POST /v1/projects/:id/retire`, `POST /v1/projects/:id/probe`, `GET /v1/projects/unregistered`. Both roots wired. | P3a, P3b | 2 | Fable | ☐ |
-| **P6** | CLI `projects` group: the seven subcommands, human and `--json` output, confirm + diff + CAS, `register-profile` kept as an alias that prints a deprecation line. | P3a, P3b | 1 | Grok | ☐ |
+| **P5** | API (after P3c): `GET /v1/projects`, `GET /v1/projects/:id`, `POST /v1/projects` (create), `PATCH /v1/projects/:id` (`expectedRevision`), `POST /v1/projects/:id/retire`, `POST /v1/projects/:id/probe`, `GET /v1/projects/unregistered`. Both roots wired. | P3a, P3b, P3c | 2 | Fable | ☐ |
+| **P6** | CLI `projects` group: the seven subcommands, human and `--json` output, confirm + diff + CAS, `register-profile` kept as an alias that prints a deprecation line. | P3a, P3b, P3c | 1 | Grok | ☐ |
 | **P7** | Web read views: `/projects`, `/projects/[id]`, the sidebar project list from the API, per-request rendering and labelled fixture fallback (the L17c pattern). | P5, L17c | 2 (what the operator sees) | Fable | ☐ |
 | **P8** | Web writes: `/projects/new` (add and adopt), edit, retire and probe through the web write path, each behind an `AlertBox`. | P7, T6 | 2 | Fable | ☐ |
 | **P9** | TUI shell: `fleet-v2 tui` with the D3 library, screen navigation, and an in-process data layer; shared with T8a. | P0 (D3) | 1 | Grok | ☐ |
@@ -157,7 +158,7 @@ its PR merges, and note the PR number.
 
 ### 4.2 Waves
 
-1. **Wave A, the projects core:** P1, then P2 and P3a in parallel, then P3b, P4 and P5, then P6 and P12. This
+1. **Wave A, the projects core:** P1 and P2 in parallel, then P3a and P3b, then P3c and P4, then P5, then P6 and P12. This
    gives the whole feature on the CLI and the API.
 2. **Wave B, the web reads:** P7 (after L17c merges). P13.
 3. **Wave C, the TUI:** P9, then P10a, P10b and P11. It can run beside Wave B once D3 is decided.
@@ -217,6 +218,29 @@ its PR merges, and note the PR number.
 - The web write path (T6 or U3) will exist before P8. If it does not, P8 waits, and the CLI and TUI
   remain the write surfaces.
 - An installation holds tens of projects, not thousands, so `listProfiles` reads the whole store.
+
+## Amendment A1 (2026-10-24): the probe lives in work-execution
+
+Found while scaffolding P2. `operator-coordination` is upstream of `work-execution` in the manifest's
+context map, so it cannot use work-execution's `CommandExecutorPort`, `LocalExecutor`, `SshExecutor`
+or per-host executor selection. The probe is about clones and worktrees on lane-runner hosts, which
+work-execution already owns (`WorkspacePort`). So:
+
+- **P2** puts `ProjectProbePort` and `ProjectProbeAdapter` in work-execution. They need nothing from
+  P1, so P2 runs in parallel with P1.
+- **P3b** gives operator-coordination `ListProjectProfiles`, `InspectProjectProfile` and
+  `RecordProjectProbe`. The profile and its `lastProbe` stay where the profile lives (D1).
+- **P3c**, new: `ProbeProjectUseCase` in work-execution. It reads the profile and records the
+  receipt through two adapters that delegate to P3b's ports (the in-process supplier pattern
+  `ActionAuthorizationAdapter` already uses). It also checks the gate procedure names against the
+  installation and lists adopt candidates from work orders.
+- **Check 3 narrowed.** The probe checks that each gate procedure NAME exists in the installation; it
+  does not look for the procedure's executable on the verifier host, which would need a shell
+  `command -v`. A missing executable shows up as a failed verification, as today.
+- **Hardening.** The probe runs git with hooks and fsmonitor off, and with git protocols limited to
+  https, ssh, git and file. It refuses a repository that starts with `-` or contains `::` (option
+  and remote-helper injection) before running anything. It never copies stderr or a remote URL into
+  a check's detail, because either can carry a credential.
 
 ## Challenge this
 

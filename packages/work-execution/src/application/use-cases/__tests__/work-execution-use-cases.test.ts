@@ -46,6 +46,10 @@ import type {
   WorktreeRunState,
 } from '../../ports/out/ExecutionRunnerPort.out-port.js';
 import type { CollectCompletedAttemptArtifactsResult } from '../../ports/out/AttemptArtifactPort.out-port.js';
+import type {
+  ProjectProfileReadPort,
+  ProjectProfileView,
+} from '../../ports/out/ProjectProfileReadPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { WorkspacePort, WorktreeInspection } from '../../ports/out/WorkspacePort.out-port.js';
 import type { ReadUsageResult, UsagePort } from '../../ports/out/UsagePort.out-port.js';
@@ -272,6 +276,35 @@ function storedWorkOrder(overrides: Partial<WorkOrderRecord> = {}): WorkOrderRec
   };
 }
 
+function makeProfile(overrides: Partial<ProjectProfileView> = {}): ProjectProfileView {
+  return {
+    projectId: 'proj-1',
+    status: 'active',
+    repository: 'git@example.org:acme/app.git',
+    clones: {},
+    gateProcedures: [],
+    revision: 1,
+    ...overrides,
+  };
+}
+
+class FakeProfileRead implements ProjectProfileReadPort {
+  calls: string[] = [];
+
+  constructor(
+    private readonly profile: ProjectProfileView | null,
+    private readonly error?: Error,
+  ) {}
+
+  async readProjectProfile(projectId: string): Promise<ProjectProfileView | null> {
+    this.calls.push(projectId);
+    if (this.error !== undefined) {
+      throw this.error;
+    }
+    return this.profile;
+  }
+}
+
 describe('RegisterWorkOrderUseCase', () => {
   it('throws Not implemented when constructed without dependencies', async () => {
     const useCase = new RegisterWorkOrderUseCase();
@@ -399,6 +432,139 @@ describe('RegisterWorkOrderUseCase', () => {
     if (result.outcome === 'registered') {
       expect(result.workOrder.prerequisiteWorkOrderIds).toEqual(['wo-exists']);
     }
+  });
+
+  it('rejects a work order whose project has no profile and saves nothing', async () => {
+    const repo = makeWorkOrderRepo();
+    const profileRead = new FakeProfileRead(null);
+    const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: repo, profileRead });
+
+    const result = await useCase.registerWorkOrder(validWorkOrderRequest());
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason:
+        "project proj-1 has no profile; register it with 'fleet-v2 projects add', or 'fleet-v2 projects adopt' when it already has work orders",
+    });
+    expect(repo.orders.size).toBe(0);
+    expect(profileRead.calls).toEqual(['proj-1']);
+  });
+
+  it('rejects a work order for a retired project and saves nothing', async () => {
+    const repo = makeWorkOrderRepo();
+    const profileRead = new FakeProfileRead(makeProfile({ status: 'retired' }));
+    const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: repo, profileRead });
+
+    const result = await useCase.registerWorkOrder(validWorkOrderRequest());
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'project proj-1 is retired; it accepts no new work orders',
+    });
+    expect(repo.orders.size).toBe(0);
+    expect(profileRead.calls).toEqual(['proj-1']);
+  });
+
+  it('refuses a status other than active, so a future status fails closed', async () => {
+    const repo = makeWorkOrderRepo();
+    const profileRead = new FakeProfileRead(
+      makeProfile({ status: 'suspended' as unknown as 'active' }),
+    );
+    const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: repo, profileRead });
+
+    const result = await useCase.registerWorkOrder(validWorkOrderRequest());
+
+    expect(result.outcome).toBe('rejected');
+    expect(repo.orders.size).toBe(0);
+  });
+
+  it('lists conflicts under the trimmed project id', async () => {
+    const repo = makeWorkOrderRepo();
+    const profileRead = new FakeProfileRead(makeProfile());
+    const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: repo, profileRead });
+
+    const first = await useCase.registerWorkOrder(validWorkOrderRequest());
+    expect(first.outcome).toBe('registered');
+    const second = await useCase.registerWorkOrder(
+      validWorkOrderRequest({ workOrderId: 'wo-overlap', projectId: '  proj-1  ' }),
+    );
+
+    expect(second.outcome).toBe('rejected');
+    expect(second.outcome === 'rejected' && second.reason).toContain('Owned path conflicts with active work order');
+  });
+
+  it('applies the profile guard before the duplicate-id check', async () => {
+    const repo = makeWorkOrderRepo();
+    const registrar = new RegisterWorkOrderUseCase({ workOrderRepo: repo });
+    await registrar.registerWorkOrder(validWorkOrderRequest());
+    const profileRead = new FakeProfileRead(null);
+    const guarded = new RegisterWorkOrderUseCase({ workOrderRepo: repo, profileRead });
+
+    const result = await guarded.registerWorkOrder(validWorkOrderRequest());
+
+    expect(result.outcome === 'rejected' && result.reason).toContain('has no profile');
+    expect(repo.orders.size).toBe(1);
+  });
+
+  it('registers as before when the project profile is active', async () => {
+    const repo = makeWorkOrderRepo();
+    const profileRead = new FakeProfileRead(makeProfile());
+    const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: repo, profileRead });
+
+    const result = await useCase.registerWorkOrder(validWorkOrderRequest());
+
+    expect(result.outcome).toBe('registered');
+    expect(profileRead.calls).toEqual(['proj-1']);
+    if (result.outcome === 'registered') {
+      expect(result.workOrder.projectId).toBe('proj-1');
+    }
+    expect((await repo.findWorkOrderById('wo-1'))?.state).toBe('approved');
+  });
+
+  it('calls the profile port once with the trimmed project id', async () => {
+    const profileRead = new FakeProfileRead(makeProfile());
+    const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: makeWorkOrderRepo(), profileRead });
+
+    const result = await useCase.registerWorkOrder(validWorkOrderRequest({ projectId: '  proj-1  ' }));
+
+    expect(profileRead.calls).toEqual(['proj-1']);
+    // The id that was checked is the id that is stored.
+    expect(result.outcome === 'registered' && result.workOrder.projectId).toBe('proj-1');
+  });
+
+  it('propagates an error thrown by the profile port and saves nothing', async () => {
+    const repo = makeWorkOrderRepo();
+    const profileRead = new FakeProfileRead(null, new Error('adapter exploded'));
+    const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: repo, profileRead });
+
+    await expect(useCase.registerWorkOrder(validWorkOrderRequest())).rejects.toThrow('adapter exploded');
+    expect(repo.orders.size).toBe(0);
+  });
+
+  it('registers an unknown project when no profileRead is configured', async () => {
+    const repo = makeWorkOrderRepo();
+    const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: repo });
+
+    const result = await useCase.registerWorkOrder(validWorkOrderRequest());
+
+    expect(result.outcome).toBe('registered');
+    expect((await repo.findWorkOrderById('wo-1'))?.state).toBe('approved');
+  });
+
+  it('rejects missing fields without calling the profile port', async () => {
+    const profileRead = new FakeProfileRead(makeProfile());
+    const useCase = new RegisterWorkOrderUseCase({
+      workOrderRepo: makeWorkOrderRepo(),
+      profileRead,
+    });
+
+    const result = await useCase.registerWorkOrder(validWorkOrderRequest({ workOrderId: '' }));
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'Missing required work order fields: workOrderId',
+    });
+    expect(profileRead.calls).toEqual([]);
   });
 });
 

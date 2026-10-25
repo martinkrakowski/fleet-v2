@@ -13,10 +13,16 @@ import type {
   RegisterWorkOrderRequest,
   RegisterWorkOrderResult,
 } from '../ports/in/RegisterWorkOrderPort.in-port.js';
+import type { ProjectProfileReadPort } from '../ports/out/ProjectProfileReadPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 
 export interface RegisterWorkOrderDependencies {
   readonly workOrderRepo: WorkOrderRepositoryPort;
+  /**
+   * When present, a new work order requires an active profile for its
+   * projectId; when absent (today's roots until P5), behaviour is unchanged.
+   */
+  readonly profileRead?: ProjectProfileReadPort;
 }
 
 function isNonEmpty(value: unknown): value is string {
@@ -64,12 +70,30 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       return { outcome: 'rejected', reason: 'Work order owned paths must be non-empty strings' };
     }
 
+    // One trimmed id for the profile check, the conflict listing and the save.
+    const projectId = request.projectId.trim();
+    if (this.deps.profileRead) {
+      const profile = await this.deps.profileRead.readProjectProfile(projectId);
+      if (profile === null) {
+        return {
+          outcome: 'rejected',
+          reason: `project ${projectId} has no profile; register it with 'fleet-v2 projects add', or 'fleet-v2 projects adopt' when it already has work orders`,
+        };
+      }
+      if (profile.status !== 'active') {
+        return {
+          outcome: 'rejected',
+          reason: `project ${projectId} is retired; it accepts no new work orders`,
+        };
+      }
+    }
+
     const existingById = await this.deps.workOrderRepo.findWorkOrderById(request.workOrderId);
     if (existingById !== null) {
       return { outcome: 'rejected', reason: `Work order already registered: ${request.workOrderId}` };
     }
 
-    const existing = await this.deps.workOrderRepo.listWorkOrdersByProject(request.projectId);
+    const existing = await this.deps.workOrderRepo.listWorkOrdersByProject(projectId);
 
     for (const order of existing) {
       if (!isActiveWorkOrder(order.state)) {
@@ -97,7 +121,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     const nowIso = request.nowIso ?? new Date().toISOString();
     const record: WorkOrderRecord = {
       id: request.workOrderId,
-      projectId: request.projectId,
+      projectId,
       taskId: request.taskId,
       laneId: request.laneId,
       repository: request.repository,

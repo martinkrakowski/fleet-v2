@@ -16,11 +16,18 @@ import type {
 } from "../../application/ports/out/CommandExecutorPort.out-port.js";
 import type {
   ProjectProbeCheck,
+  ProjectProbeClone,
   ProjectProbePort,
   ProjectProbeReport,
   ProjectProbeRequest,
 } from "../../application/ports/out/ProjectProbePort.out-port.js";
 import type { ExecutorForRecordedHostResult } from "./ExecutorForHost.helper.js";
+
+function compareCodeUnits(a: string, b: string): number {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
 
 export interface ProjectProbeAdapterOptions {
   /** The orchestrator's own executor (never a remote host). */
@@ -81,7 +88,7 @@ function orchestratorEnv(): Readonly<Record<string, string>> {
 
 /** Single-quote a value for a shell hint, escaping `'` as `'\''`. */
 function shellQuote(v: string): string {
-  return `'${v.replace(/'/g, "'\\''")}'`;
+  return `'${v.replaceAll("'", String.raw`'\''`)}'`;
 }
 
 /** Strip `scheme://<userinfo>@` (up to the last `@` before the first `/`) to `scheme://`. */
@@ -90,11 +97,21 @@ export function redactUserinfo(url: string): string {
 }
 
 function hasRepositoryCredential(repository: string): boolean {
-  return (
-    /^https?:\/\/[^/@]*@/i.test(repository) ||
-    /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/@]*:[^/@]*@/.test(repository) ||
-    /^[^:/@]+:[^@/]+@/.test(repository)
-  );
+  const schemeEnd = repository.indexOf("://");
+  if (schemeEnd !== -1) {
+    const scheme = repository.slice(0, schemeEnd).toLowerCase();
+    const rest = repository.slice(schemeEnd + 3);
+    const slash = rest.indexOf("/");
+    const authority = slash === -1 ? rest : rest.slice(0, slash);
+    const at = authority.lastIndexOf("@");
+    if (at === -1) return false;
+    if (scheme === "http" || scheme === "https") return true;
+    return authority.slice(0, at).includes(":");
+  }
+  const slash = repository.indexOf("/");
+  const beforeSlash = slash === -1 ? repository : repository.slice(0, slash);
+  const at = beforeSlash.indexOf("@");
+  return at !== -1 && beforeSlash.slice(0, at).includes(":");
 }
 
 /** Trim whitespace and strip one trailing `/` then one trailing `.git`. */
@@ -135,7 +152,7 @@ export class ProjectProbeAdapter implements ProjectProbePort {
       };
     }
 
-    const hostNames = Object.keys(request.clones).sort();
+    const hostNames = Object.keys(request.clones).sort(compareCodeUnits);
     for (const host of hostNames) {
       const clone = request.clones[host];
       const hostExecutor = this.options.executorForHost(host);
@@ -144,104 +161,9 @@ export class ProjectProbeAdapter implements ProjectProbePort {
         continue;
       }
       const executor = hostExecutor.executor;
-
-      // clone-is-work-tree
-      const workTree = await this.runGit(executor, [
-        "-C",
-        clone.path,
-        "rev-parse",
-        "--show-toplevel",
-      ]);
-      if (this.unreachable(workTree)) {
-        checks.push(this.check("clone-is-work-tree", host, "unknown", `${host} did not answer`));
-        // STOP this host's remaining checks: the host is not answering.
-        continue;
+      if (await this.probeHost(host, clone, repository, checks, executor)) {
+        scriptsSource ??= { host, path: clone.path, executor };
       }
-      if (workTree.exitCode === 0) {
-        const toplevel = workTree.stdout.trim();
-        if (toplevel === clone.path) {
-          checks.push(this.check("clone-is-work-tree", host, "pass", `git work tree at ${clone.path}`));
-          if (scriptsSource === null) scriptsSource = { host, path: clone.path, executor };
-        } else {
-          checks.push(
-            this.check(
-              "clone-is-work-tree",
-              host,
-              "fail",
-              `${clone.path} is inside another repository at ${toplevel}; use the clone's own root`,
-            ),
-          );
-        }
-      } else {
-        checks.push(
-          this.check(
-            "clone-is-work-tree",
-            host,
-            "fail",
-            `no git work tree at ${clone.path}; on ${host} run: git clone ${shellQuote(redactUserinfo(repository))} ${shellQuote(clone.path)}`,
-          ),
-        );
-      }
-
-      // origin-matches
-      const origin = await this.runGit(executor, ["-C", clone.path, "remote", "get-url", "origin"]);
-      if (this.unreachable(origin)) {
-        checks.push(this.check("origin-matches", host, "unknown", `${host} did not answer`));
-      } else if (
-        origin.exitCode === 0 &&
-        normaliseRepository(origin.stdout) === normaliseRepository(repository)
-      ) {
-        checks.push(this.check("origin-matches", host, "pass", "origin matches"));
-      } else {
-        checks.push(this.check("origin-matches", host, "fail", "origin does not match the profile's repository"));
-      }
-
-      // worktree-root-exists
-      const rootExists = await this.runCommand(executor, ["test", "-d", clone.worktreeRoot]);
-      if (this.unreachable(rootExists)) {
-        checks.push(this.check("worktree-root-exists", host, "unknown", `${host} did not answer`));
-      } else if (rootExists.exitCode === 0) {
-        checks.push(this.check("worktree-root-exists", host, "pass", "worktree root exists"));
-      } else if (rootExists.exitCode === 1) {
-        checks.push(
-          this.check(
-            "worktree-root-exists",
-            host,
-            "fail",
-            `missing; on ${host} run: mkdir -p ${shellQuote(clone.worktreeRoot)}`,
-          ),
-        );
-      } else {
-        checks.push(this.check("worktree-root-exists", host, "unknown", `${host} did not answer`));
-      }
-
-      // lane-dir-ignored
-      const laneIgnored = await this.runGit(executor, [
-        "-C",
-        clone.path,
-        "check-ignore",
-        "-q",
-        ".lane/probe.md",
-      ]);
-      if (this.unreachable(laneIgnored)) {
-        checks.push(this.check("lane-dir-ignored", host, "unknown", `${host} did not answer`));
-      } else if (laneIgnored.exitCode === 0) {
-        checks.push(this.check("lane-dir-ignored", host, "pass", ".lane/ is ignored"));
-      } else if (laneIgnored.exitCode === 1) {
-        checks.push(
-          this.check(
-            "lane-dir-ignored",
-            host,
-            "fail",
-            `.lane/ is not ignored; add the line .lane/ to ${shellQuote(clone.path + "/.gitignore")}`,
-          ),
-        );
-      } else {
-        checks.push(this.check("lane-dir-ignored", host, "unknown", `${host} did not answer`));
-      }
-
-      // agent-instructions-tracked
-      checks.push(await this.agentInstructionsTracked(executor, host, clone.path));
     }
 
     return {
@@ -251,6 +173,130 @@ export class ProjectProbeAdapter implements ProjectProbePort {
       defaultBranch,
       detectedScripts: scriptsSource === null ? [] : await this.detectScripts(scriptsSource),
     };
+  }
+
+  private async probeHost(
+    host: string,
+    clone: ProjectProbeClone,
+    repository: string,
+    checks: ProjectProbeCheck[],
+    executor: CommandExecutorPort,
+  ): Promise<boolean> {
+    // clone-is-work-tree
+    const workTree = await this.runGit(executor, [
+      "-C",
+      clone.path,
+      "rev-parse",
+      "--show-toplevel",
+    ]);
+    if (this.unreachable(workTree)) {
+      checks.push(this.check("clone-is-work-tree", host, "unknown", `${host} did not answer`));
+      // STOP this host's remaining checks: the host is not answering.
+      return false;
+    }
+    let clonePassed = false;
+    if (workTree.exitCode === 0) {
+      const toplevel = workTree.stdout.trim();
+      if (toplevel === clone.path) {
+        checks.push(this.check("clone-is-work-tree", host, "pass", `git work tree at ${clone.path}`));
+        clonePassed = true;
+      } else {
+        checks.push(
+          this.check(
+            "clone-is-work-tree",
+            host,
+            "fail",
+            `${clone.path} is inside another repository at ${toplevel}; use the clone's own root`,
+          ),
+        );
+      }
+    } else {
+      checks.push(
+        this.check(
+          "clone-is-work-tree",
+          host,
+          "fail",
+          `no git work tree at ${clone.path}; on ${host} run: git clone ${shellQuote(redactUserinfo(repository))} ${shellQuote(clone.path)}`,
+        ),
+      );
+    }
+
+    checks.push(await this.originMatches(executor, host, clone.path, repository));
+    checks.push(await this.worktreeRootExists(executor, host, clone.worktreeRoot));
+    checks.push(await this.laneDirIgnored(executor, host, clone.path));
+    checks.push(await this.agentInstructionsTracked(executor, host, clone.path));
+    return clonePassed;
+  }
+
+  private async originMatches(
+    executor: CommandExecutorPort,
+    host: string,
+    path: string,
+    repository: string,
+  ): Promise<ProjectProbeCheck> {
+    const origin = await this.runGit(executor, ["-C", path, "remote", "get-url", "origin"]);
+    if (this.unreachable(origin)) {
+      return this.check("origin-matches", host, "unknown", `${host} did not answer`);
+    }
+    if (
+      origin.exitCode === 0 &&
+      normaliseRepository(origin.stdout) === normaliseRepository(repository)
+    ) {
+      return this.check("origin-matches", host, "pass", "origin matches");
+    }
+    return this.check("origin-matches", host, "fail", "origin does not match the profile's repository");
+  }
+
+  private async worktreeRootExists(
+    executor: CommandExecutorPort,
+    host: string,
+    worktreeRoot: string,
+  ): Promise<ProjectProbeCheck> {
+    const rootExists = await this.runCommand(executor, ["test", "-d", worktreeRoot]);
+    if (this.unreachable(rootExists)) {
+      return this.check("worktree-root-exists", host, "unknown", `${host} did not answer`);
+    }
+    if (rootExists.exitCode === 0) {
+      return this.check("worktree-root-exists", host, "pass", "worktree root exists");
+    }
+    if (rootExists.exitCode === 1) {
+      return this.check(
+        "worktree-root-exists",
+        host,
+        "fail",
+        `missing; on ${host} run: mkdir -p ${shellQuote(worktreeRoot)}`,
+      );
+    }
+    return this.check("worktree-root-exists", host, "unknown", `${host} did not answer`);
+  }
+
+  private async laneDirIgnored(
+    executor: CommandExecutorPort,
+    host: string,
+    path: string,
+  ): Promise<ProjectProbeCheck> {
+    const laneIgnored = await this.runGit(executor, [
+      "-C",
+      path,
+      "check-ignore",
+      "-q",
+      ".lane/probe.md",
+    ]);
+    if (this.unreachable(laneIgnored)) {
+      return this.check("lane-dir-ignored", host, "unknown", `${host} did not answer`);
+    }
+    if (laneIgnored.exitCode === 0) {
+      return this.check("lane-dir-ignored", host, "pass", ".lane/ is ignored");
+    }
+    if (laneIgnored.exitCode === 1) {
+      return this.check(
+        "lane-dir-ignored",
+        host,
+        "fail",
+        `.lane/ is not ignored; add the line .lane/ to ${shellQuote(path + "/.gitignore")}`,
+      );
+    }
+    return this.check("lane-dir-ignored", host, "unknown", `${host} did not answer`);
   }
 
   /** The `repository-answers` check plus the branch it named, if any. */
@@ -359,7 +405,7 @@ export class ProjectProbeAdapter implements ProjectProbePort {
     if (typeof scripts !== "object" || scripts === null || Array.isArray(scripts)) return [];
     return Object.keys(scripts)
       .filter((name) => /^[A-Za-z0-9:_.-]{1,64}$/.test(name))
-      .sort()
+      .sort(compareCodeUnits)
       .slice(0, 200);
   }
 

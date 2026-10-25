@@ -54,7 +54,7 @@ function fakeExecutor(
         const marker = Object.keys(canned).find((key) => joined.includes(key));
         const partial =
           marker !== undefined ? { exitCode: 0, ...canned[marker] } : { exitCode: 2 };
-        return { exitCode: 2, signal: null, stdout: '', stderr: '', ...partial };
+        return { signal: null, stdout: '', stderr: '', ...partial };
       },
     },
     calls,

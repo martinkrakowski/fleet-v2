@@ -401,4 +401,18 @@ describe("projects client source text", () => {
       );
     }
   });
+
+describe("projects list empty states", () => {
+  it("tells an empty station how to register a project, separately from a filter miss", () => {
+    const source = readFileSync(
+      new URL("./projects-client.tsx", import.meta.url),
+      "utf8",
+    );
+    expect(source).toContain("data.projects.length === 0 ?");
+    expect(source).toContain("No projects registered.");
+    expect(source).toContain("fleet-v2 projects add");
+    expect(source).toContain("fleet-v2 projects adopt");
+    expect(source).toContain("No profiles match this filter.");
+  });
+});
 });

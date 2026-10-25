@@ -150,6 +150,17 @@ export function ProjectsClient({ data }: { data: ProjectsData }) {
                 </Tbody>
               </Table>
             </TableContainer>
+          ) : data.projects.length === 0 ? (
+            <EmptyState
+              title="No projects registered."
+              description={
+                <>
+                  Register one with <code>fleet-v2 projects add</code>, or{" "}
+                  <code>fleet-v2 projects adopt</code> for a project that
+                  already has work orders.
+                </>
+              }
+            />
           ) : (
             <EmptyState
               title="No profiles match this filter."

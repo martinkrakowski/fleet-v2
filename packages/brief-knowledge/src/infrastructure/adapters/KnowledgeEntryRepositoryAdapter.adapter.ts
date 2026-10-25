@@ -19,7 +19,7 @@ import type {
 import { isKnowledgeTriageFlag } from '../../domain/knowledge-records.js';
 import type { ContextSelectionProps } from '../../domain/value-objects/ContextSelection.vo.js';
 import type { KnowledgeEntryRepositoryPort } from '../../application/ports/out/KnowledgeEntryRepositoryPort.out-port.js';
-import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
+import { inspectRecordListBytes, quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 const ENTRIES_FILE = 'knowledge-entries.json';
 const SELECTIONS_FILE = 'context-selections.json';
@@ -27,6 +27,20 @@ const SELECTIONS_FILE = 'context-selections.json';
 export interface KnowledgeEntryRepositoryAdapterDependencies {
   /** When set, entries and selections persist as JSON files in this directory. */
   readonly stateDir?: string;
+}
+
+/** The entries reader's record parser, shared with `fleet-v2 state check`. */
+export function parseKnowledgeEntryStateRecord(raw: unknown): KnowledgeEntryRecord | undefined {
+  return typeof raw === 'object' && raw !== null && typeof (raw as { id?: unknown }).id === 'string'
+    ? (raw as KnowledgeEntryRecord)
+    : undefined;
+}
+
+/** The selections reader's record parser, shared with `fleet-v2 state check`. */
+export function parseContextSelectionStateRecord(raw: unknown): ContextSelectionProps | undefined {
+  return typeof raw === 'object' && raw !== null && typeof (raw as { attemptId?: unknown }).attemptId === 'string'
+    ? (raw as ContextSelectionProps)
+    : undefined;
 }
 
 export class KnowledgeEntryRepositoryAdapter implements KnowledgeEntryRepositoryPort {
@@ -197,59 +211,38 @@ export class KnowledgeEntryRepositoryAdapter implements KnowledgeEntryRepository
 
   private async readEntriesFromDisk(target: string): Promise<Map<string, KnowledgeEntryRecord>> {
     const map = new Map<string, KnowledgeEntryRecord>();
-    const stored = await readJsonFile(target);
-    if (stored === null) return map;
-    const { buffer, parsed } = stored;
-    if (!Array.isArray(parsed)) {
-      await quarantineUnreadable(target, 'expects a record list', buffer);
+    const buffer = await readStateBytes(target);
+    if (buffer === null) return map;
+    const inspection = inspectRecordListBytes(buffer, parseKnowledgeEntryStateRecord);
+    if (inspection.status === 'unreadable') {
+      return quarantineUnreadable(target, inspection.detail, buffer);
     }
-    const records = parsed as unknown[];
-    for (const [index, rawRecord] of records.entries()) {
-      if (!(rawRecord && typeof (rawRecord as { id?: unknown }).id === 'string')) {
-        await quarantineUnreadable(target, `record ${index} failed validation`, buffer);
-      }
-      map.set((rawRecord as KnowledgeEntryRecord).id, rawRecord as KnowledgeEntryRecord);
+    for (const record of inspection.records) {
+      map.set(record.id, record);
     }
     return map;
   }
 
   private async readSelectionsFromDisk(target: string): Promise<ContextSelectionProps[]> {
-    const stored = await readJsonFile(target);
-    if (stored === null) return [];
-    const { buffer, parsed } = stored;
-    if (!Array.isArray(parsed)) {
-      await quarantineUnreadable(target, 'expects a record list', buffer);
+    const buffer = await readStateBytes(target);
+    if (buffer === null) return [];
+    const inspection = inspectRecordListBytes(buffer, parseContextSelectionStateRecord);
+    if (inspection.status === 'unreadable') {
+      return quarantineUnreadable(target, inspection.detail, buffer);
     }
-    const valid: ContextSelectionProps[] = [];
-    for (const [index, rawProps] of (parsed as unknown[]).entries()) {
-      if (!(rawProps && typeof (rawProps as { attemptId?: unknown }).attemptId === 'string')) {
-        await quarantineUnreadable(target, `record ${index} failed validation`, buffer);
-      }
-      valid.push(rawProps as ContextSelectionProps);
-    }
-    return valid;
+    return [...inspection.records];
   }
 }
 
-async function readJsonFile(
-  filePath: string,
-): Promise<{ buffer: Buffer; parsed: unknown } | null> {
-  let buffer: Buffer;
+async function readStateBytes(filePath: string): Promise<Buffer | null> {
   try {
-    buffer = await fs.readFile(filePath);
+    return await fs.readFile(filePath);
   } catch (error: unknown) {
     if (isEnoent(error)) {
       return null;
     }
     throw error;
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(buffer.toString('utf8'));
-  } catch {
-    await quarantineUnreadable(filePath, 'not valid JSON', buffer);
-  }
-  return { buffer, parsed };
 }
 
 function isEnoent(error: unknown): boolean {

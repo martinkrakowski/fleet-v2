@@ -14,17 +14,22 @@
  */
 
 import type { ProjectProfileRecord } from '../../domain/coordination-records.js';
-import { ProjectProfile } from '../../domain/entities/ProjectProfile.js';
 import type { InstallationReferencePort } from '../ports/out/InstallationReferencePort.out-port.js';
-import {
-  ProjectProfileRevisionConflictError,
-  type ProjectProfileRepositoryPort,
-} from '../ports/out/ProjectProfileRepositoryPort.out-port.js';
+import type { ProjectProfileRepositoryPort } from '../ports/out/ProjectProfileRepositoryPort.out-port.js';
 import type {
   RegisterProjectProfilePort,
   RegisterProjectProfileRequest,
   RegisterProjectProfileResult,
 } from '../ports/in/RegisterProjectProfilePort.in-port.js';
+import {
+  checkInstallationNames,
+  findCredentialName,
+  isFilled,
+  isPlainObject,
+  parseProfileRecord,
+  saveProfileWithConflictCheck,
+  trimString,
+} from './profile-write-checks.js';
 
 export interface RegisterProjectProfileDependencies {
   readonly profileRepo: ProjectProfileRepositoryPort;
@@ -40,63 +45,6 @@ const REQUIRED_TEXT_FIELDS = [
 ] as const;
 
 const FORBIDDEN_REGISTRATION_FIELDS = ['status', 'lastProbe', 'revision'] as const;
-
-/**
- * Field and capability names that would move a secret into persisted
- * installation state. Only names are inspected; values are never read, copied
- * or compared.
- */
-const CREDENTIAL_NAME_PATTERN =
-  /(token|secret|credential|password|passphrase|api[-_]?key|private[-_]?key|access[-_]?key|authorization|cookie)/i;
-
-function findCredentialName(names: readonly string[]): string | null {
-  for (const name of names) {
-    if (CREDENTIAL_NAME_PATTERN.test(name)) {
-      return name;
-    }
-  }
-  return null;
-}
-
-function isFilled(value: unknown): value is string {
-  return typeof value === 'string' && value.trim().length > 0;
-}
-
-/**
- * Check a candidate profile's host and procedure names against the loaded
- * installation. Returns null when the names are acceptable or no installation
- * reference was supplied; otherwise the refusal reason. The designated
- * dispatcher host is checked first, then clone hosts in sorted order, then
- * gate procedures.
- */
-function checkInstallationNames(
-  installationRefs: InstallationReferencePort | undefined,
-  profile: ProjectProfileRecord,
-): string | null {
-  if (installationRefs === undefined) {
-    return null;
-  }
-  const refs = installationRefs.references();
-  if (refs === null) {
-    return 'no installation is loaded to check host and procedure names against';
-  }
-  const hostNames = new Set(refs.hostNames);
-  if (!hostNames.has(profile.designatedDispatcherHost)) {
-    return `designatedDispatcherHost ${profile.designatedDispatcherHost} is not a host in the installation`;
-  }
-  for (const host of Object.keys(profile.clones).sort()) {
-    if (!hostNames.has(host)) {
-      return `clone host ${host} is not a host in the installation`;
-    }
-  }
-  const procedureNames = new Set(refs.procedureNames);
-  for (const procedure of profile.gateProcedures) {
-    if (!procedureNames.has(procedure)) {
-      return `gate procedure ${procedure} is not a verification procedure in the installation`;
-    }
-  }
-  return null;
-}
 
 export class RegisterProjectProfileUseCase implements RegisterProjectProfilePort {
   constructor(private readonly deps?: RegisterProjectProfileDependencies) {}
@@ -120,48 +68,15 @@ export class RegisterProjectProfileUseCase implements RegisterProjectProfilePort
     // A configured runtime still refuses a non-plain request object instead of
     // inventing one; the HTTP boundary always supplies an object body, and an
     // empty object body is rejected by the field validation below.
-    if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    if (!isPlainObject(input)) {
       return { outcome: 'rejected', reason: 'request must be an object' };
     }
     const request = input as RegisterProjectProfileRequest;
-    for (const field of FORBIDDEN_REGISTRATION_FIELDS) {
-      if (Object.prototype.hasOwnProperty.call(request, field)) {
-        return { outcome: 'rejected', reason: `${field} cannot be set by registration` };
-      }
+    const fieldError = this.validateRequestFields(request);
+    if (fieldError !== null) {
+      return { outcome: 'rejected', reason: fieldError };
     }
-    const credentialField = findCredentialName(Object.keys(request));
-    if (credentialField !== null) {
-      return {
-        outcome: 'rejected',
-        reason: `profile registration must not carry a credential field: ${credentialField}`,
-      };
-    }
-    for (const field of REQUIRED_TEXT_FIELDS) {
-      if (!isFilled(request[field])) {
-        return { outcome: 'rejected', reason: `profile registration requires a non-empty ${field}` };
-      }
-    }
-    if (
-      !Number.isInteger(request.maxConcurrentLanes) ||
-      request.maxConcurrentLanes < 1
-    ) {
-      return {
-        outcome: 'rejected',
-        reason: 'profile registration requires a positive integer maxConcurrentLanes',
-      };
-    }
-    const capabilities: Readonly<Record<string, boolean | string>> = request.runnerCapabilities;
-    if (typeof capabilities !== 'object' || capabilities === null) {
-      return { outcome: 'rejected', reason: 'profile registration requires a runnerCapabilities map' };
-    }
-    const credentialCapability = findCredentialName(Object.keys(capabilities));
-    if (credentialCapability !== null) {
-      return {
-        outcome: 'rejected',
-        reason: `runner capability must not carry a credential value: ${credentialCapability}`,
-      };
-    }
-    const projectId = request.projectId.trim();
+    const projectId = trimString(request.projectId);
     const existing = await this.deps.profileRepo.findProfileById(projectId);
     if (existing !== null) {
       return {
@@ -169,18 +84,74 @@ export class RegisterProjectProfileUseCase implements RegisterProjectProfilePort
         reason: `project ${projectId} is already registered; edit it with update`,
       };
     }
+    const candidate = this.buildCandidateRecord(request, projectId);
+    const parsed = parseProfileRecord(candidate, 'profile registration was refused');
+    if ('reason' in parsed) {
+      return { outcome: 'rejected', reason: parsed.reason };
+    }
+    const nameError = checkInstallationNames(this.deps.installationRefs, parsed.profile);
+    if (nameError !== null) {
+      return { outcome: 'rejected', reason: nameError };
+    }
+    const conflictError = await saveProfileWithConflictCheck(
+      this.deps.profileRepo,
+      parsed.profile,
+      projectId,
+    );
+    if (conflictError !== null) {
+      return { outcome: 'rejected', reason: conflictError };
+    }
+    return { outcome: 'registered', profile: parsed.profile };
+  }
+
+  private validateRequestFields(request: RegisterProjectProfileRequest): string | null {
+    for (const key of FORBIDDEN_REGISTRATION_FIELDS) {
+      if (Object.hasOwn(request, key)) {
+        return `${key} cannot be set by registration`;
+      }
+    }
+    const credentialField = findCredentialName(Object.keys(request));
+    if (credentialField !== null) {
+      return `profile registration must not carry a credential field: ${credentialField}`;
+    }
+    for (const field of REQUIRED_TEXT_FIELDS) {
+      if (!isFilled(request[field])) {
+        return `profile registration requires a non-empty ${field}`;
+      }
+    }
+    if (!Number.isInteger(request.maxConcurrentLanes) || request.maxConcurrentLanes < 1) {
+      return 'profile registration requires a positive integer maxConcurrentLanes';
+    }
+    return this.validateRunnerCapabilities(request.runnerCapabilities);
+  }
+
+  private validateRunnerCapabilities(capabilities: unknown): string | null {
+    if (typeof capabilities !== 'object' || capabilities === null) {
+      return 'profile registration requires a runnerCapabilities map';
+    }
+    const credentialCapability = findCredentialName(Object.keys(capabilities));
+    if (credentialCapability !== null) {
+      return `runner capability must not carry a credential value: ${credentialCapability}`;
+    }
+    return null;
+  }
+
+  private buildCandidateRecord(
+    request: RegisterProjectProfileRequest,
+    projectId: string,
+  ): ProjectProfileRecord {
     // The composition root supplies the clock; no authority depends on it here.
     const nowIso = isFilled(request.nowIso) ? request.nowIso : new Date().toISOString();
     // A new profile starts at revision 0 with the entity's v2 defaults; the
     // optional v2 request fields are the only way to set them.
-    const candidate: ProjectProfileRecord = {
+    return {
       projectId,
-      displayName: request.displayName.trim(),
-      repository: request.repository.trim(),
-      designatedDispatcherHost: request.designatedDispatcherHost.trim(),
-      policyRevision: request.policyRevision.trim(),
+      displayName: trimString(request.displayName),
+      repository: trimString(request.repository),
+      designatedDispatcherHost: trimString(request.designatedDispatcherHost),
+      policyRevision: trimString(request.policyRevision),
       maxConcurrentLanes: request.maxConcurrentLanes,
-      runnerCapabilities: Object.freeze({ ...capabilities }),
+      runnerCapabilities: Object.freeze({ ...request.runnerCapabilities }),
       revision: 0,
       updatedAtIso: nowIso,
       status: 'active',
@@ -190,30 +161,5 @@ export class RegisterProjectProfileUseCase implements RegisterProjectProfilePort
       defaultAllowedPathPrefixes: request.defaultAllowedPathPrefixes ?? [],
       lastProbe: null,
     };
-    let profile: ProjectProfileRecord;
-    try {
-      profile = ProjectProfile.fromRecord(candidate).toRecord();
-    } catch (error) {
-      return {
-        outcome: 'rejected',
-        reason: error instanceof Error ? error.message : 'profile registration was refused',
-      };
-    }
-    const nameCheck = checkInstallationNames(this.deps.installationRefs, profile);
-    if (nameCheck !== null) {
-      return { outcome: 'rejected', reason: nameCheck };
-    }
-    try {
-      await this.deps.profileRepo.saveProfile(profile);
-    } catch (error) {
-      if (error instanceof ProjectProfileRevisionConflictError) {
-        return {
-          outcome: 'rejected',
-          reason: `profile ${projectId} changed while it was being written; read it again and retry`,
-        };
-      }
-      throw error;
-    }
-    return { outcome: 'registered', profile };
   }
 }

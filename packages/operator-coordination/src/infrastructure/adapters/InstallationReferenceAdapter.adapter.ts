@@ -10,6 +10,13 @@ import type {
   InstallationReferences,
 } from '../../application/ports/out/InstallationReferencePort.out-port.js';
 
+function compareCodeUnits(a: string, b: string): number {
+  if (a < b) {
+    return -1;
+  }
+  return a > b ? 1 : 0;
+}
+
 export class InstallationReferenceAdapter implements InstallationReferencePort {
   constructor(private readonly refs: InstallationReferences | null = null) {}
 
@@ -18,8 +25,8 @@ export class InstallationReferenceAdapter implements InstallationReferencePort {
       return null;
     }
     return Object.freeze({
-      hostNames: Object.freeze([...this.refs.hostNames].sort()),
-      procedureNames: Object.freeze([...this.refs.procedureNames].sort()),
+      hostNames: Object.freeze([...this.refs.hostNames].sort(compareCodeUnits)),
+      procedureNames: Object.freeze([...this.refs.procedureNames].sort(compareCodeUnits)),
     });
   }
 }

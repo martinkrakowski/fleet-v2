@@ -5,7 +5,7 @@ import { readFile, rm } from 'node:fs/promises';
 import { LocalExecutor } from '../LocalExecutor.adapter.js';
 import { SshExecutor, posixQuote, sshArgvFor } from '../SshExecutor.adapter.js';
 import { runSpawnOutcome } from '../spawn-run.js';
-import { executorForHost, resolveRoleExecutors } from '../ExecutorSelector.adapter.js';
+import { executorForHost, executorForInstallationHost, resolveRoleExecutors } from '../ExecutorSelector.adapter.js';
 import { WorkspaceAdapter } from '../WorkspaceAdapter.adapter.js';
 import { AttemptArtifactAdapter } from '../AttemptArtifactAdapter.adapter.js';
 import { ExecutionRunnerAdapter, RunnerSubprocessError, runViaExecFile } from '../ExecutionRunnerAdapter.adapter.js';
@@ -444,6 +444,55 @@ describe('resolveRoleExecutors', () => {
         hosts: { broken: { transport: 'ssh', roles: ['lane-runner'] } },
       }),
     ).toThrow(/sshAlias/);
+  });
+});
+
+describe('executorForInstallationHost', () => {
+  it('refuses every name when hosts is undefined with the no-v2 reason', () => {
+    expect(executorForInstallationHost(undefined, 'orch')).toEqual({
+      ok: false,
+      reason: 'no v2 installation names lane hosts',
+    });
+  });
+
+  it('refuses a host that is not an own property with the installation reason', () => {
+    expect(executorForInstallationHost({ orch: { transport: 'local' } }, 'missing-host')).toEqual({
+      ok: false,
+      reason: 'host missing-host is not in the installation',
+    });
+  });
+
+  it('builds a local executor for a local host spec', () => {
+    const result = executorForInstallationHost(
+      { orch: { transport: 'local', roles: ['orchestrator'] } },
+      'orch',
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.executor).toBeInstanceOf(LocalExecutor);
+    }
+  });
+
+  it('builds an ssh executor from a host alias', () => {
+    const result = executorForInstallationHost(
+      { 'runner-1': { transport: 'ssh', sshAlias: 'runner-host', roles: ['lane-runner'] } },
+      'runner-1',
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.executor).toBeInstanceOf(SshExecutor);
+    }
+  });
+
+  it('reports an executorForHost throw as a refused reason', () => {
+    const result = executorForInstallationHost(
+      { broken: { transport: 'ssh' } },
+      'broken',
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain('sshAlias');
+    }
   });
 });
 

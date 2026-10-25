@@ -14,7 +14,7 @@ import type { WorkOrderRecord } from '../../domain/execution-records.js';
 import type { WorkOrderRepositoryPort } from '../../application/ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
 import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
-import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
+import { inspectRecordListBytes, quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface WorkOrderRepositoryAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
@@ -27,6 +27,11 @@ function isWorkOrderRecord(value: unknown): value is WorkOrderRecord {
   if (typeof value !== 'object' || value === null) return false;
   const candidate = value as Record<string, unknown>;
   return typeof candidate.id === 'string' && typeof candidate.revision === 'number';
+}
+
+/** The reader's record parser, shared with `fleet-v2 state check`. */
+export function parseWorkOrderStateRecord(raw: unknown): WorkOrderRecord | undefined {
+  return isWorkOrderRecord(raw) ? raw : undefined;
 }
 
 export class WorkOrderRepositoryAdapter implements WorkOrderRepositoryPort {
@@ -142,22 +147,11 @@ export class WorkOrderRepositoryAdapter implements WorkOrderRepositoryPort {
       }
       throw error;
     }
-    const raw = buffer.toString('utf8');
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      await quarantineUnreadable(target, 'not valid JSON', buffer);
+    const inspection = inspectRecordListBytes(buffer, parseWorkOrderStateRecord);
+    if (inspection.status === 'unreadable') {
+      return quarantineUnreadable(target, inspection.detail, buffer);
     }
-    if (!Array.isArray(parsed)) {
-      await quarantineUnreadable(target, 'expects a record list', buffer);
-    }
-    const records = parsed as unknown[];
-    for (const [index, rawItem] of records.entries()) {
-      if (!isWorkOrderRecord(rawItem)) {
-        await quarantineUnreadable(target, `record ${index} failed validation`, buffer);
-      }
-      const item = rawItem as WorkOrderRecord;
+    for (const item of inspection.records) {
       map.set(item.id, item);
     }
     return map;

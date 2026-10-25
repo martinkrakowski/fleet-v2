@@ -191,8 +191,11 @@ describe('fleet-v2 state', () => {
     const line = stdout.find((text) => text.startsWith('  quarantine attempts.json.'));
     expect(line).toBeDefined();
     expect(line!.endsWith(`unreadable: not valid JSON, ${garbage.length} bytes\n`)).toBe(true);
-    expect(stdout.at(-1)).toBe(
+    expect(stdout[stdout.length - 2]).toBe(
       'nothing was changed; the quarantine copies listed above are kept for recovery\n',
+    );
+    expect(stdout.at(-1)).toBe(
+      'restore one with: fleet-v2 state restore <file> --from <quarantine copy name>\n',
     );
   });
 

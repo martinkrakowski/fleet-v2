@@ -23,6 +23,8 @@ export * from "./LocalExecutor.adapter.js";
 export * from "./OpencodeDbUsageAdapter.adapter.js";
 export * from "./OwnerDecisionAdapter.adapter.js";
 export * from "./ProjectProbeAdapter.adapter.js";
+export * from "./ProjectProbeRecordAdapter.adapter.js";
+export * from "./ProjectProfileReadAdapter.adapter.js";
 export * from "./RunnerForAttemptAdapter.adapter.js";
 export * from "./RunnerSelectorAdapter.adapter.js";
 export * from "./spawn-run.js";

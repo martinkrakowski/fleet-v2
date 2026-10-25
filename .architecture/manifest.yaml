@@ -356,6 +356,7 @@ bounded_contexts:
           - InspectWorkOrderUseCase
           - InspectAttemptUseCase
           - ListAttemptsUseCase
+          - ProbeProjectUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -371,6 +372,7 @@ bounded_contexts:
             - InspectWorkOrderPort
             - InspectAttemptPort
             - ListAttemptsPort
+            - ProbeProjectPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -394,8 +396,10 @@ bounded_contexts:
             - AllowedSeatPort
             - UsagePort
             - ProjectProbePort
+            - ProjectProfileReadPort
+            - ProjectProbeRecordPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, LocalExecutor, SshExecutor]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -430,6 +434,9 @@ bounded_contexts:
       BriefKnowledgePort: "Request bounded context proposals, record selected versions and forward only completed-attempt notes to the knowledge context."
       ActionAuthorizationPort: "Obtain and durably consume an applicable scope-bound grant from operator coordination; pending or unknown results block the action."
       ExecutionObservationPort: "Publish recorded lifecycle observations through coordination; preserve a delivery gap without failing the lane."
+      ProbeProjectPort: "Probe one registered project read-only: read its profile, check its repository and clones and that its gate procedures exist in the installation, and record the receipt only if the profile did not change while it was probed."
+      ProjectProfileReadPort: "Read one project profile and its revision from the coordination context; known absence is null."
+      ProjectProbeRecordPort: "Record a probe receipt on a profile at the revision the probe started from; a changed profile is a typed rejection, never an overwrite."
       ProjectProbePort: "Read-only check of a project before registration or after an edit: the repository answers, and on each named host the clone is a git work tree whose origin matches, the worktree root exists, .lane/ is ignored and an agent instruction file is tracked; an unreachable host is unknown, a failing check carries the command that would fix it and nothing is ever run to fix it."
       UsagePort: "Read what an attempt's recorded opencode session cost from opencode's own database on the recorded runner host; an attempt with no session id is unavailable with reason no session id, and a failed read never changes collection."
     adapter_bindings:
@@ -445,6 +452,14 @@ bounded_contexts:
       - { adapter: LaneDiffCheckAdapter, implements: LaneDiffCheckPort, integration: injected-command-executor-git-collection }
       - { adapter: OpencodeDbUsageAdapter, implements: UsagePort, integration: opencode-db-read-via-recorded-host-node-script }
       - { adapter: ProjectProbeAdapter, implements: ProjectProbePort, integration: injected-command-executor-read-only-git-probe }
+      - adapter: ProjectProfileReadAdapter
+        implements: ProjectProfileReadPort
+        integration: in-process
+        delegates_to: [operator-coordination/InspectProjectProfilePort]
+      - adapter: ProjectProbeRecordAdapter
+        implements: ProjectProbeRecordPort
+        integration: in-process
+        delegates_to: [operator-coordination/RecordProjectProbePort]
       - { adapter: LocalExecutor, implements: CommandExecutorPort, integration: local-execfile-argv-no-shell }
       - { adapter: SshExecutor, implements: CommandExecutorPort, integration: batch-mode-ssh-quoted-argv }
       - { adapter: WorkspaceAdapter, implements: WorkspacePort, integration: reviewed-git-worktree-subprocess }

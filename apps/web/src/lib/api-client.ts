@@ -55,6 +55,14 @@ export interface FleetWebApiClient {
   ): Promise<LiveEndpointResult<T>>;
   fetchCoordinationView<T>(fallback: T): Promise<LiveEndpointResult<T>>;
   fetchAttentionView<T>(fallback: T): Promise<LiveEndpointResult<T>>;
+  fetchProjectList<T>(
+    query: { readonly status?: "active" | "retired" },
+    fallback: T,
+  ): Promise<LiveEndpointResult<T>>;
+  fetchProjectView<T>(
+    projectId: string,
+    fallback: T,
+  ): Promise<LiveEndpointResult<T>>;
 }
 
 function apiResult<T>(
@@ -254,6 +262,26 @@ export function createFleetWebApiClient(
       fallback: T,
     ): Promise<LiveEndpointResult<T>> {
       return read("/v1/attention", fallback);
+    },
+    fetchProjectList<T>(
+      query: { readonly status?: "active" | "retired" },
+      fallback: T,
+    ): Promise<LiveEndpointResult<T>> {
+      const params = new URLSearchParams();
+      if (query.status !== undefined) {
+        params.set("status", query.status);
+      }
+      const queryString = params.toString();
+      return read(
+        queryString ? `/v1/projects?${queryString}` : "/v1/projects",
+        fallback,
+      );
+    },
+    fetchProjectView<T>(
+      projectId: string,
+      fallback: T,
+    ): Promise<LiveEndpointResult<T>> {
+      return read(`/v1/projects/${encodeURIComponent(projectId)}`, fallback);
     },
   };
 }

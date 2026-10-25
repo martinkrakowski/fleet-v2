@@ -587,4 +587,83 @@ describe("createFleetWebApiClient", () => {
       expect(result.fallbackReason).toContain("/v1/attempts");
     });
   });
+
+  describe("fetchProjectList and fetchProjectView", () => {
+    it("uses /v1/projects with no query when none is given", async () => {
+      requestedUrls = [];
+      const client = clientWith(() =>
+        Promise.resolve(jsonResponse(200, { ok: true })),
+      );
+
+      await client.fetchProjectList({}, null);
+
+      expect(requestedUrls).toEqual([`${BASE_URL}/v1/projects`]);
+    });
+
+    it("encodes status into the query string", async () => {
+      requestedUrls = [];
+      const client = clientWith(() =>
+        Promise.resolve(jsonResponse(200, { ok: true })),
+      );
+
+      await client.fetchProjectList({ status: "retired" }, null);
+
+      expect(requestedUrls).toEqual([
+        `${BASE_URL}/v1/projects?status=retired`,
+      ]);
+    });
+
+    it("addresses /v1/projects/:id with an encoded id", async () => {
+      requestedUrls = [];
+      const client = clientWith(() =>
+        Promise.resolve(jsonResponse(200, { ok: true })),
+      );
+
+      await client.fetchProjectView("fleet v2/x", null);
+
+      expect(requestedUrls).toEqual([
+        `${BASE_URL}/v1/projects/fleet%20v2%2Fx`,
+      ]);
+    });
+
+    it("requests no-store so a server render never serves a cached list", async () => {
+      let capturedInit: RequestInit | undefined;
+      const client = createFleetWebApiClient({
+        baseUrl: BASE_URL,
+        fetchImpl: async (_input, init) => {
+          capturedInit = init;
+          return jsonResponse(200, { ok: true });
+        },
+      });
+
+      await client.fetchProjectList({}, null);
+
+      expect(capturedInit?.cache).toBe("no-store");
+    });
+
+    it("falls back to the fixture on a 501 for both reads", async () => {
+      const client = clientWith(() =>
+        Promise.resolve(
+          jsonResponse(NOT_IMPLEMENTED_STATUS, {
+            operationId: "op-1",
+            code: "NOT_IMPLEMENTED",
+            result: null,
+          }),
+        ),
+      );
+
+      const list = await client.fetchProjectList({}, WORK_ORDER_FIXTURE);
+      expect(list.source).toBe("fixture-fallback");
+      expect(list.status).toBe(501);
+      expect(list.data).toBe(WORK_ORDER_FIXTURE);
+      expect(list.fallbackReason).toContain("NOT_IMPLEMENTED");
+      expect(list.fallbackReason).toContain("/v1/projects");
+
+      const view = await client.fetchProjectView("proj-nope", WORK_ORDER_FIXTURE);
+      expect(view.source).toBe("fixture-fallback");
+      expect(view.status).toBe(501);
+      expect(view.data).toBe(WORK_ORDER_FIXTURE);
+      expect(view.fallbackReason).toContain("/v1/projects/");
+    });
+  });
 });

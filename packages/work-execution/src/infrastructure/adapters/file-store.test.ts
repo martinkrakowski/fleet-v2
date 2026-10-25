@@ -1,9 +1,16 @@
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { FileLockTimeoutError, withFileLock, writeJsonAtomically } from './file-store.js';
+import {
+  FileLockTimeoutError,
+  StateFileUnreadableError,
+  quarantineUnreadable,
+  withFileLock,
+  writeJsonAtomically,
+} from './file-store.js';
 
 /** An explicit one-way latch: the test decides when the holder may proceed. */
 function createLatch(): { promise: Promise<void>; resolve: () => void } {
@@ -139,5 +146,84 @@ describe('withFileLock', () => {
     // Release in finally must not unlink the file because the token does not match
     const content = await fs.readFile(lockPath, 'utf8');
     expect(content).toBe(foreignToken);
+  });
+});
+
+describe('quarantineUnreadable', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-quarantine-test-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  function sha256Of(bytes: Uint8Array): string {
+    return createHash('sha256').update(bytes).digest('hex');
+  }
+
+  it('keeps a byte-identical copy (0o600) in a 0o700 directory, names both paths, and leaves the original untouched', async () => {
+    const filePath = path.join(tempDir, 'attempts.json');
+    const bytes = Buffer.from('{ \u0000 not valid json\n', 'utf8');
+    await fs.writeFile(filePath, bytes);
+
+    let caught: unknown;
+    try {
+      await quarantineUnreadable(filePath, 'not valid JSON');
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(StateFileUnreadableError);
+    const error = caught as StateFileUnreadableError;
+    expect(error.filePath).toBe(filePath);
+    expect(error.quarantinePath).not.toBeNull();
+    expect(error.message).toContain(filePath);
+    expect(error.message).toContain(error.quarantinePath!);
+    expect(error.message).toContain("run 'fleet-v2 state check'");
+
+    // The original file is untouched.
+    expect(sha256Of(await fs.readFile(filePath))).toBe(sha256Of(bytes));
+
+    // The quarantine copy is byte-identical.
+    const quarantinePath = error.quarantinePath!;
+    expect(sha256Of(await fs.readFile(quarantinePath))).toBe(sha256Of(bytes));
+
+    // Modes: copy 0o600, directory 0o700.
+    expect((await fs.stat(quarantinePath)).mode & 0o777).toBe(0o600);
+    const quarantineDir = path.join(tempDir, 'quarantine');
+    expect((await fs.stat(quarantineDir)).mode & 0o777).toBe(0o700);
+  });
+
+  it('keeps only the 5 newest quarantine copies for a basename after a sixth failure', async () => {
+    const filePath = path.join(tempDir, 'attempts.json');
+    for (let index = 0; index < 6; index += 1) {
+      await fs.writeFile(filePath, `{ corrupt #${index}`, 'utf8');
+      await expect(quarantineUnreadable(filePath, 'not valid JSON')).rejects.toBeInstanceOf(
+        StateFileUnreadableError,
+      );
+    }
+    const copies = await fs.readdir(path.join(tempDir, 'quarantine'));
+    expect(copies).toHaveLength(5);
+    for (const copy of copies) {
+      expect(copy.startsWith('attempts.json.')).toBe(true);
+    }
+  });
+
+  it('throws with quarantinePath null when the copy itself fails', async () => {
+    // The parent directory does not exist, so reading/copying fails.
+    const filePath = path.join(tempDir, 'missing', 'attempts.json');
+    let caught: unknown;
+    try {
+      await quarantineUnreadable(filePath, 'not valid JSON');
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(StateFileUnreadableError);
+    const error = caught as StateFileUnreadableError;
+    expect(error.quarantinePath).toBeNull();
+    expect(error.message).toContain('could not be copied');
   });
 });

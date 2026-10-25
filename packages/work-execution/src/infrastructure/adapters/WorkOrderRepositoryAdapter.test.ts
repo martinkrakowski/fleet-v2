@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -5,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { WorkOrderRecord } from '../../domain/execution-records.js';
 import { WorkOrderRepositoryAdapter } from './WorkOrderRepositoryAdapter.adapter.js';
+import { StateFileUnreadableError } from './file-store.js';
 
 describe('WorkOrderRepositoryAdapter cross-process safe persistence', () => {
   let tempDir: string;
@@ -126,5 +128,71 @@ describe('WorkOrderRepositoryAdapter cross-process safe persistence', () => {
 
     const contentAfter = await fs.readFile(filePath, 'utf8');
     expect(contentAfter).toBe(corruptContent);
+  });
+});
+
+describe('WorkOrderRepositoryAdapter quarantines unreadable state files', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-work-order-quarantine-test-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  function makeWorkOrder(): WorkOrderRecord {
+    return {
+      id: 'wo-1',
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      laneId: 'lane-1',
+      repository: 'repo-1',
+      baseCommit: 'commit-1',
+      ownedPaths: ['src/a'],
+      policyRevision: 'pol-1',
+      prerequisiteWorkOrderIds: [],
+      state: 'approved',
+      revision: 1,
+      createdAtIso: '2026-10-15T10:00:00.000Z',
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+  }
+
+  const workOrdersPath = () => path.join(tempDir, 'work-orders.json');
+  const quarantineDir = () => path.join(tempDir, 'quarantine');
+
+  it('throws StateFileUnreadableError and quarantines garbage bytes', async () => {
+    await fs.writeFile(workOrdersPath(), '{ not valid json', 'utf8');
+    const adapter = new WorkOrderRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.listWorkOrdersByProject()).rejects.toBeInstanceOf(StateFileUnreadableError);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+
+  it('throws StateFileUnreadableError and quarantines a wrong top-level shape', async () => {
+    await fs.writeFile(workOrdersPath(), JSON.stringify({ orders: [] }), 'utf8');
+    const adapter = new WorkOrderRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.listWorkOrdersByProject()).rejects.toBeInstanceOf(StateFileUnreadableError);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+
+  it('throws StateFileUnreadableError instead of skipping a record that fails validation', async () => {
+    await fs.writeFile(workOrdersPath(), JSON.stringify([makeWorkOrder(), { id: 'broken' }]), 'utf8');
+    const adapter = new WorkOrderRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.listWorkOrdersByProject()).rejects.toBeInstanceOf(StateFileUnreadableError);
+    expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+
+  it('throws and leaves the bytes unchanged when a save reads an unreadable file', async () => {
+    const garbage = '{ not valid json';
+    await fs.writeFile(workOrdersPath(), garbage, 'utf8');
+    const before = createHash('sha256').update(await fs.readFile(workOrdersPath())).digest('hex');
+    const adapter = new WorkOrderRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.saveWorkOrder(makeWorkOrder())).rejects.toBeInstanceOf(
+      StateFileUnreadableError,
+    );
+    const after = createHash('sha256').update(await fs.readFile(workOrdersPath())).digest('hex');
+    expect(after).toBe(before);
   });
 });

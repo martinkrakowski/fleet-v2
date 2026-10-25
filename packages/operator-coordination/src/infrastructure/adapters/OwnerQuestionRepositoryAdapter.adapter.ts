@@ -79,6 +79,11 @@ function copy(record: OwnerQuestionRecord): OwnerQuestionRecord {
   };
 }
 
+/** The reader's record parser, shared with `fleet-v2 state check`. */
+export function parseOwnerQuestionStateRecord(raw: unknown): OwnerQuestionRecord | undefined {
+  return OwnerQuestion.fromRecord(raw as OwnerQuestionRecord).toRecord();
+}
+
 export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPort {
   private readonly inMemoryQuestions = new Map<string, OwnerQuestionRecord>();
   private readonly changeSignal: ChangeSignalPort;
@@ -213,7 +218,7 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
     const records = await readRecordList(
       path,
       'OwnerQuestionRepositoryAdapter',
-      (entry) => OwnerQuestion.fromRecord(entry as OwnerQuestionRecord).toRecord(),
+      parseOwnerQuestionStateRecord,
     );
     const map = new Map<string, OwnerQuestionRecord>();
     for (const record of records) {

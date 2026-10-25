@@ -12,4 +12,5 @@ export * from "./OwnerQuestionRepositoryAdapter.adapter.js";
 export * from "./ProjectProfileRepositoryAdapter.adapter.js";
 export * from "./record-list-store.js";
 export * from "./RelayTransportAdapter.adapter.js";
+export * from "./state-files.js";
 export * from "./WavesHttpClient.adapter.js";

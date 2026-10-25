@@ -39,6 +39,11 @@ function copy(record: ProjectProfileRecord): ProjectProfileRecord {
   return ProjectProfile.fromRecord(record).toRecord();
 }
 
+/** The reader's record parser, shared with `fleet-v2 state check`. */
+export function parseProjectProfileStateRecord(raw: unknown): ProjectProfileRecord | undefined {
+  return ProjectProfile.fromRecord(raw as ProjectProfileRecord).toRecord();
+}
+
 export class ProjectProfileRepositoryAdapter implements ProjectProfileRepositoryPort {
   private readonly inMemoryProfiles = new Map<string, ProjectProfileRecord>();
   private readonly changeSignal: ChangeSignalPort;
@@ -173,8 +178,7 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
     const records = await readRecordList(
       path,
       'ProjectProfileRepositoryAdapter',
-      (entry) =>
-        ProjectProfile.fromRecord(entry as ProjectProfileRecord).toRecord(),
+      parseProjectProfileStateRecord,
     );
     const map = new Map<string, ProjectProfileRecord>();
     for (const profile of records) {

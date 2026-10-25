@@ -1,18 +1,17 @@
 /**
  * One shared reader for every operator-coordination JSON record-list store.
  *
- * A store file must be a JSON array; each entry is re-validated by the
- * calling adapter's domain constructor before it is returned, in file
- * order. Unreadable bytes never become readable state: the exact bytes are
- * quarantined and a StateFileUnreadableError names the reason. A missing
- * file is known absence (an empty list); any other read failure is thrown
- * as the calling adapter's "could not read" error, so a caller can always
- * tell the two apart.
+ * A store file must be a JSON array; the shared state-check parser validates
+ * it exactly as `fleet-v2 state check` would. Unreadable bytes never become
+ * readable state: the exact bytes are quarantined and a
+ * StateFileUnreadableError names the reason. A missing file is known absence
+ * (an empty list); any other read failure is thrown as the calling adapter's
+ * "could not read" error, so a caller can always tell the two apart.
  */
 
 import { promises as fs } from 'node:fs';
 
-import { quarantineUnreadable } from './file-store.js';
+import { inspectRecordListBytes, quarantineUnreadable } from './file-store.js';
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -29,7 +28,7 @@ function isNotFound(error: unknown): boolean {
 export async function readRecordList<T>(
   path: string,
   adapterName: string,
-  toRecord: (entry: unknown) => T,
+  parseRecord: (raw: unknown) => T | undefined,
 ): Promise<T[]> {
   let buffer: Buffer;
   try {
@@ -40,32 +39,9 @@ export async function readRecordList<T>(
     }
     throw new Error(`${adapterName} could not read ${path}: ${describe(error)}`);
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(buffer.toString('utf8'));
-  } catch {
-    await quarantineUnreadable(path, 'not valid JSON', buffer);
+  const inspection = inspectRecordListBytes(buffer, parseRecord);
+  if (inspection.status === 'unreadable') {
+    return quarantineUnreadable(path, inspection.detail, buffer);
   }
-  if (!Array.isArray(parsed)) {
-    await quarantineUnreadable(path, 'expects a record list', buffer);
-  }
-  const entries = parsed as unknown[];
-  const records: T[] = [];
-  let failureIndex: number | null = null;
-  for (const [index, entry] of entries.entries()) {
-    try {
-      records.push(toRecord(entry));
-    } catch {
-      failureIndex = index;
-      break;
-    }
-  }
-  if (failureIndex !== null) {
-    await quarantineUnreadable(
-      path,
-      `record ${failureIndex} failed validation`,
-      buffer,
-    );
-  }
-  return records;
+  return [...inspection.records];
 }

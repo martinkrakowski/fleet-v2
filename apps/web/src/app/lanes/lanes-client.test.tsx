@@ -51,16 +51,17 @@ describe("LanesClient live-source wiring", () => {
   });
 
   it("labels recorded rows without a slot", () => {
-    expect(attention).toContain(
-      'a.slot === null ? "no slot recorded" : `slot ${a.slot} stays held`',
-    );
+    // The wording itself is pinned by derive.test.ts (unknownAttention).
+    expect(attention).toContain("unknownAttention(a, note)");
   });
 
   it("refreshes only the visible live source on a schedule", () => {
     expect(refresh).toContain("30_000");
-    expect(refresh).toContain("shouldRefresh(source, document.visibilityState)");
+    expect(refresh).toContain(
+      "shouldRefresh(source, fallbackReason, document.visibilityState)",
+    );
     expect(refresh).toContain("router.refresh()");
-    expect(refresh).toContain('source === "api" && visibility === "visible"');
+    expect(refresh).toContain("[source, fallbackReason, intervalMs, router]");
   });
 });
 

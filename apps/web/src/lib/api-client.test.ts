@@ -523,4 +523,68 @@ describe("createFleetWebApiClient", () => {
       delete (process.env as Record<string, string>).NEXT_PUBLIC_TOKEN_FILE;
     });
   });
+
+  describe("fetchAttemptList", () => {
+    it("uses /v1/attempts with no query when none is given", async () => {
+      requestedUrls = [];
+      const client = clientWith(() =>
+        Promise.resolve(jsonResponse(200, { ok: true })),
+      );
+
+      await client.fetchAttemptList({}, null);
+
+      expect(requestedUrls).toEqual([`${BASE_URL}/v1/attempts`]);
+    });
+
+    it("encodes limit and projectId into the query string", async () => {
+      requestedUrls = [];
+      const client = clientWith(() =>
+        Promise.resolve(jsonResponse(200, { ok: true })),
+      );
+
+      await client.fetchAttemptList(
+        { limit: 200, projectId: "fleet-v2" },
+        null,
+      );
+
+      expect(requestedUrls).toEqual([
+        `${BASE_URL}/v1/attempts?limit=200&projectId=fleet-v2`,
+      ]);
+    });
+
+    it("requests no-store so a server render never serves a cached list", async () => {
+      let capturedInit: RequestInit | undefined;
+      const client = createFleetWebApiClient({
+        baseUrl: BASE_URL,
+        fetchImpl: async (_input, init) => {
+          capturedInit = init;
+          return jsonResponse(200, { ok: true });
+        },
+      });
+
+      await client.fetchAttemptList({ limit: 200 }, null);
+
+      expect(capturedInit?.cache).toBe("no-store");
+    });
+
+    it("falls back to the fixture on a 501", async () => {
+      const client = clientWith(() =>
+        Promise.resolve(
+          jsonResponse(NOT_IMPLEMENTED_STATUS, {
+            operationId: "op-1",
+            code: "NOT_IMPLEMENTED",
+            result: null,
+          }),
+        ),
+      );
+
+      const result = await client.fetchAttemptList({}, WORK_ORDER_FIXTURE);
+
+      expect(result.source).toBe("fixture-fallback");
+      expect(result.status).toBe(501);
+      expect(result.data).toBe(WORK_ORDER_FIXTURE);
+      expect(result.fallbackReason).toContain("NOT_IMPLEMENTED");
+      expect(result.fallbackReason).toContain("/v1/attempts");
+    });
+  });
 });

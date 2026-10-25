@@ -23,7 +23,6 @@ import type {
   ProjectAttentionSummaryRecord,
   ProjectProbeReceiptRecord,
   ProjectProfileRecord,
-  ProjectProbeReceiptRecord,
   RelayAcknowledgementRecord,
 } from '../../../domain/coordination-records.js';
 import type { ObservationEnvelopeProps } from '../../../domain/value-objects/ObservationEnvelope.vo.js';

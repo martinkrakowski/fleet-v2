@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 export interface FileLockOptions {
@@ -172,6 +172,26 @@ export async function writeJsonAtomically(filePath: string, data: unknown): Prom
   }
 }
 
+/**
+ * Persist raw bytes via an atomic write: writes to a process/timestamp-unique
+ * temp file first, then renames over the target path.
+ */
+export async function writeBytesAtomically(filePath: string, bytes: Buffer): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}-${Date.now()}-${tempFileCounter++}.tmp`;
+  try {
+    await fs.writeFile(tempPath, bytes);
+    await fs.rename(tempPath, filePath);
+  } catch (error: unknown) {
+    try {
+      await fs.rm(tempPath, { force: true });
+    } catch {
+      // ignore
+    }
+    throw error;
+  }
+}
+
 export interface QuarantinePostWriteNotes {
   readonly chmodFailed?: boolean;
   readonly pruneFailures?: number;
@@ -265,7 +285,8 @@ function quarantineCopyPattern(basename: string): RegExp {
 
 /**
  * Best-effort housekeeping: keep only the 5 newest quarantine copies for a
- * basename by name order, and never delete the copy just written. Every
+ * basename by name order, and never delete the copy just written. Protected
+ * names are never deleted and are kept in addition to the five. Every
  * candidate is tried even if an `rm` fails; returns the count of failures.
  */
 async function pruneQuarantineCopies(
@@ -273,6 +294,7 @@ async function pruneQuarantineCopies(
   basename: string,
   justWrittenName: string,
   fsImpl: QuarantineFs,
+  protectNames: readonly string[],
 ): Promise<number> {
   const pattern = quarantineCopyPattern(basename);
   let entries: string[];
@@ -304,7 +326,7 @@ async function pruneQuarantineCopies(
     });
   // The copy just written is always kept, even when a clock step makes it
   // sort as the oldest; the other four kept are the newest of the rest.
-  const others = copies.filter((name) => name !== justWrittenName);
+  const others = copies.filter((name) => name !== justWrittenName && !protectNames.includes(name));
   const candidates = others.slice(0, Math.max(0, others.length - 4));
   let failures = 0;
   for (const oldest of candidates) {
@@ -328,70 +350,82 @@ async function pruneQuarantineCopies(
  * `quarantinePath: null`; a later `chmod` or prune failure still reports the
  * written `quarantinePath`.
  */
-export async function quarantineUnreadable(
-  filePath: string,
-  detail: string,
+/** Write `bytes` under the first free name: `baseName`, then `-dup1` … `-dup5` on EEXIST. */
+async function writeFirstFreeCopy(
+  quarantineDir: string,
+  baseName: string,
   bytes: Buffer,
+  fsImpl: QuarantineFs,
+  dupIndex = 0,
+): Promise<string> {
+  const candidateName = dupIndex === 0 ? baseName : `${baseName}-dup${dupIndex}`;
+  try {
+    await fsImpl.writeFile(path.join(quarantineDir, candidateName), bytes, { mode: 0o600, flag: 'wx' });
+    return candidateName;
+  } catch (error: unknown) {
+    if (errorCodeOf(error) !== 'EEXIST' || dupIndex === 5) {
+      throw error;
+    }
+    return writeFirstFreeCopy(quarantineDir, baseName, bytes, fsImpl, dupIndex + 1);
+  }
+}
+
+export interface QuarantineCopy {
+  readonly quarantinePath: string;
+  /** True when an existing copy with equal bytes was reused and nothing was written. */
+  readonly reused: boolean;
+  readonly chmodFailed: boolean;
+  readonly pruneFailures: number;
+}
+
+export interface KeepQuarantineCopyOptions {
+  /** Quarantine copy names that pruning must never delete. */
+  readonly protectNames?: readonly string[];
+}
+
+/**
+ * Keep `bytes` as a quarantine copy of `filePath` (same naming, modes,
+ * reuse-on-equal-bytes and pruning as `quarantineUnreadable`). Throws the
+ * underlying error only when no copy could be written.
+ */
+export async function keepQuarantineCopy(
+  filePath: string,
+  bytes: Buffer,
+  options: KeepQuarantineCopyOptions = {},
   fsImpl: QuarantineFs = fs,
-): Promise<never> {
+): Promise<QuarantineCopy> {
   const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
   const basename = path.basename(filePath);
   const quarantineDir = path.join(path.dirname(filePath), 'quarantine');
   const existingPattern = new RegExp(
     `^${escapeRegExp(basename)}\\.\\d{8}T\\d{6}\\.\\d{3}Z-\\d+\\.${digest}(?:-dup\\d+)?$`,
   );
+  let entries: string[] = [];
   try {
-    const entries = await fsImpl.readdir(quarantineDir);
-    for (const name of entries) {
-      if (!existingPattern.test(name)) {
-        continue;
-      }
-      const existingPath = path.join(quarantineDir, name);
-      let read: Uint8Array;
-      try {
-        read = await fsImpl.readFile(existingPath);
-      } catch {
-        continue;
-      }
-      if (Buffer.from(read).equals(bytes)) {
-        throw new StateFileUnreadableError(filePath, existingPath, detail);
-      }
-    }
-  } catch (error: unknown) {
-    if (error instanceof StateFileUnreadableError) {
-      throw error;
-    }
-    // Directory may not exist yet; proceed to write a new copy.
+    entries = await fsImpl.readdir(quarantineDir);
+  } catch {
+    // The directory may not exist yet; write a new copy.
   }
-
-  const baseName = `${basename}.${quarantineUtcStamp()}-${quarantineCounter++}.${digest}`;
-
-  let quarantinePath: string | null = null;
-  let writtenName = baseName;
-  try {
-    await fsImpl.mkdir(quarantineDir, { recursive: true, mode: 0o700 });
-    for (let dupIndex = 0; dupIndex <= 5; dupIndex += 1) {
-      const candidateName = dupIndex === 0 ? baseName : `${baseName}-dup${dupIndex}`;
-      const candidatePath = path.join(quarantineDir, candidateName);
-      try {
-        await fsImpl.writeFile(candidatePath, bytes, { mode: 0o600, flag: 'wx' });
-        quarantinePath = candidatePath;
-        writtenName = candidateName;
-        break;
-      } catch (error: unknown) {
-        const isEexist =
-          typeof error === 'object' &&
-          error !== null &&
-          (error as { code?: string }).code === 'EEXIST';
-        if (!isEexist || dupIndex === 5) {
-          throw error;
+  const matches = await Promise.all(
+    entries
+      .filter((name) => existingPattern.test(name))
+      .map(async (name) => {
+        const existingPath = path.join(quarantineDir, name);
+        try {
+          return Buffer.from(await fsImpl.readFile(existingPath)).equals(bytes) ? existingPath : null;
+        } catch {
+          return null;
         }
-      }
-    }
-  } catch (error: unknown) {
-    throw new StateFileUnreadableError(filePath, null, detail, error);
+      }),
+  );
+  const reusedPath = matches.find((match) => match !== null);
+  if (typeof reusedPath === 'string') {
+    return { quarantinePath: reusedPath, reused: true, chmodFailed: false, pruneFailures: 0 };
   }
-
+  const baseName = `${basename}.${quarantineUtcStamp()}-${quarantineCounter++}.${digest}`;
+  await fsImpl.mkdir(quarantineDir, { recursive: true, mode: 0o700 });
+  const writtenName = await writeFirstFreeCopy(quarantineDir, baseName, bytes, fsImpl);
+  const quarantinePath = path.join(quarantineDir, writtenName);
   let chmodFailed = false;
   try {
     await fsImpl.chmod(quarantineDir, 0o700);
@@ -399,21 +433,38 @@ export async function quarantineUnreadable(
     chmodFailed = true;
   }
   try {
-    await fsImpl.chmod(quarantinePath!, 0o600);
+    await fsImpl.chmod(quarantinePath, 0o600);
   } catch {
     chmodFailed = true;
   }
-
   const pruneFailures = await pruneQuarantineCopies(
     quarantineDir,
     basename,
     writtenName,
     fsImpl,
+    options.protectNames ?? [],
   );
+  return { quarantinePath, reused: false, chmodFailed, pruneFailures };
+}
 
-  throw new StateFileUnreadableError(filePath, quarantinePath, detail, undefined, {
-    chmodFailed,
-    pruneFailures,
+export async function quarantineUnreadable(
+  filePath: string,
+  detail: string,
+  bytes: Buffer,
+  fsImpl: QuarantineFs = fs,
+): Promise<never> {
+  let copy: QuarantineCopy;
+  try {
+    copy = await keepQuarantineCopy(filePath, bytes, {}, fsImpl);
+  } catch (error: unknown) {
+    throw new StateFileUnreadableError(filePath, null, detail, error);
+  }
+  if (copy.reused) {
+    throw new StateFileUnreadableError(filePath, copy.quarantinePath, detail);
+  }
+  throw new StateFileUnreadableError(filePath, copy.quarantinePath, detail, undefined, {
+    chmodFailed: copy.chmodFailed,
+    pruneFailures: copy.pruneFailures,
   });
 }
 

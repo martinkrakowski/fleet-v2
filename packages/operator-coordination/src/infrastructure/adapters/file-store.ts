@@ -256,6 +256,13 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** The quarantine copy name pattern for one store basename (see `quarantineUnreadable`). */
+function quarantineCopyPattern(basename: string): RegExp {
+  return new RegExp(
+    `^${escapeRegExp(basename)}\\.(\\d{8}T\\d{6}\\.\\d{3}Z)-(\\d+)\\.[0-9a-f]{12}(?:-dup(\\d+))?$`,
+  );
+}
+
 /**
  * Best-effort housekeeping: keep only the 5 newest quarantine copies for a
  * basename by name order, and never delete the copy just written. Every
@@ -267,9 +274,7 @@ async function pruneQuarantineCopies(
   justWrittenName: string,
   fsImpl: QuarantineFs,
 ): Promise<number> {
-  const pattern = new RegExp(
-    `^${escapeRegExp(basename)}\\.(\\d{8}T\\d{6}\\.\\d{3}Z)-(\\d+)\\.[0-9a-f]{12}(?:-dup(\\d+))?$`,
-  );
+  const pattern = quarantineCopyPattern(basename);
   let entries: string[];
   try {
     entries = await fsImpl.readdir(quarantineDir);
@@ -410,4 +415,171 @@ export async function quarantineUnreadable(
     chmodFailed,
     pruneFailures,
   });
+}
+
+// ---------------------------------------------------------------------------
+// State-file inspection (E1b): the one parser every store reader and
+// `fleet-v2 state check` share, so a check and a read can never disagree.
+// ---------------------------------------------------------------------------
+
+/** Outcome of parsing one JSON record-list state file's bytes. */
+export type RecordListInspection<T> =
+  | { readonly status: 'ok'; readonly records: readonly T[] }
+  | { readonly status: 'unreadable'; readonly detail: string; readonly recordIndex: number | null };
+
+/**
+ * Pure: parse `bytes` as a JSON array and turn each element into a record
+ * with `parseRecord`; `undefined` or a throw marks the element invalid. The
+ * detail strings are exactly the ones the readers pass to
+ * `quarantineUnreadable`.
+ */
+export function inspectRecordListBytes<T>(
+  bytes: Buffer,
+  parseRecord: (raw: unknown) => T | undefined,
+): RecordListInspection<T> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString('utf8'));
+  } catch {
+    return { status: 'unreadable', detail: 'not valid JSON', recordIndex: null };
+  }
+  if (!Array.isArray(parsed)) {
+    return { status: 'unreadable', detail: 'expects a record list', recordIndex: null };
+  }
+  const records: T[] = [];
+  for (const [index, raw] of parsed.entries()) {
+    let record: T | undefined;
+    try {
+      record = parseRecord(raw);
+    } catch {
+      record = undefined;
+    }
+    if (record === undefined) {
+      return {
+        status: 'unreadable',
+        detail: `record ${index} failed validation`,
+        recordIndex: index,
+      };
+    }
+    records.push(record);
+  }
+  return { status: 'ok', records };
+}
+
+/** A store file's inspection without its records. */
+export type StateFileInspection =
+  | { readonly status: 'ok'; readonly recordCount: number }
+  | { readonly status: 'unreadable'; readonly detail: string; readonly recordIndex: number | null };
+
+/** A read-only look at one file on disk. */
+export type StateFileReadResult =
+  | StateFileInspection
+  | { readonly status: 'missing' }
+  | { readonly status: 'read-error'; readonly code: string };
+
+export interface QuarantineCopyCheck {
+  readonly name: string;
+  readonly path: string;
+  readonly sizeBytes: number | null;
+  readonly result: StateFileReadResult;
+}
+
+export interface StateFileCheck {
+  readonly basename: string;
+  readonly filePath: string;
+  readonly result: StateFileReadResult;
+  readonly quarantineCopies: readonly QuarantineCopyCheck[];
+}
+
+/** One JSON state store a context owns, as `fleet-v2 state` sees it. */
+export interface StateFileDescriptor {
+  readonly basename: string;
+  /** Pure: the same parse and validation the store's reader applies. */
+  inspect(bytes: Buffer): StateFileInspection;
+  /** True only for a quarantine copy name of this store. */
+  isQuarantineCopyName(name: string): boolean;
+  /** Read-only: never writes, locks, creates or quarantines anything. */
+  check(stateDir: string): Promise<StateFileCheck>;
+}
+
+function errorCodeOf(error: unknown): string {
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    typeof (error as { code?: unknown }).code === 'string'
+  ) {
+    return (error as { code: string }).code;
+  }
+  return 'unknown';
+}
+
+async function readAndInspect(
+  filePath: string,
+  inspect: (bytes: Buffer) => StateFileInspection,
+): Promise<StateFileReadResult> {
+  let bytes: Buffer;
+  try {
+    bytes = await fs.readFile(filePath);
+  } catch (error: unknown) {
+    const code = errorCodeOf(error);
+    return code === 'ENOENT' ? { status: 'missing' } : { status: 'read-error', code };
+  }
+  return inspect(bytes);
+}
+
+async function checkQuarantineCopy(
+  quarantineDir: string,
+  name: string,
+  inspect: (bytes: Buffer) => StateFileInspection,
+): Promise<QuarantineCopyCheck> {
+  const copyPath = path.join(quarantineDir, name);
+  try {
+    const stat = await fs.lstat(copyPath);
+    if (!stat.isFile()) {
+      return {
+        name,
+        path: copyPath,
+        sizeBytes: null,
+        result: { status: 'read-error', code: 'not a regular file' },
+      };
+    }
+    return { name, path: copyPath, sizeBytes: stat.size, result: await readAndInspect(copyPath, inspect) };
+  } catch (error: unknown) {
+    return { name, path: copyPath, sizeBytes: null, result: { status: 'read-error', code: errorCodeOf(error) } };
+  }
+}
+
+/** Build the descriptor of one record-list store from the parser its reader uses. */
+export function describeRecordListStore<T>(
+  basename: string,
+  parseRecord: (raw: unknown) => T | undefined,
+): StateFileDescriptor {
+  const pattern = quarantineCopyPattern(basename);
+  const inspect = (bytes: Buffer): StateFileInspection => {
+    const result = inspectRecordListBytes(bytes, parseRecord);
+    return result.status === 'ok' ? { status: 'ok', recordCount: result.records.length } : result;
+  };
+  return {
+    basename,
+    inspect,
+    isQuarantineCopyName: (name: string): boolean => pattern.test(name),
+    check: async (stateDir: string): Promise<StateFileCheck> => {
+      const filePath = path.join(stateDir, basename);
+      const result = await readAndInspect(filePath, inspect);
+      const quarantineDir = path.join(stateDir, 'quarantine');
+      let names: string[];
+      try {
+        names = await fs.readdir(quarantineDir);
+      } catch {
+        names = [];
+      }
+      const quarantineCopies = await Promise.all(
+        names
+          .filter((entry) => pattern.test(entry))
+          .sort()
+          .map((name) => checkQuarantineCopy(quarantineDir, name, inspect)),
+      );
+      return { basename, filePath, result, quarantineCopies };
+    },
+  };
 }

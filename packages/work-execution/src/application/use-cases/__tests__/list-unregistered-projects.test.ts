@@ -277,4 +277,11 @@ describe('ListUnregisteredProjectsUseCase', () => {
     }
     expect(fromNullPrototype.projects).toHaveLength(1);
   });
+
+  it('treats an omitted argument as an empty request', async () => {
+    const workOrderRepo = { listWorkOrdersByProject: async () => [] } as never;
+    const profileRead = { readProjectProfile: async () => null } as never;
+    const useCase = new ListUnregisteredProjectsUseCase({ workOrderRepo, profileRead });
+    await expect(useCase.execute()).resolves.toEqual({ outcome: 'listed', projects: [] });
+  });
 });

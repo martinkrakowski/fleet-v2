@@ -89,11 +89,13 @@ export class ListUnregisteredProjectsUseCase implements ListUnregisteredProjects
       throw new Error('Not implemented: ListUnregisteredProjectsUseCase');
     }
 
+    // The request has no fields, so an omitted argument is an empty request.
+    const request: unknown = input === undefined ? {} : input;
     const isPlainObject =
-      typeof input === 'object' &&
-      input !== null &&
-      (Object.getPrototypeOf(input) === Object.prototype ||
-        Object.getPrototypeOf(input) === null);
+      typeof request === 'object' &&
+      request !== null &&
+      (Object.getPrototypeOf(request) === Object.prototype ||
+        Object.getPrototypeOf(request) === null);
     if (!isPlainObject) {
       throw new Error('request must be an object');
     }

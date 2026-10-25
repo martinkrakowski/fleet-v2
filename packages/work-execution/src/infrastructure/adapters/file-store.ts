@@ -542,6 +542,24 @@ export interface StateFileCheck {
   readonly quarantineCopies: readonly QuarantineCopyCheck[];
 }
 
+export type QuarantineCopyRead =
+  | { readonly status: 'read'; readonly name: string; readonly path: string; readonly bytes: Buffer }
+  | { readonly status: 'refused'; readonly reason: string };
+
+export interface RestoreStateFileRequest {
+  readonly stateDir: string;
+  readonly candidate: Buffer;
+  /** sha256 hex of the current bytes the operator was shown; null when the file was missing. */
+  readonly expectedCurrentSha256: string | null;
+  /** The candidate's own quarantine name, so pruning keeps it. */
+  readonly protectNames?: readonly string[];
+  readonly lockTimeoutMs?: number;
+}
+
+export type RestoreStateFileOutcome =
+  | { readonly status: 'restored'; readonly recordCount: number; readonly previousCopyPath: string | null }
+  | { readonly status: 'refused'; readonly reason: string };
+
 /** One JSON state store a context owns, as `fleet-v2 state` sees it. */
 export interface StateFileDescriptor {
   readonly basename: string;
@@ -551,6 +569,10 @@ export interface StateFileDescriptor {
   isQuarantineCopyName(name: string): boolean;
   /** Read-only: never writes, locks, creates or quarantines anything. */
   check(stateDir: string): Promise<StateFileCheck>;
+  /** Read a quarantine copy of this store: a bare name inside <stateDir>/quarantine or a path directly in it (relative paths resolve against the current directory, like any shell path); never a symlink. */
+  readQuarantineCopy(stateDir: string, from: string): Promise<QuarantineCopyRead>;
+  /** Under the store's lock: re-validate, compare-and-swap on the current bytes, keep them as a quarantine copy, write the candidate's exact bytes atomically. */
+  restore(request: RestoreStateFileRequest): Promise<RestoreStateFileOutcome>;
 }
 
 function errorCodeOf(error: unknown): string {
@@ -600,6 +622,104 @@ async function checkQuarantineCopy(
   }
 }
 
+async function readQuarantineCopyFor(
+  basename: string,
+  pattern: RegExp,
+  stateDir: string,
+  from: string,
+): Promise<QuarantineCopyRead> {
+  const quarantineDir = path.join(stateDir, 'quarantine');
+  const candidatePath = path.basename(from) === from ? path.join(quarantineDir, from) : path.resolve(from);
+  const name = path.basename(candidatePath);
+  if (!pattern.test(name)) {
+    return { status: 'refused', reason: `${name} is not a quarantine copy of ${basename}` };
+  }
+  let quarantineReal: string;
+  try {
+    quarantineReal = await fs.realpath(quarantineDir);
+  } catch {
+    return { status: 'refused', reason: `${quarantineDir} does not exist` };
+  }
+  let parentReal: string;
+  try {
+    parentReal = await fs.realpath(path.dirname(candidatePath));
+  } catch {
+    return { status: 'refused', reason: `${path.dirname(candidatePath)} does not exist` };
+  }
+  if (parentReal !== quarantineReal) {
+    return { status: 'refused', reason: `--from must name a file directly inside ${quarantineDir}` };
+  }
+  const realPath = path.join(quarantineReal, name);
+  let handle: fs.FileHandle;
+  try {
+    handle = await fs.open(realPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  } catch (error: unknown) {
+    const code = errorCodeOf(error);
+    if (code === 'ELOOP') {
+      return { status: 'refused', reason: `${name} is a symbolic link` };
+    }
+    return { status: 'refused', reason: `${name} could not be opened (${code})` };
+  }
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) {
+      return { status: 'refused', reason: `${name} is not a regular file` };
+    }
+    return { status: 'read', name, path: realPath, bytes: await handle.readFile() };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function restoreRecordListStore(
+  basename: string,
+  inspect: (bytes: Buffer) => StateFileInspection,
+  request: RestoreStateFileRequest,
+): Promise<RestoreStateFileOutcome> {
+  const filePath = path.join(request.stateDir, basename);
+  return withFileLock<RestoreStateFileOutcome>(
+    `${filePath}.lock`,
+    async () => {
+      const candidateInspection = inspect(request.candidate);
+      if (candidateInspection.status !== 'ok') {
+        return { status: 'refused', reason: `the candidate is unreadable (${candidateInspection.detail})` };
+      }
+      const recordCount = candidateInspection.recordCount;
+      let current: Buffer | null;
+      try {
+        current = await fs.readFile(filePath);
+      } catch (error: unknown) {
+        const code = errorCodeOf(error);
+        if (code === 'ENOENT') {
+          current = null;
+        } else {
+          return { status: 'refused', reason: `the current file could not be read (${code})` };
+        }
+      }
+      const currentSha = current === null ? null : createHash('sha256').update(current).digest('hex');
+      if (currentSha !== request.expectedCurrentSha256) {
+        return { status: 'refused', reason: 'the store changed since it was inspected; run state restore again' };
+      }
+      if (current !== null && inspect(current).status === 'ok') {
+        return { status: 'refused', reason: `${basename} is readable; state restore replaces only a missing or unreadable store` };
+      }
+      let previousCopyPath: string | null = null;
+      if (current !== null) {
+        try {
+          const copy = await keepQuarantineCopy(filePath, current, { protectNames: request.protectNames ?? [] });
+          previousCopyPath = copy.quarantinePath;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return { status: 'refused', reason: `the current bytes could not be kept (${message}); nothing was written` };
+        }
+      }
+      await writeBytesAtomically(filePath, request.candidate);
+      return { status: 'restored', recordCount, previousCopyPath };
+    },
+    { timeoutMs: request.lockTimeoutMs ?? 10_000 },
+  );
+}
+
 /** Build the descriptor of one record-list store from the parser its reader uses. */
 export function describeRecordListStore<T>(
   basename: string,
@@ -632,5 +752,7 @@ export function describeRecordListStore<T>(
       );
       return { basename, filePath, result, quarantineCopies };
     },
+    readQuarantineCopy: (stateDir, from) => readQuarantineCopyFor(basename, pattern, stateDir, from),
+    restore: (request) => restoreRecordListStore(basename, inspect, request),
   };
 }

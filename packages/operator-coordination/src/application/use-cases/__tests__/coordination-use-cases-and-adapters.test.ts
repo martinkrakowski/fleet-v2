@@ -2276,3 +2276,19 @@ describe('RelayTransportAdapter', () => {
     });
   });
 });
+
+describe('profile read use cases refuse a non-object request', () => {
+  it('rejects an array as the request for list, inspect and record', async () => {
+    const repo = new ProjectProfileRepositoryAdapter();
+    for (const useCase of [
+      new ListProjectProfilesUseCase({ profileRepo: repo }),
+      new InspectProjectProfileUseCase({ profileRepo: repo }),
+      new RecordProjectProbeUseCase({ profileRepo: repo }),
+    ]) {
+      await expect(useCase.execute([])).resolves.toEqual({
+        outcome: 'rejected',
+        reason: 'request must be an object',
+      });
+    }
+  });
+});

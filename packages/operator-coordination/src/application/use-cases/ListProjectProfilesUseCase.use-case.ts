@@ -32,7 +32,7 @@ export class ListProjectProfilesUseCase implements ListProjectProfilesPort {
     if (!this.deps) {
       throw new Error('Not implemented: ListProjectProfilesUseCase');
     }
-    if (typeof input !== 'object' || input === null) {
+    if (typeof input !== 'object' || input === null || Array.isArray(input)) {
       return { outcome: 'rejected', reason: 'request must be an object' };
     }
     const request = input as ListProjectProfilesRequest;

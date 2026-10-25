@@ -40,7 +40,7 @@ export class RecordProjectProbeUseCase implements RecordProjectProbePort {
     if (!this.deps) {
       throw new Error('Not implemented: RecordProjectProbeUseCase');
     }
-    if (typeof input !== 'object' || input === null) {
+    if (typeof input !== 'object' || input === null || Array.isArray(input)) {
       return { outcome: 'rejected', reason: 'request must be an object' };
     }
     const request = input as RecordProjectProbeRequest;
@@ -75,7 +75,7 @@ export class RecordProjectProbeUseCase implements RecordProjectProbePort {
     } catch (error) {
       return {
         outcome: 'rejected',
-        reason: error instanceof Error ? error.message : 'probe recording was refused',
+        reason: error instanceof Error ? error.message : String(error),
       };
     }
     try {

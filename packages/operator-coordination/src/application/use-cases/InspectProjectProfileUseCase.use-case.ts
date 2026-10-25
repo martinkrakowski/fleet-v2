@@ -32,7 +32,7 @@ export class InspectProjectProfileUseCase implements InspectProjectProfilePort {
     if (!this.deps) {
       throw new Error('Not implemented: InspectProjectProfileUseCase');
     }
-    if (typeof input !== 'object' || input === null) {
+    if (typeof input !== 'object' || input === null || Array.isArray(input)) {
       return { outcome: 'rejected', reason: 'request must be an object' };
     }
     const request = input as InspectProjectProfileRequest;

@@ -15,10 +15,13 @@ import {
 // already authorises heavier remote work (dispatch).
 export default defineEventHandler(async (event) => {
   const operationId = newOperationId();
-  const projectId = getRouterParam(event, "id") ?? "";
+  // Trimmed exactly as the use case trims it, so `%20a` and `a` share one
+  // single-flight slot; h3 has already decoded the path.
+  const projectId = (getRouterParam(event, "id") ?? "").trim();
   try {
-    const probed = await workComposition().probeLimiter.run(projectId, () =>
-      workComposition().probeProject.execute({ projectId }),
+    const composition = workComposition();
+    const probed = await composition.probeLimiter.run(projectId, () =>
+      composition.probeProject.execute({ projectId }),
     );
     if (!probed.ok) {
       if (probed.reason === "busy-project") {

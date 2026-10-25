@@ -278,16 +278,11 @@ describe("project probe and unregistered routes", () => {
     expect(listed.body.code).toBe("NOT_IMPLEMENTED");
   });
 
-  it("refuses a concurrent probe of the same project while one is held open", async () => {
+  it("refuses a concurrent probe of the same project, padded or not, and caps probes overall", async () => {
     const composition = createConfiguredWorkComposition({ stateDir: tempDir });
-    let startProbe!: () => void;
-    let finishProbe!: (result: ProbeProjectResult) => void;
-    const started = new Promise<void>((resolve) => {
-      startProbe = resolve;
-    });
-    const heldOpen = new Promise<ProbeProjectResult>((resolve) => {
-      finishProbe = resolve;
-    });
+    const releases = new Map<string, (result: ProbeProjectResult) => void>();
+    const startedIds: string[] = [];
+    let notifyStarted: () => void = () => undefined;
 
     const probedReport = {
       probedAtIso: "2026-10-25T00:00:00.000Z",
@@ -298,44 +293,66 @@ describe("project probe and unregistered routes", () => {
       defaultBranch: "main",
       detectedScripts: [],
     };
+    const done = (projectId: string): ProbeProjectResult => ({
+      outcome: "probed",
+      projectId,
+      report: probedReport,
+      recorded: true,
+    });
 
     vi.spyOn(composition.probeProject, "execute").mockImplementation(
       async (input) => {
         const request = input as ProbeProjectRequest;
-        if (request.projectId === "proj-held") {
-          startProbe();
-          return heldOpen;
+        if (request.projectId.startsWith("proj-held")) {
+          startedIds.push(request.projectId);
+          notifyStarted();
+          return new Promise<ProbeProjectResult>((resolve) => {
+            releases.set(request.projectId, resolve);
+          });
         }
-        return {
-          outcome: "probed",
-          projectId: request.projectId,
-          report: probedReport,
-          recorded: true,
-        };
+        return done(request.projectId);
       },
     );
     configureWorkComposition(composition);
 
+    const waitForStarts = (count: number) =>
+      new Promise<void>((resolve) => {
+        notifyStarted = () => {
+          if (startedIds.length >= count) resolve();
+        };
+        notifyStarted();
+      });
+
     const firstPending = call("POST", "/v1/projects/proj-held/probe");
-    await started;
+    let secondHeld: Promise<Awaited<ReturnType<typeof call>>> | undefined;
+    try {
+      await waitForStarts(1);
 
-    const second = await call("POST", "/v1/projects/proj-held/probe");
-    expect(second.status).toBe(409);
-    expect(second.body.code).toBe("BUSY");
-    expect(second.body.result!.reason).toBe("a probe of proj-held is already running");
+      const same = await call("POST", "/v1/projects/proj-held/probe");
+      expect(same.status).toBe(409);
+      expect(same.body.code).toBe("BUSY");
+      expect(same.body.result!.reason).toBe("a probe of proj-held is already running");
 
-    const other = await call("POST", "/v1/projects/proj-other/probe");
-    expect(other.status).toBe(200);
-    expect(other.body.code).toBe("OK");
+      // A padded id is the same project: the use case trims it, so must the limiter.
+      const padded = await call("POST", "/v1/projects/%20proj-held/probe");
+      expect(padded.status).toBe(409);
 
-    finishProbe({
-      outcome: "probed",
-      projectId: "proj-held",
-      report: probedReport,
-      recorded: true,
-    });
+      const other = await call("POST", "/v1/projects/proj-other/probe");
+      expect(other.status).toBe(200);
+      expect(other.body.code).toBe("OK");
+
+      // A second held probe takes the last global slot; a third project is 429.
+      secondHeld = call("POST", "/v1/projects/proj-held-2/probe");
+      await waitForStarts(2);
+      const over = await call("POST", "/v1/projects/proj-third/probe");
+      expect(over.status).toBe(429);
+      expect(over.body.code).toBe("BUSY");
+      expect(over.body.result!.reason).toBe("probe capacity is busy; retry shortly");
+    } finally {
+      for (const [projectId, release] of releases) release(done(projectId));
+    }
     const first = await firstPending;
     expect(first.status).toBe(200);
-    expect(first.body.code).toBe("OK");
+    if (secondHeld) expect((await secondHeld).status).toBe(200);
   });
 });

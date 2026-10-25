@@ -27,12 +27,20 @@ import {
 } from "vitest";
 
 import { RegisterWorkOrderUseCase } from "@fleet/work-execution/use-cases";
-import { WorkOrderRepositoryAdapter } from "@fleet/work-execution";
+import {
+  WorkOrderRepositoryAdapter,
+  type ProbeProjectRequest,
+  type ProbeProjectResult,
+} from "@fleet/work-execution";
 
 import securityMiddleware from "../../middleware/security.js";
 import { setActiveApiToken } from "../token.js";
 import { createConfiguredOperatorComposition } from "../operator/composition";
 import { configureFleetApiRuntime } from "../runtime.js";
+import {
+  configureWorkComposition,
+  createConfiguredWorkComposition,
+} from "../work/composition";
 
 const VALID_TOKEN = "a".repeat(32);
 
@@ -268,5 +276,83 @@ describe("project probe and unregistered routes", () => {
     const listed = await call("GET", "/v1/projects/unregistered");
     expect(listed.status).toBe(501);
     expect(listed.body.code).toBe("NOT_IMPLEMENTED");
+  });
+
+  it("refuses a concurrent probe of the same project, padded or not, and caps probes overall", async () => {
+    const composition = createConfiguredWorkComposition({ stateDir: tempDir });
+    const releases = new Map<string, (result: ProbeProjectResult) => void>();
+    const startedIds: string[] = [];
+    let notifyStarted: () => void = () => undefined;
+
+    const probedReport = {
+      probedAtIso: "2026-10-25T00:00:00.000Z",
+      probedFrom: "orchestrator" as const,
+      checks: [
+        { name: "host-reachable", host: null, result: "pass" as const, detail: "ok" },
+      ],
+      defaultBranch: "main",
+      detectedScripts: [],
+    };
+    const done = (projectId: string): ProbeProjectResult => ({
+      outcome: "probed",
+      projectId,
+      report: probedReport,
+      recorded: true,
+    });
+
+    vi.spyOn(composition.probeProject, "execute").mockImplementation(
+      async (input) => {
+        const request = input as ProbeProjectRequest;
+        if (request.projectId.startsWith("proj-held")) {
+          startedIds.push(request.projectId);
+          notifyStarted();
+          return new Promise<ProbeProjectResult>((resolve) => {
+            releases.set(request.projectId, resolve);
+          });
+        }
+        return done(request.projectId);
+      },
+    );
+    configureWorkComposition(composition);
+
+    const waitForStarts = (count: number) =>
+      new Promise<void>((resolve) => {
+        notifyStarted = () => {
+          if (startedIds.length >= count) resolve();
+        };
+        notifyStarted();
+      });
+
+    const firstPending = call("POST", "/v1/projects/proj-held/probe");
+    let secondHeld: Promise<Awaited<ReturnType<typeof call>>> | undefined;
+    try {
+      await waitForStarts(1);
+
+      const same = await call("POST", "/v1/projects/proj-held/probe");
+      expect(same.status).toBe(409);
+      expect(same.body.code).toBe("BUSY");
+      expect(same.body.result!.reason).toBe("a probe of proj-held is already running");
+
+      // A padded id is the same project: the use case trims it, so must the limiter.
+      const padded = await call("POST", "/v1/projects/%20proj-held/probe");
+      expect(padded.status).toBe(409);
+
+      const other = await call("POST", "/v1/projects/proj-other/probe");
+      expect(other.status).toBe(200);
+      expect(other.body.code).toBe("OK");
+
+      // A second held probe takes the last global slot; a third project is 429.
+      secondHeld = call("POST", "/v1/projects/proj-held-2/probe");
+      await waitForStarts(2);
+      const over = await call("POST", "/v1/projects/proj-third/probe");
+      expect(over.status).toBe(429);
+      expect(over.body.code).toBe("BUSY");
+      expect(over.body.result!.reason).toBe("probe capacity is busy; retry shortly");
+    } finally {
+      for (const [projectId, release] of releases) release(done(projectId));
+    }
+    const first = await firstPending;
+    expect(first.status).toBe(200);
+    if (secondHeld) expect((await secondHeld).status).toBe(200);
   });
 });

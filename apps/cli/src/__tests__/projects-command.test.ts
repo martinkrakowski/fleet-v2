@@ -529,4 +529,13 @@ describe('fleet-v2 projects', () => {
     expect(projectsHelp.code).toBe(0);
     expect(projectsHelp.out).toContain('Usage: fleet-v2 projects <subcommand> [flags]');
   });
+
+  it('treats a blank project id as a usage error and help only as the first word', async () => {
+    const runtime = makeV2Runtime(makeTempDir());
+    const blank = await runProjects(['show', '   '], runtime);
+    expect(blank.code).toBe(2);
+    expect(blank.err).toContain('projects show requires a project id');
+    const trailingHelp = await runProjects(['retire', 'alpha', 'help'], runtime);
+    expect(trailingHelp.code).toBe(2);
+  });
 });

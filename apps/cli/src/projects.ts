@@ -116,7 +116,8 @@ function parseProjectsTokens(tokens: readonly string[], subcommand: ProjectsSubc
   const positional: string[] = [];
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
-    if (isHelpToken(token)) {
+    // `help` is a word only in the first position; the flags count anywhere.
+    if (token === '--help' || token === '-h' || (index === 0 && token === 'help')) {
       return { ok: true, positional: [], flags: { help: true } };
     }
     if (!token.startsWith('--') || token === '--') {
@@ -155,12 +156,9 @@ function parseProjectsTokens(tokens: readonly string[], subcommand: ProjectsSubc
 }
 
 /** The one project id a show/edit/retire subcommand requires. */
-function requireProjectId(parsed: Extract<ParsedTokens, { ok: true }>, subcommand: ProjectsSubcommand): string {
-  const id = parsed.positional[0] ?? '';
-  if (id.trim() === '') {
-    throw new Error(`projects ${subcommand} requires a project id`);
-  }
-  return id.trim();
+function requireProjectId(parsed: Extract<ParsedTokens, { ok: true }>): string | null {
+  const id = (parsed.positional[0] ?? '').trim();
+  return id === '' ? null : id;
 }
 
 /** Reject unexpected positional tokens; every subcommand picks its count. */
@@ -377,7 +375,11 @@ async function projectsShow(
     io.stderr(`${unexpected}\n`);
     return 2;
   }
-  const projectId = requireProjectId(parsed, 'show');
+  const projectId = requireProjectId(parsed);
+  if (projectId === null) {
+    io.stderr(`projects show requires a project id\n`);
+    return 2;
+  }
   const result = await runtime.coordination.inspectProjectProfile.inspectProjectProfile({ projectId });
   if (parsed.flags.json === true) {
     io.stdout(`${JSON.stringify(result)}\n`);
@@ -594,7 +596,10 @@ function parseEditArgs(tokens: readonly string[]): ParsedEdit {
   if (unexpected !== null) {
     return { ok: false, error: unexpected };
   }
-  const projectId = requireProjectId(parsed, 'edit');
+  const projectId = requireProjectId(parsed);
+  if (projectId === null) {
+    return { ok: false, error: "projects edit requires a project id" };
+  }
   const changes: EditChanges = {};
   if (parsed.flags['display-name'] !== undefined) {
     changes.displayName = String(parsed.flags['display-name']);
@@ -715,7 +720,11 @@ async function projectsRetire(
     io.stderr(`${unexpected}\n`);
     return 2;
   }
-  const projectId = requireProjectId(parsed, 'retire');
+  const projectId = requireProjectId(parsed);
+  if (projectId === null) {
+    io.stderr(`projects retire requires a project id\n`);
+    return 2;
+  }
   const inspected = await runtime.coordination.inspectProjectProfile.inspectProjectProfile({ projectId });
   if (inspected.outcome === 'rejected') {
     io.stderr(`${inspected.reason}\n`);

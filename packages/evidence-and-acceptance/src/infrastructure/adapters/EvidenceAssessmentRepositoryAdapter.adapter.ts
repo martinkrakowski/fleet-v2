@@ -14,7 +14,7 @@ import {
   EvidenceAssessmentRevisionConflictError,
   type EvidenceAssessmentRepositoryPort,
 } from '../../application/ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
-import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
+import { inspectRecordListBytes, quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface EvidenceAssessmentRepositoryOptions {
   /** When set, assessments are also persisted as `assessments.json`. */
@@ -44,6 +44,11 @@ function isAssessmentRecord(value: unknown): value is EvidenceAssessmentRecord {
     typeof (value as { id?: unknown }).id === 'string' &&
     typeof (value as { revision?: unknown }).revision === 'number'
   );
+}
+
+/** The reader's record parser, shared with `fleet-v2 state check`. */
+export function parseAssessmentStateRecord(raw: unknown): EvidenceAssessmentRecord | undefined {
+  return isAssessmentRecord(raw) ? copyRecord(raw) : undefined;
 }
 
 export class EvidenceAssessmentRepositoryAdapter implements EvidenceAssessmentRepositoryPort {
@@ -141,23 +146,12 @@ export class EvidenceAssessmentRepositoryAdapter implements EvidenceAssessmentRe
       }
       throw error;
     }
-    const raw = buffer.toString('utf8');
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      await quarantineUnreadable(stateFilePath, 'not valid JSON', buffer);
+    const inspection = inspectRecordListBytes(buffer, parseAssessmentStateRecord);
+    if (inspection.status === 'unreadable') {
+      return quarantineUnreadable(stateFilePath, inspection.detail, buffer);
     }
-    if (!Array.isArray(parsed)) {
-      await quarantineUnreadable(stateFilePath, 'expects a record list', buffer);
-    }
-    const records = parsed as unknown[];
-    for (const [index, rawRecord] of records.entries()) {
-      if (!isAssessmentRecord(rawRecord)) {
-        await quarantineUnreadable(stateFilePath, `record ${index} failed validation`, buffer);
-      }
-      const record = rawRecord as EvidenceAssessmentRecord;
-      map.set(record.id, copyRecord(record));
+    for (const item of inspection.records) {
+      map.set(item.id, item);
     }
     return map;
   }

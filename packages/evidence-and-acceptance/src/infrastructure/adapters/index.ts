@@ -12,4 +12,5 @@ export * from "./OcmReviewTransport.adapter.js";
 export * from "./OwnerDecisionAdapter.adapter.js";
 export * from "./spawn-run.js";
 export * from "./SshExecutor.adapter.js";
+export * from "./state-files.js";
 export * from "./VerificationExecutorAdapter.adapter.js";

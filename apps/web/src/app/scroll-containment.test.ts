@@ -78,7 +78,7 @@ describe("shell containment", () => {
   });
 });
 
-describe("opt-in containment roots of the five routes", () => {
+describe("opt-in containment roots of the routes", () => {
   it("/ renders no root element — it redirects to /lanes", () => {
     const home = read("page.tsx");
     expect(home).toMatch(/redirect\("\/lanes"\)/);
@@ -119,6 +119,32 @@ describe("opt-in containment roots of the five routes", () => {
       ),
     ).toBeTruthy();
   });
+
+  it("/projects opts in on its root element", () => {
+    const projects = read("projects", "projects-client.tsx");
+    expect(projects).toContain(
+      "<div className={styles.page} data-contained-scroll>",
+    );
+  });
+
+  it("/projects is a dynamic server page, not a client component", () => {
+    const page = read("projects", "page.tsx");
+    expect(page).toContain('export const dynamic = "force-dynamic"');
+    expect(page).not.toContain('"use client"');
+  });
+
+  it("/projects/[id] opts in on its root element", () => {
+    const detail = read("projects", "[id]", "project-detail-client.tsx");
+    expect(detail).toContain(
+      "<div className={styles.page} data-contained-scroll>",
+    );
+  });
+
+  it("/projects/[id] is a dynamic server page, not a client component", () => {
+    const page = read("projects", "[id]", "page.tsx");
+    expect(page).toContain('export const dynamic = "force-dynamic"');
+    expect(page).not.toContain('"use client"');
+  });
 });
 
 describe("keyboard-accessible scroll regions", () => {
@@ -156,6 +182,27 @@ describe("keyboard-accessible scroll regions", () => {
     expectScrollRegion(
       openingTag(brief, /<div[^>]*styles\.detail[^>]*>/, "brief detail column"),
       "Brief detail",
+    );
+  });
+
+  it("names the projects table scroll and the detail stack", () => {
+    const projects = read("projects", "projects-client.tsx");
+    expectScrollRegion(
+      openingTag(
+        projects,
+        /<CardBody[^>]*styles\.tableScroll[^>]*>/,
+        "projects table scroll body",
+      ),
+      "Projects",
+    );
+    const detail = read("projects", "[id]", "project-detail-client.tsx");
+    expectScrollRegion(
+      openingTag(
+        detail,
+        /<div[^>]*styles\.stack[^>]*>/,
+        "project detail stack",
+      ),
+      "Project profile",
     );
   });
 });

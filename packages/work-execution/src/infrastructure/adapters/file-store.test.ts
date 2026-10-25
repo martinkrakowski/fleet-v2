@@ -5,7 +5,9 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  describeRecordListStore,
   FileLockTimeoutError,
+  inspectRecordListBytes,
   type QuarantineFs,
   StateFileUnreadableError,
   quarantineUnreadable,
@@ -650,5 +652,138 @@ describe('quarantineUnreadable', () => {
     expect(writeCalled).toBe(false);
     const copies = (await fs.readdir(quarantineDir)).sort();
     expect(copies).toEqual([truncatedName, validName]);
+  });
+});
+
+describe('inspectRecordListBytes', () => {
+  const idParser = (raw: unknown): unknown =>
+    typeof (raw as { id?: unknown }).id === 'string' ? raw : undefined;
+
+  it('parses a valid two-element list', () => {
+    const bytes = Buffer.from('[{"id":"a"},{"id":"b"}]');
+    const result = inspectRecordListBytes(bytes, idParser);
+    expect(result).toEqual({ status: 'ok', records: [{ id: 'a' }, { id: 'b' }] });
+  });
+
+  it('reports non-JSON bytes', () => {
+    const bytes = Buffer.from('{ not json');
+    const result = inspectRecordListBytes(bytes, idParser);
+    expect(result).toEqual({ status: 'unreadable', detail: 'not valid JSON', recordIndex: null });
+  });
+
+  it('rejects a non-array document', () => {
+    const result = inspectRecordListBytes(Buffer.from('{}'), idParser);
+    expect(result).toEqual({ status: 'unreadable', detail: 'expects a record list', recordIndex: null });
+  });
+
+  it('reports the index of the first failing record', () => {
+    const bytes = Buffer.from('[{"id":"a"},{"x":1}]');
+    const result = inspectRecordListBytes(bytes, idParser);
+    expect(result).toEqual({ status: 'unreadable', detail: 'record 1 failed validation', recordIndex: 1 });
+  });
+
+  it('reports a throwing parser as a failed record', () => {
+    const throwingParser = (raw: unknown): unknown => {
+      if ((raw as { id?: unknown }).id === 'boom') {
+        throw new Error('nope');
+      }
+      return raw;
+    };
+    const bytes = Buffer.from('[{"id":"boom"},{"id":"b"}]');
+    const result = inspectRecordListBytes(bytes, throwingParser);
+    expect(result).toEqual({ status: 'unreadable', detail: 'record 0 failed validation', recordIndex: 0 });
+  });
+});
+
+describe('describeRecordListStore', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-e1b-desc-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  const parser = (raw: unknown): unknown =>
+    typeof (raw as { id?: unknown }).id === 'string' ? raw : undefined;
+
+  const d = describeRecordListStore('x.json', parser);
+
+  it('recognizes quarantine copy names of its own store only', () => {
+    const own = 'x.json.20261025T101500.123Z-0.0123456789ab';
+    expect(d.isQuarantineCopyName(own)).toBe(true);
+    expect(d.isQuarantineCopyName('y.json.20261025T101500.123Z-0.0123456789ab')).toBe(false);
+    expect(d.isQuarantineCopyName('../x.json.20261025T101500.123Z-0.0123456789ab')).toBe(false);
+    expect(d.isQuarantineCopyName('x.json')).toBe(false);
+  });
+
+  it('reports a missing store file without creating a quarantine directory', async () => {
+    const check = await d.check(tempDir);
+    expect(check.result).toEqual({ status: 'missing' });
+    expect(check.quarantineCopies).toEqual([]);
+    expect(await fs.readdir(tempDir)).toEqual([]);
+  });
+
+  it('checks the store file and quarantine copies sorted by name', async () => {
+    await fs.writeFile(path.join(tempDir, 'x.json'), '[{"id":"a"},{"id":"b"}]');
+    const quarantineDir = path.join(tempDir, 'quarantine');
+    await fs.mkdir(quarantineDir, { recursive: true });
+    const validName = 'x.json.20261025T101500.123Z-0.0123456789ab';
+    const garbageName = 'x.json.20261025T101501.123Z-1.0123456789ab';
+    const linkName = 'x.json.20261025T101502.123Z-2.0123456789ab';
+    await fs.writeFile(path.join(quarantineDir, validName), '[{"id":"a"}]');
+    await fs.writeFile(path.join(quarantineDir, garbageName), '{ garbage');
+    await fs.symlink('target', path.join(quarantineDir, linkName));
+
+    const check = await d.check(tempDir);
+    expect(check.result).toEqual({ status: 'ok', recordCount: 2 });
+    expect(check.quarantineCopies.map((copy) => copy.name)).toEqual([validName, garbageName, linkName]);
+    const [validCheck, garbageCheck, linkCheck] = check.quarantineCopies;
+    expect(validCheck?.result).toEqual({ status: 'ok', recordCount: 1 });
+    expect(garbageCheck?.result).toMatchObject({ status: 'unreadable' });
+    expect(linkCheck?.result).toEqual({ status: 'read-error', code: 'not a regular file' });
+  });
+
+  it('is read-only: check changes no file metadata and creates no quarantine directory', async () => {
+    await fs.writeFile(path.join(tempDir, 'x.json'), '{ garbage');
+    const snapshot = async (): Promise<Array<{ name: string; size: number; mtimeMs: number }>> => {
+      const names = await fs.readdir(tempDir, { recursive: true });
+      const stats = await Promise.all(names.map((name) => fs.lstat(path.join(tempDir, name))));
+      return names.map((name, index) => ({
+        name,
+        size: stats[index]!.size,
+        mtimeMs: stats[index]!.mtimeMs,
+      }));
+    };
+    const before = await snapshot();
+    await d.check(tempDir);
+    const after = await snapshot();
+    expect(after).toEqual(before);
+    expect(await fs.readdir(tempDir)).not.toContain('quarantine');
+  });
+});
+
+describe('quarantine copy names', () => {
+  it('match the writer: quarantineUnreadable names agree with isQuarantineCopyName', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-e1b-qnames-'));
+    try {
+      const d = describeRecordListStore('x.json', (raw: unknown): unknown =>
+        typeof (raw as { id?: unknown }).id === 'string' ? raw : undefined,
+      );
+      let caught: unknown;
+      try {
+        await quarantineUnreadable(path.join(tempDir, 'x.json'), 'd', Buffer.from('{ garbage'));
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(StateFileUnreadableError);
+      const error = caught as StateFileUnreadableError;
+      expect(error.quarantinePath).not.toBeNull();
+      expect(d.isQuarantineCopyName(path.basename(error.quarantinePath!))).toBe(true);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
   });
 });

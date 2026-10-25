@@ -93,6 +93,12 @@ function fakeClient(
     fetchAttentionView: async () => {
       throw new Error("unused");
     },
+    fetchProjectList: async () => {
+      throw new Error("unused");
+    },
+    fetchProjectView: async () => {
+      throw new Error("unused");
+    },
     fetchAttemptList: async <T>(
       query: AttemptListQuery,
       fallback: T,

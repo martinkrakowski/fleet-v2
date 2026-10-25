@@ -122,7 +122,10 @@ import {
   ExpireOwnerQuestionsUseCase,
   InspectConfiguredCapabilitiesUseCase,
   InspectOutstandingCoordinationUseCase,
+  InspectProjectProfileUseCase,
+  InstallationReferenceAdapter,
   ListOwnerQuestionsUseCase,
+  ListProjectProfilesUseCase,
   ObservationPublicationAdapter,
   OwnerQuestionRepositoryAdapter,
   ProjectProfileRepositoryAdapter,
@@ -130,13 +133,16 @@ import {
   ReadOwnerQuestionUseCase,
   ReadProjectAttentionUseCase,
   RecordAuthorizationConsumptionUseCase,
+  RecordProjectProbeUseCase,
   RecordRelayAcknowledgementUseCase,
   RegisterProjectProfileUseCase,
   RelayTransportAdapter,
   RequestScopedDecisionUseCase,
   ResolveActionAuthorizationUseCase,
+  RetireProjectProfileUseCase,
   SendFleetRelayUseCase,
   SyncOneWayOwnerQuestionsUseCase,
+  UpdateProjectProfileUseCase,
   type OwnerQuestionClock,
 } from '@fleet/operator-coordination';
 import { requireValidInstallationModel, type FleetInstallation } from '@fleet/installation';
@@ -468,6 +474,11 @@ export interface FleetCliRuntime {
     readonly relayTransport: RelayTransportAdapter;
     readonly attentionRead: AttentionReadAdapter;
     readonly registerProjectProfile: RegisterProjectProfileUseCase;
+    readonly updateProjectProfile: UpdateProjectProfileUseCase;
+    readonly retireProjectProfile: RetireProjectProfileUseCase;
+    readonly listProjectProfiles: ListProjectProfilesUseCase;
+    readonly inspectProjectProfile: InspectProjectProfileUseCase;
+    readonly recordProjectProbe: RecordProjectProbeUseCase;
     readonly inspectConfiguredCapabilities: InspectConfiguredCapabilitiesUseCase;
     readonly requestScopedDecision: RequestScopedDecisionUseCase;
     readonly resolveActionAuthorization: ResolveActionAuthorizationUseCase;
@@ -623,6 +634,18 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const ownerQuestionRepository = new OwnerQuestionRepositoryAdapter({ stateDir });
   const ownerQuestionClock: OwnerQuestionClock = { nowIso: () => new Date().toISOString() };
 
+  // Installation name references for project profiles (P6a): a v2
+  // installation enables host and gate-procedure name checks behind profile
+  // registration and update; a v1 or absent installation passes no reference
+  // port, which keeps the no-install behaviour (no name checks).
+  const installationRefs =
+    options?.installation?.schemaVersion === 2
+      ? new InstallationReferenceAdapter({
+          hostNames: Object.keys(options.installation.hosts ?? {}),
+          procedureNames: Object.keys(options.installation.verification?.procedures ?? {}),
+        })
+      : undefined;
+
   const coordination = {
     projectProfileRepository,
     coordinationRequestRepository,
@@ -630,7 +653,18 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     observationPublication,
     relayTransport,
     attentionRead,
-    registerProjectProfile: new RegisterProjectProfileUseCase({ profileRepo: projectProfileRepository }),
+    registerProjectProfile: new RegisterProjectProfileUseCase({
+      profileRepo: projectProfileRepository,
+      ...(installationRefs !== undefined ? { installationRefs } : {}),
+    }),
+    updateProjectProfile: new UpdateProjectProfileUseCase({
+      profileRepo: projectProfileRepository,
+      ...(installationRefs !== undefined ? { installationRefs } : {}),
+    }),
+    retireProjectProfile: new RetireProjectProfileUseCase({ profileRepo: projectProfileRepository }),
+    listProjectProfiles: new ListProjectProfilesUseCase({ profileRepo: projectProfileRepository }),
+    inspectProjectProfile: new InspectProjectProfileUseCase({ profileRepo: projectProfileRepository }),
+    recordProjectProbe: new RecordProjectProbeUseCase({ profileRepo: projectProfileRepository }),
     inspectConfiguredCapabilities: new InspectConfiguredCapabilitiesUseCase({
       profileRepo: projectProfileRepository,
     }),

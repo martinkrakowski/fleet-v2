@@ -75,6 +75,7 @@ import {
 import { hostsCommand, type HostsCliOptions } from './hosts.js';
 import { seatsCommand, type SeatsCliOptions } from './seats.js';
 import { initCommand, type InitCliOptions } from './init.js';
+import { projectsCommand, type ProjectsCliOptions } from './projects.js';
 
 export { resolveRunnerSettings };
 
@@ -1800,6 +1801,9 @@ edit and remove, each write confirmed and compare-and-swapped.
 The seats group shows or changes policy.useFreeSeats: seats free-tier status|on|off,
 each change confirmed and compare-and-swapped.
 
+The projects group lists, shows, registers, edits and retires project profiles;
+every change is confirmed unless --yes is given.
+
 init sets up a fresh installation file non-interactively (every step is a
 flag); run 'fleet-v2 init --help' for its flags.
 
@@ -1808,6 +1812,7 @@ Commands:
   doctor [--probe-seats] [--host <name>] [--json]
   hosts list|add|edit|remove
   seats free-tier [status|on|off] [--yes]
+  projects list|show|add|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
   brief prepare [--allowedPathPrefixes '["packages/x/src"]']
   capacity reserve
@@ -1839,6 +1844,7 @@ export async function runCli(
   hostsOptions?: HostsCliOptions,
   initOptions?: InitCliOptions,
   seatsOptions?: SeatsCliOptions,
+  projectsOptions?: ProjectsCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -1897,6 +1903,11 @@ export async function runCli(
         stateDir,
         installation: loadResult.installation,
       });
+    }
+    // The projects group manages its profiles through the composed runtime
+    // (the state-backed pattern), not the installation file itself.
+    if (group === 'projects') {
+      return await projectsCommand(restArgv.slice(1), io, activeRuntime, projectsOptions ?? {});
     }
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);

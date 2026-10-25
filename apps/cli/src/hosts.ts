@@ -382,7 +382,7 @@ function moveLaneRunnerRole(
 }
 
 /** The default confirmation: one stdin line, only an explicit y/yes writes. */
-function confirmFromStdin(io: CliIo): (question: string) => Promise<boolean> {
+export function confirmFromStdin(io: CliIo): (question: string) => Promise<boolean> {
   return (question) =>
     new Promise<boolean>((resolve) => {
       io.stdout(`${question} `);

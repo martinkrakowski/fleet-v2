@@ -57,6 +57,7 @@ import {
   resolveImplementerSeat,
   type ImplementerSeatResolution,
 } from "@fleet/work-execution/use-cases";
+import { ProbeLimiter } from "./probe-limiter";
 
 /**
  * Reads the seat an attempt was actually implemented on. Absent on a
@@ -80,6 +81,11 @@ export interface WorkComposition {
   inspectAttempt: InspectAttemptUseCase;
   listAttempts: ListAttemptsUseCase;
   probeProject: ProbeProjectUseCase;
+  /**
+   * Throttles HTTP probe requests: one in-flight probe per project and a
+   * small global cap. Owned by this composition root, not the route.
+   */
+  probeLimiter: ProbeLimiter;
   listUnregisteredProjects: ListUnregisteredProjectsUseCase;
   prepareBriefPackage: PrepareBriefPackageUseCase;
   reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
@@ -215,6 +221,7 @@ function unconfiguredWorkComposition(): WorkComposition {
     inspectAttempt: new InspectAttemptUseCase(),
     listAttempts: new ListAttemptsUseCase(),
     probeProject: new ProbeProjectUseCase(),
+    probeLimiter: new ProbeLimiter(),
     listUnregisteredProjects: new ListUnregisteredProjectsUseCase(),
     prepareBriefPackage: new PrepareBriefPackageUseCase(),
     reserveExecutionCapacity: new ReserveExecutionCapacityUseCase(),
@@ -406,6 +413,7 @@ export function createConfiguredWorkComposition(
           ? Object.keys(options?.installation?.verification?.procedures ?? {})
           : null,
     }),
+    probeLimiter: new ProbeLimiter(),
     listUnregisteredProjects: new ListUnregisteredProjectsUseCase({
       workOrderRepo,
       profileRead,

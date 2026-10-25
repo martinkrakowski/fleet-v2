@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { ProjectProfileRecord } from '../../domain/coordination-records.js';
+import { ProjectProfileRevisionConflictError } from '../../application/ports/out/ProjectProfileRepositoryPort.out-port.js';
 import { ProjectProfileRepositoryAdapter } from './ProjectProfileRepositoryAdapter.adapter.js';
 
 describe('ProjectProfileRepositoryAdapter cross-process safe persistence', () => {
@@ -107,5 +108,96 @@ describe('ProjectProfileRepositoryAdapter cross-process safe persistence', () =>
 
     const contentAfter = await fs.readFile(filePath, 'utf8');
     expect(contentAfter).toBe(corruptContent);
+  });
+
+  it('rejects a non-zero initial revision and a stale revision in stateDir with ProjectProfileRevisionConflictError', async () => {
+    const adapter = new ProjectProfileRepositoryAdapter({ stateDir: tempDir });
+    const base: ProjectProfileRecord = {
+      projectId: 'proj-cas',
+      displayName: 'Project CAS',
+      repository: 'org/repo-cas',
+      designatedDispatcherHost: 'host-1',
+      policyRevision: 'pol-1',
+      maxConcurrentLanes: 2,
+      runnerCapabilities: {
+        filesystemScope: 'scoped-worktree',
+        networkEgressRestricted: true,
+      },
+      revision: 2,
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+      status: 'active',
+      defaultBranch: null,
+      clones: {},
+      gateProcedures: [],
+      defaultAllowedPathPrefixes: [],
+      lastProbe: null,
+    };
+
+    let initialConflict: unknown;
+    try {
+      await adapter.saveProfile(base);
+    } catch (error: unknown) {
+      initialConflict = error;
+    }
+    expect(initialConflict).toBeInstanceOf(ProjectProfileRevisionConflictError);
+    const newIdError = initialConflict as ProjectProfileRevisionConflictError;
+    expect(newIdError.expectedRevision).toBe(-1);
+    expect(newIdError.actualRevision).toBe(2);
+    expect(newIdError.message).toContain('write must be 0');
+
+    await adapter.saveProfile({ ...base, revision: 0 });
+    await adapter.saveProfile({ ...base, revision: 1 });
+
+    let staleConflict: unknown;
+    try {
+      await adapter.saveProfile({ ...base, revision: 1 });
+    } catch (error: unknown) {
+      staleConflict = error;
+    }
+    expect(staleConflict).toBeInstanceOf(ProjectProfileRevisionConflictError);
+    const staleError = staleConflict as ProjectProfileRevisionConflictError;
+    expect(staleError.expectedRevision).toBe(1);
+    expect(staleError.actualRevision).toBe(1);
+    expect(staleError.message).toContain('write must be 2');
+  });
+
+  it('lists active and retired profiles from stateDir sorted by projectId', async () => {
+    const writer = new ProjectProfileRepositoryAdapter({ stateDir: tempDir });
+    const retiredProfile: ProjectProfileRecord = {
+      projectId: 'proj-z',
+      displayName: 'Project Z',
+      repository: 'org/repo-z',
+      designatedDispatcherHost: 'host-1',
+      policyRevision: 'pol-1',
+      maxConcurrentLanes: 1,
+      runnerCapabilities: {
+        filesystemScope: 'scoped-worktree',
+      },
+      revision: 0,
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+      status: 'retired',
+      defaultBranch: 'main',
+      clones: {},
+      gateProcedures: [],
+      defaultAllowedPathPrefixes: [],
+      lastProbe: null,
+    };
+    const activeProfile: ProjectProfileRecord = {
+      ...retiredProfile,
+      projectId: 'proj-a',
+      displayName: 'Project A',
+      repository: 'org/repo-a',
+      status: 'active',
+    };
+
+    await writer.saveProfile(retiredProfile);
+    await writer.saveProfile(activeProfile);
+
+    const reader = new ProjectProfileRepositoryAdapter({ stateDir: tempDir });
+    const listed = await reader.listProfiles();
+    expect(listed.map((profile) => ({ id: profile.projectId, status: profile.status }))).toEqual([
+      { id: 'proj-a', status: 'active' },
+      { id: 'proj-z', status: 'retired' },
+    ]);
   });
 });

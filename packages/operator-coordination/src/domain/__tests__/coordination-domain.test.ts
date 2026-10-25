@@ -392,12 +392,44 @@ describe('ProjectProfile', () => {
       ProjectProfile.fromRecord(
         profileRecord({ clones: { host1: { path: '/work/../x', worktreeRoot: '/wt' } } }),
       ),
-    ).toThrow('ProjectProfile clone host1 requires absolute paths without ..');
+    ).toThrow('ProjectProfile clone host1 requires normalised absolute paths');
     expect(() =>
       ProjectProfile.fromRecord(
-        profileRecord({ clones: { host1: { path: '/work', worktreeRoot: '/work/wt' } } }),
+        profileRecord({ clones: { host1: { path: '/srv/clone/', worktreeRoot: '/srv/clone' } } }),
+      ),
+    ).toThrow('ProjectProfile clone host1 requires normalised absolute paths');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({ clones: { host1: { path: '///srv/clone', worktreeRoot: '/srv/wt' } } }),
+      ),
+    ).toThrow('ProjectProfile clone host1 requires normalised absolute paths');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({ clones: { host1: { path: '/srv/./clone', worktreeRoot: '/srv/wt' } } }),
+      ),
+    ).toThrow('ProjectProfile clone host1 requires normalised absolute paths');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({ clones: { host1: { path: '/', worktreeRoot: '/srv/wt' } } }),
+      ),
+    ).toThrow('ProjectProfile clone host1 requires normalised absolute paths');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({ clones: { host1: { path: '/srv/clone', worktreeRoot: '/srv/clone/wt' } } }),
       ),
     ).toThrow('ProjectProfile clone host1 worktreeRoot must be outside the clone');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({
+          clones: {
+            host1: { path: '/srv/clone', worktreeRoot: '/srv/wt', extra: 'nope' } as unknown as {
+              path: string;
+              worktreeRoot: string;
+            },
+          },
+        }),
+      ),
+    ).toThrow('ProjectProfile clone host1 carries only path and worktreeRoot');
     expect(() =>
       ProjectProfile.fromRecord(profileRecord({ gateProcedures: ['verify', 'verify'] })),
     ).toThrow('ProjectProfile requires gateProcedures to be unique non-empty names');
@@ -415,12 +447,45 @@ describe('ProjectProfile', () => {
         }),
       ),
     ).toThrow('ProjectProfile requires lastProbe to be null or a probe receipt');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({
+          lastProbe: {
+            probedAtIso: '2026-10-15T09:00:00.000Z',
+            probedFrom: 'host-1',
+            checks: [
+              {
+                name: 'git-fetch',
+                host: 'host-1',
+                result: 'pass',
+                detail: 'ok',
+                apiKey: 'secret',
+              } as never,
+            ],
+          },
+        }),
+      ),
+    ).toThrow('ProjectProfile requires lastProbe to be null or a probe receipt');
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({
+          lastProbe: {
+            probedAtIso: '2026-10-15T09:00:00.000Z',
+            probedFrom: 'host-1',
+            checks: [],
+            extra: 'unexpected',
+          } as never,
+        }),
+      ),
+    ).toThrow('ProjectProfile requires lastProbe to be null or a probe receipt');
   });
 
   it('deep-copies clones and the probe receipt on toRecord', () => {
     const profile = ProjectProfile.fromRecord(
       profileRecord({
         clones: { host1: { path: '/srv/clone', worktreeRoot: '/srv/wt' } },
+        gateProcedures: ['verify'],
+        defaultAllowedPathPrefixes: ['src'],
         lastProbe: {
           probedAtIso: '2026-10-15T09:00:00.000Z',
           probedFrom: 'host-1',
@@ -429,10 +494,14 @@ describe('ProjectProfile', () => {
       }),
     );
     const first = profile.toRecord();
-    Object.assign(first.clones, { host1: { path: '/hacked', worktreeRoot: '/hacked-wt' } });
+    (first.clones.host1 as { path: string }).path = '/elsewhere';
+    (first.gateProcedures as string[]).push('injected');
+    (first.defaultAllowedPathPrefixes as string[]).push('injected');
     Object.assign(first.lastProbe!.checks[0], { detail: 'mutated' });
     const second = profile.toRecord();
     expect(second.clones['host1']).toEqual({ path: '/srv/clone', worktreeRoot: '/srv/wt' });
+    expect(second.gateProcedures).toEqual(['verify']);
+    expect(second.defaultAllowedPathPrefixes).toEqual(['src']);
     expect(second.lastProbe!.checks[0].detail).toBe('ok');
   });
 });

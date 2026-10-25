@@ -31,6 +31,10 @@ export type {
 const FORBIDDEN_FIELD_PATTERN =
   /(token|secret|credential|password|passphrase|api[-_]?key|private[-_]?key|access[-_]?key|authorization|cookie)/i;
 
+const ALLOWED_CLONE_KEYS = new Set(['path', 'worktreeRoot']);
+const ALLOWED_PROBE_KEYS = new Set(['probedAtIso', 'probedFrom', 'checks']);
+const ALLOWED_PROBE_CHECK_KEYS = new Set(['name', 'host', 'result', 'detail']);
+
 /** One configured capability: supported, explicitly unsupported, or not known. */
 export type CapabilityStatus = 'supported' | 'missing' | 'unknown';
 
@@ -107,24 +111,22 @@ export class ProjectProfile {
       if (key.trim().length === 0 || FORBIDDEN_FIELD_PATTERN.test(key)) {
         throw new Error(`ProjectProfile clone host name is invalid: ${key}`);
       }
-      if (typeof clone !== 'object' || clone === null) {
-        throw new Error(`ProjectProfile clone ${key} requires absolute paths without ..`);
+      if (typeof clone !== 'object' || clone === null || Array.isArray(clone)) {
+        throw new Error(`ProjectProfile clone ${key} requires normalised absolute paths`);
+      }
+      for (const cloneKey of Object.keys(clone)) {
+        if (!ALLOWED_CLONE_KEYS.has(cloneKey)) {
+          throw new Error(`ProjectProfile clone ${key} carries only path and worktreeRoot`);
+        }
       }
       const { path: clonePath, worktreeRoot } = clone as {
         path?: unknown;
         worktreeRoot?: unknown;
       };
-      if (
-        typeof clonePath !== 'string' ||
-        typeof worktreeRoot !== 'string' ||
-        !clonePath.startsWith('/') ||
-        !worktreeRoot.startsWith('/') ||
-        hasDotDotSegment(clonePath) ||
-        hasDotDotSegment(worktreeRoot)
-      ) {
-        throw new Error(`ProjectProfile clone ${key} requires absolute paths without ..`);
+      if (!isNormalisedAbsolutePath(clonePath) || !isNormalisedAbsolutePath(worktreeRoot)) {
+        throw new Error(`ProjectProfile clone ${key} requires normalised absolute paths`);
       }
-      if (worktreeRoot === clonePath || worktreeRoot.startsWith(clonePath.replace(/\/+$/, '') + '/')) {
+      if (worktreeRoot === clonePath || worktreeRoot.startsWith(clonePath + '/')) {
         throw new Error(`ProjectProfile clone ${key} worktreeRoot must be outside the clone`);
       }
       copy[key] = { path: clonePath, worktreeRoot };
@@ -177,6 +179,8 @@ export class ProjectProfile {
     const probe = lastProbe;
     const isProbe =
       typeof probe === 'object' &&
+      !Array.isArray(probe) &&
+      Object.keys(probe).every((key) => ALLOWED_PROBE_KEYS.has(key)) &&
       typeof probe.probedAtIso === 'string' &&
       probe.probedAtIso.trim().length > 0 &&
       typeof probe.probedFrom === 'string' &&
@@ -185,10 +189,12 @@ export class ProjectProfile {
     if (!isProbe) {
       throw new Error('ProjectProfile requires lastProbe to be null or a probe receipt');
     }
-    for (const check of probe.checks) {
+    const checks = probe.checks.map((check) => {
       const validCheck =
         typeof check === 'object' &&
         check !== null &&
+        !Array.isArray(check) &&
+        Object.keys(check).every((key) => ALLOWED_PROBE_CHECK_KEYS.has(key)) &&
         typeof check.name === 'string' &&
         check.name.trim().length > 0 &&
         (check.host === null || typeof check.host === 'string') &&
@@ -197,11 +203,17 @@ export class ProjectProfile {
       if (!validCheck) {
         throw new Error('ProjectProfile requires lastProbe to be null or a probe receipt');
       }
-    }
+      return {
+        name: check.name,
+        host: check.host,
+        result: check.result,
+        detail: check.detail,
+      };
+    });
     return {
       probedAtIso: probe.probedAtIso,
       probedFrom: probe.probedFrom,
-      checks: probe.checks.map((check) => ({ ...check })),
+      checks,
     };
   }
 
@@ -233,7 +245,10 @@ export class ProjectProfile {
       ...this.record,
       runnerCapabilities: { ...this.record.runnerCapabilities },
       clones: Object.fromEntries(
-        Object.entries(this.record.clones).map(([key, clone]) => [key, { ...clone }]),
+        Object.entries(this.record.clones).map(([key, clone]) => [
+          key,
+          { path: clone.path, worktreeRoot: clone.worktreeRoot },
+        ]),
       ),
       gateProcedures: [...this.record.gateProcedures],
       defaultAllowedPathPrefixes: [...this.record.defaultAllowedPathPrefixes],
@@ -241,8 +256,14 @@ export class ProjectProfile {
         this.record.lastProbe === null
           ? null
           : {
-              ...this.record.lastProbe,
-              checks: this.record.lastProbe.checks.map((check) => ({ ...check })),
+              probedAtIso: this.record.lastProbe.probedAtIso,
+              probedFrom: this.record.lastProbe.probedFrom,
+              checks: this.record.lastProbe.checks.map((check) => ({
+                name: check.name,
+                host: check.host,
+                result: check.result,
+                detail: check.detail,
+              })),
             },
     };
   }
@@ -261,7 +282,10 @@ export class ProjectProfile {
 
   getClones(): Readonly<Record<string, { readonly path: string; readonly worktreeRoot: string }>> {
     return Object.fromEntries(
-      Object.entries(this.record.clones).map(([key, clone]) => [key, { ...clone }]),
+      Object.entries(this.record.clones).map(([key, clone]) => [
+        key,
+        { path: clone.path, worktreeRoot: clone.worktreeRoot },
+      ]),
     );
   }
 
@@ -301,6 +325,21 @@ export class ProjectProfile {
   nextRevision(): number {
     return this.record.revision + 1;
   }
+}
+
+/**
+ * True when `value` starts with `/` and every segment after the leading slash
+ * is non-empty and neither `.` nor `..`.
+ */
+function isNormalisedAbsolutePath(value: unknown): value is string {
+  if (typeof value !== 'string' || !value.startsWith('/')) {
+    return false;
+  }
+  const segments = value.split('/').slice(1);
+  return (
+    segments.length > 0 &&
+    segments.every((segment) => segment.length > 0 && segment !== '.' && segment !== '..')
+  );
 }
 
 /** True when a path contains a `..` path segment. */

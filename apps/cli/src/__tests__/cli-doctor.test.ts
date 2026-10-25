@@ -16,6 +16,13 @@ import type { DoctorLine, DoctorProbes, HostProbeExecutor } from '@fleet/onboard
 
 import { runCli, type CliIo, type DoctorCliOptions } from '../index.js';
 
+beforeEach(() => {
+  vi.stubEnv('FLEET_STATE_DIR', '');
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 const MODEL = {
   schemaVersion: 2,
   hosts: {
@@ -380,14 +387,6 @@ function makeTempDir(): string {
 }
 
 describe('doctor state line', () => {
-  beforeEach(() => {
-    vi.stubEnv('FLEET_STATE_DIR', '');
-  });
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-  });
-
   it('adds a PASS state line as the last stdout line for a clean directory', async () => {
     const dir = makeTempDir();
     const { io, stdout } = captureIo();
@@ -410,7 +409,7 @@ describe('doctor state line', () => {
     });
     expect(code).toBe(1);
     const last = stdout[stdout.length - 1];
-    expect(last).toBe(`FAIL state ${dir} state-files — unreadable: journal.json; run fleet-v2 state check\n`);
+    expect(last).toBe(`FAIL state ${dir} state-files — run fleet-v2 state check; unreadable: journal.json\n`);
   });
 
   it('omits the state line without a state directory', async () => {

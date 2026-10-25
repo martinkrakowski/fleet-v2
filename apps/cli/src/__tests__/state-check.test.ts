@@ -118,6 +118,15 @@ describe('fleet-v2 state', () => {
     expect(stdout.join('')).toContain('attempts.json: ok (2 records)\n');
   });
 
+  it('uses singular record for a one-record attempts store', async () => {
+    const dir = makeTempDir();
+    await fs.writeFile(path.join(dir, 'attempts.json'), JSON.stringify([ATTEMPT_RECORD('a1')]));
+    const { io, stdout } = mockIo();
+    const code = await runCli(['--state-dir', dir, 'state', 'check'], io);
+    expect(code).toBe(0);
+    expect(stdout.join('')).toContain('attempts.json: ok (1 record)\n');
+  });
+
   it('reports an unreadable journal store and exits 1', async () => {
     const dir = makeTempDir();
     await fs.writeFile(path.join(dir, 'journal.json'), '{ nope');
@@ -127,7 +136,7 @@ describe('fleet-v2 state', () => {
     const text = stdout.join('');
     expect(text).toContain('journal.json: unreadable: not valid JSON\n');
     expect(text).toContain('state check: 1 of 10 store files unreadable\n');
-    expect(stdout.at(-1)).toBe('nothing was changed; no quarantine copies exist yet\n');
+    expect(stdout.at(-1)).toBe('nothing was changed; no quarantine copies were found\n');
   });
 
   it('reports a non-list store as expecting a record list', async () => {

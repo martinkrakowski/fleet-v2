@@ -45,7 +45,7 @@ unreadable, 2 usage error (including no state directory).`;
 export function describeStateFileResult(result: StateFileReadResult): string {
   switch (result.status) {
     case 'ok':
-      return `ok (${result.recordCount} records)`;
+      return `ok (${result.recordCount} ${result.recordCount === 1 ? 'record' : 'records'})`;
     case 'missing':
       return 'missing';
     case 'read-error':
@@ -107,7 +107,7 @@ async function stateCheck(argv: readonly string[], io: CliIo, stateDir: string):
   const copies = checks.reduce((total, check) => total + check.quarantineCopies.length, 0);
   io.stdout(
     copies === 0
-      ? 'nothing was changed; no quarantine copies exist yet\n'
+      ? 'nothing was changed; no quarantine copies were found\n'
       : 'nothing was changed; the quarantine copies listed above are kept for recovery\n',
   );
   return 1;
@@ -125,7 +125,7 @@ export async function stateDoctorLine(stateDir: string): Promise<DoctorLine> {
     return {
       ...base,
       status: 'FAIL',
-      detail: boundDoctorDetail(`unreadable: ${bad.join(', ')}; run fleet-v2 state check`),
+      detail: boundDoctorDetail(`run fleet-v2 state check; unreadable: ${bad.join(', ')}`),
     };
   } catch {
     return { ...base, status: 'UNKNOWN', detail: 'the state check could not run' };

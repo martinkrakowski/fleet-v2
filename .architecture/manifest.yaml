@@ -400,8 +400,9 @@ bounded_contexts:
             - ProjectProbePort
             - ProjectProfileReadPort
             - ProjectProbeRecordPort
+            - ChangeSignalPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -442,6 +443,7 @@ bounded_contexts:
       ProjectProbeRecordPort: "Record a probe receipt on a profile at the revision the probe started from; a changed profile is a typed rejection, never an overwrite."
       ProjectProbePort: "Read-only check of a project before registration or after an edit: the repository answers, and on each named host the clone is a git work tree whose origin matches, the worktree root exists, .lane/ is ignored and an agent instruction file is tracked; an unreachable host is unknown, a failing check carries the command that would fix it and nothing is ever run to fix it."
       UsagePort: "Read what an attempt's recorded opencode session cost from opencode's own database on the recorded runner host; an attempt with no session id is unavailable with reason no session id, and a failed read never changes collection."
+      ChangeSignalPort: "Announce, after a successful save, that a record of a kind changed; carries no record state; never fails or delays the save."
     adapter_bindings:
       - { adapter: WorkOrderRepositoryAdapter, implements: WorkOrderRepositoryPort, integration: local-transactional-store }
       - { adapter: AttemptRepositoryAdapter, implements: AttemptRepositoryPort, integration: local-transactional-store }
@@ -496,6 +498,7 @@ bounded_contexts:
         implements: ExecutionObservationPort
         integration: in-process
         delegates_to: [operator-coordination/PublishProjectObservationPort]
+      - { adapter: NoopChangeSignalAdapter, implements: ChangeSignalPort, integration: in-process-noop }
     domain_specification:
       aggregate_roots: [WorkOrder, Attempt]
       child_ownership: { ActionJournalEntry: Attempt, CapacityReservation: Attempt }
@@ -668,9 +671,9 @@ bounded_contexts:
         use_cases: [RegisterProjectProfileUseCase, UpdateProjectProfileUseCase, RetireProjectProfileUseCase, ListProjectProfilesUseCase, InspectProjectProfileUseCase, RecordProjectProbeUseCase, InspectConfiguredCapabilitiesUseCase, RequestScopedDecisionUseCase, ResolveActionAuthorizationUseCase, CheckOwnerDecisionUseCase, RecordAuthorizationConsumptionUseCase, PublishProjectObservationUseCase, ReadProjectAttentionUseCase, SendFleetRelayUseCase, RecordRelayAcknowledgementUseCase, InspectOutstandingCoordinationUseCase, AskOwnerQuestionUseCase, AnswerOwnerQuestionUseCase, ExpireOwnerQuestionsUseCase, AcknowledgeOwnerAnswerUseCase, ListOwnerQuestionsUseCase, ReadOwnerQuestionUseCase, SyncOneWayOwnerQuestionsUseCase]
         ports:
           in: [RegisterProjectProfilePort, UpdateProjectProfilePort, RetireProjectProfilePort, ListProjectProfilesPort, InspectProjectProfilePort, RecordProjectProbePort, InspectConfiguredCapabilitiesPort, RequestScopedDecisionPort, ResolveActionAuthorizationPort, CheckOwnerDecisionPort, RecordAuthorizationConsumptionPort, PublishProjectObservationPort, ReadProjectAttentionPort, SendFleetRelayPort, RecordRelayAcknowledgementPort, InspectOutstandingCoordinationPort, AskOwnerQuestionPort, AnswerOwnerQuestionPort, ExpireOwnerQuestionsPort, AcknowledgeOwnerAnswerPort, ListOwnerQuestionsPort, ReadOwnerQuestionPort, SyncOneWayOwnerQuestionsPort]
-          out: [ProjectProfileRepositoryPort, InstallationReferencePort, CoordinationRequestRepositoryPort, OwnerQuestionRepositoryPort, DecisionTransportPort, ObservationPublicationPort, AttentionReadPort, RelayTransportPort]
+          out: [ProjectProfileRepositoryPort, InstallationReferencePort, CoordinationRequestRepositoryPort, OwnerQuestionRepositoryPort, DecisionTransportPort, ObservationPublicationPort, AttentionReadPort, RelayTransportPort, ChangeSignalPort]
       infrastructure:
-        adapters: [ProjectProfileRepositoryAdapter, InstallationReferenceAdapter, CoordinationRequestRepositoryAdapter, OwnerQuestionRepositoryAdapter, DecisionTransportAdapter, ObservationPublicationAdapter, AttentionReadAdapter, RelayTransportAdapter]
+        adapters: [ProjectProfileRepositoryAdapter, InstallationReferenceAdapter, CoordinationRequestRepositoryAdapter, OwnerQuestionRepositoryAdapter, DecisionTransportAdapter, ObservationPublicationAdapter, AttentionReadAdapter, RelayTransportAdapter, NoopChangeSignalAdapter]
     contracts:
       RegisterProjectProfilePort: "Validate installation references, designated dispatcher, runner capabilities and approved policy without persisting credential values."
       UpdateProjectProfilePort: "Change an active profile only when the caller names the revision it read; host, clone and gate procedure names are checked against the installation; a change of repository or clones clears the last probe."
@@ -703,6 +706,7 @@ bounded_contexts:
       ObservationPublicationPort: "Publish a versioned Waves snapshot through its client without exposing tokens to agents."
       AttentionReadPort: "Read the existing Waves attention and project-staleness endpoints with bounded requests."
       RelayTransportPort: "Deliver notices or write a local outbox and return transport receipts without inferring acceptance."
+      ChangeSignalPort: "Announce, after a successful save, that a record of a kind changed; carries no record state; never fails or delays the save."
     adapter_bindings:
       - { adapter: ProjectProfileRepositoryAdapter, implements: ProjectProfileRepositoryPort, integration: private-installation-config-and-local-store }
       - { adapter: InstallationReferenceAdapter, implements: InstallationReferencePort, integration: names-from-the-loaded-installation }
@@ -712,6 +716,7 @@ bounded_contexts:
       - { adapter: ObservationPublicationAdapter, implements: ObservationPublicationPort, integration: existing-waves-client }
       - { adapter: AttentionReadAdapter, implements: AttentionReadPort, integration: existing-waves-read-endpoints }
       - { adapter: RelayTransportAdapter, implements: RelayTransportPort, integration: harness-notice-channel-or-local-outbox }
+      - { adapter: NoopChangeSignalAdapter, implements: ChangeSignalPort, integration: in-process-noop }
     domain_specification:
       aggregate_roots: [ProjectProfile, CoordinationRequest, OwnerQuestion]
       child_ownership: { AuthorizationConsumption: CoordinationRequest, RelayAcknowledgement: CoordinationRequest }

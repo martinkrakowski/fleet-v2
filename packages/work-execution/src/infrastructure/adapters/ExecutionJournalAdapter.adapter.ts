@@ -25,11 +25,15 @@ import type {
   ReserveCapacityAtomicallyResult,
   SelectRecordUnderLockVerdict,
 } from '../../application/ports/out/ExecutionJournalPort.out-port.js';
+import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
+import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
 import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface ExecutionJournalAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
   readonly stateDir?: string;
+  /** Emitter for post-save change signals; defaults to a no-op adapter. */
+  readonly changeSignal?: ChangeSignalPort;
 }
 
 function isActionJournalEntryRecord(value: unknown): value is ActionJournalEntryRecord {
@@ -87,8 +91,24 @@ function arbitrateReservation(
 export class ExecutionJournalAdapter implements ExecutionJournalPort {
   private readonly inMemoryJournalEntries: ActionJournalEntryRecord[] = [];
   private readonly inMemoryReservationsById = new Map<string, CapacityReservationRecord>();
+  private readonly changeSignal: ChangeSignalPort;
+  private signalEmitFailuresCount = 0;
 
-  constructor(private readonly options?: ExecutionJournalAdapterOptions) {}
+  constructor(private readonly options?: ExecutionJournalAdapterOptions) {
+    this.changeSignal = options?.changeSignal ?? new NoopChangeSignalAdapter();
+  }
+
+  get signalEmitFailures(): number {
+    return this.signalEmitFailuresCount;
+  }
+
+  private signal(sig: ChangeSignal): void {
+    try {
+      this.changeSignal.emit(sig);
+    } catch {
+      this.signalEmitFailuresCount += 1;
+    }
+  }
 
   async appendJournalEntry(entry: ActionJournalEntryRecord): Promise<void> {
     const stateDir = this.options?.stateDir;
@@ -132,17 +152,41 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
     if (stateDir === undefined) {
       refuseSupersedingReservation(this.inMemoryReservationsById, reservation);
       this.inMemoryReservationsById.set(reservation.id, reservation);
+      this.signal({ kind: 'capacity', id: reservation.id, stateFile: null, before: null, written: null });
       return;
     }
 
     const target = path.join(stateDir, 'reservations.json');
     const lockPath = path.join(stateDir, 'reservations.json.lock');
 
+    let before: ChangeSignal['before'] = null;
+    let written: ChangeSignal['written'] = null;
+
     await withFileLock(lockPath, async () => {
+      try {
+        const stat = await fs.stat(target);
+        before = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+      } catch {
+        before = null;
+      }
       const reservations = await this.readReservationsFromDisk(target);
       refuseSupersedingReservation(reservations, reservation);
       reservations.set(reservation.id, reservation);
       await writeJsonAtomically(target, [...reservations.values()]);
+      try {
+        const stat = await fs.stat(target);
+        written = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+      } catch {
+        written = null;
+      }
+    });
+
+    this.signal({
+      kind: 'capacity',
+      id: reservation.id,
+      stateFile: path.resolve(target),
+      before,
+      written,
     });
   }
 
@@ -219,6 +263,13 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
         );
         if (result.outcome === 'reserved') {
           this.inMemoryReservationsById.set(result.reservation.id, result.reservation);
+          this.signal({
+            kind: 'capacity',
+            id: result.reservation.id,
+            stateFile: null,
+            before: null,
+            written: null,
+          });
         }
         return result;
       }
@@ -227,7 +278,16 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
     const target = path.join(stateDir, 'reservations.json');
     const lockPath = path.join(stateDir, 'reservations.json.lock');
 
-    return await withFileLock(lockPath, async () => {
+    let before: ChangeSignal['before'] = null;
+    let written: ChangeSignal['written'] = null;
+
+    const result = await withFileLock(lockPath, async () => {
+      try {
+        const stat = await fs.stat(target);
+        before = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+      } catch {
+        before = null;
+      }
       const reservations = await this.readReservationsFromDisk(target);
       const held = [...reservations.values()].filter(
         (reservation) => reservation.held === true,
@@ -240,13 +300,30 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       if (busy !== null) {
         return busy;
       }
-      const result = arbitrateReservation(request.attemptId, chosen.record, chosen.maxSlots, held);
-      if (result.outcome === 'reserved') {
-        reservations.set(result.reservation.id, result.reservation);
+      const chose = arbitrateReservation(request.attemptId, chosen.record, chosen.maxSlots, held);
+      if (chose.outcome === 'reserved') {
+        reservations.set(chose.reservation.id, chose.reservation);
         await writeJsonAtomically(target, [...reservations.values()]);
+        try {
+          const stat = await fs.stat(target);
+          written = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+        } catch {
+          written = null;
+        }
       }
-      return result;
+      return chose;
     });
+
+    if (result.outcome === 'reserved') {
+      this.signal({
+        kind: 'capacity',
+        id: result.reservation.id,
+        stateFile: path.resolve(target),
+        before,
+        written,
+      });
+    }
+    return result;
   }
 
   async listActiveReservations(
@@ -277,13 +354,24 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       );
       if (held === undefined) return false;
       this.inMemoryReservationsById.set(held.id, { ...held, held: false, releasedAtIso });
+      this.signal({ kind: 'capacity', id: held.id, stateFile: null, before: null, written: null });
       return true;
     }
 
     const target = path.join(stateDir, 'reservations.json');
     const lockPath = path.join(stateDir, 'reservations.json.lock');
 
-    return await withFileLock(lockPath, async () => {
+    let before: ChangeSignal['before'] = null;
+    let written: ChangeSignal['written'] = null;
+    let releasedId: string | null = null;
+
+    const released = await withFileLock(lockPath, async () => {
+      try {
+        const stat = await fs.stat(target);
+        before = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+      } catch {
+        before = null;
+      }
       const reservations = await this.readReservationsFromDisk(target);
       const held = [...reservations.values()].find(
         (reservation) => reservation.attemptId === attemptId && reservation.held === true,
@@ -291,8 +379,26 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       if (held === undefined) return false;
       reservations.set(held.id, { ...held, held: false, releasedAtIso });
       await writeJsonAtomically(target, [...reservations.values()]);
+      try {
+        const stat = await fs.stat(target);
+        written = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+      } catch {
+        written = null;
+      }
+      releasedId = held.id;
       return true;
     });
+
+    if (released && releasedId !== null) {
+      this.signal({
+        kind: 'capacity',
+        id: releasedId,
+        stateFile: path.resolve(target),
+        before,
+        written,
+      });
+    }
+    return released;
   }
 
   private async readJournalFromDisk(target: string): Promise<ActionJournalEntryRecord[]> {

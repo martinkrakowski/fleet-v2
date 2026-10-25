@@ -11,12 +11,15 @@
  * is null while unreadable state throws.
  */
 
-import { join } from 'node:path';
+import { promises as fs } from 'node:fs';
+import { join, resolve } from 'node:path';
 
 import type { ProjectProfileRecord } from '../../domain/coordination-records.js';
 import { ProjectProfile } from '../../domain/entities/ProjectProfile.js';
 import type { ProjectProfileRepositoryPort } from '../../application/ports/out/ProjectProfileRepositoryPort.out-port.js';
 import { ProjectProfileRevisionConflictError } from '../../application/ports/out/ProjectProfileRepositoryPort.out-port.js';
+import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
+import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
 import { readRecordList } from './record-list-store.js';
 
@@ -24,6 +27,8 @@ export interface ProjectProfileRepositoryAdapterOptions {
   /** When set, profiles are persisted here and reloaded on first use. */
   readonly stateDir?: string;
   readonly fileName?: string;
+  /** Emitter for post-save change signals; defaults to a no-op adapter. */
+  readonly changeSignal?: ChangeSignalPort;
 }
 
 const DEFAULT_FILE_NAME = 'project-profiles.json';
@@ -36,8 +41,24 @@ function copy(record: ProjectProfileRecord): ProjectProfileRecord {
 
 export class ProjectProfileRepositoryAdapter implements ProjectProfileRepositoryPort {
   private readonly inMemoryProfiles = new Map<string, ProjectProfileRecord>();
+  private readonly changeSignal: ChangeSignalPort;
+  private signalEmitFailuresCount = 0;
 
-  constructor(private readonly options: ProjectProfileRepositoryAdapterOptions = {}) {}
+  constructor(private readonly options: ProjectProfileRepositoryAdapterOptions = {}) {
+    this.changeSignal = options.changeSignal ?? new NoopChangeSignalAdapter();
+  }
+
+  get signalEmitFailures(): number {
+    return this.signalEmitFailuresCount;
+  }
+
+  private signal(sig: ChangeSignal): void {
+    try {
+      this.changeSignal.emit(sig);
+    } catch {
+      this.signalEmitFailuresCount += 1;
+    }
+  }
 
   async saveProfile(record: ProjectProfileRecord): Promise<void> {
     const target = this.statePath;
@@ -46,13 +67,23 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
       const existing = this.inMemoryProfiles.get(validated.projectId);
       this.assertWritable(existing, validated);
       this.inMemoryProfiles.set(validated.projectId, validated);
+      this.signal({ kind: 'profile', id: validated.projectId, stateFile: null, before: null, written: null });
       return;
     }
 
     const lockPath = `${target}.lock`;
     const validated = ProjectProfile.fromRecord(record).toRecord();
 
+    let before: ChangeSignal['before'] = null;
+    let written: ChangeSignal['written'] = null;
+
     await withFileLock(lockPath, async () => {
+      try {
+        const stat = await fs.stat(target);
+        before = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+      } catch {
+        before = null;
+      }
       const profiles = await this.readProfilesFromDisk(target);
       const existing = profiles.get(validated.projectId);
       this.assertWritable(existing, validated);
@@ -61,6 +92,20 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
         .sort((left, right) => left.projectId.localeCompare(right.projectId))
         .map(copy);
       await writeJsonAtomically(target, list);
+      try {
+        const stat = await fs.stat(target);
+        written = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+      } catch {
+        written = null;
+      }
+    });
+
+    this.signal({
+      kind: 'profile',
+      id: validated.projectId,
+      stateFile: resolve(target),
+      before,
+      written,
     });
   }
 

@@ -20,6 +20,7 @@ export * from "./file-store.js";
 export * from "./ForgeActionAdapter.adapter.js";
 export * from "./LaneDiffCheckAdapter.adapter.js";
 export * from "./LocalExecutor.adapter.js";
+export * from "./NoopChangeSignalAdapter.adapter.js";
 export * from "./OpencodeDbUsageAdapter.adapter.js";
 export * from "./OwnerDecisionAdapter.adapter.js";
 export * from "./ProjectProbeAdapter.adapter.js";

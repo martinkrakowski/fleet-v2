@@ -12,11 +12,15 @@ import * as path from 'node:path';
 
 import type { WorkOrderRecord } from '../../domain/execution-records.js';
 import type { WorkOrderRepositoryPort } from '../../application/ports/out/WorkOrderRepositoryPort.out-port.js';
+import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
+import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
 import { quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface WorkOrderRepositoryAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
   readonly stateDir?: string;
+  /** Emitter for post-save change signals; defaults to a no-op adapter. */
+  readonly changeSignal?: ChangeSignalPort;
 }
 
 function isWorkOrderRecord(value: unknown): value is WorkOrderRecord {
@@ -27,8 +31,24 @@ function isWorkOrderRecord(value: unknown): value is WorkOrderRecord {
 
 export class WorkOrderRepositoryAdapter implements WorkOrderRepositoryPort {
   private readonly inMemoryRecords = new Map<string, WorkOrderRecord>();
+  private readonly changeSignal: ChangeSignalPort;
+  private signalEmitFailuresCount = 0;
 
-  constructor(private readonly options?: WorkOrderRepositoryAdapterOptions) {}
+  constructor(private readonly options?: WorkOrderRepositoryAdapterOptions) {
+    this.changeSignal = options?.changeSignal ?? new NoopChangeSignalAdapter();
+  }
+
+  get signalEmitFailures(): number {
+    return this.signalEmitFailuresCount;
+  }
+
+  private signal(sig: ChangeSignal): void {
+    try {
+      this.changeSignal.emit(sig);
+    } catch {
+      this.signalEmitFailuresCount += 1;
+    }
+  }
 
   async saveWorkOrder(record: WorkOrderRecord): Promise<void> {
     const stateDir = this.options?.stateDir;
@@ -40,13 +60,23 @@ export class WorkOrderRepositoryAdapter implements WorkOrderRepositoryPort {
         );
       }
       this.inMemoryRecords.set(record.id, record);
+      this.signal({ kind: 'work-order', id: record.id, stateFile: null, before: null, written: null });
       return;
     }
 
     const target = path.join(stateDir, 'work-orders.json');
     const lockPath = path.join(stateDir, 'work-orders.json.lock');
 
+    let before: ChangeSignal['before'] = null;
+    let written: ChangeSignal['written'] = null;
+
     await withFileLock(lockPath, async () => {
+      try {
+        const stat = await fs.stat(target);
+        before = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+      } catch {
+        before = null;
+      }
       const records = await this.readRecordsFromDisk(target);
       const existing = records.get(record.id);
       if (existing !== undefined && existing.revision >= record.revision) {
@@ -56,6 +86,20 @@ export class WorkOrderRepositoryAdapter implements WorkOrderRepositoryPort {
       }
       records.set(record.id, record);
       await writeJsonAtomically(target, [...records.values()]);
+      try {
+        const stat = await fs.stat(target);
+        written = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+      } catch {
+        written = null;
+      }
+    });
+
+    this.signal({
+      kind: 'work-order',
+      id: record.id,
+      stateFile: path.resolve(target),
+      before,
+      written,
     });
   }
 

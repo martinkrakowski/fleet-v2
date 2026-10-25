@@ -16,7 +16,7 @@
 
 | Area | On `main` | Gap |
 |---|---|---|
-| Evidence records | `packages/evidence-and-acceptance/src/domain/evidence-records.ts`: receipts carry `evidenceRef: string` and `summary: string`; entities in `domain/entities/{ReviewReceipt,VerificationReceipt,FindingDisposition}.ts` | No check of what those strings say. An empty-looking or "should work" value is accepted |
+| Evidence records | `packages/evidence-and-acceptance/src/domain/evidence-records.ts`: receipts carry `evidenceRef`, review findings carry `summary`, and dispositions carry `reason`; entities in `domain/entities/{ReviewReceipt,VerificationReceipt,FindingDisposition}.ts`. The constructors already reject empty or whitespace-only `evidenceRef`, finding `summary` and disposition `reason` | Placeholder text ("should work", "tbd", "n/a") is accepted. Placeholder detection is the new check |
 | Knowledge entries | `packages/brief-knowledge/src/domain/knowledge-records.ts`: `KnowledgeEntryRecord` with `claimText`, disposition, checks, triage flag | No notion of claim kind. A disproved approach cannot be told apart from a fact, so context selection cannot give it to the next round |
 | Artifact collection | `work-execution` `CollectAttemptArtifactsPort` (in) and `AttemptArtifactPort` (out): "bounded immutable artifacts after lane completion" | No sealed manifest proving what was collected before anything is removed |
 | Worktree removal | Not built. `WorkspacePort.removeWorktree` is host-programs plan P5; its safety rules are in the live-updates plan §3.6 | Nothing yet ties removal to proven collection |
@@ -26,7 +26,12 @@
 ### 3.1 Placeholder evidence (evidence-and-acceptance, domain)
 
 - **Rejecter:** a pure function `isPlaceholderEvidence(text: string): boolean` in `packages/evidence-and-acceptance/src/domain/`. After trimming and lower-casing, it is true when the text is empty or starts with one of a fixed, exported list: `tbd`, `todo`, `n/a`, `na`, `none`, `should work`, `looks right`, `looks good`, `lgtm`, `probably`, `i think`, `seems`. Matching is whole-word at the start; it never matches inside a word. This is adapted from Agensh's `board-service/verifier.py`, 56 lines, MIT; credited in a header comment if code is copied rather than re-written.
-- **Where it applies:** the constructors of `ReviewReceipt`, `VerificationReceipt` and `FindingDisposition` refuse a placeholder in `evidenceRef`, `summary` or a disposition's reason. The refusal names the field, never echoes the value (the value may be long or credential-shaped).
+- **Where it applies:**
+  - `ReviewReceipt`: `evidenceRef` and each finding's `summary`.
+  - `VerificationReceipt`: `evidenceRef` only. Its props have no `summary`.
+  - `FindingDisposition`: `evidenceRef`, where present, and `reason`.
+
+  Empty values are already refused today; this adds placeholder text. The refusal names the field, never echoes the value (the value may be long or credential-shaped).
 - **Records already on disk.** A stored receipt that fails the new check would make its store unreadable, so it would be quarantined (E1). Default (D1): the check applies to **new** writes only. The reader keeps the old shape-only validation. A later lane may tighten the readers after `state check` shows no store would be affected.
 
 ### 3.2 "Already failed" notes in fix-round briefs (brief-knowledge)
@@ -34,7 +39,13 @@
 - **New field:** `claimKind` on `KnowledgeEntryRecord`, one of `fact`, `observed` or `failed`. It is optional, so existing records load as `fact`.
 - **What a `failed` entry is:** "approach X was tried and disproved because Y". It has the same attribution (source attempt, commit, checker) and the same keeper path as any claim: capture proposes, only a check and disposition accept it. Nothing passes live between workers.
 - **Length:** `claimText` for `failed` is capped at 300 characters. Detail goes in the source attempt's artifacts, referenced by the existing `sourceAttemptId`. This follows Agensh's capped notes with full text behind a label.
-- **Context selection:** for a fix-round brief on a work order, include the accepted `failed` entries from that work order's earlier attempts, newest first, at most 10. They go in their own brief section, "Already tried and disproved; do not repeat", which counts toward the brief's size budget.
+- **Context selection:** for a fix-round brief on work order W, while preparing attempt N:
+  1. Take the attempt ids from `AttemptRepositoryPort.listAttemptsByWorkOrder(W)` (creation order) that come before N.
+  2. Select the `failed` entries whose `sourceAttemptId` is one of those ids, `disposition` is accepted and `supersededById` is null.
+  3. Order them by the source attempt's position in that list, newest attempt first; within one attempt, by the entry's `createdAtIso`, newest first.
+  4. Take at most 10.
+
+  Entries from other work orders are never selected. They go in their own brief section, "Already tried and disproved; do not repeat", which counts toward the brief's size budget.
 - **Capture:** the orchestrator, or a reviewer's numbered findings marked "disproved", proposes `failed` candidates through the existing capture use case. No new port.
 
 ### 3.3 Sealed artifact manifest before teardown (work-execution)

@@ -58,6 +58,11 @@ Exit codes: 0 every store file is readable or missing, 1 any store file is
 unreadable, 2 usage error (including no state directory). Exit codes for
 restore: 0 restored; 1 refused, declined or invalid candidate; 2 usage.`;
 
+/** `record` or `records` for a count. */
+function recordWord(count: number): string {
+  return count === 1 ? 'record' : 'records';
+}
+
 /** One status phrase for a store file or quarantine copy. */
 export function describeStateFileResult(result: StateFileReadResult): string {
   switch (result.status) {
@@ -229,12 +234,12 @@ async function stateRestore(
   io.stdout(`restore ${currentPath}\n`);
   io.stdout(`  current:   ${describeStateFileResult(currentResult)}${currentSuffix}\n`);
   io.stdout(
-    `  candidate: ok (${candidate.recordCount} records), ${read.bytes.length} bytes, sha256 ${sha(read.bytes).slice(0, 12)}, from quarantine/${read.name}\n`,
+    `  candidate: ok (${candidate.recordCount} ${recordWord(candidate.recordCount)}), ${read.bytes.length} bytes, sha256 ${sha(read.bytes).slice(0, 12)}, from quarantine/${read.name}\n`,
   );
   io.stdout(`  records:   ${before} -> ${candidate.recordCount}\n`);
   if (currentResult.status === 'ok') {
     io.stderr(
-      `${file} is readable (${currentResult.recordCount} records); state restore replaces only a missing or unreadable store\n`,
+      `${file} is readable (${currentResult.recordCount} ${recordWord(currentResult.recordCount)}); state restore replaces only a missing or unreadable store\n`,
     );
     io.stdout('nothing changed\n');
     return 1;
@@ -264,7 +269,7 @@ async function stateRestore(
     io.stdout('nothing changed\n');
     return 1;
   }
-  io.stdout(`restored ${file} (${outcome.recordCount} records)\n`);
+  io.stdout(`restored ${file} (${outcome.recordCount} ${recordWord(outcome.recordCount)})\n`);
   io.stdout(outcome.previousCopyPath === null ? 'there was no previous file\n' : `previous bytes kept at ${outcome.previousCopyPath}\n`);
   return 0;
 }

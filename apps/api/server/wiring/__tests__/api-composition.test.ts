@@ -333,7 +333,20 @@ describe("configured compositions execute real operations", () => {
 
   it("work composition registers, inspects, reserves and refuses fix rounds", async () => {
     const stateDir = await makeTempDir();
-    const work = createConfiguredWorkComposition({ stateDir });
+    // The work-order guard needs a profile; register one through the operator
+    // context and delegate profile reads to it from the work composition.
+    const operator = createConfiguredOperatorComposition({ stateDir });
+    const profiled = await operator.registerProjectProfile.execute(PROFILE_REQUEST);
+    expect(profiled.outcome).toBe("registered");
+    const work = createConfiguredWorkComposition(
+      { stateDir },
+      {
+        projectProfile: {
+          inspect: async (request) => operator.inspectProjectProfile.execute(request),
+          record: async (request) => operator.recordProjectProbe.execute(request),
+        },
+      },
+    );
 
     const registered = await work.registerWorkOrder.registerWorkOrder(WORK_ORDER_REQUEST);
     expect(registered.outcome).toBe("registered");
@@ -636,7 +649,24 @@ describe("configured compositions execute real operations", () => {
   it("configure*(options) serves requests and configure*(null) restores refusals", async () => {
     const stateDir = await makeTempDir();
 
-    configureWorkComposition({ stateDir });
+    // The work-order guard needs a profile; register one through the operator
+    // context and pass the profile delegate to the work composition.
+    configureOperatorComposition({ stateDir });
+    const guardProfiled = await getOperatorComposition().registerProjectProfile.execute(
+      PROFILE_REQUEST,
+    );
+    expect(guardProfiled.outcome).toBe("registered");
+    configureWorkComposition(
+      { stateDir },
+      {
+        projectProfile: {
+          inspect: async (request) =>
+            getOperatorComposition().inspectProjectProfile.execute(request),
+          record: async (request) =>
+            getOperatorComposition().recordProjectProbe.execute(request),
+        },
+      },
+    );
     const registered = await workComposition().registerWorkOrder.registerWorkOrder(
       WORK_ORDER_REQUEST,
     );
@@ -655,10 +685,6 @@ describe("configured compositions execute real operations", () => {
       NOTES_REQUEST,
     );
     expect(captured.outcome).toBe("captured");
-
-    configureOperatorComposition({ stateDir });
-    const profiled = await getOperatorComposition().registerProjectProfile.execute(PROFILE_REQUEST);
-    expect(profiled.outcome).toBe("registered");
 
     configureWorkComposition(null);
     await expect(workComposition().registerWorkOrder.execute(undefined as never)).rejects.toThrow(
@@ -722,6 +748,10 @@ describe("configured compositions execute real operations", () => {
     const stateDir = await makeTempDir();
     configureFleetApiRuntime({ stateDir });
 
+    // The work-order guard needs a profile; register one through the runtime's
+    // operator context first.
+    const profiled = await getOperatorComposition().registerProjectProfile.execute(PROFILE_REQUEST);
+    expect(profiled.outcome).toBe("registered");
     await workComposition().registerWorkOrder.registerWorkOrder(WORK_ORDER_REQUEST);
     const captured = await getKnowledgeComposition().captureCompletedAttemptNotes.execute(
       NOTES_REQUEST,
@@ -849,6 +879,10 @@ describe("state directory discipline", () => {
     const stateDir = await makeTempDir();
     configureFleetApiRuntime({ stateDir });
 
+    // The work-order guard needs a profile; register one through the runtime's
+    // operator context first.
+    const profiled = await getOperatorComposition().registerProjectProfile.execute(PROFILE_REQUEST);
+    expect(profiled.outcome).toBe("registered");
     await workComposition().registerWorkOrder.registerWorkOrder(WORK_ORDER_REQUEST);
     const workOrders = JSON.parse(
       await readFile(path.join(stateDir, "work-orders.json"), "utf8"),
@@ -864,7 +898,20 @@ describe("state directory discipline", () => {
 
   it("keeps all state in memory when no stateDir is configured", async () => {
     const stateDir = await makeTempDir();
-    const work = createConfiguredWorkComposition();
+    // The work-order guard needs a profile; register one through an in-memory
+    // operator composition and delegate profile reads to it.
+    const operator = createConfiguredOperatorComposition();
+    const profiled = await operator.registerProjectProfile.execute(PROFILE_REQUEST);
+    expect(profiled.outcome).toBe("registered");
+    const work = createConfiguredWorkComposition(
+      {},
+      {
+        projectProfile: {
+          inspect: async (request) => operator.inspectProjectProfile.execute(request),
+          record: async (request) => operator.recordProjectProbe.execute(request),
+        },
+      },
+    );
 
     const registered = await work.registerWorkOrder.registerWorkOrder(WORK_ORDER_REQUEST);
     expect(registered.outcome).toBe("registered");

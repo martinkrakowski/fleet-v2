@@ -23,8 +23,15 @@ function isActiveWorkOrder(state: WorkOrderRecord['state']): boolean {
   return state !== 'merged' && state !== 'stopped';
 }
 
+/** Code-unit order, the same order a bare `sort()` gives strings. */
+function compareCodeUnits(a: string, b: string): number {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
 function distinctSorted(values: readonly string[]): string[] {
-  return [...new Set(values)].sort();
+  return [...new Set(values)].sort(compareCodeUnits);
 }
 
 function buildProject(
@@ -118,7 +125,7 @@ export class ListUnregisteredProjectsUseCase implements ListUnregisteredProjects
       projects.push(buildProject(projectId, orders));
     }
 
-    projects.sort((a, b) => (a.projectId < b.projectId ? -1 : a.projectId > b.projectId ? 1 : 0));
+    projects.sort((a, b) => compareCodeUnits(a.projectId, b.projectId));
 
     return { outcome: 'listed', projects };
   }

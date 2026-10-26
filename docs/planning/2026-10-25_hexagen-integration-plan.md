@@ -29,6 +29,18 @@
   - `hexagen sync --check`, exit 0 or 1;
   - a versioned manifest (`schemaVersion`, plus `hexagen manifest migrate`).
 
+### 1.1 The two lint commands, and which lane uses which (checked against hexagen `main`, 2026-10-25)
+
+| Command | Package (pinned 0.14.0) | What it does | Output | Exit codes |
+|---|---|---|---|---|
+| `hexagen arch validate`, which is fleet-v2's `yarn lint:arch` and what CI runs | `@hexagen-monaco/sync` (bin `hexagen`) | Validates the manifest, then runs the arch-linter internally and hides its output | One human-readable line | 0 compliant; 1 for both violations and "could not run" (until hexagen's H2) |
+| `hexagen-lint --json` | `@hexagen-monaco/arch-linter` (bin `hexagen-lint`) | The arch-linter alone, without manifest validation | One JSON line: `fresh`, `baselined`, `stale`, `expired`, `introduced`, `baselineGrowth`, `filesScanned` | 0 compliant, 1 violations, 2 could not run |
+
+They are separate commands, not aliases. **The mapping this plan uses:**
+- **The merge gate stays `lint:arch`** (`hexagen arch validate`), the same command CI runs.
+- **`hexagen-lint --json` is used only where machine-readable findings are needed** (F4 evidence), alongside the gate, never instead of it.
+- **Once hexagen's H2 ships `arch validate --json`** with exit 2, F4 switches to it, and one command serves both purposes.
+
 ## 2. The rules that keep the projects separate
 
 1. **They meet only at hexagen's published contract:** its command-line tools, their JSON output and exit codes, and the manifest format. fleet-v2 never imports hexagen code, never adds it as a runtime dependency of any `apps/*`, and never names it in its domain or application layers. hexagen is reached only through an infrastructure adapter behind a port.
@@ -81,12 +93,12 @@
 
 | Lane | Scope | Tier | Depends on |
 |---|---|---|---|
-| F1 | `tests/hexagen-contract.test.sh` (runs under `yarn test:bin`): runs the **installed, pinned** `hexagen-lint --json` and `hexagen sync --check` on a fixture, and asserts the keys and exit codes fleet-v2 reads | 1 | none |
+| F1 | `tests/hexagen-contract.test.sh` (runs under `yarn test:bin`), using the **installed, pinned** binaries on two fixtures, one compliant and one with a violation. It asserts: <br>• **the gate command CI runs:** `hexagen arch validate` exits 0 and 1 respectively; <br>• **the evidence command:** `hexagen-lint --json` exits 0 and 1, the JSON keys F4 reads are present, and a missing root gives exit 2 (could not run, not a violation); <br>• `hexagen sync --check` exits 0 on a converged tree | 1 | none |
 | F2 | Probe: a read-only hexagen-state check (§3) in `ProjectProbeAdapter`; `{state, generatorVersion, pinnedVersion}` on the profile; file reads only | 2 (data) | none |
-| F3 | Docs and installation example: register `hexagen-lint --json --ratchet` and `hexagen sync --check` as verification procedures, plus a runbook paragraph. No code | 0 | none |
-| F4 | `ArchitectureConformancePort` (evidence-and-acceptance, out) and `HexagenCliAdapter`. It runs the pinned tools through the command executor (an argv list, no shell), parses the JSON leniently and handles several versions. A missing tool or unknown version gives `not-configured` or `unknown`, never a pass. The findings are attached to the receipt | 2 | F1, owner D1 |
+| F3 | Docs and installation example: register `hexagen arch validate` (the same command as `lint:arch`) and `hexagen sync --check` as verification procedures, with exit 0 meaning pass and anything else not a pass, plus a runbook paragraph. No code | 0 | none |
+| F4 | `ArchitectureConformancePort` (evidence-and-acceptance, out) and `HexagenCliAdapter`. It runs the pinned `hexagen-lint --json` through the command executor (an argv list, no shell), parses the JSON leniently and handles several versions. Exit 2 means `unknown`, never a violation and never a pass. It switches to `arch validate --json` once hexagen's H2 is released. A missing tool or unknown version gives `not-configured` or `unknown`, never a pass. The findings are attached to the receipt | 2 | F1, owner D1 |
 | F5 | Wire F4's checks into the acceptance gate's predicates | 2 | F4, gate-predicates S2 |
-| F6 | Fan-out: on a new hexagen release (owner-triggered: `fleet-v2 hexagen fanout <version>`), propose one update work order per `provisioned` or `provisioned-legacy` project in the inventory. Each order's brief: bump the pin, `hexagen sync`, `sync:check`, `lint:arch`, the CHANGELOG items. Proposed, never auto-merged | 2 | F2 |
+| F6 | Fan-out: on a new hexagen release (owner-triggered: `fleet-v2 hexagen fanout <version>`), propose one update work order per `provisioned` or `provisioned-legacy` project in the inventory. Each order's brief: bump the pin, `hexagen sync`, then the same gate commands CI runs (`yarn sync:check`, `yarn lint:arch`), and the CHANGELOG items. Proposed, never auto-merged | 2 | F2 |
 | F7 | A pull-request template for pin bumps: "bump `@hexagen-monaco/*`, run `sync --check`, quote the CHANGELOG items, run the contract test" | 0 | none |
 
 **Order:** F1, F3 and F7 now (cheap, no new code). F2 next, then F6. F4 and F5 only when the owner wants findings as evidence (D1).

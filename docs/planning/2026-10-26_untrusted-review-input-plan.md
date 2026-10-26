@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-26
 - **Target repository:** `fleet-v2`
-- **Status:** draft for the owner's decisions (§6). Nothing built. Anchors checked against `main` at `acfdf45` on 2026-10-26 (§2).
+- **Status:** decided (owner 2026-10-26: "Accept all of fable's recommendations"; see `2026-10-26_execution-order.md`). D1–D4 as recommended; U1 and U2 run as one lane; U3 is a hand edit in the private `fleet` repository. Nothing built. Anchors checked against `main` at `acfdf45` on 2026-10-26 (§2).
 - **Owner request (2026-10-26):** analyse [Graphify-Labs/graphify](https://github.com/Graphify-Labs/graphify) for features that would benefit fleet-v2, then "Proceed with your recommendations for the feature write up". The read-only review found ten candidates. This plan builds one, defers two, and folds a fourth into an existing plan (§3.4).
 - **Credit:** the idea comes from Graphify's untrusted-source wrapping (`llm.py`, `_read_files()`), and the deferred ideas come from its `affected.py` and `prs.py --conflicts`. Graphify is Apache-2.0 (older parts MIT). This plan takes **ideas only**: no Graphify code is copied, briefs describe the behaviour in our own words, and lanes are not given Graphify's source. Credit is given here as a courtesy and a record of provenance; no licence review was done, and none is claimed.
 
@@ -75,7 +75,7 @@ The reviewer reads files with its own read-only tools, and that text never passe
 | U2 | `buildReviewPrompt(request, nonce)`, the nonce generation in the transport, and the §3.2 tests | 2 (security) | U1 |
 | U3 | Private `fleet` repository: the Grok step-3/step-5 prompt templates wrap the embedded diff and files the same way, with a fresh nonce per prompt, and `NO DEFECTS` counts only as the final line | 0 (docs and templates) | none; independent of U1–U2 |
 
-U1 and U2 fit in one lane of about 45 minutes. They are split so the Tier 2 pass looks only at the wiring. Both follow the standard pipeline (Mercury-3, gate, Grok, Argon fix rounds, the Fable pass on U2). Queue them after E3a-2.
+U1 and U2 run as **one lane** of about 45 minutes (decided 2026-10-26): U2's diff is a few lines, so the split would only narrow the Fable pass. It follows the standard pipeline (Mercury-3, gate, Grok, Argon fix rounds, the Fable pass) and is queued after E3a-2. U3 is a hand edit in the private `fleet` repository, not a lane.
 
 ## 5. Hard to undo
 

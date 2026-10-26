@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-26
 - **Target repository:** `fleet-v2`
-- **Status:** draft for the owner's decisions (§6). Nothing built. Anchors checked against `main` at `b6ede22` on 2026-10-26 (§2).
+- **Status:** decided (owner 2026-10-26: "Accept all of fable's recommendations"; see `2026-10-26_execution-order.md`). D1, D3, D4 as recommended; D2 with the abandoned-request rule added to §3.2. R1 runs first in the queue, then V1. Nothing built. Anchors checked against `main` at `b6ede22` on 2026-10-26 (§2).
 - **Owner request (2026-10-26):** analyse [fabio-rovai/open-ontologies](https://github.com/fabio-rovai/open-ontologies) for features that would benefit fleet-v2, then "go ahead and write up the recommended ideas worth taking". The read-only review found little: no code or dependency worth taking, and two ideas from its decision records. This plan writes up those two.
 - **Credit:** open-ontologies' decision records: "conformance is not truth" (a check that did not run must say so, because a missing result and a clean one look the same) and "a second reviewer can contradict, never confirm". It is MIT-licensed. This plan takes ideas only: no code is copied (it is Rust), briefs describe the behaviour in our own words, and lanes are not given its source. Credit is given as a courtesy and a record of provenance; no licence review was done, and none is claimed.
 - **Builds on:** `2026-10-23_attempt-record-gate-predicates-usage-plan.md` (S2, gate predicates, not built yet) and `2026-10-25_hexagen-integration-plan.md` (F5, the lint mapping).
@@ -46,6 +46,7 @@
 
 - **Rule change in `collectReviewBlockers`:**
   - Among the receipts that are independent and read-only for this head, take the **latest per reviewer model**. "Latest" is the last one recorded in the assessment's append-only `reviewReceipts`, never `completedAtIso`, which records when a run finished, not when it was asked for. To make recording order equal request order, a review request for a reviewer and head is refused while an earlier request from the same reviewer for that head is still outstanding, so runs from the same reviewer never overlap.
+  - **An outstanding request can be abandoned.** A review run can die with its host, and its request would then block every later request from that reviewer for that head. A request is abandoned when the transport reports the run ended without a receipt, or when it is older than a fixed limit (default 2 hours) with no receipt; an abandoned request is journaled as such and no longer blocks. A receipt that arrives for an abandoned request is still recorded, in recording order (decided 2026-10-26).
   - If any of those says `fail`, acceptance is blocked with "review by `<reviewer>` failed for this head", even when another reviewer passed.
   - `unknown` neither passes nor blocks. It is listed, and acceptance still needs a passing review as today.
 - **How a dissent is answered (D2 default):**
@@ -85,7 +86,7 @@ V1 and R1 are independent and can run in parallel. Each follows the standard pip
 | # | Question | Default |
 |---|---|---|
 | D1 | Should a failing independent review block even when another reviewer passed? | **Yes.** Disagreement is the signal; outvoting it hides it |
-| D2 | What answers a dissent? | **The same reviewer's later pass on the same head, or a new head.** Never another reviewer's pass. An owner override, if wanted later, goes through the existing authorization path |
+| D2 | What answers a dissent? | **The same reviewer's later pass on the same head, or a new head.** Never another reviewer's pass. An owner override, if wanted later, goes through the existing authorization path. Decided 2026-10-26, with abandoned requests (§3.2); the "newest receipt overall" alternative is rejected |
 | D3 | Should a procedure without a coverage declaration keep today's exit-0 pass? | **Yes,** so nothing changes until a procedure opts in. The gate's test, lint and lint:arch procedures opt in with V2 |
 | D4 | Minimum units for a targeted test run? | **1.** A filter that matches nothing is the failure this plan exists for; a higher floor belongs in the lane brief |
 

@@ -27,24 +27,25 @@
 
 ### 3.1 Coverage on verification receipts (evidence-and-acceptance)
 
-- **Domain value:** `CheckCoverage` = `{ ran: boolean, reason?: string, unitKind: 'tests' | 'files' | 'checks', units: number }`. It is optional on `ExecuteVerificationCheckResult` and on `VerificationReceiptRecord`; records written before it existed load without it.
+- **Domain value:** `CheckCoverage` is a discriminated union: `{ ran: true, unitKind: 'tests' | 'files' | 'checks', units: number }` or `{ ran: false, reason: string }`. It is optional on `ExecuteVerificationCheckResult` and on `VerificationReceiptRecord`; records written before it existed load without it.
 - **Domain rule:** a pure function `applyCoverage(result, coverage, expectation)`.
   - **Expectation:** `expectation` is `{ unitKind, minUnits }` for a procedure that declares one, or absent.
-  - **Downgrade to `unknown`:** with an expectation, a `pass` becomes `unknown` when `coverage` is missing, `ran` is false, the `unitKind` differs, or `units < minUnits`.
+  - **Downgrade to `unknown`:** with an expectation, a `pass` becomes `unknown` when `coverage` is missing, is the `ran: false` variant, has a different `unitKind`, or has `units < minUnits`.
   - **No change:** without an expectation, nothing changes, so procedures without a declaration behave exactly as today. `fail` is never upgraded.
 - **Adapter:** each allow-listed procedure in `VerificationExecutorAdapter` may name one **coverage reader** from a fixed set, keyed by tool and implemented in infrastructure. Starting set:
-  - `vitest-summary`: the test count from vitest's summary line;
+  - `vitest-summary`: the number of **executed** tests from vitest's summary (passed plus failed). Skipped and todo tests are not counted, so an all-skipped run has 0 units;
   - `hexagen-lint-json`: `filesScanned` from `hexagen-lint --json`;
   - `eslint-json`: the file count of `--format json`.
 
-  A reader that finds no count returns `{ ran: false, reason: 'no count in output' }`. Readers parse the captured output only and never re-run anything.
+  A reader that finds no count returns `{ ran: false, reason: 'no count in output' }`. Readers consume the full combined stdout and stderr that the adapter captures, before it is truncated into `outputSummary`; they never parse `outputSummary`, and they never re-run anything.
 - **Exit codes:** only 0 can become `pass`, as today. The readers also never turn a non-zero exit into anything but `fail` or `unknown`. A checker crash whose code looks like a verdict is the reason the rule is "0 or nothing".
 - **Declaration:** the expectation lives with the allow-list entry for now. When S2 lands, each `AcceptanceSpec.commands[]` entry carries `{ argv, coverage?: { reader, unitKind, minUnits } }`, and the S2 acceptance use case applies the same `applyCoverage`.
+- **Turning coverage on invalidates old receipts.** Adding or tightening a procedure's expectation is a policy change: it increments `policyRevision`, which already marks an assessment stale. Receipts recorded under the earlier revision, including every receipt without coverage, cannot satisfy acceptance; the check runs again.
 
 ### 3.2 A failing independent review blocks (evidence-and-acceptance)
 
 - **Rule change in `collectReviewBlockers`:**
-  - Among the receipts that are independent and read-only for this head, take the **latest per reviewer model** (by `completedAtIso`).
+  - Among the receipts that are independent and read-only for this head, take the **latest per reviewer model**. "Latest" is the last one recorded in the assessment's append-only `reviewReceipts`, never `completedAtIso`, which records when a run finished, not when it was asked for. To make recording order equal request order, a review request for a reviewer and head is refused while an earlier request from the same reviewer for that head is still outstanding, so runs from the same reviewer never overlap.
   - If any of those says `fail`, acceptance is blocked with "review by `<reviewer>` failed for this head", even when another reviewer passed.
   - `unknown` neither passes nor blocks. It is listed, and acceptance still needs a passing review as today.
 - **How a dissent is answered (D2 default):**
@@ -68,8 +69,8 @@
 | Lane | Scope | Tier | Depends on |
 |---|---|---|---|
 | V1 | `CheckCoverage` and `applyCoverage` in the domain; optional field on the port result and the receipt record; record round-trip and table tests (each downgrade case; no expectation means no change; `fail` never upgraded) | 2 (data) | none |
-| V2 | The three coverage readers; the allow-list entry's optional `coverage` declaration; adapter tests from captured fixture outputs (zero tests, all skipped, no files, missing summary, normal run) | 2 (acceptance) | V1 |
-| R1 | `collectReviewBlockers` latest-per-reviewer rule, the dissent blocker, `reviewTally`; tests: pass plus fail from two reviewers blocks; the same reviewer's later pass clears it; another reviewer's pass does not; `unknown` neither passes nor blocks | 2 (acceptance) | none |
+| V2 | The three coverage readers on the full captured output; the allow-list entry's optional `coverage` declaration; the `policyRevision` increment when an expectation is added; adapter tests from captured fixture outputs (zero tests, all skipped with 0 executed units, no files, missing summary, a summary beyond the 4,000-character `outputSummary` cut, normal run) | 2 (acceptance) | V1 |
+| R1 | `collectReviewBlockers` latest-per-reviewer rule, the dissent blocker, `reviewTally`; the refusal of an overlapping request from the same reviewer; tests: pass plus fail from two reviewers blocks; the same reviewer's later pass clears it; another reviewer's pass does not; `unknown` neither passes nor blocks; selection follows recording order even when `completedAtIso` runs backwards | 2 (acceptance) | none |
 | R2 | CLI and API show `reviewTally`; docs in the README's acceptance section | 1 | R1 |
 
 V1 and R1 are independent and can run in parallel. Each follows the standard pipeline (Mercury-3, gate, Grok, Argon fix rounds, the Fable pass on the Tier 2 lanes). S2, when it is built, takes the coverage declaration in its own lane.

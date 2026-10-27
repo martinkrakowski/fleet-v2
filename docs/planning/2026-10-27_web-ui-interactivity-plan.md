@@ -2,9 +2,9 @@
 
 - **Date:** 2026-10-27
 - **Target repository:** `fleet-v2`
-- **Status:** rev 2. Rev 1 applied Fable's review of the research; rev 2 adds the orchestrator
-  request channel (§3.6) and the live tail (§3.7) from Fable's design review (§7). Decisions in §5
-  are open with defaults. Nothing built. Anchors checked against `main` at `dae491f`.
+- **Status:** rev 3. Rev 1 applied Fable's review of the research; rev 2 added the orchestrator
+  request channel (§3.6) and the live tail (§3.7) from Fable's design review; rev 3 applies Grok
+  4.7's review of rev 2 (§7). Decisions in §5 are open with defaults. Nothing built. Anchors checked against `main` at `dae491f`.
 - **Owner requests (2026-10-27):**
   - "Given all of the fleet-v2 features and functionality, the UI lacks interactivity with the
     actual lanes, and orchestration. Run a sub-agent to research UI/UX improvements. The have Fable
@@ -117,7 +117,7 @@ inbox also shows the owner's open requests with their lifecycle card.
 **P8-read. Work-order and run timeline.** One vertical timeline per work order: attempts grouped
 by `workOrderId` and chained by `priorAttemptId` (first pass, fix 1, fix 2), each with its journal
 entries and `GET /v1/heads/:sha/evidence` (verification and review receipts, findings,
-dispositions, acceptance at that head). It needs no new backend. R2's `reviewTally` and RW1's
+dispositions, acceptance at that head). It needs no new backend beyond A-J's journal route. R2's `reviewTally` and RW1's
 review `kind` are rendered once served; until then the timeline says "not recorded", never
 "passed".
 
@@ -128,11 +128,13 @@ in a header and relays only `{seq, kind, id}` signals to the browser over a same
 client re-reads the affected route, debounced, and a `resync` triggers one full refresh. Polling
 stays as the fallback (live-updates D3) and E5 adds the offline display.
 
-The live-updates plan places E3b after T3a. Conductor D9 refuses a shared-bearer `/v1/changes`
-reader in a process that holds forge credentials; the web server holds the bearer server-side
-(`api-client.ts:139-147`) and no forge credentials, so D9 does not forbid it there. P2 still
-follows T3a by default (§5, D2), because the interim, a shorter visible-tab poll on the attempt
-page, is enough. Push updates are polish: they rank below the inbox, the timeline and the tail.
+Conductor D9 refuses a shared-bearer `/v1/changes` reader in a process that holds forge
+credentials. The web server holds the bearer server-side (`api-client.ts:139-147`) and no forge
+credentials, so D9 is not engaged there. By default (§5, D2) the web server, and only the web
+server, may read `/v1/changes` on the shared bearer before T3a; its token is re-scoped to `read` at
+T3a. This is the same interim as the tail (D11). This amends the live-updates plan's ordering of
+E3b after T3a. Until E3c lands, the attempt page keeps its shorter visible-tab poll. Push updates
+are polish: they rank below the inbox, the timeline and the tail.
 
 ### 3.3 Run board (conductor)
 
@@ -148,8 +150,13 @@ drives a step.
 - **Halt** is a direct route (K7) that writes the halt marker through the same adapter as
   `conductor halt`. It never depends on a live orchestrator. Body: "parks every run before its
   next external action; does not stop a running lane".
-- **Stop** is a direct route: it stops the run's running attempt first through `StopAttempt`
-  (danger tone).
+- **Stop** is a direct route (A-C) that writes a keyed run-journal entry `<runId>/stop@web`
+  carrying the run's `expectedRevision`. The driver obeys it: the run goes to `stopped`, and the
+  driver stops the running attempt itself through `StopAttempt` (conductor §3.2: "a running
+  attempt is stopped first through `StopAttempt`"). The web never calls `StopAttempt` for an
+  attempt that belongs to a run. Body: "records a stop for run <id>; the conductor stops its
+  running attempt <id> and ends the run as `stopped`; does not merge, push, revert or delete
+  anything; a stopped run is not resumed" (danger tone).
 - **Resume** goes through the request channel as `resume-run`. The claimant calls `ResumeLaneRun`,
   which refuses server-side when `parked.reason === 'one-way-door'`; those parks are answered by
   the owner's signed decision on the keyed question, not by a button. The request carries the
@@ -160,15 +167,18 @@ drives a step.
 
 **P5.** Reconcile, stop, collect and request acceptance from the attempt page, through the T6
 proxy, behind `AlertBox`. Each control renders only when the server offers it. A fix round and a
-review are requests through the channel (§3.6), not direct routes.
+review are requests through the channel (§3.6), not direct routes. The direct attempt stop applies
+only to an attempt that belongs to no lane run; for an attempt owned by a run, the route refuses
+with a pointer to the run, and the page offers the run's stop (P7-write) instead.
 
 | Route | Repeat behaviour (enforced by the use case) | Confirm body must say |
 |---|---|---|
 | `POST /v1/attempts/:id/reconcile` | Safe to repeat | "Asks the runner whether the session ended, and **ends the attempt record if the server reports the session ended**. Does not stop or restart the lane." It is a write (`ReconcileAttemptUseCase.use-case.ts:121,192,216`). |
-| `POST /v1/attempts/:id/stop` | Safe to repeat; refused while the runner is `unknown` | Stops the session; destructive tone |
+| `POST /v1/attempts/:id/stop` | Safe to repeat; refused while the runner is `unknown`; refused with a pointer to the run when the attempt belongs to a lane run | "Stops the session of attempt <id>, which belongs to no lane run; does not collect, merge or delete anything." Destructive tone |
 | `POST /v1/attempts/:id/artifacts` | Safe to repeat | Collects against the completion receipt; does not judge the work |
 | `POST /v1/attempts/:id/acceptance` | Assessment at a head; repeat re-assesses | Requests acceptance; does not merge |
 | Halt (K7 route) | Writing the marker twice is harmless | See P7-write |
+| Run stop (A-C route) | Keyed run-journal entry `<runId>/stop@web` with `expectedRevision`; K1b refuses a second one | See P7-write |
 | `POST /v1/requests` | Client-minted ULID `requestId`; a repeat POST returns the existing record | See §3.6 |
 | `POST /v1/questions/:id/answers` | Q1b's revision and idempotency rules; built as Q5; never through the channel | One-way answers show the bytes to sign; the web cannot sign |
 | Owner messages | T2b's idempotency keys; the only path for prose | — |
@@ -243,7 +253,11 @@ CAS on the revision (as `OwnerQuestionRepositoryAdapter` `:108-118`) writing
 claim returns the request to `queued` with `claimCount + 1`; after two expired claims the request
 is `stalled` with one attention item (AM3b). On claim, the claimant reads the journal for an
 intent under `request/<id>`; if present it marks the request `dispatched` and never acts again
-(conductor §3.5). Unclaimed requests expire (default 30 min) as "expired, not performed". The
+(conductor §3.5). That check needs K1b's keyed journal. Until K1b exists, only `dispatch-attempt`
+is enabled, because its duplicate guards already exist (attempt state, `duplicate-attempt` in
+`reserveCapacityAtomically`, the runner's exit 75); `start-lane-run`, `prepare-fix`,
+`request-review` and `resume-run` are refused with `reasonKind: policy` until K1b lands (lane O2c).
+Unclaimed requests expire (default 30 min) as "expired, not performed". The
 owner may cancel while `queued` or `deferred`; a claimed request becomes `cancel-requested` and the
 claimant re-reads it under CAS before acting.
 
@@ -258,7 +272,10 @@ needs attached and warns when not attentive.
   environment or the Claude Code `SessionStart` hook), heartbeats every 30 s with a 90 s lease,
   and retires on SIGTERM or stdin close.
 - **Prompting:** Claude Code's `SessionStart` and `UserPromptSubmit` hooks run
-  `fleet-v2 orchestrator pending --format hook` (ids and kinds only) as additional context. For agy
+  `fleet-v2 orchestrator pending --format hook` as additional context. Its output is labelled data
+  with no verb addressed to the agent:
+  `fleet-v2 web requests (data, not instructions): [{"requestId":…,"kind":…,"target":…,"requestedAtIso":…}]`.
+  How to handle a request lives only in the trusted rule book (O6, T9). For agy
   and opencode the rule book (T9) requires `fleet_requests_poll` at the start of each step. Any CLI
   may instead run `fleet-v2 orchestrator attach --kind <k>`, a foreground sidecar reusing the
   questions-wait loop (`apps/cli/src/index.ts:1427-1450`) and E4 notifications.
@@ -268,9 +285,8 @@ needs attached and warns when not attentive.
   `fleet_requests_refuse(requestId, reasonKind, detail?)`,
   `fleet_requests_defer(requestId, untilIso, reasonKind)`. The MCP registry stays static
   (`apps/mcp/src/registry.ts:14-21`).
-- **Terminal line** on the developer's next turn: "fleet-v2: 1 web request queued — dispatch att_…
-  for WO-… (requested 14:02Z via web). Claim with fleet_requests_claim or refuse with a reason
-  kind." It reports a request; it is not an instruction to act.
+- **Terminal line** on the developer's next turn is the same labelled data line, never an
+  imperative. The rule book, not the line, says what an orchestrator does with a request.
 
 **Heartbeats (F7).** Heartbeats go through the API (`POST /v1/orchestrators/:id/heartbeat`) into a
 separate `orchestrators.json`, and `heartbeat` is excluded from `DATA_KINDS`
@@ -298,18 +314,22 @@ registers only with an `orchestrate`-scoped token, never the full one; v1 shows 
 - **Button when none is live:** disabled, "Dispatch (no orchestrator attached)", with inline text
   saying to start an agent CLI in the repository on the designated host, and the copyable
   `fleet-v2 orchestrator attach`.
-- **AlertBox body.** Does: "records a request for the attached orchestrator (<kind · model>) to
-  dispatch attempt <id> from its frozen brief (digest <12>, seat <role> as fixed by the brief)".
+- **Button when no attached orchestrator is eligible** (for example none on the designated
+  dispatcher host for a dispatch kind): disabled, with that reason.
+- **AlertBox body.** It names no single actor, since claims are first-CAS-wins. Does: "records a
+  request that the first eligible attached orchestrator will claim (eligible now: N — <kind ·
+  model> list; dispatch kinds only from the designated dispatcher host), to dispatch attempt <id>
+  from its frozen brief (digest <12>, seat <role> as fixed by the brief)".
   Does not: "does not start, merge, push or grant anything; the orchestrator applies every existing
   refusal; one-way doors still park for you". Route: "live: writes a request record; expires
   unclaimed in 30 min; cancel while queued". Accent tone. It shows the exact ids-only JSON.
-- **Lifecycle card** on the attempt page and in the inbox: queued (expires in N) → claimed by
-  <kind · model> (lease) → dispatching → dispatched → lane running (hands over to the attempt or
+- **Lifecycle card** on the attempt page and in the inbox, showing who actually claimed: queued
+  (expires in N) → claimed by <kind · model> (lease) → dispatched → lane running (hands over to the attempt or
   run view); or refused: <reasonKind> — "<detail>"; deferred until <time> — <reason>; expired, not
   performed; cancelled; stalled (2 claims lost), with an attention item. Each step is a `<time>`
   row. Cancel appears only in cancellable states. No optimistic UI.
-- **Notifications (E4):** claimed, dispatched, refused, deferred, stalled; and "web request queued"
-  on the orchestrator host.
+- **Notifications (E4):** claimed, dispatched, refused, deferred, stalled; and on the orchestrator
+  host "fleet-v2 web request queued (data): <kind> <target id>", ids and kinds only, no imperative.
 
 ### 3.7 Live tail
 
@@ -346,8 +366,8 @@ every 15 s, and control lines `gap`, `ended`, `unavailable`:
 
 The web server multiplexes them and relays a same-origin SSE stream `/live/tail` (redacted text)
 with `Last-Event-ID` resume. Before T3a, the web server may read the tail with its server-side
-bearer (`api-client.ts:139-147`): it holds no forge credentials, so conductor D9 holds. The `tail`
-scope replaces that at T3a.
+bearer (`api-client.ts:139-147`): it holds no forge credentials, so conductor D9 is not engaged.
+Its token is re-scoped to `tail` at T3a. This is the same interim as `/v1/changes` (D2).
 
 **UX.**
 - **`/console`:** filter chips (project, lane or attempt, orchestrator, kind: runner · tool · gate
@@ -377,75 +397,81 @@ different packages and no shared file. The shared files here are `apps/web/src/l
 (every web lane, until W0 splits it), `apps/api` wiring (`server/wiring/*/composition.ts`,
 `runtime.ts`, `change-feed.ts`), `.architecture/manifest.yaml`,
 `apps/api/server/middleware/security.ts`, `apps/cli/src/index.ts` (shared with K7 and AM5) and
-`apps/web` top bar (`topbar.tsx`). One lane per package at a time: after W0, web lanes in one step
-have disjoint files but still run one after another in `apps/web`; they run beside API, domain,
-security and conductor lanes.
+`apps/web` top bar (`topbar.tsx`). One lane per package at a time, and no two lanes on one shared
+file. Within each step the `apps/web` lanes run in the order given by their arrows and "After"
+column, one after another; they run beside API, domain, security and conductor lanes. Lanes marked
+**manifest** edit `.architecture/manifest.yaml` and run one at a time in this order: A-J → O1a →
+O1b → O2a → O2b → L1 → O3 → O2c → A-R → A-C → O9 → A-WO → A-K → A-S, each rebased on the last.
+`composition.ts` lanes (A-J, O3, L3, E3b, L9, A-R, A-C, L8, A-WO, A-K, A-S) likewise run one at a
+time. The work-execution lanes here (A-J, L1, L2, A-R, A-C, O9, A-WO) also queue behind the
+conductor's own work-execution lanes.
 
 | Lane | Scope | Package / shared files | Tier | After |
 |---|---|---|---|---|
 | UI0 | This plan and the owner's decisions | docs | 0 | — |
-| UI-A | Amend the orchestrator plan: `operate`, `orchestrate` and `tail` scopes in T3a; Q4/T7 read half ahead of T6 | docs | 0 | UI0 (D3) |
-| **Step 1. Read the real attempt (parallel now: W0 ‖ A-J ‖ O1a ‖ L1b ‖ UI-A)** | | | | |
+| UI-A | Amend the orchestrator plan: `operate`, `orchestrate` and `tail` scopes in T3a; Q4/T7 read half ahead of T6; the D2 interim for E3b | docs | 0 | UI0 (D2, D3) |
+| **Step 1. Read the real attempt (parallel now: W0 ‖ A-J ‖ L1b ‖ UI-A; then O1a after A-J)** | | | | |
 | W0 | Split `api-client.ts` into per-resource readers; no behaviour change | apps/web, **`api-client.ts`** | 1 | — |
 | A-J | `GET /v1/attempts/:id/journal` over `listJournalEntriesForAttempt`; no legality block | work-execution (application), apps/api, **`composition.ts`, manifest** | 1 | — |
-| O1a | `OrchestratorSession` aggregate: record, lease, attached/attentive, statuses | operator-coordination (domain), **manifest** | 2 | UI0 |
-| L1b | `policy.liveTail` (`summaries` default, `full` opt-in) | installation | 2 | — |
+| L1b | `policy.liveTail` (`summaries` default, `full` opt-in) | installation | 2 | S1d |
+| O1a | `OrchestratorSession` aggregate: record, lease, attached/attentive, statuses | operator-coordination (domain), **manifest** | 2 | UI0, A-J (manifest) |
 | W1a | Live `/attempt`: inspect read, `unknown` outcome, recorded runner facts, usage, artifacts; `map-attempt.ts` keeps usage/runner/artifacts; rows open the page; shorter visible-tab poll | apps/web | 2 | W0 |
 | W1b | Work-order sidebar (`GET /v1/work-orders/:id`), journal panel, P12 sample labels and "sample digest" | apps/web | 2 | W1a, A-J |
-| **Step 2. Domain lanes (parallel across packages)** | | | | |
-| O1b → O2a → O2b | `OrchestratorRequest` aggregate (closed payload, `reasonKind`, lifecycle); register/heartbeat/retire/list with `orchestrators.json`; create/claim/renew/complete/refuse/defer/cancel/expire, the dispatcher-host gate, journal-key reconciliation | operator-coordination | 2 | O1a |
-| L1 → L2 | `LaneSessionEventPort` and the opencode adapter, summaries, `full` behind policy; then the agy file-tail adapter | work-execution (infra) | 2 | A-J (same package), L1b |
+| **Step 2. Domain lanes (parallel across packages); web: Q4 → W8a → W10** | | | | |
+| O1b → O2a → O2b | `OrchestratorRequest` aggregate (closed payload, `reasonKind`, lifecycle); register/heartbeat/retire/list with `orchestrators.json`; create/claim/renew/complete/refuse/defer/cancel/expire and the dispatcher-host gate, with only `dispatch-attempt` enabled | operator-coordination, **manifest** | 2 | O1a |
+| L1 → L2 | `LaneSessionEventPort` and the opencode adapter, summaries, `full` behind policy; then the agy file-tail adapter | work-execution (infra), **manifest** (L1) | 2 | A-J (same package), L1b, O2b (manifest) |
 | Q4 | Questions view, badge, attention card from `/v1/attention` | apps/web | 2 | W1b |
-| W8a | Work-order timeline: attempts by `workOrderId`/`priorAttemptId`, journal, head evidence; `reviewTally` and `kind` when served | apps/web | 2 | W1b; full fidelity after R2, RW1 |
-| W10 | Usage and seat/model chips per row, sums per work order, `source` and estimate labels | apps/web | 2 | W1a |
-| **Step 3. API wiring (one at a time on `composition.ts`, `change-feed.ts`)** | | | | |
-| O3 | `/v1/orchestrators*`, `/v1/requests*`; `orchestrator` and `request` feed kinds; heartbeat excluded from `DATA_KINDS` | apps/api (`operator/composition.ts`, **`change-feed.ts`**, **`runtime.ts`**) | 2 | O2b |
+| W8a | Work-order timeline: attempts by `workOrderId`/`priorAttemptId`, journal, head evidence; `reviewTally` and `kind` when served | apps/web | 2 | Q4; full fidelity after R2, RW1 |
+| W10 | Usage and seat/model chips per row, sums per work order, `source` and estimate labels | apps/web | 2 | W8a |
+| **Step 3. API wiring (one at a time: O3 → L3; E3b in sequence with them)** | | | | |
+| O3 | `/v1/orchestrators*`, `/v1/requests*`; `orchestrator` and `request` feed kinds; heartbeat excluded from `DATA_KINDS` | apps/api (`operator/composition.ts`, **`change-feed.ts`**, **`runtime.ts`**), **manifest** | 2 | O2b, L1 (manifest) |
 | L3 | Tail routes (`/v1/attempts/:id/tail`, `/v1/orchestrators/:id/activity`), ring, redaction, control lines | apps/api, **`composition.ts`** | 2 | L1, O3 |
-| E3b | `/v1/changes` (live-updates plan) | apps/api | 2 | T3a, or D2 |
-| **Step 4. Reads and carriers (before the write path)** | | | | |
+| E3b | `/v1/changes` (live-updates plan), on the shared bearer for the web server until T3a (D2) | apps/api, **`change-feed.ts`, `runtime.ts`** | 2 | E3a, L3 |
+| **Step 4. Reads and carriers (before the write path); web: O7 → L4 → L5 → L6** | | | | |
 | O4 | MCP registration, heartbeat, retire, `fleet_requests_*` | apps/mcp | 2 | O3; serial with T4 and the MCP plan's M lanes |
-| O5 | CLI `orchestrator attach \| status \| pending --format hook` | apps/cli, **`index.ts`** | 2 | O3; serial with K7, AM5 |
-| O6 | Hook recipe, rule-book text, `.mcp.json.example` | docs | 1 | O4, O5; with T5, T9 |
-| O7 | Presence chip and `/orchestrators` read | apps/web, **`topbar.tsx`** | 2 | O3, W0 |
-| L4 | Web `/live/tail` SSE relay (E3c owns `/live/changes` only) | apps/web | 2 | L3 |
+| O5 | CLI `orchestrator attach \| status \| pending --format hook` (labelled data output) | apps/cli, **`index.ts`** | 2 | O3; serial with K7, AM5 |
+| O6 | Hook recipe, rule-book text (how to handle requests), `.mcp.json.example` | docs | 1 | O4, O5; with T5, T9 |
+| O7 | Presence chip and `/orchestrators` read | apps/web, **`topbar.tsx`** | 2 | O3, W10 |
+| L4 | Web `/live/tail` SSE relay (E3c owns `/live/changes` only) | apps/web | 2 | L3, O7 |
 | L5 | `/console` view | apps/web, packages/ui | 2 | L4 |
-| L6 | Attempt-page lane pane, silent and ended states | apps/web | 2 | W1a, L4 |
-| **Step 5. Write path (orchestrator plan lanes, serial)** | | | | |
-| T3a → T3b → T6 | Scopes with `operate`, `orchestrate`, `tail`; session exchange; web proxy and first write route | apps/api, **`security.ts`**; apps/web | 2 | UI-A; T3a's own prerequisites |
-| L9 | `tail` scope enforced on the tail routes; the interim bearer read retired | apps/api, **`security.ts`** | 2 | T3a, L3 |
-| E3c → E5 | Web change relay; offline display | apps/web | 2 | E3b |
-| **Step 6. Actions after T6** | | | | |
-| W5a | Reconcile, stop, collect from the attempt page | apps/web | 2 | T6, W1a |
+| L6 | Attempt-page lane pane, silent and ended states | apps/web | 2 | L5, W1a |
+| **Step 5. Write path (orchestrator plan lanes, serial); web: T6 → E3c → E5** | | | | |
+| T3a → T3b → T6 | Scopes with `operate`, `orchestrate`, `tail`; session exchange; web proxy and first write route | apps/api, **`security.ts`**; apps/web | 2 | UI-A; T3a's own prerequisites; T6 after L6 |
+| L9 | `tail` scope enforced on the tail routes; the interim bearer read retired (with `read` for `/v1/changes`) | apps/api, **`security.ts`, `composition.ts`** | 2 | T3a, L3, E3b |
+| E3c → E5 | Web change relay; offline display | apps/web | 2 | E3b, T6 |
+| **Step 6. Actions after T6; web: W5a → W5b → O8 → Q5 → W8b** | | | | |
+| W5a | Reconcile, stop (attempts with no run only), collect from the attempt page | apps/web | 2 | T6, E5 |
 | W5b | Request acceptance | apps/web, packages/ui | 2 | W5a |
-| O8 | Request button, AlertBox body, lifecycle card, cancel; card in the inbox | apps/web, packages/ui | 2 | O7, T3a, T3b, T6, Q4 |
-| Q5 | Question answers, one-way answers show bytes to sign | apps/web, packages/ui | 2 | T6, Q4 |
-| W8b | Finding dispositions from the timeline | apps/web | 2 | T6, W8a |
-| **Step 7. Conductor** | | | | |
-| A-R | `GET /v1/runs`, `/v1/runs/:id`, run journal by key | work-execution, apps/api, **`composition.ts`, manifest** | 2 | K3 |
-| W7a | Run board read, dry-run and shadow entries distinct | apps/web | 2 | A-R, K7 |
-| A-C | Direct run routes: halt marker through the CLI's adapter, stop | work-execution, apps/api, **`composition.ts`** | 2 | K7, T3a |
-| W7b | Halt and stop controls; resume and start as requests (O8's card) | apps/web | 2 | A-C, W7a, O8 |
-| O9 | `start-lane-run` claimed by the conductor driver; interactive dispatch kinds refused when the conductor is enabled | work-execution, apps/cli | 2 | K3, K7, O2b |
-| L8 | Per-run journal tail | apps/api | 2 | K1b, L3 |
+| O8 | Request button (eligible-orchestrator list, disabled reasons), AlertBox body, lifecycle card, cancel; card in the inbox | apps/web, packages/ui | 2 | W5b, O7, T3a, T3b, T6, Q4 |
+| Q5 | Question answers, one-way answers show bytes to sign | apps/web, packages/ui | 2 | O8 |
+| W8b | Finding dispositions from the timeline | apps/web | 2 | Q5, W8a |
+| **Step 7. Conductor; serial A-R → A-C → O9; web: W7a → W7b** | | | | |
+| O2c | Journal-key reconciliation (`request/<requestId>`); enables `start-lane-run`, `prepare-fix`, `request-review`, `resume-run` | operator-coordination, **manifest** | 2 | O2b, K1b, O3 (manifest) |
+| A-R | `GET /v1/runs`, `/v1/runs/:id`, run journal by key | work-execution, apps/api, **`composition.ts`, manifest** | 2 | K3, O2c (manifest) |
+| A-C | Direct run routes: halt marker through the CLI's adapter; run stop as a keyed run-journal entry `<runId>/stop@web` with `expectedRevision`; attempt stop refuses run-owned attempts | work-execution, apps/api, **`composition.ts`, manifest** | 2 | A-R, K7, T3a |
+| O9 | `start-lane-run` claimed by the conductor driver; interactive dispatch kinds refused when the conductor is enabled | work-execution, apps/cli, **`index.ts`, manifest** | 2 | A-C, O5, K3, K7, O2c |
+| W7a | Run board read, dry-run and shadow entries distinct | apps/web | 2 | A-R, K7, W8b |
+| W7b | Halt and run-stop controls; resume and start as requests (O8's card) | apps/web | 2 | W7a, A-C, O8 |
+| L8 | Per-run journal tail | apps/api, **`composition.ts`** | 2 | K1b, L3, A-C |
 | L7 | Orchestrator activity from `PostToolUse` summaries | apps/mcp, docs | 2 | O4, T2a |
-| O10 | E4 triggers for requests; AM3b attention item for `stalled` | operator-coordination | 2 | E4, AM3b, O2b |
-| **Step 8. Work orders, knowledge, seats** | | | | |
-| A-WO | `ListWorkOrders` use case, manifest, `GET /v1/work-orders` | work-execution, apps/api, **`composition.ts`, manifest** | 1 | any time the API wiring is free |
-| W6 | Work-order list and brief viewer for a real attempt's frozen brief | apps/web | 2 | A-WO |
-| A-K → WK | Knowledge candidates route over `ListCandidateClaims`; live `/knowledge` read | apps/api, **`composition.ts`, manifest**; apps/web | 2 | — |
-| A-S → W9 | Seats read route (plan, cursors, last probe); seats view | apps/api, **manifest**; apps/web | 2 | S1a |
+| O10 | E4 triggers for requests; AM3b attention item for `stalled` | operator-coordination | 2 | E4, AM3b, O2c |
+| **Step 8. Work orders, knowledge, seats; web: W6 → WK → W9** | | | | |
+| A-WO | `ListWorkOrders` use case, manifest, `GET /v1/work-orders` | work-execution, apps/api, **`composition.ts`, manifest** | 1 | O9 (manifest, work-execution) |
+| W6 | Work-order list and brief viewer for a real attempt's frozen brief | apps/web | 2 | A-WO, W7b |
+| A-K → WK | Knowledge candidates route over `ListCandidateClaims`; live `/knowledge` read | apps/api, **`composition.ts`, manifest**; apps/web | 2 | A-WO (manifest); WK after W6 |
+| A-S → W9 | Seats read route (plan, cursors, last probe); seats view | apps/api, **`composition.ts`, manifest**; apps/web | 2 | S1a, A-K (manifest); W9 after WK |
 | **Step 9. Deferred** | Seats writes, P11 conflict graph, streaming gate and review output | — | — | owner |
 
-Pre-merge passes follow each lane's tier: the one Fable pass for Tier 2 lanes that touch authority,
-security or what the operator can do (O2b, O3, O4, O8, O9, L1, L3, L9, W5a, Q5, A-C), and T3a,
-T3b, T6 as their own plan says.
+Every Tier 2 lane in this plan touches data safety, security or user-facing behaviour, so every
+Tier 2 lane gets its one Fable pre-merge pass. Tier 0 and Tier 1 lanes follow their tier (no model
+review, or one Grok pass).
 
 ## 5. Decisions for the owner
 
 | # | Question | Recommended default |
 |---|---|---|
 | D1 | May the web dispatch when an orchestrator is registered? | **The web writes a typed request; a registered orchestrator with a live lease claims it and acts under its own existing authority; the web never dispatches.** Web requests go under the `message` scope; no web token gets a `dispatch` scope, ever (§3.6). |
-| D2 | May the web server read `/v1/changes` on the shared bearer before T3a's `read` scope? | **No, poll in the interim.** Conductor D9 does not forbid it for the web server (it holds no forge credentials, the same reasoning as D11), but a shorter visible-tab poll on the attempt page is enough until E3b lands after T3a. |
+| D2 | May the web server read `/v1/changes` on the shared bearer before T3a's `read` scope? | **Yes, the web server only, re-scoped to `read` at T3a.** It holds no forge credentials, so conductor D9 is not engaged; the same interim as the tail (D11). The attempt page keeps its shorter visible-tab poll until E3c lands. |
 | D3 | Amend T3a with `operate`, `orchestrate` and `tail` scopes? | **Yes,** filed as UI-A before T3a is dispatched. |
 | D4 | Seats writes from the web? | **Deferred.** The CLI keeps the writes; the web reads seats after S1a. |
 | D5 | Free text in requests? | **None.** Typed ids and enums only; prose goes through the T2b owner-message thread. |
@@ -454,7 +480,7 @@ T3b, T6 as their own plan says.
 | D8 | Remote orchestrators | **May register with an `orchestrate`-scoped token;** dispatch kinds only when the orchestrator's host is the profile's `designatedDispatcherHost`. |
 | D9 | Which actions bypass the channel? | **Halt, stop, reconcile, collect and question answers are direct routes,** never queued. |
 | D10 | Tail content | **Summaries by default;** `full` opt-in per installation, stream-through, never persisted. |
-| D11 | Tail scope and interim | **A separate `tail` scope under T3a;** until then the web server reads the tail with its server-side bearer. |
+| D11 | Tail scope and interim | **A separate `tail` scope under T3a;** until then the web server, and only it, reads the tail with its server-side bearer, re-scoped to `tail` at T3a (the same interim as D2). Tail content stays `summaries` by default (D10). |
 | D12 | Registration carrier | **The MCP process heartbeat plus hooks;** the `attach` sidecar as the fallback for any CLI. |
 
 ## 6. States and accessibility
@@ -473,7 +499,7 @@ Every live view uses the same vocabulary:
   warned, with the `attach` command.
 - **Tail:** not started, running, silent (runner says active), silent (runner unreachable, last
   known), ended, unavailable, gap, line withheld (§3.7).
-- **Request:** queued, claimed, dispatching, dispatched, refused, deferred, expired, cancelled,
+- **Request:** queued, claimed, dispatched, refused, deferred, expired, cancelled,
   cancel-requested, stalled (§3.6).
 - **Not routed yet:** name the CLI command.
 
@@ -494,6 +520,8 @@ P1–P12, an order and the dispatch question this plan's D1 answers.
    W1a, W10).
 2. Major: push updates were placed before T3a, against live-updates E3b and conductor D9. Moved
    after T3a with an owner decision (D2) and the shorter visible-tab poll as the interim (§3.2).
+   Rev 3 (Grok, finding 7) sets D2's default to the web-server-only interim on the shared bearer,
+   since the web server holds no forge credentials.
 3. Major: the API does not dedupe on `Idempotency-Key`. Idempotency stated per route; the proxy
    only mints client ids (§2, table in §3.4).
 4. Major: resume must be refused server-side for one-way-door parks. `ResumeLaneRun` refuses them;
@@ -537,6 +565,25 @@ F1–F13 applied.**
 - F12 (minor): 30 min expiry, cancel while queued or deferred, `cancel-requested` re-read under CAS.
 - F13 (major): lane output is untrusted; summaries by default, `full` opt-in and never persisted,
   plain-text rendering, secret-pattern withholding, bounded queues, a `tail` scope (§3.7, D10, D11).
+
+**Grok 4.7 (2026-10-27): 6 majors, 1 minor, all applied.**
+1. Major: a web stop raced the conductor. A run-owned attempt is stopped only through the run:
+   A-C writes `<runId>/stop@web` with `expectedRevision`, the driver stops the attempt through
+   `StopAttempt`; the direct attempt stop refuses run-owned attempts (§3.3, §3.4, A-C, W5a).
+2. Major: O2b's crash safety needed K1b. Journal-key reconciliation moved to O2c after K1b; until
+   then only `dispatch-attempt` is enabled and the other kinds are refused with `policy` (§3.6).
+3. Major: the AlertBox named one actor while claims are first-CAS-wins. The body lists the eligible
+   orchestrators; the card shows who claimed; no eligible orchestrator disables the button (§3.6).
+4. Major: the hook and terminal lines were imperatives in model-visible text. Now labelled data
+   only; handling lives in the rule book (O6, T9); notification text likewise (§3.6).
+5. Major: scheduling. A-J → O1a on the manifest; an explicit manifest order and `composition.ts`
+   order; every `apps/web` lane ordered within its step; O9 after O5; A-R → A-C; further fixes
+   found on recheck: L1, O3, O2c, A-WO, A-K, A-S ordered on the manifest, E3b and L8 on
+   `composition.ts`, O7 after W10, T6 after L6 in `apps/web` (§4).
+6. Major: every Tier 2 lane gets its one Fable pre-merge pass (§4).
+7. Minor: P8-read needs no backend beyond A-J; `dispatching` removed from the lifecycle card; D2
+   and D11 share one interim (web server only on the shared bearer, re-scoped at T3a) (§3.1, §3.2,
+   §3.6, §3.7, §5).
 
 ## Hard to undo
 

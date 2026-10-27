@@ -129,8 +129,8 @@ describe('GET /v1/changes', () => {
       expect(response.headers.get('content-type')?.startsWith('application/x-ndjson')).toBe(true);
       expect(response.headers.get('cache-control')).toBe('no-store');
       const reader = response.body!.getReader();
-      const first = await readLines(reader, 1);
-      const line = JSON.parse(first[0]!) as Record<string, unknown>;
+      const first = await readLines(reader, 1).catch(() => undefined);
+      const line = JSON.parse(first![0]!) as Record<string, unknown>;
       expect(line.kind).toBe('resync');
       expect(line.stream).toBe(getChangeFeed()!.streamId);
     } finally {
@@ -156,8 +156,8 @@ describe('GET /v1/changes', () => {
       expect(response.status).toBe(200);
       const reader = response.body!.getReader();
       feed.emit({ kind: 'attempt', id: 'att-1', stateFile: null, before: null, written: null });
-      const got = await readLines(reader, 1);
-      const line = JSON.parse(got[0]!) as Record<string, unknown>;
+      const got = await readLines(reader, 1).catch(() => undefined);
+      const line = JSON.parse(got![0]!) as Record<string, unknown>;
       expect(line.kind).toBe('attempt');
       expect(line.id).toBe('att-1');
       expect(line.seq).toBe(head + 1);
@@ -178,8 +178,8 @@ describe('GET /v1/changes', () => {
         signal: controller.signal,
       });
       const reader = response.body!.getReader();
-      const first = await readLines(reader, 1);
-      expect(JSON.parse(first[0]!) as Record<string, unknown>).toMatchObject({
+      const first = await readLines(reader, 1).catch(() => undefined);
+      expect(JSON.parse(first![0]!) as Record<string, unknown>).toMatchObject({
         kind: 'resync',
       });
       expect(openChangeStreamCount()).toBe(before + 1);

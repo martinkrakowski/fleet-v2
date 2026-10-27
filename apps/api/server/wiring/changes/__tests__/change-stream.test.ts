@@ -188,6 +188,57 @@ describe('ChangeStream', () => {
     }
   });
 
+  it('a resync drops queued lines and stops polling until it is written', () => {
+    vi.useFakeTimers();
+    let accepting = false;
+    const feed = makeFeed();
+    const fake = fakeSink(() => accepting);
+    const stream = new ChangeStream({ feed, after: 's1:0', sink: fake.sink, maxQueue: 8 });
+    try {
+      stream.start();
+      feed.emit(signal('att-1'));
+      vi.advanceTimersByTime(250);
+      // the first write is refused, so the sink is blocked from here on
+      expect(fake.chunks).toHaveLength(1);
+      for (let i = 2; i <= 21; i += 1) {
+        feed.emit(signal(`att-${i}`));
+      }
+      // one poll reads 20 entries, so the queue overflows into a pending resync
+      vi.advanceTimersByTime(250);
+      expect(stream.queuedLines).toBe(0);
+      // three more emits, then another poll: nothing may be queued while the resync is pending
+      feed.emit(signal('att-22'));
+      feed.emit(signal('att-23'));
+      feed.emit(signal('att-24'));
+      vi.advanceTimersByTime(250);
+      expect(stream.queuedLines).toBe(0);
+      const beforeDrain = fake.chunks.length;
+      accepting = true;
+      stream.drain();
+      // exactly one line comes out: the resync at the current head, and no data lines after it
+      const drained = lines(fake.chunks.slice(beforeDrain));
+      expect(drained).toHaveLength(1);
+      expect(drained[0]).toMatchObject({
+        kind: 'resync',
+        seq: feed.headSeq,
+        stream: 's1',
+        id: null,
+      });
+      // a further emit and poll then deliver normally
+      feed.emit(signal('att-25'));
+      vi.advanceTimersByTime(250);
+      const all = lines(fake.chunks);
+      expect(all[all.length - 1]).toMatchObject({
+        kind: 'attempt',
+        id: 'att-25',
+        seq: feed.headSeq,
+      });
+    } finally {
+      stream.close();
+      vi.useRealTimers();
+    }
+  });
+
   it('backpressure queues lines without dropping until the queue overflows', () => {
     vi.useFakeTimers();
     let accepting = false;
@@ -251,17 +302,22 @@ describe('ChangeStream', () => {
     const fake = fakeSink();
     const before = openChangeStreamCount();
     const stream = new ChangeStream({ feed, after: 's1:0', sink: fake.sink });
-    stream.start();
-    expect(openChangeStreamCount()).toBe(before + 1);
-    expect(vi.getTimerCount()).toBe(2);
-    stream.close();
-    expect(openChangeStreamCount()).toBe(before);
-    expect(vi.getTimerCount()).toBe(0);
-    feed.emit(signal('att-1'));
-    vi.advanceTimersByTime(30_000);
-    expect(fake.chunks).toEqual([]);
-    stream.close();
-    stream.close();
+    try {
+      stream.start();
+      expect(openChangeStreamCount()).toBe(before + 1);
+      expect(vi.getTimerCount()).toBe(2);
+      stream.close();
+      expect(openChangeStreamCount()).toBe(before);
+      expect(vi.getTimerCount()).toBe(0);
+      feed.emit(signal('att-1'));
+      vi.advanceTimersByTime(30_000);
+      expect(fake.chunks).toEqual([]);
+      stream.close();
+      stream.close();
+    } finally {
+      stream.close();
+      vi.useRealTimers();
+    }
   });
 
   it('a lost feed ends the sink and closes the stream', () => {
@@ -271,12 +327,17 @@ describe('ChangeStream', () => {
     const fake = fakeSink();
     const before = openChangeStreamCount();
     const stream = new ChangeStream({ feed, after: 's1:0', sink: fake.sink, isLive: () => live });
-    stream.start();
-    live = false;
-    vi.advanceTimersByTime(250);
-    expect(fake.ended).toBe(true);
-    expect(stream.isOpen).toBe(false);
-    expect(openChangeStreamCount()).toBe(before);
+    try {
+      stream.start();
+      live = false;
+      vi.advanceTimersByTime(250);
+      expect(fake.ended).toBe(true);
+      expect(stream.isOpen).toBe(false);
+      expect(openChangeStreamCount()).toBe(before);
+    } finally {
+      stream.close();
+      vi.useRealTimers();
+    }
   });
 
   it('a feed resync entry passes through as a line', () => {

@@ -118,6 +118,11 @@ export class ChangeStream {
       this.sink.end();
       return;
     }
+    if (this.resyncPending) {
+      // The pending resync moves the cursor to head once it is written;
+      // reading now would only queue lines that are stale by then.
+      return;
+    }
     const read = this.feed.read(this.cursor);
     this.cursor = read.cursor;
     if (read.kind === "resync") {
@@ -153,6 +158,8 @@ export class ChangeStream {
   private nextLine(): string | null {
     if (this.resyncPending) {
       this.resyncPending = false;
+      // Nothing queued before the resync may be written after it.
+      this.queue.length = 0;
       const seq = this.feed.headSeq;
       this.cursor = `${this.feed.streamId}:${seq}`;
       return toLine({

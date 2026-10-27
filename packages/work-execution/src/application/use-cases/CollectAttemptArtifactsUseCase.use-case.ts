@@ -10,6 +10,7 @@
 import type { ActionJournalEntryRecord, AttemptRecord, AttemptUsageRecord } from '../../domain/execution-records.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import type { AttemptOutcomeValue } from '../../domain/value-objects/AttemptOutcome.vo.js';
+import type { StopReasonValue } from '../../domain/value-objects/StopReason.vo.js';
 import type {
   CollectAttemptArtifactsPort,
   CollectAttemptArtifactsRequest,
@@ -176,6 +177,8 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
     }
 
     const outcome: AttemptOutcomeValue = collected.artifacts.commitsSinceBase.length > 0 ? 'done' : 'no-commit';
+    // S1: no commit is a stop reason a fallback seat may wait for.
+    const stopReason: StopReasonValue = outcome === 'no-commit' ? 'no-commit' : 'none';
 
     const nowIso = new Date().toISOString();
     // S3: read the attempt's opencode session usage when a usage port is
@@ -198,6 +201,7 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
       revision: nextAttemptRevision(attempt),
       state: 'collected',
       outcome,
+      stopReason,
       artifacts,
       ...(usageResult !== undefined ? { usage: usageResult.usage } : {}),
       updatedAtIso: nowIso,
@@ -225,6 +229,7 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
           revision: nextAttemptRevision(fresh),
           state: 'collected',
           outcome,
+          stopReason,
           artifacts,
           ...(usageResult !== undefined ? { usage: usageResult.usage } : {}),
           updatedAtIso: nowIso,

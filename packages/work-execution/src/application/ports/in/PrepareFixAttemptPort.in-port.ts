@@ -15,6 +15,12 @@ export interface PrepareFixAttemptRequest {
   readonly worktreePath?: string;
   readonly baseCommit?: string;
   readonly numberedFixes: readonly string[];
+  /**
+   * Seat ids the installation currently marks unhealthy (S1). They are only
+   * ever skipped, never added; absent means none. Used only when the prior
+   * attempt carries a seat plan.
+   */
+  readonly unhealthySeatIds?: readonly string[];
   readonly nowIso?: string;
 }
 

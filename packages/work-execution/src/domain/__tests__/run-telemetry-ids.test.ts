@@ -38,6 +38,7 @@ import {
   type TelemetryHmac,
   type TelemetryHashInput,
   type TelemetrySpanIdentity,
+  type TelemetryTraceRoot,
 } from '../run-telemetry-ids.js';
 import { LANE_RUN_MAX_ROUND } from '../lane-run-records.js';
 import { buildLaneRunStepKey, laneRunStopKey, requestKey } from '../lane-run-keys.js';
@@ -199,7 +200,10 @@ describe('refusals return null', () => {
     ['roundIdentity negative', () => roundIdentity(-1)],
     ['roundIdentity fractional', () => roundIdentity(1.5)],
     ['roundIdentity with a string', () => roundIdentity('1')],
-    ['journalKeyIdentity of a request key', () => journalKeyIdentity(input(requestKey(ENTRY_ID).key))],
+    ['journalKeyIdentity of a request key', () => {
+      const request = requestKey(ENTRY_ID);
+      return journalKeyIdentity(input(request.ok ? request.key : 'not-a-key'));
+    }],
     ['journalKeyIdentity of a non-key', () => journalKeyIdentity(input('not-a-key'))],
     ['ciWaitIdentity of a non-ULID', () => ciWaitIdentity('ci-1')],
     ['telemetryHashInput of an empty string', () => telemetryHashInput('')],
@@ -222,7 +226,7 @@ describe('refusals return null', () => {
     ['attemptIdentity with a forged token', () => attemptIdentity({} as unknown as TelemetryHashInput)],
     ['telemetrySpanId with a forged identity', () =>
       telemetrySpanId(hmac, runTraceRoot(RUN_ID) as NonNullable<typeof RUN_ROOT>, {} as unknown as TelemetrySpanIdentity)],
-    ['telemetryTraceId with a forged root', () => telemetryTraceId(hmac, {} as unknown as typeof RUN_ROOT)],
+    ['telemetryTraceId with a forged root', () => telemetryTraceId(hmac, {} as unknown as TelemetryTraceRoot)],
   ])('%s', (_name, act) => {
     expect(act()).toBeNull();
   });

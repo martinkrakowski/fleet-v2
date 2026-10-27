@@ -6,6 +6,7 @@ export * from "./entities/index.js";
 export * from "./execution-records.js";
 export * from "./lane-diff-check.js";
 export * from "./lane-run-decider.js";
+export * from "./lane-run-journal.js";
 export * from "./lane-run-keys.js";
 export * from "./lane-run-records.js";
 export * from "./lane-run-transitions.js";

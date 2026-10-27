@@ -26,10 +26,24 @@ export type QuestionSummary =
   | { readonly status: "error"; readonly reason: string }
   | { readonly status: "not-read" };
 
+/**
+ * Feeds the ROOT layout, so it never throws: any failure (including building the client) becomes an
+ * error summary rather than taking every page down, as `loadProjectNav` does.
+ */
 export async function loadQuestionSummary(
-  client: Pick<FleetWebApiClient, "fetchQuestionList"> =
-    createFleetWebApiClient(),
+  client?: Pick<FleetWebApiClient, "fetchQuestionList">,
   now: () => Date = () => new Date(),
+): Promise<QuestionSummary> {
+  try {
+    return await loadQuestionSummaryUnchecked(client ?? createFleetWebApiClient(), now);
+  } catch {
+    return { status: "error", reason: "the question summary could not be loaded" };
+  }
+}
+
+async function loadQuestionSummaryUnchecked(
+  client: Pick<FleetWebApiClient, "fetchQuestionList">,
+  now: () => Date,
 ): Promise<QuestionSummary> {
   const endpoint = await client.fetchQuestionList({ state: "open" }, null);
 

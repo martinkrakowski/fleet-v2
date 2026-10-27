@@ -208,4 +208,15 @@ describe("openQuestionCount", () => {
   it("returns null for a not-read summary", () => {
     expect(openQuestionCount({ status: "not-read" })).toBeNull();
   });
+
+  it("never throws: a client that rejects becomes an error summary", async () => {
+    const failing = {
+      fetchQuestionList: async () => {
+        throw new Error("boom http://api.example.internal");
+      },
+    };
+    const summary = await loadQuestionSummary(failing as never);
+    expect(summary.status).toBe("error");
+    expect(JSON.stringify(summary)).not.toContain("example.internal");
+  });
 });

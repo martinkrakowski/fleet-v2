@@ -414,7 +414,13 @@ function historyErrorValue(
     return 'invalid';
   }
   const first = readPlainObject(history[0], ['event', 'atIso', 'reason']);
-  if (first === null || first.event !== 'opened' || new Date(first.atIso as string).toISOString() !== createdAtIso || first.reason !== null) {
+  if (
+    first === null ||
+    first.event !== 'opened' ||
+    timestampErrorValue(first.atIso as string) !== null ||
+    new Date(first.atIso as string).toISOString() !== createdAtIso ||
+    first.reason !== null
+  ) {
     return 'invalid';
   }
   let previousTime = Date.parse(createdAtIso);
@@ -817,7 +823,7 @@ export class OwnerItem {
           atIso,
         });
       }
-      return { success: false, error: new Error('OwnerItem a merged item is final'), code: 'state' };
+      return { success: false, error: new Error('OwnerItem a closed pull request must reopen before it merges'), code: 'state' };
     }
     if (state === 'closed') {
       if (source !== 'forge-observation') {

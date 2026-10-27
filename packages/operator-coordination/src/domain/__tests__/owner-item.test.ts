@@ -259,6 +259,11 @@ describe('OwnerItem open and create', () => {
       message: 'OwnerItem answered must name the item\'s question',
     },
     {
+      name: 'a history whose opened entry has no parseable time',
+      record: { ...baseRecord(), history: [{ event: 'opened', atIso: 'not-a-time', reason: null }] },
+      message: 'OwnerItem history is not a valid sequence for its state',
+    },
+    {
       name: 'a history starting closed',
       record: { ...baseRecord(), history: [{ event: 'closed', atIso: NOW, reason: 'merged' }] },
       message: 'OwnerItem history is not a valid sequence for its state',
@@ -599,7 +604,7 @@ describe('OwnerItem merge transitions', () => {
     expect(merged.success).toBe(false);
     if (!merged.success) {
       expect(merged.code).toBe('state');
-      expect(merged.error.message).toBe('OwnerItem a merged item is final');
+      expect(merged.error.message).toBe('OwnerItem a closed pull request must reopen before it merges');
     }
     expect(closedAgain2.value.toRecord().history.map((entry) => entry.reason)).toEqual([
       null,

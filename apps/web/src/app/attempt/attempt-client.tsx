@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import Link from "next/link";
 import {
   Badge,
@@ -230,6 +230,10 @@ function renderRecord(data: AttemptPageData): ReactNode {
 export default function AttemptPage({ data }: { data: AttemptPageData }) {
   useAutoRefresh(data.source, data.fallbackReason, ATTEMPT_REFRESH_MS);
   const [copied, setCopied] = useState<string | null>(null);
+  // A copy confirmation lasts until the next data update, so later state changes are announced.
+  useEffect(() => {
+    setCopied(null);
+  }, [data]);
 
   return (
     <div className={styles.layout} data-contained-scroll>

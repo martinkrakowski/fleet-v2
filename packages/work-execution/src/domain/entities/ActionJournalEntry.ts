@@ -7,7 +7,7 @@
 
 import type { ActionJournalEntryRecord } from '../execution-records.js';
 
-const ACTIONS: readonly unknown[] = ['dispatch', 'reconcile', 'stop', 'collect', 'forge'];
+const ACTIONS: readonly unknown[] = ['dispatch', 'reconcile', 'stop', 'collect', 'forge', 'accept'];
 const STATUSES: readonly unknown[] = ['intent-recorded', 'completed', 'ambiguous', 'refused'];
 
 export class ActionJournalEntry {

@@ -9,6 +9,8 @@ import type {
   ChainTrigger,
   ChainsSection,
   CostClass,
+  CoverageReaderName,
+  CoverageUnitKind,
   DecisionConsumers,
   DecisionsSectionV2,
   FallbackSeat,
@@ -20,6 +22,7 @@ import type {
   HostSection,
   HostRunnerSection,
   PolicySection,
+  ProcedureCoverage,
   ReviewerSection,
   RunnerCapabilityDeclaration,
   RunnerSection,
@@ -76,7 +79,17 @@ const RUNNER_KEYS: readonly string[] = [
 const WORKTREE_KEYS: readonly string[] = ['sshHost'];
 const VERIFICATION_KEYS: readonly string[] = ['sshHost', 'procedures'];
 const V2_VERIFICATION_KEYS: readonly string[] = ['procedures'];
-const PROCEDURE_KEYS: readonly string[] = ['command', 'args'];
+const PROCEDURE_KEYS: readonly string[] = ['command', 'args', 'coverage'];
+const PROCEDURE_COVERAGE_KEYS: readonly string[] = [
+  'reader',
+  'unitKind',
+  'minUnits',
+];
+const READER_UNIT_KINDS: Readonly<Record<CoverageReaderName, CoverageUnitKind>> = {
+  'vitest-summary': 'tests',
+  'hexagen-lint-json': 'files',
+  'eslint-json': 'files',
+};
 const FORGE_KEYS: readonly string[] = ['owner', 'repo'];
 const SEAT_KEYS: readonly string[] = ['agent', 'model', 'variant'];
 const WAVES_KEYS: readonly string[] = [
@@ -591,6 +604,72 @@ function parseWorktreeSection(
   return { sshHost };
 }
 
+function parseProcedureCoverage(
+  entry: JsonObject,
+  procedurePath: string,
+  errors: string[],
+): ProcedureCoverage | undefined {
+  if (!Object.hasOwn(entry, 'coverage')) {
+    return undefined;
+  }
+  const p = `${procedurePath}.coverage`;
+  const value = entry.coverage;
+  if (!isJsonObject(value)) {
+    errors.push(`${p}: must be an object`);
+    return undefined;
+  }
+  collectUnknownKeys(value, PROCEDURE_COVERAGE_KEYS, p, errors);
+
+  const reader = value.reader;
+  if (!Object.hasOwn(value, 'reader')) {
+    errors.push(`${p}.reader: required`);
+    return undefined;
+  }
+  if (typeof reader !== 'string') {
+    errors.push(
+      `${p}.reader: must be one of vitest-summary, hexagen-lint-json, eslint-json`,
+    );
+    return undefined;
+  }
+  if (!Object.hasOwn(READER_UNIT_KINDS, reader)) {
+    errors.push(
+      `${p}.reader: must be one of vitest-summary, hexagen-lint-json, eslint-json`,
+    );
+    return undefined;
+  }
+  const readerName = reader as CoverageReaderName;
+
+  const unitKind = value.unitKind;
+  if (!Object.hasOwn(value, 'unitKind')) {
+    errors.push(`${p}.unitKind: required`);
+    return undefined;
+  }
+  if (unitKind !== 'tests' && unitKind !== 'files' && unitKind !== 'checks') {
+    errors.push(`${p}.unitKind: must be one of tests, files, checks`);
+    return undefined;
+  }
+  if (unitKind !== READER_UNIT_KINDS[readerName]) {
+    errors.push(`${p}.unitKind: does not match the reader`);
+    return undefined;
+  }
+
+  const minUnits = value.minUnits;
+  if (!Object.hasOwn(value, 'minUnits')) {
+    errors.push(`${p}.minUnits: required`);
+    return undefined;
+  }
+  if (
+    typeof minUnits !== 'number' ||
+    !Number.isSafeInteger(minUnits) ||
+    minUnits < 1
+  ) {
+    errors.push(`${p}.minUnits: must be an integer 1 or greater`);
+    return undefined;
+  }
+
+  return { reader: readerName, unitKind, minUnits };
+}
+
 function parseProcedures(
   record: JsonObject,
   errors: string[],
@@ -623,12 +702,14 @@ function parseProcedures(
       `${procedurePath}.args`,
       errors,
     );
+    const coverage = parseProcedureCoverage(entry, procedurePath, errors);
     if (command === undefined) {
       continue;
     }
     procedures[name] = {
       command,
       ...(args !== undefined ? { args } : {}),
+      ...(coverage !== undefined ? { coverage } : {}),
     };
   }
   return procedures;

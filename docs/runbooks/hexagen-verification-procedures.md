@@ -23,10 +23,10 @@ Then name them in the project's gate procedures (`--gate-procedures hexagen-arch
 
 ## Reading the result
 
-- **Exit 0** is a pass.
+- **Exit 0** is a pass, unless the procedure declares coverage (see `verification-coverage.md`).
 - **Anything else is not a pass,** including exit 2 ("could not run"), a missing binary, a timeout or a killed process. fleet-v2 records the procedure as failed or unknown and never as passed.
 - The human-readable output is kept as the receipt's output summary.
-- The JSON findings line (`hexagen-lint --json`) is not read yet. That arrives with the `ArchitectureConformancePort` (plan lane F4), only when evidence needs the findings themselves.
+- The JSON line of `hexagen-lint --json` is read only for its `filesScanned` count, by a procedure that declares the `hexagen-lint-json` coverage reader. The findings themselves arrive with the `ArchitectureConformancePort` (plan lane F4).
 
 ## When hexagen changes
 

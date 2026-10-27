@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import type { CheckCoverage } from '../../../domain/check-coverage.js';
 import type { EvidenceAssessmentRecord } from '../../../domain/evidence-records.js';
 import type {
   ArchiveEvidenceRequest,
@@ -72,6 +73,23 @@ class CoverageStubExecutor implements VerificationExecutorPort {
       result: 'pass',
       exitCode: 0,
       coverage: { ran: true, unitKind: 'tests', units: 12 },
+      outputSummary: 'check passed',
+      completedAtIso: '2026-10-15T12:00:00.000Z',
+    };
+  }
+}
+
+class MalformedCoverageStubExecutor implements VerificationExecutorPort {
+  calls: ExecuteVerificationCheckRequest[] = [];
+
+  async executeVerificationCheck(
+    request: ExecuteVerificationCheckRequest,
+  ): Promise<ExecuteVerificationCheckResult> {
+    this.calls.push(request);
+    return {
+      result: 'pass',
+      exitCode: 0,
+      coverage: { ran: true, unitKind: 'lines', units: 3 } as unknown as CheckCoverage,
       outputSummary: 'check passed',
       completedAtIso: '2026-10-15T12:00:00.000Z',
     };
@@ -375,5 +393,31 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
     if (receipt !== undefined) {
       expect('coverage' in receipt).toBe(false);
     }
+  });
+
+  it('refuses with typed rejected before archiving when executor returns malformed coverage', async () => {
+    const repo = new InMemoryAssessmentRepo([]);
+    const executor = new MalformedCoverageStubExecutor();
+    const archive = new StubArchive();
+    const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+
+    const result = await useCase.requestVerification({
+      assessmentId: 'asm-malformed-coverage',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      requiredChecks: ['lint'],
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.reason).toContain('malformed coverage');
+    }
+    expect(archive.calls).toHaveLength(0);
+    const stored = await repo.findAssessmentById('asm-malformed-coverage');
+    expect(stored).toBeNull();
   });
 });

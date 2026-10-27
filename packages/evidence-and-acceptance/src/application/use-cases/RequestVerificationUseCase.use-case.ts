@@ -10,6 +10,7 @@ import type {
   EvidenceAssessmentRecord,
   VerificationReceiptRecord,
 } from '../../domain/evidence-records.js';
+import { isCheckCoverage } from '../../domain/check-coverage.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
@@ -158,6 +159,12 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
         candidateHeadSha: request.candidateHeadSha,
         procedureName,
       });
+      if (execution.coverage !== undefined && !isCheckCoverage(execution.coverage)) {
+        return {
+          outcome: 'rejected',
+          reason: `Verification executor returned malformed coverage for '${procedureName}'; nothing was recorded`,
+        };
+      }
       const archived = await deps.archive.archiveEvidence({
         artifactId: `verification-${request.assessmentId}-${procedureName}-${request.candidateHeadSha}`,
         candidateHeadSha: request.candidateHeadSha,

@@ -4,7 +4,7 @@
  * lease, so the store announces a heartbeat rather than a data change.
  */
 
-import { OrchestratorSession } from '../../domain/entities/OrchestratorSession.js';
+import { OrchestratorSession, isOrchestratorTokenId, isRegisteredByToken } from '../../domain/entities/OrchestratorSession.js';
 import type { OrchestratorSessionRecord } from '../../domain/orchestrator-session-records.js';
 import {
   OrchestratorSessionRevisionConflictError,
@@ -30,11 +30,12 @@ export class HeartbeatOrchestratorSessionUseCase implements HeartbeatOrchestrato
 
   async heartbeatOrchestratorSession(
     request: { orchestratorId: string },
+    presentedTokenId: string,
   ): Promise<HeartbeatOrchestratorSessionResult> {
-    return this.execute(request);
+    return this.execute(request, presentedTokenId);
   }
 
-  async execute(input: unknown): Promise<HeartbeatOrchestratorSessionResult> {
+  async execute(input: unknown, presentedTokenId: unknown): Promise<HeartbeatOrchestratorSessionResult> {
     // Unconfigured is 501 and is checked before any request validation.
     if (!this.deps) {
       throw new Error('Not implemented: HeartbeatOrchestratorSessionUseCase');
@@ -43,9 +44,15 @@ export class HeartbeatOrchestratorSessionUseCase implements HeartbeatOrchestrato
     if (orchestratorId === null) {
       return { outcome: 'refused', reason: 'an orchestratorId is required' };
     }
+    if (!isOrchestratorTokenId(presentedTokenId)) {
+      return { outcome: 'refused', reason: 'the presenting token could not be identified' };
+    }
     let stored = await this.deps.sessionRepo.get(orchestratorId);
     if (stored === null) {
       return { outcome: 'not-found' };
+    }
+    if (!isRegisteredByToken(stored.session, presentedTokenId)) {
+      return { outcome: 'not-owner' };
     }
     let renewed = renewSession(stored.session, this.deps.clock.nowIso());
     if (!renewed.ok) {
@@ -64,6 +71,9 @@ export class HeartbeatOrchestratorSessionUseCase implements HeartbeatOrchestrato
     stored = await this.deps.sessionRepo.get(orchestratorId);
     if (stored === null) {
       return { outcome: 'not-found' };
+    }
+    if (!isRegisteredByToken(stored.session, presentedTokenId)) {
+      return { outcome: 'not-owner' };
     }
     renewed = renewSession(stored.session, this.deps.clock.nowIso());
     if (!renewed.ok) {

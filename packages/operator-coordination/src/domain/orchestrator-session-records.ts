@@ -44,6 +44,12 @@ export interface OrchestratorSessionRecord {
   readonly projects: readonly string[];
   readonly claims: readonly OrchestratorRequestKind[];
   readonly scopes: readonly OrchestratorSessionScope[];
+  /**
+   * The id of the API token that registered this session — an identifier, never the token
+   * or any part of it. Heartbeat and retire refuse any other token (O3). Until T3a the API
+   * presents its one shared bearer as the fixed id `shared-bearer`.
+   */
+  readonly registeredByTokenId: string;
   readonly startedAtIso: string;
   readonly lastHeartbeatIso: string;
   readonly leaseUntilIso: string;

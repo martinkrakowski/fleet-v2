@@ -4,7 +4,7 @@
  * retired session stays retired and its id is never reused for a new session.
  */
 
-import { OrchestratorSession } from '../../domain/entities/OrchestratorSession.js';
+import { OrchestratorSession, isOrchestratorTokenId, isRegisteredByToken } from '../../domain/entities/OrchestratorSession.js';
 import type { OrchestratorSessionRecord } from '../../domain/orchestrator-session-records.js';
 import {
   OrchestratorSessionRevisionConflictError,
@@ -30,11 +30,12 @@ export class RetireOrchestratorSessionUseCase implements RetireOrchestratorSessi
 
   async retireOrchestratorSession(
     request: { orchestratorId: string },
+    presentedTokenId: string,
   ): Promise<RetireOrchestratorSessionResult> {
-    return this.execute(request);
+    return this.execute(request, presentedTokenId);
   }
 
-  async execute(input: unknown): Promise<RetireOrchestratorSessionResult> {
+  async execute(input: unknown, presentedTokenId: unknown): Promise<RetireOrchestratorSessionResult> {
     // Unconfigured is 501 and is checked before any request validation.
     if (!this.deps) {
       throw new Error('Not implemented: RetireOrchestratorSessionUseCase');
@@ -43,9 +44,15 @@ export class RetireOrchestratorSessionUseCase implements RetireOrchestratorSessi
     if (orchestratorId === null) {
       return { outcome: 'refused', reason: 'an orchestratorId is required' };
     }
+    if (!isOrchestratorTokenId(presentedTokenId)) {
+      return { outcome: 'refused', reason: 'the presenting token could not be identified' };
+    }
     let stored = await this.deps.sessionRepo.get(orchestratorId);
     if (stored === null) {
       return { outcome: 'not-found' };
+    }
+    if (!isRegisteredByToken(stored.session, presentedTokenId)) {
+      return { outcome: 'not-owner' };
     }
     if (stored.session.status === 'retired') {
       return { outcome: 'retired', session: stored.session, revision: stored.revision };
@@ -67,6 +74,9 @@ export class RetireOrchestratorSessionUseCase implements RetireOrchestratorSessi
     stored = await this.deps.sessionRepo.get(orchestratorId);
     if (stored === null) {
       return { outcome: 'not-found' };
+    }
+    if (!isRegisteredByToken(stored.session, presentedTokenId)) {
+      return { outcome: 'not-owner' };
     }
     if (stored.session.status === 'retired') {
       return { outcome: 'retired', session: stored.session, revision: stored.revision };

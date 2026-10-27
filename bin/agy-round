@@ -6,6 +6,7 @@
 #
 # Subcommands:
 #   agy-round prepare --name <n> --branch <b> --brief <local file> [--from <local git dir>]
+#                   (pushes refs/heads/<b> of --from to the clone; never HEAD; exit 2 when <b> is not a local branch there)
 #   agy-round run --name <n> --model <m> --brief <.lane/x.md> [--timeout <45m>] [--log <file>]
 #   agy-round commit --name <n> --message-file <local file> -- <path>...
 #                   (relative paths of letters, digits, the at sign and . _ / + - [ ]; brackets
@@ -35,6 +36,7 @@ usage() {
 Usage: agy-round <subcommand> [options]
 Subcommands:
   prepare --name <n> --branch <b> --brief <local file> [--from <local git dir>]
+           (pushes refs/heads/<b> of --from, never HEAD)
   run --name <n> --model <m> --brief <.lane/x.md> [--timeout <45m>] [--log <file>]
   commit --name <n> --message-file <local file> -- <path>...
   fetch --name <n> --branch <b> [--into <local git dir>]
@@ -200,6 +202,10 @@ case "$cmd" in
     base=$(basename "$brief")
     validate_filename "brief basename" "$base"
     [ -f "$brief" ] || die_usage "--brief '$brief' must be an existing regular file"
+    # Push exactly the named branch of --from, never its HEAD: with another branch checked out
+    # there, HEAD would seed the container with the wrong commit.
+    git -C "$from" rev-parse --verify --quiet "refs/heads/$branch^{commit}" >/dev/null 2>&1 \
+      || die_usage "branch '$branch' does not exist in --from '$from' (prepare pushes refs/heads/$branch, never HEAD)"
     require_env AGY_ROUND_SSH AGY_ROUND_ROOT
     validate_root
     dir="$AGY_ROUND_ROOT/$name"
@@ -210,7 +216,7 @@ case "$cmd" in
     fi
     ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git init -q $(shq "$dir") && git -C $(shq "$dir") symbolic-ref HEAD refs/heads/agy-round-unborn" \
       || fail_prepare "$dir" "git init failed in the container"
-    GIT_SSH_COMMAND='ssh -o BatchMode=yes' git -C "$from" -c core.hooksPath=/dev/null push -q "$AGY_ROUND_SSH:$dir" "HEAD:refs/heads/$branch" \
+    GIT_SSH_COMMAND='ssh -o BatchMode=yes' git -C "$from" -c core.hooksPath=/dev/null push -q "$AGY_ROUND_SSH:$dir" "refs/heads/$branch:refs/heads/$branch" \
       || fail_prepare "$dir" "push to the container failed"
     ssh -o BatchMode=yes "$AGY_ROUND_SSH" "git -C $(shq "$dir") -c core.hooksPath=/dev/null checkout -q $(shq "$branch")" \
       || fail_prepare "$dir" "checkout in the container failed"

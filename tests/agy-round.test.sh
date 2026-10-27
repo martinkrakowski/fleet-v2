@@ -206,6 +206,9 @@ mkdir -p "$T/from"
   echo 'export const a = 1;' > a.ts
   git add .
   git -c commit.gpgsign=false commit -q -m init
+  git branch -M main
+  git branch feat/x
+  git branch b
 )
 echo 'brief body' > "$T/brief.md"
 echo 'commit message' > "$T/msg"
@@ -376,6 +379,35 @@ touch "$T/ignore-err"
 run prepare --name p-ignerr --branch feat/x --brief "$T/brief.md" --from "$T/from"
 check 'prepare when check-ignore has a connection failure exits 1 with could not check' '[ "$(rc)" = 1 ] && grep -q "could not check the brief path" "$T/e" && ! grep -q "not gitignored" "$T/e"'
 rm -f "$T/ignore-err"
+
+echo '# prepare pushes the named branch, never HEAD'
+git -C "$T/from" checkout -q -b feat/other
+echo 'export const b = 2;' > "$T/from/b.ts"
+git -C "$T/from" add b.ts
+git -C "$T/from" -c commit.gpgsign=false commit -q -m 'other work'
+want=$(git -C "$T/from" rev-parse refs/heads/feat/x)
+head=$(git -C "$T/from" rev-parse HEAD)
+
+run prepare --name p-named --branch feat/x --brief "$T/brief.md" --from "$T/from"
+check 'prepare with another branch checked out exits 0' '[ "$(rc)" = 0 ]'
+check 'the container branch is the named branch'\''s commit, not HEAD' '[ "$(git -C "$T/container/p-named" rev-parse refs/heads/feat/x)" = "$want" ] && [ "$want" != "$head" ]'
+check 'the container never receives the checked-out branch'\''s commit' '! git -C "$T/container/p-named" cat-file -e "$head^{commit}" 2>/dev/null'
+
+: > "$T/ssh.log"; : > "$T/scp.log"
+run prepare --name p-missing --branch feat/missing --brief "$T/brief.md" --from "$T/from"
+check 'a branch missing from --from is a usage error (2) naming the branch' '[ "$(rc)" = 2 ] && grep -q "feat/missing" "$T/e" && grep -q "does not exist" "$T/e"'
+check 'a missing branch reaches no host' '[ ! -s "$T/ssh.log" ] && [ ! -s "$T/scp.log" ]'
+check 'a missing branch leaves no clone' '[ ! -e "$T/container/p-missing" ]'
+
+mkdir -p "$T/not-a-repo"
+run prepare --name p-norepo --branch feat/x --brief "$T/brief.md" --from "$T/not-a-repo"
+check '--from that is not a git repository is a usage error (2)' '[ "$(rc)" = 2 ] && [ ! -e "$T/container/p-norepo" ]'
+
+git -C "$T/from" tag v-example
+run prepare --name p-tag --branch v-example --brief "$T/brief.md" --from "$T/from"
+check 'a tag of the same name is not a branch (2)' '[ "$(rc)" = 2 ]'
+
+git -C "$T/from" checkout -q main
 
 echo '# commit'
 mkcontainer cm1

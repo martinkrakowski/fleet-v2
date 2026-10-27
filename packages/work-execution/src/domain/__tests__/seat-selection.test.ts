@@ -223,6 +223,13 @@ describe("selectReviewSeat", () => {
     );
   });
 
+  it("skips an unhealthy review seat", () => {
+    expectSelected(
+      selectReviewSeat({ plan: p, round: 0, implementerModels: [], sameFamily, unhealthySeatIds: [p.getSeats("review")[0].id] }),
+      1,
+    );
+  });
+
   it("reports exhaustion when every review seat shares a family", () => {
     const result = selectReviewSeat({
       plan: p,

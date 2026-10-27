@@ -42,11 +42,19 @@ export function stopReasonOf(record: Pick<AttemptRecord, 'stopReason'>): StopRea
 /** The selection view of one stored attempt. */
 export function historyEntryOf(record: AttemptRecord): SeatHistoryEntry {
   const selection = record.seatSelection ?? null;
-  const ranModel = record.runner?.model ?? null;
+  // Stored records are not schema-checked on read: a non-string model is treated as absent.
+  const ranModel: unknown = record.runner?.model;
+  const boundModel: unknown = selection?.model;
+  let model: string | null = null;
+  if (typeof ranModel === 'string') {
+    model = ranModel;
+  } else if (typeof boundModel === 'string') {
+    model = boundModel;
+  }
   return {
     role: selection?.role ?? null,
     seatIndex: selection?.seatIndex ?? null,
-    model: ranModel ?? selection?.model ?? null,
+    model,
     stopReason: stopReasonOf(record),
   };
 }

@@ -47,8 +47,20 @@ export function chainNoteText(note: ChainNote): string {
 export function journalReadIds(
   ordered: readonly RecordedAttemptWire[],
 ): ReadonlySet<string> {
-  const start = Math.max(0, ordered.length - MAX_TIMELINE_JOURNALS);
-  return new Set(ordered.slice(start).map((attempt) => attempt.id));
+  // The read window is the newest attempts by creation time; chain order only
+  // controls display. The sort is stable, so equal times keep chain order.
+  const byCreation = [...ordered].sort((left, right) =>
+    compareIso(left.createdAtIso, right.createdAtIso),
+  );
+  const start = Math.max(0, byCreation.length - MAX_TIMELINE_JOURNALS);
+  return new Set(byCreation.slice(start).map((attempt) => attempt.id));
+}
+
+function compareIso(left: string, right: string): number {
+  if (left === right) {
+    return 0;
+  }
+  return left < right ? -1 : 1;
 }
 
 export function notReadText(notRead: number): string {

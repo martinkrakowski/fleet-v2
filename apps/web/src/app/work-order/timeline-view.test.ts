@@ -101,6 +101,28 @@ describe("timeline-view pure helpers", () => {
     );
   });
 
+  it("reads the newest 12 by creation time, not by fix number", () => {
+    const branched = Array.from({ length: 14 }, (_, index) =>
+      attempt(`att_live_${index + 1}`, {
+        kind: "fix",
+        fixNumber: index + 1,
+        createdAtIso: `2026-10-24T10:${String(index + 10).padStart(2, "0")}:00Z`,
+      }),
+    );
+    // A late fix on another branch: low fix number, newest creation time.
+    const lateBranch = attempt("att_live_late", {
+      kind: "fix",
+      fixNumber: 1,
+      createdAtIso: "2026-10-24T11:00:00Z",
+    });
+    const readIds = journalReadIds([lateBranch, ...branched]);
+    expect(readIds.size).toBe(12);
+    expect(readIds.has("att_live_late")).toBe(true);
+    expect(readIds.has("att_live_1")).toBe(false);
+    expect(readIds.has("att_live_3")).toBe(false);
+    expect(readIds.has("att_live_14")).toBe(true);
+  });
+
   it("renders the not-read header text", () => {
     expect(notReadText(0)).toBe("");
     expect(notReadText(1)).toBe(

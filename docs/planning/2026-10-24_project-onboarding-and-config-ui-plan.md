@@ -126,7 +126,7 @@ fixed argv arrays and no shell. An unreachable host is `UNKNOWN`, never `PASS` a
 
 The TUI program is one binary (`fleet-v2 tui`). Its configuration screens call use cases in-process;
 its orchestrator screens (T8a–T8b) stay `/v1` clients as that plan decides. Both share the shell,
-navigation and the library chosen in D3.
+navigation and the library chosen in D3. The work board (`2026-10-27_work-board-plan.md`, D8, decided 2026-10-27) adds a read-only Board screen to this shell, lane WB14, built once P9 or T8a exists and reading the same read model as `fleet-v2 board`; until then `fleet-v2 board --watch` is its terminal view.
 
 ## 4. Workbook
 

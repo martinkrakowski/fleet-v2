@@ -2,6 +2,7 @@ import {
   attempts,
   workOrders,
   type AttemptSummary,
+  type CapacityState,
   type WorkOrderSummary,
 } from "./fixture";
 
@@ -30,15 +31,18 @@ export const STATE_FILTERS = [
  * a runner observation: unknown states stay unknown and ended states never
  * claim collected artifacts that were not recorded.
  */
-function recordedSummary(a: AttemptSummary): [word: string, note: string] {
-  switch (a.recordedState) {
+export function recordedStateSummary(
+  state: string | undefined,
+  capacity: CapacityState | null,
+): [word: string, note: string] {
+  switch (state) {
     case "intent-recorded":
-      return [
-        "queued",
-        a.capacity === "held"
-          ? "intent recorded · slot reserved · not yet dispatching"
-          : "intent recorded · waiting for a slot",
-      ];
+      if (capacity === null) {
+        return ["queued", "intent recorded · slot not read on this page"];
+      }
+      return capacity === "held"
+        ? ["queued", "intent recorded · slot reserved · not yet dispatching"]
+        : ["queued", "intent recorded · waiting for a slot"];
     case "dispatching":
       return ["active", "dispatching · recorded, not observed"];
     case "running":
@@ -54,8 +58,12 @@ function recordedSummary(a: AttemptSummary): [word: string, note: string] {
     case "cancelled":
       return ["ended", "cancelled"];
     default:
-      return ["unknown", `unrecognised recorded state ${a.recordedState}`];
+      return ["unknown", `unrecognised recorded state ${state}`];
   }
+}
+
+function recordedSummary(a: AttemptSummary): [word: string, note: string] {
+  return recordedStateSummary(a.recordedState, a.capacity);
 }
 
 export function summary(a: AttemptSummary): [word: string, note: string] {
@@ -109,10 +117,12 @@ export const woOf = (
 
 export const attemptsOf = (wo: string, list: AttemptSummary[] = attempts) =>
   list.filter((a) => a.wo === wo);
-export const attemptHref = (a: AttemptSummary) =>
-  `/attempt?id=${encodeURIComponent(a.id)}`;
+export function attemptIdHref(id: string): string {
+  return `/attempt?id=${encodeURIComponent(id)}`;
+}
+export const attemptHref = (a: AttemptSummary) => attemptIdHref(a.id);
 export function liveViewHref(a: AttemptSummary): string | null {
-  return a.basis === "recorded" ? null : attemptHref(a);
+  return a.id.trim() === "" ? null : attemptHref(a);
 }
 export function observedLine(a: AttemptSummary, note: string): string {
   const verb = a.basis === "recorded" ? "recorded" : "observed";

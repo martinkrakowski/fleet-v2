@@ -8,6 +8,7 @@ import {
   laneIdLine,
   liveViewHref,
   observedLine,
+  recordedStateSummary,
   summary,
   unknownAttention,
   woOf,
@@ -187,11 +188,35 @@ describe("attemptHref", () => {
 });
 
 describe("liveViewHref", () => {
-  it("is null for a recorded row and /attempt?id=<encoded id> for a fixture row", () => {
-    expect(liveViewHref(recorded("running"))).toBeNull();
+  it("opens the attempt view for every row with an id; empty ids stay null", () => {
+    expect(liveViewHref(recorded("running"))).toBe("/attempt?id=att_r_1");
+    expect(liveViewHref({ ...recorded("running"), id: "" })).toBeNull();
     expect(liveViewHref({ ...attempts[0], id: "att_1&2#3" })).toBe(
       "/attempt?id=att_1%262%233",
     );
+  });
+});
+
+describe("recordedStateSummary", () => {
+  it("reads intent-recorded without a capacity as unread on this page", () => {
+    expect(recordedStateSummary("intent-recorded", null)).toEqual([
+      "queued",
+      "intent recorded · slot not read on this page",
+    ]);
+  });
+
+  it("keeps the recorded running note", () => {
+    expect(recordedStateSummary("running", null)).toEqual([
+      "active",
+      "running · recorded, not observed",
+    ]);
+  });
+
+  it("maps an unrecognised state to unknown", () => {
+    expect(recordedStateSummary("gone", null)).toEqual([
+      "unknown",
+      "unrecognised recorded state gone",
+    ]);
   });
 });
 

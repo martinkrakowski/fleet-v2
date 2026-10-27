@@ -517,9 +517,26 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
             };
           }
           case "blocked":
-            return { outcome: "rejected", reason: result.blockers.join("; ") };
-          default:
-            return { outcome: "unknown", reason: result.reason };
+            return {
+              outcome: "rejected",
+              reason: result.blockers.join("; "),
+              blockerDetails: result.blockerDetails.map((blocker) => ({
+                kind: blocker.kind,
+                text: blocker.text,
+              })),
+            };
+          case "stale":
+            return {
+              outcome: "unknown",
+              reason: result.reason,
+              blockerDetails: [{ kind: "stale", text: result.reason }],
+            };
+          case "rejected":
+            return {
+              outcome: "unknown",
+              reason: result.reason,
+              blockerDetails: [{ kind: "other", text: result.reason }],
+            };
         }
       },
     },

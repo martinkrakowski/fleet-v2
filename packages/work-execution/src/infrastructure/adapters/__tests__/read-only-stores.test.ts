@@ -206,16 +206,19 @@ describe('LaneRunRepositoryAdapter read-only lease operations', () => {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   });
 
-  it('refuses lease writes and leaves the file bytes unchanged', async () => {
+  it('refuses save and every lease write and leaves the directory unchanged', async () => {
     const file = path.join(tempDir, 'lane-runs.json');
     const bytes = Buffer.from(JSON.stringify([validRun()]));
     await fs.writeFile(file, bytes);
+    const before = await snapshot(tempDir);
     const adapter = new LaneRunRepositoryAdapter({ stateDir: tempDir, readOnly: true });
+
+    await expect(adapter.save(validRun(), HOLD)).rejects.toBeInstanceOf(ReadOnlyStateStoreError);
 
     await expect(adapter.acquireLease(RUN_ID, ACQUIRE)).rejects.toBeInstanceOf(ReadOnlyStateStoreError);
     await expect(adapter.renewLease(RUN_ID, RENEW)).rejects.toBeInstanceOf(ReadOnlyStateStoreError);
     await expect(adapter.releaseLease(RUN_ID, HOLD)).rejects.toBeInstanceOf(ReadOnlyStateStoreError);
 
-    expect(await fs.readFile(file)).toEqual(bytes);
+    expect(await snapshot(tempDir)).toEqual(before);
   });
 });

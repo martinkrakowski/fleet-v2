@@ -1,13 +1,17 @@
 /**
  * The idempotency keys of plan §3.2 and §3.8: step keys
- * `<runId>/r<round>/<step>/<seatIndex>[/a<n>][@<head12>][/retry<n>]`, the control keys
- * `<runId>/stop@web` and `<runId>/park/<n>/resume@web`, and the request channel's
- * `request/<requestId>`. Pure; builders and the parser never throw and never echo
- * input. `parseLaneRunKey(buildX(…))` always returns the same parts, and building a
+ * `<runId>/r<round>/<step>/<seatIndex>[/a<n>][@<head12>][/retry<n>]` (including
+ * `reconcile`), the control keys `<runId>/stop@<via>` (graceful) and
+ * `<runId>/stop-force@<via>` (force), with via web or cli and the mode read from
+ * the key, `<runId>/park/<n>/resume@web`, the request channel's
+ * `request/<requestId>`, and the reaper's `reaper/<subjectId>/<kind>@<findingId>`.
+ * Pure; builders and the parser never throw and never echo input.
+ * `parseLaneRunKey(buildX(…))` always returns the same parts, and building a
  * parsed key returns the same string. K1b's journal refuses a second intent with the
  * same key.
  */
 
+import { containsSecretShape } from '@fleet/shared';
 import {
   LANE_RUN_ID_PATTERN,
   LANE_RUN_KEY_ATTEMPT_RULE,
@@ -23,6 +27,24 @@ export const LANE_RUN_MAX_SEAT_INDEX = 999;
 export const LANE_RUN_MAX_RETRY = 9;
 export const LANE_RUN_MAX_PARK_ORDINAL = 9999;
 export const REQUEST_ID_PATTERN = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/; // the O1b-1 ULID
+
+/** The stop modes a stop key names (plan §3.9.1). Same values as K1-2a's RunStopMode; aliased after both merge. */
+export const LANE_RUN_STOP_KEY_MODES = ['graceful', 'force'] as const;
+export type LaneRunStopKeyMode = (typeof LANE_RUN_STOP_KEY_MODES)[number];
+
+/** Where a control key came from: the web request channel or the CLI. */
+export const LANE_RUN_KEY_VIAS = ['web', 'cli'] as const;
+export type LaneRunKeyVia = (typeof LANE_RUN_KEY_VIAS)[number];
+
+/** The reaper's finding kinds (plan §3.9.2). Stored data from K1b on; K10 imports this tuple, it does not redeclare it. */
+export const REAPER_FINDING_KINDS = [
+  'orphan-session', 'dead-attempt', 'driverless-run', 'leaked-slot', 'stale-stop', 'orphan-worktree',
+  'stale-attention',
+] as const;
+export type ReaperFindingKind = (typeof REAPER_FINDING_KINDS)[number];
+
+/** A record id (attempt, reservation, run, attention item) or `wt-<12 hex>` for a worktree: printable ASCII without `/` or `@`, 1–128 characters. */
+export const REAPER_SUBJECT_ID_PATTERN = /^[!-.0-?A-~]{1,128}$/;
 
 const HEAD12_PATTERN = /^[0-9a-f]{12}$/;
 const COMMIT_HEX_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -44,9 +66,20 @@ export interface LaneRunStepKeyParts {
 
 export type ParsedLaneRunKey =
   | ({ readonly kind: 'step' } & LaneRunStepKeyParts)
-  | { readonly kind: 'stop'; readonly runId: string; readonly via: 'web' }
+  | {
+      readonly kind: 'stop';
+      readonly runId: string;
+      readonly via: LaneRunKeyVia;
+      readonly mode: LaneRunStopKeyMode;
+    }
   | { readonly kind: 'resume'; readonly runId: string; readonly parkOrdinal: number; readonly via: 'web' }
-  | { readonly kind: 'request'; readonly requestId: string };
+  | { readonly kind: 'request'; readonly requestId: string }
+  | {
+      readonly kind: 'reaper';
+      readonly subjectId: string;
+      readonly findingKind: ReaperFindingKind;
+      readonly findingId: string;
+    };
 
 export type LaneRunKeyResult =
   | { readonly ok: true; readonly key: string }
@@ -162,11 +195,49 @@ export function buildLaneRunStepKey(parts: LaneRunStepKeyParts): LaneRunKeyResul
   }
 }
 
-export function laneRunStopKey(runId: string): LaneRunKeyResult {
+export function laneRunStopKey(runId: string, via: LaneRunKeyVia = 'web'): LaneRunKeyResult {
   if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
     return { ok: false, error: 'LaneRun key runId must be run- followed by a ULID' };
   }
-  return { ok: true, key: runId + '/stop@web' };
+  if (!LANE_RUN_KEY_VIAS.includes(via)) {
+    return { ok: false, error: 'LaneRun key via must be web or cli' };
+  }
+  return { ok: true, key: runId + '/stop@' + via };
+}
+
+export function laneRunStopForceKey(runId: string, via: LaneRunKeyVia): LaneRunKeyResult {
+  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
+    return { ok: false, error: 'LaneRun key runId must be run- followed by a ULID' };
+  }
+  if (!LANE_RUN_KEY_VIAS.includes(via)) {
+    return { ok: false, error: 'LaneRun key via must be web or cli' };
+  }
+  return { ok: true, key: runId + '/stop-force@' + via };
+}
+
+/** The mode a parsed stop key names; null for any other key or a malformed one. */
+export function stopModeOfKey(key: unknown): LaneRunStopKeyMode | null {
+  const parsed = parseLaneRunKey(key);
+  if (parsed === null || parsed.kind !== 'stop') {
+    return null;
+  }
+  return parsed.mode;
+}
+
+export function reaperRepairKey(subjectId: string, kind: ReaperFindingKind, findingId: string): LaneRunKeyResult {
+  if (typeof subjectId !== 'string' || !REAPER_SUBJECT_ID_PATTERN.test(subjectId)) {
+    return { ok: false, error: 'LaneRun key reaper subject must be an id without / or @ of at most 128 characters' };
+  }
+  if (containsSecretShape(subjectId)) {
+    return { ok: false, error: 'LaneRun key reaper subject contains a secret-shaped value and was refused' };
+  }
+  if (!REAPER_FINDING_KINDS.includes(kind)) {
+    return { ok: false, error: 'LaneRun key reaper kind is not a known finding kind' };
+  }
+  if (typeof findingId !== 'string' || !REQUEST_ID_PATTERN.test(findingId)) {
+    return { ok: false, error: 'LaneRun key reaper findingId must be a ULID' };
+  }
+  return { ok: true, key: 'reaper/' + subjectId + '/' + kind + '@' + findingId };
 }
 
 export function laneRunResumeKey(runId: string, parkOrdinal: number): LaneRunKeyResult {
@@ -235,6 +306,50 @@ function parseStepKeySegments(segments: string[], key: string): ParsedLaneRunKey
   return { kind: 'step', runId: segments[0], round, step, seatIndex, attemptOrdinal, head12, retry };
 }
 
+function parseStopKeySegments(segments: string[], key: string): ParsedLaneRunKey | null {
+  const atIndex = segments[1].indexOf('@');
+  if (atIndex === -1 || segments[1].indexOf('@', atIndex + 1) !== -1) {
+    return null;
+  }
+  const action = segments[1].slice(0, atIndex);
+  const via = segments[1].slice(atIndex + 1);
+  if (!LANE_RUN_KEY_VIAS.includes(via as LaneRunKeyVia)) {
+    return null;
+  }
+  let mode: LaneRunStopKeyMode;
+  let built: LaneRunKeyResult;
+  if (action === 'stop') {
+    mode = 'graceful';
+    built = laneRunStopKey(segments[0], via as LaneRunKeyVia);
+  } else if (action === 'stop-force') {
+    mode = 'force';
+    built = laneRunStopForceKey(segments[0], via as LaneRunKeyVia);
+  } else {
+    return null;
+  }
+  if (!built.ok || built.key !== key) {
+    return null;
+  }
+  return { kind: 'stop', runId: segments[0], via: via as LaneRunKeyVia, mode };
+}
+
+function parseReaperKeySegments(segments: string[], key: string): ParsedLaneRunKey | null {
+  if (segments[0] !== 'reaper') {
+    return null;
+  }
+  const atIndex = segments[2].indexOf('@');
+  if (atIndex === -1 || segments[2].indexOf('@', atIndex + 1) !== -1) {
+    return null;
+  }
+  const kind = segments[2].slice(0, atIndex);
+  const findingId = segments[2].slice(atIndex + 1);
+  const built = reaperRepairKey(segments[1], kind as ReaperFindingKind, findingId);
+  if (!built.ok || built.key !== key) {
+    return null;
+  }
+  return { kind: 'reaper', subjectId: segments[1], findingKind: kind as ReaperFindingKind, findingId };
+}
+
 export function parseLaneRunKey(key: unknown): ParsedLaneRunKey | null {
   if (typeof key !== 'string' || key.length > LANE_RUN_KEY_MAX_LENGTH) {
     return null;
@@ -248,13 +363,11 @@ export function parseLaneRunKey(key: unknown): ParsedLaneRunKey | null {
         ? { kind: 'request', requestId: segments[1] }
         : null;
     }
-    if (segments[1] === 'stop@web') {
-      const built = laneRunStopKey(segments[0]);
-      return built.ok && built.key === key
-        ? { kind: 'stop', runId: segments[0], via: 'web' }
-        : null;
-    }
-    return null;
+    return parseStopKeySegments(segments, key);
+  }
+
+  if (segments.length === 3) {
+    return parseReaperKeySegments(segments, key);
   }
 
   if (segments.length === 4 && segments[1] === 'park') {

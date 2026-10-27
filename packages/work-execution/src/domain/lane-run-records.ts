@@ -27,10 +27,11 @@ export const LANE_RUN_ID_PATTERN = /^run-[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
  * The action steps that carry a step key (plan §3.2, §3.3). `prepare` mints a fresh attempt for
  * (round, seat) (initial or fix, with the handover brief); `dispatch` starts it. The three review
  * kinds are separate steps so a brief check and a code review at one head never share a key.
+ * `reconcile` reconciles an attempt before a forced stop (K1-2b G4j); not one-way, so it may carry a retry.
  */
 export const LANE_RUN_KEY_STEPS = [
   'prepare', 'dispatch', 'stop', 'collect', 'gate', 'brief-check', 'code-review', 'pre-merge',
-  'accept', 'open-pr', 'push', 'merge', 'park',
+  'accept', 'open-pr', 'push', 'merge', 'park', 'reconcile',
 ] as const;
 export type LaneRunKeyStep = (typeof LANE_RUN_KEY_STEPS)[number];
 
@@ -42,6 +43,7 @@ export const LANE_RUN_KEY_HEAD_RULE = {
   prepare: 'absent', dispatch: 'absent', stop: 'absent', collect: 'absent',
   gate: 'required', 'brief-check': 'required', 'code-review': 'required', 'pre-merge': 'required',
   accept: 'required', 'open-pr': 'required', push: 'required', merge: 'required', park: 'absent',
+  reconcile: 'absent',
 } as const satisfies Record<LaneRunKeyStep, 'required' | 'absent'>;
 
 /** Whether a step key carries `/a<n>`. */
@@ -49,6 +51,7 @@ export const LANE_RUN_KEY_ATTEMPT_RULE = {
   prepare: 'required', dispatch: 'required', stop: 'absent', collect: 'absent',
   gate: 'absent', 'brief-check': 'absent', 'code-review': 'absent', 'pre-merge': 'absent',
   accept: 'absent', 'open-pr': 'absent', push: 'absent', merge: 'absent', park: 'absent',
+  reconcile: 'absent',
 } as const satisfies Record<LaneRunKeyStep, 'required' | 'absent'>;
 
 /** Why a StopAttempt for a run was refused (plan §3.8 "refused: its reason carrying the refusal's typed reason"). */

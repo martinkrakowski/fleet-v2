@@ -33,6 +33,7 @@ export const ORCHESTRATOR_SESSION_MAX_LEASE_SECONDS = 300; // a lease never reac
 export const ORCHESTRATOR_ATTENTIVE_WINDOW_SECONDS = 5 * 60; // §3.6 "attentive"
 export const ORCHESTRATOR_SESSION_MAX_PROJECTS = 64;
 const ID_MAX_BYTES = 256; // orchestratorId, host, model, each project id
+const MAX_VALID_DATE_MS = 8.64e15; // ECMAScript maximum valid date value
 
 const RECORD_KEYS = new Set<string>([
   'orchestratorId',
@@ -60,14 +61,42 @@ export class OrchestratorSession {
 
   /** The only way in; also used to read a stored record. Never throws. */
   static create(input: unknown): OrchestratorSessionResult {
+    try {
+      return OrchestratorSession.createUnchecked(input);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  /**
+   * Body of create. Hostile input (a throwing getter or proxy trap) may throw
+   * out of this body; the public wrapper turns that into the fixed failure
+   * result, never the exception's message. Only a plain object with exactly
+   * the allowed own enumerable string keys is accepted, and every field is
+   * read through its own property descriptor so no getter ever runs.
+   */
+  private static createUnchecked(input: unknown): OrchestratorSessionResult {
     if (typeof input !== 'object' || input === null || Array.isArray(input)) {
       return { success: false, error: new Error('OrchestratorSession requires a record') };
     }
-    const recordInput = input as Record<string, unknown>;
-    for (const key of Object.keys(recordInput)) {
-      if (!RECORD_KEYS.has(key)) {
+    const inputPrototype = Object.getPrototypeOf(input);
+    if (inputPrototype !== Object.prototype && inputPrototype !== null) {
+      return { success: false, error: new Error('OrchestratorSession requires a record') };
+    }
+    const ownKeys = Reflect.ownKeys(input);
+    if (ownKeys.length !== RECORD_KEYS.size) {
+      return { success: false, error: new Error('OrchestratorSession has an unknown key') };
+    }
+    const recordInput: Record<string, unknown> = {};
+    for (const key of ownKeys) {
+      if (typeof key !== 'string' || !RECORD_KEYS.has(key)) {
         return { success: false, error: new Error('OrchestratorSession has an unknown key') };
       }
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (descriptor === undefined || !descriptor.enumerable) {
+        return { success: false, error: new Error('OrchestratorSession has an unknown key') };
+      }
+      recordInput[key] = descriptor.value;
     }
 
     const orchestratorIdError = stringFieldError('orchestratorId', recordInput.orchestratorId, false);
@@ -217,6 +246,17 @@ export class OrchestratorSession {
     nowIso: string,
     leaseSeconds: number = ORCHESTRATOR_SESSION_LEASE_SECONDS,
   ): OrchestratorSessionResult {
+    try {
+      return this.renewLeaseUnchecked(nowIso, leaseSeconds);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  private renewLeaseUnchecked(
+    nowIso: string,
+    leaseSeconds: number = ORCHESTRATOR_SESSION_LEASE_SECONDS,
+  ): OrchestratorSessionResult {
     if (this.record.status === 'retired') {
       return { success: false, error: new Error('OrchestratorSession is retired and cannot renew its lease') };
     }
@@ -234,14 +274,26 @@ export class OrchestratorSession {
     if (nowMs < Date.parse(this.record.lastHeartbeatIso)) {
       return { success: false, error: new Error('OrchestratorSession heartbeat must not move backwards') };
     }
+    const leaseUntilMs = nowMs + leaseSeconds * 1000;
+    if (!Number.isFinite(leaseUntilMs) || leaseUntilMs > MAX_VALID_DATE_MS) {
+      return { success: false, error: new Error('lease end is out of range') };
+    }
     return OrchestratorSession.create({
       ...this.toRecord(),
       lastHeartbeatIso: new Date(nowMs).toISOString(),
-      leaseUntilIso: new Date(nowMs + leaseSeconds * 1000).toISOString(),
+      leaseUntilIso: new Date(leaseUntilMs).toISOString(),
     });
   }
 
   recordRequestsPoll(nowIso: string): OrchestratorSessionResult {
+    try {
+      return this.recordRequestsPollUnchecked(nowIso);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  private recordRequestsPollUnchecked(nowIso: string): OrchestratorSessionResult {
     if (this.record.status === 'retired') {
       return { success: false, error: new Error('OrchestratorSession is retired and cannot poll') };
     }
@@ -255,6 +307,14 @@ export class OrchestratorSession {
   }
 
   retire(nowIso: string): OrchestratorSessionResult {
+    try {
+      return this.retireUnchecked(nowIso);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  private retireUnchecked(nowIso: string): OrchestratorSessionResult {
     if (this.record.status === 'retired') {
       return { success: true, value: this };
     }
@@ -301,6 +361,14 @@ export function isOrchestratorAttentive(record: OrchestratorSessionRecord, nowIs
   }
   const sincePollMs = Date.parse(nowIso) - Date.parse(record.lastPolledRequestsAtIso);
   return sincePollMs >= 0 && sincePollMs <= ORCHESTRATOR_ATTENTIVE_WINDOW_SECONDS * 1000;
+}
+
+/**
+ * Fixed failure result for any unexpected exception while reading hostile
+ * input. The exception's own message is never echoed.
+ */
+function unreadableInputResult(): OrchestratorSessionResult {
+  return { success: false, error: new Error('OrchestratorSession input could not be read') };
 }
 
 function stringFieldError(field: string, value: unknown, nullOk: boolean): string | null {

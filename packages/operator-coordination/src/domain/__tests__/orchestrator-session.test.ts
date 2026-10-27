@@ -154,6 +154,82 @@ describe('OrchestratorSession.create', () => {
   });
 });
 
+describe('OrchestratorSession hostile and boundary input', () => {
+  it('returns a failure result when a field getter throws', () => {
+    const hostile: Record<string, unknown> = { ...VALID };
+    Object.defineProperty(hostile, 'host', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        throw new Error('host getter exploded');
+      },
+    });
+    expect(() => OrchestratorSession.create(hostile)).not.toThrow();
+    const result = OrchestratorSession.create(hostile);
+    expect(result.success).toBe(false);
+    if (result.success) {
+      return;
+    }
+    expect(result.error.message).not.toContain('exploded');
+  });
+
+  it('returns a failure result when a proxy ownKeys trap throws', () => {
+    const proxy = new Proxy({ ...VALID }, {
+      ownKeys() {
+        throw new Error('ownKeys trap exploded');
+      },
+    });
+    expect(() => OrchestratorSession.create(proxy)).not.toThrow();
+    const result = OrchestratorSession.create(proxy);
+    expect(result.success).toBe(false);
+    if (result.success) {
+      return;
+    }
+    expect(result.error.message).toBe('OrchestratorSession input could not be read');
+  });
+
+  it('refuses inherited fields', () => {
+    const inherited = Object.create(VALID);
+    expect(() => OrchestratorSession.create(inherited)).not.toThrow();
+    expect(OrchestratorSession.create(inherited).success).toBe(false);
+  });
+
+  it('refuses a missing key', () => {
+    const missing: Record<string, unknown> = { ...VALID };
+    delete missing.host;
+    expect(OrchestratorSession.create(missing).success).toBe(false);
+  });
+
+  it('refuses an extra symbol key', () => {
+    const withSymbol: Record<PropertyKey, unknown> = { ...VALID };
+    withSymbol[Symbol.for('orchestrator-session-extra-key')] = 'extra';
+    expect(() => OrchestratorSession.create(withSymbol)).not.toThrow();
+    expect(OrchestratorSession.create(withSymbol).success).toBe(false);
+  });
+
+  it('refuses a non-enumerable own key', () => {
+    const hidden: Record<string, unknown> = { ...VALID };
+    Object.defineProperty(hidden, 'host', { enumerable: false, value: 'example-host' });
+    expect(() => OrchestratorSession.create(hidden)).not.toThrow();
+    expect(OrchestratorSession.create(hidden).success).toBe(false);
+  });
+
+  it('refuses a lease end past the maximum date without throwing', () => {
+    const session = OrchestratorSession.create(VALID);
+    if (!session.success) {
+      throw new Error('VALID must construct');
+    }
+    const nearMaxIso = new Date(8.64e15 - 1).toISOString();
+    expect(() => session.value.renewLease(nearMaxIso)).not.toThrow();
+    const result = session.value.renewLease(nearMaxIso);
+    expect(result.success).toBe(false);
+    if (result.success) {
+      return;
+    }
+    expect(result.error.message).toBe('lease end is out of range');
+  });
+});
+
 describe('isOrchestratorAttached', () => {
   const session = OrchestratorSession.create(VALID);
   if (!session.success) {

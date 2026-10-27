@@ -7,6 +7,8 @@
 import type { WorkOrderStateValue } from './value-objects/WorkOrderState.vo.js';
 import type { AttemptStateValue } from './value-objects/AttemptState.vo.js';
 import type { AttemptOutcomeValue } from './value-objects/AttemptOutcome.vo.js';
+import type { StopReasonValue } from './value-objects/StopReason.vo.js';
+import type { SeatPlanProps, SeatPlanRole } from './value-objects/SeatPlan.vo.js';
 
 /**
  * Completion receipt bound to the attempt and the runner session. A runner
@@ -140,6 +142,21 @@ export interface AttemptUsageRecord {
   readonly reason: string | null;
 }
 
+/**
+ * The seat-plan entry an attempt was bound to (S1). `model`, `tool`,
+ * `variant` and `agent` copy the plan entry; what actually ran is
+ * `runner`, which an operator seat override may differ from.
+ */
+export interface AttemptSeatSelectionRecord {
+  readonly role: SeatPlanRole;
+  readonly seatIndex: number;
+  readonly seatId: string;
+  readonly model: string;
+  readonly tool: string | null;
+  readonly variant: string | null;
+  readonly agent: string | null;
+}
+
 /** Serializable record of one dispatch or one fresh fix session. */
 export interface AttemptRecord {
   readonly id: string;
@@ -169,6 +186,15 @@ export interface AttemptRecord {
    * 'unavailable'`.
    */
   readonly usage?: AttemptUsageRecord | null;
+  /**
+   * Why the attempt stopped (S1). Absent on records written before the
+   * field existed; `stopReasonOf` reads that as `unknown`.
+   */
+  readonly stopReason?: StopReasonValue;
+  /** The frozen seat plan of the attempt's lane (S1); absent means no plan (D1). */
+  readonly seatPlan?: SeatPlanProps | null;
+  /** The plan entry this attempt was bound to (S1); absent when there is no plan. */
+  readonly seatSelection?: AttemptSeatSelectionRecord | null;
   readonly reviewerSeat?: string | null;
   /**
    * Owner decision references the product froze into the brief package, read
@@ -227,6 +253,8 @@ export interface ActionJournalEntryRecord {
   readonly status: 'intent-recorded' | 'completed' | 'ambiguous' | 'refused';
   readonly sessionId: string | null;
   readonly detail: string | null;
+  /** The typed stop reason of a refused or ended action (S1); absent on other entries. */
+  readonly stopReason?: StopReasonValue;
   /**
    * Session ids seen running in the worktree when this entry was written;
    * evidence only, never proof of ownership.

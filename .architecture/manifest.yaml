@@ -340,7 +340,7 @@ bounded_contexts:
     layers:
       domain:
         entities: [WorkOrder, Attempt, ActionJournalEntry, CapacityReservation]
-        value_objects: [WorkOrderState, AttemptState, AttemptOutcome, ModelAssignment, BriefPackage, AcceptanceSpec, RunnerObservation, ExecutionLimits]
+        value_objects: [WorkOrderState, AttemptState, AttemptOutcome, ModelAssignment, BriefPackage, AcceptanceSpec, RunnerObservation, ExecutionLimits, StopReason, SeatPlan]
       application:
         use_cases:
           - RegisterWorkOrderUseCase
@@ -506,9 +506,11 @@ bounded_contexts:
         WorkOrderState: [approved, prepared, implementing, verifying, reviewing, fixing, ready-to-merge, merged, stopped]
         AttemptState: [intent-recorded, dispatching, running, reconciling, ended, collected, blocked, cancelled]
         AttemptOutcome: [done, partial, stopped, no-commit]
+        StopReason: [none, unknown, rate-limited, payment, timeout, model-missing, no-commit, gate-failed, length, step-cap, runner-refused]
       invariants:
         - "Every fresh dispatch and fix round has a new attempt identity, independent of branch, role and model identity."
         - "A brief binds attempt, base commit, approved policy revision, owned paths, model and variant, fallback, independent reviewer, positive limits and selected knowledge versions."
+        - "A seat plan holds ordered seats per role (first-pass, fix, review). Successive attempts in a role rotate through its eligible seats; an unhealthy seat, a model refused earlier in the lane, and a review seat in an implementer's model family are never selected."
         - "Record pre-dispatch commit tip and action intent before starting a worker. Local watcher exit and model final messages never establish authoritative completion."
         - "Unknown runner state retains the reservation and blocks duplicate dispatch; reconcile against the correct server/session."
         - "Collect lane notes only after lane end. Keep brief, notes and template paths ignored and check their exclusion from the index and commit range."

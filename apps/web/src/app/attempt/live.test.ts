@@ -154,6 +154,9 @@ function fakeClient(
     fetchCoordinationView: async () => {
       throw new Error("unused");
     },
+    fetchQuestionList: async () => {
+      throw new Error("unused");
+    },
     fetchAttentionView: async () => {
       throw new Error("unused");
     },

@@ -14,6 +14,7 @@ import { AttemptRepositoryAdapter } from './AttemptRepositoryAdapter.adapter.js'
 import { ExecutionJournalAdapter } from './ExecutionJournalAdapter.adapter.js';
 import { LaneRunRepositoryAdapter } from './LaneRunRepositoryAdapter.adapter.js';
 import { ConductorDriverLeaseAdapter } from './ConductorDriverLeaseAdapter.adapter.js';
+import { LaneRunJournalAdapter } from './LaneRunJournalAdapter.adapter.js';
 
 const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
   'work-orders.json': [
@@ -90,6 +91,38 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
       leaseUntilIso: '2026-10-27T10:02:00.000Z',
     },
   ],
+  'run-journal.json': [
+    {
+      version: 1,
+      entryId: '01JB0000000000000000000000',
+      kind: 'intent',
+      key: 'run-01JB0000000000000000000000/r0/dispatch/0/a1',
+      runId: 'run-01JB0000000000000000000000',
+      recordedAtIso: '2026-10-25T00:00:00.000Z',
+      mode: null,
+      expectedRevision: null,
+      mintedId: '01JB0000000000000000000001',
+      outcome: null,
+      reasonCode: null,
+      grantId: null,
+      state: null,
+    },
+    {
+      version: 1,
+      entryId: '01JB0000000000000000000002',
+      kind: 'result',
+      key: 'run-01JB0000000000000000000000/r0/dispatch/0/a1',
+      runId: 'run-01JB0000000000000000000000',
+      recordedAtIso: '2026-10-25T00:01:00.000Z',
+      mode: null,
+      expectedRevision: null,
+      mintedId: null,
+      outcome: 'completed',
+      reasonCode: null,
+      grantId: null,
+      state: null,
+    },
+  ],
 };
 
 const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
@@ -102,6 +135,8 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
     new ExecutionJournalAdapter({ stateDir }).listActiveReservations(),
   'lane-runs.json': (stateDir) => new LaneRunRepositoryAdapter({ stateDir }).list(),
   'conductor-driver-lease.json': (stateDir) => new ConductorDriverLeaseAdapter({ stateDir }).read(),
+  'run-journal.json': (stateDir) =>
+    new LaneRunJournalAdapter({ stateDir }).listForRun('run-01JB0000000000000000000000'),
 };
 
 type FixtureKind = 'valid' | 'not-json' | 'not-list' | 'bad-record';
@@ -175,6 +210,7 @@ describe('work-execution state file descriptors match the store readers', () => 
       'reservations.json',
       'lane-runs.json',
       'conductor-driver-lease.json',
+      'run-journal.json',
     ]);
   });
 });

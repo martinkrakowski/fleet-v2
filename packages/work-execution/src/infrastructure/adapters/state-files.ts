@@ -11,6 +11,7 @@ import {
 } from './ExecutionJournalAdapter.adapter.js';
 import { parseWorkOrderStateRecord } from './WorkOrderRepositoryAdapter.adapter.js';
 import { parseLaneRunStateRecord } from './LaneRunRepositoryAdapter.adapter.js';
+import { parseLaneRunJournalStateRecord } from './LaneRunJournalAdapter.adapter.js';
 
 export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('work-orders.json', parseWorkOrderStateRecord),
@@ -19,4 +20,5 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('reservations.json', parseReservationStateRecord),
   describeRecordListStore('lane-runs.json', parseLaneRunStateRecord),
   describeRecordListStore('conductor-driver-lease.json', parseConductorDriverLeaseStateRecord),
+  describeRecordListStore('run-journal.json', parseLaneRunJournalStateRecord),
 ];

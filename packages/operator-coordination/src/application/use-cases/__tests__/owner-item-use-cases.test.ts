@@ -13,6 +13,7 @@ import type { OwnerItemRecord } from '../../../domain/owner-item-records.js';
 import type {
   OwnerItemClock,
   OwnerItemIdSource,
+  RecordOwnerItemResult,
 } from '../../ports/in/RecordOwnerItemPort.in-port.js';
 import type { ListOwnerItemsRequest } from '../../ports/in/ListOwnerItemsPort.in-port.js';
 import type {
@@ -74,6 +75,16 @@ const DECISION_BODY = {
   blocks: [],
 };
 
+/** Narrow a result to the refused member; throws when it is not one. */
+function refusal(
+  result: RecordOwnerItemResult,
+): Extract<RecordOwnerItemResult, { outcome: 'refused' }> {
+  if (result.outcome !== 'refused') {
+    throw new Error('expected a refusal');
+  }
+  return result;
+}
+
 describe('RecordOwnerItemUseCase', () => {
   it('records an open merge item from a closed body', async () => {
     const repo = new OwnerItemRepositoryAdapter();
@@ -118,8 +129,7 @@ describe('RecordOwnerItemUseCase', () => {
       bodies.map((body) => uc.recordOwnerItem(body, 'orch-example-1')),
     );
     for (const result of results) {
-      expect(result.outcome).toBe('refused');
-      expect(result.code).toBe('request');
+      expect(refusal(result).code).toBe('request');
     }
     expect(i.calls).toBe(0);
 
@@ -131,9 +141,8 @@ describe('RecordOwnerItemUseCase', () => {
         },
       },
     );
-    const proxyResult = await uc.recordOwnerItem(throwingProxy, 'orch-example-1');
-    expect(proxyResult.outcome).toBe('refused');
-    expect(proxyResult.code).toBe('request');
+    const proxyRefused = refusal(await uc.recordOwnerItem(throwingProxy, 'orch-example-1'));
+    expect(proxyRefused.code).toBe('request');
     expect(i.calls).toBe(0);
 
     expect(await repo.list()).toEqual([]);
@@ -143,15 +152,13 @@ describe('RecordOwnerItemUseCase', () => {
     const repo = new OwnerItemRepositoryAdapter();
     const uc = new RecordOwnerItemUseCase({ itemRepo: repo, clock: clock(), ids: ids() });
 
-    const numberActor = await uc.recordOwnerItem(MERGE_BODY, 42 as unknown as string);
-    expect(numberActor.outcome).toBe('refused');
-    expect(numberActor.code).toBe('request');
-    expect(numberActor.reason).toBe('RecordOwnerItem the actor could not be identified');
-    expect(numberActor.reason).not.toContain('42');
+    const numberRefused = refusal(await uc.recordOwnerItem(MERGE_BODY, 42 as unknown as string));
+    expect(numberRefused.code).toBe('request');
+    expect(numberRefused.reason).toBe('RecordOwnerItem the actor could not be identified');
+    expect(numberRefused.reason).not.toContain('42');
 
-    const emptyActor = await uc.recordOwnerItem(MERGE_BODY, '');
-    expect(emptyActor.outcome).toBe('refused');
-    expect(emptyActor.code).toBe('invalid');
+    const emptyRefused = refusal(await uc.recordOwnerItem(MERGE_BODY, ''));
+    expect(emptyRefused.code).toBe('invalid');
 
     expect(await repo.list()).toEqual([]);
   });
@@ -160,9 +167,8 @@ describe('RecordOwnerItemUseCase', () => {
     const repo = new OwnerItemRepositoryAdapter();
     const uc = new RecordOwnerItemUseCase({ itemRepo: repo, clock: clock('not-a-time'), ids: ids() });
 
-    const result = await uc.recordOwnerItem(MERGE_BODY, 'orch-example-1');
-    expect(result.outcome).toBe('refused');
-    expect(result.code).toBe('clock');
+    const refused = refusal(await uc.recordOwnerItem(MERGE_BODY, 'orch-example-1'));
+    expect(refused.code).toBe('clock');
 
     expect(await repo.list()).toEqual([]);
   });
@@ -171,23 +177,17 @@ describe('RecordOwnerItemUseCase', () => {
     const repo = new OwnerItemRepositoryAdapter();
     const uc = new RecordOwnerItemUseCase({ itemRepo: repo, clock: clock(), ids: ids() });
 
-    const noSubject = await uc.recordOwnerItem(
-      { ...MERGE_BODY, kind: 'other', subject: null },
-      'orch-example-1',
+    const noSubject = refusal(
+      await uc.recordOwnerItem({ ...MERGE_BODY, kind: 'other', subject: null }, 'orch-example-1'),
     );
-    expect(noSubject.outcome).toBe('refused');
     expect(noSubject.code).toBe('invalid');
 
     const fake = fakeSecretShape();
-    const secretShaped = await uc.recordOwnerItem(
-      { ...MERGE_BODY, subject: fake },
-      'orch-example-1',
+    const secretShaped = refusal(
+      await uc.recordOwnerItem({ ...MERGE_BODY, subject: fake }, 'orch-example-1'),
     );
-    expect(secretShaped.outcome).toBe('refused');
     expect(secretShaped.code).toBe('invalid');
-    if (secretShaped.outcome === 'refused') {
-      expect(secretShaped.reason).not.toContain(fake);
-    }
+    expect(secretShaped.reason).not.toContain(fake);
 
     expect(await repo.list()).toEqual([]);
   });
@@ -343,8 +343,7 @@ describe('RecordOwnerItemUseCase', () => {
       },
       'orch-example-1',
     );
-    expect(second.outcome).toBe('refused');
-    expect(second.code).toBe('id-taken');
+    expect(refusal(second).code).toBe('id-taken');
   });
 
   it('throws Not implemented when unconfigured', async () => {

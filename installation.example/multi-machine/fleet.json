@@ -93,7 +93,9 @@
   "verification": {
     "procedures": {
       "example-gate": { "command": "fleet-verify-example", "args": ["--gate"] },
-      "example-review": { "command": "fleet-verify-example", "args": ["--review"] }
+      "example-review": { "command": "fleet-verify-example", "args": ["--review"] },
+      "hexagen-arch": { "command": "yarn", "args": ["exec", "hexagen", "arch", "validate"] },
+      "hexagen-sync-check": { "command": "yarn", "args": ["exec", "hexagen", "sync", "--check"] }
     }
   },
   "waves": {

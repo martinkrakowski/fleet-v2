@@ -47,7 +47,7 @@ export const LANE_PLAN_LIMITS = Object.freeze({
 /** A lane anywhere: every `after` form resolves to this full reference. */
 export type PlannedLaneRef = PlanRef;
 
-export interface PullRequestRef {
+export interface PlanPullRequestRef {
   readonly repository: string;
   readonly number: number;
 }
@@ -63,7 +63,7 @@ export interface PlannedLaneSidecar {
   readonly decisions: readonly string[];
   readonly status: PlannedLaneStatus;
   readonly brief: string | null;
-  readonly mergedPr: PullRequestRef | null;
+  readonly mergedPr: PlanPullRequestRef | null;
 }
 
 export interface PlanDecisionSidecar {

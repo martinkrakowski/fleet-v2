@@ -1127,7 +1127,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // The reviewed GitHub CLI subprocess behind a host-side delegate; every
   // invocation first verifies the live HEAD of the attempt's own worktree so
   // a moved branch head is never pushed or merged on stale readiness.
-  const forgeAction = new ForgeActionAdapter({
+  const forgeAction = new ForgeActionAdapter(
+    {
     runGh: (args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates),
     verifyCurrentHeadSha: async (branchName, request) => {
       const attempt = await attemptRepository.findAttemptById(request.attemptId);
@@ -1220,7 +1221,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       }
       return head;
     },
-  });
+    },
+    forgeRead,
+  );
 
   // Live registry of acceptance receipts per candidate head: the acceptance
   // delegate records entries and the merge gate consumes them, so a merge is

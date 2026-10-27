@@ -11,6 +11,7 @@
 
 import { describe, expect, it } from 'vitest';
 
+import type { GhInvocationResult } from '../ForgeActionAdapter.adapter.js';
 import { classifyGhRefusal } from '../ForgeActionAdapter.adapter.js';
 import {
   ForgeReadAdapter,
@@ -219,7 +220,7 @@ describe('ForgeReadAdapter.readPullRequest', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('is unavailable when gh rejects, never guessing an outcome', async () => {
+  it('is unavailable with a fixed reason when gh rejects, never echoing the error', async () => {
     const rejecting = async () => {
       throw new Error('gh not found in fixed locations');
     };
@@ -229,11 +230,12 @@ describe('ForgeReadAdapter.readPullRequest', () => {
 
     expect(result).toEqual({
       outcome: 'unavailable',
-      reason: 'gh pr view could not complete: gh not found in fixed locations',
+      reason: 'gh pr view could not complete',
     });
+    expect(result.outcome === 'unavailable' && result.reason).not.toContain('https');
   });
 
-  it('is unavailable with the failing first stderr line for a non-not-found non-zero exit', async () => {
+  it('is unavailable with a fixed reason for a non-not-found non-zero exit, never echoing stderr', async () => {
     const failed = makeRunGh({ exitCode: 1, stdout: '', stderr: HTTP_401_STDERR });
 
     const result = await makeAdapter({ runGh: failed.runGh }).readPullRequest({
@@ -242,8 +244,9 @@ describe('ForgeReadAdapter.readPullRequest', () => {
 
     expect(result).toEqual({
       outcome: 'unavailable',
-      reason: `gh pr view failed (exit 1): ${HTTP_401_STDERR}`,
+      reason: 'gh pr view failed (exit 1)',
     });
+    expect(result.outcome === 'unavailable' && result.reason).not.toContain('https');
   });
 
   it.each([
@@ -308,6 +311,31 @@ describe('ForgeReadAdapter.readPullRequest', () => {
     expect(result).toEqual({
       outcome: 'unavailable',
       reason: 'gh pr view answered for a different pull request',
+    });
+  });
+
+  it('is unavailable with a fixed reason when the read outlives the deadline', async () => {
+    const never = () => new Promise<GhInvocationResult>(() => undefined);
+    const adapter = makeAdapter({ runGh: never, timeoutMs: 20 });
+
+    const result = await adapter.readPullRequest({ ref: { kind: 'number', number: 202 } });
+
+    expect(result).toEqual({
+      outcome: 'unavailable',
+      reason: 'gh pr view timed out',
+    });
+  });
+
+  it('is unavailable without parsing when the stdout exceeds one mebibyte', async () => {
+    const oversized = 'x'.repeat(1_048_577);
+    const { runGh } = makeRunGh({ exitCode: 0, stdout: oversized, stderr: '' });
+    const adapter = makeAdapter({ runGh });
+
+    const result = await adapter.readPullRequest({ ref: { kind: 'number', number: 202 } });
+
+    expect(result).toEqual({
+      outcome: 'unavailable',
+      reason: 'gh pr view output too large',
     });
   });
 

@@ -8,7 +8,11 @@
  * --match-head-commit, and an unknown or unverifiable outcome is reported
  * as ambiguous for reconciliation rather than guessed. Every refusal names
  * a kind derived from the failed run's whole output; an unrecognised one
- * is `other`.
+ * is `other`. A13: because `gh pr merge` can exit non-zero after the merge
+ * landed (for example a failing `--delete-branch` follow-up), every merge
+ * refusal is confirmed by a read of the pull request state; merged at the
+ * expected head is executed, open or closed is refused, and a read that
+ * cannot answer is ambiguous rather than a guess.
  */
 
 import type {
@@ -16,6 +20,10 @@ import type {
   ForgeActionRequest,
   ForgeActionResult,
 } from '../../application/ports/out/ForgeActionPort.out-port.js';
+import type {
+  ForgeReadPort,
+  ReadPullRequestResult,
+} from '../../application/ports/out/ForgeReadPort.out-port.js';
 import type { ForgeRefusalKind } from '../../domain/coordination-keys.js';
 
 /** Result of one reviewed gh invocation. */
@@ -111,9 +119,11 @@ export function isSafeBranchName(value: string): boolean {
 
 export class ForgeActionAdapter implements ForgeActionPort {
   private readonly delegate?: ForgeActionDelegate;
+  private readonly forgeRead?: ForgeReadPort;
 
-  constructor(delegate?: ForgeActionDelegate) {
+  constructor(delegate?: ForgeActionDelegate, forgeRead?: ForgeReadPort) {
     this.delegate = delegate;
+    this.forgeRead = forgeRead;
   }
 
   isConfigured(): boolean {
@@ -241,15 +251,59 @@ export class ForgeActionAdapter implements ForgeActionPort {
       };
     }
     if (gh.exitCode !== 0) {
-      return {
-        outcome: 'refused',
-        reason: `gh pr merge failed (exit ${gh.exitCode}): ${firstLine(gh.stderr) || firstLine(gh.stdout)}`,
-        refusalKind: classifyGhRefusal(gh.stderr, gh.stdout),
-      };
+      const refusalKind = classifyGhRefusal(gh.stderr, gh.stdout);
+      return this.confirmMergeAfterRefusal(request, refusalKind);
     }
     return {
       outcome: 'executed',
       headSha: request.expectedHeadSha,
+    };
+  }
+
+  /**
+   * A13: a non-zero `gh pr merge` exit does not prove the merge failed, so
+   * the pull request state is read before any refusal is reported.
+   */
+  private async confirmMergeAfterRefusal(
+    request: ForgeActionRequest,
+    refusalKind: ForgeRefusalKind,
+  ): Promise<ForgeActionResult> {
+    const reader = this.forgeRead;
+    if (reader === undefined || !reader.isConfigured()) {
+      return {
+        outcome: 'ambiguous',
+        reason: 'gh pr merge exited non-zero and the pull request state could not be read',
+      };
+    }
+    let read: ReadPullRequestResult;
+    try {
+      read = await reader.readPullRequest({ ref: { kind: 'branch', branchName: request.branchName } });
+    } catch {
+      return {
+        outcome: 'ambiguous',
+        reason: 'gh pr merge exited non-zero and the pull request state could not be read',
+      };
+    }
+    if (read.outcome === 'not-found' || read.outcome === 'unavailable') {
+      return {
+        outcome: 'ambiguous',
+        reason: 'gh pr merge exited non-zero and the pull request state could not be read',
+      };
+    }
+    const snapshot = read.pullRequest;
+    if (snapshot.state === 'merged') {
+      if (snapshot.headSha.startsWith(request.expectedHeadSha)) {
+        return { outcome: 'executed', headSha: request.expectedHeadSha };
+      }
+      return {
+        outcome: 'ambiguous',
+        reason: 'the pull request merged at a different head',
+      };
+    }
+    return {
+      outcome: 'refused',
+      reason: 'gh pr merge exited non-zero; the pull request is not merged',
+      refusalKind,
     };
   }
 }

@@ -1595,7 +1595,7 @@ describe('ForgeActionAdapter', () => {
     ]);
   });
 
-  it('refuses a failed merge with the command error', async () => {
+  it('reports a failed merge as ambiguous when no read port is configured', async () => {
     const { runGh } = makeRunGh({ exitCode: 1, stdout: '', stderr: 'pull request not mergeable\n' });
     const adapter = new ForgeActionAdapter({
       runGh,
@@ -1605,9 +1605,8 @@ describe('ForgeActionAdapter', () => {
     const result = await adapter.performForgeAction(forgeActionRequest({ kind: 'merge-pr' }));
 
     expect(result).toEqual({
-      outcome: 'refused',
-      reason: 'gh pr merge failed (exit 1): pull request not mergeable',
-      refusalKind: 'other',
+      outcome: 'ambiguous',
+      reason: 'gh pr merge exited non-zero and the pull request state could not be read',
     });
   });
 

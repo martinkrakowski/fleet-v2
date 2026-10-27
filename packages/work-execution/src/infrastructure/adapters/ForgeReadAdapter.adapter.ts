@@ -9,8 +9,8 @@
  */
 
 import type {
-  ForgePullRequestRef,
   ForgeReadPort,
+  PullRequestRef,
   PullRequestSnapshot,
   ReadPullRequestRequest,
   ReadPullRequestResult,
@@ -22,6 +22,8 @@ export interface ForgeReadAdapterOptions {
   readonly owner?: string;
   readonly repo?: string;
   readonly runGh?: (args: readonly string[]) => Promise<GhInvocationResult>;
+  /** Test hook: overrides the read deadline (READ_TIMEOUT_MS). */
+  readonly timeoutMs?: number;
 }
 
 /** Always ask for state and head: `--json number` alone is answered without the forge. */
@@ -32,6 +34,14 @@ const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+$/;
 const HEX_40 = /^[0-9a-f]{40}$/;
 const ALL_DIGITS = /^\d+$/;
 
+/** Deadline for one `gh pr view`; a read that outlives it is unavailable. */
+const READ_TIMEOUT_MS = 30_000;
+/** Stdout above one mebibyte is not parsed; it is unavailable. */
+const READ_MAX_STDOUT_BYTES = 1_048_576;
+
+/** Marker error for the losing read deadline inside the race. */
+const READ_TIMED_OUT = 'gh pr view timed out';
+
 const UNAVAILABLE_UNREADABLE: ReadPullRequestResult = {
   outcome: 'unavailable',
   reason: 'gh pr view returned an unreadable pull request',
@@ -41,14 +51,6 @@ const UNAVAILABLE_DIFFERENT: ReadPullRequestResult = {
   outcome: 'unavailable',
   reason: 'gh pr view answered for a different pull request',
 };
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function firstLine(text: string): string {
-  return text.trim().split('\n')[0] ?? '';
-}
 
 function isValidRepository(repository: { readonly owner?: unknown; readonly repo?: unknown }): boolean {
   return (
@@ -95,7 +97,7 @@ function parseMergeCommit(value: unknown): string | null | undefined {
 }
 
 /** Pure parse of one `gh pr view --json PULL_REQUEST_VIEW_FIELDS` stdout, checked against the ref. */
-export function parsePullRequestView(stdout: string, ref: ForgePullRequestRef): ReadPullRequestResult {
+export function parsePullRequestView(stdout: string, ref: PullRequestRef): ReadPullRequestResult {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
@@ -152,11 +154,13 @@ export class ForgeReadAdapter implements ForgeReadPort {
   private readonly owner?: string;
   private readonly repo?: string;
   private readonly runGh?: (args: readonly string[]) => Promise<GhInvocationResult>;
+  private readonly timeoutMs: number;
 
   constructor(options: ForgeReadAdapterOptions = {}) {
     this.owner = options.owner;
     this.repo = options.repo;
     this.runGh = options.runGh;
+    this.timeoutMs = options.timeoutMs ?? READ_TIMEOUT_MS;
   }
 
   isConfigured(): boolean {
@@ -197,16 +201,35 @@ export class ForgeReadAdapter implements ForgeReadPort {
       PULL_REQUEST_VIEW_FIELDS,
     ];
     let gh: GhInvocationResult;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      gh = await runGh(args);
+      gh = await Promise.race([
+        runGh(args),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(READ_TIMED_OUT)), this.timeoutMs);
+        }),
+      ]);
     } catch (error) {
+      if (error instanceof Error && error.message === READ_TIMED_OUT) {
+        return { outcome: 'unavailable', reason: 'gh pr view timed out' };
+      }
       return {
         outcome: 'unavailable',
-        reason: `gh pr view could not complete: ${errorMessage(error)}`,
+        reason: 'gh pr view could not complete',
       };
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
     }
     if (gh.exitCode !== 0) {
       return this.unavailableExit(gh);
+    }
+    if (Buffer.byteLength(gh.stdout, 'utf8') > READ_MAX_STDOUT_BYTES) {
+      return {
+        outcome: 'unavailable',
+        reason: 'gh pr view output too large',
+      };
     }
     return parsePullRequestView(gh.stdout, ref);
   }
@@ -221,7 +244,7 @@ export class ForgeReadAdapter implements ForgeReadPort {
     }
     return {
       outcome: 'unavailable',
-      reason: `gh pr view failed (exit ${gh.exitCode}): ${firstLine(gh.stderr) || firstLine(gh.stdout)}`,
+      reason: `gh pr view failed (exit ${gh.exitCode})`,
     };
   }
 }

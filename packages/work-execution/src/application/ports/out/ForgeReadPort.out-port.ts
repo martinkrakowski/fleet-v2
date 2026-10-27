@@ -7,7 +7,7 @@
  */
 
 /** One pull request, by number or by its head branch. */
-export type ForgePullRequestRef =
+export type PullRequestRef =
   | { readonly kind: 'number'; readonly number: number }
   | { readonly kind: 'branch'; readonly branchName: string };
 
@@ -18,7 +18,7 @@ export interface ForgeRepositoryRef {
 }
 
 export interface ReadPullRequestRequest {
-  readonly ref: ForgePullRequestRef;
+  readonly ref: PullRequestRef;
   readonly repository?: ForgeRepositoryRef;
 }
 

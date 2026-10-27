@@ -398,6 +398,29 @@ describe('OrchestratorRequest', () => {
     }
   });
 
+  it('create stores the target id it validated, never a proxy get-trap value', () => {
+    // The descriptor shows the valid id; only a plain property read would see
+    // the get-trap value, and the stored record must come from the descriptor
+    // snapshot alone.
+    const secret = fakeSecretShape();
+    const targetProxy = new Proxy({ attemptId: 'attempt-example-1' }, {
+      get(_target, key) {
+        if (key === 'attemptId') {
+          return secret;
+        }
+        return undefined;
+      },
+    });
+    const result = OrchestratorRequest.create(validWith({ target: targetProxy }));
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      return;
+    }
+    const record = result.value.toRecord();
+    expect((record.target as { attemptId: string }).attemptId).toBe('attempt-example-1');
+    expect(JSON.stringify(record)).not.toContain(secret);
+  });
+
   const OPEN_PAYLOAD = {
     requestId: ID,
     kind: 'dispatch-attempt',
@@ -461,7 +484,29 @@ describe('OrchestratorRequest', () => {
   });
 
   it('open never throws on hostile payloads', () => {
-    const payloads: unknown[] = [undefined, 42, 'text', Object.create(null), { ...OPEN_PAYLOAD, target: [] }];
+    // A throwing enumerable getter: the payload is read through descriptors,
+    // so the getter never runs and validation fails on the undefined value.
+    const throwingGetterPayload = { ...OPEN_PAYLOAD };
+    Object.defineProperty(throwingGetterPayload, 'projectId', {
+      get() {
+        throw new Error('boom');
+      },
+      enumerable: true,
+    });
+    const throwingOwnKeysPayload = new Proxy({ ...OPEN_PAYLOAD }, {
+      ownKeys() {
+        throw new Error('boom');
+      },
+    });
+    const payloads: unknown[] = [
+      undefined,
+      42,
+      'text',
+      Object.create(null),
+      { ...OPEN_PAYLOAD, target: [] },
+      throwingGetterPayload,
+      throwingOwnKeysPayload,
+    ];
     for (const payload of payloads) {
       const result = OrchestratorRequest.open(payload, REQUESTED_BY, NOW);
       expect(result.success).toBe(false);

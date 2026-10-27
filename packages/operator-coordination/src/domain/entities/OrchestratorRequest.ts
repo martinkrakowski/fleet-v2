@@ -26,7 +26,6 @@ import {
   ORCHESTRATOR_REQUEST_TERMINAL_STATES,
 } from '../orchestrator-request-records.js';
 import type {
-  OrchestratorRequestClaimRecord,
   OrchestratorRequestLinkRecord,
   OrchestratorRequestReasonKind,
   OrchestratorRequestRecord,
@@ -91,7 +90,11 @@ export class OrchestratorRequest {
    * out of this body; the public wrapper turns that into the fixed failure
    * result, never the exception's message. Only a plain object with exactly
    * the allowed own enumerable string keys is accepted, and every field is
-   * read through its own property descriptor so no getter ever runs.
+   * read through its own property descriptor so no getter ever runs. Each
+   * nested object is then snapshotted once the same way, and the stored
+   * record is built only from those snapshots — the original nested objects
+   * are never read again, so a proxy cannot show validation one value and
+   * store another.
    */
   private static createUnchecked(input: unknown): OrchestratorRequestResult {
     if (typeof input !== 'object' || input === null || Array.isArray(input)) {
@@ -124,12 +127,20 @@ export class OrchestratorRequest {
       return invalid(projectIdError);
     }
 
-    const targetError = targetErrorValue(kind, recordInput.target);
+    const target = readPlainObject(recordInput.target, [ORCHESTRATOR_REQUEST_TARGET_KEY[kind]]);
+    if (target === null) {
+      return invalid('OrchestratorRequest target must hold exactly the one id its kind names');
+    }
+    const targetError = targetSnapshotError(kind, target);
     if (targetError !== null) {
       return invalid(targetError);
     }
 
-    const requestedByError = requestedByErrorValue(recordInput.requestedBy);
+    const requestedBy = readPlainObject(recordInput.requestedBy, ['via', 'sessionId']);
+    if (requestedBy === null) {
+      return invalid('OrchestratorRequest requestedBy must be { via: web, sessionId }');
+    }
+    const requestedByError = requestedBySnapshotError(requestedBy);
     if (requestedByError !== null) {
       return invalid(requestedByError);
     }
@@ -166,46 +177,62 @@ export class OrchestratorRequest {
       return invalid(fenceError);
     }
 
-    const claimError = claimErrorValue(recordInput.claim);
-    if (claimError !== null) {
-      return invalid(claimError);
-    }
-    const reasonError = reasonErrorValue(recordInput.reason);
-    if (reasonError !== null) {
-      return invalid(reasonError);
-    }
-    const linkedError = linkedErrorValue(kind, recordInput.requestId as string, recordInput.linked);
-    if (linkedError !== null) {
-      return invalid(linkedError);
+    let claim: Record<string, unknown> | null = null;
+    if (recordInput.claim !== null) {
+      const claimSnapshot = readPlainObject(recordInput.claim, ['orchestratorId', 'fence', 'leaseUntilIso']);
+      if (claimSnapshot === null) {
+        return invalid('OrchestratorRequest claim must be null or { orchestratorId, fence, leaseUntilIso }');
+      }
+      const claimError = claimSnapshotError(claimSnapshot);
+      if (claimError !== null) {
+        return invalid(claimError);
+      }
+      claim = claimSnapshot;
     }
 
-    const shapeError = stateShapeError(recordInput);
+    let reason: Record<string, unknown> | null = null;
+    if (recordInput.reason !== null) {
+      const reasonSnapshot = readPlainObject(recordInput.reason, ['reasonKind', 'detail']);
+      if (reasonSnapshot === null) {
+        return invalid('OrchestratorRequest reason must be null or { reasonKind, detail }');
+      }
+      const reasonError = reasonSnapshotError(reasonSnapshot);
+      if (reasonError !== null) {
+        return invalid(reasonError);
+      }
+      reason = reasonSnapshot;
+    }
+
+    let linked: Record<string, unknown> | null = null;
+    if (recordInput.linked !== null) {
+      const linkKey = ORCHESTRATOR_REQUEST_LINK_KEY[kind];
+      const linkedSnapshot = readPlainObject(recordInput.linked, [linkKey, 'journalKey']);
+      if (linkedSnapshot === null) {
+        return invalid(
+          `OrchestratorRequest linked must be null or { ${linkKey}, journalKey: request/${recordInput.requestId as string} }`,
+        );
+      }
+      const linkedError = linkedSnapshotError(kind, recordInput.requestId as string, linkedSnapshot);
+      if (linkedError !== null) {
+        return invalid(linkedError);
+      }
+      linked = linkedSnapshot;
+    }
+
+    const shapeError = stateShapeError(recordInput, claim, reason, linked);
     if (shapeError !== null) {
       return invalid(shapeError);
     }
 
-    const targetRaw = recordInput.target as Record<string, unknown>;
-    const requestedByRaw = recordInput.requestedBy as Record<string, unknown>;
-    const claimRaw = recordInput.claim as Record<string, unknown> | null;
-    const reasonRaw = recordInput.reason as Record<string, unknown> | null;
-    const linkedRaw = recordInput.linked as Record<string, unknown> | null;
-
-    const reason =
-      reasonRaw === null
-        ? null
-        : Object.freeze({
-            reasonKind: reasonRaw.reasonKind as OrchestratorRequestReasonKind,
-            detail: reasonRaw.detail as string | null,
-          });
     const record: OrchestratorRequestRecord = {
       requestId: recordInput.requestId as string,
       revision: recordInput.revision as number,
       kind,
       projectId: recordInput.projectId as string,
-      target: buildTargetRecord(kind, targetRaw),
+      target: buildTargetRecord(kind, target),
       requestedBy: Object.freeze({
-        via: requestedByRaw.via as OrchestratorRequestVia,
-        sessionId: requestedByRaw.sessionId as string,
+        via: requestedBy.via as OrchestratorRequestVia,
+        sessionId: requestedBy.sessionId as string,
       }),
       createdAtIso: new Date(recordInput.createdAtIso as string).toISOString(),
       expiresAtIso: new Date(recordInput.expiresAtIso as string).toISOString(),
@@ -214,19 +241,25 @@ export class OrchestratorRequest {
       fence: recordInput.fence as number,
       claimCount: recordInput.claimCount as number,
       claim:
-        claimRaw === null
+        claim === null
           ? null
           : Object.freeze({
-              orchestratorId: claimRaw.orchestratorId as string,
-              fence: claimRaw.fence as number,
-              leaseUntilIso: new Date(claimRaw.leaseUntilIso as string).toISOString(),
+              orchestratorId: claim.orchestratorId as string,
+              fence: claim.fence as number,
+              leaseUntilIso: new Date(claim.leaseUntilIso as string).toISOString(),
             }),
       deferredUntilIso:
         recordInput.deferredUntilIso === null
           ? null
           : new Date(recordInput.deferredUntilIso as string).toISOString(),
-      reason,
-      linked: linkedRaw === null ? null : buildLinkedRecord(kind, linkedRaw),
+      reason:
+        reason === null
+          ? null
+          : Object.freeze({
+              reasonKind: reason.reasonKind as OrchestratorRequestReasonKind,
+              detail: reason.detail as string | null,
+            }),
+      linked: linked === null ? null : buildLinkedRecord(kind, linked),
     };
     return { success: true, value: new OrchestratorRequest(Object.freeze(record)) };
   }
@@ -261,10 +294,12 @@ export class OrchestratorRequest {
     if (payloadObj === null) {
       return invalid('OrchestratorRequest payload has an unknown key');
     }
+    const target = snapshotOpenTarget(payloadObj);
     const now = new Date(nowIso).toISOString();
     const expiresAtIso = new Date(Date.parse(now) + ttlSeconds * 1000).toISOString();
     return OrchestratorRequest.create({
       ...payloadObj,
+      target,
       revision: 1,
       requestedBy,
       createdAtIso: now,
@@ -371,6 +406,20 @@ function readPlainObject(value: unknown, keys: readonly string[]): Record<string
   return out;
 }
 
+/**
+ * The `target` `open` hands to `create`: the payload's target, snapshotted
+ * once the way `readPlainObject` does so the original object is never read
+ * again. An unknown kind has no single id key to snapshot with; its target
+ * travels on untouched and `create` refuses the kind without ever reading it.
+ */
+function snapshotOpenTarget(payloadSnapshot: Record<string, unknown>): unknown {
+  const kind = payloadSnapshot.kind as OrchestratorRequestKind;
+  if (!ORCHESTRATOR_REQUEST_KINDS.includes(kind)) {
+    return payloadSnapshot.target;
+  }
+  return readPlainObject(payloadSnapshot.target, [ORCHESTRATOR_REQUEST_TARGET_KEY[kind]]);
+}
+
 function idFieldError(field: string, value: unknown): string | null {
   if (
     typeof value !== 'string' ||
@@ -397,12 +446,9 @@ function timestampFieldError(field: string, value: unknown, nullOk: boolean): st
   return null;
 }
 
-function targetErrorValue(kind: OrchestratorRequestKind, value: unknown): string | null {
-  const target = readPlainObject(value, [ORCHESTRATOR_REQUEST_TARGET_KEY[kind]]);
-  if (target === null) {
-    return 'OrchestratorRequest target must hold exactly the one id its kind names';
-  }
-  const id = target[ORCHESTRATOR_REQUEST_TARGET_KEY[kind]];
+/** The one target id, checked against its snapshot — never the original object. */
+function targetSnapshotError(kind: OrchestratorRequestKind, snapshot: Record<string, unknown>): string | null {
+  const id = snapshot[ORCHESTRATOR_REQUEST_TARGET_KEY[kind]];
   if (typeof id !== 'string' || id.trim().length === 0 || new TextEncoder().encode(id).byteLength > ID_MAX_BYTES) {
     return 'OrchestratorRequest target must hold exactly the one id its kind names';
   }
@@ -412,15 +458,12 @@ function targetErrorValue(kind: OrchestratorRequestKind, value: unknown): string
   return null;
 }
 
-function requestedByErrorValue(value: unknown): string | null {
-  const requestedBy = readPlainObject(value, ['via', 'sessionId']);
-  if (requestedBy === null) {
+/** The requesting web session, checked against its snapshot — never the original. */
+function requestedBySnapshotError(snapshot: Record<string, unknown>): string | null {
+  if (snapshot.via !== 'web') {
     return 'OrchestratorRequest requestedBy must be { via: web, sessionId }';
   }
-  if (requestedBy.via !== 'web') {
-    return 'OrchestratorRequest requestedBy must be { via: web, sessionId }';
-  }
-  const sessionId = requestedBy.sessionId;
+  const sessionId = snapshot.sessionId;
   if (
     typeof sessionId !== 'string' ||
     sessionId.trim().length === 0 ||
@@ -461,15 +504,9 @@ function fenceAndClaimCountError(input: Record<string, unknown>): string | null 
   return null;
 }
 
-function claimErrorValue(value: unknown): string | null {
-  if (value === null) {
-    return null;
-  }
-  const claim = readPlainObject(value, ['orchestratorId', 'fence', 'leaseUntilIso']);
-  if (claim === null) {
-    return 'OrchestratorRequest claim must be null or { orchestratorId, fence, leaseUntilIso }';
-  }
-  const orchestratorId = claim.orchestratorId;
+/** The claim lease, checked against its snapshot — never the original object. */
+function claimSnapshotError(snapshot: Record<string, unknown>): string | null {
+  const orchestratorId = snapshot.orchestratorId;
   if (
     typeof orchestratorId !== 'string' ||
     orchestratorId.trim().length === 0 ||
@@ -480,69 +517,64 @@ function claimErrorValue(value: unknown): string | null {
   if (containsSecretShape(orchestratorId)) {
     return 'OrchestratorRequest claim contains a secret-shaped value and was refused';
   }
-  if (!Number.isSafeInteger(claim.fence) || (claim.fence as number) < 1) {
+  if (!Number.isSafeInteger(snapshot.fence) || (snapshot.fence as number) < 1) {
     return 'OrchestratorRequest claim must be null or { orchestratorId, fence, leaseUntilIso }';
   }
-  if (typeof claim.leaseUntilIso !== 'string' || Number.isNaN(Date.parse(claim.leaseUntilIso as string))) {
+  if (typeof snapshot.leaseUntilIso !== 'string' || Number.isNaN(Date.parse(snapshot.leaseUntilIso as string))) {
     return 'OrchestratorRequest claim must be null or { orchestratorId, fence, leaseUntilIso }';
   }
   return null;
 }
 
-function reasonErrorValue(value: unknown): string | null {
-  if (value === null) {
-    return null;
-  }
-  const reason = readPlainObject(value, ['reasonKind', 'detail']);
-  if (reason === null) {
+/** The typed reason, checked against its snapshot — never the original object. */
+function reasonSnapshotError(snapshot: Record<string, unknown>): string | null {
+  if (!ORCHESTRATOR_REQUEST_REASON_KINDS.includes(snapshot.reasonKind as OrchestratorRequestReasonKind)) {
     return 'OrchestratorRequest reason must be null or { reasonKind, detail }';
   }
-  if (!ORCHESTRATOR_REQUEST_REASON_KINDS.includes(reason.reasonKind as OrchestratorRequestReasonKind)) {
-    return 'OrchestratorRequest reason must be null or { reasonKind, detail }';
-  }
-  if (reason.detail === null) {
+  if (snapshot.detail === null) {
     return null;
   }
   if (
-    typeof reason.detail !== 'string' ||
-    new TextEncoder().encode(reason.detail as string).byteLength > ORCHESTRATOR_REQUEST_DETAIL_MAX_BYTES ||
-    NON_PLAIN_TEXT_PATTERN.test(reason.detail as string)
+    typeof snapshot.detail !== 'string' ||
+    new TextEncoder().encode(snapshot.detail as string).byteLength > ORCHESTRATOR_REQUEST_DETAIL_MAX_BYTES ||
+    NON_PLAIN_TEXT_PATTERN.test(snapshot.detail as string)
   ) {
     return 'OrchestratorRequest reason detail must be at most 1024 bytes of plain text';
   }
-  if (containsSecretShape(reason.detail as string)) {
+  if (containsSecretShape(snapshot.detail as string)) {
     return 'OrchestratorRequest reason detail contains a secret-shaped value and was refused';
   }
   return null;
 }
 
-function linkedErrorValue(kind: OrchestratorRequestKind, requestId: string, value: unknown): string | null {
-  if (value === null) {
-    return null;
-  }
+/** The dispatch link, checked against its snapshot — never the original object. */
+function linkedSnapshotError(
+  kind: OrchestratorRequestKind,
+  requestId: string,
+  snapshot: Record<string, unknown>,
+): string | null {
   const linkKey = ORCHESTRATOR_REQUEST_LINK_KEY[kind];
-  const linked = readPlainObject(value, [linkKey, 'journalKey']);
-  if (linked === null) {
-    return `OrchestratorRequest linked must be null or { ${linkKey}, journalKey: request/${requestId} }`;
-  }
-  const id = linked[linkKey];
+  const id = snapshot[linkKey];
   if (typeof id !== 'string' || id.trim().length === 0 || new TextEncoder().encode(id).byteLength > ID_MAX_BYTES) {
     return `OrchestratorRequest linked must be null or { ${linkKey}, journalKey: request/${requestId} }`;
   }
   if (containsSecretShape(id)) {
     return 'OrchestratorRequest linked contains a secret-shaped value and was refused';
   }
-  if (linked.journalKey !== `request/${requestId}`) {
+  if (snapshot.journalKey !== `request/${requestId}`) {
     return `OrchestratorRequest linked must be null or { ${linkKey}, journalKey: request/${requestId} }`;
   }
   return null;
 }
 
-function stateShapeError(input: Record<string, unknown>): string | null {
+/** The lifecycle states' field expectations, checked against the snapshots. */
+function stateShapeError(
+  input: Record<string, unknown>,
+  claim: Record<string, unknown> | null,
+  reason: Record<string, unknown> | null,
+  linked: Record<string, unknown> | null,
+): string | null {
   const state = input.state as OrchestratorRequestState;
-  const claim = input.claim;
-  const reason = input.reason;
-  const linked = input.linked;
   const deferredUntilIso = input.deferredUntilIso;
   const claimCount = input.claimCount as number;
   const fence = input.fence as number;
@@ -557,7 +589,7 @@ function stateShapeError(input: Record<string, unknown>): string | null {
     if (claim === null || reason !== null || linked !== null || deferredUntilIso !== null || claimCount > 1) {
       return 'OrchestratorRequest fields do not match its state';
     }
-    if ((claim as OrchestratorRequestClaimRecord).fence !== fence) {
+    if ((claim.fence as number) !== fence) {
       return 'OrchestratorRequest fields do not match its state';
     }
     return null;
@@ -575,7 +607,7 @@ function stateShapeError(input: Record<string, unknown>): string | null {
     if (claim === null || reason !== null || linked === null || deferredUntilIso !== null || claimCount > 1) {
       return 'OrchestratorRequest fields do not match its state';
     }
-    if ((claim as OrchestratorRequestClaimRecord).fence !== fence) {
+    if ((claim.fence as number) !== fence) {
       return 'OrchestratorRequest fields do not match its state';
     }
     return null;
@@ -584,7 +616,7 @@ function stateShapeError(input: Record<string, unknown>): string | null {
     if (claim === null || reason === null || linked !== null || deferredUntilIso !== null || claimCount > 1) {
       return 'OrchestratorRequest fields do not match its state';
     }
-    if ((claim as OrchestratorRequestClaimRecord).fence !== fence) {
+    if ((claim.fence as number) !== fence) {
       return 'OrchestratorRequest fields do not match its state';
     }
     return null;
@@ -598,20 +630,20 @@ function stateShapeError(input: Record<string, unknown>): string | null {
   return null;
 }
 
-function buildTargetRecord(kind: OrchestratorRequestKind, raw: Record<string, unknown>): OrchestratorRequestTargetRecord {
+function buildTargetRecord(kind: OrchestratorRequestKind, snapshot: Record<string, unknown>): OrchestratorRequestTargetRecord {
   if (ORCHESTRATOR_REQUEST_TARGET_KEY[kind] === 'attemptId') {
-    return Object.freeze({ attemptId: raw.attemptId as string });
+    return Object.freeze({ attemptId: snapshot.attemptId as string });
   }
   if (ORCHESTRATOR_REQUEST_TARGET_KEY[kind] === 'workOrderId') {
-    return Object.freeze({ workOrderId: raw.workOrderId as string });
+    return Object.freeze({ workOrderId: snapshot.workOrderId as string });
   }
-  return Object.freeze({ runId: raw.runId as string });
+  return Object.freeze({ runId: snapshot.runId as string });
 }
 
-function buildLinkedRecord(kind: OrchestratorRequestKind, raw: Record<string, unknown>): OrchestratorRequestLinkRecord {
-  const journalKey = raw.journalKey as string;
+function buildLinkedRecord(kind: OrchestratorRequestKind, snapshot: Record<string, unknown>): OrchestratorRequestLinkRecord {
+  const journalKey = snapshot.journalKey as string;
   if (ORCHESTRATOR_REQUEST_LINK_KEY[kind] === 'attemptId') {
-    return Object.freeze({ attemptId: raw.attemptId as string, journalKey });
+    return Object.freeze({ attemptId: snapshot.attemptId as string, journalKey });
   }
-  return Object.freeze({ runId: raw.runId as string, journalKey });
+  return Object.freeze({ runId: snapshot.runId as string, journalKey });
 }

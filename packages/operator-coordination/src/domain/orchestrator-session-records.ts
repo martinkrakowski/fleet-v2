@@ -21,7 +21,11 @@ export const ORCHESTRATOR_REQUEST_KINDS = [
 ] as const;
 export type OrchestratorRequestKind = (typeof ORCHESTRATOR_REQUEST_KINDS)[number];
 
-/** API scopes a session's token may hold. Never `dispatch` (D1) and never `verdict` (owner-only). */
+/**
+ * API scopes a session's token may hold. Never `dispatch` (D1) and never `verdict` (owner-only).
+ * Descriptive only: the register use case sets them from the presenting token's own scopes, never from
+ * the request body, and they grant nothing.
+ */
 export const ORCHESTRATOR_SESSION_SCOPES = ['read', 'message', 'hook', 'operate', 'orchestrate', 'tail'] as const;
 export type OrchestratorSessionScope = (typeof ORCHESTRATOR_SESSION_SCOPES)[number];
 

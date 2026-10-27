@@ -98,6 +98,12 @@ export class OrchestratorSession {
       }
       recordInput[key] = descriptor.value;
     }
+    // Array fields are copied by index into fresh plain arrays before any check, and that same copy is
+    // validated and stored: an input array with its own iterator or species can then never show the
+    // checks one value and store another (Fable, O1a review).
+    for (const field of ARRAY_FIELDS) {
+      recordInput[field] = plainArrayCopy(recordInput[field]);
+    }
 
     const orchestratorIdError = stringFieldError('orchestratorId', recordInput.orchestratorId, false);
     if (orchestratorIdError !== null) {
@@ -409,6 +415,21 @@ function projectsErrorValue(projects: unknown): string | null {
     seen.add(project as string);
   }
   return null;
+}
+
+const ARRAY_FIELDS: readonly string[] = ['projects', 'claims', 'scopes'];
+
+/** A fresh plain array copied by index (no iterator, no species); a non-array is returned unchanged. */
+function plainArrayCopy(value: unknown): unknown {
+  if (!Array.isArray(value)) {
+    return value;
+  }
+  const copy: unknown[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, index);
+    copy.push(descriptor === undefined ? undefined : descriptor.value);
+  }
+  return copy;
 }
 
 function distinctKindsError(

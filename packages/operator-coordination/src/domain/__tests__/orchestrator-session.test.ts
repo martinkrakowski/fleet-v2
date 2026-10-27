@@ -417,4 +417,15 @@ describe('aggregate boundary', () => {
     }
     expect(COORDINATION_KINDS).not.toContain('orchestrator-session');
   });
+
+  it('validates and stores the same array: an own iterator cannot hide a refused value', () => {
+    const scopes: string[] = ['dispatch'];
+    Object.defineProperty(scopes, Symbol.iterator, {
+      value: function* fakeIterator() {
+        yield 'read';
+      },
+    });
+    const result = OrchestratorSession.create({ ...VALID, scopes });
+    expect(result.success).toBe(false);
+  });
 });

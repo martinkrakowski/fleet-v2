@@ -11,6 +11,7 @@ export * from "./BriefAuthoringPort.out-port.js";
 export * from "./BriefKnowledgePort.out-port.js";
 export * from "./ChangeSignalPort.out-port.js";
 export * from "./CommandExecutorPort.out-port.js";
+export * from "./ConductorDriverLeasePort.out-port.js";
 export * from "./ExecutionJournalPort.out-port.js";
 export * from "./ExecutionObservationPort.out-port.js";
 export * from "./ExecutionRunnerPort.out-port.js";

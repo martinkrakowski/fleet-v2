@@ -13,6 +13,7 @@ import { WorkOrderRepositoryAdapter } from './WorkOrderRepositoryAdapter.adapter
 import { AttemptRepositoryAdapter } from './AttemptRepositoryAdapter.adapter.js';
 import { ExecutionJournalAdapter } from './ExecutionJournalAdapter.adapter.js';
 import { LaneRunRepositoryAdapter } from './LaneRunRepositoryAdapter.adapter.js';
+import { ConductorDriverLeaseAdapter } from './ConductorDriverLeaseAdapter.adapter.js';
 
 const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
   'work-orders.json': [
@@ -75,6 +76,20 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
       runPolicyRevision: 'policy-example-2',
     },
   ],
+  'conductor-driver-lease.json': [
+    {
+      version: 1,
+      holderId: 'driver-example-1',
+      fence: 1,
+      leaseUntilIso: '2026-10-27T10:02:00.000Z',
+    },
+    {
+      version: 1,
+      holderId: 'driver-example-2',
+      fence: 2,
+      leaseUntilIso: '2026-10-27T10:02:00.000Z',
+    },
+  ],
 };
 
 const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
@@ -86,6 +101,7 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
   'reservations.json': (stateDir) =>
     new ExecutionJournalAdapter({ stateDir }).listActiveReservations(),
   'lane-runs.json': (stateDir) => new LaneRunRepositoryAdapter({ stateDir }).list(),
+  'conductor-driver-lease.json': (stateDir) => new ConductorDriverLeaseAdapter({ stateDir }).read(),
 };
 
 type FixtureKind = 'valid' | 'not-json' | 'not-list' | 'bad-record';
@@ -158,6 +174,7 @@ describe('work-execution state file descriptors match the store readers', () => 
       'journal.json',
       'reservations.json',
       'lane-runs.json',
+      'conductor-driver-lease.json',
     ]);
   });
 });

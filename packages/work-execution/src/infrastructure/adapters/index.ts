@@ -11,6 +11,7 @@ export * from "./AttemptRepositoryAdapter.adapter.js";
 export * from "./AttemptReviewLocator.helper.js";
 export * from "./BriefAuthoringAdapter.adapter.js";
 export * from "./BriefKnowledgeAdapter.adapter.js";
+export * from "./ConductorDriverLeaseAdapter.adapter.js";
 export * from "./ConfirmRecordedHost.js";
 export * from "./ExecutionJournalAdapter.adapter.js";
 export * from "./ExecutionObservationAdapter.adapter.js";

@@ -3,6 +3,8 @@
  * EvidenceAssessmentRepositoryAdapter implements EvidenceAssessmentRepositoryPort.
  * Records live in memory by default and persist as JSON via atomic
  * temp-file-then-rename writes under an exclusive lock when `stateDir` is configured.
+ * With `readOnly` the store never writes: an unreadable file is a read
+ * error with no quarantine copy, and every save is refused.
  */
 
 import { promises as fs } from 'node:fs';
@@ -14,11 +16,16 @@ import {
   EvidenceAssessmentRevisionConflictError,
   type EvidenceAssessmentRepositoryPort,
 } from '../../application/ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
-import { inspectRecordListBytes, quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
+import { assertStoreWritable, inspectRecordListBytes, rejectUnreadableStateFile, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface EvidenceAssessmentRepositoryOptions {
   /** When set, assessments are also persisted as `assessments.json`. */
   readonly stateDir?: string;
+  /**
+   * Read-only (telemetry plan §3.3): an unreadable file is a read error with no quarantine copy
+   * (`StateFileUnreadableReadOnlyError`), and every write throws `ReadOnlyStateStoreError`.
+   */
+  readonly readOnly?: boolean;
 }
 
 const STATE_FILE = 'assessments.json';
@@ -63,6 +70,7 @@ export class EvidenceAssessmentRepositoryAdapter implements EvidenceAssessmentRe
    * the freshly read record inside an exclusive lock.
    */
   async saveAssessment(record: EvidenceAssessmentRecord): Promise<void> {
+    assertStoreWritable(this.options.readOnly === true, 'EvidenceAssessmentRepositoryAdapter');
     const stateFilePath = this.stateFilePath;
     if (stateFilePath === null) {
       const existing = this.inMemoryAssessments.get(record.id);
@@ -148,7 +156,7 @@ export class EvidenceAssessmentRepositoryAdapter implements EvidenceAssessmentRe
     }
     const inspection = inspectRecordListBytes(buffer, parseAssessmentStateRecord);
     if (inspection.status === 'unreadable') {
-      return quarantineUnreadable(stateFilePath, inspection.detail, buffer);
+      return rejectUnreadableStateFile(stateFilePath, inspection.detail, buffer, this.options.readOnly === true);
     }
     for (const item of inspection.records) {
       map.set(item.id, item);

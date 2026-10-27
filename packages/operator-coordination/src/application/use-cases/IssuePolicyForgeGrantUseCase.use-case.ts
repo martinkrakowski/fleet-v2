@@ -29,8 +29,8 @@ import type {
   PolicyGrantClock,
   PolicyGrantIdSource,
 } from '../ports/in/IssuePolicyForgeGrantPort.in-port.js';
-import { CoordinationRequestRevisionConflictError } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import { cancelPolicyGrantOnce } from './policy-grant-cancel.js';
 
 export interface IssuePolicyForgeGrantDependencies {
   readonly requestRepo: CoordinationRequestRepositoryPort;
@@ -151,14 +151,14 @@ export class IssuePolicyForgeGrantUseCase implements IssuePolicyForgeGrantPort {
       }
       return left.id < right.id ? -1 : 1;
     });
-    const newest = ordered[ordered.length - 1];
-    if (newest === undefined || newest.id !== requestId) {
+    const newest = ordered.at(-1);
+    if (newest?.id !== requestId) {
       // A newer live grant exists: this issue's own grant is cancelled and the
       // newer one stays live. Superseded is a fixed outcome, never an error.
       const mine = await this.deps.requestRepo.findRequestById(requestId);
       const own =
         mine !== null && this.isLiveWorkOrderGrant(mine, workOrderId)
-          ? await this.cancelOne(mine, now)
+          ? await cancelPolicyGrantOnce(this.deps.requestRepo, mine, now)
           : 'skipped';
       // Report only what happened: a confirmed cancel, nothing to cancel, or a cancel that may
       // have left this grant live beside the newer one.
@@ -273,48 +273,6 @@ export class IssuePolicyForgeGrantUseCase implements IssuePolicyForgeGrantPort {
     };
   }
 
-  /**
-   * Cancel one live policy grant: `{ ...record, state: 'cancelled', revision:
-   * record.revision + 1, updatedAtIso: now }` through the domain. A revision
-   * conflict re-reads once and skips the record when another writer consumed or
-   * cancelled it; a second conflict on a still-live grant reports it.
-   */
-  private async cancelOne(
-    record: CoordinationRequestRecord,
-    now: string,
-  ): Promise<'cancelled' | 'skipped' | 'conflict'> {
-    const attempt = async (target: CoordinationRequestRecord): Promise<void> => {
-      const cancelled: CoordinationRequestRecord = {
-        ...target,
-        state: 'cancelled',
-        revision: target.revision + 1,
-        updatedAtIso: now,
-      };
-      await this.deps!.requestRepo.saveRequest(CoordinationRequest.fromRecord(cancelled).toRecord());
-    };
-    try {
-      await attempt(record);
-      return 'cancelled';
-    } catch (error) {
-      if (!(error instanceof CoordinationRequestRevisionConflictError)) {
-        throw error;
-      }
-      const fresh = await this.deps!.requestRepo.findRequestById(record.id);
-      if (fresh === null || fresh.state !== 'approved' || fresh.consumptions.length > 0) {
-        return 'skipped';
-      }
-      try {
-        await attempt(fresh);
-        return 'cancelled';
-      } catch (second) {
-        if (second instanceof CoordinationRequestRevisionConflictError) {
-          return 'conflict';
-        }
-        throw second;
-      }
-    }
-  }
-
   /** Sequential cancels over a promise chain (never `for … await`). */
   private async cancelTargets(
     targets: readonly CoordinationRequestRecord[],
@@ -330,7 +288,11 @@ export class IssuePolicyForgeGrantUseCase implements IssuePolicyForgeGrantPort {
           if (stopped) {
             return;
           }
-          const outcome = await this.cancelOne(record, now);
+          const outcome = await cancelPolicyGrantOnce(
+            this.deps!.requestRepo,
+            record,
+            now,
+          );
           if (outcome === 'cancelled') {
             if (record.grantId !== null) {
               cancelledIds.push(record.grantId);

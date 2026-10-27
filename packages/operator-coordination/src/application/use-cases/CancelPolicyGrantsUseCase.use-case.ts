@@ -7,7 +7,6 @@
  */
 
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
-import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import {
   POLICY_GRANT_SOURCES,
   POLICY_SETTING_REVISION_PATTERN,
@@ -19,8 +18,8 @@ import type {
   CancelPolicyGrantsResult,
 } from '../ports/in/CancelPolicyGrantsPort.in-port.js';
 import type { PolicyGrantClock } from '../ports/in/IssuePolicyForgeGrantPort.in-port.js';
-import { CoordinationRequestRevisionConflictError } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import { cancelPolicyGrantOnce } from './policy-grant-cancel.js';
 
 export interface CancelPolicyGrantsDependencies {
   readonly requestRepo: CoordinationRequestRepositoryPort;
@@ -66,7 +65,7 @@ export class CancelPolicyGrantsUseCase implements CancelPolicyGrantsPort {
     const targets: CoordinationRequestRecord[] = [];
     for (const record of all) {
       const parsed = parsePolicyDecisionRevision(record.decisionRevision);
-      if (parsed === null || parsed.source !== request.source || parsed.revision === currentRevision) {
+      if (parsed?.source !== request.source || parsed?.revision === currentRevision) {
         continue;
       }
       if (record.consumptions.length > 0) {
@@ -99,47 +98,6 @@ export class CancelPolicyGrantsUseCase implements CancelPolicyGrantsPort {
     };
   }
 
-  /**
-   * Cancel one live policy grant; a conflict re-reads once and skips when the
-   * record is no longer approved-and-unconsumed, and a second conflict leaves
-   * it uncancelled without a retry.
-   */
-  private async cancelOne(
-    record: CoordinationRequestRecord,
-    now: string,
-  ): Promise<'cancelled' | 'skipped' | 'conflict'> {
-    const attempt = async (target: CoordinationRequestRecord): Promise<void> => {
-      const cancelled: CoordinationRequestRecord = {
-        ...target,
-        state: 'cancelled',
-        revision: target.revision + 1,
-        updatedAtIso: now,
-      };
-      await this.deps!.requestRepo.saveRequest(CoordinationRequest.fromRecord(cancelled).toRecord());
-    };
-    try {
-      await attempt(record);
-      return 'cancelled';
-    } catch (error) {
-      if (!(error instanceof CoordinationRequestRevisionConflictError)) {
-        throw error;
-      }
-      const fresh = await this.deps!.requestRepo.findRequestById(record.id);
-      if (fresh === null || fresh.state !== 'approved' || fresh.consumptions.length > 0) {
-        return 'skipped';
-      }
-      try {
-        await attempt(fresh);
-        return 'cancelled';
-      } catch (second) {
-        if (second instanceof CoordinationRequestRevisionConflictError) {
-          return 'conflict';
-        }
-        throw second;
-      }
-    }
-  }
-
   /** Sequential cancels over a promise chain (never `for … await`). */
   private async cancelTargets(
     targets: readonly CoordinationRequestRecord[],
@@ -150,7 +108,11 @@ export class CancelPolicyGrantsUseCase implements CancelPolicyGrantsPort {
     await targets.reduce(
       (chain, record) =>
         chain.then(async () => {
-          const outcome = await this.cancelOne(record, now);
+          const outcome = await cancelPolicyGrantOnce(
+            this.deps!.requestRepo,
+            record,
+            now,
+          );
           if (outcome === 'cancelled' && record.grantId !== null) {
             cancelledIds.push(record.grantId);
           } else if (outcome === 'conflict' && record.grantId !== null) {

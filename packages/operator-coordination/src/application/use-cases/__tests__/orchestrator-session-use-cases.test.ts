@@ -245,6 +245,31 @@ describe('register', () => {
     expect(await env.list.listOrchestratorSessions()).toEqual({ sessions: [] });
   });
 
+  it('names a missing key, and an unknown key in place of a known one is still unknown', async () => {
+    const env = fresh();
+    const withoutModel: Record<string, unknown> = { ...BODY };
+    delete withoutModel.model;
+    expect(
+      await env.register.registerOrchestratorSession(withoutModel, ['message']),
+    ).toEqual({
+      outcome: 'refused',
+      reason: 'OrchestratorSession registration is missing the key model',
+    });
+    expect(
+      await env.register.registerOrchestratorSession({ ...withoutModel, status: 'active' }, [
+        'message',
+      ]),
+    ).toEqual({
+      outcome: 'refused',
+      reason: 'OrchestratorSession registration has an unknown key',
+    });
+    expect(await env.register.registerOrchestratorSession({}, ['message'])).toEqual({
+      outcome: 'refused',
+      reason: 'OrchestratorSession registration is missing the key orchestratorId',
+    });
+    expect(await env.list.listOrchestratorSessions()).toEqual({ sessions: [] });
+  });
+
   it('refuses a secret-shaped host without echoing it', async () => {
     const env = fresh();
     const fakeSecret = ['sk', '-', 'x9y8z7'.repeat(4)].join('');

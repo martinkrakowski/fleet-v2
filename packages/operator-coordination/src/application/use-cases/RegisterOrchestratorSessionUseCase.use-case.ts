@@ -40,7 +40,8 @@ const REGISTRATION_BODY_KEYS: readonly string[] = [
 
 type RegistrationBodyRead =
   | { readonly ok: true; readonly value: Record<string, unknown> }
-  | { readonly ok: false; readonly reason: 'record' | 'unknown-key' };
+  | { readonly ok: false; readonly reason: 'record' | 'unknown-key' }
+  | { readonly ok: false; readonly reason: 'missing-key'; readonly key: string };
 
 /** Read the closed registration body by descriptor, like the domain reads its records. */
 function readClosedRegistrationBody(body: unknown): RegistrationBodyRead {
@@ -52,7 +53,8 @@ function readClosedRegistrationBody(body: unknown): RegistrationBodyRead {
     return { ok: false, reason: 'record' };
   }
   const ownKeys = Reflect.ownKeys(body);
-  if (ownKeys.length !== REGISTRATION_BODY_KEYS.length) {
+  // Own keys are distinct, so more keys than the closed set means an unknown one.
+  if (ownKeys.length > REGISTRATION_BODY_KEYS.length) {
     return { ok: false, reason: 'unknown-key' };
   }
   const value: Record<string, unknown> = {};
@@ -66,7 +68,23 @@ function readClosedRegistrationBody(body: unknown): RegistrationBodyRead {
     }
     value[key] = descriptor.value;
   }
+  // Named from the closed list, never from the input.
+  const missing = REGISTRATION_BODY_KEYS.find((key) => !Object.hasOwn(value, key));
+  if (missing !== undefined) {
+    return { ok: false, reason: 'missing-key', key: missing };
+  }
   return { ok: true, value };
+}
+
+function registrationBodyRefusal(read: Exclude<RegistrationBodyRead, { ok: true }>): string {
+  switch (read.reason) {
+    case 'record':
+      return 'OrchestratorSession registration requires a record';
+    case 'unknown-key':
+      return 'OrchestratorSession registration has an unknown key';
+    case 'missing-key':
+      return `OrchestratorSession registration is missing the key ${read.key}`;
+  }
 }
 
 export class RegisterOrchestratorSessionUseCase implements RegisterOrchestratorSessionPort {
@@ -90,10 +108,7 @@ export class RegisterOrchestratorSessionUseCase implements RegisterOrchestratorS
     if (!read.ok) {
       return {
         outcome: 'refused',
-        reason:
-          read.reason === 'record'
-            ? 'OrchestratorSession registration requires a record'
-            : 'OrchestratorSession registration has an unknown key',
+        reason: registrationBodyRefusal(read),
       };
     }
     const bodyRecord = read.value;

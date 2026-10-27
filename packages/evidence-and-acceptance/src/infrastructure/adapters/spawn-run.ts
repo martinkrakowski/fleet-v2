@@ -75,6 +75,13 @@ export interface SpawnRunOptions {
   readonly timeoutMs?: number;
   readonly input?: string;
   readonly maxBufferBytes?: number;
+  /**
+   * Grace in milliseconds between the timeout's SIGTERM to the process tree
+   * and the SIGKILL that follows a still-alive tree. Defaults to
+   * `KILL_GRACE_MS`. A caller that needs the tree to flush a server-side
+   * session before it is hard-killed passes a larger grace.
+   */
+  readonly killGraceMs?: number;
 }
 
 /** Kill the whole process tree (POSIX group kill), falling back to the child. */
@@ -168,7 +175,7 @@ export function runSpawnOutcome(
         if (child.exitCode === null && child.signalCode === null) {
           killProcessTree(child);
         }
-      }, KILL_GRACE_MS);
+      }, options.killGraceMs ?? KILL_GRACE_MS);
     }, timeoutMs);
 
     const considerBuffer = (chunk: string): boolean => {

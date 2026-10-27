@@ -293,16 +293,30 @@ function defaultNonce(): string {
   return randomBytes(16).toString('hex');
 }
 
-async function defaultSpawn(
+/**
+ * The default review spawn: runs `bin/ocm-run` through `runSpawnOutcome`
+ * under the review budget, the review output cap, and a 15 s kill grace.
+ * The grace is the time `bin/ocm-run`'s TERM trap needs to abort the
+ * server-side session (two HTTP round trips: `ocm_stop`/`ocm_abort`)
+ * before the process tree is SIGKILLed; a shorter grace would leave the
+ * reviewer session running and the worktree busy (exit 75) for a retry.
+ * Limit: with an unresponsive server ocm-run's trap can need more than 15 s (one 8 s curl per call),
+ * so SIGKILL may still land before the abort; a hung server cannot be aborted anyway.
+ */
+export const REVIEW_KILL_GRACE_MS = 15 * 1000;
+
+export async function defaultSpawn(
   file: string,
   args: readonly string[],
   env: Record<string, string>,
   options?: { readonly timeoutMs: number },
+  runner: typeof runSpawnOutcome = runSpawnOutcome,
 ): Promise<OcmReviewTransportSpawnResult> {
-  const outcome = await runSpawnOutcome(file, args, {
+  const outcome = await runner(file, args, {
     env,
     timeoutMs: options?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS,
     maxBufferBytes: DEFAULT_MAX_BUFFER_BYTES,
+    killGraceMs: REVIEW_KILL_GRACE_MS,
   });
   return {
     exitCode: outcome.exitCode,

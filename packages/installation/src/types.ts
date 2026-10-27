@@ -31,10 +31,22 @@ export interface WorktreeSection {
   readonly sshHost: string;
 }
 
+/** A coverage reader the verification adapter implements (plan 2026-10-26 §3.1). */
+export type CoverageReaderName = 'vitest-summary' | 'hexagen-lint-json' | 'eslint-json';
+export type CoverageUnitKind = 'tests' | 'files' | 'checks';
+
+/** What a procedure must cover; absent keeps the exit-0 rule. Changing it needs a new policy revision. */
+export interface ProcedureCoverage {
+  readonly reader: CoverageReaderName;
+  readonly unitKind: CoverageUnitKind;
+  readonly minUnits: number;
+}
+
 /** One named verification procedure. */
 export interface VerificationProcedure {
   readonly command: string;
   readonly args?: readonly string[];
+  readonly coverage?: ProcedureCoverage;
 }
 
 /** The `verification` section. */

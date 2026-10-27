@@ -95,7 +95,9 @@
       "example-gate": { "command": "fleet-verify-example", "args": ["--gate"] },
       "example-review": { "command": "fleet-verify-example", "args": ["--review"] },
       "hexagen-arch": { "command": "yarn", "args": ["exec", "hexagen", "arch", "validate"] },
-      "hexagen-sync-check": { "command": "yarn", "args": ["exec", "hexagen", "sync", "--check"] }
+      "hexagen-sync-check": { "command": "yarn", "args": ["exec", "hexagen", "sync", "--check"] },
+      "example-tests": { "command": "yarn", "args": ["workspace", "@example/app", "test"], "coverage": { "reader": "vitest-summary", "unitKind": "tests", "minUnits": 1 } },
+      "hexagen-lint-json": { "command": "yarn", "args": ["exec", "hexagen-lint", "--json"], "coverage": { "reader": "hexagen-lint-json", "unitKind": "files", "minUnits": 1 } }
     }
   },
   "waves": {

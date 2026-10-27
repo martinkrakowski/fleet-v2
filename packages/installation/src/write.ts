@@ -201,6 +201,13 @@ function serializeVerification(
     if (procedure.args !== undefined) {
       out.args = [...procedure.args];
     }
+    if (procedure.coverage !== undefined) {
+      out.coverage = {
+        reader: procedure.coverage.reader,
+        unitKind: procedure.coverage.unitKind,
+        minUnits: procedure.coverage.minUnits,
+      };
+    }
     procedures[name] = out;
   }
   return { procedures };

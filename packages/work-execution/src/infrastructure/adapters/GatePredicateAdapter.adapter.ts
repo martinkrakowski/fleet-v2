@@ -232,8 +232,8 @@ export class GatePredicateAdapter implements GatePredicatePort {
       return unknown('git rev-parse did not complete');
     }
     const head = revParse.stdout.trim();
-    if (head !== candidateHeadSha) {
-      return fail('worktree HEAD ' + head + ' is not the candidate head');
+    if (revParse.exitCode !== 0 || head !== candidateHeadSha) {
+      return fail('HEAD is not the candidate commit');
     }
 
     const mergeBase = await this.runGit(executor, request.worktreePath, [
@@ -260,7 +260,11 @@ export class GatePredicateAdapter implements GatePredicatePort {
     if (gitFailed(revList) || revList.exitCode !== 0) {
       return unknown('git rev-list did not complete');
     }
-    const count = Number.parseInt(revList.stdout.trim(), 10);
+    const countText = revList.stdout.trim();
+    if (!/^\d+$/.test(countText)) {
+      return fail('no commit since the base');
+    }
+    const count = Number.parseInt(countText, 10);
     if (!Number.isSafeInteger(count) || count < 1) {
       return fail('no commit since the base');
     }

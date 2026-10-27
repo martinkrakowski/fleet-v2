@@ -166,6 +166,9 @@ class InMemoryJournal {
   readonly entries: ActionJournalEntryRecord[] = [];
 
   async appendJournalEntry(entry: ActionJournalEntryRecord): Promise<void> {
+    if (this.entries.some((existing) => existing.id === entry.id)) {
+      throw new Error(`Duplicate journal entry id: ${entry.id}`);
+    }
     this.entries.push(entry);
   }
 
@@ -277,10 +280,10 @@ describe('RequestAttemptAcceptanceUseCase with the gate wired', () => {
       'completed',
     ]);
     expect(acceptEntries.map((entry) => entry.id)).toEqual([
-      'attempt-1:accept:1',
-      'attempt-1:accept:2',
-      'attempt-1:accept:3',
-      'attempt-1:accept:4',
+      `attempt-1:accept:${HEAD_SHA}:0`,
+      `attempt-1:accept:${HEAD_SHA}:1`,
+      `attempt-1:accept:${HEAD_SHA}:2`,
+      `attempt-1:accept:${HEAD_SHA}:3`,
     ]);
     expect(acceptancePort.requests).toHaveLength(1);
     expect(artifact.readBriefFileCalls).toBe(1);
@@ -492,5 +495,146 @@ describe('RequestAttemptAcceptanceUseCase with the gate wired', () => {
     expect(journal.entries).toHaveLength(0);
     expect(artifact.readBriefFileCalls).toBe(0);
     expect(acceptancePort.requests).toHaveLength(1);
+  });
+
+  it('refuses an evaluated response with empty, missing, extra or out-of-order results', async () => {
+    const emptyGate = new FakeGatePredicatePort({ outcome: 'evaluated', results: [] });
+    const { deps: emptyDeps, acceptancePort: emptyAcceptance } = makeDeps({ gate: emptyGate });
+    const emptyResult = await new RequestAttemptAcceptanceUseCase(emptyDeps).requestAttemptAcceptance(
+      acceptanceRequest(),
+    );
+    expect(emptyResult).toEqual({
+      outcome: 'rejected',
+      reason: 'Gate predicate results do not match the frozen acceptance spec',
+    });
+    expect(emptyAcceptance.requests).toHaveLength(0);
+
+    const missingCommandGate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [PASS_RESULTS[0], PASS_RESULTS[1]],
+    });
+    const { deps: missingDeps, acceptancePort: missingAcceptance } = makeDeps({
+      gate: missingCommandGate,
+    });
+    const missingResult = await new RequestAttemptAcceptanceUseCase(
+      missingDeps,
+    ).requestAttemptAcceptance(acceptanceRequest());
+    expect(missingResult).toEqual({
+      outcome: 'rejected',
+      reason: 'Gate predicate results do not match the frozen acceptance spec',
+    });
+    expect(missingAcceptance.requests).toHaveLength(0);
+
+    const outOfOrderGate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [PASS_RESULTS[1], PASS_RESULTS[0], PASS_RESULTS[2]],
+    });
+    const { deps: outOfOrderDeps, acceptancePort: outOfOrderAcceptance } = makeDeps({
+      gate: outOfOrderGate,
+    });
+    const outOfOrderResult = await new RequestAttemptAcceptanceUseCase(
+      outOfOrderDeps,
+    ).requestAttemptAcceptance(acceptanceRequest());
+    expect(outOfOrderResult).toEqual({
+      outcome: 'rejected',
+      reason: 'Gate predicate results do not match the frozen acceptance spec',
+    });
+    expect(outOfOrderAcceptance.requests).toHaveLength(0);
+
+    const extraResultGate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [...PASS_RESULTS, PASS_RESULTS[2]],
+    });
+    const { deps: extraDeps, acceptancePort: extraAcceptance } = makeDeps({
+      gate: extraResultGate,
+    });
+    const extraResult = await new RequestAttemptAcceptanceUseCase(extraDeps).requestAttemptAcceptance(
+      acceptanceRequest(),
+    );
+    expect(extraResult).toEqual({
+      outcome: 'rejected',
+      reason: 'Gate predicate results do not match the frozen acceptance spec',
+    });
+    expect(extraAcceptance.requests).toHaveLength(0);
+  });
+
+  it('returns the same result on a second call after a completed run without running the gate again', async () => {
+    const gate = new FakeGatePredicatePort(EVALUATED_ALL_PASS);
+    const { deps } = makeDeps({ gate });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    const first = await useCase.requestAttemptAcceptance(acceptanceRequest());
+    const second = await useCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(first.outcome).toBe('accepted');
+    expect(second).toEqual(first);
+    expect(gate.requests).toHaveLength(1);
+
+    const failingGate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        PASS_RESULTS[1],
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'fail',
+          exitCode: 2,
+          durationMs: 1,
+          detail: 'exit 2',
+        },
+      ],
+    });
+    const { deps: failingDeps } = makeDeps({ gate: failingGate });
+    const failingUseCase = new RequestAttemptAcceptanceUseCase(failingDeps);
+
+    const firstFailed = await failingUseCase.requestAttemptAcceptance(acceptanceRequest());
+    const secondFailed = await failingUseCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(firstFailed.outcome).toBe('rejected');
+    expect(secondFailed).toEqual(firstFailed);
+    expect(failingGate.requests).toHaveLength(1);
+  });
+
+  it('refuses without running the gate when an unfinished acceptance intent already exists', async () => {
+    const gate = new FakeGatePredicatePort(EVALUATED_ALL_PASS);
+    const journal = new InMemoryJournal();
+    await journal.appendJournalEntry({
+      id: `attempt-1:accept:${HEAD_SHA}:0`,
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'accept',
+      baseCommit: BASE_COMMIT,
+      recordedAtIso: FIXED_NOW,
+      sessionId: 'session-1',
+      status: 'intent-recorded',
+      detail: `gate: 3 predicates for head ${HEAD_SHA}`,
+    });
+    const { deps, acceptancePort } = makeDeps({ gate, journal });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: `Unknown: gate evaluation for head ${HEAD_SHA} has an unfinished intent in the journal`,
+    });
+    expect(gate.requests).toHaveLength(0);
+    expect(acceptancePort.requests).toHaveLength(0);
+  });
+
+  it('runs the gate at most once across two concurrent calls and returns the same result', async () => {
+    const gate = new FakeGatePredicatePort(EVALUATED_ALL_PASS);
+    const { deps } = makeDeps({ gate });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    const [first, second] = await Promise.all([
+      useCase.requestAttemptAcceptance(acceptanceRequest()),
+      useCase.requestAttemptAcceptance(acceptanceRequest()),
+    ]);
+
+    expect(first.outcome).toBe('accepted');
+    expect(second).toEqual(first);
+    expect(gate.requests).toHaveLength(1);
   });
 });

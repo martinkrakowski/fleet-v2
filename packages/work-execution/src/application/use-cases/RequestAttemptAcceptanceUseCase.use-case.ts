@@ -41,7 +41,12 @@ import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-ac
 import type { AllowedSeatPort } from '../ports/out/AllowedSeatPort.out-port.js';
 import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
-import type { GatePredicatePort, GatePredicateResult, GatePredicateVerdict } from '../ports/out/GatePredicatePort.out-port.js';
+import type {
+  GatePredicateKind,
+  GatePredicatePort,
+  GatePredicateResult,
+  GatePredicateVerdict,
+} from '../ports/out/GatePredicatePort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 
 function isNonEmptyString(value: unknown): value is string {
@@ -74,6 +79,185 @@ const GATE_PREDICATE_VERDICT_TO_STATUS: Record<
   unknown: 'ambiguous',
   skipped: 'refused',
 };
+
+const GATE_RESULTS_MISMATCH_REASON =
+  'Gate predicate results do not match the frozen acceptance spec';
+
+interface ExpectedGatePredicate {
+  readonly name: string;
+  readonly kind: GatePredicateKind;
+}
+
+function expectedGatePredicates(spec: AcceptanceSpec): readonly ExpectedGatePredicate[] {
+  return [
+    { name: 'commit', kind: 'commit' },
+    { name: 'diff-check', kind: 'diff-check' },
+    ...spec.getCommands().map((command, index) => ({
+      name: ('command ' + String(index + 1) + ': ' + command.argv.join(' ')).slice(0, 120),
+      kind: 'command' as const,
+    })),
+  ];
+}
+
+function resultsMatchExpectedPredicates(
+  results: readonly GatePredicateResult[],
+  expected: readonly ExpectedGatePredicate[],
+): boolean {
+  if (results.length !== expected.length) {
+    return false;
+  }
+  return expected.every(
+    (predicate, index) =>
+      results[index]?.name === predicate.name && results[index]?.kind === predicate.kind,
+  );
+}
+
+function rejectionForGateResults(
+  results: readonly GatePredicateResult[],
+  expected: readonly ExpectedGatePredicate[],
+): string | null {
+  if (!resultsMatchExpectedPredicates(results, expected)) {
+    return GATE_RESULTS_MISMATCH_REASON;
+  }
+  for (const result of results) {
+    if (result.verdict !== 'pass') {
+      const exitText = result.exitCode === null ? '' : ' with exit code ' + String(result.exitCode);
+      return 'Gate predicate ' + result.name + ' ' + result.verdict + exitText + ': ' + result.detail;
+    }
+  }
+  return null;
+}
+
+function isGatePredicateKind(value: unknown): value is GatePredicateKind {
+  return value === 'commit' || value === 'diff-check' || value === 'command';
+}
+
+function isGatePredicateVerdict(value: unknown): value is GatePredicateVerdict {
+  return value === 'pass' || value === 'fail' || value === 'unknown' || value === 'skipped';
+}
+
+function parseStoredPredicateResult(entry: ActionJournalEntryRecord): GatePredicateResult | null {
+  if (typeof entry.detail !== 'string') {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(entry.detail);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return null;
+  }
+  const record = parsed as Record<string, unknown>;
+  if (
+    typeof record.predicate !== 'string' ||
+    !isGatePredicateKind(record.kind) ||
+    !isGatePredicateVerdict(record.verdict) ||
+    (record.exitCode !== null && typeof record.exitCode !== 'number') ||
+    typeof record.durationMs !== 'number' ||
+    typeof record.detail !== 'string'
+  ) {
+    return null;
+  }
+  return {
+    name: record.predicate,
+    kind: record.kind,
+    verdict: record.verdict,
+    exitCode: record.exitCode,
+    durationMs: record.durationMs,
+    detail: record.detail,
+  };
+}
+
+type StoredGateOutcome =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'completed'; readonly reason: string | null }
+  | { readonly kind: 'incomplete'; readonly reason: string };
+
+function readStoredGateOutcome(
+  entries: readonly ActionJournalEntryRecord[],
+  attemptId: string,
+  candidateHeadSha: string,
+  expected: readonly ExpectedGatePredicate[],
+): StoredGateOutcome {
+  const prefix = `${attemptId}:accept:${candidateHeadSha}:`;
+  const headSuffix = ` for head ${candidateHeadSha}`;
+  const matching = entries.filter(
+    (entry) =>
+      entry.attemptId === attemptId &&
+      entry.action === 'accept' &&
+      (entry.id.startsWith(prefix) ||
+        (entry.status === 'intent-recorded' &&
+          typeof entry.detail === 'string' &&
+          entry.detail.endsWith(headSuffix))),
+  );
+  if (matching.length === 0) {
+    return { kind: 'none' };
+  }
+
+  const byId = new Map<string, ActionJournalEntryRecord>();
+  for (const entry of matching) {
+    byId.set(entry.id, entry);
+  }
+
+  const firstResultEntry = byId.get(`${prefix}1`);
+  if (firstResultEntry !== undefined && parseStoredPredicateResult(firstResultEntry) === null) {
+    if (firstResultEntry.status === 'ambiguous') {
+      return {
+        kind: 'completed',
+        reason: 'Unknown: gate predicates unavailable: ' + (firstResultEntry.detail ?? ''),
+      };
+    }
+    if (firstResultEntry.status === 'refused') {
+      return {
+        kind: 'completed',
+        reason: firstResultEntry.detail ?? GATE_RESULTS_MISMATCH_REASON,
+      };
+    }
+  }
+
+  const parsedResults: GatePredicateResult[] = [];
+  for (let index = 0; index < expected.length; index += 1) {
+    const entry = byId.get(`${prefix}${index + 1}`);
+    if (entry === undefined) {
+      return {
+        kind: 'incomplete',
+        reason: `Unknown: gate evaluation for head ${candidateHeadSha} has an unfinished intent in the journal`,
+      };
+    }
+    const parsed = parseStoredPredicateResult(entry);
+    if (parsed === null) {
+      return {
+        kind: 'incomplete',
+        reason: `Unknown: gate evaluation for head ${candidateHeadSha} has an unfinished intent in the journal`,
+      };
+    }
+    parsedResults.push(parsed);
+  }
+
+  const extraPredicateEntries = matching.some((entry) => {
+    if (!entry.id.startsWith(prefix)) {
+      return false;
+    }
+    const indexText = entry.id.slice(prefix.length);
+    if (!/^\d+$/.test(indexText)) {
+      return false;
+    }
+    const index = Number.parseInt(indexText, 10);
+    return index > expected.length;
+  });
+  if (extraPredicateEntries) {
+    return { kind: 'completed', reason: GATE_RESULTS_MISMATCH_REASON };
+  }
+
+  return {
+    kind: 'completed',
+    reason: rejectionForGateResults(parsedResults, expected),
+  };
+}
+
+const inFlightGateRuns = new WeakMap<object, Map<string, Promise<void>>>();
 
 /**
  * Read `modelAssignment.model` from the attempt's frozen brief manifest. The
@@ -431,67 +615,197 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
         ? (rawPrefixes as string[])
         : [];
 
-    const priorEntries = await journal.listJournalEntriesForAttempt(id);
-    const entryCount = priorEntries.length + 1;
-    await journal.appendJournalEntry({
-      id: `${id}:accept:${entryCount}`,
-      attemptId: id,
-      workOrderId: attempt.workOrderId,
-      action: 'accept',
-      baseCommit: attempt.baseCommit,
-      recordedAtIso: deps.now?.() ?? new Date().toISOString(),
-      sessionId: attempt.sessionId,
-      status: 'intent-recorded',
-      detail: 'gate: ' + String(2 + spec.getCommands().length) + ' predicates for head ' + candidateHeadSha,
-    });
-
-    const gateResult = await gatePort.evaluateGatePredicates({
-      attemptId: id,
-      worktreePath: attempt.worktreePath,
-      runner: attempt.runner ?? null,
-      baseCommit: attempt.baseCommit,
-      candidateHeadSha,
-      allowedPathPrefixes,
-      spec: spec.toJSON(),
-    });
-    if (gateResult.outcome === 'unavailable') {
-      await journal.appendJournalEntry({
-        id: `${id}:accept:${entryCount + 1}`,
-        attemptId: id,
-        workOrderId: attempt.workOrderId,
-        action: 'accept',
-        baseCommit: attempt.baseCommit,
-        recordedAtIso: deps.now?.() ?? new Date().toISOString(),
-        sessionId: attempt.sessionId,
-        status: 'ambiguous',
-        detail: gateResult.reason,
-      });
-      return 'Unknown: gate predicates unavailable: ' + gateResult.reason;
+    const expected = expectedGatePredicates(spec);
+    const gateKey = `${id}:${candidateHeadSha}`;
+    let journalInFlight = inFlightGateRuns.get(journal);
+    if (journalInFlight === undefined) {
+      journalInFlight = new Map<string, Promise<void>>();
+      inFlightGateRuns.set(journal, journalInFlight);
     }
 
-    const results = gateResult.results;
-    const entries = results.map((result, offset) =>
-      this.gateJournalEntry(deps, attempt, id, entryCount + 1 + offset, result),
-    );
-    await entries.reduce(
-      (chain, entry) => chain.then(() => journal.appendJournalEntry(entry)),
-      Promise.resolve(),
-    );
+    const existingInFlight = journalInFlight.get(gateKey);
+    if (existingInFlight !== undefined) {
+      await existingInFlight;
+    }
 
-    for (const result of results) {
-      if (result.verdict !== 'pass') {
-        const exitText = result.exitCode === null ? '' : ' with exit code ' + result.exitCode;
-        return 'Gate predicate ' + result.name + ' ' + result.verdict + exitText + ': ' + result.detail;
+    const priorEntries = await journal.listJournalEntriesForAttempt(id);
+    const storedBefore = readStoredGateOutcome(priorEntries, id, candidateHeadSha, expected);
+    if (storedBefore.kind !== 'none') {
+      return storedBefore.reason;
+    }
+
+    const isOwner = !journalInFlight.has(gateKey);
+    let finishInFlight: (() => void) | undefined;
+    if (isOwner) {
+      const runPromise = new Promise<void>((resolve) => {
+        finishInFlight = resolve;
+      });
+      journalInFlight.set(gateKey, runPromise);
+    }
+
+    try {
+      try {
+        await journal.appendJournalEntry({
+          id: `${id}:accept:${candidateHeadSha}:0`,
+          attemptId: id,
+          workOrderId: attempt.workOrderId,
+          action: 'accept',
+          baseCommit: attempt.baseCommit,
+          recordedAtIso: deps.now?.() ?? new Date().toISOString(),
+          sessionId: attempt.sessionId,
+          status: 'intent-recorded',
+          detail:
+            'gate: ' +
+            String(expected.length) +
+            ' predicates for head ' +
+            candidateHeadSha,
+        });
+      } catch {
+        return await this.readAfterCollision(
+          journal,
+          journalInFlight,
+          gateKey,
+          isOwner,
+          id,
+          candidateHeadSha,
+          expected,
+        );
+      }
+
+      if (!isOwner) {
+        return await this.readAfterCollision(
+          journal,
+          journalInFlight,
+          gateKey,
+          isOwner,
+          id,
+          candidateHeadSha,
+          expected,
+        );
+      }
+
+      const gateResult = await gatePort.evaluateGatePredicates({
+        attemptId: id,
+        worktreePath: attempt.worktreePath,
+        runner: attempt.runner ?? null,
+        baseCommit: attempt.baseCommit,
+        candidateHeadSha,
+        allowedPathPrefixes,
+        spec: spec.toJSON(),
+      });
+      if (gateResult.outcome === 'unavailable') {
+        try {
+          await journal.appendJournalEntry({
+            id: `${id}:accept:${candidateHeadSha}:1`,
+            attemptId: id,
+            workOrderId: attempt.workOrderId,
+            action: 'accept',
+            baseCommit: attempt.baseCommit,
+            recordedAtIso: deps.now?.() ?? new Date().toISOString(),
+            sessionId: attempt.sessionId,
+            status: 'ambiguous',
+            detail: gateResult.reason,
+          });
+        } catch {
+          return await this.readAfterCollision(
+            journal,
+            journalInFlight,
+            gateKey,
+            isOwner,
+            id,
+            candidateHeadSha,
+            expected,
+          );
+        }
+        return 'Unknown: gate predicates unavailable: ' + gateResult.reason;
+      }
+
+      const results = gateResult.results;
+      if (!resultsMatchExpectedPredicates(results, expected)) {
+        try {
+          await journal.appendJournalEntry({
+            id: `${id}:accept:${candidateHeadSha}:1`,
+            attemptId: id,
+            workOrderId: attempt.workOrderId,
+            action: 'accept',
+            baseCommit: attempt.baseCommit,
+            recordedAtIso: deps.now?.() ?? new Date().toISOString(),
+            sessionId: attempt.sessionId,
+            status: 'refused',
+            detail: GATE_RESULTS_MISMATCH_REASON,
+          });
+        } catch {
+          return await this.readAfterCollision(
+            journal,
+            journalInFlight,
+            gateKey,
+            isOwner,
+            id,
+            candidateHeadSha,
+            expected,
+          );
+        }
+        return GATE_RESULTS_MISMATCH_REASON;
+      }
+
+      const entries = results.map((result, offset) =>
+        this.gateJournalEntry(deps, attempt, id, candidateHeadSha, offset + 1, result),
+      );
+      try {
+        await entries.reduce(
+          (chain, entry) => chain.then(() => journal.appendJournalEntry(entry)),
+          Promise.resolve(),
+        );
+      } catch {
+        return await this.readAfterCollision(
+          journal,
+          journalInFlight,
+          gateKey,
+          isOwner,
+          id,
+          candidateHeadSha,
+          expected,
+        );
+      }
+
+      return rejectionForGateResults(results, expected);
+    } finally {
+      if (isOwner) {
+        journalInFlight.delete(gateKey);
+        finishInFlight?.();
       }
     }
-    return null;
+  }
+
+  private async readAfterCollision(
+    journal: Pick<ExecutionJournalPort, 'appendJournalEntry' | 'listJournalEntriesForAttempt'>,
+    journalInFlight: Map<string, Promise<void>>,
+    gateKey: string,
+    isOwner: boolean,
+    attemptId: string,
+    candidateHeadSha: string,
+    expected: readonly ExpectedGatePredicate[],
+  ): Promise<string | null> {
+    if (!isOwner) {
+      const active = journalInFlight.get(gateKey);
+      if (active !== undefined) {
+        await active;
+      }
+    }
+    const entries = await journal.listJournalEntriesForAttempt(attemptId);
+    const stored = readStoredGateOutcome(entries, attemptId, candidateHeadSha, expected);
+    if (stored.kind === 'none') {
+      return `Unknown: gate evaluation for head ${candidateHeadSha} has an unfinished intent in the journal`;
+    }
+    return stored.reason;
   }
 
   private gateJournalEntry(
     deps: RequestAttemptAcceptanceDependencies,
     attempt: AttemptRecord,
     id: string,
-    offset: number,
+    candidateHeadSha: string,
+    predicateIndex: number,
     result: GatePredicateResult,
   ): ActionJournalEntryRecord {
     const detailObject: Record<string, unknown> = {
@@ -506,7 +820,7 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
       detailObject.coverage = result.coverage;
     }
     return {
-      id: `${id}:accept:${offset}`,
+      id: `${id}:accept:${candidateHeadSha}:${predicateIndex}`,
       attemptId: id,
       workOrderId: attempt.workOrderId,
       action: 'accept',

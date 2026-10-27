@@ -198,7 +198,7 @@ describe('GatePredicateAdapter', () => {
     expect(results[0]).toMatchObject({
       name: 'commit',
       verdict: 'fail',
-      detail: 'worktree HEAD ' + 'c'.repeat(40) + ' is not the candidate head',
+      detail: 'HEAD is not the candidate commit',
     });
     expect(results[1]).toEqual({
       name: 'diff-check',
@@ -213,6 +213,43 @@ describe('GatePredicateAdapter', () => {
     expect(executor.argvRecords.some((argv) => argv[0] === 'sh')).toBe(false);
   });
 
+  it('fails when rev-parse prints the candidate commit id but exits 1', async () => {
+    const { adapter } = makeAdapter((argv) => {
+      if (gitSubcommand(argv) === 'rev-parse') {
+        return { exitCode: 1, stdout: HEAD + '\n' };
+      }
+      return { exitCode: 0 };
+    });
+
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[0]).toMatchObject({
+      name: 'commit',
+      verdict: 'fail',
+      detail: 'HEAD is not the candidate commit',
+    });
+  });
+
+  it('never includes rev-parse stdout in a HEAD mismatch detail', async () => {
+    const sentinel = 'SENTINEL-REV-PARSE-STDOUT-789';
+    const { adapter } = makeAdapter((argv) => {
+      if (gitSubcommand(argv) === 'rev-parse') {
+        return { exitCode: 0, stdout: sentinel + '\n' };
+      }
+      return { exitCode: 0 };
+    });
+
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[0]).toMatchObject({
+      name: 'commit',
+      verdict: 'fail',
+      detail: 'HEAD is not the candidate commit',
+    });
+    expect(results[0].detail).not.toContain(sentinel);
+    for (const result of results) {
+      expect(result.detail).not.toContain(sentinel);
+    }
+  });
+
   it('fails the commit predicate when there is no commit since the base', async () => {
     const { adapter } = makeAdapter((argv) => {
       const sub = gitSubcommand(argv);
@@ -224,6 +261,25 @@ describe('GatePredicateAdapter', () => {
       }
       if (sub === 'rev-list') {
         return { stdout: '0\n' };
+      }
+      return { stdout: '' };
+    });
+
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[0]).toMatchObject({ name: 'commit', verdict: 'fail', detail: 'no commit since the base' });
+  });
+
+  it('fails the commit predicate when the commit count has trailing text', async () => {
+    const { adapter } = makeAdapter((argv) => {
+      const sub = gitSubcommand(argv);
+      if (sub === 'rev-parse') {
+        return { stdout: HEAD + '\n' };
+      }
+      if (sub === 'merge-base') {
+        return { exitCode: 0 };
+      }
+      if (sub === 'rev-list') {
+        return { stdout: '1 unexpected\n' };
       }
       return { stdout: '' };
     });

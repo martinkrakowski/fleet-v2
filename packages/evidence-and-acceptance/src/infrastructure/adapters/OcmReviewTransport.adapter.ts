@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
 
+import { UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
 import type { FindingSeverity, ReviewFindingRecord } from '../../domain/evidence-records.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type { RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
@@ -32,6 +34,8 @@ export interface OcmReviewTransportOptions {
   ) => Promise<string | null> | string | null;
   readonly readHead: (dir: string) => Promise<string | null> | string | null;
   readonly spawn?: OcmReviewTransportSpawn;
+  /** Test seam: overrides the per-prompt nonce; production uses defaultNonce(). */
+  readonly makeNonce?: () => string;
 }
 
 /** Allowed tools for read-only review proof. Any other tool voids read-only verification. */
@@ -159,14 +163,23 @@ function extractToolName(record: Record<string, unknown>): string | null {
   return null;
 }
 
-export function buildReviewPrompt(request: RunIndependentReviewRequest): string {
+// Lane-written text is a prompt-injection surface: any future embedded
+// lane-written text (a full diff, file contents) must go through
+// `wrapUntrusted` with a per-prompt nonce, never pasted in directly.
+export function buildReviewPrompt(request: RunIndependentReviewRequest, nonce: string): string {
   const sections: string[] = [
     `Independent read-only code review for attempt "${request.attemptId}" at candidate head "${request.candidateHeadSha}".`,
     'This review session is strictly read-only. Do not edit, create, delete, or modify any files.',
+    UNTRUSTED_INPUT_RULE,
   ];
 
   if (typeof request.diffSummary === 'string' && request.diffSummary.trim() !== '') {
-    sections.push(`Diff summary:\n${request.diffSummary.trim()}`);
+    const wrappedDiffSummary = wrapUntrusted({
+      label: 'diff summary',
+      text: request.diffSummary.trim(),
+      nonce,
+    });
+    sections.push(`Diff summary:\n${wrappedDiffSummary}`);
   }
 
   sections.push(
@@ -200,6 +213,10 @@ export function buildReviewerEnv(
     env.OCM_HOST = host;
   }
   return env;
+}
+
+function defaultNonce(): string {
+  return randomBytes(16).toString('hex');
 }
 
 async function defaultSpawn(
@@ -267,7 +284,8 @@ export function createOcmReviewTransport(
     }
 
     // 4. Build argv and sanitized environment
-    const prompt = buildReviewPrompt(request);
+    const nonce = (options.makeNonce ?? defaultNonce)();
+    const prompt = buildReviewPrompt(request, nonce);
     const argv: string[] = [
       '--dir',
       dir,

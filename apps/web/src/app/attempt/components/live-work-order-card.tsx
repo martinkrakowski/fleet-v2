@@ -20,6 +20,7 @@ import {
   prerequisitesText,
   workOrderAnnouncement,
 } from "../work-order-view";
+import { workOrderHref } from "../../work-order/timeline-view";
 import type { WorkOrderPanel } from "../live-context";
 import styles from "../attempt.module.css";
 
@@ -97,6 +98,15 @@ function FoundPanel({
           </span>
         </KeyValueRow>
       </KeyValueList>
+
+      <p>
+        <Link
+          className={styles.chainLink}
+          href={workOrderHref(panel.workOrder.id)}
+        >
+          Open the work-order timeline
+        </Link>
+      </p>
 
       <h3 className={styles.sidebarHeading}>Attempts (fix chain)</h3>
       {ordered.length === 0 ? (

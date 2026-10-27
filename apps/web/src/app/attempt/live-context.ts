@@ -105,15 +105,11 @@ async function loadWorkOrderPanel(
   };
 }
 
-async function loadJournalPanel(
-  data: AttemptPageData,
+export async function readJournalPanel(
+  attemptId: string,
   client: Pick<FleetWebApiClient, "fetchAttemptJournal">,
 ): Promise<JournalPanel> {
-  if (data.view !== "found" && data.view !== "unknown") {
-    return { panel: "not-read" };
-  }
-
-  const endpoint = await client.fetchAttemptJournal(data.attemptId, null);
+  const endpoint = await client.fetchAttemptJournal(attemptId, null);
 
   if (endpoint.source === "fixture-fallback") {
     if (endpoint.fallbackReason === NOT_CONFIGURED_REASON) {
@@ -139,12 +135,23 @@ async function loadJournalPanel(
         : null;
     const reason =
       code !== null && code !== "OK"
-        ? `api boundary answered ${code} for /v1/attempts/${data.attemptId}/journal`
-        : `api boundary returned an unexpected journal shape for /v1/attempts/${data.attemptId}/journal`;
+        ? `api boundary answered ${code} for /v1/attempts/${attemptId}/journal`
+        : `api boundary returned an unexpected journal shape for /v1/attempts/${attemptId}/journal`;
     return { panel: "error", reason };
   }
 
   return { panel: "listed", entries: parsed };
+}
+
+async function loadJournalPanel(
+  data: AttemptPageData,
+  client: Pick<FleetWebApiClient, "fetchAttemptJournal">,
+): Promise<JournalPanel> {
+  if (data.view !== "found" && data.view !== "unknown") {
+    return { panel: "not-read" };
+  }
+
+  return readJournalPanel(data.attemptId, client);
 }
 
 export async function loadAttemptContext(

@@ -1,0 +1,43 @@
+/*
+ * Work-order timeline view styles.
+ * All colours come from the semantic custom properties in
+ * apps/web/src/app/globals.css so Light and Dark themes both work.
+ */
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.meta {
+  color: var(--text-faint);
+}
+
+.muted {
+  color: var(--text-faint);
+}
+
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 var(--space-3);
+  border-left: 2px solid var(--border-color-light);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.step {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.stepHead {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: baseline;
+}

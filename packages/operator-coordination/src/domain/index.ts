@@ -5,4 +5,5 @@ export * from "./entities/index.js";
 export * from "./orchestrator-request-records.js";
 export * from "./orchestrator-session-records.js";
 export * from "./owner-question-records.js";
+export * from "./policy-grants.js";
 export * from "./value-objects/index.js";

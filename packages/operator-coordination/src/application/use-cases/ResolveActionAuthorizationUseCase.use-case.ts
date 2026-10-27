@@ -8,9 +8,12 @@
  * scope and expected commit that is being attempted, and still be unconsumed.
  * When a decision transport is supplied, a request that is still awaiting its
  * decision is refreshed once from that verified answer before the checks run;
- * a pending, declined or ambiguous answer leaves the action blocked.
+ * a pending, declined or ambiguous answer leaves the action blocked. Without a
+ * grant id, only an owner request recorded at the requested head may apply; a
+ * policy grant is resolved only by its id.
  */
 
+import { isPolicyGrantRecord } from '../../domain/policy-grants.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import type {
@@ -112,9 +115,9 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
   }
 
   /**
-   * A named grant locates its request directly; without one, only an approved
-   * request for this project and action scope may apply. Nothing is invented
-   * when nothing is recorded.
+   * A named grant locates its request directly. Without a grant id, only an
+   * owner request recorded at the requested head may apply; a policy grant is
+   * resolved only by its id. Nothing is invented when nothing is recorded.
    */
   private async findRecordedRequest(
     request: ResolveActionAuthorizationRequest,
@@ -123,10 +126,13 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       return this.deps?.requestRepo.findRequestByGrantId(request.authorizationGrantId.trim()) ?? null;
     }
     const recorded = await (this.deps?.requestRepo.listRequests(request.projectId.trim()) ?? []);
+    const head = request.expectedHeadSha.trim();
     const matching = recorded.filter(
       (candidate) =>
         candidate.projectId === request.projectId.trim() &&
-        candidate.actionScope === request.actionScope.trim(),
+        candidate.actionScope === request.actionScope.trim() &&
+        candidate.expectedHeadSha === head &&
+        !isPolicyGrantRecord(candidate),
     );
     const approved = matching.filter((candidate) => candidate.state === 'approved');
     const preferred =

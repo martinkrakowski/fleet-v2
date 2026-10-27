@@ -691,7 +691,7 @@ bounded_contexts:
       InstallationReferencePort: Report the installations host names and verification procedure names so profile writes can refuse names the installation does not have; unknown when no installation is loaded."
       InspectConfiguredCapabilitiesPort: "Report the configured runner and integration capabilities, missing requirements and explicit unknowns."
       RequestScopedDecisionPort: "Record the exact proposal, expected revision and action scope before asking its authorized decider."
-      ResolveActionAuthorizationPort: "Return an applicable grant from approved policy or a verified scoped decision; pending or ambiguous authority remains blocked."
+      ResolveActionAuthorizationPort: "Return an applicable grant from approved policy or a verified scoped decision; pending or ambiguous authority remains blocked. Without a grant id it never returns a policy grant and takes only a request recorded at the requested head."
       CheckOwnerDecisionPort: "Report whether one recorded coordination request authorizes its own owner decision at an exact candidate head; unreadable is unknown and neither unknown nor not-approved is an approval."
       RecordAuthorizationConsumptionPort: "Durably bind a grant to an action ID and retain reconciliation receipts without authorizing a second unrelated action."
       PublishProjectObservationPort: "Publish the owning project's explicit events and derived facts while preserving disagreements and delivery failures."
@@ -738,6 +738,7 @@ bounded_contexts:
         CoordinationState: [proposed, awaiting-decision, approved, declined, executing, completed, unknown, expired, cancelled]
       invariants:
         - "Authorization binds proposal digest, project, exact action, expected commit, policy and decision revisions."
+        - "A policy grant is an ordinary approved action-decision named by the setting revision that authorised it (policy:autoMerge@<rev> for merge-pr, policy:conductor@<rev> for push-and-open-pr and push-to-pr) and bound to its work order, attempt and acceptance receipt; it grants nothing beyond that action at that head, and an unnamed resolve never returns it."
         - "Owner questions are a separate aggregate: answers validate against the question's own options and current revision, a one-way question is answered only by a verified signed decision, and no answer, acknowledgement, expiry or sync ever writes a coordination request or grants authority."
         - "Orchestrator sessions are a separate aggregate, never a coordination kind: a session records which agent CLI is registered, what it may claim and its lease; it grants nothing, and attached and attentive are derived from the injected clock, never stored."
         - "Orchestrator requests are a separate aggregate, never a coordination kind: a web request is a closed, ids-only mailbox entry that grants nothing; the claimant acts under its own existing authority, every claim mutation checks revision, fence and lease, and a dispatched request only links to the record that carries the truth."

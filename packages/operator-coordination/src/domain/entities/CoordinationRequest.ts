@@ -14,14 +14,26 @@
 import type {
   AuthorizationConsumptionRecord,
   CoordinationRequestRecord,
+  PolicyGrantRecord,
   RelayAcknowledgementRecord,
 } from '../coordination-records.js';
+import {
+  POLICY_GRANT_SOURCE_FOR_KIND,
+  isPolicyGrantRecord,
+  parsePolicyDecisionRevision,
+  policyGrantForgeKindOf,
+} from '../policy-grants.js';
 import { CoordinationKind } from '../value-objects/CoordinationKind.vo.js';
 import type { CoordinationKindValue } from '../value-objects/CoordinationKind.vo.js';
 import { CoordinationState } from '../value-objects/CoordinationState.vo.js';
 import type { CoordinationStateValue } from '../value-objects/CoordinationState.vo.js';
 
 const DELIVERY_STATUSES: readonly string[] = ['delivered', 'pending', 'delivery-gap'];
+
+/** The record with a writable optional policyGrant so normalization can omit the key. */
+type MutableCoordinationRequestRecord = Omit<CoordinationRequestRecord, 'policyGrant'> & {
+  policyGrant?: PolicyGrantRecord;
+};
 
 export class CoordinationRequest {
   private constructor(private readonly record: CoordinationRequestRecord) {
@@ -60,6 +72,7 @@ export class CoordinationRequest {
     if (!state.success || state.value === undefined) {
       throw new Error(`CoordinationRequest has an invalid state: ${String(record.state)}`);
     }
+    const policyGrant = CoordinationRequest.readPolicyGrant(record);
     if (!DELIVERY_STATUSES.includes(record.deliveryStatus)) {
       throw new Error(`CoordinationRequest has an invalid delivery status: ${String(record.deliveryStatus)}`);
     }
@@ -75,11 +88,17 @@ export class CoordinationRequest {
     }
     const consumptions = CoordinationRequest.readConsumptions(record.consumptions);
     const acknowledgements = CoordinationRequest.readAcknowledgements(record.acknowledgements);
-    return new CoordinationRequest({
+    const normalized: MutableCoordinationRequestRecord = {
       ...record,
       consumptions,
       acknowledgements,
-    });
+    };
+    if (policyGrant === undefined) {
+      delete normalized.policyGrant;
+    } else {
+      normalized.policyGrant = policyGrant;
+    }
+    return new CoordinationRequest(normalized);
   }
 
   private static readConsumptions(
@@ -125,18 +144,69 @@ export class CoordinationRequest {
     return Object.freeze(acknowledgements.map((acknowledgement) => ({ ...acknowledgement })));
   }
 
+  private static readPolicyGrant(record: CoordinationRequestRecord): PolicyGrantRecord | undefined {
+    if (record.policyGrant === undefined) {
+      return undefined;
+    }
+    const raw: unknown = record.policyGrant;
+    const grantKeys = ['workOrderId', 'attemptId', 'acceptanceReceiptId'];
+    if (
+      typeof raw !== 'object' ||
+      raw === null ||
+      Array.isArray(raw) ||
+      Object.keys(raw).length !== grantKeys.length ||
+      !grantKeys.every((key) => Object.keys(raw).includes(key))
+    ) {
+      throw new Error(
+        'CoordinationRequest policyGrant must be { workOrderId, attemptId, acceptanceReceiptId }',
+      );
+    }
+    for (const key of grantKeys) {
+      const value = (raw as Record<string, unknown>)[key];
+      if (typeof value !== 'string' || value.trim().length === 0 || value.length > 256) {
+        throw new Error(
+          'CoordinationRequest policyGrant must be { workOrderId, attemptId, acceptanceReceiptId }',
+        );
+      }
+    }
+    if (record.kind !== 'action-decision') {
+      throw new Error('CoordinationRequest policy grant must be an action-decision');
+    }
+    const parsed = parsePolicyDecisionRevision(record.decisionRevision);
+    if (parsed === null) {
+      throw new Error('CoordinationRequest policy grant must carry a policy decision revision');
+    }
+    const kind = policyGrantForgeKindOf(record.actionScope);
+    if (kind === null || POLICY_GRANT_SOURCE_FOR_KIND[kind] !== parsed.source) {
+      throw new Error('CoordinationRequest policy grant scope does not match its setting');
+    }
+    if (record.expectedHeadSha === null) {
+      throw new Error('CoordinationRequest policy grant requires an expected head');
+    }
+    const grant = raw as PolicyGrantRecord;
+    return Object.freeze({
+      workOrderId: grant.workOrderId,
+      attemptId: grant.attemptId,
+      acceptanceReceiptId: grant.acceptanceReceiptId,
+    });
+  }
+
   getId(): string {
     return this.record.id;
   }
 
   toRecord(): CoordinationRequestRecord {
-    return {
+    const record: MutableCoordinationRequestRecord = {
       ...this.record,
       consumptions: this.record.consumptions.map((consumption) => ({ ...consumption })),
       acknowledgements: this.record.acknowledgements.map((acknowledgement) => ({
         ...acknowledgement,
       })),
     };
+    if (this.record.policyGrant !== undefined) {
+      record.policyGrant = { ...this.record.policyGrant };
+    }
+    return record;
   }
 
   getKind(): CoordinationKindValue {
@@ -165,6 +235,14 @@ export class CoordinationRequest {
 
   getDecisionRevision(): string | null {
     return this.record.decisionRevision;
+  }
+
+  getPolicyGrant(): PolicyGrantRecord | null {
+    return this.record.policyGrant === undefined ? null : { ...this.record.policyGrant };
+  }
+
+  isPolicyGrant(): boolean {
+    return isPolicyGrantRecord(this.record);
   }
 
   isApproved(): boolean {

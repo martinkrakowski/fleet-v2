@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { EvidenceAssessmentRecord } from '../../domain/evidence-records.js';
+import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain/evidence-records.js';
 import type {
   ForgeCheckStatus,
   ForgeEvidencePort,
@@ -537,5 +537,214 @@ describe('AssessHeadAcceptanceUseCase forge mode (D6)', () => {
     expect(reads).toBe(1);
     expect(result.outcome).toBe('accepted');
     expect(repo.assessment?.forgeEvidence).toBeUndefined();
+  });
+});
+
+describe('AssessHeadAcceptanceUseCase review dissent (R1)', () => {
+  const request = {
+    assessmentId: 'assessment-att-1',
+    candidateHeadSha: CANDIDATE_HEAD,
+    policyRevision: 'pol-1',
+  };
+
+  function reviewReceipt(overrides?: Partial<ReviewReceiptRecord>): ReviewReceiptRecord {
+    return {
+      id: 'review-1',
+      assessmentId: 'assessment-att-1',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: CANDIDATE_HEAD,
+      reviewerModel: 'reviewer-a',
+      implementerModel: 'implementer-model',
+      readOnlyVerified: true,
+      result: 'pass',
+      findings: [],
+      evidenceRef: 'evidence-ref-1',
+      policyRevision: 'pol-1',
+      completedAtIso: '2026-10-15T10:00:00Z',
+      ...overrides,
+    };
+  }
+
+  function useCaseFor(reviewReceipts: readonly ReviewReceiptRecord[]) {
+    const repo = new InMemoryEvidenceAssessmentRepo(
+      makePassingAssessmentRecord({ reviewReceipts }),
+    );
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      ownerDecisionPort: new InMemoryOwnerDecisionPort({
+        outcome: 'approved',
+        decisionId: 'door-1',
+      }),
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: [],
+      }),
+    });
+    return { repo, useCase };
+  }
+
+  it('reviewer A pass plus reviewer B fail (no findings) blocks with a dissent blocker and an opposing tally', async () => {
+    const { repo, useCase } = useCaseFor([
+      reviewReceipt({ id: 'review-a-pass', reviewerModel: 'reviewer-a', result: 'pass' }),
+      reviewReceipt({ id: 'review-b-fail', reviewerModel: 'reviewer-b', result: 'fail' }),
+    ]);
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(
+        result.blockers.some((blocker) =>
+          blocker.includes("review by 'reviewer-b' failed for this head"),
+        ),
+      ).toBe(true);
+      expect(result.reviewTally).toEqual({ pass: 1, fail: 1, unknown: 0, disagreement: true });
+    }
+    expect(repo.assessment?.state).toBe('blocked');
+  });
+
+  it('the same reviewer fail then pass later accepts with a non-disagreeing tally', async () => {
+    const { repo, useCase } = useCaseFor([
+      reviewReceipt({ id: 'review-a-fail', reviewerModel: 'reviewer-a', result: 'fail' }),
+      reviewReceipt({ id: 'review-a-pass', reviewerModel: 'reviewer-a', result: 'pass' }),
+    ]);
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('accepted');
+    if (result.outcome === 'accepted') {
+      expect(result.reviewTally).toEqual({ pass: 1, fail: 0, unknown: 0, disagreement: false });
+    }
+    expect(repo.assessment?.state).toBe('accepted');
+  });
+
+  it('the same reviewer pass then fail later blocks', async () => {
+    const { repo, useCase } = useCaseFor([
+      reviewReceipt({ id: 'review-a-pass', reviewerModel: 'reviewer-a', result: 'pass' }),
+      reviewReceipt({ id: 'review-a-fail', reviewerModel: 'reviewer-a', result: 'fail' }),
+    ]);
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(
+        result.blockers.some((blocker) =>
+          blocker.includes("review by 'reviewer-a' failed for this head"),
+        ),
+      ).toBe(true);
+    }
+    expect(repo.assessment?.state).toBe('blocked');
+  });
+
+  it("reviewer A fail plus B pass, then C pass, still blocks: another reviewer's pass never answers a dissent", async () => {
+    const { repo, useCase } = useCaseFor([
+      reviewReceipt({ id: 'review-a-fail', reviewerModel: 'reviewer-a', result: 'fail' }),
+      reviewReceipt({ id: 'review-b-pass', reviewerModel: 'reviewer-b', result: 'pass' }),
+      reviewReceipt({ id: 'review-c-pass', reviewerModel: 'reviewer-c', result: 'pass' }),
+    ]);
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(
+        result.blockers.some((blocker) =>
+          blocker.includes("review by 'reviewer-a' failed for this head"),
+        ),
+      ).toBe(true);
+    }
+    expect(repo.assessment?.state).toBe('blocked');
+  });
+
+  it('unknown only blocks with the existing no-review-passed message and no fail line', async () => {
+    const { repo, useCase } = useCaseFor([
+      reviewReceipt({ id: 'review-a-unknown', reviewerModel: 'reviewer-a', result: 'unknown' }),
+    ]);
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(
+        result.blockers.some((blocker) =>
+          blocker.includes('no read-only independent review passed for this candidate head'),
+        ),
+      ).toBe(true);
+      expect(result.blockers.some((blocker) => blocker.includes('failed for this head'))).toBe(false);
+    }
+    expect(repo.assessment?.state).toBe('blocked');
+  });
+
+  it('reviewer A pass plus B unknown accepts', async () => {
+    const { repo, useCase } = useCaseFor([
+      reviewReceipt({ id: 'review-a-pass', reviewerModel: 'reviewer-a', result: 'pass' }),
+      reviewReceipt({ id: 'review-b-unknown', reviewerModel: 'reviewer-b', result: 'unknown' }),
+    ]);
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('accepted');
+    expect(repo.assessment?.state).toBe('accepted');
+  });
+
+  it('a non-read-only fail is not counted alongside a passing reviewer', async () => {
+    const { repo, useCase } = useCaseFor([
+      reviewReceipt({
+        id: 'review-a-fail-not-readonly',
+        reviewerModel: 'reviewer-a',
+        result: 'fail',
+        readOnlyVerified: false,
+      }),
+      reviewReceipt({ id: 'review-b-pass', reviewerModel: 'reviewer-b', result: 'pass' }),
+    ]);
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('accepted');
+    expect(repo.assessment?.state).toBe('accepted');
+  });
+
+  it('a reviewer whose receipt records a different implementer seat is an independence blocker, not a fail line', async () => {
+    const { repo, useCase } = useCaseFor([
+      reviewReceipt({
+        id: 'review-a-fail-mismatch',
+        reviewerModel: 'reviewer-a',
+        implementerModel: 'other-implementer',
+        result: 'fail',
+      }),
+      reviewReceipt({ id: 'review-b-pass', reviewerModel: 'reviewer-b', result: 'pass' }),
+    ]);
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(
+        result.blockers.some((blocker) =>
+          blocker.includes("instead of the assessment's seat 'implementer-model'"),
+        ),
+      ).toBe(true);
+      expect(result.blockers.some((blocker) => blocker.includes('failed for this head'))).toBe(false);
+    }
+    expect(repo.assessment?.state).toBe('blocked');
+  });
+
+  it('a fail for a different head does not affect this head', async () => {
+    const { repo, useCase } = useCaseFor([
+      reviewReceipt({
+        id: 'review-a-fail-other-head',
+        reviewerModel: 'reviewer-a',
+        result: 'fail',
+        candidateHeadSha: '2222222222222222222222222222222222222222',
+      }),
+      reviewReceipt({ id: 'review-b-pass', reviewerModel: 'reviewer-b', result: 'pass' }),
+    ]);
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('accepted');
+    expect(repo.assessment?.state).toBe('accepted');
   });
 });

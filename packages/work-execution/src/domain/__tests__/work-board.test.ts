@@ -452,7 +452,7 @@ describe('R4 done', () => {
   it('a merge fact nobody links is an unlinked-merge entry with the matching project', () => {
     const board = boardOf({ merges: [merge(7)], projects: [project(PROJECT_ID, REPO)] });
     expect(board.columns.done.entries).toEqual([
-      { kind: 'unlinked-merge', repository: REPO, number: 7, projectId: PROJECT_ID, headSha: 'abc123', mergedAtIso: '2026-10-27T08:00:00.000Z', firstSeenAtIso: '2026-10-27T08:00:00.000Z', merger: 'fleet' },
+      { kind: 'unlinked-merge', repository: REPO, number: 7, projectId: PROJECT_ID, headSha: 'abc123', mergedAtIso: '2026-10-27T08:00:00.000Z', firstSeenAtIso: '2026-10-27T08:00:00.000Z', merger: 'fleet', badges: [] },
     ]);
   });
 
@@ -949,7 +949,8 @@ describe('R11 not read', () => {
     expect(board.columns.inFlight.notRead.map((r) => r.source)).toContain('attempts');
     const doneCard = board.lanes.find((l) => l.placement === 'done');
     expect(doneCard).toBeDefined();
-    expect(doneCard?.notRead).toEqual([]);
+    expect(doneCard?.notRead.map((r) => r.source)).not.toContain('attempts');
+    expect(doneCard?.notRead).toContainEqual({ source: 'forge-observation', repository: REPO, readAtIso: null, status: 'not-read' });
   });
 
   it('a source missing from sources counts as not read', () => {

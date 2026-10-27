@@ -34,6 +34,23 @@ import type {
   SourceReading,
 } from './work-board-facts.js';
 import { planTextError } from './lane-plan-sidecar.js';
+import {
+  boardStepText,
+  laneBadges,
+  lanePullRequests,
+  laneReviewCounts,
+  laneRound,
+  laneSeat,
+  laneStep,
+} from './work-board-steps.js';
+import type {
+  BoardBadge,
+  BoardLinkConflictLike,
+  BoardPrStatus,
+  BoardReviewCounts,
+  BoardSeat,
+  BoardStep,
+} from './work-board-steps.js';
 
 export const BOARD_COLUMNS = ['done', 'waiting', 'in-flight', 'queued'] as const;
 export type BoardColumn = (typeof BOARD_COLUMNS)[number];
@@ -74,6 +91,14 @@ export interface BoardLaneCard {
   readonly waitingOn: readonly BoardOwnerReason[];  // non-empty iff placement 'waiting'; sinceIso, then id
   /** The not-read readings this card's placement depended on (rule R11). */
   readonly notRead: readonly SourceReading[];
+  /** The in-flight step (S3); null off In flight. */
+  readonly step: BoardStep | null;
+  readonly stepText: string | null;
+  readonly seat: BoardSeat | null;
+  readonly round: number | null;
+  readonly pullRequests: readonly BoardPrStatus[];
+  readonly reviewCounts: BoardReviewCounts | null;
+  readonly badges: readonly BoardBadge[];
 }
 
 /** One entry of the deduplicated owner-items list (plan §3.1 identity rule). */
@@ -94,7 +119,8 @@ export interface BoardOwnerEntry {
 export type BoardDoneEntry =
   | { readonly kind: 'lane'; readonly key: string }
   | { readonly kind: 'unlinked-merge'; readonly repository: string; readonly number: number; readonly projectId: string | null;
-      readonly headSha: string; readonly mergedAtIso: string; readonly firstSeenAtIso: string; readonly merger: 'fleet' | 'unknown' };
+      readonly headSha: string; readonly mergedAtIso: string; readonly firstSeenAtIso: string; readonly merger: 'fleet' | 'unknown';
+      readonly badges: readonly BoardBadge[] };
 
 export type BoardWaitingEntry =
   | { readonly kind: 'lane'; readonly key: string }
@@ -168,6 +194,17 @@ interface Card {
   placement: BoardPlacement;
   notRead: SourceReading[];
   planOrder: number;
+  links: BoardPullRequestLinkFact[];
+  attempts: BoardAttemptFact[];
+  runs: BoardRunFact[];
+  declarations: BoardDeclarationFact[];
+  pullRequests: BoardPrStatus[];
+  step: BoardStep | null;
+  stepText: string | null;
+  seat: BoardSeat | null;
+  round: number | null;
+  reviewCounts: BoardReviewCounts | null;
+  badges: BoardBadge[];
 }
 
 function stringAsc(a: string, b: string): number {
@@ -279,6 +316,17 @@ function makeCard(ref: LaneRef, facts: BoardFacts): Card {
     placement: 'queued',
     notRead: [],
     planOrder,
+    links: [],
+    attempts: [],
+    runs: [],
+    declarations: [],
+    pullRequests: [],
+    step: null,
+    stepText: null,
+    seat: null,
+    round: null,
+    reviewCounts: null,
+    badges: [],
   };
 }
 
@@ -390,11 +438,14 @@ function buildCards(facts: BoardFacts): Card[] {
     const woIds = woIdsByKey.get(card.key) ?? [];
     card.workOrderIds = woIds.slice().sort(stringAsc);
     const links = linksByKey.get(card.key) ?? [];
-    card.started =
-      (attemptsByKey.get(card.key)?.length ?? 0) > 0 ||
-      (runsByKey.get(card.key)?.length ?? 0) > 0 ||
-      (declarationsByKey.get(card.key)?.length ?? 0) > 0 ||
-      links.length > 0;
+    const attempts = attemptsByKey.get(card.key) ?? [];
+    const runs = runsByKey.get(card.key) ?? [];
+    const declarations = declarationsByKey.get(card.key) ?? [];
+    card.links = links;
+    card.attempts = attempts;
+    card.runs = runs;
+    card.declarations = declarations;
+    card.started = attempts.length > 0 || runs.length > 0 || declarations.length > 0 || links.length > 0;
     card.done = doneOf(links, woIds, facts);
   }
 
@@ -625,15 +676,36 @@ function notReadFor(sources: readonly BoardSource[], readings: readonly SourceRe
   return readings.filter((r) => r.status === 'not-read' && sources.includes(r.source));
 }
 
-function gatherReadings(facts: BoardFacts): SourceReading[] {
+/** Rule S8: a card's not-read readings, extended with its linked PRs' forge readings and, In flight, review-evidence. */
+function cardNotRead(card: Card, readings: readonly SourceReading[]): SourceReading[] {
+  const bases = CARD_NOT_READ[card.placement];
+  const repos = new Set(card.links.map((link) => link.repository));
+  const inFlight = card.placement === 'in-flight';
+  return readings.filter((reading) => {
+    if (reading.status !== 'not-read') return false;
+    if (bases.includes(reading.source)) return true;
+    if (reading.source === 'forge-observation' && reading.repository !== null && repos.has(reading.repository)) return true;
+    if (inFlight && reading.source === 'review-evidence') return true;
+    return false;
+  });
+}
+
+function gatherReadings(facts: BoardFacts, forgeRepos: readonly string[] = []): SourceReading[] {
   const readings: SourceReading[] = [];
   for (const source of BOARD_SOURCES) {
     if (source === 'forge-observation') {
       const forge = facts.sources.filter((r) => r.source === source);
-      if (forge.length === 0) {
+      const byRepo = new Map<string, SourceReading>();
+      for (const reading of forge) byRepo.set(reading.repository ?? '', reading);
+      for (const repository of forgeRepos) {
+        if (!byRepo.has(repository)) {
+          byRepo.set(repository, { source, repository, readAtIso: null, status: 'not-read' });
+        }
+      }
+      if (byRepo.size === 0) {
         readings.push({ source, repository: null, readAtIso: null, status: 'not-read' });
       } else {
-        const sorted = [...forge].sort((a, b) => (a.repository ?? '').localeCompare(b.repository ?? ''));
+        const sorted = [...byRepo.values()].sort((a, b) => (a.repository ?? '').localeCompare(b.repository ?? ''));
         readings.push(...sorted);
       }
     } else {
@@ -662,6 +734,13 @@ function toLane(card: Card): BoardLaneCard {
     done: card.done,
     waitingOn: card.waitingOn,
     notRead: card.notRead,
+    step: card.step,
+    stepText: card.stepText,
+    seat: card.seat,
+    round: card.round,
+    pullRequests: card.pullRequests,
+    reviewCounts: card.reviewCounts,
+    badges: card.badges,
   };
 }
 
@@ -699,6 +778,10 @@ function buildDoneColumn(
     const key = merge.repository + '#' + String(merge.number);
     if (linked.has(key)) continue;
     const project = projectsByRepo.find((p) => p.repository === merge.repository);
+    const integrityBadges: BoardBadge[] = facts.mergeIntegrity
+      .filter((f) => f.repository === merge.repository && f.number === merge.number)
+      .map((f): Extract<BoardBadge, { kind: 'merge-integrity' }> => ({ kind: 'merge-integrity', repository: f.repository, number: f.number, readAtIso: f.readAtIso }))
+      .sort((a, b) => a.readAtIso.localeCompare(b.readAtIso));
     const entry: BoardDoneEntry = {
       kind: 'unlinked-merge',
       repository: merge.repository,
@@ -708,6 +791,7 @@ function buildDoneColumn(
       mergedAtIso: merge.mergedAtIso,
       firstSeenAtIso: merge.firstSeenAtIso,
       merger: merge.merger,
+      badges: integrityBadges,
     };
     const ms = parseTimeMs(merge.mergedAtIso);
     if (ms !== null && ms < cutoffMs) {
@@ -790,18 +874,78 @@ function entryOrderCompare(a: BoardOwnerEntry, b: BoardOwnerEntry): number {
 }
 
 function computeBoard(facts: BoardFacts, readAtIso: string, sinceIso: string | null, policy: BoardPolicy): WorkBoard {
-  const readings = gatherReadings(facts);
   const cards = buildCards(facts);
   const cardByKey = new Map(cards.map((c) => [c.key, c]));
+
+  const forgeRepos: string[] = [];
+  {
+    const seen = new Set<string>();
+    for (const card of cards) {
+      for (const link of card.links) {
+        if (!seen.has(link.repository)) {
+          seen.add(link.repository);
+          forgeRepos.push(link.repository);
+        }
+      }
+    }
+  }
+  const readings = gatherReadings(facts, forgeRepos);
 
   const drafts = buildEntries(facts, cardByKey);
   const entries = drafts.map((d) => finalizeEntry(d, cardByKey));
   const reasonsByKey = collectReasons(entries);
 
+  const conflictLikes: BoardLinkConflictLike[] = facts.linkConflicts.map((conflict) => ({
+    repository: conflict.repository,
+    number: conflict.number,
+    linkedLane: formatLaneRef(resolveLaneRef(conflict.linkedLane, facts)),
+    refusedLane: formatLaneRef(resolveLaneRef(conflict.refusedLane, facts)),
+    recordedAtIso: conflict.recordedAtIso,
+  }));
+
   for (const card of cards) {
     card.waitingOn = reasonsByKey.get(card.key) ?? [];
     card.placement = placementOf(card, card.waitingOn);
-    card.notRead = notReadFor(CARD_NOT_READ[card.placement], readings);
+  }
+
+  for (const card of cards) {
+    card.pullRequests = lanePullRequests(card.links, facts, readAtIso, policy);
+    card.step = laneStep({
+      placement: card.placement,
+      dropped: card.planStatus === 'dropped',
+      runs: card.runs,
+      attempts: card.attempts,
+      declarations: card.declarations,
+      pullRequests: card.pullRequests,
+      nowIso: readAtIso,
+      policy,
+    });
+    card.stepText = card.step === null ? null : boardStepText(card.step);
+    card.seat = laneSeat({
+      placement: card.placement,
+      step: card.step,
+      runs: card.runs,
+      attempts: card.attempts,
+      declarations: card.declarations,
+    });
+    card.round = laneRound({ placement: card.placement, runs: card.runs, attempts: card.attempts });
+    card.reviewCounts = laneReviewCounts(card.placement === 'in-flight', card.attempts, facts.reviewCounts, readings);
+    card.badges = laneBadges({
+      key: card.key,
+      planStatus: card.planStatus,
+      step: card.step,
+      pullRequests: card.pullRequests,
+      runs: card.runs,
+      attempts: card.attempts,
+      declarations: card.declarations,
+      ownerEntries: entries,
+      waitingOnIds: card.waitingOn.map((reason) => reason.id),
+      linkConflicts: conflictLikes,
+      mergeIntegrity: facts.mergeIntegrity,
+      nowIso: readAtIso,
+      policy,
+    });
+    card.notRead = cardNotRead(card, readings);
   }
 
   const lanes = cards.map(toLane).sort((a, b) => a.key.localeCompare(b.key));

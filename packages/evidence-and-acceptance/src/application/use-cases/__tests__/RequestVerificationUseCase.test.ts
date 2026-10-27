@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import type { CheckCoverage } from '../../../domain/check-coverage.js';
 import type { EvidenceAssessmentRecord } from '../../../domain/evidence-records.js';
 import type {
   ArchiveEvidenceRequest,
@@ -55,6 +56,62 @@ class StubExecutor implements VerificationExecutorPort {
     return {
       result: 'pass',
       exitCode: 0,
+      outputSummary: 'check passed',
+      completedAtIso: '2026-10-15T12:00:00.000Z',
+    };
+  }
+}
+
+class CoverageStubExecutor implements VerificationExecutorPort {
+  calls: ExecuteVerificationCheckRequest[] = [];
+
+  async executeVerificationCheck(
+    request: ExecuteVerificationCheckRequest,
+  ): Promise<ExecuteVerificationCheckResult> {
+    this.calls.push(request);
+    return {
+      result: 'pass',
+      exitCode: 0,
+      coverage: { ran: true, unitKind: 'tests', units: 12 },
+      outputSummary: 'check passed',
+      completedAtIso: '2026-10-15T12:00:00.000Z',
+    };
+  }
+}
+
+class MalformedCoverageStubExecutor implements VerificationExecutorPort {
+  calls: ExecuteVerificationCheckRequest[] = [];
+
+  async executeVerificationCheck(
+    request: ExecuteVerificationCheckRequest,
+  ): Promise<ExecuteVerificationCheckResult> {
+    this.calls.push(request);
+    return {
+      result: 'pass',
+      exitCode: 0,
+      coverage: { ran: true, unitKind: 'lines', units: 3 } as unknown as CheckCoverage,
+      outputSummary: 'check passed',
+      completedAtIso: '2026-10-15T12:00:00.000Z',
+    };
+  }
+}
+
+/** Valid coverage for every check except 'test', which returns a malformed value. */
+class SecondCheckMalformedStubExecutor implements VerificationExecutorPort {
+  calls: ExecuteVerificationCheckRequest[] = [];
+
+  async executeVerificationCheck(
+    request: ExecuteVerificationCheckRequest,
+  ): Promise<ExecuteVerificationCheckResult> {
+    this.calls.push(request);
+    const coverage =
+      request.procedureName === 'test'
+        ? ({ ran: true, unitKind: 'lines', units: 3 } as unknown as CheckCoverage)
+        : ({ ran: true, unitKind: 'tests', units: 12 } as CheckCoverage);
+    return {
+      result: 'pass',
+      exitCode: 0,
+      coverage,
       outputSummary: 'check passed',
       completedAtIso: '2026-10-15T12:00:00.000Z',
     };
@@ -308,5 +365,108 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
       expect(result.reason).toContain('implementer seat');
     }
     expect(executor.calls).toHaveLength(0);
+  });
+
+  it('copies execution coverage onto the stored receipt when present', async () => {
+    const repo = new InMemoryAssessmentRepo([]);
+    const executor = new CoverageStubExecutor();
+    const archive = new StubArchive();
+    const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+
+    const result = await useCase.requestVerification({
+      assessmentId: 'asm-with-coverage',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      requiredChecks: ['lint'],
+    });
+
+    expect(result.outcome).toBe('completed');
+    const stored = await repo.findAssessmentById('asm-with-coverage');
+    const receipt = stored?.verificationReceipts.find((r) => r.procedureName === 'lint');
+    expect(receipt).toBeDefined();
+    expect(receipt?.coverage).toEqual({ ran: true, unitKind: 'tests', units: 12 });
+  });
+
+  it('omits coverage from the stored receipt when executor returns none', async () => {
+    const repo = new InMemoryAssessmentRepo([]);
+    const executor = new StubExecutor();
+    const archive = new StubArchive();
+    const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+
+    const result = await useCase.requestVerification({
+      assessmentId: 'asm-without-coverage',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      requiredChecks: ['lint'],
+    });
+
+    expect(result.outcome).toBe('completed');
+    const stored = await repo.findAssessmentById('asm-without-coverage');
+    const receipt = stored?.verificationReceipts.find((r) => r.procedureName === 'lint');
+    expect(receipt).toBeDefined();
+    if (receipt !== undefined) {
+      expect('coverage' in receipt).toBe(false);
+    }
+  });
+
+  it('refuses with typed rejected before archiving when executor returns malformed coverage', async () => {
+    const repo = new InMemoryAssessmentRepo([]);
+    const executor = new MalformedCoverageStubExecutor();
+    const archive = new StubArchive();
+    const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+
+    const result = await useCase.requestVerification({
+      assessmentId: 'asm-malformed-coverage',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      requiredChecks: ['lint'],
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.reason).toContain('malformed coverage');
+    }
+    expect(archive.calls).toHaveLength(0);
+    const stored = await repo.findAssessmentById('asm-malformed-coverage');
+    expect(stored).toBeNull();
+  });
+
+  it('archives nothing when a later check returns malformed coverage after an earlier valid one', async () => {
+    const repo = new InMemoryAssessmentRepo([]);
+    const executor = new SecondCheckMalformedStubExecutor();
+    const archive = new StubArchive();
+    const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+
+    const result = await useCase.requestVerification({
+      assessmentId: 'asm-second-malformed',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      requiredChecks: ['lint', 'test'],
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.reason).toContain("'test'");
+      expect(result.reason).toContain('nothing was archived or recorded');
+    }
+    expect(executor.calls.map((call) => call.procedureName)).toEqual(['lint', 'test']);
+    expect(archive.calls).toHaveLength(0);
+    expect(await repo.findAssessmentById('asm-second-malformed')).toBeNull();
   });
 });

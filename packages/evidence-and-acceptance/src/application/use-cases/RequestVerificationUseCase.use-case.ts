@@ -10,11 +10,15 @@ import type {
   EvidenceAssessmentRecord,
   VerificationReceiptRecord,
 } from '../../domain/evidence-records.js';
+import { isCheckCoverage } from '../../domain/check-coverage.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { EvidenceArchivePort } from '../ports/out/EvidenceArchivePort.out-port.js';
-import type { VerificationExecutorPort } from '../ports/out/VerificationExecutorPort.out-port.js';
+import type {
+  ExecuteVerificationCheckResult,
+  VerificationExecutorPort,
+} from '../ports/out/VerificationExecutorPort.out-port.js';
 import type {
   RequestVerificationPort,
   RequestVerificationRequest,
@@ -151,33 +155,52 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
       updatedAtIso: nowIso,
     };
 
-    const receipts: VerificationReceiptRecord[] = [];
+    // Checks run one at a time on the verification host, as before. Every
+    // execution is validated before anything is archived, so malformed
+    // coverage from any check leaves no archived evidence and no receipt.
+    const executions: { procedureName: string; execution: ExecuteVerificationCheckResult }[] = [];
     for (const procedureName of request.requiredChecks) {
       const execution = await deps.executor.executeVerificationCheck({
         hostId: request.hostId,
         candidateHeadSha: request.candidateHeadSha,
         procedureName,
       });
-      const archived = await deps.archive.archiveEvidence({
-        artifactId: `verification-${request.assessmentId}-${procedureName}-${request.candidateHeadSha}`,
-        candidateHeadSha: request.candidateHeadSha,
-        content: execution.outputSummary,
-      });
-      receipts.push({
-        id: `vr-${request.assessmentId}-${procedureName}`,
-        assessmentId: request.assessmentId,
-        projectId: base.projectId,
-        attemptId: base.attemptId,
-        candidateHeadSha: request.candidateHeadSha,
-        hostId: request.hostId,
-        procedureName,
-        result: execution.result,
-        exitCode: execution.exitCode,
-        evidenceRef: archived.evidenceRef,
-        policyRevision: base.policyRevision,
-        completedAtIso: execution.completedAtIso,
-      });
+      executions.push({ procedureName, execution });
     }
+    const malformed = executions.find(
+      ({ execution }) => execution.coverage !== undefined && !isCheckCoverage(execution.coverage),
+    );
+    if (malformed !== undefined) {
+      return {
+        outcome: 'rejected',
+        reason: `Verification executor returned malformed coverage for '${malformed.procedureName}'; nothing was archived or recorded`,
+      };
+    }
+
+    const receipts: VerificationReceiptRecord[] = await Promise.all(
+      executions.map(async ({ procedureName, execution }) => {
+        const archived = await deps.archive.archiveEvidence({
+          artifactId: `verification-${request.assessmentId}-${procedureName}-${request.candidateHeadSha}`,
+          candidateHeadSha: request.candidateHeadSha,
+          content: execution.outputSummary,
+        });
+        return {
+          id: `vr-${request.assessmentId}-${procedureName}`,
+          assessmentId: request.assessmentId,
+          projectId: base.projectId,
+          attemptId: base.attemptId,
+          candidateHeadSha: request.candidateHeadSha,
+          hostId: request.hostId,
+          procedureName,
+          result: execution.result,
+          exitCode: execution.exitCode,
+          ...(execution.coverage !== undefined ? { coverage: execution.coverage } : {}),
+          evidenceRef: archived.evidenceRef,
+          policyRevision: base.policyRevision,
+          completedAtIso: execution.completedAtIso,
+        };
+      }),
+    );
 
     const merged: EvidenceAssessmentRecord = {
       ...base,

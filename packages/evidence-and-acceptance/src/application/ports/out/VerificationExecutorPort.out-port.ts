@@ -5,6 +5,7 @@
  */
 
 import type { EvidenceResultValue } from '../../../domain/value-objects/EvidenceResult.vo.js';
+import type { CheckCoverage } from '../../../domain/check-coverage.js';
 
 export interface ExecuteVerificationCheckRequest {
   readonly hostId: string;
@@ -15,6 +16,7 @@ export interface ExecuteVerificationCheckRequest {
 export interface ExecuteVerificationCheckResult {
   readonly result: EvidenceResultValue;
   readonly exitCode: number | null;
+  readonly coverage?: CheckCoverage;
   readonly outputSummary: string;
   readonly completedAtIso: string;
 }

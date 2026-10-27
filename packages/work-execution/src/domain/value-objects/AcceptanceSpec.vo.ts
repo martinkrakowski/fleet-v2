@@ -37,6 +37,7 @@ export const MAX_GATE_COMMANDS = 20;
 export const MAX_GATE_ARGV_ENTRIES = 64;
 export const MAX_GATE_ARG_CHARACTERS = 4096;
 
+/** Guards against a pasted shell string (word splitting), not a sandbox: env, interpreters with -c/-e and package scripts still reach a shell. */
 const SHELL_BASENAMES: readonly string[] = ['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh'];
 
 function coverageError(value: unknown, n: number): string | null {

@@ -321,6 +321,8 @@ describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
       }),
     );
 
+    expect(first.outcome).toBe('prepared');
+    expect(second.outcome).toBe('prepared');
     if (first.outcome === 'prepared' && second.outcome === 'prepared') {
       expect(first.prepared.briefDigest).not.toBe(second.prepared.briefDigest);
     }

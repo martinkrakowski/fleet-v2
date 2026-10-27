@@ -113,7 +113,7 @@ type WaitGuard = {                        // one row
 | `project-lane-cap` | "an in-flight lane of <project> ends (5 of 5)" | "reading <source> would decide it" |
 | `capacity` | "a reservation releases (8 of 8)" | "reading reservations would decide it" |
 | `seat` | — | "a seat probe is recorded (none exists yet; A-S or S1)" |
-| `brief` | A recorded failed read: "brief read failed at <time>; run `fleet-v2 plan brief-check <projectId>/<planId>/<laneId>`" | No read recorded, or the brief-read store not read: "brief not read since <time> — run `plan brief-check`" ("never read" when there is no read at all) |
+| `brief` | A recorded failed read: "brief read failed at <time>; run `fleet-v2 plan brief-check <projectId>/<planId>/<laneId>`" | No read recorded, or the brief-read store not read: "brief not read since <time> — run `fleet-v2 plan brief-check <projectId>/<planId>/<laneId>`" ("never read" when there is no read at all) |
 | `cycle-in-records` | "fix the plans' `after` rows; the import refuses new cycles" | — |
 
 "Done" covers both ways the board plan counts a predecessor Done (§3.1 there): a merge record for a linked PR, or its work order recorded `merged` with no PR; a predecessor that is a work order with no PR is never told to "merge". The brief guard's two cells are distinct on purpose: a recorded failed read is `blocked`, an absent or unread one is `unknown`, so a missing read is never shown as a failure. "Releases its worktree", not "its attempt ends": a lane between steps still holds its package because its worktree is still taken (board plan §3.6). If a later guard can clear on more than one event, its text lists them all ("one of: …"), never one of them.
@@ -182,15 +182,15 @@ type BoardLane = {                                   // the served document, for
 - Nothing blocked: "Nothing blocks it but unchecked guards: seat not checked." (board plan §3.6 wording; never "ready" in v1).
 - A store unreadable: "Not known: attempts not read (quarantined); package and slot guards could not be checked."
 
-**Chains, not a tree.** For each blocked dependency row (`after-not-done`, `exclusive-order`) whose subject is Queued or Waiting, the walk follows that predecessor's own **first** blocked dependency row (in the one order above), so each chain is one path, one line per lane: "K12 ← K1b (in flight, code-review) ← K1-2c (in flight, watching CI as of 10:02)", labelled "a chain to merge first: 2 lanes".
+**Chains, not a tree.** For each blocked dependency row (`after-not-done`, `exclusive-order`) whose subject is Queued or Waiting, the walk follows that predecessor's own **first** blocked dependency row (in the one order above), so each chain is one path, one line per lane: "K12 ← K1b (in flight, code-review) ← K1-2c (in flight, watching CI as of 10:02)", labelled "a chain to finish first: 2 lanes".
 
-- **Nothing is understated.** When a lane on the chain has more blocked dependency rows than the one followed, its entry says "and n other dependencies" (`otherBlockedDependencies`), and the chain's count becomes "at least n". There is no "longest chain" label: the view shows a chain to merge first, never a claim that it is the critical path.
+- **Nothing is understated.** When a lane on the chain has more blocked dependency rows than the one followed, its entry says "and n other dependencies" (`otherBlockedDependencies`), and the chain's count becomes "at least n". There is no "longest chain" label: the view shows a chain to finish first, never a claim that it is the critical path.
 - **A chain ends** (`head`) at a lane that has started (its step is the head), a Waiting lane (marked "waiting on you: decision D14", `ownerAction: true`), a Queued lane whose first blocked row is not a dependency (`blocked-by-resource`, naming the guard and its subject: "K11a (queued: shared file .architecture/manifest.yaml held by O1b)"), a Queued lane with nothing blocked ("K2b: nothing blocks it but unchecked guards"), a dropped or unresolved predecessor, a cycle, or the node cap.
 - **Resource guards are leaves**: "package work-execution held by K3 (in flight, fixing round 2)" names K3 and its step and does not follow K3's dependencies, since K3 has started.
 - **Several blocked dependency rows** give several chains, in row order. A lane on two chains is drawn in both; a chain is a line, so there is nothing to "see above".
 - **Lanes, not time.** fleet-v2 records no lane durations; the count is a number of lanes, and an unread source on a chain makes it "at least n".
 - **The walk keeps a visited set.** Each chain carries the set of lanes on its own path; meeting a lane already on that path ends the chain at once with head `cycle` (the path named), adds the `cycle-in-records` row at the root (blocked, never `unknown`) and an integrity badge on the card. The walk never loops and never reaches the cap through a cycle.
-- **Cap.** The closure visits at most 200 **distinct** lanes across all chains (a lane on two chains counts once). Only that sets `truncated.nodeCap` and head `cap`, read as "at least n" with "closure cut at 200 lanes"; a cycle is never reported as a size cut. The import keeps the graph acyclic, so in practice the walk ends well before the cap; the cap bounds rendering and the response.
+- **Cap.** The closure visits at most 200 **distinct** lanes across all chains (a lane on two chains counts once). Only that sets `truncated.nodeCap` and head `cap`, read as "at least n" with "closure cut at 200 lanes"; a cycle found within the cap is never reported as a size cut; a cycle whose first repeat lies beyond the 200th distinct lane is reported honestly as the cap ("at least 200"), never as a cycle the walk did not see. The import keeps the graph acyclic, so in practice the walk ends well before the cap; the cap bounds rendering and the response.
 - **Cross-project predecessors** are followed when their project is active and their plan imported; otherwise the row is `after-unresolved`, or blocked with "predecessor's project is not on the board". Either ends the chain.
 - **Dropped predecessors** are blocked leaves, `after-dropped` (board plan D12), linked to the dropped lane's card.
 - **The tree** (`WaitNode`: every blocked and unknown row below each lane, DAG-deduplicated, built on the same visited set) is produced by the same walk and carried in `--json`, but no surface draws it in v1 (Q3).
@@ -250,7 +250,7 @@ Queued and Waiting cards keep WB9a's content and gain two chips (blocked n, unkn
 │ ? unknown  seat             not checked                    │
 │            decided by a seat probe (none exists yet)       │
 │ ▸ clear (5)                                                │
-│ Chains and unblocks: open the waits-for page ›             │
+│ Chains and unblocks: open the waits-for page › (WB9d)      │
 ```
 
 The expanded state is client view state keyed by lane ref and survives a re-read. If the lane starts during a re-read, the expansion is replaced by "K12 started at 10:06: <step>" and a polite live region says "K12 moved to In flight"; nothing animates.
@@ -281,9 +281,9 @@ held by K3 (in flight). Unknown 1: seat not checked.
 ┌ Chains (lanes, not time) ───────────────────────────────┐  ┌ Unblocks ─────────┐
 │ K12 ← K1b › in flight, code-review                       │  │ K13 ›  Queued     │
 │     ← K1-2c › in flight, watching CI as of 10:02         │  │ K14 ›  Queued     │
-│ a chain to merge first: 2 lanes                          │  └───────────────────┘
+│ a chain to finish first: 2 lanes                          │  └───────────────────┘
 │ K12 ← K11a › queued: shared file held by O1b (in flight) │
-│ a chain to merge first: 1 lane                           │
+│ a chain to finish first: 1 lane                           │
 └──────────────────────────────────────────────────────────┘
 Sources: plans 10:04 · work orders 10:04 · attempts 10:03 · runs not read (not on this
 installation) · reservations 10:04 · owner items 10:04 · merges 10:03 · forge 10:02
@@ -338,9 +338,9 @@ clear    5 rows: after-not-done K1-2a, owner-decision D14, project-lane-cap,
 
 CHAINS  lanes to finish first, not time
   K12 <- K1b (in flight, code-review) <- K1-2c (in flight, watching CI 10:02)
-      a chain to merge first: 2 lanes
+      a chain to finish first: 2 lanes
   K12 <- K11a (queued: shared file .architecture/manifest.yaml held by O1b)
-      a chain to merge first: 1 lane
+      a chain to finish first: 1 lane
 
 UNBLOCKS  K13 (queued), K14 (queued)
 SOURCES   runs not read (not on this installation); forge as of 10:02
@@ -393,8 +393,8 @@ The board is a screen in the shared `fleet-v2 tui` shell (board plan D8: onboard
    unknown  seat              not checked  decided by a seat probe
    + 5 clear (c to show)
 
- Chains: K12 <- K1b <- K1-2c   a chain to merge first: 2 lanes
-         K12 <- K11a (shared file held by O1b)   1 lane
+ Chains: K12 <- K1b <- K1-2c   a chain to finish first: 2 lanes
+         K12 <- K11a (shared file held by O1b)   a chain to finish first: 1 lane
  ------------------------------------------------------------------------------
  up/down row   Enter open subject   c clear rows   u unblocks   y copy command
  Esc back   q quit
@@ -447,7 +447,7 @@ Each lane is about 45 minutes, one PR, the standard pipeline. The board plan's �
 | WB6w | `ReadBoardLaneUseCase` and `ReadBoardLanePort`; `BoardLane` with `unblocks` and `noWaits` for every column; ref resolution (full forms and `wo:` only, rename aliases; a short label refused with the full refs it could mean); not-read propagation into `sources` | work-execution (application), **manifest** | 2 | WB6, WB2c; manifest queue |
 | WB7d | `board lane` prints §3.5 for Queued and Waiting lanes: stacked rows, chains, unblocks, sources; `--all-guards`; `--json` (`BoardLane`); exit codes; 80-column snapshot tests, TTY and non-TTY | apps/cli, **`index.ts`, `composition.ts`** | 2 | WB7b, WB6w; in sequence with the other `index.ts` lanes |
 | WB8w | `GET /v1/board/lane?ref=`; `400`, `404`, `200` with not-read sources; route tests | apps/api (`work/` composition, **`runtime.ts`**) | 1 | WB8, WB6w; in sequence with the other `apps/api` wiring lanes |
-| WB9c | Card affordance on Queued and Waiting cards: chips, first-blocker line, the inline `WaitsForTable` in compact mode from the board read model's `waitsOn`, `waitCounts`, `firstBlocker` and `summary` only (no chain; a link to the lane page); expanded state across re-reads; the started-while-open case; keyboard | apps/web (no `view-nav.tsx` change) | 2 | WB9a; after the `apps/web` lane running at the time. Needs only `/v1/board` |
+| WB9c | Card affordance on Queued and Waiting cards: chips, first-blocker line, the inline `WaitsForTable` in compact mode from the board read model's `waitsOn`, `waitCounts`, `firstBlocker` and `summary` only (no chain; the link to the lane page renders only once WB9d's route exists); expanded state across re-reads; the started-while-open case; keyboard | apps/web (no `view-nav.tsx` change) | 2 | WB9a; after the `apps/web` lane running at the time. Needs only `/v1/board` |
 | WB9d | `/board/lane?ref=` page (full encoded ref): `WaitsForTable` in full mode, summary, chains, unblocks, sources, copyable command; the §3.4 states including each `noWaits` wording; mobile stacked rows | apps/web | 2 | WB9c, WB8w |
 | WB14a | The Board screen in the shared `fleet-v2 tui` shell (the board plan's WB14) | apps/cli | 2 | P9 or T8a, WB7b |
 | WB14b | The waits panel: Enter opens, row navigation to subjects with a back stack, clear rows, unblocks, copy | apps/cli | 2 | WB14a, WB6w |
@@ -512,7 +512,7 @@ Writing the plan from Fable's revision, the orchestrator changed the `holder-end
 **Grok 4.7, round 1, review of rev 0 in its pull request (2026-10-27): one blocker, eight majors, one minor.** The orchestrator checked each finding and decided the resolutions; rev 1 applies them.
 1. Blocker: `unblocks` lived only on `LaneWaits`, which is `null` for started, Done, dropped and deferred lanes, yet those pages list it. Resolved: `unblocks` moved onto `BoardLane`, served for a lane in any column (§3.2, §3.7, WB6w).
 2. Major: the expanded card drew a chain that `GET /v1/board` does not serve, and the web may not compute one. Resolved: the card shows only the per-card counts, `firstBlocker`, `summary` and its `waitsOn` rows; chains appear only on the lane page from `GET /v1/board/lane` (§3.3, WB9c).
-3. Major: following only the first blocked dependency under a "longest chain" label could understate the lanes to merge first. Resolved: the label is "a chain to merge first"; a lane with more blocked dependencies than the one followed says "and n other dependencies" and makes the chain's count "at least n" (`otherBlockedDependencies`, §3.2). The Challenge item stays.
+3. Major: following only the first blocked dependency under a "longest chain" label could understate the lanes to merge first. Resolved: the label is "a chain to finish first"; a lane with more blocked dependencies than the one followed says "and n other dependencies" and makes the chain's count "at least n" (`otherBlockedDependencies`, §3.2). The Challenge item stays.
 4. Major: no chain head for a lane held by a resource, so "K11a (queued: shared file held by O1b)" could not be represented. Resolved: head `blocked-by-resource` carrying the guard's reason and subject (§3.2).
 5. Major: no visited set, so a cycle met mid-walk could run to the cap and read as a size cut. Resolved: each chain keeps a visited set; a revisit ends it at once with head `cycle`; the 200 cap counts distinct lanes only and never reports a cycle (§3.2, WB2c).
 6. Major: dependencies cleared only on "merges", but a predecessor can be Done with no PR. Resolved: `clearedBy` `{ kind: 'done', subject }`, worded "K1b is done (merged, or recorded done without a PR)", in the wording table (§3.1).
@@ -528,3 +528,5 @@ Grok judged Q8 (exit `0` for a blocked lane) justified, not a finding.
 Whether `clearedBy` stays honest as guards grow. Today each reason has one clearing event and its text is fixed per reason, so it is rendered from records, not inferred. A later guard with several clearing events (a seat guard that clears on a probe or on a policy change) must list them all, never pick one. A reviewer should test every row of the §3.1 table against the board plan's §3.6 rules, especially the resource rows for a lane between steps.
 
 A second candidate: whether following only each predecessor's **first** blocked dependency hides the real critical path. A predecessor blocked by two dependencies shows one of them in the chain; the other appears only on that predecessor's own page. Rev 1 marks such a lane "and n other dependencies" and makes the count "at least n", so nothing is understated; a reviewer should still check whether the owner, seeing "at least", needs the full set of paths (the tree, WB7e) sooner than v1 gives it, or whether following the dependency with the most lanes behind it, instead of the first in row order, would make the one chain shown more useful.
+
+**Orchestrator, Grok round 2 (2026-10-27).** Grok's re-review found nine of ten round-1 findings resolved, one partial and four new; this was the second round, so the orchestrator applied the resolutions: every chain count reads "a chain to finish first" (a predecessor can be done without a merge, or be a resource hold); a cycle beyond the 200-lane cap reads as the cap, never as an unseen cycle; the TUI keeps the caption so one chain has one count everywhere; the brief's unknown cell names the full ref; and WB9c renders the "open the waits-for page" link only once WB9d's route exists (until then the card shows no link).

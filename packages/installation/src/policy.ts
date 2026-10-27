@@ -9,6 +9,7 @@
  */
 
 import type {
+  ChainRole,
   ChainStep,
   ChainsSection,
   FleetInstallationModel,
@@ -22,7 +23,12 @@ const REVIEWER_ROLES: readonly Exclude<SeatRole, 'implementer'>[] = [
   'high-risk-reviewer',
 ];
 
-const CHAIN_ROLES: readonly SeatRole[] = ['implementer', 'reviewer', 'high-risk-reviewer'];
+const CHAIN_ROLES: readonly ChainRole[] = ['implementer', 'fix', 'reviewer', 'high-risk-reviewer'];
+
+/** The seat role a chain's seats must hold: the fix chain is an implementer chain. */
+function requiredSeatRole(chain: ChainRole): SeatRole {
+  return chain === 'fix' ? 'implementer' : chain;
+}
 
 /**
  * The underlying model family of a model id — one family per vendor line
@@ -77,18 +83,20 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(`^${source}$`, 'i');
 }
 
-function seatSteps(chains: ChainsSection | undefined, role: SeatRole): readonly ChainStep[] {
+function seatSteps(chains: ChainsSection | undefined, role: ChainRole): readonly ChainStep[] {
   return chains?.[role] ?? [];
 }
 
 /**
  * Validate the seat and chain policy of a derived v2 model and return every
  * violation as an error string. Rules: every chain references existing seats;
- * a seat's roles include the chain's role; no seat in the reviewer or
- * high-risk-reviewer chain shares a family with any seat in the implementer
- * chain; a seat holding implementer and a reviewer role is refused; a free
- * seat is never the only seat of a role; forbidden routes refuse matching
- * seats; the per-lane cost ceiling is a positive number when present.
+ * a seat's roles include the chain's role; the fix chain's seats hold
+ * `implementer`, and the fix chain counts as an implementer chain for the
+ * family rule; no seat in the reviewer or high-risk-reviewer chain shares a
+ * family with any seat in the implementer chain; a seat holding implementer
+ * and a reviewer role is refused; a free seat is never the only seat of a
+ * role; forbidden routes refuse matching seats; the per-lane cost ceiling is
+ * a positive number when present.
  *
  * `fileChains` are the chains as the installation file writes them. The two
  * reference rules report the positions of the chains they iterate, so the
@@ -129,7 +137,7 @@ export function validateSeatPolicy(
     }
   }
 
-  const chainSeatIds = new Map<SeatRole, string[]>();
+  const chainSeatIds = new Map<ChainRole, string[]>();
   for (const role of CHAIN_ROLES) {
     const ids: string[] = [];
     for (const step of seatSteps(chains, role)) {
@@ -154,9 +162,9 @@ export function validateSeatPolicy(
         errors.push(`chains.${role}[${index}]: references unknown seat "${step.seatId}"`);
         continue;
       }
-      if (!seat.roles.includes(role)) {
+      if (!seat.roles.includes(requiredSeatRole(role))) {
         errors.push(
-          `chains.${role}[${index}]: seat "${step.seatId}" does not hold the role "${role}"`,
+          `chains.${role}[${index}]: seat "${step.seatId}" does not hold the role "${requiredSeatRole(role)}"`,
         );
       }
     }
@@ -200,7 +208,10 @@ export function validateSeatPolicy(
 
   // No seat holding a reviewer role shares a family with any implementer
   // seat, whether or not the seat is a chain member.
-  const implementerIds = chainSeatIds.get('implementer') ?? [];
+  const implementerIds = [
+    ...(chainSeatIds.get('implementer') ?? []),
+    ...(chainSeatIds.get('fix') ?? []),
+  ];
   const implementerFamilies = new Set(
     implementerIds
       .map((id) => seatsById.get(id))

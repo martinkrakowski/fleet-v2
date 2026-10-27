@@ -133,12 +133,15 @@ function serializeSeat(seat: SeatSection): Record<string, unknown> {
   }
   out.roles = [...seat.roles];
   out.costClass = seat.costClass;
+  if (seat.health !== undefined) {
+    out.health = seat.health;
+  }
   return out;
 }
 
 function serializeChains(chains: ChainsSection): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  for (const role of ['implementer', 'reviewer', 'high-risk-reviewer'] as const) {
+  for (const role of ['implementer', 'fix', 'reviewer', 'high-risk-reviewer'] as const) {
     const steps = chains[role];
     if (steps === undefined) {
       continue;

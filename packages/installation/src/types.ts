@@ -116,6 +116,12 @@ export type ChainTrigger = '429' | '402' | 'timeout' | 'quota' | 'no-commit';
 /** Cost class of a seat. */
 export type CostClass = 'free' | 'plan-quota' | 'paid';
 
+/** Operator-declared seat health (S1). Absent means healthy; an unhealthy seat is skipped by seat selection. */
+export type SeatHealth = 'healthy' | 'unhealthy';
+
+/** The chain keys: the three seat roles plus `fix`, the second-pass implementer chain (S1). */
+export type ChainRole = SeatRole | 'fix';
+
 /** Filesystem scope a v2 file may declare. `unknown` is derived only. */
 export type DeclaredFilesystemScope = 'scoped-worktree' | 'inherited-directory';
 
@@ -183,6 +189,7 @@ export interface SeatSection {
   readonly agent?: string;
   readonly roles: readonly SeatRole[];
   readonly costClass: CostClass;
+  readonly health?: SeatHealth;
 }
 
 /** One ordered step of a role's chain. */
@@ -196,6 +203,11 @@ export interface ChainsSection {
   readonly implementer?: readonly ChainStep[];
   readonly reviewer?: readonly ChainStep[];
   readonly 'high-risk-reviewer'?: readonly ChainStep[];
+  /**
+   * The second-pass / fix implementer chain (S1). Its seats hold the
+   * `implementer` role. Absent: fix rounds use the implementer chain.
+   */
+  readonly fix?: readonly ChainStep[];
 }
 
 /** One forbidden route rule of the policy shape. */
@@ -397,6 +409,7 @@ export interface SeatModel {
   readonly agent?: string;
   readonly roles: readonly SeatRole[];
   readonly costClass?: CostClass;
+  readonly health?: SeatHealth;
 }
 
 /**

@@ -58,7 +58,7 @@ const UNDECLARED_CAPABILITIES: DerivedRunnerCapabilities = {
 };
 
 /** Roles a v2 chain may carry, in the order they appear in the file. */
-const CHAIN_ROLES = ['implementer', 'reviewer', 'high-risk-reviewer'] as const;
+const CHAIN_ROLES = ['implementer', 'fix', 'reviewer', 'high-risk-reviewer'] as const;
 
 /**
  * Map an installation of either file version onto the v2 model and derive
@@ -180,6 +180,7 @@ function copySeat(seat: SeatSection): SeatModel {
     ...(seat.agent !== undefined ? { agent: seat.agent } : {}),
     roles: seat.roles,
     costClass: seat.costClass,
+    ...(seat.health !== undefined ? { health: seat.health } : {}),
   };
 }
 

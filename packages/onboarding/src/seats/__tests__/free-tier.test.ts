@@ -167,3 +167,92 @@ describe('free-tier engine (FS4)', () => {
     ]);
   });
 });
+
+describe('free-tier seat health and fix chain (S1d)', () => {
+  function s1dFixture(overrides?: {
+    seats?: Record<string, unknown>[];
+    chains?: Record<string, unknown>;
+  }): Record<string, unknown> {
+    return {
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        host: {
+          transport: 'local',
+          worktreeRoot: '/tmp/wt',
+          roles: ['orchestrator', 'lane-runner', 'verifier'],
+          runner: { kind: 'opencode', port: 4166, maxLanes: 1 },
+        },
+      },
+      seats:
+        overrides?.seats ??
+        [
+          {
+            id: 'impl',
+            tool: 'opencode',
+            model: 'acme/alpha-1',
+            roles: ['implementer'],
+            costClass: 'plan-quota',
+            health: 'unhealthy',
+          },
+          {
+            id: 'impl-b',
+            tool: 'opencode',
+            model: 'acme/alpha-2',
+            roles: ['implementer'],
+            costClass: 'paid',
+          },
+          {
+            id: 'rev',
+            tool: 'opencode',
+            model: 'acme/beta-1',
+            roles: ['reviewer'],
+            costClass: 'paid',
+          },
+        ],
+      chains:
+        overrides?.chains ??
+        {
+          implementer: [{ seatId: 'impl' }],
+          fix: [{ seatId: 'impl-b' }],
+          reviewer: [{ seatId: 'rev' }],
+        },
+    };
+  }
+
+  it('j: lists unhealthy seats and renders the skip line', () => {
+    const result = validateV2InstallationValue(s1dFixture());
+    expect(result.ok).toBe(true);
+    if (!result.ok || result.installation === undefined) return;
+    const summary = summariseFreeTier(result.installation);
+    expect(summary.unhealthySeatIds).toEqual(['impl']);
+    expect(renderFreeTierStatus(summary)).toContain(
+      'unhealthy seats (skipped by seat selection): impl',
+    );
+  });
+
+  it('k: counts the fix chain as a role', () => {
+    const result = validateV2InstallationValue(s1dFixture());
+    expect(result.ok).toBe(true);
+    if (!result.ok || result.installation === undefined) return;
+    const summary = summariseFreeTier(result.installation);
+    expect(summary.roles).toContainEqual({ role: 'fix', inFile: 1, inUse: 1 });
+    expect(renderFreeTierStatus(summary)).toContain(
+      'chains.fix: 1 of 1 seats in use',
+    );
+  });
+
+  it('l: the existing fixture still renders exactly as before', () => {
+    const result = validateV2InstallationValue(fixture());
+    expect(result.ok).toBe(true);
+    if (!result.ok || result.installation === undefined) return;
+    const summary = summariseFreeTier(result.installation);
+    expect(summary.unhealthySeatIds).toEqual([]);
+    expect(renderFreeTierStatus(summary)).toEqual([
+      'free-tier: on (policy.useFreeSeats absent; absent means on)',
+      'free seats (in use): free-impl, free-rev, free-rev-2',
+      'chains.implementer: 2 of 2 seats in use',
+      'chains.reviewer: 2 of 2 seats in use',
+    ]);
+  });
+});

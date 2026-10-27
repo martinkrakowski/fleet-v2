@@ -8,6 +8,7 @@ import {
   OwnerQuestionRepositoryAdapter,
   ProjectProfileRepositoryAdapter,
   RelayTransportAdapter,
+  type ChangeSignalPort,
 } from "@fleet/operator-coordination";
 
 import type { FleetInstallation } from "@fleet/installation";
@@ -71,6 +72,8 @@ export interface OperatorCompositionOptions {
   readonly stateDir?: string;
   readonly ownerPublicKey?: string;
   readonly installation?: FleetInstallation;
+  /** Emitter for post-save change signals; the API runtime wires the change feed. */
+  readonly changeSignal?: ChangeSignalPort;
 }
 
 let composition: OperatorComposition | undefined;
@@ -120,7 +123,10 @@ export function createConfiguredOperatorComposition(
   const ownerPublicKey =
     options?.ownerPublicKey ?? (process.env.FLEET_OWNER_PUBLIC_KEY?.trim() || undefined);
 
-  const profileRepo = new ProjectProfileRepositoryAdapter({ stateDir });
+  const profileRepo = new ProjectProfileRepositoryAdapter({
+    stateDir,
+    ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
+  });
   const requestRepo = new CoordinationRequestRepositoryAdapter({ stateDir });
   const decisionTransport = new DecisionTransportAdapter({
     decisionsDir: stateDir === undefined ? undefined : join(stateDir, "decisions"),
@@ -133,7 +139,10 @@ export function createConfiguredOperatorComposition(
   const relayTransport = new RelayTransportAdapter(
     stateDir === undefined ? {} : { outboxDir: join(stateDir, "relay-outbox") },
   );
-  const ownerQuestionRepo = new OwnerQuestionRepositoryAdapter({ stateDir });
+  const ownerQuestionRepo = new OwnerQuestionRepositoryAdapter({
+    stateDir,
+    ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
+  });
 
   // Installation name references for project profiles (P5a): a v2
   // installation enables host and gate-procedure name checks behind profile

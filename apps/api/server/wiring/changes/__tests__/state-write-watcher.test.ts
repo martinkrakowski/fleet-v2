@@ -10,6 +10,7 @@ import {
 } from '@fleet/work-execution';
 import { ChangeFeed } from '../change-feed.js';
 import { StateWriteWatcher } from '../state-write-watcher.js';
+import { configureFleetApiRuntime, getChangeFeed } from '../../runtime.js';
 
 function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
@@ -178,5 +179,22 @@ describe('StateWriteWatcher', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('runtime wiring of the change feed', () => {
+  it('configuring with a stateDir creates a change feed', async () => {
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-runtime-change-feed-'));
+    try {
+      configureFleetApiRuntime({ stateDir });
+      expect(getChangeFeed()).not.toBeNull();
+    } finally {
+      configureFleetApiRuntime(null);
+      await fs.rm(stateDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('configureFleetApiRuntime(null) clears the change feed', () => {
+    expect(getChangeFeed()).toBeNull();
   });
 });

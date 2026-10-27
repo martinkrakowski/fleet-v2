@@ -20,6 +20,7 @@
  *    later lease by fence.
  */
 
+import { isCalendarDateTime, readExactPlainRecord } from './plain-record-reads.js';
 import { containsSecretShape } from '@fleet/shared';
 import type { LaneRunLeaseRecord } from './lane-run-records.js';
 
@@ -58,38 +59,6 @@ const ACQUIRE_KEYS: readonly string[] = ['holderId', 'observedFence', 'leaseUnti
 const RENEW_KEYS: readonly string[] = ['holderId', 'fence', 'leaseUntilIso', 'nowIso'];
 const HOLD_KEYS: readonly string[] = ['holderId', 'fence', 'nowIso'];
 
-/**
- * A plain object with exactly the given own enumerable string keys, values
- * read through their own property descriptors (so no getter ever runs).
- * Anything else — a non-object, a prototype outside Object.prototype/null, a
- * missing or extra or non-enumerable key, a symbol key — returns null.
- */
-function readPlainObject(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return null;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    return null;
-  }
-  const ownKeys = Reflect.ownKeys(value);
-  if (ownKeys.length !== keys.length) {
-    return null;
-  }
-  const out: Record<string, unknown> = {};
-  for (const key of ownKeys) {
-    if (typeof key !== 'string' || !keys.includes(key)) {
-      return null;
-    }
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor?.enumerable) {
-      return null;
-    }
-    out[key] = descriptor.value;
-  }
-  return out;
-}
-
 /** The K1-1 lease field rules for an id, with the fixed reader messages. */
 function idError(field: string, value: unknown): string | null {
   if (
@@ -107,25 +76,6 @@ function idError(field: string, value: unknown): string | null {
 
 function isValidHolderId(value: unknown): boolean {
   return idError('holderId', value) === null;
-}
-
-/**
- * True when the date and time fields name a real calendar instant. Date.parse
- * rolls an impossible date such as 02-31 over into the next month instead of
- * refusing it, so the fields are checked here.
- */
-function isCalendarDateTime(iso: string): boolean {
-  const year = Number(iso.slice(0, 4));
-  const month = Number(iso.slice(5, 7));
-  const day = Number(iso.slice(8, 10));
-  const hour = Number(iso.slice(11, 13));
-  const minute = Number(iso.slice(14, 16));
-  const second = Number(iso.slice(17, 19));
-  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) {
-    return false;
-  }
-  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  return day >= 1 && day <= daysInMonth;
 }
 
 function isZonedIso(value: unknown): value is string {
@@ -172,7 +122,7 @@ function readRequestSnapshot(
   isoFields: readonly string[],
 ): Record<string, unknown> | null {
   try {
-    const snapshot = readPlainObject(request, keys);
+    const snapshot = readExactPlainRecord(request, keys);
     if (snapshot === null || !hasValidHolderAndIsoTimes(snapshot, isoFields)) {
       return null;
     }
@@ -355,7 +305,7 @@ const DRIVER_LEASE_KEYS: readonly string[] = ['version', 'holderId', 'fence', 'l
 /** Never throws, never echoes: exactly the four keys; version 1; the K1-1 lease field rules. */
 export function readConductorDriverLease(input: unknown): ConductorDriverLeaseRead {
   try {
-    const snapshot = readPlainObject(input, DRIVER_LEASE_KEYS);
+    const snapshot = readExactPlainRecord(input, DRIVER_LEASE_KEYS);
     if (snapshot === null) {
       return {
         ok: false,

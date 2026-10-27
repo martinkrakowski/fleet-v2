@@ -161,6 +161,18 @@ describe("orchestrator routes", () => {
     expect(existsSync(join(tempDir, "orchestrators.json"))).toBe(false);
   });
 
+  it("a resolver that yields no usable token id or no scopes writes nothing", async () => {
+    presentAs("", ["orchestrate"]);
+    const unidentified = await post("/v1/orchestrators", BODY);
+    expect(unidentified.status).toBe(422);
+    expect(existsSync(join(tempDir, "orchestrators.json"))).toBe(false);
+
+    presentAs("token-example-x", []);
+    const scopeless = await post("/v1/orchestrators", BODY);
+    expect(scopeless.status).toBe(403);
+    expect(existsSync(join(tempDir, "orchestrators.json"))).toBe(false);
+  });
+
   it("orchestrate is required before anything is read or written", async () => {
     presentAs("token-example-msg", ["message"]);
 

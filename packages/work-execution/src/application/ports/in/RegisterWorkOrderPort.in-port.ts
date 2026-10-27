@@ -1,11 +1,11 @@
 // @generated inbound contract scaffold — refined for migration step 1.
 /**
  * RegisterWorkOrderPort: record an approved bounded work unit, base commit,
- * owned paths, policy revision and prerequisite work; reject invalid or
- * conflicting ownership. Recording is registration, not dispatch.
+ * owned paths, policy revision, risk label and prerequisite work; reject
+ * invalid or conflicting ownership. Recording is registration, not dispatch.
  */
 
-import type { WorkOrderRecord } from '../../../domain/execution-records.js';
+import type { WorkOrderRecord, WorkOrderRisk } from '../../../domain/execution-records.js';
 
 export interface RegisterWorkOrderRequest {
   readonly workOrderId: string;
@@ -17,6 +17,8 @@ export interface RegisterWorkOrderRequest {
   readonly ownedPaths: readonly string[];
   readonly policyRevision: string;
   readonly prerequisiteWorkOrderIds?: readonly string[];
+  /** `standard` or `high`; absent registers `high` (plan A5). Frozen once registered. */
+  readonly risk?: WorkOrderRisk;
   readonly nowIso?: string;
 }
 

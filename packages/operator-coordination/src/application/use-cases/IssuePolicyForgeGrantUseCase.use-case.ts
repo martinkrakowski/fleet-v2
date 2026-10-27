@@ -156,14 +156,18 @@ export class IssuePolicyForgeGrantUseCase implements IssuePolicyForgeGrantPort {
       // A newer live grant exists: this issue's own grant is cancelled and the
       // newer one stays live. Superseded is a fixed outcome, never an error.
       const mine = await this.deps.requestRepo.findRequestById(requestId);
-      if (mine !== null && this.isLiveWorkOrderGrant(mine, workOrderId)) {
-        await this.cancelOne(mine, now);
-      }
+      const own =
+        mine !== null && this.isLiveWorkOrderGrant(mine, workOrderId)
+          ? await this.cancelOne(mine, now)
+          : 'skipped';
+      // Report only what happened: a confirmed cancel, nothing to cancel, or a cancel that may
+      // have left this grant live beside the newer one.
       return {
         outcome: 'superseded',
         requestId,
         grantId,
-        cancelledGrantIds: [grantId],
+        cancelledGrantIds: own === 'cancelled' ? [grantId] : [],
+        unresolvedGrantIds: own === 'conflict' ? [grantId] : [],
       };
     }
     const cancelledSwept = await this.cancelTargets(ordered.slice(0, -1), now, 'best-effort');

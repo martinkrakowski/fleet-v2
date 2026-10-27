@@ -583,6 +583,7 @@ describe('IssuePolicyForgeGrantUseCase', () => {
       requestId: 'request-example-1',
       grantId: 'grant-example-1',
       cancelledGrantIds: ['grant-example-1'],
+      unresolvedGrantIds: [],
     });
     expect((await repository.findRequestById('request-example-1'))?.state).toBe('cancelled');
     expect((await repository.findRequestById('request-concurrent-after'))?.state).toBe('approved');

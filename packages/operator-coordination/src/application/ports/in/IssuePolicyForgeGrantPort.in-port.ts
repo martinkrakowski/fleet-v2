@@ -51,8 +51,13 @@ export type IssuePolicyForgeGrantResult =
       readonly outcome: 'superseded';
       readonly requestId: string;
       readonly grantId: string;
-      /** This issue's own grant id, cancelled because a newer live grant exists. */
+      /** This issue's own grant id when its cancel was confirmed; empty when it was already not live. */
       readonly cancelledGrantIds: readonly string[];
+      /**
+       * This issue's own grant id when its cancel hit a second revision conflict and the grant may
+       * still be live beside the newer one; the next issue or cancel for the work order converges it.
+       */
+      readonly unresolvedGrantIds: readonly string[];
     }
   | { readonly outcome: 'refused'; readonly reason: string };
 

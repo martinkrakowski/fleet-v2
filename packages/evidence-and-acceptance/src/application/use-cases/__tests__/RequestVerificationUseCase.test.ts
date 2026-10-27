@@ -96,6 +96,28 @@ class MalformedCoverageStubExecutor implements VerificationExecutorPort {
   }
 }
 
+/** Valid coverage for every check except 'test', which returns a malformed value. */
+class SecondCheckMalformedStubExecutor implements VerificationExecutorPort {
+  calls: ExecuteVerificationCheckRequest[] = [];
+
+  async executeVerificationCheck(
+    request: ExecuteVerificationCheckRequest,
+  ): Promise<ExecuteVerificationCheckResult> {
+    this.calls.push(request);
+    const coverage =
+      request.procedureName === 'test'
+        ? ({ ran: true, unitKind: 'lines', units: 3 } as unknown as CheckCoverage)
+        : ({ ran: true, unitKind: 'tests', units: 12 } as CheckCoverage);
+    return {
+      result: 'pass',
+      exitCode: 0,
+      coverage,
+      outputSummary: 'check passed',
+      completedAtIso: '2026-10-15T12:00:00.000Z',
+    };
+  }
+}
+
 class StubArchive implements EvidenceArchivePort {
   calls: ArchiveEvidenceRequest[] = [];
 
@@ -419,5 +441,32 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
     expect(archive.calls).toHaveLength(0);
     const stored = await repo.findAssessmentById('asm-malformed-coverage');
     expect(stored).toBeNull();
+  });
+
+  it('archives nothing when a later check returns malformed coverage after an earlier valid one', async () => {
+    const repo = new InMemoryAssessmentRepo([]);
+    const executor = new SecondCheckMalformedStubExecutor();
+    const archive = new StubArchive();
+    const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+
+    const result = await useCase.requestVerification({
+      assessmentId: 'asm-second-malformed',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      requiredChecks: ['lint', 'test'],
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.reason).toContain("'test'");
+      expect(result.reason).toContain('nothing was archived or recorded');
+    }
+    expect(executor.calls.map((call) => call.procedureName)).toEqual(['lint', 'test']);
+    expect(archive.calls).toHaveLength(0);
+    expect(await repo.findAssessmentById('asm-second-malformed')).toBeNull();
   });
 });

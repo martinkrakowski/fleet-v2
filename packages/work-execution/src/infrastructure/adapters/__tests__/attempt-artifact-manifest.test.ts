@@ -406,6 +406,18 @@ describe('AttemptArtifactAdapter artifact manifest (real filesystem)', () => {
     expect(await fsp.readdir(outsideLane)).toEqual([]);
   });
 
+  it('verify does not read a manifest through a symlinked .lane (Luna re-review)', async () => {
+    const dir = await makeTempRepo();
+    const outsideLane = await fsp.mkdtemp(path.join(os.tmpdir(), 'fleet-lane-outside-'));
+    dirs.push(outsideLane);
+    await fsp.writeFile(path.join(outsideLane, path.basename(ARTIFACT_MANIFEST_RELATIVE_PATH)), '{}');
+    await fsp.rm(path.join(dir, '.lane'), { recursive: true, force: true });
+    await fsp.symlink(outsideLane, path.join(dir, '.lane'));
+    const adapter = new AttemptArtifactAdapter({ executor: new LocalExecutor() });
+    const verdict = await adapter.verifyArtifactManifest({ attemptId: 'attempt-1', worktreePath: dir });
+    expect(verdict.outcome).toBe('mismatch');
+  });
+
   it('gives mismatch / manifest-invalid (not missing) when verify encounters a directory or symlink at the manifest path', async () => {
     const dir = await makeTempRepo();
     const adapter = new AttemptArtifactAdapter({ executor: new LocalExecutor() });

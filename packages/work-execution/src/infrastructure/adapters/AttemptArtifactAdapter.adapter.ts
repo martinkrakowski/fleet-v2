@@ -619,6 +619,17 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     const manifestRelativePath =
       request.manifestPath ?? artifactManifestRelativePath(request.expectedManifestSha256);
     const targetPath = resolveWorktreeTarget(request.worktreePath, manifestRelativePath);
+    // Same containment as sealing: a symlinked .lane would let cat read a manifest from
+    // outside the worktree, so it is never a valid manifest location.
+    const laneLinkProbe = await executor.run(['test', '-L', path.dirname(targetPath)], {
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    if (laneLinkProbe.exitCode !== 1) {
+      return {
+        outcome: 'mismatch',
+        mismatches: [{ path: manifestRelativePath, kind: 'manifest-invalid' }],
+      };
+    }
     const [existsProbe, symlinkProbe] = await Promise.all([
       executor.run(['test', '-e', targetPath], { timeoutMs: PROBE_TIMEOUT_MS }),
       executor.run(['test', '-L', targetPath], { timeoutMs: PROBE_TIMEOUT_MS }),

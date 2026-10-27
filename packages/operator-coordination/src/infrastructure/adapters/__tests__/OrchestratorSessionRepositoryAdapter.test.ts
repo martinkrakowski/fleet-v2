@@ -288,4 +288,11 @@ describe('OrchestratorSessionRepositoryAdapter', () => {
     });
     await expect(escaping.list()).rejects.toThrow(/unsafe state file name/);
   });
+
+  it('refuses an expected revision whose successor would not be a safe integer', async () => {
+    const adapter = new OrchestratorSessionRepositoryAdapter();
+    await expect(adapter.save(session(), Number.MAX_SAFE_INTEGER)).rejects.toThrow(
+      /expected revision must be a non-negative integer/,
+    );
+  });
 });

@@ -15,21 +15,24 @@
  * emits a `heartbeat` change signal; every other save emits `orchestrator`.
  */
 
-import { promises as fs } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { promises as fs } from "node:fs";
+import { join, resolve } from "node:path";
 
-import type { OrchestratorSessionRecord } from '../../domain/orchestrator-session-records.js';
-import { OrchestratorSession } from '../../domain/entities/OrchestratorSession.js';
-import { OrchestratorSessionRevisionConflictError } from '../../application/ports/out/OrchestratorSessionRepositoryPort.out-port.js';
+import type { OrchestratorSessionRecord } from "../../domain/orchestrator-session-records.js";
+import { OrchestratorSession } from "../../domain/entities/OrchestratorSession.js";
+import { OrchestratorSessionRevisionConflictError } from "../../application/ports/out/OrchestratorSessionRepositoryPort.out-port.js";
 import type {
   OrchestratorSessionListQuery,
   OrchestratorSessionRepositoryPort,
   StoredOrchestratorSession,
-} from '../../application/ports/out/OrchestratorSessionRepositoryPort.out-port.js';
-import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
-import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
-import { withFileLock, writeJsonAtomically } from './file-store.js';
-import { readRecordList } from './record-list-store.js';
+} from "../../application/ports/out/OrchestratorSessionRepositoryPort.out-port.js";
+import type {
+  ChangeSignal,
+  ChangeSignalPort,
+} from "../../application/ports/out/ChangeSignalPort.out-port.js";
+import { NoopChangeSignalAdapter } from "./NoopChangeSignalAdapter.adapter.js";
+import { withFileLock, writeJsonAtomically } from "./file-store.js";
+import { readRecordList } from "./record-list-store.js";
 
 export interface OrchestratorSessionRepositoryAdapterOptions {
   /** When set, sessions are persisted here and reloaded on first use. */
@@ -39,9 +42,13 @@ export interface OrchestratorSessionRepositoryAdapterOptions {
   readonly changeSignal?: ChangeSignalPort;
 }
 
-const DEFAULT_FILE_NAME = 'orchestrators.json';
+const DEFAULT_FILE_NAME = "orchestrators.json";
 /** The other operator-coordination stores own their own files; never those. */
-const OTHER_STORE_FILE_NAMES = ['project-profiles.json', 'coordination-requests.json', 'owner-questions.json'];
+const OTHER_STORE_FILE_NAMES = [
+  "project-profiles.json",
+  "coordination-requests.json",
+  "owner-questions.json",
+];
 /** A configured file name may not escape the state directory it belongs to. */
 const SAFE_FILE_NAME = /^[A-Za-z0-9._-]{1,128}$/;
 
@@ -58,8 +65,14 @@ function copy(stored: StoredOrchestratorSession): StoredOrchestratorSession {
   };
 }
 
-function elementWiseEqual(left: readonly unknown[], right: readonly unknown[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
+function elementWiseEqual(
+  left: readonly unknown[],
+  right: readonly unknown[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
 }
 
 /**
@@ -71,9 +84,13 @@ function elementWiseEqual(left: readonly unknown[], right: readonly unknown[]): 
 function signalKindFor(
   before: OrchestratorSessionRecord | undefined,
   after: OrchestratorSessionRecord,
-): 'orchestrator' | 'heartbeat' {
-  if (before === undefined || before.status !== 'active' || after.status !== 'active') {
-    return 'orchestrator';
+): "orchestrator" | "heartbeat" {
+  if (
+    before === undefined ||
+    before.status !== "active" ||
+    after.status !== "active"
+  ) {
+    return "orchestrator";
   }
   if (
     before.orchestratorId !== after.orchestratorId ||
@@ -83,16 +100,16 @@ function signalKindFor(
     before.startedAtIso !== after.startedAtIso ||
     before.status !== after.status
   ) {
-    return 'orchestrator';
+    return "orchestrator";
   }
   if (
     !elementWiseEqual(before.projects, after.projects) ||
     !elementWiseEqual(before.claims, after.claims) ||
     !elementWiseEqual(before.scopes, after.scopes)
   ) {
-    return 'orchestrator';
+    return "orchestrator";
   }
-  return 'heartbeat';
+  return "heartbeat";
 }
 
 /**
@@ -100,9 +117,11 @@ function signalKindFor(
  * any malformed entry is `undefined`, which makes the file unreadable so the
  * exact bytes are quarantined instead of silently dropped.
  */
-export function parseOrchestratorSessionStateRecord(raw: unknown): StoredOrchestratorSession | undefined {
+export function parseOrchestratorSessionStateRecord(
+  raw: unknown,
+): StoredOrchestratorSession | undefined {
   try {
-    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
       return undefined;
     }
     const inputPrototype = Object.getPrototypeOf(raw);
@@ -114,23 +133,27 @@ export function parseOrchestratorSessionStateRecord(raw: unknown): StoredOrchest
       return undefined;
     }
     const keySet = new Set(ownKeys.map((key) => String(key)));
-    if (!keySet.has('revision') || !keySet.has('session')) {
+    if (!keySet.has("revision") || !keySet.has("session")) {
       return undefined;
     }
-    const revisionDescriptor = Object.getOwnPropertyDescriptor(raw, 'revision');
-    const sessionDescriptor = Object.getOwnPropertyDescriptor(raw, 'session');
+    const revisionDescriptor = Object.getOwnPropertyDescriptor(raw, "revision");
+    const sessionDescriptor = Object.getOwnPropertyDescriptor(raw, "session");
     if (
       revisionDescriptor === undefined ||
       sessionDescriptor === undefined ||
       !revisionDescriptor.enumerable ||
       !sessionDescriptor.enumerable ||
-      !('value' in revisionDescriptor) ||
-      !('value' in sessionDescriptor)
+      !("value" in revisionDescriptor) ||
+      !("value" in sessionDescriptor)
     ) {
       return undefined;
     }
     const revision = revisionDescriptor.value;
-    if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 1) {
+    if (
+      typeof revision !== "number" ||
+      !Number.isSafeInteger(revision) ||
+      revision < 1
+    ) {
       return undefined;
     }
     const result = OrchestratorSession.create(sessionDescriptor.value);
@@ -144,11 +167,16 @@ export function parseOrchestratorSessionStateRecord(raw: unknown): StoredOrchest
 }
 
 export class OrchestratorSessionRepositoryAdapter implements OrchestratorSessionRepositoryPort {
-  private readonly inMemorySessions = new Map<string, StoredOrchestratorSession>();
+  private readonly inMemorySessions = new Map<
+    string,
+    StoredOrchestratorSession
+  >();
   private readonly changeSignal: ChangeSignalPort;
   private signalEmitFailuresCount = 0;
 
-  constructor(private readonly options: OrchestratorSessionRepositoryAdapterOptions = {}) {
+  constructor(
+    private readonly options: OrchestratorSessionRepositoryAdapterOptions = {},
+  ) {
     this.changeSignal = options.changeSignal ?? new NoopChangeSignalAdapter();
   }
 
@@ -164,9 +192,19 @@ export class OrchestratorSessionRepositoryAdapter implements OrchestratorSession
     }
   }
 
-  async save(session: OrchestratorSessionRecord, expectedRevision: number): Promise<StoredOrchestratorSession> {
-    if (typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
-      throw new Error('OrchestratorSessionRepositoryAdapter expected revision must be a non-negative integer');
+  async save(
+    session: OrchestratorSessionRecord,
+    expectedRevision: number,
+  ): Promise<StoredOrchestratorSession> {
+    if (
+      typeof expectedRevision !== "number" ||
+      !Number.isSafeInteger(expectedRevision) ||
+      expectedRevision < 0 ||
+      expectedRevision >= Number.MAX_SAFE_INTEGER
+    ) {
+      throw new Error(
+        "OrchestratorSessionRepositoryAdapter expected revision must be a non-negative integer",
+      );
     }
     const validatedResult = OrchestratorSession.create(session);
     if (!validatedResult.success) {
@@ -182,10 +220,13 @@ export class OrchestratorSessionRepositoryAdapter implements OrchestratorSession
         throw new OrchestratorSessionRevisionConflictError(
           validated.orchestratorId,
           expectedRevision + 1,
-          'OrchestratorSessionRepositoryAdapter refuses a stale expected revision',
+          "OrchestratorSessionRepositoryAdapter refuses a stale expected revision",
         );
       }
-      const stored: StoredOrchestratorSession = { revision: expectedRevision + 1, session: validated };
+      const stored: StoredOrchestratorSession = {
+        revision: expectedRevision + 1,
+        session: validated,
+      };
       this.inMemorySessions.set(validated.orchestratorId, stored);
       this.signal({
         kind: signalKindFor(existing?.session, validated),
@@ -198,8 +239,8 @@ export class OrchestratorSessionRepositoryAdapter implements OrchestratorSession
     }
 
     let existing: StoredOrchestratorSession | undefined;
-    let before: ChangeSignal['before'] = null;
-    let written: ChangeSignal['written'] = null;
+    let before: ChangeSignal["before"] = null;
+    let written: ChangeSignal["written"] = null;
 
     await withFileLock(`${target}.lock`, async () => {
       try {
@@ -215,14 +256,21 @@ export class OrchestratorSessionRepositoryAdapter implements OrchestratorSession
         throw new OrchestratorSessionRevisionConflictError(
           validated.orchestratorId,
           expectedRevision + 1,
-          'OrchestratorSessionRepositoryAdapter refuses a stale expected revision',
+          "OrchestratorSessionRepositoryAdapter refuses a stale expected revision",
         );
       }
       existing = stored;
-      const next: StoredOrchestratorSession = { revision: expectedRevision + 1, session: validated };
+      const next: StoredOrchestratorSession = {
+        revision: expectedRevision + 1,
+        session: validated,
+      };
       records.set(validated.orchestratorId, next);
       const list = [...records.values()]
-        .sort((left, right) => left.session.orchestratorId.localeCompare(right.session.orchestratorId))
+        .sort((left, right) =>
+          left.session.orchestratorId.localeCompare(
+            right.session.orchestratorId,
+          ),
+        )
         .map(copy);
       await writeJsonAtomically(target, list);
       try {
@@ -233,7 +281,10 @@ export class OrchestratorSessionRepositoryAdapter implements OrchestratorSession
       }
     });
 
-    const stored: StoredOrchestratorSession = { revision: expectedRevision + 1, session: validated };
+    const stored: StoredOrchestratorSession = {
+      revision: expectedRevision + 1,
+      session: validated,
+    };
     this.signal({
       kind: signalKindFor(existing?.session, validated),
       id: validated.orchestratorId,
@@ -255,14 +306,24 @@ export class OrchestratorSessionRepositoryAdapter implements OrchestratorSession
     return found === undefined ? null : copy(found);
   }
 
-  async list(query?: OrchestratorSessionListQuery): Promise<readonly StoredOrchestratorSession[]> {
+  async list(
+    query?: OrchestratorSessionListQuery,
+  ): Promise<readonly StoredOrchestratorSession[]> {
     const target = this.statePath;
-    const records = target === null ? this.inMemorySessions : await this.readRecordsFromDisk(target);
+    const records =
+      target === null
+        ? this.inMemorySessions
+        : await this.readRecordsFromDisk(target);
     return [...records.values()]
-      .filter((stored) => query?.status === undefined || stored.session.status === query.status)
+      .filter(
+        (stored) =>
+          query?.status === undefined || stored.session.status === query.status,
+      )
       .sort((left, right) =>
         left.session.startedAtIso === right.session.startedAtIso
-          ? left.session.orchestratorId.localeCompare(right.session.orchestratorId)
+          ? left.session.orchestratorId.localeCompare(
+              right.session.orchestratorId,
+            )
           : left.session.startedAtIso.localeCompare(right.session.startedAtIso),
       )
       .map(copy);
@@ -275,18 +336,24 @@ export class OrchestratorSessionRepositoryAdapter implements OrchestratorSession
     }
     const name = fileName ?? DEFAULT_FILE_NAME;
     if (OTHER_STORE_FILE_NAMES.includes(name)) {
-      throw new Error('OrchestratorSessionRepositoryAdapter refuses a fileName that collides with another store');
+      throw new Error(
+        "OrchestratorSessionRepositoryAdapter refuses a fileName that collides with another store",
+      );
     }
     if (!SAFE_FILE_NAME.test(name)) {
-      throw new Error('OrchestratorSessionRepositoryAdapter refuses unsafe state file name');
+      throw new Error(
+        "OrchestratorSessionRepositoryAdapter refuses unsafe state file name",
+      );
     }
     return join(stateDir, name);
   }
 
-  private async readRecordsFromDisk(path: string): Promise<Map<string, StoredOrchestratorSession>> {
+  private async readRecordsFromDisk(
+    path: string,
+  ): Promise<Map<string, StoredOrchestratorSession>> {
     const records = await readRecordList(
       path,
-      'OrchestratorSessionRepositoryAdapter',
+      "OrchestratorSessionRepositoryAdapter",
       parseOrchestratorSessionStateRecord,
     );
     const map = new Map<string, StoredOrchestratorSession>();

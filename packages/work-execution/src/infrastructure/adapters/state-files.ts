@@ -4,6 +4,7 @@
  */
 import { describeRecordListStore, type StateFileDescriptor } from './file-store.js';
 import { parseAttemptStateRecord } from './AttemptRepositoryAdapter.adapter.js';
+import { parseConductorDriverLeaseStateRecord } from './ConductorDriverLeaseAdapter.adapter.js';
 import {
   parseJournalEntryStateRecord,
   parseReservationStateRecord,
@@ -17,4 +18,5 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('journal.json', parseJournalEntryStateRecord),
   describeRecordListStore('reservations.json', parseReservationStateRecord),
   describeRecordListStore('lane-runs.json', parseLaneRunStateRecord),
+  describeRecordListStore('conductor-driver-lease.json', parseConductorDriverLeaseStateRecord),
 ];

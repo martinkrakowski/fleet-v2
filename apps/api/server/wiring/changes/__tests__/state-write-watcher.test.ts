@@ -194,7 +194,55 @@ describe('runtime wiring of the change feed', () => {
     }
   });
 
-  it('configureFleetApiRuntime(null) clears the change feed', () => {
-    expect(getChangeFeed()).toBeNull();
+  it('configureFleetApiRuntime(null) clears the change feed', async () => {
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-runtime-change-feed-'));
+    try {
+      configureFleetApiRuntime({ stateDir });
+      expect(getChangeFeed()).not.toBeNull();
+      configureFleetApiRuntime(null);
+      expect(getChangeFeed()).toBeNull();
+    } finally {
+      configureFleetApiRuntime(null);
+      await fs.rm(stateDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('a relative stateDir resolves watched paths to match the stores and causes no resync on local save', async () => {
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-runtime-rel-'));
+    const originalCwd = process.cwd();
+    const parentDir = path.dirname(stateDir);
+    const relativeStateDir = path.basename(stateDir);
+    const captured: { watcher?: StateWriteWatcher } = {};
+    const originalStart = StateWriteWatcher.prototype.start;
+    StateWriteWatcher.prototype.start = function (this: StateWriteWatcher): void {
+      captured.watcher = this;
+    };
+    try {
+      process.chdir(parentDir);
+      configureFleetApiRuntime({ stateDir: relativeStateDir });
+      const feed = getChangeFeed();
+      expect(feed).not.toBeNull();
+      expect(captured.watcher).toBeDefined();
+      if (feed === null || captured.watcher === undefined) {
+        throw new Error('expected configured change feed and watcher');
+      }
+      await captured.watcher.tick();
+      const adapter = new AttemptRepositoryAdapter({
+        stateDir: relativeStateDir,
+        changeSignal: feed,
+      });
+      await adapter.saveAttempt(makeAttempt({ id: 'att-rel' }));
+      await captured.watcher.tick();
+      const snapshot = feed.read(`${feed.streamId}:0`);
+      expect(snapshot.kind).toBe('entries');
+      if (snapshot.kind === 'entries') {
+        expect(snapshot.entries.map((entry) => entry.kind)).toEqual(['attempt']);
+      }
+    } finally {
+      StateWriteWatcher.prototype.start = originalStart;
+      configureFleetApiRuntime(null);
+      process.chdir(originalCwd);
+      await fs.rm(stateDir, { recursive: true, force: true }).catch(() => {});
+    }
   });
 });

@@ -4,7 +4,7 @@
 // cases themselves never import across contexts.
 import { readFileSync, statSync } from "node:fs";
 import { execFile } from "node:child_process";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { ChangeFeed } from "./changes/change-feed";
 import { StateWriteWatcher } from "./changes/state-write-watcher";
@@ -628,9 +628,10 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   attemptLookup.inspectAttempt = work.inspectAttempt;
 
   if (stateDir !== undefined && changeFeed !== null) {
+    // Each watched file key must match the stores' path.resolve form.
     watcher = new StateWriteWatcher({
       feed: changeFeed,
-      files: WATCHED.map((name) => join(stateDir, name)),
+      files: WATCHED.map((name) => resolve(join(stateDir, name))),
     });
     watcher.start();
   }

@@ -3,7 +3,8 @@
  * OrchestratorSession is a pure domain aggregate recording which agent CLI is
  * registered as an orchestrator: its kind, model, host, coordinated projects,
  * the web request kinds it may claim, its token scopes, its heartbeat lease
- * and the last time it polled the request mailbox.
+ * and the last time it polled the request mailbox. A record names the token
+ * that registered it by id only, never the token or any part of it.
  *
  * It is its own aggregate — never a CoordinationKind — and a record grants
  * nothing: no authorization use case ever reads it. Validation returns a
@@ -36,6 +37,9 @@ export const ORCHESTRATOR_SESSION_MAX_PROJECTS = 64;
 const ID_MAX_BYTES = 256; // orchestratorId, host, model, each project id
 const MAX_VALID_DATE_MS = 8.64e15; // ECMAScript maximum valid date value
 
+/** A token id a session may record: 1–64 safe characters, starting with a letter or digit. */
+const TOKEN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
 const RECORD_KEYS = new Set<string>([
   'orchestratorId',
   'cliKind',
@@ -44,6 +48,7 @@ const RECORD_KEYS = new Set<string>([
   'projects',
   'claims',
   'scopes',
+  'registeredByTokenId',
   'startedAtIso',
   'lastHeartbeatIso',
   'leaseUntilIso',
@@ -148,6 +153,26 @@ export class OrchestratorSession {
     if (scopesError !== null) {
       return { success: false, error: new Error(scopesError) };
     }
+    const registeredByTokenId = recordInput.registeredByTokenId;
+    if (
+      typeof registeredByTokenId !== 'string' ||
+      !TOKEN_ID_PATTERN.test(registeredByTokenId)
+    ) {
+      return {
+        success: false,
+        error: new Error(
+          'OrchestratorSession registeredByTokenId must be a token id of 1 to 64 letters, digits, dot, underscore or hyphen',
+        ),
+      };
+    }
+    if (containsSecretShape(registeredByTokenId)) {
+      return {
+        success: false,
+        error: new Error(
+          'OrchestratorSession registeredByTokenId contains a secret-shaped value and was refused',
+        ),
+      };
+    }
 
     const startedAtError = timestampFieldError('startedAtIso', recordInput.startedAtIso, false);
     if (startedAtError !== null) {
@@ -195,6 +220,7 @@ export class OrchestratorSession {
       projects: Object.freeze(projectIds),
       claims: Object.freeze(claims),
       scopes: Object.freeze(scopes),
+      registeredByTokenId: recordInput.registeredByTokenId as string,
       startedAtIso: new Date(recordInput.startedAtIso as string).toISOString(),
       lastHeartbeatIso: new Date(recordInput.lastHeartbeatIso as string).toISOString(),
       leaseUntilIso: new Date(recordInput.leaseUntilIso as string).toISOString(),
@@ -217,6 +243,7 @@ export class OrchestratorSession {
       projects: Object.freeze(this.record.projects.slice()),
       claims: Object.freeze(this.record.claims.slice()),
       scopes: Object.freeze(this.record.scopes.slice()),
+      registeredByTokenId: this.record.registeredByTokenId,
       startedAtIso: this.record.startedAtIso,
       lastHeartbeatIso: this.record.lastHeartbeatIso,
       leaseUntilIso: this.record.leaseUntilIso,
@@ -338,6 +365,18 @@ export class OrchestratorSession {
       leaseUntilIso: new Date(nextLeaseMs).toISOString(),
     });
   }
+}
+
+/**
+ * A token id the session may record: 1–64 safe characters, never secret-shaped. Never throws.
+ */
+export function isOrchestratorTokenId(value: unknown): value is string {
+  return typeof value === 'string' && TOKEN_ID_PATTERN.test(value) && !containsSecretShape(value);
+}
+
+/** True only when `presentedTokenId` is a valid token id equal to the one that registered the session. */
+export function isRegisteredByToken(record: OrchestratorSessionRecord, presentedTokenId: unknown): boolean {
+  return isOrchestratorTokenId(presentedTokenId) && presentedTokenId === record.registeredByTokenId;
 }
 
 /**

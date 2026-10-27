@@ -1,10 +1,10 @@
-// @generated inbound contract scaffold — refined for lane O2a-2.
+// @generated inbound contract scaffold — refined for lane O2a-2 and O3-0.
 /**
  * RegisterOrchestratorSessionPort: record a new active orchestrator session
  * from a closed registration body with the injected clock. A session's scopes
  * come only from the presenting token's own scopes, passed separately by the
  * composition root — never read from the request body — and a record grants
- * nothing.
+ * nothing. The record names the registering token by id only.
  */
 
 import type { OrchestratorSessionRecord } from '../../../domain/orchestrator-session-records.js';
@@ -30,6 +30,12 @@ export interface RegisterOrchestratorSessionPort {
   /**
    * `body` is the untrusted request body. `presentedScopes` are the presenting token's own scopes,
    * supplied by the composition root from authentication — never read from the body.
+   * `presentedTokenId` is the presenting token's id, supplied by the composition root from
+   * authentication, never read from the body.
    */
-  registerOrchestratorSession(body: unknown, presentedScopes: readonly string[]): Promise<RegisterOrchestratorSessionResult>;
+  registerOrchestratorSession(
+    body: unknown,
+    presentedScopes: readonly string[],
+    presentedTokenId: string,
+  ): Promise<RegisterOrchestratorSessionResult>;
 }

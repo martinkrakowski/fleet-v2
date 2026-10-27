@@ -11,6 +11,7 @@
 import {
   OrchestratorSession,
   ORCHESTRATOR_SESSION_LEASE_SECONDS,
+  isOrchestratorTokenId,
 } from '../../domain/entities/OrchestratorSession.js';
 import { ORCHESTRATOR_SESSION_SCOPES } from '../../domain/orchestrator-session-records.js';
 import {
@@ -93,11 +94,12 @@ export class RegisterOrchestratorSessionUseCase implements RegisterOrchestratorS
   async registerOrchestratorSession(
     body: unknown,
     presentedScopes: readonly string[],
+    presentedTokenId: string,
   ): Promise<RegisterOrchestratorSessionResult> {
-    return this.execute(body, presentedScopes);
+    return this.execute(body, presentedScopes, presentedTokenId);
   }
 
-  async execute(body: unknown, presentedScopes: unknown): Promise<RegisterOrchestratorSessionResult> {
+  async execute(body: unknown, presentedScopes: unknown, presentedTokenId: unknown): Promise<RegisterOrchestratorSessionResult> {
     // Unconfigured is 501 and is checked before any request validation.
     if (!this.deps) {
       throw new Error('Not implemented: RegisterOrchestratorSessionUseCase');
@@ -133,6 +135,12 @@ export class RegisterOrchestratorSessionUseCase implements RegisterOrchestratorS
         };
       }
     }
+    if (!isOrchestratorTokenId(presentedTokenId)) {
+      return {
+        outcome: 'refused',
+        reason: 'the presenting token could not be identified',
+      };
+    }
 
     // 3. The clock alone supplies the times; the aggregate validates the full record.
     const nowIso = this.deps.clock.nowIso();
@@ -148,6 +156,7 @@ export class RegisterOrchestratorSessionUseCase implements RegisterOrchestratorS
       projects,
       claims,
       scopes: presentedCopy,
+      registeredByTokenId: presentedTokenId,
       startedAtIso: nowIso,
       lastHeartbeatIso: nowIso,
       leaseUntilIso: new Date(leaseUntilMs).toISOString(),

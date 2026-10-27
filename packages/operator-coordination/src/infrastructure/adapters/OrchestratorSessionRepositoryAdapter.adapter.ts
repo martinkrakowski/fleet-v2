@@ -77,9 +77,10 @@ function elementWiseEqual(
 
 /**
  * A save is a heartbeat only when it renews the lease or the mailbox poll of an
- * existing active session: the identity, model, host, started-at, status and
- * the three arrays are unchanged, and only the heartbeat/lease/poll timestamps
- * moved. Every other save announces an orchestrator change.
+ * existing active session: the identity, the registering token id, model, host,
+ * started-at, status and the three arrays are unchanged, and only the
+ * heartbeat/lease/poll timestamps moved. Every other save announces an
+ * orchestrator change.
  */
 function signalKindFor(
   before: OrchestratorSessionRecord | undefined,
@@ -94,6 +95,7 @@ function signalKindFor(
   }
   if (
     before.orchestratorId !== after.orchestratorId ||
+    before.registeredByTokenId !== after.registeredByTokenId ||
     before.cliKind !== after.cliKind ||
     before.model !== after.model ||
     before.host !== after.host ||

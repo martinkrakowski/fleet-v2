@@ -97,6 +97,7 @@ function sessionRecord(overrides: Partial<OrchestratorSessionRecord> = {}): Orch
     projects: ['example-project'],
     claims: ['dispatch-attempt', 'prepare-fix'],
     scopes: ['message', 'orchestrate'],
+    registeredByTokenId: 'token-example-1',
     startedAtIso: '2026-10-27T10:00:00.000Z',
     lastHeartbeatIso: '2026-10-27T10:00:30.000Z',
     leaseUntilIso: '2026-10-27T10:02:00.000Z',

@@ -40,6 +40,8 @@ const BODY = {
   claims: ['dispatch-attempt'],
 };
 
+const TOKEN = 'token-example-1';
+
 /** A clock the composition root would inject; it counts its reads and can be set. */
 function makeClock(at: string = NOW_ISO): OrchestratorSessionClock & { calls: number; set: (iso: string) => void } {
   const state = { now: at, calls: 0 };
@@ -90,7 +92,7 @@ function fresh(): Env {
 describe('registration scopes come from the token only (hard)', () => {
   it('stores the presented scopes', async () => {
     const env = fresh();
-    const result = await env.register.registerOrchestratorSession(BODY, ['message']);
+    const result = await env.register.registerOrchestratorSession(BODY, ['message'], TOKEN);
     expect(result).toEqual({
       outcome: 'registered',
       session: expect.objectContaining({ scopes: ['message'] }),
@@ -103,6 +105,7 @@ describe('registration scopes come from the token only (hard)', () => {
     const result = await env.register.registerOrchestratorSession(
       { ...BODY, scopes: ['orchestrate'] },
       ['message'],
+      TOKEN,
     );
     expect(result).toEqual({
       outcome: 'refused',
@@ -116,6 +119,7 @@ describe('registration scopes come from the token only (hard)', () => {
     const result = await env.register.registerOrchestratorSession(
       { ...BODY, scopes: ['message'] },
       ['message'],
+      TOKEN,
     );
     expect(result).toEqual({
       outcome: 'refused',
@@ -125,7 +129,7 @@ describe('registration scopes come from the token only (hard)', () => {
 
   it('stores scopes no matter the presentation order', async () => {
     const env = fresh();
-    const result = await env.register.registerOrchestratorSession(BODY, ['orchestrate', 'message']);
+    const result = await env.register.registerOrchestratorSession(BODY, ['orchestrate', 'message'], TOKEN);
     expect(result).toEqual({
       outcome: 'registered',
       session: expect.objectContaining({ scopes: ['message', 'orchestrate'] }),
@@ -135,12 +139,12 @@ describe('registration scopes come from the token only (hard)', () => {
 
   it('refuses a token holding a forbidden scope and stores nothing', async () => {
     const env = fresh();
-    const refusedDispatch = await env.register.registerOrchestratorSession(BODY, ['message', 'dispatch']);
+    const refusedDispatch = await env.register.registerOrchestratorSession(BODY, ['message', 'dispatch'], TOKEN);
     expect(refusedDispatch).toEqual({
       outcome: 'refused',
       reason: 'the presenting token holds a scope an orchestrator session may not hold',
     });
-    const refusedVerdict = await env.register.registerOrchestratorSession(BODY, ['verdict']);
+    const refusedVerdict = await env.register.registerOrchestratorSession(BODY, ['verdict'], TOKEN);
     expect(refusedVerdict).toEqual({
       outcome: 'refused',
       reason: 'the presenting token holds a scope an orchestrator session may not hold',
@@ -150,7 +154,7 @@ describe('registration scopes come from the token only (hard)', () => {
 
   it('refuses non-array presented scopes', async () => {
     const env = fresh();
-    const result = await env.register.registerOrchestratorSession(BODY, 'message' as never);
+    const result = await env.register.registerOrchestratorSession(BODY, 'message' as never, TOKEN);
     expect(result).toEqual({
       outcome: 'refused',
       reason: 'the presenting token\'s scopes could not be read',
@@ -167,7 +171,7 @@ describe('registration scopes come from the token only (hard)', () => {
       },
       configurable: true,
     });
-    const withIterator = await env.register.registerOrchestratorSession(BODY, lyingIterator);
+    const withIterator = await env.register.registerOrchestratorSession(BODY, lyingIterator, TOKEN);
     expect(withIterator.outcome).toBe('registered');
     if (withIterator.outcome === 'registered') {
       expect(withIterator.session.scopes).toEqual(['message']);
@@ -181,7 +185,7 @@ describe('registration scopes come from the token only (hard)', () => {
       enumerable: true,
       configurable: true,
     });
-    const withGetter = await env.register.registerOrchestratorSession(BODY, throwingGetter);
+    const withGetter = await env.register.registerOrchestratorSession(BODY, throwingGetter, TOKEN);
     expect(withGetter).toEqual({
       outcome: 'refused',
       reason: 'the presenting token holds a scope an orchestrator session may not hold',
@@ -192,7 +196,7 @@ describe('registration scopes come from the token only (hard)', () => {
 describe('register', () => {
   it('records an active session with clock-derived times and one orchestrator signal', async () => {
     const env = fresh();
-    const result = await env.register.registerOrchestratorSession(BODY, ['message']);
+    const result = await env.register.registerOrchestratorSession(BODY, ['message'], TOKEN);
     expect(result).toEqual({
       outcome: 'registered',
       session: {
@@ -203,6 +207,7 @@ describe('register', () => {
         projects: ['example-project'],
         claims: ['dispatch-attempt'],
         scopes: ['message'],
+        registeredByTokenId: 'token-example-1',
         startedAtIso: '2026-10-27T10:00:00.000Z',
         lastHeartbeatIso: '2026-10-27T10:00:00.000Z',
         leaseUntilIso: '2026-10-27T10:01:30.000Z',
@@ -221,6 +226,7 @@ describe('register', () => {
     const withStatus = await env.register.registerOrchestratorSession(
       { ...BODY, status: 'retired' },
       ['message'],
+      TOKEN,
     );
     expect(withStatus).toEqual({
       outcome: 'refused',
@@ -229,6 +235,7 @@ describe('register', () => {
     const withStarted = await env.register.registerOrchestratorSession(
       { ...BODY, startedAtIso: '2026-10-27T09:00:00.000Z' },
       ['message'],
+      TOKEN,
     );
     expect(withStarted).toEqual({
       outcome: 'refused',
@@ -237,6 +244,7 @@ describe('register', () => {
     const withLease = await env.register.registerOrchestratorSession(
       { ...BODY, leaseUntilIso: '2026-10-27T10:30:00.000Z' },
       ['message'],
+      TOKEN,
     );
     expect(withLease).toEqual({
       outcome: 'refused',
@@ -250,20 +258,18 @@ describe('register', () => {
     const withoutModel: Record<string, unknown> = { ...BODY };
     delete withoutModel.model;
     expect(
-      await env.register.registerOrchestratorSession(withoutModel, ['message']),
+      await env.register.registerOrchestratorSession(withoutModel, ['message'], TOKEN),
     ).toEqual({
       outcome: 'refused',
       reason: 'OrchestratorSession registration is missing the key model',
     });
     expect(
-      await env.register.registerOrchestratorSession({ ...withoutModel, status: 'active' }, [
-        'message',
-      ]),
+      await env.register.registerOrchestratorSession({ ...withoutModel, status: 'active' }, ['message'], TOKEN),
     ).toEqual({
       outcome: 'refused',
       reason: 'OrchestratorSession registration has an unknown key',
     });
-    expect(await env.register.registerOrchestratorSession({}, ['message'])).toEqual({
+    expect(await env.register.registerOrchestratorSession({}, ['message'], TOKEN)).toEqual({
       outcome: 'refused',
       reason: 'OrchestratorSession registration is missing the key orchestratorId',
     });
@@ -276,6 +282,7 @@ describe('register', () => {
     const result = await env.register.registerOrchestratorSession(
       { ...BODY, host: fakeSecret },
       ['message'],
+      TOKEN,
     );
     expect(result.outcome).toBe('refused');
     if (result.outcome === 'refused') {
@@ -287,8 +294,8 @@ describe('register', () => {
 
   it('refuses a second registration with the same id', async () => {
     const env = fresh();
-    await env.register.registerOrchestratorSession(BODY, ['message']);
-    const second = await env.register.registerOrchestratorSession(BODY, ['message']);
+    await env.register.registerOrchestratorSession(BODY, ['message'], TOKEN);
+    const second = await env.register.registerOrchestratorSession(BODY, ['message'], TOKEN);
     expect(second).toEqual({
       outcome: 'refused',
       reason: 'an orchestrator session with this id already exists',
@@ -299,12 +306,12 @@ describe('register', () => {
 describe('heartbeat', () => {
   it('renews the lease from the clock and announces a heartbeat only', async () => {
     const env = fresh();
-    await env.register.registerOrchestratorSession(BODY, ['message']);
+    await env.register.registerOrchestratorSession(BODY, ['message'], TOKEN);
     env.clock.set('2026-10-27T10:00:30.000Z');
     const before = env.signals.length;
     const result = await env.heartbeat.heartbeatOrchestratorSession({
       orchestratorId: 'orch-example-1',
-    });
+    }, TOKEN);
     expect(result).toEqual({
       outcome: 'renewed',
       session: expect.objectContaining({
@@ -320,17 +327,17 @@ describe('heartbeat', () => {
 
   it('returns not-found for an unknown id', async () => {
     const env = fresh();
-    const result = await env.heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'missing' });
+    const result = await env.heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'missing' }, TOKEN);
     expect(result).toEqual({ outcome: 'not-found' });
   });
 
   it('refuses a retired session', async () => {
     const env = fresh();
-    await env.register.registerOrchestratorSession(BODY, ['message']);
-    await env.retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' });
+    await env.register.registerOrchestratorSession(BODY, ['message'], TOKEN);
+    await env.retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' }, TOKEN);
     const result = await env.heartbeat.heartbeatOrchestratorSession({
       orchestratorId: 'orch-example-1',
-    });
+    }, TOKEN);
     expect(result).toEqual({
       outcome: 'refused',
       reason: 'OrchestratorSession is retired and cannot renew its lease',
@@ -339,11 +346,11 @@ describe('heartbeat', () => {
 
   it('refuses a clock moved backwards with the domain message', async () => {
     const env = fresh();
-    await env.register.registerOrchestratorSession(BODY, ['message']);
+    await env.register.registerOrchestratorSession(BODY, ['message'], TOKEN);
     env.clock.set('2026-10-27T09:59:59.000Z');
     const result = await env.heartbeat.heartbeatOrchestratorSession({
       orchestratorId: 'orch-example-1',
-    });
+    }, TOKEN);
     expect(result).toEqual({
       outcome: 'refused',
       reason: 'OrchestratorSession heartbeat must not move backwards',
@@ -354,12 +361,12 @@ describe('heartbeat', () => {
     const repo = new ConflictSessionRepo();
     const clock = makeClock();
     const register = new RegisterOrchestratorSessionUseCase({ sessionRepo: repo, clock });
-    await register.registerOrchestratorSession(BODY, ['message']);
+    await register.registerOrchestratorSession(BODY, ['message'], TOKEN);
     const heartbeat = new HeartbeatOrchestratorSessionUseCase({ sessionRepo: repo, clock });
     repo.conflictsRemaining = 1;
     clock.set('2026-10-27T10:00:30.000Z');
     const savesBefore = repo.saveCalls;
-    const result = await heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'orch-example-1' });
+    const result = await heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'orch-example-1' }, TOKEN);
     expect(result).toEqual({
       outcome: 'renewed',
       session: expect.objectContaining({ leaseUntilIso: '2026-10-27T10:02:00.000Z' }),
@@ -372,11 +379,11 @@ describe('heartbeat', () => {
     const repo = new ConflictSessionRepo();
     const clock = makeClock();
     const register = new RegisterOrchestratorSessionUseCase({ sessionRepo: repo, clock });
-    await register.registerOrchestratorSession(BODY, ['message']);
+    await register.registerOrchestratorSession(BODY, ['message'], TOKEN);
     const heartbeat = new HeartbeatOrchestratorSessionUseCase({ sessionRepo: repo, clock });
     repo.conflictsRemaining = Infinity;
     clock.set('2026-10-27T10:00:30.000Z');
-    const result = await heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'orch-example-1' });
+    const result = await heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'orch-example-1' }, TOKEN);
     expect(result).toEqual({
       outcome: 'refused',
       reason: 'another writer moved this session first; heartbeat again',
@@ -387,9 +394,9 @@ describe('heartbeat', () => {
 describe('retire', () => {
   it('retires a session and announces an orchestrator change', async () => {
     const env = fresh();
-    await env.register.registerOrchestratorSession(BODY, ['message']);
+    await env.register.registerOrchestratorSession(BODY, ['message'], TOKEN);
     const before = env.signals.length;
-    const result = await env.retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' });
+    const result = await env.retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' }, TOKEN);
     expect(result).toEqual({
       outcome: 'retired',
       session: expect.objectContaining({ status: 'retired' }),
@@ -402,12 +409,12 @@ describe('retire', () => {
 
   it('is idempotent: a second retire saves nothing', async () => {
     const env = fresh();
-    await env.register.registerOrchestratorSession(BODY, ['message']);
-    const first = await env.retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' });
+    await env.register.registerOrchestratorSession(BODY, ['message'], TOKEN);
+    const first = await env.retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' }, TOKEN);
     expect(first.outcome).toBe('retired');
     if (first.outcome === 'retired') {
       const signalsAfterFirst = env.signals.length;
-      const second = await env.retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' });
+      const second = await env.retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' }, TOKEN);
       expect(second).toEqual({ outcome: 'retired', session: first.session, revision: first.revision });
       expect(env.signals.length).toBe(signalsAfterFirst);
     }
@@ -415,7 +422,7 @@ describe('retire', () => {
 
   it('returns not-found for an unknown id', async () => {
     const env = fresh();
-    const result = await env.retire.retireOrchestratorSession({ orchestratorId: 'missing' });
+    const result = await env.retire.retireOrchestratorSession({ orchestratorId: 'missing' }, TOKEN);
     expect(result).toEqual({ outcome: 'not-found' });
   });
 });
@@ -423,17 +430,18 @@ describe('retire', () => {
 describe('list', () => {
   it('derives attached and attentive from the clock with one read per call', async () => {
     const env = fresh();
-    await env.register.registerOrchestratorSession(BODY, ['message']);
+    await env.register.registerOrchestratorSession(BODY, ['message'], TOKEN);
     await env.register.registerOrchestratorSession(
       { ...BODY, orchestratorId: 'orch-example-2' },
       ['message'],
+      TOKEN,
     );
 
     // 10:01:00: heartbeat A so its lease outlives B's.
     env.clock.set('2026-10-27T10:01:00.000Z');
     const beat = await env.heartbeat.heartbeatOrchestratorSession({
       orchestratorId: 'orch-example-1',
-    });
+    }, TOKEN);
     expect(beat).toEqual({
       outcome: 'renewed',
       session: expect.objectContaining({ leaseUntilIso: '2026-10-27T10:02:30.000Z' }),
@@ -479,12 +487,13 @@ describe('list', () => {
 
   it('filters by status and returns an empty list for an invalid status', async () => {
     const env = fresh();
-    await env.register.registerOrchestratorSession(BODY, ['message']);
+    await env.register.registerOrchestratorSession(BODY, ['message'], TOKEN);
     await env.register.registerOrchestratorSession(
       { ...BODY, orchestratorId: 'orch-example-2' },
       ['message'],
+      TOKEN,
     );
-    await env.retire.retireOrchestratorSession({ orchestratorId: 'orch-example-2' });
+    await env.retire.retireOrchestratorSession({ orchestratorId: 'orch-example-2' }, TOKEN);
 
     const retired = await env.list.listOrchestratorSessions({ status: 'retired' });
     expect(retired.sessions.map((entry) => entry.session.orchestratorId)).toEqual(['orch-example-2']);
@@ -506,7 +515,7 @@ describe('fix round 1 pins', () => {
       },
       configurable: true,
     });
-    const result = await env.register.registerOrchestratorSession(BODY, lyingIterator);
+    const result = await env.register.registerOrchestratorSession(BODY, lyingIterator, TOKEN);
     expect(result.outcome).toBe('registered');
     if (result.outcome === 'registered') {
       expect(result.session.scopes).toEqual(['message']);
@@ -517,7 +526,7 @@ describe('fix round 1 pins', () => {
     const env = fresh();
     class NotARecord {}
     for (const body of [null, ['orch-example-1'], new Map(), new NotARecord()]) {
-      const result = await env.register.registerOrchestratorSession(body, ['message']);
+      const result = await env.register.registerOrchestratorSession(body, ['message'], TOKEN);
       expect(result).toEqual({
         outcome: 'refused',
         reason: 'OrchestratorSession registration requires a record',
@@ -528,7 +537,7 @@ describe('fix round 1 pins', () => {
 
   it('refuses duplicate presented scopes', async () => {
     const env = fresh();
-    const result = await env.register.registerOrchestratorSession(BODY, ['message', 'message']);
+    const result = await env.register.registerOrchestratorSession(BODY, ['message', 'message'], TOKEN);
     expect(result).toEqual({
       outcome: 'refused',
       reason: 'OrchestratorSession scopes must be distinct session scopes',
@@ -539,11 +548,11 @@ describe('fix round 1 pins', () => {
   it('refuses an empty or whitespace-only orchestratorId for heartbeat and retire', async () => {
     const env = fresh();
     for (const id of ['', '   ']) {
-      expect(await env.heartbeat.heartbeatOrchestratorSession({ orchestratorId: id })).toEqual({
+      expect(await env.heartbeat.heartbeatOrchestratorSession({ orchestratorId: id }, TOKEN)).toEqual({
         outcome: 'refused',
         reason: 'an orchestratorId is required',
       });
-      expect(await env.retire.retireOrchestratorSession({ orchestratorId: id })).toEqual({
+      expect(await env.retire.retireOrchestratorSession({ orchestratorId: id }, TOKEN)).toEqual({
         outcome: 'refused',
         reason: 'an orchestratorId is required',
       });
@@ -555,15 +564,16 @@ describe('fix round 1 pins', () => {
     await env.register.registerOrchestratorSession(
       { ...BODY, orchestratorId: ' orch-1 ' },
       ['message'],
+      TOKEN,
     );
     expect(
-      await env.heartbeat.heartbeatOrchestratorSession({ orchestratorId: ' orch-1 ' }),
+      await env.heartbeat.heartbeatOrchestratorSession({ orchestratorId: ' orch-1 ' }, TOKEN),
     ).toEqual({
       outcome: 'renewed',
       session: expect.objectContaining({ orchestratorId: ' orch-1 ' }),
       revision: 2,
     });
-    expect(await env.heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'orch-1' })).toEqual({
+    expect(await env.heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'orch-1' }, TOKEN)).toEqual({
       outcome: 'not-found',
     });
   });
@@ -574,7 +584,7 @@ describe('fix round 1 pins', () => {
     });
     const clock = makeClock('not a time');
     const register = new RegisterOrchestratorSessionUseCase({ sessionRepo: repo, clock });
-    const result = await register.registerOrchestratorSession(BODY, ['message']);
+    const result = await register.registerOrchestratorSession(BODY, ['message'], TOKEN);
     expect(result).toEqual({ outcome: 'refused', reason: 'the clock could not be read' });
     expect(await new ListOrchestratorSessionsUseCase({ sessionRepo: repo, clock }).listOrchestratorSessions())
       .toEqual({ sessions: [] });
@@ -586,6 +596,7 @@ describe('fix round 1 pins', () => {
     await new RegisterOrchestratorSessionUseCase({ sessionRepo: repo, clock }).registerOrchestratorSession(
       BODY,
       ['message'],
+      TOKEN,
     );
     // Between the two saves, another writer polls the mailbox at a new revision.
     const betweenSaves = async () => {
@@ -609,7 +620,7 @@ describe('fix round 1 pins', () => {
     });
     repo.conflictsRemaining = 1;
     clock.set('2026-10-27T10:00:30.000Z');
-    const result = await heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'orch-example-1' });
+    const result = await heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'orch-example-1' }, TOKEN);
     expect(result).toEqual({
       outcome: 'renewed',
       session: expect.objectContaining({ leaseUntilIso: '2026-10-27T10:02:00.000Z' }),
@@ -623,11 +634,12 @@ describe('fix round 1 pins', () => {
     await new RegisterOrchestratorSessionUseCase({ sessionRepo: repo, clock }).registerOrchestratorSession(
       BODY,
       ['message'],
+      TOKEN,
     );
     const betweenSaves = async () => {
       await new RetireOrchestratorSessionUseCase({ sessionRepo: repo, clock }).retireOrchestratorSession({
         orchestratorId: 'orch-example-1',
-      });
+      }, TOKEN);
     };
     const heartbeat = new HeartbeatOrchestratorSessionUseCase({
       sessionRepo: new HookedRepo(repo, betweenSaves),
@@ -635,7 +647,7 @@ describe('fix round 1 pins', () => {
     });
     repo.conflictsRemaining = 1;
     clock.set('2026-10-27T10:00:30.000Z');
-    const result = await heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'orch-example-1' });
+    const result = await heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'orch-example-1' }, TOKEN);
     expect(result).toEqual({
       outcome: 'refused',
       reason: 'OrchestratorSession is retired and cannot renew its lease',
@@ -648,11 +660,12 @@ describe('fix round 1 pins', () => {
     await new RegisterOrchestratorSessionUseCase({ sessionRepo: repo, clock }).registerOrchestratorSession(
       BODY,
       ['message'],
+      TOKEN,
     );
     const retire = new RetireOrchestratorSessionUseCase({ sessionRepo: repo, clock });
     repo.conflictsRemaining = 1;
     const savesBefore = repo.saveCalls;
-    const result = await retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' });
+    const result = await retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' }, TOKEN);
     expect(result).toEqual({
       outcome: 'retired',
       session: expect.objectContaining({ status: 'retired' }),
@@ -667,11 +680,12 @@ describe('fix round 1 pins', () => {
     await new RegisterOrchestratorSessionUseCase({ sessionRepo: repo, clock }).registerOrchestratorSession(
       BODY,
       ['message'],
+      TOKEN,
     );
     const betweenSaves = async () => {
       await new RetireOrchestratorSessionUseCase({ sessionRepo: repo, clock }).retireOrchestratorSession({
         orchestratorId: 'orch-example-1',
-      });
+      }, TOKEN);
     };
     const retire = new RetireOrchestratorSessionUseCase({
       sessionRepo: new HookedRepo(repo, betweenSaves),
@@ -679,7 +693,7 @@ describe('fix round 1 pins', () => {
     });
     repo.conflictsRemaining = 1;
     const savesBefore = repo.saveCalls;
-    const result = await retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' });
+    const result = await retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' }, TOKEN);
     expect(result).toEqual({
       outcome: 'retired',
       session: expect.objectContaining({ status: 'retired' }),
@@ -692,17 +706,17 @@ describe('fix round 1 pins', () => {
 
 describe('unconfigured use cases', () => {
   it('reject with Not implemented before any validation', async () => {
-    await expect(new RegisterOrchestratorSessionUseCase().registerOrchestratorSession(BODY, ['message']))
+    await expect(new RegisterOrchestratorSessionUseCase().registerOrchestratorSession(BODY, ['message'], TOKEN))
       .rejects.toThrow('Not implemented: RegisterOrchestratorSessionUseCase');
     await expect(
       new HeartbeatOrchestratorSessionUseCase().heartbeatOrchestratorSession({
         orchestratorId: 'orch-example-1',
-      }),
+      }, TOKEN),
     ).rejects.toThrow('Not implemented: HeartbeatOrchestratorSessionUseCase');
     await expect(
       new RetireOrchestratorSessionUseCase().retireOrchestratorSession({
         orchestratorId: 'orch-example-1',
-      }),
+      }, TOKEN),
     ).rejects.toThrow('Not implemented: RetireOrchestratorSessionUseCase');
     await expect(new ListOrchestratorSessionsUseCase().listOrchestratorSessions())
       .rejects.toThrow('Not implemented: ListOrchestratorSessionsUseCase');

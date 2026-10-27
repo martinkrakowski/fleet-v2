@@ -13,6 +13,33 @@ export const ARTIFACT_MANIFEST_RELATIVE_PATH = '.lane/artifacts-manifest.json';
 
 export const ARTIFACT_MANIFEST_TEMP_RELATIVE_PATH = '.lane/artifacts-manifest.json.tmp';
 
+/**
+ * Build the content-addressed worktree-relative path for a sealed artifact
+ * manifest from its SHA-256 hex digest:
+ * `.lane/artifacts-manifest-<first 16 hex>.json`. Falls back to
+ * `ARTIFACT_MANIFEST_RELATIVE_PATH` when no digest is supplied.
+ *
+ * Older collected-artifact records that lack `manifestPath` are read as
+ * "artifacts not collected" for C2.
+ */
+export function artifactManifestRelativePath(manifestSha256?: string): string {
+  if (typeof manifestSha256 === 'string' && manifestSha256.length >= 16) {
+    return `.lane/artifacts-manifest-${manifestSha256.slice(0, 16)}.json`;
+  }
+  return ARTIFACT_MANIFEST_RELATIVE_PATH;
+}
+
+/**
+ * Build the unique temporary worktree-relative path for atomically sealing an
+ * artifact manifest: `<manifestPath>.tmp-<random 8 hex>`.
+ */
+export function artifactManifestTempRelativePath(
+  manifestRelativePath: string,
+  randomHex8: string,
+): string {
+  return `${manifestRelativePath}.tmp-${randomHex8}`;
+}
+
 export interface ArtifactManifestEntry {
   readonly path: string;
   readonly size: number;

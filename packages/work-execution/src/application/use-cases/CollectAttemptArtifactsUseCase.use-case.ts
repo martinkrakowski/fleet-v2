@@ -152,9 +152,11 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
       return { outcome: 'refused', reason: collected.reason };
     }
 
-    // C1: seal the collected files in an atomically written manifest before
-    // the attempt is recorded as collected. A port that cannot seal leaves
-    // the record without `manifestSha256`; a refused seal refuses collection.
+    // C1: seal the collected files in an atomically written, content-addressed
+    // manifest before the attempt is recorded as collected. A port that cannot
+    // seal leaves the record without `manifestPath` and `manifestSha256`
+    // (older records that lack `manifestPath` are read as "artifacts not
+    // collected" for C2); a refused seal refuses collection.
     let artifacts = collected.artifacts;
     if (this.deps.artifactPort.sealArtifactManifest) {
       const sealed = await this.deps.artifactPort.sealArtifactManifest({
@@ -166,7 +168,11 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
       if (sealed.outcome === 'refused') {
         return { outcome: 'refused', reason: 'Artifact manifest not sealed: ' + sealed.reason };
       }
-      artifacts = { ...collected.artifacts, manifestSha256: sealed.manifestSha256 };
+      artifacts = {
+        ...collected.artifacts,
+        manifestPath: sealed.manifestPath,
+        manifestSha256: sealed.manifestSha256,
+      };
     }
 
     const outcome: AttemptOutcomeValue = collected.artifacts.commitsSinceBase.length > 0 ? 'done' : 'no-commit';
@@ -204,7 +210,9 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
         // `ended`, rebuild the same `collected` transition on top of it with
         // the artifacts and usage already gathered and save once (a second
         // conflict propagates); release and the journal entry still run.
-        // Any other fresh state keeps the refusal naming that state.
+        // Any other fresh state keeps the refusal naming that state; a losing
+        // concurrent collection's content-addressed manifest file in `.lane/`
+        // is harmless and never overwrites the winner's manifest.
         const fresh = await this.deps.attemptRepo.findAttemptById(attempt.id);
         if (fresh?.state !== 'ended') {
           return {

@@ -15,7 +15,7 @@
  * operator-authored prose.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import * as path from 'node:path';
 
 import type {
@@ -33,8 +33,8 @@ import type {
 } from '../../application/ports/out/AttemptArtifactPort.out-port.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import {
-  ARTIFACT_MANIFEST_RELATIVE_PATH,
-  ARTIFACT_MANIFEST_TEMP_RELATIVE_PATH,
+  artifactManifestRelativePath,
+  artifactManifestTempRelativePath,
   buildArtifactManifest,
   compareArtifactManifest,
   parseArtifactManifest,
@@ -311,13 +311,67 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
   }
 
   /**
+   * Resolve the worktree's canonical path once on the target host via
+   * `realpath -e -- <worktreePath>`.
+   */
+  private async resolveCanonicalWorktreePath(
+    worktreePath: string,
+    executor: CommandExecutorPort,
+  ): Promise<string | null> {
+    const result = await executor.run(['realpath', '-e', '--', worktreePath], {
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    if (result.exitCode !== 0) {
+      return null;
+    }
+    const canonical = result.stdout.replace(/\r?\n$/, '');
+    return canonical.startsWith('/') ? canonical : null;
+  }
+
+  /**
+   * Probe whether a path is either absent (`test -e` false and `test -L`
+   * false) or an existing regular file (`test -L` false and `test -f` true).
+   */
+  private async isAbsentOrRegularFile(
+    targetPath: string,
+    executor: CommandExecutorPort,
+  ): Promise<boolean> {
+    const [existsProbe, symlinkProbe] = await Promise.all([
+      executor.run(['test', '-e', targetPath], { timeoutMs: PROBE_TIMEOUT_MS }),
+      executor.run(['test', '-L', targetPath], { timeoutMs: PROBE_TIMEOUT_MS }),
+    ]);
+    if (
+      (existsProbe.exitCode !== 0 && existsProbe.exitCode !== 1) ||
+      (symlinkProbe.exitCode !== 0 && symlinkProbe.exitCode !== 1)
+    ) {
+      throw new Error(`Unable to probe ${targetPath}`);
+    }
+    if (symlinkProbe.exitCode === 0) {
+      return false;
+    }
+    if (existsProbe.exitCode === 1) {
+      return true;
+    }
+    const regularProbe = await executor.run(['test', '-f', targetPath], {
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    if (regularProbe.exitCode !== 0 && regularProbe.exitCode !== 1) {
+      throw new Error(`Unable to probe ${targetPath}`);
+    }
+    return regularProbe.exitCode === 0;
+  }
+
+  /**
    * Measure one contained worktree-relative artifact path: an existence probe,
-   * a regular-file probe (symbolic links are never sealed), a byte count and
-   * a SHA-256 digest, all through the same executor. Absent and non-regular
-   * results are facts; a command failure is an error.
+   * a regular-file probe, a canonical-path check (`realpath -e -- <path>` must
+   * equal the worktree's canonical path plus the relative path, so symbolic
+   * links in any path component are refused), a byte count and a SHA-256
+   * digest, all through the same executor. Absent and non-regular results are
+   * facts; a command failure is an error.
    */
   private async measureArtifact(
     worktreePath: string,
+    canonicalWorktreePath: string,
     relativePath: string,
     executor: CommandExecutorPort,
   ): Promise<ObservedArtifact> {
@@ -349,6 +403,17 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
         `Unable to probe ${target}: exit ${String(regularProbe.exitCode)}` +
           (regularProbe.error !== undefined ? `: ${regularProbe.error}` : ''),
       );
+    }
+    const canonicalProbe = await executor.run(['realpath', '-e', '--', target], {
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    if (canonicalProbe.exitCode !== 0) {
+      return { path: relativePath, state: 'not-a-file' };
+    }
+    const canonicalTarget = canonicalProbe.stdout.replace(/\r?\n$/, '');
+    const expectedCanonical = resolveWorktreeTarget(canonicalWorktreePath, relativePath);
+    if (canonicalTarget !== expectedCanonical) {
+      return { path: relativePath, state: 'not-a-file' };
     }
     const sizeRun = await executor.run(['wc', '-c', target], {
       timeoutMs: HASH_TIMEOUT_MS,
@@ -406,9 +471,10 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
   }
 
   /**
-   * Write the attempt's artifact manifest atomically (temp file, then `mv`)
-   * and read it back, and only then report `sealed`. The manifest paths must
-   * be gitignored; every listed artifact must be a regular file at sealing.
+   * Write the attempt's content-addressed artifact manifest atomically
+   * (unique temp file, then `mv`) and read it back, and only then report
+   * `sealed`. The manifest paths must be gitignored; every listed artifact
+   * must be a regular file inside the canonical worktree at sealing.
    */
   async sealArtifactManifest(request: SealArtifactManifestRequest): Promise<SealArtifactManifestResult> {
     const rootRefusal = worktreeRootRefusal(request.worktreePath);
@@ -425,17 +491,21 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
       }
     }
     const executor = this.executorFor(request.recordedHost);
-    const ignored = await Promise.all(
-      [ARTIFACT_MANIFEST_RELATIVE_PATH, ARTIFACT_MANIFEST_TEMP_RELATIVE_PATH].map((p) =>
-        this.checkIgnored(request.worktreePath, p, executor),
-      ),
+    const canonicalWorktreePath = await this.resolveCanonicalWorktreePath(
+      request.worktreePath,
+      executor,
     );
-    if (ignored.some((value) => !value)) {
-      return { outcome: 'refused', reason: 'Artifact manifest paths are not gitignored' };
+    if (canonicalWorktreePath === null) {
+      return {
+        outcome: 'refused',
+        reason: `Unable to resolve canonical worktree path for ${request.worktreePath}`,
+      };
     }
     const uniquePaths = [...new Set(request.artifactPaths)];
     const observed = await Promise.all(
-      uniquePaths.map((p) => this.measureArtifact(request.worktreePath, p, executor)),
+      uniquePaths.map((p) =>
+        this.measureArtifact(request.worktreePath, canonicalWorktreePath, p, executor),
+      ),
     );
     for (const observation of observed) {
       if (observation.state === 'absent') {
@@ -453,15 +523,50 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
       .map((o) => ({ path: o.path, size: o.size, sha256: o.sha256 }));
     const manifest = buildArtifactManifest(request.attemptId, entries);
     const text = serializeArtifactManifest(manifest);
-    const finalPath = resolveWorktreeTarget(request.worktreePath, ARTIFACT_MANIFEST_RELATIVE_PATH);
-    const tempPath = resolveWorktreeTarget(request.worktreePath, ARTIFACT_MANIFEST_TEMP_RELATIVE_PATH);
-    const mkdir = await executor.run(['mkdir', '-p', path.dirname(finalPath)], {
+    const manifestSha256 = sha256HexDigest(text);
+    const manifestRelativePath = artifactManifestRelativePath(manifestSha256);
+    const tempRelativePath = artifactManifestTempRelativePath(
+      manifestRelativePath,
+      randomBytes(4).toString('hex'),
+    );
+    const ignored = await Promise.all(
+      [manifestRelativePath, tempRelativePath].map((p) =>
+        this.checkIgnored(request.worktreePath, p, executor),
+      ),
+    );
+    if (ignored.some((value) => !value)) {
+      return { outcome: 'refused', reason: 'Artifact manifest paths are not gitignored' };
+    }
+    const finalPath = resolveWorktreeTarget(request.worktreePath, manifestRelativePath);
+    const tempPath = resolveWorktreeTarget(request.worktreePath, tempRelativePath);
+    const laneDir = path.dirname(finalPath);
+    const mkdir = await executor.run(['mkdir', '-p', laneDir], {
       timeoutMs: BRIEF_WRITE_TIMEOUT_MS,
     });
     if (mkdir.exitCode !== 0) {
       return {
         outcome: 'refused',
         reason: `Unable to create lane directory: ${mkdir.error ?? mkdir.stderr.trim()}`,
+      };
+    }
+    const [laneDirProbe, laneLinkProbe] = await Promise.all([
+      executor.run(['test', '-d', laneDir], { timeoutMs: PROBE_TIMEOUT_MS }),
+      executor.run(['test', '-L', laneDir], { timeoutMs: PROBE_TIMEOUT_MS }),
+    ]);
+    if (laneDirProbe.exitCode !== 0 || laneLinkProbe.exitCode !== 1) {
+      return {
+        outcome: 'refused',
+        reason: 'Lane directory .lane must be a real directory and not a symbolic link',
+      };
+    }
+    const [tempAllowed, finalAllowed] = await Promise.all([
+      this.isAbsentOrRegularFile(tempPath, executor),
+      this.isAbsentOrRegularFile(finalPath, executor),
+    ]);
+    if (!tempAllowed || !finalAllowed) {
+      return {
+        outcome: 'refused',
+        reason: 'Artifact manifest target or temp path is not a regular file',
       };
     }
     const write = await executor.run(['tee', tempPath], {
@@ -487,53 +592,106 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     }
     return {
       outcome: 'sealed',
-      manifestPath: ARTIFACT_MANIFEST_RELATIVE_PATH,
-      manifestSha256: sha256HexDigest(text),
+      manifestPath: manifestRelativePath,
+      manifestSha256,
       manifest,
     };
   }
 
   /**
    * Re-hash every file the manifest lists and compare against the sealed
-   * manifest. Answers `sealed`, `missing` (no manifest) or `mismatch`; a
-   * rewrite of the manifest itself (digest differs from the recorded one) is
-   * a mismatch too.
+   * manifest. Answers `sealed`, `missing` (no manifest at all: `test -e`
+   * false and `test -L` false) or `mismatch`; a non-regular file, symlink,
+   * read failure or unparseable manifest is `manifest-invalid`, and a rewrite
+   * of the manifest itself (digest differs from the recorded one) is
+   * `manifest-changed`.
    */
-  async verifyArtifactManifest(request: VerifyArtifactManifestRequest): Promise<VerifyArtifactManifestResult> {
+  async verifyArtifactManifest(
+    request: VerifyArtifactManifestRequest & { readonly manifestPath?: string },
+  ): Promise<VerifyArtifactManifestResult> {
     const rootRefusal = worktreeRootRefusal(request.worktreePath);
     if (rootRefusal !== null) {
       throw new Error(rootRefusal);
     }
     const executor = this.executorFor(request.recordedHost);
-    const targetPath = resolveWorktreeTarget(request.worktreePath, ARTIFACT_MANIFEST_RELATIVE_PATH);
-    const text = await this.readContainedFile(request.worktreePath, targetPath, request.recordedHost);
-    if (text === null) {
+    const manifestRelativePath =
+      request.manifestPath ?? artifactManifestRelativePath(request.expectedManifestSha256);
+    const targetPath = resolveWorktreeTarget(request.worktreePath, manifestRelativePath);
+    const [existsProbe, symlinkProbe] = await Promise.all([
+      executor.run(['test', '-e', targetPath], { timeoutMs: PROBE_TIMEOUT_MS }),
+      executor.run(['test', '-L', targetPath], { timeoutMs: PROBE_TIMEOUT_MS }),
+    ]);
+    if (
+      (existsProbe.exitCode !== 0 && existsProbe.exitCode !== 1) ||
+      (symlinkProbe.exitCode !== 0 && symlinkProbe.exitCode !== 1)
+    ) {
+      return {
+        outcome: 'mismatch',
+        mismatches: [{ path: manifestRelativePath, kind: 'manifest-invalid' }],
+      };
+    }
+    if (existsProbe.exitCode === 1 && symlinkProbe.exitCode === 1) {
       return { outcome: 'missing' };
     }
+    if (symlinkProbe.exitCode === 0) {
+      return {
+        outcome: 'mismatch',
+        mismatches: [{ path: manifestRelativePath, kind: 'manifest-invalid' }],
+      };
+    }
+    const regularProbe = await executor.run(['test', '-f', targetPath], {
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    if (regularProbe.exitCode !== 0) {
+      return {
+        outcome: 'mismatch',
+        mismatches: [{ path: manifestRelativePath, kind: 'manifest-invalid' }],
+      };
+    }
+    const readResult = await executor.run(['cat', targetPath], { timeoutMs: CAT_TIMEOUT_MS });
+    if (readResult.exitCode !== 0) {
+      return {
+        outcome: 'mismatch',
+        mismatches: [{ path: manifestRelativePath, kind: 'manifest-invalid' }],
+      };
+    }
+    const text = readResult.stdout;
     if (
       request.expectedManifestSha256 !== undefined &&
       sha256HexDigest(text) !== request.expectedManifestSha256
     ) {
       return {
         outcome: 'mismatch',
-        mismatches: [{ path: ARTIFACT_MANIFEST_RELATIVE_PATH, kind: 'manifest-changed' }],
+        mismatches: [{ path: manifestRelativePath, kind: 'manifest-changed' }],
       };
     }
     const parsed = parseArtifactManifest(text);
     if (parsed === null) {
       return {
         outcome: 'mismatch',
-        mismatches: [{ path: ARTIFACT_MANIFEST_RELATIVE_PATH, kind: 'manifest-invalid' }],
+        mismatches: [{ path: manifestRelativePath, kind: 'manifest-invalid' }],
       };
     }
     if (parsed.attemptId !== request.attemptId) {
       return {
         outcome: 'mismatch',
-        mismatches: [{ path: ARTIFACT_MANIFEST_RELATIVE_PATH, kind: 'attempt-id' }],
+        mismatches: [{ path: manifestRelativePath, kind: 'attempt-id' }],
+      };
+    }
+    const canonicalWorktreePath = await this.resolveCanonicalWorktreePath(
+      request.worktreePath,
+      executor,
+     );
+    if (canonicalWorktreePath === null) {
+      return {
+        outcome: 'mismatch',
+        mismatches: [{ path: manifestRelativePath, kind: 'manifest-invalid' }],
       };
     }
     const observed = await Promise.all(
-      parsed.files.map((f) => this.measureArtifact(request.worktreePath, f.path, executor)),
+      parsed.files.map((f) =>
+        this.measureArtifact(request.worktreePath, canonicalWorktreePath, f.path, executor),
+      ),
     );
     return compareArtifactManifest(parsed, observed);
   }

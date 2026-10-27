@@ -15,6 +15,7 @@ import type {
 } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 import {
   ARTIFACT_MANIFEST_RELATIVE_PATH,
+  artifactManifestRelativePath,
   buildArtifactManifest,
   parseArtifactManifest,
   serializeArtifactManifest,
@@ -59,6 +60,8 @@ function makeFake(overrides: Record<string, Partial<CommandRunResult>> = {}): {
     switch (call.argv[0]) {
       case 'git':
         return {};
+      case 'realpath':
+        return { stdout: call.argv[call.argv.length - 1] + '\n' };
       case 'test': {
         const flag = call.argv[1];
         return flag === '-L' ? { exitCode: 1 } : { exitCode: 0 };
@@ -99,23 +102,29 @@ describe('AttemptArtifactAdapter artifact manifest (fake executor)', () => {
     const result = await sealWith(fake, ['docs/a.md']);
     expect(result.outcome).toBe('sealed');
     if (result.outcome !== 'sealed') return;
+    const expectedManifestSha256 = sha256HexDigest(fake.getTeeInput());
+    const expectedManifestPath = artifactManifestRelativePath(expectedManifestSha256);
     const teeCalls = fake.calls.filter((c) => c.argv[0] === 'tee');
     expect(teeCalls).toHaveLength(1);
-    expect(teeCalls[0].argv[1]).toBe('/wt/.lane/artifacts-manifest.json.tmp');
+    const tempTarget = teeCalls[0].argv[1];
+    expect(tempTarget).toMatch(
+      /^\/wt\/\.lane\/artifacts-manifest-[0-9a-f]{16}\.json\.tmp-[0-9a-f]{8}$/,
+    );
+    expect(tempTarget.startsWith('/wt/' + expectedManifestPath + '.tmp-')).toBe(true);
     const teeIndex = fake.calls.findIndex((c) => c.argv[0] === 'tee');
     const mvIndex = fake.calls.findIndex((c) => c.argv[0] === 'mv');
     expect(mvIndex).toBeGreaterThan(teeIndex);
     expect(fake.calls[mvIndex].argv).toEqual([
       'mv',
       '-f',
-      '/wt/.lane/artifacts-manifest.json.tmp',
-      '/wt/.lane/artifacts-manifest.json',
+      tempTarget,
+      '/wt/' + expectedManifestPath,
     ]);
     expect(
-      fake.calls.some((c) => c.argv[0] === 'tee' && c.argv[1] === '/wt/.lane/artifacts-manifest.json'),
+      fake.calls.some((c) => c.argv[0] === 'tee' && c.argv[1] === '/wt/' + expectedManifestPath),
     ).toBe(false);
-    expect(result.manifestPath).toBe(ARTIFACT_MANIFEST_RELATIVE_PATH);
-    expect(result.manifestSha256).toBe(sha256HexDigest(fake.getTeeInput()));
+    expect(result.manifestPath).toBe(expectedManifestPath);
+    expect(result.manifestSha256).toBe(expectedManifestSha256);
     expect(result.manifest.files).toEqual([{ path: 'docs/a.md', size: 6, sha256: HEX64 }]);
     expect(result.manifest.total).toEqual({ files: 1, bytes: 6 });
   });
@@ -126,9 +135,10 @@ describe('AttemptArtifactAdapter artifact manifest (fake executor)', () => {
     expect(result.outcome).toBe('refused');
     if (result.outcome !== 'refused') return;
     expect(result.reason).toContain('Unable to move artifact manifest into place');
+    const teeCall = fake.calls.find((c) => c.argv[0] === 'tee');
     const rmIndex = fake.calls.findIndex((c) => c.argv[0] === 'rm');
     expect(rmIndex).toBeGreaterThan(-1);
-    expect(fake.calls[rmIndex].argv).toEqual(['rm', '-f', '/wt/.lane/artifacts-manifest.json.tmp']);
+    expect(fake.calls[rmIndex].argv).toEqual(['rm', '-f', teeCall?.argv[1]]);
   });
 
   it('refuses when the read-back differs', async () => {
@@ -197,7 +207,8 @@ describe('AttemptArtifactAdapter artifact manifest (real filesystem)', () => {
     });
     expect(sealed.outcome).toBe('sealed');
     if (sealed.outcome !== 'sealed') return;
-    const manifestText = await fsp.readFile(path.join(dir, '.lane', 'artifacts-manifest.json'), 'utf8');
+    expect(sealed.manifestPath).toBe(artifactManifestRelativePath(sealed.manifestSha256));
+    const manifestText = await fsp.readFile(path.join(dir, sealed.manifestPath), 'utf8');
     const manifest = parseArtifactManifest(manifestText);
     expect(manifest).not.toBeNull();
     expect(manifest?.attemptId).toBe('attempt-1');
@@ -215,7 +226,7 @@ describe('AttemptArtifactAdapter artifact manifest (real filesystem)', () => {
     });
     expect(verdict.outcome).toBe('sealed');
     const laneEntries = await fsp.readdir(path.join(dir, '.lane'));
-    expect(laneEntries).not.toContain('artifacts-manifest.json.tmp');
+    expect(laneEntries.some((entry) => entry.includes('.tmp'))).toBe(false);
   });
 
   it('answers missing when no manifest exists', async () => {
@@ -296,7 +307,7 @@ describe('AttemptArtifactAdapter artifact manifest (real filesystem)', () => {
       { path: 'docs/a.md', size: 99, sha256: 'b'.repeat(64) },
     ]);
     await fsp.writeFile(
-      path.join(dir, '.lane', 'artifacts-manifest.json'),
+      path.join(dir, sealed.manifestPath),
       serializeArtifactManifest(rewritten),
     );
     const verdict = await adapter.verifyArtifactManifest({
@@ -306,7 +317,7 @@ describe('AttemptArtifactAdapter artifact manifest (real filesystem)', () => {
     });
     expect(verdict).toEqual({
       outcome: 'mismatch',
-      mismatches: [{ path: ARTIFACT_MANIFEST_RELATIVE_PATH, kind: 'manifest-changed' }],
+      mismatches: [{ path: sealed.manifestPath, kind: 'manifest-changed' }],
     });
   });
 
@@ -335,5 +346,117 @@ describe('AttemptArtifactAdapter artifact manifest (real filesystem)', () => {
     expect(result.outcome).toBe('refused');
     if (result.outcome !== 'refused') return;
     expect(result.reason).toContain('not a regular file');
+  });
+
+  it('refuses a parent-directory symlink (docs -> outside dir) and leaves the outside file untouched', async () => {
+    const dir = await makeTempRepo();
+    const outsideDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fleet-artifact-outside-'));
+    dirs.push(outsideDir);
+    const outsideFile = path.join(outsideDir, 'a.md');
+    await fsp.writeFile(outsideFile, 'outside secret\n');
+    await fsp.rm(path.join(dir, 'docs'), { recursive: true, force: true });
+    await fsp.symlink(outsideDir, path.join(dir, 'docs'));
+    const adapter = new AttemptArtifactAdapter({ executor: new LocalExecutor() });
+    const result = await adapter.sealArtifactManifest({
+      attemptId: 'attempt-1',
+      worktreePath: dir,
+      artifactPaths: ['docs/a.md'],
+    });
+    expect(result.outcome).toBe('refused');
+    if (result.outcome !== 'refused') return;
+    expect(result.reason).toContain('not a regular file');
+    expect(await fsp.readFile(outsideFile, 'utf8')).toBe('outside secret\n');
+  });
+
+  it('refuses a pre-existing symlink at the final manifest path', async () => {
+    const dir = await makeTempRepo();
+    const outsideDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fleet-manifest-outside-'));
+    dirs.push(outsideDir);
+    const outsideTarget = path.join(outsideDir, 'hijack.json');
+    await fsp.writeFile(outsideTarget, 'untouched\n');
+    const expectedManifest = buildArtifactManifest('attempt-1', [
+      { path: 'docs/a.md', size: 6, sha256: digestOf('alpha\n') },
+    ]);
+    const expectedDigest = sha256HexDigest(serializeArtifactManifest(expectedManifest));
+    const finalRelPath = artifactManifestRelativePath(expectedDigest);
+    await fsp.symlink(outsideTarget, path.join(dir, finalRelPath));
+    const adapter = new AttemptArtifactAdapter({ executor: new LocalExecutor() });
+    const result = await adapter.sealArtifactManifest({
+      attemptId: 'attempt-1',
+      worktreePath: dir,
+      artifactPaths: ['docs/a.md'],
+    });
+    expect(result.outcome).toBe('refused');
+    expect(await fsp.readFile(outsideTarget, 'utf8')).toBe('untouched\n');
+  });
+
+  it('refuses .lane as a symlink', async () => {
+    const dir = await makeTempRepo();
+    const outsideLane = await fsp.mkdtemp(path.join(os.tmpdir(), 'fleet-lane-outside-'));
+    dirs.push(outsideLane);
+    await fsp.rm(path.join(dir, '.lane'), { recursive: true, force: true });
+    await fsp.symlink(outsideLane, path.join(dir, '.lane'));
+    const adapter = new AttemptArtifactAdapter({ executor: new LocalExecutor() });
+    const result = await adapter.sealArtifactManifest({
+      attemptId: 'attempt-1',
+      worktreePath: dir,
+      artifactPaths: ['docs/a.md'],
+    });
+    expect(result.outcome).toBe('refused');
+    expect(await fsp.readdir(outsideLane)).toEqual([]);
+  });
+
+  it('gives mismatch / manifest-invalid (not missing) when verify encounters a directory or symlink at the manifest path', async () => {
+    const dir = await makeTempRepo();
+    const adapter = new AttemptArtifactAdapter({ executor: new LocalExecutor() });
+    const manifestAbsPath = path.join(dir, ARTIFACT_MANIFEST_RELATIVE_PATH);
+    await fsp.mkdir(manifestAbsPath, { recursive: true });
+    const dirVerdict = await adapter.verifyArtifactManifest({
+      attemptId: 'attempt-1',
+      worktreePath: dir,
+    });
+    expect(dirVerdict).toEqual({
+      outcome: 'mismatch',
+      mismatches: [{ path: ARTIFACT_MANIFEST_RELATIVE_PATH, kind: 'manifest-invalid' }],
+    });
+
+    await fsp.rm(manifestAbsPath, { recursive: true, force: true });
+    await fsp.symlink(path.join(dir, 'docs', 'a.md'), manifestAbsPath);
+    const symlinkVerdict = await adapter.verifyArtifactManifest({
+      attemptId: 'attempt-1',
+      worktreePath: dir,
+    });
+    expect(symlinkVerdict).toEqual({
+      outcome: 'mismatch',
+      mismatches: [{ path: ARTIFACT_MANIFEST_RELATIVE_PATH, kind: 'manifest-invalid' }],
+    });
+  });
+
+  it('produces two different file names for two sealings with different content, and verify against the first digest still says sealed', async () => {
+    const dir = await makeTempRepo();
+    await fsp.writeFile(path.join(dir, 'docs', 'b.md'), 'bravo\n');
+    const adapter = new AttemptArtifactAdapter({ executor: new LocalExecutor() });
+    const first = await adapter.sealArtifactManifest({
+      attemptId: 'attempt-1',
+      worktreePath: dir,
+      artifactPaths: ['docs/a.md'],
+    });
+    const second = await adapter.sealArtifactManifest({
+      attemptId: 'attempt-1',
+      worktreePath: dir,
+      artifactPaths: ['docs/a.md', 'docs/b.md'],
+    });
+    expect(first.outcome).toBe('sealed');
+    expect(second.outcome).toBe('sealed');
+    if (first.outcome !== 'sealed' || second.outcome !== 'sealed') return;
+    expect(first.manifestPath).not.toBe(second.manifestPath);
+    expect(first.manifestPath).toMatch(/^\.lane\/artifacts-manifest-[0-9a-f]{16}\.json$/);
+    expect(second.manifestPath).toMatch(/^\.lane\/artifacts-manifest-[0-9a-f]{16}\.json$/);
+    const verdict = await adapter.verifyArtifactManifest({
+      attemptId: 'attempt-1',
+      worktreePath: dir,
+      expectedManifestSha256: first.manifestSha256,
+    });
+    expect(verdict.outcome).toBe('sealed');
   });
 });

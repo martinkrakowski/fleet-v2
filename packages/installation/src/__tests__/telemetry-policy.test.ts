@@ -339,4 +339,17 @@ describe('policy.telemetry (OT4a)', () => {
     policyWithAliases.telemetry.projectAliases['example-project'] = 'changed';
     expect(first.projectAliases).toEqual({ 'example-project': 'example' });
   });
+
+  it('returns a fresh, frozen default for an absent or malformed block', () => {
+    for (const policy of [undefined, {}, { telemetry: { enabled: 'yes' } }]) {
+      const first = resolveTelemetryPolicy(policy);
+      const second = resolveTelemetryPolicy(policy);
+      expect(first).toEqual(DEFAULT_TELEMETRY_POLICY);
+      expect(first).not.toBe(DEFAULT_TELEMETRY_POLICY);
+      expect(first).not.toBe(second);
+      expect(first.projectAliases).not.toBe(DEFAULT_TELEMETRY_POLICY.projectAliases);
+      expect(Object.isFrozen(first)).toBe(true);
+      expect(Object.isFrozen(first.projectAliases)).toBe(true);
+    }
+  });
 });

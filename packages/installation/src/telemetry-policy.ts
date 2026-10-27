@@ -261,7 +261,7 @@ export function resolveTelemetryPolicy(policy: unknown): ResolvedTelemetryPolicy
   const record = isPlainRecord(policy) ? policy : {};
   const block = readTelemetryPolicyBlock(readOwnDataProperty(record, 'telemetry'));
   if (!block.ok) {
-    return DEFAULT_TELEMETRY_POLICY;
+    return Object.freeze({ ...DEFAULT_TELEMETRY_POLICY, projectAliases: Object.freeze({}) });
   }
   const read = block.policy;
   return Object.freeze({

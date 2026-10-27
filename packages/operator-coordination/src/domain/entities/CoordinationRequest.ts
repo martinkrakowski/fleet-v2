@@ -14,14 +14,27 @@
 import type {
   AuthorizationConsumptionRecord,
   CoordinationRequestRecord,
+  PolicyGrantRecord,
   RelayAcknowledgementRecord,
 } from '../coordination-records.js';
+import {
+  POLICY_GRANT_HEAD_PATTERN,
+  POLICY_GRANT_SOURCE_FOR_KIND,
+  isPolicyGrantRecord,
+  parsePolicyDecisionRevision,
+  policyGrantForgeKindOf,
+} from '../policy-grants.js';
 import { CoordinationKind } from '../value-objects/CoordinationKind.vo.js';
 import type { CoordinationKindValue } from '../value-objects/CoordinationKind.vo.js';
 import { CoordinationState } from '../value-objects/CoordinationState.vo.js';
 import type { CoordinationStateValue } from '../value-objects/CoordinationState.vo.js';
 
 const DELIVERY_STATUSES: readonly string[] = ['delivered', 'pending', 'delivery-gap'];
+
+/** The record with a writable optional policyGrant so normalization can omit the key. */
+type MutableCoordinationRequestRecord = Omit<CoordinationRequestRecord, 'policyGrant'> & {
+  policyGrant?: PolicyGrantRecord;
+};
 
 export class CoordinationRequest {
   private constructor(private readonly record: CoordinationRequestRecord) {
@@ -60,6 +73,7 @@ export class CoordinationRequest {
     if (!state.success || state.value === undefined) {
       throw new Error(`CoordinationRequest has an invalid state: ${String(record.state)}`);
     }
+    const policyGrant = CoordinationRequest.readPolicyGrant(record);
     if (!DELIVERY_STATUSES.includes(record.deliveryStatus)) {
       throw new Error(`CoordinationRequest has an invalid delivery status: ${String(record.deliveryStatus)}`);
     }
@@ -75,11 +89,17 @@ export class CoordinationRequest {
     }
     const consumptions = CoordinationRequest.readConsumptions(record.consumptions);
     const acknowledgements = CoordinationRequest.readAcknowledgements(record.acknowledgements);
-    return new CoordinationRequest({
+    const normalized: MutableCoordinationRequestRecord = {
       ...record,
       consumptions,
       acknowledgements,
-    });
+    };
+    if (policyGrant === undefined) {
+      delete normalized.policyGrant;
+    } else {
+      normalized.policyGrant = policyGrant;
+    }
+    return new CoordinationRequest(normalized);
   }
 
   private static readConsumptions(
@@ -125,18 +145,134 @@ export class CoordinationRequest {
     return Object.freeze(acknowledgements.map((acknowledgement) => ({ ...acknowledgement })));
   }
 
+  private static readPolicyGrant(record: CoordinationRequestRecord): PolicyGrantRecord | undefined {
+    let descriptor: PropertyDescriptor | undefined;
+    
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(record, 'policyGrant');
+    } catch {
+      throw new Error('PolicyGrant validation failed due to a prohibited Proxy trap execution.');
+    }
+    
+    if (descriptor === undefined) {
+      return undefined;
+    }
+    
+    if (descriptor.get || descriptor.set) {
+      throw new Error('CoordinationRequest policyGrant cannot be an accessor property.');
+    }
+    
+    const raw: unknown = descriptor.value;
+    
+    if (raw === undefined) {
+      return undefined;
+    }
+    
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new Error(
+        'CoordinationRequest policyGrant must be { workOrderId, attemptId, acceptanceReceiptId }',
+      );
+    }
+
+    let proto: unknown;
+    let ownKeys: PropertyKey[];
+    
+    try {
+      proto = Object.getPrototypeOf(raw);
+      ownKeys = Reflect.ownKeys(raw);
+    } catch {
+      throw new Error('PolicyGrant validation failed due to a prohibited Proxy trap execution.');
+    }
+    
+    if (proto !== Object.prototype && proto !== null) {
+      throw new Error('CoordinationRequest policyGrant must only use Object.prototype or null as its prototype.');
+    }
+    
+    let keyDescriptors: Array<[PropertyKey, PropertyDescriptor | undefined]>;
+    
+    try {
+      keyDescriptors = ownKeys.map(key => [key, Object.getOwnPropertyDescriptor(raw, key)]);
+    } catch {
+      throw new Error('PolicyGrant validation failed due to a prohibited Proxy trap execution.');
+    }
+    
+    // Now validate the snapshot and build the stored copy.
+    const keys: string[] = [];
+    const snapshot: Record<string, unknown> = {};
+
+    for (const [key, keyDescriptor] of keyDescriptors) {
+      if (typeof key !== 'string' || key.length === 0) {
+        throw new Error('Policy grant key must be a non-empty string.');
+      }
+      if (!keyDescriptor || keyDescriptor.get || keyDescriptor.set || keyDescriptor.enumerable === false) {
+        throw new Error('Policy grant property must be an enumerable data property.');
+      }
+      keys.push(key);
+      snapshot[key] = keyDescriptor.value;
+    }
+    
+    const grantKeys = ['workOrderId', 'attemptId', 'acceptanceReceiptId'];
+    if (keys.length !== grantKeys.length || !grantKeys.every((k) => keys.includes(k))) {
+      throw new Error(
+        'CoordinationRequest policyGrant must be { workOrderId, attemptId, acceptanceReceiptId }',
+      );
+    }
+    
+    const collected: Record<string, string> = {};
+    for (const key of grantKeys) {
+      // Validate and copy from the descriptor snapshot; the object is never read again.
+      const value = snapshot[key];
+
+      if (typeof value !== 'string' || value.trim().length === 0 || value.length > 256) {
+        throw new Error(
+          'CoordinationRequest policyGrant must be { workOrderId, attemptId, acceptanceReceiptId }',
+        );
+      }
+      
+      collected[key] = value;
+    }
+    
+    const grant: PolicyGrantRecord = {
+      workOrderId: collected.workOrderId,
+      attemptId: collected.attemptId,
+      acceptanceReceiptId: collected.acceptanceReceiptId,
+    };
+    
+    if (record.kind !== 'action-decision') {
+      throw new Error('CoordinationRequest policy grant must be an action-decision');
+    }
+    
+    const parsed = parsePolicyDecisionRevision(record.decisionRevision);
+    if (parsed === null) {
+      throw new Error('CoordinationRequest policy grant must carry a policy decision revision');
+    }
+    const kind = policyGrantForgeKindOf(record.actionScope);
+    if (kind === null || POLICY_GRANT_SOURCE_FOR_KIND[kind] !== parsed.source) {
+      throw new Error('CoordinationRequest policy grant scope does not match its setting');
+    }
+    if (record.expectedHeadSha === null || !POLICY_GRANT_HEAD_PATTERN.test(record.expectedHeadSha)) {
+      throw new Error('CoordinationRequest policy grant requires an expected head');
+    }
+
+    return Object.freeze(grant);
+  }
+
   getId(): string {
     return this.record.id;
   }
 
   toRecord(): CoordinationRequestRecord {
-    return {
+    const record: MutableCoordinationRequestRecord = {
       ...this.record,
       consumptions: this.record.consumptions.map((consumption) => ({ ...consumption })),
       acknowledgements: this.record.acknowledgements.map((acknowledgement) => ({
         ...acknowledgement,
       })),
     };
+    if (this.record.policyGrant !== undefined) {
+      record.policyGrant = { ...this.record.policyGrant };
+    }
+    return record;
   }
 
   getKind(): CoordinationKindValue {
@@ -165,6 +301,14 @@ export class CoordinationRequest {
 
   getDecisionRevision(): string | null {
     return this.record.decisionRevision;
+  }
+
+  getPolicyGrant(): PolicyGrantRecord | null {
+    return this.record.policyGrant === undefined ? null : { ...this.record.policyGrant };
+  }
+
+  isPolicyGrant(): boolean {
+    return isPolicyGrantRecord(this.record);
   }
 
   isApproved(): boolean {

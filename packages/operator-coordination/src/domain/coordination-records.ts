@@ -117,6 +117,17 @@ export interface RelayAcknowledgementRecord {
   readonly acknowledgedAtIso: string;
 }
 
+/**
+ * The coordinates of a policy grant (auto-merge plan A3): the work order it serves, the attempt whose
+ * accepted head it authorises, and the acceptance receipt that made it eligible. Present only on a
+ * grant issued from an installation setting; an owner grant never carries it.
+ */
+export interface PolicyGrantRecord {
+  readonly workOrderId: string;
+  readonly attemptId: string;
+  readonly acceptanceReceiptId: string;
+}
+
 /** Serializable snapshot of the CoordinationRequest aggregate. */
 export interface CoordinationRequestRecord {
   readonly id: string;
@@ -136,6 +147,8 @@ export interface CoordinationRequestRecord {
   readonly revision: number;
   readonly createdAtIso: string;
   readonly updatedAtIso: string;
+  /** Present only on a policy grant (A3); absent on every owner grant and every other request. */
+  readonly policyGrant?: PolicyGrantRecord;
 }
 
 /** Bounded attention and staleness summary; reading it rewrites nothing. */

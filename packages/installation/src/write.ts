@@ -174,6 +174,13 @@ function serializePolicy(policy: PolicySection): Record<string, unknown> {
   if (policy.liveTail !== undefined) {
     out.liveTail = { content: policy.liveTail.content };
   }
+  if (policy.autoMerge !== undefined) {
+    out.autoMerge = {
+      enabled: policy.autoMerge.enabled,
+      allowHighRisk: policy.autoMerge.allowHighRisk,
+      onBlocked: policy.autoMerge.onBlocked,
+    };
+  }
   return out;
 }
 

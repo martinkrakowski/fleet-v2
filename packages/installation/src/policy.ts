@@ -9,6 +9,7 @@
  */
 
 import type {
+  AutoMergePolicy,
   ChainRole,
   ChainStep,
   ChainsSection,
@@ -314,4 +315,34 @@ export function resolveLiveTailContent(policy: PolicySection | undefined): LiveT
     return 'full';
   }
   return DEFAULT_LIVE_TAIL_CONTENT;
+}
+
+/** Auto-merge for an installation without `policy.autoMerge`: off (plan A1, the owner's default). */
+export const DEFAULT_AUTO_MERGE_POLICY: AutoMergePolicy = Object.freeze({
+  enabled: false,
+  allowHighRisk: false,
+  onBlocked: 'ask-owner',
+});
+
+/**
+ * The effective auto-merge policy: the block's values only when all three are
+ * well-typed (`enabled` and `allowHighRisk` booleans, `onBlocked` exactly
+ * `ask-owner` or `hold`); absent or malformed in any field is the default (off).
+ * Always a fresh frozen object with the keys in canonical order.
+ */
+export function resolveAutoMergePolicy(policy: PolicySection | undefined): AutoMergePolicy {
+  const block = policy?.autoMerge;
+  if (
+    block === undefined ||
+    typeof block?.enabled !== 'boolean' ||
+    typeof block?.allowHighRisk !== 'boolean' ||
+    (block?.onBlocked !== 'ask-owner' && block?.onBlocked !== 'hold')
+  ) {
+    return Object.freeze({ ...DEFAULT_AUTO_MERGE_POLICY });
+  }
+  return Object.freeze({
+    enabled: block.enabled,
+    allowHighRisk: block.allowHighRisk,
+    onBlocked: block.onBlocked,
+  });
 }

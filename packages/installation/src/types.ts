@@ -228,6 +228,20 @@ export interface LiveTailPolicy {
   readonly content: LiveTailContent;
 }
 
+/** What auto-merge does when acceptance is blocked by anything but a first-look ci-pending (plan A1, §4). */
+export type AutoMergeOnBlocked = 'ask-owner' | 'hold';
+
+/**
+ * The v2 `policy.autoMerge` section (auto-merge plan A1). Off unless `enabled`; a
+ * high-risk lane is excluded unless `allowHighRisk`. A present block names all three
+ * fields. It grants nothing by itself: grants are issued per merge (AM3a, AM4a).
+ */
+export interface AutoMergePolicy {
+  readonly enabled: boolean;
+  readonly allowHighRisk: boolean;
+  readonly onBlocked: AutoMergeOnBlocked;
+}
+
 /**
  * The v2 `policy` section: shape only. The rules are enforced by the loader
  * itself through `validateSeatPolicy` (lane O5) on every v2 file.
@@ -239,6 +253,8 @@ export interface PolicySection {
   readonly useFreeSeats?: boolean;
   /** Absent means `{ content: 'summaries' }`; read it through `resolveLiveTailContent`. */
   readonly liveTail?: LiveTailPolicy;
+  /** Absent means off (`DEFAULT_AUTO_MERGE_POLICY`); read it through `resolveAutoMergePolicy`. */
+  readonly autoMerge?: AutoMergePolicy;
 }
 
 /** The v2 `shelf` section with the local provider (D1, default). */

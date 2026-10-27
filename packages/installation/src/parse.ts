@@ -5,6 +5,7 @@ import { isValidHostName } from '@fleet/shared';
 import { AGY_SECURITY_TEXT_VERSION } from './agy-security.js';
 
 import type {
+  AutoMergePolicy,
   ChainStep,
   ChainTrigger,
   ChainsSection,
@@ -154,9 +155,11 @@ const POLICY_KEYS: readonly string[] = [
   'perLaneCostCeiling',
   'useFreeSeats',
   'liveTail',
+  'autoMerge',
 ];
 const FORBIDDEN_ROUTE_KEYS: readonly string[] = ['tool', 'modelPattern'];
 const LIVE_TAIL_KEYS: readonly string[] = ['content'];
+const AUTO_MERGE_KEYS: readonly string[] = ['enabled', 'allowHighRisk', 'onBlocked'];
 const GIT_SHELF_KEYS: readonly string[] = [
   'provider',
   'repoDir',
@@ -1653,11 +1656,13 @@ function parseV2Policy(
     }
   }
   const liveTail = parseLiveTailPolicy(section, errors);
+  const autoMerge = parseAutoMergePolicy(section, errors);
   return {
     ...(forbiddenRoutes !== undefined ? { forbiddenRoutes } : {}),
     ...(perLaneCostCeiling !== undefined ? { perLaneCostCeiling } : {}),
     ...(useFreeSeats !== undefined ? { useFreeSeats } : {}),
     ...(liveTail !== undefined ? { liveTail } : {}),
+    ...(autoMerge !== undefined ? { autoMerge } : {}),
   };
 }
 
@@ -1684,6 +1689,58 @@ function parseLiveTailPolicy(
     return undefined;
   }
   return { content };
+}
+
+function readAutoMergeBoolean(
+  record: JsonObject,
+  field: string,
+  errors: string[],
+): boolean {
+  if (!Object.hasOwn(record, field)) {
+    errors.push(`policy.autoMerge.${field}: required`);
+    return false;
+  }
+  const value = record[field];
+  if (typeof value !== 'boolean') {
+    errors.push(`policy.autoMerge.${field}: must be a boolean`);
+    return false;
+  }
+  return value;
+}
+
+function parseAutoMergePolicy(
+  section: JsonObject,
+  errors: string[],
+): AutoMergePolicy | undefined {
+  if (!Object.hasOwn(section, 'autoMerge')) {
+    return undefined;
+  }
+  const value = section.autoMerge;
+  if (!isJsonObject(value)) {
+    errors.push('policy.autoMerge: must be an object');
+    return undefined;
+  }
+  // The field readers return placeholders on error; the errors.length guard
+  // below discards them, so a placeholder never reaches the returned policy.
+  const before = errors.length;
+  collectUnknownKeys(value, AUTO_MERGE_KEYS, 'policy.autoMerge', errors);
+  const enabled = readAutoMergeBoolean(value, 'enabled', errors);
+  const allowHighRisk = readAutoMergeBoolean(value, 'allowHighRisk', errors);
+  let onBlocked: AutoMergePolicy['onBlocked'] = 'ask-owner';
+  if (!Object.hasOwn(value, 'onBlocked')) {
+    errors.push('policy.autoMerge.onBlocked: required');
+  } else {
+    const candidate = value.onBlocked;
+    if (candidate !== 'ask-owner' && candidate !== 'hold') {
+      errors.push('policy.autoMerge.onBlocked: must be one of ask-owner, hold');
+    } else {
+      onBlocked = candidate;
+    }
+  }
+  if (errors.length !== before) {
+    return undefined;
+  }
+  return { enabled, allowHighRisk, onBlocked };
 }
 
 function parseV2Shelf(

@@ -4,7 +4,9 @@
 - **Target repository:** `fleet-v2`
 - **Status:** rev 3: the CodeRabbit findings on PR #130 (two major, two minor) applied on top of
   rev 2, which followed the Fable review of rev 1 (not ready, two blockers in the approval path; all
-  ten findings applied). See §10
+  ten findings applied). See §10. Amended 2026-10-27 by the web UI interactivity plan, lane UI-A
+  (§4.6): three more scopes in T3a, the Questions-view read ahead of T6, and the web server's
+  interim read on the shared bearer
 - **Builds on:** `2026-10-16_owner-questions-in-ui.md` (Q0–Q3 merged, Q4–Q6 open),
   `2026-10-16_mcp-server.md` (M1 merged, M2–M4 open), `2026-10-16_onboarding-settings-ui.md`
   (the web-session pattern, U3, unbuilt)
@@ -156,7 +158,8 @@ receive updates.
   in a file the orchestrator's own user can read, and the orchestrator has a shell: it could post
   a verdict with `curl`. So, before T5:
   - scopes are enforced in `apps/api/server/middleware/security.ts`: `read`, `message`, `hook`
-    (create a permission request and wait for it) and `verdict`;
+    (create a permission request and wait for it) and `verdict` (amendment UI-A adds `operate`,
+    `orchestrate` and `tail`; §4.6);
   - a **verdict-scoped token never touches disk on the orchestrator's host**. It is minted in the
     TUI's or web's session exchange and held in memory only, the pattern of
     `2026-10-16_onboarding-settings-ui.md:94-100`;
@@ -184,6 +187,43 @@ receive updates.
 - **One-way doors** stay on signed decisions; the UI can display the canonical bytes to sign, and
   cannot sign.
 
+### 4.6 Amendment UI-A: scopes and ordering for the web UI plan
+
+Amended 2026-10-27 by the web UI interactivity plan, lane UI-A
+(`2026-10-27_web-ui-interactivity-plan.md`, §3.5, §3.6, §3.7, §5 D1–D3, D11). The text above is
+unchanged; this section adds to it.
+
+**Three more scopes in T3a.** T3a defines seven scopes, not four. The new three:
+
+| Scope | Allows | Held by | Never held by |
+|---|---|---|---|
+| `operate` | The direct attempt actions (reconcile, stop for an attempt that belongs to no lane run, collect, request acceptance) and the run controls (conductor halt, run stop) | The web session token minted in T3b's exchange | The hook token; the MCP server's token |
+| `orchestrate` | Registering, heartbeating and retiring an orchestrator session; claiming, renewing, completing, refusing and deferring requests (`/v1/orchestrators*`, `/v1/requests/:id/claim` and the other claim mutations) | The MCP server's token and the CLI (`fleet-v2 orchestrator attach`, the conductor driver); a remote orchestrator registers only with an `orchestrate`-scoped token, never the full one | A web session token, ever |
+| `tail` | The tail routes (`/v1/attempts/:id/tail`, `/v1/runs/:id/journal/tail`, `/v1/orchestrators/:id/activity`) | The web server's token | The hook token |
+
+- The web posts orchestrator requests under `message`; a request carries no authority, and the
+  claimant acts under its own (web UI plan §3.6).
+- **No web token ever holds a `dispatch` scope.** T3b's exchange never mints `orchestrate` or any
+  dispatch authority for a web session, whatever the request asks.
+- The MCP server's token gains `orchestrate` beside `read` and `message` (§4.5). It still never
+  holds `verdict`, so the orchestrator still cannot approve itself.
+- T3a's tests add: a web session token gets 403 on `/v1/requests/:id/claim`; the exchange refuses
+  to mint `orchestrate`; the hook token gets 403 on every `operate`, `orchestrate` and `tail`
+  route.
+- T3a enforces each new scope on every route that exists when it lands. Routes added later declare
+  their scope in their own lane; the web UI plan's L9 enforces `tail` on the tail routes.
+
+**The web server's interim read (web UI plan D2, D11).** Until T3a, the web server, and only the
+web server, reads `/v1/changes` (live-updates E3b) and the tail routes with its server-side bearer.
+It holds no forge credentials, so conductor D9 is not engaged. At T3a its token is re-scoped to
+`read` and `tail`; the web UI plan's L9 retires the interim bearer read. This moves E3b ahead of
+T3a for the web server only; every other `/v1/changes` reader still waits for T3a's `read` scope.
+
+**The Questions-view read moves ahead of T6.** T7's Questions view is split. Its read half (the
+view over `GET /v1/questions` and `/v1/attention`, the open-count badge, the attention card) is
+built as the web UI plan's lane Q4 on the web's existing server-side read path, before T6. T7 keeps
+the Conversation view; question answers stay Q5, after T6.
+
 ## 5. Lanes (each about 45 minutes)
 
 | # | Lane | Depends on | Review |
@@ -208,6 +248,12 @@ receive updates.
 T1a–T5 and T8a–T8b give a working TUI path with the plan-quota orchestrator. T6–T7 add the web.
 T10 is optional and changes billing.
 
+**Amendment UI-A (2026-10-27, §4.6).** T3a's scope list is `read`, `message`, `hook`, `verdict`,
+`operate`, `orchestrate` and `tail`, with the tests in §4.6, and T3a is dispatched only after
+UI-A merges. T3b's exchange never mints `orchestrate`. T7's Questions-view read half is built
+earlier as the web UI plan's Q4; T7 keeps the Conversation view. In the web UI plan's ordering, T6
+runs after its L6 in `apps/web`.
+
 ## 6. Decisions for the owner
 
 1. **Billing for the orchestrator.** Keep interactive Claude Code on the plan (MCP adapter;
@@ -225,6 +271,8 @@ T10 is optional and changes billing.
 
 - **A thread store format** (T1) becomes data the owner keeps; changing it later needs a
   migration. Two-way in practice, but choose the entry shape carefully.
+- **Scope names** (amendment UI-A): `operate`, `orchestrate` and `tail` become stored token data
+  once T3a ships. This amendment only plans them.
 - **Moving the orchestrator to API billing** (T10) is reversible technically, but money spent is
   not. The owner chooses it.
 - Everything else is a two-way door.

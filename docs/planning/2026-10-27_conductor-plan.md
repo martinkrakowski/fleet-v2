@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-27
 - **Target repository:** `fleet-v2`
-- **Status:** rev 1, the Opus review of rev 0 applied (two blockers, five majors, two notes; §8). Approved in principle by the owner (2026-10-27: "Agreed and approved. Much of this you should be able to run in parallel."). Decisions in §6 are open with defaults. Nothing built. Anchors checked against `main` at `f04b825`.
+- **Status:** rev 1, the Opus review of rev 0 applied (two blockers, five majors, two notes; §8). Approved in principle by the owner (2026-10-27: "Agreed and approved. Much of this you should be able to run in parallel."). Decisions in §6 are open with defaults. Nothing built. Anchors checked against `main` at `f04b825`. Amended 2026-10-27 by the web UI interactivity plan, lane UI-B (§3.8): how a stop ends a run, the park reason `stop-unconfirmed`, and the `run-stopped` refusal in `ResumeLaneRun`.
 - **Owner request (2026-10-27):** "How far away are we from lane orchestrators being implemented?" The answer: the stations exist, the missing design is a **conductor** that moves one lane through them.
 - **Builds on:** the 2026-10-23 seat/gate/usage plan (S1, S2), 2026-10-20 auto-merge (AM1–AM5), 2026-10-24 live updates (E3), 2026-10-25 Agensh (C1), 2026-10-26 vacuous-pass (R1, V1, V2) and untrusted-input (U1, U2) plans, and the 2026-10-26 execution order.
 
@@ -103,7 +103,7 @@ One-way actions (dispatch, push, PR, merge, an owner question) are never issued 
 
 ### 3.6 Parking, concurrency, failure
 
-- **Parking.** One attention item keyed by (project, work order, reason); where the owner must choose, one keyed owner question naming ids and kinds only. Reasons: `one-way-door`, `seat-plan-exhausted`, `blocker-after-round-2`, `ambiguous`, `artifacts-unsealed`, `cost-ceiling` (`policy.perLaneCostCeiling`), `ci-failed-no-rounds`, `branch-behind`, `review-seat-unavailable`, `halted`. Tier 2 waits in `awaiting-premerge`, not in `parked`. `conductor resume <runId>`, or the owner's answer, returns the run to the parked-from state.
+- **Parking.** One attention item keyed by (project, work order, reason); where the owner must choose, one keyed owner question naming ids and kinds only. Reasons: `one-way-door`, `seat-plan-exhausted`, `blocker-after-round-2`, `ambiguous`, `artifacts-unsealed`, `cost-ceiling` (`policy.perLaneCostCeiling`), `ci-failed-no-rounds`, `branch-behind`, `review-seat-unavailable`, `halted`, and `stop-unconfirmed` (amendment UI-B, §3.8). Tier 2 waits in `awaiting-premerge`, not in `parked`. `conductor resume <runId>`, or the owner's answer, returns the run to the parked-from state.
 - **Leases.** One per run, one per state directory for the driver, both taken by CAS with a fencing revision; the run record's saves check it, and journal intents are protected by the unique key (§3.2).
 - **Admission.** Host capacity through `ReserveExecutionCapacity` and the host-wide gate budget; one active run per package; a global cap from configuration.
 - **Merge train.** One run in `merging` per target repository; a branch behind its base parks as `branch-behind` (D6).
@@ -113,6 +113,34 @@ One-way actions (dispatch, push, PR, merge, an owner question) are never issued 
 
 - **Kill switch:** `conductor halt` writes a halt marker in the state directory; `advance` checks it before any external action and parks with `halted`. Halt never stops a running lane. `policy.conductor.enabled` (absent = off) gates the driver.
 - **Dry-run:** recording fakes for every acting outbound port; each step journals `would <action>`. **Shadow mode:** the conductor follows a hand-run lane and records what it would have done (D4).
+
+### 3.8 Amendment UI-B: stopping and resuming a run
+
+Amended 2026-10-27 by the web UI interactivity plan, lane UI-B (`2026-10-27_web-ui-interactivity-plan.md`, §3.3, §3.4, §6). The text above is unchanged; this section adds to it.
+
+**A stop is a record the driver obeys.** A stop from the web is a keyed run-journal entry `<runId>/stop@web` carrying the run's `expectedRevision`. It is written only if that revision matches the run's current one; a stale revision is refused, and the web re-reads before asking again. K1b's uniqueness check refuses a second entry with the same key. The driver reads the entry on its next `advance` and stops the run's running attempt itself through `StopAttempt` (§3.2). Nothing outside the driver calls `StopAttempt` for an attempt that belongs to a run; the direct attempt stop refuses such an attempt with a pointer to the run. A run with no running attempt ends as `stopped` without calling `StopAttempt`.
+
+**How `StopAttempt`'s outcome maps.** The same mapping applies to `conductor stop <runId>`:
+
+| `StopAttempt` outcome | Run | Capacity |
+|---|---|---|
+| `terminated`, `capacityReleased: true` | `stopped` | released |
+| `cancelled` (never started) | `stopped` | released by the cancel |
+| `terminated`, `capacityReleased: false` | `stopped` | slot stays held; one attention item names it; a reconcile releases it |
+| `still-running` or `unknown` | parked, reason `stop-unconfirmed`; the driver retries the stop and reconciles | held |
+| `refused` | parked, its reason carrying the refusal's typed reason | held |
+
+A run never shows `stopped` while its attempt may still be running, and a slot is never reported as released unless the result confirmed it. A `stop-unconfirmed` park ends as `stopped` once a retried stop or a reconcile confirms that the attempt ended.
+
+**`stop-unconfirmed` is a park reason, not a state.** It joins the reasons in §3.6. Its attention item names the run and the attempt; no owner question is asked, since nothing needs a choice.
+
+**`ResumeLaneRun` refuses two cases server-side**, each with a typed reason and its own test:
+- a run parked with `parked.reason === 'one-way-door'`: the owner's signed decision on the keyed question answers it, never a resume;
+- a `stopped` run: refused with `run-stopped`; a stopped run cannot be resumed.
+
+A resume carries the run's `expectedRevision` and is journalled under `<runId>/park/<n>/resume@web` when it comes from the web (through the request channel), so K1b refuses a repeat.
+
+**Keys outside the step pattern.** K1b's keys include `<runId>/stop@web`, `<runId>/park/<n>/resume@web` and the request channel's `request/<requestId>` beside the step keys of §3.2; the uniqueness check covers them all.
 
 ## 4. Workbook
 
@@ -150,11 +178,14 @@ Each lane is about 45 minutes, one PR, the standard pipeline. **Parallel** means
 
 Group 3's work-execution lanes can each run beside a Group 2 lane in another package; inside Group 3, AM2 and S1a may overlap only if their files are disjoint, which each brief must state. AM4b touches `composition.ts`, so it runs in sequence with every other `composition.ts` lane. C1 and U1/U2 are in flight: prerequisites, not new lanes.
 
+**Amendment UI-B (2026-10-27, §3.8).** No new lanes. K1's transition table and guards gain the stop mapping and the `stop-unconfirmed` park reason, with one test per mapping row. K1b's keys include the control keys of §3.8. Whichever lane builds `ResumeLaneRun` (it backs K7's `conductor resume`) refuses `one-way-door` parks and `stopped` runs (`run-stopped`), with a test for each. K7's driver obeys `<runId>/stop@web` entries. If K1 has merged before this amendment, these land as a K1 follow-up. The web UI plan's A-C writes the stop entry and refuses run-owned attempts on the direct attempt stop.
+
 ## 5. Hard to undo
 
 - **Merges made by the conductor** are one-way. They need `policy.autoMerge` on, an eligible lane, and live mode (D4); each merge's journal entry names the policy revision that authorised it.
 - **PRs it opens or pushes to** are visible to anyone who can see the target repository; bodies are rendered from records, never lane output.
 - **The `LaneRunRecord` format, journal keys and the review `kind`** become stored data; version them from their first commit.
+- **The park reason `stop-unconfirmed` and the refusal reason `run-stopped`** (amendment UI-B) become stored and wire data the web reads.
 
 ## 6. Decisions for the owner
 

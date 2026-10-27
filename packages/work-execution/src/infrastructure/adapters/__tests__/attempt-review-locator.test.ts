@@ -54,6 +54,17 @@ const hosts: Readonly<Record<string, RunnerForAttemptHostSpec>> = {
     roles: ['lane-runner'],
     runner: { kind: 'opencode', port: 46000 },
   },
+  'lane-host-auth': {
+    transport: 'ssh',
+    sshAlias: 'lane-host-auth.example',
+    roles: ['lane-runner'],
+    runner: { kind: 'opencode', port: 46000, authFile: '/srv/fleet/auth/lane-host-auth.json' },
+  },
+  'local-no-auth': {
+    transport: 'local',
+    roles: ['lane-runner'],
+    runner: { kind: 'opencode', port: 46001 },
+  },
   'agy-host': {
     transport: 'local',
     roles: ['lane-runner'],
@@ -145,7 +156,7 @@ describe('AttemptReviewLocator', () => {
     });
   });
 
-  it('routes a recorded ssh v2 host through the installation route using its alias', async () => {
+  it('refuses a remote v2 host that declares no runner authFile for the review route', async () => {
     const locator = makeLocator({
       attempt: makeAttempt({
         runner: {
@@ -161,9 +172,53 @@ describe('AttemptReviewLocator', () => {
     });
     const location = await locator.locate('att-1');
     expect(location.route).toEqual({
+      kind: 'none',
+      reason: 'Host lane-host declares no runner authFile for a remote review route',
+    });
+  });
+
+  it('routes a remote v2 host with an authFile through the installation route carrying it', async () => {
+    const locator = makeLocator({
+      attempt: makeAttempt({
+        runner: {
+          kind: 'opencode',
+          remotePort: 46000,
+          host: 'lane-host-auth.example',
+          hostName: 'lane-host-auth',
+          agent: null,
+          model: 'example-provider/glm-5.3',
+          variant: null,
+        },
+      }),
+    });
+    const location = await locator.locate('att-1');
+    expect(location.route).toEqual({
       kind: 'installation',
       remotePort: 46000,
-      remoteHost: 'lane-host.example',
+      remoteHost: 'lane-host-auth.example',
+      authFile: '/srv/fleet/auth/lane-host-auth.json',
+    });
+  });
+
+  it('keeps a local v2 host without an authFile on the installation route without one', async () => {
+    const locator = makeLocator({
+      attempt: makeAttempt({
+        runner: {
+          kind: 'opencode',
+          remotePort: 46001,
+          host: null,
+          hostName: 'local-no-auth',
+          agent: null,
+          model: 'example-provider/glm-5.3',
+          variant: null,
+        },
+      }),
+    });
+    const location = await locator.locate('att-1');
+    expect(location.route).toEqual({
+      kind: 'installation',
+      remotePort: 46001,
+      remoteHost: '',
     });
   });
 

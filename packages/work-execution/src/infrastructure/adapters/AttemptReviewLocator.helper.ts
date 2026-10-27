@@ -100,8 +100,15 @@ export class AttemptReviewLocator {
       if (confirmed.transport === 'ssh') {
         remoteHost = confirmed.spec.sshAlias?.trim() ?? '';
       }
-      let route: AttemptReviewRoute = { kind: 'installation', remotePort: port, remoteHost };
       const authFile = confirmed.spec.runner?.authFile?.trim();
+      if (confirmed.transport === 'ssh' && (authFile === undefined || authFile === '')) {
+        // A remote route needs the host's own authFile; ocm-run would otherwise fall back to the operator's $HOME credentials.
+        return {
+          kind: 'none',
+          reason: 'Host ' + confirmed.name + ' declares no runner authFile for a remote review route',
+        };
+      }
+      let route: AttemptReviewRoute = { kind: 'installation', remotePort: port, remoteHost };
       if (authFile !== undefined && authFile !== '') {
         route = { ...route, authFile };
       }

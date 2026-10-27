@@ -13,9 +13,12 @@ import type {
   ChainRole,
   ChainStep,
   ChainsSection,
+  ConductorReaperRepairKind,
   FleetInstallationModel,
   LiveTailContent,
   PolicySection,
+  ResolvedConductorPolicy,
+  ResolvedConductorReaperPolicy,
   SeatModel,
   SeatRole,
 } from './types.js';
@@ -344,5 +347,212 @@ export function resolveAutoMergePolicy(policy: PolicySection | undefined): AutoM
     enabled: block.enabled,
     allowHighRisk: block.allowHighRisk,
     onBlocked: block.onBlocked,
+  });
+}
+
+/** Repair kinds in canonical order; the first four are record-only (D14). */
+export const CONDUCTOR_REAPER_REPAIR_KINDS: readonly ConductorReaperRepairKind[] = Object.freeze([
+  'dead-attempt', 'leaked-slot', 'stale-stop', 'stale-attention', 'orphan-session',
+]);
+
+/** The one destructive repair kind: an opt-in per installation, never a default (D14). */
+export const CONDUCTOR_DESTRUCTIVE_REPAIR_KINDS: readonly ConductorReaperRepairKind[] = Object.freeze(['orphan-session']);
+
+/** Inclusive integer bounds per number, in minutes (K2 brief, decision 4). */
+export const CONDUCTOR_MINUTE_BOUNDS = Object.freeze({
+  stopGraceMinutes: Object.freeze({ min: 5, max: 480 }),
+  intervalMinutes: Object.freeze({ min: 1, max: 1440 }),
+  graceMinutes: Object.freeze({ min: 4, max: 1440 }),
+  staleStopMinutes: Object.freeze({ min: 5, max: 1440 }),
+});
+
+const CONDUCTOR_KEYS: readonly string[] = ['enabled', 'stopGraceMinutes', 'reaper'];
+
+const CONDUCTOR_REAPER_KEYS: readonly string[] = [
+  'enabled',
+  'intervalMinutes',
+  'graceMinutes',
+  'staleStopMinutes',
+  'repairs',
+];
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function readOwnDataProperty(record: Record<string, unknown>, key: string): unknown {
+  if (!Object.hasOwn(record, key)) {
+    return undefined;
+  }
+  return Object.getOwnPropertyDescriptor(record, key)?.value;
+}
+
+function hasUnknownKeys(
+  record: Record<string, unknown>,
+  allowedKeys: readonly string[],
+): boolean {
+  for (const key of Object.keys(record)) {
+    if (!allowedKeys.includes(key)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function readConductorMinute(
+  value: unknown,
+  bounds: Readonly<{ min: number; max: number }>,
+): number | undefined {
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    return undefined;
+  }
+  if (value < bounds.min || value > bounds.max) {
+    return undefined;
+  }
+  return value;
+}
+
+function readConductorRepairs(
+  value: unknown,
+): Readonly<Record<ConductorReaperRepairKind, boolean>> | undefined {
+  if (!isPlainRecord(value)) {
+    return undefined;
+  }
+  const repairs: Record<ConductorReaperRepairKind, boolean> = {
+    'dead-attempt': false,
+    'leaked-slot': false,
+    'stale-stop': false,
+    'stale-attention': false,
+    'orphan-session': false,
+  };
+  for (const key of Object.keys(value)) {
+    const kind = key as ConductorReaperRepairKind;
+    if (!CONDUCTOR_REAPER_REPAIR_KINDS.includes(kind)) {
+      return undefined;
+    }
+    const flag = readOwnDataProperty(value, kind);
+    if (typeof flag !== 'boolean') {
+      return undefined;
+    }
+    repairs[kind] = flag;
+  }
+  return Object.freeze(repairs);
+}
+
+function freshDefaultConductorRepairs(): Readonly<Record<ConductorReaperRepairKind, boolean>> {
+  return Object.freeze({
+    'dead-attempt': false,
+    'leaked-slot': false,
+    'stale-stop': false,
+    'stale-attention': false,
+    'orphan-session': false,
+  });
+}
+
+function freshDefaultConductorReaper(): ResolvedConductorReaperPolicy {
+  return Object.freeze({
+    enabled: true,
+    intervalMinutes: 10,
+    graceMinutes: 5,
+    staleStopMinutes: 30,
+    repairs: freshDefaultConductorRepairs(),
+  });
+}
+
+function freshDefaultConductorPolicy(): ResolvedConductorPolicy {
+  return Object.freeze({
+    enabled: false,
+    stopGraceMinutes: 45,
+    reaper: freshDefaultConductorReaper(),
+  });
+}
+
+/**
+ * The conductor for an installation without `policy.conductor`: off; the reaper reports on
+ * its default schedule and repairs nothing (D12, D13, D14). Deeply frozen.
+ */
+export const DEFAULT_CONDUCTOR_POLICY: ResolvedConductorPolicy = freshDefaultConductorPolicy();
+
+/**
+ * The effective conductor policy: the block's own data properties with every absent optional
+ * field defaulted, only when every present block is a plain record with only known keys, a
+ * boolean `enabled`, and well-formed optional fields (booleans, integers within
+ * CONDUCTOR_MINUTE_BOUNDS, only known repair kinds); absent or malformed anywhere is the
+ * whole default (off, report-only). Always a fresh, deeply frozen object with the keys in
+ * canonical order.
+ */
+export function resolveConductorPolicy(policy: PolicySection | undefined): ResolvedConductorPolicy {
+  if (!isPlainRecord(policy) || !Object.hasOwn(policy, 'conductor')) {
+    return freshDefaultConductorPolicy();
+  }
+  const block = readOwnDataProperty(policy, 'conductor');
+  if (!isPlainRecord(block) || hasUnknownKeys(block, CONDUCTOR_KEYS)) {
+    return freshDefaultConductorPolicy();
+  }
+  const enabled = readOwnDataProperty(block, 'enabled');
+  if (typeof enabled !== 'boolean') {
+    return freshDefaultConductorPolicy();
+  }
+  const stopGraceMinutes = readConductorMinute(
+    readOwnDataProperty(block, 'stopGraceMinutes'),
+    CONDUCTOR_MINUTE_BOUNDS.stopGraceMinutes,
+  );
+  if (Object.hasOwn(block, 'stopGraceMinutes') && stopGraceMinutes === undefined) {
+    return freshDefaultConductorPolicy();
+  }
+  let reaper: ResolvedConductorReaperPolicy | undefined;
+  if (Object.hasOwn(block, 'reaper')) {
+    const reaperValue = readOwnDataProperty(block, 'reaper');
+    if (!isPlainRecord(reaperValue) || hasUnknownKeys(reaperValue, CONDUCTOR_REAPER_KEYS)) {
+      return freshDefaultConductorPolicy();
+    }
+    const reaperEnabled = readOwnDataProperty(reaperValue, 'enabled');
+    if (typeof reaperEnabled !== 'boolean') {
+      return freshDefaultConductorPolicy();
+    }
+    const intervalMinutes = readConductorMinute(
+      readOwnDataProperty(reaperValue, 'intervalMinutes'),
+      CONDUCTOR_MINUTE_BOUNDS.intervalMinutes,
+    );
+    if (Object.hasOwn(reaperValue, 'intervalMinutes') && intervalMinutes === undefined) {
+      return freshDefaultConductorPolicy();
+    }
+    const graceMinutes = readConductorMinute(
+      readOwnDataProperty(reaperValue, 'graceMinutes'),
+      CONDUCTOR_MINUTE_BOUNDS.graceMinutes,
+    );
+    if (Object.hasOwn(reaperValue, 'graceMinutes') && graceMinutes === undefined) {
+      return freshDefaultConductorPolicy();
+    }
+    const staleStopMinutes = readConductorMinute(
+      readOwnDataProperty(reaperValue, 'staleStopMinutes'),
+      CONDUCTOR_MINUTE_BOUNDS.staleStopMinutes,
+    );
+    if (Object.hasOwn(reaperValue, 'staleStopMinutes') && staleStopMinutes === undefined) {
+      return freshDefaultConductorPolicy();
+    }
+    let repairs: Readonly<Record<ConductorReaperRepairKind, boolean>> | undefined;
+    if (Object.hasOwn(reaperValue, 'repairs')) {
+      repairs = readConductorRepairs(readOwnDataProperty(reaperValue, 'repairs'));
+      if (repairs === undefined) {
+        return freshDefaultConductorPolicy();
+      }
+    }
+    reaper = Object.freeze({
+      enabled: reaperEnabled,
+      intervalMinutes: intervalMinutes ?? 10,
+      graceMinutes: graceMinutes ?? 5,
+      staleStopMinutes: staleStopMinutes ?? 30,
+      repairs: repairs ?? freshDefaultConductorRepairs(),
+    });
+  }
+  return Object.freeze({
+    enabled,
+    stopGraceMinutes: stopGraceMinutes ?? 45,
+    reaper: reaper ?? freshDefaultConductorReaper(),
   });
 }

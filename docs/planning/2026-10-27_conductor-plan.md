@@ -452,7 +452,7 @@ K11 is split in two because a use case, a store, the CLI and the driver hook are
 
 D11, D13, D14 and D15 (amendment K-GC, §3.9) were decided by the owner on 2026-10-27, each as recommended. D12 and D16 are the recommended defaults, shown to the owner on the same day with no objection, and stay open until the owner decides otherwise. Nothing in §3.9 that depends on D12 or D16 is changed without that decision.
 
-D17 and D18 (amendment K-WT, §3.10) are proposed on 2026-10-27 and open for the owner. D17 is the owner revisiting D15: D15 was decided as "No" with "unless the owner opts in by a later decision", and the owner's request for automated worktree cleanup is that revisit. Until D17 is decided, D15 stands and no remove method is built (KW3, KW4b).
+D17 and D18 (amendment K-WT, §3.10) were decided by the owner on 2026-10-27, each as recommended (D17: opt-in, off by default; D18: per registered clone only). D17 is the owner revisiting D15: D15 was decided as "No" with "unless the owner opts in by a later decision", and the owner's request for automated worktree cleanup is that revisit. Until D17 is decided, D15 stands and no remove method is built (KW3, KW4b).
 
 ## 7. Assumptions
 

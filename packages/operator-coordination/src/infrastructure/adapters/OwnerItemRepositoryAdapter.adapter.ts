@@ -183,7 +183,6 @@ export class OwnerItemRepositoryAdapter implements OwnerItemRepositoryPort {
       return copy(stored);
     }
 
-    let existing: StoredOwnerItem | undefined;
     let before: ChangeSignal["before"] = null;
     let written: ChangeSignal["written"] = null;
 
@@ -205,7 +204,6 @@ export class OwnerItemRepositoryAdapter implements OwnerItemRepositoryPort {
         );
       }
       this.assertNoKeyConflict(validated, records);
-      existing = stored;
       const next: StoredOwnerItem = {
         revision: expectedRevision + 1,
         item: validated,

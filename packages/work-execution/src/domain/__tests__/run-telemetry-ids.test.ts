@@ -333,4 +333,34 @@ describe('digest kinds cover every exported kind', () => {
   it('declares exactly the three kinds', () => {
     expect([...TELEMETRY_DIGEST_KINDS]).toEqual(['work-order', 'attempt', 'project']);
   });
+
+  it('dispositions from a throwing getter, a proxy, a class instance or hidden keys are refused, never thrown', () => {
+    const getter = Object.defineProperty({ route: 'collector' }, 'state', {
+      enumerable: true,
+      get() {
+        throw new Error('boom');
+      },
+    });
+    const proxy = new Proxy({ state: 'exported', route: 'collector' }, {
+      ownKeys() {
+        throw new Error('boom');
+      },
+    });
+    class Disposition {
+      state = 'pending';
+    }
+    const hidden = Object.defineProperty({ state: 'pending' }, 'extra', { value: 1, enumerable: false });
+    const symbolKeyed = { state: 'pending', [Symbol('extra')]: 1 };
+    for (const value of [getter, proxy, new Disposition(), hidden, symbolKeyed]) {
+      expect(spanDispositionText(value)).toBeNull();
+      expect(() => isFinalSpanDisposition(value)).not.toThrow();
+      expect(isFinalSpanDisposition(value)).toBe(false);
+    }
+  });
+
+  it('an id with an unpaired surrogate is not a hash input', () => {
+    expect(telemetryHashInput('a\uD800b')).toBeNull();
+    expect(telemetryHashInput('a\uDC00')).toBeNull();
+    expect(telemetryHashInput('a\uD83D\uDE00b')).not.toBeNull();
+  });
 });

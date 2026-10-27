@@ -14,6 +14,7 @@
  */
 
 import { parseLaneRunKey, REQUEST_ID_PATTERN } from './lane-run-keys.js';
+import { readExactPlainRecord } from './plain-record-reads.js';
 import { LANE_RUN_ID_PATTERN, LANE_RUN_MAX_ROUND } from './lane-run-records.js';
 
 /** `fleet.telemetry.schema`; a mapping change that must replace sent spans bumps it with the prefix (plan §3.4). */
@@ -69,10 +70,13 @@ function readText(registry: WeakMap<object, string>, token: unknown): string | n
   return registry.get(token) ?? null;
 }
 
-/** Wrap a raw operator id or journalled key. Null unless a non-empty string of at most 1024 code units. */
+/** An unpaired UTF-16 surrogate: `encodeURIComponent` throws on it, so such a value is never a hash input. */
+const LONE_SURROGATE = /\p{Cs}/u;
+
+/** Wrap a raw operator id or journalled key. Null unless a non-empty, well-formed string of at most 1024 code units. */
 export function telemetryHashInput(value: unknown): TelemetryHashInput | null {
   try {
-    if (typeof value !== 'string' || value.length === 0 || value.length > TELEMETRY_HASH_INPUT_MAX_LENGTH) {
+    if (typeof value !== 'string' || value.length === 0 || value.length > TELEMETRY_HASH_INPUT_MAX_LENGTH || LONE_SURROGATE.test(value)) {
       return null;
     }
     return mint(HASH_INPUT_TEXT, value);
@@ -379,21 +383,27 @@ export type SpanDisposition =
  * unvalidated string and never throws.
  */
 function validateSpanDisposition(value: unknown): SpanDisposition | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  try {
+    const pending = readExactPlainRecord(value, ['state']);
+    if (pending?.state === 'pending') {
+      return { state: 'pending' };
+    }
+    const exported = readExactPlainRecord(value, ['state', 'route']);
+    if (exported?.state === 'exported' && isOneOf(exported.route, TELEMETRY_ROUTES)) {
+      return { state: 'exported', route: exported.route as TelemetryRoute };
+    }
+    const rejected = readExactPlainRecord(value, ['state', 'reason']);
+    if (rejected?.state === 'rejected' && isOneOf(rejected.reason, TELEMETRY_REJECT_REASONS)) {
+      return { state: 'rejected', reason: rejected.reason as TelemetryRejectReason };
+    }
+    return null;
+  } catch {
     return null;
   }
-  const record = value as Record<string, unknown>;
-  const keys = Object.keys(record);
-  if (record.state === 'pending' && keys.length === 1) {
-    return { state: 'pending' };
-  }
-  if (record.state === 'exported' && keys.length === 2 && typeof record.route === 'string' && (TELEMETRY_ROUTES as readonly string[]).includes(record.route)) {
-    return { state: 'exported', route: record.route as TelemetryRoute };
-  }
-  if (record.state === 'rejected' && keys.length === 2 && typeof record.reason === 'string' && (TELEMETRY_REJECT_REASONS as readonly string[]).includes(record.reason)) {
-    return { state: 'rejected', reason: record.reason as TelemetryRejectReason };
-  }
-  return null;
+}
+
+function isOneOf(value: unknown, allowed: readonly string[]): boolean {
+  return typeof value === 'string' && allowed.includes(value);
 }
 
 /** `pending`, `exported@<route>` or `rejected:<reason>`; null for anything that is not a valid disposition. */

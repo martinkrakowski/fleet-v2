@@ -199,7 +199,7 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
         'ConductorDriverLeaseAdapter refuses a fileName that collides with another store',
       );
     }
-    if (!SAFE_FILE_NAME.test(name)) {
+    if (!SAFE_FILE_NAME.test(name) || name === "." || name === "..") {
       throw new Error('ConductorDriverLeaseAdapter refuses unsafe state file name');
     }
     return join(stateDir, name);

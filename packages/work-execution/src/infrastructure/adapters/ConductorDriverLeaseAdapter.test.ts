@@ -178,5 +178,9 @@ describe('ConductorDriverLeaseAdapter file shape, read-back and quarantine', () 
 
     const escaping = new ConductorDriverLeaseAdapter({ stateDir: tempDir, fileName: '../x.json' });
     await expect(escaping.read()).rejects.toThrow(/unsafe state file name/);
+    for (const dotName of ['.', '..']) {
+      const dot = new ConductorDriverLeaseAdapter({ stateDir: tempDir, fileName: dotName });
+      await expect(dot.read()).rejects.toThrow(/unsafe state file name/);
+    }
   });
 });

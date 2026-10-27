@@ -31,6 +31,7 @@ import {
   type IndependentReviewTransportResult,
   type OcmReviewTransportSpawn,
   type RunIndependentReviewRequest,
+  selectReviewerSeat,
 } from "@fleet/evidence-and-acceptance";
 import type {
   AttemptOwnerDecisionDelegate as EvidenceAttemptOwnerDecisionDelegate,
@@ -322,39 +323,24 @@ function buildReviewTransport(
     ocmRunBin: settings.ocmRunBin ?? defaultOcmRunPath(),
     ...(reviewSpawn !== undefined ? { ocmSpawn: reviewSpawn } : {}),
   });
-  // The locator and the transports refuse with reasons that can name the
-  // attempt's recorded host or its worktree path. The repository is public and
-  // the brief keeps host names and paths out of API responses, so the API's
-  // transport replaces any refusal message that carries one of them with one
-  // fixed, host-free reason; host-free refusals (seat selection, legacy
-  // routing) keep their message.
+  // The locator and the transports can fail with messages that name the attempt's recorded host,
+  // its worktree path or subprocess stderr. The repository is public, so only seat selection's
+  // own refusal passes through; every other failure becomes one fixed, host-free reason.
   return async (
     request: RunIndependentReviewRequest,
   ): Promise<IndependentReviewTransportResult> => {
+    // Seat selection reads only the installation's seats and chains, so its refusal is fixed,
+    // host-free text and reaches the caller as it is.
+    const selected = selectReviewerSeat(seats, chains, request.reviewerModel);
+    if (!selected.ok) {
+      throw new Error(selected.reason);
+    }
     try {
       return await router(request);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      let recordedHostName: string | null = null;
-      let worktreePath: string | null = null;
-      let readable = true;
-      try {
-        const attempt = await attempts.findAttemptById(request.attemptId);
-        const runnerHostName = attempt?.runner?.hostName;
-        recordedHostName =
-          typeof runnerHostName === "string" && runnerHostName.trim() !== "" ? runnerHostName : null;
-        worktreePath = attempt?.worktreePath ?? null;
-      } catch {
-        readable = false;
-      }
-      const leaks =
-        !readable ||
-        (recordedHostName !== null && message.includes(recordedHostName)) ||
-        (worktreePath !== null && message.includes(worktreePath));
-      if (leaks) {
-        throw new Error("review transport unavailable");
-      }
-      throw error;
+    } catch {
+      // Any later failure reaches an API caller as one fixed, host-free reason: locator and
+      // subprocess errors can carry hosts, paths, stderr or tokens, and the repository is public.
+      throw new Error("review transport unavailable");
     }
   };
 }

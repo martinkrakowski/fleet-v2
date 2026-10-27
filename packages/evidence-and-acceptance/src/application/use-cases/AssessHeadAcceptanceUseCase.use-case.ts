@@ -4,7 +4,8 @@
  * review, the forge state and the attempt's one-way doors against one exact
  * head, then issues a scoped acceptance receipt or an explicit blocker list. It
  * never merges: a changed head or policy revision makes prior evidence stale
- * instead of accepted.
+ * instead of accepted. Every blocker carries an A11 kind; the stored record and
+ * the texts are unchanged.
  *
  * Owner decision references are read from the attempt record through
  * AttemptOwnerDecisionPort, never from the request, and every reference is
@@ -13,9 +14,15 @@
  * a door that is now undecided, unknown or unreadable.
  */
 
+import {
+  acceptanceBlocker,
+  type AcceptanceBlocker,
+  type AcceptanceBlockerKind,
+} from '../../domain/acceptance-blockers.js';
 import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain/evidence-records.js';
 import type { ReviewTally } from '../../domain/review-selection.js';
 import { latestReceiptPerReviewer, tallyReviews } from '../../domain/review-selection.js';
+import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
@@ -70,9 +77,24 @@ function namesCiRequirement(requiredChecks: readonly string[]): boolean {
   return requiredChecks.some((check) => check.trim().toLowerCase() === 'ci');
 }
 
+/**
+ * The A11 kind for a forge CI state that is not passing (D6). Only `pending`
+ * means "not yet" and earns the second look; every other non-passing state is
+ * a standing blocker.
+ */
+function ciBlockerKind(ciState: EvidenceResultValue): AcceptanceBlockerKind {
+  if (ciState === 'pending') {
+    return 'ci-pending';
+  }
+  if (ciState === 'fail') {
+    return 'ci-failed';
+  }
+  return 'other';
+}
+
 /** Required checks without a completed, passing receipt for this exact head. */
-function collectCheckBlockers(assessment: EvidenceAssessmentRecord): readonly string[] {
-  const blockers: string[] = [];
+function collectCheckBlockers(assessment: EvidenceAssessmentRecord): readonly AcceptanceBlocker[] {
+  const blockers: AcceptanceBlocker[] = [];
   for (const check of assessment.requiredChecks) {
     const receipt = assessment.verificationReceipts.find(
       (candidate) =>
@@ -80,11 +102,11 @@ function collectCheckBlockers(assessment: EvidenceAssessmentRecord): readonly st
         candidate.candidateHeadSha === assessment.candidateHeadSha,
     );
     if (receipt === undefined) {
-      blockers.push(`required check '${check}' has no completed verification receipt`);
+      blockers.push(acceptanceBlocker('other', `required check '${check}' has no completed verification receipt`));
       continue;
     }
     if (!PASSING_RESULTS.includes(receipt.result)) {
-      blockers.push(`required check '${check}' completed as '${receipt.result}'`);
+      blockers.push(acceptanceBlocker('other', `required check '${check}' completed as '${receipt.result}'`));
     }
   }
   return blockers;
@@ -143,22 +165,27 @@ function selectReviewEvidence(assessment: EvidenceAssessmentRecord): {
  * that says `fail` blocks acceptance even when another reviewer passed.
  * Agreement between reviewers never strengthens a result.
  */
-function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly string[] {
+function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly AcceptanceBlocker[] {
   const selection = selectReviewEvidence(assessment);
   if (selection.reviews.length === 0) {
-    return ['no independent review was recorded for this candidate head'];
+    return [acceptanceBlocker('review-missing', 'no independent review was recorded for this candidate head')];
   }
-  const blockers = [...selection.blockers];
+  const blockers: AcceptanceBlocker[] = selection.blockers.map((text) =>
+    acceptanceBlocker('review-missing', text),
+  );
   for (const receipt of selection.latest) {
     if (receipt.result === 'fail') {
       blockers.push(
-        `review by '${receipt.reviewerModel}' failed for this head (receipt '${receipt.id}')`,
+        acceptanceBlocker(
+          'other',
+          `review by '${receipt.reviewerModel}' failed for this head (receipt '${receipt.id}')`,
+        ),
       );
     }
   }
   const passing = selection.latest.some((receipt) => receipt.result === 'pass');
   if (!passing && blockers.length === 0) {
-    return ['no read-only independent review passed for this candidate head'];
+    return [acceptanceBlocker('review-missing', 'no read-only independent review passed for this candidate head')];
   }
   return blockers;
 }
@@ -174,10 +201,10 @@ export function reviewTallyFor(assessment: EvidenceAssessmentRecord): ReviewTall
  * recorded disposition whose state is not blocking resolves it. The aggregate
  * already derives exactly this set, so it is reused.
  */
-function collectFindingBlockers(assessment: EvidenceAssessmentRecord): readonly string[] {
+function collectFindingBlockers(assessment: EvidenceAssessmentRecord): readonly AcceptanceBlocker[] {
   return EvidenceAssessment.fromRecord(assessment)
     .unresolvedFindingIds()
-    .map((findingId) => `finding '${findingId}' is unresolved`);
+    .map((findingId) => acceptanceBlocker('other', `finding '${findingId}' is unresolved`));
 }
 
 export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
@@ -281,7 +308,9 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
     // One-way doors are checked before a stored acceptance is returned: an
     // idempotent "already accepted" read is not a way past a door that is now
     // undecided, unknown or unreadable.
-    const doorBlockers = await this.collectOwnerDecisionBlockers(assessment);
+    const doorBlockers = (await this.collectOwnerDecisionBlockers(assessment)).map((text) =>
+      acceptanceBlocker('door', text),
+    );
 
     if (assessment.state === 'accepted') {
       if (doorBlockers.length > 0) {
@@ -296,7 +325,7 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       };
     }
 
-    const blockers: string[] = [
+    const blockers: AcceptanceBlocker[] = [
       ...doorBlockers,
       ...collectCheckBlockers(assessment),
       ...collectReviewBlockers(assessment),
@@ -308,7 +337,10 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       // that names one is blocked, never receipt-only accepted past it.
       if (namesCiRequirement(assessment.requiredChecks)) {
         blockers.push(
-          "forge mode is 'none': the brief requires CI state, and forge evidence is 'not-configured'",
+          acceptanceBlocker(
+            'other',
+            "forge mode is 'none': the brief requires CI state, and forge evidence is 'not-configured'",
+          ),
         );
       }
     } else if (deps.forgeEvidence !== undefined) {
@@ -316,13 +348,23 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
         candidateHeadSha: assessment.candidateHeadSha,
       });
       if (!PASSING_RESULTS.includes(status.ciState)) {
-        blockers.push(`forge reports CI state '${status.ciState}' for this candidate head`);
+        blockers.push(
+          acceptanceBlocker(
+            ciBlockerKind(status.ciState),
+            `forge reports CI state '${status.ciState}' for this candidate head`,
+          ),
+        );
       }
       if (status.unresolvedThreadCount === null) {
-        blockers.push('forge could not read review threads for this candidate head');
+        blockers.push(
+          acceptanceBlocker('threads-unreadable', 'forge could not read review threads for this candidate head'),
+        );
       } else if (status.unresolvedThreadCount > 0) {
         blockers.push(
-          `forge reports ${status.unresolvedThreadCount} unresolved review thread(s) for this candidate head`,
+          acceptanceBlocker(
+            'threads-unresolved',
+            `forge reports ${status.unresolvedThreadCount} unresolved review thread(s) for this candidate head`,
+          ),
         );
       }
     }
@@ -413,9 +455,10 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
   private async block(
     deps: AssessHeadAcceptanceDependencies,
     assessment: EvidenceAssessmentRecord,
-    blockers: readonly string[],
+    details: readonly AcceptanceBlocker[],
     nowIso: string,
   ): Promise<AssessHeadAcceptanceResult> {
+    const blockers = details.map((detail) => detail.text);
     const aggregate = EvidenceAssessment.fromRecord(assessment);
     aggregate.block(blockers, nowIso);
     const updated = aggregate.toRecord();
@@ -423,6 +466,7 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
     return {
       outcome: 'blocked',
       blockers,
+      blockerDetails: details.map((detail) => acceptanceBlocker(detail.kind, detail.text)),
       assessment: updated,
       reviewTally: reviewTallyFor(updated),
     };

@@ -8,7 +8,7 @@ import {
   type AttemptRecord,
   type WorkOrderRecord,
 } from '@fleet/work-execution';
-import { ChangeFeed } from '../change-feed.js';
+import { ChangeFeed, type FileStamp } from '../change-feed.js';
 import { StateWriteWatcher } from '../state-write-watcher.js';
 import { configureFleetApiRuntime, getChangeFeed } from '../../runtime.js';
 
@@ -64,6 +64,11 @@ describe('StateWriteWatcher', () => {
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   });
 
+  async function stampOf(file: string): Promise<FileStamp> {
+    const s = await fs.stat(file);
+    return { mtimeMs: s.mtimeMs, size: s.size, ino: s.ino };
+  }
+
   it('the first tick on an existing file gives no resync', async () => {
     const target = path.resolve(path.join(dir, 'attempts.json'));
     await fs.writeFile(target, JSON.stringify([]), 'utf8');
@@ -91,7 +96,7 @@ describe('StateWriteWatcher', () => {
     }
   });
 
-  it('a CLI-style save without a change signal then a tick gives one resync', async () => {
+  it('a CLI-style save without a change signal then two ticks give one resync', async () => {
     const target = path.resolve(path.join(dir, 'attempts.json'));
     const feed = new ChangeFeed({ streamId: 'stream' });
     const adapter = new AttemptRepositoryAdapter({ stateDir: dir, changeSignal: feed });
@@ -103,6 +108,7 @@ describe('StateWriteWatcher', () => {
     await cli.saveAttempt(makeAttempt({ id: 'att-b' }));
 
     await watcher.tick();
+    await watcher.tick();
     const snapshot = feed.read('stream:0');
     expect(snapshot.kind).toBe('entries');
     if (snapshot.kind === 'entries') {
@@ -113,7 +119,7 @@ describe('StateWriteWatcher', () => {
     }
   });
 
-  it('two foreign changes to two files in one tick give exactly one resync', async () => {
+  it('two foreign changes to two files in two ticks give exactly one resync', async () => {
     const attemptsTarget = path.resolve(path.join(dir, 'attempts.json'));
     const ordersTarget = path.resolve(path.join(dir, 'work-orders.json'));
     const feed = new ChangeFeed({ streamId: 'stream' });
@@ -134,6 +140,7 @@ describe('StateWriteWatcher', () => {
     await cliOrders.saveWorkOrder(makeWorkOrder({ id: 'wo-b' }));
 
     await watcher.tick();
+    await watcher.tick();
     const snapshot = feed.read('stream:0');
     expect(snapshot.kind).toBe('entries');
     if (snapshot.kind === 'entries') {
@@ -145,7 +152,7 @@ describe('StateWriteWatcher', () => {
     }
   });
 
-  it('a file that appears after a missing baseline counts as a change and gives a resync', async () => {
+  it('a file that appears after a missing baseline counts as a change and gives a resync after two ticks', async () => {
     const target = path.resolve(path.join(dir, 'attempts.json'));
     const feed = new ChangeFeed({ streamId: 'stream' });
     const watcher = new StateWriteWatcher({ feed, files: [target] });
@@ -155,10 +162,140 @@ describe('StateWriteWatcher', () => {
     await cli.saveAttempt(makeAttempt());
 
     await watcher.tick();
+    await watcher.tick();
     const snapshot = feed.read('stream:0');
     expect(snapshot.kind).toBe('entries');
     if (snapshot.kind === 'entries') {
       expect(snapshot.entries.map((entry) => entry.kind)).toEqual(['resync']);
+    }
+  });
+
+  it('start() seeds the baseline so a save before the first tick is foreign', async () => {
+    const target = path.resolve(path.join(dir, 'attempts.json'));
+    await fs.writeFile(target, JSON.stringify([]), 'utf8');
+    const feed = new ChangeFeed({ streamId: 'stream' });
+    const watcher = new StateWriteWatcher({ feed, files: [target], intervalMs: 60_000 });
+    try {
+      watcher.start();
+
+      const cli = new AttemptRepositoryAdapter({ stateDir: dir });
+      await cli.saveAttempt(makeAttempt({ id: 'att-cli' }));
+
+      await watcher.tick();
+      await watcher.tick();
+      const snapshot = feed.read('stream:0');
+      expect(snapshot.kind).toBe('entries');
+      if (snapshot.kind === 'entries') {
+        expect(snapshot.entries.map((entry) => entry.kind)).toEqual(['resync']);
+      }
+    } finally {
+      watcher.stop();
+    }
+  });
+
+  it('a tick between the adapter rename and emit gives no resync', async () => {
+    const target = path.resolve(path.join(dir, 'attempts.json'));
+    const feed = new ChangeFeed({ streamId: 'stream' });
+    const watcher = new StateWriteWatcher({ feed, files: [target] });
+    await watcher.tick(); // baseline: missing -> null
+
+    await fs.writeFile(target, '[1]'); // stands in for the adapter's rename
+    await watcher.tick(); // suspect
+    feed.emit({
+      kind: 'attempt',
+      id: 'att-x',
+      stateFile: target,
+      before: null,
+      written: await stampOf(target),
+    });
+    await watcher.tick();
+    const snapshot = feed.read('stream:0');
+    expect(snapshot.kind).toBe('entries');
+    if (snapshot.kind === 'entries') {
+      expect(snapshot.entries.map((entry) => entry.kind)).toEqual(['attempt']);
+    }
+  });
+
+  it('a burst of two own writes in one interval gives no resync', async () => {
+    const target = path.resolve(path.join(dir, 'attempts.json'));
+    const feed = new ChangeFeed({ streamId: 'stream' });
+    const watcher = new StateWriteWatcher({ feed, files: [target] });
+    await watcher.tick(); // baseline: missing -> null
+
+    await fs.writeFile(target, '[1]');
+    await watcher.tick(); // suspect
+    const first = await stampOf(target);
+    feed.emit({
+      kind: 'attempt',
+      id: 'att-1',
+      stateFile: target,
+      before: null,
+      written: first,
+    });
+
+    await fs.writeFile(target, '[1,2]');
+    const second = await stampOf(target);
+    feed.emit({
+      kind: 'attempt',
+      id: 'att-2',
+      stateFile: target,
+      before: first,
+      written: second,
+    });
+    await watcher.tick();
+    const snapshot = feed.read('stream:0');
+    expect(snapshot.kind).toBe('entries');
+    if (snapshot.kind === 'entries') {
+      expect(snapshot.entries.map((entry) => entry.kind)).toEqual([
+        'attempt',
+        'attempt',
+      ]);
+    }
+  });
+
+  it('a foreign write just before our first own write still resyncs', async () => {
+    const target = path.resolve(path.join(dir, 'attempts.json'));
+    const feed = new ChangeFeed({ streamId: 'stream' });
+    const watcher = new StateWriteWatcher({ feed, files: [target] });
+    await watcher.tick(); // baseline: missing -> null
+
+    const cli = new AttemptRepositoryAdapter({ stateDir: dir });
+    await cli.saveAttempt(makeAttempt({ id: 'att-cli' }));
+    await watcher.tick(); // suspect
+
+    const adapter = new AttemptRepositoryAdapter({ stateDir: dir, changeSignal: feed });
+    await adapter.saveAttempt(makeAttempt({ id: 'att-a' }));
+    await watcher.tick();
+    const snapshot = feed.read('stream:0');
+    expect(snapshot.kind).toBe('entries');
+    if (snapshot.kind === 'entries') {
+      expect(snapshot.entries.map((entry) => entry.kind)).toEqual([
+        'attempt',
+        'resync',
+      ]);
+    }
+  });
+
+  it('a deleted file is foreign after two ticks', async () => {
+    const target = path.resolve(path.join(dir, 'attempts.json'));
+    await fs.writeFile(target, JSON.stringify([]), 'utf8');
+    const feed = new ChangeFeed({ streamId: 'stream' });
+    const watcher = new StateWriteWatcher({ feed, files: [target] });
+    await watcher.tick(); // baseline: exists
+
+    await fs.rm(target);
+    await watcher.tick();
+    const firstSnapshot = feed.read('stream:0');
+    expect(firstSnapshot.kind).toBe('entries');
+    if (firstSnapshot.kind === 'entries') {
+      expect(firstSnapshot.entries).toEqual([]);
+    }
+
+    await watcher.tick();
+    const secondSnapshot = feed.read('stream:0');
+    expect(secondSnapshot.kind).toBe('entries');
+    if (secondSnapshot.kind === 'entries') {
+      expect(secondSnapshot.entries.map((entry) => entry.kind)).toEqual(['resync']);
     }
   });
 

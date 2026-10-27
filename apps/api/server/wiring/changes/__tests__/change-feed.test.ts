@@ -217,4 +217,24 @@ describe('ChangeFeed', () => {
     feed.resync();
     expect(feed.headSeq).toBe(3);
   });
+
+  it('isRecentLocalWrite recalls only the last 8 local stamps for a file', () => {
+    const feed = new ChangeFeed({ streamId: 'stream' });
+    const file = '/tmp/state/attempts.json';
+    for (let i = 1; i <= 9; i += 1) {
+      feed.emit({
+        kind: 'attempt',
+        id: `att-${i}`,
+        stateFile: file,
+        before: null,
+        written: stamp({ size: i }),
+      });
+    }
+    expect(feed.isRecentLocalWrite(file, stamp({ size: 1 }))).toBe(false);
+    for (let i = 2; i <= 9; i += 1) {
+      expect(feed.isRecentLocalWrite(file, stamp({ size: i }))).toBe(true);
+    }
+    expect(feed.isRecentLocalWrite('/tmp/state/other.json', stamp({ size: 9 }))).toBe(false);
+    expect(feed.isRecentLocalWrite(file, null)).toBe(false);
+  });
 });

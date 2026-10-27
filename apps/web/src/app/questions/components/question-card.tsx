@@ -12,6 +12,7 @@ import {
 import type { QuestionView } from "../map-question";
 import {
   answerCommands,
+  questionIdIsCliSafe,
   blocksText,
   isPastExpiry,
   stateTone,
@@ -50,6 +51,9 @@ export function QuestionCard({
     doorBlock = (
       <div>
         <p>Answer with the CLI until the web can (Q5):</p>
+        {questionIdIsCliSafe(question) ? null : (
+          <p>This question id starts with a dash, which the CLI would read as a flag, so no command is shown.</p>
+        )}
         {commands.map((command) => (
           <p key={command}>
             <code className={styles.mono}>{command}</code>

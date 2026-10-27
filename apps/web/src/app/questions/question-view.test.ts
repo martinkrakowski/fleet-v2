@@ -203,8 +203,16 @@ describe("answerCommands", () => {
     ).toEqual([
       "fleet-v2 questions answer q_live_1 --revision 3 --accept",
       "fleet-v2 questions answer q_live_1 --revision 3 --reject",
-      "fleet-v2 questions answer q_live_1 --revision 3 --option merge",
+      "fleet-v2 questions answer q_live_1 --revision 3 --option=merge",
     ]);
+  });
+
+  it("offers no command for a question id that starts with a dash, and passes a dashed option as --option=", () => {
+    expect(answerCommands(question({ questionId: "--force" }))).toEqual([]);
+    const commands = answerCommands(
+      question({ revision: 2, recommendation: { optionId: "--x", because: "Because" } }),
+    );
+    expect(commands[2]).toBe("fleet-v2 questions answer q_live_1 --revision 2 --option=--x");
   });
 
   it("shell-quotes an id with a quote", () => {
@@ -219,7 +227,7 @@ describe("answerCommands", () => {
       question({ recommendation: { optionId: "my option", because: "Because" } }),
     );
     expect(commands[2]).toBe(
-      "fleet-v2 questions answer q_live_1 --revision 1 --option 'my option'",
+      "fleet-v2 questions answer q_live_1 --revision 1 --option='my option'",
     );
   });
 });

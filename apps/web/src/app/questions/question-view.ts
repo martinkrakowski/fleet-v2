@@ -112,8 +112,16 @@ export function blocksText(blocks: readonly QuestionBlock[]): string {
   return blocks.map((b) => `${b.kind} ${b.ref}`).join(", ");
 }
 
+/**
+ * The CLI takes the question id as a positional token and has no `--` terminator, so an id that
+ * starts with `-` would be read as a flag even when quoted. No command is offered for such an id.
+ */
+export function questionIdIsCliSafe(q: QuestionView): boolean {
+  return !q.questionId.startsWith("-");
+}
+
 export function answerCommands(q: QuestionView): readonly string[] {
-  if (q.state !== "open" || q.doorKind !== "two-way") {
+  if (q.state !== "open" || q.doorKind !== "two-way" || !questionIdIsCliSafe(q)) {
     return [];
   }
   const id = shellQuote(q.questionId);
@@ -121,7 +129,7 @@ export function answerCommands(q: QuestionView): readonly string[] {
   return [
     `fleet-v2 questions answer ${id} --revision ${rev} --accept`,
     `fleet-v2 questions answer ${id} --revision ${rev} --reject`,
-    `fleet-v2 questions answer ${id} --revision ${rev} --option ${shellQuote(q.recommendation.optionId)}`,
+    `fleet-v2 questions answer ${id} --revision ${rev} --option=${shellQuote(q.recommendation.optionId)}`,
   ];
 }
 

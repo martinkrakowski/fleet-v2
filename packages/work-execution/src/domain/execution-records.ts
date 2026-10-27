@@ -28,6 +28,21 @@ export interface CollectedAttemptArtifacts {
   readonly collectedArtifactPaths: readonly string[];
   /** Missing notes are recorded explicitly; absence is a fact, not an error. */
   readonly notes: 'present' | 'missing';
+  /**
+   * Worktree-relative path of the sealed content-addressed artifact manifest
+   * (`.lane/artifacts-manifest-<first 16 hex>.json`). Absent on records
+   * collected before C1 (or before content-addressed manifests) or by a port
+   * that does not seal; for C2, older records that lack `manifestPath` are
+   * read as "artifacts not collected".
+   */
+  readonly manifestPath?: string;
+  /**
+   * SHA-256 of the sealed artifact manifest text (C1). Absent on records
+   * collected before C1 or by a port that does not seal; a caller that needs
+   * a sealed manifest treats absence of `manifestSha256` or `manifestPath`
+   * as not collected.
+   */
+  readonly manifestSha256?: string;
 }
 
 /** Serializable record of one registered, approved bounded work unit. */

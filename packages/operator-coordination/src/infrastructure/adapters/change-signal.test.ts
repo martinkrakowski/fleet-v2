@@ -27,6 +27,7 @@ class RecordingChangeSignalPort implements ChangeSignalPort {
 
   clear(): void {
     this.signals.length = 0;
+    this.lockHeldAtEmit.length = 0;
   }
 }
 
@@ -200,9 +201,9 @@ describe('change signals: ProjectProfileRepositoryAdapter', () => {
   });
 
   it('saveProfile emits one profile signal per successful save with kind, id, stateFile and written.size; before null then previous written ino', async () => {
-    const signals = new RecordingChangeSignalPort();
-    const adapter = new ProjectProfileRepositoryAdapter({ stateDir: tempDir, changeSignal: signals });
     const target = path.resolve(path.join(tempDir, 'project-profiles.json'));
+    const signals = new RecordingChangeSignalPort(`${target}.lock`);
+    const adapter = new ProjectProfileRepositoryAdapter({ stateDir: tempDir, changeSignal: signals });
 
     await adapter.saveProfile(makeProfile());
     expect(signals.signals).toHaveLength(1);
@@ -221,6 +222,8 @@ describe('change signals: ProjectProfileRepositoryAdapter', () => {
     expect(second.stateFile).toBe(target);
     expect(second.before).not.toBeNull();
     expect(second.before!.ino).toBe(first.written!.ino);
+    expect(signals.lockHeldAtEmit.length).toBeGreaterThan(0);
+    expect(signals.lockHeldAtEmit.every((held) => held === false)).toBe(true);
   });
 
   it('saveProfile emits nothing when the save throws on an unreadable file', async () => {

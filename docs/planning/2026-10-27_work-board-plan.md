@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-27
 - **Target repository:** `fleet-v2`
-- **Status:** rev 2. Rev 0 was reviewed by Grok 4.7 (six blockers, two majors, one minor; all applied in rev 1). Grok re-reviewed rev 1 (one blocker, five majors, three minors); that was the second round, so the orchestrator decided the resolutions, applied in rev 2 (§8). Decisions in §6 are open with recommended defaults. Nothing built. Anchors checked against `main` at `258b1b4`.
+- **Status:** rev 2. Rev 0 was reviewed by Grok 4.7 (six blockers, two majors, one minor; all applied in rev 1). Grok re-reviewed rev 1 (one blocker, five majors, three minors); that was the second round, so the orchestrator decided the resolutions, applied in rev 2 (§8). The owner decided D1, D2, D8 and D9 on 2026-10-27, each as recommended; D3–D7 and D10–D12 are recommended defaults, shown to the owner the same day with no objection, and stay open until the owner decides otherwise (§6). Nothing built. Anchors checked against `main` at `258b1b4`.
 - **Owner request (2026-10-27):** "The table that you just rendered contains highly useful data that I would want surfaced and maintained within the UI and TUI. (Done, In-flight, Queued, blocked/waiting). Write it up as a plan." The table was assembled by hand from pull-request lists, lane worktrees, briefs, a follow-up list and the plans' workbooks.
 - **Builds on:** `2026-10-27_conductor-plan.md` (K1-1 to K1-2c, K1b, K3, K6, K7, §3.2 states, §3.6 park reasons, §3.9 reaper), `2026-10-27_web-ui-interactivity-plan.md` (A-R, A-WO, A-S, W7a, O2c, O8, O9, §3.6 request channel, §6 states), `2026-10-20_auto-merge-policy-plan.md` (AM3b attention store, AM4a, AM4b PR-state read), `2026-10-24_live-updates-and-state-resilience-plan.md` (`/v1/changes`, E3c, E5), `2026-10-24_project-onboarding-and-config-ui-plan.md` (project registry, P9 TUI shell, its D3), `2026-10-18_orchestrator-interaction-plan.md` (T3a scopes, T6 write path, T8a) and `2026-10-26_execution-order.md` (how lanes are ordered today).
 
@@ -343,6 +343,8 @@ WB1 and WB3a can run in parallel across packages but both edit the manifest, so 
 | D10 | Where does a plan's sidecar live? | **In the repository that holds the plan;** `plan import` reads a local file and never fetches from a forge, so private plans stay private |
 | D11 | May the owner withdraw a `merge` or `decision` item? | **No.** A merge item ends on an observed merge or close; a decision item on a recorded choice or the plan's `decided` or removed row. `secret`, `backup` and `other` may be withdrawn with a typed reason the board shows |
 | D12 | What does a dropped dependency do to its dependants? | **Blocks them with `after-dropped`, naming it,** until the dependant's `after` is edited. It is never read as Done |
+
+D1, D2, D8 and D9 were decided by the owner on 2026-10-27, each as recommended. The others are the recommended defaults and stay open.
 
 ## 7. Assumptions
 

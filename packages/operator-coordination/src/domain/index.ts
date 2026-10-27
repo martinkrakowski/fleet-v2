@@ -2,5 +2,6 @@
 
 export * from "./coordination-records.js";
 export * from "./entities/index.js";
+export * from "./orchestrator-session-records.js";
 export * from "./owner-question-records.js";
 export * from "./value-objects/index.js";

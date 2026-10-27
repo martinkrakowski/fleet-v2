@@ -5,6 +5,19 @@ import {
   toWorkOrderSummary,
   type ListedAttemptWire,
 } from "./map-attempt";
+import type { RecordedUsage } from "../../lib/attempt-wire";
+
+const USAGE: RecordedUsage = {
+  source: "opencode-db",
+  readAtIso: "2026-10-24T10:05:00Z",
+  steps: 40,
+  wallSeconds: 1500,
+  tokensInput: 1000,
+  tokensOutput: 500,
+  costUsd: 0.12,
+  model: "example/model-a",
+  reason: null,
+};
 
 function wireRow(
   overrides: Partial<ListedAttemptWire> = {},
@@ -21,6 +34,9 @@ function wireRow(
       sessionId: "ses_live_1",
       createdAtIso: "2026-10-24T10:00:00Z",
       updatedAtIso: "2026-10-24T10:05:00Z",
+      runner: null,
+      usage: null,
+      artifacts: null,
     },
     workOrder: {
       id: "wo-live-1",
@@ -142,6 +158,97 @@ describe("toAttemptSummary", () => {
       }),
     );
     expect(cancelled.capacity).toBe("released");
+  });
+
+  it("keeps the recorded runner seat and keeps runner observations unknown", () => {
+    const summary = toAttemptSummary(
+      wireRow({
+        attempt: {
+          ...wireRow().attempt,
+          runner: {
+            kind: "opencode",
+            agent: "lane",
+            model: "example/model-a",
+            variant: null,
+          },
+        },
+      }),
+    );
+
+    expect(summary.recordedRunner).toEqual({
+      kind: "opencode",
+      agent: "lane",
+      model: "example/model-a",
+      variant: null,
+    });
+    expect(summary.facts.reachable).toBe("unknown");
+    expect(summary.facts.prepared).toBe("unknown");
+    expect(summary.facts.active).toBe("unknown");
+  });
+
+  it("fills cost only from a complete opencode-db measurement", () => {
+    const withCost = toAttemptSummary(
+      wireRow({
+        attempt: { ...wireRow().attempt, usage: USAGE },
+      }),
+    );
+    expect(withCost.cost).toEqual({ steps: 40, minutes: 25, usd: 0.12 });
+    expect(withCost.recordedUsage?.costUsd).toBe(0.12);
+
+    const nullCost = toAttemptSummary(
+      wireRow({
+        attempt: { ...wireRow().attempt, usage: { ...USAGE, costUsd: null } },
+      }),
+    );
+    expect(nullCost.cost).toBeNull();
+    expect(nullCost.recordedUsage?.costUsd).toBeNull();
+
+    const zeroCost = toAttemptSummary(
+      wireRow({
+        attempt: { ...wireRow().attempt, usage: { ...USAGE, costUsd: 0 } },
+      }),
+    );
+    expect(zeroCost.cost).toEqual({ steps: 40, minutes: 25, usd: 0 });
+
+    const unavailable = toAttemptSummary(
+      wireRow({
+        attempt: {
+          ...wireRow().attempt,
+          usage: {
+            source: "unavailable",
+            readAtIso: USAGE.readAtIso,
+            steps: null,
+            wallSeconds: null,
+            tokensInput: null,
+            tokensOutput: null,
+            costUsd: null,
+            model: null,
+            reason: "the usage db cannot be read",
+          },
+        },
+      }),
+    );
+    expect(unavailable.cost).toBeNull();
+  });
+
+  it("keeps the recorded head commit when artifacts were collected", () => {
+    const artifactWire = {
+      headCommit: "a".repeat(40),
+      commitsSinceBase: ["b".repeat(40)],
+      collectedArtifactPaths: [],
+      notes: "present",
+    };
+    const summary = toAttemptSummary(
+      {
+        ...wireRow(),
+        attempt: {
+          ...wireRow().attempt,
+          artifacts: artifactWire,
+        },
+      } as unknown as ListedAttemptWire,
+    );
+
+    expect(summary.headCommit).toBe("a".repeat(40));
   });
 });
 
@@ -311,5 +418,85 @@ describe("parseAttemptListEnvelope", () => {
     expect(parsed?.rows[1].attempt.id).toBe("att_live_2");
     expect(parsed?.rows[1].workOrder).toBeNull();
     expect(parsed?.rows[1].reservation).toBeNull();
+  });
+
+  it("returns null when one row has a malformed usage", () => {
+    const badRow = {
+      attempt: {
+        ...wireRow().attempt,
+        usage: { source: "guessed" },
+      },
+      workOrder: wireRow().workOrder,
+      reservation: wireRow().reservation,
+    };
+    expect(
+      parseAttemptListEnvelope({
+        code: "OK",
+        result: {
+          outcome: "listed",
+          total: 1,
+          truncated: false,
+          attempts: [badRow],
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("parses rows lacking runner, usage and artifacts as null", () => {
+    const parsed = parseAttemptListEnvelope({
+      code: "OK",
+      result: {
+        outcome: "listed",
+        total: 1,
+        truncated: false,
+        attempts: [wireRow()],
+      },
+    });
+
+    expect(parsed?.rows[0].attempt.runner).toBeNull();
+    expect(parsed?.rows[0].attempt.usage).toBeNull();
+    expect(parsed?.rows[0].attempt.artifacts).toBeNull();
+  });
+
+  it("drops recorded host facts from the parsed runner", () => {
+    const row = {
+      attempt: {
+        ...wireRow().attempt,
+        runner: {
+          kind: "opencode",
+          host: "example-host",
+          hostName: "example-host",
+          remotePort: 1,
+          agent: "lane",
+          model: "example/model-a",
+          variant: null,
+        },
+      },
+      workOrder: wireRow().workOrder,
+      reservation: wireRow().reservation,
+    };
+    const parsed = parseAttemptListEnvelope({
+      code: "OK",
+      result: {
+        outcome: "listed",
+        total: 1,
+        truncated: false,
+        attempts: [row],
+      },
+    });
+
+    const runner = parsed?.rows[0].attempt.runner;
+    expect(runner).toEqual({
+      kind: "opencode",
+      agent: "lane",
+      model: "example/model-a",
+      variant: null,
+    });
+    expect(Object.keys(runner!).sort((a, b) => a.localeCompare(b))).toEqual([
+      "agent",
+      "kind",
+      "model",
+      "variant",
+    ]);
   });
 });

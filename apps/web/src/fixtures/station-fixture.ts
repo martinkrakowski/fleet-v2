@@ -3,6 +3,8 @@
  * Every value here is a sample; nothing reaches a runner or the API.
  */
 
+import type { RecordedRunner, RecordedUsage } from "../lib/attempt-wire";
+
 // ---------------------------------------------------------------------------
 // Shared fact types (from app/lanes/fixture.ts and app/attempt/fixture.ts)
 // ---------------------------------------------------------------------------
@@ -92,6 +94,12 @@ export interface AttemptSummary {
   basis?: "observed" | "recorded";
   /** The API's recorded state word, present only when `basis` is "recorded". */
   recordedState?: string;
+  /** The recorded runner seat from the API; absent on sample rows. Recorded, not observed. */
+  recordedRunner?: RecordedRunner | null;
+  /** The recorded usage measurement; absent on sample rows, null when not measured. */
+  recordedUsage?: RecordedUsage | null;
+  /** The collected head commit; absent on sample rows, null when artifacts were not collected. */
+  headCommit?: string | null;
 }
 
 export const capacity = { host: "execution host A", port: 4166, slots: 3 };

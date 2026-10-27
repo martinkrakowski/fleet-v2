@@ -237,6 +237,30 @@ describe('brief prepare seat-plan flags', () => {
     expect(stdout).toHaveLength(0);
   });
 
+  it('accepts --seatPlanFromInstallation=false (treated as absent)', async () => {
+    const rt = createFleetCliRuntime({ installation: makeInstallation() });
+    const { captured } = stubPrepare(rt);
+    const { io } = capturingIo();
+
+    const exitCode = await runCli(briefArgs(['--seatPlanFromInstallation=false']), io, rt);
+
+    expect(exitCode).toBe(0);
+    const req = captured();
+    expect(req).toBeDefined();
+    expect('seatPlan' in (req ?? {})).toBe(false);
+  });
+
+  it('rejects a non-boolean --seatPlanFromInstallation value (exit 2)', async () => {
+    const rt = createFleetCliRuntime({ installation: makeInstallation() });
+    const { io, stdout, stderr } = capturingIo();
+
+    const exitCode = await runCli(briefArgs(['--seatPlanFromInstallation=banana']), io, rt);
+
+    expect(exitCode).toBe(2);
+    expect(stderr.join('')).toContain("'--seatPlanFromInstallation' takes no value, or true or false");
+    expect(stdout).toHaveLength(0);
+  });
+
   it('fills the model assignment from the first healthy first-pass seat', async () => {
     const rt = createFleetCliRuntime({ installation: makeInstallation() });
     const { captured } = stubPrepare(rt);
@@ -284,7 +308,7 @@ describe('attempt next-seat', () => {
       priorAttemptId: null,
       worktreePath: '/lanes/s1e',
       baseCommit: 'abc123',
-      state: 'ended',
+      state: 'collected',
       outcome: 'done',
       briefDigest: 'digest',
       briefPackagePath: '.lane/brief.md',
@@ -398,7 +422,7 @@ describe('attempt fix', () => {
       priorAttemptId: null,
       worktreePath: '/lanes/s1e',
       baseCommit: 'abc123',
-      state: 'ended',
+      state: 'collected',
       outcome: 'done',
       briefDigest: 'digest',
       briefPackagePath: '.lane/brief.md',

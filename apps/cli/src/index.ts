@@ -662,7 +662,11 @@ function derivedV2Model(rt: FleetCliRuntime): FleetInstallationModel | undefined
 /** brief prepare's seat plan from --seatPlan or --seatPlanFromInstallation; undefined when neither. */
 function briefSeatPlan(p: Payload, rt: FleetCliRuntime): SeatPlanProps | undefined {
   const explicit = p['seatPlan'];
-  const fromInstallation = p['seatPlanFromInstallation'] === true || p['seatPlanFromInstallation'] === 'true';
+  const raw = p['seatPlanFromInstallation'];
+  if (raw !== undefined && raw !== true && raw !== false && raw !== 'true' && raw !== 'false') {
+    throw new CliUsageError("'--seatPlanFromInstallation' takes no value, or true or false");
+  }
+  const fromInstallation = raw === true || raw === 'true';
   if (explicit !== undefined && fromInstallation) {
     throw new CliUsageError("brief prepare takes '--seatPlan' or '--seatPlanFromInstallation', not both");
   }

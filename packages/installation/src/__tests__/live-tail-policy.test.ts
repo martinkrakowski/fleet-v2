@@ -84,6 +84,7 @@ describe('policy.liveTail (L1b)', () => {
 
   it('resolves full only when exactly full', () => {
     expect(resolveLiveTailContent({ liveTail: { content: 'full' } })).toBe('full');
+    expect(resolveLiveTailContent({ liveTail: { content: 'summaries' } })).toBe('summaries');
   });
 
   it.each(['everything', 'FULL', 1, null])(

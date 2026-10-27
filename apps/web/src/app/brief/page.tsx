@@ -9,13 +9,14 @@ import { ProposalTableCard } from "./components/proposal-table-card";
 import { FrozenBriefCard } from "./components/frozen-brief-card";
 import styles from "./brief.module.css";
 
+/** A short client-side FNV-1a hash of the sample brief, labelled sample: not a SHA-256 digest. */
 function clientDigest(text: string): string {
   let h = 0x811c9dc5;
   for (let i = 0; i < text.length; i++) {
     h ^= text.charCodeAt(i);
     h = Math.imul(h, 0x01000193) >>> 0;
   }
-  return `sha256:${h.toString(16).padStart(8, "0")}…${(h % 0xffff).toString(16).padStart(4, "0")}`;
+  return `sample:${h.toString(16).padStart(8, "0")}…${(h % 0xffff).toString(16).padStart(4, "0")}`;
 }
 
 function composeMarkdown(woId: string, include: Record<string, boolean>): string {
@@ -134,7 +135,7 @@ export default function BriefPage() {
                   proposals={FIXTURE.proposals}
                   include={include}
                   locked
-                  headerNote={`locked · ${shown.digest}`}
+                  headerNote={`locked · sample digest ${shown.digest}`}
                   onToggle={() => undefined}
                 />
               ) : null}

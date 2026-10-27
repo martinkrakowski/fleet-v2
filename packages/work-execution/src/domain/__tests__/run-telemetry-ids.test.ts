@@ -144,6 +144,15 @@ describe('telemetryTraceId', () => {
       createHmac('sha256', SALT + 'x').update(message, 'utf8').digest();
     expect(telemetryTraceId(otherHmac, RUN_ROOT as NonNullable<typeof RUN_ROOT>)).not.toEqual(again);
   });
+
+  it('separates a run root and an attempt root built from the same id string', () => {
+    const sameIdAttemptRoot = attemptTraceRoot(input(RUN_ID)) as NonNullable<typeof ATTEMPT_ROOT>;
+    const runTrace = telemetryTraceId(hmac, RUN_ROOT as NonNullable<typeof RUN_ROOT>);
+    const attemptTrace = telemetryTraceId(hmac, sameIdAttemptRoot);
+    expect(runTrace).not.toBeNull();
+    expect(attemptTrace).not.toBeNull();
+    expect(runTrace).not.toEqual(attemptTrace);
+  });
 });
 
 describe('telemetrySpanId', () => {
@@ -152,8 +161,8 @@ describe('telemetrySpanId', () => {
     ['root', runRootIdentity()],
     ['attempt/' + ATTEMPT, attemptIdentity(input(ATTEMPT)) as TelemetrySpanIdentity],
     ['round/r1', roundIdentity(1) as TelemetrySpanIdentity],
-    ['key/' + STEP_KEY, journalKeyIdentity(input(STEP_KEY)) as TelemetrySpanIdentity],
-    ['key/' + STOP_KEY, journalKeyIdentity(input(STOP_KEY)) as TelemetrySpanIdentity],
+    ['key/' + encodeURIComponent(STEP_KEY), journalKeyIdentity(input(STEP_KEY)) as TelemetrySpanIdentity],
+    ['key/' + encodeURIComponent(STOP_KEY), journalKeyIdentity(input(STOP_KEY)) as TelemetrySpanIdentity],
     ['usage/' + ATTEMPT, usageIdentity(input(ATTEMPT)) as TelemetrySpanIdentity],
     [
       'usage/' + ATTEMPT + '/msg/msg-example-1',
@@ -176,6 +185,25 @@ describe('telemetrySpanId', () => {
     const otherHmac: TelemetryHmac = (message) =>
       createHmac('sha256', SALT + 'x').update(message, 'utf8').digest();
     expect(telemetrySpanId(otherHmac, root, identity)).not.toEqual(telemetrySpanId(hmac, root, identity));
+  });
+
+  it('does not collide on a / inside a component', () => {
+    const aggregate = telemetrySpanId(hmac, root, usageIdentity(input('a/msg/b')) as TelemetrySpanIdentity);
+    const call = telemetrySpanId(hmac, root, usageCallIdentity(input('a'), input('b')) as TelemetrySpanIdentity);
+    expect(aggregate).not.toBeNull();
+    expect(call).not.toBeNull();
+    expect(aggregate).not.toEqual(call);
+  });
+
+  it('encodes % so a raw / and its percent spelling give different span ids', () => {
+    // `journalKeyIdentity` only accepts keys `parseLaneRunKey` reads, so the
+    // `gate/x`-vs-`gate%2Fx` distinction is exercised on an arbitrary hash
+    // input through a builder that accepts one.
+    const rawSlash = telemetrySpanId(hmac, root, usageIdentity(input('gate/x')) as TelemetrySpanIdentity);
+    const encodedSlash = telemetrySpanId(hmac, root, usageIdentity(input('gate%2Fx')) as TelemetrySpanIdentity);
+    expect(rawSlash).not.toBeNull();
+    expect(encodedSlash).not.toBeNull();
+    expect(rawSlash).not.toEqual(encodedSlash);
   });
 });
 
@@ -278,6 +306,26 @@ describe('span dispositions', () => {
     for (const disposition of dispositions) {
       expect(isFinalSpanDisposition(disposition)).toEqual(disposition.state !== 'pending');
     }
+  });
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['a bare string', 'exported@collector'],
+    ['an invalid route', { state: 'exported', route: 'CANARY' }],
+    ['an invalid reason', { state: 'rejected', reason: 'nope' }],
+    ['an object with an extra key', { state: 'pending', extra: 1 }],
+  ] as const)('spanDispositionText refuses %s', (_name, value) => {
+    expect(spanDispositionText(value)).toBeNull();
+  });
+
+  it('isFinalSpanDisposition refuses without throwing', () => {
+    expect(isFinalSpanDisposition(null)).toBe(false);
+    expect(isFinalSpanDisposition(undefined)).toBe(false);
+    expect(isFinalSpanDisposition('exported@collector')).toBe(false);
+    expect(isFinalSpanDisposition({ state: 'nope' })).toBe(false);
+    expect(isFinalSpanDisposition({ state: 'exported', route: 'CANARY' })).toBe(false);
+    expect(isFinalSpanDisposition({ state: 'pending', extra: 1 })).toBe(false);
   });
 });
 

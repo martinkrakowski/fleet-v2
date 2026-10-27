@@ -8,7 +8,9 @@
  * and applies the all-zero rule. Operator-chosen ids, journalled keys, trace
  * roots and span identities are opaque tokens (frozen empty objects whose text
  * lives in a module-private WeakMap), so nothing serialisable carries a raw id
- * out of this module.
+ * out of this module. Every trace-root and span-identity text is built by
+ * `identityText`: components are percent-encoded with `encodeURIComponent`
+ * before being joined with `/`, so no two distinct component tuples collide.
  */
 
 import { parseLaneRunKey, REQUEST_ID_PATTERN } from './lane-run-keys.js';
@@ -155,13 +157,29 @@ export function telemetrySaltFingerprint(hmac: TelemetryHmac): string | null {
   }
 }
 
+/**
+ * The text of a trace root or a span identity: the literal `kind` word
+ * followed by `/` + `encodeURIComponent(component)` for each component, so a
+ * `/` inside a component becomes `%2F` and a `%` becomes `%25` and no two
+ * distinct component tuples produce the same text. The kind word and any
+ * fixed literal segment passed as a component (like `msg` or the `r` of a
+ * round) are module constants, never encoded user input.
+ */
+function identityText(kind: string, ...components: readonly string[]): string {
+  let text = kind;
+  for (const component of components) {
+    text += '/' + encodeURIComponent(component);
+  }
+  return text;
+}
+
 /** `run/<runId>`; null unless runId matches LANE_RUN_ID_PATTERN. */
 export function runTraceRoot(runId: unknown): TelemetryTraceRoot | null {
   try {
     if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
       return null;
     }
-    return mint(TRACE_ROOT_TEXT, 'run/' + runId);
+    return mint(TRACE_ROOT_TEXT, identityText('run', runId));
   } catch {
     return null;
   }
@@ -174,7 +192,7 @@ export function attemptTraceRoot(attemptId: TelemetryHashInput): TelemetryTraceR
     if (text === null) {
       return null;
     }
-    return mint(TRACE_ROOT_TEXT, 'attempt/' + text);
+    return mint(TRACE_ROOT_TEXT, identityText('attempt', text));
   } catch {
     return null;
   }
@@ -220,11 +238,13 @@ export function telemetrySpanId(
 }
 
 // A span kind added later must name its durable source in plan §3.4's table
-// and get its own builder here before it ships.
+// and get its own builder here before it ships. Every builder routes its text
+// through `identityText`, which percent-encodes each component with
+// `encodeURIComponent` before joining with `/`.
 
 /** `root`: the root span of a conducted run. */
 export function runRootIdentity(): TelemetrySpanIdentity {
-  return mint(SPAN_IDENTITY_TEXT, 'root');
+  return mint(SPAN_IDENTITY_TEXT, identityText('root'));
 }
 
 /** `attempt/<attemptId>`: the attempt AGENT span (both trace kinds) and the root of a hand-run trace. */
@@ -234,7 +254,7 @@ export function attemptIdentity(attemptId: TelemetryHashInput): TelemetrySpanIde
     if (text === null) {
       return null;
     }
-    return mint(SPAN_IDENTITY_TEXT, 'attempt/' + text);
+    return mint(SPAN_IDENTITY_TEXT, identityText('attempt', text));
   } catch {
     return null;
   }
@@ -246,7 +266,7 @@ export function roundIdentity(round: unknown): TelemetrySpanIdentity | null {
     if (typeof round !== 'number' || !Number.isInteger(round) || round < 0 || round > LANE_RUN_MAX_ROUND) {
       return null;
     }
-    return mint(SPAN_IDENTITY_TEXT, 'round/r' + round);
+    return mint(SPAN_IDENTITY_TEXT, identityText('round', 'r' + String(round)));
   } catch {
     return null;
   }
@@ -263,7 +283,7 @@ export function journalKeyIdentity(key: TelemetryHashInput): TelemetrySpanIdenti
     if (parsed === null || (parsed.kind !== 'step' && parsed.kind !== 'stop')) {
       return null;
     }
-    return mint(SPAN_IDENTITY_TEXT, 'key/' + text);
+    return mint(SPAN_IDENTITY_TEXT, identityText('key', text));
   } catch {
     return null;
   }
@@ -276,7 +296,7 @@ export function usageIdentity(attemptId: TelemetryHashInput): TelemetrySpanIdent
     if (text === null) {
       return null;
     }
-    return mint(SPAN_IDENTITY_TEXT, 'usage/' + text);
+    return mint(SPAN_IDENTITY_TEXT, identityText('usage', text));
   } catch {
     return null;
   }
@@ -293,7 +313,7 @@ export function usageCallIdentity(
     if (attemptText === null || messageText === null) {
       return null;
     }
-    return mint(SPAN_IDENTITY_TEXT, 'usage/' + attemptText + '/msg/' + messageText);
+    return mint(SPAN_IDENTITY_TEXT, identityText('usage', attemptText, 'msg', messageText));
   } catch {
     return null;
   }
@@ -305,7 +325,7 @@ export function ciWaitIdentity(entryId: unknown): TelemetrySpanIdentity | null {
     if (typeof entryId !== 'string' || !REQUEST_ID_PATTERN.test(entryId)) {
       return null;
     }
-    return mint(SPAN_IDENTITY_TEXT, 'ci/' + entryId);
+    return mint(SPAN_IDENTITY_TEXT, identityText('ci', entryId));
   } catch {
     return null;
   }
@@ -318,7 +338,7 @@ export function verificationReceiptIdentity(receiptId: TelemetryHashInput): Tele
     if (text === null) {
       return null;
     }
-    return mint(SPAN_IDENTITY_TEXT, 'verification/' + text);
+    return mint(SPAN_IDENTITY_TEXT, identityText('verification', text));
   } catch {
     return null;
   }
@@ -331,7 +351,7 @@ export function reviewReceiptIdentity(receiptId: TelemetryHashInput): TelemetryS
     if (text === null) {
       return null;
     }
-    return mint(SPAN_IDENTITY_TEXT, 'review/' + text);
+    return mint(SPAN_IDENTITY_TEXT, identityText('review', text));
   } catch {
     return null;
   }
@@ -351,15 +371,48 @@ export type SpanDisposition =
   | { readonly state: 'exported'; readonly route: TelemetryRoute }
   | { readonly state: 'rejected'; readonly reason: TelemetryRejectReason };
 
-/** `pending`, `exported@<route>` or `rejected:<reason>`. */
-export function spanDispositionText(disposition: SpanDisposition): string {
-  if (disposition.state === 'exported') {
-    return 'exported@' + disposition.route;
+/**
+ * The one validator behind `spanDispositionText`, `isFinalSpanDisposition`
+ * and the object path of dispositions: null unless `value` is a plain object
+ * with exactly the keys of one known state and valid field values (`route` in
+ * TELEMETRY_ROUTES, `reason` in TELEMETRY_REJECT_REASONS). It never echoes an
+ * unvalidated string and never throws.
+ */
+function validateSpanDisposition(value: unknown): SpanDisposition | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return null;
   }
-  if (disposition.state === 'rejected') {
-    return 'rejected:' + disposition.reason;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (record.state === 'pending' && keys.length === 1) {
+    return { state: 'pending' };
   }
-  return 'pending';
+  if (record.state === 'exported' && keys.length === 2 && typeof record.route === 'string' && (TELEMETRY_ROUTES as readonly string[]).includes(record.route)) {
+    return { state: 'exported', route: record.route as TelemetryRoute };
+  }
+  if (record.state === 'rejected' && keys.length === 2 && typeof record.reason === 'string' && (TELEMETRY_REJECT_REASONS as readonly string[]).includes(record.reason)) {
+    return { state: 'rejected', reason: record.reason as TelemetryRejectReason };
+  }
+  return null;
+}
+
+/** `pending`, `exported@<route>` or `rejected:<reason>`; null for anything that is not a valid disposition. */
+export function spanDispositionText(disposition: unknown): string | null {
+  try {
+    const valid = validateSpanDisposition(disposition);
+    if (valid === null) {
+      return null;
+    }
+    if (valid.state === 'exported') {
+      return 'exported@' + valid.route;
+    }
+    if (valid.state === 'rejected') {
+      return 'rejected:' + valid.reason;
+    }
+    return 'pending';
+  } catch {
+    return null;
+  }
 }
 
 /** The inverse; null for anything else (case-sensitive, no whitespace). */
@@ -391,7 +444,8 @@ export function parseSpanDispositionText(value: unknown): SpanDisposition | null
   }
 }
 
-/** True for `exported` and `rejected`: an export never selects such a span again (plan §3.3). */
-export function isFinalSpanDisposition(disposition: SpanDisposition): boolean {
-  return disposition.state !== 'pending';
+/** True for a valid `exported` or `rejected` disposition; false (never a throw) for anything else. */
+export function isFinalSpanDisposition(disposition: unknown): boolean {
+  const valid = validateSpanDisposition(disposition);
+  return valid !== null && valid.state !== 'pending';
 }

@@ -13,6 +13,7 @@ import type {
 import { isCheckCoverage } from '../../domain/check-coverage.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
+import { placeholderEvidenceRefusal, placeholderVerificationReceiptField } from '../../domain/placeholder-evidence.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { EvidenceArchivePort } from '../ports/out/EvidenceArchivePort.out-port.js';
 import type {
@@ -201,6 +202,15 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
         };
       }),
     );
+
+    // Archive-generated references never match; this guards a misbehaving archive adapter.
+    const placeholderReceipt = receipts.find((receipt) => placeholderVerificationReceiptField(receipt) !== null);
+    if (placeholderReceipt !== undefined) {
+      return {
+        outcome: 'rejected',
+        reason: placeholderEvidenceRefusal('Verification receipt', 'evidenceRef') + '; nothing was recorded',
+      };
+    }
 
     const merged: EvidenceAssessmentRecord = {
       ...base,

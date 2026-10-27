@@ -55,5 +55,5 @@ export function notReadText(notRead: number): string {
   if (notRead <= 0) {
     return "";
   }
-  return `${notRead} older attempt(s): journal not read on this page`;
+  return `${notRead} older attempt(s): journal not read on this page (only the newest ${MAX_TIMELINE_JOURNALS} attempts are read)`;
 }

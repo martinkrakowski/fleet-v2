@@ -104,10 +104,10 @@ describe("timeline-view pure helpers", () => {
   it("renders the not-read header text", () => {
     expect(notReadText(0)).toBe("");
     expect(notReadText(1)).toBe(
-      "1 older attempt(s): journal not read on this page",
+      "1 older attempt(s): journal not read on this page (only the newest 12 attempts are read)",
     );
     expect(notReadText(2)).toBe(
-      "2 older attempt(s): journal not read on this page",
+      "2 older attempt(s): journal not read on this page (only the newest 12 attempts are read)",
     );
   });
 });

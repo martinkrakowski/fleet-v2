@@ -496,6 +496,8 @@ describe("loadWorkOrderTimeline", () => {
     expect(data.attempts[0].evidence).toEqual({ panel: "not-read" });
     expect(data.attempts[1].evidence).toEqual({ panel: "not-read" });
     expect(client.evidenceHeads).toHaveLength(12);
+    expect(client.evidenceHeads).not.toContain("a".repeat(39) + "1");
+    expect(client.evidenceHeads).not.toContain("a".repeat(39) + "2");
   });
 
   it("answers not-read for unconfigured evidence", async () => {

@@ -196,7 +196,7 @@ export async function loadWorkOrderTimeline(
       evidencePanel = { panel: "head-unreadable" };
     } else {
       evidencePanel =
-        evidenceByHead.get(attempt.artifacts.headCommit) ?? { panel: "no-head" };
+        evidenceByHead.get(attempt.artifacts.headCommit) ?? { panel: "not-read" };
     }
     return {
       attempt,

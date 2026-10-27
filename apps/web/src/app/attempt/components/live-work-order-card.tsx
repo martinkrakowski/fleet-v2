@@ -120,7 +120,9 @@ function FoundPanel({
                     <span className={styles.muted}>this attempt</span>
                   </>
                 ) : (
-                  <Link href={attemptIdHref(attempt.id)}>{attempt.id}</Link>
+                  <Link className={`${styles.chainLink} mono`} href={attemptIdHref(attempt.id)}>
+                    {attempt.id}
+                  </Link>
                 )}
                 <Badge tone={word}>{word}</Badge>
                 <span className={styles.muted}>
@@ -173,7 +175,8 @@ function FoundPanel({
                 since{" "}
                 <time dateTime={slot.reservedAtIso}>
                   {slot.reservedAtIso}
-                </time>
+                </time>{" "}
+                {relativeTime(slot.reservedAtIso, observedAtIso)}
               </span>
             </li>
           ))}

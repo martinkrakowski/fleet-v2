@@ -614,3 +614,8 @@
   color: var(--text-muted);
   margin: var(--space-3) 0 var(--space-2);
 }
+
+.chainLink {
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}

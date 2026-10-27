@@ -21,6 +21,7 @@ import type {
   HostRole,
   HostSection,
   HostRunnerSection,
+  LiveTailPolicy,
   PolicySection,
   ProcedureCoverage,
   ReviewerSection,
@@ -152,8 +153,10 @@ const POLICY_KEYS: readonly string[] = [
   'forbiddenRoutes',
   'perLaneCostCeiling',
   'useFreeSeats',
+  'liveTail',
 ];
 const FORBIDDEN_ROUTE_KEYS: readonly string[] = ['tool', 'modelPattern'];
+const LIVE_TAIL_KEYS: readonly string[] = ['content'];
 const GIT_SHELF_KEYS: readonly string[] = [
   'provider',
   'repoDir',
@@ -1649,11 +1652,38 @@ function parseV2Policy(
       useFreeSeats = value;
     }
   }
+  const liveTail = parseLiveTailPolicy(section, errors);
   return {
     ...(forbiddenRoutes !== undefined ? { forbiddenRoutes } : {}),
     ...(perLaneCostCeiling !== undefined ? { perLaneCostCeiling } : {}),
     ...(useFreeSeats !== undefined ? { useFreeSeats } : {}),
+    ...(liveTail !== undefined ? { liveTail } : {}),
   };
+}
+
+function parseLiveTailPolicy(
+  section: JsonObject,
+  errors: string[],
+): LiveTailPolicy | undefined {
+  if (!Object.hasOwn(section, 'liveTail')) {
+    return undefined;
+  }
+  const value = section.liveTail;
+  if (!isJsonObject(value)) {
+    errors.push('policy.liveTail: must be an object');
+    return undefined;
+  }
+  collectUnknownKeys(value, LIVE_TAIL_KEYS, 'policy.liveTail', errors);
+  if (!Object.hasOwn(value, 'content')) {
+    errors.push('policy.liveTail.content: required');
+    return undefined;
+  }
+  const content = value.content;
+  if (content !== 'summaries' && content !== 'full') {
+    errors.push('policy.liveTail.content: must be one of summaries, full');
+    return undefined;
+  }
+  return { content };
 }
 
 function parseV2Shelf(

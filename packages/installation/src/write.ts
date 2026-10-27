@@ -171,6 +171,9 @@ function serializePolicy(policy: PolicySection): Record<string, unknown> {
   if (policy.useFreeSeats !== undefined) {
     out.useFreeSeats = policy.useFreeSeats;
   }
+  if (policy.liveTail !== undefined) {
+    out.liveTail = { content: policy.liveTail.content };
+  }
   return out;
 }
 

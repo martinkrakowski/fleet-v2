@@ -13,6 +13,8 @@ import type {
   ChainStep,
   ChainsSection,
   FleetInstallationModel,
+  LiveTailContent,
+  PolicySection,
   SeatModel,
   SeatRole,
 } from './types.js';
@@ -298,4 +300,18 @@ export function v1FamilyWarnings(installation: FleetInstallationModel): string[]
     }
   }
   return warnings;
+}
+
+/** The tail content an installation gets when `policy.liveTail` is absent (D10). */
+export const DEFAULT_LIVE_TAIL_CONTENT: LiveTailContent = 'summaries';
+
+/**
+ * The effective live-tail content: `full` only when the policy says exactly
+ * `full`; absent, malformed or anything else is `summaries`.
+ */
+export function resolveLiveTailContent(policy: PolicySection | undefined): LiveTailContent {
+  if (policy?.liveTail?.content === 'full') {
+    return 'full';
+  }
+  return DEFAULT_LIVE_TAIL_CONTENT;
 }

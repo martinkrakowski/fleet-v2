@@ -5,6 +5,7 @@ export * from "./AttemptOutcome.vo.js";
 export * from "./AttemptState.vo.js";
 export * from "./BriefPackage.vo.js";
 export * from "./ExecutionLimits.vo.js";
+export * from "./LaneRunState.vo.js";
 export * from "./ModelAssignment.vo.js";
 export * from "./RunnerObservation.vo.js";
 export * from "./SeatPlan.vo.js";

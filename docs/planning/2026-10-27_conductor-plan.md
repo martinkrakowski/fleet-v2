@@ -68,7 +68,7 @@ The run's state is a projection of attempts, the keyed journal, receipts and for
 
 **Rounds.** A round is one second-pass dispatch. The first pass is round 0; a failed first gate **uses round 1** (the first fix round), since the second-pass seat is what runs next. After round 2, any blocker, failed gate or failed CI parks. A head change after `accepting` re-enters `gating`.
 
-**Idempotency keys.** Every external action has the key `<runId>/r<round>/<step>/<seatIndex>[@<head12>]`. The intent entry carries the key and any id minted for it (attempt id, review request id, question key) **before** the action runs. The journal's uniqueness check (K1b) refuses a second intent with the same key, so two drivers that both pass a stale lease check cannot both act: the second append fails and that driver drops its step. Leases make collisions rare; the unique key makes them harmless.
+**Idempotency keys.** Every external action has the key `<runId>/r<round>/<step>/<seatIndex>[@<head12>]`. The intent entry carries the key and any id minted for it (attempt id, review request id, question key) **before** the action runs. The journal's uniqueness check (K1b) refuses a second intent with the same key, so two drivers that both pass a stale lease check cannot both act: the second append fails and that driver drops its step. Leases make collisions rare; the unique key makes them harmless. Amended by K1-1 (2026-10-27): the one-way `prepare` and `dispatch` keys carry the attempt's ordinal within the run (`/a<n>`), so a same-seat re-dispatch in one round has its own key.
 
 ### 3.3 Where each step's port lives
 

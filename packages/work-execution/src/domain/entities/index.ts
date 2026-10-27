@@ -3,4 +3,5 @@
 export * from "./ActionJournalEntry.js";
 export * from "./Attempt.js";
 export * from "./CapacityReservation.js";
+export * from "./LaneRun.js";
 export * from "./WorkOrder.js";

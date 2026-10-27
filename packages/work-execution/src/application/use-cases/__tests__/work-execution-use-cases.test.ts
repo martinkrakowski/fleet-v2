@@ -1021,6 +1021,8 @@ function validBriefRequest(overrides: Record<string, unknown> = {}): PrepareBrie
     ownedPaths: ['packages/app-a/**'],
     permissions: ['filesystem:worktree'],
     acceptanceChecks: ['yarn test'],
+    acceptanceSpec: { commitRequired: true, diffCheck: true, commands: [{ argv: ['corepack', 'yarn', 'build'] }] },
+    allowedPathPrefixes: ['packages/app-a'],
     stepLimit: 40,
     timeLimitSeconds: 3600,
     resourceBounds: { cpu: '2' },
@@ -1153,6 +1155,7 @@ describe('PrepareBriefPackageUseCase', () => {
           fallbackModel: 'fallback-model',
           seatTool: 'agy',
         },
+        allowedPathPrefixes: undefined,
       }),
     );
     expect(agyMissing).toEqual({
@@ -1193,7 +1196,7 @@ describe('PrepareBriefPackageUseCase', () => {
     }
   });
 
-  it('freezes allowedPathPrefixes into the manifest, where the digest covers it (O14d1)', async () => {
+  it('freezes allowedPathPrefixes into the manifest and refuses a package without them (O14d1, S2a)', async () => {
     const authoring = makeBriefAuthoring();
     const artifacts = makeArtifactPort();
     const useCase = new PrepareBriefPackageUseCase({
@@ -1210,21 +1213,25 @@ describe('PrepareBriefPackageUseCase', () => {
     );
     expect(withPrefixes.outcome).toBe('prepared');
 
-    // An opencode seat may omit the field: it freezes as an empty list and
-    // old manifests that never carried the field keep reading as absent.
+    // An opencode seat without prefixes is now refused: the spec's diff
+    // check needs them (S2a).
     const withoutPrefixes = await useCase.prepareBriefPackage(
       validBriefRequest({
         attemptId: 'attempt-prefix-2',
         worktreePath: '/lanes/attempt-prefix-2',
+        allowedPathPrefixes: undefined,
       }),
     );
-    expect(withoutPrefixes.outcome).toBe('prepared');
+    expect(withoutPrefixes).toEqual({
+      outcome: 'rejected',
+      reason: 'allowedPathPrefixes is required: the acceptance spec diff check refuses every changed path outside them',
+    });
 
     const manifests = artifacts.placedCalls.map((call) =>
       JSON.parse(call.manifestJson) as { allowedPathPrefixes?: unknown },
     );
+    expect(artifacts.placedCalls).toHaveLength(1);
     expect(manifests[0].allowedPathPrefixes).toEqual(['packages/x/src', 'docs/plans']);
-    expect(manifests[1].allowedPathPrefixes).toEqual([]);
   });
 
   it('freezes the seat tool into the manifest, where the digest covers it (H8)', async () => {

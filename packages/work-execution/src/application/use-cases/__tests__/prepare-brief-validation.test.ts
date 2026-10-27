@@ -66,6 +66,8 @@ function validRequest(overrides: Partial<PrepareBriefPackageUseCaseRequest> = {}
     ownedPaths: ['packages/app-a/**'],
     permissions: ['filesystem:worktree'],
     acceptanceChecks: ['yarn test'],
+    acceptanceSpec: { commitRequired: true, diffCheck: true, commands: [{ argv: ['corepack', 'yarn', 'build'] }] },
+    allowedPathPrefixes: ['packages/app-a'],
     stepLimit: 40,
     timeLimitSeconds: 3600,
     resourceBounds: { cpu: '2' },
@@ -221,5 +223,133 @@ describe('PrepareBriefPackageUseCase path validation', () => {
       expect(result.prepared.prosePath).toBe('.lane/brief.md');
       expect(result.prepared.manifestPath).toBe('.lane/brief-manifest.json');
     }
+  });
+});
+
+function makeCapturingArtifactPort(): { port: AttemptArtifactPort; placedManifestJsons: string[] } {
+  const placedManifestJsons: string[] = [];
+  const port: AttemptArtifactPort = {
+    async verifyIgnoredPaths(request) {
+      return { outcome: 'ignored', checkedPaths: request.candidatePaths };
+    },
+    async placeFrozenBrief(request) {
+      placedManifestJsons.push(request.manifestJson);
+      return {
+        outcome: 'placed',
+        prosePath: '.lane/brief.md',
+        manifestPath: '.lane/brief-manifest.json',
+      };
+    },
+    async collectCompletedAttemptArtifacts() {
+      return {
+        outcome: 'collected',
+        artifacts: {
+          headCommit: 'head456',
+          commitsSinceBase: ['commit-1'],
+          collectedArtifactPaths: ['dist/report.json'],
+          notes: 'present',
+        },
+      };
+    },
+  };
+  return { port, placedManifestJsons };
+}
+
+describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
+  it('rejects a request without an acceptance spec', async () => {
+    const useCase = makeUseCase();
+    const result = await useCase.prepareBriefPackage(validRequest({ acceptanceSpec: undefined }));
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'acceptanceSpec is required: commitRequired, diffCheck and at least one command',
+    });
+  });
+
+  it('rejects an acceptance spec with a shell-string command', async () => {
+    const useCase = makeUseCase();
+    const result = await useCase.prepareBriefPackage(
+      validRequest({
+        acceptanceSpec: { commitRequired: true, diffCheck: true, commands: [{ argv: ['yarn build'] }] },
+      }),
+    );
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'AcceptanceSpec command 1 looks like a shell string; give each argument its own argv entry',
+    });
+  });
+
+  it('rejects a package without allowed path prefixes', async () => {
+    const useCase = makeUseCase();
+    const result = await useCase.prepareBriefPackage(validRequest({ allowedPathPrefixes: [] }));
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'allowedPathPrefixes is required: the acceptance spec diff check refuses every changed path outside them',
+    });
+  });
+
+  it('freezes the acceptance spec into the placed manifest', async () => {
+    const captured = makeCapturingArtifactPort();
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring(),
+      artifactPort: captured.port,
+    });
+
+    const result = await useCase.prepareBriefPackage(validRequest());
+    expect(result.outcome).toBe('prepared');
+    expect(captured.placedManifestJsons).toHaveLength(1);
+    const manifest = JSON.parse(captured.placedManifestJsons[0]) as { acceptanceSpec?: unknown };
+    expect(manifest.acceptanceSpec).toEqual({
+      commitRequired: true,
+      diffCheck: true,
+      commands: [{ argv: ['corepack', 'yarn', 'build'] }],
+    });
+  });
+
+  it('covers the acceptance spec in the brief digest', async () => {
+    const useCase = makeUseCase();
+    const first = await useCase.prepareBriefPackage(validRequest());
+    const second = await useCase.prepareBriefPackage(
+      validRequest({
+        acceptanceSpec: {
+          commitRequired: true,
+          diffCheck: true,
+          commands: [{ argv: ['corepack', 'yarn', 'build:prod'] }],
+        },
+      }),
+    );
+
+    if (first.outcome === 'prepared' && second.outcome === 'prepared') {
+      expect(first.prepared.briefDigest).not.toBe(second.prepared.briefDigest);
+    }
+  });
+
+  it('does not call authorBrief on any acceptance-spec rejection', async () => {
+    const authorBrief = vi.fn(async () => {
+      return {
+        outcome: 'authored' as const,
+        brief: {
+          proseMarkdown: '# Frozen brief prose',
+          provenance: 'orchestrator' as const,
+        },
+      };
+    });
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: { authorBrief },
+      artifactPort: makeArtifactPort(),
+      worktreePath: '/wt',
+    });
+
+    await useCase.prepareBriefPackage(validRequest({ acceptanceSpec: undefined }));
+    await useCase.prepareBriefPackage(
+      validRequest({
+        acceptanceSpec: { commitRequired: true, diffCheck: true, commands: [{ argv: ['yarn build'] }] },
+      }),
+    );
+    await useCase.prepareBriefPackage(validRequest({ allowedPathPrefixes: [] }));
+
+    expect(authorBrief).not.toHaveBeenCalled();
   });
 });

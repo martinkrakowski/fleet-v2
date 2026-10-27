@@ -354,6 +354,8 @@ describe('dispatch through the real adapters recomputes the frozen brief digest 
       ownedPaths: ['src/**'],
       permissions: ['filesystem:worktree'],
       acceptanceChecks: ['yarn test'],
+      acceptanceSpec: { commitRequired: true, diffCheck: true, commands: [{ argv: ['corepack', 'yarn', 'build'] }] },
+      allowedPathPrefixes: ['src'],
       stepLimit: 40,
       timeLimitSeconds: 3600,
       resourceBounds: { cpu: '2' },

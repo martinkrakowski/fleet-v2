@@ -13,6 +13,7 @@ import { join, resolve } from 'node:path';
 import { readFileSync } from 'node:fs';
 
 import type {
+  AcceptanceSpecProps,
   AttemptRecord,
   AttemptSeatOverrideRecord,
   BriefContextDecision,
@@ -233,6 +234,22 @@ function jsonStrArr(payload: Payload, key: string, label: string): string[] {
     throw new CliUsageError(`${label} requires a JSON array of strings in '--${key}'`);
   }
   return parsed as string[];
+}
+
+/**
+ * A JSON object the request carries: the flag value is one JSON document
+ * (e.g. --acceptanceSpec '{"commitRequired":true,...}') or an object under
+ * --json. Absent is undefined (the use case decides); anything else is a
+ * usage error.
+ */
+function jsonObj(payload: Payload, key: string, label: string): Record<string, unknown> | undefined {
+  const value = payload[key];
+  if (value === undefined) return undefined;
+  const parsed = typeof value === 'string' ? safeJsonParse(value) : value;
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new CliUsageError(`${label} requires a JSON object in '--${key}'`);
+  }
+  return parsed as Record<string, unknown>;
 }
 
 function safeJsonParse(text: string): unknown {
@@ -730,6 +747,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         allowedPathPrefixes: jsonStrArr(p, 'allowedPathPrefixes', 'brief prepare'),
         permissions: strArr(p, 'permissions'),
         acceptanceChecks: strArr(p, 'acceptanceChecks'),
+        acceptanceSpec: jsonObj(p, 'acceptanceSpec', 'brief prepare') as AcceptanceSpecProps | undefined,
         stepLimit: num(p, 'stepLimit', 200),
         timeLimitSeconds: num(p, 'timeLimitSeconds', 3600),
         resourceBounds: nested<Record<string, string>>(p, 'resourceBounds') ?? {},
@@ -1830,7 +1848,7 @@ Commands:
   projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
   state check|restore
-  brief prepare [--allowedPathPrefixes '["packages/x/src"]']
+  brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]']
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|accept
   forge execute

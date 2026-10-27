@@ -6,7 +6,8 @@
   request channel (§3.6) and the live tail (§3.7) from Fable's design review; rev 3 applied Grok
   4.7's review of rev 2, rev 3.1 its re-review, and rev 3.2 CodeRabbit's review (§7). Decisions in §5 are open with defaults. Nothing built. Anchors checked against `main` at `dae491f`.
   Amended 2026-10-27 by the conductor plan's amendment K-GC (§3.3 note, A-F and W7c): two run-stop
-  keys, the `stop-already-forced` refusal, "Stop now", and a read-only view of the reaper's findings.
+  keys, the `stop-already-requested` and `stop-already-forced` refusals, "Stop now", the halt exit,
+  and a read-only view of the reaper's findings.
 - **Owner requests (2026-10-27):**
   - "Given all of the fleet-v2 features and functionality, the UI lacks interactivity with the
     actual lanes, and orchestration. Run a sub-agent to research UI/UX improvements. The have Fable
@@ -155,7 +156,10 @@ drives a step.
   `conductor halt`. It never depends on a live orchestrator. Body: "parks every run before its
   next external action; does not stop a running lane".
 - **Stop** is a direct route (A-C) that writes a keyed run-journal entry `<runId>/stop@web`
-  carrying the run's `expectedRevision`. The driver obeys it and stops the running attempt itself
+  carrying the run's `expectedRevision`. **Amended by K-GC (conductor §3.9; note below):** the rest
+  of this bullet, its outcome table and its body describe the forced stop, "Stop now", keyed
+  `<runId>/stop-force@web`; `<runId>/stop@web` now names the graceful stop, which calls no
+  `StopAttempt` because of the stop. The driver obeys it and stops the running attempt itself
   through `StopAttempt` (conductor §3.2: "a running attempt is stopped first through
   `StopAttempt`"). The web never calls `StopAttempt` for an attempt that belongs to a run. The
   driver maps `StopAttempt`'s outcome as follows:
@@ -193,9 +197,13 @@ drives a step.
   revert or delete anything; a stopped run cannot be resumed" (danger tone).
 - **Forced ("Stop now").** Offered beside "Stop", and while a graceful stop is pending. Body: the
   P7-write stop body above, plus "uncommitted work in the attempt's worktree is abandoned" (danger tone).
-- **One way only.** A force may follow a graceful stop; A-C refuses a graceful entry after a force with
-  the typed reason `stop-already-forced`, shown verbatim (§6 "Error"). W7b hides "Stop" once a force is
+- **One way only, one stop per mode.** A force may follow a graceful stop. K1b refuses a stop no
+  stronger than the run's recorded ones, whichever channel wrote them: `stop-already-requested` for the
+  same mode (a web graceful stop after a CLI one), `stop-already-forced` for a graceful after a force.
+  A-C returns the typed reason and W7b shows it verbatim (§6 "Error"). W7b hides "Stop" once a force is
   recorded.
+- **Halt.** A run halted during a stop leaves its `halted` park by itself once the halt is lifted, and
+  the stop continues; no resume is needed, and none is offered while a stop is pending.
 - **On the card.** A run with a graceful stop pending shows "stopping" with its wait reason
   (`stop-draining`, or `stop-grace-exceeded` past the grace); it is not parked and not yet `stopped`.
   Resume stays refused with `stop-pending`.
@@ -215,7 +223,7 @@ with a pointer to the run, and the page offers the run's stop (P7-write) instead
 | `POST /v1/attempts/:id/artifacts` | Safe to repeat | Collects against the completion receipt; does not judge the work |
 | `POST /v1/attempts/:id/acceptance` | Assessment at a head; repeat re-assesses | Requests acceptance; does not merge |
 | Halt (K7 route) | Writing the marker twice is harmless | See P7-write |
-| Run stop (A-C route) | Keyed run-journal entry `<runId>/stop@web` with `expectedRevision`; K1b refuses a second one | See P7-write |
+| Run stop (A-C route) | Keyed run-journal entry `<runId>/stop@web` with `expectedRevision`; K1b refuses a second one. Amended by K-GC: `stop@web` is graceful, `stop-force@web` forced; K1b also refuses `stop-already-requested` and `stop-already-forced` | See P7-write and its K-GC note |
 | `POST /v1/requests` | Client-minted ULID `requestId`; a repeat POST returns the existing record | See §3.6 |
 | `POST /v1/questions/:id/answers` | Q1b's revision and idempotency rules; built as Q5; never through the channel | One-way answers show the bytes to sign; the web cannot sign |
 | Owner messages | T2b's idempotency keys; the only path for prose | — |
@@ -526,7 +534,7 @@ conductor's own work-execution lanes.
 | **Step 7. Conductor; serial A-R → A-C → O9; web: W7a → W7b** | | | | |
 | O2c | Journal-key reconciliation (`request/<requestId>`); enables `start-lane-run`, `prepare-fix`, `request-review`, `resume-run`; `start-lane-run` is claimable only by `cliKind: conductor` from the start (D7); intent before the action, result after; the same fault-injection tests under K1b | operator-coordination, **manifest** | 2 | O2b, K1b, O3 (manifest) |
 | A-R | `GET /v1/runs`, `/v1/runs/:id`, run journal by key | work-execution, apps/api, **`composition.ts`, manifest** | 2 | K3, O2c (manifest), L2 (work-execution) |
-| A-C | Direct run routes: halt marker through the CLI's adapter; run stop as a keyed run-journal entry `<runId>/stop@web` with `expectedRevision`; attempt stop refuses run-owned attempts; run reads report the stop outcome mapping (§3.3), including `stop-unconfirmed` parks | work-execution, apps/api, **`composition.ts`, manifest** | 2 | A-R, K7, T3a |
+| A-C | Direct run routes: halt marker through the CLI's adapter; run stop as a keyed run-journal entry `<runId>/stop@web` with `expectedRevision` (amended by K-GC: graceful; `<runId>/stop-force@web` for "Stop now"); attempt stop refuses run-owned attempts; run reads report the stop outcome mapping (§3.3), including `stop-unconfirmed` parks | work-execution, apps/api, **`composition.ts`, manifest** | 2 | A-R, K7, T3a |
 | O9 | The conductor driver registers and claims `start-lane-run` (the claim rules already exist from O2b and O2c) | work-execution, apps/cli, **`index.ts`, manifest** | 2 | A-C, O5, K3, K7, O2c |
 | W7a | Run board read, dry-run and shadow entries distinct | apps/web | 2 | A-R, K7, W8b |
 | W7b | Halt and run-stop controls; resume and start as requests (O8's card) | apps/web | 2 | W7a, A-C, O8 |

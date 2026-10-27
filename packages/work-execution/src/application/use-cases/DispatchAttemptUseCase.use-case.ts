@@ -906,6 +906,11 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       return { ok: true, fields: {} };
     }
     const plan = manifestSeatPlan.plan;
+    // A fix attempt with no recorded selection carries the frozen plan only: binding it as a first-pass
+    // seat would mislead fix-seat rotation, which reads seatSelection.role and seatIndex (S1c).
+    if (existingAttempt?.kind === 'fix') {
+      return { ok: true, fields: { seatPlan: plan.toJSON() } };
+    }
     const seatIndex = plan.getSeats('first-pass').findIndex((seat) => seatMatchesAssignment(seat, assignment));
     if (seatIndex === -1) {
       return { ok: false, reason: 'Frozen brief model assignment matches no first-pass seat of its seat plan' };

@@ -717,6 +717,27 @@ describe('DispatchAttemptUseCase seat binding (S1b)', () => {
     expect(setup.journal.entries).toHaveLength(0);
   });
 
+  it('binds a fix attempt with no recorded selection to the frozen plan only, never as a first-pass seat', async () => {
+    const files = briefFiles(dispatchManifest({ seatPlan: PLAN }));
+    const setup = makeDispatchSetup({
+      workspaceOptions: {
+        readWorktreeFile: async (_w, rel) => (rel === '.lane/brief-manifest.json' ? files.manifestRaw : files.prose),
+      },
+    });
+    seedFixAttempt(setup);
+    const seeded = setup.attemptRepo.attempts.get('attempt-1')!;
+    setup.attemptRepo.attempts.set('attempt-1', { ...seeded, seatSelection: undefined });
+
+    const result = await setup.useCase.dispatchAttempt(
+      validDispatchRequest({ briefDigest: files.digest }) as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('started');
+    const stored = setup.attemptRepo.attempts.get('attempt-1');
+    expect(stored?.seatPlan).toBeDefined();
+    expect(stored?.seatSelection).toBeUndefined();
+  });
+
   it('dispatches a fix attempt whose frozen assignment matches its recorded seat selection', async () => {
     const files = briefFiles(
       dispatchManifest({ modelAssignment: { model: 'acme/glm-5.3', variant: 'low', seatTool: 'opencode' } }),

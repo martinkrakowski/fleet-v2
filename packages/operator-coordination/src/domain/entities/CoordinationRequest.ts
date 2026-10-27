@@ -18,6 +18,7 @@ import type {
   RelayAcknowledgementRecord,
 } from '../coordination-records.js';
 import {
+  POLICY_GRANT_HEAD_PATTERN,
   POLICY_GRANT_SOURCE_FOR_KIND,
   isPolicyGrantRecord,
   parsePolicyDecisionRevision,
@@ -249,10 +250,10 @@ export class CoordinationRequest {
     if (kind === null || POLICY_GRANT_SOURCE_FOR_KIND[kind] !== parsed.source) {
       throw new Error('CoordinationRequest policy grant scope does not match its setting');
     }
-    if (record.expectedHeadSha === null) {
+    if (record.expectedHeadSha === null || !POLICY_GRANT_HEAD_PATTERN.test(record.expectedHeadSha)) {
       throw new Error('CoordinationRequest policy grant requires an expected head');
     }
-    
+
     return Object.freeze(grant);
   }
 

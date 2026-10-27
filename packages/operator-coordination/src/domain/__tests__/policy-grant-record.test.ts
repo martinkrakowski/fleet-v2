@@ -264,6 +264,14 @@ describe('CoordinationRequest.fromRecord refuses a hostile policyGrant', () => {
     );
   });
 
+  it('refuses a policy grant whose head is not a full commit id', () => {
+    for (const head of ['abc', 'A'.repeat(40), 'a'.repeat(39), 'a'.repeat(41)]) {
+      expect(() =>
+        CoordinationRequest.fromRecord(requestRecord({ expectedHeadSha: head, policyGrant: VALID_GRANT })),
+      ).toThrow('CoordinationRequest policy grant requires an expected head');
+    }
+  });
+
   it('never runs a proxy get trap: values come from the descriptor snapshot', () => {
     let getTrapRan = false;
     const grant = new Proxy({ ...VALID_GRANT } as PolicyGrantRecord, {

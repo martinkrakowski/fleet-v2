@@ -163,7 +163,7 @@ describe('policy.conductor (K2)', () => {
     });
     expect(
       resolveConductorPolicy({
-        conductor: { enabled: true, reaper: { repairs: { 'stale-stop': true } } },
+        conductor: { enabled: true, reaper: { enabled: true, repairs: { 'stale-stop': true } } },
       } as never),
     ).toEqual({
       ...DEFAULT_CONDUCTOR_POLICY,
@@ -173,6 +173,11 @@ describe('policy.conductor (K2)', () => {
         repairs: { ...defaultRepairs, 'stale-stop': true },
       },
     });
+    expect(
+      resolveConductorPolicy({
+        conductor: { enabled: true, reaper: { repairs: { 'stale-stop': true } } },
+      } as never),
+    ).toEqual(DEFAULT_CONDUCTOR_POLICY);
   });
 
   it('keeps the destructive repair opt-in only', () => {
@@ -181,12 +186,12 @@ describe('policy.conductor (K2)', () => {
     expect(resolveConductorPolicy({ conductor: { enabled: true } } as never).reaper.repairs['orphan-session']).toBe(false);
     expect(
       resolveConductorPolicy({
-        conductor: { enabled: true, reaper: { repairs: RECORD_ONLY } },
+        conductor: { enabled: true, reaper: { enabled: true, repairs: RECORD_ONLY } },
       } as never).reaper.repairs['orphan-session'],
     ).toBe(false);
     expect(
       resolveConductorPolicy({
-        conductor: { enabled: true, reaper: { repairs: { 'orphan-session': true } } },
+        conductor: { enabled: true, reaper: { enabled: true, repairs: { 'orphan-session': true } } },
       } as never).reaper.repairs['orphan-session'],
     ).toBe(true);
   });
@@ -427,10 +432,35 @@ describe('policy.conductor (K2)', () => {
       { conductor: { enabled: true, stopGraceMinutes: 2 } },
       { conductor: { enabled: true, reaper: { enabled: true, repairs: { 'orphan-worktree': true } } } },
       { conductor: { enabled: true, reaper: { enabled: true, repairs: { 'orphan-session': 'yes' } } } },
+      Object.create({ conductor: { enabled: true } }),
+      { conductor: Object.create({ enabled: true }) },
+      { conductor: Object.assign(Object.create({ reaper: { enabled: false } }), { enabled: true }) },
+      { conductor: { enabled: true, reaper: Object.create({ enabled: false }) } },
+      { conductor: { enabled: true, forgeSyncMinutes: 10 } },
+      { conductor: { enabled: true, reaper: { enabled: true, removeWorktrees: true } } },
+      { conductor: {} },
+      { conductor: { stopGraceMinutes: 30, reaper: { enabled: false } } },
+      { conductor: { enabled: undefined } },
+      { conductor: { enabled: undefined, stopGraceMinutes: 30, reaper: { enabled: false } } },
+      { conductor: { enabled: true, reaper: {} } },
+      { conductor: { enabled: true, reaper: { intervalMinutes: 20 } } },
+      { conductor: { enabled: true, reaper: { enabled: undefined } } },
+      { conductor: { enabled: true, reaper: { enabled: undefined, intervalMinutes: 20 } } },
     ];
     for (const bad of malformed) {
       expect(resolveConductorPolicy(bad as never)).toEqual(DEFAULT_CONDUCTOR_POLICY);
     }
+    let getterRan = false;
+    const withGetter = {
+      conductor: {
+        get enabled(): boolean {
+          getterRan = true;
+          return true;
+        },
+      },
+    };
+    expect(resolveConductorPolicy(withGetter as never)).toEqual(DEFAULT_CONDUCTOR_POLICY);
+    expect(getterRan).toBe(false);
     const resolved = resolveConductorPolicy({ conductor: { enabled: true } } as never);
     expect(resolved).toEqual({
       ...DEFAULT_CONDUCTOR_POLICY,
@@ -450,14 +480,14 @@ describe('policy.conductor (K2)', () => {
     expect(
       conductorRevision(
         resolveConductorPolicy({
-          conductor: { enabled: true, reaper: { repairs: RECORD_ONLY } },
+          conductor: { enabled: true, reaper: { enabled: true, repairs: RECORD_ONLY } },
         } as never),
       ),
     ).toBe('82afb846ea78');
     expect(
       conductorRevision(
         resolveConductorPolicy({
-          conductor: { enabled: true, reaper: { repairs: { 'orphan-session': true } } },
+          conductor: { enabled: true, reaper: { enabled: true, repairs: { 'orphan-session': true } } },
         } as never),
       ),
     ).toBe('5bb8328117df');
@@ -486,17 +516,17 @@ describe('policy.conductor (K2)', () => {
     ).not.toBe(base);
     expect(
       conductorRevision(
-        resolveConductorPolicy({ conductor: { enabled: true, reaper: { intervalMinutes: 11 } } } as never),
+        resolveConductorPolicy({ conductor: { enabled: true, reaper: { enabled: true, intervalMinutes: 11 } } } as never),
       ),
     ).not.toBe(base);
     expect(
       conductorRevision(
-        resolveConductorPolicy({ conductor: { enabled: true, reaper: { graceMinutes: 6 } } } as never),
+        resolveConductorPolicy({ conductor: { enabled: true, reaper: { enabled: true, graceMinutes: 6 } } } as never),
       ),
     ).not.toBe(base);
     expect(
       conductorRevision(
-        resolveConductorPolicy({ conductor: { enabled: true, reaper: { staleStopMinutes: 31 } } } as never),
+        resolveConductorPolicy({ conductor: { enabled: true, reaper: { enabled: true, staleStopMinutes: 31 } } } as never),
       ),
     ).not.toBe(base);
     expect(
@@ -508,7 +538,7 @@ describe('policy.conductor (K2)', () => {
       expect(
         conductorRevision(
           resolveConductorPolicy({
-            conductor: { enabled: true, reaper: { repairs: { [kind]: true } } },
+            conductor: { enabled: true, reaper: { enabled: true, repairs: { [kind]: true } } },
           } as never),
         ),
       ).not.toBe(base);

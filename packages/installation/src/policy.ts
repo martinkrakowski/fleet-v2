@@ -366,8 +366,41 @@ export const CONDUCTOR_MINUTE_BOUNDS = Object.freeze({
   staleStopMinutes: Object.freeze({ min: 5, max: 1440 }),
 });
 
+const CONDUCTOR_KEYS: readonly string[] = ['enabled', 'stopGraceMinutes', 'reaper'];
+
+const CONDUCTOR_REAPER_KEYS: readonly string[] = [
+  'enabled',
+  'intervalMinutes',
+  'graceMinutes',
+  'staleStopMinutes',
+  'repairs',
+];
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function readOwnDataProperty(record: Record<string, unknown>, key: string): unknown {
+  if (!Object.hasOwn(record, key)) {
+    return undefined;
+  }
+  return Object.getOwnPropertyDescriptor(record, key)?.value;
+}
+
+function hasUnknownKeys(
+  record: Record<string, unknown>,
+  allowedKeys: readonly string[],
+): boolean {
+  for (const key of Object.keys(record)) {
+    if (!allowedKeys.includes(key)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function readConductorMinute(
@@ -386,9 +419,6 @@ function readConductorMinute(
 function readConductorRepairs(
   value: unknown,
 ): Readonly<Record<ConductorReaperRepairKind, boolean>> | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
   if (!isPlainRecord(value)) {
     return undefined;
   }
@@ -404,13 +434,13 @@ function readConductorRepairs(
     if (!CONDUCTOR_REAPER_REPAIR_KINDS.includes(kind)) {
       return undefined;
     }
-    const flag = value[kind];
+    const flag = readOwnDataProperty(value, kind);
     if (typeof flag !== 'boolean') {
       return undefined;
     }
     repairs[kind] = flag;
   }
-  return repairs;
+  return Object.freeze(repairs);
 }
 
 function freshDefaultConductorRepairs(): Readonly<Record<ConductorReaperRepairKind, boolean>> {
@@ -448,69 +478,72 @@ function freshDefaultConductorPolicy(): ResolvedConductorPolicy {
 export const DEFAULT_CONDUCTOR_POLICY: ResolvedConductorPolicy = freshDefaultConductorPolicy();
 
 /**
- * The effective conductor policy: the block's values with every absent field defaulted, only
- * when every present field is well-formed (booleans, integers within CONDUCTOR_MINUTE_BOUNDS,
- * only known repair kinds); absent or malformed anywhere is the whole default (off, report-only).
- * Always a fresh, deeply frozen object with the keys in canonical order.
+ * The effective conductor policy: the block's own data properties with every absent optional
+ * field defaulted, only when every present block is a plain record with only known keys, a
+ * boolean `enabled`, and well-formed optional fields (booleans, integers within
+ * CONDUCTOR_MINUTE_BOUNDS, only known repair kinds); absent or malformed anywhere is the
+ * whole default (off, report-only). Always a fresh, deeply frozen object with the keys in
+ * canonical order.
  */
 export function resolveConductorPolicy(policy: PolicySection | undefined): ResolvedConductorPolicy {
-  const block = policy?.conductor;
-  if (block === undefined) {
+  if (!isPlainRecord(policy) || !Object.hasOwn(policy, 'conductor')) {
     return freshDefaultConductorPolicy();
   }
-  if (!isPlainRecord(block)) {
+  const block = readOwnDataProperty(policy, 'conductor');
+  if (!isPlainRecord(block) || hasUnknownKeys(block, CONDUCTOR_KEYS)) {
     return freshDefaultConductorPolicy();
   }
-  const enabled = Object.hasOwn(block, 'enabled') ? block.enabled : undefined;
-  if (enabled !== undefined && typeof enabled !== 'boolean') {
+  const enabled = readOwnDataProperty(block, 'enabled');
+  if (typeof enabled !== 'boolean') {
     return freshDefaultConductorPolicy();
   }
   const stopGraceMinutes = readConductorMinute(
-    block.stopGraceMinutes,
+    readOwnDataProperty(block, 'stopGraceMinutes'),
     CONDUCTOR_MINUTE_BOUNDS.stopGraceMinutes,
   );
   if (Object.hasOwn(block, 'stopGraceMinutes') && stopGraceMinutes === undefined) {
     return freshDefaultConductorPolicy();
   }
-  const reaperValue = block.reaper;
-  if (reaperValue !== undefined && !isPlainRecord(reaperValue)) {
-    return freshDefaultConductorPolicy();
-  }
   let reaper: ResolvedConductorReaperPolicy | undefined;
-  if (reaperValue !== undefined) {
-    const reaperEnabled = Object.hasOwn(reaperValue, 'enabled')
-      ? reaperValue.enabled
-      : undefined;
-    if (reaperEnabled !== undefined && typeof reaperEnabled !== 'boolean') {
+  if (Object.hasOwn(block, 'reaper')) {
+    const reaperValue = readOwnDataProperty(block, 'reaper');
+    if (!isPlainRecord(reaperValue) || hasUnknownKeys(reaperValue, CONDUCTOR_REAPER_KEYS)) {
+      return freshDefaultConductorPolicy();
+    }
+    const reaperEnabled = readOwnDataProperty(reaperValue, 'enabled');
+    if (typeof reaperEnabled !== 'boolean') {
       return freshDefaultConductorPolicy();
     }
     const intervalMinutes = readConductorMinute(
-      reaperValue.intervalMinutes,
+      readOwnDataProperty(reaperValue, 'intervalMinutes'),
       CONDUCTOR_MINUTE_BOUNDS.intervalMinutes,
     );
     if (Object.hasOwn(reaperValue, 'intervalMinutes') && intervalMinutes === undefined) {
       return freshDefaultConductorPolicy();
     }
     const graceMinutes = readConductorMinute(
-      reaperValue.graceMinutes,
+      readOwnDataProperty(reaperValue, 'graceMinutes'),
       CONDUCTOR_MINUTE_BOUNDS.graceMinutes,
     );
     if (Object.hasOwn(reaperValue, 'graceMinutes') && graceMinutes === undefined) {
       return freshDefaultConductorPolicy();
     }
     const staleStopMinutes = readConductorMinute(
-      reaperValue.staleStopMinutes,
+      readOwnDataProperty(reaperValue, 'staleStopMinutes'),
       CONDUCTOR_MINUTE_BOUNDS.staleStopMinutes,
     );
     if (Object.hasOwn(reaperValue, 'staleStopMinutes') && staleStopMinutes === undefined) {
       return freshDefaultConductorPolicy();
     }
-    const repairs = readConductorRepairs(reaperValue.repairs);
-    if (reaperValue.repairs !== undefined && repairs === undefined) {
-      return freshDefaultConductorPolicy();
+    let repairs: Readonly<Record<ConductorReaperRepairKind, boolean>> | undefined;
+    if (Object.hasOwn(reaperValue, 'repairs')) {
+      repairs = readConductorRepairs(readOwnDataProperty(reaperValue, 'repairs'));
+      if (repairs === undefined) {
+        return freshDefaultConductorPolicy();
+      }
     }
     reaper = Object.freeze({
-      enabled: reaperEnabled === undefined ? true : (reaperEnabled as boolean),
+      enabled: reaperEnabled,
       intervalMinutes: intervalMinutes ?? 10,
       graceMinutes: graceMinutes ?? 5,
       staleStopMinutes: staleStopMinutes ?? 30,
@@ -518,7 +551,7 @@ export function resolveConductorPolicy(policy: PolicySection | undefined): Resol
     });
   }
   return Object.freeze({
-    enabled: enabled === undefined ? false : (enabled as boolean),
+    enabled,
     stopGraceMinutes: stopGraceMinutes ?? 45,
     reaper: reaper ?? freshDefaultConductorReaper(),
   });

@@ -57,3 +57,20 @@
   overflow-wrap: anywhere;
   margin: 0;
 }
+
+/* Seat, model and usage chips (W10) */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+}
+
+/* A long model id wraps inside its chip instead of overflowing the row at phone width. */
+.chips > * {
+  max-width: 100%;
+  height: auto;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+

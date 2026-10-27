@@ -1,9 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { Badge } from "@fleet/ui";
+import { Badge, Chip } from "@fleet/ui";
 import type { AttemptSummary, WorkOrderSummary } from "../fixture";
 import {
+  attemptsOf,
   isLive,
   laneIdLine,
   liveViewHref,
@@ -11,6 +12,15 @@ import {
   summary,
   woOf,
 } from "../derive";
+import {
+  modelChipText,
+  seatChipText,
+  sumUsage,
+  usageChip,
+  usageSumText,
+  type UsageInput,
+} from "../../../lib/usage-view";
+import { workOrderHref } from "../../work-order/timeline-view";
 import { LiveClock } from "./live-clock";
 import styles from "../lanes.module.css";
 
@@ -20,6 +30,10 @@ export interface LaneRowProps {
   attempts: AttemptSummary[];
   selected: boolean;
   onSelect: () => void;
+}
+
+function toInput(a: AttemptSummary): UsageInput {
+  return { runner: a.recordedRunner ?? null, usage: a.recordedUsage ?? null };
 }
 
 export function LaneRow({
@@ -33,6 +47,9 @@ export function LaneRow({
   const wo = woOf(attempt, workOrders);
   const href = liveViewHref(attempt);
   const live = isLive(attempt);
+  const recorded = attempt.basis === "recorded";
+  const input = toInput(attempt);
+  const chip = usageChip(input);
   return (
     <li className={`${styles.lane}${selected ? ` ${styles.laneSel}` : ""}`}>
       <div className={styles.laneRow}>
@@ -66,6 +83,25 @@ export function LaneRow({
           <span className={`${styles.sub} ${styles.mono} ${styles.idline}`}>
             {laneIdLine(attempt, attempts)}
           </span>
+          {recorded ? (
+            <span className={styles.chips}>
+              <Chip
+                mono
+                title="recorded runner seat, not a runner observation"
+              >
+                {seatChipText(input.runner)}
+              </Chip>
+              <Chip mono title="recorded model">
+                {modelChipText(input)}
+              </Chip>
+              <Chip
+                tone={chip.estimate ? "warn" : "neutral"}
+                title={chip.title}
+              >
+                {chip.text}
+              </Chip>
+            </span>
+          ) : null}
         </button>
         {href !== null ? (
           <Link className={styles.openLink} href={href}>
@@ -84,6 +120,16 @@ export function LaneRow({
       {selected ? (
         <div className={`${styles.laneMore} ${styles.mono}`}>
           {observedLine(attempt, note)}
+          {recorded ? (
+            <span className={styles.woSum}>
+              work order {attempt.wo}:{" "}
+              {usageSumText(
+                sumUsage(attemptsOf(attempt.wo, attempts).map(toInput)),
+              )}
+              {" · counted over the listed attempts "}
+              <Link href={workOrderHref(attempt.wo)}>timeline</Link>
+            </span>
+          ) : null}
         </div>
       ) : null}
     </li>

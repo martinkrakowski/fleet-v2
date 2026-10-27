@@ -145,33 +145,104 @@ export class CoordinationRequest {
   }
 
   private static readPolicyGrant(record: CoordinationRequestRecord): PolicyGrantRecord | undefined {
-    if (record.policyGrant === undefined) {
+    let descriptor: PropertyDescriptor | undefined;
+    
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(record, 'policyGrant');
+    } catch {
+      throw new Error('PolicyGrant validation failed due to a prohibited Proxy trap execution.');
+    }
+    
+    if (descriptor === undefined) {
       return undefined;
     }
-    const raw: unknown = record.policyGrant;
-    const grantKeys = ['workOrderId', 'attemptId', 'acceptanceReceiptId'];
-    if (
-      typeof raw !== 'object' ||
-      raw === null ||
-      Array.isArray(raw) ||
-      Object.keys(raw).length !== grantKeys.length ||
-      !grantKeys.every((key) => Object.keys(raw).includes(key))
-    ) {
+    
+    if (descriptor.get || descriptor.set) {
+      throw new Error('CoordinationRequest policyGrant cannot be an accessor property.');
+    }
+    
+    const raw: unknown = descriptor.value;
+    
+    if (raw === undefined) {
+      return undefined;
+    }
+    
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
       throw new Error(
         'CoordinationRequest policyGrant must be { workOrderId, attemptId, acceptanceReceiptId }',
       );
     }
+
+    let proto: unknown;
+    let ownKeys: PropertyKey[];
+    
+    try {
+      proto = Object.getPrototypeOf(raw);
+      ownKeys = Reflect.ownKeys(raw);
+    } catch {
+      throw new Error('PolicyGrant validation failed due to a prohibited Proxy trap execution.');
+    }
+    
+    if (proto !== Object.prototype && proto !== null) {
+      throw new Error('CoordinationRequest policyGrant must only use Object.prototype or null as its prototype.');
+    }
+    
+    let keyDescriptors: Array<[PropertyKey, PropertyDescriptor | undefined]>;
+    
+    try {
+      keyDescriptors = ownKeys.map(key => [key, Object.getOwnPropertyDescriptor(raw, key)]);
+    } catch {
+      throw new Error('PolicyGrant validation failed due to a prohibited Proxy trap execution.');
+    }
+    
+    // Now validate the snapshot and build the stored copy.
+    const keys: string[] = [];
+    
+    for (const [key, keyDescriptor] of keyDescriptors) {
+      if (typeof key !== 'string' || key.length === 0) {
+        throw new Error('Policy grant key must be a non-empty string.');
+      }
+      if (!keyDescriptor || keyDescriptor.get || keyDescriptor.set || keyDescriptor.enumerable === false) {
+        throw new Error('Policy grant property must be an enumerable data property.');
+      }
+      keys.push(key);
+    }
+    
+    const grantKeys = ['workOrderId', 'attemptId', 'acceptanceReceiptId'];
+    if (keys.length !== grantKeys.length || !grantKeys.every((k) => keys.includes(k))) {
+      throw new Error(
+        'CoordinationRequest policyGrant must be { workOrderId, attemptId, acceptanceReceiptId }',
+      );
+    }
+    
+    const collected: Record<string, string> = {};
     for (const key of grantKeys) {
-      const value = (raw as Record<string, unknown>)[key];
+      let value: unknown;
+      try {
+        value = (raw as Record<string, unknown>)[key];
+      } catch {
+        throw new Error('PolicyGrant validation failed due to a prohibited Proxy trap execution.');
+      }
+      
       if (typeof value !== 'string' || value.trim().length === 0 || value.length > 256) {
         throw new Error(
           'CoordinationRequest policyGrant must be { workOrderId, attemptId, acceptanceReceiptId }',
         );
       }
+      
+      collected[key] = value;
     }
+    
+    const grant: PolicyGrantRecord = {
+      workOrderId: collected.workOrderId,
+      attemptId: collected.attemptId,
+      acceptanceReceiptId: collected.acceptanceReceiptId,
+    };
+    
     if (record.kind !== 'action-decision') {
       throw new Error('CoordinationRequest policy grant must be an action-decision');
     }
+    
     const parsed = parsePolicyDecisionRevision(record.decisionRevision);
     if (parsed === null) {
       throw new Error('CoordinationRequest policy grant must carry a policy decision revision');
@@ -183,12 +254,8 @@ export class CoordinationRequest {
     if (record.expectedHeadSha === null) {
       throw new Error('CoordinationRequest policy grant requires an expected head');
     }
-    const grant = raw as PolicyGrantRecord;
-    return Object.freeze({
-      workOrderId: grant.workOrderId,
-      attemptId: grant.attemptId,
-      acceptanceReceiptId: grant.acceptanceReceiptId,
-    });
+    
+    return Object.freeze(grant);
   }
 
   getId(): string {

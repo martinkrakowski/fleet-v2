@@ -210,6 +210,118 @@ describe('CoordinationRequest.fromRecord rejects an invalid policyGrant', () => 
   });
 });
 
+describe('CoordinationRequest.fromRecord policy grant scope pairings', () => {
+  it('pairs push-and-open-pr with the conductor setting', () => {
+    const record = requestRecord({
+      actionScope: 'forge:push-and-open-pr',
+      decisionRevision: 'policy:conductor@309ab8c40bf2',
+      policyGrant: VALID_GRANT,
+    });
+    const entity = CoordinationRequest.fromRecord(record);
+    expect(entity.isPolicyGrant()).toBe(true);
+    expect(entity.toRecord()).toEqual(record);
+  });
+
+  it('refuses push-and-open-pr paired with autoMerge', () => {
+    expect(() =>
+      CoordinationRequest.fromRecord(
+        requestRecord({
+          actionScope: 'forge:push-and-open-pr',
+          policyGrant: VALID_GRANT,
+        }),
+      ),
+    ).toThrow('CoordinationRequest policy grant scope does not match its setting');
+  });
+});
+
+describe('CoordinationRequest.fromRecord refuses a hostile policyGrant', () => {
+  it('refuses a grant whose field is a getter without running it', () => {
+    let ran = false;
+    const grant = { ...VALID_GRANT } as PolicyGrantRecord;
+    Object.defineProperty(grant, 'workOrderId', {
+      get() {
+        ran = true;
+        return 'wo-example-a';
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    expect(() =>
+      CoordinationRequest.fromRecord(requestRecord({ policyGrant: grant })),
+    ).toThrow('Policy grant property must be an enumerable data property.');
+    expect(ran).toBe(false);
+  });
+
+  it('refuses a grant with a custom prototype', () => {
+    const grant = Object.assign(
+      Object.create({ extra: true }) as object,
+      VALID_GRANT,
+    ) as PolicyGrantRecord;
+    expect(() =>
+      CoordinationRequest.fromRecord(requestRecord({ policyGrant: grant })),
+    ).toThrow(
+      'CoordinationRequest policyGrant must only use Object.prototype or null as its prototype.',
+    );
+  });
+
+  it('refuses a proxy whose get trap throws without leaking the message', () => {
+    const grant = new Proxy({ ...VALID_GRANT } as PolicyGrantRecord, {
+      get() {
+        throw new Error('secret-get-text');
+      },
+    });
+    expect(() =>
+      CoordinationRequest.fromRecord(requestRecord({ policyGrant: grant })),
+    ).toThrow('PolicyGrant validation failed due to a prohibited Proxy trap execution.');
+    let message = '';
+    try {
+      CoordinationRequest.fromRecord(requestRecord({ policyGrant: grant }));
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).not.toContain('secret-get-text');
+  });
+
+  it('refuses a proxy whose ownKeys trap throws without leaking the message', () => {
+    const grant = new Proxy({ ...VALID_GRANT } as PolicyGrantRecord, {
+      ownKeys() {
+        throw new Error('secret-ownkeys-text');
+      },
+    });
+    expect(() =>
+      CoordinationRequest.fromRecord(requestRecord({ policyGrant: grant })),
+    ).toThrow('PolicyGrant validation failed due to a prohibited Proxy trap execution.');
+    let message = '';
+    try {
+      CoordinationRequest.fromRecord(requestRecord({ policyGrant: grant }));
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).not.toContain('secret-ownkeys-text');
+  });
+
+  it('refuses a grant object with a symbol key', () => {
+    const grant = { ...VALID_GRANT } as unknown as PolicyGrantRecord;
+    (grant as unknown as Record<symbol, unknown>)[Symbol('hidden')] = 'x';
+    expect(() =>
+      CoordinationRequest.fromRecord(requestRecord({ policyGrant: grant })),
+    ).toThrow('Policy grant key must be a non-empty string.');
+  });
+
+  it('refuses a grant object with a non-enumerable key', () => {
+    const grant = { ...VALID_GRANT } as unknown as PolicyGrantRecord;
+    Object.defineProperty(grant, 'hidden', {
+      value: 'x',
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+    expect(() =>
+      CoordinationRequest.fromRecord(requestRecord({ policyGrant: grant })),
+    ).toThrow('Policy grant property must be an enumerable data property.');
+  });
+});
+
 describe('isPolicyGrantRecord', () => {
   it('is true for a policy-prefixed decision revision even without policyGrant', () => {
     expect(

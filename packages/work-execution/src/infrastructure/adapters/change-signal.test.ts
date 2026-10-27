@@ -202,6 +202,7 @@ describe('change signals: AttemptRepositoryAdapter', () => {
     const adapter = new AttemptRepositoryAdapter({ stateDir: tempDir, changeSignal: signals });
 
     await adapter.saveAttempt(makeAttempt());
+    expect(signals.lockHeldAtEmit.length).toBeGreaterThan(0);
     signals.clear();
     expect(signals.signals).toHaveLength(0);
     expect(signals.lockHeldAtEmit).toHaveLength(0);

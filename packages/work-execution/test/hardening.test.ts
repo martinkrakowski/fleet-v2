@@ -253,7 +253,7 @@ describe('CollectAttemptArtifactsUseCase hardening', () => {
 describe('PrepareFixAttemptUseCase hardening', () => {
   it('refuses worktreePath that does not match prior attempt', async () => {
     const attemptRepo = new InMemoryAttemptRepo();
-    const prior = createMockAttempt({ id: 'att-prior' });
+    const prior = createMockAttempt({ id: 'att-prior', state: 'collected' });
     await attemptRepo.saveAttempt(prior);
 
     const useCase = new PrepareFixAttemptUseCase({ attemptRepo });
@@ -274,7 +274,7 @@ describe('PrepareFixAttemptUseCase hardening', () => {
 
   it('refuses baseCommit that does not match prior attempt', async () => {
     const attemptRepo = new InMemoryAttemptRepo();
-    const prior = createMockAttempt({ id: 'att-prior' });
+    const prior = createMockAttempt({ id: 'att-prior', state: 'collected' });
     await attemptRepo.saveAttempt(prior);
 
     const useCase = new PrepareFixAttemptUseCase({ attemptRepo });
@@ -295,7 +295,7 @@ describe('PrepareFixAttemptUseCase hardening', () => {
 
   it('succeeds and copies worktreePath and baseCommit from prior attempt when omitted', async () => {
     const attemptRepo = new InMemoryAttemptRepo();
-    const prior = createMockAttempt({ id: 'att-prior' });
+    const prior = createMockAttempt({ id: 'att-prior', state: 'collected' });
     await attemptRepo.saveAttempt(prior);
 
     const useCase = new PrepareFixAttemptUseCase({ attemptRepo });
@@ -318,7 +318,7 @@ describe('PrepareFixAttemptUseCase hardening', () => {
 
   it('succeeds when provided worktreePath and baseCommit match prior attempt', async () => {
     const attemptRepo = new InMemoryAttemptRepo();
-    const prior = createMockAttempt({ id: 'att-prior' });
+    const prior = createMockAttempt({ id: 'att-prior', state: 'collected' });
     await attemptRepo.saveAttempt(prior);
 
     const useCase = new PrepareFixAttemptUseCase({ attemptRepo });

@@ -2041,6 +2041,10 @@ describe('DispatchAttemptUseCase', () => {
       'attempt-1',
       storedAttempt({ id: 'attempt-1', kind: 'fix', fixNumber: 1, priorAttemptId: 'attempt-0', state: 'intent-recorded' }),
     );
+    setup.attemptRepo.attempts.set(
+      'attempt-0',
+      storedAttempt({ id: 'attempt-0', state: 'collected', sessionId: 'session-0' }),
+    );
 
     const result = await setup.useCase.dispatchAttempt(
       validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
@@ -4072,7 +4076,7 @@ function makeFixSetup(options: { prior?: Partial<AttemptRecord>; existingFix?: A
   const attemptRepo = makeAttemptRepo();
   attemptRepo.attempts.set(
     'attempt-1',
-    storedAttempt({ state: 'ended', fixNumber: 0, kind: 'initial', ...options.prior }),
+    storedAttempt({ state: 'collected', fixNumber: 0, kind: 'initial', ...options.prior }),
   );
   if (options.existingFix) {
     attemptRepo.attempts.set(options.existingFix.id, options.existingFix);
@@ -4149,7 +4153,7 @@ describe('PrepareFixAttemptUseCase', () => {
     expect(otherResult).toEqual({ outcome: 'refused', reason: 'Prior attempt not found for work order' });
   });
 
-  it.each(['running', 'reconciling', 'dispatching', 'intent-recorded', 'blocked'] as const)(
+  it.each(['running', 'reconciling', 'dispatching', 'intent-recorded', 'blocked', 'ended'] as const)(
     'refuses a fix attempt while the prior attempt is still $state',
     async (state) => {
       const setup = makeFixSetup({ prior: { state } });
@@ -4158,7 +4162,7 @@ describe('PrepareFixAttemptUseCase', () => {
       );
       expect(result).toEqual({
         outcome: 'refused',
-        reason: 'Cannot prepare fix attempt before prior attempt has ended',
+        reason: `Prior attempt attempt-1 is ${state}; a fix attempt starts only after it is collected or cancelled`,
       });
     },
   );

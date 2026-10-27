@@ -146,7 +146,11 @@ function makeWorkOrderRepo(): WorkOrderRepositoryPort {
   };
 }
 
-const attemptRepo = {} as AttemptRepositoryPort;
+const attemptRepo = {
+  async findAttemptById() {
+    return null;
+  },
+} as unknown as AttemptRepositoryPort;
 
 function makeDispatchUseCase(executor: CommandExecutorPort): DispatchAttemptUseCase {
   return new DispatchAttemptUseCase({

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { RunIndependentReviewRequest } from '../../../application/ports/out/IndependentReviewPort.out-port.js';
+import type { CliReviewSpawn } from '../CliReviewTransport.adapter.js';
 import { IndependentReviewAdapter } from '../IndependentReviewAdapter.adapter.js';
 import type { OcmReviewTransportSpawn } from '../OcmReviewTransport.adapter.js';
 import {
@@ -389,5 +390,124 @@ describe('ReviewTransportRouter', () => {
     if (unknownModel.outcome === 'unavailable') {
       expect(unknownModel.reason).toContain('No reviewer seat');
     }
+  });
+
+  describe('CLI review transport routing (RW4)', () => {
+    const CLI_REVIEWER_SEAT: ReviewTransportSeat = {
+      id: 'cli-reviewer',
+      tool: 'grok',
+      model: 'grok-4.7',
+      roles: ['reviewer'],
+    };
+
+    const CLI_CHAINS: ReviewTransportChains = {
+      reviewer: [{ seatId: 'cli-reviewer' }],
+    };
+
+    const CLI_REQUEST: RunIndependentReviewRequest = {
+      attemptId: 'att-cli',
+      candidateHeadSha: 'sha-candidate-head',
+      implementerModel: IMPLEMENTER_SEAT.model,
+      reviewerModel: 'grok-4.7',
+    };
+
+    function cliLocation(route: ReviewRunnerRoute): ReviewLocation {
+      return {
+        worktreePath: '/srv/fleet/worktrees/att-cli',
+        baseCommit: 'base-sha',
+        route,
+        readHead: async () => CLI_REQUEST.candidateHeadSha,
+        readStatus: async () => '',
+        readDiff: async () => 'diff --git a/a.txt b/a.txt\n-old\n+new\n',
+      };
+    }
+
+    const CLI_STDOUT = 'FINDING: minor a.txt:1 wording\nVERDICT: PASS\n';
+
+    it('routes a grok seat to the CLI transport and a none route does not block it', async () => {
+      const recorded: Array<{ file: string; args: readonly string[] }> = [];
+      const cliSpawn: CliReviewSpawn = async (file, args) => {
+        recorded.push({ file, args });
+        return { exitCode: 0, signal: null, stdout: CLI_STDOUT, stderr: '' };
+      };
+      let ocmCalled = false;
+      const ocmSpawn: OcmReviewTransportSpawn = async () => {
+        ocmCalled = true;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const router = createReviewTransportRouter({
+        seats: [CLI_REVIEWER_SEAT],
+        chains: CLI_CHAINS,
+        locate: async () => cliLocation({ kind: 'none', reason: 'agy host' }),
+        ocmRunBin: '/bundled/bin/ocm-run',
+        cliSpawn,
+        ocmSpawn,
+        makeNonce: () => 'a'.repeat(32),
+      });
+
+      const result = await router(CLI_REQUEST);
+
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0].file).toBe('grok');
+      expect(recorded[0].args[0]).toBe('-m');
+      expect(recorded[0].args[1]).toBe('grok-4.7');
+      expect(ocmCalled).toBe(false);
+      expect(result.result).toBe('pass');
+      expect(result.readOnlyVerified).toBe(true);
+    });
+
+    it('rejects a CLI seat that sets a variant and spawns nothing', async () => {
+      const seat = { ...CLI_REVIEWER_SEAT, variant: 'fast' };
+      let cliCalled = false;
+      let ocmCalled = false;
+      const router = createReviewTransportRouter({
+        seats: [seat],
+        chains: CLI_CHAINS,
+        locate: async () => cliLocation({ kind: 'none', reason: 'agy host' }),
+        ocmRunBin: '/bundled/bin/ocm-run',
+        cliSpawn: async () => {
+          cliCalled = true;
+          return { exitCode: 0, signal: null, stdout: CLI_STDOUT, stderr: '' };
+        },
+        ocmSpawn: async () => {
+          ocmCalled = true;
+          return { exitCode: 0, stdout: '', stderr: '' };
+        },
+      });
+
+      await expect(router(CLI_REQUEST)).rejects.toThrow(/does not support/);
+      expect(cliCalled).toBe(false);
+      expect(ocmCalled).toBe(false);
+    });
+
+    it('still rejects an agy seat as having no review transport', async () => {
+      const agySeat: ReviewTransportSeat = {
+        id: 'reviewer',
+        tool: 'agy',
+        model: 'grok-4.7',
+        roles: ['reviewer'],
+      };
+      let cliCalled = false;
+      let ocmCalled = false;
+      const router = createReviewTransportRouter({
+        seats: [agySeat],
+        chains: { reviewer: [{ seatId: 'reviewer' }] },
+        locate: async () => cliLocation({ kind: 'installation', remotePort: 46000, remoteHost: '' }),
+        ocmRunBin: '/bundled/bin/ocm-run',
+        cliSpawn: async () => {
+          cliCalled = true;
+          return { exitCode: 0, signal: null, stdout: CLI_STDOUT, stderr: '' };
+        },
+        ocmSpawn: async () => {
+          ocmCalled = true;
+          return { exitCode: 0, stdout: '', stderr: '' };
+        },
+      });
+
+      await expect(router(CLI_REQUEST)).rejects.toThrow(/which has no review transport/);
+      expect(cliCalled).toBe(false);
+      expect(ocmCalled).toBe(false);
+    });
   });
 });

@@ -10,6 +10,7 @@
  */
 
 import type { EvidenceAssessmentRecord } from '../../../domain/evidence-records.js';
+import type { ReviewTally } from '../../../domain/review-selection.js';
 
 export interface AssessHeadAcceptanceRequest {
   readonly assessmentId: string;
@@ -19,8 +20,8 @@ export interface AssessHeadAcceptanceRequest {
 }
 
 export type AssessHeadAcceptanceResult =
-  | { readonly outcome: 'accepted'; readonly receiptId: string; readonly candidateHeadSha: string; readonly assessment: EvidenceAssessmentRecord }
-  | { readonly outcome: 'blocked'; readonly blockers: readonly string[]; readonly assessment?: EvidenceAssessmentRecord }
+  | { readonly outcome: 'accepted'; readonly receiptId: string; readonly candidateHeadSha: string; readonly assessment: EvidenceAssessmentRecord; readonly reviewTally?: ReviewTally }
+  | { readonly outcome: 'blocked'; readonly blockers: readonly string[]; readonly assessment?: EvidenceAssessmentRecord; readonly reviewTally?: ReviewTally }
   | { readonly outcome: 'stale'; readonly reason: string }
   | { readonly outcome: 'rejected'; readonly reason: string };
 

@@ -14,6 +14,8 @@
  */
 
 import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain/evidence-records.js';
+import type { ReviewTally } from '../../domain/review-selection.js';
+import { latestReceiptPerReviewer, tallyReviews } from '../../domain/review-selection.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
@@ -89,21 +91,21 @@ function collectCheckBlockers(assessment: EvidenceAssessmentRecord): readonly st
 }
 
 /**
- * At least one attributable read-only review that passed for this head, where
- * every receipt counted is re-checked against the implementer seat the
- * assessment recorded at creation: a reviewer sharing the implementer's
- * underlying model family, or a receipt whose implementer field differs from
- * the recorded seat, is not independent evidence and is named as a blocker.
+ * Head-filtered review receipts broken into independence blockers and the
+ * latest independent read-only receipt per reviewer model. Recording order
+ * wins — the last receipt in the assessment's append-only `reviewReceipts`,
+ * never `completedAtIso`.
  */
-function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly string[] {
+function selectReviewEvidence(assessment: EvidenceAssessmentRecord): {
+  readonly reviews: readonly ReviewReceiptRecord[];
+  readonly blockers: readonly string[];
+  readonly latest: readonly ReviewReceiptRecord[];
+} {
   const reviews: readonly ReviewReceiptRecord[] = assessment.reviewReceipts.filter(
     (receipt) => receipt.candidateHeadSha === assessment.candidateHeadSha,
   );
-  if (reviews.length === 0) {
-    return ['no independent review was recorded for this candidate head'];
-  }
   const blockers: string[] = [];
-  let passing = false;
+  const counted: ReviewReceiptRecord[] = [];
   for (const receipt of reviews) {
     if (receipt.implementerModel !== assessment.implementerModel) {
       blockers.push(
@@ -122,14 +124,48 @@ function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly s
       );
       continue;
     }
-    if (receipt.readOnlyVerified && receipt.result === 'pass') {
-      passing = true;
+    if (receipt.readOnlyVerified) {
+      counted.push(receipt);
     }
   }
+  return { reviews, blockers, latest: latestReceiptPerReviewer(counted) };
+}
+
+/**
+ * At least one attributable read-only review that passed for this head, where
+ * every receipt counted is re-checked against the implementer seat the
+ * assessment recorded at creation: a reviewer sharing the implementer's
+ * underlying model family, or a receipt whose implementer field differs from
+ * the recorded seat, is not independent evidence and is named as a blocker.
+ *
+ * Among the independent read-only receipts, the latest per reviewer model
+ * decides — recording order wins, never `completedAtIso` — and any of those
+ * that says `fail` blocks acceptance even when another reviewer passed.
+ * Agreement between reviewers never strengthens a result.
+ */
+function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly string[] {
+  const selection = selectReviewEvidence(assessment);
+  if (selection.reviews.length === 0) {
+    return ['no independent review was recorded for this candidate head'];
+  }
+  const blockers = [...selection.blockers];
+  for (const receipt of selection.latest) {
+    if (receipt.result === 'fail') {
+      blockers.push(
+        `review by '${receipt.reviewerModel}' failed for this head (receipt '${receipt.id}')`,
+      );
+    }
+  }
+  const passing = selection.latest.some((receipt) => receipt.result === 'pass');
   if (!passing && blockers.length === 0) {
     return ['no read-only independent review passed for this candidate head'];
   }
   return blockers;
+}
+
+/** The review tally for the assessment, derived without affecting the verdict. */
+export function reviewTallyFor(assessment: EvidenceAssessmentRecord): ReviewTally {
+  return tallyReviews(selectReviewEvidence(assessment).latest);
 }
 
 /**
@@ -256,6 +292,7 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
         receiptId: assessment.acceptanceReceiptId ?? '',
         candidateHeadSha: assessment.candidateHeadSha,
         assessment,
+        reviewTally: reviewTallyFor(assessment),
       };
     }
 
@@ -304,6 +341,7 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       receiptId,
       candidateHeadSha: assessment.candidateHeadSha,
       assessment: accepted,
+      reviewTally: reviewTallyFor(accepted),
     };
   }
 
@@ -382,6 +420,11 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
     aggregate.block(blockers, nowIso);
     const updated = aggregate.toRecord();
     await deps.repo.saveAssessment(updated);
-    return { outcome: 'blocked', blockers, assessment: updated };
+    return {
+      outcome: 'blocked',
+      blockers,
+      assessment: updated,
+      reviewTally: reviewTallyFor(updated),
+    };
   }
 }

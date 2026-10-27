@@ -1008,7 +1008,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
     }
   });
 
-  it('blocks when no read-only independent review passed for the head', async () => {
+  it('blocks when an independent read-only review failed for the head', async () => {
     const repo = fakeRepository([
       completeEvidence({
         reviewReceipts: [reviewReceipt({ result: 'fail' })],
@@ -1023,7 +1023,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
       throw new Error('expected a blocked assessment');
     }
     expect(result.blockers).toEqual([
-      'no read-only independent review passed for this candidate head',
+      "review by 'openrouter/poolside/laguna-s-2.1' failed for this head (receipt 'rr-1')",
     ]);
   });
 

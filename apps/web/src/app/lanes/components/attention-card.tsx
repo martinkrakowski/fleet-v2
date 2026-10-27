@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import type { ReactNode } from "react";
 import {
   Banner,
@@ -10,7 +11,7 @@ import {
   type SemanticTone
 } from "@fleet/ui";
 import type { AttemptSummary } from "../fixture";
-import { install } from "../fixture";
+import type { QuestionSummary } from "../../questions/summary";
 import { attemptsOf, summary, unknownAttention } from "../derive";
 import styles from "../lanes.module.css";
 
@@ -47,15 +48,7 @@ function buildAttentionItems(attempts: AttemptSummary[]): AttentionItem[] {
           </>
         ),
         ss: `${note} · a ${decision.door} door · silence is not approval`,
-        rr: (
-          <a
-            href={install.wavesInboxUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            answer in Waves
-          </a>
-        )
+        rr: <Link href="/questions">open Questions</Link>
       });
     }
     if (
@@ -119,17 +112,46 @@ function buildAttentionItems(attempts: AttemptSummary[]): AttentionItem[] {
   return items;
 }
 
-export function AttentionCard({ attempts }: { attempts: AttemptSummary[] }) {
+function questionItem(summary: QuestionSummary): AttentionItem | null {
+  if (summary.status === "error") {
+    return {
+      tone: "warn",
+      tt: "Owner questions not read",
+      ss: summary.reason,
+    };
+  }
+  if (summary.status === "not-read" || summary.open === 0) {
+    return null;
+  }
+  return {
+    tone: "decision",
+    tt: `${summary.open} open owner ${
+      summary.open === 1 ? "question" : "questions"
+    }`,
+    ss: `${summary.oneWay} one-way (need the owner's signed decision) · ${summary.blocking} blocking · recorded, not answered here`,
+    rr: <Link href="/questions?state=open">open Questions</Link>,
+  };
+}
+
+export function AttentionCard({
+  attempts,
+  questions,
+}: {
+  attempts: AttemptSummary[];
+  questions: QuestionSummary;
+}) {
+  const question = questionItem(questions);
   const items = buildAttentionItems(attempts);
+  const allItems = question ? [question, ...items] : items;
   return (
     <Card className={styles.attnCard}>
       <CardHeader
         title="Needs attention"
-        actions={<span className={styles.meta}>{items.length}</span>}
+        actions={<span className={styles.meta}>{allItems.length}</span>}
       />
       <CardBody>
-        {items.length > 0 ? (
-          items.map((item, i) => (
+        {allItems.length > 0 ? (
+          allItems.map((item, i) => (
             <Banner
               key={i}
               tone={item.tone}

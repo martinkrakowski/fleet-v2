@@ -72,16 +72,26 @@ const VIEWS = [
   },
 ];
 
-export function ViewNav() {
+function countSuffix(href: string, openQuestions: number | null): string {
+  if (href !== "/questions" || openQuestions === null) return "";
+  if (openQuestions === 0) return " (none open)";
+  return " (" + openQuestions + " open)";
+}
+
+export function ViewNav({
+  openQuestions,
+}: {
+  openQuestions: number | null;
+}) {
   const pathname = usePathname();
   return (
     <div className="sidebar-section">
       <div className="sidebar-label">Views</div>
       <nav className="sidebar-nav" aria-label="Views">
         {VIEWS.map((view) => {
-          const name = view.sample
-            ? view.label + " (sample data)"
-            : view.label;
+          const name =
+            (view.sample ? view.label + " (sample data)" : view.label) +
+            countSuffix(view.href, openQuestions);
           return (
             <Link
               key={view.href}
@@ -100,6 +110,11 @@ export function ViewNav() {
                   <span className="sidebar-link-sample">sample</span>
                 ) : null}
               </span>
+              {view.href === "/questions" &&
+              openQuestions !== null &&
+              openQuestions > 0 ? (
+                <span className="sidebar-badge">{openQuestions}</span>
+              ) : null}
             </Link>
           );
         })}

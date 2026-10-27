@@ -12,6 +12,7 @@ import {
   Switch
 } from "@fleet/ui";
 import type { LanesData } from "./live";
+import type { QuestionSummary } from "../questions/summary";
 import { STATE_ORDER, kpiScopeNote, summary, woOf } from "./derive";
 import { NOT_CONFIGURED_REASON, useAutoRefresh } from "./use-auto-refresh";
 import { LanesKpiRow } from "./components/lanes-kpi-row";
@@ -21,7 +22,13 @@ import { CapacityCard } from "./components/capacity-card";
 import { AttentionCard } from "./components/attention-card";
 import styles from "./lanes.module.css";
 
-export function LanesClient({ data }: { data: LanesData }) {
+export function LanesClient({
+  data,
+  questions,
+}: {
+  data: LanesData;
+  questions: QuestionSummary;
+}) {
   useAutoRefresh(data.source, data.fallbackReason);
   const [showEnded, setShowEnded] = useState(true);
   const [stateFilter, setStateFilter] = useState("");
@@ -171,7 +178,7 @@ export function LanesClient({ data }: { data: LanesData }) {
             pendingAttempts={pendingAttempts}
             capacity={data.capacity}
           />
-          <AttentionCard attempts={data.attempts} />
+          <AttentionCard attempts={data.attempts} questions={questions} />
         </div>
       </div>
     </div>

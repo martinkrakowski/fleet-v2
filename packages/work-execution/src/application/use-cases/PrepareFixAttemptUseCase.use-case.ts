@@ -1,12 +1,19 @@
 // Implemented for migration step 2 — fresh fix rounds, never resumed sessions.
 /**
  * PrepareFixAttemptUseCase: create a fresh attempt with numbered fixes after
- * the prior attempt has ended. A fix round never resumes the prior session;
- * its conversation is not the new attempt's. The new identity is created only
- * when the prior attempt is terminal for work and the fix identity is unused.
+ * the prior attempt is collected (artifact manifest sealed) or cancelled. A
+ * fix round never resumes the prior session; its conversation is not the new
+ * attempt's. The new identity is created only when no other attempt on the
+ * work order can still touch the shared worktree and the fix identity is
+ * unused.
  */
 
 import type { AttemptRecord } from '../../domain/execution-records.js';
+import {
+  FIX_READY_PRIOR_STATES,
+  FIX_NON_BLOCKING_SIBLING_STATES,
+  attemptStateLabel,
+} from '../../domain/value-objects/AttemptState.vo.js';
 import type {
   PrepareFixAttemptPort,
   PrepareFixAttemptRequest,
@@ -18,8 +25,50 @@ export interface PrepareFixAttemptDependencies {
   readonly attemptRepo: AttemptRepositoryPort;
 }
 
-/** Prior-attempt states after which a fresh fix round may be prepared. */
-const FIXABLE_PRIOR_STATES: readonly AttemptRecord['state'][] = ['ended', 'collected', 'cancelled'];
+export interface FixPriorCheckResult {
+  readonly prior: AttemptRecord | null;
+  readonly refusal: string | null;
+}
+
+/**
+ * C1b: fix attempts share the lane's worktree, so a fix attempt starts only after its prior attempt is
+ * collected (artifact manifest sealed) or cancelled, and while no other attempt on the work order can
+ * still touch the worktree. Used by prepare and by dispatch; a refusal names only ids and states.
+ */
+export async function checkFixPriorSettled(
+  attemptRepo: AttemptRepositoryPort,
+  fix: { readonly fixAttemptId: string; readonly workOrderId: string; readonly priorAttemptId: string | null },
+): Promise<FixPriorCheckResult> {
+  if (!fix.priorAttemptId || fix.priorAttemptId.trim().length === 0) {
+    return { prior: null, refusal: 'Prior attempt not found for work order' };
+  }
+  const prior = await attemptRepo.findAttemptById(fix.priorAttemptId);
+  if (!prior || prior.workOrderId !== fix.workOrderId) {
+    return { prior: null, refusal: 'Prior attempt not found for work order' };
+  }
+  if (!FIX_READY_PRIOR_STATES.includes(prior.state)) {
+    const label = attemptStateLabel(prior.state);
+    return {
+      prior,
+      refusal: `Prior attempt ${prior.id} is ${label}; a fix attempt starts only after it is collected or cancelled`,
+    };
+  }
+  const siblings = await attemptRepo.listAttemptsByWorkOrder(fix.workOrderId);
+  const blocker = siblings.find(
+    (a) =>
+      a.id !== fix.fixAttemptId &&
+      a.id !== prior.id &&
+      !FIX_NON_BLOCKING_SIBLING_STATES.includes(a.state),
+  );
+  if (blocker) {
+    const blockerLabel = attemptStateLabel(blocker.state);
+    return {
+      prior,
+      refusal: `Attempt ${blocker.id} on the same work order is ${blockerLabel}; a fix attempt starts only after it is collected or cancelled`,
+    };
+  }
+  return { prior, refusal: null };
+}
 
 function isNonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
@@ -49,13 +98,15 @@ export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
       return { outcome: 'refused', reason: 'numberedFixes must record at least one fix' };
     }
 
-    const prior = await this.deps.attemptRepo.findAttemptById(request.priorAttemptId);
-    if (!prior || prior.workOrderId !== request.workOrderId) {
-      return { outcome: 'refused', reason: 'Prior attempt not found for work order' };
+    const check = await checkFixPriorSettled(this.deps.attemptRepo, {
+      fixAttemptId: request.fixAttemptId,
+      workOrderId: request.workOrderId,
+      priorAttemptId: request.priorAttemptId,
+    });
+    if (check.refusal !== null || check.prior === null) {
+      return { outcome: 'refused', reason: check.refusal ?? 'Prior attempt not found for work order' };
     }
-    if (!FIXABLE_PRIOR_STATES.includes(prior.state)) {
-      return { outcome: 'refused', reason: 'Cannot prepare fix attempt before prior attempt has ended' };
-    }
+    const prior = check.prior;
 
     if (request.worktreePath !== undefined && request.worktreePath !== prior.worktreePath) {
       return {

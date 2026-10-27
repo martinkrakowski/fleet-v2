@@ -32,6 +32,27 @@ export const CAPACITY_RELEASE_STATES: readonly AttemptStateValue[] = [
   'cancelled',
 ];
 
+/**
+ * C1b: prior-attempt states after which a fix attempt may be prepared or dispatched in the shared
+ * worktree. `ended` is excluded: its artifact manifest is not sealed until it is collected.
+ */
+export const FIX_READY_PRIOR_STATES: readonly AttemptStateValue[] = ['collected', 'cancelled'];
+
+/** C1b: other attempts on the work order in these states do not block a fix attempt. */
+export const FIX_NON_BLOCKING_SIBLING_STATES: readonly AttemptStateValue[] = [
+  'intent-recorded',
+  'collected',
+  'cancelled',
+];
+
+/** A state as a refusal may print it: a declared state, otherwise `'unknown'` (never the raw value). */
+export function attemptStateLabel(value: unknown): AttemptStateValue | 'unknown' {
+  if (typeof value === 'string' && ATTEMPT_STATE_VALUES.includes(value)) {
+    return value as AttemptStateValue;
+  }
+  return 'unknown';
+}
+
 export class AttemptState {
   private constructor(private readonly value: AttemptStateValue) {
     // Value is immutable after construction.

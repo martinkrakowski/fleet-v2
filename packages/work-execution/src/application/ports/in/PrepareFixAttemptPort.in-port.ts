@@ -1,8 +1,9 @@
 // @generated inbound contract scaffold — refined for migration step 1.
 /**
  * PrepareFixAttemptPort: create a fresh attempt with a small handover and
- * numbered fixes after the prior attempt has ended. A fix round never
- * resumes the prior session; its conversation is not the new attempt's.
+ * numbered fixes after the prior attempt is collected or cancelled. A fix
+ * round never resumes the prior session; its conversation is not the new
+ * attempt's.
  */
 
 import type { AttemptRecord } from '../../../domain/execution-records.js';
@@ -22,6 +23,6 @@ export type PrepareFixAttemptResult =
   | { readonly outcome: 'refused'; readonly reason: string };
 
 export interface PrepareFixAttemptPort {
-  /** Prepare a fresh fix attempt against the ended prior attempt. */
+  /** Prepare a fresh fix attempt after the prior attempt is collected or cancelled. */
   prepareFixAttempt(request: PrepareFixAttemptRequest): Promise<PrepareFixAttemptResult>;
 }

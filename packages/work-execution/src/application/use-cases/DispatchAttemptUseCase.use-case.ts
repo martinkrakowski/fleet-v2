@@ -21,6 +21,7 @@ import { parseSeatTool } from '../../domain/execution-records.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
+import { checkFixPriorSettled } from './PrepareFixAttemptUseCase.use-case.js';
 import type { DispatchAttemptPort, DispatchAttemptRequest, DispatchAttemptResult } from '../ports/in/DispatchAttemptPort.in-port.js';
 import type { RunnerIsolationCapabilities } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
@@ -201,6 +202,23 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         outcome: 'refused',
         reason: `Work order ${workOrder.id} is ${workOrder.state} and accepts no further dispatch`,
       };
+    }
+
+    // C1b: a fix attempt shares the lane's worktree with its prior attempt. It
+    // dispatches only after the prior attempt is collected (manifest sealed) or
+    // cancelled and nothing else on the work order can still touch the worktree.
+    // Refused before any reservation read, workspace inspection, journal entry,
+    // save or runner call.
+    const recordedAttempt = await this.deps.attemptRepo.findAttemptById(request.attemptId);
+    if (recordedAttempt?.kind === 'fix') {
+      const priorCheck = await checkFixPriorSettled(this.deps.attemptRepo, {
+        fixAttemptId: recordedAttempt.id,
+        workOrderId: recordedAttempt.workOrderId,
+        priorAttemptId: recordedAttempt.priorAttemptId,
+      });
+      if (priorCheck.refusal !== null) {
+        return { outcome: 'refused', reason: priorCheck.refusal };
+      }
     }
 
     const activeReservations = await this.deps.journal.listActiveReservations();

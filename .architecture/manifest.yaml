@@ -399,12 +399,13 @@ bounded_contexts:
             - LaneDiffCheckPort
             - AllowedSeatPort
             - UsagePort
+            - GatePredicatePort
             - ProjectProbePort
             - ProjectProfileReadPort
             - ProjectProbeRecordPort
             - ChangeSignalPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -429,6 +430,7 @@ bounded_contexts:
       AllowedSeatPort: "Given the installation's seat catalogue and policy.useFreeSeats, decide whether a dispatch seat (tool, model, variant) or a reviewer model may be used; with the flag false only seats that are all not free are allowed, and an unknown or mixed match is refused."
       RunnerForAttemptPort: "Given the attempt's recorded runner block, return the runner that addresses the recorded host; a host that changed, was renamed or was removed is refused naming the recorded host, and a legacy attempt keeps the single legacy runner."
       LaneDiffCheckPort: "Before any edit-only commit, collect a worktree's tracked and untracked changes against the base and run the pure lane diff check: allowed path prefixes from the frozen brief, fixed and policy protected paths, and secret patterns on added lines; findings carry path, line and rule name only, never a matched value."
+      GatePredicatePort: "Evaluate a frozen acceptance spec on an attempt's worktree host in order: the commit since the base at the candidate head with a clean tree, the lane diff check, then each fixed argv command with its declared coverage; the first predicate that does not pass stops the run and later ones are skipped; results carry no command output."
       CommandExecutorPort: "Run one reviewed argv array without a shell through a local or ssh transport and report its completed outcome, never a launch as completion."
       WorkspacePort: "Prepare scoped Git worktrees and inspect base/head commits and commit deltas without resetting user work."
       AttemptArtifactPort: "Place frozen briefs and templates under verified ignored paths and collect bounded immutable artifacts after lane completion."
@@ -458,6 +460,7 @@ bounded_contexts:
       - { adapter: AllowedSeatAdapter, implements: AllowedSeatPort, integration: installation-seat-catalogue-structural-check }
       - { adapter: RunnerForAttemptAdapter, implements: RunnerForAttemptPort, integration: per-host-cached-ocm-run-adapters-with-confirm-or-unknown }
       - { adapter: LaneDiffCheckAdapter, implements: LaneDiffCheckPort, integration: injected-command-executor-git-collection }
+      - { adapter: GatePredicateAdapter, implements: GatePredicatePort, integration: injected-command-executor-gate-predicates }
       - { adapter: OpencodeDbUsageAdapter, implements: UsagePort, integration: opencode-db-read-via-recorded-host-node-script }
       - { adapter: ProjectProbeAdapter, implements: ProjectProbePort, integration: injected-command-executor-read-only-git-probe }
       - adapter: ProjectProfileReadAdapter

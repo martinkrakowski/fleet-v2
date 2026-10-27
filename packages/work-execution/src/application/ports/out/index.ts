@@ -15,6 +15,7 @@ export * from "./ExecutionJournalPort.out-port.js";
 export * from "./ExecutionObservationPort.out-port.js";
 export * from "./ExecutionRunnerPort.out-port.js";
 export * from "./ForgeActionPort.out-port.js";
+export * from "./GatePredicatePort.out-port.js";
 export * from "./LaneDiffCheckPort.out-port.js";
 export * from "./OwnerDecisionPort.out-port.js";
 export * from "./ProjectProbePort.out-port.js";

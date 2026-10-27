@@ -247,7 +247,7 @@ export interface ActionJournalEntryRecord {
   readonly id: string;
   readonly attemptId: string;
   readonly workOrderId: string;
-  readonly action: 'dispatch' | 'reconcile' | 'stop' | 'collect' | 'forge';
+  readonly action: 'dispatch' | 'reconcile' | 'stop' | 'collect' | 'forge' | 'accept';
   readonly baseCommit: string;
   readonly recordedAtIso: string;
   readonly status: 'intent-recorded' | 'completed' | 'ambiguous' | 'refused';

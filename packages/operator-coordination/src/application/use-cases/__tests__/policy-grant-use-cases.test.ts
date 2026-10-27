@@ -522,6 +522,21 @@ describe('IssuePolicyForgeGrantUseCase', () => {
     expect(await repository.listRequests()).toHaveLength(1);
   });
 
+  it('returns the fixed reason when the policy grant record cannot be built', async () => {
+    const repository = new CoordinationRequestRepositoryAdapter();
+    const useCase = new IssuePolicyForgeGrantUseCase({
+      requestRepo: repository,
+      clock: { nowIso: () => '' },
+      ids: countingIds(),
+    });
+    const result = await useCase.issuePolicyForgeGrant(issueRequest());
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'policy grant record could not be built',
+    });
+    expect(await repository.listRequests()).toEqual([]);
+  });
+
   it('sweeps a concurrent grant that landed one second before the new grant', async () => {
     const repository = new CoordinationRequestRepositoryAdapter();
     const wrapper = new SecondListInjectsConcurrentGrant(
@@ -546,7 +561,7 @@ describe('IssuePolicyForgeGrantUseCase', () => {
     expect((await repository.findRequestById('request-example-1'))?.state).toBe('approved');
   });
 
-  it('leaves a concurrent grant that landed after the new grant alone', async () => {
+  it('returns superseded when two issuers race and leaves only the newest grant live', async () => {
     const repository = new CoordinationRequestRepositoryAdapter();
     const wrapper = new SecondListInjectsConcurrentGrant(
       repository,
@@ -563,9 +578,13 @@ describe('IssuePolicyForgeGrantUseCase', () => {
       ids: countingIds(),
     });
     const result = await useCase.issuePolicyForgeGrant(issueRequest());
-    expect(result.outcome).toBe('issued');
-    if (result.outcome !== 'issued') return;
-    expect(result.cancelledGrantIds).toEqual([]);
+    expect(result).toEqual({
+      outcome: 'superseded',
+      requestId: 'request-example-1',
+      grantId: 'grant-example-1',
+      cancelledGrantIds: ['grant-example-1'],
+    });
+    expect((await repository.findRequestById('request-example-1'))?.state).toBe('cancelled');
     expect((await repository.findRequestById('request-concurrent-after'))?.state).toBe('approved');
   });
 
@@ -702,6 +721,71 @@ describe('CancelPolicyGrantsUseCase', () => {
       nowIso: NOW_ISO,
     });
     expect(consumed.outcome).toBe('refused');
+  });
+
+  it('reports a second conflict on cancel as partial with unresolvedGrantIds', async () => {
+    const repository = new CoordinationRequestRepositoryAdapter();
+    await repository.saveRequest(
+      policyGrantRecord({
+        id: 'request-old',
+        grantId: 'grant-old',
+        decisionRevision: 'policy:autoMerge@0692f17be6e5',
+      }),
+    );
+    const wrapper = new ConflictTwiceOnCancel(repository);
+    const useCase = new CancelPolicyGrantsUseCase({
+      requestRepo: wrapper,
+      clock: countingClock(),
+    });
+    const result = await useCase.cancelPolicyGrants(cancelRequest());
+    expect(result).toEqual({
+      outcome: 'partial',
+      cancelledGrantIds: [],
+      unresolvedGrantIds: ['grant-old'],
+      consumedLeft: 0,
+    });
+    expect((await repository.findRequestById('request-old'))?.state).toBe('approved');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Resolve without a grant id
+ * ------------------------------------------------------------------ */
+
+describe('ResolveActionAuthorizationUseCase no-id resolve', () => {
+  it('never returns a policy grant when resolving without a grant id at its head', async () => {
+    const repository = new CoordinationRequestRepositoryAdapter();
+    await repository.saveRequest(policyGrantRecord());
+    const resolved = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repository,
+    }).resolveActionAuthorization({
+      projectId: 'project-example',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: HA,
+    });
+    expect(resolved).toMatchObject({
+      outcome: 'blocked',
+      reason: 'no recorded decision authorizes forge:merge-pr for project-example',
+    });
+  });
+
+  it('returns the owner grant when an approved policy grant sits at the same head as a newer owner grant', async () => {
+    const repository = new CoordinationRequestRepositoryAdapter();
+    await repository.saveRequest(policyGrantRecord());
+    await repository.saveRequest(
+      ownerGrantRecord({
+        createdAtIso: '2026-10-27T09:59:30.000Z',
+        updatedAtIso: '2026-10-27T09:59:30.000Z',
+      }),
+    );
+    const resolved = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repository,
+    }).resolveActionAuthorization({
+      projectId: 'project-example',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: HA,
+    });
+    expect(resolved).toMatchObject({ outcome: 'authorized', grantId: 'grant-owner' });
   });
 });
 

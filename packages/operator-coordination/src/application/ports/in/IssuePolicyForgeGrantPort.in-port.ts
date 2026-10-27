@@ -47,6 +47,13 @@ export type IssuePolicyForgeGrantResult =
       /** Earlier policy grants of this work order cancelled by this issue, sorted. */
       readonly cancelledGrantIds: readonly string[];
     }
+  | {
+      readonly outcome: 'superseded';
+      readonly requestId: string;
+      readonly grantId: string;
+      /** This issue's own grant id, cancelled because a newer live grant exists. */
+      readonly cancelledGrantIds: readonly string[];
+    }
   | { readonly outcome: 'refused'; readonly reason: string };
 
 export interface IssuePolicyForgeGrantPort {

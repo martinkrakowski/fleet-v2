@@ -79,9 +79,22 @@ export class CancelPolicyGrantsUseCase implements CancelPolicyGrantsPort {
     }
 
     const cancelled = await this.cancelTargets(targets, now);
+    const cancelledGrantIds = [...cancelled.cancelledIds].sort((left, right) =>
+      left.localeCompare(right),
+    );
+    if (cancelled.unresolvedIds.length > 0) {
+      return {
+        outcome: 'partial',
+        cancelledGrantIds,
+        unresolvedGrantIds: [...cancelled.unresolvedIds].sort((left, right) =>
+          left.localeCompare(right),
+        ),
+        consumedLeft,
+      };
+    }
     return {
       outcome: 'cancelled',
-      cancelledGrantIds: cancelled.cancelledIds.sort((left, right) => left.localeCompare(right)),
+      cancelledGrantIds,
       consumedLeft,
     };
   }
@@ -131,18 +144,21 @@ export class CancelPolicyGrantsUseCase implements CancelPolicyGrantsPort {
   private async cancelTargets(
     targets: readonly CoordinationRequestRecord[],
     now: string,
-  ): Promise<{ readonly cancelledIds: string[] }> {
+  ): Promise<{ readonly cancelledIds: string[]; readonly unresolvedIds: string[] }> {
     const cancelledIds: string[] = [];
+    const unresolvedIds: string[] = [];
     await targets.reduce(
       (chain, record) =>
         chain.then(async () => {
           const outcome = await this.cancelOne(record, now);
           if (outcome === 'cancelled' && record.grantId !== null) {
             cancelledIds.push(record.grantId);
+          } else if (outcome === 'conflict' && record.grantId !== null) {
+            unresolvedIds.push(record.grantId);
           }
         }),
       Promise.resolve(),
     );
-    return { cancelledIds };
+    return { cancelledIds, unresolvedIds };
   }
 }

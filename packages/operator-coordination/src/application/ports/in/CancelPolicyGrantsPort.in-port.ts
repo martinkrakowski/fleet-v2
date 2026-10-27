@@ -16,6 +16,13 @@ export interface CancelPolicyGrantsRequest {
 
 export type CancelPolicyGrantsResult =
   | { readonly outcome: 'cancelled'; readonly cancelledGrantIds: readonly string[]; readonly consumedLeft: number }
+  | {
+      readonly outcome: 'partial';
+      readonly cancelledGrantIds: readonly string[];
+      /** Grants that kept moving during their cancel and stayed live. */
+      readonly unresolvedGrantIds: readonly string[];
+      readonly consumedLeft: number;
+    }
   | { readonly outcome: 'refused'; readonly reason: string };
 
 export interface CancelPolicyGrantsPort {

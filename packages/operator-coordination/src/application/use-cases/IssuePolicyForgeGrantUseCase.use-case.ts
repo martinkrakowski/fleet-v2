@@ -4,8 +4,9 @@
  * merge-pr named by policy:autoMerge@<rev>, push-and-open-pr and push-to-pr by
  * policy:conductor@<rev>, bound to its work order, attempt and acceptance
  * receipt. It cancels every earlier unconsumed policy grant of the work order
- * first, then sweeps once for a concurrent issuer, so at most one policy grant
- * per work order stays live. It never decides eligibility.
+ * first, saves the new grant, then sweeps: the newest live grant (ordered by
+ * createdAtIso then id) stays live -- a newer concurrent issuer supersedes
+ * this issue, which cancels its own grant. It never decides eligibility.
  */
 
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
@@ -129,18 +130,43 @@ export class IssuePolicyForgeGrantUseCase implements IssuePolicyForgeGrantPort {
     let validated: CoordinationRequestRecord;
     try {
       validated = CoordinationRequest.fromRecord(grant).toRecord();
-    } catch (error) {
-      return refused(error instanceof Error ? error.message : String(error));
+    } catch {
+      return refused('policy grant record could not be built');
     }
     await this.deps.requestRepo.saveRequest(validated);
 
-    const sweep = (await this.deps.requestRepo.listRequests(projectId)).filter(
-      (record) =>
-        this.isLiveWorkOrderGrant(record, workOrderId) &&
-        record.id !== requestId &&
-        this.ordersBeforeNew(record, now, requestId),
+    // After saving the new grant, re-list the work order's live policy grants
+    // and keep only the newest (ordered by createdAtIso then id) live. When a
+    // newer live grant exists, this issue's own grant is cancelled and the
+    // result is superseded -- a fixed outcome, never an error. A crash between
+    // the save above and this sweep leaves two live grants; the next issue or
+    // cancel for this work order converges them, because the newest wins. A
+    // resolve by grant id still requires an exact head.
+    const live = (await this.deps.requestRepo.listRequests(projectId)).filter((record) =>
+      this.isLiveWorkOrderGrant(record, workOrderId),
     );
-    const cancelledSwept = await this.cancelTargets(sweep, now, 'best-effort');
+    const ordered = [...live].sort((left, right) => {
+      if (left.createdAtIso !== right.createdAtIso) {
+        return left.createdAtIso < right.createdAtIso ? -1 : 1;
+      }
+      return left.id < right.id ? -1 : 1;
+    });
+    const newest = ordered[ordered.length - 1];
+    if (newest === undefined || newest.id !== requestId) {
+      // A newer live grant exists: this issue's own grant is cancelled and the
+      // newer one stays live. Superseded is a fixed outcome, never an error.
+      const mine = await this.deps.requestRepo.findRequestById(requestId);
+      if (mine !== null && this.isLiveWorkOrderGrant(mine, workOrderId)) {
+        await this.cancelOne(mine, now);
+      }
+      return {
+        outcome: 'superseded',
+        requestId,
+        grantId,
+        cancelledGrantIds: [grantId],
+      };
+    }
+    const cancelledSwept = await this.cancelTargets(ordered.slice(0, -1), now, 'best-effort');
 
     const cancelledGrantIds = [
       ...cancelledEarlier.cancelledIds,
@@ -197,14 +223,6 @@ export class IssuePolicyForgeGrantUseCase implements IssuePolicyForgeGrantPort {
       record.consumptions.length === 0 &&
       record.policyGrant?.workOrderId === workOrderId
     );
-  }
-
-  /** The new grant orders at (now, requestId); a record before that pair is an earlier issuer. */
-  private ordersBeforeNew(record: CoordinationRequestRecord, now: string, requestId: string): boolean {
-    if (record.createdAtIso < now) {
-      return true;
-    }
-    return record.createdAtIso === now && record.id < requestId;
   }
 
   private buildGrant(input: {

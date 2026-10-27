@@ -7,6 +7,7 @@ export * from "./execution-records.js";
 export * from "./lane-diff-check.js";
 export * from "./lane-run-keys.js";
 export * from "./lane-run-records.js";
+export * from "./lane-run-transitions.js";
 export * from "./seat-selection.js";
 export * from "./value-objects/index.js";
 export * from "./worktree-path.js";

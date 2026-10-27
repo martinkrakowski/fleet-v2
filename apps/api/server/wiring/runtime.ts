@@ -4,7 +4,10 @@
 // cases themselves never import across contexts.
 import { readFileSync, statSync } from "node:fs";
 import { execFile } from "node:child_process";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+
+import { ChangeFeed } from "./changes/change-feed";
+import { StateWriteWatcher } from "./changes/state-write-watcher";
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from "./gh-binary";
 import { withFileLock, writeJsonAtomically } from "./file-store";
@@ -234,12 +237,36 @@ export async function persistAuthorizationCoordinatesToState(
 }
 
 let runtimeConfigured = false;
+let changeFeed: ChangeFeed | null = null;
+let watcher: StateWriteWatcher | null = null;
+
+/**
+ * Stores whose saves emit change signals; watched so a foreign (CLI) write
+ * becomes a resync. journal.json and coordination-requests.json are written
+ * without signals, so watching them would turn this process's own writes into
+ * resyncs.
+ */
+const WATCHED = [
+  "work-orders.json",
+  "attempts.json",
+  "reservations.json",
+  "project-profiles.json",
+  "owner-questions.json",
+];
 
 export function isFleetApiRuntimeConfigured(): boolean {
   return runtimeConfigured;
 }
 
+export function getChangeFeed(): ChangeFeed | null {
+  return changeFeed;
+}
+
 export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null): void {
+  watcher?.stop();
+  watcher = null;
+  changeFeed = null;
+
   if (options === null) {
     runtimeConfigured = false;
     configureWorkComposition(null);
@@ -254,7 +281,17 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   const stateDir = options?.stateDir;
   const ownerPublicKey = options?.ownerPublicKey;
   const installation = options?.installation;
-  const operator = createConfiguredOperatorComposition({ stateDir, ownerPublicKey, installation });
+
+  if (stateDir !== undefined) {
+    changeFeed = new ChangeFeed();
+  }
+
+  const operator = createConfiguredOperatorComposition({
+    stateDir,
+    ownerPublicKey,
+    installation,
+    ...(changeFeed !== null ? { changeSignal: changeFeed } : {}),
+  });
   const knowledge = createConfiguredKnowledgeComposition({
     stateDir,
     // The installation's v2 decisions block only (D3); v1 files never carry
@@ -579,9 +616,25 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
     acceptedReceiptByHead,
   };
 
-  const work = createConfiguredWorkComposition({ stateDir, installation }, crossContext);
+  const work = createConfiguredWorkComposition(
+    {
+      stateDir,
+      installation,
+      ...(changeFeed !== null ? { changeSignal: changeFeed } : {}),
+    },
+    crossContext,
+  );
   workLookup.inspectWorkOrder = work.inspectWorkOrder;
   attemptLookup.inspectAttempt = work.inspectAttempt;
+
+  if (stateDir !== undefined && changeFeed !== null) {
+    // Each watched file key must match the stores' path.resolve form.
+    watcher = new StateWriteWatcher({
+      feed: changeFeed,
+      files: WATCHED.map((name) => resolve(join(stateDir, name))),
+    });
+    watcher.start();
+  }
 
   configureOperatorComposition(operator);
   configureKnowledgeComposition(knowledge);

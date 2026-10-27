@@ -34,6 +34,7 @@ import {
   type ExecutionObservationDelegate,
   type ExecutionRunnerHost,
   type ForgeActionDelegate,
+  type ChangeSignalPort,
   type OwnerDecisionDelegate,
   type AttemptOwnerDecisionDelegate,
 } from "@fleet/work-execution";
@@ -102,6 +103,8 @@ export interface WorkComposition {
 
 export interface WorkCompositionOptions {
   readonly stateDir?: string;
+  /** Emitter for post-save change signals; the API runtime wires the change feed. */
+  readonly changeSignal?: ChangeSignalPort;
   readonly installation?: FleetInstallation;
   /** Live runner subprocess configuration; environment is the fallback. */
   readonly runnerAgent?: string;
@@ -301,9 +304,18 @@ export function createConfiguredWorkComposition(
     worktreeSshHost,
   });
 
-  const workOrderRepo = new WorkOrderRepositoryAdapter({ stateDir });
-  const attemptRepo = new AttemptRepositoryAdapter({ stateDir });
-  const journal = new ExecutionJournalAdapter({ stateDir });
+  const workOrderRepo = new WorkOrderRepositoryAdapter({
+    stateDir,
+    ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
+  });
+  const attemptRepo = new AttemptRepositoryAdapter({
+    stateDir,
+    ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
+  });
+  const journal = new ExecutionJournalAdapter({
+    stateDir,
+    ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
+  });
   const briefAuthoring = new BriefAuthoringAdapter();
   // H9b2: workspace and artifact reads for an attempt recorded on a named
   // host run through that recorded host's executor (the recorded host is the

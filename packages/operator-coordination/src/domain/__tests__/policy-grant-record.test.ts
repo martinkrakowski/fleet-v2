@@ -264,22 +264,17 @@ describe('CoordinationRequest.fromRecord refuses a hostile policyGrant', () => {
     );
   });
 
-  it('refuses a proxy whose get trap throws without leaking the message', () => {
+  it('never runs a proxy get trap: values come from the descriptor snapshot', () => {
+    let getTrapRan = false;
     const grant = new Proxy({ ...VALID_GRANT } as PolicyGrantRecord, {
       get() {
+        getTrapRan = true;
         throw new Error('secret-get-text');
       },
     });
-    expect(() =>
-      CoordinationRequest.fromRecord(requestRecord({ policyGrant: grant })),
-    ).toThrow('PolicyGrant validation failed due to a prohibited Proxy trap execution.');
-    let message = '';
-    try {
-      CoordinationRequest.fromRecord(requestRecord({ policyGrant: grant }));
-    } catch (error) {
-      message = (error as Error).message;
-    }
-    expect(message).not.toContain('secret-get-text');
+    const request = CoordinationRequest.fromRecord(requestRecord({ policyGrant: grant }));
+    expect(getTrapRan).toBe(false);
+    expect(request.toRecord().policyGrant).toEqual(VALID_GRANT);
   });
 
   it('refuses a proxy whose ownKeys trap throws without leaking the message', () => {

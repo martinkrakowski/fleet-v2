@@ -197,7 +197,8 @@ export class CoordinationRequest {
     
     // Now validate the snapshot and build the stored copy.
     const keys: string[] = [];
-    
+    const snapshot: Record<string, unknown> = {};
+
     for (const [key, keyDescriptor] of keyDescriptors) {
       if (typeof key !== 'string' || key.length === 0) {
         throw new Error('Policy grant key must be a non-empty string.');
@@ -206,6 +207,7 @@ export class CoordinationRequest {
         throw new Error('Policy grant property must be an enumerable data property.');
       }
       keys.push(key);
+      snapshot[key] = keyDescriptor.value;
     }
     
     const grantKeys = ['workOrderId', 'attemptId', 'acceptanceReceiptId'];
@@ -217,13 +219,9 @@ export class CoordinationRequest {
     
     const collected: Record<string, string> = {};
     for (const key of grantKeys) {
-      let value: unknown;
-      try {
-        value = (raw as Record<string, unknown>)[key];
-      } catch {
-        throw new Error('PolicyGrant validation failed due to a prohibited Proxy trap execution.');
-      }
-      
+      // Validate and copy from the descriptor snapshot; the object is never read again.
+      const value = snapshot[key];
+
       if (typeof value !== 'string' || value.trim().length === 0 || value.length > 256) {
         throw new Error(
           'CoordinationRequest policyGrant must be { workOrderId, attemptId, acceptanceReceiptId }',

@@ -381,6 +381,7 @@ bounded_contexts:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
             - ExecutionJournalPort
+            - LaneRunRepositoryPort
             - BriefAuthoringPort
             - ExecutionRunnerPort
             - CommandExecutorPort
@@ -405,7 +406,7 @@ bounded_contexts:
             - ProjectProbeRecordPort
             - ChangeSignalPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -424,6 +425,7 @@ bounded_contexts:
       WorkOrderRepositoryPort: "Persist work-order revisions with optimistic concurrency and retrieve orders by project and dependency identity."
       AttemptRepositoryPort: "Persist immutable dispatch identity and guarded lifecycle updates; return known absence separately from unreadable state."
       ExecutionJournalPort: "Atomically record intent, capacity and action receipts; a host has one designated dispatcher until shared arbitration is implemented."
+      LaneRunRepositoryPort: "Persist lane runs: create at revision 1; save only at the stored revision plus one and only by the current, unexpired run-lease holder with its fence, never moving the lease, the run's identity or its earlier attempts; acquire the run lease by CAS on the fence, renew and release it without moving the revision; known absence is null."
       BriefAuthoringPort: "Obtain a project orchestrator's brief or a hand-written file without introducing provider inference into the control plane."
       ExecutionRunnerPort: "Start, inspect and stop a matching attempt/session with explicit capabilities and strict per-lane directory isolation; a busy-worktree start is blocked and keeps its reservation until reconcile or stop resolves the worktree, and a worktree can be inspected or aborted by directory without a session id."
       RunnerSelectorPort: "Given the installation's lane-runner hosts and the attempt's seat tool, return the runner kind and host to use; a kind without an implemented adapter is refused as runner-not-available."
@@ -453,6 +455,7 @@ bounded_contexts:
       - { adapter: WorkOrderRepositoryAdapter, implements: WorkOrderRepositoryPort, integration: local-transactional-store }
       - { adapter: AttemptRepositoryAdapter, implements: AttemptRepositoryPort, integration: local-transactional-store }
       - { adapter: ExecutionJournalAdapter, implements: ExecutionJournalPort, integration: local-transactional-journal-and-capacity-arbitration }
+      - { adapter: LaneRunRepositoryAdapter, implements: LaneRunRepositoryPort, integration: local-transactional-store }
       - { adapter: BriefAuthoringAdapter, implements: BriefAuthoringPort, integration: reviewed-harness-or-hand-written-file }
       - { adapter: ExecutionRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-ocm-run-subprocess }
       - { adapter: AgyRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-agy-run-subprocess-behind-runner-mode }

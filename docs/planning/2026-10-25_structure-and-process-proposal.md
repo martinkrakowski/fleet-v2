@@ -1,7 +1,7 @@
 # Proposal: one system for structure and process (fleet-v2 × hexagen)
 
 - **Date:** 2026-10-25
-- **Status:** **proposal**, not accepted. It asks for the owner's direction (§7). Nothing is built.
+- **Status:** **proposal**; Phase 1 is not accepted yet. Decisions recorded 2026-10-26 (owner 2026-10-26: "Accept all of fable's recommendations"): D1, D2 and D4 as recommended; D3 changed (Phase 1 does not run on E3a-2); D5 deferred (§7). Nothing is built.
 - **Owner request (2026-10-25):** "What would you do to create a cohesive system between fleet-v2 and hexagen-monaco? Imagine you have full autonomy and you can create any project you desire", then "Write up the proposed plan."
 - **Builds on:** `2026-10-25_hexagen-integration-plan.md` (#204, accepted). Its rules hold here unchanged:
   - hexagen-monaco owns its contract;
@@ -135,9 +135,9 @@ Drift becomes visible instead of discovered.
 |---|---|---|
 | D1 | Where does the spec live at first? | **Inside hexagen-monaco's `docs/kernel/`**, split out only when a third consumer appears |
 | D2 | Who owns which schemas? | **hexagen: structure** (identity, findings, slices, grants). **fleet-v2: process** (receipts, work orders, policy) |
-| D3 | Run the Phase 1 experiment? | **Yes**, on fleet-v2's own next manifest-heavy lane (E3a-2 adds a port and an adapter) |
+| D3 | Run the Phase 1 experiment? | **Not on E3a-2** (decided 2026-10-26): E3a-2 is already specified as a normal lane and there is no manifest-delta tooling yet. Once the owner accepts Phase 1, the sample is E4 only if its plan documents a manifest delta; otherwise it is the first later lane whose plan names one. Original recommendation: **Yes**, on fleet-v2's own next manifest-heavy lane (E3a-2 adds a port and an adapter) |
 | D4 | Acceptance policy as data (P4)? | **Yes, after Phase 3.** Until then the pipeline rules stay in CLAUDE.md and the scripts |
-| D5 | A canary repository for the release train? | **Yes**, a minimal generated project with every contract surface, under the owner's account |
+| D5 | A canary repository for the release train? | **Deferred** (2026-10-26) until Phase 1 shows value. Original recommendation: a minimal generated project with every contract surface, under the owner's account |
 
 ## Challenge this
 

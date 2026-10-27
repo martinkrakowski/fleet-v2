@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-25
 - **Target repository:** `fleet-v2`
-- **Status:** draft for the owner's decisions (§6). Nothing built. Anchors checked against `main` on 2026-10-25 (§2).
+- **Status:** decided (owner 2026-10-26: "Accept all of fable's recommendations"; see `2026-10-26_execution-order.md`). D1, D3, D4, D5 as recommended; D2 narrowed (§6). B1–B2 deferred; A1–A2 run after the vacuous-pass plan's V1. Nothing built. Anchors checked against `main` on 2026-10-25 (§2).
 - **Owner request (2026-10-25):** "Make a list of features we can pull into fleet-v2", then "write it up". This follows a read-only review of [microsoft/Agensh](https://github.com/microsoft/Agensh): MIT licence, v1.0 of 2026-10-23, a research harness that runs up to 1,024 Copilot agents with no central orchestrator. The review found ten candidate features. This plan takes the three that fit fleet-v2's rules and are cheapest to prove. The other seven are listed in §3.4.
 - **Builds on:** `2026-10-24_live-updates-and-state-resilience-plan.md` (§3.6 safe worktree removal; E1 quarantine, check and restore, merged in #180–#202).
 
@@ -25,7 +25,7 @@
 
 ### 3.1 Placeholder evidence (evidence-and-acceptance, domain)
 
-- **Rejecter:** a pure function `isPlaceholderEvidence(text: string): boolean` in `packages/evidence-and-acceptance/src/domain/`. After trimming and lower-casing, it is true when the text is empty or starts with one of a fixed, exported list: `tbd`, `todo`, `n/a`, `na`, `none`, `should work`, `looks right`, `looks good`, `lgtm`, `probably`, `i think`, `seems`. Matching is whole-word at the start; it never matches inside a word. This is adapted from Agensh's `board-service/verifier.py`, 56 lines, MIT; credited in a header comment if code is copied rather than re-written.
+- **Rejecter:** a pure function `isPlaceholderEvidence(text: string): boolean` in `packages/evidence-and-acceptance/src/domain/`. After trimming and lower-casing, it is true when the text is empty or starts with one of a fixed, exported list: `tbd`, `todo`, `n/a`, `na`, `should work`, `looks right`, `looks good`, `lgtm`. Matching is whole-word at the start; it never matches inside a word. The words `none`, `seems`, `probably` and `i think` are refused only when they are the whole text (after trimming and dropping trailing punctuation), never as a start: "Seems the lock is released twice at line 40" is evidence, and so is "None of the tests passed at line 40"; the A1 tests include both (D2, 2026-10-26). This is adapted from Agensh's `board-service/verifier.py`, 56 lines, MIT; credited in a header comment if code is copied rather than re-written.
 - **Where it applies:**
   - `ReviewReceipt`: `evidenceRef` and each finding's `summary`.
   - `VerificationReceipt`: `evidenceRef` only. Its props have no `summary`.
@@ -100,7 +100,7 @@ Each lane follows the standard pipeline: Mercury-3, gate, Grok, Argon fix rounds
 | # | Question | Default |
 |---|---|---|
 | D1 | Does the placeholder check also apply to receipts already stored? | **No:** new writes only. Tighten readers later, after `state check` |
-| D2 | Should placeholder evidence be refused outright, or warned about for a while first? | **Refuse.** Receipts are written by the orchestrator, not by end users |
+| D2 | Should placeholder evidence be refused outright, or warned about for a while first? | **Refuse** (decided 2026-10-26), with the hedge words matched only as the whole text, not as a start (§3.1) |
 | D3 | Who may propose a `failed` note? | **The orchestrator and reviewers.** Never a lane about itself |
 | D4 | What overrides the sealed-manifest gate on worktree removal? | **`--force-unsealed` plus an owner approval** scoped to that removal through the existing authorization path; the journal records the approval's reference |
 | D5 | Copy Agensh's verifier code (MIT, with credit), or re-write it from the idea? | **Re-write.** It is 56 lines of Python; a TypeScript domain function is simpler written fresh |

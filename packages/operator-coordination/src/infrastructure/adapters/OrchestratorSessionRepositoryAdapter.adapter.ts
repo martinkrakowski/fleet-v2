@@ -32,7 +32,7 @@ import type {
 } from "../../application/ports/out/ChangeSignalPort.out-port.js";
 import { NoopChangeSignalAdapter } from "./NoopChangeSignalAdapter.adapter.js";
 import { withFileLock, writeJsonAtomically } from "./file-store.js";
-import { readRecordList } from "./record-list-store.js";
+import { readRecordList, readRevisionedEntry } from "./record-list-store.js";
 
 export interface OrchestratorSessionRepositoryAdapterOptions {
   /** When set, sessions are persisted here and reloaded on first use. */
@@ -123,46 +123,14 @@ export function parseOrchestratorSessionStateRecord(
   raw: unknown,
 ): StoredOrchestratorSession | undefined {
   try {
-    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    const entry = readRevisionedEntry(raw, "session");
+    if (entry === undefined) {
       return undefined;
     }
-    const inputPrototype = Object.getPrototypeOf(raw);
-    if (inputPrototype !== Object.prototype && inputPrototype !== null) {
-      return undefined;
-    }
-    const ownKeys = Reflect.ownKeys(raw);
-    if (ownKeys.length !== 2) {
-      return undefined;
-    }
-    const keySet = new Set(ownKeys.map((key) => String(key)));
-    if (!keySet.has("revision") || !keySet.has("session")) {
-      return undefined;
-    }
-    const revisionDescriptor = Object.getOwnPropertyDescriptor(raw, "revision");
-    const sessionDescriptor = Object.getOwnPropertyDescriptor(raw, "session");
-    if (
-      revisionDescriptor === undefined ||
-      sessionDescriptor === undefined ||
-      !revisionDescriptor.enumerable ||
-      !sessionDescriptor.enumerable ||
-      !("value" in revisionDescriptor) ||
-      !("value" in sessionDescriptor)
-    ) {
-      return undefined;
-    }
-    const revision = revisionDescriptor.value;
-    if (
-      typeof revision !== "number" ||
-      !Number.isSafeInteger(revision) ||
-      revision < 1
-    ) {
-      return undefined;
-    }
-    const result = OrchestratorSession.create(sessionDescriptor.value);
-    if (!result.success) {
-      return undefined;
-    }
-    return { revision, session: result.value.toRecord() };
+    const result = OrchestratorSession.create(entry.record);
+    return result.success
+      ? { revision: entry.revision, session: result.value.toRecord() }
+      : undefined;
   } catch {
     return undefined;
   }

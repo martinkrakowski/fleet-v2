@@ -9,6 +9,7 @@ import {
   matchesState,
   newestFirst,
   parseStateFilter,
+  relativeTimeEitherWay,
   stateCounts,
   stateTone,
   summaryText,
@@ -274,5 +275,11 @@ describe("summaryText", () => {
 
   it("singularises one open question", () => {
     expect(summaryText([question()])).toBe("1 open question · 0 one-way");
+  });
+
+  it("relativeTimeEitherWay reads future and past times", () => {
+    expect(relativeTimeEitherWay("2026-10-27T10:25:00.000Z", "2026-10-27T10:00:00.000Z")).toBe("in 25 min");
+    expect(relativeTimeEitherWay("2026-10-27T07:00:00.000Z", "2026-10-27T10:00:00.000Z")).toBe("3 h ago");
+    expect(relativeTimeEitherWay("not a time", "2026-10-27T10:00:00.000Z")).toBe("");
   });
 });

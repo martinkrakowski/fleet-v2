@@ -153,3 +153,25 @@ export function summaryText(qs: readonly QuestionView[]): string {
   }
   return `${open} open question${open === 1 ? "" : "s"} · ${oneWay} one-way`;
 }
+
+/** Relative text for a time on either side of now: "in 25 min" or "3 h ago"; empty when unreadable. */
+export function relativeTimeEitherWay(iso: string, nowIso: string): string {
+  const then = Date.parse(iso);
+  const now = Date.parse(nowIso);
+  if (!Number.isFinite(then) || !Number.isFinite(now)) {
+    return "";
+  }
+  const past = now >= then;
+  const seconds = Math.floor(Math.abs(now - then) / 1000);
+  let amount: string;
+  if (seconds < 60) {
+    amount = String(seconds) + " s";
+  } else if (seconds < 3600) {
+    amount = String(Math.floor(seconds / 60)) + " min";
+  } else if (seconds < 86400) {
+    amount = String(Math.floor(seconds / 3600)) + " h";
+  } else {
+    amount = String(Math.floor(seconds / 86400)) + " d";
+  }
+  return past ? amount + " ago" : "in " + amount;
+}

@@ -15,6 +15,7 @@ import {
   blocksText,
   isPastExpiry,
   stateTone,
+  relativeTimeEitherWay,
 } from "../question-view";
 import { relativeTime } from "../../attempt/live-view";
 import styles from "../questions.module.css";
@@ -91,7 +92,7 @@ export function QuestionCard({
                   {question.expiresAt}
                 </time>{" "}
                 <span className={styles.muted}>
-                  {relativeTime(question.expiresAt, observedAtIso)}
+                  {relativeTimeEitherWay(question.expiresAt, observedAtIso)}
                 </span>
                 {pastExpiry ? (
                   <span className={styles.muted}>

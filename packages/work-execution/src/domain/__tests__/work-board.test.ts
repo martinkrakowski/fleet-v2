@@ -338,6 +338,15 @@ describe('R1/R2 lane resolution and cards', () => {
     expect(card?.label).toBe('wo-example-3');
   });
 
+  it('a link to an unknown plan lane whose id is not plain text is labelled as an unnamed plan lane', () => {
+    const board = boardOf({
+      links: [link(7, { lane: { kind: 'plan', projectId: PROJECT_ID, planId: '2026-10-28_example', laneId: 'B\u202E1' } })],
+    });
+    const card = board.lanes.find((l) => l.ref.kind === 'plan' && l.ref.planId === '2026-10-28_example');
+    expect(card?.label).toBe('Unnamed plan lane');
+    expect(card?.planStatus).toBe('not-imported');
+  });
+
   it('a link to an unknown plan lane makes a not-imported card', () => {
     const board = boardOf({
       links: [link(7, { lane: { kind: 'plan', projectId: PROJECT_ID, planId: '2026-10-28_example', laneId: 'B1' } })],

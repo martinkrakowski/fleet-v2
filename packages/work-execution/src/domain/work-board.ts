@@ -225,6 +225,8 @@ function resolveLaneRef(ref: LaneRef, facts: BoardFacts): LaneRef {
  * when it passes the plan sidecar's plain-text rule (`planTextError`).
  */
 const BOARD_TEXT_MAX_BYTES = 1024;
+/** The label of a plan-lane card whose lane id, matched to no imported lane, is not plain text. */
+const UNNAMED_PLAN_LANE_LABEL = 'Unnamed plan lane';
 
 function isPlainText(text: string): boolean {
   return planTextError('text', text, BOARD_TEXT_MAX_BYTES) === null;
@@ -232,7 +234,10 @@ function isPlainText(text: string): boolean {
 
 function makeCard(ref: LaneRef, facts: BoardFacts): Card {
   const isPlan = ref.kind === 'plan';
-  let label = isPlan ? ref.laneId : '';
+  let label = '';
+  if (isPlan) {
+    label = isPlainText(ref.laneId) ? ref.laneId : UNNAMED_PLAN_LANE_LABEL;
+  }
   let planStatus: BoardPlanStatus = isPlan ? 'not-imported' : 'no-plan';
   let tier: 0 | 1 | 2 | null = null;
   let scope: string | null = null;

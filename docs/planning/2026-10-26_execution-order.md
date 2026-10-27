@@ -32,7 +32,7 @@ Each lane uses the standard pipeline:
 5. the Fable pre-merge pass on Tier 2;
 6. CI.
 
-At most two lanes run at once, and only once §1 allows it; never two in `evidence-and-acceptance` at the same time.
+**Parallelism (updated 2026-10-27):** the two-lane limit was a host-stability guard while solstice was hanging; the owner lifted it on 2026-10-27 once the disks moved onto the enclosure's own power supply. Lanes now run in parallel up to the host-wide gate budget, with two rules: never two lanes in the same package at once, and never two lanes that edit the same shared file (for example `apps/cli/src/composition.ts`, a generated barrel, or `CHANGELOG.md`) at once. Seats rotate per lane (the owner's 2026-10-27 round-robin), and Argon takes one fix round at a time because its container serialises lane processes.
 
 | # | Lane | Plan | Tier | Why here |
 |---|---|---|---|---|
@@ -72,4 +72,4 @@ The staging deploy runs after the host health check and before the first lane. I
 
 ## Challenge this
 
-§1 makes one lane at a time mandatory until the disks are isolated from power or the cabling is proven. Is a single day of incident-free lanes after that enough before running two at once?
+§1's host precondition is met (2026-10-27). The open question is now the shared-file rule: is "never two lanes editing the same shared file" strict enough, or should lanes that touch the same app's composition root also be serialised?

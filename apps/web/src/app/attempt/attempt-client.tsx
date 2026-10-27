@@ -19,6 +19,7 @@ import {
 import type { AttemptPageData } from "./live";
 import type { AttemptContext } from "./live-context";
 import { LiveWorkOrderCard } from "./components/live-work-order-card";
+import { LiveJournalPanel } from "./components/live-journal-panel";
 import {
   ATTEMPT_REFRESH_MS,
   useAutoRefresh,
@@ -127,7 +128,7 @@ function renderSidebar(
   }
 }
 
-function renderRecord(data: AttemptPageData): ReactNode {
+function renderRecord(data: AttemptPageData, context: AttemptContext): ReactNode {
   switch (data.view) {
     case "sample": {
       const { attempt, siblings, word, note, variant } = sampleTree(
@@ -166,7 +167,16 @@ function renderRecord(data: AttemptPageData): ReactNode {
       );
     }
     case "found":
-      return <LiveAttemptRecord data={data} />;
+      return (
+        <>
+          <LiveAttemptRecord data={data} />
+          <LiveJournalPanel
+            panel={context.journal}
+            attemptId={data.attemptId}
+            observedAtIso={data.observedAtIso}
+          />
+        </>
+      );
     case "unknown":
       return (
         <>
@@ -186,6 +196,11 @@ function renderRecord(data: AttemptPageData): ReactNode {
               host resolves.
             </p>
           </Banner>
+          <LiveJournalPanel
+            panel={context.journal}
+            attemptId={data.attemptId}
+            observedAtIso={data.observedAtIso}
+          />
         </>
       );
     case "not-found":
@@ -263,7 +278,7 @@ export default function AttemptPage({
           {copied ?? announcementFor(data)}
         </p>
         {routeLine(data)}
-        {renderRecord(data)}
+        {renderRecord(data, context)}
       </section>
     </div>
   );

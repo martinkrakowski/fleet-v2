@@ -110,6 +110,9 @@ function fakeClient(replies: {
     fetchAttemptView: async () => {
       throw new Error("unused");
     },
+    fetchAttemptJournal: async () => {
+      throw new Error("unused");
+    },
     fetchHeadEvidenceView: async () => {
       throw new Error("unused");
     },

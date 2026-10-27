@@ -95,6 +95,33 @@ const FOUND_ENVELOPE = {
   },
 };
 
+const JOURNAL_ENTRY_A = {
+  id: "jr_1",
+  action: "dispatch",
+  status: "completed",
+  recordedAtIso: "2026-10-24T10:00:05Z",
+  sessionId: "ses_live_1",
+  detail: null,
+};
+
+const JOURNAL_ENTRY_B = {
+  id: "jr_2",
+  action: "collect",
+  status: "ambiguous",
+  recordedAtIso: "2026-10-24T10:00:10Z",
+  sessionId: null,
+  detail: null,
+};
+
+const JOURNAL_ENVELOPE = {
+  code: "OK",
+  result: {
+    outcome: "listed",
+    attemptId: "att_live_1",
+    entries: [JOURNAL_ENTRY_B, JOURNAL_ENTRY_A],
+  },
+};
+
 type Reply =
   | { source: "api"; data: unknown }
   | {
@@ -103,15 +130,38 @@ type Reply =
       fallbackReason: string | null;
     };
 
-function fakeWorkOrderClient(reply: Reply) {
+function fakeWorkOrderClient(workOrderReply: Reply, journalReply?: Reply) {
   const viewed: string[] = [];
+  const journalIds: string[] = [];
   const client = {
     viewed,
+    journalIds,
     fetchWorkOrderView: async <T>(
       workOrderId: string,
       fallback: T,
     ): Promise<LiveEndpointResult<T>> => {
       viewed.push(workOrderId);
+      if (workOrderReply.source === "api") {
+        return {
+          source: "api",
+          status: 200,
+          data: workOrderReply.data as T,
+          fallbackReason: null,
+        };
+      }
+      return {
+        source: "fixture-fallback",
+        status: workOrderReply.status,
+        data: fallback,
+        fallbackReason: workOrderReply.fallbackReason,
+      };
+    },
+    fetchAttemptJournal: async <T>(
+      attemptId: string,
+      fallback: T,
+    ): Promise<LiveEndpointResult<T>> => {
+      journalIds.push(attemptId);
+      const reply = journalReply ?? workOrderReply;
       if (reply.source === "api") {
         return {
           source: "api",
@@ -246,5 +296,149 @@ describe("loadAttemptContext", () => {
       reason: "the attempt record names no work order",
     });
     expect(client.viewed).toEqual([]);
+  });
+
+  it("reads the journal for the found view", async () => {
+    const client = fakeWorkOrderClient(
+      { source: "api", data: FOUND_ENVELOPE },
+      { source: "api", data: JOURNAL_ENVELOPE },
+    );
+    const context = await loadAttemptContext(foundData("wo-live-1"), client);
+    expect(client.journalIds).toEqual(["att_live_1"]);
+    expect(context.journal).toEqual({
+      panel: "listed",
+      entries: [
+        {
+          id: "jr_2",
+          action: "collect",
+          status: "ambiguous",
+          recordedAtIso: "2026-10-24T10:00:10Z",
+          sessionId: null,
+          detail: null,
+          stopReason: null,
+        },
+        {
+          id: "jr_1",
+          action: "dispatch",
+          status: "completed",
+          recordedAtIso: "2026-10-24T10:00:05Z",
+          sessionId: "ses_live_1",
+          detail: null,
+          stopReason: null,
+        },
+      ],
+    });
+  });
+
+  it("reads the journal for the unknown view", async () => {
+    const client = fakeWorkOrderClient(
+      { source: "api", data: null },
+      { source: "api", data: JOURNAL_ENVELOPE },
+    );
+    const context = await loadAttemptContext(UNKNOWN_DATA, client);
+    expect(context.workOrder).toEqual({ panel: "not-read" });
+    expect(client.journalIds).toEqual(["att_live_1"]);
+    expect(context.journal.panel).toBe("listed");
+  });
+
+  it("does not read the journal for the sample view", async () => {
+    const client = fakeWorkOrderClient({ source: "api", data: null });
+    const context = await loadAttemptContext(SAMPLE_DATA, client);
+    expect(client.journalIds).toEqual([]);
+    expect(context.journal).toEqual({ panel: "not-read" });
+  });
+
+  it("does not read the journal for the not-found view", async () => {
+    const client = fakeWorkOrderClient({ source: "api", data: null });
+    const context = await loadAttemptContext(NOT_FOUND_DATA, client);
+    expect(client.journalIds).toEqual([]);
+    expect(context.journal).toEqual({ panel: "not-read" });
+  });
+
+  it("does not read the journal for the error view", async () => {
+    const client = fakeWorkOrderClient({ source: "api", data: null });
+    const context = await loadAttemptContext(ERROR_DATA, client);
+    expect(client.journalIds).toEqual([]);
+    expect(context.journal).toEqual({ panel: "not-read" });
+  });
+
+  it("does not read the journal for the missing-id view", async () => {
+    const client = fakeWorkOrderClient({ source: "api", data: null });
+    const context = await loadAttemptContext(MISSING_ID_DATA, client);
+    expect(client.journalIds).toEqual([]);
+    expect(context.journal).toEqual({ panel: "not-read" });
+  });
+
+  it("returns not-found when the journal route answers 404", async () => {
+    const client = fakeWorkOrderClient(
+      { source: "api", data: FOUND_ENVELOPE },
+      {
+        source: "fixture-fallback",
+        status: 404,
+        fallbackReason:
+          "api boundary returned 404 for /v1/attempts/att_live_1/journal",
+      },
+    );
+    const context = await loadAttemptContext(foundData("wo-live-1"), client);
+    expect(context.journal).toEqual({ panel: "not-found" });
+  });
+
+  it("keeps a journal fallback reason verbatim", async () => {
+    const client = fakeWorkOrderClient(
+      { source: "api", data: FOUND_ENVELOPE },
+      {
+        source: "fixture-fallback",
+        status: 500,
+        fallbackReason: "upstream exploded",
+      },
+    );
+    const context = await loadAttemptContext(foundData("wo-live-1"), client);
+    expect(context.journal).toEqual({
+      panel: "error",
+      reason: "upstream exploded",
+    });
+  });
+
+  it("returns not-read when the journal boundary is not configured", async () => {
+    const client = fakeWorkOrderClient(
+      { source: "api", data: FOUND_ENVELOPE },
+      {
+        source: "fixture-fallback",
+        status: null,
+        fallbackReason: "api boundary is not configured",
+      },
+    );
+    const context = await loadAttemptContext(foundData("wo-live-1"), client);
+    expect(context.journal).toEqual({ panel: "not-read" });
+  });
+
+  it("reports a non-OK journal code with the live.ts wording", async () => {
+    const client = fakeWorkOrderClient(
+      { source: "api", data: FOUND_ENVELOPE },
+      { source: "api", data: { code: "REFUSED", result: null } },
+    );
+    const context = await loadAttemptContext(foundData("wo-live-1"), client);
+    expect(context.journal).toEqual({
+      panel: "error",
+      reason: "api boundary answered REFUSED for /v1/attempts/att_live_1/journal",
+    });
+  });
+
+  it("brings a work-order error and a listed journal together", async () => {
+    const client = fakeWorkOrderClient(
+      {
+        source: "fixture-fallback",
+        status: 500,
+        fallbackReason: "upstream exploded",
+      },
+      { source: "api", data: JOURNAL_ENVELOPE },
+    );
+    const context = await loadAttemptContext(foundData("wo-live-1"), client);
+    expect(context.workOrder).toEqual({
+      panel: "error",
+      workOrderId: "wo-live-1",
+      reason: "upstream exploded",
+    });
+    expect(context.journal.panel).toBe("listed");
   });
 });

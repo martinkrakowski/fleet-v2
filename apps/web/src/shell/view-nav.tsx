@@ -3,10 +3,12 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
+// "sample" marks views that show sample data only; Lanes, Projects and Attempt read the API when configured.
 const VIEWS = [
   {
     href: "/lanes",
     label: "Lanes",
+    sample: false,
     icon: (
       <svg className="ic" viewBox="0 0 24 24" aria-hidden="true">
         <path d="M4 6h16" />
@@ -18,6 +20,7 @@ const VIEWS = [
   {
     href: "/projects",
     label: "Projects",
+    sample: false,
     icon: (
       <svg className="ic" viewBox="0 0 24 24" aria-hidden="true">
         <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
@@ -27,6 +30,7 @@ const VIEWS = [
   {
     href: "/attempt",
     label: "Attempt",
+    sample: false,
     icon: (
       <svg className="ic" viewBox="0 0 24 24" aria-hidden="true">
         <path d="M8 5v14l11-7z" />
@@ -36,6 +40,7 @@ const VIEWS = [
   {
     href: "/brief",
     label: "Brief",
+    sample: true,
     icon: (
       <svg className="ic" viewBox="0 0 24 24" aria-hidden="true">
         <path d="M7 3h7l4 4v14H7z" />
@@ -46,6 +51,7 @@ const VIEWS = [
   {
     href: "/knowledge",
     label: "Knowledge",
+    sample: true,
     icon: (
       <svg className="ic" viewBox="0 0 24 24" aria-hidden="true">
         <path d="M12 3a6 6 0 0 1 3.5 10.8V16h-7v-2.2A6 6 0 0 1 12 3z" />
@@ -61,21 +67,31 @@ export function ViewNav() {
     <div className="sidebar-section">
       <div className="sidebar-label">Views</div>
       <nav className="sidebar-nav" aria-label="Views">
-        {VIEWS.map((view) => (
-          <Link
-            key={view.href}
-            href={view.href}
-            className="sidebar-link"
-            data-tooltip={view.label}
-            aria-label={view.label}
-            aria-current={
-              pathname?.startsWith(view.href) ? ("page" as const) : undefined
-            }
-          >
-            {view.icon}
-            <span className="sidebar-link-label">{view.label}</span>
-          </Link>
-        ))}
+        {VIEWS.map((view) => {
+          const name = view.sample
+            ? view.label + " (sample data)"
+            : view.label;
+          return (
+            <Link
+              key={view.href}
+              href={view.href}
+              className="sidebar-link"
+              data-tooltip={name}
+              aria-label={name}
+              aria-current={
+                pathname?.startsWith(view.href) ? ("page" as const) : undefined
+              }
+            >
+              {view.icon}
+              <span className="sidebar-link-label">
+                {view.label}
+                {view.sample ? (
+                  <span className="sidebar-link-sample">sample</span>
+                ) : null}
+              </span>
+            </Link>
+          );
+        })}
       </nav>
     </div>
   );

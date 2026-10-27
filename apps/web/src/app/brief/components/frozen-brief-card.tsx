@@ -49,7 +49,7 @@ export function FrozenBriefCard({
       <CardBody>
         <div className={styles.stamp}>
           <span>
-            digest <b>{digest}</b>
+            sample digest <b>{digest}</b>
           </span>
           <span>
             frozen <b>{frozenAt}</b>

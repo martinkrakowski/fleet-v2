@@ -145,6 +145,9 @@ function fakeClient(
         fallbackReason: reply.fallbackReason,
       };
     },
+    fetchAttemptJournal: async () => {
+      throw new Error("unused");
+    },
     fetchHeadEvidenceView: async () => {
       throw new Error("unused");
     },

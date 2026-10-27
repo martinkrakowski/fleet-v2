@@ -538,3 +538,35 @@
   color: var(--text);
   font-size: 0.84rem;
 }
+
+/* ------------------------------------------------------------------ */
+/* Live attempt view (W1a)                                              */
+/* ------------------------------------------------------------------ */
+
+.liveStatus {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.cliHint {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--border-color-light);
+}
+
+.cliHint:last-child {
+  border-bottom: none;
+}
+
+.cliCommand {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  overflow-wrap: anywhere;
+}
+
+.cliDisabled {
+  color: var(--text-faint);
+}

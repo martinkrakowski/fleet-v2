@@ -75,7 +75,7 @@ export function LaneRow({
           <span
             className={styles.openLink}
             aria-disabled="true"
-            title="the attempt view does not read the API yet"
+            title="no attempt id recorded"
           >
             no live view
           </span>

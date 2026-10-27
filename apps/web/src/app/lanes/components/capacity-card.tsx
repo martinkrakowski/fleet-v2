@@ -88,7 +88,7 @@ export function CapacityCard({
                 <span
                   key={a.id}
                   className={styles.qitem}
-                  title="the attempt view does not read the API yet"
+                  title="no attempt id recorded"
                 >
                   {chip}
                 </span>

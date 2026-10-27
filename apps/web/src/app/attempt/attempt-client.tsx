@@ -1,8 +1,35 @@
 "use client";
 
-import { useSearchParams } from "next/navigation";
-import type { BadgeVariant } from "@fleet/ui";
-import { FIXTURE, findAttempt, workOrderOf, attemptsOf, summarize } from "./fixture";
+import { useEffect, useState, type ReactNode } from "react";
+import Link from "next/link";
+import {
+  Badge,
+  Banner,
+  Card,
+  CardBody,
+  CardHeader,
+  EmptyState,
+  KeyValueList,
+  KeyValueRow,
+  RouteChip,
+  type BadgeVariant,
+} from "@fleet/ui";
+import {
+  FIXTURE,
+  findAttempt,
+  workOrderOf,
+  attemptsOf,
+  summarize,
+} from "./fixture";
+import type { AttemptPageData } from "./live";
+import {
+  ATTEMPT_REFRESH_MS,
+  useAutoRefresh,
+} from "../lanes/use-auto-refresh";
+import { attemptIdHref } from "../lanes/derive";
+import { announcementFor, cliHints } from "./live-view";
+import { LiveAttemptRecord } from "./components/live-attempt-record";
+import { LiveOperationsCard } from "./components/live-operations-card";
 import { AttemptHeader } from "./components/attempt-header";
 import { RunnerFactsGrid } from "./components/runner-facts-grid";
 import { AttemptLifecycleStepper } from "./components/attempt-lifecycle-stepper";
@@ -15,13 +42,198 @@ import { WorkOrderSidebar } from "./components/work-order-sidebar";
 import { OperationsSidebar } from "./components/operations-sidebar";
 import styles from "./attempt.module.css";
 
-export default function AttemptPage() {
-  const searchParams = useSearchParams();
-  const id = searchParams.get("id") ?? "";
-  const attempt = findAttempt(id) ?? FIXTURE.attempts[0];
+function sampleTree(attemptId: string) {
+  const attempt = findAttempt(attemptId) ?? FIXTURE.attempts[0];
   const workOrder = workOrderOf(attempt);
   const siblings = attemptsOf(attempt.wo);
   const [word, note, variant] = summarize(attempt);
+  return { attempt, workOrder, siblings, word, note, variant };
+}
+
+function routeLine(data: AttemptPageData): ReactNode {
+  switch (data.view) {
+    case "found":
+    case "unknown":
+    case "not-found":
+      return (
+        <>
+          <RouteChip>live · GET /v1/attempts/{data.attemptId}</RouteChip>
+          <p className={styles.muted}>
+            Recorded state, not a runner observation · read{" "}
+            <time dateTime={data.observedAtIso}>{data.observedAtIso}</time> ·
+            refreshes every 10 s while this tab is visible
+          </p>
+        </>
+      );
+    case "error":
+      return <RouteChip variant="gap">error · {data.reason}</RouteChip>;
+    case "sample":
+      return (
+        <RouteChip variant="gap">sample · {data.fallbackReason}</RouteChip>
+      );
+    case "missing-id":
+      return null;
+  }
+}
+
+function renderSidebar(
+  data: AttemptPageData,
+  onCopied: (message: string) => void,
+): ReactNode {
+  switch (data.view) {
+    case "sample": {
+      const { attempt, workOrder, siblings, word } = sampleTree(data.attemptId);
+      return (
+        <>
+          <aside aria-label="Work order">
+            <WorkOrderSidebar
+              attempt={attempt}
+              workOrder={workOrder}
+              siblings={siblings}
+            />
+          </aside>
+          <aside className={styles.opsCol} aria-label="Operations">
+            <OperationsSidebar attempt={attempt} word={word} />
+          </aside>
+        </>
+      );
+    }
+    case "found":
+      return (
+        <>
+          <Card>
+            <CardHeader title="Work order" />
+            <CardBody>
+              <KeyValueList>
+                <KeyValueRow term="work order" mono>
+                  {data.attempt.workOrderId}
+                </KeyValueRow>
+              </KeyValueList>
+              <p className={styles.muted}>
+                The work order's details are not read on this page yet.
+              </p>
+            </CardBody>
+          </Card>
+          <LiveOperationsCard hints={cliHints(data)} onCopied={onCopied} />
+        </>
+      );
+    case "unknown":
+      return <LiveOperationsCard hints={cliHints(data)} onCopied={onCopied} />;
+    case "not-found":
+      return <p className={styles.muted}>nothing to act on</p>;
+    default:
+      return null;
+  }
+}
+
+function renderRecord(data: AttemptPageData): ReactNode {
+  switch (data.view) {
+    case "sample": {
+      const { attempt, siblings, word, note, variant } = sampleTree(
+        data.attemptId,
+      );
+      const notInFixture = data.attemptId !== "" && !findAttempt(data.attemptId);
+      return (
+        <>
+          <Banner tone="warn" title="Sample data, not this station">
+            <p>
+              The API boundary is not configured, so this page shows a sample
+              attempt and never refreshes.
+            </p>
+            {notInFixture ? (
+              <p>
+                {data.attemptId} is not in the sample data; showing sample
+                attempt {attempt.id}.
+              </p>
+            ) : null}
+          </Banner>
+          <AttemptHeader
+            attempt={attempt}
+            word={word}
+            note={note}
+            wordVariant={variant as BadgeVariant}
+            siblingCount={siblings.length}
+          />
+          <RunnerFactsGrid attempt={attempt} />
+          <AttemptLifecycleStepper attempt={attempt} />
+          <ModelCostCard attempt={attempt} />
+          <WorktreeCard attempt={attempt} />
+          <ReadinessCard attempt={attempt} />
+          <ReceiptsCard attempt={attempt} />
+          <FrozenBriefAccordion attempt={attempt} />
+        </>
+      );
+    }
+    case "found":
+      return <LiveAttemptRecord data={data} />;
+    case "unknown":
+      return (
+        <>
+          <div className={styles.headBadges}>
+            <span className="mono">{data.attemptId}</span>
+            <Badge tone="unknown">unknown</Badge>
+          </div>
+          <Banner
+            tone="warn"
+            title="Recorded host cannot be resolved: holds its slot"
+          >
+            <p>
+              <code>{data.reason}</code>
+            </p>
+            <p>
+              Not idle, not a pass. Every operation below is disabled until the
+              host resolves.
+            </p>
+          </Banner>
+        </>
+      );
+    case "not-found":
+      return (
+        <EmptyState
+          title={`Attempt ${data.attemptId} is not recorded on this station`}
+          description="Live, not sample data: GET /v1/attempts/:id answered not-found."
+          actions={<Link href="/lanes">Open Lanes</Link>}
+        />
+      );
+    case "error":
+      return (
+        <Banner tone="danger" title="The API did not answer as expected">
+          <p>
+            <code>{data.reason}</code>
+          </p>
+          <p>
+            Nothing here is sample data. Retrying every 10 s while this tab is
+            visible; no write is ever retried.
+          </p>
+        </Banner>
+      );
+    case "missing-id":
+      return (
+        <EmptyState
+          title="No attempt selected"
+          description="Open an attempt from Lanes."
+          actions={
+            <>
+              <Link href="/lanes">Open Lanes</Link>
+              {data.newestAttemptId !== null ? (
+                <Link href={attemptIdHref(data.newestAttemptId)}>
+                  Open the most recently updated attempt {data.newestAttemptId}
+                </Link>
+              ) : null}
+            </>
+          }
+        />
+      );
+  }
+}
+
+export default function AttemptPage({ data }: { data: AttemptPageData }) {
+  useAutoRefresh(data.source, data.fallbackReason, ATTEMPT_REFRESH_MS);
+  const [copied, setCopied] = useState<string | null>(null);
+  // A copy confirmation lasts until the next data update, so later state changes are announced.
+  useEffect(() => {
+    setCopied(null);
+  }, [data]);
 
   return (
     <div className={styles.layout} data-contained-scroll>
@@ -31,12 +243,7 @@ export default function AttemptPage() {
         role="region"
         aria-label="Work order and operations"
       >
-        <aside aria-label="Work order">
-          <WorkOrderSidebar attempt={attempt} workOrder={workOrder} siblings={siblings} />
-        </aside>
-        <aside className={styles.opsCol} aria-label="Operations">
-          <OperationsSidebar attempt={attempt} word={word} />
-        </aside>
+        {renderSidebar(data, setCopied)}
       </div>
 
       <section
@@ -45,20 +252,11 @@ export default function AttemptPage() {
         role="region"
         aria-label="Attempt record"
       >
-        <AttemptHeader
-          attempt={attempt}
-          word={word}
-          note={note}
-          wordVariant={variant as BadgeVariant}
-          siblingCount={siblings.length}
-        />
-        <RunnerFactsGrid attempt={attempt} />
-        <AttemptLifecycleStepper attempt={attempt} />
-        <ModelCostCard attempt={attempt} />
-        <WorktreeCard attempt={attempt} />
-        <ReadinessCard attempt={attempt} />
-        <ReceiptsCard attempt={attempt} />
-        <FrozenBriefAccordion attempt={attempt} />
+        <p className={styles.liveStatus} aria-live="polite">
+          {copied ?? announcementFor(data)}
+        </p>
+        {routeLine(data)}
+        {renderRecord(data)}
       </section>
     </div>
   );

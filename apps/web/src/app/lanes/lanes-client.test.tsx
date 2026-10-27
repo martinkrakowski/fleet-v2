@@ -23,7 +23,7 @@ describe("LanesClient live-source wiring", () => {
   const attention = read("components", "attention-card.tsx");
   const refresh = read("use-auto-refresh.ts");
 
-  it("labels live API rows and never links them to the fixture-only attempt view", () => {
+  it("labels live API rows and opens the attempt view for every row with an id", () => {
     expect(client).toContain("live · GET /v1/attempts");
     expect(client).not.toContain('import { attempts');
     expect(row).toMatch(
@@ -33,14 +33,15 @@ describe("LanesClient live-source wiring", () => {
     expect(row).not.toContain("href={attemptHref(");
     expect(row).toContain("no live view");
     expect(row).toContain('aria-disabled="true"');
-    expect(row).toContain("the attempt view does not read the API yet");
+    expect(row).toContain("no attempt id recorded");
+    expect(row).not.toContain("the attempt view does not read the API yet");
     expect(row).toContain("observedLine(attempt, note)");
     expect(capacity).toMatch(
       /import\s*\{[^}]*\bliveViewHref\b[^}]*\}\s*from\s*"\.\.\/derive"/,
     );
     expect(capacity).toContain("liveViewHref(a)");
     expect(capacity).not.toContain("href={attemptHref(");
-    expect(capacity).toContain("the attempt view does not read the API yet");
+    expect(capacity).toContain("no attempt id recorded");
   });
 
   it("reports that the API does not serve the slot budget", () => {

@@ -6,6 +6,9 @@ import type { LanesData } from "./live";
 
 export const NOT_CONFIGURED_REASON = "api boundary is not configured";
 
+/** The attempt page re-reads faster than /lanes while push updates (E3c) are not built. */
+export const ATTEMPT_REFRESH_MS = 10_000;
+
 /**
  * The Lanes page re-fetches while the tab is visible when the source is the
  * live API or the page fell back to the fixture because a configured API

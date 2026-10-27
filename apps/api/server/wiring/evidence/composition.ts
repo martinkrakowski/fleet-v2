@@ -12,7 +12,9 @@ import {
   OwnerDecisionAdapter,
   VerificationExecutorAdapter,
   type AttemptOwnerDecisionDelegate,
+  type IndependentReviewTransportResult,
   type OwnerDecisionDelegate,
+  type RunIndependentReviewRequest,
 } from "@fleet/evidence-and-acceptance";
 import { resolveRoleExecutors } from "@fleet/work-execution";
 import { requireValidInstallationModel, type FleetInstallation } from "@fleet/installation";
@@ -58,6 +60,12 @@ export interface EvidenceUseCasesOptions {
     readonly stdout: string;
     readonly stderr?: string;
   }>;
+  /**
+   * Transport to the installation's reviewer seat, built by the runtime from the
+   * reviewer chains. Absent means no reviewer is configured: requests report
+   * `No independent review transport is configured`.
+   */
+  readonly runReview?: (request: RunIndependentReviewRequest) => Promise<IndependentReviewTransportResult>;
 }
 
 function createEvidenceUseCases(): EvidenceUseCases {
@@ -120,7 +128,9 @@ export function createConfiguredEvidenceUseCases(
             ? { runGh: options.forgeGhRunner }
             : {}),
         });
-  const reviewer = new IndependentReviewAdapter();
+  const reviewer = new IndependentReviewAdapter(
+    options?.runReview !== undefined ? { runReview: options.runReview } : {},
+  );
   const ownerDecisionPort = new OwnerDecisionAdapter(crossContext?.ownerDecision);
   const attemptOwnerDecisionPort = new AttemptOwnerDecisionAdapter(
     crossContext?.attemptOwnerDecision,

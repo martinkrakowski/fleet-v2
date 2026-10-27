@@ -5,6 +5,9 @@
 - **Status:** rev 3.2. Rev 1 applied Fable's review of the research; rev 2 added the orchestrator
   request channel (§3.6) and the live tail (§3.7) from Fable's design review; rev 3 applied Grok
   4.7's review of rev 2, rev 3.1 its re-review, and rev 3.2 CodeRabbit's review (§7). Decisions in §5 are open with defaults. Nothing built. Anchors checked against `main` at `dae491f`.
+  Amended 2026-10-27 by the conductor plan's amendment K-GC (§3.3 note, A-F and W7c): two run-stop
+  keys, the `stop-already-requested` and `stop-already-forced` refusals, "Stop now", the halt exit,
+  and a read-only view of the reaper's findings.
 - **Owner requests (2026-10-27):**
   - "Given all of the fleet-v2 features and functionality, the UI lacks interactivity with the
     actual lanes, and orchestration. Run a sub-agent to research UI/UX improvements. The have Fable
@@ -153,7 +156,10 @@ drives a step.
   `conductor halt`. It never depends on a live orchestrator. Body: "parks every run before its
   next external action; does not stop a running lane".
 - **Stop** is a direct route (A-C) that writes a keyed run-journal entry `<runId>/stop@web`
-  carrying the run's `expectedRevision`. The driver obeys it and stops the running attempt itself
+  carrying the run's `expectedRevision`. **Amended by K-GC (conductor §3.9; note below):** the rest
+  of this bullet, its outcome table and its body describe the forced stop, "Stop now", keyed
+  `<runId>/stop-force@web`; `<runId>/stop@web` now names the graceful stop, which calls no
+  `StopAttempt` because of the stop. For the forced entry, the driver stops the running attempt itself
   through `StopAttempt` (conductor §3.2: "a running attempt is stopped first through
   `StopAttempt`"). The web never calls `StopAttempt` for an attempt that belongs to a run. The
   driver maps `StopAttempt`'s outcome as follows:
@@ -179,6 +185,34 @@ drives a step.
   run's `expectedRevision`, and the claimant journals it under `<runId>/park/<n>/resume@web`, so a
   repeat is refused by K1b's uniqueness check.
 
+**Amendment K-GC: two stop modes.** Amended 2026-10-27 by the conductor plan's amendment K-GC
+(`2026-10-27_conductor-plan.md` §3.9, D11). The text above is unchanged; this note adds to it.
+- **Two stop keys.** A-C writes a graceful stop as `<runId>/stop@web` and a forced stop as
+  `<runId>/stop-force@web`. The mode is read from the key, and the entry's `mode` must match it. The
+  `<runId>/stop@web` entry above now names a graceful stop; the outcome table above is the forced stop's.
+- **Park reasons the run card names.** Beside `stop-unconfirmed`, a run may park `stop-refused`
+  (a `StopAttempt` refusal, with its typed kind: `attempt-missing`, `attempt-terminal`,
+  `runner-unavailable`, `runner-refused`, `other`), `acceptance-rejected`, `step-refused` or
+  `owner-merge` (conductor §3.6). The card shows the reason and the kind as fixed text, never a
+  free-text refusal message.
+- **Graceful (the default, "Stop").** The conductor issues no new action for the run; the running
+  attempt may finish, its work is collected and gated and kept on the branch, then the run ends
+  `stopped`. Body: "records a graceful stop for run <id>; the running attempt <id> may finish; its work
+  is collected, gated and kept on the branch; then the run ends as `stopped`; does not merge, push,
+  revert or delete anything; a stopped run cannot be resumed" (danger tone).
+- **Forced ("Stop now").** Offered beside "Stop", and while a graceful stop is pending. Body: the
+  P7-write stop body above, plus "uncommitted work in the attempt's worktree is abandoned" (danger tone).
+- **One way only, one stop per mode.** A force may follow a graceful stop. K1b refuses a stop no
+  stronger than the run's recorded ones, whichever channel wrote them: `stop-already-requested` for the
+  same mode (a web graceful stop after a CLI one), `stop-already-forced` for a graceful after a force.
+  A-C returns the typed reason and W7b shows it verbatim (§6 "Error"). W7b hides "Stop" once a force is
+  recorded.
+- **Halt.** A run halted during a stop leaves its `halted` park by itself once the halt is lifted, and
+  the stop continues; no resume is needed, and none is offered while a stop is pending.
+- **On the card.** A run with a graceful stop pending shows "stopping" with its wait reason
+  (`stop-draining`, or `stop-grace-exceeded` past the grace); it is not parked and not yet `stopped`.
+  Resume stays refused with `stop-pending`.
+
 ### 3.4 Attempt actions after the write path
 
 **P5.** Reconcile, stop, collect and request acceptance from the attempt page, through the T6
@@ -194,7 +228,7 @@ with a pointer to the run, and the page offers the run's stop (P7-write) instead
 | `POST /v1/attempts/:id/artifacts` | Safe to repeat | Collects against the completion receipt; does not judge the work |
 | `POST /v1/attempts/:id/acceptance` | Assessment at a head; repeat re-assesses | Requests acceptance; does not merge |
 | Halt (K7 route) | Writing the marker twice is harmless | See P7-write |
-| Run stop (A-C route) | Keyed run-journal entry `<runId>/stop@web` with `expectedRevision`; K1b refuses a second one | See P7-write |
+| Run stop (A-C route) | Keyed run-journal entry `<runId>/stop@web` with `expectedRevision`; K1b refuses a second one. Amended by K-GC: `stop@web` is graceful, `stop-force@web` forced; K1b also refuses `stop-already-requested` and `stop-already-forced` | See P7-write and its K-GC note |
 | `POST /v1/requests` | Client-minted ULID `requestId`; a repeat POST returns the existing record | See §3.6 |
 | `POST /v1/questions/:id/answers` | Q1b's revision and idempotency rules; built as Q5; never through the channel | One-way answers show the bytes to sign; the web cannot sign |
 | Owner messages | T2b's idempotency keys; the only path for prose | — |
@@ -456,8 +490,8 @@ different packages and no shared file. The shared files here are `apps/web/src/l
 file. Within each step the `apps/web` lanes run in the order given by their arrows and "After"
 column, one after another; they run beside API, domain, security and conductor lanes. Lanes marked
 **manifest** edit `.architecture/manifest.yaml` and run one at a time in this order: A-J → O1a →
-O1b → O2a → O2b → L0 → L1 → O3 → O2c → A-R → A-C → O9 → A-WO → A-K → A-S, each rebased on the last.
-`composition.ts` lanes (A-J, O3, L3, E3b, L9, A-R, A-C, L8, A-WO, A-K, A-S) likewise run one at a
+O1b → O2a → O2b → L0 → L1 → O3 → O2c → A-R → A-C → O9 → A-WO → A-K → A-S → A-F (amendment K-GC), each rebased on the last.
+`composition.ts` lanes (A-J, O3, L3, E3b, L9, A-R, A-C, L8, A-WO, A-K, A-S, A-F) likewise run one at a
 time. The work-execution lanes here (A-J, L0, L1, L2, A-R, A-C, O9, A-WO) also queue behind the
 conductor's own work-execution lanes.
 
@@ -505,7 +539,7 @@ conductor's own work-execution lanes.
 | **Step 7. Conductor; serial A-R → A-C → O9; web: W7a → W7b** | | | | |
 | O2c | Journal-key reconciliation (`request/<requestId>`); enables `start-lane-run`, `prepare-fix`, `request-review`, `resume-run`; `start-lane-run` is claimable only by `cliKind: conductor` from the start (D7); intent before the action, result after; the same fault-injection tests under K1b | operator-coordination, **manifest** | 2 | O2b, K1b, O3 (manifest) |
 | A-R | `GET /v1/runs`, `/v1/runs/:id`, run journal by key | work-execution, apps/api, **`composition.ts`, manifest** | 2 | K3, O2c (manifest), L2 (work-execution) |
-| A-C | Direct run routes: halt marker through the CLI's adapter; run stop as a keyed run-journal entry `<runId>/stop@web` with `expectedRevision`; attempt stop refuses run-owned attempts; run reads report the stop outcome mapping (§3.3), including `stop-unconfirmed` parks | work-execution, apps/api, **`composition.ts`, manifest** | 2 | A-R, K7, T3a |
+| A-C | Direct run routes: halt marker through the CLI's adapter; run stop as a keyed run-journal entry `<runId>/stop@web` with `expectedRevision` (amended by K-GC: graceful; `<runId>/stop-force@web` for "Stop now"); attempt stop refuses run-owned attempts; run reads report the stop outcome mapping (§3.3), including `stop-unconfirmed` parks | work-execution, apps/api, **`composition.ts`, manifest** | 2 | A-R, K7, T3a |
 | O9 | The conductor driver registers and claims `start-lane-run` (the claim rules already exist from O2b and O2c) | work-execution, apps/cli, **`index.ts`, manifest** | 2 | A-C, O5, K3, K7, O2c |
 | W7a | Run board read, dry-run and shadow entries distinct | apps/web | 2 | A-R, K7, W8b |
 | W7b | Halt and run-stop controls; resume and start as requests (O8's card) | apps/web | 2 | W7a, A-C, O8 |
@@ -517,6 +551,8 @@ conductor's own work-execution lanes.
 | W6 | Work-order list and brief viewer for a real attempt's frozen brief | apps/web | 2 | A-WO, W7b |
 | A-K → WK | Knowledge candidates route over `ListCandidateClaims`; live `/knowledge` read | apps/api, **`composition.ts`, manifest**; apps/web | 2 | A-WO (manifest); WK after W6 |
 | A-S → W9 | Seats read route (plan, cursors, last probe); seats view | apps/api, **`composition.ts`, manifest**; apps/web | 2 | S1a, A-K (manifest); W9 after WK |
+| A-F | Reaper findings read route (`GET /v1/reaper/findings`) over a list use case on K11a's findings store; read-only (amendment K-GC) | work-execution (application), apps/api, **`composition.ts`, manifest** | 2 | K11a, A-S (manifest, `composition.ts`) |
+| W7c | Reaper findings on the run board: kind, subject, sightings, report or repaired; read-only; repairs stay in the CLI (amendment K-GC) | apps/web | 2 | A-F, W7b, W9 |
 | **Step 9. Deferred** | Seats writes, P11 conflict graph, streaming gate and review output | — | — | owner |
 
 Every Tier 2 lane in this plan touches data safety, security or user-facing behaviour, so every

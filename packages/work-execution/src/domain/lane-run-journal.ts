@@ -111,11 +111,11 @@ function readLaneRunJournalEntryUnchecked(input: unknown): LaneRunJournalEntryRe
   if (runIdError !== null) {
     return { ok: false, error: runIdError };
   }
-  const modeError = entryModeError(parsedKey, snapshot.mode);
+  const modeError = entryModeError(kind, parsedKey, snapshot.mode);
   if (modeError !== null) {
     return { ok: false, error: modeError };
   }
-  const expectedRevisionError = entryExpectedRevisionError(parsedKey, snapshot.expectedRevision);
+  const expectedRevisionError = entryExpectedRevisionError(kind, parsedKey, snapshot.expectedRevision);
   if (expectedRevisionError !== null) {
     return { ok: false, error: expectedRevisionError };
   }
@@ -214,8 +214,12 @@ function entryRunIdError(
   return null;
 }
 
-function entryModeError(parsedKey: ParsedLaneRunKey | null, mode: unknown): string | null {
-  if (parsedKey !== null && parsedKey.kind === 'stop') {
+function entryModeError(
+  kind: LaneRunJournalEntryKind,
+  parsedKey: ParsedLaneRunKey | null,
+  mode: unknown,
+): string | null {
+  if (kind === 'intent' && parsedKey !== null && parsedKey.kind === 'stop') {
     if (mode !== parsedKey.mode) {
       return 'LaneRunJournal mode does not match its key';
     }
@@ -227,8 +231,12 @@ function entryModeError(parsedKey: ParsedLaneRunKey | null, mode: unknown): stri
   return null;
 }
 
-function entryExpectedRevisionError(parsedKey: ParsedLaneRunKey | null, expectedRevision: unknown): string | null {
-  if (parsedKey !== null && (parsedKey.kind === 'stop' || parsedKey.kind === 'resume')) {
+function entryExpectedRevisionError(
+  kind: LaneRunJournalEntryKind,
+  parsedKey: ParsedLaneRunKey | null,
+  expectedRevision: unknown,
+): string | null {
+  if (kind === 'intent' && parsedKey !== null && (parsedKey.kind === 'stop' || parsedKey.kind === 'resume')) {
     if (!Number.isSafeInteger(expectedRevision) || (expectedRevision as number) < 1) {
       return 'LaneRunJournal expectedRevision must be a positive integer on stop and resume intents and null elsewhere';
     }
@@ -287,7 +295,7 @@ function entryGrantIdError(kind: LaneRunJournalEntryKind, grantId: unknown): str
     return null;
   }
   if (grantId !== null) {
-    return 'LaneRunJournal grantId must be null except on an intent';
+    return 'LaneRunJournal grantId must be null except on a result';
   }
   return null;
 }

@@ -124,6 +124,11 @@ describe('readLaneRunJournalEntry', () => {
       intent(REQUEST_KEY),
       intent(REAPER_KEY),
       result(STEP_KEY, 'completed'),
+      result(STOP_KEY, 'completed'),
+      result(STOP_CLI_KEY, 'completed'),
+      result(FORCE_KEY, 'completed'),
+      result(FORCE_WEB_KEY, 'completed'),
+      result(RESUME_KEY, 'completed'),
       conduct('running'),
     ];
     for (const entry of entries) {
@@ -158,6 +163,13 @@ describe('readLaneRunJournalEntry', () => {
     [{ ...intent(STEP_KEY), recordedAtIso: '2026-02-31T10:00:00Z' }, 'LaneRunJournal recordedAtIso must be an ISO-8601 time with a zone'],
     [{ ...intent(STEP_KEY), key: null }, 'LaneRunJournal key must be a run journal key for intents and results and null for conduct'],
     [{ ...conduct('running'), key: STEP_KEY }, 'LaneRunJournal key must be a run journal key for intents and results and null for conduct'],
+    [{ ...intent(STOP_KEY), mode: null }, 'LaneRunJournal mode does not match its key'],
+    [{ ...result(STOP_KEY, 'completed'), mode: 'graceful' as LaneRunStopKeyMode }, 'LaneRunJournal mode does not match its key'],
+    [{ ...result(FORCE_WEB_KEY, 'completed'), mode: 'force' as LaneRunStopKeyMode }, 'LaneRunJournal mode does not match its key'],
+    [{ ...result(RESUME_KEY, 'completed'), expectedRevision: 1 }, 'LaneRunJournal expectedRevision must be a positive integer on stop and resume intents and null elsewhere'],
+    [{ ...result(STOP_CLI_KEY, 'completed'), expectedRevision: 1 }, 'LaneRunJournal expectedRevision must be a positive integer on stop and resume intents and null elsewhere'],
+    [{ ...intent(STEP_KEY), grantId: 'example-id' }, 'LaneRunJournal grantId must be null except on a result'],
+    [{ ...conduct('running'), grantId: 'example-id' }, 'LaneRunJournal grantId must be null except on a result'],
     [{ ...intent(STEP_KEY), runId: RUN_ID_2 }, 'LaneRunJournal runId does not match its key'],
     [{ ...conduct('running'), runId: null }, 'LaneRunJournal runId does not match its key'],
     [{ ...intent(RESUME_KEY), expectedRevision: null }, 'LaneRunJournal expectedRevision must be a positive integer on stop and resume intents and null elsewhere'],
@@ -256,6 +268,31 @@ describe('prepareLaneRunJournalAppend', () => {
     }));
     const decision = prepareLaneRunJournalAppend([intent(STEP_KEY)], intent(retryKey));
     expect(decision.ok).toBe(true);
+  });
+
+  it('appends valid results under stop and resume keys after their intents', () => {
+    for (const key of [STOP_KEY, STOP_CLI_KEY, FORCE_KEY, FORCE_WEB_KEY, RESUME_KEY]) {
+      const decision = prepareLaneRunJournalAppend([intent(key)], result(key, 'completed'));
+      expect(decision.ok).toBe(true);
+    }
+  });
+
+  it('refuses a result under a stop or resume key that carries intent-only fields', () => {
+    for (const key of [STOP_KEY, STOP_CLI_KEY, FORCE_KEY, FORCE_WEB_KEY, RESUME_KEY]) {
+      expect(prepareLaneRunJournalAppend([intent(key)], { ...result(key, 'completed'), mode: 'force' as LaneRunStopKeyMode }).ok).toBe(false);
+      expect(prepareLaneRunJournalAppend([intent(key)], { ...result(key, 'completed'), expectedRevision: 1 }).ok).toBe(false);
+    }
+  });
+
+  it('still refuses an intent under a stop key with no mode', () => {
+    const decision = prepareLaneRunJournalAppend([], { ...intent(STOP_KEY), mode: null });
+    expect(decision).toEqual({ ok: false, reason: 'stop-mode-mismatch', detail: null });
+    const read = readLaneRunJournalEntry({ ...intent(STOP_KEY), mode: null });
+    expect(read.ok).toBe(false);
+    if (read.ok) {
+      return;
+    }
+    expect(read.error).toBe('LaneRunJournal mode does not match its key');
   });
 
   it('refuses a result without its intent', () => {

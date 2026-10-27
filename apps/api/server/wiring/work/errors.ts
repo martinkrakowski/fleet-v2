@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 
 export const NOT_IMPLEMENTED_STATUS = 501;
 export const NOT_IMPLEMENTED_CODE = "NOT_IMPLEMENTED";
+export const TOO_MANY_STREAMS_STATUS = 503;
+export const TOO_MANY_STREAMS_CODE = "TOO_MANY_STREAMS";
 
 export interface ApiEnvelope {
   operationId: string;

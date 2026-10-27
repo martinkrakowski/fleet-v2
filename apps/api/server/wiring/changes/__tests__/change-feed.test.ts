@@ -195,4 +195,26 @@ describe('ChangeFeed', () => {
   it('rejects a capacity below 16', () => {
     expect(() => new ChangeFeed({ capacity: 8 })).toThrow();
   });
+
+  it('headSeq is 0 on a new feed and tracks emitted entries and resyncs', () => {
+    const feed = new ChangeFeed({ streamId: 'stream' });
+    expect(feed.headSeq).toBe(0);
+    feed.emit({
+      kind: 'attempt',
+      id: 'att-1',
+      stateFile: null,
+      before: null,
+      written: null,
+    });
+    feed.emit({
+      kind: 'attempt',
+      id: 'att-2',
+      stateFile: null,
+      before: null,
+      written: null,
+    });
+    expect(feed.headSeq).toBe(2);
+    feed.resync();
+    expect(feed.headSeq).toBe(3);
+  });
 });

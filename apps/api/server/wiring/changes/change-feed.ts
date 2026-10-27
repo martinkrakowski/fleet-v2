@@ -111,6 +111,11 @@ export class ChangeFeed {
     return this.emitFailuresCount;
   }
 
+  /** The sequence number of the newest entry (0 before the first). */
+  get headSeq(): number {
+    return this.seq;
+  }
+
   /**
    * Record a change signal. Never throws: any failure is counted in
    * `emitFailures` instead of propagating into the saving caller.

@@ -262,7 +262,20 @@ describe('OwnerItem open and create', () => {
       message: 'OwnerItem history is not a valid sequence for its state',
     },
     {
-      name: 'a reopen after a merged close',
+      name: 'a reopen directly after opened',
+      record: {
+        ...baseRecord(),
+        state: 'open',
+        resolution: null,
+        history: [
+          { event: 'opened', atIso: NOW, reason: null },
+          { event: 'reopened', atIso: NOW, reason: null },
+        ],
+      },
+      message: 'OwnerItem history is not a valid sequence for its state',
+    },
+    {
+      name: 'a reopen after a closed merge',
       record: {
         ...baseRecord(),
         state: 'open',
@@ -508,6 +521,47 @@ describe('OwnerItem merge transitions', () => {
       expect(merged.value.toRecord().history[3].reason).toBe('pr-closed');
       expect(merged.value.toRecord().history[4].reason).toBe('merged');
     }
+  });
+
+  it('refuses unknown observation states without changing the item', () => {
+    const item = opened();
+    const before = item.toRecord();
+    for (const state of ['reopened', 'OPEN', '', null]) {
+      const result = item.observePullRequest({
+        repository: 'example-org/example-repo',
+        number: 251,
+        state,
+        source: 'forge-observation',
+        observedAtIso: '2026-10-27T10:05:00.000Z',
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.code).toBe('invalid');
+        expect(result.error.message).toBe('OwnerItem observation state is unknown');
+      }
+      expect(item.toRecord()).toEqual(before);
+    }
+  });
+
+  it('does not reopen an open item on a closed observation', () => {
+    const item = opened();
+    const closed = item.observePullRequest({
+      repository: 'example-org/example-repo',
+      number: 251,
+      state: 'closed',
+      source: 'forge-observation',
+      observedAtIso: '2026-10-27T10:05:00.000Z',
+    });
+    expect(closed.success).toBe(true);
+    if (closed.success) {
+      expect(closed.value.getState()).toBe('closed');
+      expect(closed.value.toRecord().history.map((entry) => entry.event)).toEqual(['opened', 'closed']);
+    }
+  });
+
+  it('freezes its record', () => {
+    const item = opened();
+    expect(Object.isFrozen(item.toRecord())).toBe(true);
   });
 
   it('refuses observing another PR', () => {

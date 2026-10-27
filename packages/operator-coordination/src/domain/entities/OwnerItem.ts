@@ -452,11 +452,7 @@ function historyErrorValue(
       if (previous === null) {
         return 'invalid';
       }
-      if (previous.event === 'closed') {
-        if (previous.reason !== 'pr-closed') {
-          return 'invalid';
-        }
-      } else if (previous.event !== 'opened') {
+      if (previous.event !== 'closed' || previous.reason !== 'pr-closed') {
         return 'invalid';
       }
     }
@@ -783,6 +779,9 @@ export class OwnerItem {
     }
     const state = observation.state;
     const source = observation.source;
+    if (state !== 'merged' && state !== 'closed' && state !== 'open') {
+      return { success: false, error: new Error('OwnerItem observation state is unknown'), code: 'invalid' };
+    }
     if (typeof observation.observedAtIso !== 'string' || timestampErrorValue(observation.observedAtIso) !== null) {
       return unreadableInputResult();
     }
@@ -1071,7 +1070,13 @@ export class OwnerItem {
     const history = this.record.history.slice();
     history.push({ event: changes.historyEvent, atIso: changes.atIso, reason: changes.historyReason });
     if (history.length > OWNER_ITEM_LIMITS.history) {
-      history.splice(1, 1);
+      for (let index = 1; index < history.length - 1; index += 1) {
+        const follower = history[index + 1];
+        if (follower === undefined || follower.event !== 'reopened') {
+          history.splice(index, 1);
+          break;
+        }
+      }
     }
     const next: OwnerItemRecord = {
       version: this.record.version,
@@ -1107,9 +1112,9 @@ export class OwnerItem {
     return this.record.state;
   }
 
-  /** Fresh plain record; arrays and objects are fresh frozen copies. */
+  /** Fresh plain record; the record and its arrays/objects are fresh frozen copies. */
   toRecord(): OwnerItemRecord {
-    return {
+    return Object.freeze({
       version: this.record.version,
       itemId: this.record.itemId,
       projectId: this.record.projectId,
@@ -1131,6 +1136,6 @@ export class OwnerItem {
           (entry: OwnerItemHistoryEntryRecord): OwnerItemHistoryEntryRecord => Object.freeze({ ...entry }),
         ),
       ),
-    };
+    } as OwnerItemRecord);
   }
 }

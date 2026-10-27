@@ -66,7 +66,6 @@ describe("parseInspectEnvelope", () => {
 
     expect(parsed).not.toBeNull();
     expect(parsed?.outcome).toBe("found");
-    expect(parsed?.outcome).toBe("found");
     if (parsed?.outcome === "found") {
       expect(parsed.attempt.id).toBe("att_live_1");
       expect(parsed.attempt.runner).toEqual({

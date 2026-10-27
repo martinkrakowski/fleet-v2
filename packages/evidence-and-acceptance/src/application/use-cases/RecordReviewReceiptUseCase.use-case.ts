@@ -12,6 +12,7 @@ import type { EvidenceAssessmentRecord } from '../../domain/evidence-records.js'
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import { ReviewReceipt, isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
+import { placeholderEvidenceRefusal, placeholderReviewReceiptField } from '../../domain/placeholder-evidence.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { EvidenceSeatPolicyPort } from '../ports/out/EvidenceSeatPolicyPort.out-port.js';
 import type {
@@ -175,6 +176,12 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
         outcome: 'rejected',
         reason: validatedReceipt.error?.message ?? 'Invalid review receipt',
       };
+    }
+
+    // New writes only (plan §3.1, D1): stored receipts are not re-checked on load.
+    const placeholderField = placeholderReviewReceiptField(normalizedReceipt);
+    if (placeholderField !== null) {
+      return { outcome: 'rejected', reason: placeholderEvidenceRefusal('Review receipt', placeholderField) };
     }
 
     const aggregate = EvidenceAssessment.fromRecord(assessment);

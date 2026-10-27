@@ -8,6 +8,7 @@
 import type { EvidenceAssessmentRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { VerificationReceipt } from '../../domain/entities/VerificationReceipt.js';
+import { placeholderEvidenceRefusal, placeholderVerificationReceiptField } from '../../domain/placeholder-evidence.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type {
@@ -67,6 +68,11 @@ export class RecordVerificationReceiptUseCase implements RecordVerificationRecei
         outcome: 'rejected',
         reason: validatedReceipt.error?.message ?? 'Invalid verification receipt',
       };
+    }
+
+    const placeholderField = placeholderVerificationReceiptField(receipt);
+    if (placeholderField !== null) {
+      return { outcome: 'rejected', reason: placeholderEvidenceRefusal('Verification receipt', placeholderField) };
     }
 
     const assessment = await deps.repo.findAssessmentById(request.assessmentId);

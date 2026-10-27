@@ -8,6 +8,7 @@
 import type { EvidenceAssessmentRecord, ReviewFindingRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { FindingDisposition } from '../../domain/entities/FindingDisposition.js';
+import { placeholderEvidenceRefusal, placeholderFindingDispositionField } from '../../domain/placeholder-evidence.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type {
@@ -108,6 +109,10 @@ export class RecordFindingDispositionUseCase implements RecordFindingDisposition
         outcome: 'rejected',
         reason: 'A finding disposition requires a reason and an evidence reference',
       };
+    }
+    const placeholderField = placeholderFindingDispositionField(disposition);
+    if (placeholderField !== null) {
+      return { outcome: 'rejected', reason: placeholderEvidenceRefusal('Finding disposition', placeholderField) };
     }
     if (disposition.candidateHeadSha !== assessment.candidateHeadSha) {
       return {

@@ -9,6 +9,7 @@ import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import { ReviewReceipt, isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
+import { placeholderEvidenceRefusal, placeholderReviewReceiptField } from '../../domain/placeholder-evidence.js';
 import {
   EvidenceAssessmentRevisionConflictError,
   type EvidenceAssessmentRepositoryPort,
@@ -200,6 +201,11 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       policyRevision: request.policyRevision,
       completedAtIso: run.completedAtIso,
     };
+    // New writes only (plan §3.1, D1): stored receipts are not re-checked on load.
+    const placeholderField = placeholderReviewReceiptField(candidate);
+    if (placeholderField !== null) {
+      return { outcome: 'rejected', reason: placeholderEvidenceRefusal('Independent review receipt', placeholderField) };
+    }
     const validated = ReviewReceipt.create(candidate);
     if (!validated.success || validated.value === undefined) {
       return {

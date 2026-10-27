@@ -686,8 +686,8 @@ bounded_contexts:
     depends_on: []
     layers:
       domain:
-        entities: [ProjectProfile, CoordinationRequest, AuthorizationConsumption, RelayAcknowledgement, OwnerQuestion, OrchestratorSession, OrchestratorRequest]
-        value_objects: [CoordinationKind, CoordinationState, ActionAuthorization, PolicyReference, ObservationEnvelope]
+        entities: [ProjectProfile, CoordinationRequest, AuthorizationConsumption, RelayAcknowledgement, OwnerQuestion, OrchestratorSession, OrchestratorRequest, OwnerItem]
+        value_objects: [CoordinationKind, CoordinationState, ActionAuthorization, PolicyReference, ObservationEnvelope, OwnerItemKind]
       application:
         use_cases: [RegisterProjectProfileUseCase, UpdateProjectProfileUseCase, RetireProjectProfileUseCase, ListProjectProfilesUseCase, InspectProjectProfileUseCase, RecordProjectProbeUseCase, InspectConfiguredCapabilitiesUseCase, RequestScopedDecisionUseCase, ResolveActionAuthorizationUseCase, CheckOwnerDecisionUseCase, RecordAuthorizationConsumptionUseCase, PublishProjectObservationUseCase, ReadProjectAttentionUseCase, SendFleetRelayUseCase, RecordRelayAcknowledgementUseCase, InspectOutstandingCoordinationUseCase, AskOwnerQuestionUseCase, AnswerOwnerQuestionUseCase, ExpireOwnerQuestionsUseCase, AcknowledgeOwnerAnswerUseCase, ListOwnerQuestionsUseCase, ReadOwnerQuestionUseCase, SyncOneWayOwnerQuestionsUseCase, RegisterOrchestratorSessionUseCase, HeartbeatOrchestratorSessionUseCase, RetireOrchestratorSessionUseCase, ListOrchestratorSessionsUseCase, IssuePolicyForgeGrantUseCase, CancelPolicyGrantsUseCase]
         ports:
@@ -747,17 +747,19 @@ bounded_contexts:
       - { adapter: RelayTransportAdapter, implements: RelayTransportPort, integration: harness-notice-channel-or-local-outbox }
       - { adapter: NoopChangeSignalAdapter, implements: ChangeSignalPort, integration: in-process-noop }
     domain_specification:
-      aggregate_roots: [ProjectProfile, CoordinationRequest, OwnerQuestion, OrchestratorSession, OrchestratorRequest]
+      aggregate_roots: [ProjectProfile, CoordinationRequest, OwnerQuestion, OrchestratorSession, OrchestratorRequest, OwnerItem]
       child_ownership: { AuthorizationConsumption: CoordinationRequest, RelayAcknowledgement: CoordinationRequest }
       enum_values:
         CoordinationKind: [action-decision, policy-proposal, relay, registry-alert]
         CoordinationState: [proposed, awaiting-decision, approved, declined, executing, completed, unknown, expired, cancelled]
+        OwnerItemKind: [merge, secret, decision, backup, other]
       invariants:
         - "Authorization binds proposal digest, project, exact action, expected commit, policy and decision revisions."
         - "A policy grant is an ordinary approved action-decision named by the setting revision that authorised it (policy:autoMerge@<rev> for merge-pr, policy:conductor@<rev> for push-and-open-pr and push-to-pr) and bound to its work order, attempt and acceptance receipt; it grants nothing beyond that action at that head, and an unnamed resolve never returns it."
         - "Owner questions are a separate aggregate: answers validate against the question's own options and current revision, a one-way question is answered only by a verified signed decision, and no answer, acknowledgement, expiry or sync ever writes a coordination request or grants authority."
         - "Orchestrator sessions are a separate aggregate, never a coordination kind: a session records which agent CLI is registered, what it may claim and its lease; it grants nothing, and attached and attentive are derived from the injected clock, never stored."
         - "Orchestrator requests are a separate aggregate, never a coordination kind: a web request is a closed, ids-only mailbox entry that grants nothing; the claimant acts under its own existing authority, every claim mutation checks revision, fence and lease, and a dispatched request only links to the record that carries the truth."
+        - "An owner item grants nothing: it is the owner's to-do (merge, secret, decision, backup or other), its own aggregate and never a coordination kind. A merge item is closed only by an observed merge or close and reopened only by a forge observation of its PR open; a decision item only by a recorded choice or its plan's decided or removed row; neither may be withdrawn or marked done by the owner. One merge is one item, keyed (project, repository, number)."
         - "Existing approved policy may authorize routine bounded work. A signed answer does not grant unrelated or privileged host actions."
         - "Policy prose never silently becomes new machine authority; policy changes remain owner-approved versioned edits."
         - "A status delivery failure is visible but does not block ordinary work. Missing required authorization blocks the affected action."

@@ -27,6 +27,7 @@ import type {
   OrchestratorSessionScope,
   OrchestratorSessionStatus,
 } from '../orchestrator-session-records.js';
+import { plainArrayCopy } from '../record-input.js';
 
 export const ORCHESTRATOR_SESSION_LEASE_SECONDS = 90; // D6 default lease
 export const ORCHESTRATOR_SESSION_MAX_LEASE_SECONDS = 300; // a lease never reaches further past its heartbeat
@@ -418,19 +419,6 @@ function projectsErrorValue(projects: unknown): string | null {
 }
 
 const ARRAY_FIELDS: readonly string[] = ['projects', 'claims', 'scopes'];
-
-/** A fresh plain array copied by index (no iterator, no species); a non-array is returned unchanged. */
-function plainArrayCopy(value: unknown): unknown {
-  if (!Array.isArray(value)) {
-    return value;
-  }
-  const copy: unknown[] = [];
-  for (let index = 0; index < value.length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, index);
-    copy.push(descriptor === undefined ? undefined : descriptor.value);
-  }
-  return copy;
-}
 
 function distinctKindsError(
   field: string,

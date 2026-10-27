@@ -33,6 +33,7 @@ import type {
   OrchestratorRequestTargetRecord,
   OrchestratorRequestVia,
 } from '../orchestrator-request-records.js';
+import { readPlainObject } from '../record-input.js';
 
 export const ORCHESTRATOR_REQUEST_TTL_SECONDS = 30 * 60;        // D6 default and maximum
 export const ORCHESTRATOR_REQUEST_CLAIM_LEASE_SECONDS = 120;    // D6 claim lease (used by O1b-2)
@@ -797,38 +798,6 @@ export function isOrchestratorRequestClaimable(record: OrchestratorRequestRecord
  */
 function unreadableInputResult(): OrchestratorRequestResult {
   return { success: false, error: new Error('OrchestratorRequest input could not be read'), code: 'invalid' };
-}
-
-/**
- * A plain object with exactly the given own enumerable string keys, values
- * read through their own property descriptors (so no getter ever runs).
- * Anything else — a non-object, a prototype outside Object.prototype/null, a
- * missing or extra or non-enumerable key, a symbol key — returns null.
- */
-function readPlainObject(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return null;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    return null;
-  }
-  const ownKeys = Reflect.ownKeys(value);
-  if (ownKeys.length !== keys.length) {
-    return null;
-  }
-  const out: Record<string, unknown> = {};
-  for (const key of ownKeys) {
-    if (typeof key !== 'string' || !keys.includes(key)) {
-      return null;
-    }
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor === undefined || !descriptor.enumerable) {
-      return null;
-    }
-    out[key] = descriptor.value;
-  }
-  return out;
 }
 
 /**

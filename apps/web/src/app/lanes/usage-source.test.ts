@@ -45,6 +45,11 @@ describe("W10 usage chips source wiring", () => {
 
   it("adds the same chips to each work-order timeline attempt without making it a client component", () => {
     expect(timeline).toContain("usageSumText(");
+    expect(timeline).toContain("usageChip(");
+    expect(timeline).toContain("seatChipText(");
+    expect(timeline).toContain("modelChipText(");
+    expect(timeline).toContain('chip.estimate ? "warn"');
+    expect(row).toContain('chip.estimate ? "warn"');
     expect(timeline).not.toContain('"use client"');
   });
 });

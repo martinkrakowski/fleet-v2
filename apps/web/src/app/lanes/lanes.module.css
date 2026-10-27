@@ -412,6 +412,15 @@
   margin-top: var(--space-1);
 }
 
+/* A long model id wraps inside its chip instead of overflowing the row at phone width. */
+.chips > * {
+  max-width: 100%;
+  height: auto;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+
 .woSum {
   display: block;
   margin-top: var(--space-1);

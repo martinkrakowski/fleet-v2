@@ -5,6 +5,7 @@ export * from "./coordination-keys.js";
 export * from "./entities/index.js";
 export * from "./execution-records.js";
 export * from "./lane-diff-check.js";
+export * from "./lane-plan-graph.js";
 export * from "./lane-plan-records.js";
 export * from "./lane-plan-sidecar.js";
 export * from "./lane-run-decider.js";

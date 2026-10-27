@@ -167,8 +167,9 @@ export class AcceptanceSpec {
     return this.props.diffCheck;
   }
 
+  /** Fresh copies, so a caller cannot change the validated spec through the getter. */
   getCommands(): readonly GateCommand[] {
-    return this.props.commands;
+    return this.toJSON().commands;
   }
 
   /** Canonical plain form: key order commitRequired, diffCheck, commands; each command argv then coverage (reader, unitKind, minUnits); fresh arrays. */

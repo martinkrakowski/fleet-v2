@@ -18,6 +18,8 @@ const VALID = {
   ],
 };
 
+type GateCommandLike = { argv: string[] };
+
 describe('AcceptanceSpec', () => {
   it('accepts a valid spec and round-trips its canonical JSON form', () => {
     const result = AcceptanceSpec.create(VALID);
@@ -65,6 +67,19 @@ describe('AcceptanceSpec', () => {
 
     expect(result.value.getCommands()).toHaveLength(1);
     expect(result.value.getCommands()[0].argv).toEqual(['corepack', 'yarn', 'build']);
+  });
+
+  it('keeps the stored spec independent of mutations through getCommands', () => {
+    const result = AcceptanceSpec.create(VALID);
+    expect(result.success).toBe(true);
+    if (!result.success || result.value === undefined) return;
+    const before = JSON.stringify(result.value.toJSON());
+
+    const commands = result.value.getCommands() as GateCommandLike[];
+    commands[0].argv.push('mutated');
+    commands.push({ argv: ['echo'] });
+
+    expect(JSON.stringify(result.value.toJSON())).toBe(before);
   });
 
   const rows: Array<[string, unknown, string]> = [

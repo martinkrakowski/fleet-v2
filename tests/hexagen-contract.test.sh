@@ -162,5 +162,5 @@ echo '# the fixtures'
 check 'no tool wrote into tests/fixtures/hexagen-contract' '[ "$(snapshot "$FIX")" = "$before" ]'
 
 echo
-echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"
+echo "$(grep -c "^[[:space:]]*check '" "$self") checks defined, $fails failed"
 [ "$fails" = 0 ]

@@ -93,7 +93,11 @@ export interface LaneRunFacts {
   readonly costCeilingReached: boolean;
   /** `selectSeat` for `implementerRoleFor(record.round, state)` (K4). */
   readonly implementerSeat: LaneRunSeatFact;
-  /** `selectReviewSeat` for the review kind due (K5). */
+  /**
+   * `selectReviewSeat` for the review kind due (K5). When that review kind already has a
+   * recorded failure in this run, the supplier must select the same seat again (D10), or
+   * supply `{ ok: false }` when that seat is unavailable; it never moves to another seat.
+   */
   readonly reviewSeat: LaneRunSeatFact;
   /** Implementer seat indexes already dispatched in `record.round` (K4). */
   readonly roundSeatIndexes: readonly number[];

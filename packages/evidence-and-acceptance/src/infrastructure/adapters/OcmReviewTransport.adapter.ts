@@ -86,7 +86,7 @@ export const REVIEWER_ENV_ALLOWLIST: readonly string[] = [
 
 const VERDICT_PATTERN = /^VERDICT: (PASS|FAIL)$/;
 const FINDING_PATTERN = /^FINDING: (blocker|major|minor|nit) (\S+?)(?::(\d+))? (.+)$/;
-const MAX_RAW_OUTPUT_LENGTH = 20000;
+export const MAX_RAW_OUTPUT_LENGTH = 20000;
 
 /** Default wall-clock budget for one review run when the caller gives no timeout. */
 export const DEFAULT_REVIEW_TIMEOUT_MS = 30 * 60 * 1000;
@@ -173,6 +173,16 @@ function extractToolName(record: Record<string, unknown>): string | null {
 // Lane-written text is a prompt-injection surface: any future embedded
 // lane-written text (a full diff, file contents) must go through
 // `wrapUntrusted` with a per-prompt nonce, never pasted in directly.
+export const REVIEW_REPLY_CONTRACT: string =
+  'When your review is complete, format your response according to the following reply contract:\n\n' +
+  '- For each finding, output a line matching:\n' +
+  '  FINDING: <blocker|major|minor|nit> <filePath>[:<line>] <summary>\n' +
+  '  Use "-" for filePath if the finding is not tied to a specific file.\n' +
+  '- Conclude with exactly one verdict line matching:\n' +
+  '  VERDICT: PASS\n' +
+  '  or\n' +
+  '  VERDICT: FAIL';
+
 export function buildReviewPrompt(request: RunIndependentReviewRequest, nonce: string): string {
   const sections: string[] = [
     `Independent read-only code review for attempt "${request.attemptId}" at candidate head "${request.candidateHeadSha}".`,
@@ -189,19 +199,64 @@ export function buildReviewPrompt(request: RunIndependentReviewRequest, nonce: s
     sections.push(`Diff summary:\n${wrappedDiffSummary}`);
   }
 
-  sections.push(
-    'Inspect the code changes and candidate head using read-only tools (read, grep, glob, list).\n' +
-      'When your review is complete, format your response according to the following reply contract:\n\n' +
-      '- For each finding, output a line matching:\n' +
-      '  FINDING: <blocker|major|minor|nit> <filePath>[:<line>] <summary>\n' +
-      '  Use "-" for filePath if the finding is not tied to a specific file.\n' +
-      '- Conclude with exactly one verdict line matching:\n' +
-      '  VERDICT: PASS\n' +
-      '  or\n' +
-      '  VERDICT: FAIL',
-  );
+  sections.push('Inspect the code changes and candidate head using read-only tools (read, grep, glob, list).\n' + REVIEW_REPLY_CONTRACT);
 
   return sections.join('\n\n');
+}
+
+export interface ParsedReviewReply {
+  readonly result: EvidenceResultValue;
+  readonly findings: ReviewFindingRecord[];
+}
+
+/** Findings from every line of `text`; the verdict only from the last non-empty line of `verdictText`. */
+export function parseReviewReply(text: string, verdictText: string): ParsedReviewReply {
+  const findings: ReviewFindingRecord[] = [];
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const findingMatch = FINDING_PATTERN.exec(line);
+    if (findingMatch !== null) {
+      findings.push({
+        findingId: `review-${findings.length + 1}`,
+        severity: findingMatch[1] as FindingSeverity,
+        summary: findingMatch[4].trim(),
+        filePath: findingMatch[2] === '-' ? null : findingMatch[2],
+        line: findingMatch[3] !== undefined ? parseInt(findingMatch[3], 10) : null,
+        state: 'unresolved',
+        dispositionReason: null,
+        dispositionEvidenceRef: null,
+      });
+    }
+  }
+
+  let verdict: 'PASS' | 'FAIL' | null = null;
+  if (verdictText.trim() !== '') {
+    const lines = verdictText.split(/\r?\n/);
+    let lastNonEmptyLine: string | null = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].trim() !== '') {
+        lastNonEmptyLine = lines[i];
+        break;
+      }
+    }
+    if (lastNonEmptyLine !== null) {
+      const verdictMatch = VERDICT_PATTERN.exec(lastNonEmptyLine);
+      if (verdictMatch !== null) {
+        verdict = verdictMatch[1] as 'PASS' | 'FAIL';
+      }
+    }
+  }
+
+  let result: EvidenceResultValue = 'unknown';
+  if (verdict === 'PASS') {
+    const hasBlocker = findings.some((f) => f.severity === 'blocker');
+    result = hasBlocker ? 'fail' : 'pass';
+  } else if (verdict === 'FAIL') {
+    result = 'fail';
+  }
+
+  return { result, findings };
 }
 
 export function buildReviewerEnv(
@@ -391,51 +446,8 @@ export function createOcmReviewTransport(
 
     // 8. Parse verdict, findings, and rawOutput
     const finalText = textParts.join('');
-    const findings: ReviewFindingRecord[] = [];
-
-    for (const rawLine of finalText.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      const findingMatch = FINDING_PATTERN.exec(line);
-      if (findingMatch !== null) {
-        findings.push({
-          findingId: `review-${findings.length + 1}`,
-          severity: findingMatch[1] as FindingSeverity,
-          summary: findingMatch[4].trim(),
-          filePath: findingMatch[2] === '-' ? null : findingMatch[2],
-          line: findingMatch[3] !== undefined ? parseInt(findingMatch[3], 10) : null,
-          state: 'unresolved',
-          dispositionReason: null,
-          dispositionEvidenceRef: null,
-        });
-      }
-    }
-
-    let verdict: 'PASS' | 'FAIL' | null = null;
-    if (textParts.length > 0) {
-      const lastPart = textParts[textParts.length - 1];
-      const lines = lastPart.split(/\r?\n/);
-      let lastNonEmptyLine: string | null = null;
-      for (let i = lines.length - 1; i >= 0; i--) {
-        if (lines[i].trim() !== '') {
-          lastNonEmptyLine = lines[i];
-          break;
-        }
-      }
-      if (lastNonEmptyLine !== null) {
-        const verdictMatch = VERDICT_PATTERN.exec(lastNonEmptyLine);
-        if (verdictMatch !== null) {
-          verdict = verdictMatch[1] as 'PASS' | 'FAIL';
-        }
-      }
-    }
-
-    let result: EvidenceResultValue = 'unknown';
-    if (verdict === 'PASS') {
-      const hasBlocker = findings.some((f) => f.severity === 'blocker');
-      result = hasBlocker ? 'fail' : 'pass';
-    } else if (verdict === 'FAIL') {
-      result = 'fail';
-    }
+    const lastText = textParts.at(-1) ?? '';
+    const { result, findings } = parseReviewReply(finalText, lastText);
 
     const rawOutput =
       finalText.length > MAX_RAW_OUTPUT_LENGTH ? finalText.slice(-MAX_RAW_OUTPUT_LENGTH) : finalText;

@@ -169,7 +169,7 @@ describe('O3-0 token-id binding', () => {
           reason: 'the presenting token could not be identified',
         });
         if (typeof id === 'string' && id.trim().length > 0) {
-          expect('the presenting token could not be identified').not.toContain(id);
+          expect(result.outcome === 'refused' ? result.reason : '').not.toContain(id);
         }
       }
       expect(await env.repo.list()).toEqual([]);

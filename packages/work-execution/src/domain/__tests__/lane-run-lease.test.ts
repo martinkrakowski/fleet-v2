@@ -141,10 +141,11 @@ describe('decideLeaseAcquire', () => {
 
 describe('decideLeaseRenew', () => {
   const RENEW = { holderId: 'driver-example-1', fence: 3, leaseUntilIso: IN_2_MIN, nowIso: NOW };
+  const IN_5_MIN = '2026-10-27T10:05:00.000Z';
 
   it('renews with the same fence and a new time', () => {
-    const decision = decideLeaseRenew(LEASE, RENEW);
-    expect(decision).toEqual({ ok: true, lease: { holderId: 'driver-example-1', fence: 3, leaseUntilIso: IN_2_MIN } });
+    const decision = decideLeaseRenew(LEASE, { ...RENEW, leaseUntilIso: IN_5_MIN });
+    expect(decision).toEqual({ ok: true, lease: { holderId: 'driver-example-1', fence: 3, leaseUntilIso: IN_5_MIN } });
   });
 
   it('refuses another holder', () => {
@@ -239,6 +240,7 @@ describe('isLeaseLapsed', () => {
 
   it('is false for a malformed nowIso', () => {
     expect(isLeaseLapsed(LEASE, '2026-10-27T10:00:00')).toBe(false);
+    expect(isLeaseLapsed(null, '2026-10-27T10:00:00')).toBe(false);
   });
 });
 

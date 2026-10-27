@@ -8,6 +8,7 @@ export * from "./file-store.js";
 export * from "./InstallationReferenceAdapter.adapter.js";
 export * from "./NoopChangeSignalAdapter.adapter.js";
 export * from "./ObservationPublicationAdapter.adapter.js";
+export * from "./OrchestratorSessionRepositoryAdapter.adapter.js";
 export * from "./OwnerQuestionRepositoryAdapter.adapter.js";
 export * from "./ProjectProfileRepositoryAdapter.adapter.js";
 export * from "./record-list-store.js";

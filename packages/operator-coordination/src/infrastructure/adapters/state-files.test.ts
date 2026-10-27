@@ -8,12 +8,14 @@ import type {
   ProjectProfileRecord,
 } from '../../domain/coordination-records.js';
 import type { OwnerQuestionRecord } from '../../domain/owner-question-records.js';
+import type { OrchestratorSessionRecord } from '../../domain/orchestrator-session-records.js';
 import {
   StateFileUnreadableError,
   type StateFileDescriptor,
   type StateFileInspection,
 } from './file-store.js';
 import { CoordinationRequestRepositoryAdapter } from './CoordinationRequestRepositoryAdapter.adapter.js';
+import { OrchestratorSessionRepositoryAdapter } from './OrchestratorSessionRepositoryAdapter.adapter.js';
 import { OwnerQuestionRepositoryAdapter } from './OwnerQuestionRepositoryAdapter.adapter.js';
 import { ProjectProfileRepositoryAdapter } from './ProjectProfileRepositoryAdapter.adapter.js';
 import { OPERATOR_COORDINATION_STATE_FILES } from './state-files.js';
@@ -86,10 +88,32 @@ function requestRecord(): CoordinationRequestRecord {
   };
 }
 
+function sessionRecord(overrides: Partial<OrchestratorSessionRecord> = {}): OrchestratorSessionRecord {
+  return {
+    orchestratorId: 'orch-example-1',
+    cliKind: 'claude-code',
+    model: 'example-provider/example-model',
+    host: 'example-host',
+    projects: ['example-project'],
+    claims: ['dispatch-attempt', 'prepare-fix'],
+    scopes: ['message', 'orchestrate'],
+    startedAtIso: '2026-10-27T10:00:00.000Z',
+    lastHeartbeatIso: '2026-10-27T10:00:30.000Z',
+    leaseUntilIso: '2026-10-27T10:02:00.000Z',
+    lastPolledRequestsAtIso: null,
+    status: 'active',
+    ...overrides,
+  };
+}
+
 const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
   'project-profiles.json': [profileRecord(), { ...profileRecord(), projectId: 'proj-2' }],
   'coordination-requests.json': [requestRecord(), { ...requestRecord(), id: 'req-2' }],
   'owner-questions.json': [questionRecord(), { ...questionRecord(), questionId: 'q-2' }],
+  'orchestrators.json': [
+    { revision: 1, session: sessionRecord({ orchestratorId: 'orch-example-1' }) },
+    { revision: 3, session: sessionRecord({ orchestratorId: 'orch-example-2' }) },
+  ],
 };
 
 const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
@@ -98,6 +122,7 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
   'coordination-requests.json': (stateDir) =>
     new CoordinationRequestRepositoryAdapter({ stateDir }).listRequests(),
   'owner-questions.json': (stateDir) => new OwnerQuestionRepositoryAdapter({ stateDir }).list(),
+  'orchestrators.json': (stateDir) => new OrchestratorSessionRepositoryAdapter({ stateDir }).list(),
 };
 
 type FixtureKind = 'valid' | 'not-json' | 'not-list' | 'bad-record';
@@ -168,6 +193,7 @@ describe('operator-coordination state file descriptors match the store readers',
       'project-profiles.json',
       'coordination-requests.json',
       'owner-questions.json',
+      'orchestrators.json',
     ]);
   });
 });

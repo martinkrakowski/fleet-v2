@@ -203,6 +203,18 @@ describe('brief prepare seat-plan flags', () => {
     expect(stdout).toHaveLength(0);
   });
 
+  it('rejects a JSON --seatPlan that is not a valid seat plan (exit 2), never a crash', async () => {
+    const rt = createFleetCliRuntime({ installation: makeInstallation() });
+    const { io, stdout, stderr } = capturingIo();
+
+    const exitCode = await runCli(briefArgs(['--seatPlan', '{"version":1}']), io, rt);
+
+    expect(exitCode).toBe(2);
+    expect(stderr.join('')).toContain("'--seatPlan' is not a valid seat plan");
+    expect(stderr.join('')).not.toContain('TypeError');
+    expect(stdout).toHaveLength(0);
+  });
+
   it('rejects a malformed JSON --seatPlan (exit 2)', async () => {
     const rt = createFleetCliRuntime({ installation: makeInstallation() });
     const { io, stdout, stderr } = capturingIo();

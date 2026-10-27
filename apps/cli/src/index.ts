@@ -671,6 +671,10 @@ function briefSeatPlan(p: Payload, rt: FleetCliRuntime): SeatPlanProps | undefin
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
       throw new CliUsageError("brief prepare requires a JSON object in '--seatPlan'");
     }
+    // Validate the shape before any field is read, so a malformed plan is a usage error (exit 2).
+    if (!SeatPlan.create(parsed).success) {
+      throw new CliUsageError("'--seatPlan' is not a valid seat plan");
+    }
     return parsed as SeatPlanProps;
   }
   if (!fromInstallation) {

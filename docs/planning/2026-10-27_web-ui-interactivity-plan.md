@@ -190,6 +190,11 @@ drives a step.
 - **Two stop keys.** A-C writes a graceful stop as `<runId>/stop@web` and a forced stop as
   `<runId>/stop-force@web`. The mode is read from the key, and the entry's `mode` must match it. The
   `<runId>/stop@web` entry above now names a graceful stop; the outcome table above is the forced stop's.
+- **Park reasons the run card names.** Beside `stop-unconfirmed`, a run may park `stop-refused`
+  (a `StopAttempt` refusal, with its typed kind: `attempt-missing`, `attempt-terminal`,
+  `runner-unavailable`, `runner-refused`, `other`), `acceptance-rejected`, `step-refused` or
+  `owner-merge` (conductor §3.6). The card shows the reason and the kind as fixed text, never a
+  free-text refusal message.
 - **Graceful (the default, "Stop").** The conductor issues no new action for the run; the running
   attempt may finish, its work is collected and gated and kept on the branch, then the run ends
   `stopped`. Body: "records a graceful stop for run <id>; the running attempt <id> may finish; its work

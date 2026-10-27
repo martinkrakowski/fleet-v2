@@ -103,7 +103,7 @@ One-way actions (dispatch, push, PR, merge, an owner question) are never issued 
 
 ### 3.6 Parking, concurrency, failure
 
-- **Parking.** One attention item keyed by (project, work order, reason); where the owner must choose, one keyed owner question naming ids and kinds only. Reasons: `one-way-door`, `seat-plan-exhausted`, `blocker-after-round-2`, `ambiguous`, `artifacts-unsealed`, `cost-ceiling` (`policy.perLaneCostCeiling`), `ci-failed-no-rounds`, `branch-behind`, `review-seat-unavailable`, `halted`, and `stop-unconfirmed` (amendment UI-B, §3.8). Tier 2 waits in `awaiting-premerge`, not in `parked`. `conductor resume <runId>`, or the owner's answer, returns the run to the parked-from state.
+- **Parking.** One attention item keyed by (project, work order, reason); where the owner must choose, one keyed owner question naming ids and kinds only. Reasons: `one-way-door`, `seat-plan-exhausted`, `blocker-after-round-2`, `ambiguous`, `artifacts-unsealed`, `cost-ceiling` (`policy.perLaneCostCeiling`), `ci-failed-no-rounds`, `branch-behind`, `review-seat-unavailable`, `halted`, and `stop-unconfirmed` (amendment UI-B, §3.8). Amended by K-GC: also `stop-refused` (a `StopAttempt` refusal; its qualifier is a typed refusal kind: `attempt-missing`, `attempt-terminal`, `runner-unavailable`, `runner-refused`, `other`), `acceptance-rejected`, `step-refused` (qualifier: the step) and `owner-merge` (no policy grant to merge), which K1-1 defines. Tier 2 waits in `awaiting-premerge`, not in `parked`. `conductor resume <runId>`, or the owner's answer, returns the run to the parked-from state.
 - **Attention without a park (amendment K-GC, §3.9).** `stop-grace-exceeded` and the reaper's finding kinds raise attention items but are not park reasons. A graceful drain is not a park.
 - **Leases.** One per run, one per state directory for the driver, both taken by CAS with a fencing revision; the run record's saves check it, and journal intents are protected by the unique key (§3.2).
 - **Admission.** Host capacity through `ReserveExecutionCapacity` and the host-wide gate budget; one active run per package; a global cap from configuration.
@@ -234,8 +234,8 @@ The cancel is journalled under the attempt's stop step key `<runId>/r<round>/sto
 
 **The shape.**
 - **Domain (work-execution):** `ReaperFinding` (kind, subject, first and last sighting, sightings), `REAPER_FINDING_KINDS`, and a pure classifier `classifyZombies(facts, nowIso, reaperPolicy)` returning findings and, per finding, `report | repair | wait`. Like `nextLaneRunAction`, it never throws and never acts.
-- **Application:** `ReapZombiesUseCase`: gather facts through the ports in the table, classify, upsert findings, raise or refresh attention items, perform the allowed repairs. A new `ReaperFindingRepositoryPort` (file and memory stores) keeps sightings across passes; it is the one new port.
-- **Driver and CLI:** the driver runs a pass every `policy.conductor.reaper.intervalMinutes` (default 10; D13). `conductor reap [--dry-run]` runs one pass; `--dry-run` lists findings and the repairs it would make, and writes nothing. A standalone `conductor reap` is how a `driverless-run` is seen, since a driver never finds itself missing.
+- **Application:** `ReapZombiesUseCase`: gather facts through the ports in the table, classify, upsert findings, raise or refresh attention items, perform the allowed repairs. A new `ReaperFindingRepositoryPort` (file and memory stores) keeps sightings across passes; it is the one new port. Its upsert is an atomic find-or-create on the open `(subject, kind)` pair under the store's lock (the same lock and CAS as the other file stores), so a driver pass and a standalone `conductor reap` running at once reuse one `findingId`, and so one repair key.
+- **Driver and CLI:** the driver runs a pass every `policy.conductor.reaper.intervalMinutes` (default 10; D13). `conductor reap [--dry-run]` runs one pass; `--dry-run` prints the findings and the repairs it would make and writes nothing: no finding, no journal entry, no attention item. A standalone `conductor reap` is how a `driverless-run` is seen, since a driver never finds itself missing.
 
 **Two sightings and a grace period.** A finding acts only when seen on two passes at least G apart, with G = `policy.conductor.reaper.graceMinutes` (default 5, and never less than twice the driver's longest poll of 2 min; D13). The reaper never acts on a subject with an intent, a save or a lease renewal younger than G, so it never races a dispatch, a stop or a driver. A finding not seen on a later pass is closed.
 
@@ -247,7 +247,11 @@ The cancel is journalled under the attempt's stop step key `<runId>/r<round>/sto
 
 **Web.** Findings are read-only in the web first (web plan: route A-F, view W7c). Repairs stay in the CLI until the owner decides otherwise.
 
-**Kill switch.** Halt stops reaper repairs too; a halted reaper still reports. `--dry-run` and dry-run mode (§3.7) journal `would repair <kind>`.
+**Kill switch.** Halt stops reaper repairs too; a halted reaper still reports. The conductor's dry-run mode (§3.7) journals `would repair <kind>`; the CLI's `conductor reap --dry-run` only prints (above).
+
+**Releases are fenced.** `releaseCapacityReservation(attemptId, releasedAtIso)` takes no observed revision, so a leaked-slot release cannot by itself detect an attempt that changed after the re-read. K11a adds a conditional release to the capacity port: it takes the attempt's observed revision and the reservation's, releases only when both still match under the reservation store's lock, and otherwise returns `changed`, which ends the repair with no write. The reaper never uses the unconditional release.
+
+**A repair intent without a result.** A pass that finds a repair intent with no result (a crash between the action and its result) never repeats the action: it reconciles the postcondition read-only (the reservation is released or not; `ReconcileAttempt`'s record shows the attempt's end or not; the attention item is closed or not) and journals the result it finds as `reconciled`. An unreadable postcondition leaves the finding open, reported, with no repair. K11a's fault-injection test asserts exactly this: crash after the action, then the next pass records `reconciled` and performs no second action.
 
 ## 4. Workbook
 
@@ -312,7 +316,7 @@ K11 is split in two because a use case, a store, the CLI and the driver hook are
 - **Merges made by the conductor** are one-way. They need `policy.autoMerge` on, an eligible lane, and live mode (D4); each merge's journal entry names the policy revision that authorised it.
 - **PRs it opens or pushes to** are visible to anyone who can see the target repository; bodies are rendered from records, never lane output.
 - **The `LaneRunRecord` format, journal keys and the review `kind`** become stored data; version them from their first commit.
-- **The park reason `stop-unconfirmed` and the refusal reason `run-stopped`** (amendment UI-B) become stored and wire data the web reads.
+- **The park reason `stop-unconfirmed` and the refusal reason `run-stopped`** (amendment UI-B) become stored and wire data the web reads. Amended by K-GC: so do the park reasons `stop-refused` (with its typed refusal kinds), `acceptance-rejected`, `step-refused` and `owner-merge`, and the stop refusals `stop-already-requested` and `stop-already-forced`.
 - **The stop keys and `RunStopMode`** (amendment K-GC): `<runId>/stop@…` now means graceful, `<runId>/stop-force@…` means force. Once K1b stores them, the meaning of a stored key cannot change. The refusal reasons `stop-already-requested` and `stop-already-forced` become wire data the web shows.
 - **The reaper's finding kinds and its `reaper/` keys** become stored data the web reads; version them from their first commit.
 - **A destructive repair** (aborting an orphan session) is one-way: the session's unfinished work is lost. It runs only behind the owner's per-kind opt-in (D14), and never removes a worktree (D15).

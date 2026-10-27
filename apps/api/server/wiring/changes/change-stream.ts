@@ -23,13 +23,25 @@ export interface ChangeStreamOptions {
 export const CHANGE_STREAM_POLL_MS = 250;
 export const CHANGE_STREAM_KEEP_ALIVE_MS = 15_000;
 export const CHANGE_STREAM_MAX_QUEUE = 256;
+export const CHANGE_STREAM_MAX_OPEN = 64;
 export const KEEP_ALIVE_LINE = "\n";
 
 let openStreams = 0;
+let maxOpen = CHANGE_STREAM_MAX_OPEN;
 
 /** Open streams in this process; tests use it to prove a closed connection stops. */
 export function openChangeStreamCount(): number {
   return openStreams;
+}
+
+/** The route refuses a new stream once openChangeStreamCount() reaches this. */
+export function changeStreamMaxOpen(): number {
+  return maxOpen;
+}
+
+/** Test-only cap override; tests restore CHANGE_STREAM_MAX_OPEN in finally. */
+export function setChangeStreamMaxOpenForTests(max: number): void {
+  maxOpen = max;
 }
 
 function toLine(entry: FeedEntry): string {

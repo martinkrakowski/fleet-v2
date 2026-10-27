@@ -14,7 +14,11 @@ import securityMiddleware from '../../middleware/security';
 import changesGet from '../../routes/v1/changes.get';
 import { configureFleetApiRuntime, getChangeFeed } from '../runtime';
 import { setActiveApiToken } from '../token';
-import { openChangeStreamCount } from '../changes/change-stream';
+import {
+  CHANGE_STREAM_MAX_OPEN,
+  openChangeStreamCount,
+  setChangeStreamMaxOpenForTests,
+} from '../changes/change-stream';
 
 const TOKEN = 'a'.repeat(32);
 
@@ -213,6 +217,65 @@ describe('GET /v1/changes', () => {
       await vi.waitFor(() => expect(done).toBe(true));
     } finally {
       controller.abort();
+    }
+  });
+
+  it('refuses a third stream over the cap with 503', async () => {
+    const stateDir = await makeTempDir();
+    setActiveApiToken(TOKEN);
+    configureFleetApiRuntime({ stateDir });
+    setChangeStreamMaxOpenForTests(2);
+    const before = openChangeStreamCount();
+    const streamOne = new AbortController();
+    const streamTwo = new AbortController();
+    const overCap = new AbortController();
+    const retried = new AbortController();
+    try {
+      const [one, two] = await Promise.all([
+        fetch(`${apiBaseUrl}/v1/changes`, {
+          headers: { authorization: `Bearer ${TOKEN}` },
+          signal: streamOne.signal,
+        }),
+        fetch(`${apiBaseUrl}/v1/changes`, {
+          headers: { authorization: `Bearer ${TOKEN}` },
+          signal: streamTwo.signal,
+        }),
+      ]);
+      expect(one.status).toBe(200);
+      expect(two.status).toBe(200);
+      await vi.waitFor(() => expect(openChangeStreamCount()).toBe(before + 2));
+      const refused = await fetch(`${apiBaseUrl}/v1/changes`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+        signal: overCap.signal,
+      });
+      expect(refused.status).toBe(503);
+      const bodyText = await refused.text();
+      const body = JSON.parse(bodyText) as {
+        operationId: unknown;
+        code: string;
+        result: unknown;
+      };
+      expect(typeof body.operationId).toBe('string');
+      expect(body.code).toBe('TOO_MANY_STREAMS');
+      expect(body.result).toBeNull();
+      expect(bodyText).not.toContain(stateDir);
+      expect(bodyText).not.toContain(TOKEN);
+      expect(bodyText).not.toContain('/v1/changes');
+      expect(openChangeStreamCount()).toBe(before + 2);
+      streamOne.abort();
+      await vi.waitFor(() => expect(openChangeStreamCount()).toBe(before + 1));
+      const again = await fetch(`${apiBaseUrl}/v1/changes`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+        signal: retried.signal,
+      });
+      expect(again.status).toBe(200);
+      await vi.waitFor(() => expect(openChangeStreamCount()).toBe(before + 2));
+    } finally {
+      streamOne.abort();
+      streamTwo.abort();
+      overCap.abort();
+      retried.abort();
+      setChangeStreamMaxOpenForTests(CHANGE_STREAM_MAX_OPEN);
     }
   });
 });

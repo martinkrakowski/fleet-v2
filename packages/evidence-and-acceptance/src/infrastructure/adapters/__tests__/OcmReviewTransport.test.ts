@@ -5,8 +5,10 @@ import { UNTRUSTED_INPUT_RULE } from '../../../domain/untrusted-input.js';
 import { IndependentReviewAdapter } from '../IndependentReviewAdapter.adapter.js';
 import {
   ALLOWED_PART_TYPES,
+  buildReviewerEnv,
   buildReviewPrompt,
   createOcmReviewTransport,
+  DEFAULT_REVIEW_TIMEOUT_MS,
   extractTextPart,
   type OcmReviewTransportSpawn,
 } from '../OcmReviewTransport.adapter.js';
@@ -1181,6 +1183,115 @@ describe('OcmReviewTransport', () => {
       expect(
         extractTextPart({ type: 'text', part: { type: 'file', text: 'VERDICT: PASS' } }),
       ).toBeNull();
+    });
+  });
+
+  describe('OcmReviewTransport routing and timeout (RW1)', () => {
+    it('installation mode without a remoteHost never reads process.env.OCM_HOST', () => {
+      const savedOcmHost = process.env.OCM_HOST;
+      process.env.OCM_HOST = 'leak.example';
+      try {
+        const env = buildReviewerEnv({ remotePort: 4096, hostMode: 'installation' });
+        expect(env.OCM_HOST).toBe('');
+      } finally {
+        if (savedOcmHost !== undefined) {
+          process.env.OCM_HOST = savedOcmHost;
+        } else {
+          delete process.env.OCM_HOST;
+        }
+      }
+    });
+
+    it('installation mode sets OCM_HOST and OPENCODE_AUTH_FILE only from options', () => {
+      const env = buildReviewerEnv({
+        remotePort: 46000,
+        hostMode: 'installation',
+        remoteHost: 'lane-host.example',
+        authFile: '/home/operator/.config/fleet/auth.json',
+      });
+      expect(env.OCM_HOST).toBe('lane-host.example');
+      expect(env.OPENCODE_AUTH_FILE).toBe('/home/operator/.config/fleet/auth.json');
+
+      const ALLOWED_ENV_KEYS = new Set([
+        'PATH',
+        'HOME',
+        'USER',
+        'LOGNAME',
+        'LANG',
+        'LC_ALL',
+        'TMPDIR',
+        'SSH_AUTH_SOCK',
+        'OCM_REMOTE_PORT',
+        'OCM_HOST',
+        'OPENCODE_AUTH_FILE',
+      ]);
+
+      for (const key of Object.keys(env)) {
+        expect(ALLOWED_ENV_KEYS.has(key)).toBe(true);
+      }
+    });
+
+    it('legacy mode ignores an authFile option', () => {
+      const env = buildReviewerEnv({
+        remotePort: 4096,
+        authFile: '/home/operator/.config/fleet/auth.json',
+      });
+      expect(env.OPENCODE_AUTH_FILE).toBeUndefined();
+    });
+
+    it('forwards the review timeout budget to the spawn', async () => {
+      const received: Array<{ timeoutMs?: number }> = [];
+      const fakeSpawn: OcmReviewTransportSpawn = async (_file, _args, _env, options) => {
+        received.push(options ?? {});
+        return {
+          exitCode: 0,
+          stdout: '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+          stderr: '',
+        };
+      };
+
+      const makeTransport = (timeoutMs?: number) =>
+        createOcmReviewTransport({
+          ocmRunBin: '/test/ocm-run',
+          remotePort: 4096,
+          agent: 'reviewer',
+          model: baseRequest.reviewerModel,
+          resolveReviewDir: async () => '/tmp/review-dir',
+          readHead: async () => baseRequest.candidateHeadSha,
+          spawn: fakeSpawn,
+          ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        });
+
+      await makeTransport(1234)(baseRequest);
+      await makeTransport()(baseRequest);
+
+      expect(received[0]).toEqual({ timeoutMs: 1234 });
+      expect(received[1]).toEqual({ timeoutMs: DEFAULT_REVIEW_TIMEOUT_MS });
+    });
+
+    it('a timeout (null exit code) rejects and surfaces as unavailable through the adapter', async () => {
+      const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+        exitCode: null,
+        stdout: '',
+        stderr: 'command exceeded its 1234ms timeout',
+      });
+
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => '/tmp/review-dir',
+        readHead: async () => baseRequest.candidateHeadSha,
+        spawn: fakeSpawn,
+        timeoutMs: 1234,
+      });
+
+      await expect(transport(baseRequest)).rejects.toThrow(/exit code null/);
+
+      const adapter = new IndependentReviewAdapter({ runReview: transport });
+      const result = await adapter.runIndependentReview(baseRequest);
+      expect(result.outcome).toBe('unavailable');
     });
   });
 });

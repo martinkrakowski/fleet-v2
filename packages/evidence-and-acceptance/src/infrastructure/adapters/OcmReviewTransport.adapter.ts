@@ -1,14 +1,11 @@
-import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { promisify } from 'node:util';
 
 import { UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
 import type { FindingSeverity, ReviewFindingRecord } from '../../domain/evidence-records.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type { RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
-
-const execFileAsync = promisify(execFile);
+import { runSpawnOutcome, DEFAULT_MAX_BUFFER_BYTES } from './spawn-run.js';
 
 export interface OcmReviewTransportSpawnResult {
   readonly exitCode: number | null;
@@ -20,6 +17,7 @@ export type OcmReviewTransportSpawn = (
   file: string,
   args: readonly string[],
   env: Record<string, string>,
+  options?: { readonly timeoutMs: number },
 ) => Promise<OcmReviewTransportSpawnResult>;
 
 export interface OcmReviewTransportOptions {
@@ -29,6 +27,12 @@ export interface OcmReviewTransportOptions {
   readonly agent: string; /* 'reviewer' */
   readonly model: string;
   readonly variant?: string;
+  /** Absent means 'legacy' (today's behaviour). */
+  readonly hostMode?: 'legacy' | 'installation';
+  /** Orchestrator-side auth file for ocm-run, installation mode only. */
+  readonly authFile?: string;
+  /** Wall-clock budget of one review run. */
+  readonly timeoutMs?: number;
   readonly resolveReviewDir: (
     request: RunIndependentReviewRequest,
   ) => Promise<string | null> | string | null;
@@ -83,6 +87,9 @@ export const REVIEWER_ENV_ALLOWLIST: readonly string[] = [
 const VERDICT_PATTERN = /^VERDICT: (PASS|FAIL)$/;
 const FINDING_PATTERN = /^FINDING: (blocker|major|minor|nit) (\S+?)(?::(\d+))? (.+)$/;
 const MAX_RAW_OUTPUT_LENGTH = 20000;
+
+/** Default wall-clock budget for one review run when the caller gives no timeout. */
+export const DEFAULT_REVIEW_TIMEOUT_MS = 30 * 60 * 1000;
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -198,7 +205,10 @@ export function buildReviewPrompt(request: RunIndependentReviewRequest, nonce: s
 }
 
 export function buildReviewerEnv(
-  options: Pick<OcmReviewTransportOptions, 'remotePort' | 'remoteHost'>,
+  options: Pick<
+    OcmReviewTransportOptions,
+    'remotePort' | 'remoteHost' | 'hostMode' | 'authFile'
+  >,
 ): Record<string, string> {
   const env: Record<string, string> = {};
   for (const key of REVIEWER_ENV_ALLOWLIST) {
@@ -208,9 +218,18 @@ export function buildReviewerEnv(
     }
   }
   env.OCM_REMOTE_PORT = String(options.remotePort);
-  const host = options.remoteHost ?? (process.env.OCM_HOST?.trim() || undefined);
-  if (host !== undefined && host !== '') {
-    env.OCM_HOST = host;
+  if (options.hostMode === 'installation') {
+    // An empty OCM_HOST means a local host is dialled directly. Never read
+    // process.env.OCM_HOST in installation mode.
+    env.OCM_HOST = options.remoteHost ?? '';
+    if (typeof options.authFile === 'string' && options.authFile.trim() !== '') {
+      env.OPENCODE_AUTH_FILE = options.authFile.trim();
+    }
+  } else {
+    const host = options.remoteHost ?? (process.env.OCM_HOST?.trim() || undefined);
+    if (host !== undefined && host !== '') {
+      env.OCM_HOST = host;
+    }
   }
   return env;
 }
@@ -223,24 +242,18 @@ async function defaultSpawn(
   file: string,
   args: readonly string[],
   env: Record<string, string>,
+  options?: { readonly timeoutMs: number },
 ): Promise<OcmReviewTransportSpawnResult> {
-  try {
-    const { stdout, stderr } = await execFileAsync(file, [...args], {
-      env,
-      maxBuffer: 64 * 1024 * 1024,
-    });
-    return { exitCode: 0, stdout: String(stdout), stderr: String(stderr) };
-  } catch (error: unknown) {
-    const failed = error as { code?: number | string; stdout?: string; stderr?: string };
-    if (typeof failed.code === 'number') {
-      return {
-        exitCode: failed.code,
-        stdout: String(failed.stdout ?? ''),
-        stderr: String(failed.stderr ?? ''),
-      };
-    }
-    throw error;
-  }
+  const outcome = await runSpawnOutcome(file, args, {
+    env,
+    timeoutMs: options?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS,
+    maxBufferBytes: DEFAULT_MAX_BUFFER_BYTES,
+  });
+  return {
+    exitCode: outcome.exitCode,
+    stdout: outcome.stdout,
+    stderr: outcome.stderr !== '' ? outcome.stderr : outcome.error ?? '',
+  };
 }
 
 export function createOcmReviewTransport(
@@ -302,7 +315,9 @@ export function createOcmReviewTransport(
 
     // 5. Spawn runner process; non-zero or null exit throws
     const spawnFn = options.spawn ?? defaultSpawn;
-    const spawnResult = await spawnFn(options.ocmRunBin, argv, env);
+    const spawnResult = await spawnFn(options.ocmRunBin, argv, env, {
+      timeoutMs: options.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS,
+    });
     if (spawnResult.exitCode !== 0) {
       throw new Error(
         `reviewer process failed with exit code ${String(spawnResult.exitCode)}: ${spawnResult.stderr || spawnResult.stdout}`,

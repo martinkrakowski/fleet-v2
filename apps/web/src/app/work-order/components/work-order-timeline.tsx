@@ -16,6 +16,7 @@ import { attemptIdHref, recordedStateSummary } from "../../lanes/derive";
 import { relativeTime } from "../../attempt/live-view";
 import { chainLabel, prerequisitesText } from "../../attempt/work-order-view";
 import { LiveJournalPanel } from "../../attempt/components/live-journal-panel";
+import { HeadEvidencePanel } from "./head-evidence-panel";
 import { chainNoteText, notReadText } from "../timeline-view";
 import type { TimelineData } from "../live";
 import styles from "../work-order.module.css";
@@ -143,9 +144,10 @@ function TimelineBody({ data }: { data: TimelineData }) {
                         "no head collected"
                       )}
                     </p>
-                    <p className={styles.muted}>
-                      head evidence: not read on this page
-                    </p>
+                    <HeadEvidencePanel
+                      panel={t.evidence}
+                      observedAtIso={data.observedAtIso}
+                    />
 
                     <LiveJournalPanel
                       panel={t.journal}

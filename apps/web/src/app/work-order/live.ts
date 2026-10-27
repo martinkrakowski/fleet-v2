@@ -1,8 +1,8 @@
 /**
  * Server-side loader for the work-order timeline page. Reads
- * `GET /v1/work-orders/:id` and the newest attempts' journals through the web
- * API client. The fixture never stands in for a real failed read: unconfigured
- * and error views say so explicitly.
+ * `GET /v1/work-orders/:id`, the newest attempts' journals and the evidence
+ * for each collected head through the web API client. The fixture never stands
+ * in for a real failed read: unconfigured and error views say so explicitly.
  */
 
 import {
@@ -18,11 +18,23 @@ import { readJournalPanel, type JournalPanel } from "../attempt/live-context";
 import { chainOrder } from "../attempt/work-order-view";
 import type { RecordedAttemptWire } from "../../lib/attempt-wire";
 import { chainNote, journalReadIds, type ChainNote } from "./timeline-view";
+import {
+  parseEvidenceEnvelope,
+  type HeadEvidenceView,
+} from "./map-evidence";
+
+export type EvidencePanel =
+  | { readonly panel: "found"; readonly evidence: HeadEvidenceView }
+  | { readonly panel: "not-recorded"; readonly headSha: string }
+  | { readonly panel: "error"; readonly headSha: string; readonly reason: string }
+  | { readonly panel: "no-head" }
+  | { readonly panel: "not-read" };
 
 export interface TimelineAttempt {
   readonly attempt: RecordedAttemptWire;
   readonly chain: ChainNote;
   readonly journal: JournalPanel;
+  readonly evidence: EvidencePanel;
 }
 
 export type TimelineView =
@@ -42,11 +54,51 @@ export type TimelineData = TimelineView & {
   readonly observedAtIso: string;
 };
 
+async function readEvidencePanel(
+  headSha: string,
+  client: Pick<FleetWebApiClient, "fetchHeadEvidenceView">,
+): Promise<EvidencePanel> {
+  const endpoint = await client.fetchHeadEvidenceView(headSha, null);
+
+  if (endpoint.source === "fixture-fallback") {
+    if (endpoint.fallbackReason === NOT_CONFIGURED_REASON) {
+      return { panel: "not-read" };
+    }
+    return {
+      panel: "error",
+      headSha,
+      reason:
+        endpoint.fallbackReason ?? "the api client gave no fallback reason",
+    };
+  }
+
+  const parsed = parseEvidenceEnvelope(endpoint.data);
+  if (parsed === null) {
+    const code =
+      typeof endpoint.data === "object" &&
+      endpoint.data !== null &&
+      typeof (endpoint.data as Record<string, unknown>).code === "string"
+        ? ((endpoint.data as Record<string, unknown>).code as string)
+        : null;
+    const reason =
+      code !== null && code !== "OK"
+        ? `api boundary answered ${code} for /v1/heads/${headSha}/evidence`
+        : `api boundary returned an unexpected evidence shape for /v1/heads/${headSha}/evidence`;
+    return { panel: "error", headSha, reason };
+  }
+
+  if (parsed.outcome === "not-found") {
+    return { panel: "not-recorded", headSha };
+  }
+
+  return { panel: "found", evidence: parsed.evidence };
+}
+
 export async function loadWorkOrderTimeline(
   workOrderId: string,
   client: Pick<
     FleetWebApiClient,
-    "fetchWorkOrderView" | "fetchAttemptJournal"
+    "fetchWorkOrderView" | "fetchAttemptJournal" | "fetchHeadEvidenceView"
   > = createFleetWebApiClient(),
   now: () => Date = () => new Date(),
 ): Promise<TimelineData> {
@@ -110,18 +162,43 @@ export async function loadWorkOrderTimeline(
   const ordered = chainOrder(parsed.attempts);
   const ids = new Set(ordered.map((attempt) => attempt.id));
   const readIds = journalReadIds(ordered);
-  const journals = await Promise.all(
-    ordered.map((attempt) =>
-      readIds.has(attempt.id)
-        ? readJournalPanel(attempt.id, client)
-        : Promise.resolve<JournalPanel>({ panel: "not-read" }),
+  const heads = Array.from(
+    new Set(
+      ordered
+        .filter((attempt) => readIds.has(attempt.id))
+        .flatMap((attempt) =>
+          attempt.artifacts === null ? [] : [attempt.artifacts.headCommit],
+        ),
     ),
   );
-  const attempts: TimelineAttempt[] = ordered.map((attempt, index) => ({
-    attempt,
-    chain: chainNote(attempt, ids),
-    journal: journals[index],
-  }));
+  const [journals, evidence] = await Promise.all([
+    Promise.all(
+      ordered.map((attempt) =>
+        readIds.has(attempt.id)
+          ? readJournalPanel(attempt.id, client)
+          : Promise.resolve<JournalPanel>({ panel: "not-read" }),
+      ),
+    ),
+    Promise.all(heads.map((sha) => readEvidencePanel(sha, client))),
+  ]);
+  const evidenceByHead = new Map(heads.map((sha, index) => [sha, evidence[index]]));
+  const attempts: TimelineAttempt[] = ordered.map((attempt, index) => {
+    let evidencePanel: EvidencePanel;
+    if (!readIds.has(attempt.id)) {
+      evidencePanel = { panel: "not-read" };
+    } else if (attempt.artifacts === null) {
+      evidencePanel = { panel: "no-head" };
+    } else {
+      evidencePanel =
+        evidenceByHead.get(attempt.artifacts.headCommit) ?? { panel: "no-head" };
+    }
+    return {
+      attempt,
+      chain: chainNote(attempt, ids),
+      journal: journals[index],
+      evidence: evidencePanel,
+    };
+  });
   const journalsNotRead = ordered.length - readIds.size;
 
   return {

@@ -50,7 +50,7 @@ describe("work-order timeline wiring", () => {
       'aria-label="Attempts in fix-chain order, first pass first"',
     );
     expect(timeline).toContain("LiveJournalPanel");
-    expect(timeline).toContain("head evidence: not read on this page");
+    expect(timeline).toContain("HeadEvidencePanel");
     expect(timeline).not.toContain("dangerouslySetInnerHTML");
     expect(timeline).not.toContain("AlertBox");
     expect(timeline).not.toContain("onConfirm");

@@ -7,6 +7,7 @@
  */
 
 import type { VerificationReceiptRecord } from '../evidence-records.js';
+import { isCheckCoverage, type CheckCoverage } from '../check-coverage.js';
 import type { EvidenceResultValue } from '../value-objects/EvidenceResult.vo.js';
 import { EVIDENCE_RESULTS } from '../value-objects/EvidenceResult.vo.js';
 
@@ -20,6 +21,7 @@ export interface VerificationReceiptProps {
   readonly procedureName: string;
   readonly result: EvidenceResultValue;
   readonly exitCode: number | null;
+  readonly coverage?: CheckCoverage;
   readonly evidenceRef: string;
   readonly policyRevision: string;
   readonly completedAtIso: string;
@@ -70,6 +72,12 @@ export class VerificationReceipt {
         error: new Error('VerificationReceipt exitCode must be an integer or null'),
       };
     }
+    if (props.coverage !== undefined && !isCheckCoverage(props.coverage)) {
+      return {
+        success: false,
+        error: new Error('VerificationReceipt coverage is malformed'),
+      };
+    }
     return {
       success: true,
       value: new VerificationReceipt({ ...props }),
@@ -106,6 +114,10 @@ export class VerificationReceipt {
 
   getResult(): EvidenceResultValue {
     return this.props.result;
+  }
+
+  getCoverage(): CheckCoverage | undefined {
+    return this.props.coverage;
   }
 
   /** A receipt only proves the head it was produced for. */

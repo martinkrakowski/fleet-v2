@@ -173,6 +173,7 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
         procedureName,
         result: execution.result,
         exitCode: execution.exitCode,
+        ...(execution.coverage !== undefined ? { coverage: execution.coverage } : {}),
         evidenceRef: archived.evidenceRef,
         policyRevision: base.policyRevision,
         completedAtIso: execution.completedAtIso,

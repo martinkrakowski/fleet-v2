@@ -4,6 +4,7 @@
  * single port module.
  */
 
+import type { CheckCoverage } from './check-coverage.js';
 import type { EvidenceResultValue } from './value-objects/EvidenceResult.vo.js';
 import type { FindingStateValue } from './value-objects/FindingState.vo.js';
 import type { AssessmentStateValue } from './value-objects/AssessmentState.vo.js';
@@ -19,6 +20,8 @@ export interface VerificationReceiptRecord {
   readonly procedureName: string;
   readonly result: EvidenceResultValue;
   readonly exitCode: number | null;
+  // Optional; records written before V1 have none.
+  readonly coverage?: CheckCoverage;
   readonly evidenceRef: string;
   readonly policyRevision: string;
   readonly completedAtIso: string;

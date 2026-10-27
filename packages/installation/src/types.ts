@@ -216,6 +216,18 @@ export interface ForbiddenRouteRule {
   readonly modelPattern: string;
 }
 
+/** How much of a lane's live session the tail may show (plan §3.7, D10). */
+export type LiveTailContent = 'summaries' | 'full';
+
+/**
+ * The v2 `policy.liveTail` section. `summaries`: step index, tool name, path,
+ * byte counts, elapsed time, exit codes, model and seat, runner status lines.
+ * `full`: an installation opt-in to stream lane output through, never persisted.
+ */
+export interface LiveTailPolicy {
+  readonly content: LiveTailContent;
+}
+
 /**
  * The v2 `policy` section: shape only. The rules are enforced by the loader
  * itself through `validateSeatPolicy` (lane O5) on every v2 file.
@@ -225,6 +237,8 @@ export interface PolicySection {
   readonly perLaneCostCeiling?: number;
   /** Absent means true: free-tier seats are used. */
   readonly useFreeSeats?: boolean;
+  /** Absent means `{ content: 'summaries' }`; read it through `resolveLiveTailContent`. */
+  readonly liveTail?: LiveTailPolicy;
 }
 
 /** The v2 `shelf` section with the local provider (D1, default). */

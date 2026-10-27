@@ -696,6 +696,17 @@ describe('CollectAttemptArtifactsUseCase stopReason', () => {
     expect(saved?.stopReason).toBe('none');
   });
 
+  it('keeps a specific stop reason already recorded instead of replacing it', async () => {
+    for (const recorded of ['length', 'rate-limited'] as const) {
+      const setup = makeCollectSetup({ attempt: { stopReason: recorded } });
+
+      const result = await setup.useCase.collectAttemptArtifacts(validCollectRequest());
+
+      expect(result.outcome).toBe('collected');
+      expect(setup.attemptRepo.attempts.get('attempt-1')?.stopReason).toBe(recorded);
+    }
+  });
+
   it('records stopReason no-commit on a collected attempt with no commits', async () => {
     const setup = makeCollectSetup({
       collectResult: {

@@ -177,8 +177,10 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
     }
 
     const outcome: AttemptOutcomeValue = collected.artifacts.commitsSinceBase.length > 0 ? 'done' : 'no-commit';
-    // S1: no commit is a stop reason a fallback seat may wait for.
-    const stopReason: StopReasonValue = outcome === 'no-commit' ? 'no-commit' : 'none';
+    // S1: no commit is a stop reason a fallback seat may wait for. A specific reason already
+    // recorded (a refusal or a limit such as length or step-cap) is kept, never replaced.
+    const collectedStopReason: StopReasonValue = outcome === 'no-commit' ? 'no-commit' : 'none';
+    const stopReason = keptStopReason(attempt.stopReason, collectedStopReason);
 
     const nowIso = new Date().toISOString();
     // S3: read the attempt's opencode session usage when a usage port is
@@ -229,7 +231,7 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
           revision: nextAttemptRevision(fresh),
           state: 'collected',
           outcome,
-          stopReason,
+          stopReason: keptStopReason(fresh.stopReason, collectedStopReason),
           artifacts,
           ...(usageResult !== undefined ? { usage: usageResult.usage } : {}),
           updatedAtIso: nowIso,
@@ -273,4 +275,9 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
     }
     return this.collectAttemptArtifacts(input as CollectAttemptArtifactsRequest);
   }
+}
+
+/** A recorded reason other than `none` wins over the one collection computes. */
+function keptStopReason(recorded: StopReasonValue | null | undefined, computed: StopReasonValue): StopReasonValue {
+  return recorded !== undefined && recorded !== null && recorded !== 'none' ? recorded : computed;
 }

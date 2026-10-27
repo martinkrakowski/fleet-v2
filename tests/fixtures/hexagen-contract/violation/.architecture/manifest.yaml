@@ -1,0 +1,12 @@
+# Fixture for tests/hexagen-contract.test.sh: the smallest layout the pinned hexagen tools accept.
+# One bounded context with one pure domain file. The tools read it; nothing here is ever run.
+schemaVersion: 1
+version: "0.1.0"
+system: contract-fixture
+scope: contract-fixture
+architecture: modular-monolith
+description: Minimal compliant layout for the hexagen contract test.
+bounded_contexts:
+  - name: orders
+    type: core
+    description: One context holding one pure domain file.

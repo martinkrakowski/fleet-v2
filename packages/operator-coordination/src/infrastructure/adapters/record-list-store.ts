@@ -45,3 +45,54 @@ export async function readRecordList<T>(
   }
   return [...inspection.records];
 }
+
+/**
+ * Read one `{ "revision": <n>, "<recordKey>": <record> }` store entry: a plain object with exactly those
+ * two own enumerable data properties, `revision` a safe integer ≥ 1. Returns the revision and the raw
+ * record value for the caller's own validator, or undefined. Never throws, never runs a getter.
+ */
+export function readRevisionedEntry(
+  raw: unknown,
+  recordKey: string,
+): { readonly revision: number; readonly record: unknown } | undefined {
+  try {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      return undefined;
+    }
+    const inputPrototype = Object.getPrototypeOf(raw);
+    if (inputPrototype !== Object.prototype && inputPrototype !== null) {
+      return undefined;
+    }
+    const ownKeys = Reflect.ownKeys(raw);
+    if (ownKeys.length !== 2) {
+      return undefined;
+    }
+    const keySet = new Set(ownKeys.map((key) => String(key)));
+    if (!keySet.has('revision') || !keySet.has(recordKey)) {
+      return undefined;
+    }
+    const revisionDescriptor = Object.getOwnPropertyDescriptor(raw, 'revision');
+    const recordDescriptor = Object.getOwnPropertyDescriptor(raw, recordKey);
+    if (
+      revisionDescriptor === undefined ||
+      recordDescriptor === undefined ||
+      !revisionDescriptor.enumerable ||
+      !recordDescriptor.enumerable ||
+      !('value' in revisionDescriptor) ||
+      !('value' in recordDescriptor)
+    ) {
+      return undefined;
+    }
+    const revision = revisionDescriptor.value;
+    if (
+      typeof revision !== 'number' ||
+      !Number.isSafeInteger(revision) ||
+      revision < 1
+    ) {
+      return undefined;
+    }
+    return { revision, record: recordDescriptor.value };
+  } catch {
+    return undefined;
+  }
+}

@@ -7,14 +7,17 @@ import type {
   CoordinationRequestRecord,
   ProjectProfileRecord,
 } from '../../domain/coordination-records.js';
+import type { OwnerItemRecord } from '../../domain/owner-item-records.js';
 import type { OwnerQuestionRecord } from '../../domain/owner-question-records.js';
 import type { OrchestratorSessionRecord } from '../../domain/orchestrator-session-records.js';
+import { OwnerItem } from '../../domain/entities/OwnerItem.js';
 import {
   StateFileUnreadableError,
   type StateFileDescriptor,
   type StateFileInspection,
 } from './file-store.js';
 import { CoordinationRequestRepositoryAdapter } from './CoordinationRequestRepositoryAdapter.adapter.js';
+import { OwnerItemRepositoryAdapter } from './OwnerItemRepositoryAdapter.adapter.js';
 import { OrchestratorSessionRepositoryAdapter } from './OrchestratorSessionRepositoryAdapter.adapter.js';
 import { OwnerQuestionRepositoryAdapter } from './OwnerQuestionRepositoryAdapter.adapter.js';
 import { ProjectProfileRepositoryAdapter } from './ProjectProfileRepositoryAdapter.adapter.js';
@@ -107,6 +110,28 @@ function sessionRecord(overrides: Partial<OrchestratorSessionRecord> = {}): Orch
   };
 }
 
+const NOW = '2026-10-27T10:00:00.000Z';
+
+/** OwnerItem.open returns a result; a genuine failure is a test bug. */
+function openedItem(overrides: Partial<OwnerItemRecord> = {}): OwnerItemRecord {
+  const opened = OwnerItem.open(
+    {
+      itemId: 'oi-example-1',
+      projectId: 'example-project',
+      kind: 'merge',
+      subject: null,
+      refs: [{ kind: 'pr', repository: 'example-org/example-repo', number: 1 }],
+      blocks: [],
+      createdBy: 'example-orchestrator',
+    },
+    NOW,
+  );
+  if (!opened.success) {
+    throw new Error(opened.error.message);
+  }
+  return { ...opened.value.toRecord(), ...overrides };
+}
+
 const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
   'project-profiles.json': [profileRecord(), { ...profileRecord(), projectId: 'proj-2' }],
   'coordination-requests.json': [requestRecord(), { ...requestRecord(), id: 'req-2' }],
@@ -114,6 +139,16 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
   'orchestrators.json': [
     { revision: 1, session: sessionRecord({ orchestratorId: 'orch-example-1' }) },
     { revision: 3, session: sessionRecord({ orchestratorId: 'orch-example-2' }) },
+  ],
+  'owner-items.json': [
+    { revision: 1, item: openedItem() },
+    {
+      revision: 2,
+      item: openedItem({
+        itemId: 'oi-example-2',
+        refs: [{ kind: 'pr', repository: 'example-org/example-repo', number: 2 }],
+      }),
+    },
   ],
 };
 
@@ -124,6 +159,7 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
     new CoordinationRequestRepositoryAdapter({ stateDir }).listRequests(),
   'owner-questions.json': (stateDir) => new OwnerQuestionRepositoryAdapter({ stateDir }).list(),
   'orchestrators.json': (stateDir) => new OrchestratorSessionRepositoryAdapter({ stateDir }).list(),
+  'owner-items.json': (stateDir) => new OwnerItemRepositoryAdapter({ stateDir }).list(),
 };
 
 type FixtureKind = 'valid' | 'not-json' | 'not-list' | 'bad-record';
@@ -195,6 +231,7 @@ describe('operator-coordination state file descriptors match the store readers',
       'coordination-requests.json',
       'owner-questions.json',
       'orchestrators.json',
+      'owner-items.json',
     ]);
   });
 });

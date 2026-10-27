@@ -6,7 +6,7 @@
  */
 
 /** `heartbeat` marks a lease-only write; consumers keep it out of their data kinds (plan F7). */
-export type ChangeSignalKind = 'question' | 'profile' | 'orchestrator' | 'heartbeat';
+export type ChangeSignalKind = 'question' | 'profile' | 'orchestrator' | 'heartbeat' | 'owner-item';
 export interface ChangeSignal {
   readonly kind: ChangeSignalKind;
   readonly id: string;

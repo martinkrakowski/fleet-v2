@@ -317,11 +317,11 @@ export function checkLeaseHeld(current: LaneRunLeaseRecord | null, request: unkn
 
 /** True when the lease is null or its leaseUntilIso is at or before nowIso; false for a malformed nowIso. */
 export function isLeaseLapsed(current: LaneRunLeaseRecord | null, nowIso: string): boolean {
-  if (current === null) {
-    return true;
-  }
   if (!isZonedIso(nowIso)) {
     return false;
+  }
+  if (current === null) {
+    return true;
   }
   return Date.parse(current.leaseUntilIso) <= Date.parse(nowIso);
 }

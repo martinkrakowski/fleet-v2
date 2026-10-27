@@ -10,6 +10,7 @@ export * from "./lane-run-keys.js";
 export * from "./lane-run-lease.js";
 export * from "./lane-run-records.js";
 export * from "./lane-run-transitions.js";
+export * from "./plain-record-reads.js";
 export * from "./seat-selection.js";
 export * from "./value-objects/index.js";
 export * from "./worktree-path.js";

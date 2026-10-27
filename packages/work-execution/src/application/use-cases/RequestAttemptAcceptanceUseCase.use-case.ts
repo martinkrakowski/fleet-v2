@@ -219,6 +219,25 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
         reason: `Reviewer model ${request.reviewerModel} matches implementer model ${implementerModel}; an independent reviewer is required`,
       };
     }
+    // S1: with a seat plan the lane may rotate implementers across families;
+    // the reviewer must be independent of every model that ran in the lane.
+    if (attempt.seatPlan) {
+      const lane = await deps.attemptRepo.listAttemptsByWorkOrder(attempt.workOrderId);
+      const laneModels = lane
+        .map((record) => record.runner?.model ?? null)
+        .filter((model): model is string => typeof model === 'string' && model.trim().length > 0);
+      const clash = laneModels.find((model) =>
+        isSameModelFamily(underlyingModelFamily(model), underlyingModelFamily(request.reviewerModel)),
+      );
+      if (clash !== undefined) {
+        return {
+          outcome: 'rejected',
+          reason:
+            'Reviewer model ' + request.reviewerModel + ' shares a model family with implementer model ' +
+            clash + ' earlier in this lane; an independent reviewer is required',
+        };
+      }
+    }
 
     // Free-seat policy (plan F5): with the flag off, a reviewer model must be
     // a catalogue seat that is not free; a free or unknown reviewer is

@@ -5,10 +5,14 @@
  * fix round never resumes the prior session; its conversation is not the new
  * attempt's. The new identity is created only when no other attempt on the
  * work order can still touch the shared worktree and the fix identity is
- * unused.
+ * unused. When the prior attempt carries a seat plan, the fix attempt is
+ * bound to the next eligible fix seat (S1 round-robin); an exhausted plan
+ * refuses.
  */
 
 import type { AttemptRecord } from '../../domain/execution-records.js';
+import { historyEntryOf, seatSelectionRecord, selectSeat } from '../../domain/seat-selection.js';
+import { SeatPlan } from '../../domain/value-objects/SeatPlan.vo.js';
 import {
   FIX_READY_PRIOR_STATES,
   FIX_NON_BLOCKING_SIBLING_STATES,
@@ -74,6 +78,11 @@ function isNonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+/** Oldest first; ties keep repository order. */
+function byCreatedAt(left: AttemptRecord, right: AttemptRecord): number {
+  return left.createdAtIso.localeCompare(right.createdAtIso);
+}
+
 export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
   constructor(private readonly deps?: PrepareFixAttemptDependencies) {}
 
@@ -126,6 +135,37 @@ export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
       return { outcome: 'refused', reason: `Fix attempt id already exists: ${request.fixAttemptId}` };
     }
 
+    // S1: a prior attempt with a seat plan hands the next fix seat to this
+    // attempt by the per-lane round-robin. No plan keeps today's behaviour.
+    let seatFields: Pick<AttemptRecord, 'seatPlan' | 'seatSelection'> = {};
+    if (prior.seatPlan) {
+      const created = SeatPlan.create(prior.seatPlan);
+      if (!created.success || created.value === undefined) {
+        return {
+          outcome: 'refused',
+          reason: 'Prior attempt carries an invalid seat plan: ' + (created.error?.message ?? 'unknown error'),
+        };
+      }
+      const unhealthy = request.unhealthySeatIds ?? [];
+      if (!Array.isArray(unhealthy) || !unhealthy.every((id) => typeof id === 'string')) {
+        return { outcome: 'refused', reason: 'unhealthySeatIds must be an array of strings' };
+      }
+      const lane = [...(await this.deps.attemptRepo.listAttemptsByWorkOrder(request.workOrderId))].sort(byCreatedAt);
+      const selection = selectSeat({
+        plan: created.value,
+        role: 'fix',
+        history: lane.map(historyEntryOf),
+        unhealthySeatIds: unhealthy,
+      });
+      if (!selection.ok) {
+        return { outcome: 'refused', reason: 'No fix seat available: ' + selection.reason };
+      }
+      seatFields = {
+        seatPlan: created.value.toJSON(),
+        seatSelection: seatSelectionRecord('fix', selection.seatIndex, selection.seat),
+      };
+    }
+
     const nowIso = request.nowIso ?? new Date().toISOString();
     // A fix attempt is a fresh identity: it never inherits or resumes the
     // prior session's sessionId or conversation.
@@ -144,6 +184,7 @@ export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
       sessionId: null,
       completionReceipt: null,
       artifacts: null,
+      ...seatFields,
       createdAtIso: nowIso,
       updatedAtIso: nowIso,
     };

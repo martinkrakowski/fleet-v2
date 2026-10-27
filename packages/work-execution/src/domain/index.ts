@@ -20,4 +20,5 @@ export * from "./seat-selection.js";
 export * from "./value-objects/index.js";
 export * from "./work-board.js";
 export * from "./work-board-facts.js";
+export * from "./work-board-steps.js";
 export * from "./worktree-path.js";

@@ -8,6 +8,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { AttemptArtifactAdapter, sha256HexDigest } from '../AttemptArtifactAdapter.adapter.js';
 import { LocalExecutor } from '../LocalExecutor.adapter.js';
+import type { AttemptArtifactPort } from '../../../application/ports/out/AttemptArtifactPort.out-port.js';
 import type {
   CommandRunOptions,
   CommandRunResult,
@@ -171,6 +172,82 @@ describe('AttemptArtifactAdapter artifact manifest (fake executor)', () => {
     expect(result.outcome).toBe('refused');
     if (result.outcome !== 'refused') return;
     expect(result.reason).toContain('not a regular file');
+  });
+
+  it('hardens every git call during sealArtifactManifest and artifact collection with core.fsmonitor=false and core.hooksPath=/dev/null', async () => {
+    const fake = makeFake();
+    const adapter = new AttemptArtifactAdapter({ executor: fake.executor });
+    const collected = await adapter.collectCompletedAttemptArtifacts({
+      attemptId: 'attempt-1',
+      worktreePath: '/wt',
+      baseCommit: '0'.repeat(40),
+      expectedArtifactPaths: ['docs/a.md'],
+      completionReceipt: {
+        attemptId: 'attempt-1',
+        sessionId: 'session-1',
+        endedAtIso: '2026-04-19T00:00:00.000Z',
+        authoritative: true,
+        exitStatus: 0,
+        stoppedByRequest: false,
+      },
+    });
+    expect(collected.outcome).toBe('collected');
+    const sealed = await adapter.sealArtifactManifest({
+      attemptId: 'attempt-1',
+      worktreePath: '/wt',
+      artifactPaths: ['docs/a.md'],
+    });
+    expect(sealed.outcome).toBe('sealed');
+    const gitCalls = fake.calls.filter((c) => c.argv[0] === 'git');
+    expect(gitCalls).toHaveLength(4);
+    for (const call of gitCalls) {
+      expect(call.argv.slice(0, 7)).toEqual([
+        'git',
+        '-C',
+        '/wt',
+        '-c',
+        'core.fsmonitor=false',
+        '-c',
+        'core.hooksPath=/dev/null',
+      ]);
+      expect(call.argv).toContain('core.fsmonitor=false');
+      expect(call.argv).toContain('core.hooksPath=/dev/null');
+    }
+  });
+
+  it('resolves canonical paths with realpath -- (no -e flag)', async () => {
+    const fake = makeFake();
+    const result = await sealWith(fake, ['docs/a.md']);
+    expect(result.outcome).toBe('sealed');
+    const realpathCalls = fake.calls.filter((c) => c.argv[0] === 'realpath');
+    expect(realpathCalls.map((c) => c.argv)).toEqual([
+      ['realpath', '--', '/wt'],
+      ['realpath', '--', '/wt/docs/a.md'],
+    ]);
+  });
+
+  it('rejects a manifestPath that does not match the content-addressed shape with no executor probes', async () => {
+    const fake = makeFake();
+    const port: AttemptArtifactPort = new AttemptArtifactAdapter({ executor: fake.executor });
+    const escapingVerdict = await port.verifyArtifactManifest?.({
+      attemptId: 'attempt-1',
+      worktreePath: '/wt',
+      manifestPath: '../x.json',
+    });
+    expect(escapingVerdict).toEqual({
+      outcome: 'mismatch',
+      mismatches: [{ path: '../x.json', kind: 'manifest-invalid' }],
+    });
+    const otherVerdict = await port.verifyArtifactManifest?.({
+      attemptId: 'attempt-1',
+      worktreePath: '/wt',
+      manifestPath: '.lane/other.json',
+    });
+    expect(otherVerdict).toEqual({
+      outcome: 'mismatch',
+      mismatches: [{ path: '.lane/other.json', kind: 'manifest-invalid' }],
+    });
+    expect(fake.calls).toEqual([]);
   });
 });
 
@@ -470,5 +547,44 @@ describe('AttemptArtifactAdapter artifact manifest (real filesystem)', () => {
       expectedManifestSha256: first.manifestSha256,
     });
     expect(verdict.outcome).toBe('sealed');
+  });
+
+  it('verifies through AttemptArtifactPort with the recorded manifestPath, and reports manifest-invalid for ../x.json or .lane/other.json', async () => {
+    const dir = await makeTempRepo();
+    const port: AttemptArtifactPort = new AttemptArtifactAdapter({ executor: new LocalExecutor() });
+    const sealed = await port.sealArtifactManifest?.({
+      attemptId: 'attempt-1',
+      worktreePath: dir,
+      artifactPaths: ['docs/a.md'],
+    });
+    expect(sealed?.outcome).toBe('sealed');
+    if (sealed?.outcome !== 'sealed') return;
+    const verdict = await port.verifyArtifactManifest?.({
+      attemptId: 'attempt-1',
+      worktreePath: dir,
+      manifestPath: sealed.manifestPath,
+      expectedManifestSha256: sealed.manifestSha256,
+    });
+    expect(verdict).toEqual({ outcome: 'sealed' });
+
+    const escapingVerdict = await port.verifyArtifactManifest?.({
+      attemptId: 'attempt-1',
+      worktreePath: dir,
+      manifestPath: '../x.json',
+    });
+    expect(escapingVerdict).toEqual({
+      outcome: 'mismatch',
+      mismatches: [{ path: '../x.json', kind: 'manifest-invalid' }],
+    });
+
+    const otherVerdict = await port.verifyArtifactManifest?.({
+      attemptId: 'attempt-1',
+      worktreePath: dir,
+      manifestPath: '.lane/other.json',
+    });
+    expect(otherVerdict).toEqual({
+      outcome: 'mismatch',
+      mismatches: [{ path: '.lane/other.json', kind: 'manifest-invalid' }],
+    });
   });
 });

@@ -75,6 +75,8 @@ export interface VerifyArtifactManifestRequest {
   readonly attemptId: string;
   readonly worktreePath: string;
   readonly recordedHost?: AttemptRunnerRecord | null;
+  /** The relative path recorded on the attempt at collection. */
+  readonly manifestPath?: string;
   /** The digest recorded on the attempt; when given, a rewritten manifest is a mismatch. */
   readonly expectedManifestSha256?: string;
 }

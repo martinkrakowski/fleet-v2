@@ -88,6 +88,21 @@ const HASH_TIMEOUT_MS = 120 * 1000;
 /** A valid SHA-256 hex digest: 64 lowercase hexadecimal characters. */
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
+/** A valid content-addressed artifact manifest worktree-relative path. */
+const MANIFEST_PATH_PATTERN = /^\.lane\/artifacts-manifest-[0-9a-f]{16}\.json$/;
+
+/**
+ * Applied to every git command: the hardening overrides — no fsmonitor and no
+ * repository hooks — so a lane-modified `.git/config` cannot execute commands
+ * during ignored-path checks or artifact collection.
+ */
+const GIT_HARDENING: readonly string[] = [
+  '-c',
+  'core.fsmonitor=false',
+  '-c',
+  'core.hooksPath=/dev/null',
+];
+
 /** Cryptographic SHA-256 hex digest injected by production composition roots. */
 export function sha256HexDigest(content: string): string {
   return createHash('sha256').update(content, 'utf8').digest('hex');
@@ -254,9 +269,12 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     args: readonly string[],
     executor: CommandExecutorPort,
   ): Promise<string> {
-    const result = await executor.run(['git', '-C', worktreePath, ...args], {
-      timeoutMs: GIT_TIMEOUT_MS,
-    });
+    const result = await executor.run(
+      ['git', '-C', worktreePath, ...GIT_HARDENING, ...args],
+      {
+        timeoutMs: GIT_TIMEOUT_MS,
+      },
+    );
     if (result.exitCode !== 0) {
       throw new Error(
         `git ${args.join(' ')} failed in ${worktreePath}: exit ${String(result.exitCode)}` +
@@ -295,6 +313,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
         'git',
         '-C',
         worktreePath,
+        ...GIT_HARDENING,
         'check-ignore',
         '-q',
         '--',
@@ -312,13 +331,13 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
 
   /**
    * Resolve the worktree's canonical path once on the target host via
-   * `realpath -e -- <worktreePath>`.
+   * `realpath -- <worktreePath>`.
    */
   private async resolveCanonicalWorktreePath(
     worktreePath: string,
     executor: CommandExecutorPort,
   ): Promise<string | null> {
-    const result = await executor.run(['realpath', '-e', '--', worktreePath], {
+    const result = await executor.run(['realpath', '--', worktreePath], {
       timeoutMs: PROBE_TIMEOUT_MS,
     });
     if (result.exitCode !== 0) {
@@ -363,7 +382,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
 
   /**
    * Measure one contained worktree-relative artifact path: an existence probe,
-   * a regular-file probe, a canonical-path check (`realpath -e -- <path>` must
+   * a regular-file probe, a canonical-path check (`realpath -- <path>` must
    * equal the worktree's canonical path plus the relative path, so symbolic
    * links in any path component are refused), a byte count and a SHA-256
    * digest, all through the same executor. Absent and non-regular results are
@@ -404,7 +423,7 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
           (regularProbe.error !== undefined ? `: ${regularProbe.error}` : ''),
       );
     }
-    const canonicalProbe = await executor.run(['realpath', '-e', '--', target], {
+    const canonicalProbe = await executor.run(['realpath', '--', target], {
       timeoutMs: PROBE_TIMEOUT_MS,
     });
     if (canonicalProbe.exitCode !== 0) {
@@ -609,11 +628,20 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
    * `manifest-changed`.
    */
   async verifyArtifactManifest(
-    request: VerifyArtifactManifestRequest & { readonly manifestPath?: string },
+    request: VerifyArtifactManifestRequest,
   ): Promise<VerifyArtifactManifestResult> {
     const rootRefusal = worktreeRootRefusal(request.worktreePath);
     if (rootRefusal !== null) {
       throw new Error(rootRefusal);
+    }
+    if (
+      request.manifestPath !== undefined &&
+      !MANIFEST_PATH_PATTERN.test(request.manifestPath)
+    ) {
+      return {
+        outcome: 'mismatch',
+        mismatches: [{ path: request.manifestPath, kind: 'manifest-invalid' }],
+      };
     }
     const executor = this.executorFor(request.recordedHost);
     const manifestRelativePath =

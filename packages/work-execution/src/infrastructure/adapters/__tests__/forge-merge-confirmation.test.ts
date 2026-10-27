@@ -100,6 +100,20 @@ describe('ForgeActionAdapter merge confirmation after a non-zero gh exit', () =>
     expect(JSON.stringify(result)).not.toContain('HTTP 403');
   });
 
+  it('confirms a 7-hex expected head as a prefix of the merged 40-hex head', async () => {
+    const shortHead = HEAD_SHA.slice(0, 7);
+    const { runGh } = makeRunGh({ exitCode: 1, stdout: '', stderr: MERGE_REFUSAL_STDERR });
+    const { port } = makeReadPort(foundSnapshot());
+    const adapter = new ForgeActionAdapter(
+      { runGh, verifyCurrentHeadSha: async () => shortHead },
+      port,
+    );
+
+    const result = await adapter.performForgeAction({ ...forgeActionRequest(), expectedHeadSha: shortHead });
+
+    expect(result).toEqual({ outcome: 'executed', headSha: shortHead });
+  });
+
   it('refuses with the classifier kind when the pull request is still open', async () => {
     const { runGh } = makeRunGh({ exitCode: 1, stdout: '', stderr: MERGE_REFUSAL_STDERR });
     const { port } = makeReadPort(foundSnapshot({ state: 'open' }));

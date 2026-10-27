@@ -326,6 +326,29 @@ describe('ForgeReadAdapter.readPullRequest', () => {
     });
   });
 
+  it('a read that rejects after the deadline won raises no unhandled rejection', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const late = () =>
+        new Promise<GhInvocationResult>((_resolve, reject) => {
+          setTimeout(() => reject(new Error('late failure')), 40);
+        });
+      const adapter = makeAdapter({ runGh: late, timeoutMs: 10 });
+
+      const result = await adapter.readPullRequest({ ref: { kind: 'number', number: 202 } });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+
+      expect(result).toEqual({ outcome: 'unavailable', reason: 'gh pr view timed out' });
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
   it('is unavailable without parsing when the stdout exceeds one mebibyte', async () => {
     const oversized = 'x'.repeat(1_048_577);
     const { runGh } = makeRunGh({ exitCode: 0, stdout: oversized, stderr: '' });

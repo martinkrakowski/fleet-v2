@@ -203,8 +203,11 @@ export class ForgeReadAdapter implements ForgeReadPort {
     let gh: GhInvocationResult;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
+      const pending = runGh(args);
+      // A read that settles after the deadline won must not become an unhandled rejection.
+      pending.catch(() => undefined);
       gh = await Promise.race([
-        runGh(args),
+        pending,
         new Promise<never>((_resolve, reject) => {
           timer = setTimeout(() => reject(new Error(READ_TIMED_OUT)), this.timeoutMs);
         }),

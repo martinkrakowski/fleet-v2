@@ -292,7 +292,7 @@ export class ForgeActionAdapter implements ForgeActionPort {
     }
     const snapshot = read.pullRequest;
     if (snapshot.state === 'merged') {
-      if (snapshot.headSha.startsWith(request.expectedHeadSha)) {
+      if (isCommitSha(request.expectedHeadSha) && snapshot.headSha.startsWith(request.expectedHeadSha)) {
         return { outcome: 'executed', headSha: request.expectedHeadSha };
       }
       return {

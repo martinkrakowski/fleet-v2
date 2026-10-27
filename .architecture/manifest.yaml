@@ -383,6 +383,7 @@ bounded_contexts:
             - ExecutionJournalPort
             - LaneRunRepositoryPort
             - ConductorDriverLeasePort
+            - LaneRunJournalPort
             - BriefAuthoringPort
             - ExecutionRunnerPort
             - CommandExecutorPort
@@ -407,7 +408,7 @@ bounded_contexts:
             - ProjectProbeRecordPort
             - ChangeSignalPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -428,6 +429,7 @@ bounded_contexts:
       ExecutionJournalPort: "Atomically record intent, capacity and action receipts; a host has one designated dispatcher until shared arbitration is implemented."
       LaneRunRepositoryPort: "Persist lane runs: create at revision 1; save only at the stored revision plus one and only by the current, unexpired run-lease holder with its fence, never moving the lease, the run's identity or its earlier attempts; acquire the run lease by CAS on the fence, renew and release it without moving the revision; known absence is null."
       ConductorDriverLeasePort: "Hold the one conductor driver lease of a state directory: acquire by CAS on the fence over a null or lapsed lease, renew and release by its holder with its fence, check and read without writing; the fence never goes back."
+      LaneRunJournalPort: "Append keyed run journal entries under the store's guard: an intent before its action, its result after, a conduct entry for an entered state; refuse a second intent with the same key, a result without its intent or after a final result, a stop whose mode does not match its key, and a stop no stronger than the strongest the run already has; list per run and per key in append order."
       BriefAuthoringPort: "Obtain a project orchestrator's brief or a hand-written file without introducing provider inference into the control plane."
       ExecutionRunnerPort: "Start, inspect and stop a matching attempt/session with explicit capabilities and strict per-lane directory isolation; a busy-worktree start is blocked and keeps its reservation until reconcile or stop resolves the worktree, and a worktree can be inspected or aborted by directory without a session id."
       RunnerSelectorPort: "Given the installation's lane-runner hosts and the attempt's seat tool, return the runner kind and host to use; a kind without an implemented adapter is refused as runner-not-available."
@@ -459,6 +461,7 @@ bounded_contexts:
       - { adapter: ExecutionJournalAdapter, implements: ExecutionJournalPort, integration: local-transactional-journal-and-capacity-arbitration }
       - { adapter: LaneRunRepositoryAdapter, implements: LaneRunRepositoryPort, integration: local-transactional-store }
       - { adapter: ConductorDriverLeaseAdapter, implements: ConductorDriverLeasePort, integration: local-transactional-store }
+      - { adapter: LaneRunJournalAdapter, implements: LaneRunJournalPort, integration: local-keyed-run-journal }
       - { adapter: BriefAuthoringAdapter, implements: BriefAuthoringPort, integration: reviewed-harness-or-hand-written-file }
       - { adapter: ExecutionRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-ocm-run-subprocess }
       - { adapter: AgyRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-agy-run-subprocess-behind-runner-mode }
@@ -531,6 +534,7 @@ bounded_contexts:
         - "Lanes have no forge, shelf or Waves access. Provider keys remain in the existing host-side key proxy; memory enters through frozen briefs."
         - "A lane run records only what cannot be derived (work order, tier, seat plan reference and cursors, round 0-2, attempt ids, PR number, park, lease, revision, run policy revision); its state is a projection of attempts, the keyed journal, receipts and forge evidence. Every external action of a run carries the idempotency key <runId>/r<round>/<step>/<seatIndex>[/a<n>][@<head12>][/retry<n>] (the attempt ordinal only on prepare and dispatch), and the control keys <runId>/stop@<via> (graceful), <runId>/stop-force@<via> (force), with via web or cli and the mode read from the key, <runId>/park/<n>/resume@web, request/<requestId> and reaper/<subjectId>/<kind>@<findingId> sit beside them."
         - "A run lease and the state directory's driver lease are taken by CAS on the fence the taker read, only when the lease is null or lapsed, and each taking raises the fence by one; renewing keeps the fence, releasing keeps holder and fence, and the fence never goes back. A lease change never moves the run's revision."
+        - "The run journal is append-only and keyed: an intent is durable before its action runs and its key is unique, a result pairs with its intent, and only ambiguous results may precede a key's one final result. A run has at most one stop per mode; a force may follow a graceful stop, never the reverse."
       lifecycle_requirements:
         - "Dispatch intent is durable before start; ambiguous results enter reconciliation rather than blind retries."
         - "Only a matching ended observation permits artifact collection and capacity release."

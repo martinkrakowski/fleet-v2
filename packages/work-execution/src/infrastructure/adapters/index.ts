@@ -22,6 +22,7 @@ export * from "./file-store.js";
 export * from "./ForgeActionAdapter.adapter.js";
 export * from "./GatePredicateAdapter.adapter.js";
 export * from "./LaneDiffCheckAdapter.adapter.js";
+export * from "./LaneRunJournalAdapter.adapter.js";
 export * from "./LaneRunRepositoryAdapter.adapter.js";
 export * from "./LocalExecutor.adapter.js";
 export * from "./NoopChangeSignalAdapter.adapter.js";

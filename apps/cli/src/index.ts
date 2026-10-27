@@ -1129,7 +1129,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
           ? selectSeat({
               plan: created.value,
               role: 'fix',
-              history: lane.map(historyEntryOf),
+              history: lane.map((attempt) => historyEntryOf(attempt)),
               unhealthySeatIds,
             })
           : selectReviewSeat({

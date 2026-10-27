@@ -105,6 +105,9 @@ export interface UsageSum {
   readonly attempts: number;
   readonly measured: number;
   readonly notMeasured: number;
+  readonly meteredCount: number;
+  readonly estimateCount: number;
+  readonly unknownBillingCount: number;
   readonly meteredUsd: number;
   readonly estimateUsd: number;
   readonly unknownBillingUsd: number;
@@ -114,6 +117,9 @@ export function sumUsage(items: readonly UsageInput[]): UsageSum {
   let attempts = 0;
   let measured = 0;
   let notMeasured = 0;
+  let meteredCount = 0;
+  let estimateCount = 0;
+  let unknownBillingCount = 0;
   let meteredUsd = 0;
   let estimateUsd = 0;
   let unknownBillingUsd = 0;
@@ -131,12 +137,15 @@ export function sumUsage(items: readonly UsageInput[]): UsageSum {
     measured += 1;
     switch (billingOf(item.runner)) {
       case "metered":
+        meteredCount += 1;
         meteredUsd += usage.costUsd;
         break;
       case "plan":
+        estimateCount += 1;
         estimateUsd += usage.costUsd;
         break;
       default:
+        unknownBillingCount += 1;
         unknownBillingUsd += usage.costUsd;
         break;
     }
@@ -145,6 +154,9 @@ export function sumUsage(items: readonly UsageInput[]): UsageSum {
     attempts,
     measured,
     notMeasured,
+    meteredCount,
+    estimateCount,
+    unknownBillingCount,
     meteredUsd,
     estimateUsd,
     unknownBillingUsd,
@@ -161,13 +173,13 @@ export function usageSumText(sum: UsageSum): string {
     }`;
   }
   const parts: string[] = [];
-  if (sum.meteredUsd > 0) {
+  if (sum.meteredCount > 0) {
     parts.push(`${money(sum.meteredUsd)} metered`);
   }
-  if (sum.estimateUsd > 0) {
+  if (sum.estimateCount > 0) {
     parts.push(`est. ${money(sum.estimateUsd)} ${PLAN_BILLED_NOTE}`);
   }
-  if (sum.unknownBillingUsd > 0) {
+  if (sum.unknownBillingCount > 0) {
     parts.push(`${money(sum.unknownBillingUsd)} billing not recorded`);
   }
   parts.push(`over ${sum.measured} of ${sum.attempts} attempts`);

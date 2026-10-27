@@ -206,6 +206,9 @@ describe("sumUsage", () => {
     expect(sum.attempts).toBe(5);
     expect(sum.measured).toBe(3);
     expect(sum.notMeasured).toBe(2);
+    expect(sum.meteredCount).toBe(2);
+    expect(sum.estimateCount).toBe(1);
+    expect(sum.unknownBillingCount).toBe(0);
     expect(sum.meteredUsd).toBeCloseTo(0.1);
     expect(sum.estimateUsd).toBeCloseTo(0.3);
     expect(sum.unknownBillingUsd).toBe(0);
@@ -217,6 +220,9 @@ describe("usageSumText", () => {
     attempts: 0,
     measured: 0,
     notMeasured: 0,
+    meteredCount: 0,
+    estimateCount: 0,
+    unknownBillingCount: 0,
     meteredUsd: 0,
     estimateUsd: 0,
     unknownBillingUsd: 0,
@@ -241,6 +247,9 @@ describe("usageSumText", () => {
         attempts: 5,
         measured: 3,
         notMeasured: 2,
+        meteredCount: 1,
+        estimateCount: 1,
+        unknownBillingCount: 1,
         meteredUsd: 0.1,
         estimateUsd: 0.3,
         unknownBillingUsd: 0.2,
@@ -256,6 +265,9 @@ describe("usageSumText", () => {
         attempts: 2,
         measured: 1,
         notMeasured: 1,
+        meteredCount: 1,
+        estimateCount: 0,
+        unknownBillingCount: 0,
         meteredUsd: 0.12,
         estimateUsd: 0,
         unknownBillingUsd: 0,
@@ -267,6 +279,9 @@ describe("usageSumText", () => {
         attempts: 1,
         measured: 1,
         notMeasured: 0,
+        meteredCount: 0,
+        estimateCount: 1,
+        unknownBillingCount: 0,
         meteredUsd: 0,
         estimateUsd: 0.3,
         unknownBillingUsd: 0,
@@ -278,11 +293,81 @@ describe("usageSumText", () => {
         attempts: 1,
         measured: 1,
         notMeasured: 0,
+        meteredCount: 0,
+        estimateCount: 0,
+        unknownBillingCount: 1,
         meteredUsd: 0,
         estimateUsd: 0,
         unknownBillingUsd: 0.2,
       }),
     ).toBe("$0.20 billing not recorded · over 1 of 1 attempts");
+  });
+
+  it("names a measured $0.00 metered bucket and a measured $0.00 plan bucket", () => {
+    expect(
+      usageSumText({
+        attempts: 1,
+        measured: 1,
+        notMeasured: 0,
+        meteredCount: 1,
+        estimateCount: 0,
+        unknownBillingCount: 0,
+        meteredUsd: 0,
+        estimateUsd: 0,
+        unknownBillingUsd: 0,
+      }),
+    ).toBe("$0.00 metered · over 1 of 1 attempts");
+
+    expect(
+      usageSumText({
+        attempts: 1,
+        measured: 1,
+        notMeasured: 0,
+        meteredCount: 0,
+        estimateCount: 1,
+        unknownBillingCount: 0,
+        meteredUsd: 0,
+        estimateUsd: 0,
+        unknownBillingUsd: 0,
+      }),
+    ).toBe("est. $0.00 plan, not spend · over 1 of 1 attempts");
+  });
+
+  it("joins a measured $0.00 metered bucket with a plan estimate", () => {
+    expect(
+      usageSumText({
+        attempts: 2,
+        measured: 2,
+        notMeasured: 0,
+        meteredCount: 1,
+        estimateCount: 1,
+        unknownBillingCount: 0,
+        meteredUsd: 0,
+        estimateUsd: 0.3,
+        unknownBillingUsd: 0,
+      }),
+    ).toBe(
+      "$0.00 metered · est. $0.30 plan, not spend · over 2 of 2 attempts",
+    );
+  });
+
+  it("sums a measured $0.00 into the matching bucket with its count", () => {
+    const sum = sumUsage([
+      input(OPENCODE, usage({ costUsd: 0 })),
+      input(OPENCODE, usage({ costUsd: 0.12 })),
+      input(AGY, usage({ costUsd: 0 })),
+      input(null, usage({ costUsd: 0 })),
+    ]);
+
+    expect(sum.attempts).toBe(4);
+    expect(sum.measured).toBe(4);
+    expect(sum.notMeasured).toBe(0);
+    expect(sum.meteredCount).toBe(2);
+    expect(sum.estimateCount).toBe(1);
+    expect(sum.unknownBillingCount).toBe(1);
+    expect(sum.meteredUsd).toBeCloseTo(0.12);
+    expect(sum.estimateUsd).toBe(0);
+    expect(sum.unknownBillingUsd).toBe(0);
   });
 });
 

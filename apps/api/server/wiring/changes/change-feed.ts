@@ -140,6 +140,9 @@ export class ChangeFeed {
       }
     } catch {
       this.emitFailuresCount += 1;
+      // Plan section 3.1: a delivery failure becomes a resync, so a client is never left with
+      // neither the lost signal nor a resync. appendEntry cannot throw.
+      this.resync();
     }
   }
 

@@ -170,7 +170,7 @@ describe('ChangeFeed', () => {
     }
   });
 
-  it('a signal whose getter throws is swallowed and counted in emitFailures', () => {
+  it('a signal whose getter throws is swallowed, counted in emitFailures and turned into a resync', () => {
     const feed = new ChangeFeed({ streamId: 'stream' });
     const signal = {
       id: 'x',
@@ -185,6 +185,11 @@ describe('ChangeFeed', () => {
     });
     expect(() => feed.emit(signal)).not.toThrow();
     expect(feed.emitFailures).toBe(1);
+    const read = feed.read('stream:0');
+    expect(read.kind).toBe('entries');
+    if (read.kind === 'entries') {
+      expect(read.entries.map((entry) => entry.kind)).toEqual(['resync']);
+    }
   });
 
   it('rejects a capacity below 16', () => {

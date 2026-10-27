@@ -98,7 +98,7 @@ function isCommitSha(value: string): boolean {
 }
 
 /** Branch names stay one safe git ref segment path. */
-function isSafeBranchName(value: string): boolean {
+export function isSafeBranchName(value: string): boolean {
   return (
     value.length > 0 &&
     !value.includes('..') &&

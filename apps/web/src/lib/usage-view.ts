@@ -1,15 +1,17 @@
 /**
  * Recorded usage view helpers shared by the lanes rows and the work-order
- * timeline. Pure: imports only types, so it is safe on both the client and
+ * timeline. Pure: imports only types and the shared billing rule
+ * (`@fleet/shared`'s `billingOf`), so it is safe on both the client and
  * the server side. Billing follows the recorded runner kind — opencode
  * figures are as opencode recorded them, agy figures are plan-billed
  * estimates (not spend), and any other recorded kind means billing is not
  * recorded.
  */
 
+import { billingOf as billingOfRunnerKind, type SeatBilling } from "@fleet/shared";
 import type { RecordedRunner, RecordedUsage } from "./attempt-wire";
 
-export type Billing = "metered" | "plan" | "unknown";
+export type Billing = SeatBilling;
 
 export interface UsageInput {
   readonly runner: RecordedRunner | null;
@@ -19,14 +21,7 @@ export interface UsageInput {
 const PLAN_BILLED_NOTE = "plan, not spend";
 
 export function billingOf(runner: RecordedRunner | null): Billing {
-  switch (runner?.kind) {
-    case "opencode":
-      return "metered";
-    case "agy":
-      return "plan";
-    default:
-      return "unknown";
-  }
+  return billingOfRunnerKind(runner?.kind);
 }
 
 export function seatChipText(runner: RecordedRunner | null): string {

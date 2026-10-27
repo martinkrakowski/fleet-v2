@@ -5,10 +5,16 @@
  * locally or through batch-mode ssh on the configured verification host, and
  * maps the completed process outcome onto the evidence result, fail closed:
  * only exit code 0 of a completed check is `pass`; anything missing, killed
- * or ambiguous is `unknown`. No command is ever run through a shell.
+ * or ambiguous is `unknown`. No command is ever run through a shell. A
+ * procedure that declares coverage passes only when its reader counted at
+ * least `minUnits` units in the full output.
  */
 
 import { spawnSync } from 'node:child_process';
+import { applyCoverage, isCheckCoverage } from '../../domain/check-coverage.js';
+import type { CheckCoverage, CoverageExpectation, CoverageUnitKind } from '../../domain/check-coverage.js';
+import { COVERAGE_READER_UNIT_KINDS, isCoverageReaderName, readCheckCoverage } from './coverage-readers.js';
+import type { CoverageReaderName } from './coverage-readers.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type {
   ExecuteVerificationCheckRequest,
@@ -17,10 +23,18 @@ import type {
 } from '../../application/ports/out/VerificationExecutorPort.out-port.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 
+/** Optional coverage the procedure must show; absent means today's exit-0 rule (plan D3). */
+export interface ProcedureCoverageDeclaration {
+  readonly reader: CoverageReaderName;
+  readonly unitKind: CoverageUnitKind;
+  readonly minUnits: number;
+}
+
 /** Allow-listed check: an executable plus optional fixed arguments. */
 export interface AllowListedVerificationCommand {
   readonly command: string;
   readonly args?: readonly string[];
+  readonly coverage?: ProcedureCoverageDeclaration;
 }
 
 /** Completed outcome of one spawned process, as far as this port needs it. */
@@ -113,6 +127,54 @@ function resolveAllowListedCommand(
   return { command: candidate.command, args };
 }
 
+function resolveCoverageDeclaration(
+  entry: unknown,
+): ProcedureCoverageDeclaration | undefined | 'malformed' {
+  if (typeof entry === 'string') {
+    return undefined;
+  }
+  if (entry === null || typeof entry !== 'object') {
+    return undefined;
+  }
+  const record = entry as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(record, 'coverage')) {
+    return undefined;
+  }
+  const coverage = record.coverage;
+  if (coverage === null || typeof coverage !== 'object' || Array.isArray(coverage)) {
+    return 'malformed';
+  }
+  const declaration = coverage as Record<string, unknown>;
+  const keys = Object.keys(declaration);
+  if (
+    keys.length !== 3 ||
+    !keys.includes('reader') ||
+    !keys.includes('unitKind') ||
+    !keys.includes('minUnits')
+  ) {
+    return 'malformed';
+  }
+  if (!isCoverageReaderName(declaration.reader)) {
+    return 'malformed';
+  }
+  const expectedUnitKind = COVERAGE_READER_UNIT_KINDS[declaration.reader];
+  if (declaration.unitKind !== expectedUnitKind) {
+    return 'malformed';
+  }
+  if (
+    typeof declaration.minUnits !== 'number' ||
+    !Number.isSafeInteger(declaration.minUnits) ||
+    declaration.minUnits < 1
+  ) {
+    return 'malformed';
+  }
+  return {
+    reader: declaration.reader,
+    unitKind: expectedUnitKind,
+    minUnits: declaration.minUnits,
+  };
+}
+
 /**
  * ssh joins the words after the destination into one remote shell line, so
  * every remote word is POSIX-single-quoted (`'` becomes `'\''`).
@@ -131,13 +193,68 @@ function receipt(
   exitCode: number | null,
   outputSummary: string,
   completedAtIso: string,
+  coverage?: CheckCoverage,
 ): ExecuteVerificationCheckResult {
   return {
     result,
     exitCode,
     outputSummary: outputSummary.slice(-OUTPUT_SUMMARY_LIMIT),
     completedAtIso,
+    ...(coverage !== undefined ? { coverage } : {}),
   };
+}
+
+function measureCoverage(
+  declaration: ProcedureCoverageDeclaration,
+  output: string,
+): CheckCoverage {
+  const read = readCheckCoverage(declaration.reader, output);
+  return isCheckCoverage(read)
+    ? read
+    : { ran: false, reason: 'coverage reader returned a malformed value' };
+}
+
+function coverageNote(
+  declaration: ProcedureCoverageDeclaration,
+  coverage: CheckCoverage,
+): string {
+  if (coverage.ran) {
+    return (
+      'coverage: ' +
+      coverage.units +
+      ' ' +
+      coverage.unitKind +
+      ' (at least ' +
+      declaration.minUnits +
+      ' ' +
+      declaration.unitKind +
+      ' expected)'
+    );
+  }
+  return 'coverage: not read (' + coverage.reason + ')';
+}
+
+function completedReceipt(
+  exitCode: number,
+  output: string,
+  procedureName: string,
+  declaration: ProcedureCoverageDeclaration | undefined,
+  completedAtIso: string,
+): ExecuteVerificationCheckResult {
+  const raw: EvidenceResultValue = exitCode === 0 ? 'pass' : 'fail';
+  const summary =
+    output.length > 0 ? output : `'${procedureName}' produced no output`;
+  if (declaration === undefined) {
+    return receipt(raw, exitCode, summary, completedAtIso);
+  }
+  const coverage = measureCoverage(declaration, output);
+  const expectation: CoverageExpectation = {
+    unitKind: declaration.unitKind,
+    minUnits: declaration.minUnits,
+  };
+  const result = applyCoverage(raw, coverage, expectation);
+  const summaryWithNote = summary + '\n' + coverageNote(declaration, coverage);
+  return receipt(result, exitCode, summaryWithNote, completedAtIso, coverage);
 }
 
 export class VerificationExecutorAdapter implements VerificationExecutorPort {
@@ -164,6 +281,18 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
       );
     }
 
+    const declaration = resolveCoverageDeclaration(
+      this.options.allowListedCommands?.[request.procedureName],
+    );
+    if (declaration === 'malformed') {
+      return receipt(
+        'unknown',
+        null,
+        `the coverage declaration for '${request.procedureName}' is malformed; refusing to run it`,
+        completedAtIso,
+      );
+    }
+
     if (!SHA_PATTERN.test(request.candidateHeadSha)) {
       return receipt(
         'unknown',
@@ -183,8 +312,6 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
       const output = [executed.stdout, executed.stderr]
         .filter((part) => part.trim().length > 0)
         .join('\n');
-      const summary =
-        output.length > 0 ? output : `'${request.procedureName}' produced no output`;
       if (executed.error !== undefined) {
         return receipt('unknown', executed.exitCode, `spawn failed: ${executed.error}`, completedAtIso);
       }
@@ -214,7 +341,7 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
           completedAtIso,
         );
       }
-      return receipt(executed.exitCode === 0 ? 'pass' : 'fail', executed.exitCode, summary, completedAtIso);
+      return completedReceipt(executed.exitCode, output, request.procedureName, declaration, completedAtIso);
     }
 
     const sshHost = this.options.sshHost;
@@ -290,11 +417,6 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
     const output = [execution.stdout, execution.stderr]
       .filter((part) => part.trim().length > 0)
       .join('\n');
-    return receipt(
-      execution.status === 0 ? 'pass' : 'fail',
-      execution.status,
-      output.length > 0 ? output : `'${request.procedureName}' produced no output`,
-      completedAtIso,
-    );
+    return completedReceipt(execution.status, output, request.procedureName, declaration, completedAtIso);
   }
 }

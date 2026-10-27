@@ -12,6 +12,7 @@ import { LocalExecutor } from '../LocalExecutor.adapter.js';
 import type {
   SpawnedVerificationOutcome,
   SpawnVerificationTransport,
+  VerificationExecutorOptions,
 } from '../VerificationExecutorAdapter.adapter.js';
 import type { ExecuteVerificationCheckRequest } from '../../../application/ports/out/VerificationExecutorPort.out-port.js';
 
@@ -442,5 +443,223 @@ describe('VerificationExecutorAdapter with a CommandExecutorPort', () => {
     expect(result.result).toBe('pass');
     expect(result.exitCode).toBe(0);
     expect(result.outputSummary).toContain('verified');
+  });
+});
+
+describe('VerificationExecutorAdapter coverage declarations', () => {
+  const declared = {
+    ci: {
+      command: '/opt/verify-run.sh',
+      coverage: { reader: 'vitest-summary', unitKind: 'tests', minUnits: 1 },
+    },
+  } as const;
+
+  const VITEST_NORMAL = [
+    ' RUN  v4.1.11 /work/packages/evidence-and-acceptance',
+    '',
+    ' ✓ src/domain/__tests__/check-coverage.test.ts (14 tests) 6ms',
+    ' ✓ src/infrastructure/adapters/__tests__/VerificationExecutorAdapter.test.ts (22 tests) 120ms',
+    '',
+    ' Test Files  2 passed (2)',
+    '      Tests  36 passed (36)',
+    '   Start at  10:12:03',
+    '   Duration  1.02s (transform 80ms, setup 0ms, import 300ms, tests 126ms, environment 0ms)',
+  ].join('\n');
+  const VITEST_FAILURES = ' Test Files  1 failed | 1 passed (2)\n      Tests  2 failed | 30 passed | 1 expected fail | 3 skipped | 1 todo (37)\n';
+  const VITEST_ALL_SKIPPED = ' Test Files  1 skipped (1)\n      Tests  5 skipped (5)\n';
+  const VITEST_NO_FILES = 'No test files found, exiting with code 0\n\nfilter: no-such-test\n';
+  const VITEST_MISSING_SUMMARY = ' RUN  v4.1.11 /work\n\n ✓ src/a.test.ts (3 tests) 2ms\n';
+  const HEXAGEN_NO_FILES = '{"fresh":[],"baselined":[],"stale":[],"expired":[],"introduced":[],"baselineGrowth":[],"filesScanned":0}\n';
+
+  interface RecordedRun {
+    argv: readonly string[];
+    options?: { timeoutMs?: number };
+  }
+
+  function fakeExecutor(outcome: Partial<{
+    exitCode: number | null;
+    signal: string | null;
+    stdout: string;
+    stderr: string;
+    error: string;
+  }>): {
+    run: (argv: readonly string[], options?: { timeoutMs?: number }) => Promise<{
+      exitCode: number | null;
+      signal: string | null;
+      stdout: string;
+      stderr: string;
+      error?: string;
+    }>;
+    calls: RecordedRun[];
+  } {
+    const calls: RecordedRun[] = [];
+    return {
+      calls,
+      run: async (argv, options) => {
+        calls.push({ argv, options });
+        return { exitCode: 0, signal: null, stdout: '', stderr: '', ...outcome };
+      },
+    };
+  }
+
+  it('attaches coverage measured from the full output on a passing run', async () => {
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: declared,
+      spawn: recordingTransport([], completed(0, VITEST_NORMAL)),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    expect(result.result).toBe('pass');
+    expect(result.coverage).toEqual({ ran: true, unitKind: 'tests', units: 36 });
+    expect(result.outputSummary.endsWith('coverage: 36 tests (at least 1 tests expected)')).toBe(true);
+  });
+
+  it('downgrades pass to unknown when every test is skipped', async () => {
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: declared,
+      spawn: recordingTransport([], completed(0, VITEST_ALL_SKIPPED)),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    expect(result.result).toBe('unknown');
+    expect(result.coverage).toEqual({ ran: true, unitKind: 'tests', units: 0 });
+  });
+
+  it('downgrades pass to unknown when no test files exist', async () => {
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: declared,
+      spawn: recordingTransport([], completed(0, VITEST_NO_FILES)),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    expect(result.result).toBe('unknown');
+    expect(result.coverage).toEqual({ ran: false, reason: 'no count in output' });
+  });
+
+  it('downgrades pass to unknown when the summary line is missing', async () => {
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: declared,
+      spawn: recordingTransport([], completed(0, VITEST_MISSING_SUMMARY)),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    expect(result.result).toBe('unknown');
+  });
+
+  it('counts failures but never upgrades a failing exit code', async () => {
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: declared,
+      spawn: recordingTransport([], completed(1, VITEST_FAILURES)),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    expect(result.result).toBe('fail');
+    expect(result.coverage).toEqual({ ran: true, unitKind: 'tests', units: 33 });
+  });
+
+  it('attaches coverage from the full output even when the summary would be truncated', async () => {
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: declared,
+      spawn: recordingTransport([], completed(0, VITEST_NORMAL, 'w\n'.repeat(3000))),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    expect(result.result).toBe('pass');
+    expect(result.coverage).toEqual({ ran: true, unitKind: 'tests', units: 36 });
+    expect(result.outputSummary.length).toBeLessThanOrEqual(4000);
+    expect(result.outputSummary).not.toContain('Tests  36 passed');
+  });
+
+  it('downgrades pass to unknown for a hexagen declaration with zero files', async () => {
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: {
+        ci: {
+          command: 'hexagen-lint',
+          args: ['--json'],
+          coverage: { reader: 'hexagen-lint-json', unitKind: 'files', minUnits: 1 },
+        },
+      },
+      spawn: recordingTransport([], completed(0, HEXAGEN_NO_FILES)),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    expect(result.result).toBe('unknown');
+    expect(result.coverage).toEqual({ ran: true, unitKind: 'files', units: 0 });
+  });
+
+  it('leaves procedures without a coverage declaration unchanged', async () => {
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: { command: '/opt/verify-run.sh' } },
+      spawn: recordingTransport([], completed(0, VITEST_ALL_SKIPPED)),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    expect(result.result).toBe('pass');
+    expect('coverage' in result).toBe(false);
+  });
+
+  it('never spawns for a malformed coverage declaration', async () => {
+    const malformed: ReadonlyArray<Record<string, unknown>> = [
+      { reader: 'nope', unitKind: 'tests', minUnits: 1 },
+      { reader: 'vitest-summary', unitKind: 'files', minUnits: 1 },
+      { reader: 'vitest-summary', unitKind: 'tests', minUnits: 0 },
+      { reader: 'vitest-summary', unitKind: 'tests', minUnits: 1, extra: true },
+    ];
+
+    const outcomes = await Promise.all(
+      malformed.map(async (coverage) => {
+        const calls: RecordedSpawn[] = [];
+        const adapter = new VerificationExecutorAdapter({
+          allowListedCommands: { ci: { command: '/opt/verify-run.sh', coverage } },
+          spawn: recordingTransport(calls, completed(0)),
+        } as unknown as VerificationExecutorOptions);
+        const result = await adapter.executeVerificationCheck(checkRequest());
+        return { calls, result };
+      }),
+    );
+
+    for (const { calls, result } of outcomes) {
+      expect(result.result).toBe('unknown');
+      expect(result.exitCode).toBeNull();
+      expect(result.outputSummary).toContain('coverage declaration');
+      expect(calls).toHaveLength(0);
+    }
+  });
+
+  it('applies coverage on the executor path too', async () => {
+    const skipped = new VerificationExecutorAdapter({
+      executor: fakeExecutor({ exitCode: 0, stdout: VITEST_ALL_SKIPPED }),
+      allowListedCommands: declared,
+    });
+    const skippedResult = await skipped.executeVerificationCheck(checkRequest());
+    expect(skippedResult.result).toBe('unknown');
+
+    const passed = new VerificationExecutorAdapter({
+      executor: fakeExecutor({ exitCode: 0, stdout: VITEST_NORMAL }),
+      allowListedCommands: declared,
+    });
+    const passedResult = await passed.executeVerificationCheck(checkRequest());
+    expect(passedResult.result).toBe('pass');
+    expect(passedResult.coverage).toEqual({ ran: true, unitKind: 'tests', units: 36 });
+  });
+
+  it('keeps a signal-terminated run unknown without coverage', async () => {
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: declared,
+      spawn: recordingTransport([], { status: null, signal: 'SIGTERM', stdout: VITEST_NORMAL, stderr: '' }),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    expect(result.result).toBe('unknown');
+    expect('coverage' in result).toBe(false);
   });
 });

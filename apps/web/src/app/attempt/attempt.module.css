@@ -619,3 +619,8 @@
   font-size: 0.78rem;
   overflow-wrap: anywhere;
 }
+
+.chainLabel {
+  font-weight: 600;
+  font-size: 0.78rem;
+}

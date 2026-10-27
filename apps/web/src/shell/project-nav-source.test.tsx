@@ -86,6 +86,6 @@ describe("ProjectNav is fed by the server layout and stays client-bound", () => 
     expect(layout).toContain('export const dynamic = "force-dynamic"');
     expect(layout).toContain("export default async function RootLayout");
     expect(layout).toContain("loadProjectNav()");
-    expect(layout).toContain("<Sidebar nav={nav} />");
+    expect(layout).toContain("<Sidebar nav={nav} openQuestions={openQuestions} />");
   });
 });

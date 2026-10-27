@@ -53,4 +53,10 @@ describe("View nav P12 sample labels", () => {
   it("updates the rail footer", () => {
     expect(sidebar).not.toContain("Lanes reads the API when configured");
   });
+
+  it("shows the open-question count in the rail", () => {
+    expect(viewNav).toContain("sidebar-badge");
+    expect(viewNav).toContain('" (none open)"');
+    expect(viewNav).toContain("openQuestions");
+  });
 });

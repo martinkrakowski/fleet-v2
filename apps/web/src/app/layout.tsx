@@ -3,6 +3,7 @@ import { Footer } from "../shell/footer";
 import { Sidebar } from "../shell/sidebar";
 import { Topbar } from "../shell/topbar";
 import { loadProjectNav } from "../shell/project-nav-data";
+import { loadQuestionSummary, openQuestionCount } from "./questions/summary";
 import "./globals.css";
 
 /**
@@ -16,14 +17,18 @@ const THEME_INIT_SCRIPT = `(function(){try{var stored=localStorage.getItem("them
 export const dynamic = "force-dynamic";
 
 export default async function RootLayout({ children }: { children: ReactNode }) {
-  const nav = await loadProjectNav();
+  const [nav, questions] = await Promise.all([
+    loadProjectNav(),
+    loadQuestionSummary(),
+  ]);
+  const openQuestions = openQuestionCount(questions);
 
   return (
     <html lang="en" suppressHydrationWarning>
       <body>
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
         <div className="app-shell">
-          <Sidebar nav={nav} />
+          <Sidebar nav={nav} openQuestions={openQuestions} />
           <div className="main">
             <Topbar />
             <div className="page-wrapper">

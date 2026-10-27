@@ -19,7 +19,13 @@ function closeDrawer() {
  * on desktop via `body.sidebar-rail` and becomes an off-canvas drawer
  * on mobile via `body.sidebar-open`.
  */
-export function Sidebar({ nav }: { nav: ProjectNavData }) {
+export function Sidebar({
+  nav,
+  openQuestions,
+}: {
+  nav: ProjectNavData;
+  openQuestions: number | null;
+}) {
   return (
     <>
       <aside className="sidebar">
@@ -31,7 +37,7 @@ export function Sidebar({ nav }: { nav: ProjectNavData }) {
           </svg>
           <span className="sidebar-brand-label">fleet</span>
         </div>
-        <ViewNav />
+        <ViewNav openQuestions={openQuestions} />
         <Suspense fallback={null}>
           <ProjectNav data={nav} />
         </Suspense>

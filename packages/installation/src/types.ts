@@ -5,7 +5,9 @@
  * credential values. In the merged result produced by `loadInstallation` the
  * v1 `runner` fields are all optional because environment overrides may
  * create a partial runner section; `parseInstallation` still requires `agent`
- * and `model` whenever a v1 file carries a `runner` section.
+ * and `model` whenever a v1 file carries a `runner` section. The one exception
+ * is `policy.telemetry.salt`, an installation secret that is never printed,
+ * logged or sent (telemetry plan §3.2).
  */
 
 /** One seat in the runner fallback chain. */
@@ -277,6 +279,39 @@ export interface ConductorPolicy {
   readonly reaper?: ConductorReaperPolicy;
 }
 
+/** Where an exported span went (telemetry plan §3.9): recorded in each `exported@<route>` disposition. */
+export type TelemetryRoute = 'collector' | 'phoenix';
+
+/**
+ * The v2 `policy.telemetry` section as written (telemetry plan §3.9). Off unless `enabled`; only `enabled`
+ * is required, and `salt` is required when `enabled` is true. `salt` is never printed, logged or sent.
+ */
+export interface TelemetryPolicy {
+  readonly enabled: boolean;
+  readonly projectName?: string;
+  readonly route?: TelemetryRoute;
+  readonly sampleRatio?: number;
+  readonly sendCost?: boolean;
+  readonly includeDryRun?: boolean;
+  /** Project id → alias sent as `fleet.project`; a project without one is sent as its salted digest. */
+  readonly projectAliases?: Readonly<Record<string, string>>;
+  /** 64–256 lowercase hex characters: the one installation salt for digests and ids (D4, D14). */
+  readonly salt?: string;
+}
+
+/** The effective telemetry policy: every field present (`resolveTelemetryPolicy`). */
+export interface ResolvedTelemetryPolicy {
+  readonly enabled: boolean;
+  readonly projectName: string;
+  readonly route: TelemetryRoute;
+  readonly sampleRatio: number;
+  readonly sendCost: boolean;
+  readonly includeDryRun: boolean;
+  readonly projectAliases: Readonly<Record<string, string>>;
+  /** Null when the file has none; telemetry then refuses to start. */
+  readonly salt: string | null;
+}
+
 /** The effective reaper policy: every field present. */
 export interface ResolvedConductorReaperPolicy {
   readonly enabled: boolean;
@@ -308,6 +343,8 @@ export interface PolicySection {
   readonly autoMerge?: AutoMergePolicy;
   /** Absent means off (`DEFAULT_CONDUCTOR_POLICY`); read it through `resolveConductorPolicy`. */
   readonly conductor?: ConductorPolicy;
+  /** Absent means off (`DEFAULT_TELEMETRY_POLICY`); read it through `resolveTelemetryPolicy`. */
+  readonly telemetry?: TelemetryPolicy;
 }
 
 /** The v2 `shelf` section with the local provider (D1, default). */

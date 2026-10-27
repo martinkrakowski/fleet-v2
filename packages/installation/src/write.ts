@@ -7,6 +7,7 @@
 
 import { copyDecisions } from './decision-consumers.js';
 import { CONDUCTOR_REAPER_REPAIR_KINDS } from './policy.js';
+import { TELEMETRY_POLICY_KEYS } from './telemetry-policy.js';
 import type {
   ChainsSection,
   DecisionsSectionV2,
@@ -17,6 +18,7 @@ import type {
   PolicySection,
   SeatSection,
   ShelfSectionV2,
+  TelemetryPolicy,
   VerificationProcedure,
   VerificationProceduresSection,
   WavesSection,
@@ -210,6 +212,20 @@ function serializePolicy(policy: PolicySection): Record<string, unknown> {
       conductor.reaper = reaper;
     }
     out.conductor = conductor;
+  }
+  if (policy.telemetry !== undefined) {
+    out.telemetry = serializeTelemetry(policy.telemetry);
+  }
+  return out;
+}
+
+function serializeTelemetry(block: TelemetryPolicy): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of TELEMETRY_POLICY_KEYS) {
+    const value = block[key as keyof TelemetryPolicy];
+    if (value !== undefined) {
+      out[key] = key === 'projectAliases' ? { ...(value as Readonly<Record<string, string>>) } : value;
+    }
   }
   return out;
 }

@@ -1,0 +1,6 @@
+// POST /v1/orchestrators/[id]/retire: the presenting token's own session only.
+import { ownedSessionRoute } from "../../../../wiring/owned-session-route.js";
+
+export default ownedSessionRoute((composition, orchestratorId, presentedTokenId) =>
+  composition.retireOrchestratorSession.retireOrchestratorSession({ orchestratorId }, presentedTokenId),
+);

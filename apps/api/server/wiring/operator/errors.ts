@@ -34,6 +34,11 @@ export function refusedEnvelope(operationId: string, reason: string): OperatorEr
   return { statusCode: 422, body: { operationId, code: "REFUSED", result: { reason } } };
 }
 
+/** The presenting token may not perform this operation: a client error, never a fault. */
+export function forbiddenEnvelope(operationId: string, reason: string): OperatorErrorResponse {
+  return { statusCode: 403, body: { operationId, code: "FORBIDDEN", result: { reason } } };
+}
+
 /** Known absence: the named aggregate does not exist. */
 export function notFoundEnvelope(operationId: string): OperatorErrorResponse {
   return { statusCode: 404, body: { operationId, code: "NOT_FOUND", result: null } };

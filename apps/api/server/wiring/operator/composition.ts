@@ -5,6 +5,7 @@ import {
   DecisionTransportAdapter,
   InstallationReferenceAdapter,
   ObservationPublicationAdapter,
+  OrchestratorSessionRepositoryAdapter,
   OwnerQuestionRepositoryAdapter,
   ProjectProfileRepositoryAdapter,
   RelayTransportAdapter,
@@ -18,9 +19,11 @@ import {
   AnswerOwnerQuestionUseCase,
   AskOwnerQuestionUseCase,
   ExpireOwnerQuestionsUseCase,
+  HeartbeatOrchestratorSessionUseCase,
   InspectConfiguredCapabilitiesUseCase,
   InspectOutstandingCoordinationUseCase,
   InspectProjectProfileUseCase,
+  ListOrchestratorSessionsUseCase,
   ListOwnerQuestionsUseCase,
   ListProjectProfilesUseCase,
   PublishProjectObservationUseCase,
@@ -29,9 +32,11 @@ import {
   RecordAuthorizationConsumptionUseCase,
   RecordProjectProbeUseCase,
   RecordRelayAcknowledgementUseCase,
+  RegisterOrchestratorSessionUseCase,
   RegisterProjectProfileUseCase,
   RequestScopedDecisionUseCase,
   ResolveActionAuthorizationUseCase,
+  RetireOrchestratorSessionUseCase,
   RetireProjectProfileUseCase,
   SendFleetRelayUseCase,
   SyncOneWayOwnerQuestionsUseCase,
@@ -66,6 +71,10 @@ export interface OperatorComposition {
   acknowledgeOwnerAnswer: AcknowledgeOwnerAnswerUseCase;
   syncOneWayOwnerQuestions: SyncOneWayOwnerQuestionsUseCase;
   expireOwnerQuestions: ExpireOwnerQuestionsUseCase;
+  registerOrchestratorSession: RegisterOrchestratorSessionUseCase;
+  heartbeatOrchestratorSession: HeartbeatOrchestratorSessionUseCase;
+  retireOrchestratorSession: RetireOrchestratorSessionUseCase;
+  listOrchestratorSessions: ListOrchestratorSessionsUseCase;
 }
 
 export interface OperatorCompositionOptions {
@@ -105,6 +114,10 @@ function unconfiguredOperatorComposition(): OperatorComposition {
     acknowledgeOwnerAnswer: new AcknowledgeOwnerAnswerUseCase(),
     syncOneWayOwnerQuestions: new SyncOneWayOwnerQuestionsUseCase(),
     expireOwnerQuestions: new ExpireOwnerQuestionsUseCase(),
+    registerOrchestratorSession: new RegisterOrchestratorSessionUseCase(),
+    heartbeatOrchestratorSession: new HeartbeatOrchestratorSessionUseCase(),
+    retireOrchestratorSession: new RetireOrchestratorSessionUseCase(),
+    listOrchestratorSessions: new ListOrchestratorSessionsUseCase(),
   };
 }
 
@@ -140,6 +153,10 @@ export function createConfiguredOperatorComposition(
     stateDir === undefined ? {} : { outboxDir: join(stateDir, "relay-outbox") },
   );
   const ownerQuestionRepo = new OwnerQuestionRepositoryAdapter({
+    stateDir,
+    ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
+  });
+  const orchestratorSessionRepo = new OrchestratorSessionRepositoryAdapter({
     stateDir,
     ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
   });
@@ -212,6 +229,22 @@ export function createConfiguredOperatorComposition(
     }),
     expireOwnerQuestions: new ExpireOwnerQuestionsUseCase({
       ownerQuestionRepo,
+      clock: systemClock,
+    }),
+    registerOrchestratorSession: new RegisterOrchestratorSessionUseCase({
+      sessionRepo: orchestratorSessionRepo,
+      clock: systemClock,
+    }),
+    heartbeatOrchestratorSession: new HeartbeatOrchestratorSessionUseCase({
+      sessionRepo: orchestratorSessionRepo,
+      clock: systemClock,
+    }),
+    retireOrchestratorSession: new RetireOrchestratorSessionUseCase({
+      sessionRepo: orchestratorSessionRepo,
+      clock: systemClock,
+    }),
+    listOrchestratorSessions: new ListOrchestratorSessionsUseCase({
+      sessionRepo: orchestratorSessionRepo,
       clock: systemClock,
     }),
   };

@@ -10,6 +10,7 @@ export type FeedKind =
   | "work-order"
   | "question"
   | "profile"
+  | "orchestrator"
   | "resync";
 
 export interface FeedEntry {
@@ -42,12 +43,15 @@ export type FeedRead =
     }
   | { readonly kind: "resync"; readonly cursor: string };
 
+// heartbeat signals (a lease-only orchestrator save, plan F7) are deliberately not a feed kind: they
+// record file stamps and append nothing.
 const DATA_KINDS: ReadonlySet<FeedKind> = new Set([
   "attempt",
   "capacity",
   "work-order",
   "question",
   "profile",
+  "orchestrator",
 ]);
 
 const DEFAULT_CAPACITY = 1024;

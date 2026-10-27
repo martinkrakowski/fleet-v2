@@ -268,6 +268,7 @@ const WATCHED = [
   "reservations.json",
   "project-profiles.json",
   "owner-questions.json",
+  "orchestrators.json",
 ];
 
 export function isFleetApiRuntimeConfigured(): boolean {

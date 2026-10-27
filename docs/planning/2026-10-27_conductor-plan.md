@@ -63,7 +63,7 @@ The run's state is a projection of attempts, the keyed journal, receipts and for
 | `watching-ci` | Head pushed | `merging` / `fixing` / `parked` | CI read (§3.3): `ci-pending` waits, `ci-failed` → `fixing` if a round is left (D5) |
 | `merging` | CI green, eligible (AM A4) | `merged` / `parked` | Policy grant at this head; any one-way door → park |
 | `merged` | Forge reports merged at the head | — | terminal |
-| `stopped` | The owner or orchestrator ends the run (`conductor stop <runId>`), or the work order is stopped | — | terminal; a running attempt is stopped first through `StopAttempt` |
+| `stopped` | The owner or orchestrator ends the run (`conductor stop <runId>`), or the work order is stopped | — | terminal; reachable from every non-terminal state; a running attempt is stopped first through `StopAttempt` |
 | `parked` | A guard needs a human | the parked-from state | Answer or action recorded; facts re-read |
 
 **Rounds.** A round is one second-pass dispatch. The first pass is round 0; a failed first gate **uses round 1** (the first fix round), since the second-pass seat is what runs next. After round 2, any blocker, failed gate or failed CI parks. A head change after `accepting` re-enters `gating`.
@@ -96,7 +96,7 @@ R1 keeps the latest receipt per reviewer model, and only that reviewer's later p
 
 On start and on every `advance`, the decider reads the run's last keyed entry (per-run listing, K1b):
 - **Result present:** derive the next state.
-- **Intent without result: reconcile, never repeat.** Dispatch: inspect the runner by worktree (L6). PR or push: read the forge for the branch's PR and head. Merge: PR state at the head (AM A13). Owner question: look it up by its idempotency key. Review: a receipt with the request id counts; without one, the review may run again under the same key's retry entry, once.
+- **Intent without result: reconcile, never repeat.** Dispatch: inspect the runner by worktree (L6). PR or push: read the forge for the branch's PR and head. Merge: PR state at the head (AM A13). Owner question: look it up by its idempotency key. Review: a receipt with the request id counts; without one, the review may run again once, under its own retry key (`…/review/<seat>@<head>/retry1`), since K1b refuses a second intent with the original key.
 - **Ambiguous:** park with `ambiguous <action>` until reconcile settles it.
 
 One-way actions (dispatch, push, PR, merge, an owner question) are never issued twice for one key.
@@ -120,11 +120,11 @@ Each lane is about 45 minutes, one PR, the standard pipeline. **Parallel** means
 
 | Lane | Scope | Package / shared files | Tier | After |
 |---|---|---|---|---|
-| K0 | This plan, decisions, manifest text | docs | 0 | — |
+| K0 | This plan, decisions, manifest text; amends `docs/planning/2026-10-26_execution-order.md` (its "at most two" lines) with the owner's 2026-10-27 lift of the two-lane cap, keeping "never two in evidence-and-acceptance" | docs | 0 | — |
 | **Group 1, parallel now** | | | | |
 | K1 | `LaneRun` record, transition table, guards, keys, pure `nextAction`; one test per row of §3.2 | work-execution (domain) | 2 | K0 |
 | AM1 → K2 | `policy.autoMerge`; then `policy.conductor` | installation | 2 | V2b out of installation |
-| AM3a | Policy grants | operator-coordination | 2 | — |
+| AM3a | Policy grants, covering every forge kind including `push-to-pr` | operator-coordination | 2 | — |
 | RW1 | Review `kind` and request id on requests and receipts; R1 selection per (reviewer, kind); `InspectHeadCiState` in-port | evidence-and-acceptance (no app wiring) | 2 | D10; V2 is out of evidence |
 | **Group 2, parallel after Group 1** | | | | |
 | K1b | Keyed journal: `key`, intent/result pairing, uniqueness check, per-run listing; file and memory stores | work-execution (domain, infra) | 2 | K1 |
@@ -135,7 +135,7 @@ Each lane is about 45 minutes, one PR, the standard pipeline. **Parallel** means
 | S1a → S1b | `SeatPlan`, `stopReason`, `seatUsed`; refusal-to-fix | work-execution | 2 | K1b |
 | AM3c | Structured blockers | evidence, work-execution port, **`composition.ts`, `apps/api`** | 2 | RW2 |
 | AG | Wire `AgyRunnerAdapter`; edit-only commit step | work-execution (infra), **`composition.ts`** | 2 | AM3c |
-| AM4b | Forge refusal kinds, PR-state read, `push-to-pr` kind | work-execution (infra) | 2 | — |
+| AM4b | Forge refusal kinds, PR-state read, `push-to-pr` kind | work-execution (domain `coordination-keys.ts`, application ports, infra), shares `apps/cli/src/composition.ts` and `apps/cli/src/index.ts` | 2 | — |
 | PC | `ReviewRequestPort`, `CiStatePort` and their adapters | work-execution, **`composition.ts`** | 2 | RW2, AG |
 | **Sequential** | | | | |
 | S2a → S2b | `AcceptanceSpec`; acceptance runs it | work-execution, evidence | 2 | S1b, AM3c |
@@ -148,7 +148,7 @@ Each lane is about 45 minutes, one PR, the standard pipeline. **Parallel** means
 | K8 | Shadow replay of recorded journals | apps/cli, tests | 1 | K7 |
 | K9 | `/v1/changes` wake-ups as D9 allows | apps/cli | 1 | K7, E3b |
 
-Group 3's work-execution lanes can each run beside a Group 2 lane in another package; inside Group 3, AM2, S1a and AM4b may overlap only if their files are disjoint, which each brief must state. C1 and U1/U2 are in flight: prerequisites, not new lanes.
+Group 3's work-execution lanes can each run beside a Group 2 lane in another package; inside Group 3, AM2 and S1a may overlap only if their files are disjoint, which each brief must state. AM4b touches `composition.ts`, so it runs in sequence with every other `composition.ts` lane. C1 and U1/U2 are in flight: prerequisites, not new lanes.
 
 ## 5. Hard to undo
 
@@ -182,6 +182,8 @@ Group 3's work-execution lanes can each run beside a Group 2 lane in another pac
 ## 8. Review
 
 **Opus, rev 0 (2026-10-27).** Applied: keyed journal, request ids and question keys in K1b, RW1, Q1, with intents fenced by the unique key (blocker); review `kind` and per-(reviewer, kind) R1 selection, no seat switch on a recorded fail, D10 (blocker); `ReviewRequestPort` and `CiStatePort` in PC; `push-to-pr`, exits from `collecting` and `awaiting-premerge`, `stopped` defined, D3 unified, rounds defined; groups re-cut by shared files; AM2 added; the lifted two-lane cap; D9.
+
+**Opus, rev 1 (2026-10-27): NO BLOCKERS.** Applied: a review retry uses its own key; `stopped` is reachable from every state; AM4b's real scope (domain `ForgeActionKind`, application ports, `composition.ts`, `index.ts`) and its sequencing with the other `composition.ts` lanes; AM3a's grants cover `push-to-pr`; K0 amends the execution-order doc's two-lane cap.
 
 ## Challenge this
 

@@ -137,10 +137,10 @@ function resolveCoverageDeclaration(
     return undefined;
   }
   const record = entry as Record<string, unknown>;
-  if (!Object.prototype.hasOwnProperty.call(record, 'coverage')) {
+  const coverage = record.coverage;
+  if (coverage === undefined) {
     return undefined;
   }
-  const coverage = record.coverage;
   if (coverage === null || typeof coverage !== 'object' || Array.isArray(coverage)) {
     return 'malformed';
   }

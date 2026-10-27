@@ -606,11 +606,28 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
     expect('coverage' in result).toBe(false);
   });
 
+  it('treats an explicit undefined coverage declaration as no declaration', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: { command: '/opt/verify-run.sh', coverage: undefined } },
+      spawn: recordingTransport(calls, completed(0, VITEST_ALL_SKIPPED)),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    expect(result.result).toBe('pass');
+    expect('coverage' in result).toBe(false);
+    expect(calls).toHaveLength(1);
+  });
+
   it('never spawns for a malformed coverage declaration', async () => {
-    const malformed: ReadonlyArray<Record<string, unknown>> = [
+    const malformed: readonly unknown[] = [
+      null,
       { reader: 'nope', unitKind: 'tests', minUnits: 1 },
       { reader: 'vitest-summary', unitKind: 'files', minUnits: 1 },
       { reader: 'vitest-summary', unitKind: 'tests', minUnits: 0 },
+      { reader: 'vitest-summary', unitKind: 'tests', minUnits: 1.5 },
+      { reader: 'vitest-summary', unitKind: 'tests', minUnits: '1' },
       { reader: 'vitest-summary', unitKind: 'tests', minUnits: 1, extra: true },
     ];
 

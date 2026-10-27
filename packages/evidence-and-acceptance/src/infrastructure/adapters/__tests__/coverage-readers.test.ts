@@ -27,6 +27,9 @@ const VITEST_MISSING_SUMMARY = ' RUN  v4.1.11 /work\n\n ✓ src/a.test.ts (3 tes
 const ESC = String.fromCodePoint(0x1b);
 const VITEST_COLOURED = ESC + '[2m      Tests ' + ESC + '[22m ' + ESC + '[1m' + ESC + '[32m36 passed' + ESC + '[39m' + ESC + '[22m' + ESC + '[90m (36)' + ESC + '[39m\n';
 const VITEST_TURBO = '@fleet/a:test:       Tests  10 passed (10)\n@fleet/b:test:       Tests  4 passed | 1 skipped (5)\n';
+const VITEST_TURBO_REPLAY = '@fleet/x:test: cache hit, replaying logs abc123\n@fleet/x:test:       Tests  36 passed (36)\n';
+const VITEST_FULL_TURBO = '@fleet/x:test:       Tests  36 passed (36)\n>>> FULL TURBO\n';
+const VITEST_TURBO_MISS = '@fleet/x:test: cache miss, executing abc123\n@fleet/x:test:       Tests  36 passed (36)\n';
 
 const HEXAGEN_NORMAL = '{"fresh":[],"baselined":[],"stale":[],"expired":[],"introduced":[],"baselineGrowth":[],"filesScanned":142}\n[arch-lint] Ratchet: 1 baseline entry no longer reproduces';
 const HEXAGEN_NO_FILES = '{"fresh":[],"baselined":[],"stale":[],"expired":[],"introduced":[],"baselineGrowth":[],"filesScanned":0}\n';
@@ -70,6 +73,18 @@ describe('readVitestSummaryCoverage', () => {
 
   it('sums executed tests across turbo workspace summaries', () => {
     expect(readVitestSummaryCoverage(VITEST_TURBO)).toEqual({ ran: true, unitKind: 'tests', units: 14 });
+  });
+
+  it('refuses a turbo cache replay log', () => {
+    expect(readVitestSummaryCoverage(VITEST_TURBO_REPLAY)).toEqual({ ran: false, reason: 'turbo cache replay' });
+  });
+
+  it('refuses a FULL TURBO banner', () => {
+    expect(readVitestSummaryCoverage(VITEST_FULL_TURBO)).toEqual({ ran: false, reason: 'turbo cache replay' });
+  });
+
+  it('counts a normal turbo cache-miss run', () => {
+    expect(readVitestSummaryCoverage(VITEST_TURBO_MISS)).toEqual({ ran: true, unitKind: 'tests', units: 36 });
   });
 
   it('never treats the Test Files line as a Tests line', () => {
@@ -124,6 +139,9 @@ describe('readCheckCoverage', () => {
       ['vitest-summary', VITEST_MISSING_SUMMARY],
       ['vitest-summary', VITEST_COLOURED],
       ['vitest-summary', VITEST_TURBO],
+      ['vitest-summary', VITEST_TURBO_REPLAY],
+      ['vitest-summary', VITEST_FULL_TURBO],
+      ['vitest-summary', VITEST_TURBO_MISS],
       ['vitest-summary', ' Test Files  2 passed (2)\n'],
       ['hexagen-lint-json', HEXAGEN_NORMAL],
       ['hexagen-lint-json', HEXAGEN_NO_FILES],

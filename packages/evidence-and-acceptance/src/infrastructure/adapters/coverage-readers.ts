@@ -32,10 +32,23 @@ export function stripAnsi(text: string): string {
   return text.replace(ANSI_SGR, '');
 }
 
+/**
+ * A declared vitest-summary procedure should run with `--force` (or a
+ * non-cached task). A replay never counts.
+ */
 export function readVitestSummaryCoverage(output: string): CheckCoverage {
+  const lines = stripAnsi(output).split('\n');
+  for (const rawLine of lines) {
+    if (
+      /cache hit, replaying logs/i.test(rawLine) ||
+      rawLine.trim().includes('FULL TURBO')
+    ) {
+      return { ran: false, reason: 'turbo cache replay' };
+    }
+  }
   let found = false;
   let total = 0;
-  for (const rawLine of stripAnsi(output).split('\n')) {
+  for (const rawLine of lines) {
     const line = rawLine.trimEnd();
     const at = line.indexOf('Tests  ');
     if (at === -1 || (at > 0 && line[at - 1] !== ' ')) {

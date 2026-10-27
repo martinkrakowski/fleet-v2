@@ -246,10 +246,15 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       return {
         outcome: 'refused',
         reason: `Ambiguous forge response requires reconciliation: ${forgeResult.reason}`,
+        forgeAmbiguous: true,
       };
     }
     await this.appendJournal(deps, request, attempt, 'refused', forgeResult.reason);
-    return { outcome: 'refused', reason: forgeResult.reason };
+    return {
+      outcome: 'refused',
+      reason: forgeResult.reason,
+      forgeRefusalKind: forgeResult.refusalKind,
+    };
   }
 
   async execute(input?: unknown): Promise<ExecuteAuthorizedForgeActionResult> {

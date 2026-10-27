@@ -6,8 +6,6 @@
  * `__tests__/work-board.test.ts`.
  */
 
-import { containsSecretShape } from '@fleet/shared';
-
 import {
   BOARD_GATING_OWNER_ITEM_KINDS,
   BOARD_SOURCES,
@@ -35,6 +33,7 @@ import type {
   LaneRef,
   SourceReading,
 } from './work-board-facts.js';
+import { planTextError } from './lane-plan-sidecar.js';
 
 export const BOARD_COLUMNS = ['done', 'waiting', 'in-flight', 'queued'] as const;
 export type BoardColumn = (typeof BOARD_COLUMNS)[number];
@@ -221,29 +220,14 @@ function resolveLaneRef(ref: LaneRef, facts: BoardFacts): LaneRef {
 }
 
 /**
- * The plain-text rule the board applies to its own display text (WB2a-1 fix 2):
- * a work-order lane id may only become a card label, and a question title may
- * only become a subject, when it is non-empty, bounded, not secret-shaped and
- * free of control, separator and bidi/isolate code points — the same plain-text
- * conditions the plan sidecar applies (`planTextError`, WB1a). That module is
- * not on this branch yet (WB1a runs as a separate lane), so the conditions are
- * gated here; replace this gate with the sidecar's exported rule when WB1a
- * merges. Nothing here reads a credential or client content.
+ * The plain-text rule the board applies to its own display text: a work-order
+ * lane id becomes a card label, and a question title becomes a subject, only
+ * when it passes the plan sidecar's plain-text rule (`planTextError`).
  */
 const BOARD_TEXT_MAX_BYTES = 1024;
 
 function isPlainText(text: string): boolean {
-  if (text.trim().length === 0 || new TextEncoder().encode(text).byteLength > BOARD_TEXT_MAX_BYTES) return false;
-  if (containsSecretShape(text)) return false;
-  for (let index = 0; index < text.length; index += 1) {
-    const codePoint = text.codePointAt(index);
-    if (codePoint === undefined) return false;
-    if (codePoint < 0x20 || (codePoint >= 0x7f && codePoint <= 0x9f)) return false;
-    if (codePoint === 0x2028 || codePoint === 0x2029) return false;
-    if (codePoint >= 0x202a && codePoint <= 0x202e) return false;
-    if (codePoint >= 0x2066 && codePoint <= 0x2069) return false;
-  }
-  return true;
+  return planTextError('text', text, BOARD_TEXT_MAX_BYTES) === null;
 }
 
 function makeCard(ref: LaneRef, facts: BoardFacts): Card {

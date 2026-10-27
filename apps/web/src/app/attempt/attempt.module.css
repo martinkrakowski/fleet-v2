@@ -570,3 +570,47 @@
 .cliDisabled {
   color: var(--text-faint);
 }
+
+/* ------------------------------------------------------------------ */
+/* Work-order sidebar (W1b)                                             */
+/* ------------------------------------------------------------------ */
+
+.chainList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.chainItem {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  padding: var(--space-1) 0;
+}
+
+.chainCurrent {
+  border-left: 2px solid var(--primary);
+  padding-left: var(--space-2);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.slotList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.sidebarHeading {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin: var(--space-3) 0 var(--space-2);
+}

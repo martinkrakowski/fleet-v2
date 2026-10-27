@@ -7,6 +7,7 @@
 
 import type { RunnerKind } from '../../../domain/execution-records.js';
 import type { AcceptanceSpecProps } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
+import type { SeatPlanProps } from '../../../domain/value-objects/SeatPlan.vo.js';
 
 export interface BriefContextDecision {
   readonly proposalId: string;
@@ -42,6 +43,14 @@ export interface PrepareBriefPackageRequest {
   readonly baseCommit: string;
   readonly policyRevision: string;
   readonly modelAssignment: BriefModelAssignment;
+  /**
+   * Optional seat plan (S1, D1): ordered seats per role. When present it is
+   * validated, the model assignment must be one of its first-pass seats, no
+   * review seat may share a model family with a first-pass or fix seat, and
+   * it is frozen into the manifest so the digest covers it. Absent keeps
+   * today's single fallback.
+   */
+  readonly seatPlan?: SeatPlanProps;
   readonly independentReviewer: string;
   readonly ownedPaths: readonly string[];
   /**

@@ -11,6 +11,7 @@ import type {
   AttemptSeatOverrideRecord,
   CommandCompletionReceipt,
 } from '../../../domain/execution-records.js';
+import type { StopReasonValue } from '../../../domain/value-objects/StopReason.vo.js';
 
 /**
  * Isolation capabilities a runner must declare before an attempt may be
@@ -87,7 +88,12 @@ export type StartRunnerSessionResult =
       readonly sessionId: string;
       readonly runner?: AttemptRunnerRecord;
     }
-  | { readonly outcome: 'refused'; readonly reason: string }
+  | {
+      readonly outcome: 'refused';
+      readonly reason: string;
+      /** Optional typed class (S1); when absent the use case classifies `reason`. */
+      readonly reasonClass?: StopReasonValue;
+    }
   | { readonly outcome: 'unknown'; readonly reason: string }
   /**
    * The start created nothing, a session may be live in the worktree, so the

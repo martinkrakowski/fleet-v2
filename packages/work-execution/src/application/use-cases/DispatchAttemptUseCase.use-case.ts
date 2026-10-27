@@ -19,6 +19,12 @@ import type {
 } from '../../domain/execution-records.js';
 import { parseSeatTool } from '../../domain/execution-records.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
+import {
+  classifyRunnerRefusal,
+  seatMatchesAssignment,
+  seatSelectionRecord,
+} from '../../domain/seat-selection.js';
+import { SeatPlan } from '../../domain/value-objects/SeatPlan.vo.js';
 import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
 import { checkFixPriorSettled } from './PrepareFixAttemptUseCase.use-case.js';
@@ -117,6 +123,25 @@ function readOwnerDecisionReferences(
   }
   return references;
 }
+
+/** The manifest's seat plan: absent, invalid (refuse), or a validated plan. */
+function readManifestSeatPlan(
+  manifest: Record<string, unknown>,
+): { readonly kind: 'absent' } | { readonly kind: 'invalid'; readonly reason: string } | { readonly kind: 'plan'; readonly plan: SeatPlan } {
+  if (manifest.seatPlan === undefined) {
+    return { kind: 'absent' };
+  }
+  const created = SeatPlan.create(manifest.seatPlan);
+  if (!created.success || created.value === undefined) {
+    return { kind: 'invalid', reason: created.error?.message ?? 'unknown error' };
+  }
+  return { kind: 'plan', plan: created.value };
+}
+
+/** The seat fields a dispatch writes on the attempt, or a refusal. */
+type SeatBinding =
+  | { readonly ok: true; readonly fields: Pick<AttemptRecord, 'seatPlan' | 'seatSelection'> }
+  | { readonly ok: false; readonly reason: string };
 
 /**
  * Append one journal entry with a deterministic identity derived from the
@@ -428,6 +453,14 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       };
     }
 
+    const manifestSeatPlan = readManifestSeatPlan(parsedManifest);
+    if (manifestSeatPlan.kind === 'invalid') {
+      return {
+        outcome: 'refused',
+        reason: "Frozen brief manifest 'seatPlan' is invalid: " + manifestSeatPlan.reason,
+      };
+    }
+
     const nowIso = request.nowIso ?? new Date().toISOString();
 
     // O14c1: the seat's tool decides which runner kind runs the lane. The
@@ -530,6 +563,22 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       }
     }
 
+    const rawBindTool = manifestModelAssignment.seatTool;
+    const seatBinding = this.bindSeat(
+      existingAttempt,
+      manifestSeatPlan,
+      {
+        model: manifestModelAssignment.model,
+        tool: typeof rawBindTool === 'string' && rawBindTool.trim() !== '' ? rawBindTool.trim() : 'opencode',
+        variant: manifestModelAssignment.variant,
+        agent: manifestModelAssignment.agent,
+      },
+      request.seatOverride !== undefined,
+    );
+    if (!seatBinding.ok) {
+      return { outcome: 'refused', reason: seatBinding.reason };
+    }
+
     const effectiveModel = request.seatOverride?.model ?? manifestModelAssignment.model;
     const effectiveAgent = request.seatOverride?.agent ?? manifestModelAssignment.agent;
     const effectiveVariant = request.seatOverride?.variant ?? manifestModelAssignment.variant;
@@ -625,6 +674,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           seatOverride: request.seatOverride ?? existingAttempt.seatOverride ?? null,
           reviewerSeat: request.reviewerSeat ?? existingAttempt.reviewerSeat ?? fallbackReviewer,
           ownerDecisionReferences,
+          ...seatBinding.fields,
           updatedAtIso: nowIso,
         }
       : {
@@ -648,6 +698,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           seatOverride: request.seatOverride ?? null,
           reviewerSeat: request.reviewerSeat ?? fallbackReviewer,
           ownerDecisionReferences,
+          ...seatBinding.fields,
           createdAtIso: nowIso,
           updatedAtIso: nowIso,
         };
@@ -783,10 +834,12 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       return { outcome: 'blocked', attempt: blockedAttempt, reason: startResult.reason };
     }
 
+    const stopReason = startResult.reasonClass ?? classifyRunnerRefusal(startResult.reason);
     const cancelledAttempt: AttemptRecord = {
       ...dispatchingAttempt,
       revision: nextAttemptRevision(dispatchingAttempt),
       state: 'cancelled',
+      stopReason,
       updatedAtIso: nowIso,
     };
     const refusedSave = await this.saveRefusedCancelledOrSkip(cancelledAttempt, nowIso, dispatchingAttempt);
@@ -804,9 +857,71 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       status: 'refused',
       sessionId: null,
       detail: startResult.reason,
+      stopReason,
     });
     await this.deps.journal.releaseCapacityReservation(request.attemptId, nowIso);
     return { outcome: 'refused', reason: startResult.reason };
+  }
+
+  /**
+   * S1: bind the attempt to its seat-plan entry. A fix attempt prepared with
+   * a selection must dispatch exactly that seat (an operator seat override
+   * is the one exception and is family-checked above). An initial attempt
+   * with a manifest plan binds to the first-pass seat its assignment names.
+   * No plan anywhere: no fields (D1).
+   */
+  private bindSeat(
+    existingAttempt: AttemptRecord | null,
+    manifestSeatPlan: ReturnType<typeof readManifestSeatPlan>,
+    assignment: { readonly model: string; readonly tool: string; readonly variant?: string; readonly agent?: string },
+    hasSeatOverride: boolean,
+  ): SeatBinding {
+    const selection = existingAttempt?.seatSelection ?? null;
+    if (selection !== null) {
+      if (
+        !hasSeatOverride &&
+        !seatMatchesAssignment(
+          {
+            model: selection.model,
+            tool: selection.tool ?? undefined,
+            variant: selection.variant ?? undefined,
+            agent: selection.agent ?? undefined,
+          },
+          assignment,
+        )
+      ) {
+        return {
+          ok: false,
+          reason:
+            'Frozen brief model assignment ' + assignment.model + ' does not match seat ' +
+            selection.seatId + ' (' + selection.model + ') selected for attempt ' + existingAttempt!.id,
+        };
+      }
+      return { ok: true, fields: {} };
+    }
+    if (existingAttempt?.seatPlan) {
+      return { ok: true, fields: {} };
+    }
+    if (manifestSeatPlan.kind !== 'plan') {
+      return { ok: true, fields: {} };
+    }
+    const plan = manifestSeatPlan.plan;
+    // A fix attempt with no recorded selection carries the frozen plan only: binding it as a first-pass
+    // seat would mislead fix-seat rotation, which reads seatSelection.role and seatIndex (S1c).
+    if (existingAttempt?.kind === 'fix') {
+      return { ok: true, fields: { seatPlan: plan.toJSON() } };
+    }
+    const seatIndex = plan.getSeats('first-pass').findIndex((seat) => seatMatchesAssignment(seat, assignment));
+    if (seatIndex === -1) {
+      return { ok: false, reason: 'Frozen brief model assignment matches no first-pass seat of its seat plan' };
+    }
+    return {
+      ok: true,
+      fields: {
+        seatPlan: plan.toJSON(),
+        seatSelection: seatSelectionRecord('first-pass', seatIndex, plan.getSeats('first-pass')[seatIndex]),
+      },
+    };
   }
 
   /**
@@ -1043,6 +1158,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       ...base,
       revision: nextAttemptRevision(base),
       state: 'cancelled',
+      stopReason: cancelledAttempt.stopReason,
       updatedAtIso: nowIso,
     });
     try {

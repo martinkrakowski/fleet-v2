@@ -21,6 +21,9 @@ import type {
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
 import type { BriefAuthoringPort } from '../ports/out/BriefAuthoringPort.out-port.js';
 import type { BriefKnowledgePort } from '../ports/out/BriefKnowledgePort.out-port.js';
+import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
+import { seatMatchesAssignment, seatPlanFamilyConflicts } from '../../domain/seat-selection.js';
+import { SeatPlan } from '../../domain/value-objects/SeatPlan.vo.js';
 
 export interface PrepareBriefPackageDependencies {
   readonly briefAuthoring: BriefAuthoringPort;
@@ -69,6 +72,47 @@ export function simpleDeterministicHexDigest(content: string): string {
 
 function isNonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+/** Fail-closed model-family comparison (owner rule 2026-10-16). */
+function sameModelFamily(left: string, right: string): boolean {
+  return isSameModelFamily(underlyingModelFamily(left), underlyingModelFamily(right));
+}
+
+/** Validate an optional seat plan against the assignment and reviewer; the plan or a refusal reason. */
+function checkSeatPlan(
+  request: PrepareBriefPackageRequest,
+): { readonly plan: SeatPlan | undefined } | { readonly reason: string } {
+  if (request.seatPlan === undefined) {
+    return { plan: undefined };
+  }
+  const created = SeatPlan.create(request.seatPlan);
+  if (!created.success || created.value === undefined) {
+    return { reason: 'Seat plan is invalid: ' + (created.error?.message ?? 'unknown error') };
+  }
+  const plan = created.value;
+  const conflicts = seatPlanFamilyConflicts(plan, sameModelFamily);
+  if (conflicts.length > 0) {
+    return { reason: 'Seat plan refused: ' + conflicts.join('; ') };
+  }
+  const implementerSeats = [...plan.getSeats('first-pass'), ...plan.getSeats('fix')];
+  const reviewerClash = implementerSeats.find((seat) => sameModelFamily(seat.model, request.independentReviewer));
+  if (reviewerClash !== undefined) {
+    return { reason: 'Independent reviewer shares a model family with seat-plan seat ' + reviewerClash.id };
+  }
+  const assignment = request.modelAssignment;
+  const matchesFirstPass = plan.getSeats('first-pass').some((seat) =>
+    seatMatchesAssignment(seat, {
+      model: assignment.model,
+      tool: assignment.seatTool,
+      variant: assignment.variant,
+      agent: (assignment as { readonly agent?: string }).agent ?? null,
+    }),
+  );
+  if (!matchesFirstPass) {
+    return { reason: 'Model assignment must match a first-pass seat of the seat plan' };
+  }
+  return { plan };
 }
 
 export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
@@ -201,6 +245,11 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       };
     }
 
+    const seatPlanCheck = checkSeatPlan(request);
+    if ('reason' in seatPlanCheck) {
+      return { outcome: 'rejected', reason: seatPlanCheck.reason };
+    }
+
     const decisions = request.contextDecisions ?? [];
     if (decisions.some((decision) => !isNonEmpty(decision.decisionBecause))) {
       return { outcome: 'rejected', reason: 'Every context decision must record decisionBecause' };
@@ -240,6 +289,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
         baseCommit: request.baseCommit,
         policyRevision: request.policyRevision,
         modelAssignment: request.modelAssignment,
+        ...(seatPlanCheck.plan !== undefined ? { seatPlan: seatPlanCheck.plan.toJSON() } : {}),
         independentReviewer: request.independentReviewer,
         ownedPaths: request.ownedPaths,
         allowedPathPrefixes,

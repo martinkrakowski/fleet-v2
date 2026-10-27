@@ -1258,10 +1258,28 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         };
       }
       if (result.outcome === 'blocked') {
-        return { outcome: 'rejected', reason: `Acceptance blocked: ${result.blockers.join('; ')}` };
+        return {
+          outcome: 'rejected',
+          reason: `Acceptance blocked: ${result.blockers.join('; ')}`,
+          blockerDetails: result.blockerDetails.map((blocker) => ({
+            kind: blocker.kind,
+            text: blocker.text,
+          })),
+        };
       }
-      // `rejected` and `stale` both leave the action without a pass.
-      return { outcome: 'rejected', reason: result.reason };
+      if (result.outcome === 'stale') {
+        return {
+          outcome: 'rejected',
+          reason: result.reason,
+          blockerDetails: [{ kind: 'stale', text: result.reason }],
+        };
+      }
+      // `rejected` and `stale` both leave the action without a pass; the kind says which.
+      return {
+        outcome: 'rejected',
+        reason: result.reason,
+        blockerDetails: [{ kind: 'other', text: result.reason }],
+      };
     },
   });
 

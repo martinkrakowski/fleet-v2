@@ -28,7 +28,9 @@ import {
   assessmentIdForAttempt,
   createReviewTransportRouter,
   hasReviewerSeat,
+  type IndependentReviewTransportResult,
   type OcmReviewTransportSpawn,
+  type RunIndependentReviewRequest,
 } from "@fleet/evidence-and-acceptance";
 import type {
   AttemptOwnerDecisionDelegate as EvidenceAttemptOwnerDecisionDelegate,
@@ -313,13 +315,48 @@ function buildReviewTransport(
       ...(settings.runnerRemoteHost !== undefined ? { remoteHost: settings.runnerRemoteHost } : {}),
     },
   });
-  return createReviewTransportRouter({
+  const router = createReviewTransportRouter({
     seats,
     chains,
     locate: (attemptId) => locator.locate(attemptId),
     ocmRunBin: settings.ocmRunBin ?? defaultOcmRunPath(),
     ...(reviewSpawn !== undefined ? { ocmSpawn: reviewSpawn } : {}),
   });
+  // The locator and the transports refuse with reasons that can name the
+  // attempt's recorded host or its worktree path. The repository is public and
+  // the brief keeps host names and paths out of API responses, so the API's
+  // transport replaces any refusal message that carries one of them with one
+  // fixed, host-free reason; host-free refusals (seat selection, legacy
+  // routing) keep their message.
+  return async (
+    request: RunIndependentReviewRequest,
+  ): Promise<IndependentReviewTransportResult> => {
+    try {
+      return await router(request);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      let recordedHostName: string | null = null;
+      let worktreePath: string | null = null;
+      let readable = true;
+      try {
+        const attempt = await attempts.findAttemptById(request.attemptId);
+        const runnerHostName = attempt?.runner?.hostName;
+        recordedHostName =
+          typeof runnerHostName === "string" && runnerHostName.trim() !== "" ? runnerHostName : null;
+        worktreePath = attempt?.worktreePath ?? null;
+      } catch {
+        readable = false;
+      }
+      const leaks =
+        !readable ||
+        (recordedHostName !== null && message.includes(recordedHostName)) ||
+        (worktreePath !== null && message.includes(worktreePath));
+      if (leaks) {
+        throw new Error("review transport unavailable");
+      }
+      throw error;
+    }
+  };
 }
 
 export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null): void {

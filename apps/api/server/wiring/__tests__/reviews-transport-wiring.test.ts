@@ -316,19 +316,28 @@ describe("POST /v1/reviews review transport wiring", () => {
     await seedAssessment(stateDir, head);
     const { spy, calls } = makeSpy();
     configureFleetApiRuntime({ stateDir, installation: INSTALLATION, reviewSpawn: spy });
+    const previousPort = process.env.OCM_REMOTE_PORT;
+    process.env.OCM_REMOTE_PORT = "59999";
+    try {
+      const response = await callReviews(reviewRequest({ candidateHeadSha: head }));
 
-    const response = await callReviews(reviewRequest({ candidateHeadSha: head }));
-
-    expect(response.status).toBe(200);
-    expect(response.envelope.result?.outcome).toBe("reviewed");
-    expect(calls).toHaveLength(1);
-    const call = calls[0];
-    expect(call.args).toContain("--dir");
-    expect(call.args[call.args.indexOf("--dir") + 1]).toBe(repoDir);
-    expect(call.args).toContain("-m");
-    expect(call.args[call.args.indexOf("-m") + 1]).toBe(REVIEWER_MODEL);
-    expect(call.env.OCM_REMOTE_PORT).toBe("46000");
-    expect(call.env.OCM_HOST).toBe("");
+      expect(response.status).toBe(200);
+      expect(response.envelope.result?.outcome).toBe("reviewed");
+      expect(calls).toHaveLength(1);
+      const call = calls[0];
+      expect(call.args).toContain("--dir");
+      expect(call.args[call.args.indexOf("--dir") + 1]).toBe(repoDir);
+      expect(call.args).toContain("-m");
+      expect(call.args[call.args.indexOf("-m") + 1]).toBe(REVIEWER_MODEL);
+      expect(call.env.OCM_REMOTE_PORT).toBe("46000");
+      expect(call.env.OCM_HOST).toBe("");
+    } finally {
+      if (previousPort === undefined) {
+        delete process.env.OCM_REMOTE_PORT;
+      } else {
+        process.env.OCM_REMOTE_PORT = previousPort;
+      }
+    }
   });
 
   it("never reads OCM_HOST from the environment on a v2 installation", async () => {
@@ -354,6 +363,29 @@ describe("POST /v1/reviews review transport wiring", () => {
         process.env.OCM_HOST = previous;
       }
     }
+  });
+
+  it("hides host names and paths when the review transport fails", async () => {
+    const { dir: repoDir, base, head } = await makeGitRepo();
+    const stateDir = await makeTempDir();
+    await seedAttempt(stateDir, repoDir, base, head);
+    await seedAssessment(stateDir, head);
+    // A spy whose spawned ocm-run fails: the transport's refusal carries the
+    // worktree path, and a locator refusal would carry the recorded host.
+    const spy: OcmReviewTransportSpawn = async () => ({
+      exitCode: 1,
+      stdout: "",
+      stderr: `spawn failed for ${repoDir} on this-machine`,
+    });
+    configureFleetApiRuntime({ stateDir, installation: INSTALLATION, reviewSpawn: spy });
+
+    const response = await callReviews(reviewRequest({ candidateHeadSha: head }));
+
+    expect(response.status).toBe(200);
+    expect(response.envelope.result?.outcome).toBe("rejected");
+    expect(response.envelope.result?.reason).toBe("review transport unavailable");
+    expect(response.envelope.result?.reason).not.toContain(repoDir);
+    expect(response.envelope.result?.reason).not.toContain("this-machine");
   });
 
   it("reports no transport when the installation names no reviewer seat", async () => {

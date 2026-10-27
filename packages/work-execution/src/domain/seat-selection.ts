@@ -137,7 +137,14 @@ export function selectSeat(input: {
     if (entry.model !== null && MODEL_REFUSAL_CLASSES.includes(entry.stopReason)) {
       refusedModels.set(entry.model.trim(), entry.stopReason);
     }
-    if (entry.role === input.role && entry.seatIndex !== null) {
+    // A stored index outside the plan (negative, fractional, too large) is ignored, never trusted.
+    if (
+      entry.role === input.role &&
+      entry.seatIndex !== null &&
+      Number.isInteger(entry.seatIndex) &&
+      entry.seatIndex >= 0 &&
+      entry.seatIndex < seats.length
+    ) {
       lastIndex = entry.seatIndex;
     }
   }

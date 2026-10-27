@@ -167,6 +167,27 @@ describe("selectSeat", () => {
     );
   });
 
+  it("reports exhaustion when every model in the fix chain was refused", () => {
+    const p = plan([seat("A", "alpha-1"), seat("B", "beta-1")]);
+    const result = selectSeat({
+      plan: p,
+      role: "fix",
+      history: [
+        h({ role: "first-pass", seatIndex: 0, model: "alpha-1", stopReason: "rate-limited" }),
+        h({ role: "first-pass", seatIndex: 1, model: "beta-1", stopReason: "rate-limited" }),
+      ],
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("ignores a stored seat index outside the plan instead of throwing", () => {
+    const p = plan([seat("A", "alpha-1"), seat("B", "beta-1")]);
+    for (const seatIndex of [-2, -1, 1.5, 7]) {
+      const result = selectSeat({ plan: p, role: "fix", history: [h({ seatIndex })] });
+      expect(result.ok).toBe(true);
+    }
+  });
+
   it("reports exhaustion when every fix seat is blocked", () => {
     const p = plan([seat("A", "alpha-1"), seat("B", "beta-1")]);
     const result = selectSeat({ plan: p, role: "fix", history: [], unhealthySeatIds: ["A", "B"] });

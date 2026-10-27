@@ -51,7 +51,7 @@ export class StopReason {
 
   static create(value: unknown): { success: boolean; value?: StopReason; error?: Error } {
     if (typeof value !== 'string' || !STOP_REASON_VALUES.includes(value)) {
-      return { success: false, error: new Error(`Invalid stop reason: ${String(value)}`) };
+      return { success: false, error: new Error('Invalid stop reason') };
     }
     return { success: true, value: new StopReason(value as StopReasonValue) };
   }

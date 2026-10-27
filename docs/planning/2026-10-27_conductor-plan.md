@@ -137,6 +137,7 @@ A run never shows `stopped` while its attempt may still be running, and a slot i
 **`ResumeLaneRun` refuses two cases server-side**, each with a typed reason and its own test:
 - a run parked with `parked.reason === 'one-way-door'`: the owner's signed decision on the keyed question answers it, never a resume;
 - a `stopped` run: refused with `run-stopped`; a stopped run cannot be resumed.
+- a `stop-unconfirmed` park: refused with `stop-pending`; a requested stop always wins over a resume. The driver keeps retrying and reconciling the stop; only a confirmed stop (`stopped`) or an operator reconcile that finds the attempt gone ends the park.
 
 A resume carries the run's `expectedRevision` and is journalled under `<runId>/park/<n>/resume@web` when it comes from the web (through the request channel), so K1b refuses a repeat.
 
@@ -178,7 +179,7 @@ Each lane is about 45 minutes, one PR, the standard pipeline. **Parallel** means
 
 Group 3's work-execution lanes can each run beside a Group 2 lane in another package; inside Group 3, AM2 and S1a may overlap only if their files are disjoint, which each brief must state. AM4b touches `composition.ts`, so it runs in sequence with every other `composition.ts` lane. C1 and U1/U2 are in flight: prerequisites, not new lanes.
 
-**Amendment UI-B (2026-10-27, §3.8).** No new lanes. K1's transition table and guards gain the stop mapping and the `stop-unconfirmed` park reason, with one test per mapping row. K1b's keys include the control keys of §3.8. Whichever lane builds `ResumeLaneRun` (it backs K7's `conductor resume`) refuses `one-way-door` parks and `stopped` runs (`run-stopped`), with a test for each. K7's driver obeys `<runId>/stop@web` entries. If K1 has merged before this amendment, these land as a K1 follow-up. The web UI plan's A-C writes the stop entry and refuses run-owned attempts on the direct attempt stop.
+**Amendment UI-B (2026-10-27, §3.8).** No new lanes. K1's transition table and guards gain the stop mapping and the `stop-unconfirmed` park reason, with one test per mapping row. K1b's keys include the control keys of §3.8. Whichever lane builds `ResumeLaneRun` (it backs K7's `conductor resume`) refuses `one-way-door` parks, `stopped` runs (`run-stopped`) and `stop-unconfirmed` parks (`stop-pending`), with a test for each. K7's driver obeys `<runId>/stop@web` entries. If K1 has merged before this amendment, these land as a K1 follow-up. The web UI plan's A-C writes the stop entry and refuses run-owned attempts on the direct attempt stop.
 
 ## 5. Hard to undo
 

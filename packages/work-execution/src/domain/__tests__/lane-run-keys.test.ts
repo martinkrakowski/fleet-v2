@@ -134,15 +134,18 @@ describe('key builders', () => {
   });
 
   it('never runs a throwing getter and never throws', () => {
+    let getterRan = false;
     const hostile = {};
     Object.defineProperty(hostile, 'runId', {
       get() {
+        getterRan = true;
         throw new Error('boom');
       },
       enumerable: true,
       configurable: true,
     });
     const result = buildLaneRunStepKey(hostile as LaneRunStepKeyParts);
+    expect(getterRan).toBe(false);
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.error).not.toContain('boom');
@@ -150,8 +153,19 @@ describe('key builders', () => {
 
   it('never throws when a Proxy get or getOwnPropertyDescriptor trap throws', () => {
     for (const trap of ['get', 'getOwnPropertyDescriptor'] as const) {
-      const proxy = new Proxy({}, { [trap]() { throw new Error('boom'); } });
+      let getTrapRan = false;
+      const proxy = new Proxy(
+        {},
+        {
+          [trap]() {
+            if (trap === 'get') getTrapRan = true;
+            throw new Error('boom');
+          },
+        },
+      );
       const result = buildLaneRunStepKey(proxy as LaneRunStepKeyParts);
+      // Values are read through property descriptors only, so a get trap never runs.
+      expect(getTrapRan).toBe(false);
       expect(result.ok).toBe(false);
       if (result.ok) continue;
       expect(result.error).not.toContain('boom');

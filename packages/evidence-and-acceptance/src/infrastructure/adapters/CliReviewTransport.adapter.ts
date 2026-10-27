@@ -31,10 +31,11 @@ import type { SpawnRunOutcome, SpawnRunOptions } from './spawn-run.js';
 
 /**
  * Copied from GROK_TOOL.invocation.argvTemplate in packages/tooling/src/grok.ts:
- * plan mode neither writes nor runs commands. The evidence context may not import
- * @fleet/tooling; change both in the same PR.
+ * plan mode neither writes nor runs commands, and `--disable-web-search` removes
+ * web search and web fetch. The evidence context may not import @fleet/tooling;
+ * change both in the same PR.
  */
-export const GROK_REVIEW_ARGV_TEMPLATE: readonly string[] = ['grok', '-m', '{model}', '--permission-mode', 'plan', '{prompt}'];
+export const GROK_REVIEW_ARGV_TEMPLATE: readonly string[] = ['grok', '-m', '{model}', '--permission-mode', 'plan', '--disable-web-search', '{prompt}'];
 
 /** Seat tools with a single-turn CLI review transport, by seat `tool`. */
 export const CLI_REVIEW_ARGV_TEMPLATES: Readonly<Record<string, readonly string[]>> = {
@@ -209,10 +210,19 @@ export function createCliReviewTransport(
         throw new Error(`reviewer CLI failed with exit code ${code}: ${detail}`);
       }
 
-      // 9. An empty answer is a failed review, never a pass
+      // 9. An empty or one-line answer is a failed review, never a pass
       const text = outcome.stdout;
-      if (text.trim() === '') {
+      let nonBlankLineCount = 0;
+      for (const line of text.split(/\r?\n/)) {
+        if (line.trim() !== '') {
+          nonBlankLineCount += 1;
+        }
+      }
+      if (nonBlankLineCount === 0) {
         throw new Error('reviewer CLI returned an empty response');
+      }
+      if (nonBlankLineCount < 2) {
+        throw new Error('reviewer CLI returned a one-line response');
       }
 
       // 10. Verify head and status after the review

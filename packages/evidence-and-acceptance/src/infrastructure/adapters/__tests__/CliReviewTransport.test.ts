@@ -77,6 +77,18 @@ function buildHarness(overrides: Partial<CliReviewTransportOptions> = {}): Harne
 }
 
 describe('CliReviewTransport', () => {
+  it('pins the grok review argv template element by element', () => {
+    expect(GROK_REVIEW_ARGV_TEMPLATE).toEqual([
+      'grok',
+      '-m',
+      '{model}',
+      '--permission-mode',
+      'plan',
+      '--disable-web-search',
+      '{prompt}',
+    ]);
+  });
+
   it('spawns the grok binary with the exact argv and scaffold options', async () => {
     const { transport, spawnCalls, scratchDirs } = buildHarness();
 
@@ -85,7 +97,15 @@ describe('CliReviewTransport', () => {
     expect(spawnCalls).toHaveLength(1);
     const { file, args, options } = spawnCalls[0];
     expect(file).toBe('grok');
-    expect(args).toEqual(['-m', 'grok-4.7', '--permission-mode', 'plan', expect.stringContaining('Independent read-only code review')]);
+    expect(args).toContain('--disable-web-search');
+    expect(args).toEqual([
+      '-m',
+      'grok-4.7',
+      '--permission-mode',
+      'plan',
+      '--disable-web-search',
+      expect.stringContaining('Independent read-only code review'),
+    ]);
     expect(options.cwd).toBe(scratchDirs[0]);
     expect(options.input).toBeUndefined();
     expect(options.timeoutMs).toBe(DEFAULT_REVIEW_TIMEOUT_MS);
@@ -105,7 +125,7 @@ describe('CliReviewTransport', () => {
       let capturedEnv: Readonly<Record<string, string>> | undefined;
       const spawn: CliReviewSpawn = async (_file, _args, options) => {
         capturedEnv = options.env;
-        return { exitCode: 0, signal: null, stdout: 'VERDICT: PASS\n', stderr: '' };
+        return { exitCode: 0, signal: null, stdout: PASS_STDOUT, stderr: '' };
       };
 
       const { transport } = buildHarness({ spawn });
@@ -151,7 +171,7 @@ describe('CliReviewTransport', () => {
 
     expect(readDiffCalls).toEqual([['base-sha', BASE_REQUEST.candidateHeadSha]]);
 
-    const prompt = spawnCalls[0].args[4];
+    const prompt = spawnCalls[0].args[5];
     expect(prompt).toContain(UNTRUSTED_INPUT_RULE);
     expect(prompt).toContain(REVIEW_REPLY_CONTRACT);
 
@@ -169,7 +189,7 @@ describe('CliReviewTransport', () => {
 
     await transport(request);
 
-    const prompt = spawnCalls[0].args[4];
+    const prompt = spawnCalls[0].args[5];
     expect(prompt.split(NONCE).length - 1).toBe(4);
     expect(prompt).toContain(`<<<UNTRUSTED nonce=${NONCE} label="diff summary">>>`);
   });
@@ -202,7 +222,7 @@ describe('CliReviewTransport', () => {
     const spawn: CliReviewSpawn = async () => ({
       exitCode: 0,
       signal: null,
-      stdout: 'FINDING: major a.txt:2 something\n',
+      stdout: 'FINDING: major a.txt:2 something\nFINDING: minor a.txt:3 something else\n',
       stderr: '',
     });
     const { transport } = buildHarness({ spawn });
@@ -210,6 +230,20 @@ describe('CliReviewTransport', () => {
     const result = await transport(BASE_REQUEST);
 
     expect(result.result).toBe('unknown');
+  });
+
+  it('a two-line answer with a verdict still parses', async () => {
+    const spawn: CliReviewSpawn = async () => ({
+      exitCode: 0,
+      signal: null,
+      stdout: 'Reviewed the embedded diff and found nothing blocking.\nVERDICT: PASS\n',
+      stderr: '',
+    });
+    const { transport } = buildHarness({ spawn });
+
+    const result = await transport(BASE_REQUEST);
+
+    expect(result.result).toBe('pass');
   });
 
   it('passes with the finding, read-only verified, and removes the scratch dir', async () => {
@@ -310,6 +344,13 @@ describe('CliReviewTransport', () => {
       await expect(transport(BASE_REQUEST)).rejects.toThrow(/empty response/);
       await expect(access(scratchDirs[0])).rejects.toThrow();
     });
+
+    it('a one-line stdout rejects and removes the scratch dir', async () => {
+      const spawn: CliReviewSpawn = async () => ({ exitCode: 0, signal: null, stdout: 'VERDICT: PASS\n', stderr: '' });
+      const { transport, scratchDirs } = buildHarness({ spawn });
+      await expect(transport(BASE_REQUEST)).rejects.toThrow(/one-line response/);
+      await expect(access(scratchDirs[0])).rejects.toThrow();
+    });
   });
 
   describe('read-only verification', () => {
@@ -319,7 +360,7 @@ describe('CliReviewTransport', () => {
           throw new Error('expected a scratch cwd');
         }
         await writeFile(join(options.cwd, 'leak.txt'), 'x');
-        return { exitCode: 0, signal: null, stdout: 'VERDICT: PASS\n', stderr: '' };
+        return { exitCode: 0, signal: null, stdout: PASS_STDOUT, stderr: '' };
       };
       const { transport } = buildHarness({ spawn });
 
@@ -392,6 +433,7 @@ describe('CliReviewTransport', () => {
         'grok-4.7',
         '--permission-mode',
         'plan',
+        '--disable-web-search',
         'PROMPT',
       ]);
     });
@@ -406,6 +448,19 @@ describe('CliReviewTransport', () => {
     expect(result.outcome).toBe('unavailable');
     if (result.outcome === 'unavailable') {
       expect(result.reason).toContain('reviewer model mismatch');
+    }
+  });
+
+  it('through IndependentReviewAdapter a one-line answer is unavailable with the one-line reason', async () => {
+    const spawn: CliReviewSpawn = async () => ({ exitCode: 0, signal: null, stdout: 'VERDICT: PASS\n', stderr: '' });
+    const { transport } = buildHarness({ spawn });
+    const adapter = new IndependentReviewAdapter({ runReview: transport });
+
+    const result = await adapter.runIndependentReview(BASE_REQUEST);
+
+    expect(result.outcome).toBe('unavailable');
+    if (result.outcome === 'unavailable') {
+      expect(result.reason).toContain('reviewer CLI returned a one-line response');
     }
   });
 });

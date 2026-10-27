@@ -9,6 +9,7 @@ import type {
   CollectedAttemptArtifacts,
   CommandCompletionReceipt,
 } from '../../../domain/execution-records.js';
+import type { ArtifactManifest, ArtifactManifestVerdict } from '../../../domain/artifact-manifest.js';
 
 export interface PlaceFrozenBriefRequest {
   readonly attemptId: string;
@@ -53,6 +54,33 @@ export type CollectCompletedAttemptArtifactsResult =
   | { readonly outcome: 'collected'; readonly artifacts: CollectedAttemptArtifacts }
   | { readonly outcome: 'refused'; readonly reason: string };
 
+export interface SealArtifactManifestRequest {
+  readonly attemptId: string;
+  readonly worktreePath: string;
+  /** The collected worktree-relative paths, as recorded by collection. */
+  readonly artifactPaths: readonly string[];
+  readonly recordedHost?: AttemptRunnerRecord | null;
+}
+
+export type SealArtifactManifestResult =
+  | {
+      readonly outcome: 'sealed';
+      readonly manifestPath: string;
+      readonly manifestSha256: string;
+      readonly manifest: ArtifactManifest;
+    }
+  | { readonly outcome: 'refused'; readonly reason: string };
+
+export interface VerifyArtifactManifestRequest {
+  readonly attemptId: string;
+  readonly worktreePath: string;
+  readonly recordedHost?: AttemptRunnerRecord | null;
+  /** The digest recorded on the attempt; when given, a rewritten manifest is a mismatch. */
+  readonly expectedManifestSha256?: string;
+}
+
+export type VerifyArtifactManifestResult = ArtifactManifestVerdict;
+
 export interface AttemptArtifactPort {
   /** Verify candidate paths are ignored before placing anything in the worktree. */
   verifyIgnoredPaths(request: VerifyIgnoredPathsRequest): Promise<VerifyIgnoredPathsResult>;
@@ -82,4 +110,10 @@ export interface AttemptArtifactPort {
     relativePath: string,
     recordedHost?: AttemptRunnerRecord | null,
   ): Promise<string | null>;
+
+  /** Write the attempt's artifact manifest atomically and read it back (C1). */
+  sealArtifactManifest?(request: SealArtifactManifestRequest): Promise<SealArtifactManifestResult>;
+
+  /** Re-hash every file the manifest lists: sealed, missing (no manifest) or mismatch. */
+  verifyArtifactManifest?(request: VerifyArtifactManifestRequest): Promise<VerifyArtifactManifestResult>;
 }

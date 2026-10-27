@@ -529,14 +529,6 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
       manifestRelativePath,
       randomBytes(4).toString('hex'),
     );
-    const ignored = await Promise.all(
-      [manifestRelativePath, tempRelativePath].map((p) =>
-        this.checkIgnored(request.worktreePath, p, executor),
-      ),
-    );
-    if (ignored.some((value) => !value)) {
-      return { outcome: 'refused', reason: 'Artifact manifest paths are not gitignored' };
-    }
     const finalPath = resolveWorktreeTarget(request.worktreePath, manifestRelativePath);
     const tempPath = resolveWorktreeTarget(request.worktreePath, tempRelativePath);
     const laneDir = path.dirname(finalPath);
@@ -558,6 +550,16 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
         outcome: 'refused',
         reason: 'Lane directory .lane must be a real directory and not a symbolic link',
       };
+    }
+    // After the .lane check: git check-ignore exits 128 for a path beyond a symlink,
+    // which must be a refusal, not an error.
+    const ignored = await Promise.all(
+      [manifestRelativePath, tempRelativePath].map((p) =>
+        this.checkIgnored(request.worktreePath, p, executor),
+      ),
+    );
+    if (ignored.some((value) => !value)) {
+      return { outcome: 'refused', reason: 'Artifact manifest paths are not gitignored' };
     }
     const [tempAllowed, finalAllowed] = await Promise.all([
       this.isAbsentOrRegularFile(tempPath, executor),

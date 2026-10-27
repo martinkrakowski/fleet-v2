@@ -46,6 +46,7 @@ import {
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   ListAttemptsUseCase,
+  ListAttemptJournalUseCase,
   ListUnregisteredProjectsUseCase,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
@@ -81,6 +82,7 @@ export interface WorkComposition {
   inspectWorkOrder: InspectWorkOrderUseCase;
   inspectAttempt: InspectAttemptUseCase;
   listAttempts: ListAttemptsUseCase;
+  listAttemptJournal: ListAttemptJournalUseCase;
   probeProject: ProbeProjectUseCase;
   /**
    * Throttles HTTP probe requests: one in-flight probe per project and a
@@ -223,6 +225,7 @@ function unconfiguredWorkComposition(): WorkComposition {
     inspectWorkOrder: new InspectWorkOrderUseCase(),
     inspectAttempt: new InspectAttemptUseCase(),
     listAttempts: new ListAttemptsUseCase(),
+    listAttemptJournal: new ListAttemptJournalUseCase(),
     probeProject: new ProbeProjectUseCase(),
     probeLimiter: new ProbeLimiter(),
     listUnregisteredProjects: new ListUnregisteredProjectsUseCase(),
@@ -434,6 +437,7 @@ export function createConfiguredWorkComposition(
     inspectWorkOrder: new InspectWorkOrderUseCase({ workOrderRepo, attemptRepo, journal }),
     inspectAttempt: new InspectAttemptUseCase({ attemptRepo, runnerForAttempt }),
     listAttempts: new ListAttemptsUseCase({ attemptRepo, workOrderRepo, journal }),
+    listAttemptJournal: new ListAttemptJournalUseCase({ attemptRepo, journal }),
     prepareBriefPackage: new PrepareBriefPackageUseCase({
       briefAuthoring,
       artifactPort,

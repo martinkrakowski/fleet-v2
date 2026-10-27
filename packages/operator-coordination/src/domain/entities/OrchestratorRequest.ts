@@ -71,6 +71,17 @@ export type OrchestratorRequestResult =
   | { readonly success: true; readonly value: OrchestratorRequest }
   | { readonly success: false; readonly error: Error; readonly code: OrchestratorRequestRefusalCode };
 
+/** Who claims: the orchestrator id and the revision it read. */
+export interface OrchestratorRequestClaimant {
+  readonly orchestratorId: string;
+  readonly expectedRevision: number;
+}
+
+/** Who holds the current claim: as above plus the fence it was issued. */
+export interface OrchestratorRequestHolder extends OrchestratorRequestClaimant {
+  readonly fence: number;
+}
+
 export class OrchestratorRequest {
   private constructor(private readonly record: OrchestratorRequestRecord) {
     // Invariants are validated in create; the record is frozen on the way in.
@@ -360,10 +371,424 @@ export class OrchestratorRequest {
   isTerminal(): boolean {
     return (ORCHESTRATOR_REQUEST_TERMINAL_STATES as readonly string[]).includes(this.record.state);
   }
+
+  /**
+   * Claim a queued request, or a deferred one past its deferral, for an
+   * orchestrator. Every claim is issued a fence one higher than the last.
+   * Revision is checked first, then expiry, then the deferral.
+   */
+  claim(
+    claimant: unknown,
+    nowIso: string,
+    leaseSeconds: number = ORCHESTRATOR_REQUEST_CLAIM_LEASE_SECONDS,
+  ): OrchestratorRequestResult {
+    try {
+      return this.claimUnchecked(claimant, nowIso, leaseSeconds);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  private claimUnchecked(
+    claimant: unknown,
+    nowIso: string,
+    leaseSeconds: number,
+  ): OrchestratorRequestResult {
+    if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
+      return invalid('OrchestratorRequest now must be a valid timestamp');
+    }
+    const claimantSnapshot = readPlainObject(claimant, ['orchestratorId', 'expectedRevision']);
+    if (claimantSnapshot === null) {
+      return invalid('OrchestratorRequest claimant must be { orchestratorId, expectedRevision }');
+    }
+    if (claimantSnapshot.expectedRevision !== this.record.revision) {
+      return refusal('OrchestratorRequest revision does not match the record', 'revision');
+    }
+    const state = this.record.state;
+    if (state !== 'queued' && state !== 'deferred') {
+      return refusal('OrchestratorRequest cannot claim from its current state', 'state');
+    }
+    const nowMs = Date.parse(nowIso);
+    if (nowMs >= Date.parse(this.record.expiresAtIso)) {
+      return refusal('OrchestratorRequest has expired unclaimed', 'expired');
+    }
+    if (state === 'deferred' && nowMs < Date.parse(this.record.deferredUntilIso as string)) {
+      return refusal('OrchestratorRequest is deferred until later', 'state');
+    }
+    const idError = idFieldError('claim', claimantSnapshot.orchestratorId);
+    if (idError !== null) {
+      return invalid(idError);
+    }
+    if (
+      !Number.isInteger(leaseSeconds) ||
+      leaseSeconds < 1 ||
+      leaseSeconds > ORCHESTRATOR_REQUEST_MAX_CLAIM_LEASE_SECONDS
+    ) {
+      return invalid('OrchestratorRequest claim lease must be 1 to 300 seconds');
+    }
+    const fence = this.record.fence + 1;
+    const leaseUntilIso = new Date(nowMs + leaseSeconds * 1000).toISOString();
+    return this.recreate(nowIso, {
+      state: 'claimed',
+      fence,
+      claim: {
+        orchestratorId: claimantSnapshot.orchestratorId as string,
+        fence,
+        leaseUntilIso,
+      },
+      reason: null,
+      deferredUntilIso: null,
+    });
+  }
+
+  /**
+   * Renew the claim lease. The holder check (revision, state, id, fence,
+   * lease) runs first; the state and claim are unchanged.
+   */
+  renewClaim(
+    holder: unknown,
+    nowIso: string,
+    leaseSeconds: number = ORCHESTRATOR_REQUEST_CLAIM_LEASE_SECONDS,
+  ): OrchestratorRequestResult {
+    try {
+      return this.renewClaimUnchecked(holder, nowIso, leaseSeconds);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  private renewClaimUnchecked(
+    holder: unknown,
+    nowIso: string,
+    leaseSeconds: number,
+  ): OrchestratorRequestResult {
+    const holderCheck = this.holderError('renew', ['claimed', 'cancel-requested'], holder, nowIso);
+    if (holderCheck !== null) {
+      return refusal(holderCheck.message, holderCheck.code);
+    }
+    if (
+      !Number.isInteger(leaseSeconds) ||
+      leaseSeconds < 1 ||
+      leaseSeconds > ORCHESTRATOR_REQUEST_MAX_CLAIM_LEASE_SECONDS
+    ) {
+      return invalid('OrchestratorRequest claim lease must be 1 to 300 seconds');
+    }
+    const claim = this.record.claim;
+    if (claim === null) {
+      return refusal('OrchestratorRequest caller does not hold the current claim', 'holder');
+    }
+    const leaseUntilIso = new Date(Date.parse(nowIso) + leaseSeconds * 1000).toISOString();
+    return this.recreate(nowIso, { claim: { ...claim, leaseUntilIso } });
+  }
+
+  /**
+   * Mark the request dispatched with a link to the journal record. The link
+   * is validated by rule o; the claim is kept.
+   */
+  complete(holder: unknown, linked: unknown, nowIso: string): OrchestratorRequestResult {
+    try {
+      return this.completeUnchecked(holder, linked, nowIso);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  private completeUnchecked(holder: unknown, linked: unknown, nowIso: string): OrchestratorRequestResult {
+    const holderCheck = this.holderError('complete', ['claimed', 'cancel-requested'], holder, nowIso);
+    if (holderCheck !== null) {
+      return refusal(holderCheck.message, holderCheck.code);
+    }
+    const linkKey = ORCHESTRATOR_REQUEST_LINK_KEY[this.record.kind];
+    const linkedSnapshot = readPlainObject(linked, [linkKey, 'journalKey']);
+    if (linkedSnapshot === null) {
+      return invalid(`OrchestratorRequest linked must be null or { ${linkKey}, journalKey: request/<requestId> }`);
+    }
+    const linkedError = completeLinkedSnapshotError(this.record.kind, this.record.requestId, linkedSnapshot);
+    if (linkedError !== null) {
+      return invalid(linkedError);
+    }
+    return this.recreate(nowIso, { state: 'dispatched', linked: linkedSnapshot });
+  }
+
+  /**
+   * Refuse the request with a typed reason; the claim is kept.
+   */
+  refuse(holder: unknown, reason: unknown, nowIso: string): OrchestratorRequestResult {
+    try {
+      return this.refuseUnchecked(holder, reason, nowIso);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  private refuseUnchecked(holder: unknown, reason: unknown, nowIso: string): OrchestratorRequestResult {
+    const holderCheck = this.holderError('refuse', ['claimed', 'cancel-requested'], holder, nowIso);
+    if (holderCheck !== null) {
+      return refusal(holderCheck.message, holderCheck.code);
+    }
+    const reasonSnapshot = readPlainObject(reason, ['reasonKind', 'detail']);
+    if (reasonSnapshot === null) {
+      return invalid('OrchestratorRequest reason must be null or { reasonKind, detail }');
+    }
+    const reasonError = reasonSnapshotError(reasonSnapshot);
+    if (reasonError !== null) {
+      return invalid(reasonError);
+    }
+    return this.recreate(nowIso, { state: 'refused', reason: reasonSnapshot });
+  }
+
+  /**
+   * Defer a claimed request until a time after now and no later than its
+   * expiry; the claim is dropped.
+   */
+  defer(holder: unknown, untilIso: unknown, reason: unknown, nowIso: string): OrchestratorRequestResult {
+    try {
+      return this.deferUnchecked(holder, untilIso, reason, nowIso);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  private deferUnchecked(
+    holder: unknown,
+    untilIso: unknown,
+    reason: unknown,
+    nowIso: string,
+  ): OrchestratorRequestResult {
+    const holderCheck = this.holderError('defer', ['claimed'], holder, nowIso);
+    if (holderCheck !== null) {
+      return refusal(holderCheck.message, holderCheck.code);
+    }
+    const nowMs = Date.parse(nowIso);
+    const untilMs = typeof untilIso === 'string' ? Date.parse(untilIso) : Number.NaN;
+    if (Number.isNaN(untilMs) || untilMs <= nowMs || untilMs > Date.parse(this.record.expiresAtIso)) {
+      return invalid('OrchestratorRequest defer must end after now and no later than its expiry');
+    }
+    const reasonSnapshot = readPlainObject(reason, ['reasonKind', 'detail']);
+    if (reasonSnapshot === null) {
+      return invalid('OrchestratorRequest reason must be null or { reasonKind, detail }');
+    }
+    const reasonError = reasonSnapshotError(reasonSnapshot);
+    if (reasonError !== null) {
+      return invalid(reasonError);
+    }
+    return this.recreate(nowIso, {
+      state: 'deferred',
+      claim: null,
+      deferredUntilIso: new Date(untilMs).toISOString(),
+      reason: reasonSnapshot,
+    });
+  }
+
+  /**
+   * The holder confirms the owner's requested cancel. Only a cancel-requested
+   * request can be confirmed; the claim is dropped.
+   */
+  confirmCancel(holder: unknown, nowIso: string): OrchestratorRequestResult {
+    try {
+      return this.confirmCancelUnchecked(holder, nowIso);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  private confirmCancelUnchecked(holder: unknown, nowIso: string): OrchestratorRequestResult {
+    const holderCheck = this.holderError('confirm cancel', ['cancel-requested'], holder, nowIso);
+    if (holderCheck !== null) {
+      return refusal(holderCheck.message, holderCheck.code);
+    }
+    return this.recreate(nowIso, { state: 'cancelled', claim: null });
+  }
+
+  /**
+   * The owner cancels. Queued and deferred requests cancel outright; a
+   * claimed request becomes cancel-requested and waits for the holder's
+   * confirmation; an already cancel-requested request returns itself.
+   */
+  requestCancel(expectedRevision: unknown, nowIso: string): OrchestratorRequestResult {
+    try {
+      return this.requestCancelUnchecked(expectedRevision, nowIso);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  private requestCancelUnchecked(expectedRevision: unknown, nowIso: string): OrchestratorRequestResult {
+    if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
+      return invalid('OrchestratorRequest now must be a valid timestamp');
+    }
+    if (expectedRevision !== this.record.revision) {
+      return refusal('OrchestratorRequest revision does not match the record', 'revision');
+    }
+    if ((ORCHESTRATOR_REQUEST_TERMINAL_STATES as readonly string[]).includes(this.record.state)) {
+      return refusal('OrchestratorRequest cannot cancel from its current state', 'state');
+    }
+    if (this.record.state === 'cancel-requested') {
+      return { success: true, value: this };
+    }
+    if (this.record.state === 'claimed') {
+      return this.recreate(nowIso, { state: 'cancel-requested' });
+    }
+    return this.recreate(nowIso, { state: 'cancelled', claim: null, reason: null, deferredUntilIso: null });
+  }
+
+  /**
+   * Sweep a claimed request whose lease lapsed: claimCount rises, a second
+   * lost claim stalls the request, and a lapsed cancel-requested request is
+   * cancelled.
+   */
+  expireLapsedClaim(nowIso: string): OrchestratorRequestResult {
+    try {
+      return this.expireLapsedClaimUnchecked(nowIso);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  private expireLapsedClaimUnchecked(nowIso: string): OrchestratorRequestResult {
+    if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
+      return invalid('OrchestratorRequest now must be a valid timestamp');
+    }
+    const state = this.record.state;
+    const claim = this.record.claim;
+    if (state === 'claimed' || state === 'cancel-requested') {
+      if (claim !== null && Date.parse(nowIso) >= Date.parse(claim.leaseUntilIso)) {
+        if (state === 'cancel-requested') {
+          return this.recreate(nowIso, { state: 'cancelled', claim: null });
+        }
+        const claimCount = this.record.claimCount + 1;
+        if (claimCount === ORCHESTRATOR_REQUEST_MAX_LOST_CLAIMS) {
+          return this.recreate(nowIso, { state: 'stalled', claim: null, claimCount });
+        }
+        return this.recreate(nowIso, { state: 'queued', claim: null, claimCount });
+      }
+    }
+    return refusal('OrchestratorRequest has no lapsed claim', 'state');
+  }
+
+  /**
+   * Sweep an unclaimed queued or deferred request past its expiry.
+   */
+  expireUnclaimed(nowIso: string): OrchestratorRequestResult {
+    try {
+      return this.expireUnclaimedUnchecked(nowIso);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  private expireUnclaimedUnchecked(nowIso: string): OrchestratorRequestResult {
+    if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
+      return invalid('OrchestratorRequest now must be a valid timestamp');
+    }
+    const state = this.record.state;
+    if (
+      (state === 'queued' || state === 'deferred') &&
+      Date.parse(nowIso) >= Date.parse(this.record.expiresAtIso)
+    ) {
+      return this.recreate(nowIso, { state: 'expired', reason: null, deferredUntilIso: null });
+    }
+    return refusal('OrchestratorRequest is not an unclaimed request past its expiry', 'state');
+  }
+
+  /**
+   * The five fence checks, in order: now valid, holder shape, revision,
+   * state, holder id and fence, lease. Returns a fixed failure or null.
+   */
+  private holderError(
+    verb: string,
+    allowedStates: readonly OrchestratorRequestState[],
+    holder: unknown,
+    nowIso: unknown,
+  ): { message: string; code: OrchestratorRequestRefusalCode } | null {
+    if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
+      return { message: 'OrchestratorRequest now must be a valid timestamp', code: 'invalid' };
+    }
+    const holderSnapshot = readPlainObject(holder, ['orchestratorId', 'fence', 'expectedRevision']);
+    if (holderSnapshot === null) {
+      return { message: 'OrchestratorRequest holder must be { orchestratorId, fence, expectedRevision }', code: 'invalid' };
+    }
+    if (holderSnapshot.expectedRevision !== this.record.revision) {
+      return { message: 'OrchestratorRequest revision does not match the record', code: 'revision' };
+    }
+    if (!allowedStates.includes(this.record.state)) {
+      return { message: `OrchestratorRequest cannot ${verb} from its current state`, code: 'state' };
+    }
+    const claim = this.record.claim;
+    if (
+      claim === null ||
+      claim.orchestratorId !== holderSnapshot.orchestratorId ||
+      claim.fence !== holderSnapshot.fence
+    ) {
+      return { message: 'OrchestratorRequest caller does not hold the current claim', code: 'holder' };
+    }
+    if (Date.parse(nowIso) >= Date.parse(claim.leaseUntilIso)) {
+      return { message: 'OrchestratorRequest claim lease has expired', code: 'lease' };
+    }
+    return null;
+  }
+
+  /** Re-validate a changed record with revision bumped and updatedAt set to now. */
+  private recreate(nowIso: string, changes: Record<string, unknown>): OrchestratorRequestResult {
+    return OrchestratorRequest.create({
+      ...this.toRecord(),
+      ...changes,
+      revision: this.record.revision + 1,
+      updatedAtIso: new Date(Date.parse(nowIso)).toISOString(),
+    });
+  }
 }
 
 function invalid(message: string): OrchestratorRequestResult {
   return { success: false, error: new Error(message), code: 'invalid' };
+}
+
+function refusal(message: string, code: OrchestratorRequestRefusalCode): OrchestratorRequestResult {
+  return { success: false, error: new Error(message), code };
+}
+
+/**
+ * The dispatch-link check for `complete` (rule o), with the literal
+ * `<requestId>` placeholder in refusal messages so no input value is ever
+ * interpolated.
+ */
+function completeLinkedSnapshotError(
+  kind: OrchestratorRequestKind,
+  requestId: string,
+  snapshot: Record<string, unknown>,
+): string | null {
+  const linkKey = ORCHESTRATOR_REQUEST_LINK_KEY[kind];
+  const shapeMessage = `OrchestratorRequest linked must be null or { ${linkKey}, journalKey: request/<requestId> }`;
+  const id = snapshot[linkKey];
+  if (typeof id !== 'string' || id.trim().length === 0 || new TextEncoder().encode(id).byteLength > ID_MAX_BYTES) {
+    return shapeMessage;
+  }
+  if (containsSecretShape(id)) {
+    return 'OrchestratorRequest linked contains a secret-shaped value and was refused';
+  }
+  if (snapshot.journalKey !== `request/${requestId}`) {
+    return shapeMessage;
+  }
+  return null;
+}
+
+/** True when a queued (or deferral-passed) request is claimable before expiry. */
+export function isOrchestratorRequestClaimable(record: OrchestratorRequestRecord, nowIso: unknown): boolean {
+  if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
+    return false;
+  }
+  const nowMs = Date.parse(nowIso);
+  if (record.state === 'queued') {
+    return nowMs < Date.parse(record.expiresAtIso);
+  }
+  if (record.state === 'deferred') {
+    return (
+      record.deferredUntilIso !== null &&
+      nowMs >= Date.parse(record.deferredUntilIso) &&
+      nowMs < Date.parse(record.expiresAtIso)
+    );
+  }
+  return false;
 }
 
 /**

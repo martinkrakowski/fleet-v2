@@ -20,18 +20,27 @@ import type {
   BriefModelAssignment,
   CommandCompletionReceipt,
   ReserveExecutionCapacityCandidateHost,
+  SeatPlanProps,
 } from '@fleet/work-execution';
 import {
   AttemptRevisionConflictError,
+  historyEntryOf,
   nextAttemptRevision,
   parseSeatTool,
   resolveInstallationHostForRole,
+  SeatPlan,
+  selectReviewSeat,
+  selectSeat,
 } from '@fleet/work-execution';
 import { resolveImplementerSeat } from '@fleet/work-execution/use-cases';
 import type {
   FindingDispositionRecord,
   ReviewReceiptRecord,
   VerificationReceiptRecord,
+} from '@fleet/evidence-and-acceptance';
+import {
+  isSameModelFamily,
+  underlyingModelFamily as evidenceFamily,
 } from '@fleet/evidence-and-acceptance';
 import {
   computeRankingTrialFigures,
@@ -50,7 +59,15 @@ import type {
   OwnerQuestionState,
 } from '@fleet/operator-coordination';
 
-import { loadInstallation, type FleetInstallation, type HostSection, type LoadResult } from '@fleet/installation';
+import {
+  loadInstallation,
+  deriveInstallationModel,
+  isFleetInstallationV2,
+  type FleetInstallation,
+  type FleetInstallationModel,
+  type HostSection,
+  type LoadResult,
+} from '@fleet/installation';
 import type {
   DoctorLine,
   DoctorProbes,
@@ -75,6 +92,7 @@ import {
 } from './composition.js';
 import { hostsCommand, type HostsCliOptions } from './hosts.js';
 import { seatsCommand, type SeatsCliOptions } from './seats.js';
+import { seatPlanFromInstallation, unhealthySeatIdsOf } from './seat-plan.js';
 import { initCommand, type InitCliOptions } from './init.js';
 import { projectsCommand, type ProjectsCliOptions } from './projects.js';
 import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
@@ -632,6 +650,43 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
+/** The derived v2 model of the runtime's installation, or undefined for v1 or none. */
+function derivedV2Model(rt: FleetCliRuntime): FleetInstallationModel | undefined {
+  const installation = rt.installation;
+  if (installation === undefined || !isFleetInstallationV2(installation)) {
+    return undefined;
+  }
+  return deriveInstallationModel(installation).model;
+}
+
+/** brief prepare's seat plan from --seatPlan or --seatPlanFromInstallation; undefined when neither. */
+function briefSeatPlan(p: Payload, rt: FleetCliRuntime): SeatPlanProps | undefined {
+  const explicit = p['seatPlan'];
+  const fromInstallation = p['seatPlanFromInstallation'] === true || p['seatPlanFromInstallation'] === 'true';
+  if (explicit !== undefined && fromInstallation) {
+    throw new CliUsageError("brief prepare takes '--seatPlan' or '--seatPlanFromInstallation', not both");
+  }
+  if (explicit !== undefined) {
+    const parsed = typeof explicit === 'string' ? safeJsonParse(explicit) : explicit;
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new CliUsageError("brief prepare requires a JSON object in '--seatPlan'");
+    }
+    return parsed as SeatPlanProps;
+  }
+  if (!fromInstallation) {
+    return undefined;
+  }
+  const model = derivedV2Model(rt);
+  if (model === undefined) {
+    throw new CliUsageError("'--seatPlanFromInstallation' needs a v2 installation");
+  }
+  const built = seatPlanFromInstallation(model);
+  if ('reason' in built) {
+    throw new CliUsageError(built.reason);
+  }
+  return built.plan;
+}
+
 // ---------------------------------------------------------------------------
 // Command table. Each handler builds one typed request from the payload; the
 // use case owns every behavioural decision.
@@ -722,6 +777,41 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
           `'--seatTool ${String(seatTool)}' conflicts with the seat tool in --modelAssignment`,
         );
       }
+      const seatPlan = briefSeatPlan(p, rt);
+      const unhealthy = new Set(unhealthySeatIdsOf(derivedV2Model(rt)));
+      const planSeatForAssignment =
+        seatPlan !== undefined && nestedAssignment === undefined && optStr(p, 'model') === undefined
+          ? seatPlan['first-pass'].find((seat) => !unhealthy.has(seat.id))
+          : undefined;
+      if (
+        seatPlan !== undefined &&
+        nestedAssignment === undefined &&
+        optStr(p, 'model') === undefined &&
+        planSeatForAssignment === undefined
+      ) {
+        throw new CliUsageError(
+          'Every first-pass seat of the seat plan is unhealthy; pass --model to choose one',
+        );
+      }
+      let modelAssignment: BriefModelAssignment;
+      if (nestedAssignment !== undefined) {
+        modelAssignment = { ...nestedAssignment, seatTool };
+      } else if (planSeatForAssignment !== undefined) {
+        modelAssignment = {
+          model: planSeatForAssignment.model,
+          variant: planSeatForAssignment.variant ?? 'default',
+          fallbackModel: str(p, 'fallbackModel') || planSeatForAssignment.model,
+          seatTool,
+          ...(planSeatForAssignment.agent !== undefined ? { agent: planSeatForAssignment.agent } : {}),
+        } as BriefModelAssignment;
+      } else {
+        modelAssignment = {
+          model: str(p, 'model'),
+          variant: str(p, 'variant') || 'default',
+          fallbackModel: str(p, 'fallbackModel'),
+          seatTool,
+        };
+      }
       return rt.execution.prepareBriefPackage.prepareBriefPackage({
         workOrderId: str(p, 'workOrderId'),
         projectId: str(p, 'projectId'),
@@ -730,15 +820,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         repository: str(p, 'repository'),
         baseCommit: str(p, 'baseCommit'),
         policyRevision: str(p, 'policyRevision'),
-        modelAssignment:
-          nestedAssignment !== undefined
-            ? { ...nestedAssignment, seatTool }
-            : {
-                model: str(p, 'model'),
-                variant: str(p, 'variant') || 'default',
-                fallbackModel: str(p, 'fallbackModel'),
-                seatTool,
-              },
+        modelAssignment,
         independentReviewer: str(p, 'independentReviewer'),
         ownedPaths: strArr(p, 'ownedPaths'),
         // The edit-only diff check's allowed prefixes: one JSON array (or an
@@ -757,6 +839,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         attemptId: optStr(p, 'attemptId'),
         worktreePath: optStr(p, 'worktreePath'),
         handWrittenBriefPath: strOrNull(p, 'handWrittenBriefPath'),
+        ...(seatPlan !== undefined ? { seatPlan } : {}),
       });
     },
   },
@@ -1001,8 +1084,10 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         return measureAndSave(fresh);
       }
     },
-    fix: async (p, rt) =>
-      rt.execution.prepareFixAttempt.prepareFixAttempt({
+    fix: async (p, rt) => {
+      const extra = p['unhealthySeatIds'] === undefined ? [] : jsonStrArr(p, 'unhealthySeatIds', 'attempt fix');
+      const unhealthySeatIds = [...new Set([...unhealthySeatIdsOf(derivedV2Model(rt)), ...extra])];
+      return rt.execution.prepareFixAttempt.prepareFixAttempt({
         fixAttemptId: str(p, 'fixAttemptId'),
         workOrderId: str(p, 'workOrderId'),
         priorAttemptId: str(p, 'priorAttemptId'),
@@ -1010,7 +1095,49 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         baseCommit: str(p, 'baseCommit'),
         numberedFixes: strArr(p, 'numberedFixes'),
         nowIso: optStr(p, 'nowIso'),
-      }),
+        ...(unhealthySeatIds.length > 0 ? { unhealthySeatIds } : {}),
+      });
+    },
+    'next-seat': async (p, rt) => {
+      const attemptId = str(p, 'attemptId');
+      const role = enumOf(p, 'role', ['fix', 'review'] as const, "attempt next-seat '--role'");
+      const attempt = await rt.execution.attemptRepository.findAttemptById(attemptId);
+      if (attempt === null) {
+        return { outcome: 'refused', reason: 'Attempt not found: ' + attemptId };
+      }
+      if (!attempt.seatPlan) {
+        return { outcome: 'refused', reason: 'Attempt ' + attemptId + ' carries no seat plan' };
+      }
+      const created = SeatPlan.create(attempt.seatPlan);
+      if (!created.success || created.value === undefined) {
+        return { outcome: 'refused', reason: 'Attempt ' + attemptId + ' carries an invalid seat plan' };
+      }
+      const lane = [...(await rt.execution.attemptRepository.listAttemptsByWorkOrder(attempt.workOrderId))].sort(
+        (left, right) => left.createdAtIso.localeCompare(right.createdAtIso),
+      );
+      const unhealthySeatIds = unhealthySeatIdsOf(derivedV2Model(rt));
+      const selection =
+        role === 'fix'
+          ? selectSeat({
+              plan: created.value,
+              role: 'fix',
+              history: lane.map(historyEntryOf),
+              unhealthySeatIds,
+            })
+          : selectReviewSeat({
+              plan: created.value,
+              round: attempt.fixNumber,
+              implementerModels: lane
+                .map((record) => record.runner?.model ?? null)
+                .filter((model): model is string => typeof model === 'string' && model.trim() !== ''),
+              sameFamily: (left, right) => isSameModelFamily(evidenceFamily(left), evidenceFamily(right)),
+              unhealthySeatIds,
+            });
+      if (!selection.ok) {
+        return { outcome: 'refused', reason: selection.reason };
+      }
+      return { outcome: 'selected', role, seatIndex: selection.seatIndex, seat: selection.seat };
+    },
     accept: async (p, rt) => {
       const attemptId = str(p, 'attemptId');
       const attempt = await rt.execution.attemptRepository.findAttemptById(attemptId);
@@ -1840,6 +1967,11 @@ ok, missing, unreadable or invalid record per file; it never writes. state
 restore replaces a missing or unreadable store from a quarantine copy after
 confirmation; it is CLI only.
 
+A seat plan lists ordered seats per role (first-pass, fix, review). brief
+prepare --seatPlanFromInstallation builds it from the installation's chains;
+attempt fix rotates to the next eligible fix seat and skips seats whose
+health is unhealthy; attempt next-seat --role fix|review shows the next one.
+
 Commands:
   work-order register|inspect
   doctor [--probe-seats] [--host <name>] [--json]
@@ -1848,9 +1980,9 @@ Commands:
   projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
   state check|restore
-  brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]']
+  brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
-  attempt dispatch|reconcile|stop|collect|usage|fix|accept
+  attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept
   forge execute
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede

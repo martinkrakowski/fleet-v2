@@ -13,13 +13,26 @@ import { GH_BINARY_CANDIDATES, resolveGhBinary } from "./gh-binary";
 import { withFileLock, writeJsonAtomically } from "./file-store";
 
 import {
+  AttemptRepositoryAdapter,
+  AttemptReviewLocator,
+  ExecutorForHost,
   consumptionId,
+  defaultOcmRunPath,
   forgeActionScope,
   observationEventKind,
+  resolveRoleExecutors,
   type AttemptOwnerDecisionDelegate as WorkAttemptOwnerDecisionDelegate,
   type OwnerDecisionDelegate as WorkOwnerDecisionDelegate,
 } from "@fleet/work-execution";
-import { assessmentIdForAttempt } from "@fleet/evidence-and-acceptance";
+import {
+  assessmentIdForAttempt,
+  createReviewTransportRouter,
+  hasReviewerSeat,
+  type IndependentReviewTransportResult,
+  type OcmReviewTransportSpawn,
+  type RunIndependentReviewRequest,
+  selectReviewerSeat,
+} from "@fleet/evidence-and-acceptance";
 import type {
   AttemptOwnerDecisionDelegate as EvidenceAttemptOwnerDecisionDelegate,
   OwnerDecisionDelegate as EvidenceOwnerDecisionDelegate,
@@ -29,7 +42,7 @@ import type {
   InspectWorkOrderUseCase,
 } from "@fleet/work-execution/use-cases";
 
-import type { FleetInstallation } from "@fleet/installation";
+import { requireValidInstallationModel, type FleetInstallation } from "@fleet/installation";
 
 import { configureEvidenceUseCases, createConfiguredEvidenceUseCases } from "./evidence/composition";
 import {
@@ -43,6 +56,7 @@ import {
 import {
   configureWorkComposition,
   createConfiguredWorkComposition,
+  resolveWorkRunnerSettings,
   type WorkCrossContextDelegates,
 } from "./work/composition";
 
@@ -51,6 +65,8 @@ export interface FleetApiRuntimeOptions {
   readonly stateDir?: string;
   readonly ownerPublicKey?: string;
   readonly installation?: FleetInstallation;
+  /** Spy transport for the review subprocess (tests only); production runs ocm-run. */
+  readonly reviewSpawn?: OcmReviewTransportSpawn;
 }
 
 /** Whether `path` is an executable regular file (S4036: absolute gh only). */
@@ -262,6 +278,73 @@ export function getChangeFeed(): ChangeFeed | null {
   return changeFeed;
 }
 
+/**
+ * The independent review transport for the installation's reviewer seat, or
+ * undefined when the installation names no reviewer (requests then report
+ * that no transport is configured). The locator reads the attempt record and
+ * runs read-only git through the attempt's recorded host, like the work
+ * context's own reads; a v2 installation's hosts are the only routing source.
+ */
+function buildReviewTransport(
+  stateDir: string | undefined,
+  installation: FleetInstallation | undefined,
+  reviewSpawn: OcmReviewTransportSpawn | undefined,
+) {
+  let model: ReturnType<typeof requireValidInstallationModel> | undefined;
+  if (installation !== undefined) {
+    model = requireValidInstallationModel(installation);
+  }
+  const seats = model?.seats ?? [];
+  const chains = model?.chains;
+  if (!hasReviewerSeat(seats, chains)) {
+    return undefined;
+  }
+  const settings = resolveWorkRunnerSettings({ installation });
+  const executorForHost = new ExecutorForHost({
+    hosts: installation?.hosts,
+    legacyExecutor: resolveRoleExecutors(installation, {
+      worktreeSshHost: settings.worktreeSshHost,
+    }).worktree,
+  });
+  const attempts = new AttemptRepositoryAdapter({ stateDir });
+  const locator = new AttemptReviewLocator({
+    findAttempt: (id) => attempts.findAttemptById(id),
+    executorForHost,
+    hosts: installation?.hosts,
+    legacyRoute: {
+      ...(settings.runnerRemotePort !== undefined ? { remotePort: settings.runnerRemotePort } : {}),
+      ...(settings.runnerRemoteHost !== undefined ? { remoteHost: settings.runnerRemoteHost } : {}),
+    },
+  });
+  const router = createReviewTransportRouter({
+    seats,
+    chains,
+    locate: (attemptId) => locator.locate(attemptId),
+    ocmRunBin: settings.ocmRunBin ?? defaultOcmRunPath(),
+    ...(reviewSpawn !== undefined ? { ocmSpawn: reviewSpawn } : {}),
+  });
+  // The locator and the transports can fail with messages that name the attempt's recorded host,
+  // its worktree path or subprocess stderr. The repository is public, so only seat selection's
+  // own refusal passes through; every other failure becomes one fixed, host-free reason.
+  return async (
+    request: RunIndependentReviewRequest,
+  ): Promise<IndependentReviewTransportResult> => {
+    // Seat selection reads only the installation's seats and chains, so its refusal is fixed,
+    // host-free text and reaches the caller as it is.
+    const selected = selectReviewerSeat(seats, chains, request.reviewerModel);
+    if (!selected.ok) {
+      throw new Error(selected.reason);
+    }
+    try {
+      return await router(request);
+    } catch {
+      // Any later failure reaches an API caller as one fixed, host-free reason: locator and
+      // subprocess errors can carry hosts, paths, stderr or tokens, and the repository is public.
+      throw new Error("review transport unavailable");
+    }
+  };
+}
+
 export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null): void {
   watcher?.stop();
   watcher = null;
@@ -346,8 +429,14 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
       return { outcome: "recorded", ownerDecisionReferences: recorded };
     },
   };
+  const runReview = buildReviewTransport(stateDir, installation, options?.reviewSpawn);
   const evidence = createConfiguredEvidenceUseCases(
-    { stateDir, installation, forgeGhRunner: runGhSubprocess },
+    {
+      stateDir,
+      installation,
+      forgeGhRunner: runGhSubprocess,
+      ...(runReview !== undefined ? { runReview } : {}),
+    },
     {
       ownerDecision: ownerDecisionDelegate,
       attemptOwnerDecision: attemptOwnerDecisionDelegate,

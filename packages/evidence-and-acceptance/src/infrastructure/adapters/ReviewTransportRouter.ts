@@ -1,7 +1,8 @@
 /**
  * Review transport router: picks the installation's reviewer seat for the
  * requested reviewer model and dispatches to the transport for that seat's
- * tool.
+ * tool. opencode seats go through `ocm-run`; `grok` seats through the CLI
+ * transport.
  *
  * A seat is chosen only from the reviewer and high-risk-reviewer chains, and
  * only by an exact model match. `--agent reviewer` is the default from
@@ -11,6 +12,8 @@
  */
 
 import type { RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
+import { CLI_REVIEW_ARGV_TEMPLATES, createCliReviewTransport } from './CliReviewTransport.adapter.js';
+import type { CliReviewSpawn } from './CliReviewTransport.adapter.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
 import { createOcmReviewTransport } from './OcmReviewTransport.adapter.js';
 import type { OcmReviewTransportSpawn } from './OcmReviewTransport.adapter.js';
@@ -137,6 +140,8 @@ export interface ReviewTransportRouterOptions {
   /** Test seams. */
   readonly ocmSpawn?: OcmReviewTransportSpawn;
   readonly makeNonce?: () => string;
+  readonly cliSpawn?: CliReviewSpawn;
+  readonly makeScratchDir?: () => Promise<string>;
 }
 
 export const DEFAULT_REVIEW_AGENT = 'reviewer';
@@ -153,6 +158,15 @@ export function createReviewTransportRouter(
     const seat = selected.seat;
     const location = await options.locate(request.attemptId);
 
+    if (Object.hasOwn(CLI_REVIEW_ARGV_TEMPLATES, seat.tool)) {
+      if (seat.variant !== undefined) {
+        throw new Error(
+          `Reviewer seat '${seat.id}' sets a variant, which the ${seat.tool} review transport does not support`,
+        );
+      }
+      return runCli(options, seat, location, request);
+    }
+
     switch (seat.tool) {
       case 'opencode':
         return runOpencode(options, seat, location, request);
@@ -162,6 +176,24 @@ export function createReviewTransportRouter(
         );
     }
   };
+}
+
+function runCli(
+  options: ReviewTransportRouterOptions,
+  seat: ReviewTransportSeat,
+  location: ReviewLocation,
+  request: RunIndependentReviewRequest,
+): Promise<IndependentReviewTransportResult> {
+  const transport = createCliReviewTransport({
+    argvTemplate: CLI_REVIEW_ARGV_TEMPLATES[seat.tool],
+    model: seat.model,
+    location,
+    ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    ...(options.makeNonce !== undefined ? { makeNonce: options.makeNonce } : {}),
+    ...(options.cliSpawn !== undefined ? { spawn: options.cliSpawn } : {}),
+    ...(options.makeScratchDir !== undefined ? { makeScratchDir: options.makeScratchDir } : {}),
+  });
+  return transport(request);
 }
 
 function runOpencode(

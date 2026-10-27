@@ -92,6 +92,8 @@ describe('GROK_TOOL', () => {
       '{model}',
       '--permission-mode',
       'plan',
+      '--disable-web-search',
+      '-p',
       '{prompt}',
     ]);
     expect(GROK_TOOL.costSource).toBe('pay-per-token');

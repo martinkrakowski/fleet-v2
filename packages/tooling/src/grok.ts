@@ -45,9 +45,10 @@ function parseGrokModels(output: string): ModelListResult {
 
 /**
  * The Grok CLI as fleet invokes it: a reviewer in `--permission-mode plan`,
- * which neither writes nor runs commands. The template pins plan mode, so a
- * grok seat is read-only (`canRunCommands: false`, `readOnlyMode: true`)
- * and needs no allow rules.
+ * which neither writes nor runs commands, and `--disable-web-search`, and `-p` (single-turn, prints and exits; a positional prompt would start the interactive session instead), which
+ * removes web search and web fetch. The template pins plan mode, so a grok
+ * seat is read-only (`canRunCommands: false`, `readOnlyMode: true`) and
+ * needs no allow rules.
  */
 export const GROK_TOOL: ToolDescriptor = {
   id: 'grok',
@@ -68,7 +69,7 @@ export const GROK_TOOL: ToolDescriptor = {
     headless: true,
   },
   invocation: {
-    argvTemplate: ['grok', '-m', '{model}', '--permission-mode', 'plan', '{prompt}'],
+    argvTemplate: ['grok', '-m', '{model}', '--permission-mode', 'plan', '--disable-web-search', '-p', '{prompt}'],
   },
   costSource: 'pay-per-token',
 };

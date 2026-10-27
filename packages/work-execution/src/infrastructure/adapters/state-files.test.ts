@@ -12,6 +12,7 @@ import { WORK_EXECUTION_STATE_FILES } from './state-files.js';
 import { WorkOrderRepositoryAdapter } from './WorkOrderRepositoryAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from './AttemptRepositoryAdapter.adapter.js';
 import { ExecutionJournalAdapter } from './ExecutionJournalAdapter.adapter.js';
+import { LaneRunRepositoryAdapter } from './LaneRunRepositoryAdapter.adapter.js';
 
 const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
   'work-orders.json': [
@@ -40,6 +41,40 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
     { id: 'rs-1', attemptId: 'a' },
     { id: 'rs-2', attemptId: 'a' },
   ],
+  'lane-runs.json': [
+    {
+      version: 1,
+      runId: 'run-01JB0000000000000000000000',
+      workOrderId: 'wo-example-1',
+      tier: 2,
+      seatPlanRef: 'a'.repeat(64),
+      cursors: { 'first-pass': 0, fix: null, review: null },
+      round: 0,
+      attemptIds: ['attempt-example-1'],
+      prNumber: null,
+      parked: null,
+      parkCount: 0,
+      lease: null,
+      revision: 1,
+      runPolicyRevision: 'policy-example-1',
+    },
+    {
+      version: 1,
+      runId: 'run-01JB0000000000000000000001',
+      workOrderId: 'wo-example-2',
+      tier: 2,
+      seatPlanRef: 'b'.repeat(64),
+      cursors: { 'first-pass': null, fix: null, review: null },
+      round: 0,
+      attemptIds: [],
+      prNumber: null,
+      parked: null,
+      parkCount: 0,
+      lease: null,
+      revision: 1,
+      runPolicyRevision: 'policy-example-2',
+    },
+  ],
 };
 
 const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
@@ -50,6 +85,7 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
     new ExecutionJournalAdapter({ stateDir }).listJournalEntriesForAttempt('a'),
   'reservations.json': (stateDir) =>
     new ExecutionJournalAdapter({ stateDir }).listActiveReservations(),
+  'lane-runs.json': (stateDir) => new LaneRunRepositoryAdapter({ stateDir }).list(),
 };
 
 type FixtureKind = 'valid' | 'not-json' | 'not-list' | 'bad-record';
@@ -121,6 +157,7 @@ describe('work-execution state file descriptors match the store readers', () => 
       'attempts.json',
       'journal.json',
       'reservations.json',
+      'lane-runs.json',
     ]);
   });
 });

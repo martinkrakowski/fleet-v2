@@ -27,6 +27,27 @@ function fakeSecretShape(): string {
   return `gh${'p_'}${'A'.repeat(30)}`;
 }
 
+/**
+ * Request builders: the default holder, fence and times each decision accepts,
+ * with per-test overrides. The three shapes stay separate so no builder ever
+ * carries a key the corresponding reader would refuse.
+ */
+function acquireRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    holderId: 'driver-example-1',
+    observedFence: 0,
+    leaseUntilIso: IN_2_MIN,
+    nowIso: NOW,
+    ...overrides,
+  };
+}
+function holdRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { holderId: 'driver-example-1', fence: 3, nowIso: NOW, ...overrides };
+}
+function renewRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { ...holdRequest(), leaseUntilIso: IN_2_MIN, ...overrides };
+}
+
 describe('lease constants', () => {
   it('labels the five refusals', () => {
     expect(LEASE_REFUSALS).toEqual([
@@ -41,44 +62,24 @@ describe('lease constants', () => {
 
 describe('decideLeaseAcquire', () => {
   it('acquires from null with fence 1', () => {
-    const decision = decideLeaseAcquire(null, {
-      holderId: 'driver-example-1',
-      observedFence: 0,
-      leaseUntilIso: IN_2_MIN,
-      nowIso: NOW,
-    });
+    const decision = decideLeaseAcquire(null, acquireRequest());
     expect(decision).toEqual({ ok: true, lease: { holderId: 'driver-example-1', fence: 1, leaseUntilIso: IN_2_MIN } });
   });
 
   it('acquires over an expired lease raising the fence to 4 with the new holder', () => {
     const expired: LaneRunLeaseRecord = { holderId: 'driver-old', fence: 3, leaseUntilIso: NOW };
-    const decision = decideLeaseAcquire(expired, {
-      holderId: 'driver-new',
-      observedFence: 3,
-      leaseUntilIso: IN_2_MIN,
-      nowIso: NOW,
-    });
+    const decision = decideLeaseAcquire(expired, acquireRequest({ holderId: 'driver-new', observedFence: 3 }));
     expect(decision).toEqual({ ok: true, lease: { holderId: 'driver-new', fence: 4, leaseUntilIso: IN_2_MIN } });
   });
 
   it('refuses over a live lease even with a stale observed fence', () => {
-    const decision = decideLeaseAcquire(LEASE, {
-      holderId: 'driver-another',
-      observedFence: 2,
-      leaseUntilIso: IN_2_MIN,
-      nowIso: NOW,
-    });
+    const decision = decideLeaseAcquire(LEASE, acquireRequest({ holderId: 'driver-another', observedFence: 2 }));
     expect(decision).toEqual({ ok: false, reason: 'lease-held' });
   });
 
   it('refuses when the observed fence is not the current fence of an expired lease', () => {
     const expired: LaneRunLeaseRecord = { holderId: 'driver-example-1', fence: 3, leaseUntilIso: NOW };
-    const decision = decideLeaseAcquire(expired, {
-      holderId: 'driver-example-1',
-      observedFence: 2,
-      leaseUntilIso: IN_2_MIN,
-      nowIso: NOW,
-    });
+    const decision = decideLeaseAcquire(expired, acquireRequest({ observedFence: 2 }));
     expect(decision).toEqual({ ok: false, reason: 'lease-moved' });
   });
 
@@ -87,94 +88,66 @@ describe('decideLeaseAcquire', () => {
     ['2026-10-27T09:59:00.000Z'],
     [IN_11_MIN],
   ])('refuses a leaseUntilIso outside the window (%s)', (leaseUntilIso) => {
-    const decision = decideLeaseAcquire(null, {
-      holderId: 'driver-example-1',
-      observedFence: 0,
-      leaseUntilIso,
-      nowIso: NOW,
-    });
+    const decision = decideLeaseAcquire(null, acquireRequest({ leaseUntilIso }));
     expect(decision).toEqual({ ok: false, reason: 'invalid-request' });
   });
 
   it('counts a lease whose leaseUntilIso equals NOW as expired', () => {
     const atNow: LaneRunLeaseRecord = { holderId: 'driver-example-1', fence: 3, leaseUntilIso: NOW };
-    const decision = decideLeaseAcquire(atNow, {
-      holderId: 'driver-example-1',
-      observedFence: 3,
-      leaseUntilIso: IN_2_MIN,
-      nowIso: NOW,
-    });
+    const decision = decideLeaseAcquire(atNow, acquireRequest({ observedFence: 3 }));
     expect(decision).toEqual({ ok: true, lease: { holderId: 'driver-example-1', fence: 4, leaseUntilIso: IN_2_MIN } });
   });
 
   it('two drivers with one expired lease: first acquires, second is lease-held, stale fence later is lease-moved', () => {
     const expired: LaneRunLeaseRecord = { holderId: 'driver-a', fence: 3, leaseUntilIso: NOW };
-    const first = decideLeaseAcquire(expired, {
-      holderId: 'driver-a',
-      observedFence: 3,
-      leaseUntilIso: IN_2_MIN,
-      nowIso: NOW,
-    });
+    const first = decideLeaseAcquire(expired, acquireRequest({ holderId: 'driver-a', observedFence: 3 }));
     expect(first).toEqual({ ok: true, lease: { holderId: 'driver-a', fence: 4, leaseUntilIso: IN_2_MIN } });
     if (!first.ok) return;
 
-    const second = decideLeaseAcquire(first.lease, {
-      holderId: 'driver-b',
-      observedFence: 3,
-      leaseUntilIso: IN_2_MIN,
-      nowIso: NOW,
-    });
+    const second = decideLeaseAcquire(first.lease, acquireRequest({ holderId: 'driver-b', observedFence: 3 }));
     expect(second).toEqual({ ok: false, reason: 'lease-held' });
 
     const lapsed = decideLeaseAcquire(
       { ...first.lease, leaseUntilIso: NOW },
-      {
-        holderId: 'driver-b',
-        observedFence: 3,
-        leaseUntilIso: IN_2_MIN,
-        nowIso: NOW,
-      },
+      acquireRequest({ holderId: 'driver-b', observedFence: 3 }),
     );
     expect(lapsed).toEqual({ ok: false, reason: 'lease-moved' });
   });
 });
 
 describe('decideLeaseRenew', () => {
-  const RENEW = { holderId: 'driver-example-1', fence: 3, leaseUntilIso: IN_2_MIN, nowIso: NOW };
   const IN_5_MIN = '2026-10-27T10:05:00.000Z';
 
   it('renews with the same fence and a new time', () => {
-    const decision = decideLeaseRenew(LEASE, { ...RENEW, leaseUntilIso: IN_5_MIN });
+    const decision = decideLeaseRenew(LEASE, renewRequest({ leaseUntilIso: IN_5_MIN }));
     expect(decision).toEqual({ ok: true, lease: { holderId: 'driver-example-1', fence: 3, leaseUntilIso: IN_5_MIN } });
   });
 
   it('refuses another holder', () => {
-    const decision = decideLeaseRenew(LEASE, { ...RENEW, holderId: 'driver-another' });
+    const decision = decideLeaseRenew(LEASE, renewRequest({ holderId: 'driver-another' }));
     expect(decision).toEqual({ ok: false, reason: 'lease-not-held' });
   });
 
   it('refuses another fence', () => {
-    const decision = decideLeaseRenew(LEASE, { ...RENEW, fence: 2 });
+    const decision = decideLeaseRenew(LEASE, renewRequest({ fence: 2 }));
     expect(decision).toEqual({ ok: false, reason: 'lease-not-held' });
   });
 
   it('refuses an expired lease', () => {
     const expired: LaneRunLeaseRecord = { holderId: 'driver-example-1', fence: 3, leaseUntilIso: NOW };
-    const decision = decideLeaseRenew(expired, { ...RENEW, nowIso: '2026-10-27T10:01:00.000Z' });
+    const decision = decideLeaseRenew(expired, renewRequest({ nowIso: '2026-10-27T10:01:00.000Z' }));
     expect(decision).toEqual({ ok: false, reason: 'lease-expired' });
   });
 
   it('refuses a null lease', () => {
-    const decision = decideLeaseRenew(null, RENEW);
+    const decision = decideLeaseRenew(null, renewRequest());
     expect(decision).toEqual({ ok: false, reason: 'lease-not-held' });
   });
 });
 
 describe('decideLeaseRelease', () => {
-  const RELEASE = { holderId: 'driver-example-1', fence: 3, nowIso: NOW };
-
   it('ends a live lease now, keeping holder and fence', () => {
-    const decision = decideLeaseRelease(LEASE, RELEASE);
+    const decision = decideLeaseRelease(LEASE, holdRequest());
     expect(decision).toEqual({ ok: true, lease: { holderId: 'driver-example-1', fence: 3, leaseUntilIso: NOW } });
   });
 
@@ -184,43 +157,36 @@ describe('decideLeaseRelease', () => {
       fence: 3,
       leaseUntilIso: '2026-10-27T09:58:00.000Z',
     };
-    const decision = decideLeaseRelease(expired, RELEASE);
+    const decision = decideLeaseRelease(expired, holdRequest());
     expect(decision).toEqual({ ok: true, lease: expired });
   });
 
   it('refuses a wrong fence', () => {
-    const decision = decideLeaseRelease(LEASE, { ...RELEASE, fence: 2 });
+    const decision = decideLeaseRelease(LEASE, holdRequest({ fence: 2 }));
     expect(decision).toEqual({ ok: false, reason: 'lease-not-held' });
   });
 
   it('lets another holder acquire at fence 4 after the release', () => {
-    const released = decideLeaseRelease(LEASE, RELEASE);
+    const released = decideLeaseRelease(LEASE, holdRequest());
     expect(released.ok).toBe(true);
     if (!released.ok) return;
-    const acquired = decideLeaseAcquire(released.lease, {
-      holderId: 'driver-another',
-      observedFence: 3,
-      leaseUntilIso: IN_2_MIN,
-      nowIso: NOW,
-    });
+    const acquired = decideLeaseAcquire(released.lease, acquireRequest({ holderId: 'driver-another', observedFence: 3 }));
     expect(acquired).toEqual({ ok: true, lease: { holderId: 'driver-another', fence: 4, leaseUntilIso: IN_2_MIN } });
   });
 });
 
 describe('checkLeaseHeld', () => {
-  const HELD = { holderId: 'driver-example-1', fence: 3, nowIso: NOW };
-
   it('returns null for the holder with its fence before expiry', () => {
-    expect(checkLeaseHeld(LEASE, HELD)).toBeNull();
+    expect(checkLeaseHeld(LEASE, holdRequest())).toBeNull();
   });
 
   it('returns lease-expired after expiry', () => {
     const atNow: LaneRunLeaseRecord = { holderId: 'driver-example-1', fence: 3, leaseUntilIso: NOW };
-    expect(checkLeaseHeld(atNow, HELD)).toBe('lease-expired');
+    expect(checkLeaseHeld(atNow, holdRequest())).toBe('lease-expired');
   });
 
   it('returns lease-not-held for a stale fence', () => {
-    expect(checkLeaseHeld(LEASE, { ...HELD, fence: 2 })).toBe('lease-not-held');
+    expect(checkLeaseHeld(LEASE, holdRequest({ fence: 2 }))).toBe('lease-not-held');
   });
 });
 
@@ -248,19 +214,14 @@ describe('hostile lease requests', () => {
   const hostile: Array<() => unknown> = [
     () => null,
     () => [],
-    () => ({ holderId: 'driver-example-1', observedFence: 3, leaseUntilIso: IN_2_MIN, nowIso: NOW, extra: true }),
-    () => ({ holderId: 'driver-example-1', observedFence: 3, leaseUntilIso: IN_2_MIN }),
-    () => ({ holderId: 'driver-example-1', fence: 1.5, leaseUntilIso: IN_2_MIN, nowIso: NOW }),
-    () => ({ holderId: 'driver-example-1', observedFence: -1, leaseUntilIso: IN_2_MIN, nowIso: NOW }),
-    () => ({ holderId: 'driver-example-1', observedFence: 3, leaseUntilIso: IN_2_MIN, nowIso: '2026-10-27T10:00:00' }),
-    () => ({ holderId: 'driver-example-1', observedFence: 3, leaseUntilIso: IN_2_MIN, nowIso: '2026-02-31T10:00:00Z' }),
+    () => acquireRequest({ observedFence: 3, extra: true }),
+    () => acquireRequest({ nowIso: undefined }),
+    () => renewRequest({ fence: 1.5 }),
+    () => acquireRequest({ observedFence: -1 }),
+    () => acquireRequest({ nowIso: '2026-10-27T10:00:00' }),
+    () => acquireRequest({ nowIso: '2026-02-31T10:00:00Z' }),
     () => {
-      const record: Record<string, unknown> = {
-        holderId: 'driver-example-1',
-        observedFence: 3,
-        leaseUntilIso: IN_2_MIN,
-        nowIso: NOW,
-      };
+      const record = acquireRequest({ observedFence: 3 }) as Record<string, unknown>;
       Object.defineProperty(record, 'nowIso', {
         get() {
           throw new Error('boom');
@@ -269,15 +230,12 @@ describe('hostile lease requests', () => {
       });
       return record;
     },
-    () => new Proxy(
-      { holderId: 'driver-example-1', observedFence: 3, leaseUntilIso: IN_2_MIN, nowIso: NOW },
-      {
-        ownKeys() {
-          throw new Error('boom');
-        },
+    () => new Proxy(acquireRequest({ observedFence: 3 }), {
+      ownKeys() {
+        throw new Error('boom');
       },
-    ),
-    () => ({ holderId: fakeSecretShape(), observedFence: 3, leaseUntilIso: IN_2_MIN, nowIso: NOW }),
+    }),
+    () => acquireRequest({ observedFence: 3, holderId: fakeSecretShape() }),
   ];
 
   it('never throws and refuses every hostile request with invalid-request', () => {

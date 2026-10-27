@@ -82,7 +82,7 @@ function readPlainObject(value: unknown, keys: readonly string[]): Record<string
       return null;
     }
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor === undefined || !descriptor.enumerable) {
+    if (!descriptor?.enumerable) {
       return null;
     }
     out[key] = descriptor.value;
@@ -148,75 +148,85 @@ function withinLeaseWindow(leaseUntilIso: string, nowIso: string): boolean {
   return until > now && until - now <= LANE_RUN_LEASE_MAX_MS;
 }
 
-function readAcquireRequest(request: unknown): LeaseAcquireRequest | null {
+/** A safe integer of at least `minimum`: the shared fence rule of every reader. */
+function isFence(value: unknown, minimum: number): boolean {
+  return Number.isSafeInteger(value) && (value as number) >= minimum;
+}
+
+/** The holder id is valid and every named field is a zoned ISO time. */
+function hasValidHolderAndIsoTimes(
+  snapshot: Record<string, unknown>,
+  isoFields: readonly string[],
+): boolean {
+  return isValidHolderId(snapshot.holderId) && isoFields.every((field) => isZonedIso(snapshot[field]));
+}
+
+/**
+ * The shared front half of every request reader: read the plain-object
+ * snapshot, then validate the holder and the ISO time fields. Fence rules
+ * differ per request and stay with each reader.
+ */
+function readRequestSnapshot(
+  request: unknown,
+  keys: readonly string[],
+  isoFields: readonly string[],
+): Record<string, unknown> | null {
   try {
-    const snapshot = readPlainObject(request, ACQUIRE_KEYS);
-    if (snapshot === null || !isValidHolderId(snapshot.holderId)) {
+    const snapshot = readPlainObject(request, keys);
+    if (snapshot === null || !hasValidHolderAndIsoTimes(snapshot, isoFields)) {
       return null;
     }
-    const observedFence = snapshot.observedFence;
-    if (!Number.isSafeInteger(observedFence) || (observedFence as number) < 0) {
-      return null;
-    }
-    if (!isZonedIso(snapshot.leaseUntilIso) || !isZonedIso(snapshot.nowIso)) {
-      return null;
-    }
-    return {
-      holderId: snapshot.holderId as string,
-      observedFence: observedFence as number,
-      leaseUntilIso: snapshot.leaseUntilIso as string,
-      nowIso: snapshot.nowIso as string,
-    };
+    return snapshot;
   } catch {
     return null;
   }
+}
+
+/** True when the holder and fence name the current lease (null never matches). */
+function holdsCurrentLease(
+  current: LaneRunLeaseRecord | null,
+  holderId: string,
+  fence: number,
+): current is LaneRunLeaseRecord {
+  return current?.holderId === holderId && current?.fence === fence;
+}
+
+function readAcquireRequest(request: unknown): LeaseAcquireRequest | null {
+  const snapshot = readRequestSnapshot(request, ACQUIRE_KEYS, ['leaseUntilIso', 'nowIso']);
+  if (snapshot === null || !isFence(snapshot.observedFence, 0)) {
+    return null;
+  }
+  return {
+    holderId: snapshot.holderId as string,
+    observedFence: snapshot.observedFence as number,
+    leaseUntilIso: snapshot.leaseUntilIso as string,
+    nowIso: snapshot.nowIso as string,
+  };
 }
 
 function readRenewRequest(request: unknown): LeaseRenewRequest | null {
-  try {
-    const snapshot = readPlainObject(request, RENEW_KEYS);
-    if (snapshot === null || !isValidHolderId(snapshot.holderId)) {
-      return null;
-    }
-    const fence = snapshot.fence;
-    if (!Number.isSafeInteger(fence) || (fence as number) < 1) {
-      return null;
-    }
-    if (!isZonedIso(snapshot.leaseUntilIso) || !isZonedIso(snapshot.nowIso)) {
-      return null;
-    }
-    return {
-      holderId: snapshot.holderId as string,
-      fence: fence as number,
-      leaseUntilIso: snapshot.leaseUntilIso as string,
-      nowIso: snapshot.nowIso as string,
-    };
-  } catch {
+  const snapshot = readRequestSnapshot(request, RENEW_KEYS, ['leaseUntilIso', 'nowIso']);
+  if (snapshot === null || !isFence(snapshot.fence, 1)) {
     return null;
   }
+  return {
+    holderId: snapshot.holderId as string,
+    fence: snapshot.fence as number,
+    leaseUntilIso: snapshot.leaseUntilIso as string,
+    nowIso: snapshot.nowIso as string,
+  };
 }
 
 function readHoldRequest(request: unknown): LeaseHoldRequest | null {
-  try {
-    const snapshot = readPlainObject(request, HOLD_KEYS);
-    if (snapshot === null || !isValidHolderId(snapshot.holderId)) {
-      return null;
-    }
-    const fence = snapshot.fence;
-    if (!Number.isSafeInteger(fence) || (fence as number) < 1) {
-      return null;
-    }
-    if (!isZonedIso(snapshot.nowIso)) {
-      return null;
-    }
-    return {
-      holderId: snapshot.holderId as string,
-      fence: fence as number,
-      nowIso: snapshot.nowIso as string,
-    };
-  } catch {
+  const snapshot = readRequestSnapshot(request, HOLD_KEYS, ['nowIso']);
+  if (snapshot === null || !isFence(snapshot.fence, 1)) {
     return null;
   }
+  return {
+    holderId: snapshot.holderId as string,
+    fence: snapshot.fence as number,
+    nowIso: snapshot.nowIso as string,
+  };
 }
 
 export function decideLeaseAcquire(current: LaneRunLeaseRecord | null, request: unknown): LeaseDecision {
@@ -256,7 +266,7 @@ export function decideLeaseRenew(current: LaneRunLeaseRecord | null, request: un
   if (!withinLeaseWindow(parsed.leaseUntilIso, parsed.nowIso)) {
     return { ok: false, reason: 'invalid-request' };
   }
-  if (current === null || current.holderId !== parsed.holderId || current.fence !== parsed.fence) {
+  if (!holdsCurrentLease(current, parsed.holderId, parsed.fence)) {
     return { ok: false, reason: 'lease-not-held' };
   }
   if (isExpired(current, parsed.nowIso)) {
@@ -277,7 +287,7 @@ export function decideLeaseRelease(current: LaneRunLeaseRecord | null, request: 
   if (parsed === null) {
     return { ok: false, reason: 'invalid-request' };
   }
-  if (current === null || current.holderId !== parsed.holderId || current.fence !== parsed.fence) {
+  if (!holdsCurrentLease(current, parsed.holderId, parsed.fence)) {
     return { ok: false, reason: 'lease-not-held' };
   }
   if (isExpired(current, parsed.nowIso)) {
@@ -306,7 +316,7 @@ export function checkLeaseHeld(current: LaneRunLeaseRecord | null, request: unkn
   if (parsed === null) {
     return 'invalid-request';
   }
-  if (current === null || current.holderId !== parsed.holderId || current.fence !== parsed.fence) {
+  if (!holdsCurrentLease(current, parsed.holderId, parsed.fence)) {
     return 'lease-not-held';
   }
   if (isExpired(current, parsed.nowIso)) {
@@ -359,7 +369,7 @@ export function readConductorDriverLease(input: unknown): ConductorDriverLeaseRe
     if (holderIdMessage !== null) {
       return { ok: false, error: holderIdMessage };
     }
-    if (!Number.isSafeInteger(snapshot.fence) || (snapshot.fence as number) < 1) {
+    if (!isFence(snapshot.fence, 1)) {
       return { ok: false, error: 'ConductorDriverLease fence must be a positive integer' };
     }
     if (!isZonedIso(snapshot.leaseUntilIso)) {

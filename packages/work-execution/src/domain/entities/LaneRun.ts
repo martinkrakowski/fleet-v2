@@ -9,6 +9,7 @@
  * is refused with a fixed message, never echoed.
  */
 
+import { isCalendarDateTime, readExactPlainRecord } from '../plain-record-reads.js';
 import { containsSecretShape } from '@fleet/shared';
 import { LANE_RUN_MAX_PARK_ORDINAL, LANE_RUN_MAX_SEAT_INDEX } from '../lane-run-keys.js';
 import {
@@ -95,7 +96,7 @@ export class LaneRun {
     if (inputPrototype !== Object.prototype && inputPrototype !== null) {
       return invalid('LaneRun requires a record');
     }
-    const recordInput = readPlainObject(input, RECORD_KEYS);
+    const recordInput = readExactPlainRecord(input, RECORD_KEYS);
     if (recordInput === null) {
       return invalid('LaneRun has an unknown key');
     }
@@ -117,7 +118,7 @@ export class LaneRun {
       return invalid('LaneRun seatPlanRef must be a sha256 hex digest');
     }
 
-    const cursorsSnapshot = readPlainObject(recordInput.cursors, SEAT_PLAN_ROLES);
+    const cursorsSnapshot = readExactPlainRecord(recordInput.cursors, SEAT_PLAN_ROLES);
     const cursorsError = cursorsSnapshotError(cursorsSnapshot);
     if (cursorsError !== null) {
       return invalid(cursorsError);
@@ -153,7 +154,7 @@ export class LaneRun {
 
     let parked: LaneRunParkRecord | null = null;
     if (recordInput.parked !== null) {
-      const parkedSnapshot = readPlainObject(recordInput.parked, PARKED_KEYS);
+      const parkedSnapshot = readExactPlainRecord(recordInput.parked, PARKED_KEYS);
       const parkedError = parkedSnapshotError(parkedSnapshot);
       if (parkedError !== null) {
         return invalid(parkedError);
@@ -166,7 +167,7 @@ export class LaneRun {
 
     let lease: LaneRunLeaseRecord | null = null;
     if (recordInput.lease !== null) {
-      const leaseSnapshot = readPlainObject(recordInput.lease, LEASE_KEYS);
+      const leaseSnapshot = readExactPlainRecord(recordInput.lease, LEASE_KEYS);
       const leaseError = leaseSnapshotError(leaseSnapshot);
       if (leaseError !== null) {
         return invalid(leaseError);
@@ -260,38 +261,6 @@ function invalid(message: string): LaneRunResult {
 
 function unreadableInputResult(): LaneRunResult {
   return { success: false, error: new Error('LaneRun input could not be read'), code: 'invalid' };
-}
-
-/**
- * A plain object with exactly the given own enumerable string keys, values
- * read through their own property descriptors (so no getter ever runs).
- * Anything else — a non-object, a prototype outside Object.prototype/null, a
- * missing or extra or non-enumerable key, a symbol key — returns null.
- */
-function readPlainObject(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return null;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    return null;
-  }
-  const ownKeys = Reflect.ownKeys(value);
-  if (ownKeys.length !== keys.length) {
-    return null;
-  }
-  const out: Record<string, unknown> = {};
-  for (const key of ownKeys) {
-    if (typeof key !== 'string' || !keys.includes(key)) {
-      return null;
-    }
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor === undefined || !descriptor.enumerable) {
-      return null;
-    }
-    out[key] = descriptor.value;
-  }
-  return out;
 }
 
 /** A fresh plain array copied by index (no iterator, no species); a non-array is returned unchanged. */
@@ -431,24 +400,6 @@ function leaseSnapshotError(snapshot: Record<string, unknown> | null): string | 
     return 'LaneRun lease must be null or { holderId, fence, leaseUntilIso }';
   }
   return null;
-}
-
-/**
- * True when the date and time fields name a real calendar instant. Date.parse rolls an impossible
- * date such as 02-31 over into the next month instead of refusing it, so the fields are checked here.
- */
-function isCalendarDateTime(iso: string): boolean {
-  const year = Number(iso.slice(0, 4));
-  const month = Number(iso.slice(5, 7));
-  const day = Number(iso.slice(8, 10));
-  const hour = Number(iso.slice(11, 13));
-  const minute = Number(iso.slice(14, 16));
-  const second = Number(iso.slice(17, 19));
-  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) {
-    return false;
-  }
-  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  return day >= 1 && day <= daysInMonth;
 }
 
 function buildLeaseRecord(snapshot: Record<string, unknown>): LaneRunLeaseRecord {

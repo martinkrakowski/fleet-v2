@@ -243,6 +243,57 @@ export interface AutoMergePolicy {
 }
 
 /**
+ * Reaper finding kinds that have a repair (conductor plan §3.9.2, D14). The first four are
+ * record-only; `orphan-session` aborts a session and is destructive. `driverless-run` and
+ * `orphan-worktree` are report-only and have no repair (D15: no worktree removal).
+ */
+export type ConductorReaperRepairKind =
+  | 'dead-attempt'
+  | 'leaked-slot'
+  | 'stale-stop'
+  | 'stale-attention'
+  | 'orphan-session';
+
+/** Per-kind repair opt-ins as written in the file; an absent kind is off. */
+export type ConductorReaperRepairs = Readonly<Partial<Record<ConductorReaperRepairKind, boolean>>>;
+
+/** The v2 `policy.conductor.reaper` section as written; only `enabled` is required. */
+export interface ConductorReaperPolicy {
+  readonly enabled: boolean;
+  readonly intervalMinutes?: number;
+  readonly graceMinutes?: number;
+  readonly staleStopMinutes?: number;
+  readonly repairs?: ConductorReaperRepairs;
+}
+
+/**
+ * The v2 `policy.conductor` section as written (conductor plan §3.7, §3.9). Off unless
+ * `enabled`; only `enabled` is required. It grants nothing by itself: forge actions still
+ * need a policy grant (AM3a), merges also `policy.autoMerge`.
+ */
+export interface ConductorPolicy {
+  readonly enabled: boolean;
+  readonly stopGraceMinutes?: number;
+  readonly reaper?: ConductorReaperPolicy;
+}
+
+/** The effective reaper policy: every field present. */
+export interface ResolvedConductorReaperPolicy {
+  readonly enabled: boolean;
+  readonly intervalMinutes: number;
+  readonly graceMinutes: number;
+  readonly staleStopMinutes: number;
+  readonly repairs: Readonly<Record<ConductorReaperRepairKind, boolean>>;
+}
+
+/** The effective conductor policy: every field present (`resolveConductorPolicy`). */
+export interface ResolvedConductorPolicy {
+  readonly enabled: boolean;
+  readonly stopGraceMinutes: number;
+  readonly reaper: ResolvedConductorReaperPolicy;
+}
+
+/**
  * The v2 `policy` section: shape only. The rules are enforced by the loader
  * itself through `validateSeatPolicy` (lane O5) on every v2 file.
  */
@@ -255,6 +306,8 @@ export interface PolicySection {
   readonly liveTail?: LiveTailPolicy;
   /** Absent means off (`DEFAULT_AUTO_MERGE_POLICY`); read it through `resolveAutoMergePolicy`. */
   readonly autoMerge?: AutoMergePolicy;
+  /** Absent means off (`DEFAULT_CONDUCTOR_POLICY`); read it through `resolveConductorPolicy`. */
+  readonly conductor?: ConductorPolicy;
 }
 
 /** The v2 `shelf` section with the local provider (D1, default). */

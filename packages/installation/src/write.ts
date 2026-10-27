@@ -6,6 +6,7 @@
  */
 
 import { copyDecisions } from './decision-consumers.js';
+import { CONDUCTOR_REAPER_REPAIR_KINDS } from './policy.js';
 import type {
   ChainsSection,
   DecisionsSectionV2,
@@ -180,6 +181,35 @@ function serializePolicy(policy: PolicySection): Record<string, unknown> {
       allowHighRisk: policy.autoMerge.allowHighRisk,
       onBlocked: policy.autoMerge.onBlocked,
     };
+  }
+  if (policy.conductor !== undefined) {
+    const conductor: Record<string, unknown> = { enabled: policy.conductor.enabled };
+    if (policy.conductor.stopGraceMinutes !== undefined) {
+      conductor.stopGraceMinutes = policy.conductor.stopGraceMinutes;
+    }
+    if (policy.conductor.reaper !== undefined) {
+      const reaper: Record<string, unknown> = { enabled: policy.conductor.reaper.enabled };
+      if (policy.conductor.reaper.intervalMinutes !== undefined) {
+        reaper.intervalMinutes = policy.conductor.reaper.intervalMinutes;
+      }
+      if (policy.conductor.reaper.graceMinutes !== undefined) {
+        reaper.graceMinutes = policy.conductor.reaper.graceMinutes;
+      }
+      if (policy.conductor.reaper.staleStopMinutes !== undefined) {
+        reaper.staleStopMinutes = policy.conductor.reaper.staleStopMinutes;
+      }
+      if (policy.conductor.reaper.repairs !== undefined) {
+        const repairs: Record<string, unknown> = {};
+        for (const kind of CONDUCTOR_REAPER_REPAIR_KINDS) {
+          if (policy.conductor.reaper.repairs[kind] !== undefined) {
+            repairs[kind] = policy.conductor.reaper.repairs[kind];
+          }
+        }
+        reaper.repairs = repairs;
+      }
+      conductor.reaper = reaper;
+    }
+    out.conductor = conductor;
   }
   return out;
 }

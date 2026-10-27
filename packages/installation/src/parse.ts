@@ -9,6 +9,9 @@ import type {
   ChainStep,
   ChainTrigger,
   ChainsSection,
+  ConductorPolicy,
+  ConductorReaperPolicy,
+  ConductorReaperRepairs,
   CostClass,
   CoverageReaderName,
   CoverageUnitKind,
@@ -39,6 +42,8 @@ import type {
   WavesSection,
   WorktreeSection,
 } from './types.js';
+
+import { CONDUCTOR_MINUTE_BOUNDS, CONDUCTOR_REAPER_REPAIR_KINDS } from './policy.js';
 
 export type ParseResult =
   | { ok: true; installation: FleetInstallation }
@@ -156,10 +161,19 @@ const POLICY_KEYS: readonly string[] = [
   'useFreeSeats',
   'liveTail',
   'autoMerge',
+  'conductor',
 ];
 const FORBIDDEN_ROUTE_KEYS: readonly string[] = ['tool', 'modelPattern'];
 const LIVE_TAIL_KEYS: readonly string[] = ['content'];
 const AUTO_MERGE_KEYS: readonly string[] = ['enabled', 'allowHighRisk', 'onBlocked'];
+const CONDUCTOR_KEYS: readonly string[] = ['enabled', 'stopGraceMinutes', 'reaper'];
+const CONDUCTOR_REAPER_KEYS: readonly string[] = [
+  'enabled',
+  'intervalMinutes',
+  'graceMinutes',
+  'staleStopMinutes',
+  'repairs',
+];
 const GIT_SHELF_KEYS: readonly string[] = [
   'provider',
   'repoDir',
@@ -1657,12 +1671,14 @@ function parseV2Policy(
   }
   const liveTail = parseLiveTailPolicy(section, errors);
   const autoMerge = parseAutoMergePolicy(section, errors);
+  const conductor = parseConductorPolicy(section, errors);
   return {
     ...(forbiddenRoutes !== undefined ? { forbiddenRoutes } : {}),
     ...(perLaneCostCeiling !== undefined ? { perLaneCostCeiling } : {}),
     ...(useFreeSeats !== undefined ? { useFreeSeats } : {}),
     ...(liveTail !== undefined ? { liveTail } : {}),
     ...(autoMerge !== undefined ? { autoMerge } : {}),
+    ...(conductor !== undefined ? { conductor } : {}),
   };
 }
 
@@ -1741,6 +1757,165 @@ function parseAutoMergePolicy(
     return undefined;
   }
   return { enabled, allowHighRisk, onBlocked };
+}
+
+function readConductorBoolean(
+  record: JsonObject,
+  field: string,
+  path: string,
+  errors: string[],
+  required: boolean,
+): boolean | undefined {
+  if (!Object.hasOwn(record, field)) {
+    if (required) {
+      errors.push(`${path}.${field}: required`);
+    }
+    return undefined;
+  }
+  const value = record[field];
+  if (typeof value !== 'boolean') {
+    errors.push(`${path}.${field}: must be a boolean`);
+    return undefined;
+  }
+  return value;
+}
+
+function readConductorMinutes(
+  record: JsonObject,
+  field: string,
+  path: string,
+  bounds: Readonly<{ min: number; max: number }>,
+  errors: string[],
+): number | undefined {
+  if (!Object.hasOwn(record, field)) {
+    return undefined;
+  }
+  const value = record[field];
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < bounds.min ||
+    value > bounds.max
+  ) {
+    errors.push(`${path}.${field}: must be an integer ${bounds.min}..${bounds.max}`);
+    return undefined;
+  }
+  return value;
+}
+
+function parseConductorRepairs(
+  reaper: JsonObject,
+  errors: string[],
+): ConductorReaperRepairs | undefined {
+  if (!Object.hasOwn(reaper, 'repairs')) {
+    return undefined;
+  }
+  const value = reaper.repairs;
+  if (!isJsonObject(value)) {
+    errors.push('policy.conductor.reaper.repairs: must be an object');
+    return undefined;
+  }
+  collectUnknownKeys(
+    value,
+    CONDUCTOR_REAPER_REPAIR_KINDS,
+    'policy.conductor.reaper.repairs',
+    errors,
+  );
+  const repairs: Mutable<ConductorReaperRepairs> = {};
+  for (const kind of CONDUCTOR_REAPER_REPAIR_KINDS) {
+    if (!Object.hasOwn(value, kind)) {
+      continue;
+    }
+    const flag = value[kind];
+    if (typeof flag !== 'boolean') {
+      errors.push(`policy.conductor.reaper.repairs.${kind}: must be a boolean`);
+      continue;
+    }
+    repairs[kind] = flag;
+  }
+  return repairs;
+}
+
+function parseConductorReaper(
+  conductor: JsonObject,
+  errors: string[],
+): ConductorReaperPolicy | undefined {
+  if (!Object.hasOwn(conductor, 'reaper')) {
+    return undefined;
+  }
+  const value = conductor.reaper;
+  if (!isJsonObject(value)) {
+    errors.push('policy.conductor.reaper: must be an object');
+    return undefined;
+  }
+  const before = errors.length;
+  collectUnknownKeys(value, CONDUCTOR_REAPER_KEYS, 'policy.conductor.reaper', errors);
+  const enabled = readConductorBoolean(value, 'enabled', 'policy.conductor.reaper', errors, true);
+  const intervalMinutes = readConductorMinutes(
+    value,
+    'intervalMinutes',
+    'policy.conductor.reaper',
+    CONDUCTOR_MINUTE_BOUNDS.intervalMinutes,
+    errors,
+  );
+  const graceMinutes = readConductorMinutes(
+    value,
+    'graceMinutes',
+    'policy.conductor.reaper',
+    CONDUCTOR_MINUTE_BOUNDS.graceMinutes,
+    errors,
+  );
+  const staleStopMinutes = readConductorMinutes(
+    value,
+    'staleStopMinutes',
+    'policy.conductor.reaper',
+    CONDUCTOR_MINUTE_BOUNDS.staleStopMinutes,
+    errors,
+  );
+  const repairs = parseConductorRepairs(value, errors);
+  if (errors.length !== before || enabled === undefined) {
+    return undefined;
+  }
+  return {
+    enabled,
+    ...(intervalMinutes !== undefined ? { intervalMinutes } : {}),
+    ...(graceMinutes !== undefined ? { graceMinutes } : {}),
+    ...(staleStopMinutes !== undefined ? { staleStopMinutes } : {}),
+    ...(repairs !== undefined ? { repairs } : {}),
+  };
+}
+
+function parseConductorPolicy(
+  section: JsonObject,
+  errors: string[],
+): ConductorPolicy | undefined {
+  if (!Object.hasOwn(section, 'conductor')) {
+    return undefined;
+  }
+  const value = section.conductor;
+  if (!isJsonObject(value)) {
+    errors.push('policy.conductor: must be an object');
+    return undefined;
+  }
+  const before = errors.length;
+  collectUnknownKeys(value, CONDUCTOR_KEYS, 'policy.conductor', errors);
+  const enabled = readConductorBoolean(value, 'enabled', 'policy.conductor', errors, true);
+  const stopGraceMinutes = readConductorMinutes(
+    value,
+    'stopGraceMinutes',
+    'policy.conductor',
+    CONDUCTOR_MINUTE_BOUNDS.stopGraceMinutes,
+    errors,
+  );
+  const reaper = parseConductorReaper(value, errors);
+  if (errors.length !== before || enabled === undefined) {
+    return undefined;
+  }
+  return {
+    enabled,
+    ...(stopGraceMinutes !== undefined ? { stopGraceMinutes } : {}),
+    ...(reaper !== undefined ? { reaper } : {}),
+  };
 }
 
 function parseV2Shelf(

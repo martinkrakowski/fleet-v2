@@ -76,9 +76,13 @@ export function readVitestSummaryCoverage(output: string): CheckCoverage {
     found = true;
     total += lineExecuted;
   }
-  return found
-    ? { ran: true, unitKind: 'tests', units: total }
-    : { ...NO_COUNT };
+  if (!found) {
+    return { ...NO_COUNT };
+  }
+  if (!Number.isSafeInteger(total)) {
+    return { ran: false, reason: 'count out of range' };
+  }
+  return { ran: true, unitKind: 'tests', units: total };
 }
 
 export function readHexagenLintJsonCoverage(output: string): CheckCoverage {

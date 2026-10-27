@@ -139,3 +139,10 @@ describe('readCheckCoverage', () => {
     }
   });
 });
+
+describe('readVitestSummaryCoverage out-of-range counts (V2a, Luna minor)', () => {
+  it('refuses a count beyond Number.MAX_SAFE_INTEGER instead of emitting unsafe units', () => {
+    const coverage = readVitestSummaryCoverage('      Tests  9007199254740992 passed (9007199254740992)\n');
+    expect(coverage).toEqual({ ran: false, reason: 'count out of range' });
+  });
+});

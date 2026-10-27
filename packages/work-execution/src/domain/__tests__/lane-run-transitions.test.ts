@@ -191,6 +191,16 @@ describe('acceptance and head change', () => {
     expect(laneRunHeadChanged('accepting', 'a'.repeat(12), 'b'.repeat(12))).toBe(false);
     expect(laneRunHeadChanged('gating', 'a'.repeat(12), 'b'.repeat(12))).toBe(false);
   });
+
+  it('head change needs two 12-hex lowercase heads, never any two different strings', () => {
+    const [state] = LANE_RUN_HEAD_CHANGE_STATES;
+    expect(laneRunHeadChanged(state, 'not-a-head!!', 'also-bad!!!!')).toBe(false);
+    expect(laneRunHeadChanged(state, 'abc', 'abcdef123456')).toBe(false);
+    expect(laneRunHeadChanged(state, 'ABCDEF123456', 'abcdef123456')).toBe(false);
+    expect(laneRunHeadChanged(state, 'abcdef1234567', 'abcdef123456')).toBe(false);
+    expect(laneRunHeadChanged(state, 123456789012 as unknown as string, 'abcdef123456')).toBe(false);
+    expect(laneRunHeadChanged(state, 'abcdef123456', '0123456789ab')).toBe(true);
+  });
 });
 
 describe('run-stop mapping', () => {

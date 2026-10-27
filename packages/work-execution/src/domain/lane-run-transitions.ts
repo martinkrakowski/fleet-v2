@@ -135,10 +135,17 @@ export function laneRunHeadChanged(state: LaneRunStateValue, head12: string | nu
   if (!(LANE_RUN_HEAD_CHANGE_STATES as readonly LaneRunStateValue[]).includes(state)) {
     return false;
   }
-  if (head12 === null || acceptedHead12 === null) {
+  if (!isHead12(head12) || !isHead12(acceptedHead12)) {
     return false;
   }
   return head12 !== acceptedHead12;
+}
+
+const LANE_RUN_HEAD12_PATTERN = /^[0-9a-f]{12}$/;
+
+/** A 12-hex lowercase head; anything else (null, wrong length, other characters, non-strings) is not one. */
+function isHead12(value: unknown): value is string {
+  return typeof value === 'string' && LANE_RUN_HEAD12_PATTERN.test(value);
 }
 
 /** The StopAttempt outcome for a run's attempt, as the domain reads it (a later lane maps the port result). */

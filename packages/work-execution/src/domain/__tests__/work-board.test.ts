@@ -319,6 +319,25 @@ describe('R1/R2 lane resolution and cards', () => {
     expect(card?.placement).toBe('queued');
   });
 
+  it('a link lane and a declaration lane naming the same unknown work order make exactly one card', () => {
+    const linkLane: LaneRef = { kind: 'work-order', projectId: 'p1', workOrderId: 'wo-x' };
+    const declarationLane: LaneRef = { kind: 'work-order', projectId: 'p2', workOrderId: 'wo-x' };
+    const board = boardOf({
+      links: [link(7, { lane: linkLane })],
+      declarations: [{ lane: declarationLane, step: 'first-pass', seatRole: 'first-pass', model: 'model-e', declaredAtIso: NOW }],
+    });
+    expect(board.lanes.filter((l) => l.key === 'wo:wo-x')).toHaveLength(1);
+    expectNoLaneInTwoColumns(board);
+    const keys = columnLaneKeys(board);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it('a no-plan work order whose laneId is not plain text is labelled with its work order id', () => {
+    const board = boardOf({ workOrders: [wo('wo-example-3', { planRef: null, laneId: 'bad\u202Elane' })] });
+    const card = board.lanes.find((l) => l.key === 'wo:wo-example-3');
+    expect(card?.label).toBe('wo-example-3');
+  });
+
   it('a link to an unknown plan lane makes a not-imported card', () => {
     const board = boardOf({
       links: [link(7, { lane: { kind: 'plan', projectId: PROJECT_ID, planId: '2026-10-28_example', laneId: 'B1' } })],
@@ -456,6 +475,12 @@ describe('R5 open decision questions', () => {
   it('answered with an answer carrying neither option nor text is open', () => {
     const board = boardOf({ questions: [question('q-example-1', { state: 'answered', answer: { shape: 'answer', hasOption: false, hasText: false } })] });
     expect(hasQuestionEntry(board, 'q-example-1')).toBe(true);
+  });
+
+  it('a question title with a control character becomes the fixed subject', () => {
+    const board = boardOf({ questions: [question('q-example-4', { title: 'bad\u0007title' })] });
+    const entry = board.ownerItems.find((e) => e.origin === 'question' && e.id === 'q-example-4');
+    expect(entry?.subject).toBe('Owner question');
   });
 
   it('answered with accept is closed', () => {

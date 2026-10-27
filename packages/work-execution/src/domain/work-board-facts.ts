@@ -1,9 +1,10 @@
 /**
  * The typed facts the work board reads (work-board plan §3.7, §3.9):
  * one plain shape per store, mapped by WB6 from each store's records; ids,
- * enums, counts, times and the bounded plain text the stores already
- * validated (owner-item subjects, question titles, PR titles), never a
- * credential or client content; a fact grants nothing.
+ * enums, counts, times and text, never a credential or client content; a
+ * fact grants nothing. Not every text field here has been validated by its
+ * store: the board itself applies the plain-text rule to the texts it
+ * displays (work-order lane ids and question titles) before rendering them.
  */
 
 import type { WorkOrderStateValue } from './value-objects/WorkOrderState.vo.js';

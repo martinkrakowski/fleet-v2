@@ -6,13 +6,14 @@
  * `__tests__/work-board.test.ts`.
  */
 
+import { containsSecretShape } from '@fleet/shared';
+
 import {
   BOARD_GATING_OWNER_ITEM_KINDS,
   BOARD_SOURCES,
   DEFAULT_BOARD_POLICY,
   formatLaneRef,
   parseTimeMs,
-  sameLaneRef,
   WORK_BOARD_SCHEMA_VERSION,
 } from './work-board-facts.js';
 import type {
@@ -219,6 +220,32 @@ function resolveLaneRef(ref: LaneRef, facts: BoardFacts): LaneRef {
   return ref;
 }
 
+/**
+ * The plain-text rule the board applies to its own display text (WB2a-1 fix 2):
+ * a work-order lane id may only become a card label, and a question title may
+ * only become a subject, when it is non-empty, bounded, not secret-shaped and
+ * free of control, separator and bidi/isolate code points — the same plain-text
+ * conditions the plan sidecar applies (`planTextError`, WB1a). That module is
+ * not on this branch yet (WB1a runs as a separate lane), so the conditions are
+ * gated here; replace this gate with the sidecar's exported rule when WB1a
+ * merges. Nothing here reads a credential or client content.
+ */
+const BOARD_TEXT_MAX_BYTES = 1024;
+
+function isPlainText(text: string): boolean {
+  if (text.trim().length === 0 || new TextEncoder().encode(text).byteLength > BOARD_TEXT_MAX_BYTES) return false;
+  if (containsSecretShape(text)) return false;
+  for (let index = 0; index < text.length; index += 1) {
+    const codePoint = text.codePointAt(index);
+    if (codePoint === undefined) return false;
+    if (codePoint < 0x20 || (codePoint >= 0x7f && codePoint <= 0x9f)) return false;
+    if (codePoint === 0x2028 || codePoint === 0x2029) return false;
+    if (codePoint >= 0x202a && codePoint <= 0x202e) return false;
+    if (codePoint >= 0x2066 && codePoint <= 0x2069) return false;
+  }
+  return true;
+}
+
 function makeCard(ref: LaneRef, facts: BoardFacts): Card {
   const isPlan = ref.kind === 'plan';
   let label = isPlan ? ref.laneId : '';
@@ -243,7 +270,7 @@ function makeCard(ref: LaneRef, facts: BoardFacts): Card {
     }
   } else {
     const wo = facts.workOrders.find((w) => w.id === ref.workOrderId);
-    label = wo ? wo.laneId : ref.workOrderId;
+    label = wo && isPlainText(wo.laneId) ? wo.laneId : ref.workOrderId;
   }
 
   return {
@@ -311,7 +338,10 @@ function doneOf(links: readonly BoardPullRequestLinkFact[], woIds: readonly stri
 function buildCards(facts: BoardFacts): Card[] {
   const refs: LaneRef[] = [];
   const pushRef = (ref: LaneRef): void => {
-    if (!refs.some((r) => sameLaneRef(r, ref))) refs.push(ref);
+    // Dedup by the card key's identity: `wo:<workOrderId>` has no project, so
+    // two work-order refs for the same id from different projects are one card.
+    const key = formatLaneRef(ref);
+    if (!refs.some((r) => formatLaneRef(r) === key)) refs.push(ref);
   };
 
   for (const plan of facts.plans) {
@@ -485,7 +515,7 @@ function draftForQuestion(question: BoardQuestionFact, cardByKey: Map<string, Ca
     id: question.questionId,
     projectId: null,
     kind: 'decision',
-    subject: question.title,
+    subject: isPlainText(question.title) ? question.title : 'Owner question',
     sinceIso: question.askedAtIso,
     gating: true,
     namesLanes: names,

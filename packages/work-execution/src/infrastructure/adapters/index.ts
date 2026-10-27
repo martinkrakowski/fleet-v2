@@ -8,6 +8,7 @@ export * from "./AllowedSeatAdapter.adapter.js";
 export * from "./AttemptArtifactAdapter.adapter.js";
 export * from "./AttemptOwnerDecisionAdapter.adapter.js";
 export * from "./AttemptRepositoryAdapter.adapter.js";
+export * from "./AttemptReviewLocator.helper.js";
 export * from "./BriefAuthoringAdapter.adapter.js";
 export * from "./BriefKnowledgeAdapter.adapter.js";
 export * from "./ConfirmRecordedHost.js";

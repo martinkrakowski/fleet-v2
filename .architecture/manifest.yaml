@@ -670,7 +670,7 @@ bounded_contexts:
     depends_on: []
     layers:
       domain:
-        entities: [ProjectProfile, CoordinationRequest, AuthorizationConsumption, RelayAcknowledgement, OwnerQuestion, OrchestratorSession]
+        entities: [ProjectProfile, CoordinationRequest, AuthorizationConsumption, RelayAcknowledgement, OwnerQuestion, OrchestratorSession, OrchestratorRequest]
         value_objects: [CoordinationKind, CoordinationState, ActionAuthorization, PolicyReference, ObservationEnvelope]
       application:
         use_cases: [RegisterProjectProfileUseCase, UpdateProjectProfileUseCase, RetireProjectProfileUseCase, ListProjectProfilesUseCase, InspectProjectProfileUseCase, RecordProjectProbeUseCase, InspectConfiguredCapabilitiesUseCase, RequestScopedDecisionUseCase, ResolveActionAuthorizationUseCase, CheckOwnerDecisionUseCase, RecordAuthorizationConsumptionUseCase, PublishProjectObservationUseCase, ReadProjectAttentionUseCase, SendFleetRelayUseCase, RecordRelayAcknowledgementUseCase, InspectOutstandingCoordinationUseCase, AskOwnerQuestionUseCase, AnswerOwnerQuestionUseCase, ExpireOwnerQuestionsUseCase, AcknowledgeOwnerAnswerUseCase, ListOwnerQuestionsUseCase, ReadOwnerQuestionUseCase, SyncOneWayOwnerQuestionsUseCase]
@@ -723,7 +723,7 @@ bounded_contexts:
       - { adapter: RelayTransportAdapter, implements: RelayTransportPort, integration: harness-notice-channel-or-local-outbox }
       - { adapter: NoopChangeSignalAdapter, implements: ChangeSignalPort, integration: in-process-noop }
     domain_specification:
-      aggregate_roots: [ProjectProfile, CoordinationRequest, OwnerQuestion, OrchestratorSession]
+      aggregate_roots: [ProjectProfile, CoordinationRequest, OwnerQuestion, OrchestratorSession, OrchestratorRequest]
       child_ownership: { AuthorizationConsumption: CoordinationRequest, RelayAcknowledgement: CoordinationRequest }
       enum_values:
         CoordinationKind: [action-decision, policy-proposal, relay, registry-alert]
@@ -732,6 +732,7 @@ bounded_contexts:
         - "Authorization binds proposal digest, project, exact action, expected commit, policy and decision revisions."
         - "Owner questions are a separate aggregate: answers validate against the question's own options and current revision, a one-way question is answered only by a verified signed decision, and no answer, acknowledgement, expiry or sync ever writes a coordination request or grants authority."
         - "Orchestrator sessions are a separate aggregate, never a coordination kind: a session records which agent CLI is registered, what it may claim and its lease; it grants nothing, and attached and attentive are derived from the injected clock, never stored."
+        - "Orchestrator requests are a separate aggregate, never a coordination kind: a web request is a closed, ids-only mailbox entry that grants nothing; the claimant acts under its own existing authority, every claim mutation checks revision, fence and lease, and a dispatched request only links to the record that carries the truth."
         - "Existing approved policy may authorize routine bounded work. A signed answer does not grant unrelated or privileged host actions."
         - "Policy prose never silently becomes new machine authority; policy changes remain owner-approved versioned edits."
         - "A status delivery failure is visible but does not block ordinary work. Missing required authorization blocks the affected action."

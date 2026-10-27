@@ -88,19 +88,58 @@ function stepKeyError(parts: LaneRunStepKeyParts): string | null {
 }
 
 export function buildLaneRunStepKey(parts: LaneRunStepKeyParts): LaneRunKeyResult {
-  const error = stepKeyError(parts);
-  if (error !== null) {
-    return { ok: false, error };
+  try {
+    // Read the input once into a snapshot: refuse a value that is not a plain
+    // object (null, arrays, non-objects, or a prototype other than
+    // Object.prototype or null).
+    if (typeof parts !== 'object' || parts === null || Array.isArray(parts)) {
+      return { ok: false, error: 'LaneRun key parts must be a plain object' };
+    }
+    const proto = Object.getPrototypeOf(parts);
+    if (proto !== Object.prototype && proto !== null) {
+      return { ok: false, error: 'LaneRun key parts must be a plain object' };
+    }
+
+    // Read each expected own key through Reflect.getOwnPropertyDescriptor(...).value,
+    // so no getter runs. A missing key reads as undefined.
+    const read = (key: string): unknown => {
+      const descriptor = Reflect.getOwnPropertyDescriptor(parts, key);
+      return descriptor === undefined ? undefined : descriptor.value;
+    };
+    const snapshot = {
+      runId: read('runId'),
+      round: read('round'),
+      step: read('step'),
+      seatIndex: read('seatIndex'),
+      head12: read('head12'),
+      retry: read('retry'),
+    };
+
+    // Validate only the snapshot.
+    const error = stepKeyError(snapshot as LaneRunStepKeyParts);
+    if (error !== null) {
+      return { ok: false, error };
+    }
+
+    const runId = snapshot.runId as string;
+    const round = snapshot.round as number;
+    const step = snapshot.step as LaneRunKeyStep;
+    const seatIndex = snapshot.seatIndex as number;
+    const head12 = snapshot.head12 as string | null;
+    const retry = snapshot.retry as number | null;
+    let key = runId + '/r' + round + '/' + step + '/' + seatIndex;
+    if (head12 !== null) {
+      key += '@' + head12;
+    }
+    if (retry !== null) {
+      key += '/retry' + retry;
+    }
+    return { ok: true, key };
+  } catch {
+    // A throwing Proxy trap (or hostile descriptor) must never escape: return the
+    // builder's invalid result with a fixed reason that echoes no value.
+    return { ok: false, error: 'LaneRun key parts must be a plain object' };
   }
-  const { runId, round, step, seatIndex, head12, retry } = parts;
-  let key = runId + '/r' + String(round) + '/' + step + '/' + String(seatIndex);
-  if (head12 !== null) {
-    key += '@' + head12;
-  }
-  if (retry !== null) {
-    key += '/retry' + String(retry);
-  }
-  return { ok: true, key };
 }
 
 export function laneRunStopKey(runId: string): LaneRunKeyResult {
@@ -149,7 +188,7 @@ function parseStepKeySegments(segments: string[], key: string): ParsedLaneRunKey
     if (!RETRY_SEGMENT_PATTERN.test(segments[4])) {
       return null;
     }
-    retry = Number(segments[4].slice(6));
+    retry = Number(segments[4].slice(5));
   }
   const built = buildLaneRunStepKey({ runId: segments[0], round, step, seatIndex, head12, retry });
   if (!built.ok || built.key !== key) {

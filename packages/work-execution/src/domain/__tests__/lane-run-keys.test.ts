@@ -41,10 +41,29 @@ describe('key builders', () => {
       kind: 'step', runId: RUN_ID, round: 1, step: 'code-review', seatIndex: 2, head12: HEAD12, retry: null,
     });
 
-    const retry = buildLaneRunStepKey({
+    const parts: LaneRunStepKeyParts = {
       runId: RUN_ID, round: 1, step: 'code-review', seatIndex: 2, head12: HEAD12, retry: 1,
-    });
-    expect(retry).toEqual({ ok: true, key: `${RUN_ID}/r1/code-review/2@0123456789ab/retry1` });
+    };
+    const built = buildLaneRunStepKey(parts);
+    expect(built).toEqual({ ok: true, key: `${RUN_ID}/r1/code-review/2@0123456789ab/retry1` });
+
+    // Round-trip verification: parse the built retry key back to its parts,
+    // check them, and rebuild the identical key.
+    if (!built.ok) throw new Error('unreachable: retry key must build');
+    const parsed = parseLaneRunKey(built.key);
+    expect(parsed).toEqual(expect.objectContaining({
+      kind: 'step',
+      runId: RUN_ID,
+      round: 1,
+      step: 'code-review',
+      seatIndex: 2,
+      head12: HEAD12,
+      retry: 1,
+    }));
+
+    if (parsed === null || parsed.kind !== 'step') throw new Error('unreachable: parsed step key');
+    const rebuilt = buildLaneRunStepKey(parsed);
+    expect(rebuilt).toEqual(built);
 
     expect(laneRunStopKey(RUN_ID)).toEqual({ ok: true, key: `${RUN_ID}/stop@web` });
     expect(parseLaneRunKey(`${RUN_ID}/stop@web`)).toEqual({ kind: 'stop', runId: RUN_ID, via: 'web' });
@@ -105,6 +124,38 @@ describe('key builders', () => {
   it.each(refusalRows)('refuses step parts %j with %s', (parts, message) => {
     const result = buildLaneRunStepKey(parts as LaneRunStepKeyParts);
     expect(result).toEqual({ ok: false, error: message });
+  });
+
+  it('returns the invalid result without throwing for non-object input', () => {
+    for (const input of [null, undefined, 42, []]) {
+      const result = buildLaneRunStepKey(input as unknown as LaneRunStepKeyParts);
+      expect(result.ok).toBe(false);
+    }
+  });
+
+  it('never runs a throwing getter and never throws', () => {
+    const hostile = {};
+    Object.defineProperty(hostile, 'runId', {
+      get() {
+        throw new Error('boom');
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    const result = buildLaneRunStepKey(hostile as LaneRunStepKeyParts);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).not.toContain('boom');
+  });
+
+  it('never throws when a Proxy get or getOwnPropertyDescriptor trap throws', () => {
+    for (const trap of ['get', 'getOwnPropertyDescriptor'] as const) {
+      const proxy = new Proxy({}, { [trap]() { throw new Error('boom'); } });
+      const result = buildLaneRunStepKey(proxy as LaneRunStepKeyParts);
+      expect(result.ok).toBe(false);
+      if (result.ok) continue;
+      expect(result.error).not.toContain('boom');
+    }
   });
 
   it('refuses a bad park ordinal', () => {

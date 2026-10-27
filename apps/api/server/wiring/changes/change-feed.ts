@@ -52,6 +52,7 @@ const DATA_KINDS: ReadonlySet<FeedKind> = new Set([
 
 const DEFAULT_CAPACITY = 1024;
 const MIN_CAPACITY = 16;
+const RECENT_LOCAL_STAMPS = 8;
 
 function sameStamp(left: FileStamp, right: FileStamp): boolean {
   return (
@@ -93,6 +94,7 @@ export class ChangeFeed {
   private seq = 0;
   private readonly entries: FeedEntry[] = [];
   private readonly lastLocal = new Map<string, FileStamp>();
+  private readonly recentLocal = new Map<string, FileStamp[]>();
   private emitFailuresCount = 0;
 
   constructor(options: ChangeFeedOptions = {}) {
@@ -133,6 +135,7 @@ export class ChangeFeed {
       }
       if (signal.stateFile !== null && signal.written !== null) {
         this.lastLocal.set(signal.stateFile, signal.written);
+        this.rememberLocal(signal.stateFile, signal.written);
       }
       if (DATA_KINDS.has(signal.kind as FeedKind)) {
         this.appendEntry({
@@ -164,6 +167,24 @@ export class ChangeFeed {
 
   lastLocalWrite(stateFile: string): FileStamp | undefined {
     return this.lastLocal.get(stateFile);
+  }
+
+  /** True when `stamp` is one of the last few stamps this process wrote to `stateFile`. */
+  isRecentLocalWrite(stateFile: string, stamp: FileStamp | null): boolean {
+    if (stamp === null) {
+      return false;
+    }
+    const recent = this.recentLocal.get(stateFile) ?? [];
+    return recent.some((known) => sameStamp(known, stamp));
+  }
+
+  private rememberLocal(stateFile: string, stamp: FileStamp): void {
+    const recent = this.recentLocal.get(stateFile) ?? [];
+    recent.push(stamp);
+    if (recent.length > RECENT_LOCAL_STAMPS) {
+      recent.shift();
+    }
+    this.recentLocal.set(stateFile, recent);
   }
 
   read(cursor: string | null): FeedRead {

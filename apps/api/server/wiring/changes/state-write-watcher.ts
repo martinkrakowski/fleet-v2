@@ -1,8 +1,10 @@
 // Watches the store files whose saves emit change signals and turns foreign
 // writes (a CLI run, another API process) into a resync on the shared change
 // feed. The watcher's own process writes are recognized through the feed's
-// last-local-write stamps and are never reported as foreign.
-import { promises as fs } from "node:fs";
+// last-local-write stamps and are never reported as foreign. A changed stamp
+// that is not yet a known local write is held as a suspect and confirmed foreign
+// one tick later, so an adapter's rename-to-emit gap never triggers a resync.
+import { promises as fs, statSync } from "node:fs";
 import type { ChangeFeed, FileStamp } from "./change-feed";
 
 export interface StateWriteWatcherOptions {
@@ -40,6 +42,7 @@ export class StateWriteWatcher {
   private readonly intervalMs: number;
   private readonly statFn: ((file: string) => Promise<FileStamp | null>) | undefined;
   private readonly lastObserved = new Map<string, FileStamp | null>();
+  private readonly suspects = new Map<string, FileStamp | null>();
   private timer: NodeJS.Timeout | null = null;
   private statFailuresCount = 0;
 
@@ -63,18 +66,23 @@ export class StateWriteWatcher {
       const file = this.files[i]!;
       const stamp = stamps[i]!;
       const previous = this.lastObserved.get(file);
+      this.lastObserved.set(file, stamp);
       if (previous === undefined) {
         // First observation sets the baseline; it is never foreign.
-        this.lastObserved.set(file, stamp);
         continue;
       }
-      if (
-        !sameStamp(previous, stamp) &&
-        !sameStamp(stamp, this.feed.lastLocalWrite(file))
-      ) {
-        foreignChanged = true;
+      if (this.suspects.has(file)) {
+        // Seen last tick and not ours then; ours now only if its emit has since landed.
+        const suspect = this.suspects.get(file) ?? null;
+        this.suspects.delete(file);
+        if (!this.feed.isRecentLocalWrite(file, suspect)) {
+          foreignChanged = true;
+        }
       }
-      this.lastObserved.set(file, stamp);
+      if (!sameStamp(previous, stamp) && !this.feed.isRecentLocalWrite(file, stamp)) {
+        // Possibly our own write whose emit has not run yet: confirm on the next tick.
+        this.suspects.set(file, stamp);
+      }
     }
     if (foreignChanged) {
       this.feed.resync();
@@ -84,6 +92,13 @@ export class StateWriteWatcher {
   start(): void {
     if (this.timer !== null) {
       return;
+    }
+    if (this.statFn === undefined) {
+      for (const file of this.files) {
+        if (!this.lastObserved.has(file)) {
+          this.lastObserved.set(file, this.statNow(file));
+        }
+      }
     }
     this.timer = setInterval(() => {
       void this.tick().catch(() => {
@@ -112,6 +127,19 @@ export class StateWriteWatcher {
         return null;
       }
       this.statFailuresCount += 1;
+      return null;
+    }
+  }
+
+  /** Synchronous stat for the start-up baseline; same null rules as stat(). */
+  private statNow(file: string): FileStamp | null {
+    try {
+      const stats = statSync(file);
+      return { mtimeMs: stats.mtimeMs, size: stats.size, ino: stats.ino };
+    } catch (error: unknown) {
+      if (!isEnoent(error)) {
+        this.statFailuresCount += 1;
+      }
       return null;
     }
   }

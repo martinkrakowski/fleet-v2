@@ -58,8 +58,11 @@ export function isCheckCoverage(value: unknown): value is CheckCoverage {
     if (typeof record.reason !== 'string') {
       return false;
     }
-    const trimmed = record.reason.trim();
-    if (trimmed.length === 0 || trimmed.length > 200) {
+    if (
+      record.reason.length === 0 ||
+      record.reason.length > 200 ||
+      record.reason !== record.reason.trim()
+    ) {
       return false;
     }
     return true;

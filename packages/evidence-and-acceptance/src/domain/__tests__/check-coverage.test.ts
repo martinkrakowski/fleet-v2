@@ -16,6 +16,7 @@ describe('isCheckCoverage', () => {
     { ran: true, unitKind: 'files', units: 42 },
     { ran: true, unitKind: 'checks', units: 7 },
     { ran: false, reason: 'no count in output' },
+    { ran: false, reason: 'x'.repeat(200) },
   ] as const)('accepts %#', (value) => {
     expect(isCheckCoverage(value)).toBe(true);
   });
@@ -26,6 +27,9 @@ describe('isCheckCoverage', () => {
     { ran: true, unitKind: 'lines', units: 3 },
     { ran: false, reason: '' },
     { ran: false, reason: 'x'.repeat(201) },
+    { ran: false, reason: 'x'.repeat(200) + ' ' },
+    { ran: false, reason: '  padded  ' },
+    { ran: false, reason: '   ' },
     { ran: true, unitKind: 'tests', units: 3, extra: true },
     { ran: false, reason: 'why', extra: true },
     null,

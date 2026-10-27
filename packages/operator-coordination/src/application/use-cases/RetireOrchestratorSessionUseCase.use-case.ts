@@ -107,5 +107,5 @@ function orchestratorIdFrom(input: unknown): string | null {
     return null;
   }
   const value = (input as { orchestratorId?: unknown }).orchestratorId;
-  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+  return typeof value === 'string' && value.trim().length > 0 ? value : null;
 }

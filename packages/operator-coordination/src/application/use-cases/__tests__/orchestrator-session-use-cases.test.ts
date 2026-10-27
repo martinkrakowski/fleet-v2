@@ -471,6 +471,200 @@ describe('list', () => {
   });
 });
 
+describe('fix round 1 pins', () => {
+  it('copies presented scopes by index even when the iterator lies with a forbidden scope', async () => {
+    const env = fresh();
+    const lyingIterator: string[] = ['message'];
+    Object.defineProperty(lyingIterator, Symbol.iterator, {
+      value: function* () {
+        yield 'dispatch';
+      },
+      configurable: true,
+    });
+    const result = await env.register.registerOrchestratorSession(BODY, lyingIterator);
+    expect(result.outcome).toBe('registered');
+    if (result.outcome === 'registered') {
+      expect(result.session.scopes).toEqual(['message']);
+    }
+  });
+
+  it('registers only a plain record body', async () => {
+    const env = fresh();
+    class NotARecord {}
+    for (const body of [null, ['orch-example-1'], new Map(), new NotARecord()]) {
+      const result = await env.register.registerOrchestratorSession(body, ['message']);
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: 'OrchestratorSession registration requires a record',
+      });
+    }
+    expect(await env.list.listOrchestratorSessions()).toEqual({ sessions: [] });
+  });
+
+  it('refuses duplicate presented scopes', async () => {
+    const env = fresh();
+    const result = await env.register.registerOrchestratorSession(BODY, ['message', 'message']);
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'OrchestratorSession scopes must be distinct session scopes',
+    });
+    expect(await env.list.listOrchestratorSessions()).toEqual({ sessions: [] });
+  });
+
+  it('refuses an empty or whitespace-only orchestratorId for heartbeat and retire', async () => {
+    const env = fresh();
+    for (const id of ['', '   ']) {
+      expect(await env.heartbeat.heartbeatOrchestratorSession({ orchestratorId: id })).toEqual({
+        outcome: 'refused',
+        reason: 'an orchestratorId is required',
+      });
+      expect(await env.retire.retireOrchestratorSession({ orchestratorId: id })).toEqual({
+        outcome: 'refused',
+        reason: 'an orchestratorId is required',
+      });
+    }
+  });
+
+  it('uses the id exactly as given: spaces are part of the id', async () => {
+    const env = fresh();
+    await env.register.registerOrchestratorSession(
+      { ...BODY, orchestratorId: ' orch-1 ' },
+      ['message'],
+    );
+    expect(
+      await env.heartbeat.heartbeatOrchestratorSession({ orchestratorId: ' orch-1 ' }),
+    ).toEqual({
+      outcome: 'renewed',
+      session: expect.objectContaining({ orchestratorId: ' orch-1 ' }),
+      revision: 2,
+    });
+    expect(await env.heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'orch-1' })).toEqual({
+      outcome: 'not-found',
+    });
+  });
+
+  it('refuses an unreadable clock instead of throwing', async () => {
+    const repo = new OrchestratorSessionRepositoryAdapter({
+      changeSignal: { emit() {} },
+    });
+    const clock = makeClock('not a time');
+    const register = new RegisterOrchestratorSessionUseCase({ sessionRepo: repo, clock });
+    const result = await register.registerOrchestratorSession(BODY, ['message']);
+    expect(result).toEqual({ outcome: 'refused', reason: 'the clock could not be read' });
+    expect(await new ListOrchestratorSessionsUseCase({ sessionRepo: repo, clock }).listOrchestratorSessions())
+      .toEqual({ sessions: [] });
+  });
+
+  it('heartbeat retry renews at the fresh revision when another writer moved the session', async () => {
+    const repo = new ConflictSessionRepo();
+    const clock = makeClock();
+    await new RegisterOrchestratorSessionUseCase({ sessionRepo: repo, clock }).registerOrchestratorSession(
+      BODY,
+      ['message'],
+    );
+    // Between the two saves, another writer polls the mailbox at a new revision.
+    const betweenSaves = async () => {
+      const stored = await repo.get('orch-example-1');
+      if (stored === null) {
+        throw new Error('expected the session to be stored');
+      }
+      const loaded = OrchestratorSession.create(stored.session);
+      if (!loaded.success) {
+        throw new Error(loaded.error.message);
+      }
+      const polled = loaded.value.recordRequestsPoll('2026-10-27T10:00:20.000Z');
+      if (!polled.success) {
+        throw new Error(polled.error.message);
+      }
+      await repo.save(polled.value.toRecord(), stored.revision);
+    };
+    const heartbeat = new HeartbeatOrchestratorSessionUseCase({
+      sessionRepo: new HookedRepo(repo, betweenSaves),
+      clock,
+    });
+    repo.conflictsRemaining = 1;
+    clock.set('2026-10-27T10:00:30.000Z');
+    const result = await heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'orch-example-1' });
+    expect(result).toEqual({
+      outcome: 'renewed',
+      session: expect.objectContaining({ leaseUntilIso: '2026-10-27T10:02:00.000Z' }),
+      revision: 3,
+    });
+  });
+
+  it('heartbeat retry refuses when the session was retired between the two saves', async () => {
+    const repo = new ConflictSessionRepo();
+    const clock = makeClock();
+    await new RegisterOrchestratorSessionUseCase({ sessionRepo: repo, clock }).registerOrchestratorSession(
+      BODY,
+      ['message'],
+    );
+    const betweenSaves = async () => {
+      await new RetireOrchestratorSessionUseCase({ sessionRepo: repo, clock }).retireOrchestratorSession({
+        orchestratorId: 'orch-example-1',
+      });
+    };
+    const heartbeat = new HeartbeatOrchestratorSessionUseCase({
+      sessionRepo: new HookedRepo(repo, betweenSaves),
+      clock,
+    });
+    repo.conflictsRemaining = 1;
+    clock.set('2026-10-27T10:00:30.000Z');
+    const result = await heartbeat.heartbeatOrchestratorSession({ orchestratorId: 'orch-example-1' });
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'OrchestratorSession is retired and cannot renew its lease',
+    });
+  });
+
+  it('retire retry saves and returns retired after one conflict', async () => {
+    const repo = new ConflictSessionRepo();
+    const clock = makeClock();
+    await new RegisterOrchestratorSessionUseCase({ sessionRepo: repo, clock }).registerOrchestratorSession(
+      BODY,
+      ['message'],
+    );
+    const retire = new RetireOrchestratorSessionUseCase({ sessionRepo: repo, clock });
+    repo.conflictsRemaining = 1;
+    const savesBefore = repo.saveCalls;
+    const result = await retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' });
+    expect(result).toEqual({
+      outcome: 'retired',
+      session: expect.objectContaining({ status: 'retired' }),
+      revision: 2,
+    });
+    expect(repo.saveCalls - savesBefore).toBe(2);
+  });
+
+  it('retire returns retired with no second save when the session was retired between the two saves', async () => {
+    const repo = new ConflictSessionRepo();
+    const clock = makeClock();
+    await new RegisterOrchestratorSessionUseCase({ sessionRepo: repo, clock }).registerOrchestratorSession(
+      BODY,
+      ['message'],
+    );
+    const betweenSaves = async () => {
+      await new RetireOrchestratorSessionUseCase({ sessionRepo: repo, clock }).retireOrchestratorSession({
+        orchestratorId: 'orch-example-1',
+      });
+    };
+    const retire = new RetireOrchestratorSessionUseCase({
+      sessionRepo: new HookedRepo(repo, betweenSaves),
+      clock,
+    });
+    repo.conflictsRemaining = 1;
+    const savesBefore = repo.saveCalls;
+    const result = await retire.retireOrchestratorSession({ orchestratorId: 'orch-example-1' });
+    expect(result).toEqual({
+      outcome: 'retired',
+      session: expect.objectContaining({ status: 'retired' }),
+      revision: 2,
+    });
+    // Only the conflicting save and the concurrent writer's save happened; the retry saved nothing.
+    expect(repo.saveCalls - savesBefore).toBe(2);
+  });
+});
+
 describe('unconfigured use cases', () => {
   it('reject with Not implemented before any validation', async () => {
     await expect(new RegisterOrchestratorSessionUseCase().registerOrchestratorSession(BODY, ['message']))
@@ -537,6 +731,38 @@ class ConflictSessionRepo implements OrchestratorSessionRepositoryPort {
     return [...this.stored.values()]
       .filter((entry) => query?.status === undefined || entry.session.status === query.status)
       .map(copyStored);
+  }
+}
+
+/** A repository double that runs a hook between the failing save and the retry. */
+class HookedRepo implements OrchestratorSessionRepositoryPort {
+  constructor(
+    private readonly inner: ConflictSessionRepo,
+    private readonly onConflict: () => Promise<void>,
+  ) {}
+
+  async save(
+    session: OrchestratorSessionRecord,
+    expectedRevision: number,
+  ): Promise<StoredOrchestratorSession> {
+    try {
+      return await this.inner.save(session, expectedRevision);
+    } catch (error) {
+      if (error instanceof OrchestratorSessionRevisionConflictError) {
+        await this.onConflict();
+      }
+      throw error;
+    }
+  }
+
+  async get(orchestratorId: string): Promise<StoredOrchestratorSession | null> {
+    return this.inner.get(orchestratorId);
+  }
+
+  async list(
+    query?: OrchestratorSessionListQuery,
+  ): Promise<readonly StoredOrchestratorSession[]> {
+    return this.inner.list(query);
   }
 }
 

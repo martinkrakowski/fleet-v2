@@ -121,6 +121,9 @@ export class RegisterOrchestratorSessionUseCase implements RegisterOrchestratorS
 
     // 3. The clock alone supplies the times; the aggregate validates the full record.
     const nowIso = this.deps.clock.nowIso();
+    if (!Number.isFinite(Date.parse(nowIso))) {
+      return { outcome: 'refused', reason: 'the clock could not be read' };
+    }
     const leaseUntilMs = Date.parse(nowIso) + ORCHESTRATOR_SESSION_LEASE_SECONDS * 1000;
     const createdResult = OrchestratorSession.create({
       orchestratorId: bodyRecord.orchestratorId,

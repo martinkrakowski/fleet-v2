@@ -341,40 +341,73 @@ export function prepareLaneRunJournalAppend(
   }
   const entry = read.entry;
 
-  // 3. Entry id uniqueness.
-  for (const existingEntry of existing) {
-    if (existingEntry.entryId === entry.entryId) {
-      return { ok: false, reason: 'duplicate-entry-id', detail: null };
-    }
+  // 3. Keyed refusals, in check order: entry id, stop intents, duplicate intent key, result.
+  const refusal = appendRefusal(existing, entry);
+  if (refusal !== null) {
+    return refusal;
   }
 
-  // 4. Stop intents: the per-run strongest-stop refusal, before the key check.
-  if (entry.kind === 'intent' && entry.mode !== null) {
-    const refusal = stopIntentRefusal(existing, entry);
-    if (refusal !== null) {
-      return { ok: false, reason: refusal, detail: null };
-    }
-  }
-
-  // 5. Any other intent: the same key already present.
-  if (entry.kind === 'intent' && entry.mode === null) {
-    for (const existingEntry of existing) {
-      if (existingEntry.kind === 'intent' && existingEntry.key === entry.key) {
-        return { ok: false, reason: 'duplicate-key', detail: null };
-      }
-    }
-  }
-
-  // 6. Result: needs its intent, the same run, and nothing after a final result.
-  if (entry.kind === 'result') {
-    const refusal = resultRefusal(existing, entry);
-    if (refusal !== null) {
-      return refusal;
-    }
-  }
-
-  // 7. Conduct: no further check. 8. Append.
+  // 4. Conduct: no further check. 5. Append.
   return { ok: true, entry };
+}
+
+type LaneRunJournalAppendRefusal =
+  | { readonly ok: false; readonly reason: LaneRunJournalRefusal; readonly detail: string | null }
+  | null;
+
+function appendRefusal(
+  existing: readonly LaneRunJournalEntryRecord[],
+  entry: LaneRunJournalEntryRecord,
+): LaneRunJournalAppendRefusal {
+  // Entry id uniqueness.
+  if (hasDuplicateEntryId(existing, entry.entryId)) {
+    return { ok: false, reason: 'duplicate-entry-id', detail: null };
+  }
+
+  // Stop intents: the per-run strongest-stop refusal, before the key check.
+  if (entry.kind === 'intent' && entry.mode !== null) {
+    const reason = stopIntentRefusal(existing, entry);
+    if (reason !== null) {
+      return { ok: false, reason, detail: null };
+    }
+    return null;
+  }
+
+  // Any other intent: the same key already present.
+  if (entry.kind === 'intent' && entry.mode === null && hasDuplicateIntentKey(existing, entry.key)) {
+    return { ok: false, reason: 'duplicate-key', detail: null };
+  }
+
+  // Result: needs its intent, the same run, and nothing after a final result.
+  if (entry.kind === 'result') {
+    return resultRefusal(existing, entry);
+  }
+
+  return null;
+}
+
+function hasDuplicateEntryId(
+  existing: readonly LaneRunJournalEntryRecord[],
+  entryId: string,
+): boolean {
+  for (const existingEntry of existing) {
+    if (existingEntry.entryId === entryId) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasDuplicateIntentKey(
+  existing: readonly LaneRunJournalEntryRecord[],
+  key: string | null,
+): boolean {
+  for (const existingEntry of existing) {
+    if (existingEntry.kind === 'intent' && existingEntry.key === key) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function stopModeMismatchOf(input: unknown): boolean {
@@ -387,7 +420,7 @@ function stopModeMismatchOf(input: unknown): boolean {
   try {
     const readField = (name: string): unknown => {
       const descriptor = Reflect.getOwnPropertyDescriptor(input, name);
-      return descriptor === undefined ? undefined : descriptor.value;
+      return descriptor?.value;
     };
     kind = readField('kind');
     key = readField('key');
@@ -438,7 +471,7 @@ function stopIntentRefusal(
 function resultRefusal(
   existing: readonly LaneRunJournalEntryRecord[],
   entry: LaneRunJournalEntryRecord,
-): { readonly ok: false; readonly reason: LaneRunJournalRefusal; readonly detail: string | null } | null {
+): LaneRunJournalAppendRefusal {
   let intent: LaneRunJournalEntryRecord | null = null;
   for (const existingEntry of existing) {
     if (existingEntry.kind === 'intent' && existingEntry.key === entry.key) {
@@ -473,9 +506,7 @@ export function laneRunJournalStopFacts(entries: readonly LaneRunJournalEntryRec
   let stopRequestedAtIso: string | null = null;
   for (const entry of entries) {
     if (entry.kind === 'intent' && entry.mode !== null && entry.runId === runId) {
-      if (stopRequestedAtIso === null) {
-        stopRequestedAtIso = entry.recordedAtIso;
-      }
+      stopRequestedAtIso ??= entry.recordedAtIso;
       if (entry.mode === 'force') {
         stopMode = 'force';
       } else if (stopMode !== 'force') {
@@ -503,34 +534,52 @@ export function laneRunJournalPendingIntent(entries: readonly LaneRunJournalEntr
   }
   let pending: LaneRunJournalPendingIntent | null = null;
   for (const entry of entries) {
-    if (entry.kind !== 'intent' || entry.runId !== runId || entry.key === null) {
-      continue;
+    const stepIntent = pendingStepIntent(entries, entry, runId);
+    if (stepIntent !== null) {
+      pending = stepIntent;
     }
-    const parsed = parseLaneRunKey(entry.key);
-    if (parsed === null || parsed.kind !== 'step') {
-      continue;
-    }
-    let hasFinalResult = false;
-    let hasResult = false;
-    for (const other of entries) {
-      if (other.kind === 'result' && other.key === entry.key) {
-        hasResult = true;
-        if (other.outcome !== 'ambiguous') {
-          hasFinalResult = true;
-          break;
-        }
-      }
-    }
-    if (hasFinalResult) {
-      continue;
-    }
-    pending = {
-      key: entry.key,
-      step: parsed.step,
-      reconciliation: hasResult ? 'ambiguous' : 'unread',
-    };
   }
   return pending;
+}
+
+function pendingStepIntent(
+  entries: readonly LaneRunJournalEntryRecord[],
+  entry: LaneRunJournalEntryRecord,
+  runId: string,
+): LaneRunJournalPendingIntent | null {
+  if (entry.kind !== 'intent' || entry.runId !== runId || entry.key === null) {
+    return null;
+  }
+  const parsed = parseLaneRunKey(entry.key);
+  if (parsed?.kind !== 'step') {
+    return null;
+  }
+  if (entryHasFinalResult(entries, entry.key)) {
+    return null;
+  }
+  return {
+    key: entry.key,
+    step: parsed.step,
+    reconciliation: entryHasAnyResult(entries, entry.key) ? 'ambiguous' : 'unread',
+  };
+}
+
+function entryHasFinalResult(entries: readonly LaneRunJournalEntryRecord[], key: string): boolean {
+  for (const other of entries) {
+    if (other.kind === 'result' && other.key === key && other.outcome !== 'ambiguous') {
+      return true;
+    }
+  }
+  return false;
+}
+
+function entryHasAnyResult(entries: readonly LaneRunJournalEntryRecord[], key: string): boolean {
+  for (const other of entries) {
+    if (other.kind === 'result' && other.key === key) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** The state of the run's last conduct entry; 'ready' when it has none. */

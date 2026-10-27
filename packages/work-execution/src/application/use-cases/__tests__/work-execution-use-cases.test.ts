@@ -4512,6 +4512,36 @@ describe('attempt revision compare-and-swap retry', () => {
     expect(journal.heldFor('attempt-1')).toBe(false);
   });
 
+  it('dispatch refused start whose cancelled save conflicts keeps the stop reason on the rebuilt save (S1b)', async () => {
+    const attemptRepo = makeFailingSaveAttemptRepo({ conflictOnSave: 2 });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const runner = makeRunner({
+      startResult: { outcome: 'refused', reason: 'HTTP 429 Too Many Requests' },
+    });
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('refused');
+    const stored = attemptRepo.attempts.get('attempt-1');
+    expect(stored?.state).toBe('cancelled');
+    expect(stored?.stopReason).toBe('rate-limited');
+  });
+
   it('dispatch with running and rebuilt saves both conflicting stops the started session once and journals completed then ambiguous', async () => {
     const attemptRepo = makeFailingSaveAttemptRepo({
       conflictOnSaves: [2, 3],

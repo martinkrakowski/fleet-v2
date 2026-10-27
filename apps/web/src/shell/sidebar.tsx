@@ -36,7 +36,7 @@ export function Sidebar({ nav }: { nav: ProjectNavData }) {
           <ProjectNav data={nav} />
         </Suspense>
         <div className="sidebar-footer">
-          Brief and Knowledge show sample data · Lanes, Projects and Attempt read the API when configured
+          Brief and Knowledge show sample data · Lanes, Projects, Attempt and Questions read the API when configured
         </div>
       </aside>
       <div className="sidebar-backdrop" onClick={closeDrawer} />

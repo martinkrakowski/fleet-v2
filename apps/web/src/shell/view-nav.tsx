@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
-// "sample" marks views that show sample data only; Lanes, Projects and Attempt read the API when configured.
+// "sample" marks views that show sample data only; Lanes, Projects, Attempt and Questions read the API when configured.
 const VIEWS = [
   {
     href: "/lanes",
@@ -34,6 +34,17 @@ const VIEWS = [
     icon: (
       <svg className="ic" viewBox="0 0 24 24" aria-hidden="true">
         <path d="M8 5v14l11-7z" />
+      </svg>
+    ),
+  },
+  {
+    href: "/questions",
+    label: "Questions",
+    sample: false,
+    icon: (
+      <svg className="ic" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M9 9a3 3 0 1 1 4 2.8c-.6.3-1 .8-1 1.5V14" />
+        <path d="M12 17.5v.01" />
       </svg>
     ),
   },

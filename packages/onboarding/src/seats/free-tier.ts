@@ -17,9 +17,9 @@ import {
 } from '@fleet/installation';
 
 import type {
+  ChainRole,
   FleetInstallation,
   HostSection,
-  SeatRole,
 } from '@fleet/installation';
 
 import type { HostDraftCandidate } from '../hosts/draft.js';
@@ -32,7 +32,7 @@ export type FreeTierSetting = 'absent' | 'true' | 'false';
 
 /** One role's seat counts: file chain steps vs derived (in-use) chain length. */
 export interface FreeTierRoleCount {
-  readonly role: SeatRole;
+  readonly role: ChainRole;
   readonly inFile: number;
   readonly inUse: number;
 }
@@ -42,6 +42,7 @@ export interface FreeTierSummary {
   readonly setting: FreeTierSetting;
   readonly enabled: boolean; // setting !== 'false'
   readonly freeSeatIds: readonly string[]; // seats with costClass 'free', in file order
+  readonly unhealthySeatIds: readonly string[]; // seats with health 'unhealthy', in file order
   readonly roles: readonly FreeTierRoleCount[];
 }
 
@@ -95,8 +96,9 @@ export function validateV2InstallationValue(value: unknown): ValidateV2Result {
   return { ok: false, installation, errors };
 }
 
-const FREE_TIER_ROLES: readonly SeatRole[] = [
+const FREE_TIER_ROLES: readonly ChainRole[] = [
   'implementer',
+  'fix',
   'reviewer',
   'high-risk-reviewer',
 ];
@@ -110,9 +112,13 @@ export function summariseFreeTier(
     flag === undefined ? 'absent' : flag ? 'true' : 'false';
 
   const freeSeatIds: string[] = [];
+  const unhealthySeatIds: string[] = [];
   for (const seat of installation.seats ?? []) {
     if (seat.costClass === 'free') {
       freeSeatIds.push(seat.id);
+    }
+    if (seat.health === 'unhealthy') {
+      unhealthySeatIds.push(seat.id);
     }
   }
 
@@ -128,7 +134,7 @@ export function summariseFreeTier(
     });
   }
 
-  return { setting, enabled: setting !== 'false', freeSeatIds, roles };
+  return { setting, enabled: setting !== 'false', freeSeatIds, unhealthySeatIds, roles };
 }
 
 /**
@@ -220,6 +226,9 @@ export function renderFreeTierStatus(summary: FreeTierSummary): string[] {
     lines.push(`free seats (in use): ${summary.freeSeatIds.join(', ')}`);
   } else {
     lines.push(`free seats (disabled): ${summary.freeSeatIds.join(', ')}`);
+  }
+  if (summary.unhealthySeatIds.length > 0) {
+    lines.push('unhealthy seats (skipped by seat selection): ' + summary.unhealthySeatIds.join(', '));
   }
   for (const role of summary.roles) {
     lines.push(

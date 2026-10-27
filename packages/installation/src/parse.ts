@@ -26,6 +26,7 @@ import type {
   ReviewerSection,
   RunnerCapabilityDeclaration,
   RunnerSection,
+  SeatHealth,
   SeatSection,
   SeatRole,
   ShelfSection,
@@ -138,11 +139,13 @@ const V2_SEAT_KEYS: readonly string[] = [
   'agent',
   'roles',
   'costClass',
+  'health',
 ];
 const CHAIN_KEYS: readonly (keyof ChainsSection)[] = [
   'implementer',
   'reviewer',
   'high-risk-reviewer',
+  'fix',
 ];
 const CHAIN_STEP_KEYS: readonly string[] = ['seatId', 'triggers'];
 const POLICY_KEYS: readonly string[] = [
@@ -201,6 +204,7 @@ const SEAT_ROLES: readonly SeatRole[] = [
   'high-risk-reviewer',
 ];
 const COST_CLASSES: readonly CostClass[] = ['free', 'plan-quota', 'paid'];
+const SEAT_HEALTH_VALUES: readonly SeatHealth[] = ['healthy', 'unhealthy'];
 const CHAIN_TRIGGERS: readonly ChainTrigger[] = [
   '429',
   '402',
@@ -1431,6 +1435,17 @@ function parseV2Seats(
       'must be a known cost class',
       errors,
     );
+    let health: SeatHealth | undefined;
+    if (Object.hasOwn(entry, 'health')) {
+      health = readRequiredEnum(
+        entry,
+        'health',
+        `${seatPath}.health`,
+        SEAT_HEALTH_VALUES,
+        'must be healthy or unhealthy',
+        errors,
+      );
+    }
     if (id !== undefined) {
       if (seenIds.has(id)) {
         repeated = true;
@@ -1455,6 +1470,7 @@ function parseV2Seats(
       ...(agent !== undefined ? { agent } : {}),
       roles,
       costClass,
+      ...(health !== undefined ? { health } : {}),
     });
   }
   if (repeated) {

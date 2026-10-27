@@ -3,11 +3,18 @@
  * `AttemptSummary`/`WorkOrderSummary` records.
  *
  * The live list is a RECORDED view: it reports what the API journal holds,
- * never a runner observation. Every mapped row carries `basis: "recorded"`
- * with the recorded state word, and the UI rules keep unknown separate from
- * idle and recorded separate from observed.
+ * never a runner observation. Rows keep the recorded runner seat, usage and
+ * head commit; runner observations stay unknown. Every mapped row carries
+ * `basis: "recorded"` with the recorded state word, and the UI rules keep
+ * unknown separate from idle and recorded separate from observed.
  */
 
+import {
+  isRecord,
+  parseRecordedAttempt,
+  usageCost,
+  type RecordedAttemptWire,
+} from "../../lib/attempt-wire";
 import type {
   AttemptSummary,
   CapacityState,
@@ -16,18 +23,7 @@ import type {
 
 /** One row of the `result.attempts` array from `/v1/attempts`. */
 export interface ListedAttemptWire {
-  attempt: {
-    id: string;
-    workOrderId: string;
-    kind: "initial" | "fix";
-    fixNumber: number;
-    priorAttemptId: string | null;
-    state: string;
-    outcome: string | null;
-    sessionId: string | null;
-    createdAtIso: string;
-    updatedAtIso: string;
-  };
+  attempt: RecordedAttemptWire;
   workOrder: {
     id: string;
     projectId: string;
@@ -45,46 +41,6 @@ export interface ParsedAttemptList {
   rows: ListedAttemptWire[];
   total: number;
   truncated: boolean;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function parseAttempt(value: unknown): ListedAttemptWire["attempt"] | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-  if (typeof value.id !== "string") return null;
-  if (typeof value.workOrderId !== "string") return null;
-  if (typeof value.state !== "string") return null;
-  if (typeof value.createdAtIso !== "string") return null;
-  if (typeof value.updatedAtIso !== "string") return null;
-  if (value.kind !== "initial" && value.kind !== "fix") return null;
-  if (
-    typeof value.fixNumber !== "number" ||
-    !Number.isInteger(value.fixNumber) ||
-    value.fixNumber < 0
-  ) {
-    return null;
-  }
-  if (value.priorAttemptId !== null && typeof value.priorAttemptId !== "string") {
-    return null;
-  }
-  if (value.outcome !== null && typeof value.outcome !== "string") return null;
-  if (value.sessionId !== null && typeof value.sessionId !== "string") return null;
-  return {
-    id: value.id,
-    workOrderId: value.workOrderId,
-    kind: value.kind,
-    fixNumber: value.fixNumber,
-    priorAttemptId: value.priorAttemptId,
-    state: value.state,
-    outcome: value.outcome,
-    sessionId: value.sessionId,
-    createdAtIso: value.createdAtIso,
-    updatedAtIso: value.updatedAtIso,
-  };
 }
 
 function parseWorkOrderWire(
@@ -139,7 +95,7 @@ function parseRow(value: unknown): ListedAttemptWire | null {
   if (!isRecord(value)) {
     return null;
   }
-  const attempt = parseAttempt(value.attempt);
+  const attempt = parseRecordedAttempt(value.attempt);
   if (!attempt) {
     return null;
   }
@@ -242,7 +198,7 @@ export function toAttemptSummary(row: ListedAttemptWire): AttemptSummary {
     },
     mergeHead: null,
     pullRequest: null,
-    cost: null,
+    cost: usageCost(attempt.usage),
     legal: [],
     notOffered: [
       {
@@ -252,6 +208,9 @@ export function toAttemptSummary(row: ListedAttemptWire): AttemptSummary {
     ],
     basis: "recorded",
     recordedState: state,
+    recordedRunner: attempt.runner,
+    recordedUsage: attempt.usage,
+    headCommit: attempt.artifacts?.headCommit ?? null,
   };
 }
 

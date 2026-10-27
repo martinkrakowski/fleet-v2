@@ -49,3 +49,6 @@ export { budgetAllows } from './decisions/budget.js';
 export type { BudgetInput, BudgetDecision } from './decisions/budget.js';
 
 export { isValidHostName } from './host-name.js';
+
+export { SEAT_BILLINGS, billingOf } from './billing.js';
+export type { SeatBilling } from './billing.js';

@@ -32,10 +32,13 @@ describe("W10 usage chips source wiring", () => {
   });
 
   it("keeps the usage view pure with type-only imports and exact wording", () => {
+    const sharedBillingImport =
+      'import { billingOf as billingOfRunnerKind, type SeatBilling } from "@fleet/shared";';
     const imports = view.match(/^import .*$/gm) ?? [];
     expect(imports.length).toBeGreaterThan(0);
+    expect(imports).toContain(sharedBillingImport);
     for (const line of imports) {
-      expect(line.startsWith("import type")).toBe(true);
+      expect(line.startsWith("import type") || line === sharedBillingImport).toBe(true);
     }
     expect(view).toContain('"plan, not spend"');
     expect(view).toContain('"not measured"');

@@ -1272,7 +1272,7 @@ describe('OcmReviewTransport', () => {
     it('a timeout (null exit code) rejects and surfaces as unavailable through the adapter', async () => {
       const fakeSpawn: OcmReviewTransportSpawn = async () => ({
         exitCode: null,
-        stdout: '',
+        stdout: '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
         stderr: 'command exceeded its 1234ms timeout',
       });
 

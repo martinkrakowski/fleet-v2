@@ -3,7 +3,9 @@ import {
   consumptionId,
   forgeActionScope,
   observationEventKind,
+  FORGE_REFUSAL_KINDS,
   type ForgeActionKind,
+  type ForgeRefusalKind,
 } from '../coordination-keys.js';
 
 describe('coordination-keys domain', () => {
@@ -36,5 +38,16 @@ describe('coordination-keys domain', () => {
       expect(observationEventKind('forge', 'refused')).toBe('execution:forge:refused');
       expect(observationEventKind('dispatch', 'started')).toBe('execution:dispatch:started');
     });
+  });
+});
+
+describe('FORGE_REFUSAL_KINDS', () => {
+  it('lists the four refusal kinds in conflict-first order', () => {
+    expect(FORGE_REFUSAL_KINDS).toEqual(['conflict', 'protection', 'permission', 'other']);
+  });
+
+  it('accepts other as a ForgeRefusalKind', () => {
+    const kind: ForgeRefusalKind = 'other';
+    expect(kind).toBe('other');
   });
 });

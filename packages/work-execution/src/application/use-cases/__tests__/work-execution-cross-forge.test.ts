@@ -996,6 +996,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
     expect(result).toEqual({
       outcome: 'refused',
       reason: 'Ambiguous forge response requires reconciliation: merge request timed out',
+      forgeAmbiguous: true,
     });
     expect(journal.entries.map((entry) => entry.status)).toEqual([
       'intent-recorded',
@@ -1006,16 +1007,46 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
 
   it('reports a refused forge response with its reason', async () => {
     const { useCase, journal } = makeDeps({
-      forgeResult: { outcome: 'refused', reason: 'gh pr merge failed (exit 1)' },
+      forgeResult: {
+        outcome: 'refused',
+        reason: 'gh pr merge failed (exit 1)',
+        refusalKind: 'other',
+      },
     });
 
     const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
 
-    expect(result).toEqual({ outcome: 'refused', reason: 'gh pr merge failed (exit 1)' });
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'gh pr merge failed (exit 1)',
+      forgeRefusalKind: 'other',
+    });
     expect(journal.entries.map((entry) => entry.status)).toEqual([
       'intent-recorded',
       'refused',
     ]);
+  });
+
+  it('passes the forge refusal kind through and omits it for pre-forge refusals', async () => {
+    const forged = await makeDeps({
+      forgeResult: {
+        outcome: 'refused',
+        reason: 'gh pr merge failed (exit 1): X',
+        refusalKind: 'conflict',
+      },
+    }).useCase.executeAuthorizedForgeAction(forgeRequest());
+
+    expect(forged).toEqual({
+      outcome: 'refused',
+      reason: 'gh pr merge failed (exit 1): X',
+      forgeRefusalKind: 'conflict',
+    });
+
+    const preForge = await makeDeps({ workOrder: null }).useCase.executeAuthorizedForgeAction(
+      forgeRequest(),
+    );
+    expect('forgeRefusalKind' in preForge).toBe(false);
+    expect('forgeAmbiguous' in preForge).toBe(false);
   });
 
   it('enforces single grant consumption through the real authorization adapter', async () => {
@@ -1455,6 +1486,7 @@ describe('ForgeActionAdapter', () => {
     expect(result).toEqual({
       outcome: 'refused',
       reason: `Moved head: branch feat/${LANE_ID} is at ${OTHER_SHA}, expected ${HEAD_SHA}`,
+      refusalKind: 'other',
     });
     expect(calls).toHaveLength(0);
   });
@@ -1525,6 +1557,7 @@ describe('ForgeActionAdapter', () => {
     expect(result).toEqual({
       outcome: 'refused',
       reason: 'gh pr create failed (exit 1): GraphQL: branch protection (organization rules)',
+      refusalKind: 'protection',
     });
   });
 
@@ -1574,6 +1607,7 @@ describe('ForgeActionAdapter', () => {
     expect(result).toEqual({
       outcome: 'refused',
       reason: 'gh pr merge failed (exit 1): pull request not mergeable',
+      refusalKind: 'other',
     });
   });
 
@@ -1589,10 +1623,12 @@ describe('ForgeActionAdapter', () => {
     expect(createResult).toEqual({
       outcome: 'refused',
       reason: 'Cannot perform forge action without verifyCurrentHeadSha',
+      refusalKind: 'other',
     });
     expect(mergeResult).toEqual({
       outcome: 'refused',
       reason: 'Cannot perform forge action without verifyCurrentHeadSha',
+      refusalKind: 'other',
     });
     expect(calls).toHaveLength(0);
   });
@@ -1606,8 +1642,16 @@ describe('ForgeActionAdapter', () => {
     );
     const badBranch = await adapter.performForgeAction(forgeActionRequest({ branchName: 'bad branch' }));
 
-    expect(badHead).toEqual({ outcome: 'refused', reason: 'Invalid expected head SHA: not-a-sha' });
-    expect(badBranch).toEqual({ outcome: 'refused', reason: 'Invalid branch name: bad branch' });
+    expect(badHead).toEqual({
+      outcome: 'refused',
+      reason: 'Invalid expected head SHA: not-a-sha',
+      refusalKind: 'other',
+    });
+    expect(badBranch).toEqual({
+      outcome: 'refused',
+      reason: 'Invalid branch name: bad branch',
+      refusalKind: 'other',
+    });
     expect(calls).toHaveLength(0);
   });
 });

@@ -6,7 +6,9 @@
  * argument array; the branch head is verified against the expected head
  * before any command runs, merges are pinned to the expected head with
  * --match-head-commit, and an unknown or unverifiable outcome is reported
- * as ambiguous for reconciliation rather than guessed.
+ * as ambiguous for reconciliation rather than guessed. Every refusal names
+ * a kind derived from the failed run's whole output; an unrecognised one
+ * is `other`.
  */
 
 import type {
@@ -14,6 +16,7 @@ import type {
   ForgeActionRequest,
   ForgeActionResult,
 } from '../../application/ports/out/ForgeActionPort.out-port.js';
+import type { ForgeRefusalKind } from '../../domain/coordination-keys.js';
 
 /** Result of one reviewed gh invocation. */
 export interface GhInvocationResult {
@@ -42,6 +45,51 @@ function errorMessage(error: unknown): string {
 
 function firstLine(text: string): string {
   return text.trim().split('\n')[0] ?? '';
+}
+
+/** Lower-case needles checked in this order: permission, then protection, then conflict. */
+const PERMISSION_NEEDLES: readonly string[] = [
+  'resource not accessible by integration',
+  'does not have the correct permissions',
+  'must have admin rights',
+  'must have write access',
+  'permission denied',
+  'bad credentials',
+  'http 401',
+  'http 403',
+  'gh auth login',
+];
+const PROTECTION_NEEDLES: readonly string[] = [
+  'base branch policy prohibits the merge',
+  'required status check',
+  'approving review',
+  'review is required',
+  'repository rule violation',
+  'protected branch',
+  'branch protection',
+];
+const CONFLICT_NEEDLES: readonly string[] = [
+  'merge commit cannot be cleanly created',
+  'merge conflict',
+  'has conflicts',
+];
+
+/**
+ * Classify a failed `gh` run by its whole output (plan AM4b). Permission wins
+ * over protection, protection over conflict; anything unrecognised is `other`.
+ */
+export function classifyGhRefusal(stderr: string, stdout: string): ForgeRefusalKind {
+  const text = (stderr + '\n' + stdout).toLowerCase();
+  if (PERMISSION_NEEDLES.some((needle) => text.includes(needle))) {
+    return 'permission';
+  }
+  if (PROTECTION_NEEDLES.some((needle) => text.includes(needle))) {
+    return 'protection';
+  }
+  if (CONFLICT_NEEDLES.some((needle) => text.includes(needle))) {
+    return 'conflict';
+  }
+  return 'other';
 }
 
 /** Commit SHAs are 7-40 lowercase hex characters. */
@@ -81,12 +129,14 @@ export class ForgeActionAdapter implements ForgeActionPort {
       return {
         outcome: 'refused',
         reason: `Invalid expected head SHA: ${request.expectedHeadSha}`,
+        refusalKind: 'other',
       };
     }
     if (!isSafeBranchName(request.branchName)) {
       return {
         outcome: 'refused',
         reason: `Invalid branch name: ${request.branchName}`,
+        refusalKind: 'other',
       };
     }
 
@@ -97,6 +147,7 @@ export class ForgeActionAdapter implements ForgeActionPort {
       return {
         outcome: 'refused',
         reason: 'Cannot perform forge action without verifyCurrentHeadSha',
+        refusalKind: 'other',
       };
     }
     let currentHead: string;
@@ -113,6 +164,7 @@ export class ForgeActionAdapter implements ForgeActionPort {
       return {
         outcome: 'refused',
         reason: `Moved head: branch ${request.branchName} is at ${currentHead}, expected ${request.expectedHeadSha}`,
+        refusalKind: 'other',
       };
     }
 
@@ -149,6 +201,7 @@ export class ForgeActionAdapter implements ForgeActionPort {
       return {
         outcome: 'refused',
         reason: `gh pr create failed (exit ${gh.exitCode}): ${firstLine(gh.stderr) || firstLine(gh.stdout)}`,
+        refusalKind: classifyGhRefusal(gh.stderr, gh.stdout),
       };
     }
     const match = /\/pull\/(\d+)/.exec(gh.stdout) ?? /^#(\d+)\b/m.exec(gh.stdout);
@@ -191,6 +244,7 @@ export class ForgeActionAdapter implements ForgeActionPort {
       return {
         outcome: 'refused',
         reason: `gh pr merge failed (exit ${gh.exitCode}): ${firstLine(gh.stderr) || firstLine(gh.stdout)}`,
+        refusalKind: classifyGhRefusal(gh.stderr, gh.stdout),
       };
     }
     return {

@@ -4,4 +4,5 @@ export * from "./ActionAuthorization.vo.js";
 export * from "./CoordinationKind.vo.js";
 export * from "./CoordinationState.vo.js";
 export * from "./ObservationEnvelope.vo.js";
+export * from "./OwnerItemKind.vo.js";
 export * from "./PolicyReference.vo.js";

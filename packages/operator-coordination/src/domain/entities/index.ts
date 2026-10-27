@@ -4,6 +4,7 @@ export * from "./AuthorizationConsumption.js";
 export * from "./CoordinationRequest.js";
 export * from "./OrchestratorRequest.js";
 export * from "./OrchestratorSession.js";
+export * from "./OwnerItem.js";
 export * from "./OwnerQuestion.js";
 export * from "./ProjectProfile.js";
 export * from "./RelayAcknowledgement.js";

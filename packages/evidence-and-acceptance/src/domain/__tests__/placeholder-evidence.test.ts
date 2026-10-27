@@ -174,6 +174,19 @@ describe('write-side field checks (A2, D1)', () => {
   });
 });
 
+describe('reason versus summary rule split (A2, Fable minor 1)', () => {
+  it('refuses a disposition reason that starts with a placeholder, while the same text is a valid finding summary', () => {
+    const text = 'TBD: will fix in the next round';
+    expect(placeholderFindingDispositionField({ reason: text, evidenceRef: 'ref-1' })).toBe('reason');
+    expect(
+      placeholderReviewReceiptField({
+        evidenceRef: 'ref-1',
+        findings: [{ summary: text }] as unknown as Parameters<typeof placeholderReviewReceiptField>[0]['findings'],
+      }),
+    ).toBeNull();
+  });
+});
+
 describe('isWholeValuePlaceholder (amendment D-a/D-b)', () => {
   it.each(['n/a', 'TBD', 'none.', '', '   ', 'tbd', 'todo', 'should work', 'lgtm', 'seems', 'probably', 'i think', 'N/A', 'na', 'none', 'looks right', 'looks good'])(
     'refuses %j',

@@ -23,6 +23,13 @@ import {
   type RunnerForAttemptHostSpec,
 } from './ConfirmRecordedHost.js';
 
+/**
+ * The worktree (and a full clone's .git/config) is lane-writable, so every git call disables the
+ * lane's fsmonitor and hooks, as C1's artifact adapter does: `status` refreshes the index and would
+ * otherwise run a planted `core.fsmonitor` command on the recorded host (Fable, RW2 review).
+ */
+export const REVIEW_GIT_HARDENING: readonly string[] = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null'];
+
 export type AttemptReviewRoute =
   | { readonly kind: 'installation'; readonly remotePort: number; readonly remoteHost: string; readonly authFile?: string }
   | { readonly kind: 'legacy'; readonly remotePort?: number; readonly remoteHost?: string }
@@ -137,7 +144,7 @@ export class AttemptReviewLocator {
     args: readonly string[],
   ): Promise<string | null> {
     try {
-      const result = await executor.run(['git', '-C', worktreePath, ...args], {
+      const result = await executor.run(['git', '-C', worktreePath, ...REVIEW_GIT_HARDENING, ...args], {
         timeoutMs,
         maxBufferBytes: MAX_BUFFER_BYTES,
       });

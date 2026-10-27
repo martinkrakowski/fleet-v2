@@ -4,7 +4,7 @@ import type { AttemptRecord } from '../../../domain/execution-records.js';
 import type { CommandRunOptions, CommandRunResult, CommandExecutorPort } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 import { ExecutorForHost } from '../ExecutorForHost.helper.js';
 import type { RunnerForAttemptHostSpec } from '../ConfirmRecordedHost.js';
-import { AttemptReviewLocator } from '../AttemptReviewLocator.helper.js';
+import { AttemptReviewLocator, REVIEW_GIT_HARDENING } from '../AttemptReviewLocator.helper.js';
 
 const WORKTREE = '/srv/fleet/worktrees/att-1';
 const A40 = 'a'.repeat(40);
@@ -311,8 +311,8 @@ describe('AttemptReviewLocator', () => {
     });
     const location = await locator.locate('att-1');
     await expect(location.readHead()).resolves.toBe('abc…');
-    expect(calls[0]).toEqual(['git', '-C', WORKTREE, 'rev-parse', 'HEAD']);
-    expect(calls[0]?.length).toBe(5);
+    expect(calls[0]).toEqual(['git', '-C', WORKTREE, ...REVIEW_GIT_HARDENING, 'rev-parse', 'HEAD']);
+    expect(calls[0]?.length).toBe(9);
 
     const failing = fakeLegacyExecutor(() => ({ exitCode: 1 }));
     const failingLocator = makeLocator({
@@ -379,6 +379,7 @@ describe('AttemptReviewLocator', () => {
       'git',
       '-C',
       WORKTREE,
+      ...REVIEW_GIT_HARDENING,
       '-c',
       'core.quotePath=false',
       'diff',
@@ -408,6 +409,6 @@ describe('AttemptReviewLocator', () => {
     });
     const location = await locator.locate('att-1');
     await expect(location.readStatus()).resolves.toBe('');
-    expect(calls[0]).toEqual(['git', '-C', WORKTREE, 'status', '--porcelain=v1']);
+    expect(calls[0]).toEqual(['git', '-C', WORKTREE, ...REVIEW_GIT_HARDENING, 'status', '--porcelain=v1']);
   });
 });

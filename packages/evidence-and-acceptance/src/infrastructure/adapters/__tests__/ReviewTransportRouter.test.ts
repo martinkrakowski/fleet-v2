@@ -374,6 +374,8 @@ describe('ReviewTransportRouter', () => {
       reviewerModel: 'other-provider/glm-5.3-flash',
     });
     expect(sameFamily.outcome).toBe('unavailable');
+    expect(sameFamily.reason).toMatch(/share the same underlying model/);
+    expect(sameFamily.reason).not.toMatch(/No reviewer seat/);
     expect(locateCalls).toEqual([]);
 
     const unknownModel = await adapter.runIndependentReview({

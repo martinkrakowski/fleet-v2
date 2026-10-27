@@ -77,6 +77,24 @@ describe('LaneRun.create', () => {
     if (!withOffset.success) return;
     expect(withOffset.value.toRecord().lease?.leaseUntilIso).toBe('2026-10-27T08:00:00.000Z');
 
+    for (const impossible of [
+      '2026-02-31T10:00:00Z',
+      '2026-02-29T10:00:00Z',
+      '2026-13-01T10:00:00Z',
+      '2026-00-10T10:00:00Z',
+      '2026-10-00T10:00:00Z',
+      '2026-10-27T24:00:00Z',
+      '2026-10-27T10:60:00Z',
+    ]) {
+      const refused = LaneRun.create({ ...VALID, lease: { ...VALID_LEASE, leaseUntilIso: impossible } });
+      expect(refused.success).toBe(false);
+    }
+    const leapDay = LaneRun.create({
+      ...VALID,
+      lease: { ...VALID_LEASE, leaseUntilIso: '2028-02-29T10:00:00Z' },
+    });
+    expect(leapDay.success).toBe(true);
+
     const first = withLease.value.toRecord();
     const second = withLease.value.toRecord();
     (first.attemptIds as string[]).push('attempt-example-2');

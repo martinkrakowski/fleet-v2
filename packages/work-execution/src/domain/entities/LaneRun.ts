@@ -425,11 +425,30 @@ function leaseSnapshotError(snapshot: Record<string, unknown> | null): string | 
   if (
     typeof snapshot.leaseUntilIso !== 'string' ||
     !LEASE_ISO_PATTERN.test(snapshot.leaseUntilIso) ||
+    !isCalendarDateTime(snapshot.leaseUntilIso) ||
     Number.isNaN(Date.parse(snapshot.leaseUntilIso))
   ) {
     return 'LaneRun lease must be null or { holderId, fence, leaseUntilIso }';
   }
   return null;
+}
+
+/**
+ * True when the date and time fields name a real calendar instant. Date.parse rolls an impossible
+ * date such as 02-31 over into the next month instead of refusing it, so the fields are checked here.
+ */
+function isCalendarDateTime(iso: string): boolean {
+  const year = Number(iso.slice(0, 4));
+  const month = Number(iso.slice(5, 7));
+  const day = Number(iso.slice(8, 10));
+  const hour = Number(iso.slice(11, 13));
+  const minute = Number(iso.slice(14, 16));
+  const second = Number(iso.slice(17, 19));
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) {
+    return false;
+  }
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return day >= 1 && day <= daysInMonth;
 }
 
 function buildLeaseRecord(snapshot: Record<string, unknown>): LaneRunLeaseRecord {

@@ -30,6 +30,7 @@ import {
   AllowedSeatAdapter,
   AttemptArtifactAdapter,
   AttemptRepositoryAdapter,
+  AttemptReviewLocator,
   BriefAuthoringAdapter,
   BriefKnowledgeAdapter,
   CollectAttemptArtifactsUseCase,
@@ -63,6 +64,7 @@ import {
   executorForInstallationHost,
   hasRecordedHostName,
   consumptionId,
+  defaultOcmRunPath,
   forgeActionScope,
   isSafeSshHost,
   observationEventKind,
@@ -82,12 +84,15 @@ import {
   AssessHeadAcceptanceUseCase,
   assessmentIdForAttempt,
   AttemptOwnerDecisionAdapter,
+  createReviewTransportRouter,
   EvidenceArchiveAdapter,
   EvidenceAssessmentRepositoryAdapter,
   EvidenceSeatPolicyAdapter,
   ForgeEvidenceAdapter,
+  hasReviewerSeat,
   IndependentReviewAdapter,
   InspectAcceptanceEvidenceUseCase,
+  type OcmReviewTransportSpawn,
   OwnerDecisionAdapter,
   RecordFindingDispositionUseCase,
   RecordReviewReceiptUseCase,
@@ -195,6 +200,8 @@ export interface FleetCliRuntimeOptions {
   readonly adviceFetch?: typeof fetch;
   /** Stub key reader override for the ranking advice provider (tests only). */
   readonly adviceReadKey?: (path: string) => Promise<string>;
+  /** Spy transport for the review subprocess (tests only); production runs ocm-run. */
+  readonly reviewSpawn?: OcmReviewTransportSpawn;
 }
 
 export interface ResolvedRunnerSettings {
@@ -865,8 +872,36 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     executor: roleExecutors.verifier,
     allowListedCommands: options?.installation?.verification?.procedures,
   });
-  // No independent review transport is configured; requests report that.
-  const independentReview = new IndependentReviewAdapter();
+  // The reviewer seat comes from the installation's reviewer and
+  // high-risk-reviewer chains; with none, requests report "No independent
+  // review transport is configured". Independence (a different model family)
+  // is enforced by the adapter and use case before any transport runs.
+  // The locator needs the work context's attempt repository and recorded-host
+  // executors, built below; it is filled in there, and review requests only
+  // run after composition finishes.
+  const reviewLocatorRef: { locator?: AttemptReviewLocator } = {};
+  const reviewSeats = installationModel?.seats ?? [];
+  const reviewChains = installationModel?.chains;
+  let independentReview: IndependentReviewAdapter;
+  if (hasReviewerSeat(reviewSeats, reviewChains)) {
+    independentReview = new IndependentReviewAdapter({
+      runReview: createReviewTransportRouter({
+        seats: reviewSeats,
+        chains: reviewChains,
+        locate: async (attemptId) => {
+          const locator = reviewLocatorRef.locator;
+          if (locator === undefined) {
+            throw new Error('The work context is not wired for review location');
+          }
+          return locator.locate(attemptId);
+        },
+        ocmRunBin: ocmRunBin ?? defaultOcmRunPath(),
+        ...(options?.reviewSpawn !== undefined ? { ocmSpawn: options.reviewSpawn } : {}),
+      }),
+    });
+  } else {
+    independentReview = new IndependentReviewAdapter();
+  }
   // Free-seat flag (F5): a structural subset of the derived model; absent
   // installation or flag means allowed.
   const seatPolicy = new EvidenceSeatPolicyAdapter({
@@ -997,6 +1032,18 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const executorForHost = new ExecutorForHost({
     hosts: options?.installation?.hosts,
     legacyExecutor: roleExecutors.worktree,
+  });
+  // The review locator reads attempt records and recorded-host executors from
+  // this work context; it is filled in here so the router bound above only
+  // runs after composition finishes.
+  reviewLocatorRef.locator = new AttemptReviewLocator({
+    findAttempt: (attemptId) => attemptRepository.findAttemptById(attemptId),
+    executorForHost,
+    hosts: options?.installation?.hosts,
+    legacyRoute: {
+      ...(runnerRemotePort !== undefined ? { remotePort: runnerRemotePort } : {}),
+      ...(runnerRemoteHost !== undefined ? { remoteHost: runnerRemoteHost } : {}),
+    },
   });
   const workspace = new WorkspaceAdapter({
     executor: roleExecutors.worktree,

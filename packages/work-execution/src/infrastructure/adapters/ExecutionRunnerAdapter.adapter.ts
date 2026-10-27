@@ -76,6 +76,11 @@ function resolveBundledOcmRunPath(): string {
 
 const DEFAULT_OCM_RUN_PATH = resolveBundledOcmRunPath();
 
+/** The bundled `bin/ocm-run` path (or `ocm-run` from PATH when absent), for other ocm-run callers. */
+export function defaultOcmRunPath(): string {
+  return DEFAULT_OCM_RUN_PATH;
+}
+
 export interface SubprocessResult {
   readonly exitCode: number;
   readonly stdout: string;

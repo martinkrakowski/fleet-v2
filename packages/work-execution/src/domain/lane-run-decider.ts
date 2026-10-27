@@ -23,8 +23,10 @@ import {
   afterLaneRunAcceptance,
   afterLaneRunFailure,
   afterLaneRunPreMergePass,
+  laneRunDrainContinues,
   laneRunHaltLiftExit,
   laneRunHeadChanged,
+  LANE_RUN_DRAIN_STEPS,
   LANE_RUN_HEAD_CHANGE_STATES,
   LANE_RUN_STEP_OF_STATE,
 } from './lane-run-transitions.js';
@@ -713,9 +715,61 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return stopAct(facts.attempt, wait('stop-unconfirmed'));
     }
 
-    // G4i: interim — a graceful stop takes no action at all.
+    // G4i / GD1–GD6 (§3.9.1): a graceful stop drains the run's live attempt.
     if (facts.stopMode === 'graceful') {
-      return wait('stop-draining');
+      const phase = facts.attempt === null ? null : facts.attempt.phase;
+      const live = phase === 'dispatching' || phase === 'running' || phase === 'blocked';
+      const drainContinues = laneRunDrainContinues(facts.state, facts.gate);
+      const drainWait = (): LaneRunDecision => {
+        if (facts.stopRequestedAtIso === null || Number.isNaN(Date.parse(facts.stopRequestedAtIso))) {
+          return wait('stop-grace-exceeded');
+        }
+        if (now >= Date.parse(facts.stopRequestedAtIso) + facts.stopGraceMinutes * 60_000) {
+          return wait('stop-grace-exceeded');
+        }
+        return wait('stop-draining');
+      };
+      // GD1: nothing live left to drain ends the run.
+      if ((phase === null || !live) && !drainContinues) {
+        return enter('stopped');
+      }
+      // GD2: a park whose attempt may still run stands (§3.8).
+      if (live && facts.state === 'parked') {
+        return wait('parked');
+      }
+      // GD3: a live attempt outside the drain states waits on the drain.
+      if (live && !drainContinues) {
+        return drainWait();
+      }
+      // GD4: inside the drain states the state rules apply, with GD5 and GD6.
+      let decision: LaneRunDecision;
+      switch (facts.state) {
+        case 'dispatching':
+          decision = dispatchingRules();
+          break;
+        case 'running':
+          decision = runningRules();
+          break;
+        case 'collecting':
+          decision = collectingRules();
+          break;
+        case 'gating':
+          decision = gatingRules();
+          break;
+        default:
+          decision = WAIT_FACTS_INCONSISTENT;
+      }
+      if (decision.kind === 'wait' && (decision.reason === 'dispatch-pending' || decision.reason === 'lane-running')) {
+        return drainWait();
+      }
+      if (
+        decision.kind === 'act' &&
+        !(LANE_RUN_DRAIN_STEPS as readonly string[]).includes(decision.step) &&
+        decision.step !== 'stop'
+      ) {
+        return drainWait();
+      }
+      return decision;
     }
 
     // G5: parked waits for a resume or the owner's answer.

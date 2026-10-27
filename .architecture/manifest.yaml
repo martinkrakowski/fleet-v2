@@ -521,6 +521,7 @@ bounded_contexts:
         - "Domain rules receive time, IDs and digest values as inputs; infrastructure supplies clocks, randomness and hashing."
         - "Lanes have no forge, shelf or Waves access. Provider keys remain in the existing host-side key proxy; memory enters through frozen briefs."
         - "A lane run records only what cannot be derived (work order, tier, seat plan reference and cursors, round 0-2, attempt ids, PR number, park, lease, revision, run policy revision); its state is a projection of attempts, the keyed journal, receipts and forge evidence. Every external action of a run carries the idempotency key <runId>/r<round>/<step>/<seatIndex>[@<head12>], and the control keys <runId>/stop@web, <runId>/park/<n>/resume@web and request/<requestId> sit beside them."
+        - "A run lease and the state directory's driver lease are taken by CAS on the fence the taker read, only when the lease is null or lapsed, and each taking raises the fence by one; renewing keeps the fence, releasing keeps holder and fence, and the fence never goes back. A lease change never moves the run's revision."
       lifecycle_requirements:
         - "Dispatch intent is durable before start; ambiguous results enter reconciliation rather than blind retries."
         - "Only a matching ended observation permits artifact collection and capacity release."

@@ -85,6 +85,7 @@ describe('CliReviewTransport', () => {
       '--permission-mode',
       'plan',
       '--disable-web-search',
+      '-p',
       '{prompt}',
     ]);
   });
@@ -104,6 +105,7 @@ describe('CliReviewTransport', () => {
       '--permission-mode',
       'plan',
       '--disable-web-search',
+      '-p',
       expect.stringContaining('Independent read-only code review'),
     ]);
     expect(options.cwd).toBe(scratchDirs[0]);
@@ -171,7 +173,7 @@ describe('CliReviewTransport', () => {
 
     expect(readDiffCalls).toEqual([['base-sha', BASE_REQUEST.candidateHeadSha]]);
 
-    const prompt = spawnCalls[0].args[5];
+    const prompt = spawnCalls[0].args[spawnCalls[0].args.length - 1];
     expect(prompt).toContain(UNTRUSTED_INPUT_RULE);
     expect(prompt).toContain(REVIEW_REPLY_CONTRACT);
 
@@ -189,7 +191,7 @@ describe('CliReviewTransport', () => {
 
     await transport(request);
 
-    const prompt = spawnCalls[0].args[5];
+    const prompt = spawnCalls[0].args[spawnCalls[0].args.length - 1];
     expect(prompt.split(NONCE).length - 1).toBe(4);
     expect(prompt).toContain(`<<<UNTRUSTED nonce=${NONCE} label="diff summary">>>`);
   });
@@ -434,6 +436,7 @@ describe('CliReviewTransport', () => {
         '--permission-mode',
         'plan',
         '--disable-web-search',
+        '-p',
         'PROMPT',
       ]);
     });

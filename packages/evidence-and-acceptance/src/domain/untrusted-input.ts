@@ -24,7 +24,7 @@ export function wrapUntrusted(input: { label: string; text: string; nonce: strin
     throw new Error('wrapUntrusted: label is not allowed');
   }
 
-  const defangedText = text.replace(/<<<(?=\s*(?:end\s+)?untrusted)/gi, '[<<<]');
+  const defangedText = text.replace(/<<<(?=[\s\u200B-\u200D\uFEFF]*(?:end[\s\u200B-\u200D\uFEFF]+)?untrusted)/gi, '[<<<]');
   const openingMarker = `<<<UNTRUSTED nonce=${nonce} label="${label}">>>`;
   const closingMarker = `<<<END UNTRUSTED nonce=${nonce}>>>`;
   return [openingMarker, defangedText, closingMarker].join('\n');

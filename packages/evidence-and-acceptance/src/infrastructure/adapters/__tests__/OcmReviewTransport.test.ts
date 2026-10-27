@@ -1122,6 +1122,8 @@ describe('OcmReviewTransport', () => {
 
       expect(prompts).toHaveLength(2);
       expect(extractPromptNonce(prompts[0])).not.toBe(extractPromptNonce(prompts[1]));
+      // The default nonce is randomBytes(16): exactly 32 lowercase hex characters (Fable minor).
+      expect(extractPromptNonce(prompts[0])).toMatch(/^[0-9a-f]{32}$/);
     });
 
     // Verdict parsing is unchanged and stays covered by the tests above:

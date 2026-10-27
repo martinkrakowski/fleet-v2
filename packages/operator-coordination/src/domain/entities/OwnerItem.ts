@@ -99,6 +99,18 @@ function isSecretShaped(text: string): boolean {
   return containsSecretShape(text) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(text));
 }
 
+/** Code points refused everywhere as format controls: C0, DEL/C1 and bidi/line-separator controls. */
+function isForbiddenControlCodePoint(codePoint: number): boolean {
+  return (
+    codePoint < 0x20 ||
+    (codePoint >= 0x7f && codePoint <= 0x9f) ||
+    codePoint === 0x2028 ||
+    codePoint === 0x2029 ||
+    (codePoint >= 0x202a && codePoint <= 0x202e) ||
+    (codePoint >= 0x2066 && codePoint <= 0x2069)
+  );
+}
+
 function idFieldError(field: string, value: unknown): string | null {
   if (typeof value !== 'string') {
     return `OwnerItem ${field} must be a non-empty id of at most 256 bytes`;
@@ -114,7 +126,7 @@ function idFieldError(field: string, value: unknown): string | null {
   }
   for (const char of value) {
     const codePoint = char.codePointAt(0) as number;
-    if (codePoint <= 0x20 || (codePoint >= 0x7f && codePoint <= 0x9f)) {
+    if (codePoint <= 0x20 || isForbiddenControlCodePoint(codePoint) || /\s/u.test(char)) {
       return `OwnerItem ${field} must be a non-empty id of at most 256 bytes`;
     }
   }
@@ -138,15 +150,7 @@ function subjectErrorValue(subject: unknown, kind: OwnerItemKindValue): string |
     return 'OwnerItem subject must be single-line plain text of at most 120 characters';
   }
   for (const char of subject) {
-    const codePoint = char.codePointAt(0) as number;
-    if (
-      codePoint < 0x20 ||
-      (codePoint >= 0x7f && codePoint <= 0x9f) ||
-      codePoint === 0x2028 ||
-      codePoint === 0x2029 ||
-      (codePoint >= 0x202a && codePoint <= 0x202e) ||
-      (codePoint >= 0x2066 && codePoint <= 0x2069)
-    ) {
+    if (isForbiddenControlCodePoint(char.codePointAt(0) as number)) {
       return 'OwnerItem subject must be single-line plain text of at most 120 characters';
     }
   }
@@ -176,7 +180,7 @@ function repositoryError(repository: string): string | null {
   }
   for (const char of repository) {
     const codePoint = char.codePointAt(0) as number;
-    if (codePoint <= 0x20 || (codePoint >= 0x7f && codePoint <= 0x9f)) {
+    if (codePoint <= 0x20 || isForbiddenControlCodePoint(codePoint) || /\s/u.test(char)) {
       return 'invalid';
     }
   }
@@ -404,18 +408,25 @@ function historyErrorValue(
   state: OwnerItemState,
   resolution: unknown,
   withdrawal: unknown,
+  kind: OwnerItemKindValue,
 ): string | null {
   if (!Array.isArray(history) || history.length < 1 || history.length > OWNER_ITEM_LIMITS.history) {
     return 'invalid';
   }
+  const first = readPlainObject(history[0], ['event', 'atIso', 'reason']);
+  if (first === null || first.event !== 'opened' || new Date(first.atIso as string).toISOString() !== createdAtIso || first.reason !== null) {
+    return 'invalid';
+  }
   let previousTime = Date.parse(createdAtIso);
-  for (let index = 0; index < history.length; index += 1) {
+  let previousEvent: OwnerItemHistoryEntryRecord['event'] = 'opened';
+  let previousReason: string | null = null;
+  for (let index = 1; index < history.length; index += 1) {
     const entry = readPlainObject(history[index], ['event', 'atIso', 'reason']);
     if (entry === null) {
       return 'invalid';
     }
     const event = entry.event;
-    if (event !== 'opened' && event !== 'closed' && event !== 'reopened' && event !== 'withdrawn') {
+    if (event !== 'closed' && event !== 'reopened' && event !== 'withdrawn') {
       return 'invalid';
     }
     if (typeof entry.atIso !== 'string' || timestampErrorValue(entry.atIso) !== null) {
@@ -426,36 +437,33 @@ function historyErrorValue(
       return 'invalid';
     }
     previousTime = time;
-    if (event === 'opened' || event === 'reopened') {
-      if (entry.reason !== null) {
+    if (previousEvent === 'opened' || previousEvent === 'reopened') {
+      if (event === 'closed') {
+        if (
+          typeof entry.reason !== 'string' ||
+          !(OWNER_ITEM_RESOLUTIONS_BY_KIND[kind] as readonly string[]).includes(entry.reason)
+        ) {
+          return 'invalid';
+        }
+      } else if (event === 'withdrawn') {
+        if (!(OWNER_ITEM_OWNER_CLOSABLE_KINDS as readonly OwnerItemKindValue[]).includes(kind)) {
+          return 'invalid';
+        }
+        if (typeof entry.reason !== 'string' || !OWNER_ITEM_WITHDRAW_REASONS.includes(entry.reason as OwnerItemWithdrawReason)) {
+          return 'invalid';
+        }
+      } else {
         return 'invalid';
       }
-    } else if (event === 'closed') {
-      if (typeof entry.reason !== 'string' || !OWNER_ITEM_RESOLUTION_KINDS.includes(entry.reason as OwnerItemResolutionKind)) {
+    } else if (previousEvent === 'closed' && previousReason === 'pr-closed') {
+      if (event !== 'reopened' || entry.reason !== null) {
         return 'invalid';
       }
-    } else if (typeof entry.reason !== 'string' || !OWNER_ITEM_WITHDRAW_REASONS.includes(entry.reason as OwnerItemWithdrawReason)) {
+    } else {
       return 'invalid';
     }
-  }
-  const first = readPlainObject(history[0], ['event', 'atIso', 'reason']);
-  if (first === null || first.event !== 'opened' || new Date(first.atIso as string).toISOString() !== createdAtIso || first.reason !== null) {
-    return 'invalid';
-  }
-  for (let index = 1; index < history.length; index += 1) {
-    const entry = readPlainObject(history[index], ['event', 'atIso', 'reason']);
-    if (entry === null) {
-      return 'invalid';
-    }
-    if (entry.event === 'reopened') {
-      const previous = readPlainObject(history[index - 1], ['event', 'atIso', 'reason']);
-      if (previous === null) {
-        return 'invalid';
-      }
-      if (previous.event !== 'closed' || previous.reason !== 'pr-closed') {
-        return 'invalid';
-      }
-    }
+    previousEvent = event;
+    previousReason = typeof entry.reason === 'string' ? entry.reason : null;
   }
   const last = readPlainObject(history[history.length - 1], ['event', 'atIso', 'reason']);
   if (last === null) {
@@ -699,7 +707,7 @@ export class OwnerItem {
         return fail('OwnerItem answered must name the item\'s question');
       }
     }
-    if (historyErrorValue(historyCopy, createdAtIso, state, record.resolution, record.withdrawal) !== null) {
+    if (historyErrorValue(historyCopy, createdAtIso, state, record.resolution, record.withdrawal, kind) !== null) {
       return fail('OwnerItem history is not a valid sequence for its state');
     }
     const finalRecord: OwnerItemRecord = {
@@ -799,7 +807,7 @@ export class OwnerItem {
       if (current === 'closed' && currentResolutionKind === 'merged') {
         return { success: true, value: this };
       }
-      if (current === 'open' || (current === 'closed' && currentResolutionKind === 'pr-closed')) {
+      if (current === 'open') {
         return this.transitionTo({
           state: 'closed',
           resolution: { kind: 'merged', observedAtIso: atIso },
@@ -1070,10 +1078,13 @@ export class OwnerItem {
     const history = this.record.history.slice();
     history.push({ event: changes.historyEvent, atIso: changes.atIso, reason: changes.historyReason });
     if (history.length > OWNER_ITEM_LIMITS.history) {
+      // Drop the oldest closed(pr-closed) + reopened pair right after entry 0,
+      // so the capped history still satisfies the history state machine.
       for (let index = 1; index < history.length - 1; index += 1) {
+        const entry = history[index];
         const follower = history[index + 1];
-        if (follower === undefined || follower.event !== 'reopened') {
-          history.splice(index, 1);
+        if (entry.event === 'closed' && entry.reason === 'pr-closed' && follower !== undefined && follower.event === 'reopened') {
+          history.splice(index, 2);
           break;
         }
       }

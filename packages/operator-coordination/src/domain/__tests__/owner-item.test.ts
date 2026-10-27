@@ -102,6 +102,21 @@ describe('OwnerItem open and create', () => {
       message: 'OwnerItem kind is not one of merge, secret, decision, backup, other',
     },
     {
+      name: 'an item id with U+202E',
+      record: { ...baseRecord(), itemId: 'oi\u202Eexample' },
+      message: 'OwnerItem itemId must be a non-empty id of at most 256 bytes',
+    },
+    {
+      name: 'an item id with U+00A0',
+      record: { ...baseRecord(), itemId: 'oi\u00A0example' },
+      message: 'OwnerItem itemId must be a non-empty id of at most 256 bytes',
+    },
+    {
+      name: 'a pr ref repository with U+2066',
+      record: { ...baseRecord(), refs: [{ kind: 'pr', repository: 'example-org/example\u2066repo', number: 251 }] },
+      message: 'OwnerItem refs[0] is not a pr reference',
+    },
+    {
       name: 'other with a null subject',
       record: { ...baseRecord(), kind: 'other', subject: null },
       message: 'OwnerItem other requires a subject',
@@ -284,6 +299,78 @@ describe('OwnerItem open and create', () => {
           { event: 'opened', atIso: NOW, reason: null },
           { event: 'closed', atIso: NOW, reason: 'merged' },
           { event: 'reopened', atIso: NOW, reason: null },
+        ],
+      },
+      message: 'OwnerItem history is not a valid sequence for its state',
+    },
+    {
+      name: 'an opened after a closed merge',
+      record: {
+        ...baseRecord(),
+        state: 'open',
+        resolution: null,
+        history: [
+          { event: 'opened', atIso: NOW, reason: null },
+          { event: 'closed', atIso: NOW, reason: 'merged' },
+          { event: 'opened', atIso: NOW, reason: null },
+        ],
+      },
+      message: 'OwnerItem history is not a valid sequence for its state',
+    },
+    {
+      name: 'a closed pr-closed after a closed merged',
+      record: {
+        ...baseRecord(),
+        state: 'open',
+        resolution: null,
+        history: [
+          { event: 'opened', atIso: NOW, reason: null },
+          { event: 'closed', atIso: NOW, reason: 'merged' },
+          { event: 'closed', atIso: NOW, reason: 'pr-closed' },
+          { event: 'reopened', atIso: NOW, reason: null },
+        ],
+      },
+      message: 'OwnerItem history is not a valid sequence for its state',
+    },
+    {
+      name: 'a withdrawn duplicate on a secret item followed by opened',
+      record: {
+        ...baseRecord(),
+        kind: 'secret',
+        state: 'open',
+        resolution: null,
+        history: [
+          { event: 'opened', atIso: NOW, reason: null },
+          { event: 'withdrawn', atIso: NOW, reason: 'duplicate' },
+          { event: 'opened', atIso: NOW, reason: null },
+        ],
+      },
+      message: 'OwnerItem history is not a valid sequence for its state',
+    },
+    {
+      name: 'a closed merged after a closed done on a merge item',
+      record: {
+        ...baseRecord(),
+        state: 'closed',
+        resolution: { kind: 'merged', observedAtIso: NOW },
+        history: [
+          { event: 'opened', atIso: NOW, reason: null },
+          { event: 'closed', atIso: NOW, reason: 'done' },
+          { event: 'closed', atIso: NOW, reason: 'merged' },
+        ],
+      },
+      message: 'OwnerItem history is not a valid sequence for its state',
+    },
+    {
+      name: 'a merge item with a withdrawn entry',
+      record: {
+        ...baseRecord(),
+        state: 'open',
+        resolution: null,
+        history: [
+          { event: 'opened', atIso: NOW, reason: null },
+          { event: 'withdrawn', atIso: NOW, reason: 'duplicate' },
+          { event: 'opened', atIso: NOW, reason: null },
         ],
       },
       message: 'OwnerItem history is not a valid sequence for its state',
@@ -509,18 +596,17 @@ describe('OwnerItem merge transitions', () => {
       source: 'merge-record',
       observedAtIso: '2026-10-27T10:10:00.000Z',
     });
-    expect(merged.success).toBe(true);
-    if (merged.success) {
-      expect(merged.value.toRecord().history.map((entry) => entry.event)).toEqual([
-        'opened',
-        'closed',
-        'reopened',
-        'closed',
-        'closed',
-      ]);
-      expect(merged.value.toRecord().history[3].reason).toBe('pr-closed');
-      expect(merged.value.toRecord().history[4].reason).toBe('merged');
+    expect(merged.success).toBe(false);
+    if (!merged.success) {
+      expect(merged.code).toBe('state');
+      expect(merged.error.message).toBe('OwnerItem a merged item is final');
     }
+    expect(closedAgain2.value.toRecord().history.map((entry) => entry.reason)).toEqual([
+      null,
+      'pr-closed',
+      null,
+      'pr-closed',
+    ]);
   });
 
   it('refuses unknown observation states without changing the item', () => {
@@ -627,9 +713,14 @@ describe('OwnerItem merge transitions', () => {
       item = reopened.value;
     }
     const record = item.toRecord();
-    expect(record.history).toHaveLength(64);
+    expect(record.history.length).toBeLessThanOrEqual(64);
     expect(record.history[0].event).toBe('opened');
-    expect(record.history[63].event).toBe('reopened');
+    expect(record.history[record.history.length - 1].event).toBe('reopened');
+    const roundTrip = OwnerItem.create(JSON.parse(JSON.stringify(record)));
+    expect(roundTrip.success).toBe(true);
+    if (roundTrip.success) {
+      expect(roundTrip.value.toRecord()).toEqual(record);
+    }
   });
 });
 

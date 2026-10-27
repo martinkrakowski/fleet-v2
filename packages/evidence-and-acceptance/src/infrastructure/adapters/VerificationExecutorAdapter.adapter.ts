@@ -137,7 +137,8 @@ function resolveCoverageDeclaration(
     return undefined;
   }
   const record = entry as Record<string, unknown>;
-  const coverage = record.coverage;
+  // Own property only: an inherited coverage is never a declaration.
+  const coverage = Object.hasOwn(record, 'coverage') ? record.coverage : undefined;
   if (coverage === undefined) {
     return undefined;
   }

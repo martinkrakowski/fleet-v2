@@ -40,7 +40,7 @@ export function readVitestSummaryCoverage(output: string): CheckCoverage {
   const lines = stripAnsi(output).split('\n');
   for (const rawLine of lines) {
     if (
-      /cache hit, replaying logs/i.test(rawLine) ||
+      /cache hit, replaying/i.test(rawLine) ||
       rawLine.trim().includes('FULL TURBO')
     ) {
       return { ran: false, reason: 'turbo cache replay' };

@@ -164,3 +164,10 @@ describe('readVitestSummaryCoverage out-of-range counts (V2a, Luna minor)', () =
     expect(coverage).toEqual({ ran: false, reason: 'count out of range' });
   });
 });
+
+describe('readVitestSummaryCoverage turbo replay wording (V2a, Luna re-review)', () => {
+  it('treats the older "cache hit, replaying output" form as a replay', () => {
+    const out = '@fleet/x:test: cache hit, replaying output abc123\n@fleet/x:test:       Tests  36 passed (36)\n';
+    expect(readVitestSummaryCoverage(out)).toEqual({ ran: false, reason: 'turbo cache replay' });
+  });
+});

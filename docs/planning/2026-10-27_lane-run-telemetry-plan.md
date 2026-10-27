@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-27
 - **Target repository:** `fleet-v2`
-- **Status:** rev 3.1, after a Grok review (rev 2), a Fable review (rev 3) and a Grok re-check (rev 3.1); §8. Decisions in §6 are open with recommended defaults. Nothing built. Anchors checked against `origin/main` at `db47edd` (K1b-3, PR #281, merged).
+- **Status:** rev 3.1, after a Grok review (rev 2), a Fable review (rev 3) and a Grok re-check (rev 3.1); §8. **The owner decided D1–D14 on 2026-10-27 as recommended (§6).** OT1a, OT1s, OT2d and OT4a are dispatchable. Nothing built. Anchors checked against `origin/main` at `db47edd` (K1b-3, PR #281, merged).
 - **Owner request (2026-10-27):** "Yes write a plan to send lane runs to Phoenix as traces."
 - **Builds on:** `2026-10-27_conductor-plan.md` (`LaneRun`, the keyed run journal K1b, the decider, §3.2 states, §3.5 crash and resume, §3.9 reaper, D2 driver placement), `2026-10-23_attempt-record-gate-predicates-usage-plan.md` (S1 seat selection, S3 usage), `2026-10-27_work-board-plan.md` (§3.12 telemetry, WB12), `2026-10-27_web-ui-interactivity-plan.md` (§3.7 live tail, F13 content policy, P10 usage chips).
 
@@ -311,6 +311,8 @@ OT1a, OT1s, OT2d and OT4a can start now on `main`; OT1b follows OT1a, OT1r and O
 - Everything else is a two-way door: the adapter is off by default and removable, and no record format changes except the new disposition store (versioned).
 
 ## 6. Decisions for the owner
+
+**Decided 2026-10-27:** the owner accepted every default below (D1–D14) as written.
 
 | # | Question | Default |
 |---|---|---|

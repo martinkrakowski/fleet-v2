@@ -1720,6 +1720,8 @@ function parseAutoMergePolicy(
     errors.push('policy.autoMerge: must be an object');
     return undefined;
   }
+  // The field readers return placeholders on error; the errors.length guard
+  // below discards them, so a placeholder never reaches the returned policy.
   const before = errors.length;
   collectUnknownKeys(value, AUTO_MERGE_KEYS, 'policy.autoMerge', errors);
   const enabled = readAutoMergeBoolean(value, 'enabled', errors);

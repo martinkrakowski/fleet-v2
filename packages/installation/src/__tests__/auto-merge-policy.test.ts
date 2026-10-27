@@ -156,7 +156,7 @@ describe('policy.autoMerge (AM1)', () => {
     ON,
     { enabled: false, allowHighRisk: false, onBlocked: 'hold' },
     { enabled: true, allowHighRisk: true, onBlocked: 'hold' },
-  ])('round-trips %s through the writer', (block) => {
+  ])('round-trips enabled=$enabled allowHighRisk=$allowHighRisk onBlocked=$onBlocked through the writer', (block) => {
     const parsed = parseV2Fixture(withAutoMerge(block));
     const written = writeInstallationV2(parsed);
     expect(parseInstallation(JSON.parse(written))).toEqual({
@@ -211,11 +211,6 @@ describe('policy.autoMerge (AM1)', () => {
     expect(autoMergeRevision({ enabled: true, allowHighRisk: true, onBlocked: 'hold' })).toBe(
       '2ca034b88e81',
     );
-    expect(autoMergeRevision(DEFAULT_AUTO_MERGE_POLICY)).toMatch(/^[0-9a-f]{12}$/);
-    expect(autoMergeRevision(ON)).toMatch(/^[0-9a-f]{12}$/);
-    expect(
-      autoMergeRevision({ enabled: true, allowHighRisk: true, onBlocked: 'hold' }),
-    ).toMatch(/^[0-9a-f]{12}$/);
   });
 
   it('is stable across key order', () => {

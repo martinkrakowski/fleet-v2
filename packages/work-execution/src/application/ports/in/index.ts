@@ -5,6 +5,7 @@ export * from "./DispatchAttemptPort.in-port.js";
 export * from "./ExecuteAuthorizedForgeActionPort.in-port.js";
 export * from "./InspectAttemptPort.in-port.js";
 export * from "./InspectWorkOrderPort.in-port.js";
+export * from "./ListAttemptJournalPort.in-port.js";
 export * from "./ListAttemptsPort.in-port.js";
 export * from "./ListUnregisteredProjectsPort.in-port.js";
 export * from "./PrepareBriefPackagePort.in-port.js";

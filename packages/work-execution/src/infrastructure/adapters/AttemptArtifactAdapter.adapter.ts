@@ -24,11 +24,26 @@ import type {
   CollectCompletedAttemptArtifactsResult,
   PlaceFrozenBriefRequest,
   PlaceFrozenBriefResult,
+  SealArtifactManifestRequest,
+  SealArtifactManifestResult,
+  VerifyArtifactManifestRequest,
+  VerifyArtifactManifestResult,
   VerifyIgnoredPathsRequest,
   VerifyIgnoredPathsResult,
 } from '../../application/ports/out/AttemptArtifactPort.out-port.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
+import {
+  ARTIFACT_MANIFEST_RELATIVE_PATH,
+  ARTIFACT_MANIFEST_TEMP_RELATIVE_PATH,
+  buildArtifactManifest,
+  compareArtifactManifest,
+  parseArtifactManifest,
+  serializeArtifactManifest,
+  type ArtifactManifestEntry,
+  type ObservedArtifact,
+} from '../../domain/artifact-manifest.js';
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
+import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { hasRecordedHostName } from './ConfirmRecordedHost.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
 import { resolveWorktreeTarget, worktreeRootRefusal } from './WorkspaceAdapter.adapter.js';
@@ -66,6 +81,12 @@ const PROBE_TIMEOUT_MS = 60 * 1000;
 
 /** Wall-clock budget for one file read (`cat`). */
 const CAT_TIMEOUT_MS = 60 * 1000;
+
+/** Wall-clock budget for one hash/size command (`wc`, `sha256sum`). */
+const HASH_TIMEOUT_MS = 120 * 1000;
+
+/** A valid SHA-256 hex digest: 64 lowercase hexadecimal characters. */
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 /** Cryptographic SHA-256 hex digest injected by production composition roots. */
 export function sha256HexDigest(content: string): string {
@@ -264,8 +285,11 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
   }
 
   /** Exit 0 means ignored; exit 1 means not ignored; anything else is an error. */
-  private async checkIgnored(worktreePath: string, candidatePath: string): Promise<boolean> {
-    const executor = this.executorFor();
+  private async checkIgnored(
+    worktreePath: string,
+    candidatePath: string,
+    executor: CommandExecutorPort = this.executorFor(),
+  ): Promise<boolean> {
     const result = await executor.run(
       [
         'git',
@@ -284,6 +308,79 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
       `git check-ignore failed for ${candidatePath} in ${worktreePath}: exit ${String(result.exitCode)}` +
         (result.error !== undefined ? ` (${result.error})` : ''),
     );
+  }
+
+  /**
+   * Measure one contained worktree-relative artifact path: an existence probe,
+   * a regular-file probe (symbolic links are never sealed), a byte count and
+   * a SHA-256 digest, all through the same executor. Absent and non-regular
+   * results are facts; a command failure is an error.
+   */
+  private async measureArtifact(
+    worktreePath: string,
+    relativePath: string,
+    executor: CommandExecutorPort,
+  ): Promise<ObservedArtifact> {
+    const target = resolveWorktreeTarget(worktreePath, relativePath);
+    const exists = await this.pathExists(worktreePath, target, executor);
+    if (!exists) {
+      return { path: relativePath, state: 'absent' };
+    }
+    const symlinkProbe = await executor.run(['test', '-L', target], {
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    if (symlinkProbe.exitCode === 0) {
+      return { path: relativePath, state: 'not-a-file' };
+    }
+    if (symlinkProbe.exitCode !== 1) {
+      throw new Error(
+        `Unable to probe ${target}: exit ${String(symlinkProbe.exitCode)}` +
+          (symlinkProbe.error !== undefined ? `: ${symlinkProbe.error}` : ''),
+      );
+    }
+    const regularProbe = await executor.run(['test', '-f', target], {
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    if (regularProbe.exitCode === 1) {
+      return { path: relativePath, state: 'not-a-file' };
+    }
+    if (regularProbe.exitCode !== 0) {
+      throw new Error(
+        `Unable to probe ${target}: exit ${String(regularProbe.exitCode)}` +
+          (regularProbe.error !== undefined ? `: ${regularProbe.error}` : ''),
+      );
+    }
+    const sizeRun = await executor.run(['wc', '-c', target], {
+      timeoutMs: HASH_TIMEOUT_MS,
+    });
+    if (sizeRun.exitCode !== 0) {
+      throw new Error(
+        'Unable to measure ' + target + ': exit ' + String(sizeRun.exitCode) +
+          (sizeRun.error !== undefined ? ': ' + sizeRun.error : ''),
+      );
+    }
+    const size = Number(sizeRun.stdout.trim().split(/\s+/)[0]);
+    if (!Number.isSafeInteger(size) || size < 0) {
+      throw new Error('Unable to read size of ' + target);
+    }
+    const digestRun = await executor.run(['sha256sum', target], {
+      timeoutMs: HASH_TIMEOUT_MS,
+    });
+    if (digestRun.exitCode !== 0) {
+      throw new Error(
+        'Unable to measure ' + target + ': exit ' + String(digestRun.exitCode) +
+          (digestRun.error !== undefined ? ': ' + digestRun.error : ''),
+      );
+    }
+    let digestText = digestRun.stdout.trim();
+    if (digestText.startsWith('\\')) {
+      digestText = digestText.slice(1);
+    }
+    const sha256 = digestText.slice(0, 64);
+    if (!SHA256_HEX.test(sha256)) {
+      throw new Error('Unable to read digest of ' + target);
+    }
+    return { path: relativePath, state: 'file', size, sha256 };
   }
 
   /**
@@ -306,6 +403,139 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
       );
     }
     return result.exitCode === 0 ? result.stdout : null;
+  }
+
+  /**
+   * Write the attempt's artifact manifest atomically (temp file, then `mv`)
+   * and read it back, and only then report `sealed`. The manifest paths must
+   * be gitignored; every listed artifact must be a regular file at sealing.
+   */
+  async sealArtifactManifest(request: SealArtifactManifestRequest): Promise<SealArtifactManifestResult> {
+    const rootRefusal = worktreeRootRefusal(request.worktreePath);
+    if (rootRefusal !== null) {
+      return { outcome: 'refused', reason: rootRefusal };
+    }
+    for (const artifactPath of request.artifactPaths) {
+      const refusedReason = validateWorktreeRelativePath(artifactPath);
+      if (refusedReason !== null) {
+        return {
+          outcome: 'refused',
+          reason: `artifact path '${artifactPath}' is refused: ${refusedReason}`,
+        };
+      }
+    }
+    const executor = this.executorFor(request.recordedHost);
+    const ignored = await Promise.all(
+      [ARTIFACT_MANIFEST_RELATIVE_PATH, ARTIFACT_MANIFEST_TEMP_RELATIVE_PATH].map((p) =>
+        this.checkIgnored(request.worktreePath, p, executor),
+      ),
+    );
+    if (ignored.some((value) => !value)) {
+      return { outcome: 'refused', reason: 'Artifact manifest paths are not gitignored' };
+    }
+    const uniquePaths = [...new Set(request.artifactPaths)];
+    const observed = await Promise.all(
+      uniquePaths.map((p) => this.measureArtifact(request.worktreePath, p, executor)),
+    );
+    for (const observation of observed) {
+      if (observation.state === 'absent') {
+        return { outcome: 'refused', reason: `artifact '${observation.path}' is absent at sealing` };
+      }
+      if (observation.state === 'not-a-file') {
+        return {
+          outcome: 'refused',
+          reason: `artifact '${observation.path}' is not a regular file and cannot be sealed`,
+        };
+      }
+    }
+    const entries: ArtifactManifestEntry[] = observed
+      .filter((o): o is Extract<ObservedArtifact, { state: 'file' }> => o.state === 'file')
+      .map((o) => ({ path: o.path, size: o.size, sha256: o.sha256 }));
+    const manifest = buildArtifactManifest(request.attemptId, entries);
+    const text = serializeArtifactManifest(manifest);
+    const finalPath = resolveWorktreeTarget(request.worktreePath, ARTIFACT_MANIFEST_RELATIVE_PATH);
+    const tempPath = resolveWorktreeTarget(request.worktreePath, ARTIFACT_MANIFEST_TEMP_RELATIVE_PATH);
+    const mkdir = await executor.run(['mkdir', '-p', path.dirname(finalPath)], {
+      timeoutMs: BRIEF_WRITE_TIMEOUT_MS,
+    });
+    if (mkdir.exitCode !== 0) {
+      return {
+        outcome: 'refused',
+        reason: `Unable to create lane directory: ${mkdir.error ?? mkdir.stderr.trim()}`,
+      };
+    }
+    const write = await executor.run(['tee', tempPath], {
+      input: text,
+      timeoutMs: TEE_TIMEOUT_MS,
+    });
+    if (write.exitCode !== 0) {
+      const detail = write.error !== undefined ? write.error : write.stderr.trim();
+      await executor.run(['rm', '-f', tempPath], { timeoutMs: BRIEF_WRITE_TIMEOUT_MS });
+      return { outcome: 'refused', reason: 'Unable to write artifact manifest: ' + detail };
+    }
+    const move = await executor.run(['mv', '-f', tempPath, finalPath], {
+      timeoutMs: BRIEF_WRITE_TIMEOUT_MS,
+    });
+    if (move.exitCode !== 0) {
+      const detail = move.error !== undefined ? move.error : move.stderr.trim();
+      await executor.run(['rm', '-f', tempPath], { timeoutMs: BRIEF_WRITE_TIMEOUT_MS });
+      return { outcome: 'refused', reason: 'Unable to move artifact manifest into place: ' + detail };
+    }
+    const readBack = await this.readContainedFile(request.worktreePath, finalPath, request.recordedHost);
+    if (readBack !== text) {
+      return { outcome: 'refused', reason: 'Artifact manifest read-back differs from what was written' };
+    }
+    return {
+      outcome: 'sealed',
+      manifestPath: ARTIFACT_MANIFEST_RELATIVE_PATH,
+      manifestSha256: sha256HexDigest(text),
+      manifest,
+    };
+  }
+
+  /**
+   * Re-hash every file the manifest lists and compare against the sealed
+   * manifest. Answers `sealed`, `missing` (no manifest) or `mismatch`; a
+   * rewrite of the manifest itself (digest differs from the recorded one) is
+   * a mismatch too.
+   */
+  async verifyArtifactManifest(request: VerifyArtifactManifestRequest): Promise<VerifyArtifactManifestResult> {
+    const rootRefusal = worktreeRootRefusal(request.worktreePath);
+    if (rootRefusal !== null) {
+      throw new Error(rootRefusal);
+    }
+    const executor = this.executorFor(request.recordedHost);
+    const targetPath = resolveWorktreeTarget(request.worktreePath, ARTIFACT_MANIFEST_RELATIVE_PATH);
+    const text = await this.readContainedFile(request.worktreePath, targetPath, request.recordedHost);
+    if (text === null) {
+      return { outcome: 'missing' };
+    }
+    if (
+      request.expectedManifestSha256 !== undefined &&
+      sha256HexDigest(text) !== request.expectedManifestSha256
+    ) {
+      return {
+        outcome: 'mismatch',
+        mismatches: [{ path: ARTIFACT_MANIFEST_RELATIVE_PATH, kind: 'manifest-changed' }],
+      };
+    }
+    const parsed = parseArtifactManifest(text);
+    if (parsed === null) {
+      return {
+        outcome: 'mismatch',
+        mismatches: [{ path: ARTIFACT_MANIFEST_RELATIVE_PATH, kind: 'manifest-invalid' }],
+      };
+    }
+    if (parsed.attemptId !== request.attemptId) {
+      return {
+        outcome: 'mismatch',
+        mismatches: [{ path: ARTIFACT_MANIFEST_RELATIVE_PATH, kind: 'attempt-id' }],
+      };
+    }
+    const observed = await Promise.all(
+      parsed.files.map((f) => this.measureArtifact(request.worktreePath, f.path, executor)),
+    );
+    return compareArtifactManifest(parsed, observed);
   }
 
   async readBriefManifest(

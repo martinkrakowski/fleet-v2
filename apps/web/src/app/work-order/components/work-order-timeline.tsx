@@ -6,6 +6,7 @@ import {
   Card,
   CardBody,
   CardHeader,
+  Chip,
   EmptyState,
   KeyValueList,
   KeyValueRow,
@@ -19,6 +20,13 @@ import { LiveJournalPanel } from "../../attempt/components/live-journal-panel";
 import { HeadEvidencePanel } from "./head-evidence-panel";
 import { chainNoteText, notReadText } from "../timeline-view";
 import type { TimelineData } from "../live";
+import {
+  modelChipText,
+  seatChipText,
+  sumUsage,
+  usageChip,
+  usageSumText,
+} from "../../../lib/usage-view";
 import styles from "../work-order.module.css";
 
 function TimelineBody({ data }: { data: TimelineData }) {
@@ -75,6 +83,19 @@ function TimelineBody({ data }: { data: TimelineData }) {
                     )}
                   </span>
                 </KeyValueRow>
+                <KeyValueRow term="usage">
+                  {usageSumText(
+                    sumUsage(
+                      data.attempts.map((t) => ({
+                        runner: t.attempt.runner,
+                        usage: t.attempt.usage,
+                      })),
+                    ),
+                  )}{" "}
+                  <span className={styles.muted}>
+                    over every recorded attempt of this work order
+                  </span>
+                </KeyValueRow>
               </KeyValueList>
             </CardBody>
           </Card>
@@ -94,6 +115,11 @@ function TimelineBody({ data }: { data: TimelineData }) {
             >
               {data.attempts.map((t) => {
                 const [word] = recordedStateSummary(t.attempt.state, null);
+                const input = {
+                  runner: t.attempt.runner,
+                  usage: t.attempt.usage,
+                };
+                const chip = usageChip(input);
                 return (
                   <li key={t.attempt.id} className={styles.step}>
                     <div className={styles.stepHead}>
@@ -110,6 +136,23 @@ function TimelineBody({ data }: { data: TimelineData }) {
                       </span>
                       <span className={styles.muted}>
                         {chainNoteText(t.chain)}
+                      </span>
+                      <span className={styles.chips}>
+                        <Chip
+                          mono
+                          title="recorded runner seat, not a runner observation"
+                        >
+                          {seatChipText(t.attempt.runner)}
+                        </Chip>
+                        <Chip mono title="recorded model">
+                          {modelChipText(input)}
+                        </Chip>
+                        <Chip
+                          tone={chip.estimate ? "warn" : "neutral"}
+                          title={chip.title}
+                        >
+                          {chip.text}
+                        </Chip>
                       </span>
                     </div>
 

@@ -16,6 +16,10 @@
  * The evidence context's exact-head assessment is consumed through
  * AcceptanceAssessmentPort; a receipt for any other head is never propagated
  * as an acceptance of the requested one.
+ * When the gate is wired, the frozen acceptance spec is evaluated predicate
+ * by predicate before the evidence assessment, each result is journaled,
+ * and the first predicate that does not pass rejects; model reports are
+ * never an input.
  *
  * `resolveImplementerSeat` is the single binding of an attempt to the seat
  * that implemented it. Composition roots read it through the same function so
@@ -31,10 +35,14 @@ import type { AcceptanceAssessmentPort } from '../ports/out/AcceptanceAssessment
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
-import type { AttemptRecord, WorkOrderRecord } from '../../domain/execution-records.js';
+import type { AttemptRecord, WorkOrderRecord, ActionJournalEntryRecord } from '../../domain/execution-records.js';
 import { WorkOrder } from '../../domain/entities/WorkOrder.js';
 import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import type { AllowedSeatPort } from '../ports/out/AllowedSeatPort.out-port.js';
+import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
+import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
+import type { GatePredicatePort, GatePredicateResult, GatePredicateVerdict } from '../ports/out/GatePredicatePort.out-port.js';
+import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
@@ -56,6 +64,16 @@ export type ImplementerSeatResolution =
       readonly source: 'attempt-runner' | 'frozen-manifest';
     }
   | { readonly outcome: 'unknown'; readonly reason: string };
+
+const GATE_PREDICATE_VERDICT_TO_STATUS: Record<
+  GatePredicateVerdict,
+  ActionJournalEntryRecord['status']
+> = {
+  pass: 'completed',
+  fail: 'refused',
+  unknown: 'ambiguous',
+  skipped: 'refused',
+};
 
 /**
  * Read `modelAssignment.model` from the attempt's frozen brief manifest. The
@@ -147,8 +165,17 @@ export interface RequestAttemptAcceptanceDependencies {
   readonly workOrderRepo?: WorkOrderRepositoryPort;
   /** Consumes the evidence context's exact-head assessment. */
   readonly acceptancePort: AcceptanceAssessmentPort;
-  /** Reads the frozen brief manifest when the attempt records no runner seat. */
-  readonly artifactPort?: Pick<AttemptArtifactPort, 'readBriefManifest'>;
+  /** Reads the frozen brief package (prose and manifest) for the gate. */
+  readonly artifactPort?: Pick<AttemptArtifactPort, 'readBriefManifest' | 'readBriefFile'>;
+  /**
+   * Plan S2: evaluates the frozen acceptance spec before the evidence
+   * assessment. When absent the gate is not run (composition roots wire it).
+   */
+  readonly gatePredicates?: GatePredicatePort;
+  /** Required with gatePredicates: one entry per predicate. */
+  readonly journal?: Pick<ExecutionJournalPort, 'appendJournalEntry' | 'listJournalEntriesForAttempt'>;
+  /** Infrastructure digest (SHA-256); the FNV fallback is for tests. */
+  readonly computeDigest?: (content: string) => string;
   /** Free-seat check (plan F5): refuses a free or unknown reviewer when wired. */
   readonly allowedSeats?: AllowedSeatPort;
   /**
@@ -259,6 +286,13 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
       };
     }
 
+    if (deps.gatePredicates !== undefined) {
+      const gate = await this.runGate(deps, deps.gatePredicates, attempt, request.candidateHeadSha);
+      if (gate !== null) {
+        return { outcome: 'rejected', reason: gate };
+      }
+    }
+
     const verdict = await deps.acceptancePort.assessHeadAcceptance({
       attemptId: request.attemptId,
       workOrderId: attempt.workOrderId,
@@ -319,5 +353,168 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
       revision: workOrder.nextRevision(),
       updatedAtIso: deps.now?.() ?? new Date().toISOString(),
     });
+  }
+
+  /**
+   * Plan S2: evaluate the frozen acceptance spec predicate by predicate before
+   * the evidence assessment. Returns a rejection reason, or null when every
+   * predicate passed.
+   */
+  private async runGate(
+    deps: RequestAttemptAcceptanceDependencies,
+    gatePort: GatePredicatePort,
+    attempt: AttemptRecord,
+    candidateHeadSha: string,
+  ): Promise<string | null> {
+    const id = attempt.id;
+    if (deps.journal === undefined) {
+      return 'Gate predicates need the execution journal';
+    }
+    const journal = deps.journal;
+    if (!isNonEmptyString(attempt.briefPackagePath) || !isNonEmptyString(attempt.briefDigest)) {
+      return `Attempt ${id} records no frozen brief; the gate cannot be read`;
+    }
+    const artifactPort = deps.artifactPort;
+    if (artifactPort?.readBriefFile === undefined || artifactPort.readBriefManifest === undefined) {
+      return 'No artifact port can read the frozen brief';
+    }
+
+    let prose: string | null;
+    let manifestRaw: string | null;
+    try {
+      prose = await artifactPort.readBriefFile(
+        attempt.worktreePath,
+        attempt.briefPackagePath,
+        attempt.runner ?? null,
+      );
+      manifestRaw = await artifactPort.readBriefManifest(
+        attempt.worktreePath,
+        attempt.briefPackagePath.replace(/\.md$/, '-manifest.json'),
+        attempt.runner ?? null,
+      );
+    } catch {
+      return `Unable to read the frozen brief for attempt ${id}`;
+    }
+    if (prose === null || manifestRaw === null) {
+      return `Unable to read the frozen brief for attempt ${id}`;
+    }
+
+    const digest = (deps.computeDigest ?? simpleDeterministicHexDigest)(
+      prose + '\n' + manifestRaw,
+    );
+    if (digest !== attempt.briefDigest) {
+      return `Frozen brief digest mismatch for attempt ${id}: the brief or its manifest changed after it was prepared`;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(manifestRaw);
+    } catch {
+      return `Frozen brief manifest for attempt ${id} is not a JSON object`;
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return `Frozen brief manifest for attempt ${id} is not a JSON object`;
+    }
+    const manifest = parsed as Record<string, unknown>;
+    if (manifest.baseCommit !== attempt.baseCommit) {
+      return 'Frozen brief base commit does not match the attempt base commit';
+    }
+    const created = AcceptanceSpec.create(manifest.acceptanceSpec);
+    if (!created.success || created.value === undefined) {
+      return `Frozen brief has no valid acceptance spec: ${created.error?.message ?? 'unknown error'}`;
+    }
+    const spec = created.value;
+
+    const rawPrefixes = manifest.allowedPathPrefixes;
+    const allowedPathPrefixes =
+      Array.isArray(rawPrefixes) && rawPrefixes.every((item) => typeof item === 'string')
+        ? (rawPrefixes as string[])
+        : [];
+
+    const priorEntries = await journal.listJournalEntriesForAttempt(id);
+    const entryCount = priorEntries.length + 1;
+    await journal.appendJournalEntry({
+      id: `${id}:accept:${entryCount}`,
+      attemptId: id,
+      workOrderId: attempt.workOrderId,
+      action: 'accept',
+      baseCommit: attempt.baseCommit,
+      recordedAtIso: deps.now?.() ?? new Date().toISOString(),
+      sessionId: attempt.sessionId,
+      status: 'intent-recorded',
+      detail: 'gate: ' + String(2 + spec.getCommands().length) + ' predicates for head ' + candidateHeadSha,
+    });
+
+    const gateResult = await gatePort.evaluateGatePredicates({
+      attemptId: id,
+      worktreePath: attempt.worktreePath,
+      runner: attempt.runner ?? null,
+      baseCommit: attempt.baseCommit,
+      candidateHeadSha,
+      allowedPathPrefixes,
+      spec: spec.toJSON(),
+    });
+    if (gateResult.outcome === 'unavailable') {
+      await journal.appendJournalEntry({
+        id: `${id}:accept:${entryCount + 1}`,
+        attemptId: id,
+        workOrderId: attempt.workOrderId,
+        action: 'accept',
+        baseCommit: attempt.baseCommit,
+        recordedAtIso: deps.now?.() ?? new Date().toISOString(),
+        sessionId: attempt.sessionId,
+        status: 'ambiguous',
+        detail: gateResult.reason,
+      });
+      return 'Unknown: gate predicates unavailable: ' + gateResult.reason;
+    }
+
+    const results = gateResult.results;
+    const entries = results.map((result, offset) =>
+      this.gateJournalEntry(deps, attempt, id, entryCount + 1 + offset, result),
+    );
+    await entries.reduce(
+      (chain, entry) => chain.then(() => journal.appendJournalEntry(entry)),
+      Promise.resolve(),
+    );
+
+    for (const result of results) {
+      if (result.verdict !== 'pass') {
+        const exitText = result.exitCode === null ? '' : ' with exit code ' + result.exitCode;
+        return 'Gate predicate ' + result.name + ' ' + result.verdict + exitText + ': ' + result.detail;
+      }
+    }
+    return null;
+  }
+
+  private gateJournalEntry(
+    deps: RequestAttemptAcceptanceDependencies,
+    attempt: AttemptRecord,
+    id: string,
+    offset: number,
+    result: GatePredicateResult,
+  ): ActionJournalEntryRecord {
+    const detailObject: Record<string, unknown> = {
+      predicate: result.name,
+      kind: result.kind,
+      verdict: result.verdict,
+      exitCode: result.exitCode,
+      durationMs: result.durationMs,
+      detail: result.detail,
+    };
+    if (result.coverage !== undefined) {
+      detailObject.coverage = result.coverage;
+    }
+    return {
+      id: `${id}:accept:${offset}`,
+      attemptId: id,
+      workOrderId: attempt.workOrderId,
+      action: 'accept',
+      baseCommit: attempt.baseCommit,
+      recordedAtIso: deps.now?.() ?? new Date().toISOString(),
+      sessionId: attempt.sessionId,
+      status: GATE_PREDICATE_VERDICT_TO_STATUS[result.verdict],
+      detail: JSON.stringify(detailObject),
+    };
   }
 }

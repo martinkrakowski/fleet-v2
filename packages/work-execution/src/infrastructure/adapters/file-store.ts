@@ -472,6 +472,63 @@ export async function quarantineUnreadable(
   });
 }
 
+/**
+ * Error thrown by a store opened read-only (telemetry plan §3.3) when its JSON state file cannot be
+ * parsed or validated. Unlike `StateFileUnreadableError`, nothing was copied: a read-only reader never
+ * writes, locks, creates or quarantines anything.
+ */
+export class StateFileUnreadableReadOnlyError extends Error {
+  readonly filePath: string;
+  readonly detail: string;
+
+  constructor(filePath: string, detail: string) {
+    super(
+      `State file ${filePath} is unreadable (${detail}); this read-only read kept no copy and wrote nothing`,
+    );
+    this.name = 'StateFileUnreadableReadOnlyError';
+    this.filePath = filePath;
+    this.detail = detail;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/** Error thrown when a write reaches a store opened read-only. Nothing was locked, read or written. */
+export class ReadOnlyStateStoreError extends Error {
+  readonly storeName: string;
+
+  constructor(storeName: string) {
+    super(`${storeName} was opened read-only and refuses every write`);
+    this.name = 'ReadOnlyStateStoreError';
+    this.storeName = storeName;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/**
+ * The unreadable-file path of every store reader: a writable store quarantines the bytes exactly as
+ * `quarantineUnreadable` does; a read-only store throws `StateFileUnreadableReadOnlyError` and touches
+ * nothing on disk.
+ */
+export async function rejectUnreadableStateFile(
+  filePath: string,
+  detail: string,
+  bytes: Buffer,
+  readOnly: boolean,
+  fsImpl: QuarantineFs = fs,
+): Promise<never> {
+  if (readOnly) {
+    throw new StateFileUnreadableReadOnlyError(filePath, detail);
+  }
+  return quarantineUnreadable(filePath, detail, bytes, fsImpl);
+}
+
+/** Throws `ReadOnlyStateStoreError` when `readOnly`; every write method of a store calls it first. */
+export function assertStoreWritable(readOnly: boolean, storeName: string): void {
+  if (readOnly) {
+    throw new ReadOnlyStateStoreError(storeName);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // State-file inspection (E1b): the one parser every store reader and
 // `fleet-v2 state check` share, so a check and a read can never disagree.

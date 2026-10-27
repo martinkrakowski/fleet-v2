@@ -36,6 +36,7 @@ import type {
   SeatRole,
   ShelfSection,
   ShelfSectionV2,
+  TelemetryPolicy,
   VerificationProcedure,
   VerificationProceduresSection,
   VerificationSection,
@@ -44,6 +45,7 @@ import type {
 } from './types.js';
 
 import { CONDUCTOR_MINUTE_BOUNDS, CONDUCTOR_REAPER_REPAIR_KINDS } from './policy.js';
+import { readTelemetryPolicyBlock } from './telemetry-policy.js';
 
 export type ParseResult =
   | { ok: true; installation: FleetInstallation }
@@ -162,6 +164,7 @@ const POLICY_KEYS: readonly string[] = [
   'liveTail',
   'autoMerge',
   'conductor',
+  'telemetry',
 ];
 const FORBIDDEN_ROUTE_KEYS: readonly string[] = ['tool', 'modelPattern'];
 const LIVE_TAIL_KEYS: readonly string[] = ['content'];
@@ -1672,6 +1675,7 @@ function parseV2Policy(
   const liveTail = parseLiveTailPolicy(section, errors);
   const autoMerge = parseAutoMergePolicy(section, errors);
   const conductor = parseConductorPolicy(section, errors);
+  const telemetry = parseTelemetryPolicy(section, errors);
   return {
     ...(forbiddenRoutes !== undefined ? { forbiddenRoutes } : {}),
     ...(perLaneCostCeiling !== undefined ? { perLaneCostCeiling } : {}),
@@ -1679,6 +1683,7 @@ function parseV2Policy(
     ...(liveTail !== undefined ? { liveTail } : {}),
     ...(autoMerge !== undefined ? { autoMerge } : {}),
     ...(conductor !== undefined ? { conductor } : {}),
+    ...(telemetry !== undefined ? { telemetry } : {}),
   };
 }
 
@@ -1916,6 +1921,21 @@ function parseConductorPolicy(
     ...(stopGraceMinutes !== undefined ? { stopGraceMinutes } : {}),
     ...(reaper !== undefined ? { reaper } : {}),
   };
+}
+
+function parseTelemetryPolicy(
+  section: JsonObject,
+  errors: string[],
+): TelemetryPolicy | undefined {
+  if (!Object.hasOwn(section, 'telemetry')) {
+    return undefined;
+  }
+  const read = readTelemetryPolicyBlock(section.telemetry);
+  if (!read.ok) {
+    errors.push(...read.errors);
+    return undefined;
+  }
+  return read.policy;
 }
 
 function parseV2Shelf(

@@ -700,7 +700,8 @@ describe('OwnerItem decision transitions', () => {
     });
     expect(removedResult.success).toBe(true);
     if (removedResult.success) {
-      expect(removedResult.value.toRecord().resolution.kind).toBe('decision-removed');
+      const resolution = removedResult.value.toRecord().resolution;
+      expect(resolution !== null && resolution.kind).toBe('decision-removed');
     }
   });
 });

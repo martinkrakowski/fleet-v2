@@ -348,7 +348,7 @@ function resolutionErrorValue(resolution: unknown, kind: OwnerItemKindValue): st
   if (typeof resKind !== 'string' || !OWNER_ITEM_RESOLUTION_KINDS.includes(resKind as OwnerItemResolutionKind)) {
     return 'invalid';
   }
-  if (!OWNER_ITEM_RESOLUTIONS_BY_KIND[kind].includes(resKind as OwnerItemResolutionKind)) {
+  if (!(OWNER_ITEM_RESOLUTIONS_BY_KIND[kind] as readonly OwnerItemResolutionKind[]).includes(resKind as OwnerItemResolutionKind)) {
     return 'invalid';
   }
   for (const key of Object.keys(parsed)) {
@@ -689,7 +689,7 @@ export class OwnerItem {
       if (record.withdrawal !== null || resolutionErrorValue(record.resolution, kind) !== null) {
         return fail('OwnerItem closed requires a resolution its kind allows');
       }
-    } else if (!OWNER_ITEM_OWNER_CLOSABLE_KINDS.includes(kind) || record.resolution !== null || withdrawalErrorValue(record.withdrawal) !== null) {
+    } else if (!(OWNER_ITEM_OWNER_CLOSABLE_KINDS as readonly OwnerItemKindValue[]).includes(kind) || record.resolution !== null || withdrawalErrorValue(record.withdrawal) !== null) {
       return fail('OwnerItem withdrawn requires a withdrawal and a kind the owner may close');
     }
     if (
@@ -884,12 +884,12 @@ export class OwnerItem {
       return { success: false, error: new Error('OwnerItem a decision closes only on a recorded choice'), code: 'no-choice' };
     }
     const current = this.record.state;
-    const currentResolutionKind = this.record.resolution === null ? null : this.record.resolution.kind;
+    const currentResolution = this.record.resolution;
     if (
       current === 'closed' &&
-      currentResolutionKind === 'answered' &&
-      this.record.resolution !== null &&
-      this.record.resolution.questionId === answer.questionId
+      currentResolution !== null &&
+      currentResolution.kind === 'answered' &&
+      currentResolution.questionId === answer.questionId
     ) {
       return { success: true, value: this };
     }

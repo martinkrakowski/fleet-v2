@@ -31,6 +31,7 @@ class RecordingChangeSignalPort implements ChangeSignalPort {
 
   clear(): void {
     this.signals.length = 0;
+    this.lockHeldAtEmit.length = 0;
   }
 }
 
@@ -194,6 +195,18 @@ describe('change signals: AttemptRepositoryAdapter', () => {
     expect(signals.signals).toHaveLength(1);
     expect(signals.signals[0]).toMatchObject({ stateFile: null, before: null, written: null });
   });
+
+  it('clear() resets lockHeldAtEmit', async () => {
+    const target = path.resolve(path.join(tempDir, 'attempts.json'));
+    const signals = new RecordingChangeSignalPort(`${target}.lock`);
+    const adapter = new AttemptRepositoryAdapter({ stateDir: tempDir, changeSignal: signals });
+
+    await adapter.saveAttempt(makeAttempt());
+    expect(signals.lockHeldAtEmit.length).toBeGreaterThan(0);
+    signals.clear();
+    expect(signals.signals).toHaveLength(0);
+    expect(signals.lockHeldAtEmit).toHaveLength(0);
+  });
 });
 
 describe('change signals: WorkOrderRepositoryAdapter', () => {
@@ -208,9 +221,9 @@ describe('change signals: WorkOrderRepositoryAdapter', () => {
   });
 
   it('saveWorkOrder emits one signal per successful save with kind, id, stateFile and written.size; before null then previous written ino', async () => {
-    const signals = new RecordingChangeSignalPort();
-    const adapter = new WorkOrderRepositoryAdapter({ stateDir: tempDir, changeSignal: signals });
     const target = path.resolve(path.join(tempDir, 'work-orders.json'));
+    const signals = new RecordingChangeSignalPort(`${target}.lock`);
+    const adapter = new WorkOrderRepositoryAdapter({ stateDir: tempDir, changeSignal: signals });
 
     await adapter.saveWorkOrder(makeWorkOrder());
     expect(signals.signals).toHaveLength(1);
@@ -228,6 +241,8 @@ describe('change signals: WorkOrderRepositoryAdapter', () => {
     expect(second.id).toBe('wo-1');
     expect(second.before).not.toBeNull();
     expect(second.before!.ino).toBe(first.written!.ino);
+    expect(signals.lockHeldAtEmit.length).toBeGreaterThan(0);
+    expect(signals.lockHeldAtEmit.every((held) => held === false)).toBe(true);
   });
 
   it('saveWorkOrder emits nothing when the save throws on an unreadable file', async () => {
@@ -251,9 +266,9 @@ describe('change signals: ExecutionJournalAdapter saveCapacityReservation', () =
   });
 
   it('saveCapacityReservation emits one signal per successful save with kind, id, stateFile and written.size; before null then previous written ino', async () => {
-    const signals = new RecordingChangeSignalPort();
-    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir, changeSignal: signals });
     const target = path.resolve(path.join(tempDir, 'reservations.json'));
+    const signals = new RecordingChangeSignalPort(`${target}.lock`);
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir, changeSignal: signals });
 
     await adapter.saveCapacityReservation(makeReservation());
     expect(signals.signals).toHaveLength(1);
@@ -271,6 +286,8 @@ describe('change signals: ExecutionJournalAdapter saveCapacityReservation', () =
     expect(second.id).toBe('res-2');
     expect(second.before).not.toBeNull();
     expect(second.before!.ino).toBe(first.written!.ino);
+    expect(signals.lockHeldAtEmit.length).toBeGreaterThan(0);
+    expect(signals.lockHeldAtEmit.every((held) => held === false)).toBe(true);
   });
 
   it('saveCapacityReservation emits nothing when the save throws on an unreadable file', async () => {
@@ -296,9 +313,9 @@ describe('change signals: ExecutionJournalAdapter reserveCapacityAtomically', ()
   });
 
   it('reserveCapacityAtomically emits one capacity signal per successful reservation', async () => {
-    const signals = new RecordingChangeSignalPort();
-    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir, changeSignal: signals });
     const target = path.resolve(path.join(tempDir, 'reservations.json'));
+    const signals = new RecordingChangeSignalPort(`${target}.lock`);
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir, changeSignal: signals });
 
     const firstResult = await adapter.reserveCapacityAtomically({
       attemptId: 'att-a',
@@ -327,6 +344,8 @@ describe('change signals: ExecutionJournalAdapter reserveCapacityAtomically', ()
     expect(second.stateFile).toBe(target);
     expect(second.before).not.toBeNull();
     expect(second.before!.ino).toBe(first.written!.ino);
+    expect(signals.lockHeldAtEmit.length).toBeGreaterThan(0);
+    expect(signals.lockHeldAtEmit.every((held) => held === false)).toBe(true);
   });
 
   it('reserveCapacityAtomically emits nothing when the read throws on an unreadable file', async () => {
@@ -402,9 +421,9 @@ describe('change signals: ExecutionJournalAdapter releaseCapacityReservation', (
   });
 
   it('releaseCapacityReservation emits one capacity signal when it releases a held reservation', async () => {
-    const signals = new RecordingChangeSignalPort();
-    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir, changeSignal: signals });
     const target = path.resolve(path.join(tempDir, 'reservations.json'));
+    const signals = new RecordingChangeSignalPort(`${target}.lock`);
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir, changeSignal: signals });
 
     const reserveResult = await adapter.reserveCapacityAtomically({
       attemptId: 'att-a',
@@ -427,6 +446,8 @@ describe('change signals: ExecutionJournalAdapter releaseCapacityReservation', (
     expect(signal.before).not.toBeNull();
     expect(signal.before?.ino).toBe(reserveWritten?.ino);
     expect(signal.before?.size).toBe(reserveWritten?.size);
+    expect(signals.lockHeldAtEmit.length).toBeGreaterThan(0);
+    expect(signals.lockHeldAtEmit.every((held) => held === false)).toBe(true);
   });
 
   it('releaseCapacityReservation emits nothing when the read throws on an unreadable file', async () => {

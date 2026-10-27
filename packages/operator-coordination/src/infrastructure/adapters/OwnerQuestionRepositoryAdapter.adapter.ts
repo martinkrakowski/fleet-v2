@@ -208,7 +208,7 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
         'OwnerQuestionRepositoryAdapter refuses a fileName that collides with the coordination requests store',
       );
     }
-    if (!SAFE_FILE_NAME.test(name)) {
+    if (!SAFE_FILE_NAME.test(name) || name === '.' || name === '..') {
       throw new Error('OwnerQuestionRepositoryAdapter refuses unsafe state file name');
     }
     return join(stateDir, name);

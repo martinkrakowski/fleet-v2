@@ -117,7 +117,7 @@ export class LaneRunJournalAdapter implements LaneRunJournalPort {
         'LaneRunJournalAdapter refuses a fileName that collides with another store',
       );
     }
-    if (!SAFE_FILE_NAME.test(name)) {
+    if (!SAFE_FILE_NAME.test(name) || name === '.' || name === '..') {
       throw new Error(
         'LaneRunJournalAdapter refuses unsafe state file name',
       );

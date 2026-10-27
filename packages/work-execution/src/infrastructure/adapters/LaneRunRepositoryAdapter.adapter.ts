@@ -290,7 +290,7 @@ export class LaneRunRepositoryAdapter implements LaneRunRepositoryPort {
         'LaneRunRepositoryAdapter refuses a fileName that collides with another store',
       );
     }
-    if (!SAFE_FILE_NAME.test(name)) {
+    if (!SAFE_FILE_NAME.test(name) || name === '.' || name === '..') {
       throw new Error('LaneRunRepositoryAdapter refuses unsafe state file name');
     }
     return join(stateDir, name);

@@ -159,7 +159,7 @@ drives a step.
   carrying the run's `expectedRevision`. **Amended by K-GC (conductor §3.9; note below):** the rest
   of this bullet, its outcome table and its body describe the forced stop, "Stop now", keyed
   `<runId>/stop-force@web`; `<runId>/stop@web` now names the graceful stop, which calls no
-  `StopAttempt` because of the stop. The driver obeys it and stops the running attempt itself
+  `StopAttempt` because of the stop. For the forced entry, the driver stops the running attempt itself
   through `StopAttempt` (conductor §3.2: "a running attempt is stopped first through
   `StopAttempt`"). The web never calls `StopAttempt` for an attempt that belongs to a run. The
   driver maps `StopAttempt`'s outcome as follows:

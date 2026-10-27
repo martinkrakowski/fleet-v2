@@ -327,7 +327,7 @@ export class OwnerItemRepositoryAdapter implements OwnerItemRepositoryPort {
         "OwnerItemRepositoryAdapter refuses a fileName that collides with another store",
       );
     }
-    if (!SAFE_FILE_NAME.test(name)) {
+    if (!SAFE_FILE_NAME.test(name) || name === '.' || name === '..') {
       throw new Error(
         "OwnerItemRepositoryAdapter refuses unsafe state file name",
       );

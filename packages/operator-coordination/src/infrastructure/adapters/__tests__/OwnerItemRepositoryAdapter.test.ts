@@ -166,6 +166,29 @@ describe('OwnerItemRepositoryAdapter', () => {
     expect(entries.filter((name) => name.endsWith('.tmp') || name.endsWith('.lock'))).toEqual([]);
   });
 
+  it('refuses . and .. as a state file name', async () => {
+    for (const fileName of ['.', '..']) {
+      const adapter = new OwnerItemRepositoryAdapter({ stateDir: tempDir, fileName });
+      await expect(adapter.get('oi-example-1')).rejects.toThrow('OwnerItemRepositoryAdapter refuses unsafe state file name');
+    }
+  });
+
+  it('keeps one item per natural key when two adapters save concurrently', async () => {
+    const first = new OwnerItemRepositoryAdapter({ stateDir: tempDir });
+    const second = new OwnerItemRepositoryAdapter({ stateDir: tempDir });
+    const results = await Promise.allSettled([
+      first.save(openItem({ itemId: 'oi-example-1' }), 0),
+      second.save(openItem({ itemId: 'oi-example-2' }), 0),
+    ]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.reason).toBeInstanceOf(OwnerItemKeyConflictError);
+    const reader = new OwnerItemRepositoryAdapter({ stateDir: tempDir });
+    const held = [await reader.get('oi-example-1'), await reader.get('oi-example-2')].filter((item) => item !== null);
+    expect(held).toHaveLength(1);
+  });
+
   it('refuses a save whose natural key another item holds and writes nothing', async () => {
     const adapter = new OwnerItemRepositoryAdapter({ stateDir: tempDir });
     await adapter.save(openItem(), 0);

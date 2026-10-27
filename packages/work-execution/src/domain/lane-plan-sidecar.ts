@@ -797,6 +797,9 @@ function resolveAfterReference(text: string, projectId: string, planId: string):
   return null;
 }
 
+/** `repo` or `owner/repo`, in a forge's own name characters only: no whitespace, control or bidi code point can pass. */
+const PULL_REQUEST_REPOSITORY_PATTERN = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?$/;
+
 function pullRequestRepositoryError(path: string, value: unknown): string | null {
   if (typeof value !== 'string') {
     return `${path}: must be a string`;
@@ -804,7 +807,11 @@ function pullRequestRepositoryError(path: string, value: unknown): string | null
   if (isPlanSecretShaped(value)) {
     return `${path}: contains a secret-shaped value and was refused`;
   }
-  if (value.length === 0 || utf8Bytes(value) > LANE_PLAN_LIMITS.repositoryBytes || /\s/.test(value)) {
+  if (
+    value.length === 0 ||
+    utf8Bytes(value) > LANE_PLAN_LIMITS.repositoryBytes ||
+    !PULL_REQUEST_REPOSITORY_PATTERN.test(value)
+  ) {
     return `${path}: must be a repository name`;
   }
   return null;

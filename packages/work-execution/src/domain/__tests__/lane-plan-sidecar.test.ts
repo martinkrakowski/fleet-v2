@@ -155,6 +155,14 @@ describe('parseLanePlanSidecar', () => {
     expect(refusedErrors(withPrKey)).toEqual(['lanes[2].mergedPr: unknown key']);
   });
 
+  it('refuses a mergedPr repository with control, bidi or other non-name characters', () => {
+    for (const repository of ['org/repo\u0000', 'org/\u202erepo', 'org repo', 'org//repo', 'a/b/c', '']) {
+      const input = cloneValid();
+      ((input.lanes as Record<string, unknown>[])[2].mergedPr as Record<string, unknown>).repository = repository;
+      expect(refusedErrors(input)).toEqual(['lanes[2].mergedPr.repository: must be a repository name']);
+    }
+  });
+
   it('reports missing required keys in table order', () => {
     const withoutPlanIdAndLanes = cloneValid();
     delete (withoutPlanIdAndLanes as Record<string, unknown>).planId;

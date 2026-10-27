@@ -363,4 +363,23 @@ describe('digest kinds cover every exported kind', () => {
     expect(telemetryHashInput('a\uDC00')).toBeNull();
     expect(telemetryHashInput('a\uD83D\uDE00b')).not.toBeNull();
   });
+
+  it('pins literal ids under the fixture salt (golden vectors; a change here splits every exported trace)', () => {
+    expect(telemetryDigest(hmac, 'work-order', input('wo-example-1'))).toBe('edd70df3b547f013');
+    expect(telemetryTraceId(hmac, RUN_ROOT as TelemetryTraceRoot)).toBe('90c6d09ae6103d6d13086cabe4ea79d4');
+    expect(telemetrySpanId(hmac, RUN_ROOT as TelemetryTraceRoot, runRootIdentity())).toBe('e1392c4264271f62');
+    expect(STEP_KEY).toBe('run-01JB0000000000000000000000/r0/dispatch/0/a1');
+    const keyIdentity = journalKeyIdentity(input(STEP_KEY));
+    expect(keyIdentity).not.toBeNull();
+    expect(telemetrySpanId(hmac, RUN_ROOT as TelemetryTraceRoot, keyIdentity as TelemetrySpanIdentity)).toBe('43cfcc5b1aa7df67');
+    expect(telemetrySaltFingerprint(hmac)).toBe('5269c92d');
+  });
+
+  it('the all-zero rule never mutates the MAC buffer the HMAC returned', () => {
+    const shared = Buffer.alloc(32);
+    const zeroBuffer: TelemetryHmac = () => shared;
+    expect(telemetryTraceId(zeroBuffer, RUN_ROOT as TelemetryTraceRoot)).toMatch(TELEMETRY_TRACE_ID_PATTERN);
+    expect(telemetrySpanId(zeroBuffer, RUN_ROOT as TelemetryTraceRoot, runRootIdentity())).toMatch(TELEMETRY_SPAN_ID_PATTERN);
+    expect([...shared].every((byte) => byte === 0)).toBe(true);
+  });
 });

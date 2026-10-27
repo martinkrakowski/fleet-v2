@@ -33,6 +33,8 @@ export const TELEMETRY_HASH_INPUT_MAX_LENGTH = 1024;
 /**
  * HMAC-SHA256 keyed with the installation's telemetry salt (plan §3.2, D14), built by infrastructure.
  * It returns the 32-byte MAC of the UTF-8 bytes of `message`. The domain never sees the salt.
+ * `message` contains raw operator ids and journalled keys: the implementation must never log,
+ * retain or persist it, and must not memoise MACs to disk.
  */
 export type TelemetryHmac = (message: string) => Uint8Array;
 
@@ -73,7 +75,11 @@ function readText(registry: WeakMap<object, string>, token: unknown): string | n
 /** An unpaired UTF-16 surrogate: `encodeURIComponent` throws on it, so such a value is never a hash input. */
 const LONE_SURROGATE = /\p{Cs}/u;
 
-/** Wrap a raw operator id or journalled key. Null unless a non-empty, well-formed string of at most 1024 code units. */
+/**
+ * Wrap a raw operator id or journalled key. No Unicode normalisation: the text is hashed exactly
+ * as stored in the record, and normalising it would change every id derived from it.
+ * Null unless a non-empty, well-formed string of at most 1024 code units.
+ */
 export function telemetryHashInput(value: unknown): TelemetryHashInput | null {
   try {
     if (typeof value !== 'string' || value.length === 0 || value.length > TELEMETRY_HASH_INPUT_MAX_LENGTH || LONE_SURROGATE.test(value)) {
@@ -110,7 +116,7 @@ function hexOf(bytes: Uint8Array, count: number): string {
  * digests and the fingerprint do not.
  */
 function idHexOf(bytes: Uint8Array, count: number): string {
-  const copy = bytes.slice(0, count);
+  const copy = new Uint8Array(bytes.subarray(0, count));
   let allZero = true;
   for (const byte of copy) {
     if (byte !== 0) {

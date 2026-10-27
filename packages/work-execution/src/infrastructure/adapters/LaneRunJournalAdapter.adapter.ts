@@ -8,7 +8,9 @@
  * a synchronous check-and-push in memory — so two appends racing for one key,
  * or two stops racing for one run, never both pass. A refusal writes nothing.
  * Like journal.json, the run journal emits no change signal: the API watches
- * only signalled stores.
+ * only signalled stores. With `readOnly` the store never writes: an
+ * unreadable file is a read error with no quarantine copy, and every append is
+ * refused.
  */
 
 import { promises as fs } from 'node:fs';
@@ -20,13 +22,18 @@ import type {
   LaneRunJournalAppendResult,
   LaneRunJournalPort,
 } from '../../application/ports/out/LaneRunJournalPort.out-port.js';
-import { inspectRecordListBytes, quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
+import { assertStoreWritable, inspectRecordListBytes, rejectUnreadableStateFile, withFileLock, writeJsonAtomically } from './file-store.js';
 
 export interface LaneRunJournalAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
   readonly stateDir?: string;
   /** File name inside the state directory; defaults to `run-journal.json`. */
   readonly fileName?: string;
+  /**
+   * Read-only (telemetry plan §3.3): an unreadable file is a read error with no quarantine copy
+   * (`StateFileUnreadableReadOnlyError`), and every write throws `ReadOnlyStateStoreError`.
+   */
+  readonly readOnly?: boolean;
 }
 
 const DEFAULT_FILE_NAME = 'run-journal.json';
@@ -61,6 +68,7 @@ export class LaneRunJournalAdapter implements LaneRunJournalPort {
   constructor(private readonly options?: LaneRunJournalAdapterOptions) {}
 
   async append(entry: LaneRunJournalEntryRecord): Promise<LaneRunJournalAppendResult> {
+    assertStoreWritable(this.options?.readOnly === true, 'LaneRunJournalAdapter');
     const target = this.statePath;
     if (target === null) {
       // In-memory branch: the whole decide-then-push runs synchronously (no
@@ -141,7 +149,7 @@ export class LaneRunJournalAdapter implements LaneRunJournalPort {
     }
     const inspection = inspectRecordListBytes(buffer, parseLaneRunJournalStateRecord);
     if (inspection.status === 'unreadable') {
-      return quarantineUnreadable(target, inspection.detail, buffer);
+      return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
     }
     return [...inspection.records];
   }

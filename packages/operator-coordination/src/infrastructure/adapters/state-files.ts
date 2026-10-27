@@ -6,9 +6,11 @@ import { describeRecordListStore, type StateFileDescriptor } from './file-store.
 import { parseProjectProfileStateRecord } from './ProjectProfileRepositoryAdapter.adapter.js';
 import { parseCoordinationRequestStateRecord } from './CoordinationRequestRepositoryAdapter.adapter.js';
 import { parseOwnerQuestionStateRecord } from './OwnerQuestionRepositoryAdapter.adapter.js';
+import { parseOrchestratorSessionStateRecord } from './OrchestratorSessionRepositoryAdapter.adapter.js';
 
 export const OPERATOR_COORDINATION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('project-profiles.json', parseProjectProfileStateRecord),
   describeRecordListStore('coordination-requests.json', parseCoordinationRequestStateRecord),
   describeRecordListStore('owner-questions.json', parseOwnerQuestionStateRecord),
+  describeRecordListStore('orchestrators.json', parseOrchestratorSessionStateRecord),
 ];

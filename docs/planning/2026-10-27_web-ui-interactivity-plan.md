@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-27
 - **Target repository:** `fleet-v2`
-- **Status:** rev 3. Rev 1 applied Fable's review of the research; rev 2 added the orchestrator
+- **Status:** rev 3.1. Rev 1 applied Fable's review of the research; rev 2 added the orchestrator
   request channel (§3.6) and the live tail (§3.7) from Fable's design review; rev 3 applies Grok
   4.7's review of rev 2 (§7). Decisions in §5 are open with defaults. Nothing built. Anchors checked against `main` at `dae491f`.
 - **Owner requests (2026-10-27):**
@@ -418,8 +418,8 @@ conductor's own work-execution lanes.
 | W1a | Live `/attempt`: inspect read, `unknown` outcome, recorded runner facts, usage, artifacts; `map-attempt.ts` keeps usage/runner/artifacts; rows open the page; shorter visible-tab poll | apps/web | 2 | W0 |
 | W1b | Work-order sidebar (`GET /v1/work-orders/:id`), journal panel, P12 sample labels and "sample digest" | apps/web | 2 | W1a, A-J |
 | **Step 2. Domain lanes (parallel across packages); web: Q4 → W8a → W10** | | | | |
-| O1b → O2a → O2b | `OrchestratorRequest` aggregate (closed payload, `reasonKind`, lifecycle); register/heartbeat/retire/list with `orchestrators.json`; create/claim/renew/complete/refuse/defer/cancel/expire and the dispatcher-host gate, with only `dispatch-attempt` enabled | operator-coordination, **manifest** | 2 | O1a |
-| L1 → L2 | `LaneSessionEventPort` and the opencode adapter, summaries, `full` behind policy; then the agy file-tail adapter | work-execution (infra), **manifest** (L1) | 2 | A-J (same package), L1b, O2b (manifest) |
+| O1b → O2a → O2b | `OrchestratorRequest` aggregate (closed payload, `reasonKind`, lifecycle); register/heartbeat/retire/list with `orchestrators.json`; create/claim/renew/complete/refuse/defer/cancel/expire and the dispatcher-host gate, with only `dispatch-attempt` enabled; the claim use case refuses `dispatch-attempt` with `reasonKind: policy` while `policy.conductor.enabled` is on and the installation has not opted in (D7 enforced here, not in O9) | operator-coordination, **manifest** | 2 | O1a |
+| L1 → L2 | `LaneSessionEventPort` and the opencode adapter, summaries, `full` behind policy; then the agy file-tail adapter | work-execution (infra), **manifest** (L1) | 2 | A-J (same package), L1b, O2b (manifest); L2 must finish before the next work-execution lane (A-R) |
 | Q4 | Questions view, badge, attention card from `/v1/attention` | apps/web | 2 | W1b |
 | W8a | Work-order timeline: attempts by `workOrderId`/`priorAttemptId`, journal, head evidence; `reviewTally` and `kind` when served | apps/web | 2 | Q4; full fidelity after R2, RW1 |
 | W10 | Usage and seat/model chips per row, sums per work order, `source` and estimate labels | apps/web | 2 | W8a |
@@ -437,7 +437,7 @@ conductor's own work-execution lanes.
 | L6 | Attempt-page lane pane, silent and ended states | apps/web | 2 | L5, W1a |
 | **Step 5. Write path (orchestrator plan lanes, serial); web: T6 → E3c → E5** | | | | |
 | T3a → T3b → T6 | Scopes with `operate`, `orchestrate`, `tail`; session exchange; web proxy and first write route | apps/api, **`security.ts`**; apps/web | 2 | UI-A; T3a's own prerequisites; T6 after L6 |
-| L9 | `tail` scope enforced on the tail routes; the interim bearer read retired (with `read` for `/v1/changes`) | apps/api, **`security.ts`, `composition.ts`** | 2 | T3a, L3, E3b |
+| L9 | `tail` scope enforced on the tail routes; the interim bearer read retired (with `read` for `/v1/changes`) | apps/api, **`security.ts`, `composition.ts`** | 2 | T6 (`security.ts`), L3, E3b |
 | E3c → E5 | Web change relay; offline display | apps/web | 2 | E3b, T6 |
 | **Step 6. Actions after T6; web: W5a → W5b → O8 → Q5 → W8b** | | | | |
 | W5a | Reconcile, stop (attempts with no run only), collect from the attempt page | apps/web | 2 | T6, E5 |
@@ -446,10 +446,10 @@ conductor's own work-execution lanes.
 | Q5 | Question answers, one-way answers show bytes to sign | apps/web, packages/ui | 2 | O8 |
 | W8b | Finding dispositions from the timeline | apps/web | 2 | Q5, W8a |
 | **Step 7. Conductor; serial A-R → A-C → O9; web: W7a → W7b** | | | | |
-| O2c | Journal-key reconciliation (`request/<requestId>`); enables `start-lane-run`, `prepare-fix`, `request-review`, `resume-run` | operator-coordination, **manifest** | 2 | O2b, K1b, O3 (manifest) |
-| A-R | `GET /v1/runs`, `/v1/runs/:id`, run journal by key | work-execution, apps/api, **`composition.ts`, manifest** | 2 | K3, O2c (manifest) |
+| O2c | Journal-key reconciliation (`request/<requestId>`); enables `start-lane-run`, `prepare-fix`, `request-review`, `resume-run`; `start-lane-run` is claimable only by `cliKind: conductor` from the start (D7) | operator-coordination, **manifest** | 2 | O2b, K1b, O3 (manifest) |
+| A-R | `GET /v1/runs`, `/v1/runs/:id`, run journal by key | work-execution, apps/api, **`composition.ts`, manifest** | 2 | K3, O2c (manifest), L2 (work-execution) |
 | A-C | Direct run routes: halt marker through the CLI's adapter; run stop as a keyed run-journal entry `<runId>/stop@web` with `expectedRevision`; attempt stop refuses run-owned attempts | work-execution, apps/api, **`composition.ts`, manifest** | 2 | A-R, K7, T3a |
-| O9 | `start-lane-run` claimed by the conductor driver; interactive dispatch kinds refused when the conductor is enabled | work-execution, apps/cli, **`index.ts`, manifest** | 2 | A-C, O5, K3, K7, O2c |
+| O9 | The conductor driver registers and claims `start-lane-run` (the claim rules already exist from O2b and O2c) | work-execution, apps/cli, **`index.ts`, manifest** | 2 | A-C, O5, K3, K7, O2c |
 | W7a | Run board read, dry-run and shadow entries distinct | apps/web | 2 | A-R, K7, W8b |
 | W7b | Halt and run-stop controls; resume and start as requests (O8's card) | apps/web | 2 | W7a, A-C, O8 |
 | L8 | Per-run journal tail | apps/api, **`composition.ts`** | 2 | K1b, L3, A-C |
@@ -565,6 +565,8 @@ F1–F13 applied.**
 - F12 (minor): 30 min expiry, cancel while queued or deferred, `cancel-requested` re-read under CAS.
 - F13 (major): lane output is untrusted; summaries by default, `full` opt-in and never persisted,
   plain-text rendering, secret-pattern withholding, bounded queues, a `tail` scope (§3.7, D10, D11).
+
+**Grok 4.7, re-review of rev 3 (2026-10-27):** all seven rev-2 findings RESOLVED; two new majors, applied in rev 3.1: (1) the conductor-enabled refusal of `dispatch-attempt` and the conductor-only claim of `start-lane-run` move into O2b and O2c, so no window exists before O9; (2) A-R waits for L2 (work-execution), and L9 waits for T6 (`security.ts`).
 
 **Grok 4.7 (2026-10-27): 6 majors, 1 minor, all applied.**
 1. Major: a web stop raced the conductor. A run-owned attempt is stopped only through the run:

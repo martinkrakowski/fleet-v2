@@ -5,7 +5,8 @@
  * accept no further dispatch, and a work order owns its paths and revision.
  */
 
-import type { WorkOrderRecord } from '../execution-records.js';
+import type { PlanRef, WorkOrderRecord } from '../execution-records.js';
+import { PLAN_ID_PATTERN, PLANNED_LANE_ID_PATTERN } from '../lane-plan-records.js';
 import type { WorkOrderStateValue } from '../value-objects/WorkOrderState.vo.js';
 import { WorkOrderState } from '../value-objects/WorkOrderState.vo.js';
 
@@ -38,7 +39,13 @@ export class WorkOrder {
     if (!state.success || state.value === undefined) {
       throw new Error(`WorkOrder has an invalid state: ${String(record.state)}`);
     }
-    return new WorkOrder({ ...record, ownedPaths: [...record.ownedPaths] });
+    if (record.planRef !== undefined) {
+      const planRefErrorMessage = planRefError(record.planRef, record.projectId);
+      if (planRefErrorMessage !== null) {
+        throw new Error(planRefErrorMessage);
+      }
+    }
+    return new WorkOrder(storedRecord(record));
   }
 
   getId(): string {
@@ -46,7 +53,15 @@ export class WorkOrder {
   }
 
   toRecord(): WorkOrderRecord {
-    return { ...this.record, ownedPaths: [...this.record.ownedPaths] };
+    return storedRecord(this.record);
+  }
+
+  getPlanRef(): PlanRef | null {
+    const planRef = this.record.planRef;
+    if (planRef === undefined) {
+      return null;
+    }
+    return { projectId: planRef.projectId, planId: planRef.planId, laneId: planRef.laneId };
   }
 
   getState(): WorkOrderStateValue {
@@ -72,4 +87,65 @@ export class WorkOrder {
       (owned) => path === owned || path.startsWith(`${owned}/`),
     );
   }
+}
+
+/** A fresh record; `planRef` is copied when present and omitted when absent. */
+function storedRecord(record: WorkOrderRecord): WorkOrderRecord {
+  const stored: Omit<WorkOrderRecord, 'planRef'> & { planRef?: PlanRef } = {
+    id: record.id,
+    projectId: record.projectId,
+    taskId: record.taskId,
+    laneId: record.laneId,
+    repository: record.repository,
+    baseCommit: record.baseCommit,
+    ownedPaths: [...record.ownedPaths],
+    policyRevision: record.policyRevision,
+    prerequisiteWorkOrderIds: record.prerequisiteWorkOrderIds,
+    state: record.state,
+    revision: record.revision,
+    createdAtIso: record.createdAtIso,
+    updatedAtIso: record.updatedAtIso,
+  };
+  if (record.planRef !== undefined) {
+    stored.planRef = {
+      projectId: record.planRef.projectId,
+      planId: record.planRef.planId,
+      laneId: record.planRef.laneId,
+    };
+  }
+  return stored;
+}
+
+function planRefError(value: unknown, projectId: string): string | null {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    Array.isArray(value) ||
+    (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+  ) {
+    return 'WorkOrder planRef must be { projectId, planId, laneId }';
+  }
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== 3 ||
+    typeof keys[0] !== 'string' ||
+    typeof keys[1] !== 'string' ||
+    typeof keys[2] !== 'string' ||
+    !keys.includes('projectId') ||
+    !keys.includes('planId') ||
+    !keys.includes('laneId')
+  ) {
+    return 'WorkOrder planRef must be { projectId, planId, laneId }';
+  }
+  const record = value as Record<string, unknown>;
+  if (record.projectId !== projectId) {
+    return 'WorkOrder planRef projectId must equal the work order projectId';
+  }
+  if (typeof record.planId !== 'string' || !PLAN_ID_PATTERN.test(record.planId)) {
+    return 'WorkOrder planRef planId is not a plan id';
+  }
+  if (typeof record.laneId !== 'string' || !PLANNED_LANE_ID_PATTERN.test(record.laneId)) {
+    return 'WorkOrder planRef laneId is not a lane id';
+  }
+  return null;
 }

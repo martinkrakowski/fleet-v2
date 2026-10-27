@@ -47,6 +47,17 @@ export interface CollectedAttemptArtifacts {
   readonly manifestSha256?: string;
 }
 
+/**
+ * The plan lane a work order was registered from (work-board plan §3.2, review decision 7).
+ * `projectId` always equals the work order's own `projectId`; ids repeat across plans, so a
+ * lane is never matched by `laneId` text alone. Set only at registration.
+ */
+export interface PlanRef {
+  readonly projectId: string;
+  readonly planId: string;
+  readonly laneId: string;
+}
+
 /** Serializable record of one registered, approved bounded work unit. */
 export interface WorkOrderRecord {
   readonly id: string;
@@ -62,6 +73,8 @@ export interface WorkOrderRecord {
   readonly revision: number;
   readonly createdAtIso: string;
   readonly updatedAtIso: string;
+  /** Absent on a work order with no plan and on every record written before the field existed. */
+  readonly planRef?: PlanRef;
 }
 
 /** Fix rounds are fresh attempts; they never resume the prior conversation. */

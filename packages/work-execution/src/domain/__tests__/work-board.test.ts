@@ -94,10 +94,25 @@ function derive(input?: Partial<BoardFacts>, opts: { now?: string; policy?: Boar
   return deriveWorkBoard(frozen, opts.now ?? NOW, opts.policy ?? DEFAULT_BOARD_POLICY, { sinceIso: opts.since });
 }
 
+function columnLaneKeys(board: WorkBoard): string[] {
+  return [
+    ...board.columns.done.entries.flatMap((e) => (e.kind === 'lane' ? [e.key] : [])),
+    ...board.columns.waiting.entries.flatMap((e) => (e.kind === 'lane' ? [e.key] : [])),
+    ...board.columns.inFlight.keys,
+    ...board.columns.queued.keys,
+  ];
+}
+
+function expectNoLaneInTwoColumns(board: WorkBoard): void {
+  const keys = columnLaneKeys(board);
+  expect(new Set(keys).size).toBe(keys.length);
+}
+
 function boardOf(input?: Partial<BoardFacts>, opts: { now?: string; policy?: BoardPolicy; since?: string } = {}): WorkBoard {
   const result = derive(input, opts);
   expect(result.ok).toBe(true);
   if (!result.ok) throw new Error('expected a board');
+  expectNoLaneInTwoColumns(result.board);
   return result.board;
 }
 
@@ -260,6 +275,40 @@ describe('R1/R2 lane resolution and cards', () => {
     expect(a2?.workOrderIds).toEqual(['wo-example-1']);
     expect(a2?.planStatus).toBe('planned');
     expect(board.lanes.filter((l) => l.workOrderIds.includes('wo-example-1'))).toHaveLength(1);
+  });
+
+  it('a work order whose projectId differs from planRef.projectId yields only the planned lane card and attaches links and declarations naming it', () => {
+    const crossProjectWo = wo('wo-example-1', {
+      projectId: 'other-project',
+      planRef: { projectId: PROJECT_ID, planId: PLAN_ID, laneId: 'A1' },
+    });
+    const woLaneRef: LaneRef = { kind: 'work-order', projectId: 'other-project', workOrderId: 'wo-example-1' };
+
+    const withLink = boardOf({
+      workOrders: [crossProjectWo],
+      links: [link(7, { lane: woLaneRef })],
+    });
+    expect(withLink.lanes).toHaveLength(4);
+    expect(withLink.lanes.some((l) => l.projectId === 'other-project')).toBe(false);
+    const linkedA1 = withLink.lanes.find((l) => l.key === A1_KEY);
+    expect(linkedA1?.workOrderIds).toEqual(['wo-example-1']);
+    expect(linkedA1?.planStatus).toBe('planned');
+    expect(linkedA1?.started).toBe(true);
+    expect(linkedA1?.placement).toBe('in-flight');
+    expectNoLaneInTwoColumns(withLink);
+
+    const withDeclaration = boardOf({
+      workOrders: [crossProjectWo],
+      declarations: [{ lane: woLaneRef, step: 'first-pass', seatRole: 'first-pass', model: 'model-e', declaredAtIso: NOW }],
+    });
+    expect(withDeclaration.lanes).toHaveLength(4);
+    expect(withDeclaration.lanes.some((l) => l.projectId === 'other-project')).toBe(false);
+    const declaredA1 = withDeclaration.lanes.find((l) => l.key === A1_KEY);
+    expect(declaredA1?.workOrderIds).toEqual(['wo-example-1']);
+    expect(declaredA1?.planStatus).toBe('planned');
+    expect(declaredA1?.started).toBe(true);
+    expect(declaredA1?.placement).toBe('in-flight');
+    expectNoLaneInTwoColumns(withDeclaration);
   });
 
   it('a work order with no planRef is its own wo card labelled with its laneId', () => {
@@ -589,6 +638,63 @@ describe('R6 identity rule', () => {
     expect(board.ownerItems[0].gatesLanes).toEqual([]);
   });
 
+  it('a question whose only block is a work-order ref is the Waiting reason on its planned lane card or wo card and has no card of its own', () => {
+    const plannedBoard = boardOf({
+      workOrders: [wo('wo-example-1', { projectId: 'other-project', planRef: { projectId: PROJECT_ID, planId: PLAN_ID, laneId: 'A1' } })],
+      questions: [question('q-example-1', { blocks: [{ kind: 'work-order', ref: 'wo-example-1' }] })],
+    });
+    const a1 = plannedBoard.lanes.find((l) => l.key === A1_KEY);
+    expect(plannedBoard.lanes).toHaveLength(4);
+    expect(a1?.placement).toBe('waiting');
+    expect(a1?.waitingOn).toEqual([
+      { origin: 'question', id: 'q-example-1', kind: 'decision', subject: 'Question title', sinceIso: '2026-10-27T07:00:00.000Z' },
+    ]);
+    expect(plannedBoard.ownerItems).toEqual([
+      {
+        origin: 'question',
+        id: 'q-example-1',
+        projectId: null,
+        kind: 'decision',
+        subject: 'Question title',
+        sinceIso: '2026-10-27T07:00:00.000Z',
+        gating: true,
+        gatesLanes: [A1_KEY],
+        namesLanes: [A1_KEY],
+        placement: 'lane-reason',
+        questionIds: [],
+      },
+    ]);
+    expect(plannedBoard.columns.waiting.entries).toEqual([{ kind: 'lane', key: A1_KEY }]);
+    expectNoLaneInTwoColumns(plannedBoard);
+
+    const woBoard = boardOf({
+      workOrders: [wo('wo-example-2', { planRef: null, laneId: 'L7' })],
+      questions: [question('q-example-2', { blocks: [{ kind: 'work-order', ref: 'wo-example-2' }] })],
+    });
+    const woCard = woBoard.lanes.find((l) => l.key === 'wo:wo-example-2');
+    expect(woCard?.placement).toBe('waiting');
+    expect(woCard?.waitingOn).toEqual([
+      { origin: 'question', id: 'q-example-2', kind: 'decision', subject: 'Question title', sinceIso: '2026-10-27T07:00:00.000Z' },
+    ]);
+    expect(woBoard.ownerItems).toEqual([
+      {
+        origin: 'question',
+        id: 'q-example-2',
+        projectId: null,
+        kind: 'decision',
+        subject: 'Question title',
+        sinceIso: '2026-10-27T07:00:00.000Z',
+        gating: true,
+        gatesLanes: ['wo:wo-example-2'],
+        namesLanes: ['wo:wo-example-2'],
+        placement: 'lane-reason',
+        questionIds: [],
+      },
+    ]);
+    expect(woBoard.columns.waiting.entries).toEqual([{ kind: 'lane', key: 'wo:wo-example-2' }]);
+    expectNoLaneInTwoColumns(woBoard);
+  });
+
   it('closed and withdrawn items are absent', () => {
     const board = boardOf({
       ownerItems: [
@@ -647,6 +753,38 @@ describe('R7 column precedence', () => {
   it('a started dropped lane is in-flight', () => {
     const board = boardOf({ links: [link(7, { lane: A3 })] });
     expect(board.lanes.find((l) => l.key === A3_KEY)?.placement).toBe('in-flight');
+  });
+
+  it('no lane appears in two columns across work-order and question fixtures', () => {
+    const fixtures: Array<Partial<BoardFacts>> = [
+      {
+        workOrders: [wo('wo-example-1', { projectId: 'other-project', planRef: { projectId: PROJECT_ID, planId: PLAN_ID, laneId: 'A1' } })],
+        links: [link(7, { lane: { kind: 'work-order', projectId: 'other-project', workOrderId: 'wo-example-1' } })],
+      },
+      {
+        workOrders: [wo('wo-example-1', { projectId: 'other-project', planRef: { projectId: PROJECT_ID, planId: PLAN_ID, laneId: 'A1' } })],
+        declarations: [
+          {
+            lane: { kind: 'work-order', projectId: 'other-project', workOrderId: 'wo-example-1' },
+            step: 'first-pass',
+            seatRole: 'first-pass',
+            model: 'model-e',
+            declaredAtIso: NOW,
+          },
+        ],
+      },
+      {
+        workOrders: [wo('wo-example-1')],
+        questions: [question('q-example-1', { blocks: [{ kind: 'work-order', ref: 'wo-example-1' }] })],
+      },
+      {
+        workOrders: [wo('wo-example-2', { planRef: null, laneId: 'L7' })],
+        questions: [question('q-example-2', { blocks: [{ kind: 'work-order', ref: 'wo-example-2' }] })],
+      },
+    ];
+    for (const fixture of fixtures) {
+      expectNoLaneInTwoColumns(boardOf(fixture));
+    }
   });
 });
 

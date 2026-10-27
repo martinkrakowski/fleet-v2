@@ -201,13 +201,20 @@ function resolvePlanLaneRef(projectId: string, planId: string, id: string, plans
   return { kind: 'plan', projectId, planId, laneId: id };
 }
 
+function resolveWorkOrderLaneRef(wo: BoardWorkOrderFact, plans: readonly BoardPlanFact[]): LaneRef {
+  if (wo.planRef) {
+    return resolvePlanLaneRef(wo.planRef.projectId, wo.planRef.planId, wo.planRef.laneId, plans);
+  }
+  return { kind: 'work-order', projectId: wo.projectId, workOrderId: wo.id };
+}
+
 function resolveLaneRef(ref: LaneRef, facts: BoardFacts): LaneRef {
   if (ref.kind === 'plan') {
     return resolvePlanLaneRef(ref.projectId, ref.planId, ref.laneId, facts.plans);
   }
   const wo = facts.workOrders.find((w) => w.id === ref.workOrderId);
-  if (wo && wo.planRef) {
-    return resolvePlanLaneRef(wo.planRef.projectId, wo.planRef.planId, wo.planRef.laneId, facts.plans);
+  if (wo) {
+    return resolveWorkOrderLaneRef(wo, facts.plans);
   }
   return ref;
 }
@@ -315,9 +322,7 @@ function buildCards(facts: BoardFacts): Card[] {
 
   const woRef = new Map<string, LaneRef>();
   for (const wo of facts.workOrders) {
-    const ref: LaneRef = wo.planRef
-      ? resolvePlanLaneRef(wo.projectId, wo.planRef.planId, wo.planRef.laneId, facts.plans)
-      : { kind: 'work-order', projectId: wo.projectId, workOrderId: wo.id };
+    const ref = resolveWorkOrderLaneRef(wo, facts.plans);
     woRef.set(wo.id, ref);
     pushRef(ref);
   }
@@ -459,15 +464,21 @@ function draftForItem(item: BoardOwnerItemFact, cardByKey: Map<string, Card>, fa
 function draftForQuestion(question: BoardQuestionFact, cardByKey: Map<string, Card>, facts: BoardFacts): EntryDraft {
   const names = new Set<string>();
   const gates = new Set<string>();
-  for (const block of question.blocks) {
-    if (block.kind !== 'lane') continue;
-    const parts = block.ref.split('/');
-    if (parts.length !== 3) continue;
-    const ref: LaneRef = { kind: 'plan', projectId: parts[0], planId: parts[1], laneId: parts[2] };
+  const addLane = (ref: LaneRef): void => {
     const key = formatLaneRef(resolveLaneRef(ref, facts));
-    if (!cardByKey.has(key)) continue;
+    if (!cardByKey.has(key)) return;
     names.add(key);
     gates.add(key);
+  };
+  for (const block of question.blocks) {
+    if (block.kind === 'lane') {
+      const parts = block.ref.split('/');
+      if (parts.length === 3) {
+        addLane({ kind: 'plan', projectId: parts[0], planId: parts[1], laneId: parts[2] });
+      }
+    } else if (block.kind === 'work-order') {
+      addLane({ kind: 'work-order', projectId: '', workOrderId: block.ref });
+    }
   }
   return {
     origin: 'question',

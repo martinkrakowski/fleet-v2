@@ -310,7 +310,7 @@ export class OrchestratorSessionRepositoryAdapter implements OrchestratorSession
         "OrchestratorSessionRepositoryAdapter refuses a fileName that collides with another store",
       );
     }
-    if (!SAFE_FILE_NAME.test(name)) {
+    if (!SAFE_FILE_NAME.test(name) || name === "." || name === "..") {
       throw new Error(
         "OrchestratorSessionRepositoryAdapter refuses unsafe state file name",
       );

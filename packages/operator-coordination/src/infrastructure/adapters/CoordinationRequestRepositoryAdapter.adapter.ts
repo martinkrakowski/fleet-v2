@@ -177,7 +177,7 @@ export class CoordinationRequestRepositoryAdapter implements CoordinationRequest
       return null;
     }
     const name = fileName ?? DEFAULT_FILE_NAME;
-    if (!SAFE_FILE_NAME.test(name)) {
+    if (!SAFE_FILE_NAME.test(name) || name === "." || name === "..") {
       throw new Error(`CoordinationRequestRepositoryAdapter refuses unsafe state file name: ${name}`);
     }
     return join(stateDir, name);

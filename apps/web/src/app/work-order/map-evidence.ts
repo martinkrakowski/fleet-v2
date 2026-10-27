@@ -6,6 +6,7 @@
  */
 
 import { isRecord } from "../../lib/attempt-wire";
+import { isHeadSha } from "./evidence-view";
 
 export type EvidenceResult =
   | "pending"
@@ -139,7 +140,7 @@ function parseEvidenceResult(value: unknown): EvidenceResult | null {
 }
 
 function parseCoverage(value: unknown): CoverageView | null | undefined {
-  if (value === undefined || value === null) {
+  if (value === undefined) {
     return null;
   }
   if (!isRecord(value)) {
@@ -265,7 +266,6 @@ function parseReview(value: unknown): ReviewView | null {
   const kind = value.kind;
   if (
     kind !== undefined &&
-    kind !== null &&
     (typeof kind !== "string" || kind.length === 0)
   ) {
     return null;
@@ -333,7 +333,7 @@ function parseDisposition(value: unknown): DispositionView | null {
 }
 
 function parseReviewTally(value: unknown): ReviewTallyView | null | undefined {
-  if (value === undefined || value === null) {
+  if (value === undefined) {
     return null;
   }
   if (!isRecord(value)) {
@@ -359,14 +359,21 @@ function parseReviewTally(value: unknown): ReviewTallyView | null | undefined {
 
 type AssessmentWithoutTally = Omit<HeadEvidenceView, "reviewTally">;
 
-function parseAssessment(value: unknown): AssessmentWithoutTally | null {
+function parseAssessment(
+  value: unknown,
+  requestedSha: string,
+): AssessmentWithoutTally | null {
   if (!isRecord(value)) {
     return null;
   }
   if (typeof value.id !== "string") {
     return null;
   }
-  if (typeof value.candidateHeadSha !== "string") {
+  if (
+    typeof value.candidateHeadSha !== "string" ||
+    !isHeadSha(value.candidateHeadSha) ||
+    value.candidateHeadSha !== requestedSha
+  ) {
     return null;
   }
   const state = value.state;
@@ -392,7 +399,6 @@ function parseAssessment(value: unknown): AssessmentWithoutTally | null {
   const requestedReviewerModel = value.requestedReviewerModel;
   if (
     requestedReviewerModel !== undefined &&
-    requestedReviewerModel !== null &&
     typeof requestedReviewerModel !== "string"
   ) {
     return null;
@@ -463,7 +469,13 @@ function parseAssessment(value: unknown): AssessmentWithoutTally | null {
   };
 }
 
-export function parseEvidenceEnvelope(value: unknown): EvidenceEnvelopeParse {
+export function parseEvidenceEnvelope(
+  value: unknown,
+  requestedSha: string,
+): EvidenceEnvelopeParse {
+  if (!isHeadSha(requestedSha)) {
+    return null;
+  }
   if (!isRecord(value) || value.code !== "OK") {
     return null;
   }
@@ -477,7 +489,7 @@ export function parseEvidenceEnvelope(value: unknown): EvidenceEnvelopeParse {
   if (result.outcome !== "found") {
     return null;
   }
-  const assessment = parseAssessment(result.assessment);
+  const assessment = parseAssessment(result.assessment, requestedSha);
   if (assessment === null) {
     return null;
   }

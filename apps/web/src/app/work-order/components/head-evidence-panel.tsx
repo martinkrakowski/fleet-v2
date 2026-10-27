@@ -199,6 +199,9 @@ export function HeadEvidencePanel({
     case "no-head":
       body = <p>No head commit collected: no evidence to read.</p>;
       break;
+    case "head-unreadable":
+      body = <p>head commit not readable: evidence not read</p>;
+      break;
     default:
       body = <p>Evidence not read on this page.</p>;
   }

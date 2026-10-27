@@ -18,6 +18,7 @@ import { readJournalPanel, type JournalPanel } from "../attempt/live-context";
 import { chainOrder } from "../attempt/work-order-view";
 import type { RecordedAttemptWire } from "../../lib/attempt-wire";
 import { chainNote, journalReadIds, type ChainNote } from "./timeline-view";
+import { isHeadSha } from "./evidence-view";
 import {
   parseEvidenceEnvelope,
   type HeadEvidenceView,
@@ -28,6 +29,7 @@ export type EvidencePanel =
   | { readonly panel: "not-recorded"; readonly headSha: string }
   | { readonly panel: "error"; readonly headSha: string; readonly reason: string }
   | { readonly panel: "no-head" }
+  | { readonly panel: "head-unreadable" }
   | { readonly panel: "not-read" };
 
 export interface TimelineAttempt {
@@ -72,7 +74,7 @@ async function readEvidencePanel(
     };
   }
 
-  const parsed = parseEvidenceEnvelope(endpoint.data);
+  const parsed = parseEvidenceEnvelope(endpoint.data, headSha);
   if (parsed === null) {
     const code =
       typeof endpoint.data === "object" &&
@@ -167,7 +169,9 @@ export async function loadWorkOrderTimeline(
       ordered
         .filter((attempt) => readIds.has(attempt.id))
         .flatMap((attempt) =>
-          attempt.artifacts === null ? [] : [attempt.artifacts.headCommit],
+          attempt.artifacts !== null && isHeadSha(attempt.artifacts.headCommit)
+            ? [attempt.artifacts.headCommit]
+            : [],
         ),
     ),
   );
@@ -188,6 +192,8 @@ export async function loadWorkOrderTimeline(
       evidencePanel = { panel: "not-read" };
     } else if (attempt.artifacts === null) {
       evidencePanel = { panel: "no-head" };
+    } else if (!isHeadSha(attempt.artifacts.headCommit)) {
+      evidencePanel = { panel: "head-unreadable" };
     } else {
       evidencePanel =
         evidenceByHead.get(attempt.artifacts.headCommit) ?? { panel: "no-head" };

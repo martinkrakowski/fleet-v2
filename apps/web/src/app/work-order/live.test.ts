@@ -474,7 +474,7 @@ describe("loadWorkOrderTimeline", () => {
         fixNumber: index + 1,
         priorAttemptId: index === 0 ? null : `att_live_${index}`,
         artifacts: {
-          headCommit: "a".repeat(39) + String(index + 1),
+          headCommit: "a".repeat(39) + (index + 1).toString(16),
           commitsSinceBase: ["b".repeat(40)],
           notes: "present",
         } as unknown as RecordedArtifacts,
@@ -518,5 +518,140 @@ describe("loadWorkOrderTimeline", () => {
     }
     expect(data.attempts[0].evidence).toEqual({ panel: "not-read" });
     expect(client.evidenceHeads).toEqual([head]);
+  });
+
+  it("does not read evidence and answers head-unreadable when headCommit is not a sha", async () => {
+    const attempt = attemptWire("att_live_1", {
+      artifacts: {
+        headCommit: "not a sha",
+        commitsSinceBase: ["b".repeat(40)],
+        notes: "present",
+      } as unknown as RecordedArtifacts,
+    });
+    const client = fakeClient(
+      { source: "api", data: foundEnvelope([attempt]) },
+      { source: "api", data: JOURNAL_ENVELOPE },
+      {
+        source: "api",
+        data: { code: "OK", result: { outcome: "not-found", query: "h" } },
+      },
+    );
+    const data = await loadWorkOrderTimeline("wo-live-1", client);
+    expect(data.view).toBe("found");
+    if (data.view !== "found") {
+      return;
+    }
+    expect(client.evidenceHeads).toEqual([]);
+    expect(data.attempts[0].evidence).toEqual({ panel: "head-unreadable" });
+  });
+
+  it("refuses an evidence response whose candidateHeadSha differs from the requested sha", async () => {
+    const head = "b".repeat(40);
+    const otherHead = "c".repeat(40);
+    const attempt = attemptWire("att_live_1", {
+      artifacts: {
+        headCommit: head,
+        commitsSinceBase: [head],
+        notes: "present",
+      } as unknown as RecordedArtifacts,
+    });
+    const client = fakeClient(
+      { source: "api", data: foundEnvelope([attempt]) },
+      { source: "api", data: JOURNAL_ENVELOPE },
+      {
+        source: "api",
+        data: {
+          code: "OK",
+          result: {
+            outcome: "found",
+            assessment: {
+              id: "ev_live_1",
+              candidateHeadSha: otherHead,
+              policyRevision: "policy-3",
+              implementerModel: "model-impl",
+              requiredChecks: [],
+              state: "accepted",
+              verificationReceipts: [],
+              reviewReceipts: [],
+              findingDispositions: [],
+              acceptanceReceiptId: "acc_live_1",
+              blockers: [],
+              revision: 1,
+              updatedAtIso: "2026-10-24T10:35:00Z",
+            },
+          },
+        },
+      },
+    );
+    const data = await loadWorkOrderTimeline("wo-live-1", client);
+    expect(data.view).toBe("found");
+    if (data.view !== "found") {
+      return;
+    }
+    expect(data.attempts[0].evidence).toEqual({
+      panel: "error",
+      headSha: head,
+      reason: `api boundary returned an unexpected evidence shape for /v1/heads/${head}/evidence`,
+    });
+  });
+
+  it("starts journal and evidence reads concurrently before either resolves", async () => {
+    const head = "b".repeat(40);
+    const attempt = attemptWire("att_live_1", {
+      artifacts: {
+        headCommit: head,
+        commitsSinceBase: [head],
+        notes: "present",
+      } as unknown as RecordedArtifacts,
+    });
+    const started: string[] = [];
+    let releaseJournal!: () => void;
+    let releaseEvidence!: () => void;
+    const journalGate = new Promise<void>((resolve) => {
+      releaseJournal = resolve;
+    });
+    const evidenceGate = new Promise<void>((resolve) => {
+      releaseEvidence = resolve;
+    });
+    const client = {
+      fetchWorkOrderView: async <T>(): Promise<LiveEndpointResult<T>> => ({
+        source: "api",
+        status: 200,
+        data: foundEnvelope([attempt]) as T,
+        fallbackReason: null,
+      }),
+      fetchAttemptJournal: async <T>(): Promise<LiveEndpointResult<T>> => {
+        started.push("journal");
+        await journalGate;
+        return {
+          source: "api",
+          status: 200,
+          data: JOURNAL_ENVELOPE as T,
+          fallbackReason: null,
+        };
+      },
+      fetchHeadEvidenceView: async <T>(): Promise<LiveEndpointResult<T>> => {
+        started.push("evidence");
+        await evidenceGate;
+        return {
+          source: "api",
+          status: 200,
+          data: {
+            code: "OK",
+            result: { outcome: "not-found", query: "h" },
+          } as T,
+          fallbackReason: null,
+        };
+      },
+    };
+
+    const pending = loadWorkOrderTimeline("wo-live-1", client);
+    await Promise.resolve();
+    const startedBeforeResolve = [...started];
+    releaseJournal();
+    releaseEvidence();
+    const data = await pending;
+    expect(startedBeforeResolve).toEqual(["journal", "evidence"]);
+    expect(data.view).toBe("found");
   });
 });

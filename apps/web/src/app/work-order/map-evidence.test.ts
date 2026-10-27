@@ -175,7 +175,7 @@ function foundEnvelope(
 
 describe("parseEvidenceEnvelope", () => {
   it("parses a full found envelope, dropping provenance and location fields", () => {
-    const parsed = parseEvidenceEnvelope(foundEnvelope());
+    const parsed = parseEvidenceEnvelope(foundEnvelope(), HEAD);
     expect(parsed).toEqual({ outcome: "found", evidence: EXPECTED_EVIDENCE });
     expect(parsed?.outcome === "found").toBe(true);
     if (parsed?.outcome === "found") {
@@ -192,15 +192,22 @@ describe("parseEvidenceEnvelope", () => {
 
   it("parses a not-found envelope", () => {
     expect(
-      parseEvidenceEnvelope({
-        code: "OK",
-        result: { outcome: "not-found", query: "head not assessed" },
-      }),
+      parseEvidenceEnvelope(
+        {
+          code: "OK",
+          result: { outcome: "not-found", query: "head not assessed" },
+        },
+        HEAD,
+      ),
     ).toEqual({ outcome: "not-found" });
   });
 
+  it("refuses a response whose candidateHeadSha differs from the requested sha", () => {
+    expect(parseEvidenceEnvelope(foundEnvelope(), "b".repeat(40))).toBeNull();
+  });
+
   it("keeps a served review kind and defaults an absent one to null", () => {
-    const withKind = parseEvidenceEnvelope(foundEnvelope());
+    const withKind = parseEvidenceEnvelope(foundEnvelope(), HEAD);
     expect(withKind?.outcome === "found" && withKind.evidence.reviews[0].kind).toBe(
       "security",
     );
@@ -208,14 +215,17 @@ describe("parseEvidenceEnvelope", () => {
       ...ASSESSMENT,
       reviewReceipts: [ASSESSMENT.reviewReceipts[1]],
     };
-    const withoutKind = parseEvidenceEnvelope(foundEnvelope({}, withoutKindAssessment));
+    const withoutKind = parseEvidenceEnvelope(
+      foundEnvelope({}, withoutKindAssessment),
+      HEAD,
+    );
     expect(
       withoutKind?.outcome === "found" && withoutKind.evidence.reviews[0].kind,
     ).toBeNull();
   });
 
   it("keeps a served review tally and defaults an absent one to null", () => {
-    const withTally = parseEvidenceEnvelope(foundEnvelope());
+    const withTally = parseEvidenceEnvelope(foundEnvelope(), HEAD);
     expect(withTally?.outcome === "found").toBe(true);
     if (withTally?.outcome === "found") {
       expect(withTally.evidence.reviewTally).toEqual({
@@ -227,6 +237,7 @@ describe("parseEvidenceEnvelope", () => {
     }
     const absent = parseEvidenceEnvelope(
       foundEnvelope({ reviewTally: undefined }),
+      HEAD,
     );
     expect(absent?.outcome === "found").toBe(true);
     if (absent?.outcome === "found") {
@@ -237,6 +248,67 @@ describe("parseEvidenceEnvelope", () => {
         foundEnvelope({
           reviewTally: { pass: -1, fail: 0, unknown: 0, disagreement: false },
         }),
+        HEAD,
+      ),
+    ).toBeNull();
+  });
+
+  it("defaults absent coverage and requestedReviewerModel to null and refuses explicit null on optional fields", () => {
+    const verificationWithoutCoverage: Record<string, unknown> = {
+      ...ASSESSMENT.verificationReceipts[0],
+    };
+    delete verificationWithoutCoverage.coverage;
+    const assessmentWithoutOptional: Record<string, unknown> = {
+      ...ASSESSMENT,
+      verificationReceipts: [verificationWithoutCoverage],
+    };
+    delete assessmentWithoutOptional.requestedReviewerModel;
+    const absentOptional = parseEvidenceEnvelope(
+      foundEnvelope({}, assessmentWithoutOptional),
+      HEAD,
+    );
+    expect(absentOptional?.outcome === "found").toBe(true);
+    if (absentOptional?.outcome === "found") {
+      expect(absentOptional.evidence.verifications[0].coverage).toBeNull();
+      expect(absentOptional.evidence.requestedReviewerModel).toBeNull();
+    }
+
+    expect(
+      parseEvidenceEnvelope(
+        foundEnvelope(
+          {},
+          {
+            ...ASSESSMENT,
+            verificationReceipts: [
+              { ...ASSESSMENT.verificationReceipts[0], coverage: null },
+            ],
+          },
+        ),
+        HEAD,
+      ),
+    ).toBeNull();
+
+    expect(
+      parseEvidenceEnvelope(
+        foundEnvelope(
+          {},
+          {
+            ...ASSESSMENT,
+            reviewReceipts: [{ ...ASSESSMENT.reviewReceipts[0], kind: null }],
+          },
+        ),
+        HEAD,
+      ),
+    ).toBeNull();
+
+    expect(
+      parseEvidenceEnvelope(foundEnvelope({ reviewTally: null }), HEAD),
+    ).toBeNull();
+
+    expect(
+      parseEvidenceEnvelope(
+        foundEnvelope({}, { ...ASSESSMENT, requestedReviewerModel: null }),
+        HEAD,
       ),
     ).toBeNull();
   });
@@ -252,6 +324,7 @@ describe("parseEvidenceEnvelope", () => {
           ...ASSESSMENT,
           verificationReceipts: [badVerification],
         }),
+        HEAD,
       ),
     ).toBeNull();
   });
@@ -267,13 +340,14 @@ describe("parseEvidenceEnvelope", () => {
           ...ASSESSMENT,
           verificationReceipts: [badCoverage],
         }),
+        HEAD,
       ),
     ).toBeNull();
   });
 
   it("returns null for a non-OK code", () => {
     expect(
-      parseEvidenceEnvelope({ code: "NOT_IMPLEMENTED", result: null }),
+      parseEvidenceEnvelope({ code: "NOT_IMPLEMENTED", result: null }, HEAD),
     ).toBeNull();
   });
 });

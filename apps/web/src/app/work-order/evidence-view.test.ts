@@ -2,11 +2,24 @@ import { describe, expect, it } from "vitest";
 import {
   assessmentTone,
   coverageText,
+  isHeadSha,
   kindText,
   listText,
   resultTone,
   tallyText,
 } from "./evidence-view";
+
+describe("isHeadSha", () => {
+  it("accepts 7 to 40 lowercase hex characters and refuses anything else", () => {
+    expect(isHeadSha("0123abc")).toBe(true);
+    expect(isHeadSha("a".repeat(40))).toBe(true);
+    expect(isHeadSha("0123ab")).toBe(false);
+    expect(isHeadSha("a".repeat(41))).toBe(false);
+    expect(isHeadSha("0123ABC")).toBe(false);
+    expect(isHeadSha("../x")).toBe(false);
+    expect(isHeadSha("")).toBe(false);
+  });
+});
 
 describe("resultTone", () => {
   it("maps every evidence result word to a badge tone", () => {

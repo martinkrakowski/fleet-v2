@@ -10,6 +10,12 @@ import type {
   ReviewTallyView,
 } from "./map-evidence";
 
+const HEAD_SHA_PATTERN = /^[0-9a-f]{7,40}$/;
+
+export function isHeadSha(value: string): boolean {
+  return HEAD_SHA_PATTERN.test(value);
+}
+
 export function resultTone(
   result: EvidenceResult,
 ): "accepted" | "failed" | "queued" | "unknown" | "ended" {

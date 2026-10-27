@@ -21,10 +21,8 @@ import type {
   BoardFacts,
   BoardMergeFact,
   BoardOptions,
-  BoardOwnerEntry,
   BoardOwnerItemFact,
   BoardOwnerItemKind,
-  BoardOwnerReason,
   BoardPlanFact,
   BoardPlannedLaneStatus,
   BoardPolicy,
@@ -317,7 +315,7 @@ function buildCards(facts: BoardFacts): Card[] {
 
   const woRef = new Map<string, LaneRef>();
   for (const wo of facts.workOrders) {
-    const ref = wo.planRef
+    const ref: LaneRef = wo.planRef
       ? resolvePlanLaneRef(wo.projectId, wo.planRef.planId, wo.planRef.laneId, facts.plans)
       : { kind: 'work-order', projectId: wo.projectId, workOrderId: wo.id };
     woRef.set(wo.id, ref);
@@ -413,7 +411,7 @@ function isClosedQuestion(question: BoardQuestionFact): boolean {
 }
 
 function draftForItem(item: BoardOwnerItemFact, cardByKey: Map<string, Card>, facts: BoardFacts): EntryDraft {
-  const gating = BOARD_GATING_OWNER_ITEM_KINDS.includes(item.kind);
+  const gating = (BOARD_GATING_OWNER_ITEM_KINDS as readonly BoardOwnerItemKind[]).includes(item.kind);
   const names = new Set<string>();
   const gates = new Set<string>();
   const addLane = (ref: LaneRef, fromBlock: boolean): void => {
@@ -581,7 +579,12 @@ const CARD_NOT_READ: Record<BoardPlacement, readonly BoardSource[]> = {
   deferred: ['plans', 'work-orders', 'attempts', 'runs', 'declarations', 'pr-links', 'merge-records', 'owner-items', 'questions'],
 };
 
-const COLUMN_NOT_READ: Record<BoardColumn, readonly BoardSource[]> = {
+const COLUMN_NOT_READ: {
+  done: readonly BoardSource[];
+  waiting: readonly BoardSource[];
+  inFlight: readonly BoardSource[];
+  queued: readonly BoardSource[];
+} = {
   done: ['work-orders', 'pr-links', 'merge-records'],
   waiting: ['owner-items', 'questions'],
   inFlight: ['work-orders', 'attempts', 'runs', 'declarations', 'pr-links'],

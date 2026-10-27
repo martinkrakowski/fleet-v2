@@ -16,4 +16,6 @@ export * from "./lane-run-transitions.js";
 export * from "./plain-record-reads.js";
 export * from "./seat-selection.js";
 export * from "./value-objects/index.js";
+export * from "./work-board.js";
+export * from "./work-board-facts.js";
 export * from "./worktree-path.js";

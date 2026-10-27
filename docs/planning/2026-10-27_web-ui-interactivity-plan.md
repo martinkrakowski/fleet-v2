@@ -5,6 +5,8 @@
 - **Status:** rev 3.2. Rev 1 applied Fable's review of the research; rev 2 added the orchestrator
   request channel (§3.6) and the live tail (§3.7) from Fable's design review; rev 3 applied Grok
   4.7's review of rev 2, rev 3.1 its re-review, and rev 3.2 CodeRabbit's review (§7). Decisions in §5 are open with defaults. Nothing built. Anchors checked against `main` at `dae491f`.
+  Amended 2026-10-27 by the conductor plan's amendment K-GC (§3.3 note, A-F and W7c): two run-stop
+  keys, the `stop-already-forced` refusal, "Stop now", and a read-only view of the reaper's findings.
 - **Owner requests (2026-10-27):**
   - "Given all of the fleet-v2 features and functionality, the UI lacks interactivity with the
     actual lanes, and orchestration. Run a sub-agent to research UI/UX improvements. The have Fable
@@ -178,6 +180,25 @@ drives a step.
   answered by the owner's signed decision on the keyed question, not by a button. The request carries the
   run's `expectedRevision`, and the claimant journals it under `<runId>/park/<n>/resume@web`, so a
   repeat is refused by K1b's uniqueness check.
+
+**Amendment K-GC: two stop modes.** Amended 2026-10-27 by the conductor plan's amendment K-GC
+(`2026-10-27_conductor-plan.md` §3.9, D11). The text above is unchanged; this note adds to it.
+- **Two stop keys.** A-C writes a graceful stop as `<runId>/stop@web` and a forced stop as
+  `<runId>/stop-force@web`. The mode is read from the key, and the entry's `mode` must match it. The
+  `<runId>/stop@web` entry above now names a graceful stop; the outcome table above is the forced stop's.
+- **Graceful (the default, "Stop").** The conductor issues no new action for the run; the running
+  attempt may finish, its work is collected and gated and kept on the branch, then the run ends
+  `stopped`. Body: "records a graceful stop for run <id>; the running attempt <id> may finish; its work
+  is collected, gated and kept on the branch; then the run ends as `stopped`; does not merge, push,
+  revert or delete anything; a stopped run cannot be resumed" (danger tone).
+- **Forced ("Stop now").** Offered beside "Stop", and while a graceful stop is pending. Body: the
+  P7-write stop body above, plus "uncommitted work in the attempt's worktree is abandoned" (danger tone).
+- **One way only.** A force may follow a graceful stop; A-C refuses a graceful entry after a force with
+  the typed reason `stop-already-forced`, shown verbatim (§6 "Error"). W7b hides "Stop" once a force is
+  recorded.
+- **On the card.** A run with a graceful stop pending shows "stopping" with its wait reason
+  (`stop-draining`, or `stop-grace-exceeded` past the grace); it is not parked and not yet `stopped`.
+  Resume stays refused with `stop-pending`.
 
 ### 3.4 Attempt actions after the write path
 
@@ -456,8 +477,8 @@ different packages and no shared file. The shared files here are `apps/web/src/l
 file. Within each step the `apps/web` lanes run in the order given by their arrows and "After"
 column, one after another; they run beside API, domain, security and conductor lanes. Lanes marked
 **manifest** edit `.architecture/manifest.yaml` and run one at a time in this order: A-J → O1a →
-O1b → O2a → O2b → L0 → L1 → O3 → O2c → A-R → A-C → O9 → A-WO → A-K → A-S, each rebased on the last.
-`composition.ts` lanes (A-J, O3, L3, E3b, L9, A-R, A-C, L8, A-WO, A-K, A-S) likewise run one at a
+O1b → O2a → O2b → L0 → L1 → O3 → O2c → A-R → A-C → O9 → A-WO → A-K → A-S → A-F (amendment K-GC), each rebased on the last.
+`composition.ts` lanes (A-J, O3, L3, E3b, L9, A-R, A-C, L8, A-WO, A-K, A-S, A-F) likewise run one at a
 time. The work-execution lanes here (A-J, L0, L1, L2, A-R, A-C, O9, A-WO) also queue behind the
 conductor's own work-execution lanes.
 
@@ -517,6 +538,8 @@ conductor's own work-execution lanes.
 | W6 | Work-order list and brief viewer for a real attempt's frozen brief | apps/web | 2 | A-WO, W7b |
 | A-K → WK | Knowledge candidates route over `ListCandidateClaims`; live `/knowledge` read | apps/api, **`composition.ts`, manifest**; apps/web | 2 | A-WO (manifest); WK after W6 |
 | A-S → W9 | Seats read route (plan, cursors, last probe); seats view | apps/api, **`composition.ts`, manifest**; apps/web | 2 | S1a, A-K (manifest); W9 after WK |
+| A-F | Reaper findings read route (`GET /v1/reaper/findings`) over a list use case on K11a's findings store; read-only (amendment K-GC) | work-execution (application), apps/api, **`composition.ts`, manifest** | 2 | K11a, A-S (manifest, `composition.ts`) |
+| W7c | Reaper findings on the run board: kind, subject, sightings, report or repaired; read-only; repairs stay in the CLI (amendment K-GC) | apps/web | 2 | A-F, W7b, W9 |
 | **Step 9. Deferred** | Seats writes, P11 conflict graph, streaming gate and review output | — | — | owner |
 
 Every Tier 2 lane in this plan touches data safety, security or user-facing behaviour, so every

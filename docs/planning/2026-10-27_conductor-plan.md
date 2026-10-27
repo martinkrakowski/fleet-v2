@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-27
 - **Target repository:** `fleet-v2`
-- **Status:** rev 1, the Opus review of rev 0 applied (two blockers, five majors, two notes; §8). Approved in principle by the owner (2026-10-27: "Agreed and approved. Much of this you should be able to run in parallel."). Decisions in §6 are open with defaults. Nothing built. Anchors checked against `main` at `f04b825`. Amended 2026-10-27 by the web UI interactivity plan, lane UI-B (§3.8): how a stop ends a run, the park reason `stop-unconfirmed`, and the `run-stopped` refusal in `ResumeLaneRun`.
+- **Status:** rev 1, the Opus review of rev 0 applied (two blockers, five majors, two notes; §8). Approved in principle by the owner (2026-10-27: "Agreed and approved. Much of this you should be able to run in parallel."). Decisions in §6 are open with defaults. Nothing built. Anchors checked against `main` at `f04b825`. Amended 2026-10-27 by the web UI interactivity plan, lane UI-B (§3.8): how a stop ends a run, the park reason `stop-unconfirmed`, and the `run-stopped` refusal in `ResumeLaneRun`. Amended 2026-10-27 by K-GC (§3.9): a graceful and a forced run stop, the record-only cancel of an undispatched attempt, and the reaper; D11–D16 are recommended defaults, open for the owner.
 - **Owner request (2026-10-27):** "How far away are we from lane orchestrators being implemented?" The answer: the stations exist, the missing design is a **conductor** that moves one lane through them.
 - **Builds on:** the 2026-10-23 seat/gate/usage plan (S1, S2), 2026-10-20 auto-merge (AM1–AM5), 2026-10-24 live updates (E3), 2026-10-25 Agensh (C1), 2026-10-26 vacuous-pass (R1, V1, V2) and untrusted-input (U1, U2) plans, and the 2026-10-26 execution order.
 
@@ -104,6 +104,7 @@ One-way actions (dispatch, push, PR, merge, an owner question) are never issued 
 ### 3.6 Parking, concurrency, failure
 
 - **Parking.** One attention item keyed by (project, work order, reason); where the owner must choose, one keyed owner question naming ids and kinds only. Reasons: `one-way-door`, `seat-plan-exhausted`, `blocker-after-round-2`, `ambiguous`, `artifacts-unsealed`, `cost-ceiling` (`policy.perLaneCostCeiling`), `ci-failed-no-rounds`, `branch-behind`, `review-seat-unavailable`, `halted`, and `stop-unconfirmed` (amendment UI-B, §3.8). Tier 2 waits in `awaiting-premerge`, not in `parked`. `conductor resume <runId>`, or the owner's answer, returns the run to the parked-from state.
+- **Attention without a park (amendment K-GC, §3.9).** `stop-grace-exceeded` and the reaper's finding kinds raise attention items but are not park reasons. A graceful drain is not a park.
 - **Leases.** One per run, one per state directory for the driver, both taken by CAS with a fencing revision; the run record's saves check it, and journal intents are protected by the unique key (§3.2).
 - **Admission.** Host capacity through `ReserveExecutionCapacity` and the host-wide gate budget; one active run per package; a global cap from configuration.
 - **Merge train.** One run in `merging` per target repository; a branch behind its base parks as `branch-behind` (D6).
@@ -143,6 +144,88 @@ A resume carries the run's `expectedRevision` and is journalled under `<runId>/p
 
 **Keys outside the step pattern.** K1b's keys include `<runId>/stop@web`, `<runId>/park/<n>/resume@web` and the request channel's `request/<requestId>` beside the step keys of §3.2; the uniqueness check covers them all.
 
+### 3.9 Amendment K-GC: graceful and forced stops, and the reaper
+
+Amended 2026-10-27 at the owner's request (K-GC). The text above is unchanged; this section adds to it. Where it narrows an earlier rule, it says so.
+
+#### 3.9.1 Two stop modes
+
+Today `conductor halt` is global and never stops a running lane (§3.7), and the run stop of §3.8 is immediate: the driver calls `StopAttempt` on its next `advance`. K-GC adds a per-run **graceful** stop and names §3.8's behaviour the **forced** stop.
+
+| Mode | Command, web control | Key | What the driver does |
+|---|---|---|---|
+| `graceful` (default, D11) | `conductor stop <runId>`; web "Stop" | `<runId>/stop@cli`, `<runId>/stop@web` | Issues no new external action for the run except the drain steps below. The running attempt may finish. Its result is collected and gated, so the work on the branch is kept and recorded. Then the run ends `stopped` instead of advancing. |
+| `force` | `conductor stop <runId> --force`; web "Stop now" | `<runId>/stop-force@cli`, `<runId>/stop-force@web` | §3.8 unchanged: `StopAttempt` now; §3.8's outcome table applies. |
+
+**The mode is read from the key.** A stop entry also carries `mode`, and K1b refuses an entry whose `mode` does not match its key. D11 decides only which key the bare command and the web's first button write. §3.8's `<runId>/stop@web` therefore names a graceful stop from this amendment on. Nothing has been stored under it yet (K1b is not built), so this is still a two-way door; it becomes stored data with K1b (§5).
+
+**Escalation goes one way.** A force may follow a graceful stop; a graceful stop never follows a force. The force is its own key because K1b refuses a repeat key. While both are recorded, force wins: the decider reads the stronger mode. The stop routes refuse a graceful entry after a force with the typed reason `stop-already-forced`. A repeat of the same mode is refused by K1b; the CLI reports it as already recorded and exits 0, since the record already says what was asked.
+
+**The drain.** A graceful stop lets a run finish only these steps:
+
+| Run state when the stop is read | What happens |
+|---|---|
+| `dispatching`, `running` (attempt live) | The state rules run as usual: wait for the server's end report. The wait reason is `stop-draining`. `ExecutionLimits` still apply (the lane's own deadline existed before the stop; the stop neither extends nor shortens it). |
+| `collecting` | Collect and seal (C1). An edit-only seat's commit step (AG) runs here as it would without the stop. |
+| `gating`, gate not yet decided | The gate runs once at the collected head. |
+| `gating`, gate `passed`, `failed` or `unknown` | `stopped`. Never `brief-check`, never `fixing`. The gate result stays in the journal. |
+| Any other state, attempt null, `ended`, `collected` or `cancelled` | `stopped` at once (as §3.8's "no running attempt"). No review, fix round, PR, push or merge is started. An open PR is left open. |
+| `parked`, attempt ended | `stopped`. |
+| `parked`, attempt may be running (for example `ambiguous` on dispatch) | The park stands. A run never shows `stopped` while its attempt may still be running (§3.8). The owner escalates to force, or a reconcile settles it. |
+
+A seat failure during the drain (`seat-failed`) moves to `stopped`, never to the next seat. A park reached during the drain (for example `artifacts-unsealed`) keeps its attention item; once its attempt is confirmed ended, the run ends `stopped`. Halt still wins: a draining run parks `halted` before collect or gate (§3.7), and the drain continues after the halt is lifted.
+
+**Grace.** A graceful stop does not signal the lane; it waits for the lane's own end. When the drain has lasted longer than `policy.conductor.stopGraceMinutes` (default 45, the lane size; D12), the driver raises **one** attention item keyed (project, run, `stop-grace-exceeded`) naming the run and the attempt. It never escalates to force by itself. The owner may.
+
+**An attempt that was never dispatched** (`intent-recorded`, the decider's phase `prepared`) is cancelled **in the record** by either mode, without `StopAttempt`. `StopAttempt` refuses it today: a session-less attempt outside `dispatching`, `reconciling` and `blocked` is refused (`StopAttemptUseCase.use-case.ts:67-76`), so the open K7 item resolves this way. The cancel is safe only while §3.5's dispatch rule holds, so it needs all of these:
+- no unread dispatch intent for the run (the decider reconciles a pending intent first, §3.5; K1-2b G3a);
+- no dispatch key journalled for this attempt (a new attempt fact, `dispatchIssued`). If one was journalled and the record still says `intent-recorded`, the record and the journal disagree: park `ambiguous`, qualifier `dispatch`, and reconcile by worktree. If the runner shows a session in the worktree, the attempt is dispatched, and the stop treats it as running;
+- a CAS save on the attempt's revision, so a concurrent writer loses;
+- `DispatchAttempt` refuses an attempt whose record is `cancelled`. Its claim-state check refuses `dispatching`, `running`, `reconciling` and `blocked` only (`DispatchAttemptUseCase.use-case.ts:502-516`); the lane that builds the cancel verifies this and adds the refusal, with a test, if it is missing.
+
+The cancel is journalled under the attempt's stop step key `<runId>/r<round>/stop/<seatIndex>`, with the result `cancelled-unstarted`, and releases the attempt's reservation if one is held. Its outcome maps like §3.8's `cancelled` row: `stopped`; capacity released only when the release is confirmed, otherwise held with one attention item.
+
+**Resume.** A run with any stop pending, graceful or force, refuses resume with `stop-pending` (§3.8). A graceful drain is not a park, so the refusal also covers a run that is not parked.
+
+#### 3.9.2 The reaper
+
+§3.5 reconciles one run each time the driver advances it. Nothing looks for what no driver advances. The **reaper** does. It finds zombies, reports them, and repairs only what is provably safe.
+
+**What expires by itself and needs no reaper.** Request claims (O1b: claim lease and TTL) and orchestrator sessions (O2a: the 90 s session lease) end by clock in their own use cases. The run and driver leases (K3) need no repair either: a lapsed lease is taken by the next driver under CAS. The reaper only reports a run that no driver holds (below).
+
+**Finding kinds.** Each is a typed `ReaperFindingKind`.
+
+| Kind | Seen when | Facts read through | Repair |
+|---|---|---|---|
+| `orphan-session` | The runner reports a session in a known worktree (one named by an attempt or a reservation) whose attempts are all terminal, or absent | `inspectWorktreeRun`, `listAllAttempts`, `listActiveReservations` | Report. Abort only with opt-in (D14), never on a worktree with commits not on the remote, and only through `abortWorktreeRun` |
+| `dead-attempt` | The record says `running` with a session; the runner reports that session ended or not found | `inspectSession` | Record-only: run `ReconcileAttempt`, which applies its own rules (below) |
+| `driverless-run` | A non-terminal run whose run lease lapsed and no driver lease is held | K3 run and driver leases | Report only: start the driver |
+| `leaked-slot` | A held reservation whose attempt is `ended`, `collected`, `cancelled` or absent; includes §3.8's `terminated, capacityReleased: false` row | `listActiveReservations`, `findAttemptById` | Record-only: release, after re-reading the attempt in a release state |
+| `stale-stop` | A `stop-unconfirmed` park older than `policy.conductor.reaper.staleStopMinutes` (default 30), or the stop retries spent (K1-2b's `wait stop-unconfirmed`) | Run record, keyed journal | Record-only: run `ReconcileAttempt` on its attempt; the driver then ends the run (§3.8) |
+| `orphan-worktree` | A known worktree with no non-terminal attempt or run, or whose branch's PR is merged | Attempts, runs, AM4b's PR-state read | Report only (D15) |
+| `stale-attention` | An open attention item, or an unanswered owner question, for a run already `merged` or `stopped` | AM3b attention store, Q1 questions | Attention: record-only close. Question: report only |
+
+**Two changes the existing plan forces.**
+- **Only the server's matching end report ends an attempt** (§2). So the reaper never marks an attempt ended itself. Its `dead-attempt` and `stale-stop` repairs call `ReconcileAttempt`, which ends an attempt only on that report and deliberately leaves an idle `dispatching` worktree untouched (`ReconcileAttemptUseCase.use-case.ts:160-205`). A finding the reconcile does not settle stays a report.
+- **Facts come through existing ports, so v1 sees only known worktrees.** No port lists every runner session or every worktree on a host: the runner inspects one session or one worktree, and `WorkspacePort` inspects one worktree. So `orphan-session` and `orphan-worktree` cover worktrees named by an attempt or a reservation. Enumerating a host is a new read method and its own decision (D16).
+
+**The reaper never changes a run.** Only the driver changes a run, under its lease and keys (§3.2). The reaper writes attempts, reservations and attention items through the existing use cases above, and its own findings. A run it reports is moved by the driver on its next `advance`.
+
+**The shape.**
+- **Domain (work-execution):** `ReaperFinding` (kind, subject, first and last sighting, sightings), `REAPER_FINDING_KINDS`, and a pure classifier `classifyZombies(facts, nowIso, reaperPolicy)` returning findings and, per finding, `report | repair | wait`. Like `nextLaneRunAction`, it never throws and never acts.
+- **Application:** `ReapZombiesUseCase`: gather facts through the ports in the table, classify, upsert findings, raise or refresh attention items, perform the allowed repairs. A new `ReaperFindingRepositoryPort` (file and memory stores) keeps sightings across passes; it is the one new port.
+- **Driver and CLI:** the driver runs a pass every `policy.conductor.reaper.intervalMinutes` (default 10; D13). `conductor reap [--dry-run]` runs one pass; `--dry-run` lists findings and the repairs it would make, and writes nothing. A standalone `conductor reap` is how a `driverless-run` is seen, since a driver never finds itself missing.
+
+**Two sightings and a grace period.** A finding acts only when seen on two passes at least G apart, with G = `policy.conductor.reaper.graceMinutes` (default 5, and never less than twice the driver's longest poll of 2 min; D13). The reaper never acts on a subject with an intent, a save or a lease renewal younger than G, so it never races a dispatch, a stop or a driver. A finding not seen on a later pass is closed.
+
+**Report first.** By default every finding is report-only: one attention item keyed (project, subject, kind), one per finding, never one per pass. Automatic repair is allowed only for the record-only repairs in the table, each enabled per kind under `policy.conductor.reaper.repairs` (D14). A destructive repair (abort an orphan session) needs its own per-kind opt-in and never touches a worktree with commits not on the remote. No repair removes a worktree (D15).
+
+**Every repair is keyed.** Its journal entry has the key `reaper/<subjectId>/<kind>@<findingId>`, intent before the action, result after, so K1b refuses a second one and a repair is never done twice. The subject id is a record id (attempt, reservation, run, attention item); a worktree subject is named by a 12-hex digest of its path, never the path. The finding id is a ULID minted at the first sighting.
+
+**Web.** Findings are read-only in the web first (web plan: route A-F, view W7c). Repairs stay in the CLI until the owner decides otherwise.
+
+**Kill switch.** Halt stops reaper repairs too; a halted reaper still reports. `--dry-run` and dry-run mode (§3.7) journal `would repair <kind>`.
+
 ## 4. Workbook
 
 Each lane is about 45 minutes, one PR, the standard pipeline. **Parallel** means three things together: different packages, **no shared file** (notably `apps/cli/src/composition.ts`, `apps/api` wiring and `.architecture/manifest.yaml`), and room in the host-wide gate budget. The owner lifted the two-lane stability cap on 2026-10-27. Within a group, lanes marked **→** run in sequence. Manifest edits are small; lanes that add to it merge one at a time, rebased.
@@ -176,10 +259,26 @@ Each lane is about 45 minutes, one PR, the standard pipeline. **Parallel** means
 | K7 | `conductor run\|halt\|resume\|stop\|status`, polling, dry-run fakes | apps/cli | 2 | K4 |
 | K8 | Shadow replay of recorded journals | apps/cli, tests | 1 | K7 |
 | K9 | `/v1/changes` wake-ups as D9 allows | apps/cli | 1 | K7, E3b |
+| K10 | `ReaperFinding`, `REAPER_FINDING_KINDS`, `reaper/` keys, pure `classifyZombies` with the two-sighting and grace rules; one test per kind and per row of §3.9.2 | work-execution (domain), **manifest** | 2 | K1-2c, K1b, K3 |
+| K11a | `ReapZombiesUseCase`, `ReaperFindingRepositoryPort` and its file and memory stores; record-only repairs through `ReconcileAttempt`, the reservation release and the attention store; keyed repair entries; fault-injection tests (a crash after the repair before its result; a subject with a young intent) | work-execution (application, infra), **manifest** | 2 | K10, K4, AM3b, AM4b |
+| K11b | `conductor reap [--dry-run]`; the driver's reaper pass and its interval; `policy.conductor.reaper` read | apps/cli, **`index.ts`, `composition.ts`** | 2 | K11a, K7, K2 |
+| K12 | Destructive repair `orphan-session` abort, behind its per-kind opt-in and the unpushed-commits check | work-execution (application), **`composition.ts`** | 2 | K11b, D14 opt-in |
 
 Group 3's work-execution lanes can each run beside a Group 2 lane in another package; inside Group 3, AM2 and S1a may overlap only if their files are disjoint, which each brief must state. AM4b touches `composition.ts`, so it runs in sequence with every other `composition.ts` lane. C1 and U1/U2 are in flight: prerequisites, not new lanes.
 
 **Amendment UI-B (2026-10-27, §3.8).** No new lanes. K1's transition table and guards gain the stop mapping and the `stop-unconfirmed` park reason, with one test per mapping row. K1b's keys include the control keys of §3.8. Whichever lane builds `ResumeLaneRun` (it backs K7's `conductor resume`) refuses `one-way-door` parks, `stopped` runs (`run-stopped`) and `stop-unconfirmed` parks (`stop-pending`), with a test for each. K7's driver obeys `<runId>/stop@web` entries. If K1 has merged before this amendment, these land as a K1 follow-up. The web UI plan's A-C writes the stop entry and refuses run-owned attempts on the direct attempt stop.
+
+**Amendment K-GC (2026-10-27, §3.9).** New lanes K10, K11a, K11b and K12 above; the stop modes need no new lane:
+- **K1b** adds the keys K1-1 lacks: `<runId>/stop-force@web`, the `@cli` forms of both stop keys, the `mode` on a parsed stop key (read from the key), `reaper/<subjectId>/<kind>@<findingId>`, and a check that a stop entry's `mode` matches its key. K1b is the first lane that stores keys, so they land before anything is stored. It updates K1-1's manifest invariant with the new control keys.
+- **K1-2a** adds `RunStopMode` (`graceful | force`), a `strongerStopMode` helper, and the drain table of §3.9.1 as data. Its resume check reads `stopMode: RunStopMode | null` instead of `stopRequested`; a graceful stop refuses with `stop-pending`, with its own test.
+- **K1-2b** replaces `stopRequested` with `stopMode`, `stopRequestedAtIso` and `stopGraceMinutes`, adds `dispatchIssued` to the attempt fact, the decision `cancel` (the record-only cancel, under the stop step key) and the wait reasons `stop-draining` and `stop-grace-exceeded`. G4a and G4d become force rules; a graceful stop waits until K1-2c. One test per new row.
+- **K1-2c** (new, about 35 minutes, after K1-2b) replaces that wait with the drain rules of §3.9.1: collect and gate once, then `stopped`; the grace wait; a halted drain continuing once the halt is lifted. One test per row and per drain sequence.
+- **K2** adds `policy.conductor.stopGraceMinutes` and `policy.conductor.reaper` (enabled, interval, grace, stale-stop minutes, per-kind repairs; absent = report-only).
+- **K4** builds the record-only cancel of a prepared attempt and `DispatchAttempt`'s refusal of a `cancelled` record if it is missing.
+- **K7** adds `conductor stop --force`, the drain wait, the grace attention item and the `stop-already-forced` refusal.
+- **Web plan.** A-C writes both stop keys and refuses `stop-already-forced`; W7b shows "Stop" and, while a graceful stop is pending, "Stop now"; the reaper's read route (A-F) and view (W7c) are added there.
+
+K11 is split in two because a use case, a store, the CLI and the driver hook are more than one 45-minute lane, and K11b shares `index.ts` and `composition.ts` with K7, AM5 and O5. K12 is dispatched only if the owner opts in under D14.
 
 ## 5. Hard to undo
 
@@ -187,6 +286,9 @@ Group 3's work-execution lanes can each run beside a Group 2 lane in another pac
 - **PRs it opens or pushes to** are visible to anyone who can see the target repository; bodies are rendered from records, never lane output.
 - **The `LaneRunRecord` format, journal keys and the review `kind`** become stored data; version them from their first commit.
 - **The park reason `stop-unconfirmed` and the refusal reason `run-stopped`** (amendment UI-B) become stored and wire data the web reads.
+- **The stop keys and `RunStopMode`** (amendment K-GC): `<runId>/stop@…` now means graceful, `<runId>/stop-force@…` means force. Once K1b stores them, the meaning of a stored key cannot change.
+- **The reaper's finding kinds and its `reaper/` keys** become stored data the web reads; version them from their first commit.
+- **A destructive repair** (aborting an orphan session) is one-way: the session's unfinished work is lost. It runs only behind the owner's per-kind opt-in (D14), and never removes a worktree (D15).
 
 ## 6. Decisions for the owner
 
@@ -202,6 +304,14 @@ Group 3's work-execution lanes can each run beside a Group 2 lane in another pac
 | D8 | Rotation state | One cursor per (project, role), advanced when a dispatch is recorded |
 | D9 | May the driver read `/v1/changes` (shared `/v1` bearer until T3a's `read` scope) in the process that holds forge credentials? | **No:** until T3a, a separate reader process wakes the driver, or the driver polls |
 | D10 | Amend R1: selection per (reviewer, kind), and a seat switch never answers a recorded fail | **Yes**, with the same seat re-running on the next head; seat unavailable → park |
+| D11 | The default stop mode for `conductor stop` and the web's first button | **Graceful.** Force is explicit (`--force`, "Stop now"); a force may follow a graceful stop, never the reverse |
+| D12 | How long a graceful drain runs before it raises an attention item | **45 minutes** (`policy.conductor.stopGraceMinutes`, the lane size); one attention item, never an automatic force |
+| D13 | Reaper grace G and interval | **G = 5 minutes** (at least twice the driver's longest poll); **a pass every 10 minutes** in the driver, plus `conductor reap` on demand |
+| D14 | Which repairs may ever be automatic | **Record-only, per kind:** release a leaked slot, reconcile a dead attempt or a stale stop through `ReconcileAttempt`, close attention for a terminal run. **Aborting an orphan session:** off; per-kind opt-in only, never with commits not on the remote |
+| D15 | Is removing an orphan worktree in scope? | **No.** Report-only, with no remove method on any port, unless the owner opts in by a later decision |
+| D16 | Should the reaper enumerate every runner session and worktree on a host, beyond those the records name? | **Not in v1.** It would need new listing reads on the runner and workspace ports; decide after ten reaper passes are recorded |
+
+D11, D13, D14 and D15 (amendment K-GC, §3.9) were decided by the owner on 2026-10-27, each as recommended. D12 and D16 are the recommended defaults, shown to the owner on the same day with no objection, and stay open until the owner decides otherwise. Nothing in §3.9 that depends on D12 or D16 is changed without that decision.
 
 ## 7. Assumptions
 
@@ -210,6 +320,10 @@ Group 3's work-execution lanes can each run beside a Group 2 lane in another pac
 - `gh pr merge --match-head-commit` keeps refusing a moved head.
 - One state directory per installation, one driver over it.
 - S1, S2 and AM are built as planned; if one slips, the conductor parks at that step instead of guessing.
+- The runner's worktree inspection answers `idle` truthfully for an attempt that was never started; if it cannot, a prepared attempt with a journalled dispatch parks `ambiguous` instead of being cancelled.
+- A graceful stop does not reach the lane. It relies on lanes ending within their size; a lane that does not raises the grace attention item, and the owner decides whether to force.
+- The reaper and the driver read one clock per installation; skew between passes shorter than G cannot make a fresh subject look stale.
+- A standalone `conductor reap` beside a running driver is harmless: the reaper never writes a run, and every repair is keyed.
 
 ## 8. Review
 
@@ -220,3 +334,5 @@ Group 3's work-execution lanes can each run beside a Group 2 lane in another pac
 ## Challenge this
 
 Whether `LaneRunRecord` should exist at all. With a keyed journal, nearly all of the run's state can be derived, and a second record risks disagreeing with it. The plan keeps a minimal record because the seat cursors, the park and the lease cannot be derived safely. A reviewer should test whether putting those in keyed journal entries keeps crash-resume and fencing correct with one store fewer.
+
+Whether the graceful stop earns its place. A forced stop deletes no commits: collecting what is already on the branch after a force keeps most of what a drain keeps. What a drain adds is the work the lane would commit before its natural end, at the cost of a new fact, a new key, a drain table and a grace timer. A reviewer should test whether "force, then collect and gate what was committed" covers the owner's need with less, and whether a lane left to drain is likelier to commit something useful or to run to its deadline. On the reaper, the part to challenge is the claim that it never races the driver: check every record-only repair against a driver that advances the same subject in the same second.

@@ -2,8 +2,11 @@
 /**
  * BriefPackage is an immutable value object for one frozen brief package:
  * identity-bound paths, digests and revision references. The digest is
- * integrity, not truth; the package owns at least one path.
+ * integrity, not truth; the package owns at least one path. The package
+ * carries the acceptance spec its gate runs.
  */
+
+import { AcceptanceSpec } from './AcceptanceSpec.vo.js';
 
 export interface BriefPackageProps {
   readonly attemptId: string;
@@ -14,6 +17,7 @@ export interface BriefPackageProps {
   readonly policyRevision: string;
   readonly independentReviewer: string;
   readonly ownedPaths: readonly string[];
+  readonly acceptanceSpec: AcceptanceSpec;
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -46,6 +50,9 @@ export class BriefPackage {
     }
     if (props.ownedPaths.some((path) => !isNonEmptyString(path))) {
       return { success: false, error: new Error('BriefPackage owned paths must be non-empty strings') };
+    }
+    if (!(props.acceptanceSpec instanceof AcceptanceSpec)) {
+      return { success: false, error: new Error('BriefPackage requires an acceptance spec') };
     }
     return { success: true, value: new BriefPackage({ ...props, ownedPaths: [...props.ownedPaths] }) };
   }
@@ -82,6 +89,10 @@ export class BriefPackage {
     return this.props.ownedPaths;
   }
 
+  getAcceptanceSpec(): AcceptanceSpec {
+    return this.props.acceptanceSpec;
+  }
+
   getProps(): BriefPackageProps {
     return this.props;
   }
@@ -96,7 +107,8 @@ export class BriefPackage {
       this.props.policyRevision === other.props.policyRevision &&
       this.props.independentReviewer === other.props.independentReviewer &&
       this.props.ownedPaths.length === other.props.ownedPaths.length &&
-      this.props.ownedPaths.every((path, index) => path === other.props.ownedPaths[index])
+      this.props.ownedPaths.every((path, index) => path === other.props.ownedPaths[index]) &&
+      this.props.acceptanceSpec.equals(other.props.acceptanceSpec)
     );
   }
 }

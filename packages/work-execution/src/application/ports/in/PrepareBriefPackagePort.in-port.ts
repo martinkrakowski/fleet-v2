@@ -6,6 +6,7 @@
  */
 
 import type { RunnerKind } from '../../../domain/execution-records.js';
+import type { AcceptanceSpecProps } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
 
 export interface BriefContextDecision {
   readonly proposalId: string;
@@ -52,6 +53,12 @@ export interface PrepareBriefPackageRequest {
   readonly allowedPathPrefixes?: readonly string[];
   readonly permissions: readonly string[];
   readonly acceptanceChecks: readonly string[];
+  /**
+   * The gate this lane must pass, frozen into the manifest and covered by the
+   * digest (plan S2, D2). Required: a request without a valid spec is rejected.
+   * Typed optional because the CLI passes untyped input.
+   */
+  readonly acceptanceSpec?: AcceptanceSpecProps;
   readonly stepLimit: number;
   readonly timeLimitSeconds: number;
   readonly resourceBounds: Readonly<Record<string, string>>;

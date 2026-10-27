@@ -799,6 +799,8 @@ describe("configured compositions execute real operations", () => {
       ownedPaths: WORK_ORDER_REQUEST.ownedPaths,
       permissions: [],
       acceptanceChecks: [],
+      acceptanceSpec: { commitRequired: true, diffCheck: true, commands: [{ argv: ['corepack', 'yarn', 'build'] }] },
+      allowedPathPrefixes: ['src'],
       stepLimit: 10,
       timeLimitSeconds: 600,
       resourceBounds: {},

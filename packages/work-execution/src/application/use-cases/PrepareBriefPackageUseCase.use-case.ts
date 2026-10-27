@@ -4,11 +4,14 @@
  * prose brief and freeze its manifest, revision references and digest before
  * any dispatch. The package is placed only under verified ignored paths; the
  * digest is integrity, not a truth claim. Nothing enters the brief unreviewed.
+ * The acceptance spec is validated and frozen into the manifest, so the
+ * digest covers the gate.
  */
 
 import { parseSeatTool } from '../../domain/execution-records.js';
 import { validateAllowedPathPrefix } from '../../domain/lane-diff-check.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
+import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import type {
   PrepareBriefPackagePort,
   PrepareBriefPackageRequest,
@@ -137,6 +140,26 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
         return { outcome: 'rejected', reason: invalidPrefix };
       }
     }
+    // Plan S2: the gate is data in the frozen manifest. A package without a
+    // valid acceptance spec is refused before anything is authored or placed.
+    if (request.acceptanceSpec === undefined || request.acceptanceSpec === null) {
+      return {
+        outcome: 'rejected',
+        reason: 'acceptanceSpec is required: commitRequired, diffCheck and at least one command',
+      };
+    }
+    const acceptanceSpec = AcceptanceSpec.create(request.acceptanceSpec);
+    if (!acceptanceSpec.success || acceptanceSpec.value === undefined) {
+      return { outcome: 'rejected', reason: acceptanceSpec.error?.message ?? 'acceptanceSpec is invalid' };
+    }
+    // The spec's diff check refuses every changed path outside the allowed
+    // prefixes, so a package with a spec must name at least one.
+    if (allowedPathPrefixes.length === 0) {
+      return {
+        outcome: 'rejected',
+        reason: 'allowedPathPrefixes is required: the acceptance spec diff check refuses every changed path outside them',
+      };
+    }
     // The worktree path names where the frozen package lands. It is required
     // and never defaulted to the process's current directory; the request
     // wins over the composition root, and both must be a non-empty string.
@@ -222,6 +245,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
         allowedPathPrefixes,
         permissions: request.permissions,
         acceptanceChecks: request.acceptanceChecks,
+        acceptanceSpec: acceptanceSpec.value.toJSON(),
         stepLimit: request.stepLimit,
         timeLimitSeconds: request.timeLimitSeconds,
         resourceBounds: request.resourceBounds,

@@ -4,16 +4,29 @@ import {
   buildLaneRunStepKey,
   head12Of,
   laneRunResumeKey,
+  laneRunStopForceKey,
   laneRunStopKey,
   parseLaneRunKey,
+  reaperRepairKey,
+  REAPER_FINDING_KINDS,
   requestKey,
+  stopModeOfKey,
 } from '../lane-run-keys.js';
-import type { LaneRunStepKeyParts } from '../lane-run-keys.js';
+import type { LaneRunKeyVia, LaneRunStepKeyParts, ReaperFindingKind } from '../lane-run-keys.js';
 import {
   LANE_RUN_KEY_ATTEMPT_RULE,
   LANE_RUN_KEY_HEAD_RULE,
   LANE_RUN_KEY_STEPS,
 } from '../lane-run-records.js';
+
+/**
+ * Secret-shaped fakes are assembled at runtime from inert pieces so this file
+ * never contains a credential-shaped literal; the scanner still recognises the
+ * shape, which is the point under test.
+ */
+function fakeSecretShape(): string {
+  return `gh${'p_'}${'A'.repeat(30)}`;
+}
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const HEAD12 = '0123456789ab';
@@ -72,7 +85,9 @@ describe('key builders', () => {
     expect(rebuilt).toEqual(built);
 
     expect(laneRunStopKey(RUN_ID)).toEqual({ ok: true, key: `${RUN_ID}/stop@web` });
-    expect(parseLaneRunKey(`${RUN_ID}/stop@web`)).toEqual({ kind: 'stop', runId: RUN_ID, via: 'web' });
+    expect(parseLaneRunKey(`${RUN_ID}/stop@web`)).toEqual({
+      kind: 'stop', runId: RUN_ID, via: 'web', mode: 'graceful',
+    });
 
     expect(laneRunResumeKey(RUN_ID, 3)).toEqual({ ok: true, key: `${RUN_ID}/park/3/resume@web` });
     expect(parseLaneRunKey(`${RUN_ID}/park/3/resume@web`)).toEqual({
@@ -274,6 +289,160 @@ describe('key builders', () => {
     if (badStep.ok) return;
     expect(badStep.error).not.toContain('XYZZY');
   });
+
+  it('builds and parses every stop key with its mode', () => {
+    expect(laneRunStopKey(RUN_ID)).toEqual({ ok: true, key: `${RUN_ID}/stop@web` });
+    expect(laneRunStopKey(RUN_ID, 'web')).toEqual({ ok: true, key: `${RUN_ID}/stop@web` });
+    expect(laneRunStopKey(RUN_ID, 'cli')).toEqual({ ok: true, key: `${RUN_ID}/stop@cli` });
+    expect(laneRunStopForceKey(RUN_ID, 'web')).toEqual({ ok: true, key: `${RUN_ID}/stop-force@web` });
+    expect(laneRunStopForceKey(RUN_ID, 'cli')).toEqual({ ok: true, key: `${RUN_ID}/stop-force@cli` });
+
+    expect(parseLaneRunKey(`${RUN_ID}/stop@web`)).toEqual({
+      kind: 'stop', runId: RUN_ID, via: 'web', mode: 'graceful',
+    });
+    expect(parseLaneRunKey(`${RUN_ID}/stop@cli`)).toEqual({
+      kind: 'stop', runId: RUN_ID, via: 'cli', mode: 'graceful',
+    });
+    expect(parseLaneRunKey(`${RUN_ID}/stop-force@web`)).toEqual({
+      kind: 'stop', runId: RUN_ID, via: 'web', mode: 'force',
+    });
+    expect(parseLaneRunKey(`${RUN_ID}/stop-force@cli`)).toEqual({
+      kind: 'stop', runId: RUN_ID, via: 'cli', mode: 'force',
+    });
+
+    for (const key of [
+      `${RUN_ID}/stop@web`,
+      `${RUN_ID}/stop@cli`,
+      `${RUN_ID}/stop-force@web`,
+      `${RUN_ID}/stop-force@cli`,
+    ]) {
+      const parsed = parseLaneRunKey(key);
+      if (parsed === null || parsed.kind !== 'stop') throw new Error('unreachable: parsed stop key');
+      const rebuilt =
+        parsed.mode === 'force'
+          ? laneRunStopForceKey(parsed.runId, parsed.via)
+          : laneRunStopKey(parsed.runId, parsed.via);
+      expect(rebuilt).toEqual({ ok: true, key });
+    }
+
+    expect(stopModeOfKey(`${RUN_ID}/stop@web`)).toBe('graceful');
+    expect(stopModeOfKey(`${RUN_ID}/stop@cli`)).toBe('graceful');
+    expect(stopModeOfKey(`${RUN_ID}/stop-force@web`)).toBe('force');
+    expect(stopModeOfKey(`${RUN_ID}/stop-force@cli`)).toBe('force');
+    expect(stopModeOfKey(`${RUN_ID}/r1/gate/0@0123456789ab`)).toBeNull();
+    expect(stopModeOfKey(`${RUN_ID}/park/1/resume@web`)).toBeNull();
+    expect(stopModeOfKey(42)).toBeNull();
+    expect(stopModeOfKey('')).toBeNull();
+  });
+
+  it('builds and parses reaper keys', () => {
+    const attempt = reaperRepairKey('attempt-example-1', 'dead-attempt', '01JB0000000000000000000000');
+    expect(attempt).toEqual({ ok: true, key: 'reaper/attempt-example-1/dead-attempt@01JB0000000000000000000000' });
+    expect(parseLaneRunKey('reaper/attempt-example-1/dead-attempt@01JB0000000000000000000000')).toEqual({
+      kind: 'reaper', subjectId: 'attempt-example-1', findingKind: 'dead-attempt', findingId: '01JB0000000000000000000000',
+    });
+
+    const wt = reaperRepairKey('wt-0123456789ab', 'orphan-worktree', '01JB0000000000000000000000');
+    expect(wt).toEqual({ ok: true, key: 'reaper/wt-0123456789ab/orphan-worktree@01JB0000000000000000000000' });
+    expect(parseLaneRunKey('reaper/wt-0123456789ab/orphan-worktree@01JB0000000000000000000000')).toEqual({
+      kind: 'reaper', subjectId: 'wt-0123456789ab', findingKind: 'orphan-worktree', findingId: '01JB0000000000000000000000',
+    });
+
+    for (const kind of REAPER_FINDING_KINDS) {
+      const built = reaperRepairKey('attempt-example-1', kind, '01JB0000000000000000000000');
+      expect(built.ok).toBe(true);
+      if (!built.ok) continue;
+      const parsed = parseLaneRunKey(built.key);
+      expect(parsed).toEqual({
+        kind: 'reaper', subjectId: 'attempt-example-1', findingKind: kind, findingId: '01JB0000000000000000000000',
+      });
+    }
+  });
+
+  it('refuses invalid stop via, reaper subjects, kinds and finding ids', () => {
+    expect(laneRunStopKey(RUN_ID, 'xyz' as LaneRunKeyVia)).toEqual({
+      ok: false,
+      error: 'LaneRun key via must be web or cli',
+    });
+    expect(laneRunStopForceKey(RUN_ID, 'xyz' as LaneRunKeyVia)).toEqual({
+      ok: false,
+      error: 'LaneRun key via must be web or cli',
+    });
+
+    const badSubjects = ['attempt/example', 'attempt@example', 'x'.repeat(129), ''];
+    for (const subject of badSubjects) {
+      expect(reaperRepairKey(subject, 'dead-attempt', '01JB0000000000000000000000')).toEqual({
+        ok: false,
+        error: 'LaneRun key reaper subject must be an id without / or @ of at most 128 characters',
+      });
+    }
+
+    expect(reaperRepairKey(fakeSecretShape(), 'dead-attempt', '01JB0000000000000000000000')).toEqual({
+      ok: false,
+      error: 'LaneRun key reaper subject contains a secret-shaped value and was refused',
+    });
+
+    expect(reaperRepairKey('attempt-example-1', 'zombie' as ReaperFindingKind, '01JB0000000000000000000000')).toEqual({
+      ok: false,
+      error: 'LaneRun key reaper kind is not a known finding kind',
+    });
+
+    expect(reaperRepairKey('attempt-example-1', 'dead-attempt', 'not-a-ulid')).toEqual({
+      ok: false,
+      error: 'LaneRun key reaper findingId must be a ULID',
+    });
+
+    expect(laneRunStopKey(42 as unknown as string)).toEqual({
+      ok: false,
+      error: 'LaneRun key runId must be run- followed by a ULID',
+    });
+    expect(reaperRepairKey(42 as unknown as string, 'dead-attempt', '01JB0000000000000000000000').ok).toBe(false);
+    expect(reaperRepairKey('attempt-example-1', 'dead-attempt', 42 as unknown as string).ok).toBe(false);
+  });
+
+  it('never echoes hostile stop or reaper input', () => {
+    const badVia = laneRunStopKey(RUN_ID, 'XYZZY' as LaneRunKeyVia);
+    expect(badVia.ok).toBe(false);
+    if (badVia.ok) return;
+    expect(badVia.error).not.toContain('XYZZY');
+
+    const badSubject = reaperRepairKey('XYZZY/x', 'dead-attempt', '01JB0000000000000000000000');
+    expect(badSubject.ok).toBe(false);
+    if (badSubject.ok) return;
+    expect(badSubject.error).not.toContain('XYZZY');
+
+    const badKind = reaperRepairKey('attempt-example-1', 'XYZZY' as ReaperFindingKind, '01JB0000000000000000000000');
+    expect(badKind.ok).toBe(false);
+    if (badKind.ok) return;
+    expect(badKind.error).not.toContain('XYZZY');
+  });
+
+  it('builds, parses and rebuilds reconcile step keys', () => {
+    const base: LaneRunStepKeyParts = {
+      runId: RUN_ID, round: 1, step: 'reconcile', seatIndex: 0, attemptOrdinal: null, head12: null, retry: null,
+    };
+    expect(buildLaneRunStepKey(base)).toEqual({ ok: true, key: `${RUN_ID}/r1/reconcile/0` });
+    expect(buildLaneRunStepKey({ ...base, retry: 2 })).toEqual({ ok: true, key: `${RUN_ID}/r1/reconcile/0/retry2` });
+
+    expect(parseLaneRunKey(`${RUN_ID}/r1/reconcile/0`)).toEqual({ kind: 'step', ...base });
+    expect(parseLaneRunKey(`${RUN_ID}/r1/reconcile/0/retry2`)).toEqual({ kind: 'step', ...base, retry: 2 });
+
+    const built = buildLaneRunStepKey({ ...base, retry: 2 });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    const parsed = parseLaneRunKey(built.key);
+    if (parsed === null || parsed.kind !== 'step') throw new Error('unreachable: parsed reconcile key');
+    expect(buildLaneRunStepKey(parsed)).toEqual(built);
+
+    expect(buildLaneRunStepKey({ ...base, head12: HEAD12 })).toEqual({
+      ok: false,
+      error: 'LaneRun key head does not match its step',
+    });
+    expect(buildLaneRunStepKey({ ...base, attemptOrdinal: 1 })).toEqual({
+      ok: false,
+      error: 'LaneRun key attemptOrdinal does not match its step',
+    });
+  });
 });
 
 describe('parseLaneRunKey', () => {
@@ -298,7 +467,6 @@ describe('parseLaneRunKey', () => {
     `${RUN_ID}/r1/park/0@0123456789ab`,
     `${RUN_ID}/r1/merge/0@0123456789ab/retry1`,
     `${RUN_ID}/r1/gate/0@0123456789ab/retry0`,
-    `${RUN_ID}/stop@cli`,
     `${RUN_ID}/park/0/resume@web`,
     `${RUN_ID}/park/01/resume@web`,
     `${RUN_ID}/park/1/extra/resume@web`,
@@ -309,6 +477,17 @@ describe('parseLaneRunKey', () => {
     'run-1/r0/dispatch/0/a1',
     `${RUN_ID}/r1/gate/0@0123456789ab/`,
     `${RUN_ID}/r1/gate/0 @0123456789ab`,
+    `${RUN_ID}/stop-force@xyz`,
+    `${RUN_ID}/stop@`,
+    `${RUN_ID}/stop-graceful@web`,
+    `${RUN_ID}/stop@web@cli`,
+    `${RUN_ID}/Stop@web`,
+    'reaper/a/b/dead-attempt@01JB0000000000000000000000',
+    'reaper/attempt-example-1/zombie@01JB0000000000000000000000',
+    'reaper/attempt-example-1/dead-attempt@not-a-ulid',
+    'reaper/attempt-example-1/dead-attempt',
+    'reaper//dead-attempt@01JB0000000000000000000000',
+    'Reaper/attempt-example-1/dead-attempt@01JB0000000000000000000000',
   ])('rejects %j', (key) => {
     expect(parseLaneRunKey(key)).toBeNull();
   });

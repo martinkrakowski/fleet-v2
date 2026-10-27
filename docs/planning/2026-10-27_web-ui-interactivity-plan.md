@@ -2,9 +2,9 @@
 
 - **Date:** 2026-10-27
 - **Target repository:** `fleet-v2`
-- **Status:** rev 3.1. Rev 1 applied Fable's review of the research; rev 2 added the orchestrator
-  request channel (§3.6) and the live tail (§3.7) from Fable's design review; rev 3 applies Grok
-  4.7's review of rev 2 (§7). Decisions in §5 are open with defaults. Nothing built. Anchors checked against `main` at `dae491f`.
+- **Status:** rev 3.2. Rev 1 applied Fable's review of the research; rev 2 added the orchestrator
+  request channel (§3.6) and the live tail (§3.7) from Fable's design review; rev 3 applied Grok
+  4.7's review of rev 2, rev 3.1 its re-review, and rev 3.2 CodeRabbit's review (§7). Decisions in §5 are open with defaults. Nothing built. Anchors checked against `main` at `dae491f`.
 - **Owner requests (2026-10-27):**
   - "Given all of the fleet-v2 features and functionality, the UI lacks interactivity with the
     actual lanes, and orchestration. Run a sub-agent to research UI/UX improvements. The have Fable
@@ -142,8 +142,10 @@ are polish: they rank below the inbox, the timeline and the tail.
 work-execution, manifest entries, routes). The board ships with K7, so the dry-run and shadow
 rollout (conductor D4) is observable: one card per lane run with its state, round 0–2, seat per
 role, PR number, park reason, lease holder, and a distinct rendering of `would <action>` entries.
-Columns group states (implement, gate and review, fix, accept and merge, parked); each card shows
-the state word and an icon, never colour alone. On a narrow screen the board is grouped lists.
+Columns group states (implement, gate and review, fix, accept and merge, parked, ended). `parked`
+waits for a human and can return to its parked-from state; `ended` holds the terminal states,
+`merged` and `stopped`, each shown by its own word, so a stopped run never reads as parked. Each
+card shows the state word and an icon, never colour alone. On a narrow screen the board is grouped lists.
 
 **P7-write. Run controls.** The web writes records the CLI driver obeys (conductor D2); it never
 drives a step.
@@ -151,15 +153,29 @@ drives a step.
   `conductor halt`. It never depends on a live orchestrator. Body: "parks every run before its
   next external action; does not stop a running lane".
 - **Stop** is a direct route (A-C) that writes a keyed run-journal entry `<runId>/stop@web`
-  carrying the run's `expectedRevision`. The driver obeys it: the run goes to `stopped`, and the
-  driver stops the running attempt itself through `StopAttempt` (conductor §3.2: "a running
-  attempt is stopped first through `StopAttempt`"). The web never calls `StopAttempt` for an
-  attempt that belongs to a run. Body: "records a stop for run <id>; the conductor stops its
-  running attempt <id> and ends the run as `stopped`; does not merge, push, revert or delete
-  anything; a stopped run is not resumed" (danger tone).
+  carrying the run's `expectedRevision`. The driver obeys it and stops the running attempt itself
+  through `StopAttempt` (conductor §3.2: "a running attempt is stopped first through
+  `StopAttempt`"). The web never calls `StopAttempt` for an attempt that belongs to a run. The
+  driver maps `StopAttempt`'s outcome as follows:
+
+  | `StopAttempt` outcome | Run | Capacity |
+  |---|---|---|
+  | `terminated`, `capacityReleased: true` | `stopped` | released |
+  | `cancelled` (never started) | `stopped` | released by the cancel |
+  | `terminated`, `capacityReleased: false` | `stopped` | slot stays held; one attention item names it; a reconcile releases it |
+  | `still-running` or `unknown` | parked, reason `stop-unconfirmed`; the driver retries the stop and reconciles | held |
+  | `refused` | parked with the refusal's reason | held |
+
+  The run never shows `stopped` while its attempt may still be running, and a slot is never shown
+  as released unless the result confirmed it. `stop-unconfirmed` is a new park reason, not a new
+  state (amendment UI-B). Body: "records a stop for run <id>; the conductor stops its running
+  attempt <id> and ends the run as `stopped` once the runner confirms; if the runner does not
+  confirm, the run parks as `stop-unconfirmed`; does not merge, push, revert or delete anything; a
+  stopped run cannot be resumed" (danger tone).
 - **Resume** goes through the request channel as `resume-run`. The claimant calls `ResumeLaneRun`,
-  which refuses server-side when `parked.reason === 'one-way-door'`; those parks are answered by
-  the owner's signed decision on the keyed question, not by a button. The request carries the
+  which refuses server-side when `parked.reason === 'one-way-door'`, and refuses a `stopped` run
+  with the typed reason `run-stopped` (amendment UI-B; a test for each). One-way-door parks are
+  answered by the owner's signed decision on the keyed question, not by a button. The request carries the
   run's `expectedRevision`, and the claimant journals it under `<runId>/park/<n>/resume@web`, so a
   repeat is refused by K1b's uniqueness check.
 
@@ -250,10 +266,25 @@ a second claimant's intent fails.
 POST returns the existing record (the `RequestScopedDecisionUseCase` `:78-83` shape). A claim is a
 CAS on the revision (as `OwnerQuestionRepositoryAdapter` `:108-118`) writing
 `claim { orchestratorId, fence, leaseUntilIso }`. The claim lease is 2 min, renewed. An expired
-claim returns the request to `queued` with `claimCount + 1`; after two expired claims the request
-is `stalled` with one attention item (AM3b). On claim, the claimant reads the journal for an
-intent under `request/<id>`; if present it marks the request `dispatched` and never acts again
-(conductor §3.5). That check needs K1b's keyed journal. Until K1b exists, only `dispatch-attempt`
+claim returns the request to `queued` with `claimCount + 1` and a new, incremented fence; after two
+expired claims the request is `stalled` with one attention item (AM3b).
+
+**The fence.** Every claim mutation (renew, complete, refuse, defer) is a CAS on `revision` that
+also checks that `claim.fence` equals the caller's fence and that the lease has not expired. A
+stale claimant's later mutations therefore fail. Before each external action the claimant:
+1. re-reads the request and checks its fence and lease;
+2. appends the journal intent under `request/<requestId>` (written before the action, under K1b's
+   uniqueness check);
+3. acts;
+4. appends the result.
+
+A crash after the action and before the result leaves an intent without a result; the next
+claimant reconciles it (conductor §3.5) and never repeats it. On claim, the claimant reads the
+journal for an intent under `request/<id>`; if a completed one is present it marks the request
+`dispatched` and never acts again. For `dispatch-attempt` before K1b, the existing guards (attempt
+state, `duplicate-attempt`, the busy-worktree check under the journal lock, the runner's exit 75)
+stop a stale claimant from dispatching twice. O2b and O2c carry fault-injection tests: a crash after
+the action and before the journal result, and a stale claimant acting after its lease expired. That check needs K1b's keyed journal. Until K1b exists, only `dispatch-attempt`
 is enabled, because its duplicate guards already exist (attempt state, `duplicate-attempt` in
 `reserveCapacityAtomically`, the runner's exit 75); `start-lane-run`, `prepare-fix`,
 `request-review` and `resume-run` are refused with `reasonKind: policy` until K1b lands (lane O2c).
@@ -291,7 +322,9 @@ needs attached and warns when not attentive.
 **Heartbeats (F7).** Heartbeats go through the API (`POST /v1/orchestrators/:id/heartbeat`) into a
 separate `orchestrators.json`, and `heartbeat` is excluded from `DATA_KINDS`
 (`change-feed.ts:45-51`); otherwise CLI-side writes would cause a resync storm
-(`change-feed.ts:120-128`). Only register, retire and claim emit `orchestrator` or `request` signals.
+(`change-feed.ts:120-128`). Register and retire emit `orchestrator` signals. Every request
+transition (claimed, dispatched, refused, deferred, cancelled, cancel-requested, expired, stalled)
+emits a `request` signal; heartbeats and lease renewals emit nothing.
 
 **Several and remote orchestrators (F9, F10).** Many may register; a claim is first-CAS-wins and
 capability-gated. With `policy.conductor.enabled`, `start-lane-run` is claimed only by `cliKind:
@@ -327,7 +360,8 @@ registers only with an `orchestrate`-scoped token, never the full one; v1 shows 
   (expires in N) → claimed by <kind · model> (lease) → dispatched → lane running (hands over to the attempt or
   run view); or refused: <reasonKind> — "<detail>"; deferred until <time> — <reason>; expired, not
   performed; cancelled; stalled (2 claims lost), with an attention item. Each step is a `<time>`
-  row. Cancel appears only in cancellable states. No optimistic UI.
+  row. Cancel appears only in cancellable states. No optimistic UI. The card re-reads on each
+  `request` signal and, as the fallback, polls every 30 s on a visible tab (tested).
 - **Notifications (E4):** claimed, dispatched, refused, deferred, stalled; and on the orchestrator
   host "fleet-v2 web request queued (data): <kind> <target id>", ids and kinds only, no imperative.
 
@@ -342,11 +376,32 @@ client content, which `AGENTS.md` forbids printing (F13).
 | Source | Today | v1 |
 |---|---|---|
 | Attempt journal | Stored, no route | Tail route over the journal |
-| Lane session events | No event read; runner `inspectSession` returns status only | New consumer-side `LaneSessionEventPort` in work-execution: `readEvents({ attemptId, after }) → { events, cursor } \| unavailable`, with an opencode-session adapter and an agy file-tail adapter (over the files `bin/agy-run` writes) |
+| Lane session events | No event read; runner `inspectSession` returns status only | The `LaneSessionEvent` contract first (L0, below), then a consumer-side `LaneSessionEventPort` in work-execution: `readEvents({ attemptId, after }) → { events, cursor } \| unavailable`, with an opencode-session adapter and an agy file-tail adapter (over the files `bin/agy-run` writes) |
 | Gate and review output | Read after exit (last 4000 chars; review `rawOutput` last 20000) | Shown as started / ended (exit n) plus the existing summaries; streaming needs a streaming spawn with a bounded ring, later |
 | Conductor journal | Planned (K1b) | Per-run journal tail after K1b |
 | Orchestrator activity | None (T2a's `orchestrator-update` planned) | Claims and `PostToolUse` hook summaries (tool name, duration, exit; never arguments), heartbeat age |
 | Change feed | In-process | Stays signals only; the tail never rides on it |
+
+**The event contract (L0).** Defined before any adapter (`AGENTS.md`: refine typed contracts
+before implementing a station), `schemaVersion: 1`:
+
+```ts
+type LaneSessionEvent = {
+  schemaVersion: 1;
+  source: { attemptId: string; kind: 'opencode' | 'agy' };
+  seq: number;                 // strictly increasing per source
+  at: string;                  // ISO time
+  kind: 'tool' | 'step' | 'status' | 'text' | 'gap' | 'ended' | 'unavailable';
+  summary: { tool?: string; path?: string; bytes?: number; exit?: number; elapsedMs?: number; model?: string };
+  text?: string;               // only when policy.liveTail.content is 'full'
+  redaction: 'none' | { withheld: true; pattern: string };  // pattern name only, never the value
+};
+```
+
+The cursor is `<source>:<seq>`. Events from one source are delivered in `seq` order; a missing
+range is reported as one `gap` event, never silently skipped; `ended` and `unavailable` are the
+last events of a source until it resumes. L1 and L2 implement against this type; L3 and the web
+consume the same shape.
 
 **Content policy (F13).** `policy.liveTail.content` defaults to `summaries`: step index, tool name,
 path, byte counts, elapsed time, exit codes, model and seat, runner status lines. `full` is an
@@ -401,16 +456,17 @@ different packages and no shared file. The shared files here are `apps/web/src/l
 file. Within each step the `apps/web` lanes run in the order given by their arrows and "After"
 column, one after another; they run beside API, domain, security and conductor lanes. Lanes marked
 **manifest** edit `.architecture/manifest.yaml` and run one at a time in this order: A-J → O1a →
-O1b → O2a → O2b → L1 → O3 → O2c → A-R → A-C → O9 → A-WO → A-K → A-S, each rebased on the last.
+O1b → O2a → O2b → L0 → L1 → O3 → O2c → A-R → A-C → O9 → A-WO → A-K → A-S, each rebased on the last.
 `composition.ts` lanes (A-J, O3, L3, E3b, L9, A-R, A-C, L8, A-WO, A-K, A-S) likewise run one at a
-time. The work-execution lanes here (A-J, L1, L2, A-R, A-C, O9, A-WO) also queue behind the
+time. The work-execution lanes here (A-J, L0, L1, L2, A-R, A-C, O9, A-WO) also queue behind the
 conductor's own work-execution lanes.
 
 | Lane | Scope | Package / shared files | Tier | After |
 |---|---|---|---|---|
 | UI0 | This plan and the owner's decisions | docs | 0 | — |
 | UI-A | Amend the orchestrator plan: `operate`, `orchestrate` and `tail` scopes in T3a; Q4/T7 read half ahead of T6; the D2 interim for E3b | docs | 0 | UI0 (D2, D3) |
-| **Step 1. Read the real attempt (parallel now: W0 ‖ A-J ‖ L1b ‖ UI-A; then O1a after A-J)** | | | | |
+| UI-B | Amend the conductor plan: the run-stop outcome mapping (§3.3), park reason `stop-unconfirmed`, `ResumeLaneRun` refuses `run-stopped` with tests for it and for one-way-door parks | docs | 0 | UI0; before K1 merges, or a K1 follow-up |
+| **Step 1. Read the real attempt (parallel now: W0 ‖ A-J ‖ L1b ‖ UI-A ‖ UI-B; then O1a after A-J)** | | | | |
 | W0 | Split `api-client.ts` into per-resource readers; no behaviour change | apps/web, **`api-client.ts`** | 1 | — |
 | A-J | `GET /v1/attempts/:id/journal` over `listJournalEntriesForAttempt`; no legality block | work-execution (application), apps/api, **`composition.ts`, manifest** | 1 | — |
 | L1b | `policy.liveTail` (`summaries` default, `full` opt-in) | installation | 2 | S1d |
@@ -418,8 +474,9 @@ conductor's own work-execution lanes.
 | W1a | Live `/attempt`: inspect read, `unknown` outcome, recorded runner facts, usage, artifacts; `map-attempt.ts` keeps usage/runner/artifacts; rows open the page; shorter visible-tab poll | apps/web | 2 | W0 |
 | W1b | Work-order sidebar (`GET /v1/work-orders/:id`), journal panel, P12 sample labels and "sample digest" | apps/web | 2 | W1a, A-J |
 | **Step 2. Domain lanes (parallel across packages); web: Q4 → W8a → W10** | | | | |
-| O1b → O2a → O2b | `OrchestratorRequest` aggregate (closed payload, `reasonKind`, lifecycle); register/heartbeat/retire/list with `orchestrators.json`; create/claim/renew/complete/refuse/defer/cancel/expire and the dispatcher-host gate, with only `dispatch-attempt` enabled; the claim use case refuses `dispatch-attempt` with `reasonKind: policy` while `policy.conductor.enabled` is on and the installation has not opted in (D7 enforced here, not in O9) | operator-coordination, **manifest** | 2 | O1a |
-| L1 → L2 | `LaneSessionEventPort` and the opencode adapter, summaries, `full` behind policy; then the agy file-tail adapter | work-execution (infra), **manifest** (L1) | 2 | A-J (same package), L1b, O2b (manifest); L2 must finish before the next work-execution lane (A-R) |
+| O1b → O2a → O2b | `OrchestratorRequest` aggregate (closed payload, `reasonKind`, lifecycle); register/heartbeat/retire/list with `orchestrators.json`; create/claim/renew/complete/refuse/defer/cancel/expire and the dispatcher-host gate, with only `dispatch-attempt` enabled; the claim use case refuses `dispatch-attempt` with `reasonKind: policy` while `policy.conductor.enabled` is on and the installation has not opted in (D7 enforced here, not in O9); the claim fence on every claim mutation; fault-injection tests (crash after the action before the journal result; a stale claimant after lease expiry) | operator-coordination, **manifest** | 2 | O1a |
+| L0 | `LaneSessionEvent` contract only: type, `schemaVersion: 1`, cursor, ordering and gap semantics, tests of the invariants | work-execution (domain), **manifest** | 2 | A-J (same package), O2b (manifest) |
+| L1 → L2 | `LaneSessionEventPort` and the opencode adapter against L0's type, summaries, `full` behind policy; then the agy file-tail adapter | work-execution (infra), **manifest** (L1) | 2 | L0, L1b; L2 must finish before the next work-execution lane (A-R) |
 | Q4 | Questions view, badge, attention card from `/v1/attention` | apps/web | 2 | W1b |
 | W8a | Work-order timeline: attempts by `workOrderId`/`priorAttemptId`, journal, head evidence; `reviewTally` and `kind` when served | apps/web | 2 | Q4; full fidelity after R2, RW1 |
 | W10 | Usage and seat/model chips per row, sums per work order, `source` and estimate labels | apps/web | 2 | W8a |
@@ -446,9 +503,9 @@ conductor's own work-execution lanes.
 | Q5 | Question answers, one-way answers show bytes to sign | apps/web, packages/ui | 2 | O8 |
 | W8b | Finding dispositions from the timeline | apps/web | 2 | Q5, W8a |
 | **Step 7. Conductor; serial A-R → A-C → O9; web: W7a → W7b** | | | | |
-| O2c | Journal-key reconciliation (`request/<requestId>`); enables `start-lane-run`, `prepare-fix`, `request-review`, `resume-run`; `start-lane-run` is claimable only by `cliKind: conductor` from the start (D7) | operator-coordination, **manifest** | 2 | O2b, K1b, O3 (manifest) |
+| O2c | Journal-key reconciliation (`request/<requestId>`); enables `start-lane-run`, `prepare-fix`, `request-review`, `resume-run`; `start-lane-run` is claimable only by `cliKind: conductor` from the start (D7); intent before the action, result after; the same fault-injection tests under K1b | operator-coordination, **manifest** | 2 | O2b, K1b, O3 (manifest) |
 | A-R | `GET /v1/runs`, `/v1/runs/:id`, run journal by key | work-execution, apps/api, **`composition.ts`, manifest** | 2 | K3, O2c (manifest), L2 (work-execution) |
-| A-C | Direct run routes: halt marker through the CLI's adapter; run stop as a keyed run-journal entry `<runId>/stop@web` with `expectedRevision`; attempt stop refuses run-owned attempts | work-execution, apps/api, **`composition.ts`, manifest** | 2 | A-R, K7, T3a |
+| A-C | Direct run routes: halt marker through the CLI's adapter; run stop as a keyed run-journal entry `<runId>/stop@web` with `expectedRevision`; attempt stop refuses run-owned attempts; run reads report the stop outcome mapping (§3.3), including `stop-unconfirmed` parks | work-execution, apps/api, **`composition.ts`, manifest** | 2 | A-R, K7, T3a |
 | O9 | The conductor driver registers and claims `start-lane-run` (the claim rules already exist from O2b and O2c) | work-execution, apps/cli, **`index.ts`, manifest** | 2 | A-C, O5, K3, K7, O2c |
 | W7a | Run board read, dry-run and shadow entries distinct | apps/web | 2 | A-R, K7, W8b |
 | W7b | Halt and run-stop controls; resume and start as requests (O8's card) | apps/web | 2 | W7a, A-C, O8 |
@@ -499,6 +556,8 @@ Every live view uses the same vocabulary:
   warned, with the `attach` command.
 - **Tail:** not started, running, silent (runner says active), silent (runner unreachable, last
   known), ended, unavailable, gap, line withheld (§3.7).
+- **Run:** the conductor's states, with `parked` (reason shown, including `stop-unconfirmed`)
+  distinct from the terminal `merged` and `stopped`.
 - **Request:** queued, claimed, dispatched, refused, deferred, expired, cancelled,
   cancel-requested, stalled (§3.6).
 - **Not routed yet:** name the CLI command.
@@ -566,6 +625,22 @@ F1–F13 applied.**
 - F13 (major): lane output is untrusted; summaries by default, `full` opt-in and never persisted,
   plain-text rendering, secret-pattern withholding, bounded queues, a `tail` scope (§3.7, D10, D11).
 
+**CodeRabbit (2026-10-27): 4 majors, 2 minors, all applied.**
+1. Minor: the run board had no place for `stopped`. An `ended` group holds `merged` and `stopped`,
+   each by its word, distinct from `parked` (§3.3).
+2. Major: the run-stop outcome was undefined. `StopAttempt`'s outcomes are mapped; `stopped` only
+   on a confirmed stop, `stop-unconfirmed` park otherwise, slots never released unconfirmed (§3.3,
+   UI-B).
+3. Major: `ResumeLaneRun` refuses a `stopped` run with `run-stopped`, beside one-way-door parks,
+   with a test for each (§3.3, UI-B).
+4. Major: the claim fence was undefined. Every claim mutation checks revision, fence and lease; an
+   expired lease re-queues with a new fence; intent before the action, result after; fault-injection
+   tests in O2b and O2c (§3.6).
+5. Minor: every request transition emits a `request` signal; the card falls back to a 30 s
+   visible-tab poll, tested (§3.6).
+6. Major: the `LaneSessionEvent` contract is defined first, in a new lane L0 before L1, on the
+   manifest order (§3.7, §4).
+
 **Grok 4.7, re-review of rev 3 (2026-10-27):** all seven rev-2 findings RESOLVED; two new majors, applied in rev 3.1: (1) the conductor-enabled refusal of `dispatch-attempt` and the conductor-only claim of `start-lane-run` move into O2b and O2c, so no window exists before O9; (2) A-R waits for L2 (work-execution), and L9 waits for T6 (`security.ts`).
 
 **Grok 4.7 (2026-10-27): 6 majors, 1 minor, all applied.**
@@ -592,6 +667,8 @@ F1–F13 applied.**
 - **Scope names** `operate`, `orchestrate` and `tail` become stored token data once T3a ships.
 - **The request record, its kinds and `reasonKind` values, and the `orchestrators.json` layout**
   become stored data and contracts for the MCP tools; version them from the first commit.
+- **The `LaneSessionEvent` contract (`schemaVersion: 1`) and the park reason `stop-unconfirmed`**
+  become stored or wire data; a change needs a new schema version.
 - **The run read model, the journal route and the tail line shape** become contracts the web and
   the TUI depend on.
 - **Tail content in `full` mode** reaches a browser and cannot be recalled once seen. It is an

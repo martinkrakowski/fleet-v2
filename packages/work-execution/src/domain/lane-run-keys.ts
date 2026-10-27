@@ -1,6 +1,6 @@
 /**
  * The idempotency keys of plan §3.2 and §3.8: step keys
- * `<runId>/r<round>/<step>/<seatIndex>[@<head12>][/retry<n>]`, the control keys
+ * `<runId>/r<round>/<step>/<seatIndex>[/a<n>][@<head12>][/retry<n>]`, the control keys
  * `<runId>/stop@web` and `<runId>/park/<n>/resume@web`, and the request channel's
  * `request/<requestId>`. Pure; builders and the parser never throw and never echo
  * input. `parseLaneRunKey(buildX(…))` always returns the same parts, and building a
@@ -10,8 +10,10 @@
 
 import {
   LANE_RUN_ID_PATTERN,
+  LANE_RUN_KEY_ATTEMPT_RULE,
   LANE_RUN_KEY_HEAD_RULE,
   LANE_RUN_KEY_STEPS,
+  LANE_RUN_MAX_ATTEMPTS,
   LANE_RUN_ONE_WAY_STEPS,
 } from './lane-run-records.js';
 import type { LaneRunKeyStep } from './lane-run-records.js';
@@ -26,16 +28,18 @@ const HEAD12_PATTERN = /^[0-9a-f]{12}$/;
 const COMMIT_HEX_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const ROUND_SEGMENT_PATTERN = /^r[0-2]$/;
 const SEAT_INDEX_TEXT_PATTERN = /^(?:0|[1-9][0-9]{0,2})$/;
+const ATTEMPT_SEGMENT_PATTERN = /^a[1-9][0-9]*$/;
 const RETRY_SEGMENT_PATTERN = /^retry[1-9]$/;
 const PARK_ORDINAL_TEXT_PATTERN = /^[1-9][0-9]*$/;
 
 export interface LaneRunStepKeyParts {
   readonly runId: string;
-  readonly round: number;          // 0..2
+  readonly round: number;                 // 0..2
   readonly step: LaneRunKeyStep;
-  readonly seatIndex: number;      // 0..999, written without leading zeros
-  readonly head12: string | null;  // 12 lowercase hex; per LANE_RUN_KEY_HEAD_RULE
-  readonly retry: number | null;   // 1..9; only for steps outside LANE_RUN_ONE_WAY_STEPS
+  readonly seatIndex: number;             // 0..999, written without leading zeros
+  readonly attemptOrdinal: number | null; // 1..32; per LANE_RUN_KEY_ATTEMPT_RULE
+  readonly head12: string | null;         // 12 lowercase hex; per LANE_RUN_KEY_HEAD_RULE
+  readonly retry: number | null;          // 1..9; only for steps outside LANE_RUN_ONE_WAY_STEPS
 }
 
 export type ParsedLaneRunKey =
@@ -57,7 +61,7 @@ export function head12Of(commit: unknown): string | null {
 }
 
 function stepKeyError(parts: LaneRunStepKeyParts): string | null {
-  const { runId, round, step, seatIndex, head12, retry } = parts;
+  const { runId, round, step, seatIndex, attemptOrdinal, head12, retry } = parts;
   if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
     return 'LaneRun key runId must be run- followed by a ULID';
   }
@@ -70,7 +74,18 @@ function stepKeyError(parts: LaneRunStepKeyParts): string | null {
   if (!Number.isInteger(seatIndex) || seatIndex < 0 || seatIndex > LANE_RUN_MAX_SEAT_INDEX) {
     return 'LaneRun key seatIndex must be an integer from 0 to 999';
   }
-  if (head12 !== null && !HEAD12_PATTERN.test(head12)) {
+  if (
+    attemptOrdinal !== null &&
+    (!Number.isInteger(attemptOrdinal) || attemptOrdinal < 1 || attemptOrdinal > LANE_RUN_MAX_ATTEMPTS)
+  ) {
+    return 'LaneRun key attemptOrdinal must be an integer from 1 to 32';
+  }
+  const attemptRule = LANE_RUN_KEY_ATTEMPT_RULE[step];
+  const hasAttempt = attemptOrdinal !== null;
+  if ((attemptRule === 'absent' && hasAttempt) || (attemptRule === 'required' && !hasAttempt)) {
+    return 'LaneRun key attemptOrdinal does not match its step';
+  }
+  if (head12 !== null && (typeof head12 !== 'string' || !HEAD12_PATTERN.test(head12))) {
     return 'LaneRun key head must be 12 lowercase hex characters';
   }
   const headRule = LANE_RUN_KEY_HEAD_RULE[step];
@@ -111,6 +126,7 @@ export function buildLaneRunStepKey(parts: LaneRunStepKeyParts): LaneRunKeyResul
       round: read('round'),
       step: read('step'),
       seatIndex: read('seatIndex'),
+      attemptOrdinal: read('attemptOrdinal'),
       head12: read('head12'),
       retry: read('retry'),
     };
@@ -125,9 +141,13 @@ export function buildLaneRunStepKey(parts: LaneRunStepKeyParts): LaneRunKeyResul
     const round = snapshot.round as number;
     const step = snapshot.step as LaneRunKeyStep;
     const seatIndex = snapshot.seatIndex as number;
+    const attemptOrdinal = snapshot.attemptOrdinal as number | null;
     const head12 = snapshot.head12 as string | null;
     const retry = snapshot.retry as number | null;
     let key = runId + '/r' + round + '/' + step + '/' + seatIndex;
+    if (attemptOrdinal !== null) {
+      key += '/a' + attemptOrdinal;
+    }
     if (head12 !== null) {
       key += '@' + head12;
     }
@@ -175,26 +195,44 @@ function parseStepKeySegments(segments: string[], key: string): ParsedLaneRunKey
   if (!LANE_RUN_KEY_STEPS.includes(step)) {
     return null;
   }
-  const tail = segments[3];
-  const atIndex = tail.indexOf('@');
-  const seatText = atIndex === -1 ? tail : tail.slice(0, atIndex);
-  const head12 = atIndex === -1 ? null : tail.slice(atIndex + 1);
-  if (!SEAT_INDEX_TEXT_PATTERN.test(seatText)) {
-    return null;
-  }
-  const seatIndex = Number(seatText);
+  let seatIndex: number;
+  let attemptOrdinal: number | null = null;
+  let head12: string | null = null;
   let retry: number | null = null;
-  if (segments.length === 5) {
-    if (!RETRY_SEGMENT_PATTERN.test(segments[4])) {
+  if (LANE_RUN_KEY_ATTEMPT_RULE[step] === 'required') {
+    if (segments.length !== 5 || !SEAT_INDEX_TEXT_PATTERN.test(segments[3])) {
       return null;
     }
-    retry = Number(segments[4].slice(5));
+    seatIndex = Number(segments[3]);
+    const tail = segments[4];
+    const atIndex = tail.indexOf('@');
+    const attemptText = atIndex === -1 ? tail : tail.slice(0, atIndex);
+    head12 = atIndex === -1 ? null : tail.slice(atIndex + 1);
+    if (!ATTEMPT_SEGMENT_PATTERN.test(attemptText)) {
+      return null;
+    }
+    attemptOrdinal = Number(attemptText.slice(1));
+  } else {
+    const tail = segments[3];
+    const atIndex = tail.indexOf('@');
+    const seatText = atIndex === -1 ? tail : tail.slice(0, atIndex);
+    head12 = atIndex === -1 ? null : tail.slice(atIndex + 1);
+    if (!SEAT_INDEX_TEXT_PATTERN.test(seatText)) {
+      return null;
+    }
+    seatIndex = Number(seatText);
+    if (segments.length === 5) {
+      if (!RETRY_SEGMENT_PATTERN.test(segments[4])) {
+        return null;
+      }
+      retry = Number(segments[4].slice(5));
+    }
   }
-  const built = buildLaneRunStepKey({ runId: segments[0], round, step, seatIndex, head12, retry });
+  const built = buildLaneRunStepKey({ runId: segments[0], round, step, seatIndex, attemptOrdinal, head12, retry });
   if (!built.ok || built.key !== key) {
     return null;
   }
-  return { kind: 'step', runId: segments[0], round, step, seatIndex, head12, retry };
+  return { kind: 'step', runId: segments[0], round, step, seatIndex, attemptOrdinal, head12, retry };
 }
 
 export function parseLaneRunKey(key: unknown): ParsedLaneRunKey | null {

@@ -41,8 +41,15 @@ export const LANE_RUN_ONE_WAY_STEPS = ['prepare', 'dispatch', 'open-pr', 'push',
 export const LANE_RUN_KEY_HEAD_RULE = {
   prepare: 'absent', dispatch: 'absent', stop: 'absent', collect: 'absent',
   gate: 'required', 'brief-check': 'required', 'code-review': 'required', 'pre-merge': 'required',
-  accept: 'required', 'open-pr': 'required', push: 'required', merge: 'required', park: 'optional',
-} as const satisfies Record<LaneRunKeyStep, 'required' | 'absent' | 'optional'>;
+  accept: 'required', 'open-pr': 'required', push: 'required', merge: 'required', park: 'absent',
+} as const satisfies Record<LaneRunKeyStep, 'required' | 'absent'>;
+
+/** Whether a step key carries `/a<n>`. */
+export const LANE_RUN_KEY_ATTEMPT_RULE = {
+  prepare: 'required', dispatch: 'required', stop: 'absent', collect: 'absent',
+  gate: 'absent', 'brief-check': 'absent', 'code-review': 'absent', 'pre-merge': 'absent',
+  accept: 'absent', 'open-pr': 'absent', push: 'absent', merge: 'absent', park: 'absent',
+} as const satisfies Record<LaneRunKeyStep, 'required' | 'absent'>;
 
 /** Why a StopAttempt for a run was refused (plan §3.8 "refused: its reason carrying the refusal's typed reason"). */
 export const RUN_STOP_REFUSAL_KINDS = [

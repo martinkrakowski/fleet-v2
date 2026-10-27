@@ -10,7 +10,7 @@
  */
 
 import { containsSecretShape } from '@fleet/shared';
-import { LANE_RUN_MAX_SEAT_INDEX } from '../lane-run-keys.js';
+import { LANE_RUN_MAX_PARK_ORDINAL, LANE_RUN_MAX_SEAT_INDEX } from '../lane-run-keys.js';
 import {
   LANE_RUN_ID_PATTERN,
   LANE_RUN_KEY_STEPS,
@@ -41,6 +41,7 @@ export type LaneRunResult =
 
 const ID_MAX_BYTES = 256;
 const SEAT_PLAN_REF_PATTERN = /^[0-9a-f]{64}$/;
+const LEASE_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 
 const RECORD_KEYS: readonly string[] = [
   'version',
@@ -142,7 +143,11 @@ export class LaneRun {
       return invalid('LaneRun prNumber must be null or a positive integer');
     }
     const parkCount = recordInput.parkCount;
-    if (!Number.isSafeInteger(parkCount) || (parkCount as number) < 0) {
+    if (
+      !Number.isSafeInteger(parkCount) ||
+      (parkCount as number) < 0 ||
+      (parkCount as number) > LANE_RUN_MAX_PARK_ORDINAL
+    ) {
       return invalid('LaneRun parkCount must be a non-negative integer');
     }
 
@@ -417,7 +422,11 @@ function leaseSnapshotError(snapshot: Record<string, unknown> | null): string | 
   if (!Number.isSafeInteger(snapshot.fence) || (snapshot.fence as number) < 1) {
     return 'LaneRun lease must be null or { holderId, fence, leaseUntilIso }';
   }
-  if (typeof snapshot.leaseUntilIso !== 'string' || Number.isNaN(Date.parse(snapshot.leaseUntilIso as string))) {
+  if (
+    typeof snapshot.leaseUntilIso !== 'string' ||
+    !LEASE_ISO_PATTERN.test(snapshot.leaseUntilIso) ||
+    Number.isNaN(Date.parse(snapshot.leaseUntilIso))
+  ) {
     return 'LaneRun lease must be null or { holderId, fence, leaseUntilIso }';
   }
   return null;

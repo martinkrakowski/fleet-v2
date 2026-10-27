@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { LaneRun } from '../entities/LaneRun.js';
+import { LANE_RUN_MAX_PARK_ORDINAL } from '../lane-run-keys.js';
 import { LANE_RUN_PARK_REASONS } from '../lane-run-records.js';
 import {
   LANE_RUN_RESUMABLE_STATES,
@@ -68,12 +69,30 @@ describe('LaneRun.create', () => {
       leaseUntilIso: '2026-10-27T10:00:00.000Z',
     });
 
+    const withOffset = LaneRun.create({
+      ...VALID,
+      lease: { ...VALID_LEASE, leaseUntilIso: '2026-10-27T10:00:00+02:00' },
+    });
+    expect(withOffset.success).toBe(true);
+    if (!withOffset.success) return;
+    expect(withOffset.value.toRecord().lease?.leaseUntilIso).toBe('2026-10-27T08:00:00.000Z');
+
     const first = withLease.value.toRecord();
     const second = withLease.value.toRecord();
     (first.attemptIds as string[]).push('attempt-example-2');
     (first.cursors as Record<string, number | null>)['first-pass'] = 7;
     expect(second.attemptIds).toEqual(['attempt-example-1']);
     expect(second.cursors).toEqual({ 'first-pass': 0, fix: null, review: null });
+  });
+
+  it.each([
+    [{ ...VALID, parkCount: LANE_RUN_MAX_PARK_ORDINAL }],
+    [{ ...VALID, parked: { ...VALID_PARKED, questionId: 'question-example-1' }, parkCount: 1 }],
+  ])('accepts valid boundary record %j', (input) => {
+    const result = LaneRun.create(input);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.value.toRecord()).toEqual(input);
   });
 
   it.each([
@@ -94,7 +113,15 @@ describe('LaneRun.create', () => {
       'LaneRun cursors must be { first-pass, fix, review }, each null or a seat index',
     ],
     [
+      { ...VALID, cursors: { 'first-pass': 0, fix: null, review: null, extra: 0 } },
+      'LaneRun cursors must be { first-pass, fix, review }, each null or a seat index',
+    ],
+    [
       { ...VALID, cursors: { 'first-pass': -1, fix: null, review: null } },
+      'LaneRun cursors must be { first-pass, fix, review }, each null or a seat index',
+    ],
+    [
+      { ...VALID, cursors: { 'first-pass': 1000, fix: null, review: null } },
       'LaneRun cursors must be { first-pass, fix, review }, each null or a seat index',
     ],
     [{ ...VALID, round: 3 }, 'LaneRun round must be 0, 1 or 2'],
@@ -106,6 +133,7 @@ describe('LaneRun.create', () => {
     [{ ...VALID, round: 2, attemptIds: ['attempt-1', 'attempt-2'] }, 'LaneRun round exceeds its attempts'],
     [{ ...VALID, prNumber: 0 }, 'LaneRun prNumber must be null or a positive integer'],
     [{ ...VALID, parkCount: -1 }, 'LaneRun parkCount must be a non-negative integer'],
+    [{ ...VALID, parkCount: LANE_RUN_MAX_PARK_ORDINAL + 1 }, 'LaneRun parkCount must be a non-negative integer'],
     [
       { ...VALID, parked: { ...VALID_PARKED, extra: true }, parkCount: 1 },
       'LaneRun parked must be null or { reason, qualifier, parkedFrom, questionId }',
@@ -141,6 +169,10 @@ describe('LaneRun.create', () => {
     [{ ...VALID, parked: VALID_PARKED, parkCount: 0 }, 'LaneRun parkCount must count the current park'],
     [
       { ...VALID, lease: { holderId: 'lease-example-1', fence: 0, leaseUntilIso: '2026-10-27T10:00:00Z' } },
+      'LaneRun lease must be null or { holderId, fence, leaseUntilIso }',
+    ],
+    [
+      { ...VALID, lease: { holderId: 'lease-example-1', fence: 1, leaseUntilIso: '2026-10-27T10:00:00' } },
       'LaneRun lease must be null or { holderId, fence, leaseUntilIso }',
     ],
     [{ ...VALID, revision: 0 }, 'LaneRun revision must be a positive integer'],

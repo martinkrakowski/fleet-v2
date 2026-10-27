@@ -16,9 +16,9 @@
 Lanes, gates and staging all run on solstice. On 2026-10-26 it hung twice, silently, under heavy reads on three newly fitted disks. The likely cause is power: one of those disks shares a power cable with the root SSD. No lane, gate or deploy runs on solstice until both hold:
 
 1. The three disks are unmounted and out of solstice's fstab, so nothing on the host can load them.
-2. One of these is true:
-   - the cabling is fixed and a read test of all three disks at once survives;
-   - or the disks stay idle and unmounted while lanes run.
+2. Then one of these sets how many lanes may run:
+   - **One lane at a time** while the disks are only unmounted. An unmounted disk still draws power, and spins up on any access, so the shared power path is not proven safe.
+   - **Parallel lanes (at most two)** only when the disks are powered off or disconnected, or after the cabling is fixed and a read test of all three disks at once survives.
 
 Lanes never touch those disks. They use the NVMe worktrees and the root disk.
 
@@ -32,7 +32,7 @@ Each lane uses the standard pipeline:
 5. the Fable pre-merge pass on Tier 2;
 6. CI.
 
-At most two lanes run at once, and never two in `evidence-and-acceptance` at the same time.
+At most two lanes run at once, and only once §1 allows it; never two in `evidence-and-acceptance` at the same time.
 
 | # | Lane | Plan | Tier | Why here |
 |---|---|---|---|---|
@@ -72,4 +72,4 @@ The staging deploy runs after the host health check and before the first lane. I
 
 ## Challenge this
 
-Running E3a-2 in parallel with the evidence lanes doubles the load on a host that has just hung twice. If the host precondition is met only by "the disks stay idle", one lane at a time is the safer start until a day of lanes has passed without incident.
+§1 makes one lane at a time mandatory until the disks are isolated from power or the cabling is proven. Is a single day of incident-free lanes after that enough before running two at once?

@@ -135,7 +135,7 @@ Drift becomes visible instead of discovered.
 |---|---|---|
 | D1 | Where does the spec live at first? | **Inside hexagen-monaco's `docs/kernel/`**, split out only when a third consumer appears |
 | D2 | Who owns which schemas? | **hexagen: structure** (identity, findings, slices, grants). **fleet-v2: process** (receipts, work orders, policy) |
-| D3 | Run the Phase 1 experiment? | **Not on E3a-2** (decided 2026-10-26): E3a-2 is already specified as a normal lane and there is no manifest-delta tooling yet. The sample is E4 or a later manifest-heavy lane, once the owner accepts Phase 1. Original recommendation: **Yes**, on fleet-v2's own next manifest-heavy lane (E3a-2 adds a port and an adapter) |
+| D3 | Run the Phase 1 experiment? | **Not on E3a-2** (decided 2026-10-26): E3a-2 is already specified as a normal lane and there is no manifest-delta tooling yet. Once the owner accepts Phase 1, the sample is E4 only if its plan documents a manifest delta; otherwise it is the first later lane whose plan names one. Original recommendation: **Yes**, on fleet-v2's own next manifest-heavy lane (E3a-2 adds a port and an adapter) |
 | D4 | Acceptance policy as data (P4)? | **Yes, after Phase 3.** Until then the pipeline rules stay in CLAUDE.md and the scripts |
 | D5 | A canary repository for the release train? | **Deferred** (2026-10-26) until Phase 1 shows value. Original recommendation: a minimal generated project with every contract surface, under the owner's account |
 

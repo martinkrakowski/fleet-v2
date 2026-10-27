@@ -2,12 +2,16 @@
 /**
  * Covers the plain read of one attempt's action journal: listed entries in
  * recorded order, known attempt with no entries, unknown attempt, blank id,
- * the unconfigured "Not implemented" throw, and the no-mutation guarantee.
+ * the unconfigured "Not implemented" throw, the no-mutation guarantee, and
+ * the detail withhold/truncate rules applied before entries leave.
  */
 
 import { describe, expect, it } from 'vitest';
 
-import { ListAttemptJournalUseCase } from '../ListAttemptJournalUseCase.use-case.js';
+import {
+  JOURNAL_DETAIL_MAX_CHARS,
+  ListAttemptJournalUseCase,
+} from '../ListAttemptJournalUseCase.use-case.js';
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import type {
   ExecutionJournalPort,
@@ -102,11 +106,26 @@ function makeAttemptRepo(attempts: readonly AttemptRecord[] = [att1]): AttemptRe
 class FakeExecutionJournal implements ExecutionJournalPort {
   listCalls = 0;
 
-  constructor(private readonly entries: readonly ActionJournalEntryRecord[]) {}
+  private readonly storedByAttempt: ReadonlyMap<string, readonly ActionJournalEntryRecord[]>;
 
+  constructor(entries: readonly ActionJournalEntryRecord[]) {
+    const grouped = new Map<string, ActionJournalEntryRecord[]>();
+    for (const entry of entries) {
+      const group = grouped.get(entry.attemptId);
+      if (group === undefined) {
+        grouped.set(entry.attemptId, [entry]);
+      } else {
+        group.push(entry);
+      }
+    }
+    this.storedByAttempt = grouped;
+  }
+
+  // Same stored array reference on every call; the copy test fails if the use
+  // case returns it without copying.
   async listJournalEntriesForAttempt(attemptId: string): Promise<readonly ActionJournalEntryRecord[]> {
     this.listCalls += 1;
-    return this.entries.filter((entry) => entry.attemptId === attemptId);
+    return this.storedByAttempt.get(attemptId) ?? [];
   }
 
   async listActiveReservations(): Promise<readonly CapacityReservationRecord[]> {
@@ -197,5 +216,53 @@ describe('ListAttemptJournalUseCase', () => {
       attemptId: 'att-1',
       entries: [entryJ1, entryJ2],
     });
+  });
+
+  it('withholds a secret-shaped detail and never returns the matched text', async () => {
+    const secret = 'ghp_' + 'x'.repeat(30);
+    const entry: ActionJournalEntryRecord = {
+      ...entryJ1,
+      id: 'j-secret',
+      detail: 'runner error: ' + secret,
+    };
+    const { useCase } = makeUseCase({ entries: [entry] });
+    const result = await useCase.listAttemptJournal({ attemptId: 'att-1' });
+    if (result.outcome !== 'listed') {
+      throw new Error(`expected listed, got ${result.outcome}`);
+    }
+    const [first] = result.entries;
+    expect(first?.detail).toBe('[detail withheld: secret-shaped (github-token)]');
+    expect(JSON.stringify(result)).not.toContain('ghp_');
+  });
+
+  it('truncates a detail longer than 2000 characters', async () => {
+    const longDetail = 'lorem ipsum dolor sit amet '.repeat(100).slice(0, 2500);
+    const entry: ActionJournalEntryRecord = {
+      ...entryJ1,
+      id: 'j-long',
+      detail: longDetail,
+    };
+    const { useCase } = makeUseCase({ entries: [entry] });
+    const result = await useCase.listAttemptJournal({ attemptId: 'att-1' });
+    if (result.outcome !== 'listed') {
+      throw new Error(`expected listed, got ${result.outcome}`);
+    }
+    const [first] = result.entries;
+    expect(first?.detail).toBe(longDetail.slice(0, JOURNAL_DETAIL_MAX_CHARS) + ' [truncated]');
+  });
+
+  it('keeps a normal detail unchanged', async () => {
+    const entry: ActionJournalEntryRecord = {
+      ...entryJ1,
+      id: 'j-normal',
+      detail: 'dispatch recorded for wo-1',
+    };
+    const { useCase } = makeUseCase({ entries: [entry] });
+    const result = await useCase.listAttemptJournal({ attemptId: 'att-1' });
+    if (result.outcome !== 'listed') {
+      throw new Error(`expected listed, got ${result.outcome}`);
+    }
+    const [first] = result.entries;
+    expect(first?.detail).toBe('dispatch recorded for wo-1');
   });
 });

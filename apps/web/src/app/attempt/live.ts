@@ -14,7 +14,7 @@ import {
 // Declared here, not imported from use-auto-refresh.ts: that module is "use client", and a server
 // module importing from it gets a client-reference proxy instead of the string (Fable, W1a-1).
 // It must equal the transport's not-configured fallback reason in lib/api/transport.ts.
-const NOT_CONFIGURED_REASON = "api boundary is not configured";
+export const NOT_CONFIGURED_REASON = "api boundary is not configured";
 import { parseAttemptListEnvelope } from "../lanes/map-attempt";
 import { parseInspectEnvelope, type AttemptDetail } from "./map-inspect";
 

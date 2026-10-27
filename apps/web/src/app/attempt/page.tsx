@@ -1,3 +1,4 @@
+import { loadAttemptContext } from "./live-context";
 import { loadAttemptPage } from "./live";
 import AttemptPage from "./attempt-client";
 
@@ -10,5 +11,7 @@ export default async function Page({
 }) {
   const params = await searchParams;
   const id = typeof params.id === "string" ? params.id : "";
-  return <AttemptPage data={await loadAttemptPage(id)} />;
+  const data = await loadAttemptPage(id);
+  const context = await loadAttemptContext(data);
+  return <AttemptPage data={data} context={context} />;
 }

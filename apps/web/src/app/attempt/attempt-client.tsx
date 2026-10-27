@@ -5,12 +5,7 @@ import Link from "next/link";
 import {
   Badge,
   Banner,
-  Card,
-  CardBody,
-  CardHeader,
   EmptyState,
-  KeyValueList,
-  KeyValueRow,
   RouteChip,
   type BadgeVariant,
 } from "@fleet/ui";
@@ -22,6 +17,8 @@ import {
   summarize,
 } from "./fixture";
 import type { AttemptPageData } from "./live";
+import type { AttemptContext } from "./live-context";
+import { LiveWorkOrderCard } from "./components/live-work-order-card";
 import {
   ATTEMPT_REFRESH_MS,
   useAutoRefresh,
@@ -78,6 +75,7 @@ function routeLine(data: AttemptPageData): ReactNode {
 
 function renderSidebar(
   data: AttemptPageData,
+  context: AttemptContext,
   onCopied: (message: string) => void,
 ): ReactNode {
   switch (data.view) {
@@ -101,24 +99,27 @@ function renderSidebar(
     case "found":
       return (
         <>
-          <Card>
-            <CardHeader title="Work order" />
-            <CardBody>
-              <KeyValueList>
-                <KeyValueRow term="work order" mono>
-                  {data.attempt.workOrderId}
-                </KeyValueRow>
-              </KeyValueList>
-              <p className={styles.muted}>
-                The work order's details are not read on this page yet.
-              </p>
-            </CardBody>
-          </Card>
+          <LiveWorkOrderCard
+            panel={context.workOrder}
+            attemptId={data.attemptId}
+            observedAtIso={data.observedAtIso}
+            reasonWhenNotRead="Work order not read on this page."
+          />
           <LiveOperationsCard hints={cliHints(data)} onCopied={onCopied} />
         </>
       );
     case "unknown":
-      return <LiveOperationsCard hints={cliHints(data)} onCopied={onCopied} />;
+      return (
+        <>
+          <LiveWorkOrderCard
+            panel={context.workOrder}
+            attemptId={data.attemptId}
+            observedAtIso={data.observedAtIso}
+            reasonWhenNotRead="Not read: the attempt record is unknown, so its work order is not known here. Not idle, not a pass."
+          />
+          <LiveOperationsCard hints={cliHints(data)} onCopied={onCopied} />
+        </>
+      );
     case "not-found":
       return <p className={styles.muted}>nothing to act on</p>;
     default:
@@ -227,7 +228,13 @@ function renderRecord(data: AttemptPageData): ReactNode {
   }
 }
 
-export default function AttemptPage({ data }: { data: AttemptPageData }) {
+export default function AttemptPage({
+  data,
+  context,
+}: {
+  data: AttemptPageData;
+  context: AttemptContext;
+}) {
   useAutoRefresh(data.source, data.fallbackReason, ATTEMPT_REFRESH_MS);
   const [copied, setCopied] = useState<string | null>(null);
   // A copy confirmation lasts until the next data update, so later state changes are announced.
@@ -243,7 +250,7 @@ export default function AttemptPage({ data }: { data: AttemptPageData }) {
         role="region"
         aria-label="Work order and operations"
       >
-        {renderSidebar(data, setCopied)}
+        {renderSidebar(data, context, setCopied)}
       </div>
 
       <section

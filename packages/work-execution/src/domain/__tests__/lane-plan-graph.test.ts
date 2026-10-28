@@ -5,6 +5,7 @@ import {
   formatLanePlanCycle,
 } from '../lane-plan-graph.js';
 import type { LanePlanGraphLane, LanePlanGraphPlan } from '../lane-plan-graph.js';
+import { LANE_PLAN_LIMITS } from '../lane-plan-records.js';
 import type { PlannedLaneRef } from '../lane-plan-records.js';
 
 function refFromText(text: string): PlannedLaneRef {
@@ -215,5 +216,104 @@ describe('findLanePlanCycle', () => {
     const before = structuredClone(input);
     findLanePlanCycle(input);
     expect(input).toEqual(before);
+  });
+
+  it('never fails open: a malformed lane or ref is skipped, the cycle is still found', () => {
+    const cyclic = plan('example-project', 'plan-1', [
+      lane('A', ['example-project/plan-1/B']),
+      lane('B', ['example-project/plan-1/A']),
+    ]);
+    const expected = [
+      { projectId: 'example-project', planId: 'plan-1', laneId: 'A' },
+      { projectId: 'example-project', planId: 'plan-1', laneId: 'B' },
+    ];
+    const afterNull = plan('example-project', 'plan-2', [
+      { laneId: 'Z', after: null } as unknown as LanePlanGraphLane,
+    ]);
+    expect(findLanePlanCycle([cyclic, afterNull])).toEqual(expected);
+
+    const afterWithNullRef = plan('example-project', 'plan-2', [
+      { laneId: 'Z', after: [null] } as unknown as LanePlanGraphLane,
+    ]);
+    expect(findLanePlanCycle([cyclic, afterWithNullRef])).toEqual(expected);
+
+    const afterNotAnArray = plan('example-project', 'plan-2', [
+      { laneId: 'Z', after: 'example-project/plan-1/A' } as unknown as LanePlanGraphLane,
+    ]);
+    expect(findLanePlanCycle([cyclic, afterNotAnArray])).toEqual(expected);
+
+    const refNotAnObject = plan('example-project', 'plan-2', [
+      { laneId: 'Z', after: ['example-project/plan-1/A', 7] } as unknown as LanePlanGraphLane,
+    ]);
+    expect(findLanePlanCycle([cyclic, refNotAnObject])).toEqual(expected);
+
+    const refWithNonStringFields = plan('example-project', 'plan-2', [
+      {
+        laneId: 'Z',
+        after: [{ projectId: null, planId: 'plan-1', laneId: 'A' }],
+      } as unknown as LanePlanGraphLane,
+    ]);
+    expect(findLanePlanCycle([cyclic, refWithNonStringFields])).toEqual(expected);
+
+    const laneIdNotAString = [
+      { laneId: null, after: [] },
+    ] as unknown as LanePlanGraphLane[];
+    expect(findLanePlanCycle([cyclic, plan('example-project', 'plan-2', laneIdNotAString)])).toEqual(
+      expected,
+    );
+  });
+
+  it('adds an ambiguous alias edge to every lane carrying it', () => {
+    const plan1 = plan('example-project', 'plan-1', [
+      lane('X', ['example-project/plan-2/Q'], { aliases: ['OLD'] }),
+      lane('Y', ['example-project/plan-2/Q'], { aliases: ['OLD'] }),
+    ]);
+    const plan2 = plan('example-project', 'plan-2', [
+      lane('Q', ['example-project/plan-1/OLD']),
+    ]);
+    const cycle = findLanePlanCycle([plan1, plan2]);
+    expect(cycle).toEqual([
+      { projectId: 'example-project', planId: 'plan-1', laneId: 'X' },
+      { projectId: 'example-project', planId: 'plan-2', laneId: 'Q' },
+    ]);
+  });
+
+  it('appends the edges of a duplicate laneId instead of overwriting them', () => {
+    const lanes = [
+      lane('A', ['example-project/plan-1/B']),
+      lane('A'),
+      lane('B', ['example-project/plan-1/A']),
+    ];
+    const cycle = findLanePlanCycle([plan('example-project', 'plan-1', lanes)]);
+    expect(cycle).toEqual([
+      { projectId: 'example-project', planId: 'plan-1', laneId: 'A' },
+      { projectId: 'example-project', planId: 'plan-1', laneId: 'B' },
+    ]);
+  });
+
+  it('prints <invalid id> for a cycle ref that fails its id pattern', () => {
+    const cycle: PlannedLaneRef[] = [
+      { projectId: 'example-project', planId: 'plan-1', laneId: 'bad\u202Eid' },
+    ];
+    expect(formatLanePlanCycle(cycle)).toBe('<invalid id> -> <invalid id>');
+  });
+
+  it('stays bounded over 100 plans x 300 lanes x 32 after refs', () => {
+    const planCount = 100;
+    const plans: LanePlanGraphPlan[] = [];
+    for (let p = 0; p < planCount; p += 1) {
+      const lanes: LanePlanGraphLane[] = [];
+      for (let i = 0; i < LANE_PLAN_LIMITS.lanes; i += 1) {
+        const after: string[] = [];
+        for (let r = 0; r < LANE_PLAN_LIMITS.after; r += 1) {
+          // Every dependency points into the next plan; the last plan's
+          // targets are unresolved, so the graph is acyclic.
+          after.push(`example-project/plan-${p + 1}/L${(i + 1) % LANE_PLAN_LIMITS.lanes}`);
+        }
+        lanes.push(lane(`L${i}`, after));
+      }
+      plans.push(plan('example-project', `plan-${p}`, lanes));
+    }
+    expect(findLanePlanCycle(plans)).toBeNull();
   });
 });

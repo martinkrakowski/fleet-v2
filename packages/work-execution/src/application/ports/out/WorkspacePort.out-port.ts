@@ -76,6 +76,39 @@ export type CommitLaneOutputResult =
   /** A git command failed or ended without an exit code; nothing is known to have moved. */
   | { readonly outcome: 'error'; readonly reason: string };
 
+/**
+ * K7-5a (owner decision K7-D7, "Start reserves first"): the request to create
+ * one lane run's worktree at exactly the path the capacity reserve chose, on
+ * a new branch at the work order's base, in the project profile's clone on
+ * the reserved host.
+ */
+export interface PrepareLaneWorktreeRequest {
+  /** The project profile's clone on the reserved host (absolute, normalised). */
+  readonly clonePath: string;
+  /** The reservation's worktree path (absolute, normalised, outside the clone). */
+  readonly worktreePath: string;
+  /** 'fleet/' + runId. */
+  readonly branch: string;
+  /** 40 lowercase hex: the work order's base. */
+  readonly baseCommit: string;
+  /** Routes the executor to the reserved host. */
+  readonly recordedHost: AttemptRunnerRecord;
+}
+
+export type PrepareLaneWorktreeResult =
+  | { readonly outcome: 'prepared' }
+  /**
+   * The path is already a worktree of this clone on `branch`, HEAD at
+   * `baseCommit`, nothing uncommitted or untracked.
+   */
+  | { readonly outcome: 'already-prepared' }
+  | {
+      readonly outcome: 'refused';
+      readonly reason: 'invalid-request' | 'path-exists-other' | 'branch-exists-other' | 'git-refused';
+    }
+  /** The executor did not answer (timeout, transport): the worktree may or may not exist. */
+  | { readonly outcome: 'unknown' };
+
 export interface WorkspacePort {
   /** Inspect the worktree as a typed record; part of readiness, once per prepared environment. */
   inspectWorktree(request: WorktreeInspectionRequest): Promise<WorktreeInspection>;
@@ -93,6 +126,14 @@ export interface WorkspacePort {
    * parent, moving the branch by compare-and-swap. Never pushes.
    */
   commitLaneOutput?(request: CommitLaneOutputRequest): Promise<CommitLaneOutputResult>;
+
+  /**
+   * K7-5a (K7-D7): create the run's worktree at the reserved path on a new
+   * branch at the base; never forces, never removes, never resets. A
+   * worktree already prepared exactly this way reads as `already-prepared`,
+   * so a retried start is safe.
+   */
+  prepareLaneWorktree?(request: PrepareLaneWorktreeRequest): Promise<PrepareLaneWorktreeResult>;
 }
 
 /**

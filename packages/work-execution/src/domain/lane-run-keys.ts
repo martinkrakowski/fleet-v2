@@ -3,7 +3,7 @@
  * `<runId>/r<round>/<step>/<seatIndex>[/a<n>][@<head12>][/retry<n>]` (including
  * `reconcile`), the control keys `<runId>/stop@<via>` (graceful) and
  * `<runId>/stop-force@<via>` (force), with via web or cli and the mode read from
- * the key, `<runId>/park/<n>/resume@web`, the request channel's
+ * the key, `<runId>/park/<n>/resume@<via>` (with via web or cli), the request channel's
  * `request/<requestId>`, and the reaper's `reaper/<subjectId>/<kind>@<findingId>`.
  * Pure; builders and the parser never throw and never echo input.
  * `parseLaneRunKey(buildX(…))` always returns the same parts, and building a
@@ -72,7 +72,7 @@ export type ParsedLaneRunKey =
       readonly via: LaneRunKeyVia;
       readonly mode: LaneRunStopKeyMode;
     }
-  | { readonly kind: 'resume'; readonly runId: string; readonly parkOrdinal: number; readonly via: 'web' }
+  | { readonly kind: 'resume'; readonly runId: string; readonly parkOrdinal: number; readonly via: LaneRunKeyVia }
   | { readonly kind: 'request'; readonly requestId: string }
   | {
       readonly kind: 'reaper';
@@ -240,14 +240,17 @@ export function reaperRepairKey(subjectId: string, kind: ReaperFindingKind, find
   return { ok: true, key: 'reaper/' + subjectId + '/' + kind + '@' + findingId };
 }
 
-export function laneRunResumeKey(runId: string, parkOrdinal: number): LaneRunKeyResult {
+export function laneRunResumeKey(runId: string, parkOrdinal: number, via: LaneRunKeyVia = 'web'): LaneRunKeyResult {
   if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
     return { ok: false, error: 'LaneRun key runId must be run- followed by a ULID' };
   }
   if (!Number.isInteger(parkOrdinal) || parkOrdinal < 1 || parkOrdinal > LANE_RUN_MAX_PARK_ORDINAL) {
     return { ok: false, error: 'LaneRun key park ordinal must be an integer from 1 to 9999' };
   }
-  return { ok: true, key: runId + '/park/' + String(parkOrdinal) + '/resume@web' };
+  if (!LANE_RUN_KEY_VIAS.includes(via)) {
+    return { ok: false, error: 'LaneRun key via must be web or cli' };
+  }
+  return { ok: true, key: runId + '/park/' + String(parkOrdinal) + '/resume@' + via };
 }
 
 export function requestKey(requestId: string): LaneRunKeyResult {
@@ -371,13 +374,22 @@ export function parseLaneRunKey(key: unknown): ParsedLaneRunKey | null {
   }
 
   if (segments.length === 4 && segments[1] === 'park') {
-    if (segments[3] !== 'resume@web' || !PARK_ORDINAL_TEXT_PATTERN.test(segments[2])) {
+    if (!PARK_ORDINAL_TEXT_PATTERN.test(segments[2])) {
+      return null;
+    }
+    const atIndex = segments[3].indexOf('@');
+    if (atIndex === -1 || segments[3].indexOf('@', atIndex + 1) !== -1) {
+      return null;
+    }
+    const action = segments[3].slice(0, atIndex);
+    const via = segments[3].slice(atIndex + 1);
+    if (action !== 'resume' || !LANE_RUN_KEY_VIAS.includes(via as LaneRunKeyVia)) {
       return null;
     }
     const parkOrdinal = Number(segments[2]);
-    const built = laneRunResumeKey(segments[0], parkOrdinal);
+    const built = laneRunResumeKey(segments[0], parkOrdinal, via as LaneRunKeyVia);
     return built.ok && built.key === key
-      ? { kind: 'resume', runId: segments[0], parkOrdinal, via: 'web' }
+      ? { kind: 'resume', runId: segments[0], parkOrdinal, via: via as LaneRunKeyVia }
       : null;
   }
 

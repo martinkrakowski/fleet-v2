@@ -94,6 +94,11 @@ describe('key builders', () => {
       kind: 'resume', runId: RUN_ID, parkOrdinal: 3, via: 'web',
     });
 
+    expect(laneRunResumeKey(RUN_ID, 3, 'cli')).toEqual({ ok: true, key: `${RUN_ID}/park/3/resume@cli` });
+    expect(parseLaneRunKey(`${RUN_ID}/park/3/resume@cli`)).toEqual({
+      kind: 'resume', runId: RUN_ID, parkOrdinal: 3, via: 'cli',
+    });
+
     expect(requestKey('01JB0000000000000000000000')).toEqual({ ok: true, key: 'request/01JB0000000000000000000000' });
     expect(parseLaneRunKey('request/01JB0000000000000000000000')).toEqual({
       kind: 'request', requestId: '01JB0000000000000000000000',
@@ -331,6 +336,7 @@ describe('key builders', () => {
     expect(stopModeOfKey(`${RUN_ID}/stop-force@cli`)).toBe('force');
     expect(stopModeOfKey(`${RUN_ID}/r1/gate/0@0123456789ab`)).toBeNull();
     expect(stopModeOfKey(`${RUN_ID}/park/1/resume@web`)).toBeNull();
+    expect(stopModeOfKey(`${RUN_ID}/park/1/resume@cli`)).toBeNull();
     expect(stopModeOfKey(42)).toBeNull();
     expect(stopModeOfKey('')).toBeNull();
   });
@@ -471,6 +477,7 @@ describe('parseLaneRunKey', () => {
     `${RUN_ID}/park/01/resume@web`,
     `${RUN_ID}/park/1/extra/resume@web`,
     `${RUN_ID}/park/1/resume@web/extra`,
+    `${RUN_ID}/park/1/resume@api`,
     'request/not-a-ulid',
     'request/01JB0000000000000000000000/x',
     'run-1/r0/dispatch/0',

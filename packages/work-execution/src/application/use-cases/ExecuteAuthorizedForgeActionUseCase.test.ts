@@ -750,12 +750,70 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       return { ...record, ownerDecisionReferences: doors };
     }
 
+    it('journals an ambiguous outcome and rethrows when the forge call throws', async () => {
+      const forgeError = new Error('forge subprocess exploded');
+      const deps = baseDeps(attemptWithDoors([]));
+      const throwingForgePort: ForgeActionPort = {
+        isConfigured: () => true,
+        async performForgeAction() {
+          throw forgeError;
+        },
+      };
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({ ...deps, forgePort: throwingForgePort });
+      await expect(useCase.executeAuthorizedForgeAction(mergeReq)).rejects.toBe(forgeError);
+      const statuses = deps.journal.entries.map((entry) => entry.status);
+      expect(statuses).toEqual(['intent-recorded', 'ambiguous']);
+      const ambiguous = deps.journal.entries[1]!;
+      expect(ambiguous.id).toBe('forge:forge-att-001:ambiguous:2');
+      expect(ambiguous.detail).toBe('forge subprocess exploded');
+      expect(ambiguous).not.toHaveProperty('authorizedBy');
+    });
+
+    it('the ambiguous entry carries authorizedBy when the request names it', async () => {
+      const forgeError = new Error('forge subprocess exploded');
+      const deps = baseDeps(attemptWithDoors([]));
+      const throwingForgePort: ForgeActionPort = {
+        isConfigured: () => true,
+        async performForgeAction() {
+          throw forgeError;
+        },
+      };
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({ ...deps, forgePort: throwingForgePort });
+      await expect(
+        useCase.executeAuthorizedForgeAction({ ...mergeReq, authorizedBy: 'policy:autoMerge@0123456789ab' }),
+      ).rejects.toBe(forgeError);
+      const ambiguous = deps.journal.entries[1]!;
+      expect(ambiguous.status).toBe('ambiguous');
+      expect(ambiguous.authorizedBy).toBe('policy:autoMerge@0123456789ab');
+    });
+
+    it('rethrows the original forge error even when the ambiguous journal append throws', async () => {
+      const forgeError = new Error('forge subprocess exploded');
+      const deps = baseDeps(attemptWithDoors([]));
+      const throwingForgePort: ForgeActionPort = {
+        isConfigured: () => true,
+        async performForgeAction() {
+          throw forgeError;
+        },
+      };
+      const journal = deps.journal as InMemoryJournal;
+      const baseAppend = journal.appendJournalEntry.bind(journal);
+      journal.appendJournalEntry = async (entry) => {
+        if (entry.status === 'ambiguous') {
+          throw new Error('journal unavailable');
+        }
+        await baseAppend(entry);
+      };
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({ ...deps, journal, forgePort: throwingForgePort });
+      await expect(useCase.executeAuthorizedForgeAction(mergeReq)).rejects.toBe(forgeError);
+      expect(deps.journal.entries.map((entry) => entry.status)).toEqual(['intent-recorded']);
+    });
+
     it('an approved door does not block the merge', async () => {
       const calls = { resolve: 0 };
       const useCase = new ExecuteAuthorizedForgeActionUseCase(
         baseDeps(attemptWithDoors(['req-door-1']), ownerPortWith({ outcome: 'approved', decisionId: 'req-door-1' }, calls)),
-      );
-      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      );      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
       expect(result.outcome).toBe('executed');
       expect(calls.resolve).toBe(1);
     });

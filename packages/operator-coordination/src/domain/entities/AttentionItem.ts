@@ -62,9 +62,14 @@ const RAISE_AGAIN_KEYS: readonly string[] = ['kind', 'subject', 'workOrderId', '
 
 const CLEAR_KEYS: readonly string[] = ['reason', 'via', 'by'];
 
-/** JSON.stringify(['attention', projectId, subject.kind, subject.ref, kind]) — never a template literal. */
+/**
+ * JSON.stringify(['attention', projectId, subject.kind, subject.ref, kind]) — never a template literal.
+ * A `pr` ref is keyed in lower case, as the aggregate stores it, so a lookup by the caller's spelling
+ * finds the same item.
+ */
 export function attentionItemKey(projectId: string, subject: AttentionItemSubjectRecord, kind: string): string {
-  return JSON.stringify(['attention', projectId, subject.kind, subject.ref, kind]);
+  const ref = subject.kind === 'pr' ? subject.ref.toLowerCase() : subject.ref;
+  return JSON.stringify(['attention', projectId, subject.kind, ref, kind]);
 }
 
 function fail(message: string): AttentionItemResult {

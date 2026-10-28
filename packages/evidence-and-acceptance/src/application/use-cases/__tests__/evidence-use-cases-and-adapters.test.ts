@@ -1094,7 +1094,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
         candidateHeadSha: HEAD,
         ciState: 'pending',
         unresolvedThreadCount: 0,
-        observedHeadSha: null,
+        observedHeadSha: HEAD,
       }),
     });
 
@@ -1115,7 +1115,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
         candidateHeadSha: HEAD,
         ciState: 'pass',
         unresolvedThreadCount: 2,
-        observedHeadSha: null,
+        observedHeadSha: HEAD,
       }),
     });
 
@@ -1138,7 +1138,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
         candidateHeadSha: HEAD,
         ciState: 'pass',
         unresolvedThreadCount: null,
-        observedHeadSha: null,
+        observedHeadSha: HEAD,
       }),
     });
 
@@ -1162,7 +1162,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
         candidateHeadSha: HEAD,
         ciState: 'pass',
         unresolvedThreadCount: 0,
-        observedHeadSha: null,
+        observedHeadSha: HEAD,
       }),
     });
 

@@ -408,7 +408,7 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
     expect(harness.reconcileCalls).toHaveLength(1);
   });
 
-  it('test 5: a running attempt past its time limit decides stop', async () => {
+  it('test 5: a running attempt past its time limit decides stop; unwired it is not-wired', async () => {
     const running = attemptFixture({ state: 'running', sessionId: 'session-example-1' });
     const harness = await makeHarness(runRecord(), [running]);
     await conduct(harness, 'running', NOW);
@@ -416,7 +416,9 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
     harness.setReconcileAnswer(activeAnswer(running));
     harness.setManifest(JSON.stringify({ timeLimitSeconds: 2700 }));
     const result = await advance(harness);
-    expect(result).toEqual({ outcome: 'not-built', decision: 'act', step: 'stop' });
+    // K4-6 built the stop act; this harness wires no stop port, so the reached
+    // decision reports not-wired (the old not-built pin is superseded).
+    expect(result).toEqual({ outcome: 'not-wired', step: 'stop' });
   });
 
   it('test 6: a running attempt with no readable limit parks ambiguous stop', async () => {

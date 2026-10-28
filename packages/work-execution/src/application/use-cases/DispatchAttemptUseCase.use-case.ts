@@ -9,7 +9,8 @@
  *
  * Dispatch recomputes the frozen brief digest from the worktree's prose and
  * manifest before any save or runner contact and refuses a mismatch (D3): an
- * edited brief never dispatches.
+ * edited brief never dispatches. The held reservation's seat tool chooses the
+ * runner (opencode or the agy runner); an agy runner runs no port.
  */
 
 import type {
@@ -51,6 +52,11 @@ export interface DispatchAttemptDependencies {
   readonly journal: ExecutionJournalPort;
   readonly workspace: WorkspacePort;
   readonly runner: ExecutionRunnerPort;
+  /**
+   * AG-3: the agy runner. A reservation whose seat tool is `agy` dispatches through it; without it such a
+   * reservation is refused as runner-not-available before any journal entry or save.
+   */
+  readonly agyRunner?: ExecutionRunnerPort;
   readonly observation?: ExecutionObservationPort;
   readonly artifactPort?: AttemptArtifactPort;
   /**
@@ -254,12 +260,19 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       return { outcome: 'refused', reason: 'No active capacity reservation for attempt' };
     }
 
+    // AG-3: the reservation's seat tool names the runner; a legacy reservation (null) is opencode.
+    const reservedTool = heldReservation.seatTool ?? 'opencode';
+    const runner = reservedTool === 'agy' ? this.deps.agyRunner : this.deps.runner;
+    if (runner === undefined) {
+      return { outcome: 'refused', reason: 'runner-not-available' };
+    }
+
     // H9a fix (review): a reservation recorded for another host must never
     // dispatch here. The runner's own host name comes from the installation
     // (v2); it is null for v1 or absent installations, so legacy and pre-H9a
     // records with a null hostName pass through untouched. This refuses
     // before any start call and before any journal write.
-    const runnerHostName = this.deps.runner.describeRunner?.()?.hostName ?? null;
+    const runnerHostName = runner.describeRunner?.()?.hostName ?? null;
     const reservationHostName = heldReservation.hostName ?? null;
     if (reservationHostName !== null && reservationHostName !== runnerHostName) {
       return {
@@ -280,7 +293,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       };
     }
 
-    const runnerCapabilities = this.deps.runner.describeCapabilities();
+    const runnerCapabilities = runner.describeCapabilities();
     // Requirements come from the frozen brief's lane profile only; the
     // request carries no requirements field.
     const requiredCapabilities = BRIEF_RUNNER_REQUIREMENTS;
@@ -299,7 +312,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       expectedArtifactPaths: request.expectedArtifacts ?? [],
       // H9b2: the inspection runs where the dispatching runner's host lives;
       // a legacy runner describes no host and keeps the configured executor.
-      recordedHost: this.deps.runner.describeRunner?.() ?? null,
+      recordedHost: runner.describeRunner?.() ?? null,
     });
     if (!inspection.matchesBaseCommit) {
       return {
@@ -335,8 +348,8 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       };
     }
 
-    const runnerInfo = this.deps.runner.describeRunner?.();
-    if (!runnerInfo || runnerInfo.remotePort === null) {
+    const runnerInfo = runner.describeRunner?.();
+    if (!runnerInfo || (runnerInfo.kind !== 'agy' && runnerInfo.remotePort === null)) {
       return { outcome: 'refused', reason: 'No runner port can be described for dispatch' };
     }
     const runnerPort = runnerInfo.remotePort;
@@ -355,7 +368,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           raw = await this.deps.artifactPort.readBriefManifest(
             request.worktreePath,
             candidate,
-            this.deps.runner.describeRunner?.() ?? null,
+            runner.describeRunner?.() ?? null,
           );
         } else if (this.deps.workspace.readWorktreeFile) {
           raw = await this.deps.workspace.readWorktreeFile(
@@ -401,7 +414,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         proseRaw = await this.deps.artifactPort.readBriefFile(
           request.worktreePath,
           request.briefPackagePath,
-          this.deps.runner.describeRunner?.() ?? null,
+          runner.describeRunner?.() ?? null,
         );
       } else if (this.deps.workspace.readWorktreeFile) {
         proseRaw = await this.deps.workspace.readWorktreeFile(
@@ -494,6 +507,21 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       const selection = this.deps.runnerSelector.selectRunner({ seatTool });
       if (!selection.ok) {
         return { outcome: 'refused', reason: selection.reason };
+      }
+    }
+
+    // AG-3: the frozen brief's seat tool must match the seat tool the held
+    // reservation was taken for; a mismatch refuses before anything is
+    // written, whether or not a selector is wired. Any reservation that names
+    // a seat tool (agy or opencode) refuses a brief naming another tool; only
+    // a legacy reservation with no seat tool skips the check.
+    if (heldReservation.seatTool !== null && heldReservation.seatTool !== undefined) {
+      const briefTool = parseSeatTool(manifestModelAssignment.seatTool) ?? 'opencode';
+      if (briefTool !== heldReservation.seatTool) {
+        return {
+          outcome: 'refused',
+          reason: 'Frozen brief seat tool does not match the reservation seat tool',
+        };
       }
     }
 
@@ -646,7 +674,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     }
 
     const initialRunner: AttemptRunnerRecord = {
-      kind: 'opencode',
+      kind: runnerInfo.kind,
       remotePort: runnerPort,
       host: runnerHost,
       // The installation host name travels with the record so a host's running
@@ -707,7 +735,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       return dispatchingConflict;
     }
 
-    const startResult = await this.deps.runner.startSession({
+    const startResult = await runner.startSession({
       attemptId: request.attemptId,
       worktreePath: request.worktreePath,
       briefPackagePath: request.briefPackagePath,
@@ -745,7 +773,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         sessionId: startResult.sessionId,
         detail: `Session started: ${startResult.sessionId}`,
       });
-      const runningSave = await this.saveRunningOrConflict(runningAttempt, startResult.sessionId, runnerValue, nowIso);
+      const runningSave = await this.saveRunningOrConflict(runningAttempt, startResult.sessionId, runnerValue, nowIso, runner);
       if (runningSave.kind === 'conflict') {
         return runningSave.result;
       }
@@ -801,8 +829,8 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       // An unknown answer or a runner without inspectWorktreeRun omits the
       // field; the ids stay out of the entry's detail.
       let observedSessionIds: readonly string[] | undefined;
-      if (this.deps.runner.inspectWorktreeRun) {
-        const observed = await this.deps.runner.inspectWorktreeRun({
+      if (runner.inspectWorktreeRun) {
+        const observed = await runner.inspectWorktreeRun({
           attemptId: request.attemptId,
           worktreePath: request.worktreePath,
           runner: blockedAttempt.runner,
@@ -978,6 +1006,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     sessionId: string,
     runnerValue: AttemptRecord['runner'],
     nowIso: string,
+    runner: ExecutionRunnerPort,
   ): Promise<RunningSaveOutcome> {
     const deps = this.deps!;
     const alreadyRecorded = (record: AttemptRecord): RunningSaveOutcome => {
@@ -1004,7 +1033,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       if (winner !== null && winner.sessionId === sessionId) {
         return alreadyRecorded(winner);
       }
-      const stopResult = await deps.runner.stopSession({
+      const stopResult = await runner.stopSession({
         attemptId: runningAttempt.id,
         sessionId,
         gracePeriodSeconds: 10,
@@ -1086,7 +1115,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         // this call started one. The new session is never attached to that
         // record (reconcile would demote a terminal state or release capacity
         // twice); it is stopped instead, once, and the outcome journalled.
-        const stopResult = await deps.runner.stopSession({
+        const stopResult = await runner.stopSession({
           attemptId: runningAttempt.id,
           sessionId,
           gracePeriodSeconds: 10,

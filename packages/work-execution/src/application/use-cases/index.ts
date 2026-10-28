@@ -21,5 +21,6 @@ export * from "./RequestAttemptAcceptanceUseCase.use-case.js";
 export * from "./RequestLaneRunStopUseCase.use-case.js";
 export * from "./ReserveExecutionCapacityUseCase.use-case.js";
 export * from "./ResumeLaneRunUseCase.use-case.js";
+export * from "./RunConductorPassUseCase.use-case.js";
 export * from "./StartLaneRunUseCase.use-case.js";
 export * from "./StopAttemptUseCase.use-case.js";

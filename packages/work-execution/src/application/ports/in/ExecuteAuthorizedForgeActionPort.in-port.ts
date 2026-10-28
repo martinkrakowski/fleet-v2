@@ -5,13 +5,13 @@
  * match. A moved head is refused; lanes gain no forge credentials here.
  */
 
-import type { ForgeRefusalKind } from '../../../domain/coordination-keys.js';
+import type { ForgeActionKind, ForgeRefusalKind } from '../../../domain/coordination-keys.js';
 
 export interface ExecuteAuthorizedForgeActionRequest {
   readonly actionId: string;
   readonly attemptId: string;
   readonly workOrderId: string;
-  readonly kind: 'push-and-open-pr' | 'merge-pr';
+  readonly kind: ForgeActionKind;
   readonly expectedHeadSha: string;
   readonly authorizationGrantId: string;
 }

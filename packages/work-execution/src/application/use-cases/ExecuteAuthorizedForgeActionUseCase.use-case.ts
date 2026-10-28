@@ -99,15 +99,13 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       };
     }
 
-    // One-way doors are re-checked at merge/push-and-open time through the
-    // same owner-decision ports acceptance used: an owner decision withdrawn
-    // after a stored acceptance still refuses the forge action, and the
-    // refusal happens before any authorization grant is consumed.
-    if (request.kind === 'merge-pr' || request.kind === 'push-and-open-pr') {
-      const doorBlockers = await this.collectForgeDoorBlockers(deps, request);
-      if (doorBlockers.length > 0) {
-        return { outcome: 'refused', reason: doorBlockers.join('; ') };
-      }
+    // One-way doors are re-checked at merge/push-and-open/push-to-pr time
+    // through the same owner-decision ports acceptance used: an owner decision
+    // withdrawn after a stored acceptance still refuses the forge action, and
+    // the refusal happens before any authorization grant is consumed.
+    const doorBlockers = await this.collectForgeDoorBlockers(deps, request);
+    if (doorBlockers.length > 0) {
+      return { outcome: 'refused', reason: doorBlockers.join('; ') };
     }
 
     // Merge requires current-head acceptance; old readiness is not a receipt.

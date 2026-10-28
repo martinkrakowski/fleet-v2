@@ -2,7 +2,9 @@
  * Pure coordination keys and event kinds shared across composition roots.
  */
 
-export type ForgeActionKind = 'push-and-open-pr' | 'merge-pr';
+/** Forge actions fleet may run; `push-to-pr` updates an existing PR's branch and never opens one. */
+export const FORGE_ACTION_KINDS = ['push-and-open-pr', 'push-to-pr', 'merge-pr'] as const;
+export type ForgeActionKind = (typeof FORGE_ACTION_KINDS)[number];
 
 /**
  * Why the forge refused an action it was asked to run (auto-merge plan A13, §4).

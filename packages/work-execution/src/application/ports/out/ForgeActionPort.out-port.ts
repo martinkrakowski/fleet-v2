@@ -4,18 +4,22 @@
  * operations through stable action IDs and explicit expected-head checks.
  * Credentials stay in the adapter's environment; lanes never see them. An
  * ambiguous response is reported for reconciliation, never guessed. Every
- * refusal names its kind; an unrecognised one is `other`.
+ * refusal names its kind; an unrecognised one is `other`. The
+ * `push-to-pr` kind updates an existing open pull request's branch and
+ * never opens a new one.
  */
 
-import type { ForgeRefusalKind } from '../../../domain/coordination-keys.js';
+import type { ForgeActionKind, ForgeRefusalKind } from '../../../domain/coordination-keys.js';
 
 export interface ForgeActionRequest {
   readonly actionId: string;
   readonly attemptId: string;
   readonly workOrderId: string;
-  readonly kind: 'push-and-open-pr' | 'merge-pr';
+  readonly kind: ForgeActionKind;
   readonly expectedHeadSha: string;
   readonly branchName: string;
+  /** Known pull request number (e.g. from an earlier push-and-open-pr), when available. */
+  readonly pullRequestNumber?: number;
 }
 
 export type ForgeActionResult =

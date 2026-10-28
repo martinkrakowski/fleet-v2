@@ -1162,16 +1162,23 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
             : await readGitHeadLocally(attempt.worktreePath)
           : await readGitHead(attempt.worktreePath, worktreeSshHost);
       // A worktree that lives on another host has its branch only on that
-      // host's repository; `gh pr create` needs the branch on origin, so the
-      // verified head is fetched across and pushed before the PR is opened.
+      // host's repository; `gh pr create` (and `push-to-pr`, which updates an
+      // existing PR's branch) needs the branch on origin, so the verified head
+      // is fetched across and pushed before the PR is opened.
       const branchRef = `${head}:refs/heads/${branchName}`;
+      // push-to-pr updates an existing PR branch: never force it (a non-fast-forward
+      // push fails and the action is ambiguous); the other kinds keep `-f`.
+      const pushArgs =
+        request.kind === 'push-to-pr'
+          ? ['push', 'origin', branchRef]
+          : ['push', '-f', 'origin', branchRef];
       const recordedWantsSeed =
         recordedIsNamed
           ? recordedSshAlias !== null ||
             process.env.FLEET_FORGE_PUSH_ORIGIN === '1'
           : null;
       const shouldSeedOrigin =
-        request.kind === 'push-and-open-pr' &&
+        (request.kind === 'push-and-open-pr' || request.kind === 'push-to-pr') &&
         head === request.expectedHeadSha &&
         (recordedWantsSeed !== null
           ? recordedWantsSeed
@@ -1189,7 +1196,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
           branchRef,
           '--force',
         ]);
-        await runGitCommand(['push', '-f', 'origin', branchRef]);
+        await runGitCommand(pushArgs);
       } else if (
         shouldSeedOrigin &&
         recordedIsNamed &&
@@ -1199,7 +1206,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         // A recorded local host: the worktree lives on this machine, so the
         // orchestrator fetches from the worktree path itself.
         await runGitCommand(['fetch', attempt.worktreePath, branchRef, '--force']);
-        await runGitCommand(['push', '-f', 'origin', branchRef]);
+        await runGitCommand(pushArgs);
       } else if (
         shouldSeedOrigin &&
         !recordedIsNamed &&
@@ -1217,10 +1224,14 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
           branchRef,
           '--force',
         ]);
-        await runGitCommand(['push', '-f', 'origin', branchRef]);
+        await runGitCommand(pushArgs);
       }
       return head;
     },
+    pullRequestRead: forgeRead,
+    ...(forgeGithubSection !== undefined
+      ? { repository: { owner: forgeGithubSection.owner, repo: forgeGithubSection.repo } }
+      : {}),
     },
     forgeRead,
   );

@@ -3,6 +3,7 @@ import {
   consumptionId,
   forgeActionScope,
   observationEventKind,
+  FORGE_ACTION_KINDS,
   FORGE_REFUSAL_KINDS,
   type ForgeActionKind,
   type ForgeRefusalKind,
@@ -49,5 +50,12 @@ describe('FORGE_REFUSAL_KINDS', () => {
   it('accepts other as a ForgeRefusalKind', () => {
     const kind: ForgeRefusalKind = 'other';
     expect(kind).toBe('other');
+  });
+});
+
+describe('FORGE_ACTION_KINDS', () => {
+  it('lists all three forge action kinds and scopes push-to-pr', () => {
+    expect(FORGE_ACTION_KINDS).toEqual(['push-and-open-pr', 'push-to-pr', 'merge-pr']);
+    expect(forgeActionScope('push-to-pr')).toBe('forge:push-to-pr');
   });
 });

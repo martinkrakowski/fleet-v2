@@ -492,7 +492,7 @@ describe('AssessHeadAcceptanceUseCase forge mode (D6)', () => {
             candidateHeadSha: CANDIDATE_HEAD,
             ciState: 'unknown',
             unresolvedThreadCount: null,
-            observedHeadSha: null,
+            observedHeadSha: CANDIDATE_HEAD,
           };
         },
       },
@@ -528,7 +528,7 @@ describe('AssessHeadAcceptanceUseCase forge mode (D6)', () => {
             candidateHeadSha: CANDIDATE_HEAD,
             ciState: 'pass',
             unresolvedThreadCount: 0,
-            observedHeadSha: null,
+            observedHeadSha: CANDIDATE_HEAD,
           };
         },
       },
@@ -547,6 +547,98 @@ describe('AssessHeadAcceptanceUseCase forge mode (D6)', () => {
     expect(reads).toBe(1);
     expect(result.outcome).toBe('accepted');
     expect(repo.assessment?.forgeEvidence).toBeUndefined();
+  });
+});
+
+describe('AssessHeadAcceptanceUseCase forge observed head (PC-2b)', () => {
+  const request = {
+    assessmentId: 'assessment-att-1',
+    candidateHeadSha: CANDIDATE_HEAD,
+    policyRevision: 'pol-1',
+  };
+  const OTHER_HEAD = '2222222222222222222222222222222222222222';
+
+  function forgeStatusPort(ciState: 'pass' | 'pending', observedHeadSha: string | null): ForgeEvidencePort {
+    return {
+      async readForgeCheckStatus(): Promise<ForgeCheckStatus> {
+        return {
+          candidateHeadSha: CANDIDATE_HEAD,
+          ciState,
+          unresolvedThreadCount: 0,
+          observedHeadSha,
+        };
+      },
+    };
+  }
+
+  function acceptanceUseCase(forge: ForgeEvidencePort) {
+    return new AssessHeadAcceptanceUseCase({
+      repo: new InMemoryEvidenceAssessmentRepo(makePassingAssessmentRecord()),
+      forgeEvidence: forge,
+      forgeMode: 'github',
+      ownerDecisionPort: new InMemoryOwnerDecisionPort({ outcome: 'approved', decisionId: 'door-1' }),
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: [],
+      }),
+    });
+  }
+
+  it('pass with observedHeadSha equal to the candidate head is accepted', async () => {
+    const result = await acceptanceUseCase(forgeStatusPort('pass', CANDIDATE_HEAD)).assessHeadAcceptance(
+      request,
+    );
+
+    expect(result.outcome).toBe('accepted');
+  });
+
+  it('pass with observedHeadSha for another head is blocked: head moved, kind other, no CI-state blocker', async () => {
+    const result = await acceptanceUseCase(forgeStatusPort('pass', OTHER_HEAD)).assessHeadAcceptance(
+      request,
+    );
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockerDetails).toContainEqual({
+        kind: 'other',
+        text: 'forge pull request head moved while CI state was read',
+      });
+      expect(result.blockers.some((blocker) => blocker.includes('forge reports CI state'))).toBe(false);
+      if (result.assessment === undefined) {
+        throw new Error('expected a blocked assessment record');
+      }
+      expect(result.assessment.blockers).toEqual([
+        'forge pull request head moved while CI state was read',
+      ]);
+    }
+  });
+
+  it('pass with observedHeadSha null is blocked: could not confirm the head', async () => {
+    const result = await acceptanceUseCase(forgeStatusPort('pass', null)).assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockerDetails).toContainEqual({
+        kind: 'other',
+        text: 'forge could not confirm the pull request head after reading CI state',
+      });
+      expect(result.blockers.some((blocker) => blocker.includes('forge reports CI state'))).toBe(false);
+    }
+  });
+
+  it('pending with another head is blocked with the head blocker as well, so it is never ci-pending only', async () => {
+    const result = await acceptanceUseCase(forgeStatusPort('pending', OTHER_HEAD)).assessHeadAcceptance(
+      request,
+    );
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockerDetails).toEqual([
+        { kind: 'other', text: 'forge pull request head moved while CI state was read' },
+        { kind: 'ci-pending', text: "forge reports CI state 'pending' for this candidate head" },
+      ]);
+      expect(result.blockerDetails.every((blocker) => blocker.kind === 'ci-pending')).toBe(false);
+    }
   });
 });
 

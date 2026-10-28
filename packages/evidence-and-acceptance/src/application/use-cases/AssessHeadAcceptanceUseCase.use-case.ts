@@ -349,6 +349,21 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       const status = await deps.forgeEvidence.readForgeCheckStatus({
         candidateHeadSha: assessment.candidateHeadSha,
       });
+      const headConfirmed =
+        status.candidateHeadSha === assessment.candidateHeadSha && status.observedHeadSha === assessment.candidateHeadSha;
+      if (!headConfirmed) {
+        // The forge CI state may belong to another head (or the forge could not
+        // re-read the head after reading CI state). This blocker is never
+        // `ci-pending`, so the list is never read as CI pending only.
+        blockers.push(
+          acceptanceBlocker(
+            'other',
+            status.observedHeadSha === null
+              ? 'forge could not confirm the pull request head after reading CI state'
+              : 'forge pull request head moved while CI state was read',
+          ),
+        );
+      }
       if (!PASSING_RESULTS.includes(status.ciState)) {
         blockers.push(
           acceptanceBlocker(

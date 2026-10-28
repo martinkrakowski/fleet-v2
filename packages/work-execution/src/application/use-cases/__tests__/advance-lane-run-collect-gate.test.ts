@@ -869,6 +869,24 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
     expect(harness.collectRequests).toHaveLength(0);
   });
 
+  it('test 5c: an absent frozen manifest refuses the collect before the edit-only commit or the collector', async () => {
+    const agyEnded = endedAttempt({ runner: AGY_RUNNER });
+    for (const attempt of [endedAttempt(), agyEnded]) {
+      const harness = await makeHarness(runRecord(), [attempt]);
+      harness.setManifest(null);
+      await conduct(harness, 'collecting', NOW);
+      expect(await advance(harness)).toEqual({
+        outcome: 'acted',
+        step: 'collect',
+        key: collectKey(),
+        result: 'refused',
+        reasonCode: 'collect-refused',
+      });
+      expect(harness.collectRequests).toHaveLength(0);
+      expect(harness.commitRequests).toHaveLength(0);
+    }
+  });
+
   it('test 9: each absent port is not-wired with its step and writes nothing', async () => {
     const running = attemptFixture({ state: 'running', sessionId: 'session-example-1' });
     const hStop = await makeHarness(runRecord(), [running], { wireStop: false });

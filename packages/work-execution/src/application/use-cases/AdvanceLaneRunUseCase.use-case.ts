@@ -938,6 +938,17 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       }
       return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'no-completion-receipt' };
     }
+    // The frozen artifact list is read before any write: an absent or unreadable manifest, or an
+    // unreadable expectedArtifacts, refuses the collect before the edit-only commit touches git.
+    const manifest = await readFrozenManifest(latest, this.deps.artifactPort);
+    const expectedArtifacts = manifest === null ? null : manifestExpectedArtifacts(manifest);
+    if (expectedArtifacts === null) {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'collect-refused');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'collect-refused' };
+    }
     if (latest.runner?.kind === 'agy' && commitEditOnlyAttempt !== undefined) {
       const committed = await commitEditOnlyAttempt.commitEditOnlyAttempt({
         attemptId: latest.id,
@@ -957,16 +968,6 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
         }
         return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'edit-only-unknown' };
       }
-    }
-    const manifest = await readFrozenManifest(latest, this.deps.artifactPort);
-    const expectedArtifacts = manifestExpectedArtifacts(manifest);
-    if (expectedArtifacts === null) {
-      // A present but unreadable expectedArtifacts is refused, never read as "nothing expected".
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'collect-refused');
-      if (resultRefusal !== null) {
-        return { outcome: 'refused', reason: resultRefusal };
-      }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'collect-refused' };
     }
     const collected = await collect.collectAttemptArtifacts({
       attemptId: latest.id,

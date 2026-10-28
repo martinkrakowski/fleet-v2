@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-27
 - **Target repository:** `fleet-v2` (lanes SR*, MX*, BP1). The hexagen side (HM1–HM4) is a set of work orders against `hexagen-monaco`, owned and planned there (hexagen integration plan §2.3).
-- **Status:** rev 1.1. Rev 1 applied a Fable review of rev 0 (one blocker, six majors, four minors). Grok 4.7 re-checked rev 1: the blocker and all six majors resolved, with two new majors and two minors, all applied in rev 1.1 (§8). Nothing built. Decisions in §6 are open with recommended defaults. Anchors checked against fleet-v2 `origin/main` at `a56a0a8` and hexagen-monaco `origin/main` at `f071763` (read from the local clone, not fetched).
+- **Status:** rev 1.1. Rev 1 applied a Fable review of rev 0 (one blocker, six majors, four minors). Grok 4.7 re-checked rev 1: the blocker and all six majors resolved, with two new majors and two minors, all applied in rev 1.1 (§8). Nothing built. Decisions in §6 are open with recommended defaults. Anchors checked against fleet-v2 `origin/main` at `a56a0a8` and hexagen-monaco `origin/main` at `f071763` (read from the local clone, not fetched). **The owner decided D1–D17 on 2026-10-27 as recommended (§6).**
 - **Owner request (2026-10-27):** "write a plan for the mcp tooling, use the hexagen template engine, including seats and assignments."
 - **Why now:** no tool exposes seat selection. The orchestrator picks every lane's model by hand and passes it per dispatch; the round-robin between seats lives in the orchestrator's memory. The conductor gets a seat plan from K4 on, but nothing gives the orchestrating agent the same answer before then, or alongside it.
 - **Builds on:** `2026-10-16_mcp-server.md` (the narrow `apps/mcp`; M1a and M1b merged, M2–M4 open), `2026-10-23_attempt-record-gate-predicates-usage-plan.md` (S1 `SeatPlan`, `stopReason`, S3 usage), `2026-10-27_conductor-plan.md` (§3.2 rounds, §3.3 seats and review rows, §3.4, K4, K5, PC, D8 rotation state, D10), `2026-10-18_orchestrator-interaction-plan.md` (§4.5 and §4.6: T3a scopes, the MCP token's scopes), `2026-10-27_web-ui-interactivity-plan.md` (§3.6 request channel, O2c, O3, A-C, A-R, A-S, A-F), `2026-10-27_work-board-plan.md` and `2026-10-27_waits-for-view-plan.md` (WB8, WB8w), `2026-10-27_lane-run-telemetry-plan.md` (§3.2 never-send list, OT1s `billingOf`, OT2b), `2026-10-19_free-seat-flag-plan.md` (`policy.useFreeSeats`), `2026-10-25_hexagen-integration-plan.md` (contract ownership, release fan-out, `generator.name`).
@@ -367,6 +367,8 @@ Each lane is about 45 minutes, one pull request, the standard pipeline. **Parall
 None of these is a one-way door in the sense of a merge, a push or a data deletion. Each is a format other code will depend on.
 
 ## 6. Decisions for the owner
+
+**Decided 2026-10-27:** the owner accepted every default below (D1–D17) as written.
 
 | # | Question | Recommended default |
 |---|---|---|

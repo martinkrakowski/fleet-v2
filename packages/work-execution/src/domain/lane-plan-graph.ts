@@ -8,6 +8,14 @@
  * recursive); returns the first cycle found in dependency order, or null.
  * A malformed lane or reference is skipped locally — it adds no edge and
  * never hides a cycle among the well-formed remainder.
+ *
+ * An ambiguous alias (several lanes carry the former id) becomes one virtual
+ * node per (plan, alias): a reference naming it adds a single edge to that
+ * node, and the node carries one edge to each lane carrying the alias, built
+ * once per (plan, alias). Total edges grow with references plus lanes, never
+ * with their product. Virtual node keys start with a prefix no lane key can
+ * have (lane ids cannot contain `:`), and a virtual node never appears in a
+ * returned cycle: only lanes carry refs.
  */
 
 import {
@@ -32,6 +40,9 @@ export interface LanePlanGraphPlan {
   readonly lanes: readonly LanePlanGraphLane[];
   readonly exclusiveOrder?: readonly { readonly lanes: readonly string[] }[];
 }
+
+/** No lane key can start with this: lane ids cannot contain `:`. */
+const ALIAS_NODE_PREFIX = 'alias:';
 
 const WHITE = 0;
 const GREY = 1;
@@ -110,16 +121,42 @@ function buildAdjacency(
   sortedKeys: readonly PlanKey[],
   planByKey: ReadonlyMap<PlanKey, LanePlanGraphPlan>,
 ): GraphData {
-  const adjacency = new Map<NodeKey, NodeKey[]>();
+  const edgeLists = new Map<NodeKey, NodeKey[]>();
   const refs = new Map<NodeKey, PlannedLaneRef>();
   // Resolved ids are computed once per plan key, never per reference.
   const resolvedByKey = new Map<PlanKey, Map<string, readonly string[]>>(
     sortedKeys.map((key) => [key, resolveLaneIds(planByKey.get(key) as LanePlanGraphPlan)]),
   );
+  // Each ambiguous name gets one virtual node per plan, created on first use;
+  // its edges to the lanes carrying the name are built once, never per ref.
+  const aliasNodes = new Map<PlanKey, Map<string, NodeKey>>();
+  const resolveTargetNode = (
+    planKey: PlanKey,
+    name: string,
+    targetLaneIds: readonly string[],
+  ): NodeKey => {
+    let forPlan = aliasNodes.get(planKey);
+    if (forPlan === undefined) {
+      forPlan = new Map();
+      aliasNodes.set(planKey, forPlan);
+    }
+    const existing = forPlan.get(name);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const nodeKey = `${ALIAS_NODE_PREFIX}${planKey}/${name}`;
+    const targets: NodeKey[] = [];
+    for (const targetLaneId of targetLaneIds) {
+      targets.push(`${planKey}/${targetLaneId}`);
+    }
+    edgeLists.set(nodeKey, targets);
+    forPlan.set(name, nodeKey);
+    return nodeKey;
+  };
   for (const planKey of sortedKeys) {
     const plan = planByKey.get(planKey) as LanePlanGraphPlan;
     const resolved = resolvedByKey.get(planKey) as Map<string, readonly string[]>;
-    const exclusiveEdges = collectExclusiveEdges(plan, resolved);
+    const exclusiveEdges = collectExclusiveEdges(planKey, plan, resolved, resolveTargetNode);
     for (const lane of lanesOf(plan)) {
       const laneId = lane.laneId;
       if (!isString(laneId)) {
@@ -127,8 +164,9 @@ function buildAdjacency(
       }
       const source = `${planKey}/${laneId}`;
       refs.set(source, { projectId: plan.projectId, planId: plan.planId, laneId });
-      // A duplicate laneId appends its edges to the existing entry.
-      const edges = adjacency.get(source) ?? [];
+      // A duplicate laneId appends its edges to the existing entry. Each
+      // target is deduplicated once per source when the list is frozen.
+      const edges = edgeLists.get(source) ?? [];
       const afterRefs = Array.isArray(lane.after) ? lane.after : [];
       for (const candidate of afterRefs) {
         if (!isValidRef(candidate)) {
@@ -143,8 +181,10 @@ function buildAdjacency(
         if (targetLaneIds === undefined) {
           continue;
         }
-        for (const targetLaneId of targetLaneIds) {
-          edges.push(`${targetPlanKey}/${targetLaneId}`);
+        if (targetLaneIds.length === 1) {
+          edges.push(`${targetPlanKey}/${targetLaneIds[0] as string}`);
+        } else {
+          edges.push(resolveTargetNode(targetPlanKey, candidate.laneId, targetLaneIds));
         }
       }
       const fromExclusive = exclusiveEdges.get(source);
@@ -153,10 +193,29 @@ function buildAdjacency(
           edges.push(target);
         }
       }
-      adjacency.set(source, edges);
+      edgeLists.set(source, edges);
     }
   }
+  const adjacency = new Map<NodeKey, readonly NodeKey[]>();
+  for (const [node, edges] of edgeLists) {
+    adjacency.set(node, edges.length > 1 ? [...new Set(edges)] : edges);
+  }
   return { adjacency, refs };
+}
+
+/** Total adjacency entries across every node of the built graph. */
+export function laneGraphEdgeCount(plans: readonly LanePlanGraphPlan[]): number {
+  const planByKey = new Map<PlanKey, LanePlanGraphPlan>();
+  for (const plan of plans) {
+    planByKey.set(`${plan.projectId}/${plan.planId}`, plan);
+  }
+  const sortedKeys = [...planByKey.keys()].sort((a, b) => (a < b ? -1 : 1));
+  const { adjacency } = buildAdjacency(sortedKeys, planByKey);
+  let count = 0;
+  for (const edges of adjacency.values()) {
+    count += edges.length;
+  }
+  return count;
 }
 
 function lanesOf(plan: LanePlanGraphPlan): readonly LanePlanGraphLane[] {
@@ -225,9 +284,16 @@ function addResolution(resolved: Map<string, string[]>, name: string, laneId: st
   }
 }
 
+/**
+ * Each lane resolving an entry's `lanes[k]` waits on the lanes resolving
+ * `lanes[k - 1]`. An ambiguous target name collapses to its virtual node, so
+ * the edge count grows with the from-side lanes, never with their product.
+ */
 function collectExclusiveEdges(
+  planKey: PlanKey,
   plan: LanePlanGraphPlan,
   resolved: ReadonlyMap<string, readonly string[]>,
+  resolveTargetNode: (planKey: PlanKey, name: string, targets: readonly string[]) => NodeKey,
 ): Map<NodeKey, NodeKey[]> {
   const map = new Map<NodeKey, NodeKey[]>();
   const entries = Array.isArray(plan.exclusiveOrder) ? plan.exclusiveOrder : [];
@@ -239,17 +305,12 @@ function collectExclusiveEdges(
       if (fromTargets === undefined || toTargets === undefined) {
         continue;
       }
+      const toNode = resolveTargetNode(planKey, names[k - 1], toTargets);
       for (const fromResolved of fromTargets) {
-        for (const toResolved of toTargets) {
-          const fromKey = `${plan.projectId}/${plan.planId}/${fromResolved}`;
-          const toKey = `${plan.projectId}/${plan.planId}/${toResolved}`;
-          const targets = map.get(fromKey);
-          if (targets === undefined) {
-            map.set(fromKey, [toKey]);
-          } else {
-            targets.push(toKey);
-          }
-        }
+        const fromKey = `${planKey}/${fromResolved}`;
+        const targets = map.get(fromKey) ?? [];
+        targets.push(toNode);
+        map.set(fromKey, targets);
       }
     }
   }

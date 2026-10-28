@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   findLanePlanCycle,
   formatLanePlanCycle,
+  laneGraphEdgeCount,
 } from '../lane-plan-graph.js';
 import type { LanePlanGraphLane, LanePlanGraphPlan } from '../lane-plan-graph.js';
 import { LANE_PLAN_LIMITS } from '../lane-plan-records.js';
@@ -314,6 +315,52 @@ describe('findLanePlanCycle', () => {
       }
       plans.push(plan('example-project', `plan-${p}`, lanes));
     }
+    // A cold JIT in the test runner puts the single call near vitest's 5s
+    // default; the point of the test is completion and bounded edges, not a
+    // wall-clock budget, so give it headroom explicitly.
     expect(findLanePlanCycle(plans)).toBeNull();
+  }, 20000);
+
+  it('keeps the edge count linear when 300 lanes share one ambiguous alias', () => {
+    const laneCount = LANE_PLAN_LIMITS.lanes;
+    const refCount = LANE_PLAN_LIMITS.after;
+    const shared = plan(
+      'example-project',
+      'plan-1',
+      Array.from({ length: laneCount }, (_, i) => lane(`L${i}`, [], { aliases: ['SHARED'] })),
+    );
+    const pointing = plan(
+      'example-project',
+      'plan-2',
+      Array.from({ length: laneCount }, (_, i) =>
+        lane(
+          `L${i}`,
+          Array.from({ length: refCount }, () => 'example-project/plan-1/SHARED'),
+        ),
+      ),
+    );
+    const plans = [shared, pointing];
+    expect(findLanePlanCycle(plans)).toBeNull();
+    // 300 lanes x 32 refs, plus the alias node's 300 edges, plus 300 more —
+    // never 300 x 32 x 300.
+    expect(laneGraphEdgeCount(plans)).toBeLessThanOrEqual(laneCount * refCount + laneCount + laneCount);
+  });
+
+  it('finds a cycle through an ambiguous-alias node and prints real lane ids only', () => {
+    const plan1 = plan('example-project', 'plan-1', [
+      lane('A', ['example-project/plan-2/C'], { aliases: ['S'] }),
+      lane('B', [], { aliases: ['S'] }),
+    ]);
+    const plan2 = plan('example-project', 'plan-2', [
+      lane('C', ['example-project/plan-1/S']),
+    ]);
+    const cycle = findLanePlanCycle([plan1, plan2]);
+    expect(cycle).toEqual([
+      { projectId: 'example-project', planId: 'plan-1', laneId: 'A' },
+      { projectId: 'example-project', planId: 'plan-2', laneId: 'C' },
+    ]);
+    expect(formatLanePlanCycle(cycle as PlannedLaneRef[])).toBe(
+      'example-project/plan-1/A -> example-project/plan-2/C -> example-project/plan-1/A',
+    );
   });
 });

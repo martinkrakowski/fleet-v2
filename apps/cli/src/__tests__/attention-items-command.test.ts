@@ -100,11 +100,11 @@ describe('coordination attention-items and attention-dismiss', () => {
     const allDoc = parseDocument(all.stdout);
     const allItems = allDoc.items as Array<Record<string, unknown>>;
     expect(allItems).toHaveLength(2);
-    expect(
-      allItems.map((entry) => (entry.item as Record<string, unknown>).workOrderId).sort((a, b) =>
-        String(a).localeCompare(String(b)),
-      ),
-    ).toEqual(['wo-example-1', 'wo-example-2']);
+    // Store order: the order the items were raised.
+    expect(allItems.map((entry) => (entry.item as Record<string, unknown>).workOrderId)).toEqual([
+      'wo-example-1',
+      'wo-example-2',
+    ]);
 
     const filtered = await runCoordination(
       runtime,

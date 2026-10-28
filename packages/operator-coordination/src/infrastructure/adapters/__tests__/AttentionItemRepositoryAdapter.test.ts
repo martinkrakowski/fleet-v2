@@ -275,6 +275,24 @@ describe('AttentionItemRepositoryAdapter', () => {
     expect(entries).toHaveLength(1);
   });
 
+  it('quarantines a file holding two items with one key and never reads either', async () => {
+    const first = raiseItem({ itemId: 'att-example-1' });
+    const second = raiseItem({ itemId: 'att-example-2' });
+    await fs.writeFile(
+      path.join(tempDir, 'attention-items.json'),
+      JSON.stringify([
+        { revision: 1, item: first },
+        { revision: 1, item: second },
+      ]),
+      'utf8',
+    );
+    const adapter = new AttentionItemRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.list()).rejects.toBeInstanceOf(StateFileUnreadableError);
+    await expect(adapter.get('att-example-1')).rejects.toBeInstanceOf(StateFileUnreadableError);
+    const entries = await fs.readdir(path.join(tempDir, 'quarantine'));
+    expect(entries).toHaveLength(1);
+  });
+
   it('refuses file names that collide with another store or are unsafe', async () => {
     for (const name of ['owner-items.json', '../x']) {
       const unsafe = new AttentionItemRepositoryAdapter({ stateDir: tempDir, fileName: name });

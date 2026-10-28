@@ -40,7 +40,7 @@ import type {
   ChangeSignalPort,
 } from "../../application/ports/out/ChangeSignalPort.out-port.js";
 import { NoopChangeSignalAdapter } from "./NoopChangeSignalAdapter.adapter.js";
-import { withFileLock, writeJsonAtomically } from "./file-store.js";
+import { quarantineUnreadable, withFileLock, writeJsonAtomically } from "./file-store.js";
 import { readRecordList, readRevisionedEntry } from "./record-list-store.js";
 
 export interface AttentionItemRepositoryAdapterOptions {
@@ -344,7 +344,16 @@ export class AttentionItemRepositoryAdapter implements AttentionItemRepositoryPo
       parseAttentionItemStateRecord,
     );
     const map = new Map<string, StoredAttentionItem>();
+    const keys = new Set<string>();
     for (const stored of records) {
+      // One item per key is a store invariant: a file breaking it is unreadable as a whole and its exact
+      // bytes are quarantined, never half-read.
+      const key = attentionItemKey(stored.item.projectId, stored.item.subject, stored.item.kind);
+      if (keys.has(key) || map.has(stored.item.itemId)) {
+        const bytes = await fs.readFile(path);
+        return quarantineUnreadable(path, "two attention items share one key or id", bytes);
+      }
+      keys.add(key);
       map.set(stored.item.itemId, stored);
     }
     return map;

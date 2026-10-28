@@ -124,19 +124,22 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
         `Independent review requires a distinct underlying model: ${request.reviewerModel} and ${request.implementerModel} share the same underlying model`,
       );
     }
-    const existing = await deps.repo.findAssessmentById(request.assessmentId);
-    if (existing === null) {
-      return rejectedFor(
-        request,
-        'no-assessment',
-        `No assessment exists for assessmentId '${request.assessmentId}'`,
-      );
-    }
+    // A new review checks the seat policy before any assessment read (FS3b). Only a request carrying a
+    // requestId reads the assessment first, to replay a stored receipt without consulting the seat.
+    let existing: Awaited<ReturnType<typeof deps.repo.findAssessmentById>> = null;
     // A replayed request id never runs a second review (§3.5): the recorded receipt answers when reviewer,
     // kind and head match and the assessment still matches the request. Replay runs before the seat policy —
     // a stored receipt needs no new seat — and before the head and identity checks so a reused id always gets
     // its typed code. Any other reuse (a different head included) is request-id-reused.
     if (request.requestId !== undefined) {
+      existing = await deps.repo.findAssessmentById(request.assessmentId);
+      if (existing === null) {
+        return rejectedFor(
+          request,
+          'no-assessment',
+          `No assessment exists for assessmentId '${request.assessmentId}'`,
+        );
+      }
       const found = existing.reviewReceipts.find(
         (receipt) => receipt.requestId === request.requestId,
       );
@@ -180,6 +183,17 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       });
       if (check.outcome === 'refused') {
         return rejectedFor(request, 'seat-refused', check.reason);
+      }
+    }
+
+    if (existing === null) {
+      existing = await deps.repo.findAssessmentById(request.assessmentId);
+      if (existing === null) {
+        return rejectedFor(
+          request,
+          'no-assessment',
+          `No assessment exists for assessmentId '${request.assessmentId}'`,
+        );
       }
     }
 

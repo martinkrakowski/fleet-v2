@@ -37,6 +37,8 @@ import { isValidAgyModel } from './AgyRunnerAdapter.adapter.js';
 import type {
   CommitLaneOutputRequest,
   CommitLaneOutputResult,
+  PrepareLaneWorktreeRequest,
+  PrepareLaneWorktreeResult,
 } from '../../application/ports/out/WorkspacePort.out-port.js';
 
 /**
@@ -124,6 +126,50 @@ const CAT_TIMEOUT_MS = 60 * 1000;
 const COMMIT_GIT_CONFIG: readonly string[] = [
   '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false', '-c', 'core.fsmonitor=false',
 ];
+
+/**
+ * K7-5a: the branch a lane run's worktree is created on — 'fleet/' + runId,
+ * where the run id is 'run-' + a 25-character ULID (Crockford alphabet,
+ * first character 0–7).
+ */
+const LANE_RUN_BRANCH_PATTERN = /^fleet\/run-[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
+
+/** K7-5a: the work order's base commit, 40 lowercase hex. */
+const BASE_COMMIT_PATTERN = /^[0-9a-f]{40}$/;
+
+/**
+ * K7-5a validation: whether `value` is an absolute, normalised path — no
+ * `..` or `.` segments, no doubled or trailing slash, no NUL, not the
+ * filesystem root. Fixed refusal reasons only; the path is never echoed.
+ */
+function isAbsoluteNormalisedPath(value: string): boolean {
+  if (typeof value !== 'string' || !value.startsWith('/') || value === '/' || value.includes('\0')) {
+    return false;
+  }
+  if (value.includes('//') || value.endsWith('/')) {
+    return false;
+  }
+  return value
+    .slice(1)
+    .split('/')
+    .every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+}
+
+/**
+ * K7-5a validation of one `prepareLaneWorktree` request, before any command
+ * runs: both paths absolute and normalised, the worktree path outside the
+ * clone, the branch a lane-run branch and the base a 40-hex commit.
+ */
+export function prepareLaneWorktreeRequestIsValid(request: PrepareLaneWorktreeRequest): boolean {
+  const { clonePath, worktreePath, branch, baseCommit } = request;
+  if (!isAbsoluteNormalisedPath(clonePath) || !isAbsoluteNormalisedPath(worktreePath)) {
+    return false;
+  }
+  if (worktreePath === clonePath || worktreePath.startsWith(`${clonePath}/`)) {
+    return false;
+  }
+  return LANE_RUN_BRANCH_PATTERN.test(branch) && BASE_COMMIT_PATTERN.test(baseCommit);
+}
 const COMMIT_HEAD_PATTERN = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 const COMMIT_ATTEMPT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
@@ -507,5 +553,125 @@ export class WorkspaceAdapter implements WorkspacePort {
 
     // 10. Done.
     return { outcome: 'committed', headCommit: commit, branchRef };
+  }
+
+  /**
+   * K7-5a (K7-D7, "Start reserves first"): create the run's worktree at
+   * exactly the path the capacity reserve chose, on a new branch at the
+   * work order's base, in the project's clone, through the reserved host's
+   * executor. One `worktree add` with no `--force`; a worktree already
+   * prepared exactly this way reads as `already-prepared` so a retried
+   * start is safe. It never removes, resets or checks out anything.
+   */
+  async prepareLaneWorktree(request: PrepareLaneWorktreeRequest): Promise<PrepareLaneWorktreeResult> {
+    // 1. Validate before any command runs (no executor call on a bad request).
+    if (prepareLaneWorktreeRequestIsValid(request) !== true) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+
+    // 2. The write runs on the reserved host's executor; an unresolvable
+    //    host is a transport failure: the worktree may or may not exist.
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(request.recordedHost);
+    } catch {
+      return { outcome: 'unknown' };
+    }
+
+    const { clonePath, worktreePath, branch, baseCommit } = request;
+
+    try {
+      // 3. Already there? A path that exists must be exactly what a prior
+      //    start of this run would have made; anything else is refused.
+      if (await this.pathExists(worktreePath, worktreePath, executor)) {
+        return await this.alreadyPreparedOutcome(executor, clonePath, worktreePath, branch, baseCommit);
+      }
+
+      // 4. Branch taken elsewhere? (`--verify --quiet`: exit 1 means free.)
+      const branchRun = await executor.run(
+        ['git', '-C', clonePath, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (branchRun.exitCode === null || branchRun.error !== undefined) {
+        return { outcome: 'unknown' };
+      }
+      if (branchRun.exitCode === 0) {
+        return { outcome: 'refused', reason: 'branch-exists-other' };
+      }
+      if (branchRun.exitCode !== 1) {
+        return { outcome: 'refused', reason: 'git-refused' };
+      }
+
+      // 5. Create: one call, no `--force`. A non-zero exit refuses; a thrown
+      //    or unanswered command is `unknown` — the worktree may or may not exist.
+      const addRun = await executor.run(
+        [
+          'git', '-C', clonePath, '-c', 'core.hooksPath=/dev/null',
+          'worktree', 'add', '-b', branch, worktreePath, baseCommit,
+        ],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (addRun.exitCode === null || addRun.error !== undefined) {
+        return { outcome: 'unknown' };
+      }
+      return addRun.exitCode === 0
+        ? { outcome: 'prepared' }
+        : { outcome: 'refused', reason: 'git-refused' };
+    } catch {
+      return { outcome: 'unknown' };
+    }
+  }
+
+  /**
+   * K7-5a, step 3's read side: prove the existing path is exactly the
+   * prepared worktree — a listed worktree of this clone, on `branch`, HEAD
+   * at `baseCommit`, nothing uncommitted or untracked — or refuse. A
+   * command that never reported an exit code is `unknown`, not a refusal.
+   */
+  private async alreadyPreparedOutcome(
+    executor: CommandExecutorPort,
+    clonePath: string,
+    worktreePath: string,
+    branch: string,
+    baseCommit: string,
+  ): Promise<PrepareLaneWorktreeResult> {
+    const [headRun, statusRun, listRun] = await Promise.all([
+      executor.run(
+        ['git', '-C', worktreePath, 'rev-parse', '--show-toplevel', '--abbrev-ref', 'HEAD', 'HEAD'],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      ),
+      executor.run(
+        ['git', '-C', worktreePath, 'status', '--porcelain', '--untracked-files=all'],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      ),
+      executor.run(['git', '-C', clonePath, 'worktree', 'list', '--porcelain'], {
+        timeoutMs: GIT_TIMEOUT_MS,
+      }),
+    ]);
+    const commands = [headRun, statusRun, listRun];
+    if (commands.some((run) => run.exitCode === null || run.error !== undefined)) {
+      return { outcome: 'unknown' };
+    }
+    if (commands.some((run) => run.exitCode !== 0)) {
+      return { outcome: 'refused', reason: 'path-exists-other' };
+    }
+    const revParseLines = headRun.stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line !== '');
+    const [toplevel, checkedBranch, head] = revParseLines;
+    const listedWorktrees = listRun.stdout
+      .split('\n')
+      .filter((line) => line.startsWith('worktree '))
+      .map((line) => unquotePorcelainPath(line.slice('worktree '.length).trim()));
+    const exactlyPrepared =
+      toplevel === worktreePath &&
+      checkedBranch === branch &&
+      head === baseCommit &&
+      statusRun.stdout.trim() === '' &&
+      listedWorktrees.includes(worktreePath);
+    return exactlyPrepared
+      ? { outcome: 'already-prepared' }
+      : { outcome: 'refused', reason: 'path-exists-other' };
   }
 }

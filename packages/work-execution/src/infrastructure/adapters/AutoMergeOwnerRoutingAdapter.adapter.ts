@@ -29,11 +29,19 @@ export interface AutoMergeOwnerRoutingDelegates {
   readonly newQuestionId?: () => string;
 }
 
+/** A notice line on one line: line breaks and other control characters become spaces. */
+function oneLine(text: string): string {
+  return Array.from(text, (char) => {
+    const code = char.codePointAt(0) ?? 0;
+    return code < 0x20 || code === 0x7f ? ' ' : char;
+  }).join('');
+}
+
 /** `reason`, then each line after `' | '`, cut to 1000 characters. */
 function summaryOf(notice: AutoMergeNotice): string {
   let summary = notice.reason;
   for (const line of notice.lines) {
-    summary = summary + ' | ' + line;
+    summary = summary + ' | ' + oneLine(line);
   }
   return summary.slice(0, 1000);
 }
@@ -46,7 +54,7 @@ function bodyOf(notice: AutoMergeNotice): string {
     'Head: ' + (notice.headSha ?? 'none'),
   ];
   for (const line of notice.lines) {
-    lines.push('- ' + line);
+    lines.push('- ' + oneLine(line));
   }
   return lines.join('\n').slice(0, 8000);
 }
@@ -80,6 +88,8 @@ export class AutoMergeOwnerRoutingAdapter implements AutoMergeOwnerRoutingPort {
         return { outcome: 'exists' };
       case 'refused':
         return { outcome: 'refused', reason: 'attention item refused: ' + answer.code };
+      default:
+        return { outcome: 'refused', reason: 'unexpected attention answer' };
     }
   }
 
@@ -138,6 +148,8 @@ export class AutoMergeOwnerRoutingAdapter implements AutoMergeOwnerRoutingPort {
         return { outcome: 'exists' };
       case 'refused':
         return { outcome: 'refused', reason: 'owner question refused' };
+      default:
+        return { outcome: 'refused', reason: 'unexpected owner question answer' };
     }
   }
 }

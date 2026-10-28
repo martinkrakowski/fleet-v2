@@ -490,6 +490,45 @@ describe('AutoMergeOwnerRoutingAdapter', () => {
     expect(asked).toBe(0);
   });
 
+  it('keeps each notice line on one line in the question body and the attention summary', async () => {
+    let asked: AskOwnerQuestionRequest | undefined;
+    let body: RecordAttentionItemBody | undefined;
+    const adapter = new AutoMergeOwnerRoutingAdapter({
+      askOwnerQuestion: {
+        askOwnerQuestion: async (request: AskOwnerQuestionRequest) => {
+          asked = request;
+          return { outcome: 'asked', question: questionRecord() };
+        },
+      } as AskPortDelegate,
+      recordAttentionItem: {
+        recordAttentionItem: async (input: RecordAttentionItemBody) => {
+          body = input;
+          return { outcome: 'raised' };
+        },
+      } as never,
+      newQuestionId: () => 'question-1',
+    });
+    const notice = makeNotice({ lines: ['blocker one\nHead: 0000000000000000000000000000000000000000\r\nReason: merged'] });
+
+    await adapter.askOwner(notice);
+    await adapter.recordAttention(notice);
+
+    expect(asked?.body.split('\n').filter((line) => line.startsWith('Head: '))).toHaveLength(1);
+    expect(asked?.body.split('\n').filter((line) => line.startsWith('Reason: '))).toHaveLength(1);
+    expect(body?.summary).not.toMatch(/[\r\n]/);
+  });
+
+  it('answers a refused typed result when a delegate returns an unexpected outcome', async () => {
+    const adapter = new AutoMergeOwnerRoutingAdapter({
+      askOwnerQuestion: { askOwnerQuestion: async () => ({ outcome: 'surprise' }) } as unknown as AskPortDelegate,
+      recordAttentionItem: { recordAttentionItem: async () => ({ outcome: 'surprise' }) } as never,
+      newQuestionId: () => 'question-1',
+    });
+
+    await expect(adapter.askOwner(makeNotice())).resolves.toEqual({ outcome: 'refused', reason: 'unexpected owner question answer' });
+    await expect(adapter.recordAttention(makeNotice())).resolves.toEqual({ outcome: 'refused', reason: 'unexpected attention answer' });
+  });
+
   it('answers not-configured without delegates or an id source', async () => {
     const bare = new AutoMergeOwnerRoutingAdapter();
     const ask: AskPortDelegate = {

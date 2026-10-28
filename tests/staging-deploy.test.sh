@@ -1,4 +1,5 @@
 #!/bin/sh
+echo "deliberate failure: proves a failed shard turns the aggregate gate red (throwaway PR, never merged)"; exit 1
 # Tests for deploy/staging/deploy.sh. Nothing here can reach a cluster, a registry or a node:
 #   - a throwaway git repository holds a copy of deploy/staging and of the .gitignore that keeps
 #     staging.env untracked; every change to it is committed, because the script builds from HEAD

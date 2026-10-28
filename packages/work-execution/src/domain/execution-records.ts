@@ -305,4 +305,9 @@ export interface ActionJournalEntryRecord {
    * evidence only, never proof of ownership.
    */
   readonly observedSessionIds?: readonly string[];
+  /**
+   * Who authorised a forge action (auto-merge plan A8): `policy:autoMerge@<rev>` or
+   * `policy:conductor@<rev>` for a policy grant. Absent means an owner grant.
+   */
+  readonly authorizedBy?: string;
 }

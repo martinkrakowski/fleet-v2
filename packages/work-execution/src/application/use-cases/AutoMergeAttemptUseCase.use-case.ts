@@ -1,4 +1,4 @@
-// Implemented use case — auto-merge policy station (AM4a-2, up to the merge).
+// Implemented use case — auto-merge policy station (AM4a-3, through the merge).
 /**
  * AutoMergeAttemptUseCase implements AutoMergeAttemptPort.
  *
@@ -16,10 +16,14 @@
  * the same head and a remaining `ci-pending` blocker falls to `onBlocked`.
  * No timer runs.
  *
- * In this part an eligible attempt reports `merge-not-wired`: the grant and
- * forge dependencies are declared but never called (AM4a-3 calls them). An
- * empty blocker list is never read as pending; unreadable facts route to
- * attention rather than being guessed.
+ * An eligible attempt is granted one `merge-pr` policy grant at its accepted
+ * head, the setting is re-read (A7) and a change stops before the forge, and
+ * the merge runs through ExecuteAuthorizedForgeAction with the grant id and its
+ * policy decision revision. Forge refusals ask the owner whatever onBlocked
+ * says; an ambiguous or thrown forge outcome suspends auto-merge; a refusal
+ * with no kind is a moved head only when the stored head moved. An empty
+ * blocker list is never read as pending; unreadable facts route to attention
+ * rather than being guessed.
  */
 
 import type {
@@ -43,8 +47,14 @@ import type {
   AcceptanceAssessmentResult,
 } from '../ports/out/AcceptanceAssessmentPort.out-port.js';
 import type { AutoMergeOwnerRoutingPort } from '../ports/out/AutoMergeOwnerRoutingPort.out-port.js';
-import type { PolicyMergeGrantPort } from '../ports/out/PolicyMergeGrantPort.out-port.js';
-import type { ExecuteAuthorizedForgeActionPort } from '../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
+import type {
+  PolicyMergeGrantPort,
+  PolicyMergeGrantResult,
+} from '../ports/out/PolicyMergeGrantPort.out-port.js';
+import type {
+  ExecuteAuthorizedForgeActionPort,
+  ExecuteAuthorizedForgeActionResult,
+} from '../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
 import type {
   ActionJournalEntryRecord,
   AttemptRecord,
@@ -56,7 +66,9 @@ import { readExactPlainRecord } from '../../domain/plain-record-reads.js';
 import {
   AUTO_MERGE_HEAD_PATTERN,
   AUTO_MERGE_ROUTE_RULE,
+  autoMergeActionId,
   autoMergeBlockersOf,
+  autoMergeDecisionRevision,
   autoMergeDoorsOf,
   autoMergeFirstLookEntryId,
   autoMergeForgeEntryPrefix,
@@ -67,6 +79,7 @@ import {
   type AutoMergeBlocker,
   type AutoMergeOnBlocked,
   type AutoMergeReason,
+  type AutoMergeSettings,
 } from '../../domain/auto-merge.js';
 
 export interface AutoMergeAttemptDependencies {
@@ -316,8 +329,8 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
           'stale: the acceptance evidence does not cover this head',
         ]);
       }
-      // Eligible — and in this part the merge is not wired yet.
-      return this.notMerged(headCtx, 'merge-not-wired', 'the merge step is not wired yet');
+      // Eligible: one grant, an A7 re-read, then the merge.
+      return this.performMerge(deps, headCtx, attempt, workOrder, head, assessment.receiptId, settings.settings);
     }
     const blockers: readonly AutoMergeBlocker[] = autoMergeBlockersOf(
       assessment.outcome === 'rejected' || assessment.outcome === 'unknown' ? assessment.blockerDetails : undefined,
@@ -408,6 +421,136 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
     } catch {
       return { kind: 'unreadable' as const };
     }
+  }
+
+  /**
+   * AM4a-3 step 4.4: the eligible attempt gets one policy grant, the setting is
+   * re-read (A7), and the merge runs through ExecuteAuthorizedForgeAction with
+   * the grant id and the policy decision revision. Every §4 forge exception is
+   * routed here; an ambiguous or thrown forge outcome suspends auto-merge.
+   */
+  private async performMerge(
+    deps: AutoMergeAttemptDependencies,
+    ctx: RoutingContext,
+    attempt: AttemptRecord,
+    workOrder: WorkOrderRecord,
+    head: string,
+    receiptId: string,
+    settings: AutoMergeSettings,
+  ): Promise<AutoMergeAttemptResult> {
+    // 1. Both dependencies are required; otherwise the merge is not wired.
+    if (!deps.policyMergeGrant || !deps.executeForgeAction) {
+      return this.notMerged(ctx, 'merge-not-wired', 'the merge step is not wired yet');
+    }
+
+    // 2. One policy grant for this head. A refusal, a throw or an unexpected
+    // answer is a refused grant; a superseded grant is noted and not routed.
+    let grant: PolicyMergeGrantResult;
+    try {
+      grant = await deps.policyMergeGrant.issuePolicyMergeGrant({
+        projectId: workOrder.projectId,
+        workOrderId: workOrder.id,
+        attemptId: attempt.id,
+        expectedHeadSha: head,
+        policyRevision: workOrder.policyRevision,
+        acceptanceReceiptId: receiptId,
+        settingRevision: settings.revision,
+      });
+    } catch {
+      return this.notMerged(ctx, 'grant-refused', 'the policy grant could not be issued', [
+        'the policy grant could not be issued',
+      ]);
+    }
+    if (grant.outcome === 'superseded') {
+      return this.notMerged(ctx, 'grant-superseded', 'the grant was superseded');
+    }
+    if (grant.outcome === 'refused') {
+      const line = grant.reason.slice(0, MAX_DETAIL_TEXT);
+      return this.notMerged(ctx, 'grant-refused', line, [line]);
+    }
+    if (grant.outcome !== 'issued') {
+      return this.notMerged(ctx, 'grant-refused', 'the grant answer was unexpected', [
+        'the grant answer was unexpected',
+      ]);
+    }
+    // The grant id is read once, as an own data property: never inherited, never an accessor.
+    const grantIdDescriptor = Object.getOwnPropertyDescriptor(grant, 'grantId');
+    const grantId =
+      grantIdDescriptor !== undefined && 'value' in grantIdDescriptor ? (grantIdDescriptor.value as unknown) : undefined;
+    if (
+      typeof grantId !== 'string' ||
+      grantId.trim() === '' ||
+      grant.decisionRevision !== autoMergeDecisionRevision(settings.revision)
+    ) {
+      return this.notMerged(ctx, 'grant-revision-mismatch', 'the grant does not name the setting revision', [
+        'the grant does not name the setting revision',
+      ]);
+    }
+
+    // 3. A7: the setting is re-read; a change stops before the forge and leaves
+    // the grant unspent for the writer to cancel.
+    let reread: ReturnType<typeof readAutoMergeSettingsAnswer>;
+    try {
+      reread = readAutoMergeSettingsAnswer(await deps.settings.readAutoMergeSettings());
+    } catch {
+      reread = { kind: 'unreadable', reason: 'settings port threw' };
+    }
+    if (
+      reread.kind !== 'on' ||
+      reread.settings.revision !== settings.revision ||
+      reread.settings.forgeMode !== settings.forgeMode
+    ) {
+      return this.notMerged(ctx, 'setting-changed', 'the auto-merge setting changed after the grant was issued');
+    }
+
+    // 4. The merge runs only at the same head, with the grant and the decision
+    // revision that authorised it (A8).
+    let forgeResult: ExecuteAuthorizedForgeActionResult;
+    try {
+      forgeResult = await deps.executeForgeAction.executeAuthorizedForgeAction({
+        actionId: autoMergeActionId(attempt.id, head),
+        attemptId: attempt.id,
+        workOrderId: workOrder.id,
+        kind: 'merge-pr',
+        expectedHeadSha: head,
+        authorizationGrantId: grantId,
+        authorizedBy: grant.decisionRevision,
+      });
+    } catch {
+      return this.notMerged(ctx, 'forge-ambiguous', 'the forge action threw', ['the forge action threw']);
+    }
+    if (forgeResult.outcome === 'executed') {
+      return {
+        outcome: 'merged',
+        attemptId: attempt.id,
+        headSha: head,
+        ...(forgeResult.pullRequestNumber !== undefined ? { pullRequestNumber: forgeResult.pullRequestNumber } : {}),
+        decisionRevision: grant.decisionRevision,
+      };
+    }
+    // Forge text (gh stderr) is capped before it reaches a result or a record.
+    const forgeLine = forgeResult.reason.slice(0, MAX_DETAIL_TEXT);
+    if (forgeResult.forgeAmbiguous === true) {
+      return this.notMerged(ctx, 'forge-ambiguous', forgeLine, [forgeLine]);
+    }
+    if (forgeResult.forgeRefusalKind !== undefined) {
+      return this.notMerged(ctx, 'forge-refused', forgeLine, [
+        'refusal kind: ' + forgeResult.forgeRefusalKind,
+        forgeLine,
+      ]);
+    }
+    // A refusal with no forge kind: a moved head goes back through acceptance at
+    // its new head; otherwise the refusal happened before the grant was spent.
+    let currentAttempt: AttemptRecord | null;
+    try {
+      currentAttempt = await deps.attemptRepo.findAttemptById(attempt.id);
+    } catch {
+      currentAttempt = null;
+    }
+    if (currentAttempt === null || currentAttempt.artifacts?.headCommit !== head) {
+      return this.notMerged(ctx, 'head-moved', 'the attempt head moved during the merge attempt');
+    }
+    return this.notMerged(ctx, 'forge-refused-before-grant', forgeLine, [forgeLine]);
   }
 
   /**

@@ -242,15 +242,21 @@ export function pricingSafe(span: { readonly kind: unknown; readonly attributes:
     if (typeof attributes !== 'object' || attributes === null || Array.isArray(attributes)) {
       return false;
     }
-    const snapshot = attributes as Record<string, unknown>;
-    // Reading every own value surfaces any throwing getter; a throw reads as unsafe.
-    for (const key of Object.keys(snapshot)) {
-      void snapshot[key];
+    // Every own key, enumerable or not (symbols are never attribute names), is
+    // read once through its descriptor into a null-prototype snapshot; an
+    // accessor reads as unsafe, so no getter can hide or change a priced key.
+    const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (const key of Object.getOwnPropertyNames(attributes)) {
+      const descriptor = Object.getOwnPropertyDescriptor(attributes, key);
+      if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) {
+        return false;
+      }
+      snapshot[key] = descriptor.value;
     }
-    const hasPricedKey =
-      Object.prototype.hasOwnProperty.call(snapshot, 'llm.model_name') ||
-      Object.prototype.hasOwnProperty.call(snapshot, 'llm.provider') ||
-      Object.keys(snapshot).some((key) => key.startsWith('llm.cost.'));
+    const keys = Object.keys(snapshot);
+    const hasPricedKey = keys.some(
+      (key) => key === 'llm.model_name' || key === 'llm.provider' || key.startsWith('llm.cost.'),
+    );
     if (!hasPricedKey) {
       return true;
     }

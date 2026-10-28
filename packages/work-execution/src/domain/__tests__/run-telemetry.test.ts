@@ -177,6 +177,8 @@ describe('pricingSafe', () => {
     ['a plan-billed LLM span with a cost', { kind: 'LLM', attributes: { 'fleet.seat.billing': 'plan', 'llm.cost.total': 1 } }],
     ['an LLM span with a prompt cost and no billing', { kind: 'LLM', attributes: { 'llm.cost.prompt': 1 } }],
     ['null attributes', { kind: 'LLM', attributes: null }],
+    ['an AGENT span carrying a provider', { kind: 'AGENT', attributes: { 'llm.provider': 'x' } }],
+    ['an AGENT span with a non-enumerable cost', { kind: 'AGENT', attributes: Object.defineProperty({}, 'llm.cost.total', { value: 1, enumerable: false }) }],
   ])('is false for %s', (_label, span) => {
     expect(pricingSafe(span)).toBe(false);
   });

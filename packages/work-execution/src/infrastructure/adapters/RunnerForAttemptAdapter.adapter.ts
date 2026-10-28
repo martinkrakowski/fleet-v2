@@ -14,6 +14,9 @@
  *   Otherwise one `ExecutionRunnerAdapter` is built and cached per host name
  *   from the installation's hosts, with the same environment and options as
  *   today's single adapter, per host.
+ * - **Recorded agy host:** a confirmed agy host gets an `AgyRunnerAdapter`
+ *   when the root supplies an agy executor for it, and is refused otherwise
+ *   (exactly as before when no executor is given).
  */
 
 import type {
@@ -40,6 +43,7 @@ import {
   type ExecutionRunnerHost,
   type SubprocessRunner,
 } from "./ExecutionRunnerAdapter.adapter.js";
+import { AgyRunnerAdapter } from "./AgyRunnerAdapter.adapter.js";
 
 export type { RunnerForAttemptHostSpec } from "./ConfirmRecordedHost.js";
 
@@ -71,6 +75,10 @@ export interface RunnerForAttemptAdapterOptions {
   readonly resolveAttempt?: (
     attemptId: string,
   ) => Promise<AttemptRecord | null> | AttemptRecord | null;
+  /** AG-2: the executor that runs `bin/agy-run` on a named agy lane-runner host; absent keeps agy refused. */
+  readonly agyExecutorForHost?: (hostName: string) => CommandExecutorPort | null;
+  /** AG-2: the agy-run script path for every agy host (the adapter's default when absent). */
+  readonly agyRunBin?: string;
 }
 
 /** The confirm-or-unknown refusal, naming the recorded host. */
@@ -97,20 +105,43 @@ export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
       return { ok: false, reason: confirmed.reason };
     }
 
+    const name = confirmed.name;
+    const spec = confirmed.spec;
+    const currentKind = spec.runner?.kind ?? "opencode";
+    const currentTransport = confirmed.transport;
+
+    // AG-2: a confirmed agy host gets an AgyRunnerAdapter when the root gives
+    // an executor for that host; without one the old refusal stands unchanged.
+    if (currentKind === "agy") {
+      if (this.options.agyExecutorForHost === undefined) {
+        return {
+          ok: false,
+          reason: `recorded host ${name} runner kind ${currentKind} has no adapter`,
+        };
+      }
+      const cachedAgy = this.adapters.get(name);
+      if (cachedAgy !== undefined) return { ok: true, runner: cachedAgy };
+      const builtAgy = this.buildAgyRunner(name, spec, currentTransport);
+      if (builtAgy === null) {
+        return {
+          ok: false,
+          reason: `recorded host ${name} has no agy executor`,
+        };
+      }
+      this.adapters.set(name, builtAgy);
+      return { ok: true, runner: builtAgy };
+    }
+
     // H9b1 follow-up (Fable review): only the `opencode` runner kind has an
-    // adapter. A confirmed host whose current runner kind is not `opencode`
-    // is refused instead of building an ocm-run adapter for it.
-    const currentKind = confirmed.spec.runner?.kind ?? "opencode";
+    // ocm-run adapter. Any other confirmed kind is refused instead of
+    // building an ocm-run adapter for it.
     if (currentKind !== "opencode") {
       return {
         ok: false,
-        reason: `recorded host ${confirmed.name} runner kind ${currentKind} has no adapter`,
+        reason: `recorded host ${name} runner kind ${currentKind} has no adapter`,
       };
     }
 
-    const name = confirmed.name;
-    const spec = confirmed.spec;
-    const currentTransport = confirmed.transport;
     const cached = this.adapters.get(name);
     if (cached !== undefined) return { ok: true, runner: cached };
 
@@ -151,11 +182,47 @@ export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
       ...(this.options?.runnerTransport !== undefined
         ? { runnerTransport: this.options.runnerTransport }
         : {}),
+      ...this.sharedResolvers(),
+    });
+  }
+
+  /** Resolvers forwarded to every per-host runner adapter (opencode and agy). */
+  private sharedResolvers(): Pick<
+    RunnerForAttemptAdapterOptions,
+    'resolveWorktreePath' | 'resolveAttempt'
+  > {
+    return {
       ...(this.options?.resolveWorktreePath !== undefined
         ? { resolveWorktreePath: this.options.resolveWorktreePath }
         : {}),
       ...(this.options?.resolveAttempt !== undefined
         ? { resolveAttempt: this.options.resolveAttempt }
+        : {}),
+    };
+  }
+
+  /** Build the agy runner adapter for one confirmed agy host (AG-2). */
+  private buildAgyRunner(
+    name: string,
+    spec: RunnerForAttemptHostSpec,
+    transport: "local" | "ssh",
+  ): ExecutionRunnerPort | null {
+    const executor = this.options.agyExecutorForHost!(name);
+    if (executor === null) return null;
+    return new AgyRunnerAdapter({
+      executor,
+      hostName: name,
+      ...(transport === "ssh" && spec.sshAlias !== undefined
+        ? { sshAlias: spec.sshAlias }
+        : {}),
+      mode: spec.runner?.agyMode ?? "edit-only",
+      transport,
+      ...(this.options.agyRunBin !== undefined
+        ? { agyRunBin: this.options.agyRunBin }
+        : {}),
+      ...this.sharedResolvers(),
+      ...(this.options.capabilities !== undefined
+        ? { capabilities: this.options.capabilities }
         : {}),
     });
   }

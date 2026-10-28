@@ -269,6 +269,10 @@ export interface AgyRunnerAdapterOptions {
   readonly transport?: 'local' | 'ssh';
   /** Capability overrides on top of the enforced defaults. */
   readonly capabilities?: Partial<RunnerIsolationCapabilities>;
+  /** The installation host the adapter runs on; recorded on every attempt it starts (H9a). */
+  readonly hostName?: string;
+  /** Recorded as `host` when `transport` is `ssh`, as an opencode v2 dispatch records it. */
+  readonly sshAlias?: string;
   /** Optional resolver for cross-process lookup of an attempt's worktree path when not cached in memory. */
   readonly resolveWorktreePath?: (attemptId: string) => Promise<string | null> | string | null;
   /** Optional resolver for the attempt record, used to confirm the recorded runner kind. */
@@ -319,12 +323,28 @@ export class AgyRunnerAdapter implements ExecutionRunnerPort {
 
   /** agy runs no tunnel port; the record carries the kind and a null port (D7). */
   describeRunner(): AttemptRunnerRecord {
+    return this.runnerRecord(null);
+  }
+
+  /**
+   * The runner record this adapter reports: kind agy, a null port, the ssh
+   * alias on `host` when the transport is ssh, and the installation host
+   * name when known. With neither host option set this is exactly the
+   * pre-AG-2 literal.
+   */
+  private runnerRecord(model: string | null): AttemptRunnerRecord {
     return {
       kind: 'agy',
       remotePort: null,
-      host: null,
+      host:
+        this.options.transport === 'ssh' &&
+        this.options.sshAlias !== undefined &&
+        this.options.sshAlias.trim() !== ''
+          ? this.options.sshAlias
+          : null,
+      ...(this.options.hostName !== undefined ? { hostName: this.options.hostName } : {}),
       agent: null,
-      model: null,
+      model,
       variant: null,
     };
   }
@@ -385,14 +405,7 @@ export class AgyRunnerAdapter implements ExecutionRunnerPort {
     if (result.exitCode === null) {
       return {
         outcome: 'blocked',
-        runner: {
-          kind: 'agy',
-          remotePort: null,
-          host: null,
-          agent: null,
-          model,
-          variant: null,
-        },
+        runner: this.runnerRecord(model),
         reason: `agy run ended without an exit status (${
           result.error ?? result.signal ?? 'unknown cause'
         }); the lane may still be running in the worktree, so inspect it with agy-run --status before retrying`,
@@ -401,14 +414,7 @@ export class AgyRunnerAdapter implements ExecutionRunnerPort {
     if (result.exitCode === AGY_RUN_EXIT_BUSY) {
       return {
         outcome: 'blocked',
-        runner: {
-          kind: 'agy',
-          remotePort: null,
-          host: null,
-          agent: null,
-          model,
-          variant: null,
-        },
+        runner: this.runnerRecord(model),
         reason: 'Worktree already has an active session (agy-run exit 75)',
       };
     }
@@ -432,14 +438,7 @@ export class AgyRunnerAdapter implements ExecutionRunnerPort {
     return {
       outcome: 'started',
       sessionId: agyResult.conversationId ?? `agy-${request.attemptId}`,
-      runner: {
-        kind: 'agy',
-        remotePort: null,
-        host: null,
-        agent: null,
-        model,
-        variant: null,
-      },
+      runner: this.runnerRecord(model),
     };
   }
 

@@ -30,6 +30,8 @@ export interface RunnerForAttemptHostSpec {
     readonly kind?: RunnerKind;
     readonly port?: number;
     readonly authFile?: string;
+    /** The installation's declared agy mode (D7); absent for opencode hosts. */
+    readonly agyMode?: 'edit-only' | 'full';
   };
 }
 
@@ -116,10 +118,14 @@ export function confirmRecordedHost(
     }
   }
 
-  const currentPort =
-    typeof spec.runner?.port === "number" ? spec.runner.port : null;
-  if ((recorded.remotePort ?? null) !== currentPort) {
-    return { ok: false, reason: changedReason(name) };
+  // agy runs no port (D7): the record carries null while the installation
+  // requires a number, so the port comparison is skipped for agy hosts.
+  if (currentKind !== 'agy') {
+    const currentPort =
+      typeof spec.runner?.port === "number" ? spec.runner.port : null;
+    if ((recorded.remotePort ?? null) !== currentPort) {
+      return { ok: false, reason: changedReason(name) };
+    }
   }
 
   return { ok: true, name, spec, transport: currentTransport };

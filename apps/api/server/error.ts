@@ -62,6 +62,9 @@ export function errorBody(error: { statusCode?: unknown; statusMessage?: unknown
   let statusMessage: string;
   if (statusCode >= 500) {
     statusMessage = "Internal Server Error";
+  } else if (statusCode === 404) {
+    // h3's own no-route 404 says "Cannot find any route matching <path>": never echo it.
+    statusMessage = "Not Found";
   } else if (isAcceptableStatusMessage(error.statusMessage)) {
     statusMessage = error.statusMessage;
   } else {

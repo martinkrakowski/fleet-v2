@@ -133,9 +133,24 @@ describe("default handler on a loopback h3 app", () => {
   it("answers a thrown plain Error with 500 and never echoes the request", async () => {
     const response = await fetch(`http://127.0.0.1:${port}/echo/abc?token=xyz`);
     expect(response.status).toBe(500);
+    expect(response.headers.get("content-type")).toMatch(/^application\/json/);
     const text = await response.text();
-    expect(text).not.toContain("echo");
-    expect(text).not.toContain("abc");
-    expect(text).not.toContain("token");
+    expect(text).toBe('{"statusCode":500,"statusMessage":"Internal Server Error"}');
+    for (const echoed of ["echo", "abc", "token", "xyz", "secret"]) {
+      expect(text).not.toContain(echoed);
+    }
+  });
+
+  it("answers an unmatched route with a fixed 404 that never echoes the path", async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/nowhere/abc?token=xyz`);
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe('{"statusCode":404,"statusMessage":"Not Found"}');
+  });
+
+  it("never passes a 404's own statusMessage through", () => {
+    expect(errorBody({ statusCode: 404, statusMessage: "Cannot find any route matching /x/y." })).toEqual({
+      statusCode: 404,
+      statusMessage: "Not Found",
+    });
   });
 });

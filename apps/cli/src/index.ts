@@ -56,6 +56,7 @@ import { COORDINATION_KINDS } from '@fleet/operator-coordination';
 import type {
   AnswerOwnerQuestionRequest,
   AskOwnerQuestionRequest,
+  AttentionItemState,
   ListOwnerQuestionsRequest,
   OwnerQuestionState,
 } from '@fleet/operator-coordination';
@@ -1452,6 +1453,31 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
       rt.coordination.readProjectAttention.readProjectAttention({
         projectId: str(p, 'projectId'),
       }),
+    'attention-items': async (p, rt) =>
+      rt.coordination.listAttentionItems.listAttentionItems({
+        ...(optStr(p, 'projectId') !== undefined ? { projectId: optStr(p, 'projectId') } : {}),
+        ...(optStr(p, 'state') !== undefined ? { state: optStr(p, 'state') as AttentionItemState } : {}),
+        ...(optStr(p, 'kind') !== undefined ? { kind: optStr(p, 'kind') } : {}),
+        ...(optStr(p, 'workOrderId') !== undefined ? { workOrderId: optStr(p, 'workOrderId') } : {}),
+      }),
+    'attention-dismiss': async (p, rt) => {
+      const revisionRaw = optStr(p, 'expectedRevision');
+      const revision = revisionRaw === undefined ? NaN : Number(revisionRaw);
+      if (revisionRaw === undefined || !Number.isSafeInteger(revision)) {
+        throw new CliUsageError(
+          "attention-dismiss requires '--expectedRevision <n>' with an integer value",
+        );
+      }
+      return rt.coordination.clearAttentionItem.clearAttentionItem(
+        {
+          action: 'dismiss',
+          itemId: str(p, 'itemId'),
+          expectedRevision: revision,
+        },
+        'cli',
+        'cli',
+      );
+    },
     'send-relay': async (p, rt) =>
       rt.coordination.sendFleetRelay.sendFleetRelay({
         requestId: str(p, 'requestId'),
@@ -1981,7 +2007,7 @@ Commands:
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede
   decisions report --consumer knowledge-ranking
-  coordination register-profile|capabilities|request-decision|resolve-auth|consume-auth|publish-observation|attention|send-relay|ack-relay|outstanding
+  coordination register-profile|capabilities|request-decision|resolve-auth|consume-auth|publish-observation|attention|attention-items|attention-dismiss|send-relay|ack-relay|outstanding
   questions ask|list|show|answer|sync|expire|acknowledge|wait
   help | --help
 

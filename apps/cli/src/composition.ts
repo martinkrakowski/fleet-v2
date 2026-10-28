@@ -40,6 +40,7 @@ import {
   ExecutionObservationAdapter,
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
+  ForgeReadAdapter,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   ListUnregisteredProjectsUseCase,
@@ -575,6 +576,8 @@ export interface FleetCliRuntime {
     readonly briefKnowledge: BriefKnowledgeAdapter;
     readonly executionObservation: ExecutionObservationAdapter;
     readonly forgeAction: ForgeActionAdapter;
+    /** Read-only PR state (AM4b-2); bound in forge mode `github` only. */
+    readonly forgeRead: ForgeReadAdapter;
     readonly registerWorkOrder: RegisterWorkOrderUseCase;
     readonly inspectWorkOrder: InspectWorkOrderUseCase;
     readonly inspectAttempt: InspectAttemptUseCase;
@@ -934,6 +937,17 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
           runGh: forgeGhRunner,
         })
       : new ForgeEvidenceAdapter();
+  // AM4b-2: the read-only PR-state read (auto-merge A13, conductor reconcile)
+  // shares the forge-evidence runner and the installation's owner/repo. Any
+  // other mode leaves it unconfigured, so every read is `unavailable`.
+  const forgeRead =
+    forgeMode === 'github'
+      ? new ForgeReadAdapter({
+          owner: forgeGithubSection?.owner,
+          repo: forgeGithubSection?.repo,
+          runGh: forgeGhRunner,
+        })
+      : new ForgeReadAdapter();
   const ownerDecision = new OwnerDecisionAdapter({
     checkOwnerDecision: async (request) => {
       const result = await coordination.checkOwnerDecision.checkOwnerDecision({
@@ -1113,7 +1127,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // The reviewed GitHub CLI subprocess behind a host-side delegate; every
   // invocation first verifies the live HEAD of the attempt's own worktree so
   // a moved branch head is never pushed or merged on stale readiness.
-  const forgeAction = new ForgeActionAdapter({
+  const forgeAction = new ForgeActionAdapter(
+    {
     runGh: (args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates),
     verifyCurrentHeadSha: async (branchName, request) => {
       const attempt = await attemptRepository.findAttemptById(request.attemptId);
@@ -1206,7 +1221,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       }
       return head;
     },
-  });
+    },
+    forgeRead,
+  );
 
   // Live registry of acceptance receipts per candidate head: the acceptance
   // delegate records entries and the merge gate consumes them, so a merge is
@@ -1552,6 +1569,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     briefKnowledge,
     executionObservation,
     forgeAction,
+    forgeRead,
     probeProject: new ProbeProjectUseCase({
       profileRead,
       probe: new ProjectProbeAdapter({

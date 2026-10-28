@@ -14,6 +14,11 @@ import {
   classifyGhRefusal,
 } from '../ForgeActionAdapter.adapter.js';
 import type { ForgeActionRequest } from '../../../application/ports/out/ForgeActionPort.out-port.js';
+import type {
+  ForgeReadPort,
+  ReadPullRequestRequest,
+  ReadPullRequestResult,
+} from '../../../application/ports/out/ForgeReadPort.out-port.js';
 
 const HEAD_SHA = '0123456789abcdef0123456789abcdef01234567';
 const OTHER_SHA = 'fedcba9876543210fedcba9876543210fedcba98';
@@ -113,6 +118,24 @@ describe('ForgeActionAdapter refusal kinds', () => {
     return { calls, runGh };
   }
 
+  /** A read port that answers `open` at the current head, so a merge refusal stays refused. */
+  function makeOpenReadPort(): ForgeReadPort {
+    const read = async (_request: ReadPullRequestRequest): Promise<ReadPullRequestResult> => ({
+      outcome: 'found',
+      pullRequest: {
+        number: 12,
+        state: 'open',
+        headSha: HEAD_SHA,
+        headRef: LANE_BRANCH,
+        baseRef: 'main',
+        mergedAtIso: null,
+        closedAtIso: null,
+        mergeCommitSha: null,
+      },
+    });
+    return { readPullRequest: read, isConfigured: () => true };
+  }
+
   it('kinds a refused create as permission', async () => {
     const { runGh } = makeRunGh({ exitCode: 1, stdout: '', stderr: PERMISSION_FIXTURE });
     const adapter = new ForgeActionAdapter({
@@ -131,10 +154,13 @@ describe('ForgeActionAdapter refusal kinds', () => {
 
   it('kinds a refused merge as permission', async () => {
     const { runGh } = makeRunGh({ exitCode: 1, stdout: '', stderr: PERMISSION_FIXTURE });
-    const adapter = new ForgeActionAdapter({
-      runGh,
-      verifyCurrentHeadSha: async () => HEAD_SHA,
-    });
+    const adapter = new ForgeActionAdapter(
+      {
+        runGh,
+        verifyCurrentHeadSha: async () => HEAD_SHA,
+      },
+      makeOpenReadPort(),
+    );
 
     const result = await adapter.performForgeAction(
       forgeActionRequest({ kind: 'merge-pr' }),
@@ -142,17 +168,20 @@ describe('ForgeActionAdapter refusal kinds', () => {
 
     expect(result).toEqual({
       outcome: 'refused',
-      reason: `gh pr merge failed (exit 1): ${PERMISSION_FIXTURE}`,
+      reason: 'gh pr merge exited non-zero; the pull request is not merged',
       refusalKind: 'permission',
     });
   });
 
   it('kinds a refused merge as conflict', async () => {
     const { runGh } = makeRunGh({ exitCode: 1, stdout: '', stderr: CONFLICT_FIXTURE });
-    const adapter = new ForgeActionAdapter({
-      runGh,
-      verifyCurrentHeadSha: async () => HEAD_SHA,
-    });
+    const adapter = new ForgeActionAdapter(
+      {
+        runGh,
+        verifyCurrentHeadSha: async () => HEAD_SHA,
+      },
+      makeOpenReadPort(),
+    );
 
     const result = await adapter.performForgeAction(
       forgeActionRequest({ kind: 'merge-pr' }),
@@ -160,21 +189,24 @@ describe('ForgeActionAdapter refusal kinds', () => {
 
     expect(result).toEqual({
       outcome: 'refused',
-      reason: `gh pr merge failed (exit 1): ${CONFLICT_FIXTURE}`,
+      reason: 'gh pr merge exited non-zero; the pull request is not merged',
       refusalKind: 'conflict',
     });
   });
 
-  it('uses the first line for the reason and the whole output for the kind', async () => {
+  it('kinds a refused merge from the whole failed output, with the fixed reason', async () => {
     const { runGh } = makeRunGh({
       exitCode: 1,
       stdout: '',
       stderr: `warning: something\n${PERMISSION_FIXTURE}\n`,
     });
-    const adapter = new ForgeActionAdapter({
-      runGh,
-      verifyCurrentHeadSha: async () => HEAD_SHA,
-    });
+    const adapter = new ForgeActionAdapter(
+      {
+        runGh,
+        verifyCurrentHeadSha: async () => HEAD_SHA,
+      },
+      makeOpenReadPort(),
+    );
 
     const result = await adapter.performForgeAction(
       forgeActionRequest({ kind: 'merge-pr' }),
@@ -182,7 +214,7 @@ describe('ForgeActionAdapter refusal kinds', () => {
 
     expect(result).toEqual({
       outcome: 'refused',
-      reason: 'gh pr merge failed (exit 1): warning: something',
+      reason: 'gh pr merge exited non-zero; the pull request is not merged',
       refusalKind: 'permission',
     });
   });

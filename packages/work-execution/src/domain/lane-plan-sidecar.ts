@@ -26,7 +26,7 @@ import type {
   PlannedLaneTier,
   PlanDecisionSidecar,
   PlanDecisionState,
-  PullRequestRef,
+  PlanPullRequestRef,
 } from './lane-plan-records.js';
 
 export type LanePlanSidecarResult =
@@ -720,7 +720,7 @@ function buildNormalizedLane(raw: unknown, projectId: string, planId: string): P
         (item) => resolveAfterReference(item as string, projectId, planId) as PlannedLaneRef,
       )
     : [];
-  const mergedPr: PullRequestRef | null =
+  const mergedPr: PlanPullRequestRef | null =
     lane.mergedPr === undefined || lane.mergedPr === null
       ? null
       : {

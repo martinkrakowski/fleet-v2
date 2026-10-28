@@ -390,6 +390,7 @@ bounded_contexts:
             - WorkspacePort
             - AttemptArtifactPort
             - ForgeActionPort
+            - ForgeReadPort
             - AcceptanceAssessmentPort
             - AcceptanceEvidencePort
             - OwnerDecisionPort
@@ -408,7 +409,7 @@ bounded_contexts:
             - ProjectProbeRecordPort
             - ChangeSignalPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -441,6 +442,7 @@ bounded_contexts:
       WorkspacePort: "Prepare scoped Git worktrees and inspect base/head commits and commit deltas without resetting user work."
       AttemptArtifactPort: "Place frozen briefs and templates under verified ignored paths and collect bounded immutable artifacts after lane completion."
       ForgeActionPort: "Perform permitted credential-bearing PR and merge operations through stable action IDs and explicit expected-head checks."
+      ForgeReadPort: "Read one pull request's state by number or branch (open, merged or closed; head, base, merge time and merge commit) without mutating anything; a forge that cannot be read or a response that cannot be verified is unavailable, never a guess and never absence."
       AcceptanceAssessmentPort: "Consume the evidence context's exact-head assessment without importing its repositories or mutating its aggregates."
       AcceptanceEvidencePort: "Consume the evidence context's exact-head assessment to authorize merge actions."
       OwnerDecisionPort: "Re-check the attempt's frozen one-way doors through owner coordination before forge actions; an undecided, declined or unreadable decision blocks the action."
@@ -485,6 +487,7 @@ bounded_contexts:
       - { adapter: WorkspaceAdapter, implements: WorkspacePort, integration: reviewed-git-worktree-subprocess }
       - { adapter: AttemptArtifactAdapter, implements: AttemptArtifactPort, integration: bounded-filesystem-and-approved-remote-artifact-access }
       - { adapter: ForgeActionAdapter, implements: ForgeActionPort, integration: reviewed-github-cli-subprocess }
+      - { adapter: ForgeReadAdapter, implements: ForgeReadPort, integration: reviewed-github-cli-subprocess-read-only }
       - adapter: AcceptanceAssessmentAdapter
         implements: AcceptanceAssessmentPort
         integration: in-process

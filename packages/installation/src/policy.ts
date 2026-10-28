@@ -22,6 +22,7 @@ import type {
   SeatModel,
   SeatRole,
 } from './types.js';
+import { hasUnknownKeys, isPlainRecord, readBoundedInteger, readOwnDataProperty } from './policy-read.js';
 
 /** Roles whose chain must not share a family with the implementer chain. */
 const REVIEWER_ROLES: readonly Exclude<SeatRole, 'implementer'>[] = [
@@ -376,46 +377,6 @@ const CONDUCTOR_REAPER_KEYS: readonly string[] = [
   'repairs',
 ];
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return false;
-  }
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
-function readOwnDataProperty(record: Record<string, unknown>, key: string): unknown {
-  if (!Object.hasOwn(record, key)) {
-    return undefined;
-  }
-  return Object.getOwnPropertyDescriptor(record, key)?.value;
-}
-
-function hasUnknownKeys(
-  record: Record<string, unknown>,
-  allowedKeys: readonly string[],
-): boolean {
-  for (const key of Object.keys(record)) {
-    if (!allowedKeys.includes(key)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function readConductorMinute(
-  value: unknown,
-  bounds: Readonly<{ min: number; max: number }>,
-): number | undefined {
-  if (typeof value !== 'number' || !Number.isInteger(value)) {
-    return undefined;
-  }
-  if (value < bounds.min || value > bounds.max) {
-    return undefined;
-  }
-  return value;
-}
-
 function readConductorRepairs(
   value: unknown,
 ): Readonly<Record<ConductorReaperRepairKind, boolean>> | undefined {
@@ -497,7 +458,7 @@ export function resolveConductorPolicy(policy: PolicySection | undefined): Resol
   if (typeof enabled !== 'boolean') {
     return freshDefaultConductorPolicy();
   }
-  const stopGraceMinutes = readConductorMinute(
+  const stopGraceMinutes = readBoundedInteger(
     readOwnDataProperty(block, 'stopGraceMinutes'),
     CONDUCTOR_MINUTE_BOUNDS.stopGraceMinutes,
   );
@@ -514,21 +475,21 @@ export function resolveConductorPolicy(policy: PolicySection | undefined): Resol
     if (typeof reaperEnabled !== 'boolean') {
       return freshDefaultConductorPolicy();
     }
-    const intervalMinutes = readConductorMinute(
+    const intervalMinutes = readBoundedInteger(
       readOwnDataProperty(reaperValue, 'intervalMinutes'),
       CONDUCTOR_MINUTE_BOUNDS.intervalMinutes,
     );
     if (Object.hasOwn(reaperValue, 'intervalMinutes') && intervalMinutes === undefined) {
       return freshDefaultConductorPolicy();
     }
-    const graceMinutes = readConductorMinute(
+    const graceMinutes = readBoundedInteger(
       readOwnDataProperty(reaperValue, 'graceMinutes'),
       CONDUCTOR_MINUTE_BOUNDS.graceMinutes,
     );
     if (Object.hasOwn(reaperValue, 'graceMinutes') && graceMinutes === undefined) {
       return freshDefaultConductorPolicy();
     }
-    const staleStopMinutes = readConductorMinute(
+    const staleStopMinutes = readBoundedInteger(
       readOwnDataProperty(reaperValue, 'staleStopMinutes'),
       CONDUCTOR_MINUTE_BOUNDS.staleStopMinutes,
     );

@@ -89,3 +89,59 @@ export interface LanePlanSidecar {
   readonly decisions: readonly PlanDecisionSidecar[];
   readonly exclusiveOrder: readonly ExclusiveOrderSidecar[];
 }
+
+export const LANE_PLAN_RECORD_VERSION = 1 as const;
+export const PULL_REQUEST_LINK_RECORD_VERSION = 1 as const;
+export const PLANNED_LANE_MAX_ALIASES = 16;
+/** Where a link came from (plan §3.2 "PR links are unique"). */
+export const PULL_REQUEST_LINK_SOURCES = ['fleet-forge-action', 'run', 'sidecar', 'cli'] as const;
+export type PullRequestLinkSource = (typeof PULL_REQUEST_LINK_SOURCES)[number];
+export const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
+/** Canonical UTC ISO-8601 with milliseconds, as `Date.prototype.toISOString` writes it. */
+export const CANONICAL_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+/** One stored lane. A dropped lane is kept; `aliases` are former ids, oldest first. */
+export interface PlannedLaneRecord {
+  readonly laneId: string;
+  readonly aliases: readonly string[];
+  readonly scope: string;
+  readonly packages: readonly string[];
+  readonly sharedFiles: readonly string[];
+  readonly tier: PlannedLaneTier;
+  readonly after: readonly PlannedLaneRef[];
+  readonly decisions: readonly string[];
+  readonly status: PlannedLaneStatus;
+  readonly brief: string | null;
+  readonly mergedPr: PullRequestRef | null;
+}
+
+/** A plan's machine workbook as imported, keyed (projectId, planId). Version 1. */
+export interface LanePlanRecord {
+  readonly version: typeof LANE_PLAN_RECORD_VERSION;
+  readonly projectId: string;
+  readonly planId: string;
+  /** The sidecar's revision; the store's compare-and-swap value (WB4a). */
+  readonly revision: number;
+  /** sha256 hex of `canonicalLanePlanSidecarJson`, computed by infrastructure (WB4a). */
+  readonly digest: string;
+  readonly doc: string;
+  readonly lanes: readonly PlannedLaneRecord[];
+  readonly decisions: readonly PlanDecisionSidecar[];
+  readonly exclusiveOrder: readonly ExclusiveOrderSidecar[];
+  readonly importedAtIso: string;
+}
+
+/**
+ * A pull request's one lane. `planId` is null for a lane with no plan: the work order's
+ * own laneId in its project (plan §3.4, the fleet merge path of a work order without planRef).
+ */
+export interface PullRequestLinkRecord {
+  readonly version: typeof PULL_REQUEST_LINK_RECORD_VERSION;
+  readonly repository: string;
+  readonly number: number;
+  readonly projectId: string;
+  readonly planId: string | null;
+  readonly laneId: string;
+  readonly source: PullRequestLinkSource;
+  readonly linkedAtIso: string;
+}

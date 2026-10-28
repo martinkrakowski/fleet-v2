@@ -339,7 +339,7 @@ bounded_contexts:
     depends_on: [evidence-and-acceptance, brief-knowledge, operator-coordination]
     layers:
       domain:
-        entities: [WorkOrder, Attempt, ActionJournalEntry, CapacityReservation, LaneRun]
+        entities: [WorkOrder, Attempt, ActionJournalEntry, CapacityReservation, LaneRun, LanePlan, PlannedLane, PullRequestLink]
         value_objects: [WorkOrderState, AttemptState, AttemptOutcome, ModelAssignment, BriefPackage, AcceptanceSpec, RunnerObservation, ExecutionLimits, StopReason, SeatPlan, LaneRunState]
       application:
         use_cases:
@@ -518,8 +518,8 @@ bounded_contexts:
         delegates_to: [operator-coordination/PublishProjectObservationPort]
       - { adapter: NoopChangeSignalAdapter, implements: ChangeSignalPort, integration: in-process-noop }
     domain_specification:
-      aggregate_roots: [WorkOrder, Attempt, LaneRun]
-      child_ownership: { ActionJournalEntry: Attempt, CapacityReservation: Attempt }
+      aggregate_roots: [WorkOrder, Attempt, LaneRun, LanePlan, PullRequestLink]
+      child_ownership: { ActionJournalEntry: Attempt, CapacityReservation: Attempt, PlannedLane: LanePlan }
       enum_values:
         WorkOrderState: [approved, prepared, implementing, verifying, reviewing, fixing, ready-to-merge, merged, stopped]
         AttemptState: [intent-recorded, dispatching, running, reconciling, ended, collected, blocked, cancelled]
@@ -538,6 +538,8 @@ bounded_contexts:
         - "A lane run records only what cannot be derived (work order, tier, seat plan reference and cursors, round 0-2, attempt ids, PR number, park, lease, revision, run policy revision); its state is a projection of attempts, the keyed journal, receipts and forge evidence. Every external action of a run carries the idempotency key <runId>/r<round>/<step>/<seatIndex>[/a<n>][@<head12>][/retry<n>] (the attempt ordinal only on prepare and dispatch), and the control keys <runId>/stop@<via> (graceful), <runId>/stop-force@<via> (force), with via web or cli and the mode read from the key, <runId>/park/<n>/resume@web, request/<requestId> and reaper/<subjectId>/<kind>@<findingId> sit beside them."
         - "A run lease and the state directory's driver lease are taken by CAS on the fence the taker read, only when the lease is null or lapsed, and each taking raises the fence by one; renewing keeps the fence, releasing keeps holder and fence, and the fence never goes back. A lease change never moves the run's revision."
         - "The run journal is append-only and keyed: an intent is durable before its action runs and its key is unique, a result pairs with its intent, and only ambiguous results may precede a key's one final result. A run has at most one stop per mode; a force may follow a graceful stop, never the reverse."
+        - "A planned lane grants nothing and owns no path until registered: a lane plan is keyed (projectId, planId) and records each lane's status (planned, deferred or dropped; a dropped lane is kept, never deleted) and its former ids as aliases. A lane becomes a work order only through registration, which keeps the owned-path check; the work order's optional planRef names the plan lane, and its project is the work order's own."
+        - "A PR links to at most one lane: a pull request link is keyed (repository, number); the same link again is a no-op and a link to a different lane is refused (pr-already-linked)."
       lifecycle_requirements:
         - "Dispatch intent is durable before start; ambiguous results enter reconciliation rather than blind retries."
         - "Only a matching ended observation permits artifact collection and capacity release."

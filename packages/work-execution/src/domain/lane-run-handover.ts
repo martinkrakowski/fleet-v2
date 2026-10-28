@@ -37,6 +37,12 @@ export type RenderHandoverBriefResult =
   | { readonly ok: false; readonly reason: string };
 
 const MAX_NUMBERED_FIXES = 20;
+/** A repository-relative path: plain path characters only, so it can never break the fenced block. */
+const FINDING_PATH_PATTERN = /^[A-Za-z0-9._@+/-]{1,300}$/;
+/** A gate reason code: lowercase and hyphens, like every journal reason code. */
+const GATE_REASON_CODE_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+/** Header values (run id, branch, head) sit outside the block: printable ASCII only, and never a backtick. */
+const HEADER_VALUE_PATTERN = /^[\x20-\x5f\x61-\x7e]{1,200}$/;
 const MAX_SUMMARY_CHARS = 300;
 
 const SEVERITY_RANK: Record<HandoverFindingSeverity, number> = {
@@ -83,6 +89,12 @@ function renderFindingLine(
   if (containsSecretShape(finding.summary)) {
     return { ok: false, reason: 'secret-shaped-finding' };
   }
+  if (finding.filePath !== null && !FINDING_PATH_PATTERN.test(finding.filePath)) {
+    return { ok: false, reason: 'invalid-finding-path' };
+  }
+  if (finding.line !== null && (!Number.isInteger(finding.line) || finding.line < 0)) {
+    return { ok: false, reason: 'invalid-finding-line' };
+  }
   const location = [finding.filePath, finding.line].filter((part) => part !== null).join(':');
   return { ok: true, text: `[${finding.severity}] ${location} — ${cleanSummary(finding.summary)}` };
 }
@@ -95,6 +107,9 @@ function cleanSummary(raw: string): string {
 }
 
 export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHandoverBriefResult {
+  if (![input.runId, input.branchName, input.head12].every((value) => HEADER_VALUE_PATTERN.test(value))) {
+    return { ok: false, reason: 'invalid-header-value' };
+  }
   const included = includedFindings(input.findings);
   const rawLines: { readonly text: string }[] = [];
 
@@ -108,6 +123,9 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
     }
   } else if (input.source === 'gate' && input.gateReasonCodes.length > 0) {
     for (const code of input.gateReasonCodes) {
+      if (!GATE_REASON_CODE_PATTERN.test(code)) {
+        return { ok: false, reason: 'invalid-gate-code' };
+      }
       rawLines.push({ text: `[gate] ${code}` });
     }
   } else {

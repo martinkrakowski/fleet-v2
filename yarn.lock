@@ -523,22 +523,22 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@hexagen-monaco/arch-linter@npm:0.14.0":
-  version: 0.14.0
-  resolution: "@hexagen-monaco/arch-linter@npm:0.14.0"
+"@hexagen-monaco/arch-linter@npm:0.15.0":
+  version: 0.15.0
+  resolution: "@hexagen-monaco/arch-linter@npm:0.15.0"
   dependencies:
     js-yaml: "npm:^4.1.1"
     ts-morph: "npm:^27.0.2"
     zod: "npm:^3.23.8"
   bin:
     hexagen-lint: dist/cli.js
-  checksum: 10c0/0efca8e9634fb3f4d12701a1891e848c13e41cbd29c1db146fc7f45a70798e6eeb9fe0fdb73f679a8d2296dc76b0910e11c2cf5acf24c9f945cb024d109caf14
+  checksum: 10c0/6e4ce7047f06ea3bd4ebf74ea16239d6099d1f08959a5dc528ab20e126d0d5061f7520c583772f76fec13bf8d49d2b95b71c43d754bbe131c96a4135d6942ed9
   languageName: node
   linkType: hard
 
-"@hexagen-monaco/sync@npm:0.14.0":
-  version: 0.14.0
-  resolution: "@hexagen-monaco/sync@npm:0.14.0"
+"@hexagen-monaco/sync@npm:0.15.0":
+  version: 0.15.0
+  resolution: "@hexagen-monaco/sync@npm:0.15.0"
   dependencies:
     commander: "npm:^14.0.3"
     js-yaml: "npm:^4.1.1"
@@ -546,7 +546,7 @@ __metadata:
     zod: "npm:^3.23.8"
   bin:
     hexagen: dist/cli.js
-  checksum: 10c0/e6eda0dce9c659687ebdaf3b25031a0baa9e5aa88e39528972cde9f37ad58f764dcfdd20e6edb78f3888881ed3e963769636504345f46569a0c35c6ec2bac7cf
+  checksum: 10c0/e8cb50efa15e0fcb75fdae4a2e1ad916ece7a96fd0ce8d23bc8cbe2d3104d22b901862bb8a9057b4382902baff66054fd6d95601b62802583f11c12f7e45f337
   languageName: node
   linkType: hard
 
@@ -3476,8 +3476,8 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "fleet@workspace:."
   dependencies:
-    "@hexagen-monaco/arch-linter": "npm:0.14.0"
-    "@hexagen-monaco/sync": "npm:0.14.0"
+    "@hexagen-monaco/arch-linter": "npm:0.15.0"
+    "@hexagen-monaco/sync": "npm:0.15.0"
     eslint: "npm:^9.0.0"
     prettier: "npm:^3.0.0"
     turbo: "npm:^2.11.5"

@@ -22,7 +22,6 @@ import {
 } from '../ports/out/AttentionItemRepositoryPort.out-port.js';
 import type {
   ClearAttentionItemPort,
-  ClearAttentionItemRequest,
   ClearAttentionItemResult,
 } from '../ports/in/ClearAttentionItemPort.in-port.js';
 import type { AttentionClock } from '../ports/in/RecordAttentionItemPort.in-port.js';

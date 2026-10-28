@@ -754,4 +754,106 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     const attempt = await harness.attemptRepo.findAttemptById(intent?.mintedId as string);
     expect(attempt?.state).toBe('intent-recorded');
   });
+
+  it('test 12b: five further advances of a running lane never dispatch again', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const key = dispatchKey(0, 0, 1);
+    const dispatched = await advance(harness);
+    expect(dispatched).toMatchObject({
+      outcome: 'acted',
+      step: 'dispatch',
+      key,
+      reasonCode: 'dispatch-started',
+    });
+    // The attempt record the runner left behind is running; the runner fake
+    // keeps answering for it. Every further advance stays inside the time
+    // limit (dispatched at LATER, limit 2700s) and inside the lease.
+    const stored = await harness.attemptRepo.findAttemptById('attempt-example-1');
+    expect(stored).not.toBeNull();
+    await harness.attemptRepo.saveAttempt({
+      ...attemptFixture(),
+      revision: (stored?.revision ?? 0) + 1,
+      state: 'running',
+      updatedAtIso: LATER,
+    });
+    for (let index = 1; index <= 5; index += 1) {
+      const nowIso = new Date(Date.parse(LATER) + index * 30_000).toISOString();
+      await advance(harness, { nowIso });
+    }
+    expect(harness.dispatchRequests).toHaveLength(1);
+    expect(harness.cancelRequests).toHaveLength(0);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === key)).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === key)).toHaveLength(1);
+  });
+
+  for (const [outcome, reasonCode] of [
+    ['unknown', 'dispatch-unknown'],
+    ['blocked', 'dispatch-blocked'],
+  ] as const) {
+    it(`test 16${outcome === 'unknown' ? 'a' : 'b'}: a ${outcome} dispatch result is journalled as ${reasonCode}, never as started`, async () => {
+      const harness = await makeHarness(runRecord(), [attemptFixture()]);
+      const attemptRecord = attemptFixture();
+      harness.setDispatchAnswer(
+        outcome === 'unknown'
+          ? async () => ({ outcome: 'unknown', attempt: attemptRecord, reason: 'the runner transport died' })
+          : async () => ({ outcome: 'blocked', attempt: attemptRecord, reason: 'a session may be live in the worktree' }),
+      );
+      await admit(harness, 'attempt-example-1');
+      const key = dispatchKey(0, 0, 1);
+      const dispatched = await advance(harness);
+      expect(dispatched).toEqual({
+        outcome: 'acted',
+        step: 'dispatch',
+        key,
+        result: 'completed',
+        reasonCode,
+      });
+      expect(harness.dispatchRequests).toHaveLength(1);
+      expect(await lastJournalState(harness)).toBe('dispatching');
+      const entries = await harness.runJournal.listForRun(RUN_ID);
+      expect(entries).toContainEqual(
+        expect.objectContaining({ kind: 'result', key, outcome: 'completed', reasonCode }),
+      );
+      // A further advance never re-sends the spent key.
+      const waited = await advance(harness);
+      expect(waited).toEqual({ outcome: 'waiting', reason: 'dispatch-pending' });
+      expect(harness.dispatchRequests).toHaveLength(1);
+    });
+  }
+
+  it('test 17: a dispatch-started key is never cancelled', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const dispatched = await advance(harness);
+    expect(dispatched).toMatchObject({ outcome: 'acted', step: 'dispatch', reasonCode: 'dispatch-started' });
+    const stopBuilt = laneRunStopKey(RUN_ID, 'web');
+    expect(stopBuilt.ok).toBe(true);
+    if (!stopBuilt.ok) {
+      throw new Error('fixture must build a stop key');
+    }
+    const stopEntry = {
+      ...laneRunIntentEntry(harness.deps.newUlid(), RUN_ID, stopBuilt.key, null, LATER),
+      mode: 'graceful' as const,
+      expectedRevision: 1,
+    };
+    const stopAppended = await harness.runJournal.append(stopEntry);
+    expect(stopAppended.outcome).toBe('appended');
+    // G4f: a graceful stop lets the started attempt finish; the cancel act
+    // (G4e) is only for never-dispatched attempts.
+    const parked = await advance(harness);
+    expect(parked).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'dispatch' });
+    expect(harness.cancelRequests).toHaveLength(0);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(
+      entries.some(
+        (entry) =>
+          entry.kind === 'result' &&
+          entry.key !== null &&
+          entry.key.includes('/stop/') &&
+          entry.outcome === 'cancelled-unstarted',
+      ),
+    ).toBe(false);
+  });
 });

@@ -101,7 +101,7 @@ function stepIntentsOf(entries: readonly LaneRunJournalEntryRecord[], runId: str
       continue;
     }
     const parsed = parseLaneRunKey(entry.key);
-    if (parsed === null || parsed.kind !== 'step') {
+    if (parsed === null || parsed.kind !== 'step' || parsed.runId !== runId) {
       continue;
     }
     out.push({ entry, parsed });
@@ -124,7 +124,9 @@ export function laneRunAttemptPlacement(
   entries: readonly LaneRunJournalEntryRecord[], runId: string, attemptId: string,
 ): { readonly round: number; readonly seatIndex: number } | null {
   for (const { entry, parsed } of stepIntentsOf(entries, runId)) {
-    if (entry.mintedId === attemptId) {
+    // Only the attempt's own prepare or dispatch intent places it; a stop,
+    // collect or gate intent naming the same id never does.
+    if (entry.mintedId === attemptId && (parsed.step === 'prepare' || parsed.step === 'dispatch')) {
       return { round: parsed.round, seatIndex: parsed.seatIndex };
     }
   }
@@ -197,13 +199,16 @@ export function laneRunGateFact(
 
 /** The step of the run's latest final step-key result when its outcome is 'refused' and its round is `round`; else null. */
 export function laneRunRefusedStep(entries: readonly LaneRunJournalEntryRecord[], runId: string, round: number): LaneRunKeyStep | null {
+  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
+    return null;
+  }
   let latest: LaneRunJournalEntryRecord | null = null;
   for (const entry of entries) {
     if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
       continue;
     }
     const parsed = parseLaneRunKey(entry.key);
-    if (parsed === null || parsed.kind !== 'step') {
+    if (parsed === null || parsed.kind !== 'step' || parsed.runId !== runId) {
       continue;
     }
     latest = entry;

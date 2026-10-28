@@ -204,8 +204,10 @@ describe("readObjectBody JSON body byte cap", () => {
     expect(text.status).toBe(400);
 
     const invalid = await post("{");
-    expect(invalid.status).toBe(200);
-    expect((await payloadOf(invalid)).body).toEqual({});
+    expect(invalid.status).toBe(400);
+    const invalidText = await invalid.text();
+    expect(invalidText).toContain("Invalid JSON body");
+    expect(invalidText).not.toContain("Invalid JSON object body");
 
     const nowIso = await post('{"nowIso":"2026-01-01T00:00:00Z","key":"value"}');
     expect(nowIso.status).toBe(200);

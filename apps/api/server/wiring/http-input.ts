@@ -125,7 +125,8 @@ export async function readBoundedRawBody(event: H3Event, limit: number): Promise
 /**
  * Read the request body as a JSON object. An absent body resolves to `{}` so a
  * configured runtime answers the use case's own validation; a non-object body
- * (primitive or array) is a client error, never a silent empty request. A body
+ * (primitive or array) or a body that is not valid JSON is a client error (400),
+ * never a silent empty request. A body
  * over `MAX_JSON_BODY_BYTES` is refused with 413 before it is parsed.
  */
 export async function readObjectBody(event: H3Event): Promise<Record<string, unknown>> {
@@ -133,7 +134,14 @@ export async function readObjectBody(event: H3Event): Promise<Record<string, unk
   if (raw === undefined || raw.byteLength === 0) {
     return {};
   }
-  const body = await readBody(event).catch(() => undefined);
+  // Owner decision 2026-10-27: a body that is present but is not valid JSON is a
+  // client error (400), never a silent empty request. The body is never echoed.
+  let body: unknown;
+  try {
+    body = await readBody(event);
+  } catch {
+    throw createError({ statusCode: 400, statusMessage: "Invalid JSON body" });
+  }
   if (body === undefined || body === null || body === "") {
     return {};
   }

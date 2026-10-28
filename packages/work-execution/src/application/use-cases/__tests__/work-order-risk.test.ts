@@ -130,6 +130,13 @@ describe('work order risk (AM2)', () => {
     expect(resolveWorkOrderRisk({ risk: undefined })).toBe('high');
     expect(resolveWorkOrderRisk({ risk: 'medium' as never })).toBe('high');
     expect(resolveWorkOrderRisk({ risk: 'standard' })).toBe('standard');
+    const prototype = Object.prototype as unknown as Record<string, unknown>;
+    prototype.risk = 'standard';
+    try {
+      expect(resolveWorkOrderRisk({})).toBe('high');
+    } finally {
+      delete prototype.risk;
+    }
     expect(DEFAULT_WORK_ORDER_RISK).toBe('high');
     expect([...WORK_ORDER_RISKS]).toEqual(['standard', 'high']);
     expect(parseWorkOrderRisk('high')).toBe('high');

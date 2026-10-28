@@ -122,7 +122,7 @@ function storedRecord(record: WorkOrderRecord): WorkOrderRecord {
       laneId: record.planRef.laneId,
     };
   }
-  if (record.risk !== undefined) {
+  if (Object.hasOwn(record, 'risk') && record.risk !== undefined) {
     stored.risk = record.risk;
   }
   return stored;

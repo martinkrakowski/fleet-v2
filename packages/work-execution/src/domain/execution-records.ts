@@ -80,7 +80,8 @@ export function parseWorkOrderRisk(value: unknown): WorkOrderRisk | undefined {
  * `standard` or `high`; absent or anything else reads as `high`.
  */
 export function resolveWorkOrderRisk(record: Pick<WorkOrderRecord, 'risk'>): WorkOrderRisk {
-  return parseWorkOrderRisk(record.risk) ?? DEFAULT_WORK_ORDER_RISK;
+  // Own property only: an inherited `risk` (a polluted prototype) never labels a record.
+  return parseWorkOrderRisk(Object.hasOwn(record, 'risk') ? record.risk : undefined) ?? DEFAULT_WORK_ORDER_RISK;
 }
 
 /** Serializable record of one registered, approved bounded work unit. */

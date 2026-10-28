@@ -747,7 +747,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         policyRevision: str(p, 'policyRevision'),
         prerequisiteWorkOrderIds: strArr(p, 'prerequisiteWorkOrderIds'),
         risk:
-          optStr(p, 'risk') === undefined
+          p.risk === undefined
             ? undefined
             : enumOf(p, 'risk', WORK_ORDER_RISKS, 'work-order register --risk'),
         nowIso: optStr(p, 'nowIso'),

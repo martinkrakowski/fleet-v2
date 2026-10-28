@@ -211,5 +211,15 @@ describe('work-order register --risk (AM2)', () => {
       }),
     ]);
     expect(medium.code).toBe(2);
+
+    const blank = await cli(runtime, [
+      ...registerJsonArg({
+        workOrderId: 'wo-risk-example-6',
+        laneId: 'lane-6',
+        ownedPaths: 'packages/example-six/**',
+        risk: '',
+      }),
+    ]);
+    expect(blank.code).toBe(2);
   });
 });

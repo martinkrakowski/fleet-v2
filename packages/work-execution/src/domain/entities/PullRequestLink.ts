@@ -9,8 +9,8 @@
  * fixed message, never echoed.
  */
 
-import {
 import { readExactPlainRecord } from '../plain-record-reads.js';
+import {
   CANONICAL_ISO_PATTERN,
   PLAN_ID_PATTERN,
   PLAN_PROJECT_ID_PATTERN,

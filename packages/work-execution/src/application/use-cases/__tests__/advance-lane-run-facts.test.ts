@@ -276,7 +276,7 @@ async function lastJournalState(harness: Harness): Promise<string | null> {
 
 function stepKey(parts: {
   readonly round: number;
-  readonly step: 'dispatch' | 'stop' | 'gate';
+  readonly step: 'dispatch' | 'stop' | 'gate' | 'prepare';
   readonly seatIndex: number;
   readonly attemptOrdinal: number | null;
   readonly head12: string | null;
@@ -352,7 +352,9 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
       releasedAtIso: null,
     });
     const dispatched = await advance(harness);
-    expect(dispatched).toEqual({ outcome: 'not-built', decision: 'act', step: 'dispatch' });
+    // K4-5 built the dispatch act; this harness wires no dispatch port, so the
+    // reached decision reports not-wired (the old not-built pin is superseded).
+    expect(dispatched).toEqual({ outcome: 'not-wired', step: 'dispatch' });
     expect(harness.admissionCalls).toHaveLength(1);
   });
 
@@ -394,7 +396,15 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
     const failed = await advance(harness);
     expect(failed).toEqual({ outcome: 'entered', state: 'seat-failed' });
     const prepared = await advance(harness);
-    expect(prepared).toEqual({ outcome: 'not-built', decision: 'act', step: 'prepare' });
+    // K4-5 built the prepare act: the pivot prepares a fresh attempt on fp-2
+    // under the r0/prepare/1/a2 key (the old not-built pin is superseded).
+    expect(prepared).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: stepKey({ round: 0, step: 'prepare', seatIndex: 1, attemptOrdinal: 2, head12: null }),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
     expect(harness.reconcileCalls).toHaveLength(1);
   });
 
@@ -526,6 +536,14 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
     await appendResult(harness, secondKey, 'completed', 'dispatch-started', LATER);
     await conduct(harness, 'seat-failed', NOW);
     const result = await advance(harness);
-    expect(result).toEqual({ outcome: 'not-built', decision: 'act', step: 'prepare' });
+    // K4-5 built the prepare act: the rotated seat (fp-2, index 1) prepares
+    // under the r0/prepare/1/a3 key (the old not-built pin is superseded).
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: stepKey({ round: 0, step: 'prepare', seatIndex: 1, attemptOrdinal: 3, head12: null }),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
   });
 });

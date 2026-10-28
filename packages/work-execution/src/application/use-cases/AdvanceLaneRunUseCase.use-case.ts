@@ -5,12 +5,18 @@
  * and attempt-record facts, asks the pure decider (`nextLaneRunAction`) and
  * performs the record-only decisions: `enter`, `park`, `wait` and `done`.
  *
- * This part stops there. The facts that need the runner, the frozen manifest,
- * reservations, costs or seat selection are read in full (K4-4b), including
- * the lane's end from the runner through reconcile and the one `admit` call
- * on the decider's wait for admission, never while halted. Every `act`,
- * `reconcile` and `cancel` decision is still reported `not-built` (K4-5 to
- * K4-7 build them) and writes nothing.
+ * The facts that need the runner, the frozen manifest, reservations, costs or
+ * seat selection are read in full (K4-4b), including the lane's end from the
+ * runner through reconcile and the one `admit` call on the decider's wait for
+ * admission, never while halted. Three acts are performed here (K4-5): `act
+ * prepare` (a fresh round-0 attempt on the selected first-pass seat, the seat
+ * pivot), `act dispatch` (through `DispatchAttemptPort`, with the pivot's
+ * conductor seat override) and the G4e `cancel` (through
+ * `CancelPreparedAttemptPort`). Each writes its keyed intent first, performs
+ * the one action, saves the record it needs, then appends the result entry;
+ * both acting steps re-check the cost ceiling before writing anything. The
+ * remaining `act` and `reconcile` decisions are still reported `not-built`
+ * (K4-6 and K4-7 build them) and write nothing.
  */
 
 import type {
@@ -26,7 +32,14 @@ import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.o
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
 import type { ReconcileAttemptPort } from '../ports/in/ReconcileAttemptPort.in-port.js';
-import { parseSeatTool, type AttemptRecord } from '../../domain/execution-records.js';
+import type { DispatchAttemptPort } from '../ports/in/DispatchAttemptPort.in-port.js';
+import type { CancelPreparedAttemptPort } from '../ports/in/CancelPreparedAttemptPort.in-port.js';
+import { AttemptRevisionConflictError } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import {
+  parseSeatTool,
+  type AttemptRecord,
+  type AttemptSeatOverrideRecord,
+} from '../../domain/execution-records.js';
 import type { ArtifactManifestVerdict } from '../../domain/artifact-manifest.js';
 import { checkLeaseHeld } from '../../domain/lane-run-lease.js';
 import type { LeaseRefusal } from '../../domain/lane-run-lease.js';
@@ -42,14 +55,22 @@ import {
   laneRunConductEntry,
   laneRunDispatchedAtIso,
   laneRunGateFact,
+  laneRunIntentEntry,
   laneRunParkedConductCount,
   laneRunRefusedStep,
+  laneRunResultEntry,
   laneRunStopsIssued,
   laneRunTimedOut,
+  type LaneRunResultReasonCode,
 } from '../../domain/lane-run-step-facts.js';
+import type { LaneRunJournalOutcome } from '../../domain/lane-run-journal.js';
 import { head12Of } from '../../domain/lane-run-keys.js';
 import { isCalendarDateTime } from '../../domain/plain-record-reads.js';
-import type { LaneRunParkReason, LaneRunRecord } from '../../domain/lane-run-records.js';
+import type {
+  LaneRunCursorsRecord,
+  LaneRunParkReason,
+  LaneRunRecord,
+} from '../../domain/lane-run-records.js';
 import type {
   LaneRunAttemptFact,
   LaneRunDecision,
@@ -58,7 +79,7 @@ import type {
 } from '../../domain/lane-run-decider.js';
 import { laneRunAttemptPhaseOf, nextLaneRunAction } from '../../domain/lane-run-decider.js';
 import { canEnterLaneRunState, implementerRoleFor } from '../../domain/lane-run-transitions.js';
-import { historyEntryOf, selectSeat, stopReasonOf } from '../../domain/seat-selection.js';
+import { historyEntryOf, selectSeat, seatSelectionRecord, stopReasonOf } from '../../domain/seat-selection.js';
 import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
 import { SeatPlan } from '../../domain/value-objects/SeatPlan.vo.js';
 
@@ -76,6 +97,12 @@ export interface AdvanceLaneRunDependencies {
   readonly stopGraceMinutes?: number;
   /** policy.perLaneCostCeiling; absent = no ceiling. */
   readonly perLaneCostCeiling?: number;
+  /** Dispatch a prepared attempt (K4-5); absent → `not-wired dispatch`. */
+  readonly dispatchAttempt?: DispatchAttemptPort;
+  /** The record-only cancel of a never-dispatched attempt (K4-1, K4-5); absent → `not-wired stop`. */
+  readonly cancelPreparedAttempt?: CancelPreparedAttemptPort;
+  /** The installation schema version the dispatching root runs under (H9a2). */
+  readonly installationSchemaVersion?: number;
 }
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */
@@ -219,19 +246,38 @@ async function readFrozenManifest(
   }
 }
 
-/** Positive safe-integer `timeLimitSeconds` of a frozen manifest; null when absent or invalid. */
-function manifestTimeLimitSeconds(manifest: Record<string, unknown> | null): number | null {
+/** A positive safe-integer field of a frozen manifest; null when absent or invalid. */
+function manifestPositiveInteger(manifest: Record<string, unknown> | null, field: string): number | null {
   if (manifest === null) {
     return null;
   }
-  const seconds = manifest.timeLimitSeconds;
-  if (typeof seconds !== 'number' || !Number.isSafeInteger(seconds) || seconds <= 0) {
+  const value = manifest[field];
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
     return null;
   }
-  return seconds;
+  return value;
 }
 
-type WriteOutcome = { readonly ok: true } | { readonly ok: false; readonly reason: AdvanceLaneRunRefusal };
+/** Positive safe-integer `timeLimitSeconds` of a frozen manifest; null when absent or invalid. */
+function manifestTimeLimitSeconds(manifest: Record<string, unknown> | null): number | null {
+  return manifestPositiveInteger(manifest, 'timeLimitSeconds');
+}
+
+/** `expectedArtifacts` of a frozen manifest: the field absent reads `[]`; present but not a string array is unreadable (null). */
+function manifestExpectedArtifacts(manifest: Record<string, unknown> | null): readonly string[] | null {
+  if (manifest === null || !Object.prototype.hasOwnProperty.call(manifest, 'expectedArtifacts')) {
+    return [];
+  }
+  const value = manifest.expectedArtifacts;
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+    return null;
+  }
+  return value as readonly string[];
+}
+
+type WriteOutcome =
+  | { readonly ok: true; readonly record?: LaneRunRecord }
+  | { readonly ok: false; readonly reason: AdvanceLaneRunRefusal };
 
 /**
  * One advance's facts plus what its decision hooks need. Kept per call, never on
@@ -243,6 +289,8 @@ interface GatheredLaneRunFacts {
   readonly deadlineUnknown: boolean;
   /** The latest attempt as gathered, for the admission hook. */
   readonly latestAttempt: AttemptRecord | null;
+  /** The run's attempt records in `attemptIds` order (null where a record is missing), for the prepare act. */
+  readonly attemptRecords: readonly (AttemptRecord | null)[];
 }
 
 export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
@@ -321,13 +369,19 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'waiting', reason: decision.reason };
     }
     if (decision.kind === 'act') {
+      if (decision.step === 'prepare') {
+        return this.performPrepare(record, gathered, decision, request);
+      }
+      if (decision.step === 'dispatch') {
+        return this.performDispatch(record, gathered, decision, request);
+      }
       return { outcome: 'not-built', decision: 'act', step: decision.step };
     }
     if (decision.kind === 'reconcile') {
       return { outcome: 'not-built', decision: 'reconcile', step: decision.step };
     }
     if (decision.kind === 'cancel') {
-      return { outcome: 'not-built', decision: 'cancel', step: 'stop' };
+      return this.performCancel(decision, request);
     }
     if (decision.kind === 'enter') {
       return this.performEnter(record, facts.state, decision.to, request);
@@ -386,6 +440,372 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     return { outcome: 'parked', reason, qualifier };
   }
 
+  /** The acts' own cost-ceiling re-check (§3.6): park before anything is written. */
+  private async ceilingPark(
+    record: LaneRunRecord,
+    gathered: GatheredLaneRunFacts,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult | null> {
+    if (!gathered.facts.costCeilingReached) {
+      return null;
+    }
+    return this.performPark(record, 'cost-ceiling', null, gathered.facts.state, request);
+  }
+
+  private async appendRunIntent(
+    request: AdvanceLaneRunRequest,
+    key: string,
+    mintedId: string | null,
+  ): Promise<AdvanceLaneRunRefusal | null> {
+    const appended = await this.deps.runJournal.append(
+      laneRunIntentEntry(this.deps.newUlid(), request.runId, key, mintedId, request.nowIso),
+    );
+    return appended.outcome === 'appended' ? null : 'journal-refused';
+  }
+
+  private async appendRunResult(
+    request: AdvanceLaneRunRequest,
+    key: string,
+    outcome: LaneRunJournalOutcome,
+    reasonCode: LaneRunResultReasonCode | null,
+  ): Promise<AdvanceLaneRunRefusal | null> {
+    const appended = await this.deps.runJournal.append(
+      laneRunResultEntry(this.deps.newUlid(), request.runId, key, outcome, reasonCode, request.nowIso),
+    );
+    return appended.outcome === 'appended' ? null : 'journal-refused';
+  }
+
+  /**
+   * The `act prepare` decision (K4-5): a fresh round-0 attempt on the selected
+   * first-pass seat, copying the frozen-brief fields from the run's latest
+   * attempt (the seat pivot). Order: intent, attempt record, run record,
+   * result — so a result never exists for an attempt the run record does not
+   * list. A fix-round prepare stays with K5 and is refused under its key.
+   */
+  private async performPrepare(
+    record: LaneRunRecord,
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'act' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const ceiling = await this.ceilingPark(record, gathered, request);
+    if (ceiling !== null) {
+      return ceiling;
+    }
+    const nowIso = request.nowIso;
+    const refuse = async (reasonCode: LaneRunResultReasonCode): Promise<AdvanceLaneRunResult> => {
+      const intentRefusal = await this.appendRunIntent(request, decision.key, null);
+      if (intentRefusal !== null) {
+        return { outcome: 'refused', reason: intentRefusal };
+      }
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', reasonCode);
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
+    };
+
+    if (decision.round !== 0) {
+      return refuse('prepare-fix-round-not-built');
+    }
+    let source: AttemptRecord | null = null;
+    for (let index = gathered.attemptRecords.length - 1; index >= 0; index -= 1) {
+      const candidate = gathered.attemptRecords[index];
+      if (candidate !== null) {
+        source = candidate;
+        break;
+      }
+    }
+    if (source === null) {
+      return refuse('no-frozen-brief');
+    }
+    const planResult = SeatPlan.create(source.seatPlan);
+    const seat =
+      planResult.success && planResult.value !== undefined
+        ? planResult.value.getSeats('first-pass')[decision.seatIndex]
+        : undefined;
+    if (seat === undefined) {
+      return refuse('seat-missing');
+    }
+    const sourceTool = parseSeatTool(source.seatSelection?.tool) ?? 'opencode';
+    if ((parseSeatTool(seat.tool) ?? 'opencode') !== sourceTool) {
+      return refuse('seat-tool-differs');
+    }
+    const attemptId = 'attempt-' + this.deps.newUlid();
+    const intentRefusal = await this.appendRunIntent(request, decision.key, attemptId);
+    if (intentRefusal !== null) {
+      return { outcome: 'refused', reason: intentRefusal };
+    }
+    const attempt: AttemptRecord = {
+      id: attemptId,
+      workOrderId: source.workOrderId,
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: source.id,
+      worktreePath: source.worktreePath,
+      baseCommit: source.baseCommit,
+      state: 'intent-recorded',
+      outcome: null,
+      revision: 0,
+      briefDigest: source.briefDigest,
+      briefPackagePath: source.briefPackagePath,
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: null,
+      seatPlan: source.seatPlan ?? null,
+      seatSelection: seatSelectionRecord('first-pass', decision.seatIndex, seat),
+      reviewerSeat: source.reviewerSeat ?? null,
+      createdAtIso: nowIso,
+      updatedAtIso: nowIso,
+    };
+    try {
+      await this.deps.attemptRepo.saveAttempt(attempt);
+    } catch (error) {
+      if (error instanceof AttemptRevisionConflictError) {
+        const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'attempt-exists');
+        if (resultRefusal !== null) {
+          return { outcome: 'refused', reason: resultRefusal };
+        }
+        return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'attempt-exists' };
+      }
+      throw error;
+    }
+    try {
+      const saved = await this.saveOrRefuse(
+        { ...record, attemptIds: [...record.attemptIds, attemptId], revision: record.revision + 1 },
+        request,
+      );
+      if (!saved.ok) {
+        // The intent stays pending; K4-7's prepare reconcile finds the attempt
+        // and appends the id to the run record.
+        return { outcome: 'refused', reason: saved.reason };
+      }
+    } catch {
+      return { outcome: 'refused', reason: 'save-refused' };
+    }
+    const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'prepared');
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'prepared' };
+  }
+
+  /**
+   * The `act dispatch` decision (K4-5): start the prepared attempt through
+   * `DispatchAttemptPort` with the frozen brief's limits, raising the round and
+   * the seat cursor on the record before the call (§3.2, D8). The dispatch key
+   * is one-way: when a reconcile already recorded the dispatch as never
+   * started but its cancel did not land, the attempt is cancelled instead of
+   * re-sending the key. A pivot dispatches with a conductor seat override.
+   */
+  private async performDispatch(
+    record: LaneRunRecord,
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'act' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const facts = gathered.facts;
+    const ceiling = await this.ceilingPark(record, gathered, request);
+    if (ceiling !== null) {
+      return ceiling;
+    }
+    const dispatch = this.deps.dispatchAttempt;
+    if (dispatch === undefined) {
+      return { outcome: 'not-wired', step: decision.step };
+    }
+    const nowIso = request.nowIso;
+    const latest = gathered.latestAttempt;
+    if (latest === null || latest.state !== 'intent-recorded') {
+      return { outcome: 'waiting', reason: 'facts-inconsistent' };
+    }
+    if (facts.attempt !== null && facts.attempt.dispatchResult === 'not-started') {
+      const cancel = this.deps.cancelPreparedAttempt;
+      if (cancel === undefined) {
+        return { outcome: 'not-wired', step: decision.step };
+      }
+      await cancel.cancelPreparedAttempt({ attemptId: latest.id, nowIso });
+      return { outcome: 'waiting', reason: 'dispatch-pending' };
+    }
+    const manifest = await readFrozenManifest(latest, this.deps.artifactPort);
+    const stepLimit = manifestPositiveInteger(manifest, 'stepLimit');
+    const timeLimitSeconds = manifestTimeLimitSeconds(manifest);
+    const expectedArtifacts = manifestExpectedArtifacts(manifest);
+    const briefPackagePath = latest.briefPackagePath;
+    const briefDigest = latest.briefDigest;
+    const inputsReadable =
+      stepLimit !== null &&
+      timeLimitSeconds !== null &&
+      expectedArtifacts !== null &&
+      briefPackagePath !== null &&
+      briefDigest !== null;
+    const intentRefusal = await this.appendRunIntent(request, decision.key, latest.id);
+    if (intentRefusal !== null) {
+      return { outcome: 'refused', reason: intentRefusal };
+    }
+    if (!inputsReadable) {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'dispatch-inputs-unreadable');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return this.performPark(record, 'step-refused', 'dispatch', facts.state, request);
+    }
+    const role = implementerRoleFor(decision.round, facts.state);
+    const roundRaised = decision.round > record.round;
+    if (roundRaised || record.cursors[role] !== decision.seatIndex) {
+      const cursors: LaneRunCursorsRecord =
+        role === 'first-pass'
+          ? { ...record.cursors, 'first-pass': decision.seatIndex }
+          : { ...record.cursors, fix: decision.seatIndex };
+      const saved = await this.saveOrRefuse(
+        {
+          ...record,
+          round: roundRaised ? decision.round : record.round,
+          cursors,
+          revision: record.revision + 1,
+        },
+        request,
+      );
+      if (!saved.ok) {
+        // The pending intent is reconciled by K4-7 as never started; the
+        // dispatch is never called on a refused save.
+        return { outcome: 'refused', reason: saved.reason };
+      }
+      // Later writes in this advance (a park) must chain on the saved revision.
+      record = saved.record ?? record;
+    }
+    const pivot =
+      latest.kind === 'initial' && latest.priorAttemptId !== null && latest.seatSelection != null
+        ? latest.seatSelection
+        : null;
+    const seatOverride: AttemptSeatOverrideRecord | null =
+      pivot === null
+        ? null
+        : {
+            model: pivot.model,
+            ...(pivot.agent !== null ? { agent: pivot.agent } : {}),
+            ...(pivot.variant !== null ? { variant: pivot.variant } : {}),
+            reason: 'seat-plan pivot to ' + pivot.seatId,
+            setBy: 'conductor',
+            expiresAtIso: new Date(Date.parse(nowIso) + timeLimitSeconds * 1000).toISOString(),
+          };
+    const dispatched = await dispatch.dispatchAttempt({
+      attemptId: latest.id,
+      workOrderId: record.workOrderId,
+      worktreePath: latest.worktreePath,
+      briefPackagePath,
+      briefDigest,
+      baseCommit: latest.baseCommit,
+      stepLimit,
+      timeLimitSeconds,
+      expectedArtifacts,
+      nowIso,
+      ...(seatOverride !== null ? { seatOverride } : {}),
+      ...(this.deps.installationSchemaVersion !== undefined
+        ? { installationSchemaVersion: this.deps.installationSchemaVersion }
+        : {}),
+    });
+    if (dispatched.outcome === 'started' || dispatched.outcome === 'blocked' || dispatched.outcome === 'unknown') {
+      let reasonCode: LaneRunResultReasonCode;
+      if (dispatched.outcome === 'started') {
+        reasonCode = 'dispatch-started';
+      } else if (dispatched.outcome === 'blocked') {
+        reasonCode = 'dispatch-blocked';
+      } else {
+        reasonCode = 'dispatch-unknown';
+      }
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', reasonCode);
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      const conductRefusal = await this.conductDispatching(facts.state, request);
+      if (conductRefusal !== null) {
+        return { outcome: 'refused', reason: conductRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
+    }
+    // Refused: a runner refusal saved with its stop reason (S1) pivots through
+    // seat-failed; anything else parks for the owner (the key is spent).
+    const stored = await this.deps.attemptRepo.findAttemptById(latest.id);
+    let reasonCode: LaneRunResultReasonCode;
+    if (stored !== null && stored.state === 'cancelled') {
+      reasonCode = 'runner-refused';
+    } else {
+      reasonCode = 'dispatch-refused';
+    }
+    const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', reasonCode);
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    if (reasonCode === 'runner-refused') {
+      const conductRefusal = await this.conductDispatching(facts.state, request);
+      if (conductRefusal !== null) {
+        return { outcome: 'refused', reason: conductRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
+    }
+    return this.performPark(record, 'step-refused', 'dispatch', facts.state, request);
+  }
+
+  /** The `dispatching` conduct entry after a dispatch, unless the run is already in it. */
+  private async conductDispatching(
+    state: LaneRunStateValue,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunRefusal | null> {
+    if (state === 'dispatching') {
+      return null;
+    }
+    const appended = await this.appendConduct(request, 'dispatching');
+    return appended.ok ? null : appended.reason;
+  }
+
+  /**
+   * The G4e `cancel` decision (K4-5): the record-only cancel of a prepared,
+   * never-dispatched attempt, journalled under its stop step key.
+   */
+  private async performCancel(
+    decision: Extract<LaneRunDecision, { kind: 'cancel' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const cancel = this.deps.cancelPreparedAttempt;
+    if (cancel === undefined) {
+      return { outcome: 'not-wired', step: 'stop' };
+    }
+    const intentRefusal = await this.appendRunIntent(request, decision.key, decision.attemptId);
+    if (intentRefusal !== null) {
+      return { outcome: 'refused', reason: intentRefusal };
+    }
+    const cancelled = await cancel.cancelPreparedAttempt({
+      attemptId: decision.attemptId,
+      nowIso: request.nowIso,
+    });
+    let outcome: LaneRunJournalOutcome;
+    let reasonCode: LaneRunResultReasonCode;
+    if (cancelled.outcome === 'cancelled') {
+      outcome = 'cancelled-unstarted';
+      if (cancelled.capacity === 'released') {
+        reasonCode = 'capacity-released';
+      } else if (cancelled.capacity === 'none-held') {
+        reasonCode = 'capacity-none-held';
+      } else {
+        reasonCode = 'capacity-held';
+      }
+    } else if (cancelled.reason === 'not-prepared') {
+      outcome = 'refused';
+      reasonCode = 'cancel-refused';
+    } else if (cancelled.reason === 'changed') {
+      outcome = 'refused';
+      reasonCode = 'cancel-changed';
+    } else {
+      outcome = 'cancelled-unstarted';
+      reasonCode = 'attempt-absent';
+    }
+    const resultRefusal = await this.appendRunResult(request, decision.key, outcome, reasonCode);
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: 'stop', key: decision.key, result: outcome, reasonCode };
+  }
+
   private async appendConduct(
     request: AdvanceLaneRunRequest,
     state: LaneRunStateValue,
@@ -402,7 +822,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       fence: request.lease.fence,
       nowIso: request.nowIso,
     });
-    return saved.outcome === 'saved' ? { ok: true } : { ok: false, reason: 'save-refused' };
+    return saved.outcome === 'saved' ? { ok: true, record: saved.record } : { ok: false, reason: 'save-refused' };
   }
 
   /**
@@ -515,7 +935,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       refusedStep: laneRunRefusedStep(entries, record.runId, record.round),
       merge: { oneWayDoor: true, branchBehind: true, trainFree: false, policyGrant: false },
     };
-    return { facts, deadlineUnknown, latestAttempt: latest };
+    return { facts, deadlineUnknown, latestAttempt: latest, attemptRecords };
   }
 
   /** Reconcile the latest running attempt; `refused` / `not-found` keep the record as read. */

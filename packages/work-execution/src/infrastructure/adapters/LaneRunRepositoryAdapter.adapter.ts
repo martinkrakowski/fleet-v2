@@ -23,7 +23,9 @@
  * lease (holder and fence match, not expired at the caller's nowIso). It
  * never changes the lease, the run's identity or its earlier attempts.
  * Lease operations apply K3-1's decisions to the stored record's lease and
- * never move `revision`. There is no change signal in this lane.
+ * never move `revision`. There is no change signal in this lane. With
+ * `readOnly` the store never writes: an unreadable file is a read error with
+ * no quarantine copy, and every create, save and lease write is refused.
  */
 
 import { promises as fs } from 'node:fs';
@@ -47,8 +49,9 @@ import type {
   LaneRunRepositoryResult,
 } from '../../application/ports/out/LaneRunRepositoryPort.out-port.js';
 import {
+  assertStoreWritable,
   inspectRecordListBytes,
-  quarantineUnreadable,
+  rejectUnreadableStateFile,
   withFileLock,
   writeJsonAtomically,
 } from './file-store.js';
@@ -57,6 +60,11 @@ export interface LaneRunRepositoryAdapterOptions {
   /** When set, runs persist here and reload on first use. */
   readonly stateDir?: string;
   readonly fileName?: string;
+  /**
+   * Read-only (telemetry plan §3.3): an unreadable file is a read error with no quarantine copy
+   * (`StateFileUnreadableReadOnlyError`), and every write throws `ReadOnlyStateStoreError`.
+   */
+  readonly readOnly?: boolean;
 }
 
 const DEFAULT_FILE_NAME = 'lane-runs.json';
@@ -255,6 +263,7 @@ export class LaneRunRepositoryAdapter implements LaneRunRepositoryPort {
     runId: string,
     decide: (stored: LaneRunRecord | undefined) => LaneRunRepositoryResult,
   ): Promise<LaneRunRepositoryResult> {
+    assertStoreWritable(this.options.readOnly === true, 'LaneRunRepositoryAdapter');
     const target = this.statePath;
     if (target === null) {
       const stored = this.inMemoryRuns.get(runId);
@@ -313,7 +322,7 @@ export class LaneRunRepositoryAdapter implements LaneRunRepositoryPort {
     }
     const inspection = inspectRecordListBytes(buffer, parseLaneRunStateRecord);
     if (inspection.status === 'unreadable') {
-      return quarantineUnreadable(target, inspection.detail, buffer);
+      return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options.readOnly === true);
     }
     for (const item of inspection.records) {
       records.set(item.runId, item);

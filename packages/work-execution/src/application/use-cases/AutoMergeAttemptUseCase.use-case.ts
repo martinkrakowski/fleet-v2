@@ -473,9 +473,13 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
         'the grant answer was unexpected',
       ]);
     }
+    // The grant id is read once, as an own data property: never inherited, never an accessor.
+    const grantIdDescriptor = Object.getOwnPropertyDescriptor(grant, 'grantId');
+    const grantId =
+      grantIdDescriptor !== undefined && 'value' in grantIdDescriptor ? (grantIdDescriptor.value as unknown) : undefined;
     if (
-      typeof grant.grantId !== 'string' ||
-      grant.grantId.trim() === '' ||
+      typeof grantId !== 'string' ||
+      grantId.trim() === '' ||
       grant.decisionRevision !== autoMergeDecisionRevision(settings.revision)
     ) {
       return this.notMerged(ctx, 'grant-revision-mismatch', 'the grant does not name the setting revision', [
@@ -509,7 +513,7 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
         workOrderId: workOrder.id,
         kind: 'merge-pr',
         expectedHeadSha: head,
-        authorizationGrantId: grant.grantId,
+        authorizationGrantId: grantId,
         authorizedBy: grant.decisionRevision,
       });
     } catch {

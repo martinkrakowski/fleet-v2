@@ -842,6 +842,32 @@ describe('AutoMergeAttemptUseCase (AM4a-2)', () => {
     }
   });
 
+  it('refuses a grant id that is missing, inherited or an accessor, and never forges', async () => {
+    const missing = { outcome: 'issued', decisionRevision: 'policy:autoMerge@0123456789ab' };
+    const inherited = Object.assign(Object.create({ grantId: 'grant-example-1' }) as object, {
+      outcome: 'issued',
+      decisionRevision: 'policy:autoMerge@0123456789ab',
+    });
+    let accessorReads = 0;
+    const accessor = {
+      outcome: 'issued',
+      decisionRevision: 'policy:autoMerge@0123456789ab',
+      get grantId(): string {
+        accessorReads += 1;
+        return 'grant-example-1';
+      },
+    };
+    for (const answer of [missing, inherited, accessor]) {
+      const built = build();
+      built.grant.answer = answer as typeof built.grant.answer;
+      await seed(built);
+      const result = await built.run();
+      expect(result).toMatchObject({ outcome: 'not-merged', reason: 'grant-revision-mismatch' });
+      expect(built.forge.calls).toBe(0);
+    }
+    expect(accessorReads).toBe(0);
+  });
+
   it('keeps not-merged when routing is unwired or fails, and answers exists on a repeat key', async () => {
     const unwired = build({ routing: undefined });
     unwired.gate.result = { verdict: 'failed', reason: 'a predicate failed' };

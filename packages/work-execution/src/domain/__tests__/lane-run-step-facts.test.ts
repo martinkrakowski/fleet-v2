@@ -147,9 +147,9 @@ describe('laneRunAttemptPlacement', () => {
     expect(laneRunAttemptPlacement(entries, RUN_ID, ATTEMPT)).toEqual({ round: 0, seatIndex: 1 });
   });
 
-  it('never places an attempt from a stop, collect or gate intent that comes first', () => {
+  it('never places an attempt from a stop intent that comes first', () => {
     const entries = [
-      intent(keyOf({ round: 2, step: 'collect', seatIndex: 3, attemptOrdinal: 1 }), { mintedId: ATTEMPT }),
+      intent(keyOf({ round: 2, step: 'stop', seatIndex: 3 }), { mintedId: ATTEMPT }),
       intent(keyOf({ round: 0, step: 'prepare', seatIndex: 1, attemptOrdinal: 1 }), { mintedId: ATTEMPT }),
     ];
     expect(laneRunAttemptPlacement(entries, RUN_ID, ATTEMPT)).toEqual({ round: 0, seatIndex: 1 });

@@ -1240,10 +1240,8 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     const attempt = await this.deps.attemptRepo.findAttemptById(mintedId);
     const outcome: LaneRunJournalOutcome = attempt !== null ? 'reconciled' : 'not-started';
     const reasonCode: LaneRunResultReasonCode = attempt !== null ? 'prepared' : 'attempt-absent';
-    const resultRefusal = await this.appendRunResult(request, decision.key, outcome, reasonCode);
-    if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
-    }
+    // The ordinal is spent on the run record BEFORE the result is journalled: once a result exists this
+    // handler never runs again, so a crash between the two must leave the id on the run, never off it.
     if (!record.attemptIds.includes(mintedId)) {
       const saved = await this.saveOrRefuse(
         { ...record, attemptIds: [...record.attemptIds, mintedId], revision: record.revision + 1 },
@@ -1252,6 +1250,10 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       if (!saved.ok) {
         return { outcome: 'refused', reason: saved.reason };
       }
+    }
+    const resultRefusal = await this.appendRunResult(request, decision.key, outcome, reasonCode);
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: outcome, reasonCode };
   }
@@ -1275,6 +1277,17 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       (attempt.state === 'running' || attempt.state === 'ended' || attempt.state === 'collected' || attempt.sessionId !== null)
     ) {
       return this.reconcileDispatchStarted(gathered, decision, request, 'dispatch-started');
+    }
+    if (
+      attempt !== null &&
+      attempt.state === 'cancelled' &&
+      attempt.sessionId === null &&
+      (attempt.stopReason ?? 'none') === 'none' &&
+      attempt.outcome === 'stopped'
+    ) {
+      // Re-entry after a crash between the idle-worktree cancel and its result: CancelPreparedAttempt
+      // leaves the stop reason 'none', a runner refusal always records a class, so this was never dispatched.
+      return this.closeDispatchNotStarted(decision, request);
     }
     if (attempt !== null && attempt.state === 'cancelled') {
       const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'runner-refused');
@@ -1388,15 +1401,29 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     if (worktree.state !== 'idle') {
       return ambiguous('worktree-unknown');
     }
+    // The untouched attempt is cancelled BEFORE the key is closed not-started, and only a confirmed
+    // cancel closes it: a not-started result over an attempt still intent-recorded would let it dispatch.
+    if (attempt !== null && attempt.state !== 'cancelled') {
+      const cancel = this.deps.cancelPreparedAttempt;
+      if (cancel === undefined) {
+        return ambiguous('worktree-unknown');
+      }
+      const cancelled = await cancel.cancelPreparedAttempt({ attemptId, nowIso: request.nowIso });
+      if (cancelled.outcome !== 'cancelled') {
+        return ambiguous('worktree-unknown');
+      }
+    }
+    return this.closeDispatchNotStarted(decision, request);
+  }
+
+  /** The dispatch key's `not-started` / `worktree-idle` result, once its untouched attempt is cancelled. */
+  private async closeDispatchNotStarted(
+    decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
     const resultRefusal = await this.appendRunResult(request, decision.key, 'not-started', 'worktree-idle');
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
-    }
-    if (attempt !== null) {
-      const cancel = this.deps.cancelPreparedAttempt;
-      if (cancel !== undefined) {
-        await cancel.cancelPreparedAttempt({ attemptId, nowIso: request.nowIso });
-      }
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'not-started', reasonCode: 'worktree-idle' };
   }

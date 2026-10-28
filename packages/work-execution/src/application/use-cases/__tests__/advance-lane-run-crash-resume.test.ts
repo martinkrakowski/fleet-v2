@@ -559,6 +559,59 @@ describe('AdvanceLaneRunUseCase reconcile and crash-resume (K4-7)', () => {
     expect(journal.filter((entry) => entry.kind === 'intent' && entry.key === key)).toHaveLength(1);
   });
 
+  it('test 2b: an idle worktree whose cancel is refused stays ambiguous and never closes the key not-started', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    const refusing: AdvanceLaneRunDependencies = {
+      ...harness.deps,
+      cancelPreparedAttempt: { cancelPreparedAttempt: async () => ({ outcome: 'refused', reason: 'changed' }) },
+    };
+    const key = dispatchKey();
+    await appendIntent(harness, key, 'attempt-example-1', NOW);
+    const result = await new AdvanceLaneRunUseCase(refusing).advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+    expect(result).toEqual({ outcome: 'acted', step: 'dispatch', key, result: 'ambiguous', reasonCode: 'worktree-unknown' });
+    const results = await resultsForKey(harness, key);
+    expect(results.map((entry) => entry.outcome)).toEqual(['ambiguous']);
+    expect(laneRunAttemptDispatchResult(await harness.runJournal.listForRun(RUN_ID), RUN_ID, 'attempt-example-1')).not.toBe('not-started');
+    expect((await harness.attemptRepo.findAttemptById('attempt-example-1'))?.state).toBe('intent-recorded');
+  });
+
+  it('test 2c: a crash after the idle cancel but before its result re-enters as not-started, never runner-refused', async () => {
+    const harness = await makeHarness(runRecord(), [
+      // Exactly what CancelPreparedAttempt leaves: cancelled, outcome stopped, stop reason still 'none'.
+      attemptFixture({ state: 'cancelled', outcome: 'stopped', sessionId: null }),
+    ]);
+    const key = dispatchKey();
+    await appendIntent(harness, key, 'attempt-example-1', NOW);
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'dispatch', key, result: 'not-started', reasonCode: 'worktree-idle' });
+    expect(harness.cancelRequests).toEqual([]);
+    expect(harness.dispatchRequests).toEqual([]);
+  });
+
+  it('test 2d: a runner-refused cancelled attempt (a stop reason class recorded) stays runner-refused', async () => {
+    const harness = await makeHarness(runRecord(), [
+      attemptFixture({ state: 'cancelled', outcome: 'stopped', sessionId: null, stopReason: 'no-route' } as never),
+    ]);
+    const key = dispatchKey();
+    await appendIntent(harness, key, 'attempt-example-1', NOW);
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'dispatch', key, result: 'refused', reasonCode: 'runner-refused' });
+  });
+
+  it('test 6b: a crash after the prepare save but before its result appends the result once and keeps one id', async () => {
+    const harness = await makeHarness(runRecord({ attemptIds: ['attempt-example-1'] }), [attemptFixture()]);
+    const key = stepKey({ round: 0, step: 'prepare', seatIndex: 0, attemptOrdinal: 1, head12: null });
+    await appendIntent(harness, key, 'attempt-example-1', NOW);
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'prepare', key, result: 'reconciled', reasonCode: 'prepared' });
+    expect((await harness.runRepo.get(RUN_ID))?.attemptIds).toEqual(['attempt-example-1']);
+    expect(await resultsForKey(harness, key)).toHaveLength(1);
+  });
+
   it('test 3: a busy worktree is ambiguous worktree-running; the next advance parks ambiguous dispatch and a parked advance waits', async () => {
     const harness = await makeHarness(runRecord(), [attemptFixture()]);
     const key = dispatchKey();

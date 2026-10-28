@@ -406,3 +406,75 @@ describe('AssessHeadAcceptanceUseCase', () => {
     }
   });
 });
+
+describe('review kind pass gate (PC-1)', () => {
+  it('does not accept a passing brief-check receipt alone', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [independentReviewReceiptWithFindings([], { kind: 'brief-check' })],
+    });
+    const repo = new InMemoryAssessmentRepo([record]);
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
+
+    const result = await useCase.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockers).toContain('no read-only independent review passed for this candidate head');
+    }
+  });
+
+  it('accepts a passing code-review alongside a passing brief-check', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [
+        independentReviewReceiptWithFindings([], { kind: 'brief-check' }),
+        independentReviewReceiptWithFindings([], { id: 'rr-2', kind: 'code-review' }),
+      ],
+    });
+    const repo = new InMemoryAssessmentRepo([record]);
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
+
+    const result = await useCase.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(result.outcome).toBe('accepted');
+  });
+
+  it('blocks a failing brief-check even alongside a passing code-review', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [
+        independentReviewReceiptWithFindings([], { kind: 'brief-check', result: 'fail' }),
+        independentReviewReceiptWithFindings([], { id: 'rr-2', kind: 'code-review' }),
+      ],
+    });
+    const repo = new InMemoryAssessmentRepo([record]);
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
+
+    const result = await useCase.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockers.join('\n')).toContain("review by 'seat-a/reviewer' failed");
+    }
+  });
+
+  it('treats a kind-less passing receipt exactly as on main', async () => {
+    const record = sampleRecord(); // the default review receipt has no kind and passes
+    const repo = new InMemoryAssessmentRepo([record]);
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
+
+    const result = await useCase.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(result.outcome).toBe('accepted');
+  });
+});

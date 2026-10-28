@@ -5,7 +5,11 @@
  * implementer: changing the provider seat prefix is not independence.
  */
 
-import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain/evidence-records.js';
+import type {
+  EvidenceAssessmentRecord,
+  ReviewReceiptRecord,
+} from '../../domain/evidence-records.js';
+import { REVIEW_KINDS, REVIEW_REQUEST_ID_PATTERN } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import { ReviewReceipt, isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
@@ -21,6 +25,7 @@ import type {
   RequestIndependentReviewPort,
   RequestIndependentReviewRequest,
   RequestIndependentReviewResult,
+  ReviewRejection,
 } from '../ports/in/RequestIndependentReviewPort.in-port.js';
 
 export interface RequestIndependentReviewDependencies {
@@ -45,6 +50,17 @@ function sharesUnderlyingModel(implementerModel: string, reviewerModel: string):
       underlyingModelFamily(reviewerModel),
     )
   );
+}
+
+/** A rejection that carries the typed code only for conductor requests (those with a requestId). */
+function rejectedFor(
+  request: RequestIndependentReviewRequest,
+  rejection: ReviewRejection,
+  reason: string,
+): RequestIndependentReviewResult {
+  return request.requestId !== undefined
+    ? { outcome: 'rejected', reason, rejection }
+    : { outcome: 'rejected', reason };
 }
 
 export class RequestIndependentReviewUseCase implements RequestIndependentReviewPort {
@@ -83,63 +99,136 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       !isNonEmptyTrimmedString(request.implementerModel) ||
       !isNonEmptyTrimmedString(request.reviewerModel)
     ) {
-      return {
-        outcome: 'rejected',
-        reason:
-          'Independent review requires non-empty assessmentId, projectId, attemptId, candidateHeadSha, policyRevision, implementerModel and reviewerModel',
-      };
+      return rejectedFor(
+        request,
+        'invalid-request',
+        'Independent review requires non-empty assessmentId, projectId, attemptId, candidateHeadSha, policyRevision, implementerModel and reviewerModel',
+      );
+    }
+    if (
+      (request.kind !== undefined && !REVIEW_KINDS.includes(request.kind)) ||
+      (request.requestId !== undefined &&
+        (typeof request.requestId !== 'string' || !REVIEW_REQUEST_ID_PATTERN.test(request.requestId))) ||
+      (request.requestId !== undefined && request.kind === undefined)
+    ) {
+      return rejectedFor(
+        request,
+        'invalid-request',
+        'Independent review requires a known kind and a well-formed requestId together',
+      );
     }
     if (sharesUnderlyingModel(request.implementerModel, request.reviewerModel)) {
-      return {
-        outcome: 'rejected',
-        reason: `Independent review requires a distinct underlying model: ${request.reviewerModel} and ${request.implementerModel} share the same underlying model`,
-      };
+      return rejectedFor(
+        request,
+        'not-independent',
+        `Independent review requires a distinct underlying model: ${request.reviewerModel} and ${request.implementerModel} share the same underlying model`,
+      );
     }
+    // A new review checks the seat policy before any assessment read (FS3b). Only a request carrying a
+    // requestId reads the assessment first, to replay a stored receipt without consulting the seat.
+    let existing: Awaited<ReturnType<typeof deps.repo.findAssessmentById>> = null;
+    // A replayed request id never runs a second review (§3.5): the recorded receipt answers when reviewer,
+    // kind and head match and the assessment still matches the request. Replay runs before the seat policy —
+    // a stored receipt needs no new seat — and before the head and identity checks so a reused id always gets
+    // its typed code. Any other reuse (a different head included) is request-id-reused.
+    if (request.requestId !== undefined) {
+      existing = await deps.repo.findAssessmentById(request.assessmentId);
+      if (existing === null) {
+        return rejectedFor(
+          request,
+          'no-assessment',
+          `No assessment exists for assessmentId '${request.assessmentId}'`,
+        );
+      }
+      const found = existing.reviewReceipts.find(
+        (receipt) => receipt.requestId === request.requestId,
+      );
+      if (found !== undefined) {
+        if (
+          found.reviewerModel.trim() !== request.reviewerModel.trim() ||
+          found.kind !== request.kind ||
+          found.candidateHeadSha !== request.candidateHeadSha
+        ) {
+          return rejectedFor(
+            request,
+            'request-id-reused',
+            'Review request id ' + request.requestId + ' was already used for another review',
+          );
+        }
+        if (
+          existing.projectId !== request.projectId ||
+          existing.attemptId !== request.attemptId ||
+          existing.policyRevision !== request.policyRevision
+        ) {
+          return rejectedFor(
+            request,
+            'assessment-mismatch',
+            'Assessment identity mismatch (projectId, attemptId, or policyRevision does not match existing assessment)',
+          );
+        }
+        if (existing.implementerModel !== request.implementerModel) {
+          return rejectedFor(
+            request,
+            'assessment-mismatch',
+            `Assessment '${existing.id}' was implemented on seat '${existing.implementerModel}', not '${request.implementerModel}'`,
+          );
+        }
+        return { outcome: 'reviewed', receipt: found };
+      }
+    }
+
     if (deps.seatPolicy) {
       const check = await deps.seatPolicy.checkReviewerSeat({
         reviewerModel: request.reviewerModel,
       });
       if (check.outcome === 'refused') {
-        return { outcome: 'rejected', reason: check.reason };
+        return rejectedFor(request, 'seat-refused', check.reason);
       }
     }
 
-    const existing = await deps.repo.findAssessmentById(request.assessmentId);
     if (existing === null) {
-      return {
-        outcome: 'rejected',
-        reason: `No assessment exists for assessmentId '${request.assessmentId}'`,
-      };
+      existing = await deps.repo.findAssessmentById(request.assessmentId);
+      if (existing === null) {
+        return rejectedFor(
+          request,
+          'no-assessment',
+          `No assessment exists for assessmentId '${request.assessmentId}'`,
+        );
+      }
     }
+
     if (existing.candidateHeadSha !== request.candidateHeadSha) {
-      return {
-        outcome: 'rejected',
-        reason: `Assessment '${request.assessmentId}' exists for candidate head '${existing.candidateHeadSha}', not '${request.candidateHeadSha}'`,
-      };
+      return rejectedFor(
+        request,
+        'assessment-mismatch',
+        `Assessment '${request.assessmentId}' exists for candidate head '${existing.candidateHeadSha}', not '${request.candidateHeadSha}'`,
+      );
     }
     if (
       existing.projectId !== request.projectId ||
       existing.attemptId !== request.attemptId ||
       existing.policyRevision !== request.policyRevision
     ) {
-      return {
-        outcome: 'rejected',
-        reason:
-          'Assessment identity mismatch (projectId, attemptId, or policyRevision does not match existing assessment)',
-      };
+      return rejectedFor(
+        request,
+        'assessment-mismatch',
+        'Assessment identity mismatch (projectId, attemptId, or policyRevision does not match existing assessment)',
+      );
     }
     if (existing.implementerModel !== request.implementerModel) {
-      return {
-        outcome: 'rejected',
-        reason: `Assessment '${existing.id}' was implemented on seat '${existing.implementerModel}', not '${request.implementerModel}'`,
-      };
+      return rejectedFor(
+        request,
+        'assessment-mismatch',
+        `Assessment '${existing.id}' was implemented on seat '${existing.implementerModel}', not '${request.implementerModel}'`,
+      );
     }
 
     if (AssessmentState.create(existing.state).value?.isTerminal()) {
-      return {
-        outcome: 'rejected',
-        reason: `Assessment '${existing.id}' is in terminal state '${existing.state}'`,
-      };
+      return rejectedFor(
+        request,
+        'assessment-terminal',
+        `Assessment '${existing.id}' is in terminal state '${existing.state}'`,
+      );
     }
 
     const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
@@ -160,17 +249,18 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
         });
       } catch (error) {
         if (error instanceof EvidenceAssessmentRevisionConflictError) {
-          return { outcome: 'rejected', reason: run.reason };
+          return rejectedFor(request, 'review-unavailable', run.reason);
         }
         throw error;
       }
-      return { outcome: 'rejected', reason: run.reason };
+      return rejectedFor(request, 'review-unavailable', run.reason);
     }
     if (!run.readOnlyVerified) {
-      return {
-        outcome: 'rejected',
-        reason: 'Independent review was not verified read-only, so it is not evidence',
-      };
+      return rejectedFor(
+        request,
+        'not-read-only',
+        'Independent review was not verified read-only, so it is not evidence',
+      );
     }
 
     const archived = await deps.archive.archiveEvidence({
@@ -179,8 +269,16 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       content: run.rawOutput,
     });
 
+    const kindFields: Partial<ReviewReceiptRecord> =
+      request.kind !== undefined ? { kind: request.kind } : {};
+    const requestIdFields: Partial<ReviewReceiptRecord> =
+      request.requestId !== undefined ? { requestId: request.requestId } : {};
+    const receiptId =
+      request.requestId !== undefined
+        ? 'rr-' + request.assessmentId + '-' + request.candidateHeadSha.slice(0, 8) + '-' + request.requestId
+        : 'rr-' + request.assessmentId + '-' + request.candidateHeadSha.slice(0, 8);
     const candidate: ReviewReceiptRecord = {
-      id: `rr-${request.assessmentId}-${request.candidateHeadSha.slice(0, 8)}`,
+      id: receiptId,
       assessmentId: request.assessmentId,
       projectId: request.projectId,
       attemptId: request.attemptId,
@@ -200,18 +298,25 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       evidenceRef: archived.evidenceRef,
       policyRevision: request.policyRevision,
       completedAtIso: run.completedAtIso,
+      ...kindFields,
+      ...requestIdFields,
     };
     // New writes only (plan §3.1, D1): stored receipts are not re-checked on load.
     const placeholderField = placeholderReviewReceiptField(candidate);
     if (placeholderField !== null) {
-      return { outcome: 'rejected', reason: placeholderEvidenceRefusal('Independent review receipt', placeholderField) };
+      return rejectedFor(
+        request,
+        'invalid-receipt',
+        placeholderEvidenceRefusal('Independent review receipt', placeholderField),
+      );
     }
     const validated = ReviewReceipt.create(candidate);
     if (!validated.success || validated.value === undefined) {
-      return {
-        outcome: 'rejected',
-        reason: validated.error?.message ?? 'Independent review produced an invalid receipt',
-      };
+      return rejectedFor(
+        request,
+        'invalid-receipt',
+        validated.error?.message ?? 'Independent review produced an invalid receipt',
+      );
     }
     const receipt = validated.value.toRecord();
 

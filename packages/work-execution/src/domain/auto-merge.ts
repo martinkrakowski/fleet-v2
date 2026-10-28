@@ -23,7 +23,8 @@ export const AUTO_MERGE_ROUTE_RULE: Readonly<Record<AutoMergeReason, AutoMergeRo
   'invalid-request': 'none',
   'attempt-missing': 'none',
   'work-order-missing': 'none',
-  'records-unreadable': 'none',
+  // An unreadable attempt or work-order record surfaces to the owner, like every other unreadable fact (plan §4).
+  'records-unreadable': 'attention',
   'work-order-closed': 'none',
   'no-head': 'none',
   'already-attempted': 'none',
@@ -43,6 +44,8 @@ export const AUTO_MERGE_ROUTE_RULE: Readonly<Record<AutoMergeReason, AutoMergeRo
   'grant-refused': 'attention',
   'grant-revision-mismatch': 'attention',
   'forge-ambiguous': 'attention',
+  // A forge refusal is already on record for this head: the run that met it asked the owner (forge-refused);
+  // a repeat run never issues a second grant and only raises attention.
   'forge-refused-before-grant': 'attention',
   'forge-refused': 'owner-question',
   'gate-not-passed': 'on-blocked',
@@ -214,11 +217,12 @@ function autoMergeDoorsFromReferences(references: unknown): AutoMergeDoors {
   return references.length === 0 ? { kind: 'none' } : { kind: 'named', count: references.length };
 }
 
-/** Read an AttemptOwnerDecisionPort answer: recorded with an array of strings → none/named; else unreadable. */
+/**
+ * Read an AttemptOwnerDecisionPort answer: only `{ outcome: 'recorded', ownerDecisionReferences: string[] }` is
+ * readable (empty → none, else named). Anything else, a bare array included, is unreadable — never stricter at
+ * the merge than here.
+ */
 export function autoMergeDoorsOf(answer: unknown): AutoMergeDoors {
-  if (Array.isArray(answer)) {
-    return autoMergeDoorsFromReferences(answer);
-  }
   const record = readExactPlainRecord(answer, ['outcome', 'ownerDecisionReferences']);
   if (record === null || record.outcome !== 'recorded') {
     return { kind: 'unreadable' };
@@ -241,7 +245,9 @@ export function autoMergeIneligibility(facts: AutoMergeEligibilityFacts): AutoMe
   if (facts.doors.kind === 'named') {
     return 'door-named';
   }
-  if (facts.risk === 'high' && !facts.allowHighRisk) {
+  // An allow-list (plan A5: absent or unknown risk is high): only `standard`, or `high` with an explicit opt-in.
+  const riskAllowed = facts.risk === 'standard' || (facts.risk === 'high' && facts.allowHighRisk === true);
+  if (!riskAllowed) {
     return 'high-risk';
   }
   if (facts.forgeMode !== 'github') {

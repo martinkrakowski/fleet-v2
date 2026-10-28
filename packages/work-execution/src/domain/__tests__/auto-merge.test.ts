@@ -37,6 +37,17 @@ describe('AUTO_MERGE_ROUTE_RULE', () => {
     expect(AUTO_MERGE_ROUTE_RULE['ci-pending-second-look']).toBe('on-blocked');
   });
 
+  it('pins every attention reason (plan §4: needs the owner, never silent)', () => {
+    const attention = AUTO_MERGE_REASONS.filter((reason) => AUTO_MERGE_ROUTE_RULE[reason] === 'attention');
+    expect([...attention].sort()).toEqual(
+      [
+        'acceptance-unreadable', 'door-named', 'doors-unreadable', 'forge-ambiguous', 'forge-history-unreadable',
+        'forge-mode', 'forge-refused-before-grant', 'forge-suspended', 'grant-refused', 'grant-revision-mismatch',
+        'high-risk', 'records-unreadable', 'settings-unreadable',
+      ].sort(),
+    );
+  });
+
   it('keeps owner-question reserved for forge-refused alone', () => {
     const ownerQuestionReasons: AutoMergeReason[] = AUTO_MERGE_REASONS.filter(
       (reason) => AUTO_MERGE_ROUTE_RULE[reason] === 'owner-question',
@@ -174,7 +185,9 @@ describe('autoMergeDoorsOf', () => {
       kind: 'named',
       count: 1,
     });
-    expect(autoMergeDoorsOf(['d1'])).toEqual({ kind: 'named', count: 1 });
+    // A bare array is not a recorded answer: unreadable, as the merge's own re-check reads it.
+    expect(autoMergeDoorsOf(['d1'])).toEqual({ kind: 'unreadable' });
+    expect(autoMergeDoorsOf([])).toEqual({ kind: 'unreadable' });
   });
 
   it('reads unknown answers, non-string lists and malformed values as unreadable', () => {
@@ -261,5 +274,20 @@ describe('auto-merge keys', () => {
     expect(AUTO_MERGE_HEAD_PATTERN.test('a'.repeat(41))).toBe(false);
     expect(AUTO_MERGE_REVISION_PATTERN.test('0123456789ab')).toBe(true);
     expect(AUTO_MERGE_REVISION_PATTERN.test('0123456789abc')).toBe(false);
+  });
+});
+
+describe('autoMergeIneligibility risk allow-list', () => {
+  const base = { doors: { kind: 'none' } as const, forgeMode: 'github' as const };
+  it('refuses an absent, unknown or mis-cased risk and a truthy non-boolean opt-in', () => {
+    for (const risk of [undefined, null, 'High', 'standard ', 'low']) {
+      expect(autoMergeIneligibility({ ...base, risk: risk as never, allowHighRisk: true })).toBe('high-risk');
+    }
+    expect(autoMergeIneligibility({ ...base, risk: 'high', allowHighRisk: 'yes' as never })).toBe('high-risk');
+    expect(autoMergeIneligibility({ ...base, risk: 'high', allowHighRisk: false })).toBe('high-risk');
+  });
+  it('allows standard, and high only with allowHighRisk true', () => {
+    expect(autoMergeIneligibility({ ...base, risk: 'standard', allowHighRisk: false })).toBeNull();
+    expect(autoMergeIneligibility({ ...base, risk: 'high', allowHighRisk: true })).toBeNull();
   });
 });

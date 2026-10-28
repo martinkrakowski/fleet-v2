@@ -386,11 +386,19 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
     expect(after?.revision).toBe(1);
   });
 
-  it('test 7: a prepared attempt under the stubbed no-capacity admission waits; the admission port is never called', async () => {
+  it('test 7: a prepared attempt under no-capacity admission waits and asks the admission port once (K4-4b)', async () => {
     const harness = await makeHarness(runRecord(), attemptFixture());
     const result = await advance(harness);
     expect(result).toEqual({ outcome: 'waiting', reason: 'admission' });
-    expect(harness.admissionCalls).toEqual([]);
+    expect(harness.admissionCalls).toEqual([
+      {
+        attemptId: 'attempt-example-1',
+        workOrderId: 'wo-example-1',
+        seatTool: 'opencode',
+        worktreePath: '/tmp/opencode/wo-example-1/wt-example-1',
+        nowIso: LATER,
+      },
+    ]);
     expect(await harness.runJournal.listForRun(RUN_ID)).toEqual([]);
     const after = await harness.runRepo.get(RUN_ID);
     expect(after?.revision).toBe(1);

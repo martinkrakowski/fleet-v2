@@ -1070,6 +1070,58 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
     expect(journal.entries.at(-1)?.status).toBe('refused');
     expect(workOrderRepo.saved).toHaveLength(1);
   });
+
+  it('executes a push-to-pr without requiring an acceptance receipt and never merges', async () => {
+    const authorization = new FakeActionAuthorization();
+    const { useCase, forgePort, workOrderRepo } = makeDeps({
+      authorization,
+      acceptanceEvidence: { outcome: 'not-found', reason: 'no assessment recorded' },
+      forgeResult: { outcome: 'executed', pullRequestNumber: 42, headSha: HEAD_SHA },
+    });
+
+    const result = await useCase.executeAuthorizedForgeAction(
+      forgeRequest({ kind: 'push-to-pr' }),
+    );
+
+    expect(result).toEqual({
+      outcome: 'executed',
+      pullRequestNumber: 42,
+      headSha: HEAD_SHA,
+    });
+    expect(authorization.consumeRequests).toEqual([
+      expect.objectContaining({ actionKind: 'push-to-pr' }),
+    ]);
+    expect(workOrderRepo.saved).toHaveLength(0);
+    expect(forgePort.requests).toEqual([
+      {
+        actionId: 'action-1',
+        attemptId: 'attempt-1',
+        workOrderId: 'wo-1',
+        kind: 'push-to-pr',
+        expectedHeadSha: HEAD_SHA,
+        branchName: `feat/${LANE_ID}`,
+      },
+    ]);
+  });
+
+  it('re-checks one-way doors for push-to-pr before consuming the grant', async () => {
+    const authorization = new FakeActionAuthorization();
+    const { useCase, forgePort } = makeDeps({
+      authorization,
+      attempt: makeAttempt({ ownerDecisionReferences: ['door-1'] }),
+    });
+
+    const result = await useCase.executeAuthorizedForgeAction(
+      forgeRequest({ kind: 'push-to-pr' }),
+    );
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: "owner decision 'door-1' could not be resolved: no owner decision port is configured",
+    });
+    expect(authorization.consumeRequests).toHaveLength(0);
+    expect(forgePort.requests).toHaveLength(0);
+  });
 });
 
 describe('AcceptanceAssessmentAdapter', () => {

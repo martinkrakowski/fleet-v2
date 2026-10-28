@@ -22,6 +22,8 @@ import type {
 } from '../../application/ports/out/ForgeActionPort.out-port.js';
 import type {
   ForgeReadPort,
+  ForgeRepositoryRef,
+  ReadPullRequestRequest,
   ReadPullRequestResult,
 } from '../../application/ports/out/ForgeReadPort.out-port.js';
 import type { ForgeRefusalKind } from '../../domain/coordination-keys.js';
@@ -45,6 +47,16 @@ export interface ForgeActionDelegate {
     branchName: string,
     request: ForgeActionRequest,
   ) => Promise<string>;
+  /**
+   * Read-only PR state (AM4b-2). Required for `push-to-pr`: without it the
+   * push refuses, since the open PR and its head cannot be checked.
+   */
+  readonly pullRequestRead?: Pick<ForgeReadPort, 'readPullRequest'>;
+  /**
+   * The installation's repository (AM4b-3): when configured, every `gh`
+   * argv carries `-R owner/repo` and reads name it explicitly.
+   */
+  readonly repository?: ForgeRepositoryRef;
 }
 
 function errorMessage(error: unknown): string {
@@ -150,8 +162,29 @@ export class ForgeActionAdapter implements ForgeActionPort {
       };
     }
 
-    // The live head must be verified for every invocation: an unconfigured
-    // verification delegate refuses instead of trusting stale readiness.
+    // `push-to-pr` reads the pull request first (the pre-read happens before
+    // anything is pushed); the other kinds verify the live head next.
+    if (request.kind === 'push-to-pr') {
+      return this.runPushToPr(request);
+    }
+
+    const verified = await this.verifyHead(request);
+    if (verified !== null) {
+      return verified;
+    }
+
+    if (request.kind === 'push-and-open-pr') {
+      return this.runPrCreate(runGh, request);
+    }
+    return this.runPrMerge(runGh, request);
+  }
+
+  /**
+   * Verify the branch's live head matches the expected head. Returns a
+   * final result (refused or ambiguous) when the check fails, or `null`
+   * when the head matches and the action may proceed.
+   */
+  private async verifyHead(request: ForgeActionRequest): Promise<ForgeActionResult | null> {
     const verifyCurrentHeadSha = this.delegate?.verifyCurrentHeadSha;
     if (!verifyCurrentHeadSha) {
       return {
@@ -177,11 +210,112 @@ export class ForgeActionAdapter implements ForgeActionPort {
         refusalKind: 'other',
       };
     }
+    return null;
+  }
 
-    if (request.kind === 'push-and-open-pr') {
-      return this.runPrCreate(runGh, request);
+  /** `-R owner/repo` when the installation repository is configured; else no extra args. */
+  private repositoryArgs(): readonly string[] {
+    const repository = this.delegate?.repository;
+    return repository !== undefined ? ['-R', `${repository.owner}/${repository.repo}`] : [];
+  }
+
+  /**
+   * Push-to-pr (AM4b-3): update an existing open PR's branch with the
+   * attempt's verified head, never opening a second PR. The PR is read
+   * before anything is pushed and again afterwards; a missing, closed or
+   * unreadable PR refuses, an already-current head is a no-op, and a
+   * post-push confirmation that does not show the head is ambiguous for
+   * reconciliation.
+   */
+  private async runPushToPr(request: ForgeActionRequest): Promise<ForgeActionResult> {
+    const reader = this.delegate?.pullRequestRead;
+    if (reader === undefined) {
+      return {
+        outcome: 'refused',
+        reason: 'Cannot push to a pull request without a pull request read',
+        refusalKind: 'other',
+      };
     }
-    return this.runPrMerge(runGh, request);
+    const readRequest: ReadPullRequestRequest = {
+      ref: { kind: 'branch', branchName: request.branchName },
+      ...(this.delegate?.repository !== undefined ? { repository: this.delegate.repository } : {}),
+    };
+
+    let preRead: ReadPullRequestResult;
+    try {
+      preRead = await reader.readPullRequest(readRequest);
+    } catch (error) {
+      return {
+        outcome: 'refused',
+        reason: `Could not read the pull request for branch ${request.branchName}: ${errorMessage(error)}`,
+        refusalKind: 'other',
+      };
+    }
+    if (preRead.outcome === 'unavailable') {
+      return {
+        outcome: 'refused',
+        reason: `Could not read the pull request for branch ${request.branchName}: ${preRead.reason}`,
+        refusalKind: 'other',
+      };
+    }
+    if (preRead.outcome === 'not-found') {
+      return {
+        outcome: 'refused',
+        reason: `No pull request exists for branch ${request.branchName}; push-to-pr never opens one`,
+        refusalKind: 'other',
+      };
+    }
+    const snapshot = preRead.pullRequest;
+    if (snapshot.state !== 'open') {
+      return {
+        outcome: 'refused',
+        reason: `Pull request #${snapshot.number} for branch ${request.branchName} is ${snapshot.state}, not open`,
+        refusalKind: 'other',
+      };
+    }
+    if (snapshot.headSha === request.expectedHeadSha) {
+      return {
+        outcome: 'executed',
+        pullRequestNumber: snapshot.number,
+        headSha: request.expectedHeadSha,
+      };
+    }
+
+    const verified = await this.verifyHead(request);
+    if (verified !== null) {
+      return verified;
+    }
+
+    let postRead: ReadPullRequestResult;
+    try {
+      postRead = await reader.readPullRequest(readRequest);
+    } catch (error) {
+      return {
+        outcome: 'ambiguous',
+        reason: `Pushed branch ${request.branchName} but its pull request does not show head ${request.expectedHeadSha}: ${errorMessage(error)}`,
+      };
+    }
+    if (
+      postRead.outcome === 'found' &&
+      postRead.pullRequest.state === 'open' &&
+      postRead.pullRequest.headSha === request.expectedHeadSha
+    ) {
+      return {
+        outcome: 'executed',
+        pullRequestNumber: postRead.pullRequest.number,
+        headSha: request.expectedHeadSha,
+      };
+    }
+    const whatWasRead =
+      postRead.outcome === 'found'
+        ? `#${postRead.pullRequest.number} ${postRead.pullRequest.state} at ${postRead.pullRequest.headSha}`
+        : postRead.outcome === 'not-found'
+          ? 'no pull request'
+          : postRead.reason;
+    return {
+      outcome: 'ambiguous',
+      reason: `Pushed branch ${request.branchName} but its pull request does not show head ${request.expectedHeadSha}: ${whatWasRead}`,
+    };
   }
 
   private async runPrCreate(
@@ -191,6 +325,7 @@ export class ForgeActionAdapter implements ForgeActionPort {
     const args = [
       'pr',
       'create',
+      ...this.repositoryArgs(),
       '--head',
       request.branchName,
       '--title',
@@ -236,6 +371,7 @@ export class ForgeActionAdapter implements ForgeActionPort {
     const args = [
       'pr',
       'merge',
+      ...this.repositoryArgs(),
       request.branchName,
       '--match-head-commit',
       request.expectedHeadSha,
@@ -277,7 +413,14 @@ export class ForgeActionAdapter implements ForgeActionPort {
     }
     let read: ReadPullRequestResult;
     try {
-      read = await reader.readPullRequest({ ref: { kind: 'branch', branchName: request.branchName } });
+      const ref =
+        request.pullRequestNumber !== undefined
+          ? { kind: 'number' as const, number: request.pullRequestNumber }
+          : { kind: 'branch' as const, branchName: request.branchName };
+      read = await reader.readPullRequest({
+        ref,
+        ...(this.delegate?.repository !== undefined ? { repository: this.delegate.repository } : {}),
+      });
     } catch {
       return {
         outcome: 'ambiguous',

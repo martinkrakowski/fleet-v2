@@ -1164,8 +1164,10 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   forge: {
     execute: async (p, rt) => {
       const kind = str(p, 'kind');
-      if (kind !== 'push-and-open-pr' && kind !== 'merge-pr') {
-        throw new CliUsageError("forge kind must be 'push-and-open-pr' or 'merge-pr'");
+      if (kind !== 'push-and-open-pr' && kind !== 'merge-pr' && kind !== 'push-to-pr') {
+        throw new CliUsageError(
+          "forge kind must be 'push-and-open-pr' or 'merge-pr', or 'push-to-pr' for an existing pull request",
+        );
       }
       const attemptId = str(p, 'attemptId');
       const attempt = await rt.execution.attemptRepository.findAttemptById(attemptId);

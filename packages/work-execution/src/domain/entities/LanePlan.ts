@@ -27,10 +27,19 @@ import type {
   LanePlanRecord,
   LanePlanSidecar,
   PlannedLaneRecord,
+  PlannedLaneRef,
+  PlannedLaneStatus,
+  PlannedLaneTier,
   PlanDecisionSidecar,
   PlanDecisionState,
+  PlanPullRequestRef,
 } from '../lane-plan-records.js';
-import { planIdError, planPathError, planTextError } from '../lane-plan-sidecar.js';
+import {
+  planDecisionAndOrderRecords,
+  planIdError,
+  planPathError,
+  planTextError,
+} from '../lane-plan-sidecar.js';
 import { PlannedLane } from './PlannedLane.js';
 
 export type LanePlanResult =
@@ -84,35 +93,20 @@ export class LanePlan {
         revision: sidecar.revision,
         digest: meta.digest,
         doc: sidecar.doc,
-        lanes: sidecar.lanes.map((lane) => ({
+        lanes: sidecar.lanes.map((lane) => freshLaneRecord({
           laneId: lane.laneId,
           aliases: lane.renamedFrom === null ? [] : [lane.renamedFrom],
           scope: lane.scope,
-          packages: [...lane.packages],
-          sharedFiles: [...lane.sharedFiles],
+          packages: lane.packages,
+          sharedFiles: lane.sharedFiles,
           tier: lane.tier,
-          after: lane.after.map((ref) => ({
-            projectId: ref.projectId,
-            planId: ref.planId,
-            laneId: ref.laneId,
-          })),
-          decisions: [...lane.decisions],
+          after: lane.after,
+          decisions: lane.decisions,
           status: lane.status,
           brief: lane.brief,
-          mergedPr: lane.mergedPr === null
-            ? null
-            : { repository: lane.mergedPr.repository, number: lane.mergedPr.number },
+          mergedPr: lane.mergedPr,
         })),
-        decisions: sidecar.decisions.map((decision) => ({
-          id: decision.id,
-          question: decision.question,
-          default: decision.default,
-          state: decision.state,
-        })),
-        exclusiveOrder: sidecar.exclusiveOrder.map((entry) => ({
-          file: entry.file,
-          lanes: [...entry.lanes],
-        })),
+        ...planDecisionAndOrderRecords(sidecar.decisions, sidecar.exclusiveOrder),
         importedAtIso: meta.importedAtIso,
       };
       return LanePlan.create(record);
@@ -129,54 +123,27 @@ export class LanePlan {
    * read through its own property descriptor so no getter ever runs.
    */
   private static createUnchecked(input: unknown): LanePlanResult {
-    if (typeof input !== 'object' || input === null || Array.isArray(input)) {
-      return invalid('LanePlan requires a record');
+    const snapshotOrError = lanePlanRecordSnapshot(input);
+    if (typeof snapshotOrError === 'string') {
+      return invalid(snapshotOrError);
     }
-    const inputPrototype = Object.getPrototypeOf(input);
-    if (inputPrototype !== Object.prototype && inputPrototype !== null) {
-      return invalid('LanePlan requires a record');
-    }
-    const recordInput = readExactPlainRecord(input, RECORD_KEYS);
-    if (recordInput === null) {
-      return invalid('LanePlan must have exactly its record fields');
-    }
+    const recordInput = snapshotOrError;
 
-    if (recordInput.version !== LANE_PLAN_RECORD_VERSION) {
-      return invalid('LanePlan version must be 1');
-    }
-    const projectIdError = planIdError('projectId', recordInput.projectId, PLAN_PROJECT_ID_PATTERN, 'project id');
-    if (projectIdError !== null) {
-      return invalid(`LanePlan ${projectIdError}`);
-    }
-    const planIdCheck = planIdError('planId', recordInput.planId, PLAN_ID_PATTERN, 'plan id');
-    if (planIdCheck !== null) {
-      return invalid(`LanePlan ${planIdCheck}`);
-    }
-    if (!Number.isSafeInteger(recordInput.revision) || (recordInput.revision as number) < 1) {
-      return invalid('LanePlan revision must be a positive integer');
+    const headError = recordHeadError(recordInput);
+    if (headError !== null) {
+      return invalid(headError);
     }
     const revision = recordInput.revision as number;
-    if (typeof recordInput.digest !== 'string' || !SHA256_HEX_PATTERN.test(recordInput.digest)) {
-      return invalid('LanePlan digest must be a sha256 hex digest');
-    }
-    const docError = planPathError('doc', recordInput.doc);
-    if (docError !== null) {
-      return invalid(`LanePlan ${docError}`);
-    }
 
     const lanesRaw = plainArrayCopy(recordInput.lanes);
-    if (!Array.isArray(lanesRaw)) {
-      return invalid('LanePlan lanes: must be a list');
+    const lanesListError = lanesListShapeError(lanesRaw);
+    if (lanesListError !== null) {
+      return invalid(lanesListError);
     }
-    if (lanesRaw.length === 0) {
-      return invalid('LanePlan lanes: must not be empty');
-    }
-    if (lanesRaw.length > LANE_PLAN_LIMITS.lanes) {
-      return invalid('LanePlan lanes: has too many entries');
-    }
+    const lanesList = lanesRaw as unknown[];
     const lanes: PlannedLane[] = [];
-    for (let index = 0; index < lanesRaw.length; index += 1) {
-      const laneResult = PlannedLane.create(lanesRaw[index], `lanes[${index}]`);
+    for (let index = 0; index < lanesList.length; index += 1) {
+      const laneResult = PlannedLane.create(lanesList[index], `lanes[${index}]`);
       if (!laneResult.success) {
         return { success: false, error: laneResult.error, code: 'invalid' };
       }
@@ -240,35 +207,8 @@ export class LanePlan {
       revision: this.record.revision,
       digest: this.record.digest,
       doc: this.record.doc,
-      lanes: this.record.lanes.map((lane) => ({
-        laneId: lane.laneId,
-        aliases: [...lane.aliases],
-        scope: lane.scope,
-        packages: [...lane.packages],
-        sharedFiles: [...lane.sharedFiles],
-        tier: lane.tier,
-        after: lane.after.map((ref) => ({
-          projectId: ref.projectId,
-          planId: ref.planId,
-          laneId: ref.laneId,
-        })),
-        decisions: [...lane.decisions],
-        status: lane.status,
-        brief: lane.brief,
-        mergedPr: lane.mergedPr === null
-          ? null
-          : { repository: lane.mergedPr.repository, number: lane.mergedPr.number },
-      })),
-      decisions: this.record.decisions.map((decision) => ({
-        id: decision.id,
-        question: decision.question,
-        default: decision.default,
-        state: decision.state,
-      })),
-      exclusiveOrder: this.record.exclusiveOrder.map((entry) => ({
-        file: entry.file,
-        lanes: [...entry.lanes],
-      })),
+      lanes: this.record.lanes.map(freshLaneRecord),
+      ...planDecisionAndOrderRecords(this.record.decisions, this.record.exclusiveOrder),
       importedAtIso: this.record.importedAtIso,
     };
   }
@@ -295,25 +235,7 @@ export class LanePlan {
     if (lane === undefined) {
       return null;
     }
-    return {
-      laneId: lane.laneId,
-      aliases: [...lane.aliases],
-      scope: lane.scope,
-      packages: [...lane.packages],
-      sharedFiles: [...lane.sharedFiles],
-      tier: lane.tier,
-      after: lane.after.map((ref) => ({
-        projectId: ref.projectId,
-        planId: ref.planId,
-        laneId: ref.laneId,
-      })),
-      decisions: [...lane.decisions],
-      status: lane.status,
-      brief: lane.brief,
-      mergedPr: lane.mergedPr === null
-        ? null
-        : { repository: lane.mergedPr.repository, number: lane.mergedPr.number },
-    };
+    return freshLaneRecord(lane);
   }
 
   /** The current lane id for an id or alias, or null. */
@@ -329,6 +251,100 @@ function invalid(message: string): LanePlanResult {
 
 function unreadableInputResult(): LanePlanResult {
   return { success: false, error: new Error('LanePlan input could not be read'), code: 'invalid' };
+}
+
+/** The record's plain-object snapshot, or the fixed error for a non-record input. */
+function lanePlanRecordSnapshot(input: unknown): Record<string, unknown> | string {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    return 'LanePlan requires a record';
+  }
+  const inputPrototype = Object.getPrototypeOf(input);
+  if (inputPrototype !== Object.prototype && inputPrototype !== null) {
+    return 'LanePlan requires a record';
+  }
+  const recordInput = readExactPlainRecord(input, RECORD_KEYS);
+  if (recordInput === null) {
+    return 'LanePlan must have exactly its record fields';
+  }
+  return recordInput;
+}
+
+/** Header field checks (version, ids, revision, digest, doc); the fixed error or null. */
+function recordHeadError(recordInput: Record<string, unknown>): string | null {
+  if (recordInput.version !== LANE_PLAN_RECORD_VERSION) {
+    return 'LanePlan version must be 1';
+  }
+  const projectIdError = planIdError('projectId', recordInput.projectId, PLAN_PROJECT_ID_PATTERN, 'project id');
+  if (projectIdError !== null) {
+    return `LanePlan ${projectIdError}`;
+  }
+  const planIdCheck = planIdError('planId', recordInput.planId, PLAN_ID_PATTERN, 'plan id');
+  if (planIdCheck !== null) {
+    return `LanePlan ${planIdCheck}`;
+  }
+  if (!Number.isSafeInteger(recordInput.revision) || (recordInput.revision as number) < 1) {
+    return 'LanePlan revision must be a positive integer';
+  }
+  if (typeof recordInput.digest !== 'string' || !SHA256_HEX_PATTERN.test(recordInput.digest)) {
+    return 'LanePlan digest must be a sha256 hex digest';
+  }
+  const docError = planPathError('doc', recordInput.doc);
+  if (docError !== null) {
+    return `LanePlan ${docError}`;
+  }
+  return null;
+}
+
+/** The lanes list shape checks (presence as a list, emptiness, size); the fixed error or null. */
+function lanesListShapeError(lanesRaw: unknown): string | null {
+  if (!Array.isArray(lanesRaw)) {
+    return 'LanePlan lanes: must be a list';
+  }
+  if (lanesRaw.length === 0) {
+    return 'LanePlan lanes: must not be empty';
+  }
+  if (lanesRaw.length > LANE_PLAN_LIMITS.lanes) {
+    return 'LanePlan lanes: has too many entries';
+  }
+  return null;
+}
+
+/** The per-lane fields a fresh lane record is built from. */
+interface LaneRecordSource {
+  readonly laneId: string;
+  readonly aliases: readonly string[];
+  readonly scope: string;
+  readonly packages: readonly string[];
+  readonly sharedFiles: readonly string[];
+  readonly tier: PlannedLaneTier;
+  readonly after: readonly PlannedLaneRef[];
+  readonly decisions: readonly string[];
+  readonly status: PlannedLaneStatus;
+  readonly brief: string | null;
+  readonly mergedPr: PlanPullRequestRef | null;
+}
+
+/** One fresh lane record; nested lists and references are fresh copies. */
+function freshLaneRecord(lane: LaneRecordSource): PlannedLaneRecord {
+  return {
+    laneId: lane.laneId,
+    aliases: [...lane.aliases],
+    scope: lane.scope,
+    packages: [...lane.packages],
+    sharedFiles: [...lane.sharedFiles],
+    tier: lane.tier,
+    after: lane.after.map((ref) => ({
+      projectId: ref.projectId,
+      planId: ref.planId,
+      laneId: ref.laneId,
+    })),
+    decisions: [...lane.decisions],
+    status: lane.status,
+    brief: lane.brief,
+    mergedPr: lane.mergedPr === null
+      ? null
+      : { repository: lane.mergedPr.repository, number: lane.mergedPr.number },
+  };
 }
 
 /** Deep-freezes a value and returns it, for use inside a record literal. */
@@ -412,38 +428,47 @@ function readExclusiveOrders(value: unknown): ExclusiveOrderSidecar[] | string {
     if (fileError !== null) {
       return `LanePlan ${fileError}`;
     }
-    const lanesRaw = plainArrayCopy(snapshot.lanes);
-    if (!Array.isArray(lanesRaw)) {
-      return `LanePlan ${base}.lanes: must be a list`;
-    }
-    if (lanesRaw.length < 2) {
-      return `LanePlan ${base}.lanes: must name at least two lanes`;
-    }
-    if (lanesRaw.length > LANE_PLAN_LIMITS.exclusiveOrderLanes) {
-      return `LanePlan ${base}.lanes: has too many entries`;
-    }
-    const lanes: string[] = [];
-    const seen = new Set<string>();
-    for (let laneIndex = 0; laneIndex < lanesRaw.length; laneIndex += 1) {
-      const idError = planIdError(
-        `${base}.lanes[${laneIndex}]`,
-        lanesRaw[laneIndex],
-        PLANNED_LANE_ID_PATTERN,
-        'lane id',
-      );
-      if (idError !== null) {
-        return `LanePlan ${idError}`;
-      }
-      const item = lanesRaw[laneIndex] as string;
-      if (seen.has(item)) {
-        return `LanePlan ${base}.lanes[${laneIndex}]: is a duplicate`;
-      }
-      seen.add(item);
-      lanes.push(item);
+    const lanes = exclusiveEntryLanes(snapshot.lanes, base);
+    if (typeof lanes === 'string') {
+      return lanes;
     }
     entries.push({ file: snapshot.file as string, lanes });
   }
   return entries;
+}
+
+/** One exclusive order's lane list: a list of at least two distinct lane ids. */
+function exclusiveEntryLanes(value: unknown, base: string): string[] | string {
+  const lanesRaw = plainArrayCopy(value);
+  if (!Array.isArray(lanesRaw)) {
+    return `LanePlan ${base}.lanes: must be a list`;
+  }
+  if (lanesRaw.length < 2) {
+    return `LanePlan ${base}.lanes: must name at least two lanes`;
+  }
+  if (lanesRaw.length > LANE_PLAN_LIMITS.exclusiveOrderLanes) {
+    return `LanePlan ${base}.lanes: has too many entries`;
+  }
+  const lanes: string[] = [];
+  const seen = new Set<string>();
+  for (let laneIndex = 0; laneIndex < lanesRaw.length; laneIndex += 1) {
+    const idError = planIdError(
+      `${base}.lanes[${laneIndex}]`,
+      lanesRaw[laneIndex],
+      PLANNED_LANE_ID_PATTERN,
+      'lane id',
+    );
+    if (idError !== null) {
+      return `LanePlan ${idError}`;
+    }
+    const item = lanesRaw[laneIndex] as string;
+    if (seen.has(item)) {
+      return `LanePlan ${base}.lanes[${laneIndex}]: is a duplicate`;
+    }
+    seen.add(item);
+    lanes.push(item);
+  }
+  return lanes;
 }
 
 /**
@@ -459,6 +484,27 @@ function crossReferenceError(
   decisions: PlanDecisionSidecar[],
   exclusiveOrder: ExclusiveOrderSidecar[],
 ): string | null {
+  const laneIdsOrError = collectLaneIds(lanes);
+  if (typeof laneIdsOrError === 'string') {
+    return laneIdsOrError;
+  }
+  const aliasError = laneAliasesError(lanes, laneIdsOrError);
+  if (aliasError !== null) {
+    return aliasError;
+  }
+  const decisionIdsOrError = collectPlanDecisionIds(decisions);
+  if (typeof decisionIdsOrError === 'string') {
+    return decisionIdsOrError;
+  }
+  const laneCrossError = laneRecordsCrossError(lanes, projectId, planId, laneIdsOrError, decisionIdsOrError);
+  if (laneCrossError !== null) {
+    return laneCrossError;
+  }
+  return exclusiveOrderCrossError(exclusiveOrder, laneIdsOrError);
+}
+
+/** The set of lane ids, or the fixed error of the first duplicate. */
+function collectLaneIds(lanes: PlannedLane[]): Set<string> | string {
   const laneIds = new Set<string>();
   for (let index = 0; index < lanes.length; index += 1) {
     const laneId = lanes[index].getLaneId();
@@ -467,6 +513,11 @@ function crossReferenceError(
     }
     laneIds.add(laneId);
   }
+  return laneIds;
+}
+
+/** Alias checks: no alias may name a current lane or repeat an earlier alias. */
+function laneAliasesError(lanes: PlannedLane[], laneIds: Set<string>): string | null {
   const seenAlias = new Set<string>();
   for (let index = 0; index < lanes.length; index += 1) {
     const aliases = lanes[index].getAliases();
@@ -478,6 +529,11 @@ function crossReferenceError(
       seenAlias.add(alias);
     }
   }
+  return null;
+}
+
+/** The set of plan decision ids, or the fixed error of the first duplicate. */
+function collectPlanDecisionIds(decisions: PlanDecisionSidecar[]): Set<string> | string {
   const decisionIds = new Set<string>();
   for (let index = 0; index < decisions.length; index += 1) {
     const id = decisions[index].id;
@@ -486,34 +542,95 @@ function crossReferenceError(
     }
     decisionIds.add(id);
   }
+  return decisionIds;
+}
+
+/** Per-lane cross-references, in lane order: after refs, lane decisions, one merged PR at most. */
+function laneRecordsCrossError(
+  lanes: PlannedLane[],
+  projectId: string,
+  planId: string,
+  laneIds: Set<string>,
+  decisionIds: Set<string>,
+): string | null {
   const seenMergedPr = new Set<string>();
   const laneRecords = lanes.map((lane) => lane.toRecord());
   for (let index = 0; index < laneRecords.length; index += 1) {
     const lane = laneRecords[index];
-    for (let afterIndex = 0; afterIndex < lane.after.length; afterIndex += 1) {
-      const ref = lane.after[afterIndex];
-      if (ref.projectId === projectId && ref.planId === planId) {
-        if (ref.laneId === lane.laneId) {
-          return `LanePlan lanes[${index}].after[${afterIndex}]: names its own lane`;
-        }
-        if (!laneIds.has(ref.laneId)) {
-          return `LanePlan lanes[${index}].after[${afterIndex}]: names no lane in this plan`;
-        }
-      }
+    const afterError = laneAfterError(lane, index, projectId, planId, laneIds);
+    if (afterError !== null) {
+      return afterError;
     }
-    for (let decisionIndex = 0; decisionIndex < lane.decisions.length; decisionIndex += 1) {
-      if (!decisionIds.has(lane.decisions[decisionIndex])) {
-        return `LanePlan lanes[${index}].decisions[${decisionIndex}]: names no decision in this plan`;
-      }
+    const decisionError = laneDecisionsError(lane, index, decisionIds);
+    if (decisionError !== null) {
+      return decisionError;
     }
-    if (lane.mergedPr !== null) {
-      const key = `${lane.mergedPr.repository}|${lane.mergedPr.number}`;
-      if (seenMergedPr.has(key)) {
-        return `LanePlan lanes[${index}].mergedPr: is a duplicate`;
-      }
-      seenMergedPr.add(key);
+    const mergedPrError = laneMergedPrError(lane, index, seenMergedPr);
+    if (mergedPrError !== null) {
+      return mergedPrError;
     }
   }
+  return null;
+}
+
+/** Same-plan `after` references of one lane: no self reference, only current lanes. */
+function laneAfterError(
+  lane: PlannedLaneRecord,
+  index: number,
+  projectId: string,
+  planId: string,
+  laneIds: Set<string>,
+): string | null {
+  for (let afterIndex = 0; afterIndex < lane.after.length; afterIndex += 1) {
+    const ref = lane.after[afterIndex];
+    if (ref.projectId === projectId && ref.planId === planId) {
+      if (ref.laneId === lane.laneId) {
+        return `LanePlan lanes[${index}].after[${afterIndex}]: names its own lane`;
+      }
+      if (!laneIds.has(ref.laneId)) {
+        return `LanePlan lanes[${index}].after[${afterIndex}]: names no lane in this plan`;
+      }
+    }
+  }
+  return null;
+}
+
+/** Lane decisions of one lane must each name a plan decision. */
+function laneDecisionsError(
+  lane: PlannedLaneRecord,
+  index: number,
+  decisionIds: Set<string>,
+): string | null {
+  for (let decisionIndex = 0; decisionIndex < lane.decisions.length; decisionIndex += 1) {
+    if (!decisionIds.has(lane.decisions[decisionIndex])) {
+      return `LanePlan lanes[${index}].decisions[${decisionIndex}]: names no decision in this plan`;
+    }
+  }
+  return null;
+}
+
+/** One merged PR per lane at most, across the whole plan. */
+function laneMergedPrError(
+  lane: PlannedLaneRecord,
+  index: number,
+  seenMergedPr: Set<string>,
+): string | null {
+  if (lane.mergedPr === null) {
+    return null;
+  }
+  const key = `${lane.mergedPr.repository}|${lane.mergedPr.number}`;
+  if (seenMergedPr.has(key)) {
+    return `LanePlan lanes[${index}].mergedPr: is a duplicate`;
+  }
+  seenMergedPr.add(key);
+  return null;
+}
+
+/** Exclusive orders name current lanes and each file at most once. */
+function exclusiveOrderCrossError(
+  exclusiveOrder: ExclusiveOrderSidecar[],
+  laneIds: Set<string>,
+): string | null {
   const seenFile = new Set<string>();
   for (let index = 0; index < exclusiveOrder.length; index += 1) {
     const entry = exclusiveOrder[index];

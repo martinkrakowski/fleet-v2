@@ -76,17 +76,11 @@ export class PlannedLane {
    * read through its own property descriptor so no getter ever runs.
    */
   private static createUnchecked(input: unknown, path: string): PlannedLaneResult {
-    if (typeof input !== 'object' || input === null || Array.isArray(input)) {
-      return invalid(`PlannedLane ${path}: must be an object`);
+    const snapshotOrError = laneRecordSnapshot(input, path);
+    if (typeof snapshotOrError === 'string') {
+      return invalid(snapshotOrError);
     }
-    const inputPrototype = Object.getPrototypeOf(input);
-    if (inputPrototype !== Object.prototype && inputPrototype !== null) {
-      return invalid(`PlannedLane ${path}: must be an object`);
-    }
-    const recordInput = readExactPlainRecord(input, RECORD_KEYS);
-    if (recordInput === null) {
-      return invalid(`PlannedLane ${path}: must have exactly its record fields`);
-    }
+    const recordInput = snapshotOrError;
 
     const laneIdError = planIdError(`${path}.laneId`, recordInput.laneId, PLANNED_LANE_ID_PATTERN, 'lane id');
     if (laneIdError !== null) {
@@ -94,172 +88,51 @@ export class PlannedLane {
     }
     const laneId = recordInput.laneId as string;
 
-    const aliasesRaw = plainArrayCopy(recordInput.aliases);
-    if (!Array.isArray(aliasesRaw)) {
-      return invalid(`PlannedLane ${path}.aliases: must be a list`);
+    const aliases = readLaneAliases(recordInput.aliases, path, laneId);
+    if (typeof aliases === 'string') {
+      return invalid(aliases);
     }
-    if (aliasesRaw.length > PLANNED_LANE_MAX_ALIASES) {
-      return invalid(`PlannedLane ${path}.aliases: has too many entries`);
-    }
-    const aliases: string[] = [];
-    const seenAlias = new Set<string>();
-    for (let index = 0; index < aliasesRaw.length; index += 1) {
-      const idError = planIdError(
-        `${path}.aliases[${index}]`,
-        aliasesRaw[index],
-        PLANNED_LANE_ID_PATTERN,
-        'lane id',
-      );
-      if (idError !== null) {
-        return invalid(`PlannedLane ${idError}`);
-      }
-      const alias = aliasesRaw[index] as string;
-      if (alias === laneId) {
-        return invalid(`PlannedLane ${path}.aliases[${index}]: names its own lane`);
-      }
-      if (seenAlias.has(alias)) {
-        return invalid(`PlannedLane ${path}.aliases[${index}]: is a duplicate`);
-      }
-      seenAlias.add(alias);
-      aliases.push(alias);
-    }
-
     const scopeError = planTextError(`${path}.scope`, recordInput.scope, LANE_PLAN_LIMITS.scopeBytes);
     if (scopeError !== null) {
       return invalid(`PlannedLane ${scopeError}`);
     }
-
-    const packagesRaw = plainArrayCopy(recordInput.packages);
-    if (!Array.isArray(packagesRaw)) {
-      return invalid(`PlannedLane ${path}.packages: must be a list`);
+    const packages = readLanePackages(recordInput.packages, path);
+    if (typeof packages === 'string') {
+      return invalid(packages);
     }
-    if (packagesRaw.length === 0) {
-      return invalid(`PlannedLane ${path}.packages: must not be empty`);
+    const sharedFiles = readLaneSharedFiles(recordInput.sharedFiles, path);
+    if (typeof sharedFiles === 'string') {
+      return invalid(sharedFiles);
     }
-    if (packagesRaw.length > LANE_PLAN_LIMITS.packages) {
-      return invalid(`PlannedLane ${path}.packages: has too many entries`);
-    }
-    const packages: string[] = [];
-    const seenPackage = new Set<string>();
-    for (let index = 0; index < packagesRaw.length; index += 1) {
-      const idError = planIdError(
-        `${path}.packages[${index}]`,
-        packagesRaw[index],
-        PLAN_PACKAGE_PATTERN,
-        'package name',
-      );
-      if (idError !== null) {
-        return invalid(`PlannedLane ${idError}`);
-      }
-      const item = packagesRaw[index] as string;
-      if (seenPackage.has(item)) {
-        return invalid(`PlannedLane ${path}.packages[${index}]: is a duplicate`);
-      }
-      seenPackage.add(item);
-      packages.push(item);
-    }
-
-    const sharedFilesRaw = plainArrayCopy(recordInput.sharedFiles);
-    if (!Array.isArray(sharedFilesRaw)) {
-      return invalid(`PlannedLane ${path}.sharedFiles: must be a list`);
-    }
-    if (sharedFilesRaw.length > LANE_PLAN_LIMITS.sharedFiles) {
-      return invalid(`PlannedLane ${path}.sharedFiles: has too many entries`);
-    }
-    const sharedFiles: string[] = [];
-    const seenSharedFile = new Set<string>();
-    for (let index = 0; index < sharedFilesRaw.length; index += 1) {
-      const pathError = planPathError(`${path}.sharedFiles[${index}]`, sharedFilesRaw[index]);
-      if (pathError !== null) {
-        return invalid(`PlannedLane ${pathError}`);
-      }
-      const item = sharedFilesRaw[index] as string;
-      if (seenSharedFile.has(item)) {
-        return invalid(`PlannedLane ${path}.sharedFiles[${index}]: is a duplicate`);
-      }
-      seenSharedFile.add(item);
-      sharedFiles.push(item);
-    }
-
     if (!PLANNED_LANE_TIERS.includes(recordInput.tier as PlannedLaneTier)) {
       return invalid(`PlannedLane ${path}.tier: must be 0, 1 or 2`);
     }
     const tier = recordInput.tier as PlannedLaneTier;
 
-    const afterRaw = plainArrayCopy(recordInput.after);
-    if (!Array.isArray(afterRaw)) {
-      return invalid(`PlannedLane ${path}.after: must be a list`);
+    const after = readLaneAfter(recordInput.after, path);
+    if (typeof after === 'string') {
+      return invalid(after);
     }
-    if (afterRaw.length > LANE_PLAN_LIMITS.after) {
-      return invalid(`PlannedLane ${path}.after: has too many entries`);
+    const decisions = readLaneDecisions(recordInput.decisions, path);
+    if (typeof decisions === 'string') {
+      return invalid(decisions);
     }
-    const after: PlannedLaneRef[] = [];
-    const seenAfter = new Set<string>();
-    for (let index = 0; index < afterRaw.length; index += 1) {
-      const ref = readLaneRef(afterRaw[index], `${path}.after[${index}]`);
-      if (typeof ref === 'string') {
-        return invalid(ref);
-      }
-      const key = `${ref.projectId}/${ref.planId}/${ref.laneId}`;
-      if (seenAfter.has(key)) {
-        return invalid(`PlannedLane ${path}.after[${index}]: is a duplicate`);
-      }
-      seenAfter.add(key);
-      after.push(Object.freeze(ref));
-    }
-
-    const decisionsRaw = plainArrayCopy(recordInput.decisions);
-    if (!Array.isArray(decisionsRaw)) {
-      return invalid(`PlannedLane ${path}.decisions: must be a list`);
-    }
-    if (decisionsRaw.length > LANE_PLAN_LIMITS.laneDecisions) {
-      return invalid(`PlannedLane ${path}.decisions: has too many entries`);
-    }
-    const decisions: string[] = [];
-    const seenDecision = new Set<string>();
-    for (let index = 0; index < decisionsRaw.length; index += 1) {
-      const idError = planIdError(
-        `${path}.decisions[${index}]`,
-        decisionsRaw[index],
-        PLAN_DECISION_ID_PATTERN,
-        'decision id',
-      );
-      if (idError !== null) {
-        return invalid(`PlannedLane ${idError}`);
-      }
-      const item = decisionsRaw[index] as string;
-      if (seenDecision.has(item)) {
-        return invalid(`PlannedLane ${path}.decisions[${index}]: is a duplicate`);
-      }
-      seenDecision.add(item);
-      decisions.push(item);
-    }
-
     if (!PLANNED_LANE_STATUSES.includes(recordInput.status as PlannedLaneStatus)) {
       return invalid(`PlannedLane ${path}.status: must be one of planned, deferred, dropped`);
     }
     const status = recordInput.status as PlannedLaneStatus;
 
-    if (recordInput.brief !== null) {
-      const briefError = planPathError(`${path}.brief`, recordInput.brief);
-      if (briefError !== null) {
-        return invalid(`PlannedLane ${briefError}`);
-      }
+    const briefError = laneBriefError(recordInput.brief, path);
+    if (briefError !== null) {
+      return invalid(briefError);
     }
     const brief = recordInput.brief as string | null;
 
-    let mergedPr: PlanPullRequestRef | null = null;
-    if (recordInput.mergedPr !== null) {
-      const snapshot = readExactPlainRecord(recordInput.mergedPr, ['repository', 'number']);
-      if (!snapshot) {
-        return invalid(`PlannedLane ${path}.mergedPr: failed to read plain record structure`);
-      }
-      const prError = pullRequestRefError(`${path}.mergedPr`, snapshot);
-      if (prError !== null) {
-        return invalid(`PlannedLane ${prError}`);
-      }
-      mergedPr = snapshot as unknown as PlanPullRequestRef;
+    const mergedPrOrError = readLaneMergedPr(recordInput.mergedPr, path);
+    if (typeof mergedPrOrError === 'string') {
+      return invalid(mergedPrOrError);
     }
+    const mergedPr = mergedPrOrError;
 
     const record: PlannedLaneRecord = Object.freeze({
       laneId,
@@ -325,6 +198,201 @@ function invalid(message: string): PlannedLaneResult {
 
 function unreadableInputResult(): PlannedLaneResult {
   return { success: false, error: new Error('PlannedLane input could not be read'), code: 'invalid' };
+}
+
+/** The lane record's plain-object snapshot, or the fixed error for a non-record input. */
+function laneRecordSnapshot(input: unknown, path: string): Record<string, unknown> | string {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    return `PlannedLane ${path}: must be an object`;
+  }
+  const inputPrototype = Object.getPrototypeOf(input);
+  if (inputPrototype !== Object.prototype && inputPrototype !== null) {
+    return `PlannedLane ${path}: must be an object`;
+  }
+  const recordInput = readExactPlainRecord(input, RECORD_KEYS);
+  if (recordInput === null) {
+    return `PlannedLane ${path}: must have exactly its record fields`;
+  }
+  return recordInput;
+}
+
+/** Alias list: bounded, each a lane id, none its own lane, none repeated. */
+function readLaneAliases(value: unknown, path: string, laneId: string): string[] | string {
+  const aliasesRaw = plainArrayCopy(value);
+  if (!Array.isArray(aliasesRaw)) {
+    return `PlannedLane ${path}.aliases: must be a list`;
+  }
+  if (aliasesRaw.length > PLANNED_LANE_MAX_ALIASES) {
+    return `PlannedLane ${path}.aliases: has too many entries`;
+  }
+  const aliases: string[] = [];
+  const seenAlias = new Set<string>();
+  for (let index = 0; index < aliasesRaw.length; index += 1) {
+    const idError = planIdError(
+      `${path}.aliases[${index}]`,
+      aliasesRaw[index],
+      PLANNED_LANE_ID_PATTERN,
+      'lane id',
+    );
+    if (idError !== null) {
+      return `PlannedLane ${idError}`;
+    }
+    const alias = aliasesRaw[index] as string;
+    if (alias === laneId) {
+      return `PlannedLane ${path}.aliases[${index}]: names its own lane`;
+    }
+    if (seenAlias.has(alias)) {
+      return `PlannedLane ${path}.aliases[${index}]: is a duplicate`;
+    }
+    seenAlias.add(alias);
+    aliases.push(alias);
+  }
+  return aliases;
+}
+
+/** Package list: non-empty, bounded, each a package name, none repeated. */
+function readLanePackages(value: unknown, path: string): string[] | string {
+  const packagesRaw = plainArrayCopy(value);
+  if (!Array.isArray(packagesRaw)) {
+    return `PlannedLane ${path}.packages: must be a list`;
+  }
+  if (packagesRaw.length === 0) {
+    return `PlannedLane ${path}.packages: must not be empty`;
+  }
+  if (packagesRaw.length > LANE_PLAN_LIMITS.packages) {
+    return `PlannedLane ${path}.packages: has too many entries`;
+  }
+  const packages: string[] = [];
+  const seenPackage = new Set<string>();
+  for (let index = 0; index < packagesRaw.length; index += 1) {
+    const idError = planIdError(
+      `${path}.packages[${index}]`,
+      packagesRaw[index],
+      PLAN_PACKAGE_PATTERN,
+      'package name',
+    );
+    if (idError !== null) {
+      return `PlannedLane ${idError}`;
+    }
+    const item = packagesRaw[index] as string;
+    if (seenPackage.has(item)) {
+      return `PlannedLane ${path}.packages[${index}]: is a duplicate`;
+    }
+    seenPackage.add(item);
+    packages.push(item);
+  }
+  return packages;
+}
+
+/** Shared-file list: bounded, each a relative path, none repeated. */
+function readLaneSharedFiles(value: unknown, path: string): string[] | string {
+  const sharedFilesRaw = plainArrayCopy(value);
+  if (!Array.isArray(sharedFilesRaw)) {
+    return `PlannedLane ${path}.sharedFiles: must be a list`;
+  }
+  if (sharedFilesRaw.length > LANE_PLAN_LIMITS.sharedFiles) {
+    return `PlannedLane ${path}.sharedFiles: has too many entries`;
+  }
+  const sharedFiles: string[] = [];
+  const seenSharedFile = new Set<string>();
+  for (let index = 0; index < sharedFilesRaw.length; index += 1) {
+    const pathError = planPathError(`${path}.sharedFiles[${index}]`, sharedFilesRaw[index]);
+    if (pathError !== null) {
+      return `PlannedLane ${pathError}`;
+    }
+    const item = sharedFilesRaw[index] as string;
+    if (seenSharedFile.has(item)) {
+      return `PlannedLane ${path}.sharedFiles[${index}]: is a duplicate`;
+    }
+    seenSharedFile.add(item);
+    sharedFiles.push(item);
+  }
+  return sharedFiles;
+}
+
+/** After list: bounded, each a resolved lane reference, none repeated. */
+function readLaneAfter(value: unknown, path: string): PlannedLaneRef[] | string {
+  const afterRaw = plainArrayCopy(value);
+  if (!Array.isArray(afterRaw)) {
+    return `PlannedLane ${path}.after: must be a list`;
+  }
+  if (afterRaw.length > LANE_PLAN_LIMITS.after) {
+    return `PlannedLane ${path}.after: has too many entries`;
+  }
+  const after: PlannedLaneRef[] = [];
+  const seenAfter = new Set<string>();
+  for (let index = 0; index < afterRaw.length; index += 1) {
+    const ref = readLaneRef(afterRaw[index], `${path}.after[${index}]`);
+    if (typeof ref === 'string') {
+      return ref;
+    }
+    const key = `${ref.projectId}/${ref.planId}/${ref.laneId}`;
+    if (seenAfter.has(key)) {
+      return `PlannedLane ${path}.after[${index}]: is a duplicate`;
+    }
+    seenAfter.add(key);
+    after.push(Object.freeze(ref));
+  }
+  return after;
+}
+
+/** Decision list: bounded, each a decision id, none repeated. */
+function readLaneDecisions(value: unknown, path: string): string[] | string {
+  const decisionsRaw = plainArrayCopy(value);
+  if (!Array.isArray(decisionsRaw)) {
+    return `PlannedLane ${path}.decisions: must be a list`;
+  }
+  if (decisionsRaw.length > LANE_PLAN_LIMITS.laneDecisions) {
+    return `PlannedLane ${path}.decisions: has too many entries`;
+  }
+  const decisions: string[] = [];
+  const seenDecision = new Set<string>();
+  for (let index = 0; index < decisionsRaw.length; index += 1) {
+    const idError = planIdError(
+      `${path}.decisions[${index}]`,
+      decisionsRaw[index],
+      PLAN_DECISION_ID_PATTERN,
+      'decision id',
+    );
+    if (idError !== null) {
+      return `PlannedLane ${idError}`;
+    }
+    const item = decisionsRaw[index] as string;
+    if (seenDecision.has(item)) {
+      return `PlannedLane ${path}.decisions[${index}]: is a duplicate`;
+    }
+    seenDecision.add(item);
+    decisions.push(item);
+  }
+  return decisions;
+}
+
+/** The brief, when present, must be a relative path. */
+function laneBriefError(value: unknown, path: string): string | null {
+  if (value === null) {
+    return null;
+  }
+  const briefError = planPathError(`${path}.brief`, value);
+  if (briefError !== null) {
+    return `PlannedLane ${briefError}`;
+  }
+  return null;
+}
+
+/** The merged PR, when present: its snapshot, or null when absent, or the fixed error. */
+function readLaneMergedPr(value: unknown, path: string): PlanPullRequestRef | null | string {
+  if (value === null) {
+    return null;
+  }
+  const snapshot = readExactPlainRecord(value, ['repository', 'number']);
+  if (!snapshot) {
+    return `PlannedLane ${path}.mergedPr: failed to read plain record structure`;
+  }
+  const prError = pullRequestRefError(`${path}.mergedPr`, snapshot);
+  if (prError !== null) {
+    return `PlannedLane ${prError}`;
+  }
+  return snapshot as unknown as PlanPullRequestRef;
 }
 
 /** A resolved `{ projectId, planId, laneId }` or its fixed error message. */

@@ -24,8 +24,8 @@
     "staging:deploy": "sh deploy/staging/deploy.sh"
   },
   "devDependencies": {
-    "@hexagen-monaco/arch-linter": "0.14.0",
-    "@hexagen-monaco/sync": "0.14.0",
+    "@hexagen-monaco/arch-linter": "0.15.0",
+    "@hexagen-monaco/sync": "0.15.0",
     "eslint": "^9.0.0",
     "prettier": "^3.0.0",
     "turbo": "^2.11.5",

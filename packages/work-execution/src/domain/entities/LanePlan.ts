@@ -75,45 +75,49 @@ export class LanePlan {
     sidecar: LanePlanSidecar,
     meta: { digest: string; importedAtIso: string },
   ): LanePlanResult {
-    const record: LanePlanRecord = {
-      version: LANE_PLAN_RECORD_VERSION,
-      projectId: sidecar.projectId,
-      planId: sidecar.planId,
-      revision: sidecar.revision,
-      digest: meta.digest,
-      doc: sidecar.doc,
-      lanes: sidecar.lanes.map((lane) => ({
-        laneId: lane.laneId,
-        aliases: lane.renamedFrom === null ? [] : [lane.renamedFrom],
-        scope: lane.scope,
-        packages: [...lane.packages],
-        sharedFiles: [...lane.sharedFiles],
-        tier: lane.tier,
-        after: lane.after.map((ref) => ({
-          projectId: ref.projectId,
-          planId: ref.planId,
-          laneId: ref.laneId,
+    try {
+      const record: LanePlanRecord = {
+        version: LANE_PLAN_RECORD_VERSION,
+        projectId: sidecar.projectId,
+        planId: sidecar.planId,
+        revision: sidecar.revision,
+        digest: meta.digest,
+        doc: sidecar.doc,
+        lanes: sidecar.lanes.map((lane) => ({
+          laneId: lane.laneId,
+          aliases: lane.renamedFrom === null ? [] : [lane.renamedFrom],
+          scope: lane.scope,
+          packages: [...lane.packages],
+          sharedFiles: [...lane.sharedFiles],
+          tier: lane.tier,
+          after: lane.after.map((ref) => ({
+            projectId: ref.projectId,
+            planId: ref.planId,
+            laneId: ref.laneId,
+          })),
+          decisions: [...lane.decisions],
+          status: lane.status,
+          brief: lane.brief,
+          mergedPr: lane.mergedPr === null
+            ? null
+            : { repository: lane.mergedPr.repository, number: lane.mergedPr.number },
         })),
-        decisions: [...lane.decisions],
-        status: lane.status,
-        brief: lane.brief,
-        mergedPr: lane.mergedPr === null
-          ? null
-          : { repository: lane.mergedPr.repository, number: lane.mergedPr.number },
-      })),
-      decisions: sidecar.decisions.map((decision) => ({
-        id: decision.id,
-        question: decision.question,
-        default: decision.default,
-        state: decision.state,
-      })),
-      exclusiveOrder: sidecar.exclusiveOrder.map((entry) => ({
-        file: entry.file,
-        lanes: [...entry.lanes],
-      })),
-      importedAtIso: meta.importedAtIso,
-    };
-    return LanePlan.create(record);
+        decisions: sidecar.decisions.map((decision) => ({
+          id: decision.id,
+          question: decision.question,
+          default: decision.default,
+          state: decision.state,
+        })),
+        exclusiveOrder: sidecar.exclusiveOrder.map((entry) => ({
+          file: entry.file,
+          lanes: [...entry.lanes],
+        })),
+        importedAtIso: meta.importedAtIso,
+      };
+      return LanePlan.create(record);
+    } catch {
+      return unreadableInputResult();
+    }
   }
 
   /**
@@ -214,7 +218,11 @@ export class LanePlan {
       revision,
       digest: recordInput.digest as string,
       doc: recordInput.doc as string,
-      lanes: Object.freeze(lanes.map((lane) => lane.toRecord())),
+      lanes: Object.freeze(lanes.map((lane) => {
+        const laneRecord = lane.toRecord();
+        deepFreezeValue(laneRecord);
+        return laneRecord;
+      })),
       decisions: Object.freeze(decisions),
       exclusiveOrder: Object.freeze(exclusiveOrder),
       importedAtIso,
@@ -320,6 +328,22 @@ function invalid(message: string): LanePlanResult {
 
 function unreadableInputResult(): LanePlanResult {
   return { success: false, error: new Error('LanePlan input could not be read'), code: 'invalid' };
+}
+
+function deepFreezeValue(value: unknown): void {
+  if (value === null || typeof value !== 'object') {
+    return;
+  }
+  Object.freeze(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      deepFreezeValue(item);
+    }
+    return;
+  }
+  for (const key of Object.keys(value)) {
+    deepFreezeValue((value as Record<string, unknown>)[key]);
+  }
 }
 
 function readDecisions(value: unknown): PlanDecisionSidecar[] | string {

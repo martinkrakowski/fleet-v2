@@ -32,6 +32,7 @@ import {
   planTextError,
   pullRequestRefError,
 } from '../lane-plan-sidecar.js';
+import { readExactPlainRecord } from '../plain-record-reads.js';
 
 export type PlannedLaneResult =
   | { readonly success: true; readonly value: PlannedLane }
@@ -249,12 +250,15 @@ export class PlannedLane {
 
     let mergedPr: PullRequestRef | null = null;
     if (recordInput.mergedPr !== null) {
-      const prError = pullRequestRefError(`${path}.mergedPr`, recordInput.mergedPr);
+      const snapshot = readExactPlainRecord(recordInput.mergedPr, ['repository', 'number']);
+      if (!snapshot) {
+        return invalid(`PlannedLane ${path}.mergedPr: failed to read plain record structure`);
+      }
+      const prError = pullRequestRefError(`${path}.mergedPr`, snapshot);
       if (prError !== null) {
         return invalid(`PlannedLane ${prError}`);
       }
-      const pr = recordInput.mergedPr as PullRequestRef;
-      mergedPr = { repository: pr.repository, number: pr.number };
+      mergedPr = snapshot as unknown as PullRequestRef;
     }
 
     const record: PlannedLaneRecord = Object.freeze({

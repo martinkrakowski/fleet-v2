@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { LanePlan } from '../entities/LanePlan.js';
-import type { LanePlanRecord } from '../lane-plan-records.js';
+import type { LanePlanRecord, LanePlanSidecar } from '../lane-plan-records.js';
 import { parseLanePlanSidecar } from '../lane-plan-sidecar.js';
 
 /**
@@ -261,5 +261,59 @@ describe('LanePlan.create hostile input', () => {
     });
     const keysResult = LanePlan.create(keysHostile);
     expect(keysResult.success).toBe(false);
+  });
+});
+
+describe('LanePlan.create mergedPr snapshot', () => {
+  it('refuses a mergedPr whose number is read through an accessor', () => {
+    const record = structuredClone(storedRecord()) as unknown as Record<string, unknown>;
+    const lane = (record.lanes as unknown as Record<string, unknown>[])[0];
+    let reads = 0;
+    const pr = { repository: 'example-org/example-repo' };
+    Object.defineProperty(pr, 'number', {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return reads === 1 ? 7 : 8;
+      },
+    });
+    lane.mergedPr = pr;
+    const result = LanePlan.create(record);
+    expect(result.success).toBe(false);
+    expect(reads).toBe(0);
+  });
+});
+
+describe('LanePlan.fromSidecar hostile input', () => {
+  it('returns a failure result without throwing for a throwing accessor', () => {
+    const result = parseLanePlanSidecar(VALID);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const sidecar = structuredClone(result.sidecar) as unknown as Record<string, unknown>;
+    Object.defineProperty(sidecar, 'projectId', {
+      enumerable: true,
+      get: () => {
+        throw new Error('hostile accessor');
+      },
+    });
+    const plan = LanePlan.fromSidecar(sidecar as unknown as LanePlanSidecar, {
+      digest: 'a'.repeat(64),
+      importedAtIso: '2026-10-27T12:00:00.000Z',
+    });
+    expect(plan.success).toBe(false);
+  });
+});
+
+describe('LanePlan deep freeze', () => {
+  it('deep-freezes the lanes inside the aggregate record', () => {
+    const plan = LanePlan.create(storedRecord());
+    if (!plan.success) throw new Error('fixture must store');
+    const record = (plan.value as unknown as { record: LanePlanRecord }).record;
+    expect(Object.isFrozen(record)).toBe(true);
+    expect(Object.isFrozen(record.lanes)).toBe(true);
+    const lane = record.lanes[1];
+    expect(Object.isFrozen(lane)).toBe(true);
+    expect(Object.isFrozen(lane.after[0])).toBe(true);
+    expect(Object.isFrozen(record.lanes[2].mergedPr)).toBe(true);
   });
 });

@@ -6,6 +6,7 @@ export * from "./AskOwnerQuestionUseCase.use-case.js";
 export * from "./CancelPolicyGrantsUseCase.use-case.js";
 export * from "./CheckOwnerDecisionUseCase.use-case.js";
 export * from "./ExpireOwnerQuestionsUseCase.use-case.js";
+export * from "./FindOwnerQuestionByKeyUseCase.use-case.js";
 export * from "./HeartbeatOrchestratorSessionUseCase.use-case.js";
 export * from "./InspectConfiguredCapabilitiesUseCase.use-case.js";
 export * from "./InspectOutstandingCoordinationUseCase.use-case.js";

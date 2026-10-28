@@ -771,16 +771,29 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     // limit (dispatched at LATER, limit 2700s) and inside the lease.
     const stored = await harness.attemptRepo.findAttemptById('attempt-example-1');
     expect(stored).not.toBeNull();
+    if (stored === null) {
+      throw new Error('the dispatched attempt must be stored');
+    }
+    // The record the dispatch left, moved to running as the runner would; nothing else replaced.
     await harness.attemptRepo.saveAttempt({
-      ...attemptFixture(),
-      revision: (stored?.revision ?? 0) + 1,
+      ...stored,
+      revision: (stored.revision ?? 0) + 1,
       state: 'running',
       updatedAtIso: LATER,
     });
+    const further: unknown[] = [];
     for (let index = 1; index <= 5; index += 1) {
       const nowIso = new Date(Date.parse(LATER) + index * 30_000).toISOString();
-      await advance(harness, { nowIso });
+      further.push(await advance(harness, { nowIso }));
     }
+    // The running path, not a bail-out: the first advance enters running, the rest wait on the lane.
+    expect(further).toEqual([
+      { outcome: 'entered', state: 'running' },
+      { outcome: 'waiting', reason: 'lane-running' },
+      { outcome: 'waiting', reason: 'lane-running' },
+      { outcome: 'waiting', reason: 'lane-running' },
+      { outcome: 'waiting', reason: 'lane-running' },
+    ]);
     expect(harness.dispatchRequests).toHaveLength(1);
     expect(harness.cancelRequests).toHaveLength(0);
     const entries = await harness.runJournal.listForRun(RUN_ID);
@@ -813,9 +826,9 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
       expect(harness.dispatchRequests).toHaveLength(1);
       expect(await lastJournalState(harness)).toBe('dispatching');
       const entries = await harness.runJournal.listForRun(RUN_ID);
-      expect(entries).toContainEqual(
-        expect.objectContaining({ kind: 'result', key, outcome: 'completed', reasonCode }),
-      );
+      const results = entries.filter((entry) => entry.kind === 'result' && entry.key === key);
+      expect(results).toHaveLength(1);
+      expect(results[0]).toEqual(expect.objectContaining({ outcome: 'completed', reasonCode }));
       // A further advance never re-sends the spent key.
       const waited = await advance(harness);
       expect(waited).toEqual({ outcome: 'waiting', reason: 'dispatch-pending' });
@@ -846,14 +859,10 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(parked).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'dispatch' });
     expect(harness.cancelRequests).toHaveLength(0);
     const entries = await harness.runJournal.listForRun(RUN_ID);
+    // Nothing at all is journalled as a result under any stop key: no cancelled-unstarted
+    // outcome or reason code, and no other stop result either.
     expect(
-      entries.some(
-        (entry) =>
-          entry.kind === 'result' &&
-          entry.key !== null &&
-          entry.key.includes('/stop/') &&
-          entry.outcome === 'cancelled-unstarted',
-      ),
-    ).toBe(false);
+      entries.filter((entry) => entry.kind === 'result' && entry.key !== null && entry.key.includes('/stop/')),
+    ).toEqual([]);
   });
 });

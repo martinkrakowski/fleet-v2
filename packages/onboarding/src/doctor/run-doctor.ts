@@ -15,6 +15,8 @@ import type {
 } from '@fleet/installation';
 import type { ToolId } from '@fleet/tooling';
 
+import { renderAutoMergeStatus, summariseAutoMerge } from '../policy/auto-merge.js';
+
 import type { DoctorLine, DoctorStatus } from './types.js';
 import type { DoctorProbes } from './probes.js';
 
@@ -204,6 +206,15 @@ async function installationLines(
         ),
       );
     }
+    lines.push(
+      line(
+        'installation',
+        'policy',
+        'auto-merge',
+        'PASS',
+        renderAutoMergeStatus(summariseAutoMerge(result.installation))[0],
+      ),
+    );
   }
   for (const warning of result.warnings) {
     // The loader's warnings name accepted-and-ignored v1 fields (D1); they

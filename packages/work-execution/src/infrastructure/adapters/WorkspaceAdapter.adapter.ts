@@ -1,9 +1,11 @@
 // @generated adapter scaffold — implemented for migration station O3 (reviewed git subprocesses).
 /**
  * WorkspaceAdapter implements WorkspacePort. It inspects a Git worktree as a
- * typed record through reviewed `git` subprocesses without modifying the
- * worktree: no resets, no checkouts, no cleanup. Unreadable state is an
- * error, never a silent guess.
+ * typed record through reviewed `git` subprocesses; every read leaves the
+ * worktree untouched (no resets, no checkouts, no cleanup) and the one write
+ * is `commitLaneOutput`: stage, `commit-tree`, `update-ref` by
+ * compare-and-swap; never a push, a reset or a checkout. Unreadable state is
+ * an error, never a silent guess.
  *
  * Every command runs through the configured `CommandExecutorPort` (local or
  * ssh) with an explicit wall-clock budget: git commands, existence probes
@@ -28,8 +30,14 @@ import {
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
+import { isFixedProtectedPath, pathUnderPrefix } from '../../domain/lane-diff-check.js';
 import { hasRecordedHostName } from './ConfirmRecordedHost.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
+import { isValidAgyModel } from './AgyRunnerAdapter.adapter.js';
+import type {
+  CommitLaneOutputRequest,
+  CommitLaneOutputResult,
+} from '../../application/ports/out/WorkspacePort.out-port.js';
 
 /**
  * Adapter-layer helper for resolving one caller-supplied path against a
@@ -112,6 +120,23 @@ const PROBE_TIMEOUT_MS = 60 * 1000;
 /** Wall-clock budget for one file read (`cat`). */
 const CAT_TIMEOUT_MS = 60 * 1000;
 
+/** The commit's argv hardening (2026-10-16 plan, step 4): no hooks, no signing, no fsmonitor. */
+const COMMIT_GIT_CONFIG: readonly string[] = [
+  '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false', '-c', 'core.fsmonitor=false',
+];
+const COMMIT_HEAD_PATTERN = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+const COMMIT_ATTEMPT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+/**
+ * The commit message of one edit-only attempt: a subject line and the two
+ * trailers, nothing else.
+ */
+export function editOnlyCommitMessage(attemptId: string, implementerModel: string): string {
+  return 'fleet: edit-only lane output for ' + attemptId + '\n\n' +
+    'Implemented-By: agy ' + implementerModel + '\n' +
+    'Fleet-Attempt: ' + attemptId + '\n';
+}
+
 /**
  * Validate that an SSH host string is safe to pass to subprocess commands.
  * Matches `^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$` and does not start with `-`.
@@ -135,6 +160,28 @@ function unquotePorcelainPath(porcelainPath: string): string {
     return porcelainPath.slice(1, -1);
   }
   return porcelainPath;
+}
+
+const RAW_DIFF_TREE_META = /^:[0-7]{6} [0-7]{6} [0-9a-f]{40} [0-9a-f]{40} [ACDMTUX]$/;
+
+/**
+ * Strict parse of `git diff-tree -r --no-renames -z` raw output: null unless the
+ * text is empty or ends in NUL and splits into complete (meta, path) pairs with
+ * a well-formed meta and a non-empty path.
+ */
+function parseRawDiffTree(stdout: string): { readonly dstMode: string; readonly path: string }[] | null {
+  if (stdout === '') return [];
+  if (!stdout.endsWith('\0')) return null;
+  const fields = stdout.slice(0, -1).split('\0');
+  if (fields.length % 2 !== 0) return null;
+  const entries: { readonly dstMode: string; readonly path: string }[] = [];
+  for (let index = 0; index < fields.length; index += 2) {
+    const meta = fields[index] ?? '';
+    const path = fields[index + 1] ?? '';
+    if (!RAW_DIFF_TREE_META.test(meta) || path === '') return null;
+    entries.push({ dstMode: meta.slice(1).split(' ')[1] ?? '', path });
+  }
+  return entries;
 }
 
 export class WorkspaceAdapter implements WorkspacePort {
@@ -288,5 +335,177 @@ export class WorkspaceAdapter implements WorkspacePort {
       );
     }
     return result.exitCode === 0 ? result.stdout : null;
+  }
+
+  /**
+   * One commit command in the worktree with the commit hardening: no hooks,
+   * no signing, no fsmonitor. `ok: false` when the command failed or never
+   * reported an exit code, with a fixed reason that never carries stderr or
+   * a path.
+   */
+  private async runCommitGit(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+    args: readonly string[],
+  ): Promise<{ ok: true; stdout: string } | { ok: false; reason: string }> {
+    const result = await executor.run(['git', '-C', worktreePath, ...COMMIT_GIT_CONFIG, ...args], {
+      timeoutMs: GIT_TIMEOUT_MS,
+    });
+    if (result.exitCode !== 0 || result.error !== undefined) {
+      return { ok: false, reason: 'git ' + args[0] + ' failed' };
+    }
+    return { ok: true, stdout: result.stdout };
+  }
+
+  /**
+   * Stage the whole checked change set, write the staged tree and read
+   * HEAD's tree. The one shared HEAD-tree comparison for both of its uses:
+   * the nothing-to-commit check on the main path and the ownership proof of
+   * the already-committed path.
+   */
+  private async stageAndCompareWithHeadTree(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+  ): Promise<{ ok: true; tree: string; headTree: string } | { ok: false; reason: string }> {
+    // Stage the whole checked change set. Ignored files are never staged.
+    const addRun = await this.runCommitGit(executor, worktreePath, ['add', '-A', '--', '.']);
+    if (!addRun.ok) return { ok: false, reason: addRun.reason };
+    const treeRun = await this.runCommitGit(executor, worktreePath, ['write-tree']);
+    if (!treeRun.ok) return { ok: false, reason: treeRun.reason };
+    const headTreeRun = await this.runCommitGit(executor, worktreePath, ['rev-parse', '--verify', 'HEAD^{tree}']);
+    if (!headTreeRun.ok) return { ok: false, reason: headTreeRun.reason };
+    return { ok: true, tree: treeRun.stdout.trim(), headTree: headTreeRun.stdout.trim() };
+  }
+
+  async commitLaneOutput(request: CommitLaneOutputRequest): Promise<CommitLaneOutputResult> {
+    // 1. Validate before any command runs.
+    const worktreeRefusal = worktreeRootRefusal(request.worktreePath);
+    const allowedPathPrefixes = request.allowedPathPrefixes;
+    const prefixesValid =
+      allowedPathPrefixes.length > 0 &&
+      allowedPathPrefixes.every((prefix) => typeof prefix === 'string' && prefix !== '');
+    if (
+      worktreeRefusal !== null ||
+      COMMIT_HEAD_PATTERN.test(request.expectedHead) !== true ||
+      COMMIT_ATTEMPT_ID_PATTERN.test(request.attemptId) !== true ||
+      isValidAgyModel(request.implementerModel) !== true ||
+      prefixesValid !== true
+    ) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+
+    // 2. The commit runs on the recorded host's executor when there is one.
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(request.recordedHost);
+    } catch {
+      return { outcome: 'error', reason: 'worktree host could not be resolved' };
+    }
+
+    const { worktreePath } = request;
+
+    // 3. Read HEAD.
+    const headRun = await this.runCommitGit(executor, worktreePath, ['rev-parse', '--verify', 'HEAD^{commit}']);
+    if (!headRun.ok) return { outcome: 'error', reason: headRun.reason };
+    const head = headRun.stdout.trim();
+
+    // 4. The checked-out branch, else a detached head is refused.
+    const branchRun = await this.runCommitGit(executor, worktreePath, ['symbolic-ref', '-q', 'HEAD']);
+    if (!branchRun.ok) return { outcome: 'refused', reason: 'detached-head' };
+    const branchRef = branchRun.stdout.trim();
+    if (branchRef.startsWith('refs/heads/') !== true) {
+      return { outcome: 'refused', reason: 'detached-head' };
+    }
+
+    // 5. HEAD must be the dispatch head; a crash after the commit reads as
+    // already-committed instead of a head-moved refusal. `already-committed`
+    // must prove the commit is this adapter's: the dispatch head as the only
+    // parent, this adapter's exact message, and a worktree holding nothing
+    // beyond that commit. A foreign commit carrying the trailer never passes.
+    if (head !== request.expectedHead) {
+      const parentsRun = await this.runCommitGit(executor, worktreePath, ['show', '-s', '--format=%P', 'HEAD']);
+      if (!parentsRun.ok) return { outcome: 'error', reason: parentsRun.reason };
+      const parents = parentsRun.stdout.trim();
+      if (parents !== request.expectedHead) {
+        return { outcome: 'refused', reason: 'head-moved' };
+      }
+      const messageRun = await this.runCommitGit(executor, worktreePath, ['show', '-s', '--format=%B', 'HEAD']);
+      if (!messageRun.ok) return { outcome: 'error', reason: messageRun.reason };
+      const expectedMessage = editOnlyCommitMessage(request.attemptId, request.implementerModel);
+      // Trailing whitespace only: a leading newline or space is an agent-written body.
+      if (messageRun.stdout.replace(/\s+$/u, '') !== expectedMessage.replace(/\s+$/u, '')) {
+        return { outcome: 'refused', reason: 'head-moved' };
+      }
+      const ownershipTree = await this.stageAndCompareWithHeadTree(executor, worktreePath);
+      if (!ownershipTree.ok) return { outcome: 'error', reason: ownershipTree.reason };
+      if (ownershipTree.tree !== ownershipTree.headTree) {
+        return { outcome: 'refused', reason: 'head-moved' };
+      }
+      return { outcome: 'already-committed', headCommit: head, branchRef };
+    }
+
+    // 6–7. Stage the change set, write the staged tree and compare it with
+    // HEAD's tree (the shared comparison helper).
+    const stagedTree = await this.stageAndCompareWithHeadTree(executor, worktreePath);
+    if (!stagedTree.ok) return { outcome: 'error', reason: stagedTree.reason };
+    const tree = stagedTree.tree;
+    if (tree === stagedTree.headTree) {
+      return { outcome: 'nothing-to-commit' };
+    }
+
+    // 7b. The diff check ran before staging; re-check the tree that is
+    // actually about to be committed, so a file written between the check
+    // and `add -A` is refused here. Nothing is committed and no ref moves;
+    // the staged index is left as it is (no reset).
+    const diffTreeRun = await this.runCommitGit(
+      executor,
+      worktreePath,
+      ['diff-tree', '-r', '--no-renames', '-z', request.expectedHead, tree],
+    );
+    if (!diffTreeRun.ok) return { outcome: 'error', reason: diffTreeRun.reason };
+    // Raw `-z` output: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0" per entry.
+    // Parsed strictly: anything that is not a sequence of complete, well-formed
+    // records refuses (fail closed). A symlink (120000) or gitlink (160000) is
+    // never committed, nor a protected path, nor anything outside the prefixes.
+    const entries = parseRawDiffTree(diffTreeRun.stdout);
+    const outsideAllowedPaths =
+      entries === null ||
+      entries.some(
+        (entry) =>
+          entry.dstMode === '120000' ||
+          entry.dstMode === '160000' ||
+          isFixedProtectedPath(entry.path) ||
+          allowedPathPrefixes.some((prefix) => pathUnderPrefix(entry.path, prefix)) !== true,
+      );
+    if (outsideAllowedPaths) {
+      return { outcome: 'refused', reason: 'outside-allowed-paths' };
+    }
+
+    // 8. Write the commit: the dispatch head is the only parent.
+    const commitRun = await this.runCommitGit(
+      executor,
+      worktreePath,
+      [
+        'commit-tree', tree, '-p', request.expectedHead, '--no-gpg-sign',
+        '-m', editOnlyCommitMessage(request.attemptId, request.implementerModel),
+      ],
+    );
+    if (!commitRun.ok) return { outcome: 'error', reason: commitRun.reason };
+    const commit = commitRun.stdout.trim();
+    if (COMMIT_HEAD_PATTERN.test(commit) !== true) {
+      return { outcome: 'error', reason: 'git commit-tree failed' };
+    }
+
+    // 9. Move the branch by compare-and-swap: git refuses when the branch
+    // moved since `expectedHead`, and then nothing was moved.
+    const updateRun = await this.runCommitGit(
+      executor,
+      worktreePath,
+      ['update-ref', '-m', 'fleet edit-only commit ' + request.attemptId, branchRef, commit, request.expectedHead],
+    );
+    if (!updateRun.ok) return { outcome: 'refused', reason: 'ref-moved' };
+
+    // 10. Done.
+    return { outcome: 'committed', headCommit: commit, branchRef };
   }
 }

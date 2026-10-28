@@ -14,15 +14,14 @@
 // would hand its value to whatever code the task runs (including a lane's tests).
 //
 // Output names variables and file:line only, never a value. Exit 0 clean, 1 findings, 2 error.
-// Usage: node scripts/check-turbo-env.mjs [repository root]
+// Usage: node scripts/check-turbo-env.mjs (scans the repository this script lives in)
 import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = path.resolve(
-  process.argv[2] ??
-    path.join(path.dirname(fileURLToPath(import.meta.url)), ".."),
-);
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+// Bytewise order, the same on every host and locale.
+const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const SCAN_DIRS = ["apps", "packages"];
 const SKIP_DIRS = new Set([
   "node_modules",
@@ -158,7 +157,7 @@ function* walk(dir) {
 
 function lineOf(text, index) {
   let line = 1;
-  for (let i = 0; i < index; i += 1) if (text.charCodeAt(i) === 10) line += 1;
+  for (let i = 0; i < index; i += 1) if (text.codePointAt(i) === 10) line += 1;
   return line;
 }
 
@@ -258,7 +257,7 @@ for (const p of [...hashed, ...passed]) {
     );
   }
 }
-for (const name of [...reads.keys()].sort()) {
+for (const name of [...reads.keys()].sort(byCodeUnit)) {
   const where = reads.get(name);
   const declared = matches(hashed, name) || matches(passed, name);
   if (CREDENTIAL.has(name)) continue; // must stay undeclared; checked above
@@ -276,7 +275,7 @@ for (const name of [...reads.keys()].sort()) {
     findings.push(`${name} is read (${where}) but not declared: ${hint}`);
   }
 }
-for (const name of [...RUNTIME_ONLY, ...CREDENTIAL].sort()) {
+for (const name of [...RUNTIME_ONLY, ...CREDENTIAL].sort(byCodeUnit)) {
   if (!reads.has(name))
     findings.push(
       `${name} is listed in this script but no longer read under apps/ or packages/; remove it`,

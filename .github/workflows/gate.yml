@@ -84,8 +84,9 @@ jobs:
           cache: yarn
       - name: corepack enable
         run: corepack enable
-      - name: yarn install --immutable
-        run: yarn install --immutable
+      - name: yarn install --immutable --mode=skip-build
+        run: yarn install --immutable --mode=skip-build
+      # Lifecycle scripts are skipped here: sync:check needs only the installed hexagen package.
       # hexagen sync --check reads the manifest and the tracked sources, not build output:
       # it passes on a checkout with no dist/ (checked before the split, 2026-10-28).
       - name: yarn sync:check
@@ -111,9 +112,9 @@ jobs:
           cache: yarn
       - name: corepack enable
         run: corepack enable
-      # tests/hexagen-contract.test.sh runs the installed hexagen binaries.
-      - name: yarn install --immutable
-        run: yarn install --immutable
+      # tests/hexagen-contract.test.sh runs the installed hexagen binaries; no lifecycle script is needed.
+      - name: yarn install --immutable --mode=skip-build
+        run: yarn install --immutable --mode=skip-build
       # Each shard runs the runner pin checks and every tests/*.test.sh whose index in the
       # bytewise-sorted list is (shard - 1) modulo 4.
       - name: shell tests (shard ${{ matrix.shard }} of 4)

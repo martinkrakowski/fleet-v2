@@ -53,12 +53,12 @@ while [ "$#" -gt 0 ]; do
   esac
   shard_i=${spec%%/*}
   shard_n=${spec#*/}
-  case $shard_i in '' | *[!0-9]*) usage ;; esac
-  case $shard_n in '' | *[!0-9]*) usage ;; esac
+  case $shard_i in '' | *[!0-9]*) usage ;; *) ;; esac
+  case $shard_n in '' | *[!0-9]*) usage ;; *) ;; esac
   # Reject leading zeros so "01/4" and "1/04" are not silently accepted, and keep the
   # numbers small enough for sh arithmetic.
-  case $shard_i in 0?*) usage ;; esac
-  case $shard_n in 0?*) usage ;; esac
+  case $shard_i in 0?*) usage ;; *) ;; esac
+  case $shard_n in 0?*) usage ;; *) ;; esac
   [ "${#shard_i}" -le 4 ] && [ "${#shard_n}" -le 4 ] || usage
   [ "$shard_n" -ge 1 ] && [ "$shard_i" -ge 1 ] && [ "$shard_i" -le "$shard_n" ] || usage
   sharded=1

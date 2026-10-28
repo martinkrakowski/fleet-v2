@@ -14,7 +14,7 @@ trap 'rm -rf "$T"' EXIT
 fails=0
 ok() { printf 'ok   %s\n' "$1"; }
 bad() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
-check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+check() { label=$1; condition=$2; if eval "$condition"; then ok "$label"; else bad "$label"; fi; }
 run() { "$RUNSH" "$SCRIPT" "$@" > "$T/o" 2> "$T/e"; echo $? > "$T/rc"; }
 rc() { cat "$T/rc"; }
 

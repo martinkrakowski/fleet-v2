@@ -66,3 +66,5 @@ mise\.toml	1	1
 \.claude-plugin/	1	1
 pnpm-workspace\.yaml	0	1
 \.pnpmfile\.cjs	1	1
+# Turbo task configuration (lane speed plan D27/D29): a lane must not weaken cache inputs or env declarations.
+turbo\.json	1	1

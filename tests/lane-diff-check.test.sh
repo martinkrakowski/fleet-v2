@@ -53,6 +53,10 @@ rm -f package.json
 echo x > packages/x/package.json
 run "$R" --base base; check 'a workspace package.json is a finding' 'grep -q "^protected: packages/x/package.json" "$T/o"'
 rm -f packages/x/package.json
+echo '{}' > turbo.json
+echo '{}' > packages/x/turbo.json
+run "$R" --base base; check 'a root or workspace turbo.json is a finding (speed plan D27)' '[ "$(rc)" = 1 ] && grep -q "^protected: turbo.json$" "$T/o" && grep -q "^protected: packages/x/turbo.json$" "$T/o"'
+rm -f turbo.json packages/x/turbo.json
 
 echo '# secret patterns'
 tok="ghp_"; tok="${tok}abcdefghijklmnopqrstuvwxyz0123456789"

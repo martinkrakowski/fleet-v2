@@ -503,6 +503,7 @@ describe('S3.5 dropped after start', () => {
     const underlying = a3?.step?.kind === 'dropped-after-start' ? a3.step.underlying : null;
     expect(underlying).toEqual({ kind: 'attempt-live', attemptId: 'attempt-example-1', attemptKind: 'initial', fixNumber: 0, state: 'running' });
     expect(a3?.stepText).toBe('dropped in plan; started work not merged (first pass running)');
+    expect(a3?.badges.some((badge) => badge.kind === 'attempt-running')).toBe(false);
   });
 });
 

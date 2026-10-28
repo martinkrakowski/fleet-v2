@@ -642,7 +642,11 @@ function pushPlanLaneNotImported(out: BoardBadge[], input: BoardLaneBadgeInput):
 }
 
 /** S7: badges for every fact the card's column and step did not use, in BOARD_BADGE_KINDS order. */
-export function laneBadges(input: BoardLaneBadgeInput): BoardBadge[] {
+export function laneBadges(raw: BoardLaneBadgeInput): BoardBadge[] {
+  // S7: the fact a step uses is never repeated as a badge, so a dropped lane's
+  // step is unwrapped to the step it wraps before any badge is chosen.
+  const step = raw.step !== null && raw.step.kind === 'dropped-after-start' ? raw.step.underlying : raw.step;
+  const input: BoardLaneBadgeInput = { ...raw, step };
   const out: BoardBadge[] = [];
   pushAttemptRunning(out, input);
   pushRun(out, input);

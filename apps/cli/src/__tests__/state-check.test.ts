@@ -56,6 +56,7 @@ const STORE_ORDER = [
   'reservations.json',
   'lane-runs.json',
   'conductor-driver-lease.json',
+  'conductor-halt.json',
   'run-journal.json',
   'assessments.json',
   'knowledge-entries.json',
@@ -104,11 +105,11 @@ describe('fleet-v2 state', () => {
     const code = await runCli(['--state-dir', dir, 'state', 'check'], io);
     expect(code).toBe(0);
     const missingLines = stdout.filter((line) => line.endsWith(': missing\n'));
-    expect(missingLines).toHaveLength(15);
+    expect(missingLines).toHaveLength(16);
     for (let index = 0; index < STORE_ORDER.length; index += 1) {
       expect(missingLines[index]).toBe(`${STORE_ORDER[index]}: missing\n`);
     }
-    expect(stdout.at(-1)).toBe('state check: all 15 store files readable or missing\n');
+    expect(stdout.at(-1)).toBe('state check: all 16 store files readable or missing\n');
   });
 
   it('reports a valid attempts store as ok', async () => {
@@ -140,7 +141,7 @@ describe('fleet-v2 state', () => {
     expect(code).toBe(1);
     const text = stdout.join('');
     expect(text).toContain('journal.json: unreadable: not valid JSON\n');
-    expect(text).toContain('state check: 1 of 15 store files unreadable\n');
+    expect(text).toContain('state check: 1 of 16 store files unreadable\n');
     expect(stdout.at(-1)).toBe('nothing was changed; no quarantine copies were found\n');
   });
 

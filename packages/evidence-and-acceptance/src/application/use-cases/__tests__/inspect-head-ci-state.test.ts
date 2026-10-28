@@ -28,8 +28,12 @@ class FakeForgeEvidencePort implements ForgeEvidencePort {
   }
 }
 
-function statusFor(ciState: ForgeCheckStatus['ciState'], head = HEAD): ForgeCheckStatus {
-  return { candidateHeadSha: head, ciState, unresolvedThreadCount: 0 };
+function statusFor(
+  ciState: ForgeCheckStatus['ciState'],
+  head = HEAD,
+  observedHeadSha: string | null = head,
+): ForgeCheckStatus {
+  return { candidateHeadSha: head, ciState, unresolvedThreadCount: 0, observedHeadSha };
 }
 
 describe('InspectHeadCiStateUseCase', () => {
@@ -105,6 +109,26 @@ describe('InspectHeadCiStateUseCase', () => {
 
   it('answers unknown / unreadable when the answer is for another head', async () => {
     const fake = new FakeForgeEvidencePort(statusFor('pass', OTHER_HEAD));
+    const useCase = new InspectHeadCiStateUseCase({ forgeEvidence: fake });
+    expect(await useCase.inspectHeadCiState({ candidateHeadSha: HEAD })).toEqual({
+      candidateHeadSha: HEAD,
+      state: 'unknown',
+      reason: 'unreadable',
+    });
+  });
+
+  it('answers unknown / head-moved when the observed head differs from the asked head', async () => {
+    const fake = new FakeForgeEvidencePort(statusFor('pass', HEAD, OTHER_HEAD));
+    const useCase = new InspectHeadCiStateUseCase({ forgeEvidence: fake });
+    expect(await useCase.inspectHeadCiState({ candidateHeadSha: HEAD })).toEqual({
+      candidateHeadSha: HEAD,
+      state: 'unknown',
+      reason: 'head-moved',
+    });
+  });
+
+  it('answers unknown / unreadable when the observed head could not be read', async () => {
+    const fake = new FakeForgeEvidencePort(statusFor('pass', HEAD, null));
     const useCase = new InspectHeadCiStateUseCase({ forgeEvidence: fake });
     expect(await useCase.inspectHeadCiState({ candidateHeadSha: HEAD })).toEqual({
       candidateHeadSha: HEAD,

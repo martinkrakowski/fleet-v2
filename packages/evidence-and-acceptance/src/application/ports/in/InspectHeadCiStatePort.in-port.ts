@@ -5,7 +5,7 @@
 export const HEAD_CI_STATES = ['pending', 'passed', 'failed', 'unknown'] as const;
 export type HeadCiState = (typeof HEAD_CI_STATES)[number];
 
-export const HEAD_CI_REASONS = ['read', 'not-configured', 'invalid-head', 'unreadable'] as const;
+export const HEAD_CI_REASONS = ['read', 'not-configured', 'invalid-head', 'unreadable', 'head-moved'] as const;
 export type HeadCiReason = (typeof HEAD_CI_REASONS)[number];
 
 export interface InspectHeadCiStateRequest {

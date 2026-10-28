@@ -91,6 +91,29 @@ function openPullRequestNumberForHead(payload: unknown, sha: string): number | n
   return typeof number === 'number' && Number.isInteger(number) ? number : null;
 }
 
+/**
+ * The head of the pull request with this number in the same payload shape as
+ * the open-pull lookup. Unlike that lookup, it does not require the head to
+ * equal the requested sha, so a moved head is observed rather than treated as
+ * no match. Anything unreadable is null.
+ */
+function pullHeadForNumber(payload: unknown, number: number): string | null {
+  if (!Array.isArray(payload)) {
+    return null;
+  }
+  const entry = payload.find((item) => {
+    if (typeof item !== 'object' || item === null) {
+      return false;
+    }
+    return (item as { number?: unknown }).number === number;
+  });
+  if (typeof entry !== 'object' || entry === null) {
+    return null;
+  }
+  const sha = (entry as { head?: { sha?: unknown } }).head?.sha;
+  return typeof sha === 'string' && HEAD_SHA_PATTERN.test(sha) ? sha : null;
+}
+
 /** Unresolved review threads from the GraphQL payload; unreadable is null. */
 function unresolvedThreadCountFrom(payload: unknown): number | null {
   if (typeof payload !== 'object' || payload === null) {
@@ -126,6 +149,7 @@ export class ForgeEvidenceAdapter implements ForgeEvidencePort {
       candidateHeadSha,
       ciState: 'unknown',
       unresolvedThreadCount: null,
+      observedHeadSha: null,
     });
 
     if (!HEAD_SHA_PATTERN.test(candidateHeadSha)) {
@@ -184,6 +208,19 @@ export class ForgeEvidenceAdapter implements ForgeEvidencePort {
           ? ciStateFromBuckets(parseJson(checks.stdout))
           : 'unknown';
 
+      // Step B': re-read the PR's head with the same lookup used to find it.
+      // A head that moved between this read and the checks read is observed as
+      // different, so the CI state is never assumed to belong to the requested
+      // head. An unreadable re-read is null, failing closed.
+      const pullsAfterChecks = await runGh([
+        'api',
+        `repos/${owner}/${repo}/commits/${candidateHeadSha}/pulls`,
+      ]);
+      const observedHeadSha =
+        pullsAfterChecks.exitCode === 0
+          ? pullHeadForNumber(parseJson(pullsAfterChecks.stdout), pullRequestNumber)
+          : null;
+
       // Step C: unresolved review threads on that pull request.
       const threads = await runGh([
         'api',
@@ -200,7 +237,7 @@ export class ForgeEvidenceAdapter implements ForgeEvidencePort {
       const unresolvedThreadCount =
         threads.exitCode === 0 ? unresolvedThreadCountFrom(parseJson(threads.stdout)) : null;
 
-      return { candidateHeadSha, ciState, unresolvedThreadCount };
+      return { candidateHeadSha, ciState, unresolvedThreadCount, observedHeadSha };
     } catch {
       // A rejecting transport is an unreadable forge, never a thrown error.
       return unreadable();

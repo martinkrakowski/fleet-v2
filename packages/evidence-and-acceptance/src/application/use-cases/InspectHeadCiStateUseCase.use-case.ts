@@ -29,6 +29,7 @@ const STATE_BY_CI: ReadonlyMap<string, HeadCiState> = new Map([
 
 const READ_REASON: HeadCiReason = 'read';
 const UNREADABLE_REASON: HeadCiReason = 'unreadable';
+const HEAD_MOVED_REASON: HeadCiReason = 'head-moved';
 
 function unknownResult(candidateHeadSha: string, reason: HeadCiReason): InspectHeadCiStateResult {
   return { candidateHeadSha, state: 'unknown', reason };
@@ -66,6 +67,15 @@ export class InspectHeadCiStateUseCase implements InspectHeadCiStatePort {
     // another head (wrong-head race) is unreadable, never a pass.
     if (status.candidateHeadSha !== candidateHeadSha) {
       return unknownResult(candidateHeadSha, UNREADABLE_REASON);
+    }
+    // The head the adapter observed after reading the checks must be exactly
+    // the asked head; an unreadable observation is unreadable, and a moved
+    // head is a head-moved race, never a pass.
+    if (status.observedHeadSha === null) {
+      return unknownResult(candidateHeadSha, UNREADABLE_REASON);
+    }
+    if (status.observedHeadSha !== candidateHeadSha) {
+      return unknownResult(candidateHeadSha, HEAD_MOVED_REASON);
     }
     return mapReadStatus(status);
   }

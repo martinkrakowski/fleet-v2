@@ -549,4 +549,9 @@ describe('laneRunPackageKeys (K7-D5)', () => {
     expect(laneRunPackagesOverlap({ ...sameRepo, ownedPaths: ['packages'] }, { repository: 'repo-other-1', ownedPaths: ['packages/a'] })).toBe(false);
     expect(laneRunPackagesOverlap({ ...sameRepo, ownedPaths: ['docs'] }, { ...sameRepo, ownedPaths: ['docs/x.md'] })).toBe(true);
   });
+
+  it('only exactly packages or apps (a trailing slash allowed) is a whole-tree key; packages/.. and packages//x stay skipped', () => {
+    expect(laneRunPackageKeys(['packages', 'apps/'])).toEqual(['apps', 'packages']);
+    expect(laneRunPackageKeys(['packages/..', 'packages//nested', 'apps/..'])).toEqual([]);
+  });
 });

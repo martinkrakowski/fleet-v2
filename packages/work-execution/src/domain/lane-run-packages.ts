@@ -35,9 +35,9 @@ export function laneRunPackageKeys(ownedPaths: readonly string[]): readonly stri
       const second = ownedPath.split('/')[1]?.trim() ?? '';
       if (second !== '' && second !== '..') {
         keys.add(first + '/' + second);
-      } else {
-        // A bare `packages` / `apps` path owns the whole tree (K7-5b fix
-        // round 2): its key overlaps every `packages/<x>` / `apps/<x>` key.
+      } else if (ownedPath.trim().replace(/\/+$/u, '') === first) {
+        // Exactly `packages` / `apps` (a trailing slash allowed) owns the whole tree: its key overlaps every
+        // `packages/<x>` / `apps/<x>` key. Any other blank or `..` second segment is still skipped.
         keys.add(first);
       }
       continue;

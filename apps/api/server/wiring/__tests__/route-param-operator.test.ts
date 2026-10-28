@@ -117,4 +117,12 @@ describe("routeParam on the operator and knowledge routes", () => {
     const { status } = await call(method, target);
     expect(status).not.toBe(400);
   });
+
+  // Decoded exactly once: "%25E0%25A4%25A" becomes the plain string "%E0%A4%A". A second decode would
+  // turn it into a malformed sequence and answer the fixed 400, so "not 400" proves a single decode.
+  it.each(routes)("decodes a double-encoded param exactly once on %s (%s)", async (_name, method, path) => {
+    const target = path.replace(":id", "%25E0%25A4%25A");
+    const { status } = await call(method, target);
+    expect(status).not.toBe(400);
+  });
 });

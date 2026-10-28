@@ -268,7 +268,7 @@ export const RUN_TELEMETRY_ATTRIBUTES: Readonly<Record<string, TelemetryAttribut
   'agent.name': { type: 'string', check: oneOf(SEAT_PLAN_ROLES) },
   'fleet.seat.tool': { type: 'string', check: oneOf(TELEMETRY_SEAT_TOOLS) },
   'fleet.seat.billing': { type: 'string', check: oneOf(TELEMETRY_SEAT_BILLINGS) },
-  'llm.invocation_parameters': { type: 'string', check: isTelemetryInvocationParameters },
+  'llm.invocation_parameters': { type: 'string', check: (v, c) => c.spanKind === 'LLM' && isTelemetryInvocationParameters(v) },
   'llm.model_name': meteredModel,
   'llm.provider': meteredModel,
   'llm.token_count.prompt': llmCount,
@@ -334,6 +334,27 @@ export function telemetryResourceAttributes(input: TelemetryResourceInput): Read
 }
 
 /**
+ * A plain copy of an input array read through own data descriptors only, so
+ * neither an iterator nor a getter on the input runs; null when any index is
+ * not a plain data property. Validation and output both use this copy.
+ */
+function plainArrayCopyOf(value: readonly unknown[]): unknown[] | null {
+  const length: unknown = Object.getOwnPropertyDescriptor(value, 'length')?.value;
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) {
+    return null;
+  }
+  const copy: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (descriptor === undefined || !('value' in descriptor)) {
+      return null;
+    }
+    copy.push(descriptor.value);
+  }
+  return copy;
+}
+
+/**
  * Keep only allow-listed keys whose value passes its rule (plan §3.2). Output
  * keys follow the order of RUN_TELEMETRY_ATTRIBUTES whatever the input order,
  * so the same facts always encode to the same bytes. Builder-owned keys are
@@ -356,11 +377,13 @@ export function filterTelemetryAttributes(
     if (prototype !== Object.prototype && prototype !== null) {
       return Object.freeze({});
     }
-    const snapshot: Record<string, unknown> = {};
+    // A null-prototype snapshot: an own `__proto__` key stays a plain key and
+    // can never supply an inherited sibling (such as a billing class).
+    const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const key of Object.keys(input)) {
       const descriptor = Object.getOwnPropertyDescriptor(input, key);
       if (descriptor !== undefined && 'value' in descriptor && descriptor.enumerable) {
-        snapshot[key] = descriptor.value;
+        snapshot[key] = Array.isArray(descriptor.value) ? plainArrayCopyOf(descriptor.value) : descriptor.value;
       }
     }
     const output: Record<string, TelemetryAttributeValue> = {};
@@ -374,7 +397,7 @@ export function filterTelemetryAttributes(
       const value = snapshot[key];
       const rule = RUN_TELEMETRY_ATTRIBUTES[key];
       if (rule.check(value, { spanKind, attributes: snapshot })) {
-        output[key] = Array.isArray(value) ? Object.freeze([...value]) : (value as TelemetryAttributeValue);
+        output[key] = Array.isArray(value) ? Object.freeze(value.slice()) : (value as TelemetryAttributeValue);
       }
     }
     return Object.freeze(output);

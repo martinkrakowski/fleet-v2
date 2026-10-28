@@ -243,7 +243,7 @@ describe('filterTelemetryAttributes', () => {
         throw new Error(`token counts must not be kept on an AGENT span: ${key}`);
       }
     }
-    expect(kept['llm.invocation_parameters']).toBe('{"variant":"low"}');
+    expect(kept['llm.invocation_parameters']).toBeUndefined();
     expect(kept['fleet.seat.model']).toBe('openrouter/z-ai/glm-5.3-flash');
     expect(kept['fleet.seat.billing']).toBe('metered');
   });
@@ -358,5 +358,26 @@ describe('telemetryResourceAttributes', () => {
     const resource = telemetryResourceAttributes(input);
     expect(Object.keys(resource)).toEqual(expectedKeys);
     expect(resource['service.name']).toBe(TELEMETRY_SERVICE_NAME);
+  });
+
+  it('an own __proto__ key never supplies an inherited billing class', () => {
+    const input = JSON.parse('{"__proto__":{"fleet.seat.billing":"metered"},"llm.model_name":"openrouter/example"}') as Record<string, unknown>;
+    const kept = filterTelemetryAttributes(input, 'LLM');
+    expect(kept['llm.model_name']).toBeUndefined();
+    expect(kept['fleet.seat.billing']).toBeUndefined();
+  });
+
+  it('a tag array is copied without running its iterator or getters', () => {
+    const tags = ['dry-run'];
+    Object.defineProperty(tags, Symbol.iterator, {
+      value: function* () {
+        yield 'injected text';
+      },
+    });
+    const kept = filterTelemetryAttributes({ 'tag.tags': tags }, 'CHAIN');
+    expect(kept['tag.tags'] === undefined || !(kept['tag.tags'] as readonly string[]).includes('injected text')).toBe(true);
+    const withGetter: unknown[] = [];
+    Object.defineProperty(withGetter, '0', { get: () => 'dry-run', enumerable: true });
+    expect(filterTelemetryAttributes({ 'tag.tags': withGetter }, 'CHAIN')['tag.tags']).toBeUndefined();
   });
 });

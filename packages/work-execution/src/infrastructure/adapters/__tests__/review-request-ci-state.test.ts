@@ -424,6 +424,22 @@ describe('ReviewRequestAdapter.findReviewReceipt', () => {
     expect(result).toEqual({ outcome: 'unavailable', reason: 'receipt-mismatch' });
   });
 
+  it('is unavailable receipt-mismatch when the receipt carries the request id but no kind', async () => {
+    const { inspectAcceptanceEvidence } = makeInspectFake({
+      outcome: 'found',
+      assessment: makeAssessment({ reviewReceipts: [makeReceipt({ kind: undefined })] }),
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const result = await adapter.findReviewReceipt({
+      attemptId: 'attempt-example-1',
+      requestId: REQUEST_ID,
+      candidateHeadSha: HEAD,
+    });
+
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'receipt-mismatch' });
+  });
+
   it('is unavailable receipt-mismatch when the receipt answers another head', async () => {
     const { inspectAcceptanceEvidence } = makeInspectFake({
       outcome: 'found',

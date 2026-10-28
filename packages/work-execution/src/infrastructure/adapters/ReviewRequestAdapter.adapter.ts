@@ -78,12 +78,19 @@ function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
   return 'unknown';
 }
 
-/** One shared summary builder used by requestReview and findReviewReceipt. */
-function summaryOf(receipt: ReviewReceiptRecord): ReviewReceiptSummary {
+/**
+ * One shared summary builder used by requestReview and findReviewReceipt. The kind and request id are the
+ * values the caller has already matched on the receipt; nothing is defaulted here.
+ */
+function summaryOf(
+  receipt: ReviewReceiptRecord,
+  kind: ReviewReceiptSummary['kind'],
+  requestId: string,
+): ReviewReceiptSummary {
   return {
     receiptId: receipt.id,
-    requestId: receipt.requestId ?? '',
-    kind: receipt.kind ?? 'code-review',
+    requestId,
+    kind,
     reviewerModel: receipt.reviewerModel,
     candidateHeadSha: receipt.candidateHeadSha,
     verdict: mapVerdict(receipt.result),
@@ -153,7 +160,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       ) {
         return { outcome: 'unknown', reason: 'receipt-mismatch' };
       }
-      return { outcome: 'receipt', receipt: summaryOf(receipt) };
+      return { outcome: 'receipt', receipt: summaryOf(receipt, request.kind, request.requestId) };
     }
     return mapRejection(result.rejection);
   }
@@ -197,6 +204,10 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     ) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
-    return { outcome: 'found', receipt: summaryOf(matches[0]) };
+    const [only] = matches;
+    if (only.kind === undefined) {
+      return { outcome: 'unavailable', reason: 'receipt-mismatch' };
+    }
+    return { outcome: 'found', receipt: summaryOf(only, only.kind, request.requestId) };
   }
 }

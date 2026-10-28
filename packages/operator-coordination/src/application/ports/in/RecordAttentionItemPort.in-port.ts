@@ -25,7 +25,7 @@ export interface RecordAttentionItemBody {
   readonly summary: string;
 }
 
-export type RecordAttentionItemRefusalCode = 'request' | 'clock' | 'id-taken' | 'conflict' | AttentionItemRefusalCode;
+export type RecordAttentionItemRefusalCode = 'request' | 'clock' | 'id-taken' | 'conflict' | 'store-unreadable' | AttentionItemRefusalCode;
 
 export type RecordAttentionItemResult =
   | { readonly outcome: 'raised' | 'refreshed' | 'reopened'; readonly item: AttentionItemRecord; readonly revision: number }

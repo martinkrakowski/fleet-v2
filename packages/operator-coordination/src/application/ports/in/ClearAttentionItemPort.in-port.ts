@@ -22,7 +22,7 @@ export type ClearAttentionItemResult =
   | { readonly outcome: 'cleared'; readonly items: readonly StoredAttentionItem[] }
   | { readonly outcome: 'unchanged'; readonly items: readonly StoredAttentionItem[] }
   | { readonly outcome: 'not-found' }
-  | { readonly outcome: 'refused'; readonly code: 'request' | 'clock' | 'stale-revision' | 'conflict' | AttentionItemRefusalCode; readonly reason: string };
+  | { readonly outcome: 'refused'; readonly code: 'request' | 'clock' | 'stale-revision' | 'conflict' | 'store-unreadable' | AttentionItemRefusalCode; readonly reason: string };
 
 export interface ClearAttentionItemPort {
   /** `request` is untrusted. `via` and `actor` come from the composition root (CLI: 'cli'; web: 'web'; a machine caller: 'machine'). */

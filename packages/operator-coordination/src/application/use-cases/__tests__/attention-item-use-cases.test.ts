@@ -78,6 +78,20 @@ function refusal(
   return result;
 }
 
+/** A repository fake whose every method throws; override the ones a test needs to succeed. */
+function throwingRepo(overrides: Partial<AttentionItemRepositoryPort> = {}): AttentionItemRepositoryPort {
+  const boom = () => {
+    throw new Error('boom');
+  };
+  return {
+    save: boom,
+    get: boom,
+    findByKey: boom,
+    list: boom,
+    ...overrides,
+  };
+}
+
 describe('RecordAttentionItemUseCase', () => {
   it('raises a new open item from a closed body at revision 1', async () => {
     const repo = new AttentionItemRepositoryAdapter();
@@ -311,6 +325,56 @@ describe('RecordAttentionItemUseCase', () => {
     );
     expect(refusal(second).code).toBe('id-taken');
     expect(await repo.list()).toHaveLength(1);
+  });
+
+  it('refuses store-unreadable when the repository read throws during record', async () => {
+    const uc = new RecordAttentionItemUseCase({ itemRepo: throwingRepo(), clock: clock(), ids: ids() });
+
+    const result = refusal(await uc.recordAttentionItem(RAISE_BODY, 'auto-merge'));
+    expect(result.code).toBe('store-unreadable');
+    expect(result.reason).not.toContain('boom');
+  });
+
+  it('refuses store-unreadable when the repository save throws during record', async () => {
+    const real = new AttentionItemRepositoryAdapter();
+    const repo = throwingRepo({
+      save: async () => {
+        throw new Error('boom');
+      },
+      get: (itemId) => real.get(itemId),
+      findByKey: (key) => real.findByKey(key),
+      list: (query) => real.list(query),
+    });
+    const uc = new RecordAttentionItemUseCase({ itemRepo: repo, clock: clock(), ids: ids() });
+
+    const result = refusal(await uc.recordAttentionItem(RAISE_BODY, 'auto-merge'));
+    expect(result.code).toBe('store-unreadable');
+    expect(result.reason).not.toContain('boom');
+  });
+
+  it('refreshes an existing open item with a changed summary and stores the new summary', async () => {
+    const repo = new AttentionItemRepositoryAdapter();
+    const uc = new RecordAttentionItemUseCase({ itemRepo: repo, clock: clock([NOW_ISO, LATER_ISO]), ids: ids() });
+
+    const first = await uc.recordAttentionItem(RAISE_BODY, 'auto-merge');
+    expect(first.outcome).toBe('raised');
+
+    const second = await uc.recordAttentionItem(
+      { ...RAISE_BODY, summary: 'Merge unblocked after a retry' },
+      'auto-merge',
+    );
+    expect(second).toEqual({
+      outcome: 'refreshed',
+      item: expect.objectContaining({
+        itemId: 'att-example-1',
+        summary: 'Merge unblocked after a retry',
+        raisedCount: 2,
+      }),
+      revision: 2,
+    });
+
+    const stored = await repo.get('att-example-1');
+    expect(stored?.item.summary).toBe('Merge unblocked after a retry');
   });
 
   it('throws Not implemented when unconfigured', async () => {
@@ -547,6 +611,105 @@ describe('ClearAttentionItemUseCase', () => {
       expect(refusal(await uc.clearAttentionItem(body, 'cli', 'owner-example-1')).code).toBe('request');
     }
     expect((await repo.list())[0]?.item.state).toBe('open');
+  });
+
+  it('refuses store-unreadable when the repository read throws during dismiss', async () => {
+    const uc = new ClearAttentionItemUseCase({ itemRepo: throwingRepo(), clock: clock() });
+
+    const result = refusal(
+      await uc.clearAttentionItem(
+        { action: 'dismiss', itemId: 'att-example-1', expectedRevision: 1 },
+        'cli',
+        'owner-example-1',
+      ),
+    );
+    expect(result.code).toBe('store-unreadable');
+    expect(result.reason).not.toContain('boom');
+  });
+
+  it('refuses store-unreadable when the repository save throws during dismiss', async () => {
+    const real = new AttentionItemRepositoryAdapter();
+    await real.save(await seededOpen(), 0);
+    const repo = throwingRepo({
+      save: async () => {
+        throw new Error('boom');
+      },
+      get: (itemId) => real.get(itemId),
+      findByKey: (key) => real.findByKey(key),
+      list: (query) => real.list(query),
+    });
+    const uc = new ClearAttentionItemUseCase({ itemRepo: repo, clock: clock([NOW_ISO, LATER_ISO]) });
+
+    const result = refusal(
+      await uc.clearAttentionItem(
+        { action: 'dismiss', itemId: 'att-example-1', expectedRevision: 1 },
+        'cli',
+        'owner-example-1',
+      ),
+    );
+    expect(result.code).toBe('store-unreadable');
+    expect(result.reason).not.toContain('boom');
+  });
+
+  it('refuses store-unreadable when the repository read throws during resolve', async () => {
+    const uc = new ClearAttentionItemUseCase({ itemRepo: throwingRepo(), clock: clock() });
+
+    const result = refusal(
+      await uc.clearAttentionItem(
+        {
+          action: 'resolve',
+          projectId: 'example-project',
+          kind: 'merge',
+          subject: { kind: 'work-order', ref: 'wo-example-1' },
+          reason: 'stale',
+        },
+        'machine',
+        'reaper-example-1',
+      ),
+    );
+    expect(result.code).toBe('store-unreadable');
+    expect(result.reason).not.toContain('boom');
+  });
+
+  it('refuses store-unreadable when the repository read throws during work-order-merged', async () => {
+    const uc = new ClearAttentionItemUseCase({ itemRepo: throwingRepo(), clock: clock() });
+
+    const result = refusal(
+      await uc.clearAttentionItem(
+        { action: 'work-order-merged', projectId: 'example-project', workOrderId: 'wo-example-1' },
+        'machine',
+        'auto-merge',
+      ),
+    );
+    expect(result.code).toBe('store-unreadable');
+    expect(result.reason).not.toContain('boom');
+  });
+
+  it('refuses resolve with a reason other than resolved or stale and saves nothing', async () => {
+    const repo = new AttentionItemRepositoryAdapter();
+    const uc = new ClearAttentionItemUseCase({ itemRepo: repo, clock: clock() });
+    await repo.save(await seededOpen(), 0);
+
+    for (const reason of ['dismissed', 'merged']) {
+      const result = refusal(
+        await uc.clearAttentionItem(
+          {
+            action: 'resolve',
+            projectId: 'example-project',
+            kind: 'merge',
+            subject: { kind: 'work-order', ref: 'wo-example-1' },
+            reason,
+          },
+          'machine',
+          'reaper-example-1',
+        ),
+      );
+      expect(result.code).toBe('request');
+    }
+
+    const stored = (await repo.list())[0];
+    expect(stored?.item.state).toBe('open');
+    expect(stored?.revision).toBe(1);
   });
 
   it('throws Not implemented when unconfigured', async () => {

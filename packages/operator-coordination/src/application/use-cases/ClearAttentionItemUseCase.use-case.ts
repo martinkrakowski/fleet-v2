@@ -10,7 +10,6 @@
 import { AttentionItem, attentionItemKey } from '../../domain/entities/AttentionItem.js';
 import { readPlainObject } from '../../domain/record-input.js';
 import {
-  ATTENTION_ITEM_CLEAR_REASONS,
   ATTENTION_ITEM_CLEAR_VIAS,
   type AttentionItemClearVia,
   type AttentionItemSubjectRecord,
@@ -54,11 +53,17 @@ function readSubjectInput(value: unknown): { readonly kind: string; readonly ref
   return { kind: parsed.kind, ref: parsed.ref };
 }
 
+/** resolve accepts exactly these two clearance reasons; anything else is refused. */
+const RESOLVE_REASONS: readonly string[] = ['resolved', 'stale'];
+
+/** Fixed refusal message for any unreadable repository failure; never echoes the error or the input. */
+const STORE_UNREADABLE_REASON = 'ClearAttentionItem the attention item store could not be read';
+
 /** One item's clear-then-save; `unchanged` cannot happen for a state-open item. */
 type ClearOutcome =
   | { readonly outcome: 'cleared'; readonly items: readonly StoredAttentionItem[] }
   | { readonly outcome: 'unchanged'; readonly items: readonly StoredAttentionItem[] }
-  | { readonly outcome: 'refused'; readonly code: 'request' | 'clock' | 'stale-revision' | 'conflict' | 'invalid' | 'state' | 'key'; readonly reason: string };
+  | { readonly outcome: 'refused'; readonly code: 'request' | 'clock' | 'stale-revision' | 'conflict' | 'store-unreadable' | 'invalid' | 'state' | 'key'; readonly reason: string };
 
 export class ClearAttentionItemUseCase implements ClearAttentionItemPort {
   constructor(private readonly deps?: ClearAttentionItemDependencies) {}
@@ -168,7 +173,16 @@ export class ClearAttentionItemUseCase implements ClearAttentionItemPort {
         reason: 'ClearAttentionItem dismiss requires a string itemId and an integer expectedRevision',
       };
     }
-    const stored = await this.deps!.itemRepo.get(parsed.itemId);
+    let stored: StoredAttentionItem | null = null;
+    try {
+      stored = await this.deps!.itemRepo.get(parsed.itemId);
+    } catch {
+      return {
+        outcome: 'refused',
+        code: 'store-unreadable',
+        reason: STORE_UNREADABLE_REASON,
+      };
+    }
     if (stored === null) {
       return { outcome: 'not-found' };
     }
@@ -195,7 +209,7 @@ export class ClearAttentionItemUseCase implements ClearAttentionItemPort {
       typeof parsed.kind !== 'string' ||
       subject === null ||
       typeof parsed.reason !== 'string' ||
-      !(ATTENTION_ITEM_CLEAR_REASONS as readonly string[]).includes(parsed.reason)
+      !RESOLVE_REASONS.includes(parsed.reason)
     ) {
       return {
         outcome: 'refused',
@@ -203,11 +217,20 @@ export class ClearAttentionItemUseCase implements ClearAttentionItemPort {
         reason: 'ClearAttentionItem resolve requires a string projectId, kind, {kind, ref} subject and reason resolved or stale',
       };
     }
-    const stored = await this.deps!.itemRepo.findByKey(attentionItemKey(parsed.projectId, subject as AttentionItemSubjectRecord, parsed.kind));
+    let stored: StoredAttentionItem | null = null;
+    try {
+      stored = await this.deps!.itemRepo.findByKey(attentionItemKey(parsed.projectId, subject as AttentionItemSubjectRecord, parsed.kind));
+    } catch {
+      return {
+        outcome: 'refused',
+        code: 'store-unreadable',
+        reason: STORE_UNREADABLE_REASON,
+      };
+    }
     if (stored === null) {
       return { outcome: 'not-found' };
     }
-    return this.clearAndSave(stored, { reason: parsed.reason as 'resolved' | 'stale', via, by: actor }, nowIso);
+    return this.clearAndSave(stored, { reason: parsed.reason, via, by: actor }, nowIso);
   }
 
   /** work-order-merged: every open item whose workOrderId matches in the project. */
@@ -224,7 +247,16 @@ export class ClearAttentionItemUseCase implements ClearAttentionItemPort {
         reason: 'ClearAttentionItem work-order-merged requires a string projectId and workOrderId',
       };
     }
-    const open = await this.deps!.itemRepo.list({ projectId: parsed.projectId, workOrderId: parsed.workOrderId, state: 'open' });
+    let open: readonly StoredAttentionItem[] = [];
+    try {
+      open = await this.deps!.itemRepo.list({ projectId: parsed.projectId, workOrderId: parsed.workOrderId, state: 'open' });
+    } catch {
+      return {
+        outcome: 'refused',
+        code: 'store-unreadable',
+        reason: STORE_UNREADABLE_REASON,
+      };
+    }
     if (open.length === 0) {
       return { outcome: 'unchanged', items: [] };
     }
@@ -280,7 +312,11 @@ export class ClearAttentionItemUseCase implements ClearAttentionItemPort {
           reason: 'ClearAttentionItem another writer moved this item first',
         };
       }
-      throw error;
+      return {
+        outcome: 'refused',
+        code: 'store-unreadable',
+        reason: STORE_UNREADABLE_REASON,
+      };
     }
   }
 }

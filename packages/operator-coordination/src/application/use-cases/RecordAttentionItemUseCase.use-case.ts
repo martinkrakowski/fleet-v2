@@ -15,6 +15,7 @@ import {
   AttentionItemKeyConflictError,
   AttentionItemRevisionConflictError,
   type AttentionItemRepositoryPort,
+  type StoredAttentionItem,
 } from '../ports/out/AttentionItemRepositoryPort.out-port.js';
 import type {
   AttentionClock,
@@ -30,6 +31,9 @@ export interface RecordAttentionItemDependencies {
 }
 
 const RECORD_BODY_KEYS: readonly string[] = ['projectId', 'kind', 'subject', 'workOrderId', 'summary'];
+
+/** Fixed refusal message for any unreadable repository failure; never echoes the error or the input. */
+const STORE_UNREADABLE_REASON = 'RecordAttentionItem the attention item store could not be read';
 
 function isCanonicalIso(value: string): boolean {
   const parsed = Date.parse(value);
@@ -135,7 +139,11 @@ export class RecordAttentionItemUseCase implements RecordAttentionItemPort {
           reason: 'RecordAttentionItem the minted item id is already taken',
         };
       }
-      throw error;
+      return {
+        outcome: 'refused',
+        code: 'store-unreadable',
+        reason: STORE_UNREADABLE_REASON,
+      };
     }
   }
 
@@ -147,7 +155,16 @@ export class RecordAttentionItemUseCase implements RecordAttentionItemPort {
   private async raiseOnHolder(candidate: AttentionItem, nowIso: string): Promise<RecordAttentionItemResult | null> {
     const record = candidate.toRecord();
     const key = attentionItemKey(record.projectId, record.subject, record.kind);
-    const holder = await this.deps!.itemRepo.findByKey(key);
+    let holder: StoredAttentionItem | null = null;
+    try {
+      holder = await this.deps!.itemRepo.findByKey(key);
+    } catch {
+      return {
+        outcome: 'refused',
+        code: 'store-unreadable',
+        reason: STORE_UNREADABLE_REASON,
+      };
+    }
     if (holder === null) {
       return null;
     }
@@ -184,7 +201,11 @@ export class RecordAttentionItemUseCase implements RecordAttentionItemPort {
           reason: 'RecordAttentionItem another writer moved this item first',
         };
       }
-      throw error;
+      return {
+        outcome: 'refused',
+        code: 'store-unreadable',
+        reason: STORE_UNREADABLE_REASON,
+      };
     }
   }
 }

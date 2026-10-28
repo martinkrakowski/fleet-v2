@@ -110,6 +110,10 @@ class FakeOwnerQuestionRepo implements OwnerQuestionRepositoryPort {
       return true;
     });
   }
+
+  async findByIdempotencyKey(key: string): Promise<OwnerQuestionRecord | null> {
+    return [...this.records.values()].find((r) => r.idempotencyKey === key) ?? null;
+  }
 }
 
 /** A coordination request repository that refuses every write: no owner

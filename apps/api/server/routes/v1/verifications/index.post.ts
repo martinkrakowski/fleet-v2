@@ -46,7 +46,8 @@ export default defineEventHandler(async (event) => {
     } else if (body.assessmentId !== expected) {
       throw createError({
         statusCode: 400,
-        statusMessage: `assessmentId must be ${expected} (the attempt's assessment id) or omitted`,
+        // Fixed text: an error body never echoes a request field (API-ERR).
+        statusMessage: "assessmentId must be the attempt's assessment id or omitted",
       });
     }
   }

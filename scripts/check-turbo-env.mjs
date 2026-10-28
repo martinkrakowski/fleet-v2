@@ -178,6 +178,7 @@ for (const dir of SCAN_DIRS) {
       for (const part of m[1].split(",")) {
         const name = part
           .split(":")[0]
+          .split("=")[0]
           .replace(/\.\.\..*/, "")
           .trim();
         if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))

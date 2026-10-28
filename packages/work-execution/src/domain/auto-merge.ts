@@ -164,7 +164,9 @@ const AUTO_MERGE_OTHER_BLOCKER = 'other';
 
 /**
  * Read the acceptance port's `blockerDetails`. Absent, non-array, empty, or containing a non-record
- * reads as one `other` blocker; texts are capped for display and the list is capped at 20 entries.
+ * reads as one `other` blocker. EVERY entry is validated before any cap; texts are capped for display.
+ * A list longer than 20 keeps its first 19 entries and ends with one `other` entry naming how many more
+ * there are, so a truncated list is never "only ci-pending" (fail-closed).
  */
 export function autoMergeBlockersOf(details: unknown, fallbackText: string): readonly AutoMergeBlocker[] {
   const fallback: AutoMergeBlocker = { kind: AUTO_MERGE_OTHER_BLOCKER, text: fallbackText.slice(0, AUTO_MERGE_MAX_BLOCKER_TEXT) };
@@ -173,16 +175,18 @@ export function autoMergeBlockersOf(details: unknown, fallbackText: string): rea
   }
   const blockers: AutoMergeBlocker[] = [];
   for (const element of details) {
-    if (blockers.length >= AUTO_MERGE_MAX_BLOCKERS) {
-      break;
-    }
     const record = readExactPlainRecord(element, ['kind', 'text']);
     if (record === null || typeof record.kind !== 'string' || typeof record.text !== 'string') {
       return [fallback];
     }
     blockers.push({ kind: record.kind, text: record.text.slice(0, AUTO_MERGE_MAX_BLOCKER_TEXT) });
   }
-  return blockers;
+  if (blockers.length <= AUTO_MERGE_MAX_BLOCKERS) {
+    return blockers;
+  }
+  const kept = blockers.slice(0, AUTO_MERGE_MAX_BLOCKERS - 1);
+  const more = blockers.length - kept.length;
+  return [...kept, { kind: AUTO_MERGE_OTHER_BLOCKER, text: `${more} more blockers` }];
 }
 
 /**

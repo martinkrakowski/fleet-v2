@@ -129,6 +129,18 @@ describe('readAutoMergeSettingsAnswer', () => {
 });
 
 describe('autoMergeBlockersOf and isCiPendingOnly', () => {
+  it('validates every entry before the cap: a failing check after 20 pending ones is never read as pending-only', () => {
+    const pending = Array.from({ length: 20 }, () => ({ kind: 'ci-pending', text: 'a' }));
+    const withFailure = autoMergeBlockersOf([...pending, { kind: 'ci-failed', text: 'b' }], 'fallback');
+    expect(withFailure).toHaveLength(20);
+    expect(withFailure[19]).toEqual({ kind: 'other', text: '2 more blockers' });
+    expect(isCiPendingOnly(withFailure)).toBe(false);
+    expect(autoMergeBlockersOf([...pending, 42], 'fallback')).toEqual([{ kind: 'other', text: 'fallback' }]);
+    const exactlyTwenty = autoMergeBlockersOf(pending, 'fallback');
+    expect(exactlyTwenty).toHaveLength(20);
+    expect(isCiPendingOnly(exactlyTwenty)).toBe(true);
+  });
+
   const fallback = 'fallback text';
 
   it('reads absent, empty, non-array and record-less lists as one other blocker', () => {

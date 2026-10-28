@@ -35,6 +35,7 @@ import {
 import { resolveImplementerSeat } from '@fleet/work-execution/use-cases';
 import type {
   FindingDispositionRecord,
+  ReviewKind,
   ReviewReceiptRecord,
   VerificationReceiptRecord,
 } from '@fleet/evidence-and-acceptance';
@@ -1199,6 +1200,8 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
       if (!seat.bound) {
         return seat.rejection;
       }
+      const kind = str(p, 'kind');
+      const requestId = optStr(p, 'requestId');
       return rt.evidence.requestIndependentReview.requestIndependentReview({
         assessmentId: evidenceAssessmentId(p),
         projectId: str(p, 'projectId'),
@@ -1209,6 +1212,10 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         reviewerModel: str(p, 'reviewerModel'),
         diffSummary: optStr(p, 'diffSummary'),
         nowIso: optStr(p, 'nowIso'),
+        // Conductor fields are forwarded only when present, so existing manual
+        // payloads are unchanged and the use case validates them.
+        ...(kind !== '' ? { kind: kind as ReviewKind } : {}),
+        ...(requestId !== undefined ? { requestId } : {}),
       });
     },
     'record-review': async (p, rt) => {

@@ -20,6 +20,18 @@ export function reviewKindOf(receipt: Pick<ReviewReceiptRecord, 'kind'>): Review
   return receipt.kind ?? 'code-review';
 }
 
+/**
+ * Whether a receipt satisfies the acceptance review gate as the passing review
+ * (§3.4): only receipts whose kind is absent or `code-review` count. A receipt
+ * of another kind (e.g. `brief-check`) never satisfies the gate on its own; a
+ * failing latest receipt of any kind still blocks acceptance.
+ */
+export function satisfiesReviewPassGate(
+  receipt: Pick<ReviewReceiptRecord, 'kind' | 'result'>,
+): boolean {
+  return receipt.result === 'pass' && reviewKindOf(receipt) === 'code-review';
+}
+
 /** The last receipt per reviewer model and review kind, in array order. */
 export function latestReceiptPerReviewer(
   receipts: readonly ReviewReceiptRecord[],

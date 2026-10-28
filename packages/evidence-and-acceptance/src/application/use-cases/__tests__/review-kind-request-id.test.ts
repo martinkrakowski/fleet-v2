@@ -116,6 +116,21 @@ class StubSeatPolicy implements EvidenceSeatPolicyPort {
   }
 }
 
+class MutableSeatPolicy implements EvidenceSeatPolicyPort {
+  calls: string[] = [];
+
+  constructor(private result: ReviewerSeatCheck) {}
+
+  setResult(result: ReviewerSeatCheck): void {
+    this.result = result;
+  }
+
+  async checkReviewerSeat(request: CheckReviewerSeatRequest): Promise<ReviewerSeatCheck> {
+    this.calls.push(request.reviewerModel);
+    return this.result;
+  }
+}
+
 function sampleRecord(overrides: Partial<EvidenceAssessmentRecord> = {}): EvidenceAssessmentRecord {
   return {
     id: 'assessment-attempt-example-1',
@@ -239,6 +254,58 @@ describe('review kind and request id (PC-1)', () => {
       ),
     );
     expect(replay.rejection).toBe('request-id-reused');
+    expect(reviewer.calls).toHaveLength(1);
+  });
+
+  it('replays a stored receipt even when the reviewer seat is now refused', async () => {
+    const reviewer = new StubReviewer();
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const seat = new MutableSeatPolicy({ outcome: 'allowed' });
+    const useCase = new RequestIndependentReviewUseCase({
+      repo,
+      reviewer,
+      archive: new StubArchive(),
+      seatPolicy: seat,
+    });
+    const first = await useCase.requestIndependentReview(
+      baseRequest({ kind: 'brief-check', requestId: REQUEST_ID }),
+    );
+    seat.setResult({ outcome: 'refused', reason: 'seat is busy' });
+    const replay = await useCase.requestIndependentReview(
+      baseRequest({ kind: 'brief-check', requestId: REQUEST_ID }),
+    );
+    expect(replay).toEqual(first);
+    // A stored receipt needs no new seat: the policy was consulted once, for
+    // the original (new) review only.
+    expect(seat.calls).toEqual([REVIEWER]);
+    expect(reviewer.calls).toHaveLength(1);
+  });
+
+  it('a matching replay with a different attemptId is assessment-mismatch, never a second review', async () => {
+    const reviewer = new StubReviewer();
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive: new StubArchive() });
+    await useCase.requestIndependentReview(baseRequest({ kind: 'brief-check', requestId: REQUEST_ID }));
+    const replay = rejectionOf(
+      await useCase.requestIndependentReview(
+        baseRequest({ kind: 'brief-check', requestId: REQUEST_ID, attemptId: 'attempt-example-2' }),
+      ),
+    );
+    expect(replay.rejection).toBe('assessment-mismatch');
+    expect(reviewer.calls).toHaveLength(1);
+  });
+
+  it('a matching replay with a different implementerModel is assessment-mismatch, never a second review', async () => {
+    const reviewer = new StubReviewer();
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive: new StubArchive() });
+    await useCase.requestIndependentReview(baseRequest({ kind: 'brief-check', requestId: REQUEST_ID }));
+    const replay = rejectionOf(
+      await useCase.requestIndependentReview(
+        baseRequest({ kind: 'brief-check', requestId: REQUEST_ID, implementerModel: 'other-provider/llama-3.1' }),
+      ),
+    );
+    expect(replay.rejection).toBe('assessment-mismatch');
     expect(reviewer.calls).toHaveLength(1);
   });
 

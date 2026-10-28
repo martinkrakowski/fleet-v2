@@ -124,15 +124,6 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
         `Independent review requires a distinct underlying model: ${request.reviewerModel} and ${request.implementerModel} share the same underlying model`,
       );
     }
-    if (deps.seatPolicy) {
-      const check = await deps.seatPolicy.checkReviewerSeat({
-        reviewerModel: request.reviewerModel,
-      });
-      if (check.outcome === 'refused') {
-        return rejectedFor(request, 'seat-refused', check.reason);
-      }
-    }
-
     const existing = await deps.repo.findAssessmentById(request.assessmentId);
     if (existing === null) {
       return rejectedFor(
@@ -142,25 +133,53 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       );
     }
     // A replayed request id never runs a second review (§3.5): the recorded receipt answers when reviewer,
-    // kind and head match; any other reuse (a different head included) is request-id-reused. Checked before
-    // the head and identity checks so a reused id always gets that typed code.
+    // kind and head match and the assessment still matches the request. Replay runs before the seat policy —
+    // a stored receipt needs no new seat — and before the head and identity checks so a reused id always gets
+    // its typed code. Any other reuse (a different head included) is request-id-reused.
     if (request.requestId !== undefined) {
       const found = existing.reviewReceipts.find(
         (receipt) => receipt.requestId === request.requestId,
       );
       if (found !== undefined) {
         if (
-          found.reviewerModel.trim() === request.reviewerModel.trim() &&
-          found.kind === request.kind &&
-          found.candidateHeadSha === request.candidateHeadSha
+          found.reviewerModel.trim() !== request.reviewerModel.trim() ||
+          found.kind !== request.kind ||
+          found.candidateHeadSha !== request.candidateHeadSha
         ) {
-          return { outcome: 'reviewed', receipt: found };
+          return rejectedFor(
+            request,
+            'request-id-reused',
+            'Review request id ' + request.requestId + ' was already used for another review',
+          );
         }
-        return rejectedFor(
-          request,
-          'request-id-reused',
-          'Review request id ' + request.requestId + ' was already used for another review',
-        );
+        if (
+          existing.projectId !== request.projectId ||
+          existing.attemptId !== request.attemptId ||
+          existing.policyRevision !== request.policyRevision
+        ) {
+          return rejectedFor(
+            request,
+            'assessment-mismatch',
+            'Assessment identity mismatch (projectId, attemptId, or policyRevision does not match existing assessment)',
+          );
+        }
+        if (existing.implementerModel !== request.implementerModel) {
+          return rejectedFor(
+            request,
+            'assessment-mismatch',
+            `Assessment '${existing.id}' was implemented on seat '${existing.implementerModel}', not '${request.implementerModel}'`,
+          );
+        }
+        return { outcome: 'reviewed', receipt: found };
+      }
+    }
+
+    if (deps.seatPolicy) {
+      const check = await deps.seatPolicy.checkReviewerSeat({
+        reviewerModel: request.reviewerModel,
+      });
+      if (check.outcome === 'refused') {
+        return rejectedFor(request, 'seat-refused', check.reason);
       }
     }
 

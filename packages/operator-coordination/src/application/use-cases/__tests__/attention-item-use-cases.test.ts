@@ -454,6 +454,22 @@ describe('ClearAttentionItemUseCase', () => {
     expect(await repo.list()).toHaveLength(1);
   });
 
+  it('resolves a pr subject by key whatever the case of its owner and repository', async () => {
+    const repo = new AttentionItemRepositoryAdapter();
+    const record = new RecordAttentionItemUseCase({ itemRepo: repo, clock: clock(), ids: ids() });
+    const subject = { kind: 'pr', ref: 'Example-Org/Example-Repo#7' };
+    const raised = await record.recordAttentionItem({ ...RAISE_BODY, subject }, 'auto-merge');
+    expect(raised).toMatchObject({ outcome: 'raised', item: { subject: { kind: 'pr', ref: 'example-org/example-repo#7' } } });
+
+    const uc = new ClearAttentionItemUseCase({ itemRepo: repo, clock: clock([LATER_ISO]) });
+    const cleared = await uc.clearAttentionItem(
+      { action: 'resolve', projectId: 'example-project', kind: 'merge', subject, reason: 'resolved' },
+      'machine',
+      'auto-merge',
+    );
+    expect(cleared).toMatchObject({ outcome: 'cleared', items: [{ item: { itemId: 'att-example-1', state: 'cleared' } }] });
+  });
+
   it('resolves by key with reason stale, and an unknown key is not-found', async () => {
     const repo = new AttentionItemRepositoryAdapter();
     const uc = new ClearAttentionItemUseCase({ itemRepo: repo, clock: clock([LATER_ISO]) });

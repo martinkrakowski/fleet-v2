@@ -404,11 +404,13 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
     expect(after?.revision).toBe(1);
   });
 
-  it('test 8: act decisions are reported not-built and write nothing', async () => {
+  it('test 8: a collect act with no collect port wired reports not-wired and writes nothing', async () => {
     const harness = await makeHarness(runRecord(), attemptFixture({ state: 'running' }));
     await conduct(harness, 'collecting', NOW);
     const result = await advance(harness);
-    expect(result).toEqual({ outcome: 'not-built', decision: 'act', step: 'collect' });
+    // K4-6 built the collect act; this harness wires no collect port, so the
+    // reached decision reports not-wired (the old not-built pin is superseded).
+    expect(result).toEqual({ outcome: 'not-wired', step: 'collect' });
     expect(await harness.runJournal.listForRun(RUN_ID)).toHaveLength(1);
     expect(harness.reconcileCalls).toEqual([]);
     const after = await harness.runRepo.get(RUN_ID);

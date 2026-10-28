@@ -15,8 +15,13 @@
  * `CancelPreparedAttemptPort`). Each writes its keyed intent first, performs
  * the one action, saves the record it needs, then appends the result entry;
  * both acting steps re-check the cost ceiling before writing anything. The
- * remaining `act` and `reconcile` decisions are still reported `not-built`
- * (K4-6 and K4-7 build them) and write nothing.
+ * acts `stop`, `collect` and `gate` are performed here too (K4-6): stop
+ * handles a timeout and a forced run stop through `StopAttemptPort` mapped by
+ * the plan's §3.8 table, collect runs the edit-only commit step first for an
+ * agy attempt then collects through `CollectAttemptArtifactsPort`, and gate
+ * reads the typed verdict from `EvaluateAttemptGatePort`. The remaining
+ * `reconcile` decisions are still reported `not-built` (K4-7 builds them)
+ * and write nothing.
  */
 
 import type {
@@ -34,6 +39,10 @@ import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-p
 import type { ReconcileAttemptPort } from '../ports/in/ReconcileAttemptPort.in-port.js';
 import type { DispatchAttemptPort } from '../ports/in/DispatchAttemptPort.in-port.js';
 import type { CancelPreparedAttemptPort } from '../ports/in/CancelPreparedAttemptPort.in-port.js';
+import type { StopAttemptPort, StopAttemptResult } from '../ports/in/StopAttemptPort.in-port.js';
+import type { CollectAttemptArtifactsPort } from '../ports/in/CollectAttemptArtifactsPort.in-port.js';
+import type { CommitEditOnlyAttemptPort } from '../ports/in/CommitEditOnlyAttemptPort.in-port.js';
+import type { EvaluateAttemptGatePort } from '../ports/in/EvaluateAttemptGatePort.in-port.js';
 import { AttemptRevisionConflictError } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import {
   parseSeatTool,
@@ -78,7 +87,8 @@ import type {
   LaneRunSeatFact,
 } from '../../domain/lane-run-decider.js';
 import { laneRunAttemptPhaseOf, nextLaneRunAction } from '../../domain/lane-run-decider.js';
-import { canEnterLaneRunState, implementerRoleFor } from '../../domain/lane-run-transitions.js';
+import { canEnterLaneRunState, implementerRoleFor, laneRunStopEffect } from '../../domain/lane-run-transitions.js';
+import type { RunStopEffect, RunStopOutcome } from '../../domain/lane-run-transitions.js';
 import { historyEntryOf, selectSeat, seatSelectionRecord, stopReasonOf } from '../../domain/seat-selection.js';
 import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
 import { SeatPlan } from '../../domain/value-objects/SeatPlan.vo.js';
@@ -101,6 +111,14 @@ export interface AdvanceLaneRunDependencies {
   readonly dispatchAttempt?: DispatchAttemptPort;
   /** The record-only cancel of a never-dispatched attempt (K4-1, K4-5); absent → `not-wired stop`. */
   readonly cancelPreparedAttempt?: CancelPreparedAttemptPort;
+  /** Stop a running attempt (K4-6); absent → `not-wired stop`. */
+  readonly stopAttempt?: StopAttemptPort;
+  /** Collect an ended attempt's artifacts (K4-6); absent → `not-wired collect`. */
+  readonly collectAttemptArtifacts?: CollectAttemptArtifactsPort;
+  /** The edit-only commit step (AG-4), run first at collect for an agy attempt (K4-6); absent → `not-wired collect` only for agy. */
+  readonly commitEditOnlyAttempt?: CommitEditOnlyAttemptPort;
+  /** The frozen gate verdict (K4-2, K4-6); absent → `not-wired gate`. */
+  readonly evaluateAttemptGate?: EvaluateAttemptGatePort;
   /** The installation schema version the dispatching root runs under (H9a2). */
   readonly installationSchemaVersion?: number;
 }
@@ -275,6 +293,32 @@ function manifestExpectedArtifacts(manifest: Record<string, unknown> | null): re
   return value as readonly string[];
 }
 
+/** Map a StopAttempt port result onto the domain's RunStopOutcome; a refusal re-reads the attempt for its kind. */
+async function runStopOutcomeOf(
+  result: StopAttemptResult,
+  latestId: string,
+  attemptRepo: AttemptRepositoryPort,
+): Promise<RunStopOutcome> {
+  if (result.outcome === 'terminated' || result.outcome === 'cancelled') {
+    return { outcome: result.outcome, capacityReleased: result.capacityReleased };
+  }
+  if (result.outcome === 'still-running' || result.outcome === 'unknown') {
+    return { outcome: result.outcome };
+  }
+  const stored = await attemptRepo.findAttemptById(latestId);
+  if (stored === null) {
+    return { outcome: 'refused', refusal: 'attempt-missing' };
+  }
+  if (
+    stored.state === 'cancelled' ||
+    stored.state === 'collected' ||
+    (stored.state === 'ended' && stored.completionReceipt !== null && stored.completionReceipt.authoritative === true)
+  ) {
+    return { outcome: 'refused', refusal: 'attempt-terminal' };
+  }
+  return { outcome: 'refused', refusal: 'other' };
+}
+
 type WriteOutcome =
   | { readonly ok: true; readonly record?: LaneRunRecord }
   | { readonly ok: false; readonly reason: AdvanceLaneRunRefusal };
@@ -374,6 +418,15 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       }
       if (decision.step === 'dispatch') {
         return this.performDispatch(record, gathered, decision, request);
+      }
+      if (decision.step === 'stop') {
+        return this.performStop(record, gathered, decision, request);
+      }
+      if (decision.step === 'collect') {
+        return this.performCollect(record, gathered, decision, request);
+      }
+      if (decision.step === 'gate') {
+        return this.performGate(record, gathered, decision, request);
       }
       return { outcome: 'not-built', decision: 'act', step: decision.step };
     }
@@ -756,6 +809,236 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     }
     const appended = await this.appendConduct(request, 'dispatching');
     return appended.ok ? null : appended.reason;
+  }
+
+  /**
+   * The `act stop` decision (K4-6): stop the latest running attempt through
+   * `StopAttemptPort`. A timeout (no force) journals `stop-timeout` when the
+   * stop terminated or cancelled, `stop-unconfirmed` when still-running or
+   * unknown (the decider retries under `/retryN`), and parks `stop-refused`
+   * on a refusal. A forced run maps the plan's §3.8 table: stopped releases or
+   * holds the slot, still-running parks `stop-unconfirmed`, a refusal parks
+   * `stop-refused` with the attempt's re-read kind, never its text.
+   */
+  private async performStop(
+    record: LaneRunRecord,
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'act' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const stop = this.deps.stopAttempt;
+    if (stop === undefined) {
+      return { outcome: 'not-wired', step: decision.step };
+    }
+    const latest = gathered.latestAttempt;
+    if (latest === null) {
+      return { outcome: 'waiting', reason: 'facts-inconsistent' };
+    }
+    const intentRefusal = await this.appendRunIntent(request, decision.key, null);
+    if (intentRefusal !== null) {
+      return { outcome: 'refused', reason: intentRefusal };
+    }
+    const result = await stop.stopAttempt({ attemptId: latest.id, nowIso: request.nowIso });
+    const mapped = await runStopOutcomeOf(result, latest.id, this.deps.attemptRepo);
+    const effect = laneRunStopEffect(mapped);
+    if (gathered.facts.stopMode === 'force') {
+      return this.finishForceStop(record, gathered, decision, effect, request);
+    }
+    if (mapped.outcome === 'terminated' || mapped.outcome === 'cancelled') {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'stop-timeout');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-timeout' };
+    }
+    if (mapped.outcome === 'still-running' || mapped.outcome === 'unknown') {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'stop-unconfirmed');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-unconfirmed' };
+    }
+    const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', null);
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return this.performPark(record, 'stop-refused', effect.run === 'parked' ? effect.qualifier : null, gathered.facts.state, request);
+  }
+
+  /** The force branch of `act stop` (§3.8): stopped, stop-unconfirmed or stop-refused. */
+  private async finishForceStop(
+    record: LaneRunRecord,
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'act' }>,
+    effect: RunStopEffect,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    if (effect.run === 'stopped') {
+      const reasonCode = effect.capacity === 'held' ? 'stop-force-slot-held' : 'stop-force';
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', reasonCode);
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      const appended = await this.appendConduct(request, 'stopped');
+      if (!appended.ok) {
+        return { outcome: 'refused', reason: appended.reason };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
+    }
+    if (effect.reason === 'stop-unconfirmed') {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'stop-unconfirmed');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      if (record.parked === null) {
+        return this.performPark(record, 'stop-unconfirmed', null, gathered.facts.state, request);
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-unconfirmed' };
+    }
+    const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', null);
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return this.performPark(record, 'stop-refused', effect.qualifier, gathered.facts.state, request);
+  }
+
+  /**
+   * The `act collect` decision (K4-6): collect an ended attempt's artifacts
+   * through `CollectAttemptArtifactsPort`, running the edit-only commit step
+   * (`CommitEditOnlyAttemptPort`) first when the attempt ran under agy. A
+   * commit refusal parks for the owner on the next advance, unknown parks as
+   * ambiguous, and a collect refusal journals `collect-refused`.
+   */
+  private async performCollect(
+    record: LaneRunRecord,
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'act' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const collect = this.deps.collectAttemptArtifacts;
+    if (collect === undefined) {
+      return { outcome: 'not-wired', step: decision.step };
+    }
+    const latest = gathered.latestAttempt;
+    if (latest === null) {
+      return { outcome: 'waiting', reason: 'facts-inconsistent' };
+    }
+    const commitEditOnlyAttempt = this.deps.commitEditOnlyAttempt;
+    if (latest.runner?.kind === 'agy' && commitEditOnlyAttempt === undefined) {
+      return { outcome: 'not-wired', step: decision.step };
+    }
+    const intentRefusal = await this.appendRunIntent(request, decision.key, null);
+    if (intentRefusal !== null) {
+      return { outcome: 'refused', reason: intentRefusal };
+    }
+    if (latest.state !== 'ended' || latest.completionReceipt === null) {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'no-completion-receipt');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'no-completion-receipt' };
+    }
+    // The frozen artifact list is read before any write: an absent or unreadable manifest, or an
+    // unreadable expectedArtifacts, refuses the collect before the edit-only commit touches git.
+    const manifest = await readFrozenManifest(latest, this.deps.artifactPort);
+    const expectedArtifacts = manifest === null ? null : manifestExpectedArtifacts(manifest);
+    if (expectedArtifacts === null) {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'collect-refused');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'collect-refused' };
+    }
+    if (latest.runner?.kind === 'agy' && commitEditOnlyAttempt !== undefined) {
+      const committed = await commitEditOnlyAttempt.commitEditOnlyAttempt({
+        attemptId: latest.id,
+        nowIso: request.nowIso,
+      });
+      if (committed.outcome === 'refused') {
+        const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'edit-only-refused');
+        if (resultRefusal !== null) {
+          return { outcome: 'refused', reason: resultRefusal };
+        }
+        return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'edit-only-refused' };
+      }
+      if (committed.outcome === 'unknown') {
+        const resultRefusal = await this.appendRunResult(request, decision.key, 'ambiguous', 'edit-only-unknown');
+        if (resultRefusal !== null) {
+          return { outcome: 'refused', reason: resultRefusal };
+        }
+        return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'edit-only-unknown' };
+      }
+    }
+    const collected = await collect.collectAttemptArtifacts({
+      attemptId: latest.id,
+      workOrderId: record.workOrderId,
+      expectedArtifacts,
+      completionReceipt: latest.completionReceipt,
+    });
+    if (collected.outcome === 'collected') {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'collected');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'collected' };
+    }
+    const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'collect-refused');
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'collect-refused' };
+  }
+
+  /**
+   * The `act gate` decision (K4-6): evaluate the frozen acceptance spec at the
+   * collected head through `EvaluateAttemptGatePort`; only the typed verdict
+   * decides, never a reason string.
+   */
+  private async performGate(
+    record: LaneRunRecord,
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'act' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const gate = this.deps.evaluateAttemptGate;
+    if (gate === undefined) {
+      return { outcome: 'not-wired', step: decision.step };
+    }
+    const latest = gathered.latestAttempt;
+    if (latest === null || latest.artifacts === null) {
+      return { outcome: 'waiting', reason: 'facts-inconsistent' };
+    }
+    // Only a sealed collection is gated: a missing or mismatched C1 manifest parks first.
+    if (gathered.facts.attempt?.collection?.manifest !== 'sealed') {
+      return this.performPark(record, 'artifacts-unsealed', null, gathered.facts.state, request);
+    }
+    const intentRefusal = await this.appendRunIntent(request, decision.key, null);
+    if (intentRefusal !== null) {
+      return { outcome: 'refused', reason: intentRefusal };
+    }
+    const verdict = await gate.evaluateAttemptGate({
+      attemptId: latest.id,
+      candidateHeadSha: latest.artifacts.headCommit,
+    });
+    if (verdict.verdict === 'passed') {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'gate-passed');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'gate-passed' };
+    }
+    if (verdict.verdict === 'failed') {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'gate-failed');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'gate-failed' };
+    }
+    const resultRefusal = await this.appendRunResult(request, decision.key, 'ambiguous', 'gate-unknown');
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'gate-unknown' };
   }
 
   /**

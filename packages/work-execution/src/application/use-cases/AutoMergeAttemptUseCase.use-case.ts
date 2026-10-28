@@ -459,6 +459,9 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
  * and the trailing `:<status>:<seq>`. Parsed from the right so action ids that
  * themselves contain `:` still parse; null when the id is not parseable.
  */
+const FORGE_ENTRY_STATUSES: readonly string[] = ['intent-recorded', 'completed', 'refused', 'ambiguous'];
+
+/** `forge:<actionId>:<status>:<seq>`, parsed from the right; any malformed part makes the id unreadable. */
 function parseForgeActionId(id: string): string | null {
   if (!id.startsWith('forge:')) {
     return null;
@@ -467,7 +470,13 @@ function parseForgeActionId(id: string): string | null {
   if (parts.length < 3) {
     return null;
   }
-  return parts.slice(0, parts.length - 2).join(':');
+  const seq = parts[parts.length - 1];
+  const status = parts[parts.length - 2];
+  const actionId = parts.slice(0, parts.length - 2).join(':');
+  if (!/^[1-9][0-9]{0,8}$/.test(seq) || !FORGE_ENTRY_STATUSES.includes(status) || actionId === '' || actionId.startsWith(':') || actionId.endsWith(':')) {
+    return null;
+  }
+  return actionId;
 }
 
 /**

@@ -265,7 +265,7 @@ const BOARD_TEXT_MAX_BYTES = 1024;
 /** The label of a plan-lane card whose lane id, matched to no imported lane, is not plain text. */
 const UNNAMED_PLAN_LANE_LABEL = 'Unnamed plan lane';
 
-function isPlainText(text: string): boolean {
+export function isPlainText(text: string): boolean {
   return planTextError('text', text, BOARD_TEXT_MAX_BYTES) === null;
 }
 
@@ -909,7 +909,7 @@ function computeBoard(facts: BoardFacts, readAtIso: string, sinceIso: string | n
   }
 
   for (const card of cards) {
-    card.pullRequests = lanePullRequests(card.links, facts, readAtIso, policy);
+    card.pullRequests = lanePullRequests(card.links, facts, readAtIso, policy, readings);
     card.step = laneStep({
       placement: card.placement,
       dropped: card.planStatus === 'dropped',

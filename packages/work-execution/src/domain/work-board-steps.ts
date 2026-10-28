@@ -4,6 +4,7 @@
  */
 
 import { parseTimeMs } from './work-board-facts.js';
+import { isPlainText } from './work-board.js';
 import type {
   BoardAttemptFact,
   BoardDeclarationFact,
@@ -22,10 +23,34 @@ import type {
 } from './work-board-facts.js';
 import type { AttemptStateValue } from './value-objects/AttemptState.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
-import type { SeatPlanRole } from './value-objects/SeatPlan.vo.js';
 import type { StopReasonValue } from './value-objects/StopReason.vo.js';
 
 type LaneRunParkReason = NonNullable<BoardRunFact['parkReason']>;
+
+/** The fixed text for a time that does not parse; never the raw input. */
+const UNREADABLE_TIME = 'an unreadable time';
+/** The fixed text for a seat model that is not plain text; null means "not recorded". */
+const UNNAMED_SEAT = 'Unnamed seat';
+/** The fixed text for a seat role that is not plain text; null means "not recorded". */
+const UNKNOWN_ROLE = 'unknown role';
+
+/** A displayed time: the input ISO instant re-rendered from its parsed milliseconds, never the input string. */
+function renderTime(iso: string): string {
+  const ms = parseTimeMs(iso);
+  return ms === null ? UNREADABLE_TIME : new Date(ms).toISOString();
+}
+
+/** A displayed seat role: the plain-text rule, or the fixed text; null stays null ("not recorded"). */
+function renderedSeatRole(role: string | null): string | null {
+  if (role === null) return null;
+  return isPlainText(role) ? role : UNKNOWN_ROLE;
+}
+
+/** A displayed seat model: the plain-text rule, or the fixed text; null stays null ("not recorded"). */
+function renderedSeatModel(model: string | null): string | null {
+  if (model === null) return null;
+  return isPlainText(model) ? model : UNNAMED_SEAT;
+}
 
 export type BoardPrState = 'open' | 'closed' | 'merged' | 'not-observed' | 'not-read';
 
@@ -70,7 +95,7 @@ export const BOARD_BADGE_KINDS = [
 ] as const;
 
 export type BoardBadge =
-  | { readonly kind: 'attempt-running'; readonly attemptId: string; readonly seatRole: SeatPlanRole | null;
+  | { readonly kind: 'attempt-running'; readonly attemptId: string; readonly seatRole: string | null;
       readonly model: string | null; readonly state: AttemptStateValue }
   | { readonly kind: 'run'; readonly runId: string; readonly state: LaneRunStateValue; readonly round: number;
       readonly parkReason: LaneRunParkReason | null }
@@ -164,13 +189,13 @@ function forgeStateToBoard(state: BoardForgePullRequestFact['state']): BoardPrSt
 }
 
 /** S1: a linked PR's status with its read time and staleness. */
-export function pullRequestStatus(repository: string, number: number, facts: BoardFacts, nowIso: string, policy: BoardPolicy): BoardPrStatus {
+export function pullRequestStatus(repository: string, number: number, facts: BoardFacts, nowIso: string, policy: BoardPolicy, readings: readonly SourceReading[] = facts.sources): BoardPrStatus {
   const merge = facts.merges.find((m) => m.repository === repository && m.number === number);
   if (merge) {
     return { repository, number, state: 'merged', source: 'merge-record', asOfIso: null, ciState: null, title: null, stale: false };
   }
 
-  const reading = facts.sources.find((r) => r.source === 'forge-observation' && r.repository === repository);
+  const reading = readings.find((r) => r.source === 'forge-observation' && r.repository === repository);
   if (!reading || reading.status !== 'read') {
     return { repository, number, state: 'not-read', source: 'none', asOfIso: null, ciState: null, title: null, stale: false };
   }
@@ -283,8 +308,8 @@ function stepFromDeclaration(declaration: BoardDeclarationFact, nowIso: string, 
   return {
     kind: 'declared',
     step: declaration.step,
-    seatRole: declaration.seatRole,
-    model: declaration.model,
+    seatRole: renderedSeatRole(declaration.seatRole) ?? UNKNOWN_ROLE,
+    model: renderedSeatModel(declaration.model) ?? UNNAMED_SEAT,
     declaredAtIso: declaration.declaredAtIso,
   };
 }
@@ -323,7 +348,7 @@ export function laneStep(input: BoardLaneStepInput): BoardStep | null {
 }
 
 function prStepText(pr: BoardPrStatus, verb: string, suffix: string): string {
-  let text = 'PR #' + String(pr.number) + ' ' + verb + (pr.asOfIso ?? '');
+  let text = 'PR #' + String(pr.number) + ' ' + verb + (pr.asOfIso === null ? '' : renderTime(pr.asOfIso));
   if (suffix !== '') text += suffix;
   if (pr.stale) text += '; may have changed';
   return text;
@@ -359,7 +384,7 @@ export function boardStepText(step: BoardStep): string {
       return text;
     }
     case 'declared':
-      return 'declared, not observed: ' + step.step + ' as of ' + step.declaredAtIso;
+      return 'declared, not observed: ' + step.step + ' as of ' + renderTime(step.declaredAtIso);
     case 'declaration-lapsed':
       return 'state unknown (declaration lapsed)';
     case 'dropped-after-start':
@@ -382,12 +407,12 @@ export function laneSeat(input: BoardLaneSeatInput): BoardSeat | null {
   const underlying = step !== null && step.kind === 'dropped-after-start' ? step.underlying : step;
   if (underlying !== null && (underlying.kind === 'run' || underlying.kind === 'run-stopped')) {
     const run = latestRun(input.runs);
-    if (run !== null) return { role: run.seatRole, model: run.model, source: 'run' };
+    if (run !== null) return { role: renderedSeatRole(run.seatRole), model: renderedSeatModel(run.model), source: 'run' };
   }
   const attempt = latestAttempt(input.attempts);
-  if (attempt !== null) return { role: attempt.seatRole, model: attempt.model, source: 'attempt' };
+  if (attempt !== null) return { role: renderedSeatRole(attempt.seatRole), model: renderedSeatModel(attempt.model), source: 'attempt' };
   const declaration = latestDeclaration(input.declarations);
-  if (declaration !== null) return { role: declaration.seatRole, model: declaration.model, source: 'declaration' };
+  if (declaration !== null) return { role: renderedSeatRole(declaration.seatRole), model: renderedSeatModel(declaration.model), source: 'declaration' };
   return null;
 }
 
@@ -406,14 +431,14 @@ export function laneRound(input: {
 }
 
 /** S6: S1 for every linked PR of the lane, number descending. */
-export function lanePullRequests(links: readonly BoardPullRequestLinkFact[], facts: BoardFacts, nowIso: string, policy: BoardPolicy): BoardPrStatus[] {
+export function lanePullRequests(links: readonly BoardPullRequestLinkFact[], facts: BoardFacts, nowIso: string, policy: BoardPolicy, readings: readonly SourceReading[] = facts.sources): BoardPrStatus[] {
   const seen = new Set<string>();
   const out: BoardPrStatus[] = [];
   for (const link of links) {
     const key = link.repository + '#' + String(link.number);
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push(pullRequestStatus(link.repository, link.number, facts, nowIso, policy));
+    out.push(pullRequestStatus(link.repository, link.number, facts, nowIso, policy, readings));
   }
   out.sort((a, b) => {
     if (a.number !== b.number) return b.number - a.number;
@@ -523,8 +548,8 @@ function pushAttemptRunning(out: BoardBadge[], input: BoardLaneBadgeInput): void
   out.push({
     kind: 'attempt-running',
     attemptId: attempt.id,
-    seatRole: attempt.seatRole,
-    model: attempt.model,
+    seatRole: renderedSeatRole(attempt.seatRole),
+    model: renderedSeatModel(attempt.model),
     state: attempt.state,
   });
 }
@@ -657,22 +682,5 @@ export function laneBadges(raw: BoardLaneBadgeInput): BoardBadge[] {
   pushMergeIntegrity(out, input);
   pushDeclaration(out, input);
   pushPlanLaneNotImported(out, input);
-  return out;
-}
-
-/** S8: the not-read forge readings for a set of repositories (synthesised when none is recorded). */
-export function forgeNotReadForRepos(repositories: readonly string[], readings: readonly SourceReading[]): SourceReading[] {
-  const seen = new Set<string>();
-  const out: SourceReading[] = [];
-  for (const repository of repositories) {
-    if (seen.has(repository)) continue;
-    seen.add(repository);
-    const reading = readings.find((r) => r.source === 'forge-observation' && r.repository === repository);
-    if (reading !== undefined) {
-      if (reading.status === 'not-read') out.push(reading);
-    } else {
-      out.push({ source: 'forge-observation', repository, readAtIso: null, status: 'not-read' });
-    }
-  }
   return out;
 }

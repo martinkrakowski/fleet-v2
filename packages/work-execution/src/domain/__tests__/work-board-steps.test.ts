@@ -758,6 +758,116 @@ describe('S8 not read extended', () => {
   });
 });
 
+describe('S4 rendered times (WB2a-2 fix 1)', () => {
+  // V8's Date.parse accepts parenthesised comments, so a bidi-wrapped comment parses to a number.
+  const BIDI_AS_OF = 'Oct 27 2026 09:30 GMT (\u202Emerged\u202C)';
+
+  it('a parseable non-ISO asOfIso renders from its parsed milliseconds, with no bidi text', () => {
+    const board = boardOf({
+      sources: forgeReadSources(),
+      links: [link(7)],
+      forgeObservations: [forgeObs([openPr(7)], { readAtIso: BIDI_AS_OF })],
+    });
+    const a1 = board.lanes.find((l) => l.key === A1_KEY);
+    expect(a1?.stepText).toBe('PR #7 open as of 2026-10-27T09:30:00.000Z, CI unknown; may have changed');
+    expect(a1?.stepText?.includes('\u202E')).toBe(false);
+  });
+
+  it('an unparseable asOfIso renders "an unreadable time" with the stale suffix', () => {
+    const board = boardOf({
+      sources: forgeReadSources(),
+      links: [link(7)],
+      forgeObservations: [forgeObs([openPr(7)], { readAtIso: 'not a time' })],
+    });
+    const a1 = board.lanes.find((l) => l.key === A1_KEY);
+    expect(a1?.stepText).toBe('PR #7 open as of an unreadable time, CI unknown; may have changed');
+  });
+
+  it('a parseable non-ISO declaredAtIso renders from its parsed milliseconds', () => {
+    const board = boardOf({
+      declarations: [{ lane: A1, step: 'code-review', seatRole: 'review', model: 'model-r', declaredAtIso: BIDI_AS_OF }],
+    });
+    const a1 = board.lanes.find((l) => l.key === A1_KEY);
+    expect(a1?.stepText).toBe('declared, not observed: code-review as of 2026-10-27T09:30:00.000Z');
+    expect(a1?.stepText?.includes('\u202E')).toBe(false);
+  });
+
+  it('an unparseable declaredAtIso renders "an unreadable time"', () => {
+    expect(boardStepText({ kind: 'declared', step: 'code-review', seatRole: 'review', model: 'model-r', declaredAtIso: 'not a time' }))
+      .toBe('declared, not observed: code-review as of an unreadable time');
+  });
+});
+
+describe('S5 seat plain text (WB2a-2 fix 1)', () => {
+  const BIDI_MODEL = 'model\u202E-e';
+
+  it('a model with bidi text becomes Unnamed seat in the seat, the declared step and the badge', () => {
+    const attemptBoard = boardOf({
+      workOrders: [wo('wo-example-1')],
+      attempts: [attempt('attempt-example-1', { model: BIDI_MODEL })],
+    });
+    const a1 = attemptBoard.lanes.find((l) => l.key === A1_KEY);
+    expect(a1?.placement).toBe('in-flight');
+    expect(a1?.seat).toEqual({ role: 'first-pass', model: 'Unnamed seat', source: 'attempt' });
+
+    const badgeBoard = boardOf({
+      workOrders: [wo('wo-example-1')],
+      attempts: [
+        attempt('attempt-example-1', { model: BIDI_MODEL, createdAtIso: '2026-10-27T08:00:00.000Z' }),
+        attempt('attempt-example-2', { state: 'ended', createdAtIso: '2026-10-27T09:00:00.000Z' }),
+      ],
+    });
+    const b1 = badgeBoard.lanes.find((l) => l.key === A1_KEY);
+    expect(b1?.badges.find((b) => b.kind === 'attempt-running')).toMatchObject({ attemptId: 'attempt-example-1', seatRole: 'first-pass', model: 'Unnamed seat' });
+
+    const declaredBoard = boardOf({
+      declarations: [{ lane: A1, step: 'code-review', seatRole: 'review', model: BIDI_MODEL, declaredAtIso: '2026-10-27T09:30:00.000Z' }],
+    });
+    const d1 = declaredBoard.lanes.find((l) => l.key === A1_KEY);
+    expect(d1?.step).toMatchObject({ kind: 'declared', model: 'Unnamed seat' });
+    expect(d1?.seat).toEqual({ role: 'review', model: 'Unnamed seat', source: 'declaration' });
+  });
+
+  it('a role that is not plain text becomes unknown role, never null', () => {
+    const board = boardOf({
+      declarations: [{ lane: A1, step: 'code-review', seatRole: 'review\u202E', model: 'model-r', declaredAtIso: '2026-10-27T09:30:00.000Z' }],
+    });
+    const a1 = board.lanes.find((l) => l.key === A1_KEY);
+    expect(a1?.step).toMatchObject({ kind: 'declared', seatRole: 'unknown role' });
+    expect(a1?.seat).toEqual({ role: 'unknown role', model: 'model-r', source: 'declaration' });
+  });
+});
+
+describe('S6 one forge reading per repository (WB2a-2 fix 1)', () => {
+  it('two forge readings for one repository (not-read first, then read) agree between the PR status and notRead', () => {
+    const sources = allReadSources().filter((r) => r.source !== 'forge-observation');
+    sources.push({ source: 'forge-observation', repository: REPO, readAtIso: null, status: 'not-read' });
+    sources.push({ source: 'forge-observation', repository: REPO, readAtIso: READ_AT, status: 'read' });
+    const board = boardOf({
+      sources,
+      links: [link(7)],
+      forgeObservations: [forgeObs([openPr(7)])],
+    });
+    const a1 = board.lanes.find((l) => l.key === A1_KEY);
+    expect(a1?.pullRequests[0]).toMatchObject({ state: 'open', source: 'forge-observation', asOfIso: READ_AT });
+    expect(a1?.notRead.every((r) => r.source !== 'forge-observation')).toBe(true);
+  });
+
+  it('the reverse order (read first, then not-read) makes both not-read', () => {
+    const sources = allReadSources().filter((r) => r.source !== 'forge-observation');
+    sources.push({ source: 'forge-observation', repository: REPO, readAtIso: READ_AT, status: 'read' });
+    sources.push({ source: 'forge-observation', repository: REPO, readAtIso: null, status: 'not-read' });
+    const board = boardOf({
+      sources,
+      links: [link(7)],
+      forgeObservations: [forgeObs([openPr(7)])],
+    });
+    const a1 = board.lanes.find((l) => l.key === A1_KEY);
+    expect(a1?.pullRequests[0]).toMatchObject({ state: 'not-read', source: 'none' });
+    expect(a1?.notRead).toContainEqual({ source: 'forge-observation', repository: REPO, readAtIso: null, status: 'not-read' });
+  });
+});
+
 describe('no guess', () => {
   it('a PR title attaching to a lane attaches to no lane', () => {
     const board = boardOf({

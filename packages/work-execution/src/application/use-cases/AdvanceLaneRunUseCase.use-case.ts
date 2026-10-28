@@ -972,6 +972,10 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     if (latest === null) {
       return { outcome: 'waiting', reason: 'facts-inconsistent' };
     }
+    // Shared by the act and the reconcile: an agy attempt is never collected without its edit-only commit.
+    if (latest.runner?.kind === 'agy' && this.deps.commitEditOnlyAttempt === undefined) {
+      return { outcome: 'not-wired', step: decision.step };
+    }
     if (latest.state !== 'ended' || latest.completionReceipt === null) {
       const resultRefusal = await this.appendRunResult(request, key, 'refused', 'no-completion-receipt');
       if (resultRefusal !== null) {
@@ -1447,6 +1451,11 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
     request: AdvanceLaneRunRequest,
   ): Promise<AdvanceLaneRunResult> {
+    // The G4e cancel journals under the stop key with its attempt id; a stop intent carries none.
+    const cancelAttemptId = await this.intentMintedIdOf(decision.key);
+    if (cancelAttemptId !== null) {
+      return this.reconcileCancel(cancelAttemptId, decision, request);
+    }
     const latest = gathered.latestAttempt;
     const stored = latest === null ? null : await this.deps.attemptRepo.findAttemptById(latest.id);
     const attempt = stored ?? latest;
@@ -1478,6 +1487,56 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'refused', reason: resultRefusal };
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-timeout' };
+  }
+
+  /**
+   * A pending G4e cancel intent (§3.9.1): settled as a cancel, never with stop semantics, so a
+   * never-dispatched attempt is never read as timed out. The cancel is record-only, so an attempt still
+   * `intent-recorded` is cancelled now; an already cancelled one is reported with the capacity it holds.
+   */
+  private async reconcileCancel(
+    attemptId: string,
+    decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const attempt = await this.deps.attemptRepo.findAttemptById(attemptId);
+    let outcome: LaneRunJournalOutcome;
+    let reasonCode: LaneRunResultReasonCode;
+    if (attempt === null) {
+      outcome = 'cancelled-unstarted';
+      reasonCode = 'attempt-absent';
+    } else if (attempt.state === 'cancelled') {
+      const reservations = await this.deps.executionJournal.listActiveReservations();
+      const held = reservations.some((reservation) => reservation.attemptId === attemptId && reservation.held);
+      outcome = 'cancelled-unstarted';
+      reasonCode = held ? 'capacity-held' : 'capacity-none-held';
+    } else if (attempt.state === 'intent-recorded') {
+      const cancel = this.deps.cancelPreparedAttempt;
+      if (cancel === undefined) {
+        return { outcome: 'not-wired', step: decision.step };
+      }
+      const cancelled = await cancel.cancelPreparedAttempt({ attemptId, nowIso: request.nowIso });
+      if (cancelled.outcome === 'cancelled') {
+        outcome = 'cancelled-unstarted';
+        reasonCode =
+          cancelled.capacity === 'released'
+            ? 'capacity-released'
+            : cancelled.capacity === 'none-held'
+              ? 'capacity-none-held'
+              : 'capacity-held';
+      } else {
+        outcome = 'refused';
+        reasonCode = cancelled.reason === 'changed' ? 'cancel-changed' : 'cancel-refused';
+      }
+    } else {
+      outcome = 'refused';
+      reasonCode = 'cancel-refused';
+    }
+    const resultRefusal = await this.appendRunResult(request, decision.key, outcome, reasonCode);
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: outcome, reasonCode };
   }
 
   /**
@@ -1558,8 +1617,19 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'worktree-unknown' };
     }
     const result = await this.deps.reconcileAttempt.reconcileAttempt({ attemptId: latest.id, nowIso: request.nowIso });
-    const outcome: LaneRunJournalOutcome = result.outcome === 'not-found' ? 'not-started' : 'reconciled';
-    const reasonCode: LaneRunResultReasonCode = result.outcome === 'not-found' ? 'attempt-absent' : 'reconciled';
+    // Only a settled answer is `reconciled`; a refused or unknown reconcile settles nothing and stays ambiguous.
+    let outcome: LaneRunJournalOutcome;
+    let reasonCode: LaneRunResultReasonCode;
+    if (result.outcome === 'not-found') {
+      outcome = 'not-started';
+      reasonCode = 'attempt-absent';
+    } else if (result.outcome === 'refused' || result.outcome === 'unknown') {
+      outcome = 'ambiguous';
+      reasonCode = 'dispatch-unknown';
+    } else {
+      outcome = 'reconciled';
+      reasonCode = 'reconciled';
+    }
     const resultRefusal = await this.appendRunResult(request, decision.key, outcome, reasonCode);
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };

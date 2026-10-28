@@ -616,6 +616,58 @@ describe('AdvanceLaneRunUseCase reconcile and crash-resume (K4-7)', () => {
     });
   }
 
+  it('test 7b: a pending cancel intent under the stop key is settled as a cancel, never stop-timeout', async () => {
+    for (const [state, expectedCode, cancels] of [
+      ['cancelled', 'capacity-none-held', 0],
+      ['intent-recorded', 'capacity-none-held', 1],
+    ] as const) {
+      const harness = await makeHarness(runRecord(), [attemptFixture({ state } as never)]);
+      const key = stopKey();
+      await appendIntent(harness, key, 'attempt-example-1', NOW);
+      const result = await advance(harness);
+      expect(result).toEqual({ outcome: 'acted', step: 'stop', key, result: 'cancelled-unstarted', reasonCode: expectedCode });
+      expect(harness.cancelRequests).toHaveLength(cancels);
+      expect(harness.stopRequests).toEqual([]);
+      const results = await resultsForKey(harness, key);
+      expect(results.map((entry) => entry.reasonCode)).toEqual([expectedCode]);
+    }
+  });
+
+  it('test 12b: a G4j force reconcile whose runner answers refused or unknown stays ambiguous, never reconciled', async () => {
+    for (const answer of ['refused', 'unknown'] as const) {
+      const harness = await makeHarness(runRecord(), [attemptFixture({ state: 'dispatching', sessionId: null } as never)]);
+      harness.setReconcileAnswer(
+        answer === 'refused'
+          ? ({ outcome: 'refused', reason: 'example refusal' } as never)
+          : ({ outcome: 'unknown', attempt: attemptFixture({ state: 'dispatching' } as never), reason: 'example transport died' } as never),
+      );
+      const key = reconcileKey();
+      await appendIntent(harness, key, 'attempt-example-1', NOW);
+      const result = await advance(harness);
+      expect(result).toMatchObject({ result: 'ambiguous', reasonCode: 'dispatch-unknown' });
+    }
+  });
+
+  it('test 8b: a collect reconcile of an agy attempt with no edit-only commit port is not-wired and collects nothing', async () => {
+    const agyEnded = attemptFixture({
+      state: 'ended',
+      runner: { kind: 'agy', hostName: 'lane-host', remotePort: null, host: null, agent: null, model: 'model-example-1', variant: null },
+    } as never);
+    const harness = await makeHarness(runRecord(), [agyEnded]);
+    const rest: AdvanceLaneRunDependencies = { ...harness.deps, commitEditOnlyAttempt: undefined };
+    const key = collectKey();
+    await appendIntent(harness, key, null, NOW);
+    const result = await new AdvanceLaneRunUseCase(rest).advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+    expect(result).toEqual({ outcome: 'not-wired', step: 'collect' });
+    expect(harness.collectRequests).toEqual([]);
+    expect(await resultsForKey(harness, key)).toEqual([]);
+  });
+
   it('test 6b: a crash after the prepare save but before its result appends the result once and keeps one id', async () => {
     const harness = await makeHarness(runRecord({ attemptIds: ['attempt-example-1'] }), [attemptFixture()]);
     const key = stepKey({ round: 0, step: 'prepare', seatIndex: 0, attemptOrdinal: 1, head12: null });

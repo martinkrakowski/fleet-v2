@@ -952,4 +952,47 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
     expect(harness.collectRequests).toHaveLength(0);
     expect(await harness.runJournal.listForRun(RUN_ID)).toHaveLength(1);
   });
+
+  it('test 12: a forced-stop reconcile reads the reservation: a still-held slot is stop-force-slot-held, else stop-force', async () => {
+    const terminal = () => attemptFixture({ state: 'ended', sessionId: 'session-example-1', completionReceipt: receipt() });
+
+    const heldHarness = await makeHarness(runRecord(), [terminal()]);
+    await conduct(heldHarness, 'running', NOW);
+    await appendStopIntent(heldHarness, 'force', NOW);
+    await appendIntent(heldHarness, stopKey(), null, NOW);
+    await heldHarness.executionJournal.saveCapacityReservation({
+      id: heldHarness.deps.newUlid(),
+      attemptId: 'attempt-example-1',
+      hostId: 'host-example-1',
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      reservedAtIso: NOW,
+      releasedAtIso: null,
+    });
+    const held = await advance(heldHarness);
+    expect(held).toEqual({
+      outcome: 'acted',
+      step: 'stop',
+      key: stopKey(),
+      result: 'completed',
+      reasonCode: 'stop-force-slot-held',
+    });
+    expect(heldHarness.stopRequests).toHaveLength(0);
+    expect(await lastJournalState(heldHarness)).toBe('stopped');
+
+    const releasedHarness = await makeHarness(runRecord(), [terminal()]);
+    await conduct(releasedHarness, 'running', NOW);
+    await appendStopIntent(releasedHarness, 'force', NOW);
+    await appendIntent(releasedHarness, stopKey(), null, NOW);
+    const released = await advance(releasedHarness);
+    expect(released).toEqual({
+      outcome: 'acted',
+      step: 'stop',
+      key: stopKey(),
+      result: 'completed',
+      reasonCode: 'stop-force',
+    });
+    expect(await lastJournalState(releasedHarness)).toBe('stopped');
+  });
 });

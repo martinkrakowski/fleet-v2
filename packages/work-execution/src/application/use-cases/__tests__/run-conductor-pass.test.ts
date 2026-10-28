@@ -15,6 +15,7 @@ import { ConductorDriverLeaseAdapter } from '../../../infrastructure/adapters/Co
 import { ConductorHaltAdapter } from '../../../infrastructure/adapters/ConductorHaltAdapter.adapter.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
+import type { ConductorDriverLeasePort } from '../../ports/out/ConductorDriverLeasePort.out-port.js';
 import type { AdvanceLaneRunPort, AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import type { RunConductorPassResult } from '../../ports/in/RunConductorPassPort.in-port.js';
 import { ResumeLaneRunUseCase } from '../ResumeLaneRunUseCase.use-case.js';
@@ -111,7 +112,7 @@ async function createRun(repo: LaneRunRepositoryAdapter, overrides: Partial<Lane
   return record;
 }
 
-function useCase(fx: Stores, advance: ScriptedAdvance, resume?: ResumeLaneRunUseCase): RunConductorPassUseCase {
+function useCase(fx: Stores, advance: ScriptedAdvance, resume?: ResumeLaneRunUseCase, now: () => string = () => NOW): RunConductorPassUseCase {
   return new RunConductorPassUseCase({
     driverLease: fx.driverLease,
     runRepo: fx.repo,
@@ -119,6 +120,7 @@ function useCase(fx: Stores, advance: ScriptedAdvance, resume?: ResumeLaneRunUse
     halt: fx.halt,
     resume: resume ?? { applyPendingResume: async () => ({ outcome: 'none' }) },
     advance,
+    now,
   });
 }
 
@@ -128,8 +130,9 @@ async function runPass(
   nowIso: string,
   advance: ScriptedAdvance,
   resume?: ResumeLaneRunUseCase,
+  now: () => string = () => nowIso,
 ): Promise<RunConductorPassResult> {
-  return useCase(fx, advance, resume).runPass({ holderId, nowIso });
+  return useCase(fx, advance, resume, now).runPass({ holderId, nowIso });
 }
 
 describe('RunConductorPassUseCase driver lease', () => {
@@ -293,6 +296,7 @@ describe('RunConductorPassUseCase halt', () => {
       halt: { read: async () => ({ state: 'unreadable' }) },
       resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
       advance,
+      now: () => NOW,
     });
     const result = await useCase.runPass({ holderId: HOLDER, nowIso: NOW });
     expect(result).toMatchObject({ outcome: 'completed', halted: true });
@@ -400,5 +404,96 @@ describe('RunConductorPassUseCase releaseLeases', () => {
     expect(again).toMatchObject({ outcome: 'completed' });
     expect(await fx.driverLease.read()).toMatchObject({ holderId: HOLDER_3, fence: 2 });
     expect((await fx.repo.get(RUN_ID))?.lease).toMatchObject({ holderId: HOLDER_3, fence: 2 });
+  });
+});
+
+describe('RunConductorPassUseCase per-step lease renewal', () => {
+  it('a second holder taking the driver lease between steps ends the pass before its next step', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    let advanceCalls = 0;
+    const advance: AdvanceLaneRunPort = {
+      async advanceLaneRun(_request: AdvanceLaneRunRequest): Promise<AdvanceLaneRunResult> {
+        advanceCalls += 1;
+        if (advanceCalls === 1) {
+          // After the first step the driver lease lapses; a second driver takes over.
+          await fx.driverLease.acquire({
+            holderId: HOLDER_2,
+            observedFence: 1,
+            leaseUntilIso: '2026-10-27T10:11:00.000Z',
+            nowIso: LATER,
+          });
+        }
+        return { outcome: 'entered', state: 'dispatching' };
+      },
+    };
+    // The clock reads NOW at the pass start and the first step, then LATER
+    // (after the takeover) before the second step.
+    const times = [NOW, NOW, LATER];
+    let index = 0;
+    const clock = () => times[Math.min(index++, times.length - 1)];
+    const pass = new RunConductorPassUseCase({
+      driverLease: fx.driverLease,
+      runRepo: fx.repo,
+      runJournal: fx.journal,
+      halt: fx.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: clock,
+    });
+    const result = await pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toEqual({ outcome: 'refused', reason: 'driver-lease-held' });
+    expect(advanceCalls).toBe(1);
+    expect(await fx.driverLease.read()).toMatchObject({ holderId: HOLDER_2, fence: 2 });
+  });
+
+  it('a normal multi-step run renews the driver and run leases before each step', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    const results: AdvanceLaneRunResult[] = [
+      { outcome: 'entered', state: 'dispatching' },
+      { outcome: 'entered', state: 'dispatching' },
+      { outcome: 'waiting', reason: 'admission' },
+    ];
+    const advance = new ScriptedAdvance(new Map([[RUN_ID, results]]));
+
+    let driverRenews = 0;
+    let runRenews = 0;
+    const driverLease = fx.driverLease;
+    const wrappedDriver: ConductorDriverLeasePort = {
+      read: () => driverLease.read(),
+      acquire: (request) => driverLease.acquire(request),
+      renew: (request) => {
+        driverRenews += 1;
+        return driverLease.renew(request);
+      },
+      release: (request) => driverLease.release(request),
+      check: (request) => driverLease.check(request),
+    };
+    const repo = fx.repo;
+    const wrappedRepo = {
+      list: () => repo.list(),
+      acquireLease: (runId: string, request: Parameters<typeof repo.acquireLease>[1]) => repo.acquireLease(runId, request),
+      renewLease: (runId: string, request: Parameters<typeof repo.renewLease>[1]) => {
+        runRenews += 1;
+        return repo.renewLease(runId, request);
+      },
+      releaseLease: (runId: string, request: Parameters<typeof repo.releaseLease>[1]) => repo.releaseLease(runId, request),
+    };
+
+    const pass = new RunConductorPassUseCase({
+      driverLease: wrappedDriver,
+      runRepo: wrappedRepo,
+      runJournal: fx.journal,
+      halt: fx.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: () => NOW,
+    });
+    const result = await pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed', progressed: true });
+    expect(advance.calls).toHaveLength(3);
+    expect(driverRenews).toBe(3);
+    expect(runRenews).toBe(3);
   });
 });

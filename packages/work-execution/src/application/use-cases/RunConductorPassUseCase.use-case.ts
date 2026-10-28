@@ -4,9 +4,13 @@
  * driver lease, reads the halt marker, and for each non-terminal run takes or
  * renews its run lease, applies a recorded resume (K7-3), then calls
  * `advanceLaneRun` until the run waits, parks, ends or refuses, at most eight
- * steps. The CLI loops over passes with back-off; `releaseLeases` releases
- * every lease the holder holds on shutdown. Time enters only as `nowIso`; ids
- * come from the caller.
+ * steps. Before each step it reads a fresh time from the `now` clock and renews
+ * the driver lease and the run's lease, so a pass never outlives its lease
+ * window; a refused or other-held renewal ends the pass (driver) or stops
+ * acting on that run (run). The CLI loops over passes with back-off;
+ * `releaseLeases` releases every lease the holder holds on shutdown. Time
+ * enters through the `now` clock (real time in production, a fake in tests);
+ * ids come from the caller.
  */
 
 import { isConductorHalted, isZonedIsoDateTime } from '../../domain/conductor-halt.js';
@@ -41,6 +45,11 @@ export interface RunConductorPassDependencies {
   readonly halt: Pick<ConductorHaltPort, 'read'>;
   readonly resume: Pick<ResumeLaneRunPort, 'applyPendingResume'>;
   readonly advance: AdvanceLaneRunPort;
+  /**
+   * The pass clock, read fresh before each step; production passes real time,
+   * tests a fake. When absent the system clock supplies the time.
+   */
+  readonly now?: () => string;
 }
 
 const ID_MAX_BYTES = 256;
@@ -72,26 +81,26 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
   constructor(private readonly deps: RunConductorPassDependencies) {}
 
   async runPass(request: RunConductorPassRequest): Promise<RunConductorPassResult> {
-    if (!isValidHolderId(request.holderId) || !isZonedIsoDateTime(request.nowIso)) {
+    if (!isValidHolderId(request.holderId)) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
-    const until = leaseUntilIso(request.nowIso);
+    const nowIso = this.nowIso();
+    if (!isZonedIsoDateTime(nowIso)) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    const until = leaseUntilIso(nowIso);
+
+    const renewDriver = (renew: LeaseRenewRequest) =>
+      this.deps.driverLease.renew(renew).then((result) =>
+        result.outcome === 'ok' ? withoutLeaseVersion(result.lease) : null,
+      );
+    const acquireDriver = (acquire: LeaseAcquireRequest) =>
+      this.deps.driverLease.acquire(acquire).then((result) =>
+        result.outcome === 'ok' ? withoutLeaseVersion(result.lease) : null,
+      );
 
     const driverLease = withoutLeaseVersion(await this.deps.driverLease.read());
-    const driverHeld = await this.holdLease(
-      driverLease,
-      request.holderId,
-      request.nowIso,
-      until,
-      (renew) =>
-        this.deps.driverLease.renew(renew).then((result) =>
-          result.outcome === 'ok' ? withoutLeaseVersion(result.lease) : null,
-        ),
-      (acquire) =>
-        this.deps.driverLease.acquire(acquire).then((result) =>
-          result.outcome === 'ok' ? withoutLeaseVersion(result.lease) : null,
-        ),
-    );
+    const driverHeld = await this.holdLease(driverLease, request.holderId, nowIso, until, renewDriver, acquireDriver);
     if (driverHeld.outcome === 'held-by-other') {
       return { outcome: 'refused', reason: 'driver-lease-held' };
     }
@@ -118,20 +127,16 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
     // Each run's steps depend on the previous result, and one driver acting on
     // one run at a time keeps the host budget; a for…of with await is intended.
     for (const record of liveRuns) {
-      const runHeld = await this.holdLease(
-        record.lease,
-        request.holderId,
-        request.nowIso,
-        until,
-        (renew) =>
-          this.deps.runRepo.renewLease(record.runId, renew).then((result) =>
-            result.outcome === 'saved' ? result.record.lease : null,
-          ),
-        (acquire) =>
-          this.deps.runRepo.acquireLease(record.runId, acquire).then((result) =>
-            result.outcome === 'saved' ? result.record.lease : null,
-          ),
-      );
+      const renewRun = (renew: LeaseRenewRequest) =>
+        this.deps.runRepo.renewLease(record.runId, renew).then((result) =>
+          result.outcome === 'saved' ? result.record.lease : null,
+        );
+      const acquireRun = (acquire: LeaseAcquireRequest) =>
+        this.deps.runRepo.acquireLease(record.runId, acquire).then((result) =>
+          result.outcome === 'saved' ? result.record.lease : null,
+        );
+
+      const runHeld = await this.holdLease(record.lease, request.holderId, nowIso, until, renewRun, acquireRun);
       if (runHeld.outcome === 'held-by-other') {
         reports.push({ runId: record.runId, outcome: 'skipped', reason: 'lease-held' });
         continue;
@@ -141,11 +146,15 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
         continue;
       }
 
-      const lease = { holderId: request.holderId, fence: runHeld.lease.fence };
+      let lease: LaneRunLeaseRecord = {
+        holderId: request.holderId,
+        fence: runHeld.lease.fence,
+        leaseUntilIso: runHeld.lease.leaseUntilIso,
+      };
       const resumed = await this.deps.resume.applyPendingResume({
         runId: record.runId,
-        lease,
-        nowIso: request.nowIso,
+        lease: { holderId: lease.holderId, fence: lease.fence },
+        nowIso,
       });
       if (resumed.outcome === 'refused' && resumed.reason === 'save-refused') {
         reports.push({ runId: record.runId, outcome: 'resume-refused', reason: resumed.reason });
@@ -155,11 +164,55 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
       const steps: AdvanceLaneRunResult[] = [];
       let finished = false;
       while (steps.length < CONDUCTOR_MAX_STEPS_PER_RUN && !finished) {
+        // Fresh time before each step: renew the driver and run leases with it,
+        // so a pass never outlives its lease window.
+        const stepNowIso = this.nowIso();
+        if (!isZonedIsoDateTime(stepNowIso)) {
+          return { outcome: 'refused', reason: 'invalid-request' };
+        }
+        const stepUntil = leaseUntilIso(stepNowIso);
+
+        // Renew the driver lease; refused or held by another ends the pass.
+        const driverLeaseNow = withoutLeaseVersion(await this.deps.driverLease.read());
+        const driverRenewed = await this.holdLease(
+          driverLeaseNow,
+          request.holderId,
+          stepNowIso,
+          stepUntil,
+          renewDriver,
+          acquireDriver,
+        );
+        if (driverRenewed.outcome === 'held-by-other') {
+          return { outcome: 'refused', reason: 'driver-lease-held' };
+        }
+        if (driverRenewed.outcome === 'refused') {
+          return { outcome: 'refused', reason: 'driver-lease-refused' };
+        }
+
+        // Renew this run's lease; refused or held by another stops acting on it.
+        const runRenewed = await this.holdLease(
+          lease,
+          request.holderId,
+          stepNowIso,
+          stepUntil,
+          renewRun,
+          acquireRun,
+        );
+        if (runRenewed.outcome === 'held-by-other') {
+          reports.push({ runId: record.runId, outcome: 'skipped', reason: 'lease-held' });
+          continue;
+        }
+        if (runRenewed.outcome === 'refused') {
+          reports.push({ runId: record.runId, outcome: 'skipped', reason: 'lease-refused' });
+          continue;
+        }
+        lease = runRenewed.lease;
+
         const step = await this.deps.advance.advanceLaneRun({
           runId: record.runId,
-          lease,
+          lease: { holderId: lease.holderId, fence: lease.fence },
           halted,
-          nowIso: request.nowIso,
+          nowIso: stepNowIso,
         });
         steps.push(step);
         if (step.outcome === 'waiting' && step.reason === 'stop-grace-exceeded') {
@@ -210,6 +263,11 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
       }
     }
     return { released };
+  }
+
+  /** The pass clock, read fresh before each step; production real time, tests a fake. */
+  private nowIso(): string {
+    return this.deps.now?.() ?? new Date().toISOString();
   }
 
   /** Take or renew one lease by CAS; another live holder is 'held-by-other', a refused write 'refused'. */

@@ -111,7 +111,7 @@ describe('AttentionItem', () => {
     expect(raiseResult({ summary: '' }).success).toBe(false);
     expect(raiseResult({ summary: 'a'.repeat(1025) }).success).toBe(false);
     expect(raiseResult({ summary: 'two\nlines' }).success).toBe(false);
-    expect(raiseResult({ summary: 'reversed‮text' }).success).toBe(false);
+    expect(raiseResult({ summary: 'reversed\u202etext' }).success).toBe(false);
     expect(raiseResult({ summary: fakeSecretShape() }).success).toBe(false);
     expect(raiseResult({ raisedBy: 'auto merge' }).success).toBe(false);
     expect(raiseResult({ raisedBy: fakeSecretShape() }).success).toBe(false);

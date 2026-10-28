@@ -1282,11 +1282,11 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       attempt !== null &&
       attempt.state === 'cancelled' &&
       attempt.sessionId === null &&
-      (attempt.stopReason ?? 'none') === 'none' &&
-      attempt.outcome === 'stopped'
+      !(await this.dispatchEverJournalled(attempt.id))
     ) {
-      // Re-entry after a crash between the idle-worktree cancel and its result: CancelPreparedAttempt
-      // leaves the stop reason 'none', a runner refusal always records a class, so this was never dispatched.
+      // Re-entry after a crash between the idle-worktree cancel and its result. DispatchAttempt journals a
+      // `dispatch` intent before it contacts any runner, so a cancelled attempt with no such entry never
+      // reached a runner, whoever cancelled it; one with an entry did, and stays runner-refused below.
       return this.closeDispatchNotStarted(decision, request);
     }
     if (attempt !== null && attempt.state === 'cancelled') {
@@ -1414,6 +1414,12 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       }
     }
     return this.closeDispatchNotStarted(decision, request);
+  }
+
+  /** True when the execution journal holds a non-refused `dispatch` entry for the attempt (a runner may have been contacted). */
+  private async dispatchEverJournalled(attemptId: string): Promise<boolean> {
+    const entries = await this.deps.executionJournal.listJournalEntriesForAttempt(attemptId);
+    return entries.some((entry) => entry.action === 'dispatch' && entry.status !== 'refused');
   }
 
   /** The dispatch key's `not-started` / `worktree-idle` result, once its untouched attempt is cancelled. */

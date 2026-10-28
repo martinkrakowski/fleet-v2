@@ -593,14 +593,28 @@ describe('AdvanceLaneRunUseCase reconcile and crash-resume (K4-7)', () => {
     expect(harness.dispatchRequests).toEqual([]);
   });
 
-  it('test 2d: a runner-refused cancelled attempt (a stop reason class recorded) stays runner-refused', async () => {
-    const harness = await makeHarness(runRecord(), [
-      attemptFixture({ state: 'cancelled', outcome: 'stopped', sessionId: null, stopReason: 'no-route' } as never),
-    ]);
-    const key = dispatchKey();
-    await appendIntent(harness, key, 'attempt-example-1', NOW);
-    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'dispatch', key, result: 'refused', reasonCode: 'runner-refused' });
-  });
+  for (const [label, shape] of [
+    ['a runner refusal (stop reason recorded)', { state: 'cancelled', sessionId: null, stopReason: 'no-route' }],
+    ['a session-less reconcile or stop abort (outcome stopped, no stop reason)', { state: 'cancelled', outcome: 'stopped', sessionId: null }],
+  ] as const) {
+    it(`test 2d: a cancelled attempt that was dispatched (${label}) stays runner-refused, never not-started`, async () => {
+      const harness = await makeHarness(runRecord(), [attemptFixture(shape as never)]);
+      // DispatchAttempt journals its intent before it contacts any runner.
+      await harness.executionJournal.appendJournalEntry({
+        attemptId: 'attempt-example-1',
+        workOrderId: 'wo-example-1',
+        action: 'dispatch',
+        baseCommit: 'a'.repeat(40),
+        recordedAtIso: NOW,
+        status: 'intent-recorded',
+        sessionId: null,
+        detail: 'Dispatch intent recorded before runner start',
+      } as never);
+      const key = dispatchKey();
+      await appendIntent(harness, key, 'attempt-example-1', NOW);
+      expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'dispatch', key, result: 'refused', reasonCode: 'runner-refused' });
+    });
+  }
 
   it('test 6b: a crash after the prepare save but before its result appends the result once and keeps one id', async () => {
     const harness = await makeHarness(runRecord({ attemptIds: ['attempt-example-1'] }), [attemptFixture()]);

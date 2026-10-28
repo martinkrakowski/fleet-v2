@@ -10,6 +10,11 @@
 import type {
   ReviewFindingRecord,
   ReviewReceiptRecord,
+  ReviewKind,
+} from '../evidence-records.js';
+import {
+  REVIEW_KINDS,
+  REVIEW_REQUEST_ID_PATTERN,
 } from '../evidence-records.js';
 import type { EvidenceResultValue } from '../value-objects/EvidenceResult.vo.js';
 import { EVIDENCE_RESULTS } from '../value-objects/EvidenceResult.vo.js';
@@ -29,6 +34,10 @@ export interface ReviewReceiptProps {
   readonly evidenceRef: string;
   readonly policyRevision: string;
   readonly completedAtIso: string;
+  /** The review kind (§3.3); absent on receipts recorded before the conductor, read as `code-review`. */
+  readonly kind?: ReviewKind;
+  /** The conductor's request id (§3.5); absent on manual reviews. */
+  readonly requestId?: string;
 }
 
 function isNonEmptyTrimmedString(value: unknown): value is string {
@@ -162,6 +171,27 @@ export class ReviewReceipt {
         error: new Error('ReviewReceipt contains an invalid finding'),
       };
     }
+    if (props.kind !== undefined && !REVIEW_KINDS.includes(props.kind)) {
+      return {
+        success: false,
+        error: new Error('ReviewReceipt has an invalid kind: ' + String(props.kind)),
+      };
+    }
+    if (
+      props.requestId !== undefined &&
+      (typeof props.requestId !== 'string' || !REVIEW_REQUEST_ID_PATTERN.test(props.requestId))
+    ) {
+      return {
+        success: false,
+        error: new Error('ReviewReceipt has an invalid requestId'),
+      };
+    }
+    if (props.requestId !== undefined && props.kind === undefined) {
+      return {
+        success: false,
+        error: new Error('ReviewReceipt with a requestId requires a kind'),
+      };
+    }
     return {
       success: true,
       value: new ReviewReceipt({ ...props, findings: [...props.findings] }),
@@ -202,6 +232,14 @@ export class ReviewReceipt {
 
   getFindings(): readonly ReviewFindingRecord[] {
     return this.props.findings;
+  }
+
+  getKind(): ReviewKind | undefined {
+    return this.props.kind;
+  }
+
+  getRequestId(): string | undefined {
+    return this.props.requestId;
   }
 
   /** A review only proves the head it was produced for. */

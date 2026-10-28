@@ -125,6 +125,7 @@ describe('ForgeActionAdapter refusal kinds', () => {
       pullRequest: {
         number: 12,
         state: 'open',
+        mergeState: 'clean',
         headSha: HEAD_SHA,
         headRef: LANE_BRANCH,
         baseRef: 'main',

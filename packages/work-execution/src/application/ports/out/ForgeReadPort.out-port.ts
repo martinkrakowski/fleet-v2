@@ -24,9 +24,18 @@ export interface ReadPullRequestRequest {
 
 export type PullRequestState = 'open' | 'merged' | 'closed';
 
+/**
+ * Whether the branch merges without conflict (clean), is behind the base
+ * (behind), or is blocked by conflict or failing checks (blocked); unknown
+ * when the forge does not answer.
+ */
+export type PullRequestMergeState = 'clean' | 'behind' | 'blocked' | 'unknown';
+
 export interface PullRequestSnapshot {
   readonly number: number;
   readonly state: PullRequestState;
+  /** The forge's merge state: CLEAN → clean, BEHIND → behind, BLOCKED/DIRTY/UNSTABLE → blocked, else unknown. */
+  readonly mergeState: PullRequestMergeState;
   /** The PR's current head commit (40 hex). */
   readonly headSha: string;
   readonly headRef: string;

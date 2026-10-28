@@ -236,8 +236,10 @@ export function seatPlanFamilyConflicts(plan: SeatPlan, sameFamily: SameModelFam
 
 /**
  * Classify a runner's refusal text into a stop reason. Order matters: a
- * missing model, then payment, then rate limits and quota, then timeouts;
- * anything else is `runner-refused`. The text is matched, never stored.
+ * missing model, then payment, then rate limits and quota, then timeouts,
+ * then a provider with no route or endpoint for the model (`no-route`; a
+ * host-level 'no route to host' is not one); anything else is
+ * `runner-refused`. The text is matched, never stored.
  */
 export function classifyRunnerRefusal(reason: string): StopReasonValue {
   const text = reason.toLowerCase();
@@ -252,6 +254,9 @@ export function classifyRunnerRefusal(reason: string): StopReasonValue {
   }
   if (/timed? ?out|deadline exceeded|etimedout/.test(text)) {
     return 'timeout';
+  }
+  if (/no endpoints? (?:found|available)|no route(?! to host)|no allowed providers|no providers? (?:are )?available/.test(text)) {
+    return 'no-route';
   }
   return 'runner-refused';
 }

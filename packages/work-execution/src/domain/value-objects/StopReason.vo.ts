@@ -1,9 +1,12 @@
-// Value object refined for lane S1a (seat plan and attempt record).
+// Value object refined for lanes S1a and SR1a (seat plan, attempt record, no-route).
 /**
  * StopReason is the typed class of why an attempt stopped. `none` means it
  * ended normally; `unknown` is how a record written before the field existed
  * reads, and it never triggers a fallback seat. The model-refusal classes
  * keep a model out of the rest of its lane: the domain holds no reset clock.
+ * `no-route` (SR1a, D9) is a provider saying it has no route or endpoint for
+ * the model; like the other model-refusal classes it keeps that model out of
+ * the rest of the lane.
  */
 
 export const STOP_REASONS = [
@@ -18,6 +21,7 @@ export const STOP_REASONS = [
   'length',
   'step-cap',
   'runner-refused',
+  'no-route',
 ] as const;
 
 export type StopReasonValue = (typeof STOP_REASONS)[number];
@@ -33,6 +37,7 @@ export const MODEL_REFUSAL_CLASSES: readonly StopReasonValue[] = [
   'payment',
   'timeout',
   'model-missing',
+  'no-route',
 ];
 
 const STOP_REASON_VALUES: readonly string[] = STOP_REASONS;

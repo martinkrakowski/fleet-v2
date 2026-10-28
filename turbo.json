@@ -1,9 +1,13 @@
 {
   "$schema": "https://turbo.build/schema.json",
   "agentGuidance": false,
+  "envMode": "strict",
+  "globalDependencies": [".nvmrc", "tsconfig.base.json", "yarn.lock"],
+  "globalPassThroughEnv": ["HOME", "PATH", "USER", "SHELL", "LANG", "TERM", "CI", "GITHUB_ACTIONS"],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
+      "env": ["NEXT_PUBLIC_FLEET_API_URL"],
       "outputs": [
         "dist/**",
         ".next/**",
@@ -25,7 +29,14 @@
       "cache": true
     },
     "test": {
-      "dependsOn": ["^build"]
+      "dependsOn": ["^build"],
+      "env": ["OCM_IT_REQUIRE", "OCM_IT_SCRIPT", "NEXT_PUBLIC_FLEET_API_URL"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/bin/ocm-run",
+        "$TURBO_ROOT$/bin/agy-run",
+        "$TURBO_ROOT$/installation.example/**"
+      ]
     }
   }
 }

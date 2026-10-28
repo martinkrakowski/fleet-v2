@@ -1,0 +1,18 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "test": {
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/bin/ocm-run",
+        "$TURBO_ROOT$/bin/agy-run",
+        "$TURBO_ROOT$/installation.example/**",
+        "$TURBO_ROOT$/apps/cli/src/**",
+        "$TURBO_ROOT$/apps/web/src/**",
+        "$TURBO_ROOT$/packages/onboarding/src/**",
+        "$TURBO_ROOT$/packages/tooling/src/**"
+      ]
+    }
+  }
+}

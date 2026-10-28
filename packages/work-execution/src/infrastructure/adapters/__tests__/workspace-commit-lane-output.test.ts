@@ -30,6 +30,7 @@ const defaultRequest: CommitLaneOutputRequest = {
   expectedHead: HEAD_A,
   attemptId: DEFAULT_ATTEMPT,
   implementerModel: DEFAULT_MODEL,
+  allowedPathPrefixes: ['packages/example/'],
 };
 
 /** One fake executor run's answer, keyed by the git subcommand or tail. */
@@ -59,6 +60,9 @@ const happyAnswers: Record<string, CommandRunResult> = {
   'add -A -- .': { exitCode: 0, signal: null, stdout: '', stderr: '' },
   'write-tree': { exitCode: 0, signal: null, stdout: TREE_2 + '\n', stderr: '' },
   'rev-parse --verify HEAD^{tree}': { exitCode: 0, signal: null, stdout: TREE_1 + '\n', stderr: '' },
+  ['diff-tree -r --no-renames --name-only -z ' + HEAD_A + ' ' + TREE_2]: {
+    exitCode: 0, signal: null, stdout: 'packages/example/a.ts\0', stderr: '',
+  },
   'commit-tree': { exitCode: 0, signal: null, stdout: NEW + '\n', stderr: '' },
   'update-ref': { exitCode: 0, signal: null, stdout: '', stderr: '' },
 };
@@ -88,7 +92,7 @@ describe('WorkspaceAdapter commitLaneOutput', () => {
     });
     const subcommands = recorded.map((argv) => argv[3 + COMMIT_CONFIG.length]);
     expect(subcommands).toEqual([
-      'rev-parse', 'symbolic-ref', 'add', 'write-tree', 'rev-parse', 'commit-tree', 'update-ref',
+      'rev-parse', 'symbolic-ref', 'add', 'write-tree', 'rev-parse', 'diff-tree', 'commit-tree', 'update-ref',
     ]);
     for (const argv of recorded) {
       expect(argv.slice(0, 3 + COMMIT_CONFIG.length)).toEqual(['git', '-C', WORKTREE, ...COMMIT_CONFIG]);
@@ -118,14 +122,81 @@ describe('WorkspaceAdapter commitLaneOutput', () => {
     expect(subcommands).not.toContain('update-ref');
   });
 
+  it('refuses outside-allowed-paths when the staged tree touches a path outside the prefixes', async () => {
+    const answers: Record<string, CommandRunResult> = {
+      ...happyAnswers,
+      ['diff-tree -r --no-renames --name-only -z ' + HEAD_A + ' ' + TREE_2]: {
+        exitCode: 0, signal: null, stdout: 'packages/example/a.ts\0scripts/late.sh\0', stderr: '',
+      },
+    };
+    const { executor, recorded } = scripted(answers);
+    const adapter = new WorkspaceAdapter({ executor });
+    const result = await adapter.commitLaneOutput!(defaultRequest);
+    expect(result).toEqual({ outcome: 'refused', reason: 'outside-allowed-paths' });
+    const subcommands = recorded.map((argv) => argv[3 + COMMIT_CONFIG.length]);
+    expect(subcommands).not.toContain('commit-tree');
+    expect(subcommands).not.toContain('update-ref');
+  });
+
+  it('accepts a prefix without a trailing slash and refuses a sibling prefix path', async () => {
+    const acceptAnswers: Record<string, CommandRunResult> = {
+      ...happyAnswers,
+      ['diff-tree -r --no-renames --name-only -z ' + HEAD_A + ' ' + TREE_2]: {
+        exitCode: 0, signal: null, stdout: 'packages/example/a.ts\0', stderr: '',
+      },
+    };
+    const accept = scripted(acceptAnswers);
+    const acceptResult = await new WorkspaceAdapter({ executor: accept.executor })
+      .commitLaneOutput!({ ...defaultRequest, allowedPathPrefixes: ['packages/example'] });
+    expect(acceptResult).toEqual({ outcome: 'committed', headCommit: NEW, branchRef: BRANCH });
+
+    const refuseAnswers: Record<string, CommandRunResult> = {
+      ...happyAnswers,
+      ['diff-tree -r --no-renames --name-only -z ' + HEAD_A + ' ' + TREE_2]: {
+        exitCode: 0, signal: null, stdout: 'packages/example-other/a.ts\0', stderr: '',
+      },
+    };
+    const refuse = scripted(refuseAnswers);
+    const refuseResult = await new WorkspaceAdapter({ executor: refuse.executor })
+      .commitLaneOutput!({ ...defaultRequest, allowedPathPrefixes: ['packages/example'] });
+    expect(refuseResult).toEqual({ outcome: 'refused', reason: 'outside-allowed-paths' });
+    const subcommands = refuse.recorded.map((argv) => argv[3 + COMMIT_CONFIG.length]);
+    expect(subcommands).not.toContain('commit-tree');
+    expect(subcommands).not.toContain('update-ref');
+  });
+
+  it('refuses invalid requests when no allowed path prefix is given, before any command', async () => {
+    const { executor, recorded } = scripted(happyAnswers);
+    const adapter = new WorkspaceAdapter({ executor });
+    const requests: CommitLaneOutputRequest[] = [
+      { ...defaultRequest, allowedPathPrefixes: [] },
+      { ...defaultRequest, allowedPathPrefixes: [''] },
+    ];
+    for (const request of requests) {
+      const result = await adapter.commitLaneOutput!(request);
+      expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    }
+    expect(recorded).toEqual([]);
+  });
+
+  it('reports an error with a fixed reason when diff-tree fails', async () => {
+    const answers: Record<string, CommandRunResult> = {
+      ...happyAnswers,
+      ['diff-tree -r --no-renames --name-only -z ' + HEAD_A + ' ' + TREE_2]: {
+        exitCode: 128, signal: null, stdout: '', stderr: 'XYZZY',
+      },
+    };
+    const { executor } = scripted(answers);
+    const adapter = new WorkspaceAdapter({ executor });
+    const result = await adapter.commitLaneOutput!(defaultRequest);
+    expect(result).toEqual({ outcome: 'error', reason: 'git diff-tree failed' });
+  });
+
   it('refuses head-moved when HEAD moved without the attempt commit', async () => {
     const answers: Record<string, CommandRunResult> = {
       ...happyAnswers,
       'rev-parse --verify HEAD^{commit}': { exitCode: 0, signal: null, stdout: HEAD_B + '\n', stderr: '' },
       'show -s --format=%P HEAD': { exitCode: 0, signal: null, stdout: PARENT_D + '\n', stderr: '' },
-      'show -s --format=%(trailers:key=Fleet-Attempt,valueonly,separator=%x2C) HEAD': {
-        exitCode: 0, signal: null, stdout: '', stderr: '',
-      },
     };
     const { executor, recorded } = scripted(answers);
     const adapter = new WorkspaceAdapter({ executor });
@@ -135,38 +206,72 @@ describe('WorkspaceAdapter commitLaneOutput', () => {
     expect(subcommands).not.toContain('add');
   });
 
-  it('reads an already-committed crash as already-committed when the trailer matches', async () => {
+  it('reads an already-committed crash as already-committed when parents, message and tree all match', async () => {
     const answers: Record<string, CommandRunResult> = {
       ...happyAnswers,
       'rev-parse --verify HEAD^{commit}': { exitCode: 0, signal: null, stdout: NEW + '\n', stderr: '' },
       'show -s --format=%P HEAD': { exitCode: 0, signal: null, stdout: HEAD_A + '\n', stderr: '' },
-      'show -s --format=%(trailers:key=Fleet-Attempt,valueonly,separator=%x2C) HEAD': {
-        exitCode: 0, signal: null, stdout: DEFAULT_ATTEMPT + '\n', stderr: '',
+      'show -s --format=%B HEAD': {
+        exitCode: 0,
+        signal: null,
+        stdout: editOnlyCommitMessage(DEFAULT_ATTEMPT, DEFAULT_MODEL) + '\n',
+        stderr: '',
       },
+      'write-tree': { exitCode: 0, signal: null, stdout: TREE_2 + '\n', stderr: '' },
+      'rev-parse --verify HEAD^{tree}': { exitCode: 0, signal: null, stdout: TREE_2 + '\n', stderr: '' },
     };
     const { executor, recorded } = scripted(answers);
     const adapter = new WorkspaceAdapter({ executor });
     const result = await adapter.commitLaneOutput!(defaultRequest);
     expect(result).toEqual({ outcome: 'already-committed', headCommit: NEW, branchRef: BRANCH });
     const subcommands = recorded.map((argv) => argv[3 + COMMIT_CONFIG.length]);
+    expect(subcommands).not.toContain('commit-tree');
+    expect(subcommands).not.toContain('update-ref');
+  });
+
+  it('refuses head-moved for an agent commit carrying the trailer instead of the adapter message', async () => {
+    const answers: Record<string, CommandRunResult> = {
+      ...happyAnswers,
+      'rev-parse --verify HEAD^{commit}': { exitCode: 0, signal: null, stdout: NEW + '\n', stderr: '' },
+      'show -s --format=%P HEAD': { exitCode: 0, signal: null, stdout: HEAD_A + '\n', stderr: '' },
+      'show -s --format=%B HEAD': {
+        exitCode: 0,
+        signal: null,
+        stdout: 'feat: agent work\n\nFleet-Attempt: ' + DEFAULT_ATTEMPT + '\n',
+        stderr: '',
+      },
+    };
+    const { executor, recorded } = scripted(answers);
+    const adapter = new WorkspaceAdapter({ executor });
+    const result = await adapter.commitLaneOutput!(defaultRequest);
+    expect(result).toEqual({ outcome: 'refused', reason: 'head-moved' });
+    const subcommands = recorded.map((argv) => argv[3 + COMMIT_CONFIG.length]);
     expect(subcommands).not.toContain('add');
     expect(subcommands).not.toContain('commit-tree');
     expect(subcommands).not.toContain('update-ref');
   });
 
-  it('refuses head-moved when the already-committed trailer names another attempt', async () => {
+  it('refuses head-moved when the commit is ours but the worktree holds changes beyond it', async () => {
     const answers: Record<string, CommandRunResult> = {
       ...happyAnswers,
       'rev-parse --verify HEAD^{commit}': { exitCode: 0, signal: null, stdout: NEW + '\n', stderr: '' },
       'show -s --format=%P HEAD': { exitCode: 0, signal: null, stdout: HEAD_A + '\n', stderr: '' },
-      'show -s --format=%(trailers:key=Fleet-Attempt,valueonly,separator=%x2C) HEAD': {
-        exitCode: 0, signal: null, stdout: 'attempt-example-2\n', stderr: '',
+      'show -s --format=%B HEAD': {
+        exitCode: 0,
+        signal: null,
+        stdout: editOnlyCommitMessage(DEFAULT_ATTEMPT, DEFAULT_MODEL),
+        stderr: '',
       },
+      'write-tree': { exitCode: 0, signal: null, stdout: TREE_2 + '\n', stderr: '' },
+      'rev-parse --verify HEAD^{tree}': { exitCode: 0, signal: null, stdout: TREE_1 + '\n', stderr: '' },
     };
-    const { executor } = scripted(answers);
+    const { executor, recorded } = scripted(answers);
     const adapter = new WorkspaceAdapter({ executor });
     const result = await adapter.commitLaneOutput!(defaultRequest);
     expect(result).toEqual({ outcome: 'refused', reason: 'head-moved' });
+    const subcommands = recorded.map((argv) => argv[3 + COMMIT_CONFIG.length]);
+    expect(subcommands).not.toContain('commit-tree');
+    expect(subcommands).not.toContain('update-ref');
   });
 
   it('refuses detached-head when symbolic-ref fails', async () => {
@@ -249,7 +354,7 @@ describe('WorkspaceAdapter commitLaneOutput', () => {
     });
     const result = await adapter.commitLaneOutput!({ ...defaultRequest, recordedHost });
     expect(result).toEqual({ outcome: 'committed', headCommit: NEW, branchRef: BRANCH });
-    expect(recordedScript.recorded.length).toBe(7);
+    expect(recordedScript.recorded.length).toBe(8);
     expect(defaultScript.recorded).toEqual([]);
   });
 

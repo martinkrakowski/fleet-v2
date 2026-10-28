@@ -30,6 +30,7 @@ import {
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
+import { pathUnderPrefix } from '../../domain/lane-diff-check.js';
 import { hasRecordedHostName } from './ConfirmRecordedHost.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
 import { isValidAgyModel } from './AgyRunnerAdapter.adapter.js';
@@ -334,14 +335,39 @@ export class WorkspaceAdapter implements WorkspacePort {
     return { ok: true, stdout: result.stdout };
   }
 
+  /**
+   * Stage the whole checked change set, write the staged tree and read
+   * HEAD's tree. The one shared HEAD-tree comparison for both of its uses:
+   * the nothing-to-commit check on the main path and the ownership proof of
+   * the already-committed path.
+   */
+  private async stageAndCompareWithHeadTree(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+  ): Promise<{ ok: true; tree: string; headTree: string } | { ok: false; reason: string }> {
+    // Stage the whole checked change set. Ignored files are never staged.
+    const addRun = await this.runCommitGit(executor, worktreePath, ['add', '-A', '--', '.']);
+    if (!addRun.ok) return { ok: false, reason: addRun.reason };
+    const treeRun = await this.runCommitGit(executor, worktreePath, ['write-tree']);
+    if (!treeRun.ok) return { ok: false, reason: treeRun.reason };
+    const headTreeRun = await this.runCommitGit(executor, worktreePath, ['rev-parse', '--verify', 'HEAD^{tree}']);
+    if (!headTreeRun.ok) return { ok: false, reason: headTreeRun.reason };
+    return { ok: true, tree: treeRun.stdout.trim(), headTree: headTreeRun.stdout.trim() };
+  }
+
   async commitLaneOutput(request: CommitLaneOutputRequest): Promise<CommitLaneOutputResult> {
     // 1. Validate before any command runs.
     const worktreeRefusal = worktreeRootRefusal(request.worktreePath);
+    const allowedPathPrefixes = request.allowedPathPrefixes;
+    const prefixesValid =
+      allowedPathPrefixes.length > 0 &&
+      allowedPathPrefixes.every((prefix) => typeof prefix === 'string' && prefix !== '');
     if (
       worktreeRefusal !== null ||
       COMMIT_HEAD_PATTERN.test(request.expectedHead) !== true ||
       COMMIT_ATTEMPT_ID_PATTERN.test(request.attemptId) !== true ||
-      isValidAgyModel(request.implementerModel) !== true
+      isValidAgyModel(request.implementerModel) !== true ||
+      prefixesValid !== true
     ) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
@@ -370,37 +396,56 @@ export class WorkspaceAdapter implements WorkspacePort {
     }
 
     // 5. HEAD must be the dispatch head; a crash after the commit reads as
-    // already-committed instead of a head-moved refusal.
+    // already-committed instead of a head-moved refusal. `already-committed`
+    // must prove the commit is this adapter's: the dispatch head as the only
+    // parent, this adapter's exact message, and a worktree holding nothing
+    // beyond that commit. A foreign commit carrying the trailer never passes.
     if (head !== request.expectedHead) {
       const parentsRun = await this.runCommitGit(executor, worktreePath, ['show', '-s', '--format=%P', 'HEAD']);
       if (!parentsRun.ok) return { outcome: 'error', reason: parentsRun.reason };
-      const trailerRun = await this.runCommitGit(
-        executor,
-        worktreePath,
-        ['show', '-s', '--format=%(trailers:key=Fleet-Attempt,valueonly,separator=%x2C)', 'HEAD'],
-      );
-      if (!trailerRun.ok) return { outcome: 'error', reason: trailerRun.reason };
       const parents = parentsRun.stdout.trim();
-      const trailer = trailerRun.stdout.trim();
-      if (parents === request.expectedHead && trailer === request.attemptId) {
-        return { outcome: 'already-committed', headCommit: head, branchRef };
+      if (parents !== request.expectedHead) {
+        return { outcome: 'refused', reason: 'head-moved' };
       }
-      return { outcome: 'refused', reason: 'head-moved' };
+      const messageRun = await this.runCommitGit(executor, worktreePath, ['show', '-s', '--format=%B', 'HEAD']);
+      if (!messageRun.ok) return { outcome: 'error', reason: messageRun.reason };
+      const expectedMessage = editOnlyCommitMessage(request.attemptId, request.implementerModel);
+      if (messageRun.stdout.trim() !== expectedMessage.trim()) {
+        return { outcome: 'refused', reason: 'head-moved' };
+      }
+      const ownershipTree = await this.stageAndCompareWithHeadTree(executor, worktreePath);
+      if (!ownershipTree.ok) return { outcome: 'error', reason: ownershipTree.reason };
+      if (ownershipTree.tree !== ownershipTree.headTree) {
+        return { outcome: 'refused', reason: 'head-moved' };
+      }
+      return { outcome: 'already-committed', headCommit: head, branchRef };
     }
 
-    // 6. Stage the whole checked change set. Ignored files are never staged.
-    const addRun = await this.runCommitGit(executor, worktreePath, ['add', '-A', '--', '.']);
-    if (!addRun.ok) return { outcome: 'error', reason: addRun.reason };
-
-    // 7. Write the staged tree and compare it with HEAD's tree.
-    const treeRun = await this.runCommitGit(executor, worktreePath, ['write-tree']);
-    if (!treeRun.ok) return { outcome: 'error', reason: treeRun.reason };
-    const tree = treeRun.stdout.trim();
-    const headTreeRun = await this.runCommitGit(executor, worktreePath, ['rev-parse', '--verify', 'HEAD^{tree}']);
-    if (!headTreeRun.ok) return { outcome: 'error', reason: headTreeRun.reason };
-    const headTree = headTreeRun.stdout.trim();
-    if (tree === headTree) {
+    // 6–7. Stage the change set, write the staged tree and compare it with
+    // HEAD's tree (the shared comparison helper).
+    const stagedTree = await this.stageAndCompareWithHeadTree(executor, worktreePath);
+    if (!stagedTree.ok) return { outcome: 'error', reason: stagedTree.reason };
+    const tree = stagedTree.tree;
+    if (tree === stagedTree.headTree) {
       return { outcome: 'nothing-to-commit' };
+    }
+
+    // 7b. The diff check ran before staging; re-check the tree that is
+    // actually about to be committed, so a file written between the check
+    // and `add -A` is refused here. Nothing is committed and no ref moves;
+    // the staged index is left as it is (no reset).
+    const diffTreeRun = await this.runCommitGit(
+      executor,
+      worktreePath,
+      ['diff-tree', '-r', '--no-renames', '--name-only', '-z', request.expectedHead, tree],
+    );
+    if (!diffTreeRun.ok) return { outcome: 'error', reason: diffTreeRun.reason };
+    const changedPaths = diffTreeRun.stdout.split('\0').filter((changedPath) => changedPath !== '');
+    const outsideAllowedPaths = changedPaths.some(
+      (changedPath) => allowedPathPrefixes.some((prefix) => pathUnderPrefix(changedPath, prefix)) !== true,
+    );
+    if (outsideAllowedPaths) {
+      return { outcome: 'refused', reason: 'outside-allowed-paths' };
     }
 
     // 8. Write the commit: the dispatch head is the only parent.

@@ -49,12 +49,19 @@ export interface CommitLaneOutputRequest {
   readonly attemptId: string;
   /** The model that implemented the change, written as `Implemented-By: agy <model>`. */
   readonly implementerModel: string;
+  /**
+   * The frozen brief's allowed path prefixes. The staged tree is re-checked
+   * against them after staging, so a file written between the diff check and
+   * staging is never committed; at least one non-empty string is required.
+   */
+  readonly allowedPathPrefixes: readonly string[];
   /** The attempt's recorded runner block: the commit runs on that host's executor. */
   readonly recordedHost?: AttemptRunnerRecord | null;
 }
 
 export type CommitLaneOutputRefusal =
   | 'invalid-request'
+  | 'outside-allowed-paths'
   | 'head-moved'
   | 'detached-head'
   | 'ref-moved';

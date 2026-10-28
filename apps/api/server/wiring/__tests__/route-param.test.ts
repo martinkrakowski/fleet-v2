@@ -99,6 +99,7 @@ describe("routeParam", () => {
     ["/echo/a%20b", "a b"],
     ["/echo/100%25", "100%"],
     ["/echo/%2541", "%41"],
+    ["/echo/%252F", "%2F"],
     ["/echo/caf%C3%A9", "café"],
     ["/echo/example-id_1.2", "example-id_1.2"],
   ];

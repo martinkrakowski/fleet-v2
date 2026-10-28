@@ -11,6 +11,7 @@ export * from "./lane-plan-graph.js";
 export * from "./lane-plan-records.js";
 export * from "./lane-plan-sidecar.js";
 export * from "./lane-run-decider.js";
+export * from "./lane-run-handover.js";
 export * from "./lane-run-journal.js";
 export * from "./lane-run-keys.js";
 export * from "./lane-run-lease.js";

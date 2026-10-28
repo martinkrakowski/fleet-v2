@@ -19,7 +19,9 @@
  * When the gate is wired, the frozen acceptance spec is evaluated predicate
  * by predicate before the evidence assessment, each result is journaled,
  * and the first predicate that does not pass rejects; model reports are
- * never an input.
+ * never an input. The gate also stands alone behind EvaluateAttemptGatePort,
+ * with a typed verdict (passed, failed, unknown), and runs once per head
+ * either way: a second evaluation reads the stored outcome.
  *
  * `resolveImplementerSeat` is the single binding of an attempt to the seat
  * that implemented it. Composition roots read it through the same function so
@@ -31,6 +33,11 @@ import type {
   RequestAttemptAcceptanceRequest,
   RequestAttemptAcceptanceResult,
 } from '../ports/in/RequestAttemptAcceptancePort.in-port.js';
+import type {
+  EvaluateAttemptGatePort,
+  EvaluateAttemptGateRequest,
+  EvaluateAttemptGateResult,
+} from '../ports/in/EvaluateAttemptGatePort.in-port.js';
 import type { AcceptanceAssessmentPort } from '../ports/out/AcceptanceAssessmentPort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
@@ -83,6 +90,21 @@ const GATE_PREDICATE_VERDICT_TO_STATUS: Record<
 const GATE_RESULTS_MISMATCH_REASON =
   'Gate predicate results do not match the frozen acceptance spec';
 
+/** The gate's typed outcome, shared by acceptance and the standalone gate port. */
+type GateVerdict = EvaluateAttemptGateResult;
+
+function gatePassed(): GateVerdict {
+  return { verdict: 'passed' };
+}
+
+function gateUnknown(reason: string): GateVerdict {
+  return { verdict: 'unknown', reason };
+}
+
+function gateFailed(reason: string): GateVerdict {
+  return { verdict: 'failed', reason };
+}
+
 interface ExpectedGatePredicate {
   readonly name: string;
   readonly kind: GatePredicateKind;
@@ -112,20 +134,28 @@ function resultsMatchExpectedPredicates(
   );
 }
 
-function rejectionForGateResults(
+/**
+ * The typed verdict for one evaluated head: a mismatch is `unknown`, the
+ * first non-`pass` result decides (`fail` → `failed`, `unknown` or
+ * `skipped` → `unknown`, since a skipped predicate before any failure means
+ * the gate did not finish), and all pass is `passed`.
+ */
+function gateVerdictForResults(
   results: readonly GatePredicateResult[],
   expected: readonly ExpectedGatePredicate[],
-): string | null {
+): GateVerdict {
   if (!resultsMatchExpectedPredicates(results, expected)) {
-    return GATE_RESULTS_MISMATCH_REASON;
+    return gateUnknown(GATE_RESULTS_MISMATCH_REASON);
   }
   for (const result of results) {
     if (result.verdict !== 'pass') {
       const exitText = result.exitCode === null ? '' : ' with exit code ' + String(result.exitCode);
-      return 'Gate predicate ' + result.name + ' ' + result.verdict + exitText + ': ' + result.detail;
+      const reason =
+        'Gate predicate ' + result.name + ' ' + result.verdict + exitText + ': ' + result.detail;
+      return result.verdict === 'fail' ? gateFailed(reason) : gateUnknown(reason);
     }
   }
-  return null;
+  return gatePassed();
 }
 
 function isGatePredicateKind(value: unknown): value is GatePredicateKind {
@@ -172,7 +202,7 @@ function parseStoredPredicateResult(entry: ActionJournalEntryRecord): GatePredic
 
 type StoredGateOutcome =
   | { readonly kind: 'none' }
-  | { readonly kind: 'completed'; readonly reason: string | null }
+  | { readonly kind: 'completed'; readonly verdict: GateVerdict }
   | { readonly kind: 'incomplete'; readonly reason: string };
 
 function readStoredGateOutcome(
@@ -206,13 +236,13 @@ function readStoredGateOutcome(
     if (firstResultEntry.status === 'ambiguous') {
       return {
         kind: 'completed',
-        reason: 'Unknown: gate predicates unavailable: ' + (firstResultEntry.detail ?? ''),
+        verdict: gateUnknown('Unknown: gate predicates unavailable: ' + (firstResultEntry.detail ?? '')),
       };
     }
     if (firstResultEntry.status === 'refused') {
       return {
         kind: 'completed',
-        reason: firstResultEntry.detail ?? GATE_RESULTS_MISMATCH_REASON,
+        verdict: gateUnknown(firstResultEntry.detail ?? GATE_RESULTS_MISMATCH_REASON),
       };
     }
   }
@@ -248,12 +278,12 @@ function readStoredGateOutcome(
     return index > expected.length;
   });
   if (extraPredicateEntries) {
-    return { kind: 'completed', reason: GATE_RESULTS_MISMATCH_REASON };
+    return { kind: 'completed', verdict: gateUnknown(GATE_RESULTS_MISMATCH_REASON) };
   }
 
   return {
     kind: 'completed',
-    reason: rejectionForGateResults(parsedResults, expected),
+    verdict: gateVerdictForResults(parsedResults, expected),
   };
 }
 
@@ -369,7 +399,9 @@ export interface RequestAttemptAcceptanceDependencies {
   readonly now?: () => string;
 }
 
-export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptancePort {
+export class RequestAttemptAcceptanceUseCase
+  implements RequestAttemptAcceptancePort, EvaluateAttemptGatePort
+{
   constructor(private readonly deps?: RequestAttemptAcceptanceDependencies) {}
 
   async requestAttemptAcceptance(
@@ -472,8 +504,8 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
 
     if (deps.gatePredicates !== undefined) {
       const gate = await this.runGate(deps, deps.gatePredicates, attempt, request.candidateHeadSha);
-      if (gate !== null) {
-        return { outcome: 'rejected', reason: gate };
+      if (gate.verdict !== 'passed') {
+        return { outcome: 'rejected', reason: gate.reason };
       }
     }
 
@@ -519,6 +551,35 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
     return this.requestAttemptAcceptance(input as RequestAttemptAcceptanceRequest);
   }
 
+  /**
+   * EvaluateAttemptGatePort: the frozen gate alone, with a typed verdict and
+   * no reviewer, work order, assessment or free-seat check. The gate still
+   * runs once per head; a second call reads the stored outcome.
+   */
+  async evaluateAttemptGate(request: EvaluateAttemptGateRequest): Promise<EvaluateAttemptGateResult> {
+    const deps = this.deps;
+    if (!deps) {
+      throw new Error('Not implemented: RequestAttemptAcceptanceUseCase');
+    }
+    if (deps.gatePredicates === undefined) {
+      return gateUnknown('Gate predicates are not wired');
+    }
+    const attempt = await deps.attemptRepo.findAttemptById(request.attemptId);
+    if (attempt === null) {
+      return gateUnknown('Attempt not found');
+    }
+    if (attempt.state !== 'collected' && attempt.state !== 'ended') {
+      return gateUnknown('Attempt is not ready for the gate');
+    }
+    if (attempt.artifacts === null) {
+      return gateUnknown('Attempt has no collected artifacts');
+    }
+    if (attempt.artifacts.headCommit !== request.candidateHeadSha) {
+      return gateUnknown('Candidate head is not the collected head');
+    }
+    return this.runGate(deps, deps.gatePredicates, attempt, request.candidateHeadSha);
+  }
+
   /** Accepted heads may move a non-terminal work order to 'ready-to-merge'. */
   private async markReadyToMerge(
     deps: RequestAttemptAcceptanceDependencies,
@@ -541,26 +602,26 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
 
   /**
    * Plan S2: evaluate the frozen acceptance spec predicate by predicate before
-   * the evidence assessment. Returns a rejection reason, or null when every
-   * predicate passed.
+   * the evidence assessment. Returns the typed gate verdict; the gate runs
+   * once per head and a later call reads the stored outcome.
    */
   private async runGate(
     deps: RequestAttemptAcceptanceDependencies,
     gatePort: GatePredicatePort,
     attempt: AttemptRecord,
     candidateHeadSha: string,
-  ): Promise<string | null> {
+  ): Promise<GateVerdict> {
     const id = attempt.id;
     if (deps.journal === undefined) {
-      return 'Gate predicates need the execution journal';
+      return gateUnknown('Gate predicates need the execution journal');
     }
     const journal = deps.journal;
     if (!isNonEmptyString(attempt.briefPackagePath) || !isNonEmptyString(attempt.briefDigest)) {
-      return `Attempt ${id} records no frozen brief; the gate cannot be read`;
+      return gateUnknown(`Attempt ${id} records no frozen brief; the gate cannot be read`);
     }
     const artifactPort = deps.artifactPort;
     if (artifactPort?.readBriefFile === undefined || artifactPort.readBriefManifest === undefined) {
-      return 'No artifact port can read the frozen brief';
+      return gateUnknown('No artifact port can read the frozen brief');
     }
 
     let prose: string | null;
@@ -577,35 +638,39 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
         attempt.runner ?? null,
       );
     } catch {
-      return `Unable to read the frozen brief for attempt ${id}`;
+      return gateUnknown(`Unable to read the frozen brief for attempt ${id}`);
     }
     if (prose === null || manifestRaw === null) {
-      return `Unable to read the frozen brief for attempt ${id}`;
+      return gateUnknown(`Unable to read the frozen brief for attempt ${id}`);
     }
 
     const digest = (deps.computeDigest ?? simpleDeterministicHexDigest)(
       prose + '\n' + manifestRaw,
     );
     if (digest !== attempt.briefDigest) {
-      return `Frozen brief digest mismatch for attempt ${id}: the brief or its manifest changed after it was prepared`;
+      return gateUnknown(
+        `Frozen brief digest mismatch for attempt ${id}: the brief or its manifest changed after it was prepared`,
+      );
     }
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(manifestRaw);
     } catch {
-      return `Frozen brief manifest for attempt ${id} is not a JSON object`;
+      return gateUnknown(`Frozen brief manifest for attempt ${id} is not a JSON object`);
     }
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return `Frozen brief manifest for attempt ${id} is not a JSON object`;
+      return gateUnknown(`Frozen brief manifest for attempt ${id} is not a JSON object`);
     }
     const manifest = parsed as Record<string, unknown>;
     if (manifest.baseCommit !== attempt.baseCommit) {
-      return 'Frozen brief base commit does not match the attempt base commit';
+      return gateUnknown('Frozen brief base commit does not match the attempt base commit');
     }
     const created = AcceptanceSpec.create(manifest.acceptanceSpec);
     if (!created.success || created.value === undefined) {
-      return `Frozen brief has no valid acceptance spec: ${created.error?.message ?? 'unknown error'}`;
+      return gateUnknown(
+        `Frozen brief has no valid acceptance spec: ${created.error?.message ?? 'unknown error'}`,
+      );
     }
     const spec = created.value;
 
@@ -630,8 +695,11 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
 
     const priorEntries = await journal.listJournalEntriesForAttempt(id);
     const storedBefore = readStoredGateOutcome(priorEntries, id, candidateHeadSha, expected);
-    if (storedBefore.kind !== 'none') {
-      return storedBefore.reason;
+    if (storedBefore.kind === 'completed') {
+      return storedBefore.verdict;
+    }
+    if (storedBefore.kind === 'incomplete') {
+      return gateUnknown(storedBefore.reason);
     }
 
     const isOwner = !journalInFlight.has(gateKey);
@@ -717,7 +785,7 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
             expected,
           );
         }
-        return 'Unknown: gate predicates unavailable: ' + gateResult.reason;
+        return gateUnknown('Unknown: gate predicates unavailable: ' + gateResult.reason);
       }
 
       const results = gateResult.results;
@@ -745,7 +813,7 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
             expected,
           );
         }
-        return GATE_RESULTS_MISMATCH_REASON;
+        return gateUnknown(GATE_RESULTS_MISMATCH_REASON);
       }
 
       const entries = results.map((result, offset) =>
@@ -768,7 +836,7 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
         );
       }
 
-      return rejectionForGateResults(results, expected);
+      return gateVerdictForResults(results, expected);
     } finally {
       if (isOwner) {
         journalInFlight.delete(gateKey);
@@ -785,7 +853,7 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
     attemptId: string,
     candidateHeadSha: string,
     expected: readonly ExpectedGatePredicate[],
-  ): Promise<string | null> {
+  ): Promise<GateVerdict> {
     if (!isOwner) {
       const active = journalInFlight.get(gateKey);
       if (active !== undefined) {
@@ -795,9 +863,14 @@ export class RequestAttemptAcceptanceUseCase implements RequestAttemptAcceptance
     const entries = await journal.listJournalEntriesForAttempt(attemptId);
     const stored = readStoredGateOutcome(entries, attemptId, candidateHeadSha, expected);
     if (stored.kind === 'none') {
-      return `Unknown: gate evaluation for head ${candidateHeadSha} has an unfinished intent in the journal`;
+      return gateUnknown(
+        `Unknown: gate evaluation for head ${candidateHeadSha} has an unfinished intent in the journal`,
+      );
     }
-    return stored.reason;
+    if (stored.kind === 'completed') {
+      return stored.verdict;
+    }
+    return gateUnknown(stored.reason);
   }
 
   private gateJournalEntry(

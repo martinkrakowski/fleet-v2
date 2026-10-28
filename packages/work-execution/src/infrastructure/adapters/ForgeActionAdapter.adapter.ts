@@ -292,13 +292,14 @@ export class ForgeActionAdapter implements ForgeActionPort {
     } catch (error) {
       return {
         outcome: 'ambiguous',
-        reason: `Pushed branch ${request.branchName} but its pull request does not show head ${request.expectedHeadSha}: ${errorMessage(error)}`,
+        reason: `After the push step for branch ${request.branchName}, its pull request could not be read`,
       };
     }
     if (
       postRead.outcome === 'found' &&
       postRead.pullRequest.state === 'open' &&
-      postRead.pullRequest.headSha === request.expectedHeadSha
+      postRead.pullRequest.number === snapshot.number &&
+      postRead.pullRequest.headSha.startsWith(request.expectedHeadSha)
     ) {
       return {
         outcome: 'executed',
@@ -314,7 +315,7 @@ export class ForgeActionAdapter implements ForgeActionPort {
           : postRead.reason;
     return {
       outcome: 'ambiguous',
-      reason: `Pushed branch ${request.branchName} but its pull request does not show head ${request.expectedHeadSha}: ${whatWasRead}`,
+      reason: `After the push step for branch ${request.branchName}, pull request #${snapshot.number} does not show head ${request.expectedHeadSha}: ${whatWasRead}`,
     };
   }
 

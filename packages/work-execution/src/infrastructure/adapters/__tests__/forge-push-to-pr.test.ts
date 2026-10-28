@@ -270,7 +270,7 @@ describe('ForgeActionAdapter push-to-pr', () => {
 
     expect(result).toEqual({
       outcome: 'ambiguous',
-      reason: `Pushed branch feat/${LANE_ID} but its pull request does not show head ${HEAD_SHA}: ${what}`,
+      reason: `After the push step for branch feat/${LANE_ID}, pull request #42 does not show head ${HEAD_SHA}: ${what}`,
     });
     expect(calls).toHaveLength(0);
   });
@@ -289,8 +289,24 @@ describe('ForgeActionAdapter push-to-pr', () => {
 
     expect(result).toEqual({
       outcome: 'ambiguous',
-      reason: `Pushed branch feat/${LANE_ID} but its pull request does not show head ${HEAD_SHA}: read exploded`,
+      reason: `After the push step for branch feat/${LANE_ID}, its pull request could not be read`,
     });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('is ambiguous when the post-read finds a different open pull request at the head', async () => {
+    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
+    const reader = new FakeReader([pr(42, 'open', OTHER_SHA), pr(43, 'open', HEAD_SHA)]);
+    const verifier = makeVerifier(HEAD_SHA);
+    const adapter = new ForgeActionAdapter({
+      runGh,
+      verifyCurrentHeadSha: verifier.verify,
+      pullRequestRead: reader,
+    });
+
+    const result = await adapter.performForgeAction(forgeActionRequest());
+
+    expect(result.outcome).toBe('ambiguous');
     expect(calls).toHaveLength(0);
   });
 

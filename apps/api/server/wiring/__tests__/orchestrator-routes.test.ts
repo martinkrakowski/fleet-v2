@@ -319,4 +319,13 @@ describe("orchestrator routes", () => {
     expect(restored.tokenId).toBe(SHARED_BEARER_TOKEN_ID);
     expect(restored.scopes).toEqual(["orchestrate"]);
   });
+
+  it("retires a stored session id holding a slash by its encoded form", async () => {
+    await post("/v1/orchestrators", { ...BODY, orchestratorId: "team/alpha" });
+    expect((await get("/v1/orchestrators")).status).toBe(200);
+
+    const retired = await post("/v1/orchestrators/team%2Falpha/retire", {});
+    expect(retired.status).toBe(200);
+    expect((await retired.json()).result.outcome).toBe("retired");
+  });
 });

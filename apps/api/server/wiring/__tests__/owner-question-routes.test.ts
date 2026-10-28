@@ -364,4 +364,25 @@ describe("owner question routes", () => {
     expect(expireBody.result.outcome).toBe("expired");
     expect(expireBody.result.expired).toEqual([]);
   });
+
+  it("reads a stored question id holding a slash by its encoded form; a malformed param is a 400", async () => {
+    await seedQuestion({ ...oneWayQuestionRecord(new Date().toISOString()), questionId: "q-example/1" });
+
+    const encoded = await fetch(`${baseUrl}/v1/questions/q-example%2F1`, {
+      headers: authHeaders(),
+    });
+    expect(encoded.status).toBe(200);
+    const result = (await encoded.json()).result as { outcome: string };
+    expect(result.outcome).toBe("found");
+
+    const unencoded = await fetch(`${baseUrl}/v1/questions/q-example/1`, {
+      headers: authHeaders(),
+    });
+    expect(unencoded.status).toBe(404);
+
+    const malformed = await fetch(`${baseUrl}/v1/questions/%E0%A4%A`, {
+      headers: authHeaders(),
+    });
+    expect(malformed.status).toBe(400);
+  });
 });

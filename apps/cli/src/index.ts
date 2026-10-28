@@ -19,7 +19,6 @@ import type {
   BriefContextDecision,
   BriefModelAssignment,
   CommandCompletionReceipt,
-  ReserveExecutionCapacityCandidateHost,
   SeatPlanProps,
 } from '@fleet/work-execution';
 import {
@@ -64,7 +63,6 @@ import {
   loadInstallation,
   deriveInstallationModel,
   isFleetInstallationV2,
-  type FleetInstallation,
   type FleetInstallationModel,
   type HostSection,
   type LoadResult,
@@ -98,6 +96,7 @@ import { initCommand, type InitCliOptions } from './init.js';
 import { projectsCommand, type ProjectsCliOptions } from './projects.js';
 import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
 import { conductorCommand, type ConductorCliOptions } from './conductor.js';
+import { laneRunnerCandidateHosts } from './conductor-wiring.js';
 
 export { resolveRunnerSettings };
 
@@ -452,38 +451,6 @@ function decisionsReportLine(figure: RankingTrialContextFigures): string {
     `agreesDecided=${yesNo(figure.selectionAgreesWithDecided)}`,
     `agreesLexical=${yesNo(figure.selectionAgreesWithLexical)}`,
   ].join(' ');
-}
-
-/**
- * The lane-runner hosts of a v2 installation, as the reserve's candidates
- * (H9a2). Only hosts carrying the lane-runner role with a runner block are
- * offered; `maxLanes` defaults to 1 inside the use case when absent. A v1 or
- * absent installation yields `undefined` and keeps the legacy request path.
- */
-function laneRunnerCandidateHosts(
-  installation?: FleetInstallation,
-): ReserveExecutionCapacityCandidateHost[] | undefined {
-  if (installation?.schemaVersion !== 2 || installation.hosts === undefined) {
-    return undefined;
-  }
-  const candidates: ReserveExecutionCapacityCandidateHost[] = [];
-  for (const name of Object.keys(installation.hosts)) {
-    const host = installation.hosts[name];
-    if (!host.roles?.includes('lane-runner') || host.runner === undefined) continue;
-    candidates.push({
-      name,
-      kind: host.runner.kind,
-      transport: host.transport === 'ssh' ? 'ssh' : 'local',
-      sshAlias:
-        host.transport === 'ssh' && host.sshAlias !== undefined && host.sshAlias.trim() !== ''
-          ? host.sshAlias
-          : null,
-      port: typeof host.runner.port === 'number' ? host.runner.port : null,
-      maxLanes: host.runner.maxLanes,
-      worktreeRoot: host.worktreeRoot,
-    });
-  }
-  return candidates;
 }
 
 /**

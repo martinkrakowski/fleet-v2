@@ -193,19 +193,13 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (matches.length === 0) {
       return { outcome: 'not-found' };
     }
+    const [only] = matches;
     if (
       matches.length > 1 ||
-      matches.some(
-        (receipt) =>
-          receipt.candidateHeadSha !== request.candidateHeadSha ||
-          receipt.attemptId !== request.attemptId ||
-          receipt.kind === undefined,
-      )
+      only.candidateHeadSha !== request.candidateHeadSha ||
+      only.attemptId !== request.attemptId ||
+      only.kind === undefined
     ) {
-      return { outcome: 'unavailable', reason: 'receipt-mismatch' };
-    }
-    const [only] = matches;
-    if (only.kind === undefined) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
     return { outcome: 'found', receipt: summaryOf(only, only.kind, request.requestId) };

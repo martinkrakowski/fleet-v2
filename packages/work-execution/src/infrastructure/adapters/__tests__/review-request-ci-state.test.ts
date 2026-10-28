@@ -287,6 +287,22 @@ describe('ReviewRequestAdapter.requestReview', () => {
     expect(result).toEqual({ outcome: 'unknown', reason: 'receipt-mismatch' });
   });
 
+  it.each([
+    ['another kind', { kind: 'pre-merge' as const }],
+    ['no kind', { kind: undefined }],
+    ['another attempt', { attemptId: 'attempt-other' }],
+  ])('is unknown receipt-mismatch when the receipt has %s', async (_label, override) => {
+    const { requestIndependentReview } = makeRequestReviewFake({
+      outcome: 'reviewed',
+      receipt: makeReceipt(override as Partial<ReviewReceiptRecord>),
+    });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+
+    const result = await adapter.requestReview(makeReviewRequest({ kind: 'code-review' }));
+
+    expect(result).toEqual({ outcome: 'unknown', reason: 'receipt-mismatch' });
+  });
+
   it('is unknown receipt-mismatch when the receipt answers another head', async () => {
     const { requestIndependentReview } = makeRequestReviewFake({
       outcome: 'reviewed',
@@ -440,6 +456,22 @@ describe('ReviewRequestAdapter.findReviewReceipt', () => {
     expect(result).toEqual({ outcome: 'unavailable', reason: 'receipt-mismatch' });
   });
 
+  it('is unavailable receipt-mismatch when the receipt names another attempt than its assessment', async () => {
+    const { inspectAcceptanceEvidence } = makeInspectFake({
+      outcome: 'found',
+      assessment: makeAssessment({ reviewReceipts: [makeReceipt({ attemptId: 'attempt-other' })] }),
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const result = await adapter.findReviewReceipt({
+      attemptId: 'attempt-example-1',
+      requestId: REQUEST_ID,
+      candidateHeadSha: HEAD,
+    });
+
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'receipt-mismatch' });
+  });
+
   it('is unavailable receipt-mismatch when the receipt answers another head', async () => {
     const { inspectAcceptanceEvidence } = makeInspectFake({
       outcome: 'found',
@@ -556,6 +588,25 @@ describe('CiStateAdapter.readHeadCiState', () => {
       state: 'passed',
       reason: 'read',
     });
+    const adapter = new CiStateAdapter({ inspectHeadCiState });
+
+    const result = await adapter.readHeadCiState({ headSha: HEAD });
+
+    expect(result).toEqual({ headSha: HEAD, state: 'unknown', reason: 'unreadable' });
+  });
+
+  it.each([
+    ['passed with head-moved', 'passed', 'head-moved'],
+    ['failed with not-configured', 'failed', 'not-configured'],
+    ['pending with unreadable', 'pending', 'unreadable'],
+    ['an unknown state', 'green', 'read'],
+    ['an unknown reason', 'unknown', 'because'],
+  ])('answers unknown/unreadable for %s', async (_label, state, reason) => {
+    const { inspectHeadCiState } = makeHeadCiFake({
+      candidateHeadSha: HEAD,
+      state,
+      reason,
+    } as unknown as InspectHeadCiStateResult);
     const adapter = new CiStateAdapter({ inspectHeadCiState });
 
     const result = await adapter.readHeadCiState({ headSha: HEAD });

@@ -53,7 +53,8 @@ export class CiStateAdapter implements CiStatePort {
       answer.candidateHeadSha !== headSha ||
       !isHeadCiState(answer.state) ||
       !isHeadCiReason(answer.reason) ||
-      (answer.reason === 'read' && answer.state === 'unknown')
+      // `read` exactly when the state is pending, passed or failed (the in-port's invariant), both ways.
+      (answer.reason === 'read') !== (answer.state !== 'unknown')
     ) {
       return { headSha, state: 'unknown', reason: 'unreadable' };
     }

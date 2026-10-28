@@ -344,7 +344,7 @@ describe('CommitEditOnlyAttemptUseCase', () => {
       initialDiffOutcome: { outcome: 'error', reason: 'git not available' },
     });
     const result = await errored.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' });
-    expect(result).toEqual({ outcome: 'unknown', reason: 'git not available' });
+    expect(result).toEqual({ outcome: 'unknown', reason: 'the lane diff check could not run' });
 
     const unreachable = makeLane({ diffCheckAvailable: false });
     const other = await unreachable.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' });
@@ -385,7 +385,7 @@ describe('CommitEditOnlyAttemptUseCase', () => {
     });
     expect(await failed.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' })).toEqual({
       outcome: 'unknown',
-      reason: 'git died',
+      reason: 'the edit-only commit could not complete',
     });
   });
 

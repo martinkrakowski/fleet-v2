@@ -182,7 +182,8 @@ export class CommitEditOnlyAttemptUseCase {
       policyProtectedPaths: deps.policyProtectedPaths,
     });
     if (diffVerdict.outcome === 'error') {
-      return { outcome: 'unknown', reason: diffVerdict.reason };
+      // Fixed text: an adapter reason never reaches the result.
+      return { outcome: 'unknown', reason: 'the lane diff check could not run' };
     }
     if (diffVerdict.outcome === 'findings') {
       await appendEditOnlyJournalEntry(
@@ -283,7 +284,7 @@ export class CommitEditOnlyAttemptUseCase {
       );
       return { outcome: 'refused', reason, findings: [] };
     }
-    return { outcome: 'unknown', reason: commitResult.reason };
+    return { outcome: 'unknown', reason: 'the edit-only commit could not complete' };
   }
 
   /**

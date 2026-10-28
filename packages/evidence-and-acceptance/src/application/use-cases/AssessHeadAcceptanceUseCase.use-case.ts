@@ -21,7 +21,7 @@ import {
 } from '../../domain/acceptance-blockers.js';
 import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain/evidence-records.js';
 import type { ReviewTally } from '../../domain/review-selection.js';
-import { latestReceiptPerReviewer, tallyReviews } from '../../domain/review-selection.js';
+import { latestReceiptPerReviewer, satisfiesReviewPassGate, tallyReviews } from '../../domain/review-selection.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
@@ -163,7 +163,9 @@ function selectReviewEvidence(assessment: EvidenceAssessmentRecord): {
  * Among the independent read-only receipts, the latest per reviewer model
  * decides — recording order wins, never `completedAtIso` — and any of those
  * that says `fail` blocks acceptance even when another reviewer passed.
- * Agreement between reviewers never strengthens a result.
+ * Only receipts whose kind is absent or `code-review` satisfy the passing
+ * gate; a receipt of another kind never passes on its own. Agreement between
+ * reviewers never strengthens a result.
  */
 function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly AcceptanceBlocker[] {
   const selection = selectReviewEvidence(assessment);
@@ -183,7 +185,7 @@ function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly A
       );
     }
   }
-  const passing = selection.latest.some((receipt) => receipt.result === 'pass');
+  const passing = selection.latest.some(satisfiesReviewPassGate);
   if (!passing && blockers.length === 0) {
     return [acceptanceBlocker('review-missing', 'no read-only independent review passed for this candidate head')];
   }

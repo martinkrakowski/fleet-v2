@@ -497,3 +497,64 @@ describe('RunConductorPassUseCase per-step lease renewal', () => {
     expect(runRenews).toBe(3);
   });
 });
+
+describe('RunConductorPassUseCase run lease lost mid-pass', () => {
+  function refusingRepo(fx: Stores, refuseFromCall: number) {
+    const repo = fx.repo;
+    let renews = 0;
+    return {
+      list: () => repo.list(),
+      acquireLease: (runId: string, request: Parameters<typeof repo.acquireLease>[1]) => repo.acquireLease(runId, request),
+      renewLease: async (runId: string, request: Parameters<typeof repo.renewLease>[1]) => {
+        renews += 1;
+        if (renews >= refuseFromCall) {
+          return { outcome: 'refused', reason: 'lease-not-held' } as never;
+        }
+        return repo.renewLease(runId, request);
+      },
+      releaseLease: (runId: string, request: Parameters<typeof repo.releaseLease>[1]) => repo.releaseLease(runId, request),
+    };
+  }
+
+  it('a run lease refused before the second step stops that run; the pass completes and reports the step that ran', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    const advance = new ScriptedAdvance(
+      new Map([[RUN_ID, [{ outcome: 'entered', state: 'dispatching' }, { outcome: 'entered', state: 'running' }] as AdvanceLaneRunResult[]]]),
+    );
+    const pass = new RunConductorPassUseCase({
+      driverLease: fx.driverLease,
+      runRepo: refusingRepo(fx, 2),
+      runJournal: fx.journal,
+      halt: fx.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: () => NOW,
+    });
+    const result = await pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed' });
+    expect(advance.calls).toHaveLength(1);
+    if (result.outcome !== 'completed') return;
+    expect(result.runs).toEqual([{ runId: RUN_ID, outcome: 'advanced', steps: [{ outcome: 'entered', state: 'dispatching' }] }]);
+  });
+
+  it('a run lease refused before the first step skips the run lease-refused and never advances it', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    const advance = new ScriptedAdvance(new Map());
+    const pass = new RunConductorPassUseCase({
+      driverLease: fx.driverLease,
+      runRepo: refusingRepo(fx, 1),
+      runJournal: fx.journal,
+      halt: fx.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: () => NOW,
+    });
+    const result = await pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed' });
+    expect(advance.calls).toHaveLength(0);
+    if (result.outcome !== 'completed') return;
+    expect(result.runs).toEqual([{ runId: RUN_ID, outcome: 'skipped', reason: 'lease-refused' }]);
+  });
+});

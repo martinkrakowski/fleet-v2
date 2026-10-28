@@ -163,6 +163,8 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
 
       const steps: AdvanceLaneRunResult[] = [];
       let finished = false;
+      // Set when this run's lease could not be renewed: stop acting on the run at once.
+      let lost: 'lease-held' | 'lease-refused' | null = null;
       while (steps.length < CONDUCTOR_MAX_STEPS_PER_RUN && !finished) {
         // Fresh time before each step: renew the driver and run leases with it,
         // so a pass never outlives its lease window.
@@ -199,12 +201,12 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
           acquireRun,
         );
         if (runRenewed.outcome === 'held-by-other') {
-          reports.push({ runId: record.runId, outcome: 'skipped', reason: 'lease-held' });
-          continue;
+          lost = 'lease-held';
+          break;
         }
         if (runRenewed.outcome === 'refused') {
-          reports.push({ runId: record.runId, outcome: 'skipped', reason: 'lease-refused' });
-          continue;
+          lost = 'lease-refused';
+          break;
         }
         lease = runRenewed.lease;
 
@@ -220,7 +222,12 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
         }
         finished = !(step.outcome === 'entered' || step.outcome === 'repaired' || step.outcome === 'acted');
       }
-      reports.push({ runId: record.runId, outcome: 'advanced', steps });
+      // One report per run: skipped when the lease was lost before any step, else the steps that ran.
+      if (lost !== null && steps.length === 0) {
+        reports.push({ runId: record.runId, outcome: 'skipped', reason: lost });
+      } else {
+        reports.push({ runId: record.runId, outcome: 'advanced', steps });
+      }
     }
 
     const progressed = reports.some(

@@ -512,11 +512,10 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
 
     // AG-3: the frozen brief's seat tool must match the seat tool the held
     // reservation was taken for; a mismatch refuses before anything is
-    // written, whether or not a selector is wired. A reservation whose tool
-    // is `agy` never runs on a brief that names another tool; an `opencode`
-    // reservation keeps the AG-2 behaviour where the brief's seat tool drives
-    // the selection.
-    if (heldReservation.seatTool === 'agy') {
+    // written, whether or not a selector is wired. Any reservation that names
+    // a seat tool (agy or opencode) refuses a brief naming another tool; only
+    // a legacy reservation with no seat tool skips the check.
+    if (heldReservation.seatTool !== null && heldReservation.seatTool !== undefined) {
       const briefTool = parseSeatTool(manifestModelAssignment.seatTool) ?? 'opencode';
       if (briefTool !== heldReservation.seatTool) {
         return {

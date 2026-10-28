@@ -341,6 +341,22 @@ describe('DispatchAttemptUseCase: the reservation seat tool chooses the runner (
     expect(setup.attemptRepo.attempts.size).toBe(0);
   });
 
+  it('refuses an opencode reservation for a brief that names the agy tool', async () => {
+    const setup = makeDispatchSetup({
+      reservationSeatTool: 'opencode',
+      manifest: dispatchManifest({
+        modelAssignment: { model: 'gemini-example-high', seatTool: 'agy' },
+      }),
+    });
+    const result = await setup.useCase.dispatchAttempt(setup.request);
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Frozen brief seat tool does not match the reservation seat tool',
+    });
+    expect(setup.journal.entries).toHaveLength(0);
+    expect(setup.attemptRepo.attempts.size).toBe(0);
+  });
+
   it('runs the opencode runner for an opencode reservation even with an agy runner wired', async () => {
     const setup = makeDispatchSetup({
       reservationSeatTool: 'opencode',

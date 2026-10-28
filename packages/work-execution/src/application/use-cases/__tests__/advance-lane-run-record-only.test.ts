@@ -417,7 +417,7 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
     expect(after?.revision).toBe(1);
   });
 
-  it('test 9: a reconcile decision is reported not-built and writes nothing', async () => {
+  it('test 9: a dispatch reconcile without a runner records ambiguous worktree-unknown', async () => {
     const harness = await makeHarness(runRecord(), attemptFixture());
     const built = buildLaneRunStepKey({
       runId: RUN_ID,
@@ -436,7 +436,16 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
     const appended = await harness.runJournal.append(intent);
     expect(appended.outcome).toBe('appended');
     const result = await advance(harness);
-    expect(result).toEqual({ outcome: 'not-built', decision: 'reconcile', step: 'dispatch' });
+    // K4-7 built the reconcile; this harness wires no runnerForAttempt, so the
+    // worktree read records ambiguous worktree-unknown (the old not-built pin
+    // is superseded).
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'dispatch',
+      key: built.key,
+      result: 'ambiguous',
+      reasonCode: 'worktree-unknown',
+    });
     expect(harness.reconcileCalls).toEqual([]);
     expect(harness.admissionCalls).toEqual([]);
     const after = await harness.runRepo.get(RUN_ID);

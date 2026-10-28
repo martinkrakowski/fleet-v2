@@ -19,9 +19,16 @@
  * handles a timeout and a forced run stop through `StopAttemptPort` mapped by
  * the plan's §3.8 table, collect runs the edit-only commit step first for an
  * agy attempt then collects through `CollectAttemptArtifactsPort`, and gate
- * reads the typed verdict from `EvaluateAttemptGatePort`. The remaining
- * `reconcile` decisions are still reported `not-built` (K4-7 builds them)
- * and write nothing.
+ * reads the typed verdict from `EvaluateAttemptGatePort`. The `reconcile`
+ * decisions are performed here too (K4-7, §3.5): an intent without a result
+ * is reconciled, never repeated. Prepare and dispatch are one-way, so their
+ * reconcile only reads and records — a dispatch reads the attempt record,
+ * then the runner by worktree, and an idle worktree under an untouched
+ * record is `not-started` with the attempt cancelled so its key is never
+ * re-sent; a stop reads the record; collect and gate, which are not
+ * one-way, are completed. The G4j force reconcile (a fresh
+ * `…/reconcile/<seat>` key) moves a prepared attempt to reconciling so it
+ * can be stopped; any other step stays `not-built` and writes nothing.
  */
 
 import type {
@@ -43,10 +50,12 @@ import type { StopAttemptPort, StopAttemptResult } from '../ports/in/StopAttempt
 import type { CollectAttemptArtifactsPort } from '../ports/in/CollectAttemptArtifactsPort.in-port.js';
 import type { CommitEditOnlyAttemptPort } from '../ports/in/CommitEditOnlyAttemptPort.in-port.js';
 import type { EvaluateAttemptGatePort } from '../ports/in/EvaluateAttemptGatePort.in-port.js';
+import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 import { AttemptRevisionConflictError } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import {
   parseSeatTool,
   type AttemptRecord,
+  type AttemptRunnerRecord,
   type AttemptSeatOverrideRecord,
 } from '../../domain/execution-records.js';
 import type { ArtifactManifestVerdict } from '../../domain/artifact-manifest.js';
@@ -73,7 +82,7 @@ import {
   type LaneRunResultReasonCode,
 } from '../../domain/lane-run-step-facts.js';
 import type { LaneRunJournalOutcome } from '../../domain/lane-run-journal.js';
-import { head12Of } from '../../domain/lane-run-keys.js';
+import { head12Of, parseLaneRunKey } from '../../domain/lane-run-keys.js';
 import { isCalendarDateTime } from '../../domain/plain-record-reads.js';
 import type {
   LaneRunCursorsRecord,
@@ -119,6 +128,12 @@ export interface AdvanceLaneRunDependencies {
   readonly commitEditOnlyAttempt?: CommitEditOnlyAttemptPort;
   /** The frozen gate verdict (K4-2, K4-6); absent → `not-wired gate`. */
   readonly evaluateAttemptGate?: EvaluateAttemptGatePort;
+  /**
+   * Resolve the runner that addresses a host for the dispatch reconcile's
+   * worktree read (K4-7); absent → a dispatch reconcile that needs the
+   * worktree read records `ambiguous` / `worktree-unknown`.
+   */
+  readonly runnerForAttempt?: RunnerForAttemptPort;
   /** The installation schema version the dispatching root runs under (H9a2). */
   readonly installationSchemaVersion?: number;
 }
@@ -431,7 +446,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'not-built', decision: 'act', step: decision.step };
     }
     if (decision.kind === 'reconcile') {
-      return { outcome: 'not-built', decision: 'reconcile', step: decision.step };
+      return this.performReconcile(record, gathered, decision, request);
     }
     if (decision.kind === 'cancel') {
       return this.performCancel(decision, request);
@@ -931,42 +946,73 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     if (intentRefusal !== null) {
       return { outcome: 'refused', reason: intentRefusal };
     }
+    return this.runCollectBody(record, gathered, decision, request, decision.key);
+  }
+
+  /**
+   * The collect body after its intent (K4-6): the frozen artifact list is
+   * read before any write, the edit-only commit step runs first for an agy
+   * attempt, then the collection. Both steps are safe to repeat — the commit
+   * reads `already-committed`, a collected record is not collected twice —
+   * so the collect reconcile (K4-7) runs this same body under the pending
+   * key instead of appending a second intent.
+   */
+  private async runCollectBody(
+    record: LaneRunRecord,
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'act' | 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+    key: string,
+  ): Promise<AdvanceLaneRunResult> {
+    const collect = this.deps.collectAttemptArtifacts;
+    if (collect === undefined) {
+      return { outcome: 'not-wired', step: decision.step };
+    }
+    const latest = gathered.latestAttempt;
+    if (latest === null) {
+      return { outcome: 'waiting', reason: 'facts-inconsistent' };
+    }
+    // Shared by the act and the reconcile: an agy attempt is never collected without its edit-only commit.
+    if (latest.runner?.kind === 'agy' && this.deps.commitEditOnlyAttempt === undefined) {
+      return { outcome: 'not-wired', step: decision.step };
+    }
     if (latest.state !== 'ended' || latest.completionReceipt === null) {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'no-completion-receipt');
+      const resultRefusal = await this.appendRunResult(request, key, 'refused', 'no-completion-receipt');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'no-completion-receipt' };
+      return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'no-completion-receipt' };
     }
     // The frozen artifact list is read before any write: an absent or unreadable manifest, or an
     // unreadable expectedArtifacts, refuses the collect before the edit-only commit touches git.
     const manifest = await readFrozenManifest(latest, this.deps.artifactPort);
     const expectedArtifacts = manifest === null ? null : manifestExpectedArtifacts(manifest);
     if (expectedArtifacts === null) {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'collect-refused');
+      const resultRefusal = await this.appendRunResult(request, key, 'refused', 'collect-refused');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'collect-refused' };
+      return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'collect-refused' };
     }
+    const commitEditOnlyAttempt = this.deps.commitEditOnlyAttempt;
     if (latest.runner?.kind === 'agy' && commitEditOnlyAttempt !== undefined) {
       const committed = await commitEditOnlyAttempt.commitEditOnlyAttempt({
         attemptId: latest.id,
         nowIso: request.nowIso,
       });
       if (committed.outcome === 'refused') {
-        const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'edit-only-refused');
+        const resultRefusal = await this.appendRunResult(request, key, 'refused', 'edit-only-refused');
         if (resultRefusal !== null) {
           return { outcome: 'refused', reason: resultRefusal };
         }
-        return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'edit-only-refused' };
+        return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'edit-only-refused' };
       }
       if (committed.outcome === 'unknown') {
-        const resultRefusal = await this.appendRunResult(request, decision.key, 'ambiguous', 'edit-only-unknown');
+        const resultRefusal = await this.appendRunResult(request, key, 'ambiguous', 'edit-only-unknown');
         if (resultRefusal !== null) {
           return { outcome: 'refused', reason: resultRefusal };
         }
-        return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'edit-only-unknown' };
+        return { outcome: 'acted', step: decision.step, key, result: 'ambiguous', reasonCode: 'edit-only-unknown' };
       }
     }
     const collected = await collect.collectAttemptArtifacts({
@@ -976,17 +1022,17 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       completionReceipt: latest.completionReceipt,
     });
     if (collected.outcome === 'collected') {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'collected');
+      const resultRefusal = await this.appendRunResult(request, key, 'completed', 'collected');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'collected' };
+      return { outcome: 'acted', step: decision.step, key, result: 'completed', reasonCode: 'collected' };
     }
-    const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'collect-refused');
+    const resultRefusal = await this.appendRunResult(request, key, 'refused', 'collect-refused');
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
-    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'collect-refused' };
+    return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'collect-refused' };
   }
 
   /**
@@ -1000,8 +1046,25 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     decision: Extract<LaneRunDecision, { kind: 'act' }>,
     request: AdvanceLaneRunRequest,
   ): Promise<AdvanceLaneRunResult> {
-    const gate = this.deps.evaluateAttemptGate;
-    if (gate === undefined) {
+    const preCheck = await this.gatePreCheck(record, gathered, decision, request);
+    if (preCheck !== null) {
+      return preCheck;
+    }
+    const intentRefusal = await this.appendRunIntent(request, decision.key, null);
+    if (intentRefusal !== null) {
+      return { outcome: 'refused', reason: intentRefusal };
+    }
+    return this.runGateBody(record, gathered, decision, request, decision.key);
+  }
+
+  /** The gate's pre-checks before its intent (K4-6): the wiring, the attempt's artifacts, the sealed collection. */
+  private async gatePreCheck(
+    record: LaneRunRecord,
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'act' | 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult | null> {
+    if (this.deps.evaluateAttemptGate === undefined) {
       return { outcome: 'not-wired', step: decision.step };
     }
     const latest = gathered.latestAttempt;
@@ -1012,33 +1075,54 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     if (gathered.facts.attempt?.collection?.manifest !== 'sealed') {
       return this.performPark(record, 'artifacts-unsealed', null, gathered.facts.state, request);
     }
-    const intentRefusal = await this.appendRunIntent(request, decision.key, null);
-    if (intentRefusal !== null) {
-      return { outcome: 'refused', reason: intentRefusal };
+    return null;
+  }
+
+  /**
+   * The gate body after its intent (K4-6): evaluate the frozen acceptance
+   * spec at the collected head and record the typed verdict's mapping. A
+   * second evaluation returns the first's stored outcome (S2b journals it
+   * once), so the gate reconcile (K4-7) runs this same body under the
+   * pending key instead of appending a second intent.
+   */
+  private async runGateBody(
+    record: LaneRunRecord,
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'act' | 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+    key: string,
+  ): Promise<AdvanceLaneRunResult> {
+    const gate = this.deps.evaluateAttemptGate;
+    if (gate === undefined) {
+      return { outcome: 'not-wired', step: decision.step };
+    }
+    const latest = gathered.latestAttempt;
+    if (latest === null || latest.artifacts === null) {
+      return { outcome: 'waiting', reason: 'facts-inconsistent' };
     }
     const verdict = await gate.evaluateAttemptGate({
       attemptId: latest.id,
       candidateHeadSha: latest.artifacts.headCommit,
     });
     if (verdict.verdict === 'passed') {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'gate-passed');
+      const resultRefusal = await this.appendRunResult(request, key, 'completed', 'gate-passed');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'gate-passed' };
+      return { outcome: 'acted', step: decision.step, key, result: 'completed', reasonCode: 'gate-passed' };
     }
     if (verdict.verdict === 'failed') {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'gate-failed');
+      const resultRefusal = await this.appendRunResult(request, key, 'completed', 'gate-failed');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'gate-failed' };
+      return { outcome: 'acted', step: decision.step, key, result: 'completed', reasonCode: 'gate-failed' };
     }
-    const resultRefusal = await this.appendRunResult(request, decision.key, 'ambiguous', 'gate-unknown');
+    const resultRefusal = await this.appendRunResult(request, key, 'ambiguous', 'gate-unknown');
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
-    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'gate-unknown' };
+    return { outcome: 'acted', step: decision.step, key, result: 'ambiguous', reasonCode: 'gate-unknown' };
   }
 
   /**
@@ -1087,6 +1171,470 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'refused', reason: resultRefusal };
     }
     return { outcome: 'acted', step: 'stop', key: decision.key, result: outcome, reasonCode };
+  }
+
+  /**
+   * The `reconcile` decisions (K4-7, §3.5): an intent without a result is
+   * reconciled, never repeated. One private handler per step; the result
+   * entry is appended under the pending key, and nothing here calls an
+   * acting port of a one-way step. A key whose step is `reconcile` is the
+   * G4j force reconcile; any other unhandled step stays `not-built`.
+   */
+  private async performReconcile(
+    record: LaneRunRecord,
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const parsed = parseLaneRunKey(decision.key);
+    if (parsed !== null && parsed.kind === 'step' && parsed.step === 'reconcile') {
+      return this.reconcileForceStop(gathered, decision, request);
+    }
+    if (decision.step === 'prepare') {
+      return this.reconcilePrepare(record, decision, request);
+    }
+    if (decision.step === 'dispatch') {
+      return this.reconcileDispatch(gathered, decision, request);
+    }
+    if (decision.step === 'stop') {
+      return this.reconcileStop(gathered, decision, request);
+    }
+    if (decision.step === 'collect') {
+      return this.reconcileCollect(record, gathered, decision, request);
+    }
+    if (decision.step === 'gate') {
+      return this.reconcileGate(record, gathered, decision, request);
+    }
+    return { outcome: 'not-built', decision: 'reconcile', step: decision.step };
+  }
+
+  /** The minted id of a key's intent, or null when the key has no intent. */
+  private async intentMintedIdOf(key: string): Promise<string | null> {
+    const entries = await this.deps.runJournal.listForKey(key);
+    for (const entry of entries) {
+      if (entry.kind === 'intent') {
+        return entry.mintedId;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The prepare reconcile (§3.5): the key's minted id is the attempt the
+   * prepare act wrote before it saved the run record. When the attempt
+   * exists the run record gains the id it may still lack (the crash lost the
+   * save); when it does not, the ordinal is spent: the id is appended anyway
+   * (a burned ordinal reads as a `cancelled` attempt fact) and the next
+   * prepare mints a new attempt under a new key. The one-way key is never
+   * re-sent.
+   */
+  private async reconcilePrepare(
+    record: LaneRunRecord,
+    decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const mintedId = await this.intentMintedIdOf(decision.key);
+    if (mintedId === null) {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'not-started', 'attempt-absent');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'not-started', reasonCode: 'attempt-absent' };
+    }
+    const attempt = await this.deps.attemptRepo.findAttemptById(mintedId);
+    const outcome: LaneRunJournalOutcome = attempt !== null ? 'reconciled' : 'not-started';
+    const reasonCode: LaneRunResultReasonCode = attempt !== null ? 'prepared' : 'attempt-absent';
+    // The ordinal is spent on the run record BEFORE the result is journalled: once a result exists this
+    // handler never runs again, so a crash between the two must leave the id on the run, never off it.
+    if (!record.attemptIds.includes(mintedId)) {
+      const saved = await this.saveOrRefuse(
+        { ...record, attemptIds: [...record.attemptIds, mintedId], revision: record.revision + 1 },
+        request,
+      );
+      if (!saved.ok) {
+        return { outcome: 'refused', reason: saved.reason };
+      }
+    }
+    const resultRefusal = await this.appendRunResult(request, decision.key, outcome, reasonCode);
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: outcome, reasonCode };
+  }
+
+  /**
+   * The dispatch reconcile (§3.5, §3.9.1): one-way, so it only reads and
+   * records. The attempt record decides first — `DispatchAttempt` saves
+   * `dispatching` before it calls the runner, so a record still
+   * `intent-recorded` proves no start was requested for it — and only that
+   * case inspects the worktree.
+   */
+  private async reconcileDispatch(
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const mintedId = await this.intentMintedIdOf(decision.key);
+    const attempt = mintedId === null ? null : await this.deps.attemptRepo.findAttemptById(mintedId);
+    if (
+      attempt !== null &&
+      (attempt.state === 'running' || attempt.state === 'ended' || attempt.state === 'collected' || attempt.sessionId !== null)
+    ) {
+      return this.reconcileDispatchStarted(gathered, decision, request, 'dispatch-started');
+    }
+    if (
+      attempt !== null &&
+      attempt.state === 'cancelled' &&
+      attempt.sessionId === null &&
+      !(await this.dispatchEverJournalled(attempt.id))
+    ) {
+      // Re-entry after a crash between the idle-worktree cancel and its result. DispatchAttempt journals a
+      // `dispatch` intent before it contacts any runner, so a cancelled attempt with no such entry never
+      // reached a runner, whoever cancelled it; one with an entry did, and stays runner-refused below.
+      return this.closeDispatchNotStarted(decision, request);
+    }
+    if (attempt !== null && attempt.state === 'cancelled') {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'runner-refused');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      const conductRefusal = await this.conductDispatching(gathered.facts.state, request);
+      if (conductRefusal !== null) {
+        return { outcome: 'refused', reason: conductRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'runner-refused' };
+    }
+    if (
+      attempt !== null &&
+      (attempt.state === 'dispatching' || attempt.state === 'reconciling' || attempt.state === 'blocked')
+    ) {
+      const result = await this.deps.reconcileAttempt.reconcileAttempt({ attemptId: attempt.id, nowIso: request.nowIso });
+      if (result.outcome === 'active' || result.outcome === 'ended' || result.outcome === 'cancelled') {
+        return this.reconcileDispatchStarted(gathered, decision, request, 'reconciled');
+      }
+      // unknown, refused, not-found: the next advance parks `ambiguous dispatch`.
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'ambiguous', 'dispatch-unknown');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'dispatch-unknown' };
+    }
+    // The record is still `intent-recorded`, or absent: the worktree decides.
+    return this.reconcileDispatchByWorktree(gathered, decision, attempt, mintedId, request);
+  }
+
+  /** A dispatch reconcile that found the attempt started (or reconciled): record it and conduct `dispatching`. */
+  private async reconcileDispatchStarted(
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+    reasonCode: LaneRunResultReasonCode,
+  ): Promise<AdvanceLaneRunResult> {
+    const resultRefusal = await this.appendRunResult(request, decision.key, 'reconciled', reasonCode);
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    const conductRefusal = await this.conductDispatching(gathered.facts.state, request);
+    if (conductRefusal !== null) {
+      return { outcome: 'refused', reason: conductRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'reconciled', reasonCode };
+  }
+
+  /**
+   * The worktree read of a dispatch reconcile: the attempt is still
+   * `intent-recorded` or absent. The runner record to resolve with is the
+   * attempt's own; an agy seat without one is resolved from the held
+   * reservation's host (an agy worktree is never inspected through the
+   * opencode runner), an opencode seat resolves the legacy runner. `idle`
+   * proves the dispatch never started: the attempt is cancelled so its
+   * one-way key can never be re-sent.
+   */
+  private async reconcileDispatchByWorktree(
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+    attempt: AttemptRecord | null,
+    mintedId: string | null,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const ambiguous = async (reasonCode: LaneRunResultReasonCode): Promise<AdvanceLaneRunResult> => {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'ambiguous', reasonCode);
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode };
+    };
+    const runnerForAttempt = this.deps.runnerForAttempt;
+    if (runnerForAttempt === undefined) {
+      return ambiguous('worktree-unknown');
+    }
+    let runnerRecord: AttemptRunnerRecord | null = attempt?.runner ?? null;
+    if (runnerRecord === null && (parseSeatTool(attempt?.seatSelection?.tool) ?? 'opencode') === 'agy') {
+      const reservations = await this.deps.executionJournal.listActiveReservations();
+      const held = reservations.find((reservation) => reservation.attemptId === mintedId && reservation.held);
+      if (held === undefined || held.hostName == null) {
+        return ambiguous('worktree-unknown');
+      }
+      runnerRecord = {
+        kind: 'agy',
+        hostName: held.hostName,
+        remotePort: null,
+        host: null,
+        agent: null,
+        model: null,
+        variant: null,
+      };
+    }
+    const resolved = runnerForAttempt.runnerForAttempt({ runner: runnerRecord });
+    if (!resolved.ok || resolved.runner.inspectWorktreeRun === undefined) {
+      return ambiguous('worktree-unknown');
+    }
+    const attemptId = mintedId ?? (attempt !== null ? attempt.id : gathered.latestAttempt?.id ?? null);
+    const worktreePath = attempt?.worktreePath ?? gathered.latestAttempt?.worktreePath ?? null;
+    if (attemptId === null || worktreePath === null) {
+      return ambiguous('worktree-unknown');
+    }
+    const worktree = await resolved.runner.inspectWorktreeRun({ attemptId, worktreePath, runner: runnerRecord });
+    if (worktree.state === 'running') {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'ambiguous', 'worktree-running');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'worktree-running' };
+    }
+    if (worktree.state !== 'idle') {
+      return ambiguous('worktree-unknown');
+    }
+    // The untouched attempt is cancelled BEFORE the key is closed not-started, and only a confirmed
+    // cancel closes it: a not-started result over an attempt still intent-recorded would let it dispatch.
+    if (attempt !== null && attempt.state !== 'cancelled') {
+      const cancel = this.deps.cancelPreparedAttempt;
+      if (cancel === undefined) {
+        return ambiguous('worktree-unknown');
+      }
+      const cancelled = await cancel.cancelPreparedAttempt({ attemptId, nowIso: request.nowIso });
+      if (cancelled.outcome !== 'cancelled') {
+        return ambiguous('worktree-unknown');
+      }
+    }
+    return this.closeDispatchNotStarted(decision, request);
+  }
+
+  /** True when the execution journal holds a non-refused `dispatch` entry for the attempt (a runner may have been contacted). */
+  private async dispatchEverJournalled(attemptId: string): Promise<boolean> {
+    const entries = await this.deps.executionJournal.listJournalEntriesForAttempt(attemptId);
+    return entries.some((entry) => entry.action === 'dispatch' && entry.status !== 'refused');
+  }
+
+  /** The dispatch key's `not-started` / `worktree-idle` result, once its untouched attempt is cancelled. */
+  private async closeDispatchNotStarted(
+    decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const resultRefusal = await this.appendRunResult(request, decision.key, 'not-started', 'worktree-idle');
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'not-started', reasonCode: 'worktree-idle' };
+  }
+
+  /**
+   * The stop reconcile (§3.5): the stop act's intent without a result is
+   * settled from the attempt record alone — `StopAttempt` is never called
+   * again here. A terminal attempt completes the stop, `stop-timeout` when
+   * no force stop is recorded and `stop-force` (with the `stopped` conduct)
+   * otherwise; anything else stays `stop-unconfirmed`, which the decider
+   * retries under a retry key.
+   */
+  private async reconcileStop(
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    // The G4e cancel journals under the stop key with its attempt id; a stop intent carries none.
+    const cancelAttemptId = await this.intentMintedIdOf(decision.key);
+    if (cancelAttemptId !== null) {
+      return this.reconcileCancel(cancelAttemptId, decision, request);
+    }
+    const latest = gathered.latestAttempt;
+    const stored = latest === null ? null : await this.deps.attemptRepo.findAttemptById(latest.id);
+    const attempt = stored ?? latest;
+    const terminal =
+      attempt !== null &&
+      (attempt.state === 'cancelled' ||
+        attempt.state === 'collected' ||
+        (attempt.state === 'ended' && attempt.completionReceipt !== null && attempt.completionReceipt.authoritative === true));
+    if (!terminal) {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'stop-unconfirmed');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-unconfirmed' };
+    }
+    if (gathered.facts.stopMode === 'force') {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'stop-force');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      const appended = await this.appendConduct(request, 'stopped');
+      if (!appended.ok) {
+        return { outcome: 'refused', reason: appended.reason };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-force' };
+    }
+    const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'stop-timeout');
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-timeout' };
+  }
+
+  /**
+   * A pending G4e cancel intent (§3.9.1): settled as a cancel, never with stop semantics, so a
+   * never-dispatched attempt is never read as timed out. The cancel is record-only, so an attempt still
+   * `intent-recorded` is cancelled now; an already cancelled one is reported with the capacity it holds.
+   */
+  private async reconcileCancel(
+    attemptId: string,
+    decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const attempt = await this.deps.attemptRepo.findAttemptById(attemptId);
+    let outcome: LaneRunJournalOutcome;
+    let reasonCode: LaneRunResultReasonCode;
+    if (attempt === null) {
+      outcome = 'cancelled-unstarted';
+      reasonCode = 'attempt-absent';
+    } else if (attempt.state === 'cancelled') {
+      const reservations = await this.deps.executionJournal.listActiveReservations();
+      const held = reservations.some((reservation) => reservation.attemptId === attemptId && reservation.held);
+      outcome = 'cancelled-unstarted';
+      reasonCode = held ? 'capacity-held' : 'capacity-none-held';
+    } else if (attempt.state === 'intent-recorded') {
+      const cancel = this.deps.cancelPreparedAttempt;
+      if (cancel === undefined) {
+        return { outcome: 'not-wired', step: decision.step };
+      }
+      const cancelled = await cancel.cancelPreparedAttempt({ attemptId, nowIso: request.nowIso });
+      if (cancelled.outcome === 'cancelled') {
+        outcome = 'cancelled-unstarted';
+        reasonCode =
+          cancelled.capacity === 'released'
+            ? 'capacity-released'
+            : cancelled.capacity === 'none-held'
+              ? 'capacity-none-held'
+              : 'capacity-held';
+      } else {
+        outcome = 'refused';
+        reasonCode = cancelled.reason === 'changed' ? 'cancel-changed' : 'cancel-refused';
+      }
+    } else {
+      outcome = 'refused';
+      reasonCode = 'cancel-refused';
+    }
+    const resultRefusal = await this.appendRunResult(request, decision.key, outcome, reasonCode);
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: outcome, reasonCode };
+  }
+
+  /**
+   * The collect reconcile (§3.5): collect is not one-way, so its reconcile
+   * completes it. An already collected attempt records `reconciled`; an
+   * ended attempt runs the K4-6 collect body, both of whose steps are safe
+   * to repeat.
+   */
+  private async reconcileCollect(
+    record: LaneRunRecord,
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const latest = gathered.latestAttempt;
+    if (latest === null) {
+      return { outcome: 'waiting', reason: 'facts-inconsistent' };
+    }
+    if (latest.state === 'collected') {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'reconciled', 'collected');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'reconciled', reasonCode: 'collected' };
+    }
+    return this.runCollectBody(record, gathered, decision, request, decision.key);
+  }
+
+  /**
+   * The gate reconcile (§3.5): gate is not one-way, so its reconcile
+   * completes it — the K4-6 pre-checks and mapping run again, and the
+   * evaluation returns the first's stored outcome.
+   */
+  private async reconcileGate(
+    record: LaneRunRecord,
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const preCheck = await this.gatePreCheck(record, gathered, decision, request);
+    if (preCheck !== null) {
+      return preCheck;
+    }
+    return this.runGateBody(record, gathered, decision, request, decision.key);
+  }
+
+  /**
+   * The G4j force reconcile (§3.5, §3.9.1): a forced stop may not stop a
+   * started prepared attempt before a fresh `…/reconcile/<seat>` key has
+   * reconciled it, moving the record from `intent-recorded` to `reconciling`
+   * (K4-1's pinned behaviour) so the next advance stops it by worktree
+   * through G4d. The intent is appended first (mintedId = the attempt id);
+   * an agy attempt with no runner record stays `ambiguous` — the forced stop
+   * that follows would resolve a null runner record to the opencode runner —
+   * so the park stands and the owner stops the lane.
+   */
+  private async reconcileForceStop(
+    gathered: GatheredLaneRunFacts,
+    decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+    request: AdvanceLaneRunRequest,
+  ): Promise<AdvanceLaneRunResult> {
+    const latest = gathered.latestAttempt;
+    if (latest === null) {
+      return { outcome: 'waiting', reason: 'facts-inconsistent' };
+    }
+    const entries = await this.deps.runJournal.listForKey(decision.key);
+    if (!entries.some((entry) => entry.kind === 'intent')) {
+      const intentRefusal = await this.appendRunIntent(request, decision.key, latest.id);
+      if (intentRefusal !== null) {
+        return { outcome: 'refused', reason: intentRefusal };
+      }
+    }
+    if ((latest.runner ?? null) === null && (parseSeatTool(latest.seatSelection?.tool) ?? 'opencode') === 'agy') {
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'ambiguous', 'worktree-unknown');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'worktree-unknown' };
+    }
+    const result = await this.deps.reconcileAttempt.reconcileAttempt({ attemptId: latest.id, nowIso: request.nowIso });
+    // Only a settled answer is `reconciled`; a refused or unknown reconcile settles nothing and stays ambiguous.
+    let outcome: LaneRunJournalOutcome;
+    let reasonCode: LaneRunResultReasonCode;
+    if (result.outcome === 'not-found') {
+      outcome = 'not-started';
+      reasonCode = 'attempt-absent';
+    } else if (result.outcome === 'refused' || result.outcome === 'unknown') {
+      outcome = 'ambiguous';
+      reasonCode = 'dispatch-unknown';
+    } else {
+      outcome = 'reconciled';
+      reasonCode = 'reconciled';
+    }
+    const resultRefusal = await this.appendRunResult(request, decision.key, outcome, reasonCode);
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: outcome, reasonCode };
   }
 
   private async appendConduct(

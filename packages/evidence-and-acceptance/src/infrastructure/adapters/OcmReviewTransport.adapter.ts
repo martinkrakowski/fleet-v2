@@ -277,53 +277,50 @@ export interface ParsedReviewReply {
   readonly findings: ReviewFindingRecord[];
 }
 
-/** Findings from every line of `text`; the verdict only from the last non-empty line of `verdictText`. */
-export function parseReviewReply(text: string, verdictText: string): ParsedReviewReply {
+/** Every finding line of `text`, numbered in order. */
+function parseFindingLines(text: string): ReviewFindingRecord[] {
   const findings: ReviewFindingRecord[] = [];
-
   for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    const findingMatch = FINDING_PATTERN.exec(line);
+    const findingMatch = FINDING_PATTERN.exec(rawLine.trim());
     if (findingMatch !== null) {
       findings.push({
         findingId: `review-${findings.length + 1}`,
         severity: findingMatch[1] as FindingSeverity,
         summary: findingMatch[4].trim(),
         filePath: findingMatch[2] === '-' ? null : findingMatch[2],
-        line: findingMatch[3] !== undefined ? parseInt(findingMatch[3], 10) : null,
+        line: findingMatch[3] === undefined ? null : Number.parseInt(findingMatch[3], 10),
         state: 'unresolved',
         dispositionReason: null,
         dispositionEvidenceRef: null,
       });
     }
   }
+  return findings;
+}
 
-  let verdict: 'PASS' | 'FAIL' | null = null;
-  if (verdictText.trim() !== '') {
-    const lines = verdictText.split(/\r?\n/);
-    let lastNonEmptyLine: string | null = null;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (lines[i].trim() !== '') {
-        lastNonEmptyLine = lines[i];
-        break;
-      }
-    }
-    if (lastNonEmptyLine !== null) {
-      const verdictMatch = VERDICT_PATTERN.exec(lastNonEmptyLine);
-      if (verdictMatch !== null) {
-        verdict = verdictMatch[1] as 'PASS' | 'FAIL';
-      }
-    }
+/** The verdict on the last non-empty line of `verdictText`, or null when that line carries none. */
+function lastLineVerdict(verdictText: string): 'PASS' | 'FAIL' | null {
+  const lastNonEmptyLine = verdictText
+    .split(/\r?\n/)
+    .reverse()
+    .find((line) => line.trim() !== '');
+  if (lastNonEmptyLine === undefined) {
+    return null;
   }
+  const verdictMatch = VERDICT_PATTERN.exec(lastNonEmptyLine);
+  return verdictMatch === null ? null : (verdictMatch[1] as 'PASS' | 'FAIL');
+}
 
+/** Findings from every line of `text`; the verdict only from the last non-empty line of `verdictText`. */
+export function parseReviewReply(text: string, verdictText: string): ParsedReviewReply {
+  const findings = parseFindingLines(text);
+  const verdict = lastLineVerdict(verdictText);
   let result: EvidenceResultValue = 'unknown';
   if (verdict === 'PASS') {
-    const hasBlocker = findings.some((f) => f.severity === 'blocker');
-    result = hasBlocker ? 'fail' : 'pass';
+    result = findings.some((f) => f.severity === 'blocker') ? 'fail' : 'pass';
   } else if (verdict === 'FAIL') {
     result = 'fail';
   }
-
   return { result, findings };
 }
 
@@ -335,53 +332,14 @@ export function parseReviewReply(text: string, verdictText: string): ParsedRevie
  * `parseReviewReply` unchanged.
  */
 export function parseReviewReplyStrict(text: string, verdictText: string): ParsedReviewReply {
-  const findings: ReviewFindingRecord[] = [];
-
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    const findingMatch = FINDING_PATTERN.exec(line);
-    if (findingMatch !== null) {
-      findings.push({
-        findingId: `review-${findings.length + 1}`,
-        severity: findingMatch[1] as FindingSeverity,
-        summary: findingMatch[4].trim(),
-        filePath: findingMatch[2] === '-' ? null : findingMatch[2],
-        line: findingMatch[3] !== undefined ? parseInt(findingMatch[3], 10) : null,
-        state: 'unresolved',
-        dispositionReason: null,
-        dispositionEvidenceRef: null,
-      });
-    }
-  }
-
-  let verdict: 'PASS' | 'FAIL' | null = null;
-  if (verdictText.trim() !== '') {
-    const lines = verdictText.split(/\r?\n/);
-    let lastNonEmptyLine: string | null = null;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (lines[i].trim() !== '') {
-        lastNonEmptyLine = lines[i];
-        break;
-      }
-    }
-    if (lastNonEmptyLine !== null) {
-      const verdictMatch = VERDICT_PATTERN.exec(lastNonEmptyLine);
-      if (verdictMatch !== null) {
-        verdict = verdictMatch[1] as 'PASS' | 'FAIL';
-      }
-    }
-  }
-
+  const findings = parseFindingLines(text);
+  const verdict = lastLineVerdict(verdictText);
   let result: EvidenceResultValue = 'unknown';
   if (verdict === 'PASS') {
-    const hasBlockingFinding = findings.some(
-      (f) => f.severity === 'blocker' || f.severity === 'major',
-    );
-    result = hasBlockingFinding ? 'fail' : 'pass';
+    result = findings.some((f) => f.severity === 'blocker' || f.severity === 'major') ? 'fail' : 'pass';
   } else if (verdict === 'FAIL' && findings.length > 0) {
     result = 'fail';
   }
-
   return { result, findings };
 }
 

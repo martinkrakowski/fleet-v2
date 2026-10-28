@@ -233,13 +233,20 @@ function manifestTimeLimitSeconds(manifest: Record<string, unknown> | null): num
 
 type WriteOutcome = { readonly ok: true } | { readonly ok: false; readonly reason: AdvanceLaneRunRefusal };
 
+/**
+ * One advance's facts plus what its decision hooks need. Kept per call, never on
+ * the instance: one use case serves overlapping advances of different runs.
+ */
+interface GatheredLaneRunFacts {
+  readonly facts: LaneRunFacts;
+  /** A running attempt's deadline could not be read (K4-4b): park `ambiguous stop`. */
+  readonly deadlineUnknown: boolean;
+  /** The latest attempt as gathered, for the admission hook. */
+  readonly latestAttempt: AttemptRecord | null;
+}
+
 export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
   constructor(private readonly deps: AdvanceLaneRunDependencies) {}
-
-  /** Set when a running attempt's deadline cannot be read (K4-4b). */
-  private deadlineUnknown = false;
-  /** The latest attempt as gathered, for the admission hook (K4-4b). */
-  private latestAttempt: AttemptRecord | null = null;
 
   async advanceLaneRun(request: AdvanceLaneRunRequest): Promise<AdvanceLaneRunResult> {
     const invalid = requestShapeError(request);
@@ -289,24 +296,25 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'waiting', reason: 'facts-inconsistent' };
     }
 
-    const facts = await this.gatherFacts(record, entries, request, journalState);
-    const decision = nextLaneRunAction(record, facts, request.nowIso);
-    return this.performDecision(record, facts, decision, request);
+    const gathered = await this.gatherFacts(record, entries, request, journalState);
+    const decision = nextLaneRunAction(record, gathered.facts, request.nowIso);
+    return this.performDecision(record, gathered, decision, request);
   }
 
   private async performDecision(
     record: LaneRunRecord,
-    facts: LaneRunFacts,
+    gathered: GatheredLaneRunFacts,
     decision: LaneRunDecision,
     request: AdvanceLaneRunRequest,
   ): Promise<AdvanceLaneRunResult> {
+    const facts = gathered.facts;
     if (decision.kind === 'done') {
       return { outcome: 'done' };
     }
     if (decision.kind === 'wait' && decision.reason === 'admission') {
-      return this.performAdmissionWait(record, facts, request);
+      return this.performAdmissionWait(record, facts, gathered.latestAttempt, request);
     }
-    if (decision.kind === 'wait' && decision.reason === 'lane-running' && this.deadlineUnknown) {
+    if (decision.kind === 'wait' && decision.reason === 'lane-running' && gathered.deadlineUnknown) {
       return this.performPark(record, 'ambiguous', 'stop', facts.state, request);
     }
     if (decision.kind === 'wait') {
@@ -410,9 +418,8 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     entries: readonly LaneRunJournalEntryRecord[],
     request: AdvanceLaneRunRequest,
     journalState: LaneRunStateValue,
-  ): Promise<LaneRunFacts> {
-    this.deadlineUnknown = false;
-    this.latestAttempt = null;
+  ): Promise<GatheredLaneRunFacts> {
+    let deadlineUnknown = false;
 
     const attemptRecords = await Promise.all(
       record.attemptIds.map((attemptId) => this.deps.attemptRepo.findAttemptById(attemptId)),
@@ -432,7 +439,6 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
         latest = reconciled;
       }
     }
-    this.latestAttempt = latest;
 
     const state = journalState;
     const phase = latest === null ? null : laneRunAttemptPhaseOf(latest.state);
@@ -445,7 +451,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       if (dispatchedAt !== null && timeLimitSeconds !== null) {
         deadlineIso = new Date(Date.parse(dispatchedAt) + timeLimitSeconds * 1000).toISOString();
       } else {
-        this.deadlineUnknown = true;
+        deadlineUnknown = true;
       }
     }
 
@@ -484,7 +490,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       }
     }
 
-    return {
+    const facts: LaneRunFacts = {
       state,
       halted: request.halted,
       stopMode: stopFacts.stopMode,
@@ -509,6 +515,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       refusedStep: laneRunRefusedStep(entries, record.runId, record.round),
       merge: { oneWayDoor: true, branchBehind: true, trainFree: false, policyGrant: false },
     };
+    return { facts, deadlineUnknown, latestAttempt: latest };
   }
 
   /** Reconcile the latest running attempt; `refused` / `not-found` keep the record as read. */
@@ -566,10 +573,10 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
   private async performAdmissionWait(
     record: LaneRunRecord,
     facts: LaneRunFacts,
+    latest: AttemptRecord | null,
     request: AdvanceLaneRunRequest,
   ): Promise<AdvanceLaneRunResult> {
     const attempt = facts.attempt;
-    const latest = this.latestAttempt;
     if (!request.halted && attempt !== null && attempt.phase === 'prepared' && latest !== null) {
       await this.deps.admission.admit({
         attemptId: attempt.attemptId,

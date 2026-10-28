@@ -151,7 +151,7 @@ export const PROTECTED_PATH_RULES: readonly LaneDiffProtectedRule[] = [
   { pattern: "pnpm-workspace\\.yaml", anyDepth: false, caseInsensitive: true },
   { pattern: "\\.pnpmfile\\.cjs", anyDepth: true, caseInsensitive: true },
   // Turbo task configuration (lane speed plan D27/D29): cache inputs and env declarations.
-  { pattern: "turbo\\.json", anyDepth: true, caseInsensitive: true },
+  { pattern: String.raw`turbo\.json`, anyDepth: true, caseInsensitive: true },
 ];
 
 type LaneDiffProtectedRuleKind = "dir" | "prefix" | "file";

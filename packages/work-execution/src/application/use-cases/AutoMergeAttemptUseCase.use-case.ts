@@ -528,13 +528,15 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
         decisionRevision: grant.decisionRevision,
       };
     }
+    // Forge text (gh stderr) is capped before it reaches a result or a record.
+    const forgeLine = forgeResult.reason.slice(0, MAX_DETAIL_TEXT);
     if (forgeResult.forgeAmbiguous === true) {
-      return this.notMerged(ctx, 'forge-ambiguous', forgeResult.reason, [forgeResult.reason]);
+      return this.notMerged(ctx, 'forge-ambiguous', forgeLine, [forgeLine]);
     }
     if (forgeResult.forgeRefusalKind !== undefined) {
-      return this.notMerged(ctx, 'forge-refused', forgeResult.reason, [
+      return this.notMerged(ctx, 'forge-refused', forgeLine, [
         'refusal kind: ' + forgeResult.forgeRefusalKind,
-        forgeResult.reason.slice(0, MAX_DETAIL_TEXT),
+        forgeLine,
       ]);
     }
     // A refusal with no forge kind: a moved head goes back through acceptance at
@@ -548,9 +550,7 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
     if (currentAttempt === null || currentAttempt.artifacts?.headCommit !== head) {
       return this.notMerged(ctx, 'head-moved', 'the attempt head moved during the merge attempt');
     }
-    return this.notMerged(ctx, 'forge-refused-before-grant', forgeResult.reason, [
-      forgeResult.reason.slice(0, MAX_DETAIL_TEXT),
-    ]);
+    return this.notMerged(ctx, 'forge-refused-before-grant', forgeLine, [forgeLine]);
   }
 
   /**

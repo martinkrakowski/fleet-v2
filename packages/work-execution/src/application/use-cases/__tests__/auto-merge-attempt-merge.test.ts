@@ -485,6 +485,38 @@ describe('AutoMergeAttemptUseCase (AM4a-3)', () => {
     }
   });
 
+  it('passes the issued grant id, head, attempt and policy revision to the forge', async () => {
+    const built = build();
+    built.grant.answer = { outcome: 'issued', grantId: 'grant-policy-distinct-7', decisionRevision: DECISION_REVISION };
+    await seed(built);
+    await built.run();
+    expect(built.forge.calls).toBe(1);
+    expect(built.forge.requests[0]).toMatchObject({
+      attemptId: ATTEMPT_ID,
+      workOrderId: WORK_ORDER_ID,
+      kind: 'merge-pr',
+      expectedHeadSha: HEAD,
+      authorizationGrantId: 'grant-policy-distinct-7',
+      authorizedBy: DECISION_REVISION,
+    });
+  });
+
+  it('caps forge text in the result and the routed lines for ambiguous and refused outcomes', async () => {
+    const long = 'x'.repeat(5000);
+    for (const answer of [
+      { outcome: 'refused', reason: long, forgeAmbiguous: true },
+      { outcome: 'refused', reason: long, forgeRefusalKind: 'conflict' },
+    ] as const) {
+      const built = build();
+      built.forge.answer = answer as typeof built.forge.answer;
+      await seed(built);
+      const result = await built.run();
+      expect(result).toMatchObject({ outcome: 'not-merged' });
+      expect(JSON.stringify(result)).not.toContain('x'.repeat(301));
+      expect(JSON.stringify(built.routing)).not.toContain('x'.repeat(301));
+    }
+  });
+
   it('never merges a closed work order twice', async () => {
     const built = buildWithRealForge();
     await seed(built);

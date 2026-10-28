@@ -55,8 +55,8 @@ export class AutoMergeOwnerRoutingAdapter implements AutoMergeOwnerRoutingPort {
   constructor(private readonly delegate?: AutoMergeOwnerRoutingDelegates) {}
 
   async recordAttention(notice: AutoMergeNotice): Promise<AutoMergeNoticeResult> {
-    const recordAttentionItem = this.delegate?.recordAttentionItem?.recordAttentionItem;
-    if (!recordAttentionItem) {
+    const attention = this.delegate?.recordAttentionItem;
+    if (!attention) {
       return { outcome: 'refused', reason: 'not-configured' };
     }
     const body: RecordAttentionItemBody = {
@@ -68,7 +68,7 @@ export class AutoMergeOwnerRoutingAdapter implements AutoMergeOwnerRoutingPort {
     };
     let answer: RecordAttentionItemResult;
     try {
-      answer = await recordAttentionItem(body, 'auto-merge');
+      answer = await attention.recordAttentionItem(body, 'auto-merge');
     } catch {
       return { outcome: 'refused', reason: 'attention item could not be recorded' };
     }
@@ -84,16 +84,22 @@ export class AutoMergeOwnerRoutingAdapter implements AutoMergeOwnerRoutingPort {
   }
 
   async askOwner(notice: AutoMergeNotice): Promise<AutoMergeNoticeResult> {
-    const askOwnerQuestion = this.delegate?.askOwnerQuestion?.askOwnerQuestion;
+    const questions = this.delegate?.askOwnerQuestion;
     const newQuestionId = this.delegate?.newQuestionId;
-    if (!askOwnerQuestion || !newQuestionId) {
+    if (!questions || !newQuestionId) {
       return { outcome: 'refused', reason: 'not-configured' };
+    }
+    let questionId: string;
+    try {
+      questionId = newQuestionId();
+    } catch {
+      return { outcome: 'refused', reason: 'owner question id could not be minted' };
     }
     const title = (
       'Auto-merge held attempt ' + notice.attemptId + ': ' + notice.reason
     ).slice(0, 200);
     const request: AskOwnerQuestionRequest = {
-      questionId: newQuestionId(),
+      questionId,
       askedBy: 'auto-merge',
       title,
       body: bodyOf(notice),
@@ -121,7 +127,7 @@ export class AutoMergeOwnerRoutingAdapter implements AutoMergeOwnerRoutingPort {
     };
     let answer: AskOwnerQuestionResult;
     try {
-      answer = await askOwnerQuestion(request);
+      answer = await questions.askOwnerQuestion(request);
     } catch {
       return { outcome: 'refused', reason: 'owner question could not be asked' };
     }

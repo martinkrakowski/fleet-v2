@@ -164,6 +164,19 @@ describe('PolicyMergeGrantAdapter', () => {
     });
   });
 
+  it('calls a class-based grant port through its object, keeping its receiver', async () => {
+    const request = makeGrantRequest();
+    class GrantPort {
+      private readonly answer = grantedAnswer(request);
+      async issuePolicyForgeGrant() {
+        return this.answer;
+      }
+    }
+    const adapter = new PolicyMergeGrantAdapter({ issuePolicyForgeGrant: new GrantPort() as unknown as GrantPortDelegate });
+
+    await expect(adapter.issuePolicyMergeGrant(request)).resolves.toMatchObject({ outcome: 'issued', grantId: 'grant-1' });
+  });
+
   it('maps superseded to superseded', async () => {
     const request = makeGrantRequest();
     const delegate: GrantPortDelegate = {
@@ -430,6 +443,51 @@ describe('AutoMergeOwnerRoutingAdapter', () => {
       outcome: 'refused',
       reason: 'owner question could not be asked',
     });
+  });
+
+  it('calls class-based question and attention ports through their objects, keeping their receivers', async () => {
+    class AskPort {
+      private readonly answer = { outcome: 'asked' as const, question: questionRecord() };
+      async askOwnerQuestion() {
+        return this.answer;
+      }
+    }
+    class AttentionPort {
+      private readonly answer = { outcome: 'raised' as const };
+      async recordAttentionItem() {
+        return this.answer;
+      }
+    }
+    const adapter = new AutoMergeOwnerRoutingAdapter({
+      askOwnerQuestion: new AskPort() as unknown as AskPortDelegate,
+      recordAttentionItem: new AttentionPort() as never,
+      newQuestionId: () => 'question-1',
+    });
+
+    await expect(adapter.askOwner(makeNotice())).resolves.toEqual({ outcome: 'recorded' });
+    await expect(adapter.recordAttention(makeNotice())).resolves.toEqual({ outcome: 'recorded' });
+  });
+
+  it('refuses with a fixed reason when the question id source throws', async () => {
+    let asked = 0;
+    const delegate: AskPortDelegate = {
+      askOwnerQuestion: async () => {
+        asked += 1;
+        return { outcome: 'asked', question: questionRecord() };
+      },
+    };
+    const adapter = new AutoMergeOwnerRoutingAdapter({
+      askOwnerQuestion: delegate,
+      newQuestionId: () => {
+        throw new Error('boom');
+      },
+    });
+
+    await expect(adapter.askOwner(makeNotice())).resolves.toEqual({
+      outcome: 'refused',
+      reason: 'owner question id could not be minted',
+    });
+    expect(asked).toBe(0);
   });
 
   it('answers not-configured without delegates or an id source', async () => {

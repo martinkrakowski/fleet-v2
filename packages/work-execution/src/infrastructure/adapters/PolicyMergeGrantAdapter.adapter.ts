@@ -27,13 +27,14 @@ export class PolicyMergeGrantAdapter implements PolicyMergeGrantPort {
   async issuePolicyMergeGrant(
     request: PolicyMergeGrantRequest,
   ): Promise<PolicyMergeGrantResult> {
-    const issue = this.delegate?.issuePolicyForgeGrant?.issuePolicyForgeGrant;
-    if (!issue) {
+    // The delegate is called through its object, so a class-based port keeps its receiver.
+    const port = this.delegate?.issuePolicyForgeGrant;
+    if (!port) {
       return { outcome: 'refused', reason: 'not-configured' };
     }
     let answer: IssuePolicyForgeGrantResult;
     try {
-      answer = await issue({ ...request, forgeKind: 'merge-pr', source: 'autoMerge' });
+      answer = await port.issuePolicyForgeGrant({ ...request, forgeKind: 'merge-pr', source: 'autoMerge' });
     } catch {
       return { outcome: 'refused', reason: 'policy grant could not be issued' };
     }

@@ -441,12 +441,14 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
     expect(after?.revision).toBe(1);
   });
 
-  it('test 10: a cancel decision is reported not-built (step stop) and writes nothing', async () => {
+  it('test 10: a cancel decision with no cancel port wired reports not-wired and writes nothing', async () => {
     const harness = await makeHarness(runRecord(), attemptFixture());
     const stop = await harness.runJournal.append(stopIntentEntry(harness, NOW, 1));
     expect(stop.outcome).toBe('appended');
     const result = await advance(harness);
-    expect(result).toEqual({ outcome: 'not-built', decision: 'cancel', step: 'stop' });
+    // K4-5 built the G4e cancel act; this harness wires no cancel port, so the
+    // reached decision reports not-wired (the old not-built pin is superseded).
+    expect(result).toEqual({ outcome: 'not-wired', step: 'stop' });
     expect(harness.reconcileCalls).toEqual([]);
     expect(harness.admissionCalls).toEqual([]);
     expect(await harness.runJournal.listForRun(RUN_ID)).toHaveLength(1);

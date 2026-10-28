@@ -2,12 +2,13 @@
 /**
  * RunnerSelectorAdapter implements RunnerSelectorPort: pick the runner kind
  * and host for an attempt's seat from an installation's lane-runner hosts.
- * The installation's runner model is a union on `kind`; the selector narrows
- * on it against the seat's tool. A kind selects only when an adapter for it
- * was provided to the selector, so an `agy` selection is refused with
- * `runner-not-available` — and dispatch refuses before any spawn — until the
- * roots hand over the `agy` adapter (lane O14c2 implemented the adapter;
- * O14e1 wires it).
+ * The host selected is the first lane-runner host (in installation key order)
+ * whose runner kind equals the seat's tool. The installation's runner model
+ * is a union on `kind`; the selector narrows on it against the seat's tool.
+ * A kind selects only when an adapter for it was provided to the selector,
+ * so an `agy` selection is refused with `runner-not-available` — and
+ * dispatch refuses before any spawn — until the roots hand over the `agy`
+ * adapter (lane O14c2 implemented the adapter; O14e1 wires it).
  *
  * The input is a structural subset of `@fleet/installation`'s derived model,
  * so this module keeps work-execution free of a dependency on that package.
@@ -40,15 +41,25 @@ export interface RunnerSelectorAdapterOptions {
   readonly implementedRunnerKinds?: readonly RunnerKind[];
 }
 
-/** First host whose roles include `role`, or undefined. */
-function hostWithRole(
+/** Whether any host serves the lane-runner role. */
+function hasLaneRunnerHost(
   hosts: Readonly<Record<string, RunnerSelectorLaneRunnerHost>> | undefined,
-  role: string,
+): boolean {
+  return (
+    hosts !== undefined && Object.values(hosts).some((host) => host.roles?.includes('lane-runner'))
+  );
+}
+
+/** First lane-runner host (installation key order) whose runner kind is `kind`; undefined when none. */
+function laneRunnerHostOfKind(
+  hosts: Readonly<Record<string, RunnerSelectorLaneRunnerHost>> | undefined,
+  kind: RunnerKind,
 ): { name: string; host: RunnerSelectorLaneRunnerHost } | undefined {
   if (hosts === undefined) return undefined;
-  for (const name of Object.keys(hosts)) {
-    const host = hosts[name];
-    if (host.roles?.includes(role)) return { name, host };
+  for (const [name, host] of Object.entries(hosts)) {
+    if (!host.roles?.includes('lane-runner')) continue;
+    const hostKind = host.runner?.kind ?? 'opencode';
+    if (hostKind === kind) return { name, host };
   }
   return undefined;
 }
@@ -60,9 +71,8 @@ export class RunnerSelectorAdapter implements RunnerSelectorPort {
     // A seat without a recorded tool is today's opencode seat.
     const tool = request.seatTool?.trim() || 'opencode';
     const hosts = this.options?.hosts;
-    const laneRunnerHost = hostWithRole(hosts, 'lane-runner');
 
-    if (laneRunnerHost === undefined) {
+    if (!hasLaneRunnerHost(hosts)) {
       // No v2 lane-runner host: the legacy mapping is opencode-only.
       if (tool !== 'opencode') {
         return { ok: false, reason: 'runner-not-available' };
@@ -70,10 +80,16 @@ export class RunnerSelectorAdapter implements RunnerSelectorPort {
       return { ok: true, kind: 'opencode', hostName: null, remotePort: null };
     }
 
-    const runnerKind = laneRunnerHost.host.runner?.kind ?? 'opencode';
-    if (runnerKind !== tool) {
+    // The kind is the seat's tool; a tool that is not a declared runner kind
+    // is refused, never retried as another kind.
+    if (tool !== 'opencode' && tool !== 'agy') {
       return { ok: false, reason: 'runner-not-available' };
     }
+    const laneRunnerHost = laneRunnerHostOfKind(hosts, tool);
+    if (laneRunnerHost === undefined) {
+      return { ok: false, reason: 'runner-not-available' };
+    }
+    const runnerKind = laneRunnerHost.host.runner?.kind ?? 'opencode';
     const implemented = this.options?.implementedRunnerKinds ?? ['opencode'];
     if (!implemented.includes(runnerKind)) {
       // The host declares the kind but no adapter was provided for it: the

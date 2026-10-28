@@ -2,6 +2,7 @@
 
 export * from "./CancelPreparedAttemptPort.in-port.js";
 export * from "./CollectAttemptArtifactsPort.in-port.js";
+export * from "./CommitEditOnlyAttemptPort.in-port.js";
 export * from "./DispatchAttemptPort.in-port.js";
 export * from "./EvaluateAttemptGatePort.in-port.js";
 export * from "./ExecuteAuthorizedForgeActionPort.in-port.js";

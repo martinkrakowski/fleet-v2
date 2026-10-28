@@ -1,7 +1,7 @@
 // POST /v1/reviews/:id/receipt — RecordReviewReceipt
 import { getEvidenceUseCases } from "../../../../wiring/evidence/composition.js";
 import { evidenceResponse, isNotImplemented } from "../../../../wiring/evidence/errors.js";
-import { isPlainObject, readObjectBody } from "../../../../wiring/http-input";
+import { isPlainObject, readObjectBody, routeParam } from "../../../../wiring/http-input";
 import { workComposition } from "../../../../wiring/work/composition.js";
 
 type ReceiptRequestBody = Record<string, unknown>;
@@ -50,6 +50,7 @@ async function bindReceiptImplementerSeat(
 }
 
 export default defineEventHandler(async (event) => {
+  const receiptId = routeParam(event, "id");
   // `body.assessmentId` is forwarded untouched; the route parameter is the
   // receipt identity and is merged into `receipt.id`.
   const useCase = getEvidenceUseCases().recordReviewReceipt;
@@ -68,7 +69,7 @@ export default defineEventHandler(async (event) => {
         {
           ...body,
           receipt: isPlainObject(body.receipt)
-            ? { ...body.receipt, id: getRouterParam(event, "id") ?? "" }
+            ? { ...body.receipt, id: receiptId }
             : body.receipt,
         },
       );
@@ -82,6 +83,6 @@ export default defineEventHandler(async (event) => {
   const receipt = isPlainObject(bound.receipt) ? bound.receipt : {};
   return evidenceResponse(event, useCase, "RecordReviewReceipt", {
     ...bound,
-    receipt: { ...receipt, id: getRouterParam(event, "id") ?? "" },
+    receipt: { ...receipt, id: receiptId },
   });
 });

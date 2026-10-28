@@ -6,6 +6,7 @@ import {
   getMethod,
   getQuery,
   getRequestHeader,
+  getRouterParam,
   readBody,
   readRawBody,
   type H3Event,
@@ -158,4 +159,44 @@ export function readQueryRecord(event: H3Event): Record<string, unknown> {
   const rest = { ...(getQuery(event) as Record<string, unknown>) };
   delete rest.nowIso;
   return rest;
+}
+
+const INVALID_ROUTE_PARAM = "Invalid route parameter";
+
+function invalidRouteParam(): Error {
+  return createError({ statusCode: 400, statusMessage: INVALID_ROUTE_PARAM });
+}
+
+/** True when `value` holds a C0 control character or DEL (checked by code point, not a regular expression). */
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codePoint = value.codePointAt(index);
+    if (codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The named route parameter, fully percent-decoded. h3 decodes the request path before routing except
+ * `%2F` and `%25` (h3 1.15.11), so one decodeURIComponent here completes it: `team%2Falpha` is
+ * `team/alpha`. Refused with 400 and a fixed message, never echoing the value: absent or empty, malformed
+ * percent-encoding, a control character, `.` or `..`.
+ */
+export function routeParam(event: H3Event, name: string): string {
+  const raw = getRouterParam(event, name);
+  if (typeof raw !== "string" || raw === "") {
+    throw invalidRouteParam();
+  }
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    throw invalidRouteParam();
+  }
+  if (decoded === "" || decoded === "." || decoded === ".." || hasControlCharacter(decoded)) {
+    throw invalidRouteParam();
+  }
+  return decoded;
 }

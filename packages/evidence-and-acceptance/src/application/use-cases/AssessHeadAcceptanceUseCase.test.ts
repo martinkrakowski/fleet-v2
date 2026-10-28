@@ -488,7 +488,12 @@ describe('AssessHeadAcceptanceUseCase forge mode (D6)', () => {
       repo,
       forgeEvidence: {
         async readForgeCheckStatus() {
-          return { candidateHeadSha: CANDIDATE_HEAD, ciState: 'unknown', unresolvedThreadCount: null };
+          return {
+            candidateHeadSha: CANDIDATE_HEAD,
+            ciState: 'unknown',
+            unresolvedThreadCount: null,
+            observedHeadSha: null,
+          };
         },
       },
       forgeMode: 'github',
@@ -519,7 +524,12 @@ describe('AssessHeadAcceptanceUseCase forge mode (D6)', () => {
       forgeEvidence: {
         async readForgeCheckStatus() {
           reads += 1;
-          return { candidateHeadSha: CANDIDATE_HEAD, ciState: 'pass', unresolvedThreadCount: 0 };
+          return {
+            candidateHeadSha: CANDIDATE_HEAD,
+            ciState: 'pass',
+            unresolvedThreadCount: 0,
+            observedHeadSha: null,
+          };
         },
       },
       forgeMode: 'github',

@@ -414,4 +414,21 @@ describe('telemetryResourceAttributes', () => {
     });
     expect(filterTelemetryAttributes({ 'tag.tags': long }, 'CHAIN')['tag.tags']).toBeUndefined();
   });
+
+  it('model ids refuse URLs, emails, hosts with ports and credentialed URLs; real ids pass', () => {
+    for (const bad of [
+      'https://user:secret@example.com',
+      'https://phoenix.example.test:6006/v1/traces',
+      'someone@example.com',
+      'git@example.com:org/repo',
+      'api.example.com:443',
+      'a/b/c/d/e',
+    ]) {
+      const kept = filterTelemetryAttributes({ 'fleet.seat.model': bad }, 'AGENT');
+      expect(kept['fleet.seat.model']).toBeUndefined();
+    }
+    for (const good of ['openrouter/z-ai/glm-5.3-flash', 'openrouter/poolside/laguna-s-2.1:free', 'gemini-4-argon-high', 'grok-4.7']) {
+      expect(filterTelemetryAttributes({ 'fleet.seat.model': good }, 'AGENT')['fleet.seat.model']).toBe(good);
+    }
+  });
 });

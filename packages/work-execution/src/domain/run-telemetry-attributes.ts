@@ -112,7 +112,12 @@ function isMeteredLlm(context: TelemetryAttributeContext): boolean {
 // secret-shape refusal: a value that reads like a credential never ships.
 
 export const TELEMETRY_PROJECT_ALIAS_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
-export const TELEMETRY_MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/#@-]{0,127}$/;
+/**
+ * A model id: up to four `/`-separated segments of `[A-Za-z0-9._-]` and at most
+ * one lowercase `:suffix` (such as `:free`). No `@`, `#`, `://` or port, so a
+ * URL, an email address, a host:port or a credentialed URL never passes.
+ */
+export const TELEMETRY_MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*){0,3}(?::[a-z][a-z0-9-]{0,15})?$/;
 export const TELEMETRY_VARIANT_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
 export const TELEMETRY_SERVICE_VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9a-z.-]{1,32})?$/;
 const HEAD12_PATTERN = /^[0-9a-f]{12}$/;
@@ -141,7 +146,7 @@ export function isTelemetryProjectValue(value: unknown): boolean {
 /** Model id pattern and no secret shape. */
 export function isTelemetryModelId(value: unknown): boolean {
   try {
-    return typeof value === 'string' && TELEMETRY_MODEL_ID_PATTERN.test(value) && !containsSecretShape(value);
+    return typeof value === 'string' && value.length <= 128 && TELEMETRY_MODEL_ID_PATTERN.test(value) && !containsSecretShape(value);
   } catch {
     return false;
   }

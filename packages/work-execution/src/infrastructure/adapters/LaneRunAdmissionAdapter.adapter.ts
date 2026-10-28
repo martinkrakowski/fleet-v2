@@ -88,6 +88,24 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
       candidateHosts,
       nowIso: request.nowIso,
     });
+    if (reserved.outcome === 'reserved') {
+      // The cap and package-busy checks are re-run after the reservation is
+      // written (K7-5b fix round 2): another start may have reserved
+      // concurrently between the first check and this one. The re-check
+      // excludes this attempt's own reservation from being double-counted;
+      // if it now blocks, THIS reservation is released and the start is
+      // refused `no-capacity`. Both racers may refuse (safe; the caller
+      // retries). A reservation that was not made, or a re-check that
+      // passes, keeps the existing result.
+      const stillBlocked = await this.admissionBlocked(request.workOrderId, request.attemptId);
+      if (stillBlocked) {
+        await this.options.executionJournal.releaseCapacityReservation(
+          request.attemptId,
+          request.nowIso,
+        );
+        return { outcome: 'no-capacity' };
+      }
+    }
     return this.firstReservationResultOf(reserved, request);
   }
 

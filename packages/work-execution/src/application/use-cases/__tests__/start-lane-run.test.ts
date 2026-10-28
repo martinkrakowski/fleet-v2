@@ -686,6 +686,125 @@ describe('StartLaneRunUseCase', () => {
     });
   });
 
+  it('test 6b: abandon of a completed step-4 attempt releases the slot; a retry start with the same ids is never re-reserved', async () => {
+    const harness = makeHarness();
+    // Crash at step 5: the attempt exists (`intent-recorded`), the
+    // reservation is held.
+    harness.failNextRunCreate();
+    expect(await harness.useCase.startLaneRun(requestFixture())).toMatchObject({
+      outcome: 'incomplete',
+      step: 'run',
+    });
+    expect(await harness.attemptRepoStore.findAttemptById(ATTEMPT_ID)).toMatchObject({
+      state: 'intent-recorded',
+    });
+
+    // Abandon: the attempt is cancelled record-only and the slot released.
+    expect(
+      await harness.useCase.abandonStart({ runId: RUN_ID, attemptId: ATTEMPT_ID, nowIso: LATER }),
+    ).toEqual({ outcome: 'abandoned', capacity: 'released', attemptCancelled: true });
+    expect(await harness.attemptRepoStore.findAttemptById(ATTEMPT_ID)).toMatchObject({
+      state: 'cancelled',
+    });
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+
+    // A retry start with the same ids refuses without reserving, preparing
+    // the worktree or rewriting the brief: the attempt is no longer
+    // prepared.
+    const briefCallsBefore = harness.briefCalls.length;
+    const retry = await harness.useCase.startLaneRun(requestFixture({ nowIso: LATER }));
+    expect(retry).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'attempt',
+      reason: 'attempt-differs',
+    });
+    expect(harness.capacityCalls).toHaveLength(1); // only the first start's reserve
+    expect(harness.worktreeCalls).toHaveLength(1); // only the first start's call
+    expect(harness.briefCalls).toHaveLength(briefCallsBefore);
+  });
+
+  it('test 6c: abandon of a cancelled attempt releases its held reservation', async () => {
+    const harness = makeHarness();
+    await harness.attemptRepoStore.saveAttempt({
+      id: ATTEMPT_ID,
+      workOrderId: 'wo-example-1',
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      worktreePath: WORKTREE_PATH,
+      baseCommit: COMMIT,
+      state: 'cancelled',
+      outcome: null,
+      briefDigest: DIGEST,
+      briefPackagePath: WORKTREE_PATH + '/.lane/brief.md',
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: null,
+      seatPlan: SEAT_PLAN,
+      seatSelection: { role: 'first-pass', seatIndex: 0, seatId: 'fp-1', model: 'model-example-1', tool: 'opencode', variant: null, agent: null },
+      reviewerSeat: null,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    });
+    await harness.executionJournal.saveCapacityReservation({
+      id: 'res-example-held',
+      attemptId: ATTEMPT_ID,
+      hostId: HOST_NAME,
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      hostName: HOST_NAME,
+      hostKind: 'opencode',
+      transport: 'local',
+      sshAlias: null,
+      port: null,
+      worktreePath: WORKTREE_PATH,
+      reservedAtIso: NOW,
+      releasedAtIso: null,
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+    expect(
+      await harness.useCase.abandonStart({ runId: RUN_ID, attemptId: ATTEMPT_ID, nowIso: LATER }),
+    ).toEqual({ outcome: 'abandoned', capacity: 'released', attemptCancelled: false });
+    expect(releaseSpy).toHaveBeenCalledWith(ATTEMPT_ID, LATER);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+  });
+
+  it('test 2c: a model assignment that is not the selected first-pass seat is refused before any reserve', async () => {
+    const twoSeatPlan = {
+      version: 1 as const,
+      'first-pass': [
+        { id: 'fp-1', model: 'model-example-1', tool: 'opencode' },
+        { id: 'fp-2', model: 'model-example-2', tool: 'opencode' },
+      ],
+      fix: [{ id: 'fx-1', model: 'model-example-1', tool: 'opencode' }],
+      review: [],
+    };
+    const harness = makeHarness();
+    // The first pass starts at seat 0; the assignment names the second seat.
+    const result = await harness.useCase.startLaneRun(
+      requestFixture({
+        brief: briefFixture({
+          seatPlan: twoSeatPlan,
+          modelAssignment: {
+            model: 'model-example-2',
+            variant: 'default',
+            fallbackModel: 'model-example-2',
+            seatTool: 'opencode',
+          },
+        }),
+      }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(harness.capacityCalls).toHaveLength(0);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+    expect(await harness.attemptRepoStore.listAllAttempts()).toEqual([]);
+  });
+
   it('test 7: after a start the driver\'s first step is dispatch, without an admit call', async () => {
     const harness = makeHarness();
     expect(await harness.useCase.startLaneRun(requestFixture())).toMatchObject({ outcome: 'started' });

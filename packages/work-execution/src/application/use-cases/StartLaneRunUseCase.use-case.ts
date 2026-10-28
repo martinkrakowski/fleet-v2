@@ -29,7 +29,7 @@ import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
 import { laneRunJournalState } from '../../domain/lane-run-journal.js';
 import type { SeatHistoryEntry } from '../../domain/seat-selection.js';
-import { selectSeat, seatSelectionRecord } from '../../domain/seat-selection.js';
+import { selectSeat, seatMatchesAssignment, seatSelectionRecord } from '../../domain/seat-selection.js';
 import { isCalendarDateTime } from '../../domain/plain-record-reads.js';
 import { LANE_RUN_TERMINAL_STATES } from '../../domain/value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
@@ -234,6 +234,35 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     if (!seat.ok) {
       return { outcome: 'refused', reason: 'no-first-pass-seat' };
     }
+    // The model assignment must be the selected first-pass seat (K7-5b fix
+    // round 2): any difference between the brief's frozen assignment (model,
+    // seat tool, variant) and the seat selection chose is refused before any
+    // write, exactly like a malformed request.
+    const selectedSeat = planValue.getSeats('first-pass')[seat.seatIndex];
+    if (
+      selectedSeat === undefined ||
+      !seatMatchesAssignment(selectedSeat, {
+        model: request.brief.modelAssignment.model,
+        tool: request.brief.modelAssignment.seatTool,
+        variant: request.brief.modelAssignment.variant,
+      })
+    ) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+
+    // An attempt that is no longer prepared is never re-reserved (K7-5b fix
+    // round 2): a retry with the ids of a spent attempt (not
+    // `intent-recorded`, or naming another work order) reports
+    // `incomplete attempt attempt-differs` without reserving, preparing the
+    // worktree or writing the brief.
+    const attempt = await deps.attemptRepo.findAttemptById(request.attemptId);
+    if (
+      attempt !== null &&
+      (attempt.state !== ('intent-recorded' satisfies AttemptStateValue) ||
+        attempt.workOrderId !== request.brief.workOrderId)
+    ) {
+      return incomplete(request.runId, request.attemptId, 'attempt', 'attempt-differs');
+    }
 
     // Step 1: reserve (a retry reuses the held reservation).
     const held = await this.heldReservationFor(request.attemptId);
@@ -397,7 +426,20 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     const attempt = await deps.attemptRepo.findAttemptById(request.attemptId);
     if (attempt !== null) {
       if (attempt.state !== 'intent-recorded') {
-        return { outcome: 'refused', reason: 'attempt-not-prepared' };
+        // Even a spent attempt's held reservation is released (K7-5b fix
+        // round 2): abandon can always release, otherwise a cancelled or
+        // completed attempt would leak its slot forever. The worktree the
+        // attempt may name is never touched (D15: nothing removes a
+        // worktree).
+        const released = await deps.executionJournal.releaseCapacityReservation(
+          request.attemptId,
+          request.nowIso,
+        );
+        return {
+          outcome: 'abandoned',
+          capacity: released ? 'released' : 'none-held',
+          attemptCancelled: false,
+        };
       }
       const cancelled = await deps.cancelPreparedAttempt.cancelPreparedAttempt({
         attemptId: request.attemptId,

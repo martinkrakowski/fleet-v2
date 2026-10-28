@@ -35,12 +35,30 @@ export function laneRunPackageKeys(ownedPaths: readonly string[]): readonly stri
       const second = ownedPath.split('/')[1]?.trim() ?? '';
       if (second !== '' && second !== '..') {
         keys.add(first + '/' + second);
+      } else {
+        // A bare `packages` / `apps` path owns the whole tree (K7-5b fix
+        // round 2): its key overlaps every `packages/<x>` / `apps/<x>` key.
+        keys.add(first);
       }
       continue;
     }
     keys.add(first);
   }
   return [...keys].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+}
+
+/** Whether two package keys overlap: equal, or a bare tree key over its own children. */
+function packageKeysOverlap(a: string, b: string): boolean {
+  if (a === b) {
+    return true;
+  }
+  if (a === 'packages' || a === 'apps') {
+    return b.startsWith(a + '/');
+  }
+  if (b === 'packages' || b === 'apps') {
+    return a.startsWith(b + '/');
+  }
+  return false;
 }
 
 /** Same repository and at least one shared package key. */
@@ -52,5 +70,5 @@ export function laneRunPackagesOverlap(
     return false;
   }
   const bKeys = laneRunPackageKeys(b.ownedPaths);
-  return laneRunPackageKeys(a.ownedPaths).some((key) => bKeys.includes(key));
+  return laneRunPackageKeys(a.ownedPaths).some((key) => bKeys.some((other) => packageKeysOverlap(key, other)));
 }

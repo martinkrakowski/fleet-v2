@@ -13,7 +13,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AttemptRecord, CapacityReservationRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { laneRunConductEntry } from '../../../domain/lane-run-step-facts.js';
-import { laneRunPackageKeys } from '../../../domain/lane-run-packages.js';
+import { laneRunPackageKeys, laneRunPackagesOverlap } from '../../../domain/lane-run-packages.js';
 import type { ReserveExecutionCapacityPort, ReserveExecutionCapacityRequest, ReserveExecutionCapacityResult } from '../../../application/ports/in/ReserveExecutionCapacityPort.in-port.js';
 import type { LaneRunAdmissionRequest } from '../../../application/ports/out/LaneRunAdmissionPort.out-port.js';
 import { LaneRunAdmissionAdapter } from '../LaneRunAdmissionAdapter.adapter.js';
@@ -359,6 +359,30 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     expect(harness.reserveCalls).toHaveLength(1);
   });
 
+  it('test 9c: the checks are re-run after the reservation is written; a concurrent start makes this attempt release and refuse no-capacity', async () => {
+    const harness = makeHarness({ maxActiveRuns: 1 });
+    // While this start is reserving, another start reserves concurrently for
+    // another attempt (an in-flight held reservation with no run).
+    harness.setReserveAnswer(async (request) => {
+      await harness.executionJournal.saveCapacityReservation(
+        reservationFixture('attempt-example-9'),
+      );
+      const reservation = reservationFixture(request.attemptId);
+      await harness.executionJournal.saveCapacityReservation(reservation);
+      return { outcome: 'reserved', reservation };
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+
+    expect(result).toEqual({ outcome: 'no-capacity' });
+    expect(harness.reserveCalls).toHaveLength(1);
+    expect(releaseSpy).toHaveBeenCalledWith('attempt-example-1', NOW);
+    expect(await heldFor(harness.executionJournal, 'attempt-example-1')).toBe(false);
+    // The concurrent racer keeps its reservation; the caller retries.
+    expect(await heldFor(harness.executionJournal, 'attempt-example-9')).toBe(true);
+  });
+
   it('test 8b: no candidate hosts refuses no-host; an incomplete reservation is released and refused', async () => {
     const noHost = makeHarness({ candidateHosts: [] });
     expect(await noHost.adapter.reserveFirst(firstReservationRequest())).toEqual({
@@ -505,5 +529,24 @@ describe('laneRunPackageKeys (K7-D5)', () => {
     ]);
     expect(laneRunPackageKeys([])).toEqual([]);
     expect(laneRunPackageKeys([undefined as unknown as string])).toEqual([]);
+  });
+
+  it('test 15c: bare packages and apps own their whole tree; other paths keep their behaviour', () => {
+    expect(laneRunPackageKeys(['packages'])).toEqual(['packages']);
+    expect(laneRunPackageKeys(['apps'])).toEqual(['apps']);
+    expect(laneRunPackageKeys(['apps/'])).toEqual(['apps']);
+
+    const sameRepo = { repository: 'repo-example-1' };
+    // A bare tree overlaps every key under that tree.
+    expect(laneRunPackagesOverlap({ ...sameRepo, ownedPaths: ['packages'] }, { ...sameRepo, ownedPaths: ['packages/a/src'] })).toBe(true);
+    expect(laneRunPackagesOverlap({ ...sameRepo, ownedPaths: ['packages/a/src'] }, { ...sameRepo, ownedPaths: ['packages'] })).toBe(true);
+    // A bare tree of one kind does not overlap the other tree.
+    expect(laneRunPackagesOverlap({ ...sameRepo, ownedPaths: ['apps'] }, { ...sameRepo, ownedPaths: ['packages/a'] })).toBe(false);
+    // Unchanged behaviour: equal keys overlap, sibling keys do not, other
+    // repositories never overlap, and non-tree paths keep first-segment keys.
+    expect(laneRunPackagesOverlap({ ...sameRepo, ownedPaths: ['packages/a'] }, { ...sameRepo, ownedPaths: ['packages/a/test'] })).toBe(true);
+    expect(laneRunPackagesOverlap({ ...sameRepo, ownedPaths: ['packages/a'] }, { ...sameRepo, ownedPaths: ['packages/b'] })).toBe(false);
+    expect(laneRunPackagesOverlap({ ...sameRepo, ownedPaths: ['packages'] }, { repository: 'repo-other-1', ownedPaths: ['packages/a'] })).toBe(false);
+    expect(laneRunPackagesOverlap({ ...sameRepo, ownedPaths: ['docs'] }, { ...sameRepo, ownedPaths: ['docs/x.md'] })).toBe(true);
   });
 });

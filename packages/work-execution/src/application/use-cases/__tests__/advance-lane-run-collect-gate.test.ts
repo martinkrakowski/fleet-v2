@@ -263,6 +263,7 @@ interface Harness {
   readonly callOrder: string[];
   readonly deps: AdvanceLaneRunDependencies;
   setManifest(json: string | null): void;
+  setManifestVerdict(verdict: 'sealed' | 'missing' | 'mismatch'): void;
   setReconcileAnswer(answer: ReconcileAttemptResult): void;
   setStopAnswer(answer: (request: StopAttemptRequest) => Promise<StopAttemptResult>): void;
   setCollectAnswer(answer: (request: CollectAttemptArtifactsRequest) => Promise<CollectAttemptArtifactsResult>): void;
@@ -293,6 +294,7 @@ async function makeHarness(
   const gateRequests: EvaluateAttemptGateRequest[] = [];
   const callOrder: string[] = [];
   let manifestJson: string | null = JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] });
+  let manifestVerdict: 'sealed' | 'missing' | 'mismatch' = 'missing';
   let reconcileAnswer: ReconcileAttemptResult = activeAnswer(attempts[attempts.length - 1] ?? attemptFixture());
   let stopAnswer: (request: StopAttemptRequest) => Promise<StopAttemptResult> = async (request) => {
     const existing = await attemptRepo.findAttemptById(request.attemptId);
@@ -352,7 +354,7 @@ async function makeHarness(
     executionJournal,
     artifactPort: {
       readBriefManifest: async () => manifestJson,
-      verifyArtifactManifest: async () => ({ outcome: 'missing' }),
+      verifyArtifactManifest: async () => ({ outcome: manifestVerdict }) as never,
     },
     reconcileAttempt: {
       reconcileAttempt: async () => reconcileAnswer,
@@ -418,6 +420,9 @@ async function makeHarness(
     deps,
     setManifest: (json) => {
       manifestJson = json;
+    },
+    setManifestVerdict: (verdict) => {
+      manifestVerdict = verdict;
     },
     setReconcileAnswer: (answer) => {
       reconcileAnswer = answer;
@@ -794,6 +799,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
     const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
 
     const hPass = await makeHarness(runRecord(), [collected]);
+    hPass.setManifestVerdict('sealed');
     await conduct(hPass, 'gating', NOW);
     const passed = await advance(hPass);
     expect(passed).toEqual({
@@ -807,6 +813,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
     expect(await advance(hPass)).toEqual({ outcome: 'entered', state: 'brief-check' });
 
     const hFail = await makeHarness(runRecord(), [collected]);
+    hFail.setManifestVerdict('sealed');
     await conduct(hFail, 'gating', NOW);
     hFail.setGateAnswer({ verdict: 'failed', reason: 'Gate predicate command 1 failed' });
     const failed = await advance(hFail);
@@ -820,6 +827,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
     expect(await advance(hFail)).toEqual({ outcome: 'entered', state: 'fixing' });
 
     const hUnknown = await makeHarness(runRecord(), [collected]);
+    hUnknown.setManifestVerdict('sealed');
     await conduct(hUnknown, 'gating', NOW);
     hUnknown.setGateAnswer({ verdict: 'unknown', reason: 'predicates unavailable' });
     const unknown = await advance(hUnknown);
@@ -831,6 +839,34 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       reasonCode: 'gate-unknown',
     });
     expect(await advance(hUnknown)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'gate' });
+  });
+
+  it('test 8b: a gating run whose collection is not sealed parks artifacts-unsealed and never gates', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+    for (const verdict of ['missing', 'mismatch'] as const) {
+      const harness = await makeHarness(runRecord(), [collected]);
+      harness.setManifestVerdict(verdict);
+      await conduct(harness, 'gating', NOW);
+      expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'artifacts-unsealed', qualifier: null });
+      expect(harness.gateRequests).toEqual([]);
+      const entries = await harness.runJournal.listForRun(RUN_ID);
+      expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === gateKey())).toEqual([]);
+    }
+  });
+
+  it('test 5b: a manifest whose expectedArtifacts is not a string array refuses the collect without calling it', async () => {
+    const ended = endedAttempt({ runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'model-example-1', variant: null } });
+    const harness = await makeHarness(runRecord(), [ended]);
+    harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: 'all' }));
+    await conduct(harness, 'collecting', NOW);
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'collect',
+      key: collectKey(),
+      result: 'refused',
+      reasonCode: 'collect-refused',
+    });
+    expect(harness.collectRequests).toHaveLength(0);
   });
 
   it('test 9: each absent port is not-wired with its step and writes nothing', async () => {

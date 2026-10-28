@@ -959,7 +959,15 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       }
     }
     const manifest = await readFrozenManifest(latest, this.deps.artifactPort);
-    const expectedArtifacts = manifestExpectedArtifacts(manifest) ?? [];
+    const expectedArtifacts = manifestExpectedArtifacts(manifest);
+    if (expectedArtifacts === null) {
+      // A present but unreadable expectedArtifacts is refused, never read as "nothing expected".
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'collect-refused');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'collect-refused' };
+    }
     const collected = await collect.collectAttemptArtifacts({
       attemptId: latest.id,
       workOrderId: record.workOrderId,
@@ -998,6 +1006,10 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     const latest = gathered.latestAttempt;
     if (latest === null || latest.artifacts === null) {
       return { outcome: 'waiting', reason: 'facts-inconsistent' };
+    }
+    // Only a sealed collection is gated: a missing or mismatched C1 manifest parks first.
+    if (gathered.facts.attempt?.collection?.manifest !== 'sealed') {
+      return this.performPark(record, 'artifacts-unsealed', null, gathered.facts.state, request);
     }
     const intentRefusal = await this.appendRunIntent(request, decision.key, null);
     if (intentRefusal !== null) {

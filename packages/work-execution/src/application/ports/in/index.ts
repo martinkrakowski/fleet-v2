@@ -22,4 +22,5 @@ export * from "./RequestAttemptAcceptancePort.in-port.js";
 export * from "./RequestLaneRunStopPort.in-port.js";
 export * from "./ReserveExecutionCapacityPort.in-port.js";
 export * from "./ResumeLaneRunPort.in-port.js";
+export * from "./StartLaneRunPort.in-port.js";
 export * from "./StopAttemptPort.in-port.js";

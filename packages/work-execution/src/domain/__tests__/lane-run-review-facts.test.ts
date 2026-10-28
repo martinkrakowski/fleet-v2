@@ -87,6 +87,12 @@ describe('laneRunReviewFact', () => {
     expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual({ verdict: 'no-receipt', seatIndex: 3, retries: 0 });
   });
 
+  it('maps a final result with no reason code to unknown, never pending', () => {
+    const key = reviewKey('code-review', { seatIndex: 2 });
+    const entries = [intent(key), result(key, 'completed', null)];
+    expect(laneRunReviewFact(entries, RUN_ID, 'code-review', HEAD)).toEqual({ verdict: 'unknown', seatIndex: 2, retries: 0 });
+  });
+
   it('maps any other final reason code to unknown', () => {
     const key = reviewKey('pre-merge', { seatIndex: 1 });
     const entries = [intent(key), result(key, 'completed', 'review-refused')];

@@ -64,7 +64,8 @@ export function laneRunReviewFact(
   }
 
   let verdict: LaneRunReviewFact['verdict'];
-  if (finalReasonCode === undefined || finalReasonCode === null) {
+  // No final result is pending; a final result with no reason code is still final, and unknown.
+  if (finalReasonCode === undefined) {
     verdict = 'pending';
   } else if (finalReasonCode === 'review-passed') {
     verdict = 'passed';

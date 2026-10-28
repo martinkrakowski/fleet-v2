@@ -128,7 +128,13 @@ export class AskOwnerQuestionUseCase implements AskOwnerQuestionPort {
       if (error instanceof OwnerQuestionRevisionConflictError) {
         if (question.toRecord().idempotencyKey !== undefined) {
           const stored = await this.deps.ownerQuestionRepo.get(request.questionId);
-          if (stored !== null && sameOwnerQuestionAsk(stored, question.toRecord())) {
+          // `exists` only for the question stored under this very key; the same ask stored without it (or under
+          // another key) is a plain revision conflict.
+          if (
+            stored !== null &&
+            stored.idempotencyKey === question.toRecord().idempotencyKey &&
+            sameOwnerQuestionAsk(stored, question.toRecord())
+          ) {
             return { outcome: 'exists', question: stored };
           }
         }

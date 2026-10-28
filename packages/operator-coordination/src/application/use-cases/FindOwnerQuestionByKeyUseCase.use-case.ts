@@ -37,7 +37,8 @@ export class FindOwnerQuestionByKeyUseCase implements FindOwnerQuestionByKeyPort
     }
     const request = input as FindOwnerQuestionByKeyRequest;
     // A key that is not a non-empty string is known absence: no store read.
-    const idempotencyKey = typeof request.idempotencyKey === 'string' ? request.idempotencyKey.trim() : '';
+    // The exact key, never trimmed: " K " must not resolve to the question stored under "K".
+    const idempotencyKey = typeof request.idempotencyKey === 'string' ? request.idempotencyKey : '';
     if (idempotencyKey === '') {
       return { outcome: 'not-found' };
     }

@@ -457,3 +457,36 @@ describe('FindOwnerQuestionByKeyUseCase', () => {
     );
   });
 });
+
+describe('Q1-2 review fixes', () => {
+  it('a keyed ask whose id is held by the same ask WITHOUT the key is refused, never exists', async () => {
+    const repo = new OwnerQuestionRepositoryAdapter();
+    const unkeyed = new AskOwnerQuestionUseCase({
+      ownerQuestionRepo: repo,
+      requestRepo: new CoordinationRequestRepositoryAdapter(),
+      clock: clock(),
+    });
+    expect((await unkeyed.askOwnerQuestion(exampleRequest())).outcome).toBe('asked');
+    const keyed = new AskOwnerQuestionUseCase({
+      ownerQuestionRepo: repo,
+      requestRepo: new CoordinationRequestRepositoryAdapter(),
+      clock: clock(),
+    });
+    const result = await keyed.askOwnerQuestion(exampleRequest({ idempotencyKey: K }));
+    expect(result.outcome).toBe('refused');
+  });
+
+  it('finds by the exact key only: a padded key never resolves to the stored one', async () => {
+    const repo = new OwnerQuestionRepositoryAdapter();
+    const ask = new AskOwnerQuestionUseCase({
+      ownerQuestionRepo: repo,
+      requestRepo: new CoordinationRequestRepositoryAdapter(),
+      clock: clock(),
+    });
+    expect((await ask.askOwnerQuestion(exampleRequest({ idempotencyKey: K }))).outcome).toBe('asked');
+    const find = new FindOwnerQuestionByKeyUseCase({ ownerQuestionRepo: repo });
+    expect((await find.findOwnerQuestionByKey({ idempotencyKey: ` ${K} ` })).outcome).toBe('not-found');
+    expect((await find.findOwnerQuestionByKey({ idempotencyKey: '   ' })).outcome).toBe('not-found');
+    expect((await find.findOwnerQuestionByKey({ idempotencyKey: K })).outcome).toBe('found');
+  });
+});

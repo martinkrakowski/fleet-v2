@@ -71,6 +71,7 @@ function foundSnapshot(overrides: SnapshotOverride = {}): ReadPullRequestResult 
     pullRequest: {
       number: 12,
       state: overrides.state ?? 'merged',
+      mergeState: 'clean',
       headSha: overrides.headSha ?? HEAD_SHA,
       headRef: BRANCH,
       baseRef: 'main',

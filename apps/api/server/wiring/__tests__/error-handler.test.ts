@@ -120,6 +120,9 @@ describe("default handler on a loopback h3 app", () => {
     // a redirect location and its security headers; only the security headers may reach the response.
     const defaultHandler = async (error: unknown, event: { path: string }) => {
       defaultCalls.push(event.path);
+      if (event.path.startsWith("/throws-default")) {
+        throw new TypeError("Invalid URL from a forwarded host");
+      }
       return {
         status: 302,
         statusText: "Found",
@@ -159,6 +162,13 @@ describe("default handler on a loopback h3 app", () => {
     expect(response.headers.get("location")).toBeNull();
     expect(response.headers.get("content-type")).toMatch(/^application\/json/);
     expect(await response.text()).toBe('{"statusCode":500,"statusMessage":"Internal Server Error"}');
+  });
+
+  it("still sends the sanitized body when Nitro's default descriptor throws", async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/throws-default/abc?token=xyz`);
+    expect(response.status).toBe(404);
+    expect(response.headers.get("content-type")).toMatch(/^application\/json/);
+    expect(await response.text()).toBe('{"statusCode":404,"statusMessage":"Not Found"}');
   });
 
   it("answers a thrown 400 with exactly the two fields", async () => {

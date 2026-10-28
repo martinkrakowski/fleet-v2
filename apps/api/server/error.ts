@@ -92,7 +92,17 @@ export default defineNitroErrorHandler(async (error, event, context) => {
   }
   // Nitro's default descriptor logs an unhandled or fatal error on the server (never in the body)
   // and computes its security headers; it does not send. Only those headers are kept from it.
-  const nitroDefault = await context?.defaultHandler(error, event, { json: true });
+  // If the descriptor itself throws (it parses forwarded host headers), the sanitized body is still
+  // sent: h3's fallback would otherwise answer with the error's own message and data.
+  let nitroDefault: { headers: Record<string, string> } | undefined;
+  try {
+    nitroDefault =
+      typeof context?.defaultHandler === "function"
+        ? await context.defaultHandler(error, event, { json: true })
+        : undefined;
+  } catch {
+    nitroDefault = undefined;
+  }
   const body = errorBody(error);
   setResponseStatus(event, body.statusCode, body.statusMessage);
   for (const [name, value] of Object.entries(nitroDefault?.headers ?? {})) {

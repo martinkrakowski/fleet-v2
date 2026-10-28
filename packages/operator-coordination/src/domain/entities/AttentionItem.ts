@@ -31,6 +31,7 @@ import type {
   AttentionItemClearVia,
   AttentionItemRecord,
   AttentionItemState,
+  AttentionItemSubjectKind,
   AttentionItemSubjectRecord,
 } from '../attention-item-records.js';
 
@@ -128,32 +129,36 @@ function kindErrorValue(value: unknown): string | null {
   return null;
 }
 
-function subjectErrorValue(subject: unknown): string | null {
+type SubjectValidation =
+  | { readonly ok: true; readonly parsed: AttentionItemSubjectRecord }
+  | { readonly ok: false; readonly error: string };
+
+function subjectErrorValue(subject: unknown): SubjectValidation {
   const parsed = readPlainObject(subject, ['kind', 'ref']);
   if (parsed === null) {
-    return 'AttentionItem subject must be a { kind, ref } object';
+    return { ok: false, error: 'AttentionItem subject must be a { kind, ref } object' };
   }
   const kind = parsed.kind;
   if (typeof kind !== 'string' || !(ATTENTION_ITEM_SUBJECT_KINDS as readonly string[]).includes(kind)) {
-    return 'AttentionItem subject kind is not one of work-order, run, attempt, reservation, worktree, pr, project';
+    return { ok: false, error: 'AttentionItem subject kind is not one of work-order, run, attempt, reservation, worktree, pr, project' };
   }
   const ref = parsed.ref;
   if (typeof ref !== 'string') {
-    return 'AttentionItem subject ref is not valid for its kind';
+    return { ok: false, error: 'AttentionItem subject ref is not valid for its kind' };
   }
   if (isSecretShaped(ref)) {
-    return 'AttentionItem subject ref contains a secret-shaped value and was refused';
+    return { ok: false, error: 'AttentionItem subject ref contains a secret-shaped value and was refused' };
   }
   if (kind === 'worktree' && !ATTENTION_ITEM_WORKTREE_REF_PATTERN.test(ref)) {
-    return 'AttentionItem worktree subject ref must be a wt-<12 hex> digest, never a path';
+    return { ok: false, error: 'AttentionItem worktree subject ref must be a wt-<12 hex> digest, never a path' };
   }
   if (kind === 'pr' && !ATTENTION_ITEM_PR_REF_PATTERN.test(ref)) {
-    return 'AttentionItem pr subject ref must be <owner>/<repo>#<number>';
+    return { ok: false, error: 'AttentionItem pr subject ref must be <owner>/<repo>#<number>' };
   }
   if (kind !== 'worktree' && kind !== 'pr' && idFieldError('subject ref', ref) !== null) {
-    return 'AttentionItem subject ref is not valid for its kind';
+    return { ok: false, error: 'AttentionItem subject ref is not valid for its kind' };
   }
-  return null;
+  return { ok: true, parsed: { kind: kind as AttentionItemSubjectKind, ref: ref as string } };
 }
 
 function summaryErrorValue(value: unknown): string | null {
@@ -163,7 +168,8 @@ function summaryErrorValue(value: unknown): string | null {
   if (isSecretShaped(value)) {
     return 'AttentionItem summary contains a secret-shaped value and was refused';
   }
-  if (value.trim() === '' || [...value].length > ATTENTION_ITEM_LIMITS.summaryChars) {
+  const summaryLength = [...value].length;
+  if (summaryLength < 1 || summaryLength > ATTENTION_ITEM_LIMITS.summaryChars) {
     return 'AttentionItem summary must be single-line plain text of at most 1024 code points';
   }
   for (const char of value) {
@@ -185,29 +191,41 @@ function canonicalIsoError(value: unknown): string | null {
   return null;
 }
 
-function clearanceErrorValue(clearance: unknown, lastRaisedAtIso: string): string | null {
+type ClearanceValidation =
+  | { readonly ok: true; readonly parsed: AttentionItemClearanceRecord }
+  | { readonly ok: false; readonly error: string };
+
+function clearanceErrorValue(clearance: unknown, lastRaisedAtIso: string): ClearanceValidation {
   const parsed = readPlainObject(clearance, ['reason', 'via', 'by', 'atIso']);
   if (parsed === null) {
-    return 'AttentionItem clearance must be a { reason, via, by, atIso } record';
+    return { ok: false, error: 'AttentionItem clearance must be a { reason, via, by, atIso } record' };
   }
   const reason = parsed.reason;
   if (typeof reason !== 'string' || !(ATTENTION_ITEM_CLEAR_REASONS as readonly string[]).includes(reason)) {
-    return 'AttentionItem clearance reason is not one of dismissed, merged, resolved, stale';
+    return { ok: false, error: 'AttentionItem clearance reason is not one of dismissed, merged, resolved, stale' };
   }
   const via = parsed.via;
   if (typeof via !== 'string' || !(ATTENTION_ITEM_CLEAR_VIAS as readonly string[]).includes(via)) {
-    return 'AttentionItem clearance via is not one of cli, web, machine';
+    return { ok: false, error: 'AttentionItem clearance via is not one of cli, web, machine' };
   }
   if (idFieldError('clearance by', parsed.by) !== null) {
-    return 'AttentionItem clearance by is not a valid actor';
+    return { ok: false, error: 'AttentionItem clearance by is not a valid actor' };
   }
   if (canonicalIsoError(parsed.atIso) !== null) {
-    return 'AttentionItem clearance atIso must be a canonical ISO timestamp';
+    return { ok: false, error: 'AttentionItem clearance atIso must be a canonical ISO timestamp' };
   }
   if (Date.parse(parsed.atIso as string) < Date.parse(lastRaisedAtIso)) {
-    return 'AttentionItem clearance atIso must not precede the last raise';
+    return { ok: false, error: 'AttentionItem clearance atIso must not precede the last raise' };
   }
-  return null;
+  return {
+    ok: true,
+    parsed: {
+      reason: reason as AttentionItemClearReason,
+      via: via as AttentionItemClearVia,
+      by: parsed.by as string,
+      atIso: parsed.atIso as string,
+    },
+  };
 }
 
 export class AttentionItem {
@@ -245,9 +263,9 @@ export class AttentionItem {
     if (kindError !== null) {
       return fail(kindError);
     }
-    const subjectError = subjectErrorValue(record.subject);
-    if (subjectError !== null) {
-      return fail(subjectError);
+    const subjectValidation = subjectErrorValue(record.subject);
+    if (!subjectValidation.ok) {
+      return fail(subjectValidation.error);
     }
     const workOrderIdError =
       record.workOrderId === null ? null : idFieldError('workOrderId', record.workOrderId);
@@ -274,19 +292,27 @@ export class AttentionItem {
     if (typeof record.raisedCount !== 'number' || !Number.isSafeInteger(record.raisedCount) || record.raisedCount < 1) {
       return fail('AttentionItem raisedCount must be a safe integer of at least 1');
     }
+    let clearanceParsed: AttentionItemClearanceRecord | null = null;
     if (state === 'open') {
       if (record.clearance !== null) {
         return fail('AttentionItem open carries no clearance');
       }
-    } else if (record.clearance === null || clearanceErrorValue(record.clearance, record.lastRaisedAtIso as string) !== null) {
-      return fail('AttentionItem cleared requires a valid clearance');
+    } else {
+      if (record.clearance === null) {
+        return fail('AttentionItem cleared requires a valid clearance');
+      }
+      const clearanceValidation = clearanceErrorValue(record.clearance, record.lastRaisedAtIso as string);
+      if (!clearanceValidation.ok) {
+        return fail('AttentionItem cleared requires a valid clearance');
+      }
+      clearanceParsed = clearanceValidation.parsed;
     }
-    const subject = record.subject as AttentionItemSubjectRecord;
+    const subjectSnapshot = subjectValidation.parsed;
     const finalRecord: AttentionItemRecord = Object.freeze({
       itemId: record.itemId as string,
       projectId: record.projectId as string,
       kind: record.kind as string,
-      subject: Object.freeze({ kind: subject.kind, ref: subject.ref }),
+      subject: Object.freeze({ kind: subjectSnapshot.kind, ref: subjectSnapshot.ref }),
       workOrderId: record.workOrderId === null ? null : (record.workOrderId as string),
       summary: record.summary as string,
       state,
@@ -295,9 +321,14 @@ export class AttentionItem {
       lastRaisedAtIso: record.lastRaisedAtIso as string,
       raisedCount: record.raisedCount as number,
       clearance:
-        record.clearance === null
+        clearanceParsed === null
           ? null
-          : Object.freeze({ ...(record.clearance as AttentionItemClearanceRecord) }),
+          : Object.freeze({
+              reason: clearanceParsed.reason,
+              via: clearanceParsed.via,
+              by: clearanceParsed.by,
+              atIso: clearanceParsed.atIso,
+            }),
     });
     if (JSON.stringify(finalRecord).length > ATTENTION_ITEM_LIMITS.recordJsonChars) {
       return fail('AttentionItem record exceeds its size limit');
@@ -341,45 +372,45 @@ export class AttentionItem {
     let parsed: Record<string, unknown> | null;
     try {
       parsed = readPlainObject(input, RAISE_AGAIN_KEYS);
+      if (parsed === null) {
+        return fail('AttentionItem a later raise requires exactly its fields');
+      }
+      const subjectValidation = subjectErrorValue(parsed.subject);
+      if (!subjectValidation.ok) {
+        return fail(subjectValidation.error);
+      }
+      const kindError = kindErrorValue(parsed.kind);
+      if (kindError !== null) {
+        return fail(kindError);
+      }
+      const subjectSnapshot = subjectValidation.parsed;
+      const key = attentionItemKey(this.record.projectId, subjectSnapshot, parsed.kind as string);
+      if (key !== this.key() || parsed.workOrderId !== this.record.workOrderId) {
+        return failCode('key', 'AttentionItem a later raise must name the same key and work order');
+      }
+      if (canonicalIsoError(nowIso) !== null) {
+        return failCode('clock', 'AttentionItem a later raise requires a canonical ISO timestamp');
+      }
+      if (Date.parse(nowIso) < Date.parse(this.record.lastRaisedAtIso)) {
+        return failCode('clock', 'AttentionItem a later raise must not precede the last raise');
+      }
+      const candidate: AttentionItemRecord = {
+        ...this.record,
+        kind: parsed.kind as string,
+        subject: subjectSnapshot,
+        workOrderId: this.record.workOrderId,
+        summary: parsed.summary as string,
+        raisedBy: parsed.raisedBy as string,
+        state: 'open',
+        firstRaisedAtIso: this.record.firstRaisedAtIso,
+        lastRaisedAtIso: nowIso,
+        raisedCount: this.record.raisedCount + 1,
+        clearance: null,
+      };
+      return AttentionItem.create(candidate);
     } catch {
       return unreadableInputResult();
     }
-    if (parsed === null) {
-      return fail('AttentionItem a later raise requires exactly its fields');
-    }
-    const subject = parsed.subject;
-    const subjectError = subjectErrorValue(subject);
-    if (subjectError !== null) {
-      return fail(subjectError);
-    }
-    const kindError = kindErrorValue(parsed.kind);
-    if (kindError !== null) {
-      return fail(kindError);
-    }
-    const key = attentionItemKey(this.record.projectId, subject as AttentionItemSubjectRecord, parsed.kind as string);
-    if (key !== this.key() || parsed.workOrderId !== this.record.workOrderId) {
-      return failCode('key', 'AttentionItem a later raise must name the same key and work order');
-    }
-    if (canonicalIsoError(nowIso) !== null) {
-      return failCode('clock', 'AttentionItem a later raise requires a canonical ISO timestamp');
-    }
-    if (Date.parse(nowIso) < Date.parse(this.record.lastRaisedAtIso)) {
-      return failCode('clock', 'AttentionItem a later raise must not precede the last raise');
-    }
-    const candidate: AttentionItemRecord = {
-      ...this.record,
-      kind: parsed.kind as string,
-      subject: subject as AttentionItemSubjectRecord,
-      workOrderId: this.record.workOrderId,
-      summary: parsed.summary as string,
-      raisedBy: parsed.raisedBy as string,
-      state: 'open',
-      firstRaisedAtIso: this.record.firstRaisedAtIso,
-      lastRaisedAtIso: nowIso,
-      raisedCount: this.record.raisedCount + 1,
-      clearance: null,
-    };
-    return AttentionItem.create(candidate);
   }
 
   /** Clears an open item with a reason, channel and actor. Never throws. */

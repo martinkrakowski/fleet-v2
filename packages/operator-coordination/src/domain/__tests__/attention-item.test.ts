@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { attentionItemKey, AttentionItem } from '../entities/AttentionItem.js';
+import type { AttentionItemResult } from '../entities/AttentionItem.js';
 import type { AttentionItemRecord } from '../attention-item-records.js';
 
 /**
@@ -84,7 +85,13 @@ describe('AttentionItem', () => {
     const missingKey = { ...RAISE_BODY };
     delete (missingKey as Record<string, unknown>).summary;
     expect(AttentionItem.raise(missingKey, NOW).success).toBe(false);
-    expect(raiseResult([1, 2, 3] as unknown as Record<string, unknown>).success).toBe(false);
+    const arrayRefusal = AttentionItem.raise([1, 2, 3], NOW);
+    expect(arrayRefusal.success).toBe(false);
+    if (!arrayRefusal.success) {
+      expect(arrayRefusal.error.message).not.toContain('1');
+      expect(arrayRefusal.error.message).not.toContain('2');
+      expect(arrayRefusal.error.message).not.toContain('3');
+    }
     expect(AttentionItem.raise(null, NOW).success).toBe(false);
     const ownKeysThrowing = new Proxy(
       {},
@@ -230,7 +237,7 @@ describe('AttentionItem', () => {
     expect(AttentionItem.create({ ...clearedRecord, lastRaisedAtIso: '2026-10-28T10:10:00Z' }).success).toBe(false);
   });
 
-  it('never throws on undefined, getter-bearing or proxy input', () => {
+  it('never throws on undefined, getter-bearing or proxy input and returns a refusal', () => {
     const getters = {
       get itemId(): string {
         return 'att-example-1';
@@ -247,18 +254,125 @@ describe('AttentionItem', () => {
         },
       },
     );
-    expect(AttentionItem.create(undefined)).toBeDefined();
-    expect(AttentionItem.create(getters)).toBeDefined();
-    expect(AttentionItem.create(proxy)).toBeDefined();
-    expect(AttentionItem.raise(undefined, NOW)).toBeDefined();
-    expect(AttentionItem.raise(getters, NOW)).toBeDefined();
-    expect(AttentionItem.raise(proxy, NOW)).toBeDefined();
+    expect(AttentionItem.create(undefined).success).toBe(false);
+    expect(AttentionItem.create(getters).success).toBe(false);
+    expect(AttentionItem.create(proxy).success).toBe(false);
+    expect(AttentionItem.raise(undefined, NOW).success).toBe(false);
+    expect(AttentionItem.raise(getters, NOW).success).toBe(false);
+    expect(AttentionItem.raise(proxy, NOW).success).toBe(false);
     const item = raiseNow();
-    expect(item.raiseAgain(undefined, LATER)).toBeDefined();
-    expect(item.raiseAgain(getters, LATER)).toBeDefined();
-    expect(item.raiseAgain(proxy, LATER)).toBeDefined();
-    expect(item.clear(undefined, LATER)).toBeDefined();
-    expect(item.clear(getters, LATER)).toBeDefined();
-    expect(item.clear(proxy, LATER)).toBeDefined();
+    expect(item.raiseAgain(undefined, LATER).success).toBe(false);
+    expect(item.raiseAgain(getters, LATER).success).toBe(false);
+    expect(item.raiseAgain(proxy, LATER).success).toBe(false);
+    expect(item.clear(undefined, LATER).success).toBe(false);
+    expect(item.clear(getters, LATER).success).toBe(false);
+    expect(item.clear(proxy, LATER).success).toBe(false);
+  });
+
+  it('builds the record subject only from the validated snapshot, never live getter values', () => {
+    const subject = new Proxy(
+      { kind: 'work-order', ref: 'wo-example-1' },
+      {
+        get(target, prop) {
+          if (prop === 'ref') {
+            return 'wo-getter-value';
+          }
+          return Reflect.get(target, prop);
+        },
+      },
+    );
+    const created = AttentionItem.create({ ...raiseNow().toRecord(), subject });
+    expect(created.success).toBe(true);
+    if (created.success) {
+      expect(created.value.toRecord().subject.ref).toBe('wo-example-1');
+    }
+  });
+
+  it('builds the clearance only from the validated snapshot, never live getter values', () => {
+    const cleared = raiseNow().clear({ reason: 'dismissed', via: 'cli', by: 'cli' }, LATER);
+    expect(cleared.success).toBe(true);
+    if (!cleared.success) {
+      return;
+    }
+    const clearance = new Proxy(
+      { reason: 'dismissed', via: 'cli', by: 'cli', atIso: LATER },
+      {
+        get(target, prop) {
+          if (prop === 'by') {
+            return 'getter-actor';
+          }
+          return Reflect.get(target, prop);
+        },
+      },
+    );
+    const created = AttentionItem.create({ ...cleared.value.toRecord(), clearance });
+    expect(created.success).toBe(true);
+    if (created.success) {
+      expect(created.value.toRecord().clearance?.by).toBe('cli');
+    }
+  });
+
+  it('raiseAgain compares the key on the subject snapshot, never live getter values', () => {
+    const item = raiseNow();
+    const subject = new Proxy(
+      { kind: 'work-order', ref: 'wo-example-1' },
+      {
+        get(target, prop) {
+          if (prop === 'ref') {
+            return 'wo-getter-value';
+          }
+          return Reflect.get(target, prop);
+        },
+      },
+    );
+    const again = item.raiseAgain(
+      {
+        kind: 'owner-merge',
+        subject,
+        workOrderId: 'wo-example-1',
+        summary: 'Needs an owner merge: still parked',
+        raisedBy: 'auto-merge',
+      },
+      LATER,
+    );
+    expect(again.success).toBe(true);
+    if (again.success) {
+      expect(again.value.toRecord().subject.ref).toBe('wo-example-1');
+    }
+  });
+
+  it('raiseAgain turns a throwing subject getter into a refusal and never throws', () => {
+    const item = raiseNow();
+    const throwingSubject = new Proxy(
+      { kind: 'work-order', ref: 'wo-example-1' },
+      {
+        get() {
+          throw new Error('subject getter threw');
+        },
+        getOwnPropertyDescriptor() {
+          throw new Error('subject descriptor read threw');
+        },
+      },
+    );
+    let outcome: AttentionItemResult | undefined;
+    expect(() => {
+      outcome = item.raiseAgain(
+        {
+          kind: 'owner-merge',
+          subject: throwingSubject,
+          workOrderId: 'wo-example-1',
+          summary: 'Needs an owner merge: still parked',
+          raisedBy: 'auto-merge',
+        },
+        LATER,
+      );
+    }).not.toThrow();
+    expect(outcome?.success).toBe(false);
+  });
+
+  it('accepts a single space as a valid summary (1–1024 code points, no controls)', () => {
+    expect(raiseResult({ summary: ' ' }).success).toBe(true);
+    expect(raiseResult({ summary: ' '.repeat(1024) }).success).toBe(true);
+    expect(raiseResult({ summary: ' '.repeat(1025) }).success).toBe(false);
   });
 });

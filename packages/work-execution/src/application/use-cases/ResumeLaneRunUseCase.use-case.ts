@@ -189,6 +189,28 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     }
 
     const first = pending[0];
+    const firstPendingKey = first.key as string;
+
+    // The conduct landed but the save did not (a crash, or a refused save): the journal already left the
+    // park for its parked-from state while the record is still parked. Finish that exit here, so the
+    // intent is settled as resumed and never refused as not-parked ahead of the repair.
+    if (facts.state === record.parked.parkedFrom) {
+      const finished = await this.deps.runRepo.save(
+        { ...record, parked: null, revision: record.revision + 1 },
+        { holderId: request.lease.holderId, fence: request.lease.fence, nowIso: request.nowIso },
+      );
+      if (finished.outcome !== 'saved') {
+        return { outcome: 'refused', key: firstPendingKey, reason: 'save-refused' };
+      }
+      if (!(await this.appendResult(request.runId, firstPendingKey, 'reconciled', 'resumed', request.nowIso))) {
+        return { outcome: 'refused', key: firstPendingKey, reason: 'journal-refused' };
+      }
+      for (const intent of pending.slice(1)) {
+        await this.appendResult(request.runId, intent.key as string, 'refused', 'not-parked', request.nowIso);
+      }
+      return { outcome: 'resumed', to: record.parked.parkedFrom, key: firstPendingKey };
+    }
+
     const check = checkLaneRunResume({
       record,
       state: facts.state,

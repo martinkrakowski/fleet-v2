@@ -8,7 +8,7 @@
  * no network.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { AttemptRecord, CapacityReservationRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
@@ -281,6 +281,15 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     expect(harness.reserveCalls).toHaveLength(1);
   });
 
+  it('test 9b: an in-flight held reservation without a run counts against the cap', async () => {
+    const harness = makeHarness({ maxActiveRuns: 1 });
+    await harness.holdReservation('attempt-example-9');
+
+    const blocked = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(blocked).toEqual({ outcome: 'no-capacity' });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
   it('test 10: package-busy blocks a shared package of the same repository, not a different one', async () => {
     const harness = makeHarness({ maxActiveRuns: 2 });
     await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-example-2'));
@@ -289,6 +298,42 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
       workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/work-execution/src'] }),
     );
     await harness.holdReservation('attempt-example-2');
+
+    harness.workOrders.set(
+      'wo-example-1',
+      workOrderFixture({ id: 'wo-example-1', ownedPaths: ['packages/work-execution/test'] }),
+    );
+    const shared = await harness.adapter.reserveFirst(
+      firstReservationRequest({ workOrderId: 'wo-example-1' }),
+    );
+    expect(shared).toEqual({ outcome: 'no-capacity' });
+    expect(harness.reserveCalls).toHaveLength(0);
+
+    harness.workOrders.set(
+      'wo-example-1',
+      workOrderFixture({ id: 'wo-example-1', ownedPaths: ['apps/cli/src'] }),
+    );
+    const distinct = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(distinct).toEqual({
+      outcome: 'reserved',
+      hostName: HOST_NAME,
+      hostKind: 'opencode',
+      worktreePath: WORKTREE_PATH,
+    });
+    expect(harness.reserveCalls).toHaveLength(1);
+  });
+
+  it('test 10b: an in-flight held reservation without a run blocks a shared package, not a distinct one', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    harness.attempts.set(
+      'attempt-example-9',
+      attemptFixture('attempt-example-9', { workOrderId: 'wo-example-2' }),
+    );
+    await harness.holdReservation('attempt-example-9');
+    harness.workOrders.set(
+      'wo-example-2',
+      workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/work-execution/src'] }),
+    );
 
     harness.workOrders.set(
       'wo-example-1',
@@ -323,12 +368,21 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     expect(noHost.reserveCalls).toHaveLength(0);
 
     const incomplete = makeHarness();
+    // Actually save the bad reservation first: `held === false` must not pass
+    // without the release.
+    await incomplete.holdReservation('attempt-example-1', {
+      hostName: null,
+      hostKind: null,
+      worktreePath: null,
+    });
+    const releaseSpy = vi.spyOn(incomplete.executionJournal, 'releaseCapacityReservation');
     incomplete.setReserveAnswer(async (request) => ({
       outcome: 'reserved',
       reservation: reservationFixture(request.attemptId, { hostName: null, hostKind: null, worktreePath: null }),
     }));
     const refused = await incomplete.adapter.reserveFirst(firstReservationRequest());
     expect(refused).toEqual({ outcome: 'refused', reason: 'reservation-incomplete' });
+    expect(releaseSpy).toHaveBeenCalledWith('attempt-example-1', NOW);
     expect(await heldFor(incomplete.executionJournal, 'attempt-example-1')).toBe(false);
   });
 });
@@ -354,20 +408,46 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
     expect(request.host).toMatchObject({ hostName: HOST_NAME, hostKind: 'opencode', transport: 'local' });
   });
 
+  it('test 11c: a later attempt whose request path differs from the first attempt\'s is refused before the reserve', async () => {
+    const harness = makeHarness();
+    await harness.createRun(runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']));
+    harness.attempts.set('attempt-example-1', attemptFixture('attempt-example-1'));
+    await harness.holdReservation('attempt-example-1');
+
+    const wrongPath = await harness.adapter.admit(
+      admitRequest({ worktreePath: WORKTREE_ROOT + '/other00000000000000000000000002' }),
+    );
+    expect(wrongPath).toEqual({ outcome: 'refused', reason: 'worktree-mismatch' });
+    expect(harness.reserveCalls).toHaveLength(0);
+
+    const fresh = makeHarness();
+    await fresh.createRun(runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']));
+    await fresh.holdReservation('attempt-example-1');
+    const unreadable = await fresh.adapter.admit(admitRequest());
+    expect(unreadable).toEqual({ outcome: 'refused', reason: 'worktree-mismatch' });
+    expect(fresh.reserveCalls).toHaveLength(0);
+  });
+
   it('test 12: a reservation at another path is released and refused worktree-mismatch', async () => {
     const harness = makeHarness();
     await harness.createRun(runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']));
     harness.attempts.set('attempt-example-1', attemptFixture('attempt-example-1'));
     await harness.holdReservation('attempt-example-1');
+    // Actually save the bad reservation first: `held === false` must not pass
+    // without the release.
+    const badPath = WORKTREE_ROOT + '/other00000000000000000000000000002';
+    await harness.holdReservation('attempt-example-2', { worktreePath: badPath });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
     harness.setReserveAnswer(async (request) => ({
       outcome: 'reserved',
       reservation: reservationFixture(request.attemptId, {
-        worktreePath: WORKTREE_ROOT + '/other00000000000000000000000000002',
+        worktreePath: badPath,
       }),
     }));
 
     const result = await harness.adapter.admit(admitRequest());
     expect(result).toEqual({ outcome: 'refused', reason: 'worktree-mismatch' });
+    expect(releaseSpy).toHaveBeenCalledWith('attempt-example-2', NOW);
     expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
   });
 

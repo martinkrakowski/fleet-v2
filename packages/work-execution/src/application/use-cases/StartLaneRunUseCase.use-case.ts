@@ -95,7 +95,9 @@ export type StartLaneRunIncompleteReason =
   | 'brief-rejected'
   | 'attempt-differs'
   | 'attempt-save-failed'
-  | 'run-exists';
+  | 'run-exists'
+  | 'reservation-incomplete'
+  | 'attempt-incomplete';
 
 const WORKTREE_REFUSAL_REASONS: Record<string, StartLaneRunIncompleteReason> = {
   'path-exists-other': 'worktree-path-exists-other',
@@ -194,7 +196,13 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     if (workOrder === null) {
       return { outcome: 'refused', reason: 'work-order-missing' };
     }
-    if (WorkOrderState.create(workOrder.state).value?.isTerminal() === true) {
+    const workOrderState = WorkOrderState.create(workOrder.state);
+    if (workOrderState.value === undefined) {
+      // Unreadable work-order state refuses exactly like a missing work order;
+      // never proceed to reserve.
+      return { outcome: 'refused', reason: 'work-order-missing' };
+    }
+    if (workOrderState.value.isTerminal()) {
       return { outcome: 'refused', reason: 'work-order-not-open' };
     }
     const otherRuns = await deps.runRepo.list();
@@ -236,6 +244,13 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       hostName = held.hostName;
       hostKind = held.hostKind;
       worktreePath = held.worktreePath;
+    } else if (held !== null) {
+      // A held but incomplete reservation is released, never re-reserved over.
+      // Both release outcomes report `incomplete reserve`: a confirmed release
+      // lets the operator's retry start clean; an unconfirmed one keeps the run
+      // absent and the abandon path can still release it later.
+      await deps.executionJournal.releaseCapacityReservation(request.attemptId, request.nowIso);
+      return incomplete(request.runId, request.attemptId, 'reserve', 'reservation-incomplete');
     } else {
       const reserved = await deps.capacity.reserveFirst({
         attemptId: request.attemptId,
@@ -413,6 +428,12 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     const held = await this.heldReservationFor(request.attemptId);
     const hostName = attempt?.runner?.hostName ?? held?.hostName ?? '';
     const worktreePath = attempt?.worktreePath ?? held?.worktreePath ?? '';
+    if (hostName === '' || worktreePath === '') {
+      // Neither the attempt's runner host nor a held reservation gives a host
+      // and worktree path: incomplete, never `started` with an empty host or
+      // path.
+      return incomplete(request.runId, request.attemptId, 'attempt', 'attempt-incomplete');
+    }
     return { outcome: 'started', runId: run.runId, attemptId: request.attemptId, hostName, worktreePath };
   }
 

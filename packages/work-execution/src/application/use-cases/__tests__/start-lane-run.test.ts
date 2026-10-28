@@ -7,7 +7,7 @@
  * against a fake-acting `AdvanceLaneRunUseCase`.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
@@ -489,6 +489,21 @@ describe('StartLaneRunUseCase', () => {
     }
   });
 
+  it('test 2b: an unreadable work-order state refuses work-order-missing and never reserves', async () => {
+    const harness = makeHarness({
+      workOrder: storedWorkOrder({
+        state: 'not-a-real-state' as unknown as WorkOrderRecord['state'],
+      }),
+    });
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({ outcome: 'refused', reason: 'work-order-missing' });
+    expect(harness.capacityCalls).toHaveLength(0);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await harness.executionJournal.listActiveReservations()).toEqual([]);
+    expect(await harness.attemptRepoStore.listAllAttempts()).toEqual([]);
+  });
+
   it('test 3: no capacity reports no-capacity, writes nothing and never calls the worktree', async () => {
     const harness = makeHarness();
     harness.setCapacityAnswer({ outcome: 'no-capacity' });
@@ -499,6 +514,41 @@ describe('StartLaneRunUseCase', () => {
     expect(harness.briefCalls).toHaveLength(0);
     expect(await harness.attemptRepoStore.listAllAttempts()).toEqual([]);
     expect(await harness.runRepoStore.list()).toEqual([]);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+  });
+
+  it('test 3b: a held, incomplete reservation is released and reported incomplete reserve, never re-reserved', async () => {
+    const harness = makeHarness();
+    await harness.executionJournal.saveCapacityReservation({
+      id: 'res-example-incomplete',
+      attemptId: ATTEMPT_ID,
+      hostId: HOST_NAME,
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      hostName: null,
+      hostKind: null,
+      transport: 'local',
+      sshAlias: null,
+      port: null,
+      worktreePath: null,
+      reservedAtIso: NOW,
+      releasedAtIso: null,
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'reserve',
+      reason: 'reservation-incomplete',
+    });
+    expect(releaseSpy).toHaveBeenCalledTimes(1);
+    expect(releaseSpy).toHaveBeenCalledWith(ATTEMPT_ID, NOW);
+    expect(harness.capacityCalls).toHaveLength(0);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
     expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
   });
 
@@ -562,6 +612,38 @@ describe('StartLaneRunUseCase', () => {
     expect(harness.capacityCalls).toHaveLength(1);
     expect(harness.worktreeCalls).toHaveLength(1);
     expect(harness.briefCalls).toHaveLength(1);
+  });
+
+  it('test 5b: a retry after completion with neither runner host nor held reservation returns incomplete attempt', async () => {
+    const harness = makeHarness();
+    const created = await harness.runRepoStore.create({
+      version: 1,
+      runId: RUN_ID,
+      workOrderId: 'wo-example-1',
+      tier: 2,
+      seatPlanRef: DIGEST,
+      cursors: { 'first-pass': null, fix: null, review: null },
+      round: 0,
+      attemptIds: [ATTEMPT_ID],
+      prNumber: null,
+      parked: null,
+      parkCount: 0,
+      lease: null,
+      revision: 1,
+      runPolicyRevision: 'policy-example-1',
+    });
+    expect(created.outcome).toBe('saved');
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'attempt',
+      reason: 'attempt-incomplete',
+    });
+    expect(harness.capacityCalls).toHaveLength(0);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
   });
 
   it('test 6: abandon releases a reserve-only crash, cancels a prepared attempt and refuses a completed start', async () => {

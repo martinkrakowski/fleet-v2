@@ -115,6 +115,18 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
       // rounds decide this case.
       return { outcome: 'refused', reason: 'host-kind-differs' };
     }
+    // A later attempt must use the run's first attempt's worktree path. Read
+    // the first attempt record and compare it with the request before
+    // reserving; different, or the first attempt unreadable, refuse
+    // `worktree-mismatch` without reserving.
+    const firstAttemptId = run.attemptIds[0];
+    const firstAttempt =
+      firstAttemptId === undefined
+        ? null
+        : await this.options.attemptRepo.findAttemptById(firstAttemptId);
+    if (firstAttempt === null || firstAttempt.worktreePath !== request.worktreePath) {
+      return { outcome: 'refused', reason: 'worktree-mismatch' };
+    }
     const host: ReserveExecutionCapacityHost = {
       hostName: candidate.name,
       hostKind: candidate.kind,
@@ -215,16 +227,39 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
         active.push({ run, state });
       }
     }
-    if (active.length >= this.options.maxActiveRuns) {
+    // In-flight starts: held capacity reservations that belong to no lane run
+    // yet (a start that reserved and has not created its run) count as active
+    // runs, and as busy for their work order's package when it can be read; an
+    // unreadable work order counts as busy (fail closed).
+    const inFlight: { readonly workOrderId: string | null }[] = [];
+    for (const reservation of heldReservations) {
+      if (reservation.attemptId === excludeAttemptId) {
+        continue;
+      }
+      const referenced = runs.some((run) => run.attemptIds.includes(reservation.attemptId));
+      if (referenced) {
+        continue;
+      }
+      const attempt = await this.options.attemptRepo.findAttemptById(reservation.attemptId);
+      inFlight.push({ workOrderId: attempt?.workOrderId ?? null });
+    }
+    if (active.length + inFlight.length >= this.options.maxActiveRuns) {
       return true;
     }
     const thisOrder = await this.options.workOrderRepo.findWorkOrderById(workOrderId);
     if (thisOrder === null) {
       return true;
     }
-    const workOrders = await Promise.all(
-      active.map((activeRun) => this.options.workOrderRepo.findWorkOrderById(activeRun.run.workOrderId)),
-    );
+    const workOrders = await Promise.all([
+      ...active.map((activeRun) =>
+        this.options.workOrderRepo.findWorkOrderById(activeRun.run.workOrderId),
+      ),
+      ...inFlight.map((inflight) =>
+        inflight.workOrderId === null
+          ? Promise.resolve(null)
+          : this.options.workOrderRepo.findWorkOrderById(inflight.workOrderId),
+      ),
+    ]);
     return workOrders.some(
       (other) => other === null || laneRunPackagesOverlap(other, thisOrder),
     );

@@ -58,6 +58,32 @@ export interface PlanRef {
   readonly laneId: string;
 }
 
+/**
+ * How much a work order may do without the owner (auto-merge plan A5).
+ * `standard` may later be merged by policy; `high` (data safety, security,
+ * user-facing behaviour, or simply unlabelled) never merges without the owner
+ * unless the installation opts in separately.
+ */
+export const WORK_ORDER_RISKS = ['standard', 'high'] as const;
+export type WorkOrderRisk = (typeof WORK_ORDER_RISKS)[number];
+
+/** A work order without a risk label is high risk (fail closed, plan A5). */
+export const DEFAULT_WORK_ORDER_RISK: WorkOrderRisk = 'high';
+
+/** Classify a value as a declared risk; anything else is `undefined`, never a default. */
+export function parseWorkOrderRisk(value: unknown): WorkOrderRisk | undefined {
+  return value === 'standard' || value === 'high' ? value : undefined;
+}
+
+/**
+ * The effective risk of a stored work order: its `risk` only when it is exactly
+ * `standard` or `high`; absent or anything else reads as `high`.
+ */
+export function resolveWorkOrderRisk(record: Pick<WorkOrderRecord, 'risk'>): WorkOrderRisk {
+  // Own property only: an inherited `risk` (a polluted prototype) never labels a record.
+  return parseWorkOrderRisk(Object.hasOwn(record, 'risk') ? record.risk : undefined) ?? DEFAULT_WORK_ORDER_RISK;
+}
+
 /** Serializable record of one registered, approved bounded work unit. */
 export interface WorkOrderRecord {
   readonly id: string;
@@ -68,6 +94,12 @@ export interface WorkOrderRecord {
   readonly baseCommit: string;
   readonly ownedPaths: readonly string[];
   readonly policyRevision: string;
+  /**
+   * Set once at registration and never changed (plan A5). Optional only for
+   * records stored before AM2; read it through `resolveWorkOrderRisk`, which
+   * treats an absent value as `high`.
+   */
+  readonly risk?: WorkOrderRisk;
   readonly prerequisiteWorkOrderIds: readonly string[];
   readonly state: WorkOrderStateValue;
   readonly revision: number;

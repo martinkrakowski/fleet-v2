@@ -337,6 +337,7 @@ describe('RegisterWorkOrderUseCase', () => {
       baseCommit: 'abc123',
       ownedPaths: ['packages/app-a/**'],
       policyRevision: 'policy-7',
+      risk: 'high',
       prerequisiteWorkOrderIds: [],
       state: 'approved',
       revision: 1,

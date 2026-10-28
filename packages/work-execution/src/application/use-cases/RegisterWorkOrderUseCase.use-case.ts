@@ -4,9 +4,14 @@
  * base commit, owned paths, policy revision and prerequisites. Recording is
  * registration, not dispatch: invalid input, duplicate identities, conflicting
  * path ownership on active work orders and missing prerequisites are rejected
- * explicitly and authorize nothing.
+ * explicitly and authorize nothing. The risk label is recorded at registration
+ * (absent = high) and is never changed afterwards.
  */
 
+import {
+  DEFAULT_WORK_ORDER_RISK,
+  parseWorkOrderRisk,
+} from '../../domain/execution-records.js';
 import type { WorkOrderRecord } from '../../domain/execution-records.js';
 import type {
   RegisterWorkOrderPort,
@@ -71,6 +76,13 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       return { outcome: 'rejected', reason: 'Work order owned paths must be non-empty strings' };
     }
 
+    // Plan A5: an absent label is high risk; any other value is refused, never guessed.
+    const risk =
+      request.risk === undefined ? DEFAULT_WORK_ORDER_RISK : parseWorkOrderRisk(request.risk);
+    if (risk === undefined) {
+      return { outcome: 'rejected', reason: "Work order risk must be 'standard' or 'high'" };
+    }
+
     // One trimmed id for the profile check, the conflict listing and the save.
     const projectId = request.projectId.trim();
     if (this.deps.profileRead) {
@@ -129,6 +141,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       baseCommit: request.baseCommit,
       ownedPaths: [...request.ownedPaths],
       policyRevision: request.policyRevision,
+      risk,
       prerequisiteWorkOrderIds: [...prerequisites],
       state: 'approved',
       revision: 1,

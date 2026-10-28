@@ -5,7 +5,8 @@
  * accept no further dispatch, and a work order owns its paths and revision.
  */
 
-import type { PlanRef, WorkOrderRecord } from '../execution-records.js';
+import type { PlanRef, WorkOrderRecord, WorkOrderRisk } from '../execution-records.js';
+import { resolveWorkOrderRisk } from '../execution-records.js';
 import { PLAN_ID_PATTERN, PLANNED_LANE_ID_PATTERN } from '../lane-plan-records.js';
 import type { WorkOrderStateValue } from '../value-objects/WorkOrderState.vo.js';
 import { WorkOrderState } from '../value-objects/WorkOrderState.vo.js';
@@ -68,6 +69,11 @@ export class WorkOrder {
     return this.record.state;
   }
 
+  /** The registered risk; a record stored without one is `high` (plan A5). */
+  getRisk(): WorkOrderRisk {
+    return resolveWorkOrderRisk(this.record);
+  }
+
   /** Terminal states (merged, stopped) accept no further attempt dispatch. */
   isTerminal(): boolean {
     return this.record.state === 'merged' || this.record.state === 'stopped';
@@ -89,9 +95,12 @@ export class WorkOrder {
   }
 }
 
-/** A fresh record; `planRef` is copied when present and omitted when absent. */
+/** A fresh record; `planRef` and `risk` are copied when present and omitted when absent. */
 function storedRecord(record: WorkOrderRecord): WorkOrderRecord {
-  const stored: Omit<WorkOrderRecord, 'planRef'> & { planRef?: PlanRef } = {
+  const stored: Omit<WorkOrderRecord, 'planRef' | 'risk'> & {
+    planRef?: PlanRef;
+    risk?: WorkOrderRisk;
+  } = {
     id: record.id,
     projectId: record.projectId,
     taskId: record.taskId,
@@ -112,6 +121,9 @@ function storedRecord(record: WorkOrderRecord): WorkOrderRecord {
       planId: record.planRef.planId,
       laneId: record.planRef.laneId,
     };
+  }
+  if (Object.hasOwn(record, 'risk') && record.risk !== undefined) {
+    stored.risk = record.risk;
   }
   return stored;
 }

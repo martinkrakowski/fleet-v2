@@ -396,6 +396,37 @@ describe('ResumeLaneRunUseCase applyPendingResume', () => {
     expect(entries.filter((entry) => entry.kind === 'conduct' && entry.state === 'gating')).toHaveLength(1);
   });
 
+  it('a stop recorded after an interrupted resume still wins: refused stop-pending, the record stays parked', async () => {
+    const fx = await seededParked();
+    await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await fx.resume.applyPendingResume({
+        runId: RUN_ID,
+        lease: { holderId: 'driver-example-2', fence: 99 },
+        nowIso: NOW,
+      }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'save-refused' });
+    expect(
+      await fx.journal.append({
+        ...laneRunIntentEntry(ENTRY_2, RUN_ID, `${RUN_ID}/stop@cli`, null, LATER),
+        mode: 'graceful',
+        expectedRevision: 2,
+      }),
+    ).toMatchObject({ outcome: 'appended' });
+    expect(
+      await fx.resume.applyPendingResume({
+        runId: RUN_ID,
+        lease: { holderId: HOLDER, fence: 1 },
+        nowIso: LATER,
+      }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'stop-pending' });
+    expect((await fx.repo.get(RUN_ID))?.parked).toEqual(PARKED);
+    const entries = await fx.journal.listForRun(RUN_ID);
+    const results = entries.filter((entry) => entry.kind === 'result' && entry.key === RESUME_CLI_KEY);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ outcome: 'refused', reasonCode: 'stop-pending' });
+  });
+
   it('a web and a cli resume for the same park: the first applies, the second is refused not-parked', async () => {
     const fx = await seededParked();
     await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });

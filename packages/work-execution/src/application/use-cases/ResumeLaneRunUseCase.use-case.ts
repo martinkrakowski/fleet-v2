@@ -195,6 +195,12 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     // park for its parked-from state while the record is still parked. Finish that exit here, so the
     // intent is settled as resumed and never refused as not-parked ahead of the repair.
     if (facts.state === record.parked.parkedFrom) {
+      // A stop recorded since still wins: the resume is refused, and AdvanceLaneRun's park-exit repair
+      // and stop handling settle the run, exactly as for a refused save without a stop.
+      if (facts.stopMode !== null) {
+        await this.appendResult(request.runId, firstPendingKey, 'refused', 'stop-pending', request.nowIso);
+        return { outcome: 'refused', key: firstPendingKey, reason: 'stop-pending' };
+      }
       const finished = await this.deps.runRepo.save(
         { ...record, parked: null, revision: record.revision + 1 },
         { holderId: request.lease.holderId, fence: request.lease.fence, nowIso: request.nowIso },

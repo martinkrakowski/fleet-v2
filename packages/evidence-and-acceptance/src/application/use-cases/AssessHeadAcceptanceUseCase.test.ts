@@ -626,7 +626,7 @@ describe('AssessHeadAcceptanceUseCase forge observed head (PC-2b)', () => {
     }
   });
 
-  it('pending with another head is blocked with only the head blocker, no ci-pending kind', async () => {
+  it('pending with another head is blocked with the head blocker as well, so it is never ci-pending only', async () => {
     const result = await acceptanceUseCase(forgeStatusPort('pending', OTHER_HEAD)).assessHeadAcceptance(
       request,
     );
@@ -635,8 +635,9 @@ describe('AssessHeadAcceptanceUseCase forge observed head (PC-2b)', () => {
     if (result.outcome === 'blocked') {
       expect(result.blockerDetails).toEqual([
         { kind: 'other', text: 'forge pull request head moved while CI state was read' },
+        { kind: 'ci-pending', text: "forge reports CI state 'pending' for this candidate head" },
       ]);
-      expect(result.blockerDetails.some((blocker) => blocker.kind === 'ci-pending')).toBe(false);
+      expect(result.blockerDetails.every((blocker) => blocker.kind === 'ci-pending')).toBe(false);
     }
   });
 });

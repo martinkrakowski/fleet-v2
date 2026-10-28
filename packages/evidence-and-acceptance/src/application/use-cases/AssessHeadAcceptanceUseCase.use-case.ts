@@ -352,9 +352,9 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       const headConfirmed =
         status.candidateHeadSha === assessment.candidateHeadSha && status.observedHeadSha === assessment.candidateHeadSha;
       if (!headConfirmed) {
-        // The forge CI state belongs to another head (or the forge could not
-        // re-read the head after reading CI state); it is not evidence for this
-        // candidate head.
+        // The forge CI state may belong to another head (or the forge could not
+        // re-read the head after reading CI state). This blocker is never
+        // `ci-pending`, so the list is never read as CI pending only.
         blockers.push(
           acceptanceBlocker(
             'other',
@@ -363,7 +363,8 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
               : 'forge pull request head moved while CI state was read',
           ),
         );
-      } else if (!PASSING_RESULTS.includes(status.ciState)) {
+      }
+      if (!PASSING_RESULTS.includes(status.ciState)) {
         blockers.push(
           acceptanceBlocker(
             ciBlockerKind(status.ciState),

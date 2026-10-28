@@ -1443,8 +1443,9 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
    * settled from the attempt record alone — `StopAttempt` is never called
    * again here. A terminal attempt completes the stop, `stop-timeout` when
    * no force stop is recorded and `stop-force` (with the `stopped` conduct)
-   * otherwise; anything else stays `stop-unconfirmed`, which the decider
-   * retries under a retry key.
+   * otherwise; a forced stop reads the active reservations so a still-held
+   * slot reports `stop-force-slot-held`, never released. Anything else stays
+   * `stop-unconfirmed`, which the decider retries under a retry key.
    */
   private async reconcileStop(
     gathered: GatheredLaneRunFacts,
@@ -1472,7 +1473,11 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-unconfirmed' };
     }
     if (gathered.facts.stopMode === 'force') {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'stop-force');
+      // §3.8: a slot is never reported released unless the reservation confirmed it.
+      const reservations = await this.deps.executionJournal.listActiveReservations();
+      const held = attempt !== null && reservations.some((reservation) => reservation.attemptId === attempt.id && reservation.held);
+      const reasonCode = held ? 'stop-force-slot-held' : 'stop-force';
+      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', reasonCode);
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
@@ -1480,7 +1485,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       if (!appended.ok) {
         return { outcome: 'refused', reason: appended.reason };
       }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-force' };
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
     }
     const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'stop-timeout');
     if (resultRefusal !== null) {
@@ -1820,7 +1825,11 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     return { ok: false };
   }
 
-  /** The `wait admission` hook: reserve once for a prepared attempt, never while halted. */
+  /**
+   * The `wait admission` hook: reserve once for a prepared attempt, never
+   * while halted. A refused admit parks `step-refused dispatch` (the dispatch
+   * refusal's park) so the owner sees it; admitted and no-capacity wait.
+   */
   private async performAdmissionWait(
     record: LaneRunRecord,
     facts: LaneRunFacts,
@@ -1829,13 +1838,16 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
   ): Promise<AdvanceLaneRunResult> {
     const attempt = facts.attempt;
     if (!request.halted && attempt !== null && attempt.phase === 'prepared' && latest !== null) {
-      await this.deps.admission.admit({
+      const admission = await this.deps.admission.admit({
         attemptId: attempt.attemptId,
         workOrderId: record.workOrderId,
         seatTool: parseSeatTool(latest.seatSelection?.tool) ?? 'opencode',
         worktreePath: latest.worktreePath,
         nowIso: request.nowIso,
       });
+      if (admission.outcome === 'refused') {
+        return this.performPark(record, 'step-refused', 'dispatch', facts.state, request);
+      }
     }
     return { outcome: 'waiting', reason: 'admission' };
   }

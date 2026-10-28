@@ -23,6 +23,7 @@ import {
   type LaneRunResultReasonCode,
 } from '../../../domain/lane-run-step-facts.js';
 import type { ReconcileAttemptResult } from '../../ports/in/ReconcileAttemptPort.in-port.js';
+import type { LaneRunAdmissionResult } from '../../ports/out/LaneRunAdmissionPort.out-port.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
@@ -173,6 +174,7 @@ interface Harness {
   readonly deps: AdvanceLaneRunDependencies;
   setManifest(json: string | null): void;
   setReconcileAnswer(answer: ReconcileAttemptResult): void;
+  setAdmissionAnswer(answer: LaneRunAdmissionResult): void;
 }
 
 async function makeHarness(
@@ -188,6 +190,7 @@ async function makeHarness(
   const reconcileCalls: unknown[] = [];
   let manifestJson: string | null = JSON.stringify({ timeLimitSeconds: 3600 });
   let reconcileAnswer: ReconcileAttemptResult = activeAnswer(attempts[attempts.length - 1] ?? attemptFixture());
+  let admissionAnswer: LaneRunAdmissionResult = { outcome: 'admitted' };
   const created = await runRepo.create(record);
   expect(created.outcome).toBe('saved');
   const leased = await runRepo.acquireLease(record.runId, {
@@ -228,7 +231,7 @@ async function makeHarness(
     admission: {
       admit: async (request) => {
         admissionCalls.push(request);
-        return { outcome: 'admitted' };
+        return admissionAnswer;
       },
     },
     newUlid: makeUlidMinter(),
@@ -247,6 +250,9 @@ async function makeHarness(
     },
     setReconcileAnswer: (answer) => {
       reconcileAnswer = answer;
+    },
+    setAdmissionAnswer: (answer) => {
+      admissionAnswer = answer;
     },
   };
 }
@@ -547,5 +553,32 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
       result: 'completed',
       reasonCode: 'prepared',
     });
+  });
+
+  it('test 10: a refused admit parks the run step-refused dispatch so the owner sees it', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    harness.setAdmissionAnswer({ outcome: 'refused', reason: 'run-host-unknown' });
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    const after = await harness.runRepo.get(RUN_ID);
+    expect(after?.parked).toEqual({
+      reason: 'step-refused',
+      qualifier: 'dispatch',
+      parkedFrom: 'ready',
+      questionId: null,
+    });
+    expect(after?.parkCount).toBe(1);
+    expect(after?.revision).toBe(2);
+    expect(await lastJournalState(harness)).toBe('parked');
+  });
+
+  it('test 11: a no-capacity admit keeps waiting admission and never parks', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    harness.setAdmissionAnswer({ outcome: 'no-capacity' });
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'waiting', reason: 'admission' });
+    const after = await harness.runRepo.get(RUN_ID);
+    expect(after?.parked).toBeNull();
+    expect(after?.parkCount).toBe(0);
   });
 });

@@ -30,6 +30,7 @@ import type {
   WorkOrderRecord,
 } from '../../domain/execution-records.js';
 import { WorkOrder } from '../../domain/entities/WorkOrder.js';
+import { AUTHORIZED_BY_PATTERN } from '../../domain/auto-merge.js';
 
 export interface ExecuteAuthorizedForgeActionDependencies {
   readonly attemptRepo: AttemptRepositoryPort;
@@ -83,6 +84,13 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         outcome: 'refused',
         reason: "Forge mode is 'none': no forge transport is configured, so forge actions refuse",
       };
+    }
+
+    // A policy-authorised action must name a policy setting revision (A8); an
+    // owner grant leaves `authorizedBy` absent. Anything else refuses before a
+    // grant is consumed or a journal entry is written (A11).
+    if (request.authorizedBy !== undefined && !AUTHORIZED_BY_PATTERN.test(request.authorizedBy)) {
+      return { outcome: 'refused', reason: 'authorizedBy must name a policy setting revision' };
     }
 
     const attempt = await deps.attemptRepo.findAttemptById(request.attemptId);
@@ -209,14 +217,32 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       `kind=${request.kind} expectedHeadSha=${request.expectedHeadSha}`,
     );
 
-    const forgeResult = await deps.forgePort.performForgeAction({
-      actionId: request.actionId,
-      attemptId: request.attemptId,
-      workOrderId: request.workOrderId,
-      kind: request.kind,
-      expectedHeadSha: request.expectedHeadSha,
-      branchName: `feat/${workOrder.laneId}`,
-    });
+    let forgeResult: Awaited<ReturnType<typeof deps.forgePort.performForgeAction>>;
+    try {
+      forgeResult = await deps.forgePort.performForgeAction({
+        actionId: request.actionId,
+        attemptId: request.attemptId,
+        workOrderId: request.workOrderId,
+        kind: request.kind,
+        expectedHeadSha: request.expectedHeadSha,
+        branchName: `feat/${workOrder.laneId}`,
+      });
+    } catch (error) {
+      // The intent is durable but the forge outcome was not recorded; journal
+      // the ambiguous outcome before propagating the original forge error.
+      try {
+        await this.appendJournal(
+          deps,
+          request,
+          attempt,
+          'ambiguous',
+          error instanceof Error ? error.message : String(error),
+        );
+      } catch {
+        // A journalling failure must not mask the original forge error.
+      }
+      throw error;
+    }
 
     if (forgeResult.outcome === 'executed') {
       await this.appendJournal(
@@ -266,7 +292,17 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     if (!input || typeof input !== 'object') {
       throw new Error('Not implemented: ExecuteAuthorizedForgeActionUseCase');
     }
-    return this.executeAuthorizedForgeAction(input as ExecuteAuthorizedForgeActionRequest);
+    // The HTTP entry point copies the six known fields and drops `authorizedBy`
+    // so a body can never label a merge as a policy merge (A8).
+    const record = input as ExecuteAuthorizedForgeActionRequest;
+    return this.executeAuthorizedForgeAction({
+      actionId: record.actionId,
+      attemptId: record.attemptId,
+      workOrderId: record.workOrderId,
+      kind: record.kind,
+      expectedHeadSha: record.expectedHeadSha,
+      authorizationGrantId: record.authorizationGrantId,
+    });
   }
 
   /** A completed merge advances the work order to the terminal 'merged' state. */
@@ -302,6 +338,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       status,
       sessionId: null,
       detail,
+      ...(request.authorizedBy === undefined ? {} : { authorizedBy: request.authorizedBy }),
     };
     await deps.journal.appendJournalEntry(entry);
   }

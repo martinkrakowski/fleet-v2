@@ -3,7 +3,8 @@
  * Covers AutoMergeAttemptUseCase: off is today's behaviour with nothing
  * written; unreadable facts route to attention; eligibility (A4), the gate,
  * the exact-head acceptance evidence, the single ci-pending first look and
- * §4 routing. An eligible attempt reports merge-not-wired. Fakes only.
+ * §4 routing. An eligible attempt merges through the grant and the forge
+ * (AM4a-3). Fakes only.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -28,8 +29,11 @@ import type {
   AcceptanceAssessmentResult,
 } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
 import type { AutoMergeOwnerRoutingPort, AutoMergeNotice } from '../../ports/out/AutoMergeOwnerRoutingPort.out-port.js';
-import type { PolicyMergeGrantPort } from '../../ports/out/PolicyMergeGrantPort.out-port.js';
-import type { ExecuteAuthorizedForgeActionPort } from '../../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
+import type { PolicyMergeGrantPort, PolicyMergeGrantResult } from '../../ports/out/PolicyMergeGrantPort.out-port.js';
+import type {
+  ExecuteAuthorizedForgeActionPort,
+  ExecuteAuthorizedForgeActionResult,
+} from '../../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
 import { WorkOrderRepositoryAdapter } from '../../../infrastructure/adapters/WorkOrderRepositoryAdapter.adapter.js';
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
@@ -208,23 +212,25 @@ class FakeRouting implements AutoMergeOwnerRoutingPort {
 
 class FakeGrant implements PolicyMergeGrantPort {
   calls = 0;
+  answer: PolicyMergeGrantResult = {
+    outcome: 'issued',
+    grantId: 'grant-example-1',
+    decisionRevision: 'policy:autoMerge@0123456789ab',
+  };
 
-  async issuePolicyMergeGrant(): Promise<{
-    readonly outcome: 'issued';
-    readonly grantId: string;
-    readonly decisionRevision: string;
-  }> {
+  async issuePolicyMergeGrant(): Promise<PolicyMergeGrantResult> {
     this.calls += 1;
-    throw new Error('the grant must never be called in AM4a-2');
+    return this.answer;
   }
 }
 
 class FakeForge implements ExecuteAuthorizedForgeActionPort {
   calls = 0;
+  answer: ExecuteAuthorizedForgeActionResult = { outcome: 'executed', headSha: HEAD };
 
-  async executeAuthorizedForgeAction(): Promise<never> {
+  async executeAuthorizedForgeAction(): Promise<ExecuteAuthorizedForgeActionResult> {
     this.calls += 1;
-    throw new Error('the forge must never be called in AM4a-2');
+    return this.answer;
   }
 }
 
@@ -479,9 +485,16 @@ describe('AutoMergeAttemptUseCase (AM4a-2)', () => {
       forgeEntry({ id: 'forge:auto-merge:attempt-example-2:' + OTHER_HEAD + ':refused:2', attemptId: 'attempt-example-2', status: 'refused' }),
     );
     const result = await built.run();
-    expect(result).toMatchObject({ outcome: 'not-merged', reason: 'merge-not-wired' });
+    expect(result).toEqual({
+      outcome: 'merged',
+      attemptId: ATTEMPT_ID,
+      headSha: HEAD,
+      decisionRevision: 'policy:autoMerge@0123456789ab',
+    });
     expect(built.gate.calls).toBe(1);
     expect(built.acceptance.calls).toBe(1);
+    expect(built.grant.calls).toBe(1);
+    expect(built.forge.calls).toBe(1);
   });
 
   it('treats an unparseable forge entry id as unreadable forge history', async () => {
@@ -554,7 +567,12 @@ describe('AutoMergeAttemptUseCase (AM4a-2)', () => {
     await seed(highWithOptIn);
     await highWithOptIn.workOrderRepo.saveWorkOrder(makeWorkOrder({ risk: 'high', revision: 2 }));
     const optInResult = await highWithOptIn.run();
-    expect(optInResult).toMatchObject({ outcome: 'not-merged', reason: 'merge-not-wired' });
+    expect(optInResult).toEqual({
+      outcome: 'merged',
+      attemptId: ATTEMPT_ID,
+      headSha: HEAD,
+      decisionRevision: 'policy:autoMerge@0123456789ab',
+    });
     expect(highWithOptIn.acceptance.calls).toBe(1);
   });
 
@@ -757,24 +775,97 @@ describe('AutoMergeAttemptUseCase (AM4a-2)', () => {
     expect(built.routing.calls[0]?.method).toBe('recordAttention');
   });
 
-  it('reports merge-not-wired for an eligible attempt and never calls the grant or the forge', async () => {
+  it('merges an eligible attempt through the grant and the forge', async () => {
     const built = build();
     await seed(built);
     const result = await built.run();
-    expect(result).toMatchObject({
-      outcome: 'not-merged',
-      reason: 'merge-not-wired',
-      route: 'none',
-      routeOutcome: 'none',
+    expect(result).toEqual({
+      outcome: 'merged',
+      attemptId: ATTEMPT_ID,
+      headSha: HEAD,
+      decisionRevision: 'policy:autoMerge@0123456789ab',
     });
-    expect(built.grant.calls).toBe(0);
-    expect(built.forge.calls).toBe(0);
+    expect(built.grant.calls).toBe(1);
+    expect(built.forge.calls).toBe(1);
     expect(built.acceptance.requests[0]).toEqual({
       attemptId: ATTEMPT_ID,
       workOrderId: WORK_ORDER_ID,
       candidateHeadSha: HEAD,
       policyRevision: 'policy-example-1',
     });
+  });
+
+  it('stops with setting-changed before the forge when the re-read forge mode differs', async () => {
+    const firstRead: AutoMergeSettingsAnswer = {
+      outcome: 'read',
+      enabled: true,
+      allowHighRisk: false,
+      onBlocked: 'ask-owner',
+      revision: '0123456789ab',
+      forgeMode: 'github',
+    };
+    const changedRead: AutoMergeSettingsAnswer = {
+      outcome: 'read',
+      enabled: true,
+      allowHighRisk: false,
+      onBlocked: 'ask-owner',
+      revision: '0123456789ab',
+      forgeMode: 'none',
+    };
+    let reads = 0;
+    const settings: AutoMergeSettingsPort = {
+      async readAutoMergeSettings() {
+        reads += 1;
+        return reads === 1 ? firstRead : changedRead;
+      },
+    };
+    const rebuilt = build({ settings });
+    await seed(rebuilt);
+    const result = await rebuilt.run();
+    expect(result).toMatchObject({ outcome: 'not-merged', reason: 'setting-changed' });
+    expect(rebuilt.grant.calls).toBe(1);
+    expect(rebuilt.forge.calls).toBe(0);
+  });
+
+  it('refuses a grant id that is not a non-empty string and never forges', async () => {
+    for (const grantId of [undefined, null, '', 7] as unknown[]) {
+      const built = build();
+      built.grant.answer = {
+        outcome: 'issued',
+        grantId: grantId as string,
+        decisionRevision: 'policy:autoMerge@0123456789ab',
+      };
+      await seed(built);
+      const result = await built.run();
+      expect(result).toMatchObject({ outcome: 'not-merged', reason: 'grant-revision-mismatch' });
+      expect(built.forge.calls).toBe(0);
+    }
+  });
+
+  it('refuses a grant id that is missing, inherited or an accessor, and never forges', async () => {
+    const missing = { outcome: 'issued', decisionRevision: 'policy:autoMerge@0123456789ab' };
+    const inherited = Object.assign(Object.create({ grantId: 'grant-example-1' }) as object, {
+      outcome: 'issued',
+      decisionRevision: 'policy:autoMerge@0123456789ab',
+    });
+    let accessorReads = 0;
+    const accessor = {
+      outcome: 'issued',
+      decisionRevision: 'policy:autoMerge@0123456789ab',
+      get grantId(): string {
+        accessorReads += 1;
+        return 'grant-example-1';
+      },
+    };
+    for (const answer of [missing, inherited, accessor]) {
+      const built = build();
+      built.grant.answer = answer as typeof built.grant.answer;
+      await seed(built);
+      const result = await built.run();
+      expect(result).toMatchObject({ outcome: 'not-merged', reason: 'grant-revision-mismatch' });
+      expect(built.forge.calls).toBe(0);
+    }
+    expect(accessorReads).toBe(0);
   });
 
   it('keeps not-merged when routing is unwired or fails, and answers exists on a repeat key', async () => {

@@ -321,16 +321,36 @@ export interface TelemetryResourceInput {
 export function telemetryResourceAttributes(input: TelemetryResourceInput): Readonly<Record<string, string>> {
   try {
     const attributes: Record<string, string> = { 'service.name': TELEMETRY_SERVICE_NAME };
-    if (isTelemetryServiceVersion(input.serviceVersion)) {
-      attributes['service.version'] = input.serviceVersion as string;
+    // Each field is read once, through its own data descriptor: the value
+    // validated is the value emitted, and no getter on the input runs.
+    const serviceVersion: unknown = Object.getOwnPropertyDescriptor(input, 'serviceVersion')?.value;
+    const projectName: unknown = Object.getOwnPropertyDescriptor(input, 'projectName')?.value;
+    if (isTelemetryServiceVersion(serviceVersion)) {
+      attributes['service.version'] = serviceVersion as string;
     }
-    if (isTelemetryProjectAlias(input.projectName)) {
-      attributes['openinference.project.name'] = input.projectName as string;
+    if (isTelemetryProjectAlias(projectName)) {
+      attributes['openinference.project.name'] = projectName as string;
     }
     return Object.freeze(attributes);
   } catch {
     return Object.freeze({ 'service.name': TELEMETRY_SERVICE_NAME });
   }
+}
+
+/**
+ * One encoding per fact: `-0` becomes `0` (an OTLP double encodes them
+ * differently), and a tag list is emitted in TELEMETRY_TAGS order whatever
+ * the input order.
+ */
+function canonicalValue(value: unknown): TelemetryAttributeValue {
+  if (Array.isArray(value)) {
+    const order = TELEMETRY_TAGS as readonly string[];
+    return Object.freeze(value.slice().sort((a, b) => order.indexOf(String(a)) - order.indexOf(String(b)))) as TelemetryAttributeValue;
+  }
+  if (value === 0) {
+    return 0;
+  }
+  return value as TelemetryAttributeValue;
 }
 
 /**
@@ -340,13 +360,14 @@ export function telemetryResourceAttributes(input: TelemetryResourceInput): Read
  */
 function plainArrayCopyOf(value: readonly unknown[]): unknown[] | null {
   const length: unknown = Object.getOwnPropertyDescriptor(value, 'length')?.value;
-  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) {
+  // The only array rule is the tag list, so nothing longer is ever copied.
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0 || length > TELEMETRY_TAGS.length) {
     return null;
   }
   const copy: unknown[] = [];
   for (let index = 0; index < length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-    if (descriptor === undefined || !('value' in descriptor)) {
+    if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) {
       return null;
     }
     copy.push(descriptor.value);
@@ -382,7 +403,7 @@ export function filterTelemetryAttributes(
     const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const key of Object.keys(input)) {
       const descriptor = Object.getOwnPropertyDescriptor(input, key);
-      if (descriptor !== undefined && 'value' in descriptor && descriptor.enumerable) {
+      if (descriptor !== undefined && Object.hasOwn(descriptor, 'value') && descriptor.enumerable) {
         snapshot[key] = Array.isArray(descriptor.value) ? plainArrayCopyOf(descriptor.value) : descriptor.value;
       }
     }
@@ -397,7 +418,7 @@ export function filterTelemetryAttributes(
       const value = snapshot[key];
       const rule = RUN_TELEMETRY_ATTRIBUTES[key];
       if (rule.check(value, { spanKind, attributes: snapshot })) {
-        output[key] = Array.isArray(value) ? Object.freeze(value.slice()) : (value as TelemetryAttributeValue);
+        output[key] = canonicalValue(value);
       }
     }
     return Object.freeze(output);

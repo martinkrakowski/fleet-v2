@@ -380,4 +380,38 @@ describe('telemetryResourceAttributes', () => {
     Object.defineProperty(withGetter, '0', { get: () => 'dry-run', enumerable: true });
     expect(filterTelemetryAttributes({ 'tag.tags': withGetter }, 'CHAIN')['tag.tags']).toBeUndefined();
   });
+
+  it('reads resource fields once: a getter never supplies an unvalidated value', () => {
+    let reads = 0;
+    const input = {
+      get serviceVersion(): string {
+        reads += 1;
+        return reads === 1 ? '0.1.0' : 'CANARY host:port';
+      },
+      projectName: 'fleet-lanes',
+    };
+    const resource = telemetryResourceAttributes(input);
+    expect(resource['service.version']).toBeUndefined();
+    expect(JSON.stringify(resource)).not.toContain('CANARY');
+  });
+
+  it('encodes -0 as 0 and emits tags in one order', () => {
+    const negativeZero = filterTelemetryAttributes({ 'fleet.usage.wall_seconds': -0 }, 'CHAIN');
+    expect(Object.is(negativeZero['fleet.usage.wall_seconds'], 0)).toBe(true);
+    const first = filterTelemetryAttributes({ 'tag.tags': ['tier-2', 'conducted'] }, 'CHAIN');
+    const second = filterTelemetryAttributes({ 'tag.tags': ['conducted', 'tier-2'] }, 'CHAIN');
+    expect(first['tag.tags']).toEqual(second['tag.tags']);
+  });
+
+  it('refuses an array longer than the tag list without walking it', () => {
+    const long = new Proxy(['conducted'], {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'length') {
+          return { value: Number.MAX_SAFE_INTEGER, writable: true, enumerable: false, configurable: false };
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    expect(filterTelemetryAttributes({ 'tag.tags': long }, 'CHAIN')['tag.tags']).toBeUndefined();
+  });
 });

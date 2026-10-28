@@ -1,13 +1,14 @@
 import { getOperatorComposition } from "../../../../wiring/operator/composition.js";
 import { errorEnvelope, newOperationId, successEnvelope } from "../../../../wiring/operator/errors.js";
-import { readObjectBody } from "../../../../wiring/http-input";
+import { readObjectBody, routeParam } from "../../../../wiring/http-input";
 
 export default defineEventHandler(async (event) => {
+  const grantId = routeParam(event, "id");
   const operationId = newOperationId();
   try {
     const result = await getOperatorComposition().recordAuthorizationConsumption.execute({
       ...(await readObjectBody(event)),
-      grantId: getRouterParam(event, "id") ?? "",
+      grantId,
     });
     return successEnvelope(operationId, result);
   } catch (error) {

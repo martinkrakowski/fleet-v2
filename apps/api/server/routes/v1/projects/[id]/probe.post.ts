@@ -1,4 +1,5 @@
-import { defineEventHandler, getRouterParam, setResponseStatus } from "h3";
+import { defineEventHandler, setResponseStatus } from "h3";
+import { routeParam } from "../../../../wiring/http-input";
 import { workComposition } from "../../../../wiring/work/composition";
 import {
   envelope,
@@ -14,10 +15,10 @@ import {
 // immediately, never queued. Admission stays behind the bearer token, which
 // already authorises heavier remote work (dispatch).
 export default defineEventHandler(async (event) => {
-  const operationId = newOperationId();
   // Trimmed exactly as the use case trims it, so `%20a` and `a` share one
-  // single-flight slot; h3 has already decoded the path.
-  const projectId = (getRouterParam(event, "id") ?? "").trim();
+  // single-flight slot; routeParam has fully decoded the id.
+  const projectId = routeParam(event, "id").trim();
+  const operationId = newOperationId();
   try {
     const composition = workComposition();
     const probed = await composition.probeLimiter.run(projectId, () =>

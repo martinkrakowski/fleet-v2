@@ -97,6 +97,7 @@ import { seatPlanFromInstallation, unhealthySeatIdsOf } from './seat-plan.js';
 import { initCommand, type InitCliOptions } from './init.js';
 import { projectsCommand, type ProjectsCliOptions } from './projects.js';
 import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
+import { conductorCommand, type ConductorCliOptions } from './conductor.js';
 
 export { resolveRunnerSettings };
 
@@ -1987,6 +1988,9 @@ prepare --seatPlanFromInstallation builds it from the installation's chains;
 attempt fix rotates to the next eligible fix seat and skips seats whose
 health is unhealthy; attempt next-seat --role fix|review shows the next one.
 
+The conductor group shows lane runs and records a halt, a run stop or a
+resume; the driver obeys the records. Run 'fleet-v2 conductor --help'.
+
 Commands:
   work-order register|inspect
   doctor [--probe-seats] [--host <name>] [--json]
@@ -1995,6 +1999,7 @@ Commands:
   projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
   state check|restore
+  conductor status|halt|stop|resume
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept
@@ -2027,6 +2032,7 @@ export async function runCli(
   seatsOptions?: SeatsCliOptions,
   projectsOptions?: ProjectsCliOptions,
   stateOptions?: StateCliOptions,
+  conductorOptions?: ConductorCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -2095,6 +2101,12 @@ export async function runCli(
     // (the state-backed pattern), not the installation file itself.
     if (group === 'projects') {
       return await projectsCommand(restArgv.slice(1), io, activeRuntime, projectsOptions ?? {});
+    }
+    if (group === 'conductor') {
+      return await conductorCommand(restArgv.slice(1), io, activeRuntime, {
+        ...conductorOptions,
+        stateDir: conductorOptions?.stateDir ?? stateDir,
+      });
     }
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);

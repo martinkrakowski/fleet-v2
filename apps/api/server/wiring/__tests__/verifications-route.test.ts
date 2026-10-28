@@ -304,7 +304,7 @@ describe("POST /v1/verifications with a v2 installation (H4 follow-ups)", () => 
     expect(response.status).toBe(400);
     expect(response.payload).toMatchObject({
       statusCode: 400,
-      statusMessage: expect.stringContaining("assessment-att-400"),
+      statusMessage: "assessmentId must be the attempt's assessment id or omitted",
     });
   });
 });

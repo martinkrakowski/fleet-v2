@@ -62,9 +62,10 @@ export function errorBody(error: { statusCode?: unknown; statusMessage?: unknown
   let statusMessage: string;
   if (statusCode >= 500) {
     statusMessage = "Internal Server Error";
-  } else if (statusCode === 404) {
-    // h3's own no-route 404 says "Cannot find any route matching <path>": never echo it.
-    statusMessage = "Not Found";
+  } else if (statusCode === 404 || statusCode === 405) {
+    // h3's own 404 and 405 name the path or the method ("Cannot find any route matching <path>",
+    // "Method <m> is not allowed on this route."): never echo them.
+    statusMessage = REASON_PHRASES[statusCode] ?? "Request Error";
   } else if (isAcceptableStatusMessage(error.statusMessage)) {
     statusMessage = error.statusMessage;
   } else {
@@ -75,6 +76,11 @@ export function errorBody(error: { statusCode?: unknown; statusMessage?: unknown
 }
 
 export default defineNitroErrorHandler((error, event) => {
+  // A response already sent (or streamed) cannot be rewritten; returning keeps Nitro's default
+  // handler, which echoes the URL, from running after a throw here.
+  if (event.handled) {
+    return;
+  }
   const body = errorBody(error);
   setResponseStatus(event, body.statusCode, body.statusMessage);
   setResponseHeader(event, "content-type", "application/json; charset=utf-8");

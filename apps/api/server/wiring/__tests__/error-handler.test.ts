@@ -2,6 +2,9 @@
 // prove the pure errorBody mapping; a loopback h3 app proves the default
 // handler on the wire: the response carries only statusCode and statusMessage
 // and never echoes the request or the thrown error.
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createServer, type Server } from "node:http";
 import { createApp, createError, createRouter, defineEventHandler, toNodeListener } from "h3";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -16,6 +19,9 @@ vi.mock("nitropack/runtime", () => ({
 }));
 
 import handler, { errorBody } from "../../error.js";
+
+/** apps/api, three levels above this test file (server/wiring/__tests__). */
+const apiRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
 describe("errorBody", () => {
   it("keeps an acceptable 4xx statusMessage verbatim", () => {
@@ -145,6 +151,34 @@ describe("default handler on a loopback h3 app", () => {
     const response = await fetch(`http://127.0.0.1:${port}/nowhere/abc?token=xyz`);
     expect(response.status).toBe(404);
     expect(await response.text()).toBe('{"statusCode":404,"statusMessage":"Not Found"}');
+  });
+
+  it("never passes h3's method-naming 405 statusMessage through", () => {
+    expect(errorBody({ statusCode: 405, statusMessage: "Method post is not allowed on this route." })).toEqual({
+      statusCode: 405,
+      statusMessage: "Method Not Allowed",
+    });
+  });
+
+  it("is registered as the Nitro error handler", () => {
+    const config = readFileSync(join(apiRoot, "nitro.config.ts"), "utf8");
+    expect(config).toMatch(/errorHandler:\s*"~\/error"/);
+  });
+
+  it("no API source builds a statusMessage from a template literal (a 4xx message passes through)", () => {
+    const offenders: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name !== "__tests__" && entry.name !== "node_modules") walk(path);
+        } else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) {
+          if (/statusMessage:\s*`/.test(readFileSync(path, "utf8"))) offenders.push(path);
+        }
+      }
+    };
+    walk(join(apiRoot, "server"));
+    expect(offenders).toEqual([]);
   });
 
   it("never passes a 404's own statusMessage through", () => {

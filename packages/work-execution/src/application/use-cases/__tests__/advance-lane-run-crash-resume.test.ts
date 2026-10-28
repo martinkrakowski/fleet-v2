@@ -989,4 +989,36 @@ describe('AdvanceLaneRunUseCase reconcile and crash-resume (K4-7)', () => {
     const parked = await advance(harness);
     expect(parked).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'reconcile' });
   });
+
+  it('KF-1: a crash between the dispatch-started result and the dispatching conduct repairs the conduct; no second attempt is minted', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    // The dispatch fake starts the prepared attempt, exactly as a live dispatch
+    // would; the crash then loses the `dispatching` conduct: the intent and its
+    // `completed`/`dispatch-started` result are journalled, the attempt record
+    // was saved `dispatching` before the runner call, but the run stays `ready`.
+    const dispatch = harness.deps.dispatchAttempt;
+    if (dispatch === undefined) {
+      throw new Error('the example harness always wires the dispatch fake');
+    }
+    await dispatch.dispatchAttempt({
+      attemptId: 'attempt-example-1',
+      workOrderId: 'wo-example-1',
+      worktreePath: WORKTREE,
+      briefPackagePath: '.lane/brief-package',
+      briefDigest: SHA,
+      baseCommit: COMMIT,
+      stepLimit: 100,
+      timeLimitSeconds: 2700,
+      nowIso: NOW,
+    });
+    await harness.attemptRepo.saveAttempt(attemptFixture({ state: 'dispatching', sessionId: 'session-example-9', revision: 1 }));
+    await appendIntent(harness, dispatchKey(), 'attempt-example-1', NOW);
+    await appendResult(harness, dispatchKey(), 'completed', 'dispatch-started', NOW);
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'entered', state: 'dispatching' });
+    expect(harness.dispatchRequests).toHaveLength(1);
+    expect((await harness.runRepo.get(RUN_ID))?.attemptIds).toEqual(['attempt-example-1']);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries[entries.length - 1]).toMatchObject({ kind: 'conduct', state: 'dispatching' });
+  });
 });

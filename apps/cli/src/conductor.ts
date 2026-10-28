@@ -113,6 +113,16 @@ function readControlOptions(argv: readonly string[], io: CliIo): ControlOptions 
   return { force, lift, revision, positionals };
 }
 
+/** What each subcommand accepts; anything else is a usage error, never silently ignored. */
+const SUBCOMMAND_SHAPE: Readonly<
+  Record<string, { readonly force: boolean; readonly lift: boolean; readonly revision: boolean; readonly runId: 'none' | 'optional' | 'required'; readonly writes: boolean }>
+> = {
+  status: { force: false, lift: false, revision: false, runId: 'optional', writes: false },
+  halt: { force: false, lift: true, revision: false, runId: 'none', writes: true },
+  stop: { force: true, lift: false, revision: true, runId: 'required', writes: true },
+  resume: { force: false, lift: false, revision: true, runId: 'required', writes: true },
+};
+
 /** The exit code of a control result, read from its outcome; text is never parsed. */
 function exitFor(result: { readonly outcome: string }): number {
   if (result.outcome === 'refused' || result.outcome === 'not-found') {
@@ -138,6 +148,27 @@ export async function conductorCommand(
     return 2;
   }
   const { force, lift, revision, positionals } = parsed;
+  const shape = SUBCOMMAND_SHAPE[subcommand];
+  if (shape !== undefined) {
+    const misplaced =
+      (force && !shape.force ? '--force' : null) ??
+      (lift && !shape.lift ? '--lift' : null) ??
+      (revision !== undefined && !shape.revision ? '--revision' : null);
+    if (misplaced !== null) {
+      io.stderr(`conductor ${subcommand} does not take ${misplaced}\n${CONDUCTOR_HELP}\n`);
+      return 2;
+    }
+    if (shape.runId === 'none' && positionals.length > 0) {
+      io.stderr(`conductor ${subcommand} takes no run id\n${CONDUCTOR_HELP}\n`);
+      return 2;
+    }
+    // A halt, stop or resume is a record the driver obeys later: in-memory stores would report success for a
+    // record that vanishes when this process exits (a halt that is no kill switch).
+    if (shape.writes && options.stateDir === undefined) {
+      io.stderr(`conductor ${subcommand} needs a durable state directory (--state-dir or FLEET_STATE_DIR)\n${CONDUCTOR_HELP}\n`);
+      return 2;
+    }
+  }
   const nowIso = options.now !== undefined ? options.now() : new Date().toISOString();
   const conductor = runtime.conductor;
   switch (subcommand) {

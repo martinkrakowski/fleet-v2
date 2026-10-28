@@ -102,6 +102,8 @@ function tempStateDir(): string {
 async function runConductor(
   runtime: FleetCliRuntime,
   args: readonly string[],
+  /** null runs with no durable state directory. */
+  stateDir: string | null = '/state-dir-example',
 ): Promise<{ code: number; stdout: string[]; stderr: string[] }> {
   const io = captureIo();
   const code = await runCli(
@@ -114,7 +116,7 @@ async function runConductor(
     undefined,
     undefined,
     undefined,
-    { now: () => NOW },
+    stateDir === null ? { now: () => NOW } : { now: () => NOW, stateDir },
   );
   return { code, stdout: io.outLines, stderr: io.errLines };
 }
@@ -234,6 +236,35 @@ describe('fleet-v2 conductor (K7-4)', () => {
       runId: RUN_ID,
       to: 'gating',
     });
+  });
+
+  it('halt, stop and resume without a durable state directory are usage errors; status still reads', async () => {
+    const runtime = makeRuntime(tempStateDir());
+    await seedParkedRun(runtime);
+    for (const args of [['halt'], ['halt', '--lift'], ['stop', RUN_ID], ['resume', RUN_ID]]) {
+      const result = await runConductor(runtime, args, null);
+      expect(result.code).toBe(2);
+      expect(result.stdout).toEqual([]);
+      expect(result.stderr.join('')).toContain('needs a durable state directory');
+    }
+    expect((await runConductor(runtime, ['status'], null)).code).toBe(0);
+  });
+
+  it('a flag or run id the subcommand does not take is a usage error, never silently ignored', async () => {
+    const runtime = makeRuntime(tempStateDir());
+    await seedParkedRun(runtime);
+    for (const args of [
+      ['stop', RUN_ID, '--lift'],
+      ['halt', '--force'],
+      ['halt', '--revision', '2'],
+      ['halt', RUN_ID],
+      ['resume', RUN_ID, '--force'],
+      ['status', '--lift'],
+    ]) {
+      const result = await runConductor(runtime, args);
+      expect(result.code).toBe(2);
+      expect(result.stdout).toEqual([]);
+    }
   });
 
   it('prints help naming every subcommand and refuses an unknown one', async () => {

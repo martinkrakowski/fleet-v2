@@ -183,7 +183,30 @@ export const REVIEW_REPLY_CONTRACT: string =
   '  or\n' +
   '  VERDICT: FAIL';
 
+/**
+ * Failure-mode checklist every conductor review prompt carries (§3.3). The
+ * CLI transport reuses it, so both transports ask the same items.
+ */
+export const REVIEW_CHECKLIST: string = [
+  'Check every item below and report a FINDING for each item that fails:',
+  '(a) the change does what the brief asks, nothing more (scope drift);',
+  '(b) claimed checks really pass, or are not claimed;',
+  '(c) imports, APIs and files that do not exist;',
+  '(d) state cleared on every exit path;',
+  '(e) permissive defaults and fail-open branches;',
+  '(f) the architecture rules: the domain is pure, ports live in application, I/O lives in infrastructure;',
+  '(g) each finding names a concrete failure scenario.',
+].join('\n');
+
 export function buildReviewPrompt(request: RunIndependentReviewRequest, nonce: string): string {
+  if (request.kind === undefined) {
+    return buildManualReviewPrompt(request, nonce);
+  }
+  return buildKindReviewPrompt(request, nonce);
+}
+
+/** The prompt a manual review (no kind) receives; byte-for-byte the pre-kind text. */
+function buildManualReviewPrompt(request: RunIndependentReviewRequest, nonce: string): string {
   const sections: string[] = [
     `Independent read-only code review for attempt "${request.attemptId}" at candidate head "${request.candidateHeadSha}".`,
     'This review session is strictly read-only. Do not edit, create, delete, or modify any files.',
@@ -197,6 +220,51 @@ export function buildReviewPrompt(request: RunIndependentReviewRequest, nonce: s
       nonce,
     });
     sections.push(`Diff summary:\n${wrappedDiffSummary}`);
+  }
+
+  sections.push('Inspect the code changes and candidate head using read-only tools (read, grep, glob, list).\n' + REVIEW_REPLY_CONTRACT);
+
+  return sections.join('\n\n');
+}
+
+/**
+ * The prompt a conductor review (a request with `kind`) receives: the header
+ * names the kind, a brief-check carries the frozen brief wrapped as untrusted,
+ * and code-review and pre-merge carry the failure-mode checklist.
+ */
+function buildKindReviewPrompt(request: RunIndependentReviewRequest, nonce: string): string {
+  const sections: string[] = [
+    `Independent read-only ${request.kind} review for attempt "${request.attemptId}" at candidate head "${request.candidateHeadSha}".`,
+    'This review session is strictly read-only. Do not edit, create, delete, or modify any files.',
+    UNTRUSTED_INPUT_RULE,
+  ];
+
+  if (typeof request.diffSummary === 'string' && request.diffSummary.trim() !== '') {
+    const wrappedDiffSummary = wrapUntrusted({
+      label: 'diff summary',
+      text: request.diffSummary.trim(),
+      nonce,
+    });
+    sections.push(`Diff summary:\n${wrappedDiffSummary}`);
+  }
+
+  if (request.kind === 'brief-check') {
+    if (typeof request.briefText === 'string' && request.briefText.trim() !== '') {
+      const wrappedBrief = wrapUntrusted({
+        label: 'brief',
+        text: request.briefText,
+        nonce,
+      });
+      sections.push(
+        `Brief:\n${wrappedBrief}\n\n` +
+          'Does the change satisfy every work-order item of the brief? Report a FINDING for each item the change does not satisfy.',
+      );
+    } else {
+      // The conductor always supplies the brief; a missing one still builds.
+      sections.push('The brief was not supplied.');
+    }
+  } else {
+    sections.push(REVIEW_CHECKLIST);
   }
 
   sections.push('Inspect the code changes and candidate head using read-only tools (read, grep, glob, list).\n' + REVIEW_REPLY_CONTRACT);
@@ -253,6 +321,64 @@ export function parseReviewReply(text: string, verdictText: string): ParsedRevie
     const hasBlocker = findings.some((f) => f.severity === 'blocker');
     result = hasBlocker ? 'fail' : 'pass';
   } else if (verdict === 'FAIL') {
+    result = 'fail';
+  }
+
+  return { result, findings };
+}
+
+/**
+ * Strict verdict validation for conductor replies (a request with `kind`):
+ * PASS with any blocker or major finding is a fail, a FAIL with zero findings
+ * is unknown (the run parks ambiguous rather than starting a fix round
+ * without findings), and a missing verdict is unknown. Manual reviews keep
+ * `parseReviewReply` unchanged.
+ */
+export function parseReviewReplyStrict(text: string, verdictText: string): ParsedReviewReply {
+  const findings: ReviewFindingRecord[] = [];
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const findingMatch = FINDING_PATTERN.exec(line);
+    if (findingMatch !== null) {
+      findings.push({
+        findingId: `review-${findings.length + 1}`,
+        severity: findingMatch[1] as FindingSeverity,
+        summary: findingMatch[4].trim(),
+        filePath: findingMatch[2] === '-' ? null : findingMatch[2],
+        line: findingMatch[3] !== undefined ? parseInt(findingMatch[3], 10) : null,
+        state: 'unresolved',
+        dispositionReason: null,
+        dispositionEvidenceRef: null,
+      });
+    }
+  }
+
+  let verdict: 'PASS' | 'FAIL' | null = null;
+  if (verdictText.trim() !== '') {
+    const lines = verdictText.split(/\r?\n/);
+    let lastNonEmptyLine: string | null = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].trim() !== '') {
+        lastNonEmptyLine = lines[i];
+        break;
+      }
+    }
+    if (lastNonEmptyLine !== null) {
+      const verdictMatch = VERDICT_PATTERN.exec(lastNonEmptyLine);
+      if (verdictMatch !== null) {
+        verdict = verdictMatch[1] as 'PASS' | 'FAIL';
+      }
+    }
+  }
+
+  let result: EvidenceResultValue = 'unknown';
+  if (verdict === 'PASS') {
+    const hasBlockingFinding = findings.some(
+      (f) => f.severity === 'blocker' || f.severity === 'major',
+    );
+    result = hasBlockingFinding ? 'fail' : 'pass';
+  } else if (verdict === 'FAIL' && findings.length > 0) {
     result = 'fail';
   }
 
@@ -461,7 +587,11 @@ export function createOcmReviewTransport(
     // 8. Parse verdict, findings, and rawOutput
     const finalText = textParts.join('');
     const lastText = textParts.at(-1) ?? '';
-    const { result, findings } = parseReviewReply(finalText, lastText);
+    // A conductor request (a kind) is validated strictly; a manual request keeps today's parse.
+    const { result, findings } =
+      request.kind !== undefined
+        ? parseReviewReplyStrict(finalText, lastText)
+        : parseReviewReply(finalText, lastText);
 
     const rawOutput =
       finalText.length > MAX_RAW_OUTPUT_LENGTH ? finalText.slice(-MAX_RAW_OUTPUT_LENGTH) : finalText;

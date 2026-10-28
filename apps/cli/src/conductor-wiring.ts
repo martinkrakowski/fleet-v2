@@ -16,14 +16,24 @@ import {
   AdvanceLaneRunUseCase,
   CancelPreparedAttemptUseCase,
   LaneRunAdmissionAdapter,
+  ResumeLaneRunUseCase,
   RunConductorPassUseCase,
   StartLaneRunUseCase,
   sha256HexDigest,
+  type AttemptRepositoryAdapter,
+  type ConductorDriverLeaseAdapter,
+  type ConductorHaltAdapter,
+  type ExecutionJournalAdapter,
+  type LaneRunJournalAdapter,
+  type LaneRunRepositoryAdapter,
   type ReserveExecutionCapacityCandidateHost,
   type RunConductorPassPort,
   type StartLaneRunPort,
+  type WorkOrderRepositoryAdapter,
 } from '@fleet/work-execution';
 
+import { createDryRunFakes } from './conductor-dry-run.js';
+import { newUlid } from './ulid.js';
 import type { FleetCliRuntime } from './composition.js';
 
 /**
@@ -65,6 +75,39 @@ export interface ConductorDriver {
   readonly start: StartLaneRunPort | null;
   readonly policy: ResolvedConductorPolicy;
   readonly runPolicyRevision: string; // 'policy:conductor@' + conductorRevision(policy)
+}
+
+/**
+ * The parts every conductor driver shares: the pass use case over the stores
+ * and the advance, the start port (null in the dry-run), the resolved policy
+ * and its revision. One builder so the live and dry-run drivers never
+ * duplicate the pass wiring.
+ */
+function buildConductorDriver(parts: {
+  readonly driverLease: ConductorDriverLeaseAdapter;
+  readonly runRepo: LaneRunRepositoryAdapter;
+  readonly runJournal: LaneRunJournalAdapter;
+  readonly halt: ConductorHaltAdapter;
+  readonly resume: ResumeLaneRunUseCase;
+  readonly advance: AdvanceLaneRunUseCase;
+  readonly start: StartLaneRunPort | null;
+  readonly policy: ResolvedConductorPolicy;
+  readonly runPolicyRevision: string;
+}): ConductorDriver {
+  const pass = new RunConductorPassUseCase({
+    driverLease: parts.driverLease,
+    runRepo: parts.runRepo,
+    runJournal: parts.runJournal,
+    halt: parts.halt,
+    resume: parts.resume,
+    advance: parts.advance,
+  });
+  return {
+    pass,
+    start: parts.start,
+    policy: parts.policy,
+    runPolicyRevision: parts.runPolicyRevision,
+  };
 }
 
 /**
@@ -119,14 +162,6 @@ export function buildLiveConductorDriver(
     evaluateAttemptGate: execution.requestAttemptAcceptance,
     runnerForAttempt: execution.runnerForAttempt,
   });
-  const pass = new RunConductorPassUseCase({
-    driverLease: conductor.driverLease,
-    runRepo: conductor.laneRunRepository,
-    runJournal: conductor.laneRunJournal,
-    halt: conductor.halt,
-    resume: conductor.resumeLaneRun,
-    advance,
-  });
   const start = new StartLaneRunUseCase({
     workOrderRepo: execution.workOrderRepository,
     profileRead: conductor.profileRead,
@@ -140,10 +175,81 @@ export function buildLiveConductorDriver(
     cancelPreparedAttempt,
     computeDigest: sha256HexDigest,
   });
-  return {
-    pass,
+  return buildConductorDriver({
+    driverLease: conductor.driverLease,
+    runRepo: conductor.laneRunRepository,
+    runJournal: conductor.laneRunJournal,
+    halt: conductor.halt,
+    resume: conductor.resumeLaneRun,
+    advance,
     start,
     policy,
     runPolicyRevision: 'policy:conductor@' + conductorRevision(policy),
-  };
+  });
+}
+
+/** The scratch stores the dry-run driver composes over (K7-8). */
+export interface DryRunStores {
+  readonly runRepo: LaneRunRepositoryAdapter;
+  readonly runJournal: LaneRunJournalAdapter;
+  readonly attemptRepo: AttemptRepositoryAdapter;
+  readonly executionJournal: ExecutionJournalAdapter;
+  readonly workOrderRepo: WorkOrderRepositoryAdapter;
+  readonly driverLease: ConductorDriverLeaseAdapter;
+  readonly halt: ConductorHaltAdapter;
+}
+
+/**
+ * The dry-run driver over the scratch stores and recording fakes (K7-8): no
+ * executor, no runner, no forge adapter, and no `start` port — a dry-run
+ * starts nothing. `policy` resolves as an absent block (the dry-run itself
+ * performs no `policy.conductor.enabled` check).
+ */
+export function buildDryRunConductorDriver(
+  stores: DryRunStores,
+  options: { readonly maxActiveRuns: number; readonly nowIso: () => string },
+): ConductorDriver {
+  const policy = resolveConductorPolicy(undefined);
+  const fakes = createDryRunFakes(
+    { attemptRepo: stores.attemptRepo, executionJournal: stores.executionJournal },
+    options.nowIso,
+  );
+  const cancelPreparedAttempt = new CancelPreparedAttemptUseCase({
+    attemptRepo: stores.attemptRepo,
+    journal: stores.executionJournal,
+  });
+  const resume = new ResumeLaneRunUseCase({
+    runRepo: stores.runRepo,
+    runJournal: stores.runJournal,
+    newUlid,
+  });
+  const advance = new AdvanceLaneRunUseCase({
+    runRepo: stores.runRepo,
+    runJournal: stores.runJournal,
+    attemptRepo: stores.attemptRepo,
+    executionJournal: stores.executionJournal,
+    artifactPort: fakes.artifactPort,
+    reconcileAttempt: fakes.reconcileAttempt,
+    admission: fakes.admission,
+    newUlid,
+    stopGraceMinutes: policy.stopGraceMinutes,
+    dispatchAttempt: fakes.dispatchAttempt,
+    cancelPreparedAttempt,
+    stopAttempt: fakes.stopAttempt,
+    collectAttemptArtifacts: fakes.collectAttemptArtifacts,
+    commitEditOnlyAttempt: fakes.commitEditOnlyAttempt,
+    evaluateAttemptGate: fakes.evaluateAttemptGate,
+    runnerForAttempt: fakes.runnerForAttempt,
+  });
+  return buildConductorDriver({
+    driverLease: stores.driverLease,
+    runRepo: stores.runRepo,
+    runJournal: stores.runJournal,
+    halt: stores.halt,
+    resume,
+    advance,
+    start: null,
+    policy,
+    runPolicyRevision: 'policy:conductor@' + conductorRevision(policy),
+  });
 }

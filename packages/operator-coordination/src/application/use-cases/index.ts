@@ -13,6 +13,7 @@ export * from "./InspectConfiguredCapabilitiesUseCase.use-case.js";
 export * from "./InspectOutstandingCoordinationUseCase.use-case.js";
 export * from "./InspectProjectProfileUseCase.use-case.js";
 export * from "./IssuePolicyForgeGrantUseCase.use-case.js";
+export * from "./ListAttentionItemsUseCase.use-case.js";
 export * from "./ListOrchestratorSessionsUseCase.use-case.js";
 export * from "./ListOwnerItemsUseCase.use-case.js";
 export * from "./ListOwnerQuestionsUseCase.use-case.js";

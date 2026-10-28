@@ -1122,6 +1122,37 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
     expect(authorization.consumeRequests).toHaveLength(0);
     expect(forgePort.requests).toHaveLength(0);
   });
+
+  it('omits authorizedBy when a request does not carry a policy revision', async () => {
+    const { useCase, journal } = makeDeps();
+    const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
+    expect(result.outcome).toBe('executed');
+    for (const entry of journal.entries) {
+      expect('authorizedBy' in entry).toBe(false);
+    }
+  });
+
+  it('refuses an authorizedBy value that does not name a policy setting revision', async () => {
+    const authorization = new FakeActionAuthorization();
+    const { useCase, journal, forgePort } = makeDeps({ authorization });
+    const result = await useCase.executeAuthorizedForgeAction(forgeRequest({ authorizedBy: 'owner-decision' }));
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'authorizedBy must name a policy setting revision',
+    });
+    expect(authorization.consumeRequests).toHaveLength(0);
+    expect(journal.entries).toHaveLength(0);
+    expect(forgePort.requests).toHaveLength(0);
+  });
+
+  it('drops authorizedBy on the HTTP execute entry point', async () => {
+    const { useCase, journal } = makeDeps();
+    const result = await useCase.execute({ ...forgeRequest(), authorizedBy: 'policy:autoMerge@0123456789ab' });
+    expect(result.outcome).toBe('executed');
+    for (const entry of journal.entries) {
+      expect('authorizedBy' in entry).toBe(false);
+    }
+  });
 });
 
 describe('AcceptanceAssessmentAdapter', () => {

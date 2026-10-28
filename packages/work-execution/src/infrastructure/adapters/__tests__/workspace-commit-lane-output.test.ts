@@ -406,4 +406,35 @@ describe('WorkspaceAdapter commitLaneOutput', () => {
     const subcommands = recorded.map((argv) => argv[3 + COMMIT_CONFIG.length]);
     expect(subcommands).not.toContain('commit-tree');
   });
+
+  it.each([
+    ['a dangling partial record', raw('packages/example/a.ts') + ':100644 120000 ' + '0'.repeat(40)],
+    ['a missing final NUL', raw('packages/example/a.ts').slice(0, -1)],
+    ['a doubled NUL', raw('packages/example/a.ts') + '\0'],
+    ['an empty path', ':100644 100644 ' + '0'.repeat(40) + ' ' + '0'.repeat(40) + ' M\0\0'],
+    ['a malformed meta', ':100644 100644 abc def M\0packages/example/a.ts\0'],
+  ])('refuses outside-allowed-paths for %s in the diff-tree listing', async (_name, stdout) => {
+    const answers: Record<string, CommandRunResult> = {
+      ...happyAnswers,
+      ['diff-tree -r --no-renames -z ' + HEAD_A + ' ' + TREE_2]: { exitCode: 0, signal: null, stdout, stderr: '' },
+    };
+    const { executor, recorded } = scripted(answers);
+    const adapter = new WorkspaceAdapter({ executor });
+    expect(await adapter.commitLaneOutput!(defaultRequest)).toEqual({ outcome: 'refused', reason: 'outside-allowed-paths' });
+    const subcommands = recorded.map((argv) => argv[3 + COMMIT_CONFIG.length]);
+    expect(subcommands).not.toContain('commit-tree');
+  });
+
+  it('accepts a path containing a space or a newline as one path', async () => {
+    const answers: Record<string, CommandRunResult> = {
+      ...happyAnswers,
+      ['diff-tree -r --no-renames -z ' + HEAD_A + ' ' + TREE_2]: {
+        exitCode: 0, signal: null, stdout: raw('packages/example/a b.ts', 'packages/example/c\nd.ts'), stderr: '',
+      },
+    };
+    const { executor } = scripted(answers);
+    const adapter = new WorkspaceAdapter({ executor });
+    const result = await adapter.commitLaneOutput!(defaultRequest);
+    expect(result.outcome).not.toBe('refused');
+  });
 });

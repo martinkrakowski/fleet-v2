@@ -162,6 +162,28 @@ function unquotePorcelainPath(porcelainPath: string): string {
   return porcelainPath;
 }
 
+const RAW_DIFF_TREE_META = /^:[0-7]{6} [0-7]{6} [0-9a-f]{40} [0-9a-f]{40} [ACDMTUX]$/;
+
+/**
+ * Strict parse of `git diff-tree -r --no-renames -z` raw output: null unless the
+ * text is empty or ends in NUL and splits into complete (meta, path) pairs with
+ * a well-formed meta and a non-empty path.
+ */
+function parseRawDiffTree(stdout: string): { readonly dstMode: string; readonly path: string }[] | null {
+  if (stdout === '') return [];
+  if (!stdout.endsWith('\0')) return null;
+  const fields = stdout.slice(0, -1).split('\0');
+  if (fields.length % 2 !== 0) return null;
+  const entries: { readonly dstMode: string; readonly path: string }[] = [];
+  for (let index = 0; index < fields.length; index += 2) {
+    const meta = fields[index] ?? '';
+    const path = fields[index + 1] ?? '';
+    if (!RAW_DIFF_TREE_META.test(meta) || path === '') return null;
+    entries.push({ dstMode: meta.slice(1).split(' ')[1] ?? '', path });
+  }
+  return entries;
+}
+
 export class WorkspaceAdapter implements WorkspacePort {
   constructor(private readonly options?: WorkspaceAdapterOptions) {}
 
@@ -442,22 +464,14 @@ export class WorkspaceAdapter implements WorkspacePort {
     );
     if (!diffTreeRun.ok) return { outcome: 'error', reason: diffTreeRun.reason };
     // Raw `-z` output: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0" per entry.
-    // A symlink (120000) or gitlink (160000) is never committed, nor a
-    // protected path, nor anything outside the allowed prefixes.
-    const fields = diffTreeRun.stdout.split('\0');
-    const entries: { readonly dstMode: string; readonly path: string }[] = [];
-    for (let index = 0; index + 1 < fields.length; index += 2) {
-      const meta = fields[index] ?? '';
-      const changedPath = fields[index + 1] ?? '';
-      if (meta === '' && changedPath === '') continue;
-      const dstMode = meta.startsWith(':') ? (meta.slice(1).split(' ')[1] ?? '') : '';
-      entries.push({ dstMode, path: changedPath });
-    }
+    // Parsed strictly: anything that is not a sequence of complete, well-formed
+    // records refuses (fail closed). A symlink (120000) or gitlink (160000) is
+    // never committed, nor a protected path, nor anything outside the prefixes.
+    const entries = parseRawDiffTree(diffTreeRun.stdout);
     const outsideAllowedPaths =
-      fields.length % 2 === 0 && fields.at(-1) !== '' ||
+      entries === null ||
       entries.some(
         (entry) =>
-          entry.path === '' ||
           entry.dstMode === '120000' ||
           entry.dstMode === '160000' ||
           isFixedProtectedPath(entry.path) ||

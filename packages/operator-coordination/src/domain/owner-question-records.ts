@@ -72,6 +72,8 @@ export interface OwnerQuestionRecord {
   readonly expiresAt: string | null;
   readonly answer: OwnerQuestionAnswerRecord | null;
   readonly acknowledgement: OwnerQuestionAcknowledgementRecord | null;
+  /** The caller's idempotency key (for the conductor, its step key); absent when the ask named none. Never changes once stored. */
+  readonly idempotencyKey?: string;
 }
 
 /**

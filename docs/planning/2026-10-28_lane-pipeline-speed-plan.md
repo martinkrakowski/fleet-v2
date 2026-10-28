@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-28
 - **Target repository:** `fleet-v2` (repository configuration in Horizon A, conductor amendments in Horizon B). The orchestrator's own scripts live outside this repository: they are listed so the plan is whole, but they are not lanes here. The incremental `sync --check` is a work order against `hexagen-monaco` (§3.4).
-- **Status:** rev 1, after a Grok check of rev 0 (one blocker, five majors, one minor; all applied, §8). Fable reviewed the improvements in two passes before rev 0 was written: one on today's orchestration, one on the pipeline once the conductor is built. Nothing built. Decisions D19–D35 (§6) continue the conductor plan's numbering (its last is D18) and are open with recommended defaults. Anchors checked against `origin/main` at `50adfde`.
+- **Status:** rev 1, after a Grok check of rev 0 (one blocker, five majors, one minor; all applied, §8). Fable reviewed the improvements in two passes before rev 0 was written: one on today's orchestration, one on the pipeline once the conductor is built. Nothing built. Decisions D19–D35 (§6) continue the conductor plan's numbering (its last is D18) and are open with recommended defaults. Anchors checked against `origin/main` at `50adfde`. **The owner decided D19–D35 on 2026-10-28 as recommended (§6). A-0 (2026-10-28): the repository is user-owned, so GitHub's merge queue is not offered; D22's strict no-queue path applies, and auto-merge is off (an owner setting).**
 - **Owner request (2026-10-28):** "Ask fable to review the improvements. Then write up a plan." and "how could we get lanes down to 15-20m total time, once the orchestrator lane is implemented".
 - **Short answer.** Tier 1 can reach about **17 minutes p50** once the conductor runs it, provided a 1–2 unit first pass takes about 6 minutes (floor about 14; about 24 with one fix round). Tier 2 cannot reach 15–20 minutes without dropping the independent review or the Fable pass, which this plan does not do: its floor is about **24 minutes** with no fix round and about **31 minutes p50** with one (§3.6). The honest ways to get more lanes under 20 minutes are smaller scope per lane and classifying work as Tier 1 where it truly is.
 - **Amends:** `2026-10-27_conductor-plan.md` §3.2 (states), §3.6 (admission, merge train), D3, D6 and the K4, K5, K6, K7 and K9 rows. Each amendment is marked there by the lane that builds it, in the conductor plan's style.
@@ -344,6 +344,8 @@ Parallel means different packages and no shared file. **The orchestrator owns th
 - **Smaller lanes** (D25). Two-way, but it changes how the owner reads the board: more PRs, each smaller.
 
 ## 6. Decisions for the owner
+
+**Decided 2026-10-28:** the owner accepted every default below (D19–D35) as written. A-0 found no merge queue for a user-owned repository, so D21 does not apply and D22 does.
 
 | # | Question | Default |
 |---|---|---|

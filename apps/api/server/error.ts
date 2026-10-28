@@ -75,14 +75,31 @@ export function errorBody(error: { statusCode?: unknown; statusMessage?: unknown
   return { statusCode, statusMessage };
 }
 
-export default defineNitroErrorHandler((error, event) => {
+/** Headers Nitro's default descriptor sets that this handler keeps (never its body, status or location). */
+const KEPT_DEFAULT_HEADERS = new Set([
+  "x-content-type-options",
+  "x-frame-options",
+  "referrer-policy",
+  "content-security-policy",
+  "cache-control",
+]);
+
+export default defineNitroErrorHandler(async (error, event, context) => {
   // A response already sent (or streamed) cannot be rewritten; returning keeps Nitro's default
   // handler, which echoes the URL, from running after a throw here.
   if (event.handled) {
     return;
   }
+  // Nitro's default descriptor logs an unhandled or fatal error on the server (never in the body)
+  // and computes its security headers; it does not send. Only those headers are kept from it.
+  const nitroDefault = await context?.defaultHandler(error, event, { json: true });
   const body = errorBody(error);
   setResponseStatus(event, body.statusCode, body.statusMessage);
+  for (const [name, value] of Object.entries(nitroDefault?.headers ?? {})) {
+    if (KEPT_DEFAULT_HEADERS.has(name.toLowerCase())) {
+      setResponseHeader(event, name, value);
+    }
+  }
   setResponseHeader(event, "content-type", "application/json; charset=utf-8");
   return send(event, JSON.stringify(body));
 });

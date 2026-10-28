@@ -21,6 +21,8 @@ vi.mock("nitropack/runtime", () => ({
 import handler, { errorBody } from "../../error.js";
 
 /** apps/api, three levels above this test file (server/wiring/__tests__). */
+/** Paths Nitro's default descriptor was asked about (the stand-in records them). */
+const defaultCalls: string[] = [];
 const apiRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
 describe("errorBody", () => {
@@ -114,7 +116,25 @@ describe("default handler on a loopback h3 app", () => {
       }),
     );
     // The third argument is Nitro's fallback default handler; our handler never uses it.
-    const app = createApp({ onError: (error, event) => handler(error, event, undefined as never) });
+    // A stand-in for Nitro's default descriptor: it records the call and returns the URL-echoing body,
+    // a redirect location and its security headers; only the security headers may reach the response.
+    const defaultHandler = async (error: unknown, event: { path: string }) => {
+      defaultCalls.push(event.path);
+      return {
+        status: 302,
+        statusText: "Found",
+        headers: {
+          location: "/elsewhere",
+          "content-type": "text/html",
+          "x-content-type-options": "nosniff",
+          "cache-control": "no-cache",
+        },
+        body: { error: true, url: `http://127.0.0.1${event.path}`, message: String(error) },
+      };
+    };
+    const app = createApp({
+      onError: (error, event) => handler(error, event, { defaultHandler } as never),
+    });
     app.use(router);
     server = createServer(toNodeListener(app));
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
@@ -127,6 +147,18 @@ describe("default handler on a loopback h3 app", () => {
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     });
+  });
+
+  it("calls Nitro's default descriptor once and keeps only its security headers", async () => {
+    defaultCalls.length = 0;
+    const response = await fetch(`http://127.0.0.1:${port}/echo/abc?token=xyz`);
+    expect(defaultCalls).toHaveLength(1);
+    expect(response.status).toBe(500);
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("cache-control")).toBe("no-cache");
+    expect(response.headers.get("location")).toBeNull();
+    expect(response.headers.get("content-type")).toMatch(/^application\/json/);
+    expect(await response.text()).toBe('{"statusCode":500,"statusMessage":"Internal Server Error"}');
   });
 
   it("answers a thrown 400 with exactly the two fields", async () => {

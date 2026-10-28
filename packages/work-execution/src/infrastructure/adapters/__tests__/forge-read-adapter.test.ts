@@ -16,6 +16,7 @@ import { classifyGhRefusal } from '../ForgeActionAdapter.adapter.js';
 import {
   ForgeReadAdapter,
   PULL_REQUEST_VIEW_FIELDS,
+  parsePullRequestView,
   type ForgeReadAdapterOptions,
 } from '../ForgeReadAdapter.adapter.js';
 
@@ -26,6 +27,7 @@ const MERGED_FIXTURE = JSON.stringify({
   headRefOid: '3dd5d90509461e3d2154b52da28671aeffa84130',
   mergeCommit: { oid: '3fe9fac07688024ae64dc5a3da66010e4418d628' },
   mergedAt: '2026-10-25T20:12:08Z',
+  mergeStateStatus: 'CLEAN',
   number: 202,
   state: 'MERGED',
 });
@@ -37,6 +39,7 @@ const OPEN_FIXTURE = JSON.stringify({
   headRefOid: '8e136fe0e0cc916b9d3485eaafe653e3143d9d63',
   mergeCommit: null,
   mergedAt: null,
+  mergeStateStatus: 'BEHIND',
   number: 259,
   state: 'OPEN',
 });
@@ -48,6 +51,7 @@ const CLOSED_UNMERGED_FIXTURE = JSON.stringify({
   headRefOid: '8e136fe0e0cc916b9d3485eaafe653e3143d9d63',
   mergeCommit: null,
   mergedAt: null,
+  mergeStateStatus: 'BLOCKED',
   number: 259,
   state: 'CLOSED',
 });
@@ -86,6 +90,7 @@ describe('ForgeReadAdapter.readPullRequest', () => {
       pullRequest: {
         number: 202,
         state: 'merged',
+        mergeState: 'clean',
         headSha: '3dd5d90509461e3d2154b52da28671aeffa84130',
         headRef: 'feat/example-lane',
         baseRef: 'main',
@@ -112,6 +117,7 @@ describe('ForgeReadAdapter.readPullRequest', () => {
       pullRequest: {
         number: 259,
         state: 'open',
+        mergeState: 'behind',
         headSha: '8e136fe0e0cc916b9d3485eaafe653e3143d9d63',
         headRef: 'feat/example-open',
         baseRef: 'main',
@@ -146,7 +152,30 @@ describe('ForgeReadAdapter.readPullRequest', () => {
         closedAtIso: '2026-10-26T09:00:00.000Z',
         mergedAtIso: null,
         mergeCommitSha: null,
+        mergeState: 'blocked',
       }),
+    });
+  });
+
+  it.each([
+    ['CLEAN', 'clean'],
+    ['BEHIND', 'behind'],
+    ['BLOCKED', 'blocked'],
+    ['DIRTY', 'blocked'],
+    ['UNSTABLE', 'blocked'],
+    ['HAS_HOOKS', 'unknown'],
+    [null, 'unknown'],
+    [undefined, 'unknown'],
+    [42, 'unknown'],
+  ])('maps gh mergeStateStatus %s to mergeState %s', (status, expected) => {
+    const payload = JSON.stringify({
+      ...JSON.parse(OPEN_FIXTURE),
+      mergeStateStatus: status,
+    });
+    const result = parsePullRequestView(payload, { kind: 'branch', branchName: 'feat/example-open' });
+    expect(result).toEqual({
+      outcome: 'found',
+      pullRequest: expect.objectContaining({ mergeState: expected }),
     });
   });
 

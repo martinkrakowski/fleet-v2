@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-28
 - **Target repository:** `fleet-v2`
-- **Status:** rev 1, after two read-only Grok checks (round 1: one blocker, one major, two minors, all fixed; round 2: no defects). Nothing built. Decisions TD-D1–TD-D11 (§6) are this plan's own series, prefixed so they never collide with the work-board plan's D1–D12 or the speed plan's D19–D35; they are open with recommended defaults. Anchors checked against `origin/main` at `5247aac`.
+- **Status:** rev 1, after two read-only Grok checks (round 1: one blocker, one major, two minors, all fixed; round 2: no defects). Nothing built. **The owner decided TD-D1–TD-D11 on 2026-10-28 as recommended ("Accept all").** Decisions TD-D1–TD-D11 (§6) are this plan's own series, prefixed so they never collide with the work-board plan's D1–D12 or the speed plan's D19–D35; they are open with recommended defaults. Anchors checked against `origin/main` at `5247aac`.
 - **Owner request (2026-10-28):** "write up a plan to add a todo section within the ui". The same evening the owner asked to be reminded of the to-do list in the morning (§3.8).
 - **Builds on:** `2026-10-27_work-board-plan.md` (§3.3 owner items, §3.9 hexagon, §3.10–3.11, the WB lanes, D1, D8, D9, D11), `2026-10-27_waits-for-view-plan.md` (Waiting rows, the TUI Board screen), `2026-10-16_owner-questions-in-ui.md` (where questions are answered), `2026-10-27_web-ui-interactivity-plan.md` (T3a scopes, T6 write path, the request channel) and `AGENTS.md` (Web UI action rules, exit codes, credentials).
 
@@ -167,17 +167,17 @@ Start now: TD0, TD1a, then TD1b. TD2 waits for TDM. TD5a is the first lane the o
 
 | # | Question | Recommended default |
 |---|---|---|
-| TD-D1 | What counts as a to-do? | **Open owner items of every kind, plus owner questions in state `open` that no item references.** An owner-waiting park appears only through its recorded owner item; a park without one stays the board's badge, with a count and link on the list. `rejected`, `expired` and answered-without-a-choice questions are left off (narrower than the board, which keeps them). Derived rows are never stored as items; a `premerge` review hold is not a to-do |
-| TD-D2 | Ship the list before the full board (WB6)? | **Yes.** Extract the board's owner-entry rule (TD1a) and read items and questions only, with lanes shown as not read; switch to the board's facts in TD6 without changing the wire shape |
-| TD-D3 | Where does it live on the web? | **A `/todo` sidebar view between Lanes and Questions.** Questions stay the place answers are given; the board keeps its Waiting column; `/todo` links to both |
-| TD-D4 | What does the badge count? | **Every open row that needs the owner, a folded question counted once.** The Questions badge stays as it is |
-| TD-D5 | May the owner add a personal to-do from the web? | **Later (TD9), `other` kind only, after T6.** Until then `owner-items add` in the CLI (WB7a) |
-| TD-D6 | Snooze or due dates? | **Not in v1.** Both are record-version changes; revisit after a few weeks of use |
-| TD-D7 | Which state changes from the list? | **Mark done or withdraw `secret`, `backup`, `other` only, through WB13a's route under `operate`, behind `AlertBox`.** Never merge, answer a decision, withdraw `merge`/`decision` or close a derived row (restates board D9 and D11) |
-| TD-D8 | How does the morning reminder work? | **`fleet-v2 todo --digest`, plain text on stdout, run by the owner's own scheduler** (runbook TD-R) |
-| TD-D9 | Add an outbound notification service (email, chat, push)? | **Not now.** If wanted later: a separate plan, opt-in per installation, counts and ids only by default |
-| TD-D10 | The TUI? | **A To-do screen in the shared `fleet-v2 tui` shell (board D8)**; `fleet-v2 todo` until the shell exists |
-| TD-D11 | A sample-data fallback on `/todo` when the API is not configured? | **No.** Show "not configured", as `/questions` does |
+| TD-D1 | What counts as a to-do? | **Decided 2026-10-28 (owner: accept all):** **Open owner items of every kind, plus owner questions in state `open` that no item references.** An owner-waiting park appears only through its recorded owner item; a park without one stays the board's badge, with a count and link on the list. `rejected`, `expired` and answered-without-a-choice questions are left off (narrower than the board, which keeps them). Derived rows are never stored as items; a `premerge` review hold is not a to-do |
+| TD-D2 | Ship the list before the full board (WB6)? | **Decided 2026-10-28 (owner: accept all):** **Yes.** Extract the board's owner-entry rule (TD1a) and read items and questions only, with lanes shown as not read; switch to the board's facts in TD6 without changing the wire shape |
+| TD-D3 | Where does it live on the web? | **Decided 2026-10-28 (owner: accept all):** **A `/todo` sidebar view between Lanes and Questions.** Questions stay the place answers are given; the board keeps its Waiting column; `/todo` links to both |
+| TD-D4 | What does the badge count? | **Decided 2026-10-28 (owner: accept all):** **Every open row that needs the owner, a folded question counted once.** The Questions badge stays as it is |
+| TD-D5 | May the owner add a personal to-do from the web? | **Decided 2026-10-28 (owner: accept all):** **Later (TD9), `other` kind only, after T6.** Until then `owner-items add` in the CLI (WB7a) |
+| TD-D6 | Snooze or due dates? | **Decided 2026-10-28 (owner: accept all):** **Not in v1.** Both are record-version changes; revisit after a few weeks of use |
+| TD-D7 | Which state changes from the list? | **Decided 2026-10-28 (owner: accept all):** **Mark done or withdraw `secret`, `backup`, `other` only, through WB13a's route under `operate`, behind `AlertBox`.** Never merge, answer a decision, withdraw `merge`/`decision` or close a derived row (restates board D9 and D11) |
+| TD-D8 | How does the morning reminder work? | **Decided 2026-10-28 (owner: accept all):** **`fleet-v2 todo --digest`, plain text on stdout, run by the owner's own scheduler** (runbook TD-R) |
+| TD-D9 | Add an outbound notification service (email, chat, push)? | **Decided 2026-10-28 (owner: accept all):** **Not now.** If wanted later: a separate plan, opt-in per installation, counts and ids only by default |
+| TD-D10 | The TUI? | **Decided 2026-10-28 (owner: accept all):** **A To-do screen in the shared `fleet-v2 tui` shell (board D8)**; `fleet-v2 todo` until the shell exists |
+| TD-D11 | A sample-data fallback on `/todo` when the API is not configured? | **Decided 2026-10-28 (owner: accept all):** **No.** Show "not configured", as `/questions` does |
 
 ## 7. Assumptions
 

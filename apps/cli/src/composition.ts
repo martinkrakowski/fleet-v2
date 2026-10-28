@@ -22,6 +22,7 @@ import { join } from 'node:path';
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { newUlid } from './ulid.js';
 
 import {
   AcceptanceAssessmentAdapter,
@@ -78,6 +79,14 @@ import {
   resolveRoleExecutors,
   resolveRunnerCapabilityProfile,
   sha256HexDigest,
+  ConductorDriverLeaseAdapter,
+  ConductorHaltAdapter,
+  InspectLaneRunsUseCase,
+  LaneRunJournalAdapter,
+  LaneRunRepositoryAdapter,
+  RequestLaneRunStopUseCase,
+  ResumeLaneRunUseCase,
+  type ProjectProfileReadPort,
   type AttemptRecord,
   type ExecutionRunnerHost,
   type ExecutorForRecordedHostResult,
@@ -603,6 +612,19 @@ export interface FleetCliRuntime {
     readonly executeAuthorizedForgeAction: ExecuteAuthorizedForgeActionUseCase;
     readonly probeProject: ProbeProjectUseCase;
     readonly listUnregisteredProjects: ListUnregisteredProjectsUseCase;
+  };
+  readonly conductor: {
+    readonly laneRunRepository: LaneRunRepositoryAdapter;
+    readonly laneRunJournal: LaneRunJournalAdapter;
+    readonly driverLease: ConductorDriverLeaseAdapter;
+    readonly halt: ConductorHaltAdapter;
+    readonly requestLaneRunStop: RequestLaneRunStopUseCase;
+    readonly inspectLaneRuns: InspectLaneRunsUseCase;
+    readonly resumeLaneRun: ResumeLaneRunUseCase;
+    /** A fresh ULID per call (journal entry ids, run and attempt ids). */
+    readonly newUlid: () => string;
+    /** The project profile read the root already builds; exposed for `conductor start` (K7-7). */
+    readonly profileRead: ProjectProfileReadPort;
   };
 }
 
@@ -1788,11 +1810,43 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
 
   attemptLookup.inspectAttempt = execution.inspectAttempt;
 
+  // K7: the conductor's stores and its record-only controls. Nothing here
+  // dispatches.
+  const laneRunRepository = new LaneRunRepositoryAdapter({ stateDir });
+  const laneRunJournal = new LaneRunJournalAdapter({ stateDir });
+  const conductorDriverLease = new ConductorDriverLeaseAdapter({ stateDir });
+  const conductorHalt = new ConductorHaltAdapter({ stateDir });
+  const conductorNewUlid = () => newUlid();
+  const conductor = {
+    laneRunRepository,
+    laneRunJournal,
+    driverLease: conductorDriverLease,
+    halt: conductorHalt,
+    requestLaneRunStop: new RequestLaneRunStopUseCase({
+      runRepo: laneRunRepository,
+      runJournal: laneRunJournal,
+    }),
+    inspectLaneRuns: new InspectLaneRunsUseCase({
+      runRepo: laneRunRepository,
+      runJournal: laneRunJournal,
+      halt: conductorHalt,
+      driverLease: conductorDriverLease,
+    }),
+    resumeLaneRun: new ResumeLaneRunUseCase({
+      runRepo: laneRunRepository,
+      runJournal: laneRunJournal,
+      newUlid: conductorNewUlid,
+    }),
+    newUlid: conductorNewUlid,
+    profileRead,
+  };
+
   return {
     installation: options?.installation,
     coordination,
     knowledge,
     evidence,
     execution,
+    conductor,
   };
 }

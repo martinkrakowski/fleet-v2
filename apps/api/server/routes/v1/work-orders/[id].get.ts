@@ -4,12 +4,14 @@ import {
   mapWorkError,
   newOperationId,
 } from "../../../wiring/work/errors";
+import { routeParam } from "../../../wiring/http-input";
 
 export default defineEventHandler(async (event) => {
+  const workOrderId = routeParam(event, "id");
   const operationId = newOperationId();
   try {
     const result = await workComposition().inspectWorkOrder.execute({
-      workOrderId: getRouterParam(event, "id") ?? "",
+      workOrderId,
     });
     return envelope(operationId, "OK", result);
   } catch (error) {

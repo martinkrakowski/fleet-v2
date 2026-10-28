@@ -4,14 +4,15 @@ import {
   mapWorkError,
   newOperationId,
 } from "../../../../wiring/work/errors";
-import { readObjectBody } from "../../../../wiring/http-input";
+import { readObjectBody, routeParam } from "../../../../wiring/http-input";
 
 export default defineEventHandler(async (event) => {
+  const priorAttemptId = routeParam(event, "id");
   const operationId = newOperationId();
   try {
     const result = await workComposition().prepareFixAttempt.execute({
       ...(await readObjectBody(event)),
-      priorAttemptId: getRouterParam(event, "id") ?? "",
+      priorAttemptId,
     });
     return envelope(operationId, "OK", result);
   } catch (error) {

@@ -524,7 +524,7 @@ bounded_contexts:
         WorkOrderState: [approved, prepared, implementing, verifying, reviewing, fixing, ready-to-merge, merged, stopped]
         AttemptState: [intent-recorded, dispatching, running, reconciling, ended, collected, blocked, cancelled]
         AttemptOutcome: [done, partial, stopped, no-commit]
-        StopReason: [none, unknown, rate-limited, payment, timeout, model-missing, no-commit, gate-failed, length, step-cap, runner-refused]
+        StopReason: [none, unknown, rate-limited, payment, timeout, model-missing, no-commit, gate-failed, length, step-cap, runner-refused, no-route]
         LaneRunState: [ready, dispatching, running, seat-failed, collecting, gating, brief-check, code-review, fixing, accepting, awaiting-premerge, opening-pr, pushing, watching-ci, merging, merged, stopped, parked]
       invariants:
         - "Every fresh dispatch and fix round has a new attempt identity, independent of branch, role and model identity."

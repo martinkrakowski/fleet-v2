@@ -74,6 +74,11 @@ function requestShapeError(request: AdvanceLaneRunRequest): AdvanceLaneRunRefusa
   if (typeof request.runId !== 'string' || request.runId.trim().length === 0) {
     return 'invalid-request';
   }
+  // The port is reached from the CLI and the driver; a missing lease is refused, never thrown on.
+  const lease: unknown = request.lease;
+  if (typeof lease !== 'object' || lease === null) {
+    return 'invalid-request';
+  }
   if (typeof request.lease.holderId !== 'string' || request.lease.holderId.trim().length === 0) {
     return 'invalid-request';
   }

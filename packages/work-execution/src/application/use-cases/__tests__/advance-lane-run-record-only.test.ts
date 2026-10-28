@@ -261,6 +261,16 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
     expect(after?.revision).toBe(1);
   });
 
+  it('test 1b: a request with a missing or null lease is refused invalid-request, never thrown; nothing written', async () => {
+    const harness = await makeHarness(runRecord(), attemptFixture());
+    for (const lease of [undefined, null, 'holder']) {
+      const result = await advance(harness, { lease: lease as never });
+      expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    }
+    expect(await harness.runJournal.listForRun(RUN_ID)).toEqual([]);
+    expect((await harness.runRepo.get(RUN_ID))?.revision).toBe(1);
+  });
+
   it('test 2: a dispatching journal state with a running attempt enters running; revision unchanged', async () => {
     const harness = await makeHarness(runRecord(), attemptFixture({ state: 'running' }));
     await conduct(harness, 'dispatching', NOW);

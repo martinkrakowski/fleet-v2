@@ -23,6 +23,7 @@ export * from "./LaneDiffCheckPort.out-port.js";
 export * from "./LaneRunAdmissionPort.out-port.js";
 export * from "./LaneRunJournalPort.out-port.js";
 export * from "./LaneRunRepositoryPort.out-port.js";
+export * from "./LaneRunStartCapacityPort.out-port.js";
 export * from "./OwnerDecisionPort.out-port.js";
 export * from "./ProjectProbePort.out-port.js";
 export * from "./ProjectProbeRecordPort.out-port.js";

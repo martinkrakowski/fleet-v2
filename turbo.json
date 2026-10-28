@@ -3,7 +3,7 @@
   "agentGuidance": false,
   "envMode": "strict",
   "globalDependencies": [".nvmrc", "tsconfig.base.json", "yarn.lock"],
-  "globalPassThroughEnv": ["HOME", "PATH", "USER", "SHELL", "LANG", "TERM"],
+  "globalPassThroughEnv": ["HOME", "PATH", "USER", "SHELL", "LANG", "TERM", "CI", "GITHUB_ACTIONS"],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],

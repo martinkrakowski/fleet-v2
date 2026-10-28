@@ -34,6 +34,12 @@ const defaultRequest: CommitLaneOutputRequest = {
 };
 
 /** One fake executor run's answer, keyed by the git subcommand or tail. */
+const ZERO = '0'.repeat(40);
+/** Raw `diff-tree -z` output for modified regular files (mode 100644). */
+function raw(...paths: string[]): string {
+  return paths.map((p) => ':100644 100644 ' + ZERO + ' ' + ZERO + ' M\0' + p + '\0').join('');
+}
+
 function scripted(answers: Record<string, CommandRunResult>) {
   const recorded: readonly string[][] = [];
   const executor: CommandExecutorPort = {
@@ -60,8 +66,8 @@ const happyAnswers: Record<string, CommandRunResult> = {
   'add -A -- .': { exitCode: 0, signal: null, stdout: '', stderr: '' },
   'write-tree': { exitCode: 0, signal: null, stdout: TREE_2 + '\n', stderr: '' },
   'rev-parse --verify HEAD^{tree}': { exitCode: 0, signal: null, stdout: TREE_1 + '\n', stderr: '' },
-  ['diff-tree -r --no-renames --name-only -z ' + HEAD_A + ' ' + TREE_2]: {
-    exitCode: 0, signal: null, stdout: 'packages/example/a.ts\0', stderr: '',
+  ['diff-tree -r --no-renames -z ' + HEAD_A + ' ' + TREE_2]: {
+    exitCode: 0, signal: null, stdout: raw('packages/example/a.ts'), stderr: '',
   },
   'commit-tree': { exitCode: 0, signal: null, stdout: NEW + '\n', stderr: '' },
   'update-ref': { exitCode: 0, signal: null, stdout: '', stderr: '' },
@@ -125,8 +131,8 @@ describe('WorkspaceAdapter commitLaneOutput', () => {
   it('refuses outside-allowed-paths when the staged tree touches a path outside the prefixes', async () => {
     const answers: Record<string, CommandRunResult> = {
       ...happyAnswers,
-      ['diff-tree -r --no-renames --name-only -z ' + HEAD_A + ' ' + TREE_2]: {
-        exitCode: 0, signal: null, stdout: 'packages/example/a.ts\0scripts/late.sh\0', stderr: '',
+      ['diff-tree -r --no-renames -z ' + HEAD_A + ' ' + TREE_2]: {
+        exitCode: 0, signal: null, stdout: raw('packages/example/a.ts', 'scripts/late.sh'), stderr: '',
       },
     };
     const { executor, recorded } = scripted(answers);
@@ -141,8 +147,8 @@ describe('WorkspaceAdapter commitLaneOutput', () => {
   it('accepts a prefix without a trailing slash and refuses a sibling prefix path', async () => {
     const acceptAnswers: Record<string, CommandRunResult> = {
       ...happyAnswers,
-      ['diff-tree -r --no-renames --name-only -z ' + HEAD_A + ' ' + TREE_2]: {
-        exitCode: 0, signal: null, stdout: 'packages/example/a.ts\0', stderr: '',
+      ['diff-tree -r --no-renames -z ' + HEAD_A + ' ' + TREE_2]: {
+        exitCode: 0, signal: null, stdout: raw('packages/example/a.ts'), stderr: '',
       },
     };
     const accept = scripted(acceptAnswers);
@@ -152,8 +158,8 @@ describe('WorkspaceAdapter commitLaneOutput', () => {
 
     const refuseAnswers: Record<string, CommandRunResult> = {
       ...happyAnswers,
-      ['diff-tree -r --no-renames --name-only -z ' + HEAD_A + ' ' + TREE_2]: {
-        exitCode: 0, signal: null, stdout: 'packages/example-other/a.ts\0', stderr: '',
+      ['diff-tree -r --no-renames -z ' + HEAD_A + ' ' + TREE_2]: {
+        exitCode: 0, signal: null, stdout: raw('packages/example-other/a.ts'), stderr: '',
       },
     };
     const refuse = scripted(refuseAnswers);
@@ -182,7 +188,7 @@ describe('WorkspaceAdapter commitLaneOutput', () => {
   it('reports an error with a fixed reason when diff-tree fails', async () => {
     const answers: Record<string, CommandRunResult> = {
       ...happyAnswers,
-      ['diff-tree -r --no-renames --name-only -z ' + HEAD_A + ' ' + TREE_2]: {
+      ['diff-tree -r --no-renames -z ' + HEAD_A + ' ' + TREE_2]: {
         exitCode: 128, signal: null, stdout: '', stderr: 'XYZZY',
       },
     };
@@ -368,5 +374,36 @@ describe('WorkspaceAdapter commitLaneOutput', () => {
     });
     const result = await adapter.commitLaneOutput!({ ...defaultRequest, recordedHost });
     expect(result).toEqual({ outcome: 'error', reason: 'worktree host could not be resolved' });
+  });
+
+  it('refuses head-moved for the adapter message preceded by a newline', async () => {
+    const answers: Record<string, CommandRunResult> = {
+      ...happyAnswers,
+      'rev-parse --verify HEAD^{commit}': { exitCode: 0, signal: null, stdout: NEW + '\n', stderr: '' },
+      'show -s --format=%P HEAD': { exitCode: 0, signal: null, stdout: HEAD_A + '\n', stderr: '' },
+      'show -s --format=%B HEAD': {
+        exitCode: 0, signal: null, stdout: '\n' + editOnlyCommitMessage(DEFAULT_ATTEMPT, DEFAULT_MODEL) + '\n', stderr: '',
+      },
+      'rev-parse --verify HEAD^{tree}': { exitCode: 0, signal: null, stdout: TREE_2 + '\n', stderr: '' },
+    };
+    const { executor } = scripted(answers);
+    const adapter = new WorkspaceAdapter({ executor });
+    expect(await adapter.commitLaneOutput!(defaultRequest)).toEqual({ outcome: 'refused', reason: 'head-moved' });
+  });
+
+  it.each([
+    ['a symlink', ':000000 120000 ' + '0'.repeat(40) + ' ' + '1'.repeat(40) + ' A\0packages/example/link\0'],
+    ['a gitlink', ':000000 160000 ' + '0'.repeat(40) + ' ' + '1'.repeat(40) + ' A\0packages/example/sub\0'],
+    ['a protected path under a prefix', raw('packages/example/package.json')],
+  ])('refuses outside-allowed-paths for %s in the staged tree', async (_name, stdout) => {
+    const answers: Record<string, CommandRunResult> = {
+      ...happyAnswers,
+      ['diff-tree -r --no-renames -z ' + HEAD_A + ' ' + TREE_2]: { exitCode: 0, signal: null, stdout, stderr: '' },
+    };
+    const { executor, recorded } = scripted(answers);
+    const adapter = new WorkspaceAdapter({ executor });
+    expect(await adapter.commitLaneOutput!(defaultRequest)).toEqual({ outcome: 'refused', reason: 'outside-allowed-paths' });
+    const subcommands = recorded.map((argv) => argv[3 + COMMIT_CONFIG.length]);
+    expect(subcommands).not.toContain('commit-tree');
   });
 });

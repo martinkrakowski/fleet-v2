@@ -30,7 +30,7 @@ import {
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
-import { pathUnderPrefix } from '../../domain/lane-diff-check.js';
+import { isFixedProtectedPath, pathUnderPrefix } from '../../domain/lane-diff-check.js';
 import { hasRecordedHostName } from './ConfirmRecordedHost.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
 import { isValidAgyModel } from './AgyRunnerAdapter.adapter.js';
@@ -410,7 +410,8 @@ export class WorkspaceAdapter implements WorkspacePort {
       const messageRun = await this.runCommitGit(executor, worktreePath, ['show', '-s', '--format=%B', 'HEAD']);
       if (!messageRun.ok) return { outcome: 'error', reason: messageRun.reason };
       const expectedMessage = editOnlyCommitMessage(request.attemptId, request.implementerModel);
-      if (messageRun.stdout.trim() !== expectedMessage.trim()) {
+      // Trailing whitespace only: a leading newline or space is an agent-written body.
+      if (messageRun.stdout.replace(/\s+$/u, '') !== expectedMessage.replace(/\s+$/u, '')) {
         return { outcome: 'refused', reason: 'head-moved' };
       }
       const ownershipTree = await this.stageAndCompareWithHeadTree(executor, worktreePath);
@@ -437,13 +438,31 @@ export class WorkspaceAdapter implements WorkspacePort {
     const diffTreeRun = await this.runCommitGit(
       executor,
       worktreePath,
-      ['diff-tree', '-r', '--no-renames', '--name-only', '-z', request.expectedHead, tree],
+      ['diff-tree', '-r', '--no-renames', '-z', request.expectedHead, tree],
     );
     if (!diffTreeRun.ok) return { outcome: 'error', reason: diffTreeRun.reason };
-    const changedPaths = diffTreeRun.stdout.split('\0').filter((changedPath) => changedPath !== '');
-    const outsideAllowedPaths = changedPaths.some(
-      (changedPath) => allowedPathPrefixes.some((prefix) => pathUnderPrefix(changedPath, prefix)) !== true,
-    );
+    // Raw `-z` output: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0" per entry.
+    // A symlink (120000) or gitlink (160000) is never committed, nor a
+    // protected path, nor anything outside the allowed prefixes.
+    const fields = diffTreeRun.stdout.split('\0');
+    const entries: { readonly dstMode: string; readonly path: string }[] = [];
+    for (let index = 0; index + 1 < fields.length; index += 2) {
+      const meta = fields[index] ?? '';
+      const changedPath = fields[index + 1] ?? '';
+      if (meta === '' && changedPath === '') continue;
+      const dstMode = meta.startsWith(':') ? (meta.slice(1).split(' ')[1] ?? '') : '';
+      entries.push({ dstMode, path: changedPath });
+    }
+    const outsideAllowedPaths =
+      fields.length % 2 === 0 && fields.at(-1) !== '' ||
+      entries.some(
+        (entry) =>
+          entry.path === '' ||
+          entry.dstMode === '120000' ||
+          entry.dstMode === '160000' ||
+          isFixedProtectedPath(entry.path) ||
+          allowedPathPrefixes.some((prefix) => pathUnderPrefix(entry.path, prefix)) !== true,
+      );
     if (outsideAllowedPaths) {
       return { outcome: 'refused', reason: 'outside-allowed-paths' };
     }

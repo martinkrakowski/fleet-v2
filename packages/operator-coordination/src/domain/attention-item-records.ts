@@ -27,6 +27,8 @@ export const ATTENTION_ITEM_KIND_PATTERN = /^[a-z][a-z0-9-]{0,63}$/;
 /** Printable ASCII without space, 1–256 characters: item ids, actors, work-order ids, non-pr non-worktree subject refs. */
 export const ATTENTION_ITEM_ID_PATTERN = /^[\x21-\x7e]{1,256}$/;
 export const ATTENTION_ITEM_WORKTREE_REF_PATTERN = /^wt-[0-9a-f]{12}$/;
+/** run, attempt, work-order and reservation refs: an id slug, never a path (§3.10.3). */
+export const ATTENTION_ITEM_SLUG_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 /** `<owner>/<repo>#<number>`. */
 export const ATTENTION_ITEM_PR_REF_PATTERN = /^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}#[1-9][0-9]{0,9}$/;
 

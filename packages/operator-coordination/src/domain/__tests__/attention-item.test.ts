@@ -375,4 +375,53 @@ describe('AttentionItem', () => {
     expect(raiseResult({ summary: ' '.repeat(1024) }).success).toBe(true);
     expect(raiseResult({ summary: ' '.repeat(1025) }).success).toBe(false);
   });
+
+  it('refuses a reopen dated before the clearance it would erase (Fable)', () => {
+    const item = raiseNow();
+    const cleared = item.clear({ reason: 'dismissed', via: 'cli', by: 'cli' }, LATER);
+    if (!cleared.success) {
+      throw new Error('setup');
+    }
+    const body = {
+      kind: 'owner-merge',
+      subject: { kind: 'work-order', ref: 'wo-example-1' },
+      workOrderId: 'wo-example-1',
+      summary: 'reopen',
+      raisedBy: 'auto-merge',
+    };
+    const early = cleared.value.raiseAgain(body, '2026-10-28T10:05:00.000Z');
+    expect(early.success).toBe(false);
+    if (!early.success) {
+      expect(early.code).toBe('clock');
+    }
+    expect(cleared.value.raiseAgain(body, LATER).success).toBe(true);
+  });
+
+  it('refuses format characters (LRM, RLM, ALM, zero-width, BOM) in a summary', () => {
+    for (const mark of ['\u200e', '\u200f', '\u061c', '\u200b', '\u200d', '\ufeff']) {
+      expect(raiseResult({ summary: `before${mark}after` }).success).toBe(false);
+    }
+    expect(raiseResult({ summary: 'plain text' }).success).toBe(true);
+  });
+
+  it('lowercases a pull request owner and repository, so one PR has one key', () => {
+    const upper = raiseNow({ subject: { kind: 'pr', ref: 'Example-Org/Example-Repo#7' } });
+    const lower = raiseNow({ subject: { kind: 'pr', ref: 'example-org/example-repo#7' } });
+    expect(upper.toRecord().subject.ref).toBe('example-org/example-repo#7');
+    expect(upper.key()).toBe(lower.key());
+  });
+
+  it('refuses path-shaped refs for run, attempt, work-order, reservation and project subjects', () => {
+    for (const kind of ['run', 'attempt', 'work-order', 'reservation', 'project']) {
+      for (const ref of ['/srv/host/worktrees/wt-abc', '../../etc', 'a:b']) {
+        expect(raiseResult({ subject: { kind, ref } }).success).toBe(false);
+      }
+    }
+    expect(raiseResult({ subject: { kind: 'run', ref: 'run-01JB0000000000000000000000' } }).success).toBe(true);
+  });
+
+  it('clear refuses a time before the last raise', () => {
+    const result = raiseNow().clear({ reason: 'dismissed', via: 'cli', by: 'cli' }, '2026-10-28T09:00:00.000Z');
+    expect(result.success).toBe(false);
+  });
 });

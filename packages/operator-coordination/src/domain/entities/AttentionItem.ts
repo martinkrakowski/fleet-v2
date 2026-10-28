@@ -24,6 +24,7 @@ import {
   ATTENTION_ITEM_STATES,
   ATTENTION_ITEM_SUBJECT_KINDS,
   ATTENTION_ITEM_WORKTREE_REF_PATTERN,
+  ATTENTION_ITEM_SLUG_REF_PATTERN,
 } from '../attention-item-records.js';
 import type {
   AttentionItemClearReason,
@@ -99,7 +100,8 @@ function refusedControlCodePoint(codePoint: number): boolean {
   if (codePoint >= 0x2066 && codePoint <= 0x2069) {
     return true;
   }
-  return false;
+  // Every Unicode format character (general category Cf): LRM, RLM, ALM, zero-width marks, BOM and the rest.
+  return /\p{Cf}/u.test(String.fromCodePoint(codePoint));
 }
 
 function idFieldError(field: string, value: unknown): string | null {
@@ -155,10 +157,15 @@ function subjectErrorValue(subject: unknown): SubjectValidation {
   if (kind === 'pr' && !ATTENTION_ITEM_PR_REF_PATTERN.test(ref)) {
     return { ok: false, error: 'AttentionItem pr subject ref must be <owner>/<repo>#<number>' };
   }
-  if (kind !== 'worktree' && kind !== 'pr' && idFieldError('subject ref', ref) !== null) {
-    return { ok: false, error: 'AttentionItem subject ref is not valid for its kind' };
+  if (kind === 'project' && !ATTENTION_ITEM_PROJECT_ID_PATTERN.test(ref)) {
+    return { ok: false, error: 'AttentionItem project subject ref must be a project id' };
   }
-  return { ok: true, parsed: { kind: kind as AttentionItemSubjectKind, ref: ref as string } };
+  if (kind !== 'worktree' && kind !== 'pr' && kind !== 'project' && !ATTENTION_ITEM_SLUG_REF_PATTERN.test(ref)) {
+    return { ok: false, error: 'AttentionItem subject ref must be an id slug, never a path' };
+  }
+  // GitHub owner and repository names are case-insensitive: one pull request, one key.
+  const canonicalRef = kind === 'pr' ? ref.toLowerCase() : ref;
+  return { ok: true, parsed: { kind: kind as AttentionItemSubjectKind, ref: canonicalRef } };
 }
 
 function summaryErrorValue(value: unknown): string | null {
@@ -391,8 +398,12 @@ export class AttentionItem {
       if (canonicalIsoError(nowIso) !== null) {
         return failCode('clock', 'AttentionItem a later raise requires a canonical ISO timestamp');
       }
-      if (Date.parse(nowIso) < Date.parse(this.record.lastRaisedAtIso)) {
-        return failCode('clock', 'AttentionItem a later raise must not precede the last raise');
+      // A raise (and above all a reopen) never precedes the last raise or the clearance it would erase.
+      const floorIso = this.record.clearance !== null && Date.parse(this.record.clearance.atIso) > Date.parse(this.record.lastRaisedAtIso)
+        ? this.record.clearance.atIso
+        : this.record.lastRaisedAtIso;
+      if (Date.parse(nowIso) < Date.parse(floorIso)) {
+        return failCode('clock', 'AttentionItem a later raise must not precede the last raise or the clearance');
       }
       const candidate: AttentionItemRecord = {
         ...this.record,

@@ -500,7 +500,8 @@ describe('DispatchAttemptUseCase runner selection (O14c1)', () => {
         runnerSelector: selector,
       });
 
-    // A manifest carrying agy on the model assignment reaches the selector as agy.
+    // AG-3: a manifest carrying agy under a reservation taken for opencode is
+    // refused after the (pure) selection and before anything is written.
     const agyUseCase = buildUseCase(withSeatTool('agy'));
     const agyDispatch = await agyUseCase.dispatchAttempt({
       ...dispatchRequest(),
@@ -508,7 +509,10 @@ describe('DispatchAttemptUseCase runner selection (O14c1)', () => {
         `${FAKE_BRIEF_PROSE}\n${manifestForSeatTool('agy')}`,
       ),
     });
-    expect(agyDispatch.outcome).toBe('started');
+    expect(agyDispatch).toEqual({
+      outcome: 'refused',
+      reason: 'Frozen brief seat tool does not match the reservation seat tool',
+    });
     expect(selectionCalls).toEqual(['agy']);
 
     // A manifest with no seatTool keeps today's behaviour: the opencode seat.

@@ -6,6 +6,7 @@ export * from "./AskOwnerQuestionPort.in-port.js";
 export * from "./CancelPolicyGrantsPort.in-port.js";
 export * from "./CheckOwnerDecisionPort.in-port.js";
 export * from "./ExpireOwnerQuestionsPort.in-port.js";
+export * from "./FindOwnerQuestionByKeyPort.in-port.js";
 export * from "./HeartbeatOrchestratorSessionPort.in-port.js";
 export * from "./InspectConfiguredCapabilitiesPort.in-port.js";
 export * from "./InspectOutstandingCoordinationPort.in-port.js";

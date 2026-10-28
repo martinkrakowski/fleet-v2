@@ -10,6 +10,7 @@
  */
 
 import {
+import { readExactPlainRecord } from '../plain-record-reads.js';
   CANONICAL_ISO_PATTERN,
   PLAN_ID_PATTERN,
   PLAN_PROJECT_ID_PATTERN,
@@ -20,7 +21,7 @@ import {
 import type {
   PullRequestLinkRecord,
   PullRequestLinkSource,
-  PullRequestRef,
+  PlanPullRequestRef,
 } from '../lane-plan-records.js';
 import { isPlanSecretShaped, planIdError, pullRequestRefError } from '../lane-plan-sidecar.js';
 
@@ -68,7 +69,7 @@ export class PullRequestLink {
     if (inputPrototype !== Object.prototype && inputPrototype !== null) {
       return invalid('PullRequestLink requires a record');
     }
-    const recordInput = readPlainRecord(input, RECORD_KEYS);
+    const recordInput = readExactPlainRecord(input, RECORD_KEYS);
     if (recordInput === null) {
       return invalid('PullRequestLink must have exactly its record fields');
     }
@@ -172,7 +173,7 @@ export class PullRequestLink {
 }
 
 /** `<repository>#<number>`: the store key of a pull request (one link per key). */
-export function pullRequestLinkKey(ref: PullRequestRef): string {
+export function pullRequestLinkKey(ref: PlanPullRequestRef): string {
   return `${ref.repository}#${ref.number}`;
 }
 
@@ -209,29 +210,3 @@ function unreadableInputResult(): PullRequestLinkResult {
   };
 }
 
-/** A plain object with exactly the given own enumerable string keys, read through descriptors. */
-function readPlainRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return null;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    return null;
-  }
-  const ownKeys = Reflect.ownKeys(value);
-  if (ownKeys.length !== keys.length) {
-    return null;
-  }
-  const out: Record<string, unknown> = {};
-  for (const key of ownKeys) {
-    if (typeof key !== 'string' || !keys.includes(key)) {
-      return null;
-    }
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor?.enumerable) {
-      return null;
-    }
-    out[key] = descriptor.value;
-  }
-  return out;
-}

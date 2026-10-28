@@ -3,6 +3,7 @@
  * LanePlan is a plan's machine workbook as a stored, versioned aggregate
  * (work-board plan §3.2, §5): keyed (projectId, planId), carrying the plan's
  * revision, the import digest, its lanes as `PlannedLane` children with their
+import { readExactPlainRecord } from '../plain-record-reads.js';
  * status and former ids as aliases (a dropped lane is kept, never deleted),
  * the plan's decisions and exclusive orders, and the import time. A planned
  * lane grants nothing and owns no path until it is registered as a work
@@ -135,7 +136,7 @@ export class LanePlan {
     if (inputPrototype !== Object.prototype && inputPrototype !== null) {
       return invalid('LanePlan requires a record');
     }
-    const recordInput = readPlainRecord(input, RECORD_KEYS);
+    const recordInput = readExactPlainRecord(input, RECORD_KEYS);
     if (recordInput === null) {
       return invalid('LanePlan must have exactly its record fields');
     }
@@ -223,8 +224,8 @@ export class LanePlan {
         deepFreezeValue(laneRecord);
         return laneRecord;
       })),
-      decisions: Object.freeze(decisions),
-      exclusiveOrder: Object.freeze(exclusiveOrder),
+      decisions: deepFreezeValue(decisions),
+      exclusiveOrder: deepFreezeValue(exclusiveOrder),
       importedAtIso,
     });
     return { success: true, value: new LanePlan(record) };
@@ -357,7 +358,7 @@ function readDecisions(value: unknown): PlanDecisionSidecar[] | string {
   const decisions: PlanDecisionSidecar[] = [];
   for (let index = 0; index < list.length; index += 1) {
     const base = `decisions[${index}]`;
-    const snapshot = readPlainRecord(list[index], DECISION_KEYS);
+    const snapshot = readExactPlainRecord(list[index], DECISION_KEYS);
     if (snapshot === null) {
       return `LanePlan ${base}: must be a decision record`;
     }
@@ -397,7 +398,7 @@ function readExclusiveOrders(value: unknown): ExclusiveOrderSidecar[] | string {
   const entries: ExclusiveOrderSidecar[] = [];
   for (let index = 0; index < list.length; index += 1) {
     const base = `exclusiveOrder[${index}]`;
-    const snapshot = readPlainRecord(list[index], EXCLUSIVE_KEYS);
+    const snapshot = readExactPlainRecord(list[index], EXCLUSIVE_KEYS);
     if (snapshot === null) {
       return `LanePlan ${base}: must be an exclusive order record`;
     }
@@ -523,32 +524,6 @@ function crossReferenceError(
   return null;
 }
 
-/** A plain object with exactly the given own enumerable string keys, read through descriptors. */
-function readPlainRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return null;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    return null;
-  }
-  const ownKeys = Reflect.ownKeys(value);
-  if (ownKeys.length !== keys.length) {
-    return null;
-  }
-  const out: Record<string, unknown> = {};
-  for (const key of ownKeys) {
-    if (typeof key !== 'string' || !keys.includes(key)) {
-      return null;
-    }
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor?.enumerable) {
-      return null;
-    }
-    out[key] = descriptor.value;
-  }
-  return out;
-}
 
 /** A fresh plain array copied by index (no iterator, no species); a non-array is returned unchanged. */
 function plainArrayCopy(value: unknown): unknown {

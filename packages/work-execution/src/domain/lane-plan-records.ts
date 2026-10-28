@@ -112,7 +112,7 @@ export interface PlannedLaneRecord {
   readonly decisions: readonly string[];
   readonly status: PlannedLaneStatus;
   readonly brief: string | null;
-  readonly mergedPr: PullRequestRef | null;
+  readonly mergedPr: PlanPullRequestRef | null;
 }
 
 /** A plan's machine workbook as imported, keyed (projectId, planId). Version 1. */

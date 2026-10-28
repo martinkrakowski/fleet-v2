@@ -24,7 +24,7 @@ import type {
   PlannedLaneRef,
   PlannedLaneStatus,
   PlannedLaneTier,
-  PullRequestRef,
+  PlanPullRequestRef,
 } from '../lane-plan-records.js';
 import {
   planIdError,
@@ -83,7 +83,7 @@ export class PlannedLane {
     if (inputPrototype !== Object.prototype && inputPrototype !== null) {
       return invalid(`PlannedLane ${path}: must be an object`);
     }
-    const recordInput = readPlainRecord(input, RECORD_KEYS);
+    const recordInput = readExactPlainRecord(input, RECORD_KEYS);
     if (recordInput === null) {
       return invalid(`PlannedLane ${path}: must have exactly its record fields`);
     }
@@ -248,7 +248,7 @@ export class PlannedLane {
     }
     const brief = recordInput.brief as string | null;
 
-    let mergedPr: PullRequestRef | null = null;
+    let mergedPr: PlanPullRequestRef | null = null;
     if (recordInput.mergedPr !== null) {
       const snapshot = readExactPlainRecord(recordInput.mergedPr, ['repository', 'number']);
       if (!snapshot) {
@@ -258,7 +258,7 @@ export class PlannedLane {
       if (prError !== null) {
         return invalid(`PlannedLane ${prError}`);
       }
-      mergedPr = snapshot as unknown as PullRequestRef;
+      mergedPr = snapshot as unknown as PlanPullRequestRef;
     }
 
     const record: PlannedLaneRecord = Object.freeze({
@@ -329,7 +329,7 @@ function unreadableInputResult(): PlannedLaneResult {
 
 /** A resolved `{ projectId, planId, laneId }` or its fixed error message. */
 function readLaneRef(value: unknown, path: string): PlannedLaneRef | string {
-  const snapshot = readPlainRecord(value, AFTER_KEYS);
+  const snapshot = readExactPlainRecord(value, AFTER_KEYS);
   if (snapshot === null) {
     return `PlannedLane ${path}: must be a resolved lane reference object`;
   }
@@ -356,32 +356,6 @@ function planIdErrorValue(path: string, value: unknown): string | null {
   return planIdError(path, value, PLAN_ID_PATTERN, 'plan id');
 }
 
-/** A plain object with exactly the given own enumerable string keys, read through descriptors. */
-function readPlainRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return null;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    return null;
-  }
-  const ownKeys = Reflect.ownKeys(value);
-  if (ownKeys.length !== keys.length) {
-    return null;
-  }
-  const out: Record<string, unknown> = {};
-  for (const key of ownKeys) {
-    if (typeof key !== 'string' || !keys.includes(key)) {
-      return null;
-    }
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor?.enumerable) {
-      return null;
-    }
-    out[key] = descriptor.value;
-  }
-  return out;
-}
 
 /** A fresh plain array copied by index (no iterator, no species); a non-array is returned unchanged. */
 function plainArrayCopy(value: unknown): unknown {

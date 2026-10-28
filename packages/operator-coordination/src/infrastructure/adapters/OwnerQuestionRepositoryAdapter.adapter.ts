@@ -17,7 +17,10 @@ import { join, resolve } from 'node:path';
 
 import type { OwnerQuestionRecord } from '../../domain/owner-question-records.js';
 import { OwnerQuestion } from '../../domain/entities/OwnerQuestion.js';
-import { OwnerQuestionRevisionConflictError } from '../../application/ports/out/OwnerQuestionRepositoryPort.out-port.js';
+import {
+  OwnerQuestionIdempotencyKeyConflictError,
+  OwnerQuestionRevisionConflictError,
+} from '../../application/ports/out/OwnerQuestionRepositoryPort.out-port.js';
 import type {
   OwnerQuestionListQuery,
   OwnerQuestionRepositoryPort,
@@ -116,6 +119,7 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
         throw revisionConflict(validated.questionId, expectedRevision, storedRevision, validated.revision);
       }
       assertRevisionArithmetic(validated.revision, expectedRevision);
+      this.assertKeyRules(validated, this.inMemoryQuestions);
       this.inMemoryQuestions.set(validated.questionId, validated);
       this.signal({ kind: 'question', id: validated.questionId, stateFile: null, before: null, written: null });
       return;
@@ -138,6 +142,7 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
         throw revisionConflict(validated.questionId, expectedRevision, storedRevision, validated.revision);
       }
       assertRevisionArithmetic(validated.revision, expectedRevision);
+      this.assertKeyRules(validated, records);
       records.set(validated.questionId, validated);
       const list = [...records.values()]
         .sort((left, right) => left.questionId.localeCompare(right.questionId))
@@ -195,6 +200,44 @@ export class OwnerQuestionRepositoryAdapter implements OwnerQuestionRepositoryPo
           : left.askedAt.localeCompare(right.askedAt),
       )
       .map(copy);
+  }
+
+  async findByIdempotencyKey(key: string): Promise<OwnerQuestionRecord | null> {
+    if (typeof key !== 'string' || key.length === 0) {
+      return null;
+    }
+    const target = this.statePath;
+    const records = target === null ? this.inMemoryQuestions : await this.readRecordsFromDisk(target);
+    const found = [...records.values()]
+      .filter((record) => record.idempotencyKey === key)
+      .sort((left, right) => left.questionId.localeCompare(right.questionId))[0];
+    return found === undefined ? null : copy(found);
+  }
+
+  /**
+   * The idempotency-key invariants: a stored key never changes (both absent,
+   * or equal) and no other stored question holds the same key as the one
+   * being written. Called under the store's own data (inside the lock on
+   * disk) after the revision checks, before the write.
+   */
+  private assertKeyRules(validated: OwnerQuestionRecord, records: Map<string, OwnerQuestionRecord>): void {
+    const stored = records.get(validated.questionId);
+    if (stored !== undefined && stored.idempotencyKey !== validated.idempotencyKey) {
+      throw new Error('OwnerQuestionRepositoryAdapter refuses a change to a stored idempotency key');
+    }
+    if (validated.idempotencyKey !== undefined) {
+      const holder = [...records.values()]
+        .filter((record) => record.questionId !== validated.questionId)
+        .sort((left, right) => left.questionId.localeCompare(right.questionId))
+        .find((record) => record.idempotencyKey === validated.idempotencyKey);
+      if (holder !== undefined) {
+        throw new OwnerQuestionIdempotencyKeyConflictError(
+          validated.questionId,
+          holder.questionId,
+          'OwnerQuestionRepositoryAdapter refuses an idempotency key another question holds',
+        );
+      }
+    }
   }
 
   private get statePath(): string | null {

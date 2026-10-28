@@ -57,6 +57,10 @@ class FakeOwnerQuestionRepo implements OwnerQuestionRepositoryPort {
   async list(): Promise<readonly OwnerQuestionRecord[]> {
     return [...this.records.values()];
   }
+
+  async findByIdempotencyKey(key: string): Promise<OwnerQuestionRecord | null> {
+    return [...this.records.values()].find((r) => r.idempotencyKey === key) ?? null;
+  }
 }
 
 function emptyQuestions(): FakeOwnerQuestionRepo {

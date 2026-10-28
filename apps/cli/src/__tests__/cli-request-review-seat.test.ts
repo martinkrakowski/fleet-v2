@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { AttemptRecord } from '@fleet/work-execution';
 import { nextAttemptRevision } from '@fleet/work-execution';
+import type { EvidenceAssessmentRecord } from '@fleet/evidence-and-acceptance';
 
 import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
@@ -171,5 +172,54 @@ describe('evidence request-review implementer seat binding', () => {
     const result = jsonOf<{ outcome: string; reason: string }>(invocation);
     expect(result.outcome).toBe('rejected');
     expect(result.reason).toBe(`Attempt not found: '${UNKNOWN_ATTEMPT_ID}'`);
+  });
+
+  it('forwards kind and requestId so a conductor review replays instead of reviewing twice', async () => {
+    const requestId = 'review-01JB0000000000000000000001';
+    const assessmentId = `assessment-${ATTEMPT_ID}`;
+    const receipt = {
+      id: `rr-${assessmentId}-${HEAD_SHA.slice(0, 8)}-${requestId}`,
+      assessmentId,
+      projectId: PROJECT_ID,
+      attemptId: ATTEMPT_ID,
+      candidateHeadSha: HEAD_SHA,
+      reviewerModel: 'openrouter/anthropic/claude-sonnet-4.5',
+      implementerModel: SEAT_MODEL,
+      readOnlyVerified: true,
+      result: 'pass' as const,
+      findings: [],
+      evidenceRef: 'ref-1',
+      policyRevision: POLICY_REVISION,
+      completedAtIso: '2026-10-28T12:00:00.000Z',
+      kind: 'code-review' as const,
+      requestId,
+    };
+    const assessment: EvidenceAssessmentRecord = {
+      id: assessmentId,
+      projectId: PROJECT_ID,
+      attemptId: ATTEMPT_ID,
+      candidateHeadSha: HEAD_SHA,
+      policyRevision: POLICY_REVISION,
+      implementerModel: SEAT_MODEL,
+      requiredChecks: [],
+      state: 'pending',
+      verificationReceipts: [],
+      reviewReceipts: [receipt],
+      findingDispositions: [],
+      acceptanceReceiptId: null,
+      blockers: [],
+      revision: 0,
+      updatedAtIso: '2026-10-28T12:00:00.000Z',
+    };
+    await runtime.evidence.evidenceAssessmentRepository.saveAssessment(assessment);
+
+    // The payload carries kind + requestId; the CLI must forward them so the
+    // recorded receipt answers instead of a second review being attempted.
+    const invocation = await cli(reviewRequest({ kind: 'code-review', requestId }));
+
+    expect(invocation.code).toBe(0);
+    const result = jsonOf<{ outcome: string; receipt: { id: string } }>(invocation);
+    expect(result.outcome).toBe('reviewed');
+    expect(result.receipt.id).toBe(receipt.id);
   });
 });

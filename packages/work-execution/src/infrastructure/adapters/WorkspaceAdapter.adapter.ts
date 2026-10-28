@@ -1,9 +1,11 @@
 // @generated adapter scaffold — implemented for migration station O3 (reviewed git subprocesses).
 /**
  * WorkspaceAdapter implements WorkspacePort. It inspects a Git worktree as a
- * typed record through reviewed `git` subprocesses without modifying the
- * worktree: no resets, no checkouts, no cleanup. Unreadable state is an
- * error, never a silent guess.
+ * typed record through reviewed `git` subprocesses; every read leaves the
+ * worktree untouched (no resets, no checkouts, no cleanup) and the one write
+ * is `commitLaneOutput`: stage, `commit-tree`, `update-ref` by
+ * compare-and-swap; never a push, a reset or a checkout. Unreadable state is
+ * an error, never a silent guess.
  *
  * Every command runs through the configured `CommandExecutorPort` (local or
  * ssh) with an explicit wall-clock budget: git commands, existence probes
@@ -30,6 +32,11 @@ import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { hasRecordedHostName } from './ConfirmRecordedHost.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
+import { isValidAgyModel } from './AgyRunnerAdapter.adapter.js';
+import type {
+  CommitLaneOutputRequest,
+  CommitLaneOutputResult,
+} from '../../application/ports/out/WorkspacePort.out-port.js';
 
 /**
  * Adapter-layer helper for resolving one caller-supplied path against a
@@ -111,6 +118,23 @@ const PROBE_TIMEOUT_MS = 60 * 1000;
 
 /** Wall-clock budget for one file read (`cat`). */
 const CAT_TIMEOUT_MS = 60 * 1000;
+
+/** The commit's argv hardening (2026-10-16 plan, step 4): no hooks, no signing, no fsmonitor. */
+const COMMIT_GIT_CONFIG: readonly string[] = [
+  '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false', '-c', 'core.fsmonitor=false',
+];
+const COMMIT_HEAD_PATTERN = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+const COMMIT_ATTEMPT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+/**
+ * The commit message of one edit-only attempt: a subject line and the two
+ * trailers, nothing else.
+ */
+export function editOnlyCommitMessage(attemptId: string, implementerModel: string): string {
+  return 'fleet: edit-only lane output for ' + attemptId + '\n\n' +
+    'Implemented-By: agy ' + implementerModel + '\n' +
+    'Fleet-Attempt: ' + attemptId + '\n';
+}
 
 /**
  * Validate that an SSH host string is safe to pass to subprocess commands.
@@ -288,5 +312,122 @@ export class WorkspaceAdapter implements WorkspacePort {
       );
     }
     return result.exitCode === 0 ? result.stdout : null;
+  }
+
+  /**
+   * One commit command in the worktree with the commit hardening: no hooks,
+   * no signing, no fsmonitor. `ok: false` when the command failed or never
+   * reported an exit code, with a fixed reason that never carries stderr or
+   * a path.
+   */
+  private async runCommitGit(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+    args: readonly string[],
+  ): Promise<{ ok: true; stdout: string } | { ok: false; reason: string }> {
+    const result = await executor.run(['git', '-C', worktreePath, ...COMMIT_GIT_CONFIG, ...args], {
+      timeoutMs: GIT_TIMEOUT_MS,
+    });
+    if (result.exitCode !== 0 || result.error !== undefined) {
+      return { ok: false, reason: 'git ' + args[0] + ' failed' };
+    }
+    return { ok: true, stdout: result.stdout };
+  }
+
+  async commitLaneOutput(request: CommitLaneOutputRequest): Promise<CommitLaneOutputResult> {
+    // 1. Validate before any command runs.
+    const worktreeRefusal = worktreeRootRefusal(request.worktreePath);
+    if (
+      worktreeRefusal !== null ||
+      COMMIT_HEAD_PATTERN.test(request.expectedHead) !== true ||
+      COMMIT_ATTEMPT_ID_PATTERN.test(request.attemptId) !== true ||
+      isValidAgyModel(request.implementerModel) !== true
+    ) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+
+    // 2. The commit runs on the recorded host's executor when there is one.
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(request.recordedHost);
+    } catch {
+      return { outcome: 'error', reason: 'worktree host could not be resolved' };
+    }
+
+    const { worktreePath } = request;
+
+    // 3. Read HEAD.
+    const headRun = await this.runCommitGit(executor, worktreePath, ['rev-parse', '--verify', 'HEAD^{commit}']);
+    if (!headRun.ok) return { outcome: 'error', reason: headRun.reason };
+    const head = headRun.stdout.trim();
+
+    // 4. The checked-out branch, else a detached head is refused.
+    const branchRun = await this.runCommitGit(executor, worktreePath, ['symbolic-ref', '-q', 'HEAD']);
+    if (!branchRun.ok) return { outcome: 'refused', reason: 'detached-head' };
+    const branchRef = branchRun.stdout.trim();
+    if (branchRef.startsWith('refs/heads/') !== true) {
+      return { outcome: 'refused', reason: 'detached-head' };
+    }
+
+    // 5. HEAD must be the dispatch head; a crash after the commit reads as
+    // already-committed instead of a head-moved refusal.
+    if (head !== request.expectedHead) {
+      const parentsRun = await this.runCommitGit(executor, worktreePath, ['show', '-s', '--format=%P', 'HEAD']);
+      if (!parentsRun.ok) return { outcome: 'error', reason: parentsRun.reason };
+      const trailerRun = await this.runCommitGit(
+        executor,
+        worktreePath,
+        ['show', '-s', '--format=%(trailers:key=Fleet-Attempt,valueonly,separator=%x2C)', 'HEAD'],
+      );
+      if (!trailerRun.ok) return { outcome: 'error', reason: trailerRun.reason };
+      const parents = parentsRun.stdout.trim();
+      const trailer = trailerRun.stdout.trim();
+      if (parents === request.expectedHead && trailer === request.attemptId) {
+        return { outcome: 'already-committed', headCommit: head, branchRef };
+      }
+      return { outcome: 'refused', reason: 'head-moved' };
+    }
+
+    // 6. Stage the whole checked change set. Ignored files are never staged.
+    const addRun = await this.runCommitGit(executor, worktreePath, ['add', '-A', '--', '.']);
+    if (!addRun.ok) return { outcome: 'error', reason: addRun.reason };
+
+    // 7. Write the staged tree and compare it with HEAD's tree.
+    const treeRun = await this.runCommitGit(executor, worktreePath, ['write-tree']);
+    if (!treeRun.ok) return { outcome: 'error', reason: treeRun.reason };
+    const tree = treeRun.stdout.trim();
+    const headTreeRun = await this.runCommitGit(executor, worktreePath, ['rev-parse', '--verify', 'HEAD^{tree}']);
+    if (!headTreeRun.ok) return { outcome: 'error', reason: headTreeRun.reason };
+    const headTree = headTreeRun.stdout.trim();
+    if (tree === headTree) {
+      return { outcome: 'nothing-to-commit' };
+    }
+
+    // 8. Write the commit: the dispatch head is the only parent.
+    const commitRun = await this.runCommitGit(
+      executor,
+      worktreePath,
+      [
+        'commit-tree', tree, '-p', request.expectedHead, '--no-gpg-sign',
+        '-m', editOnlyCommitMessage(request.attemptId, request.implementerModel),
+      ],
+    );
+    if (!commitRun.ok) return { outcome: 'error', reason: commitRun.reason };
+    const commit = commitRun.stdout.trim();
+    if (COMMIT_HEAD_PATTERN.test(commit) !== true) {
+      return { outcome: 'error', reason: 'git commit-tree failed' };
+    }
+
+    // 9. Move the branch by compare-and-swap: git refuses when the branch
+    // moved since `expectedHead`, and then nothing was moved.
+    const updateRun = await this.runCommitGit(
+      executor,
+      worktreePath,
+      ['update-ref', '-m', 'fleet edit-only commit ' + request.attemptId, branchRef, commit, request.expectedHead],
+    );
+    if (!updateRun.ok) return { outcome: 'refused', reason: 'ref-moved' };
+
+    // 10. Done.
+    return { outcome: 'committed', headCommit: commit, branchRef };
   }
 }

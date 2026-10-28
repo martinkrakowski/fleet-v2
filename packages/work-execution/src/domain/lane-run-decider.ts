@@ -241,11 +241,28 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         attemptOrdinal: record.attemptIds.indexOf(attempt.attemptId) + 1,
       });
 
+    /**
+     * KF-1: a crash between the journalled dispatch result (`completed`
+     * `dispatch-started`, or a reconcile's `reconciled`) and the `dispatching`
+     * conduct leaves the run `ready`, `seat-failed` or `fixing` with a started,
+     * still-live attempt. The lost conduct is repaired (`enter dispatching`),
+     * never a second attempt prepared and never the dispatch re-sent. An
+     * `ended` or `collected` attempt is not live, and `cancelled` is the
+     * dispatching rules' own transition, so none of them repairs.
+     */
+    const lostDispatchConduct = (attempt: LaneRunAttemptFact, round: number): boolean =>
+      attempt.dispatchResult === 'started' &&
+      attempt.round === round &&
+      (attempt.phase === 'dispatching' || attempt.phase === 'running' || attempt.phase === 'blocked');
+
     const dispatchOrPrepare = (
       round: number,
       attempt: LaneRunAttemptFact | null,
       seat: LaneRunSeatFact,
     ): LaneRunDecision => {
+      if (attempt !== null && lostDispatchConduct(attempt, round)) {
+        return enter('dispatching');
+      }
       if (attempt !== null && attempt.phase === 'prepared' && attempt.round === round) {
         if (facts.admission !== 'admitted') {
           return wait('admission');
@@ -383,7 +400,11 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         return park('cost-ceiling', null);
       }
       const attempt = facts.attempt;
-      if (attempt !== null && attempt.phase === 'prepared' && attempt.round === record.round) {
+      if (
+        attempt !== null &&
+        attempt.round === record.round &&
+        (attempt.phase === 'prepared' || lostDispatchConduct(attempt, record.round))
+      ) {
         return dispatchOrPrepare(record.round, attempt, facts.implementerSeat);
       }
       if (!facts.implementerSeat.ok || facts.roundSeatIndexes.includes(facts.implementerSeat.seatIndex)) {
@@ -452,7 +473,11 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       }
       const nextRound = record.round + 1;
       const attempt = facts.attempt;
-      if (attempt !== null && attempt.phase === 'prepared' && attempt.round === nextRound) {
+      if (
+        attempt !== null &&
+        attempt.round === nextRound &&
+        (attempt.phase === 'prepared' || lostDispatchConduct(attempt, nextRound))
+      ) {
         return dispatchOrPrepare(nextRound, attempt, facts.implementerSeat);
       }
       if (attempt === null) {
@@ -599,8 +624,18 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return WAIT_FACTS_INCONSISTENT;
     }
 
-    // G3a: an unread intent without a result is reconciled first, in any state.
+    // G3a: an unread intent without a result is reconciled first, in any state —
+    // except under a halt, where a collect or gate reconcile would re-run its act
+    // body (an edit-only commit, a collect, a gate on the lane host; §3.7): the
+    // halt rules' decision (G4b/G6) applies instead. Prepare, dispatch, stop and
+    // cancel reconciles stay as they are under halt (read-only or record-only).
     if (facts.pendingIntent !== null && facts.pendingIntent.reconciliation === 'unread') {
+      if (facts.halted && (facts.pendingIntent.step === 'collect' || facts.pendingIntent.step === 'gate')) {
+        if (facts.state === 'parked') {
+          return wait('parked');
+        }
+        return park('halted', null);
+      }
       return { kind: 'reconcile', step: facts.pendingIntent.step, key: facts.pendingIntent.key };
     }
 

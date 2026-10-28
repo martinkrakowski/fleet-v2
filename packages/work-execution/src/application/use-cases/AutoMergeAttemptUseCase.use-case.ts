@@ -1,0 +1,417 @@
+// Implemented use case — auto-merge policy station (AM4a-2, up to the merge).
+/**
+ * AutoMergeAttemptUseCase implements AutoMergeAttemptPort.
+ *
+ * It decides whether one collected attempt may merge under `policy.autoMerge`
+ * and routes every exception by the plan's §4 table. The setting is read
+ * field by field through AutoMergeSettingsPort; `off` is today's behaviour:
+ * nothing further is read and nothing is written. Records, forge history,
+ * one-way doors (A4), the frozen gate and the exact-head acceptance evidence
+ * follow; every failed or unexpected read ends in a not-merged outcome,
+ * never in a merge.
+ *
+ * A `ci-pending`-only block is recorded once as a first look in the
+ * execution journal (an `accept` entry with a dedicated id that can never be
+ * mistaken for a stored gate outcome) and waits; the next run re-assesses at
+ * the same head and a remaining `ci-pending` blocker falls to `onBlocked`.
+ * No timer runs.
+ *
+ * In this part an eligible attempt reports `merge-not-wired`: the grant and
+ * forge dependencies are declared but never called (AM4a-3 calls them). An
+ * empty blocker list is never read as pending; unreadable facts route to
+ * attention rather than being guessed.
+ */
+
+import type {
+  AutoMergeAttemptPort,
+  AutoMergeAttemptRequest,
+  AutoMergeAttemptResult,
+  AutoMergeRoute,
+  AutoMergeRouteOutcome,
+} from '../ports/in/AutoMergeAttemptPort.in-port.js';
+import type { AutoMergeSettingsPort } from '../ports/out/AutoMergeSettingsPort.out-port.js';
+import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
+import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
+import type { AttemptOwnerDecisionPort } from '../ports/out/AttemptOwnerDecisionPort.out-port.js';
+import type {
+  EvaluateAttemptGatePort,
+  EvaluateAttemptGateResult,
+} from '../ports/in/EvaluateAttemptGatePort.in-port.js';
+import type {
+  AcceptanceAssessmentPort,
+  AcceptanceAssessmentResult,
+} from '../ports/out/AcceptanceAssessmentPort.out-port.js';
+import type { AutoMergeOwnerRoutingPort } from '../ports/out/AutoMergeOwnerRoutingPort.out-port.js';
+import type { PolicyMergeGrantPort } from '../ports/out/PolicyMergeGrantPort.out-port.js';
+import type { ExecuteAuthorizedForgeActionPort } from '../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
+import type {
+  ActionJournalEntryRecord,
+  AttemptRecord,
+  WorkOrderRecord,
+} from '../../domain/execution-records.js';
+import { resolveWorkOrderRisk } from '../../domain/execution-records.js';
+import { readExactPlainRecord } from '../../domain/plain-record-reads.js';
+import {
+  AUTO_MERGE_HEAD_PATTERN,
+  AUTO_MERGE_ROUTE_RULE,
+  autoMergeBlockersOf,
+  autoMergeDoorsOf,
+  autoMergeFirstLookEntryId,
+  autoMergeForgeEntryPrefix,
+  autoMergeIneligibility,
+  autoMergeRoutingKey,
+  isCiPendingOnly,
+  readAutoMergeSettingsAnswer,
+  type AutoMergeBlocker,
+  type AutoMergeOnBlocked,
+  type AutoMergeReason,
+} from '../../domain/auto-merge.js';
+
+export interface AutoMergeAttemptDependencies {
+  readonly settings: AutoMergeSettingsPort;
+  readonly attemptRepo: AttemptRepositoryPort;
+  readonly workOrderRepo: WorkOrderRepositoryPort;
+  readonly journal: ExecutionJournalPort;
+  readonly attemptOwnerDecisionPort?: AttemptOwnerDecisionPort;
+  readonly evaluateAttemptGate?: EvaluateAttemptGatePort;
+  readonly acceptancePort?: AcceptanceAssessmentPort;
+  readonly routing?: AutoMergeOwnerRoutingPort;
+  readonly policyMergeGrant?: PolicyMergeGrantPort; // called in AM4a-3
+  readonly executeForgeAction?: ExecuteAuthorizedForgeActionPort; // called in AM4a-3
+  readonly nowIso: () => string;
+}
+
+const MAX_ATTEMPT_ID = 256;
+const MAX_DETAIL_TEXT = 300;
+const NOT_IMPLEMENTED = 'Not implemented: AutoMergeAttemptUseCase';
+
+/** Everything `notMerged` needs besides the reason and detail. */
+interface RoutingContext {
+  readonly attemptId: string;
+  readonly projectId: string | null;
+  readonly workOrderId: string | null;
+  readonly head: string | null;
+  readonly onBlocked: AutoMergeOnBlocked | null;
+  readonly routing?: AutoMergeOwnerRoutingPort;
+}
+
+export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
+  constructor(private readonly deps?: AutoMergeAttemptDependencies) {}
+
+  async autoMergeAttempt(request: AutoMergeAttemptRequest): Promise<AutoMergeAttemptResult> {
+    const deps = this.deps;
+    if (!deps) {
+      throw new Error(NOT_IMPLEMENTED);
+    }
+
+    // 1. Request validation: exactly one trimmed non-empty `attemptId`.
+    const parsed = readExactPlainRecord(request, ['attemptId']);
+    const attemptId =
+      parsed !== null && typeof parsed.attemptId === 'string' ? parsed.attemptId.trim() : null;
+    if (attemptId === null || attemptId.length === 0 || attemptId.length > MAX_ATTEMPT_ID) {
+      return this.notMerged(emptyContext(deps), 'invalid-request', 'the request names no attempt');
+    }
+
+    // 2. The setting is read first. `off` is today's behaviour: no other port
+    // is called and nothing is written. Unreadable is deferred until the work
+    // order is known, so the attention item can address it.
+    let settings: ReturnType<typeof readAutoMergeSettingsAnswer>;
+    try {
+      settings = readAutoMergeSettingsAnswer(await deps.settings.readAutoMergeSettings());
+    } catch {
+      settings = { kind: 'unreadable', reason: 'settings port threw' };
+    }
+    if (settings.kind === 'off') {
+      return { outcome: 'off' };
+    }
+
+    // 3. The attempt, then its work order. A failed read is `records-unreadable`;
+    // a known absence names itself. All three have no work order to address.
+    let attempt: AttemptRecord | null = null;
+    let workOrder: WorkOrderRecord | null = null;
+    try {
+      attempt = await deps.attemptRepo.findAttemptById(attemptId);
+      if (attempt !== null) {
+        workOrder = await deps.workOrderRepo.findWorkOrderById(attempt.workOrderId);
+      }
+    } catch {
+      return this.notMerged(emptyContext(deps), 'records-unreadable', 'the execution records could not be read');
+    }
+    if (attempt === null) {
+      return this.notMerged(emptyContext(deps), 'attempt-missing', 'no attempt record answers');
+    }
+    if (workOrder === null) {
+      return this.notMerged(
+        emptyContext(deps, attempt),
+        'work-order-missing',
+        'the attempt names no readable work order',
+      );
+    }
+
+    const ctx: RoutingContext = {
+      attemptId: attempt.id,
+      projectId: workOrder.projectId,
+      workOrderId: workOrder.id,
+      head: null,
+      onBlocked: settings.kind === 'on' ? settings.settings.onBlocked : null,
+      routing: deps.routing,
+    };
+
+    // 4. An unreadable setting is treated as off for this run: no grant, an attention item.
+    if (settings.kind === 'unreadable') {
+      return this.notMerged(ctx, 'settings-unreadable', settings.reason, ['the auto-merge setting could not be read']);
+    }
+
+    // 5. Closed work orders are never auto-merged.
+    if (workOrder.state === 'merged' || workOrder.state === 'stopped') {
+      return this.notMerged(ctx, 'work-order-closed', 'the work order is ' + workOrder.state);
+    }
+
+    // 6. The head must be the exact collected commit id.
+    const head = attempt.artifacts?.headCommit;
+    if (typeof head !== 'string' || !AUTO_MERGE_HEAD_PATTERN.test(head)) {
+      return this.notMerged(ctx, 'no-head', 'the attempt has no collected head commit');
+    }
+    const headCtx: RoutingContext = { ...ctx, head };
+
+    // 7. Forge history: every attempt of the work order, this attempt included.
+    const entries = await this.readForgeHistory(deps, workOrder.id, attempt.id);
+    if (entries === null) {
+      return this.notMerged(headCtx, 'forge-history-unreadable', 'the forge history could not be read', [
+        'the forge history could not be read',
+      ]);
+    }
+
+    // 8. Any ambiguous forge entry suspends auto-merge for the whole work order.
+    const ambiguousCount = entries.filter((entry) => entry.action === 'forge' && entry.status === 'ambiguous').length;
+    if (ambiguousCount > 0) {
+      return this.notMerged(
+        headCtx,
+        'forge-suspended',
+        ambiguousCount + ' ambiguous forge entries',
+        ['an ambiguous forge entry suspends auto-merge until it is reconciled'],
+      );
+    }
+
+    // 9. This head's own action: one grant per (attempt, head), never a second.
+    const prefix = autoMergeForgeEntryPrefix(attempt.id, head);
+    const own = entries.filter((entry) => entry.attemptId === attempt.id && entry.id.startsWith(prefix));
+    const hasIntent = own.some((entry) => entry.status === 'intent-recorded');
+    const hasResult = own.some(
+      (entry) => entry.status === 'completed' || entry.status === 'refused' || entry.status === 'ambiguous',
+    );
+    if (hasIntent && hasResult) {
+      return this.notMerged(headCtx, 'already-attempted', 'this head was already tried once');
+    }
+    if (hasIntent) {
+      return this.notMerged(headCtx, 'forge-suspended', 'the merge intent has no recorded outcome', [
+        'the merge intent has no recorded outcome',
+      ]);
+    }
+
+    // 10. One-way doors, then risk and forge mode (A4, in the domain's order).
+    const doors = await this.readDoors(deps, attempt.id);
+    const ineligibility = autoMergeIneligibility({
+      doors,
+      risk: resolveWorkOrderRisk(workOrder),
+      allowHighRisk: settings.settings.allowHighRisk,
+      forgeMode: settings.settings.forgeMode,
+    });
+    if (ineligibility !== null) {
+      return this.notMerged(headCtx, ineligibility, 'needs an owner merge', ['needs an owner merge']);
+    }
+
+    // 11. The frozen gate answers first; anything but `passed` blocks.
+    if (!deps.evaluateAttemptGate) {
+      return this.notMerged(headCtx, 'gate-not-passed', 'gate port not wired', ['gate port not wired']);
+    }
+    let verdict: EvaluateAttemptGateResult;
+    try {
+      verdict = await deps.evaluateAttemptGate.evaluateAttemptGate({ attemptId: attempt.id, candidateHeadSha: head });
+    } catch {
+      return this.notMerged(headCtx, 'gate-not-passed', 'the gate evaluation threw', ['the gate evaluation threw']);
+    }
+    if (verdict.verdict !== 'passed') {
+      const line = verdict.reason.slice(0, MAX_DETAIL_TEXT);
+      return this.notMerged(headCtx, 'gate-not-passed', line, [line]);
+    }
+
+    // 12. Exact-head acceptance evidence; a receipt for another head is stale.
+    if (!deps.acceptancePort) {
+      return this.notMerged(headCtx, 'acceptance-unreadable', 'acceptance port not wired', [
+        'the acceptance evidence could not be read',
+      ]);
+    }
+    let assessment: AcceptanceAssessmentResult;
+    try {
+      assessment = await deps.acceptancePort.assessHeadAcceptance({
+        attemptId: attempt.id,
+        workOrderId: workOrder.id,
+        candidateHeadSha: head,
+        policyRevision: workOrder.policyRevision,
+      });
+    } catch {
+      return this.notMerged(headCtx, 'acceptance-unreadable', 'the acceptance evidence could not be read', [
+        'the acceptance evidence could not be read',
+      ]);
+    }
+
+    if (assessment.outcome === 'accepted') {
+      const stale =
+        assessment.assessedHeadSha !== head ||
+        typeof assessment.receiptId !== 'string' ||
+        assessment.receiptId.length === 0;
+      if (stale) {
+        return this.notMerged(headCtx, 'acceptance-blocked', 'the acceptance evidence is stale', [
+          'stale: the acceptance evidence does not cover this head',
+        ]);
+      }
+      // Eligible — and in this part the merge is not wired yet.
+      return this.notMerged(headCtx, 'merge-not-wired', 'the merge step is not wired yet');
+    }
+    const blockers: readonly AutoMergeBlocker[] = autoMergeBlockersOf(
+      assessment.outcome === 'rejected' || assessment.outcome === 'unknown' ? assessment.blockerDetails : undefined,
+      'acceptance did not pass',
+    );
+
+    // 13. A `ci-pending`-only block gets exactly one first look.
+    if (!isCiPendingOnly(blockers)) {
+      return this.notMerged(headCtx, 'acceptance-blocked', 'acceptance did not pass', blockers.map((b) => b.text));
+    }
+
+    let recentEntries: readonly ActionJournalEntryRecord[];
+    try {
+      recentEntries = await deps.journal.listJournalEntriesForAttempt(attempt.id);
+    } catch {
+      return this.notMerged(headCtx, 'first-look-unrecorded', 'the journal could not be re-read');
+    }
+    const firstLookId = autoMergeFirstLookEntryId(attempt.id, head);
+    const firstLook = recentEntries.find((entry) => entry.id === firstLookId) ?? null;
+    if (firstLook === null) {
+      const recordedAtIso = deps.nowIso();
+      try {
+        await deps.journal.appendJournalEntry({
+          id: firstLookId,
+          attemptId: attempt.id,
+          workOrderId: workOrder.id,
+          action: 'accept',
+          status: 'refused',
+          baseCommit: attempt.baseCommit,
+          recordedAtIso,
+          sessionId: null,
+          detail: 'auto-merge first look: ci-pending',
+        });
+      } catch {
+        return this.notMerged(headCtx, 'first-look-unrecorded', 'the first look could not be recorded');
+      }
+      return { outcome: 'waiting', reason: 'ci-pending-first-look', headSha: head, firstLookAtIso: recordedAtIso };
+    }
+
+    // 14. The second look: a remaining `ci-pending` blocker falls to `onBlocked`.
+    const firstLookAt = firstLook.recordedAtIso;
+    return this.notMerged(
+      headCtx,
+      'ci-pending-second-look',
+      'first look at ' + firstLookAt,
+      blockers.map((blocker) => blocker.text),
+    );
+  }
+
+  async execute(input?: unknown): Promise<AutoMergeAttemptResult> {
+    if (!this.deps || !input || typeof input !== 'object') {
+      throw new Error(NOT_IMPLEMENTED);
+    }
+    return this.autoMergeAttempt(input as AutoMergeAttemptRequest);
+  }
+
+  /** Every attempt of the work order plus this one, deduplicated, read concurrently. */
+  private async readForgeHistory(
+    deps: AutoMergeAttemptDependencies,
+    workOrderId: string,
+    attemptId: string,
+  ): Promise<readonly ActionJournalEntryRecord[] | null> {
+    let attemptIds: string[];
+    try {
+      const listed = await deps.attemptRepo.listAttemptsByWorkOrder(workOrderId);
+      const ids = new Set<string>(listed.map((record) => record.id));
+      ids.add(attemptId);
+      attemptIds = [...ids];
+    } catch {
+      return null;
+    }
+    try {
+      const listed = await Promise.all(attemptIds.map((id) => deps.journal.listJournalEntriesForAttempt(id)));
+      return listed.flat();
+    } catch {
+      return null;
+    }
+  }
+
+  private async readDoors(deps: AutoMergeAttemptDependencies, attemptId: string) {
+    if (!deps.attemptOwnerDecisionPort) {
+      return { kind: 'unreadable' as const };
+    }
+    try {
+      return await deps.attemptOwnerDecisionPort
+        .readAttemptOwnerDecisionReferences({ attemptId })
+        .then((answer) => autoMergeDoorsOf(answer));
+    } catch {
+      return { kind: 'unreadable' as const };
+    }
+  }
+
+  /**
+   * Build the not-merged result and route it. The route follows the plan's §4
+   * table; `on-blocked` resolves through the setting. A routing failure never
+   * changes the outcome.
+   */
+  private async notMerged(
+    ctx: RoutingContext,
+    reason: AutoMergeReason,
+    detail: string | null,
+    lines: readonly string[] = [],
+  ): Promise<AutoMergeAttemptResult> {
+    const rule = AUTO_MERGE_ROUTE_RULE[reason];
+    let route: AutoMergeRoute = rule === 'on-blocked' ? (ctx.onBlocked === 'ask-owner' ? 'owner-question' : 'attention') : rule;
+    let routeOutcome: AutoMergeRouteOutcome = 'none';
+    if (route !== 'none' && ctx.workOrderId !== null && ctx.projectId !== null) {
+      if (!ctx.routing) {
+        routeOutcome = 'not-wired';
+      } else {
+        const notice = {
+          key: autoMergeRoutingKey(ctx.attemptId, ctx.head, reason),
+          projectId: ctx.projectId,
+          workOrderId: ctx.workOrderId,
+          attemptId: ctx.attemptId,
+          headSha: ctx.head,
+          reason,
+          lines,
+        };
+        try {
+          const answer =
+            route === 'attention' ? await ctx.routing.recordAttention(notice) : await ctx.routing.askOwner(notice);
+          routeOutcome = answer.outcome;
+        } catch {
+          routeOutcome = 'failed';
+        }
+      }
+    }
+    if (route === 'none' || ctx.workOrderId === null || ctx.projectId === null) {
+      route = 'none';
+      routeOutcome = 'none';
+    }
+    return { outcome: 'not-merged', reason, route, routeOutcome, detail };
+  }
+}
+
+function emptyContext(deps: AutoMergeAttemptDependencies, attempt?: AttemptRecord): RoutingContext {
+  return {
+    attemptId: attempt?.id ?? '',
+    projectId: null,
+    workOrderId: null,
+    head: null,
+    onBlocked: null,
+    routing: deps.routing,
+  };
+}

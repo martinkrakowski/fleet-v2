@@ -141,6 +141,29 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
         `No assessment exists for assessmentId '${request.assessmentId}'`,
       );
     }
+    // A replayed request id never runs a second review (§3.5): the recorded receipt answers when reviewer,
+    // kind and head match; any other reuse (a different head included) is request-id-reused. Checked before
+    // the head and identity checks so a reused id always gets that typed code.
+    if (request.requestId !== undefined) {
+      const found = existing.reviewReceipts.find(
+        (receipt) => receipt.requestId === request.requestId,
+      );
+      if (found !== undefined) {
+        if (
+          found.reviewerModel.trim() === request.reviewerModel.trim() &&
+          found.kind === request.kind &&
+          found.candidateHeadSha === request.candidateHeadSha
+        ) {
+          return { outcome: 'reviewed', receipt: found };
+        }
+        return rejectedFor(
+          request,
+          'request-id-reused',
+          'Review request id ' + request.requestId + ' was already used for another review',
+        );
+      }
+    }
+
     if (existing.candidateHeadSha !== request.candidateHeadSha) {
       return rejectedFor(
         request,
@@ -165,28 +188,6 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
         'assessment-mismatch',
         `Assessment '${existing.id}' was implemented on seat '${existing.implementerModel}', not '${request.implementerModel}'`,
       );
-    }
-
-    // A replayed request id never runs a second review (§3.5): the recorded
-    // receipt answers when reviewer, kind and head match the request.
-    if (request.requestId !== undefined) {
-      const found = existing.reviewReceipts.find(
-        (receipt) => receipt.requestId === request.requestId,
-      );
-      if (found !== undefined) {
-        if (
-          found.reviewerModel.trim() === request.reviewerModel.trim() &&
-          found.kind === request.kind &&
-          found.candidateHeadSha === request.candidateHeadSha
-        ) {
-          return { outcome: 'reviewed', receipt: found };
-        }
-        return rejectedFor(
-          request,
-          'request-id-reused',
-          'Review request id ' + request.requestId + ' was already used for another review',
-        );
-      }
     }
 
     if (AssessmentState.create(existing.state).value?.isTerminal()) {

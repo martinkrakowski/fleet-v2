@@ -228,6 +228,20 @@ describe('review kind and request id (PC-1)', () => {
     expect(reviewer.calls).toHaveLength(1);
   });
 
+  it('a reused request id naming a different head is request-id-reused, not assessment-mismatch', async () => {
+    const reviewer = new StubReviewer();
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive: new StubArchive() });
+    await useCase.requestIndependentReview(baseRequest({ kind: 'brief-check', requestId: REQUEST_ID }));
+    const replay = rejectionOf(
+      await useCase.requestIndependentReview(
+        baseRequest({ kind: 'brief-check', requestId: REQUEST_ID, candidateHeadSha: 'b'.repeat(40) }),
+      ),
+    );
+    expect(replay.rejection).toBe('request-id-reused');
+    expect(reviewer.calls).toHaveLength(1);
+  });
+
   it('refuses malformed conductor fields without calling anything', async () => {
     const reviewer = new StubReviewer();
     const repo = new InMemoryAssessmentRepo([sampleRecord()]);

@@ -27,6 +27,7 @@ import {
   AcceptanceAssessmentAdapter,
   AcceptanceEvidenceAdapter,
   ActionAuthorizationAdapter,
+  AgyRunnerAdapter,
   AllowedSeatAdapter,
   AttemptArtifactAdapter,
   AttemptRepositoryAdapter,
@@ -34,6 +35,7 @@ import {
   BriefAuthoringAdapter,
   BriefKnowledgeAdapter,
   CollectAttemptArtifactsUseCase,
+  CommitEditOnlyAttemptUseCase,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
   ExecutionJournalAdapter,
@@ -43,6 +45,7 @@ import {
   ForgeReadAdapter,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
+  LaneDiffCheckAdapter,
   ListUnregisteredProjectsUseCase,
   LocalExecutor,
   OpencodeDbUsageAdapter,
@@ -57,6 +60,7 @@ import {
   RequestAttemptAcceptanceUseCase,
   ReserveExecutionCapacityUseCase,
   RunnerForAttemptAdapter,
+  RunnerSelectorAdapter,
   SshExecutor,
   StopAttemptUseCase,
   WorkOrderRepositoryAdapter,
@@ -74,6 +78,7 @@ import {
   resolveRoleExecutors,
   resolveRunnerCapabilityProfile,
   sha256HexDigest,
+  type AttemptRecord,
   type ExecutionRunnerHost,
   type ExecutorForRecordedHostResult,
   type GhInvocationResult,
@@ -159,7 +164,11 @@ import {
   UpdateProjectProfileUseCase,
   type OwnerQuestionClock,
 } from '@fleet/operator-coordination';
-import { requireValidInstallationModel, type FleetInstallation } from '@fleet/installation';
+import {
+  requireValidInstallationModel,
+  type FleetInstallation,
+  type FleetInstallationModel,
+} from '@fleet/installation';
 
 export interface FleetCliRuntimeOptions {
   /** Directory for file-backed state; every store is in-memory when omitted. */
@@ -584,6 +593,8 @@ export interface FleetCliRuntime {
     readonly prepareBriefPackage: PrepareBriefPackageUseCase;
     readonly reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
     readonly dispatchAttempt: DispatchAttemptUseCase;
+    /** AG-5: the edit-only commit step for a recorded agy edit-only attempt. */
+    readonly commitEditOnlyAttempt: CommitEditOnlyAttemptUseCase;
     readonly reconcileAttempt: ReconcileAttemptUseCase;
     readonly stopAttempt: StopAttemptUseCase;
     readonly collectAttemptArtifacts: CollectAttemptArtifactsUseCase;
@@ -593,6 +604,46 @@ export interface FleetCliRuntime {
     readonly probeProject: ProbeProjectUseCase;
     readonly listUnregisteredProjects: ListUnregisteredProjectsUseCase;
   };
+}
+
+/**
+ * The first lane-runner host whose runner is agy, by installation key order;
+ * undefined when none (AG-5). Dispatch gets one agy runner only: dispatching
+ * across several agy hosts needs the per-reservation runner of H9b/H10.
+ */
+function agyLaneRunnerHostOf(
+  hosts: FleetInstallationModel['hosts'] | undefined,
+): { readonly name: string; readonly mode: 'edit-only' | 'full'; readonly sshAlias?: string } | undefined {
+  if (hosts === undefined) return undefined;
+  for (const [name, host] of Object.entries(hosts)) {
+    if (!host.roles.includes('lane-runner')) continue;
+    if (host.runner?.kind !== 'agy') continue;
+    return {
+      name,
+      mode: host.runner.agyMode,
+      ...(host.transport === 'ssh' && host.sshAlias !== undefined
+        ? { sshAlias: host.sshAlias }
+        : {}),
+    };
+  }
+  return undefined;
+}
+
+/**
+ * The recorded host's agy mode (D7): edit-only commits here; full and opencode
+ * lanes commit themselves. Unknown when the attempt is not recorded on a
+ * current agy lane-runner host.
+ */
+function editOnlyModeOf(
+  attempt: AttemptRecord,
+  hosts: FleetInstallationModel['hosts'] | undefined,
+): 'edit-only' | 'not-edit-only' | 'unknown' {
+  if (attempt.runner?.kind !== 'agy') return 'not-edit-only';
+  const hostName = attempt.runner.hostName?.trim();
+  if (hostName === undefined || hostName === '') return 'unknown';
+  const host = hosts?.[hostName];
+  if (host === undefined || host.runner?.kind !== 'agy') return 'unknown';
+  return host.runner.agyMode === 'edit-only' ? 'edit-only' : 'not-edit-only';
 }
 
 export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCliRuntime {
@@ -612,6 +663,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     ? requireValidInstallationModel(options.installation)
     : undefined;
   const runnerProfile = resolveRunnerCapabilityProfile(installationModel?.hosts);
+  // AG-5: the installation's agy lane-runner host (first by key order), if any.
+  const agyHost = agyLaneRunnerHostOf(installationModel?.hosts);
   const forgeMode = resolveInstallationForgeMode(options?.installation);
   // The installation's selected lane-runner host (v2): its presence routes the
   // runner from the host entry and ignores the routing environment (plan
@@ -1091,11 +1144,18 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // recorded host. One adapter per host name is built and cached from the
   // installation's hosts with the same options as the single runner above;
   // legacy attempts (no recorded hostName) keep this single runner.
+  // AG-5: the executor that runs `bin/agy-run` on a named agy lane-runner host,
+  // for attempts recorded on that host (reconcile, stop, collect, edit-only commit).
+  const agyExecutorForHost = (name: string) => {
+    const resolved = executorForHostName(name);
+    return resolved.ok ? resolved.executor : null;
+  };
   const runnerForAttempt = new RunnerForAttemptAdapter({
     hosts: options?.installation?.hosts,
     legacyRunner: runner,
     ocmRunBin,
     executor: roleExecutors.orchestrator,
+    agyExecutorForHost,
     runSubprocess: options?.runSubprocess,
     ...(runnerProfile !== undefined ? { capabilities: runnerProfile.capabilities } : {}),
     ...(runnerProfile !== undefined ? { runnerTransport: runnerProfile.transport } : {}),
@@ -1103,6 +1163,42 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       (await attemptRepository.findAttemptById(attemptId))?.worktreePath ?? null,
     resolveAttempt: async (attemptId) =>
       await attemptRepository.findAttemptById(attemptId),
+  });
+  // AG-5: the agy runner of the installation's agy lane-runner host. Its
+  // executor runs `bin/agy-run` on that host; its mode is the host's declared
+  // agyMode (D7). Absent host or executor: no agy runner, and an agy
+  // reservation is refused as runner-not-available.
+  const agyExecutor = agyHost === undefined ? undefined : executorForHostName(agyHost.name);
+  const agyProfile =
+    agyHost === undefined
+      ? undefined
+      : resolveRunnerCapabilityProfile({
+          [agyHost.name]: installationModel!.hosts[agyHost.name],
+        });
+  const agyRunner =
+    agyHost !== undefined && agyExecutor !== undefined && agyExecutor.ok
+      ? new AgyRunnerAdapter({
+          executor: agyExecutor.executor,
+          hostName: agyHost.name,
+          ...(agyHost.sshAlias !== undefined ? { sshAlias: agyHost.sshAlias } : {}),
+          mode: agyHost.mode,
+          ...(agyProfile !== undefined
+            ? {
+                capabilities: agyProfile.capabilities,
+                transport: agyProfile.transport,
+              }
+            : {}),
+          resolveWorktreePath: async (attemptId) =>
+            (await attemptRepository.findAttemptById(attemptId))?.worktreePath ?? null,
+          resolveAttempt: async (attemptId) => await attemptRepository.findAttemptById(attemptId),
+        })
+      : undefined;
+  // AG-5: the selector implements both runner kinds for dispatch. The single
+  // agy runner is handed to dispatch; a second agy host is never dispatched to
+  // (its recorded attempts still resolve through runnerForAttempt per host).
+  const runnerSelector = new RunnerSelectorAdapter({
+    hosts: installationModel?.hosts,
+    implementedRunnerKinds: agyRunner === undefined ? ['opencode'] : ['opencode', 'agy'],
   });
   const attemptArtifact = new AttemptArtifactAdapter({
     executor: roleExecutors.worktree,
@@ -1626,10 +1722,24 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       journal: executionJournal,
       workspace,
       runner,
+      runnerSelector,
+      ...(agyRunner !== undefined ? { agyRunner } : {}),
       observation: executionObservation,
       artifactPort: attemptArtifact,
       computeDigest: sha256HexDigest,
       allowedSeats,
+    }),
+    commitEditOnlyAttempt: new CommitEditOnlyAttemptUseCase({
+      attemptRepo: attemptRepository,
+      journal: executionJournal,
+      workspace,
+      artifactPort: attemptArtifact,
+      laneDiffCheckFor: (attempt) => {
+        const resolved = executorForHost.executorForRecordedHost(attempt.runner ?? null);
+        return resolved.ok ? new LaneDiffCheckAdapter(resolved.executor) : null;
+      },
+      editOnlyModeOf: (attempt) => editOnlyModeOf(attempt, installationModel?.hosts),
+      computeDigest: sha256HexDigest,
     }),
     reconcileAttempt: new ReconcileAttemptUseCase({
       attemptRepo: attemptRepository,

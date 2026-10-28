@@ -26,6 +26,7 @@ export * from "./RegisterOrchestratorSessionPort.in-port.js";
 export * from "./RegisterProjectProfilePort.in-port.js";
 export * from "./RequestScopedDecisionPort.in-port.js";
 export * from "./ResolveActionAuthorizationPort.in-port.js";
+export * from "./ResolveOwnerItemPort.in-port.js";
 export * from "./RetireOrchestratorSessionPort.in-port.js";
 export * from "./RetireProjectProfilePort.in-port.js";
 export * from "./SendFleetRelayPort.in-port.js";

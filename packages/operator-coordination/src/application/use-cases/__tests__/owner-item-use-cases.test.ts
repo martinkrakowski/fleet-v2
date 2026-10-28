@@ -520,3 +520,45 @@ describe('ListOwnerItemsUseCase', () => {
     );
   });
 });
+
+describe('WB3a-3-2 required regression: record after a domain close', () => {
+  it('returns exists with revision 2 when the same merge body is recorded after the stored item is closed', async () => {
+    const repo = new OwnerItemRepositoryAdapter();
+    const useCase = new RecordOwnerItemUseCase({ itemRepo: repo, clock: clock(), ids: ids() });
+
+    const first = await useCase.recordOwnerItem(MERGE_BODY, 'orch-example-1');
+    expect(first.outcome).toBe('recorded');
+
+    const stored = await repo.get('oi-example-1');
+    expect(stored).not.toBeNull();
+    if (stored === null) {
+      return;
+    }
+    const loaded = OwnerItem.create(stored.item);
+    expect(loaded.success).toBe(true);
+    if (!loaded.success) {
+      return;
+    }
+    const merged = loaded.value.observePullRequest({
+      repository: 'example-org/example-repo',
+      number: 251,
+      state: 'merged',
+      source: 'merge-record',
+      observedAtIso: NOW_ISO,
+    });
+    expect(merged.success).toBe(true);
+    if (!merged.success) {
+      return;
+    }
+    await repo.save(merged.value.toRecord(), stored.revision);
+
+    const second = await useCase.recordOwnerItem(MERGE_BODY, 'orch-example-2');
+    expect(second).toEqual({
+      outcome: 'exists',
+      item: expect.objectContaining({ itemId: 'oi-example-1', state: 'closed' }),
+      revision: 2,
+    });
+
+    expect(await repo.list()).toHaveLength(1);
+  });
+});

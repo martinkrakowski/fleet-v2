@@ -28,6 +28,7 @@ export * from "./RegisterOrchestratorSessionUseCase.use-case.js";
 export * from "./RegisterProjectProfileUseCase.use-case.js";
 export * from "./RequestScopedDecisionUseCase.use-case.js";
 export * from "./ResolveActionAuthorizationUseCase.use-case.js";
+export * from "./ResolveOwnerItemUseCase.use-case.js";
 export * from "./RetireOrchestratorSessionUseCase.use-case.js";
 export * from "./RetireProjectProfileUseCase.use-case.js";
 export * from "./SendFleetRelayUseCase.use-case.js";

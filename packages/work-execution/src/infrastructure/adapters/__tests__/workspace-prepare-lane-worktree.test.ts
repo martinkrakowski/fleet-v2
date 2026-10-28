@@ -39,7 +39,7 @@ const ADD_ARGV = [
 ];
 const PATH_PROBE_ARGV = ['test', '-e', WORKTREE];
 const BRANCH_PROBE_ARGV = ['git', '-C', CLONE, 'rev-parse', '--verify', '--quiet', `refs/heads/${BRANCH}`];
-const HEAD_ARGV = ['git', '-C', WORKTREE, 'rev-parse', '--show-toplevel', '--abbrev-ref', 'HEAD', 'HEAD'];
+const HEAD_ARGV = ['git', '-C', WORKTREE, 'rev-parse', '--show-toplevel', 'HEAD', '--abbrev-ref', 'HEAD'];
 const STATUS_ARGV = ['git', '-C', WORKTREE, 'status', '--porcelain', '--untracked-files=all'];
 const LIST_ARGV = ['git', '-C', CLONE, 'worktree', 'list', '--porcelain'];
 
@@ -86,7 +86,8 @@ const freshPathAnswers: Record<string, CommandRunResult> = {
 function preparedAnswers(branch: string, statusStdout: string): Record<string, CommandRunResult> {
   return {
     [PATH_PROBE_ARGV.join(' ')]: ok(),
-    [HEAD_ARGV.join(' ')]: ok(WORKTREE + '\n' + branch + '\n' + BASE + '\n'),
+    // The order real git prints for HEAD_ARGV (checked against git 2.x): toplevel, commit, branch.
+    [HEAD_ARGV.join(' ')]: ok(WORKTREE + '\n' + BASE + '\n' + branch + '\n'),
     [STATUS_ARGV.join(' ')]: ok(statusStdout),
     [LIST_ARGV.join(' ')]: ok('worktree ' + CLONE + '\n\nworktree ' + WORKTREE + '\n'),
   };

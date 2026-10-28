@@ -637,7 +637,9 @@ export class WorkspaceAdapter implements WorkspacePort {
   ): Promise<PrepareLaneWorktreeResult> {
     const [headRun, statusRun, listRun] = await Promise.all([
       executor.run(
-        ['git', '-C', worktreePath, 'rev-parse', '--show-toplevel', '--abbrev-ref', 'HEAD', 'HEAD'],
+        // --abbrev-ref applies to every later argument, so the commit is asked for before it:
+        // stdout is the toplevel, the full HEAD commit, then the branch name.
+        ['git', '-C', worktreePath, 'rev-parse', '--show-toplevel', 'HEAD', '--abbrev-ref', 'HEAD'],
         { timeoutMs: GIT_TIMEOUT_MS },
       ),
       executor.run(
@@ -659,7 +661,7 @@ export class WorkspaceAdapter implements WorkspacePort {
       .split('\n')
       .map((line) => line.trim())
       .filter((line) => line !== '');
-    const [toplevel, checkedBranch, head] = revParseLines;
+    const [toplevel, head, checkedBranch] = revParseLines;
     const listedWorktrees = listRun.stdout
       .split('\n')
       .filter((line) => line.startsWith('worktree '))

@@ -18,14 +18,33 @@
  * dispatches real lanes — it refuses unless
  * `policy.conductor.enabled` is on, needs the explicit `--live` flag and a
  * durable state directory, and may be run only with the owner's explicit
- * authority. All I/O here goes through the injected `CliIo`.
+ * authority. `conductor run --dry-run` (K7-8) copies the state stores into a
+ * scratch directory and drives them with recording fakes, printing what the
+ * driver would do; it acts on nothing and never touches the real state. All
+ * I/O here goes through the injected `CliIo`.
  */
 
 import { readFileSync } from 'node:fs';
+import { mkdtemp, copyFile as fsCopyFile, rm as fsRm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import {
+  parseLaneRunKey,
+  AttemptRepositoryAdapter,
+  ConductorDriverLeaseAdapter,
+  ConductorHaltAdapter,
+  ExecutionJournalAdapter,
+  LaneRunJournalAdapter,
+  LaneRunRepositoryAdapter,
+  WorkOrderRepositoryAdapter,
+  type LaneRunJournalEntryRecord,
+  type RunConductorPassResult,
+} from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
 import type { CliIo } from './index.js';
-import { buildLiveConductorDriver, type ConductorDriver } from './conductor-wiring.js';
+import { buildLiveConductorDriver, buildDryRunConductorDriver, type ConductorDriver, type DryRunStores } from './conductor-wiring.js';
 
 export interface ConductorCliOptions {
   /** Clock override for tests; production uses the system clock. */
@@ -42,6 +61,8 @@ export interface ConductorCliOptions {
     mode: 'live' | 'dry-run',
     options: { readonly maxActiveRuns: number },
   ) => ConductorDriver;
+  /** Test seam for the dry-run's scratch copy (production uses fs.promises.copyFile). */
+  readonly copyFile?: (source: string, destination: string) => Promise<void>;
 }
 
 export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
@@ -50,7 +71,7 @@ export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
        fleet-v2 conductor resume <runId> [--revision <n>]
        fleet-v2 conductor start --brief-request <file.json> --tier 1|2 [--run-id <id> --attempt-id <id>]
        fleet-v2 conductor start --abandon --run-id <id> --attempt-id <id>
-       fleet-v2 conductor run --live [--once] [--max-active-runs <n>]
+       fleet-v2 conductor run --live|--dry-run [--once] [--max-active-runs <n>]
 
 Read-only status of one lane run (or every run) with its projected state,
 the halt marker and the driver lease; a kill-switch halt the driver checks
@@ -62,9 +83,13 @@ never takes a run lease.
 
 conductor run --live dispatches real lanes. Run it only with the owner's
 explicit authority; it also needs policy.conductor.enabled and a state
-directory. conductor start reserves capacity and prepares a worktree on a
-lane host; it needs policy.conductor.enabled and a state directory, and
-dispatches nothing. start --abandon works while the conductor is disabled.
+directory. conductor run --dry-run copies the state stores into a scratch
+directory and drives them with recording fakes, printing what the driver
+would do; it reaches no host, needs neither --live nor
+policy.conductor.enabled, and never writes the real state. conductor start
+reserves capacity and prepares a worktree on a lane host; it needs
+policy.conductor.enabled and a state directory, and dispatches nothing.
+start --abandon works while the conductor is disabled.
 
 Each subcommand prints one JSON document on stdout (conductor run prints one
 JSON line per pass).
@@ -565,9 +590,7 @@ async function runCommand(
     return 2;
   }
   if (flags.dryRun) {
-    // K7-8 defines the dry-run driver; until then it is refused, never guessed.
-    io.stderr(`--dry-run is not built yet\n${CONDUCTOR_HELP}\n`);
-    return 2;
+    return await dryRunCommand(io, runtime, options, flags);
   }
   // An in-memory driver would dispatch with no durable record.
   if (options.stateDir === undefined) {
@@ -585,12 +608,56 @@ async function runCommand(
     return 1;
   }
   const holderId = 'driver-' + runtime.conductor.newUlid();
-  const sleep = options.sleep ?? defaultSleep;
-  // Production registers process signal handlers for `run` only and removes
-  // them on exit; tests inject `stopSignal` instead.
+  const seenAttention = new Set<string>();
+  return await pollConductorPasses({
+    driver,
+    holderId,
+    nowIso: () => nowIsoOf(options),
+    sleep: options.sleep ?? defaultSleep,
+    stopSignal: options.stopSignal,
+    once: flags.once,
+    eachPass: async (pass, result) => {
+      io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
+      if (result.outcome === 'refused') {
+        return { stop: true, exitCode: 1 };
+      }
+      for (const item of result.attention) {
+        const key = `${item.runId}:${item.kind}`;
+        if (seenAttention.has(key)) {
+          continue;
+        }
+        seenAttention.add(key);
+        io.stdout(`${JSON.stringify({ attention: item.kind, runId: item.runId })}\n`);
+      }
+      return { stop: false };
+    },
+  });
+}
+
+/** The outcome of one pass in the shared poll loop: stop, and the exit code to carry. */
+interface PollPassOutcome {
+  readonly stop: boolean;
+  readonly exitCode?: number;
+}
+
+/**
+ * The shared poll loop of `conductor run`: one pass at a time under the
+ * driver lease, printing one line per pass through `eachPass`, polling with
+ * back-off from 30 seconds to 2 minutes, releasing its leases on SIGINT or
+ * SIGTERM. `eachPass` returns whether the loop should stop and an exit code.
+ */
+async function pollConductorPasses(options: {
+  readonly driver: ConductorDriver;
+  readonly holderId: string;
+  readonly nowIso: () => string;
+  readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+  readonly stopSignal?: AbortSignal;
+  readonly once: boolean;
+  readonly eachPass: (pass: number, result: RunConductorPassResult) => Promise<PollPassOutcome>;
+}): Promise<number> {
   const controller = new AbortController();
   const signal = options.stopSignal ?? controller.signal;
-  const onSignal = () => {
+  const onSignal = (): void => {
     controller.abort();
   };
   let signalHandlersBound = false;
@@ -601,40 +668,191 @@ async function runCommand(
   }
   let exitCode = 0;
   let previousDelay: number | null = null;
-  const seenAttention = new Set<string>();
   try {
     for (let pass = 1; ; pass += 1) {
-      const result = await driver.pass.runPass({ holderId, nowIso: nowIsoOf(options) });
-      io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
-      if (result.outcome === 'refused') {
-        exitCode = 1;
+      const result = await options.driver.pass.runPass({
+        holderId: options.holderId,
+        nowIso: options.nowIso(),
+      });
+      const outcome = await options.eachPass(pass, result);
+      if (outcome.exitCode !== undefined) {
+        exitCode = outcome.exitCode;
+      }
+      if (outcome.stop) {
         break;
       }
-      for (const item of result.attention) {
-        const key = `${item.runId}:${item.kind}`;
-        if (seenAttention.has(key)) {
-          continue;
-        }
-        seenAttention.add(key);
-        io.stdout(`${JSON.stringify({ attention: item.kind, runId: item.runId })}\n`);
-      }
-      if (flags.once) {
+      if (options.once) {
         break;
       }
-      previousDelay = nextPollDelayMs(previousDelay, result.progressed);
-      await sleep(previousDelay, signal);
+      if (result.outcome !== 'refused') {
+        previousDelay = nextPollDelayMs(previousDelay, result.progressed);
+      }
+      await options.sleep(previousDelay ?? MIN_POLL_MS, signal);
       if (signal.aborted) {
         break;
       }
     }
   } finally {
-    await driver.pass.releaseLeases({ holderId, nowIso: nowIsoOf(options) });
+    await options.driver.pass.releaseLeases({
+      holderId: options.holderId,
+      nowIso: options.nowIso(),
+    });
     if (signalHandlersBound) {
       process.removeListener('SIGINT', onSignal);
       process.removeListener('SIGTERM', onSignal);
     }
   }
   return exitCode;
+}
+
+/** The state files a dry-run copies into its scratch directory; a missing file is skipped. */
+const DRY_RUN_STORE_FILES = [
+  'work-orders.json',
+  'attempts.json',
+  'journal.json',
+  'reservations.json',
+  'lane-runs.json',
+  'run-journal.json',
+  'conductor-driver-lease.json',
+  'conductor-halt.json',
+] as const;
+
+/** True when an error is a missing source file (skipped, never a failure). */
+function isEnoent(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: string }).code === 'ENOENT'
+  );
+}
+
+/** The scratch adapters of a dry-run: on `scratchDir`, or in-memory without one. */
+function storesForScratch(scratchDir: string | null): DryRunStores {
+  const stateDir = scratchDir ?? undefined;
+  return {
+    runRepo: new LaneRunRepositoryAdapter({ stateDir }),
+    runJournal: new LaneRunJournalAdapter({ stateDir }),
+    attemptRepo: new AttemptRepositoryAdapter({ stateDir }),
+    executionJournal: new ExecutionJournalAdapter({ stateDir }),
+    workOrderRepo: new WorkOrderRepositoryAdapter({ stateDir }),
+    driverLease: new ConductorDriverLeaseAdapter({ stateDir }),
+    halt: new ConductorHaltAdapter({ stateDir }),
+  };
+}
+
+/** Every run-journal entry of the scratch stores, in deterministic order. */
+async function scratchJournalEntries(stores: DryRunStores): Promise<readonly LaneRunJournalEntryRecord[]> {
+  const runs = await stores.runRepo.list();
+  const entries: LaneRunJournalEntryRecord[] = [];
+  for (const record of runs) {
+    entries.push(...(await stores.runJournal.listForRun(record.runId)));
+  }
+  return entries.sort(
+    (left, right) =>
+      left.recordedAtIso.localeCompare(right.recordedAtIso) ||
+      left.entryId.localeCompare(right.entryId),
+  );
+}
+
+/**
+ * Print the entries a pass appended: each intent as a `would <action>` line
+ * with its result's outcome and reason code, and each conduct entry as an
+ * `entered` line. The output never prints a path.
+ */
+function printDryRunAppendedLines(io: CliIo, appended: readonly LaneRunJournalEntryRecord[]): void {
+  const resultsByKey = new Map<string, LaneRunJournalEntryRecord>();
+  for (const entry of appended) {
+    if (entry.kind === 'result' && entry.key !== null && !resultsByKey.has(entry.key)) {
+      resultsByKey.set(entry.key, entry);
+    }
+  }
+  for (const entry of appended) {
+    if (entry.kind === 'intent' && entry.key !== null) {
+      const parsed = parseLaneRunKey(entry.key);
+      const step = parsed !== null && parsed.kind === 'step' ? parsed.step : null;
+      const result = resultsByKey.get(entry.key);
+      io.stdout(
+        `${JSON.stringify({
+          would: step,
+          key: entry.key,
+          result: result?.outcome ?? null,
+          reasonCode: result?.reasonCode ?? null,
+        })}\n`,
+      );
+    } else if (entry.kind === 'conduct') {
+      io.stdout(`${JSON.stringify({ entered: entry.state, runId: entry.runId })}\n`);
+    }
+  }
+}
+
+/**
+ * `conductor run --dry-run` (K7-8): copy the state stores into a fresh scratch
+ * directory and drive them with recording fakes, printing what the driver
+ * would do. It acts on nothing: no `policy.conductor.enabled` check, no
+ * `--live`, and the real state files are never opened for writing. Without a
+ * state directory it runs over empty in-memory stores. The scratch directory
+ * is removed before returning, and the output never prints a path.
+ */
+async function dryRunCommand(
+  io: CliIo,
+  runtime: FleetCliRuntime,
+  options: ConductorCliOptions,
+  flags: RunFlags,
+): Promise<number> {
+  let scratchDir: string | null = null;
+  try {
+    if (options.stateDir !== undefined) {
+      scratchDir = await mkdtemp(join(tmpdir(), 'fleet-v2-conductor-dry-run-'));
+      const copyFile = options.copyFile ?? fsCopyFile;
+      for (const file of DRY_RUN_STORE_FILES) {
+        const source = join(options.stateDir, file);
+        try {
+          await copyFile(source, join(scratchDir, file));
+        } catch (error) {
+          if (isEnoent(error)) {
+            continue;
+          }
+          io.stderr(`conductor run --dry-run could not copy the state stores\n${CONDUCTOR_HELP}\n`);
+          return 1;
+        }
+      }
+    }
+    const stores = storesForScratch(scratchDir);
+    const driver = buildDryRunConductorDriver(stores, {
+      maxActiveRuns: flags.maxActiveRuns,
+      nowIso: () => nowIsoOf(options),
+    });
+    const holderId = 'driver-' + runtime.conductor.newUlid();
+    let currentEntryIds = new Set<string>();
+    const refreshEntryIds = async (): Promise<void> => {
+      const entries = await scratchJournalEntries(stores);
+      currentEntryIds = new Set(entries.map((entry) => entry.entryId));
+    };
+    await refreshEntryIds();
+    return await pollConductorPasses({
+      driver,
+      holderId,
+      nowIso: () => nowIsoOf(options),
+      sleep: options.sleep ?? defaultSleep,
+      stopSignal: options.stopSignal,
+      once: flags.once,
+      eachPass: async (pass, result) => {
+        const after = await scratchJournalEntries(stores);
+        const appended = after.filter((entry) => !currentEntryIds.has(entry.entryId));
+        printDryRunAppendedLines(io, appended);
+        currentEntryIds = new Set(after.map((entry) => entry.entryId));
+        io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
+        return {
+          stop: result.outcome === 'refused',
+          exitCode: result.outcome === 'refused' ? 1 : undefined,
+        };
+      },
+    });
+  } finally {
+    if (scratchDir !== null) {
+      await fsRm(scratchDir, { recursive: true, force: true });
+    }
+  }
 }
 
 /** `fleet-v2 conductor <subcommand>` dispatch. */

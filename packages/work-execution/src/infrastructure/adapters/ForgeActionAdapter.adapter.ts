@@ -289,7 +289,7 @@ export class ForgeActionAdapter implements ForgeActionPort {
     let postRead: ReadPullRequestResult;
     try {
       postRead = await reader.readPullRequest(readRequest);
-    } catch (error) {
+    } catch {
       return {
         outcome: 'ambiguous',
         reason: `After the push step for branch ${request.branchName}, its pull request could not be read`,

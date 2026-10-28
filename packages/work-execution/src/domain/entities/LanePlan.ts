@@ -3,7 +3,6 @@
  * LanePlan is a plan's machine workbook as a stored, versioned aggregate
  * (work-board plan §3.2, §5): keyed (projectId, planId), carrying the plan's
  * revision, the import digest, its lanes as `PlannedLane` children with their
-import { readExactPlainRecord } from '../plain-record-reads.js';
  * status and former ids as aliases (a dropped lane is kept, never deleted),
  * the plan's decisions and exclusive orders, and the import time. A planned
  * lane grants nothing and owns no path until it is registered as a work
@@ -11,6 +10,7 @@ import { readExactPlainRecord } from '../plain-record-reads.js';
  * secret-shaped input is refused with a fixed message, never echoed.
  */
 
+import { readExactPlainRecord } from '../plain-record-reads.js';
 import {
   CANONICAL_ISO_PATTERN,
   LANE_PLAN_LIMITS,
@@ -224,8 +224,8 @@ export class LanePlan {
         deepFreezeValue(laneRecord);
         return laneRecord;
       })),
-      decisions: deepFreezeValue(decisions),
-      exclusiveOrder: deepFreezeValue(exclusiveOrder),
+      decisions: deepFrozen(decisions),
+      exclusiveOrder: deepFrozen(exclusiveOrder),
       importedAtIso,
     });
     return { success: true, value: new LanePlan(record) };
@@ -329,6 +329,12 @@ function invalid(message: string): LanePlanResult {
 
 function unreadableInputResult(): LanePlanResult {
   return { success: false, error: new Error('LanePlan input could not be read'), code: 'invalid' };
+}
+
+/** Deep-freezes a value and returns it, for use inside a record literal. */
+function deepFrozen<T>(value: T): T {
+  deepFreezeValue(value);
+  return value;
 }
 
 function deepFreezeValue(value: unknown): void {

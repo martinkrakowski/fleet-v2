@@ -294,7 +294,18 @@ async function seed(built: Built): Promise<void> {
 
 describe('AutoMergeAttemptUseCase (AM4a-2)', () => {
   it('reads nothing and writes nothing when the setting is off', async () => {
-    const built = build();
+    const attemptRepo = new AttemptRepositoryAdapter();
+    let findCalls = 0;
+    const spyAttemptRepo: AttemptRepositoryPort = {
+      findAttemptById: async (attemptId: string) => {
+        findCalls += 1;
+        return attemptRepo.findAttemptById(attemptId);
+      },
+      saveAttempt: (record) => attemptRepo.saveAttempt(record),
+      listAttemptsByWorkOrder: (workOrderId) => attemptRepo.listAttemptsByWorkOrder(workOrderId),
+      listAllAttempts: () => attemptRepo.listAllAttempts(),
+    };
+    const built = build({ attemptRepo: spyAttemptRepo });
     built.settings.answer = {
       outcome: 'read',
       enabled: false,
@@ -306,6 +317,7 @@ describe('AutoMergeAttemptUseCase (AM4a-2)', () => {
     await seed(built);
     const result = await built.run();
     expect(result).toEqual({ outcome: 'off' });
+    expect(findCalls).toBe(0);
     expect(built.doors.calls).toBe(0);
     expect(built.gate.calls).toBe(0);
     expect(built.acceptance.calls).toBe(0);
@@ -366,6 +378,7 @@ describe('AutoMergeAttemptUseCase (AM4a-2)', () => {
         findAttemptById: () => Promise.reject(new Error('store unavailable')),
       } as unknown as AttemptRepositoryPort,
     });
+    // Records are unreadable before the work order is known, so no notice can address a project: route stays none despite the §4 attention rule.
     const throwingResult = await throwing.run();
     expect(throwingResult).toMatchObject({ outcome: 'not-merged', reason: 'records-unreadable', route: 'none' });
     expect(throwing.routing.calls).toHaveLength(0);
@@ -423,6 +436,64 @@ describe('AutoMergeAttemptUseCase (AM4a-2)', () => {
     const attemptedResult = await attempted.run();
     expect(attemptedResult).toMatchObject({ outcome: 'not-merged', reason: 'already-attempted', route: 'none' });
     expect(attempted.routing.calls).toHaveLength(0);
+  });
+
+  it('suspends when another forge action of the work order recorded an intent with no outcome', async () => {
+    const built = build();
+    await seed(built);
+    await built.attemptRepo.saveAttempt(makeAttempt({ id: 'attempt-example-2', sessionId: 'session-example-2' }));
+    await built.journal.appendJournalEntry(
+      forgeEntry({ id: 'forge:auto-merge:attempt-example-2:' + OTHER_HEAD + ':intent-recorded:1', attemptId: 'attempt-example-2' }),
+    );
+    const result = await built.run();
+    expect(result).toMatchObject({ outcome: 'not-merged', reason: 'forge-suspended', route: 'attention' });
+    expect(built.gate.calls).toBe(0);
+    expect(built.acceptance.calls).toBe(0);
+  });
+
+  it('suspends when another forge action completed a merge the work order did not record', async () => {
+    const built = build();
+    await seed(built);
+    await built.attemptRepo.saveAttempt(makeAttempt({ id: 'attempt-example-2', sessionId: 'session-example-2' }));
+    await built.journal.appendJournalEntry(
+      forgeEntry({
+        id: 'forge:auto-merge:attempt-example-2:' + OTHER_HEAD + ':completed:2',
+        attemptId: 'attempt-example-2',
+        status: 'completed',
+      }),
+    );
+    const result = await built.run();
+    expect(result).toMatchObject({ outcome: 'not-merged', reason: 'forge-suspended', route: 'attention' });
+    expect(built.gate.calls).toBe(0);
+    expect(built.acceptance.calls).toBe(0);
+  });
+
+  it('proceeds when a forge action recorded an intent and a refusal', async () => {
+    const built = build();
+    await seed(built);
+    await built.attemptRepo.saveAttempt(makeAttempt({ id: 'attempt-example-2', sessionId: 'session-example-2' }));
+    await built.journal.appendJournalEntry(
+      forgeEntry({ id: 'forge:auto-merge:attempt-example-2:' + OTHER_HEAD + ':intent-recorded:1', attemptId: 'attempt-example-2' }),
+    );
+    await built.journal.appendJournalEntry(
+      forgeEntry({ id: 'forge:auto-merge:attempt-example-2:' + OTHER_HEAD + ':refused:2', attemptId: 'attempt-example-2', status: 'refused' }),
+    );
+    const result = await built.run();
+    expect(result).toMatchObject({ outcome: 'not-merged', reason: 'merge-not-wired' });
+    expect(built.gate.calls).toBe(1);
+    expect(built.acceptance.calls).toBe(1);
+  });
+
+  it('treats an unparseable forge entry id as unreadable forge history', async () => {
+    const built = build();
+    await seed(built);
+    await built.attemptRepo.saveAttempt(makeAttempt({ id: 'attempt-example-2', sessionId: 'session-example-2' }));
+    await built.journal.appendJournalEntry(
+      forgeEntry({ id: 'forge:unparseable', attemptId: 'attempt-example-2' }),
+    );
+    const result = await built.run();
+    expect(result).toMatchObject({ outcome: 'not-merged', reason: 'forge-history-unreadable', route: 'attention' });
+    expect(built.gate.calls).toBe(0);
   });
 
   it('routes named and unreadable doors to attention and never asks acceptance', async () => {
@@ -659,6 +730,21 @@ describe('AutoMergeAttemptUseCase (AM4a-2)', () => {
     await seed(built);
     const result = await built.run();
     expect(result).toMatchObject({ outcome: 'not-merged', reason: 'acceptance-blocked' });
+  });
+
+  it('never accepts an empty or non-string receipt id', async () => {
+    const empty = build();
+    empty.acceptance.result = { outcome: 'accepted', receiptId: '', assessedHeadSha: HEAD };
+    await seed(empty);
+    const emptyResult = await empty.run();
+    // Stale/blocked, never the not-wired reason: an empty receipt is not evidence.
+    expect(emptyResult).toMatchObject({ outcome: 'not-merged', reason: 'acceptance-blocked' });
+
+    const numeric = build();
+    numeric.acceptance.result = { outcome: 'accepted', receiptId: 42 as unknown as string, assessedHeadSha: HEAD };
+    await seed(numeric);
+    const numericResult = await numeric.run();
+    expect(numericResult).toMatchObject({ outcome: 'not-merged', reason: 'acceptance-blocked' });
   });
 
   it('routes an unreadable acceptance answer to attention', async () => {

@@ -50,6 +50,7 @@ import type {
   AttemptRecord,
   WorkOrderRecord,
 } from '../../domain/execution-records.js';
+import type { WorkOrderStateValue } from '../../domain/value-objects/WorkOrderState.vo.js';
 import { resolveWorkOrderRisk } from '../../domain/execution-records.js';
 import { readExactPlainRecord } from '../../domain/plain-record-reads.js';
 import {
@@ -183,8 +184,23 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
       ]);
     }
 
-    // 8. Any ambiguous forge entry suspends auto-merge for the whole work order.
-    const ambiguousCount = entries.filter((entry) => entry.action === 'forge' && entry.status === 'ambiguous').length;
+    // 8. Forge-history accounting for the whole work order (before doors/gate/acceptance).
+    const forgeEntries = entries.filter((entry) => entry.action === 'forge');
+
+    // 8a. This head's own action: one grant per (attempt, head), never a second.
+    // Checked first: a definitive own result wins over any other unaccounted entry.
+    const prefix = autoMergeForgeEntryPrefix(attempt.id, head);
+    const own = forgeEntries.filter((entry) => entry.attemptId === attempt.id && entry.id.startsWith(prefix));
+    const ownHasIntent = own.some((entry) => entry.status === 'intent-recorded');
+    const ownHasResult = own.some(
+      (entry) => entry.status === 'completed' || entry.status === 'refused' || entry.status === 'ambiguous',
+    );
+    if (ownHasIntent && ownHasResult) {
+      return this.notMerged(headCtx, 'already-attempted', 'this head was already tried once');
+    }
+
+    // 8b. Any ambiguous forge entry suspends auto-merge for the whole work order.
+    const ambiguousCount = forgeEntries.filter((entry) => entry.status === 'ambiguous').length;
     if (ambiguousCount > 0) {
       return this.notMerged(
         headCtx,
@@ -194,20 +210,53 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
       );
     }
 
-    // 9. This head's own action: one grant per (attempt, head), never a second.
-    const prefix = autoMergeForgeEntryPrefix(attempt.id, head);
-    const own = entries.filter((entry) => entry.attemptId === attempt.id && entry.id.startsWith(prefix));
-    const hasIntent = own.some((entry) => entry.status === 'intent-recorded');
-    const hasResult = own.some(
-      (entry) => entry.status === 'completed' || entry.status === 'refused' || entry.status === 'ambiguous',
-    );
-    if (hasIntent && hasResult) {
-      return this.notMerged(headCtx, 'already-attempted', 'this head was already tried once');
-    }
-    if (hasIntent) {
+    // 8c. This attempt's own intent with no recorded outcome suspends (today's behaviour).
+    if (ownHasIntent) {
       return this.notMerged(headCtx, 'forge-suspended', 'the merge intent has no recorded outcome', [
         'the merge intent has no recorded outcome',
       ]);
+    }
+
+    // 8d. Group every forge entry by its action id; an id that cannot be parsed
+    // makes the forge history unreadable.
+    const groups = new Map<string, ActionJournalEntryRecord[]>();
+    for (const entry of forgeEntries) {
+      const actionId = parseForgeActionId(entry.id);
+      if (actionId === null) {
+        return this.notMerged(headCtx, 'forge-history-unreadable', 'a forge history entry id could not be read', [
+          'a forge history entry id could not be read',
+        ]);
+      }
+      const group = groups.get(actionId) ?? [];
+      group.push(entry);
+      groups.set(actionId, group);
+    }
+
+    // 8e. A forge action whose intent was recorded but whose outcome is unknown suspends.
+    for (const group of groups.values()) {
+      const groupHasIntent = group.some((entry) => entry.status === 'intent-recorded');
+      const groupHasResult = group.some(
+        (entry) => entry.status === 'completed' || entry.status === 'refused' || entry.status === 'ambiguous',
+      );
+      if (groupHasIntent && !groupHasResult) {
+        return this.notMerged(headCtx, 'forge-suspended', 'a forge action has no recorded outcome', [
+          'a forge action has no recorded outcome',
+        ]);
+      }
+    }
+
+    // 8f. A completed merge the work order does not record suspends: a merge happened
+    // but was not recorded. Step 5 already excluded merged/stopped; the guard keeps
+    // the rule explicit against the full state union.
+    if ((workOrder.state as WorkOrderStateValue) !== 'merged') {
+      for (const group of groups.values()) {
+        const completedMerge = group.some((entry) => entry.status === 'completed' && isCompletedMergeEntry(entry));
+        if (completedMerge) {
+          return this.notMerged(headCtx, 'forge-suspended', 'a merge completed but was not recorded', [
+            'a merge completed but was not recorded',
+          ]);
+        }
+      }
     }
 
     // 10. One-way doors, then risk and forge mode (A4, in the domain's order).
@@ -403,6 +452,32 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
     }
     return { outcome: 'not-merged', reason, route, routeOutcome, detail };
   }
+}
+
+/**
+ * The action id of a forge journal entry: the part of the id between `forge:`
+ * and the trailing `:<status>:<seq>`. Parsed from the right so action ids that
+ * themselves contain `:` still parse; null when the id is not parseable.
+ */
+function parseForgeActionId(id: string): string | null {
+  if (!id.startsWith('forge:')) {
+    return null;
+  }
+  const parts = id.slice('forge:'.length).split(':');
+  if (parts.length < 3) {
+    return null;
+  }
+  return parts.slice(0, parts.length - 2).join(':');
+}
+
+/**
+ * True when a completed forge entry records a merge rather than another forge
+ * action. The executor writes `pull request #<n>` for a push-and-open and no
+ * PR number for a merge; when the kind cannot be told from the entry it is
+ * treated as a merge (fail closed).
+ */
+function isCompletedMergeEntry(entry: ActionJournalEntryRecord): boolean {
+  return typeof entry.detail !== 'string' || !/\bpull request\b/.test(entry.detail);
 }
 
 function emptyContext(deps: AutoMergeAttemptDependencies, attempt?: AttemptRecord): RoutingContext {

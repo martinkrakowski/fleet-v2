@@ -23,7 +23,7 @@ export const AUTO_MERGE_ROUTE_RULE: Readonly<Record<AutoMergeReason, AutoMergeRo
   'invalid-request': 'none',
   'attempt-missing': 'none',
   'work-order-missing': 'none',
-  // An unreadable attempt or work-order record surfaces to the owner, like every other unreadable fact (plan §4).
+  // Routes to attention when the project is known; the work order is unreadable before it is known, so then there is no project id to address and it is otherwise not routable.
   'records-unreadable': 'attention',
   'work-order-closed': 'none',
   'no-head': 'none',

@@ -217,14 +217,32 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       `kind=${request.kind} expectedHeadSha=${request.expectedHeadSha}`,
     );
 
-    const forgeResult = await deps.forgePort.performForgeAction({
-      actionId: request.actionId,
-      attemptId: request.attemptId,
-      workOrderId: request.workOrderId,
-      kind: request.kind,
-      expectedHeadSha: request.expectedHeadSha,
-      branchName: `feat/${workOrder.laneId}`,
-    });
+    let forgeResult: Awaited<ReturnType<typeof deps.forgePort.performForgeAction>>;
+    try {
+      forgeResult = await deps.forgePort.performForgeAction({
+        actionId: request.actionId,
+        attemptId: request.attemptId,
+        workOrderId: request.workOrderId,
+        kind: request.kind,
+        expectedHeadSha: request.expectedHeadSha,
+        branchName: `feat/${workOrder.laneId}`,
+      });
+    } catch (error) {
+      // The intent is durable but the forge outcome was not recorded; journal
+      // the ambiguous outcome before propagating the original forge error.
+      try {
+        await this.appendJournal(
+          deps,
+          request,
+          attempt,
+          'ambiguous',
+          error instanceof Error ? error.message : String(error),
+        );
+      } catch {
+        // A journalling failure must not mask the original forge error.
+      }
+      throw error;
+    }
 
     if (forgeResult.outcome === 'executed') {
       await this.appendJournal(

@@ -473,7 +473,11 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
         'the grant answer was unexpected',
       ]);
     }
-    if (grant.grantId.length === 0 || grant.decisionRevision !== autoMergeDecisionRevision(settings.revision)) {
+    if (
+      typeof grant.grantId !== 'string' ||
+      grant.grantId.trim() === '' ||
+      grant.decisionRevision !== autoMergeDecisionRevision(settings.revision)
+    ) {
       return this.notMerged(ctx, 'grant-revision-mismatch', 'the grant does not name the setting revision', [
         'the grant does not name the setting revision',
       ]);
@@ -487,7 +491,11 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
     } catch {
       reread = { kind: 'unreadable', reason: 'settings port threw' };
     }
-    if (reread.kind !== 'on' || reread.settings.revision !== settings.revision) {
+    if (
+      reread.kind !== 'on' ||
+      reread.settings.revision !== settings.revision ||
+      reread.settings.forgeMode !== settings.forgeMode
+    ) {
       return this.notMerged(ctx, 'setting-changed', 'the auto-merge setting changed after the grant was issued');
     }
 

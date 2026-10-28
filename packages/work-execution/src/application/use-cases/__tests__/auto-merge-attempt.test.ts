@@ -795,6 +795,53 @@ describe('AutoMergeAttemptUseCase (AM4a-2)', () => {
     });
   });
 
+  it('stops with setting-changed before the forge when the re-read forge mode differs', async () => {
+    const firstRead: AutoMergeSettingsAnswer = {
+      outcome: 'read',
+      enabled: true,
+      allowHighRisk: false,
+      onBlocked: 'ask-owner',
+      revision: '0123456789ab',
+      forgeMode: 'github',
+    };
+    const changedRead: AutoMergeSettingsAnswer = {
+      outcome: 'read',
+      enabled: true,
+      allowHighRisk: false,
+      onBlocked: 'ask-owner',
+      revision: '0123456789ab',
+      forgeMode: 'none',
+    };
+    let reads = 0;
+    const settings: AutoMergeSettingsPort = {
+      async readAutoMergeSettings() {
+        reads += 1;
+        return reads === 1 ? firstRead : changedRead;
+      },
+    };
+    const rebuilt = build({ settings });
+    await seed(rebuilt);
+    const result = await rebuilt.run();
+    expect(result).toMatchObject({ outcome: 'not-merged', reason: 'setting-changed' });
+    expect(rebuilt.grant.calls).toBe(1);
+    expect(rebuilt.forge.calls).toBe(0);
+  });
+
+  it('refuses a grant id that is not a non-empty string and never forges', async () => {
+    for (const grantId of [undefined, null, '', 7] as unknown[]) {
+      const built = build();
+      built.grant.answer = {
+        outcome: 'issued',
+        grantId: grantId as string,
+        decisionRevision: 'policy:autoMerge@0123456789ab',
+      };
+      await seed(built);
+      const result = await built.run();
+      expect(result).toMatchObject({ outcome: 'not-merged', reason: 'grant-revision-mismatch' });
+      expect(built.forge.calls).toBe(0);
+    }
+  });
+
   it('keeps not-merged when routing is unwired or fails, and answers exists on a repeat key', async () => {
     const unwired = build({ routing: undefined });
     unwired.gate.result = { verdict: 'failed', reason: 'a predicate failed' };

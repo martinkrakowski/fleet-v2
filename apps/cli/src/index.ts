@@ -1966,7 +1966,7 @@ Commands:
   projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
   state check|restore
-  conductor status|halt|stop|resume
+  conductor status|halt|stop|resume|start|run
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept

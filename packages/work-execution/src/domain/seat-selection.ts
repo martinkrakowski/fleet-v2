@@ -252,6 +252,117 @@ export function selectReviewSeat(input: {
   return { ok: false, reason: 'Seat plan exhausted for role review: ' + blocks.join('; ') };
 }
 
+/**
+ * Every model that implemented the lane (plan §3.5.6): ran, else bound. Fails
+ * closed on an attempt with neither.
+ */
+export function implementerModelsOf(
+  attempts: readonly AttemptRecord[],
+): { readonly ok: true; readonly models: readonly string[] } | { readonly ok: false; readonly attemptId: string } {
+  const models: string[] = [];
+  const seen = new Set<string>();
+  for (const attempt of attempts) {
+    const model = historyEntryOf(attempt).model;
+    const trimmed = (model ?? '').trim();
+    if (trimmed.length === 0) {
+      return { ok: false, attemptId: attempt.id };
+    }
+    if (!seen.has(trimmed)) {
+      seen.add(trimmed);
+      models.push(trimmed);
+    }
+  }
+  return { ok: true, models };
+}
+
+export type PreMergeSeatSelectionResult =
+  | { readonly ok: true; readonly seatIndex: number; readonly seat: SeatPlanSeat }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Pick the pre-merge (Tier 2) review seat from the installation's plain
+ * `chains['high-risk-reviewer']` chain (plan §3.5.1, D8), in owner order. A
+ * seat that shares a model family with any model that implemented the lane —
+ * first pass or fix round, including an agy round whose runner is null — is
+ * never selected.
+ */
+export function selectPreMergeSeat(input: {
+  readonly seats: readonly SeatPlanSeat[];
+  readonly attempts: readonly AttemptRecord[];
+  readonly sameFamily: SameModelFamily;
+  readonly unhealthySeatIds?: readonly string[];
+  readonly unavailable?: ReadonlyMap<string, SeatUnavailability>;
+  readonly rotationStart?: number;
+}): PreMergeSeatSelectionResult {
+  if (input.seats.length === 0) {
+    return { ok: false, reason: 'No pre-merge seats' };
+  }
+  const models = implementerModelsOf(input.attempts);
+  if (!models.ok) {
+    return { ok: false, reason: 'Implementer model unknown for attempt ' + models.attemptId };
+  }
+  const unhealthy = new Set(input.unhealthySeatIds ?? []);
+  const unavailable = input.unavailable ?? new Map<string, SeatUnavailability>();
+  if (isSafeRotationStart(input.rotationStart)) {
+    const eligible = eligibleSeatsForRotation(input.seats, (seat) =>
+      isPreMergeSeatBlocked(seat, unhealthy, unavailable, models.models, input.sameFamily),
+    );
+    if (eligible.length > 0) {
+      const chosen = eligible[input.rotationStart % eligible.length];
+      return { ok: true, seatIndex: chosen.index, seat: chosen.seat };
+    }
+  }
+  const blocks: string[] = [];
+  for (const [seatIndex, seat] of input.seats.entries()) {
+    const block = preMergeSeatBlock(seat, unhealthy, unavailable, models.models, input.sameFamily);
+    if (block === null) {
+      return { ok: true, seatIndex, seat };
+    }
+    blocks.push(block);
+  }
+  return { ok: false, reason: 'Pre-merge seats exhausted: ' + blocks.join('; ') };
+}
+
+/** Why a pre-merge chain seat cannot be selected now, or null when it can. */
+function preMergeSeatBlock(
+  seat: SeatPlanSeat,
+  unhealthy: ReadonlySet<string>,
+  unavailable: ReadonlyMap<string, SeatUnavailability>,
+  implementerModels: readonly string[],
+  sameFamily: SameModelFamily,
+): string | null {
+  if (unhealthy.has(seat.id)) {
+    return seat.id + ': unhealthy';
+  }
+  const availability = unavailable.get(seat.id);
+  if (availability !== undefined) {
+    return seat.id + ': ' + availability.reason;
+  }
+  if (seat.on !== undefined) {
+    return seat.id + ': fallback seats are not used for pre-merge';
+  }
+  const sharedWith = implementerModels.find((model) => sameFamily(seat.model, model));
+  if (sharedWith !== undefined) {
+    return seat.id + ': shares a model family with implementer model ' + sharedWith;
+  }
+  return null;
+}
+
+function isPreMergeSeatBlocked(
+  seat: SeatPlanSeat,
+  unhealthy: ReadonlySet<string>,
+  unavailable: ReadonlyMap<string, SeatUnavailability>,
+  implementerModels: readonly string[],
+  sameFamily: SameModelFamily,
+): boolean {
+  return (
+    unhealthy.has(seat.id) ||
+    unavailable.has(seat.id) ||
+    seat.on !== undefined ||
+    implementerModels.some((model) => sameFamily(seat.model, model))
+  );
+}
+
 type EligibleSeat = { readonly seat: SeatPlanSeat; readonly index: number };
 
 /** A rotation start is trusted only when it is a non-negative safe integer (same rule as stored indexes). */

@@ -575,7 +575,8 @@ describe('runDoctor', () => {
       (line) =>
         line.check !== 'schema-version' &&
         line.check !== 'runner-capabilities' &&
-        line.check !== 'free-tier',
+        line.check !== 'free-tier' &&
+        line.check !== 'auto-merge',
     );
     const unknownLines = lines.filter((line) => line.status === 'UNKNOWN');
     expect(unknownLines).toHaveLength(expectedUnknown.length);
@@ -706,5 +707,60 @@ describe('runDoctor free-tier (FS4)', () => {
       (line) => line.scope === 'installation' && line.check === 'free-tier',
     );
     expect(policyLine?.detail).toBe('on (policy.useFreeSeats true)');
+  });
+});
+
+describe('runDoctor auto-merge line (AM5-2)', () => {
+  /** A loaded result whose raw installation carries the given policy. */
+  function autoMergeResult(
+    policy: Record<string, unknown> | undefined,
+  ): DoctorableInstallation {
+    const model = sampleModel();
+    return {
+      status: 'loaded',
+      file: '/installation/fleet.json',
+      installation:
+        policy === undefined
+          ? { schemaVersion: 2 }
+          : { schemaVersion: 2, policy: policy as never },
+      model,
+      warnings: [],
+    };
+  }
+
+  it('an absent block reports the default policy and says absent means off', async () => {
+    const { probes } = fakeProbes();
+    const lines = await collect(autoMergeResult(undefined), probes);
+
+    const policyLine = lines.find(
+      (line) => line.scope === 'installation' && line.check === 'auto-merge',
+    );
+    expect(policyLine).toMatchObject({
+      subject: 'policy',
+      status: 'PASS',
+      detail:
+        'auto-merge: off, allowHighRisk false, onBlocked ask-owner, revision 0692f17be6e5 (absent; absent means off)',
+    });
+    expect(doctorExitCode(lines)).toBe(0);
+  });
+
+  it('an explicit enabled block reports on with its own revision', async () => {
+    const { probes } = fakeProbes();
+    const lines = await collect(
+      autoMergeResult({
+        autoMerge: { enabled: true, allowHighRisk: false, onBlocked: 'hold' },
+      }),
+      probes,
+    );
+
+    const policyLine = lines.find(
+      (line) => line.scope === 'installation' && line.check === 'auto-merge',
+    );
+    expect(policyLine).toMatchObject({
+      subject: 'policy',
+      status: 'PASS',
+      detail:
+        'auto-merge: on, allowHighRisk false, onBlocked hold, revision 1cbf028644d3',
+    });
   });
 });

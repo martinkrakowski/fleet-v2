@@ -5,7 +5,10 @@
  */
 
 import type { EvidenceResultValue } from '../../../domain/value-objects/EvidenceResult.vo.js';
-import type { ReviewFindingRecord } from '../../../domain/evidence-records.js';
+import type {
+  ReviewFindingRecord,
+  ReviewKind,
+} from '../../../domain/evidence-records.js';
 
 export interface RunIndependentReviewRequest {
   readonly attemptId: string;
@@ -13,6 +16,10 @@ export interface RunIndependentReviewRequest {
   readonly implementerModel: string;
   readonly reviewerModel: string;
   readonly diffSummary?: string;
+  /** The review kind for conductor requests; a manual review carries no kind. */
+  readonly kind?: ReviewKind;
+  /** The frozen brief for a brief-check request; only meaningful with `kind`. */
+  readonly briefText?: string;
 }
 
 export type RunIndependentReviewResult =

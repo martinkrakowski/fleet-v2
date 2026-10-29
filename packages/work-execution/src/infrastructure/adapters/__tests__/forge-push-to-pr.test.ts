@@ -58,6 +58,7 @@ function pr(number: number, state: PullRequestState, headSha: string): ReadPullR
     pullRequest: {
       number,
       state,
+      mergeState: 'clean',
       headSha,
       headRef: `feat/${LANE_ID}`,
       baseRef: 'main',

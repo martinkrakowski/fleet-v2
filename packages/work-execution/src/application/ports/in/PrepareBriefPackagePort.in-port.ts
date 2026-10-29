@@ -118,7 +118,38 @@ export type PrepareBriefPackageResult =
   | { readonly outcome: 'prepared'; readonly prepared: PreparedBriefPackage }
   | { readonly outcome: 'rejected'; readonly reason: string };
 
+/** The acceptance spec as a preview may show it (plan §3.7): no argv element, no path. */
+export interface BriefAcceptancePreview {
+  readonly commitRequired: boolean;
+  readonly diffCheck: boolean;
+  readonly commandCount: number;
+  /** One digest per command, over JSON.stringify(argv), in spec order. */
+  readonly commandDigests: readonly string[];
+}
+
+export interface BriefPackagePreview {
+  readonly attemptId: string;
+  /** The digest a prepare would freeze now (same input, same prose): integrity, not a truth claim. */
+  readonly briefDigest: string;
+  readonly modelAssignment: { readonly model: string; readonly variant: string; readonly seatTool: RunnerKind };
+  /** The frozen seat plan a prepare would write, or null when the request has none. */
+  readonly seatPlan: SeatPlanProps | null;
+  readonly acceptance: BriefAcceptancePreview;
+  readonly prNotesPresent: boolean;
+  readonly selectedKnowledgeVersions: readonly SelectedKnowledgeVersion[];
+}
+
+export type PreviewBriefPackageResult =
+  | { readonly outcome: 'previewed'; readonly preview: BriefPackagePreview }
+  | { readonly outcome: 'rejected'; readonly reason: string };
+
 export interface PrepareBriefPackagePort {
   /** Freeze one brief package and record its digest before any dispatch. */
   prepareBriefPackage(request: PrepareBriefPackageRequest): Promise<PrepareBriefPackageResult>;
+  /**
+   * Validate and compute what a prepare would freeze; writes nothing and
+   * commits no seat. Required on the contract: every implementer provides
+   * it, so a port fake must supply one (e.g. throwing when unused).
+   */
+  previewBriefPackage(request: PrepareBriefPackageRequest): Promise<PreviewBriefPackageResult>;
 }

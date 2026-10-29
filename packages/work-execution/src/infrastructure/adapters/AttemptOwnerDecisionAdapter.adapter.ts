@@ -12,6 +12,35 @@ import type {
   AttemptOwnerDecisionResult,
 } from '../../application/ports/out/AttemptOwnerDecisionPort.out-port.js';
 
+import type { InspectAttemptPort } from '../../application/ports/in/InspectAttemptPort.in-port.js';
+
+/**
+ * The one reading of an attempt's frozen one-way doors that both composition roots (CLI and API) bind: the
+ * attempt record dispatch wrote, never a request body or worktree file. An unwired lookup, a missing attempt or a
+ * record written before the field existed reads as `unknown`.
+ */
+export async function readOwnerDecisionReferencesFromAttempt(
+  lookup: { readonly inspectAttempt?: Pick<InspectAttemptPort, 'inspectAttempt'> },
+  request: ReadAttemptOwnerDecisionRequest,
+): Promise<AttemptOwnerDecisionResult> {
+  const inspectAttempt = lookup.inspectAttempt;
+  if (!inspectAttempt) {
+    return { outcome: 'unknown', reason: 'The work context is not wired for attempt inspection' };
+  }
+  const inspection = await inspectAttempt.inspectAttempt({ attemptId: request.attemptId });
+  if (inspection.outcome !== 'found') {
+    return { outcome: 'unknown', reason: `No attempt is recorded for ${request.attemptId}` };
+  }
+  const recorded = inspection.attempt.ownerDecisionReferences;
+  if (recorded === undefined) {
+    return {
+      outcome: 'unknown',
+      reason: `attempt ${request.attemptId} was recorded before owner decision references were frozen`,
+    };
+  }
+  return { outcome: 'recorded', ownerDecisionReferences: recorded };
+}
+
 export interface AttemptOwnerDecisionDelegate {
   readonly readAttemptOwnerDecisionReferences?: (
     request: ReadAttemptOwnerDecisionRequest,

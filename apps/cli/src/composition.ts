@@ -24,6 +24,9 @@ import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
 import { newUlid } from './ulid.js';
 import { autoMergeSettingsFromLoad } from './auto-merge-settings.js';
+import { composeCoordination } from './composition/coordination.js';
+import { composeKnowledge } from './composition/knowledge.js';
+import { composeEvidence } from './composition/evidence.js';
 
 import {
   AcceptanceAssessmentAdapter,
@@ -60,8 +63,6 @@ import {
   PrepareFixAttemptUseCase,
   ProbeProjectUseCase,
   ProjectProbeAdapter,
-  ProjectProbeRecordAdapter,
-  ProjectProfileReadAdapter,
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
   RequestAttemptAcceptanceUseCase,
@@ -75,10 +76,8 @@ import {
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
   ExecutorForHost,
-  executorForInstallationHost,
   hasRecordedHostName,
   consumptionId,
-  defaultOcmRunPath,
   forgeActionScope,
   isSafeSshHost,
   observationEventKind,
@@ -97,7 +96,6 @@ import {
   type ProjectProfileReadPort,
   type AttemptRecord,
   type ExecutionRunnerHost,
-  type ExecutorForRecordedHostResult,
   type EvaluateAttemptGatePort,
   type ForgeActionDelegate,
   type GhInvocationResult,
@@ -110,12 +108,9 @@ import {
   AssessHeadAcceptanceUseCase,
   assessmentIdForAttempt,
   AttemptOwnerDecisionAdapter,
-  createReviewTransportRouter,
   EvidenceArchiveAdapter,
   EvidenceAssessmentRepositoryAdapter,
-  EvidenceSeatPolicyAdapter,
   ForgeEvidenceAdapter,
-  hasReviewerSeat,
   IndependentReviewAdapter,
   InspectAcceptanceEvidenceUseCase,
   InspectHeadCiStateUseCase,
@@ -131,20 +126,15 @@ import {
 } from '@fleet/evidence-and-acceptance';
 
 import {
-  AdvisedKnowledgeRetrievalAdapter,
   CaptureCompletedAttemptNotesUseCase,
   CheckKnowledgeClaimUseCase,
   ClaimVerificationAdapter,
-  createClaimTriage,
-  createRankingAdvice,
   DecideKnowledgeDispositionUseCase,
   type DecisionReceiptJournalPort,
-  FileDecisionReceiptJournalAdapter,
   KeeperPublicationAdapter,
   KnowledgeEntryRepositoryAdapter,
   KnowledgeRetrievalAdapter,
   ListCandidateClaimsUseCase,
-  NotConfiguredReceiptJournal,
   ProposeBriefContextUseCase,
   PublishAcceptedKeeperUseCase,
   RecordContextSelectionUseCase,
@@ -165,10 +155,8 @@ import {
   DecisionTransportAdapter,
   ExpireOwnerQuestionsUseCase,
   InspectConfiguredCapabilitiesUseCase,
-  IssuePolicyForgeGrantUseCase,
   InspectOutstandingCoordinationUseCase,
   InspectProjectProfileUseCase,
-  InstallationReferenceAdapter,
   ListOwnerQuestionsUseCase,
   ListProjectProfilesUseCase,
   ObservationPublicationAdapter,
@@ -189,8 +177,6 @@ import {
   SendFleetRelayUseCase,
   SyncOneWayOwnerQuestionsUseCase,
   UpdateProjectProfileUseCase,
-  type OwnerQuestionClock,
-  type AttentionClock,
 } from '@fleet/operator-coordination';
 import {
   loadInstallation,
@@ -769,447 +755,36 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const ownerPublicKey =
     options?.ownerPublicKey ?? (process.env.FLEET_OWNER_PUBLIC_KEY?.trim() || undefined);
 
-  // --- operator-coordination -------------------------------------------------
-
-  const projectProfileRepository = new ProjectProfileRepositoryAdapter({ stateDir });
-  const coordinationRequestRepository = new CoordinationRequestRepositoryAdapter({ stateDir });
-  // Owner-recorded decision answers, one `<requestId>.json` per request. An
-  // absent or grantless answer stays `awaiting-decision`; nothing is upgraded.
-  const decisionTransport = new DecisionTransportAdapter({
-    decisionsDir: stateDir === undefined ? undefined : join(stateDir, 'decisions'),
-    ownerPublicKey,
-  });
-  const observationPublication = new ObservationPublicationAdapter({
-    outboxDir: stateDir === undefined ? undefined : join(stateDir, 'observation-outbox'),
-  });
-  const relayTransport = new RelayTransportAdapter({
-    outboxDir: stateDir === undefined ? undefined : join(stateDir, 'relay-outbox'),
-  });
-  // The Waves attention summary reader stays unconfigured; reads report
-  // absence. Stored attention items are kept in attentionItemRepository,
-  // persisted to `<stateDir>/attention-items.json` and in-memory without a
-  // stateDir.
-  const attentionRead = new AttentionReadAdapter();
-  // Owner questions are their own aggregate beside the coordination requests,
-  // persisted to `<stateDir>/owner-questions.json` and in-memory without a
-  // stateDir. The clock is the composition root's alone: no request body ever
-  // supplies the moment a question is asked, answered, expired or
-  // acknowledged.
-  const ownerQuestionRepository = new OwnerQuestionRepositoryAdapter({ stateDir });
-  const ownerQuestionClock: OwnerQuestionClock = { nowIso: () => new Date().toISOString() };
-  const attentionItemRepository = new AttentionItemRepositoryAdapter({ stateDir });
-  const attentionClock: AttentionClock = { nowIso: () => new Date().toISOString() };
-
-  // Installation name references for project profiles (P6a): a v2
-  // installation enables host and gate-procedure name checks behind profile
-  // registration and update; a v1 or absent installation passes no reference
-  // port, which keeps the no-install behaviour (no name checks).
-  const installationRefs =
-    options?.installation?.schemaVersion === 2
-      ? new InstallationReferenceAdapter({
-          hostNames: Object.keys(options.installation.hosts ?? {}),
-          procedureNames: Object.keys(options.installation.verification?.procedures ?? {}),
-        })
-      : undefined;
-
-  const coordination = {
-    projectProfileRepository,
+  const {
+    coordination,
     coordinationRequestRepository,
-    decisionTransport,
-    observationPublication,
-    relayTransport,
-    attentionRead,
-    registerProjectProfile: new RegisterProjectProfileUseCase({
-      profileRepo: projectProfileRepository,
-      ...(installationRefs !== undefined ? { installationRefs } : {}),
-    }),
-    updateProjectProfile: new UpdateProjectProfileUseCase({
-      profileRepo: projectProfileRepository,
-      ...(installationRefs !== undefined ? { installationRefs } : {}),
-    }),
-    retireProjectProfile: new RetireProjectProfileUseCase({ profileRepo: projectProfileRepository }),
-    listProjectProfiles: new ListProjectProfilesUseCase({ profileRepo: projectProfileRepository }),
-    inspectProjectProfile: new InspectProjectProfileUseCase({ profileRepo: projectProfileRepository }),
-    recordProjectProbe: new RecordProjectProbeUseCase({ profileRepo: projectProfileRepository }),
-    inspectConfiguredCapabilities: new InspectConfiguredCapabilitiesUseCase({
-      profileRepo: projectProfileRepository,
-    }),
-    requestScopedDecision: new RequestScopedDecisionUseCase({
-      requestRepo: coordinationRequestRepository,
-      decisionTransport,
-    }),
-    resolveActionAuthorization: new ResolveActionAuthorizationUseCase({
-      requestRepo: coordinationRequestRepository,
-      decisionTransport,
-    }),
-    // One-way doors are answered by the coordination request's own
-    // authorization rule, through the application layer: the evidence context
-    // never reads this repository directly.
-    checkOwnerDecision: new CheckOwnerDecisionUseCase({
-      requestRepo: coordinationRequestRepository,
-    }),
-    recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase({
-      requestRepo: coordinationRequestRepository,
-    }),
-    publishProjectObservation: new PublishProjectObservationUseCase({
-      publicationPort: observationPublication,
-    }),
-    readProjectAttention: new ReadProjectAttentionUseCase({ attentionPort: attentionRead }),
-    sendFleetRelay: new SendFleetRelayUseCase({
-      requestRepo: coordinationRequestRepository,
-      relayTransport,
-    }),
-    recordRelayAcknowledgement: new RecordRelayAcknowledgementUseCase({
-      requestRepo: coordinationRequestRepository,
-    }),
-    inspectOutstandingCoordination: new InspectOutstandingCoordinationUseCase({
-      requestRepo: coordinationRequestRepository,
-      publicationPort: observationPublication,
-    }),
-    // Owner questions: two-way questions are answered through the answer use
-    // case with `answeredVia 'cli'`; one-way questions are settled only by the
-    // signed owner decision their linked request carries, read through the
-    // same decision transport that verifies forge-time approvals. An answer
-    // unblocks; it grants nothing and writes no coordination request.
-    ownerQuestionRepository,
-    askOwnerQuestion: new AskOwnerQuestionUseCase({
-      ownerQuestionRepo: ownerQuestionRepository,
-      requestRepo: coordinationRequestRepository,
-      clock: ownerQuestionClock,
-    }),
-    answerOwnerQuestion: new AnswerOwnerQuestionUseCase({
-      ownerQuestionRepo: ownerQuestionRepository,
-      clock: ownerQuestionClock,
-    }),
-    listOwnerQuestions: new ListOwnerQuestionsUseCase({
-      ownerQuestionRepo: ownerQuestionRepository,
-    }),
-    readOwnerQuestion: new ReadOwnerQuestionUseCase({
-      ownerQuestionRepo: ownerQuestionRepository,
-    }),
-    syncOneWayOwnerQuestions: new SyncOneWayOwnerQuestionsUseCase({
-      ownerQuestionRepo: ownerQuestionRepository,
-      requestRepo: coordinationRequestRepository,
-      decisionTransport,
-      clock: ownerQuestionClock,
-    }),
-    expireOwnerQuestions: new ExpireOwnerQuestionsUseCase({
-      ownerQuestionRepo: ownerQuestionRepository,
-      clock: ownerQuestionClock,
-    }),
-    acknowledgeOwnerAnswer: new AcknowledgeOwnerAnswerUseCase({
-      ownerQuestionRepo: ownerQuestionRepository,
-      clock: ownerQuestionClock,
-    }),
-    attentionItemRepository,
-    recordAttentionItem: new RecordAttentionItemUseCase({
-      itemRepo: attentionItemRepository,
-      clock: attentionClock,
-      ids: { newItemId: () => 'att-' + newUlid() },
-    }),
-    clearAttentionItem: new ClearAttentionItemUseCase({
-      itemRepo: attentionItemRepository,
-      clock: attentionClock,
-    }),
-    listAttentionItems: new ListAttentionItemsUseCase({
-      itemRepo: attentionItemRepository,
-    }),
-  };
+    issuePolicyForgeGrantUseCase,
+    profileRead,
+    probeRecord,
+    executorForHostName,
+  } = composeCoordination({ stateDir, ownerPublicKey, options });
 
-  // AM5-3: the auto-merge policy-grant use case over the shared coordination
-  // request store; the consumer adapters delegate to it through this root. The
-  // clock and ids are the root's own, as for every composition here.
-  const issuePolicyForgeGrantUseCase = new IssuePolicyForgeGrantUseCase({
-    requestRepo: coordinationRequestRepository,
-    clock: { nowIso: () => new Date().toISOString() },
-    ids: { newRequestId: newUlid, newGrantId: newUlid },
-  });
+  const { knowledge } = composeKnowledge({ stateDir, options });
 
-  // --- project profiles and probes (P6b) --------------------------------------
-  // The execution context reads profiles and records probe receipts through
-  // the operator-coordination use cases, bound here (same delegate pattern as
-  // the other cross-context adapters).
-  const profileRead = new ProjectProfileReadAdapter({
-    inspect: (req) => coordination.inspectProjectProfile.execute(req),
-  });
-  const probeRecord = new ProjectProbeRecordAdapter({
-    record: (req) => coordination.recordProjectProbe.execute(req),
-  });
-  // One executor per named installation host for the probe's read-only git
-  // checks. A v2 installation names its hosts; a v1 or absent installation has
-  // no host names, so every name is refused. The shared helper keeps the CLI
-  // and API probe rules and reason strings identical.
-  const executorForHostName = (name: string): ExecutorForRecordedHostResult =>
-    executorForInstallationHost(
-      options?.installation?.schemaVersion === 2 ? options.installation.hosts : undefined,
-      name,
-    );
-
-  // --- brief-knowledge -------------------------------------------------------
-
-  const knowledgeEntryRepository = new KnowledgeEntryRepositoryAdapter({ stateDir });
-  // Bounded, allow-listed procedures only; the claim text is never interpreted.
-  const claimVerification = new ClaimVerificationAdapter();
-  const keeperPublication = new KeeperPublicationAdapter({ stateDir });
-  const knowledgeRetrieval = new KnowledgeRetrievalAdapter();
-  // Advisory only (decision port plan): the installation's v2 decisions block
-  // (v1 files never carry one) drives an advice port that reorders the
-  // deterministic retrieval set; with no block the advice port is null and the
-  // inner result stands unchanged. Proposals flow through ProposeBriefContext
-  // only; the key never enters argv, env or logs.
-  const rankingAdvice = createRankingAdvice({
-    ...(options?.installation?.decisions !== undefined
-      ? { decisions: options.installation.decisions }
-      : {}),
-    ...(stateDir !== undefined ? { stateDir } : {}),
-    fetch: options?.adviceFetch ?? globalThis.fetch,
-    ...(options?.adviceReadKey !== undefined ? { readKey: options.adviceReadKey } : {}),
-  });
-  const advisedRetrieval = new AdvisedKnowledgeRetrievalAdapter(
-    knowledgeRetrieval,
-    rankingAdvice,
-  );
-  // Candidate-claim triage (K6): the same decisions block, key source and
-  // receipt journal the ranking advice uses. The factory returns undefined
-  // unless the block is enabled, a key source is declared, the claim-triage
-  // consumer carries `acknowledgeCandidateClaimsLeaveHost: true` and a fetch
-  // was injected — triage stays off otherwise and capture is unchanged.
-  const claimTriage = createClaimTriage({
-    ...(options?.installation?.decisions !== undefined
-      ? { decisions: options.installation.decisions }
-      : {}),
-    ...(stateDir !== undefined ? { stateDir } : {}),
-    fetch: options?.adviceFetch ?? globalThis.fetch,
-    ...(options?.adviceReadKey !== undefined ? { readKey: options.adviceReadKey } : {}),
-  });
-  // The decision receipt journal (K4): the same `<stateDir>/decision-receipts`
-  // store the ranking advice adapter writes. With no state dir nothing was
-  // ever reserved or settled, so the unconfigured journal answers reads with
-  // an empty snapshot and the selection outcome is skipped silently.
-  const decisionReceiptJournal: DecisionReceiptJournalPort =
-    stateDir === undefined || stateDir.trim().length === 0
-      ? new NotConfiguredReceiptJournal()
-      : new FileDecisionReceiptJournalAdapter(stateDir);
-
-  const knowledge = {
-    knowledgeEntryRepository,
-    claimVerification,
-    keeperPublication,
-    knowledgeRetrieval,
-    captureCompletedAttemptNotes: new CaptureCompletedAttemptNotesUseCase({
-      repo: knowledgeEntryRepository,
-      ...(claimTriage !== undefined ? { triage: claimTriage } : {}),
-    }),
-    checkKnowledgeClaim: new CheckKnowledgeClaimUseCase({
-      repo: knowledgeEntryRepository,
-      verifier: claimVerification,
-    }),
-    decideKnowledgeDisposition: new DecideKnowledgeDispositionUseCase({
-      repo: knowledgeEntryRepository,
-    }),
-    listCandidateClaims: new ListCandidateClaimsUseCase({
-      repo: knowledgeEntryRepository,
-    }),
-    publishAcceptedKeeper: new PublishAcceptedKeeperUseCase({
-      repo: knowledgeEntryRepository,
-      publisher: keeperPublication,
-    }),
-    proposeBriefContext: new ProposeBriefContextUseCase({
-      repo: knowledgeEntryRepository,
-      retrieval: advisedRetrieval,
-    }),
-    recordContextSelection: new RecordContextSelectionUseCase({
-      repo: knowledgeEntryRepository,
-      // The selection outcome joins the ranking receipt the proposals named
-      // (K4); best effort by contract, never failing the recording.
-      journal: decisionReceiptJournal,
-    }),
-    recordKnowledgeReuse: new RecordKnowledgeReuseUseCase({ repo: knowledgeEntryRepository }),
-    supersedeKnowledgeEntry: new SupersedeKnowledgeEntryUseCase({ repo: knowledgeEntryRepository }),
-    decisionReceiptJournal,
-  };
-
-  // --- evidence-and-acceptance ------------------------------------------------
-
-  const evidenceAssessmentRepository = new EvidenceAssessmentRepositoryAdapter({ stateDir });
-  const evidenceArchive = new EvidenceArchiveAdapter({
-    archiveDir: stateDir === undefined ? undefined : join(stateDir, 'evidence-archive'),
-  });
-  // The verification executor runs only allow-listed procedures, locally or
-  // over the verifier role's ssh transport; with no installation (and so no
-  // allow-list) executed checks report `unknown` until a receipt is recorded
-  // by the operator.
-  const verificationExecutor = new VerificationExecutorAdapter({
-    executor: roleExecutors.verifier,
-    allowListedCommands: options?.installation?.verification?.procedures,
-  });
-  // The reviewer seat comes from the installation's reviewer and
-  // high-risk-reviewer chains; with none, requests report "No independent
-  // review transport is configured". Independence (a different model family)
-  // is enforced by the adapter and use case before any transport runs.
-  // The locator needs the work context's attempt repository and recorded-host
-  // executors, built below; it is filled in there, and review requests only
-  // run after composition finishes.
-  const reviewLocatorRef: { locator?: AttemptReviewLocator } = {};
-  const reviewSeats = installationModel?.seats ?? [];
-  const reviewChains = installationModel?.chains;
-  let independentReview: IndependentReviewAdapter;
-  if (hasReviewerSeat(reviewSeats, reviewChains)) {
-    independentReview = new IndependentReviewAdapter({
-      runReview: createReviewTransportRouter({
-        seats: reviewSeats,
-        chains: reviewChains,
-        locate: async (attemptId) => {
-          const locator = reviewLocatorRef.locator;
-          if (locator === undefined) {
-            throw new Error('The work context is not wired for review location');
-          }
-          return locator.locate(attemptId);
-        },
-        ocmRunBin: ocmRunBin ?? defaultOcmRunPath(),
-        ...(options?.reviewSpawn !== undefined ? { ocmSpawn: options.reviewSpawn } : {}),
-      }),
-    });
-  } else {
-    independentReview = new IndependentReviewAdapter();
-  }
-  // Free-seat flag (F5): a structural subset of the derived model; absent
-  // installation or flag means allowed.
-  const seatPolicy = new EvidenceSeatPolicyAdapter({
-    useFreeSeats: installationModel?.policy?.useFreeSeats,
-    seats: installationModel?.seats,
-  });
-  // Instantiated for the station that binds a live forge transport. With
-  // forge mode `github` (D6) it is bound to AssessHeadAcceptanceUseCase with
-  // the installation's owner/repo; with mode `none` acceptance is
-  // receipt-only and records `forgeEvidence: 'not-configured'`; with no forge
-  // section the CLI keeps today's receipt-only behaviour.
-  const forgeSection =
-    installationModel?.forge !== undefined && 'mode' in installationModel.forge
-      ? installationModel.forge
-      : undefined;
-  const forgeGithubSection =
-    forgeSection?.mode === 'github' ? forgeSection : undefined;
-  // The argument-array gh runner shared with the forge action adapter (D6):
-  // mode `github` hands it to the forge-evidence adapter so reads can
-  // succeed; tests inject a stub transport through the runtime options.
-  const ghBinaryCandidates = options?.ghBinaryCandidates ?? GH_BINARY_CANDIDATES;
-  const forgeGhRunner =
-    options?.forgeGhRunner ??
-    ((args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates));
-  const forgeEvidence =
-    forgeMode === 'github'
-      ? new ForgeEvidenceAdapter({
-          owner: forgeGithubSection?.owner,
-          repo: forgeGithubSection?.repo,
-          runGh: forgeGhRunner,
-        })
-      : new ForgeEvidenceAdapter();
-  // AM4b-2: the read-only PR-state read (auto-merge A13, conductor reconcile)
-  // shares the forge-evidence runner and the installation's owner/repo. Any
-  // other mode leaves it unconfigured, so every read is `unavailable`.
-  const forgeRead =
-    forgeMode === 'github'
-      ? new ForgeReadAdapter({
-          owner: forgeGithubSection?.owner,
-          repo: forgeGithubSection?.repo,
-          runGh: forgeGhRunner,
-        })
-      : new ForgeReadAdapter();
-  const ownerDecision = new OwnerDecisionAdapter({
-    checkOwnerDecision: async (request) => {
-      const result = await coordination.checkOwnerDecision.checkOwnerDecision({
-        requestId: request.requestId,
-        candidateHeadSha: request.candidateHeadSha,
-      });
-      return result.outcome === 'approved'
-        ? { outcome: 'approved', decisionId: result.requestId }
-        : result;
-    },
-  });
-  // The doors an attempt must clear are read from its own record, which
-  // dispatch wrote from the frozen brief package. The attempt lookup is
-  // captured here and filled in once the work composition exists below.
-  const attemptLookup: { inspectAttempt?: InspectAttemptUseCase } = {};
-  const attemptOwnerDecision = new AttemptOwnerDecisionAdapter({
-    readAttemptOwnerDecisionReferences: async (request) => {
-      const inspectAttempt = attemptLookup.inspectAttempt;
-      if (!inspectAttempt) {
-        return {
-          outcome: 'unknown',
-          reason: 'The work context is not wired for attempt inspection',
-        };
-      }
-      const inspection = await inspectAttempt.inspectAttempt({
-        attemptId: request.attemptId,
-      });
-      if (inspection.outcome !== 'found') {
-        return {
-          outcome: 'unknown',
-          reason: `No attempt is recorded for ${request.attemptId}`,
-        };
-      }
-      const recorded = inspection.attempt.ownerDecisionReferences;
-      if (recorded === undefined) {
-        return {
-          outcome: 'unknown',
-          reason: `attempt ${request.attemptId} was recorded before owner decision references were frozen`,
-        };
-      }
-      return { outcome: 'recorded', ownerDecisionReferences: recorded };
-    },
-  });
-
-  const evidence = {
-    evidenceAssessmentRepository,
-    evidenceArchive,
-    verificationExecutor,
-    independentReview,
-    forgeEvidence,
+  const {
+    evidence,
+    reviewLocatorRef,
+    attemptLookup,
+    forgeRead,
+    ghBinaryCandidates,
+    forgeGithubSection,
     ownerDecision,
     attemptOwnerDecision,
-    requestVerification: new RequestVerificationUseCase({
-      repo: evidenceAssessmentRepository,
-      executor: verificationExecutor,
-      archive: evidenceArchive,
-    }),
-    requestIndependentReview: new RequestIndependentReviewUseCase({
-      repo: evidenceAssessmentRepository,
-      reviewer: independentReview,
-      archive: evidenceArchive,
-      seatPolicy,
-    }),
-    openEvidenceAssessment: new OpenEvidenceAssessmentUseCase({
-      repo: evidenceAssessmentRepository,
-    }),
-    recordVerificationReceipt: new RecordVerificationReceiptUseCase({
-      repo: evidenceAssessmentRepository,
-    }),
-    recordReviewReceipt: new RecordReviewReceiptUseCase({
-      repo: evidenceAssessmentRepository,
-      seatPolicy,
-    }),
-    recordFindingDisposition: new RecordFindingDispositionUseCase({
-      repo: evidenceAssessmentRepository,
-    }),
-    assessHeadAcceptance: new AssessHeadAcceptanceUseCase({
-      repo: evidenceAssessmentRepository,
-      // Forge mode `github` binds the forge-evidence port in this root too
-      // (D6); mode `none` records receipt-only acceptance as not-configured.
-      ...(forgeMode === 'github' ? { forgeEvidence } : {}),
-      ...(forgeMode === 'none' ? { forgeMode: 'none' as const } : {}),
-      ownerDecisionPort: ownerDecision,
-      attemptOwnerDecisionPort: attemptOwnerDecision,
-    }),
-    inspectAcceptanceEvidence: new InspectAcceptanceEvidenceUseCase({
-      repo: evidenceAssessmentRepository,
-    }),
-    // Forge mode `github` only, as for assessHeadAcceptance; otherwise every
-    // head answers unknown / not-configured.
-    inspectHeadCiState: new InspectHeadCiStateUseCase(
-      forgeMode === 'github' ? { forgeEvidence } : {},
-    ),
-  };
+  } = composeEvidence({
+    stateDir,
+    roleExecutors,
+    options,
+    installationModel,
+    ocmRunBin,
+    forgeMode,
+    coordination,
+    runGhSubprocess,
+  });
 
   // --- work-execution ---------------------------------------------------------
 

@@ -42,7 +42,7 @@ export interface AcceptanceFacts {
   readonly acceptedHead12: string | null;
   readonly preMerge: 'none' | 'passed' | 'failed' | 'unknown';
   readonly ci: 'pending' | 'passed' | 'failed' | 'unknown';
-  readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string } | null;
+  readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string; readonly containsLaneHead: boolean } | null;
   readonly merge: MergeFacts;
 }
 
@@ -70,7 +70,7 @@ function finalResultOfKey(
  * `step-refused <step>` for the owner. An unread intent would have been routed
  * to the reconcile by the decider's G3a, so an intent here has a final result.
  */
-async function parkSpentOneWayKey(
+export async function parkSpentOneWayKey(
   ctx: AdvanceStepContext,
   record: LaneRunRecord,
   gathered: GatheredLaneRunFacts,
@@ -200,6 +200,7 @@ async function prFactOf(
   port: ForgeReadPort,
   record: LaneRunRecord,
   latest: AttemptRecord,
+  laneHead12: string | null,
 ): Promise<PrReadResult> {
   try {
     const read = await port.readPullRequest({ ref: pullRequestRefOf(record, latest) });
@@ -211,7 +212,7 @@ async function prFactOf(
       return { pr: null, mergeState: null };
     }
     return {
-      pr: { state: read.pullRequest.state, head12 },
+      pr: { state: read.pullRequest.state, head12, containsLaneHead: head12 === laneHead12 },
       mergeState: read.pullRequest.mergeState,
     };
   } catch {
@@ -251,11 +252,19 @@ export async function acceptanceFactsOf(
     if (ctx.deps.ciState !== undefined) {
       ci = await ciFactOf(ctx.deps.ciState, headSha);
     }
-    if (ctx.deps.forgeRead !== undefined) {
-      const prRead = await prFactOf(ctx.deps.forgeRead, record, latest);
-      pr = prRead.pr;
-      mergeState = prRead.mergeState;
-    }
+  }
+  // CT-2a: an owner-merge park reads the PR so G5 can leave once the PR merges
+  // with the lane head; every other park keeps reading nothing.
+  const canReadPr =
+    !halted &&
+    latest !== null &&
+    latest.artifacts !== null &&
+    (FACT_READ_STATES.includes(state) ||
+      (state === 'parked' && record.parked?.reason === 'owner-merge'));
+  if (canReadPr && ctx.deps.forgeRead !== undefined) {
+    const prRead = await prFactOf(ctx.deps.forgeRead, record, latest, head12);
+    pr = prRead.pr;
+    mergeState = prRead.mergeState;
   }
   const merge = await mergeFactsOf(ctx, record, state, halted, acceptance, mergeState);
   return { acceptance, acceptedHead12, preMerge, ci, pr, merge };

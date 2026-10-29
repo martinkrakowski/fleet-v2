@@ -73,6 +73,11 @@ runner environment allowlist to smuggle a setting through.
   `AGY_ROUND_SETTLE` are the environment (all but the last required) of `bin/agy-round`, the
   orchestrator's one-command-per-step driver for an agy fix round.
 
+- `bin/gate-slot <command> [args...]` runs one acceptance command inside a host-wide check
+  slot (`FLEET_V2_GATE_SLOTS`, default 8; the same lock files as the orchestrator's gate), so
+  conducted runs share the host's gate budget. Worker caps stay in the command's own flags;
+  `FLEET_V2_GATE_TMPDIR` sets the command's `TMPDIR`. It needs `flock`.
+
 Before committing what any lane produced, run `scripts/lane-diff-check.sh <worktree>`
 (protected paths including ignored ones — github workflows, agent/editor instruction and tool files,
 yarn/npm/package manifests and lockfiles, git attributes/modules, lane plumbing, install trees;

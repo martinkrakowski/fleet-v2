@@ -1139,6 +1139,18 @@ describe('Fleet CLI workflow', () => {
     expect(missingSubcommand.code).toBe(2);
     expect(missingSubcommand.stderr).toContain('Subcommands:');
 
+    // Usage errors list subcommands in UTF-16 code-unit order (the same order
+    // as the default sort(), which keeps mixed-case names stable).
+    const subcommandsLine = missingSubcommand.stderr
+      .split('\n')
+      .find((line) => line.startsWith('Subcommands: '));
+    expect(subcommandsLine).toBeDefined();
+    const listedSubcommands = subcommandsLine!.slice('Subcommands: '.length).split(', ');
+    const codeUnitSorted = [...listedSubcommands].sort((a, b) =>
+      a < b ? -1 : a > b ? 1 : 0,
+    );
+    expect(listedSubcommands).toEqual(codeUnitSorted);
+
     const unknownSubcommand = await cli(['work-order', 'frobnicate']);
     expect(unknownSubcommand.code).toBe(2);
     expect(unknownSubcommand.stderr).toContain('Unknown work-order subcommand: frobnicate');

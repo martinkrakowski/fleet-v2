@@ -2,6 +2,7 @@
 
 export * from "./AcceptanceAssessmentAdapter.adapter.js";
 export * from "./AcceptanceEvidenceAdapter.adapter.js";
+export * from "./AcceptanceReceiptReadAdapter.adapter.js";
 export * from "./ActionAuthorizationAdapter.adapter.js";
 export * from "./AgyRunnerAdapter.adapter.js";
 export * from "./AllowedSeatAdapter.adapter.js";

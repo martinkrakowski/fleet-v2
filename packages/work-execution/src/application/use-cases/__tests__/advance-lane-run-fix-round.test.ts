@@ -702,6 +702,25 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(harness.fixRequests[0]!.numberedFixes).toEqual(['[gate] gate-failed']);
   });
 
+  it('b2) uses the recorded branch for the handover header; old records fall back (KF-5b)', async () => {
+    // The prior worktree path's last segment would be an invalid header value
+    // (a backtick), so the prepare can only succeed when the run's recorded
+    // branch is used for the handover header.
+    const harness = await makeHarness(
+      runRecord({ branchName: 'fleet/' + RUN_ID }),
+      [{ ...collectedAttempt(), worktreePath: '/tmp/opencode/wo-example-1/wt-`inject' }],
+    );
+    await seedReviewFailure(harness, [blockerFinding()]);
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests).toHaveLength(1);
+  });
+
   it('c) refuses prepare-refused when the receipt has only nit findings, saving no fix attempt', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await seedReviewFailure(harness, [

@@ -571,10 +571,10 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     }
     findings = handoverFindingsOf(found.receipt);
   }
-  // No branch name is recorded on the run or the attempt: the conductor names
-  // worktrees after their branch, so the branch is the prior worktree path's
-  // last path segment (orchestrator decision).
-  const branchName = prior.worktreePath.split('/').pop() ?? '';
+  // The run's recorded branch wins (KF-5b); old records without it fall back
+  // to the prior worktree path's last segment (the conductor names worktrees
+  // after their branch).
+  const branchName = record.branchName ?? prior.worktreePath.split('/').pop() ?? '';
   const brief = renderHandoverBrief({
     runId: record.runId,
     round,

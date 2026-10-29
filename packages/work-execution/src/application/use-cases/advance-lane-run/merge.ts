@@ -149,14 +149,17 @@ function acceptedHead12Of(
 }
 
 /**
- * No branch name is recorded on the run, so the PR is read by number when
- * `record.prNumber` is set, else by branch — the branch name being the last
- * path segment of the latest attempt's worktreePath (the same decision K5-5
- * takes).
+ * The PR is read by number when `record.prNumber` is set, else by the run's
+ * recorded branch (`record.branchName`, KF-5b); old records without the field
+ * fall back to the last path segment of the latest attempt's worktreePath
+ * (the same decision K5-5 takes).
  */
 function pullRequestRefOf(record: LaneRunRecord, latest: AttemptRecord): PullRequestRef {
   if (record.prNumber !== null) {
     return { kind: 'number', number: record.prNumber };
+  }
+  if (record.branchName !== undefined) {
+    return { kind: 'branch', branchName: record.branchName };
   }
   const segments = latest.worktreePath.split('/');
   return { kind: 'branch', branchName: segments[segments.length - 1] };
@@ -619,6 +622,7 @@ async function runPrPushBody(
     return refuseGrant();
   }
   let forgeRequest: ExecuteAuthorizedForgeActionRequest;
+  const recordedBranch = record.branchName === undefined ? {} : { branchName: record.branchName };
   if (kind === 'push-and-open-pr' && rendered !== null) {
     forgeRequest = {
       actionId,
@@ -630,6 +634,7 @@ async function runPrPushBody(
       authorizedBy: grant.decisionRevision,
       title: rendered.title,
       body: rendered.body,
+      ...recordedBranch,
     };
   } else {
     forgeRequest = {
@@ -640,6 +645,7 @@ async function runPrPushBody(
       expectedHeadSha: headSha,
       authorizationGrantId: grant.grantId,
       authorizedBy: grant.decisionRevision,
+      ...recordedBranch,
     };
   }
   let forged: ExecuteAuthorizedForgeActionResult;
@@ -825,7 +831,11 @@ export async function performMerge(
   let result: 'completed' | 'refused' | 'ambiguous';
   let reasonCode: LaneRunResultReasonCode;
   try {
-    const outcome = await autoMergeAttempt.autoMergeAttempt({ attemptId: latest.id });
+    const outcome = await autoMergeAttempt.autoMergeAttempt(
+      record.branchName === undefined
+        ? { attemptId: latest.id }
+        : { attemptId: latest.id, branchName: record.branchName },
+    );
     if (outcome.outcome === 'merged') {
       if (head12Of(outcome.headSha) === gathered.facts.head12) {
         result = 'completed';

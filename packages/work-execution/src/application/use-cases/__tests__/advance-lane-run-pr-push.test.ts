@@ -464,8 +464,8 @@ async function appendResult(
 }
 
 /** A collected attempt in `opening-pr`, accepted at the collected head. */
-async function openingPrHarness(options: HarnessOptions = {}): Promise<Harness> {
-  const harness = await makeHarness(runRecord(), [collectedAttempt()], options);
+async function openingPrHarness(options: HarnessOptions = {}, record: LaneRunRecord = runRecord()): Promise<Harness> {
+  const harness = await makeHarness(record, [collectedAttempt()], options);
   await conduct(harness, 'opening-pr', NOW);
   await appendIntent(harness, acceptKey(), null, NOW);
   await appendResult(harness, acceptKey(), 'completed', 'accepted', NOW);
@@ -473,8 +473,8 @@ async function openingPrHarness(options: HarnessOptions = {}): Promise<Harness> 
 }
 
 /** A collected attempt in `pushing`, accepted at the collected head. */
-async function pushingHarness(options: HarnessOptions = {}): Promise<Harness> {
-  const harness = await makeHarness(runRecord(), [collectedAttempt()], options);
+async function pushingHarness(options: HarnessOptions = {}, record: LaneRunRecord = runRecord()): Promise<Harness> {
+  const harness = await makeHarness(record, [collectedAttempt()], options);
   await conduct(harness, 'pushing', NOW);
   await appendIntent(harness, acceptKey(), null, NOW);
   await appendResult(harness, acceptKey(), 'completed', 'accepted', NOW);
@@ -882,5 +882,105 @@ describe('AdvanceLaneRunUseCase push act (K6-6)', () => {
     expect(harness.forgeRequests).toEqual([]);
     const record = await harness.runRepo.get(RUN_ID);
     expect(record?.prNumber).toBe(7);
+  });
+});
+
+describe('AdvanceLaneRunUseCase recorded branch (KF-5b)', () => {
+  const BRANCH = 'fleet/' + RUN_ID;
+
+  it("the open-pr forge request carries the run's recorded branch", async () => {
+    const harness = await openingPrHarness({}, runRecord({ branchName: BRANCH }));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'completed',
+      reasonCode: 'pr-opened',
+    });
+    expect(harness.forgeRequests).toHaveLength(1);
+    expect(harness.forgeRequests[0]).toMatchObject({ kind: 'push-and-open-pr', branchName: BRANCH });
+  });
+
+  it("the open-pr reconcile reads the PR by the recorded branch", async () => {
+    const harness = await openingPrHarness({}, runRecord({ branchName: BRANCH }));
+    harness.setForgeAnswer({ outcome: 'refused', reason: FORGE_REASON, forgeAmbiguous: true });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'ambiguous',
+      reasonCode: 'forge-ambiguous',
+    });
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'reconciled',
+      reasonCode: 'pr-opened',
+    });
+    // The facts read (gc) and the reconcile read all name the recorded branch.
+    expect(harness.forgeReadRequests).toHaveLength(3);
+    expect(
+      harness.forgeReadRequests.every(
+        (request) => request.ref.kind === 'branch' && request.ref.branchName === BRANCH,
+      ),
+    ).toBe(true);
+  });
+
+  it("the push forge request carries the run's recorded branch", async () => {
+    const harness = await pushingHarness({}, runRecord({ branchName: BRANCH }));
+    harness.setForgeReadAnswer({
+      outcome: 'found',
+      pullRequest: {
+        number: 7,
+        state: 'open',
+        mergeState: 'clean',
+        headSha: MOVED_COMMIT,
+        headRef: 'wt-example-1',
+        baseRef: 'main',
+        mergedAtIso: null,
+        closedAtIso: null,
+        mergeCommitSha: null,
+      },
+    });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'push',
+      key: pushKey(),
+      result: 'completed',
+      reasonCode: 'pushed',
+    });
+    expect(harness.forgeRequests).toHaveLength(1);
+    expect(harness.forgeRequests[0]).toMatchObject({ kind: 'push-to-pr', branchName: BRANCH });
+  });
+
+  it('old records without the field keep the worktree-path fallback and forward no branchName', async () => {
+    const harness = await openingPrHarness();
+    harness.setForgeAnswer({ outcome: 'refused', reason: FORGE_REASON, forgeAmbiguous: true });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'ambiguous',
+      reasonCode: 'forge-ambiguous',
+    });
+    expect(harness.forgeRequests[0]).not.toHaveProperty('branchName');
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'reconciled',
+      reasonCode: 'pr-opened',
+    });
+    // The facts read (twice) and the reconcile read all fall back to the
+    // worktree path's last segment for old records.
+    expect(harness.forgeReadRequests).toHaveLength(3);
+    expect(
+      harness.forgeReadRequests.every(
+        (request) => request.ref.kind === 'branch' && request.ref.branchName === 'wt-example-1',
+      ),
+    ).toBe(true);
   });
 });

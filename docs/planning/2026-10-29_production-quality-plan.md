@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-29
 - **Target repository:** `fleet-v2`
-- **Status:** rev 1. It is the orchestrator's quality assessment, reviewed by Fable (read-only; its corrections are in §2 and its additions in §4). No decision is taken yet (§6). Nothing is built. Anchors were checked against `origin/main` at `9a137e02`.
+- **Status:** rev 1. It is the orchestrator's quality assessment, reviewed by Fable (read-only; its corrections are in §2 and its additions in §4). **The owner decided D1–D8 on 2026-10-29 as recommended (§6): "Accept as recommended."** Wave 1 is dispatchable. Nothing is built. Anchors were checked against `origin/main` at `9a137e02`.
 - **Owner request (2026-10-29):** "Provide an honest code quality grade for merged code, based on the fleet-v2 pipeline." Then: "Run your recommendations by Fable, and ask if it could improve anything else. Then write up the fleet-v2 production quality improvements plan."
 
 ## 1. Goal
@@ -210,6 +210,8 @@ This replaces the fix/feat ratio. A daily check also lists lane branches with co
 **Size:** about 20 lanes in total.
 
 ## 6. Decisions for the owner
+
+**Decided 2026-10-29 by the owner, all as recommended.**
 
 | # | Question | Recommendation |
 |---|---|---|

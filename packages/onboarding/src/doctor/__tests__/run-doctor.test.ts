@@ -418,7 +418,11 @@ describe('runDoctor', () => {
   });
 
   it('probes a remote lane host\'s runner authFile on the orchestrator, never over ssh (KF-14c)', async () => {
-    const model = sampleModel({ runnerAuthFile: '/home/dev/.opencode/auth.json' });
+    // The lane host is REMOTE: the old probe went over ssh to 'lane-alias'.
+    const model = sampleModel({
+      runnerAuthFile: '/home/dev/.opencode/auth.json',
+      host: { transport: 'ssh', sshAlias: 'lane-alias' },
+    });
     const seen: string[] = [];
     const { probes } = fakeProbes({
       fileMode: async (host, path) => {
@@ -428,6 +432,7 @@ describe('runDoctor', () => {
     });
     await collect(loadedResult(model), probes);
     expect(seen.filter((call) => call.endsWith('/home/dev/.opencode/auth.json'))).toEqual(['local:/home/dev/.opencode/auth.json']);
+    expect(seen.some((call) => call.startsWith('lane-alias:'))).toBe(false);
   });
 
   it('fails a missing credential file', async () => {

@@ -289,6 +289,25 @@ function laneCommitScript(): string {
  * The `ocm-run` wrapper: appends its argv and its OCM_HOST/OCM_REMOTE_PORT
  * env to recording logs, then execs the repository's real `bin/ocm-run`.
  */
+/** How long teardown waits for the fake clients to exit after TERM. */
+const FAKE_CLIENT_EXIT_WAIT_MS = 3000;
+
+/** Resolves once no listed pid answers a signal-0 probe, or the deadline passes. */
+async function waitForPidsToExit(pids: readonly number[], deadlineMs: number): Promise<void> {
+  const deadline = Date.now() + deadlineMs;
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  while (pids.some(alive) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 function ocmRunWrapperScript(realOcmRunBin: string, argvLog: string, envLog: string, stderrLog: string): string {
   return [
     '#!/bin/sh',
@@ -481,24 +500,28 @@ export async function startConductedFixture(
       }
       failedBriefPath = null;
     }
-    // 1) every running fake opencode client dies with the fixture.
     try {
-      // 1) every running fake opencode client dies with the fixture.
+      // 1) every running fake opencode client dies with the fixture: TERM to
+      //    each recorded pid (the client forwards it to its own child), then
+      //    wait for them to be gone before the directories go away.
+      let pids: number[] = [];
       try {
-        const pids = (await fs.readFile(fakePidsFile, 'utf8'))
+        pids = (await fs.readFile(fakePidsFile, 'utf8'))
           .split('\n')
           .map((line) => line.trim())
-          .filter((line) => /^[0-9]+$/.test(line));
-        for (const pid of pids) {
-          try {
-            process.kill(Number(pid), 'SIGTERM');
-          } catch {
-            // Already gone: nothing to clean.
-          }
-        }
+          .filter((line) => /^[0-9]+$/.test(line))
+          .map(Number);
       } catch {
         // No pids file: no fake client ever started.
       }
+      for (const pid of pids) {
+        try {
+          process.kill(pid, 'SIGTERM');
+        } catch {
+          // Already gone: nothing to clean.
+        }
+      }
+      await waitForPidsToExit(pids, FAKE_CLIENT_EXIT_WAIT_MS);
       // 2) the ssh fixture stop now also ends the ssh -f -N tunnel.
       await e2e.stop();
     } finally {

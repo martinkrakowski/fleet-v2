@@ -5,6 +5,7 @@ import type { ExecuteAuthorizedForgeActionResult, ExecuteAuthorizedForgeActionRe
 import type { CiStatePort } from '../../ports/out/CiStatePort.out-port.js';
 import type { ConductorForgeGrantResult } from '../../ports/out/ConductorForgeGrantPort.out-port.js';
 import type { ForgeReadPort, PullRequestMergeState, PullRequestRef, ReadPullRequestResult } from '../../ports/out/ForgeReadPort.out-port.js';
+import type { ForgeAncestryPort } from '../../ports/out/ForgeAncestryPort.out-port.js';
 import type { ReviewRequestPort } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { laneRunJournalState } from '../../../domain/lane-run-journal.js';
@@ -195,12 +196,28 @@ async function ciFactOf(
   }
 }
 
+/**
+ * The ancestry answer as a boolean (CT-2b): only an `answered` true is true;
+ * unavailable or a throwing port is false, and the PR snapshot is kept so the
+ * decider parks `ambiguous merge` rather than waiting on inconsistent facts.
+ */
+async function containsLaneHeadOf(ancestry: ForgeAncestryPort, ancestorSha: string, descendantSha: string): Promise<boolean> {
+  try {
+    const answer = await ancestry.containsCommit({ ancestorSha, descendantSha });
+    return answer.outcome === 'answered' && answer.contains;
+  } catch {
+    return false;
+  }
+}
+
 /** The PR read: the snapshot's state and head plus its merge state; anything but a found snapshot reads null. */
 async function prFactOf(
   port: ForgeReadPort,
   record: LaneRunRecord,
   latest: AttemptRecord,
   laneHead12: string | null,
+  laneHeadSha: string | null,
+  ancestry: ForgeAncestryPort | undefined,
 ): Promise<PrReadResult> {
   try {
     const read = await port.readPullRequest({ ref: pullRequestRefOf(record, latest) });
@@ -211,8 +228,16 @@ async function prFactOf(
     if (head12 === null) {
       return { pr: null, mergeState: null };
     }
+    let containsLaneHead = head12 === laneHead12;
+    if (!containsLaneHead && read.pullRequest.state === 'merged' && ancestry !== undefined && laneHeadSha !== null) {
+      // CT-2b: a merged PR's head is rarely the lane's collected head (the
+      // merge train adds a merge commit), so ancestry answers it from the
+      // forge. No answer is false: the run parks ambiguous merge or stays
+      // parked for the owner; it never enters merged on a guess.
+      containsLaneHead = await containsLaneHeadOf(ancestry, laneHeadSha, read.pullRequest.headSha);
+    }
     return {
-      pr: { state: read.pullRequest.state, head12, containsLaneHead: head12 === laneHead12 },
+      pr: { state: read.pullRequest.state, head12, containsLaneHead },
       mergeState: read.pullRequest.mergeState,
     };
   } catch {
@@ -262,7 +287,7 @@ export async function acceptanceFactsOf(
     (FACT_READ_STATES.includes(state) ||
       (state === 'parked' && record.parked?.reason === 'owner-merge'));
   if (canReadPr && ctx.deps.forgeRead !== undefined) {
-    const prRead = await prFactOf(ctx.deps.forgeRead, record, latest, head12);
+    const prRead = await prFactOf(ctx.deps.forgeRead, record, latest, head12, latest.artifacts.headCommit, ctx.deps.forgeAncestry);
     pr = prRead.pr;
     mergeState = prRead.mergeState;
   }

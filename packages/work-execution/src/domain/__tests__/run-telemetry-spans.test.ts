@@ -8,19 +8,29 @@
 import { createHmac } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
+  attemptIdentity,
+  attemptTraceRoot,
   journalKeyIdentity,
   ciWaitIdentity,
+  reviewReceiptIdentity,
   roundIdentity,
   runRootIdentity,
   runTraceRoot,
   telemetryDigest,
   telemetryHashInput,
   telemetrySpanId,
+  usageIdentity,
+  verificationReceiptIdentity,
   type TelemetryHmac,
   type TelemetryHashInput,
 } from '../run-telemetry-ids.js';
-import { laneRunSpans } from '../run-telemetry-spans.js';
-import type { LaneRunTelemetryFacts } from '../run-telemetry-spans.js';
+import { attemptTraceSpans, laneRunSpans } from '../run-telemetry-spans.js';
+import type {
+  AttemptTraceTelemetryFacts,
+  LaneRunTelemetryFacts,
+  TelemetryGateReceiptFact,
+  TelemetryReviewReceiptFact,
+} from '../run-telemetry-spans.js';
 import {
   buildLaneRunStepKey,
   laneRunStopKey,
@@ -31,7 +41,8 @@ import { LANE_RUN_RECORD_VERSION, type LaneRunRecord } from '../lane-run-records
 import { LANE_RUN_JOURNAL_ENTRY_VERSION } from '../lane-run-journal.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalEntryKind, LaneRunJournalOutcome } from '../lane-run-journal.js';
 import type { LaneRunStateValue } from '../value-objects/LaneRunState.vo.js';
-import type { TelemetrySpan } from '../run-telemetry.js';
+import { pricingSafe, type TelemetrySpan } from '../run-telemetry.js';
+import type { AttemptRecord } from '../execution-records.js';
 
 const SALT = 'example-telemetry-salt-0123456789abcdef0123456789abcdef';
 const hmac: TelemetryHmac = (message) => createHmac('sha256', SALT).update(message, 'utf8').digest();
@@ -176,8 +187,12 @@ function makeRun(): LaneRunRecord {
   };
 }
 
-function factsOf(journal: readonly LaneRunJournalEntryRecord[], project: string | null = 'example'): LaneRunTelemetryFacts {
-  return { run: makeRun(), journal, project, tags: ['conducted', 'tier-2'] };
+function factsOf(
+  journal: readonly LaneRunJournalEntryRecord[],
+  project: string | null = 'example',
+  attempts: readonly AttemptRecord[] = [],
+): LaneRunTelemetryFacts {
+  return { run: makeRun(), journal, project, tags: ['conducted', 'tier-2'], attempts };
 }
 
 function spanNamed(spans: readonly TelemetrySpan[], name: string): TelemetrySpan | undefined {
@@ -448,7 +463,7 @@ describe('laneRunSpans (OT1b-1)', () => {
   it('yields no spans and rejectedInvalid 1 when the work-order id cannot be digested', () => {
     entryCounter = 0;
     const run = { ...makeRun(), workOrderId: '\uD800' };
-    const result = laneRunSpans(hmac, { run, journal: baseJournal(), project: 'example', tags: ['conducted'] });
+    const result = laneRunSpans(hmac, { run, journal: baseJournal(), project: 'example', tags: ['conducted'], attempts: [] });
     expect(result.spans).toEqual([]);
     expect(result.rejectedInvalid).toBe(1);
   });
@@ -467,6 +482,9 @@ describe('laneRunSpans (OT1b-1)', () => {
   it('maps a journal mixed with another run and control keys to exactly the same spans as the own entries alone', () => {
     entryCounter = 0;
     const own = baseJournal();
+    // Foreign entries lead the journal: the root's start must come from the
+    // first entry that survives this run's scoping, so a foreign run entry and
+    // a null-state conduct entry before the run's own entries are exercised.
     const foreignLead = [
       stepIntent(PREPARE_KEY2, 30), stepResult(PREPARE_KEY2, 31),
       entry('conduct', { state: null, recordedAtIso: time(32) }),
@@ -514,5 +532,301 @@ describe('laneRunSpans (OT1b-1)', () => {
     expect(roundSpans.length).toBe(1);
     expect((roundSpans[0] as { startIso: string }).startIso).toBe(time(1));
     expect((roundSpans[0] as { endIso: string }).endIso).toBe(time(2));
+  });
+});
+
+describe('laneRunSpans attempt and usage spans (OT1b-2)', () => {
+  function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
+    return {
+      id: ATTEMPT_ID,
+      workOrderId: WORK_ORDER_ID,
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      worktreePath: '/worktree/path',
+      baseCommit: 'a'.repeat(40),
+      state: 'collected',
+      revision: 1,
+      dispatchRevision: 1,
+      outcome: 'done',
+      briefDigest: null,
+      briefPackagePath: null,
+      sessionId: null,
+      completionReceipt: {
+        attemptId: ATTEMPT_ID,
+        sessionId: 'ses-1',
+        endedAtIso: time(25),
+        authoritative: true,
+        exitStatus: 0,
+        stoppedByRequest: false,
+      },
+      artifacts: null,
+      runner: { kind: 'opencode', remotePort: null, host: null, agent: null, model: 'example-model', variant: null },
+      seatPlan: null,
+      seatSelection: {
+        role: 'first-pass',
+        seatIndex: 0,
+        seatId: 'seat-1',
+        model: 'example-model',
+        tool: 'opencode',
+        variant: null,
+        agent: null,
+      },
+      reviewerSeat: null,
+      stopReason: 'none',
+      createdAtIso: time(1),
+      updatedAtIso: time(25),
+      usage: {
+        source: 'opencode-db',
+        readAtIso: time(7),
+        sessionId: null,
+        steps: 12,
+        wallSeconds: 45.5,
+        tokensInput: 100,
+        tokensOutput: 80,
+        tokensReasoning: 20,
+        tokensCacheRead: 10,
+        tokensCacheWrite: 5,
+        costUsd: 0.25,
+        model: 'example-model',
+        agent: 'first-pass',
+        reason: null,
+      },
+      ...overrides,
+    };
+  }
+
+  it('emits the attempt span under its round, from dispatch result to collect result, only when terminal', () => {
+    const result = laneRunSpans(hmac, factsOf(baseJournal(), 'example', [makeAttempt()]));
+    const attempt = spanNamed(result.spans, 'attempt');
+    expect(attempt).toBeDefined();
+    const span = attempt as {
+      kind: string; startIso: string; endIso: string; parentSpanId: string; attributes: Record<string, unknown>;
+    };
+    expect(span.kind).toBe('AGENT');
+    expect(span.startIso).toBe(time(4));
+    expect(span.endIso).toBe(time(7));
+    const root = runTraceRoot(RUN_ID) as NonNullable<ReturnType<typeof runTraceRoot>>;
+    expect(span.parentSpanId).toBe(telemetrySpanId(hmac, root, roundIdentity(0) as never));
+    expect(span.attributes['fleet.attempt.digest']).toBe(telemetryDigest(hmac, 'attempt', asInput(ATTEMPT_ID)));
+    expect(span.attributes['agent.name']).toBe('first-pass');
+    expect(span.attributes['fleet.seat.billing']).toBe('metered');
+    expect(span.attributes['fleet.outcome']).toBe('done');
+    expect(span.attributes['session.id']).toBe(SESSION_DIGEST);
+
+    const notTerminal = laneRunSpans(hmac, factsOf(baseJournal(), 'example', [makeAttempt({ state: 'running' })]));
+    expect(spanNamed(notTerminal.spans, 'attempt')).toBeUndefined();
+  });
+
+  it('emits the usage span under the attempt only for opencode-db usage, with token counts and metered cost', () => {
+    const result = laneRunSpans(hmac, factsOf(baseJournal(), 'example', [makeAttempt()]));
+    const usage = spanNamed(result.spans, 'usage');
+    expect(usage).toBeDefined();
+    const span = usage as {
+      kind: string; parentSpanId: string; attributes: Record<string, unknown>; startIso: string; endIso: string;
+    };
+    expect(span.kind).toBe('LLM');
+    const attempt = spanNamed(result.spans, 'attempt') as { spanId: string };
+    expect(span.parentSpanId).toBe(attempt.spanId);
+    expect(span.attributes['fleet.usage.steps']).toBe(12);
+    expect(span.attributes['fleet.usage.wall_seconds']).toBe(45.5);
+    expect(span.attributes['llm.token_count.prompt']).toBe(100);
+    expect(span.attributes['llm.token_count.completion']).toBe(80);
+    expect(span.attributes['llm.model_name']).toBe('example-model');
+    expect(span.attributes['llm.cost.total']).toBe(0.25);
+
+    const unavailable = laneRunSpans(hmac, factsOf(baseJournal(), 'example', [makeAttempt({
+      usage: {
+        source: 'unavailable', readAtIso: time(7), sessionId: null, steps: null, wallSeconds: null,
+        tokensInput: null, tokensOutput: null, tokensReasoning: null, tokensCacheRead: null, tokensCacheWrite: null,
+        costUsd: null, model: null, agent: null, reason: 'read-failed',
+      },
+    })]));
+    expect(spanNamed(unavailable.spans, 'usage')).toBeUndefined();
+  });
+
+  it('derives the attempt and usage span ids from the §3.4 table', () => {
+    const result = laneRunSpans(hmac, factsOf(baseJournal(), 'example', [makeAttempt()]));
+    const root = runTraceRoot(RUN_ID) as NonNullable<ReturnType<typeof runTraceRoot>>;
+    expect(spanNamed(result.spans, 'attempt')?.spanId).toBe(
+      telemetrySpanId(hmac, root, attemptIdentity(asInput(ATTEMPT_ID)) as never),
+    );
+    expect(spanNamed(result.spans, 'usage')?.spanId).toBe(
+      telemetrySpanId(hmac, root, usageIdentity(asInput(ATTEMPT_ID)) as never),
+    );
+  });
+
+  it('a plan-billed attempt usage span carries no llm model or cost and pricingSafe passes', () => {
+    const attempt = makeAttempt({
+      runner: { kind: 'agy', remotePort: null, host: null, agent: null, model: 'example-canary-model', variant: null },
+      seatSelection: {
+        role: 'first-pass', seatIndex: 0, seatId: 'seat-2',
+        model: 'example-canary-model', tool: 'agy', variant: null, agent: null,
+      },
+    });
+    const result = laneRunSpans(hmac, factsOf(baseJournal(), 'example', [attempt]));
+    const usage = spanNamed(result.spans, 'usage') as TelemetrySpan;
+    expect(usage).toBeDefined();
+    expect(usage.attributes['llm.model_name']).toBeUndefined();
+    expect(Object.keys(usage.attributes).some((key) => key.startsWith('llm.cost.'))).toBe(false);
+    expect(pricingSafe(usage)).toBe(true);
+    expect(usage.attributes['fleet.cost.basis']).toBe('plan-estimate');
+    expect(usage.attributes['fleet.cost.estimate_usd']).toBe(0.25);
+  });
+});
+
+describe('attemptTraceSpans (OT1b-2)', () => {
+  const HAND_ATTEMPT_ID = 'attempt-hand-run-1';
+
+  function makeHandAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
+    return {
+      id: HAND_ATTEMPT_ID,
+      workOrderId: WORK_ORDER_ID,
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      worktreePath: '/worktree/path',
+      baseCommit: 'a'.repeat(40),
+      state: 'collected',
+      revision: 1,
+      dispatchRevision: 1,
+      outcome: 'done',
+      briefDigest: null,
+      briefPackagePath: null,
+      sessionId: null,
+      completionReceipt: {
+        attemptId: HAND_ATTEMPT_ID,
+        sessionId: 'ses-1',
+        endedAtIso: time(30),
+        authoritative: true,
+        exitStatus: 0,
+        stoppedByRequest: false,
+      },
+      artifacts: null,
+      runner: { kind: 'opencode', remotePort: null, host: null, agent: null, model: 'example-model', variant: null },
+      seatPlan: null,
+      seatSelection: {
+        role: 'first-pass', seatIndex: 0, seatId: 'seat-1',
+        model: 'example-model', tool: 'opencode', variant: null, agent: null,
+      },
+      reviewerSeat: null,
+      stopReason: 'none',
+      createdAtIso: time(1),
+      updatedAtIso: time(30),
+      usage: {
+        source: 'opencode-db', readAtIso: time(10), sessionId: null, steps: 8, wallSeconds: 20,
+        tokensInput: 50, tokensOutput: 40, tokensReasoning: 10, tokensCacheRead: 5, tokensCacheWrite: 2,
+        costUsd: 0.12, model: 'example-model', agent: 'first-pass', reason: null,
+      },
+      ...overrides,
+    };
+  }
+
+  function gateReceipt(id: string, result: 'pass' | 'fail' = 'pass', exitCode = 0): TelemetryGateReceiptFact {
+    return { receiptId: asInput(id), result, exitCode, completedAtIso: time(32) };
+  }
+
+  function reviewReceipt(id: string, kind: 'brief-check' | 'code-review' = 'code-review'): TelemetryReviewReceiptFact {
+    return {
+      receiptId: asInput(id),
+      kind,
+      result: 'pass',
+      findings: { blocker: 0, major: 1, minor: 2, nit: 3 },
+      completedAtIso: time(33),
+    };
+  }
+
+  function handFacts(overrides: Partial<AttemptTraceTelemetryFacts> = {}): AttemptTraceTelemetryFacts {
+    return {
+      attempt: makeHandAttempt(),
+      receipts: { verification: [gateReceipt('receipt-gate-1')], review: [reviewReceipt('receipt-review-1')] },
+      conductedAttemptIds: new Set<string>(),
+      ...overrides,
+    };
+  }
+
+  it('emits the attempt root span and its usage, gate and review children', () => {
+    const result = attemptTraceSpans(hmac, handFacts());
+    const attempt = spanNamed(result.spans, 'attempt');
+    expect(attempt).toBeDefined();
+    const span = attempt as { kind: string; parentSpanId: string | null; startIso: string; endIso: string };
+    expect(span.kind).toBe('AGENT');
+    expect(span.parentSpanId).toBeNull();
+    expect(span.startIso).toBe(time(1));
+    expect(span.endIso).toBe(time(30));
+    const root = attemptTraceRoot(asInput(HAND_ATTEMPT_ID)) as NonNullable<ReturnType<typeof attemptTraceRoot>>;
+    const attemptSpan = attempt as { spanId: string };
+    expect(attemptSpan.spanId).toBe(telemetrySpanId(hmac, root, attemptIdentity(asInput(HAND_ATTEMPT_ID)) as never));
+
+    const usage = spanNamed(result.spans, 'usage') as { kind: string; parentSpanId: string };
+    expect(usage.kind).toBe('LLM');
+    expect(usage.parentSpanId).toBe(attemptSpan.spanId);
+
+    const gate = spanNamed(result.spans, 'gate') as {
+      kind: string; parentSpanId: string; attributes: Record<string, unknown>; startIso: string; endIso: string;
+    };
+    expect(gate.kind).toBe('GUARDRAIL');
+    expect(gate.parentSpanId).toBe(attemptSpan.spanId);
+    expect(gate.attributes['fleet.gate.result']).toBe('pass');
+    expect(gate.attributes['fleet.gate.exit_code']).toBe(0);
+    expect(gate.startIso).toBe(time(32));
+    expect(gate.endIso).toBe(time(32));
+
+    const review = spanNamed(result.spans, 'review') as { kind: string; parentSpanId: string; attributes: Record<string, unknown> };
+    expect(review.kind).toBe('EVALUATOR');
+    expect(review.parentSpanId).toBe(attemptSpan.spanId);
+    expect(review.attributes['fleet.review.kind']).toBe('code-review');
+    expect(review.attributes['fleet.review.result']).toBe('pass');
+    expect(review.attributes['fleet.review.findings.major']).toBe(1);
+    expect(review.attributes['fleet.review.findings.nit']).toBe(3);
+  });
+
+  it('derives the attempt, usage, gate receipt and review receipt span ids from the §3.4 table', () => {
+    const result = attemptTraceSpans(hmac, handFacts());
+    const root = attemptTraceRoot(asInput(HAND_ATTEMPT_ID)) as NonNullable<ReturnType<typeof attemptTraceRoot>>;
+    expect(spanNamed(result.spans, 'attempt')?.spanId).toBe(
+      telemetrySpanId(hmac, root, attemptIdentity(asInput(HAND_ATTEMPT_ID)) as never),
+    );
+    expect(spanNamed(result.spans, 'usage')?.spanId).toBe(
+      telemetrySpanId(hmac, root, usageIdentity(asInput(HAND_ATTEMPT_ID)) as never),
+    );
+    expect(spanNamed(result.spans, 'gate')?.spanId).toBe(
+      telemetrySpanId(hmac, root, verificationReceiptIdentity(asInput('receipt-gate-1')) as never),
+    );
+    expect(spanNamed(result.spans, 'review')?.spanId).toBe(
+      telemetrySpanId(hmac, root, reviewReceiptIdentity(asInput('receipt-review-1')) as never),
+    );
+  });
+
+  it('falls back to updatedAtIso for the root end when there is no completion receipt', () => {
+    const attempt = makeHandAttempt({ completionReceipt: null, updatedAtIso: time(40) });
+    const result = attemptTraceSpans(hmac, handFacts({ attempt }));
+    const attemptSpan = spanNamed(result.spans, 'attempt') as { endIso: string };
+    expect(attemptSpan.endIso).toBe(time(40));
+  });
+
+  it('returns no spans for a conducted attempt or a non-terminal attempt', () => {
+    const conducted = attemptTraceSpans(hmac, handFacts({ conductedAttemptIds: new Set([HAND_ATTEMPT_ID]) }));
+    expect(conducted.spans).toEqual([]);
+    const running = attemptTraceSpans(hmac, handFacts({ attempt: makeHandAttempt({ state: 'running' }) }));
+    expect(running.spans).toEqual([]);
+  });
+
+  it('a receipt arriving after the root keeps the same span id and parent as when mapped together', () => {
+    const lateGate = gateReceipt('receipt-gate-late', 'fail', 3);
+    const early = attemptTraceSpans(hmac, handFacts({ receipts: { verification: [gateReceipt('receipt-gate-1')], review: [] } }));
+    const late = attemptTraceSpans(hmac, handFacts({ receipts: { verification: [gateReceipt('receipt-gate-1'), lateGate], review: [] } }));
+    const together = attemptTraceSpans(hmac, handFacts({ receipts: { verification: [gateReceipt('receipt-gate-1'), lateGate], review: [] } }));
+    const root = attemptTraceRoot(asInput(HAND_ATTEMPT_ID)) as NonNullable<ReturnType<typeof attemptTraceRoot>>;
+    const expectedLateId = telemetrySpanId(hmac, root, verificationReceiptIdentity(asInput('receipt-gate-late')) as never);
+    const inLate = late.spans.find((span) => span.spanId === expectedLateId);
+    const inTogether = together.spans.find((span) => span.spanId === expectedLateId);
+    expect(inLate).toBeDefined();
+    expect(inTogether).toBeDefined();
+    expect(inLate?.parentSpanId).toBe(inTogether?.parentSpanId);
+    expect(inLate?.attributes).toEqual(inTogether?.attributes);
+    const earlyAttempt = spanNamed(early.spans, 'attempt') as { spanId: string };
+    const lateAttempt = spanNamed(late.spans, 'attempt') as { spanId: string };
+    expect(lateAttempt.spanId).toBe(earlyAttempt.spanId);
   });
 });

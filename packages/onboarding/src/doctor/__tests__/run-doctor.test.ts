@@ -417,6 +417,19 @@ describe('runDoctor', () => {
     expect(credential?.detail.startsWith('/home/dev/.opencode/auth.json: mode 0644')).toBe(true);
   });
 
+  it('probes a remote lane host\'s runner authFile on the orchestrator, never over ssh (KF-14c)', async () => {
+    const model = sampleModel({ runnerAuthFile: '/home/dev/.opencode/auth.json' });
+    const seen: string[] = [];
+    const { probes } = fakeProbes({
+      fileMode: async (host, path) => {
+        seen.push(`${host}:${path}`);
+        return 0o600;
+      },
+    });
+    await collect(loadedResult(model), probes);
+    expect(seen.filter((call) => call.endsWith('/home/dev/.opencode/auth.json'))).toEqual(['local:/home/dev/.opencode/auth.json']);
+  });
+
   it('fails a missing credential file', async () => {
     const model = sampleModel({ runnerAuthFile: '/gone/auth.json' });
     const { probes } = fakeProbes({ fileMode: async () => undefined });

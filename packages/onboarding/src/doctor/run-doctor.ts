@@ -353,7 +353,11 @@ async function credentialLines(
   for (const [name, host] of Object.entries(model.hosts)) {
     const authFile = host.runner?.authFile;
     if (authFile !== undefined) {
-      credentialPaths.push({ host: probeHostOf(name, host), path: authFile });
+      // KF-14c: ocm-run reads the runner authFile where it runs, on the
+      // orchestrator host (dispatch and the review route both spawn it here
+      // and tunnel to the lane host), so the file is probed locally for every
+      // host; the lane host never holds it.
+      credentialPaths.push({ host: 'local', path: authFile });
     }
   }
   const decisions = model.decisions;

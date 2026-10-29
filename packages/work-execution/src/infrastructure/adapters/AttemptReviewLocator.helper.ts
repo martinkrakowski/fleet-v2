@@ -15,6 +15,7 @@
  */
 
 import type { AttemptRecord, AttemptRunnerRecord } from '../../domain/execution-records.js';
+import { ReviewTransportError } from '@fleet/evidence-and-acceptance';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import { ExecutorForHost } from './ExecutorForHost.helper.js';
 import {
@@ -74,7 +75,9 @@ export class AttemptReviewLocator {
     }
     const resolved = this.options.executorForHost.executorForRecordedHost(attempt.runner ?? null);
     if (!resolved.ok) {
-      throw new Error(resolved.reason);
+      // A recorded host that changed or was removed never falls back (H9b);
+      // the refusal travels as the typed route code so the journal names it.
+      throw new ReviewTransportError(resolved.reason, 'route-host-changed');
     }
     const executor = resolved.executor;
     const worktreePath = attempt.worktreePath;

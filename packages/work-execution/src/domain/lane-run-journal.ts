@@ -314,10 +314,14 @@ function entryDetailError(snapshot: Record<string, unknown>, present: boolean): 
     return null;
   }
   const detail = snapshot.detail;
-  if (
-    detail !== null &&
-    (typeof detail !== 'string' || !LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(detail))
-  ) {
+  if (detail === null) {
+    return null;
+  }
+  // Only a result carries a detail, like a reason code (KF-14a, review).
+  if (snapshot.kind !== 'result') {
+    return 'LaneRunJournal detail must be null on an intent or conduct entry';
+  }
+  if (typeof detail !== 'string' || !LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(detail)) {
     return 'LaneRunJournal detail must be null or a lowercase token';
   }
   return null;

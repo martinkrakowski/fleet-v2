@@ -289,6 +289,7 @@ describe('AttemptReviewLocator', () => {
       }),
       hosts: { 'this-machine': hosts['this-machine'] },
     });
+    await expect(locator.locate('att-1')).rejects.toMatchObject({ code: 'route-host-changed' });
     await expect(locator.locate('att-1')).rejects.toThrow(
       /recorded host lane-host changed or was removed/,
     );

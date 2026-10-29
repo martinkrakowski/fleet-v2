@@ -263,6 +263,15 @@ describe('detail (KF-14a)', () => {
     expect(read.entry.detail).toBe('route-no-auth-file');
   });
 
+  it('refuses a detail on an intent or conduct entry, like a reason code (KF-14a review)', () => {
+    const intentEntry = { ...result(STEP_KEY, 'completed', { detail: null }), kind: 'intent', outcome: null, reasonCode: null, detail: 'route-no-port' };
+    const read = readLaneRunJournalEntry(intentEntry);
+    expect(read.ok).toBe(false);
+    if (!read.ok) {
+      expect(read.error).toBe('LaneRunJournal detail must be null on an intent or conduct entry');
+    }
+  });
+
   it('refuses a free-text detail like a bad reason code', () => {
     const read = readLaneRunJournalEntry(result(STEP_KEY, 'completed', { detail: 'Host lane-host refuses' }));
     expect(read.ok).toBe(false);

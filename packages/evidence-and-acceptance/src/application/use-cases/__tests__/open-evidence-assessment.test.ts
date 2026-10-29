@@ -254,6 +254,37 @@ describe('OpenEvidenceAssessmentUseCase', () => {
     expect(repo.saveCalls).toBe(0);
   });
 
+  it('refuses invalid-request and never calls the store when requiredChecks is empty', async () => {
+    const repo = new InMemoryAssessmentRepo([]);
+    const useCase = new OpenEvidenceAssessmentUseCase({ repo });
+
+    const result = await useCase.openEvidenceAssessment(sampleRequest({ requiredChecks: [] }));
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(repo.findCalls).toBe(0);
+    expect(repo.saveCalls).toBe(0);
+  });
+
+  it('refuses terminal for an accepted assessment at the same head and writes nothing', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord({ state: 'accepted' })]);
+    const useCase = new OpenEvidenceAssessmentUseCase({ repo });
+
+    const result = await useCase.openEvidenceAssessment(sampleRequest());
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'terminal' });
+    expect(repo.saveCalls).toBe(0);
+  });
+
+  it('answers exists for a blocked assessment at the same head and leaves its blockers', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord({ state: 'blocked' })]);
+    const useCase = new OpenEvidenceAssessmentUseCase({ repo });
+
+    const result = await useCase.openEvidenceAssessment(sampleRequest());
+
+    expect(result.outcome).toBe('exists');
+    expect(repo.saveCalls).toBe(0);
+  });
+
   it('refuses invalid-request and never calls the store when the candidate head sha is not 40 lowercase hex', async () => {
     const repo = new InMemoryAssessmentRepo([]);
     const useCase = new OpenEvidenceAssessmentUseCase({ repo });

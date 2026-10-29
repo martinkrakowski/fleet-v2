@@ -65,6 +65,8 @@ export class OpenEvidenceAssessmentUseCase implements OpenEvidenceAssessmentPort
       !isNonEmptyTrimmedString(request.policyRevision) ||
       !isNonEmptyTrimmedString(request.implementerModel) ||
       !Array.isArray(request.requiredChecks) ||
+      // An assessment with no required check has nothing left to block acceptance; RequestVerification refuses it too.
+      request.requiredChecks.length === 0 ||
       !request.requiredChecks.every(isNonEmptyTrimmedString)
     ) {
       return { outcome: 'refused', reason: 'invalid-request' };

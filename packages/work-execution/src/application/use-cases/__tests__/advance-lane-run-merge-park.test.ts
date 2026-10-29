@@ -885,4 +885,33 @@ describe('AdvanceLaneRunUseCase park notice re-raise (KF-4)', () => {
     expect(harness.askParkQuestionCalls).toEqual([]);
     expect(harness.portCalls.filter((call) => call.startsWith('park'))).toHaveLength(0);
   });
+
+  it('test 18: the reconcile after a landed notice re-raise saves at the fresh revision (KF-9)', async () => {
+    // A parked run whose owner question lands on THIS advance saves the
+    // question id at revision + 1; the unread prepare intent's reconcile (G3a)
+    // must then append its attempt id at the FRESH revision, never refusing
+    // once as `save-refused` on the stale one.
+    const harness = await makeHarness(
+      runRecord({
+        parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null },
+        parkCount: 1,
+      }),
+      [attemptFixture({ id: 'attempt-fix-1', kind: 'fix', fixNumber: 1, priorAttemptId: 'attempt-example-1' })],
+      { wireParkNotice: true, wireWorkOrder: true },
+    );
+    await conduct(harness, 'parked', NOW);
+    const prepareKey = stepKey({ round: 1, step: 'prepare', seatIndex: 0, attemptOrdinal: 2, head12: null });
+    await appendIntent(harness, prepareKey, 'attempt-fix-1', NOW);
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey,
+      result: 'reconciled',
+      reasonCode: 'prepared',
+    });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.attemptIds).toContain('attempt-fix-1');
+    expect(record?.parked?.questionId).toBe(QUESTION_ID);
+  });
 });

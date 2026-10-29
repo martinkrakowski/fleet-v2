@@ -260,6 +260,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     }
 
     const gathered = await gatherFacts(this.ctx, record, entries, request, journalState);
+    let decisionRecord: LaneRunRecord = record;
     // A parked run whose notice did not land re-raises it under its saved park
     // key on every advance until it lands. For an owner-question reason the
     // question id is saved once it lands, which turns this condition off; for
@@ -277,9 +278,19 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
         record.parked.qualifier,
         request,
       );
+      // KF-9: the re-raise may have saved the question id at revision + 1; the
+      // decision below must not save with the already-loaded record at the
+      // stale revision or its write is refused once as `save-refused`. One
+      // read, no other behaviour change; the same refusal as a vanished run
+      // above.
+      const fresh = await this.deps.runRepo.get(request.runId);
+      if (fresh === null) {
+        return { outcome: 'refused', reason: 'run-not-found' };
+      }
+      decisionRecord = fresh;
     }
-    const decision = nextLaneRunAction(record, gathered.facts, request.nowIso);
-    return this.performDecision(record, gathered, decision, request);
+    const decision = nextLaneRunAction(decisionRecord, gathered.facts, request.nowIso);
+    return this.performDecision(decisionRecord, gathered, decision, request);
   }
 
   private async performDecision(

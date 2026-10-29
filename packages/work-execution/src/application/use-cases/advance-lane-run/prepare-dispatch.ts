@@ -12,13 +12,15 @@ import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendConduct, appendRunIntent, appendRunResult, ceilingPark, performPark, saveOrRefuse } from './step-context.js';
 import { manifestExpectedArtifacts, manifestPositiveInteger, manifestTimeLimitSeconds, readFrozenManifest } from './frozen-manifest.js';
+import { performFixPrepare } from './review-fix.js';
 
 /**
  * The `act prepare` decision (K4-5): a fresh round-0 attempt on the selected
  * first-pass seat, copying the frozen-brief fields from the run's latest
  * attempt (the seat pivot). Order: intent, attempt record, run record,
  * result — so a result never exists for an attempt the run record does not
- * list. A fix-round prepare stays with K5 and is refused under its key.
+ * list. A fix-round prepare stays with K5 and routes to `performFixPrepare`
+ * under its key.
  */
 export async function performPrepare(ctx: AdvanceStepContext,
   record: LaneRunRecord,
@@ -44,7 +46,7 @@ export async function performPrepare(ctx: AdvanceStepContext,
   };
 
   if (decision.round !== 0) {
-    return refuse('prepare-fix-round-not-built');
+    return performFixPrepare(ctx, record, gathered, decision, request, refuse);
   }
   let source: AttemptRecord | null = null;
   for (let index = gathered.attemptRecords.length - 1; index >= 0; index -= 1) {

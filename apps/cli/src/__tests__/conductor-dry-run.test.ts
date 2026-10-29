@@ -21,6 +21,24 @@ import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli } from '../index.js';
 import type { CliIo } from '../index.js';
 import type { ConductorCliOptions } from '../conductor.js';
+import type { DryRunFakes } from '../conductor-dry-run.js';
+
+// Capture the dry-run fakes the CLI composes, so a test can read the recorder
+// without the dry-run printing it (the scratch stores are removed on return).
+const capturedFakes = vi.hoisted(() => ({ current: null as unknown }));
+vi.mock('../conductor-dry-run.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../conductor-dry-run.js')>();
+  return {
+    ...actual,
+    createDryRunFakes: (
+      ...args: Parameters<typeof actual.createDryRunFakes>
+    ): ReturnType<typeof actual.createDryRunFakes> => {
+      const fakes = actual.createDryRunFakes(...args);
+      capturedFakes.current = fakes;
+      return fakes;
+    },
+  };
+});
 
 const NOW = '2026-10-27T10:00:00.000Z';
 const RUN_ID = 'run-01JB0000000000000000000000';
@@ -34,7 +52,7 @@ const SEAT_PLAN = {
     { id: 'fp-2', model: 'model-example-2', tool: 'opencode' },
   ],
   fix: [{ id: 'fx-1', model: 'model-example-1', tool: 'opencode' }],
-  review: [],
+  review: [{ id: 'review-dry-run', model: 'example/dry-run-reviewer' }],
 };
 
 const SEAT_SELECTION = {
@@ -286,14 +304,15 @@ describe('conductor run --dry-run (K7-8)', () => {
 
     expect(result.code).toBe(0);
     const would = wouldLines(result.stdout);
-    expect(would.map((line) => line.would)).toEqual(['dispatch', 'collect', 'gate']);
+    expect(would.map((line) => line.would)).toEqual(['dispatch', 'collect', 'gate', 'brief-check', 'code-review']);
     expect(would[0]).toMatchObject({ key: `${RUN_ID}/r0/dispatch/0/a1`, result: 'completed', reasonCode: 'dispatch-started' });
     expect(would[1]).toMatchObject({ key: `${RUN_ID}/r0/collect/0`, result: 'completed', reasonCode: 'collected' });
     expect(would[2]).toMatchObject({ key: `${RUN_ID}/r0/gate/0@dddddddddddd`, result: 'completed', reasonCode: 'gate-passed' });
+    expect(would[3]).toMatchObject({ key: `${RUN_ID}/r0/brief-check/0@dddddddddddd`, result: 'completed', reasonCode: 'review-passed' });
+    expect(would[4]).toMatchObject({ key: `${RUN_ID}/r0/code-review/0@dddddddddddd`, result: 'completed', reasonCode: 'review-passed' });
     // The entered states the driver would enter, in order: dispatch, run,
-    // collect, gate, then the brief check — where K5's review step is not
-    // built yet, so on this base the run parks at review-seat-unavailable
-    // instead of issuing the not-built review act.
+    // collect, gate, then both reviews pass and the run reaches accepting —
+    // where K6's accept act is not wired yet, so the run stops there.
     const entered = enteredLines(result.stdout);
     expect(entered.map((line) => line.entered)).toEqual([
       'dispatching',
@@ -301,7 +320,8 @@ describe('conductor run --dry-run (K7-8)', () => {
       'collecting',
       'gating',
       'brief-check',
-      'parked',
+      'code-review',
+      'accepting',
     ]);
     expect(entered[entered.length - 1]).toMatchObject({ runId: RUN_ID });
 
@@ -310,12 +330,38 @@ describe('conductor run --dry-run (K7-8)', () => {
     const firstPass = passes[0];
     expect(firstPass.runs).toHaveLength(1);
     expect(firstPass.runs[0].outcome).toBe('advanced');
-    const steps = firstPass.runs[0].steps;
-    expect(steps[steps.length - 1]).toEqual({
-      outcome: 'parked',
-      reason: 'review-seat-unavailable',
-      qualifier: null,
+    // The reviews pass and the run reaches accepting; the pass cap may split
+    // the steps over several passes, so the run's final step is the last step
+    // of the last pass that acted. K6 is not wired in the dry-run yet: the
+    // first accepting act is not-wired, never a park.
+    const allSteps = passes.flatMap((pass) => pass.runs.flatMap((run) => run.steps));
+    expect(allSteps.some((step) => step.outcome === 'parked')).toBe(false);
+    expect(allSteps[allSteps.length - 1]).toEqual({
+      outcome: 'not-wired',
+      step: 'accept',
     });
+
+    // Each review opened the evidence assessment and then issued its request,
+    // in that order, under a minted request id the act journalled first.
+    const fakes = capturedFakes.current as DryRunFakes | null;
+    expect(fakes).not.toBeNull();
+    const calls = fakes!.recorder.calls;
+    const ports = calls.map((call) => call.port);
+    const gateIndex = ports.indexOf('gate');
+    expect(ports.slice(gateIndex + 1)).toEqual([
+      'reviewAssessment',
+      'reviewRequest',
+      'reviewAssessment',
+      'reviewRequest',
+    ]);
+    const requestIds = calls
+      .filter((call) => call.port === 'reviewRequest')
+      .map((call) => call.requestId);
+    expect(requestIds).toHaveLength(2);
+    for (const requestId of requestIds) {
+      expect(requestId).toMatch(/^review-/);
+    }
+    expect(requestIds[0]).not.toBe(requestIds[1]);
 
     // The real state is untouched, the scratch directory is gone, and no
     // subprocess ever ran.

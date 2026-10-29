@@ -59,6 +59,8 @@ import {
   resolveWorkRunnerSettings,
   type WorkCrossContextDelegates,
 } from "./work/composition";
+import { readOwnerDecisionReferencesFromAttempt } from "@fleet/work-execution";
+import { readAcceptanceForAttempt } from "@fleet/work-execution";
 
 export interface FleetApiRuntimeOptions {
   /** Shared persistence directory for every context's file-backed adapters. */
@@ -403,32 +405,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   const attemptOwnerDecisionDelegate: EvidenceAttemptOwnerDecisionDelegate & WorkAttemptOwnerDecisionDelegate = {
     // The doors come from the attempt record dispatch wrote from the
     // frozen brief package, never from a request body or worktree file.
-    readAttemptOwnerDecisionReferences: async (request) => {
-      const inspectAttempt = attemptLookup.inspectAttempt;
-      if (!inspectAttempt) {
-        return {
-          outcome: "unknown",
-          reason: "The work context is not wired for attempt inspection",
-        };
-      }
-      const inspection = await inspectAttempt.inspectAttempt({
-        attemptId: request.attemptId,
-      });
-      if (inspection.outcome !== "found") {
-        return {
-          outcome: "unknown",
-          reason: `No attempt is recorded for ${request.attemptId}`,
-        };
-      }
-      const recorded = inspection.attempt.ownerDecisionReferences;
-      if (recorded === undefined) {
-        return {
-          outcome: "unknown",
-          reason: `attempt ${request.attemptId} was recorded before owner decision references were frozen`,
-        };
-      }
-      return { outcome: "recorded", ownerDecisionReferences: recorded };
-    },
+    readAttemptOwnerDecisionReferences: (request) => readOwnerDecisionReferencesFromAttempt(attemptLookup, request),
   };
   const runReview = buildReviewTransport(stateDir, installation, options?.reviewSpawn);
   const evidence = createConfiguredEvidenceUseCases(
@@ -660,44 +637,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
       },
     },
     acceptanceEvidence: {
-      readAcceptance: async (request) => {
-        let inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
-          assessmentId: assessmentIdForAttempt(request.attemptId),
-          candidateHeadSha: request.candidateHeadSha,
-        });
-        if (inspected.outcome === "not-found") {
-          inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
-            assessmentId: request.attemptId,
-            candidateHeadSha: request.candidateHeadSha,
-          });
-        }
-        // No head-only fallback: an assessment that is not bound to this
-        // attempt is another attempt's evidence, and this attempt has none.
-        if (
-          inspected.outcome === "found" &&
-          inspected.assessment.attemptId !== request.attemptId
-        ) {
-          return {
-            outcome: "not-found",
-            reason: `No acceptance assessment found for head ${request.candidateHeadSha}`,
-          };
-        }
-        if (inspected.outcome === "found") {
-          return {
-            outcome: "found",
-            assessment: {
-              candidateHeadSha: inspected.assessment.candidateHeadSha,
-              policyRevision: inspected.assessment.policyRevision,
-              state: inspected.assessment.state,
-              acceptanceReceiptId: inspected.assessment.acceptanceReceiptId,
-            },
-          };
-        }
-        return {
-          outcome: "not-found",
-          reason: `No acceptance assessment found for head ${request.candidateHeadSha}`,
-        };
-      },
+      readAcceptance: (request) => readAcceptanceForAttempt(evidence.inspectAcceptanceEvidence, request),
     },
     observation: {
       publish: async (request) => {

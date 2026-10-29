@@ -40,6 +40,11 @@ import type {
   PrepareFixAttemptResult,
 } from '../../ports/in/PrepareFixAttemptPort.in-port.js';
 import type {
+  PrepareBriefPackageResult,
+} from '../../ports/in/PrepareBriefPackagePort.in-port.js';
+import type { PrepareBriefPackageUseCaseRequest } from '../PrepareBriefPackageUseCase.use-case.js';
+import { renderHandoverBrief } from '../../../domain/lane-run-handover.js';
+import type {
   DispatchAttemptRequest,
   DispatchAttemptResult,
 } from '../../ports/in/DispatchAttemptPort.in-port.js';
@@ -53,6 +58,30 @@ const COMMIT_A = 'a'.repeat(40);
 const HEAD12_A = 'a'.repeat(12);
 const SHA = 'c'.repeat(64);
 const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
+
+/** The frozen manifest a conducted run writes: every field the fix-round brief rebuild needs. */
+const FULL_MANIFEST_JSON = JSON.stringify({
+  workOrderId: 'wo-example-1',
+  projectId: 'project-example-1',
+  taskId: 'task-example-1',
+  laneId: 'lane-example-1',
+  repository: 'example/repo',
+  baseCommit: COMMIT_A,
+  policyRevision: 'policy-example-1',
+  modelAssignment: { model: 'model-example-1', variant: 'default', fallbackModel: 'fallback-model', seatTool: 'opencode' },
+  independentReviewer: 'review-model-1',
+  ownedPaths: ['packages/example/src'],
+  allowedPathPrefixes: ['packages/example/src'],
+  permissions: ['filesystem:worktree'],
+  acceptanceChecks: ['check-1'],
+  acceptanceSpec: { commitRequired: true, diffCheck: true, commands: [{ argv: ['corepack', 'yarn', 'build'] }] },
+  stepLimit: 100,
+  timeLimitSeconds: 2700,
+  resourceBounds: { cpu: '2' },
+  expectedArtifacts: [],
+  ownerDecisionReferences: [],
+  prNotes: { hardToUndo: 'undo', assumptions: 'assume', challengeThis: 'challenge' },
+});
 
 const BASE_RECORD = {
   version: 1,
@@ -162,8 +191,8 @@ function buildFixAttempt(request: PrepareFixAttemptRequest, seatIndex: number): 
     state: 'intent-recorded',
     outcome: null,
     revision: 0,
-    briefDigest: SHA,
-    briefPackagePath: '.lane/brief-package',
+    briefDigest: request.briefDigest ?? SHA,
+    briefPackagePath: request.briefPackagePath ?? '.lane/brief-package',
     sessionId: null,
     completionReceipt: null,
     artifacts: null,
@@ -268,6 +297,7 @@ interface Harness {
   readonly executionJournal: ExecutionJournalAdapter;
   readonly reviewRequests: ReviewRequest[];
   readonly fixRequests: PrepareFixAttemptRequest[];
+  readonly briefRequests: PrepareBriefPackageUseCaseRequest[];
   readonly dispatchRequests: DispatchAttemptRequest[];
   readonly deps: AdvanceLaneRunDependencies;
   /** Journal length when the prepare port was called (order assertion). */
@@ -275,6 +305,7 @@ interface Harness {
   setManifest(json: string | null): void;
   setFindReceiptAnswer(answer: (request: FindReviewReceiptRequest) => Promise<FindReviewReceiptResult>): void;
   setFixAnswer(answer: (request: PrepareFixAttemptRequest) => Promise<PrepareFixAttemptResult>): void;
+  setBriefAnswer(answer: (request: PrepareBriefPackageUseCaseRequest) => Promise<PrepareBriefPackageResult>): void;
   setDispatchAnswer(answer: (request: DispatchAttemptRequest) => Promise<DispatchAttemptResult>): void;
   setSameFamily(fn: SameModelFamily): void;
   setJournalBaseline(length: number): void;
@@ -298,13 +329,9 @@ async function makeHarness(
   const executionJournal = new ExecutionJournalAdapter();
   const reviewRequests: ReviewRequest[] = [];
   const fixRequests: PrepareFixAttemptRequest[] = [];
+  const briefRequests: PrepareBriefPackageUseCaseRequest[] = [];
   const dispatchRequests: DispatchAttemptRequest[] = [];
-  let manifestJson: string | null = JSON.stringify({
-    acceptanceChecks: ['check-1'],
-    stepLimit: 100,
-    timeLimitSeconds: 2700,
-    expectedArtifacts: [],
-  });
+  let manifestJson: string | null = FULL_MANIFEST_JSON;
   let journalLengthWhenPrepared = 0;
   let journalLengthBeforeAdvance = 0;
   let sameFamilyImpl: SameModelFamily = (left, right) => left === right;
@@ -326,6 +353,16 @@ async function makeHarness(
   let prepareAnswer: (request: PrepareFixAttemptRequest) => Promise<PrepareFixAttemptResult> = async (request) => ({
     outcome: 'prepared',
     attempt: buildFixAttempt(request, 0),
+  });
+  let prepareBriefAnswer: (request: PrepareBriefPackageUseCaseRequest) => Promise<PrepareBriefPackageResult> = async (request) => ({
+    outcome: 'prepared',
+    prepared: {
+      attemptId: request.attemptId ?? '',
+      briefDigest: SHA,
+      prosePath: '.lane/brief.md',
+      manifestPath: '.lane/brief-manifest.json',
+      selectedKnowledgeVersions: [],
+    },
   });
   let dispatchAnswer: (request: DispatchAttemptRequest) => Promise<DispatchAttemptResult> = async (request) => ({
     outcome: 'started',
@@ -410,6 +447,26 @@ async function makeHarness(
             },
           },
         }),
+    // KF-6: the recording `prepareBrief` fake; a fix round places its brief
+    // package before preparing the fix attempt.
+    prepareBrief: {
+      prepareBriefPackage: async (request) => {
+        briefRequests.push(request);
+        return prepareBriefAnswer(request);
+      },
+      previewBriefPackage: async () => ({
+        outcome: 'previewed',
+        preview: {
+          attemptId: '',
+          briefDigest: SHA,
+          modelAssignment: { model: 'model-example-1', variant: 'default', seatTool: 'opencode' },
+          seatPlan: null,
+          acceptance: { commitRequired: true, diffCheck: true, commandCount: 1, commandDigests: [] },
+          prNotesPresent: false,
+          selectedKnowledgeVersions: [],
+        },
+      }),
+    },
     ...(options.wireDispatch === false
       ? {}
       : {
@@ -429,6 +486,7 @@ async function makeHarness(
     executionJournal,
     reviewRequests,
     fixRequests,
+    briefRequests,
     dispatchRequests,
     deps,
     get journalLengthWhenPrepared() {
@@ -442,6 +500,9 @@ async function makeHarness(
     },
     setFixAnswer: (answer) => {
       prepareAnswer = answer;
+    },
+    setBriefAnswer: (answer) => {
+      prepareBriefAnswer = answer;
     },
     setDispatchAnswer: (answer) => {
       dispatchAnswer = answer;
@@ -584,6 +645,34 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       '[major] src/ex.ts:20 — blocks the acceptance check',
     ]);
     expect(fixRequest.fixAttemptId.startsWith('attempt-')).toBe(true);
+
+    // KF-6: the fix round placed its brief package before preparing the fix
+    // attempt — the handover text as the prose, the manifest fields, and the
+    // prepared digest and path carried into the fix attempt.
+    expect(harness.briefRequests).toHaveLength(1);
+    const briefRequest = harness.briefRequests[0]!;
+    expect(briefRequest.attemptId).toBe(fixRequest.fixAttemptId);
+    expect(briefRequest.worktreePath).toBe(WORKTREE);
+    expect(briefRequest.contextDecisions).toEqual([]);
+    expect(briefRequest.prNotes).toEqual({ hardToUndo: 'undo', assumptions: 'assume', challengeThis: 'challenge' });
+    const rendered = renderHandoverBrief({
+      runId: RUN_ID,
+      round: 1,
+      branchName: WORKTREE.split('/').pop() ?? '',
+      head12: HEAD12_A,
+      source: 'review',
+      findings: [
+        blockerFinding(),
+        { findingId: 'finding-2', severity: 'major', summary: 'blocks the acceptance check', filePath: 'src/ex.ts', line: 20 },
+      ],
+      gateReasonCodes: [],
+    });
+    expect(rendered.ok).toBe(true);
+    if (rendered.ok) {
+      expect(briefRequest.proseMarkdown).toBe(rendered.text);
+    }
+    expect(fixRequest.briefDigest).toBe(SHA);
+    expect(fixRequest.briefPackagePath).toBe('.lane/brief.md');
 
     const record = await harness.runRepo.get(RUN_ID);
     expect(record?.attemptIds).toEqual(['attempt-example-1', fixRequest.fixAttemptId]);
@@ -751,5 +840,71 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     const savedAttempt = await harness.attemptRepo.findAttemptById(harness.fixRequests[0]!.fixAttemptId);
     expect(savedAttempt?.seatSelection?.seatIndex).toBe(1);
     expect(savedAttempt?.seatSelection?.seatId).toBe('fx-2');
+  });
+
+  it('i) dispatches the prepared fix attempt: the brief digest and path flow from prepareBrief into the fix attempt', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+
+    const first = await advance(harness);
+    expect(first).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared' });
+
+    const afterPrepare = await harness.runRepo.get(RUN_ID);
+    const fixAttemptId = afterPrepare?.attemptIds[1];
+    expect(typeof fixAttemptId).toBe('string');
+    const saved = await harness.attemptRepo.findAttemptById(fixAttemptId as string);
+    expect(saved?.briefDigest).toBe(SHA);
+    expect(saved?.briefPackagePath).toBe('.lane/brief.md');
+
+    await admit(harness, fixAttemptId as string);
+    const dispatched = await advance(harness);
+    expect(dispatched).toMatchObject({
+      outcome: 'acted',
+      step: 'dispatch',
+      result: 'completed',
+      reasonCode: 'dispatch-started',
+    });
+    expect(harness.dispatchRequests).toHaveLength(1);
+  });
+
+  it('j) refuses prepare-refused when the brief placement is rejected, saving no fix attempt', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setBriefAnswer(async () => ({ outcome: 'rejected', reason: 'example' }));
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.attemptIds).toEqual(['attempt-example-1']);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'prepare-refused')).toBe(true);
+  });
+
+  it('k) refuses prepare-refused when the prior manifest is unusable or incomplete', async () => {
+    for (const manifest of [null, JSON.stringify({ stepLimit: 100 })]) {
+      const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+      await seedReviewFailure(harness, [blockerFinding()]);
+      harness.setManifest(manifest);
+
+      const result = await advance(harness);
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'prepare',
+        key: prepareKey(1, 0, 2),
+        result: 'refused',
+        reasonCode: 'prepare-refused',
+      });
+      expect(harness.fixRequests).toHaveLength(0);
+      expect(harness.briefRequests).toHaveLength(0);
+      const record = await harness.runRepo.get(RUN_ID);
+      expect(record?.attemptIds).toEqual(['attempt-example-1']);
+    }
   });
 });

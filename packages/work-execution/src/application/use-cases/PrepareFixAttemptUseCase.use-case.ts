@@ -106,6 +106,14 @@ export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
     if (!Array.isArray(request.numberedFixes) || request.numberedFixes.length === 0) {
       return { outcome: 'refused', reason: 'numberedFixes must record at least one fix' };
     }
+    const hasBriefDigest = request.briefDigest !== undefined;
+    const hasBriefPackagePath = request.briefPackagePath !== undefined;
+    if (hasBriefDigest !== hasBriefPackagePath) {
+      return { outcome: 'refused', reason: 'briefDigest and briefPackagePath must be given together' };
+    }
+    if (hasBriefDigest && (!isNonEmpty(request.briefDigest) || !isNonEmpty(request.briefPackagePath))) {
+      return { outcome: 'refused', reason: 'briefDigest and briefPackagePath must be non-empty strings' };
+    }
 
     const check = await checkFixPriorSettled(this.deps.attemptRepo, {
       fixAttemptId: request.fixAttemptId,
@@ -179,8 +187,8 @@ export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
       baseCommit: prior.baseCommit,
       state: 'intent-recorded',
       outcome: null,
-      briefDigest: null,
-      briefPackagePath: null,
+      briefDigest: request.briefDigest ?? null,
+      briefPackagePath: request.briefPackagePath ?? null,
       sessionId: null,
       completionReceipt: null,
       artifacts: null,

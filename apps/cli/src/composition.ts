@@ -35,6 +35,7 @@ import {
   AttemptReviewLocator,
   BriefAuthoringAdapter,
   BriefKnowledgeAdapter,
+  CiStateAdapter,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
   DispatchAttemptUseCase,
@@ -59,6 +60,7 @@ import {
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
   RequestAttemptAcceptanceUseCase,
+  ReviewRequestAdapter,
   ReserveExecutionCapacityUseCase,
   RunnerForAttemptAdapter,
   RunnerSelectorAdapter,
@@ -107,6 +109,7 @@ import {
   hasReviewerSeat,
   IndependentReviewAdapter,
   InspectAcceptanceEvidenceUseCase,
+  InspectHeadCiStateUseCase,
   type OcmReviewTransportSpawn,
   OwnerDecisionAdapter,
   RecordFindingDispositionUseCase,
@@ -577,6 +580,8 @@ export interface FleetCliRuntime {
     readonly recordFindingDisposition: RecordFindingDispositionUseCase;
     readonly assessHeadAcceptance: AssessHeadAcceptanceUseCase;
     readonly inspectAcceptanceEvidence: InspectAcceptanceEvidenceUseCase;
+    /** CI per exact head (PC); K6 composes it. */
+    readonly inspectHeadCiState: InspectHeadCiStateUseCase;
   };
   readonly execution: {
     readonly workOrderRepository: WorkOrderRepositoryAdapter;
@@ -634,6 +639,10 @@ export interface FleetCliRuntime {
     readonly newUlid: () => string;
     /** The project profile read the root already builds; exposed for `conductor start` (K7-7). */
     readonly profileRead: ProjectProfileReadPort;
+    /** The review step's port (PC); K5 composes it into the advance. */
+    readonly reviewRequest: ReviewRequestAdapter;
+    /** CI per exact head (PC); K6 composes it. */
+    readonly ciState: CiStateAdapter;
   };
 }
 
@@ -1135,6 +1144,11 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     inspectAcceptanceEvidence: new InspectAcceptanceEvidenceUseCase({
       repo: evidenceAssessmentRepository,
     }),
+    // Forge mode `github` only, as for assessHeadAcceptance; otherwise every
+    // head answers unknown / not-configured.
+    inspectHeadCiState: new InspectHeadCiStateUseCase(
+      forgeMode === 'github' ? { forgeEvidence } : {},
+    ),
   };
 
   // --- work-execution ---------------------------------------------------------
@@ -1866,6 +1880,17 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     }),
     newUlid: conductorNewUlid,
     profileRead,
+    // Delegates are bound as arrow functions: the use cases read `this.deps`,
+    // so an unbound method call would fail every request.
+    reviewRequest: new ReviewRequestAdapter({
+      requestIndependentReview: (request) =>
+        evidence.requestIndependentReview.requestIndependentReview(request),
+      inspectAcceptanceEvidence: (request) =>
+        evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence(request),
+    }),
+    ciState: new CiStateAdapter({
+      inspectHeadCiState: (request) => evidence.inspectHeadCiState.inspectHeadCiState(request),
+    }),
   };
 
   return {

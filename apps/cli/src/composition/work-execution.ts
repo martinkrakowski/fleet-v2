@@ -23,6 +23,7 @@ import {
   ExecuteAuthorizedForgeActionUseCase,
   ExecutionObservationAdapter,
   GatePredicateAdapter,
+  ProcessTreeTerminationAdapter,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   LaneDiffCheckAdapter,
@@ -470,6 +471,9 @@ export function composeExecution(input: ComposeExecutionInput) {
     computeDigest: sha256HexDigest,
   });
   const attemptGate = options?.attemptGate ?? composedAttemptGate;
+  // PK-1: stop, the dispatch conflict stops and collect kill the attempt's
+  // process tree on its recorded host (a legacy record is refused by the adapter).
+  const processTreeTermination = new ProcessTreeTerminationAdapter({ executorForHost });
 
   const execution = {
     workOrderRepository,
@@ -543,6 +547,7 @@ export function composeExecution(input: ComposeExecutionInput) {
       artifactPort: attemptArtifact,
       computeDigest: sha256HexDigest,
       allowedSeats,
+      processTreeTermination,
     }),
     commitEditOnlyAttempt: new CommitEditOnlyAttemptUseCase({
       attemptRepo: attemptRepository,
@@ -567,6 +572,7 @@ export function composeExecution(input: ComposeExecutionInput) {
       journal: executionJournal,
       runner,
       runnerForAttempt,
+      processTreeTermination,
     }),
     collectAttemptArtifacts: new CollectAttemptArtifactsUseCase({
       attemptRepo: attemptRepository,
@@ -575,6 +581,7 @@ export function composeExecution(input: ComposeExecutionInput) {
       briefKnowledge,
       runnerForAttempt,
       usage: opencodeDbUsage,
+      processTreeTermination,
     }),
     prepareFixAttempt: new PrepareFixAttemptUseCase({ attemptRepo: attemptRepository }),
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({

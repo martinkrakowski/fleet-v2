@@ -38,6 +38,7 @@ import {
   BriefAuthoringAdapter,
   BriefKnowledgeAdapter,
   CiStateAdapter,
+  GateReceiptAdapter,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
   ConductorForgeGrantAdapter,
@@ -654,6 +655,8 @@ export interface FleetCliRuntime {
     readonly reviewRequest: ReviewRequestAdapter;
     /** Opens the evidence assessment before a conductor review (K5-3); K5-6 composes it into the advance. */
     readonly reviewAssessment: ReviewAssessmentAdapter;
+    /** The conducted gate's verification receipts, one per acceptance check (KF-13). */
+    readonly gateReceipts: GateReceiptAdapter;
     /** CI per exact head (PC); K6 composes it. */
     readonly ciState: CiStateAdapter;
     /** The conductor's own push grant issuer (K6-2); K6-8 composes it into the advance. */

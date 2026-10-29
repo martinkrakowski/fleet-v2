@@ -11,6 +11,7 @@ import {
   CiStateAdapter,
   ConductorDriverLeaseAdapter,
   ConductorHaltAdapter,
+  GateReceiptAdapter,
   InspectLaneRunsUseCase,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
@@ -22,6 +23,7 @@ import {
 } from '@fleet/work-execution';
 
 import { conductorRevision, resolveConductorPolicy } from '@fleet/installation';
+import { assessmentIdForAttempt } from '@fleet/evidence-and-acceptance';
 
 import type { FleetCliRuntime } from '../composition.js';
 import type { FleetInstallation, LoadResult } from '@fleet/installation';
@@ -96,6 +98,13 @@ export function composeConductor(input: ComposeConductorInput) {
     reviewAssessment: new ReviewAssessmentAdapter({
       openEvidenceAssessment: (request) =>
         evidence.openEvidenceAssessment.openEvidenceAssessment(request),
+    }),
+    // The conducted gate's verification receipts (KF-13): one per acceptance
+    // check at the collected head, into the assessment the gate opens first.
+    gateReceipts: new GateReceiptAdapter({
+      recordVerificationReceipt: (request) =>
+        evidence.recordVerificationReceipt.recordVerificationReceipt(request),
+      assessmentIdOf: assessmentIdForAttempt,
     }),
     ciState: new CiStateAdapter({
       inspectHeadCiState: (request) => evidence.inspectHeadCiState.inspectHeadCiState(request),

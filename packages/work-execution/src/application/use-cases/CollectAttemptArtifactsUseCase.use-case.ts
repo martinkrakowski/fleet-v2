@@ -25,7 +25,9 @@ import {
 import type { BriefKnowledgePort } from '../ports/out/BriefKnowledgePort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
+import type { ProcessTreeTerminationPort } from '../ports/out/ProcessTreeTerminationPort.out-port.js';
 import type { ReadUsageResult, UsagePort } from '../ports/out/UsagePort.out-port.js';
+import { terminateAttemptProcessTree } from './StopAttemptUseCase.use-case.js';
 
 export interface CollectAttemptArtifactsDependencies {
   readonly attemptRepo: AttemptRepositoryPort;
@@ -44,6 +46,12 @@ export interface CollectAttemptArtifactsDependencies {
    * collection outcome.
    */
   readonly usage?: UsagePort;
+  /**
+   * Optional (PK-1b). When wired, a collected attempt's worktree process
+   * tree is terminated and the count is journalled before the collect entry.
+   * Without it the behaviour is unchanged.
+   */
+  readonly processTreeTermination?: ProcessTreeTerminationPort;
 }
 
 /**
@@ -243,6 +251,14 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
     }
     // Release is idempotent: false simply means no reservation was held.
     await this.deps.journal.releaseCapacityReservation(attempt.id, nowIso);
+    await terminateAttemptProcessTree(
+      this.deps.processTreeTermination,
+      this.deps.journal,
+      attempt,
+      'collect',
+      10,
+      nowIso,
+    );
     const usageDetail =
       usageResult === undefined
         ? `Artifacts collected with outcome ${outcome}`

@@ -52,10 +52,12 @@ import type { ReconcileAttemptPort } from '../ports/in/ReconcileAttemptPort.in-p
 import type { DispatchAttemptPort } from '../ports/in/DispatchAttemptPort.in-port.js';
 import type { CancelPreparedAttemptPort } from '../ports/in/CancelPreparedAttemptPort.in-port.js';
 import type { StopAttemptPort } from '../ports/in/StopAttemptPort.in-port.js';
+import type { ExecuteAuthorizedForgeActionPort } from '../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
 import type { CollectAttemptArtifactsPort } from '../ports/in/CollectAttemptArtifactsPort.in-port.js';
 import type { CommitEditOnlyAttemptPort } from '../ports/in/CommitEditOnlyAttemptPort.in-port.js';
 import type { EvaluateAttemptGatePort } from '../ports/in/EvaluateAttemptGatePort.in-port.js';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
+import type { ConductorForgeGrantPort } from '../ports/out/ConductorForgeGrantPort.out-port.js';
 import type { ReviewRequestPort } from '../ports/out/ReviewRequestPort.out-port.js';
 import type { PrepareFixAttemptPort } from '../ports/in/PrepareFixAttemptPort.in-port.js';
 import type { ReviewAssessmentPort } from '../ports/out/ReviewAssessmentPort.out-port.js';
@@ -87,7 +89,7 @@ import { performCancel, performStop } from './advance-lane-run/stop-cancel.js';
 import { performCollect, performGate } from './advance-lane-run/collect-gate.js';
 import { performReconcile } from './advance-lane-run/reconcile.js';
 import { performReview } from './advance-lane-run/review-fix.js';
-import { performAccept } from './advance-lane-run/merge.js';
+import { performAccept, performOpenPr, performPush } from './advance-lane-run/merge.js';
 import { gatherFacts, performAdmissionWait } from './advance-lane-run/facts.js';
 
 export interface AdvanceLaneRunDependencies {
@@ -140,6 +142,10 @@ export interface AdvanceLaneRunDependencies {
   readonly ciState?: CiStatePort;
   /** Read one pull request's state, read-only (K6-5); absent → the facts keep `pr: null`. */
   readonly forgeRead?: ForgeReadPort;
+  /** Issue the conductor's own forge push grants under `policy:conductor@<rev>` (K6-6); absent → `not-wired`. */
+  readonly conductorForgeGrant?: ConductorForgeGrantPort;
+  /** Execute an authorized forge action under a conductor grant (K6-6); absent → `not-wired`. */
+  readonly executeForgeAction?: ExecuteAuthorizedForgeActionPort;
 }
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */
@@ -266,6 +272,12 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       }
       if (decision.step === 'accept') {
         return performAccept(this.ctx, record, gathered, decision, request);
+      }
+      if (decision.step === 'open-pr') {
+        return performOpenPr(this.ctx, record, gathered, decision, request);
+      }
+      if (decision.step === 'push') {
+        return performPush(this.ctx, record, gathered, decision, request);
       }
       if (decision.step === 'stop') {
         return performStop(this.ctx, record, gathered, decision, request);

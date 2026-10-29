@@ -1,18 +1,23 @@
 /** The conductor's acceptance, PR, push and merge acts and facts (K6). */
 
 import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
+import type { ExecuteAuthorizedForgeActionResult, ExecuteAuthorizedForgeActionRequest } from '../../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
 import type { CiStatePort } from '../../ports/out/CiStatePort.out-port.js';
-import type { ForgeReadPort, PullRequestRef } from '../../ports/out/ForgeReadPort.out-port.js';
+import type { ConductorForgeGrantResult } from '../../ports/out/ConductorForgeGrantPort.out-port.js';
+import type { ForgeReadPort, PullRequestRef, ReadPullRequestResult } from '../../ports/out/ForgeReadPort.out-port.js';
 import type { ReviewRequestPort } from '../../ports/out/ReviewRequestPort.out-port.js';
-import type { AttemptRecord } from '../../../domain/execution-records.js';
-import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
+import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
+import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
 import { head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
+import type { LaneRunPrBodyFrozen, RenderPrBodyResult } from '../../../domain/lane-run-pr-body.js';
+import { renderPrBody } from '../../../domain/lane-run-pr-body.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendRunIntent, appendRunResult } from './step-context.js';
+import { appendRunIntent, appendRunResult, saveOrRefuse } from './step-context.js';
+import { readFrozenManifest } from './frozen-manifest.js';
 
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
 type ReconcileDecision = Extract<LaneRunDecision, { kind: 'reconcile' }>;
@@ -318,4 +323,342 @@ export async function reconcileAccept(
     return preCheck;
   }
   return runAcceptBody(ctx, record, gathered, decision, request, decision.key);
+}
+
+/** The frozen D7 note sections of the brief manifest: three non-empty strings; null when absent or malformed. */
+function frozenPrNotesOf(manifest: Record<string, unknown> | null): LaneRunPrBodyFrozen | null {
+  const notes = manifest?.prNotes;
+  if (typeof notes !== 'object' || notes === null || Array.isArray(notes)) {
+    return null;
+  }
+  const record = notes as Record<string, unknown>;
+  const text = (field: string): string => (typeof record[field] === 'string' ? (record[field] as string) : '');
+  const hardToUndo = text('hardToUndo');
+  const assumptions = text('assumptions');
+  const challengeThis = text('challengeThis');
+  if (hardToUndo.trim().length === 0 || assumptions.trim().length === 0 || challengeThis.trim().length === 0) {
+    return null;
+  }
+  return { hardToUndo, assumptions, challengeThis };
+}
+
+/** The open-pr/push act pre-checks (K6-6): the wiring and the collected head. */
+function prPushPreCheck(
+  ctx: AdvanceStepContext,
+  gathered: GatheredLaneRunFacts,
+  decision: ActDecision | ReconcileDecision,
+): AdvanceLaneRunResult | null {
+  if (
+    ctx.deps.conductorForgeGrant === undefined ||
+    ctx.deps.executeForgeAction === undefined ||
+    ctx.deps.acceptanceAssessment === undefined ||
+    ctx.deps.workOrderRepo === undefined
+  ) {
+    return { outcome: 'not-wired', step: decision.step };
+  }
+  const latest = gathered.latestAttempt;
+  if (latest === null || latest.artifacts === null) {
+    return { outcome: 'waiting', reason: 'facts-inconsistent' };
+  }
+  return null;
+}
+
+/** Append the keyed intent (mintedId null) then a refused result for a pre-execution refusal; nothing external is called. */
+async function refuseKeyed(
+  ctx: AdvanceStepContext,
+  request: AdvanceLaneRunRequest,
+  decision: ActDecision,
+  reasonCode: Extract<LaneRunResultReasonCode, 'forge-refused' | 'grant-refused'>,
+): Promise<AdvanceLaneRunResult> {
+  const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
+  if (intentRefusal !== null) {
+    return { outcome: 'refused', reason: intentRefusal };
+  }
+  const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode);
+  if (resultRefusal !== null) {
+    return { outcome: 'refused', reason: resultRefusal };
+  }
+  return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
+}
+
+/** The two conductor push grant kinds (K6-6): open a PR, or push to an existing one. */
+type ForgePushKind = 'push-and-open-pr' | 'push-to-pr';
+
+/**
+ * The shared open-pr/push body (K6-6): the frozen D7 notes and `renderPrBody`
+ * (open-pr only) before any intent, the acceptance receipt id read again at
+ * the exact head, the conductor push grant, then the keyed intent minting the
+ * forge action id and the authorized forge action. A missing or invalid note,
+ * a missing receipt, a refused or thrown grant all refuse with a null
+ * minted id and no forge call; an ambiguous or thrown forge outcome leaves the
+ * intent pending for the reconcile. Reason strings are never journalled.
+ */
+async function runPrPushBody(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: ActDecision,
+  request: AdvanceLaneRunRequest,
+  kind: ForgePushKind,
+): Promise<AdvanceLaneRunResult> {
+  const latest = gathered.latestAttempt;
+  if (latest === null || latest.artifacts === null) {
+    return { outcome: 'waiting', reason: 'facts-inconsistent' };
+  }
+  const conductorForgeGrant = ctx.deps.conductorForgeGrant;
+  const executeForgeAction = ctx.deps.executeForgeAction;
+  const acceptanceAssessment = ctx.deps.acceptanceAssessment;
+  const workOrderRepo = ctx.deps.workOrderRepo;
+  if (
+    conductorForgeGrant === undefined ||
+    executeForgeAction === undefined ||
+    acceptanceAssessment === undefined ||
+    workOrderRepo === undefined
+  ) {
+    return { outcome: 'not-wired', step: decision.step };
+  }
+  const headSha = latest.artifacts.headCommit;
+
+  // The work order carries the project id; a null one is facts-inconsistent.
+  let workOrder: WorkOrderRecord | null;
+  try {
+    workOrder = await workOrderRepo.findWorkOrderById(record.workOrderId);
+  } catch {
+    workOrder = null;
+  }
+  if (workOrder === null) {
+    return { outcome: 'waiting', reason: 'facts-inconsistent' };
+  }
+
+  // PR bodies come from records only (§5): the frozen D7 notes and renderPrBody.
+  // Only push-and-open-pr renders; a missing or invalid note (or an unrenderable
+  // body) refuses before any intent, grant or forge call.
+  let rendered: RenderPrBodyResult | null = null;
+  if (kind === 'push-and-open-pr') {
+    const manifest = await readFrozenManifest(latest, ctx.deps.artifactPort);
+    const frozen = frozenPrNotesOf(manifest);
+    const title = 'Fleet work order ' + record.workOrderId;
+    rendered = frozen === null ? null : renderPrBody({
+      workOrderId: record.workOrderId,
+      title,
+      tier: record.tier,
+      runId: record.runId,
+      rounds: record.round,
+      gate: 'passed',
+      reviews: [],
+      frozen,
+    });
+    if (rendered === null || !rendered.ok) {
+      return refuseKeyed(ctx, request, decision, 'forge-refused');
+    }
+  }
+
+  // The acceptance receipt id is read again at the exact head (K6-5): never
+  // journalled, idempotent per head; anything else refuses the grant.
+  let receiptId: string | null = null;
+  try {
+    const assessment = await acceptanceAssessment.assessHeadAcceptance({
+      attemptId: latest.id,
+      workOrderId: record.workOrderId,
+      candidateHeadSha: headSha,
+      policyRevision: record.runPolicyRevision,
+    });
+    if (assessment.outcome === 'accepted' && assessment.assessedHeadSha === headSha) {
+      receiptId = assessment.receiptId;
+    }
+  } catch {
+    // fall through: no receipt.
+  }
+  if (receiptId === null) {
+    return refuseKeyed(ctx, request, decision, 'grant-refused');
+  }
+
+  // The conductor's own push grant under `policy:conductor@<revision>`; a
+  // refusal or a throw refuses before the forge call.
+  let grant: ConductorForgeGrantResult;
+  try {
+    grant = await conductorForgeGrant.issueConductorForgeGrant({
+      projectId: workOrder.projectId,
+      workOrderId: record.workOrderId,
+      attemptId: latest.id,
+      forgeKind: kind,
+      expectedHeadSha: headSha,
+      policyRevision: record.runPolicyRevision,
+      acceptanceReceiptId: receiptId,
+    });
+  } catch {
+    return refuseKeyed(ctx, request, decision, 'grant-refused');
+  }
+  if (grant.outcome !== 'issued') {
+    return refuseKeyed(ctx, request, decision, 'grant-refused');
+  }
+
+  // Only now mint the forge action id under the keyed intent and call the forge.
+  const actionId = 'forge-' + ctx.deps.newUlid();
+  const intentRefusal = await appendRunIntent(ctx, request, decision.key, actionId);
+  if (intentRefusal !== null) {
+    return { outcome: 'refused', reason: intentRefusal };
+  }
+  let forgeRequest: ExecuteAuthorizedForgeActionRequest;
+  if (kind === 'push-and-open-pr' && rendered !== null) {
+    forgeRequest = {
+      actionId,
+      attemptId: latest.id,
+      workOrderId: record.workOrderId,
+      kind: 'push-and-open-pr',
+      expectedHeadSha: headSha,
+      authorizationGrantId: grant.grantId,
+      authorizedBy: grant.decisionRevision,
+      title: rendered.title,
+      body: rendered.body,
+    };
+  } else {
+    forgeRequest = {
+      actionId,
+      attemptId: latest.id,
+      workOrderId: record.workOrderId,
+      kind: 'push-to-pr',
+      expectedHeadSha: headSha,
+      authorizationGrantId: grant.grantId,
+      authorizedBy: grant.decisionRevision,
+    };
+  }
+  let forged: ExecuteAuthorizedForgeActionResult;
+  try {
+    forged = await executeForgeAction.executeAuthorizedForgeAction(forgeRequest);
+  } catch {
+    // Ambiguous: the intent stays pending for the reconcile; nothing more is written.
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'forge-ambiguous' };
+  }
+  if (forged.outcome === 'executed') {
+    if (kind === 'push-and-open-pr') {
+      const saved = await saveOrRefuse(ctx,
+        { ...record, prNumber: forged.pullRequestNumber ?? record.prNumber, revision: record.revision + 1 },
+        request,
+      );
+      if (!saved.ok) {
+        return { outcome: 'refused', reason: saved.reason };
+      }
+    }
+    const reasonCode = kind === 'push-and-open-pr' ? 'pr-opened' : 'pushed';
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', reasonCode);
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
+  }
+  if (forged.forgeAmbiguous === true) {
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'forge-ambiguous' };
+  }
+  const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'forge-refused');
+  if (resultRefusal !== null) {
+    return { outcome: 'refused', reason: resultRefusal };
+  }
+  return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'forge-refused' };
+}
+
+/**
+ * The `act open-pr` step (K6-6): open the branch's PR through a conductor push
+ * grant (`push-and-open-pr`) and the authorized forge action, with the PR
+ * title and body rendered from records only. One-way: an intent that exists is
+ * never re-sent; the reconcile decides from the forge.
+ */
+export async function performOpenPr(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: ActDecision,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  const preCheck = prPushPreCheck(ctx, gathered, decision);
+  if (preCheck !== null) {
+    return preCheck;
+  }
+  return runPrPushBody(ctx, record, gathered, decision, request, 'push-and-open-pr');
+}
+
+/**
+ * The `act push` step (K6-6): push the head to the branch's existing PR
+ * through a conductor push grant (`push-to-pr`); no title, body or prNumber
+ * write. One-way like open-pr.
+ */
+export async function performPush(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: ActDecision,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  const preCheck = prPushPreCheck(ctx, gathered, decision);
+  if (preCheck !== null) {
+    return preCheck;
+  }
+  return runPrPushBody(ctx, record, gathered, decision, request, 'push-to-pr');
+}
+
+/** Append the reconcile result under the pending key and return the acted outcome. */
+async function appendReconcileResult(
+  ctx: AdvanceStepContext,
+  request: AdvanceLaneRunRequest,
+  decision: ReconcileDecision,
+  outcome: LaneRunJournalOutcome,
+  reasonCode: LaneRunResultReasonCode,
+): Promise<AdvanceLaneRunResult> {
+  const resultRefusal = await appendRunResult(ctx, request, decision.key, outcome, reasonCode);
+  if (resultRefusal !== null) {
+    return { outcome: 'refused', reason: resultRefusal };
+  }
+  return { outcome: 'acted', step: decision.step, key: decision.key, result: outcome, reasonCode };
+}
+
+/**
+ * The open-pr/push reconcile (§3.5): both are one-way, so the reconcile only
+ * reads the forge and records — never re-sends the action. The PR is read by
+ * number when `record.prNumber` is set, else by the branch name (the last path
+ * segment of the latest attempt's worktreePath). A found open PR at the exact
+ * head reconciles and fills a missing `prNumber`; another head or not-found is
+ * refused, unreadable ambiguous.
+ */
+export async function reconcilePrPush(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: ReconcileDecision,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  const forgeRead = ctx.deps.forgeRead;
+  if (forgeRead === undefined) {
+    return { outcome: 'not-wired', step: decision.step };
+  }
+  const latest = gathered.latestAttempt;
+  if (latest === null) {
+    return { outcome: 'waiting', reason: 'facts-inconsistent' };
+  }
+  let read: ReadPullRequestResult;
+  try {
+    read = await forgeRead.readPullRequest({ ref: pullRequestRefOf(record, latest) });
+  } catch {
+    return appendReconcileResult(ctx, request, decision, 'ambiguous', 'forge-ambiguous');
+  }
+  if (read.outcome === 'found') {
+    const snapshot = read.pullRequest;
+    if (snapshot.state === 'open' && head12Of(snapshot.headSha) === gathered.facts.head12) {
+      if (record.prNumber === null) {
+        const saved = await saveOrRefuse(ctx,
+          { ...record, prNumber: snapshot.number, revision: record.revision + 1 },
+          request,
+        );
+        if (!saved.ok) {
+          return { outcome: 'refused', reason: saved.reason };
+        }
+      }
+      const reasonCode = decision.step === 'open-pr' ? 'pr-opened' : 'pushed';
+      return appendReconcileResult(ctx, request, decision, 'reconciled', reasonCode);
+    }
+    return appendReconcileResult(ctx, request, decision, 'refused', 'forge-refused');
+  }
+  if (read.outcome === 'not-found') {
+    return appendReconcileResult(ctx, request, decision, 'refused', 'forge-refused');
+  }
+  return appendReconcileResult(ctx, request, decision, 'ambiguous', 'forge-ambiguous');
 }

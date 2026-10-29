@@ -566,6 +566,17 @@ describe('StartLaneRunUseCase', () => {
     expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
   });
 
+  it('test 3e (KF-14b): the start passes the new no-review-route refusal through', async () => {
+    const harness = makeHarness();
+    harness.setCapacityAnswer({ outcome: 'refused', reason: 'no-review-route' });
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({ outcome: 'refused', reason: 'no-review-route' });
+    expect(harness.capacityCalls).toHaveLength(1);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+  });
+
   it('test 3b: a held, incomplete reservation is released and reported incomplete reserve, never re-reserved', async () => {    const harness = makeHarness();
     await harness.executionJournal.saveCapacityReservation({
       id: 'res-example-incomplete',

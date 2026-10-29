@@ -31,7 +31,11 @@ export type LaneRunFirstReservationResult =
   | { readonly outcome: 'no-capacity' }
   | {
       readonly outcome: 'refused';
-      readonly reason: 'no-host' | 'reserve-refused' | 'reservation-incomplete';
+      readonly reason:
+        | 'no-host'
+        | 'no-review-route'
+        | 'reserve-refused'
+        | 'reservation-incomplete';
     };
 
 /** The first attempt of a new run: global cap and package-busy, then the reserve chooses host and worktree path (K7-D7). */

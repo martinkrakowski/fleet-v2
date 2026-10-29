@@ -64,6 +64,7 @@ export type StartLaneRunRefusal =
   | 'no-first-pass-seat'
   | 'run-exists'
   | 'no-host'
+  | 'no-review-route'
   | 'reserve-refused';
 
 export interface AbandonStartRequest {

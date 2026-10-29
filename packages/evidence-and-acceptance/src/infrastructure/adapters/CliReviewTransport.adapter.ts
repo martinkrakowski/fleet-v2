@@ -378,16 +378,14 @@ export function createCliReviewTransport(
       // `text` for grok). The unwrapped reply then meets the same line guard.
       const text =
         isAgy ? readAgyReviewReply(outcome.stdout) : isGrok ? readGrokReviewReply(outcome.stdout) : outcome.stdout;
-      let nonBlankLineCount = 0;
-      for (const line of text.split(/\r?\n/)) {
-        if (line.trim() !== '') {
-          nonBlankLineCount += 1;
-        }
-      }
-      if (nonBlankLineCount === 0) {
+      const nonBlankLines = text.split(/\r?\n/).filter((line) => line.trim() !== '');
+      if (nonBlankLines.length === 0) {
         throw new Error('reviewer CLI returned an empty response');
       }
-      if (nonBlankLineCount < 2) {
+      // A clean review with no findings is exactly one line, the verdict
+      // (KF-14d: grok answers a bare `VERDICT: PASS`); only a one-line answer
+      // that is not a verdict is the failed review the guard exists for.
+      if (nonBlankLines.length < 2 && !/^VERDICT: (PASS|FAIL)$/.test(nonBlankLines[0].trim())) {
         throw new Error('reviewer CLI returned a one-line response');
       }
 

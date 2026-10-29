@@ -21,6 +21,9 @@ import {
 } from '@fleet/installation';
 import type { FleetInstallationV2 } from '@fleet/installation';
 
+import { assessmentIdForAttempt } from '@fleet/evidence-and-acceptance';
+import type { VerificationReceiptRecord } from '@fleet/evidence-and-acceptance';
+
 import { createFleetCliRuntime, type FleetCliRuntime } from '../../composition.js';
 import { runCli } from '../../index.js';
 import { buildLiveConductorDriver, type ConductorDriver } from '../../conductor-wiring.js';
@@ -43,6 +46,17 @@ export interface ConductedFixtureOptions {
   readonly seatAgent?: string;
   /** When set, the frozen model assignment names this agent instead. */
   readonly assignmentAgent?: string | null;
+  /**
+   * Q1c: when true the fake lane runs a fixture-written script that appends a
+   * line to `packages/example/README.md`, commits it, and then ends the
+   * session, so a conducted run collects, gates and reviews a real commit.
+   */
+  readonly committingLane?: boolean;
+  /**
+   * Q1c: the verdicts the fake review transport answers with, consumed in
+   * order (one per review); past the list every review passes.
+   */
+  readonly reviewVerdicts?: readonly ('PASS' | 'FAIL')[];
 }
 
 export interface CliRunResult {
@@ -87,12 +101,28 @@ export interface ConductedFixture extends E2eFixture {
   readonly fakeArgvFile: string;
   /** File listing the running fake opencode client pids. */
   readonly fakePidsFile: string;
+  /** File the `gh` stub on PATH appends its argv to, one line per call. */
+  readonly ghArgvLog: string;
   /** Captured CLI I/O shared by every command this fixture runs. */
   readonly io: CapturedIo;
   /** `conductor start --brief-request ...` through the CLI. */
   readonly start: (tier: 1 | 2) => Promise<CliRunResult>;
   /** One `conductor run --live --once` pass through the CLI (60 s abort). */
   readonly runPass: () => Promise<CliRunResult>;
+  /**
+   * Q1c: record one completed passing verification receipt per
+   * `acceptanceChecks` name at the latest attempt's collected head through
+   * the runtime's record-verification-receipt port. Idempotent; answers
+   * false while the collected head or the review-opened assessment is not
+   * there yet, so a caller retries on the next pass; true once recorded.
+   */
+  readonly recordAcceptanceReceipts: () => Promise<boolean>;
+  /**
+   * Q1c: make the next fix-brief placement fail — chmod 0444 on the latest
+   * attempt's `.lane/brief.md` so the placement's `tee` fails on the host.
+   * `stop()` restores the mode.
+   */
+  readonly makeFixPlacementFail: () => Promise<void>;
   /** A runtime rebuilt over the current installation FILE (scenario 3). */
   readonly rebuildRuntime: () => Promise<FleetCliRuntime>;
   /** Kill the fake lanes, tear the tunnel and sshd down, restore PATH. */
@@ -145,6 +175,7 @@ function buildConductedInstallation(
   orchestratorWorktreeRoot: string,
   laneWorktreeRoot: string,
   seatAgent: string,
+  runnerAuthFile: string,
 ): FleetInstallationV2 {
   return {
     schemaVersion: 2,
@@ -162,6 +193,10 @@ function buildConductedInstallation(
         runner: {
           kind: 'opencode',
           port: fakePort,
+          // The review route of a recorded ssh host names the host's own auth
+          // file; the fixture's review transport never runs ocm-run, but the
+          // route must still resolve.
+          authFile: runnerAuthFile,
           capabilities: {
             networkEgressRestricted: true,
             cpuAndMemoryLimited: true,
@@ -207,9 +242,31 @@ function buildConductedInstallation(
   };
 }
 
-/** The stub `gh` binary on PATH: every call prints the example PR URL. */
-function ghStubScript(): string {
-  return '#!/bin/sh\necho "https://github.com/example-owner/example-repo/pull/7"\n';
+/** The stub `gh` binary on PATH: records one flattened argv line per call, then prints the example PR URL. */
+function ghStubScript(argvLog: string): string {
+  return [
+    '#!/bin/sh',
+    // One line per call: a `--body` carries newlines, so they are flattened.
+    `printf '%s\\n' "$*" | tr '\\n' ' ' >> ${sq(argvLog)}`,
+    'echo "https://github.com/example-owner/example-repo/pull/7"',
+    '',
+  ].join('\n');
+}
+
+/**
+ * The committing lane script (Q1c): appends one line to the owned README and
+ * commits it as the lane, then holds the session busy for a moment so
+ * `ocm-run --detach`'s visibility poll still sees it before the client ends
+ * the session.
+ */
+function laneCommitScript(): string {
+  return [
+    '#!/bin/sh',
+    'printf "\\nA lane edit for this run.\\n" >> packages/example/README.md',
+    'git -c user.name=example -c user.email=example@example.invalid commit -am "lane: append an example line" >/dev/null',
+    'sleep 2',
+    '',
+  ].join('\n');
 }
 
 /**
@@ -236,22 +293,51 @@ function fakeOpencodeWrapperScript(
   fakeScript: string,
   pidsFile: string,
   argvFile: string,
+  lane?: { readonly scriptPath: string },
 ): string {
   return [
     '#!/bin/sh',
     `FAKE_OPENCODE_PIDS_FILE=${sq(pidsFile)} \\`,
     'FAKE_OPENCODE_FLIP=1 \\',
     `FAKE_OPENCODE_ARGV_FILE=${sq(argvFile)} \\`,
+    ...(lane === undefined
+      ? []
+      : [
+          `FAKE_OPENCODE_LANE_SCRIPT=${sq(lane.scriptPath)} \\`,
+          'FAKE_OPENCODE_END=1 \\',
+        ]),
     `exec ${sq(fakeScript)} "$@"`,
     '',
   ].join('\n');
 }
 
-/** A recording gh runner answering pulls, checks and graphql like PC-4's stub. */
-function makeForgeGhRunner(head: () => string) {
+/**
+ * A recording gh runner answering every read the conductor's forge ports make
+ * (PC-4's stub plus the `pr view` snapshot and the compare read): an open PR
+ * number 7 at the worktree head whose merge state is clean, CI buckets that
+ * pass, and zero unresolved review threads.
+ */
+function makeForgeGhRunner(head: () => string, branchName: string) {
   const calls: string[][] = [];
   const forgeGhRunner = async (args: readonly string[]) => {
     calls.push([...args]);
+    if (args[0] === 'pr' && args[1] === 'view') {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          number: 7,
+          state: 'OPEN',
+          headRefOid: head(),
+          headRefName: branchName,
+          baseRefName: 'main',
+          mergedAt: null,
+          closedAt: null,
+          mergeCommit: null,
+          mergeStateStatus: 'CLEAN',
+        }),
+        stderr: '',
+      };
+    }
     if (args[0] === 'pr' && args[1] === 'checks') {
       return { exitCode: 0, stdout: '[{"bucket":"pass"}]', stderr: '' };
     }
@@ -264,25 +350,42 @@ function makeForgeGhRunner(head: () => string) {
         stderr: '',
       };
     }
-    return {
-      exitCode: 0,
-      stdout: JSON.stringify([{ state: 'open', number: 7, head: { sha: head() } }]),
-      stderr: '',
-    };
+    if (args[0] === 'api' && typeof args[1] === 'string' && args[1].endsWith('/pulls')) {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify([{ state: 'open', number: 7, head: { sha: head() } }]),
+        stderr: '',
+      };
+    }
+    if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('/compare/')) {
+      return { exitCode: 0, stdout: JSON.stringify({ status: 'diverged' }), stderr: '' };
+    }
+    return { exitCode: 0, stdout: '[]', stderr: '' };
   };
   return { calls, forgeGhRunner };
 }
 
-/** The fake review transport: exit 0, one step_start event, a VERDICT: PASS text part. */
-const REVIEW_PASS_FIXTURE =
-  '{"type":"step_start","part":{"type":"step-start"}}\n' +
-  '{"type":"text","part":{"type":"text","text":"VERDICT: PASS\\n"}}';
+/** The fake review transport: exit 0, one step_start event, then the verdict text part. */
+const REVIEW_STEP_START_LINE = '{"type":"step_start","part":{"type":"step-start"}}';
+const REVIEW_PASS_TEXT = 'VERDICT: PASS\n';
+/** A FAIL carries one finding line before its verdict, so the verdict is never `unknown`. */
+const REVIEW_FAIL_TEXT = 'FINDING: blocker packages/example/README.md:1 example\nVERDICT: FAIL\n';
 
-function makeReviewSpawn() {
+function makeReviewSpawn(verdicts: readonly ('PASS' | 'FAIL')[]) {
   const calls: Array<{ file: string; args: readonly string[] }> = [];
+  let index = 0;
   const reviewSpawn = async (file: string, args: readonly string[]) => {
     calls.push({ file, args });
-    return { exitCode: 0, stdout: REVIEW_PASS_FIXTURE, stderr: '' };
+    const verdict = verdicts[index] ?? 'PASS';
+    index += 1;
+    const text = verdict === 'FAIL' ? REVIEW_FAIL_TEXT : REVIEW_PASS_TEXT;
+    return {
+      exitCode: 0,
+      stdout:
+        REVIEW_STEP_START_LINE + '\n' +
+        JSON.stringify({ type: 'text', part: { type: 'text', text } }),
+      stderr: '',
+    };
   };
   return { calls, reviewSpawn };
 }
@@ -323,6 +426,8 @@ export async function startConductedFixture(
   const ocmRunEnvLog = path.join(dir, 'ocm-run.env.log');
   const fakeArgvFile = path.join(dir, 'fake-opencode.argv.log');
   const fakePidsFile = path.join(dir, 'fake-opencode.pids');
+  const ghArgvLog = path.join(dir, 'gh.argv.log');
+  const laneScriptPath = path.join(dir, 'lane-commit.sh');
 
   // PATH layering: the wrapper dirs come first; the real PATH stays reachable.
   const previousPath = process.env.PATH;
@@ -330,11 +435,22 @@ export async function startConductedFixture(
   process.env.PATH = `${pathbin}:${e2e.bin}:${previousPath ?? ''}`;
 
   let stopped = false;
+  // The `.lane/brief.md` a fix-placement failure made read-only (Q1c), restored on stop.
+  let failedBriefPath: string | null = null;
   const stop = async (): Promise<void> => {
     if (stopped) {
       return;
     }
     stopped = true;
+    // 0) a fix-placement chmod is restored even when the test failed.
+    if (failedBriefPath !== null) {
+      try {
+        await fs.chmod(failedBriefPath, 0o644);
+      } catch {
+        // Already gone: nothing to restore.
+      }
+      failedBriefPath = null;
+    }
     // 1) every running fake opencode client dies with the fixture.
     try {
       const pids = (await fs.readFile(fakePidsFile, 'utf8'))
@@ -369,11 +485,20 @@ export async function startConductedFixture(
       await fs.writeFile(target, body, 'utf8');
       await fs.chmod(target, 0o700);
     };
-    await writeTool('gh', ghStubScript());
+    await writeTool('gh', ghStubScript(ghArgvLog));
     await writeTool('ocm-run', ocmRunWrapperScript(realOcmRunBin, ocmRunArgvLog, ocmRunEnvLog));
+    if (options?.committingLane === true) {
+      await fs.writeFile(laneScriptPath, laneCommitScript(), 'utf8');
+      await fs.chmod(laneScriptPath, 0o700);
+    }
     await writeTool(
       'opencode',
-      fakeOpencodeWrapperScript(fakeOpencodeScript, fakePidsFile, fakeArgvFile),
+      fakeOpencodeWrapperScript(
+        fakeOpencodeScript,
+        fakePidsFile,
+        fakeArgvFile,
+        options?.committingLane === true ? { scriptPath: laneScriptPath } : undefined,
+      ),
     );
 
     // --- origin repo + clone --------------------------------------------
@@ -398,11 +523,14 @@ export async function startConductedFixture(
     const baseCommit = git(['rev-parse', 'HEAD'], { cwd: clonePath });
 
     // --- installation ----------------------------------------------------
+    const runnerAuthFile = path.join(dir, 'runner-auth.env');
+    await fs.writeFile(runnerAuthFile, '', 'utf8');
     const installation = buildConductedInstallation(
       Number(new URL(e2e.fakeOpencodeUrl).port),
       path.join(dir, 'orchestrator-worktrees'),
       worktreeRoot,
       seatAgent,
+      runnerAuthFile,
     );
     const written = writeInstallationV2(installation);
     const parsed = parseInstallation(JSON.parse(written));
@@ -415,9 +543,13 @@ export async function startConductedFixture(
       'utf8',
     );
 
+    // --- ids (before the runtime: the forge stub names the run's branch) ---
+    const runId = 'run-0' + idChars(20261029, 25);
+    const attemptId = 'attempt-' + idChars(97202610, 26);
+
     // --- runtime ----------------------------------------------------------
-    const gh = makeForgeGhRunner(() => readWorktreeHead(worktreeRoot, baseCommit));
-    const review = makeReviewSpawn();
+    const gh = makeForgeGhRunner(() => readWorktreeHead(worktreeRoot, baseCommit), `fleet/${runId}`);
+    const review = makeReviewSpawn(options?.reviewVerdicts ?? []);
     const buildRuntime = (installationForRuntime: FleetInstallationV2): FleetCliRuntime => {
       return createFleetCliRuntime({
         stateDir: e2e.stateDir,
@@ -542,10 +674,6 @@ export async function startConductedFixture(
     const briefRequestPath = path.join(dir, 'brief-request.json');
     await fs.writeFile(briefRequestPath, JSON.stringify(briefRequest, null, 2), 'utf8');
 
-    // --- ids ---------------------------------------------------------------
-    const runId = 'run-0' + idChars(20261029, 25);
-    const attemptId = 'attempt-' + idChars(97202610, 26);
-
     const io = captureIo();
     const takeStdout = (): string[] => {
       const lines = [...io.outLines];
@@ -610,6 +738,72 @@ export async function startConductedFixture(
       return currentRuntime;
     };
 
+    // --- Q1c levers ---------------------------------------------------------
+    const latestAttemptOf = async () => {
+      const run = await currentRuntime.conductor.laneRunRepository.get(runId);
+      if (run === null) {
+        return null;
+      }
+      const latestId = run.attemptIds[run.attemptIds.length - 1];
+      if (latestId === undefined) {
+        return null;
+      }
+      const attempt = await currentRuntime.execution.attemptRepository.findAttemptById(latestId);
+      if (attempt === null) {
+        return null;
+      }
+      return { run, attempt };
+    };
+
+    const recordAcceptanceReceipts = async (): Promise<boolean> => {
+      const found = await latestAttemptOf();
+      if (found === null || found.attempt.artifacts === null) {
+        return false;
+      }
+      const assessmentId = assessmentIdForAttempt(found.attempt.id);
+      // The assessment is opened by the run's first review; before that the
+      // receipts have nowhere to land, so the caller retries on the next pass.
+      const assessment = await currentRuntime.evidence.evidenceAssessmentRepository
+        .findAssessmentById(assessmentId);
+      if (assessment === null) {
+        return false;
+      }
+      const checks = briefRequest.acceptanceChecks as readonly string[];
+      let recorded = true;
+      for (const name of checks) {
+        const receipt: VerificationReceiptRecord = {
+          id: `verif-${assessmentId}-${name}`,
+          assessmentId,
+          projectId: PROJECT_ID,
+          attemptId: found.attempt.id,
+          candidateHeadSha: found.attempt.artifacts.headCommit,
+          hostId: 'lane-host',
+          procedureName: name,
+          result: 'pass',
+          exitCode: 0,
+          evidenceRef: `fixture://verification/${name}`,
+          policyRevision: found.run.runPolicyRevision,
+          completedAtIso: new Date().toISOString(),
+        };
+        const result = await currentRuntime.evidence.recordVerificationReceipt
+          .recordVerificationReceipt({ assessmentId, receipt });
+        if (result.outcome !== 'recorded') {
+          recorded = false;
+        }
+      }
+      return recorded;
+    };
+
+    const makeFixPlacementFail = async (): Promise<void> => {
+      const found = await latestAttemptOf();
+      if (found === null) {
+        throw new Error('makeFixPlacementFail needs the run and its latest attempt');
+      }
+      const briefPath = path.join(found.attempt.worktreePath, '.lane', 'brief.md');
+      await fs.chmod(briefPath, 0o444);
+      failedBriefPath = briefPath;
+    };
+
     return {
       ...e2e,
       get runtime() {
@@ -628,9 +822,12 @@ export async function startConductedFixture(
       ocmRunEnvLog,
       fakeArgvFile,
       fakePidsFile,
+      ghArgvLog,
       io,
       start,
       runPass,
+      recordAcceptanceReceipts,
+      makeFixPlacementFail,
       rebuildRuntime,
       stop,
     };

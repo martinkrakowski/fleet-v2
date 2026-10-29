@@ -309,7 +309,8 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       // KF-8: the reservation record carries the host's transport, alias and
       // port; a legacy record (fields absent) derives its transport from the
       // alias it carries.
-      transport = held.transport ?? (held.sshAlias ? 'ssh' : 'local');
+      // A blank alias is no alias (the same trim the completeness check applies).
+      transport = held.transport ?? (held.sshAlias?.trim() ? 'ssh' : 'local');
       sshAlias = held.sshAlias ?? null;
       port = held.port ?? null;
     } else if (held !== null) {

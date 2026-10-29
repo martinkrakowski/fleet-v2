@@ -722,6 +722,31 @@ describe('StartLaneRunUseCase', () => {
     expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
   });
 
+  it('test 3j (KF-8): a held legacy reservation with a blank alias and no transport reads as local and starts', async () => {
+    const harness = makeHarness();
+    await harness.executionJournal.saveCapacityReservation({
+      id: 'res-example-legacy-blank-alias',
+      attemptId: ATTEMPT_ID,
+      hostId: HOST_NAME,
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      hostName: HOST_NAME,
+      hostKind: 'opencode',
+      transport: null,
+      sshAlias: '   ',
+      port: 41001,
+      worktreePath: WORKTREE_PATH,
+      reservedAtIso: NOW,
+      releasedAtIso: null,
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+    await harness.useCase.startLaneRun(requestFixture());
+    expect(releaseSpy).not.toHaveBeenCalled();
+    expect(harness.worktreeCalls).toHaveLength(1);
+    expect(harness.worktreeCalls[0]!.recordedHost).toMatchObject({ host: null, remotePort: 41001, kind: 'opencode' });
+  });
+
   it('test 3f (KF-8): a held opencode reservation without a port is released and reported incomplete reserve', async () => {
     const harness = makeHarness();
     await harness.executionJournal.saveCapacityReservation({

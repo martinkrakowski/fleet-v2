@@ -234,16 +234,16 @@ describe('ReviewRequestAdapter.requestReview', () => {
   });
 
   const REJECTION_CASES: readonly (readonly [ReviewRejection, ReviewRequestResult])[] = [
-    ['review-unavailable', { outcome: 'no-receipt', reason: 'review-unavailable' }],
-    ['not-read-only', { outcome: 'no-receipt', reason: 'not-read-only' }],
-    ['invalid-receipt', { outcome: 'no-receipt', reason: 'invalid-receipt' }],
-    ['invalid-request', { outcome: 'refused', reason: 'invalid-request' }],
-    ['not-independent', { outcome: 'refused', reason: 'not-independent' }],
-    ['seat-refused', { outcome: 'refused', reason: 'seat-refused' }],
-    ['no-assessment', { outcome: 'refused', reason: 'no-assessment' }],
-    ['assessment-mismatch', { outcome: 'refused', reason: 'assessment-mismatch' }],
-    ['assessment-terminal', { outcome: 'refused', reason: 'assessment-terminal' }],
-    ['request-id-reused', { outcome: 'refused', reason: 'request-id-reused' }],
+    ['review-unavailable', { outcome: 'no-receipt', reason: 'review-unavailable', detail: null }],
+    ['not-read-only', { outcome: 'no-receipt', reason: 'not-read-only', detail: null }],
+    ['invalid-receipt', { outcome: 'no-receipt', reason: 'invalid-receipt', detail: null }],
+    ['invalid-request', { outcome: 'refused', reason: 'invalid-request', detail: null }],
+    ['not-independent', { outcome: 'refused', reason: 'not-independent', detail: null }],
+    ['seat-refused', { outcome: 'refused', reason: 'seat-refused', detail: null }],
+    ['no-assessment', { outcome: 'refused', reason: 'no-assessment', detail: null }],
+    ['assessment-mismatch', { outcome: 'refused', reason: 'assessment-mismatch', detail: null }],
+    ['assessment-terminal', { outcome: 'refused', reason: 'assessment-terminal', detail: null }],
+    ['request-id-reused', { outcome: 'refused', reason: 'request-id-reused', detail: null }],
   ];
 
   it.each(REJECTION_CASES)(
@@ -272,8 +272,45 @@ describe('ReviewRequestAdapter.requestReview', () => {
 
     const result = await adapter.requestReview(makeReviewRequest());
 
-    expect(result).toEqual({ outcome: 'refused', reason: 'unclassified' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'unclassified', detail: null });
     expect(JSON.stringify(result)).not.toContain('no explicit rejection code');
+  });
+
+  it('carries a matching delegate code as detail on no-receipt', async () => {
+    const { requestIndependentReview } = makeRequestReviewFake({
+      outcome: 'rejected',
+      reason: 'free text from the delegate never reaches the caller',
+      rejection: 'review-unavailable',
+      code: 'route-no-auth-file',
+    });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+
+    const result = await adapter.requestReview(makeReviewRequest());
+
+    expect(result).toEqual({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: 'route-no-auth-file',
+    });
+    expect(JSON.stringify(result)).not.toContain('free text from the delegate never reaches the caller');
+  });
+
+  it('leaves detail null for a code that does not match the journal pattern', async () => {
+    const { requestIndependentReview } = makeRequestReviewFake({
+      outcome: 'rejected',
+      reason: 'free text from the delegate never reaches the caller',
+      rejection: 'review-unavailable',
+      code: 'Not-A-Pattern-Code',
+    } as unknown as RequestIndependentReviewResult);
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+
+    const result = await adapter.requestReview(makeReviewRequest());
+
+    expect(result).toEqual({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: null,
+    });
   });
 
   it('is unknown receipt-mismatch when the receipt answers another request id', async () => {
@@ -343,7 +380,7 @@ describe('ReviewRequestAdapter.requestReview', () => {
 
       const result = await adapter.requestReview(makeReviewRequest(overrides as Partial<ReviewRequest>));
 
-      expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+      expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request', detail: null });
       expect(calls).toHaveLength(0);
     },
   );
@@ -353,7 +390,7 @@ describe('ReviewRequestAdapter.requestReview', () => {
 
     const result = await adapter.requestReview(makeReviewRequest());
 
-    expect(result).toEqual({ outcome: 'refused', reason: 'not-configured' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'not-configured', detail: null });
   });
 
   it('forwards briefText with a brief-check request', async () => {
@@ -400,7 +437,7 @@ describe('ReviewRequestAdapter.requestReview', () => {
       makeReviewRequest({ kind: 'brief-check', briefText: 'a'.repeat(64 * 1024 + 1) }),
     );
 
-    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request', detail: null });
     expect(calls).toHaveLength(0);
   });
 
@@ -434,8 +471,20 @@ describe('ReviewRequestAdapter.requestReview', () => {
       makeReviewRequest({ kind: 'brief-check', briefText: 'é'.repeat(32 * 1024 + 1) }),
     );
 
-    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request', detail: null });
     expect(calls).toHaveLength(0);
+  });
+
+  it('journals only a declared code as detail: an undeclared pattern-valid token is null (KF-14a Luna)', async () => {
+    const adapter = new ReviewRequestAdapter({
+      requestIndependentReview: async () => ({ outcome: 'rejected', reason: 'x', rejection: 'review-unavailable', code: 'arbitrary-token' as never }),
+    });
+    const refused = await adapter.requestReview(makeReviewRequest());
+    expect(refused).toEqual({ outcome: 'no-receipt', reason: 'review-unavailable', detail: null });
+    const known = new ReviewRequestAdapter({
+      requestIndependentReview: async () => ({ outcome: 'rejected', reason: 'x', rejection: 'review-unavailable', code: 'route-no-auth-file' }),
+    });
+    expect(await known.requestReview(makeReviewRequest())).toEqual({ outcome: 'no-receipt', reason: 'review-unavailable', detail: 'route-no-auth-file' });
   });
 });
 

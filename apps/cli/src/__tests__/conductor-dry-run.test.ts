@@ -21,8 +21,9 @@ import {
   laneRunIntentEntry,
   laneRunResultEntry,
 } from '@fleet/work-execution';
-import type { FleetInstallation } from '@fleet/installation';
+import { parseInstallation, type FleetInstallation } from '@fleet/installation';
 
+import { laneRunnerCandidateHosts } from '../conductor-wiring.js';
 import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli } from '../index.js';
 import type { CliIo } from '../index.js';
@@ -640,5 +641,95 @@ describe('conductor run --dry-run (K7-8)', () => {
     expect(briefCalls[0]?.attemptId).toMatch(/^attempt-/);
     // KF-9: the brief request was addressed to the seed attempt's reserved host.
     expect(briefCalls[0]?.recordedHostName).toBe('lane-example');
+  });
+});
+
+describe('laneRunnerCandidateHosts review routes (KF-14b)', () => {
+  function parseV2(file: unknown): FleetInstallation {
+    const result = parseInstallation(file);
+    if (!result.ok || result.installation === undefined) {
+      throw new Error(
+        `fixture failed to parse: ${result.ok ? 'missing installation' : JSON.stringify(result.errors)}`,
+      );
+    }
+    return result.installation;
+  }
+
+  function installationWith(hosts: Record<string, unknown>): FleetInstallation {
+    return parseV2({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        hub: {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['orchestrator'],
+        },
+        ...hosts,
+      },
+    });
+  }
+
+  it('marks an ssh host without runner.authFile as no-auth-file', () => {
+    const candidates = laneRunnerCandidateHosts(
+      installationWith({
+        remote: {
+          transport: 'ssh',
+          sshAlias: 'lane-ssh',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['lane-runner'],
+          runner: { kind: 'opencode', port: 46000 },
+        },
+      }),
+    );
+    expect(candidates).toEqual([
+      {
+        name: 'remote',
+        kind: 'opencode',
+        transport: 'ssh',
+        sshAlias: 'lane-ssh',
+        port: 46000,
+        maxLanes: undefined,
+        worktreeRoot: '/srv/fleet/worktrees',
+        reviewRoute: 'no-auth-file',
+      },
+    ]);
+  });
+
+  it('marks an ssh host with a runner.authFile as available', () => {
+    const candidates = laneRunnerCandidateHosts(
+      installationWith({
+        remote: {
+          transport: 'ssh',
+          sshAlias: 'lane-ssh',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['lane-runner'],
+          runner: {
+            kind: 'opencode',
+            port: 46000,
+            authFile: '/run/fleet/opencode-auth',
+          },
+        },
+      }),
+    );
+    expect(candidates).toEqual([
+      expect.objectContaining({ name: 'remote', transport: 'ssh', reviewRoute: 'available' }),
+    ]);
+  });
+
+  it('marks a local host as available, with or without an authFile', () => {
+    const candidates = laneRunnerCandidateHosts(
+      installationWith({
+        here: {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['lane-runner'],
+          runner: { kind: 'opencode', port: 46000 },
+        },
+      }),
+    );
+    expect(candidates).toEqual([
+      expect.objectContaining({ name: 'here', transport: 'local', reviewRoute: 'available' }),
+    ]);
   });
 });

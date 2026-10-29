@@ -3,9 +3,26 @@ import { randomBytes } from 'node:crypto';
 import { UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
 import type { FindingSeverity, ReviewFindingRecord } from '../../domain/evidence-records.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
-import type { RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
+import type { ReviewUnavailableCode, RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
+import type { ReviewRunnerRoute } from './ReviewTransportRouter.js';
 import { runSpawnOutcome, DEFAULT_MAX_BUFFER_BYTES } from './spawn-run.js';
+
+/**
+ * A typed transport failure (KF-14a): the code is one fixed `ReviewUnavailableCode`,
+ * never transport or forge text. Every refusal of the opencode review transport throws
+ * `ReviewTransportError`; the router throws it for seat and tool refusals, and
+ * `IndependentReviewAdapter` maps any other throw to `transport-failed`.
+ */
+export class ReviewTransportError extends Error {
+  readonly code: ReviewUnavailableCode;
+
+  constructor(message: string, code: ReviewUnavailableCode) {
+    super(message);
+    this.name = 'ReviewTransportError';
+    this.code = code;
+  }
+}
 
 export interface OcmReviewTransportSpawnResult {
   readonly exitCode: number | null;
@@ -31,6 +48,11 @@ export interface OcmReviewTransportOptions {
   readonly hostMode?: 'legacy' | 'installation';
   /** Orchestrator-side auth file for ocm-run, installation mode only. */
   readonly authFile?: string;
+  /**
+   * The resolved review route (KF-14a). A `none` route refuses before any
+   * work with the route's code (absent → `route-unresolved`).
+   */
+  readonly route?: ReviewRunnerRoute;
   /** Wall-clock budget of one review run. */
   readonly timeoutMs?: number;
   readonly resolveReviewDir: (
@@ -413,39 +435,47 @@ export function createOcmReviewTransport(
   options: OcmReviewTransportOptions,
 ): (request: RunIndependentReviewRequest) => Promise<IndependentReviewTransportResult> {
   return async (request: RunIndependentReviewRequest): Promise<IndependentReviewTransportResult> => {
+    // 0. A `none` route refuses before any work (KF-14a): the route's code is
+    // the fixed reason; an absent code (an older locator) is route-unresolved.
+    if (options.route !== undefined && options.route.kind === 'none') {
+      throw new ReviewTransportError(options.route.reason, options.route.code ?? 'route-unresolved');
+    }
+
     // 1. Verify reviewer model matches options.model
     if (request.reviewerModel !== options.model) {
-      throw new Error(
+      throw new ReviewTransportError(
         `reviewer model mismatch: request specified "${request.reviewerModel}" but transport configured for "${options.model}"`,
+        'transport-failed',
       );
     }
 
     // 2. Reject options starting with '-'
     if (options.model.startsWith('-') || options.model.trim().startsWith('-')) {
-      throw new Error(`invalid model: "${options.model}" starts with "-"`);
+      throw new ReviewTransportError(`invalid model: "${options.model}" starts with "-"`, 'transport-failed');
     }
     if (options.agent.startsWith('-') || options.agent.trim().startsWith('-')) {
-      throw new Error(`invalid agent: "${options.agent}" starts with "-"`);
+      throw new ReviewTransportError(`invalid agent: "${options.agent}" starts with "-"`, 'transport-failed');
     }
     if (
       options.variant !== undefined &&
       (options.variant.startsWith('-') || options.variant.trim().startsWith('-'))
     ) {
-      throw new Error(`invalid variant: "${options.variant}" starts with "-"`);
+      throw new ReviewTransportError(`invalid variant: "${options.variant}" starts with "-"`, 'transport-failed');
     }
 
     // 3. Resolve review directory and verify before head
     const dir = await options.resolveReviewDir(request);
     if (dir === null || typeof dir !== 'string' || dir.trim() === '') {
-      throw new Error(`failed to resolve review directory for attempt ${request.attemptId}`);
+      throw new ReviewTransportError(`failed to resolve review directory for attempt ${request.attemptId}`, 'transport-failed');
     }
     if (dir.startsWith('-') || dir.trim().startsWith('-')) {
-      throw new Error(`invalid review directory: "${dir}" starts with "-"`);
+      throw new ReviewTransportError(`invalid review directory: "${dir}" starts with "-"`, 'transport-failed');
     }
     const before = await options.readHead(dir);
     if (before !== request.candidateHeadSha) {
-      throw new Error(
+      throw new ReviewTransportError(
         `head mismatch before review: expected ${request.candidateHeadSha}, found ${String(before)} in ${dir}`,
+        'transport-failed',
       );
     }
 
@@ -472,8 +502,9 @@ export function createOcmReviewTransport(
       timeoutMs: options.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS,
     });
     if (spawnResult.exitCode !== 0) {
-      throw new Error(
+      throw new ReviewTransportError(
         `reviewer process failed with exit code ${String(spawnResult.exitCode)}: ${spawnResult.stderr || spawnResult.stdout}`,
+        'transport-failed',
       );
     }
 

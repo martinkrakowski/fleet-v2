@@ -157,6 +157,14 @@ describe('GateReceiptAdapter.recordGateReceipts', () => {
     expect(result).toEqual({ outcome: 'unavailable', reason: 'No assessment exists for the attempt' });
   });
 
+  it('never throws when assessmentIdOf or receiptIdOf throws; it answers unavailable (KF-13a Luna)', async () => {
+    const { delegates } = makeDelegateFake({});
+    const badAssessment = new GateReceiptAdapter({ ...delegates, assessmentIdOf: () => { throw new Error('no id'); } });
+    expect((await badAssessment.recordGateReceipts(makeRequest())).outcome).toBe('unavailable');
+    const badReceipt = new GateReceiptAdapter({ ...delegates, receiptIdOf: () => { throw new Error('no id'); } });
+    expect((await badReceipt.recordGateReceipts(makeRequest())).outcome).toBe('unavailable');
+  });
+
   it('never throws when the delegate throws; it answers unavailable', async () => {
     const { delegates } = makeDelegateFake({ throwAt: 1 });
     const adapter = new GateReceiptAdapter(delegates);

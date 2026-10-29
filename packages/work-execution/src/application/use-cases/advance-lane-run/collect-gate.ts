@@ -162,6 +162,24 @@ async function recordGateReceipts(
   if (gateReceipts === undefined) {
     return true;
   }
+  // Every read and write below is guarded: a throw is `false` (gate-unknown),
+  // never an exception out of the gate step.
+  try {
+    return await recordGateReceiptsGuarded(ctx, record, latest, key, request, results, gateReceipts);
+  } catch {
+    return false;
+  }
+}
+
+async function recordGateReceiptsGuarded(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  key: string,
+  request: AdvanceLaneRunRequest,
+  results: readonly GatePredicateResult[],
+  gateReceipts: NonNullable<AdvanceStepContext['deps']['gateReceipts']>,
+): Promise<boolean> {
   const manifest = await readFrozenManifest(latest, ctx.deps.artifactPort);
   const checks = manifestAcceptanceChecks(manifest);
   if (checks === null || latest.artifacts === null) {
@@ -188,25 +206,18 @@ async function recordGateReceipts(
   if (commandResults.length !== checks.length) {
     return false;
   }
-  let opened;
-  try {
-    opened = await reviewAssessment.openReviewAssessment({
-      attemptId: latest.id,
-      projectId: workOrder.projectId,
-      candidateHeadSha: latest.artifacts.headCommit,
-      policyRevision: record.runPolicyRevision,
-      implementerModel: implementerModel.trim(),
-      requiredChecks: checks,
-    });
-  } catch {
-    return false;
-  }
+  const opened = await reviewAssessment.openReviewAssessment({
+    attemptId: latest.id,
+    projectId: workOrder.projectId,
+    candidateHeadSha: latest.artifacts.headCommit,
+    policyRevision: record.runPolicyRevision,
+    implementerModel: implementerModel.trim(),
+    requiredChecks: checks,
+  });
   if (opened.outcome !== 'open') {
     return false;
   }
-  let outcome;
-  try {
-    outcome = await gateReceipts.recordGateReceipts({
+  const outcome = await gateReceipts.recordGateReceipts({
       attemptId: latest.id,
       projectId: workOrder.projectId,
       candidateHeadSha: latest.artifacts.headCommit,
@@ -223,10 +234,8 @@ async function recordGateReceipts(
           : {}),
       })),
     });
-  } catch {
-    return false;
-  }
-  return outcome.outcome === 'recorded';
+  // A recorded answer counts only when every check got its receipt.
+  return outcome.outcome === 'recorded' && outcome.count === checks.length;
 }
 
 /**

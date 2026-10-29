@@ -57,16 +57,27 @@ export class GateReceiptAdapter implements GateReceiptPort {
 
   async recordGateReceipts(request: RecordGateReceiptsRequest): Promise<RecordGateReceiptsResult> {
     const { recordVerificationReceipt, assessmentIdOf, receiptIdOf } = this.delegates;
-    const assessmentId = assessmentIdOf(request.attemptId);
+    // The id delegates are guarded too: the adapter never throws.
+    let assessmentId: string;
+    try {
+      assessmentId = assessmentIdOf(request.attemptId);
+    } catch {
+      return { outcome: 'unavailable', reason: 'No assessment exists for the attempt' };
+    }
     if (!isNonEmptyTrimmed(assessmentId)) {
       return { outcome: 'unavailable', reason: 'No assessment exists for the attempt' };
     }
     let recordedCount = 0;
     for (const receipt of request.receipts) {
-      const id =
-        receiptIdOf === undefined
-          ? defaultReceiptId(request.attemptId, receipt.procedureName, request.candidateHeadSha)
-          : receiptIdOf(request.attemptId, receipt.procedureName, request.candidateHeadSha);
+      let id: string;
+      try {
+        id =
+          receiptIdOf === undefined
+            ? defaultReceiptId(request.attemptId, receipt.procedureName, request.candidateHeadSha)
+            : receiptIdOf(request.attemptId, receipt.procedureName, request.candidateHeadSha);
+      } catch {
+        return { outcome: 'unavailable', reason: 'The receipt id could not be derived' };
+      }
       const verificationReceipt: VerificationReceiptRecord = {
         id,
         assessmentId,

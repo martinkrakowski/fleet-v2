@@ -77,18 +77,20 @@ export async function terminateAttemptProcessTree(
   if (!port) {
     return;
   }
+  // Only the port call is guarded: a throwing port reads `unavailable`. The
+  // journal append is evidence and propagates like every other entry's.
+  let outcome: TerminateWorktreeProcessesResult;
   try {
-    let outcome: TerminateWorktreeProcessesResult;
-    try {
-      outcome = await port.terminateWorktreeProcesses({
-        attemptId: attempt.id,
-        worktreePath: attempt.worktreePath,
-        runner: attempt.runner ?? null,
-        gracePeriodSeconds,
-      });
-    } catch {
-      outcome = { outcome: 'unavailable', reason: 'port threw' };
-    }
+    outcome = await port.terminateWorktreeProcesses({
+      attemptId: attempt.id,
+      worktreePath: attempt.worktreePath,
+      runner: attempt.runner ?? null,
+      gracePeriodSeconds,
+    });
+  } catch {
+    outcome = { outcome: 'unavailable', reason: 'port threw' };
+  }
+  {
     const entry: JournalEntryDraft =
       outcome.outcome === 'terminated'
         ? {
@@ -112,8 +114,6 @@ export async function terminateAttemptProcessTree(
             detail: `Process tree termination ${outcome.outcome}: ${outcome.reason}`,
           };
     await appendJournalEntry(journal, entry);
-  } catch {
-    // The helper never throws: the use case's own outcome is never changed.
   }
 }
 
@@ -343,14 +343,18 @@ export class StopAttemptUseCase implements StopAttemptPort {
       const capacityReleased = ownsReservation
         ? await deps.journal.releaseCapacityReservation(attempt.id, nowIso)
         : false;
-      await terminateAttemptProcessTree(
-        deps.processTreeTermination,
-        deps.journal,
-        attempt,
-        'stop',
-        request.gracePeriodSeconds ?? 10,
-        nowIso,
-      );
+      // A re-dispatched attempt leaves a foreign live session in the same
+      // worktree: its process tree is not this stop's to kill.
+      if (ownsReservation) {
+        await terminateAttemptProcessTree(
+          deps.processTreeTermination,
+          deps.journal,
+          attempt,
+          'stop',
+          request.gracePeriodSeconds ?? 10,
+          nowIso,
+        );
+      }
       await appendJournalEntry(deps.journal, {
         attemptId: attempt.id,
         workOrderId: attempt.workOrderId,

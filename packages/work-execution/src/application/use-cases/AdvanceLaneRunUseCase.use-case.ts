@@ -57,6 +57,7 @@ import type { CommitEditOnlyAttemptPort } from '../ports/in/CommitEditOnlyAttemp
 import type { EvaluateAttemptGatePort } from '../ports/in/EvaluateAttemptGatePort.in-port.js';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 import type { ReviewRequestPort } from '../ports/out/ReviewRequestPort.out-port.js';
+import type { PrepareFixAttemptPort } from '../ports/in/PrepareFixAttemptPort.in-port.js';
 import type { ReviewAssessmentPort } from '../ports/out/ReviewAssessmentPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { SameModelFamily } from '../../domain/seat-selection.js';
@@ -119,6 +120,8 @@ export interface AdvanceLaneRunDependencies {
   readonly sameModelFamily?: SameModelFamily;
   /** Read the work order for its project id (K5); absent → `not-wired`. */
   readonly workOrderRepo?: Pick<WorkOrderRepositoryPort, 'findWorkOrderById'>;
+  /** K5-5: prepares a fix-round attempt from numbered findings (plan §3.3 Fix row). */
+  readonly prepareFixAttempt?: PrepareFixAttemptPort;
   /**
    * Resolve the runner that addresses a host for the dispatch reconcile's
    * worktree read (K4-7); absent → a dispatch reconcile that needs the

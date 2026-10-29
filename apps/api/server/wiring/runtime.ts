@@ -59,6 +59,7 @@ import {
   resolveWorkRunnerSettings,
   type WorkCrossContextDelegates,
 } from "./work/composition";
+import { configureTelemetryReadComposition } from "./telemetry/composition";
 import { readOwnerDecisionReferencesFromAttempt } from "@fleet/work-execution";
 import { readAcceptanceForAttempt } from "@fleet/work-execution";
 
@@ -359,6 +360,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
     configureEvidenceUseCases(null);
     configureKnowledgeComposition(null);
     configureOperatorComposition(null);
+    configureTelemetryReadComposition(null);
     return;
   }
 
@@ -687,4 +689,5 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   configureKnowledgeComposition(knowledge);
   configureEvidenceUseCases(evidence);
   configureWorkComposition(work);
+  configureTelemetryReadComposition({ stateDir });
 }

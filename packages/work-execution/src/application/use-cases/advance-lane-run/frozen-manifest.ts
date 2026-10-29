@@ -7,12 +7,12 @@ export async function readFrozenManifest(
   attempt: AttemptRecord,
   artifactPort: AdvanceLaneRunDependencies['artifactPort'],
 ): Promise<Record<string, unknown> | null> {
-  const read = artifactPort.readBriefManifest;
-  if (read === undefined || attempt.briefPackagePath === null) {
+  // Called on the port, never copied off it: an adapter method reads `this` (KF-11).
+  if (artifactPort.readBriefManifest === undefined || attempt.briefPackagePath === null) {
     return null;
   }
   try {
-    const text = await read(
+    const text = await artifactPort.readBriefManifest(
       attempt.worktreePath,
       attempt.briefPackagePath.replace(/\.md$/, '-manifest.json'),
       attempt.runner ?? null,

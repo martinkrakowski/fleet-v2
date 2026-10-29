@@ -2,6 +2,7 @@
 
 export * from "./AcceptanceAssessmentPort.out-port.js";
 export * from "./AcceptanceEvidencePort.out-port.js";
+export * from "./AcceptanceReceiptReadPort.out-port.js";
 export * from "./ActionAuthorizationPort.out-port.js";
 export * from "./AllowedSeatPort.out-port.js";
 export * from "./AttemptArtifactPort.out-port.js";

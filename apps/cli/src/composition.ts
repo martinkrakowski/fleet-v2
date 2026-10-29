@@ -26,6 +26,7 @@ import { composeEvidence } from './composition/evidence.js';
 import { composeExecutionHosts } from './composition/work-execution-hosts.js';
 import { composeExecution } from './composition/work-execution.js';
 import { composeConductor } from './composition/conductor.js';
+import { composeTelemetryReads } from './composition/telemetry.js';
 
 import {
   AcceptanceAssessmentAdapter,
@@ -89,6 +90,7 @@ import {
   type GhInvocationResult,
   type SubprocessRunner,
   type CommandExecutorPort,
+  type AcceptanceReceiptReadAdapter,
 } from '@fleet/work-execution';
 
 import {
@@ -661,6 +663,10 @@ export interface FleetCliRuntime {
     /** The auto-merge setting read once at composition; a toggle takes a restart (K6-8). */
     readonly autoMergeEnabled: boolean;
   };
+  readonly telemetry: {
+    /** Telemetry's own read-only receipt read (OT2b); OT2c consumes it. */
+    readonly acceptanceReceiptRead: AcceptanceReceiptReadAdapter;
+  };
 }
 
 /**
@@ -859,6 +865,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     installation: options?.installation,
   });
 
+  const { telemetry } = composeTelemetryReads({ stateDir });
+
   return {
     installation: options?.installation,
     coordination,
@@ -866,5 +874,6 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     evidence,
     execution,
     conductor,
+    telemetry,
   };
 }

@@ -18,13 +18,20 @@ import type {
   ExecutionJournalPort,
   LaneRunAdmissionPort,
   ReconcileAttemptPort,
+  ReviewAssessmentPort,
+  ReviewRequestPort,
   RunnerForAttemptPort,
   StopAttemptPort,
 } from '@fleet/work-execution';
 
 /** Every acting outbound port the dry-run fakes, with the attempt it acted on. */
 export interface DryRunRecorder {
-  readonly calls: readonly { readonly port: string; readonly attemptId: string | null }[];
+  readonly calls: readonly {
+    readonly port: string;
+    readonly attemptId: string | null;
+    /** The minted request id a review act journalled, for the review ports. */
+    readonly requestId?: string;
+  }[];
 }
 
 /** Recording fakes for every acting outbound port of the dry-run driver. */
@@ -38,14 +45,20 @@ export interface DryRunFakes {
   readonly commitEditOnlyAttempt: CommitEditOnlyAttemptPort;     // 'not-applicable'
   readonly evaluateAttemptGate: EvaluateAttemptGatePort;          // 'passed'
   readonly runnerForAttempt: RunnerForAttemptPort;                // a runner whose inspectWorktreeRun is 'idle' and whose other methods throw 'dry-run: no runner'
-  readonly artifactPort: Pick<AttemptArtifactPort, 'readBriefManifest' | 'verifyArtifactManifest'>; // { stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] }; 'sealed'
+  readonly reviewAssessment: ReviewAssessmentPort;                // 'open'
+  readonly reviewRequest: ReviewRequestPort;                      // a fixed passed receipt per request; reads answer 'not-found'
+  readonly artifactPort: Pick<
+    AttemptArtifactPort,
+    'readBriefManifest' | 'verifyArtifactManifest' | 'readBriefFile'
+  >; // { stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['dry-run-check'] }; 'sealed'; the brief text reads null
 }
 
-/** The frozen manifest the dry-run fakes read: the limits the seeds carry. */
+/** The frozen manifest the dry-run fakes read: the limits and checks the seeds carry. */
 export const DRY_RUN_MANIFEST_JSON = JSON.stringify({
   stepLimit: 100,
   timeLimitSeconds: 2700,
   expectedArtifacts: [],
+  acceptanceChecks: ['dry-run-check'],
 });
 
 /** The head commit the collect fake records: one commit since base, 'd' × 40. */
@@ -100,12 +113,20 @@ export function createDryRunFakes(
   },
   nowIso: () => string,
 ): DryRunFakes {
-  const calls: { readonly port: string; readonly attemptId: string | null }[] = [];
-  const recordCall = (port: string, request: { readonly attemptId?: string } = {}): void => {
-    calls.push({ port, attemptId: request.attemptId ?? null });
+  const calls: { readonly port: string; readonly attemptId: string | null; readonly requestId?: string }[] = [];
+  const recordCall = (
+    port: string,
+    request: { readonly attemptId?: string; readonly requestId?: string } = {},
+  ): void => {
+    calls.push({
+      port,
+      attemptId: request.attemptId ?? null,
+      ...(request.requestId !== undefined ? { requestId: request.requestId } : {}),
+    });
   };
   let sessionSequence = 0;
   let reservationSequence = 0;
+  let reviewSequence = 0;
 
   const findOrCreateAttempt = async (request: {
     readonly attemptId: string;
@@ -257,7 +278,38 @@ export function createDryRunFakes(
     },
   };
 
-  const artifactPort: Pick<AttemptArtifactPort, 'readBriefManifest' | 'verifyArtifactManifest'> = {
+  const reviewAssessment: ReviewAssessmentPort = {
+    openReviewAssessment: async (request) => {
+      recordCall('reviewAssessment', request);
+      return { outcome: 'open' };
+    },
+  };
+
+  const reviewRequest: ReviewRequestPort = {
+    requestReview: async (request) => {
+      recordCall('reviewRequest', request);
+      reviewSequence += 1;
+      return {
+        outcome: 'receipt',
+        receipt: {
+          receiptId: 'rr-dry-run-' + String(reviewSequence),
+          requestId: request.requestId,
+          kind: request.kind,
+          reviewerModel: request.reviewerModel,
+          candidateHeadSha: request.candidateHeadSha,
+          verdict: 'passed',
+          findings: [],
+        },
+      };
+    },
+    findReviewReceipt: async () => ({ outcome: 'not-found' }),
+    findLatestReceiptOfKind: async () => ({ outcome: 'not-found' }),
+  };
+
+  const artifactPort: Pick<
+    AttemptArtifactPort,
+    'readBriefManifest' | 'verifyArtifactManifest' | 'readBriefFile'
+  > = {
     readBriefManifest: async () => DRY_RUN_MANIFEST_JSON,
     verifyArtifactManifest: async (request) => ({
       outcome: 'sealed',
@@ -268,6 +320,7 @@ export function createDryRunFakes(
         total: { files: 0, bytes: 0 },
       },
     }),
+    readBriefFile: async () => null,
   };
 
   return {
@@ -280,6 +333,8 @@ export function createDryRunFakes(
     commitEditOnlyAttempt,
     evaluateAttemptGate,
     runnerForAttempt,
+    reviewAssessment,
+    reviewRequest,
     artifactPort,
   };
 }

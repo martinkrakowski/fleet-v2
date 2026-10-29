@@ -1,6 +1,7 @@
 /** The conductor's review and fix-round acts (K5). */
 
 import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
+import type { PrepareFixAttemptRequest, PrepareFixAttemptResult } from '../../ports/in/PrepareFixAttemptPort.in-port.js';
 import type {
   FindReviewReceiptResult,
   ReviewRequestKind,
@@ -8,6 +9,8 @@ import type {
   ReviewVerdict,
 } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
+import type { HandoverFinding, RenderHandoverBriefInput } from '../../../domain/lane-run-handover.js';
+import { renderHandoverBrief } from '../../../domain/lane-run-handover.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import { laneRunReviewFact } from '../../../domain/lane-run-review-facts.js';
 import { head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
@@ -19,7 +22,7 @@ import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunSta
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import { readFrozenManifest } from './frozen-manifest.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendRunIntent, appendRunResult, intentMintedIdOf } from './step-context.js';
+import { appendRunIntent, appendRunResult, intentMintedIdOf, saveOrRefuse } from './step-context.js';
 
 type ReviewKind = 'brief-check' | 'code-review';
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
@@ -376,4 +379,179 @@ export async function reconcileReview(
     return { outcome: 'refused', reason: resultRefusal };
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: ambiguous ? 'ambiguous' : 'completed', reasonCode };
+}
+
+/**
+ * Why the run is `fixing`: the LATEST final result entry of this run whose
+ * key's step sent it there — a `brief-check`/`code-review` result with reason
+ * `review-failed` (a review source), a `gate` result with reason `gate-failed`
+ * (a gate source), or a K6 `ci`/`pre-merge` failure (a gate-shaped source with
+ * its reason code). `ci` has no key step yet, so only `pre-merge` counts here.
+ */
+function fixingFailureSourceOf(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+): { readonly key: string; readonly source: 'review' | 'gate'; readonly reasonCode: string } | null {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index]!;
+    if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step') {
+      continue;
+    }
+    if (
+      (parsed.step === 'brief-check' || parsed.step === 'code-review') &&
+      entry.reasonCode === 'review-failed'
+    ) {
+      return { key: entry.key, source: 'review', reasonCode: entry.reasonCode };
+    }
+    if (parsed.step === 'gate' && entry.reasonCode === 'gate-failed') {
+      return { key: entry.key, source: 'gate', reasonCode: entry.reasonCode };
+    }
+    if (parsed.step === 'pre-merge' && entry.reasonCode !== null) {
+      return { key: entry.key, source: 'gate', reasonCode: entry.reasonCode };
+    }
+  }
+  return null;
+}
+
+/** Receipt findings map one-to-one onto the renderer's typed findings. */
+function handoverFindingsOf(receipt: {
+  readonly findings: readonly { readonly findingId: string; readonly severity: 'blocker' | 'major' | 'minor' | 'nit';
+    readonly summary: string; readonly filePath: string | null; readonly line: number | null }[];
+}): HandoverFinding[] {
+  return receipt.findings.map((finding) => ({
+    findingId: finding.findingId,
+    severity: finding.severity,
+    summary: finding.summary,
+    filePath: finding.filePath,
+    line: finding.line,
+  }));
+}
+
+/**
+ * The `act prepare` for a fix round (K5-5, plan §3.3 Fix row): render the
+ * handover brief from the failure that sent the run to `fixing` — numbered
+ * findings from the review receipt, or the gate's reason code — then prepare
+ * the fix attempt through `PrepareFixAttemptPort` in EXACTLY `performPrepare`'s
+ * order (intent, port call, record save, result). The rendered `text` is never
+ * journalled and never stored here: the fix use case renders the brief it
+ * dispatches from `numberedFixes`. `refuse` is `performPrepare`'s local
+ * refusal, so a refusal journals its intent (null minted id) and result under
+ * the same key with the same shape.
+ */
+export async function performFixPrepare(ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: ActDecision,
+  request: AdvanceLaneRunRequest,
+  refuse: (reasonCode: LaneRunResultReasonCode) => Promise<AdvanceLaneRunResult>,
+): Promise<AdvanceLaneRunResult> {
+  const fixPort = ctx.deps.prepareFixAttempt;
+  if (fixPort === undefined || ctx.deps.reviewRequest === undefined) {
+    return { outcome: 'not-wired', step: decision.step };
+  }
+  if (decision.round !== 1 && decision.round !== 2) {
+    return refuse('prepare-refused');
+  }
+  const round: 1 | 2 = decision.round === 1 ? 1 : 2;
+  let prior: AttemptRecord | null = null;
+  for (let index = gathered.attemptRecords.length - 1; index >= 0; index -= 1) {
+    const candidate = gathered.attemptRecords[index];
+    if (candidate !== null && candidate.artifacts !== null) {
+      prior = candidate;
+      break;
+    }
+  }
+  if (prior === null || prior.artifacts === null) {
+    return refuse('no-frozen-brief');
+  }
+  const head = head12Of(prior.artifacts.headCommit);
+  if (head === null) {
+    return refuse('prepare-refused');
+  }
+  const entries = await ctx.deps.runJournal.listForRun(record.runId);
+  const failure = fixingFailureSourceOf(entries, record.runId);
+  if (failure === null) {
+    return refuse('prepare-refused');
+  }
+  let findings: readonly HandoverFinding[] = [];
+  if (failure.source === 'review') {
+    const requestId = await intentMintedIdOf(ctx, failure.key);
+    if (requestId === null) {
+      return refuse('prepare-refused');
+    }
+    let found: FindReviewReceiptResult;
+    try {
+      found = await ctx.deps.reviewRequest.findReviewReceipt({
+        attemptId: prior.id,
+        requestId,
+        candidateHeadSha: prior.artifacts.headCommit,
+      });
+    } catch {
+      found = { outcome: 'unavailable', reason: 'unreadable' };
+    }
+    if (found.outcome !== 'found') {
+      return refuse('prepare-refused');
+    }
+    findings = handoverFindingsOf(found.receipt);
+  }
+  // No branch name is recorded on the run or the attempt: the conductor names
+  // worktrees after their branch, so the branch is the prior worktree path's
+  // last path segment (orchestrator decision).
+  const branchName = prior.worktreePath.split('/').pop() ?? '';
+  const brief = renderHandoverBrief({
+    runId: record.runId,
+    round,
+    branchName,
+    head12: head,
+    source: failure.source === 'review' ? 'review' : 'gate',
+    findings,
+    gateReasonCodes: failure.source === 'review' ? [] : [failure.reasonCode],
+  } satisfies RenderHandoverBriefInput);
+  if (!brief.ok || brief.numberedFixes.length === 0) {
+    return refuse('prepare-refused');
+  }
+  const numberedFixes: readonly string[] = brief.numberedFixes;
+  const fixRequest: PrepareFixAttemptRequest = {
+    fixAttemptId: 'attempt-' + ctx.deps.newUlid(),
+    workOrderId: record.workOrderId,
+    priorAttemptId: prior.id,
+    numberedFixes,
+    nowIso: request.nowIso,
+  };
+  const intentRefusal = await appendRunIntent(ctx, request, decision.key, fixRequest.fixAttemptId);
+  if (intentRefusal !== null) {
+    return { outcome: 'refused', reason: intentRefusal };
+  }
+  let prepared: PrepareFixAttemptResult;
+  try {
+    // PrepareFixAttempt selects the fix seat itself; the decider's seat index is advisory until the port takes one (follow-up).
+    prepared = await fixPort.prepareFixAttempt(fixRequest);
+  } catch {
+    prepared = { outcome: 'refused', reason: 'prepare-refused' };
+  }
+  if (prepared.outcome !== 'prepared' || prepared.attempt.id !== fixRequest.fixAttemptId) {
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'prepare-refused');
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'prepare-refused' };
+  }
+  const saved = await saveOrRefuse(ctx,
+    { ...record, attemptIds: [...record.attemptIds, prepared.attempt.id], revision: record.revision + 1 },
+    request,
+  );
+  if (!saved.ok) {
+    // The intent stays pending; the prepare reconcile finds the attempt and
+    // appends the id to the run record (K4-7).
+    return { outcome: 'refused', reason: saved.reason };
+  }
+  const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', 'prepared');
+  if (resultRefusal !== null) {
+    return { outcome: 'refused', reason: resultRefusal };
+  }
+  return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'prepared' };
 }

@@ -85,6 +85,10 @@ describe("buildRegistry", () => {
       "fleet_attempt_list",
       "fleet_attempt_journal",
       "fleet_work_order",
+      "fleet_head_evidence",
+      "fleet_question_list",
+      "fleet_question",
+      "fleet_project_list",
     ]);
     expect([...registry.resources.map((resource) => resource.name)]).toEqual([
       ...FLEET_RESOURCE_NAMES,

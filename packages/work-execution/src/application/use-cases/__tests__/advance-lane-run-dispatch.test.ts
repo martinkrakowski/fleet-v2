@@ -597,7 +597,7 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(parked).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'prepare' });
   });
 
-  it('test 9: a fix-round prepare is refused prepare-fix-round-not-built', async () => {
+  it('test 9: a fix-round prepare without the K5 ports is not-wired and writes nothing', async () => {
     const collected = attemptFixture({
       state: 'collected',
       artifacts: {
@@ -610,15 +610,11 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     const harness = await makeHarness(runRecord(), [collected]);
     await conduct(harness, 'fixing', NOW);
     const result = await advance(harness);
-    expect(result).toEqual({
-      outcome: 'acted',
-      step: 'prepare',
-      key: prepareKey(1, 0, 2),
-      result: 'refused',
-      reasonCode: 'prepare-fix-round-not-built',
-    });
+    expect(result).toEqual({ outcome: 'not-wired', step: 'prepare' });
     const after = await harness.runRepo.get(RUN_ID);
     expect(after?.attemptIds).toHaveLength(1);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'conduct' && entry.state === 'fixing')).toHaveLength(1);
   });
 
   it('test 10: a graceful stop with a prepared, never-dispatched attempt cancels it under its stop key and ends stopped', async () => {

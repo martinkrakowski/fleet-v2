@@ -35,5 +35,5 @@ export interface LaneRunParkNoticePort {
   /** Ask the keyed owner question for reasons the owner must decide; a repeat returns the stored question. */
   askParkQuestion(request: LaneRunParkRequest): Promise<LaneRunParkNoticeResult>;
   /** Read the question previously asked under the key; reads write nothing. */
-  findParkQuestion(key: string): Promise<LaneRunParkFindResult>;
+  findParkQuestion(request: { readonly key: string }): Promise<LaneRunParkFindResult>;
 }

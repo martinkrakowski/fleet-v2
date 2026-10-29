@@ -52,6 +52,9 @@ export const PARK_QUESTION_REASONS: readonly string[] = [
 /** The reason code that opens a one-way door question; every other reason is two-way. */
 const ONE_WAY_REASON = 'one-way-door';
 
+/** Lowercase code shape a qualifier must match when present. */
+const QUALIFIER_CODE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
 /** Fixed title and body per reason code; the codes decide, never lane output. */
 function questionTexts(
   reason: string,
@@ -98,15 +101,20 @@ function doorKindFor(reason: string): OwnerQuestionDoorKind {
   return reason === ONE_WAY_REASON ? 'one-way' : 'two-way';
 }
 
-/** Map an owner-question record's state onto the conductor's three read states. */
-function parkState(state: unknown): LaneRunParkQuestionState {
-  if (state === 'open') {
-    return 'open';
+/** Map an owner-question record's state onto the conductor's three read states; null for unknown states. */
+function parkState(state: unknown): LaneRunParkQuestionState | null {
+  switch (state) {
+    case 'open':
+      return 'open';
+    case 'expired':
+      return 'expired';
+    case 'answered':
+    case 'acknowledged':
+    case 'rejected':
+      return 'answered';
+    default:
+      return null;
   }
-  if (state === 'expired') {
-    return 'expired';
-  }
-  return 'answered';
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -128,6 +136,14 @@ export class LaneRunParkNoticeAdapter implements LaneRunParkNoticePort {
     if (!recordAttentionItem) {
       return { outcome: 'refused', reason: 'not-configured' };
     }
+    if (request.qualifier !== undefined && !QUALIFIER_CODE.test(request.qualifier)) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    try {
+      questionTexts(request.reason, request);
+    } catch {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
     const qualifier = request.qualifier === undefined ? '' : `, qualifier ${request.qualifier}`;
     const body = {
       projectId: request.projectId,
@@ -138,10 +154,10 @@ export class LaneRunParkNoticeAdapter implements LaneRunParkNoticePort {
     };
     try {
       const answer = await recordAttentionItem(body, PARK_ACTOR);
-      if (
-        isPlainObject(answer) &&
-        (answer.outcome === 'raised' || answer.outcome === 'refreshed' || answer.outcome === 'reopened')
-      ) {
+      if (isPlainObject(answer) && answer.outcome === 'refreshed') {
+        return { outcome: 'exists' };
+      }
+      if (isPlainObject(answer) && (answer.outcome === 'raised' || answer.outcome === 'reopened')) {
         return { outcome: 'recorded' };
       }
       return { outcome: 'refused', reason: 'unreadable' };
@@ -188,20 +204,24 @@ export class LaneRunParkNoticeAdapter implements LaneRunParkNoticePort {
     }
   }
 
-  async findParkQuestion(key: string): Promise<LaneRunParkFindResult> {
+  async findParkQuestion(request: { readonly key: string }): Promise<LaneRunParkFindResult> {
     const findOwnerQuestionByKey = this.delegate?.findOwnerQuestionByKey;
     if (!findOwnerQuestionByKey) {
       return { outcome: 'unavailable' };
     }
     try {
-      const answer = await findOwnerQuestionByKey({ idempotencyKey: key });
+      const answer = await findOwnerQuestionByKey({ idempotencyKey: request.key });
       if (isPlainObject(answer) && answer.outcome === 'found') {
         const question = answer.question;
         if (isPlainObject(question) && typeof question.questionId === 'string') {
+          const state = parkState(question.state);
+          if (state === null) {
+            return { outcome: 'unavailable' };
+          }
           return {
             outcome: 'found',
             questionId: question.questionId,
-            state: parkState(question.state),
+            state,
           };
         }
         return { outcome: 'unavailable' };

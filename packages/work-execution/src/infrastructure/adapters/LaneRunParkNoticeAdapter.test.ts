@@ -56,8 +56,33 @@ describe('LaneRunParkNoticeAdapter', () => {
       );
     });
 
-    it('maps refreshed and reopened outcomes to recorded', async () => {
-      for (const outcome of ['refreshed', 'reopened']) {
+    it('refuses an unknown reason code with invalid-request without raising', async () => {
+      const recordAttentionItem = attentionDelegate();
+      const adapter = new LaneRunParkNoticeAdapter({ recordAttentionItem });
+      expect(await adapter.recordParkAttention({ ...REQUEST, reason: 'mystery' })).toEqual({
+        outcome: 'refused',
+        reason: 'invalid-request',
+      });
+      expect(recordAttentionItem).not.toHaveBeenCalled();
+    });
+
+    it('refuses a qualifier that is not a lowercase code with invalid-request', async () => {
+      const recordAttentionItem = attentionDelegate();
+      const adapter = new LaneRunParkNoticeAdapter({ recordAttentionItem });
+      expect(await adapter.recordParkAttention({ ...REQUEST, qualifier: 'Ci-Unknown' })).toEqual({
+        outcome: 'refused',
+        reason: 'invalid-request',
+      });
+      expect(recordAttentionItem).not.toHaveBeenCalled();
+    });
+
+    it('maps refreshed to exists and raised/reopened to recorded', async () => {
+      const refreshed = new LaneRunParkNoticeAdapter({
+        recordAttentionItem: vi.fn(async (_request: unknown) => ({ outcome: 'refreshed', item: {}, revision: 2 })),
+      });
+      expect(await refreshed.recordParkAttention(REQUEST)).toEqual({ outcome: 'exists' });
+
+      for (const outcome of ['raised', 'reopened']) {
         const adapter = new LaneRunParkNoticeAdapter({
           recordAttentionItem: vi.fn(async (_request: unknown) => ({ outcome, item: {}, revision: 2 })),
         });
@@ -126,13 +151,30 @@ describe('LaneRunParkNoticeAdapter', () => {
           optionId: 'resume',
           because: 'The parked run should continue once the owner has seen the notice.',
         });
-        const title = ask.title as string;
-        const body = ask.body as string;
-        expect(title).toContain(reason);
-        expect(body).toContain('run-42');
-        expect(body).toContain('wo-7');
-        expect(body).toContain('proj-1');
-        expect(body).toContain(reason);
+        const expectedTexts: Record<string, { title: string; body: string }> = {
+          'one-way-door': {
+            title: 'Lane run parked: one-way door (one-way-door)',
+            body:
+              'The conductor parked run run-42 of work order wo-7 in project proj-1 with reason one-way-door. The run reached a one-way door that the owner must decide before the run may continue. Choose resume or stop.',
+          },
+          'owner-merge': {
+            title: 'Lane run parked: owner merge (owner-merge)',
+            body:
+              'The conductor parked run run-42 of work order wo-7 in project proj-1 with reason owner-merge. Automatic merge is off for this run, so the owner merges by hand. Choose resume or stop.',
+          },
+          'blocker-after-round-2': {
+            title: 'Lane run parked: blocker after round 2 (blocker-after-round-2)',
+            body:
+              'The conductor parked run run-42 of work order wo-7 in project proj-1 with reason blocker-after-round-2. The run still carries a blocker after its second fix round. Choose resume or stop.',
+          },
+          'seat-plan-exhausted': {
+            title: 'Lane run parked: seat plan exhausted (seat-plan-exhausted)',
+            body:
+              'The conductor parked run run-42 of work order wo-7 in project proj-1 with reason seat-plan-exhausted. The seat plan has no remaining seat for the run. Choose resume or stop.',
+          },
+        };
+        expect(ask.title).toBe(expectedTexts[reason].title);
+        expect(ask.body).toBe(expectedTexts[reason].body);
       },
     );
 
@@ -163,7 +205,7 @@ describe('LaneRunParkNoticeAdapter', () => {
   describe('findParkQuestion', () => {
     it('reports unavailable when unbound', async () => {
       const adapter = new LaneRunParkNoticeAdapter();
-      expect(await adapter.findParkQuestion(REQUEST.key)).toEqual({ outcome: 'unavailable' });
+      expect(await adapter.findParkQuestion({ key: REQUEST.key })).toEqual({ outcome: 'unavailable' });
     });
 
     it('looks the question up by the key and maps the open state', async () => {
@@ -172,7 +214,7 @@ describe('LaneRunParkNoticeAdapter', () => {
         question: { questionId: 'q-9', state: 'open' },
       }));
       const adapter = new LaneRunParkNoticeAdapter({ findOwnerQuestionByKey });
-      expect(await adapter.findParkQuestion(REQUEST.key)).toEqual({
+      expect(await adapter.findParkQuestion({ key: REQUEST.key })).toEqual({
         outcome: 'found',
         questionId: 'q-9',
         state: 'open',
@@ -181,6 +223,7 @@ describe('LaneRunParkNoticeAdapter', () => {
     });
 
     it.each([
+      ['open', 'open'],
       ['answered', 'answered'],
       ['acknowledged', 'answered'],
       ['rejected', 'answered'],
@@ -192,30 +235,43 @@ describe('LaneRunParkNoticeAdapter', () => {
           question: { questionId: 'q-9', state },
         })),
       });
-      expect(await adapter.findParkQuestion(REQUEST.key)).toEqual({
+      expect(await adapter.findParkQuestion({ key: REQUEST.key })).toEqual({
         outcome: 'found',
         questionId: 'q-9',
         state: expected,
       });
     });
 
+    it.each([undefined, 'weird', 42] as const)(
+      'reports unavailable for an unknown owner-question state %s',
+      async (state) => {
+        const adapter = new LaneRunParkNoticeAdapter({
+          findOwnerQuestionByKey: vi.fn(async (_request: unknown) => ({
+            outcome: 'found',
+            question: { questionId: 'q-9', state },
+          })),
+        });
+        expect(await adapter.findParkQuestion({ key: REQUEST.key })).toEqual({ outcome: 'unavailable' });
+      },
+    );
+
     it('maps known absence to not-found and malformed or thrown answers to unavailable', async () => {
       const absent = new LaneRunParkNoticeAdapter({
         findOwnerQuestionByKey: vi.fn(async (_request: unknown) => ({ outcome: 'not-found' })),
       });
-      expect(await absent.findParkQuestion(REQUEST.key)).toEqual({ outcome: 'not-found' });
+      expect(await absent.findParkQuestion({ key: REQUEST.key })).toEqual({ outcome: 'not-found' });
 
       const malformed = new LaneRunParkNoticeAdapter({
         findOwnerQuestionByKey: vi.fn(async (_request: unknown) => ({ outcome: 'found', question: {} })),
       });
-      expect(await malformed.findParkQuestion(REQUEST.key)).toEqual({ outcome: 'unavailable' });
+      expect(await malformed.findParkQuestion({ key: REQUEST.key })).toEqual({ outcome: 'unavailable' });
 
       const thrown = new LaneRunParkNoticeAdapter({
         findOwnerQuestionByKey: vi.fn(async (_request: unknown) => {
           throw new Error('store down');
         }),
       });
-      expect(await thrown.findParkQuestion(REQUEST.key)).toEqual({ outcome: 'unavailable' });
+      expect(await thrown.findParkQuestion({ key: REQUEST.key })).toEqual({ outcome: 'unavailable' });
     });
   });
 });

@@ -200,6 +200,57 @@ export interface AttemptSeatSelectionRecord {
   readonly tool: string | null;
   readonly variant: string | null;
   readonly agent: string | null;
+  /**
+   * The rotation ticket the selection owned (plan §3.5.3). Absent on records
+   * written before SR1b.
+   */
+  readonly ticket?: number;
+  /**
+   * The length of the available list the selection indexed. Absent on records
+   * written before SR1b.
+   */
+  readonly availableCount?: number;
+}
+
+/**
+ * One rotation counter per (project, role) (plan §3.5.3, D3). `ticket` only
+ * ever increases; `revision` carries optimistic concurrency.
+ */
+export const SEAT_TICKET_ROLES = ['first-pass', 'fix', 'review', 'pre-merge'] as const;
+export type SeatTicketRole = (typeof SEAT_TICKET_ROLES)[number];
+
+export interface SeatTicketRecord {
+  readonly version: 1;
+  readonly projectId: string;
+  readonly role: SeatTicketRole;
+  readonly ticket: number;
+  readonly revision: number;
+  readonly updatedAtIso: string;
+}
+
+/** Outcomes of a seat observation recorded from outside fleet's runner (plan §3.5.5). */
+export const SEAT_OBSERVATION_OUTCOMES = [
+  'rate-limited',
+  'payment',
+  'timeout',
+  'model-missing',
+  'no-route',
+  'empty-response',
+] as const;
+export type SeatObservationOutcome = (typeof SEAT_OBSERVATION_OUTCOMES)[number];
+
+/**
+ * A refusal seen on a seat that ran outside fleet's runner (plan §3.5.5).
+ * Never evidence; never edits health.
+ */
+export interface SeatObservationRecord {
+  readonly version: 1;
+  readonly observationId: string;
+  readonly seatId: string;
+  readonly outcome: SeatObservationOutcome;
+  readonly observedAtIso: string;
+  readonly subject: { readonly attemptId: string } | { readonly reviewRequestId: string };
+  readonly via: 'cli' | 'mcp';
 }
 
 /** Serializable record of one dispatch or one fresh fix session. */

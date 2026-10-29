@@ -474,6 +474,18 @@ describe('ReviewRequestAdapter.requestReview', () => {
     expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request', detail: null });
     expect(calls).toHaveLength(0);
   });
+
+  it('journals only a declared code as detail: an undeclared pattern-valid token is null (KF-14a Luna)', async () => {
+    const adapter = new ReviewRequestAdapter({
+      requestIndependentReview: async () => ({ outcome: 'rejected', reason: 'x', rejection: 'review-unavailable', code: 'arbitrary-token' as never }),
+    });
+    const refused = await adapter.requestReview(makeReviewRequest());
+    expect(refused).toEqual({ outcome: 'no-receipt', reason: 'review-unavailable', detail: null });
+    const known = new ReviewRequestAdapter({
+      requestIndependentReview: async () => ({ outcome: 'rejected', reason: 'x', rejection: 'review-unavailable', code: 'route-no-auth-file' }),
+    });
+    expect(await known.requestReview(makeReviewRequest())).toEqual({ outcome: 'no-receipt', reason: 'review-unavailable', detail: 'route-no-auth-file' });
+  });
 });
 
 describe('ReviewRequestAdapter.findReviewReceipt', () => {

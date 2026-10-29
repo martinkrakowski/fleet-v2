@@ -36,6 +36,10 @@ import type {
   ReviewVerdict,
 } from '../../application/ports/out/ReviewRequestPort.out-port.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../domain/lane-run-journal.js';
+import { REVIEW_UNAVAILABLE_CODES } from '@fleet/evidence-and-acceptance';
+
+/** The only codes that may reach a run-journal `detail`: the evidence context's unavailable codes plus the two post-run rejections. */
+const REVIEW_DETAIL_CODES: ReadonlySet<string> = new Set([...REVIEW_UNAVAILABLE_CODES, 'not-read-only', 'invalid-receipt']);
 
 const HEAD_PATTERN = /^[0-9a-f]{40}$/;
 const REVIEW_KIND_VALUES: readonly string[] = REVIEW_KINDS;
@@ -136,10 +140,12 @@ function mapRejection(
   rejection: ReviewRejection | undefined,
   code?: ReviewUnavailableCode | 'not-read-only' | 'invalid-receipt',
 ): ReviewRequestResult {
-  // The fixed reason code journals as the result's `detail` only when it
-  // matches the run-journal pattern; anything else (including an absent code)
-  // is null, so free text never reaches the journal.
-  const detail = code !== undefined && LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(code) ? code : null;
+  // The fixed reason code journals as the result's `detail` only when it is a
+  // member of the declared code unions AND matches the run-journal pattern;
+  // anything else (an absent or unknown code) is null, so neither free text
+  // nor an undeclared token ever reaches the journal.
+  const detail =
+    code !== undefined && REVIEW_DETAIL_CODES.has(code) && LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(code) ? code : null;
   switch (rejection) {
     case 'review-unavailable':
     case 'not-read-only':

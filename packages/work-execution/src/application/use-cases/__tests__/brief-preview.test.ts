@@ -327,6 +327,18 @@ describe('PrepareBriefPackageUseCase previewBriefPackage (BP1)', () => {
     }
   });
 
+  it('preview rejections never echo an allowed path prefix, whichever check refuses it', async () => {
+    const marker = '/MARKER-ABSOLUTE-PREFIX';
+    const preview = await makeUseCase().useCase.previewBriefPackage(
+      validRequest({ allowedPathPrefixes: [marker] }),
+    );
+    expect(preview.outcome).toBe('rejected');
+    if (preview.outcome === 'rejected') {
+      expect(preview.reason).not.toContain('MARKER-ABSOLUTE-PREFIX');
+      expect(preview.reason).toContain('<path>');
+    }
+  });
+
   it('throws Not implemented when unconfigured and keeps execute() prepared/rejected only', async () => {
     const unconfigured = new PrepareBriefPackageUseCase();
     await expect(unconfigured.previewBriefPackage(validRequest())).rejects.toThrow(

@@ -328,6 +328,33 @@ type BuiltBriefPackage =
       readonly selectedKnowledgeVersions: readonly SelectedKnowledgeVersion[];
     };
 
+/**
+ * Every path the request or the configuration supplies (worktree, allowed prefixes, expected artifacts, the
+ * hand-written brief) is replaced by `<path>` in a preview rejection, whichever check produced it; prepare's own
+ * messages are unchanged.
+ */
+function redactRequestPaths(
+  reason: string,
+  request: PrepareBriefPackageUseCaseRequest,
+  deps: { readonly handWrittenBriefPath?: string | null },
+): string {
+  const candidates: unknown[] = [
+    request.worktreePath,
+    request.handWrittenBriefPath,
+    deps.handWrittenBriefPath,
+    ...(Array.isArray(request.allowedPathPrefixes) ? request.allowedPathPrefixes : []),
+    ...(Array.isArray(request.expectedArtifacts) ? request.expectedArtifacts : []),
+  ];
+  const paths = candidates
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .sort((left, right) => right.length - left.length);
+  let redacted = reason;
+  for (const path of paths) {
+    redacted = redacted.split(path).join('<path>');
+  }
+  return redacted;
+}
+
 export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
   constructor(private readonly deps?: PrepareBriefPackageDependencies) {}
 
@@ -503,7 +530,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     // fixed reasons when forPreview is set.
     const built = await this.build(request, this.deps, true);
     if ('reason' in built) {
-      return { outcome: 'rejected', reason: built.reason };
+      return { outcome: 'rejected', reason: redactRequestPaths(built.reason, request, this.deps) };
     }
 
     const compute = this.deps.computeDigest ?? simpleDeterministicHexDigest;

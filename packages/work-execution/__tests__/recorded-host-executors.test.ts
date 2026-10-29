@@ -91,6 +91,17 @@ function recordingExecutor(alias: string | null): CommandExecutorPort & {
   };
 }
 
+/** A legacy-executor spy whose `run` throws: a code path that runs it fails the test. */
+function throwingLegacyExecutor(): CommandExecutorPort & { calls: number } {
+  return {
+    calls: 0,
+    async run(): Promise<CommandRunResult> {
+      this.calls += 1;
+      throw new Error('the legacy executor must never run');
+    },
+  };
+}
+
 describe("ExecutorForHost", () => {
   const legacyExecutor = recordingExecutor(null);
   const helper = new ExecutorForHost({ hosts, legacyExecutor });
@@ -110,7 +121,9 @@ describe("ExecutorForHost", () => {
   });
 
   it("resolves an older alias-only record through the one ssh host with that alias, never local", () => {
-    const result = helper.executorForRecordedHost(
+    const legacy = throwingLegacyExecutor();
+    const isolated = new ExecutorForHost({ hosts, legacyExecutor: legacy });
+    const result = isolated.executorForRecordedHost(
       attemptRunner(null, "a.example", 4001),
     );
     expect(result.ok).toBe(true);
@@ -118,20 +131,24 @@ describe("ExecutorForHost", () => {
     expect(result.executor).toBeInstanceOf(SshExecutor);
     expect((result.executor as SshExecutor).sshHost).toBe("a.example");
     // Cached and keyed by the resolved host name, like a confirmed host.
-    const again = helper.executorForRecordedHost(
+    const again = isolated.executorForRecordedHost(
       attemptRunner(null, "a.example", 4001),
     );
     expect(again.ok && again.executor === result.executor).toBe(true);
-    const viaName = helper.executorForRecordedHost(
+    const viaName = isolated.executorForRecordedHost(
       attemptRunner("host-a", "a.example", 4001),
     );
     expect(viaName.ok && viaName.executor === result.executor).toBe(true);
+    // The legacy executor never ran: the alias resolved to the ssh host alone.
+    expect(legacy.calls).toBe(0);
   });
 
   it("refuses an alias-only record whose alias matches no single installation host, never local", () => {
+    const legacy = throwingLegacyExecutor();
+    const isolated = new ExecutorForHost({ hosts, legacyExecutor: legacy });
     // No host carries this alias.
     expect(
-      helper.executorForRecordedHost(attemptRunner(null, "gone.example", 4002)),
+      isolated.executorForRecordedHost(attemptRunner(null, "gone.example", 4002)),
     ).toEqual({
       ok: false,
       reason:
@@ -139,19 +156,21 @@ describe("ExecutorForHost", () => {
     });
     // Two hosts share the alias ("host-b" and "changed-host").
     expect(
-      helper.executorForRecordedHost(attemptRunner(null, "b.example", 4002)),
+      isolated.executorForRecordedHost(attemptRunner(null, "b.example", 4002)),
     ).toEqual({
       ok: false,
       reason:
         "the attempt names a host alias that matches no single installation host",
     });
     // The refusal never names the alias or a path.
-    const refused = helper.executorForRecordedHost(
+    const refused = isolated.executorForRecordedHost(
       attemptRunner(null, "b.example", 4002),
     );
     if (refused.ok) return;
     expect(refused.reason).not.toContain("b.example");
     expect(refused.reason).not.toContain("/");
+    // The legacy executor never ran: both refusals resolved without it.
+    expect(legacy.calls).toBe(0);
   });
 
   it("builds an SshExecutor with the recorded host's alias for an ssh host", () => {
@@ -179,6 +198,8 @@ describe("ExecutorForHost", () => {
   });
 
   it("refuses a changed port, a changed alias, a changed transport, a removed role and a removed host, naming the host", () => {
+    const legacy = throwingLegacyExecutor();
+    const isolated = new ExecutorForHost({ hosts, legacyExecutor: legacy });
     const cases: Array<[AttemptRunnerRecord, string]> = [
       [attemptRunner("changed-host", "b.example", 4002), "changed-host"],
       [attemptRunner("re-aliased", "b.example", 4002), "re-aliased"],
@@ -186,7 +207,7 @@ describe("ExecutorForHost", () => {
       [attemptRunner("gone", null, 4002), "gone"],
     ];
     for (const [recorded, name] of cases) {
-      const result = helper.executorForRecordedHost(recorded);
+      const result = isolated.executorForRecordedHost(recorded);
       expect(result).toEqual({
         ok: false,
         reason: `recorded host ${name} changed or was removed`,
@@ -198,7 +219,7 @@ describe("ExecutorForHost", () => {
       hosts: {
         "was-ssh": { transport: "local" as const, roles: ["lane-runner"] },
       },
-      legacyExecutor,
+      legacyExecutor: legacy,
     });
     expect(
       localNow.executorForRecordedHost(
@@ -208,6 +229,8 @@ describe("ExecutorForHost", () => {
       ok: false,
       reason: "recorded host was-ssh changed or was removed",
     });
+    // The legacy executor never ran: every refusal resolved without it.
+    expect(legacy.calls).toBe(0);
   });
 });
 

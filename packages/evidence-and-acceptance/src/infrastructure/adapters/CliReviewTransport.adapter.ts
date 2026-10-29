@@ -1,5 +1,5 @@
 /**
- * Single-turn CLI review transport (grok).
+ * Single-turn CLI review transport (grok, agy).
  *
  * Runs on the machine running fleet-v2, so the change under review is
  * embedded in the prompt and wrapped as untrusted, never read from disk.
@@ -39,8 +39,37 @@ import type { SpawnRunOutcome, SpawnRunOptions } from './spawn-run.js';
  */
 export const GROK_REVIEW_ARGV_TEMPLATE: readonly string[] = ['grok', '-m', '{model}', '--permission-mode', 'plan', '--disable-web-search', '-p', '{prompt}'];
 
+/**
+ * Copied from AGY_TOOL.invocation.argvTemplate in packages/tooling/src/agy.ts
+ * (the conservative edit-only template). It differs from the rulebook shape in
+ * the lane brief: the tooling template carries `--mode accept-edits` and no
+ * `--effort`/`--print-timeout` flags, and the tooling one is used per the
+ * brief. `--output-format json` wraps the reply; `readAgyReviewReply` below
+ * unwraps it. The evidence context may not import @fleet/tooling; change both
+ * in the same PR.
+ */
+export const AGY_REVIEW_ARGV_TEMPLATE: readonly string[] = [
+  'agy',
+  '--print',
+  '{prompt}',
+  '--model',
+  '{model}',
+  '--output-format',
+  'json',
+  '--mode',
+  'accept-edits',
+];
+
+/**
+ * Headless agy auto-denies shell commands and then returns an EMPTY response,
+ * so an agy review prompt starts with this preamble, before the untrusted
+ * block. An empty response is a failed review, never a clean verdict.
+ */
+export const AGY_NO_SHELL_PREAMBLE = 'Read files only with your file-reading tool; run no shell command.';
+
 /** Seat tools with a single-turn CLI review transport, by seat `tool`. */
 export const CLI_REVIEW_ARGV_TEMPLATES: Readonly<Record<string, readonly string[]>> = {
+  agy: AGY_REVIEW_ARGV_TEMPLATE,
   grok: GROK_REVIEW_ARGV_TEMPLATE,
 };
 
@@ -55,6 +84,9 @@ const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/:-]*$/;
 export function substituteReviewArgv(template: readonly string[], model: string, prompt: string): string[] {
   if (!MODEL_PATTERN.test(model)) {
     throw new Error(`invalid reviewer model: "${model}"`);
+  }
+  if (template.includes('--dangerously-skip-permissions') || template.includes('--yolo')) {
+    throw new Error('review argv template must not carry --dangerously-skip-permissions or --yolo');
   }
 
   let modelSeen = 0;
@@ -184,6 +216,30 @@ function cliReviewerEnv(): Record<string, string> {
   return env;
 }
 
+interface AgyJsonReply {
+  readonly response?: unknown;
+}
+
+/**
+ * agy runs with `--output-format json`, so its stdout is the wrapper object;
+ * the reply text lives in the `response` field (the field AGY_TOOL's recorded
+ * output shape documents). Unparsable JSON, a missing field or an EMPTY
+ * response is the same failed-review outcome the empty-answer path returns,
+ * never a clean verdict.
+ */
+function readAgyReviewReply(stdout: string): string {
+  let parsed: AgyJsonReply;
+  try {
+    parsed = JSON.parse(stdout) as AgyJsonReply;
+  } catch {
+    throw new Error('reviewer CLI returned an empty response');
+  }
+  if (typeof parsed.response !== 'string' || parsed.response.trim() === '') {
+    throw new Error('reviewer CLI returned an empty response');
+  }
+  return parsed.response;
+}
+
 export function createCliReviewTransport(
   options: CliReviewTransportOptions,
 ): (request: RunIndependentReviewRequest) => Promise<IndependentReviewTransportResult> {
@@ -220,7 +276,11 @@ export function createCliReviewTransport(
 
     // 5. Build the embedded prompt and enforce the size cap
     const nonce = (options.makeNonce ?? defaultNonce)();
-    const prompt = buildEmbeddedReviewPrompt(request, diff, nonce);
+    const isAgy = options.argvTemplate === AGY_REVIEW_ARGV_TEMPLATE;
+    const basePrompt = buildEmbeddedReviewPrompt(request, diff, nonce);
+    // Headless agy auto-denies shell commands and then answers empty, so its
+    // prompt starts with the no-shell preamble; the grok prompt is unchanged.
+    const prompt = isAgy ? `${AGY_NO_SHELL_PREAMBLE}\n\n${basePrompt}` : basePrompt;
     const bytes = Buffer.byteLength(prompt, 'utf8');
     const maxPromptBytes = options.maxPromptBytes ?? MAX_CLI_PROMPT_BYTES;
     if (bytes > maxPromptBytes) {
@@ -252,19 +312,25 @@ export function createCliReviewTransport(
         throw new Error(`reviewer CLI failed with exit code ${code}: ${detail}`);
       }
 
-      // 9. An empty or one-line answer is a failed review, never a pass
-      const text = outcome.stdout;
-      let nonBlankLineCount = 0;
-      for (const line of text.split(/\r?\n/)) {
-        if (line.trim() !== '') {
-          nonBlankLineCount += 1;
+      // 9. An empty or one-line answer is a failed review, never a pass.
+      // For agy the stdout is the `--output-format json` wrapper: unwrap it
+      // and take the reply text from the documented `response` field.
+      let text = outcome.stdout;
+      if (isAgy) {
+        text = readAgyReviewReply(outcome.stdout);
+      } else {
+        let nonBlankLineCount = 0;
+        for (const line of text.split(/\r?\n/)) {
+          if (line.trim() !== '') {
+            nonBlankLineCount += 1;
+          }
         }
-      }
-      if (nonBlankLineCount === 0) {
-        throw new Error('reviewer CLI returned an empty response');
-      }
-      if (nonBlankLineCount < 2) {
-        throw new Error('reviewer CLI returned a one-line response');
+        if (nonBlankLineCount === 0) {
+          throw new Error('reviewer CLI returned an empty response');
+        }
+        if (nonBlankLineCount < 2) {
+          throw new Error('reviewer CLI returned a one-line response');
+        }
       }
 
       // 10. Verify head and status after the review

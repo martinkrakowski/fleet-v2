@@ -11,7 +11,6 @@ import type { EvidenceAssessmentRecord } from '@fleet/evidence-and-acceptance';
 import { assessmentIdForAttempt, createFleetCliRuntime } from '../composition.js';
 
 const HEAD = 'a'.repeat(40);
-const HEAD_2 = 'b'.repeat(40);
 const ATTEMPT_ID = 'attempt-example-1';
 const PROJECT_ID = 'project-example-1';
 const REQUEST_ID = 'review-01JB0000000000000000000001';

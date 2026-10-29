@@ -21,6 +21,7 @@ import type {
   RequestIndependentReviewResult,
   ReviewReceiptRecord,
   ReviewRejection,
+  ReviewUnavailableCode,
 } from '@fleet/evidence-and-acceptance';
 import type {
   FindLatestReceiptOfKindRequest,
@@ -34,6 +35,7 @@ import type {
   ReviewReceiptSummary,
   ReviewVerdict,
 } from '../../application/ports/out/ReviewRequestPort.out-port.js';
+import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../domain/lane-run-journal.js';
 
 const HEAD_PATTERN = /^[0-9a-f]{40}$/;
 const REVIEW_KIND_VALUES: readonly string[] = REVIEW_KINDS;
@@ -130,12 +132,19 @@ function summaryOf(
   return { ...receiptOfKindSummaryOf(receipt, kind, requestId), requestId };
 }
 
-function mapRejection(rejection: ReviewRejection | undefined): ReviewRequestResult {
+function mapRejection(
+  rejection: ReviewRejection | undefined,
+  code?: ReviewUnavailableCode | 'not-read-only' | 'invalid-receipt',
+): ReviewRequestResult {
+  // The fixed reason code journals as the result's `detail` only when it
+  // matches the run-journal pattern; anything else (including an absent code)
+  // is null, so free text never reaches the journal.
+  const detail = code !== undefined && LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(code) ? code : null;
   switch (rejection) {
     case 'review-unavailable':
     case 'not-read-only':
     case 'invalid-receipt':
-      return { outcome: 'no-receipt', reason: rejection };
+      return { outcome: 'no-receipt', reason: rejection, detail };
     case 'invalid-request':
     case 'not-independent':
     case 'seat-refused':
@@ -143,9 +152,9 @@ function mapRejection(rejection: ReviewRejection | undefined): ReviewRequestResu
     case 'assessment-mismatch':
     case 'assessment-terminal':
     case 'request-id-reused':
-      return { outcome: 'refused', reason: rejection };
+      return { outcome: 'refused', reason: rejection, detail };
     default:
-      return { outcome: 'refused', reason: 'unclassified' };
+      return { outcome: 'refused', reason: 'unclassified', detail: null };
   }
 }
 
@@ -189,10 +198,10 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         (typeof request.briefText !== 'string' ||
           briefTextByteLength(request.briefText) > BRIEF_TEXT_MAX_BYTES))
     ) {
-      return { outcome: 'refused', reason: 'invalid-request' };
+      return { outcome: 'refused', reason: 'invalid-request', detail: null };
     }
     if (!this.delegates.requestIndependentReview) {
-      return { outcome: 'refused', reason: 'not-configured' };
+      return { outcome: 'refused', reason: 'not-configured', detail: null };
     }
     let result: RequestIndependentReviewResult;
     try {
@@ -228,7 +237,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       }
       return { outcome: 'receipt', receipt: summaryOf(receipt, request.kind, request.requestId) };
     }
-    return mapRejection(result.rejection);
+    return mapRejection(result.rejection, result.code);
   }
 
   async findReviewReceipt(request: FindReviewReceiptRequest): Promise<FindReviewReceiptResult> {

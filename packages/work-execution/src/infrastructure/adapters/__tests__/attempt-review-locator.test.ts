@@ -174,6 +174,7 @@ describe('AttemptReviewLocator', () => {
     expect(location.route).toEqual({
       kind: 'none',
       reason: 'Host lane-host declares no runner authFile for a remote review route',
+      code: 'route-no-auth-file',
     });
   });
 
@@ -240,6 +241,36 @@ describe('AttemptReviewLocator', () => {
     expect(location.route.kind).toBe('none');
     if (location.route.kind === 'none') {
       expect(location.route.reason).toContain('not opencode');
+      expect(location.route.code).toBe('route-not-opencode');
+    }
+  });
+
+  it('refuses a recorded opencode host that declares no runner port with the route-no-port code', async () => {
+    const locator = makeLocator({
+      attempt: makeAttempt({
+        runner: {
+          kind: 'opencode',
+          remotePort: null,
+          host: null,
+          hostName: 'local-no-port',
+          agent: null,
+          model: 'example-provider/glm-5.3',
+          variant: null,
+        },
+      }),
+      hosts: {
+        'local-no-port': {
+          transport: 'local',
+          roles: ['lane-runner'],
+          runner: { kind: 'opencode' },
+        },
+      },
+    });
+    const location = await locator.locate('att-1');
+    expect(location.route.kind).toBe('none');
+    if (location.route.kind === 'none') {
+      expect(location.route.reason).toContain('declares no runner port');
+      expect(location.route.code).toBe('route-no-port');
     }
   });
 

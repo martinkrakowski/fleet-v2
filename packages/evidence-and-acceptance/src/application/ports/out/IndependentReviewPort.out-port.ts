@@ -22,6 +22,20 @@ export interface RunIndependentReviewRequest {
   readonly briefText?: string;
 }
 
+/**
+ * The fixed reason codes of an unavailable review (KF-14a): the route codes
+ * name the reviewer route refusal, the seat codes the seat selection refusal,
+ * and the rest the adapter-level failures. A code is a typed token, never a
+ * transport or forge message.
+ */
+export const REVIEW_UNAVAILABLE_CODES = [
+  'route-host-changed', 'route-not-opencode', 'route-no-port', 'route-no-auth-file',
+  'route-unresolved',
+  'seat-none', 'seat-ambiguous', 'seat-implementer', 'seat-tool-no-transport', 'seat-variant-unsupported',
+  'same-family', 'transport-missing', 'transport-failed',
+] as const;
+export type ReviewUnavailableCode = (typeof REVIEW_UNAVAILABLE_CODES)[number];
+
 export type RunIndependentReviewResult =
   | {
       readonly outcome: 'completed';
@@ -31,7 +45,7 @@ export type RunIndependentReviewResult =
       readonly rawOutput: string;
       readonly completedAtIso: string;
     }
-  | { readonly outcome: 'unavailable'; readonly reason: string };
+  | { readonly outcome: 'unavailable'; readonly reason: string; readonly code: ReviewUnavailableCode };
 
 export interface IndependentReviewPort {
   runIndependentReview(request: RunIndependentReviewRequest): Promise<RunIndependentReviewResult>;

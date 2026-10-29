@@ -55,6 +55,12 @@ export interface LaneRunJournalEntryRecord {
   readonly outcome: LaneRunJournalOutcome | null;
   /** A result: an optional typed reason token. Other kinds: null. */
   readonly reasonCode: string | null;
+  /**
+   * A result: an optional fixed reason detail (KF-14a), validated against
+   * `LANE_RUN_JOURNAL_REASON_CODE_PATTERN` when non-null — a free-text detail
+   * is refused like a bad reason code. Other kinds: null.
+   */
+  readonly detail: string | null;
   /** A result: the policy grant the action consumed, if any (§3.9.1: a consumed grant is named, never reused). Other kinds: null. */
   readonly grantId: string | null;
   /** conduct: the state entered. Other kinds: null. */
@@ -85,21 +91,35 @@ const ENTRY_KEYS: readonly string[] = [
   'mintedId',
   'outcome',
   'reasonCode',
+  'detail',
   'grantId',
   'state',
 ];
+
+/** The stored shape before KF-14a (no `detail`); still read as `detail: null`. */
+const LEGACY_ENTRY_KEYS: readonly string[] = ENTRY_KEYS.filter((key) => key !== 'detail');
 
 const ID_MAX_BYTES = 256;
 const LEASE_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 
 function readLaneRunJournalEntryUnchecked(input: unknown): LaneRunJournalEntryRead {
-  const snapshot = readExactPlainRecord(input, ENTRY_KEYS);
+  let snapshot = readExactPlainRecord(input, ENTRY_KEYS);
+  let hasDetail = true;
   if (snapshot === null) {
-    return { ok: false, error: 'LaneRunJournal entry must be a record with exactly the entry keys' };
+    // Old stored entries carry no `detail`; read them as `detail: null`.
+    snapshot = readExactPlainRecord(input, LEGACY_ENTRY_KEYS);
+    if (snapshot === null) {
+      return { ok: false, error: 'LaneRunJournal entry must be a record with exactly the entry keys' };
+    }
+    hasDetail = false;
   }
   const headError = entryHeadError(snapshot);
   if (headError !== null) {
     return { ok: false, error: headError };
+  }
+  const detailError = entryDetailError(snapshot, hasDetail);
+  if (detailError !== null) {
+    return { ok: false, error: detailError };
   }
   const kind = snapshot.kind as LaneRunJournalEntryKind;
   const key = snapshot.key;
@@ -152,6 +172,7 @@ function readLaneRunJournalEntryUnchecked(input: unknown): LaneRunJournalEntryRe
     mintedId: snapshot.mintedId as string | null,
     outcome: snapshot.outcome as LaneRunJournalOutcome | null,
     reasonCode: snapshot.reasonCode as string | null,
+    detail: hasDetail ? (snapshot.detail as string | null) : null,
     grantId: snapshot.grantId as string | null,
     state: snapshot.state as LaneRunStateValue | null,
   });
@@ -284,6 +305,20 @@ function entryReasonCodeError(kind: LaneRunJournalEntryKind, reasonCode: unknown
   }
   if (reasonCode !== null) {
     return 'LaneRunJournal reasonCode must be null or a lowercase token on a result';
+  }
+  return null;
+}
+
+function entryDetailError(snapshot: Record<string, unknown>, present: boolean): string | null {
+  if (!present) {
+    return null;
+  }
+  const detail = snapshot.detail;
+  if (
+    detail !== null &&
+    (typeof detail !== 'string' || !LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(detail))
+  ) {
+    return 'LaneRunJournal detail must be null or a lowercase token';
   }
   return null;
 }

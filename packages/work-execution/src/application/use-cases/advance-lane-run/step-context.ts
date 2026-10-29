@@ -185,9 +185,10 @@ export async function appendRunResult(ctx: AdvanceStepContext,
   key: string,
   outcome: LaneRunJournalOutcome,
   reasonCode: LaneRunResultReasonCode | null,
+  detail: string | null = null,
 ): Promise<AdvanceLaneRunRefusal | null> {
   const appended = await ctx.deps.runJournal.append(
-    laneRunResultEntry(ctx.deps.newUlid(), request.runId, key, outcome, reasonCode, request.nowIso),
+    laneRunResultEntry(ctx.deps.newUlid(), request.runId, key, outcome, reasonCode, request.nowIso, detail),
   );
   return appended.outcome === 'appended' ? null : 'journal-refused';
 }

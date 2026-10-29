@@ -76,6 +76,7 @@ function stopIntentEntry(
     mintedId: null,
     outcome: null,
     reasonCode: null,
+    detail: null,
     grantId: null,
     state: null,
   };

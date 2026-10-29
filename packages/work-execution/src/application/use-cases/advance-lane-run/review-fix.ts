@@ -161,8 +161,9 @@ async function finishReview(
   decision: ActDecision,
   result: 'completed' | 'refused',
   reasonCode: LaneRunResultReasonCode,
+  detail: string | null = null,
 ): Promise<AdvanceLaneRunResult> {
-  const resultRefusal = await appendRunResult(ctx, request, decision.key, result, reasonCode);
+  const resultRefusal = await appendRunResult(ctx, request, decision.key, result, reasonCode, detail);
   if (resultRefusal !== null) {
     return { outcome: 'refused', reason: resultRefusal };
   }
@@ -185,16 +186,16 @@ function reviewResultOfVerdict(verdict: ReviewVerdict): { readonly result: 'comp
 /** The journal result for a review port outcome; null when nothing is established. */
 function reviewResultOf(
   outcome: ReviewRequestResult,
-): { readonly result: 'completed' | 'refused'; readonly reasonCode: LaneRunResultReasonCode } | null {
+): { readonly result: 'completed' | 'refused'; readonly reasonCode: LaneRunResultReasonCode; readonly detail: string | null } | null {
   switch (outcome.outcome) {
     case 'unknown':
       return null;
     case 'no-receipt':
-      return { result: 'completed', reasonCode: 'review-no-receipt' };
+      return { result: 'completed', reasonCode: 'review-no-receipt', detail: outcome.detail };
     case 'refused':
-      return { result: 'refused', reasonCode: 'review-refused' };
+      return { result: 'refused', reasonCode: 'review-refused', detail: outcome.detail };
     default:
-      return reviewResultOfVerdict(outcome.receipt.verdict);
+      return { ...reviewResultOfVerdict(outcome.receipt.verdict), detail: null };
   }
 }
 
@@ -325,7 +326,7 @@ export async function performReview(
     return pendingReview(decision);
   }
   const mapped = reviewResultOf(outcome);
-  return mapped === null ? pendingReview(decision) : finishReview(ctx, request, decision, mapped.result, mapped.reasonCode);
+  return mapped === null ? pendingReview(decision) : finishReview(ctx, request, decision, mapped.result, mapped.reasonCode, mapped.detail);
 }
 
 /**

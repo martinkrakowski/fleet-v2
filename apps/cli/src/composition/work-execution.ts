@@ -81,6 +81,7 @@ import {
 
 import type { FleetCliRuntime, FleetCliRuntimeOptions } from '../composition.js';
 import type { readJsonRecord } from '../composition.js';
+import { readAcceptanceForAttempt } from '@fleet/work-execution';
 
 /** Grant-to-attempt binding persisted for cross-process forge execution. */
 interface AuthorizationCoordinates {
@@ -242,44 +243,7 @@ export function composeExecution(input: ComposeExecutionInput) {
   });
 
   const acceptanceEvidence = new AcceptanceEvidenceAdapter({
-    readAcceptance: async (request) => {
-      let inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
-        assessmentId: assessmentIdForAttempt(request.attemptId),
-        candidateHeadSha: request.candidateHeadSha,
-      });
-      if (inspected.outcome === 'not-found') {
-        inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
-          assessmentId: request.attemptId,
-          candidateHeadSha: request.candidateHeadSha,
-        });
-      }
-      // No head-only fallback: an assessment that is not bound to this attempt
-      // is another attempt's evidence, and this attempt has none.
-      if (
-        inspected.outcome === 'found' &&
-        inspected.assessment.attemptId !== request.attemptId
-      ) {
-        return {
-          outcome: 'not-found',
-          reason: `No acceptance assessment found for head ${request.candidateHeadSha}`,
-        };
-      }
-      if (inspected.outcome === 'found') {
-        return {
-          outcome: 'found',
-          assessment: {
-            candidateHeadSha: inspected.assessment.candidateHeadSha,
-            policyRevision: inspected.assessment.policyRevision,
-            state: inspected.assessment.state,
-            acceptanceReceiptId: inspected.assessment.acceptanceReceiptId,
-          },
-        };
-      }
-      return {
-        outcome: 'not-found',
-        reason: `No acceptance assessment found for head ${request.candidateHeadSha}`,
-      };
-    },
+    readAcceptance: (request) => readAcceptanceForAttempt(evidence.inspectAcceptanceEvidence, request),
   });
 
   const briefKnowledge = new BriefKnowledgeAdapter({

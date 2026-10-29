@@ -24,6 +24,8 @@ import type { LaneRunTelemetryFacts } from '../run-telemetry-spans.js';
 import {
   buildLaneRunStepKey,
   laneRunStopKey,
+  requestKey,
+  reaperRepairKey,
 } from '../lane-run-keys.js';
 import { LANE_RUN_RECORD_VERSION, type LaneRunRecord } from '../lane-run-records.js';
 import { LANE_RUN_JOURNAL_ENTRY_VERSION } from '../lane-run-journal.js';
@@ -34,6 +36,9 @@ import type { TelemetrySpan } from '../run-telemetry.js';
 const SALT = 'example-telemetry-salt-0123456789abcdef0123456789abcdef';
 const hmac: TelemetryHmac = (message) => createHmac('sha256', SALT).update(message, 'utf8').digest();
 const RUN_ID = 'run-01JB0000000000000000000000';
+const RUN_ID2 = 'run-01JC0000000000000000000000';
+const REQUEST_ID = '01JD0000000000000000000000';
+const FINDING_ID = '01JE0000000000000000000000';
 const HEAD12 = '0123456789ab';
 const WORK_ORDER_ID = 'work-order-example-1';
 const ATTEMPT_ID = 'attempt-example-1';
@@ -46,12 +51,12 @@ function asInput(text: string): TelemetryHashInput {
   return token as TelemetryHashInput;
 }
 
-function stepKey(step: string, extra: string): string {
+function stepKey(step: string, extra: string, round = 0, runId = RUN_ID): string {
   const attemptRule = ['prepare', 'dispatch'].includes(step);
   const headRule = ['gate', 'brief-check', 'code-review', 'pre-merge', 'accept', 'open-pr', 'push', 'merge'].includes(step);
   const built = buildLaneRunStepKey({
-    runId: RUN_ID,
-    round: 0,
+    runId,
+    round,
     step: step as never,
     seatIndex: 0,
     attemptOrdinal: attemptRule ? 1 : null,
@@ -76,6 +81,17 @@ const MERGE_KEY = stepKey('merge', '');
 const STOP_KEY_RESULT = laneRunStopKey(RUN_ID, 'web');
 expect(STOP_KEY_RESULT.ok).toBe(true);
 const STOP_KEY = STOP_KEY_RESULT.ok ? STOP_KEY_RESULT.key : '';
+const STOP_KEY2_RESULT = laneRunStopKey(RUN_ID2, 'web');
+expect(STOP_KEY2_RESULT.ok).toBe(true);
+const STOP_KEY2 = STOP_KEY2_RESULT.ok ? STOP_KEY2_RESULT.key : '';
+const PREPARE_KEY2 = stepKey('prepare', '', 0, RUN_ID2);
+const REQUEST_KEY_RESULT = requestKey(REQUEST_ID);
+expect(REQUEST_KEY_RESULT.ok).toBe(true);
+const REQUEST_KEY = REQUEST_KEY_RESULT.ok ? REQUEST_KEY_RESULT.key : '';
+const REAPER_KEY_RESULT = reaperRepairKey('wt-000000000000', 'orphan-session', FINDING_ID);
+expect(REAPER_KEY_RESULT.ok).toBe(true);
+const REAPER_KEY = REAPER_KEY_RESULT.ok ? REAPER_KEY_RESULT.key : '';
+const OTHER_RUN_KEYS = [PREPARE_KEY2, STOP_KEY2, REQUEST_KEY, REAPER_KEY];
 
 function time(second: number): string {
   return `2026-10-29T10:00:${String(second).padStart(2, '0')}.000Z`;
@@ -289,16 +305,50 @@ describe('laneRunSpans (OT1b-1)', () => {
     });
   });
 
-  it('derives every span id from the §3.4 table, built independently', () => {
+  it('derives the root span id from the §3.4 table, built independently', () => {
     const result = laneRunSpans(hmac, factsOf(baseJournal()));
     const root = runTraceRoot(RUN_ID) as NonNullable<ReturnType<typeof runTraceRoot>>;
-    const byName = new Map(result.spans.map((span) => [span.name, span]));
-    expect(byName.get('lane-run')?.spanId).toBe(telemetrySpanId(hmac, root, runRootIdentity()));
-    expect(byName.get('round')?.spanId).toBe(telemetrySpanId(hmac, root, roundIdentity(0) as never));
-    expect(byName.get('prepare')?.spanId).toBe(telemetrySpanId(hmac, root, journalKeyIdentity(asInput(PREPARE_KEY)) as never));
-    expect(byName.get('accept')?.spanId).toBe(telemetrySpanId(hmac, root, journalKeyIdentity(asInput(ACCEPT_KEY)) as never));
-    expect(byName.get('ci-wait')?.spanId).toBe(
-      telemetrySpanId(hmac, root, ciWaitIdentity(baseJournal().find((e) => e.state === 'watching-ci')?.entryId ?? '') as never),
+    expect(spanNamed(result.spans, 'lane-run')?.spanId).toBe(
+      telemetrySpanId(hmac, root, runRootIdentity()),
+    );
+  });
+
+  it('derives the round span id from the §3.4 table, built independently', () => {
+    const result = laneRunSpans(hmac, factsOf(baseJournal()));
+    const root = runTraceRoot(RUN_ID) as NonNullable<ReturnType<typeof runTraceRoot>>;
+    expect(spanNamed(result.spans, 'round')?.spanId).toBe(
+      telemetrySpanId(hmac, root, roundIdentity(0) as never),
+    );
+  });
+
+  it('derives the keyed step span id from the §3.4 table, a retry key included', () => {
+    entryCounter = 0;
+    const journal = [stepIntent(COLLECT_RETRY_KEY, 1), stepResult(COLLECT_RETRY_KEY, 2)];
+    const result = laneRunSpans(hmac, factsOf(journal));
+    const root = runTraceRoot(RUN_ID) as NonNullable<ReturnType<typeof runTraceRoot>>;
+    expect(spanNamed(result.spans, 'collect')?.spanId).toBe(
+      telemetrySpanId(hmac, root, journalKeyIdentity(asInput(COLLECT_RETRY_KEY)) as never),
+    );
+  });
+
+  it('derives the stop-request span id from the §3.4 table, built independently', () => {
+    entryCounter = 0;
+    const journal = [stepIntent(STOP_KEY, 1), conductOf('stopped', 2)];
+    const result = laneRunSpans(hmac, factsOf(journal));
+    const root = runTraceRoot(RUN_ID) as NonNullable<ReturnType<typeof runTraceRoot>>;
+    expect(spanNamed(result.spans, 'stop-request')?.spanId).toBe(
+      telemetrySpanId(hmac, root, journalKeyIdentity(asInput(STOP_KEY)) as never),
+    );
+  });
+
+  it('derives the ci-wait span id from the §3.4 table, built independently', () => {
+    const result = laneRunSpans(hmac, factsOf(baseJournal()));
+    const root = runTraceRoot(RUN_ID) as NonNullable<ReturnType<typeof runTraceRoot>>;
+    const watching = baseJournal().find((e) => e.state === 'watching-ci') as NonNullable<
+      ReturnType<typeof baseJournal>[number]
+    >;
+    expect(spanNamed(result.spans, 'ci-wait')?.spanId).toBe(
+      telemetrySpanId(hmac, root, ciWaitIdentity(watching.entryId) as never),
     );
   });
 
@@ -375,8 +425,91 @@ describe('laneRunSpans (OT1b-1)', () => {
     const text = JSON.stringify(result.spans);
     expect(text).not.toContain(WORK_ORDER_ID);
     expect(text).not.toContain(ATTEMPT_ID);
-    for (const key of [PREPARE_KEY, DISPATCH_KEY, COLLECT_KEY, GATE_KEY, CODE_REVIEW_KEY, ACCEPT_KEY, OPEN_PR_KEY, PUSH_KEY, MERGE_KEY]) {
+    for (const key of [PREPARE_KEY, DISPATCH_KEY, COLLECT_KEY, GATE_KEY, CODE_REVIEW_KEY, ACCEPT_KEY, OPEN_PR_KEY, PUSH_KEY, MERGE_KEY, STOP_KEY]) {
       expect(text).not.toContain(key);
     }
+  });
+
+  it('maps a stop intent alone and the full journal with an overtaken stop result to the identical stop-request span', () => {
+    entryCounter = 0;
+    const prefix = laneRunSpans(hmac, factsOf([stepIntent(STOP_KEY, 1)]));
+    const full = laneRunSpans(hmac, factsOf([
+      stepIntent(STOP_KEY, 1),
+      stepResult(STOP_KEY, 2, 'overtaken'),
+    ]));
+    const stop = spanNamed(prefix.spans, 'stop-request');
+    expect(stop).toBeDefined();
+    expect(spanNamed(full.spans, 'stop-request')).toEqual(stop);
+    expect((stop as { status: { code: string; reasonCode: string | null } }).status).toEqual({
+      code: 'unset', reasonCode: null,
+    });
+  });
+
+  it('yields no spans and rejectedInvalid 1 when the work-order id cannot be digested', () => {
+    entryCounter = 0;
+    const run = { ...makeRun(), workOrderId: '\uD800' };
+    const result = laneRunSpans(hmac, { run, journal: baseJournal(), project: 'example', tags: ['conducted'] });
+    expect(result.spans).toEqual([]);
+    expect(result.rejectedInvalid).toBe(1);
+  });
+
+  it('drops a child span that cannot be built and counts it in rejectedInvalid', () => {
+    entryCounter = 0;
+    const journal = [
+      stepIntent(COLLECT_KEY, 2),
+      stepResult(COLLECT_KEY, 1), // a result recorded before its intent: no span can be built
+    ];
+    const result = laneRunSpans(hmac, factsOf(journal));
+    expect(result.spans).toEqual([]);
+    expect(result.rejectedInvalid).toBe(1);
+  });
+
+  it('maps a journal mixed with another run and control keys to exactly the same spans as the own entries alone', () => {
+    entryCounter = 0;
+    const own = baseJournal();
+    const otherRun = [
+      stepIntent(PREPARE_KEY2, 30), stepResult(PREPARE_KEY2, 31),
+      stepIntent(STOP_KEY2, 32), stepResult(STOP_KEY2, 33, 'overtaken'),
+      entry('conduct', { runId: RUN_ID2, recordedAtIso: time(34), state: 'merged' }),
+      entry('intent', { key: REQUEST_KEY, runId: null, recordedAtIso: time(35) }),
+      entry('intent', { key: REAPER_KEY, runId: null, recordedAtIso: time(36) }),
+    ];
+    const mixed = laneRunSpans(hmac, factsOf([...own, ...otherRun]));
+    const alone = laneRunSpans(hmac, factsOf(own));
+    expect(mixed.spans).toEqual(alone.spans);
+    expect(mixed.rejectedInvalid).toBe(alone.rejectedInvalid);
+    const text = JSON.stringify(mixed.spans);
+    for (const key of OTHER_RUN_KEYS) {
+      expect(text).not.toContain(key);
+    }
+  });
+
+  it('gives an errored step result an error status and its fleet.reason_code', () => {
+    entryCounter = 0;
+    const journal = [
+      stepIntent(COLLECT_KEY, 1),
+      stepResult(COLLECT_KEY, 2, 'refused', 'gate-refused'),
+    ];
+    const result = laneRunSpans(hmac, factsOf(journal));
+    const collect = spanNamed(result.spans, 'collect');
+    expect(collect).toBeDefined();
+    expect((collect as { status: { code: string; reasonCode: string | null } }).status).toEqual({
+      code: 'error', reasonCode: 'gate-refused',
+    });
+    expect((collect as { attributes: Record<string, unknown> }).attributes['fleet.reason_code']).toBe('gate-refused');
+  });
+
+  it('closes round 0 once round 1 starts on a non-terminal run, and withholds round 1', () => {
+    entryCounter = 0;
+    const journal = [
+      stepIntent(COLLECT_KEY, 1), stepResult(COLLECT_KEY, 2),
+      stepIntent(stepKey('collect', '', 1), 3), stepResult(stepKey('collect', '', 1), 4),
+    ];
+    const result = laneRunSpans(hmac, factsOf(journal));
+    expect(spanNamed(result.spans, 'lane-run')).toBeUndefined();
+    const roundSpans = result.spans.filter((span) => span.name === 'round');
+    expect(roundSpans.length).toBe(1);
+    expect((roundSpans[0] as { startIso: string }).startIso).toBe(time(1));
+    expect((roundSpans[0] as { endIso: string }).endIso).toBe(time(2));
   });
 });

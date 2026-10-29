@@ -268,7 +268,7 @@ describe('AttemptReviewLocator', () => {
       runner: {
         kind: 'opencode',
         remotePort: 4166,
-        host: 'legacy-host.example',
+        host: null,
         agent: null,
         model: 'example-provider/glm-5.3',
         variant: null,
@@ -276,7 +276,7 @@ describe('AttemptReviewLocator', () => {
     });
     const withRunner = makeLocator({
       attempt: legacyAttempt,
-      legacyRoute: { remotePort: 4096 },
+      legacyRoute: { remotePort: 4096, remoteHost: 'legacy-host.example' },
     });
     expect((await withRunner.locate('att-1')).route).toEqual({
       kind: 'legacy',
@@ -301,7 +301,7 @@ describe('AttemptReviewLocator', () => {
         runner: {
           kind: 'opencode',
           remotePort: 4166,
-          host: 'legacy-host.example',
+          host: null,
           agent: null,
           model: 'example-provider/glm-5.3',
           variant: null,
@@ -320,7 +320,7 @@ describe('AttemptReviewLocator', () => {
         runner: {
           kind: 'opencode',
           remotePort: 4166,
-          host: 'legacy-host.example',
+          host: null,
           agent: null,
           model: 'example-provider/glm-5.3',
           variant: null,
@@ -341,7 +341,7 @@ describe('AttemptReviewLocator', () => {
         runner: {
           kind: 'opencode',
           remotePort: 4166,
-          host: 'legacy-host.example',
+          host: null,
           agent: null,
           model: 'example-provider/glm-5.3',
           variant: null,
@@ -360,7 +360,7 @@ describe('AttemptReviewLocator', () => {
         runner: {
           kind: 'opencode',
           remotePort: 4166,
-          host: 'legacy-host.example',
+          host: null,
           agent: null,
           model: 'example-provider/glm-5.3',
           variant: null,
@@ -399,7 +399,7 @@ describe('AttemptReviewLocator', () => {
         runner: {
           kind: 'opencode',
           remotePort: 4166,
-          host: 'legacy-host.example',
+          host: null,
           agent: null,
           model: 'example-provider/glm-5.3',
           variant: null,

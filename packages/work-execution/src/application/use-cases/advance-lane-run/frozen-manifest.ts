@@ -1,6 +1,7 @@
 /** Frozen brief manifest readers shared by AdvanceLaneRunUseCase's acts and the class (AL-1). */
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AttemptRecord } from '../../../domain/execution-records.js';
+import { conductedRunnerOf } from './conducted-host.js';
 
 /** The frozen brief manifest as a plain object; null when absent or unreadable (K4-4b). */
 export async function readFrozenManifest(
@@ -11,11 +12,17 @@ export async function readFrozenManifest(
   if (artifactPort.readBriefManifest === undefined || attempt.briefPackagePath === null) {
     return null;
   }
+  // Q2a-2: a conducted attempt's read goes through its recorded host or is not
+  // made; a missing host never falls back to the local executor.
+  const recordedHost = conductedRunnerOf(attempt);
+  if (recordedHost === null) {
+    return null;
+  }
   try {
     const text = await artifactPort.readBriefManifest(
       attempt.worktreePath,
       attempt.briefPackagePath.replace(/\.md$/, '-manifest.json'),
-      attempt.runner ?? null,
+      recordedHost,
     );
     if (text === null) {
       return null;

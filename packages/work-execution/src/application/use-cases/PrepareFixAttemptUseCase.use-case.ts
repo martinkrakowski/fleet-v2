@@ -11,6 +11,7 @@
  */
 
 import type { AttemptRecord } from '../../domain/execution-records.js';
+import { runnerHasHostName } from '../../domain/execution-records.js';
 import { historyEntryOf, seatSelectionRecord, selectSeat } from '../../domain/seat-selection.js';
 import { SeatPlan } from '../../domain/value-objects/SeatPlan.vo.js';
 import {
@@ -176,7 +177,24 @@ export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
 
     const nowIso = request.nowIso ?? new Date().toISOString();
     // A fix attempt is a fresh identity: it never inherits or resumes the
-    // prior session's sessionId or conversation.
+    // prior session's sessionId or conversation. It does inherit the prior
+    // attempt's host block (its runner kind, host name, alias and port) so a
+    // conducted fix attempt keeps running on the prior attempt's host; the
+    // session fields stay null — dispatch overwrites the block with
+    // describeRunner(). A prior without a runner or host name writes no
+    // runner (the legacy hand-run behaviour).
+    const priorRunner =
+      prior.runner !== null && prior.runner !== undefined && runnerHasHostName(prior.runner)
+        ? {
+            kind: prior.runner.kind,
+            remotePort: prior.runner.remotePort,
+            host: prior.runner.host,
+            hostName: prior.runner.hostName,
+            agent: null,
+            model: null,
+            variant: null,
+          }
+        : undefined;
     const record: AttemptRecord = {
       id: request.fixAttemptId,
       workOrderId: request.workOrderId,
@@ -192,6 +210,7 @@ export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
       sessionId: null,
       completionReceipt: null,
       artifacts: null,
+      ...(priorRunner !== undefined ? { runner: priorRunner } : {}),
       ...seatFields,
       createdAtIso: nowIso,
       updatedAtIso: nowIso,

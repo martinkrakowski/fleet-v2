@@ -36,7 +36,15 @@ const attempt = {
   id: 'attempt-example',
   worktreePath: '/example/worktree',
   briefPackagePath: '/example/worktree/.lane/brief.md',
-  runner: null,
+  runner: {
+    kind: 'opencode',
+    remotePort: 4166,
+    host: 'lane-alias-example',
+    hostName: 'lane-host-example',
+    agent: null,
+    model: null,
+    variant: null,
+  },
   artifacts: { manifestPath: '.lane/artifact-manifest.json', manifestSha256: 'a'.repeat(64) },
 } as unknown as AttemptRecord;
 

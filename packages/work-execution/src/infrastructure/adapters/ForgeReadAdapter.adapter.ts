@@ -15,6 +15,8 @@ import type {
   ReadPullRequestRequest,
   ReadPullRequestResult,
 } from '../../application/ports/out/ForgeReadPort.out-port.js';
+import type { ContainsCommitRequest, ContainsCommitResult } from '../../application/ports/out/ForgeAncestryPort.out-port.js';
+import type { ForgeAncestryPort } from '../../application/ports/out/ForgeAncestryPort.out-port.js';
 import type { GhInvocationResult } from './ForgeActionAdapter.adapter.js';
 import { isSafeBranchName } from './ForgeActionAdapter.adapter.js';
 
@@ -50,6 +52,11 @@ const UNAVAILABLE_UNREADABLE: ReadPullRequestResult = {
 const UNAVAILABLE_DIFFERENT: ReadPullRequestResult = {
   outcome: 'unavailable',
   reason: 'gh pr view answered for a different pull request',
+};
+
+const UNAVAILABLE_UNREADABLE_COMPARE: ContainsCommitResult = {
+  outcome: 'unavailable',
+  reason: 'gh api compare returned an unreadable answer',
 };
 
 function isValidRepository(repository: { readonly owner?: unknown; readonly repo?: unknown }): boolean {
@@ -160,7 +167,33 @@ export function parsePullRequestView(stdout: string, ref: PullRequestRef): ReadP
   return { outcome: 'found', pullRequest };
 }
 
-export class ForgeReadAdapter implements ForgeReadPort {
+/**
+ * Pure parse of one `gh api repos/<owner>/<repo>/compare/<base>...<head>`
+ * stdout (CT-2b): `identical` or `ahead` means the head contains the base;
+ * `behind` or `diverged` means it does not; anything else (unparsable,
+ * missing or an unknown status) is unavailable, never a guess.
+ */
+export function parseCompareStatus(stdout: string): ContainsCommitResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return UNAVAILABLE_UNREADABLE_COMPARE;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return UNAVAILABLE_UNREADABLE_COMPARE;
+  }
+  const status = (parsed as Record<string, unknown>).status;
+  if (status === 'identical' || status === 'ahead') {
+    return { outcome: 'answered', contains: true };
+  }
+  if (status === 'behind' || status === 'diverged') {
+    return { outcome: 'answered', contains: false };
+  }
+  return UNAVAILABLE_UNREADABLE_COMPARE;
+}
+
+export class ForgeReadAdapter implements ForgeReadPort, ForgeAncestryPort {
   private readonly owner?: string;
   private readonly repo?: string;
   private readonly runGh?: (args: readonly string[]) => Promise<GhInvocationResult>;
@@ -210,31 +243,14 @@ export class ForgeReadAdapter implements ForgeReadPort {
       '--json',
       PULL_REQUEST_VIEW_FIELDS,
     ];
-    let gh: GhInvocationResult;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const pending = runGh(args);
-      // A read that settles after the deadline won must not become an unhandled rejection.
-      pending.catch(() => undefined);
-      gh = await Promise.race([
-        pending,
-        new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error(READ_TIMED_OUT)), this.timeoutMs);
-        }),
-      ]);
-    } catch (error) {
-      if (error instanceof Error && error.message === READ_TIMED_OUT) {
-        return { outcome: 'unavailable', reason: 'gh pr view timed out' };
-      }
-      return {
-        outcome: 'unavailable',
-        reason: 'gh pr view could not complete',
-      };
-    } finally {
-      if (timer !== undefined) {
-        clearTimeout(timer);
-      }
+    const raced = await this.runGhWithinDeadline(args);
+    if (raced.kind === 'timed-out') {
+      return { outcome: 'unavailable', reason: 'gh pr view timed out' };
     }
+    if (raced.kind === 'failed') {
+      return { outcome: 'unavailable', reason: 'gh pr view could not complete' };
+    }
+    const gh = raced.gh;
     if (gh.exitCode !== 0) {
       return this.unavailableExit(gh);
     }
@@ -245,6 +261,80 @@ export class ForgeReadAdapter implements ForgeReadPort {
       };
     }
     return parsePullRequestView(gh.stdout, ref);
+  }
+
+  /**
+   * One gh invocation raced against the shared read deadline: a read that
+   * settles after the deadline won must not become an unhandled rejection.
+   * The caller maps the three outcomes onto its own reason strings.
+   */
+  private async runGhWithinDeadline(args: readonly string[]): Promise<
+    | { kind: 'ok'; gh: GhInvocationResult }
+    | { kind: 'timed-out' }
+    | { kind: 'failed' }
+  > {
+    const runGh = this.runGh;
+    if (runGh === undefined) {
+      return { kind: 'failed' };
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const pending = runGh(args);
+      pending.catch(() => undefined);
+      const gh = await Promise.race([
+        pending,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(READ_TIMED_OUT)), this.timeoutMs);
+        }),
+      ]);
+      return { kind: 'ok', gh };
+    } catch (error) {
+      if (error instanceof Error && error.message === READ_TIMED_OUT) {
+        return { kind: 'timed-out' };
+      }
+      return { kind: 'failed' };
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  async containsCommit(request: ContainsCommitRequest): Promise<ContainsCommitResult> {
+    const runGh = this.runGh;
+    if (runGh === undefined) {
+      return { outcome: 'unavailable', reason: 'forge read is not configured' };
+    }
+    const repository = request.repository ?? { owner: this.owner, repo: this.repo };
+    if (!isValidRepository(repository)) {
+      return { outcome: 'unavailable', reason: 'forge repository is not configured or not valid' };
+    }
+    if (!HEX_40.test(request.ancestorSha) || !HEX_40.test(request.descendantSha)) {
+      return { outcome: 'unavailable', reason: 'commit sha is not valid' };
+    }
+    // Equal shas are the same commit: the descendant contains the ancestor.
+    if (request.ancestorSha === request.descendantSha) {
+      return { outcome: 'answered', contains: true };
+    }
+    const args = [
+      'api',
+      `repos/${repository.owner}/${repository.repo}/compare/${request.ancestorSha}...${request.descendantSha}`,
+    ];
+    const raced = await this.runGhWithinDeadline(args);
+    if (raced.kind === 'timed-out') {
+      return { outcome: 'unavailable', reason: 'gh api compare timed out' };
+    }
+    if (raced.kind === 'failed') {
+      return { outcome: 'unavailable', reason: 'gh api compare could not complete' };
+    }
+    const gh = raced.gh;
+    if (gh.exitCode !== 0) {
+      return { outcome: 'unavailable', reason: `gh api compare failed (exit ${gh.exitCode})` };
+    }
+    if (Buffer.byteLength(gh.stdout, 'utf8') > READ_MAX_STDOUT_BYTES) {
+      return { outcome: 'unavailable', reason: 'gh api compare output too large' };
+    }
+    return parseCompareStatus(gh.stdout);
   }
 
   private unavailableExit(gh: GhInvocationResult): ReadPullRequestResult {

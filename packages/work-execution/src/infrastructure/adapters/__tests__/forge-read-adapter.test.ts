@@ -444,3 +444,114 @@ describe('A13: a merge that landed is read as merged despite the refusal stderr'
     });
   });
 });
+
+describe('ForgeReadAdapter.containsCommit (CT-2b)', () => {
+  const SHA_A = '3dd5d90509461e3d2154b52da28671aeffa84130';
+  const SHA_B = '3fe9fac07688024ae64dc5a3da66010e4418d628';
+
+  function compareFixture(status: string): string {
+    return JSON.stringify({ status, ahead_by: status === 'ahead' ? 1 : 0, behind_by: 0 });
+  }
+
+  it('answers equal shas as contains: true with no gh call', async () => {
+    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
+    const adapter = makeAdapter({ runGh });
+    expect(await adapter.containsCommit({ ancestorSha: SHA_A, descendantSha: SHA_A })).toEqual({
+      outcome: 'answered',
+      contains: true,
+    });
+    expect(calls).toEqual([]);
+  });
+
+  it('calls exactly gh api compare with the two shas and reads identical as contains', async () => {
+    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: compareFixture('identical'), stderr: '' });
+    const adapter = makeAdapter({ runGh });
+    expect(await adapter.containsCommit({ ancestorSha: SHA_A, descendantSha: SHA_B })).toEqual({
+      outcome: 'answered',
+      contains: true,
+    });
+    expect(calls).toEqual([
+      ['api', `repos/example-owner/example-repo/compare/${SHA_A}...${SHA_B}`],
+    ]);
+  });
+
+  it('reads ahead as contains: true', async () => {
+    const { runGh } = makeRunGh({ exitCode: 0, stdout: compareFixture('ahead'), stderr: '' });
+    expect(await makeAdapter({ runGh }).containsCommit({ ancestorSha: SHA_A, descendantSha: SHA_B })).toEqual({
+      outcome: 'answered',
+      contains: true,
+    });
+  });
+
+  it('reads behind as contains: false', async () => {
+    const { runGh } = makeRunGh({ exitCode: 0, stdout: compareFixture('behind'), stderr: '' });
+    expect(await makeAdapter({ runGh }).containsCommit({ ancestorSha: SHA_A, descendantSha: SHA_B })).toEqual({
+      outcome: 'answered',
+      contains: false,
+    });
+  });
+
+  it('reads diverged as contains: false', async () => {
+    const { runGh } = makeRunGh({ exitCode: 0, stdout: compareFixture('diverged'), stderr: '' });
+    expect(await makeAdapter({ runGh }).containsCommit({ ancestorSha: SHA_A, descendantSha: SHA_B })).toEqual({
+      outcome: 'answered',
+      contains: false,
+    });
+  });
+
+  it('reads an unknown status as unavailable', async () => {
+    const { runGh } = makeRunGh({ exitCode: 0, stdout: compareFixture('complicated'), stderr: '' });
+    expect(await makeAdapter({ runGh }).containsCommit({ ancestorSha: SHA_A, descendantSha: SHA_B })).toEqual({
+      outcome: 'unavailable',
+      reason: 'gh api compare returned an unreadable answer',
+    });
+  });
+
+  it('reads malformed JSON and a missing status as unavailable', async () => {
+    const malformed = makeRunGh({ exitCode: 0, stdout: 'not json', stderr: '' });
+    expect(await makeAdapter({ runGh: malformed.runGh }).containsCommit({ ancestorSha: SHA_A, descendantSha: SHA_B })).toEqual({
+      outcome: 'unavailable',
+      reason: 'gh api compare returned an unreadable answer',
+    });
+    const missing = makeRunGh({ exitCode: 0, stdout: JSON.stringify({ ahead_by: 1 }), stderr: '' });
+    expect(await makeAdapter({ runGh: missing.runGh }).containsCommit({ ancestorSha: SHA_A, descendantSha: SHA_B })).toEqual({
+      outcome: 'unavailable',
+      reason: 'gh api compare returned an unreadable answer',
+    });
+  });
+
+  it('reads a non-zero exit as unavailable, never not-found', async () => {
+    const { runGh } = makeRunGh({ exitCode: 1, stdout: '', stderr: 'HTTP 404: Not Found' });
+    expect(await makeAdapter({ runGh }).containsCommit({ ancestorSha: SHA_A, descendantSha: SHA_B })).toEqual({
+      outcome: 'unavailable',
+      reason: 'gh api compare failed (exit 1)',
+    });
+  });
+
+  it('reads a timed-out compare as unavailable', async () => {
+    const never = async () => new Promise<GhInvocationResult>(() => undefined);
+    const adapter = makeAdapter({ runGh: never, timeoutMs: 5 });
+    expect(await adapter.containsCommit({ ancestorSha: SHA_A, descendantSha: SHA_B })).toEqual({
+      outcome: 'unavailable',
+      reason: 'gh api compare timed out',
+    });
+  });
+
+  it('reads an invalid sha or an invalid repository as unavailable without a gh call', async () => {
+    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: compareFixture('identical'), stderr: '' });
+    const adapter = makeAdapter({ runGh });
+    expect(await adapter.containsCommit({ ancestorSha: 'short', descendantSha: SHA_B })).toEqual({
+      outcome: 'unavailable',
+      reason: 'commit sha is not valid',
+    });
+    expect(await adapter.containsCommit({ ancestorSha: SHA_A, descendantSha: SHA_A.toUpperCase() })).toEqual({
+      outcome: 'unavailable',
+      reason: 'commit sha is not valid',
+    });
+    expect(await adapter.containsCommit({ ancestorSha: SHA_A, descendantSha: SHA_B, repository: { owner: 'bad owner', repo: 'example-repo' } })).toEqual({
+      outcome: 'unavailable',
+      reason: 'forge repository is not configured or not valid',
+    });
+    expect(calls).toEqual([]);
+  });
+});

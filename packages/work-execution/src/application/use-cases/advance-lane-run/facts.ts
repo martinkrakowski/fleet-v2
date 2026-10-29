@@ -197,7 +197,7 @@ export async function gatherFacts(ctx: AdvanceStepContext,
     }
   }
 
-  const review = await reviewFactsOf(ctx, record, state, entries, head12, attemptRecords);
+  const review = reviewFactsOf(ctx, record, state, entries, head12, attemptRecords);
 
   const facts: LaneRunFacts = {
     state,

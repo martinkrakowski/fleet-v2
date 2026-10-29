@@ -529,7 +529,7 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
       laneRunIntentEntry(mint(), RUN_ID, codeKey, null, NOW),
       laneRunResultEntry(mint(), RUN_ID, codeKey, 'completed', 'review-failed', NOW),
     ];
-    const facts = await reviewFactsOf(ctx, record, 'code-review', entries, HEAD12_B, [collectedAttempt(COMMIT_B)]);
+    const facts = reviewFactsOf(ctx, record, 'code-review', entries, HEAD12_B, [collectedAttempt(COMMIT_B)]);
     expect(facts.reviewSeat).toEqual({ ok: false });
   });
 
@@ -542,11 +542,11 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
       laneRunIntentEntry(mint(), RUN_ID, codeKey, null, NOW),
       laneRunResultEntry(mint(), RUN_ID, codeKey, 'completed', 'review-failed', NOW),
     ];
-    const pinned = await reviewFactsOf(ctx, runRecord(), 'code-review', failed, HEAD12_B, [collectedAttempt(COMMIT_B)]);
+    const pinned = reviewFactsOf(ctx, runRecord(), 'code-review', failed, HEAD12_B, [collectedAttempt(COMMIT_B)]);
     expect(pinned.reviewSeat).toEqual({ ok: true, seatIndex: 0 });
 
     const noFail = [laneRunConductEntry(mint(), RUN_ID, 'code-review', NOW)];
-    const unpinned = await reviewFactsOf(ctx, runRecord(), 'code-review', noFail, HEAD12_B, [collectedAttempt(COMMIT_B)]);
+    const unpinned = reviewFactsOf(ctx, runRecord(), 'code-review', noFail, HEAD12_B, [collectedAttempt(COMMIT_B)]);
     expect(unpinned.reviewSeat).toEqual({ ok: false });
   });
 

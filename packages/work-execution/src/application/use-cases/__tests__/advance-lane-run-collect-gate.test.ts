@@ -1277,7 +1277,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         wireReviewAssessment: true,
         wireGateReceipts: true,
       });
-      harness.setManifest({ ...CHECKS_MANIFEST, acceptanceChecks: ['same', 'same'] });
+      harness.setManifest(JSON.stringify({ ...JSON.parse(CHECKS_MANIFEST), acceptanceChecks: ['same', 'same'] }));
       harness.setManifestVerdict('sealed');
       harness.setGateAnswer({
         verdict: 'passed',

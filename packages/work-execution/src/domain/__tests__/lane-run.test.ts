@@ -59,6 +59,33 @@ describe('LaneRun.create', () => {
     expect(jsonRoundTrip.value.toRecord()).toEqual(VALID);
   });
 
+  it('accepts a valid branchName and round-trips it only when present', () => {
+    const withBranch = { ...VALID, branchName: `fleet/${RUN_ID}` };
+    const result = LaneRun.create(withBranch);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.value.toRecord()).toEqual(withBranch);
+
+    // The field stays optional: a record without it round-trips without the key.
+    const absent = LaneRun.create(VALID);
+    expect(absent.success).toBe(true);
+    if (!absent.success) return;
+    expect(Object.hasOwn(absent.value.toRecord(), 'branchName')).toBe(false);
+  });
+
+  it.each([
+    ['../x', 'parent traversal'],
+    ['has space', 'a space'],
+    ['', 'an empty string'],
+    ['123', 'an all-digit name'],
+    ['a'.repeat(201), 'more than 200 characters'],
+  ])('refuses %j as branchName (%s)', (branchName) => {
+    const result = LaneRun.create({ ...VALID, branchName });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.message).toBe('LaneRun branchName must be a safe branch name');
+  });
+
   it('normalises the lease timestamp and isolates toRecord mutations', () => {
     const withLease = LaneRun.create({ ...VALID, lease: VALID_LEASE });
     expect(withLease.success).toBe(true);

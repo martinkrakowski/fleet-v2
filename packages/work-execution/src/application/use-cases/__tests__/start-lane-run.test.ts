@@ -373,6 +373,8 @@ describe('StartLaneRunUseCase', () => {
       lease: null,
       round: 0,
     });
+    // The run record names the worktree branch start gave the workspace (KF-5a).
+    expect(run?.branchName).toBe(`fleet/${RUN_ID}`);
     expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
   });
 

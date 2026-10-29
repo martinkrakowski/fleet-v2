@@ -59,7 +59,11 @@ const RECORD_KEYS: readonly string[] = [
   'lease',
   'revision',
   'runPolicyRevision',
+  'branchName',
 ];
+
+/** Keys before KF-5a: records without `branchName` stay readable. */
+const LEGACY_RECORD_KEYS: readonly string[] = RECORD_KEYS.filter((key) => key !== 'branchName');
 
 const PARKED_KEYS: readonly string[] = ['reason', 'qualifier', 'parkedFrom', 'questionId'];
 const LEASE_KEYS: readonly string[] = ['holderId', 'fence', 'leaseUntilIso'];
@@ -96,7 +100,7 @@ export class LaneRun {
     if (inputPrototype !== Object.prototype && inputPrototype !== null) {
       return invalid('LaneRun requires a record');
     }
-    const recordInput = readExactPlainRecord(input, RECORD_KEYS);
+    const recordInput = readExactPlainRecord(input, RECORD_KEYS) ?? readExactPlainRecord(input, LEGACY_RECORD_KEYS);
     if (recordInput === null) {
       return invalid('LaneRun has an unknown key');
     }
@@ -183,6 +187,28 @@ export class LaneRun {
       return invalid(runPolicyRevisionError);
     }
 
+    // The same rule as ForgeActionAdapter's `isSafeBranchName`, with ForgeReadAdapter's
+    // all-digit refusal; the domain copies it rather than importing an adapter (KF-5a).
+    let branchName: string | undefined;
+    if (recordInput.branchName !== undefined) {
+      const branch = recordInput.branchName;
+      const allDigits = /^\d+$/;
+      const safe =
+        typeof branch === 'string' &&
+        branch.length <= 200 &&
+        branch.length > 0 &&
+        !branch.includes('..') &&
+        !branch.endsWith('/') &&
+        !branch.endsWith('.') &&
+        !branch.endsWith('.lock') &&
+        /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) &&
+        !allDigits.test(branch);
+      if (!safe) {
+        return invalid('LaneRun branchName must be a safe branch name');
+      }
+      branchName = branch;
+    }
+
     const record: LaneRunRecord = {
       version: LANE_RUN_RECORD_VERSION,
       runId: recordInput.runId as string,
@@ -202,6 +228,7 @@ export class LaneRun {
       lease,
       revision: recordInput.revision as number,
       runPolicyRevision: recordInput.runPolicyRevision as string,
+      ...(branchName === undefined ? {} : { branchName }),
     };
     return { success: true, value: new LaneRun(Object.freeze(record)) };
   }
@@ -223,6 +250,7 @@ export class LaneRun {
       lease: this.record.lease === null ? null : { ...this.record.lease },
       revision: this.record.revision,
       runPolicyRevision: this.record.runPolicyRevision,
+      ...(this.record.branchName === undefined ? {} : { branchName: this.record.branchName }),
     };
   }
 

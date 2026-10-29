@@ -71,6 +71,17 @@ describe.each(['memory', 'file'] as const)('LaneRunRepositoryAdapter (%s)', (mod
       reason: 'invalid-record',
     });
     expect(await adapter.get(validRun().runId)).toEqual(validRun());
+    expect(await adapter.create(validRun({ runId: 'run-01JB0000000000000000000002', branchName: 'fleet/run-01JB0000000000000000000002' }))).toEqual({
+      outcome: 'saved',
+      record: validRun({ runId: 'run-01JB0000000000000000000002', branchName: 'fleet/run-01JB0000000000000000000002' }),
+    });
+    // A distinct run written without the field keeps its absence on read (KF-5a).
+    expect(await adapter.create(validRun({ runId: 'run-01JB0000000000000000000001' }))).toEqual({
+      outcome: 'saved',
+      record: validRun({ runId: 'run-01JB0000000000000000000001' }),
+    });
+    expect(Object.hasOwn((await adapter.get('run-01JB0000000000000000000001')) ?? {}, 'branchName')).toBe(false);
+    expect(Object.hasOwn((await adapter.get('run-01JB0000000000000000000002')) ?? {}, 'branchName')).toBe(true);
   });
 
   it('lease then save: acquire raises the fence without moving the revision and save lands', async () => {

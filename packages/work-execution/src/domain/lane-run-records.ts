@@ -133,4 +133,10 @@ export interface LaneRunRecord {
   readonly revision: number;
   /** The policy revision the run started under; a merge's journal entry names it (plan §5). */
   readonly runPolicyRevision: string;
+  /**
+   * The run's worktree branch (`fleet/<runId>` by K7-D7), recorded at start so forge
+   * acts and reads name the branch the run created; absent on records written before
+   * KF-5a (readers fall back to the worktree path's last segment).
+   */
+  readonly branchName?: string;
 }

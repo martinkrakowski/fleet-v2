@@ -9,6 +9,11 @@ import type { AutoMergeReason } from '../../../domain/auto-merge.js';
 
 export interface AutoMergeAttemptRequest {
   readonly attemptId: string;
+  /**
+   * The run's recorded branch (KF-5b) forwarded to the `merge-pr` action
+   * request; absent keeps the forge use case's `feat/<laneId>` default.
+   */
+  readonly branchName?: string;
 }
 
 export type AutoMergeRoute = 'none' | 'attention' | 'owner-question';

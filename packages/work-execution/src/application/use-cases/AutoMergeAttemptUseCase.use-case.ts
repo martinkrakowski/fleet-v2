@@ -108,6 +108,8 @@ interface RoutingContext {
   readonly head: string | null;
   readonly onBlocked: AutoMergeOnBlocked | null;
   readonly routing?: AutoMergeOwnerRoutingPort;
+  /** The run's recorded branch (KF-5b); forwarded to the merge-pr action when present. */
+  readonly branchName?: string;
 }
 
 export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
@@ -119,13 +121,18 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
       throw new Error(NOT_IMPLEMENTED);
     }
 
-    // 1. Request validation: exactly one trimmed non-empty `attemptId`.
-    const parsed = readExactPlainRecord(request, ['attemptId']);
+    // 1. Request validation: exactly one trimmed non-empty `attemptId` and an
+    // optional `branchName` (KF-5b, the run's recorded branch).
+    const parsed =
+      readExactPlainRecord(request, ['attemptId']) ??
+      readExactPlainRecord(request, ['attemptId', 'branchName']);
     const attemptId =
       parsed !== null && typeof parsed.attemptId === 'string' ? parsed.attemptId.trim() : null;
     if (attemptId === null || attemptId.length === 0 || attemptId.length > MAX_ATTEMPT_ID) {
       return this.notMerged(emptyContext(deps), 'invalid-request', 'the request names no attempt');
     }
+    const branchName =
+      parsed !== null && typeof parsed.branchName === 'string' ? parsed.branchName.trim() : undefined;
 
     // 2. The setting is read first. `off` is today's behaviour: no other port
     // is called and nothing is written. Unreadable is deferred until the work
@@ -170,6 +177,7 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
       head: null,
       onBlocked: settings.kind === 'on' ? settings.settings.onBlocked : null,
       routing: deps.routing,
+      branchName,
     };
 
     // 4. An unreadable setting is treated as off for this run: no grant, an attention item.
@@ -515,6 +523,7 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
         expectedHeadSha: head,
         authorizationGrantId: grantId,
         authorizedBy: grant.decisionRevision,
+        ...(ctx.branchName !== undefined ? { branchName: ctx.branchName } : {}),
       });
     } catch {
       return this.notMerged(ctx, 'forge-ambiguous', 'the forge action threw', ['the forge action threw']);

@@ -32,6 +32,19 @@ import type {
 import { WorkOrder } from '../../domain/entities/WorkOrder.js';
 import { AUTHORIZED_BY_PATTERN } from '../../domain/auto-merge.js';
 
+/** A safe branch name, the forge read's rule (KF-5b): one safe git ref, never all digits. */
+function isSafeBranchName(value: string): boolean {
+  return (
+    value.length > 0 &&
+    !value.includes('..') &&
+    !value.endsWith('/') &&
+    !value.endsWith('.') &&
+    !value.endsWith('.lock') &&
+    /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value) &&
+    !/^\d+$/.test(value)
+  );
+}
+
 export interface ExecuteAuthorizedForgeActionDependencies {
   readonly attemptRepo: AttemptRepositoryPort;
   readonly workOrderRepo: WorkOrderRepositoryPort;
@@ -91,6 +104,13 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     // grant is consumed or a journal entry is written (A11).
     if (request.authorizedBy !== undefined && !AUTHORIZED_BY_PATTERN.test(request.authorizedBy)) {
       return { outcome: 'refused', reason: 'authorizedBy must name a policy setting revision' };
+    }
+
+    // A requested branch must be safe like the forge read's rule (KF-5b); the
+    // run's recorded branch already passed the LaneRun domain guard, but the
+    // request is untrusted here and refuses before a grant is consumed.
+    if (request.branchName !== undefined && !isSafeBranchName(request.branchName)) {
+      return { outcome: 'refused', reason: 'branchName must be a safe branch name' };
     }
 
     const attempt = await deps.attemptRepo.findAttemptById(request.attemptId);
@@ -225,7 +245,9 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         workOrderId: request.workOrderId,
         kind: request.kind,
         expectedHeadSha: request.expectedHeadSha,
-        branchName: `feat/${workOrder.laneId}`,
+        // The run's recorded branch wins when the request carries one; absent
+        // keeps the manual/auto-merge default (KF-5b).
+        branchName: request.branchName ?? `feat/${workOrder.laneId}`,
         // Title/body are forwarded only when opening a PR; push-to-pr and
         // merge never carry them (K6-2).
         ...(request.kind === 'push-and-open-pr'

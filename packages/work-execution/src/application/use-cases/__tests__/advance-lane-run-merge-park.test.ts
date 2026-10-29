@@ -489,8 +489,8 @@ async function appendResult(
 }
 
 /** A collected attempt in `merging`, accepted at the collected head, PR open at the head. */
-async function mergingHarness(options: HarnessOptions = {}): Promise<Harness> {
-  const harness = await makeHarness(runRecord(), [collectedAttempt()], {
+async function mergingHarness(options: HarnessOptions = {}, record: LaneRunRecord = runRecord()): Promise<Harness> {
+  const harness = await makeHarness(record, [collectedAttempt()], {
     wireForgeRead: true,
     wireWorkOrder: true,
     wireAutoMerge: true,
@@ -518,6 +518,20 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
     harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
     expect(await advance(harness)).toEqual({ outcome: 'done' });
+  });
+
+  it('passes the recorded branch to the merge port (KF-5b)', async () => {
+    const harness = await mergingHarness({}, runRecord({ branchName: 'fleet/' + RUN_ID }));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'merge',
+      key: mergeKey(),
+      result: 'completed',
+      reasonCode: 'merged',
+    });
+    expect(harness.autoMergeRequests).toEqual([
+      { attemptId: 'attempt-example-1', branchName: 'fleet/' + RUN_ID },
+    ]);
   });
 
   it('test 2: waiting refuses merge-waiting; after the head moves and acceptance re-establishes, the next merge acts at the new head', async () => {

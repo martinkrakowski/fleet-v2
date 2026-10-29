@@ -769,4 +769,25 @@ describe('AutoMergeAttemptUseCase (AM4a-3)', () => {
       decisionRevision: DECISION_REVISION,
     });
   });
+
+  it("forwards the run's recorded branch on the merge-pr action (KF-5b)", async () => {
+    const built = build();
+    await seed(built);
+    const useCase = new AutoMergeAttemptUseCase(built.deps);
+    const result = await useCase.autoMergeAttempt({
+      attemptId: ATTEMPT_ID,
+      branchName: 'fleet/run-01JB0000000000000000000000',
+    });
+    expect(result).toMatchObject({ outcome: 'merged' });
+    expect(built.forge.calls).toBe(1);
+    expect(built.forge.requests[0]?.branchName).toBe('fleet/run-01JB0000000000000000000000');
+  });
+
+  it('omits branchName on the merge-pr action when the request does not carry one (KF-5b)', async () => {
+    const built = build();
+    await seed(built);
+    await built.run();
+    expect(built.forge.calls).toBe(1);
+    expect(built.forge.requests[0]).not.toHaveProperty('branchName');
+  });
 });

@@ -394,6 +394,7 @@ bounded_contexts:
             - ForgeActionPort
             - ForgeReadPort
             - ForgeAncestryPort
+            - ProcessTreeTerminationPort
             - AcceptanceAssessmentPort
             - AcceptanceEvidencePort
             - OwnerDecisionPort
@@ -424,7 +425,7 @@ bounded_contexts:
             - RunTelemetryPort
             - AcceptanceReceiptReadPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, ProcessTreeTerminationAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -459,6 +460,7 @@ bounded_contexts:
       ForgeActionPort: "Perform permitted credential-bearing PR and merge operations through stable action IDs and explicit expected-head checks."
       ForgeReadPort: "Read one pull request's state by number or branch (open, merged or closed; head, base, merge time and merge commit) without mutating anything; a forge that cannot be read or a response that cannot be verified is unavailable, never a guess and never absence."
       ForgeAncestryPort: "Answer whether one commit contains another as an ancestor (a merged PR head containing the lane head) through a read-only forge compare; no answer is unavailable, never a guess."
+      ProcessTreeTerminationPort: "Terminate every process on the attempt's recorded host whose working directory is inside the attempt's worktree, TERM then KILL after a grace period, never a process outside it; the count is reported; no recorded host or no answer is refused or unavailable, never a guess."
       AcceptanceAssessmentPort: "Consume the evidence context's exact-head assessment without importing its repositories or mutating its aggregates."
       AcceptanceEvidencePort: "Consume the evidence context's exact-head assessment to authorize merge actions."
       ReviewRequestPort: "Request a read-only review of one kind (brief-check, code-review, pre-merge) at one exact head under the conductor's request id, and find the receipt recorded for a request id; a review that recorded nothing is no-receipt, a refusal before any review is refused, anything unestablished is unknown, and read the latest receipt of one kind at a head; reason codes only."
@@ -523,6 +525,7 @@ bounded_contexts:
       - { adapter: ForgeActionAdapter, implements: ForgeActionPort, integration: reviewed-github-cli-subprocess }
       - { adapter: ForgeReadAdapter, implements: ForgeReadPort, integration: reviewed-github-cli-subprocess-read-only }
       - { adapter: ForgeReadAdapter, implements: ForgeAncestryPort, integration: reviewed-github-cli-subprocess-read-only }
+      - { adapter: ProcessTreeTerminationAdapter, implements: ProcessTreeTerminationPort, integration: host-shell-subprocess-over-recorded-host-executor }
       - adapter: AcceptanceAssessmentAdapter
         implements: AcceptanceAssessmentPort
         integration: in-process

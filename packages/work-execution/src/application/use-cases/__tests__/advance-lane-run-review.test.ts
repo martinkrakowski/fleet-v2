@@ -293,6 +293,7 @@ async function makeHarness(
               return reviewAnswer(request);
             },
             findReviewReceipt: async () => ({ outcome: 'not-found' }),
+            findLatestReceiptOfKind: async () => ({ outcome: 'not-found' }),
           },
         }),
     ...(options.wireReviewAssessment === false

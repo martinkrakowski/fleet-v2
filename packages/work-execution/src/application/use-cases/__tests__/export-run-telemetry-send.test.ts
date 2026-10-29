@@ -402,6 +402,11 @@ function zeroCounts(): ExportRunTelemetryCounts {
   };
 }
 
+/** After a send lane the four send counts never overlap and add up to toSend. */
+function sendCountsTotal(counts: ExportRunTelemetryCounts): number {
+  return counts.exported + counts.rejected + counts.pending + counts.refusedByStore;
+}
+
 function asExported(result: ExportRunTelemetryResult): Extract<ExportRunTelemetryResult, { outcome: 'exported' }> {
   expect(result.outcome).toBe('exported');
   return result as Extract<ExportRunTelemetryResult, { outcome: 'exported' }>;
@@ -597,6 +602,49 @@ describe('ExportRunTelemetryUseCase send: store refusals (OT2c-2)', () => {
     expect(spanTexts(fakes.dispositions.snapshot()).size).toBe(0);
   });
 
+  it('a pending write that kept a concurrent final sends nothing and counts every span refusedByStore', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
+    fakes.dispositions.writeScript = [{ outcome: 'written', applied: 1, kept: 1 }];
+
+    const result = asExported(await new ExportRunTelemetryUseCase(deps).execute(makeRequest()));
+
+    expect(fakes.telemetry.sendCalls).toBe(0);
+    expect(fakes.dispositions.writeCalls).toBe(1);
+    expect(result.counts).toEqual({ ...zeroCounts(), attemptsSelected: 1, spansMapped: 2, toSend: 2, refusedByStore: 2 });
+    expect(result.errorKind).toBeNull();
+  });
+
+  it('a stale reopen never turns a concurrently exported span back to pending', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
+    const [first, second] = await handAttemptSpanIds(deps);
+    const { deps: seededDeps, fakes: seededFakes } = makeDeps(
+      makeDispositionsRecord({ spans: { [first!.traceId]: { [second!.spanId]: 'rejected:http-4xx' } } }),
+    );
+    seededFakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
+    // Another exporter records the rejected span as exported after this export read the store.
+    const realWrite = seededFakes.dispositions.write.bind(seededFakes.dispositions);
+    let interleaved = false;
+    seededFakes.dispositions.write = async (request) => {
+      if (!interleaved) {
+        interleaved = true;
+        await realWrite({
+          saltFingerprint: request.saltFingerprint,
+          updates: [{ traceId: first!.traceId, spanId: second!.spanId, disposition: { state: 'exported', route: 'collector' } }],
+          nowIso: request.nowIso,
+        });
+      }
+      return realWrite(request);
+    };
+
+    const result = asExported(await new ExportRunTelemetryUseCase(seededDeps).execute(makeRequest({ retryRejected: true })));
+
+    expect(spanTexts(seededFakes.dispositions.snapshot()).get(second!.spanId)).toBe('exported@collector');
+    expect(seededFakes.telemetry.sendCalls).toBe(0);
+    expect(result.counts.refusedByStore).toBe(result.counts.toSend);
+  });
+
   it('a lock-busy result write leaves the spans pending and the next export resends them', async () => {
     const { deps, fakes } = makeDeps();
     fakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
@@ -606,9 +654,10 @@ describe('ExportRunTelemetryUseCase send: store refusals (OT2c-2)', () => {
 
     expect(fakes.telemetry.sendCalls).toBe(1);
     expect(fakes.dispositions.writeCalls).toBe(2);
-    expect(result.counts.exported).toBe(2);
-    expect(result.counts.pending).toBe(2);
+    expect(result.counts.exported).toBe(0);
+    expect(result.counts.pending).toBe(0);
     expect(result.counts.refusedByStore).toBe(2);
+    expect(sendCountsTotal(result.counts)).toBe(result.counts.toSend);
     expect(result.errorKind).toBeNull();
     const afterFirst = spanTexts(fakes.dispositions.snapshot());
     expect(afterFirst.size).toBe(2);
@@ -664,9 +713,10 @@ describe('ExportRunTelemetryUseCase send: store refusals (OT2c-2)', () => {
 
     expect(result.reason).toBe('salt-mismatch');
     expect(result.counters).toEqual({ 'salt-mismatch': 1 });
-    expect(result.counts.exported).toBe(2);
-    expect(result.counts.pending).toBe(2);
+    expect(result.counts.exported).toBe(0);
+    expect(result.counts.pending).toBe(0);
     expect(result.counts.refusedByStore).toBe(2);
+    expect(sendCountsTotal(result.counts)).toBe(result.counts.toSend);
     expect(fakes.telemetry.sendCalls).toBe(1);
     expect(fakes.dispositions.writeCalls).toBe(2);
   });
@@ -683,9 +733,10 @@ describe('ExportRunTelemetryUseCase send: store refusals (OT2c-2)', () => {
 
     expect(result.reason).toBe('store-unreadable');
     expect(result.counters).toEqual({});
-    expect(result.counts.exported).toBe(2);
-    expect(result.counts.pending).toBe(2);
+    expect(result.counts.exported).toBe(0);
+    expect(result.counts.pending).toBe(0);
     expect(result.counts.refusedByStore).toBe(2);
+    expect(sendCountsTotal(result.counts)).toBe(result.counts.toSend);
     expect(fakes.telemetry.sendCalls).toBe(1);
     expect(fakes.dispositions.writeCalls).toBe(2);
   });
@@ -756,7 +807,8 @@ describe('ExportRunTelemetryUseCase send: retryRejected reopen (OT2c-2)', () => 
 
     const result = asExported(await new ExportRunTelemetryUseCase(seededDeps).execute(makeRequest({ retryRejected: true })));
 
-    expect(result.counts.refusedByStore).toBe(1);
+    expect(result.counts.refusedByStore).toBe(result.counts.toSend);
+    expect(sendCountsTotal(result.counts)).toBe(result.counts.toSend);
     expect(result.errorKind).toBeNull();
     expect(seededFakes.telemetry.sendCalls).toBe(0);
     expect(seededFakes.dispositions.writeCalls).toBe(1);

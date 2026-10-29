@@ -1036,6 +1036,42 @@ describe('ExportRunTelemetryUseCase nested request fields (OT2c-2)', () => {
     expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request', counts: zeroCounts(), counters: {} });
     expect(getterCalled).toBe(false);
   });
+
+  it('a marks target behind an index getter is refused without invoking the getter', async () => {
+    const { deps } = makeDeps();
+    const targets: unknown[] = [];
+    let getterCalled = false;
+    Object.defineProperty(targets, '0', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        getterCalled = true;
+        return { kind: 'attempt', attemptId: HAND_ATTEMPT_ID };
+      },
+    });
+
+    const result = await new ExportRunTelemetryUseCase(deps).execute(makeRequest({ selection: { kind: 'marks', targets } }));
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request', counts: zeroCounts(), counters: {} });
+    expect(getterCalled).toBe(false);
+  });
+
+  it('a marks target array is read by index, never through its iterator', async () => {
+    const { deps } = makeDeps();
+    const targets: unknown[] = [{ kind: 'attempt', attemptId: HAND_ATTEMPT_ID }];
+    let iteratorCalled = false;
+    Object.defineProperty(targets, Symbol.iterator, {
+      value() {
+        iteratorCalled = true;
+        throw new Error('example-iterator');
+      },
+    });
+
+    const result = await new ExportRunTelemetryUseCase(deps).execute(makeRequest({ selection: { kind: 'marks', targets } }));
+
+    expect(iteratorCalled).toBe(false);
+    expect(result.outcome).not.toBe('refused');
+  });
 });
 
 describe('ExportRunTelemetryUseCase redaction (OT2c-1, §3.2)', () => {

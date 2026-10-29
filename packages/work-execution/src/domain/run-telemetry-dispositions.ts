@@ -325,7 +325,9 @@ function decodeWriteRequest(request: unknown): DecodedWriteRequest | null {
  * that differs from the recorded one is refused (`salt-mismatch`) and writes
  * nothing; the first write records the request's fingerprint. Each update
  * applies to its one `(traceId, spanId)` entry only: a `pending` update keeps
- * a stored final entry unless `reopen` is true, and a final update always
+ * a stored final entry unless `reopen` is true and that entry is rejected (a
+ * stored exported entry is never reopened, so a stale reopen cannot undo
+ * another exporter's export), and a final update always
  * replaces whatever is there. Counters are increments; `exportedAt` sets
  * `lastExportAtIso` from `nowIso`. The result is a new frozen record;
  * `current` is never mutated.
@@ -361,7 +363,8 @@ export function applyDispositionWrite(
       }
       const storedDisposition = stored === undefined ? null : parseSpanDispositionText(stored);
       const storedIsFinal = storedDisposition !== null && isFinalSpanDisposition(storedDisposition);
-      if (storedIsFinal && text === 'pending' && !decoded.reopen) {
+      const reopenable = decoded.reopen && storedDisposition !== null && storedDisposition.state === 'rejected';
+      if (storedIsFinal && text === 'pending' && !reopenable) {
         kept += 1;
         continue;
       }

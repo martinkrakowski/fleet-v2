@@ -71,7 +71,7 @@ describe.each(['memory', 'file'] as const)('TelemetryDispositionAdapter (%s)', (
     }
   });
 
-  it('a pending never replaces a stored exported@collector without reopen; with reopen it does', async () => {
+  it('a pending never replaces a stored exported@collector, even with reopen; reopen replaces a rejected one', async () => {
     expect(await adapter.write(finalWrite(TRACE_A, [spanId(SPAN_PREFIX_A, 0)], { state: 'exported', route: 'collector' })))
       .toEqual({ outcome: 'written', applied: 1, kept: 0 });
     expect(await adapter.write(pendingWrite(TRACE_A, spanId(SPAN_PREFIX_A, 0))))
@@ -90,12 +90,28 @@ describe.each(['memory', 'file'] as const)('TelemetryDispositionAdapter (%s)', (
         updates: [{ traceId: TRACE_A, spanId: spanId(SPAN_PREFIX_A, 0), disposition: { state: 'pending' } }],
         nowIso: NOW,
       }),
+    ).toEqual({ outcome: 'written', applied: 0, kept: 1 });
+    read = await adapter.read();
+    if (read.outcome !== 'read') {
+      expect.fail('the read must succeed');
+    }
+    expect(read.record.spans[TRACE_A]![spanId(SPAN_PREFIX_A, 0)]).toBe('exported@collector');
+
+    expect(await adapter.write(finalWrite(TRACE_A, [spanId(SPAN_PREFIX_A, 1)], { state: 'rejected', reason: 'http-4xx' })))
+      .toEqual({ outcome: 'written', applied: 1, kept: 0 });
+    expect(
+      await adapter.write({
+        saltFingerprint: FINGERPRINT_A,
+        reopen: true,
+        updates: [{ traceId: TRACE_A, spanId: spanId(SPAN_PREFIX_A, 1), disposition: { state: 'pending' } }],
+        nowIso: NOW,
+      }),
     ).toEqual({ outcome: 'written', applied: 1, kept: 0 });
     read = await adapter.read();
     if (read.outcome !== 'read') {
       expect.fail('the read must succeed');
     }
-    expect(read.record.spans[TRACE_A]![spanId(SPAN_PREFIX_A, 0)]).toBe('pending');
+    expect(read.record.spans[TRACE_A]![spanId(SPAN_PREFIX_A, 1)]).toBe('pending');
   });
 
   it('a rejected:http-4xx over a pending replaces, and an exported over a rejected replaces', async () => {

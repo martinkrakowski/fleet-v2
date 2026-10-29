@@ -173,8 +173,19 @@ function parseSelection(value: unknown): ExportRunTelemetrySelection | null {
     if (!targets.ok || !Array.isArray(targets.value)) {
       return null;
     }
+    // Indices are read as own data properties, never through the array's
+    // iterator or an index getter.
+    const length = ownDataField(targets.value as unknown as Record<string, unknown>, 'length');
+    if (!length.ok || typeof length.value !== 'number' || !Number.isSafeInteger(length.value) || length.value < 0) {
+      return null;
+    }
     const parsedTargets: RunTelemetryMarkTarget[] = [];
-    for (const target of targets.value) {
+    for (let index = 0; index < length.value; index += 1) {
+      const element = ownDataField(targets.value as unknown as Record<string, unknown>, String(index));
+      if (!element.ok) {
+        return null;
+      }
+      const target = element.value;
       if (!isPlainObject(target)) {
         return null;
       }
@@ -754,9 +765,9 @@ export class ExportRunTelemetryUseCase implements ExportRunTelemetryPort {
         return storeRefusal(reopened.value.reason, counts);
       }
       if (reopened.value.outcome === 'skipped') {
-        // The rejected spans stay rejected: sending nothing is safer than a
-        // final they would be sent into again (the next export reopens).
-        return { outcome: 'exported', counts: { ...counts, refusedByStore: rejectedSpanIds.size }, errorKind: null };
+        // The rejected spans stay rejected and nothing is sent: sending nothing
+        // is safer than a final they would be sent into again (the next export reopens).
+        return { outcome: 'exported', counts: { ...counts, refusedByStore: spans.length }, errorKind: null };
       }
     }
 
@@ -780,6 +791,12 @@ export class ExportRunTelemetryUseCase implements ExportRunTelemetryPort {
     }
     if (pendingWrite.value.outcome === 'skipped') {
       // Nothing is sent: the spans are exported next time.
+      return { outcome: 'exported', counts: { ...counts, refusedByStore: spans.length }, errorKind: null };
+    }
+    if (pendingWrite.value.kept !== 0) {
+      // Another exporter finalised a selected span after our read: the store
+      // kept that final, so not every span landed pending. Nothing is sent;
+      // the next export re-reads the store and skips the finals.
       return { outcome: 'exported', counts: { ...counts, refusedByStore: spans.length }, errorKind: null };
     }
 
@@ -846,14 +863,17 @@ export class ExportRunTelemetryUseCase implements ExportRunTelemetryPort {
         nowIso,
       }),
     );
+    // Unrecorded results: no final was stored, so the finals count as refused
+    // by the store (they stay pending there) and the counts still add up to toSend.
+    const unrecordedCounts: ExportRunTelemetryCounts = { ...recordedCounts, exported: 0, rejected: 0, refusedByStore: finals.length };
     if (!recorded.ok || recorded.value.outcome === 'skipped') {
       // The final dispositions stay pending in the store: the next export
       // resends them (safe under first-write-wins).
-      return { outcome: 'exported', counts: { ...recordedCounts, pending: spans.length, refusedByStore: finals.length }, errorKind: sent.errorKind };
+      return { outcome: 'exported', counts: unrecordedCounts, errorKind: sent.errorKind };
     }
     if (recorded.value.outcome === 'refused') {
       // The store refused the result write: fail closed like Steps 1 and 2.
-      return storeRefusal(recorded.value.reason, { ...recordedCounts, pending: spans.length, refusedByStore: finals.length });
+      return storeRefusal(recorded.value.reason, unrecordedCounts);
     }
     return { outcome: 'exported', counts: recordedCounts, errorKind: sent.errorKind };
   }

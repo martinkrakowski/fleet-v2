@@ -62,6 +62,14 @@ export interface ExportRunTelemetryCounts {
   readonly toSend: number;
   /** Receipts dropped because their `completedAtIso` is invalid (plan §3.3). */
   readonly receiptsDropped: number;
+  /**
+   * The send lane's outcome per span, recorded in the store: `exported` and
+   * `rejected` are finals stored by this export; `pending` spans stay pending
+   * in the store; `refusedByStore` spans had a disposition write the store
+   * skipped, refused or kept (they keep their earlier stored state and are
+   * sent or recorded next time). After a send lane the four never overlap and
+   * add up to `toSend`.
+   */
   readonly exported: number;
   readonly rejected: number;
   readonly pending: number;

@@ -1,11 +1,16 @@
 /** The conductor's review and fix-round acts (K5). */
 
 import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
-import type { ReviewRequestKind, ReviewRequestResult } from '../../ports/out/ReviewRequestPort.out-port.js';
+import type {
+  FindReviewReceiptResult,
+  ReviewRequestKind,
+  ReviewRequestResult,
+  ReviewVerdict,
+} from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import { laneRunReviewFact } from '../../../domain/lane-run-review-facts.js';
-import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
+import { head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision, LaneRunReviewFact, LaneRunSeatFact } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
@@ -14,7 +19,7 @@ import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunSta
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import { readFrozenManifest } from './frozen-manifest.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendRunIntent, appendRunResult } from './step-context.js';
+import { appendRunIntent, appendRunResult, intentMintedIdOf } from './step-context.js';
 
 type ReviewKind = 'brief-check' | 'code-review';
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
@@ -163,6 +168,14 @@ function pendingReview(decision: ActDecision): AdvanceLaneRunResult {
   return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'review-unknown' };
 }
 
+/** The journal result for a receipt verdict (K5-4a mapping, reused by the review reconcile). */
+function reviewResultOfVerdict(verdict: ReviewVerdict): { readonly result: 'completed'; readonly reasonCode: LaneRunResultReasonCode } {
+  if (verdict === 'passed') {
+    return { result: 'completed', reasonCode: 'review-passed' };
+  }
+  return { result: 'completed', reasonCode: verdict === 'failed' ? 'review-failed' : 'review-unknown' };
+}
+
 /** The journal result for a review port outcome; null when nothing is established. */
 function reviewResultOf(
   outcome: ReviewRequestResult,
@@ -174,13 +187,8 @@ function reviewResultOf(
       return { result: 'completed', reasonCode: 'review-no-receipt' };
     case 'refused':
       return { result: 'refused', reasonCode: 'review-refused' };
-    default: {
-      const verdict = outcome.receipt.verdict;
-      if (verdict === 'passed') {
-        return { result: 'completed', reasonCode: 'review-passed' };
-      }
-      return { result: 'completed', reasonCode: verdict === 'failed' ? 'review-failed' : 'review-unknown' };
-    }
+    default:
+      return reviewResultOfVerdict(outcome.receipt.verdict);
   }
 }
 
@@ -306,4 +314,66 @@ export async function performReview(
   }
   const mapped = reviewResultOf(outcome);
   return mapped === null ? pendingReview(decision) : finishReview(ctx, request, decision, mapped.result, mapped.reasonCode);
+}
+
+/**
+ * The review reconcile (§3.5): an intent without a final result — after a
+ * crash, or a review whose `requestReview` left nothing established — is
+ * answered from the evidence receipt of the journalled request id, never by
+ * a second `requestReview`. A receipt carrying the request id counts; the
+ * key closes `review-no-receipt` and the decider issues the one retry key;
+ * no minted id or an unavailable receipt stays `ambiguous` for the owner.
+ */
+export async function reconcileReview(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  if (ctx.deps.reviewRequest === undefined) {
+    return { outcome: 'not-wired', step: decision.step };
+  }
+  const latest = gathered.latestAttempt;
+  if (latest === null || latest.artifacts === null) {
+    return { outcome: 'waiting', reason: 'facts-inconsistent' };
+  }
+  // The review key's head must be the latest attempt's collected head; else the facts are inconsistent.
+  const parsed = parseLaneRunKey(decision.key);
+  if (parsed === null || parsed.kind !== 'step' || parsed.head12 !== head12Of(latest.artifacts.headCommit)) {
+    return { outcome: 'waiting', reason: 'facts-inconsistent' };
+  }
+  const requestId = await intentMintedIdOf(ctx, decision.key);
+  if (requestId === null) {
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'ambiguous', 'review-unknown');
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'review-unknown' };
+  }
+  let found: FindReviewReceiptResult;
+  try {
+    found = await ctx.deps.reviewRequest.findReviewReceipt({
+      attemptId: latest.id,
+      requestId,
+      candidateHeadSha: latest.artifacts.headCommit,
+    });
+  } catch {
+    found = { outcome: 'unavailable', reason: 'unreadable' };
+  }
+  if (found.outcome === 'found') {
+    const mapped = reviewResultOfVerdict(found.receipt.verdict);
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, mapped.result, mapped.reasonCode);
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'reconciled', reasonCode: mapped.reasonCode };
+  }
+  const ambiguous = found.outcome === 'unavailable';
+  const reasonCode = ambiguous ? 'review-unknown' : 'review-no-receipt';
+  const resultRefusal = await appendRunResult(ctx, request, decision.key, ambiguous ? 'ambiguous' : 'completed', reasonCode);
+  if (resultRefusal !== null) {
+    return { outcome: 'refused', reason: resultRefusal };
+  }
+  return { outcome: 'acted', step: decision.step, key: decision.key, result: ambiguous ? 'ambiguous' : 'completed', reasonCode };
 }

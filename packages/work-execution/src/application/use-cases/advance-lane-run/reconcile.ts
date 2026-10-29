@@ -10,6 +10,7 @@ import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js
 import { appendConduct, appendRunIntent, appendRunResult, intentMintedIdOf, saveOrRefuse } from './step-context.js';
 import { conductDispatching } from './prepare-dispatch.js';
 import { gatePreCheck, runCollectBody, runGateBody } from './collect-gate.js';
+import { reconcileReview } from './review-fix.js';
 import { reconcileAccept } from './merge.js';
 
 /**
@@ -46,6 +47,9 @@ export async function performReconcile(ctx: AdvanceStepContext,
   }
   if (decision.step === 'gate') {
     return reconcileGate(ctx, record, gathered, decision, request);
+  }
+  if (decision.step === 'brief-check' || decision.step === 'code-review') {
+    return reconcileReview(ctx, record, gathered, decision, request);
   }
   return { outcome: 'not-built', decision: 'reconcile', step: decision.step };
 }

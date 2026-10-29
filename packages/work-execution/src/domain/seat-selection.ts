@@ -284,7 +284,12 @@ export type PreMergeSeatSelectionResult =
  * `chains['high-risk-reviewer']` chain (plan §3.5.1, D8), in owner order. A
  * seat that shares a model family with any model that implemented the lane —
  * first pass or fix round, including an agy round whose runner is null — is
- * never selected.
+ * never selected. The returned `seatIndex` is the seat's index in `seats`.
+ *
+ * Callers honouring conductor D10 do not call this after a recorded pre-merge
+ * `fail`: they pin the recorded seat (its `seatIndex`) directly. `rotationStart`
+ * indexes the *eligible* list, so passing a pinned `seatIndex` as
+ * `rotationStart` would pick a different seat.
  */
 export function selectPreMergeSeat(input: {
   readonly seats: readonly SeatPlanSeat[];

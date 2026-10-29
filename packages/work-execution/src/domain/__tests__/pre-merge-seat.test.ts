@@ -69,10 +69,13 @@ function attempt(
   };
 }
 
-function expectSelected(result: ReturnType<typeof selectPreMergeSeat>, seatId: string): void {
+function expectSelected(result: ReturnType<typeof selectPreMergeSeat>, seatId: string, seatIndex?: number): void {
   expect(result.ok).toBe(true);
   if (result.ok) {
     expect(result.seat.id).toBe(seatId);
+    if (seatIndex !== undefined) {
+      expect(result.seatIndex).toBe(seatIndex);
+    }
   }
 }
 
@@ -113,7 +116,22 @@ describe("selectPreMergeSeat", () => {
       ],
       sameFamily,
     });
-    expectSelected(result, "rv-a");
+    expectSelected(result, "rv-a", 2);
+  });
+
+  it("reports the seat's index in the chain, not in the eligible list (D10 pins it)", () => {
+    const result = selectPreMergeSeat({
+      seats: [
+        seat("fp-a", "example-provider/alpha-1"),
+        seat("fp-b", "example-provider/beta-1"),
+        seat("rv-a", "example-provider/gamma-1"),
+      ],
+      attempts: [attempt("attempt-example-1", { ranModel: "example-provider/delta-1" })],
+      sameFamily,
+      unhealthySeatIds: ["fp-a"],
+      rotationStart: 0,
+    });
+    expectSelected(result, "fp-b", 1);
   });
 
   it("refuses when an attempt has no model, naming the attempt id", () => {

@@ -6,17 +6,24 @@
  */
 
 import type {
+  AcceptanceAssessmentPort,
   AttemptArtifactPort,
   AttemptRecord,
   AttemptRepositoryPort,
+  AutoMergeAttemptPort,
+  CiStatePort,
   CollectedAttemptArtifacts,
   CollectAttemptArtifactsPort,
   CommandCompletionReceipt,
   CommitEditOnlyAttemptPort,
+  ConductorForgeGrantPort,
   DispatchAttemptPort,
   EvaluateAttemptGatePort,
+  ExecuteAuthorizedForgeActionPort,
   ExecutionJournalPort,
+  ForgeReadPort,
   LaneRunAdmissionPort,
+  LaneRunParkNoticePort,
   ReconcileAttemptPort,
   ReviewAssessmentPort,
   ReviewRequestPort,
@@ -51,14 +58,22 @@ export interface DryRunFakes {
     AttemptArtifactPort,
     'readBriefManifest' | 'verifyArtifactManifest' | 'readBriefFile'
   >; // { stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['dry-run-check'] }; 'sealed'; the brief text reads null
+  readonly acceptanceAssessment: AcceptanceAssessmentPort;        // 'accepted' at the asked head; 'ar-dry-run-' + n
+  readonly ciState: CiStatePort;                                  // 'passed' at the exact head, reason 'read'
+  readonly forgeRead: ForgeReadPort;                              // 'not-found' until the push ran; then the PR at the pushed head: 'open' (clean, number 1) and, after the merge, 'merged'
+  readonly conductorForgeGrant: ConductorForgeGrantPort;          // 'issued'; 'grant-dry-run-' + n under 'policy:conductor@dry-run'
+  readonly executeForgeAction: ExecuteAuthorizedForgeActionPort;  // 'executed' at the expected head; PR number 1
+  readonly autoMergeAttempt: AutoMergeAttemptPort;                // 'merged' at the PR head; 'policy:autoMerge@dry-run'
+  readonly parkNotice: LaneRunParkNoticePort;                     // 'recorded'; the question id is 'question-dry-run-' + n
 }
 
-/** The frozen manifest the dry-run fakes read: the limits and checks the seeds carry. */
+/** The frozen manifest the dry-run fakes read: the limits, the frozen PR notes and the checks the seeds carry. */
 export const DRY_RUN_MANIFEST_JSON = JSON.stringify({
   stepLimit: 100,
   timeLimitSeconds: 2700,
   expectedArtifacts: [],
   acceptanceChecks: ['dry-run-check'],
+  prNotes: { hardToUndo: 'dry run', assumptions: 'dry run', challengeThis: 'dry run' },
 });
 
 /** The head commit the collect fake records: one commit since base, 'd' × 40. */
@@ -114,19 +129,34 @@ export function createDryRunFakes(
   nowIso: () => string,
 ): DryRunFakes {
   const calls: { readonly port: string; readonly attemptId: string | null; readonly requestId?: string }[] = [];
-  const recordCall = (
-    port: string,
-    request: { readonly attemptId?: string; readonly requestId?: string } = {},
-  ): void => {
+  const recordCall = (port: string, request?: object): void => {
+    const field = (name: string): string | undefined => {
+      if (request === undefined || !(name in request)) {
+        return undefined;
+      }
+      const value = (request as Record<string, unknown>)[name];
+      return typeof value === 'string' ? value : undefined;
+    };
+    const attemptId = field('attemptId');
+    const requestId = field('requestId');
     calls.push({
       port,
-      attemptId: request.attemptId ?? null,
-      ...(request.requestId !== undefined ? { requestId: request.requestId } : {}),
+      attemptId: attemptId ?? null,
+      ...(requestId !== undefined ? { requestId } : {}),
     });
   };
   let sessionSequence = 0;
   let reservationSequence = 0;
   let reviewSequence = 0;
+  let acceptanceSequence = 0;
+  let grantSequence = 0;
+  let questionSequence = 0;
+  // The fake PR's lifecycle: nothing until the push ran, open afterwards,
+  // merged after the auto-merge fake ran.
+  let prOpened = false;
+  let prMerged = false;
+  let prHeadSha: string | null = null;
+  const PR_NUMBER = 1;
 
   const findOrCreateAttempt = async (request: {
     readonly attemptId: string;
@@ -303,7 +333,27 @@ export function createDryRunFakes(
       };
     },
     findReviewReceipt: async () => ({ outcome: 'not-found' }),
-    findLatestReceiptOfKind: async () => ({ outcome: 'not-found' }),
+    // D3: a passed pre-merge receipt at the asked head (manual, requestId
+    // null), so a Tier 2 run passes awaiting-premerge; every other kind is
+    // absent.
+    findLatestReceiptOfKind: async (request) => {
+      recordCall('findLatestReceiptOfKind', request);
+      if (request.kind !== 'pre-merge') {
+        return { outcome: 'not-found' };
+      }
+      return {
+        outcome: 'found',
+        receipt: {
+          receiptId: 'pm-dry-run-1',
+          requestId: null,
+          kind: request.kind,
+          reviewerModel: 'example/dry-run-reviewer',
+          candidateHeadSha: request.candidateHeadSha,
+          verdict: 'passed',
+          findings: [],
+        },
+      };
+    },
   };
 
   const artifactPort: Pick<
@@ -323,6 +373,104 @@ export function createDryRunFakes(
     readBriefFile: async () => null,
   };
 
+  // K6-8: the acting fakes for the conductor's acceptance, PR, push, merge
+  // and park ports. Every one records its call; none reaches a forge, a
+  // transport or a host.
+  const acceptanceAssessment: AcceptanceAssessmentPort = {
+    assessHeadAcceptance: async (request) => {
+      recordCall('acceptanceAssessment', request);
+      acceptanceSequence += 1;
+      return {
+        outcome: 'accepted',
+        receiptId: 'ar-dry-run-' + String(acceptanceSequence),
+        assessedHeadSha: request.candidateHeadSha,
+      };
+    },
+  };
+
+  const ciState: CiStatePort = {
+    readHeadCiState: async (request) => {
+      recordCall('ciState', request);
+      return { headSha: request.headSha, state: 'passed', reason: 'read' };
+    },
+  };
+
+  const forgeRead: ForgeReadPort = {
+    readPullRequest: async () => {
+      recordCall('forgeRead');
+      if (!prOpened) {
+        return { outcome: 'not-found' };
+      }
+      return {
+        outcome: 'found',
+        pullRequest: {
+          number: PR_NUMBER,
+          state: prMerged ? 'merged' : 'open',
+          mergeState: 'clean',
+          headSha: prHeadSha ?? DRY_RUN_HEAD_COMMIT,
+          headRef: 'lane-example-branch',
+          baseRef: 'main',
+          mergedAtIso: prMerged ? nowIso() : null,
+          closedAtIso: null,
+          mergeCommitSha: prMerged ? 'e'.repeat(40) : null,
+        },
+      };
+    },
+    isConfigured: () => true,
+  };
+
+  const conductorForgeGrant: ConductorForgeGrantPort = {
+    issueConductorForgeGrant: async (request) => {
+      recordCall('conductorForgeGrant', request);
+      grantSequence += 1;
+      return {
+        outcome: 'issued',
+        grantId: 'grant-dry-run-' + String(grantSequence),
+        decisionRevision: 'policy:conductor@dry-run',
+      };
+    },
+  };
+
+  const executeForgeAction: ExecuteAuthorizedForgeActionPort = {
+    executeAuthorizedForgeAction: async (request) => {
+      recordCall('executeForgeAction', request);
+      prOpened = true;
+      prHeadSha = request.expectedHeadSha;
+      return {
+        outcome: 'executed',
+        pullRequestNumber: PR_NUMBER,
+        headSha: request.expectedHeadSha,
+      };
+    },
+  };
+
+  const autoMergeAttempt: AutoMergeAttemptPort = {
+    autoMergeAttempt: async (request) => {
+      recordCall('autoMergeAttempt', request);
+      prMerged = true;
+      return {
+        outcome: 'merged',
+        attemptId: request.attemptId,
+        headSha: prHeadSha ?? DRY_RUN_HEAD_COMMIT,
+        pullRequestNumber: PR_NUMBER,
+        decisionRevision: 'policy:autoMerge@dry-run',
+      };
+    },
+  };
+
+  const parkNotice: LaneRunParkNoticePort = {
+    recordParkAttention: async (request) => {
+      recordCall('parkNotice', request);
+      return { outcome: 'recorded' };
+    },
+    askParkQuestion: async (request) => {
+      recordCall('parkNotice', request);
+      questionSequence += 1;
+      return { outcome: 'recorded', questionId: 'question-dry-run-' + String(questionSequence) };
+    },
+    findParkQuestion: async () => ({ outcome: 'not-found' }),
+  };
+
   return {
     recorder: { calls },
     admission,
@@ -336,5 +484,12 @@ export function createDryRunFakes(
     reviewAssessment,
     reviewRequest,
     artifactPort,
+    acceptanceAssessment,
+    ciState,
+    forgeRead,
+    conductorForgeGrant,
+    executeForgeAction,
+    autoMergeAttempt,
+    parkNotice,
   };
 }

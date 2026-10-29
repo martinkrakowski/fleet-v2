@@ -170,6 +170,15 @@ export function buildLiveConductorDriver(
       isSameModelFamily(underlyingModelFamily(left), underlyingModelFamily(right)),
     workOrderRepo: execution.workOrderRepository,
     prepareFixAttempt: execution.prepareFixAttempt,
+    // K6-8: the conductor's acceptance, PR, push, merge and park ports.
+    acceptanceAssessment: execution.acceptanceAssessment,
+    ciState: conductor.ciState,
+    forgeRead: execution.forgeRead,
+    conductorForgeGrant: conductor.conductorForgeGrant,
+    executeForgeAction: execution.executeAuthorizedForgeAction,
+    autoMergeAttempt: execution.autoMergeAttempt,
+    parkNotice: conductor.parkNotice,
+    autoMergeEnabled: conductor.autoMergeEnabled,
   });
   const start = new StartLaneRunUseCase({
     workOrderRepo: execution.workOrderRepository,
@@ -254,6 +263,15 @@ export function buildDryRunConductorDriver(
     sameModelFamily: () => false,
     workOrderRepo: stores.workOrderRepo,
     prepareFixAttempt: new PrepareFixAttemptUseCase({ attemptRepo: stores.attemptRepo }),
+    // K6-8: the dry-run's recording fakes for the conductor's acting ports.
+    acceptanceAssessment: fakes.acceptanceAssessment,
+    ciState: fakes.ciState,
+    forgeRead: fakes.forgeRead,
+    conductorForgeGrant: fakes.conductorForgeGrant,
+    executeForgeAction: fakes.executeForgeAction,
+    autoMergeAttempt: fakes.autoMergeAttempt,
+    parkNotice: fakes.parkNotice,
+    autoMergeEnabled: true,
   });
   return buildConductorDriver({
     driverLease: stores.driverLease,

@@ -36,6 +36,12 @@ import {
   refusalsFor,
 } from './RecordingRunTelemetryAdapter.adapter.js';
 import { encodeOtlpTraces } from './OtlpJsonEncoder.helper.js';
+import {
+  checkOtlpEndpoint,
+  createFetchOtlpPost,
+  readOtlpTokenFile,
+  withOtlpRetry,
+} from './OtlpHttpTransport.helper.js';
 
 /** The outcome of one OTLP/HTTP POST; OT3b-2 wraps retries and deadlines around it. */
 export type OtlpPostOutcome =
@@ -53,6 +59,13 @@ export interface OtlpHttpRunTelemetryAdapterOptions {
   readonly maxQueueSpans?: number;
   readonly maxBatchSpans?: number;
   readonly maxBatchBytes?: number;
+  /**
+   * OT3b-2: called with each `send`'s deadline when the call actually runs, so
+   * a deadline-aware transport wrapper (the retry/deadline layer) can enforce
+   * it. Sends are serialised, so the value observed is always the running
+   * call's.
+   */
+  readonly onDeadline?: (deadline: RunTelemetrySendDeadline) => void;
 }
 
 /** Per-call state threaded through the batch and split processing. */
@@ -62,6 +75,8 @@ interface OtlpCallState {
   errorKind: TelemetryErrorKind | null;
   stopped: boolean;
   sawPartialRejected: boolean;
+  /** Consecutive single-span 400/413 results in this call (the breaker's count). */
+  breakerCount: number;
 }
 
 const DEFAULT_MAX_QUEUE_SPANS = 2048;
@@ -75,6 +90,7 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
   readonly #maxQueueSpans: number;
   readonly #maxBatchSpans: number;
   readonly #maxBatchBytes: number;
+  readonly #onDeadline: ((deadline: RunTelemetrySendDeadline) => void) | null;
   #queueDrops = 0;
   #errorKinds: Partial<Record<TelemetryErrorKind, number>> = {};
   #tail: Promise<void> = Promise.resolve();
@@ -86,6 +102,7 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
     this.#maxQueueSpans = options.maxQueueSpans ?? DEFAULT_MAX_QUEUE_SPANS;
     this.#maxBatchSpans = options.maxBatchSpans ?? DEFAULT_MAX_BATCH_SPANS;
     this.#maxBatchBytes = options.maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES;
+    this.#onDeadline = options.onDeadline ?? null;
   }
 
   /**
@@ -112,6 +129,7 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
 
   async #runSend(spans: readonly TelemetrySpan[], deadline: RunTelemetrySendDeadline): Promise<RunTelemetrySendResult> {
     try {
+      this.#onDeadline?.(deadline);
       if (!isAcceptedDeadline(deadline)) {
         // Refused without a send (plan §3.5): nothing is attributable, so valid
         // spans stay `pending` with a null error kind.
@@ -140,7 +158,14 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
         this.#queueDrops += 1;
       }
 
-      const call: OtlpCallState = { dispositions, positions, errorKind: null, stopped: false, sawPartialRejected: false };
+      const call: OtlpCallState = {
+      dispositions,
+      positions,
+      errorKind: null,
+      stopped: false,
+      sawPartialRejected: false,
+      breakerCount: 0,
+    };
 
       // Batching (§3.5): groups of at most maxBatchSpans sendable spans, in
       // input order; a stopping outcome ends the call, the rest stay pending.
@@ -294,9 +319,10 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
       call.stopped = true;
       return;
     }
-    // Any other status: conservatively a non-attributable failure.
+    // Any other status (e.g. 302, or a non-HTTP number): conservatively a
+    // non-attributable failure — the `network` kind, spans left `pending`.
     this.#pendingAll(call, batchBase, batch, encodedIndices);
-    call.errorKind = 'http-4xx';
+    call.errorKind = 'network';
     call.stopped = true;
   }
 
@@ -307,6 +333,9 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
     batch: readonly TelemetrySpan[],
     encodedIndices: readonly number[],
   ): Promise<void> {
+    // The single-span 400/413 results of this split resend run (absolute
+    // sendable indices); the breaker pulls them back to `pending` on a stop.
+    const breakerPending: number[] = [];
     for (let i = 0; i < encodedIndices.length && !call.stopped; i += 1) {
       const idx = encodedIndices[i];
       const single = [batch[idx]];
@@ -320,11 +349,27 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
         continue;
       }
       const outcome = await this.#safePost(encoded.payload);
-      if (this.#onSingleSpanResult(outcome) === 'stop') {
-        // OT3b-2's misconfiguration breaker: stop; everything not yet sent
-        // stays pending.
-        for (let j = i; j < encodedIndices.length; j += 1) {
-          this.#mark(call, batchBase + encodedIndices[j], pendingDispositionFor(batch[encodedIndices[j]]));
+      const breakerStop = this.#onSingleSpanResult(call, outcome) === 'stop';
+      // The stopping outcome still goes through `#mapOutcome`, so the call's
+      // error kind is that request's real kind (auth, timeout, 5xx, ...) and
+      // never a blanket `http-4xx`.
+      await this.#mapOutcome(call, batchBase + idx, single, singleIndices, outcome);
+      if (isSingleSpan4xx(outcome)) {
+        breakerPending.push(idx);
+      }
+      if (breakerStop || call.stopped) {
+        // The call stops here — by the misconfiguration breaker or by a
+        // stopping outcome: the single-span 4xx results of this run go back
+        // to `pending` (not `rejected:*`, plan §3.5), everything not yet sent
+        // stays `pending`, and the error kind is the stopping request's real
+        // kind (`#mapOutcome` set it; a breaker trip on 4xxs falls back to
+        // `http-4xx`).
+        for (const pendingIdx of breakerPending) {
+          this.#mark(call, batchBase + pendingIdx, pendingDispositionFor(batch[pendingIdx]));
+        }
+        for (let j = i + 1; j < encodedIndices.length; j += 1) {
+          const unsentIdx = encodedIndices[j];
+          this.#mark(call, batchBase + unsentIdx, pendingDispositionFor(batch[unsentIdx]));
         }
         call.stopped = true;
         if (call.errorKind === null) {
@@ -332,16 +377,22 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
         }
         return;
       }
-      await this.#mapOutcome(call, batchBase + idx, single, singleIndices, outcome);
     }
   }
 
   /**
-   * Hook for OT3b-2's misconfiguration breaker (plan §3.5): called after each
-   * single-span split resend result; currently always continues.
+   * The misconfiguration breaker (plan §3.5 "Send"): after three consecutive
+   * single-span 400/413 results with no 2xx between them in one `send`, the
+   * call stops — the endpoint or payload shape is misconfigured, so resending
+   * the remaining spans one by one would only burn the deadline.
    */
-  #onSingleSpanResult(_outcome: OtlpPostOutcome): 'continue' | 'stop' {
-    return 'continue';
+  #onSingleSpanResult(call: OtlpCallState, outcome: OtlpPostOutcome): 'continue' | 'stop' {
+    if (isSingleSpan4xx(outcome)) {
+      call.breakerCount += 1;
+    } else if (outcome.kind === 'http' && outcome.status >= 200 && outcome.status < 300) {
+      call.breakerCount = 0;
+    }
+    return call.breakerCount >= 3 ? 'stop' : 'continue';
   }
 
   #pendingAll(call: OtlpCallState, batchBase: number, batch: readonly TelemetrySpan[], encodedIndices: readonly number[]): void {
@@ -357,4 +408,78 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
 
 function rejectedDispositionFor(span: TelemetrySpan, reason: TelemetryRejectReason): RunTelemetrySpanDisposition {
   return { spanId: span.spanId, disposition: { state: 'rejected', reason } };
+}
+
+/** A single-span 400 or 413 outcome — the breaker's counted result. */
+function isSingleSpan4xx(outcome: OtlpPostOutcome): boolean {
+  return outcome.kind === 'http' && (outcome.status === 400 || outcome.status === 413);
+}
+
+/** Fixed refusal reasons of the OTLP HTTP factory; they never echo the input (plan §3.9). */
+export type OtlpHttpRunTelemetryAdapterFactoryResult =
+  | { ok: true; adapter: OtlpHttpRunTelemetryAdapter }
+  | { ok: false; reason: 'endpoint-invalid' | 'endpoint-needs-https' | 'token-file-unreadable' | 'token-empty' };
+
+export interface CreateOtlpHttpRunTelemetryAdapterOptions {
+  /** The operator-supplied endpoint string; validated by the loopback rule. */
+  readonly endpoint: unknown;
+  /** The operator-supplied token file path; read once, never logged. */
+  readonly tokenFile: unknown;
+  readonly route: TelemetryRoute;
+  readonly resource: TelemetryResourceInput;
+  /** Injected fetch for tests; the global `fetch` by default. */
+  readonly fetchImpl?: typeof fetch;
+  /** An optional stop signal handed to every request. */
+  readonly stopSignal?: AbortSignal;
+  /** The per-request timeout in milliseconds; 5000 by default. */
+  readonly timeoutMs?: number;
+  /** Injected clock for `Retry-After` dates and deadline checks. */
+  readonly nowMs?: () => number;
+  /** Injected retry wait for tests; the unref'd `otlpRetrySleep` by default. */
+  readonly sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Builds a real `OtlpHttpRunTelemetryAdapter` over the fetch transport
+ * (plan §3.5 "Send", §3.9): the endpoint passes the loopback rule, the token
+ * file reads once, and the post is wrapped with the retry and deadline layer
+ * fed from each `send`'s deadline. Refusals are fixed reason strings that
+ * never echo the endpoint or the token.
+ */
+export function createOtlpHttpRunTelemetryAdapter(
+  options: CreateOtlpHttpRunTelemetryAdapterOptions,
+): OtlpHttpRunTelemetryAdapterFactoryResult {
+  const endpoint = checkOtlpEndpoint(options.endpoint);
+  if (!endpoint.ok) {
+    return endpoint;
+  }
+  const token = readOtlpTokenFile(options.tokenFile);
+  if (!token.ok) {
+    return token;
+  }
+  let currentDeadline: RunTelemetrySendDeadline = null;
+  const post = withOtlpRetry(
+    createFetchOtlpPost({
+      url: endpoint.url,
+      token: token.token,
+      fetchImpl: options.fetchImpl,
+      stopSignal: options.stopSignal,
+      timeoutMs: options.timeoutMs,
+      nowMs: options.nowMs,
+    }),
+    {
+      deadline: () => currentDeadline,
+      nowMs: options.nowMs,
+      sleep: options.sleep,
+    },
+  );
+  const adapter = new OtlpHttpRunTelemetryAdapter({
+    post,
+    route: options.route,
+    resource: options.resource,
+    onDeadline: (deadline) => {
+      currentDeadline = deadline;
+    },
+  });
+  return { ok: true, adapter };
 }

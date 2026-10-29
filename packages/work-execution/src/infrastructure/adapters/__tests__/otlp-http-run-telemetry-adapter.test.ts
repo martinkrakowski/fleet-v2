@@ -224,7 +224,7 @@ describe('OtlpHttpRunTelemetryAdapter core (OT3b-1)', () => {
     expect(result.errorKind).toBeNull();
   });
 
-  it('splits a batch on a 400 and maps each single-span 400 as http-4xx', async () => {
+  it('trips the OT3b-2 breaker on three single-span 400s in a split: the three spans go back to pending', async () => {
     const spans = [makeSpan(), makeSpan(), makeSpan()];
     const { post, calls } = scriptedPost([
       { kind: 'http', status: 400, retryAfterSeconds: null, rejectedSpans: null },
@@ -236,11 +236,11 @@ describe('OtlpHttpRunTelemetryAdapter core (OT3b-1)', () => {
     const result = await adapter.send(spans, null);
     expect(calls).toHaveLength(4);
     expect(result.dispositions.map((d) => spanDispositionText(d.disposition))).toEqual([
-      'rejected:http-4xx',
-      'rejected:http-4xx',
-      'rejected:http-4xx',
+      'pending',
+      'pending',
+      'pending',
     ]);
-    expect(result.errorKind).toBeNull();
+    expect(result.errorKind).toBe('http-4xx');
   });
 
   it('maps a single-span 400 to rejected:http-4xx', async () => {

@@ -69,6 +69,7 @@ import type { ForgeAncestryPort } from '../ports/out/ForgeAncestryPort.out-port.
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { AutoMergeAttemptPort } from '../ports/in/AutoMergeAttemptPort.in-port.js';
 import type { LaneRunParkNoticePort } from '../ports/out/LaneRunParkNoticePort.out-port.js';
+import type { GateReceiptPort } from '../ports/out/GateReceiptPort.out-port.js';
 import type { SameModelFamily } from '../../domain/seat-selection.js';
 import { checkLeaseHeld } from '../../domain/lane-run-lease.js';
 import type { LeaseRefusal } from '../../domain/lane-run-lease.js';
@@ -162,6 +163,8 @@ export interface AdvanceLaneRunDependencies {
   readonly autoMergeEnabled?: boolean;
   /** Answer whether a merged PR head contains the lane head (CT-2b); absent → `containsLaneHead` stays head equality. */
   readonly forgeAncestry?: ForgeAncestryPort;
+  /** Record the conducted gate's verification receipts (KF-13a); absent → the gate records nothing. */
+  readonly gateReceipts?: GateReceiptPort;
 }
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */

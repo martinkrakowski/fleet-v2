@@ -429,6 +429,52 @@ function makeProseCapturingArtifactPort(): { port: AttemptArtifactPort; placedPr
   return { port, placedProseMarkdowns };
 }
 
+describe('PrepareBriefPackageUseCase acceptance checks (KF-13a)', () => {
+  const TWO_COMMANDS = {
+    commitRequired: true,
+    diffCheck: true,
+    commands: [{ argv: ['corepack', 'yarn', 'build'] }, { argv: ['corepack', 'yarn', 'test'] }],
+  } as const;
+  const CHECK_COUNT_REASON = 'acceptanceChecks must name one check per acceptanceSpec command, in order';
+
+  it('rejects a 3-check / 2-command brief with the fixed reason', async () => {
+    const useCase = makeUseCase();
+    const result = await useCase.prepareBriefPackage(
+      validRequest({ acceptanceChecks: ['build', 'test', 'lint'], acceptanceSpec: TWO_COMMANDS }),
+    );
+
+    expect(result).toEqual({ outcome: 'rejected', reason: CHECK_COUNT_REASON });
+  });
+
+  it('rejects acceptance checks that are not a non-empty string array', async () => {
+    const useCase = makeUseCase();
+    for (const acceptanceChecks of ['build', 7, ['build', ''], ['build', '  ']]) {
+      const result = await useCase.prepareBriefPackage(
+        validRequest({ acceptanceChecks: acceptanceChecks as unknown as string[] }),
+      );
+      expect(result).toEqual({ outcome: 'rejected', reason: CHECK_COUNT_REASON });
+    }
+  });
+
+  it('accepts a 2-check / 2-command brief', async () => {
+    const useCase = makeUseCase();
+    const result = await useCase.prepareBriefPackage(
+      validRequest({ acceptanceChecks: ['build', 'test'], acceptanceSpec: TWO_COMMANDS }),
+    );
+
+    expect(result.outcome).toBe('prepared');
+  });
+
+  it('accepts absent or empty acceptance checks', async () => {
+    const useCase = makeUseCase();
+    const absent = await useCase.prepareBriefPackage(validRequest({ acceptanceChecks: undefined }));
+    const empty = await useCase.prepareBriefPackage(validRequest({ acceptanceChecks: [] }));
+
+    expect(absent.outcome).toBe('prepared');
+    expect(empty.outcome).toBe('prepared');
+  });
+});
+
 describe('PrepareBriefPackageUseCase proseMarkdown (KF-6)', () => {
   it('skips authoring and places the supplied prose when proseMarkdown is present', async () => {
     const authorBrief = vi.fn(async () => {

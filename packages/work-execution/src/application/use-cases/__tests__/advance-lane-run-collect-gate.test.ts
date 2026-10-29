@@ -13,6 +13,7 @@ import type {
   AttemptRecord,
   CollectedAttemptArtifacts,
   CommandCompletionReceipt,
+  WorkOrderRecord,
 } from '../../../domain/execution-records.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
@@ -43,6 +44,15 @@ import type {
   EvaluateAttemptGateRequest,
   EvaluateAttemptGateResult,
 } from '../../ports/in/EvaluateAttemptGatePort.in-port.js';
+import type {
+  OpenReviewAssessmentRequest,
+  OpenReviewAssessmentResult,
+} from '../../ports/out/ReviewAssessmentPort.out-port.js';
+import type {
+  RecordGateReceiptsRequest,
+  RecordGateReceiptsResult,
+} from '../../ports/out/GateReceiptPort.out-port.js';
+import type { GatePredicateResult } from '../../ports/out/GatePredicatePort.out-port.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
@@ -125,6 +135,22 @@ const CONDUCTED_RUNNER = {
   agent: null,
   model: 'model-example-1',
   variant: null,
+};
+
+const WORK_ORDER_FIXTURE: WorkOrderRecord = {
+  id: 'wo-example-1',
+  projectId: 'project-example-1',
+  taskId: 'task-example-1',
+  laneId: 'lane-example-1',
+  repository: 'repo-example-1',
+  baseCommit: COMMIT,
+  ownedPaths: ['src'],
+  policyRevision: 'policy-example-1',
+  prerequisiteWorkOrderIds: [],
+  state: 'approved',
+  revision: 1,
+  createdAtIso: NOW,
+  updatedAtIso: NOW,
 };
 
 function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
@@ -274,6 +300,8 @@ interface Harness {
   readonly gateRequests: readonly EvaluateAttemptGateRequest[];
   readonly callOrder: string[];
   readonly deps: AdvanceLaneRunDependencies;
+  readonly reviewOpenRequests: readonly OpenReviewAssessmentRequest[];
+  readonly gateReceiptRequests: readonly RecordGateReceiptsRequest[];
   setManifest(json: string | null): void;
   setManifestVerdict(verdict: 'sealed' | 'missing' | 'mismatch'): void;
   setReconcileAnswer(answer: ReconcileAttemptResult): void;
@@ -281,6 +309,8 @@ interface Harness {
   setCollectAnswer(answer: (request: CollectAttemptArtifactsRequest) => Promise<CollectAttemptArtifactsResult>): void;
   setCommitAnswer(answer: CommitEditOnlyAttemptResult): void;
   setGateAnswer(answer: EvaluateAttemptGateResult): void;
+  setReviewAssessmentAnswer(answer: OpenReviewAssessmentResult): void;
+  setGateReceiptsAnswer(answer: RecordGateReceiptsResult): void;
 }
 
 interface HarnessOptions {
@@ -289,6 +319,8 @@ interface HarnessOptions {
   readonly wireCollect?: boolean;
   readonly wireCommit?: boolean;
   readonly wireGate?: boolean;
+  readonly wireReviewAssessment?: boolean;
+  readonly wireGateReceipts?: boolean;
 }
 
 async function makeHarness(
@@ -304,10 +336,14 @@ async function makeHarness(
   const collectRequests: CollectAttemptArtifactsRequest[] = [];
   const commitRequests: CommitEditOnlyAttemptRequest[] = [];
   const gateRequests: EvaluateAttemptGateRequest[] = [];
+  const reviewOpenRequests: OpenReviewAssessmentRequest[] = [];
+  const gateReceiptRequests: RecordGateReceiptsRequest[] = [];
   const callOrder: string[] = [];
   let manifestJson: string | null = JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] });
   let manifestVerdict: 'sealed' | 'missing' | 'mismatch' = 'missing';
   let reconcileAnswer: ReconcileAttemptResult = activeAnswer(attempts[attempts.length - 1] ?? attemptFixture());
+  let reviewAssessmentAnswer: OpenReviewAssessmentResult = { outcome: 'open' };
+  let gateReceiptsAnswer: RecordGateReceiptsResult = { outcome: 'recorded', count: 0 };
   let stopAnswer: (request: StopAttemptRequest) => Promise<StopAttemptResult> = async (request) => {
     const existing = await attemptRepo.findAttemptById(request.attemptId);
     if (existing === null) {
@@ -374,6 +410,9 @@ async function makeHarness(
     admission: {
       admit: async () => ({ outcome: 'admitted' }),
     },
+    workOrderRepo: {
+      findWorkOrderById: async () => WORK_ORDER_FIXTURE,
+    },
     newUlid: makeUlidMinter(),
     ...(options.ceiling !== undefined ? { perLaneCostCeiling: options.ceiling } : {}),
     ...(options.wireStop === false
@@ -418,6 +457,26 @@ async function makeHarness(
             },
           },
         }),
+    ...(options.wireReviewAssessment === true
+      ? {
+          reviewAssessment: {
+            openReviewAssessment: async (request) => {
+              reviewOpenRequests.push(request);
+              return reviewAssessmentAnswer;
+            },
+          },
+        }
+      : {}),
+    ...(options.wireGateReceipts === true
+      ? {
+          gateReceipts: {
+            recordGateReceipts: async (request) => {
+              gateReceiptRequests.push(request);
+              return gateReceiptsAnswer;
+            },
+          },
+        }
+      : {}),
   };
   return {
     runRepo,
@@ -428,6 +487,8 @@ async function makeHarness(
     collectRequests,
     commitRequests,
     gateRequests,
+    reviewOpenRequests,
+    gateReceiptRequests,
     callOrder,
     deps,
     setManifest: (json) => {
@@ -450,6 +511,12 @@ async function makeHarness(
     },
     setGateAnswer: (answer) => {
       gateAnswer = answer;
+    },
+    setReviewAssessmentAnswer: (answer) => {
+      reviewAssessmentAnswer = answer;
+    },
+    setGateReceiptsAnswer: (answer) => {
+      gateReceiptsAnswer = answer;
     },
   };
 }
@@ -1006,5 +1073,238 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       reasonCode: 'stop-force',
     });
     expect(await lastJournalState(releasedHarness)).toBe('stopped');
+  });
+
+  describe('KF-13a: a wired gate records one verification receipt per acceptance check', () => {
+    const CHECKS_MANIFEST = JSON.stringify({
+      stepLimit: 100,
+      timeLimitSeconds: 2700,
+      expectedArtifacts: [],
+      acceptanceChecks: ['build', 'test'],
+      modelAssignment: { model: 'model-example-1' },
+    });
+
+    function commandResult(
+      name: string,
+      verdict: GatePredicateResult['verdict'],
+      exitCode: number | null,
+      kind: GatePredicateResult['kind'] = 'command',
+    ): GatePredicateResult {
+      return { name, kind, verdict, exitCode, durationMs: 1, detail: 'exit ' + String(exitCode) };
+    }
+
+    it('records two receipts in check order after opening the assessment with the same requiredChecks', async () => {
+      const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+      const harness = await makeHarness(runRecord(), [collected], {
+        wireReviewAssessment: true,
+        wireGateReceipts: true,
+      });
+      harness.setManifest(CHECKS_MANIFEST);
+      harness.setManifestVerdict('sealed');
+      harness.setGateAnswer({
+        verdict: 'passed',
+        results: [
+          commandResult('commit', 'pass', null, 'commit'),
+          commandResult('diff-check', 'pass', null, 'diff-check'),
+          commandResult('command 1: build', 'pass', 0),
+          commandResult('command 2: test', 'pass', 0),
+        ],
+      });
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'gate',
+        key: gateKey(),
+        result: 'completed',
+        reasonCode: 'gate-passed',
+      });
+      expect(harness.reviewOpenRequests).toHaveLength(1);
+      expect(harness.reviewOpenRequests[0]).toEqual({
+        attemptId: 'attempt-example-1',
+        projectId: 'project-example-1',
+        candidateHeadSha: COMMIT,
+        policyRevision: 'policy-example-1',
+        implementerModel: 'model-example-1',
+        requiredChecks: ['build', 'test'],
+      });
+      expect(harness.gateReceiptRequests).toHaveLength(1);
+      expect(harness.gateReceiptRequests[0]).toMatchObject({
+        attemptId: 'attempt-example-1',
+        projectId: 'project-example-1',
+        candidateHeadSha: COMMIT,
+        hostId: 'lane-host-example',
+        policyRevision: 'policy-example-1',
+        completedAtIso: LATER,
+        evidenceRef: 'run-journal:' + gateKey(),
+        receipts: [
+          { procedureName: 'build', result: 'pass', exitCode: 0 },
+          { procedureName: 'test', result: 'pass', exitCode: 0 },
+        ],
+      });
+      // Receipts are recorded before the run result is appended.
+      const entries = await harness.runJournal.listForRun(RUN_ID);
+      expect(entries[entries.length - 1]).toMatchObject({
+        kind: 'result',
+        key: gateKey(),
+        outcome: 'completed',
+        reasonCode: 'gate-passed',
+      });
+    });
+
+    it('records the failing receipt and the run result is still gate-failed', async () => {
+      const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+      const harness = await makeHarness(runRecord(), [collected], {
+        wireReviewAssessment: true,
+        wireGateReceipts: true,
+      });
+      harness.setManifest(CHECKS_MANIFEST);
+      harness.setManifestVerdict('sealed');
+      harness.setGateAnswer({
+        verdict: 'failed',
+        reason: 'Gate predicate command 1 failed',
+        results: [
+          commandResult('commit', 'pass', null, 'commit'),
+          commandResult('diff-check', 'pass', null, 'diff-check'),
+          commandResult('command 1: build', 'fail', 2),
+          commandResult('command 2: test', 'skipped', null),
+        ],
+      });
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'gate',
+        key: gateKey(),
+        result: 'completed',
+        reasonCode: 'gate-failed',
+      });
+      expect(harness.gateReceiptRequests).toHaveLength(1);
+      expect(harness.gateReceiptRequests[0]?.receipts).toEqual([
+        { procedureName: 'build', result: 'fail', exitCode: 2 },
+        { procedureName: 'test', result: 'skipped', exitCode: null },
+      ]);
+    });
+
+    it('records nothing when the gateReceipts dep is absent', async () => {
+      const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+      const harness = await makeHarness(runRecord(), [collected], { wireReviewAssessment: true });
+      harness.setManifest(CHECKS_MANIFEST);
+      harness.setManifestVerdict('sealed');
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'gate',
+        key: gateKey(),
+        result: 'completed',
+        reasonCode: 'gate-passed',
+      });
+      expect(harness.reviewOpenRequests).toHaveLength(0);
+      expect(harness.gateReceiptRequests).toHaveLength(0);
+    });
+
+    it('fails closed to gate-unknown when the assessment open is unavailable', async () => {
+      const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+      const harness = await makeHarness(runRecord(), [collected], {
+        wireReviewAssessment: true,
+        wireGateReceipts: true,
+      });
+      harness.setManifest(CHECKS_MANIFEST);
+      harness.setManifestVerdict('sealed');
+      harness.setReviewAssessmentAnswer({ outcome: 'unavailable', reason: 'head-mismatch' });
+      harness.setGateAnswer({
+        verdict: 'passed',
+        results: [
+          commandResult('command 1: build', 'pass', 0),
+          commandResult('command 2: test', 'pass', 0),
+        ],
+      });
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'gate',
+        key: gateKey(),
+        result: 'ambiguous',
+        reasonCode: 'gate-unknown',
+      });
+      expect(harness.gateReceiptRequests).toHaveLength(0);
+    });
+
+    it('fails closed to gate-unknown when the record is unavailable', async () => {
+      const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+      const harness = await makeHarness(runRecord(), [collected], {
+        wireReviewAssessment: true,
+        wireGateReceipts: true,
+      });
+      harness.setManifest(CHECKS_MANIFEST);
+      harness.setManifestVerdict('sealed');
+      harness.setGateReceiptsAnswer({ outcome: 'unavailable', reason: 'host gone' });
+      harness.setGateAnswer({
+        verdict: 'passed',
+        results: [
+          commandResult('command 1: build', 'pass', 0),
+          commandResult('command 2: test', 'pass', 0),
+        ],
+      });
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'gate',
+        key: gateKey(),
+        result: 'ambiguous',
+        reasonCode: 'gate-unknown',
+      });
+      expect(harness.gateReceiptRequests).toHaveLength(1);
+    });
+
+    it('fails closed to gate-unknown on a checks/command count mismatch with no partial record', async () => {
+      const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+      const harness = await makeHarness(runRecord(), [collected], {
+        wireReviewAssessment: true,
+        wireGateReceipts: true,
+      });
+      harness.setManifest(
+        JSON.stringify({
+          stepLimit: 100,
+          timeLimitSeconds: 2700,
+          expectedArtifacts: [],
+          acceptanceChecks: ['build', 'test', 'lint'],
+          modelAssignment: { model: 'model-example-1' },
+        }),
+      );
+      harness.setManifestVerdict('sealed');
+      harness.setGateAnswer({
+        verdict: 'passed',
+        results: [
+          commandResult('command 1: build', 'pass', 0),
+          commandResult('command 2: test', 'pass', 0),
+        ],
+      });
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'gate',
+        key: gateKey(),
+        result: 'ambiguous',
+        reasonCode: 'gate-unknown',
+      });
+      expect(harness.gateReceiptRequests).toHaveLength(0);
+    });
   });
 });

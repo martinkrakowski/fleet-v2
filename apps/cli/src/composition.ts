@@ -258,6 +258,16 @@ export interface FleetCliRuntimeOptions {
   readonly forgeActionDelegate?: Pick<ForgeActionDelegate, 'runGh' | 'verifyCurrentHeadSha'>;
 }
 
+/** The fields of a test-only forge delegate that were actually supplied; nothing else is overridden. */
+function forgeActionOverrides(
+  delegate: Pick<ForgeActionDelegate, 'runGh' | 'verifyCurrentHeadSha'> | undefined,
+): Partial<Pick<ForgeActionDelegate, 'runGh' | 'verifyCurrentHeadSha'>> {
+  return {
+    ...(delegate?.runGh === undefined ? {} : { runGh: delegate.runGh }),
+    ...(delegate?.verifyCurrentHeadSha === undefined ? {} : { verifyCurrentHeadSha: delegate.verifyCurrentHeadSha }),
+  };
+}
+
 export interface ResolvedRunnerSettings {
   readonly worktreeSshHost?: string;
   readonly runnerAgent?: string;
@@ -1329,12 +1339,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // a moved branch head is never pushed or merged on stale readiness.
   const forgeAction = new ForgeActionAdapter(
     {
-    runGh:
-      options?.forgeActionDelegate?.runGh ??
-      ((args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates)),
-    verifyCurrentHeadSha:
-      options?.forgeActionDelegate?.verifyCurrentHeadSha ??
-      (async (branchName, request) => {
+    runGh: (args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates),
+    verifyCurrentHeadSha: async (branchName, request) => {
       const attempt = await attemptRepository.findAttemptById(request.attemptId);
       if (attempt === null) {
         throw new Error(`No attempt is recorded for ${request.attemptId}`);
@@ -1431,11 +1437,13 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         await runGitCommand(pushArgs);
       }
       return head;
-      }),
+    },
     pullRequestRead: forgeRead,
     ...(forgeGithubSection !== undefined
       ? { repository: { owner: forgeGithubSection.owner, repo: forgeGithubSection.repo } }
       : {}),
+    // Test-only: a supplied gh runner or head read replaces the production one (spread last, so it wins).
+    ...forgeActionOverrides(options?.forgeActionDelegate),
     },
     forgeRead,
   );

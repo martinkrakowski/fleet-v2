@@ -2,29 +2,12 @@
   "$schema": "https://turbo.build/schema.json",
   "agentGuidance": false,
   "envMode": "strict",
-  "globalDependencies": [
-    ".nvmrc",
-    "tsconfig.base.json",
-    "yarn.lock"
-  ],
-  "globalPassThroughEnv": [
-    "HOME",
-    "PATH",
-    "USER",
-    "SHELL",
-    "LANG",
-    "TERM",
-    "CI",
-    "GITHUB_ACTIONS"
-  ],
+  "globalDependencies": [".nvmrc", "tsconfig.base.json", "yarn.lock"],
+  "globalPassThroughEnv": ["HOME", "PATH", "USER", "SHELL", "LANG", "TERM", "CI", "GITHUB_ACTIONS"],
   "tasks": {
     "build": {
-      "dependsOn": [
-        "^build"
-      ],
-      "env": [
-        "NEXT_PUBLIC_FLEET_API_URL"
-      ],
+      "dependsOn": ["^build"],
+      "env": ["NEXT_PUBLIC_FLEET_API_URL"],
       "outputs": [
         "dist/**",
         ".next/**",
@@ -38,27 +21,16 @@
       "persistent": true
     },
     "lint": {
-      "dependsOn": [
-        "^build"
-      ]
+      "dependsOn": ["^build"]
     },
     "typecheck": {
-      "dependsOn": [
-        "^build"
-      ],
+      "dependsOn": ["^build"],
       "outputs": [],
       "cache": true
     },
     "test": {
-      "dependsOn": [
-        "^build"
-      ],
-      "env": [
-        "OCM_IT_REQUIRE",
-        "OCM_IT_SCRIPT",
-        "NEXT_PUBLIC_FLEET_API_URL",
-        "FLEET_E2E_SSH"
-      ],
+      "dependsOn": ["^build"],
+      "env": ["OCM_IT_REQUIRE", "OCM_IT_SCRIPT", "NEXT_PUBLIC_FLEET_API_URL", "FLEET_E2E_SSH"],
       "inputs": [
         "$TURBO_DEFAULT$",
         "$TURBO_ROOT$/bin/ocm-run",

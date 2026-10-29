@@ -314,9 +314,12 @@ function ocmRunWrapperScript(realOcmRunBin: string, argvLog: string, envLog: str
     `printf '%s\\n' "$*" >> ${sq(argvLog)}`,
     `printf 'OCM_HOST=%s\\n' "\${OCM_HOST-}" >> ${sq(envLog)}`,
     `printf 'OCM_REMOTE_PORT=%s\\n' "\${OCM_REMOTE_PORT-}" >> ${sq(envLog)}`,
-    // stderr and the exit code are kept per call so a flaky dispatch is diagnosable.
-    `${sq(realOcmRunBin)} "$@" 2>> ${sq(stderrLog)}`,
-    'rc=$?',
+    // stderr is copied into the log AND still reaches the caller (production code
+    // classifies failures by it); the child's own exit code is kept through the
+    // pipe by way of a per-call file, since POSIX sh has no pipefail.
+    `rcf=$(mktemp "\${TMPDIR:-/tmp}/ocm-run-rc.XXXXXX") || exit 1`,
+    `{ { ${sq(realOcmRunBin)} "$@" 2>&1 1>&3 3>&-; echo "$?" > "$rcf"; } | tee -a ${sq(stderrLog)} >&2; } 3>&1`,
+    'rc=$(cat "$rcf"); rm -f "$rcf"',
     `printf 'exit=%s argv=%s\\n' "$rc" "$*" >> ${sq(stderrLog)}`,
     'exit "$rc"',
     '',

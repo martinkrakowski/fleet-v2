@@ -111,6 +111,17 @@ const SEAT_SELECTION_FP2 = {
   agent: null,
 };
 
+/** The recorded host of a conducted attempt (KF-10/Q2a-2 invariant). */
+const CONDUCTED_RUNNER: AttemptRunnerRecord = {
+  kind: 'opencode',
+  remotePort: 4166,
+  host: 'lane-alias-example',
+  hostName: 'lane-host-example',
+  agent: null,
+  model: null,
+  variant: null,
+};
+
 function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
     id: 'attempt-example-1',
@@ -127,6 +138,7 @@ function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
     sessionId: null,
     completionReceipt: null,
     artifacts: null,
+    runner: CONDUCTED_RUNNER,
     seatPlan: SEAT_PLAN,
     seatSelection: SEAT_SELECTION,
     stopReason: 'none',
@@ -528,6 +540,16 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(prepared).toMatchObject({ outcome: 'acted', reasonCode: 'prepared' });
     const after = await harness.runRepo.get(RUN_ID);
     const pivotId = after?.attemptIds[1] as string;
+    // Q2a-2: a pivot attempt carries the recorded host when it dispatches (the
+    // invariant the conductor enforces); stamp it as the reservation would.
+    const pivotRecord = await harness.attemptRepo.findAttemptById(pivotId);
+    if (pivotRecord !== null) {
+      await harness.attemptRepo.saveAttempt({
+        ...pivotRecord,
+        runner: CONDUCTED_RUNNER,
+        revision: (pivotRecord.revision ?? 0) + 1,
+      });
+    }
     await admit(harness, pivotId);
     const dispatched = await advance(harness);
     expect(dispatched).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });

@@ -96,6 +96,7 @@ import { performReconcile } from './advance-lane-run/reconcile.js';
 import { performReview } from './advance-lane-run/review-fix.js';
 import { performAccept, performMerge, performOpenPr, performPush } from './advance-lane-run/merge.js';
 import { gatherFacts, performAdmissionWait } from './advance-lane-run/facts.js';
+import { conductedRunnerOf } from './advance-lane-run/conducted-host.js';
 
 export interface AdvanceLaneRunDependencies {
   readonly runRepo: LaneRunRepositoryPort;
@@ -316,6 +317,19 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'waiting', reason: decision.reason };
     }
     if (decision.kind === 'act') {
+      // Q2a-2 act guard: an act on an attempt without a recorded host parks
+      // `step-refused` with the step as qualifier — a missing host is never
+      // read through the local executor. `prepare` creates the next attempt and
+      // `stop` must always be possible, so neither is parked.
+      const latestAttempt = gathered.latestAttempt;
+      if (
+        latestAttempt !== null &&
+        decision.step !== 'prepare' &&
+        decision.step !== 'stop' &&
+        conductedRunnerOf(latestAttempt) === null
+      ) {
+        return performPark(this.ctx, record, 'step-refused', decision.step, facts.state, request);
+      }
       if (decision.step === 'prepare') {
         return performPrepare(this.ctx, record, gathered, decision, request);
       }

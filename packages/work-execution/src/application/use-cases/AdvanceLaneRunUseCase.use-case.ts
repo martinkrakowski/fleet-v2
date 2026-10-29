@@ -58,6 +58,9 @@ import type { EvaluateAttemptGatePort } from '../ports/in/EvaluateAttemptGatePor
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 import type { ReviewRequestPort } from '../ports/out/ReviewRequestPort.out-port.js';
 import type { ReviewAssessmentPort } from '../ports/out/ReviewAssessmentPort.out-port.js';
+import type { AcceptanceAssessmentPort } from '../ports/out/AcceptanceAssessmentPort.out-port.js';
+import type { CiStatePort } from '../ports/out/CiStatePort.out-port.js';
+import type { ForgeReadPort } from '../ports/out/ForgeReadPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { SameModelFamily } from '../../domain/seat-selection.js';
 import { checkLeaseHeld } from '../../domain/lane-run-lease.js';
@@ -83,6 +86,7 @@ import { performCancel, performStop } from './advance-lane-run/stop-cancel.js';
 import { performCollect, performGate } from './advance-lane-run/collect-gate.js';
 import { performReconcile } from './advance-lane-run/reconcile.js';
 import { performReview } from './advance-lane-run/review-fix.js';
+import { performAccept } from './advance-lane-run/merge.js';
 import { gatherFacts, performAdmissionWait } from './advance-lane-run/facts.js';
 
 export interface AdvanceLaneRunDependencies {
@@ -127,6 +131,12 @@ export interface AdvanceLaneRunDependencies {
   readonly runnerForAttempt?: RunnerForAttemptPort;
   /** The installation schema version the dispatching root runs under (H9a2). */
   readonly installationSchemaVersion?: number;
+  /** Assess the candidate head's acceptance (K6-5); absent → `not-wired accept`. */
+  readonly acceptanceAssessment?: AcceptanceAssessmentPort;
+  /** Read the CI state of one exact head (K6-5); absent → the facts keep `ci: 'unknown'`. */
+  readonly ciState?: CiStatePort;
+  /** Read one pull request's state, read-only (K6-5); absent → the facts keep `pr: null`. */
+  readonly forgeRead?: ForgeReadPort;
 }
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */
@@ -250,6 +260,9 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       }
       if (decision.step === 'dispatch') {
         return performDispatch(this.ctx, record, gathered, decision, request);
+      }
+      if (decision.step === 'accept') {
+        return performAccept(this.ctx, record, gathered, decision, request);
       }
       if (decision.step === 'stop') {
         return performStop(this.ctx, record, gathered, decision, request);

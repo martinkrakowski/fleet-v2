@@ -49,31 +49,31 @@ export async function reviewFactsOf(
           }
         }
       }
-      const sameFamily = ctx.deps.sameModelFamily;
-      if (sameFamily !== undefined) {
-        let d10SeatIndex: number | null = null;
-        for (const entry of entries) {
-          if (
-            entry.kind === 'result' &&
-            entry.runId === record.runId &&
-            entry.reasonCode === 'review-failed' &&
-            entry.key !== null
-          ) {
-            const parsed = parseLaneRunKey(entry.key);
-            if (parsed !== null && parsed.kind === 'step' && parsed.step === kind) {
-              d10SeatIndex = parsed.seatIndex;
-            }
+      // D10 first, independent of the family comparison: a recorded fail pins
+      // its seat even when `sameModelFamily` is unbound (Luna, K5-4a review).
+      let d10SeatIndex: number | null = null;
+      for (const entry of entries) {
+        if (
+          entry.kind === 'result' &&
+          entry.runId === record.runId &&
+          entry.reasonCode === 'review-failed' &&
+          entry.key !== null
+        ) {
+          const parsed = parseLaneRunKey(entry.key);
+          if (parsed !== null && parsed.kind === 'step' && parsed.step === kind) {
+            d10SeatIndex = parsed.seatIndex;
           }
         }
-        if (d10SeatIndex !== null) {
-          reviewSeat =
-            d10SeatIndex < plan.getSeats('review').length
-              ? { ok: true, seatIndex: d10SeatIndex }
-              : { ok: false };
-        } else {
-          const selected = selectReviewSeat({ plan, round: record.round, implementerModels, sameFamily });
-          reviewSeat = selected.ok ? { ok: true, seatIndex: selected.seatIndex } : { ok: false };
-        }
+      }
+      const sameFamily = ctx.deps.sameModelFamily;
+      if (d10SeatIndex !== null) {
+        reviewSeat =
+          d10SeatIndex < plan.getSeats('review').length
+            ? { ok: true, seatIndex: d10SeatIndex }
+            : { ok: false };
+      } else if (sameFamily !== undefined) {
+        const selected = selectReviewSeat({ plan, round: record.round, implementerModels, sameFamily });
+        reviewSeat = selected.ok ? { ok: true, seatIndex: selected.seatIndex } : { ok: false };
       }
     }
   }

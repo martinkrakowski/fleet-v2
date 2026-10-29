@@ -199,6 +199,7 @@ interface Harness {
   readonly workOrderLookups: string[];
   readonly deps: AdvanceLaneRunDependencies;
   readonly journalLengthWhenCalled: number;
+  readonly journalLengthWhenOpened: number;
   setManifest(json: string | null): void;
   setBriefText(text: string | null): void;
   setReviewAnswer(answer: (request: ReviewRequest) => Promise<ReviewRequestResult>): void;
@@ -230,6 +231,7 @@ async function makeHarness(
   let openAnswer: OpenReviewAssessmentResult = { outcome: 'open' };
   let workOrderAnswer: WorkOrderRecord | null = WORK_ORDER;
   let journalLengthWhenCalled = 0;
+  let journalLengthWhenOpened = 0;
   let journalLengthBeforeAdvance = 0;
   let sameFamilyImpl: SameModelFamily = (left, right) => left === right;
   let reviewAnswer: (request: ReviewRequest) => Promise<ReviewRequestResult> = async (request) => {
@@ -298,6 +300,9 @@ async function makeHarness(
       : {
           reviewAssessment: {
             openReviewAssessment: async (request) => {
+              // The intent must precede the assessment call as well (Luna minor, K5-4a review).
+              journalLengthWhenOpened = (await runJournal.listForRun(RUN_ID)).length;
+              expect(journalLengthWhenOpened).toBe(journalLengthBeforeAdvance + 1);
               openRequests.push(request);
               return openAnswer;
             },
@@ -326,6 +331,9 @@ async function makeHarness(
     deps,
     get journalLengthWhenCalled() {
       return journalLengthWhenCalled;
+    },
+    get journalLengthWhenOpened() {
+      return journalLengthWhenOpened;
     },
     setManifest: (json) => {
       manifestJson = json;
@@ -424,6 +432,7 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
     });
     // The intent was appended before any port call, minting the request id.
     expect(harness.journalLengthWhenCalled).toBe(2);
+    expect(harness.journalLengthWhenOpened).toBe(2);
     const entries = await harness.runJournal.listForRun(RUN_ID);
     const intent = entries.find((entry) => entry.kind === 'intent' && entry.key === key);
     expect(intent?.mintedId).toBe(request.requestId);
@@ -522,6 +531,23 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
     ];
     const facts = await reviewFactsOf(ctx, record, 'code-review', entries, HEAD12_B, [collectedAttempt(COMMIT_B)]);
     expect(facts.reviewSeat).toEqual({ ok: false });
+  });
+
+  it('D10: the pin holds when sameModelFamily is unbound; without a recorded fail the seat is { ok: false }', async () => {
+    const ctx = { deps: {} } as unknown as AdvanceStepContext;
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    const mint = makeUlidMinter();
+    const failed = [
+      laneRunConductEntry(mint(), RUN_ID, 'code-review', NOW),
+      laneRunIntentEntry(mint(), RUN_ID, codeKey, null, NOW),
+      laneRunResultEntry(mint(), RUN_ID, codeKey, 'completed', 'review-failed', NOW),
+    ];
+    const pinned = await reviewFactsOf(ctx, runRecord(), 'code-review', failed, HEAD12_B, [collectedAttempt(COMMIT_B)]);
+    expect(pinned.reviewSeat).toEqual({ ok: true, seatIndex: 0 });
+
+    const noFail = [laneRunConductEntry(mint(), RUN_ID, 'code-review', NOW)];
+    const unpinned = await reviewFactsOf(ctx, runRecord(), 'code-review', noFail, HEAD12_B, [collectedAttempt(COMMIT_B)]);
+    expect(unpinned.reviewSeat).toEqual({ ok: false });
   });
 
   it('reviewRequest unbound is not-wired and writes nothing', async () => {

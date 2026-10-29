@@ -765,4 +765,39 @@ describe('AdvanceLaneRunUseCase push act (K6-6)', () => {
     });
     expect(harness.forgeRequests).toHaveLength(1);
   });
+
+  it('test 11: a push whose head moved since the grant is refused by the forge and journals forge-refused, then parks step-refused push', async () => {
+    const harness = await pushingHarness();
+    harness.setForgeReadAnswer({
+      outcome: 'found',
+      pullRequest: {
+        number: 7,
+        state: 'open',
+        mergeState: 'clean',
+        headSha: MOVED_COMMIT,
+        headRef: 'wt-example-1',
+        baseRef: 'main',
+        mergedAtIso: null,
+        closedAtIso: null,
+        mergeCommitSha: null,
+      },
+    });
+    // The forge re-checks the expected head at push time (ForgeActionAdapter): a moved head is a plain refusal.
+    harness.setForgeAnswer({ outcome: 'refused', reason: 'expected head moved' });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'push',
+      key: pushKey(),
+      result: 'refused',
+      reasonCode: 'forge-refused',
+    });
+    expect(harness.forgeRequests).toHaveLength(1);
+    expect(harness.forgeRequests[0]).toMatchObject({ kind: 'push-to-pr', expectedHeadSha: COMMIT });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.key === pushKey() && entry.outcome === 'refused' && entry.reasonCode === 'forge-refused')).toBe(true);
+    expect(JSON.stringify(entries)).not.toContain('expected head moved');
+    // The one-way key is spent: the next advance parks for the owner instead of pushing again.
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'push' });
+    expect(harness.forgeRequests).toHaveLength(1);
+  });
 });

@@ -257,6 +257,44 @@ describe('AttemptArtifactAdapter with a fake executor', () => {
     expect(result.outcome).toBe('refused');
   });
 
+  it('places the frozen brief through the recorded host\'s executor; without one it keeps the local executor (KF-8)', async () => {
+    const local = fakeExecutor(() => ({}));
+    const remote = fakeExecutor(() => ({}));
+    const adapter = new AttemptArtifactAdapter({
+      executor: local.executor,
+      executorForRecordedHost: () => ({ ok: true, executor: remote.executor }),
+    });
+    const recordedHost = {
+      kind: 'opencode' as const,
+      hostName: 'lane-ssh',
+      remotePort: 41002,
+      host: 'lane-ssh',
+      agent: null,
+      model: null,
+      variant: null,
+    };
+    const placed = await adapter.placeFrozenBrief({
+      attemptId: 'att-1',
+      worktreePath: '/wt',
+      proseMarkdown: '# Brief',
+      manifestJson: '{}',
+      recordedHost,
+    });
+    expect(placed.outcome).toBe('placed');
+    expect(remote.calls.length).toBeGreaterThan(0);
+    expect(local.calls).toHaveLength(0);
+
+    // Manual prepare carries no recorded host and keeps the configured executor.
+    const manual = await new AttemptArtifactAdapter({ executor: local.executor }).placeFrozenBrief({
+      attemptId: 'att-2',
+      worktreePath: '/wt',
+      proseMarkdown: '# Brief',
+      manifestJson: '{}',
+    });
+    expect(manual.outcome).toBe('placed');
+    expect(local.calls.length).toBeGreaterThan(0);
+  });
+
   it('collects artifacts through the executor with the recorded head and notes', async () => {
     const { executor } = fakeExecutor((_call, index) => {
       // rev-parse HEAD, rev-list, then existence probes.

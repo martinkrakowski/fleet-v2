@@ -192,6 +192,9 @@ function makeHarness(options: HarnessOptions = {}) {
           hostName: HOST_NAME,
           hostKind: 'opencode' as const,
           worktreePath: WORKTREE_PATH,
+          transport: 'local' as const,
+          sshAlias: null,
+          port: 41001,
         };
       if (answer.outcome === 'reserved') {
         await executionJournal.saveCapacityReservation({
@@ -203,9 +206,9 @@ function makeHarness(options: HarnessOptions = {}) {
           seatTool: request.seatTool,
           hostName: answer.hostName,
           hostKind: answer.hostKind,
-          transport: 'local',
-          sshAlias: null,
-          port: null,
+          transport: answer.transport,
+          sshAlias: answer.sshAlias,
+          port: answer.port,
           worktreePath: answer.worktreePath,
           reservedAtIso: request.nowIso,
           releasedAtIso: null,
@@ -339,7 +342,7 @@ describe('StartLaneRunUseCase', () => {
       recordedHost: {
         kind: 'opencode',
         hostName: HOST_NAME,
-        remotePort: null,
+        remotePort: 41001,
         host: null,
         agent: null,
         model: null,
@@ -347,7 +350,19 @@ describe('StartLaneRunUseCase', () => {
       },
     });
     expect(harness.briefCalls).toHaveLength(1);
-    expect(harness.briefCalls[0]).toMatchObject({ attemptId: ATTEMPT_ID, worktreePath: WORKTREE_PATH });
+    expect(harness.briefCalls[0]).toMatchObject({
+      attemptId: ATTEMPT_ID,
+      worktreePath: WORKTREE_PATH,
+      recordedHost: {
+        kind: 'opencode',
+        hostName: HOST_NAME,
+        remotePort: 41001,
+        host: null,
+        agent: null,
+        model: null,
+        variant: null,
+      },
+    });
 
     const attempt = await harness.attemptRepoStore.findAttemptById(ATTEMPT_ID);
     expect(attempt).not.toBeNull();
@@ -538,8 +553,7 @@ describe('StartLaneRunUseCase', () => {
     expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
   });
 
-  it('test 3b: a held, incomplete reservation is released and reported incomplete reserve, never re-reserved', async () => {
-    const harness = makeHarness();
+  it('test 3b: a held, incomplete reservation is released and reported incomplete reserve, never re-reserved', async () => {    const harness = makeHarness();
     await harness.executionJournal.saveCapacityReservation({
       id: 'res-example-incomplete',
       attemptId: ATTEMPT_ID,
@@ -570,6 +584,171 @@ describe('StartLaneRunUseCase', () => {
     expect(harness.capacityCalls).toHaveLength(0);
     expect(harness.worktreeCalls).toHaveLength(0);
     expect(harness.briefCalls).toHaveLength(0);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+  });
+
+  it('test 3c (KF-8): a start on an ssh host records the alias and port and places the brief on that host', async () => {
+    const harness = makeHarness();
+    harness.setCapacityAnswer({
+      outcome: 'reserved',
+      hostName: HOST_NAME,
+      hostKind: 'opencode',
+      worktreePath: WORKTREE_PATH,
+      transport: 'ssh',
+      sshAlias: 'lane-ssh-example',
+      port: 41002,
+    });
+    const result = await harness.useCase.startLaneRun(requestFixture());
+
+    expect(result).toEqual({
+      outcome: 'started',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      hostName: HOST_NAME,
+      worktreePath: WORKTREE_PATH,
+    });
+    expect(harness.worktreeCalls).toHaveLength(1);
+    expect(harness.worktreeCalls[0]).toMatchObject({
+      clonePath: '/tmp/fleet-example/clone',
+      worktreePath: WORKTREE_PATH,
+      recordedHost: {
+        kind: 'opencode',
+        hostName: HOST_NAME,
+        remotePort: 41002,
+        host: 'lane-ssh-example',
+        agent: null,
+        model: null,
+        variant: null,
+      },
+    });
+    expect(harness.briefCalls).toHaveLength(1);
+    expect(harness.briefCalls[0]).toMatchObject({
+      attemptId: ATTEMPT_ID,
+      worktreePath: WORKTREE_PATH,
+      recordedHost: {
+        kind: 'opencode',
+        hostName: HOST_NAME,
+        remotePort: 41002,
+        host: 'lane-ssh-example',
+        agent: null,
+        model: null,
+        variant: null,
+      },
+    });
+    const held = (await harness.executionJournal.listActiveReservations()).find(
+      (reservation) => reservation.attemptId === ATTEMPT_ID && reservation.held,
+    );
+    expect(held).toMatchObject({
+      transport: 'ssh',
+      sshAlias: 'lane-ssh-example',
+      port: 41002,
+    });
+  });
+
+  it('test 3d (KF-8): an agy host records no remote port', async () => {
+    const harness = makeHarness();
+    harness.setCapacityAnswer({
+      outcome: 'reserved',
+      hostName: HOST_NAME,
+      hostKind: 'agy',
+      worktreePath: WORKTREE_PATH,
+      transport: 'local',
+      sshAlias: null,
+      port: null,
+    });
+    const result = await harness.useCase.startLaneRun(
+      requestFixture({
+        brief: briefFixture({
+          modelAssignment: {
+            model: 'model-example-1',
+            variant: 'default',
+            fallbackModel: 'model-example-2',
+            seatTool: 'agy' as const,
+          },
+          seatPlan: {
+            version: 1 as const,
+            'first-pass': [{ id: 'fp-1', model: 'model-example-1', tool: 'agy' }],
+            fix: [{ id: 'fx-1', model: 'model-example-1', tool: 'agy' }],
+            review: [],
+          },
+          allowedPathPrefixes: ['packages/example/src'],
+        }),
+      }),
+    );
+
+    expect(result).toMatchObject({ outcome: 'started', hostName: HOST_NAME });
+    expect(harness.worktreeCalls).toHaveLength(1);
+    expect(harness.worktreeCalls[0].recordedHost).toEqual({
+      kind: 'agy',
+      hostName: HOST_NAME,
+      remotePort: null,
+      host: null,
+      agent: null,
+      model: null,
+      variant: null,
+    });
+    expect(harness.briefCalls[0].recordedHost).toEqual(harness.worktreeCalls[0].recordedHost);
+  });
+
+  it('test 3e (KF-8): a held ssh reservation without an alias is released and reported incomplete reserve', async () => {
+    const harness = makeHarness();
+    await harness.executionJournal.saveCapacityReservation({
+      id: 'res-example-ssh-no-alias',
+      attemptId: ATTEMPT_ID,
+      hostId: HOST_NAME,
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      hostName: HOST_NAME,
+      hostKind: 'opencode',
+      transport: 'ssh',
+      sshAlias: null,
+      port: 41001,
+      worktreePath: WORKTREE_PATH,
+      reservedAtIso: NOW,
+      releasedAtIso: null,
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'reserve',
+      reason: 'reservation-incomplete',
+    });
+    expect(releaseSpy).toHaveBeenCalledTimes(1);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+  });
+
+  it('test 3f (KF-8): a held opencode reservation without a port is released and reported incomplete reserve', async () => {
+    const harness = makeHarness();
+    await harness.executionJournal.saveCapacityReservation({
+      id: 'res-example-opencode-no-port',
+      attemptId: ATTEMPT_ID,
+      hostId: HOST_NAME,
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      hostName: HOST_NAME,
+      hostKind: 'opencode',
+      transport: 'local',
+      sshAlias: null,
+      port: null,
+      worktreePath: WORKTREE_PATH,
+      reservedAtIso: NOW,
+      releasedAtIso: null,
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'reserve',
+      reason: 'reservation-incomplete',
+    });
+    expect(releaseSpy).toHaveBeenCalledTimes(1);
     expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
   });
 

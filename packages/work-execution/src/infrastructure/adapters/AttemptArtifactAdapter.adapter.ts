@@ -60,7 +60,8 @@ export interface AttemptArtifactAdapterOptions {
    * through that recorded host's executor (the recorded host is the truth);
    * a host that changed or was removed is refused, naming the recorded
    * host. Legacy records (no recorded host name) keep `executor`. Brief
-   * placement (a write before dispatch) always keeps `executor`.
+   * placement (KF-8) resolves the request's recorded host the same way;
+   * without one (manual prepare) it keeps `executor`.
    */
   readonly executorForRecordedHost?: (
     recorded: AttemptRunnerRecord | null | undefined,
@@ -156,13 +157,18 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     if (rootRefusal !== null) {
       return { outcome: 'refused', reason: rootRefusal };
     }
-    const executor = this.executorFor();
+    const executor = this.executorFor(request.recordedHost);
     const briefTargets = ['.lane/brief.md', '.lane/brief-manifest.json'];
-    const ignored = await this.verifyIgnoredPaths({
-      worktreePath: request.worktreePath,
-      candidatePaths: briefTargets,
-    });
-    if (ignored.outcome === 'not-ignored') {
+    // The ignored-path check runs through the same executor as the writes:
+    // with a recorded host the placement resolves, the worktree lives on
+    // that host, so the git check-ignore must run there too.
+    const offendingPaths: string[] = [];
+    for (const briefTarget of briefTargets) {
+      if (!(await this.checkIgnored(request.worktreePath, briefTarget, executor))) {
+        offendingPaths.push(briefTarget);
+      }
+    }
+    if (offendingPaths.length > 0) {
       return { outcome: 'refused', reason: 'Brief target paths are not gitignored' };
     }
     const laneDirectory = path.join(request.worktreePath, '.lane');

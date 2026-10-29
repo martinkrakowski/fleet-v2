@@ -16,6 +16,12 @@ export interface PlaceFrozenBriefRequest {
   readonly worktreePath: string;
   readonly proseMarkdown: string;
   readonly manifestJson: string;
+  /**
+   * KF-8. The attempt's recorded runner block, as the reservation recorded
+   * it: the recorded host is the truth, so the placement writes through that
+   * host's executor. Absent (manual prepare) keeps the configured executor.
+   */
+  readonly recordedHost?: AttemptRunnerRecord | null;
 }
 
 /** Paths must be ignored by the worktree's index before the package is placed. */

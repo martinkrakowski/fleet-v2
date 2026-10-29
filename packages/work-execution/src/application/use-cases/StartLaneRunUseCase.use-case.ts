@@ -36,7 +36,7 @@ import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.
 import type { AttemptStateValue } from '../../domain/value-objects/AttemptState.vo.js';
 import { SeatPlan } from '../../domain/value-objects/SeatPlan.vo.js';
 import { WorkOrderState } from '../../domain/value-objects/WorkOrderState.vo.js';
-import type { AttemptRecord, CapacityReservationRecord } from '../../domain/execution-records.js';
+import type { AttemptRecord, AttemptRunnerRecord, CapacityReservationRecord } from '../../domain/execution-records.js';
 import type {
   AbandonStartRequest,
   AbandonStartResult,
@@ -105,6 +105,29 @@ const WORKTREE_REFUSAL_REASONS: Record<string, StartLaneRunIncompleteReason> = {
   'git-refused': 'worktree-git-refused',
   'invalid-request': 'worktree-unknown',
 };
+
+/**
+ * The recorded host of one reservation (KF-8): the ssh alias decides the
+ * transport, so an ssh host records its alias on `host` and a local host
+ * records `null`; agy runs no port (D7).
+ */
+function recordedHostOf(reservation: {
+  readonly hostKind: 'opencode' | 'agy';
+  readonly hostName: string;
+  readonly transport: 'local' | 'ssh';
+  readonly sshAlias: string | null;
+  readonly port: number | null;
+}): AttemptRunnerRecord {
+  return {
+    kind: reservation.hostKind,
+    hostName: reservation.hostName,
+    host: reservation.transport === 'ssh' ? reservation.sshAlias : null,
+    remotePort: reservation.hostKind === 'agy' ? null : reservation.port,
+    agent: null,
+    model: null,
+    variant: null,
+  };
+}
 
 function incomplete(
   runId: string,
@@ -276,10 +299,30 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     let hostName: string;
     let hostKind: 'opencode' | 'agy';
     let worktreePath: string;
+    let transport: 'local' | 'ssh';
+    let sshAlias: string | null;
+    let port: number | null;
     if (held !== null && held.hostName != null && held.worktreePath != null && held.hostKind != null) {
       hostName = held.hostName;
       hostKind = held.hostKind;
       worktreePath = held.worktreePath;
+      // KF-8: the reservation record carries the host's transport, alias and
+      // port; a legacy record (fields absent) derives its transport from the
+      // alias it carries.
+      transport = held.transport ?? (held.sshAlias ? 'ssh' : 'local');
+      sshAlias = held.sshAlias ?? null;
+      port = held.port ?? null;
+      // An ssh reservation without its alias, or an opencode host without a
+      // port, can never be confirmed against the installation (H9b2): it is
+      // released like any other incomplete reservation, never a null-host
+      // record.
+      if (
+        (transport === 'ssh' && sshAlias === null) ||
+        (hostKind === 'opencode' && port === null)
+      ) {
+        await deps.executionJournal.releaseCapacityReservation(request.attemptId, request.nowIso);
+        return incomplete(request.runId, request.attemptId, 'reserve', 'reservation-incomplete');
+      }
     } else if (held !== null) {
       // A held but incomplete reservation is released, never re-reserved over.
       // Both release outcomes report `incomplete reserve`: a confirmed release
@@ -308,8 +351,12 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       hostName = reserved.hostName;
       hostKind = reserved.hostKind;
       worktreePath = reserved.worktreePath;
+      transport = reserved.transport;
+      sshAlias = reserved.sshAlias;
+      port = reserved.port;
     }
     const reservation = { hostName, hostKind, worktreePath };
+    const recordedHost = recordedHostOf({ hostKind, hostName, transport, sshAlias, port });
 
     // Step 2: worktree at the reserved path. Every non-success from here on
     // leaves the reservation held.
@@ -322,15 +369,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       worktreePath,
       branch: branchForRun(request.runId),
       baseCommit: workOrder.baseCommit,
-      recordedHost: {
-        kind: hostKind,
-        hostName,
-        remotePort: null,
-        host: null,
-        agent: null,
-        model: null,
-        variant: null,
-      },
+      recordedHost,
     });
     if (prepared === undefined) {
       return incomplete(request.runId, request.attemptId, 'worktree', 'worktree-unknown');
@@ -350,6 +389,9 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       ...request.brief,
       attemptId: request.attemptId,
       worktreePath,
+      // KF-8: the placement goes to the reservation's recorded host, so a
+      // worktree on an ssh host writes its brief on that host.
+      recordedHost,
     };
     const briefResult = await deps.prepareBrief.prepareBriefPackage(briefRequest);
     if (briefResult.outcome === 'rejected') {

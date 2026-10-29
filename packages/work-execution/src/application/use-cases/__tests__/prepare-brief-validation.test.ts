@@ -226,13 +226,19 @@ describe('PrepareBriefPackageUseCase path validation', () => {
   });
 });
 
-function makeCapturingArtifactPort(): { port: AttemptArtifactPort; placedManifestJsons: string[] } {
+function makeCapturingArtifactPort(): {
+  port: AttemptArtifactPort;
+  placedManifestJsons: string[];
+  placedRequests: Parameters<AttemptArtifactPort['placeFrozenBrief']>[0][];
+} {
   const placedManifestJsons: string[] = [];
+  const placedRequests: Parameters<AttemptArtifactPort['placeFrozenBrief']>[0][] = [];
   const port: AttemptArtifactPort = {
     async verifyIgnoredPaths(request) {
       return { outcome: 'ignored', checkedPaths: request.candidatePaths };
     },
     async placeFrozenBrief(request) {
+      placedRequests.push(request);
       placedManifestJsons.push(request.manifestJson);
       return {
         outcome: 'placed',
@@ -252,7 +258,7 @@ function makeCapturingArtifactPort(): { port: AttemptArtifactPort; placedManifes
       };
     },
   };
-  return { port, placedManifestJsons };
+  return { port, placedManifestJsons, placedRequests };
 }
 
 describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
@@ -306,6 +312,37 @@ describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
       diffCheck: true,
       commands: [{ argv: ['corepack', 'yarn', 'build'] }],
     });
+  });
+
+  it('forwards the recorded host to the frozen brief placement (KF-8)', async () => {
+    const captured = makeCapturingArtifactPort();
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring(),
+      artifactPort: captured.port,
+    });
+    const recordedHost = {
+      kind: 'opencode' as const,
+      hostName: 'lane-ssh',
+      remotePort: 41002,
+      host: 'lane-ssh',
+      agent: null,
+      model: null,
+      variant: null,
+    };
+    const result = await useCase.prepareBriefPackage(validRequest({ recordedHost }));
+    expect(result.outcome).toBe('prepared');
+    expect(captured.placedRequests).toHaveLength(1);
+    expect(captured.placedRequests[0].recordedHost).toEqual(recordedHost);
+
+    // A request without a recorded host places without one (manual prepare).
+    const manual = makeCapturingArtifactPort();
+    const manualUseCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring(),
+      artifactPort: manual.port,
+    });
+    await manualUseCase.prepareBriefPackage(validRequest());
+    expect(manual.placedRequests).toHaveLength(1);
+    expect(manual.placedRequests[0].recordedHost).toBeUndefined();
   });
 
   it('covers the acceptance spec in the brief digest', async () => {

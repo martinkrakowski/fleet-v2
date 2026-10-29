@@ -201,6 +201,11 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
         hostName: reservation.hostName,
         hostKind: reservation.hostKind,
         worktreePath: reservation.worktreePath,
+        // Records persisted before these fields existed read with `null`; a
+        // legacy record derives its transport from the alias it carries.
+        transport: reservation.transport ?? (reservation.sshAlias ? 'ssh' : 'local'),
+        sshAlias: reservation.sshAlias ?? null,
+        port: reservation.port ?? null,
       };
     }
     if (

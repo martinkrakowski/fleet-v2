@@ -117,6 +117,16 @@ function buildConductorDriver(parts: {
  * The live driver over the runtime's real ports. Builds objects only; calling
  * `pass.runPass` acts on lane hosts.
  */
+/**
+ * The gate the live conductor evaluates after collect (KF-12): the composed,
+ * predicate-backed instance (`execution.attemptGate`, GP-wire), never the
+ * `attempt accept` instance, which has no predicates and answers `unknown`
+ * ('Gate predicates are not wired') for every attempt, parking each run.
+ */
+export function conductorGateOf(runtime: FleetCliRuntime): FleetCliRuntime['execution']['attemptGate'] {
+  return runtime.execution.attemptGate;
+}
+
 export function buildLiveConductorDriver(
   runtime: FleetCliRuntime,
   options: { readonly maxActiveRuns: number },
@@ -162,7 +172,7 @@ export function buildLiveConductorDriver(
     stopAttempt: execution.stopAttempt,
     collectAttemptArtifacts: execution.collectAttemptArtifacts,
     commitEditOnlyAttempt: execution.commitEditOnlyAttempt,
-    evaluateAttemptGate: execution.requestAttemptAcceptance,
+    evaluateAttemptGate: conductorGateOf(runtime),
     runnerForAttempt: execution.runnerForAttempt,
     reviewRequest: conductor.reviewRequest,
     reviewAssessment: conductor.reviewAssessment,

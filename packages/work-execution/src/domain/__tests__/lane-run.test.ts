@@ -73,17 +73,54 @@ describe('LaneRun.create', () => {
     expect(Object.hasOwn(absent.value.toRecord(), 'branchName')).toBe(false);
   });
 
+  it('accepts a 200-character branchName (the boundary)', () => {
+    const boundary = LaneRun.create({ ...VALID, branchName: 'a'.repeat(200) });
+    expect(boundary.success).toBe(true);
+    if (!boundary.success) return;
+    expect(boundary.value.toRecord().branchName).toBe('a'.repeat(200));
+  });
+
   it.each([
     ['../x', 'parent traversal'],
     ['has space', 'a space'],
     ['', 'an empty string'],
     ['123', 'an all-digit name'],
     ['a'.repeat(201), 'more than 200 characters'],
+    // Every case below passes the character class and exercises one explicit guard (fix round 1).
+    ['fleet/../x', 'a parent segment'],
+    ['fleet/', 'a trailing slash'],
+    ['fleet/x.', 'a trailing dot'],
+    ['fleet/x.lock', 'a .lock suffix'],
+    [`fleet/gh${'p_'}${'A'.repeat(30)}`, 'a credential-shaped name'],
   ])('refuses %j as branchName (%s)', (branchName) => {
     const result = LaneRun.create({ ...VALID, branchName });
     expect(result.success).toBe(false);
     if (result.success) return;
     expect(result.error.message).toBe('LaneRun branchName must be a safe branch name');
+  });
+
+  it('refuses hostile branchName key shapes like a hostile workOrderId (fix round 1)', () => {
+    const MESSAGE = 'LaneRun branchName must be a safe branch name';
+    // An enumerable getter is never run: the descriptor's read value is undefined,
+    // but the key is present, so the field is refused rather than skipped.
+    const getterRecord: Record<string, unknown> = { ...VALID };
+    Object.defineProperty(getterRecord, 'branchName', {
+      get() {
+        return 'fleet/x';
+      },
+      enumerable: true,
+    });
+    const inputs: unknown[] = [
+      { ...VALID, branchName: undefined },
+      { ...VALID, branchName: null },
+      getterRecord,
+    ];
+    for (const input of inputs) {
+      const result = LaneRun.create(input);
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      expect(result.error.message).toBe(MESSAGE);
+    }
   });
 
   it('normalises the lease timestamp and isolates toRecord mutations', () => {

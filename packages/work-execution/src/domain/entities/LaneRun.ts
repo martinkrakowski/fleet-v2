@@ -189,8 +189,12 @@ export class LaneRun {
 
     // The same rule as ForgeActionAdapter's `isSafeBranchName`, with ForgeReadAdapter's
     // all-digit refusal; the domain copies it rather than importing an adapter (KF-5a).
+    // Presence is decided with Object.hasOwn so a hostile key shape is refused like a
+    // hostile workOrderId: `readExactPlainRecord` exposes an accessor's descriptor value,
+    // which is undefined, so a getter or an explicit `{ branchName: undefined }` key
+    // arrives here as present-but-not-a-string (fix round 1).
     let branchName: string | undefined;
-    if (recordInput.branchName !== undefined) {
+    if (Object.hasOwn(recordInput, 'branchName')) {
       const branch = recordInput.branchName;
       const allDigits = /^\d+$/;
       const safe =
@@ -202,7 +206,8 @@ export class LaneRun {
         !branch.endsWith('.') &&
         !branch.endsWith('.lock') &&
         /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) &&
-        !allDigits.test(branch);
+        !allDigits.test(branch) &&
+        !containsSecretShape(branch);
       if (!safe) {
         return invalid('LaneRun branchName must be a safe branch name');
       }

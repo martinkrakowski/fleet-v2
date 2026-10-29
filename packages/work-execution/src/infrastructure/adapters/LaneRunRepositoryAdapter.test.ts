@@ -80,8 +80,9 @@ describe.each(['memory', 'file'] as const)('LaneRunRepositoryAdapter (%s)', (mod
       outcome: 'saved',
       record: validRun({ runId: 'run-01JB0000000000000000000001' }),
     });
-    expect(Object.hasOwn((await adapter.get('run-01JB0000000000000000000001')) ?? {}, 'branchName')).toBe(false);
-    expect(Object.hasOwn((await adapter.get('run-01JB0000000000000000000002')) ?? {}, 'branchName')).toBe(true);
+    // The round-tripped VALUE is asserted in both modes, not just key presence (fix round 1).
+    expect((await adapter.get('run-01JB0000000000000000000001'))?.branchName).toBeUndefined();
+    expect((await adapter.get('run-01JB0000000000000000000002'))?.branchName).toBe('fleet/run-01JB0000000000000000000002');
   });
 
   it('lease then save: acquire raises the fence without moving the revision and save lands', async () => {
@@ -168,6 +169,56 @@ describe.each(['memory', 'file'] as const)('LaneRunRepositoryAdapter (%s)', (mod
 
     // after every refusal the stored run is unchanged
     expect(await adapter.get(runId)).toEqual(validRun({ lease: LEASE }));
+  });
+
+  it('save refuses a changed, added or dropped branch name and accepts the same one (KF-5a fix round 1)', async () => {
+    await adapter.create(validRun({ branchName: 'fleet/run-01JB0000000000000000000000' }));
+    const runId = validRun().runId;
+    await adapter.acquireLease(runId, ACQUIRE);
+    const base = { revision: 2, lease: LEASE };
+
+    // a changed branch name → identity-changed
+    expect(await adapter.save(validRun({ branchName: 'fleet/other', ...base }), HOLD)).toEqual({
+      outcome: 'refused',
+      reason: 'identity-changed',
+    });
+    // a dropped branch name → identity-changed
+    expect(await adapter.save(validRun(base), HOLD)).toEqual({
+      outcome: 'refused',
+      reason: 'identity-changed',
+    });
+
+    // an added branch name where the stored record has none → identity-changed
+    await adapter.create(validRun({ runId: 'run-01JB0000000000000000000003' }));
+    await adapter.acquireLease('run-01JB0000000000000000000003', ACQUIRE);
+    expect(
+      await adapter.save(
+        validRun({ runId: 'run-01JB0000000000000000000003', branchName: 'fleet/run-01JB0000000000000000000003', ...base }),
+        HOLD,
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'identity-changed' });
+
+    // the same branch name saves
+    expect(
+      await adapter.save(
+        validRun({
+          branchName: 'fleet/run-01JB0000000000000000000000',
+          round: 1,
+          attemptIds: ['attempt-example-1', 'attempt-example-2'],
+          ...base,
+        }),
+        HOLD,
+      ),
+    ).toEqual({
+      outcome: 'saved',
+      record: validRun({
+        branchName: 'fleet/run-01JB0000000000000000000000',
+        round: 1,
+        attemptIds: ['attempt-example-1', 'attempt-example-2'],
+        revision: 2,
+        lease: LEASE,
+      }),
+    });
   });
 
   it('fencing: a lapsed lease moves on; stale saves and renewals never land', async () => {

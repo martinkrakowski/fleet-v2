@@ -621,6 +621,10 @@ describe("new read tool names", () => {
       "fleet_attempt_list",
       "fleet_attempt_journal",
       "fleet_work_order",
+      "fleet_head_evidence",
+      "fleet_question_list",
+      "fleet_question",
+      "fleet_project_list",
     ]);
   });
 });

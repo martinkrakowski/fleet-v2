@@ -116,6 +116,17 @@ const AGY_RUNNER = {
   variant: null,
 };
 
+/** The recorded host of a conducted opencode attempt (KF-10/Q2a-2 invariant). */
+const CONDUCTED_RUNNER = {
+  kind: 'opencode' as const,
+  remotePort: 4166,
+  host: 'lane-alias-example',
+  hostName: 'lane-host-example',
+  agent: null,
+  model: 'model-example-1',
+  variant: null,
+};
+
 function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
     id: 'attempt-example-1',
@@ -132,6 +143,7 @@ function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
     sessionId: null,
     completionReceipt: null,
     artifacts: null,
+    runner: CONDUCTED_RUNNER,
     seatPlan: SEAT_PLAN,
     seatSelection: SEAT_SELECTION,
     stopReason: 'none',
@@ -667,7 +679,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
   });
 
   it('test 5: collecting an ended opencode attempt collects without the commit step', async () => {
-    const ended = endedAttempt({ runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'model-example-1', variant: null } });
+    const ended = endedAttempt({ runner: CONDUCTED_RUNNER });
     const harness = await makeHarness(runRecord(), [ended]);
     await conduct(harness, 'collecting', NOW);
     const result = await advance(harness);
@@ -855,7 +867,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
   });
 
   it('test 5b: a manifest whose expectedArtifacts is not a string array refuses the collect without calling it', async () => {
-    const ended = endedAttempt({ runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: 'model-example-1', variant: null } });
+    const ended = endedAttempt({ runner: CONDUCTED_RUNNER });
     const harness = await makeHarness(runRecord(), [ended]);
     harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: 'all' }));
     await conduct(harness, 'collecting', NOW);

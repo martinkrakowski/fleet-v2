@@ -97,6 +97,17 @@ const WORK_ORDER: WorkOrderRecord = {
   updatedAtIso: NOW,
 };
 
+/** The recorded host of a conducted attempt (KF-10/Q2a-2 invariant). */
+const CONDUCTED_RUNNER = {
+  kind: 'opencode' as const,
+  remotePort: 4166,
+  host: 'lane-alias-example',
+  hostName: 'lane-host-example',
+  agent: null,
+  model: null,
+  variant: null,
+};
+
 /** A collected attempt whose head is `headCommit`; it is the run's latest attempt. */
 function collectedAttempt(headCommit: string = COMMIT_A): AttemptRecord {
   const artifacts: CollectedAttemptArtifacts = {
@@ -127,6 +138,7 @@ function collectedAttempt(headCommit: string = COMMIT_A): AttemptRecord {
       stoppedByRequest: false,
     },
     artifacts,
+    runner: CONDUCTED_RUNNER,
     seatPlan: REVIEW_SEAT_PLAN,
     seatSelection: {
       role: 'first-pass',

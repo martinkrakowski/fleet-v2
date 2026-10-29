@@ -5,8 +5,8 @@
  * registered project profile and approved work order, an accepted brief
  * request, a recording `ocm-run` wrapper and a fake `opencode` client on
  * PATH, and the CLI runtime wired with stub forge/review transports. The
- * fixture mutates only `process.env.PATH` (restored on stop) and everything
- * stays inside its own disposable directory.
+ * fixture mutates only `process.env.PATH` (its two dirs removed on stop) and
+ * everything stays inside its own disposable directory.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -114,9 +114,21 @@ function captureIo(): CapturedIo {
   };
 }
 
+/**
+ * Every fixture git command runs insulated from the real $HOME: no global
+ * hooks (core.hooksPath=/dev/null), no signing (commit.gpgSign=false) and an
+ * explicit example identity, so the fixture never picks up operator config.
+ */
+const GIT_SAFE_ARGS = [
+  '-c', 'commit.gpgSign=false',
+  '-c', 'core.hooksPath=/dev/null',
+  '-c', 'user.name=example',
+  '-c', 'user.email=example@example.invalid',
+];
+
 /** git with a hard timeout: a hung fixture git call fails setup, not the test clock. */
 function git(args: readonly string[], options?: { cwd?: string }): string {
-  return String(execFileSync('git', [...args], {
+  return String(execFileSync('git', [...GIT_SAFE_ARGS, ...args], {
     ...(options?.cwd !== undefined ? { cwd: options.cwd } : {}),
     encoding: 'utf8',
     timeout: 20000,
@@ -145,6 +157,7 @@ function buildConductedInstallation(
   orchestratorWorktreeRoot: string,
   laneWorktreeRoot: string,
   seatAgent: string,
+  laneAuthFile: string,
 ): FleetInstallationV2 {
   return {
     schemaVersion: 2,
@@ -162,6 +175,10 @@ function buildConductedInstallation(
         runner: {
           kind: 'opencode',
           port: fakePort,
+          // The empty orchestrator-side auth file ocm-run sources INSTEAD of the
+          // operator's $HOME/.config/opencode/server-auth.env: the real $HOME
+          // never reaches ocm-run.
+          authFile: laneAuthFile,
           capabilities: {
             networkEgressRestricted: true,
             cpuAndMemoryLimited: true,
@@ -324,10 +341,19 @@ export async function startConductedFixture(
   const fakeArgvFile = path.join(dir, 'fake-opencode.argv.log');
   const fakePidsFile = path.join(dir, 'fake-opencode.pids');
 
-  // PATH layering: the wrapper dirs come first; the real PATH stays reachable.
-  const previousPath = process.env.PATH;
-  const pathWasUnset = previousPath === undefined;
-  process.env.PATH = `${pathbin}:${e2e.bin}:${previousPath ?? ''}`;
+  // PATH layering: prepend ONLY this fixture's two dirs; the real PATH stays
+  // reachable. On stop we remove exactly those two entries from the CURRENT
+  // value instead of restoring a snapshot: two fixtures alive at once each own
+  // two dirs, and a snapshot restore would put the other fixture's
+  // already-deleted dirs back on PATH whichever stop order runs.
+  const ownedPathDirs = [pathbin, e2e.bin];
+  const stripOwnPathDirs = (value: string): string => {
+    const parts = value
+      .split(':')
+      .filter((entry) => entry !== '' && !ownedPathDirs.includes(entry));
+    return parts.join(':');
+  };
+  process.env.PATH = `${pathbin}:${e2e.bin}:${process.env.PATH ?? ''}`;
 
   let stopped = false;
   const stop = async (): Promise<void> => {
@@ -335,29 +361,37 @@ export async function startConductedFixture(
       return;
     }
     stopped = true;
-    // 1) every running fake opencode client dies with the fixture.
     try {
-      const pids = (await fs.readFile(fakePidsFile, 'utf8'))
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => /^[0-9]+$/.test(line));
-      for (const pid of pids) {
-        try {
-          process.kill(Number(pid), 'SIGTERM');
-        } catch {
-          // Already gone: nothing to clean.
+      // 1) every running fake opencode client dies with the fixture.
+      try {
+        const pids = (await fs.readFile(fakePidsFile, 'utf8'))
+          .split('\n')
+          .map((line) => line.trim())
+          .filter((line) => /^[0-9]+$/.test(line));
+        for (const pid of pids) {
+          try {
+            process.kill(Number(pid), 'SIGTERM');
+          } catch {
+            // Already gone: nothing to clean.
+          }
+        }
+      } catch {
+        // No pids file: no fake client ever started.
+      }
+      // 2) the ssh fixture stop now also ends the ssh -f -N tunnel.
+      await e2e.stop();
+    } finally {
+      // 3) drop exactly our own two dirs from the current PATH: any stop order
+      // leaves the other fixture's entries intact and no deleted dir behind.
+      const currentPath = process.env.PATH;
+      if (currentPath !== undefined) {
+        const cleaned = stripOwnPathDirs(currentPath);
+        if (cleaned === '') {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = cleaned;
         }
       }
-    } catch {
-      // No pids file: no fake client ever started.
-    }
-    // 2) the ssh fixture stop now also ends the ssh -f -N tunnel.
-    await e2e.stop();
-    // 3) restore PATH exactly as it was.
-    if (pathWasUnset) {
-      delete process.env.PATH;
-    } else {
-      process.env.PATH = previousPath;
     }
   };
 
@@ -398,11 +432,16 @@ export async function startConductedFixture(
     const baseCommit = git(['rev-parse', 'HEAD'], { cwd: clonePath });
 
     // --- installation ----------------------------------------------------
+    // The lane host's authFile is an empty file ocm-run sources instead of the
+    // real $HOME/.config/opencode/server-auth.env.
+    const laneAuthFile = path.join(dir, 'opencode-auth.env');
+    await fs.writeFile(laneAuthFile, '', 'utf8');
     const installation = buildConductedInstallation(
       Number(new URL(e2e.fakeOpencodeUrl).port),
       path.join(dir, 'orchestrator-worktrees'),
       worktreeRoot,
       seatAgent,
+      laneAuthFile,
     );
     const written = writeInstallationV2(installation);
     const parsed = parseInstallation(JSON.parse(written));
@@ -547,11 +586,13 @@ export async function startConductedFixture(
     const attemptId = 'attempt-' + idChars(97202610, 26);
 
     const io = captureIo();
-    const takeStdout = (): string[] => {
-      const lines = [...io.outLines];
+    /** Returns stdout AND stderr both captured BEFORE the buffers clear. */
+    const takeOutput = (): { stdout: string[]; stderr: string[] } => {
+      const stdout = [...io.outLines];
+      const stderr = [...io.errLines];
       io.outLines.length = 0;
       io.errLines.length = 0;
-      return lines;
+      return { stdout, stderr };
     };
 
     const start = async (tier: 1 | 2): Promise<CliRunResult> => {
@@ -568,7 +609,7 @@ export async function startConductedFixture(
         undefined,
         { stateDir: e2e.stateDir },
       );
-      return { code, stdout: takeStdout(), stderr: [...io.errLines] };
+      return { code, ...takeOutput() };
     };
 
     const runPass = async (): Promise<CliRunResult> => {
@@ -590,7 +631,7 @@ export async function startConductedFixture(
             stopSignal: controller.signal,
           },
         );
-        return { code, stdout: takeStdout(), stderr: [...io.errLines] };
+        return { code, ...takeOutput() };
       } finally {
         clearTimeout(timer);
       }
@@ -615,7 +656,11 @@ export async function startConductedFixture(
       get runtime() {
         return currentRuntime;
       },
-      driver: buildLiveConductorDriver(runtime, { maxActiveRuns: 1 }),
+      // A getter so a renamed-host fixture drives the rebuilt runtime: the
+      // driver is rebuilt over the CURRENT runtime on every access.
+      get driver() {
+        return buildLiveConductorDriver(currentRuntime, { maxActiveRuns: 1 });
+      },
       baseCommit,
       clonePath,
       bareRepo,

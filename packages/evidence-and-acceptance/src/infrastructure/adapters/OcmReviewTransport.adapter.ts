@@ -486,33 +486,36 @@ function isToolEvent(record: Record<string, unknown>): boolean {
   return false;
 }
 
+/** A non-blank tool name from a `tool` field (a string or `{ name }`), else null. */
+function toolNameOf(value: unknown): string | null {
+  if (typeof value === 'string' && value.trim() !== '') {
+    return value.trim();
+  }
+  if (isPlainRecord(value) && typeof value.name === 'string' && value.name.trim() !== '') {
+    return value.name.trim();
+  }
+  return null;
+}
+
+/**
+ * The tool name an event carries, read from EVERY placement (`part.tool`,
+ * `part.name`, `record.tool`, `record.name`); null when none holds one or
+ * when the placements disagree, so a `read` in one field cannot hide a
+ * `bash` in another (KF-14e Luna pass).
+ */
 function extractToolName(record: Record<string, unknown>): string | null {
   const part = isPlainRecord(record.part) ? record.part : null;
-
-  if (part !== null && part.tool !== undefined) {
-    if (typeof part.tool === 'string' && part.tool.trim() !== '') {
-      return part.tool.trim();
-    }
-    if (isPlainRecord(part.tool) && typeof part.tool.name === 'string' && part.tool.name.trim() !== '') {
-      return part.tool.name.trim();
+  const names: string[] = [];
+  for (const candidate of [part?.tool, part?.name, record.tool, record.name]) {
+    const name = toolNameOf(candidate);
+    if (name !== null) {
+      names.push(name);
     }
   }
-
-  if (part !== null && typeof part.name === 'string' && part.name.trim() !== '') {
-    return part.name.trim();
+  if (names.length === 0) {
+    return null;
   }
-
-  if (typeof record.tool === 'string' && record.tool.trim() !== '') {
-    return record.tool.trim();
-  }
-  if (isPlainRecord(record.tool) && typeof record.tool.name === 'string' && record.tool.name.trim() !== '') {
-    return record.tool.name.trim();
-  }
-  if (typeof record.name === 'string' && record.name.trim() !== '') {
-    return record.name.trim();
-  }
-
-  return null;
+  return names.every((name) => name === names[0]) ? names[0] : null;
 }
 
 // Lane-written text is a prompt-injection surface: any future embedded

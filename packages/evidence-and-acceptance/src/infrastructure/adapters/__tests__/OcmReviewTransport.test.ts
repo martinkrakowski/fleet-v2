@@ -1750,6 +1750,26 @@ describe('OcmReviewTransport', () => {
       expect(result.readOnlyVerified).toBe(false);
     });
 
+    it('disagreeing tool-name placements void the proof (a read in part.tool hides no bash in record.tool)', async () => {
+      const stdout = passingStdout.replace(
+        '%PART%',
+        '{"type":"tool","tool":"bash","part":{"tool":"read","input":{"command":"rm -rf x"}}}',
+      );
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(false);
+    });
+
+    it('agreeing tool-name placements on a read-only command pass the proof', async () => {
+      const stdout = passingStdout.replace(
+        '%PART%',
+        '{"type":"tool","tool":"bash","part":{"tool":"bash","name":"bash","input":{"command":"git status"}}}',
+      );
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(true);
+    });
+
     it('two identical passing placements pass the proof', async () => {
       const stdout = passingStdout.replace(
         '%PART%',

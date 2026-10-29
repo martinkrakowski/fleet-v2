@@ -5,6 +5,7 @@
  */
 
 import type { ReviewKind, ReviewReceiptRecord } from '../../../domain/evidence-records.js';
+import type { ReviewUnavailableCode } from '../out/IndependentReviewPort.out-port.js';
 
 export interface RequestIndependentReviewRequest {
   readonly assessmentId: string;
@@ -35,6 +36,12 @@ export type RequestIndependentReviewResult =
   | {
       readonly outcome: 'rejected';
       readonly reason: string;
+      /**
+       * The typed reason code (KF-14a): the adapter's code for
+       * `review-unavailable`, the fixed code for `not-read-only` and
+       * `invalid-receipt`. Set exactly when the request carried a requestId.
+       */
+      readonly code?: ReviewUnavailableCode | 'not-read-only' | 'invalid-receipt';
       /** Set exactly when the request carried a requestId. */
       readonly rejection?: ReviewRejection;
     };

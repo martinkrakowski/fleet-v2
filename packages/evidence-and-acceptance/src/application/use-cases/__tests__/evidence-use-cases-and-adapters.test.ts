@@ -509,7 +509,7 @@ describe('RequestIndependentReviewUseCase', () => {
   it('rejects an unavailable reviewer seat', async () => {
     const useCase = new RequestIndependentReviewUseCase({
       repo: fakeRepository([assessmentRecord({ requiredChecks: [] })]),
-      reviewer: stubReviewer({ outcome: 'unavailable', reason: 'seat is busy' }),
+      reviewer: stubReviewer({ outcome: 'unavailable', reason: 'seat is busy', code: 'transport-failed' }),
       archive: recordingArchive(),
     });
 
@@ -1549,10 +1549,12 @@ describe('IndependentReviewAdapter', () => {
     expect(unconfigured).toEqual({
       outcome: 'unavailable',
       reason: 'No independent review transport is configured',
+      code: 'transport-missing',
     });
     expect(failing).toEqual({
       outcome: 'unavailable',
       reason: 'reviewer seat timed out',
+      code: 'transport-failed',
     });
   });
 

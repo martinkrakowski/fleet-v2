@@ -170,6 +170,7 @@ export function buildLiveConductorDriver(
       isSameModelFamily(underlyingModelFamily(left), underlyingModelFamily(right)),
     workOrderRepo: execution.workOrderRepository,
     prepareFixAttempt: execution.prepareFixAttempt,
+    prepareBrief: execution.prepareBriefPackage,
     // K6-8: the conductor's acceptance, PR, push, merge and park ports.
     acceptanceAssessment: execution.acceptanceAssessment,
     ciState: conductor.ciState,
@@ -263,6 +264,7 @@ export function buildDryRunConductorDriver(
     sameModelFamily: () => false,
     workOrderRepo: stores.workOrderRepo,
     prepareFixAttempt: new PrepareFixAttemptUseCase({ attemptRepo: stores.attemptRepo }),
+    prepareBrief: fakes.prepareBrief,
     // K6-8: the dry-run's recording fakes for the conductor's acting ports.
     acceptanceAssessment: fakes.acceptanceAssessment,
     ciState: fakes.ciState,

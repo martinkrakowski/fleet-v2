@@ -15,6 +15,12 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { AttemptRecord } from '@fleet/work-execution';
+import {
+  buildLaneRunStepKey,
+  laneRunConductEntry,
+  laneRunIntentEntry,
+  laneRunResultEntry,
+} from '@fleet/work-execution';
 import type { FleetInstallation } from '@fleet/installation';
 
 import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
@@ -213,6 +219,99 @@ async function seedCompletedStart(runtime: FleetCliRuntime): Promise<void> {
     runPolicyRevision: 'policy-example-1',
   });
   expect(run.outcome).toBe('saved');
+}
+
+/** The head commit the dry-run collect fake records, in 12-nibble form. */
+const FIX_HEAD12 = 'd'.repeat(12);
+
+/**
+ * A run already in `fixing` after a gate failure at the collected head: a
+ * collected round-0 attempt and the gate intent/result/conduct journal entries,
+ * so the dry-run driver's first advance is the fix-round `act prepare`.
+ */
+async function seedFixRoundStart(runtime: FleetCliRuntime): Promise<void> {
+  await runtime.execution.workOrderRepository.saveWorkOrder({
+    id: 'wo-example-1',
+    projectId: 'project-example-1',
+    taskId: 'task-example-1',
+    laneId: 'lane-example-1',
+    repository: 'repo-example-1',
+    baseCommit: 'a'.repeat(40),
+    ownedPaths: ['packages/example/src'],
+    policyRevision: 'policy-example-1',
+    prerequisiteWorkOrderIds: [],
+    state: 'approved',
+    revision: 1,
+    createdAtIso: NOW,
+    updatedAtIso: NOW,
+  });
+  await runtime.execution.attemptRepository.saveAttempt({
+    id: ATTEMPT_ID,
+    workOrderId: 'wo-example-1',
+    kind: 'initial',
+    fixNumber: 0,
+    priorAttemptId: null,
+    worktreePath: WORKTREE,
+    baseCommit: 'a'.repeat(40),
+    state: 'collected',
+    outcome: null,
+    revision: 1,
+    briefDigest: 'c'.repeat(64),
+    briefPackagePath: '.lane/brief.md',
+    sessionId: null,
+    completionReceipt: {
+      attemptId: ATTEMPT_ID,
+      sessionId: 'session-example-1',
+      endedAtIso: NOW,
+      authoritative: true,
+      exitStatus: 0,
+      stoppedByRequest: false,
+    },
+    artifacts: {
+      headCommit: 'd'.repeat(40),
+      commitsSinceBase: ['d'.repeat(40)],
+      collectedArtifactPaths: [],
+      notes: 'present',
+    },
+    seatPlan: SEAT_PLAN,
+    seatSelection: SEAT_SELECTION,
+    stopReason: 'none',
+    createdAtIso: NOW,
+    updatedAtIso: NOW,
+  });
+  const run = await runtime.conductor.laneRunRepository.create({
+    version: 1,
+    runId: RUN_ID,
+    workOrderId: 'wo-example-1',
+    tier: 2,
+    seatPlanRef: 'a'.repeat(64),
+    cursors: { 'first-pass': 0, fix: null, review: null },
+    round: 0,
+    attemptIds: [ATTEMPT_ID],
+    prNumber: null,
+    parked: null,
+    parkCount: 0,
+    lease: null,
+    revision: 1,
+    runPolicyRevision: 'policy-example-1',
+  });
+  expect(run.outcome).toBe('saved');
+  const gateKey = buildLaneRunStepKey({
+    runId: RUN_ID,
+    round: 0,
+    step: 'gate',
+    seatIndex: 0,
+    attemptOrdinal: null,
+    head12: FIX_HEAD12,
+    retry: null,
+  });
+  expect(gateKey.ok).toBe(true);
+  if (gateKey.ok) {
+    const journal = runtime.conductor.laneRunJournal;
+    await journal.append(laneRunIntentEntry(runtime.conductor.newUlid(), RUN_ID, gateKey.key, null, NOW));
+    await journal.append(laneRunResultEntry(runtime.conductor.newUlid(), RUN_ID, gateKey.key, 'completed', 'gate-failed', NOW));
+    await journal.append(laneRunConductEntry(runtime.conductor.newUlid(), RUN_ID, 'fixing', NOW));
+  }
 }
 
 /** sha256 of every file currently in `dir`, keyed by file name. */
@@ -491,5 +590,31 @@ describe('conductor run --dry-run (K7-8)', () => {
     expect(stderr).not.toContain(dir);
     expect(hashStateFiles(dir)).toEqual(beforeHashes);
     expect(dryRunScratchDirs()).toEqual(beforeScratch);
+  });
+
+  it('drives a seeded fix round: the prepare brief fake is called and the fix attempt prepares (KF-6)', async () => {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir);
+    await seedFixRoundStart(runtime);
+
+    const controller = new AbortController();
+    const result = await runConductor(runtime, ['run', '--dry-run', '--once'], {
+      stateDir: dir,
+      stopSignal: controller.signal,
+      sleep: async () => undefined,
+    });
+
+    expect(result.code).toBe(0);
+    const would = wouldLines(result.stdout);
+    const prepareLine = would.find((line) => line.would === 'prepare');
+    expect(prepareLine).toMatchObject({ result: 'completed', reasonCode: 'prepared' });
+    expect(prepareLine?.key).toMatch(/\/r1\/prepare\//);
+
+    const fakes = capturedFakes.current as DryRunFakes | null;
+    expect(fakes).not.toBeNull();
+    const calls = fakes!.recorder.calls;
+    const briefCalls = calls.filter((call) => call.port === 'prepareBrief');
+    expect(briefCalls.length).toBeGreaterThan(0);
+    expect(briefCalls[0]?.attemptId).toMatch(/^attempt-/);
   });
 });

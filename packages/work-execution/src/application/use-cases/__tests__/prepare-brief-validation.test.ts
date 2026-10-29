@@ -400,6 +400,106 @@ describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
   });
 });
 
+function makeProseCapturingArtifactPort(): { port: AttemptArtifactPort; placedProseMarkdowns: string[] } {
+  const placedProseMarkdowns: string[] = [];
+  const port: AttemptArtifactPort = {
+    async verifyIgnoredPaths(request) {
+      return { outcome: 'ignored', checkedPaths: request.candidatePaths };
+    },
+    async placeFrozenBrief(request) {
+      placedProseMarkdowns.push(request.proseMarkdown);
+      return {
+        outcome: 'placed',
+        prosePath: '.lane/brief.md',
+        manifestPath: '.lane/brief-manifest.json',
+      };
+    },
+    async collectCompletedAttemptArtifacts() {
+      return {
+        outcome: 'collected',
+        artifacts: {
+          headCommit: 'head456',
+          commitsSinceBase: ['commit-1'],
+          collectedArtifactPaths: ['dist/report.json'],
+          notes: 'present',
+        },
+      };
+    },
+  };
+  return { port, placedProseMarkdowns };
+}
+
+describe('PrepareBriefPackageUseCase proseMarkdown (KF-6)', () => {
+  it('skips authoring and places the supplied prose when proseMarkdown is present', async () => {
+    const authorBrief = vi.fn(async () => {
+      return {
+        outcome: 'authored' as const,
+        brief: {
+          proseMarkdown: '# Frozen brief prose',
+          provenance: 'orchestrator' as const,
+        },
+      };
+    });
+    const captured = makeProseCapturingArtifactPort();
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: { authorBrief },
+      artifactPort: captured.port,
+      worktreePath: '/wt',
+    });
+
+    const prose = '# Fix round 1 handover';
+    const result = await useCase.prepareBriefPackage(validRequest({ proseMarkdown: prose }));
+    expect(result.outcome).toBe('prepared');
+    if (result.outcome === 'prepared') {
+      expect(result.prepared.prosePath).toBe('.lane/brief.md');
+    }
+    expect(captured.placedProseMarkdowns).toEqual([prose]);
+    expect(authorBrief).not.toHaveBeenCalled();
+  });
+
+  it('covers the supplied prose in the brief digest', async () => {
+    const useCase = makeUseCase();
+    const first = await useCase.prepareBriefPackage(validRequest({ proseMarkdown: '# Fix round 1' }));
+    const second = await useCase.prepareBriefPackage(validRequest({ proseMarkdown: '# Fix round 2' }));
+
+    expect(first.outcome).toBe('prepared');
+    expect(second.outcome).toBe('prepared');
+    if (first.outcome === 'prepared' && second.outcome === 'prepared') {
+      expect(first.prepared.briefDigest).not.toBe(second.prepared.briefDigest);
+    }
+  });
+
+  it('rejects an empty proseMarkdown', async () => {
+    const useCase = makeUseCase();
+
+    for (const proseMarkdown of ['', '   ', 0, null, true]) {
+      const result = await useCase.prepareBriefPackage(
+        validRequest({ proseMarkdown: proseMarkdown as unknown as string }),
+      );
+      expect(result).toEqual({ outcome: 'rejected', reason: 'proseMarkdown must be a non-empty string' });
+    }
+  });
+
+  it('rejects a secret-shaped proseMarkdown', async () => {
+    const useCase = makeUseCase();
+    const result = await useCase.prepareBriefPackage(
+      validRequest({ proseMarkdown: 'ghp_' + 'A'.repeat(20) }),
+    );
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'proseMarkdown contains a secret-shaped value and was refused',
+    });
+  });
+
+  it('rejects a proseMarkdown over 64 KiB', async () => {
+    const useCase = makeUseCase();
+    const result = await useCase.prepareBriefPackage(
+      validRequest({ proseMarkdown: 'x'.repeat(64 * 1024 + 1) }),
+    );
+    expect(result).toEqual({ outcome: 'rejected', reason: 'proseMarkdown must be at most 64 KiB' });
+  });
+});
+
 describe('PrepareBriefPackageUseCase runner agent (KF-7)', () => {
   const agentSeatPlan = {
     version: 1 as const,

@@ -224,7 +224,7 @@ export async function gatherFacts(ctx: AdvanceStepContext,
     ci: acceptance.ci,
     pr: acceptance.pr,
     refusedStep: laneRunRefusedStep(entries, record.runId, record.round),
-    merge: { oneWayDoor: true, branchBehind: true, trainFree: false, policyGrant: false },
+    merge: acceptance.merge,
   };
   return { facts, deadlineUnknown, latestAttempt: latest, attemptRecords };
 }

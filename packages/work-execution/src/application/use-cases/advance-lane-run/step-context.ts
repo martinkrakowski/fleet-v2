@@ -7,6 +7,7 @@ import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
 import type { LaneRunParkReason, LaneRunRecord } from '../../../domain/lane-run-records.js';
+import type { LaneRunParkRequest } from '../../ports/out/LaneRunParkNoticePort.out-port.js';
 import { canEnterLaneRunState } from '../../../domain/lane-run-transitions.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 
@@ -58,6 +59,69 @@ export async function performEnter(ctx: AdvanceStepContext,
   return { outcome: 'entered', state: to };
 }
 
+/** The park reasons that also ask one keyed owner question (K6 header). */
+const OWNER_QUESTION_REASONS: readonly LaneRunParkReason[] = [
+  'one-way-door', 'owner-merge', 'blocker-after-round-2', 'seat-plan-exhausted',
+];
+
+/**
+ * Raise the park's attention item and, for the four owner reasons, the keyed
+ * owner question (K6-7). Everything is failure-tolerant: missing wiring, a
+ * missing work order, a refusal or a throw never blocks or changes the park,
+ * and the park outcome is returned unchanged. No journal entry is written for
+ * the notice (the park key is not a journal key shape); a failed notice leaves
+ * `questionId` null for the next park (or the reaper) to re-raise under the
+ * same key.
+ */
+async function raiseParkNotice(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  reason: LaneRunParkReason,
+  qualifier: string | null,
+  request: AdvanceLaneRunRequest,
+): Promise<void> {
+  const parkNotice = ctx.deps.parkNotice;
+  const workOrderRepo = ctx.deps.workOrderRepo;
+  if (parkNotice === undefined || workOrderRepo === undefined) {
+    return;
+  }
+  const key = record.runId + '/park@' + String(record.parkCount + 1);
+  try {
+    const workOrder = await workOrderRepo.findWorkOrderById(record.workOrderId);
+    if (workOrder === null) {
+      return;
+    }
+    const parkRequest: LaneRunParkRequest = {
+      key,
+      projectId: workOrder.projectId,
+      workOrderId: record.workOrderId,
+      runId: record.runId,
+      reason,
+      ...(qualifier === null ? {} : { qualifier }),
+    };
+    await parkNotice.recordParkAttention(parkRequest);
+    if (OWNER_QUESTION_REASONS.includes(reason)) {
+      const asked = await parkNotice.askParkQuestion(parkRequest);
+      const questionId = asked.outcome === 'recorded' || asked.outcome === 'exists' ? asked.questionId : undefined;
+      if (questionId !== undefined) {
+        const current = await ctx.deps.runRepo.get(record.runId);
+        if (current !== null && current.parked !== null && current.parked.questionId === null) {
+          await saveOrRefuse(ctx,
+            {
+              ...current,
+              parked: { ...current.parked, questionId },
+              revision: current.revision + 1,
+            },
+            request,
+          );
+        }
+      }
+    }
+  } catch {
+    // A notice failure or throw never blocks the park; the park stands as saved.
+  }
+}
+
 export async function performPark(ctx: AdvanceStepContext,
   record: LaneRunRecord,
   reason: LaneRunParkReason,
@@ -81,6 +145,7 @@ export async function performPark(ctx: AdvanceStepContext,
   if (!appended.ok) {
     return { outcome: 'refused', reason: appended.reason };
   }
+  await raiseParkNotice(ctx, record, reason, qualifier, request);
   return { outcome: 'parked', reason, qualifier };
 }
 

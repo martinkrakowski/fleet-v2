@@ -93,7 +93,11 @@ export function AlertBox({
       className={classes.backdrop}
       role="presentation"
       style={style}
-      onClick={onCancel}
+      // Click outside the dialog cancels; Escape (window keydown listener) is
+      // the keyboard equivalent.
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onCancel();
+      }}
     >
       <div
         role="alertdialog"
@@ -103,7 +107,6 @@ export function AlertBox({
         className={[classes.dialog, classes[toneKey] ?? classes.toneNeutral, className]
           .filter(Boolean)
           .join(' ') || undefined}
-        onClick={(event) => event.stopPropagation()}
       >
         <p className={classes.title} id={titleId}>
           {title}

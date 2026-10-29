@@ -120,8 +120,8 @@ export interface LaneRunFacts {
   readonly acceptance: 'none' | 'accepted' | 'rejected' | 'unknown';
   /** `CiStatePort` at `head12` (PC/K6). */
   readonly ci: 'pending' | 'passed' | 'failed' | 'unknown';
-  /** The run's PR as the forge reports it (K6, AM4b). */
-  readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string } | null;
+  /** The run's PR as the forge reports it (K6, AM4b); `containsLaneHead` is true when the PR head is, or contains as an ancestor, the collected lane head (CT-2a). */
+  readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string; readonly containsLaneHead: boolean } | null;
   /** The step whose latest result in this round at this head was a refusal (K1b). */
   readonly refusedStep: LaneRunKeyStep | null;
   /** Unreadable door or behind-ness reads true; `trainFree` and `policyGrant` per §3.6/AM4a (K6). */
@@ -175,6 +175,14 @@ const WAIT_FACTS_INCONSISTENT: LaneRunDecision = { kind: 'wait', reason: 'facts-
  * never a pass; a seat switch only where no review receipt was recorded. Always returns a decision,
  * never throws.
  */
+/**
+ * A merged PR counts for the lane when its head is the collected lane head or
+ * contains it as an ancestor (CT-2a); every merged-PR rule (M3, G3d, G5) reads it here.
+ */
+function mergedPrCarriesLaneHead(pr: NonNullable<LaneRunFacts['pr']>, laneHead12: string | null): boolean {
+  return pr.head12 === laneHead12 || pr.containsLaneHead;
+}
+
 export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, nowIso: string): LaneRunDecision {
   try {
     const now = Date.parse(nowIso);
@@ -582,7 +590,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (facts.pr === null) {
         return WAIT_FACTS_INCONSISTENT;
       }
-      if (facts.pr.state === 'merged' && facts.pr.head12 === facts.head12) {
+      if (facts.pr.state === 'merged' && mergedPrCarriesLaneHead(facts.pr, facts.head12)) {
         return enter('merged');
       }
       if (facts.pr.state === 'merged' || facts.pr.state === 'closed') {
@@ -649,10 +657,26 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
 
     // G3d: a merge that landed ends `merged`, never `stopped` (§3.9.1).
     if (facts.stopMode !== null && facts.state === 'merging' && facts.pr !== null && facts.pr.state === 'merged') {
-      if (facts.pr.head12 === facts.head12) {
+      if (mergedPrCarriesLaneHead(facts.pr, facts.head12)) {
         return enter('merged');
       }
       return park('ambiguous', 'merge');
+    }
+
+    // G3e: the owner-merge park leaves by itself once its PR merges with the
+    // lane head (CT-2a). It sits here, ahead of the stop rules G4a and GD1, so
+    // a landed merge ends `merged` and never `stopped` even with a stop
+    // recorded on the park (§3.9.1). A merged PR that neither equals nor
+    // contains the lane head keeps the park for the owner (no park → park).
+    if (
+      facts.state === 'parked' &&
+      record.parked !== null &&
+      record.parked.reason === 'owner-merge' &&
+      facts.pr !== null &&
+      facts.pr.state === 'merged' &&
+      mergedPrCarriesLaneHead(facts.pr, facts.head12)
+    ) {
+      return enter('merged');
     }
 
     // G4a: a force stop with nothing to stop ends the run.
@@ -807,7 +831,8 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return decision;
     }
 
-    // G5: parked waits for a resume or the owner's answer.
+    // G5: parked waits for a resume or the owner's answer (the owner-merge
+    // park's own exit is G3e above).
     if (facts.state === 'parked') {
       return wait('parked');
     }

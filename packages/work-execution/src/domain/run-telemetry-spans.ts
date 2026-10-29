@@ -13,7 +13,7 @@
  */
 
 import { billingOf } from '@fleet/shared';
-import { parseLaneRunKey, stopModeOfKey } from './lane-run-keys.js';
+import { parseLaneRunKey, stopModeOfKey, type ParsedLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_TERMINAL_STATES } from './value-objects/LaneRunState.vo.js';
 import { CAPACITY_RELEASE_STATES } from './value-objects/AttemptState.vo.js';
 import type { LaneRunJournalEntryRecord } from './lane-run-journal.js';
@@ -34,6 +34,7 @@ import {
   telemetryTraceId,
   usageIdentity,
   verificationReceiptIdentity,
+  type TelemetryDigestKind,
   type TelemetryHmac,
   type TelemetryHashInput,
   type TelemetrySpanIdentity,
@@ -115,6 +116,9 @@ const ROUND_STEPS: readonly LaneRunKeyStep[] = [
   'prepare', 'dispatch', 'collect', 'reconcile', 'stop', 'gate', 'brief-check', 'code-review', 'pre-merge',
 ];
 
+/** The states in which an attempt is terminal and its spans may be emitted (plan §3.1). */
+const TERMINAL_ATTEMPT_STATES: readonly string[] = CAPACITY_RELEASE_STATES;
+
 /** A span identity and its build input, once both are known. */
 interface PendingSpan {
   readonly identity: TelemetrySpanIdentity;
@@ -136,6 +140,13 @@ interface KeyGroup {
   ambiguous: number;
 }
 
+/** A round's aggregate start, end and errored status, updated from built step spans. */
+interface RoundSpanInfo {
+  startIso: string;
+  endIso: string;
+  errored: TelemetrySpanStatus | null;
+}
+
 /** The final (non-`ambiguous`) result of a key's results: the last one, or null. */
 function finalResultOf(results: readonly LaneRunJournalEntryRecord[]): LaneRunJournalEntryRecord | null {
   let final: LaneRunJournalEntryRecord | null = null;
@@ -155,8 +166,14 @@ function statusOfResult(result: LaneRunJournalEntryRecord): TelemetrySpanStatus 
   return { code: 'error', reasonCode: result.reasonCode };
 }
 
-/** The states in which an attempt is terminal and its spans may be emitted (plan §3.1). */
-const TERMINAL_ATTEMPT_STATES: readonly string[] = CAPACITY_RELEASE_STATES;
+/** A `<kind>` digest of an id: null when either wrapping or digesting fails. */
+function digestOf(hmac: TelemetryHmac, kind: TelemetryDigestKind, id: string): string | null {
+  const input = telemetryHashInput(id);
+  if (input === null) {
+    return null;
+  }
+  return telemetryDigest(hmac, kind, input);
+}
 
 /** The candidate attributes of an attempt span (both trace kinds); validated by `TelemetrySpan.build`. */
 function attemptAttributes(hmac: TelemetryHmac, attempt: AttemptRecord, sessionDigest: string): Readonly<Record<string, unknown>> {
@@ -165,21 +182,13 @@ function attemptAttributes(hmac: TelemetryHmac, attempt: AttemptRecord, sessionD
     'fleet.attempt.kind': attempt.kind,
     'fleet.fix_number': attempt.fixNumber,
   };
-  const attemptInput = telemetryHashInput(attempt.id);
-  if (attemptInput !== null) {
-    const digest = telemetryDigest(hmac, 'attempt', attemptInput);
-    if (digest !== null) {
-      attributes['fleet.attempt.digest'] = digest;
-    }
+  const attemptDigest = digestOf(hmac, 'attempt', attempt.id);
+  if (attemptDigest !== null) {
+    attributes['fleet.attempt.digest'] = attemptDigest;
   }
-  if (attempt.priorAttemptId !== null) {
-    const priorInput = telemetryHashInput(attempt.priorAttemptId);
-    if (priorInput !== null) {
-      const digest = telemetryDigest(hmac, 'attempt', priorInput);
-      if (digest !== null) {
-        attributes['fleet.prior_attempt.digest'] = digest;
-      }
-    }
+  const priorDigest = attempt.priorAttemptId === null ? null : digestOf(hmac, 'attempt', attempt.priorAttemptId);
+  if (priorDigest !== null) {
+    attributes['fleet.prior_attempt.digest'] = priorDigest;
   }
   const seat = attempt.seatSelection;
   if (seat !== null && seat !== undefined) {
@@ -237,13 +246,638 @@ function usageAttributes(attempt: AttemptRecord, usage: AttemptUsageRecord): Rea
   return attributes;
 }
 
+/** A shared span accumulator: the emitted spans, the rejected counter and the builder. */
+interface SpanBuilder {
+  readonly spans: TelemetrySpan[];
+  readonly rejected: { count: number };
+  build(span: PendingSpan): TelemetrySpan | null;
+}
+
+/**
+ * A span builder for one trace: an id, parent or build failure drops the span
+ * and counts it in `rejected`; a non-root span is never emitted without a
+ * parent span id. `rootSpanName` names the trace's root span.
+ */
+function createSpanBuilder(
+  hmac: TelemetryHmac,
+  root: TelemetryTraceRoot,
+  traceId: string,
+  rootSpanName: TelemetrySpanName,
+): SpanBuilder {
+  const spans: TelemetrySpan[] = [];
+  const rejected = { count: 0 };
+  const build = (span: PendingSpan): TelemetrySpan | null => {
+    const spanId = telemetrySpanId(hmac, root, span.identity);
+    if (spanId === null) {
+      rejected.count += 1;
+      return null;
+    }
+    if (span.parentSpanId === null && span.name !== rootSpanName) {
+      rejected.count += 1;
+      return null;
+    }
+    const built = TelemetrySpan.build({
+      traceId,
+      spanId,
+      parentSpanId: span.parentSpanId,
+      name: span.name,
+      kind: span.kind,
+      startIso: span.startIso,
+      endIso: span.endIso,
+      status: span.status,
+      attributes: span.attributes,
+      events: span.events,
+    });
+    if (built === null) {
+      rejected.count += 1;
+      return null;
+    }
+    spans.push(built);
+    return built;
+  };
+  return { spans, rejected, build };
+}
+
+/** The context every run-mapper helper shares: ids, shared attributes and the rejected counter. */
+interface RunMapperContext {
+  readonly hmac: TelemetryHmac;
+  readonly root: TelemetryTraceRoot;
+  readonly traceId: string;
+  readonly rootSpanId: string;
+  readonly sharedAttributes: Readonly<Record<string, unknown>>;
+  readonly rejected: { count: number };
+}
+
+/** The journal scoped to the run (plan §3.1): step and stop keys of this run, and its conduct entries with a state. */
+function scopeJournal(facts: LaneRunTelemetryFacts): LaneRunJournalEntryRecord[] {
+  const runId = facts.run.runId;
+  return facts.journal.filter((entry) => {
+    if (entry.kind === 'conduct') {
+      return entry.runId === runId && entry.state !== null;
+    }
+    if (entry.kind !== 'intent' && entry.kind !== 'result') {
+      return false;
+    }
+    if (entry.key === null) {
+      return false;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || (parsed.kind !== 'step' && parsed.kind !== 'stop')) {
+      return false;
+    }
+    return parsed.runId === runId;
+  });
+}
+
+/** The keyed journal: one group per key, intents and results in journal order. */
+function groupStepEntries(journal: readonly LaneRunJournalEntryRecord[]): KeyGroup[] {
+  const groups: KeyGroup[] = [];
+  const byKey = new Map<string, KeyGroup>();
+  for (const entry of journal) {
+    if ((entry.kind !== 'intent' && entry.kind !== 'result') || entry.key === null) {
+      continue;
+    }
+    let group = byKey.get(entry.key);
+    if (group === undefined) {
+      group = { key: entry.key, intent: null, results: [], ambiguous: 0 };
+      byKey.set(entry.key, group);
+      groups.push(group);
+    }
+    if (entry.kind === 'intent') {
+      // A key carries one intent; a second one (which the journal refuses)
+      // never replaces the first, so a prefix and the full journal agree.
+      group.intent ??= entry;
+    } else if (entry.outcome === 'ambiguous') {
+      group.ambiguous += 1;
+    } else {
+      group.results.push(entry);
+    }
+  }
+  return groups;
+}
+
+/** The rounds an intent has started, and the highest started round (plan §3.1). */
+function roundStartInfo(journal: readonly LaneRunJournalEntryRecord[]): {
+  roundsStarted: Set<number>;
+  maxRoundStarted: number;
+} {
+  const roundsStarted = new Set<number>();
+  for (const entry of journal) {
+    if (entry.kind !== 'intent' || entry.key === null) {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed !== null && parsed.kind === 'step') {
+      roundsStarted.add(parsed.round);
+    }
+  }
+  const maxRoundStarted = roundsStarted.size > 0 ? Math.max(...roundsStarted) : -1;
+  return { roundsStarted, maxRoundStarted };
+}
+
+/** The run's conduct entries, in journal order. */
+function conductEntries(journal: readonly LaneRunJournalEntryRecord[]): readonly LaneRunJournalEntryRecord[] {
+  return journal.filter((entry) => entry.kind === 'conduct');
+}
+
+/** Whether the last conduct entry closes the run terminally (plan §3.1). */
+function isTerminal(lastConduct: LaneRunJournalEntryRecord | null): boolean {
+  const lastState = lastConduct?.state ?? null;
+  return lastState !== null && (LANE_RUN_TERMINAL_STATES as readonly string[]).includes(lastState);
+}
+
+/** The dispatch-key group whose intent minted the attempt, with its round and seat. */
+function findDispatchGroup(
+  groups: readonly KeyGroup[],
+  attemptId: string,
+): { group: KeyGroup; round: number; seatIndex: number } | null {
+  for (const group of groups) {
+    const parsed = parseLaneRunKey(group.key);
+    if (parsed?.kind !== 'step' || parsed?.step !== 'dispatch') {
+      continue;
+    }
+    if (group.intent?.mintedId === attemptId) {
+      return { group, round: parsed.round, seatIndex: parsed.seatIndex };
+    }
+  }
+  return null;
+}
+
+/** The collect-key group of the same (round, seat). */
+function findCollectGroup(groups: readonly KeyGroup[], round: number, seatIndex: number): KeyGroup | null {
+  for (const group of groups) {
+    const parsed = parseLaneRunKey(group.key);
+    if (parsed?.kind !== 'step' || parsed?.step !== 'collect') {
+      continue;
+    }
+    if (parsed.round === round && parsed.seatIndex === seatIndex) {
+      return group;
+    }
+  }
+  return null;
+}
+
+/** Fold a built step span's window into the round's aggregate. */
+function updateRoundInfo(
+  roundOf: Map<number, RoundSpanInfo>,
+  round: number,
+  startIso: string,
+  endIso: string,
+  status: TelemetrySpanStatus,
+): void {
+  const current = roundOf.get(round);
+  if (current === undefined) {
+    roundOf.set(round, {
+      startIso,
+      endIso,
+      errored: status.code === 'error' ? status : null,
+    });
+    return;
+  }
+  if (Date.parse(startIso) < Date.parse(current.startIso)) {
+    current.startIso = startIso;
+  }
+  if (Date.parse(endIso) > Date.parse(current.endIso)) {
+    current.endIso = endIso;
+  }
+  if (status.code === 'error') {
+    current.errored = status;
+  }
+}
+
+/** Build one keyed step span, updating the round aggregate; `parsed` is a known step key. */
+function buildStepSpan(
+  ctx: RunMapperContext,
+  builder: SpanBuilder,
+  group: KeyGroup,
+  intent: LaneRunJournalEntryRecord,
+  parsed: Extract<ParsedLaneRunKey, { kind: 'step' }>,
+  roundOf: Map<number, RoundSpanInfo>,
+  pendingStepRounds: Set<number>,
+): void {
+  const hashInput = telemetryHashInput(group.key);
+  if (hashInput === null) {
+    ctx.rejected.count += 1;
+    return;
+  }
+  const final = finalResultOf(group.results);
+  const underRound = ROUND_STEPS.includes(parsed.step);
+  if (final === null) {
+    // Only a round-parented step holds its round open: an unfinalized
+    // root-parented key (accept, open-pr, push, merge, park) can never
+    // withhold a completed round span.
+    if (underRound) {
+      pendingStepRounds.add(parsed.round);
+    }
+    return;
+  }
+  const identity = journalKeyIdentity(hashInput);
+  if (identity === null) {
+    ctx.rejected.count += 1;
+    return;
+  }
+  const attributes: Record<string, unknown> = {
+    'fleet.step': parsed.step,
+    'fleet.round': parsed.round,
+    ...ctx.sharedAttributes,
+  };
+  if (final.reasonCode !== null) {
+    attributes['fleet.reason_code'] = final.reasonCode;
+  }
+  if (group.ambiguous > 0) {
+    attributes['fleet.ambiguous_results'] = group.ambiguous;
+  }
+  const status = statusOfResult(final);
+  let parentSpanId: string | null = ctx.rootSpanId;
+  if (underRound) {
+    const roundIdentityOf = roundIdentity(parsed.round);
+    if (roundIdentityOf === null) {
+      ctx.rejected.count += 1;
+      return;
+    }
+    parentSpanId = telemetrySpanId(ctx.hmac, ctx.root, roundIdentityOf);
+  }
+  const built = builder.build({
+    identity,
+    name: parsed.step,
+    kind: STEP_SPAN_KINDS[parsed.step],
+    startIso: intent.recordedAtIso,
+    endIso: final.recordedAtIso,
+    status,
+    attributes,
+    parentSpanId,
+    events: [],
+  });
+  if (built === null || !underRound) {
+    return;
+  }
+  updateRoundInfo(roundOf, parsed.round, intent.recordedAtIso, final.recordedAtIso, status);
+}
+
+/** The step-span build result: the round aggregates and the rounds held open by unfinalized round steps. */
+interface StepSpanBuildResult {
+  readonly roundOf: Map<number, RoundSpanInfo>;
+  readonly pendingStepRounds: ReadonlySet<number>;
+}
+
+/** Build every keyed step span; stop requests are collected separately. */
+function buildStepSpans(
+  ctx: RunMapperContext,
+  builder: SpanBuilder,
+  groups: readonly KeyGroup[],
+): StepSpanBuildResult {
+  const roundOf = new Map<number, RoundSpanInfo>();
+  const pendingStepRounds = new Set<number>();
+  for (const group of groups) {
+    const parsed = parseLaneRunKey(group.key);
+    if (parsed?.kind !== 'step' || group.intent === null) {
+      continue;
+    }
+    const intent = group.intent;
+    buildStepSpan(ctx, builder, group, intent, parsed, roundOf, pendingStepRounds);
+  }
+  return { roundOf, pendingStepRounds };
+}
+
+/** The root span, only when the run is terminal (D2). */
+function buildRootSpan(
+  ctx: RunMapperContext,
+  builder: SpanBuilder,
+  facts: LaneRunTelemetryFacts,
+  journal: readonly LaneRunJournalEntryRecord[],
+  conduct: readonly LaneRunJournalEntryRecord[],
+  lastConduct: LaneRunJournalEntryRecord | null,
+  terminal: boolean,
+): void {
+  if (lastConduct === null || lastConduct.state === null || !terminal || journal.length === 0) {
+    return;
+  }
+  const lastState = lastConduct.state;
+  const allEvents: TelemetrySpanEvent[] = [];
+  for (const entry of conduct) {
+    if (entry.state === null) {
+      continue;
+    }
+    allEvents.push({ name: 'state.entered', timeIso: entry.recordedAtIso, state: entry.state });
+  }
+  const events =
+    allEvents.length > TELEMETRY_MAX_EVENTS
+      ? allEvents.slice(-TELEMETRY_MAX_EVENTS)
+      : allEvents;
+  const attributes: Record<string, unknown> = {
+    'fleet.run.id': facts.run.runId,
+    'fleet.tier': facts.run.tier,
+    ...ctx.sharedAttributes,
+  };
+  if (facts.tags.length > 0) {
+    attributes['tag.tags'] = facts.tags.slice();
+  }
+  if (facts.project !== null) {
+    attributes['fleet.project'] = facts.project;
+  }
+  builder.build({
+    identity: runRootIdentity(),
+    name: 'lane-run',
+    kind: 'CHAIN',
+    startIso: journal[0].recordedAtIso,
+    endIso: lastConduct.recordedAtIso,
+    status:
+      lastState === 'merged'
+        ? { code: 'ok', reasonCode: null }
+        : { code: 'unset', reasonCode: 'stopped' },
+    attributes,
+    parentSpanId: null,
+    events,
+  });
+}
+
+/** Round spans: one per round with at least one built step span, withheld and closed as in plan §3.1. */
+function buildRoundSpans(
+  ctx: RunMapperContext,
+  builder: SpanBuilder,
+  roundOf: Map<number, RoundSpanInfo>,
+  pendingStepRounds: ReadonlySet<number>,
+  terminal: boolean,
+  roundsStarted: ReadonlySet<number>,
+  maxRoundStarted: number,
+): void {
+  for (let round = 0; round <= LANE_RUN_MAX_ROUND; round += 1) {
+    const info = roundOf.get(round);
+    if (info === undefined) {
+      continue;
+    }
+    if (pendingStepRounds.has(round)) {
+      continue;
+    }
+    if (!terminal && !(roundsStarted.size > 0 && maxRoundStarted > round)) {
+      continue;
+    }
+    const identity = roundIdentity(round);
+    if (identity === null) {
+      ctx.rejected.count += 1;
+      continue;
+    }
+    builder.build({
+      identity,
+      name: 'round',
+      kind: 'CHAIN',
+      startIso: info.startIso,
+      endIso: info.endIso,
+      status: info.errored ?? { code: 'ok', reasonCode: null },
+      attributes: { ...ctx.sharedAttributes },
+      parentSpanId: ctx.rootSpanId,
+      events: [],
+    });
+  }
+}
+
+/** The usage LLM child of an attempt span: only when opencode-db usage was read. */
+function buildUsageSpan(
+  ctx: RunMapperContext,
+  builder: SpanBuilder,
+  attempt: AttemptRecord,
+  attemptBuilt: TelemetrySpan,
+  startIso: string,
+  endIso: string,
+): void {
+  const usage = attempt.usage;
+  if (usage?.source !== 'opencode-db') {
+    return;
+  }
+  const usageInput = telemetryHashInput(attempt.id);
+  const usageIdentityOf = usageInput === null ? null : usageIdentity(usageInput);
+  if (usageIdentityOf === null) {
+    ctx.rejected.count += 1;
+    return;
+  }
+  builder.build({
+    identity: usageIdentityOf,
+    name: 'usage',
+    kind: 'LLM',
+    startIso,
+    endIso,
+    status: { code: 'unset', reasonCode: null },
+    attributes: usageAttributes(attempt, usage),
+    parentSpanId: attemptBuilt.spanId,
+    events: [],
+  });
+}
+
+/** Attempt and usage spans: an attempt's AGENT span under its round, its usage LLM child (plan §3.1). */
+function buildAttemptSpans(
+  ctx: RunMapperContext,
+  builder: SpanBuilder,
+  attempts: readonly AttemptRecord[],
+  groups: readonly KeyGroup[],
+  workOrderDigest: string,
+): void {
+  for (const attempt of attempts) {
+    if (!(TERMINAL_ATTEMPT_STATES as readonly string[]).includes(attempt.state)) {
+      continue;
+    }
+    const attemptInput = telemetryHashInput(attempt.id);
+    if (attemptInput === null) {
+      ctx.rejected.count += 1;
+      continue;
+    }
+    const identity = attemptIdentity(attemptInput);
+    if (identity === null) {
+      ctx.rejected.count += 1;
+      continue;
+    }
+    const dispatch = findDispatchGroup(groups, attempt.id);
+    if (dispatch === null) {
+      continue;
+    }
+    const dispatchFinal = finalResultOf(dispatch.group.results);
+    if (dispatchFinal === null) {
+      continue;
+    }
+    const collect = findCollectGroup(groups, dispatch.round, dispatch.seatIndex);
+    if (collect === null) {
+      continue;
+    }
+    const collectFinal = finalResultOf(collect.results);
+    if (collectFinal === null) {
+      continue;
+    }
+    const roundIdentityOf = roundIdentity(dispatch.round);
+    if (roundIdentityOf === null) {
+      ctx.rejected.count += 1;
+      continue;
+    }
+    const roundSpanId = telemetrySpanId(ctx.hmac, ctx.root, roundIdentityOf);
+    if (roundSpanId === null) {
+      ctx.rejected.count += 1;
+      continue;
+    }
+    if (!builder.spans.some((span) => span.spanId === roundSpanId)) {
+      continue;
+    }
+    const attemptBuilt = builder.build({
+      identity,
+      name: 'attempt',
+      kind: 'AGENT',
+      startIso: dispatchFinal.recordedAtIso,
+      endIso: collectFinal.recordedAtIso,
+      status: { code: 'unset', reasonCode: null },
+      attributes: attemptAttributes(ctx.hmac, attempt, workOrderDigest),
+      parentSpanId: roundSpanId,
+      events: [],
+    });
+    if (attemptBuilt === null) {
+      continue;
+    }
+    buildUsageSpan(ctx, builder, attempt, attemptBuilt, dispatchFinal.recordedAtIso, collectFinal.recordedAtIso);
+  }
+}
+
+/** Stop-request spans: the stop INTENT only, built after the attempt spans (plan §3.1). */
+function buildStopRequestSpans(ctx: RunMapperContext, builder: SpanBuilder, groups: readonly KeyGroup[]): void {
+  const pending: PendingSpan[] = [];
+  for (const group of groups) {
+    const parsed = parseLaneRunKey(group.key);
+    if (parsed?.kind !== 'stop' || group.intent === null) {
+      continue;
+    }
+    const hashInput = telemetryHashInput(group.key);
+    if (hashInput === null) {
+      ctx.rejected.count += 1;
+      continue;
+    }
+    const identity = journalKeyIdentity(hashInput);
+    if (identity === null) {
+      ctx.rejected.count += 1;
+      continue;
+    }
+    const mode = stopModeOfKey(group.key);
+    const attributes: Record<string, unknown> = { ...ctx.sharedAttributes };
+    if (mode !== null) {
+      attributes['fleet.stop.mode'] = mode;
+    }
+    pending.push({
+      identity,
+      name: 'stop-request',
+      kind: 'DECISION',
+      startIso: group.intent.recordedAtIso,
+      endIso: group.intent.recordedAtIso,
+      status: { code: 'unset', reasonCode: null },
+      attributes,
+      parentSpanId: ctx.rootSpanId,
+      events: [],
+    });
+  }
+  for (const span of pending) {
+    builder.build(span);
+  }
+}
+
+/** CI wait spans: a watching-ci conduct entry opens a span ending at the next conduct entry (plan §3.1). */
+function buildCiWaitSpans(
+  ctx: RunMapperContext,
+  builder: SpanBuilder,
+  conduct: readonly LaneRunJournalEntryRecord[],
+): void {
+  for (let index = 0; index < conduct.length; index += 1) {
+    const entry = conduct[index];
+    if (entry.state !== 'watching-ci') {
+      continue;
+    }
+    const next = conduct[index + 1];
+    if (next === undefined) {
+      continue;
+    }
+    const identity = ciWaitIdentity(entry.entryId);
+    if (identity === null) {
+      ctx.rejected.count += 1;
+      continue;
+    }
+    builder.build({
+      identity,
+      name: 'ci-wait',
+      kind: 'CHAIN',
+      startIso: entry.recordedAtIso,
+      endIso: next.recordedAtIso,
+      status: { code: 'unset', reasonCode: null },
+      attributes: { ...ctx.sharedAttributes },
+      parentSpanId: ctx.rootSpanId,
+      events: [],
+    });
+  }
+}
+
+/** Gate receipt spans of a hand-run trace (plan §3.1, §3.4). */
+function buildGateReceiptSpans(
+  ctx: RunMapperContext,
+  builder: SpanBuilder,
+  verification: readonly TelemetryGateReceiptFact[],
+  attemptBuilt: TelemetrySpan,
+): void {
+  for (const receipt of verification) {
+    const identity = verificationReceiptIdentity(receipt.receiptId);
+    if (identity === null) {
+      ctx.rejected.count += 1;
+      continue;
+    }
+    const attributes: Record<string, unknown> = { 'fleet.gate.result': receipt.result };
+    if (receipt.exitCode !== null) {
+      attributes['fleet.gate.exit_code'] = receipt.exitCode;
+    }
+    builder.build({
+      identity,
+      name: 'gate',
+      kind: 'GUARDRAIL',
+      startIso: receipt.completedAtIso,
+      endIso: receipt.completedAtIso,
+      status: { code: 'unset', reasonCode: null },
+      attributes,
+      parentSpanId: attemptBuilt.spanId,
+      events: [],
+    });
+  }
+}
+
+/** Review receipt spans of a hand-run trace (plan §3.1, §3.4). */
+function buildReviewReceiptSpans(
+  ctx: RunMapperContext,
+  builder: SpanBuilder,
+  review: readonly TelemetryReviewReceiptFact[],
+  attemptBuilt: TelemetrySpan,
+): void {
+  for (const receipt of review) {
+    const identity = reviewReceiptIdentity(receipt.receiptId);
+    if (identity === null) {
+      ctx.rejected.count += 1;
+      continue;
+    }
+    builder.build({
+      identity,
+      name: 'review',
+      kind: 'EVALUATOR',
+      startIso: receipt.completedAtIso,
+      endIso: receipt.completedAtIso,
+      status: { code: 'unset', reasonCode: null },
+      attributes: {
+        'fleet.review.kind': receipt.kind,
+        'fleet.review.result': receipt.result,
+        'fleet.review.findings.blocker': receipt.findings.blocker,
+        'fleet.review.findings.major': receipt.findings.major,
+        'fleet.review.findings.minor': receipt.findings.minor,
+        'fleet.review.findings.nit': receipt.findings.nit,
+      },
+      parentSpanId: attemptBuilt.spanId,
+      events: [],
+    });
+  }
+}
+
 /**
  * Map a conducted run to its closed telemetry spans (plan §3.1). Never throws;
  * a span whose identity, ids or build fails is counted in `rejectedInvalid`.
  */
 export function laneRunSpans(hmac: TelemetryHmac, facts: LaneRunTelemetryFacts): LaneRunSpansResult {
   try {
-    const root: TelemetryTraceRoot | null = runTraceRoot(facts.run?.runId);
+    const root: TelemetryTraceRoot | null = runTraceRoot(facts.run.runId);
     if (root === null) {
       return { spans: [], rejectedInvalid: 1 };
     }
@@ -264,446 +898,36 @@ export function laneRunSpans(hmac: TelemetryHmac, facts: LaneRunTelemetryFacts):
       return { spans: [], rejectedInvalid: 1 };
     }
 
-    // The journal scoped to this run (plan §3.1): step and stop keys whose
-    // parsed runId is this run's, and this run's conduct entries with a state.
-    // Request and reaper keys never belong to a run's trace; a conduct entry
-    // without a state is skipped, as `laneRunJournalState` does. The root's
-    // start comes from the first entry that survives this filter.
-    const runId = facts.run.runId;
-    const journal = facts.journal.filter((entry) => {
-      if (entry.kind === 'conduct') {
-        return entry.runId === runId && entry.state !== null;
-      }
-      if (entry.kind !== 'intent' && entry.kind !== 'result') {
-        return false;
-      }
-      if (entry.key === null) {
-        return false;
-      }
-      const parsed = parseLaneRunKey(entry.key);
-      if (parsed === null || (parsed.kind !== 'step' && parsed.kind !== 'stop')) {
-        return false;
-      }
-      return parsed.runId === runId;
-    });
-
     // session.id and fleet.work_order.digest go on every span of the run's
     // work order (plan §3.1, §3.2): both are the work order's salted digest.
-    const sharedAttributes: Record<string, unknown> = {
-      'session.id': workOrderDigest,
-      'fleet.work_order.digest': workOrderDigest,
+    const builder = createSpanBuilder(hmac, root, traceId, 'lane-run');
+    const ctx: RunMapperContext = {
+      hmac,
+      root,
+      traceId,
+      rootSpanId,
+      sharedAttributes: {
+        'session.id': workOrderDigest,
+        'fleet.work_order.digest': workOrderDigest,
+      },
+      rejected: builder.rejected,
     };
 
-    // The keyed journal: one group per key, intents and results in journal order.
-    const groups: KeyGroup[] = [];
-    const byKey = new Map<string, KeyGroup>();
-    for (const entry of journal) {
-      if ((entry.kind !== 'intent' && entry.kind !== 'result') || entry.key === null) {
-        continue;
-      }
-      let group = byKey.get(entry.key);
-      if (group === undefined) {
-        group = { key: entry.key, intent: null, results: [], ambiguous: 0 };
-        byKey.set(entry.key, group);
-        groups.push(group);
-      }
-      if (entry.kind === 'intent') {
-        // A key carries one intent; a second one (which the journal refuses)
-        // never replaces the first, so a prefix and the full journal agree.
-        if (group.intent === null) {
-          group.intent = entry;
-        }
-      } else if (entry.outcome === 'ambiguous') {
-        group.ambiguous += 1;
-      } else {
-        group.results.push(entry);
-      }
-    }
+    const journal = scopeJournal(facts);
+    const groups = groupStepEntries(journal);
+    const conduct = conductEntries(journal);
+    const lastConduct = conduct.at(-1) ?? null;
+    const terminal = isTerminal(lastConduct);
+    const { roundsStarted, maxRoundStarted } = roundStartInfo(journal);
 
-    // The rounds an intent has started: a round span closes once any later
-    // round has started or the run is terminal (plan §3.1).
-    const roundsStarted = new Set<number>();
-    for (const entry of journal) {
-      if (entry.kind !== 'intent' || entry.key === null) {
-        continue;
-      }
-      const parsed = parseLaneRunKey(entry.key);
-      if (parsed !== null && parsed.kind === 'step') {
-        roundsStarted.add(parsed.round);
-      }
-    }
-    const maxRoundStarted = roundsStarted.size > 0 ? Math.max(...roundsStarted) : -1;
-    const conduct = journal.filter((entry) => entry.kind === 'conduct');
-    const lastConduct = conduct.length > 0 ? conduct[conduct.length - 1] : null;
-    const terminal =
-      lastConduct !== null &&
-      lastConduct.state !== null &&
-      (LANE_RUN_TERMINAL_STATES as readonly string[]).includes(lastConduct.state);
+    const steps = buildStepSpans(ctx, builder, groups);
+    buildRootSpan(ctx, builder, facts, journal, conduct, lastConduct, terminal);
+    buildRoundSpans(ctx, builder, steps.roundOf, steps.pendingStepRounds, terminal, roundsStarted, maxRoundStarted);
+    buildAttemptSpans(ctx, builder, facts.attempts, groups, workOrderDigest);
+    buildStopRequestSpans(ctx, builder, groups);
+    buildCiWaitSpans(ctx, builder, conduct);
 
-    // Build helper: a span whose ids, parent or build fail is dropped and
-    // counted; a non-root span is never emitted without a parent span id.
-    const spans: TelemetrySpan[] = [];
-    const rejected = { count: 0 };
-    const build = (span: PendingSpan): TelemetrySpan | null => {
-      const spanId = telemetrySpanId(hmac, root, span.identity);
-      if (spanId === null) {
-        rejected.count += 1;
-        return null;
-      }
-      if (span.parentSpanId === null && span.name !== 'lane-run') {
-        rejected.count += 1;
-        return null;
-      }
-      const built = TelemetrySpan.build({
-        traceId,
-        spanId,
-        parentSpanId: span.parentSpanId,
-        name: span.name,
-        kind: span.kind,
-        startIso: span.startIso,
-        endIso: span.endIso,
-        status: span.status,
-        attributes: span.attributes,
-        events: span.events,
-      });
-      if (built === null) {
-        rejected.count += 1;
-        return null;
-      }
-      spans.push(built);
-      return built;
-    };
-
-    // The keyed step spans (and the stop requests), built as they are mapped;
-    // a round's aggregate is updated only from steps that built.
-    const pending: PendingSpan[] = [];
-    const roundOf = new Map<number, { startIso: string; endIso: string; errored: TelemetrySpanStatus | null }>();
-    const pendingStepRounds = new Set<number>();
-
-    for (const group of groups) {
-      const parsed = parseLaneRunKey(group.key);
-      if (parsed === null || group.intent === null) {
-        continue;
-      }
-      const hashInput = telemetryHashInput(group.key);
-      if (hashInput === null) {
-        rejected.count += 1;
-        continue;
-      }
-      if (parsed.kind === 'step') {
-        const underRound = (ROUND_STEPS as readonly string[]).includes(parsed.step);
-        const final = finalResultOf(group.results);
-        if (final === null) {
-          // Only a round-parented step holds its round open: an unfinalized
-          // root-parented key (accept, open-pr, push, merge, park) can never
-          // withhold a completed round span.
-          if (underRound) {
-            pendingStepRounds.add(parsed.round);
-          }
-          continue;
-        }
-        const identity = journalKeyIdentity(hashInput);
-        if (identity === null) {
-          rejected.count += 1;
-          continue;
-        }
-        const attributes: Record<string, unknown> = {
-          'fleet.step': parsed.step,
-          'fleet.round': parsed.round,
-          ...sharedAttributes,
-        };
-        if (final.reasonCode !== null) {
-          attributes['fleet.reason_code'] = final.reasonCode;
-        }
-        if (group.ambiguous > 0) {
-          attributes['fleet.ambiguous_results'] = group.ambiguous;
-        }
-        const status = statusOfResult(final);
-        const roundIdentityOf = underRound ? roundIdentity(parsed.round) : null;
-        if (underRound && roundIdentityOf === null) {
-          rejected.count += 1;
-          continue;
-        }
-        const parentSpanId = underRound ? telemetrySpanId(hmac, root, roundIdentityOf!) : rootSpanId;
-        const built = build({
-          identity,
-          name: parsed.step,
-          kind: STEP_SPAN_KINDS[parsed.step],
-          startIso: group.intent.recordedAtIso,
-          endIso: final.recordedAtIso,
-          status,
-          attributes,
-          parentSpanId,
-          events: [],
-        });
-        if (built === null || !underRound) {
-          continue;
-        }
-        const info = roundOf.get(parsed.round);
-        if (info === undefined) {
-          roundOf.set(parsed.round, {
-            startIso: group.intent.recordedAtIso,
-            endIso: final.recordedAtIso,
-            errored: status.code === 'error' ? status : null,
-          });
-        } else {
-          if (Date.parse(group.intent.recordedAtIso) < Date.parse(info.startIso)) {
-            info.startIso = group.intent.recordedAtIso;
-          }
-          if (Date.parse(final.recordedAtIso) > Date.parse(info.endIso)) {
-            info.endIso = final.recordedAtIso;
-          }
-          if (status.code === 'error') {
-            info.errored = status;
-          }
-        }
-      } else if (parsed.kind === 'stop') {
-        const identity = journalKeyIdentity(hashInput);
-        if (identity === null) {
-          rejected.count += 1;
-          continue;
-        }
-        const mode = stopModeOfKey(group.key);
-        const attributes: Record<string, unknown> = { ...sharedAttributes };
-        if (mode !== null) {
-          attributes['fleet.stop.mode'] = mode;
-        }
-        // The stop request is the stop INTENT only: it never reads a stop
-        // result, so a prefix (intent) and the full journal (intent + any
-        // result, whatever its outcome) map to the identical span.
-        pending.push({
-          identity,
-          name: 'stop-request',
-          kind: 'DECISION',
-          startIso: group.intent.recordedAtIso,
-          endIso: group.intent.recordedAtIso,
-          status: { code: 'unset', reasonCode: null },
-          attributes,
-          parentSpanId: rootSpanId,
-          events: [],
-        });
-      }
-    }
-
-    // Root: only when the run is terminal (D2). Times and events come from the
-    // record: the first surviving journal entry's start, the terminal conduct
-    // entry's end.
-    if (terminal && lastConduct !== null && lastConduct.state !== null && journal.length > 0) {
-      const allEvents: TelemetrySpanEvent[] = [];
-      for (const entry of conduct) {
-        if (entry.state === null) {
-          continue;
-        }
-        allEvents.push({ name: 'state.entered', timeIso: entry.recordedAtIso, state: entry.state });
-      }
-      const events =
-        allEvents.length > TELEMETRY_MAX_EVENTS
-          ? allEvents.slice(allEvents.length - TELEMETRY_MAX_EVENTS)
-          : allEvents;
-      const attributes: Record<string, unknown> = {
-        'fleet.run.id': facts.run.runId,
-        'fleet.tier': facts.run.tier,
-        ...sharedAttributes,
-      };
-      if (facts.tags.length > 0) {
-        attributes['tag.tags'] = facts.tags.slice();
-      }
-      if (facts.project !== null) {
-        attributes['fleet.project'] = facts.project;
-      }
-      build({
-        identity: runRootIdentity(),
-        name: 'lane-run',
-        kind: 'CHAIN',
-        startIso: journal[0].recordedAtIso,
-        endIso: lastConduct.recordedAtIso,
-        status:
-          lastConduct.state === 'merged'
-            ? { code: 'ok', reasonCode: null }
-            : { code: 'unset', reasonCode: 'stopped' },
-        attributes,
-        parentSpanId: null,
-        events,
-      });
-    }
-
-    // Round spans: one per round with at least one built step span, withheld
-    // while any round-step intent in it still lacks a final result, emitted
-    // only once any later round has started or the run is terminal.
-    for (let round = 0; round <= LANE_RUN_MAX_ROUND; round += 1) {
-      const info = roundOf.get(round);
-      if (info === undefined) {
-        continue;
-      }
-      if (pendingStepRounds.has(round)) {
-        continue;
-      }
-      if (!terminal && !(roundsStarted.size > 0 && maxRoundStarted > round)) {
-        continue;
-      }
-      const identity = roundIdentity(round);
-      if (identity === null) {
-        rejected.count += 1;
-        continue;
-      }
-      build({
-        identity,
-        name: 'round',
-        kind: 'CHAIN',
-        startIso: info.startIso,
-        endIso: info.endIso,
-        status: info.errored ?? { code: 'ok', reasonCode: null },
-        attributes: { ...sharedAttributes },
-        parentSpanId: rootSpanId,
-        events: [],
-      });
-    }
-
-    // Attempt and usage spans (plan §3.1): an attempt's AGENT span runs from
-    // its dispatch step's final result to its collect step's final result,
-    // hangs under the round span of its dispatch key, and is emitted only once
-    // the attempt is terminal; its usage LLM child only when opencode-db usage
-    // was read. Ids come from the §3.4 table; the round span must already be
-    // emitted, so a child never precedes its parent.
-    for (const attempt of facts.attempts) {
-      if (!(TERMINAL_ATTEMPT_STATES as readonly string[]).includes(attempt.state)) {
-        continue;
-      }
-      const attemptInput = telemetryHashInput(attempt.id);
-      if (attemptInput === null) {
-        rejected.count += 1;
-        continue;
-      }
-      const identity = attemptIdentity(attemptInput);
-      if (identity === null) {
-        rejected.count += 1;
-        continue;
-      }
-      let dispatchGroup: KeyGroup | null = null;
-      let round = 0;
-      let seatIndex = 0;
-      for (const group of groups) {
-        const parsed = parseLaneRunKey(group.key);
-        if (parsed === null || parsed.kind !== 'step' || parsed.step !== 'dispatch') {
-          continue;
-        }
-        if (group.intent !== null && group.intent.mintedId === attempt.id) {
-          dispatchGroup = group;
-          round = parsed.round;
-          seatIndex = parsed.seatIndex;
-          break;
-        }
-      }
-      if (dispatchGroup === null) {
-        continue;
-      }
-      const dispatchFinal = finalResultOf(dispatchGroup.results);
-      if (dispatchFinal === null) {
-        continue;
-      }
-      let collectGroup: KeyGroup | null = null;
-      for (const group of groups) {
-        const parsed = parseLaneRunKey(group.key);
-        if (parsed === null || parsed.kind !== 'step' || parsed.step !== 'collect') {
-          continue;
-        }
-        if (parsed.round === round && parsed.seatIndex === seatIndex) {
-          collectGroup = group;
-          break;
-        }
-      }
-      if (collectGroup === null) {
-        continue;
-      }
-      const collectFinal = finalResultOf(collectGroup.results);
-      if (collectFinal === null) {
-        continue;
-      }
-      const roundIdentityOf = roundIdentity(round);
-      if (roundIdentityOf === null) {
-        rejected.count += 1;
-        continue;
-      }
-      const roundSpanId = telemetrySpanId(hmac, root, roundIdentityOf);
-      if (roundSpanId === null) {
-        // The parent id could not be built: drop and count, never half-built.
-        rejected.count += 1;
-        continue;
-      }
-      if (!spans.some((span) => span.spanId === roundSpanId)) {
-        // The round span is not closed yet; the attempt waits for it.
-        continue;
-      }
-      const attemptBuilt = build({
-        identity,
-        name: 'attempt',
-        kind: 'AGENT',
-        startIso: dispatchFinal.recordedAtIso,
-        endIso: collectFinal.recordedAtIso,
-        status: { code: 'unset', reasonCode: null },
-        attributes: attemptAttributes(hmac, attempt, workOrderDigest),
-        parentSpanId: roundSpanId,
-        events: [],
-      });
-      if (attemptBuilt === null) {
-        continue;
-      }
-      const usage = attempt.usage;
-      if (usage !== null && usage !== undefined && usage.source === 'opencode-db') {
-        const usageInput = telemetryHashInput(attempt.id);
-        const usageIdentityOf = usageInput === null ? null : usageIdentity(usageInput);
-        if (usageIdentityOf === null) {
-          rejected.count += 1;
-        } else {
-          build({
-            identity: usageIdentityOf,
-            name: 'usage',
-            kind: 'LLM',
-            startIso: dispatchFinal.recordedAtIso,
-            endIso: collectFinal.recordedAtIso,
-            status: { code: 'unset', reasonCode: null },
-            attributes: usageAttributes(attempt, usage),
-            parentSpanId: attemptBuilt.spanId,
-            events: [],
-          });
-        }
-      }
-    }
-
-    for (const span of pending) {
-      build(span);
-    }
-
-    // CI wait: a watching-ci conduct entry opens a span ending at the next
-    // conduct entry, emitted only once that next entry exists (plan §3.1).
-    for (let index = 0; index < conduct.length; index += 1) {
-      const entry = conduct[index];
-      if (entry.state !== 'watching-ci') {
-        continue;
-      }
-      const next = conduct[index + 1];
-      if (next === undefined) {
-        continue;
-      }
-      const identity = ciWaitIdentity(entry.entryId);
-      if (identity === null) {
-        rejected.count += 1;
-        continue;
-      }
-      build({
-        identity,
-        name: 'ci-wait',
-        kind: 'CHAIN',
-        startIso: entry.recordedAtIso,
-        endIso: next.recordedAtIso,
-        status: { code: 'unset', reasonCode: null },
-        attributes: { ...sharedAttributes },
-        parentSpanId: rootSpanId,
-        events: [],
-      });
-    }
-
-    return { spans, rejectedInvalid: rejected.count };
+    return { spans: builder.spans, rejectedInvalid: builder.rejected.count };
   } catch {
     return { spans: [], rejectedInvalid: 1 };
   }
@@ -760,40 +984,17 @@ export function attemptTraceSpans(hmac: TelemetryHmac, facts: AttemptTraceTeleme
         ? facts.attempt.completionReceipt.endedAtIso
         : facts.attempt.updatedAtIso;
 
-    const spans: TelemetrySpan[] = [];
-    const rejected = { count: 0 };
-    const build = (span: PendingSpan): TelemetrySpan | null => {
-      const spanId = telemetrySpanId(hmac, root, span.identity);
-      if (spanId === null) {
-        rejected.count += 1;
-        return null;
-      }
-      // The attempt span is this trace's root; every other span needs a parent.
-      if (span.parentSpanId === null && span.name !== 'attempt') {
-        rejected.count += 1;
-        return null;
-      }
-      const built = TelemetrySpan.build({
-        traceId,
-        spanId,
-        parentSpanId: span.parentSpanId,
-        name: span.name,
-        kind: span.kind,
-        startIso: span.startIso,
-        endIso: span.endIso,
-        status: span.status,
-        attributes: span.attributes,
-        events: span.events,
-      });
-      if (built === null) {
-        rejected.count += 1;
-        return null;
-      }
-      spans.push(built);
-      return built;
+    const builder = createSpanBuilder(hmac, root, traceId, 'attempt');
+    const ctx: RunMapperContext = {
+      hmac,
+      root,
+      traceId,
+      rootSpanId: attemptSpanId,
+      sharedAttributes: {},
+      rejected: builder.rejected,
     };
 
-    const attemptBuilt = build({
+    const attemptBuilt = builder.build({
       identity,
       name: 'attempt',
       kind: 'AGENT',
@@ -805,80 +1006,14 @@ export function attemptTraceSpans(hmac: TelemetryHmac, facts: AttemptTraceTeleme
       events: [],
     });
     if (attemptBuilt === null) {
-      return { spans, rejectedInvalid: rejected.count };
+      return { spans: builder.spans, rejectedInvalid: builder.rejected.count };
     }
 
-    const usage = facts.attempt.usage;
-    if (usage !== null && usage !== undefined && usage.source === 'opencode-db') {
-      const usageInput = telemetryHashInput(facts.attempt.id);
-      const usageIdentityOf = usageInput === null ? null : usageIdentity(usageInput);
-      if (usageIdentityOf === null) {
-        rejected.count += 1;
-      } else {
-        build({
-          identity: usageIdentityOf,
-          name: 'usage',
-          kind: 'LLM',
-          startIso,
-          endIso,
-          status: { code: 'unset', reasonCode: null },
-          attributes: usageAttributes(facts.attempt, usage),
-          parentSpanId: attemptBuilt.spanId,
-          events: [],
-        });
-      }
-    }
+    buildUsageSpan(ctx, builder, facts.attempt, attemptBuilt, startIso, endIso);
+    buildGateReceiptSpans(ctx, builder, facts.receipts.verification, attemptBuilt);
+    buildReviewReceiptSpans(ctx, builder, facts.receipts.review, attemptBuilt);
 
-    for (const receipt of facts.receipts.verification) {
-      const receiptIdentity = verificationReceiptIdentity(receipt.receiptId);
-      if (receiptIdentity === null) {
-        rejected.count += 1;
-        continue;
-      }
-      const attributes: Record<string, unknown> = { 'fleet.gate.result': receipt.result };
-      if (receipt.exitCode !== null) {
-        attributes['fleet.gate.exit_code'] = receipt.exitCode;
-      }
-      build({
-        identity: receiptIdentity,
-        name: 'gate',
-        kind: 'GUARDRAIL',
-        startIso: receipt.completedAtIso,
-        endIso: receipt.completedAtIso,
-        status: { code: 'unset', reasonCode: null },
-        attributes,
-        parentSpanId: attemptBuilt.spanId,
-        events: [],
-      });
-    }
-
-    for (const receipt of facts.receipts.review) {
-      const receiptIdentity = reviewReceiptIdentity(receipt.receiptId);
-      if (receiptIdentity === null) {
-        rejected.count += 1;
-        continue;
-      }
-      build({
-        identity: receiptIdentity,
-        name: 'review',
-        kind: 'EVALUATOR',
-        startIso: receipt.completedAtIso,
-        endIso: receipt.completedAtIso,
-        status: { code: 'unset', reasonCode: null },
-        attributes: {
-          'fleet.review.kind': receipt.kind,
-          'fleet.review.result': receipt.result,
-          'fleet.review.findings.blocker': receipt.findings.blocker,
-          'fleet.review.findings.major': receipt.findings.major,
-          'fleet.review.findings.minor': receipt.findings.minor,
-          'fleet.review.findings.nit': receipt.findings.nit,
-        },
-        parentSpanId: attemptBuilt.spanId,
-        events: [],
-      });
-    }
-
-    return { spans, rejectedInvalid: rejected.count };
+    return { spans: builder.spans, rejectedInvalid: builder.rejected.count };
   } catch {
     return { spans: [], rejectedInvalid: 1 };
   }

@@ -53,8 +53,13 @@ const FINDING_ID = '01JE0000000000000000000000';
 const HEAD12 = '0123456789ab';
 const WORK_ORDER_ID = 'work-order-example-1';
 const ATTEMPT_ID = 'attempt-example-1';
-const SESSION_DIGEST = telemetryDigest(hmac, 'work-order', asInput(WORK_ORDER_ID));
-expect(SESSION_DIGEST).not.toBeNull();
+function sessionDigestOf(text: string): string {
+  const digest = telemetryDigest(hmac, 'work-order', asInput(text));
+  expect(digest).not.toBeNull();
+  return digest as string;
+}
+
+const SESSION_DIGEST = sessionDigestOf(WORK_ORDER_ID);
 
 function asInput(text: string): TelemetryHashInput {
   const token = telemetryHashInput(text);
@@ -89,19 +94,31 @@ const ACCEPT_KEY = stepKey('accept', '');
 const OPEN_PR_KEY = stepKey('open-pr', '');
 const PUSH_KEY = stepKey('push', '');
 const MERGE_KEY = stepKey('merge', '');
-const STOP_KEY_RESULT = laneRunStopKey(RUN_ID, 'web');
-expect(STOP_KEY_RESULT.ok).toBe(true);
-const STOP_KEY = STOP_KEY_RESULT.ok ? STOP_KEY_RESULT.key : '';
-const STOP_KEY2_RESULT = laneRunStopKey(RUN_ID2, 'web');
-expect(STOP_KEY2_RESULT.ok).toBe(true);
-const STOP_KEY2 = STOP_KEY2_RESULT.ok ? STOP_KEY2_RESULT.key : '';
+function stopKeyOf(runId: string): string {
+  const result = laneRunStopKey(runId, 'web');
+  expect(result.ok).toBe(true);
+  return result.ok ? result.key : '';
+}
+
+const STOP_KEY = stopKeyOf(RUN_ID);
+const STOP_KEY2 = stopKeyOf(RUN_ID2);
 const PREPARE_KEY2 = stepKey('prepare', '', 0, RUN_ID2);
-const REQUEST_KEY_RESULT = requestKey(REQUEST_ID);
-expect(REQUEST_KEY_RESULT.ok).toBe(true);
-const REQUEST_KEY = REQUEST_KEY_RESULT.ok ? REQUEST_KEY_RESULT.key : '';
-const REAPER_KEY_RESULT = reaperRepairKey('wt-000000000000', 'orphan-session', FINDING_ID);
-expect(REAPER_KEY_RESULT.ok).toBe(true);
-const REAPER_KEY = REAPER_KEY_RESULT.ok ? REAPER_KEY_RESULT.key : '';
+
+function requestKeyOf(id: string): string {
+  const result = requestKey(id);
+  expect(result.ok).toBe(true);
+  return result.ok ? result.key : '';
+}
+
+const REQUEST_KEY = requestKeyOf(REQUEST_ID);
+
+function reaperKeyOf(subjectId: string, findingId: string): string {
+  const result = reaperRepairKey(subjectId, 'orphan-session', findingId);
+  expect(result.ok).toBe(true);
+  return result.ok ? result.key : '';
+}
+
+const REAPER_KEY = reaperKeyOf('wt-000000000000', FINDING_ID);
 const OTHER_RUN_KEYS = [PREPARE_KEY2, STOP_KEY2, REQUEST_KEY, REAPER_KEY];
 
 function time(second: number): string {
@@ -529,7 +546,7 @@ describe('laneRunSpans (OT1b-1)', () => {
     const result = laneRunSpans(hmac, factsOf(journal));
     expect(spanNamed(result.spans, 'lane-run')).toBeUndefined();
     const roundSpans = result.spans.filter((span) => span.name === 'round');
-    expect(roundSpans.length).toBe(1);
+    expect(roundSpans).toHaveLength(1);
     expect((roundSpans[0] as { startIso: string }).startIso).toBe(time(1));
     expect((roundSpans[0] as { endIso: string }).endIso).toBe(time(2));
   });

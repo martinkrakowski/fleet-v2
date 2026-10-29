@@ -16,6 +16,9 @@
 #                             before the second poll is never seen active and
 #                             ocm-run would wait OCM_START_MAX and abort it, so
 #                             the busy window must outlast the first polls.
+#   FAKE_OPENCODE_LANE_SCRIPT — when set to a path, run it with `sh` in the
+#                             client's cwd (the worktree) after the flip and
+#                             before ending (Q1c: a lane that commits).
 #
 # It parses `run --server <url> -s <id>`, stays alive until TERM, and exits 9
 # for any other invocation. Plain and dependency-free (the flip uses Node's
@@ -41,16 +44,30 @@ sleep 0.5
 if [ "${FAKE_OPENCODE_FLIP:-0}" = 1 ]; then
   node -e 'fetch(process.argv[1] + "/__start/" + process.argv[2], { method: "POST" }).catch(() => {})' "$url" "$sid" >/dev/null 2>&1
 fi
+# Every long child (the lane script, the busy sleep) runs through run_child so
+# a TERM to this pid ends the child too and the fixture never leaves one behind.
+child=''
+run_child() {
+  "$@" &
+  child=$!
+  wait "$child"
+  rc=$?
+  child=''
+  return "$rc"
+}
+trap 'if [ -n "$child" ]; then kill "$child" 2>/dev/null; fi; exit 143' TERM
+if [ -n "${FAKE_OPENCODE_LANE_SCRIPT:-}" ]; then
+  run_child sh "$FAKE_OPENCODE_LANE_SCRIPT"
+fi
 if [ "${FAKE_OPENCODE_END:-0}" = 1 ]; then
   # Stay busy long enough for every 1 s readiness poll to see the session:
   # ending right after the flip would make ocm-run --detach never see it
   # active and abort it after OCM_START_MAX.
   end_after=${FAKE_OPENCODE_END_AFTER_SECONDS:-3}
-  sleep "$end_after"
+  run_child sleep "$end_after"
   node -e 'fetch(process.argv[1] + "/__end/" + process.argv[2], { method: "POST" }).catch(() => {})' "$url" "$sid" >/dev/null 2>&1
   exit 0
 fi
-trap 'exit 143' TERM
 i=0
 while [ "$i" -lt 200 ]; do
   sleep 0.1

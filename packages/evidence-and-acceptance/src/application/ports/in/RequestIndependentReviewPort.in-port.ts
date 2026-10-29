@@ -20,6 +20,8 @@ export interface RequestIndependentReviewRequest {
   readonly kind?: ReviewKind;
   /** The conductor's request id (§3.2, §3.5); a replay returns the receipt already recorded for it. */
   readonly requestId?: string;
+  /** The frozen brief; only meaningful with `kind` (a brief-check review answers against it). */
+  readonly briefText?: string;
 }
 
 export const REVIEW_REJECTIONS = [

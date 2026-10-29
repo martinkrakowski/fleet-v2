@@ -28,7 +28,7 @@ export interface ForgeReadAdapterOptions {
 
 /** Always ask for state and head: `--json number` alone is answered without the forge. */
 export const PULL_REQUEST_VIEW_FIELDS =
-  'number,state,headRefOid,headRefName,baseRefName,mergedAt,closedAt,mergeCommit';
+  'number,state,headRefOid,headRefName,baseRefName,mergedAt,closedAt,mergeCommit,mergeStateStatus';
 
 const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+$/;
 const HEX_40 = /^[0-9a-f]{40}$/;
@@ -70,6 +70,14 @@ function parseState(value: unknown): PullRequestSnapshot['state'] | null {
   if (value === 'MERGED') return 'merged';
   if (value === 'CLOSED') return 'closed';
   return null;
+}
+
+/** CLEAN → clean, BEHIND → behind, BLOCKED/DIRTY/UNSTABLE → blocked, anything else or absent → unknown. */
+export function parseMergeStateStatus(value: unknown): PullRequestSnapshot['mergeState'] {
+  if (value === 'CLEAN') return 'clean';
+  if (value === 'BEHIND') return 'behind';
+  if (value === 'BLOCKED' || value === 'DIRTY' || value === 'UNSTABLE') return 'blocked';
+  return 'unknown';
 }
 
 function parseHex40(value: unknown): string | null {
@@ -116,6 +124,7 @@ export function parsePullRequestView(stdout: string, ref: PullRequestRef): ReadP
   const mergedAtIso = parseTimestamp(record.mergedAt);
   const closedAtIso = parseTimestamp(record.closedAt);
   const mergeCommitSha = parseMergeCommit(record.mergeCommit);
+  const mergeState = parseMergeStateStatus(record.mergeStateStatus);
   if (
     number === null ||
     state === null ||
@@ -140,6 +149,7 @@ export function parsePullRequestView(stdout: string, ref: PullRequestRef): ReadP
   const pullRequest: PullRequestSnapshot = {
     number,
     state,
+    mergeState,
     headSha,
     headRef,
     baseRef,

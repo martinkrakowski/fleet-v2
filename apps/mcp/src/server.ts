@@ -30,7 +30,7 @@ export async function startServer(): Promise<void> {
         inputSchema: tool.inputSchema,
         annotations: tool.annotations,
       },
-      async () => tool.handler(),
+      async (args: unknown) => tool.handler(args),
     );
   }
   for (const resource of registry.resources) {

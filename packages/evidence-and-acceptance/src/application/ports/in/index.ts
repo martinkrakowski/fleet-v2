@@ -3,6 +3,7 @@
 export * from "./AssessHeadAcceptancePort.in-port.js";
 export * from "./InspectAcceptanceEvidencePort.in-port.js";
 export * from "./InspectHeadCiStatePort.in-port.js";
+export * from "./OpenEvidenceAssessmentPort.in-port.js";
 export * from "./RecordFindingDispositionPort.in-port.js";
 export * from "./RecordReviewReceiptPort.in-port.js";
 export * from "./RecordVerificationReceiptPort.in-port.js";

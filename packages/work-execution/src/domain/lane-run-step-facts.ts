@@ -25,7 +25,12 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'stop-timeout', 'stop-force', 'stop-force-slot-held', 'stop-unconfirmed', 'stop-confirmed',
   'collected', 'collect-refused', 'edit-only-refused', 'edit-only-unknown', 'no-completion-receipt',
   'gate-passed', 'gate-failed', 'gate-unknown', 'reconciled',
+  'review-passed', 'review-failed', 'review-no-receipt', 'review-refused', 'review-unknown',
+  'assessment-unavailable', 'review-seat-unavailable',
   'resumed', 'run-stopped', 'stale-revision', 'not-parked', 'stop-pending', 'one-way-door',
+  'accepted', 'acceptance-rejected', 'acceptance-unknown', 'pr-opened',
+  'pushed', 'forge-refused', 'forge-ambiguous', 'grant-refused', 'merged', 'merge-not-merged', 'merge-waiting',
+  'merge-off', 'notice-recorded', 'notice-refused',
 ] as const;
 export type LaneRunResultReasonCode = (typeof LANE_RUN_RESULT_REASON_CODES)[number];
 

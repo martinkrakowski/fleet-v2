@@ -129,7 +129,7 @@ export function emptyTelemetryDispositionRecord(): TelemetryDispositionRecord {
   });
 }
 
-export type TelemetryDispositionRead =
+export type TelemetryDispositionRecordRead =
   | { readonly ok: true; readonly record: TelemetryDispositionRecord }
   | { readonly ok: false };
 

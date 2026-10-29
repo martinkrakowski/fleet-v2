@@ -274,22 +274,52 @@ function parseDeadline(value: unknown): { ok: true; deadline: RunTelemetrySendDe
  * every span stays pending (fail closed, never throws).
  */
 function parseSendResult(sent: unknown): RunTelemetrySendResult | null {
-  if (!isPlainObject(sent) || !Array.isArray(sent.dispositions)) {
-    return null;
-  }
-  const errorKind = sent.errorKind;
-  if (
-    errorKind !== null &&
-    !(typeof errorKind === 'string' && (TELEMETRY_ERROR_KINDS as readonly string[]).includes(errorKind))
-  ) {
-    return null;
-  }
-  for (const entry of sent.dispositions) {
-    if (!isPlainObject(entry) || typeof entry.spanId !== 'string' || spanDispositionText(entry.disposition) === null) {
+  // Every field is read through its own data descriptor (an accessor never
+  // runs), the dispositions are copied by index into fresh objects, and any
+  // throw (a revoked proxy, a hostile descriptor) reads as null: never throws.
+  try {
+    if (!isPlainObject(sent)) {
       return null;
     }
+    const dispositionsField = ownDataField(sent, 'dispositions');
+    const errorKindField = ownDataField(sent, 'errorKind');
+    if (!dispositionsField.ok || !errorKindField.ok || !Array.isArray(dispositionsField.value)) {
+      return null;
+    }
+    const errorKind = errorKindField.value;
+    if (
+      errorKind !== null &&
+      !(typeof errorKind === 'string' && (TELEMETRY_ERROR_KINDS as readonly string[]).includes(errorKind))
+    ) {
+      return null;
+    }
+    const list = dispositionsField.value as unknown[];
+    const lengthField = ownDataField(list as unknown as Record<string, unknown>, 'length');
+    if (!lengthField.ok || typeof lengthField.value !== 'number' || !Number.isSafeInteger(lengthField.value)) {
+      return null;
+    }
+    const dispositions: { spanId: string; disposition: SpanDisposition }[] = [];
+    for (let index = 0; index < lengthField.value; index += 1) {
+      const entryField = ownDataField(list as unknown as Record<string, unknown>, String(index));
+      if (!entryField.ok || !isPlainObject(entryField.value)) {
+        return null;
+      }
+      const spanIdField = ownDataField(entryField.value, 'spanId');
+      const dispositionField = ownDataField(entryField.value, 'disposition');
+      if (!spanIdField.ok || !dispositionField.ok || typeof spanIdField.value !== 'string') {
+        return null;
+      }
+      // A plain-data copy of the disposition, validated after copying.
+      const copied: unknown = JSON.parse(JSON.stringify(dispositionField.value));
+      if (spanDispositionText(copied as SpanDisposition) === null) {
+        return null;
+      }
+      dispositions.push({ spanId: spanIdField.value, disposition: copied as SpanDisposition });
+    }
+    return { dispositions, errorKind: errorKind as TelemetryErrorKind | null };
+  } catch {
+    return null;
   }
-  return { dispositions: sent.dispositions, errorKind: errorKind as TelemetryErrorKind | null };
 }
 
 interface ParsedRequest {
@@ -420,7 +450,17 @@ export class ExportRunTelemetryUseCase implements ExportRunTelemetryPort {
     if (!this.deps) {
       throw new Error('Not implemented: ExportRunTelemetryUseCase');
     }
-    const deps = this.deps;
+    // Never rejects once wired (Argon, OT2c-2): anything that escapes the
+    // steps below (a revoked proxy as the request, a hostile port result) is
+    // an invalid-request refusal, and nothing more is written.
+    try {
+      return await this.executeWired(this.deps, request);
+    } catch {
+      return { outcome: 'refused', reason: 'invalid-request', counts: zeroCounts(), counters: {} };
+    }
+  }
+
+  private async executeWired(deps: ExportRunTelemetryDependencies, request: unknown): Promise<ExportRunTelemetryResult> {
     const counts = zeroCounts();
 
     // Step 3: validate the request; anything unknown is refused before any read.

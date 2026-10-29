@@ -273,11 +273,16 @@ class FakeTelemetry implements Pick<RunTelemetryPort, 'send'> {
   probe: (() => TelemetryDispositionRecord | null) | null = null;
   storeAtSend: Array<TelemetryDispositionRecord | null> = [];
   behavior: SendBehavior = 'export';
+  /** Set by a test: the raw value send returns, bypassing `behavior` (hostile results). */
+  custom: ((spans: readonly TelemetrySpan[]) => unknown) | null = null;
 
   async send(spans: readonly TelemetrySpan[], _deadline: { readonly atMs: number } | null): Promise<RunTelemetrySendResult> {
     this.sendCalls += 1;
     this.sentSpans.push([...spans]);
     this.storeAtSend.push(this.probe === null ? null : this.probe());
+    if (this.custom !== null) {
+      return this.custom(spans) as RunTelemetrySendResult;
+    }
     switch (this.behavior) {
       case 'export':
         return {
@@ -933,5 +938,73 @@ describe('ExportRunTelemetryUseCase send: dry-run and redaction (OT2c-2)', () =>
     ]) {
       expect(serialised).not.toContain(secret);
     }
+  });
+});
+
+describe('ExportRunTelemetryUseCase never rejects on hostile inputs (OT2c-2 Argon round 2)', () => {
+  async function runWith(custom: (spans: readonly TelemetrySpan[]) => unknown) {
+    const { deps, fakes } = makeDeps();
+    fakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
+    const sentSpans = await handAttemptSpanIds(deps);
+    fakes.telemetry.custom = custom;
+    const result = await new ExportRunTelemetryUseCase(deps).execute(makeRequest());
+    return { result, fakes, sentSpans };
+  }
+
+  it('a send result whose fields are getters never runs them and leaves every span pending', async () => {
+    let getterRan = false;
+    const { result, fakes, sentSpans } = await runWith(() => ({
+      get dispositions() {
+        getterRan = true;
+        return [];
+      },
+      errorKind: null,
+    }));
+    expect(getterRan).toBe(false);
+    const exported = asExported(result);
+    expect(exported.errorKind).toBe('network');
+    expect(exported.counts.pending).toBe(sentSpans.length);
+    const texts = spanTexts(fakes.dispositions.snapshot());
+    for (const span of sentSpans) {
+      expect(texts.get(span.spanId)).toBe('pending');
+    }
+  });
+
+  it('a revoked proxy as the send result, an entry getter, or an unknown error kind each leave every span pending', async () => {
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    const results: unknown[] = [];
+    for (const custom of [
+      () => revoked.proxy,
+      (spans: readonly TelemetrySpan[]) => ({
+        dispositions: spans.map((span) => ({
+          spanId: span.spanId,
+          get disposition() {
+            throw new Error('hostile entry');
+          },
+        })),
+        errorKind: null,
+      }),
+      (spans: readonly TelemetrySpan[]) => ({
+        dispositions: spans.map((span) => ({ spanId: span.spanId, disposition: { state: 'exported', route: 'collector' } })),
+        errorKind: 'not-a-declared-kind',
+      }),
+    ]) {
+      const { result, sentSpans } = await runWith(custom);
+      const exported = asExported(result);
+      expect(exported.errorKind).toBe('network');
+      expect(exported.counts.pending).toBe(sentSpans.length);
+      expect(exported.counts.exported).toBe(0);
+      results.push(result);
+    }
+    expect(results).toHaveLength(3);
+  });
+
+  it('a revoked proxy as the request resolves to an invalid-request refusal, never a rejection', async () => {
+    const { deps } = makeDeps();
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    const result = await new ExportRunTelemetryUseCase(deps).execute(revoked.proxy);
+    expect(asRefused(result).reason).toBe('invalid-request');
   });
 });

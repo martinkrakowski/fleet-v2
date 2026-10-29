@@ -143,7 +143,10 @@ import {
   AcknowledgeOwnerAnswerUseCase,
   AnswerOwnerQuestionUseCase,
   AskOwnerQuestionUseCase,
+  AttentionItemRepositoryAdapter,
   AttentionReadAdapter,
+  ClearAttentionItemUseCase,
+  ListAttentionItemsUseCase,
   CheckOwnerDecisionUseCase,
   CoordinationRequestRepositoryAdapter,
   DecisionTransportAdapter,
@@ -160,6 +163,7 @@ import {
   PublishProjectObservationUseCase,
   ReadOwnerQuestionUseCase,
   ReadProjectAttentionUseCase,
+  RecordAttentionItemUseCase,
   RecordAuthorizationConsumptionUseCase,
   RecordProjectProbeUseCase,
   RecordRelayAcknowledgementUseCase,
@@ -172,6 +176,7 @@ import {
   SyncOneWayOwnerQuestionsUseCase,
   UpdateProjectProfileUseCase,
   type OwnerQuestionClock,
+  type AttentionClock,
 } from '@fleet/operator-coordination';
 import {
   requireValidInstallationModel,
@@ -519,6 +524,10 @@ export interface FleetCliRuntime {
     readonly recordAuthorizationConsumption: RecordAuthorizationConsumptionUseCase;
     readonly publishProjectObservation: PublishProjectObservationUseCase;
     readonly readProjectAttention: ReadProjectAttentionUseCase;
+    readonly attentionItemRepository: AttentionItemRepositoryAdapter;
+    readonly recordAttentionItem: RecordAttentionItemUseCase;
+    readonly clearAttentionItem: ClearAttentionItemUseCase;
+    readonly listAttentionItems: ListAttentionItemsUseCase;
     readonly sendFleetRelay: SendFleetRelayUseCase;
     readonly recordRelayAcknowledgement: RecordRelayAcknowledgementUseCase;
     readonly inspectOutstandingCoordination: InspectOutstandingCoordinationUseCase;
@@ -719,7 +728,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const relayTransport = new RelayTransportAdapter({
     outboxDir: stateDir === undefined ? undefined : join(stateDir, 'relay-outbox'),
   });
-  // No attention reader is configured in the scaffold; reads report absence.
+  // The Waves attention summary reader stays unconfigured; reads report
+  // absence. Stored attention items are kept in attentionItemRepository,
+  // persisted to `<stateDir>/attention-items.json` and in-memory without a
+  // stateDir.
   const attentionRead = new AttentionReadAdapter();
   // Owner questions are their own aggregate beside the coordination requests,
   // persisted to `<stateDir>/owner-questions.json` and in-memory without a
@@ -728,6 +740,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // acknowledged.
   const ownerQuestionRepository = new OwnerQuestionRepositoryAdapter({ stateDir });
   const ownerQuestionClock: OwnerQuestionClock = { nowIso: () => new Date().toISOString() };
+  const attentionItemRepository = new AttentionItemRepositoryAdapter({ stateDir });
+  const attentionClock: AttentionClock = { nowIso: () => new Date().toISOString() };
 
   // Installation name references for project profiles (P6a): a v2
   // installation enables host and gate-procedure name checks behind profile
@@ -829,6 +843,19 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     acknowledgeOwnerAnswer: new AcknowledgeOwnerAnswerUseCase({
       ownerQuestionRepo: ownerQuestionRepository,
       clock: ownerQuestionClock,
+    }),
+    attentionItemRepository,
+    recordAttentionItem: new RecordAttentionItemUseCase({
+      itemRepo: attentionItemRepository,
+      clock: attentionClock,
+      ids: { newItemId: () => 'att-' + newUlid() },
+    }),
+    clearAttentionItem: new ClearAttentionItemUseCase({
+      itemRepo: attentionItemRepository,
+      clock: attentionClock,
+    }),
+    listAttentionItems: new ListAttentionItemsUseCase({
+      itemRepo: attentionItemRepository,
     }),
   };
 

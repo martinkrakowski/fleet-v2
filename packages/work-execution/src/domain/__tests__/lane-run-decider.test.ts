@@ -381,6 +381,21 @@ describe('global rules', () => {
     assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
   });
 
+  it('G3e: an owner-merge park with a stop recorded still ends merged, never stopped, once its PR merges (CT-2a Fable)', () => {
+    const rec = record({ parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null }, parkCount: 1 });
+    for (const stopMode of ['force', 'graceful'] as const) {
+      const facts = baseFacts({
+        state: 'parked',
+        stopMode,
+        attempt: attemptFact({ phase: 'collected' }),
+        head12: HEAD,
+        acceptedHead12: HEAD,
+        pr: { state: 'merged', head12: 'ffffffffffff', containsLaneHead: true },
+      });
+      assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+    }
+  });
+
   it('G5: an owner-merge park waits when its merged PR does not contain the lane head', () => {
     const rec = record({ parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null }, parkCount: 1 });
     const facts = baseFacts({
@@ -973,6 +988,11 @@ describe('merging state', () => {
     assertDecision(closed, record({}), decide(record({}), closed), {
       kind: 'park', reason: 'ambiguous', qualifier: 'merge', parkedFrom: 'merging',
     });
+  });
+
+  it('M2b: merged at the lane head enters merged even when the ancestry answer is false (CT-2a Fable)', () => {
+    const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: HEAD, containsLaneHead: false } });
+    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'merged' });
   });
 
   it('M3b: merged at another head that contains the lane head enters merged', () => {

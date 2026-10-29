@@ -663,6 +663,22 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return park('ambiguous', 'merge');
     }
 
+    // G3e: the owner-merge park leaves by itself once its PR merges with the
+    // lane head (CT-2a). It sits here, ahead of the stop rules G4a and GD1, so
+    // a landed merge ends `merged` and never `stopped` even with a stop
+    // recorded on the park (§3.9.1). A merged PR that neither equals nor
+    // contains the lane head keeps the park for the owner (no park → park).
+    if (
+      facts.state === 'parked' &&
+      record.parked !== null &&
+      record.parked.reason === 'owner-merge' &&
+      facts.pr !== null &&
+      facts.pr.state === 'merged' &&
+      mergedPrCarriesLaneHead(facts.pr, facts.head12)
+    ) {
+      return enter('merged');
+    }
+
     // G4a: a force stop with nothing to stop ends the run.
     if (facts.stopMode === 'force') {
       const phase = facts.attempt === null ? null : facts.attempt.phase;
@@ -815,18 +831,9 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return decision;
     }
 
-    // G5: parked waits for a resume or the owner's answer; the owner-merge park
-    // leaves by itself once its PR merges with the lane head (CT-2a).
+    // G5: parked waits for a resume or the owner's answer (the owner-merge
+    // park's own exit is G3e above).
     if (facts.state === 'parked') {
-      if (
-        record.parked !== null &&
-        record.parked.reason === 'owner-merge' &&
-        facts.pr !== null &&
-        facts.pr.state === 'merged' &&
-        mergedPrCarriesLaneHead(facts.pr, facts.head12)
-      ) {
-        return enter('merged');
-      }
       return wait('parked');
     }
 

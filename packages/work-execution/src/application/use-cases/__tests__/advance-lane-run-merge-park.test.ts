@@ -642,6 +642,31 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
     expect(harness.forgeReadRequests).toHaveLength(1);
   });
 
+  it('test CT-2a-b: an owner-merge park whose PR read throws stays parked, and a halted pass reads nothing', async () => {
+    const parkedRecord = runRecord({
+      parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null },
+      parkCount: 1,
+    });
+    const harness = await makeHarness(parkedRecord, [collectedAttempt()], {
+      wireForgeRead: true,
+      wireWorkOrder: true,
+      wireAutoMerge: false,
+    });
+    await conduct(harness, 'merging', NOW);
+    await appendIntent(harness, acceptKey(), null, NOW);
+    await appendResult(harness, acceptKey(), 'completed', 'accepted', NOW);
+    await conduct(harness, 'parked', NOW);
+    harness.setForgeReadAnswer('throw');
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.forgeReadRequests).toHaveLength(1);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked).toMatchObject({ reason: 'owner-merge' });
+
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness, { halted: true })).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.forgeReadRequests).toHaveLength(1);
+  });
+
   it('test 4: oneWayDoor (acceptance not accepted) parks one-way-door with a question; accepted does not park it', async () => {
     const harness = await mergingHarness({ wireParkNotice: true, autoMergeEnabled: false });
     // Re-assess the accepted head as rejected: the head stays the accepted head (so
@@ -898,6 +923,8 @@ describe('AdvanceLaneRunUseCase park notice re-raise (KF-4)', () => {
     expect(harness.recordParkAttentionCalls).toHaveLength(2);
     expect(harness.recordParkAttentionCalls[1].key).toBe(RUN_ID + '/park@1');
     expect(harness.askParkQuestionCalls).toHaveLength(0);
+    // A park other than owner-merge reads no PR while parked (CT-2a).
+    expect(harness.forgeReadRequests).toHaveLength(1);
   });
 
   it('test 17: no parkNotice wired means no raise and the parked wait is unchanged', async () => {

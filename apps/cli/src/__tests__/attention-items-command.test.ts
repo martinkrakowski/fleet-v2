@@ -199,4 +199,20 @@ describe('coordination attention-items and attention-dismiss', () => {
     expect(code).toBe(0);
     expect(io.outLines.join('')).toContain('attention-items|attention-dismiss');
   });
+  it('passes a supplied empty filter through, so it lists nothing instead of everything', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    await seedItem(runtime, 'wo-example-1', 'wo-example-1');
+    const listed = await runCoordination(runtime, ['attention-items', '--projectId', ''], stateDir);
+    expect(listed.code).toBe(0);
+    expect(parseDocument(listed.stdout).items).toEqual([]);
+  });
+
+  it.each(['1.0', '0x1', '1e0', ' 1', '-1'])('refuses a non-canonical --expectedRevision %j', async (raw) => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    const result = await runCoordination(runtime, ['attention-dismiss', '--itemId', 'att-1', '--expectedRevision', raw], stateDir);
+    expect(result.code).toBe(2);
+  });
+
 });

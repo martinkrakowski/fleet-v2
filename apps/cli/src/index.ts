@@ -1454,16 +1454,18 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
         projectId: str(p, 'projectId'),
       }),
     'attention-items': async (p, rt) =>
+      // A supplied filter is passed through as given, even empty, so the use case can refuse it (an empty list);
+      // only an absent flag means "no filter".
       rt.coordination.listAttentionItems.listAttentionItems({
-        ...(optStr(p, 'projectId') !== undefined ? { projectId: optStr(p, 'projectId') } : {}),
-        ...(optStr(p, 'state') !== undefined ? { state: optStr(p, 'state') as AttentionItemState } : {}),
-        ...(optStr(p, 'kind') !== undefined ? { kind: optStr(p, 'kind') } : {}),
-        ...(optStr(p, 'workOrderId') !== undefined ? { workOrderId: optStr(p, 'workOrderId') } : {}),
+        ...(Object.hasOwn(p, 'projectId') ? { projectId: str(p, 'projectId') } : {}),
+        ...(Object.hasOwn(p, 'state') ? { state: str(p, 'state') as AttentionItemState } : {}),
+        ...(Object.hasOwn(p, 'kind') ? { kind: str(p, 'kind') } : {}),
+        ...(Object.hasOwn(p, 'workOrderId') ? { workOrderId: str(p, 'workOrderId') } : {}),
       }),
     'attention-dismiss': async (p, rt) => {
       const revisionRaw = optStr(p, 'expectedRevision');
-      const revision = revisionRaw === undefined ? NaN : Number(revisionRaw);
-      if (revisionRaw === undefined || !Number.isSafeInteger(revision)) {
+      const revision = revisionRaw !== undefined && /^\d{1,15}$/.test(revisionRaw) ? Number(revisionRaw) : NaN;
+      if (!Number.isSafeInteger(revision)) {
         throw new CliUsageError(
           "attention-dismiss requires '--expectedRevision <n>' with an integer value",
         );

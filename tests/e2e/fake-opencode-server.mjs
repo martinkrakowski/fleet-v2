@@ -94,6 +94,14 @@ const server = http.createServer((req, res) => {
         session.state = 'busy';
         return send(200, { started: true });
       }
+      if (parts.length === 2 && parts[0] === '__end' && req.method === 'POST') {
+        // A lane that ended: unlisted by /api/session/active, still readable
+        // by GET /api/session/<id> for post-run assertions.
+        const session = sessions.get(parts[1]);
+        if (session === undefined) return send(404, { error: 'not found' });
+        session.state = 'ended';
+        return send(200, { ended: true });
+      }
       if (url.pathname === '/__state' && req.method === 'GET') {
         const snapshot = {};
         for (const [id, session] of sessions) snapshot[id] = session.state;

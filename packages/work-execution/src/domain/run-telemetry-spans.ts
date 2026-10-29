@@ -264,11 +264,15 @@ export function laneRunSpans(hmac: TelemetryHmac, facts: LaneRunTelemetryFacts):
         continue;
       }
       if (parsed.kind === 'step') {
+        const underRound = (ROUND_STEPS as readonly string[]).includes(parsed.step);
         const final = finalResultOf(group.results);
         if (final === null) {
-          // The round this intent belongs to stays withheld: no round span
-          // while any round-step intent in it lacks a final result.
-          pendingStepRounds.add(parsed.round);
+          // Only a round-parented step holds its round open: an unfinalized
+          // root-parented key (accept, open-pr, push, merge, park) can never
+          // withhold a completed round span.
+          if (underRound) {
+            pendingStepRounds.add(parsed.round);
+          }
           continue;
         }
         const identity = journalKeyIdentity(hashInput);
@@ -288,7 +292,6 @@ export function laneRunSpans(hmac: TelemetryHmac, facts: LaneRunTelemetryFacts):
           attributes['fleet.ambiguous_results'] = group.ambiguous;
         }
         const status = statusOfResult(final);
-        const underRound = (ROUND_STEPS as readonly string[]).includes(parsed.step);
         const roundIdentityOf = underRound ? roundIdentity(parsed.round) : null;
         if (underRound && roundIdentityOf === null) {
           rejected.count += 1;

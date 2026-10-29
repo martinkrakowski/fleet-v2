@@ -467,14 +467,17 @@ describe('laneRunSpans (OT1b-1)', () => {
   it('maps a journal mixed with another run and control keys to exactly the same spans as the own entries alone', () => {
     entryCounter = 0;
     const own = baseJournal();
-    const otherRun = [
+    const foreignLead = [
       stepIntent(PREPARE_KEY2, 30), stepResult(PREPARE_KEY2, 31),
-      stepIntent(STOP_KEY2, 32), stepResult(STOP_KEY2, 33, 'overtaken'),
-      entry('conduct', { runId: RUN_ID2, recordedAtIso: time(34), state: 'merged' }),
-      entry('intent', { key: REQUEST_KEY, runId: null, recordedAtIso: time(35) }),
-      entry('intent', { key: REAPER_KEY, runId: null, recordedAtIso: time(36) }),
+      entry('conduct', { state: null, recordedAtIso: time(32) }),
     ];
-    const mixed = laneRunSpans(hmac, factsOf([...own, ...otherRun]));
+    const foreignTail = [
+      stepIntent(STOP_KEY2, 33), stepResult(STOP_KEY2, 34, 'overtaken'),
+      entry('conduct', { runId: RUN_ID2, recordedAtIso: time(35), state: 'merged' }),
+      entry('intent', { key: REQUEST_KEY, runId: null, recordedAtIso: time(36) }),
+      entry('intent', { key: REAPER_KEY, runId: null, recordedAtIso: time(37) }),
+    ];
+    const mixed = laneRunSpans(hmac, factsOf([...foreignLead, ...own, ...foreignTail]));
     const alone = laneRunSpans(hmac, factsOf(own));
     expect(mixed.spans).toEqual(alone.spans);
     expect(mixed.rejectedInvalid).toBe(alone.rejectedInvalid);

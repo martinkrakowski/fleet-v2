@@ -226,6 +226,14 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         kind: request.kind,
         expectedHeadSha: request.expectedHeadSha,
         branchName: `feat/${workOrder.laneId}`,
+        // Title/body are forwarded only when opening a PR; push-to-pr and
+        // merge never carry them (K6-2).
+        ...(request.kind === 'push-and-open-pr'
+          ? {
+              ...(request.title !== undefined ? { title: request.title } : {}),
+              ...(request.body !== undefined ? { body: request.body } : {}),
+            }
+          : {}),
       });
     } catch (error) {
       // The intent is durable but the forge outcome was not recorded; journal

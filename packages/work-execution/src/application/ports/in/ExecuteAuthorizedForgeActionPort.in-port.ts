@@ -20,6 +20,12 @@ export interface ExecuteAuthorizedForgeActionRequest {
    * Set only by in-process policy callers; the HTTP entry point drops it.
    */
   readonly authorizedBy?: string;
+  /**
+   * PR title/body forwarded to the forge only for `push-and-open-pr`; absent
+   * keeps the adapter's defaults (K6-2). Never read from lane output.
+   */
+  readonly title?: string;
+  readonly body?: string;
 }
 
 export type ExecuteAuthorizedForgeActionResult =

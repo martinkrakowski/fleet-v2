@@ -1,0 +1,60 @@
+#!/bin/sh
+# gate-slot: run one acceptance command inside a host-wide check slot (CT-3).
+#
+#   bin/gate-slot <command> [args...]
+#
+# A conducted run's acceptance commands run on the lane host in the lane's worktree. Prefixed
+# with this script, each command first takes one of FLEET_V2_GATE_SLOTS slot locks (default 8),
+# the same lock files the orchestrator's hand-run gate takes, so conducted and hand-run gates
+# share one host budget. A free slot is held for the whole life of the command (the lock's file
+# descriptor survives the exec); when every slot is busy the script waits and polls every
+# FLEET_V2_GATE_POLL_SECONDS (default 10). Worker caps are the command's own flags; this script
+# only gates admission. FLEET_V2_GATE_TMPDIR, when set, becomes TMPDIR for the command.
+# FLEET_V2_GATE_LOCK_DIR (default /tmp) holds the lock files. The command's exit code is
+# returned unchanged; a usage or setup error exits 2. Needs flock(1).
+set -u
+
+if [ "$#" -lt 1 ]; then
+  echo 'usage: gate-slot <command> [args...]' >&2
+  exit 2
+fi
+if ! command -v flock >/dev/null 2>&1; then
+  echo 'gate-slot: flock is required' >&2
+  exit 2
+fi
+
+slots=${FLEET_V2_GATE_SLOTS:-8}
+case $slots in
+  '' | *[!0-9]* | 0 | 0*) echo 'gate-slot: FLEET_V2_GATE_SLOTS must be a positive integer' >&2; exit 2 ;;
+esac
+poll=${FLEET_V2_GATE_POLL_SECONDS:-10}
+case $poll in
+  '' | *[!0-9]* | 0) echo 'gate-slot: FLEET_V2_GATE_POLL_SECONDS must be a positive integer' >&2; exit 2 ;;
+esac
+dir=${FLEET_V2_GATE_LOCK_DIR:-/tmp}
+if [ ! -d "$dir" ]; then
+  echo 'gate-slot: the lock directory does not exist' >&2
+  exit 2
+fi
+
+while :; do
+  i=1
+  while [ "$i" -le "$slots" ]; do
+    if ! exec 9>>"$dir/fleet-v2-gate-slot.$i"; then
+      echo 'gate-slot: cannot open a slot lock file' >&2
+      exit 2
+    fi
+    if flock -n 9; then
+      if [ -n "${FLEET_V2_GATE_TMPDIR:-}" ]; then
+        TMPDIR=$FLEET_V2_GATE_TMPDIR
+        export TMPDIR
+      fi
+      FLEET_V2_GATE_SLOT=$i
+      export FLEET_V2_GATE_SLOT
+      exec "$@"
+    fi
+    exec 9>&-
+    i=$((i + 1))
+  done
+  sleep "$poll"
+done

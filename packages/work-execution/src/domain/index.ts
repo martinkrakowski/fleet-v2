@@ -16,6 +16,7 @@ export * from "./lane-run-journal.js";
 export * from "./lane-run-keys.js";
 export * from "./lane-run-lease.js";
 export * from "./lane-run-packages.js";
+export * from "./lane-run-pr-body.js";
 export * from "./lane-run-records.js";
 export * from "./lane-run-review-facts.js";
 export * from "./lane-run-step-facts.js";

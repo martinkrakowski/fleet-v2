@@ -1,11 +1,12 @@
 /**
- * ExportRunTelemetryUseCase (lane OT2c-1): the telemetry export's selection,
- * mapping, sampling, cost policy and salt check (plan §3.3, §3.5, §3.8, §3.9).
- * Reads only through the ports it is given; never writes any store and, in
- * this lane, never calls `send` — OT2c-2 implements `sendAndRecord`. Never
- * throws: any port that throws or rejects maps to a fixed refused outcome
- * (fail closed). No raw id, path, value or free text reaches the result:
- * counts and fixed reason codes only.
+ * ExportRunTelemetryUseCase (lanes OT2c-1 and OT2c-2): the telemetry export's
+ * selection, mapping, sampling, cost policy and salt check (plan §3.3, §3.5,
+ * §3.8, §3.9), plus the send path: every span is written pending before the
+ * send, a disposition becomes final only on a send result, and a killed or
+ * failing export leaves the spans pending so the next export resends. Reads
+ * only through the ports it is given. Never throws: any port that throws or
+ * rejects maps to a fixed refused outcome (fail closed). No raw id, path,
+ * value or free text reaches the result: counts and fixed reason codes only.
  */
 
 import type {
@@ -15,7 +16,7 @@ import type {
   ExportRunTelemetrySelection,
 } from '../ports/in/ExportRunTelemetryPort.in-port.js';
 import type { ExportRunTelemetryPolicy } from '../ports/in/ExportRunTelemetryPort.in-port.js';
-import type { RunTelemetryPort, RunTelemetrySendDeadline } from '../ports/out/RunTelemetryPort.out-port.js';
+import type { RunTelemetryPort, RunTelemetrySendDeadline, RunTelemetrySendResult } from '../ports/out/RunTelemetryPort.out-port.js';
 import type { TelemetryDispositionPort } from '../ports/out/TelemetryDispositionPort.out-port.js';
 import type { AcceptanceReceiptReadPort } from '../ports/out/AcceptanceReceiptReadPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
@@ -45,7 +46,9 @@ import {
 } from '../../domain/run-telemetry-ids.js';
 import {
   dispositionsOfTrace,
+  type TelemetryCounterKey,
   type TelemetryDispositionRecord,
+  type TelemetryDispositionUpdate,
 } from '../../domain/run-telemetry-dispositions.js';
 
 /** The read-only ports the export reads through; composition (OT4b) wires them. */
@@ -107,6 +110,22 @@ function zeroCounts(): ExportRunTelemetryCounts {
 
 function refused(reason: ExportRefusalReason, counts: ExportRunTelemetryCounts): ExportRunTelemetryResult {
   return { outcome: 'refused', reason, counts, counters: {} };
+}
+
+/**
+ * A refused disposition write: the store's reason travels when the export
+ * knows it, with the salt-mismatch counter in the result (the store refuses
+ * such a write, so the count travels here, plan §3.5); anything else is
+ * `store-error`.
+ */
+function storeRefusal(reason: 'invalid-request' | 'salt-mismatch' | 'store-unreadable', counts: ExportRunTelemetryCounts): ExportRunTelemetryResult {
+  if (reason === 'salt-mismatch') {
+    return { outcome: 'refused', reason: 'salt-mismatch', counts, counters: { 'salt-mismatch': 1 } };
+  }
+  if (reason === 'store-unreadable') {
+    return refused('store-unreadable', counts);
+  }
+  return refused('store-error', counts);
 }
 
 /** Own data properties only: a selection kind the export knows, with valid field values, else null. */
@@ -565,11 +584,13 @@ export class ExportRunTelemetryUseCase implements ExportRunTelemetryPort {
 
     // Step 9: the stored finals drop out; `retryRejected` keeps rejected spans for OT2c-2 to reopen.
     const toSend: TelemetrySpan[] = [];
+    const rejectedSpanIds = new Set<string>();
     let alreadyFinal = 0;
     for (const span of costApplied) {
       const disposition: SpanDisposition | undefined = dispositionsOfTrace(record, span.traceId).get(span.spanId);
       if (disposition !== undefined && isFinalSpanDisposition(disposition)) {
         if (parsed.retryRejected && disposition.state === 'rejected') {
+          rejectedSpanIds.add(span.spanId);
           toSend.push(span);
           continue;
         }
@@ -594,23 +615,147 @@ export class ExportRunTelemetryUseCase implements ExportRunTelemetryPort {
     if (parsed.mode === 'dry-run') {
       return { outcome: 'dry-run', counts: resultCounts, spans: toSend };
     }
-    return await this.sendAndRecord(toSend, resultCounts, parsed.deadline, parsed.retryRejected);
+    return await this.sendAndRecord(
+      toSend,
+      resultCounts,
+      parsed.deadline,
+      parsed.retryRejected,
+      parsed.nowIso,
+      fingerprint,
+      rejectedSpanIds,
+    );
   }
 
   /**
-   * OT2c-2: send `spans` through the telemetry port with `deadline`, record
-   * each returned disposition, add the counters and, with `retryRejected`,
-   * reopen rejected spans before the send. This lane sends and writes
-   * nothing: it returns the exported result with a null error kind.
+   * OT2c-2: the send path (plan §3.5). With `retryRejected`, the selection's
+   * stored `rejected:*` spans are written back to `pending` with one `reopen`
+   * write before anything else. Then every span is written `pending` in one
+   * write, and only a written store lets the spans go to `send` — a refused
+   * or busy store sends nothing. A disposition becomes final only on the
+   * send's HTTP result: the returned final dispositions of spans we sent are
+   * recorded in one write with the send's error kind as a counter and
+   * `exportedAt` when at least one span exported. A throwing or never-
+   * resolving send leaves every span `pending` and writes nothing more, so a
+   * killed export resends. This method never throws: every store refusal and
+   * throw maps to a refused result (fail closed).
    */
   private async sendAndRecord(
-    _spans: readonly TelemetrySpan[],
+    spans: readonly TelemetrySpan[],
     counts: ExportRunTelemetryCounts,
-    _deadline: RunTelemetrySendDeadline,
-    _retryRejected: boolean,
+    deadline: RunTelemetrySendDeadline,
+    retryRejected: boolean,
+    nowIso: string,
+    saltFingerprint: string,
+    rejectedSpanIds: ReadonlySet<string>,
   ): Promise<ExportRunTelemetryResult> {
-    // OT2c-2 implements the send and the disposition writes here.
-    return { outcome: 'exported', counts, errorKind: null };
+    const deps = this.deps!;
+    if (spans.length === 0) {
+      return { outcome: 'exported', counts, errorKind: null };
+    }
+
+    // Step 1: reopen the selection's rejected spans back to pending (one write).
+    if (retryRejected && rejectedSpanIds.size > 0) {
+      const reopenUpdates: TelemetryDispositionUpdate[] = spans
+        .filter((span) => rejectedSpanIds.has(span.spanId))
+        .map((span) => ({ traceId: span.traceId, spanId: span.spanId, disposition: { state: 'pending' } as const }));
+      const reopened = await tryPort(() =>
+        deps.dispositions.write({ saltFingerprint, updates: reopenUpdates, reopen: true, nowIso }),
+      );
+      if (!reopened.ok) {
+        return refused('store-error', counts);
+      }
+      if (reopened.value.outcome === 'refused') {
+        return storeRefusal(reopened.value.reason, counts);
+      }
+      if (reopened.value.outcome === 'skipped') {
+        // The rejected spans stay rejected: sending nothing is safer than a
+        // final they would be sent into again (the next export reopens).
+        return { outcome: 'exported', counts: { ...counts, refusedByStore: rejectedSpanIds.size }, errorKind: null };
+      }
+    }
+
+    // Step 2: every span is pending before it is sent (one write).
+    const pendingWrite = await tryPort(() =>
+      deps.dispositions.write({
+        saltFingerprint,
+        updates: spans.map((span) => ({ traceId: span.traceId, spanId: span.spanId, disposition: { state: 'pending' } as const })),
+        nowIso,
+      }),
+    );
+    if (!pendingWrite.ok) {
+      return refused('store-error', counts);
+    }
+    if (pendingWrite.value.outcome === 'refused') {
+      if (pendingWrite.value.reason === 'salt-mismatch') {
+        // Another host recorded a different salt between our read and this write.
+        return { outcome: 'refused', reason: 'salt-mismatch', counts, counters: { 'salt-mismatch': 1 } };
+      }
+      return refused('store-error', counts);
+    }
+    if (pendingWrite.value.outcome === 'skipped') {
+      // Nothing is sent: the spans are exported next time.
+      return { outcome: 'exported', counts: { ...counts, refusedByStore: spans.length }, errorKind: null };
+    }
+
+    // Step 3: the send. A throw or rejection leaves every span pending and writes nothing more.
+    let sent: RunTelemetrySendResult;
+    try {
+      sent = await deps.telemetry.send(spans, deadline);
+    } catch {
+      return { outcome: 'exported', counts: { ...counts, pending: spans.length }, errorKind: 'network' };
+    }
+
+    // Step 4: only final dispositions of spans we sent are recorded; unknown
+    // span ids are ignored and counted nowhere.
+    const spanById = new Map(spans.map((span) => [span.spanId, span]));
+    const sentIds = new Set(spanById.keys());
+    const finals: TelemetryDispositionUpdate[] = [];
+    let exported = 0;
+    let rejected = 0;
+    let anyExported = false;
+    for (const entry of sent.dispositions) {
+      if (!sentIds.has(entry.spanId)) {
+        continue;
+      }
+      if (!isFinalSpanDisposition(entry.disposition)) {
+        continue;
+      }
+      finals.push({ traceId: spanById.get(entry.spanId)!.traceId, spanId: entry.spanId, disposition: entry.disposition });
+      if (entry.disposition.state === 'exported') {
+        exported += 1;
+        anyExported = true;
+      } else {
+        rejected += 1;
+      }
+    }
+    const recordedCounts: ExportRunTelemetryCounts = {
+      ...counts,
+      exported,
+      rejected,
+      pending: spans.length - finals.length,
+    };
+    if (finals.length === 0) {
+      return { outcome: 'exported', counts: recordedCounts, errorKind: sent.errorKind };
+    }
+    const counters: Partial<Record<TelemetryCounterKey, number>> = {};
+    if (sent.errorKind !== null) {
+      counters[sent.errorKind] = 1;
+    }
+    const recorded = await tryPort(() =>
+      deps.dispositions.write({
+        saltFingerprint,
+        updates: finals,
+        counters,
+        exportedAt: anyExported,
+        nowIso,
+      }),
+    );
+    if (!recorded.ok || recorded.value.outcome === 'skipped') {
+      // The final dispositions stay pending in the store: the next export
+      // resends them (safe under first-write-wins).
+      return { outcome: 'exported', counts: { ...recordedCounts, pending: spans.length, refusedByStore: finals.length }, errorKind: sent.errorKind };
+    }
+    return { outcome: 'exported', counts: recordedCounts, errorKind: sent.errorKind };
   }
 
   /**

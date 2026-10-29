@@ -37,7 +37,7 @@ export interface ExportRunTelemetryPolicy {
   readonly projectAliases: Readonly<Record<string, string>>;
 }
 
-/** The export request. `deadline` and `retryRejected` are validated here and used by the send lane (OT2c-2). */
+/** The export request. `deadline` and `retryRejected` are validated here and used by the send lane. */
 export interface ExportRunTelemetryRequest {
   readonly selection: ExportRunTelemetrySelection;
   readonly policy: ExportRunTelemetryPolicy;
@@ -47,7 +47,7 @@ export interface ExportRunTelemetryRequest {
   readonly nowIso: string;
 }
 
-/** Numbers only: what was selected, mapped, dropped and kept. `exported`, `rejected`, `pending` and `refusedByStore` are filled by the send lane (OT2c-2). */
+/** Numbers only: what was selected, mapped, dropped and kept. `exported`, `rejected`, `pending` and `refusedByStore` are filled by the send lane. */
 export interface ExportRunTelemetryCounts {
   readonly runsSelected: number;
   readonly attemptsSelected: number;

@@ -26,9 +26,12 @@ import type { TelemetrySpan } from '../../../domain/run-telemetry.js';
 import {
   TELEMETRY_COUNTER_KEYS,
   TELEMETRY_DISPOSITION_RECORD_VERSION,
+  applyDispositionWrite,
   type TelemetryCounterKey,
   type TelemetryDispositionRecord,
+  type TelemetryDispositionWriteRequest,
 } from '../../../domain/run-telemetry-dispositions.js';
+import type { TelemetryDispositionWriteResult } from '../../ports/out/TelemetryDispositionPort.out-port.js';
 import {
   telemetryHashInput,
   telemetrySaltFingerprint,
@@ -297,8 +300,11 @@ class FakeReceipts {
 
 class FakeDispositions {
   writeCalls = 0;
+  /** Scripted results for the next write calls; a throw when unset and `throwMode` says so. */
+  writeScript: Array<TelemetryDispositionWriteResult | 'throw'> = [];
+  throwMode: 'script' | 'always' = 'script';
 
-  constructor(private readonly record: TelemetryDispositionRecord) {}
+  constructor(private record: TelemetryDispositionRecord) {}
 
   mode: 'read' | 'unreadable' | 'throw' = 'read';
 
@@ -312,9 +318,25 @@ class FakeDispositions {
     return { outcome: 'read', record: this.record };
   }
 
-  async write(): Promise<never> {
+  /** OT2c-2: the store's write is in memory via the domain's own apply function. */
+  async write(request: TelemetryDispositionWriteRequest): Promise<TelemetryDispositionWriteResult> {
     this.writeCalls += 1;
-    throw new Error('this lane never writes the disposition store');
+    if (this.throwMode === 'always') {
+      throw new Error('example-store-failure');
+    }
+    const scripted = this.writeScript.shift();
+    if (scripted === 'throw') {
+      throw new Error('example-store-failure');
+    }
+    if (scripted !== undefined) {
+      return scripted;
+    }
+    const applied = applyDispositionWrite(this.record, request);
+    if (applied.outcome === 'refused') {
+      return { outcome: 'refused', reason: applied.reason };
+    }
+    this.record = applied.record;
+    return { outcome: 'written', applied: applied.applied, kept: applied.kept };
   }
 }
 
@@ -864,7 +886,7 @@ describe('ExportRunTelemetryUseCase outcomes (OT2c-1)', () => {
     expect(fakes.dispositions.writeCalls).toBe(0);
   });
 
-  it('a send in this lane returns exported without sending or writing (OT2c-2 hook)', async () => {
+  it('a send sends once through the send port and writes the spans pending (OT2c-2)', async () => {
     const { deps, fakes } = makeDeps();
     fakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
 
@@ -874,11 +896,11 @@ describe('ExportRunTelemetryUseCase outcomes (OT2c-1)', () => {
 
     expect(result).toEqual({
       outcome: 'exported',
-      counts: { ...zeroCounts(), attemptsSelected: 1, spansMapped: 2, toSend: 2 },
+      counts: { ...zeroCounts(), attemptsSelected: 1, spansMapped: 2, toSend: 2, pending: 2 },
       errorKind: null,
     });
-    expect(fakes.telemetry.sendCalls).toBe(0);
-    expect(fakes.dispositions.writeCalls).toBe(0);
+    expect(fakes.telemetry.sendCalls).toBe(1);
+    expect(fakes.dispositions.writeCalls).toBe(1);
   });
 });
 

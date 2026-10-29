@@ -34,6 +34,7 @@ export * from "./PolicyMergeGrantPort.out-port.js";
 export * from "./ProjectProbePort.out-port.js";
 export * from "./ProjectProbeRecordPort.out-port.js";
 export * from "./ProjectProfileReadPort.out-port.js";
+export * from "./ReviewAssessmentPort.out-port.js";
 export * from "./ReviewRequestPort.out-port.js";
 export * from "./RunnerForAttemptPort.out-port.js";
 export * from "./RunnerSelectorPort.out-port.js";

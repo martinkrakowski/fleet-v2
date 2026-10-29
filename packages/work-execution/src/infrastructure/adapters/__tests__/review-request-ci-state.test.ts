@@ -354,6 +354,88 @@ describe('ReviewRequestAdapter.requestReview', () => {
 
     expect(result).toEqual({ outcome: 'refused', reason: 'not-configured' });
   });
+
+  it('forwards briefText with a brief-check request', async () => {
+    const { calls, requestIndependentReview } = makeRequestReviewFake({
+      outcome: 'reviewed',
+      receipt: makeReceipt({ kind: 'brief-check' }),
+    });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+
+    const result = await adapter.requestReview(
+      makeReviewRequest({ kind: 'brief-check', briefText: '1. Add the review seat.\n2. Wire the checklist.' }),
+    );
+
+    expect(result).toEqual({
+      outcome: 'receipt',
+      receipt: { ...EXPECTED_SUMMARY, kind: 'brief-check' },
+    });
+    expect(calls[0].briefText).toBe('1. Add the review seat.\n2. Wire the checklist.');
+  });
+
+  it('does not forward briefText with a code-review request', async () => {
+    const { calls, requestIndependentReview } = makeRequestReviewFake({
+      outcome: 'reviewed',
+      receipt: makeReceipt(),
+    });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+
+    const result = await adapter.requestReview(
+      makeReviewRequest({ kind: 'code-review', briefText: '1. Add the review seat.' }),
+    );
+
+    expect(result).toEqual({ outcome: 'receipt', receipt: EXPECTED_SUMMARY });
+    expect('briefText' in calls[0]).toBe(false);
+  });
+
+  it('refuses a brief-check request whose brief exceeds 64 KiB without calling the delegate', async () => {
+    const { calls, requestIndependentReview } = makeRequestReviewFake({
+      outcome: 'reviewed',
+      receipt: makeReceipt(),
+    });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+
+    const result = await adapter.requestReview(
+      makeReviewRequest({ kind: 'brief-check', briefText: 'a'.repeat(64 * 1024 + 1) }),
+    );
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('accepts a brief-check request whose brief is exactly 64 KiB', async () => {
+    const { calls, requestIndependentReview } = makeRequestReviewFake({
+      outcome: 'reviewed',
+      receipt: makeReceipt({ kind: 'brief-check' }),
+    });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+
+    const result = await adapter.requestReview(
+      makeReviewRequest({ kind: 'brief-check', briefText: 'a'.repeat(64 * 1024) }),
+    );
+
+    expect(result).toEqual({
+      outcome: 'receipt',
+      receipt: { ...EXPECTED_SUMMARY, kind: 'brief-check' },
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('counts a multibyte brief against the 64 KiB byte cap, not the character count', async () => {
+    const { calls, requestIndependentReview } = makeRequestReviewFake({
+      outcome: 'reviewed',
+      receipt: makeReceipt(),
+    });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+
+    // 32769 'é' characters are 65538 utf-8 bytes: over the cap with room to spare.
+    const result = await adapter.requestReview(
+      makeReviewRequest({ kind: 'brief-check', briefText: 'é'.repeat(32 * 1024 + 1) }),
+    );
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(calls).toHaveLength(0);
+  });
 });
 
 describe('ReviewRequestAdapter.findReviewReceipt', () => {

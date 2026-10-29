@@ -33,6 +33,7 @@ import type {
 
 const HEAD_PATTERN = /^[0-9a-f]{40}$/;
 const REVIEW_KIND_VALUES: readonly string[] = REVIEW_KINDS;
+const BRIEF_TEXT_MAX_BYTES = 64 * 1024;
 
 export interface ReviewRequestDelegates {
   readonly requestIndependentReview?: RequestIndependentReviewPort['requestIndependentReview'];
@@ -45,6 +46,11 @@ function isNonEmptyTrimmed(value: unknown): boolean {
 
 function isReviewKind(value: unknown): boolean {
   return typeof value === 'string' && REVIEW_KIND_VALUES.includes(value);
+}
+
+/** A brief longer than 64 KiB is a refusal, never a truncated forward. */
+function briefTextByteLength(briefText: string): number {
+  return Buffer.byteLength(briefText, 'utf8');
 }
 
 function isValidReviewRequest(request: ReviewRequest): boolean {
@@ -127,7 +133,12 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
   constructor(private readonly delegates: ReviewRequestDelegates = {}) {}
 
   async requestReview(request: ReviewRequest): Promise<ReviewRequestResult> {
-    if (!isValidReviewRequest(request)) {
+    if (
+      !isValidReviewRequest(request) ||
+      (request.briefText !== undefined &&
+        (typeof request.briefText !== 'string' ||
+          briefTextByteLength(request.briefText) > BRIEF_TEXT_MAX_BYTES))
+    ) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
     if (!this.delegates.requestIndependentReview) {
@@ -145,6 +156,11 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         reviewerModel: request.reviewerModel,
         kind: request.kind,
         requestId: request.requestId,
+        // The frozen brief flows through only for a brief-check, so any other
+        // kind's transport call carries exactly the fields it carried before.
+        ...(request.kind === 'brief-check' && request.briefText !== undefined
+          ? { briefText: request.briefText }
+          : {}),
         ...(request.nowIso !== undefined ? { nowIso: request.nowIso } : {}),
       });
     } catch {

@@ -39,6 +39,7 @@ export * from "./PolicyMergeGrantAdapter.adapter.js";
 export * from "./ProjectProbeAdapter.adapter.js";
 export * from "./ProjectProbeRecordAdapter.adapter.js";
 export * from "./ProjectProfileReadAdapter.adapter.js";
+export * from "./ReviewAssessmentAdapter.adapter.js";
 export * from "./ReviewRequestAdapter.adapter.js";
 export * from "./RunnerForAttemptAdapter.adapter.js";
 export * from "./RunnerSelectorAdapter.adapter.js";

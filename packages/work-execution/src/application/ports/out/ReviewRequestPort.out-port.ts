@@ -14,6 +14,8 @@ export interface ReviewRequest {
   readonly policyRevision: string;
   readonly implementerModel: string;
   readonly reviewerModel: string;
+  /** The frozen brief; only forwarded with `kind: 'brief-check'`, capped at 64 KiB. */
+  readonly briefText?: string;
   readonly nowIso?: string;
 }
 

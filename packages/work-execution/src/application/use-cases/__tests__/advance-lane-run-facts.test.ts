@@ -87,6 +87,17 @@ const SEAT_SELECTION_FP2 = {
   agent: null,
 };
 
+/** The recorded host of a conducted attempt (KF-10/Q2a-2 invariant). */
+const CONDUCTED_RUNNER = {
+  kind: 'opencode' as const,
+  remotePort: 4166,
+  host: 'lane-alias-example',
+  hostName: 'lane-host-example',
+  agent: null,
+  model: null,
+  variant: null,
+};
+
 function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
     id: 'attempt-example-1',
@@ -103,6 +114,7 @@ function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
     sessionId: null,
     completionReceipt: null,
     artifacts: null,
+    runner: CONDUCTED_RUNNER,
     seatPlan: SEAT_PLAN,
     seatSelection: SEAT_SELECTION,
     stopReason: 'none',

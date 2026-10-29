@@ -32,6 +32,7 @@ import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { performPark } from './step-context.js';
 import { manifestTimeLimitSeconds, readFrozenManifest } from './frozen-manifest.js';
+import { conductedRunnerOf } from './conducted-host.js';
 import { reviewFactsOf } from './review-fix.js';
 import { acceptanceFactsOf } from './merge.js';
 
@@ -44,11 +45,17 @@ export async function manifestVerdictOf(
   if (artifactPort.verifyArtifactManifest === undefined) {
     return 'missing';
   }
+  // Q2a-2: a conducted attempt's read goes through its recorded host or is not
+  // made; a missing host never falls back to the local executor.
+  const recordedHost = conductedRunnerOf(latest);
+  if (recordedHost === null) {
+    return 'missing';
+  }
   try {
     const verdict = await artifactPort.verifyArtifactManifest({
       attemptId: latest.id,
       worktreePath: latest.worktreePath,
-      recordedHost: latest.runner ?? null,
+      recordedHost,
       manifestPath: latest.artifacts?.manifestPath,
       expectedManifestSha256: latest.artifacts?.manifestSha256,
     });

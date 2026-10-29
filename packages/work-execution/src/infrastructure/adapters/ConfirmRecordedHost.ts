@@ -15,6 +15,7 @@ import type {
   AttemptRunnerRecord,
   RunnerKind,
 } from "../../domain/execution-records.js";
+import { runnerHasHostName } from "../../domain/execution-records.js";
 
 /**
  * One host as the confirmers read it — a structural subset of
@@ -45,8 +46,7 @@ export interface RunnerForAttemptHostSpec {
 export function hasRecordedHostName(
   recorded: AttemptRunnerRecord | null | undefined,
 ): boolean {
-  const hostName = recorded?.hostName;
-  return typeof hostName === "string" && hostName.trim() !== "";
+  return runnerHasHostName(recorded);
 }
 
 /** The confirm-or-unknown refusal, naming the recorded host. */

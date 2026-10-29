@@ -175,6 +175,8 @@ export function buildLiveConductorDriver(
     acceptanceAssessment: execution.acceptanceAssessment,
     ciState: conductor.ciState,
     forgeRead: execution.forgeRead,
+    // CT-2b: the same adapter answers whether a merged PR head contains the lane head.
+    forgeAncestry: execution.forgeRead,
     conductorForgeGrant: conductor.conductorForgeGrant,
     executeForgeAction: execution.executeAuthorizedForgeAction,
     autoMergeAttempt: execution.autoMergeAttempt,

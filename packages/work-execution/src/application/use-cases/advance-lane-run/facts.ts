@@ -32,6 +32,7 @@ import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { performPark } from './step-context.js';
 import { manifestTimeLimitSeconds, readFrozenManifest } from './frozen-manifest.js';
+import { reviewFactsOf } from './review-fix.js';
 
 /** The manifest verdict of a collected attempt: the port's outcome, `missing` when absent or unreadable. */
 export async function manifestVerdictOf(
@@ -196,6 +197,8 @@ export async function gatherFacts(ctx: AdvanceStepContext,
     }
   }
 
+  const review = await reviewFactsOf(ctx, record, state, entries, head12, attemptRecords);
+
   const facts: LaneRunFacts = {
     state,
     halted: request.halted,
@@ -206,14 +209,14 @@ export async function gatherFacts(ctx: AdvanceStepContext,
     admission: admitted ? 'admitted' : 'no-capacity',
     costCeilingReached,
     implementerSeat: implementerSeatOf(record, state, entries, attemptRecords),
-    reviewSeat: { ok: false },
+    reviewSeat: review.reviewSeat,
     roundSeatIndexes,
     attempt,
     head12,
     acceptedHead12: null,
     gate: laneRunGateFact(entries, record.runId, head12),
-    briefCheck: { verdict: 'none', seatIndex: null, retries: 0 },
-    codeReview: { verdict: 'none', seatIndex: null, retries: 0 },
+    briefCheck: review.briefCheck,
+    codeReview: review.codeReview,
     preMerge: 'none',
     acceptance: 'none',
     ci: 'unknown',

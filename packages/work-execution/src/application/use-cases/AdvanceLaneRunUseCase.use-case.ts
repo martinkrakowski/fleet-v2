@@ -56,6 +56,10 @@ import type { CollectAttemptArtifactsPort } from '../ports/in/CollectAttemptArti
 import type { CommitEditOnlyAttemptPort } from '../ports/in/CommitEditOnlyAttemptPort.in-port.js';
 import type { EvaluateAttemptGatePort } from '../ports/in/EvaluateAttemptGatePort.in-port.js';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
+import type { ReviewRequestPort } from '../ports/out/ReviewRequestPort.out-port.js';
+import type { ReviewAssessmentPort } from '../ports/out/ReviewAssessmentPort.out-port.js';
+import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
+import type { SameModelFamily } from '../../domain/seat-selection.js';
 import { checkLeaseHeld } from '../../domain/lane-run-lease.js';
 import type { LeaseRefusal } from '../../domain/lane-run-lease.js';
 import { laneRunJournalState } from '../../domain/lane-run-journal.js';
@@ -78,6 +82,7 @@ import {
 import { performCancel, performStop } from './advance-lane-run/stop-cancel.js';
 import { performCollect, performGate } from './advance-lane-run/collect-gate.js';
 import { performReconcile } from './advance-lane-run/reconcile.js';
+import { performReview } from './advance-lane-run/review-fix.js';
 import { gatherFacts, performAdmissionWait } from './advance-lane-run/facts.js';
 
 export interface AdvanceLaneRunDependencies {
@@ -85,7 +90,7 @@ export interface AdvanceLaneRunDependencies {
   readonly runJournal: LaneRunJournalPort;
   readonly attemptRepo: AttemptRepositoryPort;
   readonly executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations' | 'listJournalEntriesForAttempt'>;
-  readonly artifactPort: Pick<AttemptArtifactPort, 'readBriefManifest' | 'verifyArtifactManifest'>;
+  readonly artifactPort: Pick<AttemptArtifactPort, 'readBriefManifest' | 'verifyArtifactManifest' | 'readBriefFile'>;
   readonly reconcileAttempt: ReconcileAttemptPort;
   readonly admission: LaneRunAdmissionPort;
   /** A fresh ULID per call (journal entry ids, attempt ids). */
@@ -106,6 +111,14 @@ export interface AdvanceLaneRunDependencies {
   readonly commitEditOnlyAttempt?: CommitEditOnlyAttemptPort;
   /** The frozen gate verdict (K4-2, K4-6); absent → `not-wired gate`. */
   readonly evaluateAttemptGate?: EvaluateAttemptGatePort;
+  /** The conductor's review request (K5); absent → `not-wired`. */
+  readonly reviewRequest?: ReviewRequestPort;
+  /** Open the evidence assessment before a review (K5); absent → `not-wired`. */
+  readonly reviewAssessment?: ReviewAssessmentPort;
+  /** Model-family comparison for review seat selection (K5); absent → reviewSeat `{ ok: false }`. */
+  readonly sameModelFamily?: SameModelFamily;
+  /** Read the work order for its project id (K5); absent → `not-wired`. */
+  readonly workOrderRepo?: Pick<WorkOrderRepositoryPort, 'findWorkOrderById'>;
   /**
    * Resolve the runner that addresses a host for the dispatch reconcile's
    * worktree read (K4-7); absent → a dispatch reconcile that needs the
@@ -246,6 +259,9 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       }
       if (decision.step === 'gate') {
         return performGate(this.ctx, record, gathered, decision, request);
+      }
+      if (decision.step === 'brief-check' || decision.step === 'code-review') {
+        return performReview(this.ctx, record, gathered, decision, request);
       }
       return { outcome: 'not-built', decision: 'act', step: decision.step };
     }

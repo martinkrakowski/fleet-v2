@@ -67,6 +67,12 @@ export interface PrepareBriefPackageRequest {
   readonly modelAssignment: BriefModelAssignment;
 
   /**
+   * Frozen prose supplied by the caller (a fix round's handover brief); when
+   * present the authoring step is skipped and this text is placed and digested
+   * as is; non-empty, at most 64 KiB, never secret-shaped.
+   */
+  readonly proseMarkdown?: string;
+  /**
    * Frozen PR notes (D7): the three sections a conducted run requires for its
    * PR body. Each is a non-empty string of at most 4000 characters and never
    * secret-shaped. Optional on the prepare request — manual prepare works

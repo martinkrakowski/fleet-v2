@@ -18,6 +18,7 @@
  */
 
 import { parseSeatTool } from '../../domain/execution-records.js';
+import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateAllowedPathPrefix } from '../../domain/lane-diff-check.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isPlanSecretShaped } from '../../domain/lane-plan-sidecar.js';
@@ -54,6 +55,8 @@ export type PrepareBriefPackageUseCaseRequest = PrepareBriefPackageRequest & {
   readonly attemptId?: string;
   readonly worktreePath?: string;
   readonly handWrittenBriefPath?: string | null;
+  /** KF-8: the recorded host of the worktree; the placement writes there. */
+  readonly recordedHost?: AttemptRunnerRecord | null;
 };
 
 /**
@@ -94,6 +97,25 @@ function isNonEmpty(value: unknown): value is string {
  */
 const PR_NOTE_MAX_LENGTH = 4000;
 
+/**
+ * Frozen prose supplied by the caller (KF-6): a non-empty string of at most
+ * 64 KiB carrying no secret shape. Returns a fixed reason or null; never
+ * echoes a value.
+ */
+const PROSE_MARKDOWN_MAX_BYTES = 64 * 1024;
+
+function proseMarkdownError(value: unknown): string | null {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    return 'proseMarkdown must be a non-empty string';
+  }
+  if (new TextEncoder().encode(value).byteLength > PROSE_MARKDOWN_MAX_BYTES) {
+    return 'proseMarkdown must be at most 64 KiB';
+  }
+  if (isPlanSecretShaped(value)) {
+    return 'proseMarkdown contains a secret-shaped value and was refused';
+  }
+  return null;
+}
 /** The runner agent pattern (KF-7): alphanumeric start, then letters, digits, dot, underscore, hyphen. */
 const AGENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
@@ -403,13 +425,29 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       return { reason: reviewerCheck.reason };
     }
 
-    const authored = await deps.briefAuthoring.authorBrief({
-      workOrderId: request.workOrderId,
-      laneId: request.laneId,
-      handWrittenBriefPath: request.handWrittenBriefPath ?? deps.handWrittenBriefPath ?? null,
-    });
-    if (authored.outcome === 'unavailable') {
-      return { reason: authored.reason };
+    let authored: Extract<AuthoredBriefResult, { readonly outcome: 'authored' }>;
+    if (request.proseMarkdown !== undefined) {
+      const proseError = proseMarkdownError(request.proseMarkdown);
+      if (proseError !== null) {
+        return { reason: proseError };
+      }
+      authored = {
+        outcome: 'authored',
+        brief: {
+          proseMarkdown: request.proseMarkdown,
+          provenance: 'hand-written-file',
+        },
+      };
+    } else {
+      const authoredResult = await deps.briefAuthoring.authorBrief({
+        workOrderId: request.workOrderId,
+        laneId: request.laneId,
+        handWrittenBriefPath: request.handWrittenBriefPath ?? deps.handWrittenBriefPath ?? null,
+      });
+      if (authoredResult.outcome === 'unavailable') {
+        return { reason: authoredResult.reason };
+      }
+      authored = authoredResult;
     }
 
     const attemptId = request.attemptId ?? deps.attemptId ?? `${request.workOrderId}-attempt-1`;
@@ -417,6 +455,9 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     const verified = await deps.artifactPort.verifyIgnoredPaths({
       worktreePath: placementCheck.worktreePath,
       candidatePaths: ['.lane/brief.md', '.lane/brief-manifest.json', ...request.expectedArtifacts],
+      // KF-8: the verification runs on the worktree's recorded host, so a
+      // worktree on an ssh host is checked against that host's ignore rules.
+      ...(request.recordedHost !== undefined ? { recordedHost: request.recordedHost } : {}),
     });
     if (verified.outcome === 'not-ignored') {
       return {
@@ -504,6 +545,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       worktreePath: built.worktreePath,
       proseMarkdown: built.authored.brief.proseMarkdown,
       manifestJson: built.manifestJson,
+      ...(request.recordedHost !== undefined ? { recordedHost: request.recordedHost } : {}),
     });
     if (placed.outcome === 'refused') {
       return { outcome: 'rejected', reason: placed.reason };

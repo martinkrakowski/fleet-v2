@@ -23,6 +23,10 @@ export type LaneRunFirstReservationResult =
       readonly hostName: string;
       readonly hostKind: RunnerKind;
       readonly worktreePath: string;
+      /** The reservation record's transport; a legacy record derives it from the alias. */
+      readonly transport: 'local' | 'ssh';
+      readonly sshAlias: string | null;
+      readonly port: number | null;
     }
   | { readonly outcome: 'no-capacity' }
   | {

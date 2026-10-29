@@ -381,3 +381,86 @@ describe('C1b dispatch refuses until the prior attempt is collected', () => {
     expect(attemptRepo.listCalls()).toBe(0);
   });
 });
+
+describe('PrepareFixAttemptUseCase brief package fields (KF-6)', () => {
+  const briefFixRequest = {
+    fixAttemptId: 'attempt-fix-1',
+    workOrderId: 'wo-1',
+    priorAttemptId: 'attempt-1',
+    numberedFixes: ['1. example fix'],
+    nowIso: '2026-10-27T10:00:00.000Z',
+  };
+
+  function makeBriefPrepareSetup() {
+    const attemptRepo = makeAttemptRepo();
+    attemptRepo.attempts.set('attempt-1', attempt({ state: 'collected' }));
+    const useCase = new PrepareFixAttemptUseCase({
+      attemptRepo: attemptRepo as unknown as AttemptRepositoryPort,
+    });
+    return { attemptRepo, useCase };
+  }
+
+  it('stores briefDigest and briefPackagePath when both are given', async () => {
+    const { attemptRepo, useCase } = makeBriefPrepareSetup();
+    const result = await useCase.prepareFixAttempt({
+      ...briefFixRequest,
+      briefDigest: 'digest-9',
+      briefPackagePath: '.lane/brief.md',
+    } as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0]);
+
+    expect(result.outcome).toBe('prepared');
+    const saved = attemptRepo.attempts.get('attempt-fix-1');
+    expect(saved?.briefDigest).toBe('digest-9');
+    expect(saved?.briefPackagePath).toBe('.lane/brief.md');
+  });
+
+  it('keeps briefDigest and briefPackagePath null when neither is given', async () => {
+    const { attemptRepo, useCase } = makeBriefPrepareSetup();
+    const result = await useCase.prepareFixAttempt(
+      briefFixRequest as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('prepared');
+    const saved = attemptRepo.attempts.get('attempt-fix-1');
+    expect(saved?.briefDigest).toBeNull();
+    expect(saved?.briefPackagePath).toBeNull();
+  });
+
+  it('refuses one without the other', async () => {
+    const { attemptRepo, useCase } = makeBriefPrepareSetup();
+
+    const onlyDigest = await useCase.prepareFixAttempt({
+      ...briefFixRequest,
+      briefDigest: 'digest-9',
+    } as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0]);
+    expect(onlyDigest).toEqual({
+      outcome: 'refused',
+      reason: 'briefDigest and briefPackagePath must be given together',
+    });
+
+    const onlyPath = await useCase.prepareFixAttempt({
+      ...briefFixRequest,
+      briefPackagePath: '.lane/brief.md',
+    } as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0]);
+    expect(onlyPath).toEqual({
+      outcome: 'refused',
+      reason: 'briefDigest and briefPackagePath must be given together',
+    });
+    expect(attemptRepo.attempts.has('attempt-fix-1')).toBe(false);
+  });
+
+  it('refuses empty brief package fields', async () => {
+    const { attemptRepo, useCase } = makeBriefPrepareSetup();
+    const result = await useCase.prepareFixAttempt({
+      ...briefFixRequest,
+      briefDigest: ' ',
+      briefPackagePath: '.lane/brief.md',
+    } as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0]);
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'briefDigest and briefPackagePath must be non-empty strings',
+    });
+    expect(attemptRepo.attempts.has('attempt-fix-1')).toBe(false);
+  });
+});

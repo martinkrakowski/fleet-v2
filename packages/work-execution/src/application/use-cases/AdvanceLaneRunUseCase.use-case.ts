@@ -60,6 +60,7 @@ import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out
 import type { ConductorForgeGrantPort } from '../ports/out/ConductorForgeGrantPort.out-port.js';
 import type { ReviewRequestPort } from '../ports/out/ReviewRequestPort.out-port.js';
 import type { PrepareFixAttemptPort } from '../ports/in/PrepareFixAttemptPort.in-port.js';
+import type { PrepareBriefPackagePort } from '../ports/in/PrepareBriefPackagePort.in-port.js';
 import type { ReviewAssessmentPort } from '../ports/out/ReviewAssessmentPort.out-port.js';
 import type { AcceptanceAssessmentPort } from '../ports/out/AcceptanceAssessmentPort.out-port.js';
 import type { CiStatePort } from '../ports/out/CiStatePort.out-port.js';
@@ -131,6 +132,8 @@ export interface AdvanceLaneRunDependencies {
   readonly workOrderRepo?: Pick<WorkOrderRepositoryPort, 'findWorkOrderById'>;
   /** K5-5: prepares a fix-round attempt from numbered findings (plan §3.3 Fix row). */
   readonly prepareFixAttempt?: PrepareFixAttemptPort;
+  /** KF-6: places the fix round's brief package from the prior attempt's frozen manifest before dispatch. */
+  readonly prepareBrief?: PrepareBriefPackagePort;
   /**
    * Resolve the runner that addresses a host for the dispatch reconcile's
    * worktree read (K4-7); absent → a dispatch reconcile that needs the

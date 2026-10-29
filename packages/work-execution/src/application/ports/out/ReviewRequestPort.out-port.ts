@@ -51,10 +51,14 @@ export type ReviewNoReceiptReason = (typeof REVIEW_NO_RECEIPT_REASONS)[number];
 
 export type ReviewRequestResult =
   | { readonly outcome: 'receipt'; readonly receipt: ReviewReceiptSummary }
-  /** The review ran or was attempted and recorded nothing (§3.4: re-run once, then the next seat). */
-  | { readonly outcome: 'no-receipt'; readonly reason: ReviewNoReceiptReason }
+  /**
+   * The review ran or was attempted and recorded nothing (§3.4: re-run once,
+   * then the next seat). `detail` is the fixed reason code when it matches the
+   * run-journal pattern (KF-14a), else null.
+   */
+  | { readonly outcome: 'no-receipt'; readonly reason: ReviewNoReceiptReason; readonly detail: string | null }
   /** Refused before any review ran; nothing recorded. */
-  | { readonly outcome: 'refused'; readonly reason: ReviewRequestRefusal }
+  | { readonly outcome: 'refused'; readonly reason: ReviewRequestRefusal; readonly detail: string | null }
   /** Nothing is established (a throw, or a receipt that does not match the request): reconcile by request id. */
   | { readonly outcome: 'unknown'; readonly reason: 'delegate-failed' | 'receipt-mismatch' };
 

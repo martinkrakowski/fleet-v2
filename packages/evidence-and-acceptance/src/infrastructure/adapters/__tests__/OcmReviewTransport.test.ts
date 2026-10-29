@@ -17,6 +17,7 @@ import {
   READ_ONLY_REVIEW_SHELL_COMMANDS,
   REVIEW_CHECKLIST,
   REVIEW_REPLY_CONTRACT,
+  ReviewTransportError,
 } from '../OcmReviewTransport.adapter.js';
 
 function extractPromptNonce(prompt: string): string {
@@ -57,6 +58,44 @@ describe('OcmReviewTransport', () => {
       /reviewer model mismatch: request specified "openai\/gpt-4o" but transport configured for "google\/gemini-1.5-pro"/,
     );
     expect(spawnCalled).toBe(false);
+  });
+
+  it('a route of kind none throws ReviewTransportError with the route code before any work', async () => {
+    let spawnCalled = false;
+    const fakeSpawn: OcmReviewTransportSpawn = async () => {
+      spawnCalled = true;
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      route: { kind: 'none', reason: 'attempt ran on an agy host', code: 'route-not-opencode' },
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    await expect(transport(baseRequest)).rejects.toBeInstanceOf(ReviewTransportError);
+    await expect(transport(baseRequest)).rejects.toMatchObject({ code: 'route-not-opencode' });
+    expect(spawnCalled).toBe(false);
+  });
+
+  it('a route of kind none without a code is route-unresolved', async () => {
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      route: { kind: 'none', reason: 'attempt ran on an agy host' },
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+    });
+
+    await expect(transport(baseRequest)).rejects.toMatchObject({ code: 'route-unresolved' });
   });
 
   it('null dir throws and does not spawn', async () => {

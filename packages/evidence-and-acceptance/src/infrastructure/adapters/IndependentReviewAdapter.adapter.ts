@@ -12,6 +12,7 @@ import type {
   RunIndependentReviewRequest,
   RunIndependentReviewResult,
 } from '../../application/ports/out/IndependentReviewPort.out-port.js';
+import { ReviewTransportError } from './OcmReviewTransport.adapter.js';
 
 export interface IndependentReviewTransportResult {
   readonly rawOutput: string;
@@ -51,6 +52,7 @@ export class IndependentReviewAdapter implements IndependentReviewPort {
       return {
         outcome: 'unavailable',
         reason: 'Independent review requires a candidate head and both model identities',
+        code: 'transport-failed',
       };
     }
     if (
@@ -63,6 +65,7 @@ export class IndependentReviewAdapter implements IndependentReviewPort {
       return {
         outcome: 'unavailable',
         reason: `Reviewer ${request.reviewerModel} and implementer ${request.implementerModel} share the same underlying model`,
+        code: 'same-family',
       };
     }
 
@@ -71,6 +74,7 @@ export class IndependentReviewAdapter implements IndependentReviewPort {
       return {
         outcome: 'unavailable',
         reason: 'No independent review transport is configured',
+        code: 'transport-missing',
       };
     }
 
@@ -78,9 +82,13 @@ export class IndependentReviewAdapter implements IndependentReviewPort {
     try {
       review = await runReview(request);
     } catch (error) {
+      if (error instanceof ReviewTransportError) {
+        return { outcome: 'unavailable', reason: error.message, code: error.code };
+      }
       return {
         outcome: 'unavailable',
         reason: error instanceof Error ? error.message : 'Independent review transport failed',
+        code: 'transport-failed',
       };
     }
 

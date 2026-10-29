@@ -240,6 +240,7 @@ function stopIntentEntry(harness: Harness, nowIso: string, expectedRevision: num
     mintedId: null,
     outcome: null,
     reasonCode: null,
+    detail: null,
     grantId: null,
     state: null,
   };

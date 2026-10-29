@@ -76,7 +76,7 @@ class StubReviewer implements IndependentReviewPort {
   ): Promise<RunIndependentReviewResult> {
     this.calls.push(request);
     if (this.outcome.unavailableReason !== undefined) {
-      return { outcome: 'unavailable', reason: this.outcome.unavailableReason };
+      return { outcome: 'unavailable', reason: this.outcome.unavailableReason, code: 'transport-failed' };
     }
     return {
       outcome: 'completed',
@@ -403,6 +403,38 @@ describe('review kind and request id (PC-1)', () => {
       });
       const result = rejectionOf(await useCase.requestIndependentReview(testCase.request));
       expect(result.rejection).toBe(testCase.expected);
+    }
+  });
+
+  it('carries the fixed reason code on conductor rejections', async () => {
+    const cases: Array<{
+      name: string;
+      reviewer: StubReviewer;
+      request: RequestIndependentReviewRequest;
+      expectedCode: string;
+    }> = [
+      {
+        name: 'review-unavailable carries the adapter code',
+        reviewer: new StubReviewer({ unavailableReason: 'transport down' }),
+        request: baseRequest({ kind: 'brief-check', requestId: REQUEST_ID }),
+        expectedCode: 'transport-failed',
+      },
+      {
+        name: 'not-read-only carries its fixed code',
+        reviewer: new StubReviewer({ readOnlyVerified: false }),
+        request: baseRequest({ kind: 'brief-check', requestId: REQUEST_ID }),
+        expectedCode: 'not-read-only',
+      },
+    ];
+    for (const testCase of cases) {
+      const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+      const useCase = new RequestIndependentReviewUseCase({
+        repo,
+        reviewer: testCase.reviewer,
+        archive: new StubArchive(),
+      });
+      const result = rejectionOf(await useCase.requestIndependentReview(testCase.request));
+      expect(result.code).toBe(testCase.expectedCode);
     }
   });
 

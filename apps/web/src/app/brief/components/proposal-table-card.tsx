@@ -22,8 +22,8 @@ import styles from "../brief.module.css";
 
 const FREEZE_ROUTE_NOTE = "gap · the live freeze route is not on this station";
 
-const badgeKind = (kind: ProposalFixture["kind"]) =>
-  kind === "keeper" ? "keeper" : kind === "candidate" ? "candidate" : "candidate";
+const badgeKind = (kind: ProposalFixture["kind"]): "keeper" | "candidate" =>
+  kind === "keeper" ? "keeper" : "candidate";
 
 export interface ProposalTableCardProps {
   proposals: ProposalFixture[];

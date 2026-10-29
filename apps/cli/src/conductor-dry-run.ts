@@ -37,6 +37,7 @@ export interface DryRunRecorder {
   readonly calls: readonly {
     readonly port: string;
     readonly attemptId: string | null;
+    readonly recordedHostName?: string | null;
     /** The minted request id a review act journalled, for the review ports. */
     readonly requestId?: string;
   }[];
@@ -148,7 +149,7 @@ export function createDryRunFakes(
   },
   nowIso: () => string,
 ): DryRunFakes {
-  const calls: { readonly port: string; readonly attemptId: string | null; readonly requestId?: string }[] = [];
+  const calls: { readonly port: string; readonly attemptId: string | null; readonly requestId?: string; readonly recordedHostName?: string | null }[] = [];
   const recordCall = (port: string, request?: object): void => {
     const field = (name: string): string | undefined => {
       if (request === undefined || !(name in request)) {
@@ -159,10 +160,14 @@ export function createDryRunFakes(
     };
     const attemptId = field('attemptId');
     const requestId = field('requestId');
+    // KF-9: a brief-package request records the host it was addressed to, so a
+    // dry run can prove the fix brief was placed on the reserved host.
+    const recordedHost = (request as { recordedHost?: { readonly host?: string | null; readonly hostName?: string | null } | null } | undefined)?.recordedHost;
     calls.push({
       port,
       attemptId: attemptId ?? null,
       ...(requestId !== undefined ? { requestId } : {}),
+      ...(recordedHost !== undefined ? { recordedHostName: recordedHost?.hostName ?? recordedHost?.host ?? null } : {}),
     });
   };
   let sessionSequence = 0;

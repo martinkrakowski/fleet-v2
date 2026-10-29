@@ -1,0 +1,519 @@
+/**
+ * Redaction tests (plan §3.2, OT1r): `redactionChecks` over a stub mapper and
+ * a stub encoder that live in this file, because the nominal `TelemetrySpan`,
+ * the mapper and the encoder are later lanes (OT1a-3, OT1b, OT3a). The stub
+ * mapper builds attributes only from digests (`telemetryDigest`), enums,
+ * counts and the run id, and passes each through `filterTelemetryAttributes`.
+ * Names are `example` names only; the HMAC salt is an obvious fixture string,
+ * never a real secret, and every secret-shaped test string is built by
+ * concatenation at run time so no literal in this file matches a secret
+ * pattern or the lane diff check.
+ */
+
+import { createHmac } from 'node:crypto';
+import { describe, expect, it } from 'vitest';
+import {
+  filterTelemetryAttributes,
+  RUN_TELEMETRY_ATTRIBUTES,
+  TELEMETRY_SERVICE_NAME,
+  telemetryInvocationParameters,
+  telemetryResourceAttributes,
+  type TelemetryAttributeValue,
+  type TelemetrySpanKind,
+} from '../run-telemetry-attributes.js';
+import {
+  telemetryDigest,
+  telemetryHashInput,
+  type TelemetryHmac,
+} from '../run-telemetry-ids.js';
+import {
+  redactionChecks,
+  TELEMETRY_REDACTION_CHECKS,
+  type TelemetryRedactionCheck,
+  type TelemetryRedactionCheckResult,
+  type TelemetryRedactionReport,
+} from '../run-telemetry-redaction.js';
+
+const SALT = 'example-telemetry-salt-fixture';
+const hmac: TelemetryHmac = (message) => createHmac('sha256', SALT).update(message, 'utf8').digest();
+
+const RUN_ID = 'run-01JB0000000000000000000000';
+const WORK_ORDER_ID = 'example-work-order-1';
+const ATTEMPT_ID = 'example-attempt-1';
+
+/** The salted digest of a fixture id (the domain's own digest path). */
+function digestOf(kind: 'work-order' | 'attempt' | 'project', raw: string): string {
+  const input = telemetryHashInput(raw);
+  if (input === null) {
+    throw new Error(`fixture hash input refused: ${kind}`);
+  }
+  const digest = telemetryDigest(hmac, kind, input);
+  if (digest === null) {
+    throw new Error(`fixture digest failed: ${kind}`);
+  }
+  return digest;
+}
+
+/** A fixture attempt, journal entry, receipt or run, as the mapper would see it. */
+interface StubFixture {
+  readonly spanKind: TelemetrySpanKind;
+  readonly runId: string;
+  readonly workOrderId: string;
+  readonly attemptId: string;
+  readonly project: string;
+  readonly step: string;
+  readonly tags: readonly string[];
+  readonly round: number;
+  readonly seatIndex: number;
+  readonly seatTool: string;
+  readonly seatBilling: string;
+  readonly seatModel: string;
+  readonly seatProvider: string;
+  readonly findingsBlocker: number;
+  readonly findingsMajor: number;
+  readonly findingsMinor: number;
+  readonly findingsNit: number;
+  readonly gateExitCode: number;
+  readonly costBasis: string;
+  readonly usageSource: string;
+  readonly wallSeconds: number;
+  readonly prNumber: number;
+  readonly head12: string;
+  readonly meteredLlm: boolean;
+  /** Free text below: the mapper drops every one of these, never sent. */
+  readonly worktreePath: string;
+  readonly briefPath: string;
+  readonly host: string;
+  readonly hostId: string;
+  readonly detail: string;
+  readonly findingSummary: string;
+  readonly findingPath: string;
+  readonly dispositionReason: string;
+  readonly procedureName: string;
+  readonly evidenceRef: string;
+  readonly branch: string;
+  readonly receiptId: string;
+}
+
+const CANARY_TEXT_FIELDS = [
+  'worktreePath', 'briefPath', 'host', 'hostId', 'detail', 'findingSummary', 'findingPath',
+  'dispositionReason', 'procedureName', 'evidenceRef', 'branch', 'receiptId',
+] as const;
+
+function baseFixture(spanKind: TelemetrySpanKind, overrides: Partial<StubFixture> = {}): StubFixture {
+  return {
+    spanKind,
+    runId: RUN_ID,
+    workOrderId: WORK_ORDER_ID,
+    attemptId: ATTEMPT_ID,
+    project: 'example-project',
+    step: 'dispatch',
+    tags: ['conducted'],
+    round: 0,
+    seatIndex: 0,
+    seatTool: 'opencode',
+    seatBilling: 'metered',
+    seatModel: 'example-model',
+    seatProvider: 'example-provider',
+    findingsBlocker: 0,
+    findingsMajor: 1,
+    findingsMinor: 2,
+    findingsNit: 3,
+    gateExitCode: 0,
+    costBasis: 'metered',
+    usageSource: 'opencode-db',
+    wallSeconds: 12.5,
+    prNumber: 42,
+    head12: '0123456789ab',
+    meteredLlm: false,
+    worktreePath: '',
+    briefPath: '',
+    host: '',
+    hostId: '',
+    detail: '',
+    findingSummary: '',
+    findingPath: '',
+    dispositionReason: '',
+    procedureName: '',
+    evidenceRef: '',
+    branch: '',
+    receiptId: '',
+    ...overrides,
+  };
+}
+
+/** Every free-text field and every operator id set to `CANARY-<field>` (plan test 1). */
+function canaryOverrides(): Partial<StubFixture> {
+  const overrides: Record<string, string> = { workOrderId: 'CANARY-work-order', attemptId: 'CANARY-attempt', project: 'CANARY-project' };
+  for (const field of CANARY_TEXT_FIELDS) {
+    overrides[field] = `CANARY-${field}`;
+  }
+  return overrides as Partial<StubFixture>;
+}
+
+/**
+ * The stub mapper: only digests, enums, counts and the run id reach the
+ * candidate attributes; everything free-text is dropped, and each survivor
+ * passes `filterTelemetryAttributes`.
+ */
+function stubMap(fixture: StubFixture): Readonly<Record<string, TelemetryAttributeValue>> {
+  const meteredLlm = fixture.meteredLlm
+    ? {
+        'llm.model_name': fixture.seatModel,
+        'llm.provider': fixture.seatProvider,
+        'llm.invocation_parameters': telemetryInvocationParameters('example-variant') ?? '',
+        'llm.token_count.prompt': 120,
+        'llm.token_count.completion': 80,
+        'llm.token_count.total': 200,
+        'llm.cost.total': 0.25,
+      }
+    : {};
+  const candidate: Record<string, TelemetryAttributeValue | undefined> = {
+    'fleet.run.id': fixture.runId,
+    'fleet.work_order.digest': digestOf('work-order', fixture.workOrderId),
+    'session.id': digestOf('work-order', fixture.workOrderId),
+    'fleet.attempt.digest': digestOf('attempt', fixture.attemptId),
+    'fleet.project': fixture.project,
+    'fleet.step': fixture.step,
+    'fleet.round': fixture.round,
+    'fleet.seat.index': fixture.seatIndex,
+    'fleet.seat.tool': fixture.seatTool,
+    'fleet.seat.billing': fixture.seatBilling,
+    'fleet.seat.model': fixture.seatModel,
+    'fleet.seat.provider': fixture.seatProvider,
+    'fleet.review.findings.blocker': fixture.findingsBlocker,
+    'fleet.review.findings.major': fixture.findingsMajor,
+    'fleet.review.findings.minor': fixture.findingsMinor,
+    'fleet.review.findings.nit': fixture.findingsNit,
+    'fleet.gate.exit_code': fixture.gateExitCode,
+    'fleet.cost.basis': fixture.costBasis,
+    'fleet.usage.source': fixture.usageSource,
+    'fleet.usage.wall_seconds': fixture.wallSeconds,
+    'fleet.pr.number': fixture.prNumber,
+    'fleet.head12': fixture.head12,
+    'tag.tags': fixture.tags,
+    ...meteredLlm,
+  };
+  const present: Record<string, TelemetryAttributeValue> = {};
+  for (const key of Object.keys(candidate)) {
+    const value = candidate[key];
+    if (value !== undefined) {
+      present[key] = value;
+    }
+  }
+  return filterTelemetryAttributes(present, fixture.spanKind);
+}
+
+interface StubSpan {
+  readonly spanKind: TelemetrySpanKind;
+  readonly attributes: Readonly<Record<string, TelemetryAttributeValue>>;
+}
+
+interface StubResource {
+  readonly serviceVersion?: string;
+  readonly projectName?: string;
+}
+
+/** The OTLP/JSON attribute value shape for one filtered attribute. */
+function attributeValueToJson(key: string, value: TelemetryAttributeValue): Record<string, unknown> {
+  if (Array.isArray(value)) {
+    return { arrayValue: { values: value.map((item) => ({ stringValue: item })) } };
+  }
+  if (typeof value === 'string') {
+    return { stringValue: value };
+  }
+  const rule = RUN_TELEMETRY_ATTRIBUTES[key];
+  if (rule !== undefined && rule.type === 'int') {
+    return { intValue: value };
+  }
+  return { doubleValue: value };
+}
+
+/** The stub encoder: writes the OTLP/JSON shape the payload format defines. */
+function stubEncode(spans: readonly StubSpan[], resource: StubResource): Uint8Array {
+  const resourceAttributes = telemetryResourceAttributes({
+    serviceVersion: resource.serviceVersion ?? '1.0.0',
+    projectName: resource.projectName ?? 'example-project',
+  });
+  const payload = {
+    resourceSpans: [
+      {
+        resource: {
+          attributes: Object.entries(resourceAttributes).map(([key, value]) => ({ key, value: { stringValue: value } })),
+        },
+        scopeSpans: [
+          {
+            spans: spans.map((span) => ({
+              attributes: [
+                { key: 'openinference.span.kind', value: { stringValue: span.spanKind } },
+                { key: 'fleet.telemetry.schema', value: { intValue: 1 } },
+                ...Object.entries(span.attributes).map(([key, value]) => ({ key, value: attributeValueToJson(key, value) })),
+              ],
+            })),
+          },
+        ],
+      },
+    ],
+  };
+  return new TextEncoder().encode(JSON.stringify(payload));
+}
+
+function spanOf(fixture: StubFixture): StubSpan {
+  return { spanKind: fixture.spanKind, attributes: stubMap(fixture) };
+}
+
+/** The stub payload: one span per kind, with a metered LLM span. */
+function stubPayload(): Uint8Array {
+  return stubEncode(
+    [
+      spanOf(baseFixture('AGENT')),
+      spanOf(baseFixture('LLM', { meteredLlm: true })),
+      spanOf(baseFixture('TOOL')),
+      spanOf(baseFixture('CHAIN')),
+    ],
+    {},
+  );
+}
+
+/** A hand-written attribute of a hand-built payload. */
+interface HandAttribute {
+  readonly key: string;
+  readonly value: Record<string, unknown>;
+}
+
+/** Hand-built span attributes that pass every other check. */
+function handSpanAttributes(extra: readonly HandAttribute[]): readonly HandAttribute[] {
+  return [
+    { key: 'fleet.telemetry.schema', value: { intValue: 1 } },
+    { key: 'fleet.run.id', value: { stringValue: RUN_ID } },
+    ...extra,
+  ];
+}
+
+/** A hand-written OTLP/JSON payload with one resource and one span. */
+function handPayload(resourceAttributes: readonly HandAttribute[], spanAttributes: readonly HandAttribute[], spanKind: string): Uint8Array {
+  const payload = {
+    resourceSpans: [
+      {
+        resource: { attributes: resourceAttributes },
+        scopeSpans: [{ spans: [{ attributes: [{ key: 'openinference.span.kind', value: { stringValue: spanKind } }, ...spanAttributes] }] }],
+      },
+    ],
+  };
+  return new TextEncoder().encode(JSON.stringify(payload));
+}
+
+const RESOURCE_NAME_ONLY: readonly HandAttribute[] = [{ key: 'service.name', value: { stringValue: TELEMETRY_SERVICE_NAME } }];
+
+/** The report entry for one check name. */
+function check(report: TelemetryRedactionReport, name: TelemetryRedactionCheck): TelemetryRedactionCheckResult {
+  const found = report.checks.find((entry) => entry.check === name);
+  if (found === undefined) {
+    throw new Error(`missing check: ${name}`);
+  }
+  return found;
+}
+
+/** Report hygiene: the serialised report names no canary, key or value. */
+function expectNoLeak(report: TelemetryRedactionReport, secrets: readonly string[]): void {
+  const text = JSON.stringify(report);
+  for (const secret of secrets) {
+    expect(text).not.toContain(secret);
+  }
+}
+
+describe('redactionChecks (OT1r)', () => {
+  it('drops every canary string field and passes (plan test 1)', () => {
+    const fixtures = [
+      baseFixture('AGENT', canaryOverrides()),
+      baseFixture('LLM', { meteredLlm: true, ...canaryOverrides() }),
+      baseFixture('TOOL', canaryOverrides()),
+      baseFixture('CHAIN', canaryOverrides()),
+    ];
+    const bytes = stubEncode(fixtures.map(spanOf), { projectName: 'CANARY-project', serviceVersion: 'CANARY-version' });
+    const text = new TextDecoder().decode(bytes);
+    expect(text).not.toContain('CANARY');
+
+    const payload = JSON.parse(text) as { resourceSpans: [{ resource: { attributes: { key: string }[] } }] };
+    const resourceKeys = payload.resourceSpans[0].resource.attributes.map((attribute) => attribute.key);
+    // The invalid project alias and build version were dropped by the mapper.
+    expect(resourceKeys).toEqual(['service.name']);
+
+    const canaries = [
+      ...CANARY_TEXT_FIELDS.map((field) => `CANARY-${field}`),
+      'CANARY-work-order',
+      'CANARY-attempt',
+      'CANARY-project',
+      'CANARY-version',
+    ];
+    const report = redactionChecks(bytes, canaries);
+    expect(report.pass).toBe(true);
+    expect(report.checks.every((entry) => entry.pass)).toBe(true);
+  });
+
+  it('sends operator ids only as their 16-hex digests (plan test 2)', () => {
+    const workOrderBranch = 'feat/acme-billing-CANARY';
+    const workOrderClient = 'CANARY Client Ltd';
+    const attemptId = workOrderBranch + '#1';
+    const bytes = stubEncode(
+      [
+        spanOf(baseFixture('AGENT', { workOrderId: workOrderBranch, attemptId })),
+        spanOf(baseFixture('CHAIN', { workOrderId: workOrderClient })),
+      ],
+      {},
+    );
+    const text = new TextDecoder().decode(bytes);
+    expect(text).not.toContain(workOrderBranch);
+    expect(text).not.toContain(workOrderClient);
+    expect(text).not.toContain(attemptId);
+    expect(text).toContain(digestOf('work-order', workOrderBranch));
+    expect(text).toContain(digestOf('work-order', workOrderClient));
+    expect(text).toContain(digestOf('attempt', attemptId));
+    const report = redactionChecks(bytes, [workOrderBranch, workOrderClient, attemptId]);
+    expect(report.pass).toBe(true);
+    expectNoLeak(report, [workOrderBranch, workOrderClient, attemptId]);
+  });
+
+  it('the stub payload passes every check (plan test 3)', () => {
+    const report = redactionChecks(stubPayload(), []);
+    expect(report.pass).toBe(true);
+  });
+
+  it('a span key outside the allow-list fails key-allow-list (plan test 3)', () => {
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'example.not.allowed', value: { stringValue: 'example-value' } }]), 'AGENT');
+    const report = redactionChecks(bytes, []);
+    expect(report.pass).toBe(false);
+    expect(check(report, 'key-allow-list').pass).toBe(false);
+    expectNoLeak(report, ['example.not.allowed', 'example-value']);
+  });
+
+  it('a never-sent key fails key-allow-list (plan test 3)', () => {
+    const inputValue = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'input.value', value: { stringValue: 'example-text' } }]), 'AGENT');
+    const httpUrl = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'http.url', value: { stringValue: 'https://example.invalid' } }]), 'AGENT');
+    for (const bytes of [inputValue, httpUrl]) {
+      const report = redactionChecks(bytes, []);
+      expect(check(report, 'key-allow-list').pass).toBe(false);
+    }
+  });
+
+  it('an unknown resource key fails key-allow-list (plan test 3)', () => {
+    const bytes = handPayload(
+      [RESOURCE_NAME_ONLY[0], { key: 'host.name', value: { stringValue: 'example-host' } }],
+      handSpanAttributes([]),
+      'AGENT',
+    );
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'key-allow-list').pass).toBe(false);
+  });
+
+  it('fleet.round as a string fails values (plan test 4)', () => {
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.round', value: { stringValue: '1' } }]), 'AGENT');
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'key-allow-list').pass).toBe(true);
+    expect(check(report, 'values').pass).toBe(false);
+  });
+
+  it('a 15-hex digest fails values (plan test 4)', () => {
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.work_order.digest', value: { stringValue: 'a'.repeat(15) } }]), 'AGENT');
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'values').pass).toBe(false);
+    expectNoLeak(report, ['a'.repeat(15)]);
+  });
+
+  it('a NaN written as a string doubleValue fails values (plan test 4)', () => {
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.usage.wall_seconds', value: { doubleValue: 'NaN' } }]), 'AGENT');
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'values').pass).toBe(false);
+    expectNoLeak(report, ['NaN', 'fleet.usage.wall_seconds']);
+  });
+
+  it('llm.model_name on a non-LLM span fails values (plan test 4)', () => {
+    const bytes = handPayload(
+      RESOURCE_NAME_ONLY,
+      handSpanAttributes([
+        { key: 'fleet.seat.billing', value: { stringValue: 'metered' } },
+        { key: 'llm.model_name', value: { stringValue: 'example-model' } },
+      ]),
+      'CHAIN',
+    );
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'values').pass).toBe(false);
+    expectNoLeak(report, ['llm.model_name', 'example-model']);
+  });
+
+  it('a value object with two fields fails values (plan test 4)', () => {
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.round', value: { stringValue: '1', intValue: 1 } }]), 'AGENT');
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'values').pass).toBe(false);
+  });
+
+  it('fixtures seeded with secret shapes in every free-text field still encode to a passing payload (plan test 5)', () => {
+    const githubToken = 'gh' + 'p_' + 'a'.repeat(36);
+    const awsKey = 'AKIA' + 'A'.repeat(16);
+    const overrides: Record<string, string> = { workOrderId: githubToken, attemptId: awsKey, project: githubToken };
+    let index = 0;
+    for (const field of CANARY_TEXT_FIELDS) {
+      overrides[field] = index % 2 === 0 ? 'note ' + githubToken : 'note ' + awsKey;
+      index += 1;
+    }
+    const bytes = stubEncode(
+      [spanOf(baseFixture('AGENT', overrides as Partial<StubFixture>)), spanOf(baseFixture('LLM', { meteredLlm: true, ...overrides } as Partial<StubFixture>))],
+      { projectName: githubToken, serviceVersion: awsKey },
+    );
+    const text = new TextDecoder().decode(bytes);
+    expect(text).not.toContain(githubToken);
+    expect(text).not.toContain(awsKey);
+    const report = redactionChecks(bytes, [githubToken, awsKey]);
+    expect(report.pass).toBe(true);
+    expect(check(report, 'secret-shapes').pass).toBe(true);
+  });
+
+  it('a hand-written payload whose string value is secret-shaped fails secret-shapes (plan test 5)', () => {
+    const githubToken = 'gh' + 'p_' + 'a'.repeat(36);
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.seat.model', value: { stringValue: githubToken } }]), 'AGENT');
+    const report = redactionChecks(bytes, [githubToken]);
+    expect(check(report, 'secret-shapes').pass).toBe(false);
+    expectNoLeak(report, [githubToken, 'fleet.seat.model']);
+  });
+
+  it('refuses payloads that do not parse, with every check failed (robustness)', () => {
+    const notUtf8 = new Uint8Array([0xff, 0xfe, 0x61, 0x62]);
+    const reports = [
+      redactionChecks(notUtf8, []),
+      redactionChecks(new TextEncoder().encode('[]'), []),
+      redactionChecks(new TextEncoder().encode('{}'), []),
+      redactionChecks(new TextEncoder().encode('{"resourceSpans":"nope"}'), []),
+    ];
+    for (const report of reports) {
+      expect(report.pass).toBe(false);
+      expect(report.checks.every((entry) => !entry.pass && entry.offendingSpans === 0)).toBe(true);
+    }
+  });
+
+  it('skips blank or very short canaries and counts them (robustness)', () => {
+    const report = redactionChecks(stubPayload(), ['', '   ', 'ab']);
+    expect(report.pass).toBe(true);
+    expect(report.skippedCanaries).toBe(3);
+  });
+
+  it('counts the spans whose attributes contain a canary (robustness)', () => {
+    const bytes = stubEncode([spanOf(baseFixture('AGENT')), spanOf(baseFixture('TOOL'))], {});
+    const report = redactionChecks(bytes, ['example-model']);
+    expect(report.pass).toBe(false);
+    // Both fixture spans carry the model id, so both offend.
+    expect(check(report, 'canaries').offendingSpans).toBe(2);
+  });
+
+  it('the report is frozen and lists the checks in order (robustness)', () => {
+    const report = redactionChecks(stubPayload(), []);
+    expect(Object.isFrozen(report)).toBe(true);
+    expect(Object.isFrozen(report.checks)).toBe(true);
+    for (const entry of report.checks) {
+      expect(Object.isFrozen(entry)).toBe(true);
+    }
+    expect(report.checks.map((entry) => entry.check)).toEqual([...TELEMETRY_REDACTION_CHECKS]);
+  });
+
+  it.todo('adapter errors name an error kind, never the endpoint, a header or a body (belongs with the sender, OT3b)');
+  it.todo('a cast object literal is refused by the encoder (belongs with the encoder and the nominal span, OT3a and OT1a-3)');
+});

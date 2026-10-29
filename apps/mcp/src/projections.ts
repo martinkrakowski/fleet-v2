@@ -425,7 +425,8 @@ function projectFindings(findings: unknown): HeadFindingCountsProjection {
       }
     }
   }
-  const total = bySeverity.blocker + bySeverity.major + bySeverity.minor + bySeverity.nit;
+  // Every finding counts in `total`, whatever its severity, so `unresolved` can never exceed it; the buckets may sum to less.
+  const total = Array.isArray(findings) ? findings.length : 0;
   return { total, bySeverity, unresolved };
 }
 

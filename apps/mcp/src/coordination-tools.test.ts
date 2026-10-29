@@ -5,6 +5,7 @@
 import { describe, expect, it } from "vitest";
 import type { ApiClientResult, FleetApiClient } from "./client.js";
 import { buildRegistry, type FleetRegistry } from "./registry.js";
+import { projectHeadEvidence } from "./projections.js";
 
 const HEAD = "0".repeat(40);
 const ISO_EXAMPLE = "2026-10-28T00:00:00.000Z";
@@ -650,3 +651,29 @@ describe("fleet_project_list tool", () => {
     });
   });
 });
+
+describe("head evidence finding counts (CodeRabbit #381)", () => {
+  it("counts a finding of an unknown severity in total, so unresolved never exceeds total", () => {
+    const projected = projectHeadEvidence({
+      outcome: "found",
+      assessment: {
+        id: "assessment-example-1",
+        reviewReceipts: [
+          {
+            id: "review-example-1",
+            findings: [
+              { severity: "major", state: "unresolved" },
+              { severity: "critical", state: "unresolved" },
+              { state: "unresolved" },
+            ],
+          },
+        ],
+      },
+    });
+    const counts = projected.assessment?.reviews[0]?.findings;
+    expect(counts?.total).toBe(3);
+    expect(counts?.unresolved).toBe(3);
+    expect(counts?.bySeverity.major).toBe(1);
+  });
+});
+

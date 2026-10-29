@@ -59,6 +59,7 @@ import {
   resolveWorkRunnerSettings,
   type WorkCrossContextDelegates,
 } from "./work/composition";
+import { readOwnerDecisionReferencesFromAttempt } from "@fleet/work-execution";
 
 export interface FleetApiRuntimeOptions {
   /** Shared persistence directory for every context's file-backed adapters. */
@@ -403,32 +404,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   const attemptOwnerDecisionDelegate: EvidenceAttemptOwnerDecisionDelegate & WorkAttemptOwnerDecisionDelegate = {
     // The doors come from the attempt record dispatch wrote from the
     // frozen brief package, never from a request body or worktree file.
-    readAttemptOwnerDecisionReferences: async (request) => {
-      const inspectAttempt = attemptLookup.inspectAttempt;
-      if (!inspectAttempt) {
-        return {
-          outcome: "unknown",
-          reason: "The work context is not wired for attempt inspection",
-        };
-      }
-      const inspection = await inspectAttempt.inspectAttempt({
-        attemptId: request.attemptId,
-      });
-      if (inspection.outcome !== "found") {
-        return {
-          outcome: "unknown",
-          reason: `No attempt is recorded for ${request.attemptId}`,
-        };
-      }
-      const recorded = inspection.attempt.ownerDecisionReferences;
-      if (recorded === undefined) {
-        return {
-          outcome: "unknown",
-          reason: `attempt ${request.attemptId} was recorded before owner decision references were frozen`,
-        };
-      }
-      return { outcome: "recorded", ownerDecisionReferences: recorded };
-    },
+    readAttemptOwnerDecisionReferences: (request) => readOwnerDecisionReferencesFromAttempt(attemptLookup, request),
   };
   const runReview = buildReviewTransport(stateDir, installation, options?.reviewSpawn);
   const evidence = createConfiguredEvidenceUseCases(

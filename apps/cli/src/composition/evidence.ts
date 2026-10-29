@@ -41,6 +41,7 @@ import {
 import type { FleetInstallationModel } from '@fleet/installation';
 
 import type { FleetCliRuntime, FleetCliRuntimeOptions } from '../composition.js';
+import { readOwnerDecisionReferencesFromAttempt } from '@fleet/work-execution';
 
 export interface ComposeEvidenceInput {
   readonly stateDir?: string;
@@ -171,32 +172,7 @@ export function composeEvidence(input: ComposeEvidenceInput) {
   // captured here and filled in once the work composition exists below.
   const attemptLookup: { inspectAttempt?: InspectAttemptUseCase } = {};
   const attemptOwnerDecision = new AttemptOwnerDecisionAdapter({
-    readAttemptOwnerDecisionReferences: async (request) => {
-      const inspectAttempt = attemptLookup.inspectAttempt;
-      if (!inspectAttempt) {
-        return {
-          outcome: 'unknown',
-          reason: 'The work context is not wired for attempt inspection',
-        };
-      }
-      const inspection = await inspectAttempt.inspectAttempt({
-        attemptId: request.attemptId,
-      });
-      if (inspection.outcome !== 'found') {
-        return {
-          outcome: 'unknown',
-          reason: `No attempt is recorded for ${request.attemptId}`,
-        };
-      }
-      const recorded = inspection.attempt.ownerDecisionReferences;
-      if (recorded === undefined) {
-        return {
-          outcome: 'unknown',
-          reason: `attempt ${request.attemptId} was recorded before owner decision references were frozen`,
-        };
-      }
-      return { outcome: 'recorded', ownerDecisionReferences: recorded };
-    },
+    readAttemptOwnerDecisionReferences: (request) => readOwnerDecisionReferencesFromAttempt(attemptLookup, request),
   });
 
   const evidence = {

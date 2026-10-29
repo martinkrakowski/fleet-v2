@@ -238,6 +238,10 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       implementerModel: request.implementerModel,
       reviewerModel: request.reviewerModel,
       diffSummary: request.diffSummary,
+      // Conductor fields flow through only when defined, so a manual request's
+      // transport call carries exactly the five fields it carried before.
+      ...(request.kind !== undefined ? { kind: request.kind } : {}),
+      ...(request.briefText !== undefined ? { briefText: request.briefText } : {}),
     });
     if (run.outcome === 'unavailable') {
       try {

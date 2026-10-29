@@ -22,11 +22,14 @@ import type {
   ReviewRejection,
 } from '@fleet/evidence-and-acceptance';
 import type {
+  FindLatestReceiptOfKindRequest,
+  FindLatestReceiptOfKindResult,
   FindReviewReceiptRequest,
   FindReviewReceiptResult,
   ReviewRequest,
   ReviewRequestPort,
   ReviewRequestResult,
+  ReviewReceiptOfKind,
   ReviewReceiptSummary,
   ReviewVerdict,
 } from '../../application/ports/out/ReviewRequestPort.out-port.js';
@@ -74,6 +77,14 @@ function isValidFindReceiptRequest(request: FindReviewReceiptRequest): boolean {
   );
 }
 
+function isValidFindLatestReceiptOfKindRequest(request: FindLatestReceiptOfKindRequest): boolean {
+  return (
+    isNonEmptyTrimmed(request.attemptId) &&
+    HEAD_PATTERN.test(request.candidateHeadSha) &&
+    isReviewKind(request.kind)
+  );
+}
+
 function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
   if (result === 'pass') {
     return 'passed';
@@ -88,11 +99,11 @@ function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
  * One shared summary builder used by requestReview and findReviewReceipt. The kind and request id are the
  * values the caller has already matched on the receipt; nothing is defaulted here.
  */
-function summaryOf(
+function receiptOfKindSummaryOf(
   receipt: ReviewReceiptRecord,
   kind: ReviewReceiptSummary['kind'],
-  requestId: string,
-): ReviewReceiptSummary {
+  requestId: string | null,
+): ReviewReceiptOfKind {
   return {
     receiptId: receipt.id,
     requestId,
@@ -108,6 +119,14 @@ function summaryOf(
       line: finding.line,
     })),
   };
+}
+
+function summaryOf(
+  receipt: ReviewReceiptRecord,
+  kind: ReviewReceiptSummary['kind'],
+  requestId: string,
+): ReviewReceiptSummary {
+  return { ...receiptOfKindSummaryOf(receipt, kind, requestId), requestId };
 }
 
 function mapRejection(rejection: ReviewRejection | undefined): ReviewRequestResult {
@@ -219,5 +238,51 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
     return { outcome: 'found', receipt: summaryOf(only, only.kind, request.requestId) };
+  }
+
+  async findLatestReceiptOfKind(
+    request: FindLatestReceiptOfKindRequest,
+  ): Promise<FindLatestReceiptOfKindResult> {
+    if (!isValidFindLatestReceiptOfKindRequest(request)) {
+      return { outcome: 'unavailable', reason: 'invalid-request' };
+    }
+    if (!this.delegates.inspectAcceptanceEvidence) {
+      return { outcome: 'unavailable', reason: 'not-configured' };
+    }
+    let inspected: InspectAcceptanceEvidenceResult;
+    try {
+      inspected = await this.delegates.inspectAcceptanceEvidence({
+        assessmentId: assessmentIdForAttempt(request.attemptId),
+      });
+    } catch {
+      return { outcome: 'unavailable', reason: 'unreadable' };
+    }
+    if (inspected.outcome === 'not-found') {
+      return { outcome: 'not-found' };
+    }
+    const assessment = inspected.assessment;
+    if (assessment.attemptId !== request.attemptId) {
+      return { outcome: 'not-found' };
+    }
+    const candidates = assessment.reviewReceipts.filter(
+      (receipt): receipt is ReviewReceiptRecord & { kind: ReviewReceiptSummary['kind'] } =>
+        receipt.kind === request.kind &&
+        receipt.attemptId === request.attemptId &&
+        receipt.candidateHeadSha === request.candidateHeadSha,
+    );
+    if (candidates.length === 0) {
+      return { outcome: 'not-found' };
+    }
+    const [first, ...rest] = candidates;
+    let latest = first;
+    for (const candidate of rest) {
+      if (candidate.completedAtIso >= latest.completedAtIso) {
+        latest = candidate;
+      }
+    }
+    return {
+      outcome: 'found',
+      receipt: receiptOfKindSummaryOf(latest, latest.kind, latest.requestId ?? null),
+    };
   }
 }

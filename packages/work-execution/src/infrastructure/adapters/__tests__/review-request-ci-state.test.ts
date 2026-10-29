@@ -22,6 +22,7 @@ import type {
   ReviewRejection,
 } from '@fleet/evidence-and-acceptance';
 import type {
+  FindLatestReceiptOfKindRequest,
   ReviewRequest,
   ReviewRequestResult,
 } from '../../../application/ports/out/ReviewRequestPort.out-port.js';
@@ -596,6 +597,202 @@ describe('ReviewRequestAdapter.findReviewReceipt', () => {
 
     expect(result).toEqual({ outcome: 'unavailable', reason: 'not-configured' });
   });
+});
+
+describe('ReviewRequestAdapter.findLatestReceiptOfKind', () => {
+  const makeFindRequest = (
+    overrides: Partial<FindLatestReceiptOfKindRequest> = {},
+  ): FindLatestReceiptOfKindRequest => ({
+    attemptId: 'attempt-example-1',
+    candidateHeadSha: HEAD,
+    kind: KIND,
+    ...overrides,
+  });
+
+  it('is not-found when no receipt matches', async () => {
+    const { inspectAcceptanceEvidence } = makeInspectFake({
+      outcome: 'found',
+      assessment: makeAssessment({ reviewReceipts: [] }),
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const result = await adapter.findLatestReceiptOfKind(makeFindRequest());
+
+    expect(result).toEqual({ outcome: 'not-found' });
+    expect(JSON.stringify(result)).not.toContain('evidence://');
+  });
+
+  it('finds the one receipt of the kind with requestId equal to the receipt\'s', async () => {
+    const { calls, inspectAcceptanceEvidence } = makeInspectFake({
+      outcome: 'found',
+      assessment: makeAssessment(),
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const result = await adapter.findLatestReceiptOfKind(makeFindRequest());
+
+    expect(result).toEqual({ outcome: 'found', receipt: EXPECTED_SUMMARY });
+    expect(calls).toEqual([{ assessmentId: ASSESSMENT_ID }]);
+  });
+
+  it('returns the receipt with the greater completedAtIso when the older is listed last', async () => {
+    const { inspectAcceptanceEvidence } = makeInspectFake({
+      outcome: 'found',
+      assessment: makeAssessment({
+        reviewReceipts: [
+          makeReceipt({ id: RECEIPT_ID + '-newer', completedAtIso: '2026-10-28T12:00:00.000Z' }),
+          makeReceipt({ id: RECEIPT_ID + '-older', completedAtIso: '2026-10-28T06:00:00.000Z' }),
+        ],
+      }),
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const result = await adapter.findLatestReceiptOfKind(makeFindRequest());
+
+    expect(result).toEqual({
+      outcome: 'found',
+      receipt: expect.objectContaining({ receiptId: RECEIPT_ID + '-newer' }),
+    });
+  });
+
+  it('lets the later listed receipt win on equal completedAtIso', async () => {
+    const { inspectAcceptanceEvidence } = makeInspectFake({
+      outcome: 'found',
+      assessment: makeAssessment({
+        reviewReceipts: [
+          makeReceipt({ id: RECEIPT_ID + '-first' }),
+          makeReceipt({ id: RECEIPT_ID + '-second' }),
+        ],
+      }),
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const result = await adapter.findLatestReceiptOfKind(makeFindRequest());
+
+    expect(result).toEqual({
+      outcome: 'found',
+      receipt: expect.objectContaining({ receiptId: RECEIPT_ID + '-second' }),
+    });
+  });
+
+  it('is not-found when the receipts answer another head', async () => {
+    const { inspectAcceptanceEvidence } = makeInspectFake({
+      outcome: 'found',
+      assessment: makeAssessment({ reviewReceipts: [makeReceipt({ candidateHeadSha: OTHER_HEAD })] }),
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const result = await adapter.findLatestReceiptOfKind(makeFindRequest());
+
+    expect(result).toEqual({ outcome: 'not-found' });
+  });
+
+  it('is not-found for code-review when only a kind-less receipt exists', async () => {
+    const { inspectAcceptanceEvidence } = makeInspectFake({
+      outcome: 'found',
+      assessment: makeAssessment({ reviewReceipts: [makeReceipt({ kind: undefined })] }),
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const result = await adapter.findLatestReceiptOfKind(makeFindRequest());
+
+    expect(result).toEqual({ outcome: 'not-found' });
+  });
+
+  it('is not-found when only another kind exists', async () => {
+    const { inspectAcceptanceEvidence } = makeInspectFake({
+      outcome: 'found',
+      assessment: makeAssessment({ reviewReceipts: [makeReceipt({ kind: 'brief-check' })] }),
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const result = await adapter.findLatestReceiptOfKind(makeFindRequest());
+
+    expect(result).toEqual({ outcome: 'not-found' });
+  });
+
+  it('finds a pre-merge receipt without requestId and reports requestId null', async () => {
+    const { inspectAcceptanceEvidence } = makeInspectFake({
+      outcome: 'found',
+      assessment: makeAssessment({
+        reviewReceipts: [
+          makeReceipt({ kind: 'pre-merge', requestId: undefined, result: 'pass' }),
+        ],
+      }),
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const result = await adapter.findLatestReceiptOfKind(makeFindRequest({ kind: 'pre-merge' }));
+
+    expect(result).toEqual({
+      outcome: 'found',
+      receipt: { ...EXPECTED_SUMMARY, kind: 'pre-merge', requestId: null },
+    });
+  });
+
+  it('is not-found when the found assessment belongs to another attempt', async () => {
+    const { inspectAcceptanceEvidence } = makeInspectFake({
+      outcome: 'found',
+      assessment: makeAssessment({ attemptId: 'attempt-example-2' }),
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const result = await adapter.findLatestReceiptOfKind(makeFindRequest());
+
+    expect(result).toEqual({ outcome: 'not-found' });
+  });
+
+  it('is not-found when the assessment is absent', async () => {
+    const { inspectAcceptanceEvidence } = makeInspectFake({
+      outcome: 'not-found',
+      query: ASSESSMENT_ID,
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const result = await adapter.findLatestReceiptOfKind(makeFindRequest());
+
+    expect(result).toEqual({ outcome: 'not-found' });
+  });
+
+  it('is unavailable unreadable when the inspection delegate throws', async () => {
+    const inspectAcceptanceEvidence = async (): Promise<InspectAcceptanceEvidenceResult> => {
+      throw new Error('inspection exploded');
+    };
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const result = await adapter.findLatestReceiptOfKind(makeFindRequest());
+
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'unreadable' });
+  });
+
+  it('is unavailable not-configured when no inspection delegate is bound', async () => {
+    const adapter = new ReviewRequestAdapter();
+
+    const result = await adapter.findLatestReceiptOfKind(makeFindRequest());
+
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'not-configured' });
+  });
+
+  it.each([
+    ['a bad head', { candidateHeadSha: 'not-a-sha' }],
+    ['an unknown kind', { kind: 'unknown-kind' }],
+  ] as const)(
+    'is unavailable invalid-request for %s without calling the delegate',
+    async (_label, overrides) => {
+      const { calls, inspectAcceptanceEvidence } = makeInspectFake({
+        outcome: 'found',
+        assessment: makeAssessment(),
+      });
+      const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+      const result = await adapter.findLatestReceiptOfKind(
+        makeFindRequest(overrides as Partial<FindLatestReceiptOfKindRequest>),
+      );
+
+      expect(result).toEqual({ outcome: 'unavailable', reason: 'invalid-request' });
+      expect(calls).toHaveLength(0);
+    },
+  );
 });
 
 describe('CiStateAdapter.readHeadCiState', () => {

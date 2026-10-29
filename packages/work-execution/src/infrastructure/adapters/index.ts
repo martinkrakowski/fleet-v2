@@ -37,6 +37,7 @@ export * from "./NoopChangeSignalAdapter.adapter.js";
 export * from "./OpencodeDbUsageAdapter.adapter.js";
 export * from "./OwnerDecisionAdapter.adapter.js";
 export * from "./PolicyMergeGrantAdapter.adapter.js";
+export * from "./ProcessTreeTerminationAdapter.adapter.js";
 export * from "./ProjectProbeAdapter.adapter.js";
 export * from "./ProjectProbeRecordAdapter.adapter.js";
 export * from "./ProjectProfileReadAdapter.adapter.js";

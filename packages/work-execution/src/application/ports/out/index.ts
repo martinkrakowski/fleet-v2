@@ -33,6 +33,7 @@ export * from "./LaneRunRepositoryPort.out-port.js";
 export * from "./LaneRunStartCapacityPort.out-port.js";
 export * from "./OwnerDecisionPort.out-port.js";
 export * from "./PolicyMergeGrantPort.out-port.js";
+export * from "./ProcessTreeTerminationPort.out-port.js";
 export * from "./ProjectProbePort.out-port.js";
 export * from "./ProjectProbeRecordPort.out-port.js";
 export * from "./ProjectProfileReadPort.out-port.js";

@@ -113,12 +113,16 @@ function readStatus(value: unknown): Record<string, unknown> | null {
 
 /** Frozen normalised copies of at most 64 state-entry events, or null. */
 function readEvents(value: unknown): readonly TelemetrySpanEvent[] | null {
-  if (!Array.isArray(value) || value.length > TELEMETRY_MAX_EVENTS) {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  // One length read, checked and then used, so a proxy cannot pass the bound with one answer
+  // and drive the loop with another. Own indexed reads only: the iterator is overridable.
+  const length: unknown = value.length;
+  if (typeof length !== 'number' || !Number.isInteger(length) || length < 0 || length > TELEMETRY_MAX_EVENTS) {
     return null;
   }
   const events: TelemetrySpanEvent[] = [];
-  // Own indexed reads only: the iterator is overridable, so it is never used.
-  const length = value.length;
   for (let i = 0; i < length; i += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, i);
     if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) {

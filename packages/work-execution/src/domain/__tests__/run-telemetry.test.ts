@@ -166,6 +166,25 @@ describe('TelemetrySpan.build', () => {
     });
     expect(TelemetrySpan.build({ ...base, events })).toBeNull();
   });
+
+  it('reads the events length once, so a proxy cannot pass the bound and then grow the loop', () => {
+    const event = { name: 'state.entered', timeIso: '2026-10-27T10:00:00Z', state: 'running' };
+    const target = Array.from({ length: 65 }, () => ({ ...event }));
+    let lengthReads = 0;
+    const events = new Proxy(target, {
+      get(t, key, receiver) {
+        if (key === 'length') {
+          lengthReads += 1;
+          // In bounds on the first read, past the limit on any later one.
+          return lengthReads === 1 ? 1 : 65;
+        }
+        return Reflect.get(t, key, receiver);
+      },
+    }) as unknown as TelemetrySpanInput['events'];
+    const span = mustBuild({ ...base, events });
+    expect(span.events).toHaveLength(1);
+    expect(lengthReads).toBe(1);
+  });
 });
 
 describe('TelemetrySpan.isTelemetrySpan', () => {

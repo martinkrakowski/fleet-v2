@@ -413,6 +413,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       reservation,
       briefDigest,
       briefPackagePath,
+      recordedHost,
     );
     if (attemptSave !== null) {
       return attemptSave;
@@ -557,7 +558,10 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
    * Save the first attempt: a fresh `intent-recorded` record, or an existing
    * `intent-recorded` record at the same path and work order whose digest
    * and brief path are overwritten when they differ; any other record is
-   * `attempt-differs`. Returns null on success.
+   * `attempt-differs`. The reservation's recorded host is stamped on the
+   * attempt as `runner` (KF-10) so the first dispatch reads the frozen
+   * manifest through that host before any runner is contacted. Returns null
+   * on success.
    */
   private async saveFirstAttempt(
     request: StartLaneRunRequest,
@@ -567,6 +571,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     reservation: { hostName: string; hostKind: 'opencode' | 'agy'; worktreePath: string },
     briefDigest: string,
     briefPackagePath: string,
+    recordedHost: AttemptRunnerRecord,
   ): Promise<StartLaneRunResult | null> {
     const deps = this.deps!;
     const selectedSeat = plan.getSeats('first-pass')[seatIndex];
@@ -583,6 +588,22 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         return incomplete(request.runId, request.attemptId, 'attempt', 'attempt-differs');
       }
       if (existing.briefDigest === briefDigest && existing.briefPackagePath === briefPackagePath) {
+        // Same digest and path: nothing to rewrite unless the record has no
+        // runner yet, in which case the recorded host is stamped (KF-10).
+        if (existing.runner != null) {
+          return null;
+        }
+        const stamped: AttemptRecord = {
+          ...existing,
+          revision: (existing.revision ?? 0) + 1,
+          runner: recordedHost,
+          updatedAtIso: request.nowIso,
+        };
+        try {
+          await deps.attemptRepo.saveAttempt(stamped);
+        } catch {
+          return incomplete(request.runId, request.attemptId, 'attempt', 'attempt-save-failed');
+        }
         return null;
       }
       const updated: AttemptRecord = {
@@ -590,6 +611,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         revision: (existing.revision ?? 0) + 1,
         briefDigest,
         briefPackagePath,
+        ...(existing.runner == null ? { runner: recordedHost } : {}),
         updatedAtIso: request.nowIso,
       };
       try {
@@ -618,6 +640,10 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       seatSelection: seatSelectionRecord('first-pass', seatIndex, selectedSeat),
       // `reviewerSeat: null`: dispatch binds its fallback reviewer (K4-5).
       reviewerSeat: null,
+      // The reservation's recorded host rides the first attempt as `runner`
+      // (KF-10): the frozen-manifest reads before the first dispatch resolve
+      // the reserved host instead of falling back to the local executor.
+      runner: recordedHost,
       createdAtIso: request.nowIso,
       updatedAtIso: request.nowIso,
     };

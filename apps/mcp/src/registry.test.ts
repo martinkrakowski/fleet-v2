@@ -81,6 +81,10 @@ describe("buildRegistry", () => {
     ]);
     expect([...registry.tools.map((tool) => tool.name)]).toEqual([
       "fleet_coordination",
+      "fleet_attempt",
+      "fleet_attempt_list",
+      "fleet_attempt_journal",
+      "fleet_work_order",
     ]);
     expect([...registry.resources.map((resource) => resource.name)]).toEqual([
       ...FLEET_RESOURCE_NAMES,
@@ -114,7 +118,7 @@ describe("fleet_coordination tool", () => {
   it("calls exactly GET /v1/coordination and returns the envelope as pretty JSON", async () => {
     const client = fakeClient({ "/v1/coordination": OK_ENVELOPE });
     const registry = buildRegistry(client);
-    const result = await toolNamed(registry, "fleet_coordination").handler();
+    const result = await toolNamed(registry, "fleet_coordination").handler({});
     expect(client.calls).toEqual([{ method: "GET", path: "/v1/coordination" }]);
     expect(result.isError).toBeUndefined();
     expect(result.content).toEqual([
@@ -125,7 +129,7 @@ describe("fleet_coordination tool", () => {
   it("maps a client failure to isError with code, message and operationId", async () => {
     const client = fakeClient({ "/v1/coordination": FAILURE });
     const registry = buildRegistry(client);
-    const result = await toolNamed(registry, "fleet_coordination").handler();
+    const result = await toolNamed(registry, "fleet_coordination").handler({});
     expect(client.calls).toEqual([{ method: "GET", path: "/v1/coordination" }]);
     expect(result.isError).toBe(true);
     expect(JSON.parse(result.content[0]?.text ?? "")).toEqual({
@@ -144,7 +148,7 @@ describe("fleet_coordination tool", () => {
       },
     });
     const registry = buildRegistry(client);
-    const result = await toolNamed(registry, "fleet_coordination").handler();
+    const result = await toolNamed(registry, "fleet_coordination").handler({});
     expect(result.isError).toBe(true);
     expect(JSON.parse(result.content[0]?.text ?? "")).toEqual({
       code: "not-configured",
@@ -159,13 +163,17 @@ describe("fleet_coordination tool", () => {
     }
   });
 
-  it("routes only to its fixed route even when called with path/URL input", async () => {
+  it("refuses path/URL input without calling the client", async () => {
     const client = fakeClient({ "/v1/coordination": OK_ENVELOPE });
     const registry = buildRegistry(client);
-    const handler = toolNamed(registry, "fleet_coordination")
-      .handler as (input: unknown) => Promise<unknown>;
-    await handler(PATH_URL_INPUT);
-    expect(client.calls).toEqual([{ method: "GET", path: "/v1/coordination" }]);
+    const handler = toolNamed(registry, "fleet_coordination").handler;
+    const result = await handler(PATH_URL_INPUT);
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0]?.text ?? "")).toEqual({
+      code: "invalid-input",
+      message: "Input does not match the tool schema.",
+    });
+    expect(client.calls).toEqual([]);
   });
 });
 

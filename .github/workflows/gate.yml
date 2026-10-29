@@ -32,10 +32,9 @@ jobs:
       # work-execution) must run, never silently skip. turbo.json declares it in the test task's
       # env, so strict env mode passes it through to vitest.
       OCM_IT_REQUIRE: "1"
-      # Every run executes every task for now (cache reads off, writes on). Pull-request replay
-      # of cache hits is switched on only after a few PRs show cached and full runs agree
-      # (lane speed plan, D27/D29): then this becomes github.event_name != 'pull_request'.
-      TURBO_FORCE: "true"
+      # Pull requests replay cache hits (lane speed plan D27/D29, switched on by the owner on 2026-10-29);
+      # pushes to main still execute every task, so main stays a full run that also refreshes the cache.
+      TURBO_FORCE: ${{ github.event_name != 'pull_request' }}
     steps:
       - uses: actions/checkout@v4
       # Before setup-node, so its yarn cache lookup resolves Yarn 4 from packageManager.

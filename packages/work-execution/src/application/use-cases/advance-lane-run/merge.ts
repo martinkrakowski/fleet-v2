@@ -17,7 +17,7 @@ import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendRunIntent, appendRunResult, saveOrRefuse } from './step-context.js';
+import { appendRunIntent, appendRunResult, performPark, saveOrRefuse } from './step-context.js';
 import { readFrozenManifest } from './frozen-manifest.js';
 
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
@@ -63,6 +63,25 @@ function finalResultOfKey(
     }
   }
   return null;
+}
+
+/**
+ * A spent one-way key never loops: the decider re-acting on it parks
+ * `step-refused <step>` for the owner. An unread intent would have been routed
+ * to the reconcile by the decider's G3a, so an intent here has a final result.
+ */
+async function parkSpentOneWayKey(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: ActDecision,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult | null> {
+  const entries = await ctx.deps.runJournal.listForKey(decision.key);
+  if (!entries.some((entry) => entry.kind === 'intent')) {
+    return null;
+  }
+  return performPark(ctx, record, 'step-refused', decision.step, gathered.facts.state, request);
 }
 
 /**
@@ -339,8 +358,11 @@ async function runAcceptBody(
       reasonCode = 'acceptance-unknown';
     }
   } catch {
-    result = 'ambiguous';
-    reasonCode = 'acceptance-unknown';
+    // A thrown assessment leaves the intent unread (mirror performReview's
+    // pendingReview shape): append no result; the next advance's G3a routes the
+    // key to reconcileAccept, which re-runs the assessment. An `unknown`
+    // OUTCOME from the port (not a throw) keeps the ambiguous result below.
+    return { outcome: 'acted', step: decision.step, key, result: 'ambiguous', reasonCode: 'acceptance-unknown' };
   }
   const resultRefusal = await appendRunResult(ctx, request, key, result, reasonCode);
   if (resultRefusal !== null) {
@@ -354,7 +376,8 @@ async function runAcceptBody(
  * `AcceptanceAssessmentPort` under the keyed intent. Only reason codes are
  * journalled — the receipt id is not (acceptance is idempotent per head; the
  * merge reads it again through AM4a), never a reason or blocker text. A
- * thrown or `unknown` assessment stays ambiguous for the reconcile.
+ * thrown assessment stays `ambiguous` with no result for the reconcile; an
+ * `unknown` outcome journals ambiguous.
  */
 export async function performAccept(
   ctx: AdvanceStepContext,
@@ -471,11 +494,12 @@ type ForgePushKind = 'push-and-open-pr' | 'push-to-pr';
 /**
  * The shared open-pr/push body (K6-6): the frozen D7 notes and `renderPrBody`
  * (open-pr only) before any intent, the acceptance receipt id read again at
- * the exact head, the conductor push grant, then the keyed intent minting the
- * forge action id and the authorized forge action. A missing or invalid note,
- * a missing receipt, a refused or thrown grant all refuse with a null
- * minted id and no forge call; an ambiguous or thrown forge outcome leaves the
- * intent pending for the reconcile. Reason strings are never journalled.
+ * the exact head, then the keyed intent minting the forge action id, the
+ * conductor push grant, and the authorized forge action. A missing or invalid
+ * note or a missing receipt refuses before the intent (no minted id, no forge
+ * call); a refused or thrown grant refuses under the keyed intent's minted id
+ * with no forge call; an ambiguous or thrown forge outcome leaves the intent
+ * pending for the reconcile. Reason strings are never journalled.
  */
 async function runPrPushBody(
   ctx: AdvanceStepContext,
@@ -557,8 +581,26 @@ async function runPrPushBody(
     return refuseKeyed(ctx, request, decision, 'grant-refused');
   }
 
+  // Mint the forge action id under the keyed intent BEFORE any grant is issued:
+  // a crash or a journal refusal between them must never leave an issued,
+  // unconsumed conductor grant with no journal trace. A grant refusal or throw
+  // then appends `refused` / `grant-refused` under the same key — one result,
+  // no second intent.
+  const actionId = 'forge-' + ctx.deps.newUlid();
+  const intentRefusal = await appendRunIntent(ctx, request, decision.key, actionId);
+  if (intentRefusal !== null) {
+    return { outcome: 'refused', reason: intentRefusal };
+  }
+  const refuseGrant = async (): Promise<AdvanceLaneRunResult> => {
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'grant-refused');
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'grant-refused' };
+  };
+
   // The conductor's own push grant under `policy:conductor@<revision>`; a
-  // refusal or a throw refuses before the forge call.
+  // refusal or a throw refuses under the keyed intent before the forge call.
   let grant: ConductorForgeGrantResult;
   try {
     grant = await conductorForgeGrant.issueConductorForgeGrant({
@@ -571,17 +613,10 @@ async function runPrPushBody(
       acceptanceReceiptId: receiptId,
     });
   } catch {
-    return refuseKeyed(ctx, request, decision, 'grant-refused');
+    return refuseGrant();
   }
   if (grant.outcome !== 'issued') {
-    return refuseKeyed(ctx, request, decision, 'grant-refused');
-  }
-
-  // Only now mint the forge action id under the keyed intent and call the forge.
-  const actionId = 'forge-' + ctx.deps.newUlid();
-  const intentRefusal = await appendRunIntent(ctx, request, decision.key, actionId);
-  if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refuseGrant();
   }
   let forgeRequest: ExecuteAuthorizedForgeActionRequest;
   if (kind === 'push-and-open-pr' && rendered !== null) {
@@ -658,6 +693,10 @@ export async function performOpenPr(
   if (preCheck !== null) {
     return preCheck;
   }
+  const spent = await parkSpentOneWayKey(ctx, record, gathered, decision, request);
+  if (spent !== null) {
+    return spent;
+  }
   return runPrPushBody(ctx, record, gathered, decision, request, 'push-and-open-pr');
 }
 
@@ -676,6 +715,10 @@ export async function performPush(
   const preCheck = prPushPreCheck(ctx, gathered, decision);
   if (preCheck !== null) {
     return preCheck;
+  }
+  const spent = await parkSpentOneWayKey(ctx, record, gathered, decision, request);
+  if (spent !== null) {
+    return spent;
   }
   return runPrPushBody(ctx, record, gathered, decision, request, 'push-to-pr');
 }
@@ -751,9 +794,10 @@ export async function reconcilePrPush(
  * The `act merge` step (K6-7): one keyed intent, then `AutoMergeAttemptPort`
  * under the attempt id. Only reason codes are journalled — the port's `detail`
  * text is never. A merged head that matches the run's head completes; a merge
- * at any other head stays ambiguous for the reconcile; `waiting` is completed
- * (`merge-waiting`, the next pass re-reads the PR); `off` and `not-merged` are
- * refused; a throw is ambiguous. `merge` is one-way: the key is never re-sent.
+ * at any other head stays ambiguous for the reconcile; `waiting` is refused
+ * (`merge-waiting`: a one-way key cannot wait); `off` and `not-merged` are
+ * refused; a throw is ambiguous. `merge` is one-way: the key is never re-sent,
+ * and a spent key (an intent with a final result) parks `step-refused merge`.
  */
 export async function performMerge(
   ctx: AdvanceStepContext,
@@ -769,6 +813,10 @@ export async function performMerge(
   const latest = gathered.latestAttempt;
   if (latest === null || latest.artifacts === null) {
     return { outcome: 'waiting', reason: 'facts-inconsistent' };
+  }
+  const spent = await parkSpentOneWayKey(ctx, record, gathered, decision, request);
+  if (spent !== null) {
+    return spent;
   }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
   if (intentRefusal !== null) {
@@ -787,7 +835,7 @@ export async function performMerge(
         reasonCode = 'forge-ambiguous';
       }
     } else if (outcome.outcome === 'waiting') {
-      result = 'completed';
+      result = 'refused';
       reasonCode = 'merge-waiting';
     } else if (outcome.outcome === 'off') {
       result = 'refused';

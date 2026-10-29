@@ -8,6 +8,7 @@ export * from "./CommitEditOnlyAttemptPort.in-port.js";
 export * from "./DispatchAttemptPort.in-port.js";
 export * from "./EvaluateAttemptGatePort.in-port.js";
 export * from "./ExecuteAuthorizedForgeActionPort.in-port.js";
+export * from "./ExportRunTelemetryPort.in-port.js";
 export * from "./InspectAttemptPort.in-port.js";
 export * from "./InspectLaneRunsPort.in-port.js";
 export * from "./InspectWorkOrderPort.in-port.js";

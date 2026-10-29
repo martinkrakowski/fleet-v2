@@ -160,8 +160,6 @@ async function readBodyPrefix(response: Response): Promise<string> {
         break;
       }
     }
-  } catch {
-    // Keep whatever was read before the failure.
   } finally {
     try {
       await reader.cancel();
@@ -190,6 +188,12 @@ function parseRetryAfter(raw: string | null, nowMs: number): number | null {
   if (/^\d+$/.test(trimmed)) {
     return Math.max(0, Number.parseInt(trimmed, 10));
   }
+  // RFC 9110 §5.6.7 HTTP-date shapes carry alphabetic weekday/month tokens;
+  // anything else (e.g. "1.5", "-1") is not a date and yields null so the
+  // default backoff is used.
+  if (!/[a-zA-Z]/.test(trimmed)) {
+    return null;
+  }
   const dateMs = Date.parse(trimmed);
   if (Number.isNaN(dateMs)) {
     return null;
@@ -213,12 +217,12 @@ export function createFetchOtlpPost(options: CreateFetchOtlpPostOptions): OtlpPo
   const timeoutMs = options.timeoutMs ?? 5000;
   const nowMs = options.nowMs ?? (() => Date.now());
   return async (payload: Uint8Array): Promise<OtlpPostOutcome> => {
+    const signals: AbortSignal[] = [AbortSignal.timeout(timeoutMs)];
+    if (stopSignal !== undefined) {
+      signals.push(stopSignal);
+    }
+    const signal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
     try {
-      const signals: AbortSignal[] = [AbortSignal.timeout(timeoutMs)];
-      if (stopSignal !== undefined) {
-        signals.push(stopSignal);
-      }
-      const signal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
       const response = await fetchImpl(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
@@ -233,9 +237,18 @@ export function createFetchOtlpPost(options: CreateFetchOtlpPostOptions): OtlpPo
       let rejectedSpans: number | null = null;
       if (status >= 200 && status < 300) {
         rejectedSpans = parseRejectedSpans(await readBodyPrefix(response));
+      } else {
+        // A non-2xx body is cancelled, never read: releasing the unread stream
+        // back to the pool without consuming it (plan §3.5).
+        await response.body?.cancel().catch(() => undefined);
       }
       return { kind: 'http', status, retryAfterSeconds, rejectedSpans };
     } catch (error: unknown) {
+      // An abort of the combined signal — the request timeout or the stop
+      // signal, whatever its reason — is a timeout, never a network failure.
+      if (signal.aborted) {
+        return { kind: 'timeout' };
+      }
       const name = error instanceof Error ? error.name : '';
       if (name === 'AbortError' || name === 'TimeoutError') {
         return { kind: 'timeout' };
@@ -255,6 +268,12 @@ export interface WithOtlpRetryOptions {
   readonly nowMs?: () => number;
   /** Injected wait for tests; `otlpRetrySleep` by default. */
   readonly sleep?: (ms: number) => Promise<void>;
+  /**
+   * An optional stop signal: an abort during a retry wait wakes it immediately
+   * so `exporter.stop()` never stalls on a `Retry-After` sleep (plan §3.3
+   * "Exporter lifetime").
+   */
+  readonly stopSignal?: AbortSignal;
 }
 
 /** The statuses retried at most twice (plan §3.5 "Send"). */
@@ -275,6 +294,39 @@ export function otlpRetrySleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, ms);
     timer.unref();
+  });
+}
+
+/**
+ * Waits for `sleepMs(ms)` but resolves early when `signal` aborts, so a stop
+ * never has to wait out a retry backoff. Without a signal it is the sleep.
+ */
+function sleepUntil(signal: AbortSignal | undefined, sleepMs: (ms: number) => Promise<void>, ms: number): Promise<void> {
+  if (signal === undefined) {
+    return sleepMs(ms);
+  }
+  if (signal.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (): void => {
+      if (!settled) {
+        settled = true;
+        signal!.removeEventListener('abort', onAbort);
+        resolve();
+      }
+    };
+    const fail = (error: unknown): void => {
+      if (!settled) {
+        settled = true;
+        signal!.removeEventListener('abort', onAbort);
+        reject(error);
+      }
+    };
+    const onAbort = (): void => finish();
+    signal.addEventListener('abort', onAbort, { once: true });
+    sleepMs(ms).then(finish, fail);
   });
 }
 
@@ -306,10 +358,15 @@ export function withOtlpRetry(post: OtlpPost, options: WithOtlpRetryOptions): Ot
           ? RETRY_BACKOFF_MS[attempt]
           : Math.min(outcome.retryAfterSeconds * 1_000, RETRY_AFTER_CAP_MS);
       const after = deadlineAt();
-      if (after !== null && nowMs() + waitMs > after.atMs) {
+      if (after !== null && nowMs() + waitMs >= after.atMs) {
         return { kind: 'timeout' };
       }
-      await sleepMs(waitMs);
+      await sleepUntil(options.stopSignal, sleepMs, waitMs);
+      if (options.stopSignal !== undefined && options.stopSignal.aborted) {
+        // The stop signal fired during the retry wait: nothing more is posted
+        // and the call ends as a timeout (plan §3.3 "Exporter lifetime").
+        return { kind: 'timeout' };
+      }
       attempt += 1;
     }
   };

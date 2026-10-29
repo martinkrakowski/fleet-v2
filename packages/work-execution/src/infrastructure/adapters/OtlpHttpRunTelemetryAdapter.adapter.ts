@@ -77,6 +77,8 @@ interface OtlpCallState {
   sawPartialRejected: boolean;
   /** Consecutive single-span 400/413 results in this call (the breaker's count). */
   breakerCount: number;
+  /** Absolute sendable indices of the counted single-span 400/413 results. */
+  breakerPending: number[];
 }
 
 const DEFAULT_MAX_QUEUE_SPANS = 2048;
@@ -165,6 +167,7 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
       stopped: false,
       sawPartialRejected: false,
       breakerCount: 0,
+      breakerPending: [],
     };
 
       // Batching (§3.5): groups of at most maxBatchSpans sendable spans, in
@@ -214,7 +217,14 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
       return;
     }
     const outcome = await this.#safePost(encoded.payload);
-    await this.#mapOutcome(call, batchBase, batch, encodedIndices, outcome);
+    const tripped = await this.#mapOutcome(call, batchBase, batch, encodedIndices, outcome);
+    if (tripped) {
+      // The breaker tripped on a single-span batch (plan §3.5): its spans go
+      // back to `pending` and the call stops with `http-4xx`.
+      this.#revertBreakerPending(call);
+      call.stopped = true;
+      call.errorKind = 'http-4xx';
+    }
   }
 
   /** Marks encoder refusals `rejected:invalid` and returns the encoded spans' batch indices. */
@@ -248,82 +258,79 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
     }
   }
 
-  /** Result mapping for one batch (§3.5 "Dispositions from a result"). */
+  /**
+   * Result mapping for one batch (§3.5 "Dispositions from a result"). Returns
+   * whether the misconfiguration breaker tripped on this outcome (a single-span
+   * 400/413), so the caller can stop the call.
+   */
   async #mapOutcome(
     call: OtlpCallState,
     batchBase: number,
     batch: readonly TelemetrySpan[],
     encodedIndices: readonly number[],
     outcome: OtlpPostOutcome,
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (outcome.kind === 'timeout') {
-      this.#pendingAll(call, batchBase, batch, encodedIndices);
-      call.errorKind = 'timeout';
-      call.stopped = true;
-      return;
+      this.#stopCall(call, 'timeout', batchBase, batch, encodedIndices);
+      return false;
     }
     if (outcome.kind === 'network') {
-      this.#pendingAll(call, batchBase, batch, encodedIndices);
-      call.errorKind = 'network';
-      call.stopped = true;
-      return;
+      this.#stopCall(call, 'network', batchBase, batch, encodedIndices);
+      return false;
     }
     const { status, rejectedSpans } = outcome;
     if (status >= 200 && status < 300) {
       if (rejectedSpans === null || rejectedSpans === 0) {
+        // An accepted 2xx resets the breaker, batch or single (plan §3.5); a
+        // 2xx with `rejectedSpans > 0` never resets it.
+        call.breakerCount = 0;
+        call.breakerPending.length = 0;
         for (const idx of encodedIndices) {
           this.#mark(call, batchBase + idx, {
             spanId: batch[idx].spanId,
             disposition: { state: 'exported', route: this.#route },
           });
         }
-        return;
+        return false;
       }
       // 2xx with a partial success: split a multi-span batch; a single span is
       // `rejected:partial-rejected`.
       if (encodedIndices.length > 1) {
         await this.#splitResend(call, batchBase, batch, encodedIndices);
-        return;
+        return false;
       }
       const idx = encodedIndices[0];
       this.#mark(call, batchBase + idx, rejectedDispositionFor(batch[idx], 'partial-rejected'));
       call.sawPartialRejected = true;
-      return;
+      return false;
     }
     if (status === 400 || status === 413) {
       if (encodedIndices.length > 1) {
         await this.#splitResend(call, batchBase, batch, encodedIndices);
-        return;
+        return false;
       }
       const idx = encodedIndices[0];
       this.#mark(call, batchBase + idx, rejectedDispositionFor(batch[idx], status === 413 ? 'too-large' : 'http-4xx'));
-      return;
+      return this.#updateBreaker(call, batchBase + idx, outcome);
     }
     // Stopping outcomes: nothing is attributable to the spans, so they stay
     // `pending`, the call stops, and nothing more is posted.
     if (status === 401 || status === 403) {
-      this.#pendingAll(call, batchBase, batch, encodedIndices);
-      call.errorKind = 'auth';
-      call.stopped = true;
-      return;
+      this.#stopCall(call, 'auth', batchBase, batch, encodedIndices);
+      return false;
     }
     if (status >= 400 && status < 500) {
-      this.#pendingAll(call, batchBase, batch, encodedIndices);
-      call.errorKind = 'http-4xx';
-      call.stopped = true;
-      return;
+      this.#stopCall(call, 'http-4xx', batchBase, batch, encodedIndices);
+      return false;
     }
     if (status >= 500 && status < 600) {
-      this.#pendingAll(call, batchBase, batch, encodedIndices);
-      call.errorKind = 'http-5xx';
-      call.stopped = true;
-      return;
+      this.#stopCall(call, 'http-5xx', batchBase, batch, encodedIndices);
+      return false;
     }
     // Any other status (e.g. 302, or a non-HTTP number): conservatively a
     // non-attributable failure — the `network` kind, spans left `pending`.
-    this.#pendingAll(call, batchBase, batch, encodedIndices);
-    call.errorKind = 'network';
-    call.stopped = true;
+    this.#stopCall(call, 'network', batchBase, batch, encodedIndices);
+    return false;
   }
 
   /** Split resend: each encoded span is resent alone, in input order (§3.5). */
@@ -333,9 +340,6 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
     batch: readonly TelemetrySpan[],
     encodedIndices: readonly number[],
   ): Promise<void> {
-    // The single-span 400/413 results of this split resend run (absolute
-    // sendable indices); the breaker pulls them back to `pending` on a stop.
-    const breakerPending: number[] = [];
     for (let i = 0; i < encodedIndices.length && !call.stopped; i += 1) {
       const idx = encodedIndices[i];
       const single = [batch[idx]];
@@ -349,24 +353,15 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
         continue;
       }
       const outcome = await this.#safePost(encoded.payload);
-      const breakerStop = this.#onSingleSpanResult(call, outcome) === 'stop';
-      // The stopping outcome still goes through `#mapOutcome`, so the call's
-      // error kind is that request's real kind (auth, timeout, 5xx, ...) and
-      // never a blanket `http-4xx`.
-      await this.#mapOutcome(call, batchBase + idx, single, singleIndices, outcome);
-      if (isSingleSpan4xx(outcome)) {
-        breakerPending.push(idx);
-      }
-      if (breakerStop || call.stopped) {
+      const tripped = await this.#mapOutcome(call, batchBase + idx, single, singleIndices, outcome);
+      if (tripped || call.stopped) {
         // The call stops here — by the misconfiguration breaker or by a
-        // stopping outcome: the single-span 4xx results of this run go back
-        // to `pending` (not `rejected:*`, plan §3.5), everything not yet sent
-        // stays `pending`, and the error kind is the stopping request's real
-        // kind (`#mapOutcome` set it; a breaker trip on 4xxs falls back to
-        // `http-4xx`).
-        for (const pendingIdx of breakerPending) {
-          this.#mark(call, batchBase + pendingIdx, pendingDispositionFor(batch[pendingIdx]));
-        }
+        // stopping outcome: every single-span 4xx result of this call (across
+        // batches) goes back to `pending` (plan §3.5), everything not yet
+        // sent stays `pending`, and the error kind is the stopping request's
+        // real kind (`#mapOutcome` set it; a breaker trip on 4xxs falls back
+        // to `http-4xx`).
+        this.#revertBreakerPending(call);
         for (let j = i + 1; j < encodedIndices.length; j += 1) {
           const unsentIdx = encodedIndices[j];
           this.#mark(call, batchBase + unsentIdx, pendingDispositionFor(batch[unsentIdx]));
@@ -381,18 +376,44 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
   }
 
   /**
-   * The misconfiguration breaker (plan §3.5 "Send"): after three consecutive
-   * single-span 400/413 results with no 2xx between them in one `send`, the
-   * call stops — the endpoint or payload shape is misconfigured, so resending
-   * the remaining spans one by one would only burn the deadline.
+   * Records a single-span result in the misconfiguration breaker state (plan
+   * §3.5 "Send"): a 400/413 increments the consecutive count and joins the
+   * pending set. Returns true when the breaker trips (three consecutive
+   * 400/413s with no accepted 2xx between them). Accepted 2xx resets happen
+   * in `#mapOutcome`, which sees batch and single results alike.
    */
-  #onSingleSpanResult(call: OtlpCallState, outcome: OtlpPostOutcome): 'continue' | 'stop' {
+  #updateBreaker(call: OtlpCallState, absIndex: number, outcome: OtlpPostOutcome): boolean {
     if (isSingleSpan4xx(outcome)) {
       call.breakerCount += 1;
-    } else if (outcome.kind === 'http' && outcome.status >= 200 && outcome.status < 300) {
-      call.breakerCount = 0;
+      call.breakerPending.push(absIndex);
+      return call.breakerCount >= 3;
     }
-    return call.breakerCount >= 3 ? 'stop' : 'continue';
+    return false;
+  }
+
+  /** Reverts the breaker's single-span 4xx results to `pending` (plan §3.5). */
+  #revertBreakerPending(call: OtlpCallState): void {
+    for (const sendableIndex of call.breakerPending) {
+      const current = call.dispositions[call.positions[sendableIndex]];
+      if (current !== null) {
+        this.#mark(call, sendableIndex, { spanId: current.spanId, disposition: { state: 'pending' } });
+      }
+    }
+    call.breakerPending.length = 0;
+  }
+
+  /** A stopping outcome: the breaker's 4xxs and this batch go back to pending and the call stops. */
+  #stopCall(
+    call: OtlpCallState,
+    kind: TelemetryErrorKind,
+    batchBase: number,
+    batch: readonly TelemetrySpan[],
+    encodedIndices: readonly number[],
+  ): void {
+    this.#revertBreakerPending(call);
+    this.#pendingAll(call, batchBase, batch, encodedIndices);
+    call.errorKind = kind;
+    call.stopped = true;
   }
 
   #pendingAll(call: OtlpCallState, batchBase: number, batch: readonly TelemetrySpan[], encodedIndices: readonly number[]): void {
@@ -427,6 +448,12 @@ export interface CreateOtlpHttpRunTelemetryAdapterOptions {
   readonly tokenFile: unknown;
   readonly route: TelemetryRoute;
   readonly resource: TelemetryResourceInput;
+  /** Queue bound override; 2048 by default. */
+  readonly maxQueueSpans?: number;
+  /** Batch span bound override; 512 by default. */
+  readonly maxBatchSpans?: number;
+  /** Batch byte bound override; 1 MiB by default. */
+  readonly maxBatchBytes?: number;
   /** Injected fetch for tests; the global `fetch` by default. */
   readonly fetchImpl?: typeof fetch;
   /** An optional stop signal handed to every request. */
@@ -471,12 +498,16 @@ export function createOtlpHttpRunTelemetryAdapter(
       deadline: () => currentDeadline,
       nowMs: options.nowMs,
       sleep: options.sleep,
+      stopSignal: options.stopSignal,
     },
   );
   const adapter = new OtlpHttpRunTelemetryAdapter({
     post,
     route: options.route,
     resource: options.resource,
+    maxQueueSpans: options.maxQueueSpans,
+    maxBatchSpans: options.maxBatchSpans,
+    maxBatchBytes: options.maxBatchBytes,
     onDeadline: (deadline) => {
       currentDeadline = deadline;
     },

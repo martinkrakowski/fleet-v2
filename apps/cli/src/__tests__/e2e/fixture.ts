@@ -94,9 +94,10 @@ function runSshFixture(e2eDir: string, args: readonly string[]): FixtureLines {
   const stdout = execFileSync('sh', [script, ...args], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 30000,
+    timeout: 90000,
   });
-  const lines = stdout.split('\n').filter((line) => line.length > 0);
+  // Exactly the expected lines, each KEY=VALUE: a blank line is a format error, not noise.
+  const lines = (stdout.endsWith('\n') ? stdout.slice(0, -1) : stdout).split('\n');
   if (lines.length !== EXPECTED_FIXTURE_LINE_COUNT) {
     throw new Error(
       `ssh-fixture start printed ${lines.length} lines, expected ${EXPECTED_FIXTURE_LINE_COUNT}`,

@@ -17,12 +17,22 @@ import {
 } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
+import type {
+  ProcessTreeTerminationPort,
+  TerminateWorktreeProcessesResult,
+} from '../ports/out/ProcessTreeTerminationPort.out-port.js';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 
 export interface StopAttemptDependencies {
   readonly attemptRepo: AttemptRepositoryPort;
   readonly journal: ExecutionJournalPort;
   readonly runner: ExecutionRunnerPort;
+  /**
+   * Optional (PK-1b). When wired, every lane end on the runner side also
+   * terminates the attempt's worktree process tree and journals the count.
+   * Without it the behaviour is unchanged.
+   */
+  readonly processTreeTermination?: ProcessTreeTerminationPort;
   /**
    * Optional (H9b1). When given, an attempt whose recorded host changed or
    * was removed is refused, naming the recorded host, before any intent is
@@ -45,6 +55,66 @@ async function appendJournalEntry(
   };
   await journal.appendJournalEntry(entry);
   return entry;
+}
+
+/**
+ * Terminate the attempt's worktree process tree once its lane ended on the
+ * runner side (PK-1b) and journal the outcome. The termination never changes
+ * the calling use case's own outcome: no port means no call and no entry, a
+ * `terminated` answer appends one `completed` entry carrying the killed
+ * count, and a refusal, an unavailable answer or a port throw appends one
+ * `ambiguous` entry naming the outcome and reason (a throw's reason is the
+ * fixed text `port threw`). The helper never throws.
+ */
+export async function terminateAttemptProcessTree(
+  port: ProcessTreeTerminationPort | undefined,
+  journal: ExecutionJournalPort,
+  attempt: AttemptRecord,
+  action: 'stop' | 'dispatch' | 'collect',
+  gracePeriodSeconds: number,
+  nowIso: string,
+): Promise<void> {
+  if (!port) {
+    return;
+  }
+  // Only the port call is guarded: a throwing port reads `unavailable`. The
+  // journal append is evidence and propagates like every other entry's.
+  let outcome: TerminateWorktreeProcessesResult;
+  try {
+    outcome = await port.terminateWorktreeProcesses({
+      attemptId: attempt.id,
+      worktreePath: attempt.worktreePath,
+      runner: attempt.runner ?? null,
+      gracePeriodSeconds,
+    });
+  } catch {
+    outcome = { outcome: 'unavailable', reason: 'port threw' };
+  }
+  {
+    const entry: JournalEntryDraft =
+      outcome.outcome === 'terminated'
+        ? {
+            attemptId: attempt.id,
+            workOrderId: attempt.workOrderId,
+            action,
+            baseCommit: attempt.baseCommit,
+            recordedAtIso: nowIso,
+            status: 'completed',
+            sessionId: attempt.sessionId,
+            detail: `Process tree terminated: killed=${outcome.killed}`,
+          }
+        : {
+            attemptId: attempt.id,
+            workOrderId: attempt.workOrderId,
+            action,
+            baseCommit: attempt.baseCommit,
+            recordedAtIso: nowIso,
+            status: 'ambiguous',
+            sessionId: attempt.sessionId,
+            detail: `Process tree termination ${outcome.outcome}: ${outcome.reason}`,
+          };
+    await appendJournalEntry(journal, entry);
+  }
 }
 
 /**
@@ -187,6 +257,14 @@ export class StopAttemptUseCase implements StopAttemptPort {
         const capacityReleased = ownsReservation
           ? await deps.journal.releaseCapacityReservation(attempt.id, nowIso)
           : false;
+        await terminateAttemptProcessTree(
+          deps.processTreeTermination,
+          deps.journal,
+          attempt,
+          'stop',
+          request.gracePeriodSeconds ?? 10,
+          nowIso,
+        );
         await appendJournalEntry(deps.journal, {
           attemptId: attempt.id,
           workOrderId: attempt.workOrderId,
@@ -265,6 +343,18 @@ export class StopAttemptUseCase implements StopAttemptPort {
       const capacityReleased = ownsReservation
         ? await deps.journal.releaseCapacityReservation(attempt.id, nowIso)
         : false;
+      // A re-dispatched attempt leaves a foreign live session in the same
+      // worktree: its process tree is not this stop's to kill.
+      if (ownsReservation) {
+        await terminateAttemptProcessTree(
+          deps.processTreeTermination,
+          deps.journal,
+          attempt,
+          'stop',
+          request.gracePeriodSeconds ?? 10,
+          nowIso,
+        );
+      }
       await appendJournalEntry(deps.journal, {
         attemptId: attempt.id,
         workOrderId: attempt.workOrderId,

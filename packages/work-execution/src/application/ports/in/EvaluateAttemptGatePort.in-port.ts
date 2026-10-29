@@ -1,5 +1,7 @@
 // In-port — the conductor's gate step evaluates the frozen gate alone.
 
+import type { GatePredicateResult } from '../out/GatePredicatePort.out-port.js';
+
 /**
  * Evaluate the frozen acceptance spec of a collected attempt at its exact
  * collected head, or read the stored outcome when the gate already ran at
@@ -11,10 +13,19 @@ export interface EvaluateAttemptGateRequest {
   readonly candidateHeadSha: string;
 }
 
-/** `reason` is display text only; callers decide on `verdict`. */
+/**
+ * `reason` is display text only; callers decide on `verdict`. A `passed` or
+ * `failed` verdict carries the parsed predicate results it was decided from
+ * (KF-13a), so the conductor gate can record one verification receipt per
+ * acceptance check; `unknown` keeps `reason` only.
+ */
 export type EvaluateAttemptGateResult =
-  | { readonly verdict: 'passed' }
-  | { readonly verdict: 'failed'; readonly reason: string }
+  | { readonly verdict: 'passed'; readonly results?: readonly GatePredicateResult[] }
+  | {
+      readonly verdict: 'failed';
+      readonly reason: string;
+      readonly results?: readonly GatePredicateResult[];
+    }
   | { readonly verdict: 'unknown'; readonly reason: string };
 
 export interface EvaluateAttemptGatePort {

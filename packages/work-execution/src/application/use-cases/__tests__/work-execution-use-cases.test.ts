@@ -53,6 +53,10 @@ import type {
 import type { WorkOrderRepositoryPort } from '../../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { WorkspacePort, WorktreeInspection } from '../../ports/out/WorkspacePort.out-port.js';
 import type { ReadUsageResult, UsagePort } from '../../ports/out/UsagePort.out-port.js';
+import type {
+  ProcessTreeTerminationPort,
+  TerminateWorktreeProcessesResult,
+} from '../../ports/out/ProcessTreeTerminationPort.out-port.js';
 import { DispatchAttemptUseCase } from '../DispatchAttemptUseCase.use-case.js';
 import { InspectWorkOrderUseCase } from '../InspectWorkOrderUseCase.use-case.js';
 import { CollectAttemptArtifactsUseCase } from '../CollectAttemptArtifactsUseCase.use-case.js';
@@ -3462,6 +3466,30 @@ function makeStopSetup(
   return { attemptRepo, journal, runner, useCase };
 }
 
+/**
+ * Recording fake for the PK-1b process-tree termination port: it records
+ * every request and answers with the configured outcome, or throws when
+ * configured to.
+ */
+function makeProcessTreePort(result: TerminateWorktreeProcessesResult | 'throw') {
+  const calls: {
+    attemptId: string;
+    worktreePath: string;
+    runner: AttemptRunnerRecord | null | undefined;
+    gracePeriodSeconds: number;
+  }[] = [];
+  const port: ProcessTreeTerminationPort = {
+    async terminateWorktreeProcesses(request) {
+      calls.push(request);
+      if (result === 'throw') {
+        throw new Error('boom');
+      }
+      return result;
+    },
+  };
+  return { port, calls };
+}
+
 describe('StopAttemptUseCase', () => {
   it('throws Not implemented when constructed without dependencies', async () => {
     const useCase = new StopAttemptUseCase();
@@ -3739,6 +3767,174 @@ describe('StopAttemptUseCase', () => {
     expect(setup.journal.entries).toHaveLength(0);
     expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('intent-recorded');
   });
+
+  it('terminates the process tree with the request grace after a worktree abort and journals the count first', async () => {
+    const setup = makeStopSetup({
+      attempt: { state: 'blocked', sessionId: null, runner: { kind: 'opencode', remotePort: 4166, host: 'example-lane', hostName: 'lane-host', agent: null, model: 'glm-5', variant: null } },
+      abortResult: { outcome: 'aborted', endedAtIso: '2026-10-22T12:00:00.000Z' },
+    });
+    const tree = makeProcessTreePort({ outcome: 'terminated', killed: 3 });
+    const useCase = new StopAttemptUseCase({
+      attemptRepo: setup.attemptRepo,
+      journal: setup.journal,
+      runner: setup.runner.port,
+      processTreeTermination: tree.port,
+    });
+
+    const result = await useCase.stopAttempt({ attemptId: 'attempt-1', gracePeriodSeconds: 20 });
+
+    expect(result).toMatchObject({ outcome: 'cancelled', capacityReleased: true });
+    expect(result.outcome === 'cancelled' && result.attempt.state === 'cancelled').toBe(true);
+    expect(tree.calls).toEqual([
+      {
+        attemptId: 'attempt-1',
+        worktreePath: '/lanes/attempt-1',
+        runner: { kind: 'opencode', remotePort: 4166, host: 'example-lane', hostName: 'lane-host', agent: null, model: 'glm-5', variant: null },
+        gracePeriodSeconds: 20,
+      },
+    ]);
+    const completed = setup.journal.entries.filter((entry) => entry.status === 'completed');
+    expect(completed).toHaveLength(2);
+    expect(completed[0]).toMatchObject({
+      action: 'stop',
+      status: 'completed',
+      sessionId: null,
+      detail: 'Process tree terminated: killed=3',
+    });
+    expect(completed[1]).toMatchObject({
+      action: 'stop',
+      status: 'completed',
+      sessionId: null,
+      detail: 'Worktree aborted and attempt cancelled',
+    });
+  });
+
+  it('terminates the process tree with the default grace after an authoritative terminated stop and journals the count first', async () => {
+    const receipt = completionReceipt({ stoppedByRequest: true });
+    const setup = makeStopSetup({
+      stopResult: { outcome: 'terminated', receipt },
+    });
+    const tree = makeProcessTreePort({ outcome: 'terminated', killed: 1 });
+    const useCase = new StopAttemptUseCase({
+      attemptRepo: setup.attemptRepo,
+      journal: setup.journal,
+      runner: setup.runner.port,
+      processTreeTermination: tree.port,
+    });
+
+    const result = await useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toMatchObject({ outcome: 'terminated' });
+    if (result.outcome !== 'terminated') {
+      throw new Error('unreachable');
+    }
+    expect(result.attempt.state).toBe('cancelled');
+    expect(tree.calls).toEqual([
+      {
+        attemptId: 'attempt-1',
+        worktreePath: '/lanes/attempt-1',
+        runner: null,
+        gracePeriodSeconds: 10,
+      },
+    ]);
+    const completed = setup.journal.entries.filter((entry) => entry.status === 'completed');
+    expect(completed).toHaveLength(2);
+    expect(completed[0]).toMatchObject({
+      action: 'stop',
+      status: 'completed',
+      sessionId: 'session-1',
+      detail: 'Process tree terminated: killed=1',
+    });
+    expect(completed[1]).toMatchObject({
+      action: 'stop',
+      status: 'completed',
+      sessionId: 'session-1',
+      detail: 'Session terminated and termination receipt recorded',
+    });
+  });
+
+  it('journals ambiguous process-tree entries for refused, unavailable and a throwing port while the stop stays cancelled', async () => {
+    const receipt = completionReceipt({ stoppedByRequest: true });
+    for (const treeResult of [
+      { outcome: 'refused', reason: 'no processes found' },
+      { outcome: 'unavailable', reason: 'host unreachable' },
+    ] as const) {
+      const setup = makeStopSetup({
+        stopResult: { outcome: 'terminated', receipt },
+      });
+      const tree = makeProcessTreePort(treeResult);
+      const useCase = new StopAttemptUseCase({
+        attemptRepo: setup.attemptRepo,
+        journal: setup.journal,
+        runner: setup.runner.port,
+        processTreeTermination: tree.port,
+      });
+
+      const result = await useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+      expect(result).toMatchObject({ outcome: 'terminated' });
+      if (result.outcome !== 'terminated') {
+        throw new Error('unreachable');
+      }
+      expect(result.attempt.state).toBe('cancelled');
+      expect(result.attempt.outcome).toBe('stopped');
+      const ambiguous = setup.journal.entries.filter((entry) => entry.status === 'ambiguous');
+      expect(ambiguous).toHaveLength(1);
+      expect(ambiguous[0]).toMatchObject({
+        action: 'stop',
+        status: 'ambiguous',
+        sessionId: 'session-1',
+        detail: `Process tree termination ${treeResult.outcome}: ${treeResult.reason}`,
+      });
+    }
+
+    const setup = makeStopSetup({
+      stopResult: { outcome: 'terminated', receipt },
+    });
+    const tree = makeProcessTreePort('throw');
+    const useCase = new StopAttemptUseCase({
+      attemptRepo: setup.attemptRepo,
+      journal: setup.journal,
+      runner: setup.runner.port,
+      processTreeTermination: tree.port,
+    });
+
+    const result = await useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toMatchObject({ outcome: 'terminated' });
+    const ambiguous = setup.journal.entries.filter((entry) => entry.status === 'ambiguous');
+    expect(ambiguous).toHaveLength(1);
+    expect(ambiguous[0]).toMatchObject({
+      action: 'stop',
+      status: 'ambiguous',
+      sessionId: 'session-1',
+      detail: 'Process tree termination unavailable: port threw',
+    });
+  });
+
+  it('makes no process-tree call or entry on a refused stop', async () => {
+    const setup = makeStopSetup({
+      stopResult: { outcome: 'refused', reason: 'Attempt has no recorded runner port' },
+    });
+    const tree = makeProcessTreePort({ outcome: 'terminated', killed: 2 });
+    const useCase = new StopAttemptUseCase({
+      attemptRepo: setup.attemptRepo,
+      journal: setup.journal,
+      runner: setup.runner.port,
+      processTreeTermination: tree.port,
+    });
+
+    const result = await useCase.stopAttempt({ attemptId: 'attempt-1' });
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Attempt has no recorded runner port',
+    });
+    expect(tree.calls).toHaveLength(0);
+    expect(
+      setup.journal.entries.some((entry) => (entry.detail ?? '').includes('Process tree')),
+    ).toBe(false);
+  });
 });
 
 function validCollectRequest(overrides: Record<string, unknown> = {}) {
@@ -3970,6 +4166,100 @@ describe('CollectAttemptArtifactsUseCase', () => {
     expect(saved?.usage?.sessionId).toBe('session-1');
     expect(usage.calls).toHaveLength(1);
     expect(setup.journal.entries[0]?.detail).toBe('usage read');
+  });
+
+  it('terminates the process tree with the default grace after the collected save and journals the count before the collect entry', async () => {
+    const setup = makeCollectSetup();
+    const tree = makeProcessTreePort({ outcome: 'terminated', killed: 5 });
+    const useCase = new CollectAttemptArtifactsUseCase({
+      attemptRepo: setup.attemptRepo,
+      journal: setup.journal,
+      artifactPort: setup.artifacts.port,
+      processTreeTermination: tree.port,
+    });
+
+    const result = await useCase.collectAttemptArtifacts(
+      validCollectRequest() as Parameters<CollectAttemptArtifactsUseCase['collectAttemptArtifacts']>[0],
+    );
+
+    expect(result).toMatchObject({ outcome: 'collected' });
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('collected');
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.outcome).toBe('done');
+    expect(tree.calls).toEqual([
+      {
+        attemptId: 'attempt-1',
+        worktreePath: '/lanes/attempt-1',
+        runner: null,
+        gracePeriodSeconds: 10,
+      },
+    ]);
+    expect(setup.journal.entries).toHaveLength(2);
+    expect(setup.journal.entries[0]).toMatchObject({
+      action: 'collect',
+      status: 'completed',
+      sessionId: 'session-1',
+      detail: 'Process tree terminated: killed=5',
+    });
+    expect(setup.journal.entries[1]).toMatchObject({
+      action: 'collect',
+      status: 'completed',
+      detail: 'Artifacts collected with outcome done',
+    });
+  });
+
+  it('still collects with ambiguous process-tree entries for refused, unavailable and a throwing port', async () => {
+    for (const treeResult of [
+      { outcome: 'refused', reason: 'kill refused by host' },
+      { outcome: 'unavailable', reason: 'runner did not answer' },
+    ] as const) {
+      const setup = makeCollectSetup();
+      const tree = makeProcessTreePort(treeResult);
+      const useCase = new CollectAttemptArtifactsUseCase({
+        attemptRepo: setup.attemptRepo,
+        journal: setup.journal,
+        artifactPort: setup.artifacts.port,
+        processTreeTermination: tree.port,
+      });
+
+      const result = await useCase.collectAttemptArtifacts(
+        validCollectRequest() as Parameters<CollectAttemptArtifactsUseCase['collectAttemptArtifacts']>[0],
+      );
+
+      expect(result).toMatchObject({ outcome: 'collected' });
+      expect(setup.attemptRepo.attempts.get('attempt-1')?.state).toBe('collected');
+      expect(setup.journal.entries[0]).toMatchObject({
+        action: 'collect',
+        status: 'ambiguous',
+        sessionId: 'session-1',
+        detail: `Process tree termination ${treeResult.outcome}: ${treeResult.reason}`,
+      });
+      expect(setup.journal.entries[1]).toMatchObject({
+        action: 'collect',
+        status: 'completed',
+        detail: 'Artifacts collected with outcome done',
+      });
+    }
+
+    const setup = makeCollectSetup();
+    const tree = makeProcessTreePort('throw');
+    const useCase = new CollectAttemptArtifactsUseCase({
+      attemptRepo: setup.attemptRepo,
+      journal: setup.journal,
+      artifactPort: setup.artifacts.port,
+      processTreeTermination: tree.port,
+    });
+
+    const result = await useCase.collectAttemptArtifacts(
+      validCollectRequest() as Parameters<CollectAttemptArtifactsUseCase['collectAttemptArtifacts']>[0],
+    );
+
+    expect(result).toMatchObject({ outcome: 'collected' });
+    expect(setup.journal.entries[0]).toMatchObject({
+      action: 'collect',
+      status: 'ambiguous',
+      sessionId: 'session-1',
+      detail: 'Process tree termination unavailable: port threw',
+    });
   });
 
   it('still collects and stores unavailable usage when the usage port is unavailable', async () => {
@@ -4635,6 +4925,158 @@ describe('attempt revision compare-and-swap retry', () => {
     expect(journal.heldFor('attempt-1')).toBe(true);
   });
 
+  it('dispatch with both saves conflicting terminates the process tree of the stopped session and journals it before the ambiguous entry', async () => {
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      conflictOnSaves: [2, 3],
+      freshAfterConflict: storedAttempt({ state: 'reconciling', sessionId: null, revision: 5 }),
+    });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const receipt = completionReceipt({ stoppedByRequest: true });
+    const runner = makeRunner({ stopResult: { outcome: 'terminated', receipt } });
+    const tree = makeProcessTreePort({ outcome: 'terminated', killed: 4 });
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+      processTreeTermination: tree.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('second revision conflict');
+    }
+    expect(runner.stopCalls).toHaveLength(1);
+    expect(tree.calls).toHaveLength(1);
+    expect(tree.calls[0]).toMatchObject({
+      attemptId: 'attempt-1',
+      worktreePath: '/lanes/attempt-1',
+      runner: expect.objectContaining({ kind: 'opencode' }),
+      gracePeriodSeconds: 10,
+    });
+    const termination = journal.entries.find((entry) =>
+      (entry.detail ?? '').startsWith('Process tree terminated'),
+    );
+    const ambiguous = journal.entries.find(
+      (entry) =>
+        entry.status === 'ambiguous' &&
+        (entry.detail ?? '').includes('second revision conflict'),
+    );
+    expect(termination).toBeDefined();
+    expect(termination).toMatchObject({
+      action: 'dispatch',
+      status: 'completed',
+      sessionId: 'session-1',
+      detail: 'Process tree terminated: killed=4',
+    });
+    expect(ambiguous).toBeDefined();
+    expect(journal.entries.indexOf(termination!)).toBeLessThan(journal.entries.indexOf(ambiguous!));
+  });
+
+  it('dispatch whose started session loses to a foreign LIVE session never kills that session\'s worktree tree (PK-1b Luna)', async () => {
+    const seed = storedAttempt({ state: 'ended', sessionId: null, revision: 5 });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      seed,
+      conflictOnSave: 2,
+      freshAfterConflict: storedAttempt({ state: 'running', sessionId: 'ses_foreign_live', revision: 6 }),
+    });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const receipt = completionReceipt({ stoppedByRequest: true });
+    const runner = makeRunner({ stopResult: { outcome: 'terminated', receipt } });
+    const tree = makeProcessTreePort({ outcome: 'terminated', killed: 5 });
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+      processTreeTermination: tree.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('unknown');
+    expect(runner.stopCalls).toHaveLength(1);
+    expect(tree.calls).toHaveLength(0);
+    expect(journal.entries.some((entry) => (entry.detail ?? '').startsWith('Process tree'))).toBe(false);
+  });
+
+  it('dispatch whose started session loses to a foreign state terminates the process tree and journals the ambiguous outcome', async () => {
+    const seed = storedAttempt({ state: 'ended', sessionId: null, revision: 5 });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      seed,
+      conflictOnSave: 2,
+      freshAfterConflict: storedAttempt({ state: 'ended', sessionId: null, revision: 6 }),
+    });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const receipt = completionReceipt({ stoppedByRequest: true });
+    const runner = makeRunner({ stopResult: { outcome: 'terminated', receipt } });
+    const tree = makeProcessTreePort({ outcome: 'refused', reason: 'kill script missing' });
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+      processTreeTermination: tree.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('unknown');
+    if (result.outcome === 'unknown') {
+      expect(result.reason).toContain('started session session-1 was not recorded');
+    }
+    expect(runner.stopCalls).toHaveLength(1);
+    expect(tree.calls).toHaveLength(1);
+    expect(tree.calls[0]).toMatchObject({
+      attemptId: 'attempt-1',
+      worktreePath: '/lanes/attempt-1',
+      runner: expect.objectContaining({ kind: 'opencode' }),
+      gracePeriodSeconds: 10,
+    });
+    const ambiguous = journal.entries.filter((entry) => entry.status === 'ambiguous');
+    expect(ambiguous).toHaveLength(2);
+    expect(ambiguous[0]).toMatchObject({
+      action: 'dispatch',
+      status: 'ambiguous',
+      sessionId: 'session-1',
+      detail: 'Process tree termination refused: kill script missing',
+    });
+    expect(ambiguous[1]).toMatchObject({
+      action: 'dispatch',
+      status: 'ambiguous',
+      sessionId: 'session-1',
+    });
+  });
+
   it('collect conflicts with the fresh record still ended: collected is rebuilt and saved, release runs once', async () => {
     const seed = storedAttempt({
       state: 'ended',
@@ -4997,10 +5439,14 @@ describe('attempt revision compare-and-swap retry', () => {
     journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
     const receipt = completionReceipt({ stoppedByRequest: true });
     const runner = makeRunner({ stopResult: { outcome: 'terminated', receipt } });
-    const useCase = new StopAttemptUseCase({ attemptRepo, journal, runner: runner.port });
+    const tree = makeProcessTreePort({ outcome: 'terminated', killed: 9 });
+    const useCase = new StopAttemptUseCase({ attemptRepo, journal, runner: runner.port, processTreeTermination: tree.port });
 
     const result = await useCase.stopAttempt({ attemptId: 'attempt-1' });
 
+    // The foreign live session's process tree is not this stop's to kill (PK-1b Argon).
+    expect(tree.calls).toHaveLength(0);
+    expect(journal.entries.some((entry) => (entry.detail ?? '').startsWith('Process tree'))).toBe(false);
     expect(result.outcome).toBe('terminated');
     if (result.outcome === 'terminated') {
       expect(result.capacityReleased).toBe(false);

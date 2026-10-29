@@ -273,6 +273,38 @@ function validatePathsAndSpec(
         'allowedPathPrefixes is required: the acceptance spec diff check refuses every changed path outside them',
     };
   }
+  // KF-13a: when acceptance checks are declared they must name one check per
+  // acceptance spec command, in order; absent or empty stays allowed (reviews
+  // then refuse `assessment-unavailable` as today).
+  const acceptanceChecks = request.acceptanceChecks;
+  if (
+    acceptanceChecks !== undefined &&
+    (!Array.isArray(acceptanceChecks) ||
+      acceptanceChecks.some((entry) => typeof entry !== 'string' || entry.trim().length === 0))
+  ) {
+    return {
+      reason: 'acceptanceChecks must name one check per acceptanceSpec command, in order',
+    };
+  }
+  // Names are distinct: the evidence context keeps one receipt per name, so a
+  // repeated name would let one receipt stand for two checks.
+  if (
+    acceptanceChecks !== undefined &&
+    new Set(acceptanceChecks.map((entry) => entry.trim())).size !== acceptanceChecks.length
+  ) {
+    return {
+      reason: 'acceptanceChecks must be distinct names',
+    };
+  }
+  if (
+    acceptanceChecks !== undefined &&
+    acceptanceChecks.length > 0 &&
+    acceptanceChecks.length !== acceptanceSpec.value.getCommands().length
+  ) {
+    return {
+      reason: 'acceptanceChecks must name one check per acceptanceSpec command, in order',
+    };
+  }
   return { allowedPathPrefixes, acceptanceSpec: acceptanceSpec.value };
 }
 

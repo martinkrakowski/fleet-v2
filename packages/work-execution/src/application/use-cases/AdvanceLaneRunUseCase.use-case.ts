@@ -81,6 +81,7 @@ import {
   appendConduct,
   performEnter,
   performPark,
+  raiseParkNotice,
   saveOrRefuse,
 } from './advance-lane-run/step-context.js';
 import {
@@ -230,6 +231,14 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
         if (!appended.ok) {
           return { outcome: 'refused', reason: appended.reason };
         }
+        // A crash before the notice landed is repaired here too: re-raise the
+        // saved park's notice under its key before returning `repaired`.
+        await raiseParkNotice(this.ctx,
+          record,
+          record.parked.reason,
+          record.parked.qualifier,
+          request,
+        );
         return { outcome: 'repaired', state: 'parked' };
       }
       if (parkedConducts === record.parkCount) {
@@ -248,6 +257,24 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     }
 
     const gathered = await gatherFacts(this.ctx, record, entries, request, journalState);
+    // A parked run whose notice did not land re-raises it under its saved park
+    // key on every advance until it lands. For an owner-question reason the
+    // question id is saved once it lands, which turns this condition off; for
+    // an attention-only reason the idempotent re-raise answers `exists` and
+    // costs one call per advance — acceptable.
+    if (
+      record.parked !== null &&
+      journalState === 'parked' &&
+      record.parked.questionId === null &&
+      this.deps.parkNotice !== undefined
+    ) {
+      await raiseParkNotice(this.ctx,
+        record,
+        record.parked.reason,
+        record.parked.qualifier,
+        request,
+      );
+    }
     const decision = nextLaneRunAction(record, gathered.facts, request.nowIso);
     return this.performDecision(record, gathered, decision, request);
   }

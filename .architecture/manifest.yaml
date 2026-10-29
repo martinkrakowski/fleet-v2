@@ -419,9 +419,10 @@ bounded_contexts:
             - AutoMergeOwnerRoutingPort
             - ConductorForgeGrantPort
             - LaneRunParkNoticePort
+            - TelemetryDispositionPort
             - AcceptanceReceiptReadPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -468,6 +469,7 @@ bounded_contexts:
       ConductorForgeGrantPort: "Issue one push-and-open-pr or push-to-pr policy grant for an accepted attempt at an exact head under policy:conductor@<revision>; it never decides eligibility and never issues a merge grant."
       AcceptanceReceiptReadPort: "Read the verification and review receipts of one attempt at one exact head through the evidence context's read-only inspection, projected to receipt id (hash input only), result, exit code, review kind, finding counts by severity and completion time; nothing else crosses the port; absence is an empty result, an unreadable store is unavailable."
       LaneRunParkNoticePort: "Raise one attention item per parked run and reason, and ask one keyed owner question where the owner must choose; ids and reason codes only; a repeat returns the existing notice."
+      TelemetryDispositionPort: "Per-trace span dispositions (pending, exported@route, rejected with a reason class), the recorded salt fingerprint and export counters in the state directory; every write merges per span under an exclusive lock with a 500 ms give-up, a pending never replaces a final disposition unless reopened, and a different salt fingerprint is refused."
       OwnerDecisionPort: "Re-check the attempt's frozen one-way doors through owner coordination before forge actions; an undecided, declined or unreadable decision blocks the action."
       AttemptOwnerDecisionPort: "Read the owner decision references the product froze into an attempt's brief package; an attempt recorded without them is unknown and blocks forge actions."
       BriefKnowledgePort: "Request bounded context proposals, record selected versions and forward only completed-attempt notes to the knowledge context."
@@ -487,6 +489,7 @@ bounded_contexts:
       - { adapter: LaneRunRepositoryAdapter, implements: LaneRunRepositoryPort, integration: local-transactional-store }
       - { adapter: ConductorDriverLeaseAdapter, implements: ConductorDriverLeasePort, integration: local-transactional-store }
       - { adapter: LaneRunJournalAdapter, implements: LaneRunJournalPort, integration: local-keyed-run-journal }
+      - { adapter: TelemetryDispositionAdapter, implements: TelemetryDispositionPort, integration: local-transactional-store }
       - { adapter: BriefAuthoringAdapter, implements: BriefAuthoringPort, integration: reviewed-harness-or-hand-written-file }
       - { adapter: ExecutionRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-ocm-run-subprocess }
       - { adapter: AgyRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-agy-run-subprocess-behind-runner-mode }

@@ -10,7 +10,7 @@ import { requireValidInstallationModel } from '@fleet/installation';
 import type { EvidenceAssessmentRecord } from '@fleet/evidence-and-acceptance';
 
 import { assessmentIdForAttempt, createFleetCliRuntime } from '../composition.js';
-import { buildLiveConductorDriver } from '../conductor-wiring.js';
+import { buildLiveConductorDriver, conductorGateOf } from '../conductor-wiring.js';
 
 const HEAD = 'a'.repeat(40);
 const ATTEMPT_ID = 'attempt-example-1';
@@ -266,6 +266,21 @@ describe('conductor review-assessment wiring (K5-6)', () => {
     await expect(
       runtime.conductor.reviewAssessment.openReviewAssessment(makeOpenRequest('b'.repeat(40))),
     ).resolves.toEqual({ outcome: 'unavailable', reason: 'head-mismatch' });
+  });
+
+  it('the live conductor evaluates the predicate-backed gate, never the predicate-less accept instance (KF-12)', async () => {
+    const runtime = createFleetCliRuntime();
+    const gate = conductorGateOf(runtime);
+    expect(gate).toBe(runtime.execution.attemptGate);
+    expect(gate).not.toBe(runtime.execution.requestAttemptAcceptance);
+    // The predicate-less instance answers 'not wired' before it reads anything; the
+    // conductor's gate reads the attempt first (and finds none here).
+    const headSha = 'a'.repeat(40);
+    const unwired = await runtime.execution.requestAttemptAcceptance.evaluateAttemptGate({ attemptId: 'attempt-missing', candidateHeadSha: headSha });
+    expect(unwired).toMatchObject({ verdict: 'unknown', reason: 'Gate predicates are not wired' });
+    const wired = await gate.evaluateAttemptGate({ attemptId: 'attempt-missing', candidateHeadSha: headSha });
+    expect(wired.verdict).toBe('unknown');
+    expect(wired).not.toMatchObject({ reason: 'Gate predicates are not wired' });
   });
 
   it('buildLiveConductorDriver constructs over the composed runtime and calls no transport', async () => {

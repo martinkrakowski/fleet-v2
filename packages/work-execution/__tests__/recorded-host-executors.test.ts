@@ -96,14 +96,62 @@ describe("ExecutorForHost", () => {
   const helper = new ExecutorForHost({ hosts, legacyExecutor });
 
   it("returns the legacy executor for a legacy record", () => {
-    for (const recorded of [
-      null,
-      undefined,
-      attemptRunner(null, "a.example", 4001),
-    ]) {
+    for (const recorded of [null, undefined, attemptRunner(null, null, 4001)]) {
       const result = helper.executorForRecordedHost(recorded);
       expect(result).toEqual({ ok: true, executor: legacyExecutor });
     }
+  });
+
+  it("keeps the legacy executor for an alias-only record when hosts are undefined (v1/absent installation)", () => {
+    const v1 = new ExecutorForHost({ legacyExecutor });
+    expect(
+      v1.executorForRecordedHost(attemptRunner(null, "a.example", 4001)),
+    ).toEqual({ ok: true, executor: legacyExecutor });
+  });
+
+  it("resolves an older alias-only record through the one ssh host with that alias, never local", () => {
+    const result = helper.executorForRecordedHost(
+      attemptRunner(null, "a.example", 4001),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.executor).toBeInstanceOf(SshExecutor);
+    expect((result.executor as SshExecutor).sshHost).toBe("a.example");
+    // Cached and keyed by the resolved host name, like a confirmed host.
+    const again = helper.executorForRecordedHost(
+      attemptRunner(null, "a.example", 4001),
+    );
+    expect(again.ok && again.executor === result.executor).toBe(true);
+    const viaName = helper.executorForRecordedHost(
+      attemptRunner("host-a", "a.example", 4001),
+    );
+    expect(viaName.ok && viaName.executor === result.executor).toBe(true);
+  });
+
+  it("refuses an alias-only record whose alias matches no single installation host, never local", () => {
+    // No host carries this alias.
+    expect(
+      helper.executorForRecordedHost(attemptRunner(null, "gone.example", 4002)),
+    ).toEqual({
+      ok: false,
+      reason:
+        "the attempt names a host alias that matches no single installation host",
+    });
+    // Two hosts share the alias ("host-b" and "changed-host").
+    expect(
+      helper.executorForRecordedHost(attemptRunner(null, "b.example", 4002)),
+    ).toEqual({
+      ok: false,
+      reason:
+        "the attempt names a host alias that matches no single installation host",
+    });
+    // The refusal never names the alias or a path.
+    const refused = helper.executorForRecordedHost(
+      attemptRunner(null, "b.example", 4002),
+    );
+    if (refused.ok) return;
+    expect(refused.reason).not.toContain("b.example");
+    expect(refused.reason).not.toContain("/");
   });
 
   it("builds an SshExecutor with the recorded host's alias for an ssh host", () => {
@@ -206,7 +254,7 @@ describe("H9b2 reads through the recorded host's executor", () => {
       worktreePath: "/wt-legacy",
       baseCommit: "b".repeat(40),
       expectedArtifactPaths: [],
-      recordedHost: attemptRunner(null, "old-alias", 4001),
+      recordedHost: attemptRunner(null, null, 4001),
     });
     expect(legacyExecutor.calls.length).toBeGreaterThan(legacyCallsBefore);
     expect(legacyExecutor.calls[legacyCallsBefore].slice(0, 3)).toEqual([

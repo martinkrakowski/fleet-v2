@@ -121,6 +121,17 @@ const COLLECTED_ARTIFACTS = {
   notes: 'present' as const,
 };
 
+/** The recorded host of a conducted attempt (KF-10/Q2a-2 invariant). */
+const CONDUCTED_RUNNER = {
+  kind: 'opencode' as const,
+  remotePort: 4166,
+  host: 'lane-alias-example',
+  hostName: 'lane-host-example',
+  agent: null,
+  model: null,
+  variant: null,
+};
+
 function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
     id: 'attempt-example-1',
@@ -805,7 +816,7 @@ describe('AdvanceLaneRunUseCase reconcile and crash-resume (K4-7)', () => {
   it('test 8: a collect reconcile completes the collect: already collected records reconciled, an ended attempt is collected now', async () => {
     const collectedHarness = await makeHarness(
       runRecord(),
-      [attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS })],
+      [attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, runner: CONDUCTED_RUNNER })],
     );
     await conduct(collectedHarness, 'collecting', NOW);
     await appendIntent(collectedHarness, collectKey(), null, NOW);
@@ -821,7 +832,7 @@ describe('AdvanceLaneRunUseCase reconcile and crash-resume (K4-7)', () => {
 
     const endedHarness = await makeHarness(
       runRecord(),
-      [attemptFixture({ state: 'ended', sessionId: 'session-example-1', completionReceipt: receipt(false) })],
+      [attemptFixture({ state: 'ended', sessionId: 'session-example-1', completionReceipt: receipt(false), runner: CONDUCTED_RUNNER })],
     );
     await conduct(endedHarness, 'collecting', NOW);
     await appendIntent(endedHarness, collectKey(), null, NOW);
@@ -839,7 +850,7 @@ describe('AdvanceLaneRunUseCase reconcile and crash-resume (K4-7)', () => {
   it('test 9: a gate reconcile evaluates again at the head and records the stored outcome', async () => {
     const harness = await makeHarness(
       runRecord(),
-      [attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS })],
+      [attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, runner: CONDUCTED_RUNNER })],
     );
     await conduct(harness, 'gating', NOW);
     await appendIntent(harness, gateKey(), null, NOW);

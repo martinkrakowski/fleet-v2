@@ -26,6 +26,7 @@ export * from "./run-telemetry.js";
 export * from "./run-telemetry-attributes.js";
 export * from "./run-telemetry-dispositions.js";
 export * from "./run-telemetry-ids.js";
+export * from "./run-telemetry-redaction.js";
 export * from "./seat-selection.js";
 export * from "./value-objects/index.js";
 export * from "./work-board.js";

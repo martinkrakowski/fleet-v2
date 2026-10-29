@@ -131,6 +131,17 @@ const WORK_ORDER: WorkOrderRecord = {
   updatedAtIso: NOW,
 };
 
+/** The recorded host of a conducted attempt (KF-10/Q2a-2 invariant). */
+const CONDUCTED_RUNNER = {
+  kind: 'opencode' as const,
+  remotePort: 4166,
+  host: 'lane-alias-example',
+  hostName: 'lane-host-example',
+  agent: null,
+  model: null,
+  variant: null,
+};
+
 /** A collected round-0 attempt whose head is `headCommit`; it is the run's latest attempt. */
 function collectedAttempt(headCommit: string = COMMIT_A): AttemptRecord {
   return {
@@ -161,6 +172,7 @@ function collectedAttempt(headCommit: string = COMMIT_A): AttemptRecord {
       collectedArtifactPaths: [],
       notes: 'present',
     },
+    runner: CONDUCTED_RUNNER,
     seatPlan: SEAT_PLAN,
     seatSelection: {
       role: 'first-pass',
@@ -196,6 +208,9 @@ function buildFixAttempt(request: PrepareFixAttemptRequest, seatIndex: number): 
     sessionId: null,
     completionReceipt: null,
     artifacts: null,
+    // Q2a-1: the fix attempt inherits its prior's host block; the conductor
+    // only reads and dispatches through it (Q2a-2).
+    runner: CONDUCTED_RUNNER,
     seatPlan: SEAT_PLAN,
     seatSelection: {
       role: 'fix',
@@ -978,11 +993,18 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(await advance(withHost)).toMatchObject({ result: 'completed', reasonCode: 'prepared' });
     expect(withHost.briefRequests[0]?.recordedHost).toEqual(runner);
 
-    // A prior attempt without a runner block addresses null (the default
-    // executor), never a guessed host.
-    const withoutHost = await makeHarness(runRecord(), [collectedAttempt()]);
+    // A prior attempt without a recorded host is never read through the local
+    // executor: the frozen-manifest read is not made and the prepare refuses.
+    const withoutHost = await makeHarness(runRecord(), [{ ...collectedAttempt(), runner: null }]);
     await seedReviewFailure(withoutHost, [blockerFinding()]);
-    expect(await advance(withoutHost)).toMatchObject({ result: 'completed', reasonCode: 'prepared' });
-    expect(withoutHost.briefRequests[0]?.recordedHost).toBeNull();
+    expect(await advance(withoutHost)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+    });
+    expect(withoutHost.briefRequests).toHaveLength(0);
+    expect(withoutHost.fixRequests).toHaveLength(0);
   });
 });

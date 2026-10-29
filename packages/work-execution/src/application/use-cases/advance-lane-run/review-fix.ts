@@ -23,6 +23,7 @@ import { historyEntryOf, selectReviewSeat } from '../../../domain/seat-selection
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import { readFrozenManifest } from './frozen-manifest.js';
+import { conductedRunnerOf } from './conducted-host.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, intentMintedIdOf, performPark, saveOrRefuse } from './step-context.js';
 
@@ -249,7 +250,13 @@ async function briefTextFor(ctx: AdvanceStepContext, latest: AttemptRecord, step
   if (step !== 'brief-check') {
     return undefined;
   }
-  const read = await ctx.deps.artifactPort.readBriefFile?.(latest.worktreePath, '.lane/brief.md', latest.runner ?? null);
+  // Q2a-2: a conducted attempt's read goes through its recorded host or is not
+  // made; a missing host never falls back to the local executor.
+  const recordedHost = conductedRunnerOf(latest);
+  if (recordedHost === null) {
+    return undefined;
+  }
+  const read = await ctx.deps.artifactPort.readBriefFile?.(latest.worktreePath, '.lane/brief.md', recordedHost);
   return read ?? undefined;
 }
 
@@ -625,8 +632,10 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
           worktreePath: prior.worktreePath,
           proseMarkdown: brief.text,
           // KF-9: the brief package is placed on the reserved host of the
-          // prior attempt, never on the default executor.
-          recordedHost: prior.runner ?? null,
+          // prior attempt, never on the default executor. The manifest read
+          // above already refused a prior without a recorded host, so this is
+          // always the host block (Q2a-2).
+          recordedHost: conductedRunnerOf(prior),
         });
   const refusePrepared = async (): Promise<AdvanceLaneRunResult> => {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'prepare-refused');

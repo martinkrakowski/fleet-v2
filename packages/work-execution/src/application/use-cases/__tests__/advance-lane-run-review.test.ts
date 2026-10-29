@@ -29,6 +29,8 @@ import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/Execut
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import type {
+  FindReviewReceiptRequest,
+  FindReviewReceiptResult,
   ReviewRequest,
   ReviewReceiptSummary,
   ReviewRequestFinding,
@@ -203,6 +205,7 @@ interface Harness {
   setManifest(json: string | null): void;
   setBriefText(text: string | null): void;
   setReviewAnswer(answer: (request: ReviewRequest) => Promise<ReviewRequestResult>): void;
+  setFindReceiptAnswer(answer: (request: FindReviewReceiptRequest) => Promise<FindReviewReceiptResult>): void;
   setOpenAnswer(answer: OpenReviewAssessmentResult): void;
   setWorkOrderAnswer(answer: WorkOrderRecord | null): void;
   setSameFamily(fn: SameModelFamily): void;
@@ -242,6 +245,9 @@ async function makeHarness(
     expect(journalLengthWhenCalled).toBe(journalLengthBeforeAdvance + 1);
     return { outcome: 'receipt', receipt: receiptFor(request, 'passed') };
   };
+  let findReceiptAnswer: (request: FindReviewReceiptRequest) => Promise<FindReviewReceiptResult> = async () => ({
+    outcome: 'not-found',
+  });
 
   const created = await runRepo.create(record);
   expect(created.outcome).toBe('saved');
@@ -292,7 +298,7 @@ async function makeHarness(
               reviewRequests.push(request);
               return reviewAnswer(request);
             },
-            findReviewReceipt: async () => ({ outcome: 'not-found' }),
+            findReviewReceipt: async (request) => findReceiptAnswer(request),
             findLatestReceiptOfKind: async () => ({ outcome: 'not-found' }),
           },
         }),
@@ -344,6 +350,9 @@ async function makeHarness(
     },
     setReviewAnswer: (answer) => {
       reviewAnswer = answer;
+    },
+    setFindReceiptAnswer: (answer) => {
+      findReceiptAnswer = answer;
     },
     setOpenAnswer: (answer) => {
       openAnswer = answer;
@@ -652,5 +661,156 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
     expect(intents).toHaveLength(1);
     expect(results).toHaveLength(0);
     expect(harness.reviewRequests).toHaveLength(1);
+  });
+});
+
+describe('AdvanceLaneRunUseCase review reconcile (K5-4b)', () => {
+  it('a throwing request with a receipt already in evidence is reconciled from that receipt into review-passed, then code-review', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async () => {
+      throw new Error('delegate-failed');
+    });
+    harness.setFindReceiptAnswer(async (request) => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-1',
+        requestId: request.requestId,
+        kind: 'brief-check',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'passed',
+        findings: [],
+      },
+    }));
+    const key = reviewKey('brief-check', 0, HEAD12_A);
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key,
+      result: 'ambiguous',
+      reasonCode: 'review-unknown',
+    });
+    const second = await advance(harness);
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key,
+      result: 'reconciled',
+      reasonCode: 'review-passed',
+    });
+    // The reconcile read the receipt; it never called requestReview again.
+    expect(harness.reviewRequests).toHaveLength(1);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'code-review' });
+  });
+
+  it('not-found closes the key as review-no-receipt and the decider retries once under the /retry1 key', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async () => ({ outcome: 'unknown', reason: 'delegate-failed' }));
+    const key = reviewKey('brief-check', 0, HEAD12_A);
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key,
+      result: 'ambiguous',
+      reasonCode: 'review-unknown',
+    });
+    expect(harness.reviewRequests).toHaveLength(1);
+    const firstRequestId = harness.reviewRequests[0]!.requestId;
+    const second = await advance(harness);
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key,
+      result: 'completed',
+      reasonCode: 'review-no-receipt',
+    });
+    // The reconcile never called requestReview again under the first key.
+    expect(harness.reviewRequests).toHaveLength(1);
+    harness.setReviewAnswer(async (request) => ({ outcome: 'receipt', receipt: receiptFor(request, 'passed') }));
+    const third = await advance(harness);
+    expect(third).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A, 1),
+      result: 'completed',
+      reasonCode: 'review-passed',
+    });
+    expect(harness.reviewRequests).toHaveLength(2);
+    expect(harness.reviewRequests[0]!.requestId).toBe(firstRequestId);
+    expect(harness.reviewRequests[1]!.requestId).not.toBe(firstRequestId);
+  });
+
+  it('an unavailable receipt parks the run ambiguous with the review step as qualifier', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async () => ({ outcome: 'unknown', reason: 'delegate-failed' }));
+    harness.setFindReceiptAnswer(async () => ({ outcome: 'unavailable', reason: 'unreadable' }));
+    const key = reviewKey('brief-check', 0, HEAD12_A);
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key,
+      result: 'ambiguous',
+      reasonCode: 'review-unknown',
+    });
+    const second = await advance(harness);
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key,
+      result: 'ambiguous',
+      reasonCode: 'review-unknown',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'brief-check' });
+  });
+
+  it('a reconcile decision with no minted request id on the intent stays ambiguous and then parks', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    const key = reviewKey('brief-check', 0, HEAD12_A);
+    await appendIntent(harness, key, null, NOW);
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key,
+      result: 'ambiguous',
+      reasonCode: 'review-unknown',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'brief-check' });
+  });
+
+  it('the journal never carries a second intent under the same review key', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async () => {
+      throw new Error('delegate-failed');
+    });
+    harness.setFindReceiptAnswer(async (request) => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-1',
+        requestId: request.requestId,
+        kind: 'brief-check',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'passed',
+        findings: [],
+      },
+    }));
+    const key = reviewKey('brief-check', 0, HEAD12_A);
+    await advance(harness);
+    await advance(harness);
+    await advance(harness);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === key);
+    const results = entries.filter((entry) => entry.kind === 'result' && entry.key === key);
+    expect(intents).toHaveLength(1);
+    expect(results).toHaveLength(1);
   });
 });

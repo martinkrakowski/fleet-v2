@@ -38,7 +38,7 @@ export * from "./LocalExecutor.adapter.js";
 export * from "./NoopChangeSignalAdapter.adapter.js";
 export * from "./NoopRunTelemetryAdapter.adapter.js";
 export * from "./NoopRunTelemetryMarkAdapter.adapter.js";
-export * from "./OpencodeDbUsageAdapter.adapter.js";
+export * from "./OpencodeApiUsageAdapter.adapter.js";
 export * from "./OtlpHttpRunTelemetryAdapter.adapter.js";
 export * from "./OtlpHttpTransport.helper.js";
 export * from "./OtlpJsonEncoder.helper.js";

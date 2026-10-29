@@ -8,6 +8,13 @@
  * digest covers the gate. PR notes (D7) are validated when present and
  * frozen under `prNotes`; they are optional here because manual prepare
  * works without them, while a conducted start requires them.
+ *
+ * `previewBriefPackage` (plan §3.3, §3.7) validates the same request and
+ * computes what a prepare would freeze — the digest and the seat plan —
+ * and shows the acceptance spec only as a projection (commit required, diff
+ * check, command count and one digest per command's argv): no frozen brief
+ * is placed, no context selection is recorded, no seat is committed, and no
+ * argv element, owned path, prefix, artifact path or note text is returned.
  */
 
 import { parseSeatTool } from '../../domain/execution-records.js';
@@ -16,13 +23,16 @@ import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isPlanSecretShaped } from '../../domain/lane-plan-sidecar.js';
 import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import type {
+  BriefContextDecision,
   PrepareBriefPackagePort,
   PrepareBriefPackageRequest,
   PrepareBriefPackageResult,
+  PreviewBriefPackageResult,
+  BriefPackagePreview,
   SelectedKnowledgeVersion,
 } from '../ports/in/PrepareBriefPackagePort.in-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
-import type { BriefAuthoringPort } from '../ports/out/BriefAuthoringPort.out-port.js';
+import type { AuthoredBriefResult, BriefAuthoringPort } from '../ports/out/BriefAuthoringPort.out-port.js';
 import type { BriefKnowledgePort } from '../ports/out/BriefKnowledgePort.out-port.js';
 import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import { seatMatchesAssignment, seatPlanFamilyConflicts } from '../../domain/seat-selection.js';
@@ -145,176 +155,226 @@ function checkSeatPlan(
   return { plan };
 }
 
+/** Early request-shape validation: required fields, owned paths, limits, model and seat tool. */
+function validateBriefFields(request: PrepareBriefPackageRequest): string | null {
+  const requiredFields: readonly (keyof PrepareBriefPackageRequest)[] = [
+    'workOrderId',
+    'laneId',
+    'baseCommit',
+  ];
+  const missingFields = requiredFields.filter((field) => !isNonEmpty(request[field]));
+  if (missingFields.length > 0) {
+    return `Missing required brief fields: ${missingFields.join(', ')}`;
+  }
+  if (!Array.isArray(request.ownedPaths) || request.ownedPaths.length === 0) {
+    return 'Brief must own at least one path';
+  }
+  if (
+    typeof request.stepLimit !== 'number' ||
+    typeof request.timeLimitSeconds !== 'number' ||
+    request.stepLimit <= 0 ||
+    request.timeLimitSeconds <= 0
+  ) {
+    return 'stepLimit and timeLimitSeconds must be positive';
+  }
+  if (!request.modelAssignment || !isNonEmpty(request.modelAssignment.model)) {
+    return 'Model assignment requires a non-empty model';
+  }
+  // The seat tool is frozen into the manifest and covered by the digest
+  // (H8); it is required and never defaulted to a declared kind.
+  if (parseSeatTool(request.modelAssignment.seatTool) === undefined) {
+    return 'Model assignment requires a declared seat tool (opencode or agy)';
+  }
+  return null;
+}
+
+/**
+ * The allowed path prefixes feed the edit-only diff check. Required for an
+ * agy seat, optional for opencode; every entry must be a non-empty relative
+ * path that never names `.git` or `.lane`. Plan S2: the gate is data in the
+ * frozen manifest, and its diff check needs at least one prefix. Returns the
+ * validated prefixes and spec, or a refusal reason.
+ */
+function validatePathsAndSpec(
+  request: PrepareBriefPackageRequest,
+): { readonly reason: string } | {
+  readonly allowedPathPrefixes: readonly string[];
+  readonly acceptanceSpec: AcceptanceSpec;
+} {
+  // `execute` takes untyped input from the CLI and the API: a string here
+  // would pass the length and per-character checks and be frozen into the
+  // manifest as a string, so the shape is checked first.
+  const allowedPathPrefixes = request.allowedPathPrefixes ?? [];
+  if (
+    !Array.isArray(allowedPathPrefixes) ||
+    !allowedPathPrefixes.every((prefix) => typeof prefix === 'string')
+  ) {
+    return { reason: 'allowedPathPrefixes must be an array of strings' };
+  }
+  if (request.modelAssignment.seatTool === 'agy' && allowedPathPrefixes.length === 0) {
+    return { reason: 'allowedPathPrefixes is required when the seat tool is agy' };
+  }
+  for (const prefix of allowedPathPrefixes) {
+    const invalidPrefix = validateAllowedPathPrefix(prefix);
+    if (invalidPrefix !== null) {
+      return { reason: invalidPrefix };
+    }
+  }
+  if (request.acceptanceSpec === undefined || request.acceptanceSpec === null) {
+    return {
+      reason: 'acceptanceSpec is required: commitRequired, diffCheck and at least one command',
+    };
+  }
+  const acceptanceSpec = AcceptanceSpec.create(request.acceptanceSpec);
+  if (!acceptanceSpec.success || acceptanceSpec.value === undefined) {
+    return { reason: acceptanceSpec.error?.message ?? 'acceptanceSpec is invalid' };
+  }
+  if (allowedPathPrefixes.length === 0) {
+    return {
+      reason:
+        'allowedPathPrefixes is required: the acceptance spec diff check refuses every changed path outside them',
+    };
+  }
+  return { allowedPathPrefixes, acceptanceSpec: acceptanceSpec.value };
+}
+
+/**
+ * The worktree path names where the frozen package lands. It is required and
+ * never defaulted to the process's current directory; the request wins over
+ * the composition root, and both must be a non-empty absolute path that is
+ * not the filesystem root (a relative or root path makes the containment
+ * prefix degenerate). Expected artifacts are verified and frozen as relative
+ * paths; an absolute or `..` entry would escape the worktree when read back.
+ */
+function validatePlacement(
+  request: PrepareBriefPackageUseCaseRequest,
+  configuredWorktreePath: string | undefined,
+): { readonly reason: string } | { readonly worktreePath: string } {
+  const worktreePath = request.worktreePath ?? configuredWorktreePath;
+  if (!isNonEmpty(worktreePath)) {
+    return { reason: 'worktreePath is required' };
+  }
+  const trimmedWorktreePath = worktreePath.replace(/\/+$/, '');
+  if (trimmedWorktreePath === '' || !worktreePath.startsWith('/')) {
+    return {
+      reason: 'worktreePath must be an absolute path that is not the filesystem root',
+    };
+  }
+  if (!Array.isArray(request.expectedArtifacts)) {
+    return { reason: 'expectedArtifacts must be an array of strings' };
+  }
+  for (const artifact of request.expectedArtifacts) {
+    const refusedReason = validateWorktreeRelativePath(artifact);
+    if (refusedReason !== null) {
+      return {
+        reason: `expectedArtifacts entry is not a valid worktree-relative path: ${String(artifact)}`,
+      };
+    }
+  }
+  return { worktreePath };
+}
+
+/**
+ * The reviewer must be named and differ from the implementer model, an
+ * optional seat plan is validated, pr notes are validated when present, and
+ * every context decision must record decisionBecause. Returns the validated
+ * plan or a refusal reason.
+ */
+function validateReviewerAndPlan(
+  request: PrepareBriefPackageRequest,
+): { readonly reason: string } | { readonly plan: SeatPlan | undefined } {
+  if (!isNonEmpty(request.independentReviewer)) {
+    return { reason: 'Independent reviewer must be named' };
+  }
+  if (request.modelAssignment.model === request.independentReviewer) {
+    return { reason: 'Independent reviewer model must differ from the implementer model' };
+  }
+  const seatPlanCheck = checkSeatPlan(request);
+  if ('reason' in seatPlanCheck) {
+    return { reason: seatPlanCheck.reason };
+  }
+  // D7: PR notes are optional on a request (manual prepare works without
+  // them), but when present each section must be a non-empty string of at
+  // most 4000 characters with no secret shape. A conducted start refuses a
+  // brief without them; nothing here depends on presence.
+  if (request.prNotes !== undefined) {
+    const notesError = prNotesError(request.prNotes);
+    if (notesError !== null) {
+      return { reason: notesError };
+    }
+  }
+  const decisions = request.contextDecisions ?? [];
+  if (decisions.some((decision) => !isNonEmpty(decision.decisionBecause))) {
+    return { reason: 'Every context decision must record decisionBecause' };
+  }
+  return { plan: seatPlanCheck.plan };
+}
+
+/** Everything a prepare would write or freeze, or the reason it would refuse. */
+type BuiltBriefPackage =
+  | { readonly reason: string }
+  | {
+      readonly authored: Extract<AuthoredBriefResult, { readonly outcome: 'authored' }>;
+      readonly attemptId: string;
+      readonly worktreePath: string;
+      readonly manifestJson: string;
+      readonly briefDigest: string;
+      readonly acceptanceSpec: AcceptanceSpec;
+      readonly plan: SeatPlan | undefined;
+      readonly decisions: readonly BriefContextDecision[];
+      readonly selectedKnowledgeVersions: readonly SelectedKnowledgeVersion[];
+    };
+
 export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
   constructor(private readonly deps?: PrepareBriefPackageDependencies) {}
 
-  async prepareBriefPackage(
+  /**
+   * The shared build behind prepare and preview: validate the request,
+   * author the prose, verify the ignored paths and compute the manifest and
+   * its digest — everything up to and including step 4 of a prepare, with no
+   * write. A rejection reason here is the same reason a prepare would give.
+   */
+  private async build(
     request: PrepareBriefPackageUseCaseRequest,
-  ): Promise<PrepareBriefPackageResult> {
-    if (!this.deps) {
-      throw new Error('Not implemented: PrepareBriefPackageUseCase');
+    deps: PrepareBriefPackageDependencies,
+  ): Promise<BuiltBriefPackage> {
+    const fieldsError = validateBriefFields(request);
+    if (fieldsError !== null) {
+      return { reason: fieldsError };
+    }
+    const pathsCheck = validatePathsAndSpec(request);
+    if ('reason' in pathsCheck) {
+      return { reason: pathsCheck.reason };
+    }
+    const placementCheck = validatePlacement(request, deps.worktreePath);
+    if ('reason' in placementCheck) {
+      return { reason: placementCheck.reason };
+    }
+    const reviewerCheck = validateReviewerAndPlan(request);
+    if ('reason' in reviewerCheck) {
+      return { reason: reviewerCheck.reason };
     }
 
-    const requiredFields: readonly (keyof PrepareBriefPackageRequest)[] = [
-      'workOrderId',
-      'laneId',
-      'baseCommit',
-    ];
-    const missingFields = requiredFields.filter((field) => !isNonEmpty(request[field]));
-    if (missingFields.length > 0) {
-      return { outcome: 'rejected', reason: `Missing required brief fields: ${missingFields.join(', ')}` };
-    }
-    if (!Array.isArray(request.ownedPaths) || request.ownedPaths.length === 0) {
-      return { outcome: 'rejected', reason: 'Brief must own at least one path' };
-    }
-    if (
-      typeof request.stepLimit !== 'number' ||
-      typeof request.timeLimitSeconds !== 'number' ||
-      request.stepLimit <= 0 ||
-      request.timeLimitSeconds <= 0
-    ) {
-      return { outcome: 'rejected', reason: 'stepLimit and timeLimitSeconds must be positive' };
-    }
-    if (!request.modelAssignment || !isNonEmpty(request.modelAssignment.model)) {
-      return { outcome: 'rejected', reason: 'Model assignment requires a non-empty model' };
-    }
-    // The seat tool is frozen into the manifest and covered by the digest
-    // (H8); it is required and never defaulted to a declared kind.
-    if (parseSeatTool(request.modelAssignment.seatTool) === undefined) {
-      return {
-        outcome: 'rejected',
-        reason: 'Model assignment requires a declared seat tool (opencode or agy)',
-      };
-    }
-    // The allowed path prefixes feed the edit-only diff check. Required for
-    // an agy seat, optional for opencode; every entry must be a non-empty
-    // relative path that never names `.git` or `.lane`.
-    const allowedPathPrefixes = request.allowedPathPrefixes ?? [];
-    // `execute` takes untyped input from the CLI and the API: a string here
-    // would pass the length and per-character checks and be frozen into the
-    // manifest as a string, so the shape is checked first.
-    if (
-      !Array.isArray(allowedPathPrefixes) ||
-      !allowedPathPrefixes.every((prefix) => typeof prefix === 'string')
-    ) {
-      return {
-        outcome: 'rejected',
-        reason: 'allowedPathPrefixes must be an array of strings',
-      };
-    }
-    if (request.modelAssignment.seatTool === 'agy' && allowedPathPrefixes.length === 0) {
-      return {
-        outcome: 'rejected',
-        reason: 'allowedPathPrefixes is required when the seat tool is agy',
-      };
-    }
-    for (const prefix of allowedPathPrefixes) {
-      const invalidPrefix = validateAllowedPathPrefix(prefix);
-      if (invalidPrefix !== null) {
-        return { outcome: 'rejected', reason: invalidPrefix };
-      }
-    }
-    // Plan S2: the gate is data in the frozen manifest. A package without a
-    // valid acceptance spec is refused before anything is authored or placed.
-    if (request.acceptanceSpec === undefined || request.acceptanceSpec === null) {
-      return {
-        outcome: 'rejected',
-        reason: 'acceptanceSpec is required: commitRequired, diffCheck and at least one command',
-      };
-    }
-    const acceptanceSpec = AcceptanceSpec.create(request.acceptanceSpec);
-    if (!acceptanceSpec.success || acceptanceSpec.value === undefined) {
-      return { outcome: 'rejected', reason: acceptanceSpec.error?.message ?? 'acceptanceSpec is invalid' };
-    }
-    // The spec's diff check refuses every changed path outside the allowed
-    // prefixes, so a package with a spec must name at least one.
-    if (allowedPathPrefixes.length === 0) {
-      return {
-        outcome: 'rejected',
-        reason: 'allowedPathPrefixes is required: the acceptance spec diff check refuses every changed path outside them',
-      };
-    }
-    // The worktree path names where the frozen package lands. It is required
-    // and never defaulted to the process's current directory; the request
-    // wins over the composition root, and both must be a non-empty string.
-    const worktreePath = request.worktreePath ?? this.deps.worktreePath;
-    if (!isNonEmpty(worktreePath)) {
-      return { outcome: 'rejected', reason: 'worktreePath is required' };
-    }
-    // The worktree must be an absolute path that is not the filesystem root:
-    // a relative or root path makes the containment prefix degenerate (with
-    // an empty root every absolute path "lies inside" the worktree).
-    const trimmedWorktreePath = worktreePath.replace(/\/+$/, '');
-    if (trimmedWorktreePath === '' || !worktreePath.startsWith('/')) {
-      return {
-        outcome: 'rejected',
-        reason: 'worktreePath must be an absolute path that is not the filesystem root',
-      };
-    }
-    // Expected artifacts are verified and frozen as relative paths; an
-    // absolute or `..` entry would escape the worktree when read back.
-    if (!Array.isArray(request.expectedArtifacts)) {
-      return { outcome: 'rejected', reason: 'expectedArtifacts must be an array of strings' };
-    }
-    for (const artifact of request.expectedArtifacts) {
-      const refusedReason = validateWorktreeRelativePath(artifact);
-      if (refusedReason !== null) {
-        return {
-          outcome: 'rejected',
-          reason: `expectedArtifacts entry is not a valid worktree-relative path: ${String(artifact)}`,
-        };
-      }
-    }
-    if (!isNonEmpty(request.independentReviewer)) {
-      return { outcome: 'rejected', reason: 'Independent reviewer must be named' };
-    }
-    if (request.modelAssignment.model === request.independentReviewer) {
-      return {
-        outcome: 'rejected',
-        reason: 'Independent reviewer model must differ from the implementer model',
-      };
-    }
-
-    const seatPlanCheck = checkSeatPlan(request);
-    if ('reason' in seatPlanCheck) {
-      return { outcome: 'rejected', reason: seatPlanCheck.reason };
-    }
-
-    // D7: PR notes are optional on a request (manual prepare works without
-    // them), but when present each section must be a non-empty string of at
-    // most 4000 characters with no secret shape. A conducted start refuses a
-    // brief without them; nothing here depends on presence.
-    if (request.prNotes !== undefined) {
-      const notesError = prNotesError(request.prNotes);
-      if (notesError !== null) {
-        return { outcome: 'rejected', reason: notesError };
-      }
-    }
-
-    const decisions = request.contextDecisions ?? [];
-    if (decisions.some((decision) => !isNonEmpty(decision.decisionBecause))) {
-      return { outcome: 'rejected', reason: 'Every context decision must record decisionBecause' };
-    }
-
-    const authored = await this.deps.briefAuthoring.authorBrief({
+    const authored = await deps.briefAuthoring.authorBrief({
       workOrderId: request.workOrderId,
       laneId: request.laneId,
-      handWrittenBriefPath: request.handWrittenBriefPath ?? this.deps.handWrittenBriefPath ?? null,
+      handWrittenBriefPath: request.handWrittenBriefPath ?? deps.handWrittenBriefPath ?? null,
     });
     if (authored.outcome === 'unavailable') {
-      return { outcome: 'rejected', reason: authored.reason };
+      return { reason: authored.reason };
     }
 
-    const attemptId = request.attemptId ?? this.deps.attemptId ?? `${request.workOrderId}-attempt-1`;
+    const attemptId = request.attemptId ?? deps.attemptId ?? `${request.workOrderId}-attempt-1`;
 
-    const verified = await this.deps.artifactPort.verifyIgnoredPaths({
-      worktreePath,
+    const verified = await deps.artifactPort.verifyIgnoredPaths({
+      worktreePath: placementCheck.worktreePath,
       candidatePaths: ['.lane/brief.md', '.lane/brief-manifest.json', ...request.expectedArtifacts],
     });
     if (verified.outcome === 'not-ignored') {
-      return { outcome: 'rejected', reason: `Paths not ignored: ${verified.offendingPaths.join(', ')}` };
+      return { reason: `Paths not ignored: ${verified.offendingPaths.join(', ')}` };
     }
 
+    const decisions = request.contextDecisions ?? [];
     const selectedKnowledgeVersions: readonly SelectedKnowledgeVersion[] = decisions
       .filter((decision) => decision.accepted)
       .map((decision) => ({ knowledgeEntryId: decision.knowledgeEntryId, version: decision.version }));
@@ -330,13 +390,13 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
         baseCommit: request.baseCommit,
         policyRevision: request.policyRevision,
         modelAssignment: request.modelAssignment,
-        ...(seatPlanCheck.plan !== undefined ? { seatPlan: seatPlanCheck.plan.toJSON() } : {}),
+        ...(reviewerCheck.plan !== undefined ? { seatPlan: reviewerCheck.plan.toJSON() } : {}),
         independentReviewer: request.independentReviewer,
         ownedPaths: request.ownedPaths,
-        allowedPathPrefixes,
+        allowedPathPrefixes: pathsCheck.allowedPathPrefixes,
         permissions: request.permissions,
         acceptanceChecks: request.acceptanceChecks,
-        acceptanceSpec: acceptanceSpec.value.toJSON(),
+        acceptanceSpec: pathsCheck.acceptanceSpec.toJSON(),
         stepLimit: request.stepLimit,
         timeLimitSeconds: request.timeLimitSeconds,
         resourceBounds: request.resourceBounds,
@@ -357,15 +417,41 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       2,
     );
 
-    const briefDigest = this.deps.computeDigest
-      ? this.deps.computeDigest(authored.brief.proseMarkdown + '\n' + manifestJson)
-      : simpleDeterministicHexDigest(authored.brief.proseMarkdown + '\n' + manifestJson);
+    const briefContent = authored.brief.proseMarkdown + '\n' + manifestJson;
+    const briefDigest = deps.computeDigest
+      ? deps.computeDigest(briefContent)
+      : simpleDeterministicHexDigest(briefContent);
+
+    return {
+      authored,
+      attemptId,
+      worktreePath: placementCheck.worktreePath,
+      manifestJson,
+      briefDigest,
+      acceptanceSpec: pathsCheck.acceptanceSpec,
+      plan: reviewerCheck.plan,
+      decisions,
+      selectedKnowledgeVersions,
+    };
+  }
+
+  async prepareBriefPackage(
+    request: PrepareBriefPackageUseCaseRequest,
+  ): Promise<PrepareBriefPackageResult> {
+    if (!this.deps) {
+      throw new Error('Not implemented: PrepareBriefPackageUseCase');
+    }
+
+    const built = await this.build(request, this.deps);
+    if ('reason' in built) {
+      return { outcome: 'rejected', reason: built.reason };
+    }
 
     const placed = await this.deps.artifactPort.placeFrozenBrief({
-      attemptId,
-      worktreePath,
-      proseMarkdown: authored.brief.proseMarkdown,
-      manifestJson,
+      attemptId: built.attemptId,
+      worktreePath: built.worktreePath,
+      proseMarkdown: built.authored.brief.proseMarkdown,
+      manifestJson: built.manifestJson,
     });
     if (placed.outcome === 'refused') {
       return { outcome: 'rejected', reason: placed.reason };
@@ -373,8 +459,8 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
 
     if (this.deps.briefKnowledge) {
       await this.deps.briefKnowledge.recordContextSelection({
-        attemptId,
-        selections: decisions.map((decision) => ({
+        attemptId: built.attemptId,
+        selections: built.decisions.map((decision) => ({
           proposalId: decision.proposalId,
           knowledgeEntryId: decision.knowledgeEntryId,
           version: decision.version,
@@ -387,13 +473,50 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     return {
       outcome: 'prepared',
       prepared: {
-        attemptId,
-        briefDigest,
+        attemptId: built.attemptId,
+        briefDigest: built.briefDigest,
         prosePath: placed.prosePath,
         manifestPath: placed.manifestPath,
-        selectedKnowledgeVersions,
+        selectedKnowledgeVersions: built.selectedKnowledgeVersions,
       },
     };
+  }
+
+  async previewBriefPackage(
+    request: PrepareBriefPackageUseCaseRequest,
+  ): Promise<PreviewBriefPackageResult> {
+    // Unconfigured is 501 and is checked before any request validation.
+    if (!this.deps) {
+      throw new Error('Not implemented: PrepareBriefPackageUseCase');
+    }
+
+    const built = await this.build(request, this.deps);
+    if ('reason' in built) {
+      return { outcome: 'rejected', reason: built.reason };
+    }
+
+    const compute = this.deps.computeDigest ?? simpleDeterministicHexDigest;
+    const commands = built.acceptanceSpec.getCommands();
+    const commandDigests = commands.map((command) => compute(JSON.stringify(command.argv)));
+    const preview: BriefPackagePreview = {
+      attemptId: built.attemptId,
+      briefDigest: built.briefDigest,
+      modelAssignment: {
+        model: request.modelAssignment.model,
+        variant: request.modelAssignment.variant,
+        seatTool: request.modelAssignment.seatTool,
+      },
+      seatPlan: built.plan?.toJSON() ?? null,
+      acceptance: {
+        commitRequired: built.acceptanceSpec.getCommitRequired(),
+        diffCheck: built.acceptanceSpec.getDiffCheck(),
+        commandCount: commands.length,
+        commandDigests,
+      },
+      prNotesPresent: request.prNotes !== undefined,
+      selectedKnowledgeVersions: built.selectedKnowledgeVersions,
+    };
+    return { outcome: 'previewed', preview };
   }
 
   async execute(input?: unknown): Promise<PrepareBriefPackageResult> {

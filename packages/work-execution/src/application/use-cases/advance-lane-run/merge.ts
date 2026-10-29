@@ -70,7 +70,7 @@ function finalResultOfKey(
  * `step-refused <step>` for the owner. An unread intent would have been routed
  * to the reconcile by the decider's G3a, so an intent here has a final result.
  */
-async function parkSpentOneWayKey(
+export async function parkSpentOneWayKey(
   ctx: AdvanceStepContext,
   record: LaneRunRecord,
   gathered: GatheredLaneRunFacts,

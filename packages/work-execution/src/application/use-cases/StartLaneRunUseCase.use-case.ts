@@ -230,6 +230,12 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     if (request.brief.acceptanceSpec === undefined) {
       return { outcome: 'refused', reason: 'no-acceptance-spec' };
     }
+    // D7: a conducted run refuses a brief without frozen PR notes. They are
+    // optional at prepare time (manual prepare works without them) but
+    // required to start, exactly like the seat plan and the acceptance spec.
+    if (request.brief.prNotes === undefined) {
+      return { outcome: 'refused', reason: 'pr-notes-missing' };
+    }
     const seat = firstPassSeatOf(planValue);
     if (!seat.ok) {
       return { outcome: 'refused', reason: 'no-first-pass-seat' };

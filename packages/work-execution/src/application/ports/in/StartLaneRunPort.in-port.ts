@@ -60,6 +60,7 @@ export type StartLaneRunRefusal =
   | 'project-not-active'
   | 'no-seat-plan'
   | 'no-acceptance-spec'
+  | 'pr-notes-missing'
   | 'no-first-pass-seat'
   | 'run-exists'
   | 'no-host'

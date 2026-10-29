@@ -1,8 +1,9 @@
 // @generated inbound contract scaffold — refined for migration step 1.
 /**
  * PrepareBriefPackagePort: select applicable context, obtain a reviewed prose
- * brief and freeze its manifest, revision references and digest before
- * dispatch. The runtime validates the manifest; the lane reads the prose.
+ * brief and freeze its manifest, revision references, the PR notes a
+ * conducted run requires and its digest before dispatch. The runtime
+ * validates the manifest; the lane reads the prose.
  */
 
 import type { RunnerKind } from '../../../domain/execution-records.js';
@@ -34,6 +35,19 @@ export interface BriefModelAssignment {
   readonly seatTool: RunnerKind;
 }
 
+/**
+ * Frozen PR notes (D7): the three sections a conducted run requires for its
+ * PR body. Each is a non-empty string of at most 4000 characters and never
+ * secret-shaped. Optional on the prepare request — manual prepare works
+ * without them; a conducted start (`StartLaneRun`) refuses a brief without
+ * them.
+ */
+export interface PrNotes {
+  readonly hardToUndo: string;
+  readonly assumptions: string;
+  readonly challengeThis: string;
+}
+
 export interface PrepareBriefPackageRequest {
   readonly workOrderId: string;
   readonly projectId: string;
@@ -43,6 +57,15 @@ export interface PrepareBriefPackageRequest {
   readonly baseCommit: string;
   readonly policyRevision: string;
   readonly modelAssignment: BriefModelAssignment;
+
+  /**
+   * Frozen PR notes (D7): the three sections a conducted run requires for its
+   * PR body. Each is a non-empty string of at most 4000 characters and never
+   * secret-shaped. Optional on the prepare request — manual prepare works
+   * without them; a conducted start (`StartLaneRun`) refuses a brief without
+   * them.
+   */
+  readonly prNotes?: PrNotes;
   /**
    * Optional seat plan (S1, D1): ordered seats per role. When present it is
    * validated, the model assignment must be one of its first-pass seats, no

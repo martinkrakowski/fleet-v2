@@ -2,9 +2,9 @@
  * Lane Q1a: the conductor end-to-end fixture. `startE2eFixture()` stands up a
  * disposable sshd (through `tests/e2e/ssh-fixture.sh`), a fake opencode v2
  * server (`tests/e2e/fake-opencode-server.mjs`) and a v2 installation file
- * whose single lane-runner host reaches the sshd through the `fleet-e2e`
- * alias. Callers set `HOME` and `PATH` themselves; nothing here mutates the
- * process environment.
+ * with a local orchestrator host and one lane-runner host reaching the sshd
+ * through the `fleet-e2e` alias. Callers set `PATH` themselves (prepend
+ * `fixture.bin`); nothing here mutates the process environment.
  */
 
 import { execFileSync, spawn } from 'node:child_process';
@@ -14,15 +14,17 @@ import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { writeInstallationV2 } from '@fleet/installation';
-import type { FleetInstallationV2, HostSection } from '@fleet/installation';
+import { parseInstallation, writeInstallationV2 } from '@fleet/installation';
+import type { FleetInstallationV2 } from '@fleet/installation';
 import type { RunnerForAttemptHostSpec } from '@fleet/work-execution';
 
 export interface E2eFixture {
-  /** The disposable fixture directory (contains home/, worktrees/ and state/). */
+  /** The disposable fixture directory (contains home/, bin/, worktrees/ and state/). */
   readonly dir: string;
   /** The client home whose `~/.ssh/config` names the `fleet-e2e` alias. */
   readonly home: string;
+  /** The wrapper dir to prepend to PATH; ssh ignores HOME. */
+  readonly bin: string;
   /** The directory holding `installation/fleet.json`. */
   readonly stateDir: string;
   /** The ssh config alias for the fixture's sshd. */
@@ -60,8 +62,31 @@ export function resolveE2eDir(): string {
 interface FixtureLines {
   readonly dir: string;
   readonly home: string;
+  readonly bin: string;
   readonly port: number;
   readonly alias: string;
+}
+
+const EXPECTED_FIXTURE_KEYS: ReadonlySet<string> = new Set([
+  'FLEET_E2E_DIR',
+  'FLEET_E2E_HOME',
+  'FLEET_E2E_BIN',
+  'FLEET_E2E_PORT',
+  'FLEET_E2E_ALIAS',
+]);
+const EXPECTED_FIXTURE_LINE_COUNT = 5;
+const PORT_PATTERN = /^[0-9]+$/;
+const MAX_PORT = 65535;
+
+function parsePort(value: string, label: string): number {
+  if (!PORT_PATTERN.test(value)) {
+    throw new Error(`${label} is not a number: ${value}`);
+  }
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > MAX_PORT) {
+    throw new Error(`${label} must be within 1..${MAX_PORT}: ${value}`);
+  }
+  return port;
 }
 
 function runSshFixture(e2eDir: string, args: readonly string[]): FixtureLines {
@@ -69,31 +94,44 @@ function runSshFixture(e2eDir: string, args: readonly string[]): FixtureLines {
   const stdout = execFileSync('sh', [script, ...args], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 30000,
   });
-  const values: Record<string, string> = {};
-  for (const line of stdout.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed === '') continue;
-    const eq = trimmed.indexOf('=');
-    if (eq === -1) {
-      throw new Error(`unexpected ssh-fixture output line: ${trimmed}`);
-    }
-    values[trimmed.slice(0, eq)] = trimmed.slice(eq + 1);
+  const lines = stdout.split('\n').filter((line) => line.length > 0);
+  if (lines.length !== EXPECTED_FIXTURE_LINE_COUNT) {
+    throw new Error(
+      `ssh-fixture start printed ${lines.length} lines, expected ${EXPECTED_FIXTURE_LINE_COUNT}`,
+    );
   }
-  const dir = values.FLEET_E2E_DIR ?? '';
-  const home = values.FLEET_E2E_HOME ?? '';
-  const port = Number(values.FLEET_E2E_PORT ?? '');
-  const alias = values.FLEET_E2E_ALIAS ?? '';
-  if (
-    dir === '' ||
-    home === '' ||
-    !Number.isInteger(port) ||
-    port <= 0 ||
-    alias === ''
-  ) {
+  const values: Record<string, string> = {};
+  for (const line of lines) {
+    const eq = line.indexOf('=');
+    if (eq === -1) {
+      throw new Error(`unexpected ssh-fixture output line: ${line}`);
+    }
+    const key = line.slice(0, eq);
+    const value = line.slice(eq + 1);
+    if (!EXPECTED_FIXTURE_KEYS.has(key)) {
+      throw new Error(`unexpected ssh-fixture output key: ${key}`);
+    }
+    if (Object.prototype.hasOwnProperty.call(values, key)) {
+      throw new Error(`duplicate ssh-fixture output key: ${key}`);
+    }
+    values[key] = value;
+  }
+  const dir = values.FLEET_E2E_DIR;
+  const home = values.FLEET_E2E_HOME;
+  const bin = values.FLEET_E2E_BIN;
+  const alias = values.FLEET_E2E_ALIAS;
+  if (dir === '' || home === '' || bin === '' || alias === '') {
     throw new Error('ssh-fixture start printed incomplete FLEET_E2E_* output');
   }
-  return { dir, home, port, alias };
+  return {
+    dir,
+    home,
+    bin,
+    port: parsePort(values.FLEET_E2E_PORT, 'FLEET_E2E_PORT'),
+    alias,
+  };
 }
 
 interface FakeServer {
@@ -118,21 +156,32 @@ function spawnFakeOpencodeServer(e2eDir: string): Promise<FakeServer> {
     const fail = (message: string): void => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       child.kill('SIGTERM');
       reject(new Error(message));
     };
+    const timer = setTimeout(() => {
+      fail('fake opencode server did not print port= within 10 seconds');
+    }, 10000);
     child.stdout?.on('data', (chunk: Buffer) => {
       buffer += chunk.toString('utf8');
       const newline = buffer.indexOf('\n');
       if (newline === -1 || settled) return;
       settled = true;
+      clearTimeout(timer);
       const match = /^port=(\d+)$/.exec(buffer.slice(0, newline).trim());
       if (match === null) {
         child.kill('SIGTERM');
         reject(new Error(`fake opencode server printed an unexpected first line: ${buffer.slice(0, newline).trim()}`));
         return;
       }
-      const url = `http://127.0.0.1:${Number(match[1])}`;
+      const port = Number(match[1]);
+      if (!Number.isInteger(port) || port < 1 || port > MAX_PORT) {
+        child.kill('SIGTERM');
+        reject(new Error(`fake opencode server printed an invalid port: ${match[1]}`));
+        return;
+      }
+      const url = `http://127.0.0.1:${port}`;
       resolve({ child, url, exited });
     });
     child.stderr?.on('data', () => {
@@ -145,16 +194,25 @@ function spawnFakeOpencodeServer(e2eDir: string): Promise<FakeServer> {
   });
 }
 
-/** The minimal valid v2 shape from `v2-write.test.ts`, with the ssh host. */
-function buildInstallation(fakePort: number, worktreeRoot: string): FleetInstallationV2 {
+/** The minimal valid v2 shape from `v2-write.test.ts`, with two hosts. */
+function buildInstallation(
+  fakePort: number,
+  orchestratorWorktreeRoot: string,
+  laneWorktreeRoot: string,
+): FleetInstallationV2 {
   return {
     schemaVersion: 2,
     hosts: {
+      'orchestrator-host': {
+        transport: 'local',
+        worktreeRoot: orchestratorWorktreeRoot,
+        roles: ['orchestrator'],
+      },
       'lane-host': {
         transport: 'ssh',
         sshAlias: 'fleet-e2e',
-        worktreeRoot,
-        roles: ['orchestrator', 'lane-runner'],
+        worktreeRoot: laneWorktreeRoot,
+        roles: ['lane-runner'],
         runner: {
           kind: 'opencode',
           port: fakePort,
@@ -192,26 +250,27 @@ function buildInstallation(fakePort: number, worktreeRoot: string): FleetInstall
 }
 
 /**
- * The RunnerForAttemptHostSpec map derived from the installation's host. The
- * recorded `remotePort` in this fixture is the tunnel port (the sshd port),
- * so the confirm-or-unknown comparison sees that port here.
+ * The RunnerForAttemptHostSpec map derived from the installation itself: the
+ * lane-runner host's `runner.port` (the fake opencode server's port) is the
+ * recorded `remotePort` the confirm-or-unknown comparison sees.
  */
 function deriveHosts(
   installation: FleetInstallationV2,
-  sshPort: number,
 ): Readonly<Record<string, RunnerForAttemptHostSpec>> {
-  const host = installation.hosts['lane-host'] as HostSection;
-  return {
-    'lane-host': {
+  const hosts: Record<string, RunnerForAttemptHostSpec> = {};
+  for (const [name, host] of Object.entries(installation.hosts)) {
+    if (!host.roles.includes('lane-runner')) continue;
+    hosts[name] = {
       transport: host.transport,
       sshAlias: host.sshAlias,
       roles: host.roles.filter((role) => role === 'lane-runner'),
       runner: {
         kind: host.runner?.kind ?? 'opencode',
-        port: sshPort,
+        port: host.runner?.port ?? 0,
       },
-    },
-  };
+    };
+  }
+  return hosts;
 }
 
 async function terminateChild(child: ChildProcess): Promise<void> {
@@ -238,39 +297,76 @@ async function terminateChild(child: ChildProcess): Promise<void> {
 export async function startE2eFixture(): Promise<E2eFixture> {
   const e2eDir = resolveE2eDir();
   const ssh = runSshFixture(e2eDir, ['start']);
-  const stateDir = path.join(ssh.dir, 'state');
-  await fs.mkdir(path.join(stateDir, 'installation'), { recursive: true });
-
-  const fake = await spawnFakeOpencodeServer(e2eDir);
-  const fakePort = Number(new URL(fake.url).port);
-  const installation = buildInstallation(fakePort, path.join(ssh.dir, 'worktrees'));
-  await fs.writeFile(
-    path.join(stateDir, 'installation', 'fleet.json'),
-    writeInstallationV2(installation),
-    'utf8',
-  );
-
-  const hosts = deriveHosts(installation, ssh.port);
-
-  let stopped = false;
-  const stop = async (): Promise<void> => {
-    if (stopped) return;
-    stopped = true;
-    await terminateChild(fake.child);
+  let fake: FakeServer | undefined;
+  const stopSshFixture = (): void => {
     execFileSync('sh', [path.join(e2eDir, 'ssh-fixture.sh'), 'stop', ssh.dir], {
       stdio: 'ignore',
+      timeout: 15000,
     });
   };
+  try {
+    const stateDir = path.join(ssh.dir, 'state');
+    await fs.mkdir(path.join(stateDir, 'installation'), { recursive: true });
 
-  return {
-    dir: ssh.dir,
-    home: ssh.home,
-    stateDir,
-    alias: ssh.alias,
-    sshPort: ssh.port,
-    fakeOpencodeUrl: fake.url,
-    fakeOpencodeBin: e2eDir,
-    hosts,
-    stop,
-  };
+    fake = await spawnFakeOpencodeServer(e2eDir);
+    const fakePort = Number(new URL(fake.url).port);
+    const installation = buildInstallation(
+      fakePort,
+      path.join(ssh.dir, 'orchestrator-worktrees'),
+      path.join(ssh.dir, 'worktrees'),
+    );
+    const written = writeInstallationV2(installation);
+    // Prove the fixture parses here, so a bad fixture fails at start, never later.
+    const parsed = parseInstallation(JSON.parse(written));
+    if (!parsed.ok) {
+      throw new Error(`fixture installation must parse: ${parsed.errors.join('; ')}`);
+    }
+    await fs.writeFile(
+      path.join(stateDir, 'installation', 'fleet.json'),
+      written,
+      'utf8',
+    );
+
+    const hosts = deriveHosts(installation);
+
+    let stopped = false;
+    const stop = async (): Promise<void> => {
+      if (stopped) return;
+      stopped = true;
+      try {
+        if (fake !== undefined) {
+          await terminateChild(fake.child);
+        }
+      } finally {
+        stopSshFixture();
+      }
+    };
+
+    return {
+      dir: ssh.dir,
+      home: ssh.home,
+      bin: ssh.bin,
+      stateDir,
+      alias: ssh.alias,
+      sshPort: ssh.port,
+      fakeOpencodeUrl: fake.url,
+      fakeOpencodeBin: e2eDir,
+      hosts,
+      stop,
+    };
+  } catch (error) {
+    if (fake !== undefined) {
+      try {
+        await terminateChild(fake.child);
+      } catch {
+        // Best effort: the original failure is the one to surface.
+      }
+    }
+    try {
+      stopSshFixture();
+    } catch {
+      // Best effort: the original failure is the one to surface.
+    }
+    throw error;
+  }
 }

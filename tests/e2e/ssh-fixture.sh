@@ -10,17 +10,24 @@
 #       (non-root; logins only as the current user), waits until the port
 #       answers, and writes a client home whose `~/.ssh/config` names the
 #       alias `fleet-e2e` with the host key pinned in known_hosts. It prints
-#       exactly four lines:
+#       exactly five lines:
 #           FLEET_E2E_DIR=<dir>
 #           FLEET_E2E_HOME=<dir>/home
+#           FLEET_E2E_BIN=<dir>/bin
 #           FLEET_E2E_PORT=<port>
 #           FLEET_E2E_ALIAS=fleet-e2e
+#
+# OpenSSH reads the client config from the passwd home directory
+# (getpwuid), never from `$HOME`, so callers prepend `FLEET_E2E_BIN`
+# to PATH: the `ssh` wrapper there forces `-F` onto the fixture's
+# `~/.ssh/config` (which still lives at `FLEET_E2E_HOME`).
+#
 #   sh tests/e2e/ssh-fixture.sh stop <dir>
 #       kills the sshd from the pid file (TERM, then KILL) and removes the dir.
 #
-# `sshd` missing prints `unavailable=no-sshd` and exits 3. The real
-# `~/.ssh` is never touched: every key and the client config live under the
-# fixture dir.
+# `sshd` missing prints `unavailable=no-sshd` and exits 3; `ssh` missing
+# prints `unavailable=no-ssh` and exits 3. The real `~/.ssh` is never
+# touched: every key and the client config live under the fixture dir.
 set -u
 
 usage() {
@@ -59,13 +66,38 @@ if [ -z "$sshd_bin" ] || [ ! -x "$sshd_bin" ]; then
   exit 3
 fi
 
+# The wrapper needs the real ssh binary: OpenSSH reads the user config from
+# getpwuid, never from $HOME, so callers reach the fixture config through the
+# wrapper's forced `-F`.
+ssh_bin=$(command -v ssh)
+if [ -z "$ssh_bin" ] || [ ! -x "$ssh_bin" ]; then
+  echo 'unavailable=no-ssh'
+  exit 3
+fi
+
 user=$(id -un)
 
 d=$(mktemp -d "${TMPDIR:-/tmp}/fleet-e2e.XXXXXX") || exit 1
+# Canonicalise once so a TMPDIR with a trailing slash or a symlinked /tmp
+# never yields a `//` or unresolved path (WorkspaceAdapter refuses `//`).
+d=$(cd "$d" && pwd -P)
 chmod 700 "$d"
 
 die() {
   echo "$1" >&2
+  pidfile="$d/sshd.pid"
+  if [ -f "$pidfile" ]; then
+    pid=$(cat "$pidfile" 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      i=0
+      while [ "$i" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do
+        sleep 0.1
+        i=$((i + 1))
+      done
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
   rm -rf "$d"
   exit 1
 }
@@ -76,7 +108,9 @@ cat "$d/client_key.pub" > "$d/authorized_keys"
 chmod 600 "$d/authorized_keys"
 
 # Pick a free high port: try 5 random ports in 40000..60000 with sshd until
-# one of them stays up (the pid file appears and the daemon is alive).
+# one of them stays up AND answers on TCP. The daemon's exit status is
+# checked, the pid file is awaited with a bounded loop, and a daemon that
+# started but did not answer is killed before trying the next port.
 port=''
 attempt=0
 while [ "$attempt" -lt 5 ]; do
@@ -102,30 +136,51 @@ while [ "$attempt" -lt 5 ]; do
   } > "$cfg"
   rm -f "$d/sshd.pid" "$d/sshd.log"
   "$sshd_bin" -f "$cfg" -E "$d/sshd.log" >/dev/null 2>&1
-  sleep 0.2
-  if [ -f "$d/sshd.pid" ] && kill -0 "$(cat "$d/sshd.pid" 2>/dev/null)" 2>/dev/null; then
-    port=$p
-    break
+  rc_sshd=$?
+  i=0
+  while [ "$i" -lt 20 ] && [ ! -f "$d/sshd.pid" ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  pid=''
+  if [ -f "$d/sshd.pid" ]; then
+    pid=$(cat "$d/sshd.pid" 2>/dev/null || true)
+  fi
+  if [ "$rc_sshd" -eq 0 ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    answered=false
+    if command -v nc >/dev/null 2>&1; then
+      j=0
+      while [ "$j" -lt 40 ]; do
+        if nc -z -w 2 127.0.0.1 "$p" 2>/dev/null; then
+          answered=true
+          break
+        fi
+        sleep 0.25
+        j=$((j + 1))
+      done
+    else
+      # nc absent: give the daemon a moment and trust its pid/liveness.
+      sleep 1
+      answered=true
+    fi
+    if [ "$answered" = true ]; then
+      port=$p
+      break
+    fi
+  fi
+  # This attempt failed: kill the daemon (TERM, then KILL) before the
+  # next port, so nothing leaks between attempts.
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    k=0
+    while [ "$k" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do
+      sleep 0.1
+      k=$((k + 1))
+    done
+    kill -KILL "$pid" 2>/dev/null || true
   fi
 done
 [ -n "$port" ] || die 'could not start sshd on a free high port'
-
-# Wait until the port answers (TCP connect), with a sleep fallback when nc is absent.
-if command -v nc >/dev/null 2>&1; then
-  i=0
-  while [ "$i" -lt 40 ]; do
-    if nc -z 127.0.0.1 "$port" 2>/dev/null; then
-      break
-    fi
-    sleep 0.25
-    i=$((i + 1))
-  done
-  if [ "$i" -ge 40 ]; then
-    die 'sshd did not answer on the chosen port'
-  fi
-else
-  sleep 1
-fi
 
 # The client home: config and known_hosts only under the fixture dir.
 home="$d/home"
@@ -149,8 +204,23 @@ chmod 600 "$home/.ssh/known_hosts"
 } > "$home/.ssh/config"
 chmod 600 "$home/.ssh/config"
 
+# The ssh wrapper: OpenSSH reads the client config from the passwd home
+# directory, never from $HOME, so callers prepend THIS dir to PATH and the
+# wrapper forces `-F` onto the fixture config.
+mkdir -p "$d/bin"
+chmod 700 "$d/bin"
+sq() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+{
+  echo '#!/bin/sh'
+  printf 'exec %s -F %s "$@"\n' "$(sq "$ssh_bin")" "$(sq "$home/.ssh/config")"
+} > "$d/bin/ssh"
+chmod 700 "$d/bin/ssh"
+
 printf 'FLEET_E2E_DIR=%s\n' "$d"
 printf 'FLEET_E2E_HOME=%s\n' "$home"
+printf 'FLEET_E2E_BIN=%s\n' "$d/bin"
 printf 'FLEET_E2E_PORT=%s\n' "$port"
 printf 'FLEET_E2E_ALIAS=fleet-e2e\n'
 exit 0

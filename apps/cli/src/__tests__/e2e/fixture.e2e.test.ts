@@ -32,8 +32,15 @@ describe.skipIf(process.env.FLEET_E2E_SSH !== '1')(
       { timeout: 120000 },
       async () => {
         const fixture = await startE2eFixture();
-        const originalHome = process.env.HOME;
-        process.env.HOME = fixture.home;
+        // The ssh wrapper sits on `fixture.bin`; prepend it to PATH (no HOME
+        // override: OpenSSH reads the client config from getpwuid, so the
+        // wrapper's forced `-F` is what reaches the fixture config).
+        const originalPath = process.env.PATH;
+        if (originalPath !== undefined) {
+          process.env.PATH = `${fixture.bin}:${originalPath}`;
+        } else {
+          process.env.PATH = fixture.bin;
+        }
         try {
           const hop = await new SshExecutor({ host: fixture.alias }).run([
             'sh',
@@ -49,7 +56,7 @@ describe.skipIf(process.env.FLEET_E2E_SSH !== '1')(
           });
           const resolved = helper.executorForRecordedHost({
             kind: 'opencode',
-            remotePort: fixture.sshPort,
+            remotePort: Number(new URL(fixture.fakeOpencodeUrl).port),
             host: 'fleet-e2e',
             hostName: 'lane-host',
             agent: null,
@@ -80,9 +87,16 @@ describe.skipIf(process.env.FLEET_E2E_SSH !== '1')(
           expect(laneRunnerHosts).toHaveLength(1);
           expect(laneRunnerHosts[0]?.[0]).toBe('lane-host');
         } finally {
-          process.env.HOME = originalHome;
+          if (originalPath !== undefined) {
+            process.env.PATH = originalPath;
+          } else {
+            delete process.env.PATH;
+          }
           await fixture.stop();
         }
+        // After stop: the fake server no longer answers and the dir is gone.
+        await expect(fetch(`${fixture.fakeOpencodeUrl}/api/info`)).rejects.toThrow();
+        await expect(fs.stat(fixture.dir)).rejects.toThrow();
       },
     );
   },

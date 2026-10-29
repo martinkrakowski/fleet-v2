@@ -89,6 +89,17 @@ const ATTEMPT: AttemptRecord = {
   artifacts: null,
   seatPlan: SEAT_PLAN,
   seatSelection: SEAT_SELECTION,
+  // Q2a-2: a conducted attempt always carries its runner host (KF-10 stamps it
+  // at start), so the seeded start does too; without one the act guard parks.
+  runner: {
+    kind: 'opencode',
+    remotePort: null,
+    host: 'lane-example',
+    hostName: 'lane-example',
+    agent: null,
+    model: null,
+    variant: null,
+  },
   stopReason: 'none',
   createdAtIso: NOW,
   updatedAtIso: NOW,

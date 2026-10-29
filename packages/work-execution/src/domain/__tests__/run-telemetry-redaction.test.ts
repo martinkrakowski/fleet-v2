@@ -852,6 +852,24 @@ describe('redactionChecks (OT1r)', () => {
     expect(check(report, 'values').pass).toBe(true);
   });
 
+  it('a repeated fleet.state on a state.entered event fails key-allow-list (OT1r-3 Luna)', () => {
+    const parsed = JSON.parse(new TextDecoder().decode(stubPayload())) as {
+      resourceSpans: { scopeSpans: { spans: { events?: unknown[] }[] }[] }[];
+    };
+    parsed.resourceSpans[0].scopeSpans[0].spans[0].events = [
+      {
+        timeUnixNano: '1735689600000000000',
+        name: 'state.entered',
+        attributes: [
+          { key: 'fleet.state', value: { stringValue: 'running' } },
+          { key: 'fleet.state', value: { stringValue: 'running' } },
+        ],
+      },
+    ];
+    const report = redactionChecks(new TextEncoder().encode(JSON.stringify(parsed)), []);
+    expect(check(report, 'key-allow-list').pass).toBe(false);
+  });
+
   it('a non-hex traceId fails values (OT1r-3)', () => {
     const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([]), 'AGENT', { extra: { traceId: 'not-hex-trace-id' } });
     const report = redactionChecks(bytes, []);

@@ -599,7 +599,10 @@ function checkKeyAllowList(payload: DecodedPayload | null): { readonly pass: boo
       entryPass = entry.attributes.size === 0;
     } else if (entry.kind === 'event') {
       // A `state.entered` event carries at most the one key `fleet.state`
-      // (plan §3.1); any other key fails here.
+      // (plan §3.1); any other key, or a repeated one, fails here.
+      if (!entry.decoded) {
+        entryPass = false;
+      }
       for (const key of entry.attributes.keys()) {
         if (key !== TELEMETRY_STATE_EVENT_KEY) {
           entryPass = false;

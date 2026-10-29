@@ -120,12 +120,13 @@ describe('readTelemetryDispositionRecord', () => {
   });
 
   it('refuses __proto__ and constructor keys', () => {
-    const raw = '{"version":1,"saltFingerprint":null,"spans":{"__proto__":{}},"counters":{},"lastExportAtIso":null}';
-    expect(readTelemetryDispositionRecord(JSON.parse(raw)).ok).toBe(false);
-    const constructorRaw = JSON.parse(
-      '{"version":1,"saltFingerprint":null,"spans":{"constructor":{}},"counters":{},"lastExportAtIso":null}',
+    const countersJson = JSON.stringify(
+      Object.fromEntries(TELEMETRY_COUNTER_KEYS.map((key) => [key, 0])),
     );
-    expect(readTelemetryDispositionRecord(constructorRaw).ok).toBe(false);
+    const raw = `{"version":1,"saltFingerprint":null,"spans":{"__proto__":{}},"counters":${countersJson},"lastExportAtIso":null}`;
+    expect(readTelemetryDispositionRecord(JSON.parse(raw)).ok).toBe(false);
+    const constructorRaw = `{"version":1,"saltFingerprint":null,"spans":{"constructor":{}},"counters":${countersJson},"lastExportAtIso":null}`;
+    expect(readTelemetryDispositionRecord(JSON.parse(constructorRaw)).ok).toBe(false);
   });
 });
 
@@ -211,6 +212,20 @@ describe('applyDispositionWrite merge rules', () => {
       expect(result.record.spans[TRACE]![SPAN]).toBe('exported@collector');
     }
   });
+
+  it('a write builds the result on null-prototype maps, outer and inner', () => {
+    const result = applyDispositionWrite(fullRecord(), {
+      saltFingerprint: FINGERPRINT,
+      updates: [{ traceId: TRACE, spanId: SPAN, disposition: { state: 'pending' } }],
+      reopen: true,
+      nowIso: NOW,
+    });
+    if (result.outcome !== 'written') {
+      expect.fail('the write must succeed');
+    }
+    expect(Object.getPrototypeOf(result.record.spans)).toBe(null);
+    expect(Object.getPrototypeOf(result.record.spans[TRACE]!)).toBe(null);
+  });
 });
 
 describe('applyDispositionWrite refusals, counters and timestamps', () => {
@@ -246,7 +261,10 @@ describe('applyDispositionWrite refusals, counters and timestamps', () => {
     ['a negative counter', { saltFingerprint: FINGERPRINT, updates: [], counters: { timeout: -1 }, nowIso: NOW }],
     ['a bad time', { saltFingerprint: FINGERPRINT, updates: [], nowIso: '2026-10-27T10:00:00' }],
     ['a non-boolean reopen', { saltFingerprint: FINGERPRINT, updates: [], reopen: 'yes', nowIso: NOW }],
+    ['a null reopen', { saltFingerprint: FINGERPRINT, updates: [], reopen: null, nowIso: NOW }],
     ['a non-boolean exportedAt', { saltFingerprint: FINGERPRINT, updates: [], exportedAt: 'yes', nowIso: NOW }],
+    ['a null exportedAt', { saltFingerprint: FINGERPRINT, updates: [], exportedAt: null, nowIso: NOW }],
+    ['a null counters', { saltFingerprint: FINGERPRINT, updates: [], counters: null, nowIso: NOW }],
     ['too many updates', {
       saltFingerprint: FINGERPRINT,
       updates: Array.from({ length: 4097 }, (_, index) => ({
@@ -285,6 +303,25 @@ describe('applyDispositionWrite refusals, counters and timestamps', () => {
     for (const key of TELEMETRY_COUNTER_KEYS) {
       expect(second.record.counters[key]).toBeGreaterThanOrEqual(0);
     }
+  });
+
+  it('a counter increment that overflows a safe non-negative integer refuses the request', () => {
+    const first = applyDispositionWrite(emptyTelemetryDispositionRecord(), {
+      saltFingerprint: FINGERPRINT,
+      updates: [],
+      counters: { timeout: Number.MAX_SAFE_INTEGER },
+      nowIso: NOW,
+    });
+    if (first.outcome !== 'written') {
+      expect.fail('the first write must succeed');
+    }
+    const result = applyDispositionWrite(first.record, {
+      saltFingerprint: FINGERPRINT,
+      updates: [],
+      counters: { timeout: 1 },
+      nowIso: NOW,
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
   });
 
   it('exportedAt sets lastExportAtIso from nowIso and absent leaves it', () => {

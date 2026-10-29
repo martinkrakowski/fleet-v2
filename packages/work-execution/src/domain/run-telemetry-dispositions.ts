@@ -287,14 +287,14 @@ function decodeWriteRequest(request: unknown): DecodedWriteRequest | null {
       disposition: update.disposition as SpanDisposition,
     });
   }
-  if (reopen !== undefined && reopen !== null && typeof reopen !== 'boolean') {
+  if (reopen !== undefined && typeof reopen !== 'boolean') {
     return null;
   }
-  if (exportedAt !== undefined && exportedAt !== null && typeof exportedAt !== 'boolean') {
+  if (exportedAt !== undefined && typeof exportedAt !== 'boolean') {
     return null;
   }
   const decodedCounters: Record<TelemetryCounterKey, number> = Object.create(null);
-  if (counters !== undefined && counters !== null) {
+  if (counters !== undefined) {
     const entries = plainObjectEntries(counters);
     if (entries === null) {
       return null;
@@ -344,9 +344,14 @@ export function applyDispositionWrite(
     }
     let applied = 0;
     let kept = 0;
-    const spans: Record<string, Record<string, string>> = {};
-    for (const [traceId, entry] of Object.entries(current.spans)) {
-      spans[traceId] = { ...entry };
+    const spans: Record<string, Record<string, string>> = Object.create(null);
+    for (const traceId of Object.keys(current.spans)) {
+      const entry: Record<string, string> = Object.create(null);
+      const storedEntry = current.spans[traceId]!;
+      for (const spanId of Object.keys(storedEntry)) {
+        entry[spanId] = storedEntry[spanId]!;
+      }
+      spans[traceId] = entry;
     }
     for (const update of decoded.updates) {
       const stored = spans[update.traceId]?.[update.spanId];
@@ -373,17 +378,21 @@ export function applyDispositionWrite(
     for (const key of Object.keys(decoded.counters) as TelemetryCounterKey[]) {
       const increment = decoded.counters[key];
       if (increment !== undefined) {
-        counters[key] = counters[key] + increment;
+        const sum = counters[key] + increment;
+        if (!isSafeNonNegativeInteger(sum)) {
+          return { outcome: 'refused', reason: 'invalid-request' };
+        }
+        counters[key] = sum;
       }
+    }
+    const spanMap: Record<string, Readonly<Record<string, string>>> = Object.create(null);
+    for (const traceId of Object.keys(spans)) {
+      spanMap[traceId] = freezeSpanEntry(spans[traceId]!);
     }
     const record: TelemetryDispositionRecord = Object.freeze({
       version: TELEMETRY_DISPOSITION_RECORD_VERSION,
       saltFingerprint: decoded.saltFingerprint,
-      spans: Object.freeze(
-        Object.fromEntries(
-          Object.entries(spans).map(([traceId, entry]) => [traceId, freezeSpanEntry(entry)]),
-        ),
-      ) as Readonly<Record<string, Readonly<Record<string, string>>>>,
+      spans: Object.freeze(spanMap),
       counters: Object.freeze(counters),
       lastExportAtIso: decoded.exportedAt ? decoded.nowIso : current.lastExportAtIso,
     });

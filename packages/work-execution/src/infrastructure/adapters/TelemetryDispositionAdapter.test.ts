@@ -12,7 +12,6 @@ import {
 import type { TelemetryDispositionWriteRequest } from '../../domain/run-telemetry-dispositions.js';
 
 const TRACE_A = 'a'.repeat(32);
-const TRACE_B = 'b'.repeat(32);
 const SPAN_PREFIX_A = 'a';
 const SPAN_PREFIX_B = 'b';
 const FINGERPRINT_A = 'abc12345';
@@ -120,10 +119,16 @@ describe.each(['memory', 'file'] as const)('TelemetryDispositionAdapter (%s)', (
       applied: 1,
       kept: 0,
     });
+    const fileBytesBefore = isFile
+      ? await fs.readFile(path.join(tempDir, 'telemetry-dispositions.json'), 'utf8')
+      : '';
     expect(await adapter.write(pendingWrite(TRACE_A, spanId(SPAN_PREFIX_A, 1), FINGERPRINT_B))).toEqual({
       outcome: 'refused',
       reason: 'salt-mismatch',
     });
+    expect(
+      isFile ? await fs.readFile(path.join(tempDir, 'telemetry-dispositions.json'), 'utf8') : '',
+    ).toBe(fileBytesBefore);
     const read = await adapter.read();
     if (read.outcome !== 'read') {
       expect.fail('the read must succeed');
@@ -166,6 +171,18 @@ describe.each(['memory', 'file'] as const)('TelemetryDispositionAdapter (%s)', (
     expect(read.record.counters['queue-drops']).toBe(1);
     expect(read.record.lastExportAtIso).toBe(NOW);
   });
+
+  it('a write builds the record on null-prototype maps, matching memory and file mode', async () => {
+    expect(
+      await adapter.write(finalWrite(TRACE_A, [spanId(SPAN_PREFIX_A, 0)], { state: 'exported', route: 'collector' })),
+    ).toEqual({ outcome: 'written', applied: 1, kept: 0 });
+    const read = await adapter.read();
+    if (read.outcome !== 'read') {
+      expect.fail('the read must succeed');
+    }
+    expect(Object.getPrototypeOf(read.record.spans)).toBe(null);
+    expect(Object.getPrototypeOf(read.record.spans[TRACE_A]!)).toBe(null);
+  });
 });
 
 describe('TelemetryDispositionAdapter file mode details', () => {
@@ -193,8 +210,11 @@ describe('TelemetryDispositionAdapter file mode details', () => {
     if (read.outcome !== 'read') {
       expect.fail('the read must succeed');
     }
-    expect(read.record.spans[TRACE_A]![spanId(SPAN_PREFIX_A, 0)]).toBe('exported@collector');
-    expect(read.record.saltFingerprint).toBe(FINGERPRINT_A);
+    expect(read.record).toEqual({
+      ...emptyTelemetryDispositionRecord(),
+      saltFingerprint: FINGERPRINT_A,
+      spans: { [TRACE_A]: { [spanId(SPAN_PREFIX_A, 0)]: 'exported@collector' } },
+    });
   });
 
   it('an unreadable file reads unreadable, refuses a write as store-unreadable and keeps a quarantine copy', async () => {
@@ -212,9 +232,11 @@ describe('TelemetryDispositionAdapter file mode details', () => {
     const quarantineDir = path.join(tempDir, 'quarantine');
     const entries = await fs.readdir(quarantineDir);
     expect(entries.length).toBeGreaterThanOrEqual(1);
-    for (const entry of entries) {
-      const kept = await fs.readFile(path.join(quarantineDir, entry), 'utf8');
-      expect(kept).toBe(garbage);
+    const kept = await Promise.all(
+      entries.map((entry) => fs.readFile(path.join(quarantineDir, entry), 'utf8')),
+    );
+    for (const content of kept) {
+      expect(content).toBe(garbage);
     }
     expect(await fs.readFile(file, 'utf8')).toBe(garbage);
   });
@@ -225,9 +247,17 @@ describe('TelemetryDispositionAdapter file mode details', () => {
     await writer.write(pendingWrite(TRACE_A, spanId(SPAN_PREFIX_A, 0)));
     const before = await fs.readFile(file, 'utf8');
 
-    const release = new Promise<void>((resolve) => {
-      void withFileLock(`${file}.lock`, () => new Promise((r) => setTimeout(r, 1500))).then(() => resolve());
+    let resolveAcquired: (() => void) | undefined;
+    const acquired = new Promise<void>((resolve) => {
+      resolveAcquired = resolve;
     });
+    const release = new Promise<void>((resolve) => {
+      void withFileLock(`${file}.lock`, () => {
+        resolveAcquired?.();
+        return new Promise((r) => setTimeout(r, 1500));
+      }).then(() => resolve());
+    });
+    await acquired;
     const started = Date.now();
     const busy = new TelemetryDispositionAdapter({ stateDir: tempDir, lockTimeoutMs: 200 });
     expect(await busy.write(pendingWrite(TRACE_A, spanId(SPAN_PREFIX_A, 1)))).toEqual({
@@ -287,7 +317,7 @@ describe('TelemetryDispositionAdapter two writers on one state directory', () =>
 
     const [resultsA, resultsB] = await Promise.all([
       runWriter(writerA, TRACE_A, spansA, { state: 'exported', route: 'collector' }),
-      runWriter(writerB, TRACE_B, spansB, { state: 'rejected', reason: 'http-4xx' }),
+      runWriter(writerB, TRACE_A, spansB, { state: 'rejected', reason: 'http-4xx' }),
     ]);
     for (const result of [...resultsA, ...resultsB]) {
       expect((result as { outcome: string }).outcome).not.toBe('skipped');
@@ -302,6 +332,7 @@ describe('TelemetryDispositionAdapter two writers on one state directory', () =>
     }
     const allSpanIds = Object.values(read.record.spans).flatMap((entry) => Object.keys(entry));
     expect(allSpanIds).toHaveLength(40);
+    expect(Object.keys(read.record.spans)).toEqual([TRACE_A]);
 
     const exportedByThisWriter = new Set(spansA);
     for (const [traceId, entry] of Object.entries(read.record.spans)) {
@@ -315,7 +346,7 @@ describe('TelemetryDispositionAdapter two writers on one state directory', () =>
       expect(read.record.spans[TRACE_A]![id]).toBe('exported@collector');
     }
     for (const id of spansB) {
-      expect(read.record.spans[TRACE_B]![id]).toBe('rejected:http-4xx');
+      expect(read.record.spans[TRACE_A]![id]).toBe('rejected:http-4xx');
     }
   });
 });

@@ -98,6 +98,7 @@ import {
   type ExecutionRunnerHost,
   type ExecutorForRecordedHostResult,
   type EvaluateAttemptGatePort,
+  type ForgeActionDelegate,
   type GhInvocationResult,
   type SubprocessRunner,
   type CommandExecutorPort,
@@ -249,6 +250,12 @@ export interface FleetCliRuntimeOptions {
    * composes the gate predicates.
    */
   readonly attemptGate?: EvaluateAttemptGatePort;
+  /**
+   * Test-only delegate for the forge action's reviewed gh subprocess and the
+   * live head read; production binds the reviewed gh subprocess and the live
+   * head read.
+   */
+  readonly forgeActionDelegate?: Pick<ForgeActionDelegate, 'runGh' | 'verifyCurrentHeadSha'>;
 }
 
 export interface ResolvedRunnerSettings {
@@ -1322,8 +1329,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // a moved branch head is never pushed or merged on stale readiness.
   const forgeAction = new ForgeActionAdapter(
     {
-    runGh: (args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates),
-    verifyCurrentHeadSha: async (branchName, request) => {
+    runGh:
+      options?.forgeActionDelegate?.runGh ??
+      ((args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates)),
+    verifyCurrentHeadSha:
+      options?.forgeActionDelegate?.verifyCurrentHeadSha ??
+      (async (branchName, request) => {
       const attempt = await attemptRepository.findAttemptById(request.attemptId);
       if (attempt === null) {
         throw new Error(`No attempt is recorded for ${request.attemptId}`);
@@ -1420,7 +1431,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         await runGitCommand(pushArgs);
       }
       return head;
-    },
+      }),
     pullRequestRead: forgeRead,
     ...(forgeGithubSection !== undefined
       ? { repository: { owner: forgeGithubSection.owner, repo: forgeGithubSection.repo } }

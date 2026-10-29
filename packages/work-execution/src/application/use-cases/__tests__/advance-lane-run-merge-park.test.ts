@@ -787,3 +787,88 @@ describe('AdvanceLaneRunUseCase park notices (K6-7)', () => {
     expect(refusedEntries.filter((entry) => entry.kind === 'intent' && entry.key === mergeKey())).toHaveLength(1);
   });
 });
+
+describe('AdvanceLaneRunUseCase park notice re-raise (KF-4)', () => {
+  it('test 13: a park whose notice threw the first time gets its attention item and question on the next advance', async () => {
+    const harness = await mergingHarness({ wireParkNotice: true, autoMergeEnabled: false });
+    harness.setAttentionAnswer('throw');
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'owner-merge', qualifier: null });
+    expect(harness.recordParkAttentionCalls).toHaveLength(1);
+    expect(harness.askParkQuestionCalls).toHaveLength(0);
+    expect((await harness.runRepo.get(RUN_ID))?.parked?.questionId).toBeNull();
+
+    // The next advance re-raises under the saved park key: the fake succeeds,
+    // the question lands and its id is saved on the record.
+    harness.setAttentionAnswer(undefined as unknown as LaneRunParkNoticeResult);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.recordParkAttentionCalls).toHaveLength(2);
+    expect(harness.recordParkAttentionCalls[1]).toMatchObject({
+      key: RUN_ID + '/park@1',
+      reason: 'owner-merge',
+      runId: RUN_ID,
+    });
+    expect(harness.askParkQuestionCalls).toHaveLength(1);
+    expect((await harness.runRepo.get(RUN_ID))?.parked?.questionId).toBe(QUESTION_ID);
+  });
+
+  it('test 14: once the question id is saved, further advances raise nothing', async () => {
+    const harness = await mergingHarness({ wireParkNotice: true, autoMergeEnabled: false });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'owner-merge', qualifier: null });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    const attentionCalls = harness.recordParkAttentionCalls.length;
+    const questionCalls = harness.askParkQuestionCalls.length;
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.recordParkAttentionCalls).toHaveLength(attentionCalls);
+    expect(harness.askParkQuestionCalls).toHaveLength(questionCalls);
+  });
+
+  it('test 15: the park-repair path (record parked, conduct missing) raises on repair', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()], {
+      wireParkNotice: true,
+      wireWorkOrder: true,
+      wireForgeRead: true,
+      autoMergeEnabled: false,
+    });
+    // A crash between the park save and the conduct append: the record is
+    // parked but the journal has no `parked` conduct yet.
+    const current = await harness.runRepo.get(RUN_ID);
+    expect(current).not.toBeNull();
+    const saved = await harness.runRepo.save({
+      ...current!,
+      parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null },
+      parkCount: current!.parkCount + 1,
+      revision: current!.revision + 1,
+    }, { holderId: HOLDER, fence: 1, nowIso: LATER });
+    expect(saved.outcome).toBe('saved');
+    expect(await advance(harness)).toEqual({ outcome: 'repaired', state: 'parked' });
+    expect(harness.recordParkAttentionCalls).toHaveLength(1);
+    expect(harness.recordParkAttentionCalls[0]).toMatchObject({
+      key: RUN_ID + '/park@1',
+      reason: 'owner-merge',
+    });
+    expect(harness.askParkQuestionCalls).toHaveLength(1);
+    expect((await harness.runRepo.get(RUN_ID))?.parked?.questionId).toBe(QUESTION_ID);
+  });
+
+  it('test 16: an attention-only reason re-raises idempotently and never asks a question', async () => {
+    const harness = await mergingHarness({ wireParkNotice: true });
+    harness.setForgeReadAnswer(openPullRequestAtHead(7, 'behind'));
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'branch-behind', qualifier: null });
+    expect(harness.recordParkAttentionCalls).toHaveLength(1);
+    expect(harness.askParkQuestionCalls).toHaveLength(0);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    // The repeat answers `exists` under the same key; one call per advance.
+    expect(harness.recordParkAttentionCalls).toHaveLength(2);
+    expect(harness.recordParkAttentionCalls[1].key).toBe(RUN_ID + '/park@1');
+    expect(harness.askParkQuestionCalls).toHaveLength(0);
+  });
+
+  it('test 17: no parkNotice wired means no raise and the parked wait is unchanged', async () => {
+    const harness = await mergingHarness({ wireParkNotice: false, autoMergeEnabled: false });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'owner-merge', qualifier: null });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.recordParkAttentionCalls).toEqual([]);
+    expect(harness.askParkQuestionCalls).toEqual([]);
+    expect(harness.portCalls.filter((call) => call.startsWith('park'))).toHaveLength(0);
+  });
+});

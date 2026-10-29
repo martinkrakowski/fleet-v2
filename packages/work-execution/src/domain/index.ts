@@ -23,6 +23,7 @@ export * from "./lane-run-step-facts.js";
 export * from "./lane-run-transitions.js";
 export * from "./plain-record-reads.js";
 export * from "./run-telemetry-attributes.js";
+export * from "./run-telemetry-dispositions.js";
 export * from "./run-telemetry-ids.js";
 export * from "./seat-selection.js";
 export * from "./value-objects/index.js";

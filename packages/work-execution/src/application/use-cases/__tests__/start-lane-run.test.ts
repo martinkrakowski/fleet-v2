@@ -378,6 +378,17 @@ describe('StartLaneRunUseCase', () => {
       seatSelection: expect.objectContaining({ role: 'first-pass', seatIndex: 0, seatId: 'fp-1' }),
       reviewerSeat: null,
     });
+    // KF-10: the first attempt carries its reserved host as `runner`, so the
+    // first dispatch reads the frozen manifest through that host.
+    expect(attempt?.runner).toEqual({
+      kind: 'opencode',
+      hostName: HOST_NAME,
+      host: null,
+      remotePort: 41001,
+      agent: null,
+      model: null,
+      variant: null,
+    });
     const run = await harness.runRepoStore.get(RUN_ID);
     expect(run).not.toBeNull();
     expect(run).toMatchObject({
@@ -645,6 +656,17 @@ describe('StartLaneRunUseCase', () => {
       sshAlias: 'lane-ssh-example',
       port: 41002,
     });
+    // KF-10: the attempt stamps the ssh alias as `runner.host`.
+    const attempt = await harness.attemptRepoStore.findAttemptById(ATTEMPT_ID);
+    expect(attempt?.runner).toEqual({
+      kind: 'opencode',
+      hostName: HOST_NAME,
+      host: 'lane-ssh-example',
+      remotePort: 41002,
+      agent: null,
+      model: null,
+      variant: null,
+    });
   });
 
   it('test 3d (KF-8): an agy host records no remote port', async () => {
@@ -691,6 +713,17 @@ describe('StartLaneRunUseCase', () => {
       variant: null,
     });
     expect(harness.briefCalls[0].recordedHost).toEqual(harness.worktreeCalls[0].recordedHost);
+    // KF-10: an agy attempt stamps the host with a null remote port.
+    const attempt = await harness.attemptRepoStore.findAttemptById(ATTEMPT_ID);
+    expect(attempt?.runner).toEqual({
+      kind: 'agy',
+      hostName: HOST_NAME,
+      host: null,
+      remotePort: null,
+      agent: null,
+      model: null,
+      variant: null,
+    });
   });
 
   it('test 3e (KF-8): a held ssh reservation without an alias is released and reported incomplete reserve', async () => {
@@ -953,6 +986,51 @@ describe('StartLaneRunUseCase', () => {
     expect(harness.capacityCalls).toHaveLength(0);
     expect(harness.worktreeCalls).toHaveLength(0);
     expect(harness.briefCalls).toHaveLength(0);
+  });
+
+  it('test 5c (KF-10): a retry that updates an existing attempt without a runner stamps the recorded host', async () => {
+    const harness = makeHarness();
+    // A crash after the attempt save (before the run record) left the attempt
+    // without a runner; the retry with the same ids must stamp it.
+    await harness.attemptRepoStore.saveAttempt({
+      id: ATTEMPT_ID,
+      workOrderId: 'wo-example-1',
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      worktreePath: WORKTREE_PATH,
+      baseCommit: COMMIT,
+      state: 'intent-recorded',
+      outcome: null,
+      briefDigest: DIGEST,
+      briefPackagePath: WORKTREE_PATH + '/.lane/brief.md',
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: null,
+      seatPlan: SEAT_PLAN,
+      seatSelection: { role: 'first-pass', seatIndex: 0, seatId: 'fp-1', model: 'model-example-1', tool: 'opencode', variant: null, agent: null },
+      reviewerSeat: null,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    } as AttemptRecord);
+    const result = await harness.useCase.startLaneRun(requestFixture({ nowIso: LATER }));
+    expect(result).toEqual({
+      outcome: 'started',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      hostName: HOST_NAME,
+      worktreePath: WORKTREE_PATH,
+    });
+    const attempt = await harness.attemptRepoStore.findAttemptById(ATTEMPT_ID);
+    expect(attempt?.runner).toEqual({
+      kind: 'opencode',
+      hostName: HOST_NAME,
+      host: null,
+      remotePort: 41001,
+      agent: null,
+      model: null,
+      variant: null,
+    });
   });
 
   it('test 6: abandon releases a reserve-only crash, cancels a prepared attempt and refuses a completed start', async () => {

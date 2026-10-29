@@ -74,6 +74,13 @@ const SEAT_PLAN = {
   review: [],
 };
 
+const SEAT_PLAN_ONE = {
+  version: 1 as const,
+  'first-pass': [{ id: 'fp-1', model: 'model-example-1', tool: 'opencode' }],
+  fix: [{ id: 'fx-1', model: 'model-example-1', tool: 'opencode' }],
+  review: [],
+};
+
 const SEAT_PLAN_AGY_PIVOT = {
   version: 1 as const,
   'first-pass': [
@@ -577,6 +584,110 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
         reasonCode: 'dispatch-inputs-unreadable',
       }),
     );
+  });
+
+  it('test 7b (KF-10): a spent dispatch key parks step-refused dispatch without re-sending it or writing a second intent', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    // A crash after the dispatch result but before the dispatching conduct: the
+    // key has a final `dispatch-started` result and the attempt is still
+    // prepared, so the decider re-acts the same key. The spent-key guard parks
+    // instead of the journal's duplicate-key refusal.
+    const key = dispatchKey(0, 0, 1);
+    await appendIntent(harness, key, 'attempt-example-1', NOW);
+    await appendResult(harness, key, 'completed', 'dispatch-started', NOW);
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    expect(harness.dispatchRequests).toEqual([]);
+    expect(harness.cancelRequests).toEqual([]);
+    const entries = await harness.runJournal.listForKey(key);
+    expect(entries.filter((entry) => entry.kind === 'intent')).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result')).toHaveLength(1);
+  });
+
+  it('test 7c (KF-10): after a refused first dispatch parks, a resume pivots to the next first-pass seat under a new key', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    harness.setManifest(null);
+    await admit(harness, 'attempt-example-1');
+    const key = dispatchKey(0, 0, 1);
+    const first = await advance(harness);
+    expect(first).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    expect(harness.dispatchRequests).toEqual([]);
+    expect((await harness.runJournal.listForKey(key)).filter((e) => e.kind === 'intent')).toHaveLength(1);
+
+    // Resume: applyPendingResume's exit — the park cleared, the parked-from conduct journaled.
+    const parked = await harness.runRepo.get(RUN_ID);
+    if (parked === null || parked.parked === null) {
+      throw new Error('fixture must end parked');
+    }
+    expect(parked.parked).toMatchObject({ reason: 'step-refused', qualifier: 'dispatch' });
+    const saved = await harness.deps.runRepo.save(
+      { ...parked, parked: null, revision: parked.revision + 1 },
+      { holderId: HOLDER, fence: 1, nowIso: LATER },
+    );
+    expect(saved.outcome).toBe('saved');
+    await conduct(harness, 'ready', LATER);
+
+    // The next advance owns the pivot: G8 does not re-park a dispatch refusal
+    // (dispatch is no state's keyed step), so the not-started dispatch cancels
+    // the never-contacted attempt instead of re-sending the spent key.
+    const afterResume = await advance(harness);
+    expect(afterResume).toEqual({ outcome: 'waiting', reason: 'dispatch-pending' });
+    expect(harness.dispatchRequests).toEqual([]);
+    expect((await harness.runJournal.listForKey(key)).filter((e) => e.kind === 'intent')).toHaveLength(1);
+    expect((await harness.attemptRepo.findAttemptById('attempt-example-1'))?.state).toBe('cancelled');
+
+    // The following advance prepares a NEW attempt on the next first-pass seat
+    // under a new key; the spent dispatch key is never re-sent.
+    const pivotPrepare = await advance(harness);
+    expect(pivotPrepare).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(0, 1, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    const afterRecord = await harness.runRepo.get(RUN_ID);
+    const pivotId = afterRecord?.attemptIds[1];
+    const pivot = await harness.attemptRepo.findAttemptById(pivotId as string);
+    expect(pivot?.seatSelection?.seatId).toBe('fp-2');
+    expect(pivot?.seatSelection?.seatIndex).toBe(1);
+    expect((await harness.runJournal.listForKey(key)).filter((e) => e.kind === 'intent')).toHaveLength(1);
+  });
+
+  it('test 7d (KF-10): with one first-pass seat a resumed refused dispatch parks seat-plan-exhausted, never re-sending the spent key', async () => {
+    const harness = await makeHarness(runRecord(), [
+      attemptFixture({ seatPlan: SEAT_PLAN_ONE }),
+    ]);
+    harness.setManifest(null);
+    await admit(harness, 'attempt-example-1');
+    // The run reached seat-failed (a prior seat failure); its next dispatch refuses.
+    await conduct(harness, 'seat-failed', NOW);
+    const key = dispatchKey(0, 0, 1);
+    const first = await advance(harness);
+    expect(first).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    expect(harness.dispatchRequests).toEqual([]);
+
+    const parked = await harness.runRepo.get(RUN_ID);
+    if (parked === null || parked.parked === null) {
+      throw new Error('fixture must end parked');
+    }
+    expect(parked.parked).toMatchObject({ reason: 'step-refused', qualifier: 'dispatch' });
+    const saved = await harness.deps.runRepo.save(
+      { ...parked, parked: null, revision: parked.revision + 1 },
+      { holderId: HOLDER, fence: 1, nowIso: LATER },
+    );
+    expect(saved.outcome).toBe('saved');
+    await conduct(harness, 'seat-failed', LATER);
+
+    const afterResume = await advance(harness);
+    expect(afterResume).toEqual({ outcome: 'waiting', reason: 'dispatch-pending' });
+    expect(harness.dispatchRequests).toEqual([]);
+    expect((await harness.runJournal.listForKey(key)).filter((e) => e.kind === 'intent')).toHaveLength(1);
+
+    const exhausted = await advance(harness);
+    expect(exhausted).toEqual({ outcome: 'parked', reason: 'seat-plan-exhausted', qualifier: null });
+    expect((await harness.runJournal.listForKey(key)).filter((e) => e.kind === 'intent')).toHaveLength(1);
   });
 
   it('test 8: a pivot seat whose tool differs is refused seat-tool-differs and then parks step-refused prepare', async () => {

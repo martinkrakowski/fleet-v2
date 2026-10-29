@@ -125,8 +125,13 @@ const ALLOWED_HIDDEN_SEGMENTS: ReadonlySet<string> = new Set(['.lane']);
  */
 const PATTERN_WORD_PATTERN = /^[A-Za-z0-9._/@:%#,+^~-]+$/;
 
-/** Ref word: a sha, `HEAD`, `HEAD~<digits>` or a `<ref>..<ref>` / `<ref>...<ref>` range. */
-const REF_ATOM = '(?:HEAD(?:~[0-9]+)?|[0-9a-f]{7,40}|[A-Za-z0-9._/-]+)';
+/**
+ * Ref word: a sha, `HEAD`, `HEAD~<digits>` or a `<ref>..<ref>` / `<ref>...<ref>`
+ * range built only from those atoms. A ref atom carries no `/` and no `.`
+ * outside the range dots, so a path operand can never pass as a ref: every
+ * other operand must satisfy `isPathWord`.
+ */
+const REF_ATOM = '(?:HEAD(?:~[0-9]+)?|[0-9a-f]{7,40})';
 const REF_WORD_PATTERN = new RegExp(`^(?:${REF_ATOM}|${REF_ATOM}\\.{2,3}${REF_ATOM})$`);
 
 function isPathWord(word: string): boolean {
@@ -213,6 +218,11 @@ function isReadOnlyGrepCommand(words: readonly string[], isRipgrep: boolean): bo
       return false;
     }
     if (!patternSeen && word.startsWith('-')) {
+      // `-f`/`--file` make the next word a pattern FILE (read from anywhere),
+      // so any flag word carrying a lowercase `f` is refused outright.
+      if (word.includes('f') || word === '--file') {
+        return false;
+      }
       if (GREP_PLAIN_FLAGS.has(word) || /^-[nilcwFr]+$/.test(word)) {
         index += 1;
         continue;
@@ -334,24 +344,28 @@ export function isReadOnlyReviewCommand(command: unknown): boolean {
 }
 
 /**
- * The shell command a bash/shell tool event carries, read from the part's
- * input under `state.input` or `input`; null when neither placement holds one.
+ * The shell command a bash/shell tool event carries, read from the PART's
+ * input placements only (`part.input.command` and `part.state.input.command`);
+ * null when no placement holds one or when the placements disagree. An
+ * event-level `input` is never read, so a passing placement cannot hide a
+ * failing one.
  */
 function extractShellCommand(record: Record<string, unknown>): string | null {
-  const containers: Record<string, unknown>[] = [record];
   const part = isPlainRecord(record.part) ? record.part : null;
-  if (part !== null) {
-    containers.unshift(part);
+  if (part === null) {
+    return null;
   }
-  for (const container of containers) {
-    const state = isPlainRecord(container.state) ? container.state : null;
-    for (const input of [container.input, state?.input]) {
-      if (isPlainRecord(input) && typeof input.command === 'string') {
-        return input.command;
-      }
+  const state = isPlainRecord(part.state) ? part.state : null;
+  const commands: string[] = [];
+  for (const input of [part.input, state?.input]) {
+    if (isPlainRecord(input) && typeof input.command === 'string') {
+      commands.push(input.command);
     }
   }
-  return null;
+  if (commands.length === 0) {
+    return null;
+  }
+  return commands.every((command) => command === commands[0]) ? commands[0] : null;
 }
 
 /** Recognised event types for review runner stream. Any unrecognised event voids read-only. */
@@ -509,11 +523,12 @@ export function buildReviewPrompt(
   request: RunIndependentReviewRequest,
   nonce: string,
   embeddedDiff?: string | null,
+  diffUnavailable?: boolean,
 ): string {
   if (request.kind === undefined) {
     return buildManualReviewPrompt(request, nonce);
   }
-  return buildKindReviewPrompt(request, nonce, embeddedDiff);
+  return buildKindReviewPrompt(request, nonce, embeddedDiff, diffUnavailable);
 }
 
 /** The prompt a manual review (no kind) receives; byte-for-byte the pre-kind text. */
@@ -547,6 +562,7 @@ function buildKindReviewPrompt(
   request: RunIndependentReviewRequest,
   nonce: string,
   embeddedDiff?: string | null,
+  diffUnavailable?: boolean,
 ): string {
   const sections: string[] = [
     `Independent read-only ${request.kind} review for attempt "${request.attemptId}" at candidate head "${request.candidateHeadSha}".`,
@@ -593,6 +609,8 @@ function buildKindReviewPrompt(
       });
       sections.push(`Diff:\n${wrappedDiff}`);
     }
+  } else if (diffUnavailable === true) {
+    sections.push('The diff was not available; the read-only tools still work against the candidate head.');
   }
 
   sections.push(
@@ -786,13 +804,24 @@ export function createOcmReviewTransport(
     // does not need a shell to see the change.
     const nonce = (options.makeNonce ?? defaultNonce)();
     let embeddedDiff: string | null = null;
+    let diffUnavailable = false;
     if (request.kind !== undefined && options.baseCommit !== undefined && options.readDiff !== undefined) {
-      const diff = await options.readDiff(options.baseCommit, request.candidateHeadSha);
-      if (typeof diff === 'string' && diff.trim() !== '') {
-        embeddedDiff = diff;
+      // A failed diff read never aborts the review: the prompt carries the
+      // "diff not available" note next to the tools sentence and the tools
+      // still work against the candidate head.
+      let diff: string | null = null;
+      try {
+        const read = await options.readDiff(options.baseCommit, request.candidateHeadSha);
+        if (typeof read === 'string' && read.trim() !== '') {
+          diff = read;
+        }
+      } catch {
+        diff = null;
       }
+      embeddedDiff = diff;
+      diffUnavailable = diff === null;
     }
-    const prompt = buildReviewPrompt(request, nonce, embeddedDiff);
+    const prompt = buildReviewPrompt(request, nonce, embeddedDiff, diffUnavailable);
     const argv: string[] = [
       '--dir',
       dir,

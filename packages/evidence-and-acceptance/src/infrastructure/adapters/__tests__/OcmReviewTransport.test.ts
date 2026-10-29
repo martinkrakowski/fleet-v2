@@ -1450,6 +1450,11 @@ describe('OcmReviewTransport', () => {
         'wc -l f',
         'cat f',
         'ls -la d',
+        'grep -nF foo src',
+        'git diff HEAD~1..HEAD',
+        'git show HEAD',
+        'git log --oneline -5 HEAD~3..HEAD',
+        'git diff -- packages/x/a.ts',
       ];
       for (const command of allowed) {
         expect(isReadOnlyReviewCommand(command), command).toBe(true);
@@ -1490,6 +1495,14 @@ describe('OcmReviewTransport', () => {
         'cat f\n',
         '',
         42,
+        'grep -nf /etc/passwd src',
+        'grep -nf ../../.ssh/id_rsa src',
+        'rg -fr /etc/passwd src',
+        'grep --file patterns.txt src',
+        'git diff ../../.ssh/id_rsa',
+        'git diff /etc/passwd',
+        'git show .git/config',
+        'git log foo/.git/config',
       ];
       for (const command of refused) {
         expect(isReadOnlyReviewCommand(command), String(command).slice(0, 40)).toBe(false);
@@ -1652,6 +1665,151 @@ describe('OcmReviewTransport', () => {
         'Inspect the code changes and candidate head using read-only tools (read, grep, glob, list).',
       );
       expect(withoutDiff).not.toContain('label="diff">>>');
+    });
+  });
+
+  describe('event reader and diff-read failures (KF-14e fix1)', () => {
+    const nonce = '0123456789abcdef';
+    const kindRequest = { ...baseRequest, kind: 'brief-check' as const, briefText: 'Do the thing.' };
+    const passingStdout =
+      '{"type":"step_start","part":{"type":"step-start"}}\n' +
+      '{"type":"tool","part":{"tool":"read"}}\n' +
+      '%PART%\n' +
+      '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}';
+
+    const makeTransport = (stdout: string, extra: Record<string, unknown> = {}) => {
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => '/tmp/review-dir',
+        readHead: async () => baseRequest.candidateHeadSha,
+        spawn: async () => ({ exitCode: 0, stdout, stderr: '' }),
+        makeNonce: () => nonce,
+        ...extra,
+      });
+      return { transport };
+    };
+
+    it('disagreeing part placements void the proof (a passing input.command hides nothing)', async () => {
+      const stdout = passingStdout.replace(
+        '%PART%',
+        '{"type":"tool","part":{"tool":"bash","input":{"command":"git status"},"state":{"input":{"command":"rm -rf x"}}}}',
+      );
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(false);
+    });
+
+    it('two identical passing placements pass the proof', async () => {
+      const stdout = passingStdout.replace(
+        '%PART%',
+        '{"type":"tool","part":{"tool":"bash","input":{"command":"git status"},"state":{"input":{"command":"git status"}}}}',
+      );
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(true);
+    });
+
+    it('one placement only passes the proof', async () => {
+      const stdout = passingStdout.replace(
+        '%PART%',
+        '{"type":"tool","part":{"tool":"bash","state":{"input":{"command":"git status"}}}}',
+      );
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(true);
+    });
+
+    it('a bash part with no command placement voids the proof', async () => {
+      const stdout = passingStdout.replace(
+        '%PART%',
+        '{"type":"tool","part":{"tool":"bash"}}',
+      );
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(false);
+    });
+
+    it('an event-level command with a command-less part voids the proof', async () => {
+      const stdout =
+        '{"type":"step_start","part":{"type":"step-start"}}\n' +
+        '{"type":"tool","part":{"tool":"read"}}\n' +
+        '{"type":"tool","input":{"command":"git status"},"part":{"tool":"bash"}}\n' +
+        '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}';
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(false);
+    });
+
+    it('a throwing readDiff leaves the diff unset and the review continues', async () => {
+      let prompt = '';
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => '/tmp/review-dir',
+        readHead: async () => baseRequest.candidateHeadSha,
+        spawn: async (_file, args) => {
+          prompt = args[args.length - 1];
+          return {
+            exitCode: 0,
+            stdout:
+              '{"type":"step_start","part":{"type":"step-start"}}\n' +
+              '{"type":"tool","part":{"tool":"read"}}\n' +
+              '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+            stderr: '',
+          };
+        },
+        baseCommit: 'base-sha-1',
+        readDiff: async () => {
+          throw new Error('diff read failed');
+        },
+        makeNonce: () => nonce,
+      });
+
+      const result = await transport(kindRequest);
+
+      expect(prompt).toContain('The diff was not available');
+      expect(prompt).not.toContain('label="diff">>>');
+      expect(result.result).toBe('pass');
+      expect(result.readOnlyVerified).toBe(true);
+    });
+
+    it('a null or blank readDiff is treated the same and the review continues', async () => {
+      for (const unreadable of [null, '   ']) {
+        let prompt = '';
+        const transport = createOcmReviewTransport({
+          ocmRunBin: '/test/ocm-run',
+          remotePort: 4096,
+          agent: 'reviewer',
+          model: baseRequest.reviewerModel,
+          resolveReviewDir: async () => '/tmp/review-dir',
+          readHead: async () => baseRequest.candidateHeadSha,
+          spawn: async (_file, args) => {
+            prompt = args[args.length - 1];
+            return {
+              exitCode: 0,
+              stdout:
+                '{"type":"step_start","part":{"type":"step-start"}}\n' +
+                '{"type":"tool","part":{"tool":"read"}}\n' +
+                '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+              stderr: '',
+            };
+          },
+          baseCommit: 'base-sha-1',
+          readDiff: async () => unreadable,
+          makeNonce: () => nonce,
+        });
+
+        const result = await transport(kindRequest);
+
+        expect(prompt).toContain('The diff was not available');
+        expect(result.result).toBe('pass');
+        expect(result.readOnlyVerified).toBe(true);
+      }
     });
   });
 });

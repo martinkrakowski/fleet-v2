@@ -405,7 +405,7 @@ describe('CliReviewTransport', () => {
     });
 
     it('a one-line stdout rejects and removes the scratch dir', async () => {
-      const spawn: CliReviewSpawn = async () => ({ exitCode: 0, signal: null, stdout: grokStdout('VERDICT: PASS\n'), stderr: '' });
+      const spawn: CliReviewSpawn = async () => ({ exitCode: 0, signal: null, stdout: grokStdout('Looks fine to me.\n'), stderr: '' });
       const { transport, scratchDirs } = buildHarness({ spawn });
       await expect(transport(BASE_REQUEST)).rejects.toThrow(/one-line response/);
       await expect(access(scratchDirs[0])).rejects.toThrow();
@@ -492,7 +492,7 @@ describe('CliReviewTransport', () => {
       const spawn: CliReviewSpawn = async () => ({
         exitCode: 0,
         signal: null,
-        stdout: grokStdout('VERDICT: PASS\n'),
+        stdout: grokStdout('Looks fine to me.\n'),
         stderr: '',
       });
       const { transport } = buildHarness({ spawn });
@@ -593,7 +593,7 @@ describe('CliReviewTransport', () => {
   });
 
   it('through IndependentReviewAdapter a one-line answer is unavailable with the one-line reason', async () => {
-    const spawn: CliReviewSpawn = async () => ({ exitCode: 0, signal: null, stdout: grokStdout('VERDICT: PASS\n'), stderr: '' });
+    const spawn: CliReviewSpawn = async () => ({ exitCode: 0, signal: null, stdout: grokStdout('Looks fine to me.\n'), stderr: '' });
     const { transport } = buildHarness({ spawn });
     const adapter = new IndependentReviewAdapter({ runReview: transport });
 

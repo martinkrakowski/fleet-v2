@@ -430,7 +430,9 @@ describe('ReviewTransportRouter', () => {
       const recorded: Array<{ file: string; args: readonly string[] }> = [];
       const cliSpawn: CliReviewSpawn = async (file, args) => {
         recorded.push({ file, args });
-        return { exitCode: 0, signal: null, stdout: CLI_STDOUT, stderr: '' };
+        // grok runs with `--output-format json`; the reply text lives in `text`
+        // (the fixture feeds the same two-line verdict as before this lane).
+        return { exitCode: 0, signal: null, stdout: JSON.stringify({ text: CLI_STDOUT }), stderr: '' };
       };
       let ocmCalled = false;
       const ocmSpawn: OcmReviewTransportSpawn = async () => {
@@ -452,8 +454,17 @@ describe('ReviewTransportRouter', () => {
 
       expect(recorded).toHaveLength(1);
       expect(recorded[0].file).toBe('grok');
-      expect(recorded[0].args[0]).toBe('-m');
-      expect(recorded[0].args[1]).toBe('grok-4.7');
+      expect(recorded[0].args).toEqual([
+        '--prompt-file',
+        expect.stringMatching(/^\/.*\/prompt\.md$/),
+        '-m',
+        'grok-4.7',
+        '--permission-mode',
+        'plan',
+        '--disable-web-search',
+        '--output-format',
+        'json',
+      ]);
       expect(ocmCalled).toBe(false);
       expect(result.result).toBe('pass');
       expect(result.readOnlyVerified).toBe(true);

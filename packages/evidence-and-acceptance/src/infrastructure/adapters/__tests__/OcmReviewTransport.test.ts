@@ -1455,6 +1455,8 @@ describe('OcmReviewTransport', () => {
         'git show HEAD',
         'git log --oneline -5 HEAD~3..HEAD',
         'git diff -- packages/x/a.ts',
+        'grep -r -e needle src',
+        'rg -g src/a.ts needle src',
       ];
       for (const command of allowed) {
         expect(isReadOnlyReviewCommand(command), command).toBe(true);
@@ -1503,6 +1505,13 @@ describe('OcmReviewTransport', () => {
         'git diff /etc/passwd',
         'git show .git/config',
         'git log foo/.git/config',
+        'grep -e needle /etc/passwd',
+        'grep -e needle ../../.ssh/id_rsa',
+        'rg -e needle /etc/passwd',
+        'grep -e needle .git/config',
+        'grep -r -e needle ..',
+        'grep -r -e needle ~',
+        'grep -e needle -r src',
       ];
       for (const command of refused) {
         expect(isReadOnlyReviewCommand(command), String(command).slice(0, 40)).toBe(false);

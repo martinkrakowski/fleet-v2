@@ -232,6 +232,11 @@ function isReadOnlyGrepCommand(words: readonly string[], isRipgrep: boolean): bo
         if (value === undefined || value.length > MAX_REVIEW_PATTERN_LENGTH || !isPatternWord(value)) {
           return false;
         }
+        // `-e` supplies the pattern: every later positional is a FILE and must
+        // satisfy the path grammar (`-g` is a ripgrep glob, the pattern follows).
+        if (word === '-e') {
+          patternSeen = true;
+        }
         index += 2;
         continue;
       }

@@ -12,13 +12,15 @@ import * as path from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-import { createFleetCliRuntime } from "../composition.js";
+import { assessmentIdForAttempt, createFleetCliRuntime } from "../composition.js";
 import { runCli } from "../index.js";
 import { loadInstallation, type FleetInstallation, type LoadResult } from "@fleet/installation";
+import type { EvidenceAssessmentRecord } from "@fleet/evidence-and-acceptance";
 import type {
   AttemptRecord,
   EvaluateAttemptGatePort,
   EvaluateAttemptGateResult,
+  ForgeActionDelegate,
   WorkOrderRecord,
 } from "@fleet/work-execution";
 
@@ -29,6 +31,7 @@ const WORK_ORDER_ID = "wo-example-1";
 const PROJECT_ID = "project-example-1";
 const POLICY_REVISION = "pol-1";
 const IMPLEMENTER_MODEL = "provider-a/glm-5.3";
+const REVIEWER_MODEL = "provider-b/grok-4.7";
 
 const createdDirs: string[] = [];
 
@@ -102,6 +105,7 @@ function makeRuntime(options: {
   load: () => LoadResult;
   forgeGhRunner: (args: readonly string[]) => Promise<GhResult>;
   attemptGate?: EvaluateAttemptGatePort;
+  forgeActionDelegate?: Pick<ForgeActionDelegate, "runGh" | "verifyCurrentHeadSha">;
 }): ReturnType<typeof createFleetCliRuntime> {
   return createFleetCliRuntime({
     stateDir: options.stateDir,
@@ -109,6 +113,7 @@ function makeRuntime(options: {
     loadInstallationForAutoMerge: options.load,
     forgeGhRunner: options.forgeGhRunner,
     ...(options.attemptGate !== undefined ? { attemptGate: options.attemptGate } : {}),
+    ...(options.forgeActionDelegate !== undefined ? { forgeActionDelegate: options.forgeActionDelegate } : {}),
   });
 }
 
@@ -166,6 +171,42 @@ function makeAttempt(): AttemptRecord {
   };
 }
 
+function makeAssessment(): EvidenceAssessmentRecord {
+  return {
+    id: assessmentIdForAttempt(ATTEMPT_ID),
+    projectId: PROJECT_ID,
+    attemptId: ATTEMPT_ID,
+    candidateHeadSha: HEAD,
+    policyRevision: POLICY_REVISION,
+    implementerModel: IMPLEMENTER_MODEL,
+    requiredChecks: [],
+    state: "pending",
+    verificationReceipts: [],
+    reviewReceipts: [
+      {
+        id: "rr-example-1",
+        assessmentId: assessmentIdForAttempt(ATTEMPT_ID),
+        projectId: PROJECT_ID,
+        attemptId: ATTEMPT_ID,
+        candidateHeadSha: HEAD,
+        reviewerModel: REVIEWER_MODEL,
+        implementerModel: IMPLEMENTER_MODEL,
+        readOnlyVerified: true,
+        result: "pass",
+        findings: [],
+        evidenceRef: "evidence://review-example-1",
+        policyRevision: POLICY_REVISION,
+        completedAtIso: "2026-10-28T09:00:00.000Z",
+      },
+    ],
+    findingDispositions: [],
+    acceptanceReceiptId: null,
+    blockers: [],
+    revision: 1,
+    updatedAtIso: "2026-10-28T09:00:00.000Z",
+  };
+}
+
 type GhResult = { exitCode: number; stdout: string; stderr: string };
 
 /** A forge runner that fails the test if it is ever invoked. */
@@ -177,6 +218,31 @@ function recordingGhRunner(): { calls: string[][]; runner: (args: readonly strin
       calls.push([...args]);
       throw new Error("gh unexpectedly invoked");
     },
+  };
+}
+
+/** A passing gh runner for the acceptance setup under forge mode github. */
+function passingGhRunner(): (args: readonly string[]) => Promise<GhResult> {
+  return async (args: readonly string[]) => {
+    if (args[0] === "api" && typeof args[1] === "string" && args[1].startsWith("repos/")) {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify([{ state: "open", head: { sha: HEAD }, number: 7 }]),
+        stderr: "",
+      };
+    }
+    if (args[0] === "pr") {
+      return { exitCode: 0, stdout: JSON.stringify([{ bucket: "pass" }]), stderr: "" };
+    }
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        data: {
+          repository: { pullRequest: { reviewThreads: { totalCount: 0, nodes: [] } } },
+        },
+      }),
+      stderr: "",
+    };
   };
 }
 
@@ -206,9 +272,90 @@ describe("fleet-v2 attempt gate wiring (GP-wire)", () => {
     expect(runtime.execution.requestAttemptAcceptance).not.toBe(runtime.execution.attemptGate);
   });
 
-  it.todo(
-    "the composed grant path reaches the policy grant — the merge path's verifyCurrentHeadSha delegate runs a live `git rev-parse` on the attempt's worktree before the gh stub can answer, so a test reaching the grant would perform a live git invocation, which the lane rules forbid",
-  );
+  it("the composed grant path reaches the policy grant and merges through the fake forge delegate", async () => {
+    const dir = makeTempDir();
+    const stateDir = path.join(dir, "state");
+    mkdirSync(stateDir);
+    const installation = makeInstallation({
+      autoMerge: { enabled: true, allowHighRisk: false, onBlocked: "ask-owner" },
+    });
+    const { load } = setupInstallFile(dir, installation);
+    const gate: EvaluateAttemptGatePort = {
+      evaluateAttemptGate: async (): Promise<EvaluateAttemptGateResult> => ({ verdict: "passed" }),
+    };
+    const mergeCalls: string[][] = [];
+    const runtime = makeRuntime({
+      stateDir,
+      installation,
+      load,
+      forgeGhRunner: passingGhRunner(),
+      attemptGate: gate,
+      forgeActionDelegate: {
+        verifyCurrentHeadSha: async () => HEAD,
+        runGh: async (args: readonly string[]) => {
+          mergeCalls.push([...args]);
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      },
+    });
+    await runtime.execution.workOrderRepository.saveWorkOrder(makeWorkOrder());
+    await runtime.execution.attemptRepository.saveAttempt(makeAttempt());
+    await runtime.evidence.evidenceAssessmentRepository.saveAssessment(makeAssessment());
+
+    const assessIo = collectIo();
+    const assessCode = await runCli(
+      [
+        "evidence",
+        "assess",
+        "--json",
+        JSON.stringify({
+          attemptId: ATTEMPT_ID,
+          candidateHeadSha: HEAD,
+          policyRevision: POLICY_REVISION,
+        }),
+      ],
+      assessIo.io,
+      runtime,
+    );
+    expect(assessCode).toBe(0);
+    const assessed = JSON.parse(assessIo.out.join("")) as { outcome: string };
+    expect(assessed.outcome).toBe("accepted");
+
+    const { io, out } = collectIo();
+    const code = await runCli(
+      ["attempt", "auto-merge", "--json", JSON.stringify({ attemptId: ATTEMPT_ID })],
+      io,
+      runtime,
+    );
+    expect(code).toBe(0);
+    const result = JSON.parse(out.join("")) as { outcome: string; decisionRevision?: string };
+    expect(result.outcome).toBe("merged");
+    expect(result.decisionRevision).toBeDefined();
+    expect(result.decisionRevision!.startsWith("policy:autoMerge@")).toBe(true);
+    expect(mergeCalls.length).toBeGreaterThan(0);
+    for (const args of mergeCalls) {
+      expect(args).not.toContain("--force");
+      expect(args).not.toContain("-f");
+    }
+  });
+
+  it("the composed gate shows the journal is wired: a collected attempt with no frozen brief is unknown, not journal-missing", async () => {
+    const dir = makeTempDir();
+    const stateDir = path.join(dir, "state");
+    mkdirSync(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await runtime.execution.workOrderRepository.saveWorkOrder(makeWorkOrder());
+    await runtime.execution.attemptRepository.saveAttempt(makeAttempt());
+
+    const result = await runtime.execution.attemptGate.evaluateAttemptGate({
+      attemptId: ATTEMPT_ID,
+      candidateHeadSha: HEAD,
+    });
+    expect(result).toEqual({
+      verdict: "unknown",
+      reason: "Attempt attempt-example-1 records no frozen brief; the gate cannot be read",
+    });
+  });
 
   it("a failing gate stops auto-merge with gate-not-passed and no forge call", async () => {
     const dir = makeTempDir();

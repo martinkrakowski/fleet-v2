@@ -98,6 +98,7 @@ import {
   type ExecutionRunnerHost,
   type ExecutorForRecordedHostResult,
   type EvaluateAttemptGatePort,
+  type ForgeActionDelegate,
   type GhInvocationResult,
   type SubprocessRunner,
   type CommandExecutorPort,
@@ -249,6 +250,22 @@ export interface FleetCliRuntimeOptions {
    * composes the gate predicates.
    */
   readonly attemptGate?: EvaluateAttemptGatePort;
+  /**
+   * Test-only delegate for the forge action's reviewed gh subprocess and the
+   * live head read; production binds the reviewed gh subprocess and the live
+   * head read.
+   */
+  readonly forgeActionDelegate?: Pick<ForgeActionDelegate, 'runGh' | 'verifyCurrentHeadSha'>;
+}
+
+/** The fields of a test-only forge delegate that were actually supplied; nothing else is overridden. */
+function forgeActionOverrides(
+  delegate: Pick<ForgeActionDelegate, 'runGh' | 'verifyCurrentHeadSha'> | undefined,
+): Partial<Pick<ForgeActionDelegate, 'runGh' | 'verifyCurrentHeadSha'>> {
+  return {
+    ...(delegate?.runGh === undefined ? {} : { runGh: delegate.runGh }),
+    ...(delegate?.verifyCurrentHeadSha === undefined ? {} : { verifyCurrentHeadSha: delegate.verifyCurrentHeadSha }),
+  };
 }
 
 export interface ResolvedRunnerSettings {
@@ -1425,6 +1442,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     ...(forgeGithubSection !== undefined
       ? { repository: { owner: forgeGithubSection.owner, repo: forgeGithubSection.repo } }
       : {}),
+    // Test-only: a supplied gh runner or head read replaces the production one (spread last, so it wins).
+    ...forgeActionOverrides(options?.forgeActionDelegate),
     },
     forgeRead,
   );

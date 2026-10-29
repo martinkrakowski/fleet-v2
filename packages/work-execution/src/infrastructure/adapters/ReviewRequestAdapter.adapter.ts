@@ -13,6 +13,7 @@ import {
   assessmentIdForAttempt,
 } from '@fleet/evidence-and-acceptance';
 import type {
+  EvidenceAssessmentRecord,
   EvidenceResultValue,
   InspectAcceptanceEvidencePort,
   InspectAcceptanceEvidenceResult,
@@ -148,8 +149,38 @@ function mapRejection(rejection: ReviewRejection | undefined): ReviewRequestResu
   }
 }
 
+/** A receipt's completion instant; an unparseable timestamp sorts before every parseable one. */
+function completedAtMs(receipt: ReviewReceiptRecord): number {
+  const ms = Date.parse(receipt.completedAtIso);
+  return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
+}
+
+type AssessmentRead =
+  | { readonly outcome: 'assessment'; readonly assessment: EvidenceAssessmentRecord }
+  | { readonly outcome: 'not-found' }
+  | { readonly outcome: 'unavailable'; readonly reason: 'not-configured' | 'unreadable' };
+
 export class ReviewRequestAdapter implements ReviewRequestPort {
   constructor(private readonly delegates: ReviewRequestDelegates = {}) {}
+
+  /** The attempt's assessment through the inspection delegate: the one read both receipt lookups share. */
+  private async readAssessmentOf(attemptId: string): Promise<AssessmentRead> {
+    if (!this.delegates.inspectAcceptanceEvidence) {
+      return { outcome: 'unavailable', reason: 'not-configured' };
+    }
+    let inspected: InspectAcceptanceEvidenceResult;
+    try {
+      inspected = await this.delegates.inspectAcceptanceEvidence({
+        assessmentId: assessmentIdForAttempt(attemptId),
+      });
+    } catch {
+      return { outcome: 'unavailable', reason: 'unreadable' };
+    }
+    if (inspected.outcome === 'not-found' || inspected.assessment.attemptId !== attemptId) {
+      return { outcome: 'not-found' };
+    }
+    return { outcome: 'assessment', assessment: inspected.assessment };
+  }
 
   async requestReview(request: ReviewRequest): Promise<ReviewRequestResult> {
     if (
@@ -204,25 +235,11 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (!isValidFindReceiptRequest(request)) {
       return { outcome: 'unavailable', reason: 'invalid-request' };
     }
-    if (!this.delegates.inspectAcceptanceEvidence) {
-      return { outcome: 'unavailable', reason: 'not-configured' };
+    const read = await this.readAssessmentOf(request.attemptId);
+    if (read.outcome !== 'assessment') {
+      return read;
     }
-    let inspected: InspectAcceptanceEvidenceResult;
-    try {
-      inspected = await this.delegates.inspectAcceptanceEvidence({
-        assessmentId: assessmentIdForAttempt(request.attemptId),
-      });
-    } catch {
-      return { outcome: 'unavailable', reason: 'unreadable' };
-    }
-    if (inspected.outcome === 'not-found') {
-      return { outcome: 'not-found' };
-    }
-    const assessment = inspected.assessment;
-    if (assessment.attemptId !== request.attemptId) {
-      return { outcome: 'not-found' };
-    }
-    const matches = assessment.reviewReceipts.filter(
+    const matches = read.assessment.reviewReceipts.filter(
       (receipt) => receipt.requestId === request.requestId,
     );
     if (matches.length === 0) {
@@ -246,25 +263,11 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (!isValidFindLatestReceiptOfKindRequest(request)) {
       return { outcome: 'unavailable', reason: 'invalid-request' };
     }
-    if (!this.delegates.inspectAcceptanceEvidence) {
-      return { outcome: 'unavailable', reason: 'not-configured' };
+    const read = await this.readAssessmentOf(request.attemptId);
+    if (read.outcome !== 'assessment') {
+      return read;
     }
-    let inspected: InspectAcceptanceEvidenceResult;
-    try {
-      inspected = await this.delegates.inspectAcceptanceEvidence({
-        assessmentId: assessmentIdForAttempt(request.attemptId),
-      });
-    } catch {
-      return { outcome: 'unavailable', reason: 'unreadable' };
-    }
-    if (inspected.outcome === 'not-found') {
-      return { outcome: 'not-found' };
-    }
-    const assessment = inspected.assessment;
-    if (assessment.attemptId !== request.attemptId) {
-      return { outcome: 'not-found' };
-    }
-    const candidates = assessment.reviewReceipts.filter(
+    const candidates = read.assessment.reviewReceipts.filter(
       (receipt): receipt is ReviewReceiptRecord & { kind: ReviewReceiptSummary['kind'] } =>
         receipt.kind === request.kind &&
         receipt.attemptId === request.attemptId &&
@@ -276,7 +279,8 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     const [first, ...rest] = candidates;
     let latest = first;
     for (const candidate of rest) {
-      if (candidate.completedAtIso >= latest.completedAtIso) {
+      // Instants, not strings: precision or offset differences must not reorder receipts.
+      if (completedAtMs(candidate) >= completedAtMs(latest)) {
         latest = candidate;
       }
     }

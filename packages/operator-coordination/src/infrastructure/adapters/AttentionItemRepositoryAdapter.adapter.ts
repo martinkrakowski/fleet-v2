@@ -100,6 +100,28 @@ export function parseAttentionItemStateRecord(
   }
 }
 
+/**
+ * The one-key rule, pure and shared with `fleet-v2 state check`: a file
+ * whose items share a (project, subject, kind) key or an itemId is unreadable
+ * as a whole. Returns the fixed detail string, or undefined when the list is
+ * savable.
+ */
+export function attentionItemListError(
+  records: readonly StoredAttentionItem[],
+): string | undefined {
+  const keys = new Set<string>();
+  const itemIds = new Set<string>();
+  for (const stored of records) {
+    const key = attentionItemKey(stored.item.projectId, stored.item.subject, stored.item.kind);
+    if (keys.has(key) || itemIds.has(stored.item.itemId)) {
+      return "two attention items share one key or id";
+    }
+    keys.add(key);
+    itemIds.add(stored.item.itemId);
+  }
+  return undefined;
+}
+
 export class AttentionItemRepositoryAdapter implements AttentionItemRepositoryPort {
   private readonly inMemoryItems = new Map<string, StoredAttentionItem>();
   private readonly changeSignal: ChangeSignalPort;
@@ -343,17 +365,15 @@ export class AttentionItemRepositoryAdapter implements AttentionItemRepositoryPo
       "AttentionItemRepositoryAdapter",
       parseAttentionItemStateRecord,
     );
+    // One item per key is a store invariant: a file breaking it is unreadable as a whole and its exact
+    // bytes are quarantined, never half-read.
+    const listError = attentionItemListError(records);
+    if (listError !== undefined) {
+      const bytes = await fs.readFile(path);
+      return quarantineUnreadable(path, listError, bytes);
+    }
     const map = new Map<string, StoredAttentionItem>();
-    const keys = new Set<string>();
     for (const stored of records) {
-      // One item per key is a store invariant: a file breaking it is unreadable as a whole and its exact
-      // bytes are quarantined, never half-read.
-      const key = attentionItemKey(stored.item.projectId, stored.item.subject, stored.item.kind);
-      if (keys.has(key) || map.has(stored.item.itemId)) {
-        const bytes = await fs.readFile(path);
-        return quarantineUnreadable(path, "two attention items share one key or id", bytes);
-      }
-      keys.add(key);
       map.set(stored.item.itemId, stored);
     }
     return map;

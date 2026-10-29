@@ -56,6 +56,7 @@ import { COORDINATION_KINDS } from '@fleet/operator-coordination';
 import type {
   AnswerOwnerQuestionRequest,
   AskOwnerQuestionRequest,
+  AttentionItemState,
   ListOwnerQuestionsRequest,
   OwnerQuestionState,
 } from '@fleet/operator-coordination';
@@ -1452,6 +1453,33 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
       rt.coordination.readProjectAttention.readProjectAttention({
         projectId: str(p, 'projectId'),
       }),
+    'attention-items': async (p, rt) =>
+      // A supplied filter is passed through as given, even empty, so the use case can refuse it (an empty list);
+      // only an absent flag means "no filter".
+      rt.coordination.listAttentionItems.listAttentionItems({
+        ...(Object.hasOwn(p, 'projectId') ? { projectId: str(p, 'projectId') } : {}),
+        ...(Object.hasOwn(p, 'state') ? { state: str(p, 'state') as AttentionItemState } : {}),
+        ...(Object.hasOwn(p, 'kind') ? { kind: str(p, 'kind') } : {}),
+        ...(Object.hasOwn(p, 'workOrderId') ? { workOrderId: str(p, 'workOrderId') } : {}),
+      }),
+    'attention-dismiss': async (p, rt) => {
+      const revisionRaw = optStr(p, 'expectedRevision');
+      const revision = revisionRaw !== undefined && /^\d{1,15}$/.test(revisionRaw) ? Number(revisionRaw) : NaN;
+      if (!Number.isSafeInteger(revision)) {
+        throw new CliUsageError(
+          "attention-dismiss requires '--expectedRevision <n>' with an integer value",
+        );
+      }
+      return rt.coordination.clearAttentionItem.clearAttentionItem(
+        {
+          action: 'dismiss',
+          itemId: str(p, 'itemId'),
+          expectedRevision: revision,
+        },
+        'cli',
+        'cli',
+      );
+    },
     'send-relay': async (p, rt) =>
       rt.coordination.sendFleetRelay.sendFleetRelay({
         requestId: str(p, 'requestId'),
@@ -1981,7 +2009,7 @@ Commands:
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede
   decisions report --consumer knowledge-ranking
-  coordination register-profile|capabilities|request-decision|resolve-auth|consume-auth|publish-observation|attention|send-relay|ack-relay|outstanding
+  coordination register-profile|capabilities|request-decision|resolve-auth|consume-auth|publish-observation|attention|attention-items|attention-dismiss|send-relay|ack-relay|outstanding
   questions ask|list|show|answer|sync|expire|acknowledge|wait
   help | --help
 

@@ -619,6 +619,29 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
     expect(entries.some((entry) => entry.reasonCode === 'notice-recorded' || entry.reasonCode === 'notice-refused')).toBe(false);
   });
 
+  it('test CT-2a: an owner-merge-parked run reads the PR while parked and enters merged once its PR merges at the lane head', async () => {
+    const parkedRecord = runRecord({
+      parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null },
+      parkCount: 1,
+    });
+    const harness = await makeHarness(parkedRecord, [collectedAttempt()], {
+      wireForgeRead: true,
+      wireWorkOrder: true,
+      wireAutoMerge: false,
+    });
+    await conduct(harness, 'merging', NOW);
+    await appendIntent(harness, acceptKey(), null, NOW);
+    await appendResult(harness, acceptKey(), 'completed', 'accepted', NOW);
+    await conduct(harness, 'parked', NOW);
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked).toBeNull();
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'conduct' && entry.state === 'merged')).toBe(true);
+    expect(harness.forgeReadRequests).toHaveLength(1);
+  });
+
   it('test 4: oneWayDoor (acceptance not accepted) parks one-way-door with a question; accepted does not park it', async () => {
     const harness = await mergingHarness({ wireParkNotice: true, autoMergeEnabled: false });
     // Re-assess the accepted head as rejected: the head stays the accepted head (so

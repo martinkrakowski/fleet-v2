@@ -120,8 +120,8 @@ export interface LaneRunFacts {
   readonly acceptance: 'none' | 'accepted' | 'rejected' | 'unknown';
   /** `CiStatePort` at `head12` (PC/K6). */
   readonly ci: 'pending' | 'passed' | 'failed' | 'unknown';
-  /** The run's PR as the forge reports it (K6, AM4b). */
-  readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string } | null;
+  /** The run's PR as the forge reports it (K6, AM4b); `containsLaneHead` is true when the PR head is, or contains as an ancestor, the collected lane head (CT-2a). */
+  readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string; readonly containsLaneHead: boolean } | null;
   /** The step whose latest result in this round at this head was a refusal (K1b). */
   readonly refusedStep: LaneRunKeyStep | null;
   /** Unreadable door or behind-ness reads true; `trainFree` and `policyGrant` per §3.6/AM4a (K6). */
@@ -582,7 +582,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (facts.pr === null) {
         return WAIT_FACTS_INCONSISTENT;
       }
-      if (facts.pr.state === 'merged' && facts.pr.head12 === facts.head12) {
+      if (facts.pr.state === 'merged' && (facts.pr.head12 === facts.head12 || facts.pr.containsLaneHead)) {
         return enter('merged');
       }
       if (facts.pr.state === 'merged' || facts.pr.state === 'closed') {
@@ -807,8 +807,18 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return decision;
     }
 
-    // G5: parked waits for a resume or the owner's answer.
+    // G5: parked waits for a resume or the owner's answer; the owner-merge park
+    // leaves by itself once its PR merges with the lane head (CT-2a).
     if (facts.state === 'parked') {
+      if (
+        record.parked !== null &&
+        record.parked.reason === 'owner-merge' &&
+        facts.pr !== null &&
+        facts.pr.state === 'merged' &&
+        (facts.pr.head12 === facts.head12 || facts.pr.containsLaneHead)
+      ) {
+        return enter('merged');
+      }
       return wait('parked');
     }
 

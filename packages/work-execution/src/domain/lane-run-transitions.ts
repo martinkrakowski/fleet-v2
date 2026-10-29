@@ -74,6 +74,12 @@ export function canEnterLaneRunState(from: string, to: string, parkedFrom?: stri
     return state !== 'parked';
   }
   if (state === 'parked') {
+    // CT-2a: the conductor's owner-merge park enters `merged` by itself when
+    // its PR merges with the lane head (the decider's G5), even though `merged`
+    // is not the park's recorded `parkedFrom`.
+    if (to === 'merged') {
+      return true;
+    }
     return parkedFrom !== null && parkedFrom !== undefined && to === parkedFrom;
   }
   return (LANE_RUN_EXITS[state] as readonly string[]).includes(to);

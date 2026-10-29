@@ -247,6 +247,9 @@ function makeHarness(options: HarnessOptions = {}) {
           }
         : { outcome: 'rejected' as const, reason: 'example brief rejection' };
     },
+    async previewBriefPackage() {
+      throw new Error('not used in this test');
+    },
   };
 
   const cancelPreparedAttempt = new CancelPreparedAttemptUseCase({ attemptRepo, journal: executionJournal });

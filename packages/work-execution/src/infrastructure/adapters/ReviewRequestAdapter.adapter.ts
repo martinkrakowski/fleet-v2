@@ -13,6 +13,7 @@ import {
   assessmentIdForAttempt,
 } from '@fleet/evidence-and-acceptance';
 import type {
+  EvidenceAssessmentRecord,
   EvidenceResultValue,
   InspectAcceptanceEvidencePort,
   InspectAcceptanceEvidenceResult,
@@ -22,17 +23,21 @@ import type {
   ReviewRejection,
 } from '@fleet/evidence-and-acceptance';
 import type {
+  FindLatestReceiptOfKindRequest,
+  FindLatestReceiptOfKindResult,
   FindReviewReceiptRequest,
   FindReviewReceiptResult,
   ReviewRequest,
   ReviewRequestPort,
   ReviewRequestResult,
+  ReviewReceiptOfKind,
   ReviewReceiptSummary,
   ReviewVerdict,
 } from '../../application/ports/out/ReviewRequestPort.out-port.js';
 
 const HEAD_PATTERN = /^[0-9a-f]{40}$/;
 const REVIEW_KIND_VALUES: readonly string[] = REVIEW_KINDS;
+const BRIEF_TEXT_MAX_BYTES = 64 * 1024;
 
 export interface ReviewRequestDelegates {
   readonly requestIndependentReview?: RequestIndependentReviewPort['requestIndependentReview'];
@@ -45,6 +50,11 @@ function isNonEmptyTrimmed(value: unknown): boolean {
 
 function isReviewKind(value: unknown): boolean {
   return typeof value === 'string' && REVIEW_KIND_VALUES.includes(value);
+}
+
+/** A brief longer than 64 KiB is a refusal, never a truncated forward. */
+function briefTextByteLength(briefText: string): number {
+  return Buffer.byteLength(briefText, 'utf8');
 }
 
 function isValidReviewRequest(request: ReviewRequest): boolean {
@@ -68,6 +78,14 @@ function isValidFindReceiptRequest(request: FindReviewReceiptRequest): boolean {
   );
 }
 
+function isValidFindLatestReceiptOfKindRequest(request: FindLatestReceiptOfKindRequest): boolean {
+  return (
+    isNonEmptyTrimmed(request.attemptId) &&
+    HEAD_PATTERN.test(request.candidateHeadSha) &&
+    isReviewKind(request.kind)
+  );
+}
+
 function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
   if (result === 'pass') {
     return 'passed';
@@ -82,11 +100,11 @@ function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
  * One shared summary builder used by requestReview and findReviewReceipt. The kind and request id are the
  * values the caller has already matched on the receipt; nothing is defaulted here.
  */
-function summaryOf(
+function receiptOfKindSummaryOf(
   receipt: ReviewReceiptRecord,
   kind: ReviewReceiptSummary['kind'],
-  requestId: string,
-): ReviewReceiptSummary {
+  requestId: string | null,
+): ReviewReceiptOfKind {
   return {
     receiptId: receipt.id,
     requestId,
@@ -102,6 +120,14 @@ function summaryOf(
       line: finding.line,
     })),
   };
+}
+
+function summaryOf(
+  receipt: ReviewReceiptRecord,
+  kind: ReviewReceiptSummary['kind'],
+  requestId: string,
+): ReviewReceiptSummary {
+  return { ...receiptOfKindSummaryOf(receipt, kind, requestId), requestId };
 }
 
 function mapRejection(rejection: ReviewRejection | undefined): ReviewRequestResult {
@@ -123,11 +149,46 @@ function mapRejection(rejection: ReviewRejection | undefined): ReviewRequestResu
   }
 }
 
+/** A receipt's completion instant; an unparseable timestamp sorts before every parseable one. */
+function completedAtMs(receipt: ReviewReceiptRecord): number {
+  const ms = Date.parse(receipt.completedAtIso);
+  return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
+}
+
+type AssessmentRead =
+  | { readonly outcome: 'assessment'; readonly assessment: EvidenceAssessmentRecord }
+  | { readonly outcome: 'not-found' }
+  | { readonly outcome: 'unavailable'; readonly reason: 'not-configured' | 'unreadable' };
+
 export class ReviewRequestAdapter implements ReviewRequestPort {
   constructor(private readonly delegates: ReviewRequestDelegates = {}) {}
 
+  /** The attempt's assessment through the inspection delegate: the one read both receipt lookups share. */
+  private async readAssessmentOf(attemptId: string): Promise<AssessmentRead> {
+    if (!this.delegates.inspectAcceptanceEvidence) {
+      return { outcome: 'unavailable', reason: 'not-configured' };
+    }
+    let inspected: InspectAcceptanceEvidenceResult;
+    try {
+      inspected = await this.delegates.inspectAcceptanceEvidence({
+        assessmentId: assessmentIdForAttempt(attemptId),
+      });
+    } catch {
+      return { outcome: 'unavailable', reason: 'unreadable' };
+    }
+    if (inspected.outcome === 'not-found' || inspected.assessment.attemptId !== attemptId) {
+      return { outcome: 'not-found' };
+    }
+    return { outcome: 'assessment', assessment: inspected.assessment };
+  }
+
   async requestReview(request: ReviewRequest): Promise<ReviewRequestResult> {
-    if (!isValidReviewRequest(request)) {
+    if (
+      !isValidReviewRequest(request) ||
+      (request.briefText !== undefined &&
+        (typeof request.briefText !== 'string' ||
+          briefTextByteLength(request.briefText) > BRIEF_TEXT_MAX_BYTES))
+    ) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
     if (!this.delegates.requestIndependentReview) {
@@ -145,6 +206,11 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         reviewerModel: request.reviewerModel,
         kind: request.kind,
         requestId: request.requestId,
+        // The frozen brief flows through only for a brief-check, so any other
+        // kind's transport call carries exactly the fields it carried before.
+        ...(request.kind === 'brief-check' && request.briefText !== undefined
+          ? { briefText: request.briefText }
+          : {}),
         ...(request.nowIso !== undefined ? { nowIso: request.nowIso } : {}),
       });
     } catch {
@@ -169,25 +235,11 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (!isValidFindReceiptRequest(request)) {
       return { outcome: 'unavailable', reason: 'invalid-request' };
     }
-    if (!this.delegates.inspectAcceptanceEvidence) {
-      return { outcome: 'unavailable', reason: 'not-configured' };
+    const read = await this.readAssessmentOf(request.attemptId);
+    if (read.outcome !== 'assessment') {
+      return read;
     }
-    let inspected: InspectAcceptanceEvidenceResult;
-    try {
-      inspected = await this.delegates.inspectAcceptanceEvidence({
-        assessmentId: assessmentIdForAttempt(request.attemptId),
-      });
-    } catch {
-      return { outcome: 'unavailable', reason: 'unreadable' };
-    }
-    if (inspected.outcome === 'not-found') {
-      return { outcome: 'not-found' };
-    }
-    const assessment = inspected.assessment;
-    if (assessment.attemptId !== request.attemptId) {
-      return { outcome: 'not-found' };
-    }
-    const matches = assessment.reviewReceipts.filter(
+    const matches = read.assessment.reviewReceipts.filter(
       (receipt) => receipt.requestId === request.requestId,
     );
     if (matches.length === 0) {
@@ -203,5 +255,38 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
     return { outcome: 'found', receipt: summaryOf(only, only.kind, request.requestId) };
+  }
+
+  async findLatestReceiptOfKind(
+    request: FindLatestReceiptOfKindRequest,
+  ): Promise<FindLatestReceiptOfKindResult> {
+    if (!isValidFindLatestReceiptOfKindRequest(request)) {
+      return { outcome: 'unavailable', reason: 'invalid-request' };
+    }
+    const read = await this.readAssessmentOf(request.attemptId);
+    if (read.outcome !== 'assessment') {
+      return read;
+    }
+    const candidates = read.assessment.reviewReceipts.filter(
+      (receipt): receipt is ReviewReceiptRecord & { kind: ReviewReceiptSummary['kind'] } =>
+        receipt.kind === request.kind &&
+        receipt.attemptId === request.attemptId &&
+        receipt.candidateHeadSha === request.candidateHeadSha,
+    );
+    if (candidates.length === 0) {
+      return { outcome: 'not-found' };
+    }
+    const [first, ...rest] = candidates;
+    let latest = first;
+    for (const candidate of rest) {
+      // Instants, not strings: precision or offset differences must not reorder receipts.
+      if (completedAtMs(candidate) >= completedAtMs(latest)) {
+        latest = candidate;
+      }
+    }
+    return {
+      outcome: 'found',
+      receipt: receiptOfKindSummaryOf(latest, latest.kind, latest.requestId ?? null),
+    };
   }
 }

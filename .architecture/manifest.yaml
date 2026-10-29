@@ -412,13 +412,14 @@ bounded_contexts:
             - ChangeSignalPort
             - ReviewRequestPort
             - CiStatePort
+            - ReviewAssessmentPort
             - AutoMergeSettingsPort
             - PolicyMergeGrantPort
             - AutoMergeOwnerRoutingPort
             - ConductorForgeGrantPort
             - LaneRunParkNoticePort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -454,8 +455,9 @@ bounded_contexts:
       ForgeReadPort: "Read one pull request's state by number or branch (open, merged or closed; head, base, merge time and merge commit) without mutating anything; a forge that cannot be read or a response that cannot be verified is unavailable, never a guess and never absence."
       AcceptanceAssessmentPort: "Consume the evidence context's exact-head assessment without importing its repositories or mutating its aggregates."
       AcceptanceEvidencePort: "Consume the evidence context's exact-head assessment to authorize merge actions."
-      ReviewRequestPort: "Request a read-only review of one kind (brief-check, code-review, pre-merge) at one exact head under the conductor's request id, and find the receipt recorded for a request id; a review that recorded nothing is no-receipt, a refusal before any review is refused, anything unestablished is unknown; reason codes only."
+      ReviewRequestPort: "Request a read-only review of one kind (brief-check, code-review, pre-merge) at one exact head under the conductor's request id, and find the receipt recorded for a request id; a review that recorded nothing is no-receipt, a refusal before any review is refused, anything unestablished is unknown, and read the latest receipt of one kind at a head; reason codes only."
       CiStatePort: "Read the CI state of one exact head (pending, passed, failed, unknown) with a reason code through the evidence context; unknown is never a pass."
+      ReviewAssessmentPort: "Open the evidence context's assessment for one attempt at one exact head before a conductor review; opened or existing is open, anything else is unavailable with a reason code."
       AutoMergeAttemptPort: "Merge one accepted attempt at its collected head under policy.autoMerge, or route the exception by the auto-merge plan's fixed and configured rules; off reads nothing else and writes nothing; unknown is never eligible, and a named one-way door or a high-risk lane without the opt-in is never merged by policy."
       AutoMergeSettingsPort: "Read a structural subset of the installation's policy.autoMerge, its revision and the forge mode on every call, so work-execution stays free of the installation package; unreadable is a value, never a default."
       PolicyMergeGrantPort: "Issue one merge-pr policy grant authorised by policy:autoMerge at the current setting revision, bound to the work order, attempt, head and acceptance receipt, through operator coordination; it never decides eligibility."
@@ -521,6 +523,10 @@ bounded_contexts:
         implements: CiStatePort
         integration: in-process
         delegates_to: [evidence-and-acceptance/InspectHeadCiStatePort]
+      - adapter: ReviewAssessmentAdapter
+        implements: ReviewAssessmentPort
+        integration: in-process
+        delegates_to: [evidence-and-acceptance/OpenEvidenceAssessmentPort]
       - adapter: PolicyMergeGrantAdapter
         implements: PolicyMergeGrantPort
         integration: in-process

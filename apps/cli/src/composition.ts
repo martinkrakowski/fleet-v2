@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
 import { newUlid } from './ulid.js';
+import { autoMergeSettingsFromLoad } from './auto-merge-settings.js';
 
 import {
   AcceptanceAssessmentAdapter,
@@ -30,6 +31,8 @@ import {
   ActionAuthorizationAdapter,
   AgyRunnerAdapter,
   AllowedSeatAdapter,
+  AutoMergeAttemptUseCase,
+  AutoMergeOwnerRoutingAdapter,
   AttemptArtifactAdapter,
   AttemptRepositoryAdapter,
   AttemptReviewLocator,
@@ -45,12 +48,14 @@ import {
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
   ForgeReadAdapter,
+  GatePredicateAdapter,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   LaneDiffCheckAdapter,
   ListUnregisteredProjectsUseCase,
   LocalExecutor,
   OpencodeDbUsageAdapter,
+  PolicyMergeGrantAdapter,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
   ProbeProjectUseCase,
@@ -60,6 +65,7 @@ import {
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
   RequestAttemptAcceptanceUseCase,
+  ReviewAssessmentAdapter,
   ReviewRequestAdapter,
   ReserveExecutionCapacityUseCase,
   RunnerForAttemptAdapter,
@@ -92,9 +98,12 @@ import {
   type AttemptRecord,
   type ExecutionRunnerHost,
   type ExecutorForRecordedHostResult,
+  type EvaluateAttemptGatePort,
+  type ForgeActionDelegate,
   type GhInvocationResult,
   type SubprocessRunner,
   type CommandExecutorPort,
+  type AutoMergeSettingsPort,
 } from '@fleet/work-execution';
 
 import {
@@ -110,6 +119,7 @@ import {
   IndependentReviewAdapter,
   InspectAcceptanceEvidenceUseCase,
   InspectHeadCiStateUseCase,
+  OpenEvidenceAssessmentUseCase,
   type OcmReviewTransportSpawn,
   OwnerDecisionAdapter,
   RecordFindingDispositionUseCase,
@@ -155,6 +165,7 @@ import {
   DecisionTransportAdapter,
   ExpireOwnerQuestionsUseCase,
   InspectConfiguredCapabilitiesUseCase,
+  IssuePolicyForgeGrantUseCase,
   InspectOutstandingCoordinationUseCase,
   InspectProjectProfileUseCase,
   InstallationReferenceAdapter,
@@ -182,9 +193,11 @@ import {
   type AttentionClock,
 } from '@fleet/operator-coordination';
 import {
+  loadInstallation,
   requireValidInstallationModel,
   type FleetInstallation,
   type FleetInstallationModel,
+  type LoadResult,
 } from '@fleet/installation';
 
 export interface FleetCliRuntimeOptions {
@@ -192,6 +205,11 @@ export interface FleetCliRuntimeOptions {
   readonly stateDir?: string;
   /** Parsed installation configuration. */
   readonly installation?: FleetInstallation;
+  /**
+   * Fresh installation loader for the auto-merge settings binding (AM5-3).
+   * Defaults to the real `loadInstallation()`; tests inject a temp file.
+   */
+  readonly loadInstallationForAutoMerge?: () => LoadResult;
   /** Agent, model and variant handed to the live runner subprocess. */
   readonly runnerAgent?: string;
   readonly runnerModel?: string;
@@ -229,6 +247,27 @@ export interface FleetCliRuntimeOptions {
   readonly adviceReadKey?: (path: string) => Promise<string>;
   /** Spy transport for the review subprocess (tests only); production runs ocm-run. */
   readonly reviewSpawn?: OcmReviewTransportSpawn;
+  /**
+   * Gate used by auto-merge and the conductor (tests only); production
+   * composes the gate predicates.
+   */
+  readonly attemptGate?: EvaluateAttemptGatePort;
+  /**
+   * Test-only delegate for the forge action's reviewed gh subprocess and the
+   * live head read; production binds the reviewed gh subprocess and the live
+   * head read.
+   */
+  readonly forgeActionDelegate?: Pick<ForgeActionDelegate, 'runGh' | 'verifyCurrentHeadSha'>;
+}
+
+/** The fields of a test-only forge delegate that were actually supplied; nothing else is overridden. */
+function forgeActionOverrides(
+  delegate: Pick<ForgeActionDelegate, 'runGh' | 'verifyCurrentHeadSha'> | undefined,
+): Partial<Pick<ForgeActionDelegate, 'runGh' | 'verifyCurrentHeadSha'>> {
+  return {
+    ...(delegate?.runGh === undefined ? {} : { runGh: delegate.runGh }),
+    ...(delegate?.verifyCurrentHeadSha === undefined ? {} : { verifyCurrentHeadSha: delegate.verifyCurrentHeadSha }),
+  };
 }
 
 export interface ResolvedRunnerSettings {
@@ -575,6 +614,8 @@ export interface FleetCliRuntime {
     readonly attemptOwnerDecision: AttemptOwnerDecisionAdapter;
     readonly requestVerification: RequestVerificationUseCase;
     readonly requestIndependentReview: RequestIndependentReviewUseCase;
+    /** Opens the pending evidence assessment for a conductor review (K5-E2); K5-6 composes it. */
+    readonly openEvidenceAssessment: OpenEvidenceAssessmentUseCase;
     readonly recordVerificationReceipt: RecordVerificationReceiptUseCase;
     readonly recordReviewReceipt: RecordReviewReceiptUseCase;
     readonly recordFindingDisposition: RecordFindingDispositionUseCase;
@@ -623,7 +664,9 @@ export interface FleetCliRuntime {
     readonly collectAttemptArtifacts: CollectAttemptArtifactsUseCase;
     readonly prepareFixAttempt: PrepareFixAttemptUseCase;
     readonly requestAttemptAcceptance: RequestAttemptAcceptanceUseCase;
+    readonly attemptGate: RequestAttemptAcceptanceUseCase;
     readonly executeAuthorizedForgeAction: ExecuteAuthorizedForgeActionUseCase;
+    readonly autoMergeAttempt: AutoMergeAttemptUseCase;
     readonly probeProject: ProbeProjectUseCase;
     readonly listUnregisteredProjects: ListUnregisteredProjectsUseCase;
   };
@@ -641,6 +684,8 @@ export interface FleetCliRuntime {
     readonly profileRead: ProjectProfileReadPort;
     /** The review step's port (PC); K5 composes it into the advance. */
     readonly reviewRequest: ReviewRequestAdapter;
+    /** Opens the evidence assessment before a conductor review (K5-3); K5-6 composes it into the advance. */
+    readonly reviewAssessment: ReviewAssessmentAdapter;
     /** CI per exact head (PC); K6 composes it. */
     readonly ciState: CiStateAdapter;
   };
@@ -688,6 +733,9 @@ function editOnlyModeOf(
 
 export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCliRuntime {
   const stateDir = options?.stateDir;
+  // AM5-3: the auto-merge settings binding re-reads a fresh installation on
+  // every call (A7); tests inject a loader over a temp file.
+  const autoMergeLoad = options?.loadInstallationForAutoMerge ?? (() => loadInstallation());
 
   // --- live runner / worktree host configuration -----------------------------
   // Resolution precedence: options.<x> ?? installation.<x> ?? <env read>.
@@ -867,6 +915,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       itemRepo: attentionItemRepository,
     }),
   };
+
+  // AM5-3: the auto-merge policy-grant use case over the shared coordination
+  // request store; the consumer adapters delegate to it through this root. The
+  // clock and ids are the root's own, as for every composition here.
+  const issuePolicyForgeGrantUseCase = new IssuePolicyForgeGrantUseCase({
+    requestRepo: coordinationRequestRepository,
+    clock: { nowIso: () => new Date().toISOString() },
+    ids: { newRequestId: newUlid, newGrantId: newUlid },
+  });
 
   // --- project profiles and probes (P6b) --------------------------------------
   // The execution context reads profiles and records probe receipts through
@@ -1121,6 +1178,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       reviewer: independentReview,
       archive: evidenceArchive,
       seatPolicy,
+    }),
+    openEvidenceAssessment: new OpenEvidenceAssessmentUseCase({
+      repo: evidenceAssessmentRepository,
     }),
     recordVerificationReceipt: new RecordVerificationReceiptUseCase({
       repo: evidenceAssessmentRepository,
@@ -1391,6 +1451,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     ...(forgeGithubSection !== undefined
       ? { repository: { owner: forgeGithubSection.owner, repo: forgeGithubSection.repo } }
       : {}),
+    // Test-only: a supplied gh runner or head read replaces the production one (spread last, so it wins).
+    ...forgeActionOverrides(options?.forgeActionDelegate),
     },
     forgeRead,
   );
@@ -1719,6 +1781,23 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     policy: installationModel?.policy,
   });
 
+  // GP-wire: the frozen gate for auto-merge and the conductor. It runs the predicates on the attempt's recorded
+  // host through the same recorded-host executor as artifact reads, journals each predicate, and checks the
+  // frozen brief's digest with the same SHA-256 prepare uses. `attempt accept` keeps its own instance.
+  const composedAttemptGate = new RequestAttemptAcceptanceUseCase({
+    attemptRepo: attemptRepository,
+    workOrderRepo: workOrderRepository,
+    acceptancePort: acceptanceAssessment,
+    artifactPort: attemptArtifact,
+    allowedSeats,
+    gatePredicates: new GatePredicateAdapter({
+      executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
+    }),
+    journal: executionJournal,
+    computeDigest: sha256HexDigest,
+  });
+  const attemptGate = options?.attemptGate ?? composedAttemptGate;
+
   const execution = {
     workOrderRepository,
     attemptRepository,
@@ -1832,6 +1911,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       artifactPort: attemptArtifact,
       allowedSeats,
     }),
+    attemptGate: composedAttemptGate,
     executeAuthorizedForgeAction: new ExecuteAuthorizedForgeActionUseCase({
       attemptRepo: attemptRepository,
       workOrderRepo: workOrderRepository,
@@ -1847,7 +1927,42 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       // Forge mode `none` (D6) refuses every forge action.
       ...(forgeMode === 'none' ? { forgeMode: 'none' as const } : {}),
     }),
+    // Assigned after the object closes (AM5-3): it depends on the use cases
+    // above, so it cannot be part of the literal.
+    autoMergeAttempt: undefined as unknown as AutoMergeAttemptUseCase,
   };
+
+  // AM5-3: compose the auto-merge attempt use case over the consumer adapters
+  // and the coordination use cases. The settings are re-read from a fresh
+  // installation on every call (A7); a throwing loader is an unreadable answer.
+  const autoMergeSettingsPort: AutoMergeSettingsPort = {
+    async readAutoMergeSettings() {
+      try {
+        return autoMergeSettingsFromLoad(autoMergeLoad());
+      } catch {
+        return { outcome: 'unreadable', reason: 'settings port threw' };
+      }
+    },
+  };
+  execution.autoMergeAttempt = new AutoMergeAttemptUseCase({
+    settings: autoMergeSettingsPort,
+    attemptRepo: attemptRepository,
+    workOrderRepo: workOrderRepository,
+    journal: executionJournal,
+    attemptOwnerDecisionPort: attemptOwnerDecision,
+    evaluateAttemptGate: attemptGate,
+    acceptancePort: acceptanceAssessment,
+    routing: new AutoMergeOwnerRoutingAdapter({
+      askOwnerQuestion: coordination.askOwnerQuestion,
+      recordAttentionItem: coordination.recordAttentionItem,
+      newQuestionId: () => 'question-' + newUlid(),
+    }),
+    policyMergeGrant: new PolicyMergeGrantAdapter({
+      issuePolicyForgeGrant: issuePolicyForgeGrantUseCase,
+    }),
+    executeForgeAction: execution.executeAuthorizedForgeAction,
+    nowIso: () => new Date().toISOString(),
+  });
 
   attemptLookup.inspectAttempt = execution.inspectAttempt;
 
@@ -1887,6 +2002,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         evidence.requestIndependentReview.requestIndependentReview(request),
       inspectAcceptanceEvidence: (request) =>
         evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence(request),
+    }),
+    reviewAssessment: new ReviewAssessmentAdapter({
+      openEvidenceAssessment: (request) =>
+        evidence.openEvidenceAssessment.openEvidenceAssessment(request),
     }),
     ciState: new CiStateAdapter({
       inspectHeadCiState: (request) => evidence.inspectHeadCiState.inspectHeadCiState(request),

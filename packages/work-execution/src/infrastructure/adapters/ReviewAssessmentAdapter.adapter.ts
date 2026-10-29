@@ -35,7 +35,10 @@ function isValidOpenRequest(request: OpenReviewAssessmentRequest): boolean {
     isNonEmptyTrimmed(request.projectId) &&
     isNonEmptyTrimmed(request.policyRevision) &&
     isNonEmptyTrimmed(request.implementerModel) &&
-    HEAD_PATTERN.test(request.candidateHeadSha)
+    HEAD_PATTERN.test(request.candidateHeadSha) &&
+    Array.isArray(request.requiredChecks) &&
+    request.requiredChecks.length > 0 &&
+    request.requiredChecks.every(isNonEmptyTrimmed)
   );
 }
 
@@ -70,14 +73,18 @@ export class ReviewAssessmentAdapter implements ReviewAssessmentPort {
         candidateHeadSha: request.candidateHeadSha,
         policyRevision: request.policyRevision,
         implementerModel: request.implementerModel,
-        requiredChecks: [],
+        requiredChecks: [...request.requiredChecks],
       });
     } catch {
       return { outcome: 'unavailable', reason: 'unreadable' };
     }
-    if (result.outcome === 'refused') {
+    // Only a known answer is trusted: opened and exists are open; anything else is unreadable, never open.
+    if (result?.outcome === 'refused') {
       return mapRefusal(result);
     }
-    return { outcome: 'open' };
+    if (result?.outcome === 'opened' || result?.outcome === 'exists') {
+      return { outcome: 'open' };
+    }
+    return { outcome: 'unavailable', reason: 'unreadable' };
   }
 }

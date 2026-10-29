@@ -9,6 +9,8 @@ export interface OpenReviewAssessmentRequest {
   readonly candidateHeadSha: string;
   readonly policyRevision: string;
   readonly implementerModel: string;
+  /** The brief's required checks; non-empty (the evidence context refuses an assessment with none). */
+  readonly requiredChecks: readonly string[];
 }
 
 export type OpenReviewAssessmentResult =

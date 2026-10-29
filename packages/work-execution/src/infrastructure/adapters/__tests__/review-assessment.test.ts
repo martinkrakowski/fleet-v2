@@ -26,6 +26,7 @@ function makeAdapterRequest(overrides: Partial<OpenReviewAssessmentRequest> = {}
     candidateHeadSha: HEAD,
     policyRevision: 'policy-example-1',
     implementerModel: 'example-provider/glm-5.3',
+    requiredChecks: ['build', 'test'],
     ...overrides,
   };
 }
@@ -40,7 +41,7 @@ function makeOpenFake(result: OpenEvidenceAssessmentResult) {
 }
 
 describe('ReviewAssessmentAdapter.openReviewAssessment', () => {
-  it('answers open for an opened assessment and sends the exact coordinates with empty requiredChecks', async () => {
+  it('answers open for an opened assessment and sends the exact coordinates and the brief required checks', async () => {
     const { calls, openEvidenceAssessment } = makeOpenFake({
       outcome: 'opened',
       assessmentId: 'assessment-attempt-example-1',
@@ -51,7 +52,7 @@ describe('ReviewAssessmentAdapter.openReviewAssessment', () => {
 
     expect(result).toEqual({ outcome: 'open' });
     expect(calls).toEqual([
-      { ...makeAdapterRequest(), requiredChecks: [] },
+      { ...makeAdapterRequest(), requiredChecks: ['build', 'test'] },
     ]);
   });
 
@@ -117,6 +118,8 @@ describe('ReviewAssessmentAdapter.openReviewAssessment', () => {
     ['empty project', { projectId: '' }],
     ['empty policy revision', { policyRevision: '  ' }],
     ['empty implementer model', { implementerModel: '' }],
+    ['no required checks', { requiredChecks: [] }],
+    ['an empty required check', { requiredChecks: ['build', ' '] }],
   ] as const)(
     'answers unavailable invalid-request for %s without calling the delegate',
     async (_name, overrides) => {
@@ -134,4 +137,16 @@ describe('ReviewAssessmentAdapter.openReviewAssessment', () => {
       expect(calls).toHaveLength(0);
     },
   );
+
+  it.each([
+    ['an unknown outcome', { outcome: 'surprise' }],
+    ['no answer', undefined],
+  ])('answers unavailable unreadable for %s, never open', async (_label, answer) => {
+    const openEvidenceAssessment = async () => answer as unknown as OpenEvidenceAssessmentResult;
+    const adapter = new ReviewAssessmentAdapter({ openEvidenceAssessment });
+
+    const result = await adapter.openReviewAssessment(makeAdapterRequest());
+
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'unreadable' });
+  });
 });

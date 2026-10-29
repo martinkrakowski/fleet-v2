@@ -137,7 +137,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       !isValidReviewRequest(request) ||
       (request.briefText !== undefined &&
         (typeof request.briefText !== 'string' ||
-          (request.kind === 'brief-check' && briefTextByteLength(request.briefText) > BRIEF_TEXT_MAX_BYTES)))
+          briefTextByteLength(request.briefText) > BRIEF_TEXT_MAX_BYTES))
     ) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }

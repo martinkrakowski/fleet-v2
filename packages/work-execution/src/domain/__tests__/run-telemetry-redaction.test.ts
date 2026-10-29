@@ -943,5 +943,8 @@ describe('redactionChecks (OT1r)', () => {
     expect(report.pass).toBe(true);
   });
 
-  it.todo('adapter errors name an error kind, never the endpoint, a header or a body (belongs with the sender, OT3b)');
+  // Adapter errors name an error kind, never the endpoint, a header, a token
+  // or a body: asserted against the real transport in
+  // src/infrastructure/adapters/__tests__/otlp-http-transport.test.ts
+  // (OT3b-2; a domain test must not import infrastructure).
 });

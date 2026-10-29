@@ -87,7 +87,9 @@ export class ExecutorForHost {
       ) {
         const matches = Object.entries(this.options.hosts).filter(
           ([, spec]) =>
-            spec.transport === "ssh" && (spec.sshAlias?.trim() ?? "") === alias,
+            spec.transport === "ssh" &&
+            (spec.sshAlias?.trim() ?? "") === alias &&
+            (spec.roles === undefined || spec.roles.includes("lane-runner")),
         );
         if (matches.length !== 1) {
           return {

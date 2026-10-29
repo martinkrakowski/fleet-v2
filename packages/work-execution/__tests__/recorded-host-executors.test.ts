@@ -143,6 +143,24 @@ describe("ExecutorForHost", () => {
     expect(legacy.calls).toBe(0);
   });
 
+  it("never resolves an alias-only record to an ssh host without the lane-runner role (Fable, Q2a)", () => {
+    const legacy = throwingLegacyExecutor();
+    const isolated = new ExecutorForHost({
+      hosts: {
+        "orchestrator-only": { transport: "ssh", sshAlias: "o.example", roles: ["orchestrator"] },
+      } as never,
+      legacyExecutor: legacy,
+    });
+    expect(
+      isolated.executorForRecordedHost(attemptRunner(null, "o.example", 4003)),
+    ).toEqual({
+      ok: false,
+      reason:
+        "the attempt names a host alias that matches no single installation host",
+    });
+    expect(legacy.calls).toBe(0);
+  });
+
   it("refuses an alias-only record whose alias matches no single installation host, never local", () => {
     const legacy = throwingLegacyExecutor();
     const isolated = new ExecutorForHost({ hosts, legacyExecutor: legacy });

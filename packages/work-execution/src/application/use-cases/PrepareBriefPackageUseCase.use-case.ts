@@ -18,6 +18,7 @@
  */
 
 import { parseSeatTool } from '../../domain/execution-records.js';
+import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateAllowedPathPrefix } from '../../domain/lane-diff-check.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isPlanSecretShaped } from '../../domain/lane-plan-sidecar.js';
@@ -54,6 +55,8 @@ export type PrepareBriefPackageUseCaseRequest = PrepareBriefPackageRequest & {
   readonly attemptId?: string;
   readonly worktreePath?: string;
   readonly handWrittenBriefPath?: string | null;
+  /** KF-8: the recorded host of the worktree; the placement writes there. */
+  readonly recordedHost?: AttemptRunnerRecord | null;
 };
 
 /**
@@ -417,6 +420,9 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     const verified = await deps.artifactPort.verifyIgnoredPaths({
       worktreePath: placementCheck.worktreePath,
       candidatePaths: ['.lane/brief.md', '.lane/brief-manifest.json', ...request.expectedArtifacts],
+      // KF-8: the verification runs on the worktree's recorded host, so a
+      // worktree on an ssh host is checked against that host's ignore rules.
+      ...(request.recordedHost !== undefined ? { recordedHost: request.recordedHost } : {}),
     });
     if (verified.outcome === 'not-ignored') {
       return {
@@ -504,6 +510,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       worktreePath: built.worktreePath,
       proseMarkdown: built.authored.brief.proseMarkdown,
       manifestJson: built.manifestJson,
+      ...(request.recordedHost !== undefined ? { recordedHost: request.recordedHost } : {}),
     });
     if (placed.outcome === 'refused') {
       return { outcome: 'rejected', reason: placed.reason };

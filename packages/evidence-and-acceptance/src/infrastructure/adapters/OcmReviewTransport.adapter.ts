@@ -131,6 +131,15 @@ const FORBIDDEN_COMMAND_CHARACTERS: ReadonlySet<string> = new Set([
   '[',
 ]);
 
+/** The kind prompt's statement that the embedded diff is the whole change. */
+export const KIND_PROMPT_DIFF_COMPLETE =
+  'The embedded diff above is the complete change between the base and the candidate head.';
+
+/** The kind prompt's tools sentence: read-only tools only, never a shell command. */
+export const KIND_PROMPT_TOOLS_ONLY =
+  'Inspect the candidate head only with the read-only tools (read, grep, glob, list). ' +
+  'Do not run any shell command: a bash or shell call voids this review whatever the command.';
+
 /** Longest shell command accepted as read-only proof. */
 export const MAX_REVIEW_COMMAND_LENGTH = 1000;
 
@@ -628,6 +637,7 @@ function buildKindReviewPrompt(
     sections.push(REVIEW_CHECKLIST);
   }
 
+  let diffEmbedded = false;
   if (typeof embeddedDiff === 'string' && embeddedDiff.trim() !== '') {
     if (Buffer.byteLength(embeddedDiff, 'utf8') > MAX_OCM_EMBEDDED_DIFF_BYTES) {
       sections.push('The diff was too large to embed; the read-only tools still work against the candidate head.');
@@ -638,15 +648,18 @@ function buildKindReviewPrompt(
         nonce,
       });
       sections.push(`Diff:\n${wrappedDiff}`);
+      diffEmbedded = true;
     }
   } else if (diffUnavailable === true) {
     sections.push('The diff was not available; the read-only tools still work against the candidate head.');
   }
 
+  // KF-14f: the prompt never invites the shell. A reviewer that ran one anyway
+  // voided its proof on any flag outside the grammar (the first forge-github
+  // run parked twice on `not-read-only`); the grammar stays as the safety net.
   sections.push(
-    'Inspect the candidate head with the read-only tools (read, grep, glob, list). ' +
-      'The diff is embedded above; if you must run a shell command, use only git diff/log/show/status, ' +
-      'grep, rg, ls, cat, sed -n or wc, never a command that writes.\n' + REVIEW_REPLY_CONTRACT,
+    (diffEmbedded ? KIND_PROMPT_DIFF_COMPLETE + ' ' : '') +
+      KIND_PROMPT_TOOLS_ONLY + '\n' + REVIEW_REPLY_CONTRACT,
   );
 
   return sections.join('\n\n');

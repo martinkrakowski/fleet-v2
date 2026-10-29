@@ -206,8 +206,21 @@ function stubMap(fixture: StubFixture): Readonly<Record<string, TelemetryAttribu
 
 interface StubSpan {
   readonly spanKind: TelemetrySpanKind;
+  /** The fixed §3.1 name the stub encoder emits for the span's kind. */
+  readonly name: string;
   readonly attributes: Readonly<Record<string, TelemetryAttributeValue>>;
 }
+
+/** The plan's fixed span name for each span kind, for the stub encoder (§3.1). */
+const PLAN_SPAN_NAME_BY_KIND: Record<TelemetrySpanKind, string> = {
+  CHAIN: 'lane-run',
+  AGENT: 'attempt',
+  LLM: 'usage',
+  GUARDRAIL: 'gate',
+  EVALUATOR: 'brief-check',
+  DECISION: 'accept',
+  TOOL: 'merge',
+};
 
 interface StubResource {
   readonly serviceVersion?: string;
@@ -244,6 +257,7 @@ function stubEncode(spans: readonly StubSpan[], resource: StubResource): Uint8Ar
         scopeSpans: [
           {
             spans: spans.map((span) => ({
+              name: span.name,
               attributes: [
                 { key: 'openinference.span.kind', value: { stringValue: span.spanKind } },
                 { key: 'fleet.telemetry.schema', value: { intValue: 1 } },
@@ -259,7 +273,7 @@ function stubEncode(spans: readonly StubSpan[], resource: StubResource): Uint8Ar
 }
 
 function spanOf(fixture: StubFixture): StubSpan {
-  return { spanKind: fixture.spanKind, attributes: stubMap(fixture) };
+  return { spanKind: fixture.spanKind, name: PLAN_SPAN_NAME_BY_KIND[fixture.spanKind], attributes: stubMap(fixture) };
 }
 
 /** The stub payload: one span per kind, with a metered LLM span. */
@@ -290,13 +304,55 @@ function handSpanAttributes(extra: readonly HandAttribute[]): readonly HandAttri
   ];
 }
 
+/** Extra span and scope shape knobs for hand-built payloads. */
+interface HandSpanExtras {
+  readonly name?: string;
+  readonly status?: unknown;
+  readonly events?: unknown;
+  readonly links?: unknown;
+  readonly scope?: { readonly name?: string; readonly attributes?: readonly HandAttribute[] };
+  readonly extra?: Readonly<Record<string, unknown>>;
+}
+
 /** A hand-written OTLP/JSON payload with one resource and one span. */
-function handPayload(resourceAttributes: readonly HandAttribute[], spanAttributes: readonly HandAttribute[], spanKind: string): Uint8Array {
+function handPayload(
+  resourceAttributes: readonly HandAttribute[],
+  spanAttributes: readonly HandAttribute[],
+  spanKind: string,
+  extras: HandSpanExtras = {},
+): Uint8Array {
+  const span: Record<string, unknown> = {
+    name: extras.name ?? 'attempt',
+    attributes: [{ key: 'openinference.span.kind', value: { stringValue: spanKind } }, ...spanAttributes],
+  };
+  if (extras.status !== undefined) {
+    span.status = extras.status;
+  }
+  if (extras.events !== undefined) {
+    span.events = extras.events;
+  }
+  if (extras.links !== undefined) {
+    span.links = extras.links;
+  }
+  if (extras.extra !== undefined) {
+    Object.assign(span, extras.extra);
+  }
+  const scopeSpansItem: Record<string, unknown> = { spans: [span] };
+  if (extras.scope !== undefined) {
+    const scope: Record<string, unknown> = {};
+    if (extras.scope.name !== undefined) {
+      scope.name = extras.scope.name;
+    }
+    if (extras.scope.attributes !== undefined) {
+      scope.attributes = extras.scope.attributes;
+    }
+    scopeSpansItem.scope = scope;
+  }
   const payload = {
     resourceSpans: [
       {
         resource: { attributes: resourceAttributes },
-        scopeSpans: [{ spans: [{ attributes: [{ key: 'openinference.span.kind', value: { stringValue: spanKind } }, ...spanAttributes] }] }],
+        scopeSpans: [scopeSpansItem],
       },
     ],
   };
@@ -327,6 +383,23 @@ function escapeJsonUnicode(text: string): string {
   return Array.from(text)
     .map((ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`)
     .join('');
+}
+
+/** Re-writes the canonical text so one value object carries a duplicate JSON key (`intValue` twice). */
+function withDuplicateJsonKey(bytes: Uint8Array): Uint8Array {
+  const text = new TextDecoder().decode(bytes);
+  const replaced = text.replace('"intValue":1', '"intValue":1,"intValue":1');
+  expect(replaced).not.toBe(text);
+  return new TextEncoder().encode(replaced);
+}
+
+/** Re-writes the canonical text so the double 2.0251027e7 appears as the exponent literal. */
+function withExponentNumber(bytes: Uint8Array): Uint8Array {
+  const text = new TextDecoder().decode(bytes);
+  const replaced = text.replace('20251027', '2.0251027e7');
+  expect(replaced).not.toBe(text);
+  expect(replaced).not.toContain('20251027');
+  return new TextEncoder().encode(replaced);
 }
 
 describe('redactionChecks (OT1r)', () => {
@@ -606,6 +679,98 @@ describe('redactionChecks (OT1r)', () => {
       expect(Object.isFrozen(entry)).toBe(true);
     }
     expect(report.checks.map((entry) => entry.check)).toEqual([...TELEMETRY_REDACTION_CHECKS]);
+  });
+
+  it('prompt text in an event attribute fails key-allow-list and values (OT1r-2)', () => {
+    const prompt = 'EXAMPLE PROMPT TEXT INSIDE AN EVENT ATTRIBUTE';
+    const bytes = handPayload(
+      RESOURCE_NAME_ONLY,
+      handSpanAttributes([]),
+      'AGENT',
+      { events: [{ name: 'state.entered', attributes: [{ key: 'input.value', value: { stringValue: prompt } }] }] },
+    );
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'payload-parses').pass).toBe(true);
+    expect(check(report, 'key-allow-list').pass).toBe(false);
+    expect(check(report, 'values').pass).toBe(false);
+    expectNoLeak(report, [prompt, 'input.value']);
+  });
+
+  it('a scope attribute fails key-allow-list and values (OT1r-2)', () => {
+    const bytes = handPayload(
+      RESOURCE_NAME_ONLY,
+      handSpanAttributes([]),
+      'AGENT',
+      { scope: { attributes: [{ key: 'service.version', value: { stringValue: '1.0.0' } }] } },
+    );
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'payload-parses').pass).toBe(true);
+    expect(check(report, 'key-allow-list').pass).toBe(false);
+    expect(check(report, 'values').pass).toBe(false);
+  });
+
+  it('an unknown span name fails values (OT1r-2)', () => {
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([]), 'AGENT', { name: 'not-a-plan-span-name' });
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'payload-parses').pass).toBe(true);
+    expect(check(report, 'key-allow-list').pass).toBe(true);
+    expect(check(report, 'values').pass).toBe(false);
+    expectNoLeak(report, ['not-a-plan-span-name']);
+  });
+
+  it('a status.message fails values (OT1r-2)', () => {
+    const message = 'EXAMPLE STATUS MESSAGE TEXT';
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([]), 'AGENT', { status: { code: 2, message } });
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'payload-parses').pass).toBe(true);
+    expect(check(report, 'values').pass).toBe(false);
+    expectNoLeak(report, [message]);
+  });
+
+  it('a links field fails payload-parses (OT1r-2)', () => {
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([]), 'AGENT', { links: [] });
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'payload-parses').pass).toBe(false);
+  });
+
+  it('an unknown field on a span fails payload-parses (OT1r-2)', () => {
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([]), 'AGENT', { extra: { unexpectedField: 'x' } });
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'payload-parses').pass).toBe(false);
+    expectNoLeak(report, ['unexpectedField', 'x']);
+  });
+
+  it('a duplicate attribute key fails values (OT1r-2)', () => {
+    const freeText = 'FREE TEXT FIRST VALUE OF THE DUPLICATE KEY';
+    const bytes = handPayload(
+      RESOURCE_NAME_ONLY,
+      [
+        { key: 'fleet.telemetry.schema', value: { intValue: 1 } },
+        { key: 'fleet.run.id', value: { stringValue: RUN_ID } },
+        { key: 'fleet.seat.model', value: { stringValue: freeText } },
+        { key: 'fleet.seat.model', value: { stringValue: 'example-model' } },
+      ],
+      'AGENT',
+    );
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'payload-parses').pass).toBe(true);
+    expect(check(report, 'key-allow-list').pass).toBe(true);
+    expect(check(report, 'values').pass).toBe(false);
+    expectNoLeak(report, [freeText]);
+  });
+
+  it('a duplicate JSON key inside a value object fails payload-parses (OT1r-2)', () => {
+    const bytes = withDuplicateJsonKey(handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([]), 'AGENT'));
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'payload-parses').pass).toBe(false);
+  });
+
+  it('a numeric canary written as 2.0251027e7 fails canaries (OT1r-2)', () => {
+    const bytes = withExponentNumber(
+      handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.usage.wall_seconds', value: { doubleValue: 2.0251027e7 } }]), 'AGENT'),
+    );
+    const report = redactionChecks(bytes, ['20251027']);
+    expect(check(report, 'canaries').pass).toBe(false);
   });
 
   it.todo('adapter errors name an error kind, never the endpoint, a header or a body (belongs with the sender, OT3b)');

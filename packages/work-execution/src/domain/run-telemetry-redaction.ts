@@ -7,6 +7,18 @@
  * frozen and the function never throws: any internal error fails every check.
  * Pure: no `node:*`, no clock, no I/O, and nothing secret is read
  * (`TextDecoder` is a global).
+ *
+ * Strict OTLP/JSON decoding (OT1r-2): every object the decoder walks accepts
+ * only the fields the plan's payload subset names, so a payload that smuggles
+ * text in a field the checks ignore fails `payload-parses`. Only canonical JSON
+ * is accepted: the encoder (OT3a) emits `JSON.stringify` output, so the parsed
+ * payload must re-serialise to exactly the input text (duplicate JSON keys
+ * collapse in `JSON.parse` and fail here). Every attribute carrier — resource,
+ * scope, span and span event — is checked; scope and event attributes must be
+ * empty, a span event is named `state.entered`, a span name is one of the
+ * fixed §3.1 names, and `status.message` is absent or empty. Duplicate
+ * attribute keys fail the entry. Decoded numbers are pushed as strings so a
+ * numeric canary is seen.
  */
 
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
@@ -40,23 +52,29 @@ export interface TelemetryRedactionReport {
 /** A decoded OTLP attribute value: the shapes the payload format allows. */
 type DecodedAttributeValue = string | number | readonly string[];
 
-/** One walked resource or span: its decoded attribute map. */
+/**
+ * One walked attribute carrier of the payload: a resource, a scope, a span or a
+ * span event. key-allow-list and values run over every carrier.
+ */
 interface DecodedEntry {
-  readonly kind: 'resource' | 'span';
-  /** The span's decoded name; resources carry no name, so ''. */
+  readonly kind: 'resource' | 'scope' | 'span' | 'event';
+  /** The carrier's decoded name; resources carry no name, so ''. */
   readonly name: string;
   readonly attributes: ReadonlyMap<string, DecodedAttributeValue>;
   /** False when any attribute value of the entry could not be decoded. */
   readonly decoded: boolean;
+  /** False only for a span whose `status.message` is present and non-empty. */
+  readonly statusMessageEmpty: boolean;
 }
 
 interface DecodedPayload {
   readonly text: string;
   readonly entries: readonly DecodedEntry[];
   /**
-   * Every decoded string the parsed payload carries, object keys included, from
-   * every field (scope names, event names and fields the walk above ignores), so
-   * a JSON escape cannot hide a canary or a secret from the checks (OT1r, Luna).
+   * Every decoded string the parsed payload carries, object keys and decoded
+   * numbers included, from every field (scope names, event names and fields
+   * the walk above ignores), so a JSON escape or a numeric literal cannot hide
+   * a canary or a secret from the checks (OT1r, Luna).
    */
   readonly strings: readonly string[];
 }
@@ -64,7 +82,7 @@ interface DecodedPayload {
 /** Upper bound on decoded strings walked; a larger payload fails the checks. */
 const MAX_DECODED_STRINGS = 200_000;
 
-/** Every string value and object key in a JSON.parse result, or null past the bound. */
+/** Every string value, object key and decoded number in a JSON.parse result, or null past the bound. */
 function allDecodedStrings(parsed: unknown): string[] | null {
   const out: string[] = [];
   const stack: unknown[] = [parsed];
@@ -72,6 +90,8 @@ function allDecodedStrings(parsed: unknown): string[] | null {
     const value = stack.pop();
     if (typeof value === 'string') {
       out.push(value);
+    } else if (typeof value === 'number') {
+      out.push(String(value));
     } else if (Array.isArray(value)) {
       for (let i = 0; i < value.length; i += 1) {
         stack.push(value[i]);
@@ -116,6 +136,46 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
+/** True when `value` is a plain object whose own keys are all in `fields`. */
+function hasOnlyKnownFields(value: unknown, fields: readonly string[]): value is Record<string, unknown> {
+  if (!isPlainObject(value)) {
+    return false;
+  }
+  return Object.keys(value).every((key) => (fields as readonly string[]).includes(key));
+}
+
+/** The known OTLP/JSON fields of the plan's payload subset, per object kind. */
+const PAYLOAD_ROOT_FIELDS = ['resourceSpans'] as const;
+const RESOURCE_SPANS_ITEM_FIELDS = ['resource', 'scopeSpans'] as const;
+const RESOURCE_FIELDS = ['attributes'] as const;
+const SCOPE_SPANS_ITEM_FIELDS = ['scope', 'spans'] as const;
+const SCOPE_FIELDS = ['name', 'version', 'attributes'] as const;
+const SPAN_FIELDS = [
+  'traceId', 'spanId', 'parentSpanId', 'name', 'kind', 'startTimeUnixNano', 'endTimeUnixNano',
+  'attributes', 'events', 'status',
+] as const;
+const EVENT_FIELDS = ['timeUnixNano', 'name', 'attributes'] as const;
+const STATUS_FIELDS = ['code', 'message'] as const;
+const ATTRIBUTE_ENTRY_FIELDS = ['key', 'value'] as const;
+const VALUE_OBJECT_FIELDS = ['stringValue', 'intValue', 'doubleValue', 'arrayValue'] as const;
+const ARRAY_VALUE_FIELDS = ['values'] as const;
+const ARRAY_VALUE_ELEMENT_FIELDS = ['stringValue'] as const;
+
+/**
+ * The fixed span names of plan §3.1 (the trace hierarchy node labels).
+ * `run-telemetry.ts` (the mapper) is a later lane and does not exist yet, so
+ * the list is defined here from §3.1 rather than imported. A span name
+ * outside this list fails `values`.
+ */
+export const TELEMETRY_PLAN_SPAN_NAMES = [
+  'lane-run', 'round', 'prepare', 'dispatch', 'attempt', 'usage', 'collect',
+  'reconcile', 'stop', 'gate', 'brief-check', 'code-review', 'pre-merge',
+  'accept', 'open-pr', 'push', 'merge', 'ci-wait', 'park', 'stop-request',
+] as const;
+
+/** The one span event name the plan sends (§3.1): `state.entered`, state name only. */
+const TELEMETRY_STATE_ENTERED_EVENT_NAME = 'state.entered';
+
 const INT_TEXT_PATTERN = /^-?[0-9]+$/;
 
 /** A decimal string or number that is a safe integer, or null. */
@@ -137,10 +197,7 @@ function decodeDoubleValue(raw: unknown): number | null {
 
 /** `arrayValue`'s `values` as a string array, or null (plan: `{ stringValue }` elements). */
 function decodeStringArray(value: unknown): readonly string[] | null {
-  if (!isPlainObject(value)) {
-    return null;
-  }
-  if (Object.keys(value).length !== 1 || !hasOwnData(value, 'values')) {
+  if (!hasOnlyKnownFields(value, ARRAY_VALUE_FIELDS) || !hasOwnData(value, 'values')) {
     return null;
   }
   const values = ownData(value, 'values');
@@ -149,10 +206,7 @@ function decodeStringArray(value: unknown): readonly string[] | null {
   }
   const decoded: string[] = [];
   for (const element of values) {
-    if (!isPlainObject(element)) {
-      return null;
-    }
-    if (Object.keys(element).length !== 1 || !hasOwnData(element, 'stringValue')) {
+    if (!hasOnlyKnownFields(element, ARRAY_VALUE_ELEMENT_FIELDS) || !hasOwnData(element, 'stringValue')) {
       return null;
     }
     const text = ownData(element, 'stringValue');
@@ -166,7 +220,7 @@ function decodeStringArray(value: unknown): readonly string[] | null {
 
 /** One OTLP attribute value: exactly one of the four supported fields, or null. */
 function decodeAttributeValue(value: unknown): DecodedAttributeValue | null {
-  if (!isPlainObject(value)) {
+  if (!hasOnlyKnownFields(value, VALUE_OBJECT_FIELDS)) {
     return null;
   }
   if (Object.keys(value).length !== 1) {
@@ -187,10 +241,7 @@ function decodeAttributeValue(value: unknown): DecodedAttributeValue | null {
 
 /** One attribute of the payload: a string key and one decodable value, or null. */
 function readAttribute(entry: unknown): { readonly key: string; readonly value: DecodedAttributeValue } | null {
-  if (!isPlainObject(entry)) {
-    return null;
-  }
-  if (Object.keys(entry).length !== 2 || !hasOwnData(entry, 'key') || !hasOwnData(entry, 'value')) {
+  if (!hasOnlyKnownFields(entry, ATTRIBUTE_ENTRY_FIELDS) || !hasOwnData(entry, 'key') || !hasOwnData(entry, 'value')) {
     return null;
   }
   const key = ownData(entry, 'key');
@@ -204,7 +255,11 @@ function readAttribute(entry: unknown): { readonly key: string; readonly value: 
   return { key, value };
 }
 
-/** An `attributes[]` list into a map; `decoded` is false when any value is unsupported. */
+/**
+ * An `attributes[]` list into a map; `decoded` is false when any value is
+ * unsupported or any key repeats (the first value wins, but a duplicate key
+ * fails the entry, so free text after or before a valid value cannot pass).
+ */
 function readAttributes(list: unknown): { readonly attributes: ReadonlyMap<string, DecodedAttributeValue>; readonly decoded: boolean } {
   const attributes = new Map<string, DecodedAttributeValue>();
   if (!Array.isArray(list)) {
@@ -217,40 +272,111 @@ function readAttributes(list: unknown): { readonly attributes: ReadonlyMap<strin
       decoded = false;
       continue;
     }
+    if (attributes.has(attribute.key)) {
+      decoded = false;
+      continue;
+    }
     attributes.set(attribute.key, attribute.value);
   }
   return { attributes, decoded };
 }
 
-/** One span of the payload, or null when the shape is wrong. */
-function readSpan(span: unknown): DecodedEntry | null {
-  if (!isPlainObject(span) || !hasOwnData(span, 'attributes')) {
-    return null;
+/** One span event of the payload, appended as an `event` entry; false on a shape failure. */
+function readEvent(event: unknown, entries: DecodedEntry[]): boolean {
+  if (!hasOnlyKnownFields(event, EVENT_FIELDS)) {
+    return false;
+  }
+  const name = ownData(event, 'name');
+  let attributes: ReadonlyMap<string, DecodedAttributeValue> = new Map();
+  let decoded = true;
+  if (hasOwnData(event, 'attributes')) {
+    const read = readAttributes(ownData(event, 'attributes'));
+    attributes = read.attributes;
+    decoded = read.decoded;
+  }
+  entries.push({ kind: 'event', name: typeof name === 'string' ? name : '', attributes, decoded, statusMessageEmpty: true });
+  return true;
+}
+
+/** One span of the payload, appended as a `span` entry with its events; false on a shape failure. */
+function readSpan(span: unknown, entries: DecodedEntry[]): boolean {
+  if (!hasOnlyKnownFields(span, SPAN_FIELDS) || !hasOwnData(span, 'attributes')) {
+    return false;
   }
   const read = readAttributes(ownData(span, 'attributes'));
   const name = ownData(span, 'name');
-  return { kind: 'span', name: typeof name === 'string' ? name : '', attributes: read.attributes, decoded: read.decoded };
+  let statusMessageEmpty = true;
+  if (hasOwnData(span, 'status')) {
+    const status = ownData(span, 'status');
+    if (!hasOnlyKnownFields(status, STATUS_FIELDS)) {
+      return false;
+    }
+    const message = ownData(status, 'message');
+    if (typeof message !== 'string') {
+      return false;
+    }
+    statusMessageEmpty = message.length === 0;
+  }
+  entries.push({
+    kind: 'span',
+    name: typeof name === 'string' ? name : '',
+    attributes: read.attributes,
+    decoded: read.decoded,
+    statusMessageEmpty,
+  });
+  if (hasOwnData(span, 'events')) {
+    const events = ownData(span, 'events');
+    if (!Array.isArray(events)) {
+      return false;
+    }
+    for (const event of events) {
+      if (!readEvent(event, entries)) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
-/** Appends every span of one `scopeSpans` element; false on a shape failure. */
+/** One `scope` object of a `scopeSpans` element, appended as a `scope` entry; false on a shape failure. */
+function readScope(scope: unknown, entries: DecodedEntry[]): boolean {
+  if (!hasOnlyKnownFields(scope, SCOPE_FIELDS)) {
+    return false;
+  }
+  const name = ownData(scope, 'name');
+  let attributes: ReadonlyMap<string, DecodedAttributeValue> = new Map();
+  let decoded = true;
+  if (hasOwnData(scope, 'attributes')) {
+    const read = readAttributes(ownData(scope, 'attributes'));
+    attributes = read.attributes;
+    decoded = read.decoded;
+  }
+  entries.push({ kind: 'scope', name: typeof name === 'string' ? name : '', attributes, decoded, statusMessageEmpty: true });
+  return true;
+}
+
+/** Appends the scope and every span of one `scopeSpans` element; false on a shape failure. */
 function readScopeSpans(scopeSpans: unknown, entries: DecodedEntry[]): boolean {
   if (!Array.isArray(scopeSpans)) {
     return false;
   }
   for (const scopeSpan of scopeSpans) {
-    if (!isPlainObject(scopeSpan) || !hasOwnData(scopeSpan, 'spans')) {
+    if (!hasOnlyKnownFields(scopeSpan, SCOPE_SPANS_ITEM_FIELDS) || !hasOwnData(scopeSpan, 'spans')) {
       return false;
+    }
+    if (hasOwnData(scopeSpan, 'scope')) {
+      if (!readScope(ownData(scopeSpan, 'scope'), entries)) {
+        return false;
+      }
     }
     const spans = ownData(scopeSpan, 'spans');
     if (!Array.isArray(spans)) {
       return false;
     }
     for (const span of spans) {
-      const entry = readSpan(span);
-      if (entry === null) {
+      if (!readSpan(span, entries)) {
         return false;
       }
-      entries.push(entry);
     }
   }
   return true;
@@ -258,11 +384,11 @@ function readScopeSpans(scopeSpans: unknown, entries: DecodedEntry[]): boolean {
 
 /** One `resourceSpans[]` element's resource entry; false on a shape failure. */
 function readResource(resource: unknown, entries: DecodedEntry[]): boolean {
-  if (!isPlainObject(resource) || !hasOwnData(resource, 'attributes')) {
+  if (!hasOnlyKnownFields(resource, RESOURCE_FIELDS) || !hasOwnData(resource, 'attributes')) {
     return false;
   }
   const read = readAttributes(ownData(resource, 'attributes'));
-  entries.push({ kind: 'resource', name: '', attributes: read.attributes, decoded: read.decoded });
+  entries.push({ kind: 'resource', name: '', attributes: read.attributes, decoded: read.decoded, statusMessageEmpty: true });
   return true;
 }
 
@@ -273,7 +399,7 @@ function readResourceSpans(resourceSpans: unknown): DecodedEntry[] | null {
   }
   const entries: DecodedEntry[] = [];
   for (const element of resourceSpans) {
-    if (!isPlainObject(element) || !hasOwnData(element, 'resource') || !hasOwnData(element, 'scopeSpans')) {
+    if (!hasOnlyKnownFields(element, RESOURCE_SPANS_ITEM_FIELDS) || !hasOwnData(element, 'resource') || !hasOwnData(element, 'scopeSpans')) {
       return null;
     }
     if (!readResource(ownData(element, 'resource'), entries)) {
@@ -286,12 +412,21 @@ function readResourceSpans(resourceSpans: unknown): DecodedEntry[] | null {
   return entries;
 }
 
-/** Decodes the UTF-8 OTLP/JSON payload, or null when it does not parse. */
+/**
+ * Decodes the UTF-8 OTLP/JSON payload, or null when it does not parse.
+ * Only canonical JSON is accepted: the encoder (OT3a) emits `JSON.stringify`
+ * output, so the parsed payload must re-serialise to exactly the input text —
+ * a duplicate JSON object key (which `JSON.parse` collapses) or any other
+ * non-canonical text fails here.
+ */
 function decodePayload(payloadBytes: Uint8Array): DecodedPayload | null {
   try {
     const text = new TextDecoder('utf-8', { fatal: true }).decode(payloadBytes);
     const parsed: unknown = JSON.parse(text);
-    if (!isPlainObject(parsed) || !hasOwnData(parsed, 'resourceSpans')) {
+    if (JSON.stringify(parsed) !== text) {
+      return null;
+    }
+    if (!hasOnlyKnownFields(parsed, PAYLOAD_ROOT_FIELDS) || !hasOwnData(parsed, 'resourceSpans')) {
       return null;
     }
     const entries = readResourceSpans(ownData(parsed, 'resourceSpans'));
@@ -321,7 +456,7 @@ function attributeValuesContain(entry: DecodedEntry, canary: string): boolean {
   return false;
 }
 
-/** True when any decoded string the entry carries contains the canary (values, keys, span name). */
+/** True when any decoded string the entry carries contains the canary (values, keys, name). */
 function entryContainsCanary(entry: DecodedEntry, canary: string): boolean {
   if (entry.name.includes(canary)) {
     return true;
@@ -381,15 +516,20 @@ function checkKeyAllowList(payload: DecodedPayload | null): { readonly pass: boo
   let offendingSpans = 0;
   for (const entry of payload.entries) {
     let entryPass = true;
-    for (const key of entry.attributes.keys()) {
-      if (entry.kind === 'resource') {
+    if (entry.kind === 'scope' || entry.kind === 'event') {
+      // Scope and event attributes must be empty; any key fails.
+      entryPass = entry.attributes.size === 0;
+    } else if (entry.kind === 'resource') {
+      for (const key of entry.attributes.keys()) {
         if (!(RUN_TELEMETRY_RESOURCE_KEYS as readonly string[]).includes(key)) {
           entryPass = false;
         }
-        continue;
       }
-      if (isNeverSentTelemetryKey(key) || !Object.hasOwn(RUN_TELEMETRY_ATTRIBUTES, key)) {
-        entryPass = false;
+    } else {
+      for (const key of entry.attributes.keys()) {
+        if (isNeverSentTelemetryKey(key) || !Object.hasOwn(RUN_TELEMETRY_ATTRIBUTES, key)) {
+          entryPass = false;
+        }
       }
     }
     if (!entryPass) {
@@ -429,9 +569,16 @@ function attributesRecordOf(entry: DecodedEntry): Readonly<Record<string, unknow
   return record;
 }
 
-/** Every span attribute value passes its rule (plan §3.2 test 4). */
+/**
+ * Every span attribute value passes its rule, the span name is one of the
+ * fixed §3.1 names, and `status.message` is absent or empty (plan §3.2 test 4;
+ * the plan sends codes only).
+ */
 function checkSpanValues(entry: DecodedEntry): boolean {
-  if (!entry.decoded) {
+  if (!entry.decoded || !entry.statusMessageEmpty) {
+    return false;
+  }
+  if (!(TELEMETRY_PLAN_SPAN_NAMES as readonly string[]).includes(entry.name)) {
     return false;
   }
   const spanKind = spanKindOf(entry);
@@ -456,6 +603,16 @@ function checkSpanValues(entry: DecodedEntry): boolean {
     }
   }
   return true;
+}
+
+/** Scope attributes must be empty (the plan sends none). */
+function checkScopeValues(entry: DecodedEntry): boolean {
+  return entry.decoded && entry.attributes.size === 0;
+}
+
+/** Event attributes must be empty and the event name must be `state.entered` (§3.1). */
+function checkEventValues(entry: DecodedEntry): boolean {
+  return entry.decoded && entry.attributes.size === 0 && entry.name === TELEMETRY_STATE_ENTERED_EVENT_NAME;
 }
 
 /** The resource value rules (plan §3.2 "Resource attributes"). */
@@ -497,7 +654,16 @@ function checkValues(payload: DecodedPayload | null): { readonly pass: boolean; 
   let pass = true;
   let offendingSpans = 0;
   for (const entry of payload.entries) {
-    const entryPass = entry.kind === 'resource' ? checkResourceValues(entry) : checkSpanValues(entry);
+    let entryPass = false;
+    if (entry.kind === 'resource') {
+      entryPass = checkResourceValues(entry);
+    } else if (entry.kind === 'scope') {
+      entryPass = checkScopeValues(entry);
+    } else if (entry.kind === 'event') {
+      entryPass = checkEventValues(entry);
+    } else {
+      entryPass = checkSpanValues(entry);
+    }
     if (!entryPass) {
       pass = false;
       offendingSpans += 1;
@@ -575,9 +741,11 @@ function failedReport(): TelemetryRedactionReport {
 
 /**
  * Run the redaction checks over an encoded OTLP/JSON payload (plan §3.2,
- * §3.8): the payload must parse; no canary may appear; every key must be
- * allow-listed; every value must pass its rule; nothing may be secret-shaped.
- * The report carries only check names, booleans and counts, and is frozen.
+ * §3.8): the payload must parse strictly and canonically; no canary may
+ * appear; every key must be allow-listed; every value must pass its rule and
+ * the carrier shape rules (scope and event attributes empty, span names fixed,
+ * `status.message` empty); nothing may be secret-shaped. The report carries
+ * only check names, booleans and counts, and is frozen.
  */
 export function redactionChecks(payloadBytes: Uint8Array, canaryValues: readonly string[]): TelemetryRedactionReport {
   try {

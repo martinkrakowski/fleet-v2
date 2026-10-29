@@ -22,6 +22,7 @@ import type {
   ProjectProbeRequest,
 } from "../../application/ports/out/ProjectProbePort.out-port.js";
 import type { ExecutorForRecordedHostResult } from "./ExecutorForHost.helper.js";
+import { resolvePhysicalPath } from "./ResolvePhysicalPath.helper.js";
 
 function compareCodeUnits(a: string, b: string): number {
   if (a < b) return -1;
@@ -199,7 +200,11 @@ export class ProjectProbeAdapter implements ProjectProbePort {
     let clonePassed = false;
     if (workTree.exitCode === 0) {
       const toplevel = workTree.stdout.trim();
-      if (toplevel === clone.path) {
+      // A symlinked clone (macOS `/var/folders/...` → `/private/var/...`) has
+      // `--show-toplevel` print the physical path while the profile holds the
+      // path as given; accept either form. Unresolvable falls back to plain.
+      const physicalClonePath = await resolvePhysicalPath(executor, clone.path, this.timeoutMs);
+      if (toplevel === clone.path || (physicalClonePath !== null && toplevel === physicalClonePath)) {
         checks.push(this.check("clone-is-work-tree", host, "pass", `git work tree at ${clone.path}`));
         clonePassed = true;
       } else {

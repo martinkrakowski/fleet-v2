@@ -12,7 +12,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 SCRIPT=${OCM_TEST_SCRIPT:-$here/bin/ocm-run}
 RUNSH=${OCM_TEST_SH:-sh}
 T=$(mktemp -d "${TMPDIR:-/tmp}/ocm-run-test.XXXXXX") || exit 1
-mkdir -p "$T/bin" "$T/sessions"
+mkdir -p "$T/bin" "$T/sessions" "$T/usage"
 : > "$T/aborts"; : > "$T/args.log"
 fails=0
 ok() { printf 'ok   %s\n' "$1"; }
@@ -86,8 +86,17 @@ class H(http.server.BaseHTTPRequestHandler):
                 if kind in ("idle", "created"): continue
                 out.append('"%s":{"type":"%s"}' % (n, kind))
             return self.send(200, '{"data":{' + ",".join(out) + '}}')
+        if u.path.startswith("/api/session/ses_") and u.path.endswith("/message") and os.path.exists(os.path.join(T, "v2")):
+            # --usage: "$T/usage/<id>.messages" is the message list; none means 404.
+            mf = os.path.join(T, "usage", u.path.split("/")[-2] + ".messages")
+            if not os.path.exists(mf): return self.send(404, '{"error":"not found"}')
+            return self.send(200, open(mf).read())
         if u.path.startswith("/api/session/ses_") and os.path.exists(os.path.join(T, "v2")):
             sid = u.path.split("/")[-1]
+            if os.path.exists(os.path.join(T, "usage-broken")): return self.send(500, "boom", "text/plain")
+            # --usage: "$T/usage/<id>" is the whole session body when present.
+            uf = os.path.join(T, "usage", sid)
+            if os.path.exists(uf): return self.send(200, open(uf).read())
             sf = os.path.join(T, "sessions", sid)
             if not os.path.exists(sf): return self.send(404, '{"error":"not found"}')
             kind, where = open(sf).read().split("\n")[:2]
@@ -349,7 +358,7 @@ kill_fake_clients() {
     fake_alive "$p" && kill -9 "$p" 2>/dev/null
   done
 }
-clear_all() { kill_fake_clients; rm -rf "$T/proc"; rm -f "$T/sessions"/* "$T/broken" "$T/broken-once" "$T/active-seq" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/v2-session-fail" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-* "$T/client-dir" "$T/racepid" "$T/slow-create" "$T/locked-hang"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; : > "$T/curl.args.log"; : > "$T/curl.stdin"; }
+clear_all() { kill_fake_clients; rm -rf "$T/proc"; rm -f "$T/sessions"/* "$T/usage"/* "$T/usage-broken" "$T/broken" "$T/broken-once" "$T/active-seq" "$T/broken-json" "$T/locked-once" "$T/seq" "$T/html-shell" "$T/v2-bad-info" "$T/v2-unknown-shape" "$T/v2-session-fail" "$T/auth-required" "$T/lsof-pid" "$T/ps-cmd" "$T/ps-cmd"-* "$T/client-dir" "$T/racepid" "$T/slow-create" "$T/locked-hang"; : > "$T/aborts"; : > "$T/interrupts"; : > "$T/args.log"; : > "$T/http.log"; : > "$T/ssh.log"; : > "$T/curl.args.log"; : > "$T/curl.stdin"; }
 
 # --- 0. the guards
 check "guard: the server on the test port is the fake" '[ "$(curl -s -m 3 http://127.0.0.1:$P/__who)" = fake-opencode-server ]'
@@ -1023,6 +1032,40 @@ clear_all; busy ses_http9 "$D"
 out=$(run OCM_ALLOW_BUSY=1 -- --detach --dir "$D" -s ses_http9 "p" 2>&1); rc=$?
 check "D5: an active caller -s id is refused with exit 75 under OCM_ALLOW_BUSY=1" '[ "$rc" = 75 ] && echo "$out" | grep -q "already running; --detach needs an idle session"'
 check "D5: the refused active id launched no client and was not interrupted" '[ ! -s "$T/args.log" ] && ! grep -q ses_http9 "$T/interrupts" && [ -e "$T/sessions/ses_http9" ]'
+
+# --- 9. KF-15: --usage <id> prints the session body and its message list, one JSON line each
+clear_all; touch "$T/v2"; : > "$T/http.log"
+printf '{"data":{"id":"ses_U1","cost":0.0079,\n  "tokens":{"input":25563,"output":3775,"reasoning":4494,"cache":{"read":246651,"write":0}},\n  "time":{"created":1793313007225,"updated":1793313077884},"agent":"lane","model":{"id":"inception/mercury-3","providerID":"openrouter"}}}\n' > "$T/usage/ses_U1"
+printf '{"data":[{"id":"m1","type":"user"},\n{"id":"m2","type":"assistant"},{"id":"m3","type":"assistant"}]}\n' > "$T/usage/ses_U1.messages"
+out=$(run -- --usage ses_U1 2>"$T/err"); rc=$?
+check "--usage: exit 0; line 1 is the session body on one line, line 2 the message list" '[ "$rc" = 0 ] && [ "$(printf "%s\n" "$out" | wc -l | tr -d " ")" = 2 ] && [ "$(printf "%s\n" "$out" | sed -n 1p)" = "$(tr -d "\n" < "$T/usage/ses_U1")" ] && [ "$(printf "%s\n" "$out" | sed -n 2p)" = "$(tr -d "\n" < "$T/usage/ses_U1.messages")" ]'
+check "--usage: starts no run and needs no --dir" '[ ! -s "$T/args.log" ] && [ ! -s "$T/err" ]'
+check "--usage: reads exactly the two session routes" '[ "$(grep -c "^GET /api/session/" "$T/http.log")" = 2 ] && grep -q "^GET /api/session/ses_U1$" "$T/http.log" && grep -q "^GET /api/session/ses_U1/message$" "$T/http.log"'
+rm -f "$T/usage/ses_U1.messages"
+out=$(run -- --usage=ses_U1 2>"$T/err"); rc=$?
+check "--usage=<id>: an unreadable message list leaves one line, still exit 0" '[ "$rc" = 0 ] && [ "$(printf "%s\n" "$out" | wc -l | tr -d " ")" = 1 ] && [ "$(printf "%s\n" "$out" | sed -n 1p)" = "$(tr -d "\n" < "$T/usage/ses_U1")" ]'
+out=$(run -- --usage ses_NOPE 2>"$T/err"); rc=$?
+check "--usage: an unknown session is exit 1 and named" '[ "$rc" = 1 ] && grep -q "no session ses_NOPE" "$T/err" && [ -z "$out" ]'
+: > "$T/http.log"
+out=$(run -- --usage "ses_U1/../x" 2>"$T/err"); rc=$?
+check "--usage: an id with a path character is a usage error (2) before any request" '[ "$rc" = 2 ] && [ ! -s "$T/http.log" ]'
+out=$(run -- --usage "x; id" 2>"$T/err"); rc=$?
+check "--usage: an id without the ses_ prefix is a usage error (2) before any request" '[ "$rc" = 2 ] && [ ! -s "$T/http.log" ]'
+out=$(run -- --usage 2>"$T/err"); rc=$?
+check "--usage without an id is a usage error (2)" '[ "$rc" = 2 ]'
+out=$(run -- --usage ses_U1 --status --dir "$D" 2>"$T/err"); rc=$?
+check "--usage with another mode is a usage error (2)" '[ "$rc" = 2 ] && [ ! -s "$T/http.log" ]'
+touch "$T/usage-broken"
+out=$(run -- --usage ses_U1 2>"$T/err"); rc=$?
+check "--usage: a server error on the session read is exit 3, nothing printed" '[ "$rc" = 3 ] && [ -z "$out" ] && grep -q "could not read session ses_U1" "$T/err"'
+rm -f "$T/usage-broken"
+touch "$T/auth-required"; printf 'opencode:pw-usage\n' > "$T/auth-required"; printf 'OPENCODE_SERVER_PASSWORD=pw-usage\n' > "$T/auth.env"
+out=$(run OPENCODE_AUTH_FILE="$T/auth.env" -- --usage ses_U1 2>"$T/err"); rc=$?
+check "--usage: the auth file's password reaches the server (basic auth), exit 0" '[ "$rc" = 0 ] && [ "$(printf "%s\n" "$out" | wc -l | tr -d " ")" = 1 ]'
+rm -f "$T/auth-required" "$T/auth.env"
+clear_all; rm -f "$T/v2"
+out=$(run -- --usage ses_U1 2>"$T/err"); rc=$?
+check "--usage on a v1 server is exit 3 and says so" '[ "$rc" = 3 ] && grep -q "needs a v2 server" "$T/err"'
 
 printf '%s failed\n' "$fails"
 [ "$fails" = 0 ]

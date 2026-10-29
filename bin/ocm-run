@@ -58,6 +58,7 @@ for arg do
     --help | -h)
       cat <<'EOF'
 Usage: ocm-run [--status|--wait|--abort|--check|--detach] --dir <path> [--agent <agent>] [-m <model>] [--variant <variant>] [--format json] ["<prompt>"]
+       ocm-run --usage <session-id>   (v2 servers: prints GET /api/session/<id> and, when readable, /api/session/<id>/message, one JSON line each)
 EOF
       exit 0
       ;;
@@ -169,15 +170,30 @@ model=''
 has_model=0
 has_session=0
 prev=''
+usage_id=''
 for arg do
   shift
+  if [ "$prev" = --usage ]; then
+    usage_id=$arg
+    prev=''
+    continue
+  fi
   case "$arg" in
+    --usage | --usage=*)
+      [ "$mode" = run ] || { echo "ocm-run: one of --status, --wait, --abort, --check, --usage at a time" >&2; exit 2; }
+      mode=usage
+      case "$arg" in
+        --usage=*) usage_id=${arg#--usage=}; prev='' ;;
+        *) prev=--usage ;;
+      esac
+      continue
+      ;;
     --attach | --attach=* | --server | --server=*)
       echo "ocm-run: do not pass ${arg%%=*}; ocm-run connects to $url itself" >&2
       exit 2
       ;;
     --status | --wait | --abort | --check)
-      [ "$mode" = run ] || { echo "ocm-run: one of --status, --wait, --abort, --check at a time" >&2; exit 2; }
+      [ "$mode" = run ] || { echo "ocm-run: one of --status, --wait, --abort, --check, --usage at a time" >&2; exit 2; }
       mode=${arg#--}
       prev=''
       continue
@@ -217,6 +233,15 @@ for arg do
   esac
   set -- "$@" "$arg"
 done
+
+if [ "$mode" = usage ]; then
+  # The id goes into a URL path: a session id and nothing else (M3's lesson for --usage).
+  case "$usage_id" in
+    ses_*) case "$usage_id" in *[!A-Za-z0-9_]*) usage_id='' ;; esac ;;
+    *) usage_id='' ;;
+  esac
+  [ -n "$usage_id" ] || { echo "ocm-run: --usage needs a session id (ses_<letters and digits>)" >&2; exit 2; }
+fi
 
 if [ "$has_variant" = 1 ]; then
   [ -n "$variant" ] || { echo "ocm-run: --variant needs a value" >&2; exit 2; }
@@ -513,6 +538,39 @@ ocm_abort() { # $1: a session id
     ocm_curl -s -o /dev/null -m 8 -X POST -G "$url/session/$1/abort" --data-urlencode "directory=$dir"
   fi
 }
+
+if [ "$mode" = usage ]; then
+  # KF-15: the session's cost and tokens live on the server that ran it (inside a lane
+  # container, in opencode v2's session_v2 table), so they are read through the same
+  # dial and auth as a dispatch, never from a database path on some host.
+  [ "$api" = v2 ] || { echo "ocm-run: --usage needs a v2 server; $url answered v1" >&2; exit 3; }
+  uf=$(mktemp "${TMPDIR:-/tmp}/ocm-run.XXXXXX") || exit 1
+  ocm_ucode=000
+  ocm_usage_fetch() { # $1: path under /api/session/<id>; the body lands in $uf; 0 on a 200 JSON answer
+    ocm_umeta=$(ocm_curl -s -m 8 -o "$uf" -w '%{http_code}:%{content_type}' "$url/api/session/$usage_id$1") || { ocm_ucode=000; return 1; }
+    ocm_ucode=${ocm_umeta%%:*}
+    ocm_uct=$(printf '%s' "${ocm_umeta#*:}" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+    case "$ocm_ucode:$ocm_uct" in 200:application/json*) return 0 ;; *) return 1 ;; esac
+  }
+  if ! ocm_usage_fetch ""; then
+    rm -f "$uf"
+    if [ "$ocm_ucode" = 404 ]; then
+      echo "ocm-run: no session $usage_id on the server (HTTP 404)" >&2
+      exit 1
+    fi
+    echo "ocm-run: could not read session $usage_id from $url (HTTP $ocm_ucode)" >&2
+    exit 3
+  fi
+  # One JSON document per line: a JSON string never holds a raw newline, so dropping them is lossless.
+  tr -d '\n\r' < "$uf"
+  echo
+  if ocm_usage_fetch "/message"; then
+    tr -d '\n\r' < "$uf"
+    echo
+  fi
+  rm -f "$uf"
+  exit 0
+fi
 
 if [ "$mode" != run ]; then
   [ -n "$dir" ] || { echo "ocm-run: --$mode needs --dir <path on the server>" >&2; exit 2; }

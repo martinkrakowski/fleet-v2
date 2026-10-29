@@ -561,6 +561,43 @@ describe('redactionChecks (OT1r)', () => {
     expect(check(report, 'canaries').offendingSpans).toBe(1);
   });
 
+  /** The stub payload with one extra string at a field the entry walk ignores, written JSON-escaped. */
+  function withEscapedField(place: 'scope-name' | 'event-name' | 'span-name', value: string): Uint8Array {
+    const parsed = JSON.parse(new TextDecoder().decode(stubPayload())) as {
+      resourceSpans: { scopeSpans: { scope?: { name: string }; spans: { name?: string; events?: { name: string }[] }[] }[] }[];
+    };
+    const scope = parsed.resourceSpans[0].scopeSpans[0];
+    const marker = 'MARKER-FIELD-VALUE';
+    if (place === 'scope-name') {
+      scope.scope = { name: marker };
+    } else if (place === 'event-name') {
+      scope.spans[0].events = [{ name: marker }];
+    } else {
+      scope.spans[0].name = marker;
+    }
+    const text = JSON.stringify(parsed).replace(marker, escapeJsonUnicode(value));
+    expect(text).not.toContain(value);
+    return new TextEncoder().encode(text);
+  }
+
+  it('a JSON-escaped canary in a field the walk ignores fails canaries (Luna re-review)', () => {
+    const canary = 'canary-scope-value';
+    for (const place of ['scope-name', 'event-name', 'span-name'] as const) {
+      const report = redactionChecks(withEscapedField(place, canary), [canary]);
+      expect(check(report, 'canaries').pass).toBe(false);
+      expectNoLeak(report, [canary]);
+    }
+  });
+
+  it('a JSON-escaped secret in a span name or an ignored field fails secret-shapes (Luna re-review)', () => {
+    const githubToken = 'gh' + 'p_' + 'b'.repeat(36);
+    for (const place of ['scope-name', 'event-name', 'span-name'] as const) {
+      const report = redactionChecks(withEscapedField(place, githubToken), []);
+      expect(check(report, 'secret-shapes').pass).toBe(false);
+      expectNoLeak(report, [githubToken]);
+    }
+  });
+
   it('the report is frozen and lists the checks in order (robustness)', () => {
     const report = redactionChecks(stubPayload(), []);
     expect(Object.isFrozen(report)).toBe(true);

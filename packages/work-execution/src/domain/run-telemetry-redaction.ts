@@ -53,6 +53,40 @@ interface DecodedEntry {
 interface DecodedPayload {
   readonly text: string;
   readonly entries: readonly DecodedEntry[];
+  /**
+   * Every decoded string the parsed payload carries, object keys included, from
+   * every field (scope names, event names and fields the walk above ignores), so
+   * a JSON escape cannot hide a canary or a secret from the checks (OT1r, Luna).
+   */
+  readonly strings: readonly string[];
+}
+
+/** Upper bound on decoded strings walked; a larger payload fails the checks. */
+const MAX_DECODED_STRINGS = 200_000;
+
+/** Every string value and object key in a JSON.parse result, or null past the bound. */
+function allDecodedStrings(parsed: unknown): string[] | null {
+  const out: string[] = [];
+  const stack: unknown[] = [parsed];
+  while (stack.length > 0) {
+    const value = stack.pop();
+    if (typeof value === 'string') {
+      out.push(value);
+    } else if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i += 1) {
+        stack.push(value[i]);
+      }
+    } else if (typeof value === 'object' && value !== null) {
+      for (const key of Object.keys(value)) {
+        out.push(key);
+        stack.push((value as Record<string, unknown>)[key]);
+      }
+    }
+    if (out.length > MAX_DECODED_STRINGS) {
+      return null;
+    }
+  }
+  return out;
 }
 
 /** The own data-property value at `prop`, or null: no getter ever runs. */
@@ -261,10 +295,11 @@ function decodePayload(payloadBytes: Uint8Array): DecodedPayload | null {
       return null;
     }
     const entries = readResourceSpans(ownData(parsed, 'resourceSpans'));
-    if (entries === null) {
+    const strings = allDecodedStrings(parsed);
+    if (entries === null || strings === null) {
       return null;
     }
-    return { text, entries };
+    return { text, entries, strings };
   } catch {
     return null;
   }
@@ -320,6 +355,10 @@ function checkCanaries(
   }
   let pass = true;
   if (active.some((canary) => payload.text.includes(canary))) {
+    pass = false;
+  }
+  // Every decoded string in the payload, not only the walked entries' fields.
+  if (payload.strings.some((text) => active.some((canary) => text.includes(canary)))) {
     pass = false;
   }
   // Each offending span counts once, however many canaries it carries.
@@ -484,8 +523,16 @@ function textHasSecretShape(text: string): boolean {
   return false;
 }
 
-/** True when any attribute value of the entry is secret-shaped. */
+/** True when the entry's name or any attribute key or value is secret-shaped. */
 function entryHasSecretShape(entry: DecodedEntry): boolean {
+  if (textHasSecretShape(entry.name)) {
+    return true;
+  }
+  for (const key of entry.attributes.keys()) {
+    if (textHasSecretShape(key)) {
+      return true;
+    }
+  }
   for (const value of entry.attributes.values()) {
     if (Array.isArray(value) && value.some((text) => textHasSecretShape(text))) {
       return true;
@@ -509,7 +556,10 @@ function checkSecretShapes(payload: DecodedPayload | null): { readonly pass: boo
     }
   }
   // The payload text as a whole and every decoded value are checked: a shape anywhere fails.
-  const pass = !textHasSecretShape(payload.text) && offendingSpans === 0;
+  const pass =
+    !textHasSecretShape(payload.text) &&
+    offendingSpans === 0 &&
+    !payload.strings.some((text) => textHasSecretShape(text));
   return { pass, offendingSpans };
 }
 

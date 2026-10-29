@@ -271,6 +271,62 @@ describe('PrepareBriefPackageUseCase previewBriefPackage (BP1)', () => {
     expect(result.preview.acceptance.commandDigests[0]).not.toBe(result.preview.acceptance.commandDigests[1]);
   });
 
+  it('preview rejection reasons never contain artifact or offending paths; prepare keeps its messages', async () => {
+    // Invalid artifact path: preview maps to a fixed reason without the path.
+    const invalidArtifactPath = '../MARKER-INVALID-ARTIFACT.txt';
+    const invalidPreview = await makeUseCase().useCase.previewBriefPackage(
+      validRequest({ expectedArtifacts: [invalidArtifactPath] }),
+    );
+    expect(invalidPreview.outcome).toBe('rejected');
+    if (invalidPreview.outcome === 'rejected') {
+      expect(invalidPreview.reason).not.toContain(invalidArtifactPath);
+      expect(invalidPreview.reason).toBe('an expected artifact path is invalid');
+    }
+
+    // Not-ignored path: preview maps to a fixed reason without the path, while
+    // prepare keeps its byte-for-byte message that includes the path.
+    const notIgnoredPath = 'MARKER-NOT-IGNORED.txt';
+    const notIgnoredArtifactPort: AttemptArtifactPort = {
+      async verifyIgnoredPaths() {
+        return { outcome: 'not-ignored', offendingPaths: [notIgnoredPath] };
+      },
+      async placeFrozenBrief() {
+        return {
+          outcome: 'placed',
+          prosePath: '.lane/brief.md',
+          manifestPath: '.lane/brief-manifest.json',
+        };
+      },
+      async collectCompletedAttemptArtifacts() {
+        return {
+          outcome: 'collected',
+          artifacts: {
+            headCommit: '0000000000000000000000000000000000000000',
+            commitsSinceBase: [],
+            collectedArtifactPaths: [],
+            notes: 'present',
+          },
+        };
+      },
+    };
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring(),
+      artifactPort: notIgnoredArtifactPort,
+      briefKnowledge: makeRecordingKnowledgePort().port,
+    });
+    const notIgnoredPreview = await useCase.previewBriefPackage(validRequest());
+    expect(notIgnoredPreview.outcome).toBe('rejected');
+    if (notIgnoredPreview.outcome === 'rejected') {
+      expect(notIgnoredPreview.reason).not.toContain(notIgnoredPath);
+      expect(notIgnoredPreview.reason).toBe('an expected artifact path is not ignored');
+    }
+    const prepared = await useCase.prepareBriefPackage(validRequest());
+    expect(prepared.outcome).toBe('rejected');
+    if (prepared.outcome === 'rejected') {
+      expect(prepared.reason).toContain(notIgnoredPath);
+    }
+  });
+
   it('throws Not implemented when unconfigured and keeps execute() prepared/rejected only', async () => {
     const unconfigured = new PrepareBriefPackageUseCase();
     await expect(unconfigured.previewBriefPackage(validRequest())).rejects.toThrow(

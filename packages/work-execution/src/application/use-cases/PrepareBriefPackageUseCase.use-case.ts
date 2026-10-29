@@ -249,6 +249,7 @@ function validatePathsAndSpec(
 function validatePlacement(
   request: PrepareBriefPackageUseCaseRequest,
   configuredWorktreePath: string | undefined,
+  forPreview = false,
 ): { readonly reason: string } | { readonly worktreePath: string } {
   const worktreePath = request.worktreePath ?? configuredWorktreePath;
   if (!isNonEmpty(worktreePath)) {
@@ -267,7 +268,9 @@ function validatePlacement(
     const refusedReason = validateWorktreeRelativePath(artifact);
     if (refusedReason !== null) {
       return {
-        reason: `expectedArtifacts entry is not a valid worktree-relative path: ${String(artifact)}`,
+        reason: forPreview
+          ? 'an expected artifact path is invalid'
+          : `expectedArtifacts entry is not a valid worktree-relative path: ${String(artifact)}`,
       };
     }
   }
@@ -337,6 +340,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
   private async build(
     request: PrepareBriefPackageUseCaseRequest,
     deps: PrepareBriefPackageDependencies,
+    forPreview = false,
   ): Promise<BuiltBriefPackage> {
     const fieldsError = validateBriefFields(request);
     if (fieldsError !== null) {
@@ -346,7 +350,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     if ('reason' in pathsCheck) {
       return { reason: pathsCheck.reason };
     }
-    const placementCheck = validatePlacement(request, deps.worktreePath);
+    const placementCheck = validatePlacement(request, deps.worktreePath, forPreview);
     if ('reason' in placementCheck) {
       return { reason: placementCheck.reason };
     }
@@ -371,7 +375,11 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       candidatePaths: ['.lane/brief.md', '.lane/brief-manifest.json', ...request.expectedArtifacts],
     });
     if (verified.outcome === 'not-ignored') {
-      return { reason: `Paths not ignored: ${verified.offendingPaths.join(', ')}` };
+      return {
+        reason: forPreview
+          ? 'an expected artifact path is not ignored'
+          : `Paths not ignored: ${verified.offendingPaths.join(', ')}`,
+      };
     }
 
     const decisions = request.contextDecisions ?? [];
@@ -490,7 +498,10 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       throw new Error('Not implemented: PrepareBriefPackageUseCase');
     }
 
-    const built = await this.build(request, this.deps);
+    // Preview rejections never echo artifact or offending paths: the preview
+    // result must contain no path, so build maps path-bearing rejections to
+    // fixed reasons when forPreview is set.
+    const built = await this.build(request, this.deps, true);
     if ('reason' in built) {
       return { outcome: 'rejected', reason: built.reason };
     }

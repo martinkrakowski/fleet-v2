@@ -148,9 +148,8 @@ export interface PrepareBriefPackagePort {
   prepareBriefPackage(request: PrepareBriefPackageRequest): Promise<PrepareBriefPackageResult>;
   /**
    * Validate and compute what a prepare would freeze; writes nothing and
-   * commits no seat. Optional on the contract so existing port fakes (the
-   * conductor's StartLaneRun fake) keep compiling unchanged; the use case
-   * always implements it.
+   * commits no seat. Required on the contract: every implementer provides
+   * it, so a port fake must supply one (e.g. throwing when unused).
    */
-  previewBriefPackage?(request: PrepareBriefPackageRequest): Promise<PreviewBriefPackageResult>;
+  previewBriefPackage(request: PrepareBriefPackageRequest): Promise<PreviewBriefPackageResult>;
 }

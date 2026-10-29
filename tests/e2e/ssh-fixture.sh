@@ -41,6 +41,43 @@ cmd=$1
 if [ "$cmd" = stop ]; then
   [ "$#" -ge 2 ] || usage
   d=$2
+  # End any `ssh -f -N` port forwards opened through this fixture: their argv
+  # names the alias `fleet-e2e` and this fixture's own ssh config (forced on
+  # by the fixture's ssh wrapper). pgrep matches against the full argv, so the
+  # bracketed pattern never matches pgrep's own command line. TERM first,
+  # then KILL for anything that survives.
+  if command -v pgrep >/dev/null 2>&1; then
+    config_token="$d/home/.ssh/config"
+    matches_fixture() {
+      case "$1" in
+        *"$config_token"*) return 0 ;;
+      esac
+      return 1
+    }
+    for fpid in $(pgrep -f "[s]sh .*-f -N .*fleet-e2e"); do
+      argv=$(ps -ww -p "$fpid" -o args= 2>/dev/null || true)
+      if matches_fixture "$argv"; then
+        kill -TERM "$fpid" 2>/dev/null || true
+      fi
+    done
+    i=0
+    while [ "$i" -lt 20 ]; do
+      alive=false
+      for fpid in $(pgrep -f "[s]sh .*-f -N .*fleet-e2e"); do
+        argv=$(ps -ww -p "$fpid" -o args= 2>/dev/null || true)
+        if matches_fixture "$argv"; then alive=true; fi
+      done
+      [ "$alive" = true ] || break
+      sleep 0.1
+      i=$((i + 1))
+    done
+    for fpid in $(pgrep -f "[s]sh .*-f -N .*fleet-e2e"); do
+      argv=$(ps -ww -p "$fpid" -o args= 2>/dev/null || true)
+      if matches_fixture "$argv"; then
+        kill -KILL "$fpid" 2>/dev/null || true
+      fi
+    done
+  fi
   pidfile="$d/sshd.pid"
   if [ -f "$pidfile" ]; then
     pid=$(cat "$pidfile" 2>/dev/null || true)

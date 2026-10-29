@@ -29,6 +29,9 @@
  * one-way, are completed. The G4j force reconcile (a fresh
  * `…/reconcile/<seat>` key) moves a prepared attempt to reconciling so it
  * can be stopped; any other step stays `not-built` and writes nothing.
+ *
+ * The acts live in `advance-lane-run/` (step-context, frozen-manifest,
+ * prepare-dispatch, stop-cancel); the class keeps the decision switch.
  */
 
 import type {
@@ -46,17 +49,15 @@ import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-p
 import type { ReconcileAttemptPort } from '../ports/in/ReconcileAttemptPort.in-port.js';
 import type { DispatchAttemptPort } from '../ports/in/DispatchAttemptPort.in-port.js';
 import type { CancelPreparedAttemptPort } from '../ports/in/CancelPreparedAttemptPort.in-port.js';
-import type { StopAttemptPort, StopAttemptResult } from '../ports/in/StopAttemptPort.in-port.js';
+import type { StopAttemptPort } from '../ports/in/StopAttemptPort.in-port.js';
 import type { CollectAttemptArtifactsPort } from '../ports/in/CollectAttemptArtifactsPort.in-port.js';
 import type { CommitEditOnlyAttemptPort } from '../ports/in/CommitEditOnlyAttemptPort.in-port.js';
 import type { EvaluateAttemptGatePort } from '../ports/in/EvaluateAttemptGatePort.in-port.js';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
-import { AttemptRevisionConflictError } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import {
   parseSeatTool,
   type AttemptRecord,
   type AttemptRunnerRecord,
-  type AttemptSeatOverrideRecord,
 } from '../../domain/execution-records.js';
 import type { ArtifactManifestVerdict } from '../../domain/artifact-manifest.js';
 import { checkLeaseHeld } from '../../domain/lane-run-lease.js';
@@ -70,13 +71,10 @@ import {
 import {
   laneRunAttemptDispatchResult,
   laneRunAttemptPlacement,
-  laneRunConductEntry,
   laneRunDispatchedAtIso,
   laneRunGateFact,
-  laneRunIntentEntry,
   laneRunParkedConductCount,
   laneRunRefusedStep,
-  laneRunResultEntry,
   laneRunStopsIssued,
   laneRunTimedOut,
   type LaneRunResultReasonCode,
@@ -84,11 +82,7 @@ import {
 import type { LaneRunJournalOutcome } from '../../domain/lane-run-journal.js';
 import { head12Of, parseLaneRunKey } from '../../domain/lane-run-keys.js';
 import { isCalendarDateTime } from '../../domain/plain-record-reads.js';
-import type {
-  LaneRunCursorsRecord,
-  LaneRunParkReason,
-  LaneRunRecord,
-} from '../../domain/lane-run-records.js';
+import type { LaneRunRecord } from '../../domain/lane-run-records.js';
 import type {
   LaneRunAttemptFact,
   LaneRunDecision,
@@ -96,11 +90,34 @@ import type {
   LaneRunSeatFact,
 } from '../../domain/lane-run-decider.js';
 import { laneRunAttemptPhaseOf, nextLaneRunAction } from '../../domain/lane-run-decider.js';
-import { canEnterLaneRunState, implementerRoleFor, laneRunStopEffect } from '../../domain/lane-run-transitions.js';
-import type { RunStopEffect, RunStopOutcome } from '../../domain/lane-run-transitions.js';
-import { historyEntryOf, selectSeat, seatSelectionRecord, stopReasonOf } from '../../domain/seat-selection.js';
+import { implementerRoleFor } from '../../domain/lane-run-transitions.js';
+import { historyEntryOf, selectSeat, stopReasonOf } from '../../domain/seat-selection.js';
 import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
 import { SeatPlan } from '../../domain/value-objects/SeatPlan.vo.js';
+import type { AdvanceStepContext, GatheredLaneRunFacts } from './advance-lane-run/step-context.js';
+import {
+  appendConduct,
+  appendRunIntent,
+  appendRunResult,
+  intentMintedIdOf,
+  performEnter,
+  performPark,
+  saveOrRefuse,
+} from './advance-lane-run/step-context.js';
+import {
+  manifestExpectedArtifacts,
+  manifestTimeLimitSeconds,
+  readFrozenManifest,
+} from './advance-lane-run/frozen-manifest.js';
+import {
+  conductDispatching,
+  performDispatch,
+  performPrepare,
+} from './advance-lane-run/prepare-dispatch.js';
+import {
+  performCancel,
+  performStop,
+} from './advance-lane-run/stop-cancel.js';
 
 export interface AdvanceLaneRunDependencies {
   readonly runRepo: LaneRunRepositoryPort;
@@ -252,108 +269,12 @@ async function attemptFactOf(
   };
 }
 
-/** The frozen brief manifest as a plain object; null when absent or unreadable (K4-4b). */
-async function readFrozenManifest(
-  attempt: AttemptRecord,
-  artifactPort: AdvanceLaneRunDependencies['artifactPort'],
-): Promise<Record<string, unknown> | null> {
-  const read = artifactPort.readBriefManifest;
-  if (read === undefined || attempt.briefPackagePath === null) {
-    return null;
-  }
-  try {
-    const text = await read(
-      attempt.worktreePath,
-      attempt.briefPackagePath.replace(/\.md$/, '-manifest.json'),
-      attempt.runner ?? null,
-    );
-    if (text === null) {
-      return null;
-    }
-    const parsed: unknown = JSON.parse(text);
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-/** A positive safe-integer field of a frozen manifest; null when absent or invalid. */
-function manifestPositiveInteger(manifest: Record<string, unknown> | null, field: string): number | null {
-  if (manifest === null) {
-    return null;
-  }
-  const value = manifest[field];
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
-    return null;
-  }
-  return value;
-}
-
-/** Positive safe-integer `timeLimitSeconds` of a frozen manifest; null when absent or invalid. */
-function manifestTimeLimitSeconds(manifest: Record<string, unknown> | null): number | null {
-  return manifestPositiveInteger(manifest, 'timeLimitSeconds');
-}
-
-/** `expectedArtifacts` of a frozen manifest: the field absent reads `[]`; present but not a string array is unreadable (null). */
-function manifestExpectedArtifacts(manifest: Record<string, unknown> | null): readonly string[] | null {
-  if (manifest === null || !Object.prototype.hasOwnProperty.call(manifest, 'expectedArtifacts')) {
-    return [];
-  }
-  const value = manifest.expectedArtifacts;
-  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
-    return null;
-  }
-  return value as readonly string[];
-}
-
-/** Map a StopAttempt port result onto the domain's RunStopOutcome; a refusal re-reads the attempt for its kind. */
-async function runStopOutcomeOf(
-  result: StopAttemptResult,
-  latestId: string,
-  attemptRepo: AttemptRepositoryPort,
-): Promise<RunStopOutcome> {
-  if (result.outcome === 'terminated' || result.outcome === 'cancelled') {
-    return { outcome: result.outcome, capacityReleased: result.capacityReleased };
-  }
-  if (result.outcome === 'still-running' || result.outcome === 'unknown') {
-    return { outcome: result.outcome };
-  }
-  const stored = await attemptRepo.findAttemptById(latestId);
-  if (stored === null) {
-    return { outcome: 'refused', refusal: 'attempt-missing' };
-  }
-  if (
-    stored.state === 'cancelled' ||
-    stored.state === 'collected' ||
-    (stored.state === 'ended' && stored.completionReceipt !== null && stored.completionReceipt.authoritative === true)
-  ) {
-    return { outcome: 'refused', refusal: 'attempt-terminal' };
-  }
-  return { outcome: 'refused', refusal: 'other' };
-}
-
-type WriteOutcome =
-  | { readonly ok: true; readonly record?: LaneRunRecord }
-  | { readonly ok: false; readonly reason: AdvanceLaneRunRefusal };
-
-/**
- * One advance's facts plus what its decision hooks need. Kept per call, never on
- * the instance: one use case serves overlapping advances of different runs.
- */
-interface GatheredLaneRunFacts {
-  readonly facts: LaneRunFacts;
-  /** A running attempt's deadline could not be read (K4-4b): park `ambiguous stop`. */
-  readonly deadlineUnknown: boolean;
-  /** The latest attempt as gathered, for the admission hook. */
-  readonly latestAttempt: AttemptRecord | null;
-  /** The run's attempt records in `attemptIds` order (null where a record is missing), for the prepare act. */
-  readonly attemptRecords: readonly (AttemptRecord | null)[];
-}
-
 export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
-  constructor(private readonly deps: AdvanceLaneRunDependencies) {}
+  private readonly ctx: AdvanceStepContext;
+
+  constructor(private readonly deps: AdvanceLaneRunDependencies) {
+    this.ctx = { deps };
+  }
 
   async advanceLaneRun(request: AdvanceLaneRunRequest): Promise<AdvanceLaneRunResult> {
     const invalid = requestShapeError(request);
@@ -382,14 +303,14 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     // Park repair (K4-4a step 3): one write, then return `repaired`.
     if (record.parked !== null && journalState !== 'parked') {
       if (parkedConducts === record.parkCount - 1) {
-        const appended = await this.appendConduct(request, 'parked');
+        const appended = await appendConduct(this.ctx, request, 'parked');
         if (!appended.ok) {
           return { outcome: 'refused', reason: appended.reason };
         }
         return { outcome: 'repaired', state: 'parked' };
       }
       if (parkedConducts === record.parkCount) {
-        const saved = await this.saveOrRefuse(
+        const saved = await saveOrRefuse(this.ctx,
           { ...record, parked: null, revision: record.revision + 1 },
           request,
         );
@@ -422,20 +343,20 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return this.performAdmissionWait(record, facts, gathered.latestAttempt, request);
     }
     if (decision.kind === 'wait' && decision.reason === 'lane-running' && gathered.deadlineUnknown) {
-      return this.performPark(record, 'ambiguous', 'stop', facts.state, request);
+      return performPark(this.ctx, record, 'ambiguous', 'stop', facts.state, request);
     }
     if (decision.kind === 'wait') {
       return { outcome: 'waiting', reason: decision.reason };
     }
     if (decision.kind === 'act') {
       if (decision.step === 'prepare') {
-        return this.performPrepare(record, gathered, decision, request);
+        return performPrepare(this.ctx, record, gathered, decision, request);
       }
       if (decision.step === 'dispatch') {
-        return this.performDispatch(record, gathered, decision, request);
+        return performDispatch(this.ctx, record, gathered, decision, request);
       }
       if (decision.step === 'stop') {
-        return this.performStop(record, gathered, decision, request);
+        return performStop(this.ctx, record, gathered, decision, request);
       }
       if (decision.step === 'collect') {
         return this.performCollect(record, gathered, decision, request);
@@ -449,472 +370,12 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return this.performReconcile(record, gathered, decision, request);
     }
     if (decision.kind === 'cancel') {
-      return this.performCancel(decision, request);
+      return performCancel(this.ctx, decision, request);
     }
     if (decision.kind === 'enter') {
-      return this.performEnter(record, facts.state, decision.to, request);
+      return performEnter(this.ctx, record, facts.state, decision.to, request);
     }
-    return this.performPark(record, decision.reason, decision.qualifier, decision.parkedFrom, request);
-  }
-
-  private async performEnter(
-    record: LaneRunRecord,
-    from: LaneRunStateValue,
-    to: LaneRunStateValue,
-    request: AdvanceLaneRunRequest,
-  ): Promise<AdvanceLaneRunResult> {
-    if (!canEnterLaneRunState(from, to, record.parked?.parkedFrom ?? null)) {
-      return { outcome: 'refused', reason: 'illegal-transition' };
-    }
-    const appended = await this.appendConduct(request, to);
-    if (!appended.ok) {
-      return { outcome: 'refused', reason: appended.reason };
-    }
-    if (record.parked !== null) {
-      const saved = await this.saveOrRefuse(
-        { ...record, parked: null, revision: record.revision + 1 },
-        request,
-      );
-      if (!saved.ok) {
-        return { outcome: 'refused', reason: saved.reason };
-      }
-    }
-    return { outcome: 'entered', state: to };
-  }
-
-  private async performPark(
-    record: LaneRunRecord,
-    reason: LaneRunParkReason,
-    qualifier: string | null,
-    parkedFrom: LaneRunStateValue,
-    request: AdvanceLaneRunRequest,
-  ): Promise<AdvanceLaneRunResult> {
-    const saved = await this.saveOrRefuse(
-      {
-        ...record,
-        parked: { reason, qualifier, parkedFrom, questionId: null },
-        parkCount: record.parkCount + 1,
-        revision: record.revision + 1,
-      },
-      request,
-    );
-    if (!saved.ok) {
-      return { outcome: 'refused', reason: saved.reason };
-    }
-    const appended = await this.appendConduct(request, 'parked');
-    if (!appended.ok) {
-      return { outcome: 'refused', reason: appended.reason };
-    }
-    return { outcome: 'parked', reason, qualifier };
-  }
-
-  /** The acts' own cost-ceiling re-check (§3.6): park before anything is written. */
-  private async ceilingPark(
-    record: LaneRunRecord,
-    gathered: GatheredLaneRunFacts,
-    request: AdvanceLaneRunRequest,
-  ): Promise<AdvanceLaneRunResult | null> {
-    if (!gathered.facts.costCeilingReached) {
-      return null;
-    }
-    return this.performPark(record, 'cost-ceiling', null, gathered.facts.state, request);
-  }
-
-  private async appendRunIntent(
-    request: AdvanceLaneRunRequest,
-    key: string,
-    mintedId: string | null,
-  ): Promise<AdvanceLaneRunRefusal | null> {
-    const appended = await this.deps.runJournal.append(
-      laneRunIntentEntry(this.deps.newUlid(), request.runId, key, mintedId, request.nowIso),
-    );
-    return appended.outcome === 'appended' ? null : 'journal-refused';
-  }
-
-  private async appendRunResult(
-    request: AdvanceLaneRunRequest,
-    key: string,
-    outcome: LaneRunJournalOutcome,
-    reasonCode: LaneRunResultReasonCode | null,
-  ): Promise<AdvanceLaneRunRefusal | null> {
-    const appended = await this.deps.runJournal.append(
-      laneRunResultEntry(this.deps.newUlid(), request.runId, key, outcome, reasonCode, request.nowIso),
-    );
-    return appended.outcome === 'appended' ? null : 'journal-refused';
-  }
-
-  /**
-   * The `act prepare` decision (K4-5): a fresh round-0 attempt on the selected
-   * first-pass seat, copying the frozen-brief fields from the run's latest
-   * attempt (the seat pivot). Order: intent, attempt record, run record,
-   * result — so a result never exists for an attempt the run record does not
-   * list. A fix-round prepare stays with K5 and is refused under its key.
-   */
-  private async performPrepare(
-    record: LaneRunRecord,
-    gathered: GatheredLaneRunFacts,
-    decision: Extract<LaneRunDecision, { kind: 'act' }>,
-    request: AdvanceLaneRunRequest,
-  ): Promise<AdvanceLaneRunResult> {
-    const ceiling = await this.ceilingPark(record, gathered, request);
-    if (ceiling !== null) {
-      return ceiling;
-    }
-    const nowIso = request.nowIso;
-    const refuse = async (reasonCode: LaneRunResultReasonCode): Promise<AdvanceLaneRunResult> => {
-      const intentRefusal = await this.appendRunIntent(request, decision.key, null);
-      if (intentRefusal !== null) {
-        return { outcome: 'refused', reason: intentRefusal };
-      }
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', reasonCode);
-      if (resultRefusal !== null) {
-        return { outcome: 'refused', reason: resultRefusal };
-      }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
-    };
-
-    if (decision.round !== 0) {
-      return refuse('prepare-fix-round-not-built');
-    }
-    let source: AttemptRecord | null = null;
-    for (let index = gathered.attemptRecords.length - 1; index >= 0; index -= 1) {
-      const candidate = gathered.attemptRecords[index];
-      if (candidate !== null) {
-        source = candidate;
-        break;
-      }
-    }
-    if (source === null) {
-      return refuse('no-frozen-brief');
-    }
-    const planResult = SeatPlan.create(source.seatPlan);
-    const seat =
-      planResult.success && planResult.value !== undefined
-        ? planResult.value.getSeats('first-pass')[decision.seatIndex]
-        : undefined;
-    if (seat === undefined) {
-      return refuse('seat-missing');
-    }
-    const sourceTool = parseSeatTool(source.seatSelection?.tool) ?? 'opencode';
-    if ((parseSeatTool(seat.tool) ?? 'opencode') !== sourceTool) {
-      return refuse('seat-tool-differs');
-    }
-    const attemptId = 'attempt-' + this.deps.newUlid();
-    const intentRefusal = await this.appendRunIntent(request, decision.key, attemptId);
-    if (intentRefusal !== null) {
-      return { outcome: 'refused', reason: intentRefusal };
-    }
-    const attempt: AttemptRecord = {
-      id: attemptId,
-      workOrderId: source.workOrderId,
-      kind: 'initial',
-      fixNumber: 0,
-      priorAttemptId: source.id,
-      worktreePath: source.worktreePath,
-      baseCommit: source.baseCommit,
-      state: 'intent-recorded',
-      outcome: null,
-      revision: 0,
-      briefDigest: source.briefDigest,
-      briefPackagePath: source.briefPackagePath,
-      sessionId: null,
-      completionReceipt: null,
-      artifacts: null,
-      seatPlan: source.seatPlan ?? null,
-      seatSelection: seatSelectionRecord('first-pass', decision.seatIndex, seat),
-      reviewerSeat: source.reviewerSeat ?? null,
-      createdAtIso: nowIso,
-      updatedAtIso: nowIso,
-    };
-    try {
-      await this.deps.attemptRepo.saveAttempt(attempt);
-    } catch (error) {
-      if (error instanceof AttemptRevisionConflictError) {
-        const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'attempt-exists');
-        if (resultRefusal !== null) {
-          return { outcome: 'refused', reason: resultRefusal };
-        }
-        return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'attempt-exists' };
-      }
-      throw error;
-    }
-    try {
-      const saved = await this.saveOrRefuse(
-        { ...record, attemptIds: [...record.attemptIds, attemptId], revision: record.revision + 1 },
-        request,
-      );
-      if (!saved.ok) {
-        // The intent stays pending; K4-7's prepare reconcile finds the attempt
-        // and appends the id to the run record.
-        return { outcome: 'refused', reason: saved.reason };
-      }
-    } catch {
-      return { outcome: 'refused', reason: 'save-refused' };
-    }
-    const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'prepared');
-    if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
-    }
-    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'prepared' };
-  }
-
-  /**
-   * The `act dispatch` decision (K4-5): start the prepared attempt through
-   * `DispatchAttemptPort` with the frozen brief's limits, raising the round and
-   * the seat cursor on the record before the call (§3.2, D8). The dispatch key
-   * is one-way: when a reconcile already recorded the dispatch as never
-   * started but its cancel did not land, the attempt is cancelled instead of
-   * re-sending the key. A pivot dispatches with a conductor seat override.
-   */
-  private async performDispatch(
-    record: LaneRunRecord,
-    gathered: GatheredLaneRunFacts,
-    decision: Extract<LaneRunDecision, { kind: 'act' }>,
-    request: AdvanceLaneRunRequest,
-  ): Promise<AdvanceLaneRunResult> {
-    const facts = gathered.facts;
-    const ceiling = await this.ceilingPark(record, gathered, request);
-    if (ceiling !== null) {
-      return ceiling;
-    }
-    const dispatch = this.deps.dispatchAttempt;
-    if (dispatch === undefined) {
-      return { outcome: 'not-wired', step: decision.step };
-    }
-    const nowIso = request.nowIso;
-    const latest = gathered.latestAttempt;
-    if (latest === null || latest.state !== 'intent-recorded') {
-      return { outcome: 'waiting', reason: 'facts-inconsistent' };
-    }
-    if (facts.attempt !== null && facts.attempt.dispatchResult === 'not-started') {
-      const cancel = this.deps.cancelPreparedAttempt;
-      if (cancel === undefined) {
-        return { outcome: 'not-wired', step: decision.step };
-      }
-      await cancel.cancelPreparedAttempt({ attemptId: latest.id, nowIso });
-      return { outcome: 'waiting', reason: 'dispatch-pending' };
-    }
-    const manifest = await readFrozenManifest(latest, this.deps.artifactPort);
-    const stepLimit = manifestPositiveInteger(manifest, 'stepLimit');
-    const timeLimitSeconds = manifestTimeLimitSeconds(manifest);
-    const expectedArtifacts = manifestExpectedArtifacts(manifest);
-    const briefPackagePath = latest.briefPackagePath;
-    const briefDigest = latest.briefDigest;
-    const inputsReadable =
-      stepLimit !== null &&
-      timeLimitSeconds !== null &&
-      expectedArtifacts !== null &&
-      briefPackagePath !== null &&
-      briefDigest !== null;
-    const intentRefusal = await this.appendRunIntent(request, decision.key, latest.id);
-    if (intentRefusal !== null) {
-      return { outcome: 'refused', reason: intentRefusal };
-    }
-    if (!inputsReadable) {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'dispatch-inputs-unreadable');
-      if (resultRefusal !== null) {
-        return { outcome: 'refused', reason: resultRefusal };
-      }
-      return this.performPark(record, 'step-refused', 'dispatch', facts.state, request);
-    }
-    const role = implementerRoleFor(decision.round, facts.state);
-    const roundRaised = decision.round > record.round;
-    if (roundRaised || record.cursors[role] !== decision.seatIndex) {
-      const cursors: LaneRunCursorsRecord =
-        role === 'first-pass'
-          ? { ...record.cursors, 'first-pass': decision.seatIndex }
-          : { ...record.cursors, fix: decision.seatIndex };
-      const saved = await this.saveOrRefuse(
-        {
-          ...record,
-          round: roundRaised ? decision.round : record.round,
-          cursors,
-          revision: record.revision + 1,
-        },
-        request,
-      );
-      if (!saved.ok) {
-        // The pending intent is reconciled by K4-7 as never started; the
-        // dispatch is never called on a refused save.
-        return { outcome: 'refused', reason: saved.reason };
-      }
-      // Later writes in this advance (a park) must chain on the saved revision.
-      record = saved.record ?? record;
-    }
-    const pivot =
-      latest.kind === 'initial' && latest.priorAttemptId !== null && latest.seatSelection != null
-        ? latest.seatSelection
-        : null;
-    const seatOverride: AttemptSeatOverrideRecord | null =
-      pivot === null
-        ? null
-        : {
-            model: pivot.model,
-            ...(pivot.agent !== null ? { agent: pivot.agent } : {}),
-            ...(pivot.variant !== null ? { variant: pivot.variant } : {}),
-            reason: 'seat-plan pivot to ' + pivot.seatId,
-            setBy: 'conductor',
-            expiresAtIso: new Date(Date.parse(nowIso) + timeLimitSeconds * 1000).toISOString(),
-          };
-    const dispatched = await dispatch.dispatchAttempt({
-      attemptId: latest.id,
-      workOrderId: record.workOrderId,
-      worktreePath: latest.worktreePath,
-      briefPackagePath,
-      briefDigest,
-      baseCommit: latest.baseCommit,
-      stepLimit,
-      timeLimitSeconds,
-      expectedArtifacts,
-      nowIso,
-      ...(seatOverride !== null ? { seatOverride } : {}),
-      ...(this.deps.installationSchemaVersion !== undefined
-        ? { installationSchemaVersion: this.deps.installationSchemaVersion }
-        : {}),
-    });
-    if (dispatched.outcome === 'started' || dispatched.outcome === 'blocked' || dispatched.outcome === 'unknown') {
-      let reasonCode: LaneRunResultReasonCode;
-      if (dispatched.outcome === 'started') {
-        reasonCode = 'dispatch-started';
-      } else if (dispatched.outcome === 'blocked') {
-        reasonCode = 'dispatch-blocked';
-      } else {
-        reasonCode = 'dispatch-unknown';
-      }
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', reasonCode);
-      if (resultRefusal !== null) {
-        return { outcome: 'refused', reason: resultRefusal };
-      }
-      const conductRefusal = await this.conductDispatching(facts.state, request);
-      if (conductRefusal !== null) {
-        return { outcome: 'refused', reason: conductRefusal };
-      }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
-    }
-    // Refused: a runner refusal saved with its stop reason (S1) pivots through
-    // seat-failed; anything else parks for the owner (the key is spent).
-    const stored = await this.deps.attemptRepo.findAttemptById(latest.id);
-    let reasonCode: LaneRunResultReasonCode;
-    if (stored !== null && stored.state === 'cancelled') {
-      reasonCode = 'runner-refused';
-    } else {
-      reasonCode = 'dispatch-refused';
-    }
-    const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', reasonCode);
-    if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
-    }
-    if (reasonCode === 'runner-refused') {
-      const conductRefusal = await this.conductDispatching(facts.state, request);
-      if (conductRefusal !== null) {
-        return { outcome: 'refused', reason: conductRefusal };
-      }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
-    }
-    return this.performPark(record, 'step-refused', 'dispatch', facts.state, request);
-  }
-
-  /** The `dispatching` conduct entry after a dispatch, unless the run is already in it. */
-  private async conductDispatching(
-    state: LaneRunStateValue,
-    request: AdvanceLaneRunRequest,
-  ): Promise<AdvanceLaneRunRefusal | null> {
-    if (state === 'dispatching') {
-      return null;
-    }
-    const appended = await this.appendConduct(request, 'dispatching');
-    return appended.ok ? null : appended.reason;
-  }
-
-  /**
-   * The `act stop` decision (K4-6): stop the latest running attempt through
-   * `StopAttemptPort`. A timeout (no force) journals `stop-timeout` when the
-   * stop terminated or cancelled, `stop-unconfirmed` when still-running or
-   * unknown (the decider retries under `/retryN`), and parks `stop-refused`
-   * on a refusal. A forced run maps the plan's §3.8 table: stopped releases or
-   * holds the slot, still-running parks `stop-unconfirmed`, a refusal parks
-   * `stop-refused` with the attempt's re-read kind, never its text.
-   */
-  private async performStop(
-    record: LaneRunRecord,
-    gathered: GatheredLaneRunFacts,
-    decision: Extract<LaneRunDecision, { kind: 'act' }>,
-    request: AdvanceLaneRunRequest,
-  ): Promise<AdvanceLaneRunResult> {
-    const stop = this.deps.stopAttempt;
-    if (stop === undefined) {
-      return { outcome: 'not-wired', step: decision.step };
-    }
-    const latest = gathered.latestAttempt;
-    if (latest === null) {
-      return { outcome: 'waiting', reason: 'facts-inconsistent' };
-    }
-    const intentRefusal = await this.appendRunIntent(request, decision.key, null);
-    if (intentRefusal !== null) {
-      return { outcome: 'refused', reason: intentRefusal };
-    }
-    const result = await stop.stopAttempt({ attemptId: latest.id, nowIso: request.nowIso });
-    const mapped = await runStopOutcomeOf(result, latest.id, this.deps.attemptRepo);
-    const effect = laneRunStopEffect(mapped);
-    if (gathered.facts.stopMode === 'force') {
-      return this.finishForceStop(record, gathered, decision, effect, request);
-    }
-    if (mapped.outcome === 'terminated' || mapped.outcome === 'cancelled') {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'stop-timeout');
-      if (resultRefusal !== null) {
-        return { outcome: 'refused', reason: resultRefusal };
-      }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-timeout' };
-    }
-    if (mapped.outcome === 'still-running' || mapped.outcome === 'unknown') {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'stop-unconfirmed');
-      if (resultRefusal !== null) {
-        return { outcome: 'refused', reason: resultRefusal };
-      }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-unconfirmed' };
-    }
-    const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', null);
-    if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
-    }
-    return this.performPark(record, 'stop-refused', effect.run === 'parked' ? effect.qualifier : null, gathered.facts.state, request);
-  }
-
-  /** The force branch of `act stop` (§3.8): stopped, stop-unconfirmed or stop-refused. */
-  private async finishForceStop(
-    record: LaneRunRecord,
-    gathered: GatheredLaneRunFacts,
-    decision: Extract<LaneRunDecision, { kind: 'act' }>,
-    effect: RunStopEffect,
-    request: AdvanceLaneRunRequest,
-  ): Promise<AdvanceLaneRunResult> {
-    if (effect.run === 'stopped') {
-      const reasonCode = effect.capacity === 'held' ? 'stop-force-slot-held' : 'stop-force';
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', reasonCode);
-      if (resultRefusal !== null) {
-        return { outcome: 'refused', reason: resultRefusal };
-      }
-      const appended = await this.appendConduct(request, 'stopped');
-      if (!appended.ok) {
-        return { outcome: 'refused', reason: appended.reason };
-      }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
-    }
-    if (effect.reason === 'stop-unconfirmed') {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'stop-unconfirmed');
-      if (resultRefusal !== null) {
-        return { outcome: 'refused', reason: resultRefusal };
-      }
-      if (record.parked === null) {
-        return this.performPark(record, 'stop-unconfirmed', null, gathered.facts.state, request);
-      }
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-unconfirmed' };
-    }
-    const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', null);
-    if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
-    }
-    return this.performPark(record, 'stop-refused', effect.qualifier, gathered.facts.state, request);
+    return performPark(this.ctx, record, decision.reason, decision.qualifier, decision.parkedFrom, request);
   }
 
   /**
@@ -942,7 +403,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     if (latest.runner?.kind === 'agy' && commitEditOnlyAttempt === undefined) {
       return { outcome: 'not-wired', step: decision.step };
     }
-    const intentRefusal = await this.appendRunIntent(request, decision.key, null);
+    const intentRefusal = await appendRunIntent(this.ctx, request, decision.key, null);
     if (intentRefusal !== null) {
       return { outcome: 'refused', reason: intentRefusal };
     }
@@ -977,7 +438,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'not-wired', step: decision.step };
     }
     if (latest.state !== 'ended' || latest.completionReceipt === null) {
-      const resultRefusal = await this.appendRunResult(request, key, 'refused', 'no-completion-receipt');
+      const resultRefusal = await appendRunResult(this.ctx, request, key, 'refused', 'no-completion-receipt');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
@@ -988,7 +449,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     const manifest = await readFrozenManifest(latest, this.deps.artifactPort);
     const expectedArtifacts = manifest === null ? null : manifestExpectedArtifacts(manifest);
     if (expectedArtifacts === null) {
-      const resultRefusal = await this.appendRunResult(request, key, 'refused', 'collect-refused');
+      const resultRefusal = await appendRunResult(this.ctx, request, key, 'refused', 'collect-refused');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
@@ -1001,14 +462,14 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
         nowIso: request.nowIso,
       });
       if (committed.outcome === 'refused') {
-        const resultRefusal = await this.appendRunResult(request, key, 'refused', 'edit-only-refused');
+        const resultRefusal = await appendRunResult(this.ctx, request, key, 'refused', 'edit-only-refused');
         if (resultRefusal !== null) {
           return { outcome: 'refused', reason: resultRefusal };
         }
         return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'edit-only-refused' };
       }
       if (committed.outcome === 'unknown') {
-        const resultRefusal = await this.appendRunResult(request, key, 'ambiguous', 'edit-only-unknown');
+        const resultRefusal = await appendRunResult(this.ctx, request, key, 'ambiguous', 'edit-only-unknown');
         if (resultRefusal !== null) {
           return { outcome: 'refused', reason: resultRefusal };
         }
@@ -1022,13 +483,13 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       completionReceipt: latest.completionReceipt,
     });
     if (collected.outcome === 'collected') {
-      const resultRefusal = await this.appendRunResult(request, key, 'completed', 'collected');
+      const resultRefusal = await appendRunResult(this.ctx, request, key, 'completed', 'collected');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
       return { outcome: 'acted', step: decision.step, key, result: 'completed', reasonCode: 'collected' };
     }
-    const resultRefusal = await this.appendRunResult(request, key, 'refused', 'collect-refused');
+    const resultRefusal = await appendRunResult(this.ctx, request, key, 'refused', 'collect-refused');
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
@@ -1050,7 +511,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     if (preCheck !== null) {
       return preCheck;
     }
-    const intentRefusal = await this.appendRunIntent(request, decision.key, null);
+    const intentRefusal = await appendRunIntent(this.ctx, request, decision.key, null);
     if (intentRefusal !== null) {
       return { outcome: 'refused', reason: intentRefusal };
     }
@@ -1073,7 +534,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     }
     // Only a sealed collection is gated: a missing or mismatched C1 manifest parks first.
     if (gathered.facts.attempt?.collection?.manifest !== 'sealed') {
-      return this.performPark(record, 'artifacts-unsealed', null, gathered.facts.state, request);
+      return performPark(this.ctx, record, 'artifacts-unsealed', null, gathered.facts.state, request);
     }
     return null;
   }
@@ -1105,72 +566,24 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       candidateHeadSha: latest.artifacts.headCommit,
     });
     if (verdict.verdict === 'passed') {
-      const resultRefusal = await this.appendRunResult(request, key, 'completed', 'gate-passed');
+      const resultRefusal = await appendRunResult(this.ctx, request, key, 'completed', 'gate-passed');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
       return { outcome: 'acted', step: decision.step, key, result: 'completed', reasonCode: 'gate-passed' };
     }
     if (verdict.verdict === 'failed') {
-      const resultRefusal = await this.appendRunResult(request, key, 'completed', 'gate-failed');
+      const resultRefusal = await appendRunResult(this.ctx, request, key, 'completed', 'gate-failed');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
       return { outcome: 'acted', step: decision.step, key, result: 'completed', reasonCode: 'gate-failed' };
     }
-    const resultRefusal = await this.appendRunResult(request, key, 'ambiguous', 'gate-unknown');
+    const resultRefusal = await appendRunResult(this.ctx, request, key, 'ambiguous', 'gate-unknown');
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
     return { outcome: 'acted', step: decision.step, key, result: 'ambiguous', reasonCode: 'gate-unknown' };
-  }
-
-  /**
-   * The G4e `cancel` decision (K4-5): the record-only cancel of a prepared,
-   * never-dispatched attempt, journalled under its stop step key.
-   */
-  private async performCancel(
-    decision: Extract<LaneRunDecision, { kind: 'cancel' }>,
-    request: AdvanceLaneRunRequest,
-  ): Promise<AdvanceLaneRunResult> {
-    const cancel = this.deps.cancelPreparedAttempt;
-    if (cancel === undefined) {
-      return { outcome: 'not-wired', step: 'stop' };
-    }
-    const intentRefusal = await this.appendRunIntent(request, decision.key, decision.attemptId);
-    if (intentRefusal !== null) {
-      return { outcome: 'refused', reason: intentRefusal };
-    }
-    const cancelled = await cancel.cancelPreparedAttempt({
-      attemptId: decision.attemptId,
-      nowIso: request.nowIso,
-    });
-    let outcome: LaneRunJournalOutcome;
-    let reasonCode: LaneRunResultReasonCode;
-    if (cancelled.outcome === 'cancelled') {
-      outcome = 'cancelled-unstarted';
-      if (cancelled.capacity === 'released') {
-        reasonCode = 'capacity-released';
-      } else if (cancelled.capacity === 'none-held') {
-        reasonCode = 'capacity-none-held';
-      } else {
-        reasonCode = 'capacity-held';
-      }
-    } else if (cancelled.reason === 'not-prepared') {
-      outcome = 'refused';
-      reasonCode = 'cancel-refused';
-    } else if (cancelled.reason === 'changed') {
-      outcome = 'refused';
-      reasonCode = 'cancel-changed';
-    } else {
-      outcome = 'cancelled-unstarted';
-      reasonCode = 'attempt-absent';
-    }
-    const resultRefusal = await this.appendRunResult(request, decision.key, outcome, reasonCode);
-    if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
-    }
-    return { outcome: 'acted', step: 'stop', key: decision.key, result: outcome, reasonCode };
   }
 
   /**
@@ -1208,17 +621,6 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     return { outcome: 'not-built', decision: 'reconcile', step: decision.step };
   }
 
-  /** The minted id of a key's intent, or null when the key has no intent. */
-  private async intentMintedIdOf(key: string): Promise<string | null> {
-    const entries = await this.deps.runJournal.listForKey(key);
-    for (const entry of entries) {
-      if (entry.kind === 'intent') {
-        return entry.mintedId;
-      }
-    }
-    return null;
-  }
-
   /**
    * The prepare reconcile (§3.5): the key's minted id is the attempt the
    * prepare act wrote before it saved the run record. When the attempt
@@ -1233,9 +635,9 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
     request: AdvanceLaneRunRequest,
   ): Promise<AdvanceLaneRunResult> {
-    const mintedId = await this.intentMintedIdOf(decision.key);
+    const mintedId = await intentMintedIdOf(this.ctx, decision.key);
     if (mintedId === null) {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'not-started', 'attempt-absent');
+      const resultRefusal = await appendRunResult(this.ctx, request, decision.key, 'not-started', 'attempt-absent');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
@@ -1247,7 +649,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     // The ordinal is spent on the run record BEFORE the result is journalled: once a result exists this
     // handler never runs again, so a crash between the two must leave the id on the run, never off it.
     if (!record.attemptIds.includes(mintedId)) {
-      const saved = await this.saveOrRefuse(
+      const saved = await saveOrRefuse(this.ctx,
         { ...record, attemptIds: [...record.attemptIds, mintedId], revision: record.revision + 1 },
         request,
       );
@@ -1255,7 +657,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
         return { outcome: 'refused', reason: saved.reason };
       }
     }
-    const resultRefusal = await this.appendRunResult(request, decision.key, outcome, reasonCode);
+    const resultRefusal = await appendRunResult(this.ctx, request, decision.key, outcome, reasonCode);
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
@@ -1274,7 +676,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
     request: AdvanceLaneRunRequest,
   ): Promise<AdvanceLaneRunResult> {
-    const mintedId = await this.intentMintedIdOf(decision.key);
+    const mintedId = await intentMintedIdOf(this.ctx, decision.key);
     const attempt = mintedId === null ? null : await this.deps.attemptRepo.findAttemptById(mintedId);
     if (
       attempt !== null &&
@@ -1294,11 +696,11 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return this.closeDispatchNotStarted(decision, request);
     }
     if (attempt !== null && attempt.state === 'cancelled') {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'refused', 'runner-refused');
+      const resultRefusal = await appendRunResult(this.ctx, request, decision.key, 'refused', 'runner-refused');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
-      const conductRefusal = await this.conductDispatching(gathered.facts.state, request);
+      const conductRefusal = await conductDispatching(this.ctx, gathered.facts.state, request);
       if (conductRefusal !== null) {
         return { outcome: 'refused', reason: conductRefusal };
       }
@@ -1313,7 +715,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
         return this.reconcileDispatchStarted(gathered, decision, request, 'reconciled');
       }
       // unknown, refused, not-found: the next advance parks `ambiguous dispatch`.
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'ambiguous', 'dispatch-unknown');
+      const resultRefusal = await appendRunResult(this.ctx, request, decision.key, 'ambiguous', 'dispatch-unknown');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
@@ -1330,11 +732,11 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     request: AdvanceLaneRunRequest,
     reasonCode: LaneRunResultReasonCode,
   ): Promise<AdvanceLaneRunResult> {
-    const resultRefusal = await this.appendRunResult(request, decision.key, 'reconciled', reasonCode);
+    const resultRefusal = await appendRunResult(this.ctx, request, decision.key, 'reconciled', reasonCode);
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
-    const conductRefusal = await this.conductDispatching(gathered.facts.state, request);
+    const conductRefusal = await conductDispatching(this.ctx, gathered.facts.state, request);
     if (conductRefusal !== null) {
       return { outcome: 'refused', reason: conductRefusal };
     }
@@ -1358,7 +760,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     request: AdvanceLaneRunRequest,
   ): Promise<AdvanceLaneRunResult> {
     const ambiguous = async (reasonCode: LaneRunResultReasonCode): Promise<AdvanceLaneRunResult> => {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'ambiguous', reasonCode);
+      const resultRefusal = await appendRunResult(this.ctx, request, decision.key, 'ambiguous', reasonCode);
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
@@ -1396,7 +798,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     }
     const worktree = await resolved.runner.inspectWorktreeRun({ attemptId, worktreePath, runner: runnerRecord });
     if (worktree.state === 'running') {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'ambiguous', 'worktree-running');
+      const resultRefusal = await appendRunResult(this.ctx, request, decision.key, 'ambiguous', 'worktree-running');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
@@ -1431,7 +833,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
     request: AdvanceLaneRunRequest,
   ): Promise<AdvanceLaneRunResult> {
-    const resultRefusal = await this.appendRunResult(request, decision.key, 'not-started', 'worktree-idle');
+    const resultRefusal = await appendRunResult(this.ctx, request, decision.key, 'not-started', 'worktree-idle');
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
@@ -1453,7 +855,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     request: AdvanceLaneRunRequest,
   ): Promise<AdvanceLaneRunResult> {
     // The G4e cancel journals under the stop key with its attempt id; a stop intent carries none.
-    const cancelAttemptId = await this.intentMintedIdOf(decision.key);
+    const cancelAttemptId = await intentMintedIdOf(this.ctx, decision.key);
     if (cancelAttemptId !== null) {
       return this.reconcileCancel(cancelAttemptId, decision, request);
     }
@@ -1466,7 +868,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
         attempt.state === 'collected' ||
         (attempt.state === 'ended' && attempt.completionReceipt !== null && attempt.completionReceipt.authoritative === true));
     if (!terminal) {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'stop-unconfirmed');
+      const resultRefusal = await appendRunResult(this.ctx, request, decision.key, 'completed', 'stop-unconfirmed');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
@@ -1477,17 +879,17 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       const reservations = await this.deps.executionJournal.listActiveReservations();
       const held = attempt !== null && reservations.some((reservation) => reservation.attemptId === attempt.id && reservation.held);
       const reasonCode = held ? 'stop-force-slot-held' : 'stop-force';
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', reasonCode);
+      const resultRefusal = await appendRunResult(this.ctx, request, decision.key, 'completed', reasonCode);
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
-      const appended = await this.appendConduct(request, 'stopped');
+      const appended = await appendConduct(this.ctx, request, 'stopped');
       if (!appended.ok) {
         return { outcome: 'refused', reason: appended.reason };
       }
       return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
     }
-    const resultRefusal = await this.appendRunResult(request, decision.key, 'completed', 'stop-timeout');
+    const resultRefusal = await appendRunResult(this.ctx, request, decision.key, 'completed', 'stop-timeout');
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
@@ -1537,7 +939,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       outcome = 'refused';
       reasonCode = 'cancel-refused';
     }
-    const resultRefusal = await this.appendRunResult(request, decision.key, outcome, reasonCode);
+    const resultRefusal = await appendRunResult(this.ctx, request, decision.key, outcome, reasonCode);
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
@@ -1561,7 +963,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'waiting', reason: 'facts-inconsistent' };
     }
     if (latest.state === 'collected') {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'reconciled', 'collected');
+      const resultRefusal = await appendRunResult(this.ctx, request, decision.key, 'reconciled', 'collected');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
@@ -1609,13 +1011,13 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     }
     const entries = await this.deps.runJournal.listForKey(decision.key);
     if (!entries.some((entry) => entry.kind === 'intent')) {
-      const intentRefusal = await this.appendRunIntent(request, decision.key, latest.id);
+      const intentRefusal = await appendRunIntent(this.ctx, request, decision.key, latest.id);
       if (intentRefusal !== null) {
         return { outcome: 'refused', reason: intentRefusal };
       }
     }
     if ((latest.runner ?? null) === null && (parseSeatTool(latest.seatSelection?.tool) ?? 'opencode') === 'agy') {
-      const resultRefusal = await this.appendRunResult(request, decision.key, 'ambiguous', 'worktree-unknown');
+      const resultRefusal = await appendRunResult(this.ctx, request, decision.key, 'ambiguous', 'worktree-unknown');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
@@ -1635,30 +1037,11 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       outcome = 'reconciled';
       reasonCode = 'reconciled';
     }
-    const resultRefusal = await this.appendRunResult(request, decision.key, outcome, reasonCode);
+    const resultRefusal = await appendRunResult(this.ctx, request, decision.key, outcome, reasonCode);
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: outcome, reasonCode };
-  }
-
-  private async appendConduct(
-    request: AdvanceLaneRunRequest,
-    state: LaneRunStateValue,
-  ): Promise<WriteOutcome> {
-    const appended = await this.deps.runJournal.append(
-      laneRunConductEntry(this.deps.newUlid(), request.runId, state, request.nowIso),
-    );
-    return appended.outcome === 'appended' ? { ok: true } : { ok: false, reason: 'journal-refused' };
-  }
-
-  private async saveOrRefuse(next: LaneRunRecord, request: AdvanceLaneRunRequest): Promise<WriteOutcome> {
-    const saved = await this.deps.runRepo.save(next, {
-      holderId: request.lease.holderId,
-      fence: request.lease.fence,
-      nowIso: request.nowIso,
-    });
-    return saved.outcome === 'saved' ? { ok: true, record: saved.record } : { ok: false, reason: 'save-refused' };
   }
 
   /**
@@ -1846,7 +1229,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
         nowIso: request.nowIso,
       });
       if (admission.outcome === 'refused') {
-        return this.performPark(record, 'step-refused', 'dispatch', facts.state, request);
+        return performPark(this.ctx, record, 'step-refused', 'dispatch', facts.state, request);
       }
     }
     return { outcome: 'waiting', reason: 'admission' };

@@ -369,9 +369,10 @@ describe('encodeOtlpTraces over every span kind and a plan-billed LLM span (Luna
     expect(result.payload).not.toBeNull();
     // A plan-billed LLM span never carries a model or a cost on the wire.
     const text = new TextDecoder().decode(result.payload as Uint8Array);
-    if (result.encodedSpanIds.includes('b'.repeat(16))) {
-      expect(text).not.toContain('llm.cost.total');
-    }
+    expect(result.refused).toEqual([]);
+    expect(result.encodedSpanIds).toContain('b'.repeat(16));
+    expect(text).not.toContain('llm.cost.total');
+    expect(text).not.toContain('llm.model_name');
     const report = redactionChecks(result.payload as Uint8Array, []);
     expect(report.checks.filter((entry) => !entry.pass)).toEqual([]);
   });

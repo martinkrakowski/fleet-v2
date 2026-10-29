@@ -55,7 +55,7 @@ if [ "$cmd" = stop ]; then
       return 1
     }
     for fpid in $(pgrep -f "[s]sh .*-f -N .*fleet-e2e"); do
-      argv=$(ps -p "$fpid" -o args= 2>/dev/null || true)
+      argv=$(ps -ww -p "$fpid" -o args= 2>/dev/null || true)
       if matches_fixture "$argv"; then
         kill -TERM "$fpid" 2>/dev/null || true
       fi
@@ -64,7 +64,7 @@ if [ "$cmd" = stop ]; then
     while [ "$i" -lt 20 ]; do
       alive=false
       for fpid in $(pgrep -f "[s]sh .*-f -N .*fleet-e2e"); do
-        argv=$(ps -p "$fpid" -o args= 2>/dev/null || true)
+        argv=$(ps -ww -p "$fpid" -o args= 2>/dev/null || true)
         if matches_fixture "$argv"; then alive=true; fi
       done
       [ "$alive" = true ] || break
@@ -72,7 +72,7 @@ if [ "$cmd" = stop ]; then
       i=$((i + 1))
     done
     for fpid in $(pgrep -f "[s]sh .*-f -N .*fleet-e2e"); do
-      argv=$(ps -p "$fpid" -o args= 2>/dev/null || true)
+      argv=$(ps -ww -p "$fpid" -o args= 2>/dev/null || true)
       if matches_fixture "$argv"; then
         kill -KILL "$fpid" 2>/dev/null || true
       fi

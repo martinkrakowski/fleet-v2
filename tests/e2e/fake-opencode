@@ -7,8 +7,15 @@
 #   FAKE_OPENCODE_FLIP=1    — flip the created session to busy via /__start.
 #   FAKE_OPENCODE_ARGV_FILE — when set, the full argv is appended there (one
 #                             line, NUL bytes turned into spaces).
-#   FAKE_OPENCODE_END=1     — after the flip, post /__end/<sid> and exit 0
-#                             (a lane that ends at once).
+#   FAKE_OPENCODE_END=1     — after the flip, keep the session busy for
+#                             FAKE_OPENCODE_END_AFTER_SECONDS (default 3)
+#                             seconds, then post /__end/<sid> and exit 0 (a
+#                             lane that ends at once). ocm-run --detach polls
+#                             /api/session/active right after the spawn and
+#                             then every 1 s; a session that is unlisted again
+#                             before the second poll is never seen active and
+#                             ocm-run would wait OCM_START_MAX and abort it, so
+#                             the busy window must outlast the first polls.
 #   FAKE_OPENCODE_LANE_SCRIPT — when set to a path, run it with `sh` in the
 #                             client's cwd (the worktree) after the flip and
 #                             before ending (Q1c: a lane that commits).
@@ -41,6 +48,11 @@ if [ -n "${FAKE_OPENCODE_LANE_SCRIPT:-}" ]; then
   sh "$FAKE_OPENCODE_LANE_SCRIPT"
 fi
 if [ "${FAKE_OPENCODE_END:-0}" = 1 ]; then
+  # Stay busy long enough for every 1 s readiness poll to see the session:
+  # ending right after the flip would make ocm-run --detach never see it
+  # active and abort it after OCM_START_MAX.
+  end_after=${FAKE_OPENCODE_END_AFTER_SECONDS:-3}
+  sleep "$end_after"
   node -e 'fetch(process.argv[1] + "/__end/" + process.argv[2], { method: "POST" }).catch(() => {})' "$url" "$sid" >/dev/null 2>&1
   exit 0
 fi

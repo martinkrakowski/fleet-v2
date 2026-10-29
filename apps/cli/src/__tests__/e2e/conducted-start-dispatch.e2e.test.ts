@@ -18,6 +18,14 @@ import { startConductedFixture, type ConductedFixture } from './conducted.js';
 
 const TEST_TIMEOUT_MS = 120000;
 
+/** Fixture git reads run insulated from the real $HOME config (see m4). */
+const GIT_SAFE_ARGS = [
+  '-c', 'commit.gpgSign=false',
+  '-c', 'core.hooksPath=/dev/null',
+  '-c', 'user.name=example',
+  '-c', 'user.email=example@example.invalid',
+];
+
 const liveFixtures = new Set<ConductedFixture>();
 
 async function startFixture(options?: Parameters<typeof startConductedFixture>[0]) {
@@ -27,9 +35,13 @@ async function startFixture(options?: Parameters<typeof startConductedFixture>[0
 }
 
 afterEach(async () => {
+  // Restore the prototype spies (SshExecutor.run, LocalExecutor.run) before the
+  // next test and stop the fixtures in LIFO order: the newest fixture's PATH
+  // entry sits first, so it must be removed first.
+  vi.restoreAllMocks();
   const current = [...liveFixtures];
   liveFixtures.clear();
-  for (const instance of current) {
+  for (const instance of current.reverse()) {
     await instance.stop();
   }
 });
@@ -153,6 +165,21 @@ describe.skipIf(process.env.FLEET_E2E_SSH !== '1')('conducted start + dispatch o
     const current = await startFixture();
     const startResult = await current.start(1);
     expect(startResult.code).toBe(0);
+
+    // Before dispatch the attempt's runner is the bare recorded host: null
+    // agent/model/variant and the fake port (KF-8, the brief's item 4).
+    const before = await findAttemptOf(current);
+    expect(before).not.toBeNull();
+    expect(before!.runner).toEqual({
+      kind: 'opencode',
+      hostName: 'lane-host',
+      host: 'fleet-e2e',
+      remotePort: fakePortOf(current),
+      agent: null,
+      model: null,
+      variant: null,
+    });
+
     const pass = await current.runPass();
     expect(pass.code).toBe(0);
 
@@ -196,9 +223,9 @@ describe.skipIf(process.env.FLEET_E2E_SSH !== '1')('conducted start + dispatch o
       await fs.readFile(path.join(worktreePath, '.lane', 'brief-manifest.json'), 'utf8'),
     ) as Record<string, unknown>;
     expect(manifest.workOrderId).toBe('wo-example-1');
-    const head = String(execFileSync('git', ['-C', worktreePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' })).trim();
+    const head = String(execFileSync('git', [...GIT_SAFE_ARGS, '-C', worktreePath, 'rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 20000 })).trim();
     expect(head).toBe(current.baseCommit);
-    const branch = String(execFileSync('git', ['-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' })).trim();
+    const branch = String(execFileSync('git', [...GIT_SAFE_ARGS, '-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8', timeout: 20000 })).trim();
     expect(branch).toBe(`fleet/${current.runId}`);
 
     // Every worktree git command ran on the recorded host fleet-e2e.

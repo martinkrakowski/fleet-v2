@@ -625,7 +625,13 @@ export function laneRunSpans(hmac: TelemetryHmac, facts: LaneRunTelemetryFacts):
         continue;
       }
       const roundSpanId = telemetrySpanId(hmac, root, roundIdentityOf);
-      if (roundSpanId === null || !spans.some((span) => span.spanId === roundSpanId)) {
+      if (roundSpanId === null) {
+        // The parent id could not be built: drop and count, never half-built.
+        rejected.count += 1;
+        continue;
+      }
+      if (!spans.some((span) => span.spanId === roundSpanId)) {
+        // The round span is not closed yet; the attempt waits for it.
         continue;
       }
       const attemptBuilt = build({

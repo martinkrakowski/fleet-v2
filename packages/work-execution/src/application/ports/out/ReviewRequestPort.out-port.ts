@@ -69,8 +69,29 @@ export type FindReviewReceiptResult =
   | { readonly outcome: 'not-found' }
   | { readonly outcome: 'unavailable'; readonly reason: 'invalid-request' | 'not-configured' | 'unreadable' | 'receipt-mismatch' };
 
+export interface FindLatestReceiptOfKindRequest {
+  readonly attemptId: string;
+  readonly candidateHeadSha: string;
+  readonly kind: ReviewRequestKind;
+}
+
+/** A receipt of one kind at one head; manual receipts carry no request id. */
+export type ReviewReceiptOfKind = Omit<ReviewReceiptSummary, 'requestId'> & {
+  readonly requestId: string | null;
+};
+
+export type FindLatestReceiptOfKindResult =
+  | { readonly outcome: 'found'; readonly receipt: ReviewReceiptOfKind }
+  | { readonly outcome: 'not-found' }
+  | { readonly outcome: 'unavailable'; readonly reason: 'invalid-request' | 'not-configured' | 'unreadable' };
+
 export interface ReviewRequestPort {
   requestReview(request: ReviewRequest): Promise<ReviewRequestResult>;
   /** §3.5: a receipt with the request id counts. Read-only. */
   findReviewReceipt(request: FindReviewReceiptRequest): Promise<FindReviewReceiptResult>;
+  /**
+   * D3: the latest receipt of exactly `kind` at `candidateHeadSha` (by
+   * `completedAtIso`; a receipt without a kind never matches). Read-only.
+   */
+  findLatestReceiptOfKind(request: FindLatestReceiptOfKindRequest): Promise<FindLatestReceiptOfKindResult>;
 }

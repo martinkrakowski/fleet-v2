@@ -16,6 +16,7 @@ import {
   AdvanceLaneRunUseCase,
   CancelPreparedAttemptUseCase,
   LaneRunAdmissionAdapter,
+  PrepareFixAttemptUseCase,
   ResumeLaneRunUseCase,
   RunConductorPassUseCase,
   StartLaneRunUseCase,
@@ -31,6 +32,8 @@ import {
   type StartLaneRunPort,
   type WorkOrderRepositoryAdapter,
 } from '@fleet/work-execution';
+
+import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 
 import { createDryRunFakes } from './conductor-dry-run.js';
 import { newUlid } from './ulid.js';
@@ -161,6 +164,12 @@ export function buildLiveConductorDriver(
     commitEditOnlyAttempt: execution.commitEditOnlyAttempt,
     evaluateAttemptGate: execution.requestAttemptAcceptance,
     runnerForAttempt: execution.runnerForAttempt,
+    reviewRequest: conductor.reviewRequest,
+    reviewAssessment: conductor.reviewAssessment,
+    sameModelFamily: (left, right) =>
+      isSameModelFamily(underlyingModelFamily(left), underlyingModelFamily(right)),
+    workOrderRepo: execution.workOrderRepository,
+    prepareFixAttempt: execution.prepareFixAttempt,
   });
   const start = new StartLaneRunUseCase({
     workOrderRepo: execution.workOrderRepository,
@@ -240,6 +249,11 @@ export function buildDryRunConductorDriver(
     commitEditOnlyAttempt: fakes.commitEditOnlyAttempt,
     evaluateAttemptGate: fakes.evaluateAttemptGate,
     runnerForAttempt: fakes.runnerForAttempt,
+    reviewRequest: fakes.reviewRequest,
+    reviewAssessment: fakes.reviewAssessment,
+    sameModelFamily: () => false,
+    workOrderRepo: stores.workOrderRepo,
+    prepareFixAttempt: new PrepareFixAttemptUseCase({ attemptRepo: stores.attemptRepo }),
   });
   return buildConductorDriver({
     driverLease: stores.driverLease,

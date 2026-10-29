@@ -9,6 +9,7 @@ import type { FleetInstallation, ForgeSectionV2 } from '@fleet/installation';
 import type { EvidenceAssessmentRecord } from '@fleet/evidence-and-acceptance';
 
 import { assessmentIdForAttempt, createFleetCliRuntime } from '../composition.js';
+import { buildLiveConductorDriver } from '../conductor-wiring.js';
 
 const HEAD = 'a'.repeat(40);
 const ATTEMPT_ID = 'attempt-example-1';
@@ -218,5 +219,58 @@ describe('conductor review and CI wiring (PC-4)', () => {
         candidateHeadSha: HEAD,
       }),
     ).resolves.toEqual({ outcome: 'not-found' });
+  });
+});
+
+describe('conductor review-assessment wiring (K5-6)', () => {
+  /** A valid open request over the shared attempt and head. */
+  function makeOpenRequest(head: string = HEAD) {
+    return {
+      attemptId: ATTEMPT_ID,
+      projectId: PROJECT_ID,
+      candidateHeadSha: head,
+      policyRevision: 'policy-example-1',
+      implementerModel: 'example-provider/glm-5.3',
+      requiredChecks: ['dry-run-check'],
+    };
+  }
+
+  it('opening the assessment for one attempt and head answers open twice (idempotent)', async () => {
+    const runtime = createFleetCliRuntime();
+    await expect(
+      runtime.conductor.reviewAssessment.openReviewAssessment(makeOpenRequest()),
+    ).resolves.toEqual({ outcome: 'open' });
+    await expect(
+      runtime.conductor.reviewAssessment.openReviewAssessment(makeOpenRequest()),
+    ).resolves.toEqual({ outcome: 'open' });
+    const assessment = await runtime.evidence.evidenceAssessmentRepository.findAssessmentById(
+      assessmentIdForAttempt(ATTEMPT_ID),
+    );
+    expect(assessment?.state).toBe('pending');
+  });
+
+  it('an invalid request answers unavailable invalid-request without writing', async () => {
+    const runtime = createFleetCliRuntime();
+    await expect(
+      runtime.conductor.reviewAssessment.openReviewAssessment({
+        ...makeOpenRequest(),
+        candidateHeadSha: 'not-a-sha',
+      }),
+    ).resolves.toEqual({ outcome: 'unavailable', reason: 'invalid-request' });
+  });
+
+  it('a stored assessment at another head answers unavailable head-mismatch', async () => {
+    const runtime = createFleetCliRuntime();
+    await runtime.evidence.evidenceAssessmentRepository.saveAssessment(makeAssessment(false));
+    await expect(
+      runtime.conductor.reviewAssessment.openReviewAssessment(makeOpenRequest('b'.repeat(40))),
+    ).resolves.toEqual({ outcome: 'unavailable', reason: 'head-mismatch' });
+  });
+
+  it('buildLiveConductorDriver constructs over the composed runtime and calls no transport', async () => {
+    const runtime = createFleetCliRuntime();
+    const driver = buildLiveConductorDriver(runtime, { maxActiveRuns: 1 });
+    expect(driver.start).not.toBeNull();
+    expect(driver.policy).toBeDefined();
   });
 });

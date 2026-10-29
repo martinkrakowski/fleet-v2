@@ -65,6 +65,7 @@ import {
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
   RequestAttemptAcceptanceUseCase,
+  ReviewAssessmentAdapter,
   ReviewRequestAdapter,
   ReserveExecutionCapacityUseCase,
   RunnerForAttemptAdapter,
@@ -118,6 +119,7 @@ import {
   IndependentReviewAdapter,
   InspectAcceptanceEvidenceUseCase,
   InspectHeadCiStateUseCase,
+  OpenEvidenceAssessmentUseCase,
   type OcmReviewTransportSpawn,
   OwnerDecisionAdapter,
   RecordFindingDispositionUseCase,
@@ -612,6 +614,8 @@ export interface FleetCliRuntime {
     readonly attemptOwnerDecision: AttemptOwnerDecisionAdapter;
     readonly requestVerification: RequestVerificationUseCase;
     readonly requestIndependentReview: RequestIndependentReviewUseCase;
+    /** Opens the pending evidence assessment for a conductor review (K5-E2); K5-6 composes it. */
+    readonly openEvidenceAssessment: OpenEvidenceAssessmentUseCase;
     readonly recordVerificationReceipt: RecordVerificationReceiptUseCase;
     readonly recordReviewReceipt: RecordReviewReceiptUseCase;
     readonly recordFindingDisposition: RecordFindingDispositionUseCase;
@@ -680,6 +684,8 @@ export interface FleetCliRuntime {
     readonly profileRead: ProjectProfileReadPort;
     /** The review step's port (PC); K5 composes it into the advance. */
     readonly reviewRequest: ReviewRequestAdapter;
+    /** Opens the evidence assessment before a conductor review (K5-3); K5-6 composes it into the advance. */
+    readonly reviewAssessment: ReviewAssessmentAdapter;
     /** CI per exact head (PC); K6 composes it. */
     readonly ciState: CiStateAdapter;
   };
@@ -1172,6 +1178,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       reviewer: independentReview,
       archive: evidenceArchive,
       seatPolicy,
+    }),
+    openEvidenceAssessment: new OpenEvidenceAssessmentUseCase({
+      repo: evidenceAssessmentRepository,
     }),
     recordVerificationReceipt: new RecordVerificationReceiptUseCase({
       repo: evidenceAssessmentRepository,
@@ -1993,6 +2002,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         evidence.requestIndependentReview.requestIndependentReview(request),
       inspectAcceptanceEvidence: (request) =>
         evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence(request),
+    }),
+    reviewAssessment: new ReviewAssessmentAdapter({
+      openEvidenceAssessment: (request) =>
+        evidence.openEvidenceAssessment.openEvidenceAssessment(request),
     }),
     ciState: new CiStateAdapter({
       inspectHeadCiState: (request) => evidence.inspectHeadCiState.inspectHeadCiState(request),

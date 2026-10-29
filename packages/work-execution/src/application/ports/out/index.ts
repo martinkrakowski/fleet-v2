@@ -15,6 +15,7 @@ export * from "./ChangeSignalPort.out-port.js";
 export * from "./CiStatePort.out-port.js";
 export * from "./CommandExecutorPort.out-port.js";
 export * from "./ConductorDriverLeasePort.out-port.js";
+export * from "./ConductorForgeGrantPort.out-port.js";
 export * from "./ConductorHaltPort.out-port.js";
 export * from "./ExecutionJournalPort.out-port.js";
 export * from "./ExecutionObservationPort.out-port.js";

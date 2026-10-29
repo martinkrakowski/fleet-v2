@@ -453,4 +453,90 @@ describe('ForgeActionAdapter push-to-pr', () => {
     ]);
   });
 
+  describe('push-and-open-pr title and body (K6-2)', () => {
+    it('uses the provided title and body instead of the defaults, each as one arg', async () => {
+      const { calls, runGh } = makeRunGh({
+        exitCode: 0,
+        stdout: 'https://github.com/org/repo/pull/124\n',
+        stderr: '',
+      });
+      const adapter = new ForgeActionAdapter({
+        runGh,
+        verifyCurrentHeadSha: async () => HEAD_SHA,
+      });
+
+      const result = await adapter.performForgeAction(
+        forgeActionRequest({
+          kind: 'push-and-open-pr',
+          title: 'feat: a titled change',
+          body: 'first line\nsecond line',
+        }),
+      );
+
+      expect(result).toEqual({ outcome: 'executed', pullRequestNumber: 124, headSha: HEAD_SHA });
+      expect(calls).toEqual([
+        [
+          'pr',
+          'create',
+          '--head',
+          `feat/${LANE_ID}`,
+          '--title',
+          'feat: a titled change',
+          '--body',
+          'first line\nsecond line',
+        ],
+      ]);
+    });
+
+    it('keeps the exact default title and body argv when none are provided', async () => {
+      const { calls, runGh } = makeRunGh({
+        exitCode: 0,
+        stdout: 'https://github.com/org/repo/pull/125\n',
+        stderr: '',
+      });
+      const adapter = new ForgeActionAdapter({
+        runGh,
+        verifyCurrentHeadSha: async () => HEAD_SHA,
+      });
+
+      await adapter.performForgeAction(forgeActionRequest({ kind: 'push-and-open-pr' }));
+
+      expect(calls).toEqual([
+        [
+          'pr',
+          'create',
+          '--head',
+          `feat/${LANE_ID}`,
+          '--title',
+          'Fleet work order wo-1',
+          '--body',
+          `Attempt attempt-1 (action action-1) at head ${HEAD_SHA}.`,
+        ],
+      ]);
+    });
+
+    it('does not leak title or body into merge-pr argv', async () => {
+      const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
+      const adapter = new ForgeActionAdapter({
+        runGh,
+        verifyCurrentHeadSha: async () => HEAD_SHA,
+      });
+
+      await adapter.performForgeAction(
+        forgeActionRequest({ kind: 'merge-pr', title: 'ignored', body: 'ignored' }),
+      );
+
+      expect(calls).toEqual([
+        [
+          'pr',
+          'merge',
+          `feat/${LANE_ID}`,
+          '--match-head-commit',
+          HEAD_SHA,
+          '--merge',
+        ],
+      ]);
+    });
+  });
+
 });

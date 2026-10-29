@@ -8,6 +8,10 @@ import { parseCoordinationRequestStateRecord } from './CoordinationRequestReposi
 import { parseOwnerQuestionStateRecord } from './OwnerQuestionRepositoryAdapter.adapter.js';
 import { parseOrchestratorSessionStateRecord } from './OrchestratorSessionRepositoryAdapter.adapter.js';
 import { parseOwnerItemStateRecord } from './OwnerItemRepositoryAdapter.adapter.js';
+import {
+  attentionItemListError,
+  parseAttentionItemStateRecord,
+} from './AttentionItemRepositoryAdapter.adapter.js';
 
 export const OPERATOR_COORDINATION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('project-profiles.json', parseProjectProfileStateRecord),
@@ -15,4 +19,5 @@ export const OPERATOR_COORDINATION_STATE_FILES: readonly StateFileDescriptor[] =
   describeRecordListStore('owner-questions.json', parseOwnerQuestionStateRecord),
   describeRecordListStore('orchestrators.json', parseOrchestratorSessionStateRecord),
   describeRecordListStore('owner-items.json', parseOwnerItemStateRecord),
+  describeRecordListStore('attention-items.json', parseAttentionItemStateRecord, attentionItemListError),
 ];

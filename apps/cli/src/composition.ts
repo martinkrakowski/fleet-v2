@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { withFileLock, writeJsonAtomically } from './file-store.js';
 import { newUlid } from './ulid.js';
+import { autoMergeSettingsFromLoad } from './auto-merge-settings.js';
 
 import {
   AcceptanceAssessmentAdapter,
@@ -30,6 +31,8 @@ import {
   ActionAuthorizationAdapter,
   AgyRunnerAdapter,
   AllowedSeatAdapter,
+  AutoMergeAttemptUseCase,
+  AutoMergeOwnerRoutingAdapter,
   AttemptArtifactAdapter,
   AttemptRepositoryAdapter,
   AttemptReviewLocator,
@@ -51,6 +54,7 @@ import {
   ListUnregisteredProjectsUseCase,
   LocalExecutor,
   OpencodeDbUsageAdapter,
+  PolicyMergeGrantAdapter,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
   ProbeProjectUseCase,
@@ -95,6 +99,7 @@ import {
   type GhInvocationResult,
   type SubprocessRunner,
   type CommandExecutorPort,
+  type AutoMergeSettingsPort,
 } from '@fleet/work-execution';
 
 import {
@@ -155,6 +160,7 @@ import {
   DecisionTransportAdapter,
   ExpireOwnerQuestionsUseCase,
   InspectConfiguredCapabilitiesUseCase,
+  IssuePolicyForgeGrantUseCase,
   InspectOutstandingCoordinationUseCase,
   InspectProjectProfileUseCase,
   InstallationReferenceAdapter,
@@ -182,9 +188,11 @@ import {
   type AttentionClock,
 } from '@fleet/operator-coordination';
 import {
+  loadInstallation,
   requireValidInstallationModel,
   type FleetInstallation,
   type FleetInstallationModel,
+  type LoadResult,
 } from '@fleet/installation';
 
 export interface FleetCliRuntimeOptions {
@@ -192,6 +200,11 @@ export interface FleetCliRuntimeOptions {
   readonly stateDir?: string;
   /** Parsed installation configuration. */
   readonly installation?: FleetInstallation;
+  /**
+   * Fresh installation loader for the auto-merge settings binding (AM5-3).
+   * Defaults to the real `loadInstallation()`; tests inject a temp file.
+   */
+  readonly loadInstallationForAutoMerge?: () => LoadResult;
   /** Agent, model and variant handed to the live runner subprocess. */
   readonly runnerAgent?: string;
   readonly runnerModel?: string;
@@ -624,6 +637,7 @@ export interface FleetCliRuntime {
     readonly prepareFixAttempt: PrepareFixAttemptUseCase;
     readonly requestAttemptAcceptance: RequestAttemptAcceptanceUseCase;
     readonly executeAuthorizedForgeAction: ExecuteAuthorizedForgeActionUseCase;
+    readonly autoMergeAttempt: AutoMergeAttemptUseCase;
     readonly probeProject: ProbeProjectUseCase;
     readonly listUnregisteredProjects: ListUnregisteredProjectsUseCase;
   };
@@ -688,6 +702,9 @@ function editOnlyModeOf(
 
 export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCliRuntime {
   const stateDir = options?.stateDir;
+  // AM5-3: the auto-merge settings binding re-reads a fresh installation on
+  // every call (A7); tests inject a loader over a temp file.
+  const autoMergeLoad = options?.loadInstallationForAutoMerge ?? (() => loadInstallation());
 
   // --- live runner / worktree host configuration -----------------------------
   // Resolution precedence: options.<x> ?? installation.<x> ?? <env read>.
@@ -867,6 +884,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       itemRepo: attentionItemRepository,
     }),
   };
+
+  // AM5-3: the auto-merge policy-grant use case over the shared coordination
+  // request store; the consumer adapters delegate to it through this root. The
+  // clock and ids are the root's own, as for every composition here.
+  const issuePolicyForgeGrantUseCase = new IssuePolicyForgeGrantUseCase({
+    requestRepo: coordinationRequestRepository,
+    clock: { nowIso: () => new Date().toISOString() },
+    ids: { newRequestId: newUlid, newGrantId: newUlid },
+  });
 
   // --- project profiles and probes (P6b) --------------------------------------
   // The execution context reads profiles and records probe receipts through
@@ -1847,7 +1873,42 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       // Forge mode `none` (D6) refuses every forge action.
       ...(forgeMode === 'none' ? { forgeMode: 'none' as const } : {}),
     }),
+    // Assigned after the object closes (AM5-3): it depends on the use cases
+    // above, so it cannot be part of the literal.
+    autoMergeAttempt: undefined as unknown as AutoMergeAttemptUseCase,
   };
+
+  // AM5-3: compose the auto-merge attempt use case over the consumer adapters
+  // and the coordination use cases. The settings are re-read from a fresh
+  // installation on every call (A7); a throwing loader is an unreadable answer.
+  const autoMergeSettingsPort: AutoMergeSettingsPort = {
+    async readAutoMergeSettings() {
+      try {
+        return autoMergeSettingsFromLoad(autoMergeLoad());
+      } catch {
+        return { outcome: 'unreadable', reason: 'settings port threw' };
+      }
+    },
+  };
+  execution.autoMergeAttempt = new AutoMergeAttemptUseCase({
+    settings: autoMergeSettingsPort,
+    attemptRepo: attemptRepository,
+    workOrderRepo: workOrderRepository,
+    journal: executionJournal,
+    attemptOwnerDecisionPort: attemptOwnerDecision,
+    evaluateAttemptGate: execution.requestAttemptAcceptance,
+    acceptancePort: acceptanceAssessment,
+    routing: new AutoMergeOwnerRoutingAdapter({
+      askOwnerQuestion: coordination.askOwnerQuestion,
+      recordAttentionItem: coordination.recordAttentionItem,
+      newQuestionId: () => 'question-' + newUlid(),
+    }),
+    policyMergeGrant: new PolicyMergeGrantAdapter({
+      issuePolicyForgeGrant: issuePolicyForgeGrantUseCase,
+    }),
+    executeForgeAction: execution.executeAuthorizedForgeAction,
+    nowIso: () => new Date().toISOString(),
+  });
 
   attemptLookup.inspectAttempt = execution.inspectAttempt;
 

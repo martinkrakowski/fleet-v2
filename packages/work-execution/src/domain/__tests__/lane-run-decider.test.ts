@@ -1435,6 +1435,14 @@ describe('merged before stopped (G3d)', () => {
     assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
   });
 
+  it('a merge at another head that contains the lane head ends merged under a stop (CT-2a)', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'merging', stopMode: 'graceful', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: 'ffffffffffff', containsLaneHead: true },
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
   it('a merge at another head parks ambiguous merge under a stop', () => {
     const facts = baseFacts({
       state: 'merging', stopMode: 'graceful', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: 'ffffffffffff', containsLaneHead: false },

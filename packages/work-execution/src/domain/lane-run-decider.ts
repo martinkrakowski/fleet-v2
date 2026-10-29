@@ -175,6 +175,14 @@ const WAIT_FACTS_INCONSISTENT: LaneRunDecision = { kind: 'wait', reason: 'facts-
  * never a pass; a seat switch only where no review receipt was recorded. Always returns a decision,
  * never throws.
  */
+/**
+ * A merged PR counts for the lane when its head is the collected lane head or
+ * contains it as an ancestor (CT-2a); every merged-PR rule (M3, G3d, G5) reads it here.
+ */
+function mergedPrCarriesLaneHead(pr: NonNullable<LaneRunFacts['pr']>, laneHead12: string | null): boolean {
+  return pr.head12 === laneHead12 || pr.containsLaneHead;
+}
+
 export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, nowIso: string): LaneRunDecision {
   try {
     const now = Date.parse(nowIso);
@@ -582,7 +590,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (facts.pr === null) {
         return WAIT_FACTS_INCONSISTENT;
       }
-      if (facts.pr.state === 'merged' && (facts.pr.head12 === facts.head12 || facts.pr.containsLaneHead)) {
+      if (facts.pr.state === 'merged' && mergedPrCarriesLaneHead(facts.pr, facts.head12)) {
         return enter('merged');
       }
       if (facts.pr.state === 'merged' || facts.pr.state === 'closed') {
@@ -649,7 +657,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
 
     // G3d: a merge that landed ends `merged`, never `stopped` (§3.9.1).
     if (facts.stopMode !== null && facts.state === 'merging' && facts.pr !== null && facts.pr.state === 'merged') {
-      if (facts.pr.head12 === facts.head12) {
+      if (mergedPrCarriesLaneHead(facts.pr, facts.head12)) {
         return enter('merged');
       }
       return park('ambiguous', 'merge');
@@ -815,7 +823,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         record.parked.reason === 'owner-merge' &&
         facts.pr !== null &&
         facts.pr.state === 'merged' &&
-        (facts.pr.head12 === facts.head12 || facts.pr.containsLaneHead)
+        mergedPrCarriesLaneHead(facts.pr, facts.head12)
       ) {
         return enter('merged');
       }

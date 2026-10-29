@@ -45,6 +45,9 @@ function resolveBundledKillWorktreeTreeText(): string | null {
         return null;
       }
     }
+    // The walk ends at the repository root: a script found above it (a user's
+    // or the system's bin) is never shipped to a lane host.
+    if (existsSync(join(current, 'yarn.lock')) || existsSync(join(current, '.git'))) return null;
     if (current === root) return null;
     current = dirname(current);
   }
@@ -90,6 +93,12 @@ export class ProcessTreeTerminationAdapter implements ProcessTreeTerminationPort
       return {
         outcome: 'refused',
         reason: 'worktree path is not absolute',
+      };
+    }
+    if (!isDeepEnoughWorktreePath(request.worktreePath)) {
+      return {
+        outcome: 'refused',
+        reason: 'worktree path is too shallow',
       };
     }
     const grace = request.gracePeriodSeconds;
@@ -155,12 +164,12 @@ function parseKilledCount(stdout: string): number | null {
   return match === null ? null : Number(match[1]);
 }
 
-/** The `unavailable=<word>` line from the stdout, or null. */
+/** The last `unavailable=<word>` line from the stdout (one word, nothing else), or null. */
 function parseUnavailableReason(stdout: string): string | null {
   const lines = stdout.split('\n');
   let found: string | null = null;
   for (const line of lines) {
-    if (line.startsWith('unavailable=')) found = line;
+    if (/^unavailable=[A-Za-z0-9-]+$/.test(line)) found = line;
   }
   return found;
 }
@@ -171,6 +180,14 @@ function lastNonBlankLine(stdout: string): string | null {
     if (lines[i].trim() !== '') return lines[i];
   }
   return null;
+}
+
+/**
+ * At least three path segments (`/srv/fleet/wt`): `/`, `/home` or `/home/user`
+ * would select every process under them and are never a worktree.
+ */
+function isDeepEnoughWorktreePath(worktreePath: string): boolean {
+  return worktreePath.split('/').filter((segment) => segment !== '').length >= 3;
 }
 
 /** An absolute path with no newline and no NUL character. */

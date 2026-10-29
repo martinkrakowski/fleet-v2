@@ -37,14 +37,18 @@ scan_pids() {
   done
 }
 finish() {
-  for pid in $tracked; do
+  # Tracked pids first, then any sleeper this test may have left (the probe's
+  # grandchildren are not tracked), so a failing case never leaves orphans.
+  for pid in $tracked $(scan_pids 'sleep 120') $(scan_pids 'sleep 121'); do
+    [ "$pid" = "$$" ] && continue
     kill -KILL "$pid" 2>/dev/null
   done
   rm -rf "$T"
 }
 trap finish EXIT
+trap 'finish; exit 130' INT TERM
 
-mkdir "$T/wt" "$T/other" "$T/wt/sub" "$T/wt space"
+mkdir "$T/wt" "$T/other" "$T/wt/sub" "$T/wt space" "$T/wtx" "$T/wt[1]"
 
 # (a) The owner's probe: `sh -c 'sleep 1207 & sleep 1208'` with its cwd inside
 # wt/, plus a sibling sleep that must survive. The cd-ing subshell execs the
@@ -55,6 +59,10 @@ track "$probe"
 (cd "$T/other" && exec sleep 1209) &
 sibling=$!
 track "$sibling"
+# A prefix-extended sibling (`<worktree>x`) must survive as well.
+(cd "$T/wtx" && exec sleep 1213) &
+prefix_sibling=$!
+track "$prefix_sibling"
 i=0
 while [ ! -d "/proc/$probe" ] && [ "$i" -lt 50 ]; do
   sleep 0.1 2>/dev/null || sleep 1
@@ -79,6 +87,9 @@ wait_gone "$probe" && ok 'the sh is gone' || bad 'the sh is gone'
 alive "$sibling" && ok 'the sibling sleep survives' || bad 'the sibling sleep survives'
 kill "$sibling" 2>/dev/null
 wait_gone "$sibling" || true
+alive "$prefix_sibling" && ok 'the prefix-extended sibling survives' || bad 'the prefix-extended sibling survives'
+kill "$prefix_sibling" 2>/dev/null
+wait_gone "$prefix_sibling" || true
 
 # (b) A process that ignores TERM is killed after the grace period.
 (cd "$T/wt/sub" && exec sh -c 'trap "" TERM; sleep 1210') &
@@ -127,6 +138,23 @@ if [ "$?" -eq 0 ] && [ "$(printf '%s\n' "$out" | tail -n 1)" = 'killed=1' ] && w
   ok 'a worktree path containing a space kills'
 else
   bad 'a worktree path containing a space kills'
+fi
+
+# (d2) A worktree path with glob characters, run the way the adapter runs it:
+# `sh -c <script text> kill-worktree-tree <wt> <grace>` ($0/$1/$2 binding).
+(cd "$T/wt[1]" && exec sleep 1214) &
+glob_sleeper=$!
+track "$glob_sleeper"
+i=0
+while [ ! -d "/proc/$glob_sleeper" ] && [ "$i" -lt 50 ]; do
+  sleep 0.1 2>/dev/null || sleep 1
+  i=$((i + 1))
+done
+out=$(sh -c "$(cat "$SCRIPT")" kill-worktree-tree "$T/wt[1]" 1)
+if [ "$?" -eq 0 ] && [ "$(printf '%s\n' "$out" | tail -n 1)" = 'killed=1' ] && wait_gone "$glob_sleeper"; then
+  ok 'a glob-character path through sh -c <text> kills exactly one'
+else
+  bad 'a glob-character path through sh -c <text> kills exactly one'
 fi
 
 # (e) A missing directory prints killed=0 and exits 0.

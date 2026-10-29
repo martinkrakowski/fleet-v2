@@ -926,4 +926,63 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       expect(record?.attemptIds).toEqual(['attempt-example-1']);
     }
   });
+
+  it('l) parks step-refused when a refused fix prepare would re-run under the same key (KF-9)', async () => {
+    // A prepare whose brief rebuild refuses (the prior manifest is
+    // incomplete) journals its intent and its refused result; the next
+    // advance re-issues the SAME key (the run's round is still the prior
+    // round) and must park instead of looping on `duplicate-key`.
+    const refused = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(refused, [blockerFinding()]);
+    refused.setManifest(JSON.stringify({ stepLimit: 100 }));
+    expect(await advance(refused)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+    });
+
+    expect(await advance(refused)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'prepare' });
+    const entries = await refused.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === prepareKey(1, 0, 2))).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === prepareKey(1, 0, 2))).toHaveLength(1);
+    expect(refused.fixRequests).toHaveLength(0);
+    expect(refused.briefRequests).toHaveLength(0);
+    const refusedRecord = await refused.runRepo.get(RUN_ID);
+    expect(refusedRecord?.parked).toMatchObject({ reason: 'step-refused', qualifier: 'prepare' });
+
+    // A refusal that ran both ports (the fix port refuses) parks the same way
+    // with each port called exactly once in total.
+    const spent = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(spent, [blockerFinding()]);
+    spent.setFixAnswer(async () => ({ outcome: 'refused', reason: 'example' }));
+    expect(await advance(spent)).toMatchObject({ result: 'refused', reasonCode: 'prepare-refused' });
+    expect(await advance(spent)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'prepare' });
+    expect(spent.briefRequests).toHaveLength(1);
+    expect(spent.fixRequests).toHaveLength(1);
+  });
+
+  it('m) addresses the fix brief to the reserved host of the prior attempt (KF-9)', async () => {
+    const runner = {
+      kind: 'opencode' as const,
+      remotePort: 4321,
+      host: 'lane-example',
+      hostName: 'lane-example',
+      agent: 'agent-example',
+      model: 'model-example-1',
+      variant: null,
+    };
+    const withHost = await makeHarness(runRecord(), [{ ...collectedAttempt(), runner }]);
+    await seedReviewFailure(withHost, [blockerFinding()]);
+    expect(await advance(withHost)).toMatchObject({ result: 'completed', reasonCode: 'prepared' });
+    expect(withHost.briefRequests[0]?.recordedHost).toEqual(runner);
+
+    // A prior attempt without a runner block addresses null (the default
+    // executor), never a guessed host.
+    const withoutHost = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(withoutHost, [blockerFinding()]);
+    expect(await advance(withoutHost)).toMatchObject({ result: 'completed', reasonCode: 'prepared' });
+    expect(withoutHost.briefRequests[0]?.recordedHost).toBeNull();
+  });
 });

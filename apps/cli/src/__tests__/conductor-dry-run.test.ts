@@ -275,6 +275,17 @@ async function seedFixRoundStart(runtime: FleetCliRuntime): Promise<void> {
     },
     seatPlan: SEAT_PLAN,
     seatSelection: SEAT_SELECTION,
+    // KF-9: the seed attempt records the lane-runner host the fix round's
+    // brief package must be placed on.
+    runner: {
+      kind: 'opencode',
+      remotePort: null,
+      host: 'lane-example',
+      hostName: 'lane-example',
+      agent: 'agent-example',
+      model: 'model-example-1',
+      variant: null,
+    },
     stopReason: 'none',
     createdAtIso: NOW,
     updatedAtIso: NOW,
@@ -616,5 +627,7 @@ describe('conductor run --dry-run (K7-8)', () => {
     const briefCalls = calls.filter((call) => call.port === 'prepareBrief');
     expect(briefCalls.length).toBeGreaterThan(0);
     expect(briefCalls[0]?.attemptId).toMatch(/^attempt-/);
+    // KF-9: the brief request was addressed to the seed attempt's reserved host.
+    expect(briefCalls[0]?.recordedHostName).toBe('lane-example');
   });
 });

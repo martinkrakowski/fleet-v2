@@ -343,7 +343,8 @@ async function makeHarness(
   let manifestVerdict: 'sealed' | 'missing' | 'mismatch' = 'missing';
   let reconcileAnswer: ReconcileAttemptResult = activeAnswer(attempts[attempts.length - 1] ?? attemptFixture());
   let reviewAssessmentAnswer: OpenReviewAssessmentResult = { outcome: 'open' };
-  let gateReceiptsAnswer: RecordGateReceiptsResult = { outcome: 'recorded', count: 0 };
+  // null answers `recorded` with one receipt per request receipt (the honest default).
+  let gateReceiptsAnswer: RecordGateReceiptsResult | null = null;
   let stopAnswer: (request: StopAttemptRequest) => Promise<StopAttemptResult> = async (request) => {
     const existing = await attemptRepo.findAttemptById(request.attemptId);
     if (existing === null) {
@@ -472,7 +473,7 @@ async function makeHarness(
           gateReceipts: {
             recordGateReceipts: async (request) => {
               gateReceiptRequests.push(request);
-              return gateReceiptsAnswer;
+              return gateReceiptsAnswer ?? { outcome: 'recorded', count: request.receipts.length };
             },
           },
         }
@@ -1268,6 +1269,29 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         reasonCode: 'gate-unknown',
       });
       expect(harness.gateReceiptRequests).toHaveLength(1);
+    });
+
+    it('fails closed to gate-unknown when the receipt port records fewer receipts than checks (KF-13a Luna)', async () => {
+      const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+      const harness = await makeHarness(runRecord(), [collected], {
+        wireReviewAssessment: true,
+        wireGateReceipts: true,
+      });
+      harness.setManifest(CHECKS_MANIFEST);
+      harness.setManifestVerdict('sealed');
+      harness.setGateReceiptsAnswer({ outcome: 'recorded', count: 0 });
+      harness.setGateAnswer({
+        verdict: 'passed',
+        results: [
+          commandResult('command 1: build', 'pass', 0),
+          commandResult('command 2: test', 'pass', 0),
+        ],
+      });
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      expect(result).toMatchObject({ outcome: 'acted', step: 'gate', result: 'ambiguous', reasonCode: 'gate-unknown' });
     });
 
     it('fails closed to gate-unknown on a checks/command count mismatch with no partial record', async () => {

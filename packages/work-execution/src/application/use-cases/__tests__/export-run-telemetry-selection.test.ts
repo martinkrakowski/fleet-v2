@@ -955,6 +955,89 @@ describe('ExportRunTelemetryUseCase request validation (OT2c-1)', () => {
   }
 });
 
+describe('ExportRunTelemetryUseCase nested request fields (OT2c-2)', () => {
+  it('a selection field behind a getter is refused without invoking the getter', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.runRepo.withRun(makeRun());
+    fakes.journal.withEntries(RUN_ID, mergedJournal(RUN_ID));
+    const selection = { kind: 'run', runId: RUN_ID };
+    let getterCalled = false;
+    Object.defineProperty(selection, 'runId', {
+      enumerable: true,
+      get() {
+        getterCalled = true;
+        return RUN_ID;
+      },
+    });
+
+    const result = await new ExportRunTelemetryUseCase(deps).execute(makeRequest({ selection }));
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request', counts: zeroCounts(), counters: {} });
+    expect(getterCalled).toBe(false);
+  });
+
+  it('a policy field behind a getter is refused without invoking the getter', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.runRepo.withRun(makeRun());
+    fakes.journal.withEntries(RUN_ID, mergedJournal(RUN_ID));
+    const policy = makePolicy();
+    let getterCalled = false;
+    Object.defineProperty(policy, 'sampleRatio', {
+      enumerable: true,
+      get() {
+        getterCalled = true;
+        return 1;
+      },
+    });
+
+    const result = await new ExportRunTelemetryUseCase(deps).execute(makeRequest({ policy }));
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request', counts: zeroCounts(), counters: {} });
+    expect(getterCalled).toBe(false);
+  });
+
+  it('a projectAliases value behind a getter is refused without invoking the getter', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.runRepo.withRun(makeRun());
+    fakes.journal.withEntries(RUN_ID, mergedJournal(RUN_ID));
+    const aliases: Record<string, string> = {};
+    let getterCalled = false;
+    Object.defineProperty(aliases, PROJECT_ID, {
+      enumerable: true,
+      get() {
+        getterCalled = true;
+        return PROJECT_ALIAS;
+      },
+    });
+    const policy = makePolicy({ projectAliases: aliases });
+
+    const result = await new ExportRunTelemetryUseCase(deps).execute(makeRequest({ policy }));
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request', counts: zeroCounts(), counters: {} });
+    expect(getterCalled).toBe(false);
+  });
+
+  it('a deadline field behind a getter is refused without invoking the getter', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.runRepo.withRun(makeRun());
+    fakes.journal.withEntries(RUN_ID, mergedJournal(RUN_ID));
+    const deadline = { atMs: 1234 };
+    let getterCalled = false;
+    Object.defineProperty(deadline, 'atMs', {
+      enumerable: true,
+      get() {
+        getterCalled = true;
+        return 1234;
+      },
+    });
+
+    const result = await new ExportRunTelemetryUseCase(deps).execute(makeRequest({ deadline }));
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request', counts: zeroCounts(), counters: {} });
+    expect(getterCalled).toBe(false);
+  });
+});
+
 describe('ExportRunTelemetryUseCase redaction (OT2c-1, §3.2)', () => {
   it('the serialised result never carries a fixture id, path, branch or work-order id', async () => {
     const { deps, fakes } = makeDeps();

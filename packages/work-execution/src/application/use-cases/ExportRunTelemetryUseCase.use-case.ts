@@ -38,10 +38,13 @@ import {
 } from '../../domain/run-telemetry-spans.js';
 import { TelemetrySpan } from '../../domain/run-telemetry.js';
 import {
+  TELEMETRY_ERROR_KINDS,
   TELEMETRY_ROUTES,
   isFinalSpanDisposition,
+  spanDispositionText,
   telemetrySaltFingerprint,
   type SpanDisposition,
+  type TelemetryErrorKind,
   type TelemetryHmac,
 } from '../../domain/run-telemetry-ids.js';
 import {
@@ -133,54 +136,71 @@ function parseSelection(value: unknown): ExportRunTelemetrySelection | null {
   if (!isPlainObject(value)) {
     return null;
   }
-  const kind = value.kind;
-  if (kind === 'run') {
-    return Object.hasOwn(value, 'runId') && isNonEmptyString(value.runId)
-      ? { kind: 'run', runId: value.runId }
+  const kind = ownDataField(value, 'kind');
+  if (!kind.ok) {
+    return null;
+  }
+  if (kind.value === 'run') {
+    const runId = ownDataField(value, 'runId');
+    return runId.ok && isNonEmptyString(runId.value) ? { kind: 'run', runId: runId.value } : null;
+  }
+  if (kind.value === 'attempt') {
+    const attemptId = ownDataField(value, 'attemptId');
+    return attemptId.ok && isNonEmptyString(attemptId.value) ? { kind: 'attempt', attemptId: attemptId.value } : null;
+  }
+  if (kind.value === 'work-order') {
+    const workOrderId = ownDataField(value, 'workOrderId');
+    return workOrderId.ok && isNonEmptyString(workOrderId.value)
+      ? { kind: 'work-order', workOrderId: workOrderId.value }
       : null;
   }
-  if (kind === 'attempt') {
-    return Object.hasOwn(value, 'attemptId') && isNonEmptyString(value.attemptId)
-      ? { kind: 'attempt', attemptId: value.attemptId }
-      : null;
+  if (kind.value === 'window') {
+    const sinceIso = ownDataField(value, 'sinceIso');
+    if (!sinceIso.ok || !isIsoInstant(sinceIso.value)) {
+      return null;
+    }
+    const untilIso = ownDataField(value, 'untilIso');
+    if (!untilIso.ok) {
+      return null;
+    }
+    if (untilIso.value !== null && !isIsoInstant(untilIso.value)) {
+      return null;
+    }
+    return { kind: 'window', sinceIso: sinceIso.value, untilIso: untilIso.value as string | null };
   }
-  if (kind === 'work-order') {
-    return Object.hasOwn(value, 'workOrderId') && isNonEmptyString(value.workOrderId)
-      ? { kind: 'work-order', workOrderId: value.workOrderId }
-      : null;
-  }
-  if (kind === 'window') {
-    if (!Object.hasOwn(value, 'sinceIso') || !Object.hasOwn(value, 'untilIso')) {
+  if (kind.value === 'marks') {
+    const targets = ownDataField(value, 'targets');
+    if (!targets.ok || !Array.isArray(targets.value)) {
       return null;
     }
-    if (!isIsoInstant(value.sinceIso)) {
-      return null;
-    }
-    if (value.untilIso !== null && !isIsoInstant(value.untilIso)) {
-      return null;
-    }
-    return { kind: 'window', sinceIso: value.sinceIso, untilIso: value.untilIso as string | null };
-  }
-  if (kind === 'marks') {
-    if (!Object.hasOwn(value, 'targets') || !Array.isArray(value.targets)) {
-      return null;
-    }
-    const targets: RunTelemetryMarkTarget[] = [];
-    for (const target of value.targets) {
+    const parsedTargets: RunTelemetryMarkTarget[] = [];
+    for (const target of targets.value) {
       if (!isPlainObject(target)) {
         return null;
       }
-      if (target.kind === 'run' && Object.hasOwn(target, 'runId') && isNonEmptyString(target.runId)) {
-        targets.push({ kind: 'run', runId: target.runId });
-        continue;
+      const targetKind = ownDataField(target, 'kind');
+      if (!targetKind.ok) {
+        return null;
       }
-      if (target.kind === 'attempt' && Object.hasOwn(target, 'attemptId') && isNonEmptyString(target.attemptId)) {
-        targets.push({ kind: 'attempt', attemptId: target.attemptId });
-        continue;
+      if (targetKind.value === 'run') {
+        const runId = ownDataField(target, 'runId');
+        if (runId.ok && isNonEmptyString(runId.value)) {
+          parsedTargets.push({ kind: 'run', runId: runId.value });
+          continue;
+        }
+        return null;
+      }
+      if (targetKind.value === 'attempt') {
+        const attemptId = ownDataField(target, 'attemptId');
+        if (attemptId.ok && isNonEmptyString(attemptId.value)) {
+          parsedTargets.push({ kind: 'attempt', attemptId: attemptId.value });
+          continue;
+        }
+        return null;
       }
       return null;
     }
-    return { kind: 'marks', targets };
+    return { kind: 'marks', targets: parsedTargets };
   }
   return null;
 }
@@ -189,44 +209,46 @@ function parsePolicy(value: unknown): ExportRunTelemetryPolicy | null {
   if (!isPlainObject(value)) {
     return null;
   }
+  const route = ownDataField(value, 'route');
+  if (!route.ok || typeof route.value !== 'string' || !(TELEMETRY_ROUTES as readonly string[]).includes(route.value)) {
+    return null;
+  }
+  const sampleRatio = ownDataField(value, 'sampleRatio');
   if (
-    !Object.hasOwn(value, 'route') ||
-    typeof value.route !== 'string' ||
-    !(TELEMETRY_ROUTES as readonly string[]).includes(value.route)
+    !sampleRatio.ok ||
+    typeof sampleRatio.value !== 'number' ||
+    !Number.isFinite(sampleRatio.value) ||
+    sampleRatio.value < 0 ||
+    sampleRatio.value > 1
   ) {
     return null;
   }
-  if (
-    !Object.hasOwn(value, 'sampleRatio') ||
-    typeof value.sampleRatio !== 'number' ||
-    !Number.isFinite(value.sampleRatio) ||
-    value.sampleRatio < 0 ||
-    value.sampleRatio > 1
-  ) {
+  const sendCost = ownDataField(value, 'sendCost');
+  if (!sendCost.ok || typeof sendCost.value !== 'boolean') {
     return null;
   }
-  if (!Object.hasOwn(value, 'sendCost') || typeof value.sendCost !== 'boolean') {
+  const includeDryRun = ownDataField(value, 'includeDryRun');
+  if (!includeDryRun.ok || typeof includeDryRun.value !== 'boolean') {
     return null;
   }
-  if (!Object.hasOwn(value, 'includeDryRun') || typeof value.includeDryRun !== 'boolean') {
+  const aliasesField = ownDataField(value, 'projectAliases');
+  if (!aliasesField.ok || !isPlainObject(aliasesField.value)) {
     return null;
   }
-  if (!Object.hasOwn(value, 'projectAliases') || !isPlainObject(value.projectAliases)) {
-    return null;
-  }
+  const aliasesValue = aliasesField.value;
   const projectAliases: Record<string, string> = {};
-  for (const projectId of Object.keys(value.projectAliases)) {
-    const alias = value.projectAliases[projectId];
-    if (!isNonEmptyString(projectId) || !isNonEmptyString(alias) || !ALIAS_PATTERN.test(alias)) {
+  for (const projectId of Object.keys(aliasesValue)) {
+    const alias = ownDataField(aliasesValue, projectId);
+    if (!alias.ok || !isNonEmptyString(projectId) || !isNonEmptyString(alias.value) || !ALIAS_PATTERN.test(alias.value)) {
       return null;
     }
-    projectAliases[projectId] = alias;
+    projectAliases[projectId] = alias.value;
   }
   return {
-    route: value.route as ExportRunTelemetryPolicy['route'],
-    sampleRatio: value.sampleRatio,
-    sendCost: value.sendCost,
-    includeDryRun: value.includeDryRun,
+    route: route.value as ExportRunTelemetryPolicy['route'],
+    sampleRatio: sampleRatio.value,
+    sendCost: sendCost.value,
+    includeDryRun: includeDryRun.value,
     projectAliases,
   };
 }
@@ -235,15 +257,39 @@ function parseDeadline(value: unknown): { ok: true; deadline: RunTelemetrySendDe
   if (value === null) {
     return { ok: true, deadline: null };
   }
-  if (
-    isPlainObject(value) &&
-    Object.hasOwn(value, 'atMs') &&
-    typeof value.atMs === 'number' &&
-    Number.isFinite(value.atMs)
-  ) {
-    return { ok: true, deadline: { atMs: value.atMs } };
+  if (isPlainObject(value)) {
+    const atMs = ownDataField(value, 'atMs');
+    if (atMs.ok && typeof atMs.value === 'number' && Number.isFinite(atMs.value)) {
+      return { ok: true, deadline: { atMs: atMs.value } };
+    }
   }
   return { ok: false };
+}
+
+/**
+ * The send port's result, validated before use: a plain object with a
+ * dispositions array and an error kind from the declared list, and every
+ * entry a plain object with a string span id and a valid disposition.
+ * Anything else reads as null and the caller treats the send as failed:
+ * every span stays pending (fail closed, never throws).
+ */
+function parseSendResult(sent: unknown): RunTelemetrySendResult | null {
+  if (!isPlainObject(sent) || !Array.isArray(sent.dispositions)) {
+    return null;
+  }
+  const errorKind = sent.errorKind;
+  if (
+    errorKind !== null &&
+    !(typeof errorKind === 'string' && (TELEMETRY_ERROR_KINDS as readonly string[]).includes(errorKind))
+  ) {
+    return null;
+  }
+  for (const entry of sent.dispositions) {
+    if (!isPlainObject(entry) || typeof entry.spanId !== 'string' || spanDispositionText(entry.disposition) === null) {
+      return null;
+    }
+  }
+  return { dispositions: sent.dispositions, errorKind: errorKind as TelemetryErrorKind | null };
 }
 
 interface ParsedRequest {
@@ -704,19 +750,28 @@ export class ExportRunTelemetryUseCase implements ExportRunTelemetryPort {
     } catch {
       return { outcome: 'exported', counts: { ...counts, pending: spans.length }, errorKind: 'network' };
     }
+    const parsedSent = parseSendResult(sent);
+    if (parsedSent === null) {
+      // A malformed send result counts as a send failure: every span stays pending.
+      return { outcome: 'exported', counts: { ...counts, pending: spans.length }, errorKind: 'network' };
+    }
+    sent = parsedSent;
 
     // Step 4: only final dispositions of spans we sent are recorded; unknown
-    // span ids are ignored and counted nowhere.
+    // span ids are ignored and counted nowhere, and the first disposition per
+    // sent span id wins (duplicates are never double-counted).
     const spanById = new Map(spans.map((span) => [span.spanId, span]));
     const sentIds = new Set(spanById.keys());
+    const seenSpanIds = new Set<string>();
     const finals: TelemetryDispositionUpdate[] = [];
     let exported = 0;
     let rejected = 0;
     let anyExported = false;
     for (const entry of sent.dispositions) {
-      if (!sentIds.has(entry.spanId)) {
+      if (!sentIds.has(entry.spanId) || seenSpanIds.has(entry.spanId)) {
         continue;
       }
+      seenSpanIds.add(entry.spanId);
       if (!isFinalSpanDisposition(entry.disposition)) {
         continue;
       }
@@ -734,12 +789,13 @@ export class ExportRunTelemetryUseCase implements ExportRunTelemetryPort {
       rejected,
       pending: spans.length - finals.length,
     };
-    if (finals.length === 0) {
-      return { outcome: 'exported', counts: recordedCounts, errorKind: sent.errorKind };
-    }
     const counters: Partial<Record<TelemetryCounterKey, number>> = {};
     if (sent.errorKind !== null) {
       counters[sent.errorKind] = 1;
+    }
+    if (finals.length === 0 && sent.errorKind === null) {
+      // Nothing final to record and no error counter: the store already holds every span pending.
+      return { outcome: 'exported', counts: recordedCounts, errorKind: null };
     }
     const recorded = await tryPort(() =>
       deps.dispositions.write({
@@ -754,6 +810,10 @@ export class ExportRunTelemetryUseCase implements ExportRunTelemetryPort {
       // The final dispositions stay pending in the store: the next export
       // resends them (safe under first-write-wins).
       return { outcome: 'exported', counts: { ...recordedCounts, pending: spans.length, refusedByStore: finals.length }, errorKind: sent.errorKind };
+    }
+    if (recorded.value.outcome === 'refused') {
+      // The store refused the result write: fail closed like Steps 1 and 2.
+      return storeRefusal(recorded.value.reason, { ...recordedCounts, pending: spans.length, refusedByStore: finals.length });
     }
     return { outcome: 'exported', counts: recordedCounts, errorKind: sent.errorKind };
   }

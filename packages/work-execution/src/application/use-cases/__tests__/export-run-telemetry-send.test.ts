@@ -264,7 +264,7 @@ class FakeDispositions {
   }
 }
 
-type SendBehavior = 'export' | 'reject' | 'pending' | 'throw' | 'never' | 'partial' | 'unknown';
+type SendBehavior = 'export' | 'reject' | 'pending' | 'throw' | 'never' | 'partial' | 'unknown' | 'error-pending';
 
 class FakeTelemetry implements Pick<RunTelemetryPort, 'send'> {
   sendCalls = 0;
@@ -313,6 +313,11 @@ class FakeTelemetry implements Pick<RunTelemetryPort, 'send'> {
         dispositions.push({ spanId: UNKNOWN_SPAN_ID, disposition: { state: 'exported', route: 'collector' } });
         return { dispositions, errorKind: null };
       }
+      case 'error-pending':
+        return {
+          dispositions: spans.map((span) => ({ spanId: span.spanId, disposition: { state: 'pending' } })),
+          errorKind: 'timeout',
+        };
     }
   }
 }
@@ -540,7 +545,7 @@ describe('ExportRunTelemetryUseCase send: killed export (OT2c-2)', () => {
 
   it('a throwing send port leaves every span pending and the store otherwise byte-identical', async () => {
     const otherTraceId = 'a'.repeat(32);
-    const otherSpanId = 'b'.repeat(32);
+    const otherSpanId = 'b'.repeat(16);
     const before: Record<string, Record<string, string>> = {
       [otherTraceId]: { [otherSpanId]: 'exported@phoenix' },
     };
@@ -641,6 +646,44 @@ describe('ExportRunTelemetryUseCase send: store refusals (OT2c-2)', () => {
     expect(fakes.telemetry.sendCalls).toBe(0);
     expect(fakes.dispositions.writeCalls).toBe(1);
   });
+
+  it('a salt-mismatch refusal on the result write refuses with the salt-mismatch counter', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
+    fakes.dispositions.writeScript = [
+      { outcome: 'written', applied: 2, kept: 0 },
+      { outcome: 'refused', reason: 'salt-mismatch' },
+    ];
+
+    const result = asRefused(await new ExportRunTelemetryUseCase(deps).execute(makeRequest()));
+
+    expect(result.reason).toBe('salt-mismatch');
+    expect(result.counters).toEqual({ 'salt-mismatch': 1 });
+    expect(result.counts.exported).toBe(2);
+    expect(result.counts.pending).toBe(2);
+    expect(result.counts.refusedByStore).toBe(2);
+    expect(fakes.telemetry.sendCalls).toBe(1);
+    expect(fakes.dispositions.writeCalls).toBe(2);
+  });
+
+  it('a store-unreadable refusal on the result write refuses store-unreadable', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
+    fakes.dispositions.writeScript = [
+      { outcome: 'written', applied: 2, kept: 0 },
+      { outcome: 'refused', reason: 'store-unreadable' },
+    ];
+
+    const result = asRefused(await new ExportRunTelemetryUseCase(deps).execute(makeRequest()));
+
+    expect(result.reason).toBe('store-unreadable');
+    expect(result.counters).toEqual({});
+    expect(result.counts.exported).toBe(2);
+    expect(result.counts.pending).toBe(2);
+    expect(result.counts.refusedByStore).toBe(2);
+    expect(fakes.telemetry.sendCalls).toBe(1);
+    expect(fakes.dispositions.writeCalls).toBe(2);
+  });
 });
 
 describe('ExportRunTelemetryUseCase send: retryRejected reopen (OT2c-2)', () => {
@@ -694,6 +737,65 @@ describe('ExportRunTelemetryUseCase send: retryRejected reopen (OT2c-2)', () => 
     expect(seededFakes.dispositions.writeCalls).toBe(2);
     expect(seededFakes.dispositions.writeRequests[0]?.reopen).toBeUndefined();
   });
+
+  it('a lock-busy reopen write keeps the rejected spans rejected and counts refusedByStore', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
+    const sentSpans = await handAttemptSpanIds(deps);
+    const [first, second] = sentSpans;
+    const { deps: seededDeps, fakes: seededFakes } = makeDeps(
+      makeDispositionsRecord({ spans: { [first!.traceId]: { [second!.spanId]: 'rejected:http-4xx' } } }),
+    );
+    seededFakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
+    seededFakes.dispositions.writeScript = [{ outcome: 'skipped', reason: 'lock-busy' }];
+
+    const result = asExported(await new ExportRunTelemetryUseCase(seededDeps).execute(makeRequest({ retryRejected: true })));
+
+    expect(result.counts.refusedByStore).toBe(1);
+    expect(result.errorKind).toBeNull();
+    expect(seededFakes.telemetry.sendCalls).toBe(0);
+    expect(seededFakes.dispositions.writeCalls).toBe(1);
+    const after = spanTexts(seededFakes.dispositions.snapshot());
+    expect(after.get(second!.spanId)).toBe('rejected:http-4xx');
+  });
+
+  it('a salt-mismatch refusal on the reopen write refuses with the salt-mismatch counter', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
+    const sentSpans = await handAttemptSpanIds(deps);
+    const [first, second] = sentSpans;
+    const { deps: seededDeps, fakes: seededFakes } = makeDeps(
+      makeDispositionsRecord({ spans: { [first!.traceId]: { [second!.spanId]: 'rejected:http-4xx' } } }),
+    );
+    seededFakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
+    seededFakes.dispositions.writeScript = [{ outcome: 'refused', reason: 'salt-mismatch' }];
+
+    const result = asRefused(await new ExportRunTelemetryUseCase(seededDeps).execute(makeRequest({ retryRejected: true })));
+
+    expect(result.reason).toBe('salt-mismatch');
+    expect(result.counters).toEqual({ 'salt-mismatch': 1 });
+    expect(seededFakes.telemetry.sendCalls).toBe(0);
+    expect(seededFakes.dispositions.writeCalls).toBe(1);
+  });
+
+  it('a throwing reopen write refuses store-error', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
+    const sentSpans = await handAttemptSpanIds(deps);
+    const [first, second] = sentSpans;
+    const { deps: seededDeps, fakes: seededFakes } = makeDeps(
+      makeDispositionsRecord({ spans: { [first!.traceId]: { [second!.spanId]: 'rejected:http-4xx' } } }),
+    );
+    seededFakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
+    seededFakes.dispositions.writeScript = ['throw'];
+
+    const result = asRefused(await new ExportRunTelemetryUseCase(seededDeps).execute(makeRequest({ retryRejected: true })));
+
+    expect(result.reason).toBe('store-error');
+    expect(result.counters).toEqual({});
+    expect(seededFakes.telemetry.sendCalls).toBe(0);
+    expect(seededFakes.dispositions.writeCalls).toBe(1);
+  });
 });
 
 describe('ExportRunTelemetryUseCase send: counters and unknown ids (OT2c-2)', () => {
@@ -727,6 +829,28 @@ describe('ExportRunTelemetryUseCase send: counters and unknown ids (OT2c-2)', ()
     const texts = spanTexts(fakes.dispositions.snapshot());
     expect(texts.size).toBe(2);
     expect(texts.has(UNKNOWN_SPAN_ID)).toBe(false);
+  });
+
+  it('a stopping failure with every span pending still records the error-kind counter and no export time', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
+    fakes.telemetry.behavior = 'error-pending';
+
+    const result = asExported(await new ExportRunTelemetryUseCase(deps).execute(makeRequest()));
+
+    expect(result.errorKind).toBe('timeout');
+    expect(result.counts.pending).toBe(2);
+    expect(result.counts.exported).toBe(0);
+    expect(result.counts.rejected).toBe(0);
+    // Two writes: the pending write and the counter-only write with no updates.
+    expect(fakes.dispositions.writeCalls).toBe(2);
+    const record = fakes.dispositions.snapshot();
+    expect(record.counters['timeout']).toBe(1);
+    expect(record.lastExportAtIso).toBeNull();
+    const texts = spanTexts(record);
+    for (const text of texts.values()) {
+      expect(text).toBe('pending');
+    }
   });
 });
 

@@ -791,6 +791,105 @@ describe('redactionChecks (OT1r)', () => {
     expect(check(report, 'values').pass).toBe(true);
   });
 
+  it('a state.entered event with a valid fleet.state passes every check (OT1r-3)', () => {
+    const bytes = handPayload(
+      RESOURCE_NAME_ONLY,
+      handSpanAttributes([]),
+      'AGENT',
+      {
+        events: [
+          {
+            name: 'state.entered',
+            timeUnixNano: '1735689600000000000',
+            attributes: [{ key: 'fleet.state', value: { stringValue: 'running' } }],
+          },
+        ],
+      },
+    );
+    const report = redactionChecks(bytes, []);
+    expect(report.pass).toBe(true);
+    expect(report.checks.every((entry) => entry.pass)).toBe(true);
+  });
+
+  it('an event attribute other than fleet.state fails key-allow-list (OT1r-3)', () => {
+    const bytes = handPayload(
+      RESOURCE_NAME_ONLY,
+      handSpanAttributes([]),
+      'AGENT',
+      { events: [{ name: 'state.entered', attributes: [{ key: 'fleet.step', value: { stringValue: 'dispatch' } }] }] },
+    );
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'key-allow-list').pass).toBe(false);
+    expect(check(report, 'values').pass).toBe(false);
+    expectNoLeak(report, ['fleet.step', 'dispatch']);
+  });
+
+  it('an invalid fleet.state on an event fails values (OT1r-3)', () => {
+    const state = 'not-a-lane-run-state';
+    const bytes = handPayload(
+      RESOURCE_NAME_ONLY,
+      handSpanAttributes([]),
+      'AGENT',
+      { events: [{ name: 'state.entered', attributes: [{ key: 'fleet.state', value: { stringValue: state } }] }] },
+    );
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'key-allow-list').pass).toBe(true);
+    expect(check(report, 'values').pass).toBe(false);
+    expectNoLeak(report, [state]);
+  });
+
+  it('a span named review passes values (OT1r-3)', () => {
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([]), 'AGENT', { name: 'review' });
+    const report = redactionChecks(bytes, []);
+    expect(report.pass).toBe(true);
+    expect(check(report, 'values').pass).toBe(true);
+  });
+
+  it('a status message that is a reason code passes values (OT1r-3)', () => {
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([]), 'AGENT', { status: { code: 2, message: 'example-reason-code' } });
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'payload-parses').pass).toBe(true);
+    expect(check(report, 'values').pass).toBe(true);
+  });
+
+  it('a non-hex traceId fails values (OT1r-3)', () => {
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([]), 'AGENT', { extra: { traceId: 'not-hex-trace-id' } });
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'payload-parses').pass).toBe(true);
+    expect(check(report, 'key-allow-list').pass).toBe(true);
+    expect(check(report, 'values').pass).toBe(false);
+    expectNoLeak(report, ['not-hex-trace-id']);
+  });
+
+  it('a non-digit startTimeUnixNano fails values (OT1r-3)', () => {
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([]), 'AGENT', { extra: { startTimeUnixNano: '17:35:68.000' } });
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'payload-parses').pass).toBe(true);
+    expect(check(report, 'key-allow-list').pass).toBe(true);
+    expect(check(report, 'values').pass).toBe(false);
+    expectNoLeak(report, ['17:35:68.000']);
+  });
+
+  it('a well-shaped span carries its ids, times and kind without failing (OT1r-3)', () => {
+    const bytes = handPayload(
+      RESOURCE_NAME_ONLY,
+      handSpanAttributes([]),
+      'AGENT',
+      {
+        extra: {
+          traceId: 'a'.repeat(32),
+          spanId: 'b'.repeat(16),
+          parentSpanId: 'c'.repeat(16),
+          kind: 1,
+          startTimeUnixNano: '1735689600000000000',
+          endTimeUnixNano: '1735689601000000000',
+        },
+      },
+    );
+    const report = redactionChecks(bytes, []);
+    expect(report.pass).toBe(true);
+  });
+
   it.todo('adapter errors name an error kind, never the endpoint, a header or a body (belongs with the sender, OT3b)');
   it.todo('a cast object literal is refused by the encoder (belongs with the encoder and the nominal span, OT3a and OT1a-3)');
 });

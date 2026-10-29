@@ -14,14 +14,21 @@
  * is accepted: the encoder (OT3a) emits `JSON.stringify` output, so the parsed
  * payload must re-serialise to exactly the input text (duplicate JSON keys
  * collapse in `JSON.parse` and fail here). Every attribute carrier — resource,
- * scope, span and span event — is checked; scope and event attributes must be
- * empty, a span event is named `state.entered`, a span name is one of the
- * fixed §3.1 names, and `status.message` is absent or empty. Duplicate
+ * scope, span and span event — is checked; scope attributes must be empty, a
+ * span event is named `state.entered` and carries at most the one key
+ * `fleet.state` (a lane-run state), a span name is one of the fixed §3.1
+ * names (imported from `run-telemetry.ts`), and `status.message` is absent,
+ * empty or a reason code. Identifier and time fields carry the shapes the
+ * encoder sends: 32- and 16-hex ids, decimal-digit unix-nano times and an
+ * integer `kind`. Duplicate
  * attribute keys fail the entry. Decoded numbers are pushed as strings so a
  * numeric canary is seen.
  */
 
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
+import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from './lane-run-journal.js';
+import { TELEMETRY_SPAN_NAMES } from './run-telemetry.js';
+import { TELEMETRY_SPAN_ID_PATTERN, TELEMETRY_TRACE_ID_PATTERN } from './run-telemetry-ids.js';
 import {
   isNeverSentTelemetryKey,
   isTelemetryProjectAlias,
@@ -63,8 +70,14 @@ interface DecodedEntry {
   readonly attributes: ReadonlyMap<string, DecodedAttributeValue>;
   /** False when any attribute value of the entry could not be decoded. */
   readonly decoded: boolean;
-  /** False only for a span whose `status.message` is present and non-empty. */
-  readonly statusMessageEmpty: boolean;
+  /** False only for a span whose `status.message` is neither absent, empty nor a reason code. */
+  readonly statusMessageOk: boolean;
+  /**
+   * The raw identifier and time fields of a span, or of an event's
+   * `timeUnixNano`, when the payload carries them. Shapes are validated by
+   * `values`, never by the walk, so a wrong shape fails `values`.
+   */
+  readonly otlpFields?: Readonly<Record<string, unknown>>;
 }
 
 interface DecodedPayload {
@@ -161,20 +174,62 @@ const VALUE_OBJECT_FIELDS = ['stringValue', 'intValue', 'doubleValue', 'arrayVal
 const ARRAY_VALUE_FIELDS = ['values'] as const;
 const ARRAY_VALUE_ELEMENT_FIELDS = ['stringValue'] as const;
 
-/**
- * The fixed span names of plan §3.1 (the trace hierarchy node labels).
- * `run-telemetry.ts` (the mapper) is a later lane and does not exist yet, so
- * the list is defined here from §3.1 rather than imported. A span name
- * outside this list fails `values`.
- */
-export const TELEMETRY_PLAN_SPAN_NAMES = [
-  'lane-run', 'round', 'prepare', 'dispatch', 'attempt', 'usage', 'collect',
-  'reconcile', 'stop', 'gate', 'brief-check', 'code-review', 'pre-merge',
-  'accept', 'open-pr', 'push', 'merge', 'ci-wait', 'park', 'stop-request',
-] as const;
-
 /** The one span event name the plan sends (§3.1): `state.entered`, state name only. */
 const TELEMETRY_STATE_ENTERED_EVENT_NAME = 'state.entered';
+
+/** The one attribute key a span event may carry (plan §3.1): the state name. */
+const TELEMETRY_STATE_EVENT_KEY = 'fleet.state';
+
+/** A decimal digit string (a unix-nano time the encoder sends as a fixed64 JSON string). */
+const UNIX_NANO_PATTERN = /^[0-9]+$/;
+
+const SPAN_FIELD_NAMES = [
+  'traceId', 'spanId', 'parentSpanId', 'kind', 'startTimeUnixNano', 'endTimeUnixNano',
+] as const;
+
+/** A decimal digit string, or false. */
+function isUnixNanoText(value: unknown): boolean {
+  return typeof value === 'string' && UNIX_NANO_PATTERN.test(value);
+}
+
+/**
+ * The identifier and time shapes of a span (or of an event's `timeUnixNano`),
+ * checked on the raw payload values the walk captured: a 32-hex `traceId`, a
+ * 16-hex `spanId`, an absent, empty or 16-hex `parentSpanId`, decimal-digit
+ * unix-nano times and an integer `kind`. Absent fields are fine (the shape
+ * applies to what the encoder sends); a wrong shape fails `values`.
+ */
+function fieldShapesOk(fields: Readonly<Record<string, unknown>> | undefined, keys: readonly string[]): boolean {
+  if (fields === undefined) {
+    return true;
+  }
+  for (const key of keys) {
+    const value = fields[key];
+    if (value === undefined) {
+      continue;
+    }
+    if (key === 'traceId') {
+      if (!(typeof value === 'string' && TELEMETRY_TRACE_ID_PATTERN.test(value))) {
+        return false;
+      }
+    } else if (key === 'spanId') {
+      if (!(typeof value === 'string' && TELEMETRY_SPAN_ID_PATTERN.test(value))) {
+        return false;
+      }
+    } else if (key === 'parentSpanId') {
+      if (value !== '' && !(typeof value === 'string' && TELEMETRY_SPAN_ID_PATTERN.test(value))) {
+        return false;
+      }
+    } else if (key === 'kind') {
+      if (!(typeof value === 'number' && Number.isInteger(value))) {
+        return false;
+      }
+    } else if (!isUnixNanoText(value)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 const INT_TEXT_PATTERN = /^-?[0-9]+$/;
 
@@ -294,7 +349,18 @@ function readEvent(event: unknown, entries: DecodedEntry[]): boolean {
     attributes = read.attributes;
     decoded = read.decoded;
   }
-  entries.push({ kind: 'event', name: typeof name === 'string' ? name : '', attributes, decoded, statusMessageEmpty: true });
+  const otlpFields: Record<string, unknown> = {};
+  if (hasOwnData(event, 'timeUnixNano')) {
+    otlpFields['timeUnixNano'] = ownData(event, 'timeUnixNano');
+  }
+  entries.push({
+    kind: 'event',
+    name: typeof name === 'string' ? name : '',
+    attributes,
+    decoded,
+    statusMessageOk: true,
+    otlpFields,
+  });
   return true;
 }
 
@@ -305,19 +371,27 @@ function readSpan(span: unknown, entries: DecodedEntry[]): boolean {
   }
   const read = readAttributes(ownData(span, 'attributes'));
   const name = ownData(span, 'name');
-  let statusMessageEmpty = true;
+  let statusMessageOk = true;
   if (hasOwnData(span, 'status')) {
     const status = ownData(span, 'status');
     if (!hasOnlyKnownFields(status, STATUS_FIELDS)) {
       return false;
     }
-    // Codes only (plan §3.2): `message` is absent or a string; only a non-empty one fails `values`.
+    // Plan §3.2: a status message is a reason code or nothing. `message` is
+    // absent or a string (anything else fails the shape here); absent, `""`
+    // and a reason code pass `values`, anything else fails `values`.
     if (hasOwnData(status, 'message')) {
       const message = ownData(status, 'message');
       if (typeof message !== 'string') {
         return false;
       }
-      statusMessageEmpty = message.length === 0;
+      statusMessageOk = message === '' || LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(message);
+    }
+  }
+  const otlpFields: Record<string, unknown> = {};
+  for (const field of SPAN_FIELD_NAMES) {
+    if (hasOwnData(span, field)) {
+      otlpFields[field] = ownData(span, field);
     }
   }
   entries.push({
@@ -325,7 +399,8 @@ function readSpan(span: unknown, entries: DecodedEntry[]): boolean {
     name: typeof name === 'string' ? name : '',
     attributes: read.attributes,
     decoded: read.decoded,
-    statusMessageEmpty,
+    statusMessageOk,
+    otlpFields,
   });
   if (hasOwnData(span, 'events')) {
     const events = ownData(span, 'events');
@@ -354,7 +429,7 @@ function readScope(scope: unknown, entries: DecodedEntry[]): boolean {
     attributes = read.attributes;
     decoded = read.decoded;
   }
-  entries.push({ kind: 'scope', name: typeof name === 'string' ? name : '', attributes, decoded, statusMessageEmpty: true });
+  entries.push({ kind: 'scope', name: typeof name === 'string' ? name : '', attributes, decoded, statusMessageOk: true });
   return true;
 }
 
@@ -391,7 +466,7 @@ function readResource(resource: unknown, entries: DecodedEntry[]): boolean {
     return false;
   }
   const read = readAttributes(ownData(resource, 'attributes'));
-  entries.push({ kind: 'resource', name: '', attributes: read.attributes, decoded: read.decoded, statusMessageEmpty: true });
+  entries.push({ kind: 'resource', name: '', attributes: read.attributes, decoded: read.decoded, statusMessageOk: true });
   return true;
 }
 
@@ -519,9 +594,17 @@ function checkKeyAllowList(payload: DecodedPayload | null): { readonly pass: boo
   let offendingSpans = 0;
   for (const entry of payload.entries) {
     let entryPass = true;
-    if (entry.kind === 'scope' || entry.kind === 'event') {
-      // Scope and event attributes must be empty; any key fails.
+    if (entry.kind === 'scope') {
+      // Scope attributes must be empty; any key fails.
       entryPass = entry.attributes.size === 0;
+    } else if (entry.kind === 'event') {
+      // A `state.entered` event carries at most the one key `fleet.state`
+      // (plan §3.1); any other key fails here.
+      for (const key of entry.attributes.keys()) {
+        if (key !== TELEMETRY_STATE_EVENT_KEY) {
+          entryPass = false;
+        }
+      }
     } else if (entry.kind === 'resource') {
       for (const key of entry.attributes.keys()) {
         if (!(RUN_TELEMETRY_RESOURCE_KEYS as readonly string[]).includes(key)) {
@@ -574,14 +657,18 @@ function attributesRecordOf(entry: DecodedEntry): Readonly<Record<string, unknow
 
 /**
  * Every span attribute value passes its rule, the span name is one of the
- * fixed §3.1 names, and `status.message` is absent or empty (plan §3.2 test 4;
- * the plan sends codes only).
+ * fixed §3.1 names (imported from `run-telemetry.ts`, which includes
+ * `review`), `status.message` is absent, empty or a reason code (plan §3.2),
+ * and the identifier and time fields carry the shapes the encoder sends.
  */
 function checkSpanValues(entry: DecodedEntry): boolean {
-  if (!entry.decoded || !entry.statusMessageEmpty) {
+  if (!entry.decoded || !entry.statusMessageOk) {
     return false;
   }
-  if (!(TELEMETRY_PLAN_SPAN_NAMES as readonly string[]).includes(entry.name)) {
+  if (!(TELEMETRY_SPAN_NAMES as readonly string[]).includes(entry.name)) {
+    return false;
+  }
+  if (!fieldShapesOk(entry.otlpFields, SPAN_FIELD_NAMES)) {
     return false;
   }
   const spanKind = spanKindOf(entry);
@@ -613,9 +700,42 @@ function checkScopeValues(entry: DecodedEntry): boolean {
   return entry.decoded && entry.attributes.size === 0;
 }
 
-/** Event attributes must be empty and the event name must be `state.entered` (§3.1). */
+/**
+ * The same validator the attribute allow-list uses for `fleet.state` (a
+ * lane-run state), applied to a span event's `fleet.state` value. The rule
+ * reads no sibling key, so an empty context suffices; a throw reads as invalid.
+ */
+function fleetStateValueOk(value: DecodedAttributeValue): boolean {
+  const rule = RUN_TELEMETRY_ATTRIBUTES['fleet.state'];
+  if (rule === undefined || !decodedValueMatchesType(value, rule.type)) {
+    return false;
+  }
+  try {
+    return rule.check(value, { spanKind: 'AGENT', attributes: {} });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A `state.entered` event (§3.1): its attributes are empty or carry exactly
+ * the one key `fleet.state` whose value is a lane-run state, and its
+ * `timeUnixNano`, when present, is a decimal digit string.
+ */
 function checkEventValues(entry: DecodedEntry): boolean {
-  return entry.decoded && entry.attributes.size === 0 && entry.name === TELEMETRY_STATE_ENTERED_EVENT_NAME;
+  if (!entry.decoded || entry.name !== TELEMETRY_STATE_ENTERED_EVENT_NAME) {
+    return false;
+  }
+  if (entry.attributes.size === 0) {
+    return fieldShapesOk(entry.otlpFields, ['timeUnixNano']);
+  }
+  if (entry.attributes.size !== 1 || !entry.attributes.has(TELEMETRY_STATE_EVENT_KEY)) {
+    return false;
+  }
+  if (!fleetStateValueOk(entry.attributes.get(TELEMETRY_STATE_EVENT_KEY) as DecodedAttributeValue)) {
+    return false;
+  }
+  return fieldShapesOk(entry.otlpFields, ['timeUnixNano']);
 }
 
 /** The resource value rules (plan §3.2 "Resource attributes"). */
@@ -746,8 +866,10 @@ function failedReport(): TelemetryRedactionReport {
  * Run the redaction checks over an encoded OTLP/JSON payload (plan §3.2,
  * §3.8): the payload must parse strictly and canonically; no canary may
  * appear; every key must be allow-listed; every value must pass its rule and
- * the carrier shape rules (scope and event attributes empty, span names fixed,
- * `status.message` empty); nothing may be secret-shaped. The report carries
+ * the carrier shape rules (scope attributes empty, a `state.entered` event
+ * carries at most `fleet.state`, span names fixed, `status.message` a reason
+ * code or nothing, id and time fields of the shapes the encoder sends);
+ * nothing may be secret-shaped. The report carries
  * only check names, booleans and counts, and is frozen.
  */
 export function redactionChecks(payloadBytes: Uint8Array, canaryValues: readonly string[]): TelemetryRedactionReport {

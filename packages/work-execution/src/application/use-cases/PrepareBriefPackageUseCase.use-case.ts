@@ -329,10 +329,12 @@ type BuiltBriefPackage =
     };
 
 /**
- * Every path the request or the configuration supplies (worktree, allowed prefixes, expected artifacts, the
- * hand-written brief) is replaced by `<path>` in a preview rejection, whichever check produced it; prepare's own
- * messages are unchanged.
+ * A preview rejection that mentions any path the request or the configuration supplies (worktree, allowed prefixes,
+ * expected artifacts, owned paths, the hand-written brief) becomes one fixed reason, whichever check produced it;
+ * prepare's own messages are unchanged.
  */
+const PREVIEW_PATH_REASON = 'the brief request was refused: a supplied path or path prefix is invalid or unavailable';
+
 function redactRequestPaths(
   reason: string,
   request: PrepareBriefPackageUseCaseRequest,
@@ -344,15 +346,14 @@ function redactRequestPaths(
     deps.handWrittenBriefPath,
     ...(Array.isArray(request.allowedPathPrefixes) ? request.allowedPathPrefixes : []),
     ...(Array.isArray(request.expectedArtifacts) ? request.expectedArtifacts : []),
+    ...(Array.isArray(request.ownedPaths) ? request.ownedPaths : []),
   ];
   const paths = candidates
     .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
     .sort((left, right) => right.length - left.length);
-  let redacted = reason;
-  for (const path of paths) {
-    redacted = redacted.split(path).join('<path>');
-  }
-  return redacted;
+  // A reason that mentions any supplied path is replaced as a whole by one fixed message: nothing is rewritten
+  // inside the text (a short path such as `a` would otherwise mangle unrelated words), and no path survives.
+  return paths.some((path) => reason.includes(path)) ? PREVIEW_PATH_REASON : reason;
 }
 
 export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {

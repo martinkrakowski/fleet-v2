@@ -327,6 +327,20 @@ describe('PrepareBriefPackageUseCase previewBriefPackage (BP1)', () => {
     }
   });
 
+  it('a short supplied path never rewrites the words of an unrelated rejection', async () => {
+    const { useCase } = makeUseCase();
+    // 'e' occurs in the reason's words: the reason becomes the fixed message, never a rewritten sentence.
+    const clash = validRequest({ expectedArtifacts: ['e'], independentReviewer: 'example-provider/glm-5.3' });
+    const preview = await useCase.previewBriefPackage(clash);
+    const prepared = await makeUseCase().useCase.prepareBriefPackage(clash);
+    expect(preview.outcome).toBe('rejected');
+    expect(prepared.outcome).toBe('rejected');
+    if (preview.outcome === 'rejected' && prepared.outcome === 'rejected') {
+      expect(prepared.reason).toContain('e');
+      expect(preview.reason).toBe('the brief request was refused: a supplied path or path prefix is invalid or unavailable');
+    }
+  });
+
   it('preview rejections never echo an allowed path prefix, whichever check refuses it', async () => {
     const marker = '/MARKER-ABSOLUTE-PREFIX';
     const preview = await makeUseCase().useCase.previewBriefPackage(
@@ -335,7 +349,7 @@ describe('PrepareBriefPackageUseCase previewBriefPackage (BP1)', () => {
     expect(preview.outcome).toBe('rejected');
     if (preview.outcome === 'rejected') {
       expect(preview.reason).not.toContain('MARKER-ABSOLUTE-PREFIX');
-      expect(preview.reason).toContain('<path>');
+      expect(preview.reason).toBe('the brief request was refused: a supplied path or path prefix is invalid or unavailable');
     }
   });
 

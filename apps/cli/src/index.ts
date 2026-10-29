@@ -663,8 +663,13 @@ Commands:
 
 Exit codes: 0 completed, 1 refused/rejected/blocked/unknown result, 2 usage error.`;
 
+/** UTF-16 code-unit order: identical to the default sort(), stated explicitly (Sonar S2871). */
+function compareCodeUnits(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 function groupHelp(group: string): string {
-  const subcommands = Object.keys(COMMANDS[group] ?? {}).sort();
+  const subcommands = Object.keys(COMMANDS[group] ?? {}).sort(compareCodeUnits);
   return `Usage: fleet-v2 ${group} <subcommand> [--json '<payload>'] [--flag value ...]\nSubcommands: ${subcommands.join(', ')}\nSee: fleet-v2 --help`;
 }
 

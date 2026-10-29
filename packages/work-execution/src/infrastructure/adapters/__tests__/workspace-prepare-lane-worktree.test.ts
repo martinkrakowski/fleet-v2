@@ -9,6 +9,8 @@ import type { CommandRunResult } from '../../../application/ports/out/CommandExe
 import type { AttemptRunnerRecord } from '../../../domain/execution-records.js';
 import type { PrepareLaneWorktreeRequest } from '../../../application/ports/out/WorkspacePort.out-port.js';
 
+import { physicalPathArgv } from '../ResolvePhysicalPath.helper.js';
+
 const BASE = 'a'.repeat(40);
 const CLONE = '/tmp/fleet-example-clone';
 const WORKTREE = '/tmp/fleet-example-worktrees/0123abcdef0123abcdef0123abcdef01';
@@ -115,6 +117,21 @@ describe('WorkspaceAdapter prepareLaneWorktree', () => {
     const { adapter, reservedLog } = twoHostExecutors(preparedAnswers(BRANCH, ''));
     const result = await adapter.prepareLaneWorktree!(defaultRequest);
     expect(result).toEqual({ outcome: 'already-prepared' });
+    expect(reservedLog.some((argv) => argv.includes('add'))).toBe(false);
+  });
+
+  it('reads a symlinked worktree as already-prepared when toplevel and the list entry are its physical path', async () => {
+    const PHYSICAL = '/private' + WORKTREE;
+    const answers: Record<string, CommandRunResult> = {
+      ...preparedAnswers(BRANCH, ''),
+      [physicalPathArgv(WORKTREE).join(' ')]: ok(`${PHYSICAL}\n`),
+    };
+    answers[HEAD_ARGV.join(' ')] = ok(`${PHYSICAL}\n${BASE}\n${BRANCH}\n`);
+    answers[LIST_ARGV.join(' ')] = ok(`worktree ${CLONE}\n\nworktree ${PHYSICAL}\n`);
+    const { adapter, reservedLog } = twoHostExecutors(answers);
+    const result = await adapter.prepareLaneWorktree!(defaultRequest);
+    expect(result).toEqual({ outcome: 'already-prepared' });
+    expect(reservedLog).toContainEqual(physicalPathArgv(WORKTREE));
     expect(reservedLog.some((argv) => argv.includes('add'))).toBe(false);
   });
 

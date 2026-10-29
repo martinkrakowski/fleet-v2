@@ -304,15 +304,22 @@ describe('conductor run --dry-run (K7-8)', () => {
 
     expect(result.code).toBe(0);
     const would = wouldLines(result.stdout);
-    expect(would.map((line) => line.would)).toEqual(['dispatch', 'collect', 'gate', 'brief-check', 'code-review']);
+    expect(would.map((line) => line.would)).toEqual([
+      'dispatch', 'collect', 'gate', 'brief-check', 'code-review', 'accept', 'open-pr', 'merge',
+    ]);
     expect(would[0]).toMatchObject({ key: `${RUN_ID}/r0/dispatch/0/a1`, result: 'completed', reasonCode: 'dispatch-started' });
     expect(would[1]).toMatchObject({ key: `${RUN_ID}/r0/collect/0`, result: 'completed', reasonCode: 'collected' });
     expect(would[2]).toMatchObject({ key: `${RUN_ID}/r0/gate/0@dddddddddddd`, result: 'completed', reasonCode: 'gate-passed' });
     expect(would[3]).toMatchObject({ key: `${RUN_ID}/r0/brief-check/0@dddddddddddd`, result: 'completed', reasonCode: 'review-passed' });
     expect(would[4]).toMatchObject({ key: `${RUN_ID}/r0/code-review/0@dddddddddddd`, result: 'completed', reasonCode: 'review-passed' });
+    // K6-8: the seeded run then accepts the head, opens the PR through the
+    // conductor grant and merges it through the auto-merge fake.
+    expect(would[5]).toMatchObject({ key: `${RUN_ID}/r0/accept/0@dddddddddddd`, result: 'completed', reasonCode: 'accepted' });
+    expect(would[6]).toMatchObject({ key: `${RUN_ID}/r0/open-pr/0@dddddddddddd`, result: 'completed', reasonCode: 'pr-opened' });
+    expect(would[7]).toMatchObject({ key: `${RUN_ID}/r0/merge/0@dddddddddddd`, result: 'completed', reasonCode: 'merged' });
     // The entered states the driver would enter, in order: dispatch, run,
-    // collect, gate, then both reviews pass and the run reaches accepting —
-    // where K6's accept act is not wired yet, so the run stops there.
+    // collect, gate, both reviews, then the K6 acceptance → PR → CI → merge
+    // window, all the way to merged.
     const entered = enteredLines(result.stdout);
     expect(entered.map((line) => line.entered)).toEqual([
       'dispatching',
@@ -322,6 +329,11 @@ describe('conductor run --dry-run (K7-8)', () => {
       'brief-check',
       'code-review',
       'accepting',
+      'awaiting-premerge',
+      'opening-pr',
+      'watching-ci',
+      'merging',
+      'merged',
     ]);
     expect(entered[entered.length - 1]).toMatchObject({ runId: RUN_ID });
 
@@ -330,16 +342,20 @@ describe('conductor run --dry-run (K7-8)', () => {
     const firstPass = passes[0];
     expect(firstPass.runs).toHaveLength(1);
     expect(firstPass.runs[0].outcome).toBe('advanced');
-    // The reviews pass and the run reaches accepting; the pass cap may split
-    // the steps over several passes, so the run's final step is the last step
-    // of the last pass that acted. K6 is not wired in the dry-run yet: the
-    // first accepting act is not-wired, never a park.
+    // The seeded run is done: the run reached merged, and the decider's final
+    // step is the pass's done marker — never a park.
     const allSteps = passes.flatMap((pass) => pass.runs.flatMap((run) => run.steps));
     expect(allSteps.some((step) => step.outcome === 'parked')).toBe(false);
-    expect(allSteps[allSteps.length - 1]).toEqual({
-      outcome: 'not-wired',
-      step: 'accept',
-    });
+    expect(allSteps[allSteps.length - 1]).toEqual({ outcome: 'done' });
+    // The K6 journal results, in order somewhere across the passes: the head
+    // accepted, the PR opened, the run merged.
+    const acted = allSteps.filter((step) => step.outcome === 'acted');
+    expect(acted.map((step) => step.step)).toEqual(
+      expect.arrayContaining(['accept', 'open-pr', 'merge']),
+    );
+    expect(acted.map((step) => step.reasonCode)).toEqual(
+      expect.arrayContaining(['accepted', 'pr-opened', 'merged']),
+    );
 
     // Each review opened the evidence assessment and then issued its request,
     // in that order, under a minted request id the act journalled first.
@@ -348,7 +364,7 @@ describe('conductor run --dry-run (K7-8)', () => {
     const calls = fakes!.recorder.calls;
     const ports = calls.map((call) => call.port);
     const gateIndex = ports.indexOf('gate');
-    expect(ports.slice(gateIndex + 1)).toEqual([
+    expect(ports.slice(gateIndex + 1, gateIndex + 5)).toEqual([
       'reviewAssessment',
       'reviewRequest',
       'reviewAssessment',
@@ -362,6 +378,21 @@ describe('conductor run --dry-run (K7-8)', () => {
       expect(requestId).toMatch(/^review-/);
     }
     expect(requestIds[0]).not.toBe(requestIds[1]);
+    // K6-8: after the reviews the conductor reads the facts, accepts the
+    // head, grants its push, opens the PR and merges through the fakes —
+    // every call recorded, none reaching a real port.
+    expect(ports.slice(ports.lastIndexOf('reviewRequest') + 1)).toEqual([
+      'acceptanceAssessment',
+      'findLatestReceiptOfKind', 'ciState', 'forgeRead',
+      'findLatestReceiptOfKind', 'ciState', 'forgeRead',
+      'acceptanceAssessment',
+      'conductorForgeGrant', 'executeForgeAction',
+      'findLatestReceiptOfKind', 'ciState', 'forgeRead',
+      'findLatestReceiptOfKind', 'ciState', 'forgeRead',
+      'findLatestReceiptOfKind', 'ciState', 'forgeRead',
+      'autoMergeAttempt',
+      'findLatestReceiptOfKind', 'ciState', 'forgeRead',
+    ]);
 
     // The real state is untouched, the scratch directory is gone, and no
     // subprocess ever ran.

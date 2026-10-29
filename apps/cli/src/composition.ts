@@ -39,6 +39,7 @@ import {
   CiStateAdapter,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
+  ConductorForgeGrantAdapter,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
   ExecutionJournalAdapter,
@@ -48,6 +49,7 @@ import {
   ForgeReadAdapter,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
+  LaneRunParkNoticeAdapter,
   ListUnregisteredProjectsUseCase,
   OpencodeDbUsageAdapter,
   PrepareBriefPackageUseCase,
@@ -652,6 +654,12 @@ export interface FleetCliRuntime {
     readonly reviewAssessment: ReviewAssessmentAdapter;
     /** CI per exact head (PC); K6 composes it. */
     readonly ciState: CiStateAdapter;
+    /** The conductor's own push grant issuer (K6-2); K6-8 composes it into the advance. */
+    readonly conductorForgeGrant: ConductorForgeGrantAdapter;
+    /** Raises park attention items and keyed owner questions (K6-3); K6-8 composes it into the advance. */
+    readonly parkNotice: LaneRunParkNoticeAdapter;
+    /** The auto-merge setting read once at composition; a toggle takes a restart (K6-8). */
+    readonly autoMergeEnabled: boolean;
   };
 }
 
@@ -845,6 +853,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     stateDir,
     evidence,
     profileRead,
+    coordination,
+    issuePolicyForgeGrantUseCase,
+    autoMergeLoad,
+    installation: options?.installation,
   });
 
   return {

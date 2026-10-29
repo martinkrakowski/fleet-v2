@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { FleetInstallation, ForgeSectionV2 } from '@fleet/installation';
+import { requireValidInstallationModel } from '@fleet/installation';
 import type { EvidenceAssessmentRecord } from '@fleet/evidence-and-acceptance';
 
 import { assessmentIdForAttempt, createFleetCliRuntime } from '../composition.js';
@@ -272,5 +273,75 @@ describe('conductor review-assessment wiring (K5-6)', () => {
     const driver = buildLiveConductorDriver(runtime, { maxActiveRuns: 1 });
     expect(driver.start).not.toBeNull();
     expect(driver.policy).toBeDefined();
+  });
+});
+
+describe('conductor acceptance-to-merge wiring (K6-8)', () => {
+  /** An unreadable installation: the auto-merge flag fails closed. */
+  function unreadableLoad(): { status: 'invalid'; file: string; errors: string[] } {
+    return { status: 'invalid', file: 'fleet.example.yaml', errors: [] };
+  }
+
+  /** The shared v2 installation with a `policy.autoMerge` block. */
+  function installationWithAutoMerge(enabled: boolean): FleetInstallation {
+    return {
+      schemaVersion: 2,
+      hosts: HOSTS,
+      forge: { mode: 'none' },
+      policy: {
+        autoMerge: { enabled, allowHighRisk: false, onBlocked: 'ask-owner' },
+      },
+    } as unknown as FleetInstallation;
+  }
+
+  it('the runtime exposes the conductor grant, the park notice and the auto-merge flag', () => {
+    const off = createFleetCliRuntime({
+      loadInstallationForAutoMerge: unreadableLoad,
+    });
+    expect(off.conductor.conductorForgeGrant).toBeDefined();
+    expect(off.conductor.parkNotice).toBeDefined();
+    // An unreadable installation fails closed: no auto-merge.
+    expect(off.conductor.autoMergeEnabled).toBe(false);
+
+    const on = createFleetCliRuntime({
+      installation: installationWithAutoMerge(true),
+      loadInstallationForAutoMerge: () => ({
+        status: 'loaded' as const,
+        file: 'fleet.example.yaml',
+        installation: installationWithAutoMerge(true),
+        model: requireValidInstallationModel(installationWithAutoMerge(true)),
+        warnings: [],
+      }),
+    });
+    expect(on.conductor.autoMergeEnabled).toBe(true);
+  });
+
+  it('an installation without policy.autoMerge reads the flag off', () => {
+    const runtime = createFleetCliRuntime({
+      installation: makeInstallation({ mode: 'none' }),
+      loadInstallationForAutoMerge: () => ({
+        status: 'loaded' as const,
+        file: 'fleet.example.yaml',
+        installation: makeInstallation({ mode: 'none' }),
+        model: requireValidInstallationModel(makeInstallation({ mode: 'none' })),
+        warnings: [],
+      }),
+    });
+    expect(runtime.conductor.autoMergeEnabled).toBe(false);
+  });
+
+  it('buildLiveConductorDriver constructs with the K6 ports bound and calls no transport or forge', async () => {
+    const { forgeGhRunner } = makeGhRunner();
+    const runtime = createFleetCliRuntime({
+      installation: makeInstallation({ mode: 'none' }),
+      forgeGhRunner,
+      loadInstallationForAutoMerge: unreadableLoad,
+    });
+    const before = runtime.conductor.ciState.readHeadCiState;
+    const driver = buildLiveConductorDriver(runtime, { maxActiveRuns: 1 });
+    expect(driver.start).not.toBeNull();
+    expect(driver.policy).toBeDefined();
+    // Building objects only: the forged and CI transports were never touched.
+    expect(runtime.conductor.ciState.readHeadCiState).toBe(before);
   });
 });

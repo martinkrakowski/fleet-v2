@@ -53,6 +53,16 @@ afterEach(async () => {
   }
 });
 
+/** The last 600 bytes of the fixture's ocm-run stderr log, for a failure message. */
+async function ocmRunTailOf(current: ConductedFixture): Promise<string> {
+  try {
+    const text = await fs.readFile(current.ocmRunStderrLog, 'utf8');
+    return text.slice(-600).replace(/\n/g, ' | ');
+  } catch {
+    return '(no ocm-run stderr log)';
+  }
+}
+
 function runRecordOf(current: ConductedFixture) {
   return current.runtime.conductor.laneRunRepository.get(current.runId);
 }
@@ -103,7 +113,7 @@ async function driveUntilParked(current: ConductedFixture, maxPasses: number): P
     }
     if (passes >= maxPasses || Date.now() >= deadline) {
       throw new Error(
-        `the run did not park within ${maxPasses} passes (${passes} driven, journal: ` +
+        `the run did not park within ${maxPasses} passes (${passes} driven, ocm-run: ${await ocmRunTailOf(current)}; journal: ` +
         `${(await resultReasonCodesOf(current)).join(',')})`,
       );
     }
@@ -213,7 +223,7 @@ describe.skipIf(process.env.FLEET_E2E_SSH !== '1')('conducted accept + park over
       }
       if (passes >= TERMINATION_PASS_BUDGET || Date.now() >= deadline) {
         throw new Error(
-          `the refused fix-prepare did not park within ${TERMINATION_PASS_BUDGET} passes ` +
+          `the refused fix-prepare did not park within ${TERMINATION_PASS_BUDGET} passes (ocm-run: ${await ocmRunTailOf(current)}) ` +
           `(${passes} driven, journal: ${(await resultReasonCodesOf(current)).join(',')})`,
         );
       }

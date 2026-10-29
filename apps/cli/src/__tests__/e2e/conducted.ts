@@ -95,6 +95,8 @@ export interface ConductedFixture extends E2eFixture {
   readonly attemptId: string;
   /** File the ocm-run wrapper appends its argv to, one line per call. */
   readonly ocmRunArgvLog: string;
+  /** ocm-run's stderr and exit codes, one block per call, for diagnosing a dispatch that went unknown. */
+  readonly ocmRunStderrLog: string;
   /** File the ocm-run wrapper appends its OCM_HOST/OCM_REMOTE_PORT env to. */
   readonly ocmRunEnvLog: string;
   /** File the fake opencode client appends its argv to, one line per run. */
@@ -287,13 +289,17 @@ function laneCommitScript(): string {
  * The `ocm-run` wrapper: appends its argv and its OCM_HOST/OCM_REMOTE_PORT
  * env to recording logs, then execs the repository's real `bin/ocm-run`.
  */
-function ocmRunWrapperScript(realOcmRunBin: string, argvLog: string, envLog: string): string {
+function ocmRunWrapperScript(realOcmRunBin: string, argvLog: string, envLog: string, stderrLog: string): string {
   return [
     '#!/bin/sh',
     `printf '%s\\n' "$*" >> ${sq(argvLog)}`,
     `printf 'OCM_HOST=%s\\n' "\${OCM_HOST-}" >> ${sq(envLog)}`,
     `printf 'OCM_REMOTE_PORT=%s\\n' "\${OCM_REMOTE_PORT-}" >> ${sq(envLog)}`,
-    `exec ${sq(realOcmRunBin)} "$@"`,
+    // stderr and the exit code are kept per call so a flaky dispatch is diagnosable.
+    `${sq(realOcmRunBin)} "$@" 2>> ${sq(stderrLog)}`,
+    'rc=$?',
+    `printf 'exit=%s argv=%s\\n' "$rc" "$*" >> ${sq(stderrLog)}`,
+    'exit "$rc"',
     '',
   ].join('\n');
 }
@@ -437,6 +443,7 @@ export async function startConductedFixture(
   const pathbin = path.join(dir, 'pathbin');
 
   const ocmRunArgvLog = path.join(dir, 'ocm-run.argv.log');
+  const ocmRunStderrLog = path.join(dir, 'ocm-run.stderr.log');
   const ocmRunEnvLog = path.join(dir, 'ocm-run.env.log');
   const fakeArgvFile = path.join(dir, 'fake-opencode.argv.log');
   const fakePidsFile = path.join(dir, 'fake-opencode.pids');
@@ -518,7 +525,7 @@ export async function startConductedFixture(
       await fs.chmod(target, 0o700);
     };
     await writeTool('gh', ghStubScript(ghArgvLog));
-    await writeTool('ocm-run', ocmRunWrapperScript(realOcmRunBin, ocmRunArgvLog, ocmRunEnvLog));
+    await writeTool('ocm-run', ocmRunWrapperScript(realOcmRunBin, ocmRunArgvLog, ocmRunEnvLog, ocmRunStderrLog));
     if (options?.committingLane === true) {
       await fs.writeFile(laneScriptPath, laneCommitScript(), 'utf8');
       await fs.chmod(laneScriptPath, 0o700);
@@ -859,6 +866,7 @@ export async function startConductedFixture(
       runId,
       attemptId,
       ocmRunArgvLog,
+      ocmRunStderrLog,
       ocmRunEnvLog,
       fakeArgvFile,
       fakePidsFile,

@@ -216,7 +216,7 @@ describe('conductor review and CI wiring (PC-4)', () => {
       runtime.conductor.reviewRequest.findReviewReceipt({
         attemptId: ATTEMPT_ID,
         requestId: 'review-01JB0000000000000000000002',
-        candidateHeadSha: HEAD_2,
+        candidateHeadSha: HEAD,
       }),
     ).resolves.toEqual({ outcome: 'not-found' });
   });

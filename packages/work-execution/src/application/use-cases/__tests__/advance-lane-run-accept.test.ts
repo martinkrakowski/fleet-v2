@@ -476,7 +476,7 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'accept' });
   });
 
-  it('test 5: a thrown assessment is ambiguous and the next advance parks ambiguous accept', async () => {
+  it('test 5: a thrown assessment leaves the intent unread; the next advance reconciles by re-running the assessment', async () => {
     const harness = await acceptingHarness();
     harness.setAcceptanceAnswer('throw');
     expect(await advance(harness)).toEqual({
@@ -486,7 +486,25 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
       result: 'ambiguous',
       reasonCode: 'acceptance-unknown',
     });
-    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'accept' });
+    // No result was journalled: the intent stays unread for the reconcile.
+    const afterThrow = await harness.runJournal.listForRun(RUN_ID);
+    expect(afterThrow.filter((entry) => entry.kind === 'result' && entry.key === acceptKey())).toEqual([]);
+    // The next advance reconciles by calling the assessment again; when it answers
+    // accepted, it journals accepted — never a second intent.
+    harness.setAcceptanceAnswer({ outcome: 'accepted', receiptId: 'receipt-example-1', assessedHeadSha: COMMIT });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'accept',
+      key: acceptKey(),
+      result: 'completed',
+      reasonCode: 'accepted',
+    });
+    expect(harness.acceptanceRequests).toHaveLength(2);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey());
+    expect(intents).toHaveLength(1);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.key === acceptKey() && entry.outcome === 'completed' && entry.reasonCode === 'accepted')).toBe(true);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'awaiting-premerge' });
   });
 
   it('test 6: a pending accept intent from a crash reconciles by re-running the assessment once, with no second intent', async () => {

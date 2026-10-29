@@ -595,9 +595,9 @@ bounded_contexts:
         entities: [EvidenceAssessment, VerificationReceipt, ReviewReceipt, FindingDisposition]
         value_objects: [AssessmentState, EvidenceResult, FindingState, AcceptanceReceipt, EvidenceScope]
       application:
-        use_cases: [RequestVerificationUseCase, RequestIndependentReviewUseCase, RecordVerificationReceiptUseCase, RecordReviewReceiptUseCase, RecordFindingDispositionUseCase, AssessHeadAcceptanceUseCase, InspectAcceptanceEvidenceUseCase, InspectHeadCiStateUseCase]
+        use_cases: [RequestVerificationUseCase, RequestIndependentReviewUseCase, RecordVerificationReceiptUseCase, RecordReviewReceiptUseCase, RecordFindingDispositionUseCase, AssessHeadAcceptanceUseCase, InspectAcceptanceEvidenceUseCase, InspectHeadCiStateUseCase, OpenEvidenceAssessmentUseCase]
         ports:
-          in: [RequestVerificationPort, RequestIndependentReviewPort, RecordVerificationReceiptPort, RecordReviewReceiptPort, RecordFindingDispositionPort, AssessHeadAcceptancePort, InspectAcceptanceEvidencePort, InspectHeadCiStatePort]
+          in: [RequestVerificationPort, RequestIndependentReviewPort, RecordVerificationReceiptPort, RecordReviewReceiptPort, RecordFindingDispositionPort, AssessHeadAcceptancePort, InspectAcceptanceEvidencePort, InspectHeadCiStatePort, OpenEvidenceAssessmentPort]
           out: [EvidenceAssessmentRepositoryPort, EvidenceArchivePort, VerificationExecutorPort, ForgeEvidencePort, IndependentReviewPort, OwnerDecisionPort, AttemptOwnerDecisionPort, CommandExecutorPort, EvidenceSeatPolicyPort]
       infrastructure:
         adapters: [EvidenceAssessmentRepositoryAdapter, EvidenceArchiveAdapter, VerificationExecutorAdapter, ForgeEvidenceAdapter, IndependentReviewAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, LocalExecutor, SshExecutor, EvidenceSeatPolicyAdapter]
@@ -610,6 +610,7 @@ bounded_contexts:
       AssessHeadAcceptancePort: "Evaluate every required check and finding against the current head and policy; issue a scoped acceptance receipt or explicit blockers."
       InspectAcceptanceEvidencePort: "Return assessment revisions and receipt provenance, including stale, missing and unknown evidence."
       InspectHeadCiStatePort: "Read the CI state of one exact head through the forge without mutating anything: pending, passed, failed or unknown with a reason code; an unbound forge, an invalid head, an unreadable forge, no checks or an answer for another head is unknown, never a pass."
+      OpenEvidenceAssessmentPort: "Open a pending assessment for one attempt at one exact head and policy, idempotently; an assessment at another head or in a terminal state is refused, never overwritten or marked stale."
       EvidenceAssessmentRepositoryPort: "Persist assessments and child receipts with revision-aware updates."
       EvidenceArchivePort: "Retain immutable verification and review artifacts addressed by identity and digest."
       VerificationExecutorPort: "Run allow-listed checks on the configured verification host and return completed command receipts."

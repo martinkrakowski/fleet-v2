@@ -150,7 +150,7 @@ jobs:
       - name: e2e shell fixture test
         run: FLEET_E2E_SSH=1 sh tests/e2e-ssh-fixture.test.sh
       - name: e2e conductor scenarios
-        run: cd apps/cli && FLEET_E2E_SSH=1 npx vitest run src/__tests__/e2e/
+        run: cd apps/cli && FLEET_E2E_SSH=1 ../../node_modules/.bin/vitest run src/__tests__/e2e/
         env:
           CI: 'true'
 

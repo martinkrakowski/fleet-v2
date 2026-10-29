@@ -109,7 +109,7 @@ function validRequest(overrides: Partial<PrepareBriefPackageUseCaseRequest> = {}
     ownedPaths: ['packages/example/**'],
     allowedPathPrefixes: ['packages/example'],
     permissions: ['filesystem:worktree'],
-    acceptanceChecks: ['example-check'],
+    acceptanceChecks: ['example-check', 'example-check-2'],
     acceptanceSpec: {
       commitRequired: true,
       diffCheck: true,

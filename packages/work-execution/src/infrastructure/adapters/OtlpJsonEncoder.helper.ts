@@ -45,6 +45,9 @@ export type OtlpEncodeResult = {
 /** The single instrumentation scope (plan §3.5): name only, no version, no attributes. */
 export const OTLP_SCOPE = Object.freeze({ name: 'fleet-v2' });
 
+/** The largest batch the encoder enumerates; the exporter batches at most 512 spans (plan §3.5). */
+export const OTLP_MAX_BATCH_SPANS = 10_000;
+
 /** Marks a value the encoder cannot serialise; the span is refused. */
 const REFUSED = Symbol('otlp-refused');
 
@@ -175,6 +178,11 @@ export function encodeOtlpTraces(spans: readonly unknown[], resource: TelemetryR
   try {
     const length: unknown = spans.length;
     count = typeof length === 'number' && Number.isSafeInteger(length) && length > 0 ? length : 0;
+    // A batch past the bound is refused whole without enumerating it, so the
+    // fallback never allocates a hostile length (Luna pre-merge, OT3a).
+    if (count > OTLP_MAX_BATCH_SPANS) {
+      return { payload: null, encodedSpanIds: Object.freeze([]), refused: Object.freeze([]) };
+    }
     const resourceAttributes = telemetryResourceAttributes(resource);
     const resourceEntries: unknown[] = [];
     for (const key of RUN_TELEMETRY_RESOURCE_KEYS) {

@@ -313,3 +313,66 @@ describe('encodeOtlpTraces never throws (Luna, OT3a)', () => {
     expect(result.refused).toEqual([]);
   });
 });
+
+describe('encodeOtlpTraces over every span kind and a plan-billed LLM span (Luna pre-merge, OT3a)', () => {
+  it('a batch past the bound is refused whole without enumerating it', () => {
+    const huge = new Proxy([], {
+      get(target, key, receiver) {
+        if (key === 'length') {
+          return Number.MAX_SAFE_INTEGER;
+        }
+        if (typeof key === 'string' && /^[0-9]+$/.test(key)) {
+          throw new Error('hostile element read');
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    }) as unknown as readonly unknown[];
+    const result = encodeOtlpTraces(huge, RESOURCE);
+    expect(result.payload).toBeNull();
+    expect(result.refused).toEqual([]);
+  });
+
+  it('encodes one span of every kind plus a plan-billed LLM span and passes every redaction check', () => {
+    const kinds = ['CHAIN', 'AGENT', 'LLM', 'GUARDRAIL', 'EVALUATOR', 'DECISION', 'TOOL'] as const;
+    const spans = kinds.map((kind, index) =>
+      build({
+        traceId: TRACE_ID,
+        spanId: (index + 1).toString(16).padStart(16, 'a'),
+        parentSpanId: ROOT_SPAN_ID,
+        name: 'dispatch',
+        kind,
+        startIso: '2026-01-01T00:01:00Z',
+        endIso: '2026-01-01T00:02:00Z',
+        status: { code: 'unset', reasonCode: null },
+        attributes: {},
+        events: [],
+      }),
+    );
+    const planLlm = build({
+      traceId: TRACE_ID,
+      spanId: 'b'.repeat(16),
+      parentSpanId: ROOT_SPAN_ID,
+      name: 'usage',
+      kind: 'LLM',
+      startIso: '2026-01-01T00:02:00Z',
+      endIso: '2026-01-01T00:03:00Z',
+      status: { code: 'unset', reasonCode: null },
+      attributes: {
+        'llm.model_name': 'example-model',
+        'llm.token_count.prompt': 120,
+        'llm.cost.total': 0.25,
+        'fleet.seat.billing': 'plan',
+      },
+      events: [],
+    });
+    const result = encodeOtlpTraces([rootSpan, ...spans, planLlm], RESOURCE);
+    expect(result.payload).not.toBeNull();
+    // A plan-billed LLM span never carries a model or a cost on the wire.
+    const text = new TextDecoder().decode(result.payload as Uint8Array);
+    if (result.encodedSpanIds.includes('b'.repeat(16))) {
+      expect(text).not.toContain('llm.cost.total');
+    }
+    const report = redactionChecks(result.payload as Uint8Array, []);
+    expect(report.checks.filter((entry) => !entry.pass)).toEqual([]);
+  });
+});

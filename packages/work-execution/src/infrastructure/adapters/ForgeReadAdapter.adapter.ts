@@ -316,9 +316,14 @@ export class ForgeReadAdapter implements ForgeReadPort, ForgeAncestryPort {
     if (request.ancestorSha === request.descendantSha) {
       return { outcome: 'answered', contains: true };
     }
+    // Only the status is read: the full compare answer carries every file's
+    // patch since the merge base, which can exceed the stdout cap on a busy
+    // merge train and would leave the run parked for no reason.
     const args = [
       'api',
       `repos/${repository.owner}/${repository.repo}/compare/${request.ancestorSha}...${request.descendantSha}`,
+      '--jq',
+      '{status: .status}',
     ];
     const raced = await this.runGhWithinDeadline(args);
     if (raced.kind === 'timed-out') {

@@ -906,7 +906,9 @@ async function ownerMergeParkedHarness(options: HarnessOptions = {}): Promise<Ha
     parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null },
     parkCount: 1,
   });
-  const harness = await makeHarness(parkedRecord, [collectedAttempt()], {
+  // A base commit distinct from the collected head pins the ancestry request's
+  // ancestor to the COLLECTED head, never the attempt's base.
+  const harness = await makeHarness(parkedRecord, [collectedAttempt({ baseCommit: 'd'.repeat(40) })], {
     wireForgeRead: true,
     wireWorkOrder: true,
     wireAutoMerge: false,
@@ -930,6 +932,22 @@ describe('AdvanceLaneRunUseCase forge ancestry of a merged PR head (CT-2b)', () 
     expect(harness.ancestryRequests).toEqual([
       { ancestorSha: COMMIT, descendantSha: MOVED_COMMIT },
     ]);
+  });
+
+  it('test (a2): in merging, a merged PR at another head enters merged on contains: true and parks ambiguous merge on false or a throw (CT-2b Fable)', async () => {
+    const contained = await mergingHarness();
+    contained.setForgeReadAnswer(mergedPullRequestAtOtherHead(7));
+    contained.setAncestryAnswer({ outcome: 'answered', contains: true });
+    expect(await advance(contained)).toEqual({ outcome: 'entered', state: 'merged' });
+    expect(contained.ancestryRequests).toEqual([{ ancestorSha: COMMIT, descendantSha: MOVED_COMMIT }]);
+
+    for (const answer of [{ outcome: 'answered', contains: false } as const, 'throw' as const]) {
+      const harness = await mergingHarness();
+      harness.setForgeReadAnswer(mergedPullRequestAtOtherHead(7));
+      harness.setAncestryAnswer(answer);
+      expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'merge' });
+      expect(harness.ancestryRequests).toHaveLength(1);
+    }
   });
 
   it('test (b): ancestry answers contains: false and the run stays waiting parked', async () => {

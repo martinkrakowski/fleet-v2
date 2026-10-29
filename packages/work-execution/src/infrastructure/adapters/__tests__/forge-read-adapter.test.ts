@@ -471,7 +471,7 @@ describe('ForgeReadAdapter.containsCommit (CT-2b)', () => {
       contains: true,
     });
     expect(calls).toEqual([
-      ['api', `repos/example-owner/example-repo/compare/${SHA_A}...${SHA_B}`],
+      ['api', `repos/example-owner/example-repo/compare/${SHA_A}...${SHA_B}`, '--jq', '{status: .status}'],
     ]);
   });
 

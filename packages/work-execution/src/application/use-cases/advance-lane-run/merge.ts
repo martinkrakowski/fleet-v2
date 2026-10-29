@@ -196,6 +196,20 @@ async function ciFactOf(
   }
 }
 
+/**
+ * The ancestry answer as a boolean (CT-2b): only an `answered` true is true;
+ * unavailable or a throwing port is false, and the PR snapshot is kept so the
+ * decider parks `ambiguous merge` rather than waiting on inconsistent facts.
+ */
+async function containsLaneHeadOf(ancestry: ForgeAncestryPort, ancestorSha: string, descendantSha: string): Promise<boolean> {
+  try {
+    const answer = await ancestry.containsCommit({ ancestorSha, descendantSha });
+    return answer.outcome === 'answered' && answer.contains;
+  } catch {
+    return false;
+  }
+}
+
 /** The PR read: the snapshot's state and head plus its merge state; anything but a found snapshot reads null. */
 async function prFactOf(
   port: ForgeReadPort,
@@ -220,11 +234,7 @@ async function prFactOf(
       // merge train adds a merge commit), so ancestry answers it from the
       // forge. No answer is false: the run parks ambiguous merge or stays
       // parked for the owner; it never enters merged on a guess.
-      const ancestryAnswer = await ancestry.containsCommit({
-        ancestorSha: laneHeadSha,
-        descendantSha: read.pullRequest.headSha,
-      });
-      containsLaneHead = ancestryAnswer.outcome === 'answered' ? ancestryAnswer.contains : false;
+      containsLaneHead = await containsLaneHeadOf(ancestry, laneHeadSha, read.pullRequest.headSha);
     }
     return {
       pr: { state: read.pullRequest.state, head12, containsLaneHead },

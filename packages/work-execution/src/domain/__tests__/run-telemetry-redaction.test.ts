@@ -322,6 +322,13 @@ function expectNoLeak(report: TelemetryRedactionReport, secrets: readonly string
   }
 }
 
+/** Fully escapes every code point as a `\u00XX` sequence, JSON-safe and literal-free. */
+function escapeJsonUnicode(text: string): string {
+  return Array.from(text)
+    .map((ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`)
+    .join('');
+}
+
 describe('redactionChecks (OT1r)', () => {
   it('drops every canary string field and passes (plan test 1)', () => {
     const fixtures = [
@@ -390,9 +397,14 @@ describe('redactionChecks (OT1r)', () => {
   it('a never-sent key fails key-allow-list (plan test 3)', () => {
     const inputValue = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'input.value', value: { stringValue: 'example-text' } }]), 'AGENT');
     const httpUrl = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'http.url', value: { stringValue: 'https://example.invalid' } }]), 'AGENT');
-    for (const bytes of [inputValue, httpUrl]) {
+    const cases = [
+      { bytes: inputValue, secrets: ['input.value', 'example-text'] },
+      { bytes: httpUrl, secrets: ['http.url', 'https://example.invalid'] },
+    ];
+    for (const { bytes, secrets } of cases) {
       const report = redactionChecks(bytes, []);
       expect(check(report, 'key-allow-list').pass).toBe(false);
+      expectNoLeak(report, secrets);
     }
   });
 
@@ -404,13 +416,15 @@ describe('redactionChecks (OT1r)', () => {
     );
     const report = redactionChecks(bytes, []);
     expect(check(report, 'key-allow-list').pass).toBe(false);
+    expectNoLeak(report, ['host.name', 'example-host']);
   });
 
   it('fleet.round as a string fails values (plan test 4)', () => {
-    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.round', value: { stringValue: '1' } }]), 'AGENT');
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.round', value: { stringValue: 'example-round-string' } }]), 'AGENT');
     const report = redactionChecks(bytes, []);
     expect(check(report, 'key-allow-list').pass).toBe(true);
     expect(check(report, 'values').pass).toBe(false);
+    expectNoLeak(report, ['fleet.round', 'example-round-string']);
   });
 
   it('a 15-hex digest fails values (plan test 4)', () => {
@@ -442,7 +456,14 @@ describe('redactionChecks (OT1r)', () => {
   });
 
   it('a value object with two fields fails values (plan test 4)', () => {
-    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.round', value: { stringValue: '1', intValue: 1 } }]), 'AGENT');
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.round', value: { stringValue: 'example-two-field', intValue: 1 } }]), 'AGENT');
+    const report = redactionChecks(bytes, []);
+    expect(check(report, 'values').pass).toBe(false);
+    expectNoLeak(report, ['fleet.round', 'example-two-field']);
+  });
+
+  it('a resource without service.name fails values (Luna review)', () => {
+    const bytes = handPayload([], handSpanAttributes([]), 'AGENT');
     const report = redactionChecks(bytes, []);
     expect(check(report, 'values').pass).toBe(false);
   });
@@ -476,6 +497,17 @@ describe('redactionChecks (OT1r)', () => {
     expectNoLeak(report, [githubToken, 'fleet.seat.model']);
   });
 
+  it('a JSON-escaped secret-shaped decoded value fails secret-shapes (Luna review)', () => {
+    const githubToken = 'gh' + 'p_' + 'a'.repeat(36);
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.seat.model', value: { stringValue: githubToken } }]), 'AGENT');
+    const text = new TextDecoder().decode(bytes);
+    const escapedText = text.replace(githubToken, escapeJsonUnicode(githubToken));
+    expect(escapedText).not.toContain(githubToken);
+    const report = redactionChecks(new TextEncoder().encode(escapedText), [githubToken]);
+    expect(check(report, 'secret-shapes').pass).toBe(false);
+    expectNoLeak(report, [githubToken, 'fleet.seat.model']);
+  });
+
   it('refuses payloads that do not parse, with every check failed (robustness)', () => {
     const notUtf8 = new Uint8Array([0xff, 0xfe, 0x61, 0x62]);
     const reports = [
@@ -502,6 +534,31 @@ describe('redactionChecks (OT1r)', () => {
     expect(report.pass).toBe(false);
     // Both fixture spans carry the model id, so both offend.
     expect(check(report, 'canaries').offendingSpans).toBe(2);
+  });
+
+  it('a JSON-escaped canary in a decoded value fails canaries (Luna review)', () => {
+    const canary = 'example-model';
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.seat.model', value: { stringValue: canary } }]), 'AGENT');
+    const text = new TextDecoder().decode(bytes);
+    const escapedText = text.replace(canary, escapeJsonUnicode(canary));
+    expect(escapedText).not.toContain(canary);
+    const report = redactionChecks(new TextEncoder().encode(escapedText), [canary]);
+    expect(check(report, 'canaries').pass).toBe(false);
+    expectNoLeak(report, [canary]);
+  });
+
+  it('counts a span once however many canaries it carries (Luna review)', () => {
+    const bytes = handPayload(
+      RESOURCE_NAME_ONLY,
+      handSpanAttributes([
+        { key: 'fleet.seat.model', value: { stringValue: 'canary-one' } },
+        { key: 'llm.model_name', value: { stringValue: 'canary-two' } },
+      ]),
+      'AGENT',
+    );
+    const report = redactionChecks(bytes, ['canary-one', 'canary-two']);
+    expect(report.pass).toBe(false);
+    expect(check(report, 'canaries').offendingSpans).toBe(1);
   });
 
   it('the report is frozen and lists the checks in order (robustness)', () => {

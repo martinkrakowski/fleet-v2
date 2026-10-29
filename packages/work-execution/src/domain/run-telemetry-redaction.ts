@@ -43,6 +43,8 @@ type DecodedAttributeValue = string | number | readonly string[];
 /** One walked resource or span: its decoded attribute map. */
 interface DecodedEntry {
   readonly kind: 'resource' | 'span';
+  /** The span's decoded name; resources carry no name, so ''. */
+  readonly name: string;
   readonly attributes: ReadonlyMap<string, DecodedAttributeValue>;
   /** False when any attribute value of the entry could not be decoded. */
   readonly decoded: boolean;
@@ -192,7 +194,8 @@ function readSpan(span: unknown): DecodedEntry | null {
     return null;
   }
   const read = readAttributes(ownData(span, 'attributes'));
-  return { kind: 'span', attributes: read.attributes, decoded: read.decoded };
+  const name = ownData(span, 'name');
+  return { kind: 'span', name: typeof name === 'string' ? name : '', attributes: read.attributes, decoded: read.decoded };
 }
 
 /** Appends every span of one `scopeSpans` element; false on a shape failure. */
@@ -225,7 +228,7 @@ function readResource(resource: unknown, entries: DecodedEntry[]): boolean {
     return false;
   }
   const read = readAttributes(ownData(resource, 'attributes'));
-  entries.push({ kind: 'resource', attributes: read.attributes, decoded: read.decoded });
+  entries.push({ kind: 'resource', name: '', attributes: read.attributes, decoded: read.decoded });
   return true;
 }
 
@@ -283,7 +286,20 @@ function attributeValuesContain(entry: DecodedEntry, canary: string): boolean {
   return false;
 }
 
-/** The `canaries` check (plan §3.2 test 1): no canary in the payload text. */
+/** True when any decoded string the entry carries contains the canary (values, keys, span name). */
+function entryContainsCanary(entry: DecodedEntry, canary: string): boolean {
+  if (entry.name.includes(canary)) {
+    return true;
+  }
+  for (const key of entry.attributes.keys()) {
+    if (key.includes(canary)) {
+      return true;
+    }
+  }
+  return attributeValuesContain(entry, canary);
+}
+
+/** The `canaries` check (plan §3.2 test 1): no canary in the raw text or any decoded string. */
 function checkCanaries(
   payload: DecodedPayload | null,
   canaryValues: readonly string[],
@@ -291,8 +307,7 @@ function checkCanaries(
   if (payload === null) {
     return { pass: false, offendingSpans: 0, skippedCanaries: 0 };
   }
-  let pass = true;
-  let offendingSpans = 0;
+  const active: string[] = [];
   let skippedCanaries = 0;
   for (const canary of canaryValues) {
     const trimmed = typeof canary === 'string' ? canary.trim() : '';
@@ -301,14 +316,18 @@ function checkCanaries(
       skippedCanaries += 1;
       continue;
     }
-    if (!payload.text.includes(trimmed)) {
-      continue;
-    }
+    active.push(trimmed);
+  }
+  let pass = true;
+  if (active.some((canary) => payload.text.includes(canary))) {
     pass = false;
-    for (const entry of payload.entries) {
-      if (attributeValuesContain(entry, trimmed)) {
-        offendingSpans += 1;
-      }
+  }
+  // Each offending span counts once, however many canaries it carries.
+  let offendingSpans = 0;
+  for (const entry of payload.entries) {
+    if (active.some((canary) => entryContainsCanary(entry, canary))) {
+      pass = false;
+      offendingSpans += 1;
     }
   }
   return { pass, offendingSpans, skippedCanaries };
@@ -405,11 +424,13 @@ function checkResourceValues(entry: DecodedEntry): boolean {
   if (!entry.decoded) {
     return false;
   }
+  let sawServiceName = false;
   for (const [key, value] of entry.attributes) {
     if (key === 'service.name') {
       if (value !== TELEMETRY_SERVICE_NAME) {
         return false;
       }
+      sawServiceName = true;
       continue;
     }
     if (key === 'service.version') {
@@ -426,7 +447,7 @@ function checkResourceValues(entry: DecodedEntry): boolean {
     }
     return false;
   }
-  return true;
+  return sawServiceName;
 }
 
 /** The `values` check over every walked entry. */
@@ -487,8 +508,8 @@ function checkSecretShapes(payload: DecodedPayload | null): { readonly pass: boo
       offendingSpans += 1;
     }
   }
-  // The payload text as a whole is checked too: a shape anywhere fails.
-  const pass = !textHasSecretShape(payload.text);
+  // The payload text as a whole and every decoded value are checked: a shape anywhere fails.
+  const pass = !textHasSecretShape(payload.text) && offendingSpans === 0;
   return { pass, offendingSpans };
 }
 

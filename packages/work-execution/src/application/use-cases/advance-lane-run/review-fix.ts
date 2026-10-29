@@ -10,7 +10,7 @@ import type {
   ReviewRequestResult,
   ReviewVerdict,
 } from '../../ports/out/ReviewRequestPort.out-port.js';
-import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
+import type { AttemptRecord, AttemptRunnerRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import type { HandoverFinding, RenderHandoverBriefInput } from '../../../domain/lane-run-handover.js';
 import { renderHandoverBrief } from '../../../domain/lane-run-handover.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
@@ -24,7 +24,7 @@ import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunSta
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import { readFrozenManifest } from './frozen-manifest.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendRunIntent, appendRunResult, intentMintedIdOf, saveOrRefuse } from './step-context.js';
+import { appendRunIntent, appendRunResult, intentMintedIdOf, performPark, saveOrRefuse } from './step-context.js';
 
 type ReviewKind = 'brief-check' | 'code-review';
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
@@ -462,6 +462,8 @@ function briefRequestFromManifest(input: {
   readonly fixAttemptId: string;
   readonly worktreePath: string;
   readonly proseMarkdown: string;
+  /** The prior attempt's runner block, so the placement runs on the reserved host (KF-9). */
+  readonly recordedHost: AttemptRunnerRecord | null;
 }): PrepareBriefPackageUseCaseRequest | null {
   const manifest = input.manifest;
   const requiredFields = [
@@ -500,6 +502,7 @@ function briefRequestFromManifest(input: {
     attemptId: input.fixAttemptId,
     worktreePath: input.worktreePath,
     proseMarkdown: input.proseMarkdown,
+    recordedHost: input.recordedHost,
   };
 }
 
@@ -525,6 +528,16 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   const prepareBrief = ctx.deps.prepareBrief;
   if (fixPort === undefined || ctx.deps.reviewRequest === undefined || prepareBrief === undefined) {
     return { outcome: 'not-wired', step: decision.step };
+  }
+  // A refused fix prepare must never re-run under the same key: the decider's
+  // refused-step check reads the run's round, which is still the prior round
+  // until dispatch, so it would re-issue the identical key and loop forever
+  // on `duplicate-key` (KF-9). The spent-key guard of `parkSpentOneWayKey`
+  // (merge.ts) applies to the prepare step too: any intent under this key
+  // parks `step-refused prepare` for the owner before anything is written.
+  const keyEntries = await ctx.deps.runJournal.listForKey(decision.key);
+  if (keyEntries.some((entry) => entry.kind === 'intent')) {
+    return performPark(ctx, record, 'step-refused', 'prepare', gathered.facts.state, request);
   }
   if (decision.round !== 1 && decision.round !== 2) {
     return refuse('prepare-refused');
@@ -611,6 +624,9 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
           fixAttemptId: briefFixRequest.fixAttemptId,
           worktreePath: prior.worktreePath,
           proseMarkdown: brief.text,
+          // KF-9: the brief package is placed on the reserved host of the
+          // prior attempt, never on the default executor.
+          recordedHost: prior.runner ?? null,
         });
   const refusePrepared = async (): Promise<AdvanceLaneRunResult> => {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'prepare-refused');

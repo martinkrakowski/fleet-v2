@@ -4,9 +4,10 @@ import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in
 import type { ExecuteAuthorizedForgeActionResult, ExecuteAuthorizedForgeActionRequest } from '../../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
 import type { CiStatePort } from '../../ports/out/CiStatePort.out-port.js';
 import type { ConductorForgeGrantResult } from '../../ports/out/ConductorForgeGrantPort.out-port.js';
-import type { ForgeReadPort, PullRequestRef, ReadPullRequestResult } from '../../ports/out/ForgeReadPort.out-port.js';
+import type { ForgeReadPort, PullRequestMergeState, PullRequestRef, ReadPullRequestResult } from '../../ports/out/ForgeReadPort.out-port.js';
 import type { ReviewRequestPort } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
+import { laneRunJournalState } from '../../../domain/lane-run-journal.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
 import { head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { LaneRunPrBodyFrozen, RenderPrBodyResult } from '../../../domain/lane-run-pr-body.js';
@@ -27,13 +28,28 @@ const FACT_READ_STATES: readonly LaneRunStateValue[] = [
   'awaiting-premerge', 'opening-pr', 'pushing', 'watching-ci', 'merging',
 ];
 
-/** The acceptance and read-only PR/CI facts one advance gathers (K6-5). */
+/** The merge facts the decider reads in `merging` (K6-7). */
+export interface MergeFacts {
+  readonly oneWayDoor: boolean;
+  readonly branchBehind: boolean;
+  readonly trainFree: boolean;
+  readonly policyGrant: boolean;
+}
+
+/** The acceptance and read-only PR/CI/merge facts one advance gathers (K6-5/7). */
 export interface AcceptanceFacts {
   readonly acceptance: 'none' | 'accepted' | 'rejected' | 'unknown';
   readonly acceptedHead12: string | null;
   readonly preMerge: 'none' | 'passed' | 'failed' | 'unknown';
   readonly ci: 'pending' | 'passed' | 'failed' | 'unknown';
   readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string } | null;
+  readonly merge: MergeFacts;
+}
+
+/** The PR read kept for the merge facts: the decider's `pr` plus the snapshot's merge state. */
+interface PrReadResult {
+  readonly pr: AcceptanceFacts['pr'];
+  readonly mergeState: PullRequestMergeState | null;
 }
 
 /** The key's final (non-ambiguous) result, or null when it has none. */
@@ -157,30 +173,37 @@ async function ciFactOf(
   }
 }
 
-/** The PR fact: the snapshot's state and head; anything but a found snapshot reads null. */
+/** The PR read: the snapshot's state and head plus its merge state; anything but a found snapshot reads null. */
 async function prFactOf(
   port: ForgeReadPort,
   record: LaneRunRecord,
   latest: AttemptRecord,
-): Promise<AcceptanceFacts['pr']> {
+): Promise<PrReadResult> {
   try {
     const read = await port.readPullRequest({ ref: pullRequestRefOf(record, latest) });
     if (read.outcome !== 'found') {
-      return null;
+      return { pr: null, mergeState: null };
     }
     const head12 = head12Of(read.pullRequest.headSha);
-    return head12 === null ? null : { state: read.pullRequest.state, head12 };
+    if (head12 === null) {
+      return { pr: null, mergeState: null };
+    }
+    return {
+      pr: { state: read.pullRequest.state, head12 },
+      mergeState: read.pullRequest.mergeState,
+    };
   } catch {
-    return null;
+    return { pr: null, mergeState: null };
   }
 }
 
 /**
- * The acceptance and read-only facts of one advance (K6-5). The acceptance
- * journal facts are read always; the three port reads run only past
- * acceptance — a state inside the PR/CI window, a collected head to read at,
- * a bound port, and never while halted — otherwise the hard-coded defaults
- * stand (`preMerge: 'none'`, `ci: 'unknown'`, `pr: null`).
+ * The acceptance, read-only PR/CI facts of one advance (K6-5) and the merge
+ * facts (K6-7). The acceptance journal facts are read always; the port reads
+ * run only past acceptance — a state inside the PR/CI window, a collected head
+ * to read at, a bound port, and never while halted — otherwise the hard-coded
+ * defaults stand (`preMerge: 'none'`, `ci: 'unknown'`, `pr: null`). The PR is
+ * read once; its snapshot's merge state feeds the merge facts.
  */
 export async function acceptanceFactsOf(
   ctx: AdvanceStepContext,
@@ -196,6 +219,7 @@ export async function acceptanceFactsOf(
   let preMerge: AcceptanceFacts['preMerge'] = 'none';
   let ci: AcceptanceFacts['ci'] = 'unknown';
   let pr: AcceptanceFacts['pr'] = null;
+  let mergeState: PullRequestMergeState | null = null;
   const canRead = !halted && latest !== null && latest.artifacts !== null && FACT_READ_STATES.includes(state);
   if (canRead) {
     const headSha = latest.artifacts.headCommit;
@@ -206,10 +230,70 @@ export async function acceptanceFactsOf(
       ci = await ciFactOf(ctx.deps.ciState, headSha);
     }
     if (ctx.deps.forgeRead !== undefined) {
-      pr = await prFactOf(ctx.deps.forgeRead, record, latest);
+      const prRead = await prFactOf(ctx.deps.forgeRead, record, latest);
+      pr = prRead.pr;
+      mergeState = prRead.mergeState;
     }
   }
-  return { acceptance, acceptedHead12, preMerge, ci, pr };
+  const merge = await mergeFactsOf(ctx, record, state, halted, acceptance, mergeState);
+  return { acceptance, acceptedHead12, preMerge, ci, pr, merge };
+}
+
+/**
+ * The merge facts (K6-7): `oneWayDoor` is false exactly when the head is
+ * accepted (the acceptance assessment already blocks on an open one-way door
+ * with blocker kind `door`; anything else, including unreadable, is true);
+ * `branchBehind` follows the PR snapshot's merge state (behind or unknown;
+ * clean and blocked read false — blocked is CI's or the thread's business, which
+ * the merge attempt reports as not-merged); `trainFree` is true when no OTHER
+ * run is merging on the same repository; and `policyGrant` is the dependency's
+ * `autoMergeEnabled` boolean. The run list and work orders are read only in
+ * `merging`, never while halted; every read failure falls closed (wait).
+ */
+async function mergeFactsOf(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  state: LaneRunStateValue,
+  halted: boolean,
+  acceptance: AcceptanceFacts['acceptance'],
+  mergeState: PullRequestMergeState | null,
+): Promise<MergeFacts> {
+  const oneWayDoor = acceptance !== 'accepted';
+  const branchBehind = mergeState === 'behind' || mergeState === 'unknown';
+  let trainFree = true;
+  if (!halted && state === 'merging') {
+    try {
+      const workOrderRepo = ctx.deps.workOrderRepo;
+      if (workOrderRepo === undefined) {
+        trainFree = false;
+      } else {
+        const thisWo = await workOrderRepo.findWorkOrderById(record.workOrderId);
+        const runs = await ctx.deps.runRepo.list();
+        for (const other of runs) {
+          if (other.runId === record.runId || other.parked !== null) {
+            continue;
+          }
+          const otherEntries = await ctx.deps.runJournal.listForRun(other.runId);
+          if (laneRunJournalState(otherEntries, other.runId) !== 'merging') {
+            continue;
+          }
+          if (thisWo === null) {
+            trainFree = false;
+            break;
+          }
+          const otherWo = await workOrderRepo.findWorkOrderById(other.workOrderId);
+          if (otherWo === null || otherWo.repository === thisWo.repository) {
+            trainFree = false;
+            break;
+          }
+        }
+      }
+    } catch {
+      trainFree = false;
+    }
+  }
+  const policyGrant = ctx.deps.autoMergeEnabled === true;
+  return { oneWayDoor, branchBehind, trainFree, policyGrant };
 }
 
 /** The accept body after its intent (K6-5): one assessment at the exact head, mapped by reason code only. */
@@ -659,6 +743,106 @@ export async function reconcilePrPush(
   }
   if (read.outcome === 'not-found') {
     return appendReconcileResult(ctx, request, decision, 'refused', 'forge-refused');
+  }
+  return appendReconcileResult(ctx, request, decision, 'ambiguous', 'forge-ambiguous');
+}
+
+/**
+ * The `act merge` step (K6-7): one keyed intent, then `AutoMergeAttemptPort`
+ * under the attempt id. Only reason codes are journalled — the port's `detail`
+ * text is never. A merged head that matches the run's head completes; a merge
+ * at any other head stays ambiguous for the reconcile; `waiting` is completed
+ * (`merge-waiting`, the next pass re-reads the PR); `off` and `not-merged` are
+ * refused; a throw is ambiguous. `merge` is one-way: the key is never re-sent.
+ */
+export async function performMerge(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: ActDecision,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  const autoMergeAttempt = ctx.deps.autoMergeAttempt;
+  if (autoMergeAttempt === undefined) {
+    return { outcome: 'not-wired', step: decision.step };
+  }
+  const latest = gathered.latestAttempt;
+  if (latest === null || latest.artifacts === null) {
+    return { outcome: 'waiting', reason: 'facts-inconsistent' };
+  }
+  const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
+  if (intentRefusal !== null) {
+    return { outcome: 'refused', reason: intentRefusal };
+  }
+  let result: 'completed' | 'refused' | 'ambiguous';
+  let reasonCode: LaneRunResultReasonCode;
+  try {
+    const outcome = await autoMergeAttempt.autoMergeAttempt({ attemptId: latest.id });
+    if (outcome.outcome === 'merged') {
+      if (head12Of(outcome.headSha) === gathered.facts.head12) {
+        result = 'completed';
+        reasonCode = 'merged';
+      } else {
+        result = 'ambiguous';
+        reasonCode = 'forge-ambiguous';
+      }
+    } else if (outcome.outcome === 'waiting') {
+      result = 'completed';
+      reasonCode = 'merge-waiting';
+    } else if (outcome.outcome === 'off') {
+      result = 'refused';
+      reasonCode = 'merge-off';
+    } else {
+      result = 'refused';
+      reasonCode = 'merge-not-merged';
+    }
+  } catch {
+    result = 'ambiguous';
+    reasonCode = 'forge-ambiguous';
+  }
+  const resultRefusal = await appendRunResult(ctx, request, decision.key, result, reasonCode);
+  if (resultRefusal !== null) {
+    return { outcome: 'refused', reason: resultRefusal };
+  }
+  return { outcome: 'acted', step: decision.step, key: decision.key, result, reasonCode };
+}
+
+/**
+ * The merge reconcile (K6-7): merge is one-way, so the reconcile only reads the
+ * PR at the head through `forgeRead` and records — never a second
+ * `autoMergeAttempt` under the key. A merged PR at the run's head completes; an
+ * open PR at the head is refused (`merge-not-merged`, the decider acts again);
+ * any other state, `unavailable` or a throw is ambiguous.
+ */
+export async function reconcileMerge(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: ReconcileDecision,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  const forgeRead = ctx.deps.forgeRead;
+  if (forgeRead === undefined) {
+    return { outcome: 'not-wired', step: decision.step };
+  }
+  const latest = gathered.latestAttempt;
+  if (latest === null) {
+    return { outcome: 'waiting', reason: 'facts-inconsistent' };
+  }
+  let read: ReadPullRequestResult;
+  try {
+    read = await forgeRead.readPullRequest({ ref: pullRequestRefOf(record, latest) });
+  } catch {
+    return appendReconcileResult(ctx, request, decision, 'ambiguous', 'forge-ambiguous');
+  }
+  if (read.outcome === 'found') {
+    const snapshot = read.pullRequest;
+    if (snapshot.state === 'merged' && head12Of(snapshot.headSha) === gathered.facts.head12) {
+      return appendReconcileResult(ctx, request, decision, 'completed', 'merged');
+    }
+    if (snapshot.state === 'open' && head12Of(snapshot.headSha) === gathered.facts.head12) {
+      return appendReconcileResult(ctx, request, decision, 'refused', 'merge-not-merged');
+    }
   }
   return appendReconcileResult(ctx, request, decision, 'ambiguous', 'forge-ambiguous');
 }

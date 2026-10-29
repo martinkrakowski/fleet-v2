@@ -64,6 +64,8 @@ import type { AcceptanceAssessmentPort } from '../ports/out/AcceptanceAssessment
 import type { CiStatePort } from '../ports/out/CiStatePort.out-port.js';
 import type { ForgeReadPort } from '../ports/out/ForgeReadPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
+import type { AutoMergeAttemptPort } from '../ports/in/AutoMergeAttemptPort.in-port.js';
+import type { LaneRunParkNoticePort } from '../ports/out/LaneRunParkNoticePort.out-port.js';
 import type { SameModelFamily } from '../../domain/seat-selection.js';
 import { checkLeaseHeld } from '../../domain/lane-run-lease.js';
 import type { LeaseRefusal } from '../../domain/lane-run-lease.js';
@@ -88,7 +90,7 @@ import { performCancel, performStop } from './advance-lane-run/stop-cancel.js';
 import { performCollect, performGate } from './advance-lane-run/collect-gate.js';
 import { performReconcile } from './advance-lane-run/reconcile.js';
 import { performReview } from './advance-lane-run/review-fix.js';
-import { performAccept, performOpenPr, performPush } from './advance-lane-run/merge.js';
+import { performAccept, performMerge, performOpenPr, performPush } from './advance-lane-run/merge.js';
 import { gatherFacts, performAdmissionWait } from './advance-lane-run/facts.js';
 
 export interface AdvanceLaneRunDependencies {
@@ -143,6 +145,12 @@ export interface AdvanceLaneRunDependencies {
   readonly conductorForgeGrant?: ConductorForgeGrantPort;
   /** Execute an authorized forge action under a conductor grant (K6-6); absent → `not-wired`. */
   readonly executeForgeAction?: ExecuteAuthorizedForgeActionPort;
+  /** Merge the accepted head through `AutoMergeAttemptPort` (K6-7); absent → `not-wired merge`. */
+  readonly autoMergeAttempt?: AutoMergeAttemptPort;
+  /** Raise one attention item / keyed owner question per park (K6-3/7); absent → parks raise nothing. */
+  readonly parkNotice?: LaneRunParkNoticePort;
+  /** Whether `policy.autoMerge` is enabled (K6-7); absent → the merge fact `policyGrant` is false. */
+  readonly autoMergeEnabled?: boolean;
 }
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */
@@ -275,6 +283,9 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       }
       if (decision.step === 'push') {
         return performPush(this.ctx, record, gathered, decision, request);
+      }
+      if (decision.step === 'merge') {
+        return performMerge(this.ctx, record, gathered, decision, request);
       }
       if (decision.step === 'stop') {
         return performStop(this.ctx, record, gathered, decision, request);

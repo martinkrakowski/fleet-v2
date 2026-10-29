@@ -13,6 +13,7 @@ import {
 import { parseWorkOrderStateRecord } from './WorkOrderRepositoryAdapter.adapter.js';
 import { parseLaneRunStateRecord } from './LaneRunRepositoryAdapter.adapter.js';
 import { parseLaneRunJournalStateRecord } from './LaneRunJournalAdapter.adapter.js';
+import { parseTelemetryDispositionStateRecord } from './TelemetryDispositionAdapter.adapter.js';
 
 export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('work-orders.json', parseWorkOrderStateRecord),
@@ -23,4 +24,5 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('conductor-driver-lease.json', parseConductorDriverLeaseStateRecord),
   describeRecordListStore('conductor-halt.json', parseConductorHaltStateRecord),
   describeRecordListStore('run-journal.json', parseLaneRunJournalStateRecord),
+  describeRecordListStore('telemetry-dispositions.json', parseTelemetryDispositionStateRecord),
 ];

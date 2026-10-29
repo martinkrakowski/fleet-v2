@@ -48,5 +48,6 @@ export * from "./RunnerSelectorAdapter.adapter.js";
 export * from "./spawn-run.js";
 export * from "./SshExecutor.adapter.js";
 export * from "./state-files.js";
+export * from "./TelemetryDispositionAdapter.adapter.js";
 export * from "./WorkOrderRepositoryAdapter.adapter.js";
 export * from "./WorkspaceAdapter.adapter.js";

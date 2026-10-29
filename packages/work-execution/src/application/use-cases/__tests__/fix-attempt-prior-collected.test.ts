@@ -248,6 +248,90 @@ describe('C1b fix attempt waits for the prior attempt to be collected', () => {
   });
 });
 
+describe('Q2a-1 a fix attempt inherits its prior attempt\u2019s host block', () => {
+  const fixRequest = {
+    fixAttemptId: 'attempt-fix-q2a',
+    workOrderId: 'wo-1',
+    priorAttemptId: 'attempt-1',
+    numberedFixes: ['1. example fix'],
+    nowIso: '2026-10-29T10:00:00.000Z',
+  };
+
+  function prepareFromPrior(priorRunner: AttemptRecord['runner']) {
+    const attemptRepo = makeAttemptRepo();
+    attemptRepo.attempts.set('attempt-1', attempt({ state: 'collected', runner: priorRunner }));
+    const useCase = new PrepareFixAttemptUseCase({
+      attemptRepo: attemptRepo as unknown as AttemptRepositoryPort,
+    });
+    return { attemptRepo, useCase };
+  }
+
+  it('an ssh prior runner block is carried onto the fix record with null session fields', async () => {
+    const { attemptRepo, useCase } = prepareFromPrior({
+      kind: 'opencode',
+      remotePort: 4001,
+      host: 'alias-example',
+      hostName: 'host-example',
+      agent: 'agent-old',
+      model: 'model-old',
+      variant: 'variant-old',
+    });
+    const result = await useCase.prepareFixAttempt(
+      fixRequest as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0],
+    );
+    expect(result.outcome).toBe('prepared');
+    const fix = attemptRepo.attempts.get('attempt-fix-q2a');
+    expect(fix?.runner).toEqual({
+      kind: 'opencode',
+      remotePort: 4001,
+      host: 'alias-example',
+      hostName: 'host-example',
+      agent: null,
+      model: null,
+      variant: null,
+    });
+  });
+
+  it('an agy prior runner block carries the null port', async () => {
+    const { attemptRepo, useCase } = prepareFromPrior({
+      kind: 'agy',
+      remotePort: null,
+      host: 'alias-example',
+      hostName: 'host-example',
+      agent: null,
+      model: null,
+      variant: null,
+    });
+    const result = await useCase.prepareFixAttempt(
+      fixRequest as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0],
+    );
+    expect(result.outcome).toBe('prepared');
+    expect(attemptRepo.attempts.get('attempt-fix-q2a')?.runner).toEqual({
+      kind: 'agy',
+      remotePort: null,
+      host: 'alias-example',
+      hostName: 'host-example',
+      agent: null,
+      model: null,
+      variant: null,
+    });
+  });
+
+  it('a prior without a host name or runner writes no runner on the fix record', async () => {
+    for (const priorRunner of [
+      null,
+      { kind: 'opencode' as const, remotePort: 4001, host: 'alias-example', agent: null, model: null, variant: null },
+    ]) {
+      const { attemptRepo, useCase } = prepareFromPrior(priorRunner);
+      const result = await useCase.prepareFixAttempt(
+        fixRequest as Parameters<PrepareFixAttemptUseCase['prepareFixAttempt']>[0],
+      );
+      expect(result.outcome).toBe('prepared');
+      expect(attemptRepo.attempts.get('attempt-fix-q2a')?.runner).toBeUndefined();
+    }
+  });
+});
+
 describe('C1b dispatch refuses until the prior attempt is collected', () => {
   const validDispatch = {
     attemptId: 'attempt-fix-1',

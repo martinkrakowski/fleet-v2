@@ -268,6 +268,30 @@ describe('conductor review-assessment wiring (K5-6)', () => {
     ).resolves.toEqual({ outcome: 'unavailable', reason: 'head-mismatch' });
   });
 
+  it('the gate receipt adapter records one verification receipt per check into the opened assessment, and is unavailable without one (KF-13b)', async () => {
+    const runtime = createFleetCliRuntime();
+    const request = {
+      attemptId: ATTEMPT_ID,
+      projectId: PROJECT_ID,
+      candidateHeadSha: HEAD,
+      hostId: 'lane-host',
+      policyRevision: 'policy-example-1',
+      completedAtIso: '2026-10-29T12:00:00.000Z',
+      evidenceRef: 'run-journal:run-01JB0000000000000000000000/r0/gate/0',
+      receipts: [{ procedureName: 'dry-run-check', result: 'pass' as const, exitCode: 0 }],
+    };
+    const before = await runtime.conductor.gateReceipts.recordGateReceipts(request);
+    expect(before.outcome).toBe('unavailable');
+
+    await expect(runtime.conductor.reviewAssessment.openReviewAssessment(makeOpenRequest())).resolves.toEqual({ outcome: 'open' });
+    const after = await runtime.conductor.gateReceipts.recordGateReceipts(request);
+    expect(after).toEqual({ outcome: 'recorded', count: 1 });
+    const assessment = await runtime.evidence.evidenceAssessmentRepository.findAssessmentById(assessmentIdForAttempt(ATTEMPT_ID));
+    expect(assessment?.verificationReceipts.map((receipt) => [receipt.procedureName, receipt.candidateHeadSha])).toEqual([
+      ['dry-run-check', HEAD],
+    ]);
+  });
+
   it('the live conductor evaluates the predicate-backed gate, never the predicate-less accept instance (KF-12)', async () => {
     const runtime = createFleetCliRuntime();
     const gate = conductorGateOf(runtime);

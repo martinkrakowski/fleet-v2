@@ -99,6 +99,11 @@ function briefFixture(overrides: Partial<PrepareBriefPackageRequest> = {}): Prep
     expectedArtifacts: [],
     ownerDecisionReferences: [],
     contextDecisions: [],
+    prNotes: {
+      hardToUndo: 'The conductor opens the PR and merges it automatically',
+      assumptions: 'The base branch is main and CI passes',
+      challengeThis: 'That the merge train is safe without a reviewer on the final diff',
+    },
     ...overrides,
   };
 }
@@ -497,6 +502,19 @@ describe('StartLaneRunUseCase', () => {
     });
     const result = await harness.useCase.startLaneRun(requestFixture());
     expect(result).toEqual({ outcome: 'refused', reason: 'work-order-missing' });
+    expect(harness.capacityCalls).toHaveLength(0);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await harness.executionJournal.listActiveReservations()).toEqual([]);
+    expect(await harness.attemptRepoStore.listAllAttempts()).toEqual([]);
+  });
+
+  it('test 2d: a conducted start refuses a brief without frozen PR notes and writes nothing', async () => {
+    const harness = makeHarness();
+    const result = await harness.useCase.startLaneRun(
+      requestFixture({ brief: briefFixture({ prNotes: undefined }) }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'pr-notes-missing' });
     expect(harness.capacityCalls).toHaveLength(0);
     expect(harness.worktreeCalls).toHaveLength(0);
     expect(harness.briefCalls).toHaveLength(0);

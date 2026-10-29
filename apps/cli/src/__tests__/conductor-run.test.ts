@@ -139,6 +139,11 @@ function briefFixture(): Record<string, unknown> {
     expectedArtifacts: [],
     ownerDecisionReferences: [],
     contextDecisions: [],
+    prNotes: {
+      hardToUndo: 'The conductor opens the PR and merges it automatically',
+      assumptions: 'The base branch is main and CI passes',
+      challengeThis: 'That the merge train is safe without a reviewer on the final diff',
+    },
   };
 }
 

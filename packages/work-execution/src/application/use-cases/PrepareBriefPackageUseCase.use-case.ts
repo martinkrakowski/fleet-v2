@@ -5,12 +5,15 @@
  * any dispatch. The package is placed only under verified ignored paths; the
  * digest is integrity, not a truth claim. Nothing enters the brief unreviewed.
  * The acceptance spec is validated and frozen into the manifest, so the
- * digest covers the gate.
+ * digest covers the gate. PR notes (D7) are validated when present and
+ * frozen under `prNotes`; they are optional here because manual prepare
+ * works without them, while a conducted start requires them.
  */
 
 import { parseSeatTool } from '../../domain/execution-records.js';
 import { validateAllowedPathPrefix } from '../../domain/lane-diff-check.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
+import { isPlanSecretShaped } from '../../domain/lane-plan-sidecar.js';
 import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import type {
   PrepareBriefPackagePort,
@@ -72,6 +75,33 @@ export function simpleDeterministicHexDigest(content: string): string {
 
 function isNonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+/**
+ * PR notes (D7): each of the three sections is a non-empty string of at
+ * most 4000 characters and carries no secret shape. Returns a fixed reason
+ * or null; never echoes a value.
+ */
+const PR_NOTE_MAX_LENGTH = 4000;
+
+function prNotesError(notes: unknown): string | null {
+  if (typeof notes !== 'object' || notes === null || Array.isArray(notes)) {
+    return 'prNotes must be an object with hardToUndo, assumptions and challengeThis';
+  }
+  const record = notes as Record<string, unknown>;
+  for (const key of ['hardToUndo', 'assumptions', 'challengeThis'] as const) {
+    const value = record[key];
+    if (typeof value !== 'string' || value.trim().length === 0) {
+      return `prNotes.${key} must be a non-empty string`;
+    }
+    if (value.length > PR_NOTE_MAX_LENGTH) {
+      return `prNotes.${key} must be at most ${PR_NOTE_MAX_LENGTH} characters`;
+    }
+    if (isPlanSecretShaped(value)) {
+      return `prNotes.${key} contains a secret-shaped value and was refused`;
+    }
+  }
+  return null;
 }
 
 /** Fail-closed model-family comparison (owner rule 2026-10-16). */
@@ -250,6 +280,17 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       return { outcome: 'rejected', reason: seatPlanCheck.reason };
     }
 
+    // D7: PR notes are optional on a request (manual prepare works without
+    // them), but when present each section must be a non-empty string of at
+    // most 4000 characters with no secret shape. A conducted start refuses a
+    // brief without them; nothing here depends on presence.
+    if (request.prNotes !== undefined) {
+      const notesError = prNotesError(request.prNotes);
+      if (notesError !== null) {
+        return { outcome: 'rejected', reason: notesError };
+      }
+    }
+
     const decisions = request.contextDecisions ?? [];
     if (decisions.some((decision) => !isNonEmpty(decision.decisionBecause))) {
       return { outcome: 'rejected', reason: 'Every context decision must record decisionBecause' };
@@ -301,6 +342,15 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
         resourceBounds: request.resourceBounds,
         expectedArtifacts: request.expectedArtifacts,
         ownerDecisionReferences: request.ownerDecisionReferences,
+        ...(request.prNotes !== undefined
+          ? {
+              prNotes: {
+                hardToUndo: request.prNotes.hardToUndo,
+                assumptions: request.prNotes.assumptions,
+                challengeThis: request.prNotes.challengeThis,
+              },
+            }
+          : {}),
         selectedKnowledgeVersions,
       },
       null,

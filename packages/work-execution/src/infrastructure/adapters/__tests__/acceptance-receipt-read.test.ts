@@ -226,6 +226,7 @@ describe('AcceptanceReceiptReadAdapter', () => {
 
     const result = await adapter.readReceiptsForHead(EXAMPLE_ATTEMPT, EXAMPLE_HEAD);
 
+    expect(result.outcome).toBe('found');
     expect(JSON.stringify(result)).not.toContain('CANARY');
   });
 

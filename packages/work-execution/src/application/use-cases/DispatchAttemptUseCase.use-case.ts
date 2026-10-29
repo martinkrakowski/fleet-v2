@@ -1056,14 +1056,18 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         worktreePath: runningAttempt.worktreePath,
         runner: runnerValue,
       });
-      await terminateAttemptProcessTree(
-        deps.processTreeTermination,
-        deps.journal,
-        runningAttempt,
-        'dispatch',
-        10,
-        nowIso,
-      );
+      // The worktree's process tree is killed only when the winning record
+      // holds no other live session: a foreign session there is not ours.
+      if (winner === null || winner.sessionId === null) {
+        await terminateAttemptProcessTree(
+          deps.processTreeTermination,
+          deps.journal,
+          runningAttempt,
+          'dispatch',
+          10,
+          nowIso,
+        );
+      }
       const reason = `second revision conflict; started session ${sessionId} stopped (${stopResult.outcome})`;
       await appendJournalEntry(deps.journal, {
         attemptId: runningAttempt.id,
@@ -1146,14 +1150,18 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           worktreePath: runningAttempt.worktreePath,
           runner: runnerValue,
         });
-        await terminateAttemptProcessTree(
-          deps.processTreeTermination,
-          deps.journal,
-          runningAttempt,
-          'dispatch',
-          10,
-          nowIso,
-        );
+        // Same guard: with another session recorded on the fresh record, the
+        // worktree's processes belong to it and stay.
+        if (fresh.sessionId === null) {
+          await terminateAttemptProcessTree(
+            deps.processTreeTermination,
+            deps.journal,
+            runningAttempt,
+            'dispatch',
+            10,
+            nowIso,
+          );
+        }
         const reason =
           `Attempt ${runningAttempt.id} is in state ${fresh.state}` +
           (fresh.sessionId !== null ? ` with session ${fresh.sessionId}` : '') +

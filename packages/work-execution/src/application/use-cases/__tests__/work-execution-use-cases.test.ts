@@ -4984,6 +4984,42 @@ describe('attempt revision compare-and-swap retry', () => {
     expect(journal.entries.indexOf(termination!)).toBeLessThan(journal.entries.indexOf(ambiguous!));
   });
 
+  it('dispatch whose started session loses to a foreign LIVE session never kills that session\'s worktree tree (PK-1b Luna)', async () => {
+    const seed = storedAttempt({ state: 'running', sessionId: null, revision: 5 });
+    const attemptRepo = makeFailingSaveAttemptRepo({
+      seed,
+      conflictOnSave: 2,
+      freshAfterConflict: storedAttempt({ state: 'running', sessionId: 'ses_foreign_live', revision: 6 }),
+    });
+    const workOrderRepo = makeWorkOrderRepo();
+    workOrderRepo.orders.set('wo-1', storedWorkOrder({ id: 'wo-1', state: 'implementing' }));
+    const journal = makeJournal();
+    journal.reservations.set('res-1', storedReservation({ id: 'res-1', attemptId: 'attempt-1' }));
+    const receipt = completionReceipt({ stoppedByRequest: true });
+    const runner = makeRunner({ stopResult: { outcome: 'terminated', receipt } });
+    const tree = makeProcessTreePort({ outcome: 'terminated', killed: 5 });
+    const workspace = makeWorkspace();
+    const observation = makeObservation();
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo,
+      attemptRepo,
+      journal,
+      workspace: workspace.port,
+      runner: runner.port,
+      observation: observation.port,
+      processTreeTermination: tree.port,
+    });
+
+    const result = await useCase.dispatchAttempt(
+      validDispatchRequest() as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+
+    expect(result.outcome).toBe('unknown');
+    expect(runner.stopCalls).toHaveLength(1);
+    expect(tree.calls).toHaveLength(0);
+    expect(journal.entries.some((entry) => (entry.detail ?? '').startsWith('Process tree'))).toBe(false);
+  });
+
   it('dispatch whose started session loses to a foreign state terminates the process tree and journals the ambiguous outcome', async () => {
     const seed = storedAttempt({ state: 'ended', sessionId: null, revision: 5 });
     const attemptRepo = makeFailingSaveAttemptRepo({

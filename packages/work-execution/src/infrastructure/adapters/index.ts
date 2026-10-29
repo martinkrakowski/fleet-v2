@@ -38,6 +38,7 @@ export * from "./NoopChangeSignalAdapter.adapter.js";
 export * from "./NoopRunTelemetryAdapter.adapter.js";
 export * from "./NoopRunTelemetryMarkAdapter.adapter.js";
 export * from "./OpencodeDbUsageAdapter.adapter.js";
+export * from "./OtlpHttpRunTelemetryAdapter.adapter.js";
 export * from "./OtlpJsonEncoder.helper.js";
 export * from "./OwnerDecisionAdapter.adapter.js";
 export * from "./PolicyMergeGrantAdapter.adapter.js";

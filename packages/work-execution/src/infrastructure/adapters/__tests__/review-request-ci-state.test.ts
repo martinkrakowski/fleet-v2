@@ -773,6 +773,23 @@ describe('ReviewRequestAdapter.findLatestReceiptOfKind', () => {
     expect(result).toEqual({ outcome: 'unavailable', reason: 'not-configured' });
   });
 
+  it('is unavailable invalid-request for a bad head or an unknown kind, without calling the delegate', async () => {
+    const { calls, inspectAcceptanceEvidence } = makeInspectFake({
+      outcome: 'found',
+      assessment: makeAssessment(),
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const badHead = await adapter.findLatestReceiptOfKind(makeFindRequest({ candidateHeadSha: 'not-a-sha' }));
+    const badKind = await adapter.findLatestReceiptOfKind(
+      makeFindRequest({ kind: 'security-audit' as FindLatestReceiptOfKindRequest['kind'] }),
+    );
+
+    expect(badHead).toEqual({ outcome: 'unavailable', reason: 'invalid-request' });
+    expect(badKind).toEqual({ outcome: 'unavailable', reason: 'invalid-request' });
+    expect(calls).toHaveLength(0);
+  });
+
   it.each([
     ['a bad head', { candidateHeadSha: 'not-a-sha' }],
     ['an unknown kind', { kind: 'unknown-kind' }],

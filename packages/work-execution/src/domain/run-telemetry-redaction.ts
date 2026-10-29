@@ -163,6 +163,10 @@ const RESOURCE_SPANS_ITEM_FIELDS = ['resource', 'scopeSpans'] as const;
 const RESOURCE_FIELDS = ['attributes'] as const;
 const SCOPE_SPANS_ITEM_FIELDS = ['scope', 'spans'] as const;
 const SCOPE_FIELDS = ['name', 'version', 'attributes'] as const;
+/** The only instrumentation scope name the encoder emits (OT3a). */
+const TELEMETRY_SCOPE_NAME = 'fleet-v2';
+/** A plain semantic version, the only scope version shape the encoder emits (OT3a). */
+const TELEMETRY_SCOPE_VERSION_PATTERN = /^\d{1,6}\.\d{1,6}\.\d{1,6}$/;
 const SPAN_FIELDS = [
   'traceId', 'spanId', 'parentSpanId', 'name', 'kind', 'startTimeUnixNano', 'endTimeUnixNano',
   'attributes', 'events', 'status',
@@ -387,6 +391,14 @@ function readSpan(span: unknown, entries: DecodedEntry[]): boolean {
       }
       statusMessageOk = message === '' || LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(message);
     }
+    // OTLP status codes are the integers 0 (unset), 1 (ok) and 2 (error); an
+    // absent code is unset. Any other value fails `values` (CodeRabbit, #422).
+    if (hasOwnData(status, 'code')) {
+      const code = ownData(status, 'code');
+      if (!(code === 0 || code === 1 || code === 2)) {
+        statusMessageOk = false;
+      }
+    }
   }
   const otlpFields: Record<string, unknown> = {};
   for (const field of SPAN_FIELD_NAMES) {
@@ -422,6 +434,18 @@ function readScope(scope: unknown, entries: DecodedEntry[]): boolean {
     return false;
   }
   const name = ownData(scope, 'name');
+  // The instrumentation scope is fleet-v2's own: its name, when present, is
+  // exactly `fleet-v2` and its version a plain x.y.z, so no free text rides in
+  // scope metadata (CodeRabbit, #422). Anything else fails the shape.
+  if (hasOwnData(scope, 'name') && name !== TELEMETRY_SCOPE_NAME) {
+    return false;
+  }
+  if (hasOwnData(scope, 'version')) {
+    const version = ownData(scope, 'version');
+    if (typeof version !== 'string' || !TELEMETRY_SCOPE_VERSION_PATTERN.test(version)) {
+      return false;
+    }
+  }
   let attributes: ReadonlyMap<string, DecodedAttributeValue> = new Map();
   let decoded = true;
   if (hasOwnData(scope, 'attributes')) {

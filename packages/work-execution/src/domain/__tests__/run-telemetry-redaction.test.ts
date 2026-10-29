@@ -870,6 +870,41 @@ describe('redactionChecks (OT1r)', () => {
     expect(check(report, 'key-allow-list').pass).toBe(false);
   });
 
+  /** The stub payload with one span status or scope field replaced, re-serialised canonically. */
+  function withSpanStatus(status: unknown): Uint8Array {
+    const parsed = JSON.parse(new TextDecoder().decode(stubPayload())) as {
+      resourceSpans: { scopeSpans: { spans: { status?: unknown }[] }[] }[];
+    };
+    parsed.resourceSpans[0].scopeSpans[0].spans[0].status = status;
+    return new TextEncoder().encode(JSON.stringify(parsed));
+  }
+
+  function withScope(scope: unknown): Uint8Array {
+    const parsed = JSON.parse(new TextDecoder().decode(stubPayload())) as {
+      resourceSpans: { scopeSpans: { scope?: unknown }[] }[];
+    };
+    parsed.resourceSpans[0].scopeSpans[0].scope = scope;
+    return new TextEncoder().encode(JSON.stringify(parsed));
+  }
+
+  it('a status code outside 0, 1 and 2 fails values; each OTLP code passes (CodeRabbit #422)', () => {
+    for (const code of [0, 1, 2]) {
+      expect(check(redactionChecks(withSpanStatus({ code }), []), 'values').pass).toBe(true);
+    }
+    for (const code of [3, -1, 1.5, 'free text from a prompt', { nested: 'x' }, [1], null]) {
+      const report = redactionChecks(withSpanStatus({ code }), []);
+      expect(check(report, 'values').pass).toBe(false);
+    }
+  });
+
+  it('scope metadata is fleet-v2 with an x.y.z version or absent; free text fails (CodeRabbit #422)', () => {
+    expect(check(redactionChecks(withScope({ name: 'fleet-v2', version: '1.2.3' }), []), 'payload-parses').pass).toBe(true);
+    expect(check(redactionChecks(withScope({}), []), 'payload-parses').pass).toBe(true);
+    for (const scope of [{ name: 'free text from a prompt' }, { name: 'fleet-v2', version: 'free text' }, { name: 'fleet-v2', version: 3 }]) {
+      expect(check(redactionChecks(withScope(scope), []), 'payload-parses').pass).toBe(false);
+    }
+  });
+
   it('a non-hex traceId fails values (OT1r-3)', () => {
     const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([]), 'AGENT', { extra: { traceId: 'not-hex-trace-id' } });
     const report = redactionChecks(bytes, []);

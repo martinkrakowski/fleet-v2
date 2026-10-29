@@ -196,11 +196,18 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
         );
         return { outcome: 'refused', reason: 'reservation-incomplete' };
       }
+      const sshAlias = reservation.sshAlias?.trim() || null;
       return {
         outcome: 'reserved',
         hostName: reservation.hostName,
         hostKind: reservation.hostKind,
         worktreePath: reservation.worktreePath,
+        // Records persisted before these fields existed read with `null`; a
+        // legacy record derives its transport from the trimmed alias it
+        // carries (a blank alias is no alias).
+        transport: reservation.transport ?? (sshAlias ? 'ssh' : 'local'),
+        sshAlias,
+        port: reservation.port ?? null,
       };
     }
     if (

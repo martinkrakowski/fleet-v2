@@ -251,6 +251,9 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
       hostName: HOST_NAME,
       hostKind: 'opencode',
       worktreePath: WORKTREE_PATH,
+      transport: 'local',
+      sshAlias: null,
+      port: null,
     });
     expect(harness.reserveCalls).toHaveLength(1);
     const request = harness.reserveCalls[0];
@@ -258,6 +261,46 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     expect(request.candidateHosts).toEqual(CANDIDATE_HOSTS);
     expect(request.worktreePath).toBeUndefined();
     expect(request.hostId).toBeUndefined();
+  });
+
+  it('test 8c (KF-8): the reserved result carries the record\'s transport, sshAlias and port', async () => {
+    const harness = makeHarness();
+    harness.setReserveAnswer(async (request) => {
+      const reservation = reservationFixture(request.attemptId, {
+        transport: 'ssh',
+        sshAlias: 'lane-ssh-example',
+        port: 41002,
+      });
+      await harness.executionJournal.saveCapacityReservation(reservation);
+      return { outcome: 'reserved', reservation };
+    });
+    expect(await harness.adapter.reserveFirst(firstReservationRequest())).toEqual({
+      outcome: 'reserved',
+      hostName: HOST_NAME,
+      hostKind: 'opencode',
+      worktreePath: WORKTREE_PATH,
+      transport: 'ssh',
+      sshAlias: 'lane-ssh-example',
+      port: 41002,
+    });
+
+    // A legacy record persisted before `transport` existed derives its
+    // transport from the alias it carries.
+    const legacy = makeHarness();
+    legacy.setReserveAnswer(async (request) => {
+      const reservation = reservationFixture(request.attemptId, {
+        transport: undefined,
+        sshAlias: 'legacy-alias',
+        port: null,
+      });
+      await legacy.executionJournal.saveCapacityReservation(reservation);
+      return { outcome: 'reserved', reservation };
+    });
+    expect(await legacy.adapter.reserveFirst(firstReservationRequest())).toMatchObject({
+      transport: 'ssh',
+      sshAlias: 'legacy-alias',
+      port: null,
+    });
   });
 
   it('test 9: the cap blocks while another active run holds a reservation, and clears once it is stopped', async () => {
@@ -277,6 +320,9 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
       hostName: HOST_NAME,
       hostKind: 'opencode',
       worktreePath: WORKTREE_PATH,
+      transport: 'local',
+      sshAlias: null,
+      port: null,
     });
     expect(harness.reserveCalls).toHaveLength(1);
   });
@@ -319,6 +365,9 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
       hostName: HOST_NAME,
       hostKind: 'opencode',
       worktreePath: WORKTREE_PATH,
+      transport: 'local',
+      sshAlias: null,
+      port: null,
     });
     expect(harness.reserveCalls).toHaveLength(1);
   });
@@ -355,6 +404,9 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
       hostName: HOST_NAME,
       hostKind: 'opencode',
       worktreePath: WORKTREE_PATH,
+      transport: 'local',
+      sshAlias: null,
+      port: null,
     });
     expect(harness.reserveCalls).toHaveLength(1);
   });

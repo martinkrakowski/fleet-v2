@@ -251,6 +251,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         model: request.brief.modelAssignment.model,
         tool: request.brief.modelAssignment.seatTool,
         variant: request.brief.modelAssignment.variant,
+        agent: request.brief.modelAssignment.agent,
       })
     ) {
       return { outcome: 'refused', reason: 'invalid-request' };

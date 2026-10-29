@@ -355,3 +355,51 @@ describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
     expect(authorBrief).not.toHaveBeenCalled();
   });
 });
+
+describe('PrepareBriefPackageUseCase runner agent (KF-7)', () => {
+  const agentSeatPlan = {
+    version: 1 as const,
+    'first-pass': [{ id: 'fp-1', model: 'implementer-model', tool: 'opencode', agent: 'lane' }],
+    fix: [{ id: 'fx-1', model: 'implementer-model', tool: 'opencode' }],
+    review: [],
+  };
+
+  it('accepts and freezes an assignment whose agent matches its first-pass seat', async () => {
+    const captured = makeCapturingArtifactPort();
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring(),
+      artifactPort: captured.port,
+    });
+
+    const result = await useCase.prepareBriefPackage(
+      validRequest({
+        seatPlan: agentSeatPlan,
+        modelAssignment: {
+          ...validRequest().modelAssignment,
+          agent: 'lane',
+        },
+      }),
+    );
+    expect(result.outcome).toBe('prepared');
+    expect(captured.placedManifestJsons).toHaveLength(1);
+    const manifest = JSON.parse(captured.placedManifestJsons[0]) as { modelAssignment?: unknown };
+    expect(manifest.modelAssignment).toMatchObject({ agent: 'lane' });
+  });
+
+  it('rejects an invalid model assignment agent', async () => {
+    const useCase = makeUseCase();
+
+    for (const agent of ['', '   ', 'a'.repeat(65), 'lane-glm!', '-lane', 5]) {
+      const result = await useCase.prepareBriefPackage(
+        validRequest({
+          modelAssignment: { ...validRequest().modelAssignment, agent: agent as unknown as string },
+        }),
+      );
+      expect(result).toEqual({
+        outcome: 'rejected',
+        reason:
+          'Model assignment agent must be a non-empty string of at most 64 characters matching [A-Za-z0-9][A-Za-z0-9._-]*',
+      });
+    }
+  });
+});

@@ -93,16 +93,16 @@ const GATE_RESULTS_MISMATCH_REASON =
 /** The gate's typed outcome, shared by acceptance and the standalone gate port. */
 type GateVerdict = EvaluateAttemptGateResult;
 
-function gatePassed(): GateVerdict {
-  return { verdict: 'passed' };
+function gatePassed(results: readonly GatePredicateResult[]): GateVerdict {
+  return { verdict: 'passed', results };
 }
 
 function gateUnknown(reason: string): GateVerdict {
   return { verdict: 'unknown', reason };
 }
 
-function gateFailed(reason: string): GateVerdict {
-  return { verdict: 'failed', reason };
+function gateFailed(reason: string, results: readonly GatePredicateResult[]): GateVerdict {
+  return { verdict: 'failed', reason, results };
 }
 
 interface ExpectedGatePredicate {
@@ -152,10 +152,10 @@ function gateVerdictForResults(
       const exitText = result.exitCode === null ? '' : ' with exit code ' + String(result.exitCode);
       const reason =
         'Gate predicate ' + result.name + ' ' + result.verdict + exitText + ': ' + result.detail;
-      return result.verdict === 'fail' ? gateFailed(reason) : gateUnknown(reason);
+      return result.verdict === 'fail' ? gateFailed(reason, results) : gateUnknown(reason);
     }
   }
-  return gatePassed();
+  return gatePassed(results);
 }
 
 function isGatePredicateKind(value: unknown): value is GatePredicateKind {

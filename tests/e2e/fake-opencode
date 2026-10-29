@@ -1,0 +1,35 @@
+#!/bin/sh
+# Lane Q1a: the fake `opencode` client from the ocm-run integration suite
+# (`execution-runner-ocm-run.integration.test.ts`), reading its pids file and
+# flip flag from the environment instead of being generated:
+#
+#   FAKE_OPENCODE_PIDS_FILE — a file each running fake appends its pid to.
+#   FAKE_OPENCODE_FLIP=1    — flip the created session to busy via /__start.
+#
+# It parses `run --server <url> -s <id>`, stays alive until TERM, and exits 9
+# for any other invocation. Plain and dependency-free (the flip uses Node's
+# built-in fetch).
+[ "$1" = run ] || exit 9
+[ -n "${FAKE_OPENCODE_PIDS_FILE:-}" ] || exit 9
+echo "$$" >> "$FAKE_OPENCODE_PIDS_FILE"
+prev=''
+url=''
+sid=''
+for a in "$@"; do
+  case "$prev" in
+    --server) url=$a ;;
+    -s) sid=$a ;;
+  esac
+  prev=$a
+done
+[ -n "$url" ] && [ -n "$sid" ] || exit 9
+sleep 0.5
+if [ "${FAKE_OPENCODE_FLIP:-0}" = 1 ]; then
+  node -e 'fetch(process.argv[1] + "/__start/" + process.argv[2], { method: "POST" }).catch(() => {})' "$url" "$sid" >/dev/null 2>&1
+fi
+trap 'exit 143' TERM
+i=0
+while [ "$i" -lt 200 ]; do
+  sleep 0.1
+  i=$((i + 1))
+done

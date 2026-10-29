@@ -176,6 +176,7 @@ export function buildLiveConductorDriver(
     runnerForAttempt: execution.runnerForAttempt,
     reviewRequest: conductor.reviewRequest,
     reviewAssessment: conductor.reviewAssessment,
+    gateReceipts: conductor.gateReceipts,
     sameModelFamily: (left, right) =>
       isSameModelFamily(underlyingModelFamily(left), underlyingModelFamily(right)),
     workOrderRepo: execution.workOrderRepository,

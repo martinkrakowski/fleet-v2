@@ -33,8 +33,9 @@ import { WorkOrder } from '../../domain/entities/WorkOrder.js';
 import { AUTHORIZED_BY_PATTERN } from '../../domain/auto-merge.js';
 
 /** A safe branch name, the forge read's rule (KF-5b): one safe git ref, never all digits. */
-function isSafeBranchName(value: string): boolean {
+function isSafeBranchName(value: unknown): value is string {
   return (
+    typeof value === 'string' &&
     value.length > 0 &&
     !value.includes('..') &&
     !value.endsWith('/') &&

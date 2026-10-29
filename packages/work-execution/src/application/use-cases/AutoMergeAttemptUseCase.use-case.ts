@@ -131,8 +131,15 @@ export class AutoMergeAttemptUseCase implements AutoMergeAttemptPort {
     if (attemptId === null || attemptId.length === 0 || attemptId.length > MAX_ATTEMPT_ID) {
       return this.notMerged(emptyContext(deps), 'invalid-request', 'the request names no attempt');
     }
+    // A present `branchName` must be a non-empty string: a null, number or
+    // blank value is refused here, never silently replaced by the default
+    // branch after a grant was issued (KF-5b review).
+    const hasBranchName = parsed !== null && Object.hasOwn(parsed, 'branchName');
     const branchName =
-      parsed !== null && typeof parsed.branchName === 'string' ? parsed.branchName.trim() : undefined;
+      hasBranchName && typeof parsed.branchName === 'string' ? parsed.branchName.trim() : undefined;
+    if (hasBranchName && (branchName === undefined || branchName.length === 0)) {
+      return this.notMerged(emptyContext(deps), 'invalid-request', 'the request names no branch');
+    }
 
     // 2. The setting is read first. `off` is today's behaviour: no other port
     // is called and nothing is written. Unreadable is deferred until the work

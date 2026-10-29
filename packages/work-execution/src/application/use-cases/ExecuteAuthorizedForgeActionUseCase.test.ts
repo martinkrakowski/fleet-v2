@@ -1085,7 +1085,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
     });
 
     it('refuses an unsafe branch name before any grant is consumed or forge call runs', async () => {
-      for (const branchName of ['bad branch', '12345', 'a..b']) {
+      for (const branchName of ['bad branch', '12345', 'a..b', null, ['fleet/x'], 42] as unknown as string[]) {
         const journal = new InMemoryJournal();
         const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
         const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());

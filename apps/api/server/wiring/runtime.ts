@@ -60,6 +60,7 @@ import {
   type WorkCrossContextDelegates,
 } from "./work/composition";
 import { readOwnerDecisionReferencesFromAttempt } from "@fleet/work-execution";
+import { readAcceptanceForAttempt } from "@fleet/work-execution";
 
 export interface FleetApiRuntimeOptions {
   /** Shared persistence directory for every context's file-backed adapters. */
@@ -636,44 +637,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
       },
     },
     acceptanceEvidence: {
-      readAcceptance: async (request) => {
-        let inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
-          assessmentId: assessmentIdForAttempt(request.attemptId),
-          candidateHeadSha: request.candidateHeadSha,
-        });
-        if (inspected.outcome === "not-found") {
-          inspected = await evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence({
-            assessmentId: request.attemptId,
-            candidateHeadSha: request.candidateHeadSha,
-          });
-        }
-        // No head-only fallback: an assessment that is not bound to this
-        // attempt is another attempt's evidence, and this attempt has none.
-        if (
-          inspected.outcome === "found" &&
-          inspected.assessment.attemptId !== request.attemptId
-        ) {
-          return {
-            outcome: "not-found",
-            reason: `No acceptance assessment found for head ${request.candidateHeadSha}`,
-          };
-        }
-        if (inspected.outcome === "found") {
-          return {
-            outcome: "found",
-            assessment: {
-              candidateHeadSha: inspected.assessment.candidateHeadSha,
-              policyRevision: inspected.assessment.policyRevision,
-              state: inspected.assessment.state,
-              acceptanceReceiptId: inspected.assessment.acceptanceReceiptId,
-            },
-          };
-        }
-        return {
-          outcome: "not-found",
-          reason: `No acceptance assessment found for head ${request.candidateHeadSha}`,
-        };
-      },
+      readAcceptance: (request) => readAcceptanceForAttempt(evidence.inspectAcceptanceEvidence, request),
     },
     observation: {
       publish: async (request) => {

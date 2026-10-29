@@ -29,6 +29,7 @@ import { SeatPlan } from '../../domain/value-objects/SeatPlan.vo.js';
 import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
 import { checkFixPriorSettled } from './PrepareFixAttemptUseCase.use-case.js';
+import { terminateAttemptProcessTree } from './StopAttemptUseCase.use-case.js';
 import type { DispatchAttemptPort, DispatchAttemptRequest, DispatchAttemptResult } from '../ports/in/DispatchAttemptPort.in-port.js';
 import type { RunnerIsolationCapabilities } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
@@ -41,6 +42,7 @@ import {
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { ExecutionObservationPort } from '../ports/out/ExecutionObservationPort.out-port.js';
 import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
+import type { ProcessTreeTerminationPort } from '../ports/out/ProcessTreeTerminationPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
 import type { RunnerSelectorPort } from '../ports/out/RunnerSelectorPort.out-port.js';
@@ -72,6 +74,13 @@ export interface DispatchAttemptDependencies {
   readonly runnerSelector?: RunnerSelectorPort;
   /** Free-seat check (plan F3): refuses a free or unknown seat when wired. */
   readonly allowedSeats?: AllowedSeatPort;
+  /**
+   * Optional (PK-1b). When wired, a started session that must be stopped
+   * after a second save conflict also terminates the worktree process tree
+   * before the ambiguous entry is journalled. Without it the behaviour is
+   * unchanged.
+   */
+  readonly processTreeTermination?: ProcessTreeTerminationPort;
 }
 
 /** Boolean capabilities a dispatch may require the runner to enforce. */
@@ -1047,6 +1056,18 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         worktreePath: runningAttempt.worktreePath,
         runner: runnerValue,
       });
+      // The worktree's process tree is killed only when the winning record
+      // holds no other live session: a foreign session there is not ours.
+      if (winner === null || winner.sessionId === null) {
+        await terminateAttemptProcessTree(
+          deps.processTreeTermination,
+          deps.journal,
+          runningAttempt,
+          'dispatch',
+          10,
+          nowIso,
+        );
+      }
       const reason = `second revision conflict; started session ${sessionId} stopped (${stopResult.outcome})`;
       await appendJournalEntry(deps.journal, {
         attemptId: runningAttempt.id,
@@ -1129,6 +1150,18 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           worktreePath: runningAttempt.worktreePath,
           runner: runnerValue,
         });
+        // Same guard: with another session recorded on the fresh record, the
+        // worktree's processes belong to it and stay.
+        if (fresh.sessionId === null) {
+          await terminateAttemptProcessTree(
+            deps.processTreeTermination,
+            deps.journal,
+            runningAttempt,
+            'dispatch',
+            10,
+            nowIso,
+          );
+        }
         const reason =
           `Attempt ${runningAttempt.id} is in state ${fresh.state}` +
           (fresh.sessionId !== null ? ` with session ${fresh.sessionId}` : '') +

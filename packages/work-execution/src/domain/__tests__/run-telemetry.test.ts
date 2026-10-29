@@ -126,6 +126,46 @@ describe('TelemetrySpan.build', () => {
     expect(Object.isFrozen(span.events)).toBe(true);
     expect(Object.isFrozen(span.events[0])).toBe(true);
   });
+
+  it('stores the first-read status snapshot and never re-reads the status', () => {
+    const reads: Record<string, number> = { code: 0, reasonCode: 0 };
+    const target = { code: 'ok', reasonCode: null };
+    const status = new Proxy(target, {
+      getOwnPropertyDescriptor(t, key) {
+        const name = String(key);
+        reads[name] = (reads[name] ?? 0) + 1;
+        // 'code' is valid on the first read and invalid on any later one.
+        const value = name === 'code' && reads.code > 1 ? 'warn' : Reflect.get(t, key);
+        return { configurable: true, enumerable: true, writable: true, value };
+      },
+    });
+    const span = mustBuild({ ...base, status });
+    expect(span.status.code).toBe('ok');
+    expect(span.status.reasonCode).toBeNull();
+    expect(reads.code).toBe(1);
+    expect(reads.reasonCode).toBe(1);
+  });
+
+  it('refuses an events array whose iterator yields a valid event while the index holds an invalid one', () => {
+    const events = [
+      { name: 'log', timeIso: '2026-10-27T10:00:00Z', state: 'running' },
+    ] as unknown as TelemetrySpanInput['events'];
+    Object.defineProperty(events, Symbol.iterator, {
+      value: function* () {
+        yield { name: 'state.entered', timeIso: '2026-10-27T10:00:00Z', state: 'running' };
+      },
+    });
+    expect(TelemetrySpan.build({ ...base, events })).toBeNull();
+  });
+
+  it('refuses an events array with an accessor at an index', () => {
+    const events: unknown[] = [];
+    Object.defineProperty(events, 0, {
+      enumerable: true,
+      get: () => ({ name: 'state.entered', timeIso: '2026-10-27T10:00:00Z', state: 'running' }),
+    });
+    expect(TelemetrySpan.build({ ...base, events })).toBeNull();
+  });
 });
 
 describe('TelemetrySpan.isTelemetrySpan', () => {

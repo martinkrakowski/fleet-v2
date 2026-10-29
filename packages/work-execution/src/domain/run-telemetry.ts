@@ -89,19 +89,26 @@ function isZonedTime(value: unknown): boolean {
   return isCalendarDateTime(value) && Number.isFinite(Date.parse(value));
 }
 
-/** A status record with a known code and a reason code or nothing. */
-function isStatus(value: unknown): boolean {
+/**
+ * A status record with a known code and a reason code or nothing: the
+ * validated snapshot itself, read exactly once, so what was checked is what
+ * gets stored. Null on any invalid value.
+ */
+function readStatus(value: unknown): Record<string, unknown> | null {
   const record = readExactPlainRecord(value, STATUS_KEYS);
   if (record === null) {
-    return false;
+    return null;
   }
   if (typeof record.code !== 'string' || !(TELEMETRY_STATUS_CODES as readonly string[]).includes(record.code)) {
-    return false;
+    return null;
   }
   if (record.reasonCode === null) {
-    return true;
+    return record;
   }
-  return typeof record.reasonCode === 'string' && LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(record.reasonCode);
+  if (typeof record.reasonCode === 'string' && LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(record.reasonCode)) {
+    return record;
+  }
+  return null;
 }
 
 /** Frozen normalised copies of at most 64 state-entry events, or null. */
@@ -110,8 +117,14 @@ function readEvents(value: unknown): readonly TelemetrySpanEvent[] | null {
     return null;
   }
   const events: TelemetrySpanEvent[] = [];
-  for (const entry of value) {
-    const record = readExactPlainRecord(entry, EVENT_KEYS);
+  // Own indexed reads only: the iterator is overridable, so it is never used.
+  const length = value.length;
+  for (let i = 0; i < length; i += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, i);
+    if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) {
+      return null;
+    }
+    const record = readExactPlainRecord(descriptor.value, EVENT_KEYS);
     if (record === null || record.name !== 'state.entered') {
       return null;
     }
@@ -189,14 +202,14 @@ export class TelemetrySpan {
       if (Date.parse(record.endIso as string) < Date.parse(record.startIso as string)) {
         return null;
       }
-      if (!isStatus(record.status)) {
+      const statusSnapshot = readStatus(record.status);
+      if (statusSnapshot === null) {
         return null;
       }
       const events = readEvents(record.events);
       if (events === null) {
         return null;
       }
-      const statusSnapshot = readExactPlainRecord(record.status, STATUS_KEYS) as Record<string, unknown>;
       return new TelemetrySpan({
         traceId: record.traceId as string,
         spanId: record.spanId as string,

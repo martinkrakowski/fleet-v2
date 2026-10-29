@@ -512,6 +512,16 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(pivot?.seatSelection?.seatIndex).toBe(1);
     expect(pivot?.briefDigest).toBe(SHA);
     expect(pivot?.worktreePath).toBe(WORKTREE);
+    // The pivot keeps the run's host identity, so the Q2a-2 act guard lets it dispatch.
+    expect(pivot?.runner).toEqual({
+      kind: CONDUCTED_RUNNER.kind,
+      remotePort: CONDUCTED_RUNNER.remotePort,
+      host: CONDUCTED_RUNNER.host,
+      hostName: CONDUCTED_RUNNER.hostName,
+      agent: null,
+      model: null,
+      variant: null,
+    });
     const entries = await harness.runJournal.listForRun(RUN_ID);
     const prepareIntent = entries.find(
       (entry) => entry.kind === 'intent' && entry.key === prepareKey(0, 1, 2),

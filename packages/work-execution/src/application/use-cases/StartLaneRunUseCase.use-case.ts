@@ -392,6 +392,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         lease: null,
         revision: 1,
         runPolicyRevision: request.runPolicyRevision,
+        branchName: branchForRun(request.runId),
       });
     } catch {
       created = { outcome: 'refused', reason: 'run-exists' };

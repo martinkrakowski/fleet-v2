@@ -44,6 +44,10 @@ yarn-error.log*
 !.env.*.example
 *.pem
 
+# MCP client configuration is per machine (it names a token file); only the example is tracked
+.mcp.json
+!.mcp.json.example
+
 # Fleet installation and disposable lane runtime
 /.fleet/
 /.lane/

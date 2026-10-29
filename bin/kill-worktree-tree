@@ -6,11 +6,13 @@
 #
 # The worktree path is only ever "$1" or a variable inside a quoted expansion:
 # it is never interpolated into a command string, and no pid outside the
-# selected set is ever signalled. No pkill, no killall.
+# selected set is ever signalled. No pkill, no killall. A pid is tested
+# against the worktree right before EVERY signal (TERM, the poll and KILL), so
+# a pid recycled by an unrelated process during the grace period is left alone.
 #
 # Output: the last stdout line is `killed=<count of pids that received TERM>`
-# with exit 0; a host without a readable /proc prints `unavailable=no-proc`
-# and exits 3; a usage error exits 2.
+# with exit 0; a host without /proc or readlink prints `unavailable=<word>` and
+# exits 3 before any selection; a usage error exits 2.
 set -u
 
 usage() {
@@ -23,26 +25,44 @@ grace=${2:-5}
 case $grace in
   ''|*[!0-9]*) usage ;;
 esac
-
 wt=$1
+
+# Fail closed first: without a per-process cwd no selection is possible.
+if [ ! -L /proc/self/cwd ]; then
+  echo 'unavailable=no-proc'
+  exit 3
+fi
+if ! command -v readlink >/dev/null 2>&1; then
+  echo 'unavailable=no-readlink'
+  exit 3
+fi
+
 if [ ! -d "$wt" ]; then
   echo 'killed=0'
   exit 0
 fi
 wt=$(cd "$wt" && pwd -P) || { echo 'killed=0'; exit 0; }
 
-# Non-Linux host: no per-process working directory to inspect.
-if [ ! -r /proc/self/cwd ]; then
-  echo 'unavailable=no-proc'
-  exit 3
-fi
-
 self=$$
 parent=${PPID:-0}
+nl='
+'
 
-# Walk /proc, read each candidate's cwd, and select only the pids whose cwd
-# equals the worktree or lives inside it. A sibling name that merely extends
-# the path (`<worktree>x`) never matches the `"$wt"/*` pattern.
+# Whether pid $1 currently has its physical cwd at or below the worktree. The
+# sentinel keeps the cwd's own trailing newlines (command substitution would
+# strip them), so a sibling named `<worktree>` plus a newline never matches.
+# A sibling name that merely extends the path (`<worktree>x`) never matches
+# the `"$wt"/*` pattern either. Fails when the pid is gone or unreadable.
+in_worktree() {
+  cwd=$(readlink "/proc/$1/cwd" 2>/dev/null && printf x) || return 1
+  cwd=${cwd%x}
+  cwd=${cwd%"$nl"}
+  case $cwd in
+    "$wt"|"$wt"/*) return 0 ;;
+  esac
+  return 1
+}
+
 selected=''
 count=0
 for entry in /proc/[0-9]*; do
@@ -50,30 +70,26 @@ for entry in /proc/[0-9]*; do
   pid=${entry#/proc/}
   [ "$pid" = "$self" ] && continue
   [ "$pid" = "$parent" ] && continue
-  cwd=$(readlink "$entry/cwd" 2>/dev/null) || continue
-  [ -n "$cwd" ] || continue
-  case $cwd in
-    "$wt"|"$wt"/*) ;;
-    *) continue ;;
-  esac
+  in_worktree "$pid" || continue
   kill -TERM "$pid" 2>/dev/null || continue
   selected="$selected $pid"
   count=$((count + 1))
 done
 
-# Poll until none of the selected pids answers, then KILL the survivors.
+# Poll until none of the selected pids still sits in the worktree (gone, or
+# recycled by something else), then KILL the survivors that still do.
 deadline=$(( $(date +%s) + grace ))
 while :; do
   alive=0
   for pid in $selected; do
-    kill -0 "$pid" 2>/dev/null && alive=1
+    in_worktree "$pid" && alive=1
   done
   [ "$alive" -eq 0 ] && break
   [ "$(date +%s)" -ge "$deadline" ] && break
   sleep 0.2 2>/dev/null || sleep 1
 done
 for pid in $selected; do
-  kill -KILL "$pid" 2>/dev/null
+  in_worktree "$pid" && kill -KILL "$pid" 2>/dev/null
 done
 
 echo "killed=$count"

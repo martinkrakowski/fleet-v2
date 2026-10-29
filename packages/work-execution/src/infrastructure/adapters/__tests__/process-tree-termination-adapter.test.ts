@@ -193,6 +193,21 @@ describe('ProcessTreeTerminationAdapter', () => {
     },
   );
 
+  it('refuses a shallow worktree path (fewer than three segments) without a run (PK-1a Fable)', async () => {
+    for (const shallow of ['/', '/home', '/home/user', '//']) {
+      const { adapter, calls } = adapterWith();
+      const result = await adapter.terminateWorktreeProcesses(request({ worktreePath: shallow }));
+      expect(result).toEqual({ outcome: 'refused', reason: 'worktree path is too shallow' });
+      expect(calls).toHaveLength(0);
+    }
+  });
+
+  it('ignores an unavailable= line that is not one word (PK-1a Fable)', async () => {
+    const { adapter } = adapterWith({ exitCode: 3, stdout: 'unavailable=no-proc extra words\n', stderr: '' });
+    const result = await adapter.terminateWorktreeProcesses(request());
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'kill-worktree-tree failed (exit 3)' });
+  });
+
   it('parses the killed count from the last non-blank stdout line', async () => {
     const { adapter } = adapterWith({ stdout: 'warning noise\nkilled=3\n' });
     const result = await adapter.terminateWorktreeProcesses(request());

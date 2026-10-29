@@ -273,3 +273,43 @@ describe('encodeOtlpTraces (OT3a)', () => {
     expect(result.refused).toEqual([]);
   });
 });
+
+describe('encodeOtlpTraces never throws (Luna, OT3a)', () => {
+  it('refuses every input of a proxy array whose element reads throw, without throwing', () => {
+    const throwing = new Proxy([1, 2, 3], {
+      get(target, key, receiver) {
+        if (key === 'length') {
+          return 3;
+        }
+        if (typeof key === 'string' && /^[0-9]+$/.test(key)) {
+          throw new Error('hostile element read');
+        }
+        if (key === 'map') {
+          throw new Error('hostile map read');
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    }) as unknown as readonly unknown[];
+    const result = encodeOtlpTraces(throwing, { serviceVersion: '0.0.0' } as never);
+    expect(result.payload).toBeNull();
+    expect(result.refused).toEqual([
+      { index: 0, reason: 'invalid' },
+      { index: 1, reason: 'invalid' },
+      { index: 2, reason: 'invalid' },
+    ]);
+  });
+
+  it('a proxy whose length read throws yields an empty refusal, without throwing', () => {
+    const throwing = new Proxy([], {
+      get(target, key, receiver) {
+        if (key === 'length') {
+          throw new Error('hostile length read');
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    }) as unknown as readonly unknown[];
+    const result = encodeOtlpTraces(throwing, { serviceVersion: '0.0.0' } as never);
+    expect(result.payload).toBeNull();
+    expect(result.refused).toEqual([]);
+  });
+});

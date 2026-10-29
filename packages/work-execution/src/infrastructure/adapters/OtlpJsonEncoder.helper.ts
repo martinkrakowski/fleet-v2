@@ -169,7 +169,12 @@ function encodeSpan(span: TelemetrySpan, snapshot: Record<string, TelemetryAttri
  * every input refused and `payload: null`.
  */
 export function encodeOtlpTraces(spans: readonly unknown[], resource: TelemetryResourceInput): OtlpEncodeResult {
+  // The input is never read again after a failure: the fallback refuses by the
+  // count read once here, so a throwing proxy cannot make the fallback throw.
+  let count = 0;
   try {
+    const length: unknown = spans.length;
+    count = typeof length === 'number' && Number.isSafeInteger(length) && length > 0 ? length : 0;
     const resourceAttributes = telemetryResourceAttributes(resource);
     const resourceEntries: unknown[] = [];
     for (const key of RUN_TELEMETRY_RESOURCE_KEYS) {
@@ -183,7 +188,7 @@ export function encodeOtlpTraces(spans: readonly unknown[], resource: TelemetryR
     const encodedSpanIds: string[] = [];
     const refused: { index: number; reason: 'invalid' }[] = [];
 
-    for (let index = 0; index < spans.length; index += 1) {
+    for (let index = 0; index < count; index += 1) {
       const input = spans[index];
       if (!TelemetrySpan.isTelemetrySpan(input)) {
         refused.push({ index, reason: 'invalid' });
@@ -225,7 +230,7 @@ export function encodeOtlpTraces(spans: readonly unknown[], resource: TelemetryR
 
     return { payload, encodedSpanIds: Object.freeze(encodedSpanIds), refused: Object.freeze(refused) };
   } catch {
-    const refused = spans.map((_span, index) => ({ index, reason: 'invalid' as const }));
-    return { payload: null, encodedSpanIds: [], refused };
+    const refused = Array.from({ length: count }, (_unused, index) => ({ index, reason: 'invalid' as const }));
+    return { payload: null, encodedSpanIds: Object.freeze([]), refused: Object.freeze(refused) };
   }
 }

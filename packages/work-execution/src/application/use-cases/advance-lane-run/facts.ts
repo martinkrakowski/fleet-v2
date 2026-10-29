@@ -40,12 +40,12 @@ export async function manifestVerdictOf(
   latest: AttemptRecord,
   artifactPort: AdvanceLaneRunDependencies['artifactPort'],
 ): Promise<Extract<ArtifactManifestVerdict, { readonly outcome: 'sealed' | 'missing' | 'mismatch' }>['outcome']> {
-  const verify = artifactPort.verifyArtifactManifest;
-  if (verify === undefined) {
+  // Called on the port, never copied off it: an adapter method reads `this` (KF-11).
+  if (artifactPort.verifyArtifactManifest === undefined) {
     return 'missing';
   }
   try {
-    const verdict = await verify({
+    const verdict = await artifactPort.verifyArtifactManifest({
       attemptId: latest.id,
       worktreePath: latest.worktreePath,
       recordedHost: latest.runner ?? null,

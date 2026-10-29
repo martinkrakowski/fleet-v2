@@ -4985,7 +4985,7 @@ describe('attempt revision compare-and-swap retry', () => {
   });
 
   it('dispatch whose started session loses to a foreign LIVE session never kills that session\'s worktree tree (PK-1b Luna)', async () => {
-    const seed = storedAttempt({ state: 'running', sessionId: null, revision: 5 });
+    const seed = storedAttempt({ state: 'ended', sessionId: null, revision: 5 });
     const attemptRepo = makeFailingSaveAttemptRepo({
       seed,
       conflictOnSave: 2,

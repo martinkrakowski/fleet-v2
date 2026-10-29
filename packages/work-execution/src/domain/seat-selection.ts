@@ -417,7 +417,8 @@ export function coolingSeatIds(input: {
     if (updatedAt === null) {
       continue;
     }
-    const untilMs = updatedAt.getTime() + attemptsMs;
+    // A refusal stamped in the future (another host's skewed clock) cools from now, never from that future instant.
+    const untilMs = Math.min(updatedAt.getTime(), now.getTime()) + attemptsMs;
     if (now.getTime() >= untilMs) {
       continue;
     }

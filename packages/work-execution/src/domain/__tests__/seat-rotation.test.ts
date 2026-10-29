@@ -189,6 +189,31 @@ describe("rotationStart on a role with no history", () => {
   });
 });
 
+describe("rotation and on fallbacks (SR1b Fable)", () => {
+  it("never rotates onto an on fallback", () => {
+    const p = plan([seat("A", "alpha-1"), seat("B", "beta-1"), seat("F", "fallback-1", { on: ["rate-limited"] })]);
+    expectSelected(selectSeat({ plan: p, role: "fix", history: [], rotationStart: 0 }), 0);
+    expectSelected(selectSeat({ plan: p, role: "fix", history: [], rotationStart: 1 }), 1);
+    expectSelected(selectSeat({ plan: p, role: "fix", history: [], rotationStart: 2 }), 0);
+  });
+
+  it("reaches a triggered on fallback through the scan when every rotation seat is unavailable", () => {
+    const p = plan([seat("A", "alpha-1"), seat("B", "beta-1"), seat("F", "fallback-1", { on: ["rate-limited"] })]);
+    const history = [h({ role: "first-pass", seatIndex: 0, model: "alpha-1", stopReason: "rate-limited" })];
+    const unavailable = new Map([
+      ["A", { reason: "busy" as const }],
+      ["B", { reason: "busy" as const }],
+    ]);
+    expectSelected(selectSeat({ plan: p, role: "fix", history, rotationStart: 0, unavailable }), 2);
+  });
+
+  it("skips a model refused in another role's history when rotating", () => {
+    const p = plan([seat("A", "alpha-1"), seat("B", "beta-1")]);
+    const history = [h({ role: "first-pass", seatIndex: 0, model: "alpha-1", stopReason: "rate-limited" })];
+    expectSelected(selectSeat({ plan: p, role: "fix", history, rotationStart: 0 }), 1);
+  });
+});
+
 describe("unavailable blocks", () => {
   it("skips busy and cooling-observed seats", () => {
     const p = plan([seat("A", "alpha-1"), seat("B", "beta-1"), seat("C", "gamma-1")]);
@@ -247,6 +272,17 @@ describe("coolingSeatIds", () => {
       observationCooldownMinutes: input.observationCooldownMinutes ?? 0,
     });
   }
+
+  it("cools a future-stamped refusal only for the cooldown from now", () => {
+    const attempt = attemptRecord({
+      seatSelection: seatSelection("fp-a"),
+      stopReason: "rate-limited",
+      updatedAtIso: "2099-01-01T00:00:00.000Z",
+    });
+    const until = cool({ attempts: [attempt] }).get("fp-a")?.until;
+    expect(until).toBeDefined();
+    expect(Date.parse(until!) - Date.parse(now)).toBe(60 * 60 * 1000);
+  });
 
   it("never cools a seat with a 0-minute cooldown, even for a refusal stamped after now", () => {
     const attempt = attemptRecord({

@@ -94,9 +94,29 @@ function runSshFixture(e2eDir: string, args: readonly string[]): FixtureLines {
   const stdout = execFileSync('sh', [script, ...args], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 30000,
+    timeout: 90000,
   });
-  const lines = stdout.split('\n').filter((line) => line.length > 0);
+  try {
+    return parseFixtureOutput(stdout);
+  } catch (error) {
+    // The daemon is already running when the output is checked: a format
+    // error stops it (best effort, from the raw FLEET_E2E_DIR line) before
+    // the error surfaces, so a malformed start never leaks an sshd.
+    const rawDir = /^FLEET_E2E_DIR=(.+)$/m.exec(stdout)?.[1];
+    if (rawDir !== undefined && rawDir !== '') {
+      try {
+        execFileSync('sh', [script, 'stop', rawDir], { stdio: 'ignore', timeout: 15000 });
+      } catch {
+        // Best effort only; the original error is the one to report.
+      }
+    }
+    throw error;
+  }
+}
+
+function parseFixtureOutput(stdout: string): FixtureLines {
+  // Exactly the expected lines, each KEY=VALUE: a blank line is a format error, not noise.
+  const lines = (stdout.endsWith('\n') ? stdout.slice(0, -1) : stdout).split('\n');
   if (lines.length !== EXPECTED_FIXTURE_LINE_COUNT) {
     throw new Error(
       `ssh-fixture start printed ${lines.length} lines, expected ${EXPECTED_FIXTURE_LINE_COUNT}`,

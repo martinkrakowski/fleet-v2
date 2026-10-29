@@ -9,6 +9,7 @@ import { implementerRoleFor } from '../../../domain/lane-run-transitions.js';
 import { seatSelectionRecord } from '../../../domain/seat-selection.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
+import { conductedRunnerOf } from './conducted-host.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendConduct, appendRunIntent, appendRunResult, ceilingPark, performPark, saveOrRefuse } from './step-context.js';
 import { manifestExpectedArtifacts, manifestPositiveInteger, manifestTimeLimitSeconds, readFrozenManifest } from './frozen-manifest.js';
@@ -77,7 +78,24 @@ export async function performPrepare(ctx: AdvanceStepContext,
   if (intentRefusal !== null) {
     return { outcome: 'refused', reason: intentRefusal };
   }
+  // The next attempt keeps the run's host identity (seam register: a conducted
+  // attempt always carries its runner host); the session fields stay null and
+  // dispatch overwrites the block with describeRunner().
+  const sourceRunner = conductedRunnerOf(source);
   const attempt: AttemptRecord = {
+    ...(sourceRunner !== null
+      ? {
+          runner: {
+            kind: sourceRunner.kind,
+            remotePort: sourceRunner.remotePort,
+            host: sourceRunner.host,
+            hostName: sourceRunner.hostName,
+            agent: null,
+            model: null,
+            variant: null,
+          },
+        }
+      : {}),
     id: attemptId,
     workOrderId: source.workOrderId,
     kind: 'initial',

@@ -139,9 +139,15 @@ die() {
   exit 1
 }
 
+# A caller that gives up on the start (a timeout) sends TERM: die() then kills
+# the daemon of the current attempt (if any) and removes the dir with the keys
+# in it, leaving nothing behind. Installed before the first file is written.
+trap 'die "ssh-fixture: start interrupted"' INT TERM
+
 ssh-keygen -q -N '' -t ed25519 -f "$d/host_key" || die 'host key generation failed'
 ssh-keygen -q -N '' -t ed25519 -f "$d/client_key" || die 'client key generation failed'
 cat "$d/client_key.pub" > "$d/authorized_keys"
+
 chmod 600 "$d/authorized_keys"
 
 # Pick a free high port: try 5 random ports in 40000..60000 with sshd until
@@ -187,7 +193,7 @@ while [ "$attempt" -lt 5 ]; do
     answered=false
     if command -v nc >/dev/null 2>&1; then
       j=0
-      while [ "$j" -lt 40 ]; do
+      while [ "$j" -lt 16 ]; do
         if nc -z -w 2 127.0.0.1 "$p" 2>/dev/null; then
           answered=true
           break

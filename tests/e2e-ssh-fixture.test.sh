@@ -78,13 +78,15 @@ parse_fixture <<EOF
 $out
 EOF
 
+# The started dir is registered for cleanup before any early exit below.
+[ -n "$d" ] && stopped="$stopped $d"
+
 # The first fixture must have been parsed before the hop and the stop tests.
 if [ -z "$d" ] || [ -z "$home" ] || [ -z "$bin" ] || [ -z "$alias" ]; then
   echo "e2e-ssh-fixture: $fails failure(s)"
   [ "$fails" -eq 0 ]
   exit
 fi
-stopped="$stopped $d"
 
 # The wrapper must exist, be executable and force `-F` onto the fixture config.
 if [ -f "$bin/ssh" ] && [ -x "$bin/ssh" ] && grep -q -- '-F' "$bin/ssh"; then
@@ -144,6 +146,8 @@ oldifs=$IFS
 IFS=:
 set -- $PATH
 IFS=$oldifs
+# sh is resolved first: on a merged /usr/bin, sshd's directory is sh's too.
+sh_bin=$(command -v sh)
 clean_path=''
 for p in "$@"; do
   [ -n "$p" ] || continue
@@ -151,7 +155,7 @@ for p in "$@"; do
   clean_path=$clean_path:$p
 done
 clean_path=${clean_path#:}
-out3=$(env PATH="$clean_path" sh "$SCRIPT" start 2>&1)
+out3=$(env PATH="$clean_path" "$sh_bin" "$SCRIPT" start 2>&1)
 rc4=$?
 [ "$rc4" -eq 3 ] && ok 'start with sshd hidden exits 3' || bad "start with sshd hidden exited $rc4"
 [ "$out3" = 'unavailable=no-sshd' ] && ok 'start with sshd hidden prints unavailable=no-sshd' || bad "start with sshd hidden printed: $out3"

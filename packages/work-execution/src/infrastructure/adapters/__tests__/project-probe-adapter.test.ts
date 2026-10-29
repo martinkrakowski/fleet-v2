@@ -11,6 +11,7 @@ import type {
 } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { ExecutorForRecordedHostResult } from '../ExecutorForHost.helper.js';
 import { ProjectProbeAdapter, redactUserinfo } from '../ProjectProbeAdapter.adapter.js';
+import { physicalPathArgv } from '../ResolvePhysicalPath.helper.js';
 
 type RunCall = { argv: readonly string[]; options?: CommandRunOptions };
 
@@ -191,6 +192,7 @@ describe('ProjectProbeAdapter', () => {
     for (const check of report.checks) expect(check.result).toBe('pass');
     expect(hostA.calls.map((call) => call.argv)).toEqual([
       ['git', ...EXPECTED_GIT_HARDENING, '-C', '--git-dir=/x', 'rev-parse', '--show-toplevel'],
+      physicalPathArgv('--git-dir=/x'),
       ['git', ...EXPECTED_GIT_HARDENING, '-C', '--git-dir=/x', 'remote', 'get-url', 'origin'],
       ['test', '-d', '-x'],
       ['git', ...EXPECTED_GIT_HARDENING, '-C', '--git-dir=/x', 'check-ignore', '-q', '.lane/probe.md'],
@@ -409,6 +411,79 @@ describe('ProjectProbeAdapter', () => {
     );
     expect(cloneCheck.detail).not.toContain('git clone');
     expect(report.detectedScripts).toEqual([]);
+  });
+
+  it('passes clone-is-work-tree when --show-toplevel prints the physical path of a symlinked clone', async () => {
+    const GIVEN = '/var/example/clone';
+    const PHYSICAL = '/private/var/example/clone';
+    const orch = fakeExecutor({
+      'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
+    });
+    const hostA = fakeExecutor({
+      ...passingHostCanned(GIVEN),
+      'rev-parse --show-toplevel': { exitCode: 0, stdout: `${PHYSICAL}\n` },
+      'pwd -P': { exitCode: 0, stdout: `${PHYSICAL}\n` },
+    });
+    const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
+
+    const report = await adapter.probe({
+      repository: REPO,
+      clones: { a: { path: GIVEN, worktreeRoot: `${GIVEN}-root` } },
+    });
+
+    const cloneCheck = report.checks.find((check) => check.name === 'clone-is-work-tree')!;
+    expect(cloneCheck.result).toBe('pass');
+    expect(cloneCheck.detail).toBe(`git work tree at ${GIVEN}`);
+    const pwdCall = hostA.calls.find((call) => call.argv[0] === 'sh')!;
+    expect(pwdCall.argv).toEqual(physicalPathArgv(GIVEN));
+    expect(pwdCall.argv).toEqual(['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', GIVEN]);
+    expect(pwdCall.options?.timeoutMs).toBe(30_000);
+    expect(pwdCall.argv[2]).toBe('cd -- "$1" && pwd -P');
+    expect(pwdCall.argv).not.toContain(PHYSICAL);
+  });
+
+  it('fails clone-is-work-tree with today\'s detail when the physical path is another repository', async () => {
+    const GIVEN = '/var/example/clone';
+    const orch = fakeExecutor({
+      'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
+    });
+    const hostA = fakeExecutor({
+      'rev-parse --show-toplevel': { exitCode: 0, stdout: '/private/other/repo\n' },
+      'pwd -P': { exitCode: 0, stdout: '/private/var/example/clone\n' },
+    });
+    const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
+
+    const report = await adapter.probe({
+      repository: REPO,
+      clones: { a: { path: GIVEN, worktreeRoot: `${GIVEN}-root` } },
+    });
+
+    const cloneCheck = report.checks.find((check) => check.name === 'clone-is-work-tree')!;
+    expect(cloneCheck.result).toBe('fail');
+    expect(cloneCheck.detail).toBe(
+      `${GIVEN} is inside another repository at /private/other/repo; use the clone's own root`,
+    );
+  });
+
+  it('falls back to the plain comparison when the physical path cannot be resolved', async () => {
+    const GIVEN = '/var/example/clone';
+    const orch = fakeExecutor({
+      'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
+    });
+    const hostA = fakeExecutor({
+      ...passingHostCanned(GIVEN),
+      'pwd -P': { exitCode: 1 },
+    });
+    const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
+
+    const report = await adapter.probe({
+      repository: REPO,
+      clones: { a: { path: GIVEN, worktreeRoot: `${GIVEN}-root` } },
+    });
+
+    const cloneCheck = report.checks.find((check) => check.name === 'clone-is-work-tree')!;
+    expect(cloneCheck.result).toBe('pass');
+    expect(cloneCheck.detail).toBe(`git work tree at ${GIVEN}`);
   });
 
   it('redacts userinfo and single-quotes paths with apostrophes in hints', async () => {
@@ -687,6 +762,8 @@ describe('ProjectProbeAdapter', () => {
           expect(call.argv.slice(1, 1 + EXPECTED_GIT_HARDENING.length)).toEqual(
             EXPECTED_GIT_HARDENING,
           );
+        } else if (call.argv[0] === 'sh') {
+          expect(call.argv).toEqual(physicalPathArgv(call.argv[4]!));
         } else {
           expect(call.argv).toEqual(['test', '-d', worktreeRoot]);
         }

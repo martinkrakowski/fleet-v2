@@ -65,6 +65,7 @@ import type { ReviewAssessmentPort } from '../ports/out/ReviewAssessmentPort.out
 import type { AcceptanceAssessmentPort } from '../ports/out/AcceptanceAssessmentPort.out-port.js';
 import type { CiStatePort } from '../ports/out/CiStatePort.out-port.js';
 import type { ForgeReadPort } from '../ports/out/ForgeReadPort.out-port.js';
+import type { ForgeAncestryPort } from '../ports/out/ForgeAncestryPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { AutoMergeAttemptPort } from '../ports/in/AutoMergeAttemptPort.in-port.js';
 import type { LaneRunParkNoticePort } from '../ports/out/LaneRunParkNoticePort.out-port.js';
@@ -158,6 +159,8 @@ export interface AdvanceLaneRunDependencies {
   readonly parkNotice?: LaneRunParkNoticePort;
   /** Whether `policy.autoMerge` is enabled (K6-7); absent → the merge fact `policyGrant` is false. */
   readonly autoMergeEnabled?: boolean;
+  /** Answer whether a merged PR head contains the lane head (CT-2b); absent → `containsLaneHead` stays head equality. */
+  readonly forgeAncestry?: ForgeAncestryPort;
 }
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */

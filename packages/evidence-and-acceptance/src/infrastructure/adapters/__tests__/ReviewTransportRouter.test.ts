@@ -170,9 +170,11 @@ describe('ReviewTransportRouter', () => {
   });
 
   it('refuses a seat whose tool has no transport and does not spawn', async () => {
-    const agySeat: ReviewTransportSeat = {
+    // CT-4a gave `agy` a CLI review transport; an unknown tool stands in for
+    // the "no transport" refusal this test pins.
+    const unknownSeat: ReviewTransportSeat = {
       id: 'reviewer',
-      tool: 'agy',
+      tool: 'example-unknown-tool',
       model: REVIEWER_SEAT.model,
       roles: ['reviewer'],
     };
@@ -182,7 +184,7 @@ describe('ReviewTransportRouter', () => {
       return { exitCode: 0, stdout: '', stderr: '' };
     };
     const router = createReviewTransportRouter({
-      seats: [agySeat],
+      seats: [unknownSeat],
       chains: { reviewer: [{ seatId: 'reviewer' }] },
       locate: async () =>
         fixtureLocation(
@@ -428,7 +430,9 @@ describe('ReviewTransportRouter', () => {
       const recorded: Array<{ file: string; args: readonly string[] }> = [];
       const cliSpawn: CliReviewSpawn = async (file, args) => {
         recorded.push({ file, args });
-        return { exitCode: 0, signal: null, stdout: CLI_STDOUT, stderr: '' };
+        // grok runs with `--output-format json`; the reply text lives in `text`
+        // (the fixture feeds the same two-line verdict as before this lane).
+        return { exitCode: 0, signal: null, stdout: JSON.stringify({ text: CLI_STDOUT }), stderr: '' };
       };
       let ocmCalled = false;
       const ocmSpawn: OcmReviewTransportSpawn = async () => {
@@ -450,8 +454,17 @@ describe('ReviewTransportRouter', () => {
 
       expect(recorded).toHaveLength(1);
       expect(recorded[0].file).toBe('grok');
-      expect(recorded[0].args[0]).toBe('-m');
-      expect(recorded[0].args[1]).toBe('grok-4.7');
+      expect(recorded[0].args).toEqual([
+        '--prompt-file',
+        expect.stringMatching(/^\/.*\/prompt\.md$/),
+        '-m',
+        'grok-4.7',
+        '--permission-mode',
+        'plan',
+        '--disable-web-search',
+        '--output-format',
+        'json',
+      ]);
       expect(ocmCalled).toBe(false);
       expect(result.result).toBe('pass');
       expect(result.readOnlyVerified).toBe(true);
@@ -481,7 +494,7 @@ describe('ReviewTransportRouter', () => {
       expect(ocmCalled).toBe(false);
     });
 
-    it('still rejects an agy seat as having no review transport', async () => {
+    it('routes an agy seat through the CLI review transport with the agy template (CT-4a)', async () => {
       const agySeat: ReviewTransportSeat = {
         id: 'reviewer',
         tool: 'agy',
@@ -495,9 +508,15 @@ describe('ReviewTransportRouter', () => {
         chains: { reviewer: [{ seatId: 'reviewer' }] },
         locate: async () => cliLocation({ kind: 'installation', remotePort: 46000, remoteHost: '' }),
         ocmRunBin: '/bundled/bin/ocm-run',
-        cliSpawn: async () => {
+        cliSpawn: async (file) => {
           cliCalled = true;
-          return { exitCode: 0, signal: null, stdout: CLI_STDOUT, stderr: '' };
+          expect(file).toBe('agy');
+          return {
+            exitCode: 0,
+            signal: null,
+            stdout: JSON.stringify({ response: CLI_STDOUT }),
+            stderr: '',
+          };
         },
         ocmSpawn: async () => {
           ocmCalled = true;
@@ -505,9 +524,11 @@ describe('ReviewTransportRouter', () => {
         },
       });
 
-      await expect(router(CLI_REQUEST)).rejects.toThrow(/which has no review transport/);
-      expect(cliCalled).toBe(false);
+      const result = await router(CLI_REQUEST);
+
+      expect(cliCalled).toBe(true);
       expect(ocmCalled).toBe(false);
+      expect(result.result).toBe('pass');
     });
   });
 });

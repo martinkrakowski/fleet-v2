@@ -13,6 +13,7 @@ import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js
 import { appendConduct, appendRunIntent, appendRunResult, ceilingPark, performPark, saveOrRefuse } from './step-context.js';
 import { manifestExpectedArtifacts, manifestPositiveInteger, manifestTimeLimitSeconds, readFrozenManifest } from './frozen-manifest.js';
 import { performFixPrepare } from './review-fix.js';
+import { parkSpentOneWayKey } from './merge.js';
 
 /**
  * The `act prepare` decision (K4-5): a fresh round-0 attempt on the selected
@@ -165,6 +166,15 @@ export async function performDispatch(ctx: AdvanceStepContext,
     }
     await cancel.cancelPreparedAttempt({ attemptId: latest.id, nowIso });
     return { outcome: 'waiting', reason: 'dispatch-pending' };
+  }
+  // The dispatch key is one-way (KF-10): an intent already recorded for this
+  // key is never re-sent. A spent key parks step-refused dispatch without
+  // writing (the parkSpentOneWayKey shape from merge.ts) instead of hitting
+  // the journal's duplicate-key refusal on every resume. The `not-started`
+  // cancel above owns the refused-dispatch pivot, so it runs first.
+  const spent = await parkSpentOneWayKey(ctx, record, gathered, decision, request);
+  if (spent !== null) {
+    return spent;
   }
   const manifest = await readFrozenManifest(latest, ctx.deps.artifactPort);
   const stepLimit = manifestPositiveInteger(manifest, 'stepLimit');

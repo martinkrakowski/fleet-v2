@@ -393,6 +393,7 @@ bounded_contexts:
             - AttemptArtifactPort
             - ForgeActionPort
             - ForgeReadPort
+            - ForgeAncestryPort
             - AcceptanceAssessmentPort
             - AcceptanceEvidencePort
             - OwnerDecisionPort
@@ -418,8 +419,9 @@ bounded_contexts:
             - AutoMergeOwnerRoutingPort
             - ConductorForgeGrantPort
             - LaneRunParkNoticePort
+            - AcceptanceReceiptReadPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -453,6 +455,7 @@ bounded_contexts:
       AttemptArtifactPort: "Place frozen briefs and templates under verified ignored paths and collect bounded immutable artifacts after lane completion."
       ForgeActionPort: "Perform permitted credential-bearing PR and merge operations through stable action IDs and explicit expected-head checks."
       ForgeReadPort: "Read one pull request's state by number or branch (open, merged or closed; head, base, merge time and merge commit) without mutating anything; a forge that cannot be read or a response that cannot be verified is unavailable, never a guess and never absence."
+      ForgeAncestryPort: "Answer whether one commit contains another as an ancestor (a merged PR head containing the lane head) through a read-only forge compare; no answer is unavailable, never a guess."
       AcceptanceAssessmentPort: "Consume the evidence context's exact-head assessment without importing its repositories or mutating its aggregates."
       AcceptanceEvidencePort: "Consume the evidence context's exact-head assessment to authorize merge actions."
       ReviewRequestPort: "Request a read-only review of one kind (brief-check, code-review, pre-merge) at one exact head under the conductor's request id, and find the receipt recorded for a request id; a review that recorded nothing is no-receipt, a refusal before any review is refused, anything unestablished is unknown, and read the latest receipt of one kind at a head; reason codes only."
@@ -463,6 +466,7 @@ bounded_contexts:
       PolicyMergeGrantPort: "Issue one merge-pr policy grant authorised by policy:autoMerge at the current setting revision, bound to the work order, attempt, head and acceptance receipt, through operator coordination; it never decides eligibility."
       AutoMergeOwnerRoutingPort: "Ask the owner a question or record an attention item for an auto-merge exception under a stable key, so a repeat run finds the first; a recorded notice grants nothing."
       ConductorForgeGrantPort: "Issue one push-and-open-pr or push-to-pr policy grant for an accepted attempt at an exact head under policy:conductor@<revision>; it never decides eligibility and never issues a merge grant."
+      AcceptanceReceiptReadPort: "Read the verification and review receipts of one attempt at one exact head through the evidence context's read-only inspection, projected to receipt id (hash input only), result, exit code, review kind, finding counts by severity and completion time; nothing else crosses the port; absence is an empty result, an unreadable store is unavailable."
       LaneRunParkNoticePort: "Raise one attention item per parked run and reason, and ask one keyed owner question where the owner must choose; ids and reason codes only; a repeat returns the existing notice."
       OwnerDecisionPort: "Re-check the attempt's frozen one-way doors through owner coordination before forge actions; an undecided, declined or unreadable decision blocks the action."
       AttemptOwnerDecisionPort: "Read the owner decision references the product froze into an attempt's brief package; an attempt recorded without them is unknown and blocks forge actions."
@@ -507,6 +511,7 @@ bounded_contexts:
       - { adapter: AttemptArtifactAdapter, implements: AttemptArtifactPort, integration: bounded-filesystem-and-approved-remote-artifact-access }
       - { adapter: ForgeActionAdapter, implements: ForgeActionPort, integration: reviewed-github-cli-subprocess }
       - { adapter: ForgeReadAdapter, implements: ForgeReadPort, integration: reviewed-github-cli-subprocess-read-only }
+      - { adapter: ForgeReadAdapter, implements: ForgeAncestryPort, integration: reviewed-github-cli-subprocess-read-only }
       - adapter: AcceptanceAssessmentAdapter
         implements: AcceptanceAssessmentPort
         integration: in-process
@@ -539,6 +544,10 @@ bounded_contexts:
         implements: ConductorForgeGrantPort
         integration: in-process
         delegates_to: [operator-coordination/IssuePolicyForgeGrantPort]
+      - adapter: AcceptanceReceiptReadAdapter
+        implements: AcceptanceReceiptReadPort
+        integration: in-process
+        delegates_to: [evidence-and-acceptance/InspectAcceptanceEvidencePort]
       - adapter: LaneRunParkNoticeAdapter
         implements: LaneRunParkNoticePort
         integration: in-process
@@ -829,7 +838,7 @@ bounded_contexts:
         - "Fleet masters receive summaries and fleet-relevant proposals; project controllers own their status and raw notes."
 
 context_mappings:
-  - { upstream: evidence-and-acceptance, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "AcceptanceAssessmentAdapter delegates to supplier-owned application ports; dependency is declared on work-execution." }
+  - { upstream: evidence-and-acceptance, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "AcceptanceAssessmentAdapter delegates to supplier-owned application ports; AcceptanceReceiptReadAdapter (telemetry, OT2b) reads receipts through its own read-only InspectAcceptanceEvidenceUseCase instance; dependency is declared on work-execution." }
   - { upstream: work-execution, downstream: evidence-and-acceptance, pattern: OHS, mechanism: in-process-application-contract, notes: "AttemptOwnerDecisionAdapter delegates to supplier-owned InspectAttemptPort so acceptance reads the frozen one-way doors from the attempt record, never from a request body or worktree file; the dependency is declared on work-execution." }
   - { upstream: brief-knowledge, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "BriefKnowledgeAdapter delegates to supplier-owned context-selection and completed-note ingestion ports." }
   - { upstream: operator-coordination, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "ActionAuthorizationAdapter and ExecutionObservationAdapter delegate to supplier-owned authorization and publication ports." }

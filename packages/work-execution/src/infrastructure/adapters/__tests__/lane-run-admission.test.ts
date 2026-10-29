@@ -14,7 +14,7 @@ import type { AttemptRecord, CapacityReservationRecord, WorkOrderRecord } from '
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { laneRunConductEntry } from '../../../domain/lane-run-step-facts.js';
 import { laneRunPackageKeys, laneRunPackagesOverlap } from '../../../domain/lane-run-packages.js';
-import type { ReserveExecutionCapacityPort, ReserveExecutionCapacityRequest, ReserveExecutionCapacityResult } from '../../../application/ports/in/ReserveExecutionCapacityPort.in-port.js';
+import type { ReserveExecutionCapacityCandidateHost, ReserveExecutionCapacityPort, ReserveExecutionCapacityRequest, ReserveExecutionCapacityResult } from '../../../application/ports/in/ReserveExecutionCapacityPort.in-port.js';
 import type { LaneRunAdmissionRequest } from '../../../application/ports/out/LaneRunAdmissionPort.out-port.js';
 import { LaneRunAdmissionAdapter } from '../LaneRunAdmissionAdapter.adapter.js';
 import { ExecutionJournalAdapter } from '../ExecutionJournalAdapter.adapter.js';
@@ -40,6 +40,18 @@ const CANDIDATE_HOSTS = [
     worktreeRoot: WORKTREE_ROOT,
   },
 ];
+
+/** An ssh lane-runner host that declares no `runner.authFile` (KF-14b). */
+const SSH_NO_AUTH_HOST = {
+  name: 'lane-ssh-no-auth',
+  kind: 'opencode' as const,
+  transport: 'ssh' as const,
+  sshAlias: 'lane-ssh',
+  port: 46000,
+  maxLanes: 1,
+  worktreeRoot: WORKTREE_ROOT,
+  reviewRoute: 'no-auth-file' as const,
+};
 
 function workOrderFixture(overrides: Partial<WorkOrderRecord> = {}): WorkOrderRecord {
   return {
@@ -132,7 +144,7 @@ function reservationFixture(attemptId: string, overrides: Partial<CapacityReserv
 
 interface AdmissionHarnessOptions {
   readonly maxActiveRuns?: number;
-  readonly candidateHosts?: typeof CANDIDATE_HOSTS | undefined;
+  readonly candidateHosts?: readonly ReserveExecutionCapacityCandidateHost[] | undefined;
 }
 
 function makeHarness(options: AdmissionHarnessOptions = {}) {
@@ -460,6 +472,29 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     expect(refused).toEqual({ outcome: 'refused', reason: 'reservation-incomplete' });
     expect(releaseSpy).toHaveBeenCalledWith('attempt-example-1', NOW);
     expect(await heldFor(incomplete.executionJournal, 'attempt-example-1')).toBe(false);
+  });
+
+  it('test 8c: an ssh host without a review route is never offered to the reserve; alone it refuses no-review-route (KF-14b)', async () => {
+    const harness = makeHarness({ candidateHosts: [SSH_NO_AUTH_HOST] });
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({ outcome: 'refused', reason: 'no-review-route' });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('test 8d: mixed candidates — the reserve sees only the available host (KF-14b)', async () => {
+    const harness = makeHarness({ candidateHosts: [SSH_NO_AUTH_HOST, ...CANDIDATE_HOSTS] });
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'reserved',
+      hostName: HOST_NAME,
+      hostKind: 'opencode',
+      worktreePath: WORKTREE_PATH,
+      transport: 'local',
+      sshAlias: null,
+      port: null,
+    });
+    expect(harness.reserveCalls).toHaveLength(1);
+    expect(harness.reserveCalls[0]?.candidateHosts).toEqual(CANDIDATE_HOSTS);
   });
 });
 

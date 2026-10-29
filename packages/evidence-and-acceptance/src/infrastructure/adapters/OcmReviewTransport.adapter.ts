@@ -40,6 +40,13 @@ export interface OcmReviewTransportOptions {
   readonly spawn?: OcmReviewTransportSpawn;
   /** Test seam: overrides the per-prompt nonce; production uses defaultNonce(). */
   readonly makeNonce?: () => string;
+  /**
+   * The base commit the candidate diff is read against. When set together
+   * with `readDiff`, a kind review prompt embeds the base..head diff.
+   */
+  readonly baseCommit?: string;
+  /** Read-only diff read through the review location; paired with `baseCommit`. */
+  readonly readDiff?: (fromSha: string, toSha: string) => Promise<string | null> | string | null;
 }
 
 /** Allowed tools for read-only review proof. Any other tool voids read-only verification. */
@@ -49,6 +56,303 @@ export const READ_ONLY_REVIEW_TOOLS: ReadonlySet<string> = new Set([
   'glob',
   'list',
 ]);
+
+/**
+ * The shell commands the lane server's `reviewer` agent may already run, so a
+ * strictly read-only shell command is read-only proof by design. The proof
+ * grammar below is an allow-list, never a deny-list: read-only commands can
+ * still write or execute, so anything not shaped exactly like the forms here
+ * is refused.
+ */
+export const READ_ONLY_REVIEW_SHELL_COMMANDS: ReadonlySet<string> = new Set([
+  'git',
+  'grep',
+  'rg',
+  'sed',
+  'cat',
+  'ls',
+  'wc',
+]);
+
+/** First words that may smuggle a value or spawn anything: never a command word. */
+const FORBIDDEN_FIRST_WORDS: ReadonlySet<string> = new Set([
+  'env',
+  'xargs',
+  'find',
+  'sh',
+  'bash',
+  'yarn',
+  'node',
+  'tee',
+]);
+
+/**
+ * Characters that make a command non-read-only or unparsable without shell
+ * quoting. `~` is not here because a ref word may carry `HEAD~<digits>`; no
+ * other word may contain or start with it.
+ */
+const FORBIDDEN_COMMAND_CHARACTERS: ReadonlySet<string> = new Set([
+  ';',
+  '&',
+  '|',
+  '>',
+  '<',
+  '`',
+  '$',
+  '(',
+  ')',
+  '{',
+  '}',
+  '\\',
+  '*',
+  '?',
+  '[',
+]);
+
+/** Longest shell command accepted as read-only proof. */
+export const MAX_REVIEW_COMMAND_LENGTH = 1000;
+
+/** Longest `-e` pattern accepted for grep/rg. */
+const MAX_REVIEW_PATTERN_LENGTH = 200;
+
+/** Relative path word: no `/`-root, no flag, no `..`, no hidden segment but `.lane/…`. */
+const PATH_WORD_PATTERN = /^[A-Za-z0-9._/-]+$/;
+const ALLOWED_HIDDEN_SEGMENTS: ReadonlySet<string> = new Set(['.lane']);
+
+/**
+ * Pattern word: no leading `-`, no quotes, no shell metacharacters. `=` is
+ * refused everywhere so `FOO=bar …` prefixes and `--flag=value` never pass.
+ */
+const PATTERN_WORD_PATTERN = /^[A-Za-z0-9._/@:%#,+^~-]+$/;
+
+/** Ref word: a sha, `HEAD`, `HEAD~<digits>` or a `<ref>..<ref>` / `<ref>...<ref>` range. */
+const REF_ATOM = '(?:HEAD(?:~[0-9]+)?|[0-9a-f]{7,40}|[A-Za-z0-9._/-]+)';
+const REF_WORD_PATTERN = new RegExp(`^(?:${REF_ATOM}|${REF_ATOM}\\.{2,3}${REF_ATOM})$`);
+
+function isPathWord(word: string): boolean {
+  if (!PATH_WORD_PATTERN.test(word)) {
+    return false;
+  }
+  if (word.startsWith('/') || word.startsWith('-')) {
+    return false;
+  }
+  if (word.includes('..') || word === '.') {
+    return false;
+  }
+  for (const segment of word.split('/')) {
+    if (segment.startsWith('.') && !ALLOWED_HIDDEN_SEGMENTS.has(segment)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isPatternWord(word: string): boolean {
+  return word.length > 0 && PATTERN_WORD_PATTERN.test(word);
+}
+
+function isRefWord(word: string): boolean {
+  return REF_WORD_PATTERN.test(word);
+}
+
+const GIT_READ_SUBCOMMANDS: ReadonlySet<string> = new Set(['diff', 'log', 'show', 'status']);
+const GIT_PLAIN_FLAGS: ReadonlySet<string> = new Set([
+  '--stat',
+  '--name-only',
+  '--name-status',
+  '--oneline',
+  '-p',
+  '-n',
+  '--no-color',
+  '--no-pager',
+]);
+const GIT_NUMERIC_FLAG_PATTERN = /^-U[0-9]+$|^-([0-9]+)$/;
+
+function isReadOnlyGitCommand(words: readonly string[]): boolean {
+  const subcommand = words[0];
+  if (subcommand === undefined || !GIT_READ_SUBCOMMANDS.has(subcommand)) {
+    return false;
+  }
+  let sawDoubleDash = false;
+  for (const word of words.slice(1)) {
+    if (sawDoubleDash) {
+      if (!isPathWord(word)) {
+        return false;
+      }
+      continue;
+    }
+    if (word === '--') {
+      sawDoubleDash = true;
+      continue;
+    }
+    if (word.startsWith('-')) {
+      if (GIT_PLAIN_FLAGS.has(word) || GIT_NUMERIC_FLAG_PATTERN.test(word)) {
+        continue;
+      }
+      return false;
+    }
+    if (subcommand !== 'status' && isRefWord(word)) {
+      continue;
+    }
+    if (isPathWord(word)) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+const GREP_PLAIN_FLAGS: ReadonlySet<string> = new Set(['-n', '-i', '-l', '-c', '-w', '-F', '--no-color', '-r']);
+
+function isReadOnlyGrepCommand(words: readonly string[], isRipgrep: boolean): boolean {
+  let patternSeen = false;
+  let index = 0;
+  while (index < words.length) {
+    const word = words[index];
+    if (word === undefined) {
+      return false;
+    }
+    if (!patternSeen && word.startsWith('-')) {
+      if (GREP_PLAIN_FLAGS.has(word) || /^-[nilcwFr]+$/.test(word)) {
+        index += 1;
+        continue;
+      }
+      if (word === '-e' || (isRipgrep && word === '-g')) {
+        const value = words[index + 1];
+        if (value === undefined || value.length > MAX_REVIEW_PATTERN_LENGTH || !isPatternWord(value)) {
+          return false;
+        }
+        index += 2;
+        continue;
+      }
+      if (/^-[ABC]$/.test(word)) {
+        const value = words[index + 1];
+        if (value === undefined || !/^[0-9]+$/.test(value)) {
+          return false;
+        }
+        index += 2;
+        continue;
+      }
+      return false;
+    }
+    if (!patternSeen) {
+      if (!isPatternWord(word)) {
+        return false;
+      }
+      patternSeen = true;
+      index += 1;
+      continue;
+    }
+    if (!isPathWord(word)) {
+      return false;
+    }
+    index += 1;
+  }
+  return patternSeen;
+}
+
+const SED_SCRIPT_PATTERN = /^'[0-9]+(?:,[0-9]+)?p'$/;
+const LS_FLAGS: ReadonlySet<string> = new Set(['-l', '-a', '-la', '-1']);
+const WC_FLAGS: ReadonlySet<string> = new Set(['-l', '-c', '-w']);
+
+function isReadOnlyListCommand(command: string, words: readonly string[]): boolean {
+  const flags: ReadonlySet<string> | null =
+    command === 'ls' ? LS_FLAGS : command === 'wc' ? WC_FLAGS : null;
+  const paths: string[] = [];
+  for (const word of words) {
+    if (flags !== null && paths.length === 0 && word.startsWith('-')) {
+      if (!flags.has(word)) {
+        return false;
+      }
+      continue;
+    }
+    if (!isPathWord(word)) {
+      return false;
+    }
+    paths.push(word);
+  }
+  return paths.length > 0;
+}
+
+/**
+ * True only for a shell command the lane server's `reviewer` agent may run as
+ * read-only proof: `git diff|log|show|status`, `grep`, `rg`, `sed -n`, `cat`,
+ * `ls` and `wc` in the strict shapes above. Pure and fail-closed: anything
+ * unparsable, over-long, carrying a shell metacharacter, an assignment, an
+ * unknown flag or an unsafe path is refused.
+ */
+export function isReadOnlyReviewCommand(command: unknown): boolean {
+  if (typeof command !== 'string') {
+    return false;
+  }
+  if (command.length === 0 || command.length > MAX_REVIEW_COMMAND_LENGTH) {
+    return false;
+  }
+  for (const character of command) {
+    if (character === '\n' || character === '\t' || character === '\0') {
+      return false;
+    }
+    if (FORBIDDEN_COMMAND_CHARACTERS.has(character)) {
+      return false;
+    }
+  }
+  if (command !== command.trim() || command.includes('  ')) {
+    return false;
+  }
+  const words = command.split(' ');
+  if (words.some((word) => word === '' || word.includes('='))) {
+    return false;
+  }
+  const first = words[0];
+  if (first === undefined || FORBIDDEN_FIRST_WORDS.has(first) || !READ_ONLY_REVIEW_SHELL_COMMANDS.has(first)) {
+    return false;
+  }
+  const rest = words.slice(1);
+  switch (first) {
+    case 'git':
+      return isReadOnlyGitCommand(rest);
+    case 'grep':
+      return isReadOnlyGrepCommand(rest, false);
+    case 'rg':
+      return isReadOnlyGrepCommand(rest, true);
+    case 'sed':
+      return (
+        rest.length === 3 &&
+        rest[0] === '-n' &&
+        rest[1] !== undefined &&
+        SED_SCRIPT_PATTERN.test(rest[1]) &&
+        rest[2] !== undefined &&
+        isPathWord(rest[2])
+      );
+    case 'cat':
+    case 'ls':
+    case 'wc':
+      return isReadOnlyListCommand(first, rest);
+    default:
+      return false;
+  }
+}
+
+/**
+ * The shell command a bash/shell tool event carries, read from the part's
+ * input under `state.input` or `input`; null when neither placement holds one.
+ */
+function extractShellCommand(record: Record<string, unknown>): string | null {
+  const containers: Record<string, unknown>[] = [record];
+  const part = isPlainRecord(record.part) ? record.part : null;
+  if (part !== null) {
+    containers.unshift(part);
+  }
+  for (const container of containers) {
+    const state = isPlainRecord(container.state) ? container.state : null;
+    for (const input of [container.input, state?.input]) {
+      if (isPlainRecord(input) && typeof input.command === 'string') {
+        return input.command;
+      }
+    }
+  }
+  return null;
+}
 
 /** Recognised event types for review runner stream. Any unrecognised event voids read-only. */
 export const RECOGNISED_EVENT_TYPES: ReadonlySet<string> = new Set([
@@ -198,11 +502,18 @@ export const REVIEW_CHECKLIST: string = [
   '(g) each finding names a concrete failure scenario.',
 ].join('\n');
 
-export function buildReviewPrompt(request: RunIndependentReviewRequest, nonce: string): string {
+/** Byte cap for the diff embedded in a kind review prompt. */
+export const MAX_OCM_EMBEDDED_DIFF_BYTES = 120_000;
+
+export function buildReviewPrompt(
+  request: RunIndependentReviewRequest,
+  nonce: string,
+  embeddedDiff?: string | null,
+): string {
   if (request.kind === undefined) {
     return buildManualReviewPrompt(request, nonce);
   }
-  return buildKindReviewPrompt(request, nonce);
+  return buildKindReviewPrompt(request, nonce, embeddedDiff);
 }
 
 /** The prompt a manual review (no kind) receives; byte-for-byte the pre-kind text. */
@@ -232,7 +543,11 @@ function buildManualReviewPrompt(request: RunIndependentReviewRequest, nonce: st
  * names the kind, a brief-check carries the frozen brief wrapped as untrusted,
  * and code-review and pre-merge carry the failure-mode checklist.
  */
-function buildKindReviewPrompt(request: RunIndependentReviewRequest, nonce: string): string {
+function buildKindReviewPrompt(
+  request: RunIndependentReviewRequest,
+  nonce: string,
+  embeddedDiff?: string | null,
+): string {
   const sections: string[] = [
     `Independent read-only ${request.kind} review for attempt "${request.attemptId}" at candidate head "${request.candidateHeadSha}".`,
     'This review session is strictly read-only. Do not edit, create, delete, or modify any files.',
@@ -267,7 +582,24 @@ function buildKindReviewPrompt(request: RunIndependentReviewRequest, nonce: stri
     sections.push(REVIEW_CHECKLIST);
   }
 
-  sections.push('Inspect the code changes and candidate head using read-only tools (read, grep, glob, list).\n' + REVIEW_REPLY_CONTRACT);
+  if (typeof embeddedDiff === 'string' && embeddedDiff.trim() !== '') {
+    if (Buffer.byteLength(embeddedDiff, 'utf8') > MAX_OCM_EMBEDDED_DIFF_BYTES) {
+      sections.push('The diff was too large to embed; the read-only tools still work against the candidate head.');
+    } else {
+      const wrappedDiff = wrapUntrusted({
+        label: 'diff',
+        text: embeddedDiff,
+        nonce,
+      });
+      sections.push(`Diff:\n${wrappedDiff}`);
+    }
+  }
+
+  sections.push(
+    'Inspect the candidate head with the read-only tools (read, grep, glob, list). ' +
+      'The diff is embedded above; if you must run a shell command, use only git diff/log/show/status, ' +
+      'grep, rg, ls, cat, sed -n or wc, never a command that writes.\n' + REVIEW_REPLY_CONTRACT,
+  );
 
   return sections.join('\n\n');
 }
@@ -449,9 +781,18 @@ export function createOcmReviewTransport(
       );
     }
 
-    // 4. Build argv and sanitized environment
+    // 4. Build argv and sanitized environment. A kind review embeds the
+    // base..head diff read after the pre-review head read, so the reviewer
+    // does not need a shell to see the change.
     const nonce = (options.makeNonce ?? defaultNonce)();
-    const prompt = buildReviewPrompt(request, nonce);
+    let embeddedDiff: string | null = null;
+    if (request.kind !== undefined && options.baseCommit !== undefined && options.readDiff !== undefined) {
+      const diff = await options.readDiff(options.baseCommit, request.candidateHeadSha);
+      if (typeof diff === 'string' && diff.trim() !== '') {
+        embeddedDiff = diff;
+      }
+    }
+    const prompt = buildReviewPrompt(request, nonce, embeddedDiff);
     const argv: string[] = [
       '--dir',
       dir,
@@ -522,7 +863,17 @@ export function createOcmReviewTransport(
           readOnlyVoided = true;
         } else {
           toolNames.push(toolName);
-          if (!READ_ONLY_REVIEW_TOOLS.has(toolName)) {
+          if (READ_ONLY_REVIEW_TOOLS.has(toolName)) {
+            // already read-only proof
+          } else if (toolName === 'bash' || toolName === 'shell') {
+            // The lane server's reviewer agent denies bash except a read-only
+            // command list, so a strictly read-only command is proof by
+            // design; anything else (or no readable command) voids.
+            const command = extractShellCommand(parsed);
+            if (command === null || !isReadOnlyReviewCommand(command)) {
+              readOnlyVoided = true;
+            }
+          } else {
             readOnlyVoided = true;
           }
         }

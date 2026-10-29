@@ -944,5 +944,4 @@ describe('redactionChecks (OT1r)', () => {
   });
 
   it.todo('adapter errors name an error kind, never the endpoint, a header or a body (belongs with the sender, OT3b)');
-  it.todo('a cast object literal is refused by the encoder (belongs with the encoder and the nominal span, OT3a and OT1a-3)');
 });

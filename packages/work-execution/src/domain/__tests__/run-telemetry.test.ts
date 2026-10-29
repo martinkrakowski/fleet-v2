@@ -187,6 +187,34 @@ describe('TelemetrySpan.build', () => {
   });
 });
 
+describe('TelemetrySpan construction outside build (Fable, OT1a-3)', () => {
+  const fields = { ...base, attributes: {}, events: [] };
+
+  it('refuses a direct construction that bypasses the private modifier', () => {
+    const Ctor = TelemetrySpan as unknown as new (...args: unknown[]) => unknown;
+    expect(() => Reflect.construct(Ctor, [fields])).toThrow(TypeError);
+    expect(() => Reflect.construct(Ctor, [Symbol('telemetry-span-build'), fields])).toThrow(TypeError);
+  });
+
+  it('refuses a subclass, which cannot reach the build token', () => {
+    const Base = TelemetrySpan as unknown as new (...args: unknown[]) => object;
+    class Forged extends Base {
+      constructor() {
+        super(Symbol('telemetry-span-build'), fields);
+      }
+    }
+    expect(() => new Forged()).toThrow(TypeError);
+  });
+
+  it('never brands a proxy, a clone or a JSON round trip of a built span', () => {
+    const span = mustBuild(base);
+    expect(TelemetrySpan.isTelemetrySpan(new Proxy(span, {}))).toBe(false);
+    expect(TelemetrySpan.isTelemetrySpan(JSON.parse(JSON.stringify(span)))).toBe(false);
+    expect(TelemetrySpan.isTelemetrySpan({ ...span })).toBe(false);
+    expect(TelemetrySpan.isTelemetrySpan(Object.create(Object.getPrototypeOf(span) as object))).toBe(false);
+  });
+});
+
 describe('TelemetrySpan.isTelemetrySpan', () => {
   it('is true only for an instance built here', () => {
     const span = mustBuild(base);

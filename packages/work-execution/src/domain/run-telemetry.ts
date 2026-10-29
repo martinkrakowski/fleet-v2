@@ -67,6 +67,12 @@ const EVENT_KEYS: readonly string[] = ['name', 'timeIso', 'state'];
 const ZONED_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 const ALL_ZEROS_PATTERN = /^0+$/;
 const SPAN_BRAND = 'fleet-telemetry-span/v1';
+/**
+ * Module-private construction token (Fable, OT1a-3): `private` is erased at
+ * runtime, so without it `Reflect.construct`, a cast `new` or a subclass could
+ * run the constructor, install the brand and skip every check in `build`.
+ */
+const BUILD_TOKEN: unique symbol = Symbol('telemetry-span-build');
 
 /** A hex id that is not all zeros (an all-zero id is invalid in OTLP, plan §3.4). */
 function isNonZeroHex(value: unknown, pattern: RegExp): boolean {
@@ -164,7 +170,10 @@ export class TelemetrySpan {
   readonly attributes: Readonly<Record<string, TelemetryAttributeValue>>;
   readonly events: readonly TelemetrySpanEvent[];
 
-  private constructor(fields: TelemetrySpanInput /* already validated and normalised */) {
+  private constructor(token: typeof BUILD_TOKEN, fields: TelemetrySpanInput /* already validated and normalised */) {
+    if (token !== BUILD_TOKEN) {
+      throw new TypeError('TelemetrySpan is created only by TelemetrySpan.build');
+    }
     this.traceId = fields.traceId;
     this.spanId = fields.spanId;
     this.parentSpanId = fields.parentSpanId;
@@ -214,7 +223,7 @@ export class TelemetrySpan {
       if (events === null) {
         return null;
       }
-      return new TelemetrySpan({
+      return new TelemetrySpan(BUILD_TOKEN, {
         traceId: record.traceId as string,
         spanId: record.spanId as string,
         parentSpanId,

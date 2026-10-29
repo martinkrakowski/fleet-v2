@@ -11,6 +11,7 @@ import { appendConduct, appendRunIntent, appendRunResult, intentMintedIdOf, save
 import { conductDispatching } from './prepare-dispatch.js';
 import { gatePreCheck, runCollectBody, runGateBody } from './collect-gate.js';
 import { reconcileReview } from './review-fix.js';
+import { reconcileAccept } from './merge.js';
 
 /**
  * The `reconcile` decisions (K4-7, §3.5): an intent without a result is
@@ -34,6 +35,9 @@ export async function performReconcile(ctx: AdvanceStepContext,
   }
   if (decision.step === 'dispatch') {
     return reconcileDispatch(ctx, gathered, decision, request);
+  }
+  if (decision.step === 'accept') {
+    return reconcileAccept(ctx, record, gathered, decision, request);
   }
   if (decision.step === 'stop') {
     return reconcileStop(ctx, gathered, decision, request);

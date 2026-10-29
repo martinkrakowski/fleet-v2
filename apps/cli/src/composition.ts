@@ -48,6 +48,7 @@ import {
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
   ForgeReadAdapter,
+  GatePredicateAdapter,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   LaneDiffCheckAdapter,
@@ -96,6 +97,8 @@ import {
   type AttemptRecord,
   type ExecutionRunnerHost,
   type ExecutorForRecordedHostResult,
+  type EvaluateAttemptGatePort,
+  type ForgeActionDelegate,
   type GhInvocationResult,
   type SubprocessRunner,
   type CommandExecutorPort,
@@ -242,6 +245,27 @@ export interface FleetCliRuntimeOptions {
   readonly adviceReadKey?: (path: string) => Promise<string>;
   /** Spy transport for the review subprocess (tests only); production runs ocm-run. */
   readonly reviewSpawn?: OcmReviewTransportSpawn;
+  /**
+   * Gate used by auto-merge and the conductor (tests only); production
+   * composes the gate predicates.
+   */
+  readonly attemptGate?: EvaluateAttemptGatePort;
+  /**
+   * Test-only delegate for the forge action's reviewed gh subprocess and the
+   * live head read; production binds the reviewed gh subprocess and the live
+   * head read.
+   */
+  readonly forgeActionDelegate?: Pick<ForgeActionDelegate, 'runGh' | 'verifyCurrentHeadSha'>;
+}
+
+/** The fields of a test-only forge delegate that were actually supplied; nothing else is overridden. */
+function forgeActionOverrides(
+  delegate: Pick<ForgeActionDelegate, 'runGh' | 'verifyCurrentHeadSha'> | undefined,
+): Partial<Pick<ForgeActionDelegate, 'runGh' | 'verifyCurrentHeadSha'>> {
+  return {
+    ...(delegate?.runGh === undefined ? {} : { runGh: delegate.runGh }),
+    ...(delegate?.verifyCurrentHeadSha === undefined ? {} : { verifyCurrentHeadSha: delegate.verifyCurrentHeadSha }),
+  };
 }
 
 export interface ResolvedRunnerSettings {
@@ -636,6 +660,7 @@ export interface FleetCliRuntime {
     readonly collectAttemptArtifacts: CollectAttemptArtifactsUseCase;
     readonly prepareFixAttempt: PrepareFixAttemptUseCase;
     readonly requestAttemptAcceptance: RequestAttemptAcceptanceUseCase;
+    readonly attemptGate: RequestAttemptAcceptanceUseCase;
     readonly executeAuthorizedForgeAction: ExecuteAuthorizedForgeActionUseCase;
     readonly autoMergeAttempt: AutoMergeAttemptUseCase;
     readonly probeProject: ProbeProjectUseCase;
@@ -1417,6 +1442,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     ...(forgeGithubSection !== undefined
       ? { repository: { owner: forgeGithubSection.owner, repo: forgeGithubSection.repo } }
       : {}),
+    // Test-only: a supplied gh runner or head read replaces the production one (spread last, so it wins).
+    ...forgeActionOverrides(options?.forgeActionDelegate),
     },
     forgeRead,
   );
@@ -1745,6 +1772,23 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     policy: installationModel?.policy,
   });
 
+  // GP-wire: the frozen gate for auto-merge and the conductor. It runs the predicates on the attempt's recorded
+  // host through the same recorded-host executor as artifact reads, journals each predicate, and checks the
+  // frozen brief's digest with the same SHA-256 prepare uses. `attempt accept` keeps its own instance.
+  const composedAttemptGate = new RequestAttemptAcceptanceUseCase({
+    attemptRepo: attemptRepository,
+    workOrderRepo: workOrderRepository,
+    acceptancePort: acceptanceAssessment,
+    artifactPort: attemptArtifact,
+    allowedSeats,
+    gatePredicates: new GatePredicateAdapter({
+      executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
+    }),
+    journal: executionJournal,
+    computeDigest: sha256HexDigest,
+  });
+  const attemptGate = options?.attemptGate ?? composedAttemptGate;
+
   const execution = {
     workOrderRepository,
     attemptRepository,
@@ -1858,6 +1902,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       artifactPort: attemptArtifact,
       allowedSeats,
     }),
+    attemptGate: composedAttemptGate,
     executeAuthorizedForgeAction: new ExecuteAuthorizedForgeActionUseCase({
       attemptRepo: attemptRepository,
       workOrderRepo: workOrderRepository,
@@ -1896,7 +1941,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     workOrderRepo: workOrderRepository,
     journal: executionJournal,
     attemptOwnerDecisionPort: attemptOwnerDecision,
-    evaluateAttemptGate: execution.requestAttemptAcceptance,
+    evaluateAttemptGate: attemptGate,
     acceptancePort: acceptanceAssessment,
     routing: new AutoMergeOwnerRoutingAdapter({
       askOwnerQuestion: coordination.askOwnerQuestion,

@@ -33,6 +33,7 @@ import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js
 import { performPark } from './step-context.js';
 import { manifestTimeLimitSeconds, readFrozenManifest } from './frozen-manifest.js';
 import { reviewFactsOf } from './review-fix.js';
+import { acceptanceFactsOf } from './merge.js';
 
 /** The manifest verdict of a collected attempt: the port's outcome, `missing` when absent or unreadable. */
 export async function manifestVerdictOf(
@@ -169,6 +170,7 @@ export async function gatherFacts(ctx: AdvanceStepContext,
 
   const stopFacts = laneRunJournalStopFacts(entries, record.runId);
   const head12 = latest === null ? null : head12Of(latest.artifacts?.headCommit);
+  const acceptance = await acceptanceFactsOf(ctx, record, state, entries, latest, head12, request.halted);
 
   const reservations = await ctx.deps.executionJournal.listActiveReservations();
   const admitted = latestId !== null && reservations.some((reservation) => reservation.attemptId === latestId);
@@ -213,14 +215,14 @@ export async function gatherFacts(ctx: AdvanceStepContext,
     roundSeatIndexes,
     attempt,
     head12,
-    acceptedHead12: null,
+    acceptedHead12: acceptance.acceptedHead12,
     gate: laneRunGateFact(entries, record.runId, head12),
     briefCheck: review.briefCheck,
     codeReview: review.codeReview,
-    preMerge: 'none',
-    acceptance: 'none',
-    ci: 'unknown',
-    pr: null,
+    preMerge: acceptance.preMerge,
+    acceptance: acceptance.acceptance,
+    ci: acceptance.ci,
+    pr: acceptance.pr,
     refusedStep: laneRunRefusedStep(entries, record.runId, record.round),
     merge: { oneWayDoor: true, branchBehind: true, trainFree: false, policyGrant: false },
   };

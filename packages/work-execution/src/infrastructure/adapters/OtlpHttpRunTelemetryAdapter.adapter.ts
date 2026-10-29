@@ -85,6 +85,14 @@ const DEFAULT_MAX_QUEUE_SPANS = 2048;
 const DEFAULT_MAX_BATCH_SPANS = 512;
 const DEFAULT_MAX_BATCH_BYTES = 1_048_576;
 
+/** A safe integer in [min, max]; anything else (absent, non-integer, out of range) falls back or clamps. */
+function boundedInteger(value: number | undefined, fallback: number, min: number, max: number): number {
+  if (value === undefined || !Number.isSafeInteger(value)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, value));
+}
+
 export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
   readonly #post: OtlpPost;
   readonly #route: TelemetryRoute;
@@ -101,9 +109,12 @@ export class OtlpHttpRunTelemetryAdapter implements RunTelemetryPort {
     this.#post = options.post;
     this.#route = options.route;
     this.#resource = options.resource;
-    this.#maxQueueSpans = options.maxQueueSpans ?? DEFAULT_MAX_QUEUE_SPANS;
-    this.#maxBatchSpans = options.maxBatchSpans ?? DEFAULT_MAX_BATCH_SPANS;
-    this.#maxBatchBytes = options.maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES;
+    // Overrides are clamped to safe bounds (CodeRabbit, #434): a non-positive or
+    // non-integer value would stall the batching loop, and a batch past the
+    // encoder's bound would be refused whole.
+    this.#maxQueueSpans = boundedInteger(options.maxQueueSpans, DEFAULT_MAX_QUEUE_SPANS, 1, DEFAULT_MAX_QUEUE_SPANS);
+    this.#maxBatchSpans = boundedInteger(options.maxBatchSpans, DEFAULT_MAX_BATCH_SPANS, 1, DEFAULT_MAX_BATCH_SPANS);
+    this.#maxBatchBytes = boundedInteger(options.maxBatchBytes, DEFAULT_MAX_BATCH_BYTES, 1, DEFAULT_MAX_BATCH_BYTES);
     this.#onDeadline = options.onDeadline ?? null;
   }
 

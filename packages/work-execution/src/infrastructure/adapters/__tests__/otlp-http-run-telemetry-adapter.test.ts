@@ -388,3 +388,30 @@ describe('OtlpHttpRunTelemetryAdapter core (OT3b-1)', () => {
     expect(adapter.takeCounters()).toEqual({ queueDrops: 0, errorKinds: {} });
   });
 });
+
+describe('OtlpHttpRunTelemetryAdapter batching overrides are clamped (CodeRabbit #434)', () => {
+  it('a zero, negative or non-integer batch size never stalls: the send completes with every span exported', async () => {
+    for (const maxBatchSpans of [0, -3, 1.5, Number.NaN]) {
+      const spans = [makeSpan(), makeSpan()];
+      const { post } = scriptedPost([OK, OK, OK]);
+      const adapter = new OtlpHttpRunTelemetryAdapter({ post, route: 'collector', resource: RESOURCE, maxBatchSpans });
+      const result = await adapter.send(spans, null);
+      expect(result.errorKind).toBeNull();
+      expect(result.dispositions.map((d) => spanDispositionText(d.disposition))).toEqual([
+        'exported@collector',
+        'exported@collector',
+      ]);
+    }
+  });
+
+  it('a batch size above 512 is clamped to 512, so a batch never exceeds the plan bound', async () => {
+    const spans = Array.from({ length: 513 }, () => makeSpan());
+    const { post, calls } = scriptedPost([OK, OK]);
+    const adapter = new OtlpHttpRunTelemetryAdapter({ post, route: 'collector', resource: RESOURCE, maxBatchSpans: 100_000 });
+    const result = await adapter.send(spans, null);
+    expect(result.errorKind).toBeNull();
+    expect(calls).toHaveLength(2);
+    expect(payloadSpanIds(calls[0])).toHaveLength(512);
+    expect(payloadSpanIds(calls[1])).toHaveLength(1);
+  });
+});

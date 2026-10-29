@@ -45,7 +45,7 @@ export interface RenderPrBodyInput {
 }
 
 /** The PR body refusals: the D7 note refusal, the secret-shape refusal, the size refusal. */
-export type RenderPrBodyRefusalReason = 'missing-pr-notes' | 'secret-shaped' | 'too-long';
+export type RenderPrBodyRefusalReason = 'missing-pr-notes' | 'secret-shaped' | 'too-long' | 'invalid-review';
 
 export type RenderPrBodyResult =
   | { readonly ok: true; readonly title: string; readonly body: string }
@@ -55,12 +55,30 @@ export type RenderPrBodyResult =
 export const LANE_RUN_PR_BODY_MAX_CHARS = 60_000 as const;
 
 const FINDING_COUNT_LABELS = ['blocker', 'major', 'minor', 'nit'] as const;
+const REVIEW_KINDS: readonly string[] = ['brief-check', 'code-review', 'pre-merge'];
+const REVIEW_VERDICTS: readonly string[] = ['passed', 'failed', 'no-receipt', 'unknown'];
+
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Every value interpolated into a proof line is allow-listed or a non-negative integer; nothing else reaches the body. */
+function isRenderableReview(review: LaneRunPrBodyReview): boolean {
+  return (
+    REVIEW_KINDS.includes(review.kind) &&
+    REVIEW_VERDICTS.includes(review.verdict) &&
+    isCount(review.round) &&
+    typeof review.findingCounts === 'object' &&
+    review.findingCounts !== null &&
+    FINDING_COUNT_LABELS.every((label) => isCount(review.findingCounts[label]))
+  );
+}
 
 function findingCountsLine(counts: LaneRunPrBodyReview['findingCounts']): string {
   const parts: string[] = [];
   for (const label of FINDING_COUNT_LABELS) {
     const value = counts[label];
-    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    if (value > 0) {
       parts.push(`${label} ${value}`);
     }
   }
@@ -75,6 +93,10 @@ export function renderPrBody(input: RenderPrBodyInput): RenderPrBodyResult {
   // D7: the brief package's frozen sections are mandatory; an empty one refuses.
   if (hardToUndo.trim().length === 0 || assumptions.trim().length === 0 || challengeThis.trim().length === 0) {
     return { ok: false, reason: 'missing-pr-notes' };
+  }
+
+  if (!isCount(input.rounds) || !input.reviews.every(isRenderableReview)) {
+    return { ok: false, reason: 'invalid-review' };
   }
 
   // Every string the caller declares is checked for secret shape (§5: records only).

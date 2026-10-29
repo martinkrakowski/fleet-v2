@@ -112,7 +112,8 @@ describe('renderPrBody', () => {
   });
 
   it('refuses with secret-shaped when any declared input carries a secret shape', () => {
-    const secret = 'sk-live-0123456789abcdef0123456789abcdef';
+    // Built from parts so the repository's own secret scan does not flag the fixture.
+    const secret = ['sk', 'live', '0123456789abcdef0123456789abcdef'].join('-');
     expect(renderPrBody({ ...baseInput(), title: `Fix ${secret}` }))
       .toEqual({ ok: false, reason: 'secret-shaped' });
     expect(renderPrBody({ ...baseInput(), frozen: { hardToUndo: secret, assumptions: 'a', challengeThis: 'c' } }))
@@ -120,6 +121,24 @@ describe('renderPrBody', () => {
     const reviews = [{ ...baseInput().reviews[0]!, reviewerModel: secret }];
     expect(renderPrBody({ ...baseInput(), reviews }))
       .toEqual({ ok: false, reason: 'secret-shaped' });
+  });
+
+  it.each([
+    ['a secret-shaped kind', { kind: ['sk', 'live', '0123456789abcdef0123456789abcdef'].join('-') }],
+    ['an unknown verdict', { verdict: 'approved-by-me' }],
+    ['a negative count', { findingCounts: { blocker: -1, major: 0, minor: 0, nit: 0 } }],
+    ['a non-numeric count', { findingCounts: { blocker: 0, major: Number.NaN, minor: 0, nit: 0 } }],
+    ['a missing count', { findingCounts: { blocker: 0, major: 0, minor: 0 } }],
+    ['a fractional round', { round: 1.5 }],
+  ])('refuses with invalid-review for %s, never rendering it', (_label, patch) => {
+    const reviews = [{ ...baseInput().reviews[0]!, ...patch }] as unknown as RenderPrBodyInput['reviews'];
+    expect(renderPrBody({ ...baseInput(), reviews })).toEqual({ ok: false, reason: 'invalid-review' });
+  });
+
+  it('reports no findings only when every count is zero', () => {
+    const reviews = [{ ...baseInput().reviews[0]!, findingCounts: { blocker: 0, major: 0, minor: 0, nit: 0 } }];
+    const result = renderPrBody({ ...baseInput(), reviews });
+    expect(result.ok && result.body).toContain('(no findings)');
   });
 
   it('refuses with too-long when the body exceeds the size cap', () => {

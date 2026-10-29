@@ -1,4 +1,4 @@
-import { defineEventHandler, getRouterParam, setResponseStatus } from "h3";
+import { defineEventHandler, setResponseStatus } from "h3";
 import { getOperatorComposition } from "../../../../wiring/operator/composition.js";
 import {
   errorEnvelope,
@@ -6,9 +6,10 @@ import {
   refusedEnvelope,
   successEnvelope,
 } from "../../../../wiring/operator/errors.js";
-import { readObjectBody } from "../../../../wiring/http-input";
+import { readObjectBody, routeParam } from "../../../../wiring/http-input";
 
 export default defineEventHandler(async (event) => {
+  const questionId = routeParam(event, "id");
   const operationId = newOperationId();
   try {
     const body = await readObjectBody(event);
@@ -20,7 +21,7 @@ export default defineEventHandler(async (event) => {
     delete body.sessionId;
     const result = await getOperatorComposition().answerOwnerQuestion.execute({
       ...body,
-      questionId: getRouterParam(event, "id") ?? "",
+      questionId,
       answeredVia: "cli",
     });
     if (result.outcome === "refused") {

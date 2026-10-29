@@ -226,13 +226,22 @@ describe('PrepareBriefPackageUseCase path validation', () => {
   });
 });
 
-function makeCapturingArtifactPort(): { port: AttemptArtifactPort; placedManifestJsons: string[] } {
+function makeCapturingArtifactPort(): {
+  port: AttemptArtifactPort;
+  placedManifestJsons: string[];
+  placedRequests: Parameters<AttemptArtifactPort['placeFrozenBrief']>[0][];
+  verifyIgnoredPathsRequests: Parameters<AttemptArtifactPort['verifyIgnoredPaths']>[0][];
+} {
   const placedManifestJsons: string[] = [];
+  const placedRequests: Parameters<AttemptArtifactPort['placeFrozenBrief']>[0][] = [];
+  const verifyIgnoredPathsRequests: Parameters<AttemptArtifactPort['verifyIgnoredPaths']>[0][] = [];
   const port: AttemptArtifactPort = {
     async verifyIgnoredPaths(request) {
+      verifyIgnoredPathsRequests.push(request);
       return { outcome: 'ignored', checkedPaths: request.candidatePaths };
     },
     async placeFrozenBrief(request) {
+      placedRequests.push(request);
       placedManifestJsons.push(request.manifestJson);
       return {
         outcome: 'placed',
@@ -252,7 +261,7 @@ function makeCapturingArtifactPort(): { port: AttemptArtifactPort; placedManifes
       };
     },
   };
-  return { port, placedManifestJsons };
+  return { port, placedManifestJsons, placedRequests, verifyIgnoredPathsRequests };
 }
 
 describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
@@ -308,6 +317,41 @@ describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
     });
   });
 
+  it('forwards the recorded host to ignored-path verification and the frozen brief placement (KF-8)', async () => {
+    const captured = makeCapturingArtifactPort();
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring(),
+      artifactPort: captured.port,
+    });
+    const recordedHost = {
+      kind: 'opencode' as const,
+      hostName: 'lane-ssh',
+      remotePort: 41002,
+      host: 'lane-ssh',
+      agent: null,
+      model: null,
+      variant: null,
+    };
+    const result = await useCase.prepareBriefPackage(validRequest({ recordedHost }));
+    expect(result.outcome).toBe('prepared');
+    expect(captured.verifyIgnoredPathsRequests).toHaveLength(1);
+    expect(captured.verifyIgnoredPathsRequests[0].recordedHost).toEqual(recordedHost);
+    expect(captured.placedRequests).toHaveLength(1);
+    expect(captured.placedRequests[0].recordedHost).toEqual(recordedHost);
+
+    // A request without a recorded host verifies and places without one (manual prepare).
+    const manual = makeCapturingArtifactPort();
+    const manualUseCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring(),
+      artifactPort: manual.port,
+    });
+    await manualUseCase.prepareBriefPackage(validRequest());
+    expect(manual.verifyIgnoredPathsRequests).toHaveLength(1);
+    expect(manual.verifyIgnoredPathsRequests[0].recordedHost).toBeUndefined();
+    expect(manual.placedRequests).toHaveLength(1);
+    expect(manual.placedRequests[0].recordedHost).toBeUndefined();
+  });
+
   it('covers the acceptance spec in the brief digest', async () => {
     const useCase = makeUseCase();
     const first = await useCase.prepareBriefPackage(validRequest());
@@ -353,5 +397,153 @@ describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
     await useCase.prepareBriefPackage(validRequest({ allowedPathPrefixes: [] }));
 
     expect(authorBrief).not.toHaveBeenCalled();
+  });
+});
+
+function makeProseCapturingArtifactPort(): { port: AttemptArtifactPort; placedProseMarkdowns: string[] } {
+  const placedProseMarkdowns: string[] = [];
+  const port: AttemptArtifactPort = {
+    async verifyIgnoredPaths(request) {
+      return { outcome: 'ignored', checkedPaths: request.candidatePaths };
+    },
+    async placeFrozenBrief(request) {
+      placedProseMarkdowns.push(request.proseMarkdown);
+      return {
+        outcome: 'placed',
+        prosePath: '.lane/brief.md',
+        manifestPath: '.lane/brief-manifest.json',
+      };
+    },
+    async collectCompletedAttemptArtifacts() {
+      return {
+        outcome: 'collected',
+        artifacts: {
+          headCommit: 'head456',
+          commitsSinceBase: ['commit-1'],
+          collectedArtifactPaths: ['dist/report.json'],
+          notes: 'present',
+        },
+      };
+    },
+  };
+  return { port, placedProseMarkdowns };
+}
+
+describe('PrepareBriefPackageUseCase proseMarkdown (KF-6)', () => {
+  it('skips authoring and places the supplied prose when proseMarkdown is present', async () => {
+    const authorBrief = vi.fn(async () => {
+      return {
+        outcome: 'authored' as const,
+        brief: {
+          proseMarkdown: '# Frozen brief prose',
+          provenance: 'orchestrator' as const,
+        },
+      };
+    });
+    const captured = makeProseCapturingArtifactPort();
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: { authorBrief },
+      artifactPort: captured.port,
+      worktreePath: '/wt',
+    });
+
+    const prose = '# Fix round 1 handover';
+    const result = await useCase.prepareBriefPackage(validRequest({ proseMarkdown: prose }));
+    expect(result.outcome).toBe('prepared');
+    if (result.outcome === 'prepared') {
+      expect(result.prepared.prosePath).toBe('.lane/brief.md');
+    }
+    expect(captured.placedProseMarkdowns).toEqual([prose]);
+    expect(authorBrief).not.toHaveBeenCalled();
+  });
+
+  it('covers the supplied prose in the brief digest', async () => {
+    const useCase = makeUseCase();
+    const first = await useCase.prepareBriefPackage(validRequest({ proseMarkdown: '# Fix round 1' }));
+    const second = await useCase.prepareBriefPackage(validRequest({ proseMarkdown: '# Fix round 2' }));
+
+    expect(first.outcome).toBe('prepared');
+    expect(second.outcome).toBe('prepared');
+    if (first.outcome === 'prepared' && second.outcome === 'prepared') {
+      expect(first.prepared.briefDigest).not.toBe(second.prepared.briefDigest);
+    }
+  });
+
+  it('rejects an empty proseMarkdown', async () => {
+    const useCase = makeUseCase();
+
+    for (const proseMarkdown of ['', '   ', 0, null, true]) {
+      const result = await useCase.prepareBriefPackage(
+        validRequest({ proseMarkdown: proseMarkdown as unknown as string }),
+      );
+      expect(result).toEqual({ outcome: 'rejected', reason: 'proseMarkdown must be a non-empty string' });
+    }
+  });
+
+  it('rejects a secret-shaped proseMarkdown', async () => {
+    const useCase = makeUseCase();
+    const result = await useCase.prepareBriefPackage(
+      validRequest({ proseMarkdown: 'ghp_' + 'A'.repeat(20) }),
+    );
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'proseMarkdown contains a secret-shaped value and was refused',
+    });
+  });
+
+  it('rejects a proseMarkdown over 64 KiB', async () => {
+    const useCase = makeUseCase();
+    const result = await useCase.prepareBriefPackage(
+      validRequest({ proseMarkdown: 'x'.repeat(64 * 1024 + 1) }),
+    );
+    expect(result).toEqual({ outcome: 'rejected', reason: 'proseMarkdown must be at most 64 KiB' });
+  });
+});
+
+describe('PrepareBriefPackageUseCase runner agent (KF-7)', () => {
+  const agentSeatPlan = {
+    version: 1 as const,
+    'first-pass': [{ id: 'fp-1', model: 'implementer-model', tool: 'opencode', agent: 'lane' }],
+    fix: [{ id: 'fx-1', model: 'implementer-model', tool: 'opencode' }],
+    review: [],
+  };
+
+  it('accepts and freezes an assignment whose agent matches its first-pass seat', async () => {
+    const captured = makeCapturingArtifactPort();
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring(),
+      artifactPort: captured.port,
+    });
+
+    const result = await useCase.prepareBriefPackage(
+      validRequest({
+        seatPlan: agentSeatPlan,
+        modelAssignment: {
+          ...validRequest().modelAssignment,
+          agent: 'lane',
+        },
+      }),
+    );
+    expect(result.outcome).toBe('prepared');
+    expect(captured.placedManifestJsons).toHaveLength(1);
+    const manifest = JSON.parse(captured.placedManifestJsons[0]) as { modelAssignment?: unknown };
+    expect(manifest.modelAssignment).toMatchObject({ agent: 'lane' });
+  });
+
+  it('rejects an invalid model assignment agent', async () => {
+    const useCase = makeUseCase();
+
+    for (const agent of ['', '   ', 'a'.repeat(65), 'lane-glm!', '-lane', 5]) {
+      const result = await useCase.prepareBriefPackage(
+        validRequest({
+          modelAssignment: { ...validRequest().modelAssignment, agent: agent as unknown as string },
+        }),
+      );
+      expect(result).toEqual({
+        outcome: 'rejected',
+        reason:
+          'Model assignment agent must be a non-empty string of at most 64 characters matching [A-Za-z0-9][A-Za-z0-9._-]*',
+      });
+    }
   });
 });

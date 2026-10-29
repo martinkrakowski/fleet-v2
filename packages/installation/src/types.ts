@@ -328,6 +328,28 @@ export interface ResolvedConductorPolicy {
   readonly reaper: ResolvedConductorReaperPolicy;
 }
 
+/** A seat role whose starting seat may rotate across a project's lanes (MCP tooling plan §3.5.2, D4). */
+export type SeatRotationRole = 'first-pass' | 'fix' | 'review' | 'pre-merge';
+
+/**
+ * The v2 `policy.seats` section as written (MCP tooling plan §3.5.2). Every field is optional. `rotate` lists
+ * the roles whose starting seat rotates across lanes (absent or empty: fixed order); `cooldownMinutes` is how
+ * long a model refused in one lane is skipped by every lane (D5; 0 turns it off); `observationCooldownMinutes`
+ * is the same for seat observations, off unless above 0 (D7). Nothing here is written into a seat's `health`.
+ */
+export interface SeatsPolicy {
+  readonly rotate?: readonly SeatRotationRole[];
+  readonly cooldownMinutes?: number;
+  readonly observationCooldownMinutes?: number;
+}
+
+/** The effective seat policy: every field present (`resolveSeatsPolicy`). */
+export interface ResolvedSeatsPolicy {
+  readonly rotate: readonly SeatRotationRole[];
+  readonly cooldownMinutes: number;
+  readonly observationCooldownMinutes: number;
+}
+
 /**
  * The v2 `policy` section: shape only. The rules are enforced by the loader
  * itself through `validateSeatPolicy` (lane O5) on every v2 file.
@@ -345,6 +367,8 @@ export interface PolicySection {
   readonly conductor?: ConductorPolicy;
   /** Absent means off (`DEFAULT_TELEMETRY_POLICY`); read it through `resolveTelemetryPolicy`. */
   readonly telemetry?: TelemetryPolicy;
+  /** Absent means no rotation, 60-minute cooling, observations off (`DEFAULT_SEATS_POLICY`); read it through `resolveSeatsPolicy`. */
+  readonly seats?: SeatsPolicy;
 }
 
 /** The v2 `shelf` section with the local provider (D1, default). */

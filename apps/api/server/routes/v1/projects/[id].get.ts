@@ -1,4 +1,5 @@
-import { defineEventHandler, getRouterParam, setResponseStatus } from "h3";
+import { defineEventHandler, setResponseStatus } from "h3";
+import { routeParam } from "../../../wiring/http-input";
 import { getOperatorComposition } from "../../../wiring/operator/composition.js";
 import {
   errorEnvelope,
@@ -9,10 +10,11 @@ import {
 } from "../../../wiring/operator/errors.js";
 
 export default defineEventHandler(async (event) => {
+  const projectId = routeParam(event, "id");
   const operationId = newOperationId();
   try {
     const result = await getOperatorComposition().inspectProjectProfile.execute({
-      projectId: getRouterParam(event, "id") ?? "",
+      projectId,
     });
     if (result.outcome === "not-found") {
       const failure = notFoundEnvelope(operationId);

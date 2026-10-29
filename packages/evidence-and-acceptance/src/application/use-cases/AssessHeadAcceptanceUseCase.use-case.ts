@@ -21,7 +21,7 @@ import {
 } from '../../domain/acceptance-blockers.js';
 import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain/evidence-records.js';
 import type { ReviewTally } from '../../domain/review-selection.js';
-import { latestReceiptPerReviewer, tallyReviews } from '../../domain/review-selection.js';
+import { latestReceiptPerReviewer, satisfiesReviewPassGate, tallyReviews } from '../../domain/review-selection.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
@@ -163,7 +163,9 @@ function selectReviewEvidence(assessment: EvidenceAssessmentRecord): {
  * Among the independent read-only receipts, the latest per reviewer model
  * decides — recording order wins, never `completedAtIso` — and any of those
  * that says `fail` blocks acceptance even when another reviewer passed.
- * Agreement between reviewers never strengthens a result.
+ * Only receipts whose kind is absent or `code-review` satisfy the passing
+ * gate; a receipt of another kind never passes on its own. Agreement between
+ * reviewers never strengthens a result.
  */
 function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly AcceptanceBlocker[] {
   const selection = selectReviewEvidence(assessment);
@@ -183,7 +185,7 @@ function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly A
       );
     }
   }
-  const passing = selection.latest.some((receipt) => receipt.result === 'pass');
+  const passing = selection.latest.some(satisfiesReviewPassGate);
   if (!passing && blockers.length === 0) {
     return [acceptanceBlocker('review-missing', 'no read-only independent review passed for this candidate head')];
   }
@@ -347,6 +349,21 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       const status = await deps.forgeEvidence.readForgeCheckStatus({
         candidateHeadSha: assessment.candidateHeadSha,
       });
+      const headConfirmed =
+        status.candidateHeadSha === assessment.candidateHeadSha && status.observedHeadSha === assessment.candidateHeadSha;
+      if (!headConfirmed) {
+        // The forge CI state may belong to another head (or the forge could not
+        // re-read the head after reading CI state). This blocker is never
+        // `ci-pending`, so the list is never read as CI pending only.
+        blockers.push(
+          acceptanceBlocker(
+            'other',
+            status.observedHeadSha === null
+              ? 'forge could not confirm the pull request head after reading CI state'
+              : 'forge pull request head moved while CI state was read',
+          ),
+        );
+      }
       if (!PASSING_RESULTS.includes(status.ciState)) {
         blockers.push(
           acceptanceBlocker(

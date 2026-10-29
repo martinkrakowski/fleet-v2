@@ -781,15 +781,25 @@ async function restoreRecordListStore(
   );
 }
 
-/** Build the descriptor of one record-list store from the parser its reader uses. */
+/** Build the descriptor of one record-list store from the parser its reader uses.
+ * `validateList`, when given, runs once over the parsed records after every
+ * record parsed; a returned string marks the whole file unreadable with that
+ * detail, exactly as the store's own reader would refuse it. */
 export function describeRecordListStore<T>(
   basename: string,
   parseRecord: (raw: unknown) => T | undefined,
+  validateList?: (records: readonly T[]) => string | undefined,
 ): StateFileDescriptor {
   const pattern = quarantineCopyPattern(basename);
   const inspect = (bytes: Buffer): StateFileInspection => {
     const result = inspectRecordListBytes(bytes, parseRecord);
-    return result.status === 'ok' ? { status: 'ok', recordCount: result.records.length } : result;
+    if (result.status !== 'ok') {
+      return result;
+    }
+    const listError = validateList === undefined ? undefined : validateList(result.records);
+    return listError === undefined
+      ? { status: 'ok', recordCount: result.records.length }
+      : { status: 'unreadable', detail: listError, recordIndex: null };
   };
   return {
     basename,

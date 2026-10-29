@@ -11,12 +11,14 @@ import type { OwnerItemRecord } from '../../domain/owner-item-records.js';
 import type { OwnerQuestionRecord } from '../../domain/owner-question-records.js';
 import type { OrchestratorSessionRecord } from '../../domain/orchestrator-session-records.js';
 import { OwnerItem } from '../../domain/entities/OwnerItem.js';
+import { AttentionItem } from '../../domain/entities/AttentionItem.js';
 import {
   StateFileUnreadableError,
   type StateFileDescriptor,
   type StateFileInspection,
 } from './file-store.js';
 import { CoordinationRequestRepositoryAdapter } from './CoordinationRequestRepositoryAdapter.adapter.js';
+import { AttentionItemRepositoryAdapter } from './AttentionItemRepositoryAdapter.adapter.js';
 import { OwnerItemRepositoryAdapter } from './OwnerItemRepositoryAdapter.adapter.js';
 import { OrchestratorSessionRepositoryAdapter } from './OrchestratorSessionRepositoryAdapter.adapter.js';
 import { OwnerQuestionRepositoryAdapter } from './OwnerQuestionRepositoryAdapter.adapter.js';
@@ -112,6 +114,31 @@ function sessionRecord(overrides: Partial<OrchestratorSessionRecord> = {}): Orch
 
 const NOW = '2026-10-27T10:00:00.000Z';
 
+/** AttentionItem.raise returns a result; a genuine failure is a test bug. */
+function raisedItem(overrides: {
+  itemId?: string;
+  kind?: string;
+  subject?: { kind: 'work-order'; ref: string };
+  workOrderId?: string | null;
+}): unknown {
+  const raised = AttentionItem.raise(
+    {
+      itemId: overrides.itemId ?? 'att-example-1',
+      projectId: 'example-project',
+      kind: overrides.kind ?? 'needs-owner',
+      subject: overrides.subject ?? { kind: 'work-order', ref: 'wo-example-1' },
+      workOrderId: overrides.workOrderId === undefined ? 'wo-example-1' : overrides.workOrderId,
+      summary: 'example notice',
+      raisedBy: 'example-orchestrator',
+    },
+    NOW,
+  );
+  if (!raised.success) {
+    throw new Error(raised.error.message);
+  }
+  return raised.value.toRecord();
+}
+
 /** OwnerItem.open returns a result; a genuine failure is a test bug. */
 function openedItem(overrides: Partial<OwnerItemRecord> = {}): OwnerItemRecord {
   const opened = OwnerItem.open(
@@ -150,6 +177,17 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
       }),
     },
   ],
+  'attention-items.json': [
+    { revision: 1, item: raisedItem({ itemId: 'att-example-1' }) },
+    {
+      revision: 1,
+      item: raisedItem({
+        itemId: 'att-example-2',
+        subject: { kind: 'work-order', ref: 'wo-example-2' },
+        workOrderId: 'wo-example-2',
+      }),
+    },
+  ],
 };
 
 const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
@@ -160,6 +198,7 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
   'owner-questions.json': (stateDir) => new OwnerQuestionRepositoryAdapter({ stateDir }).list(),
   'orchestrators.json': (stateDir) => new OrchestratorSessionRepositoryAdapter({ stateDir }).list(),
   'owner-items.json': (stateDir) => new OwnerItemRepositoryAdapter({ stateDir }).list(),
+  'attention-items.json': (stateDir) => new AttentionItemRepositoryAdapter({ stateDir }).list(),
 };
 
 type FixtureKind = 'valid' | 'not-json' | 'not-list' | 'bad-record';
@@ -232,6 +271,38 @@ describe('operator-coordination state file descriptors match the store readers',
       'owner-questions.json',
       'orchestrators.json',
       'owner-items.json',
+      'attention-items.json',
     ]);
+  });
+
+  it('treats a file with two items under one key as unreadable with the one-key detail', async () => {
+    const sameKeyTwice = Buffer.from(
+      JSON.stringify([
+        VALID_FIXTURES['attention-items.json']![0],
+        {
+          revision: 1,
+          item: raisedItem({ itemId: 'att-example-2' }),
+        },
+      ]),
+    );
+    const descriptor = OPERATOR_COORDINATION_STATE_FILES.find(
+      (entry: StateFileDescriptor) => entry.basename === 'attention-items.json',
+    );
+    expect(descriptor).toBeDefined();
+    const inspection = descriptor!.inspect(sameKeyTwice);
+    expect(inspection).toEqual({
+      status: 'unreadable',
+      detail: 'two attention items share one key or id',
+      recordIndex: null,
+    });
+    await fs.writeFile(path.join(tempDir, 'attention-items.json'), sameKeyTwice);
+    const outcome = await new AttentionItemRepositoryAdapter({ stateDir: tempDir })
+      .list()
+      .then(
+        () => 'resolved',
+        (error: unknown) => error,
+      );
+    expect(outcome).toBeInstanceOf(StateFileUnreadableError);
+    expect((outcome as StateFileUnreadableError).detail).toBe('two attention items share one key or id');
   });
 });

@@ -4,6 +4,11 @@
  * moment the question is asked comes from the injected clock, never from the
  * request. A one-way question must reference an existing coordination request
  * of kind action-decision or policy-proposal; anything else is refused.
+ *
+ * With an idempotencyKey the ask is find-or-create: a stored question holding
+ * the key and asking the same thing is returned unchanged as `exists`
+ * (whatever its state), a different ask under that key is refused, and no key
+ * is ever asked twice. Without a key the ask behaves exactly as before.
  */
 
 import type {
@@ -34,10 +39,13 @@ export interface AskOwnerQuestionRequest {
   readonly linkedRequestId?: string | null;
   readonly blocks?: readonly OwnerQuestionBlockRecord[];
   readonly expiresAt?: string | null;
+  /** The caller's idempotency key; a repeat with the same key and the same ask returns the stored question as `exists`. */
+  readonly idempotencyKey?: string;
 }
 
 export type AskOwnerQuestionResult =
   | { readonly outcome: 'asked'; readonly question: OwnerQuestionRecord }
+  | { readonly outcome: 'exists'; readonly question: OwnerQuestionRecord }
   | { readonly outcome: 'refused'; readonly reason: string };
 
 export interface AskOwnerQuestionPort {

@@ -34,6 +34,7 @@ const OPTION_ID_MAX_CHARS = 64;
 const OPTION_TEXT_MAX_CHARS = 1024;
 const ANSWER_TEXT_MAX_CHARS = 4096;
 const RECORD_JSON_MAX_CHARS = 32768;
+const IDEMPOTENCY_KEY_PATTERN = /^[\x21-\x7e]{1,256}$/;
 
 /** States each state may move to; nothing else is allowed. */
 const ALLOWED_TRANSITIONS: Readonly<Record<OwnerQuestionState, readonly OwnerQuestionState[]>> = {
@@ -108,6 +109,7 @@ export class OwnerQuestion {
     const state = readState(input);
     const answer = OwnerQuestion.readAnswer(input.answer, state, recommendation, options, input.revision);
     const acknowledgement = OwnerQuestion.readAcknowledgement(input.acknowledgement, state, answer);
+    const idempotencyKey = readIdempotencyKey(input);
     const record: OwnerQuestionRecord = {
       questionId,
       revision: input.revision,
@@ -124,6 +126,7 @@ export class OwnerQuestion {
       expiresAt,
       answer,
       acknowledgement,
+      ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
     };
     const jsonChars = JSON.stringify(record).length;
     if (jsonChars > RECORD_JSON_MAX_CHARS) {
@@ -410,6 +413,26 @@ function readExpiresAt(input: OwnerQuestionRecordInput): string | null {
   return normaliseTimestamp('expiresAt', value);
 }
 
+/**
+ * Validate the caller's idempotency key: absent when the ask named none;
+ * otherwise a printable-ASCII slug of 1 to 256 characters that carries no
+ * secret shape. The error never echoes the value.
+ */
+function readIdempotencyKey(input: OwnerQuestionRecordInput): string | undefined {
+  const value = input.idempotencyKey;
+  if (value === undefined) {
+    return undefined;
+  }
+  if (
+    typeof value !== 'string' ||
+    !IDEMPOTENCY_KEY_PATTERN.test(value) ||
+    containsSecretShape(value)
+  ) {
+    throw new Error('OwnerQuestion idempotencyKey must be 1 to 256 printable ASCII characters without spaces');
+  }
+  return value;
+}
+
 function readDoorKind(input: OwnerQuestionRecordInput): OwnerQuestionRecord['doorKind'] {
   const value = input.doorKind ?? 'one-way';
   if (!DOOR_KINDS.includes(value)) {
@@ -441,4 +464,39 @@ function readState(input: OwnerQuestionRecordInput): OwnerQuestionState {
     throw new Error(`OwnerQuestion state is not one of ${STATES.join(', ')}`);
   }
   return value;
+}
+
+type AskProjection = Pick<
+  OwnerQuestionRecord,
+  | 'askedBy'
+  | 'title'
+  | 'body'
+  | 'options'
+  | 'recommendation'
+  | 'doorKind'
+  | 'linkedRequestId'
+  | 'blocks'
+  | 'expiresAt'
+>;
+
+/** A fixed-order projection so a JSON comparison is order-stable. */
+function askProjection(record: OwnerQuestionRecord): AskProjection {
+  return {
+    askedBy: record.askedBy,
+    title: record.title,
+    body: record.body,
+    options: record.options,
+    recommendation: record.recommendation,
+    doorKind: record.doorKind,
+    linkedRequestId: record.linkedRequestId,
+    blocks: record.blocks,
+    expiresAt: record.expiresAt,
+  };
+}
+
+/**
+ * True when two records ask the same thing: askedBy, title, body, options, recommendation, doorKind, linkedRequestId, blocks and expiresAt all equal. Ids, revision, times, state, answer, acknowledgement and the key itself are not compared.
+ */
+export function sameOwnerQuestionAsk(left: OwnerQuestionRecord, right: OwnerQuestionRecord): boolean {
+  return JSON.stringify(askProjection(left)) === JSON.stringify(askProjection(right));
 }

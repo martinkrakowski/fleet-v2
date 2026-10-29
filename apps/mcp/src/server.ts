@@ -25,8 +25,12 @@ export async function startServer(): Promise<void> {
   for (const tool of registry.tools) {
     server.registerTool(
       tool.name,
-      { description: tool.description, inputSchema: tool.inputSchema },
-      async () => tool.handler(),
+      {
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+        annotations: tool.annotations,
+      },
+      async (args: unknown) => tool.handler(args),
     );
   }
   for (const resource of registry.resources) {

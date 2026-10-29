@@ -339,7 +339,7 @@ bounded_contexts:
     depends_on: [evidence-and-acceptance, brief-knowledge, operator-coordination]
     layers:
       domain:
-        entities: [WorkOrder, Attempt, ActionJournalEntry, CapacityReservation, LaneRun]
+        entities: [WorkOrder, Attempt, ActionJournalEntry, CapacityReservation, LaneRun, LanePlan, PlannedLane, PullRequestLink]
         value_objects: [WorkOrderState, AttemptState, AttemptOutcome, ModelAssignment, BriefPackage, AcceptanceSpec, RunnerObservation, ExecutionLimits, StopReason, SeatPlan, LaneRunState]
       application:
         use_cases:
@@ -352,6 +352,7 @@ bounded_contexts:
           - RequestAttemptAcceptanceUseCase
           - PrepareFixAttemptUseCase
           - ExecuteAuthorizedForgeActionUseCase
+          - AutoMergeAttemptUseCase
           - StopAttemptUseCase
           - InspectWorkOrderUseCase
           - InspectAttemptUseCase
@@ -370,6 +371,7 @@ bounded_contexts:
             - RequestAttemptAcceptancePort
             - PrepareFixAttemptPort
             - ExecuteAuthorizedForgeActionPort
+            - AutoMergeAttemptPort
             - StopAttemptPort
             - InspectWorkOrderPort
             - InspectAttemptPort
@@ -408,8 +410,16 @@ bounded_contexts:
             - ProjectProfileReadPort
             - ProjectProbeRecordPort
             - ChangeSignalPort
+            - ReviewRequestPort
+            - CiStatePort
+            - ReviewAssessmentPort
+            - AutoMergeSettingsPort
+            - PolicyMergeGrantPort
+            - AutoMergeOwnerRoutingPort
+            - ConductorForgeGrantPort
+            - LaneRunParkNoticePort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -445,6 +455,15 @@ bounded_contexts:
       ForgeReadPort: "Read one pull request's state by number or branch (open, merged or closed; head, base, merge time and merge commit) without mutating anything; a forge that cannot be read or a response that cannot be verified is unavailable, never a guess and never absence."
       AcceptanceAssessmentPort: "Consume the evidence context's exact-head assessment without importing its repositories or mutating its aggregates."
       AcceptanceEvidencePort: "Consume the evidence context's exact-head assessment to authorize merge actions."
+      ReviewRequestPort: "Request a read-only review of one kind (brief-check, code-review, pre-merge) at one exact head under the conductor's request id, and find the receipt recorded for a request id; a review that recorded nothing is no-receipt, a refusal before any review is refused, anything unestablished is unknown, and read the latest receipt of one kind at a head; reason codes only."
+      CiStatePort: "Read the CI state of one exact head (pending, passed, failed, unknown) with a reason code through the evidence context; unknown is never a pass."
+      ReviewAssessmentPort: "Open the evidence context's assessment for one attempt at one exact head before a conductor review; opened or existing is open, anything else is unavailable with a reason code."
+      AutoMergeAttemptPort: "Merge one accepted attempt at its collected head under policy.autoMerge, or route the exception by the auto-merge plan's fixed and configured rules; off reads nothing else and writes nothing; unknown is never eligible, and a named one-way door or a high-risk lane without the opt-in is never merged by policy."
+      AutoMergeSettingsPort: "Read a structural subset of the installation's policy.autoMerge, its revision and the forge mode on every call, so work-execution stays free of the installation package; unreadable is a value, never a default."
+      PolicyMergeGrantPort: "Issue one merge-pr policy grant authorised by policy:autoMerge at the current setting revision, bound to the work order, attempt, head and acceptance receipt, through operator coordination; it never decides eligibility."
+      AutoMergeOwnerRoutingPort: "Ask the owner a question or record an attention item for an auto-merge exception under a stable key, so a repeat run finds the first; a recorded notice grants nothing."
+      ConductorForgeGrantPort: "Issue one push-and-open-pr or push-to-pr policy grant for an accepted attempt at an exact head under policy:conductor@<revision>; it never decides eligibility and never issues a merge grant."
+      LaneRunParkNoticePort: "Raise one attention item per parked run and reason, and ask one keyed owner question where the owner must choose; ids and reason codes only; a repeat returns the existing notice."
       OwnerDecisionPort: "Re-check the attempt's frozen one-way doors through owner coordination before forge actions; an undecided, declined or unreadable decision blocks the action."
       AttemptOwnerDecisionPort: "Read the owner decision references the product froze into an attempt's brief package; an attempt recorded without them is unknown and blocks forge actions."
       BriefKnowledgePort: "Request bounded context proposals, record selected versions and forward only completed-attempt notes to the knowledge context."
@@ -496,6 +515,34 @@ bounded_contexts:
         implements: AcceptanceEvidencePort
         integration: in-process
         delegates_to: [evidence-and-acceptance/InspectAcceptanceEvidencePort]
+      - adapter: ReviewRequestAdapter
+        implements: ReviewRequestPort
+        integration: in-process
+        delegates_to: [evidence-and-acceptance/RequestIndependentReviewPort, evidence-and-acceptance/InspectAcceptanceEvidencePort]
+      - adapter: CiStateAdapter
+        implements: CiStatePort
+        integration: in-process
+        delegates_to: [evidence-and-acceptance/InspectHeadCiStatePort]
+      - adapter: ReviewAssessmentAdapter
+        implements: ReviewAssessmentPort
+        integration: in-process
+        delegates_to: [evidence-and-acceptance/OpenEvidenceAssessmentPort]
+      - adapter: PolicyMergeGrantAdapter
+        implements: PolicyMergeGrantPort
+        integration: in-process
+        delegates_to: [operator-coordination/IssuePolicyForgeGrantPort]
+      - adapter: AutoMergeOwnerRoutingAdapter
+        implements: AutoMergeOwnerRoutingPort
+        integration: in-process
+        delegates_to: [operator-coordination/AskOwnerQuestionPort, operator-coordination/RecordAttentionItemPort]
+      - adapter: ConductorForgeGrantAdapter
+        implements: ConductorForgeGrantPort
+        integration: in-process
+        delegates_to: [operator-coordination/IssuePolicyForgeGrantPort]
+      - adapter: LaneRunParkNoticeAdapter
+        implements: LaneRunParkNoticePort
+        integration: in-process
+        delegates_to: [operator-coordination/RecordAttentionItemPort, operator-coordination/AskOwnerQuestionPort, operator-coordination/FindOwnerQuestionByKeyPort]
       - adapter: OwnerDecisionAdapter
         implements: OwnerDecisionPort
         integration: in-process
@@ -518,13 +565,13 @@ bounded_contexts:
         delegates_to: [operator-coordination/PublishProjectObservationPort]
       - { adapter: NoopChangeSignalAdapter, implements: ChangeSignalPort, integration: in-process-noop }
     domain_specification:
-      aggregate_roots: [WorkOrder, Attempt, LaneRun]
-      child_ownership: { ActionJournalEntry: Attempt, CapacityReservation: Attempt }
+      aggregate_roots: [WorkOrder, Attempt, LaneRun, LanePlan, PullRequestLink]
+      child_ownership: { ActionJournalEntry: Attempt, CapacityReservation: Attempt, PlannedLane: LanePlan }
       enum_values:
         WorkOrderState: [approved, prepared, implementing, verifying, reviewing, fixing, ready-to-merge, merged, stopped]
         AttemptState: [intent-recorded, dispatching, running, reconciling, ended, collected, blocked, cancelled]
         AttemptOutcome: [done, partial, stopped, no-commit]
-        StopReason: [none, unknown, rate-limited, payment, timeout, model-missing, no-commit, gate-failed, length, step-cap, runner-refused]
+        StopReason: [none, unknown, rate-limited, payment, timeout, model-missing, no-commit, gate-failed, length, step-cap, runner-refused, no-route]
         LaneRunState: [ready, dispatching, running, seat-failed, collecting, gating, brief-check, code-review, fixing, accepting, awaiting-premerge, opening-pr, pushing, watching-ci, merging, merged, stopped, parked]
       invariants:
         - "Every fresh dispatch and fix round has a new attempt identity, independent of branch, role and model identity."
@@ -538,6 +585,8 @@ bounded_contexts:
         - "A lane run records only what cannot be derived (work order, tier, seat plan reference and cursors, round 0-2, attempt ids, PR number, park, lease, revision, run policy revision); its state is a projection of attempts, the keyed journal, receipts and forge evidence. Every external action of a run carries the idempotency key <runId>/r<round>/<step>/<seatIndex>[/a<n>][@<head12>][/retry<n>] (the attempt ordinal only on prepare and dispatch), and the control keys <runId>/stop@<via> (graceful), <runId>/stop-force@<via> (force), with via web or cli and the mode read from the key, <runId>/park/<n>/resume@web, request/<requestId> and reaper/<subjectId>/<kind>@<findingId> sit beside them."
         - "A run lease and the state directory's driver lease are taken by CAS on the fence the taker read, only when the lease is null or lapsed, and each taking raises the fence by one; renewing keeps the fence, releasing keeps holder and fence, and the fence never goes back. A lease change never moves the run's revision."
         - "The run journal is append-only and keyed: an intent is durable before its action runs and its key is unique, a result pairs with its intent, and only ambiguous results may precede a key's one final result. A run has at most one stop per mode; a force may follow a graceful stop, never the reverse."
+        - "A planned lane grants nothing and owns no path until registered: a lane plan is keyed (projectId, planId) and records each lane's status (planned, deferred or dropped; a dropped lane is kept, never deleted) and its former ids as aliases. A lane becomes a work order only through registration, which keeps the owned-path check; the work order's optional planRef names the plan lane, and its project is the work order's own."
+        - "A PR links to at most one lane: a pull request link is keyed (repository, number); the same link again is a no-op and a link to a different lane is refused (pr-already-linked)."
       lifecycle_requirements:
         - "Dispatch intent is durable before start; ambiguous results enter reconciliation rather than blind retries."
         - "Only a matching ended observation permits artifact collection and capacity release."
@@ -558,9 +607,9 @@ bounded_contexts:
         entities: [EvidenceAssessment, VerificationReceipt, ReviewReceipt, FindingDisposition]
         value_objects: [AssessmentState, EvidenceResult, FindingState, AcceptanceReceipt, EvidenceScope]
       application:
-        use_cases: [RequestVerificationUseCase, RequestIndependentReviewUseCase, RecordVerificationReceiptUseCase, RecordReviewReceiptUseCase, RecordFindingDispositionUseCase, AssessHeadAcceptanceUseCase, InspectAcceptanceEvidenceUseCase]
+        use_cases: [RequestVerificationUseCase, RequestIndependentReviewUseCase, RecordVerificationReceiptUseCase, RecordReviewReceiptUseCase, RecordFindingDispositionUseCase, AssessHeadAcceptanceUseCase, InspectAcceptanceEvidenceUseCase, InspectHeadCiStateUseCase, OpenEvidenceAssessmentUseCase]
         ports:
-          in: [RequestVerificationPort, RequestIndependentReviewPort, RecordVerificationReceiptPort, RecordReviewReceiptPort, RecordFindingDispositionPort, AssessHeadAcceptancePort, InspectAcceptanceEvidencePort]
+          in: [RequestVerificationPort, RequestIndependentReviewPort, RecordVerificationReceiptPort, RecordReviewReceiptPort, RecordFindingDispositionPort, AssessHeadAcceptancePort, InspectAcceptanceEvidencePort, InspectHeadCiStatePort, OpenEvidenceAssessmentPort]
           out: [EvidenceAssessmentRepositoryPort, EvidenceArchivePort, VerificationExecutorPort, ForgeEvidencePort, IndependentReviewPort, OwnerDecisionPort, AttemptOwnerDecisionPort, CommandExecutorPort, EvidenceSeatPolicyPort]
       infrastructure:
         adapters: [EvidenceAssessmentRepositoryAdapter, EvidenceArchiveAdapter, VerificationExecutorAdapter, ForgeEvidenceAdapter, IndependentReviewAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, LocalExecutor, SshExecutor, EvidenceSeatPolicyAdapter]
@@ -572,6 +621,8 @@ bounded_contexts:
       RecordFindingDispositionPort: "Record a fix or evidence-backed refutation of a specific finding while preserving unresolved findings."
       AssessHeadAcceptancePort: "Evaluate every required check and finding against the current head and policy; issue a scoped acceptance receipt or explicit blockers."
       InspectAcceptanceEvidencePort: "Return assessment revisions and receipt provenance, including stale, missing and unknown evidence."
+      InspectHeadCiStatePort: "Read the CI state of one exact head through the forge without mutating anything: pending, passed, failed or unknown with a reason code; an unbound forge, an invalid head, an unreadable forge, no checks or an answer for another head is unknown, never a pass."
+      OpenEvidenceAssessmentPort: "Open a pending assessment for one attempt at one exact head and policy, idempotently; an assessment at another head or in a terminal state is refused, never overwritten or marked stale."
       EvidenceAssessmentRepositoryPort: "Persist assessments and child receipts with revision-aware updates."
       EvidenceArchivePort: "Retain immutable verification and review artifacts addressed by identity and digest."
       VerificationExecutorPort: "Run allow-listed checks on the configured verification host and return completed command receipts."
@@ -692,9 +743,9 @@ bounded_contexts:
         entities: [ProjectProfile, CoordinationRequest, AuthorizationConsumption, RelayAcknowledgement, OwnerQuestion, OrchestratorSession, OrchestratorRequest, OwnerItem]
         value_objects: [CoordinationKind, CoordinationState, ActionAuthorization, PolicyReference, ObservationEnvelope, OwnerItemKind]
       application:
-        use_cases: [RegisterProjectProfileUseCase, UpdateProjectProfileUseCase, RetireProjectProfileUseCase, ListProjectProfilesUseCase, InspectProjectProfileUseCase, RecordProjectProbeUseCase, InspectConfiguredCapabilitiesUseCase, RequestScopedDecisionUseCase, ResolveActionAuthorizationUseCase, CheckOwnerDecisionUseCase, RecordAuthorizationConsumptionUseCase, PublishProjectObservationUseCase, ReadProjectAttentionUseCase, SendFleetRelayUseCase, RecordRelayAcknowledgementUseCase, InspectOutstandingCoordinationUseCase, AskOwnerQuestionUseCase, AnswerOwnerQuestionUseCase, ExpireOwnerQuestionsUseCase, AcknowledgeOwnerAnswerUseCase, ListOwnerQuestionsUseCase, ReadOwnerQuestionUseCase, SyncOneWayOwnerQuestionsUseCase, RegisterOrchestratorSessionUseCase, HeartbeatOrchestratorSessionUseCase, RetireOrchestratorSessionUseCase, ListOrchestratorSessionsUseCase, IssuePolicyForgeGrantUseCase, CancelPolicyGrantsUseCase, RecordOwnerItemUseCase, ListOwnerItemsUseCase]
+        use_cases: [RegisterProjectProfileUseCase, UpdateProjectProfileUseCase, RetireProjectProfileUseCase, ListProjectProfilesUseCase, InspectProjectProfileUseCase, RecordProjectProbeUseCase, InspectConfiguredCapabilitiesUseCase, RequestScopedDecisionUseCase, ResolveActionAuthorizationUseCase, CheckOwnerDecisionUseCase, RecordAuthorizationConsumptionUseCase, PublishProjectObservationUseCase, ReadProjectAttentionUseCase, SendFleetRelayUseCase, RecordRelayAcknowledgementUseCase, InspectOutstandingCoordinationUseCase, AskOwnerQuestionUseCase, AnswerOwnerQuestionUseCase, ExpireOwnerQuestionsUseCase, AcknowledgeOwnerAnswerUseCase, ListOwnerQuestionsUseCase, ReadOwnerQuestionUseCase, SyncOneWayOwnerQuestionsUseCase, RegisterOrchestratorSessionUseCase, HeartbeatOrchestratorSessionUseCase, RetireOrchestratorSessionUseCase, ListOrchestratorSessionsUseCase, IssuePolicyForgeGrantUseCase, CancelPolicyGrantsUseCase, RecordOwnerItemUseCase, ListOwnerItemsUseCase, ResolveOwnerItemUseCase, RecordAttentionItemUseCase, ClearAttentionItemUseCase, ListAttentionItemsUseCase]
         ports:
-          in: [RegisterProjectProfilePort, UpdateProjectProfilePort, RetireProjectProfilePort, ListProjectProfilesPort, InspectProjectProfilePort, RecordProjectProbePort, InspectConfiguredCapabilitiesPort, RequestScopedDecisionPort, ResolveActionAuthorizationPort, CheckOwnerDecisionPort, RecordAuthorizationConsumptionPort, PublishProjectObservationPort, ReadProjectAttentionPort, SendFleetRelayPort, RecordRelayAcknowledgementPort, InspectOutstandingCoordinationPort, AskOwnerQuestionPort, AnswerOwnerQuestionPort, ExpireOwnerQuestionsPort, AcknowledgeOwnerAnswerPort, ListOwnerQuestionsPort, ReadOwnerQuestionPort, SyncOneWayOwnerQuestionsPort, RegisterOrchestratorSessionPort, HeartbeatOrchestratorSessionPort, RetireOrchestratorSessionPort, ListOrchestratorSessionsPort, IssuePolicyForgeGrantPort, CancelPolicyGrantsPort, RecordOwnerItemPort, ListOwnerItemsPort]
+          in: [RegisterProjectProfilePort, UpdateProjectProfilePort, RetireProjectProfilePort, ListProjectProfilesPort, InspectProjectProfilePort, RecordProjectProbePort, InspectConfiguredCapabilitiesPort, RequestScopedDecisionPort, ResolveActionAuthorizationPort, CheckOwnerDecisionPort, RecordAuthorizationConsumptionPort, PublishProjectObservationPort, ReadProjectAttentionPort, SendFleetRelayPort, RecordRelayAcknowledgementPort, InspectOutstandingCoordinationPort, AskOwnerQuestionPort, AnswerOwnerQuestionPort, ExpireOwnerQuestionsPort, AcknowledgeOwnerAnswerPort, ListOwnerQuestionsPort, ReadOwnerQuestionPort, SyncOneWayOwnerQuestionsPort, RegisterOrchestratorSessionPort, HeartbeatOrchestratorSessionPort, RetireOrchestratorSessionPort, ListOrchestratorSessionsPort, IssuePolicyForgeGrantPort, CancelPolicyGrantsPort, RecordOwnerItemPort, ListOwnerItemsPort, ResolveOwnerItemPort, RecordAttentionItemPort, ClearAttentionItemPort, ListAttentionItemsPort]
           out: [ProjectProfileRepositoryPort, InstallationReferencePort, CoordinationRequestRepositoryPort, OwnerQuestionRepositoryPort, DecisionTransportPort, ObservationPublicationPort, AttentionReadPort, RelayTransportPort, OrchestratorSessionRepositoryPort, OwnerItemRepositoryPort, ChangeSignalPort]
       infrastructure:
         adapters: [ProjectProfileRepositoryAdapter, InstallationReferenceAdapter, CoordinationRequestRepositoryAdapter, OwnerQuestionRepositoryAdapter, DecisionTransportAdapter, ObservationPublicationAdapter, AttentionReadAdapter, RelayTransportAdapter, OrchestratorSessionRepositoryAdapter, OwnerItemRepositoryAdapter, NoopChangeSignalAdapter]
@@ -731,6 +782,10 @@ bounded_contexts:
       CancelPolicyGrantsPort: "Cancel every unconsumed policy grant of one setting issued under a revision other than the current one; consumed grants, owner grants and the other setting's grants are never written."
       RecordOwnerItemPort: "Record a new open owner item from a closed body with the injected clock and id source; createdBy comes from the caller's actor, never the body. An item already holding one of its natural keys with the same project and kind is returned unchanged; a key held by an item of another kind or project is refused. A recorded item grants nothing."
       ListOwnerItemsPort: "List owner items, optionally by project, state and kind, one entry per item id with gating derived from the record, without mutating state."
+      ResolveOwnerItemPort: "Apply one typed resolution to an owner item and save it at the revision read: a merge record or forge observation of its pull request (merge items; only a forge observation closes as pr-closed or reopens), the recorded answer read from the owner question store or the plan's decided or removed row (decision items), or the owner marking done or withdrawing with a typed reason (secret, backup and other items only). A repeated resolution writes nothing; a resolution grants nothing."
+      RecordAttentionItemPort: "Raise a machine attention notice from a closed body with the injected clock and id source; the raiser is the caller's actor, never the body. One item per project, subject and kind: a repeat refreshes the open item or reopens a cleared one. An attention item grants and blocks nothing."
+      ClearAttentionItemPort: "Clear attention items by one typed action: the owner dismisses one item at the revision read, the raiser resolves one by key as resolved or stale, or every open item of a merged work order is cleared; a cleared item is left unchanged."
+      ListAttentionItemsPort: "List attention items, optionally by project, state, kind and work order, one entry per item id, without mutating state."
       ProjectProfileRepositoryPort: "Persist private installation references and policy revisions with version-aware updates."
       CoordinationRequestRepositoryPort: "Persist scoped proposals, revisions, acknowledgements and authorization-consumption receipts."
       OwnerQuestionRepositoryPort: "Persist owner questions as a separate aggregate with revision-aware saves; never share the coordination requests store."

@@ -3,9 +3,10 @@ import { createError } from "h3";
 
 import { getEvidenceUseCases } from "../../../../wiring/evidence/composition.js";
 import { evidenceResponse } from "../../../../wiring/evidence/errors.js";
-import { readObjectBody } from "../../../../wiring/http-input";
+import { readObjectBody, routeParam } from "../../../../wiring/http-input";
 
 export default defineEventHandler(async (event) => {
+  const candidateHeadSha = routeParam(event, "sha");
   const body = await readObjectBody(event);
   // Owner decision references are read from the attempt record. A body that
   // names them is asking to be judged against its own list of doors.
@@ -18,6 +19,6 @@ export default defineEventHandler(async (event) => {
   }
   return evidenceResponse(event, getEvidenceUseCases().assessHeadAcceptance, "AssessHeadAcceptance", {
     ...body,
-    candidateHeadSha: getRouterParam(event, "sha") ?? "",
+    candidateHeadSha,
   });
 });

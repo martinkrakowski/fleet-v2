@@ -30,6 +30,13 @@ export interface VerificationReceiptRecord {
 /** Severity of one reviewer finding. */
 export type FindingSeverity = 'blocker' | 'major' | 'minor' | 'nit';
 
+/** The review kinds of the conductor plan §3.3; a receipt without one reads as `code-review` (§3.4). */
+export const REVIEW_KINDS = ['brief-check', 'code-review', 'pre-merge'] as const;
+export type ReviewKind = (typeof REVIEW_KINDS)[number];
+
+/** A request id the conductor mints and journals before the review runs (§3.2). */
+export const REVIEW_REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
 /** Serializable record of one finding raised by an independent review. */
 export interface ReviewFindingRecord {
   readonly findingId: string;
@@ -57,6 +64,10 @@ export interface ReviewReceiptRecord {
   readonly evidenceRef: string;
   readonly policyRevision: string;
   readonly completedAtIso: string;
+  /** The review kind (§3.3); absent on receipts recorded before the conductor, read as `code-review`. */
+  readonly kind?: ReviewKind;
+  /** The conductor's request id (§3.5); absent on manual reviews. */
+  readonly requestId?: string;
 }
 
 /** Serializable record of one fix or evidence-backed refutation of a finding. */

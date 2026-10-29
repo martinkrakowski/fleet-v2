@@ -8,6 +8,7 @@
 import { copyDecisions } from './decision-consumers.js';
 import { CONDUCTOR_REAPER_REPAIR_KINDS } from './policy.js';
 import { TELEMETRY_POLICY_KEYS } from './telemetry-policy.js';
+import { SEATS_POLICY_KEYS } from './seats-policy.js';
 import type {
   ChainsSection,
   DecisionsSectionV2,
@@ -18,7 +19,6 @@ import type {
   PolicySection,
   SeatSection,
   ShelfSectionV2,
-  TelemetryPolicy,
   VerificationProcedure,
   VerificationProceduresSection,
   WavesSection,
@@ -214,17 +214,28 @@ function serializePolicy(policy: PolicySection): Record<string, unknown> {
     out.conductor = conductor;
   }
   if (policy.telemetry !== undefined) {
-    out.telemetry = serializeTelemetry(policy.telemetry);
+    out.telemetry = serializePolicyBlock(policy.telemetry, TELEMETRY_POLICY_KEYS);
+  }
+  if (policy.seats !== undefined) {
+    out.seats = serializePolicyBlock(policy.seats, SEATS_POLICY_KEYS);
   }
   return out;
 }
 
-function serializeTelemetry(block: TelemetryPolicy): Record<string, unknown> {
+/**
+ * A policy block's present keys in the given order; arrays and plain objects are copied one level deep.
+ */
+function serializePolicyBlock(block: object, keys: readonly string[]): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  for (const key of TELEMETRY_POLICY_KEYS) {
-    const value = block[key as keyof TelemetryPolicy];
-    if (value !== undefined) {
-      out[key] = key === 'projectAliases' ? { ...(value as Readonly<Record<string, string>>) } : value;
+  const source = block as Readonly<Record<string, unknown>>;
+  for (const key of keys) {
+    const value = source[key];
+    if (Array.isArray(value)) {
+      out[key] = [...value];
+    } else if (typeof value === 'object' && value !== null) {
+      out[key] = { ...value };
+    } else if (value !== undefined) {
+      out[key] = value;
     }
   }
   return out;

@@ -1090,7 +1090,12 @@ describe('AssessHeadAcceptanceUseCase', () => {
     const useCase = new AssessHeadAcceptanceUseCase({
       repo: fakeRepository([completeEvidence()]),
       attemptOwnerDecisionPort: noOwnerDecisions,
-      forgeEvidence: stubForge({ candidateHeadSha: HEAD, ciState: 'pending', unresolvedThreadCount: 0 }),
+      forgeEvidence: stubForge({
+        candidateHeadSha: HEAD,
+        ciState: 'pending',
+        unresolvedThreadCount: 0,
+        observedHeadSha: HEAD,
+      }),
     });
 
     const result = await useCase.assessHeadAcceptance(assessRequest());
@@ -1106,7 +1111,12 @@ describe('AssessHeadAcceptanceUseCase', () => {
     const useCase = new AssessHeadAcceptanceUseCase({
       repo: fakeRepository([completeEvidence()]),
       attemptOwnerDecisionPort: noOwnerDecisions,
-      forgeEvidence: stubForge({ candidateHeadSha: HEAD, ciState: 'pass', unresolvedThreadCount: 2 }),
+      forgeEvidence: stubForge({
+        candidateHeadSha: HEAD,
+        ciState: 'pass',
+        unresolvedThreadCount: 2,
+        observedHeadSha: HEAD,
+      }),
     });
 
     const result = await useCase.assessHeadAcceptance(assessRequest());
@@ -1128,6 +1138,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
         candidateHeadSha: HEAD,
         ciState: 'pass',
         unresolvedThreadCount: null,
+        observedHeadSha: HEAD,
       }),
     });
 
@@ -1147,7 +1158,12 @@ describe('AssessHeadAcceptanceUseCase', () => {
     const useCase = new AssessHeadAcceptanceUseCase({
       repo,
       attemptOwnerDecisionPort: noOwnerDecisions,
-      forgeEvidence: stubForge({ candidateHeadSha: HEAD, ciState: 'pass', unresolvedThreadCount: 0 }),
+      forgeEvidence: stubForge({
+        candidateHeadSha: HEAD,
+        ciState: 'pass',
+        unresolvedThreadCount: 0,
+        observedHeadSha: HEAD,
+      }),
     });
 
     const result = await useCase.assessHeadAcceptance(assessRequest());
@@ -1382,13 +1398,21 @@ describe('VerificationExecutorAdapter', () => {
 describe('ForgeEvidenceAdapter', () => {
   it('returns the configured static status for a head', async () => {
     const adapter = new ForgeEvidenceAdapter({
-      statuses: { [HEAD]: { candidateHeadSha: HEAD, ciState: 'pass', unresolvedThreadCount: 0 } },
+      statuses: {
+        [HEAD]: {
+          candidateHeadSha: HEAD,
+          ciState: 'pass',
+          unresolvedThreadCount: 0,
+          observedHeadSha: HEAD,
+        },
+      },
     });
 
     expect(await adapter.readForgeCheckStatus({ candidateHeadSha: HEAD })).toEqual({
       candidateHeadSha: HEAD,
       ciState: 'pass',
       unresolvedThreadCount: 0,
+      observedHeadSha: HEAD,
     });
   });
 
@@ -1399,6 +1423,7 @@ describe('ForgeEvidenceAdapter', () => {
       candidateHeadSha: HEAD,
       ciState: 'unknown',
       unresolvedThreadCount: null,
+      observedHeadSha: null,
     });
   });
 
@@ -1441,6 +1466,7 @@ describe('ForgeEvidenceAdapter', () => {
       candidateHeadSha: HEAD,
       ciState: 'pass',
       unresolvedThreadCount: 1,
+      observedHeadSha: HEAD,
     });
   });
 

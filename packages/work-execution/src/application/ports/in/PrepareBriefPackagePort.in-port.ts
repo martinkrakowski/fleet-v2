@@ -1,8 +1,9 @@
 // @generated inbound contract scaffold — refined for migration step 1.
 /**
  * PrepareBriefPackagePort: select applicable context, obtain a reviewed prose
- * brief and freeze its manifest, revision references and digest before
- * dispatch. The runtime validates the manifest; the lane reads the prose.
+ * brief and freeze its manifest, revision references, the PR notes a
+ * conducted run requires and its digest before dispatch. The runtime
+ * validates the manifest; the lane reads the prose.
  */
 
 import type { RunnerKind } from '../../../domain/execution-records.js';
@@ -19,8 +20,9 @@ export interface BriefContextDecision {
 }
 
 /**
- * Durable model assignment: model, variant and fallback as bound in the brief
- * manifest. Host seat names are installation and never enter this contract.
+ * Durable model assignment: model, variant, fallback, seat tool and runner
+ * agent as bound in the brief manifest. Host seat names are installation and
+ * never enter this contract.
  */
 export interface BriefModelAssignment {
   readonly model: string;
@@ -32,6 +34,26 @@ export interface BriefModelAssignment {
    * there and never from a request.
    */
   readonly seatTool: RunnerKind;
+  /**
+   * The runner agent the implementer seat runs under (`lane`, `lane-glm`);
+   * optional, frozen into the manifest with the rest of the assignment so
+   * dispatch reads it back and the start check matches the plan seat that
+   * names it.
+   */
+  readonly agent?: string;
+}
+
+/**
+ * Frozen PR notes (D7): the three sections a conducted run requires for its
+ * PR body. Each is a non-empty string of at most 4000 characters and never
+ * secret-shaped. Optional on the prepare request — manual prepare works
+ * without them; a conducted start (`StartLaneRun`) refuses a brief without
+ * them.
+ */
+export interface PrNotes {
+  readonly hardToUndo: string;
+  readonly assumptions: string;
+  readonly challengeThis: string;
 }
 
 export interface PrepareBriefPackageRequest {
@@ -43,6 +65,21 @@ export interface PrepareBriefPackageRequest {
   readonly baseCommit: string;
   readonly policyRevision: string;
   readonly modelAssignment: BriefModelAssignment;
+
+  /**
+   * Frozen prose supplied by the caller (a fix round's handover brief); when
+   * present the authoring step is skipped and this text is placed and digested
+   * as is; non-empty, at most 64 KiB, never secret-shaped.
+   */
+  readonly proseMarkdown?: string;
+  /**
+   * Frozen PR notes (D7): the three sections a conducted run requires for its
+   * PR body. Each is a non-empty string of at most 4000 characters and never
+   * secret-shaped. Optional on the prepare request — manual prepare works
+   * without them; a conducted start (`StartLaneRun`) refuses a brief without
+   * them.
+   */
+  readonly prNotes?: PrNotes;
   /**
    * Optional seat plan (S1, D1): ordered seats per role. When present it is
    * validated, the model assignment must be one of its first-pass seats, no
@@ -95,7 +132,38 @@ export type PrepareBriefPackageResult =
   | { readonly outcome: 'prepared'; readonly prepared: PreparedBriefPackage }
   | { readonly outcome: 'rejected'; readonly reason: string };
 
+/** The acceptance spec as a preview may show it (plan §3.7): no argv element, no path. */
+export interface BriefAcceptancePreview {
+  readonly commitRequired: boolean;
+  readonly diffCheck: boolean;
+  readonly commandCount: number;
+  /** One digest per command, over JSON.stringify(argv), in spec order. */
+  readonly commandDigests: readonly string[];
+}
+
+export interface BriefPackagePreview {
+  readonly attemptId: string;
+  /** The digest a prepare would freeze now (same input, same prose): integrity, not a truth claim. */
+  readonly briefDigest: string;
+  readonly modelAssignment: { readonly model: string; readonly variant: string; readonly seatTool: RunnerKind };
+  /** The frozen seat plan a prepare would write, or null when the request has none. */
+  readonly seatPlan: SeatPlanProps | null;
+  readonly acceptance: BriefAcceptancePreview;
+  readonly prNotesPresent: boolean;
+  readonly selectedKnowledgeVersions: readonly SelectedKnowledgeVersion[];
+}
+
+export type PreviewBriefPackageResult =
+  | { readonly outcome: 'previewed'; readonly preview: BriefPackagePreview }
+  | { readonly outcome: 'rejected'; readonly reason: string };
+
 export interface PrepareBriefPackagePort {
   /** Freeze one brief package and record its digest before any dispatch. */
   prepareBriefPackage(request: PrepareBriefPackageRequest): Promise<PrepareBriefPackageResult>;
+  /**
+   * Validate and compute what a prepare would freeze; writes nothing and
+   * commits no seat. Required on the contract: every implementer provides
+   * it, so a port fake must supply one (e.g. throwing when unused).
+   */
+  previewBriefPackage(request: PrepareBriefPackageRequest): Promise<PreviewBriefPackageResult>;
 }

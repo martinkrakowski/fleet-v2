@@ -5,7 +5,7 @@
  * reads a clock, a file or another context.
  */
 
-import type { AttemptRecord, AttemptSeatSelectionRecord } from './execution-records.js';
+import type { AttemptRecord, AttemptSeatSelectionRecord, SeatObservationRecord } from './execution-records.js';
 import {
   type ImplementerSeatRole,
   type SeatPlan,
@@ -30,6 +30,16 @@ export interface SeatHistoryEntry {
 export type SeatSelectionResult =
   | { readonly ok: true; readonly role: SeatPlanRole; readonly seatIndex: number; readonly seat: SeatPlanSeat }
   | { readonly ok: false; readonly reason: string };
+
+export type SeatUnavailableReason = 'unhealthy' | 'cooling' | 'cooling-observed' | 'busy';
+
+export interface SeatUnavailability {
+  readonly reason: SeatUnavailableReason;
+  /** Cooling: when it ends (ISO). */
+  readonly until?: string;
+  /** cooling-observed only: the window's first observation. */
+  readonly observationId?: string;
+}
 
 /** Compares two model ids; true means "same family" (callers fail closed). */
 export type SameModelFamily = (leftModel: string, rightModel: string) => boolean;
@@ -104,11 +114,16 @@ export function seatSelectionRecord(
 function implementerSeatBlock(
   seat: SeatPlanSeat,
   unhealthy: ReadonlySet<string>,
+  unavailable: ReadonlyMap<string, SeatUnavailability>,
   refusedModels: ReadonlyMap<string, StopReasonValue>,
   seenReasons: ReadonlySet<StopReasonValue>,
 ): string | null {
   if (unhealthy.has(seat.id)) {
     return seat.id + ': unhealthy';
+  }
+  const availability = unavailable.get(seat.id);
+  if (availability !== undefined) {
+    return seat.id + ': ' + availability.reason;
   }
   const refusal = refusedModels.get(seat.model.trim());
   if (refusal !== undefined) {
@@ -131,12 +146,15 @@ export function selectSeat(input: {
   readonly role: ImplementerSeatRole;
   readonly history: readonly SeatHistoryEntry[];
   readonly unhealthySeatIds?: readonly string[];
+  readonly unavailable?: ReadonlyMap<string, SeatUnavailability>;
+  readonly rotationStart?: number;
 }): SeatSelectionResult {
   const seats = input.plan.getSeats(input.role);
   if (seats.length === 0) {
     return { ok: false, reason: 'Seat plan has no ' + input.role + ' seats' };
   }
   const unhealthy = new Set(input.unhealthySeatIds ?? []);
+  const unavailable = input.unavailable ?? new Map<string, SeatUnavailability>();
   const refusedModels = new Map<string, StopReasonValue>();
   const seenReasons = new Set<StopReasonValue>();
   let lastIndex = -1;
@@ -156,12 +174,21 @@ export function selectSeat(input: {
       lastIndex = entry.seatIndex;
     }
   }
+  if (isSafeRotationStart(input.rotationStart) && lastIndex === -1) {
+    const eligible = eligibleSeatsForRotation(seats, (seat) =>
+      isImplementerSeatBlocked(seat, unhealthy, refusedModels, unavailable),
+    );
+    if (eligible.length > 0) {
+      const chosen = eligible[input.rotationStart % eligible.length];
+      return { ok: true, role: input.role, seatIndex: chosen.index, seat: chosen.seat };
+    }
+  }
   const start = (lastIndex + 1) % seats.length;
   const blocks: string[] = [];
   for (let step = 0; step < seats.length; step += 1) {
     const seatIndex = (start + step) % seats.length;
     const seat = seats[seatIndex];
-    const block = implementerSeatBlock(seat, unhealthy, refusedModels, seenReasons);
+    const block = implementerSeatBlock(seat, unhealthy, unavailable, refusedModels, seenReasons);
     if (block === null) {
       return { ok: true, role: input.role, seatIndex, seat };
     }
@@ -184,6 +211,8 @@ export function selectReviewSeat(input: {
   readonly implementerModels: readonly string[];
   readonly sameFamily: SameModelFamily;
   readonly unhealthySeatIds?: readonly string[];
+  readonly unavailable?: ReadonlyMap<string, SeatUnavailability>;
+  readonly rotationStart?: number;
 }): SeatSelectionResult {
   const seats = input.plan.getSeats('review');
   if (seats.length === 0) {
@@ -193,14 +222,27 @@ export function selectReviewSeat(input: {
     return { ok: false, reason: 'Review round must be a non-negative integer' };
   }
   const unhealthy = new Set(input.unhealthySeatIds ?? []);
+  const unavailable = input.unavailable ?? new Map<string, SeatUnavailability>();
+  if (isSafeRotationStart(input.rotationStart)) {
+    const eligible = eligibleSeatsForRotation(seats, (seat) =>
+      isReviewSeatBlocked(seat, unhealthy, unavailable, input.implementerModels, input.sameFamily),
+    );
+    if (eligible.length > 0) {
+      const chosen = eligible[(input.rotationStart + input.round) % eligible.length];
+      return { ok: true, role: 'review', seatIndex: chosen.index, seat: chosen.seat };
+    }
+  }
   const start = input.round % seats.length;
   const blocks: string[] = [];
   for (let step = 0; step < seats.length; step += 1) {
     const seatIndex = (start + step) % seats.length;
     const seat = seats[seatIndex];
     const sharedWith = input.implementerModels.find((model) => input.sameFamily(seat.model, model));
+    const availability = unavailable.get(seat.id);
     if (unhealthy.has(seat.id)) {
       blocks.push(seat.id + ': unhealthy');
+    } else if (availability !== undefined) {
+      blocks.push(seat.id + ': ' + availability.reason);
     } else if (sharedWith === undefined) {
       return { ok: true, role: 'review', seatIndex, seat };
     } else {
@@ -208,6 +250,318 @@ export function selectReviewSeat(input: {
     }
   }
   return { ok: false, reason: 'Seat plan exhausted for role review: ' + blocks.join('; ') };
+}
+
+/**
+ * Every model that implemented the lane (plan §3.5.6): ran, else bound. Fails
+ * closed on an attempt with neither.
+ */
+export function implementerModelsOf(
+  attempts: readonly AttemptRecord[],
+): { readonly ok: true; readonly models: readonly string[] } | { readonly ok: false; readonly attemptId: string } {
+  const models: string[] = [];
+  const seen = new Set<string>();
+  for (const attempt of attempts) {
+    const model = historyEntryOf(attempt).model;
+    const trimmed = (model ?? '').trim();
+    if (trimmed.length === 0) {
+      return { ok: false, attemptId: attempt.id };
+    }
+    if (!seen.has(trimmed)) {
+      seen.add(trimmed);
+      models.push(trimmed);
+    }
+  }
+  return { ok: true, models };
+}
+
+export type PreMergeSeatSelectionResult =
+  | { readonly ok: true; readonly seatIndex: number; readonly seat: SeatPlanSeat }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Pick the pre-merge (Tier 2) review seat from the installation's plain
+ * `chains['high-risk-reviewer']` chain (plan §3.5.1, D8), in owner order. A
+ * seat that shares a model family with any model that implemented the lane —
+ * first pass or fix round, including an agy round whose runner is null — is
+ * never selected. The returned `seatIndex` is the seat's index in `seats`.
+ *
+ * Callers honouring conductor D10 do not call this after a recorded pre-merge
+ * `fail`: they pin the recorded seat (its `seatIndex`) directly. `rotationStart`
+ * indexes the *eligible* list, so passing a pinned `seatIndex` as
+ * `rotationStart` would pick a different seat.
+ */
+export function selectPreMergeSeat(input: {
+  readonly seats: readonly SeatPlanSeat[];
+  readonly attempts: readonly AttemptRecord[];
+  readonly sameFamily: SameModelFamily;
+  readonly unhealthySeatIds?: readonly string[];
+  readonly unavailable?: ReadonlyMap<string, SeatUnavailability>;
+  readonly rotationStart?: number;
+}): PreMergeSeatSelectionResult {
+  if (input.seats.length === 0) {
+    return { ok: false, reason: 'No pre-merge seats' };
+  }
+  const models = implementerModelsOf(input.attempts);
+  if (!models.ok) {
+    return { ok: false, reason: 'Implementer model unknown for attempt ' + models.attemptId };
+  }
+  const unhealthy = new Set(input.unhealthySeatIds ?? []);
+  const unavailable = input.unavailable ?? new Map<string, SeatUnavailability>();
+  if (isSafeRotationStart(input.rotationStart)) {
+    const eligible = eligibleSeatsForRotation(input.seats, (seat) =>
+      isPreMergeSeatBlocked(seat, unhealthy, unavailable, models.models, input.sameFamily),
+    );
+    if (eligible.length > 0) {
+      const chosen = eligible[input.rotationStart % eligible.length];
+      return { ok: true, seatIndex: chosen.index, seat: chosen.seat };
+    }
+  }
+  const blocks: string[] = [];
+  for (const [seatIndex, seat] of input.seats.entries()) {
+    const block = preMergeSeatBlock(seat, unhealthy, unavailable, models.models, input.sameFamily);
+    if (block === null) {
+      return { ok: true, seatIndex, seat };
+    }
+    blocks.push(block);
+  }
+  return { ok: false, reason: 'Pre-merge seats exhausted: ' + blocks.join('; ') };
+}
+
+/** Why a pre-merge chain seat cannot be selected now, or null when it can. */
+function preMergeSeatBlock(
+  seat: SeatPlanSeat,
+  unhealthy: ReadonlySet<string>,
+  unavailable: ReadonlyMap<string, SeatUnavailability>,
+  implementerModels: readonly string[],
+  sameFamily: SameModelFamily,
+): string | null {
+  if (unhealthy.has(seat.id)) {
+    return seat.id + ': unhealthy';
+  }
+  const availability = unavailable.get(seat.id);
+  if (availability !== undefined) {
+    return seat.id + ': ' + availability.reason;
+  }
+  if (seat.on !== undefined) {
+    return seat.id + ': fallback seats are not used for pre-merge';
+  }
+  const sharedWith = implementerModels.find((model) => sameFamily(seat.model, model));
+  if (sharedWith !== undefined) {
+    return seat.id + ': shares a model family with implementer model ' + sharedWith;
+  }
+  return null;
+}
+
+function isPreMergeSeatBlocked(
+  seat: SeatPlanSeat,
+  unhealthy: ReadonlySet<string>,
+  unavailable: ReadonlyMap<string, SeatUnavailability>,
+  implementerModels: readonly string[],
+  sameFamily: SameModelFamily,
+): boolean {
+  return (
+    unhealthy.has(seat.id) ||
+    unavailable.has(seat.id) ||
+    seat.on !== undefined ||
+    implementerModels.some((model) => sameFamily(seat.model, model))
+  );
+}
+
+type EligibleSeat = { readonly seat: SeatPlanSeat; readonly index: number };
+
+/** A rotation start is trusted only when it is a non-negative safe integer (same rule as stored indexes). */
+function isSafeRotationStart(value: number | undefined): value is number {
+  return value !== undefined && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** The seats in plan order, without `on`, that the block predicate does not block. */
+function eligibleSeatsForRotation(
+  seats: readonly SeatPlanSeat[],
+  isBlocked: (seat: SeatPlanSeat) => boolean,
+): EligibleSeat[] {
+  const eligible: EligibleSeat[] = [];
+  for (let index = 0; index < seats.length; index += 1) {
+    const seat = seats[index];
+    if (seat.on === undefined && !isBlocked(seat)) {
+      eligible.push({ seat, index });
+    }
+  }
+  return eligible;
+}
+
+function isImplementerSeatBlocked(
+  seat: SeatPlanSeat,
+  unhealthy: ReadonlySet<string>,
+  refusedModels: ReadonlyMap<string, StopReasonValue>,
+  unavailable: ReadonlyMap<string, SeatUnavailability>,
+): boolean {
+  return unhealthy.has(seat.id) || refusedModels.has(seat.model.trim()) || unavailable.has(seat.id);
+}
+
+function isReviewSeatBlocked(
+  seat: SeatPlanSeat,
+  unhealthy: ReadonlySet<string>,
+  unavailable: ReadonlyMap<string, SeatUnavailability>,
+  implementerModels: readonly string[],
+  sameFamily: SameModelFamily,
+): boolean {
+  if (unhealthy.has(seat.id) || unavailable.has(seat.id)) {
+    return true;
+  }
+  return implementerModels.some((model) => sameFamily(seat.model, model));
+}
+
+const MINUTE_MS = 60_000;
+
+/** Policy minutes: a non-integer or out-of-range value reads as 0 (off). */
+function cooldownMs(minutes: number): number {
+  return Number.isInteger(minutes) && minutes >= 0 && minutes <= 1440 ? minutes * MINUTE_MS : 0;
+}
+
+function parseIso(value: string): Date | null {
+  const time = new Date(value).getTime();
+  return Number.isNaN(time) ? null : new Date(time);
+}
+
+type ObservationWindow = {
+  readonly from: Date;
+  readonly until: Date;
+  readonly firstObservationId: string;
+};
+
+/**
+ * The cooling windows observations open per seat: the first observation opens
+ * one, a later observation inside it is a duplicate and extends nothing, and
+ * one at or after its end opens the next. Unparseable times are skipped.
+ */
+function observationWindows(
+  observations: readonly SeatObservationRecord[],
+  windowMs: number,
+): Map<string, readonly ObservationWindow[]> {
+  const grouped = new Map<string, SeatObservationRecord[]>();
+  for (const observation of observations) {
+    const list = grouped.get(observation.seatId);
+    if (list === undefined) {
+      grouped.set(observation.seatId, [observation]);
+    } else {
+      list.push(observation);
+    }
+  }
+  const windows = new Map<string, readonly ObservationWindow[]>();
+  for (const [seatId, list] of grouped) {
+    const timed = list
+      .map((observation) => ({ observation, at: parseIso(observation.observedAtIso) }))
+      .filter(
+        (entry): entry is { observation: SeatObservationRecord; at: Date } => entry.at !== null,
+      )
+      .sort((left, right) => {
+        const byTime = left.at.getTime() - right.at.getTime();
+        if (byTime !== 0) {
+          return byTime;
+        }
+        // Same instant: the observation id breaks the tie, so the order is total and stable.
+        return left.observation.observationId.localeCompare(right.observation.observationId);
+      });
+    if (timed.length === 0) {
+      continue;
+    }
+    const seatWindows: ObservationWindow[] = [];
+    let first = timed[0];
+    let untilMs = first.at.getTime() + windowMs;
+    for (const entry of timed.slice(1)) {
+      if (entry.at.getTime() >= untilMs) {
+        seatWindows.push({
+          from: first.at,
+          until: new Date(untilMs),
+          firstObservationId: first.observation.observationId,
+        });
+        first = entry;
+        untilMs = entry.at.getTime() + windowMs;
+      }
+    }
+    seatWindows.push({
+      from: first.at,
+      until: new Date(untilMs),
+      firstObservationId: first.observation.observationId,
+    });
+    windows.set(seatId, seatWindows);
+  }
+  return windows;
+}
+
+/** The window containing `nowMs`, or null when none does. */
+function windowAt(windows: readonly ObservationWindow[], nowMs: number): ObservationWindow | null {
+  let containing: ObservationWindow | null = null;
+  for (const window of windows) {
+    if (window.from.getTime() > nowMs) {
+      break;
+    }
+    containing = window;
+  }
+  return containing !== null && nowMs < containing.until.getTime() ? containing : null;
+}
+
+/**
+ * Which seats are cooling now (plan §3.5.3, pure). An attempt refusal cools a
+ * seat for `cooldownMinutes` from the attempt's `updatedAtIso`; an observation
+ * cools it for `observationCooldownMinutes` from its window's first
+ * observation. An attempt's cooling wins over an observation's for the same
+ * seat. Unparseable times and off policies are skipped; the result never
+ * throws.
+ */
+export function coolingSeatIds(input: {
+  readonly attempts: readonly AttemptRecord[];
+  readonly observations: readonly SeatObservationRecord[];
+  readonly nowIso: string;
+  readonly cooldownMinutes: number;
+  readonly observationCooldownMinutes: number;
+}): ReadonlyMap<string, SeatUnavailability> {
+  const now = parseIso(input.nowIso);
+  if (now === null) {
+    return new Map();
+  }
+  const cooling = new Map<string, SeatUnavailability>();
+  const attemptsMs = cooldownMs(input.cooldownMinutes);
+  // A cooldown of 0 is off: no attempt cools a seat, whatever its timestamp.
+  for (const attempt of attemptsMs > 0 ? input.attempts : []) {
+    const seatId = typeof attempt.seatSelection?.seatId === 'string' ? attempt.seatSelection.seatId : '';
+    if (seatId.length === 0 || !MODEL_REFUSAL_CLASSES.includes(stopReasonOf(attempt))) {
+      continue;
+    }
+    const updatedAt = parseIso(attempt.updatedAtIso);
+    if (updatedAt === null) {
+      continue;
+    }
+    // A refusal stamped in the future (another host's skewed clock) cools from now, never from that future instant.
+    const untilMs = Math.min(updatedAt.getTime(), now.getTime()) + attemptsMs;
+    if (now.getTime() >= untilMs) {
+      continue;
+    }
+    const until = new Date(untilMs).toISOString();
+    const existing = cooling.get(seatId);
+    if (existing === undefined || until > (existing.until ?? '')) {
+      cooling.set(seatId, { reason: 'cooling', until });
+    }
+  }
+  const observationMs = cooldownMs(input.observationCooldownMinutes);
+  if (observationMs > 0) {
+    const nowMs = now.getTime();
+    for (const [seatId, seatWindows] of observationWindows(input.observations, observationMs)) {
+      if (cooling.has(seatId)) {
+        continue;
+      }
+      const window = windowAt(seatWindows, nowMs);
+      if (window !== null) {
+        cooling.set(seatId, {
+          reason: 'cooling-observed',
+          until: window.until.toISOString(),
+          observationId: window.firstObservationId,
+        });
+      }
+    }
+  }
+  return cooling;
 }
 
 /**
@@ -236,8 +590,10 @@ export function seatPlanFamilyConflicts(plan: SeatPlan, sameFamily: SameModelFam
 
 /**
  * Classify a runner's refusal text into a stop reason. Order matters: a
- * missing model, then payment, then rate limits and quota, then timeouts;
- * anything else is `runner-refused`. The text is matched, never stored.
+ * missing model, then payment, then rate limits and quota, then timeouts,
+ * then a provider with no route or endpoint for the model (`no-route`; a
+ * host-level 'no route to host' is not one); anything else is
+ * `runner-refused`. The text is matched, never stored.
  */
 export function classifyRunnerRefusal(reason: string): StopReasonValue {
   const text = reason.toLowerCase();
@@ -252,6 +608,9 @@ export function classifyRunnerRefusal(reason: string): StopReasonValue {
   }
   if (/timed? ?out|deadline exceeded|etimedout/.test(text)) {
     return 'timeout';
+  }
+  if (/no endpoints? (?:found|available)|no route(?! to host)|no allowed providers|no providers? (?:are )?available/.test(text)) {
+    return 'no-route';
   }
   return 'runner-refused';
 }

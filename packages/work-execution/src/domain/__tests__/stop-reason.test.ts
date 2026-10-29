@@ -28,10 +28,10 @@ describe("parseStopReason", () => {
 });
 
 describe("SEAT_TRIGGER_CLASSES", () => {
-  it("contains neither none nor unknown and has 9 entries", () => {
+  it("contains neither none nor unknown and has 10 entries", () => {
     expect(SEAT_TRIGGER_CLASSES).not.toContain("none");
     expect(SEAT_TRIGGER_CLASSES).not.toContain("unknown");
-    expect(SEAT_TRIGGER_CLASSES).toHaveLength(9);
+    expect(SEAT_TRIGGER_CLASSES).toHaveLength(10);
   });
 });
 

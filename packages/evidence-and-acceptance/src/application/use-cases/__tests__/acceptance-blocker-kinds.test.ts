@@ -144,7 +144,7 @@ function independentReviewReceiptWithFindings(
 function forge(ciState: EvidenceResultValue, unresolvedThreadCount: number | null): ForgeEvidencePort {
   return {
     async readForgeCheckStatus() {
-      return { candidateHeadSha: HEAD, ciState, unresolvedThreadCount };
+      return { candidateHeadSha: HEAD, ciState, unresolvedThreadCount, observedHeadSha: HEAD };
     },
   };
 }

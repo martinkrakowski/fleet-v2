@@ -1,4 +1,5 @@
 import { containsSecretShape } from '@fleet/shared';
+import { isPlainRecord, readOwnDataProperty } from './policy-read.js';
 
 import type { ResolvedTelemetryPolicy, TelemetryPolicy, TelemetryRoute } from './types.js';
 
@@ -13,21 +14,6 @@ export const TELEMETRY_POLICY_KEYS: readonly string[] = Object.freeze([
   'enabled', 'projectName', 'route', 'sampleRatio', 'sendCost', 'includeDryRun', 'projectAliases', 'salt',
 ]);
 const FORBIDDEN_PROJECT_IDS: readonly string[] = ['__proto__', 'constructor', 'prototype'];
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return false;
-  }
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
-function readOwnDataProperty(record: Record<string, unknown>, key: string): unknown {
-  if (!Object.hasOwn(record, key)) {
-    return undefined;
-  }
-  return Object.getOwnPropertyDescriptor(record, key)?.value;
-}
 
 function isAlias(value: unknown): value is string {
   return (

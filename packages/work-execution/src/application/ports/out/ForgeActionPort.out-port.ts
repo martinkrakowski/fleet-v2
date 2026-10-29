@@ -20,6 +20,10 @@ export interface ForgeActionRequest {
   readonly branchName: string;
   /** Known pull request number (e.g. from an earlier push-and-open-pr), when available. */
   readonly pullRequestNumber?: number;
+  /** PR title override used only for `push-and-open-pr`; absent keeps the default. */
+  readonly title?: string;
+  /** PR body override used only for `push-and-open-pr`; absent keeps the default. */
+  readonly body?: string;
 }
 
 export type ForgeActionResult =

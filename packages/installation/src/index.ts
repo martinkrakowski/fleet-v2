@@ -6,5 +6,6 @@ export * from './write.js';
 export * from './load.js';
 export * from './policy.js';
 export * from './telemetry-policy.js';
+export * from './seats-policy.js';
 export * from './auto-merge-revision.js';
 export * from './conductor-revision.js';

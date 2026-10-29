@@ -1420,6 +1420,97 @@ describe('merged before stopped (G3d)', () => {
   });
 });
 
+describe('KF-1: a lost dispatching conduct is repaired, never re-prepared', () => {
+  it('a ready run with a started, still-live attempt enters dispatching (not a second prepare)', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'ready',
+      attempt: attemptFact({ phase: 'dispatching', dispatchResult: 'started' }),
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'dispatching' });
+  });
+
+  it('a seat-failed run with a started, still-live attempt enters dispatching (not a second prepare)', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'seat-failed',
+      attempt: attemptFact({ phase: 'dispatching', dispatchResult: 'started' }),
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'dispatching' });
+  });
+
+  it('a fixing run with a started round+1 attempt enters dispatching (not a second prepare)', () => {
+    const rec = record({ attemptIds: ['attempt-example-1', 'attempt-example-2'] });
+    const facts = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'attempt-example-2', round: 1, phase: 'dispatching', dispatchResult: 'started' }),
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'dispatching' });
+  });
+
+  it('an ended or cancelled attempt never repairs: seat-failed prepares the retry, fixing waits', () => {
+    const ended = baseFacts({
+      state: 'seat-failed',
+      attempt: attemptFact({ phase: 'ended', dispatchResult: 'started' }),
+    });
+    expect(decide(record({}), ended)).toEqual({
+      kind: 'act', step: 'prepare', key: `${RUN_ID}/r0/prepare/0/a2`, round: 0, seatIndex: 0, head12: null, retry: null,
+    });
+    const cancelled = baseFacts({
+      state: 'seat-failed',
+      attempt: attemptFact({ phase: 'cancelled', dispatchResult: 'started' }),
+    });
+    expect(decide(record({}), cancelled)).toEqual({
+      kind: 'act', step: 'prepare', key: `${RUN_ID}/r0/prepare/0/a2`, round: 0, seatIndex: 0, head12: null, retry: null,
+    });
+    const prior = baseFacts({ state: 'fixing', attempt: attemptFact({ phase: 'running', dispatchResult: 'started' }) });
+    expect(decide(record({}), prior)).toEqual({ kind: 'wait', reason: 'prior-not-ended' });
+  });
+});
+
+describe('KF-1: halt blocks the collect and gate reconcile (G3a under halt)', () => {
+  const collectIntent = { key: `${RUN_ID}/r0/collect/0`, step: 'collect' as const, reconciliation: 'unread' as const };
+
+  it('a pending collect intent under a halt takes the halt decision, not the reconcile', () => {
+    const facts = baseFacts({
+      state: 'collecting',
+      halted: true,
+      attempt: attemptFact({ phase: 'ended' }),
+      pendingIntent: collectIntent,
+    });
+    expect(decide(record({}), facts)).toEqual({ kind: 'park', reason: 'halted', qualifier: null, parkedFrom: 'collecting' });
+  });
+
+  it('the same pending collect intent without a halt reconciles as today', () => {
+    const facts = baseFacts({
+      state: 'collecting',
+      attempt: attemptFact({ phase: 'ended' }),
+      pendingIntent: collectIntent,
+    });
+    expect(decide(record({}), facts)).toEqual({ kind: 'reconcile', step: 'collect', key: collectIntent.key });
+  });
+
+  it('a pending gate intent under a halt takes the halt decision, not the reconcile', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      halted: true,
+      attempt: attemptFact({ phase: 'collected', collection: { commits: 1, manifest: 'sealed' } }),
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'unread' },
+    });
+    expect(decide(record({}), facts)).toEqual({ kind: 'park', reason: 'halted', qualifier: null, parkedFrom: 'gating' });
+  });
+
+  it('a pending dispatch intent under a halt is still reconciled', () => {
+    const facts = baseFacts({
+      state: 'ready',
+      halted: true,
+      attempt: attemptFact({ phase: 'dispatching', dispatchResult: 'started' }),
+      pendingIntent: { key: `${RUN_ID}/r0/dispatch/0/a1`, step: 'dispatch', reconciliation: 'unread' },
+    });
+    expect(decide(record({}), facts)).toEqual({ kind: 'reconcile', step: 'dispatch', key: `${RUN_ID}/r0/dispatch/0/a1` });
+  });
+});
+
 describe('decision legality', () => {
   it('every enter decision produced above is a legal transition', () => {
     expect(enterDecisions.length).toBeGreaterThan(0);

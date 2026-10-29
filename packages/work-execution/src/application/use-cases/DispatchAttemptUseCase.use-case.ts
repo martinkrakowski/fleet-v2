@@ -529,7 +529,14 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
 
     // A claim-state attempt is live: dispatching it again would start a second
     // session in the same worktree. Refuse before any journal entry or save;
-    // an `intent-recorded` prepared attempt still dispatches.
+    // an `intent-recorded` prepared attempt still dispatches. A `cancelled`
+    // record never dispatches again (§3.9.1, the record-only cancel).
+    if (existingAttempt && existingAttempt.state === 'cancelled') {
+      return {
+        outcome: 'refused',
+        reason: 'Attempt ' + existingAttempt.id + ' is cancelled and is never dispatched again; prepare a new attempt',
+      };
+    }
     if (
       existingAttempt &&
       (existingAttempt.state === 'dispatching' ||

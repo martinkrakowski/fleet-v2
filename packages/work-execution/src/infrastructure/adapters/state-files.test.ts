@@ -5,15 +5,19 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   StateFileUnreadableError,
+  inspectRecordListBytes,
+  quarantineUnreadable,
   type StateFileDescriptor,
   type StateFileInspection,
 } from './file-store.js';
+import { parseConductorHaltStateRecord } from './ConductorHaltAdapter.adapter.js';
 import { WORK_EXECUTION_STATE_FILES } from './state-files.js';
 import { WorkOrderRepositoryAdapter } from './WorkOrderRepositoryAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from './AttemptRepositoryAdapter.adapter.js';
 import { ExecutionJournalAdapter } from './ExecutionJournalAdapter.adapter.js';
 import { LaneRunRepositoryAdapter } from './LaneRunRepositoryAdapter.adapter.js';
 import { ConductorDriverLeaseAdapter } from './ConductorDriverLeaseAdapter.adapter.js';
+import { ConductorHaltAdapter } from './ConductorHaltAdapter.adapter.js';
 import { LaneRunJournalAdapter } from './LaneRunJournalAdapter.adapter.js';
 
 const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
@@ -91,6 +95,10 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
       leaseUntilIso: '2026-10-27T10:02:00.000Z',
     },
   ],
+  'conductor-halt.json': [
+    { version: 1, halted: true, changedAtIso: '2026-10-27T10:00:00.000Z' },
+    { version: 1, halted: false, changedAtIso: '2026-10-27T10:01:00.000Z' },
+  ],
   'run-journal.json': [
     {
       version: 1,
@@ -135,6 +143,18 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
     new ExecutionJournalAdapter({ stateDir }).listActiveReservations(),
   'lane-runs.json': (stateDir) => new LaneRunRepositoryAdapter({ stateDir }).list(),
   'conductor-driver-lease.json': (stateDir) => new ConductorDriverLeaseAdapter({ stateDir }).read(),
+  'conductor-halt.json': async (stateDir) => {
+    // The halt port's `read()` never throws for an unreadable marker (it
+    // reads `unreadable`), so this observes the same inspection the adapter
+    // performs, which quarantines and throws the matching detail.
+    const target = path.join(stateDir, 'conductor-halt.json');
+    const buffer = await fs.readFile(target);
+    const inspection = inspectRecordListBytes(buffer, parseConductorHaltStateRecord);
+    if (inspection.status === 'unreadable') {
+      return quarantineUnreadable(target, inspection.detail, buffer);
+    }
+    return new ConductorHaltAdapter({ stateDir }).read();
+  },
   'run-journal.json': (stateDir) =>
     new LaneRunJournalAdapter({ stateDir }).listForRun('run-01JB0000000000000000000000'),
 };
@@ -210,6 +230,7 @@ describe('work-execution state file descriptors match the store readers', () => 
       'reservations.json',
       'lane-runs.json',
       'conductor-driver-lease.json',
+      'conductor-halt.json',
       'run-journal.json',
     ]);
   });

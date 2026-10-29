@@ -12,7 +12,7 @@ import type { OwnerQuestionRecord } from '../../domain/owner-question-records.js
 import { CoordinationRequestRepositoryAdapter } from './CoordinationRequestRepositoryAdapter.adapter.js';
 import { OwnerQuestionRepositoryAdapter } from './OwnerQuestionRepositoryAdapter.adapter.js';
 import { ProjectProfileRepositoryAdapter } from './ProjectProfileRepositoryAdapter.adapter.js';
-import { StateFileUnreadableError } from './file-store.js';
+import { describeRecordListStore, StateFileUnreadableError } from './file-store.js';
 
 function profileRecord(): ProjectProfileRecord {
   return {
@@ -223,6 +223,53 @@ describe('operator-coordination stores quarantine unreadable state', () => {
       );
       const after = createHash('sha256').update(await fs.readFile(filePath())).digest('hex');
       expect(after).toBe(before);
+    });
+  });
+
+  describe('describeRecordListStore validateList', () => {
+    interface FakeRecord {
+      readonly id: string;
+    }
+    const parseFake = (raw: unknown): FakeRecord | undefined =>
+      typeof raw === 'object' && raw !== null && typeof (raw as FakeRecord).id === 'string'
+        ? (raw as FakeRecord)
+        : undefined;
+
+    it('marks the whole file unreadable with the validateList detail when it returns one', () => {
+      const descriptor = describeRecordListStore<FakeRecord>(
+        'fake.json',
+        parseFake,
+        () => 'two fakes share one id',
+      );
+      const bytes = Buffer.from(JSON.stringify([{ id: 'a' }, { id: 'b' }]), 'utf8');
+      expect(descriptor.inspect(bytes)).toEqual({
+        status: 'unreadable',
+        detail: 'two fakes share one id',
+        recordIndex: null,
+      });
+    });
+
+    it('is ok when validateList returns undefined and behaves as today when it is absent', () => {
+      const withValidator = describeRecordListStore<FakeRecord>('fake.json', parseFake, () => undefined);
+      const withoutValidator = describeRecordListStore<FakeRecord>('fake.json', parseFake);
+      const bytes = Buffer.from(JSON.stringify([{ id: 'a' }, { id: 'b' }]), 'utf8');
+      expect(withValidator.inspect(bytes)).toEqual({ status: 'ok', recordCount: 2 });
+      expect(withoutValidator.inspect(bytes)).toEqual({ status: 'ok', recordCount: 2 });
+    });
+
+    it('does not call validateList when a record fails to parse', () => {
+      let calls = 0;
+      const descriptor = describeRecordListStore<FakeRecord>('fake.json', parseFake, () => {
+        calls += 1;
+        return 'two fakes share one id';
+      });
+      const bytes = Buffer.from(JSON.stringify([{ id: 'a' }, { bogus: true }]), 'utf8');
+      expect(descriptor.inspect(bytes)).toEqual({
+        status: 'unreadable',
+        detail: 'record 1 failed validation',
+        recordIndex: 1,
+      });
+      expect(calls).toBe(0);
     });
   });
 });

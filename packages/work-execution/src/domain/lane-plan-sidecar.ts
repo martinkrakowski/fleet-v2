@@ -69,17 +69,30 @@ export function canonicalLanePlanSidecarJson(sidecar: LanePlanSidecar): string {
         ? null
         : { repository: lane.mergedPr.repository, number: lane.mergedPr.number },
     })),
-    decisions: sidecar.decisions.map((decision) => ({
+    ...planDecisionAndOrderRecords(sidecar.decisions, sidecar.exclusiveOrder),
+  });
+}
+
+/**
+ * Fresh decision and exclusive-order record lists, shared verbatim by the
+ * sidecar's canonical JSON and the `LanePlan` entity's record mapping.
+ */
+export function planDecisionAndOrderRecords(
+  decisions: readonly PlanDecisionSidecar[],
+  exclusiveOrder: readonly ExclusiveOrderSidecar[],
+): { decisions: PlanDecisionSidecar[]; exclusiveOrder: ExclusiveOrderSidecar[] } {
+  return {
+    decisions: decisions.map((decision) => ({
       id: decision.id,
       question: decision.question,
       default: decision.default,
       state: decision.state,
     })),
-    exclusiveOrder: sidecar.exclusiveOrder.map((entry) => ({
+    exclusiveOrder: exclusiveOrder.map((entry) => ({
       file: entry.file,
-      lanes: entry.lanes,
+      lanes: [...entry.lanes],
     })),
-  });
+  };
 }
 
 /** True when a string matches containsSecretShape or any LANE_DIFF_SECRET_PATTERNS regex. */

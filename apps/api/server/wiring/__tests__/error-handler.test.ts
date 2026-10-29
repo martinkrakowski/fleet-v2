@@ -1,0 +1,232 @@
+// Tests for the @fleet/api Nitro error handler (server/error.ts). Unit cases
+// prove the pure errorBody mapping; a loopback h3 app proves the default
+// handler on the wire: the response carries only statusCode and statusMessage
+// and never echoes the request or the thrown error.
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createServer, type Server } from "node:http";
+import { createApp, createError, createRouter, defineEventHandler, toNodeListener } from "h3";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+
+// The real `nitropack/runtime` entry statically pulls in Nitro build-time
+// virtual modules (#nitro-internal-virtual/*) that only exist inside the
+// Nitro build, not under plain vitest. The handler's production import stays
+// as `nitropack/runtime`; here we substitute the identity wrapper so the unit
+// test exercises the real handler without loading the Nitro runtime graph.
+vi.mock("nitropack/runtime", () => ({
+  defineNitroErrorHandler: (handler: (error: unknown, event: unknown) => unknown) => handler,
+}));
+
+import handler, { errorBody } from "../../error.js";
+
+/** apps/api, three levels above this test file (server/wiring/__tests__). */
+/** Paths Nitro's default descriptor was asked about (the stand-in records them). */
+const defaultCalls: string[] = [];
+const apiRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+
+describe("errorBody", () => {
+  it("keeps an acceptable 4xx statusMessage verbatim", () => {
+    expect(errorBody({ statusCode: 400, statusMessage: "Invalid route parameter" })).toEqual({
+      statusCode: 400,
+      statusMessage: "Invalid route parameter",
+    });
+  });
+
+  it("never leaks a plain error's message into a 5xx body", () => {
+    const error = new Error("secret path /x?token=abc") as unknown as {
+      statusCode?: unknown;
+      statusMessage?: unknown;
+    };
+    const body = errorBody(error);
+    expect(body).toEqual({ statusCode: 500, statusMessage: "Internal Server Error" });
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain("secret");
+    expect(serialized).not.toContain("token");
+  });
+
+  it("answers the fixed 5xx message even when a 5xx carries a custom statusMessage", () => {
+    expect(errorBody({ statusCode: 503, statusMessage: "temporarily down" })).toEqual({
+      statusCode: 503,
+      statusMessage: "Internal Server Error",
+    });
+  });
+
+  it("falls back to the fixed reason phrase table for 4xx", () => {
+    expect(errorBody({ statusCode: 404 })).toEqual({
+      statusCode: 404,
+      statusMessage: "Not Found",
+    });
+    expect(errorBody({ statusCode: 418 })).toEqual({
+      statusCode: 418,
+      statusMessage: "Request Error",
+    });
+  });
+
+  it("refuses an unsafe statusMessage with the fixed phrase", () => {
+    expect(errorBody({ statusCode: 400, statusMessage: "bad\nnewline" })).toEqual({
+      statusCode: 400,
+      statusMessage: "Bad Request",
+    });
+    expect(errorBody({ statusCode: 400, statusMessage: "bad\u2028separator" })).toEqual({
+      statusCode: 400,
+      statusMessage: "Bad Request",
+    });
+    expect(errorBody({ statusCode: 400, statusMessage: "x".repeat(201) })).toEqual({
+      statusCode: 400,
+      statusMessage: "Bad Request",
+    });
+  });
+
+  it("maps non-integer, out-of-range and string status codes to 500", () => {
+    expect(errorBody({ statusCode: "400" }).statusCode).toBe(500);
+    expect(errorBody({ statusCode: 399 }).statusCode).toBe(500);
+    expect(errorBody({ statusCode: 600 }).statusCode).toBe(500);
+    expect(errorBody({ statusCode: 400.5 }).statusCode).toBe(500);
+    expect(errorBody({ statusCode: undefined }).statusCode).toBe(500);
+  });
+
+  it("carries exactly the two allowed keys", () => {
+    for (const input of [
+      { statusCode: 400, statusMessage: "Invalid route parameter" },
+      { statusCode: 500, statusMessage: "Internal Server Error" },
+      {},
+    ]) {
+      expect(Object.keys(errorBody(input)).sort()).toEqual(["statusCode", "statusMessage"]);
+    }
+  });
+});
+
+describe("default handler on a loopback h3 app", () => {
+  let server: Server;
+  let port: number;
+
+  beforeAll(async () => {
+    const router = createRouter();
+    router.get(
+      "/bad-request",
+      defineEventHandler(() => {
+        throw createError({ statusCode: 400, statusMessage: "Invalid route parameter" });
+      }),
+    );
+    router.get(
+      "/echo/:any",
+      defineEventHandler(() => {
+        throw new Error("secret path /echo/abc?token=xyz");
+      }),
+    );
+    // The third argument is Nitro's fallback default handler; our handler never uses it.
+    // A stand-in for Nitro's default descriptor: it records the call and returns the URL-echoing body,
+    // a redirect location and its security headers; only the security headers may reach the response.
+    const defaultHandler = async (error: unknown, event: { path: string }) => {
+      defaultCalls.push(event.path);
+      if (event.path.startsWith("/throws-default")) {
+        throw new TypeError("Invalid URL from a forwarded host");
+      }
+      return {
+        status: 302,
+        statusText: "Found",
+        headers: {
+          location: "/elsewhere",
+          "content-type": "text/html",
+          "x-content-type-options": "nosniff",
+          "cache-control": "no-cache",
+        },
+        body: { error: true, url: `http://127.0.0.1${event.path}`, message: String(error) },
+      };
+    };
+    const app = createApp({
+      onError: (error, event) => handler(error, event, { defaultHandler } as never),
+    });
+    app.use(router);
+    server = createServer(toNodeListener(app));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const address = server.address();
+    port = typeof address === "object" && address !== null ? address.port : 0;
+  });
+
+  afterAll(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  });
+
+  it("calls Nitro's default descriptor once and keeps only its security headers", async () => {
+    defaultCalls.length = 0;
+    const response = await fetch(`http://127.0.0.1:${port}/echo/abc?token=xyz`);
+    expect(defaultCalls).toHaveLength(1);
+    expect(response.status).toBe(500);
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("cache-control")).toBe("no-cache");
+    expect(response.headers.get("location")).toBeNull();
+    expect(response.headers.get("content-type")).toMatch(/^application\/json/);
+    expect(await response.text()).toBe('{"statusCode":500,"statusMessage":"Internal Server Error"}');
+  });
+
+  it("still sends the sanitized body when Nitro's default descriptor throws", async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/throws-default/abc?token=xyz`);
+    expect(response.status).toBe(404);
+    expect(response.headers.get("content-type")).toMatch(/^application\/json/);
+    expect(await response.text()).toBe('{"statusCode":404,"statusMessage":"Not Found"}');
+  });
+
+  it("answers a thrown 400 with exactly the two fields", async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/bad-request`);
+    expect(response.status).toBe(400);
+    expect(response.headers.get("content-type")).toMatch(/^application\/json/);
+    expect(await response.text()).toBe('{"statusCode":400,"statusMessage":"Invalid route parameter"}');
+  });
+
+  it("answers a thrown plain Error with 500 and never echoes the request", async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/echo/abc?token=xyz`);
+    expect(response.status).toBe(500);
+    expect(response.headers.get("content-type")).toMatch(/^application\/json/);
+    const text = await response.text();
+    expect(text).toBe('{"statusCode":500,"statusMessage":"Internal Server Error"}');
+    for (const echoed of ["echo", "abc", "token", "xyz", "secret"]) {
+      expect(text).not.toContain(echoed);
+    }
+  });
+
+  it("answers an unmatched route with a fixed 404 that never echoes the path", async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/nowhere/abc?token=xyz`);
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe('{"statusCode":404,"statusMessage":"Not Found"}');
+  });
+
+  it("never passes h3's method-naming 405 statusMessage through", () => {
+    expect(errorBody({ statusCode: 405, statusMessage: "Method post is not allowed on this route." })).toEqual({
+      statusCode: 405,
+      statusMessage: "Method Not Allowed",
+    });
+  });
+
+  it("is registered as the Nitro error handler", () => {
+    const config = readFileSync(join(apiRoot, "nitro.config.ts"), "utf8");
+    expect(config).toMatch(/errorHandler:\s*"~\/error"/);
+  });
+
+  it("no API source builds a statusMessage from a template literal (a 4xx message passes through)", () => {
+    const offenders: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name !== "__tests__" && entry.name !== "node_modules") walk(path);
+        } else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) {
+          if (/statusMessage:\s*`/.test(readFileSync(path, "utf8"))) offenders.push(path);
+        }
+      }
+    };
+    walk(join(apiRoot, "server"));
+    expect(offenders).toEqual([]);
+  });
+
+  it("never passes a 404's own statusMessage through", () => {
+    expect(errorBody({ statusCode: 404, statusMessage: "Cannot find any route matching /x/y." })).toEqual({
+      statusCode: 404,
+      statusMessage: "Not Found",
+    });
+  });
+});

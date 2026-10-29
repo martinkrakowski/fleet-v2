@@ -14,6 +14,23 @@ export interface ExecuteAuthorizedForgeActionRequest {
   readonly kind: ForgeActionKind;
   readonly expectedHeadSha: string;
   readonly authorizationGrantId: string;
+  /**
+   * Who authorised the action (auto-merge plan A8): `policy:autoMerge@<rev>` or
+   * `policy:conductor@<rev>` for a policy grant. Absent means an owner grant.
+   * Set only by in-process policy callers; the HTTP entry point drops it.
+   */
+  readonly authorizedBy?: string;
+  /**
+   * PR title/body forwarded to the forge only for `push-and-open-pr`; absent
+   * keeps the adapter's defaults (K6-2). Never read from lane output.
+   */
+  readonly title?: string;
+  readonly body?: string;
+  /**
+   * The run's recorded branch (KF-5b): a safe branch name validated like the
+   * forge read's rule; absent keeps the use case's `feat/<laneId>` default.
+   */
+  readonly branchName?: string;
 }
 
 export type ExecuteAuthorizedForgeActionResult =

@@ -12,16 +12,23 @@ export interface McpServerLike {
   connect(transport: unknown): Promise<void>;
   /**
    * Register a tool. `inputSchema` is a zod schema (raw shape or object
-   * schema); the handler receives no arguments and returns a
-   * CallToolResult-shaped object.
+   * schema); the handler receives the parsed tool arguments and returns a
+   * CallToolResult-shaped object. `annotations` are MCP tool hints (read-only,
+   * destructive, idempotent, open-world).
    */
   registerTool(
     name: string,
     config: {
       description?: string;
       inputSchema?: unknown;
+      annotations?: {
+        readOnlyHint?: boolean;
+        destructiveHint?: boolean;
+        idempotentHint?: boolean;
+        openWorldHint?: boolean;
+      };
     },
-    handler: () => Promise<unknown>,
+    handler: (args: unknown) => Promise<unknown>,
   ): unknown;
   /** Register a static resource; the read callback returns a ReadResourceResult-shaped object. */
   registerResource(

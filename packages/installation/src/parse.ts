@@ -34,9 +34,9 @@ import type {
   SeatHealth,
   SeatSection,
   SeatRole,
+  SeatsPolicy,
   ShelfSection,
   ShelfSectionV2,
-  TelemetryPolicy,
   VerificationProcedure,
   VerificationProceduresSection,
   VerificationSection,
@@ -46,6 +46,7 @@ import type {
 
 import { CONDUCTOR_MINUTE_BOUNDS, CONDUCTOR_REAPER_REPAIR_KINDS } from './policy.js';
 import { readTelemetryPolicyBlock } from './telemetry-policy.js';
+import { readSeatsPolicyBlock } from './seats-policy.js';
 
 export type ParseResult =
   | { ok: true; installation: FleetInstallation }
@@ -165,6 +166,7 @@ const POLICY_KEYS: readonly string[] = [
   'autoMerge',
   'conductor',
   'telemetry',
+  'seats',
 ];
 const FORBIDDEN_ROUTE_KEYS: readonly string[] = ['tool', 'modelPattern'];
 const LIVE_TAIL_KEYS: readonly string[] = ['content'];
@@ -1675,7 +1677,8 @@ function parseV2Policy(
   const liveTail = parseLiveTailPolicy(section, errors);
   const autoMerge = parseAutoMergePolicy(section, errors);
   const conductor = parseConductorPolicy(section, errors);
-  const telemetry = parseTelemetryPolicy(section, errors);
+  const telemetry = parsePolicyBlock(section, 'telemetry', readTelemetryPolicyBlock, errors);
+  const seats: SeatsPolicy | undefined = parsePolicyBlock(section, 'seats', readSeatsPolicyBlock, errors);
   return {
     ...(forbiddenRoutes !== undefined ? { forbiddenRoutes } : {}),
     ...(perLaneCostCeiling !== undefined ? { perLaneCostCeiling } : {}),
@@ -1684,6 +1687,7 @@ function parseV2Policy(
     ...(autoMerge !== undefined ? { autoMerge } : {}),
     ...(conductor !== undefined ? { conductor } : {}),
     ...(telemetry !== undefined ? { telemetry } : {}),
+    ...(seats !== undefined ? { seats } : {}),
   };
 }
 
@@ -1923,19 +1927,21 @@ function parseConductorPolicy(
   };
 }
 
-function parseTelemetryPolicy(
+function parsePolicyBlock<T>(
   section: JsonObject,
+  key: string,
+  read: (value: unknown) => { readonly ok: true; readonly policy: T } | { readonly ok: false; readonly errors: readonly string[] },
   errors: string[],
-): TelemetryPolicy | undefined {
-  if (!Object.hasOwn(section, 'telemetry')) {
+): T | undefined {
+  if (!Object.hasOwn(section, key)) {
     return undefined;
   }
-  const read = readTelemetryPolicyBlock(section.telemetry);
-  if (!read.ok) {
-    errors.push(...read.errors);
+  const result = read(section[key]);
+  if (!result.ok) {
+    errors.push(...result.errors);
     return undefined;
   }
-  return read.policy;
+  return result.policy;
 }
 
 function parseV2Shelf(

@@ -2,6 +2,8 @@
 
 export * from "./AssessHeadAcceptanceUseCase.use-case.js";
 export * from "./InspectAcceptanceEvidenceUseCase.use-case.js";
+export * from "./InspectHeadCiStateUseCase.use-case.js";
+export * from "./OpenEvidenceAssessmentUseCase.use-case.js";
 export * from "./RecordFindingDispositionUseCase.use-case.js";
 export * from "./RecordReviewReceiptUseCase.use-case.js";
 export * from "./RecordVerificationReceiptUseCase.use-case.js";

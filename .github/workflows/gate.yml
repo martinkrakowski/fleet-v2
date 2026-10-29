@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - main
+  # Inert until a merge queue exists on main (plan A-R1, D21/D22); then the queue's run of the
+  # merged result reports the same required check.
+  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -12,27 +15,50 @@ permissions:
 
 concurrency:
   group: gate-${{ github.ref }}
+  # Only a superseded pull_request run is cancelled; push, merge_group and dispatch runs finish.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+# The ruleset on main requires the check named `gate`. It is the aggregate job at the bottom,
+# which passes only when every job it needs succeeded. Renaming or dropping it blocks every PR.
 jobs:
-  gate:
+  build-test:
     runs-on: ubuntu-latest
-    env:
-      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
-      # ubuntu-latest has curl and nc: the ocm-run integration suite must run, never silently skip.
-      OCM_IT_REQUIRE: "1"
     timeout-minutes: 30
+    env:
+      # ubuntu-latest has curl and nc: the ocm-run integration suite (a vitest test in
+      # work-execution) must run, never silently skip. turbo.json declares it in the test task's
+      # env, so strict env mode passes it through to vitest.
+      OCM_IT_REQUIRE: "1"
+      # Pull requests replay cache hits (lane speed plan D27/D29, switched on by the owner on 2026-10-29);
+      # pushes to main still execute every task, so main stays a full run that also refreshes the cache.
+      TURBO_FORCE: ${{ github.event_name != 'pull_request' }}
     steps:
       - uses: actions/checkout@v4
+      # Before setup-node, so its yarn cache lookup resolves Yarn 4 from packageManager.
+      - name: corepack enable (cache lookup)
+        run: corepack enable
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
+          cache: yarn
       - name: corepack enable
         run: corepack enable
+      - name: turbo cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo/cache
+          key: turbo-${{ runner.os }}-${{ hashFiles('yarn.lock') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-${{ runner.os }}-${{ hashFiles('yarn.lock') }}-
       - name: yarn install --immutable
         run: yarn install --immutable
       - name: model-family fixture parity
         run: sh scripts/check-model-family-fixtures.sh
+      - name: turbo env declarations (every env read is declared or reviewed)
+        run: node scripts/check-turbo-env.mjs
       - name: yarn build
         run: yarn build
       - name: yarn typecheck
@@ -43,7 +69,77 @@ jobs:
         run: yarn lint:arch
       - name: yarn test
         run: yarn test
+
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: corepack enable (cache lookup)
+        run: corepack enable
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: yarn
+      - name: corepack enable
+        run: corepack enable
+      - name: yarn install --immutable --mode=skip-build
+        run: yarn install --immutable --mode=skip-build
+      # Lifecycle scripts are skipped here: sync:check needs only the installed hexagen package.
+      # hexagen sync --check reads the manifest and the tracked sources, not build output:
+      # it passes on a checkout with no dist/ (checked before the split, 2026-10-28).
       - name: yarn sync:check
         run: yarn sync:check
-      - name: shell tests (every tests/*.test.sh)
-        run: yarn test:bin
+
+  shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # Every shard reports, so one failure does not hide another's.
+      fail-fast: false
+      matrix:
+        # The shard count is also the denominator below; change both together.
+        shard: [1, 2, 3, 4]
+    name: shell (${{ matrix.shard }}/4)
+    steps:
+      - uses: actions/checkout@v4
+      - name: corepack enable (cache lookup)
+        run: corepack enable
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: yarn
+      - name: corepack enable
+        run: corepack enable
+      # tests/hexagen-contract.test.sh runs the installed hexagen binaries; no lifecycle script is needed.
+      - name: yarn install --immutable --mode=skip-build
+        run: yarn install --immutable --mode=skip-build
+      # Each shard runs the runner pin checks and every tests/*.test.sh whose index in the
+      # bytewise-sorted list is (shard - 1) modulo 4.
+      - name: shell tests (shard ${{ matrix.shard }} of 4)
+        run: yarn test:bin --shard ${{ matrix.shard }}/4
+
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [build-test, sync, shell]
+    # Runs whatever the needed jobs did, and fails unless every one succeeded: a failed,
+    # cancelled or skipped job (or matrix shard) is never a pass.
+    if: ${{ always() }}
+    steps:
+      - name: every needed job succeeded
+        env:
+          BUILD_TEST: ${{ needs.build-test.result }}
+          SYNC: ${{ needs.sync.result }}
+          SHELL_SHARDS: ${{ needs.shell.result }}
+        run: |
+          status=0
+          for pair in "build-test=$BUILD_TEST" "sync=$SYNC" "shell=$SHELL_SHARDS"; do
+            job=${pair%%=*}
+            result=${pair#*=}
+            echo "$job: $result"
+            if [ "$result" != "success" ]; then
+              status=1
+            fi
+          done
+          exit "$status"

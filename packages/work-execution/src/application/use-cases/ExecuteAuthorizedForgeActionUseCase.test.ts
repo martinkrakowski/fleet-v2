@@ -750,12 +750,70 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       return { ...record, ownerDecisionReferences: doors };
     }
 
+    it('journals an ambiguous outcome and rethrows when the forge call throws', async () => {
+      const forgeError = new Error('forge subprocess exploded');
+      const deps = baseDeps(attemptWithDoors([]));
+      const throwingForgePort: ForgeActionPort = {
+        isConfigured: () => true,
+        async performForgeAction() {
+          throw forgeError;
+        },
+      };
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({ ...deps, forgePort: throwingForgePort });
+      await expect(useCase.executeAuthorizedForgeAction(mergeReq)).rejects.toBe(forgeError);
+      const statuses = deps.journal.entries.map((entry) => entry.status);
+      expect(statuses).toEqual(['intent-recorded', 'ambiguous']);
+      const ambiguous = deps.journal.entries[1]!;
+      expect(ambiguous.id).toBe('forge:forge-att-001:ambiguous:2');
+      expect(ambiguous.detail).toBe('forge subprocess exploded');
+      expect(ambiguous).not.toHaveProperty('authorizedBy');
+    });
+
+    it('the ambiguous entry carries authorizedBy when the request names it', async () => {
+      const forgeError = new Error('forge subprocess exploded');
+      const deps = baseDeps(attemptWithDoors([]));
+      const throwingForgePort: ForgeActionPort = {
+        isConfigured: () => true,
+        async performForgeAction() {
+          throw forgeError;
+        },
+      };
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({ ...deps, forgePort: throwingForgePort });
+      await expect(
+        useCase.executeAuthorizedForgeAction({ ...mergeReq, authorizedBy: 'policy:autoMerge@0123456789ab' }),
+      ).rejects.toBe(forgeError);
+      const ambiguous = deps.journal.entries[1]!;
+      expect(ambiguous.status).toBe('ambiguous');
+      expect(ambiguous.authorizedBy).toBe('policy:autoMerge@0123456789ab');
+    });
+
+    it('rethrows the original forge error even when the ambiguous journal append throws', async () => {
+      const forgeError = new Error('forge subprocess exploded');
+      const deps = baseDeps(attemptWithDoors([]));
+      const throwingForgePort: ForgeActionPort = {
+        isConfigured: () => true,
+        async performForgeAction() {
+          throw forgeError;
+        },
+      };
+      const journal = deps.journal as InMemoryJournal;
+      const baseAppend = journal.appendJournalEntry.bind(journal);
+      journal.appendJournalEntry = async (entry) => {
+        if (entry.status === 'ambiguous') {
+          throw new Error('journal unavailable');
+        }
+        await baseAppend(entry);
+      };
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({ ...deps, journal, forgePort: throwingForgePort });
+      await expect(useCase.executeAuthorizedForgeAction(mergeReq)).rejects.toBe(forgeError);
+      expect(deps.journal.entries.map((entry) => entry.status)).toEqual(['intent-recorded']);
+    });
+
     it('an approved door does not block the merge', async () => {
       const calls = { resolve: 0 };
       const useCase = new ExecuteAuthorizedForgeActionUseCase(
         baseDeps(attemptWithDoors(['req-door-1']), ownerPortWith({ outcome: 'approved', decisionId: 'req-door-1' }, calls)),
-      );
-      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      );      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
       expect(result.outcome).toBe('executed');
       expect(calls.resolve).toBe(1);
     });
@@ -817,6 +875,271 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       );
       const result = await useCase.executeAuthorizedForgeAction(mergeReq);
       expect(result.outcome).toBe('executed');
+    });
+  });
+
+  describe('PR title and body forwarding (K6-2)', () => {
+    const HEAD = '1111111111111111111111111111111111111111';
+
+    function capturingDeps() {
+      const seen: Array<Record<string, unknown>> = [];
+      const journal = new InMemoryJournal();
+      const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+      const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+      const authorizationPort: ActionAuthorizationPort = {
+        async resolveActionAuthorization() {
+          return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+        },
+        async consumeActionAuthorization(req) {
+          return { outcome: 'consumed', actionId: req.actionId };
+        },
+      };
+      const forgePort: ForgeActionPort = {
+        isConfigured: () => true,
+        async performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult> {
+          seen.push({ ...request });
+          return { outcome: 'executed', pullRequestNumber: 42, headSha: request.expectedHeadSha };
+        },
+      };
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
+        workOrderRepo,
+        journal,
+        authorizationPort,
+        forgePort,
+        acceptanceEvidencePort: new InMemoryAcceptanceEvidencePort({
+          outcome: 'found',
+          assessment: {
+            candidateHeadSha: HEAD,
+            policyRevision: 'pol-1',
+            state: 'accepted',
+            acceptanceReceiptId: 'receipt-001',
+          },
+        }),
+      });
+      return { useCase, seen };
+    }
+
+    it('forwards title and body to the forge only for push-and-open-pr', async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'act-open',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'push-and-open-pr',
+        expectedHeadSha: HEAD,
+        authorizationGrantId: 'grant-001',
+        title: 'My PR title',
+        body: 'My PR body\nwith a second line',
+      });
+
+      expect(result.outcome).toBe('executed');
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({
+        kind: 'push-and-open-pr',
+        title: 'My PR title',
+        body: 'My PR body\nwith a second line',
+      });
+    });
+
+    it('omits title and body for push-to-pr even when the request carries them', async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'act-push',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'push-to-pr',
+        expectedHeadSha: HEAD,
+        authorizationGrantId: 'grant-001',
+        title: 'should not forward',
+        body: 'should not forward',
+      });
+
+      expect(result.outcome).toBe('executed');
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({ kind: 'push-to-pr' });
+      expect(seen[0]).not.toHaveProperty('title');
+      expect(seen[0]).not.toHaveProperty('body');
+    });
+
+    it('omits title and body for merge-pr', async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'act-merge',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'merge-pr',
+        expectedHeadSha: HEAD,
+        authorizationGrantId: 'grant-001',
+        title: 'should not forward',
+        body: 'should not forward',
+      });
+
+      expect(result.outcome).toBe('executed');
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({ kind: 'merge-pr' });
+      expect(seen[0]).not.toHaveProperty('title');
+      expect(seen[0]).not.toHaveProperty('body');
+    });
+
+    it('forwards neither title nor body when the push-and-open-pr request omits them', async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'act-open-2',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'push-and-open-pr',
+        expectedHeadSha: HEAD,
+        authorizationGrantId: 'grant-001',
+      });
+
+      expect(result.outcome).toBe('executed');
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({ kind: 'push-and-open-pr' });
+      expect(seen[0]).not.toHaveProperty('title');
+      expect(seen[0]).not.toHaveProperty('body');
+    });
+  });
+
+  describe('recorded branch name on forge requests (KF-5b)', () => {
+    const HEAD = '1111111111111111111111111111111111111111';
+
+    function capturingDeps() {
+      const seen: Array<Record<string, unknown>> = [];
+      const journal = new InMemoryJournal();
+      const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+      const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+      const authorizationPort: ActionAuthorizationPort = {
+        async resolveActionAuthorization() {
+          return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+        },
+        async consumeActionAuthorization(req) {
+          return { outcome: 'consumed', actionId: req.actionId };
+        },
+      };
+      const forgePort: ForgeActionPort = {
+        isConfigured: () => true,
+        async performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult> {
+          seen.push({ ...request });
+          return { outcome: 'executed', pullRequestNumber: 42, headSha: request.expectedHeadSha };
+        },
+      };
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
+        workOrderRepo,
+        journal,
+        authorizationPort,
+        forgePort,
+        acceptanceEvidencePort: new InMemoryAcceptanceEvidencePort({
+          outcome: 'found',
+          assessment: {
+            candidateHeadSha: HEAD,
+            policyRevision: 'pol-1',
+            state: 'accepted',
+            acceptanceReceiptId: 'receipt-001',
+          },
+        }),
+      });
+      return { useCase, seen, journal };
+    }
+
+    it('defaults to feat/<laneId> when the request carries no branch name', async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'act-open',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'push-and-open-pr',
+        expectedHeadSha: HEAD,
+        authorizationGrantId: 'grant-001',
+      });
+
+      expect(result.outcome).toBe('executed');
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({ kind: 'push-and-open-pr', branchName: 'feat/lane-auth' });
+    });
+
+    it("forwards the run's recorded branch when the request carries one", async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'act-open',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'push-and-open-pr',
+        expectedHeadSha: HEAD,
+        authorizationGrantId: 'grant-001',
+        branchName: 'fleet/run-01JB0000000000000000000000',
+      });
+
+      expect(result.outcome).toBe('executed');
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({ branchName: 'fleet/run-01JB0000000000000000000000' });
+    });
+
+    it('refuses an unsafe branch name before any grant is consumed or forge call runs', async () => {
+      for (const branchName of ['bad branch', '12345', 'a..b', null, ['fleet/x'], 42] as unknown as string[]) {
+        const journal = new InMemoryJournal();
+        const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+        const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+        let consumed = false;
+        let forgeCalls = 0;
+        const authorizationPort: ActionAuthorizationPort = {
+          async resolveActionAuthorization() {
+            return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+          },
+          async consumeActionAuthorization(req) {
+            consumed = true;
+            return { outcome: 'consumed', actionId: req.actionId };
+          },
+        };
+        const forgePort: ForgeActionPort = {
+          isConfigured: () => true,
+          async performForgeAction(): Promise<ForgeActionResult> {
+            forgeCalls += 1;
+            return { outcome: 'executed', headSha: HEAD };
+          },
+        };
+        const useCase = new ExecuteAuthorizedForgeActionUseCase({
+          attemptRepo,
+          attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
+          workOrderRepo,
+          journal,
+          authorizationPort,
+          forgePort,
+          acceptanceEvidencePort: new InMemoryAcceptanceEvidencePort({
+            outcome: 'found',
+            assessment: {
+              candidateHeadSha: HEAD,
+              policyRevision: 'pol-1',
+              state: 'accepted',
+              acceptanceReceiptId: 'receipt-001',
+            },
+          }),
+        });
+
+        const result = await useCase.executeAuthorizedForgeAction({
+          actionId: 'act-1',
+          attemptId: 'att-001',
+          workOrderId: 'wo-001',
+          kind: 'merge-pr',
+          expectedHeadSha: HEAD,
+          authorizationGrantId: 'grant-001',
+          branchName,
+        });
+
+        expect(result).toEqual({ outcome: 'refused', reason: 'branchName must be a safe branch name' });
+        expect(consumed).toBe(false);
+        expect(forgeCalls).toBe(0);
+        expect(journal.entries).toHaveLength(0);
+      }
     });
   });
 });

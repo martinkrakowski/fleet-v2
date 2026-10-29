@@ -18,7 +18,8 @@ const UNRESOLVED_THREADS_QUERY =
 
 /** Per-step scripted results; an Error makes that step's runGh reject. */
 type GhScript = {
-  readonly pulls?: GhCommandResult | Error;
+  /** One response per pull lookup; a single response is reused for both lookups. */
+  readonly pulls?: GhCommandResult | Error | readonly (GhCommandResult | Error)[];
   readonly checks?: GhCommandResult | Error;
   readonly threads?: GhCommandResult | Error;
 };
@@ -54,10 +55,16 @@ function recordedGh(script: GhScript = {}): {
   readonly calls: readonly (readonly string[])[];
 } {
   const calls: string[][] = [];
+  const pullsQueue = Array.isArray(script.pulls) ? [...script.pulls] : script.pulls !== undefined ? [script.pulls] : [];
+  let pullsIndex = 0;
   const runGh = async (args: readonly string[]): Promise<GhCommandResult> => {
     calls.push([...args]);
     const step =
-      args[0] === 'pr' ? script.checks : args[1] === 'graphql' ? script.threads : script.pulls;
+      args[0] === 'pr'
+        ? script.checks
+        : args[1] === 'graphql'
+          ? script.threads
+          : pullsQueue[pullsIndex++];
     if (step instanceof Error) {
       throw step;
     }
@@ -98,10 +105,12 @@ describe('ForgeEvidenceAdapter', () => {
       candidateHeadSha: HEAD,
       ciState: 'pass',
       unresolvedThreadCount: 2,
+      observedHeadSha: HEAD,
     });
     expect(calls).toEqual([
       ['api', `repos/${OWNER}/${REPO}/commits/${HEAD}/pulls`],
       ['pr', 'checks', String(PR_NUMBER), '-R', `${OWNER}/${REPO}`, '--json', 'bucket'],
+      ['api', `repos/${OWNER}/${REPO}/commits/${HEAD}/pulls`],
       [
         'api',
         'graphql',
@@ -145,6 +154,7 @@ describe('ForgeEvidenceAdapter', () => {
       candidateHeadSha: HEAD,
       ciState: 'unknown',
       unresolvedThreadCount: null,
+      observedHeadSha: null,
     });
     expect(calls).toEqual([['api', `repos/${OWNER}/${REPO}/commits/${HEAD}/pulls`]]);
   });
@@ -158,6 +168,7 @@ describe('ForgeEvidenceAdapter', () => {
       candidateHeadSha: HEAD,
       ciState: 'unknown',
       unresolvedThreadCount: null,
+      observedHeadSha: null,
     });
     expect(calls).toEqual([['api', `repos/${OWNER}/${REPO}/commits/${HEAD}/pulls`]]);
   });
@@ -171,6 +182,7 @@ describe('ForgeEvidenceAdapter', () => {
       candidateHeadSha: HEAD,
       ciState: 'unknown',
       unresolvedThreadCount: null,
+      observedHeadSha: null,
     });
     expect(calls).toEqual([['api', `repos/${OWNER}/${REPO}/commits/${HEAD}/pulls`]]);
   });
@@ -185,8 +197,9 @@ describe('ForgeEvidenceAdapter', () => {
       candidateHeadSha: HEAD,
       ciState: 'unknown',
       unresolvedThreadCount: 2,
+      observedHeadSha: HEAD,
     });
-    expect(calls.length).toBe(3);
+    expect(calls.length).toBe(4);
   });
 
   it('reports a null thread count when the threads call exits non-zero', async () => {
@@ -196,6 +209,7 @@ describe('ForgeEvidenceAdapter', () => {
       candidateHeadSha: HEAD,
       ciState: 'pass',
       unresolvedThreadCount: null,
+      observedHeadSha: HEAD,
     });
   });
 
@@ -206,6 +220,7 @@ describe('ForgeEvidenceAdapter', () => {
       candidateHeadSha: HEAD,
       ciState: 'pass',
       unresolvedThreadCount: null,
+      observedHeadSha: HEAD,
     });
   });
 
@@ -221,6 +236,7 @@ describe('ForgeEvidenceAdapter', () => {
       candidateHeadSha: HEAD,
       ciState: 'pass',
       unresolvedThreadCount: null,
+      observedHeadSha: HEAD,
     });
   });
 
@@ -231,6 +247,7 @@ describe('ForgeEvidenceAdapter', () => {
       candidateHeadSha: HEAD,
       ciState: 'pass',
       unresolvedThreadCount: null,
+      observedHeadSha: HEAD,
     });
   });
 
@@ -241,6 +258,7 @@ describe('ForgeEvidenceAdapter', () => {
       candidateHeadSha: HEAD,
       ciState: 'pass',
       unresolvedThreadCount: 2,
+      observedHeadSha: HEAD,
     });
   });
 
@@ -254,6 +272,7 @@ describe('ForgeEvidenceAdapter', () => {
         candidateHeadSha: HEAD,
         ciState: 'unknown',
         unresolvedThreadCount: null,
+        observedHeadSha: null,
       });
     }
   });
@@ -276,6 +295,7 @@ describe('ForgeEvidenceAdapter', () => {
         candidateHeadSha: HEAD,
         ciState: 'unknown',
         unresolvedThreadCount: null,
+        observedHeadSha: null,
       });
     }
     expect(missingOwner.calls).toEqual([]);
@@ -291,8 +311,63 @@ describe('ForgeEvidenceAdapter', () => {
         candidateHeadSha,
         ciState: 'unknown',
         unresolvedThreadCount: null,
+        observedHeadSha: null,
       });
     }
     expect(calls).toEqual([]);
+  });
+
+  it('re-reads the PR head after the checks with the same lookup and reports the observed head', async () => {
+    const { adapter, calls } = adapterWith({
+      pulls: [
+        pullsResponse([openPull(PR_NUMBER, HEAD)]),
+        pullsResponse([openPull(PR_NUMBER, OTHER_HEAD)]),
+      ],
+      checks: checksResponse(['pass']),
+      threads: threadsResponse(0, 0),
+    });
+
+    expect(await adapter.readForgeCheckStatus({ candidateHeadSha: HEAD })).toEqual({
+      candidateHeadSha: HEAD,
+      ciState: 'pass',
+      unresolvedThreadCount: 0,
+      observedHeadSha: OTHER_HEAD,
+    });
+    expect(calls).toEqual([
+      ['api', `repos/${OWNER}/${REPO}/commits/${HEAD}/pulls`],
+      ['pr', 'checks', String(PR_NUMBER), '-R', `${OWNER}/${REPO}`, '--json', 'bucket'],
+      ['api', `repos/${OWNER}/${REPO}/commits/${HEAD}/pulls`],
+      [
+        'api',
+        'graphql',
+        '-f',
+        `query=${UNRESOLVED_THREADS_QUERY}`,
+        '-F',
+        `owner=${OWNER}`,
+        '-F',
+        `repo=${REPO}`,
+        '-F',
+        `number=${PR_NUMBER}`,
+      ],
+    ]);
+  });
+
+  it('reports null observedHeadSha when the post-checks head re-read fails', async () => {
+    const { adapter, calls } = adapterWith({
+      pulls: [
+        pullsResponse([openPull(PR_NUMBER, HEAD)]),
+        { exitCode: 1, stdout: 'gh: not found' },
+      ],
+      checks: checksResponse(['pass']),
+      threads: threadsResponse(0, 0),
+    });
+
+    const status = await adapter.readForgeCheckStatus({ candidateHeadSha: HEAD });
+    expect(status.ciState).toBe('pass');
+    expect(status.unresolvedThreadCount).toBe(0);
+    expect(status.observedHeadSha).toBeNull();
+    // The initial lookup plus exactly one extra head read.
+    const pullLookups = calls.filter((args) => args[0] === 'api' && !args.includes('graphql'));
+    expect(pullLookups.length).toBe(2);
   });
 });

@@ -9,6 +9,7 @@ import { UNTRUSTED_INPUT_RULE } from '../../../domain/untrusted-input.js';
 import type { IndependentReviewTransportResult } from '../IndependentReviewAdapter.adapter.js';
 import { IndependentReviewAdapter } from '../IndependentReviewAdapter.adapter.js';
 import {
+  buildEmbeddedReviewPrompt,
   CLI_REVIEWER_ENV_ALLOWLIST,
   createCliReviewTransport,
   GROK_REVIEW_ARGV_TEMPLATE,
@@ -16,7 +17,7 @@ import {
   type CliReviewSpawn,
   type CliReviewTransportOptions,
 } from '../CliReviewTransport.adapter.js';
-import { DEFAULT_REVIEW_TIMEOUT_MS, REVIEW_REPLY_CONTRACT } from '../OcmReviewTransport.adapter.js';
+import { DEFAULT_REVIEW_TIMEOUT_MS, REVIEW_CHECKLIST, REVIEW_REPLY_CONTRACT } from '../OcmReviewTransport.adapter.js';
 import type { ReviewLocation } from '../ReviewTransportRouter.js';
 import type { SpawnRunOptions } from '../spawn-run.js';
 
@@ -465,5 +466,78 @@ describe('CliReviewTransport', () => {
     if (result.outcome === 'unavailable') {
       expect(result.reason).toContain('reviewer CLI returned a one-line response');
     }
+  });
+
+  describe('review prompts by kind and strict verdicts (K5-E1)', () => {
+    const BRIEF = '1. Add the review seat.\n2. Wire the checklist.';
+
+    it('a manual embedded prompt is byte-for-byte the pre-kind output', () => {
+      const prompt = buildEmbeddedReviewPrompt(BASE_REQUEST, DIFF, NONCE);
+      const expected =
+        `Independent read-only code review for attempt "${BASE_REQUEST.attemptId}" at candidate head "${BASE_REQUEST.candidateHeadSha}".\n\n` +
+        `You have no access to the repository. The complete change under review is embedded below as a unified diff. Do not try to read, edit, create or run anything.\n\n` +
+        `${UNTRUSTED_INPUT_RULE}\n\n` +
+        `Diff:\n` +
+        `<<<UNTRUSTED nonce=${NONCE} label="diff">>>\n` +
+        `${DIFF}\n` +
+        `<<<END UNTRUSTED nonce=${NONCE}>>>\n\n` +
+        REVIEW_REPLY_CONTRACT;
+      expect(prompt).toBe(expected);
+    });
+
+    it('a brief-check embedded prompt names the kind, embeds the brief with the nonce, and counts the nonce three times', async () => {
+      const { transport, spawnCalls } = buildHarness();
+      await transport({ ...BASE_REQUEST, kind: 'brief-check', briefText: BRIEF });
+
+      const prompt = spawnCalls[0].args[spawnCalls[0].args.length - 1];
+      expect(prompt).toContain(
+        `Independent read-only brief-check review for attempt "${BASE_REQUEST.attemptId}" at candidate head "${BASE_REQUEST.candidateHeadSha}".`,
+      );
+      expect(prompt).toContain(`<<<UNTRUSTED nonce=${NONCE} label="brief">>>`);
+      expect(prompt).toContain('1. Add the review seat.');
+      expect(prompt).toContain('every work-order item of the brief');
+      expect(prompt).not.toContain(REVIEW_CHECKLIST);
+      // diff block (2 occurrences) + brief block (2 occurrences)
+      expect(prompt.split(NONCE).length - 1).toBe(4);
+    });
+
+    it('a brief-check embedded prompt without a briefText still builds and says the brief was not supplied', async () => {
+      const { transport, spawnCalls } = buildHarness();
+      await transport({ ...BASE_REQUEST, kind: 'brief-check' });
+
+      const prompt = spawnCalls[0].args[spawnCalls[0].args.length - 1];
+      expect(prompt).toContain('The brief was not supplied.');
+      expect(prompt).not.toContain('label="brief"');
+    });
+
+    it('code-review and pre-merge embedded prompts carry the checklist', async () => {
+      for (const kind of ['code-review', 'pre-merge'] as const) {
+        const { transport, spawnCalls } = buildHarness();
+        await transport({ ...BASE_REQUEST, kind });
+        const prompt = spawnCalls[0].args[spawnCalls[0].args.length - 1];
+        expect(prompt).toContain(`Independent read-only ${kind} review`);
+        expect(prompt).toContain(REVIEW_CHECKLIST);
+        expect(prompt).not.toContain('label="brief"');
+      }
+    });
+
+    it('the transport applies the strict parse only when the request carries a kind', async () => {
+      const spawn: CliReviewSpawn = async () => ({
+        exitCode: 0,
+        signal: null,
+        stdout: 'FINDING: major a.txt:2 request without validation\nVERDICT: PASS\n',
+        stderr: '',
+      });
+
+      // Manual request: the old parse keeps a major-only PASS a pass.
+      const { transport: manualTransport } = buildHarness({ spawn });
+      const manual = await manualTransport(BASE_REQUEST);
+      expect(manual.result).toBe('pass');
+
+      // Conductor request: strict — a major finding turns the PASS into a fail.
+      const { transport: conductorTransport } = buildHarness({ spawn });
+      const conductor = await conductorTransport({ ...BASE_REQUEST, kind: 'code-review' });
+      expect(conductor.result).toBe('fail');
+    });
   });
 });

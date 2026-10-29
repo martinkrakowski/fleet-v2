@@ -258,11 +258,15 @@ describe('AttemptArtifactAdapter with a fake executor', () => {
   });
 
   it('places the frozen brief through the recorded host\'s executor; without one it keeps the local executor (KF-8)', async () => {
+    const recordedHostCalls: unknown[] = [];
     const local = fakeExecutor(() => ({}));
     const remote = fakeExecutor(() => ({}));
     const adapter = new AttemptArtifactAdapter({
       executor: local.executor,
-      executorForRecordedHost: () => ({ ok: true, executor: remote.executor }),
+      executorForRecordedHost: (recorded) => {
+        recordedHostCalls.push(recorded);
+        return { ok: true, executor: remote.executor };
+      },
     });
     const recordedHost = {
       kind: 'opencode' as const,
@@ -281,17 +285,61 @@ describe('AttemptArtifactAdapter with a fake executor', () => {
       recordedHost,
     });
     expect(placed.outcome).toBe('placed');
+    expect(recordedHostCalls).toEqual([recordedHost]);
     expect(remote.calls.length).toBeGreaterThan(0);
     expect(local.calls).toHaveLength(0);
 
-    // Manual prepare carries no recorded host and keeps the configured executor.
-    const manual = await new AttemptArtifactAdapter({ executor: local.executor }).placeFrozenBrief({
+    // Manual prepare carries no recorded host: the recorded-host resolver is
+    // not consulted and the configured local executor runs.
+    const manual = await adapter.placeFrozenBrief({
       attemptId: 'att-2',
       worktreePath: '/wt',
       proseMarkdown: '# Brief',
       manifestJson: '{}',
     });
     expect(manual.outcome).toBe('placed');
+    expect(recordedHostCalls).toHaveLength(1);
+    expect(local.calls.length).toBeGreaterThan(0);
+  });
+
+  it('verifies ignored paths through the recorded host\'s executor; without one it keeps the local executor (KF-8)', async () => {
+    const recordedHostCalls: unknown[] = [];
+    const local = fakeExecutor((call) => (call.argv[0] === 'git' ? { exitCode: 0 } : {}));
+    const remote = fakeExecutor((call) => (call.argv[0] === 'git' ? { exitCode: 0 } : {}));
+    const adapter = new AttemptArtifactAdapter({
+      executor: local.executor,
+      executorForRecordedHost: (recorded) => {
+        recordedHostCalls.push(recorded);
+        return { ok: true, executor: remote.executor };
+      },
+    });
+    const recordedHost = {
+      kind: 'opencode' as const,
+      hostName: 'lane-ssh',
+      remotePort: 41002,
+      host: 'lane-ssh',
+      agent: null,
+      model: null,
+      variant: null,
+    };
+    const verified = await adapter.verifyIgnoredPaths({
+      worktreePath: '/wt',
+      candidatePaths: ['.lane/brief.md'],
+      recordedHost,
+    });
+    expect(verified).toEqual({ outcome: 'ignored', checkedPaths: ['.lane/brief.md'] });
+    expect(recordedHostCalls).toEqual([recordedHost]);
+    expect(remote.calls.length).toBeGreaterThan(0);
+    expect(local.calls).toHaveLength(0);
+
+    // Without a recorded host the resolver is not consulted and the
+    // configured local executor runs.
+    const manual = await adapter.verifyIgnoredPaths({
+      worktreePath: '/wt',
+      candidatePaths: ['.lane/brief.md'],
+    });
+    expect(manual).toEqual({ outcome: 'ignored', checkedPaths: ['.lane/brief.md'] });
+    expect(recordedHostCalls).toHaveLength(1);
     expect(local.calls.length).toBeGreaterThan(0);
   });
 

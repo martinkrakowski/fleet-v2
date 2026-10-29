@@ -230,11 +230,14 @@ function makeCapturingArtifactPort(): {
   port: AttemptArtifactPort;
   placedManifestJsons: string[];
   placedRequests: Parameters<AttemptArtifactPort['placeFrozenBrief']>[0][];
+  verifyIgnoredPathsRequests: Parameters<AttemptArtifactPort['verifyIgnoredPaths']>[0][];
 } {
   const placedManifestJsons: string[] = [];
   const placedRequests: Parameters<AttemptArtifactPort['placeFrozenBrief']>[0][] = [];
+  const verifyIgnoredPathsRequests: Parameters<AttemptArtifactPort['verifyIgnoredPaths']>[0][] = [];
   const port: AttemptArtifactPort = {
     async verifyIgnoredPaths(request) {
+      verifyIgnoredPathsRequests.push(request);
       return { outcome: 'ignored', checkedPaths: request.candidatePaths };
     },
     async placeFrozenBrief(request) {
@@ -258,7 +261,7 @@ function makeCapturingArtifactPort(): {
       };
     },
   };
-  return { port, placedManifestJsons, placedRequests };
+  return { port, placedManifestJsons, placedRequests, verifyIgnoredPathsRequests };
 }
 
 describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
@@ -314,7 +317,7 @@ describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
     });
   });
 
-  it('forwards the recorded host to the frozen brief placement (KF-8)', async () => {
+  it('forwards the recorded host to ignored-path verification and the frozen brief placement (KF-8)', async () => {
     const captured = makeCapturingArtifactPort();
     const useCase = new PrepareBriefPackageUseCase({
       briefAuthoring: makeBriefAuthoring(),
@@ -331,16 +334,20 @@ describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
     };
     const result = await useCase.prepareBriefPackage(validRequest({ recordedHost }));
     expect(result.outcome).toBe('prepared');
+    expect(captured.verifyIgnoredPathsRequests).toHaveLength(1);
+    expect(captured.verifyIgnoredPathsRequests[0].recordedHost).toEqual(recordedHost);
     expect(captured.placedRequests).toHaveLength(1);
     expect(captured.placedRequests[0].recordedHost).toEqual(recordedHost);
 
-    // A request without a recorded host places without one (manual prepare).
+    // A request without a recorded host verifies and places without one (manual prepare).
     const manual = makeCapturingArtifactPort();
     const manualUseCase = new PrepareBriefPackageUseCase({
       briefAuthoring: makeBriefAuthoring(),
       artifactPort: manual.port,
     });
     await manualUseCase.prepareBriefPackage(validRequest());
+    expect(manual.verifyIgnoredPathsRequests).toHaveLength(1);
+    expect(manual.verifyIgnoredPathsRequests[0].recordedHost).toBeUndefined();
     expect(manual.placedRequests).toHaveLength(1);
     expect(manual.placedRequests[0].recordedHost).toBeUndefined();
   });

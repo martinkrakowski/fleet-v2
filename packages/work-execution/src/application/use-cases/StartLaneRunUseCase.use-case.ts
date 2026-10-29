@@ -312,17 +312,6 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       transport = held.transport ?? (held.sshAlias ? 'ssh' : 'local');
       sshAlias = held.sshAlias ?? null;
       port = held.port ?? null;
-      // An ssh reservation without its alias, or an opencode host without a
-      // port, can never be confirmed against the installation (H9b2): it is
-      // released like any other incomplete reservation, never a null-host
-      // record.
-      if (
-        (transport === 'ssh' && sshAlias === null) ||
-        (hostKind === 'opencode' && port === null)
-      ) {
-        await deps.executionJournal.releaseCapacityReservation(request.attemptId, request.nowIso);
-        return incomplete(request.runId, request.attemptId, 'reserve', 'reservation-incomplete');
-      }
     } else if (held !== null) {
       // A held but incomplete reservation is released, never re-reserved over.
       // Both release outcomes report `incomplete reserve`: a confirmed release
@@ -354,6 +343,20 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       transport = reserved.transport;
       sshAlias = reserved.sshAlias;
       port = reserved.port;
+    }
+    // KF-8: a blank alias is no alias (matching `confirmRecordedHost`'s
+    // trim), and the incomplete check runs once after both branches: an ssh
+    // reservation without an alias, or an opencode host without a port, can
+    // never be confirmed against the installation (H9b2). Such a reservation
+    // is released like any other incomplete reservation, never a null-host
+    // record.
+    sshAlias = sshAlias?.trim() || null;
+    if (
+      (transport === 'ssh' && sshAlias === null) ||
+      (hostKind === 'opencode' && port === null)
+    ) {
+      await deps.executionJournal.releaseCapacityReservation(request.attemptId, request.nowIso);
+      return incomplete(request.runId, request.attemptId, 'reserve', 'reservation-incomplete');
     }
     const reservation = { hostName, hostKind, worktreePath };
     const recordedHost = recordedHostOf({ hostKind, hostName, transport, sshAlias, port });

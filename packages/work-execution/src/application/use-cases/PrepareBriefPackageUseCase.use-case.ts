@@ -420,6 +420,9 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     const verified = await deps.artifactPort.verifyIgnoredPaths({
       worktreePath: placementCheck.worktreePath,
       candidatePaths: ['.lane/brief.md', '.lane/brief-manifest.json', ...request.expectedArtifacts],
+      // KF-8: the verification runs on the worktree's recorded host, so a
+      // worktree on an ssh host is checked against that host's ignore rules.
+      ...(request.recordedHost !== undefined ? { recordedHost: request.recordedHost } : {}),
     });
     if (verified.outcome === 'not-ignored') {
       return {

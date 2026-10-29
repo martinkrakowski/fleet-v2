@@ -139,9 +139,14 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
   }
 
   async verifyIgnoredPaths(request: VerifyIgnoredPathsRequest): Promise<VerifyIgnoredPathsResult> {
+    // The check runs through the same executor as the writes: with a
+    // recorded host the worktree lives on that host, so the git check-ignore
+    // must run there too; without one (manual prepare) it keeps the
+    // configured executor.
+    const executor = this.executorFor(request.recordedHost);
     const offendingPaths: string[] = [];
     for (const candidatePath of request.candidatePaths) {
-      const ignored = await this.checkIgnored(request.worktreePath, candidatePath);
+      const ignored = await this.checkIgnored(request.worktreePath, candidatePath, executor);
       if (!ignored) offendingPaths.push(candidatePath);
     }
     if (offendingPaths.length > 0) {

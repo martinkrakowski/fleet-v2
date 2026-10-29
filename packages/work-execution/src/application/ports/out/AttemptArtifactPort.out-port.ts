@@ -36,6 +36,13 @@ export type PlaceFrozenBriefResult =
 export interface VerifyIgnoredPathsRequest {
   readonly worktreePath: string;
   readonly candidatePaths: readonly string[];
+  /**
+   * KF-8. The attempt's recorded runner block, as the reservation recorded
+   * it: the recorded host is the truth, so the ignored-path check runs on
+   * that host's executor. Absent (manual prepare) keeps the configured
+   * executor.
+   */
+  readonly recordedHost?: AttemptRunnerRecord | null;
 }
 
 export type VerifyIgnoredPathsResult =

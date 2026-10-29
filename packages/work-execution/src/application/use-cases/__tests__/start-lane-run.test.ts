@@ -654,7 +654,8 @@ describe('StartLaneRunUseCase', () => {
       worktreePath: WORKTREE_PATH,
       transport: 'local',
       sshAlias: null,
-      port: null,
+      // The agy guard maps any numeric port to a null remote port.
+      port: 4166,
     });
     const result = await harness.useCase.startLaneRun(
       requestFixture({
@@ -749,6 +750,87 @@ describe('StartLaneRunUseCase', () => {
       reason: 'reservation-incomplete',
     });
     expect(releaseSpy).toHaveBeenCalledTimes(1);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+  });
+
+  it('test 3g (KF-8): a fresh ssh reservation without an alias is released and reported incomplete reserve', async () => {
+    const harness = makeHarness();
+    harness.setCapacityAnswer({
+      outcome: 'reserved',
+      hostName: HOST_NAME,
+      hostKind: 'opencode',
+      worktreePath: WORKTREE_PATH,
+      transport: 'ssh',
+      sshAlias: null,
+      port: 41001,
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'reserve',
+      reason: 'reservation-incomplete',
+    });
+    expect(releaseSpy).toHaveBeenCalledTimes(1);
+    expect(releaseSpy).toHaveBeenCalledWith(ATTEMPT_ID, NOW);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+  });
+
+  it('test 3h (KF-8): a fresh ssh reservation with a blank alias is released and reported incomplete reserve', async () => {
+    const harness = makeHarness();
+    harness.setCapacityAnswer({
+      outcome: 'reserved',
+      hostName: HOST_NAME,
+      hostKind: 'opencode',
+      worktreePath: WORKTREE_PATH,
+      transport: 'ssh',
+      sshAlias: '   ',
+      port: 41001,
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'reserve',
+      reason: 'reservation-incomplete',
+    });
+    expect(releaseSpy).toHaveBeenCalledTimes(1);
+    expect(releaseSpy).toHaveBeenCalledWith(ATTEMPT_ID, NOW);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+  });
+
+  it('test 3i (KF-8): a fresh opencode reservation without a port is released and reported incomplete reserve', async () => {
+    const harness = makeHarness();
+    harness.setCapacityAnswer({
+      outcome: 'reserved',
+      hostName: HOST_NAME,
+      hostKind: 'opencode',
+      worktreePath: WORKTREE_PATH,
+      transport: 'local',
+      sshAlias: null,
+      port: null,
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'reserve',
+      reason: 'reservation-incomplete',
+    });
+    expect(releaseSpy).toHaveBeenCalledTimes(1);
+    expect(releaseSpy).toHaveBeenCalledWith(ATTEMPT_ID, NOW);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
     expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
   });
 

@@ -769,11 +769,20 @@ describe('CliReviewTransport', () => {
       expect(result.findings).toHaveLength(1);
     });
 
+    it('a one-line bare verdict is a clean review, for agy and grok alike (KF-14d)', async () => {
+      const agySpawn: CliReviewSpawn = async () => ({ exitCode: 0, signal: null, stdout: agyStdout('VERDICT: PASS\n'), stderr: '' });
+      const agy = buildAgyHarness({ spawn: agySpawn });
+      expect((await agy.transport(AGY_REQUEST)).result).toBe('pass');
+      const grokSpawn: CliReviewSpawn = async () => ({ exitCode: 0, signal: null, stdout: grokStdout('VERDICT: PASS\n'), stderr: '' });
+      const grok = buildHarness({ spawn: grokSpawn });
+      expect((await grok.transport(BASE_REQUEST)).result).toBe('pass');
+    });
+
     it('a one-line response field is a failed review, as it is for grok (CT-4a Argon)', async () => {
       const spawn: CliReviewSpawn = async () => ({
         exitCode: 0,
         signal: null,
-        stdout: agyStdout('VERDICT: PASS\n'),
+        stdout: agyStdout('Looks fine to me.\n'),
         stderr: '',
       });
       const { transport, scratchDirs } = buildAgyHarness({ spawn });

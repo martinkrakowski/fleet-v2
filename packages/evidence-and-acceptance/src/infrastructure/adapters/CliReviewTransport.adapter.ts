@@ -23,6 +23,8 @@ import {
   DEFAULT_REVIEW_TIMEOUT_MS,
   MAX_RAW_OUTPUT_LENGTH,
   parseReviewReply,
+  parseReviewReplyStrict,
+  REVIEW_CHECKLIST,
   REVIEW_REPLY_CONTRACT,
 } from './OcmReviewTransport.adapter.js';
 import type { ReviewLocation } from './ReviewTransportRouter.js';
@@ -84,21 +86,61 @@ export function substituteReviewArgv(template: readonly string[], model: string,
 
 export function buildEmbeddedReviewPrompt(request: RunIndependentReviewRequest, diff: string, nonce: string): string {
   // Every lane-written text in this prompt goes through `wrapUntrusted`.
-  const header = `Independent read-only code review for attempt "${request.attemptId}" at candidate head "${request.candidateHeadSha}".`;
-  const scope =
-    'You have no access to the repository. The complete change under review is embedded below as a unified diff. Do not try to read, edit, create or run anything.';
   const wrappedDiff = wrapUntrusted({ label: 'diff', text: diff, nonce });
   const diffSection = `Diff:\n${wrappedDiff}`;
+  const wrappedDiffSummarySection = () => {
+    if (typeof request.diffSummary === 'string' && request.diffSummary.trim() !== '') {
+      const wrappedSummary = wrapUntrusted({
+        label: 'diff summary',
+        text: request.diffSummary.trim(),
+        nonce,
+      });
+      return `Diff summary:\n${wrappedSummary}`;
+    }
+    return null;
+  };
 
+  // A manual review (no kind) receives byte-for-byte the pre-kind prompt.
+  if (request.kind === undefined) {
+    const header = `Independent read-only code review for attempt "${request.attemptId}" at candidate head "${request.candidateHeadSha}".`;
+    const scope =
+      'You have no access to the repository. The complete change under review is embedded below as a unified diff. Do not try to read, edit, create or run anything.';
+
+    const sections: string[] = [header, scope, UNTRUSTED_INPUT_RULE, diffSection];
+
+    const summarySection = wrappedDiffSummarySection();
+    if (summarySection !== null) {
+      sections.push(summarySection);
+    }
+
+    sections.push(REVIEW_REPLY_CONTRACT);
+
+    return sections.join('\n\n');
+  }
+
+  const header = `Independent read-only ${request.kind} review for attempt "${request.attemptId}" at candidate head "${request.candidateHeadSha}".`;
+  const scope =
+    'You have no access to the repository. The complete change under review is embedded below as a unified diff. Do not try to read, edit, create or run anything.';
   const sections: string[] = [header, scope, UNTRUSTED_INPUT_RULE, diffSection];
 
-  if (typeof request.diffSummary === 'string' && request.diffSummary.trim() !== '') {
-    const wrappedSummary = wrapUntrusted({
-      label: 'diff summary',
-      text: request.diffSummary.trim(),
-      nonce,
-    });
-    sections.push(`Diff summary:\n${wrappedSummary}`);
+  const summarySection = wrappedDiffSummarySection();
+  if (summarySection !== null) {
+    sections.push(summarySection);
+  }
+
+  if (request.kind === 'brief-check') {
+    if (typeof request.briefText === 'string' && request.briefText.trim() !== '') {
+      const wrappedBrief = wrapUntrusted({ label: 'brief', text: request.briefText, nonce });
+      sections.push(
+        `Brief:\n${wrappedBrief}\n\n` +
+          'Does the change satisfy every work-order item of the brief? Report a FINDING for each item the change does not satisfy.',
+      );
+    } else {
+      // The conductor always supplies the brief; a missing one still builds.
+      sections.push('The brief was not supplied.');
+    }
+  } else {
+    sections.push(REVIEW_CHECKLIST);
   }
 
   sections.push(REVIEW_REPLY_CONTRACT);
@@ -238,7 +280,11 @@ export function createCliReviewTransport(
         statusAfter === statusBefore;
 
       // 12. Parse the verdict and findings from the plain-text stdout
-      const parsed = parseReviewReply(text, text);
+      // A conductor request (a kind) is validated strictly; a manual request keeps today's parse.
+      const parsed =
+        request.kind !== undefined
+          ? parseReviewReplyStrict(text, text)
+          : parseReviewReply(text, text);
       const rawOutput = text.length > MAX_RAW_OUTPUT_LENGTH ? text.slice(-MAX_RAW_OUTPUT_LENGTH) : text;
 
       // 13. Return the completed review

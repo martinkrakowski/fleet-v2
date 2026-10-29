@@ -14,6 +14,12 @@ export interface ExecuteAuthorizedForgeActionRequest {
   readonly kind: ForgeActionKind;
   readonly expectedHeadSha: string;
   readonly authorizationGrantId: string;
+  /**
+   * Who authorised the action (auto-merge plan A8): `policy:autoMerge@<rev>` or
+   * `policy:conductor@<rev>` for a policy grant. Absent means an owner grant.
+   * Set only by in-process policy callers; the HTTP entry point drops it.
+   */
+  readonly authorizedBy?: string;
 }
 
 export type ExecuteAuthorizedForgeActionResult =

@@ -380,6 +380,7 @@ describe('apps/api runtime wiring', () => {
       if (result.outcome === 'blocked') {
         expect(result.blockers.some((blocker) => blocker.includes('owner decision'))).toBe(false);
         expect(result.blockers).toEqual([
+          'forge could not confirm the pull request head after reading CI state',
           "forge reports CI state 'unknown' for this candidate head",
           'forge could not read review threads for this candidate head',
         ]);

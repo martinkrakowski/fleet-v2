@@ -11,6 +11,9 @@ import {
   DEFAULT_REVIEW_TIMEOUT_MS,
   extractTextPart,
   type OcmReviewTransportSpawn,
+  parseReviewReplyStrict,
+  REVIEW_CHECKLIST,
+  REVIEW_REPLY_CONTRACT,
 } from '../OcmReviewTransport.adapter.js';
 
 function extractPromptNonce(prompt: string): string {
@@ -1292,6 +1295,137 @@ describe('OcmReviewTransport', () => {
       const adapter = new IndependentReviewAdapter({ runReview: transport });
       const result = await adapter.runIndependentReview(baseRequest);
       expect(result.outcome).toBe('unavailable');
+    });
+  });
+
+  describe('review prompts by kind and strict verdicts (K5-E1)', () => {
+    const nonce = '0123456789abcdef';
+
+    it('a manual prompt is byte-for-byte the pre-kind output', () => {
+      const prompt = buildReviewPrompt(baseRequest, nonce);
+      const expected =
+        `Independent read-only code review for attempt "${baseRequest.attemptId}" at candidate head "${baseRequest.candidateHeadSha}".\n\n` +
+        `This review session is strictly read-only. Do not edit, create, delete, or modify any files.\n\n` +
+        `${UNTRUSTED_INPUT_RULE}\n\n` +
+        `Diff summary:\n` +
+        `<<<UNTRUSTED nonce=${nonce} label="diff summary">>>\n` +
+        `Added verification checks\n` +
+        `<<<END UNTRUSTED nonce=${nonce}>>>\n\n` +
+        `Inspect the code changes and candidate head using read-only tools (read, grep, glob, list).\n` +
+        REVIEW_REPLY_CONTRACT;
+      expect(prompt).toBe(expected);
+    });
+
+    it('a brief-check prompt names the kind and embeds the brief wrapped with the nonce', () => {
+      const prompt = buildReviewPrompt(
+        {
+          ...baseRequest,
+          kind: 'brief-check',
+          briefText: '1. Add the review seat.\n2. Wire the checklist.',
+        },
+        nonce,
+      );
+      expect(prompt).toContain(
+        `Independent read-only brief-check review for attempt "${baseRequest.attemptId}" at candidate head "${baseRequest.candidateHeadSha}".`,
+      );
+      expect(prompt).toContain(`<<<UNTRUSTED nonce=${nonce} label="brief">>>`);
+      expect(prompt).toContain('1. Add the review seat.');
+      expect(prompt).toContain('every work-order item of the brief');
+      expect(prompt).not.toContain(REVIEW_CHECKLIST);
+      expect(prompt).toContain(REVIEW_REPLY_CONTRACT);
+    });
+
+    it('a brief-check prompt without a briefText still builds and says the brief was not supplied', () => {
+      const prompt = buildReviewPrompt({ ...baseRequest, kind: 'brief-check' }, nonce);
+      expect(prompt).toContain('Independent read-only brief-check review');
+      expect(prompt).toContain('The brief was not supplied.');
+      expect(prompt).not.toContain('label="brief"');
+    });
+
+    it('code-review and pre-merge prompts carry the checklist; the checklist names every item', () => {
+      for (const kind of ['code-review', 'pre-merge'] as const) {
+        const prompt = buildReviewPrompt({ ...baseRequest, kind }, nonce);
+        expect(prompt).toContain(`Independent read-only ${kind} review`);
+        expect(prompt).toContain(REVIEW_CHECKLIST);
+        expect(prompt).not.toContain('label="brief"');
+      }
+
+      expect(REVIEW_CHECKLIST).toContain('(a) the change does what the brief asks, nothing more (scope drift)');
+      expect(REVIEW_CHECKLIST).toContain('(b) claimed checks really pass, or are not claimed');
+      expect(REVIEW_CHECKLIST).toContain('(c) imports, APIs and files that do not exist');
+      expect(REVIEW_CHECKLIST).toContain('(d) state cleared on every exit path');
+      expect(REVIEW_CHECKLIST).toContain('(e) permissive defaults and fail-open branches');
+      expect(REVIEW_CHECKLIST).toContain('(f) the architecture rules');
+      expect(REVIEW_CHECKLIST).toContain('(g) each finding names a concrete failure scenario');
+    });
+
+    it('strict parse table: PASS with a major finding is fail', () => {
+      const parsed = parseReviewReplyStrict(
+        'FINDING: major src/api.ts:11 Request without validation\nVERDICT: PASS\n',
+        'FINDING: major src/api.ts:11 Request without validation\nVERDICT: PASS\n',
+      );
+      expect(parsed.result).toBe('fail');
+      expect(parsed.findings).toHaveLength(1);
+    });
+
+    it('strict parse table: FAIL with no finding line is unknown', () => {
+      const parsed = parseReviewReplyStrict('Found nothing specific.\nVERDICT: FAIL\n', 'VERDICT: FAIL\n');
+      expect(parsed.result).toBe('unknown');
+      expect(parsed.findings).toEqual([]);
+    });
+
+    it('strict parse table: a clean PASS is pass', () => {
+      const parsed = parseReviewReplyStrict('Looks good.\nVERDICT: PASS\n', 'VERDICT: PASS\n');
+      expect(parsed.result).toBe('pass');
+    });
+
+    it('strict parse table: minor and nit findings only, with PASS, is pass', () => {
+      const text =
+        'FINDING: minor a.txt:1 wording\nFINDING: nit - typo\nVERDICT: PASS\n';
+      const parsed = parseReviewReplyStrict(text, text);
+      expect(parsed.result).toBe('pass');
+    });
+
+    it('strict parse table: no verdict is unknown', () => {
+      const parsed = parseReviewReplyStrict(
+        'FINDING: minor a.txt:1 wording\nReview ended without a verdict.',
+        'Review ended without a verdict.',
+      );
+      expect(parsed.result).toBe('unknown');
+    });
+
+    it('strict parse table: FAIL with findings is fail', () => {
+      const text = 'FINDING: blocker src/core.ts:1 Broken\nVERDICT: FAIL\n';
+      const parsed = parseReviewReplyStrict(text, text);
+      expect(parsed.result).toBe('fail');
+    });
+
+    it('the transport applies the strict parse only when the request carries a kind', async () => {
+      const withMajorFinding = {
+        exitCode: 0,
+        stdout:
+          '{"type":"tool","part":{"tool":"read"}}\n' +
+          '{"type":"text","part":{"text":"FINDING: major src/api.ts:11 Request without validation\\nVERDICT: PASS\\n"}}',
+        stderr: '',
+      };
+      const makeTransport = () =>
+        createOcmReviewTransport({
+          ocmRunBin: '/test/ocm-run',
+          remotePort: 4096,
+          agent: 'reviewer',
+          model: baseRequest.reviewerModel,
+          resolveReviewDir: async () => '/tmp/review-dir',
+          readHead: async () => baseRequest.candidateHeadSha,
+          spawn: async () => withMajorFinding,
+        });
+
+      // Manual request: the old parse keeps a major-only PASS a pass.
+      const manual = await makeTransport()(baseRequest);
+      expect(manual.result).toBe('pass');
+
+      // Conductor request: strict — a major finding turns the PASS into a fail.
+      const conductor = await makeTransport()({ ...baseRequest, kind: 'code-review' });
+      expect(conductor.result).toBe('fail');
     });
   });
 });

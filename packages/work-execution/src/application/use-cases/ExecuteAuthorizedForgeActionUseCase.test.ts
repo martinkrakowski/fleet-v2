@@ -877,4 +877,132 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       expect(result.outcome).toBe('executed');
     });
   });
+
+  describe('PR title and body forwarding (K6-2)', () => {
+    const HEAD = '1111111111111111111111111111111111111111';
+
+    function capturingDeps() {
+      const seen: Array<Record<string, unknown>> = [];
+      const journal = new InMemoryJournal();
+      const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+      const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+      const authorizationPort: ActionAuthorizationPort = {
+        async resolveActionAuthorization() {
+          return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+        },
+        async consumeActionAuthorization(req) {
+          return { outcome: 'consumed', actionId: req.actionId };
+        },
+      };
+      const forgePort: ForgeActionPort = {
+        isConfigured: () => true,
+        async performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult> {
+          seen.push({ ...request });
+          return { outcome: 'executed', pullRequestNumber: 42, headSha: request.expectedHeadSha };
+        },
+      };
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
+        workOrderRepo,
+        journal,
+        authorizationPort,
+        forgePort,
+        acceptanceEvidencePort: new InMemoryAcceptanceEvidencePort({
+          outcome: 'found',
+          assessment: {
+            candidateHeadSha: HEAD,
+            policyRevision: 'pol-1',
+            state: 'accepted',
+            acceptanceReceiptId: 'receipt-001',
+          },
+        }),
+      });
+      return { useCase, seen };
+    }
+
+    it('forwards title and body to the forge only for push-and-open-pr', async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'act-open',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'push-and-open-pr',
+        expectedHeadSha: HEAD,
+        authorizationGrantId: 'grant-001',
+        title: 'My PR title',
+        body: 'My PR body\nwith a second line',
+      });
+
+      expect(result.outcome).toBe('executed');
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({
+        kind: 'push-and-open-pr',
+        title: 'My PR title',
+        body: 'My PR body\nwith a second line',
+      });
+    });
+
+    it('omits title and body for push-to-pr even when the request carries them', async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'act-push',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'push-to-pr',
+        expectedHeadSha: HEAD,
+        authorizationGrantId: 'grant-001',
+        title: 'should not forward',
+        body: 'should not forward',
+      });
+
+      expect(result.outcome).toBe('executed');
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({ kind: 'push-to-pr' });
+      expect(seen[0]).not.toHaveProperty('title');
+      expect(seen[0]).not.toHaveProperty('body');
+    });
+
+    it('omits title and body for merge-pr', async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'act-merge',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'merge-pr',
+        expectedHeadSha: HEAD,
+        authorizationGrantId: 'grant-001',
+        title: 'should not forward',
+        body: 'should not forward',
+      });
+
+      expect(result.outcome).toBe('executed');
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({ kind: 'merge-pr' });
+      expect(seen[0]).not.toHaveProperty('title');
+      expect(seen[0]).not.toHaveProperty('body');
+    });
+
+    it('forwards neither title nor body when the push-and-open-pr request omits them', async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'act-open-2',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'push-and-open-pr',
+        expectedHeadSha: HEAD,
+        authorizationGrantId: 'grant-001',
+      });
+
+      expect(result.outcome).toBe('executed');
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({ kind: 'push-and-open-pr' });
+      expect(seen[0]).not.toHaveProperty('title');
+      expect(seen[0]).not.toHaveProperty('body');
+    });
+  });
 });

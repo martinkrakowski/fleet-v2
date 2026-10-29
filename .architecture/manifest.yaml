@@ -415,8 +415,9 @@ bounded_contexts:
             - AutoMergeSettingsPort
             - PolicyMergeGrantPort
             - AutoMergeOwnerRoutingPort
+            - ConductorForgeGrantPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -458,6 +459,7 @@ bounded_contexts:
       AutoMergeSettingsPort: "Read a structural subset of the installation's policy.autoMerge, its revision and the forge mode on every call, so work-execution stays free of the installation package; unreadable is a value, never a default."
       PolicyMergeGrantPort: "Issue one merge-pr policy grant authorised by policy:autoMerge at the current setting revision, bound to the work order, attempt, head and acceptance receipt, through operator coordination; it never decides eligibility."
       AutoMergeOwnerRoutingPort: "Ask the owner a question or record an attention item for an auto-merge exception under a stable key, so a repeat run finds the first; a recorded notice grants nothing."
+      ConductorForgeGrantPort: "Issue one push-and-open-pr or push-to-pr policy grant for an accepted attempt at an exact head under policy:conductor@<revision>; it never decides eligibility and never issues a merge grant."
       OwnerDecisionPort: "Re-check the attempt's frozen one-way doors through owner coordination before forge actions; an undecided, declined or unreadable decision blocks the action."
       AttemptOwnerDecisionPort: "Read the owner decision references the product froze into an attempt's brief package; an attempt recorded without them is unknown and blocks forge actions."
       BriefKnowledgePort: "Request bounded context proposals, record selected versions and forward only completed-attempt notes to the knowledge context."
@@ -525,6 +527,10 @@ bounded_contexts:
         implements: AutoMergeOwnerRoutingPort
         integration: in-process
         delegates_to: [operator-coordination/AskOwnerQuestionPort, operator-coordination/RecordAttentionItemPort]
+      - adapter: ConductorForgeGrantAdapter
+        implements: ConductorForgeGrantPort
+        integration: in-process
+        delegates_to: [operator-coordination/IssuePolicyForgeGrantPort]
       - adapter: OwnerDecisionAdapter
         implements: OwnerDecisionPort
         integration: in-process

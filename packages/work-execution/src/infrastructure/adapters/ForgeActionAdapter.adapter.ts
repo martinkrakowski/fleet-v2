@@ -330,9 +330,9 @@ export class ForgeActionAdapter implements ForgeActionPort {
       '--head',
       request.branchName,
       '--title',
-      `Fleet work order ${request.workOrderId}`,
+      request.title ?? `Fleet work order ${request.workOrderId}`,
       '--body',
-      `Attempt ${request.attemptId} (action ${request.actionId}) at head ${request.expectedHeadSha}.`,
+      request.body ?? `Attempt ${request.attemptId} (action ${request.actionId}) at head ${request.expectedHeadSha}.`,
     ];
     let gh: GhInvocationResult;
     try {

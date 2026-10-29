@@ -448,6 +448,10 @@ describe('PrepareBriefPackageUseCase acceptance checks (KF-13a)', () => {
 
   it('rejects acceptance checks that are not a non-empty string array', async () => {
     const useCase = makeUseCase();
+    const duplicate = await useCase.prepareBriefPackage(
+      validRequest({ acceptanceChecks: ['same', 'same'], acceptanceSpec: TWO_COMMANDS }),
+    );
+    expect(duplicate).toEqual({ outcome: 'rejected', reason: 'acceptanceChecks must be distinct names' });
     for (const acceptanceChecks of ['build', 7, ['build', ''], ['build', '  ']]) {
       const result = await useCase.prepareBriefPackage(
         validRequest({ acceptanceChecks: acceptanceChecks as unknown as string[] }),

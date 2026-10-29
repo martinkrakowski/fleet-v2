@@ -203,7 +203,9 @@ async function recordGateReceiptsGuarded(
     return false;
   }
   const commandResults = results.filter((result) => result.kind === 'command');
-  if (commandResults.length !== checks.length) {
+  // One result per check, and distinct names: a repeated name would let one
+  // recorded receipt stand for two checks in the assessment.
+  if (commandResults.length !== checks.length || new Set(checks).size !== checks.length) {
     return false;
   }
   const opened = await reviewAssessment.openReviewAssessment({

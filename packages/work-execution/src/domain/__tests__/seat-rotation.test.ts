@@ -248,6 +248,15 @@ describe("coolingSeatIds", () => {
     });
   }
 
+  it("never cools a seat with a 0-minute cooldown, even for a refusal stamped after now", () => {
+    const attempt = attemptRecord({
+      seatSelection: seatSelection("fp-a"),
+      stopReason: "rate-limited",
+      updatedAtIso: "2099-01-01T00:00:00.000Z",
+    });
+    expect(cool({ attempts: [attempt], cooldownMinutes: 0 }).has("fp-a")).toBe(false);
+  });
+
   it("cools a seat after a refusal 30 minutes ago", () => {
     const attempt = attemptRecord({
       seatSelection: seatSelection("fp-a"),

@@ -344,7 +344,8 @@ function observationWindows(
         if (byTime !== 0) {
           return byTime;
         }
-        return left.observation.observedAtIso < right.observation.observedAtIso ? -1 : 1;
+        // Same instant: the observation id breaks the tie, so the order is total and stable.
+        return left.observation.observationId.localeCompare(right.observation.observationId);
       });
     if (timed.length === 0) {
       continue;
@@ -406,7 +407,8 @@ export function coolingSeatIds(input: {
   }
   const cooling = new Map<string, SeatUnavailability>();
   const attemptsMs = cooldownMs(input.cooldownMinutes);
-  for (const attempt of input.attempts) {
+  // A cooldown of 0 is off: no attempt cools a seat, whatever its timestamp.
+  for (const attempt of attemptsMs > 0 ? input.attempts : []) {
     const seatId = typeof attempt.seatSelection?.seatId === 'string' ? attempt.seatSelection.seatId : '';
     if (seatId.length === 0 || !MODEL_REFUSAL_CLASSES.includes(stopReasonOf(attempt))) {
       continue;

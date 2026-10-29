@@ -576,6 +576,30 @@ describe('AdvanceLaneRunUseCase open-pr act (K6-6)', () => {
     expect(results[0]).toMatchObject({ outcome: 'refused', reasonCode: 'grant-refused' });
   });
 
+  it('test 3b: a thrown grant journals exactly one refused/grant-refused result under the already-journalled intent and no forge call', async () => {
+    const harness = await openingPrHarness();
+    harness.setGrantAnswer('throw');
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'refused',
+      reasonCode: 'grant-refused',
+    });
+    expect(harness.grantRequests).toHaveLength(1);
+    expect(harness.forgeRequests).toEqual([]);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === openPrKey());
+    expect(intents).toHaveLength(1);
+    expect(intents[0]!.mintedId).toBe('forge-01JB0000000000000000000003');
+    const results = entries.filter((entry) => entry.kind === 'result' && entry.key === openPrKey());
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ outcome: 'refused', reasonCode: 'grant-refused' });
+    // The spent one-way key parks on the next advance; no second grant is issued.
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'open-pr' });
+    expect(harness.grantRequests).toHaveLength(1);
+  });
+
   it('test 4: an ambiguous forge outcome leaves the intent pending; the reconcile that finds the PR at the head reconciles and fills the PR number, calling the forge action exactly once', async () => {
     const harness = await openingPrHarness();
     harness.setForgeAnswer({ outcome: 'refused', reason: FORGE_REASON, forgeAmbiguous: true });

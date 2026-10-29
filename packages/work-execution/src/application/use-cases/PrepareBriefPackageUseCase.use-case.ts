@@ -286,6 +286,16 @@ function validatePathsAndSpec(
       reason: 'acceptanceChecks must name one check per acceptanceSpec command, in order',
     };
   }
+  // Names are distinct: the evidence context keeps one receipt per name, so a
+  // repeated name would let one receipt stand for two checks.
+  if (
+    acceptanceChecks !== undefined &&
+    new Set(acceptanceChecks.map((entry) => entry.trim())).size !== acceptanceChecks.length
+  ) {
+    return {
+      reason: 'acceptanceChecks must be distinct names',
+    };
+  }
   if (
     acceptanceChecks !== undefined &&
     acceptanceChecks.length > 0 &&

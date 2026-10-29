@@ -1271,6 +1271,29 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       expect(harness.gateReceiptRequests).toHaveLength(1);
     });
 
+    it('fails closed to gate-unknown when two checks share a name, with no record (KF-13a Luna pre-merge)', async () => {
+      const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+      const harness = await makeHarness(runRecord(), [collected], {
+        wireReviewAssessment: true,
+        wireGateReceipts: true,
+      });
+      harness.setManifest({ ...CHECKS_MANIFEST, acceptanceChecks: ['same', 'same'] });
+      harness.setManifestVerdict('sealed');
+      harness.setGateAnswer({
+        verdict: 'passed',
+        results: [
+          commandResult('command 1: build', 'pass', 0),
+          commandResult('command 2: test', 'pass', 0),
+        ],
+      });
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      expect(result).toMatchObject({ outcome: 'acted', step: 'gate', result: 'ambiguous', reasonCode: 'gate-unknown' });
+      expect(harness.gateReceiptRequests).toHaveLength(0);
+    });
+
     it('fails closed to gate-unknown when the receipt port records fewer receipts than checks (KF-13a Luna)', async () => {
       const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
       const harness = await makeHarness(runRecord(), [collected], {

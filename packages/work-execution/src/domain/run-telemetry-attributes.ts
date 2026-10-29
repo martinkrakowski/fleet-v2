@@ -55,7 +55,7 @@ export const TELEMETRY_TAGS = ['conducted', 'hand-run', 'dry-run', 'shadow', 'ti
 export const TELEMETRY_SEAT_TOOLS = ['opencode', 'agy', 'review-cli'] as const;
 export const TELEMETRY_SEAT_BILLINGS = ['metered', 'plan', 'unknown'] as const;
 export const TELEMETRY_COST_BASES = ['metered', 'plan-estimate', 'unknown'] as const;
-export const TELEMETRY_USAGE_SOURCES = ['opencode-db', 'unavailable'] as const;
+export const TELEMETRY_USAGE_SOURCES = ['opencode-db', 'opencode-api', 'unavailable'] as const;
 /** Gate, review and CI results (the evidence result values, declared here: no cross-context import). */
 export const TELEMETRY_RESULTS = ['pass', 'fail', 'pending', 'unknown', 'not-applicable'] as const;
 export const TELEMETRY_REVIEW_KINDS = ['brief-check', 'code-review', 'pre-merge'] as const;

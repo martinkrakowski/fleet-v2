@@ -350,7 +350,7 @@ async function credentialLines(
 ): Promise<DoctorLine[]> {
   const lines: DoctorLine[] = [];
   const credentialPaths: Array<{ host: string; path: string }> = [];
-  for (const [name, host] of Object.entries(model.hosts)) {
+  for (const host of Object.values(model.hosts)) {
     const authFile = host.runner?.authFile;
     if (authFile !== undefined) {
       // KF-14c: ocm-run reads the runner authFile where it runs, on the

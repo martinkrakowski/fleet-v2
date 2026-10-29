@@ -56,9 +56,6 @@ runner environment allowlist to smuggle a setting through.
 - `FLEET_OCM_RUN_BIN` — override for the runner binary path. The repository
   bundles `bin/ocm-run` and `ExecutionRunnerAdapter` resolves it automatically;
   the override exists only for unusual installations.
-- `FLEET_USAGE_NODE_BIN` — override for the node binary used on the runner host
-  to read opencode's database (the S3 usage read); default `node`; never added
-  to the runner environment allow-list.
 - `FLEET_API_URL` — the server-side base URL for `@fleet/api`. The web client
   prefers it, falls back to `NEXT_PUBLIC_FLEET_API_URL`, and falls back again to
   the fixture set when neither is configured.

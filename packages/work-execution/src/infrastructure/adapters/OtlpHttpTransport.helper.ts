@@ -3,7 +3,7 @@
 // read, one fetch POST with `AbortSignal.timeout`, and the retry/deadline
 // wrapper. Nothing here logs, echoes an endpoint, a token, a header or a body:
 // every failure is reported as a fixed reason string or a fixed outcome kind,
-// and the token exists only inside this module's closure (§3.9 "never
+// and the token exists only inside a single send's local scope (§3.9 "never
 // committed, never logged").
 /**
  * Transport helpers for `OtlpHttpRunTelemetryAdapter`:
@@ -101,14 +101,23 @@ export function readOtlpTokenFile(path: unknown): OtlpTokenFileRead {
 export interface CreateFetchOtlpPostOptions {
   /** The validated endpoint URL from `checkOtlpEndpoint`. */
   readonly url: URL;
-  /** The bearer token from `readOtlpTokenFile`; it stays inside this closure. */
-  readonly token: string;
+  /**
+   * Reads the bearer token for each send (the token-file read bound to the
+   * path); the token is kept only in that call's local scope, never in this
+   * closure (§3.9).
+   */
+  readonly tokenReader: () => OtlpTokenFileRead;
   /** Injected fetch for tests; the global `fetch` by default. */
   readonly fetchImpl?: typeof fetch;
   /** An optional stop signal combined with the timeout signal. */
   readonly stopSignal?: AbortSignal;
   /** The per-request timeout in milliseconds (plan §3.3); 5000 by default. */
   readonly timeoutMs?: number;
+  /**
+   * The send deadline in epoch milliseconds, or null when unbounded; read per
+   * post, it bounds the in-flight request alongside `timeoutMs`.
+   */
+  readonly deadlineMs?: () => number | null;
   /** Injected clock for the `Retry-After` date conversion; `Date.now` by default. */
   readonly nowMs?: () => number;
 }
@@ -140,14 +149,15 @@ function parseRejectedSpans(text: string): number | null {
   return value;
 }
 
-/** Reads at most 64 KiB of the response body and returns it as text. */
-async function readBodyPrefix(response: Response): Promise<string> {
+/** Reads at most 64 KiB of the response body as text, reporting whether it stopped at the cap. */
+async function readBodyPrefix(response: Response): Promise<{ text: string; truncated: boolean }> {
   const reader = response.body?.getReader();
   if (!reader) {
-    return '';
+    return { text: '', truncated: false };
   }
   const chunks: Uint8Array[] = [];
   let total = 0;
+  let truncated = false;
   try {
     for (;;) {
       const { done, value } = await reader.read();
@@ -157,6 +167,7 @@ async function readBodyPrefix(response: Response): Promise<string> {
       chunks.push(value);
       total += value.byteLength;
       if (total >= MAX_BODY_BYTES) {
+        truncated = true;
         break;
       }
     }
@@ -176,7 +187,7 @@ async function readBodyPrefix(response: Response): Promise<string> {
     bytes.set(chunk.subarray(0, Math.min(chunk.byteLength, bytes.byteLength - offset)), offset);
     offset += Math.min(chunk.byteLength, bytes.byteLength - offset);
   }
-  return new TextDecoder().decode(bytes);
+  return { text: new TextDecoder().decode(bytes), truncated };
 }
 
 /** Converts a `Retry-After` header value to integer seconds against `nowMs`; null when unparsable. */
@@ -204,20 +215,41 @@ function parseRetryAfter(raw: string | null, nowMs: number): number | null {
 /**
  * Builds the real `OtlpPost`: one POST of the payload with
  * `content-type: application/json` and `authorization: Bearer <token>`, under
- * `AbortSignal.timeout(timeoutMs)` combined with the optional stop signal
- * (plan §3.3 "Exporter lifetime", §3.5 "Two paths, two deadlines"). It never
- * throws, and nothing it returns carries the body, a header or the URL: a
- * response maps to `{ kind: 'http', status, retryAfterSeconds, rejectedSpans }`,
- * an abort or timeout to `{ kind: 'timeout' }`, anything else to
- * `{ kind: 'network' }`.
+ * `AbortSignal.timeout(min(timeoutMs, deadlineMs() - now))` combined with the
+ * optional stop signal (plan §3.3 "Exporter lifetime", §3.5 "Two paths, two
+ * deadlines") — the deadline bounds the in-flight request, and a deadline
+ * already reached posts nothing. The token is read per send and kept only in
+ * that call's local scope. It never throws, and nothing it returns carries the
+ * body, a header, the token or the URL: a response maps to
+ * `{ kind: 'http', status, retryAfterSeconds, rejectedSpans }` — except an
+ * oversized 2xx whose truncated prefix does not parse to a complete
+ * `partialSuccess` answer, which maps to `{ kind: 'network' }` so it can never
+ * be read as full acceptance — an abort or timeout to `{ kind: 'timeout' }`,
+ * anything else to `{ kind: 'network' }`.
  */
 export function createFetchOtlpPost(options: CreateFetchOtlpPostOptions): OtlpPost {
-  const { url, token, stopSignal } = options;
+  const { url, tokenReader, stopSignal } = options;
   const fetchImpl = options.fetchImpl ?? fetch;
   const timeoutMs = options.timeoutMs ?? 5000;
   const nowMs = options.nowMs ?? (() => Date.now());
   return async (payload: Uint8Array): Promise<OtlpPostOutcome> => {
-    const signals: AbortSignal[] = [AbortSignal.timeout(timeoutMs)];
+    // The token is read per send and stays in this call's local scope; an
+    // unreadable or empty token file is not attributable to the spans.
+    const tokenRead = tokenReader();
+    if (!tokenRead.ok) {
+      return { kind: 'network' };
+    }
+    const token = tokenRead.token;
+    const deadlineMs = options.deadlineMs?.() ?? null;
+    let effectiveTimeoutMs = timeoutMs;
+    if (deadlineMs !== null) {
+      const remainingMs = deadlineMs - nowMs();
+      if (remainingMs <= 0) {
+        return { kind: 'timeout' };
+      }
+      effectiveTimeoutMs = Math.min(timeoutMs, remainingMs);
+    }
+    const signals: AbortSignal[] = [AbortSignal.timeout(effectiveTimeoutMs)];
     if (stopSignal !== undefined) {
       signals.push(stopSignal);
     }
@@ -234,15 +266,21 @@ export function createFetchOtlpPost(options: CreateFetchOtlpPostOptions): OtlpPo
       });
       const status = response.status;
       const retryAfterSeconds = parseRetryAfter(response.headers.get('retry-after'), nowMs());
-      let rejectedSpans: number | null = null;
       if (status >= 200 && status < 300) {
-        rejectedSpans = parseRejectedSpans(await readBodyPrefix(response));
-      } else {
-        // A non-2xx body is cancelled, never read: releasing the unread stream
-        // back to the pool without consuming it (plan §3.5).
-        await response.body?.cancel().catch(() => undefined);
+        const body = await readBodyPrefix(response);
+        const rejectedSpans = parseRejectedSpans(body.text);
+        // A truncated prefix that does not parse to a complete `partialSuccess`
+        // answer proves nothing: the result is never an `http` outcome that a
+        // full acceptance could be read from.
+        if (body.truncated && rejectedSpans === null) {
+          return { kind: 'network' };
+        }
+        return { kind: 'http', status, retryAfterSeconds, rejectedSpans };
       }
-      return { kind: 'http', status, retryAfterSeconds, rejectedSpans };
+      // A non-2xx body is cancelled, never read: releasing the unread stream
+      // back to the pool without consuming it (plan §3.5).
+      await response.body?.cancel().catch(() => undefined);
+      return { kind: 'http', status, retryAfterSeconds, rejectedSpans: null };
     } catch (error: unknown) {
       // An abort of the combined signal — the request timeout or the stop
       // signal, whatever its reason — is a timeout, never a network failure.

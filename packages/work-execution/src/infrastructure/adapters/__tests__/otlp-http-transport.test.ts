@@ -77,6 +77,8 @@ type ScriptedResponse = {
   bodyJson?: unknown;
   /** When true, send the head and a truncated body then hang (the client aborts). */
   hang?: boolean;
+  /** When set, wait this long before answering (the deadline can expire first). */
+  delayMs?: number;
 };
 
 let server: Server | null = null;
@@ -116,9 +118,16 @@ async function startReceiver(script: ScriptedResponse[]): Promise<string> {
         res.write('{"partialSuccess":{"rejectedSpans":"12"');
         return;
       }
-      const body = JSON.stringify({ marker: scripted.marker, ...(scripted.bodyJson as object) });
-      res.setHeader('content-type', 'application/json');
-      res.end(body);
+      const finish = (): void => {
+        const body = JSON.stringify({ marker: scripted.marker, ...(scripted.bodyJson as object) });
+        res.setHeader('content-type', 'application/json');
+        res.end(body);
+      };
+      if (scripted.delayMs !== undefined) {
+        setTimeout(finish, scripted.delayMs);
+        return;
+      }
+      finish();
     });
   });
   await new Promise<void>((resolve) => {
@@ -262,7 +271,7 @@ describe('createFetchOtlpPost (OT3b-2)', () => {
     const base = await startReceiver([
       { status: 200, marker: 'marker-post-ok', bodyJson: { partialSuccess: { rejectedSpans: '3' } } },
     ]);
-    const post = createFetchOtlpPost({ url: endpointUrl(base), token: TOKEN, nowMs: () => 0 });
+    const post = createFetchOtlpPost({ url: endpointUrl(base), tokenReader: staticTokenReader, nowMs: () => 0 });
     const outcome = await post(new Uint8Array([1, 2, 3]));
     expect(outcome).toEqual({ kind: 'http', status: 200, retryAfterSeconds: null, rejectedSpans: 3 } satisfies OtlpPostOutcome);
     expect(serverRequests).toHaveLength(1);
@@ -277,7 +286,7 @@ describe('createFetchOtlpPost (OT3b-2)', () => {
       { status: 200, marker: 'marker-post-empty' },
       { status: 200, marker: 'marker-post-garbage', bodyJson: { partialSuccess: { rejectedSpans: 'many' } } },
     ]);
-    const post = createFetchOtlpPost({ url: endpointUrl(base), token: TOKEN });
+    const post = createFetchOtlpPost({ url: endpointUrl(base), tokenReader: staticTokenReader });
     expect(expectHttp(await post(new Uint8Array())).rejectedSpans).toBe(5);
     expect(expectHttp(await post(new Uint8Array())).rejectedSpans).toBeNull();
     expect(expectHttp(await post(new Uint8Array())).rejectedSpans).toBeNull();
@@ -289,7 +298,7 @@ describe('createFetchOtlpPost (OT3b-2)', () => {
       { status: 503, marker: 'marker-ra-date', headers: { 'retry-after': 'Wed, 21 Oct 2026 07:28:10 GMT' } },
     ]);
     const fixedNow = Date.parse('2026-10-21T07:27:40Z');
-    const post = createFetchOtlpPost({ url: endpointUrl(base), token: TOKEN, nowMs: () => fixedNow });
+    const post = createFetchOtlpPost({ url: endpointUrl(base), tokenReader: staticTokenReader, nowMs: () => fixedNow });
     expect(expectHttp(await post(new Uint8Array())).retryAfterSeconds).toBe(7);
     expect(expectHttp(await post(new Uint8Array())).retryAfterSeconds).toBe(30);
   });
@@ -299,14 +308,14 @@ describe('createFetchOtlpPost (OT3b-2)', () => {
       { status: 429, marker: 'marker-ra-frac', headers: { 'retry-after': '1.5' } },
       { status: 429, marker: 'marker-ra-neg', headers: { 'retry-after': '-1' } },
     ]);
-    const post = createFetchOtlpPost({ url: endpointUrl(base), token: TOKEN });
+    const post = createFetchOtlpPost({ url: endpointUrl(base), tokenReader: staticTokenReader });
     expect(expectHttp(await post(new Uint8Array())).retryAfterSeconds).toBeNull();
     expect(expectHttp(await post(new Uint8Array())).retryAfterSeconds).toBeNull();
   });
 
   it('maps a 2xx whose body read aborts mid-body to timeout, never an http result', async () => {
     const base = await startReceiver([{ status: 200, marker: MARKERS.hang, hang: true }]);
-    const post = createFetchOtlpPost({ url: endpointUrl(base), token: TOKEN, timeoutMs: 100 });
+    const post = createFetchOtlpPost({ url: endpointUrl(base), tokenReader: staticTokenReader, timeoutMs: 100 });
     const outcome = await post(new Uint8Array());
     expect(outcome).toEqual({ kind: 'timeout' });
   });
@@ -316,7 +325,7 @@ describe('createFetchOtlpPost (OT3b-2)', () => {
     const controller = new AbortController();
     const post = createFetchOtlpPost({
       url: endpointUrl(base),
-      token: TOKEN,
+      tokenReader: staticTokenReader,
       stopSignal: controller.signal,
       fetchImpl: (async () => {
         controller.abort('stop');
@@ -328,7 +337,7 @@ describe('createFetchOtlpPost (OT3b-2)', () => {
 
   it('never reads a non-2xx body and maps aborts to timeout and failures to network', async () => {
     const base = await startReceiver([{ status: 400, marker: 'marker-4xx-body' }]);
-    const post = createFetchOtlpPost({ url: endpointUrl(base), token: TOKEN });
+    const post = createFetchOtlpPost({ url: endpointUrl(base), tokenReader: staticTokenReader });
     const outcome = await post(new Uint8Array());
     expect(outcome).toEqual({ kind: 'http', status: 400, retryAfterSeconds: null, rejectedSpans: null });
     // The 4xx body was cancelled, never read: nothing but the post outcome
@@ -337,7 +346,7 @@ describe('createFetchOtlpPost (OT3b-2)', () => {
 
     const aborting = createFetchOtlpPost({
       url: endpointUrl(base),
-      token: TOKEN,
+      tokenReader: staticTokenReader,
       fetchImpl: (async () => {
         throw Object.assign(new Error('aborted'), { name: 'TimeoutError' });
       }) as typeof fetch,
@@ -346,7 +355,7 @@ describe('createFetchOtlpPost (OT3b-2)', () => {
 
     const failing = createFetchOtlpPost({
       url: endpointUrl(base),
-      token: TOKEN,
+      tokenReader: staticTokenReader,
       fetchImpl: (async () => {
         throw new TypeError('fetch failed');
       }) as typeof fetch,
@@ -496,6 +505,9 @@ const MARKERS = {
   breaker: 'marker-400-breaker',
   auth: 'marker-401-auth',
   hang: 'marker-hang-body',
+  oversized: 'marker-oversized-2xx',
+  slow: 'marker-slow-2xx',
+  renewed: 'marker-renewed-token',
 };
 
 function factoryFor(base: string, overrides: Partial<Parameters<typeof createOtlpHttpRunTelemetryAdapter>[0]> = {}) {
@@ -966,5 +978,141 @@ describe('carried review fixes (OT3b-2)', () => {
     expect(result.dispositions.map((d) => spanDispositionText(d.disposition))).toEqual(['pending', 'pending', 'pending']);
     expect(serverRequests).toHaveLength(4);
     expectRedacted(JSON.stringify(result), base, [MARKERS.partial, MARKERS.split, MARKERS.hang]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review round 2 (OT3b pre-merge): the oversized 2xx, the in-flight deadline
+// bound and the per-send token read.
+// ---------------------------------------------------------------------------
+
+/** A token reader over the fragment-built token, the shape the transport now takes. */
+function staticTokenReader(): { ok: true; token: string } {
+  return { ok: true, token: TOKEN };
+}
+
+describe('review round 2: an oversized 2xx never exports', () => {
+  it('maps an oversized 2xx whose prefix does not parse to network at the transport', async () => {
+    // A body larger than the 64 KiB cap whose partialSuccess answer sits past
+    // the prefix: the truncated prefix cannot parse, so the result is never an
+    // `http` outcome that could be read as full acceptance.
+    const base = await startReceiver([
+      {
+        status: 200,
+        marker: MARKERS.oversized,
+        bodyJson: { padding: 'x'.repeat(70_000), partialSuccess: { rejectedSpans: '2' } },
+      },
+    ]);
+    const post = createFetchOtlpPost({ url: endpointUrl(base), tokenReader: staticTokenReader });
+    const outcome = await post(new Uint8Array([1]));
+    expect(outcome).toEqual({ kind: 'network' });
+  });
+
+  it('keeps every span pending on an oversized 2xx with rejectedSpans > 0', async () => {
+    const base = await startReceiver([
+      {
+        status: 200,
+        marker: MARKERS.oversized,
+        bodyJson: { padding: 'x'.repeat(70_000), partialSuccess: { rejectedSpans: '2' } },
+      },
+    ]);
+    const { adapter } = factoryFor(base);
+    const spans = [makeSpan(), makeSpan()];
+    const result = await adapter.send(spans, null);
+    expect(result.errorKind).toBe('network');
+    expect(result.dispositions.map((d) => spanDispositionText(d.disposition))).toEqual(['pending', 'pending']);
+    expect(serverRequests).toHaveLength(1);
+    expectRedacted(JSON.stringify(result), base, [MARKERS.oversized]);
+  });
+
+  it('keeps today\'s behaviour for an empty and a complete small 2xx body', async () => {
+    const base = await startReceiver([
+      { status: 200, marker: MARKERS.ok },
+      { status: 200, marker: MARKERS.ok, bodyJson: { partialSuccess: { rejectedSpans: '1' } } },
+    ]);
+    const post = createFetchOtlpPost({ url: endpointUrl(base), tokenReader: staticTokenReader });
+    expect(expectHttp(await post(new Uint8Array())).rejectedSpans).toBeNull();
+    expect(expectHttp(await post(new Uint8Array())).rejectedSpans).toBe(1);
+  });
+});
+
+describe('review round 2: the deadline bounds the in-flight request', () => {
+  it('aborts a pending post when the deadline expires before the receiver answers', async () => {
+    const base = await startReceiver([{ status: 200, marker: MARKERS.slow, delayMs: 300 }]);
+    const started = Date.now();
+    const post = createFetchOtlpPost({
+      url: endpointUrl(base),
+      tokenReader: staticTokenReader,
+      timeoutMs: 5000,
+      deadlineMs: () => started + 100,
+    });
+    const outcome = await post(new Uint8Array([1]));
+    expect(Date.now() - started).toBeLessThan(300);
+    expect(outcome).toEqual({ kind: 'timeout' });
+  });
+
+  it('does not post when the remaining time is already zero or negative', async () => {
+    const base = await startReceiver([]);
+    const post = createFetchOtlpPost({
+      url: endpointUrl(base),
+      tokenReader: staticTokenReader,
+      timeoutMs: 5000,
+      deadlineMs: () => 100,
+      nowMs: () => 200,
+    });
+    expect(await post(new Uint8Array())).toEqual({ kind: 'timeout' });
+    expect(serverRequests).toHaveLength(0);
+  });
+
+  it('bounds an in-flight send by the send deadline: timeout with spans pending, before the answer', async () => {
+    const base = await startReceiver([{ status: 200, marker: MARKERS.slow, delayMs: 300 }]);
+    // A real clock: the deadline is computed against wall time here.
+    const tokenPath = writeTokenFile(`${TOKEN_FRAGMENTS.join('-')}\n`);
+    const built = createOtlpHttpRunTelemetryAdapter({
+      endpoint: base + ENDPOINT_TEXT,
+      tokenFile: tokenPath,
+      route: 'collector',
+      resource: RESOURCE,
+      timeoutMs: 5000,
+    });
+    expect(built.ok).toBe(true);
+    const adapter = (built as { ok: true; adapter: OtlpHttpRunTelemetryAdapter }).adapter;
+    const span = makeSpan();
+    const started = Date.now();
+    const result = await adapter.send([span], { atMs: started + 100 });
+    expect(Date.now() - started).toBeLessThan(300);
+    expect(result.errorKind).toBe('timeout');
+    expect(spanDispositionText(result.dispositions[0].disposition)).toBe('pending');
+    expect(serverRequests).toHaveLength(1);
+    expectRedacted(JSON.stringify(result), base, [MARKERS.slow]);
+  });
+});
+
+describe('review round 2: the token is read per send', () => {
+  it('carries the file\'s current value on each request when the file is rewritten between sends', async () => {
+    const first = ['test', 'token', 'value'];
+    const second = ['renewed', 'token', 'value'];
+    const path = writeTokenFile(`${first.join('-')}\n`);
+    const base = await startReceiver([
+      { status: 200, marker: MARKERS.ok },
+      { status: 200, marker: MARKERS.renewed },
+    ]);
+    const { adapter } = factoryFor(base, { tokenFile: path });
+    const sendOne = await adapter.send([makeSpan()], null);
+    expect(sendOne.errorKind).toBeNull();
+    writeFileSync(path, `${second.join('-')}\n`, 'utf8');
+    const sendTwo = await adapter.send([makeSpan()], null);
+    expect(sendTwo.errorKind).toBeNull();
+    expect(serverRequests).toHaveLength(2);
+    // The receiver saw two different fragment-built values; neither is printed.
+    const firstSeen = serverRequests[0].authorization;
+    const secondSeen = serverRequests[1].authorization;
+    expect(firstSeen).not.toBeNull();
+    expect(secondSeen).not.toBeNull();
+    expect(secondSeen).not.toBe(firstSeen);
+    expect(firstSeen?.startsWith('Bearer ')).toBe(true);
+    expect(secondSeen?.startsWith('Bearer ')).toBe(true);
+    expect(JSON.stringify({ ...sendOne, ...sendTwo })).not.toContain(first.join('-'));
+    expect(JSON.stringify({ ...sendOne, ...sendTwo })).not.toContain(second.join('-'));
   });
 });

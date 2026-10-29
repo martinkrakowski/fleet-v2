@@ -444,7 +444,7 @@ export type OtlpHttpRunTelemetryAdapterFactoryResult =
 export interface CreateOtlpHttpRunTelemetryAdapterOptions {
   /** The operator-supplied endpoint string; validated by the loopback rule. */
   readonly endpoint: unknown;
-  /** The operator-supplied token file path; read once, never logged. */
+  /** The operator-supplied token file path; read per send, never logged. */
   readonly tokenFile: unknown;
   readonly route: TelemetryRoute;
   readonly resource: TelemetryResourceInput;
@@ -469,9 +469,10 @@ export interface CreateOtlpHttpRunTelemetryAdapterOptions {
 /**
  * Builds a real `OtlpHttpRunTelemetryAdapter` over the fetch transport
  * (plan §3.5 "Send", §3.9): the endpoint passes the loopback rule, the token
- * file reads once, and the post is wrapped with the retry and deadline layer
- * fed from each `send`'s deadline. Refusals are fixed reason strings that
- * never echo the endpoint or the token.
+ * file is validated once at build time and re-read inside every send, and the
+ * post is wrapped with the retry and deadline layer fed from each `send`'s
+ * deadline. Refusals are fixed reason strings that never echo the endpoint or
+ * the token.
  */
 export function createOtlpHttpRunTelemetryAdapter(
   options: CreateOtlpHttpRunTelemetryAdapterOptions,
@@ -480,6 +481,8 @@ export function createOtlpHttpRunTelemetryAdapter(
   if (!endpoint.ok) {
     return endpoint;
   }
+  // A build-time validation only: the file is re-read inside every send and
+  // the token is kept only in that call's local scope (§3.9).
   const token = readOtlpTokenFile(options.tokenFile);
   if (!token.ok) {
     return token;
@@ -488,10 +491,11 @@ export function createOtlpHttpRunTelemetryAdapter(
   const post = withOtlpRetry(
     createFetchOtlpPost({
       url: endpoint.url,
-      token: token.token,
+      tokenReader: () => readOtlpTokenFile(options.tokenFile),
       fetchImpl: options.fetchImpl,
       stopSignal: options.stopSignal,
       timeoutMs: options.timeoutMs,
+      deadlineMs: () => currentDeadline?.atMs ?? null,
       nowMs: options.nowMs,
     }),
     {

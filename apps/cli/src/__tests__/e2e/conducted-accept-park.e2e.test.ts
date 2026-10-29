@@ -36,10 +36,20 @@ async function startFixture(options?: Parameters<typeof startConductedFixture>[0
 }
 
 afterEach(async () => {
-  const current = [...liveFixtures];
+  // LIFO: a later fixture stacked its PATH entries on top of an earlier one;
+  // each stop is isolated so one failure never skips another fixture's cleanup.
+  const current = [...liveFixtures].reverse();
   liveFixtures.clear();
+  const failures: unknown[] = [];
   for (const instance of current) {
-    await instance.stop();
+    try {
+      await instance.stop();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) {
+    throw failures[0];
   }
 });
 
@@ -225,16 +235,23 @@ describe.skipIf(process.env.FLEET_E2E_SSH !== '1')('conducted accept + park over
     // The journal: review-failed, then exactly one prepare-refused under a
     // round-1 prepare key, then the spent-key park.
     const entries = await journalOf(current);
-    expect(entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'review-failed'))
-      .toBe(true);
-    const prepareRefusals = entries.filter(
-      (entry) =>
-        entry.kind === 'result' &&
-        entry.reasonCode === 'prepare-refused' &&
-        entry.key !== null &&
-        entry.key.includes('/r1/prepare/'),
-    );
-    expect(prepareRefusals).toHaveLength(1);
+    const reviewFailedIndex = entries.findIndex((entry) => entry.kind === 'result' && entry.reasonCode === 'review-failed');
+    expect(reviewFailedIndex).toBeGreaterThanOrEqual(0);
+    const prepareRefusalIndexes = entries
+      .map((entry, index) => ({ entry, index }))
+      .filter(
+        ({ entry }) =>
+          entry.kind === 'result' &&
+          entry.reasonCode === 'prepare-refused' &&
+          entry.key !== null &&
+          entry.key.startsWith(`${current.runId}/r1/prepare/`),
+      )
+      .map(({ index }) => index);
+    expect(prepareRefusalIndexes).toHaveLength(1);
+    const parkedConductIndex = entries.findIndex((entry) => entry.kind === 'conduct' && entry.state === 'parked');
+    // In order: the failed review, then the one refused fix-prepare, then the park.
+    expect(reviewFailedIndex).toBeLessThan(prepareRefusalIndexes[0]!);
+    expect(prepareRefusalIndexes[0]!).toBeLessThan(parkedConductIndex);
 
     const run = await runRecordOf(current);
     expect(run).not.toBeNull();

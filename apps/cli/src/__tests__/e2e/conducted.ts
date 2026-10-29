@@ -258,8 +258,10 @@ function buildConductedInstallation(
 function ghStubScript(argvLog: string): string {
   return [
     '#!/bin/sh',
-    // One line per call: a `--body` carries newlines, so they are flattened.
-    `printf '%s\\n' "$*" | tr '\\n' ' ' >> ${sq(argvLog)}`,
+    // One line per call: a `--body` carries newlines, so the ARGUMENTS are
+    // flattened and exactly one line terminator is written per call.
+    `printf '%s' "$*" | tr '\\n' ' ' >> ${sq(argvLog)}`,
+    `printf '\\n' >> ${sq(argvLog)}`,
     'echo "https://github.com/example-owner/example-repo/pull/7"',
     '',
   ].join('\n');

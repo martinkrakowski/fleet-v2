@@ -44,6 +44,16 @@ describe('LaneRunParkNoticeAdapter', () => {
       );
     });
 
+    it('records an attention item for a non-owner park reason such as step-refused (Q1c)', async () => {
+      const recordAttentionItem = attentionDelegate();
+      const adapter = new LaneRunParkNoticeAdapter({ recordAttentionItem });
+      for (const reason of ['step-refused', 'ambiguous', 'review-seat-unavailable'] as const) {
+        expect(await adapter.recordParkAttention({ ...REQUEST, reason })).toEqual({ outcome: 'recorded' });
+      }
+      expect(recordAttentionItem).toHaveBeenCalledTimes(3);
+      expect(recordAttentionItem.mock.calls[0]?.[0]).toMatchObject({ summary: 'The conductor parked run-42 with reason step-refused.' });
+    });
+
     it('names the qualifier code in the summary when one is given', async () => {
       const recordAttentionItem = attentionDelegate();
       const adapter = new LaneRunParkNoticeAdapter({ recordAttentionItem });

@@ -765,12 +765,30 @@ describe('redactionChecks (OT1r)', () => {
     expect(check(report, 'payload-parses').pass).toBe(false);
   });
 
-  it('a numeric canary written as 2.0251027e7 fails canaries (OT1r-2)', () => {
+  it('a number written in non-canonical exponent form fails payload-parses (OT1r-2)', () => {
     const bytes = withExponentNumber(
       handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.usage.wall_seconds', value: { doubleValue: 2.0251027e7 } }]), 'AGENT'),
     );
     const report = redactionChecks(bytes, ['20251027']);
+    expect(check(report, 'payload-parses').pass).toBe(false);
     expect(check(report, 'canaries').pass).toBe(false);
+  });
+
+  it('a canonical payload carrying a numeric canary parses and fails canaries (OT1r-2 Grok)', () => {
+    const bytes = handPayload(RESOURCE_NAME_ONLY, handSpanAttributes([{ key: 'fleet.usage.wall_seconds', value: { doubleValue: 2.0251027e7 } }]), 'AGENT');
+    const report = redactionChecks(bytes, ['20251027']);
+    expect(check(report, 'payload-parses').pass).toBe(true);
+    expect(check(report, 'canaries').pass).toBe(false);
+  });
+
+  it('a status carrying only a code passes (codes only, OT1r-2 Grok)', () => {
+    const parsed = JSON.parse(new TextDecoder().decode(stubPayload())) as {
+      resourceSpans: { scopeSpans: { spans: { status?: { code: number } }[] }[] }[];
+    };
+    parsed.resourceSpans[0].scopeSpans[0].spans[0].status = { code: 2 };
+    const report = redactionChecks(new TextEncoder().encode(JSON.stringify(parsed)), []);
+    expect(check(report, 'payload-parses').pass).toBe(true);
+    expect(check(report, 'values').pass).toBe(true);
   });
 
   it.todo('adapter errors name an error kind, never the endpoint, a header or a body (belongs with the sender, OT3b)');

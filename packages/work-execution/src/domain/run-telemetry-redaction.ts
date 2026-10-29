@@ -311,11 +311,14 @@ function readSpan(span: unknown, entries: DecodedEntry[]): boolean {
     if (!hasOnlyKnownFields(status, STATUS_FIELDS)) {
       return false;
     }
-    const message = ownData(status, 'message');
-    if (typeof message !== 'string') {
-      return false;
+    // Codes only (plan §3.2): `message` is absent or a string; only a non-empty one fails `values`.
+    if (hasOwnData(status, 'message')) {
+      const message = ownData(status, 'message');
+      if (typeof message !== 'string') {
+        return false;
+      }
+      statusMessageEmpty = message.length === 0;
     }
-    statusMessageEmpty = message.length === 0;
   }
   entries.push({
     kind: 'span',

@@ -18,7 +18,12 @@ import { startConductedFixture, type ConductedFixture } from './conducted.js';
 
 const TEST_TIMEOUT_MS = 150000;
 const HAPPY_PATH_PASS_BUDGET = 12;
-const TERMINATION_PASS_BUDGET = 6;
+// The same budget as the happy path: the lane's session stays active for the fake
+// client's busy window, so the early passes only wait.
+const TERMINATION_PASS_BUDGET = 12;
+// A pause between passes lets the lane end and the forge/review fakes answer
+// instead of burning the pass budget on back-to-back waits.
+const PASS_PAUSE_MS = 750;
 /** The run-driving loop's own wall-clock budget inside the 150 s scenario bound. */
 const DRIVE_BUDGET_MS = 120000;
 
@@ -95,6 +100,7 @@ async function driveUntilParked(current: ConductedFixture, maxPasses: number): P
     const pass = await current.runPass();
     expect(pass.code).toBe(0);
     passes += 1;
+    await new Promise((resolve) => setTimeout(resolve, PASS_PAUSE_MS));
     const entries = await journalOf(current);
     if (
       !receiptsRecorded &&
@@ -204,6 +210,7 @@ describe.skipIf(process.env.FLEET_E2E_SSH !== '1')('conducted accept + park over
       const pass = await current.runPass();
       expect(pass.code).toBe(0);
       passes += 1;
+      await new Promise((resolve) => setTimeout(resolve, PASS_PAUSE_MS));
       const codes = await resultReasonCodesOf(current);
       if (!placementFailed && codes.includes('review-passed')) {
         await current.makeFixPlacementFail();

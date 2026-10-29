@@ -93,6 +93,7 @@ import {
 } from './composition.js';
 import { hostsCommand, type HostsCliOptions } from './hosts.js';
 import { seatsCommand, type SeatsCliOptions } from './seats.js';
+import { policyCommand, type PolicyCliOptions } from './policy.js';
 import { seatPlanFromInstallation, unhealthySeatIdsOf } from './seat-plan.js';
 import { initCommand, type InitCliOptions } from './init.js';
 import { projectsCommand, type ProjectsCliOptions } from './projects.js';
@@ -418,6 +419,7 @@ const NON_ZERO_OUTCOMES: ReadonlySet<string> = new Set([
   'no-capacity',
   'busy-worktree',
   'still-running',
+  'not-merged',
   'unknown',
 ]);
 
@@ -1124,12 +1126,21 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
     accept: async (p, rt) => {
       const attemptId = str(p, 'attemptId');
       const attempt = await rt.execution.attemptRepository.findAttemptById(attemptId);
-      return rt.execution.requestAttemptAcceptance.requestAttemptAcceptance({
+      const result = await rt.execution.requestAttemptAcceptance.requestAttemptAcceptance({
         attemptId,
         candidateHeadSha: str(p, 'candidateHeadSha') || attempt?.artifacts?.headCommit || '',
         reviewerModel: str(p, 'reviewerModel'),
       });
+      // A6: the accept trigger runs auto-merge in the same invocation when the
+      // attempt is accepted; off leaves today's result byte-for-byte unchanged.
+      if (result.outcome === 'accepted') {
+        const autoMerge = await rt.execution.autoMergeAttempt.autoMergeAttempt({ attemptId });
+        return autoMerge.outcome === 'off' ? result : { ...result, autoMerge };
+      }
+      return result;
     },
+    'auto-merge': async (p, rt) =>
+      rt.execution.autoMergeAttempt.autoMergeAttempt({ attemptId: str(p, 'attemptId') }),
   },
   forge: {
     execute: async (p, rt) => {
@@ -1974,6 +1985,9 @@ edit and remove, each write confirmed and compare-and-swapped.
 The seats group shows or changes policy.useFreeSeats: seats free-tier status|on|off,
 each change confirmed and compare-and-swapped.
 
+The policy group shows or changes policy.autoMerge: policy auto-merge status|on|off,
+each change confirmed and compare-and-swapped.
+
 The projects group lists, shows, probes, registers, adopts, edits and retires
 project profiles; every change is confirmed unless --yes is given.
 
@@ -1998,13 +2012,14 @@ Commands:
   doctor [--probe-seats] [--host <name>] [--json]
   hosts list|add|edit|remove
   seats free-tier [status|on|off] [--yes]
+  policy auto-merge [status|on|off] [--allow-high-risk true|false] [--on-blocked ask-owner|hold] [--yes]
   projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
   state check|restore
   conductor status|halt|stop|resume|start|run
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
-  attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept
+  attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge
   forge execute
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede
@@ -2035,6 +2050,7 @@ export async function runCli(
   projectsOptions?: ProjectsCliOptions,
   stateOptions?: StateCliOptions,
   conductorOptions?: ConductorCliOptions,
+  policyOptions?: PolicyCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -2063,6 +2079,10 @@ export async function runCli(
     // The seats group manages the free-tier flag on the shared onboarding engine.
     if (group === 'seats') {
       return await seatsCommand(restArgv.slice(1), io, seatsOptions ?? {});
+    }
+    // The policy group manages the auto-merge policy on the shared onboarding engine.
+    if (group === 'policy') {
+      return await policyCommand(restArgv.slice(1), io, policyOptions ?? {});
     }
     // `state` reads the store files directly and never composes the runtime
     // or loads the installation; it is CLI-only (owner decision D4).

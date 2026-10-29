@@ -11,6 +11,8 @@ import {
   DEFAULT_REVIEW_TIMEOUT_MS,
   extractTextPart,
   isReadOnlyReviewCommand,
+  KIND_PROMPT_DIFF_COMPLETE,
+  KIND_PROMPT_TOOLS_ONLY,
   MAX_OCM_EMBEDDED_DIFF_BYTES,
   type OcmReviewTransportSpawn,
   parseReviewReplyStrict,
@@ -1686,23 +1688,27 @@ describe('OcmReviewTransport', () => {
       const prompt = buildReviewPrompt(kindRequest, nonce, 'diff --git a/f b/f\n+added line\n');
       expect(prompt).toContain('<<<UNTRUSTED nonce=0123456789abcdef label="diff">>>');
       expect(prompt).toContain('+added line');
-      expect(prompt).toContain(
-        'Inspect the candidate head with the read-only tools (read, grep, glob, list). ' +
-          'The diff is embedded above; if you must run a shell command, use only git diff/log/show/status, ' +
-          'grep, rg, ls, cat, sed -n or wc, never a command that writes.',
-      );
+      expect(prompt).toContain(KIND_PROMPT_DIFF_COMPLETE + ' ' + KIND_PROMPT_TOOLS_ONLY);
+      expect(prompt).not.toContain('if you must run a shell command');
+      expect(prompt).not.toContain('use only git diff');
       expect(prompt).not.toContain(
         'Inspect the code changes and candidate head using read-only tools (read, grep, glob, list).',
       );
+    });
+
+    it('the kind prompt forbids every shell command and names only the four read-only tools (KF-14f)', () => {
+      const prompt = buildReviewPrompt(kindRequest, nonce, 'diff --git a/f b/f\n+added line\n');
+      expect(KIND_PROMPT_TOOLS_ONLY).toContain('Do not run any shell command');
+      expect(prompt).toContain('Do not run any shell command: a bash or shell call voids this review whatever the command.');
+      expect(prompt).not.toMatch(/\b(rg|sed -n|wc|cat|ls)\b.*never a command that writes/);
     });
 
     it('an over-cap diff becomes a one-line note and the tools remain', () => {
       const prompt = buildReviewPrompt(kindRequest, nonce, 'x'.repeat(MAX_OCM_EMBEDDED_DIFF_BYTES + 1));
       expect(prompt).toContain('The diff was too large to embed');
       expect(prompt).not.toContain('<<<UNTRUSTED nonce=0123456789abcdef label="diff">>>');
-      expect(prompt).toContain(
-        'The diff is embedded above; if you must run a shell command',
-      );
+      expect(prompt).toContain(KIND_PROMPT_TOOLS_ONLY);
+      expect(prompt).not.toContain(KIND_PROMPT_DIFF_COMPLETE);
     });
 
     it('the manual prompt stays byte-identical even when a diff is offered', () => {

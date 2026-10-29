@@ -331,17 +331,16 @@ describe('conductor acceptance-to-merge wiring (K6-8)', () => {
   });
 
   it('buildLiveConductorDriver constructs with the K6 ports bound and calls no transport or forge', async () => {
-    const { forgeGhRunner } = makeGhRunner();
+    const { calls, forgeGhRunner } = makeGhRunner();
     const runtime = createFleetCliRuntime({
       installation: makeInstallation({ mode: 'none' }),
       forgeGhRunner,
       loadInstallationForAutoMerge: unreadableLoad,
     });
-    const before = runtime.conductor.ciState.readHeadCiState;
     const driver = buildLiveConductorDriver(runtime, { maxActiveRuns: 1 });
     expect(driver.start).not.toBeNull();
     expect(driver.policy).toBeDefined();
-    // Building objects only: the forged and CI transports were never touched.
-    expect(runtime.conductor.ciState.readHeadCiState).toBe(before);
+    // Building objects only: the injected gh runner (the only forge transport) recorded no call.
+    expect(calls).toEqual([]);
   });
 });

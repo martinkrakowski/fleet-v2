@@ -520,20 +520,20 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'done' });
   });
 
-  it('test 2: waiting journals merge-waiting; while the PR read still shows open the next advance acts merge again at a new head', async () => {
+  it('test 2: waiting refuses merge-waiting; after the head moves and acceptance re-establishes, the next merge acts at the new head', async () => {
     const harness = await mergingHarness();
     harness.setAutoMergeAnswer({ outcome: 'waiting', reason: 'ci-pending-first-look', headSha: COMMIT, firstLookAtIso: NOW });
     expect(await advance(harness)).toEqual({
       outcome: 'acted',
       step: 'merge',
       key: mergeKey(),
-      result: 'completed',
+      result: 'refused',
       reasonCode: 'merge-waiting',
     });
     expect(harness.autoMergeRequests).toHaveLength(1);
-    // The PR read still shows open: the merge is one-way, so the next act needs a
-    // fresh head. The branch moves, acceptance is re-established at the new head,
-    // and the PR read still shows open there.
+    // `waiting` is refused: a one-way key cannot wait. The PR read still shows open,
+    // so the next merge needs a fresh head. The branch moves, acceptance is
+    // re-established at the new head, and the PR read still shows open there.
     await harness.updateAttempt(collectedAttempt({
       revision: 1,
       artifacts: { ...COLLECTED_ARTIFACTS, headCommit: MOVED_COMMIT },
@@ -749,5 +749,126 @@ describe('AdvanceLaneRunUseCase park notices (K6-7)', () => {
     expect(harness.recordParkAttentionCalls).toEqual([]);
     expect(harness.askParkQuestionCalls).toEqual([]);
     expect((await harness.runRepo.get(RUN_ID))?.parked?.reason).toBe('owner-merge');
+  });
+
+  it('test 13: merge waiting refuses merge-waiting; the next advance parks step-refused merge without a second merge call', async () => {
+    const harness = await mergingHarness();
+    harness.setAutoMergeAnswer({ outcome: 'waiting', reason: 'ci-pending-first-look', headSha: COMMIT, firstLookAtIso: NOW });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'merge',
+      key: mergeKey(),
+      result: 'refused',
+      reasonCode: 'merge-waiting',
+    });
+    expect(harness.autoMergeRequests).toHaveLength(1);
+    // The merge key is spent: the next advance parks for the owner, never a second merge call.
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge' });
+    expect(harness.autoMergeRequests).toHaveLength(1);
+  });
+
+  it('test 14: a spent merge key parks step-refused merge without a new intent or a second merge call', async () => {
+    // A completed (non-refused) final result: the decider would re-act the same key; the guard parks.
+    const completed = await mergingHarness();
+    await appendIntent(completed, mergeKey(), null, NOW);
+    await appendResult(completed, mergeKey(), 'completed', 'merge-waiting', NOW);
+    expect(await advance(completed)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge' });
+    expect(completed.autoMergeRequests).toHaveLength(0);
+    const completedEntries = await completed.runJournal.listForRun(RUN_ID);
+    expect(completedEntries.filter((entry) => entry.kind === 'intent' && entry.key === mergeKey())).toHaveLength(1);
+
+    // A refused final result with the PR still open: same park, still no new intent or merge call.
+    const refused = await mergingHarness();
+    await appendIntent(refused, mergeKey(), null, NOW);
+    await appendResult(refused, mergeKey(), 'refused', 'merge-not-merged', NOW);
+    expect(await advance(refused)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge' });
+    expect(refused.autoMergeRequests).toHaveLength(0);
+    const refusedEntries = await refused.runJournal.listForRun(RUN_ID);
+    expect(refusedEntries.filter((entry) => entry.kind === 'intent' && entry.key === mergeKey())).toHaveLength(1);
+  });
+});
+
+describe('AdvanceLaneRunUseCase park notice re-raise (KF-4)', () => {
+  it('test 13: a park whose notice threw the first time gets its attention item and question on the next advance', async () => {
+    const harness = await mergingHarness({ wireParkNotice: true, autoMergeEnabled: false });
+    harness.setAttentionAnswer('throw');
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'owner-merge', qualifier: null });
+    expect(harness.recordParkAttentionCalls).toHaveLength(1);
+    expect(harness.askParkQuestionCalls).toHaveLength(0);
+    expect((await harness.runRepo.get(RUN_ID))?.parked?.questionId).toBeNull();
+
+    // The next advance re-raises under the saved park key: the fake succeeds,
+    // the question lands and its id is saved on the record.
+    harness.setAttentionAnswer(undefined as unknown as LaneRunParkNoticeResult);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.recordParkAttentionCalls).toHaveLength(2);
+    expect(harness.recordParkAttentionCalls[1]).toMatchObject({
+      key: RUN_ID + '/park@1',
+      reason: 'owner-merge',
+      runId: RUN_ID,
+    });
+    expect(harness.askParkQuestionCalls).toHaveLength(1);
+    expect((await harness.runRepo.get(RUN_ID))?.parked?.questionId).toBe(QUESTION_ID);
+  });
+
+  it('test 14: once the question id is saved, further advances raise nothing', async () => {
+    const harness = await mergingHarness({ wireParkNotice: true, autoMergeEnabled: false });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'owner-merge', qualifier: null });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    const attentionCalls = harness.recordParkAttentionCalls.length;
+    const questionCalls = harness.askParkQuestionCalls.length;
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.recordParkAttentionCalls).toHaveLength(attentionCalls);
+    expect(harness.askParkQuestionCalls).toHaveLength(questionCalls);
+  });
+
+  it('test 15: the park-repair path (record parked, conduct missing) raises on repair', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()], {
+      wireParkNotice: true,
+      wireWorkOrder: true,
+      wireForgeRead: true,
+      autoMergeEnabled: false,
+    });
+    // A crash between the park save and the conduct append: the record is
+    // parked but the journal has no `parked` conduct yet.
+    const current = await harness.runRepo.get(RUN_ID);
+    expect(current).not.toBeNull();
+    const saved = await harness.runRepo.save({
+      ...current!,
+      parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null },
+      parkCount: current!.parkCount + 1,
+      revision: current!.revision + 1,
+    }, { holderId: HOLDER, fence: 1, nowIso: LATER });
+    expect(saved.outcome).toBe('saved');
+    expect(await advance(harness)).toEqual({ outcome: 'repaired', state: 'parked' });
+    expect(harness.recordParkAttentionCalls).toHaveLength(1);
+    expect(harness.recordParkAttentionCalls[0]).toMatchObject({
+      key: RUN_ID + '/park@1',
+      reason: 'owner-merge',
+    });
+    expect(harness.askParkQuestionCalls).toHaveLength(1);
+    expect((await harness.runRepo.get(RUN_ID))?.parked?.questionId).toBe(QUESTION_ID);
+  });
+
+  it('test 16: an attention-only reason re-raises idempotently and never asks a question', async () => {
+    const harness = await mergingHarness({ wireParkNotice: true });
+    harness.setForgeReadAnswer(openPullRequestAtHead(7, 'behind'));
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'branch-behind', qualifier: null });
+    expect(harness.recordParkAttentionCalls).toHaveLength(1);
+    expect(harness.askParkQuestionCalls).toHaveLength(0);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    // The repeat answers `exists` under the same key; one call per advance.
+    expect(harness.recordParkAttentionCalls).toHaveLength(2);
+    expect(harness.recordParkAttentionCalls[1].key).toBe(RUN_ID + '/park@1');
+    expect(harness.askParkQuestionCalls).toHaveLength(0);
+  });
+
+  it('test 17: no parkNotice wired means no raise and the parked wait is unchanged', async () => {
+    const harness = await mergingHarness({ wireParkNotice: false, autoMergeEnabled: false });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'owner-merge', qualifier: null });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.recordParkAttentionCalls).toEqual([]);
+    expect(harness.askParkQuestionCalls).toEqual([]);
+    expect(harness.portCalls.filter((call) => call.startsWith('park'))).toHaveLength(0);
   });
 });

@@ -94,6 +94,9 @@ function isNonEmpty(value: unknown): value is string {
  */
 const PR_NOTE_MAX_LENGTH = 4000;
 
+/** The runner agent pattern (KF-7): alphanumeric start, then letters, digits, dot, underscore, hyphen. */
+const AGENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
 function prNotesError(notes: unknown): string | null {
   if (typeof notes !== 'object' || notes === null || Array.isArray(notes)) {
     return 'prNotes must be an object with hardToUndo, assumptions and challengeThis';
@@ -146,7 +149,7 @@ function checkSeatPlan(
       model: assignment.model,
       tool: assignment.seatTool,
       variant: assignment.variant,
-      agent: (assignment as { readonly agent?: string }).agent ?? null,
+      agent: assignment.agent,
     }),
   );
   if (!matchesFirstPass) {
@@ -184,6 +187,19 @@ function validateBriefFields(request: PrepareBriefPackageRequest): string | null
   // (H8); it is required and never defaulted to a declared kind.
   if (parseSeatTool(request.modelAssignment.seatTool) === undefined) {
     return 'Model assignment requires a declared seat tool (opencode or agy)';
+  }
+  // The runner agent (KF-7) is optional and frozen into the manifest with the
+  // rest of the assignment; when present it must be a non-empty string of at
+  // most 64 characters matching the allowed pattern.
+  const agent = request.modelAssignment.agent;
+  if (
+    agent !== undefined &&
+    (typeof agent !== 'string' ||
+      agent.length === 0 ||
+      agent.length > 64 ||
+      !AGENT_PATTERN.test(agent))
+  ) {
+    return 'Model assignment agent must be a non-empty string of at most 64 characters matching [A-Za-z0-9][A-Za-z0-9._-]*';
   }
   return null;
 }

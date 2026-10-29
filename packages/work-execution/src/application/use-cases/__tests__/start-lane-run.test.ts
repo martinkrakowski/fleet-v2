@@ -828,6 +828,56 @@ describe('StartLaneRunUseCase', () => {
     expect(await harness.attemptRepoStore.listAllAttempts()).toEqual([]);
   });
 
+  it('test 2e: a start whose first-pass seat names an agent accepts an assignment that names it (KF-7)', async () => {
+    const agentSeatPlan = {
+      version: 1 as const,
+      'first-pass': [{ id: 'fp-1', model: 'model-example-1', tool: 'opencode', agent: 'lane' }],
+      fix: [{ id: 'fx-1', model: 'model-example-1', tool: 'opencode' }],
+      review: [],
+    };
+    const harness = makeHarness();
+    const result = await harness.useCase.startLaneRun(
+      requestFixture({
+        brief: briefFixture({
+          seatPlan: agentSeatPlan,
+          modelAssignment: {
+            model: 'model-example-1',
+            variant: 'default',
+            fallbackModel: 'model-example-2',
+            seatTool: 'opencode',
+            agent: 'lane',
+          },
+        }),
+      }),
+    );
+    expect(result).toEqual({
+      outcome: 'started',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      hostName: HOST_NAME,
+      worktreePath: WORKTREE_PATH,
+    });
+  });
+
+  it('test 2f: a start whose plan seat names an agent refuses an assignment that does not (KF-7)', async () => {
+    const agentSeatPlan = {
+      version: 1 as const,
+      'first-pass': [{ id: 'fp-1', model: 'model-example-1', tool: 'opencode', agent: 'lane' }],
+      fix: [{ id: 'fx-1', model: 'model-example-1', tool: 'opencode' }],
+      review: [],
+    };
+    const harness = makeHarness();
+    const result = await harness.useCase.startLaneRun(
+      requestFixture({ brief: briefFixture({ seatPlan: agentSeatPlan }) }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(harness.capacityCalls).toHaveLength(0);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+    expect(await harness.attemptRepoStore.listAllAttempts()).toEqual([]);
+  });
+
   it('test 7: after a start the driver\'s first step is dispatch, without an admit call', async () => {
     const harness = makeHarness();
     expect(await harness.useCase.startLaneRun(requestFixture())).toMatchObject({ outcome: 'started' });

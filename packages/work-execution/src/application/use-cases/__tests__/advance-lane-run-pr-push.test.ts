@@ -553,7 +553,7 @@ describe('AdvanceLaneRunUseCase open-pr act (K6-6)', () => {
     });
   });
 
-  it('test 3: a refused grant journals grant-refused with a null minted id and no forge call', async () => {
+  it('test 3: a refused grant journals grant-refused with the keyed intent minted to the action id and no forge call', async () => {
     const harness = await openingPrHarness();
     harness.setGrantAnswer({ outcome: 'refused', reason: FORGE_REASON });
     expect(await advance(harness)).toEqual({
@@ -567,7 +567,37 @@ describe('AdvanceLaneRunUseCase open-pr act (K6-6)', () => {
     const entries = await harness.runJournal.listForRun(RUN_ID);
     const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === openPrKey());
     expect(intents).toHaveLength(1);
-    expect(intents[0]!.mintedId).toBeNull();
+    // The intent is minted to the action id before the grant, so it is never null.
+    // The deterministic ulid minter consumed one id each for the conduct, the accept
+    // intent and the accept result, so the action id is the minter's fourth value.
+    expect(intents[0]!.mintedId).toBe('forge-01JB0000000000000000000003');
+    const results = entries.filter((entry) => entry.kind === 'result' && entry.key === openPrKey());
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ outcome: 'refused', reasonCode: 'grant-refused' });
+  });
+
+  it('test 3b: a thrown grant journals exactly one refused/grant-refused result under the already-journalled intent and no forge call', async () => {
+    const harness = await openingPrHarness();
+    harness.setGrantAnswer('throw');
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'refused',
+      reasonCode: 'grant-refused',
+    });
+    expect(harness.grantRequests).toHaveLength(1);
+    expect(harness.forgeRequests).toEqual([]);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === openPrKey());
+    expect(intents).toHaveLength(1);
+    expect(intents[0]!.mintedId).toBe('forge-01JB0000000000000000000003');
+    const results = entries.filter((entry) => entry.kind === 'result' && entry.key === openPrKey());
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ outcome: 'refused', reasonCode: 'grant-refused' });
+    // The spent one-way key parks on the next advance; no second grant is issued.
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'open-pr' });
+    expect(harness.grantRequests).toHaveLength(1);
   });
 
   it('test 4: an ambiguous forge outcome leaves the intent pending; the reconcile that finds the PR at the head reconciles and fills the PR number, calling the forge action exactly once', async () => {
@@ -799,5 +829,58 @@ describe('AdvanceLaneRunUseCase push act (K6-6)', () => {
     // The one-way key is spent: the next advance parks for the owner instead of pushing again.
     expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'push' });
     expect(harness.forgeRequests).toHaveLength(1);
+  });
+
+  it('test 12: a spent open-pr key parks step-refused open-pr without a new intent or grant/forge calls', async () => {
+    const harness = await openingPrHarness();
+    await appendIntent(harness, openPrKey(), null, NOW);
+    await appendResult(harness, openPrKey(), 'completed', 'pr-opened', NOW);
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'open-pr' });
+    expect(harness.grantRequests).toEqual([]);
+    expect(harness.forgeRequests).toEqual([]);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === openPrKey())).toHaveLength(1);
+  });
+
+  it('test 13: a spent push key parks step-refused push without a new intent or grant/forge calls', async () => {
+    const harness = await pushingHarness();
+    harness.setForgeReadAnswer({
+      outcome: 'found',
+      pullRequest: {
+        number: 7,
+        state: 'open',
+        mergeState: 'clean',
+        headSha: MOVED_COMMIT,
+        headRef: 'wt-example-1',
+        baseRef: 'main',
+        mergedAtIso: null,
+        closedAtIso: null,
+        mergeCommitSha: null,
+      },
+    });
+    await appendIntent(harness, pushKey(), null, NOW);
+    await appendResult(harness, pushKey(), 'completed', 'pushed', NOW);
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'push' });
+    expect(harness.grantRequests).toEqual([]);
+    expect(harness.forgeRequests).toEqual([]);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === pushKey())).toHaveLength(1);
+  });
+
+  it('test 14: a crash between the intent and the grant reconciles by the forge read, never a second grant', async () => {
+    const harness = await openingPrHarness();
+    await appendIntent(harness, openPrKey(), 'forge-01JB00000000000000000000', NOW);
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'reconciled',
+      reasonCode: 'pr-opened',
+    });
+    expect(harness.grantRequests).toEqual([]);
+    expect(harness.forgeRequests).toEqual([]);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.prNumber).toBe(7);
   });
 });

@@ -236,45 +236,77 @@ interface ParsedRequest {
   readonly nowIso: string;
 }
 
-/** The request is unknown input: every field is read as an own data property and validated; anything else is null. */
-function parseRequest(value: unknown): ParsedRequest | null {
-  if (!isPlainObject(value)) {
-    return null;
+/**
+ * One request field as an own data property: `Object.getOwnPropertyDescriptor`
+ * so no accessor ever runs and a missing descriptor where one is required is
+ * itself invalid. A descriptor read that throws reads as absent (fail closed).
+ */
+function ownDataField(value: Record<string, unknown>, field: string): { ok: true; value: unknown } | { ok: false } {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, field);
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return { ok: false };
+    }
+    return { ok: true, value: descriptor.value };
+  } catch {
+    return { ok: false };
   }
-  for (const field of ['selection', 'policy', 'mode', 'deadline', 'retryRejected', 'nowIso']) {
-    if (!Object.hasOwn(value, field)) {
+}
+
+/**
+ * The request is unknown input: every field is read as an own data property
+ * and validated; anything else is null. The whole parse is wrapped so no
+ * getter or descriptor read can make `execute()` reject: any throw reads as
+ * `invalid-request` (fail closed, never throws).
+ */
+function parseRequest(value: unknown): ParsedRequest | null {
+  try {
+    if (!isPlainObject(value)) {
       return null;
     }
-  }
-  const selection = parseSelection(value.selection);
-  if (selection === null) {
+    const fields = new Map<string, unknown>();
+    for (const field of ['selection', 'policy', 'mode', 'deadline', 'retryRejected', 'nowIso']) {
+      const own = ownDataField(value, field);
+      if (!own.ok) {
+        return null;
+      }
+      fields.set(field, own.value);
+    }
+    const selection = parseSelection(fields.get('selection'));
+    if (selection === null) {
+      return null;
+    }
+    const policy = parsePolicy(fields.get('policy'));
+    if (policy === null) {
+      return null;
+    }
+    const mode = fields.get('mode');
+    if (mode !== 'send' && mode !== 'dry-run') {
+      return null;
+    }
+    const deadline = parseDeadline(fields.get('deadline'));
+    if (!deadline.ok) {
+      return null;
+    }
+    const retryRejected = fields.get('retryRejected');
+    if (typeof retryRejected !== 'boolean') {
+      return null;
+    }
+    const nowIso = fields.get('nowIso');
+    if (!isIsoInstant(nowIso)) {
+      return null;
+    }
+    return {
+      selection,
+      policy,
+      mode: mode as 'send' | 'dry-run',
+      deadline: deadline.deadline,
+      retryRejected,
+      nowIso,
+    };
+  } catch {
     return null;
   }
-  const policy = parsePolicy(value.policy);
-  if (policy === null) {
-    return null;
-  }
-  if (value.mode !== 'send' && value.mode !== 'dry-run') {
-    return null;
-  }
-  const deadline = parseDeadline(value.deadline);
-  if (!deadline.ok) {
-    return null;
-  }
-  if (typeof value.retryRejected !== 'boolean') {
-    return null;
-  }
-  if (!isIsoInstant(value.nowIso)) {
-    return null;
-  }
-  return {
-    selection,
-    policy,
-    mode: value.mode,
-    deadline: deadline.deadline,
-    retryRejected: value.retryRejected,
-    nowIso: value.nowIso,
-  };
 }
 
 /** One port call, never a throw: a rejection or a throw reads as `ok: false` (fail closed). */

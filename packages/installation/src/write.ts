@@ -67,11 +67,16 @@ export function writeInstallationV2(installation: FleetInstallationV2): string {
   return `${JSON.stringify(document, null, 2)}\n`;
 }
 
+/** UTF-16 code-unit order: identical to the default sort(), stated explicitly (Sonar S2871). */
+function compareCodeUnits(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 function serializeHosts(
   hosts: Readonly<Record<string, HostSection>>,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  for (const name of [...Object.keys(hosts)].sort()) {
+  for (const name of [...Object.keys(hosts)].sort(compareCodeUnits)) {
     out[name] = serializeHost(hosts[name]);
   }
   return out;
@@ -265,7 +270,7 @@ function serializeVerification(
 ): Record<string, unknown> {
   const procedures: Record<string, unknown> = {};
   const record: Readonly<Record<string, VerificationProcedure>> = verification.procedures;
-  for (const name of [...Object.keys(record)].sort()) {
+  for (const name of [...Object.keys(record)].sort(compareCodeUnits)) {
     const procedure = record[name];
     const out: Record<string, unknown> = { command: procedure.command };
     if (procedure.args !== undefined) {

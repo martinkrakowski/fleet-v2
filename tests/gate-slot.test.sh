@@ -32,8 +32,10 @@ for v in 0 abc 07 -1; do
 done
 out=$(run env FLEET_V2_GATE_SLOTS= sh "$SCRIPT" sh -c 'echo "$FLEET_V2_GATE_SLOT"')
 [ "$out" = 1 ] && ok 'an empty slot count means the default' || bad "an empty slot count means the default ($out)"
-FLEET_V2_GATE_POLL_SECONDS=x FLEET_V2_GATE_LOCK_DIR=$T sh "$SCRIPT" true >/dev/null 2>&1
-[ $? -eq 2 ] && ok 'a bad poll interval is refused' || bad 'a bad poll interval is refused'
+for v in x 0 00 05; do
+  env FLEET_V2_GATE_POLL_SECONDS=$v FLEET_V2_GATE_LOCK_DIR="$T" sh "$SCRIPT" true >/dev/null 2>&1
+  [ $? -eq 2 ] && ok "poll interval '$v' refused" || bad "poll interval '$v' refused"
+done
 FLEET_V2_GATE_LOCK_DIR=$T/missing sh "$SCRIPT" true >/dev/null 2>&1
 [ $? -eq 2 ] && ok 'a missing lock dir is refused' || bad 'a missing lock dir is refused'
 

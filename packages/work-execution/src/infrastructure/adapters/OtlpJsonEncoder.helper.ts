@@ -31,9 +31,9 @@ import {
   RUN_TELEMETRY_RESOURCE_KEYS,
   telemetryResourceAttributes,
   type TelemetryAttributeValue,
+  type TelemetryAttributeType,
   type TelemetryResourceInput,
 } from '../../domain/run-telemetry-attributes.js';
-import type { TelemetryAttributeType } from '../../domain/run-telemetry-attributes.js';
 
 /** The encoder's result: the payload bytes (null when no span was encoded) and per-span outcomes. */
 export type OtlpEncodeResult = {
@@ -106,9 +106,18 @@ function encodeValue(type: TelemetryAttributeType | undefined, value: TelemetryA
   return REFUSED;
 }
 
+/** Code-unit order for attribute keys: the same bytes on every host and locale. */
+function compareCodeUnits(a: string, b: string): number {
+  if (a < b) {
+    return -1;
+  }
+  return a > b ? 1 : 0;
+}
+
 /** The `attributes[]` list of a span, keys sorted for stable bytes; null refuses the span. */
 function encodeAttributes(snapshot: Record<string, TelemetryAttributeValue>): unknown[] | null {
-  const keys = Object.keys(snapshot).sort();
+  // Code-unit order (not locale order) so the bytes are the same on every host.
+  const keys = Object.keys(snapshot).sort(compareCodeUnits);
   const entries: unknown[] = [];
   for (const key of keys) {
     const encoded = encodeValue(RUN_TELEMETRY_ATTRIBUTES[key]?.type, snapshot[key]);
@@ -129,9 +138,12 @@ function encodeEvents(events: readonly TelemetrySpanEvent[]): unknown[] {
   }));
 }
 
+/** OTLP status codes: unset 0, ok 1, error 2. */
+const OTLP_STATUS_CODES: Readonly<Record<TelemetrySpanStatus['code'], number>> = Object.freeze({ unset: 0, ok: 1, error: 2 });
+
 /** The status object: an integer code, plus `message` only for a reason code (decision 10). */
 function encodeStatus(status: TelemetrySpanStatus): Record<string, unknown> {
-  const code = status.code === 'unset' ? 0 : status.code === 'ok' ? 1 : 2;
+  const code = OTLP_STATUS_CODES[status.code];
   if (status.reasonCode !== null) {
     return { code, message: status.reasonCode };
   }
@@ -161,6 +173,24 @@ function encodeSpan(span: TelemetrySpan, snapshot: Record<string, TelemetryAttri
   }
   encoded.status = encodeStatus(span.status);
   return encoded;
+}
+
+/** One input encoded, or null when it is refused (not branded, unreadable, not pricing-safe or not encodable). */
+function encodeOneSpan(input: unknown): { readonly span: unknown; readonly spanId: string } | null {
+  if (!TelemetrySpan.isTelemetrySpan(input)) {
+    return null;
+  }
+  let snapshot: Record<string, TelemetryAttributeValue>;
+  try {
+    snapshot = attributeSnapshot(input.attributes);
+  } catch {
+    return null;
+  }
+  if (!pricingSafe({ kind: input.kind, attributes: snapshot })) {
+    return null;
+  }
+  const span = encodeSpan(input, snapshot);
+  return span === null ? null : { span, spanId: input.spanId };
 }
 
 /**
@@ -197,29 +227,13 @@ export function encodeOtlpTraces(spans: readonly unknown[], resource: TelemetryR
     const refused: { index: number; reason: 'invalid' }[] = [];
 
     for (let index = 0; index < count; index += 1) {
-      const input = spans[index];
-      if (!TelemetrySpan.isTelemetrySpan(input)) {
-        refused.push({ index, reason: 'invalid' });
-        continue;
-      }
-      let snapshot: Record<string, TelemetryAttributeValue>;
-      try {
-        snapshot = attributeSnapshot(input.attributes);
-      } catch {
-        refused.push({ index, reason: 'invalid' });
-        continue;
-      }
-      if (!pricingSafe({ kind: input.kind, attributes: snapshot })) {
-        refused.push({ index, reason: 'invalid' });
-        continue;
-      }
-      const encoded = encodeSpan(input, snapshot);
+      const encoded = encodeOneSpan(spans[index]);
       if (encoded === null) {
         refused.push({ index, reason: 'invalid' });
         continue;
       }
-      encodedSpans.push(encoded);
-      encodedSpanIds.push(input.spanId);
+      encodedSpans.push(encoded.span);
+      encodedSpanIds.push(encoded.spanId);
     }
 
     const payload =

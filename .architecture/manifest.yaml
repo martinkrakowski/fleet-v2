@@ -393,6 +393,7 @@ bounded_contexts:
             - AttemptArtifactPort
             - ForgeActionPort
             - ForgeReadPort
+            - ForgeAncestryPort
             - AcceptanceAssessmentPort
             - AcceptanceEvidencePort
             - OwnerDecisionPort
@@ -455,6 +456,7 @@ bounded_contexts:
       AttemptArtifactPort: "Place frozen briefs and templates under verified ignored paths and collect bounded immutable artifacts after lane completion."
       ForgeActionPort: "Perform permitted credential-bearing PR and merge operations through stable action IDs and explicit expected-head checks."
       ForgeReadPort: "Read one pull request's state by number or branch (open, merged or closed; head, base, merge time and merge commit) without mutating anything; a forge that cannot be read or a response that cannot be verified is unavailable, never a guess and never absence."
+      ForgeAncestryPort: "Answer whether one commit contains another as an ancestor (a merged PR head containing the lane head) through a read-only forge compare; no answer is unavailable, never a guess."
       AcceptanceAssessmentPort: "Consume the evidence context's exact-head assessment without importing its repositories or mutating its aggregates."
       AcceptanceEvidencePort: "Consume the evidence context's exact-head assessment to authorize merge actions."
       ReviewRequestPort: "Request a read-only review of one kind (brief-check, code-review, pre-merge) at one exact head under the conductor's request id, and find the receipt recorded for a request id; a review that recorded nothing is no-receipt, a refusal before any review is refused, anything unestablished is unknown, and read the latest receipt of one kind at a head; reason codes only."
@@ -512,6 +514,7 @@ bounded_contexts:
       - { adapter: AttemptArtifactAdapter, implements: AttemptArtifactPort, integration: bounded-filesystem-and-approved-remote-artifact-access }
       - { adapter: ForgeActionAdapter, implements: ForgeActionPort, integration: reviewed-github-cli-subprocess }
       - { adapter: ForgeReadAdapter, implements: ForgeReadPort, integration: reviewed-github-cli-subprocess-read-only }
+      - { adapter: ForgeReadAdapter, implements: ForgeAncestryPort, integration: reviewed-github-cli-subprocess-read-only }
       - adapter: AcceptanceAssessmentAdapter
         implements: AcceptanceAssessmentPort
         integration: in-process

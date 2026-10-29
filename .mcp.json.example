@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "fleet-v2": {
+      "command": "node",
+      "args": ["apps/mcp/dist/bin.js"],
+      "env": {
+        "FLEET_API_URL": "http://127.0.0.1:<api-port>",
+        "FLEET_API_TOKEN_FILE": "/absolute/path/to/fleet-api-token"
+      }
+    }
+  }
+}

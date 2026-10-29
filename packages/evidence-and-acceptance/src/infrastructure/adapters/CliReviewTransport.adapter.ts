@@ -228,16 +228,22 @@ interface AgyJsonReply {
  * never a clean verdict.
  */
 function readAgyReviewReply(stdout: string): string {
-  let parsed: AgyJsonReply;
+  let parsed: unknown;
   try {
-    parsed = JSON.parse(stdout) as AgyJsonReply;
+    parsed = JSON.parse(stdout);
   } catch {
     throw new Error('reviewer CLI returned an empty response');
   }
-  if (typeof parsed.response !== 'string' || parsed.response.trim() === '') {
+  // `JSON.parse` also yields null, numbers and arrays: only an object with a
+  // non-blank string `response` is a reply.
+  if (typeof parsed !== 'object' || parsed === null) {
     throw new Error('reviewer CLI returned an empty response');
   }
-  return parsed.response;
+  const { response } = parsed as AgyJsonReply;
+  if (typeof response !== 'string' || response.trim() === '') {
+    throw new Error('reviewer CLI returned an empty response');
+  }
+  return response;
 }
 
 export function createCliReviewTransport(
@@ -276,7 +282,8 @@ export function createCliReviewTransport(
 
     // 5. Build the embedded prompt and enforce the size cap
     const nonce = (options.makeNonce ?? defaultNonce)();
-    const isAgy = options.argvTemplate === AGY_REVIEW_ARGV_TEMPLATE;
+    // The tool is the template's program, so a copied template is still agy.
+    const isAgy = options.argvTemplate[0] === 'agy';
     const basePrompt = buildEmbeddedReviewPrompt(request, diff, nonce);
     // Headless agy auto-denies shell commands and then answers empty, so its
     // prompt starts with the no-shell preamble; the grok prompt is unchanged.
@@ -315,22 +322,19 @@ export function createCliReviewTransport(
       // 9. An empty or one-line answer is a failed review, never a pass.
       // For agy the stdout is the `--output-format json` wrapper: unwrap it
       // and take the reply text from the documented `response` field.
-      let text = outcome.stdout;
-      if (isAgy) {
-        text = readAgyReviewReply(outcome.stdout);
-      } else {
-        let nonBlankLineCount = 0;
-        for (const line of text.split(/\r?\n/)) {
-          if (line.trim() !== '') {
-            nonBlankLineCount += 1;
-          }
+      // The unwrapped reply then meets the same line guard as grok's text.
+      const text = isAgy ? readAgyReviewReply(outcome.stdout) : outcome.stdout;
+      let nonBlankLineCount = 0;
+      for (const line of text.split(/\r?\n/)) {
+        if (line.trim() !== '') {
+          nonBlankLineCount += 1;
         }
-        if (nonBlankLineCount === 0) {
-          throw new Error('reviewer CLI returned an empty response');
-        }
-        if (nonBlankLineCount < 2) {
-          throw new Error('reviewer CLI returned a one-line response');
-        }
+      }
+      if (nonBlankLineCount === 0) {
+        throw new Error('reviewer CLI returned an empty response');
+      }
+      if (nonBlankLineCount < 2) {
+        throw new Error('reviewer CLI returned a one-line response');
       }
 
       // 10. Verify head and status after the review

@@ -12,6 +12,7 @@ import {
   AGY_NO_SHELL_PREAMBLE,
   AGY_REVIEW_ARGV_TEMPLATE,
   buildEmbeddedReviewPrompt,
+  CLI_REVIEW_ARGV_TEMPLATES,
   CLI_REVIEWER_ENV_ALLOWLIST,
   createCliReviewTransport,
   GROK_REVIEW_ARGV_TEMPLATE,
@@ -568,6 +569,7 @@ describe('CliReviewTransport', () => {
         '--mode',
         'accept-edits',
       ]);
+      expect(CLI_REVIEW_ARGV_TEMPLATES.agy).toBe(AGY_REVIEW_ARGV_TEMPLATE);
       expect(substituteReviewArgv(AGY_REVIEW_ARGV_TEMPLATE, AGY_MODEL, 'PROMPT')).toEqual([
         'agy',
         '--print',
@@ -633,6 +635,42 @@ describe('CliReviewTransport', () => {
       expect(result.findings).toHaveLength(1);
     });
 
+    it('a one-line response field is a failed review, as it is for grok (CT-4a Argon)', async () => {
+      const spawn: CliReviewSpawn = async () => ({
+        exitCode: 0,
+        signal: null,
+        stdout: agyStdout('VERDICT: PASS\n'),
+        stderr: '',
+      });
+      const { transport, scratchDirs } = buildAgyHarness({ spawn });
+
+      await expect(transport(AGY_REQUEST)).rejects.toThrow('reviewer CLI returned a one-line response');
+      await expect(access(scratchDirs[0])).rejects.toThrow();
+    });
+
+    it('a JSON null or array stdout is a failed review with the fixed reason (CT-4a Argon)', async () => {
+      for (const stdout of ['null', '[]', '42']) {
+        const spawn: CliReviewSpawn = async () => ({ exitCode: 0, signal: null, stdout, stderr: '' });
+        const { transport } = buildAgyHarness({ spawn });
+
+        await expect(transport(AGY_REQUEST)).rejects.toThrow('reviewer CLI returned an empty response');
+      }
+    });
+
+    it('a copied agy template still gets the preamble and the JSON unwrap (CT-4a Argon)', async () => {
+      let capturedPrompt = '';
+      const spawn: CliReviewSpawn = async (_file, args) => {
+        capturedPrompt = args[args.indexOf('--print') + 1];
+        return { exitCode: 0, signal: null, stdout: agyStdout(AGY_PASS), stderr: '' };
+      };
+      const { transport } = buildAgyHarness({ spawn, argvTemplate: [...AGY_REVIEW_ARGV_TEMPLATE] });
+
+      const result = await transport(AGY_REQUEST);
+
+      expect(capturedPrompt.startsWith(`${AGY_NO_SHELL_PREAMBLE}\n\n`)).toBe(true);
+      expect(result.result).toBe('pass');
+    });
+
     it('an EMPTY response field is a failed review, never a clean verdict', async () => {
       const spawn: CliReviewSpawn = async () => ({
         exitCode: 0,
@@ -693,12 +731,20 @@ describe('CliReviewTransport', () => {
       };
       const { transport } = buildAgyHarness({ spawn });
 
-      await transport(AGY_REQUEST);
+      const planted = 'FLEET_CT4A_FORBIDDEN_VAR';
+      process.env[planted] = 'planted';
+      try {
+        await transport(AGY_REQUEST);
+      } finally {
+        delete process.env[planted];
+      }
 
       expect(capturedEnv).toBeDefined();
       for (const key of Object.keys(capturedEnv ?? {})) {
         expect(CLI_REVIEWER_ENV_ALLOWLIST).toContain(key);
       }
+      expect(capturedEnv).not.toHaveProperty(planted);
+      expect(CLI_REVIEWER_ENV_ALLOWLIST).not.toContain(planted);
     });
   });
 });

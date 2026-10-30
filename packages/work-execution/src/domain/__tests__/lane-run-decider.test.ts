@@ -843,6 +843,80 @@ describe('fixing state', () => {
     });
   });
 
+  it('KF-17: fixing round 1 with a prepared round-1 attempt refused (not-started) dispatches it even when not admitted', () => {
+    const rec = record({ round: 1, attemptIds: ['attempt-example-1', 'attempt-example-2'] });
+    const facts = baseFacts({
+      state: 'fixing',
+      admission: 'no-capacity',
+      attempt: attemptFact({ attemptId: 'attempt-example-2', round: 1, phase: 'prepared', dispatchResult: 'not-started' }),
+    });
+    expect(decide(rec, facts)).toEqual({
+      kind: 'act', step: 'dispatch', key: `${RUN_ID}/r1/dispatch/0/a2`, round: 1, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
+  it('KF-17: fixing round 1 with a cancelled round-1 attempt prepares round 1 with the next ordinal', () => {
+    const rec = record({ round: 1, attemptIds: ['attempt-example-1', 'attempt-example-2'] });
+    const facts = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'attempt-example-2', round: 1, phase: 'cancelled', dispatchResult: 'not-started' }),
+    });
+    expect(decide(rec, facts)).toEqual({
+      kind: 'act', step: 'prepare', key: `${RUN_ID}/r1/prepare/0/a3`, round: 1, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
+  it('KF-17: fixing round 2 with a prepared or cancelled round-2 attempt does not park blocker-after-round-2', () => {
+    const rec = record({ round: 2, attemptIds: ['a1', 'a2', 'a3'] });
+    const prepared = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'a3', round: 2, phase: 'prepared', dispatchResult: 'not-started' }),
+    });
+    expect(decide(rec, prepared)).toEqual({
+      kind: 'act', step: 'dispatch', key: `${RUN_ID}/r2/dispatch/0/a3`, round: 2, seatIndex: 0, head12: null, retry: null,
+    });
+    const cancelled = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'a3', round: 2, phase: 'cancelled', dispatchResult: 'not-started' }),
+    });
+    expect(decide(rec, cancelled)).toEqual({
+      kind: 'act', step: 'prepare', key: `${RUN_ID}/r2/prepare/0/a4`, round: 2, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
+  it('KF-17: fixing round 2 with a collected round-2 attempt still parks blocker-after-round-2', () => {
+    const rec = record({ round: 2, attemptIds: ['a1', 'a2', 'a3'] });
+    const facts = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'a3', round: 2, phase: 'collected', collection: { commits: 1, manifest: 'sealed' } }),
+    });
+    assertDecision(facts, rec, decide(rec, facts), {
+      kind: 'park', reason: 'blocker-after-round-2', qualifier: null, parkedFrom: 'fixing',
+    });
+  });
+
+  it('KF-17: fixing round 1 with a collected round-1 attempt prepares round 2 (unchanged)', () => {
+    const rec = record({ round: 1, attemptIds: ['attempt-example-1', 'attempt-example-2'] });
+    const facts = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'attempt-example-2', round: 1, phase: 'collected', collection: { commits: 1, manifest: 'sealed' } }),
+    });
+    expect(decide(rec, facts)).toEqual({
+      kind: 'act', step: 'prepare', key: `${RUN_ID}/r2/prepare/0/a3`, round: 2, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
+  it('KF-17: fixing round 0 with a cancelled round-1 attempt (raise save refused) prepares round 1', () => {
+    const rec = record({ attemptIds: ['attempt-example-1', 'attempt-example-2'] });
+    const facts = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'attempt-example-2', round: 1, phase: 'cancelled', dispatchResult: 'not-started' }),
+    });
+    expect(decide(rec, facts)).toEqual({
+      kind: 'act', step: 'prepare', key: `${RUN_ID}/r1/prepare/0/a3`, round: 1, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
   it('X5: parks when the next seat is exhausted', () => {
     const rec = record({ attemptIds: ['attempt-example-1'] });
     const facts = baseFacts({
@@ -1506,7 +1580,7 @@ describe('KF-1: a lost dispatching conduct is repaired, never re-prepared', () =
   });
 
   it('a fixing run with a started round+1 attempt enters dispatching (not a second prepare)', () => {
-    const rec = record({ attemptIds: ['attempt-example-1', 'attempt-example-2'] });
+    const rec = record({ round: 1, attemptIds: ['attempt-example-1', 'attempt-example-2'] });
     const facts = baseFacts({
       state: 'fixing',
       attempt: attemptFact({ attemptId: 'attempt-example-2', round: 1, phase: 'dispatching', dispatchResult: 'started' }),

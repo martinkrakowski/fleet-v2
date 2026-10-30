@@ -272,6 +272,13 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         return enter('dispatching');
       }
       if (attempt !== null && attempt.phase === 'prepared' && attempt.round === round) {
+        // A prepared attempt whose dispatch was refused (or whose intent was
+        // reconciled as never started) goes straight to the dispatch act: that
+        // act only cancels the attempt, and waiting on admission would never
+        // let a refusal of `no-reservation` recover.
+        if (attempt.dispatchResult === 'not-started') {
+          return dispatchAct(attempt);
+        }
         if (facts.admission !== 'admitted') {
           return wait('admission');
         }
@@ -473,20 +480,31 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
     };
 
     const fixingRules = (): LaneRunDecision => {
-      if (record.round >= 2) {
+      const attempt = facts.attempt;
+      // The round is raised before dispatch (performDispatch), so an attempt placed at record.round that never ran
+      // (prepared, cancelled, or started with its conduct lost) is still this round's attempt. A cancelled attempt
+      // counts only with a journalled dispatch intent (`not-started`): a burned attempt ordinal with no record at
+      // all also reads `cancelled` at record.round, and that run must still park (KF-17).
+      const raisedUnrun =
+        attempt !== null &&
+        record.round >= 1 &&
+        attempt.round === record.round &&
+        (attempt.phase === 'prepared' ||
+          (attempt.phase === 'cancelled' && attempt.dispatchResult !== 'none') ||
+          lostDispatchConduct(attempt, record.round));
+      const fixRound = raisedUnrun ? record.round : record.round + 1;
+      if (fixRound > 2) {
         return park('blocker-after-round-2', null);
       }
       if (facts.costCeilingReached) {
         return park('cost-ceiling', null);
       }
-      const nextRound = record.round + 1;
-      const attempt = facts.attempt;
       if (
         attempt !== null &&
-        attempt.round === nextRound &&
-        (attempt.phase === 'prepared' || lostDispatchConduct(attempt, nextRound))
+        attempt.round === fixRound &&
+        (attempt.phase === 'prepared' || lostDispatchConduct(attempt, fixRound))
       ) {
-        return dispatchOrPrepare(nextRound, attempt, facts.implementerSeat);
+        return dispatchOrPrepare(fixRound, attempt, facts.implementerSeat);
       }
       if (attempt === null) {
         return WAIT_FACTS_INCONSISTENT;
@@ -494,7 +512,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (attempt.phase !== 'collected' && attempt.phase !== 'cancelled') {
         return wait('prior-not-ended');
       }
-      return dispatchOrPrepare(nextRound, attempt, facts.implementerSeat);
+      return dispatchOrPrepare(fixRound, attempt, facts.implementerSeat);
     };
 
     const acceptingRules = (): LaneRunDecision => {

@@ -92,6 +92,9 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 /** A valid content-addressed artifact manifest worktree-relative path. */
 const MANIFEST_PATH_PATTERN = /^\.lane\/artifacts-manifest-[0-9a-f]{16}\.json$/;
 
+/** KF-33a: a commit id this diff accepts — 40 or 64 lowercase hexadecimal characters. */
+const COMMIT_HEX = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
+
 /**
  * Applied to every git command: the hardening overrides — no fsmonitor and no
  * repository hooks — so a lane-modified `.git/config` cannot execute commands
@@ -773,5 +776,32 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     // path is refused before any `cat` runs.
     const targetPath = resolveWorktreeTarget(worktreePath, relativePath);
     return this.readContainedFile(worktreePath, targetPath, recordedHost);
+  }
+
+  /**
+   * KF-33a: the worktree-relative paths changed between the two commits.
+   * A non-hex base or head is refused before any command runs; any throw —
+   * including a non-zero git exit — is swallowed as null so callers fail
+   * closed (every finding stays in scope), never rethrow.
+   */
+  async readChangedPaths(
+    worktreePath: string,
+    baseCommit: string,
+    headCommit: string,
+    recordedHost?: AttemptRunnerRecord | null,
+  ): Promise<readonly string[] | null> {
+    if (!COMMIT_HEX.test(baseCommit) || !COMMIT_HEX.test(headCommit)) {
+      return null;
+    }
+    try {
+      const stdout = await this.runGit(
+        worktreePath,
+        ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', baseCommit, headCommit, '--'],
+        this.executorFor(recordedHost),
+      );
+      return stdout.split('\0').slice(0, -1);
+    } catch {
+      return null;
+    }
   }
 }

@@ -1353,5 +1353,117 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       });
       expect(harness.gateReceiptRequests).toHaveLength(0);
     });
+
+    it('opens the assessment with the runner model when it equals the manifest model (KF-20)', async () => {
+      const collected = attemptFixture({
+        state: 'collected',
+        artifacts: COLLECTED_ARTIFACTS,
+        runner: { ...CONDUCTED_RUNNER, model: 'model-example-1' },
+        seatSelection: null,
+      });
+      const harness = await makeHarness(runRecord(), [collected], {
+        wireReviewAssessment: true,
+        wireGateReceipts: true,
+      });
+      harness.setManifest(CHECKS_MANIFEST);
+      harness.setManifestVerdict('sealed');
+      harness.setGateAnswer({
+        verdict: 'passed',
+        results: [
+          commandResult('command 1: build', 'pass', 0),
+          commandResult('command 2: test', 'pass', 0),
+        ],
+      });
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'gate',
+        key: gateKey(),
+        result: 'completed',
+        reasonCode: 'gate-passed',
+      });
+      expect(harness.reviewOpenRequests[0]).toMatchObject({
+        attemptId: 'attempt-example-1',
+        implementerModel: 'model-example-1',
+      });
+    });
+
+    it('opens the assessment with the RUNNER model when the runner model differs from the manifest model (KF-20, a fix seat)', async () => {
+      const collected = attemptFixture({
+        state: 'collected',
+        artifacts: COLLECTED_ARTIFACTS,
+        runner: { ...CONDUCTED_RUNNER, model: 'fix-model-1' },
+      });
+      const harness = await makeHarness(runRecord(), [collected], {
+        wireReviewAssessment: true,
+        wireGateReceipts: true,
+      });
+      harness.setManifest(CHECKS_MANIFEST);
+      harness.setManifestVerdict('sealed');
+      harness.setGateAnswer({
+        verdict: 'passed',
+        results: [
+          commandResult('command 1: build', 'pass', 0),
+          commandResult('command 2: test', 'pass', 0),
+        ],
+      });
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'gate',
+        key: gateKey(),
+        result: 'completed',
+        reasonCode: 'gate-passed',
+      });
+      // The manifest's model is 'model-example-1'; the model that ran the
+      // attempt is the fix seat's 'fix-model-1' and it wins.
+      expect(harness.reviewOpenRequests[0]).toMatchObject({
+        attemptId: 'attempt-example-1',
+        implementerModel: 'fix-model-1',
+      });
+    });
+
+    it('falls back to the manifest model when the attempt has no runner model (KF-20)', async () => {
+      const collected = attemptFixture({
+        state: 'collected',
+        artifacts: COLLECTED_ARTIFACTS,
+        runner: { ...CONDUCTED_RUNNER, model: null },
+        seatSelection: null,
+      });
+      const harness = await makeHarness(runRecord(), [collected], {
+        wireReviewAssessment: true,
+        wireGateReceipts: true,
+      });
+      harness.setManifest(CHECKS_MANIFEST);
+      harness.setManifestVerdict('sealed');
+      harness.setGateAnswer({
+        verdict: 'passed',
+        results: [
+          commandResult('command 1: build', 'pass', 0),
+          commandResult('command 2: test', 'pass', 0),
+        ],
+      });
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'gate',
+        key: gateKey(),
+        result: 'completed',
+        reasonCode: 'gate-passed',
+      });
+      expect(harness.reviewOpenRequests[0]).toMatchObject({
+        attemptId: 'attempt-example-1',
+        implementerModel: 'model-example-1',
+      });
+    });
   });
 });

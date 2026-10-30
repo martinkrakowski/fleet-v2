@@ -54,6 +54,19 @@ import type {
   CancelPreparedAttemptRequest,
 } from '../../ports/in/CancelPreparedAttemptPort.in-port.js';
 import type { ExecutionRunnerPort } from '../../ports/out/ExecutionRunnerPort.out-port.js';
+import type {
+  EvaluateAttemptGateRequest,
+  EvaluateAttemptGateResult,
+} from '../../ports/in/EvaluateAttemptGatePort.in-port.js';
+import type { GatePredicateResult } from '../../ports/out/GatePredicatePort.out-port.js';
+import type {
+  OpenReviewAssessmentRequest,
+  OpenReviewAssessmentResult,
+} from '../../ports/out/ReviewAssessmentPort.out-port.js';
+import type {
+  RecordGateReceiptsRequest,
+  RecordGateReceiptsResult,
+} from '../../ports/out/GateReceiptPort.out-port.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -321,6 +334,9 @@ interface Harness {
   readonly briefRequests: PrepareBriefPackageUseCaseRequest[];
   readonly dispatchRequests: DispatchAttemptRequest[];
   readonly cancelRequests: CancelPreparedAttemptRequest[];
+  readonly gateRequests: readonly EvaluateAttemptGateRequest[];
+  readonly reviewOpenRequests: readonly OpenReviewAssessmentRequest[];
+  readonly gateReceiptRequests: readonly RecordGateReceiptsRequest[];
   readonly deps: AdvanceLaneRunDependencies;
   /** Journal length when the prepare port was called (order assertion). */
   readonly journalLengthWhenPrepared: number;
@@ -331,6 +347,8 @@ interface Harness {
   setDispatchAnswer(answer: (request: DispatchAttemptRequest) => Promise<DispatchAttemptResult>): void;
   setSameFamily(fn: SameModelFamily): void;
   setJournalBaseline(length: number): void;
+  setGateAnswer(answer: EvaluateAttemptGateResult): void;
+  setReviewAssessmentAnswer(answer: OpenReviewAssessmentResult): void;
   markAttemptCancelled(attemptId: string, stopReason: AttemptRecord['stopReason']): Promise<void>;
 }
 
@@ -338,6 +356,9 @@ interface HarnessOptions {
   readonly wireReviewRequest?: boolean;
   readonly wirePrepareFix?: boolean;
   readonly wireDispatch?: boolean;
+  readonly wireGate?: boolean;
+  readonly wireReviewAssessment?: boolean;
+  readonly wireGateReceipts?: boolean;
 }
 
 async function makeHarness(
@@ -354,10 +375,15 @@ async function makeHarness(
   const briefRequests: PrepareBriefPackageUseCaseRequest[] = [];
   const dispatchRequests: DispatchAttemptRequest[] = [];
   const cancelRequests: CancelPreparedAttemptRequest[] = [];
+  const gateRequests: EvaluateAttemptGateRequest[] = [];
+  const reviewOpenRequests: OpenReviewAssessmentRequest[] = [];
+  const gateReceiptRequests: RecordGateReceiptsRequest[] = [];
   let manifestJson: string | null = FULL_MANIFEST_JSON;
   let journalLengthWhenPrepared = 0;
   let journalLengthBeforeAdvance = 0;
   let sameFamilyImpl: SameModelFamily = (left, right) => left === right;
+  let gateAnswer: EvaluateAttemptGateResult = { verdict: 'passed' };
+  let reviewAssessmentAnswer: OpenReviewAssessmentResult = { outcome: 'open' };
   const reviewAnswer: (request: ReviewRequest) => Promise<ReviewRequestResult> = async (request) => ({
     outcome: 'receipt',
     receipt: {
@@ -531,6 +557,36 @@ async function makeHarness(
             },
           },
         }),
+    ...(options.wireGate === true
+      ? {
+          evaluateAttemptGate: {
+            evaluateAttemptGate: async (request) => {
+              gateRequests.push(request);
+              return gateAnswer;
+            },
+          },
+        }
+      : {}),
+    ...(options.wireReviewAssessment === true
+      ? {
+          reviewAssessment: {
+            openReviewAssessment: async (request) => {
+              reviewOpenRequests.push(request);
+              return reviewAssessmentAnswer;
+            },
+          },
+        }
+      : {}),
+    ...(options.wireGateReceipts === true
+      ? {
+          gateReceipts: {
+            recordGateReceipts: async (request) => {
+              gateReceiptRequests.push(request);
+              return { outcome: 'recorded', count: request.receipts.length } as RecordGateReceiptsResult;
+            },
+          },
+        }
+      : {}),
   };
 
   return {
@@ -543,6 +599,9 @@ async function makeHarness(
     briefRequests,
     dispatchRequests,
     cancelRequests,
+    gateRequests,
+    reviewOpenRequests,
+    gateReceiptRequests,
     deps,
     get journalLengthWhenPrepared() {
       return journalLengthWhenPrepared;
@@ -567,6 +626,12 @@ async function makeHarness(
     },
     setJournalBaseline: (length) => {
       journalLengthBeforeAdvance = length;
+    },
+    setGateAnswer: (answer) => {
+      gateAnswer = answer;
+    },
+    setReviewAssessmentAnswer: (answer) => {
+      reviewAssessmentAnswer = answer;
     },
     markAttemptCancelled: async (attemptId, stopReason: AttemptRecord['stopReason']) => {
       const existing = await attemptRepo.findAttemptById(attemptId);
@@ -1433,5 +1498,80 @@ describe('dispatchRefusalDetail maps every dispatch refusal to a fixed code (KF-
     expect(dispatchRefusalDetail(reason)).toBe(expected);
     expect(expected).toMatch(LANE_RUN_JOURNAL_REASON_CODE_PATTERN);
     expect(dispatchRefusalDetail(reason)).not.toBe(reason);
+  });
+});
+
+describe('KF-20: the gate and the review open the evidence assessment with the model that ran the attempt', () => {
+  const FIX_GATE_RESULT: GatePredicateResult = {
+    name: 'command 1: check-1',
+    kind: 'command',
+    verdict: 'pass',
+    exitCode: 0,
+    durationMs: 1,
+    detail: 'exit 0',
+  };
+
+  it('a fix attempt the fix seat ran passes the gate and the brief-check opens the same assessment, so the review is requested', async () => {
+    const fixAttempt: AttemptRecord = {
+      ...collectedAttempt(),
+      id: 'attempt-fix-1',
+      kind: 'fix',
+      fixNumber: 1,
+      priorAttemptId: 'attempt-example-1',
+      // The fix seat ran the attempt: the runner model is the fix seat's model.
+      runner: { ...CONDUCTED_RUNNER, model: 'fix-model-1' },
+      seatSelection: {
+        role: 'fix',
+        seatIndex: 0,
+        seatId: 'fx-1',
+        model: 'fix-model-1',
+        tool: 'opencode',
+        variant: null,
+        agent: null,
+      },
+    };
+    const harness = await makeHarness(
+      runRecord({ round: 1, attemptIds: ['attempt-example-1', 'attempt-fix-1'] }),
+      [collectedAttempt(), fixAttempt],
+      { wireGate: true, wireReviewAssessment: true, wireGateReceipts: true },
+    );
+    harness.setGateAnswer({ verdict: 'passed', results: [FIX_GATE_RESULT] });
+    await conduct(harness, 'gating', NOW);
+
+    // The gate opens the evidence assessment with the model that ran the
+    // attempt — the fix seat's model, not the manifest's first-pass model.
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'gate', result: 'completed', reasonCode: 'gate-passed',
+    });
+    expect(harness.reviewOpenRequests).toHaveLength(1);
+    expect(harness.reviewOpenRequests[0]).toMatchObject({
+      attemptId: 'attempt-fix-1',
+      candidateHeadSha: COMMIT_A,
+      policyRevision: 'policy-example-1',
+      implementerModel: 'fix-model-1',
+      requiredChecks: ['check-1'],
+    });
+    expect(harness.gateReceiptRequests).toHaveLength(1);
+
+    // The brief-check opens the SAME assessment: the same implementerModel,
+    // head and policy — never a `head-mismatch` refusal.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
+    const reviewAct = await advance(harness);
+    expect(reviewAct).toMatchObject({
+      outcome: 'acted', step: 'brief-check', result: 'completed', reasonCode: 'review-passed',
+    });
+    expect(harness.reviewOpenRequests).toHaveLength(2);
+    const [gateOpen, reviewOpen] = harness.reviewOpenRequests;
+    expect(reviewOpen!.implementerModel).toBe(gateOpen!.implementerModel);
+    expect(reviewOpen).toMatchObject({
+      attemptId: 'attempt-fix-1',
+      candidateHeadSha: COMMIT_A,
+      policyRevision: 'policy-example-1',
+      implementerModel: 'fix-model-1',
+      requiredChecks: ['check-1'],
+    });
+    // The review is requested, not refused `assessment-unavailable`.
+    expect(harness.reviewRequests).toHaveLength(1);
+    expect(harness.reviewRequests[0]).toMatchObject({ kind: 'brief-check', implementerModel: 'fix-model-1' });
   });
 });

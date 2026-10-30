@@ -248,8 +248,14 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
       // renewed with fresh time before each step, and the next run's lease is
       // taken or renewed when its turn comes. Never pause after the last run
       // and never for steps other than a started dispatch.
+      // A reconciled dispatch (crash recovery) found its session already
+      // started and starts none now, so only a completed dispatch pauses.
       const startedSession = steps.some(
-        (step) => step.outcome === 'acted' && step.step === 'dispatch' && step.reasonCode === 'dispatch-started',
+        (step) =>
+          step.outcome === 'acted' &&
+          step.step === 'dispatch' &&
+          step.result === 'completed' &&
+          step.reasonCode === 'dispatch-started',
       );
       if (startedSession && index < liveRuns.length - 1) {
         const sleep = this.deps.sleep ?? defaultSleep;

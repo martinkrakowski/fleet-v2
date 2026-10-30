@@ -670,6 +670,22 @@ describe('RunConductorPassUseCase dispatch stagger', () => {
     expect(fake.calls).toEqual([]);
   });
 
+  it('a reconciled dispatch-started step (crash recovery) starts no session and never pauses', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const advance = new ScriptedAdvance(
+      new Map([
+        [RUN_ID, [{ ...dispatchStarted(RUN_ID), result: 'reconciled' }, { outcome: 'waiting', reason: 'admission' }]],
+        [RUN_ID_2, [{ outcome: 'waiting', reason: 'admission' }]],
+      ]),
+    );
+    const fake = fakeSleep();
+    const result = await staggerUseCase(fx, advance, fake.sleep).runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed' });
+    expect(fake.calls).toEqual([]);
+  });
+
   it('a custom dispatchStaggerMs is honoured', async () => {
     const fx = stores();
     await createRun(fx.repo);

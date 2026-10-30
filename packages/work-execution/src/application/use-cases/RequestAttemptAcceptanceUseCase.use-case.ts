@@ -166,7 +166,7 @@ function isGatePredicateVerdict(value: unknown): value is GatePredicateVerdict {
   return value === 'pass' || value === 'fail' || value === 'unknown' || value === 'skipped';
 }
 
-function parseStoredPredicateResult(entry: ActionJournalEntryRecord): GatePredicateResult | null {
+export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): GatePredicateResult | null {
   if (typeof entry.detail !== 'string') {
     return null;
   }
@@ -198,6 +198,48 @@ function parseStoredPredicateResult(entry: ActionJournalEntryRecord): GatePredic
     durationMs: record.durationMs,
     detail: record.detail,
   };
+}
+
+/**
+ * Pure projection of the stored gate predicate results for one attempt head:
+ * entries whose id starts with `${attemptId}:accept:${headSha}:`, parsed,
+ * with verdict `fail` or `unknown` only, in the id's numeric `n` order.
+ * `detail` and `durationMs` are dropped.
+ */
+export function nonPassingGatePredicatesOf(
+  entries: readonly ActionJournalEntryRecord[],
+  attemptId: string,
+  headSha: string,
+): Array<{ name: string; kind: GatePredicateKind; verdict: 'fail' | 'unknown'; exitCode: number | null }> {
+  const prefix = `${attemptId}:accept:${headSha}:`;
+  const collected: Array<{
+    readonly order: number;
+    readonly value: { name: string; kind: GatePredicateKind; verdict: 'fail' | 'unknown'; exitCode: number | null };
+  }> = [];
+  for (const entry of entries) {
+    if (!entry.id.startsWith(prefix)) {
+      continue;
+    }
+    const indexText = entry.id.slice(prefix.length);
+    if (!/^\d+$/.test(indexText)) {
+      continue;
+    }
+    const parsed = parseStoredPredicateResult(entry);
+    if (parsed === null || (parsed.verdict !== 'fail' && parsed.verdict !== 'unknown')) {
+      continue;
+    }
+    collected.push({
+      order: Number.parseInt(indexText, 10),
+      value: {
+        name: parsed.name,
+        kind: parsed.kind,
+        verdict: parsed.verdict,
+        exitCode: parsed.exitCode,
+      },
+    });
+  }
+  collected.sort((a, b) => a.order - b.order);
+  return collected.map((item) => item.value);
 }
 
 type StoredGateOutcome =

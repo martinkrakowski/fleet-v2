@@ -608,6 +608,9 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     source: failure.source === 'review' ? 'review' : 'gate',
     findings,
     gateReasonCodes: failure.source === 'review' ? [] : [failure.reasonCode],
+    gatePredicates: [],
+    proofCommands: [],
+    originalBrief: null,
   } satisfies RenderHandoverBriefInput);
   if (!brief.ok || brief.numberedFixes.length === 0) {
     return refuse('prepare-refused');

@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { RequestAttemptAcceptanceUseCase } from '../RequestAttemptAcceptanceUseCase.use-case.js';
+import { RequestAttemptAcceptanceUseCase, nonPassingGatePredicatesOf } from '../RequestAttemptAcceptanceUseCase.use-case.js';
 import type { RequestAttemptAcceptanceDependencies } from '../RequestAttemptAcceptanceUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import type { RequestAttemptAcceptanceRequest } from '../../ports/in/RequestAttemptAcceptancePort.in-port.js';
@@ -636,5 +636,65 @@ describe('RequestAttemptAcceptanceUseCase with the gate wired', () => {
     expect(first.outcome).toBe('accepted');
     expect(second).toEqual(first);
     expect(gate.requests).toHaveLength(1);
+  });
+});
+
+function gateJournalEntry(partial: Partial<ActionJournalEntryRecord> & { id: string }): ActionJournalEntryRecord {
+  return {
+    attemptId: 'attempt-1',
+    workOrderId: 'wo-1',
+    action: 'accept',
+    baseCommit: BASE_COMMIT,
+    recordedAtIso: FIXED_NOW,
+    sessionId: 'session-1',
+    status: 'completed',
+    detail: '',
+    ...partial,
+  };
+}
+
+function predicateEntry(head: string, n: number, result: GatePredicateResult): ActionJournalEntryRecord {
+  return gateJournalEntry({
+    id: `attempt-1:accept:${head}:${n}`,
+    status: result.verdict === 'pass' ? 'completed' : result.verdict === 'fail' ? 'refused' : 'ambiguous',
+    detail: JSON.stringify({
+      predicate: result.name,
+      kind: result.kind,
+      verdict: result.verdict,
+      exitCode: result.exitCode,
+      durationMs: result.durationMs,
+      detail: result.detail,
+    }),
+  });
+}
+
+describe('nonPassingGatePredicatesOf', () => {
+  const headA = HEAD_SHA;
+  const headB = 'abcdef0123456789abcdef0123456789abcdef01';
+
+  it('returns only failing or unknown predicates for the given head, in numeric order', () => {
+    const entries: ActionJournalEntryRecord[] = [
+      predicateEntry(headA, 1, { name: 'commit', kind: 'commit', verdict: 'pass', exitCode: null, durationMs: 1, detail: 'ok' }),
+      predicateEntry(headA, 2, { name: 'diff-check', kind: 'diff-check', verdict: 'fail', exitCode: 1, durationMs: 1, detail: 'bad' }),
+      predicateEntry(headA, 3, { name: 'command 1: x', kind: 'command', verdict: 'unknown', exitCode: null, durationMs: 1, detail: '?' }),
+      predicateEntry(headB, 1, { name: 'commit', kind: 'commit', verdict: 'fail', exitCode: null, durationMs: 1, detail: 'bad head b' }),
+    ];
+    expect(nonPassingGatePredicatesOf(entries, 'attempt-1', headA)).toEqual([
+      { name: 'diff-check', kind: 'diff-check', verdict: 'fail', exitCode: 1 },
+      { name: 'command 1: x', kind: 'command', verdict: 'unknown', exitCode: null },
+    ]);
+  });
+
+  it('skips malformed entries and returns the rest in numeric id order', () => {
+    const entries: ActionJournalEntryRecord[] = [
+      gateJournalEntry({ id: `attempt-1:accept:${headA}:10`, detail: 'not json' }),
+      gateJournalEntry({ id: `attempt-1:accept:${headA}:abc`, detail: JSON.stringify({ predicate: 'commit', kind: 'commit', verdict: 'fail', exitCode: null, durationMs: 1, detail: 'x' }) }),
+      predicateEntry(headA, 5, { name: 'commit', kind: 'commit', verdict: 'fail', exitCode: null, durationMs: 1, detail: 'bad' }),
+      predicateEntry(headA, 2, { name: 'a', kind: 'commit', verdict: 'unknown', exitCode: null, durationMs: 1, detail: '?' }),
+    ];
+    expect(nonPassingGatePredicatesOf(entries, 'attempt-1', headA)).toEqual([
+      { name: 'a', kind: 'commit', verdict: 'unknown', exitCode: null },
+      { name: 'commit', kind: 'commit', verdict: 'fail', exitCode: null },
+    ]);
   });
 });

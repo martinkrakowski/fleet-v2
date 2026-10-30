@@ -293,6 +293,16 @@ describe('resume refusals', () => {
     ).toEqual({ ok: false, reason: 'stop-pending' });
   });
 
+  it('refuses a fix-no-progress park: a resume would re-collect the same head and park again (KF-21c)', () => {
+    const rec = record({
+      parked: { reason: 'fix-no-progress', qualifier: null, parkedFrom: 'collecting', questionId: null },
+      parkCount: 1,
+    });
+    expect(
+      checkLaneRunResume({ record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision }),
+    ).toEqual({ ok: false, reason: 'fix-no-progress' });
+  });
+
   it('refuses a stop-refused park', () => {
     const rec = record({ parked: PARKED_REFUSED, parkCount: 1 });
     expect(

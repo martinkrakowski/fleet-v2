@@ -27,7 +27,7 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'gate-passed', 'gate-failed', 'gate-unknown', 'reconciled',
   'review-passed', 'review-failed', 'review-no-receipt', 'review-refused', 'review-unknown',
   'assessment-unavailable', 'review-seat-unavailable',
-  'resumed', 'run-stopped', 'stale-revision', 'not-parked', 'stop-pending', 'one-way-door',
+  'resumed', 'run-stopped', 'stale-revision', 'not-parked', 'stop-pending', 'one-way-door', 'fix-no-progress',
   'accepted', 'acceptance-rejected', 'acceptance-unknown', 'pr-opened',
   'pushed', 'forge-refused', 'forge-ambiguous', 'grant-refused', 'merged', 'merge-not-merged', 'merge-waiting',
   'merge-off', 'notice-recorded', 'notice-refused',

@@ -88,7 +88,7 @@ function questionTexts(
     case 'fix-no-progress':
       return {
         title: `Lane run parked: fix made no progress (${reason})`,
-        body: `The conductor parked ${coordinates} with reason ${reason}. A fix attempt was collected at its prior attempt's head, so it changed nothing to gate or review. Choose resume or stop.`,
+        body: `The conductor parked ${coordinates} with reason ${reason}. A fix attempt was collected at its prior attempt's head, so it changed nothing to gate or review. A resume would park again: stop the run and start a new one.`,
       };
     default:
       throw new Error(`unknown park reason code: ${reason}`);
@@ -103,6 +103,16 @@ const PARK_OPTIONS: readonly OwnerQuestionOptionRecord[] = [
 const PARK_RECOMMENDATION: OwnerQuestionRecommendationRecord = {
   optionId: 'resume',
   because: 'The parked run should continue once the owner has seen the notice.',
+};
+
+/** `fix-no-progress` cannot resume (the same head would park again): stop is the only option. */
+const STOP_ONLY_OPTIONS: readonly OwnerQuestionOptionRecord[] = [
+  { id: 'stop', label: 'Stop the run', consequence: 'The lane run stops; start a new run for the work order.' },
+];
+
+const STOP_RECOMMENDATION: OwnerQuestionRecommendationRecord = {
+  optionId: 'stop',
+  because: 'A resume re-collects the same unchanged head and parks again.',
 };
 
 function doorKindFor(reason: string): OwnerQuestionDoorKind {
@@ -194,8 +204,8 @@ export class LaneRunParkNoticeAdapter implements LaneRunParkNoticePort {
       askedBy: PARK_ACTOR,
       title: texts.title,
       body: texts.body,
-      options: PARK_OPTIONS,
-      recommendation: PARK_RECOMMENDATION,
+      options: request.reason === 'fix-no-progress' ? STOP_ONLY_OPTIONS : PARK_OPTIONS,
+      recommendation: request.reason === 'fix-no-progress' ? STOP_RECOMMENDATION : PARK_RECOMMENDATION,
       doorKind: doorKindFor(request.reason),
       linkedRequestId: null,
       blocks,

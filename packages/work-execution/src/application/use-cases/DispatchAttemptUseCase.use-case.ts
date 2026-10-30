@@ -250,6 +250,13 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     // Refused before any reservation read, workspace inspection, journal entry,
     // save or runner call.
     const recordedAttempt = await this.deps.attemptRepo.findAttemptById(request.attemptId);
+    // KF-16: a fix attempt shares the lane's worktree with its prior attempt,
+    // so the worktree's HEAD is the prior attempt's sealed head commit, not
+    // the lane's base commit. The inspection below compares against what the
+    // worktree actually holds; `request.baseCommit` still names the lane's
+    // base everywhere else (the brief manifest check, the record, the journal).
+    let expectedCheckout = request.baseCommit;
+    let dispatchedOnPriorHead = false;
     if (recordedAttempt?.kind === 'fix') {
       const priorCheck = await checkFixPriorSettled(this.deps.attemptRepo, {
         fixAttemptId: recordedAttempt.id,
@@ -258,6 +265,24 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       });
       if (priorCheck.refusal !== null) {
         return { outcome: 'refused', reason: priorCheck.refusal };
+      }
+      const prior = priorCheck.prior;
+      // Stored records are not schema-validated on read: anything but a
+      // non-empty string is no sealed head.
+      const rawHead: unknown = prior?.artifacts?.headCommit ?? null;
+      const priorHead = typeof rawHead === 'string' && rawHead.trim() !== '' ? rawHead.trim() : null;
+      if (prior?.state === 'collected') {
+        if (priorHead === null) {
+          return {
+            outcome: 'refused',
+            reason: `Prior attempt ${prior.id} is collected but has no sealed head commit`,
+          };
+        }
+        expectedCheckout = priorHead;
+        dispatchedOnPriorHead = true;
+      } else if (prior?.state === 'cancelled' && priorHead !== null) {
+        expectedCheckout = priorHead;
+        dispatchedOnPriorHead = true;
       }
     }
 
@@ -317,7 +342,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
 
     const inspection = await this.deps.workspace.inspectWorktree({
       worktreePath: request.worktreePath,
-      baseCommit: request.baseCommit,
+      baseCommit: expectedCheckout,
       expectedArtifactPaths: request.expectedArtifacts ?? [],
       // H9b2: the inspection runs where the dispatching runner's host lives;
       // a legacy runner describes no host and keeps the configured executor.
@@ -326,7 +351,9 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     if (!inspection.matchesBaseCommit) {
       return {
         outcome: 'refused',
-        reason: `Worktree ${request.worktreePath} does not match the base commit (checked out ${inspection.checkedOutCommit})`,
+        reason: dispatchedOnPriorHead
+          ? `Worktree ${request.worktreePath} does not match the prior attempt's head (checked out ${inspection.checkedOutCommit})`
+          : `Worktree ${request.worktreePath} does not match the base commit (checked out ${inspection.checkedOutCommit})`,
       };
     }
     if (inspection.uncommittedPaths.length > 0) {

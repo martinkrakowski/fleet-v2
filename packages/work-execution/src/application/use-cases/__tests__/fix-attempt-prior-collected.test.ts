@@ -92,14 +92,14 @@ function makeWorkOrderRepo() {
   };
 }
 
-function makeJournal() {
+function makeJournal(reservations: readonly Record<string, unknown>[] = []) {
   let listActiveCalls = 0;
   const thrower = () => Promise.reject(new Error('journal must not be called'));
   return {
     listActiveCalls: () => listActiveCalls,
     async listActiveReservations() {
       listActiveCalls += 1;
-      return [];
+      return reservations;
     },
     appendJournalEntry: thrower,
     listJournalEntriesForAttempt: thrower,
@@ -110,9 +110,18 @@ function makeJournal() {
 }
 
 function makeWorkspace() {
+  const inspectionRequests: Record<string, unknown>[] = [];
+  let inspectionAnswer: (request: Record<string, unknown>) => Record<string, unknown> = () => {
+    throw new Error('inspection must not be called');
+  };
   return {
-    async inspectWorktree() {
-      throw new Error('must not be called');
+    inspectionRequests,
+    setInspectionAnswer(answer: (request: Record<string, unknown>) => Record<string, unknown>): void {
+      inspectionAnswer = answer;
+    },
+    async inspectWorktree(request: Record<string, unknown>) {
+      inspectionRequests.push(request);
+      return inspectionAnswer(request);
     },
     async readWorktreeFile() {
       throw new Error('must not be called');
@@ -120,9 +129,22 @@ function makeWorkspace() {
   };
 }
 
-function makeRunner() {
+/** Full isolation capabilities a dispatch requires, for tests that pass the capability gate. */
+const CAPABLE_RUNNER_CAPABILITIES = {
+  filesystemScope: 'scoped-worktree' as const,
+  networkEgressRestricted: true,
+  cpuAndMemoryLimited: true,
+  processTreeTermination: true,
+  authoritativeCompletion: true,
+  artifactPersistence: true,
+};
+
+function makeRunner(capable = false) {
   return {
     describeCapabilities() {
+      if (capable) {
+        return CAPABLE_RUNNER_CAPABILITIES;
+      }
       throw new Error('must not be called');
     },
     async startSession() {
@@ -141,6 +163,25 @@ function expectCleanRefusalReason(reason: string): void {
   expect(reason).not.toContain('/lanes/');
   expect(reason).not.toContain('abc123');
   expect(reason).not.toContain('session');
+}
+
+/** A held capacity reservation naming `attemptId`, as the journal fake returns. */
+function heldReservation(attemptId: string): Record<string, unknown> {
+  return {
+    id: 'reservation-1',
+    attemptId,
+    hostId: 'host-example-1',
+    slotIndex: 0,
+    held: true,
+    seatTool: null,
+    reservedAtIso: '2026-10-27T09:00:00.000Z',
+    releasedAtIso: null,
+  };
+}
+
+/** Collected artifacts sealed at `headCommit`, as the collect step writes them. */
+function collectedArtifacts(headCommit: string): AttemptRecord['artifacts'] {
+  return { headCommit, commitsSinceBase: [headCommit], collectedArtifactPaths: [], notes: 'present' };
 }
 
 describe('C1b fix attempt waits for the prior attempt to be collected', () => {
@@ -346,14 +387,21 @@ describe('C1b dispatch refuses until the prior attempt is collected', () => {
   };
 
   function makeDispatchSetup(
-    options: { priorState?: AttemptRecord['state']; seedFix?: boolean; sibling?: AttemptRecord } = {},
+    options: {
+      priorState?: AttemptRecord['state'];
+      seedFix?: boolean;
+      sibling?: AttemptRecord;
+      priorArtifacts?: AttemptRecord['artifacts'];
+      reservation?: boolean;
+      capableRunner?: boolean;
+    } = {},
   ) {
-    const { priorState, seedFix = true, sibling } = options;
+    const { priorState, seedFix = true, sibling, priorArtifacts, reservation = false, capableRunner = false } = options;
     const attemptRepo = makeAttemptRepo();
     const workOrderRepo = makeWorkOrderRepo();
-    const journal = makeJournal();
+    const journal = makeJournal(reservation ? [heldReservation('attempt-fix-1')] : []);
     const workspace = makeWorkspace();
-    const runner = makeRunner();
+    const runner = makeRunner(capableRunner);
     if (seedFix) {
       attemptRepo.attempts.set(
         'attempt-fix-1',
@@ -367,7 +415,7 @@ describe('C1b dispatch refuses until the prior attempt is collected', () => {
       );
     }
     if (priorState !== undefined) {
-      attemptRepo.attempts.set('attempt-1', attempt({ state: priorState }));
+      attemptRepo.attempts.set('attempt-1', attempt({ state: priorState, artifacts: priorArtifacts ?? null }));
     }
     if (sibling) {
       attemptRepo.attempts.set(sibling.id, sibling);
@@ -379,7 +427,18 @@ describe('C1b dispatch refuses until the prior attempt is collected', () => {
       workspace: workspace as unknown as WorkspacePort,
       runner: runner as unknown as ExecutionRunnerPort,
     });
-    return { attemptRepo, journal, useCase };
+    return { attemptRepo, journal, workspace, useCase };
+  }
+
+  /** A matching inspection answer: the worktree holds exactly `checkedOut`. */
+  function matchingInspection(checkedOut: string): (request: Record<string, unknown>) => Record<string, unknown> {
+    return (request) => ({
+      matchesBaseCommit: request.baseCommit === checkedOut,
+      checkedOutCommit: checkedOut,
+      uncommittedPaths: [],
+      untrackedPaths: [],
+      residueFromEarlierAttempts: [],
+    });
   }
 
   it('refuses while the prior is running, before any reservation read', async () => {
@@ -433,12 +492,137 @@ describe('C1b dispatch refuses until the prior attempt is collected', () => {
   });
 
   it('lets dispatch proceed to the reservation step once the prior is collected', async () => {
-    const { journal, useCase } = makeDispatchSetup({ priorState: 'collected' });
+    const { journal, useCase } = makeDispatchSetup({
+      priorState: 'collected',
+      priorArtifacts: collectedArtifacts('b'.repeat(40)),
+    });
     const result = await useCase.dispatchAttempt(
       validDispatch as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
     );
     expect(result).toEqual({ outcome: 'refused', reason: 'No active capacity reservation for attempt' });
     expect(journal.listActiveCalls()).toBe(1);
+  });
+
+  it('inspects at the collected prior\u2019s sealed head and proceeds past the inspection', async () => {
+    const { workspace, useCase } = makeDispatchSetup({
+      priorState: 'collected',
+      priorArtifacts: collectedArtifacts('b'.repeat(40)),
+      reservation: true,
+      capableRunner: true,
+    });
+    workspace.setInspectionAnswer(matchingInspection('b'.repeat(40)));
+    const result = await useCase.dispatchAttempt(
+      validDispatch as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+    // Past the inspection: the next gate is the runner port description.
+    expect(result).toEqual({ outcome: 'refused', reason: 'No runner port can be described for dispatch' });
+    expect(workspace.inspectionRequests).toHaveLength(1);
+    expect(workspace.inspectionRequests[0]).toMatchObject({ baseCommit: 'b'.repeat(40) });
+  });
+
+  it('refuses a collected prior with no sealed head before any reservation read or inspection', async () => {
+    const { journal, workspace, useCase } = makeDispatchSetup({
+      priorState: 'collected',
+      priorArtifacts: null,
+      reservation: true,
+    });
+    const result = await useCase.dispatchAttempt(
+      validDispatch as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Prior attempt attempt-1 is collected but has no sealed head commit',
+    });
+    expect(journal.listActiveCalls()).toBe(0);
+    expect(workspace.inspectionRequests).toHaveLength(0);
+  });
+
+  it('inspects a cancelled prior with no head at the request\u2019s base', async () => {
+    const { workspace, useCase } = makeDispatchSetup({
+      priorState: 'cancelled',
+      priorArtifacts: null,
+      reservation: true,
+      capableRunner: true,
+    });
+    workspace.setInspectionAnswer(matchingInspection('abc123'));
+    const result = await useCase.dispatchAttempt(
+      validDispatch as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'No runner port can be described for dispatch' });
+    expect(workspace.inspectionRequests).toHaveLength(1);
+    expect(workspace.inspectionRequests[0]).toMatchObject({ baseCommit: 'abc123' });
+  });
+
+  it('inspects a cancelled prior that has a head at that head', async () => {
+    const { workspace, useCase } = makeDispatchSetup({
+      priorState: 'cancelled',
+      priorArtifacts: collectedArtifacts('c'.repeat(40)),
+      reservation: true,
+      capableRunner: true,
+    });
+    workspace.setInspectionAnswer(matchingInspection('c'.repeat(40)));
+    await useCase.dispatchAttempt(validDispatch as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0]);
+    expect(workspace.inspectionRequests).toHaveLength(1);
+    expect(workspace.inspectionRequests[0]).toMatchObject({ baseCommit: 'c'.repeat(40) });
+  });
+
+  it('refuses a collected prior whose head is blank or not a string, before any inspection', async () => {
+    for (const headCommit of ['   ', 42 as unknown as string]) {
+      const { workspace, useCase } = makeDispatchSetup({
+        priorState: 'collected',
+        priorArtifacts: { ...collectedArtifacts('b'.repeat(40)), headCommit } as AttemptRecord['artifacts'],
+        reservation: true,
+        capableRunner: true,
+      });
+      const result = await useCase.dispatchAttempt(
+        validDispatch as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+      );
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: 'Prior attempt attempt-1 is collected but has no sealed head commit',
+      });
+      expect(workspace.inspectionRequests).toHaveLength(0);
+    }
+  });
+
+  it('inspects a first attempt at the request\u2019s base (unchanged)', async () => {
+    const { workspace, useCase } = makeDispatchSetup({ seedFix: false, reservation: true, capableRunner: true });
+    workspace.setInspectionAnswer(matchingInspection('abc123'));
+    const result = await useCase.dispatchAttempt(
+      validDispatch as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'No runner port can be described for dispatch' });
+    expect(workspace.inspectionRequests).toHaveLength(1);
+    expect(workspace.inspectionRequests[0]).toMatchObject({ baseCommit: 'abc123' });
+  });
+
+  it('rewords the mismatch refusal for a fix attempt dispatched on the prior\u2019s head', async () => {
+    const { workspace, useCase } = makeDispatchSetup({
+      priorState: 'collected',
+      priorArtifacts: collectedArtifacts('b'.repeat(40)),
+      reservation: true,
+      capableRunner: true,
+    });
+    workspace.setInspectionAnswer(matchingInspection('c'.repeat(40)));
+    const result = await useCase.dispatchAttempt(
+      validDispatch as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: `Worktree /lanes/example does not match the prior attempt's head (checked out ${'c'.repeat(40)})`,
+    });
+  });
+
+  it('keeps the base-commit mismatch refusal for a first attempt', async () => {
+    const { workspace, useCase } = makeDispatchSetup({ seedFix: false, reservation: true, capableRunner: true });
+    workspace.setInspectionAnswer(matchingInspection('d'.repeat(40)));
+    const result = await useCase.dispatchAttempt(
+      validDispatch as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: `Worktree /lanes/example does not match the base commit (checked out ${'d'.repeat(40)})`,
+    });
   });
 
   it('refuses while a sibling attempt can still touch the worktree', async () => {

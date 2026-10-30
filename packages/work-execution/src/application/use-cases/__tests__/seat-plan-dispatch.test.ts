@@ -691,7 +691,12 @@ describe('DispatchAttemptUseCase seat binding (S1b)', () => {
     );
     setup.attemptRepo.attempts.set(
       'attempt-0',
-      storedAttempt({ id: 'attempt-0', state: 'collected', sessionId: 'session-0' }),
+      storedAttempt({
+        id: 'attempt-0',
+        state: 'collected',
+        sessionId: 'session-0',
+        artifacts: { headCommit: 'abc123', commitsSinceBase: ['abc123'], collectedArtifactPaths: [], notes: 'present' },
+      }),
     );
   }
 

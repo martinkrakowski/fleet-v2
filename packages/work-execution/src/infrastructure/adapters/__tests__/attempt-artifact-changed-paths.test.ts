@@ -58,7 +58,7 @@ describe('AttemptArtifactAdapter.readChangedPaths (KF-33a)', () => {
     ]);
   });
 
-  it('drops the empty tail only: a trailing NUL adds no path, an interior empty field is kept', async () => {
+  it('a trailing NUL adds no path, interior empty fields are not tested here', async () => {
     const { executor } = fakeExecutor(() => ({ stdout: 'src/a.ts\0src/b.ts\0' }));
     const adapter = new AttemptArtifactAdapter({ executor });
     expect(await adapter.readChangedPaths!(WORKTREE, BASE, HEAD)).toEqual(['src/a.ts', 'src/b.ts']);

@@ -624,7 +624,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
       }
     }
     const receiptFindingCount = findings.length;
-    findings = partitionFindingsByScope(findings, changed).inScope;
+    findings = partitionFindingsByScope(findings, changed, prior.worktreePath).inScope;
     if (receiptFindingCount > 0 && findings.length === 0) {
       return refuse('no-in-scope-findings');
     }

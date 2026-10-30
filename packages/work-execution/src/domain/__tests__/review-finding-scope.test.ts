@@ -45,6 +45,55 @@ describe('partitionFindingsByScope (KF-33a)', () => {
     expect(partition.outOfScope).toEqual([]);
   });
 
+  it('an absolute path under the given worktree matches its changed path', () => {
+    const findings = [finding('f1', '/tmp/wo/wt/src/a.ts')];
+    const partition = partitionFindingsByScope(findings, ['src/a.ts'], '/tmp/wo/wt');
+    expect(partition.inScope).toEqual(findings);
+    expect(partition.outOfScope).toEqual([]);
+  });
+
+  it('a backticked finding path matches its changed path', () => {
+    const findings = [finding('f1', '`src/a.ts`')];
+    const partition = partitionFindingsByScope(findings, ['src/a.ts'], '/tmp/wo/wt');
+    expect(partition.inScope).toEqual(findings);
+    expect(partition.outOfScope).toEqual([]);
+  });
+
+  it('a double-quoted finding path matches its changed path', () => {
+    const findings = [finding('f1', '"src/a.ts"')];
+    const partition = partitionFindingsByScope(findings, ['src/a.ts'], '/tmp/wo/wt');
+    expect(partition.inScope).toEqual(findings);
+    expect(partition.outOfScope).toEqual([]);
+  });
+
+  it('a finding path with a trailing slash matches its changed path', () => {
+    const findings = [finding('f1', 'src/a.ts/')];
+    const partition = partitionFindingsByScope(findings, ['src/a.ts']);
+    expect(partition.inScope).toEqual(findings);
+    expect(partition.outOfScope).toEqual([]);
+  });
+
+  it('a foreign absolute path stays in scope (unknown spellings fail closed)', () => {
+    const findings = [finding('f1', '/etc/x.ts')];
+    const partition = partitionFindingsByScope(findings, ['src/a.ts'], '/tmp/wo/wt');
+    expect(partition.inScope).toEqual(findings);
+    expect(partition.outOfScope).toEqual([]);
+  });
+
+  it('a `..`-segment path stays in scope (unknown spellings fail closed)', () => {
+    const findings = [finding('f1', '../x.ts')];
+    const partition = partitionFindingsByScope(findings, ['src/a.ts'], '/tmp/wo/wt');
+    expect(partition.inScope).toEqual(findings);
+    expect(partition.outOfScope).toEqual([]);
+  });
+
+  it('an empty-after-normalising path stays in scope (unknown spellings fail closed)', () => {
+    const findings = [finding('f1', '``')];
+    const partition = partitionFindingsByScope(findings, ['src/a.ts'], '/tmp/wo/wt');
+    expect(partition.inScope).toEqual(findings);
+    expect(partition.outOfScope).toEqual([]);
+  });
+
   it('a file the lane did not change is out of scope', () => {
     const findings = [finding('f1', 'src/other.ts')];
     const partition = partitionFindingsByScope(findings, ['src/a.ts']);

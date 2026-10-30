@@ -1723,6 +1723,31 @@ describe('AdvanceLaneRunUseCase fix-round prepare scopes review findings (KF-33a
     ]);
   });
 
+  it('a2) a finding using the absolute worktree spelling of a changed file is handed over', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [
+      {
+        findingId: 'finding-9',
+        severity: 'major' as const,
+        summary: 'blocks the acceptance check',
+        filePath: WORKTREE + '/src/ex.ts',
+        line: 4,
+      },
+    ]);
+    harness.setChangedPaths(['src/ex.ts']);
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests[0]?.numberedFixes).toEqual([
+      '[major] ' + WORKTREE + '/src/ex.ts:4 — blocks the acceptance check',
+    ]);
+  });
+
   it('b) an out-of-scope major is not in the handover, the in-scope finding beside it still is', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await seedReviewFailure(harness, [

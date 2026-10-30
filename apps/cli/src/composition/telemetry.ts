@@ -247,9 +247,14 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
     const runs = await runRepo.list();
     const journals = await Promise.all(runs.map((run) => journal.listForRun(run.runId)));
     runs.forEach((run, index) => {
+      const entries = journals[index];
+      // A read that returns no list fails closed (canary-unreadable), as the sequential loop did.
+      if (!Array.isArray(entries)) {
+        throw new TypeError('journal-unreadable');
+      }
       addIfNonEmpty(values, run.workOrderId);
       workOrderIds.add(run.workOrderId);
-      addJournalKeyCanaries(values, run.runId, journals[index] ?? []);
+      addJournalKeyCanaries(values, run.runId, entries);
     });
     const workOrders = await Promise.all([...workOrderIds].map((id) => workOrderRepo.findWorkOrderById(id)));
     for (const workOrder of workOrders) {

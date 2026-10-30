@@ -786,6 +786,9 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
         { findingId: 'finding-2', severity: 'major', summary: 'blocks the acceptance check', filePath: 'src/ex.ts', line: 20 },
       ],
       gateReasonCodes: [],
+      gatePredicates: [],
+      proofCommands: [],
+      originalBrief: null,
     });
     expect(rendered.ok).toBe(true);
     if (rendered.ok) {

@@ -256,9 +256,12 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
       workOrderIds.add(run.workOrderId);
       addJournalKeyCanaries(values, run.runId, entries);
     });
-    const workOrders = await Promise.all([...workOrderIds].map((id) => workOrderRepo.findWorkOrderById(id)));
+    // One read of the work-order store, filtered to the collected ids.
+    const workOrders = await workOrderRepo.listWorkOrdersByProject();
     for (const workOrder of workOrders) {
-      addWorkOrderCanaries(values, workOrder);
+      if (workOrderIds.has(workOrder.id)) {
+        addWorkOrderCanaries(values, workOrder);
+      }
     }
     // Receipt ids are never collected: the receipt port exposes them only as
     // opaque `TelemetryHashInput` tokens that are only ever hashed.

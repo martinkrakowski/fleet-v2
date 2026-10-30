@@ -226,8 +226,13 @@ export function fixSeatForDispatch(
   manifest: Record<string, unknown> | null,
 ): FixSeatForDispatch {
   const selection = latest.seatSelection ?? null;
-  if (latest.kind !== 'fix' || selection === null || selection.role !== 'fix') {
+  if (latest.kind !== 'fix' || selection === null) {
     return { kind: 'none' };
+  }
+  // A fix attempt's selection must be a fix seat: any other role would let it
+  // dispatch on that seat's assignment without the fix-seat checks below.
+  if (selection.role !== 'fix') {
+    return { kind: 'refused', detail: 'seat-not-in-plan' };
   }
   const planResult = SeatPlan.create(latest.seatPlan);
   const planSeat =

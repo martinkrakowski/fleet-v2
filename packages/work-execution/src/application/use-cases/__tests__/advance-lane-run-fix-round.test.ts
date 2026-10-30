@@ -1381,6 +1381,13 @@ describe('fixSeatForDispatch names a fix seat only when an override can express 
       kind: 'refused', detail: 'seat-not-expressible',
     });
   });
+  it('refuses a fix attempt whose selection is not a fix seat (no first-pass fallback)', () => {
+    const attempt = fixAttempt(0);
+    const firstPass = { ...attempt, seatSelection: { ...attempt.seatSelection!, role: 'first-pass' as const, seatIndex: 0, seatId: 'fp-1', model: 'model-example-1', tool: 'opencode', agent: 'lane', variant: null } } as AttemptRecord;
+    expect(fixSeatForDispatch(firstPass, manifest({ model: 'model-example-1', agent: 'lane' }))).toEqual({
+      kind: 'refused', detail: 'seat-not-in-plan',
+    });
+  });
   it('is none for a first attempt or a fix attempt with no selection', () => {
     expect(fixSeatForDispatch({ ...fixAttempt(0), kind: 'initial' } as AttemptRecord, null)).toEqual({ kind: 'none' });
     expect(fixSeatForDispatch({ ...fixAttempt(0), seatSelection: null } as AttemptRecord, null)).toEqual({ kind: 'none' });

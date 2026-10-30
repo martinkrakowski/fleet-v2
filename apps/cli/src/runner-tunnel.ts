@@ -222,6 +222,11 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
           return 'failed';
         }
         if (await this.isPortListening(dial)) {
+          // The child may have died while the probe ran: an answering port is
+          // then someone else's, never this tunnel's.
+          if (exited) {
+            return 'failed';
+          }
           opened = true;
           return 'opened';
         }

@@ -485,7 +485,7 @@ describe("LaneDiffCheckAdapter", () => {
     ]);
     expect(gitArgvs.length).toBeGreaterThan(0);
     for (const argv of gitArgvs) {
-      expect(argv.slice(0, 3)).toEqual(["git", "-C", repo]);
+      expect(argv.slice(0, 4)).toEqual(["git", "--no-replace-objects", "-C", repo]);
     }
     for (const argv of catArgvs) {
       expect(argv[0]).toBe("cat");
@@ -495,7 +495,7 @@ describe("LaneDiffCheckAdapter", () => {
     }
   });
 
-  it("an untracked symbolic link is scanned as its target text, never the target's contents (review of #129)", async () => {
+  it("an untracked symbolic link is a symlink finding even when its target stays reachable (KF-27; review of #129)", async () => {
     const repo = makeRepo();
     const outside = mkdtempSync(join(tmpdir(), "lane-diff-outside-"));
     try {
@@ -509,13 +509,19 @@ describe("LaneDiffCheckAdapter", () => {
         baseCommit: base(repo),
         allowedPathPrefixes: PREFIXES,
       });
-      expect(result.outcome).toBe("clean");
+      // The link's target TEXT (the path string) is scanned, never the
+      // target's contents, and the link itself is a finding.
+      if (result.outcome !== "findings")
+        throw new Error(`expected findings, got ${result.outcome}`);
+      expect(result.findings).toEqual([
+        { path: "packages/x/src/link.ts", rule: "symlink" },
+      ]);
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }
   });
 
-  it("a link whose target text is secret-shaped is still found (review of #129)", async () => {
+  it("a link whose target text is secret-shaped is still found, alongside the symlink finding (review of #129)", async () => {
     const repo = makeRepo();
     symlinkSync(`/tmp/${tok}`, join(repo, "packages/x/src/link.ts"));
     const result = await adapter.checkLaneDiff({
@@ -531,6 +537,7 @@ describe("LaneDiffCheckAdapter", () => {
         line: 1,
         rule: "secret-pattern:github-token",
       },
+      { path: "packages/x/src/link.ts", rule: "symlink" },
     ]);
   });
 
@@ -570,7 +577,13 @@ describe("LaneDiffCheckAdapter", () => {
       baseCommit: base(repo),
       allowedPathPrefixes: PREFIXES,
     });
-    expect(result.outcome).toBe("clean");
+    if (result.outcome !== "findings")
+      throw new Error(`expected findings, got ${result.outcome}`);
+    // The link is read as link text (no pipe stall) and is itself a
+    // symlink finding.
+    expect(result.findings).toEqual([
+      { path: "packages/x/src/pipe.ts", rule: "symlink" },
+    ]);
   }, 10_000);
 
   it("a repository-local clean filter cannot hide a staged secret (O14d1 R3)", async () => {
@@ -580,11 +593,13 @@ describe("LaneDiffCheckAdapter", () => {
     git(repo, "add", "packages/x/.gitattributes");
     writeFileSync(join(repo, "packages/x/src/a.ts"), `const t = "${tok}";\n`);
     git(repo, "add", "packages/x/src/a.ts");
-    const result = await adapter.checkLaneDiff({
-      worktreePath: repo,
-      baseCommit: base(repo),
-      allowedPathPrefixes: PREFIXES,
-    });
+    const result = await adapter.checkLaneDiff(
+      {
+        worktreePath: repo,
+        baseCommit: base(repo),
+        allowedPathPrefixes: PREFIXES,
+      },
+    );
     if (result.outcome !== "findings")
       throw new Error(`expected findings, got ${result.outcome}`);
     expect(result.findings).toEqual(
@@ -596,5 +611,252 @@ describe("LaneDiffCheckAdapter", () => {
         },
       ]),
     );
+  });
+
+  /** An executor that records every argv and otherwise behaves locally. */
+  function recordingAdapter() {
+    const argvs: string[][] = [];
+    const local = new LocalExecutor();
+    const executor = {
+      async run(argv: readonly string[], options?: { cwd?: string }) {
+        argvs.push([...argv]);
+        return local.run(argv, options as never);
+      },
+    };
+    return { argvs, adapter: new LaneDiffCheckAdapter(executor) };
+  }
+
+  /** A repo whose base already holds a fixture line in packages/x/src/a.ts. */
+  function makeFixtureRepo(): string {
+    const repo = mkdtempSync(join(tmpdir(), "lane-diff-check-adapter-"));
+    dirs.push(repo);
+    const run = (args: string[], cwd = repo) =>
+      execFileSync(args[0], args.slice(1), { cwd, encoding: "utf8" });
+    run(["git", "init", "-q", "."]);
+    run(["git", "config", "user.email", "t@example.invalid"]);
+    run(["git", "config", "user.name", "t"]);
+    execFileSync("mkdir", ["-p", join(repo, "packages/x/src")]);
+    writeFileSync(
+      join(repo, "packages/x/src/a.ts"),
+      `export const a = 1;\n${`const fixture = "${tok}";`}\n`,
+    );
+    run(["git", "add", "."]);
+    run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"]);
+    run(["git", "tag", "base"]);
+    return repo;
+  }
+
+  describe("KF-27: base-line allowance, symlinks, helper config keys", () => {
+    it("the base blob is probed and read with cat-file against the recorded base commit", async () => {
+      const repo = makeFixtureRepo();
+      writeFileSync(
+        join(repo, "packages/x/src/a.ts"),
+        `export const a = 1;\nconst fixture = "${tok}";\nexport const a = 2;\n`,
+      );
+      const sha = base(repo);
+      const { argvs, adapter: recording } = recordingAdapter();
+      const result = await recording.checkLaneDiff({
+        worktreePath: repo,
+        baseCommit: sha,
+        allowedPathPrefixes: PREFIXES,
+      });
+      expect(result).toEqual({ outcome: "clean" });
+      const catFileArgvs = argvs.filter((argv) => argv.includes("cat-file"));
+      expect(
+        catFileArgvs.some(
+          (argv) =>
+            argv.includes("-e") &&
+            argv.includes(`${sha}:packages/x/src/a.ts`),
+        ),
+      ).toBe(true);
+      expect(
+        catFileArgvs.some(
+          (argv) =>
+            argv.includes("blob") &&
+            argv.includes(`${sha}:packages/x/src/a.ts`),
+        ),
+      ).toBe(true);
+    });
+
+    it("a file the base never had gets no excuse, even though it is committed", async () => {
+      const repo = makeRepo();
+      writeFileSync(join(repo, "packages/x/src/n.ts"), `const t = "${tok}";\n`);
+      git(repo, "add", "-A");
+      git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "new");
+      const result = await adapter.checkLaneDiff({
+        worktreePath: repo,
+        baseCommit: base(repo),
+        allowedPathPrefixes: PREFIXES,
+      });
+      if (result.outcome !== "findings")
+        throw new Error(`expected findings, got ${result.outcome}`);
+      expect(result.findings).toEqual([
+        {
+          path: "packages/x/src/n.ts",
+          line: 1,
+          rule: "secret-pattern:github-token",
+        },
+      ]);
+    });
+
+    it("a base blob read that fails after a successful probe is an error, never a silent pass", async () => {
+      const repo = makeFixtureRepo();
+      writeFileSync(
+        join(repo, "packages/x/src/a.ts"),
+        `export const a = 1;\nconst fixture = "${tok}";\nexport const a = 2;\n`,
+      );
+      const sha = base(repo);
+      const local = new LocalExecutor();
+      const brokenRead = {
+        async run(argv: readonly string[], options?: { cwd?: string }) {
+          const outcome = await local.run(argv, options as never);
+          if (
+            outcome.exitCode === 0 &&
+            argv.includes("cat-file") &&
+            argv.includes("blob") &&
+            argv.includes(`${sha}:packages/x/src/a.ts`)
+          ) {
+            return { ...outcome, exitCode: 1, stdout: "", stderr: "" };
+          }
+          return outcome;
+        },
+      };
+      const result = await new LaneDiffCheckAdapter(brokenRead).checkLaneDiff({
+        worktreePath: repo,
+        baseCommit: sha,
+        allowedPathPrefixes: PREFIXES,
+      });
+      expect(result.outcome).toBe("error");
+    });
+
+    it("a base-line fixture the base already had passes; a second copy beyond the base count fails", async () => {
+      // CL-2 shape: a touched file whose base already has fixture lines.
+      const repo = makeFixtureRepo();
+      writeFileSync(
+        join(repo, "packages/x/src/a.ts"),
+        `export const a = 1;\nconst fixture = "${tok}";\nexport const a = 2;\n`,
+      );
+      const clean = await adapter.checkLaneDiff({
+        worktreePath: repo,
+        baseCommit: base(repo),
+        allowedPathPrefixes: PREFIXES,
+      });
+      expect(clean).toEqual({ outcome: "clean" });
+      // One more copy of the same line than the base holds: the copy fails.
+      writeFileSync(
+        join(repo, "packages/x/src/a.ts"),
+        `export const a = 1;\nconst fixture = "${tok}";\nconst fixture = "${tok}";\n`,
+      );
+      const copied = await adapter.checkLaneDiff({
+        worktreePath: repo,
+        baseCommit: base(repo),
+        allowedPathPrefixes: PREFIXES,
+      });
+      if (copied.outcome !== "findings")
+        throw new Error(`expected findings, got ${copied.outcome}`);
+      expect(copied.findings).toEqual([
+        {
+          path: "packages/x/src/a.ts",
+          line: 3,
+          rule: "secret-pattern:github-token",
+        },
+      ]);
+    });
+
+    it("a replace ref forging the base blob excuses nothing", async () => {
+      const repo = makeRepo();
+      // The real base blob is clean; the lane adds a fixture line and plants
+      // a replace ref whose tree already contains that line, hoping the
+      // check reads the forged base blob and excuses it.
+      writeFileSync(
+        join(repo, "packages/x/src/a.ts"),
+        `export const a = 1;\nconst t = "${tok}";\n`,
+      );
+      git(repo, "add", "packages/x/src/a.ts");
+      const forgedTree = execFileSync(
+        "git",
+        ["write-tree"],
+        { cwd: repo, encoding: "utf8" },
+      ).trim();
+      const forged = execFileSync(
+        "git",
+        ["-c", "commit.gpgsign=false", "commit-tree", forgedTree, "-m", "forged"],
+        { cwd: repo, encoding: "utf8" },
+      ).trim();
+      const sha = base(repo);
+      git(repo, "update-ref", `refs/replace/${sha}`, forged);
+      const result = await adapter.checkLaneDiff({
+        worktreePath: repo,
+        baseCommit: sha,
+        allowedPathPrefixes: PREFIXES,
+      });
+      if (result.outcome !== "findings")
+        throw new Error(`expected findings, got ${result.outcome}`);
+      expect(result.findings).toEqual([
+        {
+          path: "packages/x/src/a.ts",
+          line: 2,
+          rule: "secret-pattern:github-token",
+        },
+      ]);
+    });
+
+    it("helper-shaped config key names are read once, by name only, and reported masked", async () => {
+      const repo = makeRepo();
+      git(repo, "config", "core.editor", "editor-program");
+      git(repo, "config", "credential.gh.helper", "helper-program");
+      git(repo, "config", "diff.external", "external-program");
+      const { argvs, adapter: recording } = recordingAdapter();
+      const result = await recording.checkLaneDiff({
+        worktreePath: repo,
+        baseCommit: base(repo),
+        allowedPathPrefixes: PREFIXES,
+      });
+      expect(
+        argvs.some(
+          (argv) =>
+            argv.includes("config") &&
+            argv.includes("-z") &&
+            argv.includes("--local") &&
+            argv.includes("--includes") &&
+            argv.includes("--name-only") &&
+            argv.includes("--list"),
+        ),
+      ).toBe(true);
+      if (result.outcome !== "findings")
+        throw new Error(`expected findings, got ${result.outcome}`);
+      expect(result.findings).toEqual([
+        { path: ".git/config", rule: "git-config-helper:core.editor" },
+        {
+          path: ".git/config",
+          rule: "git-config-helper:credential.<sub>.helper",
+        },
+        { path: ".git/config", rule: "git-config-helper:diff.external" },
+      ]);
+      // Names only: no config value is ever part of a finding.
+      expect(JSON.stringify(result)).not.toContain("helper-program");
+      expect(JSON.stringify(result)).not.toContain("editor-program");
+      expect(JSON.stringify(result)).not.toContain("external-program");
+    });
+
+    it("a failed config key read is an error, never a silent pass", async () => {
+      const repo = makeRepo();
+      const local = new LocalExecutor();
+      const brokenKeys = {
+        async run(argv: readonly string[], options?: { cwd?: string }) {
+          const outcome = await local.run(argv, options as never);
+          if (argv.includes("config") && argv.includes("--name-only")) {
+            return { ...outcome, exitCode: 1, stdout: "", stderr: "" };
+          }
+          return outcome;
+        },
+      };
+      const result = await new LaneDiffCheckAdapter(brokenKeys).checkLaneDiff({
+        worktreePath: repo,
+        baseCommit: base(repo),
+        allowedPathPrefixes: PREFIXES,
+      });
+      expect(result.outcome).toBe("error");
+    });
   });
 });

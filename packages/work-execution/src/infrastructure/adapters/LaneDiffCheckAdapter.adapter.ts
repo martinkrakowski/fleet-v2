@@ -12,7 +12,14 @@
  * attribute, a NUL byte or a textconv/clean filter cannot hide a secret,
  * because no diff is parsed at all. Like `scripts/lane-diff-check.sh`, whole
  * content scanning can flag a secret that already existed in a touched file;
- * that is intended. Git plumbing never lists anything under `.git/`, so no
+ * the pure check then applies the script's base-line allowance (KF-27): the
+ * adapter reads the base version of each changed path and passes its lines
+ * in, so a line the base already had is excused, at most as many times as it
+ * occurs there — never for a new or unreadable base, a NUL byte on either
+ * side, or a copy beyond the base count. The adapter also flags a changed
+ * symbolic link and passes the repository's helper-shaped git config key
+ * names (names only; no value is ever read) to the pure check. Git plumbing
+ * never lists anything under `.git/`, so no
  * snapshot comparison exists there and the fixed `.git/` protected rule
  * stays as defense in depth. Detecting changes under `.git/` (hooks,
  * config) needs a snapshot taken at dispatch — that is lane O14d2's job and
@@ -35,11 +42,14 @@ import type {
 } from "../../domain/lane-diff-check.js";
 import { checkLaneDiff } from "../../domain/lane-diff-check.js";
 import { LANE_DIFF_SECRET_PATTERNS } from "@fleet/shared";
+import { allowListedChildEnv } from "./spawn-run.js";
 
 interface CommandOutcome {
   readonly ok: boolean;
   readonly stdout: string;
   readonly reason: string;
+  /** The child's exit code when it reported one; null on a spawn failure. */
+  readonly exitCode: number | null;
 }
 
 /** A base ref must be a plain commit object name: 40–64 lowercase hex digits. */
@@ -84,6 +94,55 @@ const GIT_CONFIG_ARGS = [
   "-c",
   "filter.lfs.required=false",
 ] as const;
+
+/**
+ * Applied to every git call as the child's environment: replace refs and
+ * grafts in the shared clone cannot forge the base blob or hide a changed
+ * file (KF-27 review), because replace-object lookup is off and the grafts
+ * file points nowhere. The base is the allow-listed host variables a child
+ * may inherit (the ssh superset, so an ssh transport keeps its agent), plus
+ * the two overrides — the port takes a complete environment when given, so
+ * the allow-list is rebuilt here rather than widened.
+ */
+const GIT_HARDENED_ENV: Readonly<Record<string, string>> = {
+  ...allowListedChildEnv("ssh"),
+  GIT_NO_REPLACE_OBJECTS: "1",
+  GIT_GRAFT_FILE: "/dev/null",
+};
+
+/**
+ * The repository's own git config key names that make git run a helper
+ * program (KF-27): the script's exact alternative list
+ * (`scripts/lane-diff-check.sh`, `HELPER_KEYS=`), matched case-insensitively
+ * against key NAMES only — no config value is ever read.
+ */
+const HELPER_KEYS =
+  "^core\\.(fsmonitor|hookspath|sshcommand|pager|editor|askpass|gitproxy|alternaterefscommand)$|^diff\\.external$|^diff\\..+\\.(command|textconv)$|^merge\\..+\\.driver$|^credential\\.helper$|^credential\\..+\\.helper$|^gpg\\.program$|^gpg\\..+\\.program$|^sequence\\.editor$|^uploadpack\\.packobjectshook$|^remote\\..+\\.(uploadpack|receivepack)$|^pager\\..+$|^url\\..+\\.(insteadof|pushinsteadof)$|^include\\.path$|^includeif\\..+\\.path$";
+
+const HELPER_KEY_PATTERN = new RegExp(HELPER_KEYS, "i");
+
+/**
+ * A key with a subsection is reported with the subsection masked as
+ * `<sub>` (the script's `first.<sub>.last` form), and the whole key is
+ * lowercased; the masking runs on the original case, the lowercase on the
+ * masked result.
+ */
+function maskedHelperKey(key: string): string {
+  const parts = key.split(".");
+  if (parts.length < 3) return key;
+  return `${parts[0]}.<sub>.${parts[parts.length - 1]}`;
+}
+
+/** The distinct masked, lowercased helper key names among the config keys. */
+function helperConfigKeys(configList: string): string[] {
+  const keys = new Set<string>();
+  for (const field of configList.split("\0")) {
+    if (field === "") continue;
+    if (!HELPER_KEY_PATTERN.test(field)) continue;
+    keys.add(maskedHelperKey(field).toLowerCase());
+  }
+  return [...keys];
+}
 
 /** Whole content as 1-based numbered lines; line 1 is the first line. */
 function contentLines(content: string): { line: number; text: string }[] {
@@ -155,18 +214,33 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
       // executor may ignore `cwd` (batch-mode ssh runs in the remote home
       // directory), so the flag, not the option, is the source of truth.
       // `cwd` is kept too; it is harmless locally.
+      // `--no-replace-objects` and the hardened environment (above) keep
+      // replace refs and grafts the lane could have planted in the shared
+      // clone from forging the base blob or hiding a changed file: a
+      // transport that drops the environment still runs the flag.
       const run = await this.commandExecutor.run(
-        ["git", "-C", request.worktreePath, ...GIT_CONFIG_ARGS, ...argv],
-        { cwd: request.worktreePath },
+        [
+          "git",
+          "--no-replace-objects",
+          "-C",
+          request.worktreePath,
+          ...GIT_CONFIG_ARGS,
+          ...argv,
+        ],
+        {
+          cwd: request.worktreePath,
+          env: GIT_HARDENED_ENV,
+        },
       );
       if (run.error !== undefined || run.exitCode !== 0) {
         return {
           ok: false,
           stdout: "",
           reason: `lane diff check: could not ${what}`,
+          exitCode: run.exitCode,
         };
       }
-      return { ok: true, stdout: run.stdout, reason: "" };
+      return { ok: true, stdout: run.stdout, reason: "", exitCode: 0 };
     };
 
     const status = await git(
@@ -182,6 +256,12 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     this.collectStatusEntries(status.stdout, changed, worktreeDeleted);
 
     const addedLines = new Map<string, { line: number; text: string }[]>();
+    // The base version's lines per path (null = unknown: no base blob, a
+    // read failure, or a NUL byte in the base blob or the scanned content —
+    // excuse nothing, fail closed).
+    const baseLinesByPath = new Map<string, readonly string[] | null>();
+    // Whether each worktree path is a symbolic link.
+    const isSymlinkByPath = new Map<string, boolean>();
 
     // Committed changes since the base are still reviewed: the name status
     // against the base lists every path the base..worktree and base..HEAD
@@ -238,6 +318,11 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     for (const entry of changed.values()) {
       if (entry.status === "deleted") continue;
       const merged = new Map<number, Set<string>>();
+      // The raw scanned content and the raw base blob, kept only to detect a
+      // NUL byte: some line splitters cut a line at a NUL, so two different
+      // lines could compare equal and a NUL on either side excuses nothing.
+      let scannedHasNul = false;
+      let baseRaw: string | null = null;
       if (!worktreeDeleted.has(entry.path)) {
         // The worktree copy is read only when it exists, and always by its
         // absolute path: the executor may ignore `cwd`, so `cat --` gets
@@ -256,6 +341,9 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
         // `test -L` answers 0 (a link) or 1 (not a link); anything else —
         // an ssh transport failure is 255 — is no answer and fails closed,
         // or a link could be followed and its target scanned instead.
+        // A link is also a finding in itself (KF-27), even when its target
+        // stays inside the worktree.
+        isSymlinkByPath.set(entry.path, isLink.exitCode === 0);
         if (
           isLink.error !== undefined ||
           (isLink.exitCode !== 0 && isLink.exitCode !== 1)
@@ -296,6 +384,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
           };
         }
         mergeContentLines(merged, worktree.stdout);
+        scannedHasNul = worktree.stdout.includes("\u0000");
       }
       if (entry.status !== "untracked") {
         // Scan the index blob whenever the index has the path; `cat-file -e`
@@ -316,15 +405,63 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
         );
         if (!index.ok) return { outcome: "error", reason: index.reason };
         mergeContentLines(merged, index.stdout);
+        if (index.stdout.includes("\u0000")) scannedHasNul = true;
+        // The base version of the same path, for the base-line allowance:
+        // the probe answers 0 (a base blob exists) or 128 (none — a new or
+        // untracked-in-base path excuses nothing); any other exit is no
+        // answer and fails closed.
+        const baseProbe = await git(
+          ["cat-file", "-e", `${request.baseCommit}:${entry.path}`],
+          "probe a changed file's base blob",
+        );
+        if (!baseProbe.ok) {
+          if (baseProbe.exitCode !== 128) {
+            return {
+              outcome: "error",
+              reason:
+                "lane diff check: could not probe a changed file's base blob",
+            };
+          }
+        } else {
+          const baseBlob = await git(
+            ["cat-file", "blob", `${request.baseCommit}:${entry.path}`],
+            "read a changed file's base blob",
+          );
+          // A failed read after a successful probe is an error, never a
+          // silent pass.
+          if (!baseBlob.ok) return { outcome: "error", reason: baseBlob.reason };
+          baseRaw = baseBlob.stdout;
+        }
       }
       addedLines.set(entry.path, flattenContentLines(merged));
+      baseLinesByPath.set(
+        entry.path,
+        baseRaw !== null && !baseRaw.includes("\u0000") && !scannedHasNul
+          ? baseRaw.split("\n")
+          : null,
+      );
     }
+
+    // The repository's own config keys, read once per check: names only,
+    // NUL-separated, so no value is ever read. A failed key read is an
+    // error (fail closed), never a silent pass.
+    const configKeys = await git(
+      ["config", "-z", "--local", "--includes", "--name-only", "--list"],
+      "read the repository's config key names",
+    );
+    if (!configKeys.ok) return { outcome: "error", reason: configKeys.reason };
 
     const changedPaths: LaneDiffChangedPath[] = [...changed.values()].map(
       (entry) => ({
         ...entry,
         ...(addedLines.has(entry.path)
           ? { addedLines: addedLines.get(entry.path) }
+          : {}),
+        ...(baseLinesByPath.has(entry.path)
+          ? { baseLines: baseLinesByPath.get(entry.path) }
+          : {}),
+        ...(isSymlinkByPath.get(entry.path) === true
+          ? { isSymlink: true }
           : {}),
       }),
     );
@@ -335,6 +472,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
       ...(request.policyProtectedPaths !== undefined
         ? { policyProtectedPaths: request.policyProtectedPaths }
         : {}),
+      helperConfigKeys: helperConfigKeys(configKeys.stdout),
       ...(request.secretPatterns !== undefined
         ? { secretPatterns: request.secretPatterns }
         : {

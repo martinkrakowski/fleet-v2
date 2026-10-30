@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { ReviewReceiptRecord } from '../evidence-records.js';
-import { latestReceiptPerReviewer, tallyReviews } from '../review-selection.js';
+import { REVIEW_KINDS } from '../evidence-records.js';
+import {
+  latestReceiptPerReviewer,
+  reviewKindOf,
+  satisfiesReviewPassGate,
+  tallyReviews,
+} from '../review-selection.js';
 
 function receipt(overrides?: Partial<ReviewReceiptRecord>): ReviewReceiptRecord {
   return {
@@ -82,5 +88,50 @@ describe('review-selection (R1)', () => {
       unknown: 2,
       disagreement: false,
     });
+  });
+});
+
+describe('reviewKindOf', () => {
+  it('a receipt without a kind reads as code-review', () => {
+    expect(reviewKindOf(receipt())).toBe('code-review');
+  });
+
+  it.each(REVIEW_KINDS)('a receipt with kind %s reads back unchanged', (kind) => {
+    expect(reviewKindOf(receipt({ kind }))).toBe(kind);
+  });
+});
+
+describe('satisfiesReviewPassGate', () => {
+  it('only a passing receipt with kind absent or code-review satisfies the gate', () => {
+    expect(satisfiesReviewPassGate(receipt({ result: 'pass' }))).toBe(true);
+    expect(satisfiesReviewPassGate(receipt({ result: 'pass', kind: 'code-review' }))).toBe(true);
+    expect(satisfiesReviewPassGate(receipt({ result: 'pass', kind: 'brief-check' }))).toBe(false);
+    expect(satisfiesReviewPassGate(receipt({ result: 'pass', kind: 'pre-merge' }))).toBe(false);
+    expect(satisfiesReviewPassGate(receipt({ result: 'fail', kind: 'code-review' }))).toBe(false);
+    expect(satisfiesReviewPassGate(receipt({ result: 'unknown' }))).toBe(false);
+  });
+});
+
+describe('review kind selection', () => {
+  it('different kinds from the same reviewer are kept separately, in recording order', () => {
+    const latest = latestReceiptPerReviewer([
+      receipt({ id: 'review-brief', kind: 'brief-check', result: 'pass' }),
+      receipt({ id: 'review-code', result: 'fail' }),
+    ]);
+    expect(latest.map((record) => record.id)).toEqual(['review-brief', 'review-code']);
+    expect(tallyReviews(latest)).toEqual({
+      pass: 1,
+      fail: 1,
+      unknown: 0,
+      disagreement: true,
+    });
+  });
+
+  it('an untyped receipt and a later explicit code-review receipt collapse to the later one', () => {
+    const latest = latestReceiptPerReviewer([
+      receipt({ id: 'review-untyped', result: 'pass' }),
+      receipt({ id: 'review-code', kind: 'code-review', result: 'fail' }),
+    ]);
+    expect(latest.map((record) => record.id)).toEqual(['review-code']);
   });
 });

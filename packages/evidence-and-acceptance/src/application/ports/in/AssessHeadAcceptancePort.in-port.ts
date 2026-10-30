@@ -47,7 +47,8 @@ export type AssessHeadReceiptsResult =
       readonly outcome: 'receipts-passed';
       readonly receiptsId: string;
       readonly candidateHeadSha: string;
-      readonly assessment: EvidenceAssessmentRecord;
+      // No assessment record: a stored acceptance (state, acceptance receipt
+      // id) never travels through the receipts-only result.
       readonly reviewTally?: ReviewTally;
     }
   | Extract<AssessHeadAcceptanceResult, { outcome: 'blocked' | 'stale' | 'rejected' }>;

@@ -343,7 +343,6 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
           outcome: 'receipts-passed',
           receiptsId: `rcp-${assessment.id}-${assessment.candidateHeadSha.slice(0, 8)}`,
           candidateHeadSha: assessment.candidateHeadSha,
-          assessment,
           reviewTally: reviewTallyFor(assessment),
         };
       }

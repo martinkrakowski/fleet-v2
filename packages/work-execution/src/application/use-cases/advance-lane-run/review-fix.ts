@@ -603,17 +603,56 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   // to the prior worktree path's last segment (the conductor names worktrees
   // after their branch).
   const branchName = record.branchName ?? prior.worktreePath.split('/').pop() ?? '';
-  // KF-21b: read the prior's frozen manifest before rendering the handover —
-  // the failed gate checks, the proof commands and the original brief all come
-  // from it. A null manifest refuses `prepare-refused` exactly as the later
-  // null check below does today.
-  const manifest = await readFrozenManifest(prior, ctx.deps.artifactPort);
+  // KF-21b: the prior's frozen prose and manifest are read ONCE and verified
+  // against its recorded digest before anything is taken from them; the
+  // verified manifest text is the one parsed for the proof commands, the gate
+  // check names and the rebuilt brief request (never a second, unverified
+  // read). Any missing, unreadable, throwing or unverified read refuses
+  // `prepare-refused`: a lane edit to `.lane/brief.md` or its manifest is
+  // refused, never trusted.
+  if (prior.briefPackagePath === null) {
+    return refuse('prepare-refused');
+  }
+  const recordedHost = conductedRunnerOf(prior);
+  if (recordedHost === null) {
+    return refuse('prepare-refused');
+  }
+  let prose: string | null | undefined;
+  let manifestRaw: string | null | undefined;
+  try {
+    prose = await ctx.deps.artifactPort.readBriefFile?.(prior.worktreePath, '.lane/brief.md', recordedHost);
+    manifestRaw = await ctx.deps.artifactPort.readBriefManifest?.(
+      prior.worktreePath,
+      prior.briefPackagePath.replace(/\.md$/, '-manifest.json'),
+      recordedHost,
+    );
+  } catch {
+    return refuse('prepare-refused');
+  }
+  if (typeof prose !== 'string' || typeof manifestRaw !== 'string') {
+    return refuse('prepare-refused');
+  }
+  const compute = ctx.deps.computeDigest ?? simpleDeterministicHexDigest;
+  if (compute(prose + '\n' + manifestRaw) !== prior.briefDigest) {
+    return refuse('prepare-refused');
+  }
+  let manifest: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(manifestRaw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return refuse('prepare-refused');
+    }
+    manifest = parsed as Record<string, unknown>;
+  } catch {
+    return refuse('prepare-refused');
+  }
 
   // Failed gate checks: the stored predicate results of the prior's gate, in
   // their recorded order, verdict and exit code only — never their `detail`.
-  // A read that throws refuses the prepare; a review source has none.
+  // A `gate-failed` with no usable failed check refuses rather than handing
+  // the lane a bare reason code.
   const gatePredicates: { name: string; verdict: 'fail' | 'unknown'; exitCode: number | null }[] = [];
-  if (failure.source === 'gate' && manifest !== null) {
+  if (failure.source === 'gate') {
     let journalEntries: Parameters<typeof nonPassingGatePredicatesOf>[0];
     try {
       journalEntries = await ctx.deps.executionJournal.listJournalEntriesForAttempt(prior.id);
@@ -625,58 +664,23 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
         ({ name, verdict, exitCode }) => ({ name, verdict, exitCode }),
       ),
     );
+    if (failure.reasonCode === 'gate-failed' && gatePredicates.length === 0) {
+      return refuse('prepare-refused');
+    }
   }
 
-  let proofCommands: readonly (readonly string[])[] = [];
-  let originalBrief: string | null = null;
-  if (manifest !== null) {
-    // Proof commands: the frozen acceptance spec's argv, trusted only through
-    // the value object; an invalid spec refuses the prepare.
-    const spec = AcceptanceSpec.create(manifest.acceptanceSpec);
-    if (!spec.success || spec.value === undefined) {
-      return refuse('prepare-refused');
-    }
-    proofCommands = spec.value.getCommands().map((command) => command.argv);
-    // The original brief: the prior's frozen prose and manifest text are
-    // carried only when both are readable AND still match its recorded digest
-    // — a lane edit to `.lane/brief.md` is refused, never trusted. An
-    // unreadable read carries no original (null) and never blocks the prepare.
-    // Round 1 carries the prose verbatim; round 2 extracts the previous
-    // handover's original section.
-    if (prior.briefPackagePath === null) {
-      return refuse('prepare-refused');
-    }
-    const recordedHost = conductedRunnerOf(prior);
-    let prose: string | null | undefined;
-    try {
-      prose = await ctx.deps.artifactPort.readBriefFile?.(prior.worktreePath, '.lane/brief.md', recordedHost);
-    } catch {
-      return refuse('prepare-refused');
-    }
-    let manifestRaw: string | null | undefined;
-    try {
-      manifestRaw = await ctx.deps.artifactPort.readBriefManifest?.(
-        prior.worktreePath,
-        prior.briefPackagePath.replace(/\.md$/, '-manifest.json'),
-        recordedHost,
-      );
-    } catch {
-      return refuse('prepare-refused');
-    }
-    // Fail closed: an unreadable prior prose or manifest never prepares with a
-    // null original brief — an absent method, a null or undefined read refuses
-    // the prepare. A digest mismatch refuses the prepare exactly as before.
-    if (typeof prose !== 'string' || typeof manifestRaw !== 'string') {
-      return refuse('prepare-refused');
-    }
-    const compute = ctx.deps.computeDigest ?? simpleDeterministicHexDigest;
-    if (compute(prose + '\n' + manifestRaw) !== prior.briefDigest) {
-      return refuse('prepare-refused');
-    }
-    originalBrief = prior.kind === 'fix' ? originalBriefOf(prose) : prose;
-    if (prior.kind === 'fix' && originalBrief === null) {
-      return refuse('prepare-refused');
-    }
+  // Proof commands: the frozen acceptance spec's argv, trusted only through
+  // the value object; an invalid spec refuses the prepare.
+  const spec = AcceptanceSpec.create(manifest.acceptanceSpec);
+  if (!spec.success || spec.value === undefined) {
+    return refuse('prepare-refused');
+  }
+  const proofCommands: readonly (readonly string[])[] = spec.value.getCommands().map((command) => command.argv);
+  // Round 1 carries the prose verbatim; round 2 extracts the previous
+  // handover's original section.
+  const originalBrief = prior.kind === 'fix' ? originalBriefOf(prose) : prose;
+  if (originalBrief === null) {
+    return refuse('prepare-refused');
   }
 
   const brief = renderHandoverBrief({
@@ -709,20 +713,16 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   // KF-6: place the fix round's brief package from the prior attempt's frozen
   // manifest before preparing the fix attempt. The handover text is the prose;
   // it is never journalled and never stored anywhere but the brief package.
-  const briefRequest =
-    manifest === null
-      ? null
-      : briefRequestFromManifest({
-          manifest,
-          fixAttemptId: briefFixRequest.fixAttemptId,
-          worktreePath: prior.worktreePath,
-          proseMarkdown: brief.text,
-          // KF-9: the brief package is placed on the reserved host of the
-          // prior attempt, never on the default executor. The manifest read
-          // above already refused a prior without a recorded host, so this is
-          // always the host block (Q2a-2).
-          recordedHost: conductedRunnerOf(prior),
-        });
+  // KF-21b: built from the digest-verified manifest read above.
+  const briefRequest = briefRequestFromManifest({
+    manifest,
+    fixAttemptId: briefFixRequest.fixAttemptId,
+    worktreePath: prior.worktreePath,
+    proseMarkdown: brief.text,
+    // KF-9: the brief package is placed on the reserved host of the prior
+    // attempt, never on the default executor (Q2a-2): checked above.
+    recordedHost,
+  });
   const refusePrepared = async (): Promise<AdvanceLaneRunResult> => {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'prepare-refused');
     if (resultRefusal !== null) {

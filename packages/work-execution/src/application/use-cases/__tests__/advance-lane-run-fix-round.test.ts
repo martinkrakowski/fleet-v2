@@ -851,20 +851,35 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(results[0]).toMatchObject({ outcome: 'completed', reasonCode: 'prepared' });
   });
 
-  it('b) prepares a fix round from a gate failure carrying the gate reason code', async () => {
+  it('b) a gate-failed with no recorded failed check refuses prepare-refused rather than a bare reason code (KF-21b)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await seedGateFailure(harness);
 
     const result = await advance(harness);
-    expect(result).toEqual({
-      outcome: 'acted',
-      step: 'prepare',
-      key: prepareKey(1, 0, 2),
-      result: 'completed',
-      reasonCode: 'prepared',
+    expect(result).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'refused', reasonCode: 'prepare-refused' });
+    expect(harness.fixRequests).toHaveLength(0);
+  });
+
+  it('b1) a journal row with the gate id prefix but another attempt or action is never a gate check (KF-21b)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedGateFailure(harness);
+    const forged = (attemptId: string, action: 'accept' | 'dispatch', n: number) => ({
+      id: 'attempt-example-1:accept:' + COMMIT_A + ':' + n,
+      attemptId,
+      workOrderId: 'wo-example-1',
+      action,
+      baseCommit: COMMIT_A,
+      recordedAtIso: NOW,
+      status: 'completed' as const,
+      sessionId: null,
+      detail: JSON.stringify({ predicate: 'command 1', kind: 'command', verdict: 'fail', exitCode: 1, durationMs: 1, detail: 'x' }),
     });
-    expect(harness.fixRequests).toHaveLength(1);
-    expect(harness.fixRequests[0]!.numberedFixes).toEqual(['[gate] gate-failed']);
+    await harness.executionJournal.appendJournalEntry(forged('attempt-example-other', 'accept', 0));
+    await harness.executionJournal.appendJournalEntry(forged('attempt-example-1', 'dispatch', 1));
+
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'refused', reasonCode: 'prepare-refused' });
+    expect(harness.fixRequests).toHaveLength(0);
   });
 
   it('b2) uses the recorded branch for the handover header; old records fall back (KF-5b)', async () => {

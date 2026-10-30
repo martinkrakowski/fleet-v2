@@ -19,7 +19,17 @@
 #      credential? Reported as file:line and the pattern's name only. The content is never printed.
 #      A file containing a NUL byte is still scanned, a file over 5 MiB is reported as
 #      unscanned-large-file, and symlinks are resolved up to 40 hops without ever reading their
-#      targets (reporting symlink-escape or symlink-unresolved).
+#      targets (reporting symlink-escape or symlink-unresolved; a link that stays inside the
+#      worktree is still reported as symlink, since a review that reads files lexically cannot
+#      see what it points at). Base-line allowance (KF-27): a matched line is excused only when
+#      the exact same line occurs in the base version of the same path (merge-base of --base and
+#      HEAD), at most as many times as it occurs there; excused lines are reported as
+#      baseline-excused (line numbers only) and are not findings. No merge-base, or an unreadable
+#      base blob, excuses nothing.
+#   Git config keys that name a helper git would run (core.fsmonitor, core.hooksPath,
+#   diff.external, diff.<driver>.command|textconv, merge.<driver>.driver, credential helpers, …) in
+#   the repository's own (lane-writable) config are reported as git-config-helper, with any
+#   subsection masked; the gate's own git calls already neutralise the ones it could trigger.
 #   3. (with --brief) Did the lane change files the brief never mentioned? A warning, unless --strict-brief.
 #      A bare directory word in the brief (e.g. "packages") does not put the whole tree in scope.
 #
@@ -178,6 +188,28 @@ for d in $(printf '%s' "$FILTER_LIST" | tr '|' ' '); do
   [ -n "$d" ] || continue
   FILTER_ARGS="$FILTER_ARGS -c filter.$d.clean= -c filter.$d.smudge= -c filter.$d.process= -c filter.$d.required=false"
 done
+# Helper keys in the repository's own config (local and worktree scope: what a lane can write),
+# includes resolved. Names only, NUL-separated, so no value is ever read or printed. A subsection
+# is masked in the report because it is lane-chosen text.
+HELPER_KEYS='^core\.(fsmonitor|hookspath|sshcommand|pager|editor|askpass|gitproxy|alternaterefscommand)$|^diff\.external$|^diff\..+\.(command|textconv)$|^merge\..+\.driver$|^credential\.helper$|^credential\..+\.helper$|^gpg\.program$|^gpg\..+\.program$|^sequence\.editor$|^uploadpack\.packobjectshook$|^remote\..+\.(uploadpack|receivepack)$'
+{
+  g config -z --local --includes --name-only --list 2>/dev/null || true
+  g config -z --worktree --includes --name-only --list 2>/dev/null || true
+} | tr '\0' '\n' | grep -aEi -- "$HELPER_KEYS" | while IFS= read -r key; do
+  case "$key" in
+    *.*.*) printf '%s.<sub>.%s\n' "${key%%.*}" "${key##*.}" ;;
+    *) printf '%s\n' "$key" ;;
+  esac
+done | tr 'A-Z' 'a-z' | sort -u > "$T/helper-keys"
+
+# The base-line allowance compares against the merge-base of --base and HEAD. No merge-base (no
+# --base, an unborn HEAD, unrelated histories) leaves MB empty, and then nothing is excused.
+MB=''
+if [ -n "$base" ] && git rev-parse --verify -q HEAD >/dev/null; then
+  MB=$(g merge-base "$base" HEAD 2>/dev/null) || MB=''
+  case "$MB" in *[!0-9a-f]* | '') MB='' ;; esac
+fi
+
 collect() {
   if git rev-parse --verify -q HEAD >/dev/null; then
     if [ -n "$base" ]; then
@@ -245,6 +277,11 @@ for d in $(printf '%s' "$FILTER_LIST" | tr '|' ' '); do
   say "git-config-filter: $d"
   findings=$((findings + 1))
 done
+while IFS= read -r k; do
+  [ -n "$k" ] || continue
+  say "git-config-helper: $k"
+  findings=$((findings + 1))
+done < "$T/helper-keys"
 
 # name|extended regex. Names are what the report prints; the matched text never is.
 cat > "$T/patterns" <<'PAT'
@@ -322,6 +359,9 @@ while IFS= read -r f; do
     elif [ "$rc" = 2 ]; then
       say "symlink-unresolved: $f"
       findings=$((findings + 1))
+    else
+      say "symlink: $f"
+      findings=$((findings + 1))
     fi
     continue
   fi
@@ -353,11 +393,39 @@ while IFS= read -r f; do
     findings=$((findings + 1))
     continue
   fi
+  # Every matched line number, once, across all patterns; then decide which of them the base
+  # already had (KF-27). Only line numbers ever leave grep or awk, never a line's text.
+  : > "$T/hits"
   while IFS='|' read -r name re; do
     [ -n "$name" ] || continue
     # -a keeps a NUL-containing file scannable instead of skipping it as binary
     # (shell minor 10).
-    lines=$(grep -naE -e "$re" -- "$scan_target" 2>/dev/null | cut -d: -f1 | tr '\n' ',' | sed 's/,$//')
+    grep -naE -e "$re" -- "$scan_target" 2>/dev/null | cut -d: -f1 | sed "s/\$/ $name/" >> "$T/hits"
+  done < "$T/patterns"
+  [ -s "$T/hits" ] || continue
+  : > "$T/excused"
+  # Some awks cut a line at a NUL byte, so two different lines could compare equal: a NUL on
+  # either side excuses nothing.
+  if [ -n "$MB" ] && g cat-file -e "$MB:$f" 2>/dev/null &&
+     g cat-file blob "$MB:$f" > "$T/base-blob" 2>/dev/null &&
+     [ "$(tr -cd '\000' < "$T/base-blob" | wc -c | tr -d ' ')" = 0 ] &&
+     [ "$(tr -cd '\000' < "$scan_target" | wc -c | tr -d ' ')" = 0 ]; then
+    cut -d' ' -f1 "$T/hits" | sort -un > "$T/hit-lines"
+    # Excuse a hit line when the base holds the same exact line, consuming one base occurrence per
+    # excused line (in line order), so a duplicated fixture line beyond the base count still fails.
+    awk -v hitfile="$T/hit-lines" -v basefile="$T/base-blob" '
+      BEGIN {
+        while ((getline l < basefile) > 0) cnt[l]++
+        while ((getline n < hitfile) > 0) hit[n + 0] = 1
+      }
+      (NR in hit) { if (cnt[$0] > 0) { cnt[$0]--; print NR } }
+    ' "$scan_target" > "$T/excused" 2>/dev/null || : > "$T/excused"
+  fi
+  while IFS='|' read -r name re; do
+    [ -n "$name" ] || continue
+    lines=$(awk -v n="$name" '$2 == n { print $1 }' "$T/hits" | grep -vxFf "$T/excused" | tr '\n' ',' | sed 's/,$//')
+    gone=$(awk -v n="$name" '$2 == n { print $1 }' "$T/hits" | grep -xFf "$T/excused" | tr '\n' ',' | sed 's/,$//')
+    [ -z "$gone" ] || say "baseline-excused: $label:$gone ($name)"
     [ -n "$lines" ] || continue
     say "secret-pattern: $label:$lines ($name)"
     findings=$((findings + 1))

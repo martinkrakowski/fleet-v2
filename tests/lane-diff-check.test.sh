@@ -416,6 +416,69 @@ mkdir -p .devcontainer && printf '{}\n' > .devcontainer/devcontainer.json
 check 'piped with --rules, the trusted table loads and .devcontainer/ is protected' '[ "$(rc)" = 1 ] && grep -q "^protected: .devcontainer/devcontainer.json$" "$T/o"'
 rm -rf .devcontainer
 
+# KF-27: base-line allowance. A credential-shaped line already in the base version of the same path
+# is excused (reported as baseline-excused, line numbers only); a new or changed line still fails.
+head0=$(git rev-parse HEAD)
+fx='const password = "'; fx="${fx}hunter2hunter2\";"
+{ echo 'line one'; echo "$fx"; echo 'line three'; } > packages/x/src/fixture.ts
+git add packages/x/src/fixture.ts && git -c commit.gpgsign=false commit -q -m fixture
+git tag kf27base
+echo 'line four' >> packages/x/src/fixture.ts
+run "$R" --base kf27base
+check 'a pre-existing fixture line in a touched file is excused (KF-27)' '[ "$(rc)" = 0 ] && grep -q "^baseline-excused: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^secret-pattern:" "$T/o"'
+check 'the excused value is never printed (KF-27)' '! grep -q "hunter2" "$T/o" && ! grep -q "hunter2" "$T/e"'
+git -c commit.gpgsign=false commit -qam 'touch fixture'
+run "$R" --base kf27base
+check 'a committed edit to the file still excuses the base line (KF-27)' '[ "$(rc)" = 0 ] && grep -q "^baseline-excused: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o"'
+echo "$fx" >> packages/x/src/fixture.ts
+run "$R" --base kf27base
+check 'a new copy of the same fixture line beyond the base count fails (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/fixture.ts:5 (password-assignment)$" "$T/o" && grep -q "^baseline-excused: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o"'
+git checkout -q -- packages/x/src/fixture.ts
+sed 's/hunter2hunter2/hunter3hunter3/' packages/x/src/fixture.ts > "$T/fx" && cat "$T/fx" > packages/x/src/fixture.ts
+run "$R" --base kf27base
+check 'a modified fixture line fails (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o"'
+check 'the modified value is never printed (KF-27)' '! grep -q "hunter3" "$T/o"'
+git checkout -q -- packages/x/src/fixture.ts
+{ echo "$fx"; } > packages/x/src/fixture2.ts
+run "$R" --base kf27base
+check 'the same line in a different, new file is not excused (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/fixture2.ts:1 (password-assignment)$" "$T/o"'
+rm -f packages/x/src/fixture2.ts
+echo 'line five' >> packages/x/src/fixture.ts
+run "$R"
+check 'with no base nothing is excused (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o"'
+git checkout -q -- packages/x/src/fixture.ts
+{ printf 'a\000b\n'; echo "$fx"; } > packages/x/src/nulfix.ts
+git add packages/x/src/nulfix.ts && git -c commit.gpgsign=false commit -q -m nulfix
+git tag kf27nul
+echo 'tail' >> packages/x/src/nulfix.ts
+run "$R" --base kf27nul
+check 'a NUL byte in the file excuses nothing (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/nulfix.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o"'
+git checkout -q -- packages/x/src/nulfix.ts
+git reset -q --hard "$head0" && git tag -d kf27base kf27nul > /dev/null
+
+# KF-14e follow-up: a symlink that stays inside the worktree is still a finding.
+ln -s a.ts packages/x/src/inlink
+run "$R" --base base
+check 'a symlink inside the worktree is a symlink finding (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^symlink: packages/x/src/inlink$" "$T/o"'
+rm -f packages/x/src/inlink
+
+# KF-14e follow-up: git config keys naming a helper in the repository config are findings, the
+# subsection masked.
+git config core.fsmonitor false
+run "$R" --base base
+check 'core.fsmonitor in the repository config is git-config-helper (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^git-config-helper: core.fsmonitor$" "$T/o"'
+git config --unset core.fsmonitor
+git config diff.lanepicked.command true
+run "$R" --base base
+check 'a diff driver command is git-config-helper with the subsection masked (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^git-config-helper: diff.<sub>.command$" "$T/o" && ! grep -q "lanepicked" "$T/o"'
+git config --remove-section diff.lanepicked
+git config credential.helper store
+run "$R" --base base
+check 'a credential helper is git-config-helper (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^git-config-helper: credential.helper$" "$T/o"'
+git config --unset credential.helper
+run "$R" --base base
+check 'with the helper keys removed the tree is clean again (KF-27)' '[ "$(rc)" = 0 ]'
+
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"
 [ "$fails" = 0 ]

@@ -590,6 +590,27 @@ describe('receipts-only head assessment (KF-22a)', () => {
     }
   });
 
+  it('blocks a stored accepted assessment in receipts scope when forge mode is none and the brief names CI (D6)', async () => {
+    const acceptedRecord = sampleRecord({
+      state: 'accepted',
+      acceptanceReceiptId: 'acc-1',
+      requiredChecks: [...sampleRecord({}).requiredChecks, 'ci'],
+    });
+    const repo = new InMemoryAssessmentRepo([acceptedRecord]);
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      attemptOwnerDecisionPort: NO_OWNER_DECISIONS,
+      forgeMode: 'none',
+    });
+
+    const receipts = await useCase.assessHeadReceipts({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(receipts.outcome).toBe('blocked');
+  });
+
   it('answers a stored accepted assessment as receipts-passed in receipts scope and accepted in full scope', async () => {
     const acceptedRecord = sampleRecord({ state: 'accepted', acceptanceReceiptId: 'acc-1' });
     const repo = new InMemoryAssessmentRepo([acceptedRecord]);

@@ -339,6 +339,21 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
         return await this.block(deps, assessment, doorBlockers, nowIso);
       }
       if (scope === 'receipts') {
+        // D6 holds here too: with forge mode 'none' a stored acceptance never
+        // satisfies a brief that names a CI-state requirement.
+        if (deps.forgeMode === 'none' && namesCiRequirement(assessment.requiredChecks)) {
+          return await this.block(
+            deps,
+            assessment,
+            [
+              acceptanceBlocker(
+                'other',
+                "forge mode is 'none': the brief requires CI state, and forge evidence is 'not-configured'",
+              ),
+            ],
+            nowIso,
+          );
+        }
         return {
           outcome: 'receipts-passed',
           receiptsId: `rcp-${assessment.id}-${assessment.candidateHeadSha.slice(0, 8)}`,

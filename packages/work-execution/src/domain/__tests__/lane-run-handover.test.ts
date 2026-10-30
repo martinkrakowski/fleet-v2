@@ -348,6 +348,72 @@ describe('renderHandoverBrief', () => {
     expect(originalBriefOf(roundTwo.text)).toBe(original);
   });
 
+  const QUOTING_SUMMARY =
+    'see <!-- fleet:original-brief --> and ## Original brief (task reference; the numbered items above take priority) quoted';
+
+  it('originalBriefOf ignores a quoting summary and returns the real appended original', () => {
+    const original = '# Task\n\nDo it.\n';
+    const result = renderHandoverBrief(input({
+      source: 'review',
+      findings: [finding({ severity: 'blocker', summary: QUOTING_SUMMARY })],
+      originalBrief: original,
+    }));
+    if (!result.ok) {
+      throw new Error('expected an ok render');
+    }
+    expect(originalBriefOf(result.text)).toBe(original);
+  });
+
+  it('originalBriefOf returns null when only a quoting summary mentions the marker', () => {
+    const result = renderHandoverBrief(input({
+      source: 'review',
+      findings: [finding({ severity: 'blocker', summary: QUOTING_SUMMARY })],
+      originalBrief: null,
+    }));
+    if (!result.ok) {
+      throw new Error('expected an ok render');
+    }
+    expect(originalBriefOf(result.text)).toBeNull();
+  });
+
+  it('round 2 with the quoting summary round-trips the extracted original exactly', () => {
+    const original = '# Task\n\nDo it.\n';
+    const roundOne = renderHandoverBrief(input({
+      source: 'review',
+      findings: [finding({ severity: 'blocker', summary: QUOTING_SUMMARY })],
+      originalBrief: original,
+    }));
+    if (!roundOne.ok) {
+      throw new Error('expected an ok render');
+    }
+    const extracted = originalBriefOf(roundOne.text);
+    expect(extracted).toBe(original);
+    const roundTwo = renderHandoverBrief(input({
+      round: 2,
+      source: 'review',
+      findings: [finding({ severity: 'blocker', summary: QUOTING_SUMMARY })],
+      originalBrief: extracted,
+    }));
+    if (!roundTwo.ok) {
+      throw new Error('expected an ok render');
+    }
+    expect(originalBriefOf(roundTwo.text)).toBe(original);
+  });
+
+  it('round-trips an original that itself contains the full rendered section start', () => {
+    const original =
+      '# Task\n\nDo it.\n\n<!-- fleet:original-brief -->\n\n## Original brief (task reference; the numbered items above take priority)\n\nmore\n';
+    const result = renderHandoverBrief(input({
+      source: 'review',
+      findings: [finding({ severity: 'blocker', summary: 'x' })],
+      originalBrief: original,
+    }));
+    if (!result.ok) {
+      throw new Error('expected an ok render');
+    }
+    expect(originalBriefOf(result.text)).toBe(original);
+  });
+
   it('refuses a handover text over 60 000 characters', () => {
     const result = renderHandoverBrief(input({
       source: 'review',

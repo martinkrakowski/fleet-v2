@@ -18,6 +18,8 @@ import type {
   OwnerQuestionRecommendationRecord,
 } from '@fleet/operator-coordination';
 
+import { LANE_RUN_PARK_REASONS } from '../../domain/lane-run-records.js';
+
 import type {
   LaneRunParkFindResult,
   LaneRunParkNoticePort,
@@ -139,9 +141,10 @@ export class LaneRunParkNoticeAdapter implements LaneRunParkNoticePort {
     if (request.qualifier !== undefined && !QUALIFIER_CODE.test(request.qualifier)) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
-    try {
-      questionTexts(request.reason, request);
-    } catch {
+    // Every park reason raises its attention item (K6-3); only the four owner
+    // reasons also ask the keyed owner question, so the question texts stay
+    // out of this path and an unknown reason code is still refused.
+    if (!(LANE_RUN_PARK_REASONS as readonly string[]).includes(request.reason)) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
     const qualifier = request.qualifier === undefined ? '' : `, qualifier ${request.qualifier}`;

@@ -647,21 +647,35 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
       return refuse('prepare-refused');
     }
     const recordedHost = conductedRunnerOf(prior);
-    const prose = await ctx.deps.artifactPort.readBriefFile?.(prior.worktreePath, '.lane/brief.md', recordedHost);
-    const manifestRaw = await ctx.deps.artifactPort.readBriefManifest?.(
-      prior.worktreePath,
-      prior.briefPackagePath.replace(/\.md$/, '-manifest.json'),
-      recordedHost,
-    );
-    if (typeof prose === 'string' && typeof manifestRaw === 'string') {
-      const compute = ctx.deps.computeDigest ?? simpleDeterministicHexDigest;
-      if (compute(prose + '\n' + manifestRaw) !== prior.briefDigest) {
-        return refuse('prepare-refused');
-      }
-      originalBrief = prior.kind === 'fix' ? originalBriefOf(prose) : prose;
-      if (prior.kind === 'fix' && originalBrief === null) {
-        return refuse('prepare-refused');
-      }
+    let prose: string | null | undefined;
+    try {
+      prose = await ctx.deps.artifactPort.readBriefFile?.(prior.worktreePath, '.lane/brief.md', recordedHost);
+    } catch {
+      return refuse('prepare-refused');
+    }
+    let manifestRaw: string | null | undefined;
+    try {
+      manifestRaw = await ctx.deps.artifactPort.readBriefManifest?.(
+        prior.worktreePath,
+        prior.briefPackagePath.replace(/\.md$/, '-manifest.json'),
+        recordedHost,
+      );
+    } catch {
+      return refuse('prepare-refused');
+    }
+    // Fail closed: an unreadable prior prose or manifest never prepares with a
+    // null original brief — an absent method, a null or undefined read refuses
+    // the prepare. A digest mismatch refuses the prepare exactly as before.
+    if (typeof prose !== 'string' || typeof manifestRaw !== 'string') {
+      return refuse('prepare-refused');
+    }
+    const compute = ctx.deps.computeDigest ?? simpleDeterministicHexDigest;
+    if (compute(prose + '\n' + manifestRaw) !== prior.briefDigest) {
+      return refuse('prepare-refused');
+    }
+    originalBrief = prior.kind === 'fix' ? originalBriefOf(prose) : prose;
+    if (prior.kind === 'fix' && originalBrief === null) {
+      return refuse('prepare-refused');
     }
   }
 

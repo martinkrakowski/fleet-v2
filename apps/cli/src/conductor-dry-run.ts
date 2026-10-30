@@ -59,7 +59,7 @@ export interface DryRunFakes {
   readonly artifactPort: Pick<
     AttemptArtifactPort,
     'readBriefManifest' | 'verifyArtifactManifest' | 'readBriefFile'
-  >; // { stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['dry-run-check'] }; 'sealed'; the brief text reads null
+  >; // { stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['dry-run-check'] }; 'sealed'; the brief file reads the example prose for `.lane/brief.md` and null otherwise
   readonly acceptanceAssessment: AcceptanceAssessmentPort;        // 'accepted' at the asked head; 'ar-dry-run-' + n
   readonly ciState: CiStatePort;                                  // 'passed' at the exact head, reason 'read'
   readonly forgeRead: ForgeReadPort;                              // 'not-found' until the push ran; then the PR at the pushed head: 'open' (clean, number 1) and, after the merge, 'merged'
@@ -72,6 +72,14 @@ export interface DryRunFakes {
 
 /** The fixed digest the dry-run's `prepareBrief` fake answers (KF-6). */
 export const DRY_RUN_BRIEF_DIGEST = 'f'.repeat(64);
+
+/**
+ * The frozen prose the dry-run's brief file reads: the fix round's prepare
+ * refuses an unreadable prior prose (KF-21b), so the dry-run fake reads the
+ * same prose for every attempt's `.lane/brief.md` and its recorded brief
+ * digest matches it.
+ */
+export const DRY_RUN_BRIEF_PROSE = '# Task\n\nFix the acceptance problem in the dry run.\n';
 
 /** The frozen manifest the dry-run fakes read: every field a fix-round brief rebuild needs, the limits, the frozen PR notes and the checks the seeds carry. */
 export const DRY_RUN_MANIFEST_JSON = JSON.stringify({
@@ -395,7 +403,8 @@ export function createDryRunFakes(
         total: { files: 0, bytes: 0 },
       },
     }),
-    readBriefFile: async () => null,
+    readBriefFile: async (_worktreePath: string, relativePath: string) =>
+      relativePath === '.lane/brief.md' ? DRY_RUN_BRIEF_PROSE : null,
   };
 
   // K6-8: the acting fakes for the conductor's acceptance, PR, push, merge

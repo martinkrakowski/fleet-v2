@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
+import type { AttemptRecord, AttemptRunnerRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../../domain/lane-run-journal.js';
 import { dispatchRefusalDetail, fixSeatForDispatch } from '../advance-lane-run/prepare-dispatch.js';
@@ -340,11 +340,16 @@ interface Harness {
   readonly gateRequests: readonly EvaluateAttemptGateRequest[];
   readonly reviewOpenRequests: readonly OpenReviewAssessmentRequest[];
   readonly gateReceiptRequests: readonly RecordGateReceiptsRequest[];
+  /** Every `readBriefFile` call's arguments, in call order. */
+  readonly briefFileReads: readonly { worktreePath: string; relativePath: string; recordedHost: AttemptRunnerRecord | null | undefined }[];
+  /** Every `readBriefManifest` call's arguments, in call order. */
+  readonly briefManifestReads: readonly { worktreePath: string; manifestPath: string | undefined; recordedHost: AttemptRunnerRecord | null | undefined }[];
   readonly deps: AdvanceLaneRunDependencies;
   /** Journal length when the prepare port was called (order assertion). */
   readonly journalLengthWhenPrepared: number;
   setManifest(json: string | null): void;
   setProse(json: string | null): void;
+  setBriefFileError(message: string | null): void;
   setFindReceiptAnswer(answer: (request: FindReviewReceiptRequest) => Promise<FindReviewReceiptResult>): void;
   setFixAnswer(answer: (request: PrepareFixAttemptRequest) => Promise<PrepareFixAttemptResult>): void;
   setBriefAnswer(answer: (request: PrepareBriefPackageUseCaseRequest) => Promise<PrepareBriefPackageResult>): void;
@@ -382,8 +387,11 @@ async function makeHarness(
   const gateRequests: EvaluateAttemptGateRequest[] = [];
   const reviewOpenRequests: OpenReviewAssessmentRequest[] = [];
   const gateReceiptRequests: RecordGateReceiptsRequest[] = [];
+  const briefFileReads: { worktreePath: string; relativePath: string; recordedHost: AttemptRunnerRecord | null | undefined }[] = [];
+  const briefManifestReads: { worktreePath: string; manifestPath: string | undefined; recordedHost: AttemptRunnerRecord | null | undefined }[] = [];
   let manifestJson: string | null = FULL_MANIFEST_JSON;
   let prose: string | null = DEFAULT_PROSE;
+  let briefFileError: string | null = null;
   let journalLengthWhenPrepared = 0;
   let journalLengthBeforeAdvance = 0;
   let sameFamilyImpl: SameModelFamily = (left, right) => left === right;
@@ -443,8 +451,17 @@ async function makeHarness(
     attemptRepo,
     executionJournal,
     artifactPort: {
-      readBriefManifest: async () => manifestJson,
-      readBriefFile: async () => prose,
+      readBriefManifest: async (worktreePath, manifestPath, recordedHost) => {
+        briefManifestReads.push({ worktreePath, manifestPath, recordedHost });
+        return manifestJson;
+      },
+      readBriefFile: async (worktreePath, relativePath, recordedHost) => {
+        briefFileReads.push({ worktreePath, relativePath, recordedHost });
+        if (briefFileError !== null) {
+          throw new Error(briefFileError);
+        }
+        return prose;
+      },
       verifyArtifactManifest: async () => ({ outcome: 'sealed' }) as never,
     },
     reconcileAttempt: {
@@ -607,6 +624,8 @@ async function makeHarness(
     gateRequests,
     reviewOpenRequests,
     gateReceiptRequests,
+    briefFileReads,
+    briefManifestReads,
     deps,
     get journalLengthWhenPrepared() {
       return journalLengthWhenPrepared;
@@ -616,6 +635,9 @@ async function makeHarness(
     },
     setProse: (json) => {
       prose = json;
+    },
+    setBriefFileError: (message) => {
+      briefFileError = message;
     },
     setFindReceiptAnswer: (answer) => {
       findReceiptAnswer = answer;
@@ -804,6 +826,18 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       expect(fixRequest.briefDigest).toBe(simpleDeterministicHexDigest(rendered.text + '\n' + FULL_MANIFEST_JSON));
     }
     expect(fixRequest.briefPackagePath).toBe('.lane/brief.md');
+
+    // The prior's frozen prose and manifest are read through the prior's
+    // recorded host, at the prior's worktree and the frozen brief path.
+    expect(harness.briefFileReads).toEqual([
+      { worktreePath: WORKTREE, relativePath: '.lane/brief.md', recordedHost: CONDUCTED_RUNNER },
+    ]);
+    expect(harness.briefManifestReads.length).toBeGreaterThan(0);
+    expect(
+      harness.briefManifestReads.every(
+        (read) => read.worktreePath === WORKTREE && read.recordedHost === CONDUCTED_RUNNER,
+      ),
+    ).toBe(true);
 
     const record = await harness.runRepo.get(RUN_ID);
     expect(record?.attemptIds).toEqual(['attempt-example-1', fixRequest.fixAttemptId]);
@@ -1317,7 +1351,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(prose).toContain('corepack yarn build');
     // Round 1 carries the original prose after the marker.
     expect(prose.indexOf(ORIGINAL_BRIEF_MARKER)).toBeGreaterThan(-1);
-    expect(prose).toContain(DEFAULT_PROSE);
+    expect(originalBriefOf(prose)).toBe(DEFAULT_PROSE);
   });
 
   it('t) a review failure also carries the proof commands and the original brief', async () => {
@@ -1408,6 +1442,104 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(harness.briefRequests).toHaveLength(0);
     const record = await harness.runRepo.get(RUN_ID);
     expect(record?.attemptIds).toEqual(['attempt-example-1']);
+  });
+
+  it('w) refuses prepare-refused when the prior prose read is null, placing nothing', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    // The prior's `.lane/brief.md` is missing: the fix prepare refuses instead
+    // of preparing with `originalBrief: null`.
+    harness.setProse(null);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+    expect(harness.briefRequests).toHaveLength(0);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.attemptIds).toEqual(['attempt-example-1']);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'prepare-refused')).toBe(true);
+  });
+
+  it('x) refuses prepare-refused when the prior manifest read is null, placing nothing', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    // The prior's frozen manifest is missing: the fix prepare refuses.
+    harness.setManifest(null);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+    expect(harness.briefRequests).toHaveLength(0);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.attemptIds).toEqual(['attempt-example-1']);
+  });
+
+  it('y) a throwing readBriefFile refuses the prepare and no exception escapes', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setBriefFileError('boom');
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+    expect(harness.briefRequests).toHaveLength(0);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.attemptIds).toEqual(['attempt-example-1']);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'prepare-refused')).toBe(true);
+  });
+
+  it('z) round 2 whose prior prose has no original-brief marker refuses prepare-refused', async () => {
+    const harness = await makeHarness(
+      runRecord({ round: 1, attemptIds: ['attempt-example-1', 'attempt-fix-prior'] }),
+      [collectedAttempt()],
+    );
+    // The prior is a collected fix attempt whose prose has NO original-brief
+    // marker; its digest still matches, so only the marker extraction refuses.
+    const fixPrior: AttemptRecord = {
+      ...buildFixAttempt(
+        { fixAttemptId: 'attempt-fix-prior', workOrderId: 'wo-example-1', priorAttemptId: 'attempt-example-1', numberedFixes: [] },
+        0,
+      ),
+      state: 'collected',
+      briefDigest: simpleDeterministicHexDigest(DEFAULT_PROSE + '\n' + FULL_MANIFEST_JSON),
+      artifacts: { headCommit: COMMIT_A, commitsSinceBase: [COMMIT_A], collectedArtifactPaths: [], notes: 'present' },
+    };
+    await harness.attemptRepo.saveAttempt(fixPrior);
+    harness.setProse(DEFAULT_PROSE);
+    await seedReviewFailure(harness, [blockerFinding()]);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(2, 1, 3),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+    expect(harness.briefRequests).toHaveLength(0);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.attemptIds).toEqual(['attempt-example-1', 'attempt-fix-prior']);
   });
 });
 

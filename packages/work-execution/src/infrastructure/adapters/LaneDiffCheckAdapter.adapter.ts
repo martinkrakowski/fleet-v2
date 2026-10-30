@@ -16,7 +16,15 @@
  * adapter reads the base version of each changed path and passes its lines
  * in, so a line the base already had is excused, at most as many times as it
  * occurs there — never for a new or unreadable base, a NUL byte on either
- * side, or a copy beyond the base count. The adapter also flags a changed
+ * side, or a copy beyond the base count. The base is trusted only after
+ * every object on the way is verified: the base must be a commit that is an
+ * ancestor of HEAD and whose bytes re-hash to its id, each tree on the path
+ * is listed and round-tripped through `mktree` to re-derive its id, entries
+ * come from the verified listing (only regular-file modes excuse), and the
+ * blob's bytes re-hash to its id — git checks object hashes on transfer and
+ * fsck, not on read, so a lane that can write the shared object store cannot
+ * serve forged bytes for the real ids. The grafts override travels inside
+ * the argv too, because a remote executor carries only the argv. The adapter also flags a changed
  * symbolic link and passes the repository's helper-shaped git config key
  * names (names only; no value is ever read) to the pure check. Git plumbing
  * never lists anything under `.git/`, so no
@@ -96,18 +104,30 @@ const GIT_CONFIG_ARGS = [
 ] as const;
 
 /**
+ * A grafts path that never exists: git then reads no grafts and prints no
+ * deprecation hint (an existing file, even /dev/null, makes every call
+ * warn). A lane that can write the shared clone must not be able to point
+ * the check at a grafts file it controls.
+ */
+const GIT_GRAFT_FILE_NEVER =
+  "/nonexistent/fleet-v2-lane-diff-check-no-grafts";
+
+/**
  * Applied to every git call as the child's environment: replace refs and
  * grafts in the shared clone cannot forge the base blob or hide a changed
  * file (KF-27 review), because replace-object lookup is off and the grafts
- * file points nowhere. The base is the allow-listed host variables a child
- * may inherit (the ssh superset, so an ssh transport keeps its agent), plus
- * the two overrides — the port takes a complete environment when given, so
- * the allow-list is rebuilt here rather than widened.
+ * file points nowhere. The base is the local allow-list — these git calls
+ * never touch a remote over git, so `SSH_AUTH_SOCK` is not needed — plus
+ * the two overrides; the port takes a complete environment when given, so
+ * the allow-list is rebuilt here rather than widened. The two overrides
+ * also travel INSIDE the argv (below): a remote executor carries only the
+ * argv to the remote shell, so an environment variable set here would never
+ * reach the remote git.
  */
 const GIT_HARDENED_ENV: Readonly<Record<string, string>> = {
-  ...allowListedChildEnv("ssh"),
+  ...allowListedChildEnv("local"),
   GIT_NO_REPLACE_OBJECTS: "1",
-  GIT_GRAFT_FILE: "/dev/null",
+  GIT_GRAFT_FILE: GIT_GRAFT_FILE_NEVER,
 };
 
 /**
@@ -129,8 +149,16 @@ const HELPER_KEY_PATTERN = new RegExp(HELPER_KEYS, "i");
  */
 function maskedHelperKey(key: string): string {
   const parts = key.split(".");
-  if (parts.length < 3) return key;
-  return `${parts[0]}.<sub>.${parts[parts.length - 1]}`;
+  if (parts.length >= 3) return `${parts[0]}.<sub>.${parts[parts.length - 1]}`;
+  // A two-part key whose second segment is lane-chosen text — `pager.<cmd>`
+  // is the one in the helper list — masks that segment too: the command
+  // name is a subsection-like lane-chosen string and must not appear in a
+  // finding. Two-part keys with a fixed second segment (`diff.external`,
+  // `core.pager`, `credential.helper`, `include.path`) stay readable.
+  if (parts.length === 2 && parts[0].toLowerCase() === "pager") {
+    return `${parts[0]}.<sub>`;
+  }
+  return key;
 }
 
 /** The distinct masked, lowercased helper key names among the config keys. */
@@ -202,6 +230,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     const git = async (
       argv: readonly string[],
       what: string,
+      input?: string,
     ): Promise<CommandOutcome> => {
       // The config overrides pin every command against the lane's local git
       // config: no colors, no quoted paths, no mnemonic or missing a/b
@@ -218,8 +247,16 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
       // replace refs and grafts the lane could have planted in the shared
       // clone from forging the base blob or hiding a changed file: a
       // transport that drops the environment still runs the flag.
+      // `env GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=<never-existing path>`
+      // prefixes the command itself: an ssh executor carries only the argv
+      // to the remote shell, so the grafts override must travel inside the
+      // remote command (every word single-quoted by the remote executor) to
+      // reach the remote git at all. Locally the same prefix is harmless.
       const run = await this.commandExecutor.run(
         [
+          "env",
+          "GIT_NO_REPLACE_OBJECTS=1",
+          `GIT_GRAFT_FILE=${GIT_GRAFT_FILE_NEVER}`,
           "git",
           "--no-replace-objects",
           "-C",
@@ -230,6 +267,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
         {
           cwd: request.worktreePath,
           env: GIT_HARDENED_ENV,
+          ...(input !== undefined ? { input } : {}),
         },
       );
       if (run.error !== undefined || run.exitCode !== 0) {
@@ -241,6 +279,129 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
         };
       }
       return { ok: true, stdout: run.stdout, reason: "", exitCode: 0 };
+    };
+
+    // The base-line allowance trusts only a base that (a) is a commit object,
+    // (b) is an ancestor of HEAD and (c) whose bytes re-hash to the base id —
+    // checked once per check (the script's TRUSTED_BASE). On any failure the
+    // allowance is simply off: every baseLines stays null, never an error.
+    let baseTreeId: string | null = null;
+    const baseType = await git(
+      ["cat-file", "-t", request.baseCommit],
+      "check the base object's type",
+    );
+    if (baseType.ok && baseType.stdout.trim() === "commit") {
+      const ancestor = await git(
+        ["merge-base", "--is-ancestor", request.baseCommit, "HEAD"],
+        "check the base is an ancestor of HEAD",
+      );
+      if (ancestor.ok) {
+        const commitRead = await git(
+          ["cat-file", "commit", request.baseCommit],
+          "read the base commit",
+        );
+        if (commitRead.ok) {
+          // Git does not check object hashes on read, so the commit's bytes
+          // are re-hashed before anything from it is trusted.
+          const commitHash = await git(
+            ["hash-object", "--no-filters", "-t", "commit", "--stdin"],
+            "verify the base commit's hash",
+            commitRead.stdout,
+          );
+          const treeMatch = commitRead.stdout.match(
+            /^tree ([0-9a-f]{40,64})(?:\n|$)/,
+          );
+          if (
+            commitHash.ok &&
+            commitHash.stdout.trim() === request.baseCommit &&
+            treeMatch !== null
+          ) {
+            baseTreeId = treeMatch[1];
+          }
+        }
+      }
+    }
+
+    /**
+     * Read object `id` of a text-safe type and re-hash its bytes: 0 only
+     * when they hash to `id`. Git checks object hashes on transfer and
+     * fsck, not on cat-file, so a lane that can write the shared object
+     * store (a loose file, alternates) could otherwise serve forged bytes
+     * for the real id. Any read error or mismatch is a null, never an
+     * error and never a trust.
+     */
+    const readVerifiedObject = async (
+      id: string,
+      type: "commit" | "blob",
+    ): Promise<string | null> => {
+      const read = await git(
+        ["cat-file", type, id],
+        `read a base ${type}`,
+      );
+      if (!read.ok) return null;
+      const hash = await git(
+        ["hash-object", "--no-filters", "-t", type, "--stdin"],
+        `verify a base ${type}'s hash`,
+        read.stdout,
+      );
+      if (!hash.ok || hash.stdout.trim() !== id) return null;
+      return read.stdout;
+    };
+
+    /**
+     * List tree `id` NUL-separated and verify the id by round-tripping the
+     * listing through `mktree -z --missing` — it must print the same id.
+     * Tree bytes are binary, so the listing (text) is what is verified, not
+     * a hash of decoded bytes. Returns the parsed entries, or null.
+     */
+    const verifiedTreeEntries = async (
+      id: string,
+    ): Promise<Map<string, { mode: string; id: string }> | null> => {
+      const listing = await git(["ls-tree", "-z", id], "list a base tree");
+      if (!listing.ok) return null;
+      const roundTrip = await git(
+        ["mktree", "-z", "--missing"],
+        "verify a base tree's hash",
+        listing.stdout,
+      );
+      if (!roundTrip.ok || roundTrip.stdout.trim() !== id) return null;
+      const entries = new Map<string, { mode: string; id: string }>();
+      for (const field of listing.stdout.split("\0")) {
+        if (field === "") continue;
+        const tab = field.indexOf("\t");
+        if (tab < 0) return null;
+        const meta = field.slice(0, tab).split(" ");
+        if (meta.length !== 3) return null;
+        entries.set(field.slice(tab + 1), { mode: meta[0], id: meta[2] });
+      }
+      return entries;
+    };
+
+    /**
+     * The verified base blob of one path: commit tree → each tree on the
+     * way (every one re-verified) → the entry taken from the VERIFIED
+     * listing, and finally the blob itself re-hashed. A tree on the way
+     * must be mode 040000; the final entry must be a regular file
+     * (100644 or 100755) — a symlink, submodule or tree at the path
+     * excuses nothing. Any mismatch, read error or missing entry is null.
+     */
+    const verifiedBaseBlob = async (path: string): Promise<string | null> => {
+      if (baseTreeId === null) return null;
+      let id = baseTreeId;
+      const components = path.split("/");
+      for (let index = 0; index < components.length; index += 1) {
+        const entries = await verifiedTreeEntries(id);
+        if (entries === null) return null;
+        const entry = entries.get(components[index]);
+        if (entry === undefined) return null;
+        if (index === components.length - 1) {
+          if (entry.mode !== "100644" && entry.mode !== "100755") return null;
+          return readVerifiedObject(entry.id, "blob");
+        }
+        if (entry.mode !== "040000") return null;
+        id = entry.id;
+      }
+      return null;
     };
 
     const status = await git(
@@ -423,14 +584,12 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
             };
           }
         } else {
-          const baseBlob = await git(
-            ["cat-file", "blob", `${request.baseCommit}:${entry.path}`],
-            "read a changed file's base blob",
-          );
-          // A failed read after a successful probe is an error, never a
-          // silent pass.
-          if (!baseBlob.ok) return { outcome: "error", reason: baseBlob.reason };
-          baseRaw = baseBlob.stdout;
+          // The verified base blob: commit → each tree → blob, every object
+          // re-hashed and every entry taken from a verified tree listing.
+          // Any verification failure, read error or a non-regular-file mode
+          // at the path is a null (nothing excused for that file), never an
+          // error and never a trust of unverified bytes.
+          baseRaw = await verifiedBaseBlob(entry.path);
         }
       }
       addedLines.set(entry.path, flattenContentLines(merged));
@@ -443,13 +602,23 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     }
 
     // The repository's own config keys, read once per check: names only,
-    // NUL-separated, so no value is ever read. A failed key read is an
+    // NUL-separated, so no value is ever read. Both the local scope and the
+    // worktree scope (lane-writable when `extensions.worktreeConfig` is on)
+    // are read, like the script; a failed worktree-scope read is tolerated
+    // as empty (the script's `|| true`), a failed local-scope read is an
     // error (fail closed), never a silent pass.
     const configKeys = await git(
       ["config", "-z", "--local", "--includes", "--name-only", "--list"],
       "read the repository's config key names",
     );
     if (!configKeys.ok) return { outcome: "error", reason: configKeys.reason };
+    const worktreeKeys = await git(
+      ["config", "-z", "--worktree", "--includes", "--name-only", "--list"],
+      "read the repository's worktree config key names",
+    );
+    const combinedConfigKeys = worktreeKeys.ok
+      ? `${configKeys.stdout}\0${worktreeKeys.stdout}`
+      : configKeys.stdout;
 
     const changedPaths: LaneDiffChangedPath[] = [...changed.values()].map(
       (entry) => ({
@@ -472,7 +641,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
       ...(request.policyProtectedPaths !== undefined
         ? { policyProtectedPaths: request.policyProtectedPaths }
         : {}),
-      helperConfigKeys: helperConfigKeys(configKeys.stdout),
+      helperConfigKeys: helperConfigKeys(combinedConfigKeys),
       ...(request.secretPatterns !== undefined
         ? { secretPatterns: request.secretPatterns }
         : {

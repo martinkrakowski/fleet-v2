@@ -22,6 +22,8 @@ import { LANE_RUN_TERMINAL_STATES } from '../../domain/value-objects/LaneRunStat
 import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
 import type { AdvanceLaneRunPort, AdvanceLaneRunResult } from '../ports/in/AdvanceLaneRunPort.in-port.js';
 import type { ResumeLaneRunPort } from '../ports/in/ResumeLaneRunPort.in-port.js';
+import { SessionStartSpacing } from './advance-lane-run/session-start-gate.js';
+import { parseLaneRunKey } from '../../domain/lane-run-keys.js';
 import {
   CONDUCTOR_LEASE_MS,
   CONDUCTOR_MAX_STEPS_PER_RUN,
@@ -51,12 +53,12 @@ export interface RunConductorPassDependencies {
    */
   readonly now?: () => string;
   /**
-   * The pass sleep, awaited between runs when one started a lane session;
-   * production passes real time, tests a fake. When absent a `setTimeout`
-   * promise supplies the wait.
+   * The pass sleep, awaited by the session-start gate between a denied start
+   * and the run's reserved turn; production passes real time, tests a fake.
+   * When absent a `setTimeout` promise supplies the wait.
    */
   readonly sleep?: (ms: number) => Promise<void>;
-  /** How long to stagger lane session starts between runs, in ms. */
+  /** How long to space lane session starts through the start gate, in ms. */
   readonly dispatchStaggerMs?: number;
 }
 
@@ -125,14 +127,44 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
 
     const runs = await this.deps.runRepo.list();
     // Each run's journal read is independent, so the filtering reads run in parallel.
+    // The entries are kept: the start gate's seed reads the latest session-start
+    // intent from them, so the journals are never read twice.
+    const journalEntriesByRun = new Map<string, Awaited<ReturnType<LaneRunJournalPort['listForRun']>>>();
     const liveRuns = (
       await Promise.all(
         runs.map(async (record) => {
-          const state = laneRunJournalState(await this.deps.runJournal.listForRun(record.runId), record.runId);
+          const entries = await this.deps.runJournal.listForRun(record.runId);
+          journalEntriesByRun.set(record.runId, entries);
+          const state = laneRunJournalState(entries, record.runId);
           return (LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state) ? null : record;
         }),
       )
     ).filter((record): record is LaneRunRecord => record !== null);
+
+    // One gate per pass, seeded with the latest recorded session start among the
+    // dispatch, brief-check and code-review intents the filtering reads already
+    // carried: a start is spaced from one the previous pass or process made.
+    let lastStartIso: string | null = null;
+    for (const entries of journalEntriesByRun.values()) {
+      for (const entry of entries) {
+        if (entry.kind !== 'intent' || entry.key === null) {
+          continue;
+        }
+        const parsed = parseLaneRunKey(entry.key);
+        if (
+          parsed !== null &&
+          parsed.kind === 'step' &&
+          (parsed.step === 'dispatch' || parsed.step === 'brief-check' || parsed.step === 'code-review') &&
+          (lastStartIso === null || Date.parse(entry.recordedAtIso) > Date.parse(lastStartIso))
+        ) {
+          lastStartIso = entry.recordedAtIso;
+        }
+      }
+    }
+    const startGate = new SessionStartSpacing(
+      this.deps.dispatchStaggerMs ?? DEFAULT_DISPATCH_STAGGER_MS,
+      lastStartIso,
+    );
 
     const reports: ConductorRunReport[] = [];
     const attention: ConductorAttentionItem[] = [];
@@ -235,10 +267,20 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
           lease: { holderId: lease.holderId, fence: lease.fence },
           halted,
           nowIso: stepNowIso,
+          startGate,
         });
         steps.push(step);
         if (step.outcome === 'waiting' && step.reason === 'stop-grace-exceeded') {
           attention.push({ runId: record.runId, kind: 'stop-grace-exceeded' });
+        }
+        if (step.outcome === 'waiting' && step.reason === 'session-stagger') {
+          // The start gate denied this run's session start: sleep until the
+          // run's reserved turn, then advance again with fresh facts and
+          // renewed leases. The run is not finished; the loop ceiling still
+          // bounds the wait. The step is reported as it was journalled: none.
+          const sleep = this.deps.sleep ?? defaultSleep;
+          await sleep(startGate.pendingMs(record.runId, this.nowIso()));
+          continue;
         }
         finished = !(step.outcome === 'entered' || step.outcome === 'repaired' || step.outcome === 'acted');
       }
@@ -247,27 +289,6 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
         reports.push({ runId: record.runId, outcome: 'skipped', reason: lost });
       } else {
         reports.push({ runId: record.runId, outcome: 'advanced', steps });
-      }
-
-      // A run whose dispatch step started a lane session (`dispatch-started`)
-      // pauses the pass before the next live run, so concurrent session starts
-      // are staggered. No lease change is needed here: leases are renewed with
-      // fresh time before each step, and the next run's first lease decision
-      // reads fresh time too. Never pause after the last run and never for
-      // steps other than a started dispatch; a run whose lease was lost after
-      // its session started still pauses, because the session did start.
-      // A reconciled dispatch (crash recovery) found its session already
-      // started and starts none now, so only a completed dispatch pauses.
-      const startedSession = steps.some(
-        (step) =>
-          step.outcome === 'acted' &&
-          step.step === 'dispatch' &&
-          step.result === 'completed' &&
-          step.reasonCode === 'dispatch-started',
-      );
-      if (startedSession && index < liveRuns.length - 1) {
-        const sleep = this.deps.sleep ?? defaultSleep;
-        await sleep(this.deps.dispatchStaggerMs ?? DEFAULT_DISPATCH_STAGGER_MS);
       }
     }
 

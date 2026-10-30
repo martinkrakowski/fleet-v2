@@ -150,6 +150,58 @@ export async function performPrepare(ctx: AdvanceStepContext,
 }
 
 /**
+ * KF-16: the fixed detail code a refused dispatch journals with its result
+ * entry, derived from the refusal's stable prefix or phrase. Reason details
+ * are fixed codes, never free text; unknown refusals map to `other` and the
+ * function never returns the input text.
+ */
+export function dispatchRefusalDetail(reason: string): string {
+  // Worktree refusals name the path and then a fixed phrase. The path may hold
+  // spaces, so the first fixed phrase after it decides; a listed file name
+  // after the phrase can never change the code.
+  const worktree = /^Worktree .+? (does not match the base commit|does not match the prior attempt's head|has uncommitted changes|has untracked files|contains residue from earlier attempts)/.exec(reason);
+  if (worktree !== null) {
+    return WORKTREE_REFUSAL_DETAILS[worktree[1]!] ?? 'other';
+  }
+  if (reason.startsWith('No active capacity reservation')) {
+    return 'no-reservation';
+  }
+  if (reason.includes('is not the configured runner host')) {
+    return 'reservation-host-mismatch';
+  }
+  if (reason.includes('does not match the path allocated by the capacity reservation')) {
+    return 'reservation-worktree-mismatch';
+  }
+  if (reason.startsWith('Runner capabilities do not satisfy')) {
+    return 'capabilities-missing';
+  }
+  if (reason.endsWith('a fix attempt starts only after it is collected or cancelled')) {
+    return 'prior-not-settled';
+  }
+  if (reason.startsWith('Prior attempt not found')) {
+    return 'prior-not-found';
+  }
+  if (reason.startsWith('Prior attempt ') && reason.endsWith('is collected but has no sealed head commit')) {
+    return 'prior-head-missing';
+  }
+  if (reason.startsWith('Work order not found')) {
+    return 'work-order-missing';
+  }
+  if (reason === 'runner-not-available' || reason.startsWith('No runner port can be described')) {
+    return 'runner-unavailable';
+  }
+  return 'other';
+}
+
+const WORKTREE_REFUSAL_DETAILS: Readonly<Record<string, string>> = {
+  'does not match the base commit': 'worktree-head-mismatch',
+  "does not match the prior attempt's head": 'worktree-head-mismatch',
+  'has uncommitted changes': 'worktree-uncommitted',
+  'has untracked files': 'worktree-untracked',
+  'contains residue from earlier attempts': 'worktree-residue',
+};
+
+/**
  * The `act dispatch` decision (K4-5): start the prepared attempt through
  * `DispatchAttemptPort` with the frozen brief's limits, raising the round and
  * the seat cursor on the record before the call (§3.2, D8). The dispatch key
@@ -300,7 +352,12 @@ export async function performDispatch(ctx: AdvanceStepContext,
   } else {
     reasonCode = 'dispatch-refused';
   }
-  const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode);
+  // KF-16: the refused result journals a fixed detail code derived from the
+  // refusal text, for the dispatch-refused park and the runner-refused pivot
+  // alike.
+  const resultRefusal = await appendRunResult(
+    ctx, request, decision.key, 'refused', reasonCode, dispatchRefusalDetail(dispatched.reason),
+  );
   if (resultRefusal !== null) {
     return { outcome: 'refused', reason: resultRefusal };
   }

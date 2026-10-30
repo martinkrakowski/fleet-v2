@@ -633,8 +633,32 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     return refuse('prepare-refused');
   }
   const compute = ctx.deps.computeDigest ?? simpleDeterministicHexDigest;
-  if (compute(prose + '\n' + manifestRaw) !== prior.briefDigest) {
-    return refuse('prepare-refused');
+  // KF-28: the disk may hold a cancelled fix attempt's handover rather than
+  // the prior's own frozen brief — the cancelled attempt placed it over the
+  // prior's brief before its dispatch was refused. The on-disk digest is
+  // trusted when it equals the prior's recorded digest, or the `briefDigest`
+  // of a cancelled fix attempt in this run whose `priorAttemptId` names the
+  // prior (the handover that attempt placed). Anything else is untrusted
+  // lane text and refuses.
+  let trustedHandover: AttemptRecord | null = null;
+  const onDiskDigest = compute(prose + '\n' + manifestRaw);
+  if (onDiskDigest !== prior.briefDigest) {
+    for (let index = gathered.attemptRecords.length - 1; index >= 0; index -= 1) {
+      const candidate = gathered.attemptRecords[index];
+      if (
+        candidate !== null &&
+        candidate.kind === 'fix' &&
+        candidate.state === 'cancelled' &&
+        candidate.priorAttemptId === prior.id &&
+        onDiskDigest === candidate.briefDigest
+      ) {
+        trustedHandover = candidate;
+        break;
+      }
+    }
+    if (trustedHandover === null) {
+      return refuse('prepare-refused');
+    }
   }
   let manifest: Record<string, unknown>;
   try {
@@ -677,8 +701,11 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   }
   const proofCommands: readonly (readonly string[])[] = spec.value.getCommands().map((command) => command.argv);
   // Round 1 carries the prose verbatim; round 2 extracts the previous
-  // handover's original section.
-  const originalBrief = prior.kind === 'fix' ? originalBriefOf(prose) : prose;
+  // handover's original section. KF-28: when the verified prose is a
+  // cancelled fix attempt's handover, it is a handover too — the original
+  // brief is extracted from it even though the prior itself is not a fix
+  // attempt.
+  const originalBrief = trustedHandover === null && prior.kind !== 'fix' ? prose : originalBriefOf(prose);
   if (originalBrief === null) {
     return refuse('prepare-refused');
   }

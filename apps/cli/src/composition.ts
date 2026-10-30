@@ -20,6 +20,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
+import { RunnerTunnelAdapter } from './runner-tunnel.js';
 import { composeCoordination } from './composition/coordination.js';
 import { composeKnowledge } from './composition/knowledge.js';
 import { composeEvidence } from './composition/evidence.js';
@@ -670,6 +671,12 @@ export interface FleetCliRuntime {
     /** The auto-merge setting read once at composition; a toggle takes a restart (K6-8). */
     readonly autoMergeEnabled: boolean;
   };
+  /**
+   * KF-35: the runner tunnel the conductor driver holds for its lifetime,
+   * resolved from the same `OCM_HOST`/`OCM_REMOTE_PORT` environment
+   * `bin/ocm-run` itself reads. Absent values mean the driver opens nothing.
+   */
+  readonly runnerTunnel: RunnerTunnelAdapter;
   readonly telemetry: {
     /** Telemetry's own read-only receipt read (OT2b); OT2c/OT4b consume it. */
     readonly acceptanceReceiptRead: AcceptanceReceiptReadAdapter;
@@ -892,6 +899,18 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     env: process.env,
   });
 
+  // KF-35: the driver's one runner tunnel, resolved from the same
+  // OCM_HOST/OCM_REMOTE_PORT environment bin/ocm-run reads. Nothing is
+  // spawned here; the conductor driver opens the forward before its first
+  // pass and stops it in the same finally that releases its leases.
+  const parsedTunnelPort = process.env.OCM_REMOTE_PORT
+    ? Number(process.env.OCM_REMOTE_PORT)
+    : Number.NaN;
+  const runnerTunnel = new RunnerTunnelAdapter({
+    sshHost: process.env.OCM_HOST?.trim() || undefined,
+    remotePort: Number.isSafeInteger(parsedTunnelPort) ? parsedTunnelPort : undefined,
+  });
+
   return {
     installation: options?.installation,
     coordination,
@@ -899,6 +918,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     evidence,
     execution,
     conductor,
+    runnerTunnel,
     telemetry,
   };
 }

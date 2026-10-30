@@ -74,5 +74,33 @@ if flock -n "$T/fleet-v2-gate-slot.1" true; then bad 'the slot is held while the
 wait "$holder" 2>/dev/null
 holder=''
 
+# The wait is bounded: with every slot held past the limit the script exits 75 with the fixed
+# line and never runs the command; a slot that frees within the limit still runs it unchanged.
+for v in x 0 00 05; do
+  run env FLEET_V2_GATE_WAIT_MAX_SECONDS=$v sh "$SCRIPT" true >/dev/null 2>&1
+  [ $? -eq 2 ] && ok "wait limit '$v' refused" || bad "wait limit '$v' refused"
+done
+: > "$T/fleet-v2-gate-slot.1"
+flock "$T/fleet-v2-gate-slot.1" sleep 6 &
+holder=$!
+sleep 0.5 2>/dev/null || sleep 1
+rm -f "$T/ran"
+run env FLEET_V2_GATE_SLOTS=1 FLEET_V2_GATE_WAIT_MAX_SECONDS=2 sh "$SCRIPT" touch "$T/ran" 2>"$T/err"
+rc=$?
+if [ $rc -eq 75 ] && [ ! -e "$T/ran" ] && [ "$(cat "$T/err")" = 'gate-slot: no slot within the wait limit' ]; then
+  ok 'a full host past the wait limit exits 75 with the fixed line and runs nothing'
+else
+  bad "a full host past the wait limit exits 75 with the fixed line and runs nothing (rc $rc)"
+fi
+wait "$holder" 2>/dev/null
+holder=''
+flock "$T/fleet-v2-gate-slot.1" sleep 2 &
+holder=$!
+sleep 0.5 2>/dev/null || sleep 1
+run env FLEET_V2_GATE_SLOTS=1 FLEET_V2_GATE_WAIT_MAX_SECONDS=10 sh "$SCRIPT" sh -c 'exit 7' >/dev/null 2>&1
+[ $? -eq 7 ] && ok 'a slot freed within the wait limit runs the command, exit code unchanged' || bad 'a slot freed within the wait limit runs the command, exit code unchanged'
+wait "$holder" 2>/dev/null
+holder=''
+
 [ "$fails" -eq 0 ] && echo 'gate-slot: all tests passed' || echo "gate-slot: $fails failure(s)"
 [ "$fails" -eq 0 ]

@@ -1584,6 +1584,57 @@ describe('AdvanceLaneRunUseCase dispatch seat override (KF-18)', () => {
     });
   });
 
+  it('q1) a fix seat with no variant dispatches with variant default when the assignment sets one (KF-26)', async () => {
+    // The prior's recorded digest seals the frozen manifest, so the variant
+    // assignment is baked into the prior before the harness reads it back.
+    const manifestWithVariant = JSON.parse(FULL_MANIFEST_JSON) as Record<string, unknown>;
+    (manifestWithVariant['modelAssignment'] as Record<string, unknown>)['variant'] = 'low';
+    const manifestWithVariantJson = JSON.stringify(manifestWithVariant);
+    const prior = {
+      ...collectedAttempt(),
+      briefDigest: simpleDeterministicHexDigest(DEFAULT_PROSE + '\n' + manifestWithVariantJson),
+    };
+    const harness = await makeHarness(runRecord(), [prior]);
+    harness.setManifest(manifestWithVariantJson);
+    await prepareAndDispatchFixWith(harness, {});
+    expect(harness.dispatchRequests).toHaveLength(1);
+    expect(harness.dispatchRequests[0]?.seatOverride).toMatchObject({
+      model: 'fix-model-1',
+      variant: 'default',
+      reason: 'fix seat fx-1',
+      setBy: 'conductor',
+    });
+  });
+
+  it('q2) a fix seat with its own variant dispatches with that variant (KF-26)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    const variantPlan = {
+      version: 1 as const,
+      'first-pass': [{ id: 'fp-1', model: 'model-example-1', tool: 'opencode' }],
+      fix: [{ id: 'fx-1', model: 'fix-model-1', tool: 'opencode', variant: 'low' }],
+      review: [{ id: 'rev-1', model: 'review-model-1', tool: 'opencode' }],
+    };
+    await prepareAndDispatchFixWith(harness, {
+      seatPlan: variantPlan,
+      seatSelection: {
+        role: 'fix',
+        seatIndex: 0,
+        seatId: 'fx-1',
+        model: 'fix-model-1',
+        tool: 'opencode',
+        variant: 'low',
+        agent: null,
+      },
+    });
+    expect(harness.dispatchRequests).toHaveLength(1);
+    expect(harness.dispatchRequests[0]?.seatOverride).toMatchObject({
+      model: 'fix-model-1',
+      variant: 'low',
+      reason: 'fix seat fx-1',
+      setBy: 'conductor',
+    });
+  });
+
   it('r) an initial pivot attempt still dispatches with the seat-plan pivot override (KF-18)', async () => {
     const pivotAttempt: AttemptRecord = {
       ...collectedAttempt(),
@@ -1607,6 +1658,8 @@ describe('AdvanceLaneRunUseCase dispatch seat override (KF-18)', () => {
       reason: 'seat-plan pivot to fp-1',
       setBy: 'conductor',
     });
+    // A pivot (initial attempt) is unchanged: no variant override is added.
+    expect(harness.dispatchRequests[0]?.seatOverride?.variant).toBeUndefined();
   });
 
   it('s) a first attempt dispatches without a seat override (KF-18)', async () => {
@@ -1754,10 +1807,10 @@ describe('fixSeatForDispatch names a fix seat only when an override can express 
       kind: 'refused', detail: 'seat-not-expressible',
     });
   });
-  it('refuses a fix seat with no variant when the assignment sets one', () => {
-    expect(fixSeatForDispatch(fixAttempt(2), manifest({ model: 'model-example-1', variant: 'high' }))).toEqual({
-      kind: 'refused', detail: 'seat-not-expressible',
-    });
+  it('names a fix seat with no variant when the assignment sets one: the override carries variant default (KF-26)', () => {
+    const result = fixSeatForDispatch(fixAttempt(2), manifest({ model: 'model-example-1', variant: 'high' }));
+    expect(result).toMatchObject({ kind: 'seat', overrideVariant: 'default' });
+    expect((result as { seat: { variant: string | null } }).seat.variant).toBeNull();
   });
   it('refuses a fix attempt whose selection is not a fix seat (no first-pass fallback)', () => {
     const attempt = fixAttempt(0);

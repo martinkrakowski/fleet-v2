@@ -213,7 +213,7 @@ const WORKTREE_REFUSAL_DETAILS: Readonly<Record<string, string>> = {
 /** KF-18: a fix attempt's own seat, checked against its frozen plan and what an override can express. */
 type FixSeatForDispatch =
   | { readonly kind: 'none' }
-  | { readonly kind: 'seat'; readonly seat: AttemptSeatSelectionRecord }
+  | { readonly kind: 'seat'; readonly seat: AttemptSeatSelectionRecord; readonly overrideVariant?: 'default' }
   | { readonly kind: 'refused'; readonly detail: 'seat-not-in-plan' | 'seat-not-expressible' };
 
 function isUnsetVariant(value: string | null | undefined): boolean {
@@ -253,7 +253,9 @@ export function fixSeatForDispatch(
   }
   // The override carries model, agent and variant only: the frozen
   // assignment's tool is the one dispatched, and an unset override field
-  // inherits the assignment's value. Such a seat cannot be named exactly.
+  // inherits the assignment's value. A seat whose variant is unset while the
+  // assignment sets one is still nameable: the override carries
+  // `variant: 'default'` explicitly (KF-26).
   const raw = manifest?.['modelAssignment'];
   const assignment = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const assignmentTool = typeof assignment['seatTool'] === 'string' && assignment['seatTool'].trim() !== ''
@@ -264,12 +266,16 @@ export function fixSeatForDispatch(
   const seatTool = (selection.tool ?? '').trim() === '' ? 'opencode' : (selection.tool as string).trim();
   if (
     seatTool !== assignmentTool ||
-    ((selection.agent ?? '').trim() === '' && assignmentAgent !== '') ||
-    (isUnsetVariant(selection.variant) && !isUnsetVariant(assignmentVariant))
+    ((selection.agent ?? '').trim() === '' && assignmentAgent !== '')
   ) {
     return { kind: 'refused', detail: 'seat-not-expressible' };
   }
-  return { kind: 'seat', seat: selection };
+  // KF-26: a fix seat whose variant is unset while the assignment sets one is
+  // still expressible — the override carries `variant: 'default'` explicitly,
+  // so the seat runs with no variant instead of inheriting the assignment's.
+  const overrideVariant: 'default' | undefined =
+    isUnsetVariant(selection.variant) && !isUnsetVariant(assignmentVariant) ? 'default' : undefined;
+  return { kind: 'seat', seat: selection, ...(overrideVariant !== undefined ? { overrideVariant } : {}) };
 }
 
 /**
@@ -333,9 +339,9 @@ export async function performDispatch(ctx: AdvanceStepContext,
   // override; the seat-plan pivot keeps its override; a first attempt and a
   // fix attempt with no selection carry none. A fix seat the override cannot
   // name exactly (not the frozen plan's fix seat at its index, another tool
-  // than the frozen assignment's, or an agent/variant left unset where the
-  // assignment sets one) never dispatches: it refuses and parks with a fixed
-  // detail, never a guessed or inherited seat field.
+  // than the frozen assignment's, or an agent left unset where the assignment
+  // sets one) never dispatches: it refuses and parks with a fixed detail,
+  // never a guessed or inherited seat field.
   const fixSeat = fixSeatForDispatch(latest, manifest);
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, latest.id);
   if (intentRefusal !== null) {
@@ -394,6 +400,7 @@ export async function performDispatch(ctx: AdvanceStepContext,
           model: seatForOverride.model,
           ...(seatForOverride.agent !== null ? { agent: seatForOverride.agent } : {}),
           ...(seatForOverride.variant !== null ? { variant: seatForOverride.variant } : {}),
+          ...(fixSeat.kind === 'seat' && fixSeat.overrideVariant !== undefined ? { variant: fixSeat.overrideVariant } : {}),
           reason:
             latest.kind === 'fix'
               ? 'fix seat ' + seatForOverride.seatId

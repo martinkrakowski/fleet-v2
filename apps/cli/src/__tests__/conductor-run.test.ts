@@ -492,6 +492,73 @@ describe('conductor start (K7-7)', () => {
     expect(fake.startCalls[0]).toMatchObject({ runId: RUN_ID, attemptId: retryAttemptId });
   });
 
+  it('--max-active-runs reaches the driver builder and the default is 1', async () => {
+    const dir = tempStateDir();
+    const briefPath = writeBriefRequest(dir, briefFixture());
+    const fake = makeFakeDriver({ enabled: true });
+    const seen: ReadonlyArray<{ readonly maxActiveRuns: number }>[] = [];
+    const options = {
+      stateDir: dir,
+      buildDriver: (_runtime: FleetCliRuntime, _mode: 'live' | 'dry-run', driverOptions: { readonly maxActiveRuns: number }) => {
+        seen.push([driverOptions]);
+        return fake.driver;
+      },
+    };
+    expect(
+      (
+        await runConductor(
+          runtimeOf(dir),
+          ['start', '--brief-request', briefPath, '--tier', '2', '--max-active-runs', '2'],
+          options,
+        )
+      ).code,
+    ).toBe(0);
+    expect(seen).toEqual([[{ maxActiveRuns: 2 }]]);
+    seen.length = 0;
+    expect(
+      (await runConductor(runtimeOf(dir), ['start', '--brief-request', briefPath, '--tier', '2'], options)).code,
+    ).toBe(0);
+    expect(seen).toEqual([[{ maxActiveRuns: 1 }]]);
+  });
+
+  it('--max-active-runs 0, 65, x and a repeated flag are usage errors', async () => {
+    const dir = tempStateDir();
+    const briefPath = writeBriefRequest(dir, briefFixture());
+    const fake = makeFakeDriver({ enabled: true });
+    const options = { stateDir: dir, buildDriver: () => fake.driver };
+    for (const value of ['0', '65', 'x']) {
+      expect(
+        (
+          await runConductor(
+            runtimeOf(dir),
+            ['start', '--brief-request', briefPath, '--tier', '2', '--max-active-runs', value],
+            options,
+          )
+        ).code,
+      ).toBe(2);
+    }
+    expect(
+      (
+        await runConductor(
+          runtimeOf(dir),
+          [
+            'start',
+            '--brief-request',
+            briefPath,
+            '--tier',
+            '2',
+            '--max-active-runs',
+            '2',
+            '--max-active-runs',
+            '2',
+          ],
+          options,
+        )
+      ).code,
+    ).toBe(2);
+    expect(fake.startCalls).toHaveLength(0);
+  });
+
   it('--abandon reaches abandonStart with both ids and exits 0', async () => {
     const dir = tempStateDir();
     const fake = makeFakeDriver({ enabled: false });

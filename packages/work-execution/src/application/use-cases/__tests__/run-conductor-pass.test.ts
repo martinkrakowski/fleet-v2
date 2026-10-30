@@ -686,6 +686,42 @@ describe('RunConductorPassUseCase dispatch stagger', () => {
     expect(fake.calls).toEqual([]);
   });
 
+  it('after the stagger the next run decides its lease on fresh time: a lease that expired during the pause is taken', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    await fx.repo.acquireLease(RUN_ID_2, {
+      holderId: HOLDER_2,
+      observedFence: 0,
+      leaseUntilIso: SOON,
+      nowIso: NOW,
+    });
+    const advance = new ScriptedAdvance(
+      new Map([
+        [RUN_ID, [dispatchStarted(RUN_ID), { outcome: 'waiting', reason: 'admission' }]],
+        [RUN_ID_2, [{ outcome: 'waiting', reason: 'admission' }]],
+      ]),
+    );
+    let clock = NOW;
+    const pass = new RunConductorPassUseCase({
+      driverLease: fx.driverLease,
+      runRepo: fx.repo,
+      runJournal: fx.journal,
+      halt: fx.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: () => clock,
+      sleep: async () => {
+        clock = LATER;
+      },
+    });
+    const result = await pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed' });
+    if (result.outcome !== 'completed') return;
+    expect(result.runs.map((run) => run.outcome)).toEqual(['advanced', 'advanced']);
+    expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID_2]);
+  });
+
   it('a custom dispatchStaggerMs is honoured', async () => {
     const fx = stores();
     await createRun(fx.repo);

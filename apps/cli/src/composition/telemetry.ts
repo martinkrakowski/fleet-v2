@@ -62,7 +62,7 @@ function isValidSalt(salt: string): boolean {
 }
 
 function policyView(policy: ResolvedTelemetryPolicy): TelemetryPolicyView {
-  return {
+  return Object.freeze({
     enabled: policy.enabled,
     projectName: policy.projectName,
     route: policy.route,
@@ -70,7 +70,7 @@ function policyView(policy: ResolvedTelemetryPolicy): TelemetryPolicyView {
     sendCost: policy.sendCost,
     includeDryRun: policy.includeDryRun,
     projectAliases: policy.projectAliases,
-  };
+  });
 }
 
 export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOptions) {

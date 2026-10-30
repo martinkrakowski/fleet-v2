@@ -366,6 +366,18 @@ async function makeHarness(
     admission: {
       admit: async () => ({ outcome: 'admitted' }),
     },
+    // KF-22b: the merge act never touches the acceptance port (the merge facts
+    // come from journal rows and the full assessment path). A fake that throws
+    // on either method pins that: if the merge ever called it, every merge
+    // test here would fail loudly.
+    acceptanceAssessment: {
+      assessHeadAcceptance: async () => {
+        throw new Error('assessHeadAcceptance must not be called during merge');
+      },
+      assessHeadReceipts: async () => {
+        throw new Error('assessHeadReceipts must not be called during merge');
+      },
+    },
     newUlid: makeUlidMinter(),
     autoMergeEnabled,
     ...(options.wireAutoMerge === false

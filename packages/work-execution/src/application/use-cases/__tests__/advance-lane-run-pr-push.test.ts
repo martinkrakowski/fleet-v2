@@ -16,6 +16,7 @@ import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import type {
   AcceptanceAssessmentResult,
+  AcceptanceReceiptsResult,
 } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
 import type {
   ConductorForgeGrantRequest,
@@ -47,7 +48,7 @@ const PROJECT_ID = 'project-example';
 const WORK_ORDER_ID = 'wo-example-1';
 const GRANT_ID = 'grant-conductor-example-1';
 const DECISION_REVISION = 'policy:conductor@0123456789ab';
-const RECEIPT_ID = 'receipt-example-1';
+const RECEIPT_ID = 'rcp-example-1';
 const FORGE_REASON = 'forge smoke example 1';
 const HARD_TO_UNDO = 'hard-to-undo text example 1';
 const ASSUMPTIONS = 'assumptions text example 1';
@@ -231,6 +232,7 @@ interface Harness {
   readonly deps: AdvanceLaneRunDependencies;
   setManifest(json: string | null): void;
   setAcceptanceAnswer(answer: AcceptanceAssessmentResult | 'throw'): void;
+  setReceiptsAnswer(answer: AcceptanceReceiptsResult | 'throw'): void;
   setGrantAnswer(answer: ConductorForgeGrantResult | 'throw'): void;
   setForgeAnswer(answer: ExecuteAuthorizedForgeActionResult | 'throw'): void;
   setForgeReadAnswer(answer: ReadPullRequestResult | 'throw'): void;
@@ -279,6 +281,11 @@ async function makeHarness(
   let acceptanceAnswer: AcceptanceAssessmentResult | 'throw' = {
     outcome: 'accepted',
     receiptId: RECEIPT_ID,
+    assessedHeadSha: COMMIT,
+  };
+  let receiptsAnswer: AcceptanceReceiptsResult | 'throw' = {
+    outcome: 'passed',
+    receiptsId: RECEIPT_ID,
     assessedHeadSha: COMMIT,
   };
   let grantAnswer: ConductorForgeGrantResult | 'throw' = {
@@ -342,6 +349,13 @@ async function makeHarness(
                 throw new Error('assessment unavailable');
               }
               return acceptanceAnswer;
+            },
+            assessHeadReceipts: async (_request) => {
+              portCalls.push('receipts');
+              if (receiptsAnswer === 'throw') {
+                throw new Error('receipts assessment unavailable');
+              }
+              return receiptsAnswer;
             },
           },
         }),
@@ -416,6 +430,9 @@ async function makeHarness(
     },
     setAcceptanceAnswer: (answer) => {
       acceptanceAnswer = answer;
+    },
+    setReceiptsAnswer: (answer) => {
+      receiptsAnswer = answer;
     },
     setGrantAnswer: (answer) => {
       grantAnswer = answer;
@@ -537,6 +554,22 @@ describe('AdvanceLaneRunUseCase open-pr act (K6-6)', () => {
     const entries = await harness.runJournal.listForRun(RUN_ID);
     expect(entries.some((entry) => entry.kind === 'result' && entry.key === openPrKey() && entry.outcome === 'completed' && entry.reasonCode === 'pr-opened')).toBe(true);
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'watching-ci' });
+  });
+
+  it('test 1c: the push grant carries the receipts-only rcp id and assessHeadAcceptance is never called (KF-22b)', async () => {
+    const harness = await openingPrHarness();
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'completed',
+      reasonCode: 'pr-opened',
+    });
+    expect(harness.grantRequests).toHaveLength(1);
+    expect(harness.grantRequests[0]).toMatchObject({ acceptanceReceiptId: RECEIPT_ID });
+    expect(RECEIPT_ID.startsWith('rcp-')).toBe(true);
+    expect(harness.portCalls).toContain('receipts');
+    expect(harness.portCalls).not.toContain('acceptance');
   });
 
   it('test 2: missing frozen prNotes refuses forge-refused with no grant and no forge call, then the next advance parks step-refused open-pr', async () => {

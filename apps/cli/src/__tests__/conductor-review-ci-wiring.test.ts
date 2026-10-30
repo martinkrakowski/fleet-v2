@@ -3,11 +3,15 @@
 // state dir (in-memory), no reviewer seat (nothing spawns), no forge reached
 // except through the stub gh runner in forge mode github.
 
+import { promises as fs } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import type { FleetInstallation, ForgeSectionV2 } from '@fleet/installation';
 import { requireValidInstallationModel } from '@fleet/installation';
 import type { EvidenceAssessmentRecord } from '@fleet/evidence-and-acceptance';
+import type { AttemptRecord } from '@fleet/work-execution';
 
 import { assessmentIdForAttempt, createFleetCliRuntime } from '../composition.js';
 import { buildLiveConductorDriver, conductorGateOf } from '../conductor-wiring.js';
@@ -385,5 +389,149 @@ describe('conductor acceptance-to-merge wiring (K6-8)', () => {
     expect(driver.policy).toBeDefined();
     // Building objects only: the injected gh runner (the only forge transport) recorded no call.
     expect(calls).toEqual([]);
+  });
+});
+
+describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
+  /** A pending evidence assessment with a completed typecheck receipt and a passing independent review. */
+  function pendingAssessment(attemptId: string, headSha: string): EvidenceAssessmentRecord {
+    const id = assessmentIdForAttempt(attemptId);
+    return {
+      id,
+      projectId: 'project-1',
+      attemptId,
+      candidateHeadSha: headSha,
+      policyRevision: 'policy-v1',
+      implementerModel: 'openrouter/openai/gpt-4o',
+      state: 'pending',
+      revision: 1,
+      requiredChecks: ['typecheck'],
+      verificationReceipts: [
+        {
+          id: `vr-${attemptId}`,
+          assessmentId: id,
+          projectId: 'project-1',
+          attemptId,
+          candidateHeadSha: headSha,
+          hostId: 'host-1',
+          procedureName: 'typecheck',
+          result: 'pass',
+          exitCode: 0,
+          evidenceRef: `seed@${headSha}`,
+          policyRevision: 'policy-v1',
+          completedAtIso: '2026-10-15T08:00:00.000Z',
+        },
+      ],
+      reviewReceipts: [
+        {
+          id: `rr-${attemptId}`,
+          assessmentId: id,
+          projectId: 'project-1',
+          attemptId,
+          candidateHeadSha: headSha,
+          reviewerModel: 'openrouter/anthropic/claude-3.5-sonnet',
+          implementerModel: 'openrouter/openai/gpt-4o',
+          readOnlyVerified: true,
+          result: 'pass',
+          findings: [],
+          evidenceRef: `review-seed@${headSha}`,
+          policyRevision: 'policy-v1',
+          completedAtIso: '2026-10-15T09:00:00.000Z',
+        },
+      ],
+      findingDispositions: [],
+      acceptanceReceiptId: null,
+      blockers: [],
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+  }
+
+  /** A collected attempt with no owner-decision doors at the given head. */
+  function collectedAttempt(attemptId: string, headSha: string): AttemptRecord {
+    return {
+      id: attemptId,
+      workOrderId: `wo-${attemptId}`,
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      state: 'collected',
+      outcome: 'done',
+      baseCommit: 'base-sha',
+      worktreePath: '/tmp/worktree',
+      briefDigest: 'digest-1',
+      briefPackagePath: null,
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: {
+        headCommit: headSha,
+        commitsSinceBase: [headSha],
+        collectedArtifactPaths: [],
+        notes: 'present',
+      },
+      ownerDecisionReferences: [],
+      createdAtIso: '2026-10-15T09:00:00.000Z',
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+  }
+
+  const registryPath = (dir: string): string => path.join(dir, 'accepted-receipts.json');
+
+  it('a receipts pass returns passed with an rcp id and stores no acceptance (KF-22b)', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-cli-receipts-'));
+    try {
+      const runtime = createFleetCliRuntime({ stateDir: tempDir });
+      const receiptsAttempt = 'attempt-receipts';
+      const receiptsHead = 'head-sha-receipts';
+      const fullAttempt = 'attempt-full';
+      const fullHead = 'head-sha-full';
+      await runtime.evidence.evidenceAssessmentRepository.saveAssessment(pendingAssessment(receiptsAttempt, receiptsHead));
+      await runtime.execution.attemptRepository.saveAttempt(collectedAttempt(receiptsAttempt, receiptsHead));
+      await runtime.evidence.evidenceAssessmentRepository.saveAssessment(pendingAssessment(fullAttempt, fullHead));
+      await runtime.execution.attemptRepository.saveAttempt(collectedAttempt(fullAttempt, fullHead));
+
+      // The receipts-only pass returns passed and writes no acceptance: the
+      // registry file stays absent.
+      const receipts = await runtime.execution.acceptanceAssessment.assessHeadReceipts({
+        attemptId: receiptsAttempt,
+        workOrderId: 'wo-receipts',
+        candidateHeadSha: receiptsHead,
+        policyRevision: 'policy-v1',
+      });
+      expect(receipts).toEqual({
+        outcome: 'passed',
+        receiptsId: `rcp-${assessmentIdForAttempt(receiptsAttempt)}-${receiptsHead.slice(0, 8)}`,
+        assessedHeadSha: receiptsHead,
+      });
+      await expect(fs.access(registryPath(tempDir))).rejects.toThrow();
+
+      // The full acceptance path records its receipt…
+      const full = await runtime.execution.acceptanceAssessment.assessHeadAcceptance({
+        attemptId: fullAttempt,
+        workOrderId: 'wo-full',
+        candidateHeadSha: fullHead,
+        policyRevision: 'policy-v1',
+      });
+      expect(full.outcome).toBe('accepted');
+      const registry = JSON.parse(
+        await fs.readFile(registryPath(tempDir), 'utf8'),
+      ) as Record<string, string>;
+      expect(Object.keys(registry)).toEqual([fullHead]);
+      expect(registry[fullHead]).toBe(full.outcome === 'accepted' ? full.receiptId : '');
+
+      // …and a later receipts pass still leaves it unchanged.
+      const again = await runtime.execution.acceptanceAssessment.assessHeadReceipts({
+        attemptId: receiptsAttempt,
+        workOrderId: 'wo-receipts',
+        candidateHeadSha: receiptsHead,
+        policyRevision: 'policy-v1',
+      });
+      expect(again.outcome).toBe('passed');
+      const unchanged = JSON.parse(
+        await fs.readFile(registryPath(tempDir), 'utf8'),
+      ) as Record<string, string>;
+      expect(Object.keys(unchanged)).toEqual([fullHead]);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
   });
 });

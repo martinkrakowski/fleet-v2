@@ -217,6 +217,10 @@ class FakeAcceptanceAssessment implements AcceptanceAssessmentPort {
     this.requests.push(request);
     return this.result;
   }
+
+  async assessHeadReceipts(): Promise<never> {
+    throw new Error('assessHeadReceipts is not used by this test');
+  }
 }
 
 class FakeActionAuthorization implements ActionAuthorizationPort {

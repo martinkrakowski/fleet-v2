@@ -14,6 +14,7 @@ import type {
   AcceptanceAssessmentPort,
   AcceptanceAssessmentRequest,
   AcceptanceAssessmentResult,
+  AcceptanceReceiptsResult,
 } from '../../application/ports/out/AcceptanceAssessmentPort.out-port.js';
 
 /** Supplier-side delegate; the composition root binds the real use case. */
@@ -21,6 +22,9 @@ export interface AcceptanceAssessmentDelegate {
   readonly assess?: (
     request: AcceptanceAssessmentRequest,
   ) => Promise<AcceptanceAssessmentResult>;
+  readonly assessReceipts?: (
+    request: AcceptanceAssessmentRequest,
+  ) => Promise<AcceptanceReceiptsResult>;
 }
 
 export class AcceptanceAssessmentAdapter implements AcceptanceAssessmentPort {
@@ -37,5 +41,14 @@ export class AcceptanceAssessmentAdapter implements AcceptanceAssessmentPort {
       throw new Error('Not implemented: AcceptanceAssessmentAdapter.assessHeadAcceptance');
     }
     return this.delegate.assess(request);
+  }
+
+  async assessHeadReceipts(
+    request: AcceptanceAssessmentRequest,
+  ): Promise<AcceptanceReceiptsResult> {
+    if (!this.delegate?.assessReceipts) {
+      throw new Error('Not implemented: AcceptanceAssessmentAdapter.assessHeadReceipts');
+    }
+    return this.delegate.assessReceipts(request);
   }
 }

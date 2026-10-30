@@ -420,6 +420,18 @@ export function createDryRunFakes(
         assessedHeadSha: request.candidateHeadSha,
       };
     },
+    // The conductor's pre-PR accept and push grant use the receipts-only
+    // assessment; the dry-run answers passed so the simulated lane still
+    // accepts and opens/pushes.
+    assessHeadReceipts: (request) => {
+      recordCall('acceptanceAssessment', request);
+      acceptanceSequence += 1;
+      return Promise.resolve({
+        outcome: 'passed' as const,
+        receiptsId: 'rcp-dry-run-' + String(acceptanceSequence),
+        assessedHeadSha: request.candidateHeadSha,
+      });
+    },
   };
 
   const ciState: CiStatePort = {

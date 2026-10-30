@@ -322,6 +322,7 @@ describe('free-seat policy and requested reviewer (FS3b)', () => {
     reviewer.runIndependentReview = async () => ({
       outcome: 'unavailable',
       reason: 'seat is busy',
+      code: 'transport-failed',
     });
     const archive = new StubArchive();
     const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });
@@ -372,6 +373,7 @@ describe('free-seat policy and requested reviewer (FS3b)', () => {
     reviewer.runIndependentReview = async () => ({
       outcome: 'unavailable',
       reason: 'seat is busy',
+      code: 'transport-failed',
     });
     const archive = new StubArchive();
     const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });

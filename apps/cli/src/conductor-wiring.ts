@@ -55,17 +55,24 @@ export function laneRunnerCandidateHosts(
   for (const name of Object.keys(installation.hosts)) {
     const host = installation.hosts[name];
     if (!host.roles?.includes('lane-runner') || host.runner === undefined) continue;
+    // KF-14b: a remote review route needs `runner.authFile` over ssh (a
+    // deliberate rule of `AttemptReviewLocator.routeFor`); an ssh host
+    // without one is marked so the start refuses it before any run.
+    const transport = host.transport === 'ssh' ? 'ssh' : 'local';
+    const authFile = host.runner.authFile?.trim() ?? '';
+    const reviewRoute = transport === 'ssh' && authFile === '' ? 'no-auth-file' : 'available';
     candidates.push({
       name,
       kind: host.runner.kind,
-      transport: host.transport === 'ssh' ? 'ssh' : 'local',
+      transport,
       sshAlias:
-        host.transport === 'ssh' && host.sshAlias !== undefined && host.sshAlias.trim() !== ''
+        transport === 'ssh' && host.sshAlias !== undefined && host.sshAlias.trim() !== ''
           ? host.sshAlias
           : null,
       port: typeof host.runner.port === 'number' ? host.runner.port : null,
       maxLanes: host.runner.maxLanes,
       worktreeRoot: host.worktreeRoot,
+      reviewRoute,
     });
   }
   return candidates;

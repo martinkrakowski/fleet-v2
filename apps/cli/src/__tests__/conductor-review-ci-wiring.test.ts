@@ -183,7 +183,7 @@ describe('conductor review and CI wiring (PC-4)', () => {
     const runtime = createFleetCliRuntime();
     await expect(
       runtime.conductor.reviewRequest.requestReview(makeReviewRequest(REQUEST_ID)),
-    ).resolves.toEqual({ outcome: 'refused', reason: 'no-assessment' });
+    ).resolves.toEqual({ outcome: 'refused', reason: 'no-assessment', detail: null });
   });
 
   it('a request with no reviewer seat records no receipt (review-unavailable)', async () => {
@@ -191,7 +191,11 @@ describe('conductor review and CI wiring (PC-4)', () => {
     await runtime.evidence.evidenceAssessmentRepository.saveAssessment(makeAssessment(false));
     await expect(
       runtime.conductor.reviewRequest.requestReview(makeReviewRequest(REQUEST_ID)),
-    ).resolves.toEqual({ outcome: 'no-receipt', reason: 'review-unavailable' });
+    ).resolves.toEqual({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: 'transport-missing',
+    });
     const assessment = await runtime.evidence.evidenceAssessmentRepository.findAssessmentById(
       assessmentIdForAttempt(ATTEMPT_ID),
     );

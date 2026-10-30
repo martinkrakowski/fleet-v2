@@ -199,6 +199,95 @@ describe('ReviewTransportRouter', () => {
     expect(spawnCalled).toBe(false);
   });
 
+  it('the three seat refusals carry their fixed codes', async () => {
+    const routerNoSeat = createReviewTransportRouter({
+      seats: SEATS,
+      chains: CHAINS,
+      locate: async () =>
+        fixtureLocation(
+          { kind: 'installation', remotePort: 46000, remoteHost: '' },
+          BASE_REQUEST.candidateHeadSha,
+        ),
+      ocmRunBin: '/bundled/bin/ocm-run',
+    });
+    await expect(
+      routerNoSeat({ ...BASE_REQUEST, reviewerModel: 'example-provider/no-such-model' }),
+    ).rejects.toMatchObject({ code: 'seat-none' });
+
+    const duplicateSeats: readonly ReviewTransportSeat[] = [
+      { ...REVIEWER_SEAT, model: 'example-provider/shared' },
+      { ...HIGH_RISK_SEAT, model: 'example-provider/shared' },
+    ];
+    const routerAmbiguous = createReviewTransportRouter({
+      seats: duplicateSeats,
+      chains: CHAINS,
+      locate: async () =>
+        fixtureLocation(
+          { kind: 'installation', remotePort: 46000, remoteHost: '' },
+          BASE_REQUEST.candidateHeadSha,
+        ),
+      ocmRunBin: '/bundled/bin/ocm-run',
+    });
+    await expect(
+      routerAmbiguous({ ...BASE_REQUEST, reviewerModel: 'example-provider/shared' }),
+    ).rejects.toMatchObject({ code: 'seat-ambiguous' });
+
+    const implementerReviewerSeat: ReviewTransportSeat = {
+      ...REVIEWER_SEAT,
+      roles: ['reviewer', 'implementer'],
+    };
+    const routerImplementer = createReviewTransportRouter({
+      seats: [implementerReviewerSeat],
+      chains: { reviewer: [{ seatId: 'reviewer' }] },
+      locate: async () =>
+        fixtureLocation(
+          { kind: 'installation', remotePort: 46000, remoteHost: '' },
+          BASE_REQUEST.candidateHeadSha,
+        ),
+      ocmRunBin: '/bundled/bin/ocm-run',
+    });
+    await expect(routerImplementer(BASE_REQUEST)).rejects.toMatchObject({ code: 'seat-implementer' });
+  });
+
+  it('the two tool refusals carry their fixed codes', async () => {
+    const unknownSeat: ReviewTransportSeat = {
+      id: 'reviewer',
+      tool: 'example-unknown-tool',
+      model: REVIEWER_SEAT.model,
+      roles: ['reviewer'],
+    };
+    const routerTool = createReviewTransportRouter({
+      seats: [unknownSeat],
+      chains: { reviewer: [{ seatId: 'reviewer' }] },
+      locate: async () =>
+        fixtureLocation(
+          { kind: 'installation', remotePort: 46000, remoteHost: '' },
+          BASE_REQUEST.candidateHeadSha,
+        ),
+      ocmRunBin: '/bundled/bin/ocm-run',
+    });
+    await expect(routerTool(BASE_REQUEST)).rejects.toMatchObject({ code: 'seat-tool-no-transport' });
+
+    const cliVariantSeat: ReviewTransportSeat = {
+      id: 'reviewer',
+      tool: 'grok',
+      model: REVIEWER_SEAT.model,
+      variant: 'fast',
+      roles: ['reviewer'],
+    };
+    const routerVariant = createReviewTransportRouter({
+      seats: [cliVariantSeat],
+      chains: { reviewer: [{ seatId: 'reviewer' }] },
+      locate: async () =>
+        fixtureLocation(
+          { kind: 'installation', remotePort: 46000, remoteHost: '' },
+          BASE_REQUEST.candidateHeadSha,
+        ),
+      ocmRunBin: '/bundled/bin/ocm-run',
+    });
+    await expect(routerVariant(BASE_REQUEST)).rejects.toMatchObject({ code: 'seat-variant-unsupported' });
+  });
+
   it('dispatches opencode over an installation local route with the expected argv and env', async () => {
     const recorded: Array<{
       file: string;

@@ -309,8 +309,11 @@ describe('TelemetryDispositionAdapter two writers on one state directory', () =>
   it('40 interleaved writes lose nothing, and every span carries its own writer’s final disposition', async () => {
     const spansA = Array.from({ length: 20 }, (_, index) => spanId(SPAN_PREFIX_A, index));
     const spansB = Array.from({ length: 20 }, (_, index) => spanId(SPAN_PREFIX_B, index));
-    const writerA = new TelemetryDispositionAdapter({ stateDir: tempDir });
-    const writerB = new TelemetryDispositionAdapter({ stateDir: tempDir });
+    // This test proves the merge loses nothing under contention, not the 500 ms
+    // give-up (the lock-busy test covers that): a long lock timeout keeps a slow
+    // CI host from turning a contended write into a skip (flaked on #435).
+    const writerA = new TelemetryDispositionAdapter({ stateDir: tempDir, lockTimeoutMs: 30_000 });
+    const writerB = new TelemetryDispositionAdapter({ stateDir: tempDir, lockTimeoutMs: 30_000 });
 
     // The plan's two-writer test: each writer issues its 20 pending marks and
     // then its 20 final marks as one deliberate sequential loop (no lock is

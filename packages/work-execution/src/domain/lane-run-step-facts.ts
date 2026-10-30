@@ -47,6 +47,7 @@ export function laneRunConductEntry(entryId: string, runId: string, state: LaneR
     mintedId: null,
     outcome: null,
     reasonCode: null,
+    detail: null,
     grantId: null,
     state,
   });
@@ -65,6 +66,7 @@ export function laneRunIntentEntry(entryId: string, runId: string, key: string, 
     mintedId,
     outcome: null,
     reasonCode: null,
+    detail: null,
     grantId: null,
     state: null,
   });
@@ -73,6 +75,7 @@ export function laneRunIntentEntry(entryId: string, runId: string, key: string, 
 export function laneRunResultEntry(
   entryId: string, runId: string, key: string, outcome: LaneRunJournalOutcome,
   reasonCode: LaneRunResultReasonCode | null, nowIso: string,
+  detail: string | null = null,
 ): LaneRunJournalEntryRecord {
   return Object.freeze({
     version: LANE_RUN_JOURNAL_ENTRY_VERSION,
@@ -86,6 +89,7 @@ export function laneRunResultEntry(
     mintedId: null,
     outcome,
     reasonCode,
+    detail,
     grantId: null,
     state: null,
   });

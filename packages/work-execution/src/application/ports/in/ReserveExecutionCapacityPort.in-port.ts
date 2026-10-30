@@ -23,7 +23,11 @@ export interface ReserveExecutionCapacityHost {
 /**
  * One lane-runner host offered to the reserve for selection (H9a2). The
  * reserve picks among these inside the journal's locked read-modify-write;
- * `maxLanes` defaults to 1 when absent.
+ * `maxLanes` defaults to 1 when absent. `reviewRoute` (KF-14b) says whether
+ * the host can carry a remote review route: `'no-auth-file'` marks an ssh
+ * host whose runner block declares no `runner.authFile` — such a host is
+ * never offered to the reserve (a run must never park
+ * `review-seat-unavailable` at brief-check). Absent means available.
  */
 export interface ReserveExecutionCapacityCandidateHost {
   readonly name: string;
@@ -33,6 +37,7 @@ export interface ReserveExecutionCapacityCandidateHost {
   readonly port: number | null;
   readonly maxLanes?: number;
   readonly worktreeRoot: string;
+  readonly reviewRoute?: 'available' | 'no-auth-file';
 }
 
 export interface ReserveExecutionCapacityRequest {

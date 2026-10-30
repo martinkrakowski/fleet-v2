@@ -11,11 +11,11 @@
  * router by `IndependentReviewAdapter` and `RequestIndependentReviewUseCase`.
  */
 
-import type { RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
+import type { ReviewUnavailableCode, RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
 import { CLI_REVIEW_ARGV_TEMPLATES, createCliReviewTransport } from './CliReviewTransport.adapter.js';
 import type { CliReviewSpawn } from './CliReviewTransport.adapter.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
-import { createOcmReviewTransport } from './OcmReviewTransport.adapter.js';
+import { createOcmReviewTransport, ReviewTransportError } from './OcmReviewTransport.adapter.js';
 import type { OcmReviewTransportSpawn } from './OcmReviewTransport.adapter.js';
 
 export interface ReviewTransportSeat {
@@ -40,7 +40,7 @@ export interface ReviewTransportChains {
 export type ReviewRunnerRoute =
   | { readonly kind: 'installation'; readonly remotePort: number; readonly remoteHost: string; readonly authFile?: string }
   | { readonly kind: 'legacy'; readonly remotePort?: number; readonly remoteHost?: string }
-  | { readonly kind: 'none'; readonly reason: string };
+  | { readonly kind: 'none'; readonly reason: string; readonly code?: 'route-host-changed' | 'route-not-opencode' | 'route-no-port' | 'route-no-auth-file' };
 
 /** Where the attempt under review lives, and read-only git reads through its recorded host. */
 export interface ReviewLocation {
@@ -99,7 +99,7 @@ export function selectReviewerSeat(
   seats: readonly ReviewTransportSeat[],
   chains: ReviewTransportChains | undefined,
   reviewerModel: string,
-): { ok: true; seat: ReviewTransportSeat } | { ok: false; reason: string } {
+): { ok: true; seat: ReviewTransportSeat } | { ok: false; reason: string; code: ReviewUnavailableCode } {
   const model = reviewerModel.trim();
   const candidates: ReviewTransportSeat[] = [];
   for (const id of reviewerChainSeatIds(chains)) {
@@ -110,7 +110,7 @@ export function selectReviewerSeat(
   }
 
   if (candidates.length === 0) {
-    return { ok: false, reason: `No reviewer seat in the installation serves model '${model}'` };
+    return { ok: false, reason: `No reviewer seat in the installation serves model '${model}'`, code: 'seat-none' };
   }
 
   if (candidates.length > 1) {
@@ -118,12 +118,13 @@ export function selectReviewerSeat(
     return {
       ok: false,
       reason: `Reviewer model '${model}' matches several reviewer seats (${ids}); refused as ambiguous`,
+      code: 'seat-ambiguous',
     };
   }
 
   const seat = candidates[0];
   if (seat.roles.includes('implementer')) {
-    return { ok: false, reason: `Reviewer seat '${seat.id}' also holds the implementer role` };
+    return { ok: false, reason: `Reviewer seat '${seat.id}' also holds the implementer role`, code: 'seat-implementer' };
   }
 
   return { ok: true, seat };
@@ -152,7 +153,7 @@ export function createReviewTransportRouter(
   return async (request: RunIndependentReviewRequest): Promise<IndependentReviewTransportResult> => {
     const selected = selectReviewerSeat(options.seats, options.chains, request.reviewerModel);
     if (!selected.ok) {
-      throw new Error(selected.reason);
+      throw new ReviewTransportError(selected.reason, selected.code);
     }
 
     const seat = selected.seat;
@@ -160,8 +161,9 @@ export function createReviewTransportRouter(
 
     if (Object.hasOwn(CLI_REVIEW_ARGV_TEMPLATES, seat.tool)) {
       if (seat.variant !== undefined) {
-        throw new Error(
+        throw new ReviewTransportError(
           `Reviewer seat '${seat.id}' sets a variant, which the ${seat.tool} review transport does not support`,
+          'seat-variant-unsupported',
         );
       }
       return runCli(options, seat, location, request);
@@ -171,8 +173,9 @@ export function createReviewTransportRouter(
       case 'opencode':
         return runOpencode(options, seat, location, request);
       default:
-        throw new Error(
+        throw new ReviewTransportError(
           `Reviewer seat '${seat.id}' uses tool '${seat.tool}', which has no review transport`,
+          'seat-tool-no-transport',
         );
     }
   };
@@ -204,13 +207,30 @@ function runOpencode(
 ): Promise<IndependentReviewTransportResult> {
   const route = location.route;
   if (route.kind === 'none') {
-    throw new Error(route.reason);
+    // The opencode transport owns the `none` route refusal (KF-14a): it throws
+    // ReviewTransportError with the route's code before any spawn.
+    const transport = createOcmReviewTransport({
+      ocmRunBin: options.ocmRunBin,
+      remotePort: 0,
+      route,
+      agent: seat.agent ?? DEFAULT_REVIEW_AGENT,
+      model: seat.model,
+      resolveReviewDir: () => location.worktreePath,
+      readHead: () => location.readHead(),
+      ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options.ocmSpawn !== undefined ? { spawn: options.ocmSpawn } : {}),
+      ...(options.makeNonce !== undefined ? { makeNonce: options.makeNonce } : {}),
+    });
+    return transport(request);
   }
 
   let remotePort: number;
   if (route.kind === 'legacy') {
     if (typeof route.remotePort !== 'number') {
-      throw new Error(`No runner port is configured for the review of attempt ${request.attemptId}`);
+      throw new ReviewTransportError(
+        `No runner port is configured for the review of attempt ${request.attemptId}`,
+        'transport-failed',
+      );
     }
     remotePort = route.remotePort;
   } else {
@@ -220,6 +240,7 @@ function runOpencode(
   const transport = createOcmReviewTransport({
     ocmRunBin: options.ocmRunBin,
     remotePort,
+    route,
     ...(route.remoteHost !== undefined ? { remoteHost: route.remoteHost } : {}),
     hostMode: route.kind,
     ...(route.kind === 'installation' && route.authFile !== undefined

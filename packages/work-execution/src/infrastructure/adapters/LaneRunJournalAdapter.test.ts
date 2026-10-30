@@ -66,6 +66,7 @@ function baseEntry(
     mintedId: null,
     outcome: null,
     reasonCode: null,
+    detail: null,
     grantId: null,
     state: null,
     ...overrides,
@@ -316,6 +317,17 @@ describe('LaneRunJournalAdapter', () => {
       const parsed = JSON.parse(await fs.readFile(path.join(tempDir, 'run-journal.json'), 'utf8')) as unknown;
       expect(Array.isArray(parsed)).toBe(true);
       expect(parsed as unknown[]).toHaveLength(entries.length);
+    });
+
+    it('reads a pre-KF-14a journal file whose entries carry no detail as detail null', async () => {
+      const legacy = { ...stepIntent('dispatch') } as Record<string, unknown>;
+      delete legacy.detail;
+      await fs.writeFile(path.join(tempDir, 'run-journal.json'), JSON.stringify([legacy]), 'utf8');
+
+      const adapter = new LaneRunJournalAdapter({ stateDir: tempDir });
+      const entries = await adapter.listForRun(RUN_ID);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]!.detail).toBeNull();
     });
 
     it('quarantines a file holding one invalid entry or not JSON, keeping the exact bytes', async () => {

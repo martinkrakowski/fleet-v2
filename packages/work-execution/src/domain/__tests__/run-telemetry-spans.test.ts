@@ -140,6 +140,7 @@ function entry(kind: LaneRunJournalEntryKind, fields: Partial<LaneRunJournalEntr
     mintedId: null,
     outcome: null,
     reasonCode: null,
+    detail: null,
     grantId: null,
     state: null,
     ...fields,

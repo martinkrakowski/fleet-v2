@@ -49,6 +49,7 @@ export const PARK_QUESTION_REASONS: readonly string[] = [
   'owner-merge',
   'blocker-after-round-2',
   'seat-plan-exhausted',
+  'fix-no-progress',
 ];
 
 /** The reason code that opens a one-way door question; every other reason is two-way. */
@@ -83,6 +84,11 @@ function questionTexts(
       return {
         title: `Lane run parked: seat plan exhausted (${reason})`,
         body: `The conductor parked ${coordinates} with reason ${reason}. The seat plan has no remaining seat for the run. Choose resume or stop.`,
+      };
+    case 'fix-no-progress':
+      return {
+        title: `Lane run parked: fix made no progress (${reason})`,
+        body: `The conductor parked ${coordinates} with reason ${reason}. A fix attempt was collected at its prior attempt's head, so it changed nothing to gate or review. Choose resume or stop.`,
       };
     default:
       throw new Error(`unknown park reason code: ${reason}`);

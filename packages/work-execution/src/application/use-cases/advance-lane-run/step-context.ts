@@ -65,7 +65,7 @@ const OWNER_QUESTION_REASONS: readonly LaneRunParkReason[] = [
 ];
 
 /**
- * Raise the park's attention item and, for the four owner reasons, the keyed
+ * Raise the park's attention item and, for the owner reasons, the keyed
  * owner question (K6-7). Everything is failure-tolerant: missing wiring, a
  * missing work order, a refusal or a throw never blocks or changes the park,
  * and the park outcome is returned unchanged. No journal entry is written for

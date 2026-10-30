@@ -134,7 +134,7 @@ describe('LaneRunParkNoticeAdapter', () => {
       expect(askOwnerQuestion).not.toHaveBeenCalled();
     });
 
-    it.each(['one-way-door', 'owner-merge', 'blocker-after-round-2', 'seat-plan-exhausted'] as const)(
+    it.each(['one-way-door', 'owner-merge', 'blocker-after-round-2', 'seat-plan-exhausted', 'fix-no-progress'] as const)(
       'asks the fixed question for %s with the keyed idempotency key',
       async (reason) => {
         const askOwnerQuestion = vi.fn(async (_request: unknown) => ({ outcome: 'asked', question: { questionId: 'q-1' } }));
@@ -181,6 +181,11 @@ describe('LaneRunParkNoticeAdapter', () => {
             title: 'Lane run parked: seat plan exhausted (seat-plan-exhausted)',
             body:
               'The conductor parked run run-42 of work order wo-7 in project proj-1 with reason seat-plan-exhausted. The seat plan has no remaining seat for the run. Choose resume or stop.',
+          },
+          'fix-no-progress': {
+            title: 'Lane run parked: fix made no progress (fix-no-progress)',
+            body:
+              "The conductor parked run run-42 of work order wo-7 in project proj-1 with reason fix-no-progress. A fix attempt was collected at its prior attempt's head, so it changed nothing to gate or review. Choose resume or stop.",
           },
         };
         expect(ask.title).toBe(expectedTexts[reason].title);

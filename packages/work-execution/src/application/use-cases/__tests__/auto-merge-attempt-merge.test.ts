@@ -208,6 +208,10 @@ class FakeAcceptance implements AcceptanceAssessmentPort {
     }
     return this.result;
   }
+
+  async assessHeadReceipts(): Promise<never> {
+    throw new Error('assessHeadReceipts is not used by this test');
+  }
 }
 
 interface RecordedNotice {

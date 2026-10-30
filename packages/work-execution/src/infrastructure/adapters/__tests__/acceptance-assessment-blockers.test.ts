@@ -13,6 +13,7 @@ import { AcceptanceAssessmentAdapter } from '../AcceptanceAssessmentAdapter.adap
 import type {
   AssessmentBlockerKind,
   AcceptanceAssessmentResult,
+  AcceptanceReceiptsResult,
 } from '../../../application/ports/out/AcceptanceAssessmentPort.out-port.js';
 
 const REQUEST = {
@@ -58,5 +59,24 @@ describe('AcceptanceAssessmentAdapter blocker details', () => {
       'other',
     ];
     expect(new Set(all).size).toBe(8);
+  });
+
+  it('rejects a receipts-only assessment while unconfigured', async () => {
+    const adapter = new AcceptanceAssessmentAdapter();
+    await expect(adapter.assessHeadReceipts(REQUEST)).rejects.toThrow(
+      'Not implemented: AcceptanceAssessmentAdapter.assessHeadReceipts',
+    );
+  });
+
+  it('delegates a receipts-only assessment to the assessReceipts delegate', async () => {
+    const delegateResult: AcceptanceReceiptsResult = {
+      outcome: 'passed',
+      receiptsId: 'rcp-example-1',
+      assessedHeadSha: REQUEST.candidateHeadSha,
+    };
+    const adapter = new AcceptanceAssessmentAdapter({
+      assessReceipts: async () => delegateResult,
+    });
+    await expect(adapter.assessHeadReceipts(REQUEST)).resolves.toEqual(delegateResult);
   });
 });

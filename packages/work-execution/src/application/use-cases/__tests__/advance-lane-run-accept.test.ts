@@ -16,6 +16,7 @@ import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../
 import type {
   AcceptanceAssessmentRequest,
   AcceptanceAssessmentResult,
+  AcceptanceReceiptsResult,
 } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
 import type { ReadHeadCiStateRequest, HeadCiStateRead } from '../../ports/out/CiStatePort.out-port.js';
 import type { ReadPullRequestRequest, ReadPullRequestResult } from '../../ports/out/ForgeReadPort.out-port.js';
@@ -175,12 +176,14 @@ interface Harness {
   readonly runJournal: LaneRunJournalAdapter;
   readonly attemptRepo: AttemptRepositoryAdapter;
   readonly acceptanceRequests: readonly AcceptanceAssessmentRequest[];
+  readonly receiptsRequests: readonly AcceptanceAssessmentRequest[];
   readonly ciRequests: readonly ReadHeadCiStateRequest[];
   readonly forgeRequests: readonly ReadPullRequestRequest[];
   readonly receiptRequests: readonly FindLatestReceiptOfKindRequest[];
   readonly portCalls: readonly string[];
   readonly deps: AdvanceLaneRunDependencies;
   setAcceptanceAnswer(answer: AcceptanceAssessmentResult | 'throw'): void;
+  setReceiptsAnswer(answer: AcceptanceReceiptsResult | 'throw'): void;
   setCiAnswer(answer: HeadCiStateRead | 'throw'): void;
   setForgeAnswer(answer: ReadPullRequestResult | 'throw'): void;
   setReceiptAnswer(answer: FindLatestReceiptOfKindResult): void;
@@ -203,11 +206,13 @@ async function makeHarness(
   const attemptRepo = new AttemptRepositoryAdapter();
   const executionJournal = new ExecutionJournalAdapter();
   const acceptanceRequests: AcceptanceAssessmentRequest[] = [];
+  const receiptsRequests: AcceptanceAssessmentRequest[] = [];
   const ciRequests: ReadHeadCiStateRequest[] = [];
   const forgeRequests: ReadPullRequestRequest[] = [];
   const receiptRequests: FindLatestReceiptOfKindRequest[] = [];
   const portCalls: string[] = [];
   let acceptanceAnswer: AcceptanceAssessmentResult | 'throw' = { outcome: 'accepted', receiptId: 'receipt-example-1', assessedHeadSha: COMMIT };
+  let receiptsAnswer: AcceptanceReceiptsResult | 'throw' = { outcome: 'passed', receiptsId: 'rcp-example-1', assessedHeadSha: COMMIT };
   let ciAnswer: HeadCiStateRead | 'throw' = { headSha: COMMIT, state: 'passed', reason: 'read' };
   let forgeAnswer: ReadPullRequestResult | 'throw' = {
     outcome: 'found',
@@ -275,6 +280,14 @@ async function makeHarness(
               }
               return acceptanceAnswer;
             },
+            assessHeadReceipts: async (request) => {
+              receiptsRequests.push(request);
+              portCalls.push('receipts');
+              if (receiptsAnswer === 'throw') {
+                throw new Error('receipts assessment unavailable');
+              }
+              return receiptsAnswer;
+            },
           },
         }),
     ...(options.wireCi === false
@@ -327,6 +340,7 @@ async function makeHarness(
     runJournal,
     attemptRepo,
     acceptanceRequests,
+    receiptsRequests,
     ciRequests,
     forgeRequests,
     receiptRequests,
@@ -334,6 +348,9 @@ async function makeHarness(
     deps,
     setAcceptanceAnswer: (answer) => {
       acceptanceAnswer = answer;
+    },
+    setReceiptsAnswer: (answer) => {
+      receiptsAnswer = answer;
     },
     setCiAnswer: (answer) => {
       ciAnswer = answer;
@@ -408,7 +425,7 @@ async function acceptedHarness(
 }
 
 describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
-  it('test 1: an accepted assessment at the head journals accepted and the next advance enters awaiting-premerge (Tier 2)', async () => {
+  it('test 1: a passed receipts answer at the head journals accepted and the next advance enters awaiting-premerge (Tier 2); assessHeadAcceptance is never called', async () => {
     const harness = await acceptingHarness();
     const first = await advance(harness);
     expect(first).toEqual({
@@ -418,7 +435,7 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
       result: 'completed',
       reasonCode: 'accepted',
     });
-    expect(harness.acceptanceRequests).toEqual([
+    expect(harness.receiptsRequests).toEqual([
       {
         attemptId: 'attempt-example-1',
         workOrderId: 'wo-example-1',
@@ -426,6 +443,7 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
         policyRevision: 'policy-example-1',
       },
     ]);
+    expect(harness.acceptanceRequests).toEqual([]);
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'awaiting-premerge' });
   });
 
@@ -442,9 +460,9 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     expect(await advance(tier1)).toEqual({ outcome: 'entered', state: 'opening-pr' });
   });
 
-  it('test 2: a rejected assessment journals completed/acceptance-rejected and the next advance parks acceptance-rejected', async () => {
+  it('test 2: a rejected receipts answer journals completed/acceptance-rejected and the next advance parks acceptance-rejected', async () => {
     const harness = await acceptingHarness();
-    harness.setAcceptanceAnswer({ outcome: 'rejected', reason: BLOCKER_TEXT });
+    harness.setReceiptsAnswer({ outcome: 'rejected', reason: BLOCKER_TEXT });
     expect(await advance(harness)).toEqual({
       outcome: 'acted',
       step: 'accept',
@@ -452,6 +470,7 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
       result: 'completed',
       reasonCode: 'acceptance-rejected',
     });
+    expect(harness.acceptanceRequests).toEqual([]);
     expect(await advance(harness)).toEqual({
       outcome: 'parked',
       reason: 'acceptance-rejected',
@@ -459,9 +478,9 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     });
   });
 
-  it('test 3: an unknown assessment is ambiguous and the next advance parks ambiguous accept', async () => {
+  it('test 3: an unknown receipts answer is ambiguous and the next advance parks ambiguous accept', async () => {
     const harness = await acceptingHarness();
-    harness.setAcceptanceAnswer({ outcome: 'unknown', reason: BLOCKER_TEXT });
+    harness.setReceiptsAnswer({ outcome: 'unknown', reason: BLOCKER_TEXT });
     expect(await advance(harness)).toEqual({
       outcome: 'acted',
       step: 'accept',
@@ -472,9 +491,9 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'accept' });
   });
 
-  it('test 4: an accepted assessment at a moved head is ambiguous, never a pass', async () => {
+  it('test 4: a passed receipts answer at a moved head is ambiguous, never a pass', async () => {
     const harness = await acceptingHarness();
-    harness.setAcceptanceAnswer({ outcome: 'accepted', receiptId: 'receipt-example-1', assessedHeadSha: MOVED_COMMIT });
+    harness.setReceiptsAnswer({ outcome: 'passed', receiptsId: 'rcp-example-1', assessedHeadSha: MOVED_COMMIT });
     expect(await advance(harness)).toEqual({
       outcome: 'acted',
       step: 'accept',
@@ -485,9 +504,9 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'accept' });
   });
 
-  it('test 5: a thrown assessment leaves the intent unread; the next advance reconciles by re-running the assessment', async () => {
+  it('test 5: a thrown receipts assessment leaves the intent unread; the next advance reconciles by re-running the assessment', async () => {
     const harness = await acceptingHarness();
-    harness.setAcceptanceAnswer('throw');
+    harness.setReceiptsAnswer('throw');
     expect(await advance(harness)).toEqual({
       outcome: 'acted',
       step: 'accept',
@@ -499,8 +518,8 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     const afterThrow = await harness.runJournal.listForRun(RUN_ID);
     expect(afterThrow.filter((entry) => entry.kind === 'result' && entry.key === acceptKey())).toEqual([]);
     // The next advance reconciles by calling the assessment again; when it answers
-    // accepted, it journals accepted — never a second intent.
-    harness.setAcceptanceAnswer({ outcome: 'accepted', receiptId: 'receipt-example-1', assessedHeadSha: COMMIT });
+    // passed, it journals accepted — never a second intent.
+    harness.setReceiptsAnswer({ outcome: 'passed', receiptsId: 'rcp-example-1', assessedHeadSha: COMMIT });
     expect(await advance(harness)).toEqual({
       outcome: 'acted',
       step: 'accept',
@@ -508,7 +527,8 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
       result: 'completed',
       reasonCode: 'accepted',
     });
-    expect(harness.acceptanceRequests).toHaveLength(2);
+    expect(harness.receiptsRequests).toHaveLength(2);
+    expect(harness.acceptanceRequests).toEqual([]);
     const entries = await harness.runJournal.listForRun(RUN_ID);
     const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey());
     expect(intents).toHaveLength(1);
@@ -528,7 +548,7 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
       result: 'completed',
       reasonCode: 'accepted',
     });
-    expect(harness.acceptanceRequests).toHaveLength(1);
+    expect(harness.receiptsRequests).toHaveLength(1);
     const entries = await harness.runJournal.listForRun(RUN_ID);
     const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey());
     expect(intents).toHaveLength(1);
@@ -544,7 +564,7 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
 
   it('test 8: the receipt id and no blocker text reach the journal; reason codes only', async () => {
     const harness = await acceptingHarness();
-    harness.setAcceptanceAnswer({
+    harness.setReceiptsAnswer({
       outcome: 'rejected',
       reason: BLOCKER_TEXT,
       blockerDetails: [{ kind: 'ci-failed', text: BLOCKER_TEXT }],
@@ -559,7 +579,7 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     const entries = await harness.runJournal.listForRun(RUN_ID);
     expect(entries.some((entry) => entry.reasonCode === 'acceptance-rejected')).toBe(true);
     expect(entries.some((entry) => JSON.stringify(entry).includes(BLOCKER_TEXT))).toBe(false);
-    expect(entries.some((entry) => JSON.stringify(entry).includes('receipt-example-1'))).toBe(false);
+    expect(entries.some((entry) => JSON.stringify(entry).includes('rcp-example-1'))).toBe(false);
   });
 });
 
@@ -573,7 +593,7 @@ describe('AdvanceLaneRunUseCase read-only facts (K6-5)', () => {
       result: 'completed',
       reasonCode: 'accepted',
     });
-    expect(harness.portCalls).toEqual(['acceptance']);
+    expect(harness.portCalls).toEqual(['receipts']);
   });
 
   it('test 10: with every read port unbound the facts keep their hard-coded defaults', async () => {

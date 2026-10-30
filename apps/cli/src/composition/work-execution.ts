@@ -241,6 +241,48 @@ export function composeExecution(input: ComposeExecutionInput) {
         blockerDetails: [{ kind: 'other', text: result.reason }],
       };
     },
+    // The receipts-only head assessment for the conductor's pre-PR steps. It
+    // never stores acceptance: no `acceptedReceiptByHead` entry, no
+    // `accepted-receipts.json` write. Every merge decision keeps `assess`.
+    assessReceipts: async (request) => {
+      const assessmentId = assessmentIdForAttempt(request.attemptId);
+      const result = await evidence.assessHeadAcceptance.assessHeadReceipts({
+        assessmentId,
+        candidateHeadSha: request.candidateHeadSha,
+        policyRevision: request.policyRevision,
+      });
+      if (result.outcome === 'receipts-passed') {
+        return {
+          outcome: 'passed',
+          receiptsId: result.receiptsId,
+          assessedHeadSha: result.candidateHeadSha,
+        };
+      }
+      if (result.outcome === 'blocked') {
+        return {
+          outcome: 'rejected',
+          reason: `Acceptance blocked: ${result.blockers.join('; ')}`,
+          blockerDetails: result.blockerDetails.map((blocker) => ({
+            kind: blocker.kind,
+            text: blocker.text,
+          })),
+        };
+      }
+      if (result.outcome === 'stale') {
+        return {
+          outcome: 'rejected',
+          reason: result.reason,
+          blockerDetails: [{ kind: 'stale', text: result.reason }],
+        };
+      }
+      // `rejected` (the receipts-only variant of `assess`'s fallback) leaves the
+      // action without a pass; the kind says which.
+      return {
+        outcome: 'rejected',
+        reason: result.reason,
+        blockerDetails: [{ kind: 'other', text: result.reason }],
+      };
+    },
   });
 
   const acceptanceEvidence = new AcceptanceEvidenceAdapter({

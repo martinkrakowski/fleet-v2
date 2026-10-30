@@ -55,7 +55,32 @@ export type AcceptanceAssessmentResult =
       readonly blockerDetails?: readonly AssessmentBlocker[];
     };
 
+/**
+ * The result of a receipts-only head assessment for the conductor's pre-PR
+ * steps. It never carries `accepted`: a receipts pass is not an acceptance
+ * and is never stored as one. Every merge decision keeps the full
+ * `assessHeadAcceptance`.
+ */
+export type AcceptanceReceiptsResult =
+  | { readonly outcome: 'passed'; readonly receiptsId: string; readonly assessedHeadSha: string }
+  | {
+      readonly outcome: 'rejected';
+      readonly reason: string;
+      readonly blockerDetails?: readonly AssessmentBlocker[];
+    }
+  | {
+      readonly outcome: 'unknown';
+      readonly reason: string;
+      readonly blockerDetails?: readonly AssessmentBlocker[];
+    };
+
 export interface AcceptanceAssessmentPort {
   /** Assess the exact candidate head; a moved head is never assessed as-is. */
   assessHeadAcceptance(request: AcceptanceAssessmentRequest): Promise<AcceptanceAssessmentResult>;
+  /**
+   * Receipts-only head assessment, for the conductor's pre-PR steps. It never
+   * returns `accepted` and never stores acceptance; it is never a merge
+   * decision.
+   */
+  assessHeadReceipts(request: AcceptanceAssessmentRequest): Promise<AcceptanceReceiptsResult>;
 }

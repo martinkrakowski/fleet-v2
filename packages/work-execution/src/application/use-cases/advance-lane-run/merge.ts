@@ -373,13 +373,15 @@ async function runAcceptBody(
   let result: 'completed' | 'ambiguous';
   let reasonCode: LaneRunResultReasonCode;
   try {
-    const outcome = await assessment.assessHeadAcceptance({
+    // The conductor's pre-PR accept uses the receipts-only assessment: no
+    // acceptance is stored, but a `passed` answer at the exact head accepts.
+    const outcome = await assessment.assessHeadReceipts({
       attemptId: latest.id,
       workOrderId: record.workOrderId,
       candidateHeadSha: headSha,
       policyRevision: record.runPolicyRevision,
     });
-    if (outcome.outcome === 'accepted') {
+    if (outcome.outcome === 'passed') {
       if (outcome.assessedHeadSha === headSha) {
         result = 'completed';
         reasonCode = 'accepted';
@@ -598,18 +600,19 @@ async function runPrPushBody(
     }
   }
 
-  // The acceptance receipt id is read again at the exact head (K6-5): never
-  // journalled, idempotent per head; anything else refuses the grant.
+  // The grant's acceptance receipt id is the receipts-only pass read again at
+  // the exact head (K6-5): never journalled, idempotent per head; anything
+  // else refuses the grant.
   let receiptId: string | null = null;
   try {
-    const assessment = await acceptanceAssessment.assessHeadAcceptance({
+    const assessment = await acceptanceAssessment.assessHeadReceipts({
       attemptId: latest.id,
       workOrderId: record.workOrderId,
       candidateHeadSha: headSha,
       policyRevision: record.runPolicyRevision,
     });
-    if (assessment.outcome === 'accepted' && assessment.assessedHeadSha === headSha) {
-      receiptId = assessment.receiptId;
+    if (assessment.outcome === 'passed' && assessment.assessedHeadSha === headSha) {
+      receiptId = assessment.receiptsId;
     }
   } catch {
     // fall through: no receipt.

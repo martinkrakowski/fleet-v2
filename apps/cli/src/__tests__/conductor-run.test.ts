@@ -307,6 +307,56 @@ describe('conductor run usage (K7-7)', () => {
   });
 });
 
+describe('conductor run --max-active-runs (CL-4)', () => {
+  it.each<[string, readonly string[], number]>([
+    ['without the flag', [], 1],
+    ['as a separate value', ['--max-active-runs', '3'], 3],
+    ['glued with =', ['--max-active-runs=4'], 4],
+  ])('%s passes { maxActiveRuns: %i } to the driver builder', async (_label, extra, expected) => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    const seen: ReadonlyArray<{ readonly maxActiveRuns: number }>[] = [];
+    const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once', ...extra], {
+      stateDir: dir,
+      buildDriver: (
+        _runtime: FleetCliRuntime,
+        _mode: 'live' | 'dry-run',
+        driverOptions: { readonly maxActiveRuns: number },
+      ) => {
+        seen.push([driverOptions]);
+        return fake.driver;
+      },
+    });
+    expect(result.code).toBe(0);
+    expect(seen).toEqual([[{ maxActiveRuns: expected }]]);
+    expect(fake.passCalls).toHaveLength(1);
+    expect(fake.releaseCalls).toHaveLength(1);
+  });
+
+  it.each<[string, readonly string[]]>([
+    ['a value over the limit', ['--max-active-runs', '65']],
+    ['a non-numeric value', ['--max-active-runs', 'x']],
+    ['a negative value', ['--max-active-runs', '-1']],
+    ['a missing value (flag last)', ['--max-active-runs']],
+    ['a flag as the value', ['--max-active-runs', '--once']],
+    ['a repeated flag', ['--max-active-runs', '2', '--max-active-runs', '2']],
+  ])('$1 is a usage error', async (_label, extra) => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    const built: unknown[] = [];
+    const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once', ...extra], {
+      stateDir: dir,
+      buildDriver: (..._args: unknown[]) => {
+        built.push(1);
+        return fake.driver;
+      },
+    });
+    expect(result.code).toBe(2);
+    expect(result.stderr.join('\n')).toContain('--max-active-runs');
+    expect(built).toHaveLength(0);
+  });
+});
+
 describe('conductor run live loop (K7-7)', () => {
   it('refuses conductor-disabled before any pass', async () => {
     const dir = tempStateDir();

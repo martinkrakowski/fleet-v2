@@ -290,6 +290,12 @@ export async function performReview(
     return intentRefusal === null ? finishReview(ctx, request, decision, 'refused', read.refuse) : { outcome: 'refused', reason: intentRefusal };
   }
   const { latest, head, workOrder, reviewerModel, implementerModel } = read.inputs;
+  if (request.startGate !== undefined) {
+    // The wait sits before the one-way intent, so a crash during the wait spends no key.
+    if (!request.startGate.tryStart(request.runId, request.nowIso).ok) {
+      return { outcome: 'waiting', reason: 'session-stagger' };
+    }
+  }
   const requestId = 'review-' + ctx.deps.newUlid();
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, requestId);
   if (intentRefusal !== null) {

@@ -30,6 +30,7 @@ import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/Attem
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
+import type { SessionStartGate } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import type {
   FindReviewReceiptRequest,
   FindReviewReceiptResult,
@@ -1065,6 +1066,23 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       reasonCode: 'dispatch-started',
     });
     expect(harness.dispatchRequests).toHaveLength(1);
+  });
+
+  it('i2) a fix-round dispatch with a denying start gate waits session-stagger before the intent (KF-34a1)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'prepare', reasonCode: 'prepared' });
+    const afterPrepare = await harness.runRepo.get(RUN_ID);
+    const fixAttemptId = afterPrepare?.attemptIds[1] as string;
+    await admit(harness, fixAttemptId);
+    const denied = await advance(harness, {
+      startGate: { tryStart: () => ({ ok: false, retryAfterMs: 12_345 }) } satisfies SessionStartGate,
+    });
+    expect(denied).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(harness.dispatchRequests).toHaveLength(0);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'intent' && entry.key !== null && entry.key.includes('/dispatch/'))).toBe(false);
   });
 
   it('j) refuses prepare-refused when the brief placement is rejected, saving no fix attempt', async () => {

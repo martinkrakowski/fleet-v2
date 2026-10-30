@@ -22,20 +22,28 @@
 #      targets (reporting symlink-escape or symlink-unresolved; a link that stays inside the
 #      worktree is still reported as symlink, since a review that reads files lexically cannot
 #      see what it points at). Base-line allowance (KF-27): a matched line is excused only when
-#      the exact same line occurs in the base version of the same path (merge-base of --base and
-#      HEAD), at most as many times as it occurs there; excused lines are reported as
-#      baseline-excused (line numbers only) and are not findings. No merge-base, or an unreadable
-#      base blob, excuses nothing.
+#      the exact same line occurs in the version of the same path at the base commit, at most as
+#      many times as it occurs there; excused lines are reported as baseline-excused (line numbers
+#      only) and are not findings. The allowance needs --base as a full commit sha (the tip the
+#      orchestrator recorded at dispatch) that is an ancestor of HEAD: a ref name is lane-writable
+#      in the shared clone, so with a ref name (or no --base) nothing is excused and one warning
+#      line says so. Every object read for the allowance is re-hashed against the id its verified
+#      parent names (commit, trees, blob); a mismatch, a read error, a path that is not a regular
+#      file at the base, or a NUL byte excuses nothing.
 #   Git config keys that name a helper git would run (core.fsmonitor, core.hooksPath,
-#   diff.external, diff.<driver>.command|textconv, merge.<driver>.driver, credential helpers, …) in
-#   the repository's own (lane-writable) config are reported as git-config-helper, with any
-#   subsection masked; the gate's own git calls already neutralise the ones it could trigger.
+#   diff.external, diff.<driver>.command|textconv, merge.<driver>.driver, credential helpers,
+#   pager.<cmd>, url.<base>.insteadOf|pushInsteadOf, include.path, includeIf.<cond>.path, a
+#   submodule.<name>.update that runs a command, …) in the repository's own (lane-writable) config
+#   are reported as git-config-helper, with any subsection masked; the gate's own git calls already
+#   neutralise the ones it could trigger, but the orchestrator's later git calls would not. Each
+#   non-sample file in the clone's hooks directory is reported as git-hook (its name only).
 #   3. (with --brief) Did the lane change files the brief never mentioned? A warning, unless --strict-brief.
 #      A bare directory word in the brief (e.g. "packages") does not put the whole tree in scope.
 #
 #   lane-diff-check.sh <worktree> [--base <ref>] [--brief <file>] [--strict-brief]
 #                      [--allow-protected <extended regex>] [--quiet]
 # --base defaults to origin/main when it exists, else the working tree is compared with HEAD only.
+# Pass the recorded base commit sha: only a sha enables the base-line allowance.
 # Exit: 0 clean; 1 at least one finding; 2 usage or not a git worktree.
 set -u
 # Byte semantics everywhere (Fable review of L1): in a UTF-8 locale GNU grep treats a line with an
@@ -118,8 +126,10 @@ done
 [ -d "$wt" ] || { echo "lane-diff-check: $wt is not a directory" >&2; exit 2; }
 # A lane can write refs/replace/* or a grafts file in the shared clone. Every git call below reads
 # only the real objects, so neither the diff nor the base-line allowance can be redirected.
+# A path that never exists: git then reads no grafts and prints no deprecation hint (an existing
+# file, even /dev/null, makes every call warn).
 GIT_NO_REPLACE_OBJECTS=1
-GIT_GRAFT_FILE=/dev/null
+GIT_GRAFT_FILE=/nonexistent/fleet-v2-lane-diff-check-no-grafts
 export GIT_NO_REPLACE_OBJECTS GIT_GRAFT_FILE
 cd "$wt" || exit 2
 git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "lane-diff-check: $wt is not a git worktree" >&2; exit 2; }
@@ -196,24 +206,112 @@ done
 # Helper keys in the repository's own config (local and worktree scope: what a lane can write),
 # includes resolved. Names only, NUL-separated, so no value is ever read or printed. A subsection
 # is masked in the report because it is lane-chosen text.
-HELPER_KEYS='^core\.(fsmonitor|hookspath|sshcommand|pager|editor|askpass|gitproxy|alternaterefscommand)$|^diff\.external$|^diff\..+\.(command|textconv)$|^merge\..+\.driver$|^credential\.helper$|^credential\..+\.helper$|^gpg\.program$|^gpg\..+\.program$|^sequence\.editor$|^uploadpack\.packobjectshook$|^remote\..+\.(uploadpack|receivepack)$'
+HELPER_KEYS='^core\.(fsmonitor|hookspath|sshcommand|pager|editor|askpass|gitproxy|alternaterefscommand)$|^diff\.external$|^diff\..+\.(command|textconv)$|^merge\..+\.driver$|^credential\.helper$|^credential\..+\.helper$|^gpg\.program$|^gpg\..+\.program$|^sequence\.editor$|^uploadpack\.packobjectshook$|^remote\..+\.(uploadpack|receivepack)$|^pager\..+$|^url\..+\.(insteadof|pushinsteadof)$|^include\.path$|^includeif\..+\.path$'
 {
   g config -z --local --includes --name-only --list 2>/dev/null || true
   g config -z --worktree --includes --name-only --list 2>/dev/null || true
-} | tr '\0' '\n' | grep -aEi -- "$HELPER_KEYS" | while IFS= read -r key; do
+} | tr '\0' '\n' > "$T/config-keys"
+# submodule.<name>.update runs a command only when its value starts with '!'. The value is tested
+# here and never printed.
+grep -aEi -- '^submodule\..+\.update$' "$T/config-keys" | sort -u | while IFS= read -r key; do
+  for scope in --local --worktree; do
+    v=$(g config "$scope" --includes --get "$key" 2>/dev/null) || continue
+    case "$v" in '!'*) printf '%s\n' "$key"; break ;; esac
+  done
+done > "$T/command-updates"
+{ grep -aEi -- "$HELPER_KEYS" "$T/config-keys"; cat "$T/command-updates"; } | while IFS= read -r key; do
   case "$key" in
     *.*.*) printf '%s.<sub>.%s\n' "${key%%.*}" "${key##*.}" ;;
     *) printf '%s\n' "$key" ;;
   esac
 done | tr 'A-Z' 'a-z' | sort -u > "$T/helper-keys"
-
-# The base-line allowance compares against the merge-base of --base and HEAD. No merge-base (no
-# --base, an unborn HEAD, unrelated histories) leaves MB empty, and then nothing is excused.
-MB=''
-if [ -n "$base" ] && git rev-parse --verify -q HEAD >/dev/null; then
-  MB=$(g merge-base "$base" HEAD 2>/dev/null) || MB=''
-  case "$MB" in *[!0-9a-f]* | '') MB='' ;; esac
+# Hooks in the clone's hooks directory: the gate's own calls pin core.hooksPath=/dev/null, but the
+# orchestrator's later git commit or push would run them. Names only.
+hooks_dir=$(g rev-parse --git-common-dir 2>/dev/null)/hooks
+: > "$T/hooks"
+if [ -d "$hooks_dir" ]; then
+  for h in "$hooks_dir"/* "$hooks_dir"/.[!.]*; do
+    [ -e "$h" ] || [ -L "$h" ] || continue
+    case "$h" in *.sample) continue ;; esac
+    printf '%s\n' "${h##*/}" >> "$T/hooks"
+  done
 fi
+
+# The base-line allowance trusts only a base given as a full commit sha (40 or 64 lowercase hex)
+# that names a commit and is an ancestor of HEAD, and compares against the file AT that commit
+# (never a merge-base: a lane could rebase onto an older ancestor whose file still held a line
+# since removed). A ref name, a missing --base, an unborn HEAD or a base that is not an ancestor
+# leaves TRUSTED_BASE empty, and then nothing is excused (KF-27a, Fable review A1/A3).
+# The file LIST above still comes from the shared object store; the orchestrator's own review
+# reads the diff from its local clone, not from the lane host's.
+TRUSTED_BASE=''
+HASH_BYTES=0
+case "$base" in
+  *[!0-9a-f]*) ;;
+  ????????????????????????????????????????) HASH_BYTES=20 ;;
+  ????????????????????????????????????????????????????????????????) HASH_BYTES=32 ;;
+esac
+if [ "$HASH_BYTES" = 0 ]; then
+  echo 'lane-diff-check: base is not a commit sha; no base-line allowance' >&2
+elif [ "$(g cat-file -t "$base" 2>/dev/null)" = commit ] &&
+     git rev-parse --verify -q HEAD >/dev/null &&
+     g merge-base --is-ancestor "$base" HEAD 2>/dev/null; then
+  TRUSTED_BASE=$base
+else
+  echo 'lane-diff-check: base is not an ancestor commit of HEAD; no base-line allowance' >&2
+fi
+
+# Lowercase hex of stdin's bytes, no separators.
+hex_of() { od -An -v -tx1 | tr -d ' \n'; }
+
+# Read object $1 of type $2 into file $3 and re-hash the bytes: 0 only when they hash to $1. Git
+# checks object hashes on transfer and fsck, not on cat-file, so a lane that can write the shared
+# object store (a loose file, alternates) could otherwise serve forged bytes (Fable review A2).
+verified_object() {
+  g cat-file "$2" "$1" > "$3" 2>/dev/null || return 1
+  [ "$(g hash-object -t "$2" --stdin < "$3" 2>/dev/null)" = "$1" ]
+}
+
+# Write the verified blob of path $1 at TRUSTED_BASE to $T/base-blob: commit -> each tree -> blob,
+# every object re-hashed, entries parsed from the verified tree bytes themselves (no second read).
+# Fails (1) on any mismatch, a missing entry, or a final entry that is not a regular file.
+verified_base_blob() {
+  [ -n "$TRUSTED_BASE" ] || return 1
+  verified_object "$TRUSTED_BASE" commit "$T/vb-obj" || return 1
+  id=$(sed -n '1s/^tree \([0-9a-f]*\)$/\1/p' "$T/vb-obj")
+  [ -n "$id" ] || return 1
+  rest=$1
+  while :; do
+    case "$rest" in
+      */*) comp=${rest%%/*}; rest=${rest#*/}; last=0 ;;
+      *) comp=$rest; last=1 ;;
+    esac
+    [ -n "$comp" ] || return 1
+    verified_object "$id" tree "$T/vb-obj" || return 1
+    want=$(printf '%s' "$comp" | hex_of)
+    entry=$(hex_of < "$T/vb-obj" | awk -v want="$want" -v hl="$HASH_BYTES" '{
+      n = length($0) / 2; i = 0
+      while (i < n) {
+        mode = ""; while (i < n && substr($0, 2 * i + 1, 2) != "20") { mode = mode substr($0, 2 * i + 1, 2); i++ }
+        i++
+        name = ""; while (i < n && substr($0, 2 * i + 1, 2) != "00") { name = name substr($0, 2 * i + 1, 2); i++ }
+        i++
+        id = substr($0, 2 * i + 1, 2 * hl); i += hl
+        if (name == want) { print mode, id; exit }
+      }
+    }')
+    [ -n "$entry" ] || return 1
+    mode=${entry%% *}
+    id=${entry#* }
+    if [ "$last" = 1 ]; then
+      # 100644 or 100755: a regular file. A tree, symlink or submodule excuses nothing.
+      case "$mode" in 313030363434 | 313030373535) ;; *) return 1 ;; esac
+      verified_object "$id" blob "$T/base-blob" || return 1
+      return 0
+    fi
+    [ "$mode" = 3430303030 ] || return 1
+  done
+}
 
 collect() {
   if git rev-parse --verify -q HEAD >/dev/null; then
@@ -287,6 +385,11 @@ while IFS= read -r k; do
   say "git-config-helper: $k"
   findings=$((findings + 1))
 done < "$T/helper-keys"
+while IFS= read -r h; do
+  [ -n "$h" ] || continue
+  say "git-hook: $h"
+  findings=$((findings + 1))
+done < "$T/hooks"
 
 # name|extended regex. Names are what the report prints; the matched text never is.
 cat > "$T/patterns" <<'PAT'
@@ -411,8 +514,7 @@ while IFS= read -r f; do
   : > "$T/excused"
   # Some awks cut a line at a NUL byte, so two different lines could compare equal: a NUL on
   # either side excuses nothing.
-  if [ -n "$MB" ] && g cat-file -e "$MB:$f" 2>/dev/null &&
-     g cat-file blob "$MB:$f" > "$T/base-blob" 2>/dev/null &&
+  if verified_base_blob "$f" &&
      [ "$(tr -cd '\000' < "$T/base-blob" | wc -c | tr -d ' ')" = 0 ] &&
      [ "$(tr -cd '\000' < "$scan_target" | wc -c | tr -d ' ')" = 0 ]; then
     cut -d' ' -f1 "$T/hits" | sort -un > "$T/hit-lines"

@@ -183,7 +183,7 @@ export interface AttemptSeatOverrideRecord {
  * is `null` and `reason` names why.
  */
 export interface AttemptUsageRecord {
-  readonly source: 'opencode-db' | 'unavailable';
+  readonly source: 'opencode-db' | 'opencode-api' | 'unavailable';
   readonly readAtIso: string;
   readonly sessionId: string | null;
   readonly steps: number | null;

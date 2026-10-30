@@ -4,7 +4,8 @@
  * of a state directory (plan §3.3 "Application", §3.5): the per-span
  * dispositions, the recorded salt fingerprint and the export counters. Every
  * write merges per span under an exclusive lock with a 500 ms give-up; a
- * pending never replaces a final disposition unless reopened, and a different
+ * pending never replaces a final disposition unless a rejected one is
+ * reopened (an exported one is never reopened), and a different
  * salt fingerprint is refused.
  */
 

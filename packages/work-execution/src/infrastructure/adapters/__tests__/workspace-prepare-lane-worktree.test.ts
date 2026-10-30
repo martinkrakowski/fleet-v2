@@ -44,6 +44,11 @@ const BRANCH_PROBE_ARGV = ['git', '-C', CLONE, 'rev-parse', '--verify', '--quiet
 const HEAD_ARGV = ['git', '-C', WORKTREE, 'rev-parse', '--show-toplevel', 'HEAD', '--abbrev-ref', 'HEAD'];
 const STATUS_ARGV = ['git', '-C', WORKTREE, 'status', '--porcelain', '--untracked-files=all'];
 const LIST_ARGV = ['git', '-C', CLONE, 'worktree', 'list', '--porcelain'];
+const CAT_FILE_ARGV = ['git', '-C', CLONE, 'cat-file', '-e', BASE + '^{commit}'];
+const FETCH_ARGV = [
+  'git', '-C', CLONE, '-c', 'core.hooksPath=/dev/null',
+  'fetch', '--quiet', 'origin',
+];
 
 const ok: (stdout?: string) => CommandRunResult = (stdout = '') => ({
   exitCode: 0, signal: null, stdout, stderr: '',
@@ -56,14 +61,21 @@ const failed: (exitCode: number) => CommandRunResult = (exitCode) => ({
  * Two fake executors, one per configured host, each recording every argv.
  * The adapter routes the recorded host to `reserved` and every other host
  * to `other`, so the tests can prove the other host was never called.
+ * An answer may be a sequence (array) to serve repeated identical argv, as
+ * when the base-commit probe runs again after a fetch.
  */
-function twoHostExecutors(answers: Record<string, CommandRunResult>) {
+function twoHostExecutors(answers: Record<string, CommandRunResult | CommandRunResult[]>) {
   const reservedLog: string[][] = [];
   const otherLog: string[][] = [];
   const makeExecutor = (log: string[][]) => ({
     async run(argv: readonly string[]) {
       log.push([...argv]);
-      return answers[argv.join(' ')] ?? failed(1);
+      const entry = answers[argv.join(' ')];
+      if (Array.isArray(entry)) {
+        const next = entry.shift();
+        return next ?? failed(1);
+      }
+      return entry ?? failed(1);
     },
   });
   const reserved = makeExecutor(reservedLog) as CommandExecutorPort;
@@ -81,6 +93,7 @@ function twoHostExecutors(answers: Record<string, CommandRunResult>) {
 const freshPathAnswers: Record<string, CommandRunResult> = {
   [PATH_PROBE_ARGV.join(' ')]: failed(1),
   [BRANCH_PROBE_ARGV.join(' ')]: failed(1),
+  [CAT_FILE_ARGV.join(' ')]: ok(),
   [ADD_ARGV.join(' ')]: ok(),
 };
 
@@ -106,11 +119,74 @@ describe('WorkspaceAdapter prepareLaneWorktree', () => {
     const { adapter, reservedLog, otherLog } = twoHostExecutors(freshPathAnswers);
     const result = await adapter.prepareLaneWorktree!(defaultRequest);
     expect(result).toEqual({ outcome: 'prepared' });
-    expect(reservedLog).toEqual([PATH_PROBE_ARGV, BRANCH_PROBE_ARGV, ADD_ARGV]);
-    expect(reservedLog[2]).toContain('-c');
-    expect(reservedLog[2]).toContain('core.hooksPath=/dev/null');
-    expect(reservedLog[2]).not.toContain('--force');
+    expect(reservedLog).toEqual([PATH_PROBE_ARGV, BRANCH_PROBE_ARGV, CAT_FILE_ARGV, ADD_ARGV]);
+    expect(reservedLog[3]).toContain('-c');
+    expect(reservedLog[3]).toContain('core.hooksPath=/dev/null');
+    expect(reservedLog[3]).not.toContain('--force');
     expect(otherLog).toEqual([]);
+  });
+
+  it('does not fetch when the base commit is already present, and adds the worktree', async () => {
+    const { adapter, reservedLog } = twoHostExecutors(freshPathAnswers);
+    const result = await adapter.prepareLaneWorktree!(defaultRequest);
+    expect(result).toEqual({ outcome: 'prepared' });
+    expect(reservedLog.some((argv) => argv.includes('fetch'))).toBe(false);
+    expect(reservedLog).toContainEqual(CAT_FILE_ARGV);
+    expect(reservedLog).toContainEqual(ADD_ARGV);
+  });
+
+  it('fetches origin when the base commit is missing, then adds the worktree', async () => {
+    const answers: Record<string, CommandRunResult | CommandRunResult[]> = {
+      [PATH_PROBE_ARGV.join(' ')]: failed(1),
+      [BRANCH_PROBE_ARGV.join(' ')]: failed(1),
+      [CAT_FILE_ARGV.join(' ')]: [failed(1), ok()],
+      [FETCH_ARGV.join(' ')]: ok(),
+      [ADD_ARGV.join(' ')]: ok(),
+    };
+    const { adapter, reservedLog } = twoHostExecutors(answers);
+    const result = await adapter.prepareLaneWorktree!(defaultRequest);
+    expect(result).toEqual({ outcome: 'prepared' });
+    expect(reservedLog).toEqual([
+      PATH_PROBE_ARGV,
+      BRANCH_PROBE_ARGV,
+      CAT_FILE_ARGV,
+      FETCH_ARGV,
+      CAT_FILE_ARGV,
+      ADD_ARGV,
+    ]);
+    // The fetch is exactly the hardened default-remote fetch — never a
+    // caller-supplied ref or the base commit.
+    const fetchIndex = reservedLog.findIndex((argv) => argv.includes('fetch'));
+    expect(fetchIndex).toBeGreaterThan(-1);
+    expect(reservedLog[fetchIndex]).toEqual(FETCH_ARGV);
+    expect(reservedLog[fetchIndex]).not.toContain(BASE);
+  });
+
+  it('refuses git-refused when the base is still missing after the fetch, without adding', async () => {
+    const answers: Record<string, CommandRunResult> = {
+      [PATH_PROBE_ARGV.join(' ')]: failed(1),
+      [BRANCH_PROBE_ARGV.join(' ')]: failed(1),
+      [CAT_FILE_ARGV.join(' ')]: failed(1),
+      [FETCH_ARGV.join(' ')]: ok(),
+    };
+    const { adapter, reservedLog } = twoHostExecutors(answers);
+    const result = await adapter.prepareLaneWorktree!(defaultRequest);
+    expect(result).toEqual({ outcome: 'refused', reason: 'git-refused' });
+    expect(reservedLog.some((argv) => argv.includes('add'))).toBe(false);
+  });
+
+  it('reads a hanging fetch as unknown without adding', async () => {
+    const hanging: CommandRunResult = { exitCode: null, signal: null, stdout: '', stderr: '' };
+    const answers: Record<string, CommandRunResult> = {
+      [PATH_PROBE_ARGV.join(' ')]: failed(1),
+      [BRANCH_PROBE_ARGV.join(' ')]: failed(1),
+      [CAT_FILE_ARGV.join(' ')]: failed(1),
+      [FETCH_ARGV.join(' ')]: hanging,
+    };
+    const { adapter, reservedLog } = twoHostExecutors(answers);
+    const result = await adapter.prepareLaneWorktree!(defaultRequest);
+    expect(result).toEqual({ outcome: 'unknown' });
+    expect(reservedLog.some((argv) => argv.includes('add'))).toBe(false);
   });
 
   it('reads an already prepared worktree as already-prepared without adding', async () => {

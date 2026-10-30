@@ -1429,6 +1429,36 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       });
     });
 
+    it('a fix attempt with no recorded model opens no assessment and never passes the gate (KF-20)', async () => {
+      const collected = attemptFixture({
+        kind: 'fix',
+        priorAttemptId: 'attempt-example-0',
+        state: 'collected',
+        artifacts: COLLECTED_ARTIFACTS,
+        runner: { ...CONDUCTED_RUNNER, model: null },
+        seatSelection: null,
+      });
+      const harness = await makeHarness(runRecord(), [collected], {
+        wireReviewAssessment: true,
+        wireGateReceipts: true,
+      });
+      harness.setManifest(CHECKS_MANIFEST);
+      harness.setManifestVerdict('sealed');
+      harness.setGateAnswer({
+        verdict: 'passed',
+        results: [
+          commandResult('command 1: build', 'pass', 0),
+          commandResult('command 2: test', 'pass', 0),
+        ],
+      });
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      expect(harness.reviewOpenRequests).toHaveLength(0);
+      expect(result).not.toMatchObject({ reasonCode: 'gate-passed' });
+    });
+
     it('falls back to the manifest model when the attempt has no runner model (KF-20)', async () => {
       const collected = attemptFixture({
         state: 'collected',

@@ -205,8 +205,11 @@ async function recordGateReceiptsGuarded(
     modelAssignment !== null && typeof modelAssignment === 'object'
       ? (modelAssignment as { readonly model?: unknown }).model
       : null;
-  const implementerModel =
-    runnerModel !== null && runnerModel.trim().length > 0 ? runnerModel : manifestModel;
+  // The manifest's model names only a first-pass writer: a fix attempt with no
+  // recorded model has an unknown writer, so the gate fails closed (as the
+  // review step refuses it) rather than name the first-pass seat.
+  const recorded = runnerModel !== null && runnerModel.trim().length > 0 ? runnerModel : null;
+  const implementerModel = recorded ?? (latest.kind === 'fix' ? null : manifestModel);
   if (typeof implementerModel !== 'string' || implementerModel.trim().length === 0) {
     return false;
   }

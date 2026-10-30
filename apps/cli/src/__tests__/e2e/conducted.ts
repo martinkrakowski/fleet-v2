@@ -57,6 +57,20 @@ export interface ConductedFixtureOptions {
    * order (one per review); past the list every review passes.
    */
   readonly reviewVerdicts?: readonly ('PASS' | 'FAIL')[];
+  /**
+   * E2E-FIX: when set, the frozen seat plan's `fix` seat uses this model
+   * (its id `fx-1`, tool and agent stay unchanged). Default: the implementer
+   * model.
+   */
+  readonly fixModel?: string;
+  /**
+   * E2E-FIX: a directory NAME resolved against the fixture's own disposable
+   * directory. When set, the committing lane script also copies the session's
+   * `.lane/brief.md` into that directory on every dispatched session, one
+   * uniquely named file per session, so a test can read the brief the lane
+   * actually received.
+   */
+  readonly captureBriefs?: string;
 }
 
 export interface CliRunResult {
@@ -275,11 +289,20 @@ function ghStubScript(argvLog: string): string {
  * `ocm-run --detach`'s visibility poll still sees it before the client ends
  * the session.
  */
-function laneCommitScript(): string {
+function laneCommitScript(captureBriefsDir?: string): string {
   return [
     '#!/bin/sh',
     'printf "\\nA lane edit for this run.\\n" >> packages/example/README.md',
     'git -c user.name=example -c user.email=example@example.invalid commit -am "lane: append an example line" >/dev/null',
+    // E2E-FIX: capture the brief this session actually received. A unique
+    // mktemp target keeps one file per session even if two sessions overlap.
+    ...(captureBriefsDir === undefined
+      ? []
+      : [
+          `if [ -f .lane/brief.md ] && captured=$(mktemp ${sq(captureBriefsDir)}/brief-XXXXXX); then`,
+          '  cp .lane/brief.md "$captured"',
+          'fi',
+        ]),
     'sleep 2',
     '',
   ].join('\n');
@@ -553,7 +576,15 @@ export async function startConductedFixture(
     await writeTool('gh', ghStubScript(ghArgvLog));
     await writeTool('ocm-run', ocmRunWrapperScript(realOcmRunBin, ocmRunArgvLog, ocmRunEnvLog, ocmRunStderrLog));
     if (options?.committingLane === true) {
-      await fs.writeFile(laneScriptPath, laneCommitScript(), 'utf8');
+      // E2E-FIX: the brief-capture directory is created before any lane runs,
+      // so the script's mktemp never fails on a missing parent.
+      const briefCaptureDir = options?.captureBriefs === undefined
+        ? undefined
+        : path.join(dir, options.captureBriefs);
+      if (briefCaptureDir !== undefined) {
+        await fs.mkdir(briefCaptureDir, { recursive: true });
+      }
+      await fs.writeFile(laneScriptPath, laneCommitScript(briefCaptureDir), 'utf8');
       await fs.chmod(laneScriptPath, 0o700);
     }
     await writeTool(
@@ -709,7 +740,12 @@ export async function startConductedFixture(
           { id: 'fp-1', model: IMPLEMENTER_MODEL, tool: 'opencode', agent: seatAgent },
         ],
         fix: [
-          { id: 'fx-1', model: IMPLEMENTER_MODEL, tool: 'opencode', agent: seatAgent },
+          {
+            id: 'fx-1',
+            model: options?.fixModel ?? IMPLEMENTER_MODEL,
+            tool: 'opencode',
+            agent: seatAgent,
+          },
         ],
         review: [
           { id: 'rv-1', model: REVIEWER_MODEL, tool: 'opencode', agent: REVIEWER_AGENT },

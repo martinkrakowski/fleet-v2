@@ -89,10 +89,15 @@ function parseExportFlags(argv: readonly string[], io: CliIo): ExportFlags | nul
   const seen = new Set<string>();
   const readValue = (token: string, index: number): string | null => {
     if (token.includes('=')) {
-      return token.slice(token.indexOf('=') + 1);
+      const equals = token.slice(token.indexOf('=') + 1);
+      if (equals === '') {
+        io.stderr(`${token} requires a value\n`);
+        return null;
+      }
+      return equals;
     }
     const value = argv[index + 1];
-    if (value === undefined || value.startsWith('--')) {
+    if (value === undefined || value === '' || value.startsWith('--')) {
       io.stderr(`${token} requires a value\n`);
       return null;
     }
@@ -117,6 +122,11 @@ function parseExportFlags(argv: readonly string[], io: CliIo): ExportFlags | nul
       continue;
     }
     if (token === '--json') {
+      if (seen.has('json')) {
+        io.stderr(`Repeated flag: --json\n`);
+        return null;
+      }
+      seen.add('json');
       continue;
     }
     const flag =
@@ -132,7 +142,7 @@ function parseExportFlags(argv: readonly string[], io: CliIo): ExportFlags | nul
                 ? 'deadline'
                 : null;
     if (flag === null) {
-      io.stderr(`Unknown telemetry export option: ${token}\n`);
+      io.stderr(`Unknown telemetry export option\n`);
       return null;
     }
     if (seen.has(flag)) {
@@ -281,11 +291,17 @@ async function statusCommand(
   io: CliIo,
   runtime: FleetCliRuntime,
 ): Promise<number> {
-  for (const token of argv) {
-    io.stderr(`Unknown telemetry status option: ${token}\n`);
+  if (argv.length > 0) {
+    io.stderr(`Unknown telemetry status option\n`);
     return 2;
   }
-  const read = await runtime.telemetry.dispositions.read();
+  let read: Awaited<ReturnType<typeof runtime.telemetry.dispositions.read>>;
+  try {
+    read = await runtime.telemetry.dispositions.read();
+  } catch {
+    io.stdout(`${JSON.stringify({ outcome: 'store-unreadable', configured: runtime.telemetry.configured })}\n`);
+    return 1;
+  }
   if (read.outcome === 'unreadable') {
     io.stdout(`${JSON.stringify({ outcome: 'store-unreadable', configured: runtime.telemetry.configured })}\n`);
     return 1;
@@ -332,6 +348,6 @@ export async function telemetryCommand(
   if (subcommand === 'status') {
     return await statusCommand(argv.slice(1), io, runtime);
   }
-  io.stderr(`Unknown telemetry subcommand: ${subcommand === '' ? '(none)' : subcommand}\n`);
+  io.stderr(`Unknown telemetry subcommand\n`);
   return 2;
 }

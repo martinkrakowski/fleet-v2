@@ -69,14 +69,21 @@ function tempStateDir(): string {
   return mkdtempSync(join(tmpdir(), 'fleet-v2-telemetry-test-'));
 }
 
-/** Run one CLI invocation and return its exit code and captured stdout/stderr. */
+/** Run one CLI invocation and return its exit code and captured stdout/stderr.
+ *  Every call is checked for leaked secrets: the example salt, endpoint and
+ *  token may appear in neither stream. */
 async function runTelemetry(
   runtime: FleetCliRuntime,
   args: readonly string[],
 ): Promise<{ code: number; stdout: string[]; stderr: string[] }> {
   const io = captureIo();
   const code = await runCli(['telemetry', ...args], io, runtime);
-  return { code, stdout: io.outLines, stderr: io.errLines };
+  const result = { code, stdout: io.outLines, stderr: io.errLines };
+  const printed = JSON.stringify([result.stdout, result.stderr]);
+  expect(printed, `leak check for ${args.join(' ')}`).not.toContain(SALT);
+  expect(printed, `leak check for ${args.join(' ')}`).not.toContain(EXAMPLE_ENDPOINT);
+  expect(printed, `leak check for ${args.join(' ')}`).not.toContain(EXAMPLE_TOKEN);
+  return result;
 }
 
 /** One JSON document on stdout. */
@@ -206,6 +213,87 @@ describe('fleet-v2 telemetry (OT4b-2)', () => {
       expect(result.stderr, args.join(' ')).toHaveLength(1);
       expect(result.stderr.join(''), args.join(' ')).toContain(fragment);
     }
+  });
+
+  it('usage errors never echo a caller value', async () => {
+    const runtime = fakeRuntime();
+    const cases: Array<[readonly string[], string]> = [
+      [['export', '--token=example-token'], 'Unknown telemetry export option'],
+      [['export', 'stray'], 'Unknown telemetry export option'],
+      [['status', 'https://collector.example.test/v1/traces'], 'Unknown telemetry status option'],
+      [['example-secret-subcommand'], 'Unknown telemetry subcommand'],
+    ];
+    for (const [args, fragment] of cases) {
+      const result = await runTelemetry(runtime, args);
+      expect(result.code, args.join(' ')).toBe(2);
+      expect(result.stdout, args.join(' ')).toEqual([]);
+      expect(result.stderr.join(''), args.join(' ')).toContain(fragment);
+      expect(result.stderr.join(''), args.join(' ')).not.toContain('example-token');
+      expect(result.stderr.join(''), args.join(' ')).not.toContain('collector.example.test');
+      expect(result.stderr.join(''), args.join(' ')).not.toContain('example-secret-subcommand');
+    }
+  });
+
+  it('an empty flag value is a usage error and never calls the use case', async () => {
+    let called = 0;
+    const runtime = fakeRuntime({
+      exportTelemetry: {
+        execute: async () => {
+          called += 1;
+          return { outcome: 'nothing-selected', counts: ZERO_COUNTS };
+        },
+      },
+    });
+    for (const args of [
+      ['export', '--dry-run', '--run='],
+      ['export', '--dry-run', '--work-order='],
+      ['export', '--dry-run', '--run', ''],
+      ['export', '--dry-run', '--since='],
+    ]) {
+      const result = await runTelemetry(runtime, args);
+      expect(result.code, args.join(' ')).toBe(2);
+      expect(result.stdout, args.join(' ')).toEqual([]);
+      expect(result.stderr.join(''), args.join(' ')).toContain('requires a value');
+      expect(result.stderr.join(''), args.join(' ')).not.toContain('example-token');
+    }
+    expect(called).toBe(0);
+  });
+
+  it('--retry-rejected reaches the use case, --json is accepted once and rejected twice', async () => {
+    let captured: unknown;
+    const runtime = fakeRuntime({
+      exportTelemetry: {
+        execute: async (request: unknown) => {
+          captured = request;
+          return { outcome: 'nothing-selected', counts: ZERO_COUNTS };
+        },
+      },
+    });
+    const sent = await runTelemetry(runtime, ['export', '--run', 'run-example-1', '--retry-rejected', '--json']);
+    expect(sent.code).toBe(0);
+    expect((captured as Record<string, unknown>).retryRejected).toBe(true);
+    captured = undefined;
+    const jsonOnce = await runTelemetry(runtime, ['export', '--dry-run', '--since', SINCE, '--json']);
+    expect(jsonOnce.code).toBe(0);
+    expect((captured as Record<string, unknown>).retryRejected).toBe(false);
+    const jsonTwice = await runTelemetry(runtime, ['export', '--dry-run', '--since', SINCE, '--json', '--json']);
+    expect(jsonTwice.code).toBe(2);
+    expect(jsonTwice.stderr.join('')).toContain('Repeated flag: --json');
+  });
+
+  it('a throwing store read makes status exit 1 with store-unreadable and no path', async () => {
+    const runtime = fakeRuntime({
+      dispositions: {
+        read: async () => {
+          throw new Error('cannot read /example/state/telemetry-dispositions.json');
+        },
+      },
+    });
+    const result = await runTelemetry(runtime, ['status']);
+    expect(result.code).toBe(1);
+    expect(parseDocument(result.stdout)).toEqual({ outcome: 'store-unreadable', configured: 'configured' });
+    expect(JSON.stringify(result.stdout)).not.toContain('/example/state/telemetry-dispositions.json');
+    expect(JSON.stringify(result.stderr)).not.toContain('/example/state/telemetry-dispositions.json');
   });
 
   it('--help prints the help constant and exits 0', async () => {

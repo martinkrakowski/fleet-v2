@@ -22,6 +22,7 @@ import {
   telemetrySaltFingerprint,
   type RunTelemetryPort,
   type TelemetryHmac,
+  type TelemetryResourceInput,
 } from '@fleet/work-execution';
 import { TELEMETRY_SALT_MIN_DISTINCT, TELEMETRY_SALT_PATTERN, type ResolvedTelemetryPolicy } from '@fleet/installation';
 
@@ -73,6 +74,82 @@ function policyView(policy: ResolvedTelemetryPolicy): TelemetryPolicyView {
   });
 }
 
+/** Bytewise order, the same on every host and locale. */
+function compareCodeUnits(a: string, b: string): number {
+  if (a < b) {
+    return -1;
+  }
+  return a > b ? 1 : 0;
+}
+
+function addIfNonEmpty(values: Set<string>, value: string | null | undefined): void {
+  if (typeof value === 'string' && value !== '') {
+    values.add(value);
+  }
+}
+
+/** An attempt's operator ids and free-text paths (never a run id). */
+function addAttemptCanaries(
+  values: Set<string>,
+  attempt: {
+    readonly id: string;
+    readonly workOrderId: string;
+    readonly priorAttemptId?: string | null;
+    readonly worktreePath?: string | null;
+    readonly briefPackagePath?: string | null;
+    readonly sessionId?: string | null;
+  },
+): void {
+  addIfNonEmpty(values, attempt.id);
+  addIfNonEmpty(values, attempt.workOrderId);
+  addIfNonEmpty(values, attempt.priorAttemptId);
+  addIfNonEmpty(values, attempt.worktreePath);
+  addIfNonEmpty(values, attempt.briefPackagePath);
+  addIfNonEmpty(values, attempt.sessionId);
+}
+
+/** The step remainder of each journal key (the run id prefix goes out raw by plan). */
+function addJournalKeyCanaries(
+  values: Set<string>,
+  runId: string,
+  entries: readonly { readonly key: string | null }[],
+): void {
+  for (const entry of entries) {
+    if (entry.key === null) {
+      continue;
+    }
+    const stripped = entry.key.startsWith(`${runId}/`) ? entry.key.slice(runId.length + 1) : entry.key;
+    if (stripped.length >= 4) {
+      values.add(stripped);
+    }
+  }
+}
+
+/** A work order's identity, project and owned-path fields. */
+function addWorkOrderCanaries(
+  values: Set<string>,
+  workOrder: {
+    readonly id: string;
+    readonly projectId: string;
+    readonly taskId: string;
+    readonly laneId: string;
+    readonly repository: string;
+    readonly ownedPaths: readonly string[];
+  } | null,
+): void {
+  if (workOrder === null) {
+    return;
+  }
+  addIfNonEmpty(values, workOrder.id);
+  addIfNonEmpty(values, workOrder.projectId);
+  addIfNonEmpty(values, workOrder.taskId);
+  addIfNonEmpty(values, workOrder.laneId);
+  addIfNonEmpty(values, workOrder.repository);
+  for (const owned of workOrder.ownedPaths) {
+    addIfNonEmpty(values, owned);
+  }
+}
+
 export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOptions) {
   const repository = new EvidenceAssessmentRepositoryAdapter({ stateDir, readOnly: true });
   const inspector = new InspectAcceptanceEvidenceUseCase({ repo: repository });
@@ -82,7 +159,7 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
   const attemptRepo = new AttemptRepositoryAdapter({ stateDir, readOnly: true });
   const journal = new LaneRunJournalAdapter({ stateDir, readOnly: true });
   const runRepo = new LaneRunRepositoryAdapter({ stateDir, readOnly: true });
-  const workOrderRepo = new WorkOrderRepositoryAdapter({ stateDir });
+  const workOrderRepo = new WorkOrderRepositoryAdapter({ stateDir, readOnly: true });
   const dispositions = new TelemetryDispositionAdapter({ stateDir });
 
   // The installation validator's own salt rule (lowercase hex, whole bytes, not a
@@ -141,6 +218,56 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
           hmac,
         });
 
+  /**
+   * The OTLP resource input for dry-run encoding (plan §3.2): the CLI package
+   * version and the policy's project name, frozen.
+   */
+  const resource: TelemetryResourceInput = Object.freeze({
+    serviceVersion: SERVICE_VERSION,
+    projectName: policy.projectName,
+  });
+
+  /**
+   * The redaction canary values of the real state directory's records (plan
+   * §3.8): every free-text value and raw operator id that must never reach the
+   * encoded payload — attempt identity fields, work order identity, project and
+   * owned-path fields, run work order ids and the step remainder of each run
+   * journal key. Run ids and journal entry ids go out raw by plan and are never
+   * collected. A store read that throws rejects the whole call; the command
+   * catches that and reports `canary-unreadable`.
+   */
+  const canaryValues = async (): Promise<readonly string[]> => {
+    const values = new Set<string>();
+    const workOrderIds = new Set<string>();
+    const attempts = await attemptRepo.listAllAttempts();
+    for (const attempt of attempts) {
+      addAttemptCanaries(values, attempt);
+      workOrderIds.add(attempt.workOrderId);
+    }
+    const runs = await runRepo.list();
+    const journals = await Promise.all(runs.map((run) => journal.listForRun(run.runId)));
+    runs.forEach((run, index) => {
+      const entries = journals[index];
+      // A read that returns no list fails closed (canary-unreadable), as the sequential loop did.
+      if (!Array.isArray(entries)) {
+        throw new TypeError('journal-unreadable');
+      }
+      addIfNonEmpty(values, run.workOrderId);
+      workOrderIds.add(run.workOrderId);
+      addJournalKeyCanaries(values, run.runId, entries);
+    });
+    // One read of the work-order store, filtered to the collected ids.
+    const workOrders = await workOrderRepo.listWorkOrdersByProject();
+    for (const workOrder of workOrders) {
+      if (workOrderIds.has(workOrder.id)) {
+        addWorkOrderCanaries(values, workOrder);
+      }
+    }
+    // Receipt ids are never collected: the receipt port exposes them only as
+    // opaque `TelemetryHashInput` tokens that are only ever hashed.
+    return [...values].sort(compareCodeUnits);
+  };
+
   return {
     telemetry: {
       acceptanceReceiptRead,
@@ -149,6 +276,8 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
       configured,
       saltFingerprint: saltFingerprint,
       policy: policyView(policy),
+      resource,
+      canaryValues,
     },
   };
 }

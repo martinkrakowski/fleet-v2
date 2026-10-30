@@ -94,6 +94,7 @@ import {
   type AcceptanceReceiptReadAdapter,
   type ExportRunTelemetryUseCase,
   type TelemetryDispositionAdapter,
+  type TelemetryResourceInput,
 } from '@fleet/work-execution';
 
 import {
@@ -682,6 +683,10 @@ export interface FleetCliRuntime {
     readonly saltFingerprint: string | null;
     /** The resolved telemetry policy without its salt (the salt never leaves the composer). */
     readonly policy: TelemetryPolicyView;
+    /** The OTLP resource input for dry-run encoding (plan §3.2); frozen. */
+    readonly resource: TelemetryResourceInput;
+    /** The redaction canary values of the real state directory's records (OT4b-3). */
+    readonly canaryValues: () => Promise<readonly string[]>;
   };
 }
 

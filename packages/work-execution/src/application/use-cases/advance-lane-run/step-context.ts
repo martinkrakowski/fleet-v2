@@ -61,7 +61,7 @@ export async function performEnter(ctx: AdvanceStepContext,
 
 /** The park reasons that also ask one keyed owner question (K6 header). */
 const OWNER_QUESTION_REASONS: readonly LaneRunParkReason[] = [
-  'one-way-door', 'owner-merge', 'blocker-after-round-2', 'seat-plan-exhausted',
+  'one-way-door', 'owner-merge', 'blocker-after-round-2', 'seat-plan-exhausted', 'fix-no-progress',
 ];
 
 /**

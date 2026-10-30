@@ -69,6 +69,7 @@ export const LANE_RUN_PARK_REASONS = [
   'acceptance-rejected', // §3.2 accepting → parked: AssessHeadAcceptance rejected at the head
   'step-refused',        // a keyed action was refused (prepare, collect, gate, accept, open-pr, push, merge); qualifier = the step
   'owner-merge',         // merging without a policy grant (auto-merge off or not eligible): the owner merges
+  'fix-no-progress',     // a fix attempt collected at its prior's head: no change to gate or review
 ] as const;
 export type LaneRunParkReason = (typeof LANE_RUN_PARK_REASONS)[number];
 
@@ -89,6 +90,7 @@ export const LANE_RUN_PARK_QUALIFIER = {
   'acceptance-rejected': 'none',
   'step-refused': 'step',
   'owner-merge': 'none',
+  'fix-no-progress': 'none',
 } as const satisfies Record<LaneRunParkReason, 'none' | 'step' | 'stop-refusal'>;
 
 export interface LaneRunParkRecord {

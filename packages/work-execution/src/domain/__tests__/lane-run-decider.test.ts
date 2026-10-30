@@ -676,20 +676,20 @@ describe('collecting state', () => {
 
   it('C2: no commits enters seat-failed', () => {
     const facts = baseFacts({
-      state: 'collecting', attempt: attemptFact({ collection: { commits: 0, manifest: 'sealed' } }),
+      state: 'collecting', attempt: attemptFact({ collection: { headUnchanged: false, commits: 0, manifest: 'sealed' } }),
     });
     assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'seat-failed' });
   });
 
   it('C3: a missing or mismatched manifest parks artifacts-unsealed', () => {
     const missing = baseFacts({
-      state: 'collecting', attempt: attemptFact({ collection: { commits: 1, manifest: 'missing' } }),
+      state: 'collecting', attempt: attemptFact({ collection: { headUnchanged: false, commits: 1, manifest: 'missing' } }),
     });
     assertDecision(missing, record({}), decide(record({}), missing), {
       kind: 'park', reason: 'artifacts-unsealed', qualifier: null, parkedFrom: 'collecting',
     });
     const mismatch = baseFacts({
-      state: 'collecting', attempt: attemptFact({ collection: { commits: 1, manifest: 'mismatch' } }),
+      state: 'collecting', attempt: attemptFact({ collection: { headUnchanged: false, commits: 1, manifest: 'mismatch' } }),
     });
     assertDecision(mismatch, record({}), decide(record({}), mismatch), {
       kind: 'park', reason: 'artifacts-unsealed', qualifier: null, parkedFrom: 'collecting',
@@ -698,9 +698,18 @@ describe('collecting state', () => {
 
   it('C4: sealed with commits enters gating', () => {
     const facts = baseFacts({
-      state: 'collecting', attempt: attemptFact({ collection: { commits: 1, manifest: 'sealed' } }),
+      state: 'collecting', attempt: attemptFact({ collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
     });
     assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'gating' });
+  });
+
+  it('C4b: a fix attempt collected at its prior head parks fix-no-progress', () => {
+    const facts = baseFacts({
+      state: 'collecting', attempt: attemptFact({ collection: { headUnchanged: true, commits: 1, manifest: 'sealed' } }),
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'fix-no-progress', qualifier: null, parkedFrom: 'collecting',
+    });
   });
 });
 
@@ -836,7 +845,7 @@ describe('fixing state', () => {
     const rec = record({ attemptIds: ['attempt-example-1'] });
     const facts = baseFacts({
       state: 'fixing',
-      attempt: attemptFact({ phase: 'collected', collection: { commits: 1, manifest: 'sealed' } }),
+      attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
     });
     expect(decide(rec, facts)).toEqual({
       kind: 'act', step: 'prepare', key: `${RUN_ID}/r1/prepare/0/a2`, round: 1, seatIndex: 0, head12: null, retry: null,
@@ -888,7 +897,7 @@ describe('fixing state', () => {
     const rec = record({ round: 2, attemptIds: ['a1', 'a2', 'a3'] });
     const facts = baseFacts({
       state: 'fixing',
-      attempt: attemptFact({ attemptId: 'a3', round: 2, phase: 'collected', collection: { commits: 1, manifest: 'sealed' } }),
+      attempt: attemptFact({ attemptId: 'a3', round: 2, phase: 'collected', collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
     });
     assertDecision(facts, rec, decide(rec, facts), {
       kind: 'park', reason: 'blocker-after-round-2', qualifier: null, parkedFrom: 'fixing',
@@ -899,7 +908,7 @@ describe('fixing state', () => {
     const rec = record({ round: 1, attemptIds: ['attempt-example-1', 'attempt-example-2'] });
     const facts = baseFacts({
       state: 'fixing',
-      attempt: attemptFact({ attemptId: 'attempt-example-2', round: 1, phase: 'collected', collection: { commits: 1, manifest: 'sealed' } }),
+      attempt: attemptFact({ attemptId: 'attempt-example-2', round: 1, phase: 'collected', collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
     });
     expect(decide(rec, facts)).toEqual({
       kind: 'act', step: 'prepare', key: `${RUN_ID}/r2/prepare/0/a3`, round: 2, seatIndex: 0, head12: null, retry: null,
@@ -932,7 +941,7 @@ describe('fixing state', () => {
     const rec = record({ attemptIds: ['attempt-example-1'] });
     const facts = baseFacts({
       state: 'fixing',
-      attempt: attemptFact({ phase: 'collected', collection: { commits: 1, manifest: 'sealed' } }),
+      attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
       implementerSeat: { ok: false },
     });
     assertDecision(facts, rec, decide(rec, facts), {
@@ -1137,7 +1146,7 @@ describe('rounds across the run', () => {
     const rec = record({ attemptIds: ['attempt-example-1'] });
     const facts = baseFacts({
       state: 'fixing',
-      attempt: attemptFact({ phase: 'collected', collection: { commits: 1, manifest: 'sealed' } }),
+      attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
     });
     expect(decide(rec, facts)).toEqual({
       kind: 'act', step: 'prepare', key: `${RUN_ID}/r1/prepare/0/a2`, round: 1, seatIndex: 0, head12: null, retry: null,
@@ -1363,7 +1372,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
       kind: 'act', step: 'collect', key: `${RUN_ID}/r0/collect/0`, round: 0, seatIndex: 0, head12: null, retry: null,
     });
 
-    const sealed = { commits: 2, manifest: 'sealed' as const };
+    const sealed = { commits: 2, manifest: 'sealed' as const, headUnchanged: false };
     const s4 = baseFacts({ state: 'collecting', stopMode: 'graceful', attempt: attemptFact({ phase: 'collected', collection: sealed }), ...grace });
     assertDecision(s4, rec, decide(rec, s4), { kind: 'enter', to: 'gating' });
 
@@ -1385,7 +1394,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
       state: 'gating',
       stopMode: 'graceful',
       head12: HEAD,
-      attempt: attemptFact({ phase: 'collected', collection: { commits: 2, manifest: 'sealed' } }),
+      attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 2, manifest: 'sealed' } }),
     };
     const failed = baseFacts({ ...base, gate: 'failed' });
     assertDecision(failed, rec, decide(rec, failed), { kind: 'enter', to: 'stopped' });
@@ -1395,7 +1404,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
 
   it('a zero-commit collection ends the drain stopped, never preparing the next seat', () => {
     const rec = record({});
-    const attempt = attemptFact({ phase: 'collected', collection: { commits: 0, manifest: 'sealed' } });
+    const attempt = attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 0, manifest: 'sealed' } });
     const collecting = baseFacts({ state: 'collecting', stopMode: 'graceful', attempt });
     assertDecision(collecting, rec, decide(rec, collecting), { kind: 'enter', to: 'seat-failed' });
     const seatFailed = baseFacts({ state: 'seat-failed', stopMode: 'graceful', attempt });
@@ -1403,7 +1412,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
   });
 
   it('an unsealed collection parks, then the parked run enters stopped', () => {
-    const attempt = attemptFact({ phase: 'collected', collection: { commits: 2, manifest: 'missing' } });
+    const attempt = attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 2, manifest: 'missing' } });
     const rec = record({});
     const collecting = baseFacts({ state: 'collecting', stopMode: 'graceful', attempt });
     assertDecision(collecting, rec, decide(rec, collecting), {
@@ -1437,7 +1446,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
   });
 
   it('a halt parks the drain and it continues once lifted', () => {
-    const attempt = attemptFact({ phase: 'collected', collection: { commits: 2, manifest: 'sealed' } });
+    const attempt = attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 2, manifest: 'sealed' } });
     const rec = record({});
     const halted = baseFacts({ state: 'gating', stopMode: 'graceful', halted: true, head12: HEAD, gate: 'none', attempt });
     assertDecision(halted, rec, decide(rec, halted), { kind: 'park', reason: 'halted', qualifier: null, parkedFrom: 'gating' });
@@ -1470,7 +1479,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
       const facts = baseFacts({
         state,
         stopMode: 'graceful',
-        attempt: attemptFact({ phase: 'collected', collection: { commits: 2, manifest: 'sealed' } }),
+        attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 2, manifest: 'sealed' } }),
         head12: HEAD,
         acceptedHead12: HEAD,
       });
@@ -1645,7 +1654,7 @@ describe('KF-1: halt blocks the collect and gate reconcile (G3a under halt)', ()
     const facts = baseFacts({
       state: 'gating',
       halted: true,
-      attempt: attemptFact({ phase: 'collected', collection: { commits: 1, manifest: 'sealed' } }),
+      attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
       pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'unread' },
     });
     expect(decide(record({}), facts)).toEqual({ kind: 'park', reason: 'halted', qualifier: null, parkedFrom: 'gating' });

@@ -1039,4 +1039,36 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
       entries.filter((entry) => entry.kind === 'result' && entry.key !== null && entry.key.includes('/stop/')),
     ).toEqual([]);
   });
+
+  it('test 18 (KF-17): a refused dispatch whose reservation is gone, after resume, cancels the attempt instead of waiting on admission', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: 'refused by the example runner' }));
+    await admit(harness, 'attempt-example-1');
+    const key = dispatchKey(0, 0, 1);
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+
+    // Resume: clear the park and re-conduct `ready` (the park's parkedFrom).
+    const parked = await harness.runRepo.get(RUN_ID);
+    if (parked === null || parked.parked === null) {
+      throw new Error('fixture must end parked');
+    }
+    const saved = await harness.deps.runRepo.save(
+      { ...parked, parked: null, revision: parked.revision + 1 },
+      { holderId: HOLDER, fence: 1, nowIso: LATER },
+    );
+    expect(saved.outcome).toBe('saved');
+    await conduct(harness, 'ready', LATER);
+
+    // The reservation is gone: without the KF-17 admission bypass the
+    // prepared attempt would wait `admission` forever, because a refusal of
+    // `no-reservation` never admits. The not-started dispatch cancels the
+    // attempt instead, without contacting the runner.
+    expect(await harness.executionJournal.releaseCapacityReservation('attempt-example-1', LATER)).toBe(true);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'dispatch-pending' });
+    // Only the original refused call: the cancel never re-sends the key.
+    expect(harness.dispatchRequests).toHaveLength(1);
+    expect(harness.cancelRequests).toEqual([{ attemptId: 'attempt-example-1', nowIso: LATER }]);
+    expect((await harness.attemptRepo.findAttemptById('attempt-example-1'))?.state).toBe('cancelled');
+    expect((await harness.runJournal.listForKey(key)).filter((entry) => entry.kind === 'intent')).toHaveLength(1);
+  });
 });

@@ -602,7 +602,7 @@ describe('ExportRunTelemetryUseCase send: store refusals (OT2c-2)', () => {
     expect(spanTexts(fakes.dispositions.snapshot()).size).toBe(0);
   });
 
-  it('a pending write that kept a concurrent final sends nothing and counts every span refusedByStore', async () => {
+  it('a pending write that kept a concurrent final sends nothing; applied spans count pending, kept ones refusedByStore', async () => {
     const { deps, fakes } = makeDeps();
     fakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID));
     fakes.dispositions.writeScript = [{ outcome: 'written', applied: 1, kept: 1 }];
@@ -611,7 +611,7 @@ describe('ExportRunTelemetryUseCase send: store refusals (OT2c-2)', () => {
 
     expect(fakes.telemetry.sendCalls).toBe(0);
     expect(fakes.dispositions.writeCalls).toBe(1);
-    expect(result.counts).toEqual({ ...zeroCounts(), attemptsSelected: 1, spansMapped: 2, toSend: 2, refusedByStore: 2 });
+    expect(result.counts).toEqual({ ...zeroCounts(), attemptsSelected: 1, spansMapped: 2, toSend: 2, pending: 1, refusedByStore: 1 });
     expect(result.errorKind).toBeNull();
   });
 
@@ -642,7 +642,7 @@ describe('ExportRunTelemetryUseCase send: store refusals (OT2c-2)', () => {
 
     expect(spanTexts(seededFakes.dispositions.snapshot()).get(second!.spanId)).toBe('exported@collector');
     expect(seededFakes.telemetry.sendCalls).toBe(0);
-    expect(result.counts.refusedByStore).toBe(result.counts.toSend);
+    expect(sendCountsTotal(result.counts)).toBe(result.counts.toSend);
   });
 
   it('a lock-busy result write leaves the spans pending and the next export resends them', async () => {

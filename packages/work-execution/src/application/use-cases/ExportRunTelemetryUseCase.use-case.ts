@@ -796,8 +796,10 @@ export class ExportRunTelemetryUseCase implements ExportRunTelemetryPort {
     if (pendingWrite.value.kept !== 0) {
       // Another exporter finalised a selected span after our read: the store
       // kept that final, so not every span landed pending. Nothing is sent;
-      // the next export re-reads the store and skips the finals.
-      return { outcome: 'exported', counts: { ...counts, refusedByStore: spans.length }, errorKind: null };
+      // the next export re-reads the store and skips the finals. The applied
+      // spans stay pending; the kept ones keep their stored final.
+      const appliedPending = Math.min(pendingWrite.value.applied, spans.length);
+      return { outcome: 'exported', counts: { ...counts, pending: appliedPending, refusedByStore: spans.length - appliedPending }, errorKind: null };
     }
 
     // Step 3: the send. A throw or rejection leaves every span pending and writes nothing more.

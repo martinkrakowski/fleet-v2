@@ -269,7 +269,7 @@ hex_of() { od -An -v -tx1 | tr -d ' \n'; }
 # object store (a loose file, alternates) could otherwise serve forged bytes (Fable review A2).
 verified_object() {
   g cat-file "$2" "$1" > "$3" 2>/dev/null || return 1
-  [ "$(g hash-object -t "$2" --stdin < "$3" 2>/dev/null)" = "$1" ]
+  [ "$(g hash-object --no-filters -t "$2" --stdin < "$3" 2>/dev/null)" = "$1" ]
 }
 
 # Write the verified blob of path $1 at TRUSTED_BASE to $T/base-blob: commit -> each tree -> blob,

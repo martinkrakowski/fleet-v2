@@ -36,6 +36,29 @@ export type AssessHeadAcceptanceResult =
   | { readonly outcome: 'stale'; readonly reason: string }
   | { readonly outcome: 'rejected'; readonly reason: string };
 
+/**
+ * The result of a receipts-only head assessment. It never carries
+ * `accepted`: a receipts pass is the conductor's pre-PR evidence, not an
+ * acceptance, and is never stored as one. Every merge decision uses
+ * `assessHeadAcceptance`.
+ */
+export type AssessHeadReceiptsResult =
+  | {
+      readonly outcome: 'receipts-passed';
+      readonly receiptsId: string;
+      readonly candidateHeadSha: string;
+      readonly assessment: EvidenceAssessmentRecord;
+      readonly reviewTally?: ReviewTally;
+    }
+  | Extract<AssessHeadAcceptanceResult, { outcome: 'blocked' | 'stale' | 'rejected' }>;
+
 export interface AssessHeadAcceptancePort {
   assessHeadAcceptance(request: AssessHeadAcceptanceRequest): Promise<AssessHeadAcceptanceResult>;
+  /**
+   * Receipts-only head assessment (checks, reviews, findings, doors), for the
+   * conductor's pre-PR step. It skips the forge read only — no pull request
+   * exists yet — and never stores `accepted`. Every merge decision uses
+   * `assessHeadAcceptance`.
+   */
+  assessHeadReceipts(request: AssessHeadAcceptanceRequest): Promise<AssessHeadReceiptsResult>;
 }

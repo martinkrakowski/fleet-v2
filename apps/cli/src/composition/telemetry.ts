@@ -22,6 +22,7 @@ import {
   telemetrySaltFingerprint,
   type RunTelemetryPort,
   type TelemetryHmac,
+  type TelemetryResourceInput,
 } from '@fleet/work-execution';
 import { TELEMETRY_SALT_MIN_DISTINCT, TELEMETRY_SALT_PATTERN, type ResolvedTelemetryPolicy } from '@fleet/installation';
 
@@ -141,6 +142,80 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
           hmac,
         });
 
+  /**
+   * The OTLP resource input for dry-run encoding (plan §3.2): the CLI package
+   * version and the policy's project name, frozen.
+   */
+  const resource: TelemetryResourceInput = Object.freeze({
+    serviceVersion: SERVICE_VERSION,
+    projectName: policy.projectName,
+  });
+
+  /**
+   * The redaction canary values of the real state directory's records (plan
+   * §3.8): every free-text value and raw operator id that must never reach the
+   * encoded payload — attempt identity fields, work order identity, project and
+   * owned-path fields, run work order ids and the step remainder of each run
+   * journal key. Run ids and journal entry ids go out raw by plan and are never
+   * collected. A store read that throws rejects the whole call; the command
+   * catches that and reports `canary-unreadable`.
+   */
+  const canaryValues = async (): Promise<readonly string[]> => {
+    const values = new Set<string>();
+    const workOrderIds = new Set<string>();
+    const addIfNonEmpty = (value: string | null | undefined): void => {
+      if (typeof value === 'string' && value !== '') {
+        values.add(value);
+      }
+    };
+
+    const attempts = await attemptRepo.listAllAttempts();
+    for (const attempt of attempts) {
+      addIfNonEmpty(attempt.id);
+      addIfNonEmpty(attempt.workOrderId);
+      addIfNonEmpty(attempt.priorAttemptId);
+      addIfNonEmpty(attempt.worktreePath);
+      addIfNonEmpty(attempt.briefPackagePath);
+      addIfNonEmpty(attempt.sessionId);
+      workOrderIds.add(attempt.workOrderId);
+    }
+
+    const runs = await runRepo.list();
+    for (const run of runs) {
+      addIfNonEmpty(run.workOrderId);
+      workOrderIds.add(run.workOrderId);
+      const entries = await journal.listForRun(run.runId);
+      for (const entry of entries) {
+        if (entry.key === null) {
+          continue;
+        }
+        const stripped = entry.key.startsWith(`${run.runId}/`)
+          ? entry.key.slice(run.runId.length + 1)
+          : entry.key;
+        if (stripped.length >= 4) {
+          values.add(stripped);
+        }
+      }
+    }
+
+    for (const workOrderId of workOrderIds) {
+      const workOrder = await workOrderRepo.findWorkOrderById(workOrderId);
+      if (workOrder === null) {
+        continue;
+      }
+      addIfNonEmpty(workOrder.id);
+      addIfNonEmpty(workOrder.projectId);
+      addIfNonEmpty(workOrder.taskId);
+      addIfNonEmpty(workOrder.laneId);
+      addIfNonEmpty(workOrder.repository);
+      for (const owned of workOrder.ownedPaths) {
+        addIfNonEmpty(owned);
+      }
+    }
+
+    return [...values].sort();
+  };
+
   return {
     telemetry: {
       acceptanceReceiptRead,
@@ -149,6 +224,8 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
       configured,
       saltFingerprint: saltFingerprint,
       policy: policyView(policy),
+      resource,
+      canaryValues,
     },
   };
 }

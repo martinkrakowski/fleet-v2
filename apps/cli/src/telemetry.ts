@@ -4,7 +4,8 @@
  * hand-run attempts — one run, one work order, or a time window — maps them
  * to telemetry spans and either sends them through the configured collector
  * route (OTLP/HTTP) under a bounded deadline, or with `--dry-run` prints the
- * spans exactly as they would be sent and writes nothing. `status` prints
+ * spans exactly as they would be sent and writes nothing, with `--canary`
+ * running the redaction checks on the encoded payload (OT4b-3). `status` prints
  * whether telemetry is configured (never the endpoint, token or salt), the
  * salt fingerprint and the one recorded in the disposition store, the schema
  * version and id hash prefix, the route, the last export time,
@@ -15,6 +16,8 @@
 
 import {
   dispositionCounts,
+  encodeOtlpTraces,
+  redactionChecks,
   TELEMETRY_HASH_PREFIX,
   TELEMETRY_SCHEMA_VERSION,
   type ExportRunTelemetryResult,
@@ -28,7 +31,7 @@ export interface TelemetryCliOptions {
   readonly now?: () => Date;
 }
 
-export const TELEMETRY_HELP = `Usage: fleet-v2 telemetry export --run <runId>|--work-order <id>|--since <ISO> [--until <ISO>] [--deadline <seconds>] [--retry-rejected] [--dry-run] [--json]
+export const TELEMETRY_HELP = `Usage: fleet-v2 telemetry export --run <runId>|--work-order <id>|--since <ISO> [--until <ISO>] [--deadline <seconds>] [--retry-rejected] [--dry-run [--canary]] [--json]
        fleet-v2 telemetry status
 
 Export selects conducted runs and hand-run attempts — one run, one work order,
@@ -45,6 +48,7 @@ The output is always JSON; --json is accepted and has no effect.
   --deadline <seconds> total send budget in seconds (integer 1..600, default 120)
   --retry-rejected     move the selection's rejected spans back to pending before sending
   --dry-run            print the spans and write nothing; needs no endpoint
+  --canary            with --dry-run, run the redaction checks on the encoded payload
   --json               accepted; output is always JSON
 
 status prints whether telemetry is configured (never the endpoint, token or
@@ -63,6 +67,7 @@ interface ExportFlags {
   readonly deadline: number;
   readonly retryRejected: boolean;
   readonly dryRun: boolean;
+  readonly canary: boolean;
 }
 
 /** A zoned ISO time the window accepts: a finite parse and a `T` separator. */
@@ -86,6 +91,7 @@ function parseExportFlags(argv: readonly string[], io: CliIo): ExportFlags | nul
   let deadline = 120;
   let retryRejected = false;
   let dryRun = false;
+  let canary = false;
   const seen = new Set<string>();
   const readValue = (token: string, index: number): string | null => {
     if (token.includes('=')) {
@@ -119,6 +125,14 @@ function parseExportFlags(argv: readonly string[], io: CliIo): ExportFlags | nul
         return null;
       }
       dryRun = true;
+      continue;
+    }
+    if (token === '--canary') {
+      if (canary) {
+        io.stderr(`Repeated flag: ${token}\n`);
+        return null;
+      }
+      canary = true;
       continue;
     }
     if (token === '--json') {
@@ -202,7 +216,11 @@ function parseExportFlags(argv: readonly string[], io: CliIo): ExportFlags | nul
     io.stderr(`--retry-rejected cannot be combined with --dry-run\n`);
     return null;
   }
-  return { run, workOrder, since, until, deadline, retryRejected, dryRun };
+  if (canary && !dryRun) {
+    io.stderr(`--canary requires --dry-run\n`);
+    return null;
+  }
+  return { run, workOrder, since, until, deadline, retryRejected, dryRun, canary };
 }
 
 /** Send exit code (plan §3.8): 0 when nothing was selected or every selected span exported. */
@@ -214,14 +232,6 @@ function sendExitCode(result: ExportRunTelemetryResult): number {
     return result.errorKind === null && result.counts.pending + result.counts.rejected + result.counts.refusedByStore === 0
       ? 0
       : 1;
-  }
-  return 1;
-}
-
-/** Dry-run exit code (plan §3.8): 0 when no selected span would be dropped or refused as invalid. */
-function dryRunExitCode(result: ExportRunTelemetryResult): number {
-  if (result.outcome === 'dry-run' || result.outcome === 'nothing-selected') {
-    return result.counts.rejectedInvalid === 0 ? 0 : 1;
   }
   return 1;
 }
@@ -275,8 +285,62 @@ async function exportCommand(
     retryRejected: flags.retryRejected,
     nowIso,
   });
-  io.stdout(`${JSON.stringify(result)}\n`);
-  return flags.dryRun ? dryRunExitCode(result) : sendExitCode(result);
+
+  // Send mode: print the use-case result and map its outcome to the exit code.
+  if (!flags.dryRun) {
+    io.stdout(`${JSON.stringify(result)}\n`);
+    return sendExitCode(result);
+  }
+
+  // Dry-run mode: encode the selected spans exactly as they would be sent,
+  // count the encoding refusals (brand, validators and `pricingSafe`), and —
+  // with `--canary` — run the redaction checks on the encoded payload.
+  const encoded = result.outcome === 'dry-run' ? encodeOtlpTraces(result.spans, runtime.telemetry.resource) : null;
+  const encodeRefused = encoded === null ? 0 : encoded.refused.length;
+  const printed: Record<string, unknown> = { ...result, encodeRefused };
+
+  if (flags.canary) {
+    if (encoded !== null && encoded.payload !== null) {
+      let canaryValues: readonly string[];
+      try {
+        canaryValues = await runtime.telemetry.canaryValues();
+      } catch {
+        io.stdout(`${JSON.stringify({ outcome: 'canary-unreadable' })}\n`);
+        return 1;
+      }
+      const report = redactionChecks(encoded.payload, canaryValues);
+      printed.canary = {
+        pass: report.pass,
+        checks: report.checks.map((check) => ({
+          check: check.check,
+          pass: check.pass,
+          offendingSpans: check.offendingSpans,
+        })),
+        skippedCanaries: report.skippedCanaries,
+      };
+    } else {
+      printed.canary = { pass: true, checks: [], skippedCanaries: 0 };
+    }
+  }
+
+  io.stdout(`${JSON.stringify(printed)}\n`);
+
+  if (result.outcome === 'nothing-selected') {
+    return 0;
+  }
+  if (result.outcome !== 'dry-run') {
+    return 1;
+  }
+  if (result.counts.rejectedInvalid > 0 || encodeRefused > 0) {
+    return 1;
+  }
+  if (flags.canary && typeof printed.canary === 'object' && printed.canary !== null) {
+    const canaryReport = printed.canary as { readonly pass: boolean };
+    if (!canaryReport.pass) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 /**

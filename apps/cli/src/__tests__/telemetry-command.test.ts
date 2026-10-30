@@ -13,6 +13,11 @@ import { describe, expect, it } from 'vitest';
 
 import type { FleetInstallation } from '@fleet/installation';
 import {
+  AttemptRepositoryAdapter,
+  LaneRunJournalAdapter,
+  LaneRunRepositoryAdapter,
+  TelemetrySpan,
+  WorkOrderRepositoryAdapter,
   emptyTelemetryDispositionRecord,
   type ExportRunTelemetryCounts,
   type ExportRunTelemetryResult,
@@ -29,6 +34,13 @@ const EXAMPLE_ENDPOINT = 'https://collector.example.test/v1/traces';
 const EXAMPLE_TOKEN = 'example-token';
 const NOW = new Date('2026-10-30T12:00:00.000Z');
 const SINCE = '2026-01-01T00:00:00.000Z';
+
+const CANARY_WORKTREE_PATH = '/example/canary-worktree';
+const CANARY_TASK_ID = 'example-canary-task';
+const SEEDED_ATTEMPT_ID = 'att-canary-1';
+const SEEDED_WORK_ORDER_ID = 'wo-canary-1';
+const SEEDED_RUN_ID = 'run-01ARZ3NDEKTSV4RRFFQ69G5FAV';
+const SEEDED_ENTRY_ID = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 
 const ZERO_COUNTS: ExportRunTelemetryCounts = {
   runsSelected: 0,
@@ -149,12 +161,120 @@ interface FakeTelemetryOverrides {
   readonly configured?: FleetCliRuntime['telemetry']['configured'];
   readonly saltFingerprint?: string | null;
   readonly policy?: FleetCliRuntime['telemetry']['policy'];
+  readonly resource?: FleetCliRuntime['telemetry']['resource'];
+  readonly canaryValues?: FleetCliRuntime['telemetry']['canaryValues'];
   readonly dispositions?: {
     read: () => Promise<
       | { outcome: 'read'; record: TelemetryDispositionRecord }
       | { outcome: 'unreadable' }
     >;
   };
+}
+
+/** One real, encodable span for fake dry-run results. */
+function validSpan(): TelemetrySpan {
+  const span = TelemetrySpan.build({
+    traceId: 'a'.repeat(32),
+    spanId: 'b'.repeat(16),
+    parentSpanId: null,
+    name: 'lane-run',
+    kind: 'CHAIN',
+    startIso: '2026-10-01T00:00:00.000Z',
+    endIso: '2026-10-02T00:00:00.000Z',
+    status: { code: 'ok', reasonCode: null },
+    attributes: {},
+    events: [],
+  });
+  expect(span).not.toBeNull();
+  return span as TelemetrySpan;
+}
+
+/**
+ * Seed the real stores over a temp state dir: a work order with the
+ * distinctive task id, an attempt with the distinctive worktree path, and —
+ * when `withRun` — a run and one journal entry whose key strips to a step
+ * remainder. The composed runtime rereads these records.
+ */
+async function seedCanaryState(stateDir: string, withRun: boolean): Promise<void> {
+  const workOrderRepo = new WorkOrderRepositoryAdapter({ stateDir });
+  await workOrderRepo.saveWorkOrder({
+    id: SEEDED_WORK_ORDER_ID,
+    projectId: 'project-canary-1',
+    taskId: CANARY_TASK_ID,
+    laneId: 'lane-canary-1',
+    repository: 'https://example.com/canary.git',
+    baseCommit: '0123456789abcdef0123456789abcdef01234567',
+    ownedPaths: ['src/', 'tests/'],
+    policyRevision: 'policy-rev-1',
+    prerequisiteWorkOrderIds: [],
+    state: 'approved',
+    revision: 1,
+    createdAtIso: '2026-10-01T00:00:00.000Z',
+    updatedAtIso: '2026-10-01T00:00:00.000Z',
+  });
+
+  const attemptRepo = new AttemptRepositoryAdapter({ stateDir });
+  await attemptRepo.saveAttempt({
+    id: SEEDED_ATTEMPT_ID,
+    workOrderId: SEEDED_WORK_ORDER_ID,
+    kind: 'initial',
+    fixNumber: 0,
+    priorAttemptId: null,
+    worktreePath: CANARY_WORKTREE_PATH,
+    baseCommit: '0123456789abcdef0123456789abcdef01234567',
+    state: 'ended',
+    revision: 1,
+    outcome: null,
+    briefDigest: null,
+    briefPackagePath: '/example/canary-brief',
+    sessionId: 'session-canary-1',
+    completionReceipt: null,
+    artifacts: null,
+    createdAtIso: '2026-10-01T00:00:00.000Z',
+    updatedAtIso: '2026-10-01T00:00:00.000Z',
+  });
+
+  if (!withRun) {
+    return;
+  }
+
+  const runRepo = new LaneRunRepositoryAdapter({ stateDir });
+  const created = await runRepo.create({
+    version: 1,
+    runId: SEEDED_RUN_ID,
+    workOrderId: SEEDED_WORK_ORDER_ID,
+    tier: 1,
+    seatPlanRef: 'a'.repeat(64),
+    cursors: { 'first-pass': 0, fix: null, review: null },
+    round: 0,
+    attemptIds: [SEEDED_ATTEMPT_ID],
+    prNumber: null,
+    parked: null,
+    parkCount: 0,
+    lease: null,
+    revision: 1,
+    runPolicyRevision: 'policy-rev-1',
+  });
+  expect(created.outcome).toBe('saved');
+
+  const journal = new LaneRunJournalAdapter({ stateDir });
+  const appended = await journal.append({
+    version: 1,
+    entryId: SEEDED_ENTRY_ID,
+    kind: 'intent',
+    key: `${SEEDED_RUN_ID}/r0/dispatch/0/a1`,
+    runId: SEEDED_RUN_ID,
+    recordedAtIso: '2026-10-02T00:00:00.000Z',
+    mode: null,
+    expectedRevision: null,
+    mintedId: SEEDED_ATTEMPT_ID,
+    outcome: null,
+    reasonCode: null,
+    detail: null,
+    grantId: null,
+    state: null,
+  });
+  expect(appended.outcome).toBe('appended');
 }
 
 /** A fake runtime carrying only the telemetry surface the commands read. */
@@ -177,6 +297,10 @@ function fakeRuntime(overrides: FakeTelemetryOverrides = {}): FleetCliRuntime {
         includeDryRun: true,
         projectAliases: {},
       },
+      resource:
+        overrides.resource ??
+        ({ serviceVersion: '0.0.0', projectName: 'fleet-lanes' } as FleetCliRuntime['telemetry']['resource']),
+      canaryValues: overrides.canaryValues ?? (async () => []),
     },
   } as unknown as FleetCliRuntime;
 }
@@ -202,6 +326,8 @@ describe('fleet-v2 telemetry (OT4b-2)', () => {
       [['export', '--dry-run', '--since', SINCE, '--deadline', 'abc'], '--deadline'],
       [['export', '--dry-run', '--since', SINCE, '--deadline', '1.5'], '--deadline'],
       [['export', '--dry-run', '--since', SINCE, '--retry-rejected'], '--retry-rejected'],
+      [['export', '--canary', '--run', 'run-example-1'], '--canary requires --dry-run'],
+      [['export', '--dry-run', '--canary', '--canary', '--since', SINCE], 'Repeated flag'],
       [['export', 'stray'], 'Unknown telemetry export option'],
       [['status', '--frob'], 'Unknown telemetry status option'],
       [['frob'], 'Unknown telemetry subcommand'],
@@ -552,5 +678,163 @@ describe('fleet-v2 telemetry (OT4b-2)', () => {
     const result = await runTelemetry(runtime, ['status']);
     expect(result.code).toBe(1);
     expect(parseDocument(result.stdout)).toEqual({ outcome: 'store-unreadable', configured: 'configured' });
+  });
+
+  it('export --dry-run --since over seeded state encodes cleanly and exits 0', async () => {
+    const stateDir = tempStateDir();
+    try {
+      await seedCanaryState(stateDir, false);
+      const runtime = makeRuntime(stateDir);
+      const result = await runTelemetry(runtime, ['export', '--dry-run', '--since', SINCE]);
+      expect(result.code).toBe(0);
+      const document = parseDocument(result.stdout);
+      expect(document.outcome).toBe('dry-run');
+      expect(document.encodeRefused).toBe(0);
+      const printed = JSON.stringify(result.stdout);
+      expect(printed).not.toContain(CANARY_WORKTREE_PATH);
+      expect(printed).not.toContain(CANARY_TASK_ID);
+    } finally {
+      await fs.rm(stateDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('a dry run with one unbranded span reports encodeRefused 1 and exits 1', async () => {
+    const base: ExportRunTelemetryCounts = {
+      ...ZERO_COUNTS,
+      runsSelected: 0,
+      attemptsSelected: 1,
+      spansMapped: 1,
+      toSend: 1,
+    };
+    const runtime = fakeRuntime({
+      exportTelemetry: {
+        execute: async () =>
+          ({ outcome: 'dry-run', counts: base, spans: [{ notBranded: true }] }) as unknown as ExportRunTelemetryResult,
+      },
+    });
+    const result = await runTelemetry(runtime, ['export', '--dry-run', '--since', SINCE]);
+    expect(result.code).toBe(1);
+    expect(parseDocument(result.stdout)).toMatchObject({ outcome: 'dry-run', encodeRefused: 1 });
+  });
+
+  it('--dry-run --canary over seeded state prints five passing checks and never a canary value', async () => {
+    const stateDir = tempStateDir();
+    try {
+      await seedCanaryState(stateDir, false);
+      const runtime = makeRuntime(stateDir);
+      const result = await runTelemetry(runtime, ['export', '--dry-run', '--canary', '--since', SINCE]);
+      expect(result.code).toBe(0);
+      const document = parseDocument(result.stdout);
+      expect(document.outcome).toBe('dry-run');
+      expect(document.encodeRefused).toBe(0);
+      const canary = document.canary as {
+        pass: boolean;
+        checks: Array<{ check: string; pass: boolean }>;
+        skippedCanaries: number;
+      };
+      expect(canary.pass).toBe(true);
+      expect(canary.checks).toHaveLength(5);
+      expect(canary.checks.map((check) => check.check)).toEqual([
+        'payload-parses',
+        'canaries',
+        'key-allow-list',
+        'values',
+        'secret-shapes',
+      ]);
+      for (const check of canary.checks) {
+        expect(check.pass).toBe(true);
+      }
+      expect(canary.skippedCanaries).toBe(0);
+      const printed = JSON.stringify([result.stdout, result.stderr]);
+      expect(printed).not.toContain(CANARY_WORKTREE_PATH);
+      expect(printed).not.toContain(CANARY_TASK_ID);
+    } finally {
+      await fs.rm(stateDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('a planted canary in the encoded payload makes the canaries check fail and exit 1 without printing the value', async () => {
+    const planted = 'planted-canary-value';
+    const base: ExportRunTelemetryCounts = {
+      ...ZERO_COUNTS,
+      runsSelected: 0,
+      attemptsSelected: 1,
+      spansMapped: 1,
+      toSend: 1,
+    };
+    const runtime = fakeRuntime({
+      resource: { serviceVersion: '0.0.0', projectName: planted },
+      policy: {
+        enabled: true,
+        projectName: planted,
+        route: 'collector',
+        sampleRatio: 1,
+        sendCost: true,
+        includeDryRun: true,
+        projectAliases: {},
+      },
+      canaryValues: async () => [planted],
+      exportTelemetry: {
+        execute: async () => ({ outcome: 'dry-run', counts: base, spans: [validSpan()] }),
+      },
+    });
+    const result = await runTelemetry(runtime, ['export', '--dry-run', '--canary', '--since', SINCE]);
+    expect(result.code).toBe(1);
+    const document = parseDocument(result.stdout);
+    expect(document.outcome).toBe('dry-run');
+    const canary = document.canary as { pass: boolean; checks: Array<{ check: string; pass: boolean }> };
+    expect(canary.pass).toBe(false);
+    const canariesCheck = canary.checks.find((check) => check.check === 'canaries');
+    expect(canariesCheck?.pass).toBe(false);
+    expect(JSON.stringify([result.stdout, result.stderr])).not.toContain(planted);
+  });
+
+  it('a rejecting canaryValues prints canary-unreadable and exits 1', async () => {
+    const base: ExportRunTelemetryCounts = {
+      ...ZERO_COUNTS,
+      runsSelected: 0,
+      attemptsSelected: 1,
+      spansMapped: 1,
+      toSend: 1,
+    };
+    const runtime = fakeRuntime({
+      exportTelemetry: {
+        execute: async () => ({ outcome: 'dry-run', counts: base, spans: [validSpan()] }),
+      },
+      canaryValues: async () => {
+        throw new Error('store unreadable');
+      },
+    });
+    const result = await runTelemetry(runtime, ['export', '--dry-run', '--canary', '--since', SINCE]);
+    expect(result.code).toBe(1);
+    expect(parseDocument(result.stdout)).toEqual({ outcome: 'canary-unreadable' });
+    expect(JSON.stringify(result.stdout)).not.toContain('store unreadable');
+  });
+
+  it('composer canaryValues lists the expected values and no run id or entry id', async () => {
+    const stateDir = tempStateDir();
+    try {
+      await seedCanaryState(stateDir, true);
+      const runtime = makeRuntime(stateDir);
+      const values = await runtime.telemetry.canaryValues();
+      expect(values).toEqual([
+        '/example/canary-brief',
+        '/example/canary-worktree',
+        'att-canary-1',
+        'example-canary-task',
+        'https://example.com/canary.git',
+        'lane-canary-1',
+        'project-canary-1',
+        'r0/dispatch/0/a1',
+        'session-canary-1',
+        'src/',
+        'tests/',
+        'wo-canary-1',
+      ]);
+      expect(values).not.toContain(SEEDED_RUN_ID);
+      expect(values).not.toContain(SEEDED_ENTRY_ID);
+    } finally {
+      await fs.rm(stateDir, { recursive: true, force: true }).catch(() => {});
+    }
   });
 });

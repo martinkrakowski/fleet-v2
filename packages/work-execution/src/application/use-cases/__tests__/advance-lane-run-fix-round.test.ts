@@ -1180,6 +1180,91 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
   });
 });
 
+describe('AdvanceLaneRunUseCase dispatch seat override (KF-18)', () => {
+  it('q) a fix attempt dispatches on its own fix seat through a seat override (KF-18)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    // The fix port selects a fix seat whose model differs from the frozen
+    // brief's model assignment (the first-pass model): the dispatch would be
+    // refused on the seat binding without the override.
+    harness.setFixAnswer(async (request) => ({
+      outcome: 'prepared',
+      attempt: {
+        ...buildFixAttempt(request, 0),
+        seatSelection: {
+          role: 'fix',
+          seatIndex: 0,
+          seatId: 'fx-example',
+          model: 'example-provider/fix-model',
+          tool: 'opencode',
+          variant: 'low',
+          agent: 'lane-fix',
+        },
+      },
+    }));
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared',
+    });
+    const afterPrepare = await harness.runRepo.get(RUN_ID);
+    const fixAttemptId = afterPrepare?.attemptIds[1];
+    expect(typeof fixAttemptId).toBe('string');
+    await admit(harness, fixAttemptId as string);
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'dispatch', result: 'completed', reasonCode: 'dispatch-started',
+    });
+    expect(harness.dispatchRequests).toHaveLength(1);
+    expect(harness.dispatchRequests[0]?.seatOverride).toEqual({
+      model: 'example-provider/fix-model',
+      agent: 'lane-fix',
+      variant: 'low',
+      reason: 'fix seat fx-example',
+      setBy: 'conductor',
+      expiresAtIso: new Date(Date.parse(LATER) + 2700 * 1000).toISOString(),
+    });
+  });
+
+  it('r) an initial pivot attempt still dispatches with the seat-plan pivot override (KF-18)', async () => {
+    const pivotAttempt: AttemptRecord = {
+      ...collectedAttempt(),
+      id: 'attempt-example-2',
+      priorAttemptId: 'attempt-example-1',
+      state: 'intent-recorded',
+      completionReceipt: null,
+      artifacts: null,
+    };
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [collectedAttempt(), pivotAttempt],
+    );
+    await admit(harness, 'attempt-example-2');
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'dispatch', result: 'completed', reasonCode: 'dispatch-started',
+    });
+    expect(harness.dispatchRequests).toHaveLength(1);
+    expect(harness.dispatchRequests[0]?.seatOverride).toMatchObject({
+      model: 'model-example-1',
+      reason: 'seat-plan pivot to fp-1',
+      setBy: 'conductor',
+    });
+  });
+
+  it('s) a first attempt dispatches without a seat override (KF-18)', async () => {
+    const firstAttempt: AttemptRecord = {
+      ...collectedAttempt(),
+      state: 'intent-recorded',
+      completionReceipt: null,
+      artifacts: null,
+    };
+    const harness = await makeHarness(runRecord(), [firstAttempt]);
+    await admit(harness, 'attempt-example-1');
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'dispatch', result: 'completed', reasonCode: 'dispatch-started',
+    });
+    expect(harness.dispatchRequests).toHaveLength(1);
+    expect(harness.dispatchRequests[0]?.seatOverride).toBeUndefined();
+  });
+});
+
 describe('dispatchRefusalDetail maps every dispatch refusal to a fixed code (KF-16)', () => {
   it.each([
     ['Worktree /example/wt does not match the base commit (checked out abc)', 'worktree-head-mismatch'],
@@ -1203,6 +1288,11 @@ describe('dispatchRefusalDetail maps every dispatch refusal to a fixed code (KF-
     ['Work order not found: wo-1', 'work-order-missing'],
     ['runner-not-available', 'runner-unavailable'],
     ['No runner port can be described for dispatch', 'runner-unavailable'],
+    [
+      'Frozen brief model assignment example-model does not match seat fx-example (example-provider/fix-model) selected for attempt attempt-1',
+      'seat-mismatch',
+    ],
+    ['Seat override example-provider/fix-model shares underlying model family with recorded reviewer seat rev-1', 'seat-family-conflict'],
     ['something new', 'other'],
     // A path with spaces still maps by its phrase.
     ['Worktree /example/work tree does not match the base commit (checked out abc)', 'worktree-head-mismatch'],

@@ -1,7 +1,7 @@
 /** The `act prepare` and `act dispatch` steps of AdvanceLaneRunUseCase (AL-1). */
 import type { AdvanceLaneRunRefusal, AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import { AttemptRevisionConflictError } from '../../ports/out/AttemptRepositoryPort.out-port.js';
-import { parseSeatTool, type AttemptRecord, type AttemptSeatOverrideRecord } from '../../../domain/execution-records.js';
+import { parseSeatTool, type AttemptRecord, type AttemptSeatOverrideRecord, type AttemptSeatSelectionRecord } from '../../../domain/execution-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunCursorsRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
@@ -190,6 +190,15 @@ export function dispatchRefusalDetail(reason: string): string {
   if (reason === 'runner-not-available' || reason.startsWith('No runner port can be described')) {
     return 'runner-unavailable';
   }
+  // KF-18: the seat-binding refusal of a fix attempt whose fix seat differs
+  // from the frozen brief's model assignment, and the reviewer-seat family
+  // refusal of a seat override.
+  if (reason.includes('does not match seat')) {
+    return 'seat-mismatch';
+  }
+  if (reason.includes('shares underlying model family with recorded reviewer seat')) {
+    return 'seat-family-conflict';
+  }
   return 'other';
 }
 
@@ -293,18 +302,28 @@ export async function performDispatch(ctx: AdvanceStepContext,
     // Later writes in this advance (a park) must chain on the saved revision.
     record = saved.record ?? record;
   }
-  const pivot =
-    latest.kind === 'initial' && latest.priorAttemptId !== null && latest.seatSelection != null
-      ? latest.seatSelection
-      : null;
+  // KF-18: a fix attempt dispatches on its own fix seat through a seat
+  // override; the seat-plan pivot (a re-prepare on the round's next seat)
+  // keeps its override. A fix attempt with no seat selection keeps no
+  // override, and a first attempt (priorAttemptId null) never carries one.
+  const seatSelection = latest.seatSelection ?? null;
+  const seatForOverride: AttemptSeatSelectionRecord | null =
+    latest.kind === 'initial' && latest.priorAttemptId !== null
+      ? seatSelection
+      : latest.kind === 'fix' && seatSelection !== null && seatSelection.role === 'fix'
+        ? seatSelection
+        : null;
   const seatOverride: AttemptSeatOverrideRecord | null =
-    pivot === null
+    seatForOverride === null
       ? null
       : {
-          model: pivot.model,
-          ...(pivot.agent !== null ? { agent: pivot.agent } : {}),
-          ...(pivot.variant !== null ? { variant: pivot.variant } : {}),
-          reason: 'seat-plan pivot to ' + pivot.seatId,
+          model: seatForOverride.model,
+          ...(seatForOverride.agent !== null ? { agent: seatForOverride.agent } : {}),
+          ...(seatForOverride.variant !== null ? { variant: seatForOverride.variant } : {}),
+          reason:
+            latest.kind === 'fix'
+              ? 'fix seat ' + seatForOverride.seatId
+              : 'seat-plan pivot to ' + seatForOverride.seatId,
           setBy: 'conductor',
           expiresAtIso: new Date(Date.parse(nowIso) + timeLimitSeconds * 1000).toISOString(),
         };

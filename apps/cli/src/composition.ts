@@ -202,6 +202,14 @@ export interface FleetCliRuntimeOptions {
   readonly runnerRemoteHost?: string;
   /** SSH host alias holding the worktree when it is not on this host. */
   readonly worktreeSshHost?: string;
+  /**
+   * The runtime's own environment object (tests inject a record here).
+   * Defaults to `process.env`. The runner tunnel reads `OCM_HOST` and
+   * `OCM_REMOTE_PORT` from this object only, so a test runtime with an
+   * environment without them never opens a tunnel even when the real process
+   * environment carries the variables.
+   */
+  readonly env?: Record<string, string | undefined>;
   /** Owner Ed25519 public key in base64 format for verifying approved decisions. */
   readonly ownerPublicKey?: string;
   /** Deterministic subprocess execution for runner tests. */
@@ -673,8 +681,8 @@ export interface FleetCliRuntime {
   };
   /**
    * KF-35: the runner tunnel the conductor driver holds for its lifetime,
-   * resolved from the same `OCM_HOST`/`OCM_REMOTE_PORT` environment
-   * `bin/ocm-run` itself reads. Absent values mean the driver opens nothing.
+   * resolved from the runtime's own environment object's `OCM_HOST` and
+   * `OCM_REMOTE_PORT`. Absent values mean the driver opens nothing.
    */
   readonly runnerTunnel: RunnerTunnelAdapter;
   readonly telemetry: {
@@ -751,7 +759,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     runnerRemotePort,
     ocmRunBin,
     runnerRemoteHost,
-  } = resolveRunnerSettings(options);
+  } = resolveRunnerSettings(options, undefined, options?.env ?? process.env);
   // an invalid installation throws here, never runs
   const installationModel = options?.installation
     ? requireValidInstallationModel(options.installation)
@@ -899,15 +907,19 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     env: process.env,
   });
 
-  // KF-35: the driver's one runner tunnel, resolved from the same
-  // OCM_HOST/OCM_REMOTE_PORT environment bin/ocm-run reads. Nothing is
-  // spawned here; the conductor driver opens the forward before its first
-  // pass and stops it in the same finally that releases its leases.
-  const parsedTunnelPort = process.env.OCM_REMOTE_PORT
-    ? Number(process.env.OCM_REMOTE_PORT)
+  // KF-35: the driver's one runner tunnel, resolved from the runtime's own
+  // environment object — the same environment `bin/ocm-run` variables would
+  // come from, and the one tests control. A runtime environment without
+  // OCM_HOST/OCM_REMOTE_PORT opens no tunnel even when the real process
+  // environment carries them. Nothing is spawned here; the conductor driver
+  // opens the forward before its first pass and stops it in the same finally
+  // that releases its leases.
+  const runtimeEnv = options?.env ?? process.env;
+  const parsedTunnelPort = runtimeEnv.OCM_REMOTE_PORT
+    ? Number(runtimeEnv.OCM_REMOTE_PORT)
     : Number.NaN;
   const runnerTunnel = new RunnerTunnelAdapter({
-    sshHost: process.env.OCM_HOST?.trim() || undefined,
+    sshHost: runtimeEnv.OCM_HOST?.trim() || undefined,
     remotePort: Number.isSafeInteger(parsedTunnelPort) ? parsedTunnelPort : undefined,
   });
 

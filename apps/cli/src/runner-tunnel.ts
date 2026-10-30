@@ -69,6 +69,26 @@ export interface RunnerTunnelOptions {
 const DEFAULT_WAIT_MS = 10_000;
 const DEFAULT_POLL_MS = 250;
 
+/**
+ * A host `ssh` may be given safely: not blank, not leading `-` (it would be
+ * read as an option), and no whitespace or control character anywhere
+ * (mirrors `bin/ocm-run`'s own `OCM_HOST` check). `-oProxyCommand=…` is the
+ * shape this refuses.
+ */
+function isUsableSshHost(host: string): boolean {
+  if (host.startsWith('-') || /\s/u.test(host)) {
+    return false;
+  }
+  // Control characters (C0 and DEL) may not appear anywhere in the host.
+  for (const character of host) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** Production probe: one TCP dial to the loopback dial port. */
 function dialLoopback(port: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -142,12 +162,18 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
   async ensureTunnel(
     handlers: { readonly onEarlyExit?: () => void } = {},
   ): Promise<RunnerTunnelStartOutcome> {
-    const host = this.sshHost?.trim();
     const dial = this.dialPort();
     // No ssh target or no dial port: `ocm-run` handles the route itself
     // (local server, or its own usage error) and the driver opens nothing.
-    if (host === undefined || host === '' || dial === null) {
+    if (this.sshHost === undefined || dial === null) {
       return 'not-applicable';
+    }
+    const host = this.sshHost.trim();
+    // An explicit but unusable target is a refusal, not an absence: it fails
+    // the start (the conductor prints its fixed failure line) and spawns
+    // nothing — a `-oProxyCommand=…` host must never reach the spawner.
+    if (host === '' || !isUsableSshHost(host)) {
+      return 'failed';
     }
     // An already-listening dial port is somebody else's tunnel: open nothing
     // and take no ownership.
@@ -166,6 +192,7 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
         'BatchMode=yes',
         '-L',
         `127.0.0.1:${dial}:127.0.0.1:${remote}`,
+        '--',
         host,
       ]);
     } catch {
@@ -175,27 +202,45 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
     void child.exited.then(() => {
       exited = true;
     });
-    const deadline = Date.now() + this.waitMs;
-    while (Date.now() < deadline) {
-      if (exited) {
-        return 'failed';
+    // Ownership is taken before the wait so a throw or an interrupt during it
+    // cannot orphan the child: the finally stops the child and awaits its
+    // exit before any failure is reported.
+    this.child = child;
+    let opened = false;
+    void child.exited.then(() => {
+      // Only an opened tunnel's exit is a mid-run exit reported once; a child
+      // that dies during the startup wait is a start failure instead.
+      if (opened && this.child === child) {
+        this.child = null;
+        handlers.onEarlyExit?.();
       }
-      if (await this.isPortListening(dial)) {
-        this.child = child;
-        // A child that exits mid-run is reported once; ownership drops and
-        // the next pass's ocm-run calls fall back to their own forward.
-        void child.exited.then(() => {
-          if (this.child === child) {
-            this.child = null;
-            handlers.onEarlyExit?.();
-          }
-        });
-        return 'opened';
+    });
+    try {
+      const deadline = Date.now() + this.waitMs;
+      while (Date.now() < deadline) {
+        if (exited) {
+          return 'failed';
+        }
+        if (await this.isPortListening(dial)) {
+          opened = true;
+          return 'opened';
+        }
+        await this.sleep(this.pollMs);
       }
-      await this.sleep(this.pollMs);
+      return 'failed';
+    } catch {
+      // A throwing probe or sleep must not leave the child running.
+      return 'failed';
+    } finally {
+      // An opened tunnel keeps its child; only the failure paths clean up.
+      if (!opened && this.child === child) {
+        this.child = null;
+        if (!exited) {
+          child.stop();
+          await child.exited;
+        }
+      }
     }
-    child.stop();
-    return 'failed';
   }
 
   async stop(): Promise<void> {

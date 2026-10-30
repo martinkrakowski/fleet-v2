@@ -59,7 +59,10 @@ function completedPass(): RunConductorPassResult {
 }
 
 /** A fake ConductorDriver with scripted passes and recorded release calls. */
-function makeFakeDriver(passes: readonly RunConductorPassResult[]): {
+function makeFakeDriver(
+  passes: readonly RunConductorPassResult[],
+  order?: string[],
+): {
   readonly driver: ConductorDriver;
   readonly passCalls: number[];
   readonly releaseCalls: number[];
@@ -69,6 +72,7 @@ function makeFakeDriver(passes: readonly RunConductorPassResult[]): {
   const driver: ConductorDriver = {
     pass: {
       runPass: async () => {
+        order?.push('runPass');
         passCalls.push(passCalls.length + 1);
         const scripted = passes[passCalls.length - 1];
         if (scripted === undefined) {
@@ -77,6 +81,7 @@ function makeFakeDriver(passes: readonly RunConductorPassResult[]): {
         return scripted;
       },
       releaseLeases: async () => {
+        order?.push('releaseLeases');
         releaseCalls.push(1);
         return { released: 0 };
       },
@@ -227,6 +232,7 @@ describe('RunnerTunnelAdapter (KF-35)', () => {
         'BatchMode=yes',
         '-L',
         '127.0.0.1:46001:127.0.0.1:46000',
+        '--',
         'lane-host',
       ],
     ]);
@@ -286,6 +292,84 @@ describe('RunnerTunnelAdapter (KF-35)', () => {
     expect(sleeps.length).toBeGreaterThan(0);
   });
 
+  it('the bounded wait awaits the stopped child exit before reporting the failure', async () => {
+    let resolveExit: (value: { readonly code: number | null }) => void = () => undefined;
+    const exited = new Promise<{ readonly code: number | null }>((resolve) => {
+      resolveExit = resolve;
+    });
+    let exitResolved = false;
+    void exited.then(() => {
+      exitResolved = true;
+    });
+    const killCalls: number[] = [];
+    const child: TunnelChild = {
+      exited,
+      stop: () => {
+        killCalls.push(1);
+        // The kill takes a tick to take effect, like a real child's exit.
+        setTimeout(() => resolveExit({ code: null }), 0);
+      },
+    };
+    const tunnel = new RunnerTunnelAdapter({
+      sshHost: 'lane-host',
+      remotePort: 46000,
+      isPortListening: probeOf([false]),
+      spawner: () => child,
+      sleep: async () => undefined,
+      waitMs: 5,
+      pollMs: 1,
+    });
+    expect(await tunnel.ensureTunnel()).toBe('failed');
+    expect(killCalls).toHaveLength(1);
+    expect(exitResolved).toBe(true);
+    expect(tunnel.owned).toBe(false);
+  });
+
+  it('a throwing port probe stops the child, awaits its exit and reports a failure', async () => {
+    const child = fakeChild();
+    let probeCalls = 0;
+    const tunnel = new RunnerTunnelAdapter({
+      sshHost: 'lane-host',
+      remotePort: 46000,
+      isPortListening: async () => {
+        probeCalls += 1;
+        if (probeCalls === 2) {
+          throw new Error('probe blew up');
+        }
+        return false;
+      },
+      spawner: () => child,
+      sleep: async () => undefined,
+    });
+    expect(await tunnel.ensureTunnel()).toBe('failed');
+    expect(child.killCalls).toHaveLength(1);
+    expect(tunnel.owned).toBe(false);
+    await child.exited;
+  });
+
+  it.each<[string, string]>([
+    ['an option-shaped host', '-oProxyCommand=x'],
+    ['a host with whitespace', 'lane host'],
+    ['a host with a control character', 'lane\u0000host'],
+  ])('refuses %s and never reaches the spawner', async (_label, sshHost) => {
+    const spawned: string[][] = [];
+    const child = fakeChild();
+    const tunnel = new RunnerTunnelAdapter({
+      sshHost,
+      remotePort: 46000,
+      isPortListening: probeOf([false]),
+      spawner: (argv) => {
+        spawned.push([...argv]);
+        return child;
+      },
+      sleep: async () => undefined,
+    });
+    expect(await tunnel.ensureTunnel()).toBe('failed');
+    expect(spawned).toHaveLength(0);
+    expect(tunnel.owned).toBe(false);
+    expect(child.killCalls).toHaveLength(0);
+  });
+
   it('reports an owned child that exits mid-run exactly once; stop afterwards is a no-op', async () => {
     const child = fakeChild();
     const tunnel = tunnelOf({ sshHost: 'lane-host', remotePort: 46000, probe: probeOf([false, true]), child });
@@ -309,7 +393,7 @@ describe('conductor run --live holds one runner tunnel (KF-35)', () => {
   it('starts the tunnel once before pass 1 and stops it after releaseLeases, also with --once', async () => {
     const dir = tempStateDir();
     const order: string[] = [];
-    const fake = makeFakeDriver([completedPass()]);
+    const fake = makeFakeDriver([completedPass()], order);
     const tunnel = fakeTunnel('opened', order);
     const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once'], {
       stateDir: dir,
@@ -321,7 +405,7 @@ describe('conductor run --live holds one runner tunnel (KF-35)', () => {
     expect(fake.passCalls).toHaveLength(1);
     expect(fake.releaseCalls).toHaveLength(1);
     expect(tunnel.stopCalls).toHaveLength(1);
-    expect(order).toEqual(['ensure', 'stop']);
+    expect(order).toEqual(['ensure', 'runPass', 'releaseLeases', 'stop']);
   });
 
   it('stops the tunnel once in finally after a multi-pass loop ends on the stop signal', async () => {

@@ -647,42 +647,80 @@ async function runCommand(
   // A failure exits 1 and drives no pass; an already-listening port is an
   // operator's tunnel and takes no ownership; an owned child that exits
   // mid-run is logged once and later passes fall back to their own forwards.
+  // The SIGINT/SIGTERM handlers are bound before the tunnel starts, so an
+  // interrupt during the startup wait stops the tunnel child too.
   const tunnel = options.tunnel ?? runtime.runnerTunnel;
-  const started = await tunnel.ensureTunnel({
-    onEarlyExit: () => {
-      io.stderr(`${RUNNER_TUNNEL_EXITED_MESSAGE}\n`);
-    },
-  });
-  if (started === 'failed') {
-    io.stderr(`${RUNNER_TUNNEL_FAILED_MESSAGE}\n`);
-    return 1;
+  const controller = new AbortController();
+  const signal = options.stopSignal ?? controller.signal;
+  const onSignal = (): void => {
+    controller.abort();
+  };
+  const bindOwnSignals = options.stopSignal === undefined;
+  if (bindOwnSignals) {
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
   }
-  const holderId = 'driver-' + runtime.conductor.newUlid();
-  const seenAttention = new Set<string>();
-  return await pollConductorPasses({
-    driver,
-    holderId,
-    nowIso: () => nowIsoOf(options),
-    sleep: options.sleep ?? defaultSleep,
-    stopSignal: options.stopSignal,
-    once: flags.once,
-    stopTunnel: () => tunnel.stop(),
-    eachPass: async (pass, result) => {
-      io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
-      if (result.outcome === 'refused') {
-        return { stop: true, exitCode: 1 };
-      }
-      for (const item of result.attention) {
-        const key = `${item.runId}:${item.kind}`;
-        if (seenAttention.has(key)) {
-          continue;
-        }
-        seenAttention.add(key);
-        io.stdout(`${JSON.stringify({ attention: item.kind, runId: item.runId })}\n`);
-      }
-      return { stop: false };
-    },
+  // The startup wait races the stop signal: an interrupt before the tunnel
+  // opens stops the (possibly already spawned) child instead of orphaning it.
+  let onAbort: (() => void) | null = null;
+  const interrupted = new Promise<'interrupted'>((resolve) => {
+    onAbort = () => resolve('interrupted');
+    signal.addEventListener('abort', onAbort, { once: true });
   });
+  try {
+    const startPromise = tunnel.ensureTunnel({
+      onEarlyExit: () => {
+        io.stderr(`${RUNNER_TUNNEL_EXITED_MESSAGE}\n`);
+      },
+    });
+    const raced = await Promise.race([startPromise.then((outcome) => ({ outcome })), interrupted]);
+    if (raced === 'interrupted') {
+      // Stop what the startup already spawned, let its bounded wait finish,
+      // and stop again for whatever the tail of that wait may have opened.
+      await tunnel.stop();
+      await startPromise;
+      await tunnel.stop();
+      return 0;
+    }
+    if (raced.outcome === 'failed') {
+      io.stderr(`${RUNNER_TUNNEL_FAILED_MESSAGE}\n`);
+      return 1;
+    }
+    const holderId = 'driver-' + runtime.conductor.newUlid();
+    const seenAttention = new Set<string>();
+    return await pollConductorPasses({
+      driver,
+      holderId,
+      nowIso: () => nowIsoOf(options),
+      sleep: options.sleep ?? defaultSleep,
+      stopSignal: signal,
+      once: flags.once,
+      stopTunnel: () => tunnel.stop(),
+      eachPass: async (pass, result) => {
+        io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
+        if (result.outcome === 'refused') {
+          return { stop: true, exitCode: 1 };
+        }
+        for (const item of result.attention) {
+          const key = `${item.runId}:${item.kind}`;
+          if (seenAttention.has(key)) {
+            continue;
+          }
+          seenAttention.add(key);
+          io.stdout(`${JSON.stringify({ attention: item.kind, runId: item.runId })}\n`);
+        }
+        return { stop: false };
+      },
+    });
+  } finally {
+    if (onAbort !== null) {
+      signal.removeEventListener('abort', onAbort);
+    }
+    if (bindOwnSignals) {
+      process.removeListener('SIGINT', onSignal);
+      process.removeListener('SIGTERM', onSignal);
+    }
+  }
 }
 
 /** The outcome of one pass in the shared poll loop: stop, and the exit code to carry. */

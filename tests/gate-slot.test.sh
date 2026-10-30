@@ -102,5 +102,17 @@ run env FLEET_V2_GATE_SLOTS=1 FLEET_V2_GATE_WAIT_MAX_SECONDS=10 sh "$SCRIPT" sh 
 wait "$holder" 2>/dev/null
 holder=''
 
+# A wait limit shorter than the poll interval is honoured, not rounded up to a full poll.
+flock "$T/fleet-v2-gate-slot.1" sleep 8 &
+holder=$!
+sleep 0.5 2>/dev/null || sleep 1
+start=$(date +%s)
+env FLEET_V2_GATE_LOCK_DIR="$T" FLEET_V2_GATE_POLL_SECONDS=6 FLEET_V2_GATE_SLOTS=1 FLEET_V2_GATE_WAIT_MAX_SECONDS=1 sh "$SCRIPT" true >/dev/null 2>&1
+rc=$?
+waited=$(( $(date +%s) - start ))
+if [ $rc -eq 75 ] && [ "$waited" -lt 5 ]; then ok 'a wait limit below the poll interval is not rounded up'; else bad "a wait limit below the poll interval is not rounded up (rc $rc after ${waited}s)"; fi
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+holder=''
+
 [ "$fails" -eq 0 ] && echo 'gate-slot: all tests passed' || echo "gate-slot: $fails failure(s)"
 [ "$fails" -eq 0 ]

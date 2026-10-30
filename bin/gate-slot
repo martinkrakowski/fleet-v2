@@ -12,8 +12,9 @@
 # only gates admission. FLEET_V2_GATE_TMPDIR, when set, becomes TMPDIR for the command.
 # FLEET_V2_GATE_LOCK_DIR (default /tmp) holds the lock files. FLEET_V2_GATE_WAIT_MAX_SECONDS
 # (default 600) bounds the wait: when no slot frees within it the script prints the fixed line
-# 'gate-slot: no slot within the wait limit' and exits 75, so a caller can tell a full host from
-# a failed command. The command's exit code is returned unchanged; a usage or setup error exits 2.
+# 'gate-slot: no slot within the wait limit' and exits 75. A command may exit 75 itself
+# (EX_TEMPFAIL), so a caller treats 75 as "host full" only when that exact line is the last line
+# on stderr, and caps its retries. The command's exit code is returned unchanged; a usage or setup error exits 2.
 # Needs flock(1).
 set -u
 
@@ -68,6 +69,8 @@ while :; do
     echo 'gate-slot: no slot within the wait limit' >&2
     exit 75
   fi
-  sleep "$poll"
-  waited=$((waited + poll))
+  step=$poll
+  [ $((wait_max - waited)) -lt "$step" ] && step=$((wait_max - waited))
+  sleep "$step"
+  waited=$((waited + step))
 done

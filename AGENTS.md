@@ -73,7 +73,10 @@ runner environment allowlist to smuggle a setting through.
 - `bin/gate-slot <command> [args...]` runs one acceptance command inside a host-wide check
   slot (`FLEET_V2_GATE_SLOTS`, default 8; the same lock files as the orchestrator's gate), so
   conducted runs share the host's gate budget. Worker caps stay in the command's own flags;
-  `FLEET_V2_GATE_TMPDIR` sets the command's `TMPDIR`. It needs `flock`.
+  `FLEET_V2_GATE_TMPDIR` sets the command's `TMPDIR`. `FLEET_V2_GATE_WAIT_MAX_SECONDS` (default 600)
+  bounds the wait for a slot: past it the script prints `gate-slot: no slot within the wait limit` and
+  exits 75. Treat 75 as "host full" only with that exact last stderr line (a command may exit 75
+  itself), and cap retries. `scripts/gate-slot-hash.txt` pins the script. It needs `flock`.
 
 Before committing what any lane produced, run `scripts/lane-diff-check.sh <worktree>`
 (protected paths including ignored ones — github workflows, agent/editor instruction and tool files,

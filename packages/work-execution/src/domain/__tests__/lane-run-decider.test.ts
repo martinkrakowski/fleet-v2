@@ -906,6 +906,17 @@ describe('fixing state', () => {
     });
   });
 
+  it('KF-17: a cancelled round-1 attempt with no dispatch record (a burned ordinal) is not this round: round 2 is prepared', () => {
+    const rec = record({ round: 1, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] });
+    const facts = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'attempt-example-3', round: 1, phase: 'cancelled', dispatchResult: 'none' }),
+    });
+    expect(decide(rec, facts)).toEqual({
+      kind: 'act', step: 'prepare', key: `${RUN_ID}/r2/prepare/0/a4`, round: 2, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
   it('KF-17: fixing round 0 with a cancelled round-1 attempt (raise save refused) prepares round 1', () => {
     const rec = record({ attemptIds: ['attempt-example-1', 'attempt-example-2'] });
     const facts = baseFacts({

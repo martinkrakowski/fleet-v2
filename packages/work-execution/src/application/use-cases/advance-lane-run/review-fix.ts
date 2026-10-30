@@ -19,6 +19,7 @@ import { head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision, LaneRunReviewFact, LaneRunSeatFact } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
+import { partitionFindingsByScope } from '../../../domain/review-finding-scope.js';
 import { historyEntryOf, selectReviewSeat } from '../../../domain/seat-selection.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { AcceptanceSpec } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
@@ -598,6 +599,35 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
       return refuse('prepare-refused');
     }
     findings = handoverFindingsOf(found.receipt);
+    // KF-33a: only findings on files the lane changed — between the run's
+    // original base (the FIRST non-null attempt record's baseCommit; a fix
+    // attempt's own base is not the lane base) and the prior's collected head
+    // — drive the fix round. The read goes through the prior's recorded host;
+    // an absent method, a null host, a throw or a null answer fail closed
+    // (changed stays null and every finding stays in scope, as before). When
+    // the receipt had findings and none is in scope, the round is refused:
+    // the existing refused-prepare handling parks it for the orchestrator.
+    const laneBase = gathered.attemptRecords.find((entry) => entry !== null)?.baseCommit ?? null;
+    const priorHost = conductedRunnerOf(prior);
+    let changed: readonly string[] | null = null;
+    if (laneBase !== null && priorHost !== null) {
+      try {
+        changed =
+          (await ctx.deps.artifactPort.readChangedPaths?.(
+            prior.worktreePath,
+            laneBase,
+            prior.artifacts.headCommit,
+            priorHost,
+          )) ?? null;
+      } catch {
+        changed = null;
+      }
+    }
+    const receiptFindingCount = findings.length;
+    findings = partitionFindingsByScope(findings, changed, prior.worktreePath).inScope;
+    if (receiptFindingCount > 0 && findings.length === 0) {
+      return refuse('no-in-scope-findings');
+    }
   }
   // The run's recorded branch wins (KF-5b); old records without it fall back
   // to the prior worktree path's last segment (the conductor names worktrees

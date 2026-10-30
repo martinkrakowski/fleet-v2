@@ -48,7 +48,11 @@ const LEASE_UNTIL = '2026-10-27T10:05:00.000Z';
 const HOLDER = 'driver';
 const COMMIT_A = 'a'.repeat(40);
 const HEAD12_A = 'a'.repeat(12);
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
+
 const SHA = 'c'.repeat(64);
+/** The frozen prose the harness reads for an attempt's `.lane/brief.md`; its digest seals the prior (KF-21b). */
+const DEFAULT_PROSE = '# Task\n\nFix the acceptance problem.\n';
 const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
 
 /** The recorded host of a conducted attempt (KF-10/Q2a-2 invariant). */
@@ -154,7 +158,7 @@ function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
     state: 'intent-recorded',
     outcome: null,
     revision: 0,
-    briefDigest: SHA,
+    briefDigest: simpleDeterministicHexDigest(DEFAULT_PROSE + '\n' + FULL_MANIFEST_JSON),
     briefPackagePath: '.lane/brief-package',
     sessionId: null,
     completionReceipt: null,
@@ -290,7 +294,7 @@ async function makeHarness(record: LaneRunRecord, attempts: readonly AttemptReco
 
   let manifestJson: string | null = FULL_MANIFEST_JSON;
   let manifestVerdict: 'sealed' | 'missing' | 'mismatch' = 'sealed';
-  let briefText: string | null = null;
+  let briefText: string | null = DEFAULT_PROSE;
   let dispatchAnswer: (request: DispatchAttemptRequest) => Promise<DispatchAttemptResult> = async (request) => ({
     outcome: 'started',
     attempt: attemptFixture({ id: request.attemptId }),

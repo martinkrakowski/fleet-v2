@@ -217,7 +217,9 @@ export function nonPassingGatePredicatesOf(
     readonly value: { name: string; kind: GatePredicateKind; verdict: 'fail' | 'unknown'; exitCode: number | null };
   }> = [];
   for (const entry of entries) {
-    if (!entry.id.startsWith(prefix)) {
+    // The id prefix alone is not trusted: the row must be this attempt's own
+    // acceptance entry.
+    if (!entry.id.startsWith(prefix) || entry.action !== 'accept' || entry.attemptId !== attemptId) {
       continue;
     }
     const indexText = entry.id.slice(prefix.length);

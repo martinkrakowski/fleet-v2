@@ -12,7 +12,7 @@ import type {
 } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { AttemptRecord, AttemptRunnerRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import type { HandoverFinding, RenderHandoverBriefInput } from '../../../domain/lane-run-handover.js';
-import { renderHandoverBrief } from '../../../domain/lane-run-handover.js';
+import { originalBriefOf, renderHandoverBrief } from '../../../domain/lane-run-handover.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import { laneRunReviewFact } from '../../../domain/lane-run-review-facts.js';
 import { head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
@@ -21,11 +21,14 @@ import type { LaneRunDecision, LaneRunReviewFact, LaneRunSeatFact } from '../../
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import { historyEntryOf, selectReviewSeat } from '../../../domain/seat-selection.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
+import { AcceptanceSpec } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import { readFrozenManifest } from './frozen-manifest.js';
 import { conductedRunnerOf } from './conducted-host.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, intentMintedIdOf, performPark, saveOrRefuse } from './step-context.js';
+import { nonPassingGatePredicatesOf } from '../RequestAttemptAcceptanceUseCase.use-case.js';
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
 type ReviewKind = 'brief-check' | 'code-review';
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
@@ -600,6 +603,86 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   // to the prior worktree path's last segment (the conductor names worktrees
   // after their branch).
   const branchName = record.branchName ?? prior.worktreePath.split('/').pop() ?? '';
+  // KF-21b: the prior's frozen prose and manifest are read ONCE and verified
+  // against its recorded digest before anything is taken from them; the
+  // verified manifest text is the one parsed for the proof commands, the gate
+  // check names and the rebuilt brief request (never a second, unverified
+  // read). Any missing, unreadable, throwing or unverified read refuses
+  // `prepare-refused`: a lane edit to `.lane/brief.md` or its manifest is
+  // refused, never trusted.
+  if (prior.briefPackagePath === null) {
+    return refuse('prepare-refused');
+  }
+  const recordedHost = conductedRunnerOf(prior);
+  if (recordedHost === null) {
+    return refuse('prepare-refused');
+  }
+  let prose: string | null | undefined;
+  let manifestRaw: string | null | undefined;
+  try {
+    prose = await ctx.deps.artifactPort.readBriefFile?.(prior.worktreePath, '.lane/brief.md', recordedHost);
+    manifestRaw = await ctx.deps.artifactPort.readBriefManifest?.(
+      prior.worktreePath,
+      prior.briefPackagePath.replace(/\.md$/, '-manifest.json'),
+      recordedHost,
+    );
+  } catch {
+    return refuse('prepare-refused');
+  }
+  if (typeof prose !== 'string' || typeof manifestRaw !== 'string') {
+    return refuse('prepare-refused');
+  }
+  const compute = ctx.deps.computeDigest ?? simpleDeterministicHexDigest;
+  if (compute(prose + '\n' + manifestRaw) !== prior.briefDigest) {
+    return refuse('prepare-refused');
+  }
+  let manifest: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(manifestRaw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return refuse('prepare-refused');
+    }
+    manifest = parsed as Record<string, unknown>;
+  } catch {
+    return refuse('prepare-refused');
+  }
+
+  // Failed gate checks: the stored predicate results of the prior's gate, in
+  // their recorded order, verdict and exit code only — never their `detail`.
+  // A `gate-failed` with no usable failed check refuses rather than handing
+  // the lane a bare reason code.
+  const gatePredicates: { name: string; verdict: 'fail' | 'unknown'; exitCode: number | null }[] = [];
+  if (failure.source === 'gate') {
+    let journalEntries: Parameters<typeof nonPassingGatePredicatesOf>[0];
+    try {
+      journalEntries = await ctx.deps.executionJournal.listJournalEntriesForAttempt(prior.id);
+    } catch {
+      return refuse('prepare-refused');
+    }
+    gatePredicates.push(
+      ...nonPassingGatePredicatesOf(journalEntries, prior.id, prior.artifacts.headCommit).map(
+        ({ name, verdict, exitCode }) => ({ name, verdict, exitCode }),
+      ),
+    );
+    if (failure.reasonCode === 'gate-failed' && gatePredicates.length === 0) {
+      return refuse('prepare-refused');
+    }
+  }
+
+  // Proof commands: the frozen acceptance spec's argv, trusted only through
+  // the value object; an invalid spec refuses the prepare.
+  const spec = AcceptanceSpec.create(manifest.acceptanceSpec);
+  if (!spec.success || spec.value === undefined) {
+    return refuse('prepare-refused');
+  }
+  const proofCommands: readonly (readonly string[])[] = spec.value.getCommands().map((command) => command.argv);
+  // Round 1 carries the prose verbatim; round 2 extracts the previous
+  // handover's original section.
+  const originalBrief = prior.kind === 'fix' ? originalBriefOf(prose) : prose;
+  if (originalBrief === null) {
+    return refuse('prepare-refused');
+  }
+
   const brief = renderHandoverBrief({
     runId: record.runId,
     round,
@@ -608,9 +691,9 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     source: failure.source === 'review' ? 'review' : 'gate',
     findings,
     gateReasonCodes: failure.source === 'review' ? [] : [failure.reasonCode],
-    gatePredicates: [],
-    proofCommands: [],
-    originalBrief: null,
+    gatePredicates,
+    proofCommands,
+    originalBrief,
   } satisfies RenderHandoverBriefInput);
   if (!brief.ok || brief.numberedFixes.length === 0) {
     return refuse('prepare-refused');
@@ -630,21 +713,16 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   // KF-6: place the fix round's brief package from the prior attempt's frozen
   // manifest before preparing the fix attempt. The handover text is the prose;
   // it is never journalled and never stored anywhere but the brief package.
-  const manifest = await readFrozenManifest(prior, ctx.deps.artifactPort);
-  const briefRequest =
-    manifest === null
-      ? null
-      : briefRequestFromManifest({
-          manifest,
-          fixAttemptId: briefFixRequest.fixAttemptId,
-          worktreePath: prior.worktreePath,
-          proseMarkdown: brief.text,
-          // KF-9: the brief package is placed on the reserved host of the
-          // prior attempt, never on the default executor. The manifest read
-          // above already refused a prior without a recorded host, so this is
-          // always the host block (Q2a-2).
-          recordedHost: conductedRunnerOf(prior),
-        });
+  // KF-21b: built from the digest-verified manifest read above.
+  const briefRequest = briefRequestFromManifest({
+    manifest,
+    fixAttemptId: briefFixRequest.fixAttemptId,
+    worktreePath: prior.worktreePath,
+    proseMarkdown: brief.text,
+    // KF-9: the brief package is placed on the reserved host of the prior
+    // attempt, never on the default executor (Q2a-2): checked above.
+    recordedHost,
+  });
   const refusePrepared = async (): Promise<AdvanceLaneRunResult> => {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'prepare-refused');
     if (resultRefusal !== null) {

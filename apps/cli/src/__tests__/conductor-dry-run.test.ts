@@ -29,6 +29,7 @@ import { runCli } from '../index.js';
 import type { CliIo } from '../index.js';
 import type { ConductorCliOptions } from '../conductor.js';
 import type { DryRunFakes } from '../conductor-dry-run.js';
+import { DRY_RUN_BRIEF_PROSE, DRY_RUN_MANIFEST_JSON } from '../conductor-dry-run.js';
 
 // Capture the dry-run fakes the CLI composes, so a test can read the recorder
 // without the dry-run printing it (the scratch stores are removed on return).
@@ -237,6 +238,13 @@ async function seedCompletedStart(runtime: FleetCliRuntime): Promise<void> {
 const FIX_HEAD12 = 'd'.repeat(12);
 
 /**
+ * sha256 of the dry-run fake's frozen prose and manifest text — the digest the
+ * conductor's `computeDigest` (sha256HexDigest) must compute for the fix
+ * round's prepare to verify the prior's brief package (KF-21b).
+ */
+const FIX_BRIEF_DIGEST = createHash('sha256').update(DRY_RUN_BRIEF_PROSE + '\n' + DRY_RUN_MANIFEST_JSON, 'utf8').digest('hex');
+
+/**
  * A run already in `fixing` after a gate failure at the collected head: a
  * collected round-0 attempt and the gate intent/result/conduct journal entries,
  * so the dry-run driver's first advance is the fix-round `act prepare`.
@@ -268,7 +276,7 @@ async function seedFixRoundStart(runtime: FleetCliRuntime): Promise<void> {
     state: 'collected',
     outcome: null,
     revision: 1,
-    briefDigest: 'c'.repeat(64),
+    briefDigest: FIX_BRIEF_DIGEST,
     briefPackagePath: '.lane/brief.md',
     sessionId: null,
     completionReceipt: {
@@ -335,6 +343,19 @@ async function seedFixRoundStart(runtime: FleetCliRuntime): Promise<void> {
     await journal.append(laneRunResultEntry(runtime.conductor.newUlid(), RUN_ID, gateKey.key, 'completed', 'gate-failed', NOW));
     await journal.append(laneRunConductEntry(runtime.conductor.newUlid(), RUN_ID, 'fixing', NOW));
   }
+  // KF-21b: a gate-failed fix round names its failed gate check, so the seed
+  // records the prior's stored failed predicate (an execution-journal accept row).
+  await runtime.execution.executionJournal.appendJournalEntry({
+    id: ATTEMPT_ID + ':accept:' + 'd'.repeat(40) + ':0',
+    attemptId: ATTEMPT_ID,
+    workOrderId: 'wo-example-1',
+    action: 'accept',
+    baseCommit: 'd'.repeat(40),
+    recordedAtIso: NOW,
+    status: 'refused',
+    sessionId: null,
+    detail: JSON.stringify({ predicate: 'command 1: example check', kind: 'command', verdict: 'fail', exitCode: 1, durationMs: 1, detail: 'exit 1' }),
+  });
 }
 
 /** sha256 of every file currently in `dir`, keyed by file name. */

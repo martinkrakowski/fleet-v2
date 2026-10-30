@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
+import type { AttemptRecord, AttemptRunnerRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../../domain/lane-run-journal.js';
 import { dispatchRefusalDetail, fixSeatForDispatch } from '../advance-lane-run/prepare-dispatch.js';
@@ -45,7 +45,8 @@ import type {
   PrepareBriefPackageResult,
 } from '../../ports/in/PrepareBriefPackagePort.in-port.js';
 import type { PrepareBriefPackageUseCaseRequest } from '../PrepareBriefPackageUseCase.use-case.js';
-import { renderHandoverBrief } from '../../../domain/lane-run-handover.js';
+import { ORIGINAL_BRIEF_MARKER, originalBriefOf, renderHandoverBrief } from '../../../domain/lane-run-handover.js';
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import type {
   DispatchAttemptRequest,
   DispatchAttemptResult,
@@ -76,6 +77,8 @@ const HOLDER = 'driver';
 const COMMIT_A = 'a'.repeat(40);
 const HEAD12_A = 'a'.repeat(12);
 const SHA = 'c'.repeat(64);
+/** The frozen prose the harness reads back for an attempt's `.lane/brief.md`; its digest seals the prior. */
+const DEFAULT_PROSE = '# Task\n\nFix the acceptance problem.\n';
 const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
 
 /** The frozen manifest a conducted run writes: every field the fix-round brief rebuild needs. */
@@ -174,7 +177,7 @@ function collectedAttempt(headCommit: string = COMMIT_A): AttemptRecord {
     state: 'collected',
     outcome: null,
     revision: 0,
-    briefDigest: SHA,
+    briefDigest: simpleDeterministicHexDigest(DEFAULT_PROSE + '\n' + FULL_MANIFEST_JSON),
     briefPackagePath: '.lane/brief-package',
     sessionId: null,
     completionReceipt: {
@@ -337,10 +340,16 @@ interface Harness {
   readonly gateRequests: readonly EvaluateAttemptGateRequest[];
   readonly reviewOpenRequests: readonly OpenReviewAssessmentRequest[];
   readonly gateReceiptRequests: readonly RecordGateReceiptsRequest[];
+  /** Every `readBriefFile` call's arguments, in call order. */
+  readonly briefFileReads: readonly { worktreePath: string; relativePath: string; recordedHost: AttemptRunnerRecord | null | undefined }[];
+  /** Every `readBriefManifest` call's arguments, in call order. */
+  readonly briefManifestReads: readonly { worktreePath: string; manifestPath: string | undefined; recordedHost: AttemptRunnerRecord | null | undefined }[];
   readonly deps: AdvanceLaneRunDependencies;
   /** Journal length when the prepare port was called (order assertion). */
   readonly journalLengthWhenPrepared: number;
   setManifest(json: string | null): void;
+  setProse(json: string | null): void;
+  setBriefFileError(message: string | null): void;
   setFindReceiptAnswer(answer: (request: FindReviewReceiptRequest) => Promise<FindReviewReceiptResult>): void;
   setFixAnswer(answer: (request: PrepareFixAttemptRequest) => Promise<PrepareFixAttemptResult>): void;
   setBriefAnswer(answer: (request: PrepareBriefPackageUseCaseRequest) => Promise<PrepareBriefPackageResult>): void;
@@ -378,7 +387,11 @@ async function makeHarness(
   const gateRequests: EvaluateAttemptGateRequest[] = [];
   const reviewOpenRequests: OpenReviewAssessmentRequest[] = [];
   const gateReceiptRequests: RecordGateReceiptsRequest[] = [];
+  const briefFileReads: { worktreePath: string; relativePath: string; recordedHost: AttemptRunnerRecord | null | undefined }[] = [];
+  const briefManifestReads: { worktreePath: string; manifestPath: string | undefined; recordedHost: AttemptRunnerRecord | null | undefined }[] = [];
   let manifestJson: string | null = FULL_MANIFEST_JSON;
+  let prose: string | null = DEFAULT_PROSE;
+  let briefFileError: string | null = null;
   let journalLengthWhenPrepared = 0;
   let journalLengthBeforeAdvance = 0;
   let sameFamilyImpl: SameModelFamily = (left, right) => left === right;
@@ -407,7 +420,7 @@ async function makeHarness(
     outcome: 'prepared',
     prepared: {
       attemptId: request.attemptId ?? '',
-      briefDigest: SHA,
+      briefDigest: simpleDeterministicHexDigest(request.proseMarkdown + '\n' + manifestJson),
       prosePath: '.lane/brief.md',
       manifestPath: '.lane/brief-manifest.json',
       selectedKnowledgeVersions: [],
@@ -438,8 +451,17 @@ async function makeHarness(
     attemptRepo,
     executionJournal,
     artifactPort: {
-      readBriefManifest: async () => manifestJson,
-      readBriefFile: async () => null,
+      readBriefManifest: async (worktreePath, manifestPath, recordedHost) => {
+        briefManifestReads.push({ worktreePath, manifestPath, recordedHost });
+        return manifestJson;
+      },
+      readBriefFile: async (worktreePath, relativePath, recordedHost) => {
+        briefFileReads.push({ worktreePath, relativePath, recordedHost });
+        if (briefFileError !== null) {
+          throw new Error(briefFileError);
+        }
+        return prose;
+      },
       verifyArtifactManifest: async () => ({ outcome: 'sealed' }) as never,
     },
     reconcileAttempt: {
@@ -602,12 +624,20 @@ async function makeHarness(
     gateRequests,
     reviewOpenRequests,
     gateReceiptRequests,
+    briefFileReads,
+    briefManifestReads,
     deps,
     get journalLengthWhenPrepared() {
       return journalLengthWhenPrepared;
     },
     setManifest: (json) => {
       manifestJson = json;
+    },
+    setProse: (json) => {
+      prose = json;
+    },
+    setBriefFileError: (message) => {
+      briefFileError = message;
     },
     setFindReceiptAnswer: (answer) => {
       findReceiptAnswer = answer;
@@ -787,15 +817,27 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       ],
       gateReasonCodes: [],
       gatePredicates: [],
-      proofCommands: [],
-      originalBrief: null,
+      proofCommands: [['corepack', 'yarn', 'build']],
+      originalBrief: DEFAULT_PROSE,
     });
     expect(rendered.ok).toBe(true);
     if (rendered.ok) {
       expect(briefRequest.proseMarkdown).toBe(rendered.text);
+      expect(fixRequest.briefDigest).toBe(simpleDeterministicHexDigest(rendered.text + '\n' + FULL_MANIFEST_JSON));
     }
-    expect(fixRequest.briefDigest).toBe(SHA);
     expect(fixRequest.briefPackagePath).toBe('.lane/brief.md');
+
+    // The prior's frozen prose and manifest are read through the prior's
+    // recorded host, at the prior's worktree and the frozen brief path.
+    expect(harness.briefFileReads).toEqual([
+      { worktreePath: WORKTREE, relativePath: '.lane/brief.md', recordedHost: CONDUCTED_RUNNER },
+    ]);
+    expect(harness.briefManifestReads.length).toBeGreaterThan(0);
+    expect(
+      harness.briefManifestReads.every(
+        (read) => read.worktreePath === WORKTREE && read.recordedHost === CONDUCTED_RUNNER,
+      ),
+    ).toBe(true);
 
     const record = await harness.runRepo.get(RUN_ID);
     expect(record?.attemptIds).toEqual(['attempt-example-1', fixRequest.fixAttemptId]);
@@ -809,20 +851,35 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(results[0]).toMatchObject({ outcome: 'completed', reasonCode: 'prepared' });
   });
 
-  it('b) prepares a fix round from a gate failure carrying the gate reason code', async () => {
+  it('b) a gate-failed with no recorded failed check refuses prepare-refused rather than a bare reason code (KF-21b)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await seedGateFailure(harness);
 
     const result = await advance(harness);
-    expect(result).toEqual({
-      outcome: 'acted',
-      step: 'prepare',
-      key: prepareKey(1, 0, 2),
-      result: 'completed',
-      reasonCode: 'prepared',
+    expect(result).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'refused', reasonCode: 'prepare-refused' });
+    expect(harness.fixRequests).toHaveLength(0);
+  });
+
+  it('b1) a journal row with the gate id prefix but another attempt or action is never a gate check (KF-21b)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedGateFailure(harness);
+    const forged = (attemptId: string, action: 'accept' | 'dispatch', n: number) => ({
+      id: 'attempt-example-1:accept:' + COMMIT_A + ':' + n,
+      attemptId,
+      workOrderId: 'wo-example-1',
+      action,
+      baseCommit: COMMIT_A,
+      recordedAtIso: NOW,
+      status: 'completed' as const,
+      sessionId: null,
+      detail: JSON.stringify({ predicate: 'command 1', kind: 'command', verdict: 'fail', exitCode: 1, durationMs: 1, detail: 'x' }),
     });
-    expect(harness.fixRequests).toHaveLength(1);
-    expect(harness.fixRequests[0]!.numberedFixes).toEqual(['[gate] gate-failed']);
+    await harness.executionJournal.appendJournalEntry(forged('attempt-example-other', 'accept', 0));
+    await harness.executionJournal.appendJournalEntry(forged('attempt-example-1', 'dispatch', 1));
+
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'refused', reasonCode: 'prepare-refused' });
+    expect(harness.fixRequests).toHaveLength(0);
   });
 
   it('b2) uses the recorded branch for the handover header; old records fall back (KF-5b)', async () => {
@@ -995,7 +1052,8 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     const fixAttemptId = afterPrepare?.attemptIds[1];
     expect(typeof fixAttemptId).toBe('string');
     const saved = await harness.attemptRepo.findAttemptById(fixAttemptId as string);
-    expect(saved?.briefDigest).toBe(SHA);
+    const handoverProse = harness.briefRequests[0]!.proseMarkdown;
+    expect(saved?.briefDigest).toBe(simpleDeterministicHexDigest(handoverProse + '\n' + FULL_MANIFEST_JSON));
     expect(saved?.briefPackagePath).toBe('.lane/brief.md');
 
     await admit(harness, fixAttemptId as string);
@@ -1245,6 +1303,258 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(harness.fixRequests[1]?.priorAttemptId).toBe('attempt-example-1');
     const record = await harness.runRepo.get(RUN_ID);
     expect(record?.round).toBe(1);
+  });
+
+  it('s) a gate failure fills the handover with failed gate checks, proof commands and the original brief', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedGateFailure(harness);
+    // Seed the stored predicate results of the prior's gate: one failed
+    // command (exit 1) and one skipped command. Only fail/unknown pass the
+    // projection; detail text never reaches the handover.
+    await harness.executionJournal.appendJournalEntry({
+      id: 'attempt-example-1:accept:' + COMMIT_A + ':0',
+      attemptId: 'attempt-example-1',
+      workOrderId: 'wo-example-1',
+      action: 'accept',
+      baseCommit: COMMIT_A,
+      recordedAtIso: NOW,
+      status: 'completed',
+      sessionId: null,
+      detail: JSON.stringify({
+        predicate: 'command 1',
+        kind: 'command',
+        verdict: 'fail',
+        exitCode: 1,
+        durationMs: 10,
+        detail: 'gate detail text that must never appear',
+      }),
+    });
+    await harness.executionJournal.appendJournalEntry({
+      id: 'attempt-example-1:accept:' + COMMIT_A + ':1',
+      attemptId: 'attempt-example-1',
+      workOrderId: 'wo-example-1',
+      action: 'accept',
+      baseCommit: COMMIT_A,
+      recordedAtIso: NOW,
+      status: 'completed',
+      sessionId: null,
+      detail: JSON.stringify({
+        predicate: 'command 2',
+        kind: 'command',
+        verdict: 'skipped',
+        exitCode: null,
+        durationMs: 10,
+        detail: 'skip detail',
+      }),
+    });
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+
+    const prose = harness.briefRequests[0]!.proseMarkdown!;
+    expect(prose).toContain('[gate] command 1 — fail, exit 1');
+    expect(prose).not.toContain('command 2');
+    expect(prose).not.toContain('gate detail text that must never appear');
+    expect(prose).not.toContain('skip detail');
+    // Every proof-command argv from the frozen acceptance spec is present.
+    expect(prose).toContain('corepack yarn build');
+    // Round 1 carries the original prose after the marker.
+    expect(prose.indexOf(ORIGINAL_BRIEF_MARKER)).toBeGreaterThan(-1);
+    expect(originalBriefOf(prose)).toBe(DEFAULT_PROSE);
+  });
+
+  it('t) a review failure also carries the proof commands and the original brief', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+
+    const prose = harness.briefRequests[0]!.proseMarkdown!;
+    expect(prose).toContain('[blocker] src/ex.ts:4 — blocks the acceptance check');
+    expect(prose).toContain('corepack yarn build');
+    expect(prose).toContain(DEFAULT_PROSE);
+    expect(originalBriefOf(prose)).toBe(DEFAULT_PROSE);
+  });
+
+  it('u) round 2 carries the same original brief when the prior is a fix attempt', async () => {
+    const harness = await makeHarness(
+      runRecord({ round: 1, attemptIds: ['attempt-example-1', 'attempt-fix-prior'] }),
+      [collectedAttempt()],
+    );
+    // The prior is a collected fix attempt whose prose is a round-1 handover.
+    const roundOne = renderHandoverBrief({
+      runId: RUN_ID,
+      round: 1,
+      branchName: WORKTREE.split('/').pop() ?? '',
+      head12: HEAD12_A,
+      source: 'review',
+      findings: [blockerFinding()],
+      gateReasonCodes: [],
+      gatePredicates: [],
+      proofCommands: [['corepack', 'yarn', 'build']],
+      originalBrief: DEFAULT_PROSE,
+    });
+    expect(roundOne.ok).toBe(true);
+    if (!roundOne.ok) {
+      throw new Error('fixture must render a round-1 handover');
+    }
+    const fixPrior: AttemptRecord = {
+      ...buildFixAttempt(
+        { fixAttemptId: 'attempt-fix-prior', workOrderId: 'wo-example-1', priorAttemptId: 'attempt-example-1', numberedFixes: [] },
+        0,
+      ),
+      state: 'collected',
+      briefDigest: simpleDeterministicHexDigest(roundOne.text + '\n' + FULL_MANIFEST_JSON),
+      artifacts: { headCommit: COMMIT_A, commitsSinceBase: [COMMIT_A], collectedArtifactPaths: [], notes: 'present' },
+    };
+    await harness.attemptRepo.saveAttempt(fixPrior);
+    harness.setProse(roundOne.text);
+    await seedReviewFailure(harness, [blockerFinding()]);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(2, 1, 3),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+
+    const prose = harness.briefRequests[0]!.proseMarkdown!;
+    expect(originalBriefOf(prose)).toBe(DEFAULT_PROSE);
+    expect(prose).toContain('corepack yarn build');
+  });
+
+  it('v) refuses prepare-refused when the prior prose does not match its digest, placing nothing', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    // The lane edited .lane/brief.md: the prose no longer matches the prior's
+    // recorded digest, so the handover refuses and nothing is placed.
+    harness.setProse('# tampered prose\n');
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+    expect(harness.briefRequests).toHaveLength(0);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.attemptIds).toEqual(['attempt-example-1']);
+  });
+
+  it('w) refuses prepare-refused when the prior prose read is null, placing nothing', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    // The prior's `.lane/brief.md` is missing: the fix prepare refuses instead
+    // of preparing with `originalBrief: null`.
+    harness.setProse(null);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+    expect(harness.briefRequests).toHaveLength(0);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.attemptIds).toEqual(['attempt-example-1']);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'prepare-refused')).toBe(true);
+  });
+
+  it('x) refuses prepare-refused when the prior manifest read is null, placing nothing', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    // The prior's frozen manifest is missing: the fix prepare refuses.
+    harness.setManifest(null);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+    expect(harness.briefRequests).toHaveLength(0);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.attemptIds).toEqual(['attempt-example-1']);
+  });
+
+  it('y) a throwing readBriefFile refuses the prepare and no exception escapes', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setBriefFileError('boom');
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+    expect(harness.briefRequests).toHaveLength(0);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.attemptIds).toEqual(['attempt-example-1']);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'prepare-refused')).toBe(true);
+  });
+
+  it('z) round 2 whose prior prose has no original-brief marker refuses prepare-refused', async () => {
+    const harness = await makeHarness(
+      runRecord({ round: 1, attemptIds: ['attempt-example-1', 'attempt-fix-prior'] }),
+      [collectedAttempt()],
+    );
+    // The prior is a collected fix attempt whose prose has NO original-brief
+    // marker; its digest still matches, so only the marker extraction refuses.
+    const fixPrior: AttemptRecord = {
+      ...buildFixAttempt(
+        { fixAttemptId: 'attempt-fix-prior', workOrderId: 'wo-example-1', priorAttemptId: 'attempt-example-1', numberedFixes: [] },
+        0,
+      ),
+      state: 'collected',
+      briefDigest: simpleDeterministicHexDigest(DEFAULT_PROSE + '\n' + FULL_MANIFEST_JSON),
+      artifacts: { headCommit: COMMIT_A, commitsSinceBase: [COMMIT_A], collectedArtifactPaths: [], notes: 'present' },
+    };
+    await harness.attemptRepo.saveAttempt(fixPrior);
+    harness.setProse(DEFAULT_PROSE);
+    await seedReviewFailure(harness, [blockerFinding()]);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(2, 1, 3),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+    expect(harness.briefRequests).toHaveLength(0);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.attemptIds).toEqual(['attempt-example-1', 'attempt-fix-prior']);
   });
 });
 

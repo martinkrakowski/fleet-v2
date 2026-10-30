@@ -116,6 +116,11 @@ for re in "$ROOT_CI" "$ANY_CI" "$NM_EXEMPT_CI"; do
 done
 [ -n "$wt" ] || { echo "usage: lane-diff-check.sh <worktree> [--base <ref>] [--brief <file>] [--strict-brief] [--allow-protected <regex>] [--quiet] [--rules <table>]" >&2; exit 2; }
 [ -d "$wt" ] || { echo "lane-diff-check: $wt is not a directory" >&2; exit 2; }
+# A lane can write refs/replace/* or a grafts file in the shared clone. Every git call below reads
+# only the real objects, so neither the diff nor the base-line allowance can be redirected.
+GIT_NO_REPLACE_OBJECTS=1
+GIT_GRAFT_FILE=/dev/null
+export GIT_NO_REPLACE_OBJECTS GIT_GRAFT_FILE
 cd "$wt" || exit 2
 git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "lane-diff-check: $wt is not a git worktree" >&2; exit 2; }
 top=$(git rev-parse --show-toplevel) || exit 2

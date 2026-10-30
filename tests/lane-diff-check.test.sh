@@ -454,6 +454,18 @@ echo 'tail' >> packages/x/src/nulfix.ts
 run "$R" --base kf27nul
 check 'a NUL byte in the file excuses nothing (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/nulfix.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o"'
 git checkout -q -- packages/x/src/nulfix.ts
+{ echo 'line one'; echo 'line two'; } > packages/x/src/repl.ts
+git add packages/x/src/repl.ts && git -c commit.gpgsign=false commit -q -m repl
+git tag kf27repl
+realblob=$(git rev-parse kf27repl:packages/x/src/repl.ts)
+forged=$({ echo 'line one'; echo "$fx"; echo 'line two'; } | git hash-object -w --stdin)
+git replace "$realblob" "$forged"
+echo "$fx" >> packages/x/src/repl.ts
+run "$R" --base kf27repl
+check 'a replace ref forging the base blob excuses nothing (KF-27, Luna review)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/repl.ts:3 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o"'
+git replace -d "$realblob" > /dev/null
+git checkout -q -- packages/x/src/repl.ts
+git tag -d kf27repl > /dev/null
 git reset -q --hard "$head0" && git tag -d kf27base kf27nul > /dev/null
 
 # KF-14e follow-up: a symlink that stays inside the worktree is still a finding.

@@ -105,7 +105,7 @@ export class RecordFindingDispositionUseCase implements RecordFindingDisposition
     ) {
       return {
         outcome: 'rejected',
-        reason: 'A finding must be resolved as fixed or refuted; an unresolved state is not a disposition',
+        reason: 'A finding must be resolved as fixed, refuted or out-of-scope; an unresolved state is not a disposition',
       };
     }
     if (

@@ -797,7 +797,7 @@ describe('RecordFindingDispositionUseCase', () => {
     if (result.outcome !== 'rejected') {
       throw new Error('expected a rejection');
     }
-    expect(result.reason).toContain('fixed or refuted');
+    expect(result.reason).toContain('fixed, refuted or out-of-scope');
   });
 
   it('rejects a disposition without a reason or an evidence reference', async () => {

@@ -1634,7 +1634,11 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
   });
 
   it('o4) a cancelled fix attempt whose priorAttemptId is a different attempt is not trusted (KF-28)', async () => {
-    const strayProse = '# a stray handover\n';
+    // A well-formed handover (it carries the original-brief marker), so only the
+    // priorAttemptId check can refuse it.
+    const strayProse =
+      '# a stray handover\n\n<!-- fleet:original-brief -->\n\n' +
+      '## Original brief (task reference; the numbered items above take priority)\n\nexample stray original\n';
     const stray: AttemptRecord = {
       ...buildFixAttempt(
         { fixAttemptId: 'attempt-stray', workOrderId: 'wo-example-1', priorAttemptId: 'attempt-not-the-prior', numberedFixes: [] },
@@ -1644,14 +1648,19 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       outcome: 'stopped',
       briefDigest: simpleDeterministicHexDigest(strayProse + '\n' + FULL_MANIFEST_JSON),
     };
-    const harness = await makeHarness(runRecord(), [collectedAttempt(), stray]);
+    // The stray is one of the run's attempts, so the facts load it and only the
+    // priorAttemptId check can refuse it.
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-stray'] }),
+      [collectedAttempt(), stray],
+    );
     harness.setProse(strayProse);
     await seedReviewFailure(harness, [blockerFinding()]);
 
     // The disk digest matches the stray cancelled attempt's, but its
     // `priorAttemptId` does not name the prior: the prepare refuses.
     expect(await advance(harness)).toEqual({
-      outcome: 'acted', step: 'prepare', key: prepareKey(1, 0, 2), result: 'refused', reasonCode: 'prepare-refused',
+      outcome: 'acted', step: 'prepare', key: prepareKey(1, 0, 3), result: 'refused', reasonCode: 'prepare-refused',
     });
     expect(harness.fixRequests).toHaveLength(0);
     expect(harness.briefRequests).toHaveLength(0);

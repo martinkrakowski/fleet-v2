@@ -1060,6 +1060,9 @@ describe('dispatchRefusalDetail maps every dispatch refusal to a fixed code (KF-
     ['runner-not-available', 'runner-unavailable'],
     ['No runner port can be described for dispatch', 'runner-unavailable'],
     ['something new', 'other'],
+    // A path with spaces still maps by its phrase.
+    ['Worktree /example/work tree does not match the base commit (checked out abc)', 'worktree-head-mismatch'],
+    ['Worktree /example/work tree has untracked files: a.ts', 'worktree-untracked'],
     // A listed file name never changes the code: the phrase after the path decides.
     ['Worktree /example/wt has untracked files: does not match the base commit.txt', 'worktree-untracked'],
     ['Worktree /example/wt has uncommitted changes: No active capacity reservation.md', 'worktree-uncommitted'],

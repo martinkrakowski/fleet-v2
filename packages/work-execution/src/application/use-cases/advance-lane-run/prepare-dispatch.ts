@@ -156,9 +156,10 @@ export async function performPrepare(ctx: AdvanceStepContext,
  * function never returns the input text.
  */
 export function dispatchRefusalDetail(reason: string): string {
-  // Worktree refusals name the path (no spaces) and then a fixed phrase; a
-  // listed file name after the phrase can never change the code.
-  const worktree = /^Worktree \S+ (does not match the base commit|does not match the prior attempt's head|has uncommitted changes|has untracked files|contains residue from earlier attempts)/.exec(reason);
+  // Worktree refusals name the path and then a fixed phrase. The path may hold
+  // spaces, so the first fixed phrase after it decides; a listed file name
+  // after the phrase can never change the code.
+  const worktree = /^Worktree .+? (does not match the base commit|does not match the prior attempt's head|has uncommitted changes|has untracked files|contains residue from earlier attempts)/.exec(reason);
   if (worktree !== null) {
     return WORKTREE_REFUSAL_DETAILS[worktree[1]!] ?? 'other';
   }

@@ -17,6 +17,8 @@ export type HandoverFindingSeverity = (typeof HANDOVER_FINDING_SEVERITIES)[numbe
 /** The fixed marker line that starts the appended original-brief section. */
 export const ORIGINAL_BRIEF_MARKER = '<!-- fleet:original-brief -->';
 const ORIGINAL_BRIEF_HEADER = '## Original brief (task reference; the numbered items above take priority)';
+/** The exact multi-line section start the renderer writes: a single rendered line can never contain it. */
+const ORIGINAL_BRIEF_SECTION_START = `\n${ORIGINAL_BRIEF_MARKER}\n\n${ORIGINAL_BRIEF_HEADER}\n\n`;
 const MAX_HANDOVER_BRIEF_CHARS = 60000;
 
 export interface HandoverFinding {
@@ -225,22 +227,17 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
 
 /**
  * The original brief text verbatim appended by step 5, or null when the text
- * has no marker. Only the FIRST marker wins, so an original brief that itself
- * contains the marker text later round-trips exactly. An empty original is not
- * appended and reads back as null.
+ * has no section start. Only the FIRST full section start wins — the exact
+ * multi-line sequence the renderer writes — so a quoted copy of the marker and
+ * header collapsed onto one line inside a finding summary can never match, and
+ * an original brief that itself contains the marker or even the whole sequence
+ * still round-trips exactly. An empty original is not appended and reads back
+ * as null.
  */
 export function originalBriefOf(handoverText: string): string | null {
-  const markerIndex = handoverText.indexOf(ORIGINAL_BRIEF_MARKER);
-  if (markerIndex === -1) {
+  const sectionStart = handoverText.indexOf(ORIGINAL_BRIEF_SECTION_START);
+  if (sectionStart === -1) {
     return null;
   }
-  const headerIndex = handoverText.indexOf(ORIGINAL_BRIEF_HEADER, markerIndex);
-  if (headerIndex === -1) {
-    return null;
-  }
-  const afterHeader = headerIndex + ORIGINAL_BRIEF_HEADER.length;
-  if (handoverText.slice(afterHeader, afterHeader + 2) !== '\n\n') {
-    return null;
-  }
-  return handoverText.slice(afterHeader + 2);
+  return handoverText.slice(sectionStart + ORIGINAL_BRIEF_SECTION_START.length);
 }

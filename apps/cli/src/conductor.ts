@@ -273,7 +273,12 @@ function readStartFlags(argv: readonly string[], io: CliIo): StartFlags | null {
     }
     const value = argv[index + 1];
     if (value === undefined || value.startsWith('--')) {
-      io.stderr(`${token} requires a value\n${CONDUCTOR_HELP}\n`);
+      // The cap's missing value reads exactly as the run command's (KF-25 review).
+      io.stderr(
+        token === '--max-active-runs'
+          ? `--max-active-runs requires a positive integer up to ${MAX_ACTIVE_RUNS_LIMIT}\n${CONDUCTOR_HELP}\n`
+          : `${token} requires a value\n${CONDUCTOR_HELP}\n`,
+      );
       return null;
     }
     return value;
@@ -457,7 +462,7 @@ async function startCommand(
         attemptId: result.attemptId,
         step: result.step,
         reason: result.reason,
-        retry: `conductor start --brief-request ${flags.briefRequest} --tier ${flags.tier} --run-id ${result.runId} --attempt-id ${result.attemptId}`,
+        retry: `conductor start --brief-request ${flags.briefRequest} --tier ${flags.tier} --run-id ${result.runId} --attempt-id ${result.attemptId}${flags.maxActiveRuns !== undefined && flags.maxActiveRuns !== 1 ? ` --max-active-runs ${flags.maxActiveRuns}` : ''}`,
       })}\n`,
     );
     return 1;

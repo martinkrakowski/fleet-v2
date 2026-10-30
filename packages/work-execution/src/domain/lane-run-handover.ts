@@ -53,6 +53,8 @@ const GATE_REASON_CODE_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const GATE_PREDICATE_NAME_PATTERN = /^[\x20-\x5f\x61-\x7e]{1,120}$/;
 /** A proof command argv element: printable ASCII without a space or backtick, at most 200 characters. */
 const PROOF_COMMAND_ARGV_ELEMENT_PATTERN = /^[\x21-\x5f\x61-\x7e]{1,200}$/;
+/** An argv element safe to render unquoted in a POSIX shell: plain word characters and punctuation only. */
+const PROOF_COMMAND_UNQUOTED_ELEMENT_PATTERN = /^[A-Za-z0-9._/@:=+,%-]+$/;
 /** Header values (run id, branch, head) sit outside the block: printable ASCII only, and never a backtick. */
 const HEADER_VALUE_PATTERN = /^[\x20-\x5f\x61-\x7e]{1,200}$/;
 const MAX_SUMMARY_CHARS = 300;
@@ -118,6 +120,14 @@ function cleanSummary(raw: string): string {
   return capped.split('```').join('\\`\\`\\`');
 }
 
+/** Render one argv element as-is when it is shell-safe; otherwise POSIX single-quote it. */
+function quoteProofCommandElement(element: string): string {
+  if (PROOF_COMMAND_UNQUOTED_ELEMENT_PATTERN.test(element)) {
+    return element;
+  }
+  return `'${element.replace(/'/g, "'\\''")}'`;
+}
+
 export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHandoverBriefResult {
   if (![input.runId, input.branchName, input.head12].every((value) => HEADER_VALUE_PATTERN.test(value))) {
     return { ok: false, reason: 'invalid-header-value' };
@@ -135,6 +145,9 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
     }
   } else if (input.source === 'gate' && input.gatePredicates.length > 0) {
     for (const predicate of input.gatePredicates) {
+      if (containsSecretShape(predicate.name)) {
+        return { ok: false, reason: 'secret-shaped-input' };
+      }
       if (!GATE_PREDICATE_NAME_PATTERN.test(predicate.name)) {
         return { ok: false, reason: 'invalid-gate-predicate' };
       }
@@ -174,10 +187,15 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
   ];
   const proofCommandLines: string[] = [];
   for (const command of input.proofCommands) {
-    if (!command.every((element) => PROOF_COMMAND_ARGV_ELEMENT_PATTERN.test(element))) {
-      return { ok: false, reason: 'invalid-proof-command' };
+    for (const element of command) {
+      if (containsSecretShape(element)) {
+        return { ok: false, reason: 'secret-shaped-input' };
+      }
+      if (!PROOF_COMMAND_ARGV_ELEMENT_PATTERN.test(element)) {
+        return { ok: false, reason: 'invalid-proof-command' };
+      }
     }
-    proofCommandLines.push(command.join(' '));
+    proofCommandLines.push(command.map(quoteProofCommandElement).join(' '));
   }
   const hasProofCommands = input.proofCommands.length > 0;
   if (hasProofCommands) {
@@ -189,8 +207,13 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
       ? 'Run the proof commands above. Not done until the commit exists.'
       : "Run the brief's proof commands. Not done until the commit exists.",
   );
-  if (input.originalBrief !== null && input.originalBrief.length > 0) {
-    textLines.push('', ORIGINAL_BRIEF_MARKER, '', ORIGINAL_BRIEF_HEADER, '', input.originalBrief);
+  if (input.originalBrief !== null) {
+    if (containsSecretShape(input.originalBrief)) {
+      return { ok: false, reason: 'secret-shaped-input' };
+    }
+    if (input.originalBrief.length > 0) {
+      textLines.push('', ORIGINAL_BRIEF_MARKER, '', ORIGINAL_BRIEF_HEADER, '', input.originalBrief);
+    }
   }
   const text = textLines.join('\n');
   if (text.length > MAX_HANDOVER_BRIEF_CHARS) {
@@ -203,7 +226,8 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
 /**
  * The original brief text verbatim appended by step 5, or null when the text
  * has no marker. Only the FIRST marker wins, so an original brief that itself
- * contains the marker text later round-trips exactly.
+ * contains the marker text later round-trips exactly. An empty original is not
+ * appended and reads back as null.
  */
 export function originalBriefOf(handoverText: string): string | null {
   const markerIndex = handoverText.indexOf(ORIGINAL_BRIEF_MARKER);

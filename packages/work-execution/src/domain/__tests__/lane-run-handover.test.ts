@@ -225,6 +225,57 @@ describe('renderHandoverBrief', () => {
     expect(gateResult.text).toContain('Proof commands (each must exit 0):\n```\ntrue\n```');
   });
 
+  it('shell-quotes proof command argv elements that are not safe unquoted', () => {
+    const result = renderHandoverBrief(input({
+      source: 'review',
+      findings: [finding({ severity: 'blocker', summary: 'x' })],
+      proofCommands: [['echo', 'ok;id'], ['sh', '-c', "it's"], ['corepack', 'yarn', 'typecheck', '--force']],
+    }));
+    if (!result.ok) {
+      throw new Error('expected an ok render');
+    }
+    expect(result.text).toContain(
+      [
+        'Proof commands (each must exit 0):',
+        '```',
+        "echo 'ok;id'",
+        "sh -c 'it'\\''s'",
+        'corepack yarn typecheck --force',
+        '```',
+      ].join('\n'),
+    );
+  });
+
+  it('refuses a secret-shaped gate predicate name', () => {
+    // Assembled at runtime so this file never carries a credential-shaped literal.
+    const secretShaped = `gh${'p_'}${'A'.repeat(36)}`;
+    const result = renderHandoverBrief(input({
+      source: 'gate',
+      gatePredicates: [{ name: secretShaped, verdict: 'fail', exitCode: null }],
+    }));
+    expect(result).toEqual({ ok: false, reason: 'secret-shaped-input' });
+  });
+
+  it('refuses a secret-shaped proof command argv element', () => {
+    const secretShaped = `gh${'p_'}${'A'.repeat(36)}`;
+    const result = renderHandoverBrief(input({
+      source: 'review',
+      findings: [finding({ severity: 'blocker', summary: 'x' })],
+      proofCommands: [['echo', secretShaped]],
+    }));
+    expect(result).toEqual({ ok: false, reason: 'secret-shaped-input' });
+  });
+
+  it('refuses a secret-shaped original brief', () => {
+    const secretShaped = `gh${'p_'}${'A'.repeat(36)}`;
+    const result = renderHandoverBrief(input({
+      source: 'review',
+      findings: [finding({ severity: 'blocker', summary: 'x' })],
+      originalBrief: secretShaped,
+    }));
+    expect(result).toEqual({ ok: false, reason: 'secret-shaped-input' });
+  });
+
   it('refuses an invalid proof command argv element', () => {
     expect(
       renderHandoverBrief(input({
@@ -269,6 +320,32 @@ describe('renderHandoverBrief', () => {
     }
     expect(originalBriefOf(result.text)).toBe(original);
     expect(originalBriefOf('no marker here')).toBeNull();
+  });
+
+  it.each([
+    ['a plain original', '# Original task\n\nDo the thing.\n'],
+    ['an original containing the marker', 'Line one\n<!-- fleet:original-brief -->\nline two\n'],
+  ])('round 2 round-trips the original brief through originalBriefOf for %s', (_label, original) => {
+    const roundOne = renderHandoverBrief(input({
+      source: 'review',
+      findings: [finding({ severity: 'blocker', summary: 'x' })],
+      originalBrief: original,
+    }));
+    if (!roundOne.ok) {
+      throw new Error('expected an ok render');
+    }
+    const extracted = originalBriefOf(roundOne.text);
+    expect(extracted).toBe(original);
+    const roundTwo = renderHandoverBrief(input({
+      round: 2,
+      source: 'review',
+      findings: [finding({ severity: 'blocker', summary: 'x' })],
+      originalBrief: extracted,
+    }));
+    if (!roundTwo.ok) {
+      throw new Error('expected an ok render');
+    }
+    expect(originalBriefOf(roundTwo.text)).toBe(original);
   });
 
   it('refuses a handover text over 60 000 characters', () => {

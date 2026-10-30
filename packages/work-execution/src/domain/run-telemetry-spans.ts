@@ -631,7 +631,7 @@ function buildRoundSpans(
   }
 }
 
-/** The usage LLM child of an attempt span: only when opencode-db usage was read. */
+/** The usage LLM child of an attempt span: only when a read usage was measured. */
 function buildUsageSpan(
   ctx: RunMapperContext,
   builder: SpanBuilder,
@@ -641,7 +641,7 @@ function buildUsageSpan(
   endIso: string,
 ): void {
   const usage = attempt.usage;
-  if (usage?.source !== 'opencode-db') {
+  if (usage?.source !== 'opencode-db' && usage?.source !== 'opencode-api') {
     return;
   }
   const usageInput = telemetryHashInput(attempt.id);

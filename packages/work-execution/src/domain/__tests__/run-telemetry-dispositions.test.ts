@@ -144,9 +144,30 @@ describe('applyDispositionWrite merge rules', () => {
     }
   });
 
-  it('a pending with reopen replaces a stored final entry', () => {
+  it('a pending with reopen keeps a stored exported entry (a stale reopen never undoes an export)', () => {
     const current = fullRecord();
     const result = applyDispositionWrite(current, {
+      saltFingerprint: FINGERPRINT,
+      reopen: true,
+      updates: [{ traceId: TRACE, spanId: SPAN, disposition: { state: 'pending' } }],
+      nowIso: NOW,
+    });
+    expect(result).toMatchObject({ outcome: 'written', applied: 0, kept: 1 });
+    if (result.outcome === 'written') {
+      expect(result.record.spans[TRACE]![SPAN]).toBe('exported@collector');
+    }
+  });
+
+  it('a pending with reopen replaces a stored rejected entry', () => {
+    const rejected = applyDispositionWrite(emptyTelemetryDispositionRecord(), {
+      saltFingerprint: FINGERPRINT,
+      updates: [{ traceId: TRACE, spanId: SPAN, disposition: { state: 'rejected', reason: 'http-4xx' } }],
+      nowIso: NOW,
+    });
+    if (rejected.outcome !== 'written') {
+      expect.fail('the seed write must succeed');
+    }
+    const result = applyDispositionWrite(rejected.record, {
       saltFingerprint: FINGERPRINT,
       reopen: true,
       updates: [{ traceId: TRACE, spanId: SPAN, disposition: { state: 'pending' } }],

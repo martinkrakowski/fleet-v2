@@ -360,6 +360,7 @@ bounded_contexts:
           - ListAttemptJournalUseCase
           - ProbeProjectUseCase
           - ListUnregisteredProjectsUseCase
+          - ExportRunTelemetryUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -379,6 +380,7 @@ bounded_contexts:
             - ListAttemptJournalPort
             - ProbeProjectPort
             - ListUnregisteredProjectsPort
+            - ExportRunTelemetryPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -425,7 +427,7 @@ bounded_contexts:
             - RunTelemetryPort
             - AcceptanceReceiptReadPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -482,11 +484,12 @@ bounded_contexts:
       ActionAuthorizationPort: "Obtain and durably consume an applicable scope-bound grant from operator coordination; pending or unknown results block the action."
       ExecutionObservationPort: "Publish recorded lifecycle observations through coordination; preserve a delivery gap without failing the lane."
       ListUnregisteredProjectsPort: "List each project id that has work orders but no profile, with what its work orders say about it (repositories, base commits, owned paths, counts), so it can be adopted; read-only."
+      ExportRunTelemetryPort: "For a selection of conducted runs and hand-run attempts, map the records to closed spans, apply sampling, record every span not yet final as pending before sending, send, and record each returned disposition; a span becomes final only on an HTTP result, a different salt fingerprint refuses the whole export before any send, and nothing outside the disposition store is written."
       ProbeProjectPort: "Probe one registered project read-only: read its profile, check its repository and clones and that its gate procedures exist in the installation, and record the receipt only if the profile did not change while it was probed."
       ProjectProfileReadPort: "Read one project profile and its revision from the coordination context; known absence is null."
       ProjectProbeRecordPort: "Record a probe receipt on a profile at the revision the probe started from; a changed profile is a typed rejection, never an overwrite."
       ProjectProbePort: "Read-only check of a project before registration or after an edit: the repository answers, and on each named host the clone is a git work tree whose origin matches, the worktree root exists, .lane/ is ignored and an agent instruction file is tracked; an unreachable host is unknown, a failing check carries the command that would fix it and nothing is ever run to fix it."
-      UsagePort: "Read what an attempt's recorded opencode session cost from opencode's own database on the recorded runner host; an attempt with no session id is unavailable with reason no session id, and a failed read never changes collection."
+      UsagePort: "Read what an attempt's recorded opencode session cost from the opencode server that ran it, through the same route and auth a dispatch uses (ocm-run --usage); an attempt with no session id or no route is unavailable with a named reason, and a failed read never changes collection."
       ChangeSignalPort: "Announce, after a successful save, that a record of a kind changed; carries no record state; never fails or delays the save."
     adapter_bindings:
       - { adapter: WorkOrderRepositoryAdapter, implements: WorkOrderRepositoryPort, integration: local-transactional-store }
@@ -509,7 +512,7 @@ bounded_contexts:
       - { adapter: RunnerForAttemptAdapter, implements: RunnerForAttemptPort, integration: per-host-cached-ocm-run-adapters-with-confirm-or-unknown }
       - { adapter: LaneDiffCheckAdapter, implements: LaneDiffCheckPort, integration: injected-command-executor-git-collection }
       - { adapter: GatePredicateAdapter, implements: GatePredicatePort, integration: injected-command-executor-gate-predicates }
-      - { adapter: OpencodeDbUsageAdapter, implements: UsagePort, integration: opencode-db-read-via-recorded-host-node-script }
+      - { adapter: OpencodeApiUsageAdapter, implements: UsagePort, integration: ocm-run-usage-read-over-the-dispatch-route }
       - { adapter: ProjectProbeAdapter, implements: ProjectProbePort, integration: injected-command-executor-read-only-git-probe }
       - adapter: ProjectProfileReadAdapter
         implements: ProjectProfileReadPort

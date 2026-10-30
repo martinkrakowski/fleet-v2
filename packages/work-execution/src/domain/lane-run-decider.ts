@@ -63,7 +63,11 @@ export interface LaneRunAttemptFact {
    */
   readonly dispatchResult: 'none' | 'not-started' | 'started';
   /** After collection: commits since base and the C1 manifest verdict; null before collection. */
-  readonly collection: { readonly commits: number; readonly manifest: 'sealed' | 'missing' | 'mismatch' } | null;
+  readonly collection: {
+    readonly commits: number;
+    readonly manifest: 'sealed' | 'missing' | 'mismatch';
+    readonly headUnchanged: boolean;
+  } | null;
 }
 
 /** A review of one kind at the current head (§3.4). */
@@ -445,6 +449,9 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       }
       if (attempt.collection.commits === 0) {
         return enter('seat-failed');
+      }
+      if (attempt.collection.headUnchanged) {
+        return park('fix-no-progress', null);
       }
       if (attempt.collection.manifest === 'missing' || attempt.collection.manifest === 'mismatch') {
         return park('artifacts-unsealed', null);

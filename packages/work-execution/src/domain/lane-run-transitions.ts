@@ -282,7 +282,7 @@ export function laneRunHaltLiftExit(input: {
   return record.parked.parkedFrom;
 }
 
-export type LaneRunResumeRefusal = 'run-stopped' | 'stale-revision' | 'not-parked' | 'stop-pending' | 'one-way-door';
+export type LaneRunResumeRefusal = 'run-stopped' | 'stale-revision' | 'not-parked' | 'stop-pending' | 'one-way-door' | 'fix-no-progress';
 export type LaneRunResumeCheck =
   | { readonly ok: true; readonly to: LaneRunStateValue }
   | { readonly ok: false; readonly reason: LaneRunResumeRefusal };
@@ -321,6 +321,11 @@ export function checkLaneRunResume(input: {
   }
   if (record.parked.reason === 'one-way-door') {
     return { ok: false, reason: 'one-way-door' };
+  }
+  // A resume would re-collect the same unchanged head and park again: the
+  // run is stopped and a new run started instead (KF-21c).
+  if (record.parked.reason === 'fix-no-progress') {
+    return { ok: false, reason: 'fix-no-progress' };
   }
   return { ok: true, to: record.parked.parkedFrom };
 }

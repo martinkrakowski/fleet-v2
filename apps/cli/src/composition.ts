@@ -53,7 +53,7 @@ import {
   InspectWorkOrderUseCase,
   LaneRunParkNoticeAdapter,
   ListUnregisteredProjectsUseCase,
-  OpencodeDbUsageAdapter,
+  OpencodeApiUsageAdapter,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
   ProbeProjectUseCase,
@@ -609,8 +609,8 @@ export interface FleetCliRuntime {
     /** The runner entry's declared lane budget; undefined without one. */
     readonly runnerMaxLanes?: number;
     readonly attemptArtifact: AttemptArtifactAdapter;
-    /** S3: reads an attempt's opencode session usage on its recorded host. */
-    readonly opencodeDbUsage: OpencodeDbUsageAdapter;
+    /** KF-15b: reads an attempt's opencode session usage from the server that ran it. */
+    readonly opencodeUsage: OpencodeApiUsageAdapter;
     readonly briefAuthoring: BriefAuthoringAdapter;
     readonly acceptanceAssessment: AcceptanceAssessmentAdapter;
     readonly acceptanceEvidence: AcceptanceEvidenceAdapter;
@@ -792,7 +792,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     agyRunner,
     runnerSelector,
     attemptArtifact,
-    opencodeDbUsage,
+    opencodeUsage,
     briefAuthoring,
     forgeAction,
   } = composeExecutionHosts({
@@ -851,7 +851,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     agyRunner,
     runnerSelector,
     attemptArtifact,
-    opencodeDbUsage,
+    opencodeUsage,
     briefAuthoring,
     forgeAction,
     editOnlyModeOf,

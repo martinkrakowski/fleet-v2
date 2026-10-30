@@ -15,14 +15,15 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { startConductedFixture, type ConductedFixture } from './conducted.js';
 
-const TEST_TIMEOUT_MS = 150000;
+// Two lane sessions plus a fix round took about 112 s on the lane host; CI runners are slower.
+const TEST_TIMEOUT_MS = 360000;
 /** A fix round adds a prepare, a dispatch, a collect, a gate and two reviews to the happy path. */
 const FIX_ROUND_PASS_BUDGET = 24;
 // A pause between passes lets the lane end and the forge/review fakes answer
 // instead of burning the pass budget on back-to-back waits.
 const PASS_PAUSE_MS = 750;
 /** The run-driving loop's own wall-clock budget inside the 150 s scenario bound. */
-const DRIVE_BUDGET_MS = 120000;
+const DRIVE_BUDGET_MS = 300000;
 
 const liveFixtures = new Set<ConductedFixture>();
 

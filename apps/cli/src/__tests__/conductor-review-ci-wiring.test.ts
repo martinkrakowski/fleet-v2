@@ -6,7 +6,7 @@
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { FleetInstallation, ForgeSectionV2 } from '@fleet/installation';
 import { requireValidInstallationModel } from '@fleet/installation';
@@ -476,6 +476,21 @@ describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
 
   const registryPath = (dir: string): string => path.join(dir, 'accepted-receipts.json');
 
+  /**
+   * An evidence fake for one specified `assessHeadReceipts` outcome: it
+   * replaces the real use case method, so the composed
+   * `acceptanceAssessment` adapter exercises its mapping against exactly that
+   * outcome. `assessHeadAcceptance` stays real.
+   */
+  function fakeReceiptsOutcome(
+    runtime: ReturnType<typeof createFleetCliRuntime>,
+    result: Awaited<ReturnType<typeof runtime.evidence.assessHeadAcceptance.assessHeadReceipts>>,
+  ): void {
+    vi.spyOn(runtime.evidence.assessHeadAcceptance, 'assessHeadReceipts').mockResolvedValue(
+      result,
+    );
+  }
+
   it('a receipts pass returns passed with an rcp id and stores no acceptance (KF-22b)', async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-cli-receipts-'));
     try {
@@ -484,13 +499,18 @@ describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
       const receiptsHead = 'head-sha-receipts';
       const fullAttempt = 'attempt-full';
       const fullHead = 'head-sha-full';
-      await runtime.evidence.evidenceAssessmentRepository.saveAssessment(pendingAssessment(receiptsAttempt, receiptsHead));
-      await runtime.execution.attemptRepository.saveAttempt(collectedAttempt(receiptsAttempt, receiptsHead));
       await runtime.evidence.evidenceAssessmentRepository.saveAssessment(pendingAssessment(fullAttempt, fullHead));
       await runtime.execution.attemptRepository.saveAttempt(collectedAttempt(fullAttempt, fullHead));
 
-      // The receipts-only pass returns passed and writes no acceptance: the
-      // registry file stays absent.
+      // The fake evidence returns the receipts-passed outcome; the composed
+      // adapter must map it to passed and write no acceptance: the registry
+      // file stays absent.
+      const receiptsId = `rcp-${assessmentIdForAttempt(receiptsAttempt)}-${receiptsHead.slice(0, 8)}`;
+      fakeReceiptsOutcome(runtime, {
+        outcome: 'receipts-passed',
+        receiptsId,
+        candidateHeadSha: receiptsHead,
+      });
       const receipts = await runtime.execution.acceptanceAssessment.assessHeadReceipts({
         attemptId: receiptsAttempt,
         workOrderId: 'wo-receipts',
@@ -499,12 +519,12 @@ describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
       });
       expect(receipts).toEqual({
         outcome: 'passed',
-        receiptsId: `rcp-${assessmentIdForAttempt(receiptsAttempt)}-${receiptsHead.slice(0, 8)}`,
+        receiptsId,
         assessedHeadSha: receiptsHead,
       });
       await expect(fs.access(registryPath(tempDir))).rejects.toThrow();
 
-      // The full acceptance path records its receipt…
+      // The full acceptance path (real evidence, not faked) records its receipt…
       const full = await runtime.execution.acceptanceAssessment.assessHeadAcceptance({
         attemptId: fullAttempt,
         workOrderId: 'wo-full',
@@ -518,7 +538,7 @@ describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
       expect(Object.keys(registry)).toEqual([fullHead]);
       expect(registry[fullHead]).toBe(full.outcome === 'accepted' ? full.receiptId : '');
 
-      // …and a later receipts pass still leaves it unchanged.
+      // …and a later receipts pass (fake again) still leaves it unchanged.
       const again = await runtime.execution.acceptanceAssessment.assessHeadReceipts({
         attemptId: receiptsAttempt,
         workOrderId: 'wo-receipts',
@@ -541,14 +561,18 @@ describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
       const runtime = createFleetCliRuntime({ stateDir: tempDir });
       const attemptId = 'attempt-blocked';
       const headSha = 'head-sha-blocked';
-      // Two blockers of different kinds: a required check with no completed
-      // receipt ('other') and no independent review ('review-missing').
-      await runtime.evidence.evidenceAssessmentRepository.saveAssessment({
-        ...pendingAssessment(attemptId, headSha),
-        requiredChecks: ['typecheck', 'lint'],
-        reviewReceipts: [],
+      // Two blockers of different kinds, returned by the evidence fake.
+      fakeReceiptsOutcome(runtime, {
+        outcome: 'blocked',
+        blockers: [
+          "required check 'lint' has no completed verification receipt",
+          'no independent review was recorded for this candidate head',
+        ],
+        blockerDetails: [
+          { kind: 'other', text: "required check 'lint' has no completed verification receipt" },
+          { kind: 'review-missing', text: 'no independent review was recorded for this candidate head' },
+        ],
       });
-      await runtime.execution.attemptRepository.saveAttempt(collectedAttempt(attemptId, headSha));
 
       const blocked = await runtime.execution.acceptanceAssessment.assessHeadReceipts({
         attemptId,
@@ -577,15 +601,16 @@ describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
       const runtime = createFleetCliRuntime({ stateDir: tempDir });
       const attemptId = 'attempt-stale';
       const headSha = 'head-sha-stale';
-      await runtime.evidence.evidenceAssessmentRepository.saveAssessment(pendingAssessment(attemptId, headSha));
-      await runtime.execution.attemptRepository.saveAttempt(collectedAttempt(attemptId, headSha));
+      fakeReceiptsOutcome(runtime, {
+        outcome: 'stale',
+        reason: 'Candidate head or policy revision changed',
+      });
 
-      // A candidate head other than the assessment's marks the evidence stale;
-      // the receipts-only answer carries it as one stale blocker.
+      // The stale outcome carries one stale blocker through the mapping.
       const stale = await runtime.execution.acceptanceAssessment.assessHeadReceipts({
         attemptId,
         workOrderId: `wo-${attemptId}`,
-        candidateHeadSha: 'moved-head-sha',
+        candidateHeadSha: headSha,
         policyRevision: 'policy-v1',
       });
       expect(stale).toEqual({
@@ -605,11 +630,10 @@ describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
       const runtime = createFleetCliRuntime({ stateDir: tempDir });
       const attemptId = 'attempt-rejected';
       const headSha = 'head-sha-rejected';
-      await runtime.evidence.evidenceAssessmentRepository.saveAssessment({
-        ...pendingAssessment(attemptId, headSha),
-        state: 'rejected',
+      fakeReceiptsOutcome(runtime, {
+        outcome: 'rejected',
+        reason: "Assessment is already in terminal state 'rejected'",
       });
-      await runtime.execution.attemptRepository.saveAttempt(collectedAttempt(attemptId, headSha));
 
       const rejected = await runtime.execution.acceptanceAssessment.assessHeadReceipts({
         attemptId,

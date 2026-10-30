@@ -156,22 +156,13 @@ export async function performPrepare(ctx: AdvanceStepContext,
  * function never returns the input text.
  */
 export function dispatchRefusalDetail(reason: string): string {
-  if (
-    reason.includes('does not match the base commit') ||
-    reason.includes("does not match the prior attempt's head")
-  ) {
-    return 'worktree-head-mismatch';
+  // Worktree refusals name the path (no spaces) and then a fixed phrase; a
+  // listed file name after the phrase can never change the code.
+  const worktree = /^Worktree \S+ (does not match the base commit|does not match the prior attempt's head|has uncommitted changes|has untracked files|contains residue from earlier attempts)/.exec(reason);
+  if (worktree !== null) {
+    return WORKTREE_REFUSAL_DETAILS[worktree[1]!] ?? 'other';
   }
-  if (reason.includes('has uncommitted changes')) {
-    return 'worktree-uncommitted';
-  }
-  if (reason.includes('has untracked files')) {
-    return 'worktree-untracked';
-  }
-  if (reason.includes('contains residue from earlier attempts')) {
-    return 'worktree-residue';
-  }
-  if (reason.includes('No active capacity reservation')) {
+  if (reason.startsWith('No active capacity reservation')) {
     return 'no-reservation';
   }
   if (reason.includes('is not the configured runner host')) {
@@ -180,26 +171,34 @@ export function dispatchRefusalDetail(reason: string): string {
   if (reason.includes('does not match the path allocated by the capacity reservation')) {
     return 'reservation-worktree-mismatch';
   }
-  if (reason.includes('Runner capabilities do not satisfy')) {
+  if (reason.startsWith('Runner capabilities do not satisfy')) {
     return 'capabilities-missing';
   }
-  if (reason.includes('a fix attempt starts only after it is collected or cancelled')) {
+  if (reason.endsWith('a fix attempt starts only after it is collected or cancelled')) {
     return 'prior-not-settled';
   }
-  if (reason.includes('Prior attempt not found')) {
+  if (reason.startsWith('Prior attempt not found')) {
     return 'prior-not-found';
   }
-  if (reason.includes('is collected but has no sealed head commit')) {
+  if (reason.startsWith('Prior attempt ') && reason.endsWith('is collected but has no sealed head commit')) {
     return 'prior-head-missing';
   }
-  if (reason.includes('Work order not found')) {
+  if (reason.startsWith('Work order not found')) {
     return 'work-order-missing';
   }
-  if (reason.includes('runner-not-available') || reason.includes('No runner port can be described')) {
+  if (reason === 'runner-not-available' || reason.startsWith('No runner port can be described')) {
     return 'runner-unavailable';
   }
   return 'other';
 }
+
+const WORKTREE_REFUSAL_DETAILS: Readonly<Record<string, string>> = {
+  'does not match the base commit': 'worktree-head-mismatch',
+  "does not match the prior attempt's head": 'worktree-head-mismatch',
+  'has uncommitted changes': 'worktree-uncommitted',
+  'has untracked files': 'worktree-untracked',
+  'contains residue from earlier attempts': 'worktree-residue',
+};
 
 /**
  * The `act dispatch` decision (K4-5): start the prepared attempt through

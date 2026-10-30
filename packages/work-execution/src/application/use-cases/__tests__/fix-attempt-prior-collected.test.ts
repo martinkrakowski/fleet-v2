@@ -553,6 +553,38 @@ describe('C1b dispatch refuses until the prior attempt is collected', () => {
     expect(workspace.inspectionRequests[0]).toMatchObject({ baseCommit: 'abc123' });
   });
 
+  it('inspects a cancelled prior that has a head at that head', async () => {
+    const { workspace, useCase } = makeDispatchSetup({
+      priorState: 'cancelled',
+      priorArtifacts: collectedArtifacts('c'.repeat(40)),
+      reservation: true,
+      capableRunner: true,
+    });
+    workspace.setInspectionAnswer(matchingInspection('c'.repeat(40)));
+    await useCase.dispatchAttempt(validDispatch as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0]);
+    expect(workspace.inspectionRequests).toHaveLength(1);
+    expect(workspace.inspectionRequests[0]).toMatchObject({ baseCommit: 'c'.repeat(40) });
+  });
+
+  it('refuses a collected prior whose head is blank or not a string, before any inspection', async () => {
+    for (const headCommit of ['   ', 42 as unknown as string]) {
+      const { workspace, useCase } = makeDispatchSetup({
+        priorState: 'collected',
+        priorArtifacts: { ...collectedArtifacts('b'.repeat(40)), headCommit } as AttemptRecord['artifacts'],
+        reservation: true,
+        capableRunner: true,
+      });
+      const result = await useCase.dispatchAttempt(
+        validDispatch as Parameters<DispatchAttemptUseCase['dispatchAttempt']>[0],
+      );
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: 'Prior attempt attempt-1 is collected but has no sealed head commit',
+      });
+      expect(workspace.inspectionRequests).toHaveLength(0);
+    }
+  });
+
   it('inspects a first attempt at the request\u2019s base (unchanged)', async () => {
     const { workspace, useCase } = makeDispatchSetup({ seedFix: false, reservation: true, capableRunner: true });
     workspace.setInspectionAnswer(matchingInspection('abc123'));

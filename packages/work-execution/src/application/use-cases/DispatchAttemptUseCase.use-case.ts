@@ -267,9 +267,12 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         return { outcome: 'refused', reason: priorCheck.refusal };
       }
       const prior = priorCheck.prior;
-      const priorHead = prior?.artifacts?.headCommit ?? null;
+      // Stored records are not schema-validated on read: anything but a
+      // non-empty string is no sealed head.
+      const rawHead: unknown = prior?.artifacts?.headCommit ?? null;
+      const priorHead = typeof rawHead === 'string' && rawHead.trim() !== '' ? rawHead.trim() : null;
       if (prior?.state === 'collected') {
-        if (priorHead === null || priorHead.trim() === '') {
+        if (priorHead === null) {
           return {
             outcome: 'refused',
             reason: `Prior attempt ${prior.id} is collected but has no sealed head commit`,
@@ -277,7 +280,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         }
         expectedCheckout = priorHead;
         dispatchedOnPriorHead = true;
-      } else if (prior?.state === 'cancelled' && priorHead !== null && priorHead.trim() !== '') {
+      } else if (prior?.state === 'cancelled' && priorHead !== null) {
         expectedCheckout = priorHead;
         dispatchedOnPriorHead = true;
       }

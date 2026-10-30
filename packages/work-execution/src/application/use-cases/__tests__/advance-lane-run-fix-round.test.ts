@@ -11,6 +11,8 @@ import { describe, expect, it } from 'vitest';
 
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
+import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../../domain/lane-run-journal.js';
+import { dispatchRefusalDetail } from '../advance-lane-run/prepare-dispatch.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
@@ -1006,5 +1008,61 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     });
     expect(withoutHost.briefRequests).toHaveLength(0);
     expect(withoutHost.fixRequests).toHaveLength(0);
+  });
+
+  it('n) journals a fixed detail when the dispatch refuses on the worktree head (KF-16)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'completed' });
+
+    const afterPrepare = await harness.runRepo.get(RUN_ID);
+    const fixAttemptId = afterPrepare?.attemptIds[1];
+    expect(typeof fixAttemptId).toBe('string');
+    await admit(harness, fixAttemptId as string);
+
+    harness.setDispatchAnswer(async () => ({
+      outcome: 'refused' as const,
+      reason: 'Worktree /example/wt does not match the base commit (checked out abc)',
+    }));
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const refusedResult = entries.find((entry) => entry.kind === 'result' && entry.key === dispatchKey(1, 0, 2));
+    expect(refusedResult).toMatchObject({
+      outcome: 'refused',
+      reasonCode: 'dispatch-refused',
+      detail: 'worktree-head-mismatch',
+    });
+  });
+});
+
+describe('dispatchRefusalDetail maps every dispatch refusal to a fixed code (KF-16)', () => {
+  it.each([
+    ['Worktree /example/wt does not match the base commit (checked out abc)', 'worktree-head-mismatch'],
+    [`Worktree /example/wt does not match the prior attempt's head (checked out def)`, 'worktree-head-mismatch'],
+    ['Worktree /example/wt has uncommitted changes: src/ex.ts', 'worktree-uncommitted'],
+    ['Worktree /example/wt has untracked files: src/new.ts', 'worktree-untracked'],
+    ['Worktree /example/wt contains residue from earlier attempts: old.txt', 'worktree-residue'],
+    ['No active capacity reservation for attempt', 'no-reservation'],
+    [
+      'Reservation host host-a is not the configured runner host host-b; several lane-runner hosts need H9b/H10',
+      'reservation-host-mismatch',
+    ],
+    ['Worktree path does not match the path allocated by the capacity reservation', 'reservation-worktree-mismatch'],
+    ['Runner capabilities do not satisfy required isolation', 'capabilities-missing'],
+    [
+      'Prior attempt attempt-1 is ended; a fix attempt starts only after it is collected or cancelled',
+      'prior-not-settled',
+    ],
+    ['Prior attempt not found for work order', 'prior-not-found'],
+    ['Prior attempt attempt-1 is collected but has no sealed head commit', 'prior-head-missing'],
+    ['Work order not found: wo-1', 'work-order-missing'],
+    ['runner-not-available', 'runner-unavailable'],
+    ['No runner port can be described for dispatch', 'runner-unavailable'],
+    ['something new', 'other'],
+  ])('maps %s to %s', (reason, expected) => {
+    expect(dispatchRefusalDetail(reason)).toBe(expected);
+    expect(expected).toMatch(LANE_RUN_JOURNAL_REASON_CODE_PATTERN);
+    expect(dispatchRefusalDetail(reason)).not.toBe(reason);
   });
 });

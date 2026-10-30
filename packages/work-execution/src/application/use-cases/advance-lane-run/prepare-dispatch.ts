@@ -150,6 +150,58 @@ export async function performPrepare(ctx: AdvanceStepContext,
 }
 
 /**
+ * KF-16: the fixed detail code a refused dispatch journals with its result
+ * entry, derived from the refusal's stable prefix or phrase. Reason details
+ * are fixed codes, never free text; unknown refusals map to `other` and the
+ * function never returns the input text.
+ */
+export function dispatchRefusalDetail(reason: string): string {
+  if (
+    reason.includes('does not match the base commit') ||
+    reason.includes("does not match the prior attempt's head")
+  ) {
+    return 'worktree-head-mismatch';
+  }
+  if (reason.includes('has uncommitted changes')) {
+    return 'worktree-uncommitted';
+  }
+  if (reason.includes('has untracked files')) {
+    return 'worktree-untracked';
+  }
+  if (reason.includes('contains residue from earlier attempts')) {
+    return 'worktree-residue';
+  }
+  if (reason.includes('No active capacity reservation')) {
+    return 'no-reservation';
+  }
+  if (reason.includes('is not the configured runner host')) {
+    return 'reservation-host-mismatch';
+  }
+  if (reason.includes('does not match the path allocated by the capacity reservation')) {
+    return 'reservation-worktree-mismatch';
+  }
+  if (reason.includes('Runner capabilities do not satisfy')) {
+    return 'capabilities-missing';
+  }
+  if (reason.includes('a fix attempt starts only after it is collected or cancelled')) {
+    return 'prior-not-settled';
+  }
+  if (reason.includes('Prior attempt not found')) {
+    return 'prior-not-found';
+  }
+  if (reason.includes('is collected but has no sealed head commit')) {
+    return 'prior-head-missing';
+  }
+  if (reason.includes('Work order not found')) {
+    return 'work-order-missing';
+  }
+  if (reason.includes('runner-not-available') || reason.includes('No runner port can be described')) {
+    return 'runner-unavailable';
+  }
+  return 'other';
+}
+
+/**
  * The `act dispatch` decision (K4-5): start the prepared attempt through
  * `DispatchAttemptPort` with the frozen brief's limits, raising the round and
  * the seat cursor on the record before the call (§3.2, D8). The dispatch key
@@ -300,7 +352,12 @@ export async function performDispatch(ctx: AdvanceStepContext,
   } else {
     reasonCode = 'dispatch-refused';
   }
-  const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode);
+  // KF-16: the refused result journals a fixed detail code derived from the
+  // refusal text, for the dispatch-refused park and the runner-refused pivot
+  // alike.
+  const resultRefusal = await appendRunResult(
+    ctx, request, decision.key, 'refused', reasonCode, dispatchRefusalDetail(dispatched.reason),
+  );
   if (resultRefusal !== null) {
     return { outcome: 'refused', reason: resultRefusal };
   }

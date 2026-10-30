@@ -8,9 +8,11 @@
  *   lane-runner hosts (`candidateHosts`).
  * - `LaneRunAdmissionPort.admit` (K4-4a) — a later attempt of a run (a
  *   round-0 seat pivot): pinned to the run's own host and worktree, on the
- *   legacy reserve path. A reservation that comes back at any other path is
- *   released and refused (`worktree-mismatch`): the fail-closed guard for
- *   records created otherwise — a start-created run never hits it.
+ *   legacy reserve path. Its cap and package-busy checks are re-run after
+ *   the reservation is written (KF-34c1). A reservation that comes back at
+ *   any other path is released and refused (`worktree-mismatch`): the
+ *   fail-closed guard for records created otherwise — a start-created run
+ *   never hits it.
  *
  * Active runs (both checks): non-terminal runs (`laneRunJournalState`)
  * holding a reservation for one of their attempts. A run that lists the
@@ -179,6 +181,19 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
           request.nowIso,
         );
         return { outcome: 'refused', reason: 'worktree-mismatch' };
+      }
+      // The cap and package-busy checks are re-run after the reservation is
+      // written (KF-34c1): concurrent admissions or starts may have reserved
+      // between the first check and this one. If it now blocks, THIS
+      // reservation is released and the attempt is refused `no-capacity`;
+      // both racers may refuse (safe; the caller retries on its next pass).
+      const stillBlocked = await this.admissionBlocked(request.workOrderId, request.attemptId);
+      if (stillBlocked) {
+        await this.options.executionJournal.releaseCapacityReservation(
+          request.attemptId,
+          request.nowIso,
+        );
+        return { outcome: 'no-capacity' };
       }
       return { outcome: 'admitted' };
     }

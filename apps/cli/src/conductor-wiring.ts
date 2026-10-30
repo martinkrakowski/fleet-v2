@@ -103,6 +103,8 @@ function buildConductorDriver(parts: {
   readonly start: StartLaneRunPort | null;
   readonly policy: ResolvedConductorPolicy;
   readonly runPolicyRevision: string;
+  /** Session-start spacing in ms; the dry-run passes 0 because it starts no session. */
+  readonly dispatchStaggerMs?: number;
 }): ConductorDriver {
   const pass = new RunConductorPassUseCase({
     driverLease: parts.driverLease,
@@ -111,6 +113,7 @@ function buildConductorDriver(parts: {
     halt: parts.halt,
     resume: parts.resume,
     advance: parts.advance,
+    ...(parts.dispatchStaggerMs === undefined ? {} : { dispatchStaggerMs: parts.dispatchStaggerMs }),
   });
   return {
     pass,
@@ -307,5 +310,7 @@ export function buildDryRunConductorDriver(
     start: null,
     policy,
     runPolicyRevision: 'policy:conductor@' + conductorRevision(policy),
+    // A dry-run starts no session, so it never waits for a session-start turn.
+    dispatchStaggerMs: 0,
   });
 }

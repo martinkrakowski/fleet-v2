@@ -7,6 +7,7 @@ import type { GatePredicateResult } from '../../ports/out/GatePredicatePort.out-
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, performPark } from './step-context.js';
 import { manifestExpectedArtifacts, readFrozenManifest } from './frozen-manifest.js';
+import { historyEntryOf } from '../../../domain/seat-selection.js';
 
 /**
  * The `act collect` decision (K4-6): collect an ended attempt's artifacts
@@ -194,11 +195,21 @@ async function recordGateReceiptsGuarded(
   if (workOrder === null) {
     return false;
   }
+  // The implementer of an attempt is the model that ran it — the same value
+  // the review step opens the evidence assessment with — so a fix attempt
+  // from another seat opens the assessment its review reopens, never a
+  // `head-mismatch`.
+  const runnerModel = historyEntryOf(latest).model;
   const modelAssignment = manifest?.modelAssignment;
-  const implementerModel =
+  const manifestModel =
     modelAssignment !== null && typeof modelAssignment === 'object'
       ? (modelAssignment as { readonly model?: unknown }).model
       : null;
+  // The manifest's model names only a first-pass writer: a fix attempt with no
+  // recorded model has an unknown writer, so the gate fails closed (as the
+  // review step refuses it) rather than name the first-pass seat.
+  const recorded = runnerModel !== null && runnerModel.trim().length > 0 ? runnerModel : null;
+  const implementerModel = recorded ?? (latest.kind === 'fix' ? null : manifestModel);
   if (typeof implementerModel !== 'string' || implementerModel.trim().length === 0) {
     return false;
   }

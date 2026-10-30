@@ -12,7 +12,7 @@ import { describe, expect, it } from 'vitest';
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../../domain/lane-run-journal.js';
-import { dispatchRefusalDetail } from '../advance-lane-run/prepare-dispatch.js';
+import { dispatchRefusalDetail, fixSeatForDispatch } from '../advance-lane-run/prepare-dispatch.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
@@ -1266,9 +1266,32 @@ describe('AdvanceLaneRunUseCase dispatch seat override (KF-18)', () => {
     });
   }
 
-  it('t) a fix override naming a seat id outside the frozen plan is dropped (KF-18)', async () => {
+  /** Seed a review failure, prepare a fix attempt carrying `overrides`, and expect its dispatch to park unsent. */
+  async function prepareAndRefuseFixWith(harness: Harness, overrides: Partial<AttemptRecord>, detail: string): Promise<void> {
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setFixAnswer(async (request) => ({
+      outcome: 'prepared',
+      attempt: { ...buildFixAttempt(request, 0), ...overrides },
+    }));
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared',
+    });
+    const afterPrepare = await harness.runRepo.get(RUN_ID);
+    const fixAttemptId = afterPrepare?.attemptIds[1];
+    expect(typeof fixAttemptId).toBe('string');
+    await admit(harness, fixAttemptId as string);
+    await advance(harness);
+    expect(harness.dispatchRequests).toHaveLength(0);
+    const parked = await harness.runRepo.get(RUN_ID);
+    expect(parked?.parked).toMatchObject({ reason: 'step-refused', qualifier: 'dispatch' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const refused = entries.find((entry) => entry.kind === 'result' && entry.outcome === 'refused');
+    expect(refused).toMatchObject({ reasonCode: 'dispatch-refused', detail });
+  }
+
+  it('t) a fix selection naming a seat id outside the frozen plan parks unsent (KF-18)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
-    await prepareAndDispatchFixWith(harness, {
+    await prepareAndRefuseFixWith(harness, {
       seatSelection: {
         role: 'fix',
         seatIndex: 0,
@@ -1278,14 +1301,12 @@ describe('AdvanceLaneRunUseCase dispatch seat override (KF-18)', () => {
         variant: 'low',
         agent: 'lane-fix',
       },
-    });
-    expect(harness.dispatchRequests).toHaveLength(1);
-    expect(harness.dispatchRequests[0]?.seatOverride).toBeUndefined();
+    }, 'seat-not-in-plan');
   });
 
-  it('u) a fix override whose model differs from its frozen-plan seat is dropped (KF-18)', async () => {
+  it('u) a fix selection whose model differs from its frozen-plan seat parks unsent (KF-18)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
-    await prepareAndDispatchFixWith(harness, {
+    await prepareAndRefuseFixWith(harness, {
       seatSelection: {
         role: 'fix',
         seatIndex: 0,
@@ -1295,20 +1316,74 @@ describe('AdvanceLaneRunUseCase dispatch seat override (KF-18)', () => {
         variant: null,
         agent: null,
       },
-    });
-    expect(harness.dispatchRequests[0]?.seatOverride).toBeUndefined();
+    }, 'seat-not-in-plan');
   });
 
-  it('v) a fix attempt without a frozen plan keeps no override (KF-18)', async () => {
+  it('v) a fix selection with no frozen plan to check it against parks unsent (KF-18)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
-    await prepareAndDispatchFixWith(harness, { seatPlan: null });
-    expect(harness.dispatchRequests[0]?.seatOverride).toBeUndefined();
+    await prepareAndRefuseFixWith(harness, { seatPlan: null }, 'seat-not-in-plan');
   });
 
   it('w) a fix attempt without a seat selection keeps no override (KF-18)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await prepareAndDispatchFixWith(harness, { seatSelection: null });
     expect(harness.dispatchRequests[0]?.seatOverride).toBeUndefined();
+  });
+});
+
+describe('fixSeatForDispatch names a fix seat only when an override can express it (KF-18)', () => {
+  const FIX_PLAN = {
+    version: 1 as const,
+    'first-pass': [{ id: 'fp-1', model: 'model-example-1', tool: 'opencode', agent: 'lane' }],
+    fix: [
+      { id: 'fx-a', model: 'fix-model-a', tool: 'opencode', agent: 'lane-fix', variant: 'low' },
+      { id: 'fx-b', model: 'fix-model-b', tool: 'agy' },
+      { id: 'fx-c', model: 'fix-model-c', tool: 'opencode' },
+    ],
+    review: [{ id: 'rev-1', model: 'review-model-1', tool: 'opencode' }],
+  };
+  function fixAttempt(seatIndex: number): AttemptRecord {
+    const seat = FIX_PLAN.fix[seatIndex]!;
+    return {
+      ...collectedAttempt(),
+      kind: 'fix',
+      seatPlan: FIX_PLAN,
+      seatSelection: {
+        role: 'fix',
+        seatIndex,
+        seatId: seat.id,
+        model: seat.model,
+        tool: seat.tool,
+        variant: 'variant' in seat ? (seat.variant as string) : null,
+        agent: 'agent' in seat ? (seat.agent as string) : null,
+      },
+    } as AttemptRecord;
+  }
+  const manifest = (assignment: Record<string, unknown>) => ({ modelAssignment: assignment });
+
+  it('names a plan seat whose tool, agent and variant the override can carry', () => {
+    expect(fixSeatForDispatch(fixAttempt(0), manifest({ model: 'model-example-1', agent: 'lane' }))).toMatchObject({
+      kind: 'seat',
+    });
+  });
+  it('refuses a fix seat on another tool than the frozen assignment (the override cannot change the tool)', () => {
+    expect(fixSeatForDispatch(fixAttempt(1), manifest({ model: 'model-example-1' }))).toEqual({
+      kind: 'refused', detail: 'seat-not-expressible',
+    });
+  });
+  it('refuses a fix seat with no agent when the assignment sets one (it would inherit the first-pass agent)', () => {
+    expect(fixSeatForDispatch(fixAttempt(2), manifest({ model: 'model-example-1', agent: 'lane' }))).toEqual({
+      kind: 'refused', detail: 'seat-not-expressible',
+    });
+  });
+  it('refuses a fix seat with no variant when the assignment sets one', () => {
+    expect(fixSeatForDispatch(fixAttempt(2), manifest({ model: 'model-example-1', variant: 'high' }))).toEqual({
+      kind: 'refused', detail: 'seat-not-expressible',
+    });
+  });
+  it('is none for a first attempt or a fix attempt with no selection', () => {
+    expect(fixSeatForDispatch({ ...fixAttempt(0), kind: 'initial' } as AttemptRecord, null)).toEqual({ kind: 'none' });
+    expect(fixSeatForDispatch({ ...fixAttempt(0), seatSelection: null } as AttemptRecord, null)).toEqual({ kind: 'none' });
   });
 });
 

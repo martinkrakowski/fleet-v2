@@ -210,6 +210,63 @@ const WORKTREE_REFUSAL_DETAILS: Readonly<Record<string, string>> = {
   'contains residue from earlier attempts': 'worktree-residue',
 };
 
+/** KF-18: a fix attempt's own seat, checked against its frozen plan and what an override can express. */
+type FixSeatForDispatch =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'seat'; readonly seat: AttemptSeatSelectionRecord }
+  | { readonly kind: 'refused'; readonly detail: 'seat-not-in-plan' | 'seat-not-expressible' };
+
+function isUnsetVariant(value: string | null | undefined): boolean {
+  const trimmed = (value ?? '').trim();
+  return trimmed === '' || trimmed === 'default';
+}
+
+export function fixSeatForDispatch(
+  latest: AttemptRecord,
+  manifest: Record<string, unknown> | null,
+): FixSeatForDispatch {
+  const selection = latest.seatSelection ?? null;
+  if (latest.kind !== 'fix' || selection === null || selection.role !== 'fix') {
+    return { kind: 'none' };
+  }
+  const planResult = SeatPlan.create(latest.seatPlan);
+  const planSeat =
+    planResult.success && planResult.value !== undefined
+      ? planResult.value.getSeats('fix')[selection.seatIndex]
+      : undefined;
+  if (
+    planSeat === undefined ||
+    planSeat.id !== selection.seatId ||
+    !seatMatchesAssignment(planSeat, {
+      model: selection.model,
+      tool: selection.tool,
+      variant: selection.variant,
+      agent: selection.agent,
+    })
+  ) {
+    return { kind: 'refused', detail: 'seat-not-in-plan' };
+  }
+  // The override carries model, agent and variant only: the frozen
+  // assignment's tool is the one dispatched, and an unset override field
+  // inherits the assignment's value. Such a seat cannot be named exactly.
+  const raw = manifest?.['modelAssignment'];
+  const assignment = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  const assignmentTool = typeof assignment['seatTool'] === 'string' && assignment['seatTool'].trim() !== ''
+    ? assignment['seatTool'].trim()
+    : 'opencode';
+  const assignmentAgent = typeof assignment['agent'] === 'string' ? assignment['agent'].trim() : '';
+  const assignmentVariant = typeof assignment['variant'] === 'string' ? assignment['variant'] : null;
+  const seatTool = (selection.tool ?? '').trim() === '' ? 'opencode' : (selection.tool as string).trim();
+  if (
+    seatTool !== assignmentTool ||
+    ((selection.agent ?? '').trim() === '' && assignmentAgent !== '') ||
+    (isUnsetVariant(selection.variant) && !isUnsetVariant(assignmentVariant))
+  ) {
+    return { kind: 'refused', detail: 'seat-not-expressible' };
+  }
+  return { kind: 'seat', seat: selection };
+}
+
 /**
  * The `act dispatch` decision (K4-5): start the prepared attempt through
  * `DispatchAttemptPort` with the frozen brief's limits, raising the round and
@@ -267,9 +324,26 @@ export async function performDispatch(ctx: AdvanceStepContext,
     expectedArtifacts !== null &&
     briefPackagePath !== null &&
     briefDigest !== null;
+  // KF-18: a fix attempt dispatches on its own fix seat through a seat
+  // override; the seat-plan pivot keeps its override; a first attempt and a
+  // fix attempt with no selection carry none. A fix seat the override cannot
+  // name exactly (not the frozen plan's fix seat at its index, another tool
+  // than the frozen assignment's, or an agent/variant left unset where the
+  // assignment sets one) never dispatches: it refuses and parks with a fixed
+  // detail, never a guessed or inherited seat field.
+  const fixSeat = fixSeatForDispatch(latest, manifest);
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, latest.id);
   if (intentRefusal !== null) {
     return { outcome: 'refused', reason: intentRefusal };
+  }
+  if (fixSeat.kind === 'refused') {
+    const resultRefusal = await appendRunResult(
+      ctx, request, decision.key, 'refused', 'dispatch-refused', fixSeat.detail,
+    );
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
   }
   if (!inputsReadable) {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'dispatch-inputs-unreadable');
@@ -302,37 +376,12 @@ export async function performDispatch(ctx: AdvanceStepContext,
     // Later writes in this advance (a park) must chain on the saved revision.
     record = saved.record ?? record;
   }
-  // KF-18: a fix attempt dispatches on its own fix seat through a seat
-  // override; the seat-plan pivot (a re-prepare on the round's next seat)
-  // keeps its override. A fix attempt with no seat selection keeps no
-  // override, and a first attempt (priorAttemptId null) never carries one.
-  // A fix attempt's override names only a seat of its frozen plan: the
-  // selection is verified against the plan before it is used (no plan,
-  // unparsable plan, index out of range, or id/model/tool/variant/agent
-  // mismatch send no override — the dispatch then refuses `seat-mismatch`
-  // and the run parks, never a guessed seat).
-  const seatSelection = latest.seatSelection ?? null;
-  let seatForOverride: AttemptSeatSelectionRecord | null = null;
-  if (latest.kind === 'initial' && latest.priorAttemptId !== null) {
-    seatForOverride = seatSelection;
-  } else if (latest.kind === 'fix' && seatSelection !== null && seatSelection.role === 'fix') {
-    const planResult = SeatPlan.create(latest.seatPlan);
-    if (planResult.success && planResult.value !== undefined) {
-      const planSeat = planResult.value.getSeats('fix')[seatSelection.seatIndex];
-      if (
-        planSeat !== undefined &&
-        planSeat.id === seatSelection.seatId &&
-        seatMatchesAssignment(planSeat, {
-          model: seatSelection.model,
-          tool: seatSelection.tool,
-          variant: seatSelection.variant,
-          agent: seatSelection.agent,
-        })
-      ) {
-        seatForOverride = seatSelection;
-      }
-    }
-  }
+  const seatForOverride: AttemptSeatSelectionRecord | null =
+    latest.kind === 'initial' && latest.priorAttemptId !== null
+      ? (latest.seatSelection ?? null)
+      : fixSeat.kind === 'seat'
+        ? fixSeat.seat
+        : null;
   const seatOverride: AttemptSeatOverrideRecord | null =
     seatForOverride === null
       ? null

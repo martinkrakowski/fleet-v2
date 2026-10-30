@@ -117,6 +117,9 @@ const laneResidueFiles = ['.lane/brief.md', '.lane/brief-manifest.json', '.lane/
 /** Wall-clock budget for one read-only git command in the worktree. */
 const GIT_TIMEOUT_MS = 60 * 1000;
 
+/** Wall-clock budget for the base-commit fetch when the clone lacks it. */
+const GIT_FETCH_TIMEOUT_MS = 120 * 1000;
+
 /** Wall-clock budget for one existence probe (`test -e`). */
 const PROBE_TIMEOUT_MS = 60 * 1000;
 
@@ -603,7 +606,42 @@ export class WorkspaceAdapter implements WorkspacePort {
         return { outcome: 'refused', reason: 'git-refused' };
       }
 
-      // 5. Create: one call, no `--force`. A non-zero exit refuses; a thrown
+      // 5. Ensure the base commit exists in the clone before creating a
+      //    worktree on it. A clone that has never fetched the base refuses
+      //    `worktree add`; fetch the default remote (`origin`) — never a
+      //    caller-supplied ref — and check again. A null exit or an error
+      //    on either command is `unknown`, as in step 6.
+      const catFileRun = await executor.run(
+        ['git', '-C', clonePath, 'cat-file', '-e', `${baseCommit}^{commit}`],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (catFileRun.exitCode === null || catFileRun.error !== undefined) {
+        return { outcome: 'unknown' };
+      }
+      if (catFileRun.exitCode !== 0) {
+        const fetchRun = await executor.run(
+          [
+            'git', '-C', clonePath, '-c', 'core.hooksPath=/dev/null',
+            'fetch', '--quiet', 'origin',
+          ],
+          { timeoutMs: GIT_FETCH_TIMEOUT_MS },
+        );
+        if (fetchRun.exitCode === null || fetchRun.error !== undefined) {
+          return { outcome: 'unknown' };
+        }
+        const catFileAfterFetchRun = await executor.run(
+          ['git', '-C', clonePath, 'cat-file', '-e', `${baseCommit}^{commit}`],
+          { timeoutMs: GIT_TIMEOUT_MS },
+        );
+        if (catFileAfterFetchRun.exitCode === null || catFileAfterFetchRun.error !== undefined) {
+          return { outcome: 'unknown' };
+        }
+        if (catFileAfterFetchRun.exitCode !== 0) {
+          return { outcome: 'refused', reason: 'git-refused' };
+        }
+      }
+
+      // 6. Create: one call, no `--force`. A non-zero exit refuses; a thrown
       //    or unanswered command is `unknown` — the worktree may or may not exist.
       const addRun = await executor.run(
         [

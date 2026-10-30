@@ -898,6 +898,86 @@ describe('RecordFindingDispositionUseCase', () => {
     expect(result.assessment.reviewReceipts[0]?.findings[0]?.state).toBe('refuted');
     expect(result.assessment.blockers).toEqual([]);
   });
+
+  it('records an out-of-scope disposition and drops the finding from the blockers', async () => {
+    const repo = fakeRepository([withFindings()]);
+    const useCase = new RecordFindingDispositionUseCase({ repo });
+
+    const result = await useCase.recordFindingDisposition({
+      assessmentId: 'ea-1',
+      disposition: disposition({
+        state: 'out-of-scope',
+        reason: 'the finding names files this lane never changed',
+      }),
+      nowIso: NOW,
+    });
+
+    expect(result.outcome).toBe('recorded');
+    if (result.outcome !== 'recorded') {
+      throw new Error('expected a recorded disposition');
+    }
+    const findings = result.assessment.reviewReceipts[0]?.findings ?? [];
+    expect(findings[0]?.state).toBe('out-of-scope');
+    expect(findings[0]?.dispositionReason).toBe('the finding names files this lane never changed');
+    expect(findings[1]?.state).toBe('unresolved');
+    expect(result.assessment.blockers).toEqual(["finding 'f-2' is unresolved"]);
+    expect(result.assessment.state).toBe('blocked');
+  });
+
+  it('refuses an out-of-scope disposition for a finding id raised by more than one receipt', async () => {
+    const repo = fakeRepository([
+      assessmentRecord({
+        requiredChecks: [],
+        reviewReceipts: [
+          reviewReceipt({ id: 'rr-1', result: 'fail', findings: [finding('f-1')] }),
+          reviewReceipt({ id: 'rr-2', result: 'fail', findings: [finding('f-1')] }),
+        ],
+      }),
+    ]);
+    const useCase = new RecordFindingDispositionUseCase({ repo });
+
+    const result = await useCase.recordFindingDisposition({
+      assessmentId: 'ea-1',
+      disposition: disposition({ state: 'out-of-scope' }),
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome !== 'rejected') {
+      throw new Error('expected a rejection');
+    }
+    expect(result.reason).toBe(
+      'An out-of-scope disposition needs a finding id raised by exactly one receipt',
+    );
+    // Nothing was saved: the finding stays unresolved exactly as before.
+    expect(repo.saved).toBe(0);
+    const stored = repo.records.get('ea-1');
+    if (!stored) {
+      throw new Error('expected the seeded assessment to remain');
+    }
+    for (const receipt of stored.reviewReceipts) {
+      for (const findingRecord of receipt.findings) {
+        expect(findingRecord.state).toBe('unresolved');
+      }
+    }
+  });
+
+  it('refuses an out-of-scope disposition without a reason or an evidence reference', async () => {
+    const useCase = new RecordFindingDispositionUseCase({
+      repo: fakeRepository([withFindings()]),
+    });
+
+    const withoutReason = await useCase.recordFindingDisposition({
+      assessmentId: 'ea-1',
+      disposition: disposition({ state: 'out-of-scope', reason: '   ' }),
+    });
+    const withoutEvidence = await useCase.recordFindingDisposition({
+      assessmentId: 'ea-1',
+      disposition: disposition({ state: 'out-of-scope', evidenceRef: '' }),
+    });
+
+    expect(withoutReason.outcome).toBe('rejected');
+    expect(withoutEvidence.outcome).toBe('rejected');
+  });
 });
 
 describe('RecordFindingDispositionUseCase malformed input', () => {

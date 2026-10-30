@@ -1,8 +1,11 @@
 // @generated use-case scaffold — refined for step 4.
 /**
- * RecordFindingDispositionUseCase resolves one finding with a fix or an
- * evidence-backed refutation for the exact head it was raised against. Only the
- * named finding changes: unrelated unresolved findings keep blocking.
+ * RecordFindingDispositionUseCase resolves one finding with a fix, an
+ * evidence-backed refutation, or an out-of-scope marking for the exact head
+ * it was raised against. Only the named finding changes: unrelated unresolved
+ * findings keep blocking. An out-of-scope disposition may only name a finding
+ * id that a single receipt raised, so it can never resolve a same-id finding
+ * in another receipt.
  */
 
 import type { EvidenceAssessmentRecord, ReviewFindingRecord } from '../../domain/evidence-records.js';
@@ -31,7 +34,7 @@ function isNonEmptyTrimmedString(value: unknown): value is string {
 function applyDisposition(
   receiptFindings: readonly ReviewFindingRecord[],
   findingId: string,
-  state: 'fixed' | 'refuted',
+  state: 'fixed' | 'refuted' | 'out-of-scope',
   reason: string,
   evidenceRef: string,
 ): readonly ReviewFindingRecord[] {
@@ -95,7 +98,11 @@ export class RecordFindingDispositionUseCase implements RecordFindingDisposition
     if (assessment === null) {
       return { outcome: 'rejected', reason: 'Assessment not found' };
     }
-    if (dispositionState !== 'fixed' && dispositionState !== 'refuted') {
+    if (
+      dispositionState !== 'fixed' &&
+      dispositionState !== 'refuted' &&
+      dispositionState !== 'out-of-scope'
+    ) {
       return {
         outcome: 'rejected',
         reason: 'A finding must be resolved as fixed or refuted; an unresolved state is not a disposition',
@@ -135,6 +142,17 @@ export class RecordFindingDispositionUseCase implements RecordFindingDisposition
       return {
         outcome: 'rejected',
         reason: `No finding '${disposition.findingId}' was raised for assessment ${assessment.id}`,
+      };
+    }
+    if (
+      dispositionState === 'out-of-scope' &&
+      assessment.reviewReceipts.filter((receipt) =>
+        receipt.findings.some((finding) => finding.findingId === disposition.findingId),
+      ).length > 1
+    ) {
+      return {
+        outcome: 'rejected',
+        reason: 'An out-of-scope disposition needs a finding id raised by exactly one receipt',
       };
     }
     if (AssessmentState.create(assessment.state).value?.isTerminal()) {

@@ -512,7 +512,7 @@ describe('receipts-only head assessment (KF-22a)', () => {
     expect(result.outcome).toBe('receipts-passed');
     if (result.outcome === 'receipts-passed') {
       expect(result.receiptsId).toBe(`rcp-asm-1-${HEAD.slice(0, 8)}`);
-      expect(result.assessment.state).toBe('pending');
+      expect('assessment' in result).toBe(false);
       expect(result.candidateHeadSha).toBe(HEAD);
     }
     expect(forge.calls).toBe(0);
@@ -609,6 +609,9 @@ describe('receipts-only head assessment (KF-22a)', () => {
     expect(receipts.outcome).toBe('receipts-passed');
     if (receipts.outcome === 'receipts-passed') {
       expect(receipts.receiptsId).toBe(`rcp-asm-1-${HEAD.slice(0, 8)}`);
+      // The stored acceptance never travels through the receipts-only result.
+      expect('assessment' in receipts).toBe(false);
+      expect(JSON.stringify(receipts)).not.toContain('acc-1');
     }
 
     const full = await useCase.assessHeadAcceptance({

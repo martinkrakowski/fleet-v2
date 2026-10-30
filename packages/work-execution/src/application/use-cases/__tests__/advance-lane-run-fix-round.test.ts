@@ -1556,6 +1556,115 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     const record = await harness.runRepo.get(RUN_ID);
     expect(record?.attemptIds).toEqual(['attempt-example-1', 'attempt-fix-prior']);
   });
+
+  it('o2) after a cancelled fix attempt, the next prepare trusts the cancelled attempt\'s handover and recovers the original brief (KF-28)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+
+    // a2 is prepared: its handover is placed over the shared worktree's brief files.
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared',
+    });
+    const a2Id = (await harness.runRepo.get(RUN_ID))?.attemptIds[1];
+    expect(typeof a2Id).toBe('string');
+    const a2Handover = harness.briefRequests[0]!.proseMarkdown!;
+    // The disk now holds a2's handover, not a1's frozen prose.
+    harness.setProse(a2Handover);
+
+    // a2's dispatch is refused and the recovery cancels it (KF-17).
+    await admit(harness, a2Id as string);
+    harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: 'refused by the example runner' }));
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    const parked = await harness.runRepo.get(RUN_ID);
+    const saved = await harness.deps.runRepo.save(
+      { ...parked!, parked: null, revision: parked!.revision + 1 },
+      { holderId: HOLDER, fence: 1, nowIso: LATER },
+    );
+    expect(saved.outcome).toBe('saved');
+    await conduct(harness, 'fixing', LATER);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'dispatch-pending' });
+    expect(harness.cancelRequests).toEqual([{ attemptId: a2Id as string, nowIso: LATER }]);
+    expect((await harness.attemptRepo.findAttemptById(a2Id as string))?.state).toBe('cancelled');
+
+    // a3 prepares from the collected a1 even though the disk holds a2's
+    // handover: its digest matches the cancelled a2's recorded `briefDigest`
+    // and a2's `priorAttemptId` names the prior.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted', step: 'prepare', key: prepareKey(1, 1, 3), result: 'completed', reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests).toHaveLength(2);
+    expect(harness.fixRequests[1]?.priorAttemptId).toBe('attempt-example-1');
+    // The placed prose carries the SAME original brief after the marker and the numbered finding.
+    const a3Prose = harness.briefRequests[1]!.proseMarkdown!;
+    expect(a3Prose.indexOf(ORIGINAL_BRIEF_MARKER)).toBeGreaterThan(-1);
+    expect(originalBriefOf(a3Prose)).toBe(DEFAULT_PROSE);
+    expect(a3Prose).toContain('[blocker] src/ex.ts:4 — blocks the acceptance check');
+  });
+
+  it('o3) a disk prose matching neither the prior\'s nor a cancelled attempt\'s digest still refuses (KF-28)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared',
+    });
+    const a2Id = (await harness.runRepo.get(RUN_ID))?.attemptIds[1];
+    expect(typeof a2Id).toBe('string');
+    await admit(harness, a2Id as string);
+    harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: 'refused by the example runner' }));
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    const parked = await harness.runRepo.get(RUN_ID);
+    const saved = await harness.deps.runRepo.save(
+      { ...parked!, parked: null, revision: parked!.revision + 1 },
+      { holderId: HOLDER, fence: 1, nowIso: LATER },
+    );
+    expect(saved.outcome).toBe('saved');
+    await conduct(harness, 'fixing', LATER);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'dispatch-pending' });
+    expect((await harness.attemptRepo.findAttemptById(a2Id as string))?.state).toBe('cancelled');
+
+    // The disk prose matches neither the prior's digest nor any cancelled fix
+    // attempt's digest: the prepare refuses and places nothing.
+    harness.setProse('# prose matching neither digest\n');
+    const briefCount = harness.briefRequests.length;
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted', step: 'prepare', key: prepareKey(1, 1, 3), result: 'refused', reasonCode: 'prepare-refused',
+    });
+    expect(harness.fixRequests).toHaveLength(1);
+    expect(harness.briefRequests).toHaveLength(briefCount);
+  });
+
+  it('o4) a cancelled fix attempt whose priorAttemptId is a different attempt is not trusted (KF-28)', async () => {
+    // A well-formed handover (it carries the original-brief marker), so only the
+    // priorAttemptId check can refuse it.
+    const strayProse =
+      '# a stray handover\n\n<!-- fleet:original-brief -->\n\n' +
+      '## Original brief (task reference; the numbered items above take priority)\n\nexample stray original\n';
+    const stray: AttemptRecord = {
+      ...buildFixAttempt(
+        { fixAttemptId: 'attempt-stray', workOrderId: 'wo-example-1', priorAttemptId: 'attempt-not-the-prior', numberedFixes: [] },
+        1,
+      ),
+      state: 'cancelled',
+      outcome: 'stopped',
+      briefDigest: simpleDeterministicHexDigest(strayProse + '\n' + FULL_MANIFEST_JSON),
+    };
+    // The stray is one of the run's attempts, so the facts load it and only the
+    // priorAttemptId check can refuse it.
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-stray'] }),
+      [collectedAttempt(), stray],
+    );
+    harness.setProse(strayProse);
+    await seedReviewFailure(harness, [blockerFinding()]);
+
+    // The disk digest matches the stray cancelled attempt's, but its
+    // `priorAttemptId` does not name the prior: the prepare refuses.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted', step: 'prepare', key: prepareKey(1, 0, 3), result: 'refused', reasonCode: 'prepare-refused',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+    expect(harness.briefRequests).toHaveLength(0);
+  });
 });
 
 describe('AdvanceLaneRunUseCase dispatch seat override (KF-18)', () => {

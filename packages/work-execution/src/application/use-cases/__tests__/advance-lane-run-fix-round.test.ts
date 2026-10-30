@@ -344,12 +344,16 @@ interface Harness {
   readonly briefFileReads: readonly { worktreePath: string; relativePath: string; recordedHost: AttemptRunnerRecord | null | undefined }[];
   /** Every `readBriefManifest` call's arguments, in call order. */
   readonly briefManifestReads: readonly { worktreePath: string; manifestPath: string | undefined; recordedHost: AttemptRunnerRecord | null | undefined }[];
+  /** Every `readChangedPaths` call's arguments, in call order. */
+  readonly changedPathReads: readonly { worktreePath: string; baseCommit: string; headCommit: string; recordedHost: AttemptRunnerRecord | null | undefined }[];
   readonly deps: AdvanceLaneRunDependencies;
   /** Journal length when the prepare port was called (order assertion). */
   readonly journalLengthWhenPrepared: number;
   setManifest(json: string | null): void;
   setProse(json: string | null): void;
   setBriefFileError(message: string | null): void;
+  setChangedPaths(paths: readonly string[] | null): void;
+  setChangedPathsError(message: string | null): void;
   setFindReceiptAnswer(answer: (request: FindReviewReceiptRequest) => Promise<FindReviewReceiptResult>): void;
   setFixAnswer(answer: (request: PrepareFixAttemptRequest) => Promise<PrepareFixAttemptResult>): void;
   setBriefAnswer(answer: (request: PrepareBriefPackageUseCaseRequest) => Promise<PrepareBriefPackageResult>): void;
@@ -389,9 +393,12 @@ async function makeHarness(
   const gateReceiptRequests: RecordGateReceiptsRequest[] = [];
   const briefFileReads: { worktreePath: string; relativePath: string; recordedHost: AttemptRunnerRecord | null | undefined }[] = [];
   const briefManifestReads: { worktreePath: string; manifestPath: string | undefined; recordedHost: AttemptRunnerRecord | null | undefined }[] = [];
+  const changedPathReads: { worktreePath: string; baseCommit: string; headCommit: string; recordedHost: AttemptRunnerRecord | null | undefined }[] = [];
   let manifestJson: string | null = FULL_MANIFEST_JSON;
   let prose: string | null = DEFAULT_PROSE;
   let briefFileError: string | null = null;
+  let changedPathsAnswer: readonly string[] | null = null;
+  let changedPathsError: string | null = null;
   let journalLengthWhenPrepared = 0;
   let journalLengthBeforeAdvance = 0;
   let sameFamilyImpl: SameModelFamily = (left, right) => left === right;
@@ -451,6 +458,13 @@ async function makeHarness(
     attemptRepo,
     executionJournal,
     artifactPort: {
+      readChangedPaths: async (worktreePath, baseCommit, headCommit, recordedHost) => {
+        changedPathReads.push({ worktreePath, baseCommit, headCommit, recordedHost });
+        if (changedPathsError !== null) {
+          throw new Error(changedPathsError);
+        }
+        return changedPathsAnswer;
+      },
       readBriefManifest: async (worktreePath, manifestPath, recordedHost) => {
         briefManifestReads.push({ worktreePath, manifestPath, recordedHost });
         return manifestJson;
@@ -626,6 +640,7 @@ async function makeHarness(
     gateReceiptRequests,
     briefFileReads,
     briefManifestReads,
+    changedPathReads,
     deps,
     get journalLengthWhenPrepared() {
       return journalLengthWhenPrepared;
@@ -638,6 +653,12 @@ async function makeHarness(
     },
     setBriefFileError: (message) => {
       briefFileError = message;
+    },
+    setChangedPaths: (paths) => {
+      changedPathsAnswer = paths;
+    },
+    setChangedPathsError: (message) => {
+      changedPathsError = message;
     },
     setFindReceiptAnswer: (answer) => {
       findReceiptAnswer = answer;
@@ -1664,6 +1685,178 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     });
     expect(harness.fixRequests).toHaveLength(0);
     expect(harness.briefRequests).toHaveLength(0);
+  });
+});
+
+/** A second, later attempt with its own base and head (the run's prior with artifacts). */
+function laterCollectedAttempt(): AttemptRecord {
+  const handoverProse = `# Handover\n\n1. fix the thing\n\n${ORIGINAL_BRIEF_MARKER}\n\n## Original brief (task reference; the numbered items above take priority)\n\n${DEFAULT_PROSE}`;
+  return {
+    ...collectedAttempt('1'.repeat(40)),
+    id: 'attempt-example-2',
+    kind: 'fix',
+    fixNumber: 1,
+    priorAttemptId: 'attempt-example-1',
+    baseCommit: '1'.repeat(40),
+    briefDigest: simpleDeterministicHexDigest(handoverProse + '\n' + FULL_MANIFEST_JSON),
+  };
+}
+
+describe('AdvanceLaneRunUseCase fix-round prepare scopes review findings (KF-33a)', () => {
+  it('a) an in-scope blocker is still a numbered handover item (changed set contains its file)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setChangedPaths(['src/ex.ts']);
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests[0]?.numberedFixes).toEqual([
+      '[blocker] src/ex.ts:4 — blocks the acceptance check',
+    ]);
+    expect(harness.changedPathReads).toEqual([
+      { worktreePath: WORKTREE, baseCommit: COMMIT_A, headCommit: COMMIT_A, recordedHost: CONDUCTED_RUNNER },
+    ]);
+  });
+
+  it('a2) a finding using the absolute worktree spelling of a changed file is handed over', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [
+      {
+        findingId: 'finding-9',
+        severity: 'major' as const,
+        summary: 'blocks the acceptance check',
+        filePath: WORKTREE + '/src/ex.ts',
+        line: 4,
+      },
+    ]);
+    harness.setChangedPaths(['src/ex.ts']);
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests[0]?.numberedFixes).toEqual([
+      '[major] ' + WORKTREE + '/src/ex.ts:4 — blocks the acceptance check',
+    ]);
+  });
+
+  it('b) an out-of-scope major is not in the handover, the in-scope finding beside it still is', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [
+      { findingId: 'finding-9', severity: 'major' as const, summary: 'blocks the acceptance check', filePath: 'src/other.ts', line: 9 },
+      blockerFinding(),
+    ]);
+    harness.setChangedPaths(['src/ex.ts']);
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests[0]?.numberedFixes).toEqual([
+      '[blocker] src/ex.ts:4 — blocks the acceptance check',
+    ]);
+  });
+
+  it('c) a finding with no filePath stays in the handover', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [
+      { findingId: 'finding-9', severity: 'major' as const, summary: 'blocks the acceptance check', filePath: null, line: null },
+    ]);
+    harness.setChangedPaths([]);
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests[0]?.numberedFixes).toEqual([
+      '[major]  — blocks the acceptance check',
+    ]);
+  });
+
+  it('d) readChangedPaths returning null, throwing, or absent keeps every finding (today\'s behaviour)', async () => {
+    const findings = [blockerFinding(), { findingId: 'finding-9', severity: 'major' as const, summary: 'blocks the acceptance check', filePath: 'src/other.ts', line: 9 }];
+    for (const scenario of ['null', 'throwing', 'absent'] as const) {
+      const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+      await seedReviewFailure(harness, findings);
+      if (scenario === 'null') {
+        harness.setChangedPaths(null);
+      } else if (scenario === 'throwing') {
+        harness.setChangedPathsError('unreadable');
+      } else {
+        delete (harness.deps.artifactPort as Record<string, unknown>).readChangedPaths;
+      }
+
+      expect(await advance(harness)).toEqual({
+        outcome: 'acted',
+        step: 'prepare',
+        key: prepareKey(1, 0, 2),
+        result: 'completed',
+        reasonCode: 'prepared',
+      });
+      expect(harness.fixRequests[0]?.numberedFixes).toEqual([
+        '[blocker] src/ex.ts:4 — blocks the acceptance check',
+        '[major] src/other.ts:9 — blocks the acceptance check',
+      ]);
+    }
+  });
+
+  it('e) every finding out of scope refuses no-in-scope-findings and prepares no fix attempt', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [
+      { findingId: 'finding-9', severity: 'major' as const, summary: 'blocks the acceptance check', filePath: 'src/other.ts', line: 9 },
+    ]);
+    harness.setChangedPaths(['src/ex.ts']);
+
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'prepare', result: 'refused', reasonCode: 'no-in-scope-findings',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+    expect(harness.briefRequests).toHaveLength(0);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.attemptIds).toEqual(['attempt-example-1']);
+  });
+
+  it('f) the call uses the FIRST attempt\'s baseCommit, the prior\'s head and the prior\'s recorded host', async () => {
+    const harness = await makeHarness(runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }), [
+      collectedAttempt(),
+      laterCollectedAttempt(),
+    ]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setChangedPaths(['src/ex.ts']);
+    // The prior is a fix attempt, so its frozen prose is a handover whose
+    // original-brief section is the only trusted source of the round-2 text.
+    harness.setProse(
+      `# Handover\n\n1. fix the thing\n\n${ORIGINAL_BRIEF_MARKER}\n\n## Original brief (task reference; the numbered items above take priority)\n\n${DEFAULT_PROSE}`,
+    );
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 3),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    // The lane base is the FIRST record's baseCommit (never the prior's own
+    // base, which a fix attempt's record is not), the head is the prior's
+    // collected head, and the host is the prior's recorded runner.
+    expect(harness.changedPathReads).toEqual([
+      { worktreePath: WORKTREE, baseCommit: COMMIT_A, headCommit: '1'.repeat(40), recordedHost: CONDUCTED_RUNNER },
+    ]);
+    expect(harness.fixRequests[0]?.priorAttemptId).toBe('attempt-example-2');
   });
 });
 

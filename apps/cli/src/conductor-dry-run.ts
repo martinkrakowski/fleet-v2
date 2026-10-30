@@ -423,14 +423,14 @@ export function createDryRunFakes(
     // The conductor's pre-PR accept and push grant use the receipts-only
     // assessment; the dry-run answers passed so the simulated lane still
     // accepts and opens/pushes.
-    assessHeadReceipts: async (request) => {
+    assessHeadReceipts: (request) => {
       recordCall('acceptanceAssessment', request);
       acceptanceSequence += 1;
-      return {
-        outcome: 'passed',
+      return Promise.resolve({
+        outcome: 'passed' as const,
         receiptsId: 'rcp-dry-run-' + String(acceptanceSequence),
         assessedHeadSha: request.candidateHeadSha,
-      };
+      });
     },
   };
 

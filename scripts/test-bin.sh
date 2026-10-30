@@ -91,6 +91,7 @@ check_pin() { # $1: script path, $2: hash file path
 if [ "$list_only" = 0 ]; then
   check_pin bin/ocm-run scripts/ocm-run-hash.txt
   check_pin bin/agy-run scripts/agy-run-hash.txt
+  check_pin bin/gate-slot scripts/gate-slot-hash.txt
 fi
 
 # The test files, one per line. Unsharded: the glob's own order, as before. Sharded:

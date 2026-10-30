@@ -23,7 +23,7 @@ import {
   type RunTelemetryPort,
   type TelemetryHmac,
 } from '@fleet/work-execution';
-import type { ResolvedTelemetryPolicy } from '@fleet/installation';
+import { TELEMETRY_SALT_MIN_DISTINCT, TELEMETRY_SALT_PATTERN, type ResolvedTelemetryPolicy } from '@fleet/installation';
 
 /** The CLI package version, a build-time constant (plan §3.2). */
 const SERVICE_VERSION = createRequire(import.meta.url)('../../package.json').version;
@@ -41,17 +41,37 @@ export interface ComposeTelemetryOptions {
   readonly env: Readonly<Record<string, string | undefined>>;
 }
 
+/** The resolved policy without its salt: what the runtime may expose (the salt never leaves the composer). */
+export type TelemetryPolicyView = Omit<ResolvedTelemetryPolicy, 'salt'>;
+
 /** A fixed configuration code; never the endpoint, token or salt. */
 export type TelemetryConfiguredState =
   | 'configured'
   | 'disabled'
   | 'no-salt'
+  | 'salt-invalid'
   | 'no-endpoint'
   | 'no-token-file'
   | 'endpoint-invalid'
   | 'endpoint-needs-https'
   | 'token-file-unreadable'
   | 'token-empty';
+
+function isValidSalt(salt: string): boolean {
+  return TELEMETRY_SALT_PATTERN.test(salt) && salt.length % 2 === 0 && new Set(salt).size >= TELEMETRY_SALT_MIN_DISTINCT;
+}
+
+function policyView(policy: ResolvedTelemetryPolicy): TelemetryPolicyView {
+  return {
+    enabled: policy.enabled,
+    projectName: policy.projectName,
+    route: policy.route,
+    sampleRatio: policy.sampleRatio,
+    sendCost: policy.sendCost,
+    includeDryRun: policy.includeDryRun,
+    projectAliases: policy.projectAliases,
+  };
+}
 
 export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOptions) {
   const repository = new EvidenceAssessmentRepositoryAdapter({ stateDir, readOnly: true });
@@ -65,7 +85,11 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
   const workOrderRepo = new WorkOrderRepositoryAdapter({ stateDir });
   const dispositions = new TelemetryDispositionAdapter({ stateDir });
 
-  const salt = typeof policy.salt === 'string' && policy.salt !== '' ? policy.salt : null;
+  // The installation validator's own salt rule (lowercase hex, whole bytes, not a
+  // placeholder), re-checked here so a direct caller can never key an HMAC or
+  // build a sender with an invalid salt.
+  const saltSet = typeof policy.salt === 'string' && policy.salt !== '';
+  const salt = saltSet && isValidSalt(policy.salt as string) ? (policy.salt as string) : null;
   const hmac: TelemetryHmac | null =
     salt === null
       ? null
@@ -83,7 +107,7 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
   if (!policy.enabled) {
     configured = 'disabled';
   } else if (salt === null) {
-    configured = 'no-salt';
+    configured = saltSet ? 'salt-invalid' : 'no-salt';
   } else if (typeof endpoint !== 'string' || endpoint.trim() === '') {
     configured = 'no-endpoint';
   } else if (typeof tokenFile !== 'string' || tokenFile.trim() === '') {
@@ -124,7 +148,7 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
       exportTelemetry,
       configured,
       saltFingerprint: saltFingerprint,
-      policy,
+      policy: policyView(policy),
     },
   };
 }

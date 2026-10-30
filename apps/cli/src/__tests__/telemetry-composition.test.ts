@@ -148,7 +148,7 @@ describe('telemetry receipt read composition', () => {
 });
 
 describe('telemetry export composition (OT4b-1)', () => {
-  const SALT = 'a'.repeat(64);
+  const SALT = '0123456789abcdef'.repeat(4);
   const EXAMPLE_ENDPOINT = 'https://collector.example.test/v1/traces';
 
   function examplePolicy(overrides: Partial<ResolvedTelemetryPolicy> = {}): ResolvedTelemetryPolicy {
@@ -184,7 +184,28 @@ describe('telemetry export composition (OT4b-1)', () => {
     expect(composed.telemetry.configured).toBe('disabled');
     expect(composed.telemetry.saltFingerprint).toBeNull();
     expect(composed.telemetry.exportTelemetry).toBeNull();
-    expect(composed.telemetry.policy).toEqual(examplePolicy());
+    const view: Record<string, unknown> = { ...examplePolicy() };
+    delete view.salt;
+    expect(composed.telemetry.policy).toEqual(view);
+  });
+
+  it('never exposes the salt on the composed telemetry', () => {
+    const composed = composeTelemetry({ policy: examplePolicy({ enabled: true, salt: SALT }), env: {} });
+    expect(Object.keys(composed.telemetry.policy)).not.toContain('salt');
+    expect(JSON.stringify(composed.telemetry)).not.toContain(SALT);
+  });
+
+  it('reports salt-invalid for a salt the installation validator rejects, with no HMAC, export or sender', async () => {
+    const tokenFile = await makeTokenFile();
+    for (const salt of ['a'.repeat(64), 'ABCDEF0123456789'.repeat(4), '0123456789abcdef'.repeat(4) + 'a', 'not-hex']) {
+      const composed = composeTelemetry({
+        policy: examplePolicy({ enabled: true, salt }),
+        env: { FLEET_TELEMETRY_ENDPOINT: EXAMPLE_ENDPOINT, FLEET_TELEMETRY_TOKEN_FILE: tokenFile },
+      });
+      expect(composed.telemetry.configured).toBe('salt-invalid');
+      expect(composed.telemetry.saltFingerprint).toBeNull();
+      expect(composed.telemetry.exportTelemetry).toBeNull();
+    }
   });
 
   it('reports no-endpoint with a salt, a fingerprint and a usable dry-run export', async () => {

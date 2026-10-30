@@ -26,7 +26,7 @@ import { composeEvidence } from './composition/evidence.js';
 import { composeExecutionHosts } from './composition/work-execution-hosts.js';
 import { composeExecution } from './composition/work-execution.js';
 import { composeConductor } from './composition/conductor.js';
-import { composeTelemetry, type TelemetryConfiguredState } from './composition/telemetry.js';
+import { composeTelemetry, type TelemetryConfiguredState, type TelemetryPolicyView } from './composition/telemetry.js';
 
 import {
   AcceptanceAssessmentAdapter,
@@ -176,7 +176,6 @@ import {
   type FleetInstallation,
   type FleetInstallationModel,
   type LoadResult,
-  type ResolvedTelemetryPolicy,
 } from '@fleet/installation';
 
 export interface FleetCliRuntimeOptions {
@@ -681,8 +680,8 @@ export interface FleetCliRuntime {
     readonly configured: TelemetryConfiguredState;
     /** Fingerprint of the installation salt (first 8 hex), or null without one. */
     readonly saltFingerprint: string | null;
-    /** The resolved telemetry policy (`resolveTelemetryPolicy`). */
-    readonly policy: ResolvedTelemetryPolicy;
+    /** The resolved telemetry policy without its salt (the salt never leaves the composer). */
+    readonly policy: TelemetryPolicyView;
   };
 }
 

@@ -61,11 +61,11 @@ export async function performEnter(ctx: AdvanceStepContext,
 
 /** The park reasons that also ask one keyed owner question (K6 header). */
 const OWNER_QUESTION_REASONS: readonly LaneRunParkReason[] = [
-  'one-way-door', 'owner-merge', 'blocker-after-round-2', 'seat-plan-exhausted',
+  'one-way-door', 'owner-merge', 'blocker-after-round-2', 'seat-plan-exhausted', 'fix-no-progress',
 ];
 
 /**
- * Raise the park's attention item and, for the four owner reasons, the keyed
+ * Raise the park's attention item and, for the owner reasons, the keyed
  * owner question (K6-7). Everything is failure-tolerant: missing wiring, a
  * missing work order, a refusal or a throw never blocks or changes the park,
  * and the park outcome is returned unchanged. No journal entry is written for

@@ -544,7 +544,8 @@ if [ "$mode" = usage ]; then
   # container, in opencode v2's session_v2 table), so they are read through the same
   # dial and auth as a dispatch, never from a database path on some host.
   [ "$api" = v2 ] || { echo "ocm-run: --usage needs a v2 server; $url answered v1" >&2; exit 3; }
-  uf=$(mktemp "${TMPDIR:-/tmp}/ocm-run.XXXXXX") || exit 1
+  # Exit 1 is reserved for "no such session"; every other failure of this mode is 3.
+  uf=$(mktemp "${TMPDIR:-/tmp}/ocm-run.XXXXXX") || { echo "ocm-run: --usage could not create a temp file under ${TMPDIR:-/tmp}" >&2; exit 3; }
   ocm_ucode=000
   ocm_usage_fetch() { # $1: path under /api/session/<id>; the body lands in $uf; 0 on a 200 JSON answer
     ocm_umeta=$(ocm_curl -s -m 8 -o "$uf" -w '%{http_code}:%{content_type}' "$url/api/session/$usage_id$1") || { ocm_ucode=000; return 1; }

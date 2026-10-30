@@ -1059,6 +1059,8 @@ touch "$T/usage-broken"
 out=$(run -- --usage ses_U1 2>"$T/err"); rc=$?
 check "--usage: a server error on the session read is exit 3, nothing printed" '[ "$rc" = 3 ] && [ -z "$out" ] && grep -q "could not read session ses_U1" "$T/err"'
 rm -f "$T/usage-broken"
+out=$(run TMPDIR="$T/no-such-dir" -- --usage ses_U1 2>"$T/err"); rc=$?
+check "--usage: a temp file that cannot be made is exit 3 (1 stays 'no such session')" '[ "$rc" = 3 ] && [ -z "$out" ] && grep -q "could not create a temp file" "$T/err"'
 touch "$T/auth-required"; printf 'opencode:pw-usage\n' > "$T/auth-required"; printf 'OPENCODE_SERVER_PASSWORD=pw-usage\n' > "$T/auth.env"
 out=$(run OPENCODE_AUTH_FILE="$T/auth.env" -- --usage ses_U1 2>"$T/err"); rc=$?
 check "--usage: the auth file's password reaches the server (basic auth), exit 0" '[ "$rc" = 0 ] && [ "$(printf "%s\n" "$out" | wc -l | tr -d " ")" = 1 ]'

@@ -464,6 +464,19 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'code-review' });
   });
 
+  it('act brief-check with a denying start gate waits session-stagger: no intent and requestReview is never called (KF-34a1)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    const result = await advance(harness, {
+      startGate: { tryStart: () => ({ ok: false, retryAfterMs: 12_345 }) },
+    });
+    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(harness.reviewRequests).toHaveLength(0);
+    expect(harness.openRequests).toHaveLength(0);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'intent')).toBe(false);
+  });
+
   it('act brief-check fails: the next advance enters fixing', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'brief-check', NOW);

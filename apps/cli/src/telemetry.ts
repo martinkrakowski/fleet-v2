@@ -263,15 +263,33 @@ async function exportCommand(
     return 1;
   }
   const now = options.now !== undefined ? options.now() : new Date();
-  const nowIso = now.toISOString();
-  const policy = runtime.telemetry.policy;
-  const selection =
-    flags.run !== undefined
-      ? { kind: 'run' as const, runId: flags.run }
-      : flags.workOrder !== undefined
-        ? { kind: 'work-order' as const, workOrderId: flags.workOrder }
-        : { kind: 'window' as const, sinceIso: flags.since!, untilIso: flags.until ?? null };
-  const result = await runtime.telemetry.exportTelemetry.execute({
+  const result = await runtime.telemetry.exportTelemetry.execute(
+    buildExportRequest(flags, runtime.telemetry.policy, now),
+  );
+
+  // Send mode: print the use-case result and map its outcome to the exit code.
+  if (!flags.dryRun) {
+    io.stdout(`${JSON.stringify(result)}\n`);
+    return sendExitCode(result);
+  }
+  return dryRunReport(result, flags.canary, io, runtime);
+}
+
+/** The typed export request from the parsed flags, the policy view and the clock. */
+function buildExportRequest(
+  flags: NonNullable<ReturnType<typeof parseExportFlags>>,
+  policy: FleetCliRuntime['telemetry']['policy'],
+  now: Date,
+) {
+  let selection;
+  if (flags.run !== undefined) {
+    selection = { kind: 'run' as const, runId: flags.run };
+  } else if (flags.workOrder !== undefined) {
+    selection = { kind: 'work-order' as const, workOrderId: flags.workOrder };
+  } else {
+    selection = { kind: 'window' as const, sinceIso: flags.since!, untilIso: flags.until ?? null };
+  }
+  return {
     selection,
     policy: {
       route: policy.route,
@@ -280,21 +298,51 @@ async function exportCommand(
       includeDryRun: policy.includeDryRun,
       projectAliases: policy.projectAliases,
     },
-    mode: flags.dryRun ? 'dry-run' : 'send',
+    mode: flags.dryRun ? ('dry-run' as const) : ('send' as const),
     deadline: flags.dryRun ? null : { atMs: now.getTime() + flags.deadline * 1000 },
     retryRejected: flags.retryRejected,
-    nowIso,
-  });
+    nowIso: now.toISOString(),
+  };
+}
 
-  // Send mode: print the use-case result and map its outcome to the exit code.
-  if (!flags.dryRun) {
-    io.stdout(`${JSON.stringify(result)}\n`);
-    return sendExitCode(result);
+/** The canary block printed with `--canary`: check names, booleans and counts only, never a value. */
+async function canaryBlock(
+  payload: Uint8Array | null,
+  runtime: FleetCliRuntime,
+): Promise<{ readonly pass: boolean; readonly checks: readonly unknown[]; readonly skippedCanaries: number } | null> {
+  if (payload === null) {
+    return { pass: true, checks: [], skippedCanaries: 0 };
   }
+  let canaryValues: readonly string[];
+  try {
+    canaryValues = await runtime.telemetry.canaryValues();
+  } catch {
+    return null;
+  }
+  const report = redactionChecks(payload, canaryValues);
+  return {
+    pass: report.pass,
+    checks: report.checks.map((check) => ({
+      check: check.check,
+      pass: check.pass,
+      offendingSpans: check.offendingSpans,
+    })),
+    skippedCanaries: report.skippedCanaries,
+  };
+}
 
-  // Dry-run mode: encode the selected spans exactly as they would be sent,
-  // count the encoding refusals (brand, validators and `pricingSafe`), and —
-  // with `--canary` — run the redaction checks on the encoded payload.
+/**
+ * Dry-run mode: encode the selected spans exactly as they would be sent, count
+ * the encoding refusals (brand, validators and `pricingSafe`), and, with
+ * `--canary`, run the redaction checks on the encoded payload.
+ */
+async function dryRunReport(
+  result: Awaited<ReturnType<NonNullable<FleetCliRuntime['telemetry']['exportTelemetry']>['execute']>>,
+  canary: boolean,
+  io: CliIo,
+  runtime: FleetCliRuntime,
+): Promise<number> {
+
   const dryRunSpans = result.outcome === 'dry-run' ? result.spans : null;
   const encoded = dryRunSpans === null ? null : encodeOtlpTraces(dryRunSpans, runtime.telemetry.resource);
   // A batch past the encoder's bound is refused whole without enumerating it,
@@ -303,28 +351,15 @@ async function exportCommand(
     dryRunSpans === null || encoded === null ? 0 : dryRunSpans.length - encoded.encodedSpanIds.length;
   const printed: Record<string, unknown> = { ...result, encodeRefused };
 
-  if (flags.canary) {
-    if (encoded !== null && encoded.payload !== null) {
-      let canaryValues: readonly string[];
-      try {
-        canaryValues = await runtime.telemetry.canaryValues();
-      } catch {
-        io.stdout(`${JSON.stringify({ outcome: 'canary-unreadable' })}\n`);
-        return 1;
-      }
-      const report = redactionChecks(encoded.payload, canaryValues);
-      printed.canary = {
-        pass: report.pass,
-        checks: report.checks.map((check) => ({
-          check: check.check,
-          pass: check.pass,
-          offendingSpans: check.offendingSpans,
-        })),
-        skippedCanaries: report.skippedCanaries,
-      };
-    } else {
-      printed.canary = { pass: true, checks: [], skippedCanaries: 0 };
+  let canaryPass = true;
+  if (canary) {
+    const block = await canaryBlock(encoded?.payload ?? null, runtime);
+    if (block === null) {
+      io.stdout(`${JSON.stringify({ outcome: 'canary-unreadable' })}\n`);
+      return 1;
     }
+    printed.canary = block;
+    canaryPass = block.pass;
   }
 
   io.stdout(`${JSON.stringify(printed)}\n`);
@@ -335,16 +370,7 @@ async function exportCommand(
   if (result.outcome !== 'dry-run') {
     return 1;
   }
-  if (result.counts.rejectedInvalid > 0 || encodeRefused > 0) {
-    return 1;
-  }
-  if (flags.canary && typeof printed.canary === 'object' && printed.canary !== null) {
-    const canaryReport = printed.canary as { readonly pass: boolean };
-    if (!canaryReport.pass) {
-      return 1;
-    }
-  }
-  return 0;
+  return result.counts.rejectedInvalid > 0 || encodeRefused > 0 || !canaryPass ? 1 : 0;
 }
 
 /**

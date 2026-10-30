@@ -31,6 +31,7 @@ import {
   ExecutionRunnerAdapter,
   buildRunnerEnv,
 } from '../ExecutionRunnerAdapter.adapter.js';
+import { buildAgyRunnerEnv } from '../AgyRunnerAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../AttemptRepositoryAdapter.adapter.js';
 import { DispatchAttemptUseCase } from '../../../application/use-cases/DispatchAttemptUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../../../application/use-cases/PrepareBriefPackageUseCase.use-case.js';
@@ -242,6 +243,40 @@ describe('ExecutionRunnerAdapter v2 host routing (H3a)', () => {
     // A planted routing variable is never inherited, in any mode.
     expect(buildRunnerEnv()).not.toHaveProperty('OCM_HOST');
     expect(buildRunnerEnv()).not.toHaveProperty('OCM_REMOTE_PORT');
+  });
+});
+
+describe('telemetry environment stays out of the runner (OT4b-1)', () => {
+  it('keeps FLEET_TELEMETRY_ENDPOINT and FLEET_TELEMETRY_TOKEN_FILE out of the inherited allow-list', () => {
+    const previousEndpoint = process.env.FLEET_TELEMETRY_ENDPOINT;
+    const previousTokenFile = process.env.FLEET_TELEMETRY_TOKEN_FILE;
+    process.env.FLEET_TELEMETRY_ENDPOINT = 'https://collector.example.test/v1/traces';
+    process.env.FLEET_TELEMETRY_TOKEN_FILE = '/tmp/example-token';
+    try {
+      expect(RUNNER_ENV_ALLOWLIST).not.toContain('FLEET_TELEMETRY_ENDPOINT');
+      expect(RUNNER_ENV_ALLOWLIST).not.toContain('FLEET_TELEMETRY_TOKEN_FILE');
+      expect(buildRunnerEnv()).not.toHaveProperty('FLEET_TELEMETRY_ENDPOINT');
+      expect(buildRunnerEnv()).not.toHaveProperty('FLEET_TELEMETRY_TOKEN_FILE');
+      expect(buildRunnerEnv(undefined, { transport: 'ssh' })).not.toHaveProperty(
+        'FLEET_TELEMETRY_ENDPOINT',
+      );
+      expect(buildRunnerEnv(undefined, { transport: 'ssh' })).not.toHaveProperty(
+        'FLEET_TELEMETRY_TOKEN_FILE',
+      );
+      expect(buildAgyRunnerEnv()).not.toHaveProperty('FLEET_TELEMETRY_ENDPOINT');
+      expect(buildAgyRunnerEnv()).not.toHaveProperty('FLEET_TELEMETRY_TOKEN_FILE');
+    } finally {
+      if (previousEndpoint === undefined) {
+        delete process.env.FLEET_TELEMETRY_ENDPOINT;
+      } else {
+        process.env.FLEET_TELEMETRY_ENDPOINT = previousEndpoint;
+      }
+      if (previousTokenFile === undefined) {
+        delete process.env.FLEET_TELEMETRY_TOKEN_FILE;
+      } else {
+        process.env.FLEET_TELEMETRY_TOKEN_FILE = previousTokenFile;
+      }
+    }
   });
 });
 

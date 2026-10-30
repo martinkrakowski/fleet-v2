@@ -519,6 +519,226 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
     expect(request.host).toMatchObject({ hostName: HOST_NAME, hostKind: 'opencode', transport: 'local' });
   });
 
+  it('test 11d: a concurrent start during admit makes this attempt release and refuse no-capacity (KF-34c1)', async () => {
+    const harness = makeHarness({ maxActiveRuns: 1 });
+    await harness.createRun(
+      runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']),
+    );
+    harness.attempts.set('attempt-example-1', attemptFixture('attempt-example-1'));
+    await harness.holdReservation('attempt-example-1');
+    // While this admit is reserving, another start reserves concurrently for
+    // another attempt (an in-flight held reservation with no run), so the
+    // post-reservation re-check of the cap blocks and this attempt releases
+    // its own reservation and refuses `no-capacity`.
+    harness.setReserveAnswer(async (request) => {
+      await harness.executionJournal.saveCapacityReservation(
+        reservationFixture('attempt-example-9'),
+      );
+      const reservation = reservationFixture(request.attemptId);
+      await harness.executionJournal.saveCapacityReservation(reservation);
+      return { outcome: 'reserved', reservation };
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+
+    const result = await harness.adapter.admit(admitRequest());
+
+    expect(result).toEqual({ outcome: 'no-capacity' });
+    expect(harness.reserveCalls).toHaveLength(1);
+    expect(releaseSpy).toHaveBeenCalledWith('attempt-example-2', NOW);
+    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
+    // The concurrent racer keeps its reservation; the caller retries.
+    expect(await heldFor(harness.executionJournal, 'attempt-example-9')).toBe(true);
+  });
+
+  it('test 11e: two admits racing for different runs with maxActiveRuns 1 admit at most one (KF-34c1)', async () => {
+    const harness = makeHarness({ maxActiveRuns: 1 });
+    await harness.createRun(
+      runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']),
+    );
+    await harness.createRun(
+      runRecord(RUN_B_ID, ['attempt-example-3', 'attempt-example-4']),
+    );
+    harness.attempts.set('attempt-example-1', attemptFixture('attempt-example-1'));
+    harness.attempts.set('attempt-example-3', attemptFixture('attempt-example-3'));
+    // Hold no prior reservations, so each initial check passes. The reserve
+    // answers only after both reserve calls have arrived, so both
+    // reservations exist before either re-check runs.
+    let resolveBarrier: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      resolveBarrier = resolve;
+    });
+    let reserveArrivals = 0;
+    harness.setReserveAnswer(async (request) => {
+      reserveArrivals += 1;
+      if (reserveArrivals === 2) {
+        resolveBarrier();
+      }
+      await barrier;
+      const reservation = reservationFixture(request.attemptId);
+      await harness.executionJournal.saveCapacityReservation(reservation);
+      return { outcome: 'reserved', reservation };
+    });
+
+    const [first, second] = await Promise.all([
+      harness.adapter.admit(admitRequest()),
+      harness.adapter.admit(admitRequest({ attemptId: 'attempt-example-4' })),
+    ]);
+
+    expect([first, second].filter((outcome) => outcome.outcome === 'admitted')).toHaveLength(0);
+    expect(first).toEqual({ outcome: 'no-capacity' });
+    expect(second).toEqual({ outcome: 'no-capacity' });
+    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
+    expect(await heldFor(harness.executionJournal, 'attempt-example-4')).toBe(false);
+    // Both refusing is the safe outcome: each released its own reservation and
+    // the runs retry on their next pass.
+  });
+
+  it('test 11f: with maxActiveRuns 2 the same race admits both (KF-34c1)', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(
+      runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2'], 'wo-example-1'),
+    );
+    await harness.createRun(
+      runRecord(RUN_B_ID, ['attempt-example-3', 'attempt-example-4'], 'wo-example-2'),
+    );
+    harness.workOrders.set(
+      'wo-example-2',
+      workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/other/src'] }),
+    );
+    harness.attempts.set('attempt-example-1', attemptFixture('attempt-example-1'));
+    harness.attempts.set('attempt-example-3', attemptFixture('attempt-example-3'));
+    let resolveBarrier: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      resolveBarrier = resolve;
+    });
+    let reserveArrivals = 0;
+    harness.setReserveAnswer(async (request) => {
+      reserveArrivals += 1;
+      if (reserveArrivals === 2) {
+        resolveBarrier();
+      }
+      await barrier;
+      const reservation = reservationFixture(request.attemptId);
+      await harness.executionJournal.saveCapacityReservation(reservation);
+      return { outcome: 'reserved', reservation };
+    });
+
+    const [first, second] = await Promise.all([
+      harness.adapter.admit(admitRequest()),
+      harness.adapter.admit(
+        admitRequest({ attemptId: 'attempt-example-4', workOrderId: 'wo-example-2' }),
+      ),
+    ]);
+
+    expect(first).toEqual({ outcome: 'admitted' });
+    expect(second).toEqual({ outcome: 'admitted' });
+    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(true);
+    expect(await heldFor(harness.executionJournal, 'attempt-example-4')).toBe(true);
+  });
+
+  it('test 11g: a re-check that passes keeps admitted and does not release (KF-34c1)', async () => {
+    const harness = makeHarness();
+    await harness.createRun(
+      runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']),
+    );
+    harness.attempts.set('attempt-example-1', attemptFixture('attempt-example-1'));
+    await harness.holdReservation('attempt-example-1');
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+
+    const result = await harness.adapter.admit(admitRequest());
+
+    expect(result).toEqual({ outcome: 'admitted' });
+    expect(releaseSpy).not.toHaveBeenCalled();
+    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(true);
+  });
+
+  it('test 11h: two admits racing over an overlapping package admit at most one (KF-34c1)', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(
+      runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2'], 'wo-example-1'),
+    );
+    await harness.createRun(
+      runRecord(RUN_B_ID, ['attempt-example-3', 'attempt-example-4'], 'wo-example-2'),
+    );
+    harness.workOrders.set(
+      'wo-example-1',
+      workOrderFixture({ id: 'wo-example-1', ownedPaths: ['packages/work-execution/src'] }),
+    );
+    harness.workOrders.set(
+      'wo-example-2',
+      workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/work-execution/test'] }),
+    );
+    harness.attempts.set('attempt-example-1', attemptFixture('attempt-example-1'));
+    harness.attempts.set('attempt-example-3', attemptFixture('attempt-example-3'));
+    let resolveBarrier: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      resolveBarrier = resolve;
+    });
+    let reserveArrivals = 0;
+    harness.setReserveAnswer(async (request) => {
+      reserveArrivals += 1;
+      if (reserveArrivals === 2) {
+        resolveBarrier();
+      }
+      await barrier;
+      const reservation = reservationFixture(request.attemptId);
+      await harness.executionJournal.saveCapacityReservation(reservation);
+      return { outcome: 'reserved', reservation };
+    });
+
+    const [first, second] = await Promise.all([
+      harness.adapter.admit(admitRequest()),
+      harness.adapter.admit(
+        admitRequest({ attemptId: 'attempt-example-4', workOrderId: 'wo-example-2' }),
+      ),
+    ]);
+
+    expect([first, second].filter((outcome) => outcome.outcome === 'admitted')).toHaveLength(0);
+    expect(first).toEqual({ outcome: 'no-capacity' });
+    expect(second).toEqual({ outcome: 'no-capacity' });
+    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
+    expect(await heldFor(harness.executionJournal, 'attempt-example-4')).toBe(false);
+    // Both refusing is the safe outcome: each released its own reservation and
+    // the runs retry on their next pass.
+  });
+
+  it('test 11i: a reserveFirst and an admit racing with maxActiveRuns 1 admit at most one (KF-34c1)', async () => {
+    const harness = makeHarness({ maxActiveRuns: 1 });
+    await harness.createRun(
+      runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']),
+    );
+    harness.attempts.set('attempt-example-1', attemptFixture('attempt-example-1'));
+    let resolveBarrier: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      resolveBarrier = resolve;
+    });
+    let reserveArrivals = 0;
+    harness.setReserveAnswer(async (request) => {
+      reserveArrivals += 1;
+      if (reserveArrivals === 2) {
+        resolveBarrier();
+      }
+      await barrier;
+      const reservation = reservationFixture(request.attemptId);
+      await harness.executionJournal.saveCapacityReservation(reservation);
+      return { outcome: 'reserved', reservation };
+    });
+
+    const [startResult, admitResult] = await Promise.all([
+      harness.adapter.reserveFirst(
+        firstReservationRequest({ attemptId: 'attempt-example-9' }),
+      ),
+      harness.adapter.admit(admitRequest()),
+    ]);
+
+    expect(startResult).toEqual({ outcome: 'no-capacity' });
+    expect(admitResult).toEqual({ outcome: 'no-capacity' });
+    expect(await heldFor(harness.executionJournal, 'attempt-example-9')).toBe(false);
+    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
+    // Both refusing is the safe outcome: each released its own reservation and
+    // the callers retry on their next pass.
+  });
+
   it('test 11c: a later attempt whose request path differs from the first attempt\'s is refused before the reserve', async () => {
     const harness = makeHarness();
     await harness.createRun(runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']));

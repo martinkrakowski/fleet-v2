@@ -26,7 +26,7 @@ import { composeEvidence } from './composition/evidence.js';
 import { composeExecutionHosts } from './composition/work-execution-hosts.js';
 import { composeExecution } from './composition/work-execution.js';
 import { composeConductor } from './composition/conductor.js';
-import { composeTelemetryReads } from './composition/telemetry.js';
+import { composeTelemetry, type TelemetryConfiguredState } from './composition/telemetry.js';
 
 import {
   AcceptanceAssessmentAdapter,
@@ -92,6 +92,8 @@ import {
   type SubprocessRunner,
   type CommandExecutorPort,
   type AcceptanceReceiptReadAdapter,
+  type ExportRunTelemetryUseCase,
+  type TelemetryDispositionAdapter,
 } from '@fleet/work-execution';
 
 import {
@@ -170,9 +172,11 @@ import {
 import {
   loadInstallation,
   requireValidInstallationModel,
+  resolveTelemetryPolicy,
   type FleetInstallation,
   type FleetInstallationModel,
   type LoadResult,
+  type ResolvedTelemetryPolicy,
 } from '@fleet/installation';
 
 export interface FleetCliRuntimeOptions {
@@ -667,8 +671,18 @@ export interface FleetCliRuntime {
     readonly autoMergeEnabled: boolean;
   };
   readonly telemetry: {
-    /** Telemetry's own read-only receipt read (OT2b); OT2c consumes it. */
+    /** Telemetry's own read-only receipt read (OT2b); OT2c/OT4b consume it. */
     readonly acceptanceReceiptRead: AcceptanceReceiptReadAdapter;
+    /** The telemetry disposition store (OT4b); the export writes only here. */
+    readonly dispositions: TelemetryDispositionAdapter;
+    /** The export use case; null without an installation salt (dry runs need no endpoint). */
+    readonly exportTelemetry: ExportRunTelemetryUseCase | null;
+    /** Whether telemetry is configured; a fixed code, never the endpoint/token/salt. */
+    readonly configured: TelemetryConfiguredState;
+    /** Fingerprint of the installation salt (first 8 hex), or null without one. */
+    readonly saltFingerprint: string | null;
+    /** The resolved telemetry policy (`resolveTelemetryPolicy`). */
+    readonly policy: ResolvedTelemetryPolicy;
   };
 }
 
@@ -868,7 +882,11 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     installation: options?.installation,
   });
 
-  const { telemetry } = composeTelemetryReads({ stateDir });
+  const { telemetry } = composeTelemetry({
+    stateDir,
+    policy: resolveTelemetryPolicy(options?.installation?.policy),
+    env: process.env,
+  });
 
   return {
     installation: options?.installation,

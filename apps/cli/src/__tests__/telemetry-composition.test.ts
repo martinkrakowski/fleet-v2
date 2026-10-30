@@ -1,7 +1,7 @@
 // Telemetry composition wiring (OT2b): the CLI runtime exposes telemetry's own
 // read-only receipt read, built on its own evidence store and inspect use case
 // — never the evidence context's instances.
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -13,8 +13,11 @@ import {
   type ReviewReceiptRecord,
   type VerificationReceiptRecord,
 } from '@fleet/evidence-and-acceptance';
+import type { ResolvedTelemetryPolicy } from '@fleet/installation';
+import { telemetrySaltFingerprint, type TelemetryHmac } from '@fleet/work-execution';
 
 import { createFleetCliRuntime } from '../composition.js';
+import { composeTelemetry } from '../composition/telemetry.js';
 
 const EXAMPLE_ATTEMPT = 'example-attempt-a';
 const EXAMPLE_HEAD = 'example-head-sha-1';
@@ -138,6 +141,137 @@ describe('telemetry receipt read composition', () => {
 
       expect(result).toEqual({ outcome: 'unavailable', reason: 'evidence-unreadable' });
       expect(await snapshot(tempDir)).toEqual(corruptBefore);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+});
+
+describe('telemetry export composition (OT4b-1)', () => {
+  const SALT = 'a'.repeat(64);
+  const EXAMPLE_ENDPOINT = 'https://collector.example.test/v1/traces';
+
+  function examplePolicy(overrides: Partial<ResolvedTelemetryPolicy> = {}): ResolvedTelemetryPolicy {
+    return Object.freeze({
+      enabled: false,
+      projectName: 'fleet-lanes',
+      route: 'collector',
+      sampleRatio: 1,
+      sendCost: true,
+      includeDryRun: true,
+      projectAliases: Object.freeze({}),
+      salt: null,
+      ...overrides,
+    });
+  }
+
+  async function makeTokenFile(): Promise<string> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-telemetry-token-'));
+    const file = path.join(dir, 'token');
+    await fs.writeFile(file, 'example-token', 'utf8');
+    return file;
+  }
+
+  function hmacOf(salt: string): TelemetryHmac {
+    return (message) =>
+      new Uint8Array(
+        createHmac('sha256', Buffer.from(salt, 'hex')).update(message, 'utf8').digest(),
+      );
+  }
+
+  it('reports disabled, a no-op port and no export when the policy is off', () => {
+    const composed = composeTelemetry({ policy: examplePolicy(), env: {} });
+    expect(composed.telemetry.configured).toBe('disabled');
+    expect(composed.telemetry.saltFingerprint).toBeNull();
+    expect(composed.telemetry.exportTelemetry).toBeNull();
+    expect(composed.telemetry.policy).toEqual(examplePolicy());
+  });
+
+  it('reports no-endpoint with a salt, a fingerprint and a usable dry-run export', async () => {
+    const policy = examplePolicy({ enabled: true, salt: SALT });
+    const composed = composeTelemetry({ policy, env: {} });
+    expect(composed.telemetry.configured).toBe('no-endpoint');
+    expect(composed.telemetry.exportTelemetry).not.toBeNull();
+    expect(composed.telemetry.saltFingerprint).toMatch(/^[0-9a-f]{8}$/);
+    expect(composed.telemetry.saltFingerprint).toBe(telemetrySaltFingerprint(hmacOf(SALT)));
+
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-telemetry-cli-'));
+    try {
+      const onDisk = composeTelemetry({ stateDir: tempDir, policy, env: {} });
+      const before = await snapshot(tempDir);
+      const result = await onDisk.telemetry.exportTelemetry!.execute({
+        selection: {
+          kind: 'window',
+          sinceIso: '2026-01-01T00:00:00.000Z',
+          untilIso: '2026-12-31T00:00:00.000Z',
+        },
+        policy: {
+          route: policy.route,
+          sampleRatio: policy.sampleRatio,
+          sendCost: policy.sendCost,
+          includeDryRun: policy.includeDryRun,
+          projectAliases: policy.projectAliases,
+        },
+        mode: 'dry-run',
+        deadline: null,
+        retryRejected: false,
+        nowIso: '2026-10-30T00:00:00.000Z',
+      });
+      expect(result.outcome).toBe('nothing-selected');
+      expect(await snapshot(tempDir)).toEqual(before);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('requires https for a non-loopback endpoint', async () => {
+    const tokenFile = await makeTokenFile();
+    try {
+      const policy = examplePolicy({ enabled: true, salt: SALT });
+      const composed = composeTelemetry({
+        policy,
+        env: {
+          FLEET_TELEMETRY_ENDPOINT: 'http://collector.example.test/v1/traces',
+          FLEET_TELEMETRY_TOKEN_FILE: tokenFile,
+        },
+      });
+      expect(composed.telemetry.configured).toBe('endpoint-needs-https');
+    } finally {
+      await fs.rm(path.dirname(tokenFile), { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('configures with the example https endpoint and a token file', async () => {
+    const tokenFile = await makeTokenFile();
+    try {
+      const policy = examplePolicy({ enabled: true, salt: SALT });
+      const composed = composeTelemetry({
+        policy,
+        env: {
+          FLEET_TELEMETRY_ENDPOINT: EXAMPLE_ENDPOINT,
+          FLEET_TELEMETRY_TOKEN_FILE: tokenFile,
+        },
+      });
+      expect(composed.telemetry.configured).toBe('configured');
+      expect(composed.telemetry.exportTelemetry).not.toBeNull();
+      expect(composed.telemetry.saltFingerprint).toMatch(/^[0-9a-f]{8}$/);
+    } finally {
+      await fs.rm(path.dirname(tokenFile), { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('reports the factory reason for a missing token file', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-telemetry-cli-'));
+    try {
+      const policy = examplePolicy({ enabled: true, salt: SALT });
+      const composed = composeTelemetry({
+        policy,
+        env: {
+          FLEET_TELEMETRY_ENDPOINT: EXAMPLE_ENDPOINT,
+          FLEET_TELEMETRY_TOKEN_FILE: path.join(tempDir, 'missing-token'),
+        },
+      });
+      expect(composed.telemetry.configured).toBe('token-file-unreadable');
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
     }

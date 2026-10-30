@@ -8,6 +8,10 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { configureFleetApiRuntime } from "../runtime";
 import { getTelemetryReadComposition } from "../telemetry/composition";
+import {
+  NoopRunTelemetryAdapter,
+  NoopRunTelemetryMarkAdapter,
+} from "@fleet/work-execution";
 
 const createdDirs = new Set<string>();
 
@@ -36,6 +40,9 @@ describe("telemetry read composition", () => {
       const composition = getTelemetryReadComposition();
       expect(composition).not.toBeNull();
       if (composition !== null) {
+        // The API drives no run, so its telemetry ports are the no-ops.
+        expect(composition.runTelemetry).toBeInstanceOf(NoopRunTelemetryAdapter);
+        expect(composition.runTelemetryMark).toBeInstanceOf(NoopRunTelemetryMarkAdapter);
         const result = await composition.acceptanceReceiptRead.readReceiptsForHead(
           "example-attempt-unknown",
           "example-head-unknown",

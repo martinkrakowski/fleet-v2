@@ -551,6 +551,10 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     return refuse('prepare-refused');
   }
   const round: 1 | 2 = decision.round === 1 ? 1 : 2;
+  // The prior is the latest attempt WITH artifacts: a cancelled fix attempt
+  // (never dispatched) is skipped, so after a refused fix dispatch the
+  // recovered round prepares from the collected prior in the same round
+  // (KF-17).
   let prior: AttemptRecord | null = null;
   for (let index = gathered.attemptRecords.length - 1; index >= 0; index -= 1) {
     const candidate = gathered.attemptRecords[index];

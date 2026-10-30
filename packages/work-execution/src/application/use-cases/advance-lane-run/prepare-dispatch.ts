@@ -344,7 +344,11 @@ export async function performDispatch(ctx: AdvanceStepContext,
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
   }
   // Refused: a runner refusal saved with its stop reason (S1) pivots through
-  // seat-failed; anything else parks for the owner (the key is spent).
+  // seat-failed; anything else parks for the owner (the key is spent). A
+  // refused FIX dispatch recovers in the same round after resume: the round
+  // is already raised here, so the decider re-reads the parked attempt as
+  // still this round's and the next advance cancels it and prepares again
+  // at that round (KF-17).
   const stored = await ctx.deps.attemptRepo.findAttemptById(latest.id);
   let reasonCode: LaneRunResultReasonCode;
   if (stored !== null && stored.state === 'cancelled') {

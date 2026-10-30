@@ -50,6 +50,10 @@ import type {
   DispatchAttemptRequest,
   DispatchAttemptResult,
 } from '../../ports/in/DispatchAttemptPort.in-port.js';
+import type {
+  CancelPreparedAttemptRequest,
+} from '../../ports/in/CancelPreparedAttemptPort.in-port.js';
+import type { ExecutionRunnerPort } from '../../ports/out/ExecutionRunnerPort.out-port.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -316,6 +320,7 @@ interface Harness {
   readonly fixRequests: PrepareFixAttemptRequest[];
   readonly briefRequests: PrepareBriefPackageUseCaseRequest[];
   readonly dispatchRequests: DispatchAttemptRequest[];
+  readonly cancelRequests: CancelPreparedAttemptRequest[];
   readonly deps: AdvanceLaneRunDependencies;
   /** Journal length when the prepare port was called (order assertion). */
   readonly journalLengthWhenPrepared: number;
@@ -348,6 +353,7 @@ async function makeHarness(
   const fixRequests: PrepareFixAttemptRequest[] = [];
   const briefRequests: PrepareBriefPackageUseCaseRequest[] = [];
   const dispatchRequests: DispatchAttemptRequest[] = [];
+  const cancelRequests: CancelPreparedAttemptRequest[] = [];
   let manifestJson: string | null = FULL_MANIFEST_JSON;
   let journalLengthWhenPrepared = 0;
   let journalLengthBeforeAdvance = 0;
@@ -425,6 +431,37 @@ async function makeHarness(
     },
     admission: {
       admit: async () => ({ outcome: 'admitted' }),
+    },
+    // KF-17: the record-only cancel of a never-dispatched attempt, releasing
+    // its held reservation, exactly as the real use case does.
+    cancelPreparedAttempt: {
+      cancelPreparedAttempt: async (request) => {
+        cancelRequests.push(request);
+        const existing = await attemptRepo.findAttemptById(request.attemptId);
+        if (existing === null || existing.state !== 'intent-recorded') {
+          return { outcome: 'refused', reason: 'not-prepared' } as const;
+        }
+        const cancelled: AttemptRecord = {
+          ...existing,
+          revision: (existing.revision ?? 0) + 1,
+          state: 'cancelled',
+          outcome: 'stopped',
+          updatedAtIso: request.nowIso,
+        };
+        await attemptRepo.saveAttempt(cancelled);
+        const released = await executionJournal.releaseCapacityReservation(request.attemptId, request.nowIso);
+        return { outcome: 'cancelled', attempt: cancelled, capacity: released ? 'released' as const : 'none-held' as const };
+      },
+    },
+    // KF-17: the worktree reconcile of a pending dispatch intent reads an
+    // idle worktree, so the never-started dispatch closes as not-started.
+    runnerForAttempt: {
+      runnerForAttempt: () => ({
+        ok: true,
+        runner: {
+          inspectWorktreeRun: async () => ({ state: 'idle' }),
+        } as unknown as ExecutionRunnerPort,
+      }),
     },
     newUlid: makeUlidMinter(),
     sameModelFamily: (left, right) => sameFamilyImpl(left, right),
@@ -505,6 +542,7 @@ async function makeHarness(
     fixRequests,
     briefRequests,
     dispatchRequests,
+    cancelRequests,
     deps,
     get journalLengthWhenPrepared() {
       return journalLengthWhenPrepared;
@@ -1033,6 +1071,112 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       reasonCode: 'dispatch-refused',
       detail: 'worktree-head-mismatch',
     });
+  });
+
+  it('o) a refused fix dispatch recovers in the same round after resume (KF-17)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+
+    // Fixing prepares a2 under the round-1 key; the run's round is still 0
+    // until dispatch.
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared',
+    });
+    const afterPrepare = await harness.runRepo.get(RUN_ID);
+    const fixAttemptId = afterPrepare?.attemptIds[1];
+    expect(typeof fixAttemptId).toBe('string');
+    await admit(harness, fixAttemptId as string);
+
+    // The dispatch refuses with the attempt untouched: the round is raised to
+    // 1 BEFORE the call, the key is spent, and the run parks step-refused
+    // dispatch with round 1.
+    harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: 'refused by the example runner' }));
+    const key = dispatchKey(1, 0, 2);
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    const parked = await harness.runRepo.get(RUN_ID);
+    expect(parked?.parked).toMatchObject({ reason: 'step-refused', qualifier: 'dispatch' });
+    expect(parked?.round).toBe(1);
+
+    // Resume: clear the park and re-conduct `fixing` (the park's parkedFrom).
+    const saved = await harness.deps.runRepo.save(
+      { ...parked!, parked: null, revision: parked!.revision + 1 },
+      { holderId: HOLDER, fence: 1, nowIso: LATER },
+    );
+    expect(saved.outcome).toBe('saved');
+    await conduct(harness, 'fixing', LATER);
+
+    // The next advance cancels a2, releases its reservation and never re-sends
+    // the spent dispatch key.
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'dispatch-pending' });
+    expect(harness.dispatchRequests).toHaveLength(1);
+    expect(harness.cancelRequests).toEqual([{ attemptId: fixAttemptId, nowIso: LATER }]);
+    expect((await harness.attemptRepo.findAttemptById(fixAttemptId as string))?.state).toBe('cancelled');
+    expect(
+      (await harness.executionJournal.listActiveReservations()).some(
+        (reservation) => reservation.attemptId === fixAttemptId && reservation.held,
+      ),
+    ).toBe(false);
+    expect((await harness.runJournal.listForKey(key)).filter((entry) => entry.kind === 'intent')).toHaveLength(1);
+
+    // The next advance prepares a3 at round 1 with the collected a1 as prior
+    // (the next fix seat, after seat 0's spent dispatch).
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted', step: 'prepare', key: prepareKey(1, 1, 3), result: 'completed', reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests[1]?.priorAttemptId).toBe('attempt-example-1');
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.round).toBe(1);
+
+    // The next advance dispatches a3.
+    const a3 = record?.attemptIds[2];
+    expect(typeof a3).toBe('string');
+    await admit(harness, a3 as string);
+    harness.setDispatchAnswer(async (request) => ({
+      outcome: 'started',
+      attempt: buildFixAttempt({ fixAttemptId: request.attemptId, workOrderId: record!.workOrderId, priorAttemptId: 'attempt-example-1', numberedFixes: [] }, 0),
+      sessionId: 'session-example-2',
+    }));
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'dispatch', key: dispatchKey(1, 1, 3), result: 'completed', reasonCode: 'dispatch-started',
+    });
+    expect(harness.dispatchRequests).toHaveLength(2);
+  });
+
+  it('p) a crash between the round raise and the dispatch reconciles not-started and prepares again at round 1 (KF-17)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'completed' });
+    const afterPrepare = await harness.runRepo.get(RUN_ID);
+    const fixAttemptId = afterPrepare?.attemptIds[1];
+    expect(typeof fixAttemptId).toBe('string');
+    await admit(harness, fixAttemptId as string);
+
+    // Crash between the raise save and the dispatch: the dispatch intent is
+    // pending, the run's round is already 1, and the runner was never called.
+    const key = dispatchKey(1, 0, 2);
+    await appendIntent(harness, key, fixAttemptId as string, NOW);
+    const raised = await harness.runRepo.get(RUN_ID);
+    const saved = await harness.deps.runRepo.save(
+      { ...raised!, round: 1, cursors: { ...raised!.cursors, fix: 0 }, revision: raised!.revision + 1 },
+      { holderId: HOLDER, fence: 1, nowIso: LATER },
+    );
+    expect(saved.outcome).toBe('saved');
+
+    // The reconcile reads the idle worktree, cancels a2 and closes the key
+    // not-started; the dispatch is never sent.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted', step: 'dispatch', key, result: 'not-started', reasonCode: 'worktree-idle',
+    });
+    expect(harness.dispatchRequests).toHaveLength(0);
+    expect((await harness.attemptRepo.findAttemptById(fixAttemptId as string))?.state).toBe('cancelled');
+
+    // The next prepare is at round 1, from the collected a1 (the next fix seat).
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted', step: 'prepare', key: prepareKey(1, 1, 3), result: 'completed', reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests[1]?.priorAttemptId).toBe('attempt-example-1');
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.round).toBe(1);
   });
 });
 

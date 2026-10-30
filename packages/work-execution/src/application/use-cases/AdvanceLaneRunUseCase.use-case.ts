@@ -104,7 +104,7 @@ export interface AdvanceLaneRunDependencies {
   readonly runJournal: LaneRunJournalPort;
   readonly attemptRepo: AttemptRepositoryPort;
   readonly executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations' | 'listJournalEntriesForAttempt'>;
-  readonly artifactPort: Pick<AttemptArtifactPort, 'readBriefManifest' | 'verifyArtifactManifest' | 'readBriefFile'>;
+  readonly artifactPort: Pick<AttemptArtifactPort, 'readBriefManifest' | 'verifyArtifactManifest' | 'readBriefFile' | 'readChangedPaths'>;
   /**
    * Digest used to verify a prior attempt's frozen brief prose against its
    * manifest when filling a fix handover (KF-21b); default

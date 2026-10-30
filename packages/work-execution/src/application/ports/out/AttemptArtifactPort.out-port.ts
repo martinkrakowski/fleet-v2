@@ -126,6 +126,18 @@ export interface AttemptArtifactPort {
     recordedHost?: AttemptRunnerRecord | null,
   ): Promise<string | null>;
 
+  /**
+   * KF-33a: the worktree-relative paths changed between the two commits,
+   * read locally or remotely. Returns null when they cannot be read; callers
+   * treat null as "unknown" and fail closed (every finding stays in scope).
+   */
+  readChangedPaths?(
+    worktreePath: string,
+    baseCommit: string,
+    headCommit: string,
+    recordedHost?: AttemptRunnerRecord | null,
+  ): Promise<readonly string[] | null>;
+
   /** Write the attempt's artifact manifest atomically and read it back (C1). */
   sealArtifactManifest?(request: SealArtifactManifestRequest): Promise<SealArtifactManifestResult>;
 

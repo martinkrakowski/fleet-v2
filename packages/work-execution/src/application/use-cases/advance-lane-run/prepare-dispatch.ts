@@ -6,7 +6,7 @@ import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunCursorsRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { implementerRoleFor } from '../../../domain/lane-run-transitions.js';
-import { seatSelectionRecord } from '../../../domain/seat-selection.js';
+import { seatMatchesAssignment, seatSelectionRecord } from '../../../domain/seat-selection.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import { conductedRunnerOf } from './conducted-host.js';
@@ -306,13 +306,33 @@ export async function performDispatch(ctx: AdvanceStepContext,
   // override; the seat-plan pivot (a re-prepare on the round's next seat)
   // keeps its override. A fix attempt with no seat selection keeps no
   // override, and a first attempt (priorAttemptId null) never carries one.
+  // A fix attempt's override names only a seat of its frozen plan: the
+  // selection is verified against the plan before it is used (no plan,
+  // unparsable plan, index out of range, or id/model/tool/variant/agent
+  // mismatch send no override — the dispatch then refuses `seat-mismatch`
+  // and the run parks, never a guessed seat).
   const seatSelection = latest.seatSelection ?? null;
-  const seatForOverride: AttemptSeatSelectionRecord | null =
-    latest.kind === 'initial' && latest.priorAttemptId !== null
-      ? seatSelection
-      : latest.kind === 'fix' && seatSelection !== null && seatSelection.role === 'fix'
-        ? seatSelection
-        : null;
+  let seatForOverride: AttemptSeatSelectionRecord | null = null;
+  if (latest.kind === 'initial' && latest.priorAttemptId !== null) {
+    seatForOverride = seatSelection;
+  } else if (latest.kind === 'fix' && seatSelection !== null && seatSelection.role === 'fix') {
+    const planResult = SeatPlan.create(latest.seatPlan);
+    if (planResult.success && planResult.value !== undefined) {
+      const planSeat = planResult.value.getSeats('fix')[seatSelection.seatIndex];
+      if (
+        planSeat !== undefined &&
+        planSeat.id === seatSelection.seatId &&
+        seatMatchesAssignment(planSeat, {
+          model: seatSelection.model,
+          tool: seatSelection.tool,
+          variant: seatSelection.variant,
+          agent: seatSelection.agent,
+        })
+      ) {
+        seatForOverride = seatSelection;
+      }
+    }
+  }
   const seatOverride: AttemptSeatOverrideRecord | null =
     seatForOverride === null
       ? null

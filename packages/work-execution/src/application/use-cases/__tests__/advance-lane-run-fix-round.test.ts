@@ -1184,24 +1184,9 @@ describe('AdvanceLaneRunUseCase dispatch seat override (KF-18)', () => {
   it('q) a fix attempt dispatches on its own fix seat through a seat override (KF-18)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await seedReviewFailure(harness, [blockerFinding()]);
-    // The fix port selects a fix seat whose model differs from the frozen
-    // brief's model assignment (the first-pass model): the dispatch would be
-    // refused on the seat binding without the override.
-    harness.setFixAnswer(async (request) => ({
-      outcome: 'prepared',
-      attempt: {
-        ...buildFixAttempt(request, 0),
-        seatSelection: {
-          role: 'fix',
-          seatIndex: 0,
-          seatId: 'fx-example',
-          model: 'example-provider/fix-model',
-          tool: 'opencode',
-          variant: 'low',
-          agent: 'lane-fix',
-        },
-      },
-    }));
+    // The fix port selects the plan's fix seat (`fx-1` / `fix-model-1` at
+    // index 0, per the fixture plan): the override names that seat and the
+    // dispatch would be refused on the seat binding without it.
     expect(await advance(harness)).toMatchObject({
       outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared',
     });
@@ -1214,10 +1199,8 @@ describe('AdvanceLaneRunUseCase dispatch seat override (KF-18)', () => {
     });
     expect(harness.dispatchRequests).toHaveLength(1);
     expect(harness.dispatchRequests[0]?.seatOverride).toEqual({
-      model: 'example-provider/fix-model',
-      agent: 'lane-fix',
-      variant: 'low',
-      reason: 'fix seat fx-example',
+      model: 'fix-model-1',
+      reason: 'fix seat fx-1',
       setBy: 'conductor',
       expiresAtIso: new Date(Date.parse(LATER) + 2700 * 1000).toISOString(),
     });
@@ -1261,6 +1244,70 @@ describe('AdvanceLaneRunUseCase dispatch seat override (KF-18)', () => {
       outcome: 'acted', step: 'dispatch', result: 'completed', reasonCode: 'dispatch-started',
     });
     expect(harness.dispatchRequests).toHaveLength(1);
+    expect(harness.dispatchRequests[0]?.seatOverride).toBeUndefined();
+  });
+
+  /** Seed a review failure, prepare a fix attempt carrying `overrides` on its record, and dispatch it. */
+  async function prepareAndDispatchFixWith(harness: Harness, overrides: Partial<AttemptRecord>): Promise<void> {
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setFixAnswer(async (request) => ({
+      outcome: 'prepared',
+      attempt: { ...buildFixAttempt(request, 0), ...overrides },
+    }));
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared',
+    });
+    const afterPrepare = await harness.runRepo.get(RUN_ID);
+    const fixAttemptId = afterPrepare?.attemptIds[1];
+    expect(typeof fixAttemptId).toBe('string');
+    await admit(harness, fixAttemptId as string);
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'dispatch', result: 'completed', reasonCode: 'dispatch-started',
+    });
+  }
+
+  it('t) a fix override naming a seat id outside the frozen plan is dropped (KF-18)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await prepareAndDispatchFixWith(harness, {
+      seatSelection: {
+        role: 'fix',
+        seatIndex: 0,
+        seatId: 'fx-example',
+        model: 'example-provider/fix-model',
+        tool: 'opencode',
+        variant: 'low',
+        agent: 'lane-fix',
+      },
+    });
+    expect(harness.dispatchRequests).toHaveLength(1);
+    expect(harness.dispatchRequests[0]?.seatOverride).toBeUndefined();
+  });
+
+  it('u) a fix override whose model differs from its frozen-plan seat is dropped (KF-18)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await prepareAndDispatchFixWith(harness, {
+      seatSelection: {
+        role: 'fix',
+        seatIndex: 0,
+        seatId: 'fx-1',
+        model: 'different-model',
+        tool: 'opencode',
+        variant: null,
+        agent: null,
+      },
+    });
+    expect(harness.dispatchRequests[0]?.seatOverride).toBeUndefined();
+  });
+
+  it('v) a fix attempt without a frozen plan keeps no override (KF-18)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await prepareAndDispatchFixWith(harness, { seatPlan: null });
+    expect(harness.dispatchRequests[0]?.seatOverride).toBeUndefined();
+  });
+
+  it('w) a fix attempt without a seat selection keeps no override (KF-18)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await prepareAndDispatchFixWith(harness, { seatSelection: null });
     expect(harness.dispatchRequests[0]?.seatOverride).toBeUndefined();
   });
 });

@@ -360,12 +360,7 @@ function isPreMergeSeatBlocked(
   implementerModels: readonly string[],
   sameFamily: SameModelFamily,
 ): boolean {
-  return (
-    unhealthy.has(seat.id) ||
-    unavailable.has(seat.id) ||
-    seat.on !== undefined ||
-    implementerModels.some((model) => sameFamily(seat.model, model))
-  );
+  return preMergeSeatBlock(seat, unhealthy, unavailable, implementerModels, sameFamily) !== null;
 }
 
 type EligibleSeat = { readonly seat: SeatPlanSeat; readonly index: number };

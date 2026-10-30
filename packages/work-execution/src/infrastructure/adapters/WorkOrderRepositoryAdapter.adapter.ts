@@ -5,6 +5,8 @@
  * when `stateDir` is configured each mutation is persisted as JSON via an
  * atomic temp-file-then-rename write under an exclusive lock. Optimistic concurrency refuses stale
  * revisions evaluated against the freshly read record.
+ * With `readOnly` the store never writes: an unreadable file is a read
+ * error with no quarantine copy, and every save is refused.
  */
 
 import { promises as fs } from 'node:fs';
@@ -14,13 +16,24 @@ import type { WorkOrderRecord } from '../../domain/execution-records.js';
 import type { WorkOrderRepositoryPort } from '../../application/ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
 import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
-import { inspectRecordListBytes, quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
+import {
+  assertStoreWritable,
+  inspectRecordListBytes,
+  rejectUnreadableStateFile,
+  withFileLock,
+  writeJsonAtomically,
+} from './file-store.js';
 
 export interface WorkOrderRepositoryAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
   readonly stateDir?: string;
   /** Emitter for post-save change signals; defaults to a no-op adapter. */
   readonly changeSignal?: ChangeSignalPort;
+  /**
+   * Read-only (telemetry plan §3.3): an unreadable file is a read error with no quarantine copy
+   * (`StateFileUnreadableReadOnlyError`), and every write throws `ReadOnlyStateStoreError`.
+   */
+  readonly readOnly?: boolean;
 }
 
 function isWorkOrderRecord(value: unknown): value is WorkOrderRecord {
@@ -56,6 +69,7 @@ export class WorkOrderRepositoryAdapter implements WorkOrderRepositoryPort {
   }
 
   async saveWorkOrder(record: WorkOrderRecord): Promise<void> {
+    assertStoreWritable(this.options?.readOnly === true, 'WorkOrderRepositoryAdapter');
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
       const existing = this.inMemoryRecords.get(record.id);
@@ -149,7 +163,7 @@ export class WorkOrderRepositoryAdapter implements WorkOrderRepositoryPort {
     }
     const inspection = inspectRecordListBytes(buffer, parseWorkOrderStateRecord);
     if (inspection.status === 'unreadable') {
-      return quarantineUnreadable(target, inspection.detail, buffer);
+      return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
     }
     for (const item of inspection.records) {
       map.set(item.id, item);

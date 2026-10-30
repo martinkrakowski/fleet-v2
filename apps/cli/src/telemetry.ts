@@ -295,8 +295,12 @@ async function exportCommand(
   // Dry-run mode: encode the selected spans exactly as they would be sent,
   // count the encoding refusals (brand, validators and `pricingSafe`), and —
   // with `--canary` — run the redaction checks on the encoded payload.
-  const encoded = result.outcome === 'dry-run' ? encodeOtlpTraces(result.spans, runtime.telemetry.resource) : null;
-  const encodeRefused = encoded === null ? 0 : encoded.refused.length;
+  const dryRunSpans = result.outcome === 'dry-run' ? result.spans : null;
+  const encoded = dryRunSpans === null ? null : encodeOtlpTraces(dryRunSpans, runtime.telemetry.resource);
+  // A batch past the encoder's bound is refused whole without enumerating it,
+  // so its `refused` list is empty; every span still counts as refused.
+  const encodeRefused =
+    dryRunSpans === null || encoded === null ? 0 : dryRunSpans.length - encoded.encodedSpanIds.length;
   const printed: Record<string, unknown> = { ...result, encodeRefused };
 
   if (flags.canary) {

@@ -83,7 +83,7 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
   const attemptRepo = new AttemptRepositoryAdapter({ stateDir, readOnly: true });
   const journal = new LaneRunJournalAdapter({ stateDir, readOnly: true });
   const runRepo = new LaneRunRepositoryAdapter({ stateDir, readOnly: true });
-  const workOrderRepo = new WorkOrderRepositoryAdapter({ stateDir });
+  const workOrderRepo = new WorkOrderRepositoryAdapter({ stateDir, readOnly: true });
   const dispositions = new TelemetryDispositionAdapter({ stateDir });
 
   // The installation validator's own salt rule (lowercase hex, whole bytes, not a
@@ -213,6 +213,8 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
       }
     }
 
+    // Receipt ids are never collected: the receipt port exposes them only as
+    // opaque `TelemetryHashInput` tokens that are only ever hashed.
     return [...values].sort();
   };
 

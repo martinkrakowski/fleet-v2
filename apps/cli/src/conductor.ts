@@ -69,7 +69,7 @@ export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
        fleet-v2 conductor halt [--lift]
        fleet-v2 conductor stop <runId> [--force] [--revision <n>]
        fleet-v2 conductor resume <runId> [--revision <n>]
-       fleet-v2 conductor start --brief-request <file.json> --tier 1|2 [--run-id <id> --attempt-id <id>]
+       fleet-v2 conductor start --brief-request <file.json> --tier 1|2 [--run-id <id> --attempt-id <id>] [--max-active-runs <n>]
        fleet-v2 conductor start --abandon --run-id <id> --attempt-id <id>
        fleet-v2 conductor run --live|--dry-run [--once] [--max-active-runs <n>]
 
@@ -79,7 +79,8 @@ before any external action (halt --lift clears it); halt never stops a running
 lane; a stop recorded as a keyed run-journal intent — stop is graceful by
 default, --force stops the running lane now; a resume recorded for a parked
 run. The driver obeys the records; nothing here dispatches, and the CLI
-never takes a run lease.
+never takes a run lease. --max-active-runs on conductor start is the
+active-run cap the start's admission check uses.
 
 conductor run --live dispatches real lanes. Run it only with the owner's
 explicit authority; it also needs policy.conductor.enabled and a state
@@ -239,6 +240,7 @@ interface StartFlags {
   readonly tier?: number;
   readonly runId?: string;
   readonly attemptId?: string;
+  readonly maxActiveRuns: number;
   readonly abandon: boolean;
   /** Present only to reject them as usage errors. */
   readonly dryRun: boolean;
@@ -254,12 +256,13 @@ function positiveInt(value: string | undefined): number | null {
 
 /**
  * `conductor start`'s private flag reader: `--brief-request <file>`,
- * `--tier <n>`, `--run-id`, `--attempt-id`, `--abandon`; `--dry-run` and
- * `--live` are read only to be refused. An unknown flag, a repeated flag, a
- * second value or a positional is a usage error.
+ * `--tier <n>`, `--run-id`, `--attempt-id`, `--max-active-runs <n>`,
+ * `--abandon`; `--dry-run` and `--live` are read only to be refused. An
+ * unknown flag, a repeated flag, a second value or a positional is a usage
+ * error.
  */
 function readStartFlags(argv: readonly string[], io: CliIo): StartFlags | null {
-  const flags: { briefRequest?: string; tier?: number; runId?: string; attemptId?: string } = {};
+  const flags: { briefRequest?: string; tier?: number; runId?: string; attemptId?: string; maxActiveRuns?: number } = {};
   let abandon = false;
   let dryRun = false;
   let live = false;
@@ -270,7 +273,12 @@ function readStartFlags(argv: readonly string[], io: CliIo): StartFlags | null {
     }
     const value = argv[index + 1];
     if (value === undefined || value.startsWith('--')) {
-      io.stderr(`${token} requires a value\n${CONDUCTOR_HELP}\n`);
+      // The cap's missing value reads exactly as the run command's (KF-25 review).
+      io.stderr(
+        token === '--max-active-runs'
+          ? `--max-active-runs requires a positive integer up to ${MAX_ACTIVE_RUNS_LIMIT}\n${CONDUCTOR_HELP}\n`
+          : `${token} requires a value\n${CONDUCTOR_HELP}\n`,
+      );
       return null;
     }
     return value;
@@ -286,7 +294,9 @@ function readStartFlags(argv: readonly string[], io: CliIo): StartFlags | null {
             ? 'run-id'
             : token === '--attempt-id' || token.startsWith('--attempt-id=')
               ? 'attempt-id'
-              : null;
+              : token === '--max-active-runs' || token.startsWith('--max-active-runs=')
+                ? 'max-active-runs'
+                : null;
     if (token === '--abandon') {
       if (abandon) {
         io.stderr(`Repeated flag: ${token}\n${CONDUCTOR_HELP}\n`);
@@ -336,9 +346,18 @@ function readStartFlags(argv: readonly string[], io: CliIo): StartFlags | null {
       flags.runId = value;
       continue;
     }
+    if (flag === 'max-active-runs') {
+      const parsed = positiveInt(value);
+      if (parsed === null || parsed > MAX_ACTIVE_RUNS_LIMIT) {
+        io.stderr(`--max-active-runs requires a positive integer up to ${MAX_ACTIVE_RUNS_LIMIT}\n${CONDUCTOR_HELP}\n`);
+        return null;
+      }
+      flags.maxActiveRuns = parsed;
+      continue;
+    }
     flags.attemptId = value;
   }
-  return { ...flags, abandon, dryRun, live };
+  return { maxActiveRuns: 1, ...flags, abandon, dryRun, live };
 }
 
 /**
@@ -376,7 +395,7 @@ async function startCommand(
     );
     return 2;
   }
-  const driver = buildDriverOf(runtime, options);
+  const driver = buildDriverOf(runtime, options, flags.maxActiveRuns);
   if (flags.abandon) {
     if (!flags.runId || !flags.attemptId) {
       io.stderr(`conductor start --abandon needs both --run-id and --attempt-id\n${CONDUCTOR_HELP}\n`);
@@ -443,7 +462,7 @@ async function startCommand(
         attemptId: result.attemptId,
         step: result.step,
         reason: result.reason,
-        retry: `conductor start --brief-request ${flags.briefRequest} --tier ${flags.tier} --run-id ${result.runId} --attempt-id ${result.attemptId}`,
+        retry: `conductor start --brief-request ${flags.briefRequest} --tier ${flags.tier} --run-id ${result.runId} --attempt-id ${result.attemptId}${flags.maxActiveRuns !== undefined && flags.maxActiveRuns !== 1 ? ` --max-active-runs ${flags.maxActiveRuns}` : ''}`,
       })}\n`,
     );
     return 1;
@@ -458,10 +477,11 @@ async function startCommand(
 function buildDriverOf(
   runtime: FleetCliRuntime,
   options: ConductorCliOptions,
+  maxActiveRuns: number,
 ): ConductorDriver {
   return options.buildDriver !== undefined
-    ? options.buildDriver(runtime, 'live', { maxActiveRuns: 1 })
-    : buildLiveConductorDriver(runtime, { maxActiveRuns: 1 });
+    ? options.buildDriver(runtime, 'live', { maxActiveRuns })
+    : buildLiveConductorDriver(runtime, { maxActiveRuns });
 }
 
 /** The clock override, or the system clock. */

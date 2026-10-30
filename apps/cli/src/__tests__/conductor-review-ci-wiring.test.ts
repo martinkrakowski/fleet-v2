@@ -6,7 +6,7 @@
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { FleetInstallation, ForgeSectionV2 } from '@fleet/installation';
 import { requireValidInstallationModel } from '@fleet/installation';
@@ -480,16 +480,22 @@ describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
    * An evidence fake for one specified `assessHeadReceipts` outcome: it
    * replaces the real use case method, so the composed
    * `acceptanceAssessment` adapter exercises its mapping against exactly that
-   * outcome. `assessHeadAcceptance` stays real.
+   * outcome. `assessHeadAcceptance` stays real. The installed spy is returned
+   * so a test can restore it (e.g. before exercising the full acceptance
+   * path with real evidence); `afterEach` below restores anything left over.
    */
   function fakeReceiptsOutcome(
     runtime: ReturnType<typeof createFleetCliRuntime>,
     result: Awaited<ReturnType<typeof runtime.evidence.assessHeadAcceptance.assessHeadReceipts>>,
-  ): void {
-    vi.spyOn(runtime.evidence.assessHeadAcceptance, 'assessHeadReceipts').mockResolvedValue(
+  ): ReturnType<typeof vi.spyOn> {
+    return vi.spyOn(runtime.evidence.assessHeadAcceptance, 'assessHeadReceipts').mockResolvedValue(
       result,
     );
   }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
 
   it('a receipts pass returns passed with an rcp id and stores no acceptance (KF-22b)', async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-cli-receipts-'));
@@ -506,7 +512,7 @@ describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
       // adapter must map it to passed and write no acceptance: the registry
       // file stays absent.
       const receiptsId = `rcp-${assessmentIdForAttempt(receiptsAttempt)}-${receiptsHead.slice(0, 8)}`;
-      fakeReceiptsOutcome(runtime, {
+      const receiptsSpy = fakeReceiptsOutcome(runtime, {
         outcome: 'receipts-passed',
         receiptsId,
         candidateHeadSha: receiptsHead,
@@ -524,6 +530,11 @@ describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
       });
       await expect(fs.access(registryPath(tempDir))).rejects.toThrow();
 
+      // Restore the real evidence before the full acceptance path, so it genuinely
+      // reads the saved assessment instead of receiving the fake receipts
+      // result for every head.
+      receiptsSpy.mockRestore();
+
       // The full acceptance path (real evidence, not faked) records its receipt…
       const full = await runtime.execution.acceptanceAssessment.assessHeadAcceptance({
         attemptId: fullAttempt,
@@ -538,7 +549,12 @@ describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
       expect(Object.keys(registry)).toEqual([fullHead]);
       expect(registry[fullHead]).toBe(full.outcome === 'accepted' ? full.receiptId : '');
 
-      // …and a later receipts pass (fake again) still leaves it unchanged.
+      // …and a later receipts pass (fake reinstalled) still leaves it unchanged.
+      fakeReceiptsOutcome(runtime, {
+        outcome: 'receipts-passed',
+        receiptsId,
+        candidateHeadSha: receiptsHead,
+      });
       const again = await runtime.execution.acceptanceAssessment.assessHeadReceipts({
         attemptId: receiptsAttempt,
         workOrderId: 'wo-receipts',

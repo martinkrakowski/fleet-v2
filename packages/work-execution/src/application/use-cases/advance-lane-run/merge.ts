@@ -41,6 +41,8 @@ export interface MergeFacts {
 export interface AcceptanceFacts {
   readonly acceptance: 'none' | 'accepted' | 'rejected' | 'unknown';
   readonly acceptedHead12: string | null;
+  /** KF-23: the accept retry ordinal at `head12`, or null when no retry is due. */
+  readonly acceptanceRetry: number | null;
   readonly preMerge: 'none' | 'passed' | 'failed' | 'unknown';
   readonly ci: 'pending' | 'passed' | 'failed' | 'unknown';
   readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string; readonly containsLaneHead: boolean } | null;
@@ -86,10 +88,10 @@ export async function parkSpentOneWayKey(
 }
 
 /**
- * The acceptance fact at `head12`: the latest final result of an `accept`
- * step key at the head (`accepted` → accepted, `acceptance-rejected` →
- * rejected, any other final or an intent without a final → unknown); none
- * without one, and none at a missing head.
+ * The acceptance fact at `head12`: the latest accept intent at the head decides
+ * (`accepted` → accepted, `acceptance-rejected` → rejected, any other final or
+ * an intent without a final → unknown); none without one, and none at a missing
+ * head. An earlier intent's final never overrides a later intent (KF-23).
  */
 function acceptanceOf(
   entries: readonly LaneRunJournalEntryRecord[],
@@ -100,7 +102,7 @@ function acceptanceOf(
     return 'none';
   }
   let sawIntent = false;
-  let latestFinal: LaneRunResultReasonCode | null = null;
+  let latestIntentKey: string | null = null;
   for (const entry of entries) {
     if (entry.kind !== 'intent' || entry.runId !== runId || entry.key === null) {
       continue;
@@ -110,18 +112,67 @@ function acceptanceOf(
       continue;
     }
     sawIntent = true;
-    const final = finalResultOfKey(entries, entry.key);
-    if (final !== null) {
-      latestFinal = (final.reasonCode ?? null) as LaneRunResultReasonCode | null;
-    }
+    latestIntentKey = entry.key;
   }
-  if (latestFinal === null) {
+  if (latestIntentKey === null) {
     return sawIntent ? 'unknown' : 'none';
   }
-  if (latestFinal === 'accepted') {
+  const final = finalResultOfKey(entries, latestIntentKey);
+  if (final === null) {
+    return 'unknown';
+  }
+  if (final.reasonCode === 'accepted') {
     return 'accepted';
   }
-  return latestFinal === 'acceptance-rejected' ? 'rejected' : 'unknown';
+  return final.reasonCode === 'acceptance-rejected' ? 'rejected' : 'unknown';
+}
+
+/**
+ * The accept retry ordinal at `head12` (KF-23): non-null only when the latest
+ * accept result at the head is `acceptance-rejected` AND a `parked` conduct
+ * entry comes after that result in the run journal (the run has since been
+ * resumed back to `accepting`); its value is the number of accept intents
+ * already journalled at this head (1 → retry 1, …).
+ */
+function acceptanceRetryOf(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  head12: string | null,
+): number | null {
+  if (head12 === null) {
+    return null;
+  }
+  let latestIntentKey: string | null = null;
+  let acceptIntentsAtHead = 0;
+  for (const entry of entries) {
+    if (entry.kind !== 'intent' || entry.runId !== runId || entry.key === null) {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.step !== 'accept' || parsed.head12 !== head12) {
+      continue;
+    }
+    acceptIntentsAtHead += 1;
+    latestIntentKey = entry.key;
+  }
+  if (latestIntentKey === null) {
+    return null;
+  }
+  const final = finalResultOfKey(entries, latestIntentKey);
+  if (final === null || final.reasonCode !== 'acceptance-rejected') {
+    return null;
+  }
+  const resultIndex = entries.indexOf(final);
+  if (resultIndex === -1) {
+    return null;
+  }
+  for (let index = resultIndex + 1; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (entry.kind === 'conduct' && entry.runId === runId && entry.state === 'parked') {
+      return acceptIntentsAtHead;
+    }
+  }
+  return null;
 }
 
 /** The head12 of the LATEST `accepted` accept result's key over all heads; null without one. */
@@ -263,6 +314,7 @@ export async function acceptanceFactsOf(
   halted: boolean,
 ): Promise<AcceptanceFacts> {
   const acceptance = acceptanceOf(entries, record.runId, head12);
+  const acceptanceRetry = acceptanceRetryOf(entries, record.runId, head12);
   const acceptedHead12 = acceptedHead12Of(entries, record.runId);
   let preMerge: AcceptanceFacts['preMerge'] = 'none';
   let ci: AcceptanceFacts['ci'] = 'unknown';
@@ -292,7 +344,7 @@ export async function acceptanceFactsOf(
     mergeState = prRead.mergeState;
   }
   const merge = await mergeFactsOf(ctx, record, state, halted, acceptance, mergeState);
-  return { acceptance, acceptedHead12, preMerge, ci, pr, merge };
+  return { acceptance, acceptanceRetry, acceptedHead12, preMerge, ci, pr, merge };
 }
 
 /**

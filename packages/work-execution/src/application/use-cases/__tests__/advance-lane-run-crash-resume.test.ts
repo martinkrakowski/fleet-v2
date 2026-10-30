@@ -1032,4 +1032,41 @@ describe('AdvanceLaneRunUseCase reconcile and crash-resume (K4-7)', () => {
     const entries = await harness.runJournal.listForRun(RUN_ID);
     expect(entries[entries.length - 1]).toMatchObject({ kind: 'conduct', state: 'dispatching' });
   });
+
+  it('KF-23: a pending accept retry1 intent is reconciled under its own key with no second intent', async () => {
+    const harness = await makeHarness(
+      runRecord(),
+      [attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, runner: CONDUCTED_RUNNER })],
+    );
+    await conduct(harness, 'accepting', NOW);
+    const retry1Key = RUN_ID + '/r0/accept/0@' + HEAD12 + '/retry1';
+    await appendIntent(harness, retry1Key, null, NOW);
+    let assessments = 0;
+    const wired: AdvanceLaneRunDependencies = {
+      ...harness.deps,
+      acceptanceAssessment: {
+        assessHeadReceipts: async () => {
+          assessments += 1;
+          return { outcome: 'passed', receiptsId: 'rcp-example-1', assessedHeadSha: COMMIT };
+        },
+        assessHeadAcceptance: async () => ({ outcome: 'accepted', receiptId: 'receipt-example-1', assessedHeadSha: COMMIT }),
+      },
+    };
+    const result = await new AdvanceLaneRunUseCase(wired).advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'accept',
+      key: retry1Key,
+      result: 'completed',
+      reasonCode: 'accepted',
+    });
+    expect(assessments).toBe(1);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === retry1Key)).toHaveLength(1);
+  });
 });

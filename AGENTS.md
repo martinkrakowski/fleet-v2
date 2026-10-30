@@ -78,11 +78,16 @@ runner environment allowlist to smuggle a setting through.
   exits 75. Treat 75 as "host full" only with that exact last stderr line (a command may exit 75
   itself), and cap retries. `scripts/gate-slot-hash.txt` pins the script. It needs `flock`.
 
-Before committing what any lane produced, run `scripts/lane-diff-check.sh <worktree>`
+Before committing what any lane produced, run `scripts/lane-diff-check.sh <worktree> --base <sha>`
 (protected paths including ignored ones — github workflows, agent/editor instruction and tool files,
 yarn/npm/package manifests and lockfiles, git attributes/modules, lane plumbing, install trees;
 plus git config filter drivers, credential-shaped strings, files outside the brief); it prints
-file, line and pattern name only, never a matched value.
+file, line and pattern name only, never a matched value. Pass `--base` as the full commit sha
+recorded at dispatch: only then is a credential-shaped line the base file already had excused
+(`baseline-excused`); a ref name or no base excuses nothing and prints one warning. Run a trusted
+copy of the script installed outside any worktree, never the worktree's own copy. Helper keys in the
+clone's git config and non-sample files in its hooks directory are findings, so lane-host clones keep
+no installed hooks.
 
 ## Web UI action rules
 

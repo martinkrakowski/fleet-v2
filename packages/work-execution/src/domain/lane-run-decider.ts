@@ -122,6 +122,14 @@ export interface LaneRunFacts {
   readonly preMerge: 'none' | 'passed' | 'failed' | 'unknown';
   /** `AssessHeadAcceptance` at `head12` (K6). */
   readonly acceptance: 'none' | 'accepted' | 'rejected' | 'unknown';
+  /**
+   * The accept retry ordinal at `head12` (KF-23): non-null only when the latest
+   * accept result at the head is `acceptance-rejected` and the run has since
+   * been resumed back to `accepting` (a `parked` conduct after that result);
+   * its value is the number of accept intents already journalled at this head
+   * (1 → retry 1, …). Accept is not one-way, so the retry is keyed.
+   */
+  readonly acceptanceRetry: number | null;
   /** `CiStatePort` at `head12` (PC/K6). */
   readonly ci: 'pending' | 'passed' | 'failed' | 'unknown';
   /** The run's PR as the forge reports it (K6, AM4b); `containsLaneHead` is true when the PR head is, or contains as an ancestor, the collected lane head (CT-2a). */
@@ -541,6 +549,20 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         return park('ambiguous', 'accept');
       }
       if (facts.acceptance === 'rejected') {
+        if (facts.acceptanceRetry !== null && facts.acceptanceRetry <= LANE_RUN_MAX_RETRY) {
+          const attempt = facts.attempt;
+          if (attempt === null) {
+            return WAIT_FACTS_INCONSISTENT;
+          }
+          return act({
+            step: 'accept',
+            round: attempt.round,
+            seatIndex: attempt.seatIndex,
+            head12: facts.head12,
+            retry: facts.acceptanceRetry,
+            attemptOrdinal: null,
+          });
+        }
         return park('acceptance-rejected', null);
       }
       return enter(afterLaneRunAcceptance(record.tier, record.prNumber));

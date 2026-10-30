@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { LaneRun } from '../entities/LaneRun.js';
 import type { LaneRunRecord } from '../lane-run-records.js';
 import { canEnterLaneRunState } from '../lane-run-transitions.js';
+import { LANE_RUN_MAX_RETRY } from '../lane-run-keys.js';
 import {
   laneRunAttemptPhaseOf,
   nextLaneRunAction,
@@ -86,6 +87,7 @@ function baseFacts(overrides: Partial<LaneRunFacts> = {}): LaneRunFacts {
     codeReview: { verdict: 'none', seatIndex: null, retries: 0 },
     preMerge: 'none',
     acceptance: 'none',
+    acceptanceRetry: null,
     ci: 'pending',
     pr: null,
     refusedStep: null,
@@ -978,6 +980,24 @@ describe('accepting, premerge, PR and CI states', () => {
     const tierOne = baseFacts({ state: 'accepting', acceptance: 'accepted' });
     const rec = record({ tier: 1 });
     assertDecision(tierOne, rec, decide(rec, tierOne), { kind: 'enter', to: 'opening-pr' });
+  });
+
+  it('KF-23: a rejected acceptance with a retry at the head acts accept under retry1', () => {
+    const facts = baseFacts({
+      state: 'accepting', head12: HEAD, attempt: attemptFact(), acceptance: 'rejected', acceptanceRetry: 1,
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'accept', key: `${RUN_ID}/r0/accept/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
+  it('KF-23: a rejected acceptance above the retry cap parks acceptance-rejected', () => {
+    const facts = baseFacts({
+      state: 'accepting', acceptance: 'rejected', acceptanceRetry: LANE_RUN_MAX_RETRY + 1,
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'acceptance-rejected', qualifier: null, parkedFrom: 'accepting',
+    });
   });
 
   it('P1: premerge none waits premerge-pending', () => {

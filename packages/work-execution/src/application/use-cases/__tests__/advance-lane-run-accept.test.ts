@@ -404,6 +404,21 @@ async function appendResult(
   expect(appended.outcome).toBe('appended');
 }
 
+/** Simulate a conductor resume of a parked run: clear the park and enter accepting (KF-23). */
+async function resumeAccepting(harness: Harness, nowIso: string): Promise<void> {
+  const current = await harness.runRepo.get(RUN_ID);
+  expect(current).not.toBeNull();
+  if (current === null) {
+    throw new Error('run missing');
+  }
+  const saved = await harness.runRepo.save(
+    { ...current, parked: null, revision: current.revision + 1 },
+    { holderId: HOLDER, fence: 1, nowIso },
+  );
+  expect(saved.outcome).toBe('saved');
+  await conduct(harness, 'accepting', nowIso);
+}
+
 /** A collected attempt in `accepting`, placed by the run's round-0 seat 0. */
 async function acceptingHarness(options: HarnessOptions = {}): Promise<Harness> {
   const harness = await makeHarness(runRecord(), [collectedAttempt()], options);
@@ -580,6 +595,72 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     expect(entries.some((entry) => entry.reasonCode === 'acceptance-rejected')).toBe(true);
     expect(entries.some((entry) => JSON.stringify(entry).includes(BLOCKER_TEXT))).toBe(false);
     expect(entries.some((entry) => JSON.stringify(entry).includes('rcp-example-1'))).toBe(false);
+  });
+
+  it('KF-23: a rejected acceptance parks, resumes, and retries the assessment under /retry1 at the same head', async () => {
+    const harness = await acceptingHarness();
+    harness.setReceiptsAnswer({ outcome: 'rejected', reason: BLOCKER_TEXT });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'accept',
+      key: acceptKey(),
+      result: 'completed',
+      reasonCode: 'acceptance-rejected',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'acceptance-rejected', qualifier: null });
+    await resumeAccepting(harness, LATER);
+    harness.setReceiptsAnswer({ outcome: 'passed', receiptsId: 'rcp-example-1', assessedHeadSha: COMMIT });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'accept',
+      key: acceptKey() + '/retry1',
+      result: 'completed',
+      reasonCode: 'accepted',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'awaiting-premerge' });
+  });
+
+  it('KF-23: each resumed rejection retries the next accept at the same head (retry1 then retry2)', async () => {
+    const harness = await acceptingHarness();
+    harness.setReceiptsAnswer({ outcome: 'rejected', reason: BLOCKER_TEXT });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'accept',
+      key: acceptKey(),
+      result: 'completed',
+      reasonCode: 'acceptance-rejected',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'acceptance-rejected', qualifier: null });
+    await resumeAccepting(harness, LATER);
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'accept',
+      key: acceptKey() + '/retry1',
+      result: 'completed',
+      reasonCode: 'acceptance-rejected',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'acceptance-rejected', qualifier: null });
+    await resumeAccepting(harness, LATER);
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'accept',
+      key: acceptKey() + '/retry2',
+      result: 'completed',
+      reasonCode: 'acceptance-rejected',
+    });
+  });
+
+  it('KF-23: a journal whose rejected result has no park after it still parks (no retry)', async () => {
+    const harness = await acceptingHarness();
+    harness.setReceiptsAnswer({ outcome: 'rejected', reason: BLOCKER_TEXT });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'accept',
+      key: acceptKey(),
+      result: 'completed',
+      reasonCode: 'acceptance-rejected',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'acceptance-rejected', qualifier: null });
   });
 });
 

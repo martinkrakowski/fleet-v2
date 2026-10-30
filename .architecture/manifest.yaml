@@ -360,6 +360,7 @@ bounded_contexts:
           - ListAttemptJournalUseCase
           - ProbeProjectUseCase
           - ListUnregisteredProjectsUseCase
+          - ExportRunTelemetryUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -379,6 +380,7 @@ bounded_contexts:
             - ListAttemptJournalPort
             - ProbeProjectPort
             - ListUnregisteredProjectsPort
+            - ExportRunTelemetryPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -482,6 +484,7 @@ bounded_contexts:
       ActionAuthorizationPort: "Obtain and durably consume an applicable scope-bound grant from operator coordination; pending or unknown results block the action."
       ExecutionObservationPort: "Publish recorded lifecycle observations through coordination; preserve a delivery gap without failing the lane."
       ListUnregisteredProjectsPort: "List each project id that has work orders but no profile, with what its work orders say about it (repositories, base commits, owned paths, counts), so it can be adopted; read-only."
+      ExportRunTelemetryPort: "For a selection of conducted runs and hand-run attempts, map the records to closed spans, apply sampling, record every span not yet final as pending before sending, send, and record each returned disposition; a span becomes final only on an HTTP result, a different salt fingerprint refuses the whole export before any send, and nothing outside the disposition store is written."
       ProbeProjectPort: "Probe one registered project read-only: read its profile, check its repository and clones and that its gate procedures exist in the installation, and record the receipt only if the profile did not change while it was probed."
       ProjectProfileReadPort: "Read one project profile and its revision from the coordination context; known absence is null."
       ProjectProbeRecordPort: "Record a probe receipt on a profile at the revision the probe started from; a changed profile is a typed rejection, never an overwrite."

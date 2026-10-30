@@ -56,7 +56,7 @@ import {
   type ExecutorForRecordedHostResult,
   type ForgeActionAdapter,
   type ForgeReadAdapter,
-  type OpencodeDbUsageAdapter,
+  type OpencodeApiUsageAdapter,
   type ProjectProfileReadPort,
   type ProjectProbeRecordAdapter,
   type RunnerForAttemptAdapter,
@@ -120,7 +120,7 @@ export interface ComposeExecutionInput {
   readonly agyRunner?: AgyRunnerAdapter;
   readonly runnerSelector: RunnerSelectorAdapter;
   readonly attemptArtifact: AttemptArtifactAdapter;
-  readonly opencodeDbUsage: OpencodeDbUsageAdapter;
+  readonly opencodeUsage: OpencodeApiUsageAdapter;
   readonly briefAuthoring: BriefAuthoringAdapter;
   readonly forgeAction: ForgeActionAdapter;
   readonly editOnlyModeOf: (
@@ -161,7 +161,7 @@ export function composeExecution(input: ComposeExecutionInput) {
     agyRunner,
     runnerSelector,
     attemptArtifact,
-    opencodeDbUsage,
+    opencodeUsage,
     briefAuthoring,
     forgeAction,
     editOnlyModeOf,
@@ -487,7 +487,7 @@ export function composeExecution(input: ComposeExecutionInput) {
     // declared lane-runner entry, in which case the request default applies.
     runnerMaxLanes: runnerProfile?.maxLanes,
     attemptArtifact,
-    opencodeDbUsage,
+    opencodeUsage,
     briefAuthoring,
     acceptanceAssessment,
     acceptanceEvidence,
@@ -580,7 +580,7 @@ export function composeExecution(input: ComposeExecutionInput) {
       artifactPort: attemptArtifact,
       briefKnowledge,
       runnerForAttempt,
-      usage: opencodeDbUsage,
+      usage: opencodeUsage,
       processTreeTermination,
     }),
     prepareFixAttempt: new PrepareFixAttemptUseCase({ attemptRepo: attemptRepository }),

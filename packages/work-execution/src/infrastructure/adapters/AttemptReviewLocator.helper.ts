@@ -93,7 +93,8 @@ export class AttemptReviewLocator {
     };
   }
 
-  private routeFor(runner: AttemptRunnerRecord | null | undefined): AttemptReviewRoute {
+  /** The ocm-run route for a recorded runner: a review and the usage read (KF-15b) dial the same one. */
+  routeFor(runner: AttemptRunnerRecord | null | undefined): AttemptReviewRoute {
     if (runner !== null && runner !== undefined && hasRecordedHostName(runner)) {
       const confirmed = confirmRecordedHost(runner, this.options.hosts);
       if (!confirmed.ok) {

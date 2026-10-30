@@ -136,7 +136,7 @@ export const attemptCommands: Readonly<Record<string, CommandHandler>> = {
         return { outcome: 'refused', reason: `Attempt not found: ${attemptId}` };
       }
       const measureAndSave = async (base: AttemptRecord) => {
-        const measured = await rt.execution.opencodeDbUsage.readUsage({ attempt: base });
+        const measured = await rt.execution.opencodeUsage.readUsage({ attempt: base });
         await rt.execution.attemptRepository.saveAttempt({
           ...base,
           usage: measured.usage,

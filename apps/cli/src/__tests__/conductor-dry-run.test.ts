@@ -343,6 +343,19 @@ async function seedFixRoundStart(runtime: FleetCliRuntime): Promise<void> {
     await journal.append(laneRunResultEntry(runtime.conductor.newUlid(), RUN_ID, gateKey.key, 'completed', 'gate-failed', NOW));
     await journal.append(laneRunConductEntry(runtime.conductor.newUlid(), RUN_ID, 'fixing', NOW));
   }
+  // KF-21b: a gate-failed fix round names its failed gate check, so the seed
+  // records the prior's stored failed predicate (an execution-journal accept row).
+  await runtime.execution.executionJournal.appendJournalEntry({
+    id: ATTEMPT_ID + ':accept:' + 'd'.repeat(40) + ':0',
+    attemptId: ATTEMPT_ID,
+    workOrderId: 'wo-example-1',
+    action: 'accept',
+    baseCommit: 'd'.repeat(40),
+    recordedAtIso: NOW,
+    status: 'refused',
+    sessionId: null,
+    detail: JSON.stringify({ predicate: 'command 1: example check', kind: 'command', verdict: 'fail', exitCode: 1, durationMs: 1, detail: 'exit 1' }),
+  });
 }
 
 /** sha256 of every file currently in `dir`, keyed by file name. */

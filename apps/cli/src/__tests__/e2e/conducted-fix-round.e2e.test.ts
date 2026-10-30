@@ -22,7 +22,7 @@ const FIX_ROUND_PASS_BUDGET = 24;
 // A pause between passes lets the lane end and the forge/review fakes answer
 // instead of burning the pass budget on back-to-back waits.
 const PASS_PAUSE_MS = 750;
-/** The run-driving loop's own wall-clock budget inside the 150 s scenario bound. */
+/** The run-driving loop's own wall-clock budget inside the scenario bound. */
 const DRIVE_BUDGET_MS = 300000;
 
 const liveFixtures = new Set<ConductedFixture>();

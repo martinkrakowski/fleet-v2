@@ -105,6 +105,12 @@ export interface AdvanceLaneRunDependencies {
   readonly attemptRepo: AttemptRepositoryPort;
   readonly executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations' | 'listJournalEntriesForAttempt'>;
   readonly artifactPort: Pick<AttemptArtifactPort, 'readBriefManifest' | 'verifyArtifactManifest' | 'readBriefFile'>;
+  /**
+   * Digest used to verify a prior attempt's frozen brief prose against its
+   * manifest when filling a fix handover (KF-21b); default
+   * `simpleDeterministicHexDigest` so existing callers keep working.
+   */
+  readonly computeDigest?: (content: string) => string;
   readonly reconcileAttempt: ReconcileAttemptPort;
   readonly admission: LaneRunAdmissionPort;
   /** A fresh ULID per call (journal entry ids, attempt ids). */

@@ -534,4 +534,97 @@ describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
       await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
     }
   });
+
+  it('a blocked receipts assessment maps to rejected with each blocker kind and stores no acceptance (KF-22b)', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-cli-receipts-blocked-'));
+    try {
+      const runtime = createFleetCliRuntime({ stateDir: tempDir });
+      const attemptId = 'attempt-blocked';
+      const headSha = 'head-sha-blocked';
+      // Two blockers of different kinds: a required check with no completed
+      // receipt ('other') and no independent review ('review-missing').
+      await runtime.evidence.evidenceAssessmentRepository.saveAssessment({
+        ...pendingAssessment(attemptId, headSha),
+        requiredChecks: ['typecheck', 'lint'],
+        reviewReceipts: [],
+      });
+      await runtime.execution.attemptRepository.saveAttempt(collectedAttempt(attemptId, headSha));
+
+      const blocked = await runtime.execution.acceptanceAssessment.assessHeadReceipts({
+        attemptId,
+        workOrderId: `wo-${attemptId}`,
+        candidateHeadSha: headSha,
+        policyRevision: 'policy-v1',
+      });
+      expect(blocked).toEqual({
+        outcome: 'rejected',
+        reason:
+          "Acceptance blocked: required check 'lint' has no completed verification receipt; no independent review was recorded for this candidate head",
+        blockerDetails: [
+          { kind: 'other', text: "required check 'lint' has no completed verification receipt" },
+          { kind: 'review-missing', text: 'no independent review was recorded for this candidate head' },
+        ],
+      });
+      await expect(fs.access(registryPath(tempDir))).rejects.toThrow();
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('a stale receipts assessment maps to rejected with one stale blocker and stores no acceptance (KF-22b)', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-cli-receipts-stale-'));
+    try {
+      const runtime = createFleetCliRuntime({ stateDir: tempDir });
+      const attemptId = 'attempt-stale';
+      const headSha = 'head-sha-stale';
+      await runtime.evidence.evidenceAssessmentRepository.saveAssessment(pendingAssessment(attemptId, headSha));
+      await runtime.execution.attemptRepository.saveAttempt(collectedAttempt(attemptId, headSha));
+
+      // A candidate head other than the assessment's marks the evidence stale;
+      // the receipts-only answer carries it as one stale blocker.
+      const stale = await runtime.execution.acceptanceAssessment.assessHeadReceipts({
+        attemptId,
+        workOrderId: `wo-${attemptId}`,
+        candidateHeadSha: 'moved-head-sha',
+        policyRevision: 'policy-v1',
+      });
+      expect(stale).toEqual({
+        outcome: 'rejected',
+        reason: 'Candidate head or policy revision changed',
+        blockerDetails: [{ kind: 'stale', text: 'Candidate head or policy revision changed' }],
+      });
+      await expect(fs.access(registryPath(tempDir))).rejects.toThrow();
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('a rejected receipts assessment maps to rejected with one other blocker and stores no acceptance (KF-22b)', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-cli-receipts-rejected-'));
+    try {
+      const runtime = createFleetCliRuntime({ stateDir: tempDir });
+      const attemptId = 'attempt-rejected';
+      const headSha = 'head-sha-rejected';
+      await runtime.evidence.evidenceAssessmentRepository.saveAssessment({
+        ...pendingAssessment(attemptId, headSha),
+        state: 'rejected',
+      });
+      await runtime.execution.attemptRepository.saveAttempt(collectedAttempt(attemptId, headSha));
+
+      const rejected = await runtime.execution.acceptanceAssessment.assessHeadReceipts({
+        attemptId,
+        workOrderId: `wo-${attemptId}`,
+        candidateHeadSha: headSha,
+        policyRevision: 'policy-v1',
+      });
+      expect(rejected).toEqual({
+        outcome: 'rejected',
+        reason: "Assessment is already in terminal state 'rejected'",
+        blockerDetails: [{ kind: 'other', text: "Assessment is already in terminal state 'rejected'" }],
+      });
+      await expect(fs.access(registryPath(tempDir))).rejects.toThrow();
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
 });

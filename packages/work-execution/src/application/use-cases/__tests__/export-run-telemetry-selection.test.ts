@@ -170,6 +170,7 @@ function conductEntry(runId: string, second: number, state: LaneRunStateValue): 
     reasonCode: null,
     grantId: null,
     state,
+    detail: null,
   };
 }
 
@@ -543,12 +544,12 @@ describe('ExportRunTelemetryUseCase selection (OT2c-1)', () => {
 });
 
 describe('ExportRunTelemetryUseCase window boundaries (OT2c-1)', () => {
-  it('selects runs with any journal entry and attempts inside [sinceIso, untilIso] inclusively', async () => {
+  it('selects runs with a journal entry and attempts inside [sinceIso, untilIso] inclusively', async () => {
     const { deps, fakes } = makeDeps();
     fakes.runRepo.withRun(makeRun({ attemptIds: [ATTEMPT_ID] }));
     fakes.runRepo.withRun(makeRun({ runId: RUN_ID_2 }));
     fakes.attemptRepo.withAttempt(makeAttempt(ATTEMPT_ID, { createdAtIso: time(10) }));
-    fakes.journal.withEntries(RUN_ID, mergedJournal(RUN_ID));
+    fakes.journal.withEntries(RUN_ID, [conductEntry(RUN_ID, 10, 'running'), conductEntry(RUN_ID, 20, 'merged')]);
 
     const result = await new ExportRunTelemetryUseCase(deps).execute(
       makeRequest({
@@ -583,10 +584,27 @@ describe('ExportRunTelemetryUseCase window boundaries (OT2c-1)', () => {
     expect(result.counts.attemptsSelected).toBe(1);
   });
 
+  it('a run whose journal entries all lie outside the window is not selected', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.runRepo.withRun(makeRun());
+    fakes.runRepo.withRun(makeRun({ runId: RUN_ID_2 }));
+    fakes.journal.withEntries(RUN_ID, [conductEntry(RUN_ID, 5, 'running'), conductEntry(RUN_ID, 9, 'merged')]);
+    fakes.journal.withEntries(RUN_ID_2, [conductEntry(RUN_ID_2, 21, 'running'), conductEntry(RUN_ID_2, 25, 'merged')]);
+
+    const result = await new ExportRunTelemetryUseCase(deps).execute(
+      makeRequest({
+        selection: { kind: 'window', sinceIso: time(10), untilIso: time(20) },
+        nowIso: time(50),
+      }),
+    );
+
+    expect(result).toEqual({ outcome: 'nothing-selected', counts: zeroCounts() });
+  });
+
   it('an attempt before the window or after it is not selected', async () => {
     const { deps, fakes } = makeDeps();
     fakes.runRepo.withRun(makeRun());
-    fakes.journal.withEntries(RUN_ID, mergedJournal(RUN_ID));
+    fakes.journal.withEntries(RUN_ID, [conductEntry(RUN_ID, 12, 'running'), conductEntry(RUN_ID, 15, 'merged')]);
     fakes.attemptRepo.withAttempt(makeAttempt(HAND_ATTEMPT_ID, { createdAtIso: time(5), updatedAtIso: time(5) }));
     fakes.attemptRepo.withAttempt(
       makeAttempt(OTHER_HAND_ATTEMPT_ID, { createdAtIso: time(45), updatedAtIso: time(45) }),

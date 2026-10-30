@@ -962,7 +962,12 @@ export class ExportRunTelemetryUseCase implements ExportRunTelemetryPort {
         if (!entriesRead.ok) {
           return { outcome: 'read-error' };
         }
-        if (entriesRead.value.length > 0) {
+        // A run is in the window when any journal entry was recorded inside it (plan §3.8).
+        const recordedIn = entriesRead.value.some((entry) => {
+          const recorded = Date.parse(entry.recordedAtIso);
+          return Number.isFinite(recorded) && recorded >= since && recorded <= until;
+        });
+        if (recordedIn) {
           runs.push(run);
           journalByRun.set(run.runId, entriesRead.value);
         }
